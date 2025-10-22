@@ -1,5 +1,6 @@
 use crate::actions::{GuiAction, RadarConfig, ScanInfo};
 use egui::Context;
+use walkers::{HttpTiles, MapMemory};
 
 pub struct Gui {
     radar_config: RadarConfig,
@@ -13,6 +14,9 @@ pub struct Gui {
     last_fetch_time: Option<std::time::Instant>,
     auto_poll_enabled: bool,
     initial_fetch_done: bool,
+    // Map state
+    map_memory: MapMemory,
+    tiles: Option<HttpTiles>,
 }
 
 impl Default for Gui {
@@ -27,6 +31,12 @@ impl Gui {
         let date_string = radar_config.timestamp.format("%Y-%m-%d").to_string();
         let time_string = radar_config.timestamp.format("%H:%M:%S").to_string();
 
+        // Initialize map memory with a view of the contiguous US
+        let mut map_memory = MapMemory::default();
+        // Set zoom level to 4 to show the full contiguous US
+        // (default is 16 which is very zoomed in)
+        let _ = map_memory.set_zoom(4.0);
+
         Self {
             radar_config,
             scan_info: None,
@@ -37,6 +47,8 @@ impl Gui {
             last_fetch_time: None,
             auto_poll_enabled: true,
             initial_fetch_done: false,
+            map_memory,
+            tiles: None,
         }
     }
 
@@ -77,6 +89,9 @@ impl Gui {
             actions.push(a);
         }
 
+        // Map in central panel
+        self.render_map(ctx);
+
         // Bottom status bar
         self.render_status_bar(ctx);
 
@@ -87,6 +102,9 @@ impl Gui {
     pub fn set_scan_info(&mut self, info: ScanInfo) {
         self.scan_info = Some(info);
         self.fetching = false;
+
+        // Zoom to a good level for viewing radar data when a scan loads
+        let _ = self.map_memory.set_zoom(7.0);
     }
 
     /// Set fetching status
@@ -215,7 +233,7 @@ impl Gui {
                     if let Some(scan_info) = &self.scan_info {
                         ui.label(format!(
                             "Scan: {} @ {} UTC ({} elevations)",
-                            scan_info.site,
+                            scan_info.site.name,
                             scan_info.timestamp.format("%Y-%m-%d %H:%M:%S"),
                             scan_info.num_elevations
                         ));
@@ -235,5 +253,35 @@ impl Gui {
                     }
                 });
             });
+    }
+
+    fn render_map(&mut self, ctx: &Context) {
+        use walkers::{Map, Position, sources::OpenStreetMap};
+
+        // Initialize tiles on first use
+        if self.tiles.is_none() {
+            self.tiles = Some(HttpTiles::new(OpenStreetMap, ctx.to_owned()));
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // Center on radar site if we have scan info, otherwise default to center of USA
+            let center = if let Some(scan_info) = &self.scan_info {
+                Position::new(scan_info.site.lon, scan_info.site.lat)
+            } else {
+                Position::new(-98.5795, 39.8283) // Geographic center of contiguous USA
+            };
+
+            // Create and render the map
+            if let Some(tiles) = &mut self.tiles {
+                Map::new(None, &mut self.map_memory, center)
+                    .with_layer(tiles, 1.0)
+                    .zoom_with_ctrl(false) // Allow scroll to zoom without holding Ctrl
+                    .panning(false) // Disable scroll panning
+                    .drag_pan_buttons(egui::DragPanButtons::PRIMARY) // Left-click drag to pan
+                    .show(ui, |_ui, _projector, _memory| {
+                        // Future: overlay radar data here
+                    });
+            }
+        });
     }
 }

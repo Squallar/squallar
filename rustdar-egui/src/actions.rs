@@ -1,4 +1,5 @@
 use chrono::NaiveDateTime;
+use rustdar_radar::RadarSite;
 
 /// Configuration for radar site and time selection
 #[derive(Debug, Clone)]
@@ -13,7 +14,7 @@ pub struct RadarConfig {
 #[derive(Debug, Clone)]
 pub struct ScanInfo {
     /// The radar site code
-    pub site: String,
+    pub site: RadarSite,
     /// The actual timestamp of the scan data
     pub timestamp: NaiveDateTime,
     /// Number of elevation angles in the scan
@@ -52,7 +53,7 @@ impl std::fmt::Display for GuiAction {
                 config.site, config.timestamp
             ),
             GuiAction::SetScanInfo(info) => {
-                write!(f, "Set scan info: {} at {}", info.site, info.timestamp)
+                write!(f, "Set scan info: {} at {}", info.site.name, info.timestamp)
             }
         }
     }

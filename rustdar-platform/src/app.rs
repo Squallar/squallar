@@ -176,7 +176,8 @@ impl App {
         self.render_world_to_texture();
 
         // Render world texture in egui panel
-        self.render_world_panel();
+        // NOTE: Commented out - now using map in central panel from GUI
+        // self.render_world_panel();
 
         // Present the frame
         self.present_frame(screen_descriptor);
@@ -259,41 +260,6 @@ impl App {
         // Always update texture (frame detection not yet implemented)
         self.texture_manager
             .update_texture(state.egui_renderer.context());
-    }
-
-    fn render_world_panel(&self) {
-        let state = self.state.as_ref().unwrap();
-
-        // Only render world screen if we have a texture
-        if let Some(texture_handle) = self.texture_manager.texture_handle() {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
-                .show(state.egui_renderer.context(), |ui| {
-                    // Get available space and calculate scale to fit
-                    let available_rect = ui.available_rect_before_wrap();
-
-                    let texture_width = RENDER_WIDTH as f32;
-                    let texture_height = RENDER_HEIGHT as f32;
-
-                    // Scale to fit in available space while keeping aspect ratio
-                    let scale_x = available_rect.width() / texture_width;
-                    let scale_y = available_rect.height() / texture_height;
-                    let final_scale = scale_x.min(scale_y);
-
-                    let final_size =
-                        egui::Vec2::new(texture_width * final_scale, texture_height * final_scale);
-
-                    ui.with_layout(
-                        egui::Layout::centered_and_justified(egui::Direction::TopDown),
-                        |ui| {
-                            ui.add_sized(
-                                final_size,
-                                egui::Image::new(texture_handle).fit_to_exact_size(final_size),
-                            );
-                        },
-                    );
-                });
-        }
     }
 
     /// Get the current surface texture, handling common errors.
@@ -449,7 +415,7 @@ impl App {
             GuiAction::SetScanInfo(scan_info) => {
                 log::info!(
                     "Setting scan info: {} @ {}",
-                    scan_info.site,
+                    scan_info.site.name,
                     scan_info.timestamp
                 );
                 self.gui.set_scan_info(scan_info);

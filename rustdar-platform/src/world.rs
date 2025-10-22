@@ -1,6 +1,7 @@
 use chrono::NaiveDateTime;
 use nexrad::model::DataFile;
 use rustdar_egui::ScanInfo;
+use rustdar_radar::get_radar_site;
 
 pub struct World {
     scan_data: Option<DataFile>,
@@ -64,8 +65,16 @@ impl World {
 
         self.scan_data = Some(data);
 
+        // Get radar site info, or create a default with unknown location
+        let radar_site = get_radar_site(site).unwrap_or_else(|| rustdar_radar::RadarSite {
+            name: Box::leak(site.to_string().into_boxed_str()),
+            lat: 0.0,
+            lon: 0.0,
+            elev: 0,
+        });
+
         ScanInfo {
-            site: site.to_string(),
+            site: radar_site,
             timestamp: actual_timestamp,
             num_elevations,
             status: format!("Loaded {} elevation angles", num_elevations),

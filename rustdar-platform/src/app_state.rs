@@ -28,7 +28,7 @@ pub struct AppState {
     pub surface: wgpu::Surface<'static>,
     pub scale_factor: f32,
     pub egui_renderer: egui_renderer::EguiRenderer,
-    max_texture_dimension: u32,
+    max_surface_dimension: u32,
 }
 
 impl AppState {
@@ -50,15 +50,16 @@ impl AppState {
             .expect("Failed to find an appropriate adapter");
 
         let features = wgpu::Features::empty();
-        // Use downlevel limits to ensure WebGL2 compatibility
-        // This disables compute shaders and other advanced features not needed for 2D rendering
-        let limits = wgpu::Limits::downlevel_webgl2_defaults();
+        // Get the adapter's actual limits instead of forcing WebGL2 limits
+        // This allows us to use higher resolution textures and surfaces on native platforms
+        let limits = adapter.limits();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
                 required_features: features,
                 required_limits: limits,
                 memory_hints: Default::default(),
+                experimental_features: Default::default(),
                 trace: Default::default(),
             })
             .await
@@ -67,16 +68,12 @@ impl AppState {
         let swapchain_capabilities = surface.get_capabilities(&adapter);
         let swapchain_format = select_surface_format(&swapchain_capabilities);
 
-        // Get the maximum texture dimension supported by the device
-        // For WebGL2, this is typically 2048
-        let max_texture_dimension = device.limits().max_texture_dimension_2d;
+        // Get the maximum texture dimension - wgpu requires surface dimensions to respect this
+        let max_surface_dimension = device.limits().max_texture_dimension_2d;
 
-        // Clamp dimensions to device limits - wgpu requires this for surface configuration
-        let (width, height) = {
-            let width = width.clamp(MIN_SIZE, max_texture_dimension);
-            let height = height.clamp(MIN_SIZE, max_texture_dimension);
-            (width, height)
-        };
+        // Clamp surface dimensions to the device's texture dimension limit
+        let width = width.clamp(MIN_SIZE, max_surface_dimension);
+        let height = height.clamp(MIN_SIZE, max_surface_dimension);
 
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -103,22 +100,17 @@ impl AppState {
             surface_config,
             egui_renderer,
             scale_factor,
-            max_texture_dimension,
+            max_surface_dimension,
         }
     }
 
     pub fn resize_surface(&mut self, width: u32, height: u32) {
-        // Clamp dimensions to device limits (required by wgpu surface configuration)
-        let width = width.clamp(MIN_SIZE, self.max_texture_dimension);
-        let height = height.clamp(MIN_SIZE, self.max_texture_dimension);
+        // Clamp to device's maximum texture dimension (required by wgpu)
+        let width = width.clamp(MIN_SIZE, self.max_surface_dimension);
+        let height = height.clamp(MIN_SIZE, self.max_surface_dimension);
 
         if width != self.surface_config.width || height != self.surface_config.height {
-            log::debug!(
-                "Resizing surface to {}x{} (clamped to max {})",
-                width,
-                height,
-                self.max_texture_dimension
-            );
+            log::debug!("Resizing surface to {}x{}", width, height);
             self.surface_config.width = width;
             self.surface_config.height = height;
             self.surface.configure(&self.device, &self.surface_config);

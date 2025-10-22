@@ -7,9 +7,6 @@ use egui_wgpu::{ScreenDescriptor, wgpu};
 use winit::event::WindowEvent;
 use winit::window::Window;
 
-/// Maximum dimension for egui textures (width or height in pixels)
-const EGUI_MAX_TEXTURE_DIMENSION: usize = 2048;
-
 pub struct EguiRenderer {
     state: State,
     renderer: Renderer,
@@ -29,20 +26,25 @@ impl EguiRenderer {
     ) -> EguiRenderer {
         let egui_context = Context::default();
 
+        // Query the device's actual texture size limit
+        let max_texture_side = device.limits().max_texture_dimension_2d as usize;
+
         let egui_state = egui_winit::State::new(
             egui_context,
             egui::viewport::ViewportId::ROOT,
             &window,
             Some(window.scale_factor() as f32),
             None,
-            Some(EGUI_MAX_TEXTURE_DIMENSION),
+            Some(max_texture_side),
         );
         let egui_renderer = Renderer::new(
             device,
             output_color_format,
-            output_depth_format,
-            msaa_samples,
-            true,
+            egui_wgpu::RendererOptions {
+                depth_stencil_format: output_depth_format,
+                msaa_samples,
+                ..Default::default()
+            },
         );
 
         EguiRenderer {
@@ -103,6 +105,7 @@ impl EguiRenderer {
                     load: egui_wgpu::wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                     store: StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
