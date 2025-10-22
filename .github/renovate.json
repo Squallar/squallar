@@ -1,0 +1,19 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "local>USA-RedDragon/renovate-configs"
+  ],
+  "packageRules": [
+    {
+      "groupName": "egui",
+      "matchDatasources": [
+        "crate"
+      ],
+      "matchPackageNames": [
+        "egui",
+        "egui-winit",
+        "egui-wgpu"
+      ]
+    }
+  ]
+}

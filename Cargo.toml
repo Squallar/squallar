@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "rustdar-platform",
+    "rustdar-egui",
+    "rustdar-radar",
+]
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+strip = true
+opt-level = "s"
+lto = true
