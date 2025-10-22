@@ -1,5 +1,56 @@
 use chrono::NaiveDateTime;
-use rustdar_radar::RadarSite;
+use rustdar_radar::sites::RadarSite;
+use std::collections::HashMap;
+
+/// Radar product types
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RadarProduct {
+    Reflectivity,
+    Velocity,
+    SpectrumWidth,
+    DifferentialPhase,
+    CorrelationCoefficient,
+    DifferentialReflectivity,
+    ClutterFilterPower,
+}
+
+impl RadarProduct {
+    pub fn code(&self) -> &'static str {
+        match self {
+            RadarProduct::Reflectivity => "ref",
+            RadarProduct::Velocity => "vel",
+            RadarProduct::SpectrumWidth => "sw",
+            RadarProduct::DifferentialPhase => "phi",
+            RadarProduct::CorrelationCoefficient => "rho",
+            RadarProduct::DifferentialReflectivity => "zdr",
+            RadarProduct::ClutterFilterPower => "cfp",
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            RadarProduct::Reflectivity => "Reflectivity",
+            RadarProduct::Velocity => "Velocity",
+            RadarProduct::SpectrumWidth => "Spectrum Width",
+            RadarProduct::DifferentialPhase => "Differential Phase",
+            RadarProduct::CorrelationCoefficient => "Correlation Coefficient",
+            RadarProduct::DifferentialReflectivity => "Differential Reflectivity",
+            RadarProduct::ClutterFilterPower => "Clutter Filter Power",
+        }
+    }
+
+    pub fn all() -> &'static [RadarProduct] {
+        &[
+            RadarProduct::Reflectivity,
+            RadarProduct::Velocity,
+            RadarProduct::SpectrumWidth,
+            RadarProduct::DifferentialPhase,
+            RadarProduct::CorrelationCoefficient,
+            RadarProduct::DifferentialReflectivity,
+            RadarProduct::ClutterFilterPower,
+        ]
+    }
+}
 
 /// Configuration for radar site and time selection
 #[derive(Debug, Clone)]
@@ -17,8 +68,10 @@ pub struct ScanInfo {
     pub site: RadarSite,
     /// The actual timestamp of the scan data
     pub timestamp: NaiveDateTime,
-    /// Number of elevation angles in the scan
-    pub num_elevations: usize,
+    /// Available products in this scan
+    pub available_products: Vec<RadarProduct>,
+    /// Map of product to available elevation angles (sorted)
+    pub product_elevations: HashMap<RadarProduct, Vec<f32>>,
     /// Status message
     pub status: String,
 }
@@ -40,6 +93,7 @@ impl Default for RadarConfig {
 pub enum GuiAction {
     Exit,
     FetchRadarScan(RadarConfig),
+    CheckForNewScans(RadarConfig),
     SetScanInfo(ScanInfo),
 }
 
@@ -50,6 +104,11 @@ impl std::fmt::Display for GuiAction {
             GuiAction::FetchRadarScan(config) => write!(
                 f,
                 "Fetch radar scan from {} at {}",
+                config.site, config.timestamp
+            ),
+            GuiAction::CheckForNewScans(config) => write!(
+                f,
+                "Check for new scans from {} at {}",
                 config.site, config.timestamp
             ),
             GuiAction::SetScanInfo(info) => {

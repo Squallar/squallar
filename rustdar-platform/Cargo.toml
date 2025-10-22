@@ -31,23 +31,6 @@ tokio = { version = "1.42.0", features = ["rt", "rt-multi-thread"] }
 walkers = "0.18"
 winit = "0.30.12"
 web-time = "1.1.0"
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 egui-winit = { version = "0.33.0", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
 env_logger = "0.11"
 wgpu = "26.0.0"
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-console_error_panic_hook = "0.1.7"
-console_log = "1.0.0"
-egui-winit = { version = "0.33.0", default-features = false, features = ["links"] }
-web-sys = { version = "0.3.81", features = ["GpuTextureFormat", "HtmlCanvasElement", "Window", "Document", "Element", "CssStyleDeclaration"] }
-wasm-bindgen = "0.2.104"
-wasm-bindgen-futures = "0.4.54"
-wgpu = { version = "26.0.0", features = ["webgl"] }
-
-[package.metadata.wasm-pack.profile.release]
-wasm-opt = ["-O4", "--enable-bulk-memory", "--enable-mutable-globals", "--enable-reference-types", "--enable-nontrapping-float-to-int"]
-
-[package.metadata.wasm-pack.profile.dev]
-wasm-opt = ["-O4", "--enable-bulk-memory", "--enable-mutable-globals", "--enable-reference-types", "--enable-nontrapping-float-to-int"]

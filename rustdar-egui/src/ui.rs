@@ -1,4 +1,5 @@
-use crate::actions::{GuiAction, RadarConfig, ScanInfo};
+use crate::actions::{GuiAction, RadarConfig, RadarProduct, ScanInfo};
+use chrono::Timelike;
 use egui::Context;
 use walkers::{HttpTiles, MapMemory};
 
@@ -14,9 +15,16 @@ pub struct Gui {
     last_fetch_time: Option<std::time::Instant>,
     auto_poll_enabled: bool,
     initial_fetch_done: bool,
+    initial_zoom_set: bool, // Track if we've already set the initial zoom
     // Map state
     map_memory: MapMemory,
     tiles: Option<HttpTiles>,
+    // Radar rendering state
+    selected_elevation: usize,
+    selected_product: RadarProduct,
+    radar_image: Option<(egui::TextureHandle, f64, f64, f32, Vec<f32>)>, // texture, lat, lon, max_range_km, value_data
+    // Hover state for showing radar values
+    hover_value: Option<String>,
 }
 
 impl Default for Gui {
@@ -47,8 +55,13 @@ impl Gui {
             last_fetch_time: None,
             auto_poll_enabled: true,
             initial_fetch_done: false,
+            initial_zoom_set: false,
             map_memory,
             tiles: None,
+            selected_elevation: 0,
+            selected_product: RadarProduct::Reflectivity,
+            radar_image: None,
+            hover_value: None,
         }
     }
 
@@ -65,14 +78,25 @@ impl Gui {
         }
 
         // Poll for new scans every 60 seconds
-        if self.auto_poll_enabled && !self.fetching {
-            if let Some(last_fetch) = self.last_fetch_time {
-                if last_fetch.elapsed().as_secs() >= 60 {
-                    self.fetching = true;
-                    self.last_fetch_time = Some(std::time::Instant::now());
-                    actions.push(GuiAction::FetchRadarScan(self.radar_config.clone()));
-                }
-            }
+        if self.auto_poll_enabled
+            && !self.fetching
+            && let Some(last_fetch) = self.last_fetch_time
+            && last_fetch.elapsed().as_secs() >= 60
+        {
+            // Check for new files without downloading
+            let now = chrono::Local::now().naive_local();
+            let current_scan_time = now
+                .with_second(0)
+                .and_then(|t| t.with_nanosecond(0))
+                .unwrap_or(now);
+
+            // Use current time for the check request
+            let mut config = self.radar_config.clone();
+            config.timestamp = current_scan_time;
+            actions.push(GuiAction::CheckForNewScans(config));
+
+            // Reset timer to avoid spamming checks
+            self.last_fetch_time = Some(std::time::Instant::now());
         }
 
         // Menu bar
@@ -82,6 +106,9 @@ impl Gui {
             actions.push(a);
         }
 
+        // Bottom status bar - render first so it spans the full width
+        self.render_status_bar(ctx);
+
         // Left panel for radar controls
         let mut action = None;
         self.render_radar_panel(ctx, &mut action);
@@ -89,11 +116,11 @@ impl Gui {
             actions.push(a);
         }
 
+        // Right panel for radar display controls
+        self.render_radar_display_panel(ctx);
+
         // Map in central panel
         self.render_map(ctx);
-
-        // Bottom status bar
-        self.render_status_bar(ctx);
 
         actions
     }
@@ -103,8 +130,11 @@ impl Gui {
         self.scan_info = Some(info);
         self.fetching = false;
 
-        // Zoom to a good level for viewing radar data when a scan loads
-        let _ = self.map_memory.set_zoom(7.0);
+        // Only zoom to radar on the first scan load to avoid disrupting user navigation
+        if !self.initial_zoom_set {
+            let _ = self.map_memory.set_zoom(7.0);
+            self.initial_zoom_set = true;
+        }
     }
 
     /// Set fetching status
@@ -201,11 +231,93 @@ impl Gui {
         }
     }
 
+    fn render_radar_display_panel(&mut self, ctx: &Context) {
+        egui::SidePanel::right("radar_display_panel")
+            .default_width(200.0)
+            .show(ctx, |ui| {
+                ui.heading("Display");
+                ui.separator();
+
+                if let Some(scan_info) = &self.scan_info {
+                    // Product selector
+                    ui.label("Product:");
+
+                    let prev_product = self.selected_product;
+
+                    egui::ComboBox::from_id_salt("product_selector")
+                        .selected_text(self.selected_product.name())
+                        .show_ui(ui, |ui| {
+                            for product in &scan_info.available_products {
+                                ui.selectable_value(
+                                    &mut self.selected_product,
+                                    *product,
+                                    product.name(),
+                                );
+                            }
+                        });
+
+                    // Reset elevation to 0 if product changed
+                    if prev_product != self.selected_product {
+                        self.selected_elevation = 0;
+                    }
+
+                    ui.add_space(10.0);
+
+                    // Elevation selector - shows elevations for the selected product
+                    ui.label("Elevation:");
+
+                    if let Some(elevations) =
+                        scan_info.product_elevations.get(&self.selected_product)
+                    {
+                        if !elevations.is_empty() {
+                            // Clamp selected_elevation to valid range
+                            if self.selected_elevation >= elevations.len() {
+                                self.selected_elevation = 0;
+                            }
+
+                            let selected_angle = elevations
+                                .get(self.selected_elevation)
+                                .copied()
+                                .unwrap_or(0.0);
+
+                            egui::ComboBox::from_id_salt("elevation_selector")
+                                .selected_text(format!("{:.1}°", selected_angle))
+                                .show_ui(ui, |ui| {
+                                    for (i, angle) in elevations.iter().enumerate() {
+                                        ui.selectable_value(
+                                            &mut self.selected_elevation,
+                                            i,
+                                            format!("{:.1}°", angle),
+                                        );
+                                    }
+                                });
+
+                            ui.add_space(10.0);
+                            ui.separator();
+                            ui.label(format!("Showing: {}", self.selected_product.name()));
+                            ui.label(format!("Elevation: {:.1}°", selected_angle));
+                            ui.label(format!("{} tilts available", elevations.len()));
+                        } else {
+                            ui.label("No elevations available for this product");
+                        }
+                    } else {
+                        ui.label("Product not available in scan");
+                    }
+                } else {
+                    ui.label("No scan loaded");
+                    ui.separator();
+                    ui.label("Load a radar scan to view products.");
+                }
+            });
+    }
+
     fn render_status_bar(&mut self, ctx: &Context) {
         egui::TopBottomPanel::bottom("status_bar")
             .show_separator_line(true)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+
                     // Status indicator
                     if self.fetching {
                         ui.label("🔄");
@@ -232,10 +344,10 @@ impl Gui {
                     // Scan information
                     if let Some(scan_info) = &self.scan_info {
                         ui.label(format!(
-                            "Scan: {} @ {} UTC ({} elevations)",
+                            "Scan: {} @ {} UTC ({} products)",
                             scan_info.site.name,
                             scan_info.timestamp.format("%Y-%m-%d %H:%M:%S"),
-                            scan_info.num_elevations
+                            scan_info.available_products.len()
                         ));
                     } else {
                         ui.label("No scan loaded");
@@ -243,14 +355,26 @@ impl Gui {
 
                     ui.separator();
 
-                    // Error message (if any)
-                    if let Some(error_msg) = &self.error_message {
-                        ui.label("❌");
-                        ui.label(error_msg);
-                        if ui.button("✕").clicked() {
-                            self.error_message = None;
-                        }
+                    // Hover information - expand to fill available space
+                    if let Some(hover_info) = &self.hover_value {
+                        ui.label("📍");
+                        ui.label(hover_info);
+                    } else {
+                        // Add empty space when no hover info
+                        ui.label("");
                     }
+
+                    // Add flexible space to push error to the right
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Error message (if any)
+                        if let Some(error_msg) = self.error_message.clone() {
+                            if ui.button("✕").clicked() {
+                                self.error_message = None;
+                            }
+                            ui.label(&error_msg);
+                            ui.label("❌");
+                        }
+                    });
                 });
             });
     }
@@ -263,25 +387,196 @@ impl Gui {
             self.tiles = Some(HttpTiles::new(OpenStreetMap, ctx.to_owned()));
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Center on radar site if we have scan info, otherwise default to center of USA
-            let center = if let Some(scan_info) = &self.scan_info {
-                Position::new(scan_info.site.lon, scan_info.site.lat)
-            } else {
-                Position::new(-98.5795, 39.8283) // Geographic center of contiguous USA
-            };
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                // Determine the map center - only set it initially, then MapMemory takes over
+                let center = if let Some(scan_info) = &self.scan_info {
+                    Position::new(scan_info.site.lon, scan_info.site.lat)
+                } else {
+                    Position::new(-98.5795, 39.8283) // Geographic center of contiguous USA
+                };
 
-            // Create and render the map
-            if let Some(tiles) = &mut self.tiles {
-                Map::new(None, &mut self.map_memory, center)
-                    .with_layer(tiles, 1.0)
-                    .zoom_with_ctrl(false) // Allow scroll to zoom without holding Ctrl
-                    .panning(false) // Disable scroll panning
-                    .drag_pan_buttons(egui::DragPanButtons::PRIMARY) // Left-click drag to pan
-                    .show(ui, |_ui, _projector, _memory| {
-                        // Future: overlay radar data here
-                    });
-            }
-        });
+                // Clone radar image data for use in closure
+                let radar_image = self.radar_image.clone();
+
+                // Reset hover value for this frame
+                self.hover_value = None;
+
+                // Create and render the map
+                if let Some(tiles) = &mut self.tiles {
+                    // MapMemory automatically preserves user's zoom and pan between frames
+                    // The center parameter is just used for initialization if no memory exists
+                    Map::new(None, &mut self.map_memory, center)
+                        .with_layer(tiles, 1.0)
+                        .zoom_with_ctrl(false) // Allow scroll to zoom without holding Ctrl
+                        .panning(false) // Disable scroll panning
+                        .drag_pan_buttons(egui::DragPanButtons::PRIMARY) // Left-click drag to pan
+                        .show(ui, |ui, projector, memory| {
+                            // Overlay radar data if available
+                            if let Some((ref texture, lat, lon, max_range_km, ref value_data)) =
+                                radar_image
+                            {
+                                // Detect hover position and look up radar value
+                                if let Some(hover_pos) = ui.ctx().pointer_hover_pos() {
+                                    // Convert screen position to map position
+                                    let screen_vec = egui::vec2(hover_pos.x, hover_pos.y);
+                                    let map_pos = projector.unproject(screen_vec);
+                                    let hover_lat = map_pos.y();
+                                    let hover_lon = map_pos.x();
+
+                                    // Calculate bearing and distance from radar to hover point
+                                    let lat1 = lat.to_radians();
+                                    let lon1 = lon.to_radians();
+                                    let lat2 = hover_lat.to_radians();
+                                    let lon2 = hover_lon.to_radians();
+
+                                    // Haversine formula for distance
+                                    let dlat = lat2 - lat1;
+                                    let dlon = lon2 - lon1;
+                                    let a = (dlat / 2.0).sin().powi(2)
+                                        + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+                                    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+                                    let distance_km = 6371.0 * c; // Earth radius in km
+
+                                    // Calculate bearing (azimuth)
+                                    let y = dlon.sin() * lat2.cos();
+                                    let x = lat1.cos() * lat2.sin()
+                                        - lat1.sin() * lat2.cos() * dlon.cos();
+                                    let bearing_rad = y.atan2(x);
+                                    let bearing_deg = bearing_rad.to_degrees();
+                                    let azimuth = (bearing_deg + 360.0) % 360.0;
+
+                                    // Convert to radar image coordinates (1800x1800 pixels)
+                                    const IMAGE_SIZE: f64 = 1800.0;
+                                    const MAX_RANGE_KM: f64 = 230.0;
+                                    let pixels_per_km = IMAGE_SIZE / (2.0 * MAX_RANGE_KM);
+
+                                    // Convert polar to cartesian (0° = North, clockwise)
+                                    let x_offset = distance_km * azimuth.to_radians().sin();
+                                    let y_offset = -distance_km * azimuth.to_radians().cos();
+
+                                    // Convert to pixel coordinates
+                                    let px = ((IMAGE_SIZE / 2.0) + x_offset * pixels_per_km) as i32;
+                                    let py = ((IMAGE_SIZE / 2.0) + y_offset * pixels_per_km) as i32;
+
+                                    // Look up value if within bounds
+                                    let mut value_str = String::new();
+                                    if px >= 0
+                                        && px < IMAGE_SIZE as i32
+                                        && py >= 0
+                                        && py < IMAGE_SIZE as i32
+                                    {
+                                        let pixel_idx =
+                                            (py as usize * IMAGE_SIZE as usize) + px as usize;
+                                        if pixel_idx < value_data.len() {
+                                            let value = value_data[pixel_idx];
+                                            if !value.is_nan() {
+                                                // Format value based on product type
+                                                let product = self.selected_product;
+                                                value_str = match product {
+                                                    RadarProduct::Velocity => {
+                                                        let mph = value * 2.23694; // m/s to mph
+                                                        format!(" | Velocity: {:.1} mph", mph)
+                                                    }
+                                                    RadarProduct::Reflectivity => {
+                                                        format!(" | Reflectivity: {:.1} dBZ", value)
+                                                    }
+                                                    _ => format!(" | Value: {:.2}", value),
+                                                };
+                                            }
+                                        }
+                                    }
+
+                                    self.hover_value = Some(format!(
+                                        "Lat: {:.4}°, Lon: {:.4}° | Range: {:.1}km, Az: {:.1}° | Px: {},{} {}",
+                                        hover_lat, hover_lon, distance_km, azimuth, px, py, value_str
+                                    ));
+                                }
+                                // Project radar center to screen coordinates
+                                let radar_center = walkers::lat_lon(lat, lon);
+                                let center_screen = projector.project(radar_center).to_pos2();
+
+                                // Calculate size using map zoom level
+                                // At zoom level z, there are 2^z tiles across the world (256px each)
+                                // The world width in pixels at this zoom is: 256 * 2^z
+                                // Earth's circumference at equator: ~40,075 km
+                                // So pixels per km = (256 * 2^z) / 40075
+                                let zoom = memory.zoom() as f32;
+                                let tiles_across = 2.0_f32.powf(zoom);
+                                let world_width_pixels = 256.0 * tiles_across;
+                                let earth_circumference_km = 40075.0;
+                                let pixels_per_km = world_width_pixels / earth_circumference_km;
+
+                                // Adjust for latitude (map is Mercator projection)
+                                // Scale factor varies with latitude
+                                let lat_rad = (lat as f32).to_radians();
+                                let scale_factor = 1.0 / lat_rad.cos();
+
+                                let image_size_pixels =
+                                    max_range_km * 2.0 * pixels_per_km * scale_factor;
+
+                                // Draw the radar image centered on the radar site
+                                let rect = egui::Rect::from_center_size(
+                                    center_screen,
+                                    egui::vec2(image_size_pixels, image_size_pixels),
+                                );
+
+                                ui.painter().image(
+                                    texture.id(),
+                                    rect,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                        });
+                }
+            });
+    }
+
+    /// Get the selected product and elevation for rendering
+    pub fn get_rendering_params(&self) -> Option<(RadarProduct, f32)> {
+        self.scan_info.as_ref().and_then(|scan_info| {
+            scan_info
+                .product_elevations
+                .get(&self.selected_product)
+                .and_then(|elevations| elevations.get(self.selected_elevation).copied())
+                .map(|elev_angle| (self.selected_product, elev_angle))
+        })
+    }
+
+    /// Get the current scan info
+    pub fn get_scan_info(&self) -> Option<&ScanInfo> {
+        self.scan_info.as_ref()
+    }
+
+    /// Get the current radar image
+    pub fn get_radar_image(&self) -> &Option<(egui::TextureHandle, f64, f64, f32, Vec<f32>)> {
+        &self.radar_image
+    }
+
+    /// Take the radar image, removing it from the GUI
+    pub fn take_radar_image(&mut self) -> Option<(egui::TextureHandle, f64, f64, f32, Vec<f32>)> {
+        self.radar_image.take()
+    }
+
+    /// Set the radar image to display on the map
+    pub fn set_radar_image(
+        &mut self,
+        texture: egui::TextureHandle,
+        lat: f64,
+        lon: f64,
+        max_range_km: f32,
+        value_data: Vec<f32>,
+    ) {
+        self.radar_image = Some((texture, lat, lon, max_range_km, value_data));
+    }
+
+    /// Clear the radar image
+    pub fn clear_radar_image(&mut self) {
+        self.radar_image = None;
     }
 }

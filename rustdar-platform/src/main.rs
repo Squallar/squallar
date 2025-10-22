@@ -4,5 +4,8 @@
 use rustdar_platform_lib::run;
 
 fn main() {
-    pollster::block_on(run());
+    if let Err(e) = pollster::block_on(run()) {
+        eprintln!("Application error: {}", e);
+        std::process::exit(1);
+    }
 }

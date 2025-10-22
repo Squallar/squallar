@@ -25,17 +25,3 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --all-targets --all-features --workspace
-  build-wasm:
-    name: Build WASM
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-      - name: Install Rust
-        run: |
-          rustup default stable
-          rustup target add wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - name: Install wasm-pack
-        run: cargo install wasm-pack
-      - name: Build WASM
-        run: ./build-wasm.sh
