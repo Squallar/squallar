@@ -12,7 +12,6 @@ pub mod app_state;
 pub mod constants;
 pub mod egui_renderer;
 pub mod input;
-pub mod radar_renderer;
 pub mod run;
 
 pub use crate::run::run;

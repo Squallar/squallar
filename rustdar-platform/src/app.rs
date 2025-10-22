@@ -11,11 +11,15 @@ use crate::WindowRef;
 use crate::app_state;
 use crate::constants::*;
 use crate::input::InputHandler;
-use crate::radar_renderer;
 use chrono::TimeZone;
 use rustdar_egui::{
     Gui,
-    actions::{GuiAction, RadarProduct, ScanInfo},
+    actions::GuiAction,
+};
+use rustdar_radar::render::{
+    RadarProduct,
+    ScanInfo,
+    render_radar_to_image,
 };
 use rustdar_radar::scan;
 use rustdar_radar::sites::get_radar_site;
@@ -350,7 +354,7 @@ impl App {
 
                 // Render the radar data to an image
                 let radar_render_result = if let Some(data) = &self.scan_data {
-                    radar_renderer::render_radar_to_image(data, elevation, product)
+                    render_radar_to_image(data, elevation, product)
                 } else {
                     None
                 };

@@ -1,7 +1,8 @@
-use crate::actions::{GuiAction, RadarConfig, RadarProduct, ScanInfo};
+use crate::actions::{GuiAction, RadarConfig};
 use chrono::Timelike;
 use egui::Context;
 use walkers::{HttpTiles, MapMemory};
+use rustdar_radar::render::{RadarProduct, ScanInfo};
 
 pub struct Gui {
     radar_config: RadarConfig,
