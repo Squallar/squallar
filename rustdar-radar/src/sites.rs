@@ -6,7 +6,7 @@ pub struct RadarSite {
     pub elev: i32,
 }
 
-const RADARS: [RadarSite; 207] = [
+pub const RADARS: [RadarSite; 207] = [
     RadarSite {
         name: "KABR",
         lat: 45.45583,

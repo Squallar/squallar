@@ -255,11 +255,13 @@ impl App {
                     log::info!("📥 Received scan data from background thread");
                     let scan_info = self.load_scan_data(data, &site, timestamp);
                     self.gui.set_scan_info(scan_info);
+                    self.gui.set_loading_site(None);
                     log::info!("✅ Scan data loaded and UI updated");
                 }
                 Err(error_msg) => {
                     log::error!("📥 Received error from background thread: {}", error_msg);
                     self.gui.set_error(error_msg);
+                    self.gui.set_loading_site(None);
                 }
             }
         }
@@ -613,6 +615,68 @@ impl App {
                     scan_info.timestamp
                 );
                 self.gui.set_scan_info(scan_info);
+            }
+            GuiAction::SwitchRadarSite(site) => {
+                log::info!("🔄 Switch radar site requested: {}", site);
+                
+                // Update the radar config with the new site
+                let mut new_config = self.gui.get_radar_config().clone();
+                new_config.site = site.clone();
+                
+                // Set the new config in the GUI
+                self.gui.set_radar_config(new_config.clone());
+                
+                // Set the site as loading (this will turn the icon purple immediately)
+                self.gui.set_loading_site(Some(site.clone()));
+                
+                // Convert local timestamp to UTC for S3 search
+                let local_dt = chrono::Local
+                    .from_local_datetime(&new_config.timestamp)
+                    .single()
+                    .unwrap_or_else(chrono::Local::now);
+                let utc_dt = local_dt.with_timezone(&chrono::Utc);
+                let utc_timestamp = utc_dt.naive_utc();
+
+                // Spawn async task to fetch radar data
+                let site = new_config.site.clone();
+                let timestamp = utc_timestamp;
+                let window = self.window.clone();
+                let sender = self.scan_sender.clone();
+
+                {
+                    log::info!("Spawning background thread for radar fetch after site switch...");
+                    std::thread::spawn(move || {
+                        log::info!("Background thread started, creating Tokio runtime...");
+                        let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+                        log::info!("Starting fetch for {} @ {} UTC", site, timestamp.date());
+                        let result = rt.block_on(scan::get_scan(&site, timestamp));
+                        match result {
+                            Ok(data) => {
+                                log::info!(
+                                    "✅ Successfully fetched radar scan from {} @ {}",
+                                    site,
+                                    timestamp
+                                );
+                                if let Err(e) = sender.send(Ok((data, site.clone(), timestamp))) {
+                                    log::error!(
+                                        "❌ Failed to send scan data to main thread: {:?}",
+                                        e
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                let error_msg = format!("Failed to fetch radar scan: {:?}", e);
+                                log::error!("❌ {}", error_msg);
+                                let _ = sender.send(Err(error_msg));
+                            }
+                        }
+                        if let Some(window) = window {
+                            log::info!("Requesting window redraw...");
+                            window.request_redraw();
+                        }
+                    });
+                    log::info!("Background thread spawned for site switch");
+                }
             }
             GuiAction::Exit => {
                 self.request_exit(event_loop);

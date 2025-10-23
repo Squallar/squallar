@@ -3,6 +3,7 @@ use chrono::Timelike;
 use egui::Context;
 use walkers::{HttpTiles, MapMemory};
 use rustdar_radar::render::{RadarProduct, ScanInfo};
+use rustdar_radar::sites::RADARS;
 
 pub struct Gui {
     radar_config: RadarConfig,
@@ -26,6 +27,10 @@ pub struct Gui {
     radar_image: Option<(egui::TextureHandle, f64, f64, f32, Vec<f32>)>, // texture, lat, lon, max_range_km, value_data
     // Hover state for showing radar values
     hover_value: Option<String>,
+    // Site display settings
+    show_radar_sites: bool,
+    // Track which site is currently loading
+    loading_site: Option<String>,
 }
 
 impl Default for Gui {
@@ -63,6 +68,8 @@ impl Gui {
             selected_product: RadarProduct::Reflectivity,
             radar_image: None,
             hover_value: None,
+            show_radar_sites: false,
+            loading_site: None,
         }
     }
 
@@ -121,7 +128,8 @@ impl Gui {
         self.render_radar_display_panel(ctx);
 
         // Map in central panel
-        self.render_map(ctx);
+        let map_actions = self.render_map(ctx);
+        actions.extend(map_actions);
 
         actions
     }
@@ -161,6 +169,7 @@ impl Gui {
 
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.auto_poll_enabled, "Auto-poll for new scans");
+                    ui.checkbox(&mut self.show_radar_sites, "Show radar sites");
                 });
             });
         });
@@ -380,8 +389,10 @@ impl Gui {
             });
     }
 
-    fn render_map(&mut self, ctx: &Context) {
+    fn render_map(&mut self, ctx: &Context) -> Vec<GuiAction> {
         use walkers::{Map, Position, sources::OpenStreetMap};
+
+        let mut actions = Vec::new();
 
         // Initialize tiles on first use
         if self.tiles.is_none() {
@@ -414,6 +425,91 @@ impl Gui {
                         .panning(false) // Disable scroll panning
                         .drag_pan_buttons(egui::DragPanButtons::PRIMARY) // Left-click drag to pan
                         .show(ui, |ui, projector, memory| {
+                            if self.show_radar_sites {
+                                for radar_site in &RADARS {
+                                    let site_position = walkers::lat_lon(radar_site.lat, radar_site.lon);
+                                    let site_screen = projector.project(site_position).to_pos2();
+                                    
+                                    // Skip sites that are outside the visible area to improve performance
+                                    let screen_rect = ui.max_rect();
+                                    if !screen_rect.expand(100.0).contains(site_screen) {
+                                        continue;
+                                    }
+
+                                    // Determine icon size based on zoom level
+                                    let zoom = memory.zoom() as f32;
+                                    let icon_size = (10.0 + zoom * 2.0).clamp(8.0, 24.0);
+                                    
+                                    // Choose icon color based on site state
+                                    let is_current_site = self.scan_info.as_ref()
+                                        .map(|info| info.site.name == radar_site.name)
+                                        .unwrap_or(false);
+                                    
+                                    let is_loading = self.loading_site.as_ref()
+                                        .map(|loading| loading == radar_site.name)
+                                        .unwrap_or(false);
+                                    
+                                    let icon_color = if is_loading {
+                                        egui::Color32::from_rgb(160, 32, 240) // Purple for loading
+                                    } else if is_current_site {
+                                        egui::Color32::from_rgb(255, 100, 100) // Red for current site
+                                    } else {
+                                        egui::Color32::from_rgb(100, 150, 255) // Blue for other sites
+                                    };
+
+                                    // Draw the radar site icon
+                                    let icon_rect = egui::Rect::from_center_size(
+                                        site_screen,
+                                        egui::vec2(icon_size, icon_size)
+                                    );
+
+                                    // Make it clickable
+                                    let response = ui.allocate_rect(icon_rect, egui::Sense::click());
+                                    
+                                    if response.clicked() {
+                                        // Immediately set this site as loading
+                                        self.loading_site = Some(radar_site.name.to_string());
+                                        // Switch to this radar site
+                                        actions.push(GuiAction::SwitchRadarSite(radar_site.name.to_string()));
+                                    }
+
+                                    // Draw the icon circle
+                                    ui.painter().circle_filled(site_screen, icon_size / 2.0, icon_color);
+                                    
+                                    // Add a border
+                                    ui.painter().circle_stroke(
+                                        site_screen, 
+                                        icon_size / 2.0, 
+                                        egui::Stroke::new(1.5, egui::Color32::WHITE)
+                                    );
+
+                                    // Draw site name text (use black for readability on the current map)
+                                    let text_color = egui::Color32::BLACK;
+                                    let font_size = (icon_size * 0.6).clamp(8.0, 12.0);
+
+                                    // Position text slightly below the icon
+                                    let text_pos = egui::pos2(
+                                        site_screen.x,
+                                        site_screen.y + icon_size / 2.0 + 3.0,
+                                    );
+
+                                    ui.painter().text(
+                                        text_pos,
+                                        egui::Align2::CENTER_TOP,
+                                        radar_site.name,
+                                        egui::FontId::monospace(font_size),
+                                        text_color,
+                                    );
+
+                                    // Show tooltip on hover
+                                    if response.hovered() {
+                                        let tooltip_text = format!("{}\nLat: {:.3}°, Lon: {:.3}°\nElev: {} ft", 
+                                            radar_site.name, radar_site.lat, radar_site.lon, radar_site.elev);
+                                        response.on_hover_text(tooltip_text);
+                                    }
+                                }
+                            }
+
                             // Overlay radar data if available
                             if let Some((ref texture, lat, lon, max_range_km, ref value_data)) =
                                 radar_image
@@ -532,10 +628,20 @@ impl Gui {
                                     ),
                                     egui::Color32::WHITE,
                                 );
+
+                                // Draw a light grey circle showing the actual radar range
+                                let range_radius_pixels = max_range_km * pixels_per_km * scale_factor;
+                                ui.painter().circle_stroke(
+                                    center_screen,
+                                    range_radius_pixels,
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(150, 150, 150, 80)),
+                                );
                             }
                         });
                 }
             });
+
+        actions
     }
 
     /// Get the selected product and elevation for rendering
@@ -547,6 +653,24 @@ impl Gui {
                 .and_then(|elevations| elevations.get(self.selected_elevation).copied())
                 .map(|elev_angle| (self.selected_product, elev_angle))
         })
+    }
+
+    /// Get the current radar config
+    pub fn get_radar_config(&self) -> &RadarConfig {
+        &self.radar_config
+    }
+
+    /// Set the radar config
+    pub fn set_radar_config(&mut self, config: RadarConfig) {
+        self.radar_config = config.clone();
+        // Update the date/time strings to match the new config
+        self.date_string = config.timestamp.format("%Y-%m-%d").to_string();
+        self.time_string = config.timestamp.format("%H:%M:%S").to_string();
+    }
+
+    /// Set which site is currently loading
+    pub fn set_loading_site(&mut self, site: Option<String>) {
+        self.loading_site = site;
     }
 
     /// Get the current scan info
@@ -584,5 +708,6 @@ impl Gui {
     pub fn clear_graphics_state(&mut self) {
         self.radar_image = None;
         self.tiles = None;
+        self.loading_site = None;
     }
 }

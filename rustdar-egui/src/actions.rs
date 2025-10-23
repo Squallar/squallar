@@ -29,6 +29,7 @@ pub enum GuiAction {
     FetchRadarScan(RadarConfig),
     CheckForNewScans(RadarConfig),
     SetScanInfo(ScanInfo),
+    SwitchRadarSite(String), // Switch to a different radar site
 }
 
 impl std::fmt::Display for GuiAction {
@@ -47,6 +48,9 @@ impl std::fmt::Display for GuiAction {
             ),
             GuiAction::SetScanInfo(info) => {
                 write!(f, "Set scan info: {} at {}", info.site.name, info.timestamp)
+            }
+            GuiAction::SwitchRadarSite(site) => {
+                write!(f, "Switch to radar site {}", site)
             }
         }
     }
