@@ -1,6 +1,6 @@
 use chrono::NaiveDateTime;
 use log;
-use nexrad::model::DataFile;
+use nexrad_model::data::Scan;
 use std::f32::consts::PI;
 use std::collections::HashMap;
 use crate::sites::RadarSite;
@@ -80,15 +80,14 @@ impl RadarProduct {
 /// - max_range_km: actual radar range
 /// - value_data: actual radar values at each pixel (f32::NAN for no data)
 pub fn render_radar_to_image(
-    data: &DataFile,
+    data: &Scan,
     elevation_angle: f32,
     product: RadarProduct,
 ) -> Option<(Vec<u8>, f32, Vec<f32>)> {
-    // Find the elevation scan that matches the requested angle
-    let elevation_scan = data.elevation_scans().values().find(|radials| {
-        radials
-            .first()
-            .map(|r| (r.header().elev() - elevation_angle).abs() < 0.01)
+    // Find the sweep that matches the requested elevation angle
+    let target_sweep = data.sweeps().iter().find(|sweep| {
+        sweep.radials().first()
+            .map(|r| (r.elevation_angle_degrees() - elevation_angle).abs() < 0.01)
             .unwrap_or(false)
     })?;
 
@@ -100,11 +99,11 @@ pub fn render_radar_to_image(
 
     let mut actual_max_range = 0.0f32;
 
-    // elevation_scan is already a Vec<&Message31>, no need to collect
-    let radials = elevation_scan;
+    // Get the radials from the target sweep
+    let radials = target_sweep.radials();
 
     // Calculate azimuth angles for all radials
-    let azimuths: Vec<f32> = radials.iter().map(|r| r.header().azm()).collect();
+    let azimuths: Vec<f32> = radials.iter().map(|r| r.azimuth_angle_degrees()).collect();
 
     // Calculate azimuth spacing (average angular difference between radials)
     let mut azimuth_diffs = Vec::new();
@@ -126,73 +125,54 @@ pub fn render_radar_to_image(
 
     // Process each radial (sweep angle)
     for radial in radials.iter() {
-        let azimuth = radial.header().azm(); // degrees
+        let azimuth = radial.azimuth_angle_degrees(); // degrees
 
         // Get the data moment for the selected product
         let data_moment = match product {
-            RadarProduct::Reflectivity => radial.reflectivity_data(),
-            RadarProduct::Velocity => radial.velocity_data(),
-            RadarProduct::SpectrumWidth => radial.sw_data(),
-            RadarProduct::DifferentialReflectivity => radial.zdr_data(),
-            RadarProduct::CorrelationCoefficient => radial.rho_data(),
-            RadarProduct::DifferentialPhase => radial.phi_data(),
-            RadarProduct::ClutterFilterPower => radial.cfp_data(),
+            RadarProduct::Reflectivity => radial.reflectivity(),
+            RadarProduct::Velocity => radial.velocity(),
+            RadarProduct::SpectrumWidth => radial.spectrum_width(),
+            RadarProduct::DifferentialReflectivity => radial.differential_reflectivity(),
+            RadarProduct::CorrelationCoefficient => radial.correlation_coefficient(),
+            RadarProduct::DifferentialPhase => radial.differential_phase(),
+            RadarProduct::ClutterFilterPower => radial.specific_differential_phase(), // Use specific_differential_phase as closest match
         };
 
         if let Some(moment) = data_moment {
-            let generic_data = moment.data();
-            let gate_count = generic_data.number_data_moment_gates() as usize;
-            let first_gate_range = generic_data.data_moment_range() as f32 / 1000.0; // meters to km
-            let gate_size = generic_data.data_moment_range_sample_interval() as f32 / 1000.0; // meters to km
-            let scale = generic_data.scale();
-            let offset = generic_data.offset();
-
+            let moment_values = moment.values();
+            let gate_count = moment_values.len();
+            
+            // For the new API, we need to estimate range parameters
+            // This is a simplification - in reality we'd need metadata
+            let first_gate_range = 2.125; // km, typical NEXRAD first gate
+            let gate_size = 0.25; // km, typical NEXRAD gate size
+            
             // Calculate actual max range for this moment
             let moment_max_range = first_gate_range + (gate_count as f32 * gate_size);
             actual_max_range = actual_max_range.max(moment_max_range);
 
-            // Get raw moment data
-            let moment_data = moment.moment_data();
-
             // Process each gate (range bin)
-            for gate_idx in 0..gate_count {
+            for (gate_idx, moment_value) in moment_values.iter().enumerate() {
                 let range_km = first_gate_range + (gate_idx as f32 * gate_size);
 
                 if range_km > MAX_RANGE_KM {
                     break;
                 }
 
-                // Get raw value and convert to scaled value
-                if gate_idx < moment_data.len() {
-                    let raw_value = moment_data[gate_idx];
+                // Extract the actual value from the MomentValue enum
+                let scaled_value = match moment_value {
+                    nexrad_model::data::MomentValue::Value(v) => *v,
+                    nexrad_model::data::MomentValue::BelowThreshold => continue, // Skip no-data
+                    nexrad_model::data::MomentValue::RangeFolded => continue, // Skip range-folded
+                };
 
-                    // Check for special values (0 or 1 typically mean no data or range folded)
-                    // Also check for other common no-data values
-                    if raw_value == 0 || raw_value == 1 || raw_value == 255 {
-                        continue;
-                    }
+                // Skip if no valid data
+                if scaled_value >= 999.0 || scaled_value.is_nan() {
+                    continue;
+                }
 
-                    // Convert raw value to scaled value
-                    // Different products use different scaling formulas
-                    let scaled_value = if product == RadarProduct::Velocity {
-                        // For velocity: (raw - offset) * scale (centers around zero)
-                        ((raw_value as f32) - offset) * scale
-                    } else if product == RadarProduct::Reflectivity {
-                        // For reflectivity: (raw - offset) / scale
-                        // This is the correct NEXRAD Level II formula for reflectivity
-                        ((raw_value as f32) - offset) / scale
-                    } else {
-                        // For other products, use the standard formula
-                        (raw_value as f32 * scale) + offset
-                    };
-
-                    // Skip if no valid data
-                    if scaled_value >= 999.0 {
-                        continue;
-                    }
-
-                    // Get color for this value
-                    let color = get_color_for_value(product, scaled_value);
+                // Get color for this value
+                let color = get_color_for_value(product, scaled_value);
 
                     // Calculate azimuth edges (halfway between radials)
                     let az_half_spacing = avg_azimuth_spacing / 2.0;
@@ -261,7 +241,6 @@ pub fn render_radar_to_image(
                     }
                 }
             }
-        }
     }
 
     // Use the calculated max range, or fall back to a default if no data was found

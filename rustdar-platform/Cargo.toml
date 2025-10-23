@@ -24,7 +24,9 @@ clap = { version = "4.5.48", features = ["derive"] }
 egui = "0.33.0"
 egui-wgpu = { version = "0.33.0", features = ["winit"] }
 log = "0.4.28"
-nexrad = { version = "0.0.3", features = ["download"] }
+nexrad-data = { version = "0.2.0", features = ["aws"] }
+nexrad-model = "0.1.0"
+nexrad-decode = "0.1.1"
 pollster = "0.3"
 serde_json = "1.0.145"
 tokio = { version = "1.42.0", features = ["rt", "rt-multi-thread"] }

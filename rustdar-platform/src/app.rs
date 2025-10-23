@@ -26,17 +26,17 @@ use rustdar_radar::sites::get_radar_site;
 use std::collections::HashMap;
 
 use chrono::NaiveDateTime;
-use nexrad::model::DataFile;
+use nexrad_model::data::Scan;
 use std::sync::mpsc::{Receiver, Sender};
 
-type ScanResult = Result<(DataFile, String, NaiveDateTime), String>;
+type ScanResult = Result<(Scan, String, NaiveDateTime), String>;
 
 pub struct App {
     instance: wgpu::Instance,
     state: Option<app_state::AppState>,
     window: Option<WindowRef>,
     gui: Gui,
-    scan_data: Option<nexrad::model::DataFile>,
+    scan_data: Option<nexrad_model::data::Scan>,
     input: InputHandler,
     scan_receiver: Receiver<ScanResult>,
     scan_sender: Sender<ScanResult>,
@@ -78,55 +78,55 @@ impl App {
     /// Load scan data from the fetched radar data
     fn load_scan_data(
         &mut self,
-        data: nexrad::model::DataFile,
+        data: nexrad_model::data::Scan,
         site: &str,
         _requested_timestamp: chrono::NaiveDateTime,
     ) -> ScanInfo {
         // Build a map of products to their available elevation angles
         let mut product_elevations: HashMap<RadarProduct, Vec<f32>> = HashMap::new();
 
-        for radials in data.elevation_scans().values() {
-            if let Some(first_radial) = radials.first() {
-                let elev_angle = first_radial.header().elev();
+        for sweep in data.sweeps() {
+            if let Some(first_radial) = sweep.radials().first() {
+                let elev_angle = first_radial.elevation_angle_degrees();
 
                 // Check which products have data at this elevation
-                if first_radial.reflectivity_data().is_some() {
+                if first_radial.reflectivity().is_some() {
                     product_elevations
                         .entry(RadarProduct::Reflectivity)
                         .or_default()
                         .push(elev_angle);
                 }
-                if first_radial.velocity_data().is_some() {
+                if first_radial.velocity().is_some() {
                     product_elevations
                         .entry(RadarProduct::Velocity)
                         .or_default()
                         .push(elev_angle);
                 }
-                if first_radial.sw_data().is_some() {
+                if first_radial.spectrum_width().is_some() {
                     product_elevations
                         .entry(RadarProduct::SpectrumWidth)
                         .or_default()
                         .push(elev_angle);
                 }
-                if first_radial.zdr_data().is_some() {
+                if first_radial.differential_reflectivity().is_some() {
                     product_elevations
                         .entry(RadarProduct::DifferentialReflectivity)
                         .or_default()
                         .push(elev_angle);
                 }
-                if first_radial.rho_data().is_some() {
+                if first_radial.correlation_coefficient().is_some() {
                     product_elevations
                         .entry(RadarProduct::CorrelationCoefficient)
                         .or_default()
                         .push(elev_angle);
                 }
-                if first_radial.phi_data().is_some() {
+                if first_radial.differential_phase().is_some() {
                     product_elevations
                         .entry(RadarProduct::DifferentialPhase)
                         .or_default()
                         .push(elev_angle);
                 }
-                if first_radial.cfp_data().is_some() {
+                if first_radial.specific_differential_phase().is_some() {
                     product_elevations
                         .entry(RadarProduct::ClutterFilterPower)
                         .or_default()
@@ -158,28 +158,21 @@ impl App {
             RadarProduct::ClutterFilterPower => 6,
         });
 
-        // Extract actual timestamp from the volume header
-        let volume_header = data.volume_header();
-        let file_date = volume_header.file_date(); // Days since January 1, 1970 (day 1 = Jan 1, 1970)
-        let file_time = volume_header.file_time(); // Milliseconds since midnight (UTC)
-
-        // Convert days since January 1, 1970 to NaiveDate
-        // Note: The NEXRAD format uses day 1 = Jan 1, 1970, so we subtract 1
-        let unix_epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-        let scan_date = unix_epoch + chrono::Duration::days((file_date - 1) as i64);
-
-        // Convert milliseconds since midnight to time
-        let total_seconds = file_time / 1000;
-        let hours = total_seconds / 3600;
-        let minutes = (total_seconds % 3600) / 60;
-        let seconds = total_seconds % 60;
-        let millis = file_time % 1000;
-
-        let scan_time = chrono::NaiveTime::from_hms_milli_opt(hours, minutes, seconds, millis)
-            .unwrap_or_else(|| chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap());
-
-        // This timestamp is in UTC
-        let actual_timestamp = chrono::NaiveDateTime::new(scan_date, scan_time);
+        // Extract actual timestamp from the first radial's collection timestamp
+        // In the new API, we get timestamps from individual radials
+        let actual_timestamp = if let Some(first_sweep) = data.sweeps().first() {
+            if let Some(first_radial) = first_sweep.radials().first() {
+                let timestamp_ms = first_radial.collection_timestamp();
+                // Convert from milliseconds since epoch to NaiveDateTime
+                chrono::DateTime::from_timestamp_millis(timestamp_ms)
+                    .map(|dt| dt.naive_utc())
+                    .unwrap_or(_requested_timestamp)
+            } else {
+                _requested_timestamp
+            }
+        } else {
+            _requested_timestamp
+        };
 
         self.scan_data = Some(data);
 

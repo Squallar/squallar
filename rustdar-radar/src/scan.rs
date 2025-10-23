@@ -1,11 +1,8 @@
 use chrono::{NaiveDateTime, NaiveTime};
 
-use nexrad::decode::decode_file;
-use nexrad::decompress::decompress_file;
-use nexrad::download::{download_file, list_files};
-use nexrad::file::is_compressed;
-use nexrad::model::DataFile;
-use nexrad::result::Result;
+use nexrad_data::aws::archive::{download_file, list_files};
+use nexrad_model::data::Scan;
+use nexrad_data::result::Result;
 
 /// Check for new radar files without downloading them
 /// Returns the timestamp of the latest available scan, or None if no files found
@@ -23,7 +20,7 @@ pub async fn check_latest_scan(
     // Find the latest scan
     let mut latest_time = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
     for m in metas.iter() {
-        let identifier_parts = m.identifier().split('_');
+        let identifier_parts = m.name().split('_');
         let identifier_time = identifier_parts.collect::<Vec<_>>()[1];
         if let Ok(time) = NaiveTime::parse_from_str(identifier_time, "%H%M%S")
             && time > latest_time
@@ -37,7 +34,7 @@ pub async fn check_latest_scan(
     Ok(Some(latest_datetime))
 }
 
-pub async fn get_scan(site: &str, timestamp: NaiveDateTime) -> Result<DataFile> {
+pub async fn get_scan(site: &str, timestamp: NaiveDateTime) -> Result<Scan> {
     let metas = list_files(site, &timestamp.date()).await;
     let metas = metas?;
 
@@ -58,7 +55,7 @@ pub async fn get_scan(site: &str, timestamp: NaiveDateTime) -> Result<DataFile> 
     let mut latest_time = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
 
     for m in metas.iter() {
-        let identifier_parts = m.identifier().split('_');
+        let identifier_parts = m.name().split('_');
         let identifier_time = identifier_parts.collect::<Vec<_>>()[1];
         let identifier_time =
             NaiveTime::parse_from_str(identifier_time, "%H%M%S").expect("is valid time");
@@ -81,7 +78,7 @@ pub async fn get_scan(site: &str, timestamp: NaiveDateTime) -> Result<DataFile> 
 
     // If the closest match is in the future (user requested time is too new),
     // use the latest available scan instead
-    let identifier_parts = meta.identifier().split('_');
+    let identifier_parts = meta.name().split('_');
     let identifier_time = identifier_parts.collect::<Vec<_>>()[1];
     let meta_time = NaiveTime::parse_from_str(identifier_time, "%H%M%S").expect("is valid time");
 
@@ -94,18 +91,15 @@ pub async fn get_scan(site: &str, timestamp: NaiveDateTime) -> Result<DataFile> 
     println!(
         "Nearest file to {:?} is {:?}.",
         timestamp.time(),
-        meta.identifier()
+        meta.name()
     );
 
-    println!("Downloading file \"{}\"...", meta.identifier());
-    let mut downloaded_file = download_file(meta).await?;
+    println!("Downloading file \"{}\"...", meta.name());
+    let downloaded_file = download_file(meta.clone()).await?;
 
-    println!("Data file size (bytes): {}", downloaded_file.len());
+    println!("Data file size (bytes): {}", downloaded_file.data().len());
 
-    if is_compressed(downloaded_file.as_slice()) {
-        downloaded_file = decompress_file(&downloaded_file)?;
-    }
-
-    let scan = decode_file(&downloaded_file)?;
+    // The new API handles decompression and decoding automatically
+    let scan = downloaded_file.scan()?;
     Ok(scan)
 }
