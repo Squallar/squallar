@@ -31,6 +31,8 @@ pub struct Gui {
     show_radar_sites: bool,
     // Track which site is currently loading
     loading_site: Option<String>,
+    // Time dialog state
+    show_time_dialog: bool,
 }
 
 impl Default for Gui {
@@ -70,6 +72,7 @@ impl Gui {
             hover_value: None,
             show_radar_sites: false,
             loading_site: None,
+            show_time_dialog: false,
         }
     }
 
@@ -114,13 +117,13 @@ impl Gui {
             actions.push(a);
         }
 
-        // Bottom status bar - render first so it spans the full width
-        self.render_status_bar(ctx);
+        // Time dialog
+        if let Some(a) = self.render_time_dialog(ctx) {
+            actions.push(a);
+        }
 
-        // Left panel for radar controls
-        let mut action = None;
-        self.render_radar_panel(ctx, &mut action);
-        if let Some(a) = action {
+        // Bottom status bar - render first so it spans the full width
+        if let Some(a) = self.render_status_bar(ctx) {
             actions.push(a);
         }
 
@@ -170,76 +173,73 @@ impl Gui {
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.auto_poll_enabled, "Auto-poll for new scans");
                     ui.checkbox(&mut self.show_radar_sites, "Show radar sites");
+                    ui.separator();
+                    if ui.button("Time...").clicked() {
+                        self.show_time_dialog = true;
+                        ui.close_kind(egui::UiKind::Menu);
+                    }
                 });
             });
         });
     }
 
-    fn render_radar_panel(&mut self, ctx: &Context, action: &mut Option<GuiAction>) {
-        egui::SidePanel::left("radar_config_panel")
-            .default_width(300.0)
-            .show(ctx, |ui| {
-                ui.heading("Radar Configuration");
-                ui.separator();
-
-                ui.horizontal(|ui| {
-                    ui.label("Site Code:");
-                    ui.text_edit_singleline(&mut self.radar_config.site);
+    fn render_time_dialog(&mut self, ctx: &Context) -> Option<GuiAction> {
+        let mut action = None;
+        
+        if self.show_time_dialog {
+            egui::Window::new("Set Time")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.heading("Select Time");
+                        ui.add_space(10.0);
+                        
+                        ui.label("Date:");
+                        ui.text_edit_singleline(&mut self.date_string);
+                        
+                        ui.add_space(5.0);
+                        
+                        ui.label("Time:");
+                        ui.text_edit_singleline(&mut self.time_string);
+                        
+                        ui.add_space(10.0);
+                        
+                        if ui.button("Use Current Time").clicked() {
+                            self.radar_config.timestamp = chrono::Local::now().naive_local();
+                            self.date_string = self.radar_config.timestamp.format("%Y-%m-%d").to_string();
+                            self.time_string = self.radar_config.timestamp.format("%H:%M:%S").to_string();
+                        }
+                        
+                        ui.add_space(15.0);
+                        
+                        ui.horizontal(|ui| {
+                            if ui.button("OK").clicked() {
+                                // Try to parse the date and time strings
+                                let datetime_str = format!("{} {}", self.date_string, self.time_string);
+                                if let Ok(timestamp) = chrono::NaiveDateTime::parse_from_str(&datetime_str, "%Y-%m-%d %H:%M:%S") {
+                                    self.radar_config.timestamp = timestamp;
+                                    action = Some(GuiAction::FetchRadarScan(self.radar_config.clone()));
+                                }
+                                self.show_time_dialog = false;
+                            }
+                            
+                            if ui.button("Cancel").clicked() {
+                                // Restore the original strings from the current config
+                                self.date_string = self.radar_config.timestamp.format("%Y-%m-%d").to_string();
+                                self.time_string = self.radar_config.timestamp.format("%H:%M:%S").to_string();
+                                self.show_time_dialog = false;
+                            }
+                        });
+                    });
                 });
-
-                ui.add_space(10.0);
-
-                ui.label("Timestamp (local):");
-                ui.horizontal(|ui| {
-                    ui.label("Date:");
-                    if ui.text_edit_singleline(&mut self.date_string).changed() {
-                        self.update_timestamp_from_strings();
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Time:");
-                    if ui.text_edit_singleline(&mut self.time_string).changed() {
-                        self.update_timestamp_from_strings();
-                    }
-                });
-
-                ui.add_space(10.0);
-
-                if ui.button("Use Current Time").clicked() {
-                    self.radar_config.timestamp = chrono::Local::now().naive_local();
-                    self.date_string = self.radar_config.timestamp.format("%Y-%m-%d").to_string();
-                    self.time_string = self.radar_config.timestamp.format("%H:%M:%S").to_string();
-                }
-
-                ui.add_space(10.0);
-                ui.separator();
-
-                let fetch_button = ui.add_enabled(
-                    !self.fetching,
-                    egui::Button::new(if self.fetching {
-                        "Fetching..."
-                    } else {
-                        "Fetch Radar Scan"
-                    }),
-                );
-
-                if fetch_button.clicked() {
-                    self.fetching = true;
-                    *action = Some(GuiAction::FetchRadarScan(self.radar_config.clone()));
-                }
-            });
-    }
-
-    fn update_timestamp_from_strings(&mut self) {
-        // Try to parse the date and time strings
-        let datetime_str = format!("{} {}", self.date_string, self.time_string);
-        if let Ok(timestamp) =
-            chrono::NaiveDateTime::parse_from_str(&datetime_str, "%Y-%m-%d %H:%M:%S")
-        {
-            self.radar_config.timestamp = timestamp;
         }
+        
+        action
     }
+
+
 
     fn render_radar_display_panel(&mut self, ctx: &Context) {
         egui::SidePanel::right("radar_display_panel")
@@ -321,12 +321,26 @@ impl Gui {
             });
     }
 
-    fn render_status_bar(&mut self, ctx: &Context) {
+    fn render_status_bar(&mut self, ctx: &Context) -> Option<GuiAction> {
+        let mut action = None;
+        
         egui::TopBottomPanel::bottom("status_bar")
             .show_separator_line(true)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
+
+                    // Refresh button
+                    let refresh_button = ui.add_enabled(
+                        !self.fetching,
+                        egui::Button::new("🔄").frame(false)
+                    );
+                    if refresh_button.clicked() {
+                        action = Some(GuiAction::FetchRadarScan(self.radar_config.clone()));
+                    }
+                    refresh_button.on_hover_text("Refresh radar data");
+
+                    ui.separator();
 
                     // Status indicator
                     if self.fetching {
@@ -387,6 +401,8 @@ impl Gui {
                     });
                 });
             });
+        
+        action
     }
 
     fn render_map(&mut self, ctx: &Context) -> Vec<GuiAction> {
