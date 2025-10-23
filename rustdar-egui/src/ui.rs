@@ -110,29 +110,10 @@ impl Gui {
             self.last_fetch_time = Some(std::time::Instant::now());
         }
 
-        // Menu bar
-        let mut action = None;
-        self.render_menu_bar(ctx, &mut action);
-        if let Some(a) = action {
-            actions.push(a);
-        }
-
-        // Time dialog
-        if let Some(a) = self.render_time_dialog(ctx) {
-            actions.push(a);
-        }
-
-        // Bottom status bar - render first so it spans the full width
-        if let Some(a) = self.render_status_bar(ctx) {
-            actions.push(a);
-        }
-
-        // Right panel for radar display controls
-        self.render_radar_display_panel(ctx);
-
-        // Map in central panel
-        let map_actions = self.render_map(ctx);
-        actions.extend(map_actions);
+        #[cfg(target_os = "android")]
+        self.render_mobile_ui(ctx, &mut actions);
+        #[cfg(not(target_os = "android"))]
+        self.render_desktop_ui(ctx, &mut actions);
 
         actions
     }
@@ -160,6 +141,7 @@ impl Gui {
         self.fetching = false;
     }
 
+    #[cfg(not(target_os = "android"))]
     fn render_menu_bar(&mut self, ctx: &Context, action: &mut Option<GuiAction>) {
         egui::TopBottomPanel::top("menubar_container").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -238,8 +220,7 @@ impl Gui {
         action
     }
 
-
-
+    #[cfg(not(target_os = "android"))]
     fn render_radar_display_panel(&mut self, ctx: &Context) {
         egui::SidePanel::right("radar_display_panel")
             .default_width(200.0)
@@ -320,6 +301,7 @@ impl Gui {
             });
     }
 
+    #[cfg(not(target_os = "android"))]
     fn render_status_bar(&mut self, ctx: &Context) -> Option<GuiAction> {
         let mut action = None;
         
@@ -721,5 +703,202 @@ impl Gui {
         self.radar_image = None;
         self.tiles = None;
         self.loading_site = None;
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn render_desktop_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<GuiAction>) {
+        // Menu bar
+        let mut action = None;
+        self.render_menu_bar(ctx, &mut action);
+        if let Some(a) = action {
+            actions.push(a);
+        }
+
+        // Time dialog
+        if let Some(a) = self.render_time_dialog(ctx) {
+            actions.push(a);
+        }
+
+        // Bottom status bar - render first so it spans the full width
+        if let Some(a) = self.render_status_bar(ctx) {
+            actions.push(a);
+        }
+
+        // Right panel for radar display controls
+        self.render_radar_display_panel(ctx);
+
+        // Map in central panel
+        let map_actions = self.render_map(ctx);
+        actions.extend(map_actions);
+    }
+
+    #[cfg(target_os = "android")]
+    fn render_mobile_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<GuiAction>) {
+        // Time dialog (shared between platforms)
+        if let Some(a) = self.render_time_dialog(ctx) {
+            actions.push(a);
+        }
+
+        // Mobile status bar (simplified)
+        if let Some(a) = self.render_mobile_status_bar(ctx) {
+            actions.push(a);
+        }
+
+        // Bottom toolbar for mobile controls
+        if let Some(a) = self.render_mobile_bottom_toolbar(ctx) {
+            actions.push(a);
+        }
+
+        // Map in central panel
+        let map_actions = self.render_map(ctx);
+        actions.extend(map_actions);
+    }
+
+    #[cfg(target_os = "android")]
+    fn render_mobile_status_bar(&mut self, ctx: &egui::Context) -> Option<GuiAction> {
+        let mut action = None;
+        
+        egui::TopBottomPanel::top("mobile_status_bar")
+            .min_height(32.0)
+            .show_separator_line(true)
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    // Refresh button
+                    let refresh_button = ui.add_enabled(
+                        !self.fetching,
+                        egui::Button::new("🔄").min_size(egui::vec2(44.0, 32.0))
+                    );
+                    if refresh_button.clicked() {
+                        action = Some(GuiAction::FetchRadarScan(self.radar_config.clone()));
+                    }
+                    refresh_button.on_hover_text("Refresh radar data");
+
+                    ui.separator();
+
+                    // Status indicator
+                    if self.fetching {
+                        ui.label("🔄 Loading...");
+                        ui.spinner();
+                    } else if let Some(scan_info) = &self.scan_info {
+                        ui.label(format!("{} @ {}", 
+                            scan_info.site.name,
+                            scan_info.timestamp.format("%H:%M")
+                        ));
+                    } else {
+                        ui.label("No scan loaded");
+                    }
+
+                    ui.separator();
+
+                    // Error message (if any)
+                    if let Some(error_msg) = self.error_message.clone() {
+                        if ui.button("✕").clicked() {
+                            self.error_message = None;
+                        }
+                        ui.label(&error_msg);
+                    }
+                });
+            });
+        
+        action
+    }
+
+    #[cfg(target_os = "android")]
+    fn render_mobile_bottom_toolbar(&mut self, ctx: &egui::Context) -> Option<GuiAction> {
+        let action = None;
+        
+        egui::TopBottomPanel::bottom("mobile_toolbar")
+            .min_height(80.0)
+            .show_separator_line(true)
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    let button_size = egui::vec2(60.0, 60.0);
+                    
+                    // Product selector
+                    let product_text = if let Some(_scan_info) = &self.scan_info {
+                        match self.selected_product {
+                            RadarProduct::Reflectivity => "📊\nREF",
+                            RadarProduct::Velocity => "🌪\nVEL", 
+                            RadarProduct::SpectrumWidth => "📈\nSW",
+                            RadarProduct::DifferentialReflectivity => "📋\nZDR",
+                            RadarProduct::CorrelationCoefficient => "🔗\nCC",
+                            RadarProduct::DifferentialPhase => "🔄\nPDP",
+                            RadarProduct::ClutterFilterPower => "🔇\nCFP",
+                        }
+                    } else {
+                        "📊\n---"
+                    };
+                    
+                    if ui.add_sized(button_size, egui::Button::new(product_text)).clicked() {
+                        if let Some(scan_info) = &self.scan_info {
+                            // Cycle through available products
+                            let current_idx = scan_info.available_products
+                                .iter()
+                                .position(|p| *p == self.selected_product)
+                                .unwrap_or(0);
+                            let next_idx = (current_idx + 1) % scan_info.available_products.len();
+                            if let Some(next_product) = scan_info.available_products.get(next_idx) {
+                                self.selected_product = *next_product;
+                                self.selected_elevation = 0; // Reset elevation when changing product
+                            }
+                        }
+                    }
+
+                    // Elevation/Tilt selector
+                    let elevation_text = if let Some(scan_info) = &self.scan_info {
+                        if let Some(elevations) = scan_info.product_elevations.get(&self.selected_product) {
+                            if let Some(angle) = elevations.get(self.selected_elevation) {
+                                format!("📐\n{:.1}°", angle)
+                            } else {
+                                "📐\n---".to_string()
+                            }
+                        } else {
+                            "📐\n---".to_string()
+                        }
+                    } else {
+                        "📐\n---".to_string()
+                    };
+                    
+                    if ui.add_sized(button_size, egui::Button::new(elevation_text)).clicked() {
+                        if let Some(scan_info) = &self.scan_info {
+                            if let Some(elevations) = scan_info.product_elevations.get(&self.selected_product) {
+                                if !elevations.is_empty() {
+                                    self.selected_elevation = (self.selected_elevation + 1) % elevations.len();
+                                }
+                            }
+                        }
+                    }
+
+                    // Radar sites toggle
+                    let sites_text = if self.show_radar_sites {
+                        "🗺\nON"
+                    } else {
+                        "🗺\nOFF"
+                    };
+                    
+                    if ui.add_sized(button_size, egui::Button::new(sites_text)).clicked() {
+                        self.show_radar_sites = !self.show_radar_sites;
+                    }
+
+                    // Time navigation
+                    if ui.add_sized(button_size, egui::Button::new("🕐\nTIME")).clicked() {
+                        self.show_time_dialog = true;
+                    }
+
+                    // Auto-poll toggle
+                    let poll_text = if self.auto_poll_enabled {
+                        "⏰\nAUTO"
+                    } else {
+                        "⏸\nOFF"
+                    };
+                    
+                    if ui.add_sized(button_size, egui::Button::new(poll_text)).clicked() {
+                        self.auto_poll_enabled = !self.auto_poll_enabled;
+                    }
+                });
+            });
+        
+        action
     }
 }
