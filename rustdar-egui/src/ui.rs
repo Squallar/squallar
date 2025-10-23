@@ -171,7 +171,6 @@ impl Gui {
                 });
 
                 ui.menu_button("View", |ui| {
-                    ui.checkbox(&mut self.auto_poll_enabled, "Auto-poll for new scans");
                     ui.checkbox(&mut self.show_radar_sites, "Show radar sites");
                     ui.separator();
                     if ui.button("Time...").clicked() {
@@ -342,25 +341,22 @@ impl Gui {
 
                     ui.separator();
 
-                    // Status indicator
+                    // Unified auto-poll checkbox and status
                     if self.fetching {
                         ui.label("🔄");
                         ui.label("Downloading");
                         ui.spinner();
                     } else if self.auto_poll_enabled {
-                        // Show time until next poll
+                        // Show time until next poll with checkbox
                         if let Some(last_fetch) = self.last_fetch_time {
                             let elapsed = last_fetch.elapsed().as_secs();
                             let remaining = 60_u64.saturating_sub(elapsed);
-                            ui.label("🔁");
-                            ui.label(format!("Auto-polling (next in {}s)", remaining));
+                            ui.checkbox(&mut self.auto_poll_enabled, &format!("Auto-poll (next in {}s)", remaining));
                         } else {
-                            ui.label("🔁");
-                            ui.label("Auto-polling");
+                            ui.checkbox(&mut self.auto_poll_enabled, "Auto-poll");
                         }
                     } else {
-                        ui.label("⏸");
-                        ui.label("Idle");
+                        ui.checkbox(&mut self.auto_poll_enabled, "Auto-poll");
                     }
 
                     ui.separator();
