@@ -580,4 +580,9 @@ impl Gui {
     pub fn clear_radar_image(&mut self) {
         self.radar_image = None;
     }
+
+    pub fn clear_graphics_state(&mut self) {
+        self.radar_image = None;
+        self.tiles = None;
+    }
 }

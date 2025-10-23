@@ -663,6 +663,14 @@ impl ApplicationHandler for App {
         self.create_window(event_loop);
     }
 
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.old_textures.clear();
+        self.last_rendered = None;
+        self.texture_counter = 0;
+        self.gui.clear_graphics_state();
+        self.window = None;
+    }
+
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,

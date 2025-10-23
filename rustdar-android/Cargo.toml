@@ -1,0 +1,36 @@
+[package]
+name = "rustdar-android"
+version = "0.1.0"
+edition = "2024"
+
+# Android APK configuration for cargo-apk
+[package.metadata.android]
+package = "dev.mcswain.rustdar"
+label = "Rustdar Platform"
+build_targets = ["aarch64-linux-android", "armv7-linux-androideabi", "i686-linux-android", "x86_64-linux-android"]
+min_sdk_version = 26
+target_sdk_version = 34
+theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_NETWORK_STATE"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.WRITE_EXTERNAL_STORAGE"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_EXTERNAL_STORAGE"
+
+[lib]
+name = "rustdar_android"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[target.'cfg(target_os = "android")'.dependencies]
+rustdar-platform = { path = "../rustdar-platform" }
+android_logger = "0.14"
+winit = { version = "0.30.12", features = ["android-native-activity"] }
+pollster = "0.3"
+log = "0.4.28"
+# Force vendored OpenSSL for Android builds to avoid cross-compilation issues
+openssl-sys = { version = "0.9", features = ["vendored"] }

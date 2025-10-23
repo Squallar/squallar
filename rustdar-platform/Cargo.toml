@@ -34,3 +34,7 @@ web-time = "1.1.0"
 egui-winit = { version = "0.33.0", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
 env_logger = "0.11"
 wgpu = "26.0.0"
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Force vendored OpenSSL for Android builds to avoid cross-compilation issues
+openssl-sys = { version = "0.9", features = ["vendored"] }

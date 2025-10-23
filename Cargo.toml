@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "rustdar-platform",
+    "rustdar-android",
     "rustdar-egui",
     "rustdar-radar",
 ]
