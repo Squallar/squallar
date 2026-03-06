@@ -1,13 +1,85 @@
 use chrono::NaiveDateTime;
-use log;
-use nexrad_model::data::Scan;
-use std::f32::consts::PI;
+use nexrad_model::data::{DataMoment, Radial, Scan};
+use rayon::prelude::*;
+use std::f64::consts::PI;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use crate::sites::RadarSite;
 use crate::palette::get_color_for_value;
 
-const IMAGE_SIZE: usize = 1800; // 1800x1800 pixels for radar image
-const MAX_RANGE_KM: f32 = 230.0; // NEXRAD max range ~230km
+pub const IMAGE_SIZE: usize = 1800; // 1800x1800 pixels for radar image
+pub const MAX_RANGE_KM: f64 = 230.0; // NEXRAD max range ~230km
+pub const PIXELS_PER_KM: f64 = IMAGE_SIZE as f64 / (2.0 * MAX_RANGE_KM);
+
+/// Convert latitude (in radians) to Web Mercator Y coordinate.
+/// Returns a unitless value; the scale is consistent for relative comparisons.
+#[inline]
+fn lat_rad_to_mercator_y(lat_rad: f64) -> f64 {
+    (PI / 4.0 + lat_rad / 2.0).tan().ln()
+}
+
+/// Geographic bounds of the rendered radar image.
+/// The image pixels are linearly spaced in Web Mercator Y and longitude,
+/// matching the projection used by slippy-map tile providers (CartoDB, OSM).
+#[derive(Debug, Clone, Copy)]
+pub struct ImageBounds {
+    pub min_lat: f64,
+    pub max_lat: f64,
+    pub min_lon: f64,
+    pub max_lon: f64,
+    /// Mercator Y value corresponding to `min_lat` (south edge).
+    pub mercator_y_min: f64,
+    /// Mercator Y value corresponding to `max_lat` (north edge).
+    pub mercator_y_max: f64,
+}
+
+impl ImageBounds {
+    /// Compute the geographic bounds of a radar image centered on a site.
+    /// Uses `MAX_RANGE_KM` to define the image extent. The vertical axis
+    /// is mapped in Web Mercator Y so the image aligns with slippy-map tiles.
+    pub fn from_radar_site(radar_lat: f64, radar_lon: f64) -> Self {
+        let radar_lat_rad = radar_lat.to_radians();
+        let lat_deg_per_km = 1.0 / 111.32;
+        let lon_deg_per_km = 1.0 / (111.32 * radar_lat_rad.cos());
+
+        let max_lat_offset = MAX_RANGE_KM * lat_deg_per_km;
+        let max_lon_offset = MAX_RANGE_KM * lon_deg_per_km;
+
+        let min_lat = radar_lat - max_lat_offset;
+        let max_lat = radar_lat + max_lat_offset;
+
+        ImageBounds {
+            min_lat,
+            max_lat,
+            min_lon: radar_lon - max_lon_offset,
+            max_lon: radar_lon + max_lon_offset,
+            mercator_y_min: lat_rad_to_mercator_y(min_lat.to_radians()),
+            mercator_y_max: lat_rad_to_mercator_y(max_lat.to_radians()),
+        }
+    }
+
+    /// Convert geographic coordinates to image pixel coordinates.
+    /// Uses Web Mercator Y mapping for the vertical axis.
+    /// Returns `(px, py)` or `None` if outside bounds.
+    pub fn geo_to_pixel(&self, lat: f64, lon: f64) -> Option<(usize, usize)> {
+        let lon_frac = (lon - self.min_lon) / (self.max_lon - self.min_lon);
+        let merc_y = lat_rad_to_mercator_y(lat.to_radians());
+        let merc_frac = (merc_y - self.mercator_y_min) / (self.mercator_y_max - self.mercator_y_min);
+
+        if merc_frac < 0.0 || merc_frac > 1.0 || lon_frac < 0.0 || lon_frac > 1.0 {
+            return None;
+        }
+
+        let px = (lon_frac * IMAGE_SIZE as f64) as usize;
+        let py = ((1.0 - merc_frac) * IMAGE_SIZE as f64) as usize;
+
+        if px < IMAGE_SIZE && py < IMAGE_SIZE {
+            Some((px, py))
+        } else {
+            None
+        }
+    }
+}
 
 /// Information about a loaded radar scan
 #[derive(Debug, Clone)]
@@ -16,6 +88,8 @@ pub struct ScanInfo {
     pub site: RadarSite,
     /// The actual timestamp of the scan data
     pub timestamp: NaiveDateTime,
+    /// Volume Coverage Pattern number (e.g. 212, 215, 35)
+    pub vcp_number: u16,
     /// Available products in this scan
     pub available_products: Vec<RadarProduct>,
     /// Map of product to available elevation angles (sorted)
@@ -33,7 +107,6 @@ pub enum RadarProduct {
     DifferentialPhase,
     CorrelationCoefficient,
     DifferentialReflectivity,
-    ClutterFilterPower,
 }
 
 impl RadarProduct {
@@ -45,7 +118,6 @@ impl RadarProduct {
             RadarProduct::DifferentialPhase => "phi",
             RadarProduct::CorrelationCoefficient => "rho",
             RadarProduct::DifferentialReflectivity => "zdr",
-            RadarProduct::ClutterFilterPower => "cfp",
         }
     }
 
@@ -57,7 +129,6 @@ impl RadarProduct {
             RadarProduct::DifferentialPhase => "Differential Phase",
             RadarProduct::CorrelationCoefficient => "Correlation Coefficient",
             RadarProduct::DifferentialReflectivity => "Differential Reflectivity",
-            RadarProduct::ClutterFilterPower => "Clutter Filter Power",
         }
     }
 
@@ -69,185 +140,201 @@ impl RadarProduct {
             RadarProduct::DifferentialPhase,
             RadarProduct::CorrelationCoefficient,
             RadarProduct::DifferentialReflectivity,
-            RadarProduct::ClutterFilterPower,
         ]
     }
-}
 
-/// Render radar data to an RGBA image
-/// Returns (image_data, max_range_km, value_data) where:
-/// - image_data: RGBA pixel data
-/// - max_range_km: actual radar range
-/// - value_data: actual radar values at each pixel (f32::NAN for no data)
-pub fn render_radar_to_image(
-    data: &Scan,
-    elevation_angle: f32,
-    product: RadarProduct,
-) -> Option<(Vec<u8>, f32, Vec<f32>)> {
-    // Find the sweep that matches the requested elevation angle
-    let target_sweep = data.sweeps().iter().find(|sweep| {
-        sweep.radials().first()
-            .map(|r| (r.elevation_angle_degrees() - elevation_angle).abs() < 0.01)
-            .unwrap_or(false)
-    })?;
-
-    // Create RGBA image buffer (initialized to transparent)
-    let mut image = vec![0u8; IMAGE_SIZE * IMAGE_SIZE * 4];
-
-    // Create value data buffer (initialized to NaN for no data)
-    let mut value_data = vec![f32::NAN; IMAGE_SIZE * IMAGE_SIZE];
-
-    let mut actual_max_range = 0.0f32;
-
-    // Get the radials from the target sweep
-    let radials = target_sweep.radials();
-
-    // Calculate azimuth angles for all radials
-    let azimuths: Vec<f32> = radials.iter().map(|r| r.azimuth_angle_degrees()).collect();
-
-    // Calculate azimuth spacing (average angular difference between radials)
-    let mut azimuth_diffs = Vec::new();
-    for i in 1..azimuths.len() {
-        let mut diff = azimuths[i] - azimuths[i - 1];
-        // Handle wrap-around at 360/0 degrees
-        if diff < -180.0 {
-            diff += 360.0;
-        } else if diff > 180.0 {
-            diff -= 360.0;
-        }
-        azimuth_diffs.push(diff);
-    }
-    let avg_azimuth_spacing = if !azimuth_diffs.is_empty() {
-        azimuth_diffs.iter().sum::<f32>() / azimuth_diffs.len() as f32
-    } else {
-        1.0 // Default to 1 degree if can't calculate
-    };
-
-    // Process each radial (sweep angle)
-    for radial in radials.iter() {
-        let azimuth = radial.azimuth_angle_degrees(); // degrees
-
-        // Get the data moment for the selected product
-        let data_moment = match product {
+    /// Get the moment data for this product from a radial.
+    /// Centralizes the product → accessor mapping in one place.
+    pub fn get_moment<'a>(&self, radial: &'a Radial) -> Option<&'a nexrad_model::data::MomentData> {
+        match self {
             RadarProduct::Reflectivity => radial.reflectivity(),
             RadarProduct::Velocity => radial.velocity(),
             RadarProduct::SpectrumWidth => radial.spectrum_width(),
             RadarProduct::DifferentialReflectivity => radial.differential_reflectivity(),
             RadarProduct::CorrelationCoefficient => radial.correlation_coefficient(),
             RadarProduct::DifferentialPhase => radial.differential_phase(),
-            RadarProduct::ClutterFilterPower => radial.specific_differential_phase(), // Use specific_differential_phase as closest match
-        };
+        }
+    }
+}
+
+/// Render radar data to an image projected for geographic display
+/// Returns (image_data, max_range_km, value_data) where:
+/// - image_data: RGBA pixel data in geographic coordinate system
+/// - max_range_km: actual radar range
+/// - value_data: actual radar values at each pixel (f32::NAN for no data)
+pub fn render_radar_to_image(
+    data: &Scan,
+    elevation_angle: f32,
+    product: RadarProduct,
+    radar_lat: f64,
+    _radar_lon: f64,
+) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+    // Find the sweep that matches the requested elevation angle.
+    // Round the same way as load_scan_data (1 decimal place) and also verify
+    // the sweep contains data for the requested product – split-cut sweeps at
+    // the same nominal angle may carry different moment types.
+    let target_sweep = data.sweeps().iter().find(|sweep| {
+        sweep.radials().first()
+            .map(|r| {
+                let rounded = (r.elevation_angle_degrees() * 10.0).round() / 10.0;
+                (rounded - elevation_angle).abs() < 0.05 && product.get_moment(r).is_some()
+            })
+            .unwrap_or(false)
+    })?;
+
+    // Create atomic RGBA image buffer (initialized to transparent = 0)
+    let image_buf: Vec<AtomicU32> = (0..IMAGE_SIZE * IMAGE_SIZE)
+        .map(|_| AtomicU32::new(0))
+        .collect();
+
+    // Create atomic value data buffer (initialized to NaN)
+    let value_buf: Vec<AtomicU32> = (0..IMAGE_SIZE * IMAGE_SIZE)
+        .map(|_| AtomicU32::new(f32::NAN.to_bits()))
+        .collect();
+
+    // Pre-compute Web Mercator projection constants
+    let radar_lat_rad = radar_lat.to_radians();
+    let cos_radar_lat = radar_lat_rad.cos();
+    let center_px = IMAGE_SIZE as f64 / 2.0;
+
+    // Mercator Y mapping: precompute bounds and scale so pixel Y is linear in Mercator Y
+    let merc_y_top = lat_rad_to_mercator_y(radar_lat_rad + MAX_RANGE_KM / 6371.0);
+    let merc_y_bottom = lat_rad_to_mercator_y(radar_lat_rad - MAX_RANGE_KM / 6371.0);
+    let merc_y_span = merc_y_top - merc_y_bottom;
+    let merc_y_scale = IMAGE_SIZE as f64 / merc_y_span;
+
+    // Get the radials from the target sweep
+    let radials = target_sweep.radials();
+
+    // Single-pass average azimuth spacing — no Vec allocation needed
+    let mut prev_azimuth: Option<f64> = None;
+    let mut spacing_sum = 0.0f64;
+    let mut spacing_count = 0u32;
+    for radial in radials.iter() {
+        let az = radial.azimuth_angle_degrees() as f64;
+        if let Some(prev) = prev_azimuth {
+            let mut diff = az - prev;
+            if diff < -180.0 { diff += 360.0; }
+            else if diff > 180.0 { diff -= 360.0; }
+            spacing_sum += diff;
+            spacing_count += 1;
+        }
+        prev_azimuth = Some(az);
+    }
+    let avg_azimuth_spacing = if spacing_count > 0 {
+        spacing_sum / spacing_count as f64
+    } else {
+        1.0
+    };
+
+    // Compute max range from gate parameters (same for all radials in a sweep)
+    let actual_max_range = radials.iter()
+        .find_map(|radial| {
+            let moment = product.get_moment(radial)?;
+            let gate_count = moment.gate_count() as usize;
+            Some(moment.first_gate_range_km() + gate_count as f64 * moment.gate_interval_km())
+        })
+        .unwrap_or(0.0);
+
+    // Process radials in parallel — each writes to atomic buffers
+    radials.par_iter().for_each(|radial| {
+        let azimuth = radial.azimuth_angle_degrees() as f64;
+
+        let data_moment = product.get_moment(radial);
 
         if let Some(moment) = data_moment {
             let moment_values = moment.values();
-            let gate_count = moment_values.len();
-            
-            // For the new API, we need to estimate range parameters
-            // This is a simplification - in reality we'd need metadata
-            let first_gate_range = 2.125; // km, typical NEXRAD first gate
-            let gate_size = 0.25; // km, typical NEXRAD gate size
-            
-            // Calculate actual max range for this moment
-            let moment_max_range = first_gate_range + (gate_count as f32 * gate_size);
-            actual_max_range = actual_max_range.max(moment_max_range);
+            let first_gate_range = moment.first_gate_range_km();
+            let gate_size = moment.gate_interval_km();
 
-            // Process each gate (range bin)
+            let az_half_spacing = avg_azimuth_spacing / 2.0;
+            let az_start_rad = (azimuth - az_half_spacing) * PI / 180.0;
+            let az_end_rad = (azimuth + az_half_spacing) * PI / 180.0;
+            let cos_az_center = (azimuth * PI / 180.0).cos();
+
+            // Pre-compute azimuth edge sin/cos once per radial.
+            // Linear interpolation over the ~0.5° span introduces < 0.00001 error.
+            let (sin_az_start, cos_az_start) = az_start_rad.sin_cos();
+            let (sin_az_end, cos_az_end) = az_end_rad.sin_cos();
+            let sin_az_delta = sin_az_end - sin_az_start;
+            let cos_az_delta = cos_az_end - cos_az_start;
+
             for (gate_idx, moment_value) in moment_values.iter().enumerate() {
-                let range_km = first_gate_range + (gate_idx as f32 * gate_size);
-
+                let range_km = first_gate_range + (gate_idx as f64 * gate_size);
                 if range_km > MAX_RANGE_KM {
                     break;
                 }
 
-                // Extract the actual value from the MomentValue enum
                 let scaled_value = match moment_value {
                     nexrad_model::data::MomentValue::Value(v) => *v,
-                    nexrad_model::data::MomentValue::BelowThreshold => continue, // Skip no-data
-                    nexrad_model::data::MomentValue::RangeFolded => continue, // Skip range-folded
+                    _ => continue,
                 };
 
-                // Skip if no valid data
                 if scaled_value >= 999.0 || scaled_value.is_nan() {
                     continue;
                 }
 
-                // Get color for this value
                 let color = get_color_for_value(product, scaled_value);
 
-                    // Calculate azimuth edges (halfway between radials)
-                    let az_half_spacing = avg_azimuth_spacing / 2.0;
-                    let az_start = azimuth - az_half_spacing;
-                    let az_end = azimuth + az_half_spacing;
+                let range_start = range_km - (gate_size / 2.0);
+                let range_end = range_km + (gate_size / 2.0);
 
-                    // Calculate range edges (halfway between gates)
-                    let range_start = range_km - (gate_size / 2.0);
-                    let range_end = range_km + (gate_size / 2.0);
+                let num_range_samples =
+                    ((range_end - range_start) * PIXELS_PER_KM).ceil() as i32 + 2;
+                let num_az_samples = ((az_half_spacing * 2.0 * range_km * PI / 180.0)
+                    * PIXELS_PER_KM)
+                    .ceil() as i32
+                    + 2;
+                let inv_num_range = 1.0 / num_range_samples.max(1) as f64;
+                let inv_num_az = 1.0 / num_az_samples.max(1) as f64;
 
-                    // Draw filled quadrilateral for this data cell
-                    // We need to fill all pixels within the cell defined by:
-                    // - Radial edges: az_start to az_end
-                    // - Range edges: range_start to range_end
+                for r_step in 0..num_range_samples {
+                    let r = range_start + (range_end - range_start) * (r_step as f64 * inv_num_range);
 
-                    let pixels_per_km = (IMAGE_SIZE as f32) / (2.0 * MAX_RANGE_KM);
+                    let dy_center = r * cos_az_center;
+                    let dest_lat_rad = radar_lat_rad + dy_center / 6371.0;
+                    let cos_correction = cos_radar_lat / dest_lat_rad.cos();
 
-                    // Calculate the four corners of the cell in polar coordinates
-                    // Then convert each to cartesian and fill the area
-                    let az_start_rad = az_start * PI / 180.0;
-                    let az_end_rad = az_end * PI / 180.0;
+                    for az_step in 0..num_az_samples {
+                        let t = az_step as f64 * inv_num_az;
+                        let sin_az = sin_az_start + sin_az_delta * t;
+                        let cos_az = cos_az_start + cos_az_delta * t;
 
-                    // Sample multiple points along the radial to fill the cell properly
-                    let num_range_samples =
-                        ((range_end - range_start) * pixels_per_km).ceil() as i32 + 2;
-                    let num_az_samples = ((az_end - az_start).abs() * range_km * PI / 180.0
-                        * pixels_per_km)
-                        .ceil() as i32
-                        + 2;
+                        let dx_km = r * sin_az;
+                        let dy_km = r * cos_az;
+                        let px_i = (center_px + dx_km * cos_correction * PIXELS_PER_KM) as i32;
+                        // Web Mercator Y: compute destination latitude, convert to
+                        // Mercator Y, then map linearly to pixel row.
+                        let dest_lat_rad = radar_lat_rad + dy_km / 6371.0;
+                        let dest_merc_y = lat_rad_to_mercator_y(dest_lat_rad);
+                        let py_i = ((merc_y_top - dest_merc_y) * merc_y_scale) as i32;
 
-                    for r_step in 0..num_range_samples {
-                        let r_frac = r_step as f32 / num_range_samples.max(1) as f32;
-                        let r = range_start + (range_end - range_start) * r_frac;
-
-                        for az_step in 0..num_az_samples {
-                            let az_frac = az_step as f32 / num_az_samples.max(1) as f32;
-                            let az_rad = az_start_rad + (az_end_rad - az_start_rad) * az_frac;
-
-                            // Convert to cartesian
-                            let x = r * az_rad.sin();
-                            let y = -r * az_rad.cos();
-
-                            // Convert to pixel coordinates
-                            let px = ((IMAGE_SIZE as f32 / 2.0) + x * pixels_per_km) as i32;
-                            let py = ((IMAGE_SIZE as f32 / 2.0) + y * pixels_per_km) as i32;
-
-                            // Check bounds and set pixel
-                            if px >= 0
-                                && px < IMAGE_SIZE as i32
-                                && py >= 0
-                                && py < IMAGE_SIZE as i32
-                            {
-                                let pixel_idx = (py as usize * IMAGE_SIZE) + px as usize;
-                                let rgba_idx = pixel_idx * 4;
-                                if rgba_idx + 3 < image.len() {
-                                    image[rgba_idx] = color.0;
-                                    image[rgba_idx + 1] = color.1;
-                                    image[rgba_idx + 2] = color.2;
-                                    image[rgba_idx + 3] = color.3;
-
-                                    // Store the actual value at this pixel
-                                    value_data[pixel_idx] = scaled_value;
-                                }
-                            }
+                        if px_i >= 0 && px_i < IMAGE_SIZE as i32
+                            && py_i >= 0 && py_i < IMAGE_SIZE as i32
+                        {
+                            let pixel_idx = py_i as usize * IMAGE_SIZE + px_i as usize;
+                            let packed = u32::from_ne_bytes([color.0, color.1, color.2, color.3]);
+                            image_buf[pixel_idx].store(packed, Ordering::Relaxed);
+                            value_buf[pixel_idx].store(scaled_value.to_bits(), Ordering::Relaxed);
                         }
                     }
                 }
             }
-    }
+        }
+    });
 
-    // Use the calculated max range, or fall back to a default if no data was found
+    // Convert atomic buffers to final output
+    let image: Vec<u8> = image_buf.iter()
+        .flat_map(|a| a.load(Ordering::Relaxed).to_ne_bytes())
+        .collect();
+    let value_data: Vec<f32> = value_buf.iter()
+        .map(|a| f32::from_bits(a.load(Ordering::Relaxed)))
+        .collect();
+
     let max_range = if actual_max_range > 0.0 {
         actual_max_range
     } else {
-        MAX_RANGE_KM // fallback to constant
+        MAX_RANGE_KM
     };
 
     log::info!(

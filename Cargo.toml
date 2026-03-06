@@ -3,11 +3,16 @@ resolver = "2"
 members = [
     "rustdar-platform",
     "rustdar-android",
+    "rustdar-android-theme",
     "rustdar-egui",
     "rustdar-radar",
 ]
 
 [profile.dev]
+# Only optimize dependencies (not workspace code) to preserve debuggability
+strip = true
+
+[profile.dev.package."*"]
 opt-level = "s"
 
 [profile.release]

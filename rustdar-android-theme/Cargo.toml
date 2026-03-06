@@ -1,0 +1,8 @@
+[package]
+name = "rustdar-android-theme"
+version = "0.1.0"
+edition = "2024"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"

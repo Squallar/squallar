@@ -10,33 +10,31 @@ pub async fn check_latest_scan(
     site: &str,
     date: &chrono::NaiveDate,
 ) -> Result<Option<NaiveDateTime>> {
-    let metas = list_files(site, date).await;
-    let metas = metas?;
+    let metas = list_files(site, date).await?;
 
     if metas.is_empty() {
         return Ok(None);
     }
 
-    // Find the latest scan
-    let mut latest_time = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+    // Find the latest scan, using Option to avoid returning a spurious midnight time
+    let mut latest_time: Option<NaiveTime> = None;
     for m in metas.iter() {
-        let identifier_parts = m.name().split('_');
-        let identifier_time = identifier_parts.collect::<Vec<_>>()[1];
-        if let Ok(time) = NaiveTime::parse_from_str(identifier_time, "%H%M%S")
-            && time > latest_time
-        {
-            latest_time = time;
+        let Some(time_str) = m.name().split('_').nth(1) else {
+            continue;
+        };
+        if let Ok(time) = NaiveTime::parse_from_str(time_str, "%H%M%S") {
+            if latest_time.map_or(true, |lt| time > lt) {
+                latest_time = Some(time);
+            }
         }
     }
 
-    // Combine date and time
-    let latest_datetime = date.and_time(latest_time);
-    Ok(Some(latest_datetime))
+    // Only return Some if at least one filename parsed successfully
+    Ok(latest_time.map(|t| date.and_time(t)))
 }
 
 pub async fn get_scan(site: &str, timestamp: NaiveDateTime) -> Result<Scan> {
-    let metas = list_files(site, &timestamp.date()).await;
-    let metas = metas?;
+    let metas = list_files(site, &timestamp.date()).await?;
 
     if metas.is_empty() {
         return Err(std::io::Error::new(
@@ -46,60 +44,123 @@ pub async fn get_scan(site: &str, timestamp: NaiveDateTime) -> Result<Scan> {
         .into());
     }
 
-    println!("Found {} files.", metas.len());
+    log::info!("Found {} files.", metas.len());
 
-    // Find the closest scan, preferring past scans but accepting future ones
-    let mut meta = metas.first().expect("found at least one meta");
+    // Parse each filename once and find closest + latest in a single pass
+    let mut best_meta = None;
     let mut min_diff = i64::MAX;
-    let mut latest_meta = meta;
-    let mut latest_time = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+    let mut latest_meta = None;
+    let mut latest_time: Option<NaiveTime> = None;
+    let mut best_time: Option<NaiveTime> = None;
 
     for m in metas.iter() {
-        let identifier_parts = m.name().split('_');
-        let identifier_time = identifier_parts.collect::<Vec<_>>()[1];
-        let identifier_time =
-            NaiveTime::parse_from_str(identifier_time, "%H%M%S").expect("is valid time");
+        let Some(time_str) = m.name().split('_').nth(1) else {
+            continue;
+        };
+        let Ok(parsed_time) = NaiveTime::parse_from_str(time_str, "%H%M%S") else {
+            continue;
+        };
 
         // Track the latest available scan
-        if identifier_time > latest_time {
-            latest_time = identifier_time;
-            latest_meta = m;
+        if latest_time.map_or(true, |lt| parsed_time > lt) {
+            latest_time = Some(parsed_time);
+            latest_meta = Some(m);
         }
 
-        let diff = (identifier_time.signed_duration_since(timestamp.time()))
+        let diff = parsed_time
+            .signed_duration_since(timestamp.time())
             .num_seconds()
             .abs();
 
         if diff < min_diff {
             min_diff = diff;
-            meta = m;
+            best_meta = Some(m);
+            best_time = Some(parsed_time);
         }
     }
 
-    // If the closest match is in the future (user requested time is too new),
-    // use the latest available scan instead
-    let identifier_parts = meta.name().split('_');
-    let identifier_time = identifier_parts.collect::<Vec<_>>()[1];
-    let meta_time = NaiveTime::parse_from_str(identifier_time, "%H%M%S").expect("is valid time");
+    // Fall back to first meta if no filenames parsed (shouldn't happen with valid data)
+    let meta = match (best_meta, best_time) {
+        (Some(m), Some(t)) => {
+            // If the closest match is in the future and latest is in the past,
+            // use the latest available scan instead
+            if let (Some(lt), Some(lm)) = (latest_time, latest_meta) {
+                if t > timestamp.time() && lt < timestamp.time() {
+                    log::info!("Requested time is too new, using latest available scan.");
+                    lm
+                } else {
+                    m
+                }
+            } else {
+                m
+            }
+        }
+        _ => metas.first().expect("metas is non-empty"),
+    };
 
-    if meta_time > timestamp.time() && latest_time < timestamp.time() {
-        // Requested time is newer than latest available, use latest
-        meta = latest_meta;
-        println!("Requested time is too new, using latest available scan.");
-    }
-
-    println!(
+    log::info!(
         "Nearest file to {:?} is {:?}.",
         timestamp.time(),
         meta.name()
     );
 
-    println!("Downloading file \"{}\"...", meta.name());
+    log::info!("Downloading file \"{}\"...", meta.name());
     let downloaded_file = download_file(meta.clone()).await?;
 
-    println!("Data file size (bytes): {}", downloaded_file.data().len());
+    log::info!("Data file size (bytes): {}", downloaded_file.data().len());
 
     // The new API handles decompression and decoding automatically
     let scan = downloaded_file.scan()?;
     Ok(scan)
+}
+
+/// Check for the latest scan and fetch it if newer than a reference timestamp.
+/// Combines check + fetch into a single `list_files` call, avoiding the
+/// duplicate S3 LIST that happens when `check_latest_scan` + `get_scan` are
+/// called separately.
+pub async fn check_and_fetch_latest(
+    site: &str,
+    date: &chrono::NaiveDate,
+    current_timestamp: Option<NaiveDateTime>,
+) -> Result<Option<(Scan, NaiveDateTime)>> {
+    let metas = list_files(site, date).await?;
+
+    if metas.is_empty() {
+        return Ok(None);
+    }
+
+    // Find the latest scan
+    let mut latest_time: Option<NaiveTime> = None;
+    let mut latest_meta = None;
+    for m in metas.iter() {
+        let Some(time_str) = m.name().split('_').nth(1) else {
+            continue;
+        };
+        if let Ok(time) = NaiveTime::parse_from_str(time_str, "%H%M%S") {
+            if latest_time.map_or(true, |lt| time > lt) {
+                latest_time = Some(time);
+                latest_meta = Some(m);
+            }
+        }
+    }
+
+    let (latest_time, latest_meta) = match (latest_time, latest_meta) {
+        (Some(t), Some(m)) => (t, m),
+        _ => return Ok(None),
+    };
+
+    let latest_dt = date.and_time(latest_time);
+
+    // Check if we already have this scan
+    let should_fetch = current_timestamp.map_or(true, |current| latest_dt > current);
+    if !should_fetch {
+        log::info!("Already have latest scan");
+        return Ok(None);
+    }
+
+    // Download directly using the already-resolved meta (no second list_files!)
+    log::info!("Fetching newer scan: {}", latest_meta.name());
+    let downloaded_file = download_file(latest_meta.clone()).await?;
+    let scan = downloaded_file.scan()?;
+    Ok(Some((scan, latest_dt)))
 }

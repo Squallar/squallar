@@ -1253,10 +1253,16 @@ pub const RADARS: [RadarSite; 207] = [
 
 /// Get the lat/lon coordinates for a NEXRAD radar site
 pub fn get_radar_site(site: &str) -> Option<RadarSite> {
-    for radar_site in RADARS.iter() {
-        if radar_site.name == site {
-            return Some(radar_site.clone());
+    use std::collections::HashMap;
+    use std::sync::LazyLock;
+
+    static SITE_MAP: LazyLock<HashMap<&'static str, &'static RadarSite>> = LazyLock::new(|| {
+        let mut map = HashMap::with_capacity(RADARS.len());
+        for radar in RADARS.iter() {
+            map.insert(radar.name, radar);
         }
-    }
-    None
+        map
+    });
+
+    SITE_MAP.get(site).map(|s| (*s).clone())
 }

@@ -1,5 +1,7 @@
 use crate::render::RadarProduct;
 
+const TRANSPARENCY: u8 = 180;
+
 /// Get RGBA color for a radar value based on product type
 pub fn get_color_for_value(product: RadarProduct, value: f32) -> (u8, u8, u8, u8) {
     match product {
@@ -9,18 +11,12 @@ pub fn get_color_for_value(product: RadarProduct, value: f32) -> (u8, u8, u8, u8
         RadarProduct::DifferentialReflectivity => zdr_color(value),
         RadarProduct::CorrelationCoefficient => rho_color(value),
         RadarProduct::DifferentialPhase => phi_color(value),
-        RadarProduct::ClutterFilterPower => cfp_color(value),
     }
 }
 
 /// Reflectivity color scale (dBZ)
 /// Range: 0-95 dBZ with proper meteorological color scale
 fn reflectivity_color(dbz: f32) -> (u8, u8, u8, u8) {
-    // Log some values to debug the color mapping
-    if dbz > 100.0 || dbz < -10.0 {
-        log::debug!("Unusual reflectivity value: {:.2} dBZ", dbz);
-    }
-
     // Handle invalid values
     if dbz.is_nan() || dbz.is_infinite() {
         return (0, 0, 0, 0); // Transparent
@@ -97,7 +93,7 @@ fn reflectivity_color(dbz: f32) -> (u8, u8, u8, u8) {
         (255, 255, 255)
     };
 
-    (r, g, b, 200) // More opaque for better visibility
+    (r, g, b, TRANSPARENCY)
 }
 
 /// Velocity color scale (m/s)
@@ -158,7 +154,7 @@ fn velocity_color(velocity_ms: f32) -> (u8, u8, u8, u8) {
         (r, g, b)
     };
 
-    (r, g, b, 200)
+    (r, g, b, TRANSPARENCY)
 }
 
 /// Spectrum width color scale (m/s)
@@ -181,7 +177,7 @@ fn spectrum_width_color(sw: f32) -> (u8, u8, u8, u8) {
         (150, 0, 0) // Dark red (high turbulence)
     };
 
-    (r, g, b, 180)
+    (r, g, b, TRANSPARENCY)
 }
 
 /// Differential reflectivity color scale (dB)
@@ -200,7 +196,7 @@ fn zdr_color(zdr: f32) -> (u8, u8, u8, u8) {
         (255, 0, 0) // Red
     };
 
-    (r, g, b, 180)
+    (r, g, b, TRANSPARENCY)
 }
 
 /// Correlation coefficient color scale (0-1)
@@ -221,12 +217,12 @@ fn rho_color(rho: f32) -> (u8, u8, u8, u8) {
         (0, 150, 0) // Dark green (high correlation - pure rain)
     };
 
-    (r, g, b, 180)
+    (r, g, b, TRANSPARENCY)
 }
 
 /// Differential phase color scale (degrees)
 fn phi_color(phi: f32) -> (u8, u8, u8, u8) {
-    let normalized = ((phi % 360.0) + 360.0) % 360.0;
+    let normalized = phi.rem_euclid(360.0);
 
     let (r, g, b) = if normalized < 60.0 {
         (255, 0, 0) // Red
@@ -242,24 +238,5 @@ fn phi_color(phi: f32) -> (u8, u8, u8, u8) {
         (255, 0, 255) // Magenta
     };
 
-    (r, g, b, 180)
-}
-
-/// Clutter filter power color scale (dB)
-fn cfp_color(cfp: f32) -> (u8, u8, u8, u8) {
-    let (r, g, b) = if cfp < -30.0 {
-        (0, 0, 100) // Dark blue
-    } else if cfp < -20.0 {
-        (0, 100, 255) // Blue
-    } else if cfp < -10.0 {
-        (0, 255, 255) // Cyan
-    } else if cfp < 0.0 {
-        (0, 255, 0) // Green
-    } else if cfp < 10.0 {
-        (255, 255, 0) // Yellow
-    } else {
-        (255, 0, 0) // Red
-    };
-
-    (r, g, b, 180)
+    (r, g, b, TRANSPARENCY)
 }

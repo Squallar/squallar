@@ -1,15 +1,13 @@
-use std::collections::HashSet;
-use winit::event::{ElementState, Event, KeyEvent, WindowEvent};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::event::{ElementState, WindowEvent};
+use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 
-/// Type alias for a set of keyboard keys
-type KeySet = HashSet<KeyCode>;
-
-/// A simple input handler to replace winit_input_helper
+/// A simple input handler for keyboard events.
+/// Tracks keys pressed this frame (no held-key tracking needed).
+/// Handles Escape on desktop and the Android back button (GoBack).
 #[derive(Default)]
 pub struct InputHandler {
-    keys_pressed: KeySet,
-    keys_held: KeySet,
+    escape_pressed: bool,
+    back_pressed: bool,
 }
 
 impl InputHandler {
@@ -19,36 +17,30 @@ impl InputHandler {
 
     /// Clear per-frame input state. Should be called once at the start of each frame.
     pub fn clear_frame_state(&mut self) {
-        self.keys_pressed.clear();
+        self.escape_pressed = false;
+        self.back_pressed = false;
     }
 
-    /// Process a single input event.
+    /// Process a single window event for input handling.
+    /// Accepts `&WindowEvent` directly to avoid cloning the entire event.
     /// Returns true if the event was an input-related event that was handled.
-    pub fn process_event<T>(&mut self, event: &Event<T>) -> bool {
+    pub fn process_event(&mut self, event: &WindowEvent) -> bool {
         match event {
-            Event::WindowEvent {
-                event:
-                    WindowEvent::KeyboardInput {
-                        event:
-                            KeyEvent {
-                                physical_key: PhysicalKey::Code(keycode),
-                                state,
-                                ..
-                            },
-                        ..
-                    },
-                ..
-            } => {
-                match state {
-                    ElementState::Pressed => {
-                        if !self.keys_held.contains(keycode) {
-                            self.keys_pressed.insert(*keycode);
-                        }
-                        self.keys_held.insert(*keycode);
+            WindowEvent::KeyboardInput {
+                event: key_event, ..
+            } if key_event.state == ElementState::Pressed => {
+                // Check physical key for Escape
+                if let PhysicalKey::Code(keycode) = key_event.physical_key {
+                    if keycode == KeyCode::Escape {
+                        self.escape_pressed = true;
                     }
-                    ElementState::Released => {
-                        self.keys_held.remove(keycode);
+                }
+                // Check logical key for Android back button and browser back
+                match &key_event.logical_key {
+                    Key::Named(NamedKey::GoBack | NamedKey::BrowserBack) => {
+                        self.back_pressed = true;
                     }
+                    _ => {}
                 }
                 true
             }
@@ -58,6 +50,14 @@ impl InputHandler {
 
     /// Check if a key was just pressed this frame
     pub fn key_pressed(&self, keycode: KeyCode) -> bool {
-        self.keys_pressed.contains(&keycode)
+        match keycode {
+            KeyCode::Escape => self.escape_pressed,
+            _ => false,
+        }
+    }
+
+    /// Check if the Android back button was pressed this frame
+    pub fn back_pressed(&self) -> bool {
+        self.back_pressed
     }
 }

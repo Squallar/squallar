@@ -20,19 +20,15 @@ rustdar-egui = { path = "../rustdar-egui" }
 rustdar-radar = { path = "../rustdar-radar" }
 bytemuck = { version = "1.23.2", features = ["derive"] }
 chrono = "0.4.42"
-clap = { version = "4.5.48", features = ["derive"] }
 egui = "0.33.0"
 egui-wgpu = { version = "0.33.0", features = ["winit"] }
 log = "0.4.28"
-nexrad-data = { version = "0.2.0", features = ["aws"] }
-nexrad-model = "0.1.0"
-nexrad-decode = "0.1.1"
+nexrad-data = { version = "=1.0.0-rc.5", features = ["aws"] }
+nexrad-model = "=1.0.0-rc.2"
+nexrad-decode = "=1.0.0-rc.3"
 pollster = "0.3"
-serde_json = "1.0.145"
 tokio = { version = "1.42.0", features = ["rt", "rt-multi-thread"] }
-walkers = "0.18"
 winit = "0.30.12"
-web-time = "1.1.0"
 egui-winit = { version = "0.33.0", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
 env_logger = "0.11"
 wgpu = "26.0.0"
@@ -40,3 +36,9 @@ wgpu = "26.0.0"
 [target.'cfg(target_os = "android")'.dependencies]
 # Force vendored OpenSSL for Android builds to avoid cross-compilation issues
 openssl-sys = { version = "0.9", features = ["vendored"] }
+# Android theme detection
+rustdar-android-theme = { path = "../rustdar-android-theme" }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+# Cross-platform theme detection for desktop platforms
+dark-light = "2.0"

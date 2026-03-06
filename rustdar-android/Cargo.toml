@@ -12,6 +12,13 @@ min_sdk_version = 26
 target_sdk_version = 34
 theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
 
+# Handle configuration changes (orientation, screen size, fold/unfold, etc.) in-app
+# instead of letting Android destroy and recreate the activity. Without this,
+# unfolding a Z Fold triggers a full activity relaunch that deadlocks the native
+# event loop and causes an ANR.
+[package.metadata.android.application.activity]
+config_changes = "orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|density|uiMode"
+
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"
 [[package.metadata.android.uses_permission]]
@@ -20,6 +27,10 @@ name = "android.permission.ACCESS_NETWORK_STATE"
 name = "android.permission.WRITE_EXTERNAL_STORAGE"
 [[package.metadata.android.uses_permission]]
 name = "android.permission.READ_EXTERNAL_STORAGE"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_FINE_LOCATION"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_COARSE_LOCATION"
 
 [lib]
 name = "rustdar_android"
@@ -32,5 +43,8 @@ android_logger = "0.14"
 winit = { version = "0.30.12", features = ["android-native-activity"] }
 pollster = "0.3"
 log = "0.4.28"
+jni = "0.21"
+ndk-context = "0.1"
+rustls-platform-verifier = "0.6"
 # Force vendored OpenSSL for Android builds to avoid cross-compilation issues
 openssl-sys = { version = "0.9", features = ["vendored"] }

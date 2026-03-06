@@ -3,15 +3,13 @@ name = "rustdar-radar"
 version = "0.1.0"
 edition = "2024"
 
-[lib]
-crate-type = ["staticlib", "cdylib", "rlib"]
-
 [dependencies]
 chrono = "0.4.42"
 log = "0.4.28"
-nexrad-data = { version = "0.2.0", features = ["aws"] }
-nexrad-model = "0.1.0"
-nexrad-decode = "0.1.1"
+nexrad-data = { version = "=1.0.0-rc.5", features = ["aws"] }
+nexrad-model = "=1.0.0-rc.2"
+nexrad-decode = "=1.0.0-rc.3"
+rayon = "1.10"
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Force vendored OpenSSL for Android builds to avoid cross-compilation issues
