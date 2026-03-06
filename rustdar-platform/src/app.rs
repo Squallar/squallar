@@ -26,6 +26,7 @@ use rustdar_radar::render::{
 };
 use rustdar_radar::scan;
 use rustdar_radar::sites::get_radar_site;
+use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
 use std::collections::HashMap;
 
 use chrono::NaiveDateTime;
@@ -36,6 +37,9 @@ type ScanResult = (u64, Result<(Scan, String, NaiveDateTime), String>);
 
 /// Result from background radar rendering: (image_data, max_range_km, value_data, product, elevation, generation)
 type RenderResult = (Vec<u8>, f64, Vec<f32>, RadarProduct, f32, u64);
+
+/// Result from a background SPC outlook fetch
+type OutlookResult = (OutlookDay, OutlookProduct, Result<SpcOutlook, String>);
 
 pub struct App {
     instance: wgpu::Instance,
@@ -77,6 +81,11 @@ pub struct App {
     exit_requested: bool,
     // Shared Tokio runtime for all async network requests
     tokio_runtime: tokio::runtime::Runtime,
+    // Shared HTTP client for overlay data fetches (SPC, etc.)
+    http_client: reqwest::Client,
+    // Channel for SPC outlook fetch results
+    outlook_receiver: Receiver<OutlookResult>,
+    outlook_sender: Sender<OutlookResult>,
     // Channel to receive GPS location updates (Android only)
     #[cfg(target_os = "android")]
     location_receiver: Option<std::sync::mpsc::Receiver<(f64, f64)>>,
@@ -101,6 +110,7 @@ impl App {
         let input = InputHandler::new();
         let (scan_sender, scan_receiver) = std::sync::mpsc::channel();
         let (render_result_sender, render_result_receiver) = std::sync::mpsc::channel();
+        let (outlook_sender, outlook_receiver) = std::sync::mpsc::channel();
 
         // Setup theme monitoring (Android only — desktop uses WindowEvent::ThemeChanged)
         #[cfg(target_os = "android")]
@@ -114,6 +124,11 @@ impl App {
 
         let tokio_runtime = tokio::runtime::Runtime::new()
             .expect("Failed to create Tokio runtime");
+
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
 
         Self {
             instance,
@@ -138,6 +153,9 @@ impl App {
             #[cfg(target_os = "android")]
             theme_receiver,
             exit_requested: false,
+            http_client,
+            outlook_sender,
+            outlook_receiver,
             tokio_runtime,
             #[cfg(target_os = "android")]
             location_receiver: None,
@@ -383,6 +401,26 @@ impl App {
                         self.gui.set_loading_site(None);
                     }
                 }
+            }
+        }
+
+        // Check for received SPC outlook data
+        {
+            let mut any_received = false;
+            while let Ok((day, product, result)) = self.outlook_receiver.try_recv() {
+                any_received = true;
+                match result {
+                    Ok(outlook) => {
+                        log::info!("Received SPC outlook: {:?} {:?}", day, product);
+                        self.gui.set_spc_outlook(day, product, outlook);
+                    }
+                    Err(e) => {
+                        log::error!("SPC outlook fetch failed ({:?} {:?}): {}", day, product, e);
+                    }
+                }
+            }
+            if any_received {
+                self.gui.set_spc_fetching(false);
             }
         }
 
@@ -777,6 +815,38 @@ impl App {
             }
             GuiAction::Exit => {
                 self.request_exit(event_loop);
+            }
+            GuiAction::FetchSpcOutlook { day, products } => {
+                log::info!("Fetching SPC outlooks for {:?}: {:?}", day, products);
+                self.gui.set_spc_fetching(true);
+                let client = self.http_client.clone();
+                let sender = self.outlook_sender.clone();
+                let window = self.window.clone();
+                for product in products {
+                    let client = client.clone();
+                    let sender = sender.clone();
+                    let window = window.clone();
+                    self.tokio_runtime.spawn(async move {
+                        let result =
+                            rustdar_overlays::spc::fetch::fetch_outlook(&client, day, product)
+                                .await
+                                .map_err(|e| format!("{e}"));
+                        let _ = sender.send((day, product, result));
+                        if let Some(w) = window {
+                            w.request_redraw();
+                        }
+                    });
+                }
+            }
+            GuiAction::RefreshSpcOutlooks => {
+                let day = self.gui.layers().spc_day;
+                let products = self.gui.layers().enabled_spc_products();
+                if !products.is_empty() {
+                    self.handle_gui_action(
+                        GuiAction::FetchSpcOutlook { day, products },
+                        event_loop,
+                    );
+                }
             }
         }
     }

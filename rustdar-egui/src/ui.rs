@@ -1,10 +1,15 @@
 use crate::actions::{GuiAction, RadarConfig};
+use crate::hatch::draw_hatch;
+use crate::layers::{LayerKind, LayerManager};
 use chrono::Timelike;
 use egui::Context;
+use std::collections::HashMap;
 use std::sync::Arc;
 use walkers::{HttpTiles, MapMemory, Texture, Tiles, sources::{TileSource, Attribution}, TileId};
 use rustdar_radar::render::{ImageBounds, RadarProduct, ScanInfo, IMAGE_SIZE, MAX_RANGE_KM};
 use rustdar_radar::sites::RADARS;
+use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
+use rustdar_overlays::types::HatchPattern;
 
 // ---------------------------------------------------------------------------
 // Double-tap-drag zoom gesture detector (Android touch devices)
@@ -213,10 +218,7 @@ pub struct Gui {
     hover_value: Option<String>,
     // Cache the last hover screen position to skip recomputation when pointer hasn't moved
     last_hover_pos: Option<egui::Pos2>,
-    // Site display settings
-    show_radar_sites: bool,
     // City / road label overlay
-    show_city_labels: bool,
     label_tiles_light: Option<HttpTiles>,
     label_tiles_dark: Option<HttpTiles>,
     // Track which site is currently loading
@@ -227,6 +229,17 @@ pub struct Gui {
     poll_interval_secs: u64,
     // User's GPS location for blue dot indicator (lat, lon)
     user_location: Option<(f64, f64)>,
+    // Layer management (replaces individual show_* booleans)
+    layers: LayerManager,
+    // SPC convective outlook data cache
+    spc_outlooks: HashMap<(OutlookDay, OutlookProduct), SpcOutlook>,
+    // Track when each SPC product was last fetched
+    spc_fetch_times: HashMap<(OutlookDay, OutlookProduct), std::time::Instant>,
+    // Whether an SPC fetch is currently in flight
+    spc_fetching: bool,
+    // Whether the mobile slide-out menu is open (Android only)
+    #[cfg(target_os = "android")]
+    show_mobile_menu: bool,
     // Double-tap-drag zoom gesture detector (Android only)
     #[cfg(target_os = "android")]
     double_tap_detector: DoubleTapDragDetector,
@@ -275,14 +288,18 @@ impl Gui {
             cached_image_bounds: None,
             hover_value: None,
             last_hover_pos: None,
-            show_radar_sites: false,
-            show_city_labels: true,
             label_tiles_light: None,
             label_tiles_dark: None,
             loading_site: None,
             show_time_dialog: false,
             poll_interval_secs: 60,
             user_location: None,
+            layers: LayerManager::new(),
+            spc_outlooks: HashMap::new(),
+            spc_fetch_times: HashMap::new(),
+            spc_fetching: false,
+            #[cfg(target_os = "android")]
+            show_mobile_menu: false,
             #[cfg(target_os = "android")]
             double_tap_detector: DoubleTapDragDetector::default(),
             #[cfg(target_os = "android")]
@@ -371,8 +388,8 @@ impl Gui {
                 });
 
                 ui.menu_button("View", |ui| {
-                    ui.checkbox(&mut self.show_radar_sites, "Show radar sites");
-                    ui.checkbox(&mut self.show_city_labels, "Show city labels");
+                    ui.checkbox(self.layers.enabled_mut(LayerKind::RadarSites), "Show radar sites");
+                    ui.checkbox(self.layers.enabled_mut(LayerKind::CityLabels), "Show city labels");
                     ui.separator();
                     if ui.button("Time...").clicked() {
                         self.show_time_dialog = true;
@@ -437,88 +454,6 @@ impl Gui {
         }
         
         action
-    }
-
-    #[cfg(not(target_os = "android"))]
-    fn render_radar_display_panel(&mut self, ctx: &Context) {
-        egui::SidePanel::right("radar_display_panel")
-            .default_width(200.0)
-            .show(ctx, |ui| {
-                ui.heading("Display");
-                ui.separator();
-
-                if let Some(scan_info) = &self.scan_info {
-                    // Product selector
-                    ui.label("Product:");
-
-                    let prev_product = self.selected_product;
-
-                    egui::ComboBox::from_id_salt("product_selector")
-                        .selected_text(self.selected_product.name())
-                        .show_ui(ui, |ui| {
-                            for product in &scan_info.available_products {
-                                ui.selectable_value(
-                                    &mut self.selected_product,
-                                    *product,
-                                    product.name(),
-                                );
-                            }
-                        });
-
-                    // Reset elevation if product changed
-                    if prev_product != self.selected_product {
-                        self.selected_elevation = 0.0;
-                    }
-
-                    ui.add_space(10.0);
-
-                    // Elevation selector - shows elevations for the selected product
-                    ui.label("Elevation:");
-
-                    if let Some(elevations) =
-                        scan_info.product_elevations.get(&self.selected_product)
-                    {
-                        if !elevations.is_empty() {
-                            // Resolve stored angle to nearest valid elevation
-                            let selected_angle = elevations.iter()
-                                .min_by(|a, b| {
-                                    ((**a - self.selected_elevation).abs())
-                                        .partial_cmp(&((**b - self.selected_elevation).abs()))
-                                        .unwrap()
-                                })
-                                .copied()
-                                .unwrap_or(0.0);
-
-                            egui::ComboBox::from_id_salt("elevation_selector")
-                                .selected_text(format!("{:.1}°", selected_angle))
-                                .show_ui(ui, |ui| {
-                                    for angle in elevations.iter() {
-                                        ui.selectable_value(
-                                            &mut self.selected_elevation,
-                                            *angle,
-                                            format!("{:.1}°", angle),
-                                        );
-                                    }
-                                });
-
-                            ui.add_space(10.0);
-                            ui.separator();
-                            ui.label(format!("VCP {}", scan_info.vcp_number));
-                            ui.label(format!("Showing: {}", self.selected_product.name()));
-                            ui.label(format!("Elevation: {:.1}°", selected_angle));
-                            ui.label(format!("{} tilts available", elevations.len()));
-                        } else {
-                            ui.label("No elevations available for this product");
-                        }
-                    } else {
-                        ui.label("Product not available in scan");
-                    }
-                } else {
-                    ui.label("No scan loaded");
-                    ui.separator();
-                    ui.label("Load a radar scan to view products.");
-                }
-            });
     }
 
     #[cfg(not(target_os = "android"))]
@@ -625,7 +560,8 @@ impl Gui {
         }
 
         // Lazily initialize label-only tiles for city/road name overlay.
-        if self.show_city_labels {
+        let show_city_labels = self.layers.is_enabled(LayerKind::CityLabels);
+        if show_city_labels {
             if is_dark_theme && self.label_tiles_dark.is_none() {
                 self.label_tiles_dark = Some(HttpTiles::new(CartoDb::dark_labels(), ctx.to_owned()));
             } else if !is_dark_theme && self.label_tiles_light.is_none() {
@@ -635,8 +571,8 @@ impl Gui {
 
         // Take label tiles out of self to avoid borrow conflicts in the
         // map closure (they are put back after the closure returns).
-        let took_dark_labels = self.show_city_labels && is_dark_theme;
-        let took_light_labels = self.show_city_labels && !is_dark_theme;
+        let took_dark_labels = show_city_labels && is_dark_theme;
+        let took_light_labels = show_city_labels && !is_dark_theme;
         let mut label_tiles: Option<HttpTiles> = if took_dark_labels {
             self.label_tiles_dark.take()
         } else if took_light_labels {
@@ -694,7 +630,17 @@ impl Gui {
                             egui::DragPanButtons::PRIMARY
                         })
                         .show(ui, |ui, projector, memory| {
+                            // Draw SPC outlook polygons (below radar)
+                            draw_spc_overlays(
+                                ui,
+                                projector,
+                                &self.layers,
+                                &self.spc_outlooks,
+                                self.current_theme_is_dark,
+                            );
+
                             // Overlay radar data if available
+                            if self.layers.is_enabled(LayerKind::Radar) {
                             if let Some((ref texture, lat, lon, _max_range_km, ref value_data)) =
                                 radar_image
                             {
@@ -809,6 +755,7 @@ impl Gui {
                                     egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(150, 150, 150, 80)),
                                 );
                             }
+                            } // end if radar layer enabled
 
                             // Draw label-only tiles on top of the radar overlay
                             if let Some(ref mut ltiles) = label_tiles {
@@ -816,7 +763,7 @@ impl Gui {
                             }
 
                             // Draw radar site icons on the topmost layer
-                            if self.show_radar_sites {
+                            if self.layers.is_enabled(LayerKind::RadarSites) {
                                 for radar_site in &RADARS {
                                     let site_position = walkers::lat_lon(radar_site.lat, radar_site.lon);
                                     let site_screen = projector.project(site_position).to_pos2();
@@ -953,6 +900,160 @@ impl Gui {
         actions
     }
 
+    /// Render the layers panel on the left side (desktop).
+    #[cfg(not(target_os = "android"))]
+    fn render_layers_panel(&mut self, ctx: &Context) -> Vec<GuiAction> {
+        let mut actions = Vec::new();
+        let day = self.layers.spc_day;
+
+        egui::SidePanel::left("layers_panel")
+            .default_width(170.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.heading("Layers");
+                ui.separator();
+
+                // --- Radar layer ---
+                ui.checkbox(self.layers.enabled_mut(LayerKind::Radar), "🛰  Radar");
+
+                if self.layers.is_enabled(LayerKind::Radar) {
+                    ui.indent("radar_controls", |ui| {
+                        if let Some(scan_info) = &self.scan_info {
+                            // Product selector
+                            let prev_product = self.selected_product;
+                            egui::ComboBox::from_id_salt("layer_product_selector")
+                                .selected_text(self.selected_product.name())
+                                .width(120.0)
+                                .show_ui(ui, |ui| {
+                                    for product in &scan_info.available_products {
+                                        ui.selectable_value(
+                                            &mut self.selected_product,
+                                            *product,
+                                            product.name(),
+                                        );
+                                    }
+                                });
+                            if prev_product != self.selected_product {
+                                self.selected_elevation = 0.0;
+                            }
+
+                            // Elevation selector
+                            if let Some(elevations) =
+                                scan_info.product_elevations.get(&self.selected_product)
+                            {
+                                if !elevations.is_empty() {
+                                    let selected_angle = elevations
+                                        .iter()
+                                        .min_by(|a, b| {
+                                            ((**a - self.selected_elevation).abs())
+                                                .partial_cmp(
+                                                    &((**b - self.selected_elevation).abs()),
+                                                )
+                                                .unwrap()
+                                        })
+                                        .copied()
+                                        .unwrap_or(0.0);
+
+                                    egui::ComboBox::from_id_salt("layer_elevation_selector")
+                                        .selected_text(format!("{:.1}°", selected_angle))
+                                        .width(120.0)
+                                        .show_ui(ui, |ui| {
+                                            for angle in elevations.iter() {
+                                                ui.selectable_value(
+                                                    &mut self.selected_elevation,
+                                                    *angle,
+                                                    format!("{:.1}°", angle),
+                                                );
+                                            }
+                                        });
+                                }
+                            }
+                        } else {
+                            ui.label("No scan loaded");
+                        }
+                    });
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+
+                // --- SPC Outlooks section ---
+                ui.label("⛈  SPC Outlooks");
+
+                // Day selector
+                ui.horizontal(|ui| {
+                    ui.label("Day:");
+                    let mut changed = false;
+                    let mut new_day = self.layers.spc_day;
+                    if ui.selectable_label(new_day == OutlookDay::Day1, "1").clicked() {
+                        new_day = OutlookDay::Day1;
+                        changed = true;
+                    }
+                    if ui.selectable_label(new_day == OutlookDay::Day2, "2").clicked() {
+                        new_day = OutlookDay::Day2;
+                        changed = true;
+                    }
+                    if ui.selectable_label(new_day == OutlookDay::Day3, "3").clicked() {
+                        new_day = OutlookDay::Day3;
+                        changed = true;
+                    }
+                    if changed {
+                        self.layers.spc_day = new_day;
+                        // Fetch data for the new day if any SPC layers are enabled
+                        let products = self.layers.enabled_spc_products();
+                        if !products.is_empty() {
+                            actions.push(GuiAction::FetchSpcOutlook {
+                                day: new_day,
+                                products,
+                            });
+                        }
+                    }
+                });
+
+                // Product toggles (depends on selected day)
+                let spc_layers = self.layers.spc_layers_for_day();
+                for layer in &spc_layers {
+                    let was_enabled = self.layers.is_enabled(*layer);
+                    ui.checkbox(self.layers.enabled_mut(*layer), layer.display_name());
+                    let is_enabled = self.layers.is_enabled(*layer);
+
+                    // If just toggled on and we don't have data, fetch it
+                    if is_enabled && !was_enabled {
+                        if let Some(product) = layer.to_outlook_product() {
+                            if !self.spc_outlooks.contains_key(&(day, product)) {
+                                actions.push(GuiAction::FetchSpcOutlook {
+                                    day,
+                                    products: vec![product],
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Refresh button
+                if self.layers.any_spc_enabled() {
+                    ui.horizontal(|ui| {
+                        let refresh_enabled = !self.spc_fetching;
+                        if ui.add_enabled(refresh_enabled, egui::Button::new("🔄 Refresh")).clicked() {
+                            actions.push(GuiAction::RefreshSpcOutlooks);
+                        }
+                        if self.spc_fetching {
+                            ui.spinner();
+                        }
+                    });
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+
+                // --- Other overlays ---
+                ui.checkbox(self.layers.enabled_mut(LayerKind::CityLabels), "🏷  City Labels");
+                ui.checkbox(self.layers.enabled_mut(LayerKind::RadarSites), "📡  Radar Sites");
+            });
+
+        actions
+    }
+
     /// Get the selected product and elevation for rendering
     pub fn get_rendering_params(&self) -> Option<(RadarProduct, f32)> {
         self.scan_info.as_ref().and_then(|scan_info| {
@@ -1003,6 +1104,27 @@ impl Gui {
 
     pub fn set_user_location(&mut self, lat: f64, lon: f64) {
         self.user_location = Some((lat, lon));
+    }
+
+    /// Store a fetched SPC outlook in the cache.
+    pub fn set_spc_outlook(&mut self, day: OutlookDay, product: OutlookProduct, outlook: SpcOutlook) {
+        self.spc_outlooks.insert((day, product), outlook);
+        self.spc_fetch_times.insert((day, product), std::time::Instant::now());
+    }
+
+    /// Set whether an SPC fetch is currently in progress.
+    pub fn set_spc_fetching(&mut self, fetching: bool) {
+        self.spc_fetching = fetching;
+    }
+
+    /// Get the layer manager (immutable).
+    pub fn layers(&self) -> &LayerManager {
+        &self.layers
+    }
+
+    /// Get the layer manager (mutable).
+    pub fn layers_mut(&mut self) -> &mut LayerManager {
+        &mut self.layers
     }
 
     /// Get the current scan info
@@ -1074,8 +1196,9 @@ impl Gui {
             actions.push(a);
         }
 
-        // Right panel for radar display controls
-        self.render_radar_display_panel(ctx);
+        // Left panel for layer controls (replaces old right radar display panel)
+        let layer_actions = self.render_layers_panel(ctx);
+        actions.extend(layer_actions);
 
         // Map in central panel
         let map_actions = self.render_map(ctx);
@@ -1094,12 +1217,44 @@ impl Gui {
             actions.push(a);
         }
 
-        // Bottom toolbar for mobile controls
-        self.render_mobile_bottom_toolbar(ctx);
+        // Collapsible layers panel
+        let layer_actions = self.render_mobile_layers_panel(ctx);
+        actions.extend(layer_actions);
 
         // Map in central panel
         let map_actions = self.render_map(ctx);
         actions.extend(map_actions);
+
+        // Floating hamburger button to open the menu (drawn last so it's on top)
+        if !self.show_mobile_menu {
+            let top_inset = self.safe_area_insets.0;
+            let btn_rect = egui::Rect::from_min_size(
+                egui::pos2(12.0, 48.0 + top_inset),
+                egui::vec2(48.0, 48.0),
+            );
+            let response = ctx.input(|i| i.pointer.any_click()
+                && i.pointer.interact_pos().map_or(false, |p| btn_rect.contains(p)));
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("mobile_hamburger"),
+            ));
+            let bg_color = if ctx.style().visuals.dark_mode {
+                egui::Color32::from_rgba_unmultiplied(40, 40, 40, 220)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(240, 240, 240, 230)
+            };
+            painter.rect_filled(btn_rect, 8.0, bg_color);
+            painter.text(
+                btn_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "☰",
+                egui::FontId::proportional(26.0),
+                ctx.style().visuals.text_color(),
+            );
+            if response {
+                self.show_mobile_menu = true;
+            }
+        }
     }
 
     #[cfg(target_os = "android")]
@@ -1158,116 +1313,207 @@ impl Gui {
         action
     }
 
+    /// Collapsible layers/controls panel for mobile (replaces bottom toolbar).
     #[cfg(target_os = "android")]
-    fn render_mobile_bottom_toolbar(&mut self, ctx: &egui::Context) {
-        let bottom_inset = self.safe_area_insets.1;
-        egui::TopBottomPanel::bottom("mobile_toolbar")
-            .min_height(80.0 + bottom_inset)
-            .show_separator_line(true)
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.spacing_mut().item_spacing.x = 12.0;
-                    let button_size = egui::vec2(60.0, 60.0);
-                    
-                    // Product selector
-                    let product_text = if self.scan_info.is_some() {
-                        match self.selected_product {
-                            RadarProduct::Reflectivity => "📊\nREF",
-                            RadarProduct::Velocity => "🌪\nVEL", 
-                            RadarProduct::SpectrumWidth => "📈\nSW",
-                            RadarProduct::DifferentialReflectivity => "📋\nZDR",
-                            RadarProduct::CorrelationCoefficient => "🔗\nCC",
-                            RadarProduct::DifferentialPhase => "🔄\nPDP",
+    fn render_mobile_layers_panel(&mut self, ctx: &egui::Context) -> Vec<GuiAction> {
+        let mut actions = Vec::new();
+        if !self.show_mobile_menu {
+            return actions;
+        }
 
+        let top_inset = self.safe_area_insets.0;
+        let bottom_inset = self.safe_area_insets.1;
+        let day = self.layers.spc_day;
+
+        egui::SidePanel::left("mobile_layers_panel")
+            .default_width(260.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                // Safe-area top padding
+                if top_inset > 0.0 {
+                    ui.add_space(top_inset);
+                }
+
+                // Header with close button
+                ui.horizontal(|ui| {
+                    ui.heading("Layers");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("✕").clicked() {
+                            self.show_mobile_menu = false;
                         }
-                    } else {
-                        "📊\n---"
-                    };
-                    
-                    if ui.add_sized(button_size, egui::Button::new(product_text)).clicked() {
-                        if let Some(scan_info) = &self.scan_info {
-                            // Cycle through available products
-                            let current_idx = scan_info.available_products
-                                .iter()
-                                .position(|p| *p == self.selected_product)
-                                .unwrap_or(0);
-                            let next_idx = (current_idx + 1) % scan_info.available_products.len();
-                            if let Some(next_product) = scan_info.available_products.get(next_idx) {
-                                self.selected_product = *next_product;
-                                self.selected_elevation = 0.0; // Reset elevation when changing product
+                    });
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    // ── Radar ──
+                    ui.checkbox(self.layers.enabled_mut(LayerKind::Radar), "🛰  Radar");
+
+                    if self.layers.is_enabled(LayerKind::Radar) {
+                        ui.indent("m_radar_controls", |ui| {
+                            if let Some(scan_info) = &self.scan_info {
+                                let prev_product = self.selected_product;
+                                egui::ComboBox::from_id_salt("m_product_sel")
+                                    .selected_text(self.selected_product.name())
+                                    .width(180.0)
+                                    .show_ui(ui, |ui| {
+                                        for product in &scan_info.available_products {
+                                            ui.selectable_value(
+                                                &mut self.selected_product,
+                                                *product,
+                                                product.name(),
+                                            );
+                                        }
+                                    });
+                                if prev_product != self.selected_product {
+                                    self.selected_elevation = 0.0;
+                                }
+
+                                if let Some(elevations) =
+                                    scan_info.product_elevations.get(&self.selected_product)
+                                {
+                                    if !elevations.is_empty() {
+                                        let selected_angle = elevations
+                                            .iter()
+                                            .min_by(|a, b| {
+                                                ((**a - self.selected_elevation).abs())
+                                                    .partial_cmp(
+                                                        &((**b - self.selected_elevation).abs()),
+                                                    )
+                                                    .unwrap()
+                                            })
+                                            .copied()
+                                            .unwrap_or(0.0);
+
+                                        egui::ComboBox::from_id_salt("m_elev_sel")
+                                            .selected_text(format!("{:.1}°", selected_angle))
+                                            .width(180.0)
+                                            .show_ui(ui, |ui| {
+                                                for angle in elevations.iter() {
+                                                    ui.selectable_value(
+                                                        &mut self.selected_elevation,
+                                                        *angle,
+                                                        format!("{:.1}°", angle),
+                                                    );
+                                                }
+                                            });
+                                    }
+                                }
+                            } else {
+                                ui.label("No scan loaded");
                             }
-                        }
+                        });
                     }
 
-                    // Elevation/Tilt selector
-                    let elevation_text = if let Some(scan_info) = &self.scan_info {
-                        if let Some(elevations) = scan_info.product_elevations.get(&self.selected_product) {
-                            if let Some(angle) = elevations.iter()
-                                .min_by(|a, b| ((**a - self.selected_elevation).abs()).partial_cmp(&((**b - self.selected_elevation).abs())).unwrap())
-                            {
-                                format!("📐\n{:.1}°", angle)
-                            } else {
-                                "📐\n---".to_string()
+                    ui.add_space(6.0);
+                    ui.separator();
+
+                    // ── SPC Outlooks ──
+                    ui.label("⛈  SPC Outlooks");
+
+                    ui.horizontal(|ui| {
+                        ui.label("Day:");
+                        let mut changed = false;
+                        let mut new_day = self.layers.spc_day;
+                        for (d, label) in [
+                            (OutlookDay::Day1, "1"),
+                            (OutlookDay::Day2, "2"),
+                            (OutlookDay::Day3, "3"),
+                        ] {
+                            if ui.selectable_label(new_day == d, label).clicked() {
+                                new_day = d;
+                                changed = true;
                             }
-                        } else {
-                            "📐\n---".to_string()
                         }
-                    } else {
-                        "📐\n---".to_string()
-                    };
-                    
-                    if ui.add_sized(button_size, egui::Button::new(elevation_text)).clicked() {
-                        if let Some(scan_info) = &self.scan_info {
-                            if let Some(elevations) = scan_info.product_elevations.get(&self.selected_product) {
-                                if !elevations.is_empty() {
-                                    // Find current index by nearest match, cycle to next
-                                    let idx = elevations.iter()
-                                        .enumerate()
-                                        .min_by(|(_, a), (_, b)| {
-                                            ((**a - self.selected_elevation).abs())
-                                                .partial_cmp(&((**b - self.selected_elevation).abs()))
-                                                .unwrap()
-                                        })
-                                        .map(|(i, _)| i)
-                                        .unwrap_or(0);
-                                    self.selected_elevation = elevations[(idx + 1) % elevations.len()];
+                        if changed {
+                            self.layers.spc_day = new_day;
+                            let products = self.layers.enabled_spc_products();
+                            if !products.is_empty() {
+                                actions.push(GuiAction::FetchSpcOutlook {
+                                    day: new_day,
+                                    products,
+                                });
+                            }
+                        }
+                    });
+
+                    let spc_layers = self.layers.spc_layers_for_day();
+                    for layer in &spc_layers {
+                        let was_enabled = self.layers.is_enabled(*layer);
+                        ui.checkbox(self.layers.enabled_mut(*layer), layer.display_name());
+                        let is_enabled = self.layers.is_enabled(*layer);
+                        if is_enabled && !was_enabled {
+                            if let Some(product) = layer.to_outlook_product() {
+                                if !self.spc_outlooks.contains_key(&(day, product)) {
+                                    actions.push(GuiAction::FetchSpcOutlook {
+                                        day,
+                                        products: vec![product],
+                                    });
                                 }
                             }
                         }
                     }
 
-                    // Radar sites toggle
-                    let sites_text = if self.show_radar_sites {
-                        "🗺\nON"
-                    } else {
-                        "🗺\nOFF"
-                    };
-                    
-                    if ui.add_sized(button_size, egui::Button::new(sites_text)).clicked() {
-                        self.show_radar_sites = !self.show_radar_sites;
+                    if self.layers.any_spc_enabled() {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!self.spc_fetching, egui::Button::new("🔄 Refresh"))
+                                .clicked()
+                            {
+                                actions.push(GuiAction::RefreshSpcOutlooks);
+                            }
+                            if self.spc_fetching {
+                                ui.spinner();
+                            }
+                        });
                     }
 
-                    // Time navigation
-                    if ui.add_sized(button_size, egui::Button::new("🕐\nTIME")).clicked() {
+                    ui.add_space(6.0);
+                    ui.separator();
+
+                    // ── Other overlays ──
+                    ui.checkbox(self.layers.enabled_mut(LayerKind::CityLabels), "🏷  City Labels");
+                    ui.checkbox(self.layers.enabled_mut(LayerKind::RadarSites), "📡  Radar Sites");
+
+                    ui.add_space(10.0);
+                    ui.separator();
+
+                    // ── Controls ──
+                    ui.label("⚙  Controls");
+                    ui.add_space(4.0);
+
+                    // Refresh
+                    if ui
+                        .add_enabled(!self.fetching, egui::Button::new("🔄  Refresh Radar"))
+                        .clicked()
+                    {
+                        actions.push(GuiAction::FetchRadarScan(self.radar_config.clone()));
+                    }
+
+                    // Time
+                    if ui.button("🕐  Set Time...").clicked() {
                         self.show_time_dialog = true;
+                        self.show_mobile_menu = false; // close menu so dialog is visible
                     }
 
-                    // Auto-poll toggle
-                    let poll_text = if self.auto_poll_enabled {
-                        "⏰\nAUTO"
-                    } else {
-                        "⏸\nOFF"
-                    };
-                    
-                    if ui.add_sized(button_size, egui::Button::new(poll_text)).clicked() {
-                        self.auto_poll_enabled = !self.auto_poll_enabled;
+                    // Auto-poll
+                    ui.checkbox(&mut self.auto_poll_enabled, "⏰  Auto-poll");
+
+                    if self.fetching {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Loading...");
+                        });
                     }
                 });
-                // Add spacing at the bottom to avoid the navigation bar
+
+                // Safe-area bottom padding
                 if bottom_inset > 0.0 {
                     ui.add_space(bottom_inset);
                 }
             });
+
+        actions
     }
 }
 
@@ -1303,6 +1549,140 @@ fn tile_to_lat(y: u32, zoom: u8) -> f64 {
         .sinh()
         .atan()
         .to_degrees()
+}
+
+/// Draw SPC convective outlook polygons on the map.
+///
+/// This is a free function (not a method on `Gui`) to avoid capturing the
+/// entire `self` struct inside the map closure, which would conflict with
+/// disjoint field borrows required by Rust's borrow checker.
+fn draw_spc_overlays(
+    ui: &egui::Ui,
+    projector: &walkers::Projector,
+    layers: &crate::layers::LayerManager,
+    spc_outlooks: &HashMap<(OutlookDay, OutlookProduct), SpcOutlook>,
+    current_theme_is_dark: bool,
+) {
+    let screen_rect = ui.max_rect();
+    let day = layers.spc_day;
+
+    // Iterate through enabled SPC layers
+    for layer_kind in layers.spc_layers_for_day() {
+        if !layers.is_enabled(layer_kind) {
+            continue;
+        }
+        let Some(product) = layer_kind.to_outlook_product() else {
+            continue;
+        };
+        let Some(outlook) = spc_outlooks.get(&(day, product)) else {
+            continue;
+        };
+
+        // Draw features from lowest risk to highest (features are ordered low→high in GeoJSON)
+        for feature in &outlook.features {
+            for polygon in &feature.polygons {
+                if polygon.is_empty() {
+                    continue;
+                }
+                // Use exterior ring (first ring)
+                let exterior = &polygon[0];
+                if exterior.len() < 3 {
+                    continue;
+                }
+
+// Strip the GeoJSON closing duplicate (last == first)
+                    // since PathShape { closed: true } already closes the ring.
+                    // Keeping it causes degenerate edges that fold the polygon.
+                    let ring = if exterior.len() > 3
+                        && exterior.first() == exterior.last()
+                    {
+                        &exterior[..exterior.len() - 1]
+                    } else {
+                        exterior.as_slice()
+                    };
+
+                    // Project to screen coordinates
+                    let screen_pts: Vec<egui::Pos2> = ring
+                    .iter()
+                    .map(|&(lat, lon)| {
+                        projector
+                            .project(walkers::lat_lon(lat, lon))
+                            .to_pos2()
+                    })
+                    .collect();
+
+                // Quick AABB visibility check
+                let mut min_x = f32::MAX;
+                let mut min_y = f32::MAX;
+                let mut max_x = f32::MIN;
+                let mut max_y = f32::MIN;
+                for pt in &screen_pts {
+                    min_x = min_x.min(pt.x);
+                    min_y = min_y.min(pt.y);
+                    max_x = max_x.max(pt.x);
+                    max_y = max_y.max(pt.y);
+                }
+                let poly_rect = egui::Rect::from_min_max(
+                    egui::pos2(min_x, min_y),
+                    egui::pos2(max_x, max_y),
+                );
+                if !screen_rect.intersects(poly_rect) {
+                    continue;
+                }
+
+                // Draw filled polygon using ear-clipping triangulation.
+                // egui's PathShape uses a centroid triangle-fan which only works
+                // for convex shapes; SPC polygons are deeply concave.
+                let [r, g, b, a] = feature.fill_rgba;
+                let fill = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+                let [sr, sg, sb, sa] = feature.stroke_rgba;
+                let stroke_color = egui::Color32::from_rgba_unmultiplied(sr, sg, sb, sa);
+
+                // Flatten screen points into [x0, y0, x1, y1, ...] for earcutr
+                let coords: Vec<f64> = screen_pts
+                    .iter()
+                    .flat_map(|p| [p.x as f64, p.y as f64])
+                    .collect();
+                let tri_indices = earcutr::earcut(&coords, &[], 2).unwrap_or_default();
+                if !tri_indices.is_empty() {
+                    let mut mesh = egui::Mesh::default();
+                    for pt in &screen_pts {
+                        mesh.vertices.push(egui::epaint::Vertex {
+                            pos: *pt,
+                            uv: egui::epaint::WHITE_UV,
+                            color: fill,
+                        });
+                    }
+                    for idx in tri_indices {
+                        mesh.indices.push(idx as u32);
+                    }
+                    ui.painter().add(egui::Shape::mesh(mesh));
+                }
+
+                // Draw stroke outline separately (PathShape handles this fine)
+                if sa > 0 {
+                    let outline = egui::epaint::PathShape {
+                        points: screen_pts.clone(),
+                        closed: true,
+                        fill: egui::Color32::TRANSPARENT,
+                        stroke: egui::epaint::PathStroke::new(1.5, stroke_color),
+                    };
+                    ui.painter().add(egui::Shape::Path(outline));
+                }
+
+                // Draw CIG hatching if applicable
+                if feature.hatch != HatchPattern::None {
+                    draw_hatch(
+                        ui.painter(),
+                        &screen_pts,
+                        feature.hatch,
+                        screen_rect,
+                        current_theme_is_dark,
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Draw label-only map tiles on top of the radar overlay.

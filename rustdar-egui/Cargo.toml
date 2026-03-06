@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 rustdar-radar = { path = "../rustdar-radar" }
+rustdar-overlays = { path = "../rustdar-overlays" }
 chrono = "0.4.42"
+earcutr = "0.4"
 egui = "0.33.0"
 walkers = "0.47.0"

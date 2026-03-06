@@ -1,4 +1,5 @@
 use rustdar_radar::render::ScanInfo;
+use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct};
 use chrono::NaiveDateTime;
 
 /// Configuration for radar site and time selection
@@ -30,6 +31,13 @@ pub enum GuiAction {
     CheckForNewScans(RadarConfig),
     SetScanInfo(ScanInfo),
     SwitchRadarSite(String), // Switch to a different radar site
+    /// Fetch SPC outlook product(s) for the given day.
+    FetchSpcOutlook {
+        day: OutlookDay,
+        products: Vec<OutlookProduct>,
+    },
+    /// Re-fetch all currently enabled SPC outlook layers.
+    RefreshSpcOutlooks,
 }
 
 impl std::fmt::Display for GuiAction {
@@ -51,6 +59,12 @@ impl std::fmt::Display for GuiAction {
             }
             GuiAction::SwitchRadarSite(site) => {
                 write!(f, "Switch to radar site {}", site)
+            }
+            GuiAction::FetchSpcOutlook { day, products } => {
+                write!(f, "Fetch SPC {} outlook ({} products)", day, products.len())
+            }
+            GuiAction::RefreshSpcOutlooks => {
+                write!(f, "Refresh SPC outlooks")
             }
         }
     }

@@ -6,6 +6,7 @@ members = [
     "rustdar-android-theme",
     "rustdar-egui",
     "rustdar-radar",
+    "rustdar-overlays",
 ]
 
 [profile.dev]
