@@ -1013,21 +1013,15 @@ impl Gui {
                 ui.label("⛈  SPC Outlooks");
 
                 // Day selector
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Day:");
                     let mut changed = false;
                     let mut new_day = self.layers.spc_day;
-                    if ui.selectable_label(new_day == OutlookDay::Day1, "1").clicked() {
-                        new_day = OutlookDay::Day1;
-                        changed = true;
-                    }
-                    if ui.selectable_label(new_day == OutlookDay::Day2, "2").clicked() {
-                        new_day = OutlookDay::Day2;
-                        changed = true;
-                    }
-                    if ui.selectable_label(new_day == OutlookDay::Day3, "3").clicked() {
-                        new_day = OutlookDay::Day3;
-                        changed = true;
+                    for &d in OutlookDay::all() {
+                        if ui.selectable_label(new_day == d, d.label()).clicked() {
+                            new_day = d;
+                            changed = true;
+                        }
                     }
                     if changed {
                         self.layers.spc_day = new_day;
@@ -1606,16 +1600,12 @@ impl Gui {
                     // ── SPC Outlooks ──
                     ui.label("⛈  SPC Outlooks");
 
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("Day:");
                         let mut changed = false;
                         let mut new_day = self.layers.spc_day;
-                        for (d, label) in [
-                            (OutlookDay::Day1, "1"),
-                            (OutlookDay::Day2, "2"),
-                            (OutlookDay::Day3, "3"),
-                        ] {
-                            if ui.selectable_label(new_day == d, label).clicked() {
+                        for &d in OutlookDay::all() {
+                            if ui.selectable_label(new_day == d, d.label()).clicked() {
                                 new_day = d;
                                 changed = true;
                             }

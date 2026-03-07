@@ -7,6 +7,53 @@ pub enum OutlookDay {
     Day1,
     Day2,
     Day3,
+    Day4,
+    Day5,
+    Day6,
+    Day7,
+    Day8,
+}
+
+impl OutlookDay {
+    /// Returns all outlook day variants.
+    pub fn all() -> &'static [OutlookDay] {
+        &[
+            OutlookDay::Day1,
+            OutlookDay::Day2,
+            OutlookDay::Day3,
+            OutlookDay::Day4,
+            OutlookDay::Day5,
+            OutlookDay::Day6,
+            OutlookDay::Day7,
+            OutlookDay::Day8,
+        ]
+    }
+
+    /// Short label ("1", "2", … "8") for UI display.
+    pub fn label(self) -> &'static str {
+        match self {
+            OutlookDay::Day1 => "1",
+            OutlookDay::Day2 => "2",
+            OutlookDay::Day3 => "3",
+            OutlookDay::Day4 => "4",
+            OutlookDay::Day5 => "5",
+            OutlookDay::Day6 => "6",
+            OutlookDay::Day7 => "7",
+            OutlookDay::Day8 => "8",
+        }
+    }
+
+    /// Whether this is an extended-range day (4-8).
+    pub fn is_extended(self) -> bool {
+        matches!(
+            self,
+            OutlookDay::Day4
+                | OutlookDay::Day5
+                | OutlookDay::Day6
+                | OutlookDay::Day7
+                | OutlookDay::Day8
+        )
+    }
 }
 
 impl std::fmt::Display for OutlookDay {
@@ -15,6 +62,11 @@ impl std::fmt::Display for OutlookDay {
             OutlookDay::Day1 => write!(f, "Day 1"),
             OutlookDay::Day2 => write!(f, "Day 2"),
             OutlookDay::Day3 => write!(f, "Day 3"),
+            OutlookDay::Day4 => write!(f, "Day 4"),
+            OutlookDay::Day5 => write!(f, "Day 5"),
+            OutlookDay::Day6 => write!(f, "Day 6"),
+            OutlookDay::Day7 => write!(f, "Day 7"),
+            OutlookDay::Day8 => write!(f, "Day 8"),
         }
     }
 }
@@ -54,18 +106,35 @@ pub struct SpcOutlook {
 
 /// Build the SPC GeoJSON URL for the given day and product.
 pub fn outlook_url(day: OutlookDay, product: OutlookProduct) -> String {
+    // Days 4-8 use a separate extended-range endpoint
+    if day.is_extended() {
+        let n = match day {
+            OutlookDay::Day4 => 4,
+            OutlookDay::Day5 => 5,
+            OutlookDay::Day6 => 6,
+            OutlookDay::Day7 => 7,
+            OutlookDay::Day8 => 8,
+            _ => unreachable!(),
+        };
+        return format!(
+            "https://www.spc.noaa.gov/products/exper/day4-8/day{}prob.lyr.geojson",
+            n
+        );
+    }
+
     let day_str = match day {
         OutlookDay::Day1 => "day1otlk",
         OutlookDay::Day2 => "day2otlk",
         OutlookDay::Day3 => "day3otlk",
+        _ => unreachable!(),
     };
 
     let product_str = match (day, product) {
         (_, OutlookProduct::Categorical) => "_cat",
-        (OutlookDay::Day1, OutlookProduct::Tornado) => "_torn",
-        (OutlookDay::Day1, OutlookProduct::Wind) => "_wind",
-        (OutlookDay::Day1, OutlookProduct::Hail) => "_hail",
-        // Day 2 and 3 use combined probabilistic endpoint
+        (OutlookDay::Day1 | OutlookDay::Day2, OutlookProduct::Tornado) => "_torn",
+        (OutlookDay::Day1 | OutlookDay::Day2, OutlookProduct::Wind) => "_wind",
+        (OutlookDay::Day1 | OutlookDay::Day2, OutlookProduct::Hail) => "_hail",
+        // Day 3 uses combined probabilistic endpoint for all hazard types
         (_, OutlookProduct::Tornado)
         | (_, OutlookProduct::Wind)
         | (_, OutlookProduct::Hail)
@@ -180,6 +249,20 @@ pub fn parse_geojson(
         let polygons = match geo_type {
             "MultiPolygon" => parse_multi_polygon(geometry)?,
             "Polygon" => vec![parse_polygon(geometry)?],
+            "GeometryCollection" => {
+                // Days 4-8 emit an empty GeometryCollection when there are no
+                // areas drawn (e.g. "Predictability Too Low"). Skip gracefully.
+                let geometries = geometry
+                    .get("geometries")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                if geometries == 0 {
+                    continue;
+                }
+                log::warn!("Non-empty GeometryCollection not supported, skipping");
+                continue;
+            }
             other => {
                 log::warn!("Skipping unsupported geometry type: {}", other);
                 continue;

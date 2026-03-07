@@ -187,19 +187,24 @@ impl LayerManager {
     }
 
     /// Return the SPC-relevant `LayerKind` variants for the current day.
-    /// Day 1 has separate tornado/wind/hail; Day 2/3 use combined probabilistic.
+    /// Day 1-2 have separate tornado/wind/hail; Day 3 uses combined probabilistic;
+    /// Days 4-8 only have a single probabilistic product.
     pub fn spc_layers_for_day(&self) -> Vec<LayerKind> {
+        if self.spc_day.is_extended() {
+            return vec![LayerKind::SpcProbabilistic];
+        }
         match self.spc_day {
-            OutlookDay::Day1 => vec![
+            OutlookDay::Day1 | OutlookDay::Day2 => vec![
                 LayerKind::SpcCategorical,
                 LayerKind::SpcTornado,
                 LayerKind::SpcWind,
                 LayerKind::SpcHail,
             ],
-            OutlookDay::Day2 | OutlookDay::Day3 => vec![
+            OutlookDay::Day3 => vec![
                 LayerKind::SpcCategorical,
                 LayerKind::SpcProbabilistic,
             ],
+            _ => unreachable!(),
         }
     }
 }

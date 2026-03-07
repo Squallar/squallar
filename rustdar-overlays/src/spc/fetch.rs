@@ -53,20 +53,21 @@ pub async fn fetch_all_for_day(
 
 /// Which products are available for a given day.
 pub fn available_products(day: OutlookDay) -> Vec<OutlookProduct> {
+    if day.is_extended() {
+        // Days 4-8: single "any severe" probabilistic product
+        return vec![OutlookProduct::Probabilistic];
+    }
     match day {
-        OutlookDay::Day1 => vec![
+        OutlookDay::Day1 | OutlookDay::Day2 => vec![
             OutlookProduct::Categorical,
             OutlookProduct::Tornado,
             OutlookProduct::Wind,
             OutlookProduct::Hail,
         ],
-        OutlookDay::Day2 => vec![
-            OutlookProduct::Categorical,
-            OutlookProduct::Probabilistic,
-        ],
         OutlookDay::Day3 => vec![
             OutlookProduct::Categorical,
             OutlookProduct::Probabilistic,
         ],
+        _ => unreachable!(),
     }
 }
