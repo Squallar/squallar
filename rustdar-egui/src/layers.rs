@@ -1,3 +1,4 @@
+use rustdar_overlays::nws::alert::AlertCategory;
 use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct};
 
 /// Identifies each toggleable overlay layer.
@@ -9,6 +10,9 @@ pub enum LayerKind {
     SpcWind,
     SpcHail,
     SpcProbabilistic,
+    NwsWarnings,
+    NwsWatches,
+    NwsAdvisories,
     CityLabels,
     RadarSites,
 }
@@ -23,6 +27,9 @@ impl LayerKind {
             LayerKind::SpcWind => "Wind",
             LayerKind::SpcHail => "Hail",
             LayerKind::SpcProbabilistic => "Probabilistic",
+            LayerKind::NwsWarnings => "Warnings",
+            LayerKind::NwsWatches => "Watches",
+            LayerKind::NwsAdvisories => "Advisories",
             LayerKind::CityLabels => "City Labels",
             LayerKind::RadarSites => "Radar Sites",
         }
@@ -38,6 +45,24 @@ impl LayerKind {
                 | LayerKind::SpcHail
                 | LayerKind::SpcProbabilistic
         )
+    }
+
+    /// Whether this layer is an NWS alerts layer.
+    pub fn is_nws(self) -> bool {
+        matches!(
+            self,
+            LayerKind::NwsWarnings | LayerKind::NwsWatches | LayerKind::NwsAdvisories
+        )
+    }
+
+    /// Convert to the corresponding `AlertCategory`, if this is an NWS layer.
+    pub fn to_alert_category(self) -> Option<AlertCategory> {
+        match self {
+            LayerKind::NwsWarnings => Some(AlertCategory::Warning),
+            LayerKind::NwsWatches => Some(AlertCategory::Watch),
+            LayerKind::NwsAdvisories => Some(AlertCategory::Advisory),
+            _ => None,
+        }
     }
 
     /// Convert to the corresponding `OutlookProduct`, if this is an SPC layer.
@@ -93,6 +118,9 @@ impl LayerManager {
         layers.insert(LayerKind::SpcWind, LayerState::new(false));
         layers.insert(LayerKind::SpcHail, LayerState::new(false));
         layers.insert(LayerKind::SpcProbabilistic, LayerState::new(false));
+        layers.insert(LayerKind::NwsWatches, LayerState::new(true));
+        layers.insert(LayerKind::NwsAdvisories, LayerState::new(true));
+        layers.insert(LayerKind::NwsWarnings, LayerState::new(true));
         layers.insert(LayerKind::CityLabels, LayerState::new(true));
         layers.insert(LayerKind::RadarSites, LayerState::new(false));
 
@@ -139,6 +167,22 @@ impl LayerManager {
             .iter()
             .filter(|(kind, state)| kind.is_spc() && state.enabled)
             .filter_map(|(kind, _)| kind.to_outlook_product())
+            .collect()
+    }
+
+    /// Returns true if any NWS alerts layer is enabled.
+    pub fn any_nws_enabled(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|(kind, state)| kind.is_nws() && state.enabled)
+    }
+
+    /// Get all currently enabled NWS alert categories.
+    pub fn enabled_nws_categories(&self) -> Vec<AlertCategory> {
+        self.layers
+            .iter()
+            .filter(|(kind, state)| kind.is_nws() && state.enabled)
+            .filter_map(|(kind, _)| kind.to_alert_category())
             .collect()
     }
 

@@ -9,6 +9,7 @@ use walkers::{HttpTiles, MapMemory, Texture, Tiles, sources::{TileSource, Attrib
 use rustdar_radar::render::{ImageBounds, RadarProduct, ScanInfo, IMAGE_SIZE, MAX_RANGE_KM};
 use rustdar_radar::sites::RADARS;
 use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
+use rustdar_overlays::nws::alert::NwsAlert;
 use rustdar_overlays::types::HatchPattern;
 
 // ---------------------------------------------------------------------------
@@ -237,6 +238,12 @@ pub struct Gui {
     spc_fetch_times: HashMap<(OutlookDay, OutlookProduct), std::time::Instant>,
     // Whether an SPC fetch is currently in flight
     spc_fetching: bool,
+    // NWS weather alerts state
+    nws_alerts: Vec<NwsAlert>,
+    nws_fetch_time: Option<std::time::Instant>,
+    nws_fetching: bool,
+    /// Index of the currently selected alert for detail popup.
+    selected_alert: Option<usize>,
     // Whether the mobile slide-out menu is open (Android only)
     #[cfg(target_os = "android")]
     show_mobile_menu: bool,
@@ -298,6 +305,10 @@ impl Gui {
             spc_outlooks: HashMap::new(),
             spc_fetch_times: HashMap::new(),
             spc_fetching: false,
+            nws_alerts: Vec::new(),
+            nws_fetch_time: None,
+            nws_fetching: false,
+            selected_alert: None,
             #[cfg(target_os = "android")]
             show_mobile_menu: false,
             #[cfg(target_os = "android")]
@@ -339,6 +350,16 @@ impl Gui {
 
             // Reset timer to avoid spamming checks
             self.last_fetch_time = Some(std::time::Instant::now());
+        }
+
+        // Auto-refresh NWS alerts every 2 minutes when any NWS layer is enabled
+        if self.layers.any_nws_enabled()
+            && !self.nws_fetching
+            && self
+                .nws_fetch_time
+                .map_or(true, |t| t.elapsed().as_secs() >= 120)
+        {
+            actions.push(GuiAction::FetchNwsAlerts);
         }
 
         #[cfg(target_os = "android")]
@@ -757,6 +778,17 @@ impl Gui {
                             }
                             } // end if radar layer enabled
 
+                            // Draw NWS alert polygons on top of radar, below labels
+                            let clicked_alert = draw_nws_alerts(
+                                ui,
+                                projector,
+                                &self.layers,
+                                &self.nws_alerts,
+                            );
+                            if let Some(idx) = clicked_alert {
+                                self.selected_alert = Some(idx);
+                            }
+
                             // Draw label-only tiles on top of the radar overlay
                             if let Some(ref mut ltiles) = label_tiles {
                                 draw_label_tiles_overlay(ui, projector, memory.zoom(), ltiles);
@@ -1046,6 +1078,53 @@ impl Gui {
                 ui.add_space(6.0);
                 ui.separator();
 
+                // --- NWS Alerts section ---
+                ui.label("⚠  NWS Alerts");
+
+                let nws_layers = [LayerKind::NwsWarnings, LayerKind::NwsWatches, LayerKind::NwsAdvisories];
+                for layer in &nws_layers {
+                    let was_enabled = self.layers.is_enabled(*layer);
+                    ui.checkbox(self.layers.enabled_mut(*layer), layer.display_name());
+                    let is_enabled = self.layers.is_enabled(*layer);
+
+                    // If just toggled on and we have no alerts cached, fetch them
+                    if is_enabled && !was_enabled && self.nws_alerts.is_empty() && !self.nws_fetching {
+                        actions.push(GuiAction::FetchNwsAlerts);
+                    }
+                }
+
+                if self.layers.any_nws_enabled() {
+                    ui.horizontal(|ui| {
+                        let refresh_enabled = !self.nws_fetching;
+                        if ui.add_enabled(refresh_enabled, egui::Button::new("🔄 Refresh")).clicked() {
+                            actions.push(GuiAction::RefreshNwsAlerts);
+                        }
+                        if self.nws_fetching {
+                            ui.spinner();
+                        }
+                    });
+                    // Show alert count and last-updated time
+                    if !self.nws_alerts.is_empty() {
+                        let categories = self.layers.enabled_nws_categories();
+                        let visible_count = self.nws_alerts.iter()
+                            .filter(|a| categories.contains(&a.category))
+                            .count();
+                        ui.label(format!("{} alerts shown", visible_count));
+                    }
+                    if let Some(t) = self.nws_fetch_time {
+                        let secs_ago = t.elapsed().as_secs();
+                        let label = if secs_ago < 60 {
+                            format!("Updated {}s ago", secs_ago)
+                        } else {
+                            format!("Updated {}m ago", secs_ago / 60)
+                        };
+                        ui.label(egui::RichText::new(label).small().weak());
+                    }
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+
                 // --- Other overlays ---
                 ui.checkbox(self.layers.enabled_mut(LayerKind::CityLabels), "🏷  City Labels");
                 ui.checkbox(self.layers.enabled_mut(LayerKind::RadarSites), "📡  Radar Sites");
@@ -1117,6 +1196,17 @@ impl Gui {
         self.spc_fetching = fetching;
     }
 
+    /// Store fetched NWS alerts, replacing the previous set.
+    pub fn set_nws_alerts(&mut self, alerts: Vec<NwsAlert>) {
+        self.nws_alerts = alerts;
+        self.nws_fetch_time = Some(std::time::Instant::now());
+    }
+
+    /// Set whether an NWS alerts fetch is currently in progress.
+    pub fn set_nws_fetching(&mut self, fetching: bool) {
+        self.nws_fetching = fetching;
+    }
+
     /// Get the layer manager (immutable).
     pub fn layers(&self) -> &LayerManager {
         &self.layers
@@ -1163,7 +1253,7 @@ impl Gui {
 
     /// Whether auto-poll is active and the event loop should keep waking
     pub fn is_auto_poll_active(&self) -> bool {
-        self.auto_poll_enabled && self.initial_fetch_done
+        (self.auto_poll_enabled && self.initial_fetch_done) || self.layers.any_nws_enabled()
     }
 
     pub fn clear_graphics_state(&mut self) {
@@ -1175,6 +1265,105 @@ impl Gui {
         self.loading_site = None;
         // Reset theme tracking to force tile recreation on next render
         self.current_theme_is_dark = !self.current_theme_is_dark;
+    }
+
+    /// Render the NWS alert detail popup when an alert is selected.
+    fn render_alert_popup(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.selected_alert else {
+            return;
+        };
+        let Some(alert) = self.nws_alerts.get(idx) else {
+            self.selected_alert = None;
+            return;
+        };
+
+        // Clone data needed for the popup to avoid borrowing issues
+        let event = alert.event.clone();
+        let headline = alert.headline.clone();
+        let area_desc = alert.area_desc.clone();
+        let sender_name = alert.sender_name.clone();
+        let effective = alert.effective.clone();
+        let expires = alert.expires.clone();
+        let description = alert.description.clone();
+        let instruction = alert.instruction.clone();
+        let [r, g, b, _] = alert.features.first()
+            .map(|f| f.stroke_rgba)
+            .unwrap_or([200, 200, 200, 255]);
+        let accent = egui::Color32::from_rgb(r, g, b);
+
+        let mut open = true;
+        let screen = ctx.input(|i| i.viewport_rect());
+        let is_mobile = cfg!(target_os = "android");
+        let popup_width = if is_mobile {
+            (screen.width() - 32.0).max(200.0)
+        } else {
+            380.0
+        };
+        let popup_max_height = if is_mobile {
+            (screen.height() - 80.0).max(200.0)
+        } else {
+            500.0
+        };
+
+        egui::Window::new(egui::RichText::new(&event).color(accent).strong())
+            .id(egui::Id::new("nws_alert_popup"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(!is_mobile)
+            .default_width(popup_width)
+            .max_width(popup_width)
+            .max_height(popup_max_height)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                // Headline
+                if let Some(headline) = &headline {
+                    ui.label(egui::RichText::new(headline).strong().size(if is_mobile { 13.0 } else { 14.0 }));
+                    ui.add_space(4.0);
+                }
+
+                // Metadata grid — wrap long text for mobile
+                egui::Grid::new("alert_meta").num_columns(2).show(ui, |ui| {
+                    ui.label(egui::RichText::new("Areas:").strong());
+                    ui.add(egui::Label::new(&area_desc).wrap());
+                    ui.end_row();
+
+                    ui.label(egui::RichText::new("Issued by:").strong());
+                    ui.add(egui::Label::new(&sender_name).wrap());
+                    ui.end_row();
+
+                    ui.label(egui::RichText::new("Effective:").strong());
+                    ui.label(format_iso_time(&effective));
+                    ui.end_row();
+
+                    ui.label(egui::RichText::new("Expires:").strong());
+                    ui.label(format_iso_time(&expires));
+                    ui.end_row();
+                });
+
+                ui.separator();
+
+                // Description (scrollable)
+                egui::ScrollArea::vertical()
+                    .max_height(250.0)
+                    .show(ui, |ui| {
+                        ui.label(&description);
+                    });
+
+                // Instruction (emphasized)
+                if let Some(instruction) = &instruction {
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(instruction)
+                            .strong()
+                            .color(accent),
+                    );
+                }
+            });
+
+        if !open {
+            self.selected_alert = None;
+        }
     }
 
     #[cfg(not(target_os = "android"))]
@@ -1203,6 +1392,9 @@ impl Gui {
         // Map in central panel
         let map_actions = self.render_map(ctx);
         actions.extend(map_actions);
+
+        // NWS alert detail popup (rendered after map so it floats on top)
+        self.render_alert_popup(ctx);
     }
 
     #[cfg(target_os = "android")]
@@ -1224,6 +1416,9 @@ impl Gui {
         // Map in central panel
         let map_actions = self.render_map(ctx);
         actions.extend(map_actions);
+
+        // NWS alert detail popup (rendered after map so it floats on top)
+        self.render_alert_popup(ctx);
 
         // Floating hamburger button to open the menu (drawn last so it's on top)
         if !self.show_mobile_menu {
@@ -1471,6 +1666,43 @@ impl Gui {
                     ui.add_space(6.0);
                     ui.separator();
 
+                    // ── NWS Alerts ──
+                    ui.label("⚠  NWS Alerts");
+
+                    let nws_layers = [LayerKind::NwsWarnings, LayerKind::NwsWatches, LayerKind::NwsAdvisories];
+                    for layer in &nws_layers {
+                        let was_enabled = self.layers.is_enabled(*layer);
+                        ui.checkbox(self.layers.enabled_mut(*layer), layer.display_name());
+                        let is_enabled = self.layers.is_enabled(*layer);
+                        if is_enabled && !was_enabled && self.nws_alerts.is_empty() && !self.nws_fetching {
+                            actions.push(GuiAction::FetchNwsAlerts);
+                        }
+                    }
+
+                    if self.layers.any_nws_enabled() {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!self.nws_fetching, egui::Button::new("🔄 Refresh"))
+                                .clicked()
+                            {
+                                actions.push(GuiAction::RefreshNwsAlerts);
+                            }
+                            if self.nws_fetching {
+                                ui.spinner();
+                            }
+                        });
+                        if !self.nws_alerts.is_empty() {
+                            let categories = self.layers.enabled_nws_categories();
+                            let visible_count = self.nws_alerts.iter()
+                                .filter(|a| categories.contains(&a.category))
+                                .count();
+                            ui.label(format!("{} alerts shown", visible_count));
+                        }
+                    }
+
+                    ui.add_space(6.0);
+                    ui.separator();
+
                     // ── Other overlays ──
                     ui.checkbox(self.layers.enabled_mut(LayerKind::CityLabels), "🏷  City Labels");
                     ui.checkbox(self.layers.enabled_mut(LayerKind::RadarSites), "📡  Radar Sites");
@@ -1564,6 +1796,7 @@ fn draw_spc_overlays(
     current_theme_is_dark: bool,
 ) {
     let screen_rect = ui.max_rect();
+    let clip_rect = screen_rect.expand(screen_rect.width().max(screen_rect.height()) * 0.5);
     let day = layers.spc_day;
 
     // Iterate through enabled SPC layers
@@ -1601,15 +1834,34 @@ fn draw_spc_overlays(
                         exterior.as_slice()
                     };
 
-                    // Project to screen coordinates
-                    let screen_pts: Vec<egui::Pos2> = ring
+                    // Project to screen coordinates, filtering non-finite values
+                    let projected: Vec<egui::Pos2> = ring
                     .iter()
-                    .map(|&(lat, lon)| {
-                        projector
+                    .filter_map(|&(lat, lon)| {
+                        let p = projector
                             .project(walkers::lat_lon(lat, lon))
-                            .to_pos2()
+                            .to_pos2();
+                        // Filter non-finite and absurdly large coordinates that
+                        // cause precision issues in clipping math
+                        (p.x.is_finite() && p.y.is_finite()
+                            && p.x.abs() < 1e5 && p.y.abs() < 1e5)
+                            .then_some(p)
                     })
                     .collect();
+                    if projected.len() < 3 { continue; }
+
+                    // Clip polygon to padded viewport to prevent off-screen spike artifacts
+                    let screen_pts = clip_polygon_to_rect(&projected, clip_rect);
+                    if screen_pts.len() < 3 {
+                        continue;
+                    }
+
+                    // Simplify in screen space to remove near-collinear vertices
+                    // that cause miter-join spike artifacts in stroke rendering
+                    let screen_pts = simplify_screen_pts(&screen_pts, 1.5);
+                    if screen_pts.len() < 3 {
+                        continue;
+                    }
 
                 // Quick AABB visibility check
                 let mut min_x = f32::MAX;
@@ -1627,6 +1879,11 @@ fn draw_spc_overlays(
                     egui::pos2(max_x, max_y),
                 );
                 if !screen_rect.intersects(poly_rect) {
+                    continue;
+                }
+
+                // Skip polygons too small to meaningfully render
+                if (max_x - min_x) < 2.0 && (max_y - min_y) < 2.0 {
                     continue;
                 }
 
@@ -1659,15 +1916,17 @@ fn draw_spc_overlays(
                     ui.painter().add(egui::Shape::mesh(mesh));
                 }
 
-                // Draw stroke outline separately (PathShape handles this fine)
+                // Draw stroke outline as individual line segments to avoid
+                // miter-join spike artifacts that PathShape produces.
                 if sa > 0 {
-                    let outline = egui::epaint::PathShape {
-                        points: screen_pts.clone(),
-                        closed: true,
-                        fill: egui::Color32::TRANSPARENT,
-                        stroke: egui::epaint::PathStroke::new(1.5, stroke_color),
-                    };
-                    ui.painter().add(egui::Shape::Path(outline));
+                    let stroke = egui::Stroke::new(1.5, stroke_color);
+                    for i in 0..screen_pts.len() {
+                        let j = (i + 1) % screen_pts.len();
+                        ui.painter().line_segment(
+                            [screen_pts[i], screen_pts[j]],
+                            stroke,
+                        );
+                    }
                 }
 
                 // Draw CIG hatching if applicable
@@ -1683,6 +1942,157 @@ fn draw_spc_overlays(
             }
         }
     }
+}
+
+/// Draw NWS weather alert polygons on the map.
+///
+/// Returns `Some(alert_index)` if the user clicked on an alert polygon,
+/// allowing the caller to open a detail popup.
+///
+/// This is a free function (not a method on `Gui`) for the same borrow-checker
+/// reasons as `draw_spc_overlays`.
+fn draw_nws_alerts(
+    ui: &egui::Ui,
+    projector: &walkers::Projector,
+    layers: &crate::layers::LayerManager,
+    nws_alerts: &[NwsAlert],
+) -> Option<usize> {
+    if !layers.any_nws_enabled() || nws_alerts.is_empty() {
+        return None;
+    }
+
+    let screen_rect = ui.max_rect();
+    let clip_rect = screen_rect.expand(screen_rect.width().max(screen_rect.height()) * 0.5);
+    let enabled_categories = layers.enabled_nws_categories();
+    let mut clicked_index: Option<usize> = None;
+
+    for (alert_idx, alert) in nws_alerts.iter().enumerate() {
+        if !enabled_categories.contains(&alert.category) {
+            continue;
+        }
+
+        for overlay_feature in &alert.features {
+            for polygon in &overlay_feature.polygons {
+                if polygon.is_empty() {
+                    continue;
+                }
+                let exterior = &polygon[0];
+                if exterior.len() < 3 {
+                    continue;
+                }
+
+                // Strip GeoJSON closing duplicate
+                let ring = if exterior.len() > 3 && exterior.first() == exterior.last() {
+                    &exterior[..exterior.len() - 1]
+                } else {
+                    exterior.as_slice()
+                };
+
+                // Project to screen, filtering non-finite and extreme values
+                let projected: Vec<egui::Pos2> = ring
+                    .iter()
+                    .filter_map(|&(lat, lon)| {
+                        let p = projector.project(walkers::lat_lon(lat, lon)).to_pos2();
+                        (p.x.is_finite() && p.y.is_finite()
+                            && p.x.abs() < 1e5 && p.y.abs() < 1e5)
+                            .then_some(p)
+                    })
+                    .collect();
+                if projected.len() < 3 { continue; }
+
+                // Clip polygon to padded viewport
+                let screen_pts = clip_polygon_to_rect(&projected, clip_rect);
+                if screen_pts.len() < 3 {
+                    continue;
+                }
+
+                // Simplify in screen space to remove near-collinear vertices
+                // that cause miter-join spike artifacts in stroke rendering
+                let screen_pts = simplify_screen_pts(&screen_pts, 1.5);
+                if screen_pts.len() < 3 {
+                    continue;
+                }
+
+                // AABB culling
+                let mut min_x = f32::MAX;
+                let mut min_y = f32::MAX;
+                let mut max_x = f32::MIN;
+                let mut max_y = f32::MIN;
+                for pt in &screen_pts {
+                    min_x = min_x.min(pt.x);
+                    min_y = min_y.min(pt.y);
+                    max_x = max_x.max(pt.x);
+                    max_y = max_y.max(pt.y);
+                }
+                let poly_rect = egui::Rect::from_min_max(
+                    egui::pos2(min_x, min_y),
+                    egui::pos2(max_x, max_y),
+                );
+                if !screen_rect.intersects(poly_rect) {
+                    continue;
+                }
+
+                // Skip polygons too small to meaningfully render
+                if (max_x - min_x) < 2.0 && (max_y - min_y) < 2.0 {
+                    continue;
+                }
+
+                // Fill via ear-clipping
+                let [r, g, b, a] = overlay_feature.fill_rgba;
+                let fill = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+                let [sr, sg, sb, sa] = overlay_feature.stroke_rgba;
+                let stroke_color = egui::Color32::from_rgba_unmultiplied(sr, sg, sb, sa);
+
+                let coords: Vec<f64> = screen_pts
+                    .iter()
+                    .flat_map(|p| [p.x as f64, p.y as f64])
+                    .collect();
+                let tri_indices = earcutr::earcut(&coords, &[], 2).unwrap_or_default();
+                if !tri_indices.is_empty() {
+                    let mut mesh = egui::Mesh::default();
+                    for pt in &screen_pts {
+                        mesh.vertices.push(egui::epaint::Vertex {
+                            pos: *pt,
+                            uv: egui::epaint::WHITE_UV,
+                            color: fill,
+                        });
+                    }
+                    for idx in tri_indices {
+                        mesh.indices.push(idx as u32);
+                    }
+                    ui.painter().add(egui::Shape::mesh(mesh));
+                }
+
+                // Draw stroke outline as individual line segments to avoid
+                // miter-join spike artifacts that PathShape produces.
+                if sa > 0 {
+                    let stroke = egui::Stroke::new(2.0, stroke_color);
+                    for i in 0..screen_pts.len() {
+                        let j = (i + 1) % screen_pts.len();
+                        ui.painter().line_segment(
+                            [screen_pts[i], screen_pts[j]],
+                            stroke,
+                        );
+                    }
+                }
+
+                // Click detection using point-in-polygon (ray casting)
+                if clicked_index.is_none() {
+                    let clicked = ui.ctx().input(|i| {
+                        i.pointer.any_click()
+                            && i.pointer.interact_pos().map_or(false, |p| {
+                                poly_rect.contains(p) && point_in_polygon(p, &screen_pts)
+                            })
+                    });
+                    if clicked {
+                        clicked_index = Some(alert_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    clicked_index
 }
 
 /// Draw label-only map tiles on top of the radar overlay.
@@ -1747,4 +2157,176 @@ fn draw_label_tiles_overlay(
             }
         }
     }
+}
+
+/// Format an ISO 8601 timestamp into a shorter human-readable form.
+/// Falls back to displaying the raw string on parse errors.
+fn format_iso_time(iso: &str) -> String {
+    // NWS timestamps look like "2026-03-06T18:00:00-06:00"
+    chrono::DateTime::parse_from_rfc3339(iso)
+        .map(|dt| dt.format("%b %d %Y %H:%M %Z").to_string())
+        .unwrap_or_else(|_| iso.to_string())
+}
+
+/// Ray-casting (even-odd rule) point-in-polygon test.
+/// Returns `true` if `point` lies inside the polygon defined by `vertices`.
+fn point_in_polygon(point: egui::Pos2, vertices: &[egui::Pos2]) -> bool {
+    let n = vertices.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let px = point.x;
+    let py = point.y;
+    let mut j = n - 1;
+    for i in 0..n {
+        let vi = vertices[i];
+        let vj = vertices[j];
+        // Check if the ray from point going in +x direction crosses this edge
+        if (vi.y > py) != (vj.y > py)
+            && px < (vj.x - vi.x) * (py - vi.y) / (vj.y - vi.y) + vi.x
+        {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Sutherland-Hodgman polygon clipping against an axis-aligned rectangle.
+///
+/// Clips a polygon to the given rectangle by processing one edge at a time.
+/// This properly intersects polygon edges with the clip boundary instead of
+/// just clamping vertices, which would create spike artifacts.
+fn clip_polygon_to_rect(polygon: &[egui::Pos2], rect: egui::Rect) -> Vec<egui::Pos2> {
+    if polygon.is_empty() {
+        return Vec::new();
+    }
+
+    // Quick check: if all points are inside, skip clipping
+    if polygon.iter().all(|p| rect.contains(*p)) {
+        return polygon.to_vec();
+    }
+
+    let mut output = polygon.to_vec();
+
+    // Clip against each of the 4 edges: left, right, top, bottom
+    // Safe intersect lambdas guard against division by zero.
+    // Edge: left (x >= rect.min.x)
+    output = clip_edge(&output, |p| p.x >= rect.min.x, |a, b| {
+        let dx = b.x - a.x;
+        if dx.abs() < 1e-6 { return a; }
+        let t = (rect.min.x - a.x) / dx;
+        egui::pos2(rect.min.x, a.y + t * (b.y - a.y))
+    });
+    if output.len() < 3 { return output; }
+
+    // Edge: right (x <= rect.max.x)
+    output = clip_edge(&output, |p| p.x <= rect.max.x, |a, b| {
+        let dx = b.x - a.x;
+        if dx.abs() < 1e-6 { return a; }
+        let t = (rect.max.x - a.x) / dx;
+        egui::pos2(rect.max.x, a.y + t * (b.y - a.y))
+    });
+    if output.len() < 3 { return output; }
+
+    // Edge: top (y >= rect.min.y)
+    output = clip_edge(&output, |p| p.y >= rect.min.y, |a, b| {
+        let dy = b.y - a.y;
+        if dy.abs() < 1e-6 { return a; }
+        let t = (rect.min.y - a.y) / dy;
+        egui::pos2(a.x + t * (b.x - a.x), rect.min.y)
+    });
+    if output.len() < 3 { return output; }
+
+    // Edge: bottom (y <= rect.max.y)
+    output = clip_edge(&output, |p| p.y <= rect.max.y, |a, b| {
+        let dy = b.y - a.y;
+        if dy.abs() < 1e-6 { return a; }
+        let t = (rect.max.y - a.y) / dy;
+        egui::pos2(a.x + t * (b.x - a.x), rect.max.y)
+    });
+
+    output
+}
+
+/// Clip a polygon against a single half-plane edge (Sutherland-Hodgman step).
+fn clip_edge(
+    polygon: &[egui::Pos2],
+    inside: impl Fn(egui::Pos2) -> bool,
+    intersect: impl Fn(egui::Pos2, egui::Pos2) -> egui::Pos2,
+) -> Vec<egui::Pos2> {
+    if polygon.is_empty() {
+        return Vec::new();
+    }
+    let mut result = Vec::with_capacity(polygon.len());
+    let mut prev = polygon[polygon.len() - 1];
+    let mut prev_inside = inside(prev);
+
+    for &curr in polygon {
+        let curr_inside = inside(curr);
+        if curr_inside {
+            if !prev_inside {
+                result.push(intersect(prev, curr));
+            }
+            result.push(curr);
+        } else if prev_inside {
+            result.push(intersect(prev, curr));
+        }
+        prev = curr;
+        prev_inside = curr_inside;
+    }
+    result
+}
+
+/// Ramer-Douglas-Peucker simplification in screen-space (pixel coordinates).
+///
+/// Removes near-collinear vertices that cause miter-join spike artifacts
+/// in stroke rendering. An epsilon of ~1.5 pixels keeps shapes visually
+/// accurate while eliminating degenerate stroke geometry.
+fn simplify_screen_pts(pts: &[egui::Pos2], epsilon: f32) -> Vec<egui::Pos2> {
+    if pts.len() <= 3 {
+        return pts.to_vec();
+    }
+    rdp_simplify_pos2(pts, epsilon)
+}
+
+fn rdp_simplify_pos2(points: &[egui::Pos2], epsilon: f32) -> Vec<egui::Pos2> {
+    if points.len() <= 2 {
+        return points.to_vec();
+    }
+    let first = points[0];
+    let last = points[points.len() - 1];
+    let mut max_dist: f32 = 0.0;
+    let mut max_idx = 0;
+
+    for i in 1..points.len() - 1 {
+        let d = perp_dist_pos2(points[i], first, last);
+        if d > max_dist {
+            max_dist = d;
+            max_idx = i;
+        }
+    }
+
+    if max_dist > epsilon {
+        let mut left = rdp_simplify_pos2(&points[..=max_idx], epsilon);
+        let right = rdp_simplify_pos2(&points[max_idx..], epsilon);
+        left.pop();
+        left.extend(right);
+        left
+    } else {
+        vec![first, last]
+    }
+}
+
+fn perp_dist_pos2(point: egui::Pos2, line_start: egui::Pos2, line_end: egui::Pos2) -> f32 {
+    let dx = line_end.x - line_start.x;
+    let dy = line_end.y - line_start.y;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 1e-6 {
+        let px = point.x - line_start.x;
+        let py = point.y - line_start.y;
+        return (px * px + py * py).sqrt();
+    }
+    ((point.x - line_start.x) * dy - (point.y - line_start.y) * dx).abs() / len_sq.sqrt()
 }

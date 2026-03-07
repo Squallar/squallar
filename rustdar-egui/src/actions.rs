@@ -38,6 +38,10 @@ pub enum GuiAction {
     },
     /// Re-fetch all currently enabled SPC outlook layers.
     RefreshSpcOutlooks,
+    /// Fetch all active NWS weather alerts.
+    FetchNwsAlerts,
+    /// Re-fetch NWS alerts (manual refresh).
+    RefreshNwsAlerts,
 }
 
 impl std::fmt::Display for GuiAction {
@@ -65,6 +69,12 @@ impl std::fmt::Display for GuiAction {
             }
             GuiAction::RefreshSpcOutlooks => {
                 write!(f, "Refresh SPC outlooks")
+            }
+            GuiAction::FetchNwsAlerts => {
+                write!(f, "Fetch NWS alerts")
+            }
+            GuiAction::RefreshNwsAlerts => {
+                write!(f, "Refresh NWS alerts")
             }
         }
     }

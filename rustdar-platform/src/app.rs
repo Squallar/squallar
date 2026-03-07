@@ -27,6 +27,7 @@ use rustdar_radar::render::{
 use rustdar_radar::scan;
 use rustdar_radar::sites::get_radar_site;
 use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
+use rustdar_overlays::nws::alert::NwsAlert;
 use std::collections::HashMap;
 
 use chrono::NaiveDateTime;
@@ -40,6 +41,9 @@ type RenderResult = (Vec<u8>, f64, Vec<f32>, RadarProduct, f32, u64);
 
 /// Result from a background SPC outlook fetch
 type OutlookResult = (OutlookDay, OutlookProduct, Result<SpcOutlook, String>);
+
+/// Result from a background NWS alerts fetch
+type AlertResult = Result<Vec<NwsAlert>, String>;
 
 pub struct App {
     instance: wgpu::Instance,
@@ -86,6 +90,9 @@ pub struct App {
     // Channel for SPC outlook fetch results
     outlook_receiver: Receiver<OutlookResult>,
     outlook_sender: Sender<OutlookResult>,
+    // Channel for NWS alerts fetch results
+    alert_receiver: Receiver<AlertResult>,
+    alert_sender: Sender<AlertResult>,
     // Channel to receive GPS location updates (Android only)
     #[cfg(target_os = "android")]
     location_receiver: Option<std::sync::mpsc::Receiver<(f64, f64)>>,
@@ -111,6 +118,7 @@ impl App {
         let (scan_sender, scan_receiver) = std::sync::mpsc::channel();
         let (render_result_sender, render_result_receiver) = std::sync::mpsc::channel();
         let (outlook_sender, outlook_receiver) = std::sync::mpsc::channel();
+        let (alert_sender, alert_receiver) = std::sync::mpsc::channel();
 
         // Setup theme monitoring (Android only — desktop uses WindowEvent::ThemeChanged)
         #[cfg(target_os = "android")]
@@ -127,6 +135,7 @@ impl App {
 
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .user_agent("rustdar/1.0 (https://github.com/USA-RedDragon/rustdar)")
             .build()
             .unwrap_or_default();
 
@@ -156,6 +165,8 @@ impl App {
             http_client,
             outlook_sender,
             outlook_receiver,
+            alert_sender,
+            alert_receiver,
             tokio_runtime,
             #[cfg(target_os = "android")]
             location_receiver: None,
@@ -421,6 +432,22 @@ impl App {
             }
             if any_received {
                 self.gui.set_spc_fetching(false);
+            }
+        }
+
+        // Check for received NWS alerts data
+        {
+            if let Ok(result) = self.alert_receiver.try_recv() {
+                match result {
+                    Ok(alerts) => {
+                        log::info!("Received {} NWS alerts", alerts.len());
+                        self.gui.set_nws_alerts(alerts);
+                    }
+                    Err(e) => {
+                        log::error!("NWS alerts fetch failed: {}", e);
+                    }
+                }
+                self.gui.set_nws_fetching(false);
             }
         }
 
@@ -847,6 +874,23 @@ impl App {
                         event_loop,
                     );
                 }
+            }
+            GuiAction::FetchNwsAlerts | GuiAction::RefreshNwsAlerts => {
+                log::info!("Fetching NWS active alerts");
+                self.gui.set_nws_fetching(true);
+                let client = self.http_client.clone();
+                let sender = self.alert_sender.clone();
+                let window = self.window.clone();
+                self.tokio_runtime.spawn(async move {
+                    let result =
+                        rustdar_overlays::nws::fetch::fetch_active_alerts(&client)
+                            .await
+                            .map_err(|e| format!("{e}"));
+                    let _ = sender.send(result);
+                    if let Some(w) = window {
+                        w.request_redraw();
+                    }
+                });
             }
         }
     }
