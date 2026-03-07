@@ -42,6 +42,10 @@ pub enum GuiAction {
     FetchNwsAlerts,
     /// Re-fetch NWS alerts (manual refresh).
     RefreshNwsAlerts,
+    /// Fetch all active SPC Mesoscale Discussions.
+    FetchSpcDiscussions,
+    /// Re-fetch SPC Mesoscale Discussions (manual refresh).
+    RefreshSpcDiscussions,
 }
 
 impl std::fmt::Display for GuiAction {
@@ -75,6 +79,12 @@ impl std::fmt::Display for GuiAction {
             }
             GuiAction::RefreshNwsAlerts => {
                 write!(f, "Refresh NWS alerts")
+            }
+            GuiAction::FetchSpcDiscussions => {
+                write!(f, "Fetch SPC Mesoscale Discussions")
+            }
+            GuiAction::RefreshSpcDiscussions => {
+                write!(f, "Refresh SPC Mesoscale Discussions")
             }
         }
     }

@@ -1,4 +1,7 @@
+use super::discussion::{SpcDiscussion, parse_md_rss};
 use super::outlook::{OutlookDay, OutlookProduct, SpcOutlook, outlook_url, parse_geojson};
+
+const SPC_MD_RSS_URL: &str = "https://www.spc.noaa.gov/products/spcmdrss.xml";
 
 /// Fetch an SPC outlook product and parse it into an `SpcOutlook`.
 pub async fn fetch_outlook(
@@ -49,6 +52,33 @@ pub async fn fetch_all_for_day(
     }
 
     results
+}
+
+/// Fetch all currently active SPC Mesoscale Discussions from the RSS feed.
+pub async fn fetch_active_discussions(
+    client: &reqwest::Client,
+) -> Result<Vec<SpcDiscussion>, String> {
+    log::info!("Fetching SPC Mesoscale Discussions from {}", SPC_MD_RSS_URL);
+
+    let response = client
+        .get(SPC_MD_RSS_URL)
+        .send()
+        .await
+        .map_err(|e| format!("SPC MD RSS request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "SPC returned HTTP {} for MD RSS feed",
+            response.status()
+        ));
+    }
+
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read SPC MD RSS body: {}", e))?;
+
+    parse_md_rss(&text)
 }
 
 /// Which products are available for a given day.

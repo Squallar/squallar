@@ -11,6 +11,26 @@ pub fn parse_hex_color(hex: &str, alpha: u8) -> [u8; 4] {
     [r, g, b, alpha]
 }
 
+use super::discussion::MdType;
+
+/// Fill color for an SPC Mesoscale Discussion polygon based on topic.
+pub fn md_fill_color(md_type: &MdType) -> [u8; 4] {
+    match md_type {
+        MdType::Convective => [255, 180, 50, 60],
+        MdType::WinterWeather => [100, 180, 255, 60],
+        MdType::Other => [180, 180, 180, 60],
+    }
+}
+
+/// Stroke color for an SPC Mesoscale Discussion polygon based on topic.
+pub fn md_stroke_color(md_type: &MdType) -> [u8; 4] {
+    match md_type {
+        MdType::Convective => [255, 180, 50, 200],
+        MdType::WinterWeather => [100, 180, 255, 200],
+        MdType::Other => [180, 180, 180, 200],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

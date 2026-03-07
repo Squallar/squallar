@@ -9,6 +9,8 @@ use walkers::{HttpTiles, MapMemory, Texture, Tiles, sources::{TileSource, Attrib
 use rustdar_radar::render::{ImageBounds, RadarProduct, ScanInfo, IMAGE_SIZE, MAX_RANGE_KM};
 use rustdar_radar::sites::RADARS;
 use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
+use rustdar_overlays::spc::discussion::SpcDiscussion;
+use rustdar_overlays::spc::colors::{md_fill_color, md_stroke_color};
 use rustdar_overlays::nws::alert::NwsAlert;
 use rustdar_overlays::types::HatchPattern;
 
@@ -244,6 +246,12 @@ pub struct Gui {
     nws_fetching: bool,
     /// Index of the currently selected alert for detail popup.
     selected_alert: Option<usize>,
+    // SPC Mesoscale Discussions state
+    spc_discussions: Vec<SpcDiscussion>,
+    spc_md_fetch_time: Option<std::time::Instant>,
+    spc_md_fetching: bool,
+    /// Index of the currently selected MD for detail popup.
+    selected_md: Option<usize>,
     // Whether the mobile slide-out menu is open (Android only)
     #[cfg(target_os = "android")]
     show_mobile_menu: bool,
@@ -309,6 +317,10 @@ impl Gui {
             nws_fetch_time: None,
             nws_fetching: false,
             selected_alert: None,
+            spc_discussions: Vec::new(),
+            spc_md_fetch_time: None,
+            spc_md_fetching: false,
+            selected_md: None,
             #[cfg(target_os = "android")]
             show_mobile_menu: false,
             #[cfg(target_os = "android")]
@@ -360,6 +372,16 @@ impl Gui {
                 .map_or(true, |t| t.elapsed().as_secs() >= 120)
         {
             actions.push(GuiAction::FetchNwsAlerts);
+        }
+
+        // Auto-refresh SPC Mesoscale Discussions every 2 minutes when enabled
+        if self.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions)
+            && !self.spc_md_fetching
+            && self
+                .spc_md_fetch_time
+                .map_or(true, |t| t.elapsed().as_secs() >= 120)
+        {
+            actions.push(GuiAction::FetchSpcDiscussions);
         }
 
         #[cfg(target_os = "android")]
@@ -778,6 +800,17 @@ impl Gui {
                             }
                             } // end if radar layer enabled
 
+                            // Draw SPC Mesoscale Discussion polygons
+                            let clicked_md = draw_spc_discussions(
+                                ui,
+                                projector,
+                                &self.layers,
+                                &self.spc_discussions,
+                            );
+                            if let Some(idx) = clicked_md {
+                                self.selected_md = Some(idx);
+                            }
+
                             // Draw NWS alert polygons on top of radar, below labels
                             let clicked_alert = draw_nws_alerts(
                                 ui,
@@ -1072,6 +1105,50 @@ impl Gui {
                 ui.add_space(6.0);
                 ui.separator();
 
+                // --- SPC Mesoscale Discussions section ---
+                {
+                    let was_enabled = self.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
+                    let label = if self.spc_discussions.is_empty() {
+                        "📋  Mesoscale Disc.".to_string()
+                    } else {
+                        format!("📋  Mesoscale Disc. ({})", self.spc_discussions.len())
+                    };
+                    ui.checkbox(
+                        self.layers.enabled_mut(LayerKind::SpcMesoscaleDiscussions),
+                        label,
+                    );
+                    let is_enabled = self.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
+
+                    // If just toggled on and we have no data, fetch
+                    if is_enabled && !was_enabled && self.spc_discussions.is_empty() && !self.spc_md_fetching {
+                        actions.push(GuiAction::FetchSpcDiscussions);
+                    }
+                }
+
+                if self.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions) {
+                    ui.horizontal(|ui| {
+                        let refresh_enabled = !self.spc_md_fetching;
+                        if ui.add_enabled(refresh_enabled, egui::Button::new("🔄 Refresh")).clicked() {
+                            actions.push(GuiAction::RefreshSpcDiscussions);
+                        }
+                        if self.spc_md_fetching {
+                            ui.spinner();
+                        }
+                    });
+                    if let Some(t) = self.spc_md_fetch_time {
+                        let secs_ago = t.elapsed().as_secs();
+                        let label = if secs_ago < 60 {
+                            format!("Updated {}s ago", secs_ago)
+                        } else {
+                            format!("Updated {}m ago", secs_ago / 60)
+                        };
+                        ui.label(egui::RichText::new(label).small().weak());
+                    }
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+
                 // --- NWS Alerts section ---
                 ui.label("⚠  NWS Alerts");
 
@@ -1199,6 +1276,17 @@ impl Gui {
     /// Set whether an NWS alerts fetch is currently in progress.
     pub fn set_nws_fetching(&mut self, fetching: bool) {
         self.nws_fetching = fetching;
+    }
+
+    /// Store fetched SPC Mesoscale Discussions, replacing the previous set.
+    pub fn set_spc_discussions(&mut self, discussions: Vec<SpcDiscussion>) {
+        self.spc_discussions = discussions;
+        self.spc_md_fetch_time = Some(std::time::Instant::now());
+    }
+
+    /// Set whether an SPC MD fetch is currently in progress.
+    pub fn set_spc_md_fetching(&mut self, fetching: bool) {
+        self.spc_md_fetching = fetching;
     }
 
     /// Get the layer manager (immutable).
@@ -1360,6 +1448,89 @@ impl Gui {
         }
     }
 
+    /// Render the SPC Mesoscale Discussion detail popup when an MD is selected.
+    fn render_md_popup(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.selected_md else {
+            return;
+        };
+        let Some(md) = self.spc_discussions.get(idx) else {
+            self.selected_md = None;
+            return;
+        };
+
+        // Clone data to avoid borrow issues
+        let number = md.number;
+        let md_type = md.md_type;
+        let concerning = md.concerning.clone();
+        let text = md.text.clone();
+        let link = md.link.clone();
+        let stroke_rgba = md_stroke_color(&md_type);
+        let [r, g, b, _] = stroke_rgba;
+        let accent = egui::Color32::from_rgb(r, g, b);
+
+        let mut open = true;
+        let screen = ctx.input(|i| i.viewport_rect());
+        let is_mobile = cfg!(target_os = "android");
+        let popup_width = if is_mobile {
+            (screen.width() - 32.0).max(200.0)
+        } else {
+            420.0
+        };
+        let popup_max_height = if is_mobile {
+            (screen.height() - 80.0).max(200.0)
+        } else {
+            500.0
+        };
+
+        let title = format!("Mesoscale Discussion #{:04}", number);
+        egui::Window::new(egui::RichText::new(&title).color(accent).strong())
+            .id(egui::Id::new("spc_md_popup"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(!is_mobile)
+            .default_width(popup_width)
+            .max_width(popup_width)
+            .max_height(popup_max_height)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                // Type badge
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("Type: {}", md_type)).strong().color(accent));
+                });
+
+                // Concerning line
+                if let Some(ref concerning) = concerning {
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new(format!("Concerning: {}", concerning)).strong());
+                }
+
+                ui.add_space(4.0);
+                ui.separator();
+
+                // Full discussion text (scrollable)
+                egui::ScrollArea::vertical()
+                    .max_height(if is_mobile { 300.0 } else { 350.0 })
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(&text)
+                                .font(egui::FontId::monospace(if is_mobile { 11.0 } else { 12.0 }))
+                        );
+                    });
+
+                ui.add_space(4.0);
+                ui.separator();
+
+                // Link to SPC
+                if !link.is_empty() {
+                    ui.hyperlink_to("Open on SPC website", &link);
+                }
+            });
+
+        if !open {
+            self.selected_md = None;
+        }
+    }
+
     #[cfg(not(target_os = "android"))]
     fn render_desktop_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<GuiAction>) {
         // Menu bar
@@ -1389,6 +1560,9 @@ impl Gui {
 
         // NWS alert detail popup (rendered after map so it floats on top)
         self.render_alert_popup(ctx);
+
+        // SPC Mesoscale Discussion detail popup
+        self.render_md_popup(ctx);
     }
 
     #[cfg(target_os = "android")]
@@ -1413,6 +1587,9 @@ impl Gui {
 
         // NWS alert detail popup (rendered after map so it floats on top)
         self.render_alert_popup(ctx);
+
+        // SPC Mesoscale Discussion detail popup
+        self.render_md_popup(ctx);
 
         // Floating hamburger button to open the menu (drawn last so it's on top)
         if !self.show_mobile_menu {
@@ -1651,6 +1828,50 @@ impl Gui {
                                 ui.spinner();
                             }
                         });
+                    }
+
+                    ui.add_space(6.0);
+                    ui.separator();
+
+                    // ── SPC Mesoscale Discussions ──
+                    {
+                        let was_enabled = self.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
+                        let label = if self.spc_discussions.is_empty() {
+                            "📋  Mesoscale Disc.".to_string()
+                        } else {
+                            format!("📋  Mesoscale Disc. ({})", self.spc_discussions.len())
+                        };
+                        ui.checkbox(
+                            self.layers.enabled_mut(LayerKind::SpcMesoscaleDiscussions),
+                            label,
+                        );
+                        let is_enabled = self.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
+                        if is_enabled && !was_enabled && self.spc_discussions.is_empty() && !self.spc_md_fetching {
+                            actions.push(GuiAction::FetchSpcDiscussions);
+                        }
+                    }
+
+                    if self.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions) {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!self.spc_md_fetching, egui::Button::new("🔄 Refresh"))
+                                .clicked()
+                            {
+                                actions.push(GuiAction::RefreshSpcDiscussions);
+                            }
+                            if self.spc_md_fetching {
+                                ui.spinner();
+                            }
+                        });
+                        if let Some(t) = self.spc_md_fetch_time {
+                            let secs_ago = t.elapsed().as_secs();
+                            let label = if secs_ago < 60 {
+                                format!("Updated {}s ago", secs_ago)
+                            } else {
+                                format!("Updated {}m ago", secs_ago / 60)
+                            };
+                            ui.label(egui::RichText::new(label).small().weak());
+                        }
                     }
 
                     ui.add_space(6.0);
@@ -1932,6 +2153,158 @@ fn draw_spc_overlays(
             }
         }
     }
+}
+
+/// Draw SPC Mesoscale Discussion polygons on the map.
+///
+/// Returns `Some(discussion_index)` if the user clicked on an MD polygon.
+fn draw_spc_discussions(
+    ui: &egui::Ui,
+    projector: &walkers::Projector,
+    layers: &crate::layers::LayerManager,
+    discussions: &[SpcDiscussion],
+) -> Option<usize> {
+    if !layers.is_enabled(LayerKind::SpcMesoscaleDiscussions) || discussions.is_empty() {
+        return None;
+    }
+
+    let screen_rect = ui.max_rect();
+    let clip_rect = screen_rect.expand(screen_rect.width().max(screen_rect.height()) * 0.5);
+    let mut clicked_index: Option<usize> = None;
+
+    for (md_idx, md) in discussions.iter().enumerate() {
+        let fill_rgba = md_fill_color(&md.md_type);
+        let stroke_rgba = md_stroke_color(&md.md_type);
+
+        for polygon in &md.polygon {
+            if polygon.is_empty() {
+                continue;
+            }
+
+            // MD polygons have a single ring (no holes)
+            let ring = if polygon.len() > 3 && polygon.first() == polygon.last() {
+                &polygon[..polygon.len() - 1]
+            } else {
+                polygon.as_slice()
+            };
+            if ring.len() < 3 {
+                continue;
+            }
+
+            // Project to screen coordinates
+            let projected: Vec<egui::Pos2> = ring
+                .iter()
+                .filter_map(|&(lat, lon)| {
+                    let p = projector.project(walkers::lat_lon(lat, lon)).to_pos2();
+                    (p.x.is_finite() && p.y.is_finite()
+                        && p.x.abs() < 1e5 && p.y.abs() < 1e5)
+                        .then_some(p)
+                })
+                .collect();
+            if projected.len() < 3 {
+                continue;
+            }
+
+            // Clip polygon to padded viewport
+            let screen_pts = clip_polygon_to_rect(&projected, clip_rect);
+            if screen_pts.len() < 3 {
+                continue;
+            }
+
+            // Simplify in screen space
+            let screen_pts = simplify_screen_pts(&screen_pts, 1.5);
+            if screen_pts.len() < 3 {
+                continue;
+            }
+
+            // AABB culling
+            let mut min_x = f32::MAX;
+            let mut min_y = f32::MAX;
+            let mut max_x = f32::MIN;
+            let mut max_y = f32::MIN;
+            for pt in &screen_pts {
+                min_x = min_x.min(pt.x);
+                min_y = min_y.min(pt.y);
+                max_x = max_x.max(pt.x);
+                max_y = max_y.max(pt.y);
+            }
+            let poly_rect = egui::Rect::from_min_max(
+                egui::pos2(min_x, min_y),
+                egui::pos2(max_x, max_y),
+            );
+            if !screen_rect.intersects(poly_rect) {
+                continue;
+            }
+            if (max_x - min_x) < 2.0 && (max_y - min_y) < 2.0 {
+                continue;
+            }
+
+            // Fill via ear-clipping
+            let [r, g, b, a] = fill_rgba;
+            let fill = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+            let [sr, sg, sb, sa] = stroke_rgba;
+            let stroke_color = egui::Color32::from_rgba_unmultiplied(sr, sg, sb, sa);
+
+            let coords: Vec<f64> = screen_pts
+                .iter()
+                .flat_map(|p| [p.x as f64, p.y as f64])
+                .collect();
+            let tri_indices = earcutr::earcut(&coords, &[], 2).unwrap_or_default();
+            if !tri_indices.is_empty() {
+                let mut mesh = egui::Mesh::default();
+                for pt in &screen_pts {
+                    mesh.vertices.push(egui::epaint::Vertex {
+                        pos: *pt,
+                        uv: egui::epaint::WHITE_UV,
+                        color: fill,
+                    });
+                }
+                for idx in tri_indices {
+                    mesh.indices.push(idx as u32);
+                }
+                ui.painter().add(egui::Shape::mesh(mesh));
+            }
+
+            // Draw stroke outline as individual line segments
+            if sa > 0 {
+                let stroke = egui::Stroke::new(2.0, stroke_color);
+                for i in 0..screen_pts.len() {
+                    let j = (i + 1) % screen_pts.len();
+                    ui.painter().line_segment(
+                        [screen_pts[i], screen_pts[j]],
+                        stroke,
+                    );
+                }
+            }
+
+            // Draw MD number label at polygon centroid
+            let centroid_x = screen_pts.iter().map(|p| p.x).sum::<f32>() / screen_pts.len() as f32;
+            let centroid_y = screen_pts.iter().map(|p| p.y).sum::<f32>() / screen_pts.len() as f32;
+            let label_text = format!("MD {}", md.number);
+            ui.painter().text(
+                egui::pos2(centroid_x, centroid_y),
+                egui::Align2::CENTER_CENTER,
+                &label_text,
+                egui::FontId::proportional(11.0),
+                stroke_color,
+            );
+
+            // Click detection
+            if clicked_index.is_none() {
+                let clicked = ui.ctx().input(|i| {
+                    i.pointer.any_click()
+                        && i.pointer.interact_pos().map_or(false, |p| {
+                            poly_rect.contains(p) && point_in_polygon(p, &screen_pts)
+                        })
+                });
+                if clicked {
+                    clicked_index = Some(md_idx);
+                }
+            }
+        }
+    }
+
+    clicked_index
 }
 
 /// Draw NWS weather alert polygons on the map.

@@ -27,6 +27,7 @@ use rustdar_radar::render::{
 use rustdar_radar::scan;
 use rustdar_radar::sites::get_radar_site;
 use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
+use rustdar_overlays::spc::discussion::SpcDiscussion;
 use rustdar_overlays::nws::alert::NwsAlert;
 use std::collections::HashMap;
 
@@ -44,6 +45,9 @@ type OutlookResult = (OutlookDay, OutlookProduct, Result<SpcOutlook, String>);
 
 /// Result from a background NWS alerts fetch
 type AlertResult = Result<Vec<NwsAlert>, String>;
+
+/// Result from a background SPC Mesoscale Discussion fetch
+type DiscussionResult = Result<Vec<SpcDiscussion>, String>;
 
 pub struct App {
     instance: wgpu::Instance,
@@ -93,6 +97,9 @@ pub struct App {
     // Channel for NWS alerts fetch results
     alert_receiver: Receiver<AlertResult>,
     alert_sender: Sender<AlertResult>,
+    // Channel for SPC Mesoscale Discussion fetch results
+    discussion_receiver: Receiver<DiscussionResult>,
+    discussion_sender: Sender<DiscussionResult>,
     // Channel to receive GPS location updates (Android only)
     #[cfg(target_os = "android")]
     location_receiver: Option<std::sync::mpsc::Receiver<(f64, f64)>>,
@@ -119,6 +126,7 @@ impl App {
         let (render_result_sender, render_result_receiver) = std::sync::mpsc::channel();
         let (outlook_sender, outlook_receiver) = std::sync::mpsc::channel();
         let (alert_sender, alert_receiver) = std::sync::mpsc::channel();
+        let (discussion_sender, discussion_receiver) = std::sync::mpsc::channel();
 
         // Setup theme monitoring (Android only — desktop uses WindowEvent::ThemeChanged)
         #[cfg(target_os = "android")]
@@ -167,6 +175,8 @@ impl App {
             outlook_receiver,
             alert_sender,
             alert_receiver,
+            discussion_sender,
+            discussion_receiver,
             tokio_runtime,
             #[cfg(target_os = "android")]
             location_receiver: None,
@@ -448,6 +458,22 @@ impl App {
                     }
                 }
                 self.gui.set_nws_fetching(false);
+            }
+        }
+
+        // Check for received SPC Mesoscale Discussion data
+        {
+            if let Ok(result) = self.discussion_receiver.try_recv() {
+                match result {
+                    Ok(discussions) => {
+                        log::info!("Received {} SPC Mesoscale Discussions", discussions.len());
+                        self.gui.set_spc_discussions(discussions);
+                    }
+                    Err(e) => {
+                        log::error!("SPC MD fetch failed: {}", e);
+                    }
+                }
+                self.gui.set_spc_md_fetching(false);
             }
         }
 
@@ -884,6 +910,23 @@ impl App {
                 self.tokio_runtime.spawn(async move {
                     let result =
                         rustdar_overlays::nws::fetch::fetch_active_alerts(&client)
+                            .await
+                            .map_err(|e| format!("{e}"));
+                    let _ = sender.send(result);
+                    if let Some(w) = window {
+                        w.request_redraw();
+                    }
+                });
+            }
+            GuiAction::FetchSpcDiscussions | GuiAction::RefreshSpcDiscussions => {
+                log::info!("Fetching SPC Mesoscale Discussions");
+                self.gui.set_spc_md_fetching(true);
+                let client = self.http_client.clone();
+                let sender = self.discussion_sender.clone();
+                let window = self.window.clone();
+                self.tokio_runtime.spawn(async move {
+                    let result =
+                        rustdar_overlays::spc::fetch::fetch_active_discussions(&client)
                             .await
                             .map_err(|e| format!("{e}"));
                     let _ = sender.send(result);

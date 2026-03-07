@@ -10,6 +10,7 @@ pub enum LayerKind {
     SpcWind,
     SpcHail,
     SpcProbabilistic,
+    SpcMesoscaleDiscussions,
     NwsWarnings,
     NwsWatches,
     NwsAdvisories,
@@ -27,6 +28,7 @@ impl LayerKind {
             LayerKind::SpcWind => "Wind",
             LayerKind::SpcHail => "Hail",
             LayerKind::SpcProbabilistic => "Probabilistic",
+            LayerKind::SpcMesoscaleDiscussions => "Mesoscale Disc.",
             LayerKind::NwsWarnings => "Warnings",
             LayerKind::NwsWatches => "Watches",
             LayerKind::NwsAdvisories => "Advisories",
@@ -118,6 +120,7 @@ impl LayerManager {
         layers.insert(LayerKind::SpcWind, LayerState::new(false));
         layers.insert(LayerKind::SpcHail, LayerState::new(false));
         layers.insert(LayerKind::SpcProbabilistic, LayerState::new(false));
+        layers.insert(LayerKind::SpcMesoscaleDiscussions, LayerState::new(true));
         layers.insert(LayerKind::NwsWatches, LayerState::new(true));
         layers.insert(LayerKind::NwsAdvisories, LayerState::new(true));
         layers.insert(LayerKind::NwsWarnings, LayerState::new(true));
