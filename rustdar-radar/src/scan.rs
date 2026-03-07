@@ -1,4 +1,4 @@
-use chrono::{NaiveDateTime, NaiveTime};
+use chrono::{Duration, NaiveDateTime, NaiveTime};
 
 use nexrad_data::aws::archive::{download_file, list_files};
 use nexrad_model::data::Scan;
@@ -12,9 +12,19 @@ pub async fn check_latest_scan(
 ) -> Result<Option<NaiveDateTime>> {
     let metas = list_files(site, date).await?;
 
-    if metas.is_empty() {
-        return Ok(None);
-    }
+    // If no files found for the requested date, try the previous day.
+    // This handles the period just after midnight UTC before new scans appear.
+    let (metas, effective_date) = if metas.is_empty() {
+        let prev = *date - Duration::days(1);
+        log::info!("No files for {date}, trying previous day {prev}");
+        let prev_metas = list_files(site, &prev).await?;
+        if prev_metas.is_empty() {
+            return Ok(None);
+        }
+        (prev_metas, prev)
+    } else {
+        (metas, *date)
+    };
 
     // Find the latest scan, using Option to avoid returning a spurious midnight time
     let mut latest_time: Option<NaiveTime> = None;
@@ -30,19 +40,29 @@ pub async fn check_latest_scan(
     }
 
     // Only return Some if at least one filename parsed successfully
-    Ok(latest_time.map(|t| date.and_time(t)))
+    Ok(latest_time.map(|t| effective_date.and_time(t)))
 }
 
 pub async fn get_scan(site: &str, timestamp: NaiveDateTime) -> Result<Scan> {
     let metas = list_files(site, &timestamp.date()).await?;
 
-    if metas.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "No files found for the specified date.",
-        )
-        .into());
-    }
+    // If no files found for the requested date, try the previous day.
+    // This handles the period just after midnight UTC before new scans appear.
+    let (metas, fell_back) = if metas.is_empty() {
+        let prev = timestamp.date() - Duration::days(1);
+        log::info!("No files for {}, trying previous day {}", timestamp.date(), prev);
+        let prev_metas = list_files(site, &prev).await?;
+        if prev_metas.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No files found for the specified date or previous day.",
+            )
+            .into());
+        }
+        (prev_metas, true)
+    } else {
+        (metas, false)
+    };
 
     log::info!("Found {} files.", metas.len());
 
@@ -79,23 +99,36 @@ pub async fn get_scan(site: &str, timestamp: NaiveDateTime) -> Result<Scan> {
         }
     }
 
-    // Fall back to first meta if no filenames parsed (shouldn't happen with valid data)
-    let meta = match (best_meta, best_time) {
-        (Some(m), Some(t)) => {
-            // If the closest match is in the future and latest is in the past,
-            // use the latest available scan instead
-            if let (Some(lt), Some(lm)) = (latest_time, latest_meta) {
-                if t > timestamp.time() && lt < timestamp.time() {
-                    log::info!("Requested time is too new, using latest available scan.");
-                    lm
+    // When we fell back to the previous day, always use the latest scan from
+    // that day rather than the closest-to-requested-time match (which would
+    // pick a ~24-hour-old scan near midnight).
+    let meta = if fell_back {
+        match (latest_time, latest_meta) {
+            (Some(_), Some(lm)) => {
+                log::info!("Using latest scan from previous day.");
+                lm
+            }
+            _ => metas.first().expect("metas is non-empty"),
+        }
+    } else {
+        // Normal case: pick the closest match to the requested time
+        match (best_meta, best_time) {
+            (Some(m), Some(t)) => {
+                // If the closest match is in the future and latest is in the past,
+                // use the latest available scan instead
+                if let (Some(lt), Some(lm)) = (latest_time, latest_meta) {
+                    if t > timestamp.time() && lt < timestamp.time() {
+                        log::info!("Requested time is too new, using latest available scan.");
+                        lm
+                    } else {
+                        m
+                    }
                 } else {
                     m
                 }
-            } else {
-                m
             }
+            _ => metas.first().expect("metas is non-empty"),
         }
-        _ => metas.first().expect("metas is non-empty"),
     };
 
     log::info!(
@@ -125,9 +158,19 @@ pub async fn check_and_fetch_latest(
 ) -> Result<Option<(Scan, NaiveDateTime)>> {
     let metas = list_files(site, date).await?;
 
-    if metas.is_empty() {
-        return Ok(None);
-    }
+    // If no files found for the requested date, try the previous day.
+    // This handles the period just after midnight UTC before new scans appear.
+    let (metas, effective_date) = if metas.is_empty() {
+        let prev = *date - Duration::days(1);
+        log::info!("No files for {date}, trying previous day {prev}");
+        let prev_metas = list_files(site, &prev).await?;
+        if prev_metas.is_empty() {
+            return Ok(None);
+        }
+        (prev_metas, prev)
+    } else {
+        (metas, *date)
+    };
 
     // Find the latest scan
     let mut latest_time: Option<NaiveTime> = None;
@@ -149,7 +192,7 @@ pub async fn check_and_fetch_latest(
         _ => return Ok(None),
     };
 
-    let latest_dt = date.and_time(latest_time);
+    let latest_dt = effective_date.and_time(latest_time);
 
     // Check if we already have this scan
     let should_fetch = current_timestamp.map_or(true, |current| latest_dt > current);
