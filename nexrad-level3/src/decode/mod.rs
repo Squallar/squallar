@@ -8,7 +8,7 @@ mod radial;
 mod symbology;
 
 use crate::model::Level3Message;
-use crate::result::{Error, Result};
+use crate::result::Result;
 
 /// Decode a raw Level III product byte stream into a [`Level3Message`].
 ///

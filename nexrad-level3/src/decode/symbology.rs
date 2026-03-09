@@ -1,7 +1,7 @@
 //! Decoder for the Symbology Block and its data layers.
 
 use crate::model::{DataLayer, DataPacket, SymbologyBlock};
-use crate::result::{Error, Result};
+use crate::result::Result;
 
 use super::header::{read_i16, read_u16, read_u32};
 
