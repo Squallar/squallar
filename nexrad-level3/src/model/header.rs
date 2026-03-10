@@ -80,25 +80,33 @@ impl ProductDescriptionBlock {
     /// Compute the linear scale factor for digital product gate values.
     ///
     /// For digital products (codes 94+), the scale is stored in threshold
-    /// entries. Returns the scale used in: `physical = (gate - offset) / scale`.
+    /// entries as a big-endian IEEE 754 float spanning halfwords 0–1.
+    /// Returns the scale used in: `physical = (gate - offset) / scale`.
+    ///
+    /// Some products (e.g. 134 DVL, 135 EET) don't use IEEE-float thresholds;
+    /// their threshold bytes decode to subnormal/negative garbage.  In that
+    /// case the gate values already ARE the physical values, so we return 1.0.
     pub fn data_scale(&self) -> f32 {
-        // Thresholds[0..1] interpreted as a big-endian f32 for digital products
-        // with "generic" scaling, or thresholds[2] and [3] for others.
-        // The most common encoding: halfwords 30-31 of the PDB (stored in
-        // product_specific_3 and thresholds) contain an IEEE float.
-        // We use the threshold words as the scale/offset pair.
         let hw0 = self.thresholds[0];
         let hw1 = self.thresholds[1];
         let bits = ((hw0 as u32) << 16) | (hw1 as u32);
-        f32::from_bits(bits)
+        let val = f32::from_bits(bits);
+        // Valid IEEE-float scale must be a positive normal number.
+        // Subnormal / inf / nan / zero / negative → identity scale.
+        if val.is_normal() && val > 0.0 { val } else { 1.0 }
     }
 
     /// Compute the linear offset for digital product gate values.
+    ///
+    /// Same IEEE-float encoding caveat as [`data_scale`](Self::data_scale).
     pub fn data_offset(&self) -> f32 {
         let hw2 = self.thresholds[2];
         let hw3 = self.thresholds[3];
         let bits = ((hw2 as u32) << 16) | (hw3 as u32);
-        f32::from_bits(bits)
+        let val = f32::from_bits(bits);
+        // Accept normal floats and exact zero (valid offset).
+        // Subnormal / inf / nan → identity offset.
+        if val.is_normal() || val == 0.0 { val } else { 0.0 }
     }
 
     /// The elevation angle in degrees, extracted from product-specific fields.

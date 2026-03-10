@@ -43,7 +43,6 @@ pub(crate) fn read_u32(data: &[u8], offset: usize) -> Result<u32> {
 }
 
 /// Read a big-endian `i32` from `data` at the given offset.
-#[allow(dead_code)]
 pub(crate) fn read_i32(data: &[u8], offset: usize) -> Result<i32> {
     let bytes: [u8; 4] = data
         .get(offset..offset + 4)

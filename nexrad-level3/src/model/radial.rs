@@ -31,9 +31,11 @@ pub struct RadialRun {
     pub start_angle: f32,
     /// Azimuth angular width in degrees.
     pub angle_delta: f32,
-    /// Raw gate values (0–255). Interpretation depends on product type
-    /// and the PDB's threshold/scale/offset values.
-    pub gate_values: Vec<u8>,
+    /// Raw gate values. For 1-byte products values are 0–255; for 2-byte
+    /// products (e.g. EET, DPR via packet code 28) values are 0–65535.
+    /// Interpretation depends on product type and the PDB's
+    /// threshold/scale/offset values.
+    pub gate_values: Vec<u16>,
 }
 
 impl RadialPacket {

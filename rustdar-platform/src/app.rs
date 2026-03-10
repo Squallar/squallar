@@ -42,8 +42,8 @@ type ScanResult = (u64, Result<(Scan, String, NaiveDateTime), String>);
 /// Result from background radar rendering: (image_data, max_range_km, value_data, product, elevation, generation)
 type RenderResult = (Vec<u8>, f64, Vec<f32>, RadarProduct, f32, u64);
 
-/// Result from a Level III product fetch: (generation, product, result)
-type Level3Result = (u64, RadarProduct, Result<Level3Message, String>);
+/// Result from a Level III product fetch: (generation, product, tilt_code, result)
+type Level3Result = (u64, RadarProduct, String, Result<Level3Message, String>);
 
 /// Result from a background SPC outlook fetch
 type OutlookResult = (OutlookDay, OutlookProduct, Result<SpcOutlook, String>);
@@ -74,8 +74,8 @@ pub struct App {
     // re-upload the texture instantly after suspend/resume without re-rendering.
     // Fields: (rgba_data, max_range_km, value_data, product, elevation)
     cached_render: Option<(Vec<u8>, f64, Vec<f32>, RadarProduct, f32)>,
-    // Decoded Level III product data, keyed by RadarProduct
-    level3_data: HashMap<RadarProduct, Arc<Level3Message>>,
+    // Decoded Level III product data, keyed by (RadarProduct, tilt_code)
+    level3_data: HashMap<(RadarProduct, String), Arc<Level3Message>>,
     // Channel for Level III fetch results
     level3_receiver: Receiver<Level3Result>,
     level3_sender: Sender<Level3Result>,
@@ -300,13 +300,12 @@ impl App {
             })
             .collect();
 
-        // Always include Level III products with a nominal 0.5° elevation.
-        // Their data arrives asynchronously; the render path gracefully
-        // handles the case where the data hasn't arrived yet.
+        // Include Level III products in the available list.
+        // Actual elevation angles are populated as L3 data arrives.
         for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
             product_elevations_sorted
                 .entry(*l3_product)
-                .or_insert_with(|| vec![0.5]);
+                .or_insert_with(Vec::new);
         }
 
         // Get list of available products, sorted by priority (Reflectivity first)
@@ -683,14 +682,15 @@ impl App {
         }
 
         // Poll for completed Level III fetch results
-        if let Ok((generation, product, result)) = self.level3_receiver.try_recv() {
+        if let Ok((generation, product, tilt_code, result)) = self.level3_receiver.try_recv() {
             if generation < self.fetch_generation {
                 log::info!("Discarding stale Level III result (gen {} < current {})", generation, self.fetch_generation);
             } else {
                 match result {
                     Ok(message) => {
-                        log::info!("Level III {:?} fetched successfully", product);
-                        self.level3_data.insert(product, Arc::new(message));
+                        let elevation = message.pdb.elevation_angle();
+                        log::info!("Level III {:?} {} fetched successfully (elevation={:.1}°)", product, tilt_code, elevation);
+                        self.level3_data.insert((product, tilt_code), Arc::new(message));
                         // Trigger a re-render if currently viewing this product
                         if self.gui.get_rendering_params().map(|(p, _)| p) == Some(product) {
                             self.last_rendered = None;
@@ -714,17 +714,20 @@ impl App {
                                     RadarProduct::HydrometeorClassification => 10,
                                     RadarProduct::PrecipitationRate => 11,
                                 });
-                                // Level III radial products get a single nominal elevation
-                                info.product_elevations.entry(product).or_insert_with(|| {
-                                    vec![0.5] // Level III products use a nominal 0.5° elevation
-                                });
                                 info.status = format!(
                                     "Loaded {} products: {}",
                                     info.available_products.len(),
                                     info.available_products.iter().map(|p| p.name()).collect::<Vec<_>>().join(", ")
                                 );
-                                self.gui.set_scan_info(info);
                             }
+                            // Register the actual elevation angle from the PDB
+                            let elevations = info.product_elevations.entry(product).or_default();
+                            let rounded_elev = (elevation * 10.0).round() / 10.0;
+                            if !elevations.iter().any(|e| (e - rounded_elev).abs() < 0.05) {
+                                elevations.push(rounded_elev);
+                                elevations.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                            }
+                            self.gui.set_scan_info(info);
                         }
                     }
                     Err(e) => {
@@ -745,11 +748,19 @@ impl App {
 
             if needs_render && !self.render_in_flight {
                 if product.is_level3() {
-                    // Level III render path
-                    if let Some(l3_msg) = self.level3_data.get(&product) {
+                    // Level III render path — find the tilt with the closest elevation
+                    let best_l3 = self.level3_data.iter()
+                        .filter(|((p, _), _)| *p == product)
+                        .min_by(|(_, a), (_, b)| {
+                            let da = (a.pdb.elevation_angle() - elevation).abs();
+                            let db = (b.pdb.elevation_angle() - elevation).abs();
+                            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(_, msg)| Arc::clone(msg));
+                    if let Some(l3_msg) = best_l3 {
                         if let Some(scan_info) = self.gui.get_scan_info() {
                             log::info!("Spawning Level III render: {:?}", product);
-                            let l3_msg = Arc::clone(l3_msg);
+                            let l3_msg = Arc::clone(&l3_msg);
                             let lat = scan_info.site.lat;
                             let lon = scan_info.site.lon;
                             let sender = self.render_result_sender.clone();
@@ -757,8 +768,39 @@ impl App {
                             let window = self.window.clone();
 
                             std::thread::spawn(move || {
+                                log::debug!(
+                                    "L3 {:?}: pdb product_code={}, thresholds={:?}, ps47_53={:?}",
+                                    product, l3_msg.pdb.product_code,
+                                    l3_msg.pdb.thresholds, l3_msg.pdb.product_specific_47_53
+                                );
                                 // Extract radial packet from symbology
                                 let radial_packet = l3_msg.symbology.as_ref().and_then(|sym| {
+                                    log::debug!("L3 {:?}: symbology has {} layers", product, sym.layers.len());
+                                    for (li, layer) in sym.layers.iter().enumerate() {
+                                        log::debug!("L3 {:?}: layer {} has {} packets", product, li, layer.packets.len());
+                                        for (pi, pkt) in layer.packets.iter().enumerate() {
+                                            match pkt {
+                                                nexrad_level3::model::DataPacket::DigitalRadial(rp) => {
+                                                    log::debug!(
+                                                        "L3 {:?}: layer[{}].packet[{}] = DigitalRadial: radials={}, bins={}, scale_factor={}, is_legacy={}, first_range_bin={}",
+                                                        product, li, pi, rp.radials.len(), rp.num_range_bins, rp.scale_factor, rp.is_legacy, rp.first_range_bin
+                                                    );
+                                                    if let Some(r0) = rp.radials.first() {
+                                                        let non_zero: usize = r0.gate_values.iter().filter(|&&v| v > 1).count();
+                                                        let max_val = r0.gate_values.iter().copied().max().unwrap_or(0);
+                                                        log::debug!(
+                                                            "L3 {:?}: first radial: start_angle={}, delta={}, gates={}, non_zero(>1)={}, max_gate_val={}, first_10={:?}",
+                                                            product, r0.start_angle, r0.angle_delta, r0.gate_values.len(), non_zero, max_val,
+                                                            &r0.gate_values[..r0.gate_values.len().min(10)]
+                                                        );
+                                                    }
+                                                }
+                                                nexrad_level3::model::DataPacket::Raster(_) => {
+                                                    log::debug!("L3 {:?}: layer[{}].packet[{}] = Raster", product, li, pi);
+                                                }
+                                            }
+                                        }
+                                    }
                                     sym.layers.iter().find_map(|layer| {
                                         layer.packets.iter().find_map(|pkt| {
                                             if let nexrad_level3::model::DataPacket::DigitalRadial(rp) = pkt {
@@ -769,6 +811,9 @@ impl App {
                                         })
                                     })
                                 });
+                                if radial_packet.is_none() {
+                                    log::warn!("L3 {:?}: no radial packet found in symbology!", product);
+                                }
                                 if let Some(rp) = radial_packet {
                                     let scale = l3_msg.pdb.data_scale();
                                     let offset = l3_msg.pdb.data_offset();
@@ -777,10 +822,16 @@ impl App {
                                     } else {
                                         None
                                     };
+                                    log::debug!(
+                                        "L3 {:?}: rendering with scale={}, offset={}, legacy={}, gate_interval_km={}, first_gate_range_km={}",
+                                        product, scale, offset, rp.is_legacy, rp.gate_interval_km(), rp.first_gate_range_km()
+                                    );
                                     if let Some((image, range, values)) =
                                         render_level3_radial_to_image(rp, product, lat, lon, scale, offset, legacy_thresholds.as_ref())
                                     {
                                         let _ = sender.send((image, range, values, product, elevation, generation));
+                                    } else {
+                                        log::warn!("L3 {:?}: render_level3_radial_to_image returned None", product);
                                     }
                                 }
                                 if let Some(window) = window {
@@ -1104,36 +1155,32 @@ impl App {
     /// Spawn Level III product fetches for all supported Level III products.
     /// Called after a Level II scan loads so the products are available
     /// alongside the base moments.
-    fn spawn_level3_fetches(&self, site: &str, timestamp: NaiveDateTime) {
-        let level3_products = [
-            (RadarProduct::StormRelativeVelocity, "N0S"),
-            (RadarProduct::SpecificDifferentialPhase, "N0K"),
-            (RadarProduct::EchoTops, "EET"),
-            (RadarProduct::VerticallyIntegratedLiquid, "DVL"),
-            (RadarProduct::HydrometeorClassification, "HHC"),
-            (RadarProduct::PrecipitationRate, "DPR"),
-        ];
+    fn spawn_level3_fetches(&self, site: &str, _timestamp: NaiveDateTime) {
         let generation = self.fetch_generation;
-        for (product, code) in level3_products {
-            let site = site.to_string();
-            let code = code.to_string();
-            let sender = self.level3_sender.clone();
-            let window = self.window.clone();
-            self.tokio_runtime.spawn(async move {
-                log::info!("Fetching Level III {} for {}", code, site);
-                let result = match scan::get_level3_product(&site, &code, timestamp).await {
-                    Ok(msg) => {
-                        log::info!("Fetched Level III {} for {}", code, site);
-                        Ok(msg)
-                    }
-                    Err(e) => {
-                        log::warn!("Level III {} fetch failed: {}", code, e);
-                        Err(format!("{e}"))
-                    }
-                };
-                let _ = sender.send((generation, product, result));
-                if let Some(w) = window { w.request_redraw(); }
-            });
+        for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
+            let Some(dirs) = l3_product.tgftp_dirs() else { continue };
+            for &dir in dirs {
+                let site = site.to_string();
+                let dir_str = dir.to_string();
+                let product = *l3_product;
+                let sender = self.level3_sender.clone();
+                let window = self.window.clone();
+                self.tokio_runtime.spawn(async move {
+                    log::info!("Fetching TGFTP {} for {}", dir_str, site);
+                    let result = match scan::get_tgftp_product(&site, &dir_str).await {
+                        Ok(msg) => {
+                            log::info!("Fetched TGFTP {} for {}", dir_str, site);
+                            Ok(msg)
+                        }
+                        Err(e) => {
+                            log::warn!("TGFTP {} fetch failed: {}", dir_str, e);
+                            Err(format!("{e}"))
+                        }
+                    };
+                    let _ = sender.send((generation, product, dir_str, result));
+                    if let Some(w) = window { w.request_redraw(); }
+                });
+            }
         }
     }
 

@@ -3,7 +3,7 @@
 use crate::model::{RadialPacket, RadialRun};
 use crate::result::{Error, Result};
 
-use super::header::{read_i16, read_u16, read_u32};
+use super::header::{read_i16, read_i32, read_u16, read_u32};
 
 /// Decode a Digital Radial Data Array packet (packet code 16).
 ///
@@ -60,7 +60,7 @@ pub(crate) fn decode_digital_radial_packet(
         let start_angle = start_angle_raw as f32 / 10.0;
         let angle_delta = angle_delta_raw as f32 / 10.0;
 
-        // Read gate values (num_bytes of data)
+        // Read gate values (num_bytes of data), widening u8 → u16
         let gate_end = o + num_bytes;
         if gate_end > data.len() {
             return Err(Error::UnexpectedEof {
@@ -69,7 +69,7 @@ pub(crate) fn decode_digital_radial_packet(
                 available: data.len().saturating_sub(o),
             });
         }
-        let gate_values = data[o..gate_end].to_vec();
+        let gate_values: Vec<u16> = data[o..gate_end].iter().map(|&b| b as u16).collect();
         o = gate_end;
 
         // Data is padded to halfword boundary
@@ -166,10 +166,10 @@ pub(crate) fn decode_legacy_radial_packet(
         }
 
         // Decode RLE: each byte encodes high nibble = run count, low nibble = value (0-15)
-        let mut gate_values = Vec::with_capacity(num_range_bins as usize);
+        let mut gate_values: Vec<u16> = Vec::with_capacity(num_range_bins as usize);
         for &byte in &data[o..rle_end] {
             let run = (byte >> 4) as usize;
-            let val = byte & 0x0F;
+            let val = (byte & 0x0F) as u16;
             for _ in 0..run {
                 gate_values.push(val);
             }
@@ -202,22 +202,22 @@ pub(crate) fn decode_legacy_radial_packet(
 
 /// Decode a Generic Data Component packet (packet code 28).
 ///
-/// This is used by newer NEXRAD products. Layout (ICD Table V, packet 28):
+/// Packet 28 uses XDR (External Data Representation) encoding with a
+/// self-describing product description header, followed by one or more
+/// components (radial=1, text=4).
+///
+/// Layout:
 /// ```text
 /// HW 1        Packet code (28)
-/// HW 2        Reserved
+/// HW 2        Reserved (0)
 /// HW 3-4      Length of data block (u32, bytes after this field)
-/// HW 5        Number of radials (u16)
-/// HW 6        Number of range bins per radial (u16)
-/// HW 7        I center of sweep (i16)
-/// HW 8        J center of sweep (i16)
-/// HW 9        Scale factor (i16, range bin width in 0.001 km)
-/// HW 10       Number of bytes per radial gate (1 or 2)
-/// --- per radial ---
-/// HW 1-2      Starting angle (u32, scaled by 10, 0.1° units)
-/// HW 3-4      Angle delta (u32, scaled by 10, 0.1° units)
-/// ... gate data (num_bins * bytes_per_gate bytes, padded to halfword) ...
+/// ... XDR-encoded product description and component data ...
 /// ```
+///
+/// The XDR product description contains variable-length strings and metadata,
+/// followed by a parameter list and component list. For radial components,
+/// the data includes per-radial azimuth, elevation, angular width, bin count,
+/// attributes, and an `i32` data array.
 ///
 /// Returns the decoded [`RadialPacket`] and the byte offset after the packet.
 pub(crate) fn decode_generic_radial_packet(
@@ -235,90 +235,216 @@ pub(crate) fn decode_generic_radial_packet(
 
     let block_end = o + block_length;
 
-    let num_radials = read_u16(data, o)?;
-    o += 2;
-    let num_range_bins = read_u16(data, o)?;
-    o += 2;
-    let i_center = read_i16(data, o)?;
-    o += 2;
-    let j_center = read_i16(data, o)?;
-    o += 2;
-    let scale_factor_raw = read_i16(data, o)?;
-    o += 2;
-    let bytes_per_gate = read_u16(data, o)? as usize;
-    o += 2;
+    // --- XDR Product Description ---
+    // Skip: name, description (variable-length strings)
+    o = skip_xdr_string(data, o)?;
+    o = skip_xdr_string(data, o)?;
 
-    // Scale factor encodes range bin width: raw value * 0.001 km
-    // We store it as "pixels per range bin" for consistency with packet 16,
-    // so scale_factor = 1.0 / (raw * 0.001) when raw > 0.
-    let scale_factor = if scale_factor_raw > 0 {
-        1000.0 / scale_factor_raw as f32
-    } else {
-        1.0
-    };
+    // Skip: code(i32), type(i32), prod_time(u32)
+    o = skip_xdr_bytes(data, o, 12)?;
 
-    let mut radials = Vec::with_capacity(num_radials as usize);
-    for _ in 0..num_radials {
-        if o >= block_end || o + 4 > data.len() {
-            break;
+    // Skip: radar_name (variable-length string)
+    o = skip_xdr_string(data, o)?;
+
+    // Skip: lat(f32), lon(f32), height(f32), vol_time(u32), el_time(u32),
+    //        el_angle(f32), vol_num(i32), op_mode(i32), vcp_num(i32),
+    //        el_num(i32), compression(i32), uncompressed_size(i32)
+    //        = 12 × 4 = 48 bytes
+    o = skip_xdr_bytes(data, o, 48)?;
+
+    // Skip product-level parameters
+    o = skip_xdr_param_list(data, o)?;
+
+    // --- Components ---
+    let num_components = read_xdr_i32(data, o)?;
+    o += 4;
+    o += 4; // skip "pointer" field (always present, value is meaningless)
+
+    for ci in 0..num_components {
+        let comp_code = read_xdr_i32(data, o)?;
+        o += 4;
+
+        if comp_code == 1 {
+            // Radial component
+            return decode_xdr_radial_component(data, o, block_end);
         }
-        // Angles are stored as unsigned scaled values (0.1° units) in some
-        // implementations, but the ICD-defined format uses two halfwords.
-        let start_angle_raw = read_u16(data, o)?;
-        o += 2;
-        let angle_delta_raw = read_u16(data, o)?;
-        o += 2;
 
-        let start_angle = start_angle_raw as f32 / 10.0;
-        let angle_delta = angle_delta_raw as f32 / 10.0;
+        // Unknown component type — we can't skip it without knowing its size,
+        // so bail out. (Text components (code=4) aren't radial data.)
+        log::warn!(
+            "Skipping unknown XDR component code {} ({}/{})",
+            comp_code,
+            ci + 1,
+            num_components
+        );
+        break;
+    }
 
-        let gate_data_len = num_range_bins as usize * bytes_per_gate;
-        let gate_end = o + gate_data_len;
-        if gate_end > data.len() {
+    // No radial component found — return empty packet so caller can handle gracefully
+    Ok((
+        RadialPacket {
+            first_range_bin: 0,
+            num_range_bins: 0,
+            i_center: 0,
+            j_center: 0,
+            scale_factor: 1.0,
+            is_legacy: false,
+            radials: Vec::new(),
+        },
+        block_end,
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// XDR helper functions
+// ---------------------------------------------------------------------------
+
+/// Read a big-endian i32 from XDR data.
+fn read_xdr_i32(data: &[u8], offset: usize) -> Result<i32> {
+    read_i32(data, offset)
+}
+
+/// Read a big-endian f32 from XDR data.
+fn read_xdr_f32(data: &[u8], offset: usize) -> Result<f32> {
+    let bits = read_u32(data, offset)?;
+    Ok(f32::from_bits(bits))
+}
+
+/// Skip `n` bytes, validating bounds.
+fn skip_xdr_bytes(data: &[u8], offset: usize, n: usize) -> Result<usize> {
+    if offset + n > data.len() {
+        return Err(Error::UnexpectedEof {
+            offset,
+            expected: n,
+            available: data.len().saturating_sub(offset),
+        });
+    }
+    Ok(offset + n)
+}
+
+/// Skip an XDR string (4-byte length prefix + padded-to-4 content).
+fn skip_xdr_string(data: &[u8], offset: usize) -> Result<usize> {
+    let len = read_u32(data, offset)? as usize;
+    let padded = (len + 3) / 4 * 4;
+    let end = offset + 4 + padded;
+    if end > data.len() {
+        return Err(Error::UnexpectedEof {
+            offset,
+            expected: 4 + padded,
+            available: data.len().saturating_sub(offset),
+        });
+    }
+    Ok(end)
+}
+
+/// Skip an XDR parameter list: count(i32) + pointer(i32) + N × (string, string, [pointer]).
+fn skip_xdr_param_list(data: &[u8], mut offset: usize) -> Result<usize> {
+    let num = read_xdr_i32(data, offset)?;
+    offset += 4;
+    offset += 4; // skip pointer
+
+    for i in 0..num {
+        offset = skip_xdr_string(data, offset)?; // parameter id
+        offset = skip_xdr_string(data, offset)?; // parameter attributes
+        if i < num - 1 {
+            offset += 4; // inter-item pointer
+        }
+    }
+    Ok(offset)
+}
+
+/// Decode an XDR radial component into a [`RadialPacket`].
+///
+/// Assumes `offset` points to the start of the radial component body
+/// (immediately after the component code).
+fn decode_xdr_radial_component(
+    data: &[u8],
+    mut o: usize,
+    block_end: usize,
+) -> Result<(RadialPacket, usize)> {
+    // Description string
+    o = skip_xdr_string(data, o)?;
+
+    // gate_width (float, meters) and first_gate (float, meters)
+    let gate_width = read_xdr_f32(data, o)?;
+    o += 4;
+    let _first_gate = read_xdr_f32(data, o)?;
+    o += 4;
+
+    // Skip radial-level parameters
+    o = skip_xdr_param_list(data, o)?;
+
+    // Number of radials
+    let num_radials = read_xdr_i32(data, o)? as usize;
+    o += 4;
+
+    let mut radials = Vec::with_capacity(num_radials);
+    let mut max_bins: u16 = 0;
+
+    for _ in 0..num_radials {
+        let azimuth = read_xdr_f32(data, o)?;
+        o += 4;
+        let _elevation = read_xdr_f32(data, o)?;
+        o += 4;
+        let width = read_xdr_f32(data, o)?;
+        o += 4;
+        let num_bins = read_xdr_i32(data, o)? as usize;
+        o += 4;
+
+        // Skip attributes string (e.g. "type = ushort; Unit = inches/hour")
+        o = skip_xdr_string(data, o)?;
+
+        // Data array: length prefix (i32) + N × i32 values
+        let arr_len = read_xdr_i32(data, o)? as usize;
+        o += 4;
+
+        let data_end = o + arr_len * 4;
+        if data_end > data.len() {
             return Err(Error::UnexpectedEof {
                 offset: o,
-                expected: gate_data_len,
+                expected: arr_len * 4,
                 available: data.len().saturating_sub(o),
             });
         }
 
-        // For 2-byte gates, take only the MSB to produce a Vec<u8> compatible
-        // with the rest of the pipeline.
-        let gate_values = if bytes_per_gate == 2 {
-            data[o..gate_end]
-                .chunks(2)
-                .map(|pair| pair[0])
-                .collect()
-        } else {
-            data[o..gate_end].to_vec()
-        };
-        o = gate_end;
+        // Values are i32 in XDR but typically represent unsigned shorts.
+        // Truncate to u16.
+        let gate_values: Vec<u16> = data[o..data_end]
+            .chunks_exact(4)
+            .map(|c| {
+                let val = i32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+                val as u16
+            })
+            .collect();
+        o = data_end;
 
-        // Pad to halfword boundary
-        if gate_data_len % 2 != 0 {
-            o += 1;
-        }
+        max_bins = max_bins.max(num_bins as u16);
 
         radials.push(RadialRun {
-            start_angle,
-            angle_delta,
+            start_angle: azimuth,
+            angle_delta: width,
             gate_values,
         });
     }
 
-    // Ensure we advance past the full block
-    o = o.max(block_end);
+    // gate_width is in meters; scale_factor = 1000 / gate_width_m
+    // so that gate_interval_km() = 1.0 / scale_factor = gate_width_m / 1000.0
+    let scale_factor = if gate_width > 0.0 {
+        1000.0 / gate_width
+    } else {
+        1.0
+    };
 
     Ok((
         RadialPacket {
             first_range_bin: 0,
-            num_range_bins,
-            i_center,
-            j_center,
+            num_range_bins: max_bins,
+            i_center: 0,
+            j_center: 0,
             scale_factor,
             is_legacy: false,
             radials,
         },
-        o,
+        block_end.max(o),
     ))
 }

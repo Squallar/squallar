@@ -378,3 +378,40 @@ pub async fn check_latest_level3(
     let keys = list_level3_keys(&client, site, product_code, date).await?;
     Ok(keys.last().map(|(_, dt)| *dt))
 }
+
+// ---------------------------------------------------------------------------
+// TGFTP (NWS) Level III product fetching
+// ---------------------------------------------------------------------------
+
+const TGFTP_BASE_URL: &str = "https://tgftp.nws.noaa.gov/SL.us008001/DF.of/DC.radar";
+
+/// Fetch the latest Level III product from NWS TGFTP.
+///
+/// The `sn.last` endpoint always returns the most recent product, so no
+/// listing or timestamp matching is needed.
+///
+/// `tgftp_dir` is the directory component, e.g. `"56rm0"` for SRM tilt 0.
+/// `site` is the 4-letter ICAO code (e.g. `"KTLX"`) — lowercased for the URL.
+pub async fn get_tgftp_product(
+    site: &str,
+    tgftp_dir: &str,
+) -> std::result::Result<Level3Message, Level3FetchError> {
+    let site_lower = site.to_lowercase();
+    let url = format!(
+        "{TGFTP_BASE_URL}/DS.{tgftp_dir}/SI.{site_lower}/sn.last"
+    );
+
+    log::info!("Fetching TGFTP product: {url}");
+    let client = reqwest::Client::new();
+    let resp = client.get(&url).send().await?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(Level3FetchError::NotFound(format!(
+            "TGFTP product DS.{tgftp_dir} not found for {site}"
+        )));
+    }
+    let resp = resp.error_for_status()?;
+    let bytes = resp.bytes().await?;
+
+    let message = nexrad_level3::decode::decode_product(&bytes)?;
+    Ok(message)
+}

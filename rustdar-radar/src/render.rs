@@ -180,15 +180,17 @@ impl RadarProduct {
         )
     }
 
-    /// The Level III S3 product code (e.g. "N0S") for this product, if it is a Level III product.
-    pub fn level3_code(&self) -> Option<&'static str> {
+    /// The TGFTP directory names for all available tilts of this product.
+    /// Used to fetch from `https://tgftp.nws.noaa.gov/SL.us008001/DF.of/DC.radar/DS.{dir}/SI.{site}/sn.last`.
+    /// Returns `None` for Level II products.
+    pub fn tgftp_dirs(&self) -> Option<&'static [&'static str]> {
         match self {
-            RadarProduct::StormRelativeVelocity => Some("N0S"),
-            RadarProduct::SpecificDifferentialPhase => Some("N0K"),
-            RadarProduct::EchoTops => Some("EET"),
-            RadarProduct::VerticallyIntegratedLiquid => Some("DVL"),
-            RadarProduct::HydrometeorClassification => Some("HHC"),
-            RadarProduct::PrecipitationRate => Some("DPR"),
+            RadarProduct::StormRelativeVelocity => Some(&["56rm0", "56rm1", "56rm2", "56rm3"]),
+            RadarProduct::SpecificDifferentialPhase => Some(&["163k0"]),
+            RadarProduct::EchoTops => Some(&["135et"]),
+            RadarProduct::VerticallyIntegratedLiquid => Some(&["134il"]),
+            RadarProduct::HydrometeorClassification => Some(&["177hh"]),
+            RadarProduct::PrecipitationRate => Some(&["176pr"]),
             _ => None,
         }
     }
@@ -454,6 +456,75 @@ pub fn render_level3_radial_to_image(
 
     let radials = &radial_packet.radials;
 
+    // Debug: count total renderable gates across all radials
+    {
+        let mut total_gates = 0usize;
+        let mut below_thresh = 0usize;
+        let mut nan_or_999 = 0usize;
+        let mut out_of_range = 0usize;
+        let mut transparent_color = 0usize;
+        let mut rendered = 0usize;
+        for radial_run in radials.iter() {
+            let bins_to_render = radial_run.gate_values.len().min(num_bins);
+            for (gate_idx, &gate_value) in radial_run.gate_values[..bins_to_render].iter().enumerate() {
+                total_gates += 1;
+                if gate_value <= 1 {
+                    below_thresh += 1;
+                    continue;
+                }
+                let physical_value = if let Some(thresholds) = legacy_thresholds {
+                    let idx = gate_value as usize;
+                    if idx < 16 { thresholds[idx] } else { f32::NAN }
+                } else {
+                    (gate_value as f32 - offset) / scale
+                };
+                // SRV products (both legacy N0S and digital N*U) output knots;
+                // velocity_color() expects m/s.
+                let physical_value = if matches!(product, RadarProduct::StormRelativeVelocity) {
+                    physical_value * 0.514444
+                } else {
+                    physical_value
+                };
+                if physical_value.is_nan() || physical_value >= 999.0 {
+                    nan_or_999 += 1;
+                    continue;
+                }
+                let range_km = first_gate_range + gate_idx as f64 * gate_interval;
+                if range_km > MAX_RANGE_KM {
+                    out_of_range += 1;
+                    continue;
+                }
+                let color = get_color_for_value(product, physical_value);
+                if color.3 == 0 {
+                    transparent_color += 1;
+                    continue;
+                }
+                rendered += 1;
+            }
+        }
+        log::debug!(
+            "L3 {:?} gate stats: total={}, below_thresh(<=1)={}, nan_or_999={}, out_of_range(>{:.0}km)={}, transparent_color={}, renderable={}",
+            product, total_gates, below_thresh, nan_or_999, MAX_RANGE_KM, out_of_range, transparent_color, rendered
+        );
+        // Log a few sample physical values from the first radial with data
+        if let Some(r0) = radials.first() {
+            let mut samples = Vec::new();
+            let bins = r0.gate_values.len().min(num_bins);
+            for (i, &gv) in r0.gate_values[..bins].iter().enumerate() {
+                if gv > 1 && samples.len() < 5 {
+                    let pv = if let Some(thresholds) = legacy_thresholds {
+                        let idx = gv as usize;
+                        if idx < 16 { thresholds[idx] } else { f32::NAN }
+                    } else {
+                        (gv as f32 - offset) / scale
+                    };
+                    samples.push(format!("gate[{}]: raw={} -> phys={:.3}", i, gv, pv));
+                }
+            }
+            log::debug!("L3 {:?} sample values: {:?}", product, samples);
+        }
+    }
+
     // Process radials in parallel
     radials.par_iter().for_each(|radial_run| {
         let azimuth = radial_run.start_angle as f64 + radial_run.angle_delta as f64 / 2.0;
@@ -468,19 +539,26 @@ pub fn render_level3_radial_to_image(
         let cos_az_delta = cos_az_end - cos_az_start;
 
         let bins_to_render = radial_run.gate_values.len().min(num_bins);
-        for (gate_idx, &gate_byte) in radial_run.gate_values[..bins_to_render].iter().enumerate() {
+        for (gate_idx, &gate_value) in radial_run.gate_values[..bins_to_render].iter().enumerate() {
             // Gate value 0 and 1 are typically "below threshold" and "range folded"
-            if gate_byte <= 1 {
+            if gate_value <= 1 {
                 continue;
             }
 
             let physical_value = if let Some(thresholds) = legacy_thresholds {
                 // Legacy product: use threshold LUT (gate values are 0–15)
-                let idx = gate_byte as usize;
+                let idx = gate_value as usize;
                 if idx < 16 { thresholds[idx] } else { f32::NAN }
             } else {
                 // Digital product: linear scale/offset
-                (gate_byte as f32 - offset) / scale
+                (gate_value as f32 - offset) / scale
+            };
+            // SRV products (both legacy N0S and digital N*U) output knots;
+            // velocity_color() expects m/s.
+            let physical_value = if matches!(product, RadarProduct::StormRelativeVelocity) {
+                physical_value * 0.514444
+            } else {
+                physical_value
             };
             if physical_value.is_nan() || physical_value >= 999.0 {
                 continue;
