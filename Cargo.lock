@@ -3763,6 +3763,7 @@ name = "rustdar-overlays"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "earcutr",
  "futures",
  "log",
  "openssl-sys",

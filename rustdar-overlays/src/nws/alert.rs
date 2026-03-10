@@ -176,14 +176,14 @@ pub fn parse_alerts(json: &serde_json::Value) -> Vec<NwsAlert> {
         let category = AlertCategory::from_event(&event);
 
         let features = if has_geometry {
-            vec![OverlayFeature {
+            vec![OverlayFeature::new(
                 polygons,
                 fill_rgba,
                 stroke_rgba,
-                label: event.clone(),
-                label2: opt_str_field(props, "headline").unwrap_or_default(),
-                hatch: HatchPattern::None,
-            }]
+                event.clone(),
+                opt_str_field(props, "headline").unwrap_or_default(),
+                HatchPattern::None,
+            )]
         } else {
             // Will be populated later by zone geometry resolution
             Vec::new()

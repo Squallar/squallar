@@ -246,7 +246,7 @@ pub fn parse_geojson(
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let polygons = match geo_type {
+        let mut polygons = match geo_type {
             "MultiPolygon" => parse_multi_polygon(geometry)?,
             "Polygon" => vec![parse_polygon(geometry)?],
             "GeometryCollection" => {
@@ -269,14 +269,22 @@ pub fn parse_geojson(
             }
         };
 
-        features.push(OverlayFeature {
+        // Simplify SPC outlook polygons at fetch time to reduce vertex
+        // counts for rendering. SPC GeoJSON can have very detailed coastline
+        // geometry that is expensive for triangulation.
+        crate::types::simplify_polygons(&mut polygons, 0.005);
+        if polygons.is_empty() {
+            continue;
+        }
+
+        features.push(OverlayFeature::new(
             polygons,
             fill_rgba,
             stroke_rgba,
             label,
             label2,
             hatch,
-        });
+        ));
     }
 
     Ok(SpcOutlook {

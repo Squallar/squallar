@@ -1,6 +1,9 @@
 use crate::actions::{GuiAction, RadarConfig};
-use crate::hatch::draw_hatch;
 use crate::layers::{LayerKind, LayerManager};
+use crate::overlay_cache::{
+    CachedFeature, OverlayLayerCache, ViewportKey,
+    build_cached_features, draw_cached_features,
+};
 use chrono::Timelike;
 use egui::Context;
 use std::collections::HashMap;
@@ -252,6 +255,17 @@ pub struct Gui {
     spc_md_fetching: bool,
     /// Index of the currently selected MD for detail popup.
     selected_md: Option<usize>,
+    // Overlay geometry caches — avoid per-frame triangulation + projection.
+    // Each cache stores projected screen-space meshes keyed on viewport state.
+    // Caches are invalidated when the source data changes (new fetch) or
+    // when the viewport (zoom/pan) changes enough to warrant re-projection.
+    spc_overlay_caches: HashMap<(OutlookDay, OutlookProduct), OverlayLayerCache>,
+    nws_overlay_cache: OverlayLayerCache,
+    spc_md_overlay_cache: OverlayLayerCache,
+    /// Data generation counters — bumped when source data is replaced.
+    spc_data_generation: HashMap<(OutlookDay, OutlookProduct), u64>,
+    nws_data_generation: u64,
+    spc_md_data_generation: u64,
     // Whether the mobile slide-out menu is open (Android only)
     #[cfg(target_os = "android")]
     show_mobile_menu: bool,
@@ -321,6 +335,12 @@ impl Gui {
             spc_md_fetch_time: None,
             spc_md_fetching: false,
             selected_md: None,
+            spc_overlay_caches: HashMap::new(),
+            nws_overlay_cache: OverlayLayerCache::new(),
+            spc_md_overlay_cache: OverlayLayerCache::new(),
+            spc_data_generation: HashMap::new(),
+            nws_data_generation: 0,
+            spc_md_data_generation: 0,
             #[cfg(target_os = "android")]
             show_mobile_menu: false,
             #[cfg(target_os = "android")]
@@ -673,13 +693,18 @@ impl Gui {
                             egui::DragPanButtons::PRIMARY
                         })
                         .show(ui, |ui, projector, memory| {
+                            let zoom = memory.zoom();
+
                             // Draw SPC outlook polygons (below radar)
                             draw_spc_overlays(
                                 ui,
                                 projector,
+                                zoom,
                                 &self.layers,
                                 &self.spc_outlooks,
                                 self.current_theme_is_dark,
+                                &mut self.spc_overlay_caches,
+                                &self.spc_data_generation,
                             );
 
                             // Overlay radar data if available
@@ -804,8 +829,11 @@ impl Gui {
                             let clicked_md = draw_spc_discussions(
                                 ui,
                                 projector,
+                                zoom,
                                 &self.layers,
                                 &self.spc_discussions,
+                                &mut self.spc_md_overlay_cache,
+                                self.spc_md_data_generation,
                             );
                             if let Some(idx) = clicked_md {
                                 self.selected_md = Some(idx);
@@ -815,8 +843,11 @@ impl Gui {
                             let clicked_alert = draw_nws_alerts(
                                 ui,
                                 projector,
+                                zoom,
                                 &self.layers,
                                 &self.nws_alerts,
+                                &mut self.nws_overlay_cache,
+                                self.nws_data_generation,
                             );
                             if let Some(idx) = clicked_alert {
                                 self.selected_alert = Some(idx);
@@ -1260,6 +1291,9 @@ impl Gui {
     pub fn set_spc_outlook(&mut self, day: OutlookDay, product: OutlookProduct, outlook: SpcOutlook) {
         self.spc_outlooks.insert((day, product), outlook);
         self.spc_fetch_times.insert((day, product), std::time::Instant::now());
+        // Bump data generation to invalidate cached overlay geometry
+        let generation = self.spc_data_generation.entry((day, product)).or_insert(0);
+        *generation = generation.wrapping_add(1);
     }
 
     /// Set whether an SPC fetch is currently in progress.
@@ -1271,6 +1305,8 @@ impl Gui {
     pub fn set_nws_alerts(&mut self, alerts: Vec<NwsAlert>) {
         self.nws_alerts = alerts;
         self.nws_fetch_time = Some(std::time::Instant::now());
+        // Invalidate cached overlay geometry
+        self.nws_data_generation = self.nws_data_generation.wrapping_add(1);
     }
 
     /// Set whether an NWS alerts fetch is currently in progress.
@@ -1282,6 +1318,8 @@ impl Gui {
     pub fn set_spc_discussions(&mut self, discussions: Vec<SpcDiscussion>) {
         self.spc_discussions = discussions;
         self.spc_md_fetch_time = Some(std::time::Instant::now());
+        // Invalidate cached overlay geometry
+        self.spc_md_data_generation = self.spc_md_data_generation.wrapping_add(1);
     }
 
     /// Set whether an SPC MD fetch is currently in progress.
@@ -1996,19 +2034,32 @@ fn tile_to_lat(y: u32, zoom: u8) -> f64 {
 
 /// Draw SPC convective outlook polygons on the map.
 ///
+/// Uses cached projected + triangulated geometry to avoid per-frame O(n²)
+/// ear-clip triangulation. The cache is invalidated on viewport changes
+/// (pan/zoom) or when new SPC data arrives.
+///
 /// This is a free function (not a method on `Gui`) to avoid capturing the
 /// entire `self` struct inside the map closure, which would conflict with
 /// disjoint field borrows required by Rust's borrow checker.
 fn draw_spc_overlays(
     ui: &egui::Ui,
     projector: &walkers::Projector,
+    zoom: f64,
     layers: &crate::layers::LayerManager,
     spc_outlooks: &HashMap<(OutlookDay, OutlookProduct), SpcOutlook>,
     current_theme_is_dark: bool,
+    caches: &mut HashMap<(OutlookDay, OutlookProduct), OverlayLayerCache>,
+    data_generations: &HashMap<(OutlookDay, OutlookProduct), u64>,
 ) {
     let screen_rect = ui.max_rect();
-    let clip_rect = screen_rect.expand(screen_rect.width().max(screen_rect.height()) * 0.5);
+    let key = ViewportKey::from_projector_and_rect(projector, zoom, screen_rect);
     let day = layers.spc_day;
+
+    let hatch_color = if current_theme_is_dark {
+        egui::Color32::from_rgba_unmultiplied(200, 200, 200, 180)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(60, 60, 60, 180)
+    };
 
     // Iterate through enabled SPC layers
     for layer_kind in layers.spc_layers_for_day() {
@@ -2022,279 +2073,155 @@ fn draw_spc_overlays(
             continue;
         };
 
-        // Draw features from lowest risk to highest (features are ordered low→high in GeoJSON)
-        for feature in &outlook.features {
-            for polygon in &feature.polygons {
-                if polygon.is_empty() {
-                    continue;
-                }
-                // Use exterior ring (first ring)
-                let exterior = &polygon[0];
-                if exterior.len() < 3 {
-                    continue;
-                }
+        let data_gen = data_generations.get(&(day, product)).copied().unwrap_or(0);
+        let cache = caches.entry((day, product)).or_insert_with(OverlayLayerCache::new);
 
-// Strip the GeoJSON closing duplicate (last == first)
-                    // since PathShape { closed: true } already closes the ring.
-                    // Keeping it causes degenerate edges that fold the polygon.
-                    let ring = if exterior.len() > 3
-                        && exterior.first() == exterior.last()
-                    {
-                        &exterior[..exterior.len() - 1]
-                    } else {
-                        exterior.as_slice()
-                    };
-
-                    // Project to screen coordinates, filtering non-finite values
-                    let projected: Vec<egui::Pos2> = ring
-                    .iter()
-                    .filter_map(|&(lat, lon)| {
-                        let p = projector
-                            .project(walkers::lat_lon(lat, lon))
-                            .to_pos2();
-                        // Filter non-finite and absurdly large coordinates that
-                        // cause precision issues in clipping math
-                        (p.x.is_finite() && p.y.is_finite()
-                            && p.x.abs() < 1e5 && p.y.abs() < 1e5)
-                            .then_some(p)
-                    })
-                    .collect();
-                    if projected.len() < 3 { continue; }
-
-                    // Clip polygon to padded viewport to prevent off-screen spike artifacts
-                    let screen_pts = clip_polygon_to_rect(&projected, clip_rect);
-                    if screen_pts.len() < 3 {
-                        continue;
-                    }
-
-                    // Simplify in screen space to remove near-collinear vertices
-                    // that cause miter-join spike artifacts in stroke rendering
-                    let screen_pts = simplify_screen_pts(&screen_pts, 1.5);
-                    if screen_pts.len() < 3 {
-                        continue;
-                    }
-
-                // Quick AABB visibility check
-                let mut min_x = f32::MAX;
-                let mut min_y = f32::MAX;
-                let mut max_x = f32::MIN;
-                let mut max_y = f32::MIN;
-                for pt in &screen_pts {
-                    min_x = min_x.min(pt.x);
-                    min_y = min_y.min(pt.y);
-                    max_x = max_x.max(pt.x);
-                    max_y = max_y.max(pt.y);
-                }
-                let poly_rect = egui::Rect::from_min_max(
-                    egui::pos2(min_x, min_y),
-                    egui::pos2(max_x, max_y),
-                );
-                if !screen_rect.intersects(poly_rect) {
-                    continue;
-                }
-
-                // Skip polygons too small to meaningfully render
-                if (max_x - min_x) < 2.0 && (max_y - min_y) < 2.0 {
-                    continue;
-                }
-
-                // Draw filled polygon using ear-clipping triangulation.
-                // egui's PathShape uses a centroid triangle-fan which only works
-                // for convex shapes; SPC polygons are deeply concave.
-                let [r, g, b, a] = feature.fill_rgba;
-                let fill = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
-                let [sr, sg, sb, sa] = feature.stroke_rgba;
-                let stroke_color = egui::Color32::from_rgba_unmultiplied(sr, sg, sb, sa);
-
-                // Flatten screen points into [x0, y0, x1, y1, ...] for earcutr
-                let coords: Vec<f64> = screen_pts
-                    .iter()
-                    .flat_map(|p| [p.x as f64, p.y as f64])
-                    .collect();
-                let tri_indices = earcutr::earcut(&coords, &[], 2).unwrap_or_default();
-                if !tri_indices.is_empty() {
-                    let mut mesh = egui::Mesh::default();
-                    for pt in &screen_pts {
-                        mesh.vertices.push(egui::epaint::Vertex {
-                            pos: *pt,
-                            uv: egui::epaint::WHITE_UV,
-                            color: fill,
-                        });
-                    }
-                    for idx in tri_indices {
-                        mesh.indices.push(idx as u32);
-                    }
-                    ui.painter().add(egui::Shape::mesh(mesh));
-                }
-
-                // Draw stroke outline as individual line segments to avoid
-                // miter-join spike artifacts that PathShape produces.
-                if sa > 0 {
-                    let stroke = egui::Stroke::new(1.5, stroke_color);
-                    for i in 0..screen_pts.len() {
-                        let j = (i + 1) % screen_pts.len();
-                        ui.painter().line_segment(
-                            [screen_pts[i], screen_pts[j]],
-                            stroke,
-                        );
-                    }
-                }
-
-                // Draw CIG hatching if applicable
-                if feature.hatch != HatchPattern::None {
-                    draw_hatch(
-                        ui.painter(),
-                        &screen_pts,
-                        feature.hatch,
-                        screen_rect,
-                        current_theme_is_dark,
-                    );
-                }
-            }
+        // Rebuild on any viewport or data change. This is cheap because
+        // O(n²) triangulation is pre-computed at fetch time — only O(n)
+        // vertex projection runs here.
+        if !cache.is_valid(&key, data_gen) {
+            cache.features = build_cached_features(
+                &outlook.features,
+                projector,
+                screen_rect,
+                true,
+                current_theme_is_dark,
+            );
+            cache.viewport_key = key;
+            cache.data_generation = data_gen;
         }
+
+        // Draw from cache — all geometry is batched into minimal painter calls
+        draw_cached_features(
+            ui.painter(),
+            &cache.features,
+            &outlook.features,
+            screen_rect,
+            hatch_color,
+        );
     }
 }
 
 /// Draw SPC Mesoscale Discussion polygons on the map.
 ///
+/// Uses cached projected geometry. On cache miss, temporary `OverlayFeature`
+/// wrappers are built for each MD's polygon so `build_cached_features` can
+/// pre-triangulate them.
+///
 /// Returns `Some(discussion_index)` if the user clicked on an MD polygon.
 fn draw_spc_discussions(
     ui: &egui::Ui,
     projector: &walkers::Projector,
+    zoom: f64,
     layers: &crate::layers::LayerManager,
     discussions: &[SpcDiscussion],
+    cache: &mut OverlayLayerCache,
+    data_gen: u64,
 ) -> Option<usize> {
     if !layers.is_enabled(LayerKind::SpcMesoscaleDiscussions) || discussions.is_empty() {
         return None;
     }
 
     let screen_rect = ui.max_rect();
-    let clip_rect = screen_rect.expand(screen_rect.width().max(screen_rect.height()) * 0.5);
+    let key = ViewportKey::from_projector_and_rect(projector, zoom, screen_rect);
+
+    // Rebuild on any viewport or data change
+    if !cache.is_valid(&key, data_gen) {
+        let temp_features: Vec<rustdar_overlays::types::OverlayFeature> = discussions
+            .iter()
+            .map(|md| {
+                let fill = md_fill_color(&md.md_type);
+                let stroke = md_stroke_color(&md.md_type);
+                let polygons: Vec<Vec<Vec<(f64, f64)>>> = md
+                    .polygon
+                    .iter()
+                    .map(|ring| vec![ring.clone()])
+                    .collect();
+                rustdar_overlays::types::OverlayFeature::new(
+                    polygons,
+                    fill,
+                    stroke,
+                    String::new(),
+                    String::new(),
+                    HatchPattern::None,
+                )
+            })
+            .collect();
+
+        cache.features = build_cached_features(
+            &temp_features,
+            projector,
+            screen_rect,
+            false,
+            false,
+        );
+        cache.viewport_key = key;
+        cache.data_generation = data_gen;
+    }
+
     let mut clicked_index: Option<usize> = None;
+    let painter = ui.painter();
+    let mut fill_mesh = egui::Mesh::default();
+    let mut strokes: Vec<egui::Shape> = Vec::new();
 
-    for (md_idx, md) in discussions.iter().enumerate() {
-        let fill_rgba = md_fill_color(&md.md_type);
-        let stroke_rgba = md_stroke_color(&md.md_type);
+    for (md_idx, (md, cached_feat)) in discussions.iter().zip(cache.features.iter()).enumerate() {
+        let [r, g, b, a] = md_fill_color(&md.md_type);
+        let fill = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+        let [sr, sg, sb, sa] = md_stroke_color(&md.md_type);
+        let stroke_color = egui::Color32::from_rgba_unmultiplied(sr, sg, sb, sa);
 
-        for polygon in &md.polygon {
-            if polygon.is_empty() {
+        for cached_poly in &cached_feat.polygons {
+            if !screen_rect.intersects(cached_poly.poly_rect) {
                 continue;
             }
 
-            // MD polygons have a single ring (no holes)
-            let ring = if polygon.len() > 3 && polygon.first() == polygon.last() {
-                &polygon[..polygon.len() - 1]
-            } else {
-                polygon.as_slice()
-            };
-            if ring.len() < 3 {
-                continue;
-            }
-
-            // Project to screen coordinates
-            let projected: Vec<egui::Pos2> = ring
-                .iter()
-                .filter_map(|&(lat, lon)| {
-                    let p = projector.project(walkers::lat_lon(lat, lon)).to_pos2();
-                    (p.x.is_finite() && p.y.is_finite()
-                        && p.x.abs() < 1e5 && p.y.abs() < 1e5)
-                        .then_some(p)
-                })
-                .collect();
-            if projected.len() < 3 {
-                continue;
-            }
-
-            // Clip polygon to padded viewport
-            let screen_pts = clip_polygon_to_rect(&projected, clip_rect);
-            if screen_pts.len() < 3 {
-                continue;
-            }
-
-            // Simplify in screen space
-            let screen_pts = simplify_screen_pts(&screen_pts, 1.5);
-            if screen_pts.len() < 3 {
-                continue;
-            }
-
-            // AABB culling
-            let mut min_x = f32::MAX;
-            let mut min_y = f32::MAX;
-            let mut max_x = f32::MIN;
-            let mut max_y = f32::MIN;
-            for pt in &screen_pts {
-                min_x = min_x.min(pt.x);
-                min_y = min_y.min(pt.y);
-                max_x = max_x.max(pt.x);
-                max_y = max_y.max(pt.y);
-            }
-            let poly_rect = egui::Rect::from_min_max(
-                egui::pos2(min_x, min_y),
-                egui::pos2(max_x, max_y),
-            );
-            if !screen_rect.intersects(poly_rect) {
-                continue;
-            }
-            if (max_x - min_x) < 2.0 && (max_y - min_y) < 2.0 {
-                continue;
-            }
-
-            // Fill via ear-clipping
-            let [r, g, b, a] = fill_rgba;
-            let fill = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
-            let [sr, sg, sb, sa] = stroke_rgba;
-            let stroke_color = egui::Color32::from_rgba_unmultiplied(sr, sg, sb, sa);
-
-            let coords: Vec<f64> = screen_pts
-                .iter()
-                .flat_map(|p| [p.x as f64, p.y as f64])
-                .collect();
-            let tri_indices = earcutr::earcut(&coords, &[], 2).unwrap_or_default();
-            if !tri_indices.is_empty() {
-                let mut mesh = egui::Mesh::default();
-                for pt in &screen_pts {
-                    mesh.vertices.push(egui::epaint::Vertex {
+            // Fill triangles
+            if !cached_poly.tri_indices.is_empty() {
+                let base = fill_mesh.vertices.len() as u32;
+                for pt in &cached_poly.screen_pts {
+                    fill_mesh.vertices.push(egui::epaint::Vertex {
                         pos: *pt,
                         uv: egui::epaint::WHITE_UV,
                         color: fill,
                     });
                 }
-                for idx in tri_indices {
-                    mesh.indices.push(idx as u32);
+                for &idx in &cached_poly.tri_indices {
+                    fill_mesh.indices.push(base + idx);
                 }
-                ui.painter().add(egui::Shape::mesh(mesh));
             }
 
-            // Draw stroke outline as individual line segments
+            // Stroke outline
             if sa > 0 {
                 let stroke = egui::Stroke::new(2.0, stroke_color);
-                for i in 0..screen_pts.len() {
-                    let j = (i + 1) % screen_pts.len();
-                    ui.painter().line_segment(
-                        [screen_pts[i], screen_pts[j]],
-                        stroke,
-                    );
+                let pts = &cached_poly.screen_pts;
+                for i in 0..pts.len() {
+                    let j = (i + 1) % pts.len();
+                    strokes.push(egui::Shape::line_segment([pts[i], pts[j]], stroke));
                 }
             }
 
-            // Draw MD number label at polygon centroid
-            let centroid_x = screen_pts.iter().map(|p| p.x).sum::<f32>() / screen_pts.len() as f32;
-            let centroid_y = screen_pts.iter().map(|p| p.y).sum::<f32>() / screen_pts.len() as f32;
-            let label_text = format!("MD {}", md.number);
-            ui.painter().text(
-                egui::pos2(centroid_x, centroid_y),
-                egui::Align2::CENTER_CENTER,
-                &label_text,
-                egui::FontId::proportional(11.0),
-                stroke_color,
-            );
+            // MD number label at polygon centroid
+            if !cached_poly.screen_pts.is_empty() {
+                let cx = cached_poly.screen_pts.iter().map(|p| p.x).sum::<f32>()
+                    / cached_poly.screen_pts.len() as f32;
+                let cy = cached_poly.screen_pts.iter().map(|p| p.y).sum::<f32>()
+                    / cached_poly.screen_pts.len() as f32;
+                painter.text(
+                    egui::pos2(cx, cy),
+                    egui::Align2::CENTER_CENTER,
+                    format!("MD {}", md.number),
+                    egui::FontId::proportional(11.0),
+                    stroke_color,
+                );
+            }
 
             // Click detection
             if clicked_index.is_none() {
                 let clicked = ui.ctx().input(|i| {
                     i.pointer.any_click()
-                        && i.pointer.interact_pos().map_or(false, |p| {
-                            poly_rect.contains(p) && point_in_polygon(p, &screen_pts)
+                        && i.pointer.interact_pos().is_some_and(|p| {
+                            cached_poly.poly_rect.contains(p)
+                                && point_in_polygon(p, &cached_poly.screen_pts)
                         })
                 });
                 if clicked {
@@ -2304,10 +2231,19 @@ fn draw_spc_discussions(
         }
     }
 
+    if !fill_mesh.vertices.is_empty() {
+        painter.add(egui::Shape::mesh(fill_mesh));
+    }
+    painter.extend(strokes);
+
     clicked_index
 }
 
 /// Draw NWS weather alert polygons on the map.
+///
+/// Uses cached projected geometry. The cache stores a flat list of
+/// `CachedFeature`s built from all alerts' features in order, so the
+/// drawing loop can reconstruct the alert→feature mapping cheaply.
 ///
 /// Returns `Some(alert_index)` if the user clicked on an alert polygon,
 /// allowing the caller to open a detail popup.
@@ -2317,134 +2253,102 @@ fn draw_spc_discussions(
 fn draw_nws_alerts(
     ui: &egui::Ui,
     projector: &walkers::Projector,
+    zoom: f64,
     layers: &crate::layers::LayerManager,
     nws_alerts: &[NwsAlert],
+    cache: &mut OverlayLayerCache,
+    data_gen: u64,
 ) -> Option<usize> {
     if !layers.any_nws_enabled() || nws_alerts.is_empty() {
         return None;
     }
 
     let screen_rect = ui.max_rect();
-    let clip_rect = screen_rect.expand(screen_rect.width().max(screen_rect.height()) * 0.5);
+    let key = ViewportKey::from_projector_and_rect(projector, zoom, screen_rect);
+
+    // Rebuild on any viewport or data change.
+    // Cache is built for ALL alerts (regardless of enabled categories) so that
+    // layer toggles don't require an expensive cache rebuild.
+    if !cache.is_valid(&key, data_gen) {
+        let mut all_cached: Vec<CachedFeature> = Vec::new();
+        for alert in nws_alerts.iter() {
+            let cached = build_cached_features(
+                &alert.features,
+                projector,
+                screen_rect,
+                false,
+                false,
+            );
+            all_cached.extend(cached);
+        }
+        cache.features = all_cached;
+        cache.viewport_key = key;
+        cache.data_generation = data_gen;
+    }
+
     let enabled_categories = layers.enabled_nws_categories();
     let mut clicked_index: Option<usize> = None;
+    let painter = ui.painter();
+    let mut fill_mesh = egui::Mesh::default();
+    let mut strokes: Vec<egui::Shape> = Vec::new();
 
+    // Walk the flat cache in the same alert→feature order it was built.
+    let mut flat_idx = 0;
     for (alert_idx, alert) in nws_alerts.iter().enumerate() {
-        if !enabled_categories.contains(&alert.category) {
-            continue;
-        }
+        let skip = !enabled_categories.contains(&alert.category);
+        for src_feature in &alert.features {
+            if flat_idx >= cache.features.len() {
+                break;
+            }
+            let cached_feat = &cache.features[flat_idx];
+            flat_idx += 1;
 
-        for overlay_feature in &alert.features {
-            for polygon in &overlay_feature.polygons {
-                if polygon.is_empty() {
-                    continue;
-                }
-                let exterior = &polygon[0];
-                if exterior.len() < 3 {
-                    continue;
-                }
+            if skip {
+                continue;
+            }
 
-                // Strip GeoJSON closing duplicate
-                let ring = if exterior.len() > 3 && exterior.first() == exterior.last() {
-                    &exterior[..exterior.len() - 1]
-                } else {
-                    exterior.as_slice()
-                };
+            let [r, g, b, a] = src_feature.fill_rgba;
+            let fill = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+            let [sr, sg, sb, sa] = src_feature.stroke_rgba;
+            let stroke_color = egui::Color32::from_rgba_unmultiplied(sr, sg, sb, sa);
 
-                // Project to screen, filtering non-finite and extreme values
-                let projected: Vec<egui::Pos2> = ring
-                    .iter()
-                    .filter_map(|&(lat, lon)| {
-                        let p = projector.project(walkers::lat_lon(lat, lon)).to_pos2();
-                        (p.x.is_finite() && p.y.is_finite()
-                            && p.x.abs() < 1e5 && p.y.abs() < 1e5)
-                            .then_some(p)
-                    })
-                    .collect();
-                if projected.len() < 3 { continue; }
-
-                // Clip polygon to padded viewport
-                let screen_pts = clip_polygon_to_rect(&projected, clip_rect);
-                if screen_pts.len() < 3 {
+            for cached_poly in &cached_feat.polygons {
+                if !screen_rect.intersects(cached_poly.poly_rect) {
                     continue;
                 }
 
-                // Simplify in screen space to remove near-collinear vertices
-                // that cause miter-join spike artifacts in stroke rendering
-                let screen_pts = simplify_screen_pts(&screen_pts, 1.5);
-                if screen_pts.len() < 3 {
-                    continue;
-                }
-
-                // AABB culling
-                let mut min_x = f32::MAX;
-                let mut min_y = f32::MAX;
-                let mut max_x = f32::MIN;
-                let mut max_y = f32::MIN;
-                for pt in &screen_pts {
-                    min_x = min_x.min(pt.x);
-                    min_y = min_y.min(pt.y);
-                    max_x = max_x.max(pt.x);
-                    max_y = max_y.max(pt.y);
-                }
-                let poly_rect = egui::Rect::from_min_max(
-                    egui::pos2(min_x, min_y),
-                    egui::pos2(max_x, max_y),
-                );
-                if !screen_rect.intersects(poly_rect) {
-                    continue;
-                }
-
-                // Skip polygons too small to meaningfully render
-                if (max_x - min_x) < 2.0 && (max_y - min_y) < 2.0 {
-                    continue;
-                }
-
-                // Fill via ear-clipping
-                let [r, g, b, a] = overlay_feature.fill_rgba;
-                let fill = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
-                let [sr, sg, sb, sa] = overlay_feature.stroke_rgba;
-                let stroke_color = egui::Color32::from_rgba_unmultiplied(sr, sg, sb, sa);
-
-                let coords: Vec<f64> = screen_pts
-                    .iter()
-                    .flat_map(|p| [p.x as f64, p.y as f64])
-                    .collect();
-                let tri_indices = earcutr::earcut(&coords, &[], 2).unwrap_or_default();
-                if !tri_indices.is_empty() {
-                    let mut mesh = egui::Mesh::default();
-                    for pt in &screen_pts {
-                        mesh.vertices.push(egui::epaint::Vertex {
+                // Fill triangles
+                if !cached_poly.tri_indices.is_empty() {
+                    let base = fill_mesh.vertices.len() as u32;
+                    for pt in &cached_poly.screen_pts {
+                        fill_mesh.vertices.push(egui::epaint::Vertex {
                             pos: *pt,
                             uv: egui::epaint::WHITE_UV,
                             color: fill,
                         });
                     }
-                    for idx in tri_indices {
-                        mesh.indices.push(idx as u32);
+                    for &idx in &cached_poly.tri_indices {
+                        fill_mesh.indices.push(base + idx);
                     }
-                    ui.painter().add(egui::Shape::mesh(mesh));
                 }
 
-                // Draw stroke outline as individual line segments to avoid
-                // miter-join spike artifacts that PathShape produces.
+                // Stroke outline
                 if sa > 0 {
                     let stroke = egui::Stroke::new(2.0, stroke_color);
-                    for i in 0..screen_pts.len() {
-                        let j = (i + 1) % screen_pts.len();
-                        ui.painter().line_segment(
-                            [screen_pts[i], screen_pts[j]],
-                            stroke,
-                        );
+                    let pts = &cached_poly.screen_pts;
+                    for i in 0..pts.len() {
+                        let j = (i + 1) % pts.len();
+                        strokes.push(egui::Shape::line_segment([pts[i], pts[j]], stroke));
                     }
                 }
 
-                // Click detection using point-in-polygon (ray casting)
+                // Click detection
                 if clicked_index.is_none() {
                     let clicked = ui.ctx().input(|i| {
                         i.pointer.any_click()
-                            && i.pointer.interact_pos().map_or(false, |p| {
-                                poly_rect.contains(p) && point_in_polygon(p, &screen_pts)
+                            && i.pointer.interact_pos().is_some_and(|p| {
+                                cached_poly.poly_rect.contains(p)
+                                    && point_in_polygon(p, &cached_poly.screen_pts)
                             })
                     });
                     if clicked {
@@ -2454,6 +2358,11 @@ fn draw_nws_alerts(
             }
         }
     }
+
+    if !fill_mesh.vertices.is_empty() {
+        painter.add(egui::Shape::mesh(fill_mesh));
+    }
+    painter.extend(strokes);
 
     clicked_index
 }
@@ -2554,142 +2463,4 @@ fn point_in_polygon(point: egui::Pos2, vertices: &[egui::Pos2]) -> bool {
         j = i;
     }
     inside
-}
-
-/// Sutherland-Hodgman polygon clipping against an axis-aligned rectangle.
-///
-/// Clips a polygon to the given rectangle by processing one edge at a time.
-/// This properly intersects polygon edges with the clip boundary instead of
-/// just clamping vertices, which would create spike artifacts.
-fn clip_polygon_to_rect(polygon: &[egui::Pos2], rect: egui::Rect) -> Vec<egui::Pos2> {
-    if polygon.is_empty() {
-        return Vec::new();
-    }
-
-    // Quick check: if all points are inside, skip clipping
-    if polygon.iter().all(|p| rect.contains(*p)) {
-        return polygon.to_vec();
-    }
-
-    let mut output = polygon.to_vec();
-
-    // Clip against each of the 4 edges: left, right, top, bottom
-    // Safe intersect lambdas guard against division by zero.
-    // Edge: left (x >= rect.min.x)
-    output = clip_edge(&output, |p| p.x >= rect.min.x, |a, b| {
-        let dx = b.x - a.x;
-        if dx.abs() < 1e-6 { return a; }
-        let t = (rect.min.x - a.x) / dx;
-        egui::pos2(rect.min.x, a.y + t * (b.y - a.y))
-    });
-    if output.len() < 3 { return output; }
-
-    // Edge: right (x <= rect.max.x)
-    output = clip_edge(&output, |p| p.x <= rect.max.x, |a, b| {
-        let dx = b.x - a.x;
-        if dx.abs() < 1e-6 { return a; }
-        let t = (rect.max.x - a.x) / dx;
-        egui::pos2(rect.max.x, a.y + t * (b.y - a.y))
-    });
-    if output.len() < 3 { return output; }
-
-    // Edge: top (y >= rect.min.y)
-    output = clip_edge(&output, |p| p.y >= rect.min.y, |a, b| {
-        let dy = b.y - a.y;
-        if dy.abs() < 1e-6 { return a; }
-        let t = (rect.min.y - a.y) / dy;
-        egui::pos2(a.x + t * (b.x - a.x), rect.min.y)
-    });
-    if output.len() < 3 { return output; }
-
-    // Edge: bottom (y <= rect.max.y)
-    output = clip_edge(&output, |p| p.y <= rect.max.y, |a, b| {
-        let dy = b.y - a.y;
-        if dy.abs() < 1e-6 { return a; }
-        let t = (rect.max.y - a.y) / dy;
-        egui::pos2(a.x + t * (b.x - a.x), rect.max.y)
-    });
-
-    output
-}
-
-/// Clip a polygon against a single half-plane edge (Sutherland-Hodgman step).
-fn clip_edge(
-    polygon: &[egui::Pos2],
-    inside: impl Fn(egui::Pos2) -> bool,
-    intersect: impl Fn(egui::Pos2, egui::Pos2) -> egui::Pos2,
-) -> Vec<egui::Pos2> {
-    if polygon.is_empty() {
-        return Vec::new();
-    }
-    let mut result = Vec::with_capacity(polygon.len());
-    let mut prev = polygon[polygon.len() - 1];
-    let mut prev_inside = inside(prev);
-
-    for &curr in polygon {
-        let curr_inside = inside(curr);
-        if curr_inside {
-            if !prev_inside {
-                result.push(intersect(prev, curr));
-            }
-            result.push(curr);
-        } else if prev_inside {
-            result.push(intersect(prev, curr));
-        }
-        prev = curr;
-        prev_inside = curr_inside;
-    }
-    result
-}
-
-/// Ramer-Douglas-Peucker simplification in screen-space (pixel coordinates).
-///
-/// Removes near-collinear vertices that cause miter-join spike artifacts
-/// in stroke rendering. An epsilon of ~1.5 pixels keeps shapes visually
-/// accurate while eliminating degenerate stroke geometry.
-fn simplify_screen_pts(pts: &[egui::Pos2], epsilon: f32) -> Vec<egui::Pos2> {
-    if pts.len() <= 3 {
-        return pts.to_vec();
-    }
-    rdp_simplify_pos2(pts, epsilon)
-}
-
-fn rdp_simplify_pos2(points: &[egui::Pos2], epsilon: f32) -> Vec<egui::Pos2> {
-    if points.len() <= 2 {
-        return points.to_vec();
-    }
-    let first = points[0];
-    let last = points[points.len() - 1];
-    let mut max_dist: f32 = 0.0;
-    let mut max_idx = 0;
-
-    for i in 1..points.len() - 1 {
-        let d = perp_dist_pos2(points[i], first, last);
-        if d > max_dist {
-            max_dist = d;
-            max_idx = i;
-        }
-    }
-
-    if max_dist > epsilon {
-        let mut left = rdp_simplify_pos2(&points[..=max_idx], epsilon);
-        let right = rdp_simplify_pos2(&points[max_idx..], epsilon);
-        left.pop();
-        left.extend(right);
-        left
-    } else {
-        vec![first, last]
-    }
-}
-
-fn perp_dist_pos2(point: egui::Pos2, line_start: egui::Pos2, line_end: egui::Pos2) -> f32 {
-    let dx = line_end.x - line_start.x;
-    let dy = line_end.y - line_start.y;
-    let len_sq = dx * dx + dy * dy;
-    if len_sq < 1e-6 {
-        let px = point.x - line_start.x;
-        let py = point.y - line_start.y;
-        return (px * px + py * py).sqrt();
-    }
-    ((point.x - line_start.x) * dy - (point.y - line_start.y) * dx).abs() / len_sq.sqrt()
 }

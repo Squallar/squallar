@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::types::{GeoPolygon, GeoPolygonRing, HatchPattern, OverlayFeature};
+use crate::types::{GeoPolygon, HatchPattern, OverlayFeature};
 
 use super::alert::NwsAlert;
 use super::colors::alert_color;
@@ -72,14 +72,14 @@ pub async fn resolve_zone_geometries(client: &reqwest::Client, alerts: &mut [Nws
 
         for url in &alert.affected_zones {
             if let Some(polys) = zone_cache.get(url) {
-                alert.features.push(OverlayFeature {
-                    polygons: polys.clone(),
+                alert.features.push(OverlayFeature::new(
+                    polys.clone(),
                     fill_rgba,
                     stroke_rgba,
-                    label: alert.event.clone(),
-                    label2: alert.headline.clone().unwrap_or_default(),
-                    hatch: HatchPattern::None,
-                });
+                    alert.event.clone(),
+                    alert.headline.clone().unwrap_or_default(),
+                    HatchPattern::None,
+                ));
             }
         }
     }
@@ -139,7 +139,7 @@ async fn fetch_zone_geometry(
         .map(|polygon| {
             polygon
                 .into_iter()
-                .map(|ring| simplify_ring(&ring, 0.005))
+                .map(|ring| crate::types::simplify_ring(&ring, 0.005))
                 .filter(|r| r.len() >= 3)
                 .collect()
         })
@@ -147,63 +147,4 @@ async fn fetch_zone_geometry(
         .collect();
 
     if simplified.is_empty() { None } else { Some(simplified) }
-}
-
-/// Ramer-Douglas-Peucker polygon ring simplification.
-///
-/// Reduces vertex count by removing points within `epsilon` degrees of the
-/// line between their neighbours. An epsilon of ~0.002 (~200 m) keeps shapes
-/// visually accurate at typical map zoom levels while cutting vertex counts by
-/// 80-90%.
-fn simplify_ring(ring: &GeoPolygonRing, epsilon: f64) -> GeoPolygonRing {
-    if ring.len() <= 3 {
-        return ring.clone();
-    }
-    rdp_simplify(ring, epsilon)
-}
-
-fn rdp_simplify(points: &[(f64, f64)], epsilon: f64) -> Vec<(f64, f64)> {
-    if points.len() <= 2 {
-        return points.to_vec();
-    }
-
-    let first = points[0];
-    let last = points[points.len() - 1];
-    let mut max_dist = 0.0_f64;
-    let mut max_idx = 0;
-
-    for (i, &pt) in points.iter().enumerate().skip(1).take(points.len() - 2) {
-        let d = perpendicular_distance(pt, first, last);
-        if d > max_dist {
-            max_dist = d;
-            max_idx = i;
-        }
-    }
-
-    if max_dist > epsilon {
-        let mut left = rdp_simplify(&points[..=max_idx], epsilon);
-        let right = rdp_simplify(&points[max_idx..], epsilon);
-        left.pop(); // Remove duplicate junction point
-        left.extend(right);
-        left
-    } else {
-        vec![first, last]
-    }
-}
-
-fn perpendicular_distance(
-    point: (f64, f64),
-    line_start: (f64, f64),
-    line_end: (f64, f64),
-) -> f64 {
-    let dx = line_end.0 - line_start.0;
-    let dy = line_end.1 - line_start.1;
-    let len_sq = dx * dx + dy * dy;
-    if len_sq < 1e-12 {
-        let px = point.0 - line_start.0;
-        let py = point.1 - line_start.1;
-        return (px * px + py * py).sqrt();
-    }
-    let num = ((point.0 - line_start.0) * dy - (point.1 - line_start.1) * dx).abs();
-    num / len_sq.sqrt()
 }

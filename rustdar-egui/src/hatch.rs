@@ -147,6 +147,103 @@ fn draw_directional_hatch(
     }
 }
 
+/// Generate hatch line segments for a polygon without drawing them.
+///
+/// Returns `(start, end, is_dotted)` tuples suitable for caching.
+/// This avoids per-frame recomputation of scanline-polygon intersections.
+pub fn generate_hatch_lines(
+    polygon_pts: &[Pos2],
+    pattern: HatchPattern,
+    clip_rect: Rect,
+    dark_theme: bool,
+) -> Vec<(Pos2, Pos2, bool)> {
+    let _ = (clip_rect, dark_theme); // used by draw_hatch but not needed here
+    if polygon_pts.len() < 3 || pattern == HatchPattern::None {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    match pattern {
+        HatchPattern::Cig1 => {
+            collect_directional_hatch(&mut lines, polygon_pts, 45.0, true);
+        }
+        HatchPattern::Cig2 => {
+            collect_directional_hatch(&mut lines, polygon_pts, 135.0, false);
+        }
+        HatchPattern::Cig3 => {
+            collect_directional_hatch(&mut lines, polygon_pts, 45.0, false);
+            collect_directional_hatch(&mut lines, polygon_pts, 135.0, false);
+        }
+        HatchPattern::None => {}
+    }
+    lines
+}
+
+/// Collect hatch line segments at a given angle, clipped to the polygon.
+fn collect_directional_hatch(
+    out: &mut Vec<(Pos2, Pos2, bool)>,
+    polygon_pts: &[Pos2],
+    angle_degrees: f32,
+    dotted: bool,
+) {
+    let mut min_x = f32::MAX;
+    let mut min_y = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut max_y = f32::MIN;
+    for pt in polygon_pts {
+        min_x = min_x.min(pt.x);
+        min_y = min_y.min(pt.y);
+        max_x = max_x.max(pt.x);
+        max_y = max_y.max(pt.y);
+    }
+    if min_x >= max_x || min_y >= max_y {
+        return;
+    }
+
+    let angle_rad = angle_degrees.to_radians();
+    let dir_x = angle_rad.cos();
+    let dir_y = -angle_rad.sin();
+    let norm_x = -dir_y;
+    let norm_y = dir_x;
+
+    let corners = [
+        Pos2::new(min_x, min_y),
+        Pos2::new(max_x, min_y),
+        Pos2::new(min_x, max_y),
+        Pos2::new(max_x, max_y),
+    ];
+    let mut min_proj = f32::MAX;
+    let mut max_proj = f32::MIN;
+    for c in &corners {
+        let proj = c.x * norm_x + c.y * norm_y;
+        min_proj = min_proj.min(proj);
+        max_proj = max_proj.max(proj);
+    }
+
+    let mut min_dir_proj = f32::MAX;
+    let mut max_dir_proj = f32::MIN;
+    for c in &corners {
+        let proj = c.x * dir_x + c.y * dir_y;
+        min_dir_proj = min_dir_proj.min(proj);
+        max_dir_proj = max_dir_proj.max(proj);
+    }
+    let line_half_len = (max_dir_proj - min_dir_proj) * 0.5 + 10.0;
+    let dir_center = (min_dir_proj + max_dir_proj) * 0.5;
+
+    let mut t = min_proj;
+    while t <= max_proj {
+        let cx = norm_x * t + dir_x * dir_center;
+        let cy = norm_y * t + dir_y * dir_center;
+        let p1 = Pos2::new(cx - dir_x * line_half_len, cy - dir_y * line_half_len);
+        let p2 = Pos2::new(cx + dir_x * line_half_len, cy + dir_y * line_half_len);
+        let segments = clip_line_to_polygon(p1, p2, polygon_pts);
+        for (s1, s2) in segments {
+            out.push((s1, s2, dotted));
+        }
+        t += HATCH_SPACING;
+    }
+}
+
 /// Clip a line segment to a polygon using even-odd intersection.
 /// Returns a list of interior segments.
 fn clip_line_to_polygon(p1: Pos2, p2: Pos2, polygon: &[Pos2]) -> Vec<(Pos2, Pos2)> {
