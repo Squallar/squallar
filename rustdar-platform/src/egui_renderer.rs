@@ -75,7 +75,7 @@ impl EguiRenderer {
         window: &Window,
         window_surface_view: &TextureView,
         screen_descriptor: ScreenDescriptor,
-    ) {
+    ) -> Vec<egui::TextureId> {
         self.set_pixels_per_point(screen_descriptor.pixels_per_point);
 
         let full_output = self.state.egui_ctx().end_pass();
@@ -115,8 +115,17 @@ impl EguiRenderer {
 
         self.renderer
             .render(&mut rpass.forget_lifetime(), &tris, &screen_descriptor);
-        for x in &full_output.textures_delta.free {
-            self.renderer.free_texture(x)
+
+        // Return textures to free — caller must free AFTER queue.submit()
+        // to avoid destroying GPU resources still referenced by the
+        // recorded render pass.
+        full_output.textures_delta.free
+    }
+
+    /// Free textures that are no longer needed.  Call after `queue.submit()`.
+    pub fn free_textures(&mut self, ids: &[egui::TextureId]) {
+        for id in ids {
+            self.renderer.free_texture(id);
         }
     }
 }
