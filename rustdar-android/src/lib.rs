@@ -412,6 +412,14 @@ fn android_main(app: AndroidApp) {
         }
     }
 
+    // Derive the Android cache directory for zone geometry caching.
+    // internal_data_path() returns .../files; its parent is the app root,
+    // so parent/cache gives us getCacheDir() which shows as clearable
+    // "Cache" in Android app settings.
+    let android_zone_cache = app
+        .internal_data_path()
+        .and_then(|p| p.parent().map(|root| root.join("cache").join("zones")));
+
     // Create event loop with Android app
     let event_loop = winit::event_loop::EventLoop::builder()
         .with_android_app(app)
@@ -423,6 +431,11 @@ fn android_main(app: AndroidApp) {
 
     // Wire up Android back button to minimize instead of exit
     platform_app.set_back_handler(move_task_to_back);
+
+    // Set zone geometry cache directory for persistent caching
+    if let Some(cache_path) = android_zone_cache {
+        platform_app.set_zone_cache_dir(cache_path);
+    }
 
     // Set up a callback to query system bar insets when the window is ready.
     // getRootWindowInsets() can return null before the first layout, so we

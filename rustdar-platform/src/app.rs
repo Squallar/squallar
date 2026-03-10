@@ -103,6 +103,9 @@ pub struct App {
     // Channel to receive GPS location updates (Android only)
     #[cfg(target_os = "android")]
     location_receiver: Option<std::sync::mpsc::Receiver<(f64, f64)>>,
+    // Persistent cache directory for NWS zone boundary geometries.
+    // Avoids re-fetching 1000+ zone HTTP requests on every app launch.
+    zone_cache_dir: Option<std::path::PathBuf>,
     // Optional callback for back-button behavior (e.g. moveTaskToBack on Android).
     // When None, back button exits the app.
     back_handler: Option<fn()>,
@@ -178,6 +181,7 @@ impl App {
             discussion_sender,
             discussion_receiver,
             tokio_runtime,
+            zone_cache_dir: Self::default_zone_cache_dir(),
             #[cfg(target_os = "android")]
             location_receiver: None,
             back_handler: None,
@@ -907,9 +911,13 @@ impl App {
                 let client = self.http_client.clone();
                 let sender = self.alert_sender.clone();
                 let window = self.window.clone();
+                let zone_cache = self.zone_cache_dir.clone();
                 self.tokio_runtime.spawn(async move {
                     let result =
-                        rustdar_overlays::nws::fetch::fetch_active_alerts(&client)
+                        rustdar_overlays::nws::fetch::fetch_active_alerts(
+                            &client,
+                            zone_cache.as_deref(),
+                        )
                             .await
                             .map_err(|e| format!("{e}"));
                     let _ = sender.send(result);
@@ -983,6 +991,28 @@ impl App {
     /// When set, pressing back invokes this instead of exiting.
     pub fn set_back_handler(&mut self, handler: fn()) {
         self.back_handler = Some(handler);
+    }
+
+    /// Override the zone geometry cache directory.
+    /// Called from the Android entry point with the app's internal data path.
+    pub fn set_zone_cache_dir(&mut self, dir: std::path::PathBuf) {
+        self.zone_cache_dir = Some(dir);
+    }
+
+    /// Determine a platform-appropriate cache directory for zone geometries.
+    fn default_zone_cache_dir() -> Option<std::path::PathBuf> {
+        // On Android, set externally via set_zone_cache_dir()
+        #[cfg(target_os = "android")]
+        { return None; }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let base = std::env::var("XDG_CACHE_HOME")
+                .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.cache", h)))
+                .or_else(|_| std::env::var("LOCALAPPDATA"))
+                .ok()?;
+            Some(std::path::PathBuf::from(base).join("rustdar").join("zones"))
+        }
     }
 
     /// Set a receiver for GPS location updates (Android only).

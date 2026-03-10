@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use super::alert::{NwsAlert, parse_alerts};
 use super::zones::resolve_zone_geometries;
 
@@ -7,8 +9,12 @@ const NWS_ALERTS_URL: &str = "https://api.weather.gov/alerts/active?status=actua
 ///
 /// Calls `GET /alerts/active?status=actual` on the NWS API.
 /// The `reqwest::Client` must have a `User-Agent` header configured.
+///
+/// `zone_cache_dir` is an optional path to a directory for caching zone
+/// boundary geometries on disk, avoiding 1000+ HTTP requests on each launch.
 pub async fn fetch_active_alerts(
     client: &reqwest::Client,
+    zone_cache_dir: Option<&Path>,
 ) -> Result<Vec<NwsAlert>, String> {
     log::info!("Fetching NWS active alerts from {}", NWS_ALERTS_URL);
 
@@ -37,7 +43,7 @@ pub async fn fetch_active_alerts(
     let mut alerts = parse_alerts(&json);
 
     // Resolve zone/county geometries for alerts that only have zone references
-    resolve_zone_geometries(client, &mut alerts).await;
+    resolve_zone_geometries(client, &mut alerts, zone_cache_dir).await;
 
     Ok(alerts)
 }

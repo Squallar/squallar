@@ -1,9 +1,22 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::types::{GeoPolygon, HatchPattern, OverlayFeature};
 
 use super::alert::NwsAlert;
 use super::colors::alert_color;
+
+/// TTL for cached zone geometries (1 year in seconds).
+const CACHE_TTL_SECS: u64 = 365 * 24 * 3600;
+
+/// A cached zone geometry entry, serialized to JSON on disk.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedZone {
+    /// Unix timestamp (seconds since epoch) when this entry was fetched.
+    fetched_at: u64,
+    /// Simplified polygon data for the zone.
+    polygons: Vec<GeoPolygon>,
+}
 
 /// Resolve zone/county geometries for alerts that have no inline polygon.
 ///
@@ -11,7 +24,15 @@ use super::colors::alert_color;
 /// URL, then builds `OverlayFeature`s and populates each alert's `features`.
 /// Zone URLs are deduplicated so each county is fetched at most once.
 /// Fetches run concurrently for speed.
-pub async fn resolve_zone_geometries(client: &reqwest::Client, alerts: &mut [NwsAlert]) {
+///
+/// When `cache_dir` is provided, zone geometries are cached on disk to avoid
+/// re-fetching 1000+ HTTP requests on every app launch. Cached entries expire
+/// after 1 year.
+pub async fn resolve_zone_geometries(
+    client: &reqwest::Client,
+    alerts: &mut [NwsAlert],
+    cache_dir: Option<&Path>,
+) {
     // Collect unique zone URLs needed (only for alerts with no features yet)
     let mut needed_urls: Vec<String> = Vec::new();
     for alert in alerts.iter() {
@@ -28,31 +49,48 @@ pub async fn resolve_zone_geometries(client: &reqwest::Client, alerts: &mut [Nws
         return;
     }
 
+    // Check disk cache first to avoid unnecessary HTTP requests
+    let mut zone_cache: HashMap<String, Vec<GeoPolygon>> = HashMap::new();
+    let mut urls_to_fetch: Vec<String> = Vec::new();
+
+    for url in &needed_urls {
+        if let Some(polys) = cache_dir.and_then(|dir| read_cached_zone(dir, url)) {
+            zone_cache.insert(url.clone(), polys);
+        } else {
+            urls_to_fetch.push(url.clone());
+        }
+    }
+
     log::info!(
-        "Fetching {} zone geometries for zone-based alerts",
-        needed_urls.len()
+        "Zone geometries: {} cached, {} to fetch",
+        zone_cache.len(),
+        urls_to_fetch.len(),
     );
 
-    // Fetch all zone geometries concurrently
-    let futs: Vec<_> = needed_urls
-        .iter()
-        .map(|url| {
-            let client = client.clone();
-            let url = url.clone();
-            async move {
-                let result = fetch_zone_geometry(&client, &url).await;
-                (url, result)
+    if !urls_to_fetch.is_empty() {
+        // Fetch remaining zone geometries concurrently
+        let futs: Vec<_> = urls_to_fetch
+            .iter()
+            .map(|url| {
+                let client = client.clone();
+                let url = url.clone();
+                async move {
+                    let result = fetch_zone_geometry(&client, &url).await;
+                    (url, result)
+                }
+            })
+            .collect();
+
+        let results = futures::future::join_all(futs).await;
+
+        for (url, result) in results {
+            if let Some(polys) = result {
+                // Write to disk cache for next time
+                if let Some(dir) = cache_dir {
+                    write_cached_zone(dir, &url, &polys);
+                }
+                zone_cache.insert(url, polys);
             }
-        })
-        .collect();
-
-    let results = futures::future::join_all(futs).await;
-
-    // Build lookup from URL → polygons
-    let mut zone_cache: HashMap<String, Vec<GeoPolygon>> = HashMap::new();
-    for (url, result) in results {
-        if let Some(polys) = result {
-            zone_cache.insert(url, polys);
         }
     }
 
@@ -147,4 +185,66 @@ async fn fetch_zone_geometry(
         .collect();
 
     if simplified.is_empty() { None } else { Some(simplified) }
+}
+
+// ── Disk cache helpers ───────────────────────────────────────────────────
+
+/// Current unix timestamp in seconds.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Extract a cache-friendly key from a NWS zone URL.
+///
+/// E.g. `https://api.weather.gov/zones/county/TXC113` → `"county_TXC113"`.
+fn zone_cache_key(url: &str) -> Option<String> {
+    let trimmed = url.trim_end_matches('/');
+    let mut parts = trimmed.rsplit('/');
+    let id = parts.next().filter(|s| !s.is_empty())?;
+    let kind = parts.next().unwrap_or("zone");
+    Some(format!("{kind}_{id}"))
+}
+
+/// Read a zone geometry from the disk cache.
+///
+/// Returns `None` if the file is missing, corrupt, or older than the TTL.
+fn read_cached_zone(cache_dir: &Path, url: &str) -> Option<Vec<GeoPolygon>> {
+    let key = zone_cache_key(url)?;
+    let path = cache_dir.join(format!("{key}.json"));
+    let data = std::fs::read_to_string(&path).ok()?;
+    let cached: CachedZone = serde_json::from_str(&data).ok()?;
+
+    if unix_now().saturating_sub(cached.fetched_at) > CACHE_TTL_SECS {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+
+    Some(cached.polygons)
+}
+
+/// Write a zone geometry to the disk cache.
+fn write_cached_zone(cache_dir: &Path, url: &str, polygons: &[GeoPolygon]) {
+    let Some(key) = zone_cache_key(url) else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(cache_dir) {
+        log::debug!("Failed to create zone cache directory: {e}");
+        return;
+    }
+    let entry = CachedZone {
+        fetched_at: unix_now(),
+        polygons: polygons.to_vec(),
+    };
+    let path = cache_dir.join(format!("{key}.json"));
+    match serde_json::to_string(&entry) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                log::debug!("Failed to write zone cache {}: {e}", path.display());
+            }
+        }
+        Err(e) => log::debug!("Failed to serialize zone cache: {e}"),
+    }
 }
