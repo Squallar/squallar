@@ -17,6 +17,7 @@ pub fn get_color_for_value(product: RadarProduct, value: f32) -> (u8, u8, u8, u8
         RadarProduct::VerticallyIntegratedLiquid => vil_color(value),
         RadarProduct::HydrometeorClassification => hhc_color(value),
         RadarProduct::PrecipitationRate => precip_rate_color(value),
+        RadarProduct::NormalizedRotation => nrot_color(value),
     }
 }
 
@@ -412,6 +413,44 @@ fn precip_rate_color(rate: f32) -> (u8, u8, u8, u8) {
         (255, 0, 255) // Magenta
     } else {
         (200, 0, 200) // Purple (extreme)
+    };
+
+    (r, g, b, TRANSPARENCY)
+}
+
+/// Normalized Rotation (NROT) color scale (unitless)
+/// Diverging palette: blue = anticyclonic (negative), red = cyclonic (positive)
+/// Values near zero are transparent. >1.0 significant, >2.5 extreme.
+fn nrot_color(nrot: f32) -> (u8, u8, u8, u8) {
+    if nrot.is_nan() || nrot.is_infinite() {
+        return (0, 0, 0, 0);
+    }
+
+    // Values near zero — transparent (no significant rotation)
+    if nrot.abs() < 0.3 {
+        return (0, 0, 0, 0);
+    }
+
+    let (r, g, b) = if nrot > 4.0 {
+        (200, 0, 200) // Purple (extreme cyclonic)
+    } else if nrot > 2.5 {
+        (255, 0, 0) // Red (strong cyclonic)
+    } else if nrot > 1.5 {
+        (255, 150, 0) // Orange
+    } else if nrot > 1.0 {
+        (255, 255, 0) // Yellow (significant)
+    } else if nrot > 0.3 {
+        (200, 200, 200) // Light grey (weak positive)
+    } else if nrot < -4.0 {
+        (128, 0, 255) // Violet (extreme anticyclonic)
+    } else if nrot < -2.5 {
+        (0, 0, 255) // Blue (strong anticyclonic)
+    } else if nrot < -1.5 {
+        (0, 150, 255) // Light blue
+    } else if nrot < -1.0 {
+        (0, 255, 255) // Cyan (significant)
+    } else {
+        (160, 160, 160) // Grey (weak negative)
     };
 
     (r, g, b, TRANSPARENCY)

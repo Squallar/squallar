@@ -829,6 +829,9 @@ impl Gui {
                                                         RadarProduct::PrecipitationRate => {
                                                             format!(" | Precip Rate: {:.2} in/hr", value)
                                                         }
+                                                        RadarProduct::NormalizedRotation => {
+                                                            format!(" | NROT: {:.2}", value)
+                                                        }
                                                     };
                                                 }
                                             }
