@@ -4,11 +4,12 @@ use crate::overlay_cache::{
     CachedFeature, OverlayLayerCache, ViewportKey,
     build_cached_features, draw_cached_features,
 };
+use crate::pane::{PaneId, PaneLayout, PaneState, MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
 use chrono::Timelike;
 use egui::Context;
 use std::collections::HashMap;
 use std::sync::Arc;
-use walkers::{HttpTiles, MapMemory, Texture, Tiles, sources::{TileSource, Attribution}, TileId};
+use walkers::{HttpTiles, Texture, Tiles, sources::{TileSource, Attribution}, TileId};
 use rustdar_radar::render::{ImageBounds, RadarProduct, ScanInfo, IMAGE_SIZE, MAX_RANGE_KM};
 use rustdar_radar::sites::RADARS;
 use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
@@ -209,22 +210,11 @@ pub struct Gui {
     auto_poll_enabled: bool,
     initial_fetch_done: bool,
     initial_zoom_set: bool, // Track if we've already set the initial zoom
-    // Map state
-    map_memory: MapMemory,
+    // Map tile state (shared across all panes)
     tiles_light: Option<HttpTiles>,
     tiles_dark: Option<HttpTiles>,
     current_theme_is_dark: bool, // Track current theme
-    // Radar rendering state
-    selected_elevation: f32,
-    selected_product: RadarProduct,
-    radar_image: Option<(egui::TextureHandle, f64, f64, f64, Arc<Vec<f32>>)>, // texture, lat, lon, max_range_km, value_data
-    // Cached geographic bounds for the current radar image (recomputed only on site/image change)
-    cached_image_bounds: Option<ImageBounds>,
-    // Hover state for showing radar values
-    hover_value: Option<String>,
-    // Cache the last hover screen position to skip recomputation when pointer hasn't moved
-    last_hover_pos: Option<egui::Pos2>,
-    // City / road label overlay
+    // City / road label overlay (shared)
     label_tiles_light: Option<HttpTiles>,
     label_tiles_dark: Option<HttpTiles>,
     // Track which site is currently loading
@@ -235,37 +225,34 @@ pub struct Gui {
     poll_interval_secs: u64,
     // User's GPS location for blue dot indicator (lat, lon)
     user_location: Option<(f64, f64)>,
-    // Layer management (replaces individual show_* booleans)
-    layers: LayerManager,
-    // SPC convective outlook data cache
+    // SPC convective outlook data cache (shared — same weather data for all panes)
     spc_outlooks: HashMap<(OutlookDay, OutlookProduct), SpcOutlook>,
     // Track when each SPC product was last fetched
     spc_fetch_times: HashMap<(OutlookDay, OutlookProduct), std::time::Instant>,
     // Whether an SPC fetch is currently in flight
     spc_fetching: bool,
-    // NWS weather alerts state
+    // NWS weather alerts state (shared)
     nws_alerts: Vec<NwsAlert>,
     nws_fetch_time: Option<std::time::Instant>,
     nws_fetching: bool,
     /// Index of the currently selected alert for detail popup.
     selected_alert: Option<usize>,
-    // SPC Mesoscale Discussions state
+    // SPC Mesoscale Discussions state (shared)
     spc_discussions: Vec<SpcDiscussion>,
     spc_md_fetch_time: Option<std::time::Instant>,
     spc_md_fetching: bool,
     /// Index of the currently selected MD for detail popup.
     selected_md: Option<usize>,
-    // Overlay geometry caches — avoid per-frame triangulation + projection.
-    // Each cache stores projected screen-space meshes keyed on viewport state.
-    // Caches are invalidated when the source data changes (new fetch) or
-    // when the viewport (zoom/pan) changes enough to warrant re-projection.
-    spc_overlay_caches: HashMap<(OutlookDay, OutlookProduct), OverlayLayerCache>,
-    nws_overlay_cache: OverlayLayerCache,
-    spc_md_overlay_cache: OverlayLayerCache,
-    /// Data generation counters — bumped when source data is replaced.
+    /// Data generation counters — bumped when source data is replaced (shared).
     spc_data_generation: HashMap<(OutlookDay, OutlookProduct), u64>,
     nws_data_generation: u64,
     spc_md_data_generation: u64,
+    // Multi-pane state
+    panes: Vec<PaneState>,
+    active_pane: PaneId,
+    pane_layout: PaneLayout,
+    viewport_sync: bool,
+    sync_layers: bool,
     // Whether the mobile slide-out menu is open (Android only)
     #[cfg(target_os = "android")]
     show_mobile_menu: bool,
@@ -290,12 +277,6 @@ impl Gui {
         let date_string = radar_config.timestamp.format("%Y-%m-%d").to_string();
         let time_string = radar_config.timestamp.format("%H:%M:%S").to_string();
 
-        // Initialize map memory with a view of the contiguous US
-        let mut map_memory = MapMemory::default();
-        // Set zoom level to 4 to show the full contiguous US
-        // (default is 16 which is very zoomed in)
-        let _ = map_memory.set_zoom(4.0);
-
         Self {
             radar_config,
             scan_info: None,
@@ -307,23 +288,15 @@ impl Gui {
             auto_poll_enabled: true,
             initial_fetch_done: false,
             initial_zoom_set: false,
-            map_memory,
             tiles_light: None,
             tiles_dark: None,
             current_theme_is_dark: true, // Default to dark theme
-            selected_elevation: 0.0,
-            selected_product: RadarProduct::Reflectivity,
-            radar_image: None,
-            cached_image_bounds: None,
-            hover_value: None,
-            last_hover_pos: None,
             label_tiles_light: None,
             label_tiles_dark: None,
             loading_site: None,
             show_time_dialog: false,
             poll_interval_secs: 60,
             user_location: None,
-            layers: LayerManager::new(),
             spc_outlooks: HashMap::new(),
             spc_fetch_times: HashMap::new(),
             spc_fetching: false,
@@ -335,12 +308,14 @@ impl Gui {
             spc_md_fetch_time: None,
             spc_md_fetching: false,
             selected_md: None,
-            spc_overlay_caches: HashMap::new(),
-            nws_overlay_cache: OverlayLayerCache::new(),
-            spc_md_overlay_cache: OverlayLayerCache::new(),
             spc_data_generation: HashMap::new(),
             nws_data_generation: 0,
             spc_md_data_generation: 0,
+            panes: vec![PaneState::new()],
+            active_pane: 0,
+            pane_layout: PaneLayout::default(),
+            viewport_sync: true,
+            sync_layers: true,
             #[cfg(target_os = "android")]
             show_mobile_menu: false,
             #[cfg(target_os = "android")]
@@ -384,8 +359,8 @@ impl Gui {
             self.last_fetch_time = Some(std::time::Instant::now());
         }
 
-        // Auto-refresh NWS alerts every 2 minutes when any NWS layer is enabled
-        if self.layers.any_nws_enabled()
+        // Auto-refresh NWS alerts every 2 minutes when any pane has an NWS layer enabled
+        if self.panes.iter().any(|p| p.layers.any_nws_enabled())
             && !self.nws_fetching
             && self
                 .nws_fetch_time
@@ -394,8 +369,8 @@ impl Gui {
             actions.push(GuiAction::FetchNwsAlerts);
         }
 
-        // Auto-refresh SPC Mesoscale Discussions every 2 minutes when enabled
-        if self.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions)
+        // Auto-refresh SPC Mesoscale Discussions every 2 minutes when any pane has it enabled
+        if self.panes.iter().any(|p| p.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions))
             && !self.spc_md_fetching
             && self
                 .spc_md_fetch_time
@@ -421,7 +396,9 @@ impl Gui {
 
         // Only zoom to radar on the first scan load to avoid disrupting user navigation
         if !self.initial_zoom_set {
-            let _ = self.map_memory.set_zoom(7.0);
+            for pane in &mut self.panes {
+                let _ = pane.map_memory.set_zoom(7.0);
+            }
             self.initial_zoom_set = true;
         }
     }
@@ -451,8 +428,8 @@ impl Gui {
                 });
 
                 ui.menu_button("View", |ui| {
-                    ui.checkbox(self.layers.enabled_mut(LayerKind::RadarSites), "Show radar sites");
-                    ui.checkbox(self.layers.enabled_mut(LayerKind::CityLabels), "Show city labels");
+                    ui.checkbox(self.panes[self.active_pane].layers.enabled_mut(LayerKind::RadarSites), "Show radar sites");
+                    ui.checkbox(self.panes[self.active_pane].layers.enabled_mut(LayerKind::CityLabels), "Show city labels");
                     ui.separator();
                     if ui.button("Time...").clicked() {
                         self.show_time_dialog = true;
@@ -575,8 +552,10 @@ impl Gui {
 
                     ui.separator();
 
-                    // Hover information - expand to fill available space
-                    if let Some(hover_info) = &self.hover_value {
+                    // Hover information - show from whichever pane has data
+                    let hover_info = self.panes.iter()
+                        .find_map(|p| p.hover_value.as_ref());
+                    if let Some(hover_info) = hover_info {
                         ui.label("📍");
                         ui.label(hover_info);
                     } else {
@@ -622,9 +601,9 @@ impl Gui {
             self.tiles_light = Some(HttpTiles::new(CartoDb::light(), ctx.to_owned()));
         }
 
-        // Lazily initialize label-only tiles for city/road name overlay.
-        let show_city_labels = self.layers.is_enabled(LayerKind::CityLabels);
-        if show_city_labels {
+        // Lazily initialize label-only tiles if any pane uses city labels.
+        let any_city_labels = self.panes.iter().any(|p| p.layers.is_enabled(LayerKind::CityLabels));
+        if any_city_labels {
             if is_dark_theme && self.label_tiles_dark.is_none() {
                 self.label_tiles_dark = Some(HttpTiles::new(CartoDb::dark_labels(), ctx.to_owned()));
             } else if !is_dark_theme && self.label_tiles_light.is_none() {
@@ -632,10 +611,15 @@ impl Gui {
             }
         }
 
-        // Take label tiles out of self to avoid borrow conflicts in the
-        // map closure (they are put back after the closure returns).
-        let took_dark_labels = show_city_labels && is_dark_theme;
-        let took_light_labels = show_city_labels && !is_dark_theme;
+        // Take tiles out of self so they can be reborrowed per-pane in the loop.
+        let mut tiles_owned = if is_dark_theme {
+            self.tiles_dark.take()
+        } else {
+            self.tiles_light.take()
+        };
+
+        let took_dark_labels = any_city_labels && is_dark_theme;
+        let took_light_labels = any_city_labels && !is_dark_theme;
         let mut label_tiles: Option<HttpTiles> = if took_dark_labels {
             self.label_tiles_dark.take()
         } else if took_light_labels {
@@ -644,55 +628,119 @@ impl Gui {
             None
         };
 
-        // Get a mutable reference to the active tiles
-        let tiles = if is_dark_theme {
-            self.tiles_dark.as_mut()
-        } else {
-            self.tiles_light.as_mut()
-        };
+        let pane_count = self.pane_layout.pane_count;
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
-                // Determine the map center - only set it initially, then MapMemory takes over
-                let center = if let Some(scan_info) = &self.scan_info {
-                    Position::new(scan_info.site.lon, scan_info.site.lat)
-                } else {
-                    Position::new(-98.5795, 39.8283) // Geographic center of contiguous USA
-                };
+                let panel_rect = ui.max_rect();
 
-                // Clone radar image data for use in closure
-                let radar_image = self.radar_image.clone();
+                // Activate pane on primary press (before rendering so drag/pan
+                // happens on the newly-active pane in the same frame).
+                if pane_count > 1 {
+                    if let Some(pos) = ui.ctx().input(|i| {
+                        if i.pointer.primary_pressed() {
+                            i.pointer.interact_pos()
+                        } else {
+                            None
+                        }
+                    }) {
+                        for idx in 0..pane_count {
+                            let rect = self.pane_layout.pane_rect(idx, panel_rect);
+                            if rect.contains(pos) && idx != self.active_pane {
+                                self.active_pane = idx;
+                                break;
+                            }
+                        }
+                    }
+                }
 
-                // Clone user location for use in closure
-                let user_location = self.user_location;
+                // Snapshot viewport state before rendering for sync detection
+                let (pre_zooms, pre_positions): (Vec<f64>, Vec<Option<Position>>) =
+                    if self.viewport_sync && pane_count > 1 {
+                        self.panes.iter().take(pane_count)
+                            .map(|p| (p.map_memory.zoom(), p.map_memory.detached()))
+                            .unzip()
+                    } else {
+                        (vec![], vec![])
+                    };
 
-                // On Android, process double-tap-drag zoom gesture BEFORE building
-                // the Map widget so we can suppress panning while zooming.
-                #[cfg(target_os = "android")]
-                self.double_tap_detector.update(ctx, &mut self.map_memory);
+                // Dismiss overlay popups when clicking outside them (once, not per-pane)
+                let pointer_available = self.selected_alert.is_none()
+                    && self.selected_md.is_none();
+                if !pointer_available {
+                    let click_pos = ctx.input(|i| {
+                        if i.pointer.any_click() {
+                            i.pointer.interact_pos()
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(pos) = click_pos {
+                        let on_popup = ctx.layer_id_at(pos)
+                            .is_some_and(|l| l.order > egui::Order::Background);
+                        if !on_popup {
+                            self.selected_alert = None;
+                            self.selected_md = None;
+                        }
+                    }
+                }
 
-                #[cfg(target_os = "android")]
-                let is_zoom_dragging = self.double_tap_detector.is_zooming();
-                #[cfg(not(target_os = "android"))]
-                let is_zoom_dragging = false;
+                for pane_idx in 0..pane_count {
+                    let pane_rect = self.pane_layout.pane_rect(pane_idx, panel_rect);
+                    let is_active = pane_idx == self.active_pane;
 
-                // Create and render the map
-                if let Some(tiles) = tiles {
-                    // MapMemory automatically preserves user's zoom and pan between frames
-                    // The center parameter is just used for initialization if no memory exists
-                    Map::new(None, &mut self.map_memory, center)
+                    let mut pane = std::mem::take(&mut self.panes[pane_idx]);
+
+                    // Determine the map center
+                    let center = if let Some(scan_info) = &self.scan_info {
+                        Position::new(scan_info.site.lon, scan_info.site.lat)
+                    } else {
+                        Position::new(-98.5795, 39.8283) // Geographic center of contiguous USA
+                    };
+
+                    // Clone radar image data for use in closure
+                    let radar_image = pane.radar_image.clone();
+
+                    // Clone user location for use in closure
+                    let user_location = self.user_location;
+
+                    let show_city_labels = pane.layers.is_enabled(LayerKind::CityLabels);
+
+                    // On Android, process double-tap-drag zoom only for the active pane
+                    #[cfg(target_os = "android")]
+                    if is_active {
+                        self.double_tap_detector.update(ctx, &mut pane.map_memory);
+                    }
+
+                    #[cfg(target_os = "android")]
+                    let is_zoom_dragging = if is_active {
+                        self.double_tap_detector.is_zooming()
+                    } else {
+                        false
+                    };
+                    #[cfg(not(target_os = "android"))]
+                    let is_zoom_dragging = false;
+
+                    // Create a child UI constrained to this pane's rect
+                    let mut child_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(pane_rect)
+                            .id_salt(("pane_map", pane_idx)),
+                    );
+                    child_ui.set_clip_rect(pane_rect);
+
+                    if let Some(tiles) = tiles_owned.as_mut() {
+                        Map::new(None, &mut pane.map_memory, center)
                         .with_layer(tiles, 1.0)
-                        .zoom_with_ctrl(false) // Allow scroll to zoom without holding Ctrl
-                        .panning(false) // Disable scroll panning
-                        // Explicitly disable drag-to-pan during double-tap-drag zoom;
-                        // omitting the call would leave the Map's default (PRIMARY) active.
+                        .zoom_with_ctrl(false)
+                        .panning(false)
                         .drag_pan_buttons(if is_zoom_dragging {
                             egui::DragPanButtons::empty()
                         } else {
                             egui::DragPanButtons::PRIMARY
                         })
-                        .show(ui, |ui, projector, memory| {
+                        .show(&mut child_ui, |ui, projector, memory| {
                             let zoom = memory.zoom();
 
                             // Draw SPC outlook polygons (below radar)
@@ -700,44 +748,39 @@ impl Gui {
                                 ui,
                                 projector,
                                 zoom,
-                                &self.layers,
+                                &pane.layers,
                                 &self.spc_outlooks,
                                 self.current_theme_is_dark,
-                                &mut self.spc_overlay_caches,
+                                &mut pane.spc_overlay_caches,
                                 &self.spc_data_generation,
                             );
 
                             // Overlay radar data if available
-                            if self.layers.is_enabled(LayerKind::Radar) {
+                            if pane.layers.is_enabled(LayerKind::Radar) {
                             if let Some((ref texture, lat, lon, _max_range_km, ref value_data)) =
                                 radar_image
                             {
-                                // Compute image bounds and the overlay rect FIRST, so hover
-                                // lookup can use the rect for pixel indexing.
-                                let bounds = self.cached_image_bounds
+                                let bounds = pane.cached_image_bounds
                                     .unwrap_or_else(|| ImageBounds::from_radar_site(lat, lon));
 
-                                // Project the image corners through the map projector.
                                 let nw = projector.project(walkers::lat_lon(bounds.max_lat, bounds.min_lon)).to_pos2();
                                 let se = projector.project(walkers::lat_lon(bounds.min_lat, bounds.max_lon)).to_pos2();
                                 let rect = egui::Rect::from_two_pos(nw, se);
 
-                                // Hover: look up the radar value under the cursor
+                                // Hover: only compute for the pane the cursor is in
                                 if let Some(hover_pos) = ui.ctx().pointer_hover_pos() {
-                                    // Skip recomputation if the pointer hasn't moved since last frame
-                                    let pos_changed = self.last_hover_pos
+                                    if pane_rect.contains(hover_pos) {
+                                    let pos_changed = pane.last_hover_pos
                                         .map(|last| (last - hover_pos).length() > 0.5)
                                         .unwrap_or(true);
-                                    self.last_hover_pos = Some(hover_pos);
+                                    pane.last_hover_pos = Some(hover_pos);
 
                                     if pos_changed {
-                                        // Unproject for lat/lon display and haversine
                                         let screen_vec = egui::vec2(hover_pos.x, hover_pos.y);
                                         let map_pos = projector.unproject(screen_vec);
                                         let hover_lat = map_pos.y();
                                         let hover_lon = map_pos.x();
 
-                                        // Haversine distance
                                         let lat1 = lat.to_radians();
                                         let lon1 = lon.to_radians();
                                         let lat2 = hover_lat.to_radians();
@@ -749,16 +792,11 @@ impl Gui {
                                         let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
                                         let distance_km = 6371.0 * c;
 
-                                        // Bearing (azimuth)
                                         let y = dlon.sin() * lat2.cos();
                                         let x = lat1.cos() * lat2.sin()
                                             - lat1.sin() * lat2.cos() * dlon.cos();
                                         let azimuth = (y.atan2(x).to_degrees() + 360.0) % 360.0;
 
-                                        // Pixel lookup: use the cursor's fractional position within
-                                        // the drawn overlay rect. This matches exactly what the GPU
-                                        // does when bilinear-sampling the texture, so the value we
-                                        // read corresponds to the color the user sees.
                                         let mut value_str = String::new();
                                         let frac_x = (hover_pos.x - rect.left()) / rect.width();
                                         let frac_y = (hover_pos.y - rect.top()) / rect.height();
@@ -774,7 +812,7 @@ impl Gui {
                                             if pixel_idx < value_data.len() {
                                                 let value = value_data[pixel_idx];
                                                 if !value.is_nan() {
-                                                    let product = self.selected_product;
+                                                    let product = pane.selected_product;
                                                     value_str = match product {
                                                         RadarProduct::Reflectivity => {
                                                             format!(" | Reflectivity: {:.1} dBZ", value)
@@ -837,15 +875,19 @@ impl Gui {
                                             }
                                         }
 
-                                        self.hover_value = Some(format!(
+                                        pane.hover_value = Some(format!(
                                             "Lat: {:.4}°, Lon: {:.4}° | Range: {:.1}km, Az: {:.1}° {}",
                                             hover_lat, hover_lon, distance_km, azimuth, value_str
                                         ));
                                     }
-                                    // else: pointer hasn't moved, keep existing self.hover_value
+                                    } else {
+                                        // Cursor not in this pane
+                                        pane.last_hover_pos = None;
+                                        pane.hover_value = None;
+                                    }
                                 } else {
-                                    self.last_hover_pos = None;
-                                    self.hover_value = None;
+                                    pane.last_hover_pos = None;
+                                    pane.hover_value = None;
                                 }
 
                                 // Draw the radar image overlay
@@ -873,37 +915,14 @@ impl Gui {
                             }
                             } // end if radar layer enabled
 
-                            // Don't process overlay clicks when a popup is open;
-                            // instead, dismiss the popup on click outside it.
-                            let pointer_available = self.selected_alert.is_none()
-                                && self.selected_md.is_none();
-
-                            if !pointer_available {
-                                let click_pos = ui.ctx().input(|i| {
-                                    if i.pointer.any_click() {
-                                        i.pointer.interact_pos()
-                                    } else {
-                                        None
-                                    }
-                                });
-                                if let Some(pos) = click_pos {
-                                    let on_popup = ui.ctx().layer_id_at(pos)
-                                        .is_some_and(|l| l.order > egui::Order::Background);
-                                    if !on_popup {
-                                        self.selected_alert = None;
-                                        self.selected_md = None;
-                                    }
-                                }
-                            }
-
                             // Draw SPC Mesoscale Discussion polygons
                             let clicked_md = draw_spc_discussions(
                                 ui,
                                 projector,
                                 zoom,
-                                &self.layers,
+                                &pane.layers,
                                 &self.spc_discussions,
-                                &mut self.spc_md_overlay_cache,
+                                &mut pane.spc_md_overlay_cache,
                                 self.spc_md_data_generation,
                                 pointer_available,
                             );
@@ -911,14 +930,14 @@ impl Gui {
                                 self.selected_md = Some(idx);
                             }
 
-                            // Draw NWS alert polygons on top of radar, below labels
+                            // Draw NWS alert polygons
                             let clicked_alert = draw_nws_alerts(
                                 ui,
                                 projector,
                                 zoom,
-                                &self.layers,
+                                &pane.layers,
                                 &self.nws_alerts,
-                                &mut self.nws_overlay_cache,
+                                &mut pane.nws_overlay_cache,
                                 self.nws_data_generation,
                                 pointer_available,
                             );
@@ -927,70 +946,62 @@ impl Gui {
                             }
 
                             // Draw label-only tiles on top of the radar overlay
-                            if let Some(ref mut ltiles) = label_tiles {
-                                draw_label_tiles_overlay(ui, projector, memory.zoom(), ltiles);
+                            if show_city_labels {
+                                if let Some(ref mut ltiles) = label_tiles {
+                                    draw_label_tiles_overlay(ui, projector, memory.zoom(), ltiles);
+                                }
                             }
 
-                            // Draw radar site icons on the topmost layer
-                            if self.layers.is_enabled(LayerKind::RadarSites) {
+                            // Draw radar site icons
+                            if pane.layers.is_enabled(LayerKind::RadarSites) {
                                 for radar_site in &RADARS {
                                     let site_position = walkers::lat_lon(radar_site.lat, radar_site.lon);
                                     let site_screen = projector.project(site_position).to_pos2();
-                                    
-                                    // Skip sites that are outside the visible area to improve performance
+
                                     let screen_rect = ui.max_rect();
                                     if !screen_rect.expand(100.0).contains(site_screen) {
                                         continue;
                                     }
 
-                                    // Determine icon size based on zoom level
                                     let zoom = memory.zoom() as f32;
                                     let icon_size = (10.0 + zoom * 2.0).clamp(8.0, 24.0);
-                                    
-                                    // Choose icon color based on site state
+
                                     let is_current_site = self.scan_info.as_ref()
                                         .map(|info| info.site.name == radar_site.name)
                                         .unwrap_or(false);
-                                    
+
                                     let is_loading = self.loading_site.as_ref()
                                         .map(|loading| loading == radar_site.name)
                                         .unwrap_or(false);
-                                    
+
                                     let icon_color = if is_loading {
-                                        egui::Color32::from_rgb(160, 32, 240) // Purple for loading
+                                        egui::Color32::from_rgb(160, 32, 240)
                                     } else if is_current_site {
-                                        egui::Color32::from_rgb(255, 100, 100) // Red for current site
+                                        egui::Color32::from_rgb(255, 100, 100)
                                     } else {
-                                        egui::Color32::from_rgb(100, 150, 255) // Blue for other sites
+                                        egui::Color32::from_rgb(100, 150, 255)
                                     };
 
-                                    // Draw the radar site icon
                                     let icon_rect = egui::Rect::from_center_size(
                                         site_screen,
                                         egui::vec2(icon_size, icon_size)
                                     );
 
-                                    // Make it clickable
                                     let response = ui.allocate_rect(icon_rect, egui::Sense::click());
-                                    
+
                                     if response.clicked() {
-                                        // Immediately set this site as loading
                                         self.loading_site = Some(radar_site.name.to_string());
-                                        // Switch to this radar site
                                         actions.push(GuiAction::SwitchRadarSite(radar_site.name.to_string()));
                                     }
 
-                                    // Draw the icon circle
                                     ui.painter().circle_filled(site_screen, icon_size / 2.0, icon_color);
-                                    
-                                    // Add a border
+
                                     ui.painter().circle_stroke(
-                                        site_screen, 
-                                        icon_size / 2.0, 
+                                        site_screen,
+                                        icon_size / 2.0,
                                         egui::Stroke::new(1.5, egui::Color32::WHITE)
                                     );
 
-                                    // Draw site name text with theme-appropriate color
                                     let text_color = if is_dark_theme {
                                         egui::Color32::WHITE
                                     } else {
@@ -998,7 +1009,6 @@ impl Gui {
                                     };
                                     let font_size = (icon_size * 0.6).clamp(8.0, 12.0);
 
-                                    // Position text slightly below the icon
                                     let text_pos = egui::pos2(
                                         site_screen.x,
                                         site_screen.y + icon_size / 2.0 + 3.0,
@@ -1012,7 +1022,6 @@ impl Gui {
                                         text_color,
                                     );
 
-                                    // Show tooltip on hover
                                     if response.hovered() {
                                         let tooltip_text = if radar_site.elev == -99999 {
                                             format!("{}\nLat: {:.3}°, Lon: {:.3}°\nElev: N/A",
@@ -1032,22 +1041,18 @@ impl Gui {
                                     .project(walkers::lat_lon(user_lat, user_lon))
                                     .to_pos2();
 
-                                // Only draw if the position is near the visible area
                                 let screen_rect = ui.max_rect();
                                 if screen_rect.expand(50.0).contains(user_screen) {
-                                    // Semi-transparent accuracy circle
                                     ui.painter().circle_filled(
                                         user_screen,
                                         14.0,
                                         egui::Color32::from_rgba_unmultiplied(30, 130, 255, 40),
                                     );
-                                    // White ring
                                     ui.painter().circle_stroke(
                                         user_screen,
                                         7.0,
                                         egui::Stroke::new(2.5, egui::Color32::WHITE),
                                     );
-                                    // Blue dot
                                     ui.painter().circle_filled(
                                         user_screen,
                                         7.0,
@@ -1056,10 +1061,91 @@ impl Gui {
                                 }
                             }
                         });
+                    }
+
+                    // Restore pane
+                    self.panes[pane_idx] = pane;
+
+                    // Draw pane border when multi-pane
+                    if pane_count > 1 {
+                        let border_color = if is_active {
+                            egui::Color32::from_rgb(60, 140, 255)
+                        } else {
+                            egui::Color32::from_rgba_unmultiplied(128, 128, 128, 100)
+                        };
+                        let stroke_width = if is_active { 2.0 } else { 1.0 };
+                        ui.painter().rect_stroke(
+                            pane_rect,
+                            0.0,
+                            egui::Stroke::new(stroke_width, border_color),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                } // end pane loop
+
+                // Handle divider dragging on a foreground layer so they
+                // take priority over map panning in the overlap zone.
+                if pane_count > 1 {
+                    let divider_layer = egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new("pane_dividers"),
+                    );
+                    let mut divider_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(panel_rect)
+                            .layer_id(divider_layer),
+                    );
+                    self.pane_layout.handle_dividers(&mut divider_ui, panel_rect);
+                }
+
+                // Sync viewports: propagate the interacted pane's viewport to all others
+                if self.viewport_sync && pane_count > 1 {
+                    // Detect which pane changed this frame
+                    let mut source_idx = None;
+                    for idx in 0..pane_count {
+                        if idx < pre_zooms.len() {
+                            let zoom_diff = (self.panes[idx].map_memory.zoom() - pre_zooms[idx]).abs();
+                            if zoom_diff > 0.0001 {
+                                source_idx = Some(idx);
+                                break;
+                            }
+                            let prev_pos = &pre_positions[idx];
+                            let curr_pos = self.panes[idx].map_memory.detached();
+                            let pos_changed = match (prev_pos, &curr_pos) {
+                                (Some(p1), Some(p2)) => {
+                                    (p1.x() - p2.x()).abs() > 0.00001
+                                        || (p1.y() - p2.y()).abs() > 0.00001
+                                }
+                                (None, Some(_)) | (Some(_), None) => true,
+                                _ => false,
+                            };
+                            if pos_changed {
+                                source_idx = Some(idx);
+                                break;
+                            }
+                        }
+                    }
+                    let src = source_idx.unwrap_or(self.active_pane);
+                    let zoom = self.panes[src].map_memory.zoom();
+                    let pos = self.panes[src].map_memory.detached();
+                    for idx in 0..pane_count {
+                        if idx != src {
+                            let _ = self.panes[idx].map_memory.set_zoom(zoom);
+                            if let Some(p) = pos {
+                                self.panes[idx].map_memory.center_at(p);
+                            }
+                        }
+                    }
                 }
             });
 
-        // Restore label tiles back into self
+        // Restore tiles and label tiles
+        if is_dark_theme {
+            self.tiles_dark = tiles_owned;
+        } else {
+            self.tiles_light = tiles_owned;
+        }
+
         if took_dark_labels {
             self.label_tiles_dark = label_tiles;
         } else if took_light_labels {
@@ -1073,7 +1159,8 @@ impl Gui {
     #[cfg(not(target_os = "android"))]
     fn render_layers_panel(&mut self, ctx: &Context) -> Vec<GuiAction> {
         let mut actions = Vec::new();
-        let day = self.layers.spc_day;
+        let mut pane = std::mem::take(&mut self.panes[self.active_pane]);
+        let day = pane.layers.spc_day;
 
         egui::SidePanel::left("layers_panel")
             .default_width(170.0)
@@ -1082,41 +1169,91 @@ impl Gui {
                 ui.heading("Layers");
                 ui.separator();
 
-                // --- Radar layer ---
-                ui.checkbox(self.layers.enabled_mut(LayerKind::Radar), "🛰  Radar");
+                // --- Pane selector (only when multi-pane) ---
+                if self.pane_layout.pane_count > 1 {
+                    ui.horizontal(|ui| {
+                        ui.label("Pane:");
+                        for i in 0..self.pane_layout.pane_count {
+                            let label = format!("{}", i + 1);
+                            if ui.selectable_label(self.active_pane == i, &label).clicked()
+                                && self.active_pane != i
+                            {
+                                // Restore current pane before switching
+                                self.panes[self.active_pane] = std::mem::take(&mut pane);
+                                self.active_pane = i;
+                                pane = std::mem::take(&mut self.panes[i]);
+                            }
+                        }
+                    });
+                    ui.separator();
+                }
 
-                if self.layers.is_enabled(LayerKind::Radar) {
+                // --- Pane count selector ---
+                {
+                    let max_panes = if cfg!(target_os = "android") {
+                        MAX_PANES_MOBILE
+                    } else {
+                        MAX_PANES_DESKTOP
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label("Panes:");
+                        for count in 1..=max_panes {
+                            if ui.selectable_label(
+                                self.pane_layout.pane_count == count,
+                                format!("{count}"),
+                            ).clicked() && self.pane_layout.pane_count != count {
+                                // Restore current pane first
+                                self.panes[self.active_pane] = std::mem::take(&mut pane);
+                                // Resize panes vec
+                                while self.panes.len() < count {
+                                    self.panes.push(PaneState::new());
+                                }
+                                self.pane_layout = PaneLayout::for_count(count);
+                                if self.active_pane >= count {
+                                    self.active_pane = 0;
+                                }
+                                pane = std::mem::take(&mut self.panes[self.active_pane]);
+                            }
+                        }
+                    });
+                    ui.separator();
+                }
+
+                // --- Radar layer ---
+                ui.checkbox(pane.layers.enabled_mut(LayerKind::Radar), "🛰  Radar");
+
+                if pane.layers.is_enabled(LayerKind::Radar) {
                     ui.indent("radar_controls", |ui| {
                         if let Some(scan_info) = &self.scan_info {
                             // Product selector
-                            let prev_product = self.selected_product;
+                            let prev_product = pane.selected_product;
                             egui::ComboBox::from_id_salt("layer_product_selector")
-                                .selected_text(self.selected_product.name())
+                                .selected_text(pane.selected_product.name())
                                 .width(120.0)
                                 .show_ui(ui, |ui| {
                                     for product in &scan_info.available_products {
                                         ui.selectable_value(
-                                            &mut self.selected_product,
+                                            &mut pane.selected_product,
                                             *product,
                                             product.name(),
                                         );
                                     }
                                 });
-                            if prev_product != self.selected_product {
-                                self.selected_elevation = 0.0;
+                            if prev_product != pane.selected_product {
+                                pane.selected_elevation = 0.0;
                             }
 
                             // Elevation selector
                             if let Some(elevations) =
-                                scan_info.product_elevations.get(&self.selected_product)
+                                scan_info.product_elevations.get(&pane.selected_product)
                             {
                                 if !elevations.is_empty() {
                                     let selected_angle = elevations
                                         .iter()
                                         .min_by(|a, b| {
-                                            ((**a - self.selected_elevation).abs())
+                                            ((**a - pane.selected_elevation).abs())
                                                 .partial_cmp(
-                                                    &((**b - self.selected_elevation).abs()),
+                                                    &((**b - pane.selected_elevation).abs()),
                                                 )
                                                 .unwrap()
                                         })
@@ -1129,7 +1266,7 @@ impl Gui {
                                         .show_ui(ui, |ui| {
                                             for angle in elevations.iter() {
                                                 ui.selectable_value(
-                                                    &mut self.selected_elevation,
+                                                    &mut pane.selected_elevation,
                                                     *angle,
                                                     format!("{:.1}°", angle),
                                                 );
@@ -1153,7 +1290,7 @@ impl Gui {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Day:");
                     let mut changed = false;
-                    let mut new_day = self.layers.spc_day;
+                    let mut new_day = pane.layers.spc_day;
                     for &d in OutlookDay::all() {
                         if ui.selectable_label(new_day == d, d.label()).clicked() {
                             new_day = d;
@@ -1161,9 +1298,9 @@ impl Gui {
                         }
                     }
                     if changed {
-                        self.layers.spc_day = new_day;
+                        pane.layers.spc_day = new_day;
                         // Fetch data for the new day if any SPC layers are enabled
-                        let products = self.layers.enabled_spc_products();
+                        let products = pane.layers.enabled_spc_products();
                         if !products.is_empty() {
                             actions.push(GuiAction::FetchSpcOutlook {
                                 day: new_day,
@@ -1174,11 +1311,11 @@ impl Gui {
                 });
 
                 // Product toggles (depends on selected day)
-                let spc_layers = self.layers.spc_layers_for_day();
+                let spc_layers = pane.layers.spc_layers_for_day();
                 for layer in &spc_layers {
-                    let was_enabled = self.layers.is_enabled(*layer);
-                    ui.checkbox(self.layers.enabled_mut(*layer), layer.display_name());
-                    let is_enabled = self.layers.is_enabled(*layer);
+                    let was_enabled = pane.layers.is_enabled(*layer);
+                    ui.checkbox(pane.layers.enabled_mut(*layer), layer.display_name());
+                    let is_enabled = pane.layers.is_enabled(*layer);
 
                     // If just toggled on and we don't have data, fetch it
                     if is_enabled && !was_enabled {
@@ -1194,7 +1331,7 @@ impl Gui {
                 }
 
                 // Refresh button
-                if self.layers.any_spc_enabled() {
+                if pane.layers.any_spc_enabled() {
                     ui.horizontal(|ui| {
                         let refresh_enabled = !self.spc_fetching;
                         if ui.add_enabled(refresh_enabled, egui::Button::new("🔄 Refresh")).clicked() {
@@ -1211,17 +1348,17 @@ impl Gui {
 
                 // --- SPC Mesoscale Discussions section ---
                 {
-                    let was_enabled = self.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
+                    let was_enabled = pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
                     let label = if self.spc_discussions.is_empty() {
                         "📋  Mesoscale Disc.".to_string()
                     } else {
                         format!("📋  Mesoscale Disc. ({})", self.spc_discussions.len())
                     };
                     ui.checkbox(
-                        self.layers.enabled_mut(LayerKind::SpcMesoscaleDiscussions),
+                        pane.layers.enabled_mut(LayerKind::SpcMesoscaleDiscussions),
                         label,
                     );
-                    let is_enabled = self.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
+                    let is_enabled = pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
 
                     // If just toggled on and we have no data, fetch
                     if is_enabled && !was_enabled && self.spc_discussions.is_empty() && !self.spc_md_fetching {
@@ -1229,7 +1366,7 @@ impl Gui {
                     }
                 }
 
-                if self.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions) {
+                if pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions) {
                     ui.horizontal(|ui| {
                         let refresh_enabled = !self.spc_md_fetching;
                         if ui.add_enabled(refresh_enabled, egui::Button::new("🔄 Refresh")).clicked() {
@@ -1258,9 +1395,9 @@ impl Gui {
 
                 let nws_layers = [LayerKind::NwsWarnings, LayerKind::NwsWatches, LayerKind::NwsAdvisories];
                 for layer in &nws_layers {
-                    let was_enabled = self.layers.is_enabled(*layer);
-                    ui.checkbox(self.layers.enabled_mut(*layer), layer.display_name());
-                    let is_enabled = self.layers.is_enabled(*layer);
+                    let was_enabled = pane.layers.is_enabled(*layer);
+                    ui.checkbox(pane.layers.enabled_mut(*layer), layer.display_name());
+                    let is_enabled = pane.layers.is_enabled(*layer);
 
                     // If just toggled on and we have no alerts cached, fetch them
                     if is_enabled && !was_enabled && self.nws_alerts.is_empty() && !self.nws_fetching {
@@ -1268,7 +1405,7 @@ impl Gui {
                     }
                 }
 
-                if self.layers.any_nws_enabled() {
+                if pane.layers.any_nws_enabled() {
                     ui.horizontal(|ui| {
                         let refresh_enabled = !self.nws_fetching;
                         if ui.add_enabled(refresh_enabled, egui::Button::new("🔄 Refresh")).clicked() {
@@ -1280,7 +1417,7 @@ impl Gui {
                     });
                     // Show alert count and last-updated time
                     if !self.nws_alerts.is_empty() {
-                        let categories = self.layers.enabled_nws_categories();
+                        let categories = pane.layers.enabled_nws_categories();
                         let visible_count = self.nws_alerts.iter()
                             .filter(|a| categories.contains(&a.category))
                             .count();
@@ -1300,32 +1437,70 @@ impl Gui {
                 ui.add_space(6.0);
                 ui.separator();
 
+                // --- Viewport sync ---
+                if self.pane_layout.pane_count > 1 {
+                    ui.checkbox(&mut self.viewport_sync, "🔗  Sync Viewports");
+                    ui.checkbox(&mut self.sync_layers, "🔗  Sync Layers");
+                    ui.separator();
+                }
+
                 // --- Other overlays ---
-                ui.checkbox(self.layers.enabled_mut(LayerKind::CityLabels), "🏷  City Labels");
-                ui.checkbox(self.layers.enabled_mut(LayerKind::RadarSites), "📡  Radar Sites");
+                ui.checkbox(pane.layers.enabled_mut(LayerKind::CityLabels), "🏷  City Labels");
+                ui.checkbox(pane.layers.enabled_mut(LayerKind::RadarSites), "📡  Radar Sites");
             });
+
+        self.panes[self.active_pane] = pane;
+
+        // Propagate layer settings to all other panes when sync is enabled
+        if self.sync_layers && self.pane_layout.pane_count > 1 {
+            let src = &self.panes[self.active_pane].layers;
+            let spc_day = src.spc_day;
+            let snapshot: Vec<(LayerKind, bool)> = [
+                LayerKind::Radar,
+                LayerKind::SpcCategorical,
+                LayerKind::SpcTornado,
+                LayerKind::SpcWind,
+                LayerKind::SpcHail,
+                LayerKind::SpcProbabilistic,
+                LayerKind::SpcMesoscaleDiscussions,
+                LayerKind::NwsWarnings,
+                LayerKind::NwsWatches,
+                LayerKind::NwsAdvisories,
+                LayerKind::CityLabels,
+                LayerKind::RadarSites,
+            ]
+            .iter()
+            .map(|&k| (k, src.is_enabled(k)))
+            .collect();
+
+            for (idx, p) in self.panes.iter_mut().enumerate() {
+                if idx == self.active_pane {
+                    continue;
+                }
+                for &(kind, enabled) in &snapshot {
+                    p.layers.set_enabled(kind, enabled);
+                }
+                p.layers.spc_day = spc_day;
+            }
+        }
 
         actions
     }
 
-    /// Get the selected product and elevation for rendering
+    /// Get the selected product and elevation for rendering (active pane).
     pub fn get_rendering_params(&self) -> Option<(RadarProduct, f32)> {
-        self.scan_info.as_ref().and_then(|scan_info| {
-            scan_info
-                .product_elevations
-                .get(&self.selected_product)
-                .and_then(|elevations| {
-                    // Find closest matching elevation angle
-                    elevations.iter()
-                        .min_by(|a, b| {
-                            ((**a - self.selected_elevation).abs())
-                                .partial_cmp(&((**b - self.selected_elevation).abs()))
-                                .unwrap()
-                        })
-                        .copied()
-                })
-                .map(|elev_angle| (self.selected_product, elev_angle))
-        })
+        self.panes[self.active_pane].get_rendering_params(self.scan_info.as_ref())
+    }
+
+    /// Get the rendering params for a specific pane.
+    pub fn get_rendering_params_for_pane(&self, pane_idx: PaneId) -> Option<(RadarProduct, f32)> {
+        self.panes.get(pane_idx)
+            .and_then(|p| p.get_rendering_params(self.scan_info.as_ref()))
+    }
+
+    /// Number of active panes.
+    pub fn pane_count(&self) -> usize {
+        self.pane_layout.pane_count
     }
 
     /// Get the current radar config
@@ -1400,14 +1575,19 @@ impl Gui {
         self.spc_md_fetching = fetching;
     }
 
-    /// Get the layer manager (immutable).
+    /// Get the active pane's layer manager (immutable).
     pub fn layers(&self) -> &LayerManager {
-        &self.layers
+        &self.panes[self.active_pane].layers
     }
 
-    /// Get the layer manager (mutable).
+    /// Get the active pane's layer manager (mutable).
     pub fn layers_mut(&mut self) -> &mut LayerManager {
-        &mut self.layers
+        &mut self.panes[self.active_pane].layers
+    }
+
+    /// Get a specific pane's layer manager (immutable).
+    pub fn layers_for_pane(&self, pane_idx: PaneId) -> Option<&LayerManager> {
+        self.panes.get(pane_idx).map(|p| &p.layers)
     }
 
     /// Get the current scan info
@@ -1415,17 +1595,22 @@ impl Gui {
         self.scan_info.as_ref()
     }
 
-    /// Get the current radar image
+    /// Get the active pane's radar image.
     pub fn get_radar_image(&self) -> &Option<(egui::TextureHandle, f64, f64, f64, Arc<Vec<f32>>)> {
-        &self.radar_image
+        &self.panes[self.active_pane].radar_image
     }
 
-    /// Take the radar image, removing it from the GUI
+    /// Take the radar image from the active pane.
     pub fn take_radar_image(&mut self) -> Option<(egui::TextureHandle, f64, f64, f64, Arc<Vec<f32>>)> {
-        self.radar_image.take()
+        self.panes[self.active_pane].take_radar_image()
     }
 
-    /// Set the radar image to display on the map
+    /// Take the radar image from a specific pane.
+    pub fn take_radar_image_for_pane(&mut self, pane_idx: PaneId) -> Option<(egui::TextureHandle, f64, f64, f64, Arc<Vec<f32>>)> {
+        self.panes.get_mut(pane_idx).and_then(|p| p.take_radar_image())
+    }
+
+    /// Set the radar image for the active pane.
     pub fn set_radar_image(
         &mut self,
         texture: egui::TextureHandle,
@@ -1434,23 +1619,53 @@ impl Gui {
         max_range_km: f64,
         value_data: Vec<f32>,
     ) {
-        self.radar_image = Some((texture, lat, lon, max_range_km, Arc::new(value_data)));
-        self.cached_image_bounds = Some(ImageBounds::from_radar_site(lat, lon));
+        self.panes[self.active_pane].set_radar_image(texture, lat, lon, max_range_km, value_data);
     }
 
-    /// Clear the radar image
+    /// Set the radar image for a specific pane.
+    pub fn set_radar_image_for_pane(
+        &mut self,
+        pane_idx: PaneId,
+        texture: egui::TextureHandle,
+        lat: f64,
+        lon: f64,
+        max_range_km: f64,
+        value_data: Vec<f32>,
+    ) {
+        if let Some(pane) = self.panes.get_mut(pane_idx) {
+            pane.set_radar_image(texture, lat, lon, max_range_km, value_data);
+        }
+    }
+
+    /// Clear the radar image on the active pane.
     pub fn clear_radar_image(&mut self) {
-        self.radar_image = None;
-        self.cached_image_bounds = None;
+        self.panes[self.active_pane].clear_radar_image();
+    }
+
+    /// Clear the radar image on a specific pane.
+    pub fn clear_radar_image_for_pane(&mut self, pane_idx: PaneId) {
+        if pane_idx < self.panes.len() {
+            self.panes[pane_idx].clear_radar_image();
+        }
+    }
+
+    /// Clear the radar image on all panes.
+    pub fn clear_all_radar_images(&mut self) {
+        for pane in &mut self.panes {
+            pane.clear_radar_image();
+        }
     }
 
     /// Whether auto-poll is active and the event loop should keep waking
     pub fn is_auto_poll_active(&self) -> bool {
-        (self.auto_poll_enabled && self.initial_fetch_done) || self.layers.any_nws_enabled()
+        (self.auto_poll_enabled && self.initial_fetch_done)
+            || self.panes.iter().any(|p| p.layers.any_nws_enabled())
     }
 
     pub fn clear_graphics_state(&mut self) {
-        self.radar_image = None;
+        for pane in &mut self.panes {
+            pane.clear_radar_image();
+        }
         self.tiles_light = None;
         self.tiles_dark = None;
         self.label_tiles_light = None;
@@ -1800,7 +2015,9 @@ impl Gui {
 
         let top_inset = self.safe_area_insets.0;
         let bottom_inset = self.safe_area_insets.1;
-        let day = self.layers.spc_day;
+
+        let mut pane = std::mem::take(&mut self.panes[self.active_pane]);
+        let day = pane.layers.spc_day;
 
         egui::SidePanel::left("mobile_layers_panel")
             .default_width(260.0)
@@ -1823,39 +2040,77 @@ impl Gui {
                 ui.separator();
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    // ── Radar ──
-                    ui.checkbox(self.layers.enabled_mut(LayerKind::Radar), "🛰  Radar");
+                    // ── Pane count selector (mobile: 1-4) ──
+                    {
+                        ui.horizontal(|ui| {
+                            ui.label("Panes:");
+                            for count in 1..=MAX_PANES_MOBILE {
+                                if ui.selectable_label(
+                                    self.pane_layout.pane_count == count,
+                                    format!("{count}"),
+                                ).clicked() && self.pane_layout.pane_count != count {
+                                    self.panes[self.active_pane] = std::mem::take(&mut pane);
+                                    while self.panes.len() < count {
+                                        self.panes.push(PaneState::new());
+                                    }
+                                    self.pane_layout = PaneLayout::for_count(count);
+                                    if self.active_pane >= count {
+                                        self.active_pane = 0;
+                                    }
+                                    pane = std::mem::take(&mut self.panes[self.active_pane]);
+                                }
+                            }
+                        });
+                        if self.pane_layout.pane_count > 1 {
+                            ui.horizontal(|ui| {
+                                ui.label("Pane:");
+                                for i in 0..self.pane_layout.pane_count {
+                                    if ui.selectable_label(self.active_pane == i, format!("{}", i + 1)).clicked()
+                                        && self.active_pane != i
+                                    {
+                                        self.panes[self.active_pane] = std::mem::take(&mut pane);
+                                        self.active_pane = i;
+                                        pane = std::mem::take(&mut self.panes[i]);
+                                    }
+                                }
+                            });
+                        }
+                        ui.separator();
+                    }
 
-                    if self.layers.is_enabled(LayerKind::Radar) {
+                    // ── Radar ──
+                    ui.checkbox(pane.layers.enabled_mut(LayerKind::Radar), "🛰  Radar");
+
+                    if pane.layers.is_enabled(LayerKind::Radar) {
                         ui.indent("m_radar_controls", |ui| {
                             if let Some(scan_info) = &self.scan_info {
-                                let prev_product = self.selected_product;
+                                let prev_product = pane.selected_product;
                                 egui::ComboBox::from_id_salt("m_product_sel")
-                                    .selected_text(self.selected_product.name())
+                                    .selected_text(pane.selected_product.name())
                                     .width(180.0)
                                     .show_ui(ui, |ui| {
                                         for product in &scan_info.available_products {
                                             ui.selectable_value(
-                                                &mut self.selected_product,
+                                                &mut pane.selected_product,
                                                 *product,
                                                 product.name(),
                                             );
                                         }
                                     });
-                                if prev_product != self.selected_product {
-                                    self.selected_elevation = 0.0;
+                                if prev_product != pane.selected_product {
+                                    pane.selected_elevation = 0.0;
                                 }
 
                                 if let Some(elevations) =
-                                    scan_info.product_elevations.get(&self.selected_product)
+                                    scan_info.product_elevations.get(&pane.selected_product)
                                 {
                                     if !elevations.is_empty() {
                                         let selected_angle = elevations
                                             .iter()
                                             .min_by(|a, b| {
-                                                ((**a - self.selected_elevation).abs())
+                                                ((**a - pane.selected_elevation).abs())
                                                     .partial_cmp(
-                                                        &((**b - self.selected_elevation).abs()),
+                                                        &((**b - pane.selected_elevation).abs()),
                                                     )
                                                     .unwrap()
                                             })
@@ -1868,7 +2123,7 @@ impl Gui {
                                             .show_ui(ui, |ui| {
                                                 for angle in elevations.iter() {
                                                     ui.selectable_value(
-                                                        &mut self.selected_elevation,
+                                                        &mut pane.selected_elevation,
                                                         *angle,
                                                         format!("{:.1}°", angle),
                                                     );
@@ -1891,7 +2146,7 @@ impl Gui {
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Day:");
                         let mut changed = false;
-                        let mut new_day = self.layers.spc_day;
+                        let mut new_day = pane.layers.spc_day;
                         for &d in OutlookDay::all() {
                             if ui.selectable_label(new_day == d, d.label()).clicked() {
                                 new_day = d;
@@ -1899,8 +2154,8 @@ impl Gui {
                             }
                         }
                         if changed {
-                            self.layers.spc_day = new_day;
-                            let products = self.layers.enabled_spc_products();
+                            pane.layers.spc_day = new_day;
+                            let products = pane.layers.enabled_spc_products();
                             if !products.is_empty() {
                                 actions.push(GuiAction::FetchSpcOutlook {
                                     day: new_day,
@@ -1910,11 +2165,11 @@ impl Gui {
                         }
                     });
 
-                    let spc_layers = self.layers.spc_layers_for_day();
+                    let spc_layers = pane.layers.spc_layers_for_day();
                     for layer in &spc_layers {
-                        let was_enabled = self.layers.is_enabled(*layer);
-                        ui.checkbox(self.layers.enabled_mut(*layer), layer.display_name());
-                        let is_enabled = self.layers.is_enabled(*layer);
+                        let was_enabled = pane.layers.is_enabled(*layer);
+                        ui.checkbox(pane.layers.enabled_mut(*layer), layer.display_name());
+                        let is_enabled = pane.layers.is_enabled(*layer);
                         if is_enabled && !was_enabled {
                             if let Some(product) = layer.to_outlook_product() {
                                 if !self.spc_outlooks.contains_key(&(day, product)) {
@@ -1927,7 +2182,7 @@ impl Gui {
                         }
                     }
 
-                    if self.layers.any_spc_enabled() {
+                    if pane.layers.any_spc_enabled() {
                         ui.horizontal(|ui| {
                             if ui
                                 .add_enabled(!self.spc_fetching, egui::Button::new("🔄 Refresh"))
@@ -1946,23 +2201,23 @@ impl Gui {
 
                     // ── SPC Mesoscale Discussions ──
                     {
-                        let was_enabled = self.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
+                        let was_enabled = pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
                         let label = if self.spc_discussions.is_empty() {
                             "📋  Mesoscale Disc.".to_string()
                         } else {
                             format!("📋  Mesoscale Disc. ({})", self.spc_discussions.len())
                         };
                         ui.checkbox(
-                            self.layers.enabled_mut(LayerKind::SpcMesoscaleDiscussions),
+                            pane.layers.enabled_mut(LayerKind::SpcMesoscaleDiscussions),
                             label,
                         );
-                        let is_enabled = self.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
+                        let is_enabled = pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
                         if is_enabled && !was_enabled && self.spc_discussions.is_empty() && !self.spc_md_fetching {
                             actions.push(GuiAction::FetchSpcDiscussions);
                         }
                     }
 
-                    if self.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions) {
+                    if pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions) {
                         ui.horizontal(|ui| {
                             if ui
                                 .add_enabled(!self.spc_md_fetching, egui::Button::new("🔄 Refresh"))
@@ -1993,15 +2248,15 @@ impl Gui {
 
                     let nws_layers = [LayerKind::NwsWarnings, LayerKind::NwsWatches, LayerKind::NwsAdvisories];
                     for layer in &nws_layers {
-                        let was_enabled = self.layers.is_enabled(*layer);
-                        ui.checkbox(self.layers.enabled_mut(*layer), layer.display_name());
-                        let is_enabled = self.layers.is_enabled(*layer);
+                        let was_enabled = pane.layers.is_enabled(*layer);
+                        ui.checkbox(pane.layers.enabled_mut(*layer), layer.display_name());
+                        let is_enabled = pane.layers.is_enabled(*layer);
                         if is_enabled && !was_enabled && self.nws_alerts.is_empty() && !self.nws_fetching {
                             actions.push(GuiAction::FetchNwsAlerts);
                         }
                     }
 
-                    if self.layers.any_nws_enabled() {
+                    if pane.layers.any_nws_enabled() {
                         ui.horizontal(|ui| {
                             if ui
                                 .add_enabled(!self.nws_fetching, egui::Button::new("🔄 Refresh"))
@@ -2014,7 +2269,7 @@ impl Gui {
                             }
                         });
                         if !self.nws_alerts.is_empty() {
-                            let categories = self.layers.enabled_nws_categories();
+                            let categories = pane.layers.enabled_nws_categories();
                             let visible_count = self.nws_alerts.iter()
                                 .filter(|a| categories.contains(&a.category))
                                 .count();
@@ -2026,8 +2281,15 @@ impl Gui {
                     ui.separator();
 
                     // ── Other overlays ──
-                    ui.checkbox(self.layers.enabled_mut(LayerKind::CityLabels), "🏷  City Labels");
-                    ui.checkbox(self.layers.enabled_mut(LayerKind::RadarSites), "📡  Radar Sites");
+                    ui.checkbox(pane.layers.enabled_mut(LayerKind::CityLabels), "🏷  City Labels");
+                    ui.checkbox(pane.layers.enabled_mut(LayerKind::RadarSites), "📡  Radar Sites");
+
+                    // ── Viewport sync toggle ──
+                    if self.pane_layout.pane_count > 1 {
+                        ui.separator();
+                        ui.checkbox(&mut self.viewport_sync, "🔗  Sync Viewports");
+                        ui.checkbox(&mut self.sync_layers, "🔗  Sync Layers");
+                    }
 
                     ui.add_space(10.0);
                     ui.separator();
@@ -2066,6 +2328,41 @@ impl Gui {
                     ui.add_space(bottom_inset);
                 }
             });
+
+        self.panes[self.active_pane] = pane;
+
+        // Propagate layer settings to all other panes when sync is enabled
+        if self.sync_layers && self.pane_layout.pane_count > 1 {
+            let src = &self.panes[self.active_pane].layers;
+            let spc_day = src.spc_day;
+            let snapshot: Vec<(LayerKind, bool)> = [
+                LayerKind::Radar,
+                LayerKind::SpcCategorical,
+                LayerKind::SpcTornado,
+                LayerKind::SpcWind,
+                LayerKind::SpcHail,
+                LayerKind::SpcProbabilistic,
+                LayerKind::SpcMesoscaleDiscussions,
+                LayerKind::NwsWarnings,
+                LayerKind::NwsWatches,
+                LayerKind::NwsAdvisories,
+                LayerKind::CityLabels,
+                LayerKind::RadarSites,
+            ]
+            .iter()
+            .map(|&k| (k, src.is_enabled(k)))
+            .collect();
+
+            for (idx, p) in self.panes.iter_mut().enumerate() {
+                if idx == self.active_pane {
+                    continue;
+                }
+                for &(kind, enabled) in &snapshot {
+                    p.layers.set_enabled(kind, enabled);
+                }
+                p.layers.spc_day = spc_day;
+            }
+        }
 
         actions
     }

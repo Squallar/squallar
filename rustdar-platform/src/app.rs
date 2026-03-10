@@ -39,14 +39,35 @@ use std::sync::mpsc::{Receiver, Sender};
 
 type ScanResult = (u64, Result<(Scan, String, NaiveDateTime), String>);
 
-/// Result from background radar rendering: (image_data, max_range_km, value_data, product, elevation, generation)
-type RenderResult = (Vec<u8>, f64, Vec<f32>, RadarProduct, f32, u64);
+/// Result from background radar rendering: (image_data, max_range_km, value_data, product, elevation, generation, pane_idx)
+type RenderResult = (Vec<u8>, f64, Vec<f32>, RadarProduct, f32, u64, usize);
 
 /// Result from a Level III product fetch: (generation, product, tilt_code, result)
 type Level3Result = (u64, RadarProduct, String, Result<Level3Message, String>);
 
 /// Result from a background SPC outlook fetch
 type OutlookResult = (OutlookDay, OutlookProduct, Result<SpcOutlook, String>);
+
+/// Per-pane render tracking state.
+struct PaneRenderState {
+    /// True while a background render is in progress for this pane.
+    render_in_flight: bool,
+    /// Last rendered radar parameters to detect changes.
+    last_rendered: Option<(RadarProduct, f32)>,
+    /// Cached raw RGBA + metadata from the last successful render so we can
+    /// re-upload the texture instantly after suspend/resume without re-rendering.
+    cached_render: Option<(Vec<u8>, f64, Vec<f32>, RadarProduct, f32)>,
+}
+
+impl PaneRenderState {
+    fn new() -> Self {
+        Self {
+            render_in_flight: false,
+            last_rendered: None,
+            cached_render: None,
+        }
+    }
+}
 
 /// Result from a background NWS alerts fetch
 type AlertResult = Result<Vec<NwsAlert>, String>;
@@ -66,14 +87,8 @@ pub struct App {
     // Channel for background radar render results
     render_result_receiver: Receiver<RenderResult>,
     render_result_sender: Sender<RenderResult>,
-    // True while a background render is in progress
-    render_in_flight: bool,
-    // Track last rendered radar parameters to detect changes
-    last_rendered: Option<(RadarProduct, f32)>,
-    // Cached raw RGBA + metadata from the last successful render so we can
-    // re-upload the texture instantly after suspend/resume without re-rendering.
-    // Fields: (rgba_data, max_range_km, value_data, product, elevation)
-    cached_render: Option<(Vec<u8>, f64, Vec<f32>, RadarProduct, f32)>,
+    // Per-pane render tracking (indexed by pane index)
+    pane_render: Vec<PaneRenderState>,
     // Decoded Level III product data, keyed by (RadarProduct, tilt_code)
     level3_data: HashMap<(RadarProduct, String), Arc<Level3Message>>,
     // Channel for Level III fetch results
@@ -172,9 +187,7 @@ impl App {
             scan_sender,
             render_result_receiver,
             render_result_sender,
-            render_in_flight: false,
-            last_rendered: None,
-            cached_render: None,
+            pane_render: vec![PaneRenderState::new()],
             level3_data: HashMap::new(),
             level3_receiver,
             level3_sender,
@@ -442,9 +455,11 @@ impl App {
                         self.gui.set_scan_info(scan_info);
                         self.gui.set_loading_site(None);
                         // Invalidate last render so new data triggers a re-render
-                        self.last_rendered = None;
-                        self.cached_render = None;
-                        self.render_in_flight = false;
+                        for prs in &mut self.pane_render {
+                            prs.last_rendered = None;
+                            prs.cached_render = None;
+                            prs.render_in_flight = false;
+                        }
                         // Increment render generation so any in-flight renders are discarded
                         self.render_generation += 1;
                         // Clear stale Level III data and fetch fresh products
@@ -562,7 +577,7 @@ impl App {
         }
 
         // Request redraw only when there is pending background work or auto-poll is active
-        if self.render_in_flight || self.gui.is_auto_poll_active() {
+        if self.pane_render.iter().any(|prs| prs.render_in_flight) || self.gui.is_auto_poll_active() {
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
@@ -634,17 +649,26 @@ impl App {
         // This allows the GPU to finish using them before we drop them
         self.old_textures.clear();
 
+        // Ensure pane_render vec matches gui pane count
+        while self.pane_render.len() < self.gui.pane_count() {
+            self.pane_render.push(PaneRenderState::new());
+        }
+
         // Poll for completed background render results (with generation check)
-        if let Ok((image_data, max_range_km, value_data, product, elevation, generation)) =
+        while let Ok((image_data, max_range_km, value_data, product, elevation, generation, pane_idx)) =
             self.render_result_receiver.try_recv()
         {
-            self.render_in_flight = false;
+            if pane_idx < self.pane_render.len() {
+                self.pane_render[pane_idx].render_in_flight = false;
+            }
 
             if generation < self.render_generation {
                 log::info!("Discarding stale render result (gen {} < current {})", generation, self.render_generation);
-            } else if self.gui.get_rendering_params().is_some() {
+            } else if pane_idx < self.gui.pane_count()
+                && self.gui.get_rendering_params_for_pane(pane_idx).is_some()
+            {
                 // Save the old texture to be cleaned up after this frame completes
-                if let Some((old_texture, _, _, _, _)) = self.gui.take_radar_image() {
+                if let Some((old_texture, _, _, _, _)) = self.gui.take_radar_image_for_pane(pane_idx) {
                     self.old_textures.push(old_texture);
                 }
 
@@ -660,7 +684,7 @@ impl App {
                 );
 
                 // Cache the raw image data for fast restore after suspend/resume
-                self.cached_render = Some((
+                self.pane_render[pane_idx].cached_render = Some((
                     image_data,
                     max_range_km,
                     value_data.clone(),
@@ -669,7 +693,8 @@ impl App {
                 ));
 
                 if let Some(scan_info) = self.gui.get_scan_info() {
-                    self.gui.set_radar_image(
+                    self.gui.set_radar_image_for_pane(
+                        pane_idx,
                         texture,
                         scan_info.site.lat,
                         scan_info.site.lon,
@@ -678,7 +703,7 @@ impl App {
                     );
                 }
 
-                self.last_rendered = Some((product, elevation));
+                self.pane_render[pane_idx].last_rendered = Some((product, elevation));
             }
         }
 
@@ -692,9 +717,11 @@ impl App {
                         let elevation = message.pdb.elevation_angle();
                         log::info!("Level III {:?} {} fetched successfully (elevation={:.1}°)", product, tilt_code, elevation);
                         self.level3_data.insert((product, tilt_code), Arc::new(message));
-                        // Trigger a re-render if currently viewing this product
-                        if self.gui.get_rendering_params().map(|(p, _)| p) == Some(product) {
-                            self.last_rendered = None;
+                        // Trigger a re-render for any pane viewing this product
+                        for (idx, prs) in self.pane_render.iter_mut().enumerate() {
+                            if self.gui.get_rendering_params_for_pane(idx).map(|(p, _)| p) == Some(product) {
+                                prs.last_rendered = None;
+                            }
                         }
                         // Add Level III products to the scan info's available list
                         if let Some(scan_info) = self.gui.get_scan_info() {
@@ -739,30 +766,121 @@ impl App {
             }
         }
 
-        // Check if we need to spawn a new background render
-        if let Some((product, elevation)) = self.gui.get_rendering_params() {
-            let needs_render = self
-                .last_rendered
-                .map(|(last_prod, last_elev)| {
-                    last_prod != product || (last_elev - elevation).abs() > 0.01
-                })
-                .unwrap_or(true);
+        // Check all panes for needed background renders
+        for pane_idx in 0..self.gui.pane_count() {
+            if let Some((product, elevation)) = self.gui.get_rendering_params_for_pane(pane_idx) {
+                let prs = &self.pane_render[pane_idx];
+                let needs_render = prs
+                    .last_rendered
+                    .map(|(last_prod, last_elev)| {
+                        last_prod != product || (last_elev - elevation).abs() > 0.01
+                    })
+                    .unwrap_or(true);
 
-            if needs_render && !self.render_in_flight {
-                if product.is_level3() {
-                    // Level III render path — find the tilt with the closest elevation
-                    let best_l3 = self.level3_data.iter()
-                        .filter(|((p, _), _)| *p == product)
-                        .min_by(|(_, a), (_, b)| {
-                            let da = (a.pdb.elevation_angle() - elevation).abs();
-                            let db = (b.pdb.elevation_angle() - elevation).abs();
-                            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .map(|(_, msg)| Arc::clone(msg));
-                    if let Some(l3_msg) = best_l3 {
+                if needs_render && !prs.render_in_flight {
+                    if product.is_level3() {
+                        // Level III render path — find the tilt with the closest elevation
+                        let best_l3 = self.level3_data.iter()
+                            .filter(|((p, _), _)| *p == product)
+                            .min_by(|(_, a), (_, b)| {
+                                let da = (a.pdb.elevation_angle() - elevation).abs();
+                                let db = (b.pdb.elevation_angle() - elevation).abs();
+                                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .map(|(_, msg)| Arc::clone(msg));
+                        if let Some(l3_msg) = best_l3 {
+                            if let Some(scan_info) = self.gui.get_scan_info() {
+                                log::info!("Spawning Level III render for pane {}: {:?}", pane_idx, product);
+                                let l3_msg = Arc::clone(&l3_msg);
+                                let lat = scan_info.site.lat;
+                                let lon = scan_info.site.lon;
+                                let sender = self.render_result_sender.clone();
+                                let generation = self.render_generation;
+                                let window = self.window.clone();
+
+                                std::thread::spawn(move || {
+                                    log::debug!(
+                                        "L3 {:?}: pdb product_code={}, thresholds={:?}, ps47_53={:?}",
+                                        product, l3_msg.pdb.product_code,
+                                        l3_msg.pdb.thresholds, l3_msg.pdb.product_specific_47_53
+                                    );
+                                    // Extract radial packet from symbology
+                                    let radial_packet = l3_msg.symbology.as_ref().and_then(|sym| {
+                                        log::debug!("L3 {:?}: symbology has {} layers", product, sym.layers.len());
+                                        for (li, layer) in sym.layers.iter().enumerate() {
+                                            log::debug!("L3 {:?}: layer {} has {} packets", product, li, layer.packets.len());
+                                            for (pi, pkt) in layer.packets.iter().enumerate() {
+                                                match pkt {
+                                                    nexrad_level3::model::DataPacket::DigitalRadial(rp) => {
+                                                        log::debug!(
+                                                            "L3 {:?}: layer[{}].packet[{}] = DigitalRadial: radials={}, bins={}, scale_factor={}, is_legacy={}, first_range_bin={}",
+                                                            product, li, pi, rp.radials.len(), rp.num_range_bins, rp.scale_factor, rp.is_legacy, rp.first_range_bin
+                                                        );
+                                                        if let Some(r0) = rp.radials.first() {
+                                                            let non_zero: usize = r0.gate_values.iter().filter(|&&v| v > 1).count();
+                                                            let max_val = r0.gate_values.iter().copied().max().unwrap_or(0);
+                                                            log::debug!(
+                                                                "L3 {:?}: first radial: start_angle={}, delta={}, gates={}, non_zero(>1)={}, max_gate_val={}, first_10={:?}",
+                                                                product, r0.start_angle, r0.angle_delta, r0.gate_values.len(), non_zero, max_val,
+                                                                &r0.gate_values[..r0.gate_values.len().min(10)]
+                                                            );
+                                                        }
+                                                    }
+                                                    nexrad_level3::model::DataPacket::Raster(_) => {
+                                                        log::debug!("L3 {:?}: layer[{}].packet[{}] = Raster", product, li, pi);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        sym.layers.iter().find_map(|layer| {
+                                            layer.packets.iter().find_map(|pkt| {
+                                                if let nexrad_level3::model::DataPacket::DigitalRadial(rp) = pkt {
+                                                    Some(rp)
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                        })
+                                    });
+                                    if radial_packet.is_none() {
+                                        log::warn!("L3 {:?}: no radial packet found in symbology!", product);
+                                    }
+                                    if let Some(rp) = radial_packet {
+                                        let scale = l3_msg.pdb.data_scale();
+                                        let offset = l3_msg.pdb.data_offset();
+                                        let vil_lut = l3_msg.pdb.build_vil_lut();
+                                        let legacy_lut;
+                                        let lut: Option<&[f32]> = if vil_lut.is_some() {
+                                            vil_lut.as_deref()
+                                        } else if rp.is_legacy {
+                                            legacy_lut = l3_msg.pdb.decode_legacy_thresholds();
+                                            Some(legacy_lut.as_slice())
+                                        } else {
+                                            None
+                                        };
+                                        log::debug!(
+                                            "L3 {:?}: rendering with scale={}, offset={}, legacy={}, lut_len={:?}, gate_interval_km={}, first_gate_range_km={}",
+                                            product, scale, offset, rp.is_legacy, lut.map(|l| l.len()), rp.gate_interval_km(), rp.first_gate_range_km()
+                                        );
+                                        if let Some((image, range, values)) =
+                                            render_level3_radial_to_image(rp, product, lat, lon, scale, offset, lut)
+                                        {
+                                            let _ = sender.send((image, range, values, product, elevation, generation, pane_idx));
+                                        } else {
+                                            log::warn!("L3 {:?}: render_level3_radial_to_image returned None", product);
+                                        }
+                                    }
+                                    if let Some(window) = window {
+                                        window.request_redraw();
+                                    }
+                                });
+                                self.pane_render[pane_idx].render_in_flight = true;
+                            }
+                        }
+                    } else if let Some(data) = &self.scan_data {
                         if let Some(scan_info) = self.gui.get_scan_info() {
-                            log::info!("Spawning Level III render: {:?}", product);
-                            let l3_msg = Arc::clone(&l3_msg);
+                            log::info!("Spawning background render for pane {}: {:?} at {:.1}°", pane_idx, product, elevation);
+                            let data = Arc::clone(data);
                             let lat = scan_info.site.lat;
                             let lon = scan_info.site.lon;
                             let sender = self.render_result_sender.clone();
@@ -770,116 +888,24 @@ impl App {
                             let window = self.window.clone();
 
                             std::thread::spawn(move || {
-                                log::debug!(
-                                    "L3 {:?}: pdb product_code={}, thresholds={:?}, ps47_53={:?}",
-                                    product, l3_msg.pdb.product_code,
-                                    l3_msg.pdb.thresholds, l3_msg.pdb.product_specific_47_53
-                                );
-                                // Extract radial packet from symbology
-                                let radial_packet = l3_msg.symbology.as_ref().and_then(|sym| {
-                                    log::debug!("L3 {:?}: symbology has {} layers", product, sym.layers.len());
-                                    for (li, layer) in sym.layers.iter().enumerate() {
-                                        log::debug!("L3 {:?}: layer {} has {} packets", product, li, layer.packets.len());
-                                        for (pi, pkt) in layer.packets.iter().enumerate() {
-                                            match pkt {
-                                                nexrad_level3::model::DataPacket::DigitalRadial(rp) => {
-                                                    log::debug!(
-                                                        "L3 {:?}: layer[{}].packet[{}] = DigitalRadial: radials={}, bins={}, scale_factor={}, is_legacy={}, first_range_bin={}",
-                                                        product, li, pi, rp.radials.len(), rp.num_range_bins, rp.scale_factor, rp.is_legacy, rp.first_range_bin
-                                                    );
-                                                    if let Some(r0) = rp.radials.first() {
-                                                        let non_zero: usize = r0.gate_values.iter().filter(|&&v| v > 1).count();
-                                                        let max_val = r0.gate_values.iter().copied().max().unwrap_or(0);
-                                                        log::debug!(
-                                                            "L3 {:?}: first radial: start_angle={}, delta={}, gates={}, non_zero(>1)={}, max_gate_val={}, first_10={:?}",
-                                                            product, r0.start_angle, r0.angle_delta, r0.gate_values.len(), non_zero, max_val,
-                                                            &r0.gate_values[..r0.gate_values.len().min(10)]
-                                                        );
-                                                    }
-                                                }
-                                                nexrad_level3::model::DataPacket::Raster(_) => {
-                                                    log::debug!("L3 {:?}: layer[{}].packet[{}] = Raster", product, li, pi);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    sym.layers.iter().find_map(|layer| {
-                                        layer.packets.iter().find_map(|pkt| {
-                                            if let nexrad_level3::model::DataPacket::DigitalRadial(rp) = pkt {
-                                                Some(rp)
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                    })
-                                });
-                                if radial_packet.is_none() {
-                                    log::warn!("L3 {:?}: no radial packet found in symbology!", product);
-                                }
-                                if let Some(rp) = radial_packet {
-                                    let scale = l3_msg.pdb.data_scale();
-                                    let offset = l3_msg.pdb.data_offset();
-                                    // VIL (product 134) uses a special hybrid
-                                    // linear+logarithmic LUT encoded in the
-                                    // thresholds; legacy products use a 16-entry LUT.
-                                    let vil_lut = l3_msg.pdb.build_vil_lut();
-                                    let legacy_lut;
-                                    let lut: Option<&[f32]> = if vil_lut.is_some() {
-                                        vil_lut.as_deref()
-                                    } else if rp.is_legacy {
-                                        legacy_lut = l3_msg.pdb.decode_legacy_thresholds();
-                                        Some(legacy_lut.as_slice())
-                                    } else {
-                                        None
-                                    };
-                                    log::debug!(
-                                        "L3 {:?}: rendering with scale={}, offset={}, legacy={}, lut_len={:?}, gate_interval_km={}, first_gate_range_km={}",
-                                        product, scale, offset, rp.is_legacy, lut.map(|l| l.len()), rp.gate_interval_km(), rp.first_gate_range_km()
-                                    );
-                                    if let Some((image, range, values)) =
-                                        render_level3_radial_to_image(rp, product, lat, lon, scale, offset, lut)
-                                    {
-                                        let _ = sender.send((image, range, values, product, elevation, generation));
-                                    } else {
-                                        log::warn!("L3 {:?}: render_level3_radial_to_image returned None", product);
-                                    }
+                                if let Some((image, range, values)) =
+                                    render_radar_to_image(&data, elevation, product, lat, lon)
+                                {
+                                    let _ = sender.send((image, range, values, product, elevation, generation, pane_idx));
                                 }
                                 if let Some(window) = window {
                                     window.request_redraw();
                                 }
                             });
-                            self.render_in_flight = true;
+                            self.pane_render[pane_idx].render_in_flight = true;
                         }
                     }
-                } else if let Some(data) = &self.scan_data {
-                    if let Some(scan_info) = self.gui.get_scan_info() {
-                        log::info!("Spawning background render: {:?} at {:.1}°", product, elevation);
-                        let data = Arc::clone(data);
-                        let lat = scan_info.site.lat;
-                        let lon = scan_info.site.lon;
-                        let sender = self.render_result_sender.clone();
-                        let generation = self.render_generation;
-                        let window = self.window.clone();
-
-                        std::thread::spawn(move || {
-                            if let Some((image, range, values)) =
-                                render_radar_to_image(&data, elevation, product, lat, lon)
-                            {
-                                let _ = sender.send((image, range, values, product, elevation, generation));
-                            }
-                            // Wake the event loop so the result is picked up promptly
-                            if let Some(window) = window {
-                                window.request_redraw();
-                            }
-                        });
-                        self.render_in_flight = true;
-                    }
                 }
+            } else if pane_idx < self.pane_render.len() {
+                // No rendering params for this pane, clear its image
+                self.gui.clear_radar_image_for_pane(pane_idx);
+                self.pane_render[pane_idx].last_rendered = None;
             }
-        } else {
-            // No rendering params available, clear any existing image
-            self.gui.clear_radar_image();
-            self.last_rendered = None;
         }
 
         (screen_descriptor, gui_action)
@@ -894,35 +920,40 @@ impl App {
         let Some(state) = self.state.as_ref() else {
             return;
         };
-        let Some((ref image_data, max_range_km, ref value_data, product, elevation)) =
-            self.cached_render
-        else {
-            return;
-        };
-        let Some(scan_info) = self.gui.get_scan_info() else {
+        let Some(scan_info) = self.gui.get_scan_info().cloned() else {
             return;
         };
 
-        log::info!(
-            "Restoring cached radar image ({:?} at {:.1}°) from memory",
-            product,
-            elevation
-        );
+        for pane_idx in 0..self.pane_render.len().min(self.gui.pane_count()) {
+            let Some((ref image_data, max_range_km, ref value_data, product, elevation)) =
+                self.pane_render[pane_idx].cached_render
+            else {
+                continue;
+            };
 
-        self.texture_counter += 1;
-        let ctx = state.egui_renderer.context();
-        let color_image = egui::ColorImage::from_rgba_unmultiplied([1800, 1800], image_data);
-        let texture_name = format!("radar_image_{}", self.texture_counter);
-        let texture = ctx.load_texture(texture_name, color_image, egui::TextureOptions::NEAREST);
+            log::info!(
+                "Restoring cached radar image for pane {} ({:?} at {:.1}°) from memory",
+                pane_idx,
+                product,
+                elevation
+            );
 
-        self.gui.set_radar_image(
-            texture,
-            scan_info.site.lat,
-            scan_info.site.lon,
-            max_range_km,
-            value_data.clone(),
-        );
-        self.last_rendered = Some((product, elevation));
+            self.texture_counter += 1;
+            let ctx = state.egui_renderer.context();
+            let color_image = egui::ColorImage::from_rgba_unmultiplied([1800, 1800], image_data);
+            let texture_name = format!("radar_image_{}", self.texture_counter);
+            let texture = ctx.load_texture(texture_name, color_image, egui::TextureOptions::NEAREST);
+
+            self.gui.set_radar_image_for_pane(
+                pane_idx,
+                texture,
+                scan_info.site.lat,
+                scan_info.site.lon,
+                max_range_km,
+                value_data.clone(),
+            );
+            self.pane_render[pane_idx].last_rendered = Some((product, elevation));
+        }
     }
 
     /// Get the current surface texture, handling common errors.
@@ -959,7 +990,9 @@ impl App {
             // recreates it with a fresh surface.  Keep cached_render so the radar
             // image can be restored instantly.
             self.old_textures.clear();
-            self.last_rendered = None;
+            for prs in &mut self.pane_render {
+                prs.last_rendered = None;
+            }
             self.gui.clear_graphics_state();
             self.state = None;
             self.applied_visuals_dark = None;
@@ -1307,7 +1340,9 @@ impl ApplicationHandler for App {
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         log::info!("App suspended — clearing graphics state");
         self.old_textures.clear();
-        self.last_rendered = None;
+        for prs in &mut self.pane_render {
+            prs.last_rendered = None;
+        }
         self.texture_counter = 0;
         self.gui.clear_graphics_state();        // Keep cached_render intact so we can re-upload the texture
         // immediately on resume without re-rendering.        // Clear both window and state so resumed() creates fresh ones.
