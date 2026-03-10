@@ -132,7 +132,8 @@ pub fn build_cached_features(
         max_lon: nw.x().max(se.x()),
     };
 
-    features
+    // Pass 1: build all polygon geometry (triangulation, projection) without hatch
+    let mut cached: Vec<CachedFeature> = features
         .iter()
         .map(|feature| {
             // Early geo-AABB cull
@@ -154,8 +155,6 @@ pub fn build_cached_features(
                         feature.triangulations.get(poly_idx).and_then(|t| t.as_ref()),
                         projector,
                         screen_rect,
-                        if include_hatch { feature.hatch } else { HatchPattern::None },
-                        dark_theme,
                     )
                 })
                 .collect();
@@ -164,17 +163,83 @@ pub fn build_cached_features(
                 polygons: cached_polys,
             }
         })
-        .collect()
+        .collect();
+
+    if !include_hatch {
+        return cached;
+    }
+
+    // Pass 2: generate hatch lines.
+    // For each CIG level, collect screen-space polygons from *higher* CIG
+    // features to use as exclusion zones so lower-severity hatching doesn't
+    // show through higher-severity regions.
+
+    // Collect all screen-space polygon vertex lists grouped by CIG level
+    let mut cig2_polys: Vec<Vec<Pos2>> = Vec::new();
+    let mut cig3_polys: Vec<Vec<Pos2>> = Vec::new();
+    for (feat_idx, feature) in features.iter().enumerate() {
+        match feature.hatch {
+            HatchPattern::Cig2 => {
+                for cp in &cached[feat_idx].polygons {
+                    if cp.screen_pts.len() >= 3 {
+                        cig2_polys.push(cp.screen_pts.clone());
+                    }
+                }
+            }
+            HatchPattern::Cig3 => {
+                for cp in &cached[feat_idx].polygons {
+                    if cp.screen_pts.len() >= 3 {
+                        cig3_polys.push(cp.screen_pts.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Now generate hatch for each feature with appropriate exclusions
+    for (feat_idx, feature) in features.iter().enumerate() {
+        if feature.hatch == HatchPattern::None {
+            continue;
+        }
+
+        // Build the exclusion list: higher-CIG polygons that should mask this feature's hatch
+        let exclusions: Vec<&[Pos2]> = match feature.hatch {
+            HatchPattern::Cig1 => {
+                // CIG1 is masked by CIG2 and CIG3
+                cig2_polys.iter().map(|v| v.as_slice())
+                    .chain(cig3_polys.iter().map(|v| v.as_slice()))
+                    .collect()
+            }
+            HatchPattern::Cig2 => {
+                // CIG2 is masked by CIG3
+                cig3_polys.iter().map(|v| v.as_slice()).collect()
+            }
+            _ => Vec::new(), // CIG3 is the highest — no masking needed
+        };
+
+        for cp in &mut cached[feat_idx].polygons {
+            if cp.screen_pts.len() >= 3 {
+                cp.hatch_lines = generate_hatch_lines(
+                    &cp.screen_pts,
+                    feature.hatch,
+                    screen_rect,
+                    dark_theme,
+                    &exclusions,
+                );
+            }
+        }
+    }
+
+    cached
 }
 
-/// Build cached geometry for a single polygon exterior ring.
+/// Build cached geometry for a single polygon exterior ring (without hatch — hatch is added in pass 2).
 fn build_cached_polygon(
     polygon: &[Vec<(f64, f64)>],
     precomputed_tri: Option<&rustdar_overlays::types::PrecomputedTriangulation>,
     projector: &Projector,
     screen_rect: Rect,
-    hatch: HatchPattern,
-    dark_theme: bool,
 ) -> Option<CachedPolygon> {
     let exterior = polygon.first()?;
     if exterior.len() < 3 {
@@ -234,18 +299,11 @@ fn build_cached_polygon(
         triangulate_screen(&projected)
     };
 
-    // Generate hatch lines if needed
-    let hatch_lines = if hatch != HatchPattern::None {
-        generate_hatch_lines(&projected, hatch, screen_rect, dark_theme)
-    } else {
-        Vec::new()
-    };
-
     Some(CachedPolygon {
         screen_pts: projected,
         tri_indices,
         poly_rect,
-        hatch_lines,
+        hatch_lines: Vec::new(),
     })
 }
 

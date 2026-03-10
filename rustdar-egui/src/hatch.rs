@@ -151,11 +151,16 @@ fn draw_directional_hatch(
 ///
 /// Returns `(start, end, is_dotted)` tuples suitable for caching.
 /// This avoids per-frame recomputation of scanline-polygon intersections.
+///
+/// `exclusion_polygons` are screen-space polygons from higher-severity CIG
+/// areas. Any hatch segment portions that fall inside an exclusion polygon
+/// are removed so that e.g. CIG1 hatching doesn't show through a CIG2 region.
 pub fn generate_hatch_lines(
     polygon_pts: &[Pos2],
     pattern: HatchPattern,
     clip_rect: Rect,
     dark_theme: bool,
+    exclusion_polygons: &[&[Pos2]],
 ) -> Vec<(Pos2, Pos2, bool)> {
     let _ = (clip_rect, dark_theme); // used by draw_hatch but not needed here
     if polygon_pts.len() < 3 || pattern == HatchPattern::None {
@@ -176,7 +181,148 @@ pub fn generate_hatch_lines(
         }
         HatchPattern::None => {}
     }
+
+    if !exclusion_polygons.is_empty() {
+        subtract_exclusion_polygons(&mut lines, exclusion_polygons);
+    }
+
     lines
+}
+
+/// Remove portions of hatch segments that fall inside any exclusion polygon.
+fn subtract_exclusion_polygons(
+    lines: &mut Vec<(Pos2, Pos2, bool)>,
+    exclusions: &[&[Pos2]],
+) {
+    let mut result = Vec::with_capacity(lines.len());
+    for &(p1, p2, dotted) in lines.iter() {
+        let mut segments = vec![(p1, p2)];
+        for &excl_poly in exclusions {
+            if excl_poly.len() < 3 {
+                continue;
+            }
+            // Quick AABB reject per exclusion polygon
+            let seg_min_x = segments.iter().map(|(a, b)| a.x.min(b.x)).fold(f32::MAX, f32::min);
+            let seg_max_x = segments.iter().map(|(a, b)| a.x.max(b.x)).fold(f32::MIN, f32::max);
+            let seg_min_y = segments.iter().map(|(a, b)| a.y.min(b.y)).fold(f32::MAX, f32::min);
+            let seg_max_y = segments.iter().map(|(a, b)| a.y.max(b.y)).fold(f32::MIN, f32::max);
+            let (ex_min_x, ex_min_y, ex_max_x, ex_max_y) = poly_aabb(excl_poly);
+            if seg_max_x < ex_min_x || seg_min_x > ex_max_x
+                || seg_max_y < ex_min_y || seg_min_y > ex_max_y
+            {
+                continue;
+            }
+
+            let mut next_segments = Vec::with_capacity(segments.len());
+            for (s1, s2) in segments {
+                subtract_polygon_from_segment(s1, s2, excl_poly, &mut next_segments);
+            }
+            segments = next_segments;
+            if segments.is_empty() {
+                break;
+            }
+        }
+        for (s1, s2) in segments {
+            result.push((s1, s2, dotted));
+        }
+    }
+    *lines = result;
+}
+
+/// Subtract a single polygon from a line segment, outputting remaining portions.
+fn subtract_polygon_from_segment(
+    p1: Pos2,
+    p2: Pos2,
+    polygon: &[Pos2],
+    out: &mut Vec<(Pos2, Pos2)>,
+) {
+    let dx = p2.x - p1.x;
+    let dy = p2.y - p1.y;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 1e-6 {
+        return;
+    }
+
+    // Find all intersection t-values with polygon edges
+    let n = polygon.len();
+    let mut ts = Vec::new();
+    for i in 0..n {
+        let a = polygon[i];
+        let b = polygon[(i + 1) % n];
+        let ex = b.x - a.x;
+        let ey = b.y - a.y;
+        let denom = dx * ey - dy * ex;
+        if denom.abs() < 1e-10 {
+            continue;
+        }
+        let t = ((a.x - p1.x) * ey - (a.y - p1.y) * ex) / denom;
+        let s = ((a.x - p1.x) * dy - (a.y - p1.y) * dx) / denom;
+        if s >= 0.0 && s <= 1.0 && t >= 0.0 && t <= 1.0 {
+            ts.push(t);
+        }
+    }
+    ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    ts.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+
+    // Build intervals. Check inside/outside at each sub-segment midpoint.
+    let mut boundaries = vec![0.0_f32];
+    boundaries.extend_from_slice(&ts);
+    boundaries.push(1.0);
+
+    for w in boundaries.windows(2) {
+        let t0 = w[0];
+        let t1 = w[1];
+        if (t1 - t0) < 1e-6 {
+            continue;
+        }
+        let mid_t = (t0 + t1) * 0.5;
+        let mid = Pos2::new(p1.x + dx * mid_t, p1.y + dy * mid_t);
+        if !point_in_polygon_fast(mid, polygon) {
+            // This portion is outside the exclusion polygon — keep it
+            out.push((
+                Pos2::new(p1.x + dx * t0, p1.y + dy * t0),
+                Pos2::new(p1.x + dx * t1, p1.y + dy * t1),
+            ));
+        }
+    }
+}
+
+/// Fast even-odd rule point-in-polygon test.
+fn point_in_polygon_fast(point: Pos2, polygon: &[Pos2]) -> bool {
+    let n = polygon.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let px = point.x;
+    let py = point.y;
+    let mut j = n - 1;
+    for i in 0..n {
+        let vi = polygon[i];
+        let vj = polygon[j];
+        if (vi.y > py) != (vj.y > py)
+            && px < (vj.x - vi.x) * (py - vi.y) / (vj.y - vi.y) + vi.x
+        {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Compute AABB of a polygon.
+fn poly_aabb(polygon: &[Pos2]) -> (f32, f32, f32, f32) {
+    let mut min_x = f32::MAX;
+    let mut min_y = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut max_y = f32::MIN;
+    for pt in polygon {
+        min_x = min_x.min(pt.x);
+        min_y = min_y.min(pt.y);
+        max_x = max_x.max(pt.x);
+        max_y = max_y.max(pt.y);
+    }
+    (min_x, min_y, max_x, max_y)
 }
 
 /// Collect hatch line segments at a given angle, clipped to the polygon.
