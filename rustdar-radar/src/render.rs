@@ -414,8 +414,9 @@ pub fn render_radar_to_image(
 /// For digital products, `scale` and `offset` convert raw gate bytes to physical
 /// values: `physical = (gate_byte - offset) / scale`.
 ///
-/// For legacy products (`radial_packet.is_legacy`), the `legacy_thresholds` LUT
-/// maps 4-bit gate values (0–15) directly to physical values.
+/// When `lut` is provided it overrides scale/offset: the gate value is used as
+/// an index directly.  This covers both legacy 4-bit products (16-entry LUT)
+/// and special digital products like VIL (256-entry LUT).
 pub fn render_level3_radial_to_image(
     radial_packet: &nexrad_level3::model::RadialPacket,
     product: RadarProduct,
@@ -423,7 +424,7 @@ pub fn render_level3_radial_to_image(
     _radar_lon: f64,
     scale: f32,
     offset: f32,
-    legacy_thresholds: Option<&[f32; 16]>,
+    lut: Option<&[f32]>,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     if radial_packet.radials.is_empty() {
         return None;
@@ -472,9 +473,9 @@ pub fn render_level3_radial_to_image(
                     below_thresh += 1;
                     continue;
                 }
-                let physical_value = if let Some(thresholds) = legacy_thresholds {
+                let physical_value = if let Some(table) = lut {
                     let idx = gate_value as usize;
-                    if idx < 16 { thresholds[idx] } else { f32::NAN }
+                    if idx < table.len() { table[idx] } else { f32::NAN }
                 } else {
                     (gate_value as f32 - offset) / scale
                 };
@@ -512,9 +513,9 @@ pub fn render_level3_radial_to_image(
             let bins = r0.gate_values.len().min(num_bins);
             for (i, &gv) in r0.gate_values[..bins].iter().enumerate() {
                 if gv > 1 && samples.len() < 5 {
-                    let pv = if let Some(thresholds) = legacy_thresholds {
+                    let pv = if let Some(table) = lut {
                         let idx = gv as usize;
-                        if idx < 16 { thresholds[idx] } else { f32::NAN }
+                        if idx < table.len() { table[idx] } else { f32::NAN }
                     } else {
                         (gv as f32 - offset) / scale
                     };
@@ -545,12 +546,10 @@ pub fn render_level3_radial_to_image(
                 continue;
             }
 
-            let physical_value = if let Some(thresholds) = legacy_thresholds {
-                // Legacy product: use threshold LUT (gate values are 0–15)
+            let physical_value = if let Some(table) = lut {
                 let idx = gate_value as usize;
-                if idx < 16 { thresholds[idx] } else { f32::NAN }
+                if idx < table.len() { table[idx] } else { f32::NAN }
             } else {
-                // Digital product: linear scale/offset
                 (gate_value as f32 - offset) / scale
             };
             // SRV products (both legacy N0S and digital N*U) output knots;

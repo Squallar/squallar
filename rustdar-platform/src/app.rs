@@ -817,17 +817,25 @@ impl App {
                                 if let Some(rp) = radial_packet {
                                     let scale = l3_msg.pdb.data_scale();
                                     let offset = l3_msg.pdb.data_offset();
-                                    let legacy_thresholds = if rp.is_legacy {
-                                        Some(l3_msg.pdb.decode_legacy_thresholds())
+                                    // VIL (product 134) uses a special hybrid
+                                    // linear+logarithmic LUT encoded in the
+                                    // thresholds; legacy products use a 16-entry LUT.
+                                    let vil_lut = l3_msg.pdb.build_vil_lut();
+                                    let legacy_lut;
+                                    let lut: Option<&[f32]> = if vil_lut.is_some() {
+                                        vil_lut.as_deref()
+                                    } else if rp.is_legacy {
+                                        legacy_lut = l3_msg.pdb.decode_legacy_thresholds();
+                                        Some(legacy_lut.as_slice())
                                     } else {
                                         None
                                     };
                                     log::debug!(
-                                        "L3 {:?}: rendering with scale={}, offset={}, legacy={}, gate_interval_km={}, first_gate_range_km={}",
-                                        product, scale, offset, rp.is_legacy, rp.gate_interval_km(), rp.first_gate_range_km()
+                                        "L3 {:?}: rendering with scale={}, offset={}, legacy={}, lut_len={:?}, gate_interval_km={}, first_gate_range_km={}",
+                                        product, scale, offset, rp.is_legacy, lut.map(|l| l.len()), rp.gate_interval_km(), rp.first_gate_range_km()
                                     );
                                     if let Some((image, range, values)) =
-                                        render_level3_radial_to_image(rp, product, lat, lon, scale, offset, legacy_thresholds.as_ref())
+                                        render_level3_radial_to_image(rp, product, lat, lon, scale, offset, lut)
                                     {
                                         let _ = sender.send((image, range, values, product, elevation, generation));
                                     } else {
@@ -968,7 +976,7 @@ impl App {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
         // Render egui
-        state.egui_renderer.end_frame_and_draw(
+        let textures_to_free = state.egui_renderer.end_frame_and_draw(
             &state.device,
             &state.queue,
             &mut encoder,
@@ -978,6 +986,7 @@ impl App {
         );
 
         state.queue.submit(Some(encoder.finish()));
+        state.egui_renderer.free_textures(&textures_to_free);
         surface_texture.present();
     }
 
