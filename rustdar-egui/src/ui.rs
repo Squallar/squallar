@@ -870,6 +870,29 @@ impl Gui {
                             }
                             } // end if radar layer enabled
 
+                            // Don't process overlay clicks when a popup is open;
+                            // instead, dismiss the popup on click outside it.
+                            let pointer_available = self.selected_alert.is_none()
+                                && self.selected_md.is_none();
+
+                            if !pointer_available {
+                                let click_pos = ui.ctx().input(|i| {
+                                    if i.pointer.any_click() {
+                                        i.pointer.interact_pos()
+                                    } else {
+                                        None
+                                    }
+                                });
+                                if let Some(pos) = click_pos {
+                                    let on_popup = ui.ctx().layer_id_at(pos)
+                                        .is_some_and(|l| l.order > egui::Order::Background);
+                                    if !on_popup {
+                                        self.selected_alert = None;
+                                        self.selected_md = None;
+                                    }
+                                }
+                            }
+
                             // Draw SPC Mesoscale Discussion polygons
                             let clicked_md = draw_spc_discussions(
                                 ui,
@@ -879,6 +902,7 @@ impl Gui {
                                 &self.spc_discussions,
                                 &mut self.spc_md_overlay_cache,
                                 self.spc_md_data_generation,
+                                pointer_available,
                             );
                             if let Some(idx) = clicked_md {
                                 self.selected_md = Some(idx);
@@ -893,6 +917,7 @@ impl Gui {
                                 &self.nws_alerts,
                                 &mut self.nws_overlay_cache,
                                 self.nws_data_generation,
+                                pointer_available,
                             );
                             if let Some(idx) = clicked_alert {
                                 self.selected_alert = Some(idx);
@@ -2162,6 +2187,7 @@ fn draw_spc_discussions(
     discussions: &[SpcDiscussion],
     cache: &mut OverlayLayerCache,
     data_gen: u64,
+    pointer_available: bool,
 ) -> Option<usize> {
     if !layers.is_enabled(LayerKind::SpcMesoscaleDiscussions) || discussions.is_empty() {
         return None;
@@ -2261,7 +2287,7 @@ fn draw_spc_discussions(
             }
 
             // Click detection
-            if clicked_index.is_none() {
+            if pointer_available && clicked_index.is_none() {
                 let clicked = ui.ctx().input(|i| {
                     i.pointer.any_click()
                         && i.pointer.interact_pos().is_some_and(|p| {
@@ -2303,6 +2329,7 @@ fn draw_nws_alerts(
     nws_alerts: &[NwsAlert],
     cache: &mut OverlayLayerCache,
     data_gen: u64,
+    pointer_available: bool,
 ) -> Option<usize> {
     if !layers.any_nws_enabled() || nws_alerts.is_empty() {
         return None;
@@ -2388,7 +2415,7 @@ fn draw_nws_alerts(
                 }
 
                 // Click detection
-                if clicked_index.is_none() {
+                if pointer_available && clicked_index.is_none() {
                     let clicked = ui.ctx().input(|i| {
                         i.pointer.any_click()
                             && i.pointer.interact_pos().is_some_and(|p| {
