@@ -7,6 +7,7 @@ members = [
     "rustdar-egui",
     "rustdar-radar",
     "rustdar-overlays",
+    "nexrad-level3",
 ]
 
 [profile.dev]

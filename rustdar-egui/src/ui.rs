@@ -776,14 +776,59 @@ impl Gui {
                                                 if !value.is_nan() {
                                                     let product = self.selected_product;
                                                     value_str = match product {
-                                                        RadarProduct::Velocity => {
-                                                            let mph = value * 2.23694;
-                                                            format!(" | Velocity: {:.1} mph", mph)
-                                                        }
                                                         RadarProduct::Reflectivity => {
                                                             format!(" | Reflectivity: {:.1} dBZ", value)
                                                         }
-                                                        _ => format!(" | Value: {:.2}", value),
+                                                        RadarProduct::Velocity
+                                                        | RadarProduct::StormRelativeVelocity => {
+                                                            let mph = value * 2.23694;
+                                                            format!(" | {}: {:.1} mph", product.name(), mph)
+                                                        }
+                                                        RadarProduct::SpectrumWidth => {
+                                                            let mph = value * 2.23694;
+                                                            format!(" | Spectrum Width: {:.1} mph", mph)
+                                                        }
+                                                        RadarProduct::DifferentialReflectivity => {
+                                                            format!(" | Diff. Reflectivity: {:.2} dB", value)
+                                                        }
+                                                        RadarProduct::CorrelationCoefficient => {
+                                                            format!(" | Corr. Coefficient: {:.4}", value)
+                                                        }
+                                                        RadarProduct::DifferentialPhase => {
+                                                            format!(" | Diff. Phase: {:.1}°", value)
+                                                        }
+                                                        RadarProduct::SpecificDifferentialPhase => {
+                                                            format!(" | KDP: {:.2} °/km", value)
+                                                        }
+                                                        RadarProduct::EchoTops => {
+                                                            format!(" | Echo Tops: {:.1} kft", value)
+                                                        }
+                                                        RadarProduct::VerticallyIntegratedLiquid => {
+                                                            format!(" | VIL: {:.1} kg/m²", value)
+                                                        }
+                                                        RadarProduct::HydrometeorClassification => {
+                                                            let class = match value as u16 {
+                                                                0..=9 => "No Data",
+                                                                10..=19 => "Biological",
+                                                                20..=29 => "Clutter/AP",
+                                                                30..=39 => "Ice Crystals",
+                                                                40..=49 => "Dry Snow",
+                                                                50..=59 => "Wet Snow",
+                                                                60..=69 => "Rain",
+                                                                70..=79 => "Heavy Rain",
+                                                                80..=89 => "Big Drops",
+                                                                90..=99 => "Graupel",
+                                                                100..=109 => "Hail+Rain",
+                                                                110..=119 => "Large Hail",
+                                                                120..=139 => "Giant Hail",
+                                                                140..=149 => "Unknown",
+                                                                150.. => "Range Folded",
+                                                            };
+                                                            format!(" | HHC: {class}")
+                                                        }
+                                                        RadarProduct::PrecipitationRate => {
+                                                            format!(" | Precip Rate: {:.2} in/hr", value)
+                                                        }
                                                     };
                                                 }
                                             }

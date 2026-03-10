@@ -46,15 +46,40 @@ pub(crate) fn decode_symbology_block(
         while o + 2 <= layer_end && o + 2 <= data.len() {
             let packet_code = read_u16(data, o)?;
             match packet_code {
-                // Digital Radial Data Array (packet code 16 = 0xAF1F)
-                // Note: the ICD defines this as packet code 16, but the actual
-                // on-wire code is 0xAF1F (big-endian representation in the
-                // packet header). Some docs refer to it as "AF1F" or 16.
-                0xAF1F | 16 => {
+                // Legacy Radial Data Array (packet code 0xAF1F).
+                // Uses RLE encoding and halfword size fields. Gate values are
+                // 4-bit (0–15) and need threshold table mapping.
+                0xAF1F => {
                     let (radial_packet, new_offset) =
-                        super::radial::decode_radial_packet(data, o)?;
+                        super::radial::decode_legacy_radial_packet(data, o)?;
                     packets.push(DataPacket::DigitalRadial(radial_packet));
                     o = new_offset;
+                }
+                // Digital Radial Data Array (packet code 16).
+                // Raw 8-bit gate values with byte size fields.
+                16 => {
+                    let (radial_packet, new_offset) =
+                        super::radial::decode_digital_radial_packet(data, o)?;
+                    packets.push(DataPacket::DigitalRadial(radial_packet));
+                    o = new_offset;
+                }
+                // Generic Data Component (packet code 28).
+                // Contains a self-describing header with radial or raster data.
+                28 => {
+                    match super::radial::decode_generic_radial_packet(data, o) {
+                        Ok((radial_packet, new_offset)) => {
+                            packets.push(DataPacket::DigitalRadial(radial_packet));
+                            o = new_offset;
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to decode Generic Data Component at offset {}: {}",
+                                o, e
+                            );
+                            o = layer_end;
+                            break;
+                        }
+                    }
                 }
                 _ => {
                     // Skip unknown packet types by advancing to the end of this layer

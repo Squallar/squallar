@@ -207,3 +207,174 @@ pub async fn check_and_fetch_latest(
     let scan = downloaded_file.scan()?;
     Ok(Some((scan, latest_dt)))
 }
+
+// ---------------------------------------------------------------------------
+// Level III product fetching
+// ---------------------------------------------------------------------------
+
+const LEVEL3_BUCKET_URL: &str = "https://unidata-nexrad-level3.s3.amazonaws.com";
+
+/// Errors that can occur during Level III fetch operations.
+#[derive(Debug)]
+pub enum Level3FetchError {
+    /// HTTP request failed.
+    Http(reqwest::Error),
+    /// No matching product found on S3.
+    NotFound(String),
+    /// Level III decoding failed.
+    Decode(nexrad_level3::result::Error),
+    /// XML listing parse error.
+    XmlParse(String),
+}
+
+impl std::fmt::Display for Level3FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Level3FetchError::Http(e) => write!(f, "HTTP error: {e}"),
+            Level3FetchError::NotFound(msg) => write!(f, "not found: {msg}"),
+            Level3FetchError::Decode(e) => write!(f, "decode error: {e}"),
+            Level3FetchError::XmlParse(msg) => write!(f, "XML parse error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for Level3FetchError {}
+
+impl From<reqwest::Error> for Level3FetchError {
+    fn from(e: reqwest::Error) -> Self {
+        Level3FetchError::Http(e)
+    }
+}
+
+impl From<nexrad_level3::result::Error> for Level3FetchError {
+    fn from(e: nexrad_level3::result::Error) -> Self {
+        Level3FetchError::Decode(e)
+    }
+}
+
+/// Convert a 4-letter ICAO radar site code (e.g. "KTLX") to the 3-letter
+/// code used in the Level III S3 bucket (e.g. "TLX").
+/// Non-CONUS sites that don't start with 'K' (e.g. "PGUA", "TJUA") are
+/// returned with just the first character stripped, matching the bucket
+/// convention.
+fn level3_site_code(site: &str) -> &str {
+    if site.len() == 4 {
+        &site[1..]
+    } else {
+        site
+    }
+}
+
+/// List available Level III product keys for a site/product/date on S3.
+///
+/// Keys in the `unidata-nexrad-level3` bucket are flat:
+/// `{SITE3}_{CODE}_{YYYY}_{MM}_{DD}_{HH}_{mm}_{ss}`
+///
+/// Returns a sorted vec of (key, NaiveDateTime) pairs.
+async fn list_level3_keys(
+    client: &reqwest::Client,
+    site: &str,
+    product_code: &str,
+    date: &chrono::NaiveDate,
+) -> std::result::Result<Vec<(String, NaiveDateTime)>, Level3FetchError> {
+    let site3 = level3_site_code(site);
+    let prefix = format!(
+        "{site3}_{product_code}_{:04}_{:02}_{:02}",
+        date.year(),
+        date.month(),
+        date.day()
+    );
+    let url = format!("{LEVEL3_BUCKET_URL}?list-type=2&prefix={prefix}");
+
+    let resp = client.get(&url).send().await?.error_for_status()?;
+    let body = resp.text().await?;
+
+    // Parse the simple S3 XML listing to extract <Key> elements
+    let mut keys = Vec::new();
+    for line in body.split("<Key>") {
+        if let Some(end) = line.find("</Key>") {
+            let key = &line[..end];
+            if let Some(dt) = parse_level3_key_datetime(key) {
+                keys.push((key.to_string(), dt));
+            }
+        }
+    }
+
+    keys.sort_by_key(|(_, dt)| *dt);
+    Ok(keys)
+}
+
+/// Parse a Level III S3 key like `TLX_N0S_2024_03_08_15_30_42` into a NaiveDateTime.
+fn parse_level3_key_datetime(key: &str) -> Option<NaiveDateTime> {
+    let parts: Vec<&str> = key.split('_').collect();
+    // Expected: [SITE3, CODE, YYYY, MM, DD, HH, mm, ss]
+    if parts.len() < 7 {
+        return None;
+    }
+    let year: i32 = parts[2].parse().ok()?;
+    let month: u32 = parts[3].parse().ok()?;
+    let day: u32 = parts[4].parse().ok()?;
+    let hour: u32 = parts[5].parse().ok()?;
+    let minute: u32 = parts[6].parse().ok()?;
+    let second: u32 = parts.get(7).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    let date = chrono::NaiveDate::from_ymd_opt(year, month, day)?;
+    let time = NaiveTime::from_hms_opt(hour, minute, second)?;
+    Some(date.and_time(time))
+}
+
+use chrono::Datelike;
+use nexrad_level3::model::Level3Message;
+
+/// Fetch the latest Level III product for a site.
+///
+/// Lists available keys for the given date, picks the one closest to
+/// `timestamp`, downloads it, and decodes it.
+pub async fn get_level3_product(
+    site: &str,
+    product_code: &str,
+    timestamp: NaiveDateTime,
+) -> std::result::Result<Level3Message, Level3FetchError> {
+    let client = reqwest::Client::new();
+    let date = timestamp.date();
+
+    let mut keys = list_level3_keys(&client, site, product_code, &date).await?;
+
+    // If no keys found, try previous day (same midnight-crossing logic as Level II)
+    if keys.is_empty() {
+        let prev = date - Duration::days(1);
+        keys = list_level3_keys(&client, site, product_code, &prev).await?;
+    }
+
+    if keys.is_empty() {
+        return Err(Level3FetchError::NotFound(format!(
+            "No Level III {product_code} files found for {site} near {timestamp}"
+        )));
+    }
+
+    // Find the key closest to the requested timestamp
+    let best_key = keys
+        .iter()
+        .min_by_key(|(_, dt)| (dt.signed_duration_since(timestamp)).num_seconds().unsigned_abs())
+        .map(|(k, _)| k.clone())
+        .ok_or_else(|| Level3FetchError::NotFound("empty key list".to_string()))?;
+
+    log::info!("Downloading Level III product: {best_key}");
+    let url = format!("{LEVEL3_BUCKET_URL}/{best_key}");
+    let resp = client.get(&url).send().await?.error_for_status()?;
+    let bytes = resp.bytes().await?;
+
+    let message = nexrad_level3::decode::decode_product(&bytes)?;
+    Ok(message)
+}
+
+/// Check for the latest available Level III product timestamp without downloading.
+pub async fn check_latest_level3(
+    site: &str,
+    product_code: &str,
+    date: &chrono::NaiveDate,
+) -> std::result::Result<Option<NaiveDateTime>, Level3FetchError> {
+    let client = reqwest::Client::new();
+    let keys = list_level3_keys(&client, site, product_code, date).await?;
+    Ok(keys.last().map(|(_, dt)| *dt))
+}

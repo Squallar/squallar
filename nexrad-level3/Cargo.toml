@@ -8,6 +8,7 @@ description = "NEXRAD Level III product decoder"
 repository = "https://github.com/danielway/nexrad"
 
 [dependencies]
+bzip2 = "0.5"
 flate2 = "1"
 log = "0.4"
 thiserror = "2"

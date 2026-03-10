@@ -107,4 +107,37 @@ impl ProductDescriptionBlock {
     pub fn elevation_angle(&self) -> f32 {
         self.product_specific_3 as f32 / 10.0
     }
+
+    /// Decode the 16 legacy data level thresholds into physical values.
+    ///
+    /// For legacy products (e.g., code 56 SRM), each threshold `u16` encodes
+    /// a physical value with flag bits in the high byte and the numeric value
+    /// in the low byte. Returns a 16-element array where `NaN` means the
+    /// level is not displayable (blank, threshold, no data, or range-folded).
+    pub fn decode_legacy_thresholds(&self) -> [f32; 16] {
+        let mut lut = [f32::NAN; 16];
+        for (i, &t) in self.thresholds.iter().enumerate() {
+            let codes = (t >> 8) as u8;
+            let mut val = (t & 0xFF) as f32;
+
+            if codes & 0x80 != 0 {
+                // Special category: Blank, TH (below threshold),
+                // ND (no data), RF (range folded) → not displayable
+                continue;
+            } else if codes & 0x40 != 0 {
+                val *= 0.01;
+            } else if codes & 0x20 != 0 {
+                val *= 0.05;
+            } else if codes & 0x10 != 0 {
+                val *= 0.1;
+            }
+
+            if codes & 0x01 != 0 {
+                val = -val;
+            }
+
+            lut[i] = val;
+        }
+        lut
+    }
 }

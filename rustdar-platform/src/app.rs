@@ -23,6 +23,7 @@ use rustdar_radar::render::{
     RadarProduct,
     ScanInfo,
     render_radar_to_image,
+    render_level3_radial_to_image,
 };
 use rustdar_radar::scan;
 use rustdar_radar::sites::get_radar_site;
@@ -33,12 +34,16 @@ use std::collections::HashMap;
 
 use chrono::NaiveDateTime;
 use nexrad_model::data::Scan;
+use nexrad_level3::model::Level3Message;
 use std::sync::mpsc::{Receiver, Sender};
 
 type ScanResult = (u64, Result<(Scan, String, NaiveDateTime), String>);
 
 /// Result from background radar rendering: (image_data, max_range_km, value_data, product, elevation, generation)
 type RenderResult = (Vec<u8>, f64, Vec<f32>, RadarProduct, f32, u64);
+
+/// Result from a Level III product fetch: (generation, product, result)
+type Level3Result = (u64, RadarProduct, Result<Level3Message, String>);
 
 /// Result from a background SPC outlook fetch
 type OutlookResult = (OutlookDay, OutlookProduct, Result<SpcOutlook, String>);
@@ -69,6 +74,11 @@ pub struct App {
     // re-upload the texture instantly after suspend/resume without re-rendering.
     // Fields: (rgba_data, max_range_km, value_data, product, elevation)
     cached_render: Option<(Vec<u8>, f64, Vec<f32>, RadarProduct, f32)>,
+    // Decoded Level III product data, keyed by RadarProduct
+    level3_data: HashMap<RadarProduct, Arc<Level3Message>>,
+    // Channel for Level III fetch results
+    level3_receiver: Receiver<Level3Result>,
+    level3_sender: Sender<Level3Result>,
     // Generation counter to discard stale render results after site/scan changes
     render_generation: u64,
     // Generation counter to discard stale fetch results from older requests
@@ -130,6 +140,7 @@ impl App {
         let (outlook_sender, outlook_receiver) = std::sync::mpsc::channel();
         let (alert_sender, alert_receiver) = std::sync::mpsc::channel();
         let (discussion_sender, discussion_receiver) = std::sync::mpsc::channel();
+        let (level3_sender, level3_receiver) = std::sync::mpsc::channel();
 
         // Setup theme monitoring (Android only — desktop uses WindowEvent::ThemeChanged)
         #[cfg(target_os = "android")]
@@ -164,6 +175,9 @@ impl App {
             render_in_flight: false,
             last_rendered: None,
             cached_render: None,
+            level3_data: HashMap::new(),
+            level3_receiver,
+            level3_sender,
             render_generation: 0,
             fetch_generation: 0,
             texture_counter: 0,
@@ -273,7 +287,7 @@ impl App {
         }
 
         // Sort and deduplicate elevation angles for each product
-        let product_elevations_sorted: HashMap<RadarProduct, Vec<f32>> = product_elevations
+        let mut product_elevations_sorted: HashMap<RadarProduct, Vec<f32>> = product_elevations
             .into_iter()
             .map(|(product, mut angles)| {
                 angles.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -286,6 +300,15 @@ impl App {
             })
             .collect();
 
+        // Always include Level III products with a nominal 0.5° elevation.
+        // Their data arrives asynchronously; the render path gracefully
+        // handles the case where the data hasn't arrived yet.
+        for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
+            product_elevations_sorted
+                .entry(*l3_product)
+                .or_insert_with(|| vec![0.5]);
+        }
+
         // Get list of available products, sorted by priority (Reflectivity first)
         let mut available_products: Vec<RadarProduct> =
             product_elevations_sorted.keys().copied().collect();
@@ -296,6 +319,12 @@ impl App {
             RadarProduct::DifferentialReflectivity => 3,
             RadarProduct::CorrelationCoefficient => 4,
             RadarProduct::DifferentialPhase => 5,
+            RadarProduct::StormRelativeVelocity => 6,
+            RadarProduct::SpecificDifferentialPhase => 7,
+            RadarProduct::EchoTops => 8,
+            RadarProduct::VerticallyIntegratedLiquid => 9,
+            RadarProduct::HydrometeorClassification => 10,
+            RadarProduct::PrecipitationRate => 11,
         });
 
         // Extract actual timestamp from the first radial's collection timestamp
@@ -418,6 +447,9 @@ impl App {
                         self.render_in_flight = false;
                         // Increment render generation so any in-flight renders are discarded
                         self.render_generation += 1;
+                        // Clear stale Level III data and fetch fresh products
+                        self.level3_data.clear();
+                        self.spawn_level3_fetches(&site, timestamp);
                         log::info!("Scan data loaded and UI updated");
                     }
                     Err(error_msg) => {
@@ -650,6 +682,58 @@ impl App {
             }
         }
 
+        // Poll for completed Level III fetch results
+        if let Ok((generation, product, result)) = self.level3_receiver.try_recv() {
+            if generation < self.fetch_generation {
+                log::info!("Discarding stale Level III result (gen {} < current {})", generation, self.fetch_generation);
+            } else {
+                match result {
+                    Ok(message) => {
+                        log::info!("Level III {:?} fetched successfully", product);
+                        self.level3_data.insert(product, Arc::new(message));
+                        // Trigger a re-render if currently viewing this product
+                        if self.gui.get_rendering_params().map(|(p, _)| p) == Some(product) {
+                            self.last_rendered = None;
+                        }
+                        // Add Level III products to the scan info's available list
+                        if let Some(scan_info) = self.gui.get_scan_info() {
+                            let mut info = scan_info.clone();
+                            if !info.available_products.contains(&product) {
+                                info.available_products.push(product);
+                                info.available_products.sort_by_key(|p| match p {
+                                    RadarProduct::Reflectivity => 0,
+                                    RadarProduct::Velocity => 1,
+                                    RadarProduct::SpectrumWidth => 2,
+                                    RadarProduct::DifferentialReflectivity => 3,
+                                    RadarProduct::CorrelationCoefficient => 4,
+                                    RadarProduct::DifferentialPhase => 5,
+                                    RadarProduct::StormRelativeVelocity => 6,
+                                    RadarProduct::SpecificDifferentialPhase => 7,
+                                    RadarProduct::EchoTops => 8,
+                                    RadarProduct::VerticallyIntegratedLiquid => 9,
+                                    RadarProduct::HydrometeorClassification => 10,
+                                    RadarProduct::PrecipitationRate => 11,
+                                });
+                                // Level III radial products get a single nominal elevation
+                                info.product_elevations.entry(product).or_insert_with(|| {
+                                    vec![0.5] // Level III products use a nominal 0.5° elevation
+                                });
+                                info.status = format!(
+                                    "Loaded {} products: {}",
+                                    info.available_products.len(),
+                                    info.available_products.iter().map(|p| p.name()).collect::<Vec<_>>().join(", ")
+                                );
+                                self.gui.set_scan_info(info);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Level III {:?} fetch failed: {}", product, e);
+                    }
+                }
+            }
+        }
+
         // Check if we need to spawn a new background render
         if let Some((product, elevation)) = self.gui.get_rendering_params() {
             let needs_render = self
@@ -660,7 +744,53 @@ impl App {
                 .unwrap_or(true);
 
             if needs_render && !self.render_in_flight {
-                if let Some(data) = &self.scan_data {
+                if product.is_level3() {
+                    // Level III render path
+                    if let Some(l3_msg) = self.level3_data.get(&product) {
+                        if let Some(scan_info) = self.gui.get_scan_info() {
+                            log::info!("Spawning Level III render: {:?}", product);
+                            let l3_msg = Arc::clone(l3_msg);
+                            let lat = scan_info.site.lat;
+                            let lon = scan_info.site.lon;
+                            let sender = self.render_result_sender.clone();
+                            let generation = self.render_generation;
+                            let window = self.window.clone();
+
+                            std::thread::spawn(move || {
+                                // Extract radial packet from symbology
+                                let radial_packet = l3_msg.symbology.as_ref().and_then(|sym| {
+                                    sym.layers.iter().find_map(|layer| {
+                                        layer.packets.iter().find_map(|pkt| {
+                                            if let nexrad_level3::model::DataPacket::DigitalRadial(rp) = pkt {
+                                                Some(rp)
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                    })
+                                });
+                                if let Some(rp) = radial_packet {
+                                    let scale = l3_msg.pdb.data_scale();
+                                    let offset = l3_msg.pdb.data_offset();
+                                    let legacy_thresholds = if rp.is_legacy {
+                                        Some(l3_msg.pdb.decode_legacy_thresholds())
+                                    } else {
+                                        None
+                                    };
+                                    if let Some((image, range, values)) =
+                                        render_level3_radial_to_image(rp, product, lat, lon, scale, offset, legacy_thresholds.as_ref())
+                                    {
+                                        let _ = sender.send((image, range, values, product, elevation, generation));
+                                    }
+                                }
+                                if let Some(window) = window {
+                                    window.request_redraw();
+                                }
+                            });
+                            self.render_in_flight = true;
+                        }
+                    }
+                } else if let Some(data) = &self.scan_data {
                     if let Some(scan_info) = self.gui.get_scan_info() {
                         log::info!("Spawning background render: {:?} at {:.1}°", product, elevation);
                         let data = Arc::clone(data);
@@ -969,6 +1099,42 @@ impl App {
             let _ = sender.send((generation, msg));
             if let Some(w) = window { w.request_redraw(); }
         });
+    }
+
+    /// Spawn Level III product fetches for all supported Level III products.
+    /// Called after a Level II scan loads so the products are available
+    /// alongside the base moments.
+    fn spawn_level3_fetches(&self, site: &str, timestamp: NaiveDateTime) {
+        let level3_products = [
+            (RadarProduct::StormRelativeVelocity, "N0S"),
+            (RadarProduct::SpecificDifferentialPhase, "N0K"),
+            (RadarProduct::EchoTops, "EET"),
+            (RadarProduct::VerticallyIntegratedLiquid, "DVL"),
+            (RadarProduct::HydrometeorClassification, "HHC"),
+            (RadarProduct::PrecipitationRate, "DPR"),
+        ];
+        let generation = self.fetch_generation;
+        for (product, code) in level3_products {
+            let site = site.to_string();
+            let code = code.to_string();
+            let sender = self.level3_sender.clone();
+            let window = self.window.clone();
+            self.tokio_runtime.spawn(async move {
+                log::info!("Fetching Level III {} for {}", code, site);
+                let result = match scan::get_level3_product(&site, &code, timestamp).await {
+                    Ok(msg) => {
+                        log::info!("Fetched Level III {} for {}", code, site);
+                        Ok(msg)
+                    }
+                    Err(e) => {
+                        log::warn!("Level III {} fetch failed: {}", code, e);
+                        Err(format!("{e}"))
+                    }
+                };
+                let _ = sender.send((generation, product, result));
+                if let Some(w) = window { w.request_redraw(); }
+            });
+        }
     }
 
     /// Request application exit - handles both GUI and keyboard exit requests

@@ -16,6 +16,10 @@ pub struct RadialPacket {
     pub j_center: i16,
     /// Scale factor (number of pixels per range bin).
     pub scale_factor: f32,
+    /// Whether this packet was decoded from a legacy (0xAF1F) RLE format.
+    /// Legacy packets have 4-bit gate values (0–15) that must be mapped through
+    /// the PDB's threshold table, rather than using linear scale/offset.
+    pub is_legacy: bool,
     /// The individual radials.
     pub radials: Vec<RadialRun>,
 }
