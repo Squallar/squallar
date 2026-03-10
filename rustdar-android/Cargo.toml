@@ -33,7 +33,7 @@ name = "android.permission.ACCESS_FINE_LOCATION"
 name = "android.permission.ACCESS_COARSE_LOCATION"
 
 [lib]
-name = "rustdar_android"
+name = "Rustdar"
 crate-type = ["cdylib"]
 path = "src/lib.rs"
 

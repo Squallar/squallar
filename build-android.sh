@@ -6,7 +6,7 @@
 # - Android SDK and NDK installed
 # - ANDROID_HOME environment variable set
 
-set -e
+set -euo pipefail
 
 echo "Building Rustdar Platform for Android..."
 
@@ -51,8 +51,14 @@ cargo apk build --no-default-features
 cd ..
 
 APK_DIR="target/debug/apk"
-APK="$APK_DIR/rustdar_android.apk"
-UNALIGNED_APK="$APK_DIR/rustdar_android-unaligned.apk"
+
+# Derive APK filename from the lib name in Cargo.toml (cargo-apk uses this)
+LIB_NAME=$(grep -A5 '^\[lib\]' rustdar-android/Cargo.toml | grep '^name' | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+if [ -z "$LIB_NAME" ]; then
+    LIB_NAME="rustdar_android"
+fi
+APK="$APK_DIR/$LIB_NAME.apk"
+UNALIGNED_APK="$APK_DIR/$LIB_NAME-unaligned.apk"
 
 if [ ! -f "$UNALIGNED_APK" ]; then
     echo "ERROR: cargo-apk did not produce $UNALIGNED_APK"
