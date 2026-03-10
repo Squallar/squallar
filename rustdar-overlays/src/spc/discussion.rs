@@ -218,7 +218,7 @@ pub fn parse_md_rss(xml: &str) -> Result<Vec<SpcDiscussion>, String> {
         let description = extract_xml_text(item_body, "description").unwrap_or_default();
 
         // The description is often HTML-encoded; decode basic entities
-        let text = decode_html_entities(&description);
+        let text = strip_html_tags(&decode_html_entities(&description));
 
         let number = extract_md_number(&title).unwrap_or(0);
         let md_type = classify_md_type(&text);
@@ -269,6 +269,33 @@ fn decode_html_entities(s: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&#39;", "'")
+}
+
+/// Strip HTML/XML markup from text, keeping only readable content.
+///
+/// Handles CDATA wrappers, `<br>` → newline, and removes all other tags.
+fn strip_html_tags(s: &str) -> String {
+    // Remove CDATA wrappers
+    let s = s.replace("<![CDATA[", "").replace("]]>", "");
+    // Convert <br> variants to newlines
+    let s = s.replace("<br />", "\n").replace("<br/>", "\n").replace("<br>", "\n");
+    // Strip all remaining HTML tags
+    let mut result = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        if ch == '<' {
+            in_tag = true;
+        } else if ch == '>' {
+            in_tag = false;
+        } else if !in_tag {
+            result.push(ch);
+        }
+    }
+    // Collapse runs of 3+ blank lines into 2
+    while result.contains("\n\n\n") {
+        result = result.replace("\n\n\n", "\n\n");
+    }
+    result.trim().to_string()
 }
 
 #[cfg(test)]
