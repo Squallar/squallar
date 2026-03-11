@@ -2590,6 +2590,20 @@ fn draw_spc_discussions(
         return None;
     }
 
+    // Pre-check: is the click on a foreground UI layer (e.g. side panel)?
+    // NOTE: `layer_id_at` must be called OUTSIDE the `input()` closure to avoid
+    // re-entrant read-locking on the egui Context's RwLock, which deadlocks when
+    // a background writer (e.g. walkers tile IO calling `request_repaint`) is pending.
+    let (any_click, click_pos) = ui.ctx().input(|i| {
+        (i.pointer.any_click(), i.pointer.interact_pos())
+    });
+    let click_on_ui = any_click
+        && click_pos.is_some_and(|p| {
+            ui.ctx()
+                .layer_id_at(p)
+                .is_some_and(|l| l.order > egui::Order::Background)
+        });
+
     let screen_rect = ui.max_rect();
     let key = ViewportKey::from_projector_and_rect(projector, zoom, screen_rect);
 
@@ -2733,6 +2747,20 @@ fn draw_nws_alerts(
         return None;
     }
 
+    // Pre-check: is the click on a foreground UI layer (e.g. side panel)?
+    // NOTE: `layer_id_at` must be called OUTSIDE the `input()` closure to avoid
+    // re-entrant read-locking on the egui Context's RwLock, which deadlocks when
+    // a background writer (e.g. walkers tile IO calling `request_repaint`) is pending.
+    let (any_click, click_pos) = ui.ctx().input(|i| {
+        (i.pointer.any_click(), i.pointer.interact_pos())
+    });
+    let click_on_ui = any_click
+        && click_pos.is_some_and(|p| {
+            ui.ctx()
+                .layer_id_at(p)
+                .is_some_and(|l| l.order > egui::Order::Background)
+        });
+
     let screen_rect = ui.max_rect();
     let key = ViewportKey::from_projector_and_rect(projector, zoom, screen_rect);
 
@@ -2813,18 +2841,18 @@ fn draw_nws_alerts(
                     }
                 }
 
-                // Click detection
-                if pointer_available && clicked_index.is_none() {
-                    let clicked = ui.ctx().input(|i| {
-                        i.pointer.any_click()
-                            && i.pointer.interact_pos().is_some_and(|p| {
-                                cached_poly.poly_rect.contains(p)
-                                    && point_in_polygon(p, &cached_poly.screen_pts)
-                            })
-                    });
-                    if clicked {
-                        clicked_index = Some(alert_idx);
-                    }
+                // Click detection (NWS alerts)
+                // Reuse any_click/click_pos extracted once at the top to avoid
+                // per-polygon ctx.input() WRITE lock acquisition, which starves
+                // background threads (walkers tile IO) and causes a deadlock.
+                if pointer_available && !click_on_ui && clicked_index.is_none()
+                    && any_click
+                    && click_pos.is_some_and(|p| {
+                        cached_poly.poly_rect.contains(p)
+                            && point_in_polygon(p, &cached_poly.screen_pts)
+                    })
+                {
+                    clicked_index = Some(alert_idx);
                 }
             }
         }
