@@ -176,11 +176,16 @@ impl App {
             .build()
             .unwrap_or_default();
 
+        let mut gui = Gui::new();
+        if let Some(config_dir) = Gui::default_config_dir() {
+            gui.load_ui_config(&config_dir);
+        }
+
         Self {
             instance,
             state: None,
             window: None,
-            gui: Gui::new(),
+            gui,
             scan_data: None,
             input,
             scan_receiver,
@@ -1230,6 +1235,10 @@ impl App {
 
     /// Request application exit - handles both GUI and keyboard exit requests
     fn request_exit(&mut self, event_loop: Option<&ActiveEventLoop>) {
+        // Persist UI config before exiting
+        if let Some(config_dir) = Gui::default_config_dir() {
+            self.gui.save_ui_config(&config_dir);
+        }
         if let Some(event_loop) = event_loop {
             log::info!("Exiting application");
             event_loop.exit();
