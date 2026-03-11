@@ -68,20 +68,21 @@ pub async fn resolve_zone_geometries(
     );
 
     if !urls_to_fetch.is_empty() {
-        // Fetch remaining zone geometries concurrently
-        let futs: Vec<_> = urls_to_fetch
-            .iter()
-            .map(|url| {
-                let client = client.clone();
-                let url = url.clone();
-                async move {
-                    let result = fetch_zone_geometry(&client, &url).await;
-                    (url, result)
-                }
-            })
-            .collect();
+        // Fetch zone geometries with bounded concurrency to avoid exhausting
+        // file descriptors on systems with low ulimits.
+        use futures::stream::{self, StreamExt};
+        const MAX_CONCURRENT_FETCHES: usize = 50;
 
-        let results = futures::future::join_all(futs).await;
+        let results: Vec<_> = stream::iter(urls_to_fetch.into_iter().map(|url| {
+            let client = client.clone();
+            async move {
+                let result = fetch_zone_geometry(&client, &url).await;
+                (url, result)
+            }
+        }))
+        .buffer_unordered(MAX_CONCURRENT_FETCHES)
+        .collect()
+        .await;
 
         for (url, result) in results {
             if let Some(polys) = result {
