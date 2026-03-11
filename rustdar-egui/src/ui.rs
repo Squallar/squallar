@@ -17,6 +17,8 @@ use rustdar_overlays::spc::discussion::SpcDiscussion;
 use rustdar_overlays::spc::colors::{md_fill_color, md_stroke_color};
 use rustdar_overlays::nws::alert::NwsAlert;
 use rustdar_overlays::types::HatchPattern;
+#[cfg(target_os = "android")]
+use walkers::{MapMemory};
 
 // ---------------------------------------------------------------------------
 // Double-tap-drag zoom gesture detector (Android touch devices)
