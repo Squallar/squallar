@@ -7,7 +7,7 @@ use crate::overlay_cache::{
 use crate::pane::{PaneId, PaneLayout, PaneState, MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
 use chrono::Timelike;
 use egui::Context;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use walkers::{HttpTiles, Texture, Tiles, sources::{TileSource, Attribution}, TileId};
 use rustdar_radar::render::{ImageBounds, RadarProduct, ScanInfo, IMAGE_SIZE, MAX_RANGE_KM};
@@ -237,6 +237,8 @@ pub struct Gui {
     nws_fetching: bool,
     /// Index of the currently selected alert for detail popup.
     selected_alert: Option<usize>,
+    /// Alert IDs hidden by the user (not rendered on the map).
+    hidden_alerts: HashSet<String>,
     // SPC Mesoscale Discussions state (shared)
     spc_discussions: Vec<SpcDiscussion>,
     spc_md_fetch_time: Option<std::time::Instant>,
@@ -304,6 +306,7 @@ impl Gui {
             nws_fetch_time: None,
             nws_fetching: false,
             selected_alert: None,
+            hidden_alerts: HashSet::new(),
             spc_discussions: Vec::new(),
             spc_md_fetch_time: None,
             spc_md_fetching: false,
@@ -937,6 +940,7 @@ impl Gui {
                                 zoom,
                                 &pane.layers,
                                 &self.nws_alerts,
+                                &self.hidden_alerts,
                                 &mut pane.nws_overlay_cache,
                                 self.nws_data_generation,
                                 pointer_available,
@@ -1551,6 +1555,9 @@ impl Gui {
 
     /// Store fetched NWS alerts, replacing the previous set.
     pub fn set_nws_alerts(&mut self, alerts: Vec<NwsAlert>) {
+        // Prune hidden_alerts for IDs no longer present
+        let current_ids: HashSet<String> = alerts.iter().map(|a| a.id.clone()).collect();
+        self.hidden_alerts.retain(|id| current_ids.contains(id));
         self.nws_alerts = alerts;
         self.nws_fetch_time = Some(std::time::Instant::now());
         // Invalidate cached overlay geometry
@@ -1686,6 +1693,7 @@ impl Gui {
         };
 
         // Clone data needed for the popup to avoid borrowing issues
+        let alert_id = alert.id.clone();
         let event = alert.event.clone();
         let headline = alert.headline.clone();
         let area_desc = alert.area_desc.clone();
@@ -1766,6 +1774,15 @@ impl Gui {
                             .strong()
                             .color(accent),
                     );
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+                if ui.button("🚫  Hide from map").clicked() {
+                    self.hidden_alerts.insert(alert_id.clone());
+                    // Invalidate NWS overlay caches so hidden alert disappears immediately
+                    self.nws_data_generation = self.nws_data_generation.wrapping_add(1);
+                    self.selected_alert = None;
                 }
             });
 
@@ -2586,18 +2603,18 @@ fn draw_spc_discussions(
                 );
             }
 
-            // Click detection
-            if pointer_available && clicked_index.is_none() {
-                let clicked = ui.ctx().input(|i| {
-                    i.pointer.any_click()
-                        && i.pointer.interact_pos().is_some_and(|p| {
-                            cached_poly.poly_rect.contains(p)
-                                && point_in_polygon(p, &cached_poly.screen_pts)
-                        })
-                });
-                if clicked {
-                    clicked_index = Some(md_idx);
-                }
+            // Click detection (SPC discussions)
+            // Reuse any_click/click_pos extracted once at the top to avoid
+            // per-polygon ctx.input() WRITE lock acquisition, which starves
+            // background threads (walkers tile IO) and causes a deadlock.
+            if pointer_available && !click_on_ui && clicked_index.is_none()
+                && any_click
+                && click_pos.is_some_and(|p| {
+                    cached_poly.poly_rect.contains(p)
+                        && point_in_polygon(p, &cached_poly.screen_pts)
+                })
+            {
+                clicked_index = Some(md_idx);
             }
         }
     }
@@ -2627,6 +2644,7 @@ fn draw_nws_alerts(
     zoom: f64,
     layers: &crate::layers::LayerManager,
     nws_alerts: &[NwsAlert],
+    hidden_alerts: &HashSet<String>,
     cache: &mut OverlayLayerCache,
     data_gen: u64,
     pointer_available: bool,
@@ -2667,7 +2685,8 @@ fn draw_nws_alerts(
     // Walk the flat cache in the same alert→feature order it was built.
     let mut flat_idx = 0;
     for (alert_idx, alert) in nws_alerts.iter().enumerate() {
-        let skip = !enabled_categories.contains(&alert.category);
+        let skip = !enabled_categories.contains(&alert.category)
+            || hidden_alerts.contains(&alert.id);
         for src_feature in &alert.features {
             if flat_idx >= cache.features.len() {
                 break;
