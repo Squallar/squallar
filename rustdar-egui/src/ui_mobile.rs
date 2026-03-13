@@ -389,7 +389,7 @@ impl super::Gui {
                         let is_enabled = pane.layers.is_enabled(*layer);
                         if is_enabled && !was_enabled {
                             if let Some(product) = layer.to_outlook_product() {
-                                if !self.spc_outlooks.contains_key(&(day, product)) {
+                                if !self.spc_outlooks.data.contains_key(&(day, product)) {
                                     actions.push(GuiAction::FetchSpcOutlook {
                                         day,
                                         products: vec![product],
@@ -402,12 +402,12 @@ impl super::Gui {
                     if pane.layers.any_spc_enabled() {
                         ui.horizontal(|ui| {
                             if ui
-                                .add_enabled(!self.spc_fetching, egui::Button::new("\u{1f504} Refresh"))
+                                .add_enabled(!self.spc_outlooks.fetching, egui::Button::new("\u{1f504} Refresh"))
                                 .clicked()
                             {
                                 actions.push(GuiAction::RefreshSpcOutlooks);
                             }
-                            if self.spc_fetching {
+                            if self.spc_outlooks.fetching {
                                 ui.spinner();
                             }
                         });
@@ -419,17 +419,17 @@ impl super::Gui {
                     // -- SPC Mesoscale Discussions --
                     {
                         let was_enabled = pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
-                        let label = if self.spc_discussions.is_empty() {
+                        let label = if self.spc_discussions.data.is_empty() {
                             "\u{1f4cb}  Mesoscale Disc.".to_string()
                         } else {
-                            format!("\u{1f4cb}  Mesoscale Disc. ({})", self.spc_discussions.len())
+                            format!("\u{1f4cb}  Mesoscale Disc. ({})", self.spc_discussions.data.len())
                         };
                         ui.checkbox(
                             pane.layers.enabled_mut(LayerKind::SpcMesoscaleDiscussions),
                             label,
                         );
                         let is_enabled = pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
-                        if is_enabled && !was_enabled && self.spc_discussions.is_empty() && !self.spc_md_fetching {
+                        if is_enabled && !was_enabled && self.spc_discussions.data.is_empty() && !self.spc_discussions.fetching {
                             actions.push(GuiAction::FetchSpcDiscussions);
                         }
                     }
@@ -437,16 +437,16 @@ impl super::Gui {
                     if pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions) {
                         ui.horizontal(|ui| {
                             if ui
-                                .add_enabled(!self.spc_md_fetching, egui::Button::new("\u{1f504} Refresh"))
+                                .add_enabled(!self.spc_discussions.fetching, egui::Button::new("\u{1f504} Refresh"))
                                 .clicked()
                             {
                                 actions.push(GuiAction::RefreshSpcDiscussions);
                             }
-                            if self.spc_md_fetching {
+                            if self.spc_discussions.fetching {
                                 ui.spinner();
                             }
                         });
-                        if let Some(t) = self.spc_md_fetch_time {
+                        if let Some(t) = self.spc_discussions.fetch_time {
                             let secs_ago = t.elapsed().as_secs();
                             let label = if secs_ago < 60 {
                                 format!("Updated {}s ago", secs_ago)
@@ -468,7 +468,7 @@ impl super::Gui {
                         let was_enabled = pane.layers.is_enabled(*layer);
                         ui.checkbox(pane.layers.enabled_mut(*layer), layer.display_name());
                         let is_enabled = pane.layers.is_enabled(*layer);
-                        if is_enabled && !was_enabled && self.nws_alerts.is_empty() && !self.nws_fetching {
+                        if is_enabled && !was_enabled && self.nws_alerts.data.is_empty() && !self.nws_alerts.fetching {
                             actions.push(GuiAction::FetchNwsAlerts);
                         }
                     }
@@ -476,18 +476,18 @@ impl super::Gui {
                     if pane.layers.any_nws_enabled() {
                         ui.horizontal(|ui| {
                             if ui
-                                .add_enabled(!self.nws_fetching, egui::Button::new("\u{1f504} Refresh"))
+                                .add_enabled(!self.nws_alerts.fetching, egui::Button::new("\u{1f504} Refresh"))
                                 .clicked()
                             {
                                 actions.push(GuiAction::RefreshNwsAlerts);
                             }
-                            if self.nws_fetching {
+                            if self.nws_alerts.fetching {
                                 ui.spinner();
                             }
                         });
-                        if !self.nws_alerts.is_empty() {
+                        if !self.nws_alerts.data.is_empty() {
                             let categories = pane.layers.enabled_nws_categories();
-                            let visible_count = self.nws_alerts.iter()
+                            let visible_count = self.nws_alerts.data.iter()
                                 .filter(|a| categories.contains(&a.category))
                                 .count();
                             ui.label(format!("{} alerts shown", visible_count));

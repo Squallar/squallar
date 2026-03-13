@@ -1,5 +1,6 @@
 use crate::actions::{GuiAction, RadarConfig};
 use crate::layers::{LayerKind, LayerManager};
+use crate::overlay_state::OverlayState;
 use crate::pane::{PaneId, PaneLayout, PaneState, RadarImageData, MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
 use chrono::Timelike;
 use egui::Context;
@@ -56,30 +57,17 @@ pub struct Gui {
     poll_interval_secs: u64,
     // User's GPS location for blue dot indicator (lat, lon)
     user_location: Option<(f64, f64)>,
-    // SPC convective outlook data cache (shared — same weather data for all panes)
-    spc_outlooks: HashMap<(OutlookDay, OutlookProduct), SpcOutlook>,
-    // Track when each SPC product was last fetched
-    spc_fetch_times: HashMap<(OutlookDay, OutlookProduct), std::time::Instant>,
-    // Whether an SPC fetch is currently in flight
-    spc_fetching: bool,
-    // NWS weather alerts state (shared)
-    nws_alerts: Vec<NwsAlert>,
-    nws_fetch_time: Option<std::time::Instant>,
-    nws_fetching: bool,
+    spc_outlooks: OverlayState<HashMap<(OutlookDay, OutlookProduct), SpcOutlook>>,
+    /// Per-product SPC data generation (keyed separately for cache invalidation).
+    spc_data_generation: HashMap<(OutlookDay, OutlookProduct), u64>,
+    nws_alerts: OverlayState<Vec<NwsAlert>>,
     /// Index of the currently selected alert for detail popup.
     selected_alert: Option<usize>,
     /// Alert IDs hidden by the user (not rendered on the map).
     hidden_alerts: HashSet<String>,
-    // SPC Mesoscale Discussions state (shared)
-    spc_discussions: Vec<SpcDiscussion>,
-    spc_md_fetch_time: Option<std::time::Instant>,
-    spc_md_fetching: bool,
+    spc_discussions: OverlayState<Vec<SpcDiscussion>>,
     /// Index of the currently selected MD for detail popup.
     selected_md: Option<usize>,
-    /// Data generation counters — bumped when source data is replaced (shared).
-    spc_data_generation: HashMap<(OutlookDay, OutlookProduct), u64>,
-    nws_data_generation: u64,
-    spc_md_data_generation: u64,
     // Multi-pane state
     panes: Vec<PaneState>,
     active_pane: PaneId,
@@ -130,21 +118,13 @@ impl Gui {
             show_time_dialog: false,
             poll_interval_secs: 60,
             user_location: None,
-            spc_outlooks: HashMap::new(),
-            spc_fetch_times: HashMap::new(),
-            spc_fetching: false,
-            nws_alerts: Vec::new(),
-            nws_fetch_time: None,
-            nws_fetching: false,
+            spc_outlooks: OverlayState::new(),
+            spc_data_generation: HashMap::new(),
+            nws_alerts: OverlayState::new(),
             selected_alert: None,
             hidden_alerts: HashSet::new(),
-            spc_discussions: Vec::new(),
-            spc_md_fetch_time: None,
-            spc_md_fetching: false,
+            spc_discussions: OverlayState::new(),
             selected_md: None,
-            spc_data_generation: HashMap::new(),
-            nws_data_generation: 0,
-            spc_md_data_generation: 0,
             panes: vec![PaneState::new()],
             active_pane: 0,
             pane_layout: PaneLayout::default(),
@@ -195,20 +175,16 @@ impl Gui {
 
         // Auto-refresh NWS alerts every 2 minutes when any pane has an NWS layer enabled
         if self.panes.iter().any(|p| p.layers.any_nws_enabled())
-            && !self.nws_fetching
-            && self
-                .nws_fetch_time
-                .map_or(true, |t| t.elapsed().as_secs() >= 120)
+            && !self.nws_alerts.fetching
+            && self.nws_alerts.needs_refresh(120)
         {
             actions.push(GuiAction::FetchNwsAlerts);
         }
 
         // Auto-refresh SPC Mesoscale Discussions every 2 minutes when any pane has it enabled
         if self.panes.iter().any(|p| p.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions))
-            && !self.spc_md_fetching
-            && self
-                .spc_md_fetch_time
-                .map_or(true, |t| t.elapsed().as_secs() >= 120)
+            && !self.spc_discussions.fetching
+            && self.spc_discussions.needs_refresh(120)
         {
             actions.push(GuiAction::FetchSpcDiscussions);
         }
@@ -583,7 +559,7 @@ impl Gui {
                                 projector,
                                 zoom,
                                 &pane.layers,
-                                &self.spc_outlooks,
+                                &self.spc_outlooks.data,
                                 self.current_theme_is_dark,
                                 &mut pane.spc_overlay_caches,
                                 &self.spc_data_generation,
@@ -755,9 +731,9 @@ impl Gui {
                                 projector,
                                 zoom,
                                 &pane.layers,
-                                &self.spc_discussions,
+                                &self.spc_discussions.data,
                                 &mut pane.spc_md_overlay_cache,
-                                self.spc_md_data_generation,
+                                self.spc_discussions.data_generation,
                                 pointer_available,
                             );
                             if let Some(idx) = clicked_md {
@@ -770,10 +746,10 @@ impl Gui {
                                 projector,
                                 zoom,
                                 &pane.layers,
-                                &self.nws_alerts,
+                                &self.nws_alerts.data,
                                 &self.hidden_alerts,
                                 &mut pane.nws_overlay_cache,
-                                self.nws_data_generation,
+                                self.nws_alerts.data_generation,
                                 pointer_available,
                             );
                             if let Some(idx) = clicked_alert {
@@ -1155,7 +1131,7 @@ impl Gui {
                     // If just toggled on and we don't have data, fetch it
                     if is_enabled && !was_enabled {
                         if let Some(product) = layer.to_outlook_product() {
-                            if !self.spc_outlooks.contains_key(&(day, product)) {
+                            if !self.spc_outlooks.data.contains_key(&(day, product)) {
                                 actions.push(GuiAction::FetchSpcOutlook {
                                     day,
                                     products: vec![product],
@@ -1168,11 +1144,11 @@ impl Gui {
                 // Refresh button
                 if pane.layers.any_spc_enabled() {
                     ui.horizontal(|ui| {
-                        let refresh_enabled = !self.spc_fetching;
+                        let refresh_enabled = !self.spc_outlooks.fetching;
                         if ui.add_enabled(refresh_enabled, egui::Button::new("🔄 Refresh")).clicked() {
                             actions.push(GuiAction::RefreshSpcOutlooks);
                         }
-                        if self.spc_fetching {
+                        if self.spc_outlooks.fetching {
                             ui.spinner();
                         }
                     });
@@ -1184,10 +1160,10 @@ impl Gui {
                 // --- SPC Mesoscale Discussions section ---
                 {
                     let was_enabled = pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
-                    let label = if self.spc_discussions.is_empty() {
+                    let label = if self.spc_discussions.data.is_empty() {
                         "📋  Mesoscale Disc.".to_string()
                     } else {
-                        format!("📋  Mesoscale Disc. ({})", self.spc_discussions.len())
+                        format!("📋  Mesoscale Disc. ({})", self.spc_discussions.data.len())
                     };
                     ui.checkbox(
                         pane.layers.enabled_mut(LayerKind::SpcMesoscaleDiscussions),
@@ -1196,22 +1172,22 @@ impl Gui {
                     let is_enabled = pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
 
                     // If just toggled on and we have no data, fetch
-                    if is_enabled && !was_enabled && self.spc_discussions.is_empty() && !self.spc_md_fetching {
+                    if is_enabled && !was_enabled && self.spc_discussions.data.is_empty() && !self.spc_discussions.fetching {
                         actions.push(GuiAction::FetchSpcDiscussions);
                     }
                 }
 
                 if pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions) {
                     ui.horizontal(|ui| {
-                        let refresh_enabled = !self.spc_md_fetching;
+                        let refresh_enabled = !self.spc_discussions.fetching;
                         if ui.add_enabled(refresh_enabled, egui::Button::new("🔄 Refresh")).clicked() {
                             actions.push(GuiAction::RefreshSpcDiscussions);
                         }
-                        if self.spc_md_fetching {
+                        if self.spc_discussions.fetching {
                             ui.spinner();
                         }
                     });
-                    if let Some(t) = self.spc_md_fetch_time {
+                    if let Some(t) = self.spc_discussions.fetch_time {
                         let secs_ago = t.elapsed().as_secs();
                         let label = if secs_ago < 60 {
                             format!("Updated {}s ago", secs_ago)
@@ -1235,30 +1211,30 @@ impl Gui {
                     let is_enabled = pane.layers.is_enabled(*layer);
 
                     // If just toggled on and we have no alerts cached, fetch them
-                    if is_enabled && !was_enabled && self.nws_alerts.is_empty() && !self.nws_fetching {
+                    if is_enabled && !was_enabled && self.nws_alerts.data.is_empty() && !self.nws_alerts.fetching {
                         actions.push(GuiAction::FetchNwsAlerts);
                     }
                 }
 
                 if pane.layers.any_nws_enabled() {
                     ui.horizontal(|ui| {
-                        let refresh_enabled = !self.nws_fetching;
+                        let refresh_enabled = !self.nws_alerts.fetching;
                         if ui.add_enabled(refresh_enabled, egui::Button::new("🔄 Refresh")).clicked() {
                             actions.push(GuiAction::RefreshNwsAlerts);
                         }
-                        if self.nws_fetching {
+                        if self.nws_alerts.fetching {
                             ui.spinner();
                         }
                     });
                     // Show alert count and last-updated time
-                    if !self.nws_alerts.is_empty() {
+                    if !self.nws_alerts.data.is_empty() {
                         let categories = pane.layers.enabled_nws_categories();
-                        let visible_count = self.nws_alerts.iter()
+                        let visible_count = self.nws_alerts.data.iter()
                             .filter(|a| categories.contains(&a.category))
                             .count();
                         ui.label(format!("{} alerts shown", visible_count));
                     }
-                    if let Some(t) = self.nws_fetch_time {
+                    if let Some(t) = self.nws_alerts.fetch_time {
                         let secs_ago = t.elapsed().as_secs();
                         let label = if secs_ago < 60 {
                             format!("Updated {}s ago", secs_ago)
@@ -1372,16 +1348,16 @@ impl Gui {
 
     /// Store a fetched SPC outlook in the cache.
     pub fn set_spc_outlook(&mut self, day: OutlookDay, product: OutlookProduct, outlook: SpcOutlook) {
-        self.spc_outlooks.insert((day, product), outlook);
-        self.spc_fetch_times.insert((day, product), std::time::Instant::now());
-        // Bump data generation to invalidate cached overlay geometry
+        self.spc_outlooks.data.insert((day, product), outlook);
+        self.spc_outlooks.fetch_time = Some(std::time::Instant::now());
+        // Bump per-product data generation to invalidate cached overlay geometry
         let generation = self.spc_data_generation.entry((day, product)).or_insert(0);
         *generation = generation.wrapping_add(1);
     }
 
     /// Set whether an SPC fetch is currently in progress.
     pub fn set_spc_fetching(&mut self, fetching: bool) {
-        self.spc_fetching = fetching;
+        self.spc_outlooks.fetching = fetching;
     }
 
     /// Store fetched NWS alerts, replacing the previous set.
@@ -1389,28 +1365,22 @@ impl Gui {
         // Prune hidden_alerts for IDs no longer present
         let current_ids: HashSet<String> = alerts.iter().map(|a| a.id.clone()).collect();
         self.hidden_alerts.retain(|id| current_ids.contains(id));
-        self.nws_alerts = alerts;
-        self.nws_fetch_time = Some(std::time::Instant::now());
-        // Invalidate cached overlay geometry
-        self.nws_data_generation = self.nws_data_generation.wrapping_add(1);
+        self.nws_alerts.set_data(alerts);
     }
 
     /// Set whether an NWS alerts fetch is currently in progress.
     pub fn set_nws_fetching(&mut self, fetching: bool) {
-        self.nws_fetching = fetching;
+        self.nws_alerts.fetching = fetching;
     }
 
     /// Store fetched SPC Mesoscale Discussions, replacing the previous set.
     pub fn set_spc_discussions(&mut self, discussions: Vec<SpcDiscussion>) {
-        self.spc_discussions = discussions;
-        self.spc_md_fetch_time = Some(std::time::Instant::now());
-        // Invalidate cached overlay geometry
-        self.spc_md_data_generation = self.spc_md_data_generation.wrapping_add(1);
+        self.spc_discussions.set_data(discussions);
     }
 
     /// Set whether an SPC MD fetch is currently in progress.
     pub fn set_spc_md_fetching(&mut self, fetching: bool) {
-        self.spc_md_fetching = fetching;
+        self.spc_discussions.fetching = fetching;
     }
 
     /// Get the active pane's layer manager (immutable).

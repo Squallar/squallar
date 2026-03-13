@@ -14,7 +14,7 @@ impl super::Gui {
         let Some(idx) = self.selected_alert else {
             return;
         };
-        let Some(alert) = self.nws_alerts.get(idx) else {
+        let Some(alert) = self.nws_alerts.data.get(idx) else {
             self.selected_alert = None;
             return;
         };
@@ -108,7 +108,7 @@ impl super::Gui {
                 if ui.button("\u{1f6ab}  Hide from map").clicked() {
                     self.hidden_alerts.insert(alert_id.clone());
                     // Invalidate NWS overlay caches so hidden alert disappears immediately
-                    self.nws_data_generation = self.nws_data_generation.wrapping_add(1);
+                    self.nws_alerts.data_generation = self.nws_alerts.data_generation.wrapping_add(1);
                     self.selected_alert = None;
                 }
             });
@@ -123,7 +123,7 @@ impl super::Gui {
         let Some(idx) = self.selected_md else {
             return;
         };
-        let Some(md) = self.spc_discussions.get(idx) else {
+        let Some(md) = self.spc_discussions.data.get(idx) else {
             self.selected_md = None;
             return;
         };
