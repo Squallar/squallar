@@ -557,103 +557,13 @@ impl Gui {
                                         let hover_lat = map_pos.y();
                                         let hover_lon = map_pos.x();
 
-                                        let lat1 = img.lat.to_radians();
-                                        let lon1 = img.lon.to_radians();
-                                        let lat2 = hover_lat.to_radians();
-                                        let lon2 = hover_lon.to_radians();
-                                        let dlat = lat2 - lat1;
-                                        let dlon = lon2 - lon1;
-                                        let a = (dlat / 2.0).sin().powi(2)
-                                            + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
-                                        let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
-                                        let distance_km = 6371.0 * c;
-
-                                        let y = dlon.sin() * lat2.cos();
-                                        let x = lat1.cos() * lat2.sin()
-                                            - lat1.sin() * lat2.cos() * dlon.cos();
-                                        let azimuth = (y.atan2(x).to_degrees() + 360.0) % 360.0;
-
-                                        let mut value_str = String::new();
-                                        let frac_x = (hover_pos.x - rect.left()) / rect.width();
-                                        let frac_y = (hover_pos.y - rect.top()) / rect.height();
-                                        let px = (frac_x * IMAGE_SIZE as f32) as i32;
-                                        let py = (frac_y * IMAGE_SIZE as f32) as i32;
-
-                                        if px >= 0
-                                            && px < IMAGE_SIZE as i32
-                                            && py >= 0
-                                            && py < IMAGE_SIZE as i32
-                                        {
-                                            let pixel_idx = py as usize * IMAGE_SIZE + px as usize;
-                                            if pixel_idx < img.value_data.len() {
-                                                let value = img.value_data[pixel_idx];
-                                                if !value.is_nan() {
-                                                    let product = pane.selected_product;
-                                                    value_str = match product {
-                                                        RadarProduct::Reflectivity => {
-                                                            format!(" | Reflectivity: {:.1} dBZ", value)
-                                                        }
-                                                        RadarProduct::Velocity
-                                                        | RadarProduct::StormRelativeVelocity => {
-                                                            let mph = value * 2.23694;
-                                                            format!(" | {}: {:.1} mph", product.name(), mph)
-                                                        }
-                                                        RadarProduct::SpectrumWidth => {
-                                                            let mph = value * 2.23694;
-                                                            format!(" | Spectrum Width: {:.1} mph", mph)
-                                                        }
-                                                        RadarProduct::DifferentialReflectivity => {
-                                                            format!(" | Diff. Reflectivity: {:.2} dB", value)
-                                                        }
-                                                        RadarProduct::CorrelationCoefficient => {
-                                                            format!(" | Corr. Coefficient: {:.4}", value)
-                                                        }
-                                                        RadarProduct::DifferentialPhase => {
-                                                            format!(" | Diff. Phase: {:.1}°", value)
-                                                        }
-                                                        RadarProduct::SpecificDifferentialPhase => {
-                                                            format!(" | KDP: {:.2} °/km", value)
-                                                        }
-                                                        RadarProduct::EchoTops => {
-                                                            format!(" | Echo Tops: {:.1} kft", value)
-                                                        }
-                                                        RadarProduct::VerticallyIntegratedLiquid => {
-                                                            format!(" | VIL: {:.1} kg/m²", value)
-                                                        }
-                                                        RadarProduct::HydrometeorClassification => {
-                                                            let class = match value as u16 {
-                                                                0..=9 => "No Data",
-                                                                10..=19 => "Biological",
-                                                                20..=29 => "Clutter/AP",
-                                                                30..=39 => "Ice Crystals",
-                                                                40..=49 => "Dry Snow",
-                                                                50..=59 => "Wet Snow",
-                                                                60..=69 => "Rain",
-                                                                70..=79 => "Heavy Rain",
-                                                                80..=89 => "Big Drops",
-                                                                90..=99 => "Graupel",
-                                                                100..=109 => "Hail+Rain",
-                                                                110..=119 => "Large Hail",
-                                                                120..=139 => "Giant Hail",
-                                                                140..=149 => "Unknown",
-                                                                150.. => "Range Folded",
-                                                            };
-                                                            format!(" | HHC: {class}")
-                                                        }
-                                                        RadarProduct::PrecipitationRate => {
-                                                            format!(" | Precip Rate: {:.2} in/hr", value)
-                                                        }
-                                                        RadarProduct::NormalizedRotation => {
-                                                            format!(" | NROT: {:.2}", value)
-                                                        }
-                                                    };
-                                                }
-                                            }
-                                        }
-
-                                        pane.hover_value = Some(format!(
-                                            "Lat: {:.4}°, Lon: {:.4}° | Range: {:.1}km, Az: {:.1}° {}",
-                                            hover_lat, hover_lon, distance_km, azimuth, value_str
+                                        pane.hover_value = Some(compute_hover_info(
+                                            img,
+                                            hover_lat,
+                                            hover_lon,
+                                            hover_pos,
+                                            rect,
+                                            pane.selected_product,
                                         ));
                                     }
                                     } else {
@@ -876,44 +786,7 @@ impl Gui {
                 }
 
                 // Sync viewports: propagate the interacted pane's viewport to all others
-                if self.viewport_sync && pane_count > 1 {
-                    // Detect which pane changed this frame
-                    let mut source_idx = None;
-                    for idx in 0..pane_count {
-                        if idx < pre_zooms.len() {
-                            let zoom_diff = (self.panes[idx].map_memory.zoom() - pre_zooms[idx]).abs();
-                            if zoom_diff > 0.0001 {
-                                source_idx = Some(idx);
-                                break;
-                            }
-                            let prev_pos = &pre_positions[idx];
-                            let curr_pos = self.panes[idx].map_memory.detached();
-                            let pos_changed = match (prev_pos, &curr_pos) {
-                                (Some(p1), Some(p2)) => {
-                                    (p1.x() - p2.x()).abs() > 0.00001
-                                        || (p1.y() - p2.y()).abs() > 0.00001
-                                }
-                                (None, Some(_)) | (Some(_), None) => true,
-                                _ => false,
-                            };
-                            if pos_changed {
-                                source_idx = Some(idx);
-                                break;
-                            }
-                        }
-                    }
-                    let src = source_idx.unwrap_or(self.active_pane);
-                    let zoom = self.panes[src].map_memory.zoom();
-                    let pos = self.panes[src].map_memory.detached();
-                    for idx in 0..pane_count {
-                        if idx != src {
-                            let _ = self.panes[idx].map_memory.set_zoom(zoom);
-                            if let Some(p) = pos {
-                                self.panes[idx].map_memory.center_at(p);
-                            }
-                        }
-                    }
-                }
+                self.sync_viewports(pane_count, &pre_zooms, &pre_positions);
             });
 
         // Restore tiles and label tiles
@@ -1437,6 +1310,53 @@ impl Gui {
         self.loading_site = None;
     }
 
+    /// Propagate the interacted pane's viewport (zoom + position) to all other panes.
+    fn sync_viewports(
+        &mut self,
+        pane_count: usize,
+        pre_zooms: &[f64],
+        pre_positions: &[Option<walkers::Position>],
+    ) {
+        if !self.viewport_sync || pane_count <= 1 {
+            return;
+        }
+        let mut source_idx = None;
+        for idx in 0..pane_count {
+            if idx < pre_zooms.len() {
+                let zoom_diff = (self.panes[idx].map_memory.zoom() - pre_zooms[idx]).abs();
+                if zoom_diff > 0.0001 {
+                    source_idx = Some(idx);
+                    break;
+                }
+                let prev_pos = &pre_positions[idx];
+                let curr_pos = self.panes[idx].map_memory.detached();
+                let pos_changed = match (prev_pos, &curr_pos) {
+                    (Some(p1), Some(p2)) => {
+                        (p1.x() - p2.x()).abs() > 0.00001
+                            || (p1.y() - p2.y()).abs() > 0.00001
+                    }
+                    (None, Some(_)) | (Some(_), None) => true,
+                    _ => false,
+                };
+                if pos_changed {
+                    source_idx = Some(idx);
+                    break;
+                }
+            }
+        }
+        let src = source_idx.unwrap_or(self.active_pane);
+        let zoom = self.panes[src].map_memory.zoom();
+        let pos = self.panes[src].map_memory.detached();
+        for idx in 0..pane_count {
+            if idx != src {
+                let _ = self.panes[idx].map_memory.set_zoom(zoom);
+                if let Some(p) = pos {
+                    self.panes[idx].map_memory.center_at(p);
+                }
+            }
+        }
+    }
+
     #[cfg(not(target_os = "android"))]
     fn render_desktop_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<GuiAction>) {
         // Menu bar
@@ -1470,5 +1390,93 @@ impl Gui {
         // SPC Mesoscale Discussion detail popup
         self.render_md_popup(ctx);
     }
+}
+
+/// Format a radar product value for display in the hover tooltip.
+fn format_radar_value(product: RadarProduct, value: f32) -> String {
+    match product {
+        RadarProduct::Reflectivity => format!(" | Reflectivity: {:.1} dBZ", value),
+        RadarProduct::Velocity | RadarProduct::StormRelativeVelocity => {
+            let mph = value * 2.23694;
+            format!(" | {}: {:.1} mph", product.name(), mph)
+        }
+        RadarProduct::SpectrumWidth => {
+            let mph = value * 2.23694;
+            format!(" | Spectrum Width: {:.1} mph", mph)
+        }
+        RadarProduct::DifferentialReflectivity => format!(" | Diff. Reflectivity: {:.2} dB", value),
+        RadarProduct::CorrelationCoefficient => format!(" | Corr. Coefficient: {:.4}", value),
+        RadarProduct::DifferentialPhase => format!(" | Diff. Phase: {:.1}°", value),
+        RadarProduct::SpecificDifferentialPhase => format!(" | KDP: {:.2} °/km", value),
+        RadarProduct::EchoTops => format!(" | Echo Tops: {:.1} kft", value),
+        RadarProduct::VerticallyIntegratedLiquid => format!(" | VIL: {:.1} kg/m²", value),
+        RadarProduct::HydrometeorClassification => {
+            let class = match value as u16 {
+                0..=9 => "No Data",
+                10..=19 => "Biological",
+                20..=29 => "Clutter/AP",
+                30..=39 => "Ice Crystals",
+                40..=49 => "Dry Snow",
+                50..=59 => "Wet Snow",
+                60..=69 => "Rain",
+                70..=79 => "Heavy Rain",
+                80..=89 => "Big Drops",
+                90..=99 => "Graupel",
+                100..=109 => "Hail+Rain",
+                110..=119 => "Large Hail",
+                120..=139 => "Giant Hail",
+                140..=149 => "Unknown",
+                150.. => "Range Folded",
+            };
+            format!(" | HHC: {class}")
+        }
+        RadarProduct::PrecipitationRate => format!(" | Precip Rate: {:.2} in/hr", value),
+        RadarProduct::NormalizedRotation => format!(" | NROT: {:.2}", value),
+    }
+}
+
+/// Compute the hover information string for a cursor position over the radar image.
+fn compute_hover_info(
+    img: &RadarImageData,
+    hover_lat: f64,
+    hover_lon: f64,
+    hover_pos: egui::Pos2,
+    rect: egui::Rect,
+    product: RadarProduct,
+) -> String {
+    let lat1 = img.lat.to_radians();
+    let lon1 = img.lon.to_radians();
+    let lat2 = hover_lat.to_radians();
+    let lon2 = hover_lon.to_radians();
+    let dlat = lat2 - lat1;
+    let dlon = lon2 - lon1;
+    let a = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    let distance_km = 6371.0 * c;
+
+    let y = dlon.sin() * lat2.cos();
+    let x = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
+    let azimuth = (y.atan2(x).to_degrees() + 360.0) % 360.0;
+
+    let mut value_str = String::new();
+    let frac_x = (hover_pos.x - rect.left()) / rect.width();
+    let frac_y = (hover_pos.y - rect.top()) / rect.height();
+    let px = (frac_x * IMAGE_SIZE as f32) as i32;
+    let py = (frac_y * IMAGE_SIZE as f32) as i32;
+
+    if px >= 0 && px < IMAGE_SIZE as i32 && py >= 0 && py < IMAGE_SIZE as i32 {
+        let pixel_idx = py as usize * IMAGE_SIZE + px as usize;
+        if pixel_idx < img.value_data.len() {
+            let value = img.value_data[pixel_idx];
+            if !value.is_nan() {
+                value_str = format_radar_value(product, value);
+            }
+        }
+    }
+
+    format!(
+        "Lat: {:.4}°, Lon: {:.4}° | Range: {:.1}km, Az: {:.1}° {}",
+        hover_lat, hover_lon, distance_km, azimuth, value_str
+    )
 }
 
