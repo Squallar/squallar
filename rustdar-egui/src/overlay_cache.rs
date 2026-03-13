@@ -14,6 +14,8 @@ use egui::{Mesh, Pos2, Rect, Shape, Stroke};
 use rustdar_overlays::types::{GeoBounds, HatchPattern, OverlayFeature};
 use walkers::Projector;
 
+use crate::geo;
+
 use crate::hatch::generate_hatch_lines;
 
 /// A viewport fingerprint used to decide whether cached geometry can be reused.
@@ -270,7 +272,7 @@ fn build_cached_polygon(
     }
 
     // Compute AABB
-    let (min_x, min_y, max_x, max_y) = aabb(&projected);
+    let (min_x, min_y, max_x, max_y) = geo::aabb(&projected);
     let poly_rect = Rect::from_min_max(egui::pos2(min_x, min_y), egui::pos2(max_x, max_y));
 
     // Cull polygons whose screen AABB doesn't intersect the viewport
@@ -315,21 +317,6 @@ fn triangulate_screen(pts: &[Pos2]) -> Vec<u32> {
         .into_iter()
         .map(|i| i as u32)
         .collect()
-}
-
-/// Compute axis-aligned bounding box: (min_x, min_y, max_x, max_y).
-fn aabb(pts: &[Pos2]) -> (f32, f32, f32, f32) {
-    let mut min_x = f32::MAX;
-    let mut min_y = f32::MAX;
-    let mut max_x = f32::MIN;
-    let mut max_y = f32::MIN;
-    for pt in pts {
-        min_x = min_x.min(pt.x);
-        min_y = min_y.min(pt.y);
-        max_x = max_x.max(pt.x);
-        max_y = max_y.max(pt.y);
-    }
-    (min_x, min_y, max_x, max_y)
 }
 
 // ── Drawing from cache ───────────────────────────────────────────────────
@@ -393,7 +380,7 @@ pub fn draw_cached_features(
             // Accumulate hatch lines
             for &(p1, p2, dotted) in &cached_poly.hatch_lines {
                 if dotted {
-                    let dash_shapes = dashed_line_shapes(
+                    let dash_shapes = geo::dashed_line_shapes(
                         p1,
                         p2,
                         Stroke::new(1.5, hatch_color),
@@ -485,7 +472,7 @@ pub fn draw_cached_features_clickable(
             if let Some(hc) = hatch_color {
                 for &(p1, p2, dotted) in &cached_poly.hatch_lines {
                     if dotted {
-                        hatch_strokes.extend(dashed_line_shapes(
+                        hatch_strokes.extend(geo::dashed_line_shapes(
                             p1,
                             p2,
                             Stroke::new(1.5, hc),
@@ -505,7 +492,7 @@ pub fn draw_cached_features_clickable(
                     i.pointer.any_click()
                         && i.pointer.interact_pos().is_some_and(|p| {
                             cached_poly.poly_rect.contains(p)
-                                && point_in_polygon(p, &cached_poly.screen_pts)
+                                && geo::point_in_polygon(p, &cached_poly.screen_pts)
                         })
                 });
                 if clicked {
@@ -522,55 +509,4 @@ pub fn draw_cached_features_clickable(
     painter.extend(hatch_strokes);
 
     clicked_index
-}
-
-/// Ray-casting (even-odd rule) point-in-polygon test.
-fn point_in_polygon(point: Pos2, vertices: &[Pos2]) -> bool {
-    let n = vertices.len();
-    if n < 3 {
-        return false;
-    }
-    let mut inside = false;
-    let px = point.x;
-    let py = point.y;
-    let mut j = n - 1;
-    for i in 0..n {
-        let vi = vertices[i];
-        let vj = vertices[j];
-        if (vi.y > py) != (vj.y > py)
-            && px < (vj.x - vi.x) * (py - vi.y) / (vj.y - vi.y) + vi.x
-        {
-            inside = !inside;
-        }
-        j = i;
-    }
-    inside
-}
-
-/// Generate dashed line shapes from p1 to p2.
-fn dashed_line_shapes(p1: Pos2, p2: Pos2, stroke: Stroke) -> Vec<Shape> {
-    const DASH: f32 = 4.0;
-    const GAP: f32 = 4.0;
-    let dx = p2.x - p1.x;
-    let dy = p2.y - p1.y;
-    let len = (dx * dx + dy * dy).sqrt();
-    if len < 1.0 {
-        return Vec::new();
-    }
-    let nx = dx / len;
-    let ny = dy / len;
-    let mut shapes = Vec::new();
-    let mut t = 0.0_f32;
-    while t < len {
-        let end = (t + DASH).min(len);
-        shapes.push(Shape::line_segment(
-            [
-                Pos2::new(p1.x + nx * t, p1.y + ny * t),
-                Pos2::new(p1.x + nx * end, p1.y + ny * end),
-            ],
-            stroke,
-        ));
-        t = end + GAP;
-    }
-    shapes
 }

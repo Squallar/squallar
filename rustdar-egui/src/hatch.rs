@@ -1,12 +1,10 @@
 use egui::{Color32, Pos2, Rect, Stroke};
 use rustdar_overlays::types::HatchPattern;
 
+use crate::geo;
+
 /// Spacing between hatch lines in screen pixels.
 const HATCH_SPACING: f32 = 10.0;
-/// Dash length for dotted hatching (CIG1) in screen pixels.
-const DASH_LENGTH: f32 = 4.0;
-/// Gap length for dotted hatching (CIG1) in screen pixels.
-const DASH_GAP: f32 = 4.0;
 /// Stroke width for hatch lines.
 const HATCH_STROKE_WIDTH: f32 = 1.5;
 
@@ -133,11 +131,11 @@ fn draw_directional_hatch(
         let p2 = Pos2::new(cx + dir_x * line_half_len, cy + dir_y * line_half_len);
 
         // Clip this line to the polygon
-        let segments = clip_line_to_polygon(p1, p2, polygon_pts);
+        let segments = geo::clip_line_to_polygon(p1, p2, polygon_pts);
 
         for (s1, s2) in segments {
             if dotted {
-                draw_dashed_line(painter, s1, s2, stroke);
+                painter.extend(geo::dashed_line_shapes(s1, s2, stroke));
             } else {
                 painter.line_segment([s1, s2], stroke);
             }
@@ -206,7 +204,7 @@ fn subtract_exclusion_polygons(
             let seg_max_x = segments.iter().map(|(a, b)| a.x.max(b.x)).fold(f32::MIN, f32::max);
             let seg_min_y = segments.iter().map(|(a, b)| a.y.min(b.y)).fold(f32::MAX, f32::min);
             let seg_max_y = segments.iter().map(|(a, b)| a.y.max(b.y)).fold(f32::MIN, f32::max);
-            let (ex_min_x, ex_min_y, ex_max_x, ex_max_y) = poly_aabb(excl_poly);
+            let (ex_min_x, ex_min_y, ex_max_x, ex_max_y) = geo::aabb(excl_poly);
             if seg_max_x < ex_min_x || seg_min_x > ex_max_x
                 || seg_max_y < ex_min_y || seg_min_y > ex_max_y
             {
@@ -277,7 +275,7 @@ fn subtract_polygon_from_segment(
         }
         let mid_t = (t0 + t1) * 0.5;
         let mid = Pos2::new(p1.x + dx * mid_t, p1.y + dy * mid_t);
-        if !point_in_polygon_fast(mid, polygon) {
+        if !geo::point_in_polygon(mid, polygon) {
             // This portion is outside the exclusion polygon — keep it
             out.push((
                 Pos2::new(p1.x + dx * t0, p1.y + dy * t0),
@@ -287,43 +285,7 @@ fn subtract_polygon_from_segment(
     }
 }
 
-/// Fast even-odd rule point-in-polygon test.
-fn point_in_polygon_fast(point: Pos2, polygon: &[Pos2]) -> bool {
-    let n = polygon.len();
-    if n < 3 {
-        return false;
-    }
-    let mut inside = false;
-    let px = point.x;
-    let py = point.y;
-    let mut j = n - 1;
-    for i in 0..n {
-        let vi = polygon[i];
-        let vj = polygon[j];
-        if (vi.y > py) != (vj.y > py)
-            && px < (vj.x - vi.x) * (py - vi.y) / (vj.y - vi.y) + vi.x
-        {
-            inside = !inside;
-        }
-        j = i;
-    }
-    inside
-}
 
-/// Compute AABB of a polygon.
-fn poly_aabb(polygon: &[Pos2]) -> (f32, f32, f32, f32) {
-    let mut min_x = f32::MAX;
-    let mut min_y = f32::MAX;
-    let mut max_x = f32::MIN;
-    let mut max_y = f32::MIN;
-    for pt in polygon {
-        min_x = min_x.min(pt.x);
-        min_y = min_y.min(pt.y);
-        max_x = max_x.max(pt.x);
-        max_y = max_y.max(pt.y);
-    }
-    (min_x, min_y, max_x, max_y)
-}
 
 /// Collect hatch line segments at a given angle, clipped to the polygon.
 fn collect_directional_hatch(
@@ -382,7 +344,7 @@ fn collect_directional_hatch(
         let cy = norm_y * t + dir_y * dir_center;
         let p1 = Pos2::new(cx - dir_x * line_half_len, cy - dir_y * line_half_len);
         let p2 = Pos2::new(cx + dir_x * line_half_len, cy + dir_y * line_half_len);
-        let segments = clip_line_to_polygon(p1, p2, polygon_pts);
+        let segments = geo::clip_line_to_polygon(p1, p2, polygon_pts);
         for (s1, s2) in segments {
             out.push((s1, s2, dotted));
         }
@@ -390,84 +352,3 @@ fn collect_directional_hatch(
     }
 }
 
-/// Clip a line segment to a polygon using even-odd intersection.
-/// Returns a list of interior segments.
-fn clip_line_to_polygon(p1: Pos2, p2: Pos2, polygon: &[Pos2]) -> Vec<(Pos2, Pos2)> {
-    let dx = p2.x - p1.x;
-    let dy = p2.y - p1.y;
-    let line_len_sq = dx * dx + dy * dy;
-    if line_len_sq < 1e-6 {
-        return vec![];
-    }
-
-    let mut ts = Vec::new();
-
-    let n = polygon.len();
-    for i in 0..n {
-        let a = polygon[i];
-        let b = polygon[(i + 1) % n];
-
-        // Solve: p1 + t*(p2-p1) = a + s*(b-a)
-        let ex = b.x - a.x;
-        let ey = b.y - a.y;
-        let denom = dx * ey - dy * ex;
-        if denom.abs() < 1e-10 {
-            continue; // parallel
-        }
-        let t = ((a.x - p1.x) * ey - (a.y - p1.y) * ex) / denom;
-        let s = ((a.x - p1.x) * dy - (a.y - p1.y) * dx) / denom;
-
-        if s >= 0.0 && s <= 1.0 && t >= 0.0 && t <= 1.0 {
-            ts.push(t);
-        }
-    }
-
-    ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-    // Pair consecutive intersections (even-odd fill rule)
-    let mut segments = Vec::new();
-    let mut i = 0;
-    while i + 1 < ts.len() {
-        let t_start = ts[i];
-        let t_end = ts[i + 1];
-        // Only draw if the segment has nonzero length
-        if (t_end - t_start).abs() > 1e-6 {
-            let s1 = Pos2::new(p1.x + dx * t_start, p1.y + dy * t_start);
-            let s2 = Pos2::new(p1.x + dx * t_end, p1.y + dy * t_end);
-            segments.push((s1, s2));
-        }
-        i += 2;
-    }
-
-    segments
-}
-
-/// Draw a dashed line segment between two points.
-fn draw_dashed_line(painter: &egui::Painter, p1: Pos2, p2: Pos2, stroke: Stroke) {
-    let dx = p2.x - p1.x;
-    let dy = p2.y - p1.y;
-    let total_len = (dx * dx + dy * dy).sqrt();
-    if total_len < 1.0 {
-        return;
-    }
-
-    let ux = dx / total_len;
-    let uy = dy / total_len;
-
-    let mut dist = 0.0;
-    let mut drawing = true;
-
-    while dist < total_len {
-        let seg_len = if drawing { DASH_LENGTH } else { DASH_GAP };
-        let end_dist = (dist + seg_len).min(total_len);
-
-        if drawing {
-            let s = Pos2::new(p1.x + ux * dist, p1.y + uy * dist);
-            let e = Pos2::new(p1.x + ux * end_dist, p1.y + uy * end_dist);
-            painter.line_segment([s, e], stroke);
-        }
-
-        dist = end_dist;
-        drawing = !drawing;
-    }
-}

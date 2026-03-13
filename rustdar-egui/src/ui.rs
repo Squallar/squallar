@@ -2707,7 +2707,7 @@ fn draw_spc_discussions(
                 && any_click
                 && click_pos.is_some_and(|p| {
                     cached_poly.poly_rect.contains(p)
-                        && point_in_polygon(p, &cached_poly.screen_pts)
+                        && crate::geo::point_in_polygon(p, &cached_poly.screen_pts)
                 })
             {
                 clicked_index = Some(md_idx);
@@ -2851,7 +2851,7 @@ fn draw_nws_alerts(
                     && any_click
                     && click_pos.is_some_and(|p| {
                         cached_poly.poly_rect.contains(p)
-                            && point_in_polygon(p, &cached_poly.screen_pts)
+                            && crate::geo::point_in_polygon(p, &cached_poly.screen_pts)
                     })
                 {
                     clicked_index = Some(alert_idx);
@@ -2941,27 +2941,3 @@ fn format_iso_time(iso: &str) -> String {
         .unwrap_or_else(|_| iso.to_string())
 }
 
-/// Ray-casting (even-odd rule) point-in-polygon test.
-/// Returns `true` if `point` lies inside the polygon defined by `vertices`.
-fn point_in_polygon(point: egui::Pos2, vertices: &[egui::Pos2]) -> bool {
-    let n = vertices.len();
-    if n < 3 {
-        return false;
-    }
-    let mut inside = false;
-    let px = point.x;
-    let py = point.y;
-    let mut j = n - 1;
-    for i in 0..n {
-        let vi = vertices[i];
-        let vj = vertices[j];
-        // Check if the ray from point going in +x direction crosses this edge
-        if (vi.y > py) != (vj.y > py)
-            && px < (vj.x - vi.x) * (py - vi.y) / (vj.y - vi.y) + vi.x
-        {
-            inside = !inside;
-        }
-        j = i;
-    }
-    inside
-}
