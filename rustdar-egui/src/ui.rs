@@ -10,7 +10,7 @@ use egui::Context;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use walkers::{HttpTiles, Texture, Tiles, sources::{TileSource, Attribution}, TileId};
-use rustdar_radar::render::{ImageBounds, RadarProduct, ScanInfo, IMAGE_SIZE, MAX_RANGE_KM};
+use rustdar_radar::types::{ImageBounds, RadarProduct, ScanInfo, IMAGE_SIZE, MAX_RANGE_KM};
 use rustdar_radar::sites::RADARS;
 use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
 use rustdar_overlays::spc::discussion::SpcDiscussion;

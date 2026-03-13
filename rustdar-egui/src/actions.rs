@@ -1,4 +1,4 @@
-use rustdar_radar::render::ScanInfo;
+use rustdar_radar::types::ScanInfo;
 use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct};
 use chrono::NaiveDateTime;
 

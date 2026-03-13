@@ -1,4 +1,4 @@
-use crate::render::RadarProduct;
+use crate::types::RadarProduct;
 
 const TRANSPARENCY: u8 = 180;
 

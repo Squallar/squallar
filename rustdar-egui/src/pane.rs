@@ -1,7 +1,7 @@
 use crate::layers::LayerManager;
 use crate::overlay_cache::OverlayLayerCache;
 use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct};
-use rustdar_radar::render::{ImageBounds, RadarProduct};
+use rustdar_radar::types::{ImageBounds, RadarProduct, ScanInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
 use walkers::MapMemory;
@@ -48,7 +48,7 @@ impl PaneState {
     /// Get rendering params for this pane (product + closest elevation).
     pub fn get_rendering_params(
         &self,
-        scan_info: Option<&rustdar_radar::render::ScanInfo>,
+        scan_info: Option<&ScanInfo>,
     ) -> Option<(RadarProduct, f32)> {
         scan_info.and_then(|si| {
             si.product_elevations

@@ -19,12 +19,8 @@ use rustdar_egui::{
     Gui,
     actions::GuiAction,
 };
-use rustdar_radar::render::{
-    RadarProduct,
-    ScanInfo,
-    render_radar_to_image,
-    render_level3_radial_to_image,
-};
+use rustdar_radar::render::{render_radar_to_image, render_level3_radial_to_image};
+use rustdar_radar::types::{RadarProduct, ScanInfo};
 use rustdar_radar::scan;
 use rustdar_radar::sites::get_radar_site;
 use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
