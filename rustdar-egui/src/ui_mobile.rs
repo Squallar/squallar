@@ -1,9 +1,7 @@
 #![cfg(target_os = "android")]
 
 use crate::actions::GuiAction;
-use crate::layers::LayerKind;
 use crate::pane::{PaneLayout, PaneState, MAX_PANES_MOBILE};
-use rustdar_overlays::spc::outlook::OutlookDay;
 
 /// Detects a "double-tap and drag" gesture commonly used on touch devices
 /// for one-handed zooming. The gesture flow is:
@@ -234,7 +232,6 @@ impl super::Gui {
         let bottom_inset = self.safe_area_insets.1;
 
         let mut pane = std::mem::take(&mut self.panes[self.active_pane]);
-        let day = pane.layers.spc_day;
 
         egui::SidePanel::left("mobile_layers_panel")
             .default_width(260.0)
@@ -295,218 +292,7 @@ impl super::Gui {
                         ui.separator();
                     }
 
-                    // -- Radar --
-                    ui.checkbox(pane.layers.enabled_mut(LayerKind::Radar), "\u{1f6f0}  Radar");
-
-                    if pane.layers.is_enabled(LayerKind::Radar) {
-                        ui.indent("m_radar_controls", |ui| {
-                            if let Some(scan_info) = &self.scan_info {
-                                let prev_product = pane.selected_product;
-                                egui::ComboBox::from_id_salt("m_product_sel")
-                                    .selected_text(pane.selected_product.name())
-                                    .width(180.0)
-                                    .show_ui(ui, |ui| {
-                                        for product in &scan_info.available_products {
-                                            ui.selectable_value(
-                                                &mut pane.selected_product,
-                                                *product,
-                                                product.name(),
-                                            );
-                                        }
-                                    });
-                                if prev_product != pane.selected_product {
-                                    pane.selected_elevation = 0.0;
-                                }
-
-                                if let Some(elevations) =
-                                    scan_info.product_elevations.get(&pane.selected_product)
-                                {
-                                    if !elevations.is_empty() {
-                                        let selected_angle = elevations
-                                            .iter()
-                                            .min_by(|a, b| {
-                                                ((**a - pane.selected_elevation).abs())
-                                                    .partial_cmp(
-                                                        &((**b - pane.selected_elevation).abs()),
-                                                    )
-                                                    .unwrap()
-                                            })
-                                            .copied()
-                                            .unwrap_or(0.0);
-
-                                        egui::ComboBox::from_id_salt("m_elev_sel")
-                                            .selected_text(format!("{:.1}\u{b0}", selected_angle))
-                                            .width(180.0)
-                                            .show_ui(ui, |ui| {
-                                                for angle in elevations.iter() {
-                                                    ui.selectable_value(
-                                                        &mut pane.selected_elevation,
-                                                        *angle,
-                                                        format!("{:.1}\u{b0}", angle),
-                                                    );
-                                                }
-                                            });
-                                    }
-                                }
-                            } else {
-                                ui.label("No scan loaded");
-                            }
-                        });
-                    }
-
-                    ui.add_space(6.0);
-                    ui.separator();
-
-                    // -- SPC Outlooks --
-                    ui.label("\u{26c8}  SPC Outlooks");
-
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Day:");
-                        let mut changed = false;
-                        let mut new_day = pane.layers.spc_day;
-                        for &d in OutlookDay::all() {
-                            if ui.selectable_label(new_day == d, d.label()).clicked() {
-                                new_day = d;
-                                changed = true;
-                            }
-                        }
-                        if changed {
-                            pane.layers.spc_day = new_day;
-                            let products = pane.layers.enabled_spc_products();
-                            if !products.is_empty() {
-                                actions.push(GuiAction::FetchSpcOutlook {
-                                    day: new_day,
-                                    products,
-                                });
-                            }
-                        }
-                    });
-
-                    let spc_layers = pane.layers.spc_layers_for_day();
-                    for layer in &spc_layers {
-                        let was_enabled = pane.layers.is_enabled(*layer);
-                        ui.checkbox(pane.layers.enabled_mut(*layer), layer.display_name());
-                        let is_enabled = pane.layers.is_enabled(*layer);
-                        if is_enabled && !was_enabled {
-                            if let Some(product) = layer.to_outlook_product() {
-                                if !self.spc_outlooks.data.contains_key(&(day, product)) {
-                                    actions.push(GuiAction::FetchSpcOutlook {
-                                        day,
-                                        products: vec![product],
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    if pane.layers.any_spc_enabled() {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(!self.spc_outlooks.fetching, egui::Button::new("\u{1f504} Refresh"))
-                                .clicked()
-                            {
-                                actions.push(GuiAction::RefreshSpcOutlooks);
-                            }
-                            if self.spc_outlooks.fetching {
-                                ui.spinner();
-                            }
-                        });
-                    }
-
-                    ui.add_space(6.0);
-                    ui.separator();
-
-                    // -- SPC Mesoscale Discussions --
-                    {
-                        let was_enabled = pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
-                        let label = if self.spc_discussions.data.is_empty() {
-                            "\u{1f4cb}  Mesoscale Disc.".to_string()
-                        } else {
-                            format!("\u{1f4cb}  Mesoscale Disc. ({})", self.spc_discussions.data.len())
-                        };
-                        ui.checkbox(
-                            pane.layers.enabled_mut(LayerKind::SpcMesoscaleDiscussions),
-                            label,
-                        );
-                        let is_enabled = pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
-                        if is_enabled && !was_enabled && self.spc_discussions.data.is_empty() && !self.spc_discussions.fetching {
-                            actions.push(GuiAction::FetchSpcDiscussions);
-                        }
-                    }
-
-                    if pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions) {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(!self.spc_discussions.fetching, egui::Button::new("\u{1f504} Refresh"))
-                                .clicked()
-                            {
-                                actions.push(GuiAction::RefreshSpcDiscussions);
-                            }
-                            if self.spc_discussions.fetching {
-                                ui.spinner();
-                            }
-                        });
-                        if let Some(t) = self.spc_discussions.fetch_time {
-                            let secs_ago = t.elapsed().as_secs();
-                            let label = if secs_ago < 60 {
-                                format!("Updated {}s ago", secs_ago)
-                            } else {
-                                format!("Updated {}m ago", secs_ago / 60)
-                            };
-                            ui.label(egui::RichText::new(label).small().weak());
-                        }
-                    }
-
-                    ui.add_space(6.0);
-                    ui.separator();
-
-                    // -- NWS Alerts --
-                    ui.label("\u{26a0}  NWS Alerts");
-
-                    let nws_layers = [LayerKind::NwsWarnings, LayerKind::NwsWatches, LayerKind::NwsAdvisories];
-                    for layer in &nws_layers {
-                        let was_enabled = pane.layers.is_enabled(*layer);
-                        ui.checkbox(pane.layers.enabled_mut(*layer), layer.display_name());
-                        let is_enabled = pane.layers.is_enabled(*layer);
-                        if is_enabled && !was_enabled && self.nws_alerts.data.is_empty() && !self.nws_alerts.fetching {
-                            actions.push(GuiAction::FetchNwsAlerts);
-                        }
-                    }
-
-                    if pane.layers.any_nws_enabled() {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(!self.nws_alerts.fetching, egui::Button::new("\u{1f504} Refresh"))
-                                .clicked()
-                            {
-                                actions.push(GuiAction::RefreshNwsAlerts);
-                            }
-                            if self.nws_alerts.fetching {
-                                ui.spinner();
-                            }
-                        });
-                        if !self.nws_alerts.data.is_empty() {
-                            let categories = pane.layers.enabled_nws_categories();
-                            let visible_count = self.nws_alerts.data.iter()
-                                .filter(|a| categories.contains(&a.category))
-                                .count();
-                            ui.label(format!("{} alerts shown", visible_count));
-                        }
-                    }
-
-                    ui.add_space(6.0);
-                    ui.separator();
-
-                    // -- Other overlays --
-                    ui.checkbox(pane.layers.enabled_mut(LayerKind::CityLabels), "\u{1f3f7}  City Labels");
-                    ui.checkbox(pane.layers.enabled_mut(LayerKind::RadarSites), "\u{1f4e1}  Radar Sites");
-
-                    // -- Viewport sync toggle --
-                    if self.pane_layout.pane_count > 1 {
-                        ui.separator();
-                        ui.checkbox(&mut self.viewport_sync, "\u{1f517}  Sync Viewports");
-                        ui.checkbox(&mut self.sync_layers, "\u{1f517}  Sync Layers");
-                    }
+                    self.render_layer_controls(ui, &mut pane, 180.0, "m_", &mut actions);
 
                     ui.add_space(10.0);
                     ui.separator();
@@ -547,39 +333,7 @@ impl super::Gui {
             });
 
         self.panes[self.active_pane] = pane;
-
-        // Propagate layer settings to all other panes when sync is enabled
-        if self.sync_layers && self.pane_layout.pane_count > 1 {
-            let src = &self.panes[self.active_pane].layers;
-            let spc_day = src.spc_day;
-            let snapshot: Vec<(LayerKind, bool)> = [
-                LayerKind::Radar,
-                LayerKind::SpcCategorical,
-                LayerKind::SpcTornado,
-                LayerKind::SpcWind,
-                LayerKind::SpcHail,
-                LayerKind::SpcProbabilistic,
-                LayerKind::SpcMesoscaleDiscussions,
-                LayerKind::NwsWarnings,
-                LayerKind::NwsWatches,
-                LayerKind::NwsAdvisories,
-                LayerKind::CityLabels,
-                LayerKind::RadarSites,
-            ]
-            .iter()
-            .map(|&k| (k, src.is_enabled(k)))
-            .collect();
-
-            for (idx, p) in self.panes.iter_mut().enumerate() {
-                if idx == self.active_pane {
-                    continue;
-                }
-                for &(kind, enabled) in &snapshot {
-                    p.layers.set_enabled(kind, enabled);
-                }
-                p.layers.spc_day = spc_day;
-            }
-        }
+        self.propagate_layer_sync();
 
         actions
     }
