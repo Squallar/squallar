@@ -20,6 +20,8 @@ use rustdar_overlays::types::HatchPattern;
 #[cfg(target_os = "android")]
 use walkers::{MapMemory};
 
+use crate::tiles::{CartoDb, lon_to_tile_x, lat_to_tile_y, tile_to_lon, tile_to_lat};
+
 // ---------------------------------------------------------------------------
 // Double-tap-drag zoom gesture detector (Android touch devices)
 // ---------------------------------------------------------------------------
@@ -132,72 +134,6 @@ impl DoubleTapDragDetector {
     }
 }
 
-/// CartoDB tile source variants.
-/// Base maps use `nolabels` so city/road names are not obscured by the radar
-/// overlay. A separate `labels-only` layer is drawn on top of the radar.
-#[derive(Clone)]
-pub enum CartoDbStyle {
-    LightNoLabels,
-    DarkNoLabels,
-    LightLabelsOnly,
-    DarkLabelsOnly,
-}
-
-#[derive(Clone)]
-pub struct CartoDb {
-    style: CartoDbStyle,
-}
-
-impl CartoDb {
-    pub fn light() -> Self {
-        Self { style: CartoDbStyle::LightNoLabels }
-    }
-
-    pub fn dark() -> Self {
-        Self { style: CartoDbStyle::DarkNoLabels }
-    }
-
-    pub fn light_labels() -> Self {
-        Self { style: CartoDbStyle::LightLabelsOnly }
-    }
-
-    pub fn dark_labels() -> Self {
-        Self { style: CartoDbStyle::DarkLabelsOnly }
-    }
-}
-
-impl TileSource for CartoDb {
-    fn tile_url(&self, tile_id: TileId) -> String {
-        let style_name = match self.style {
-            CartoDbStyle::LightNoLabels => "light_nolabels",
-            CartoDbStyle::DarkNoLabels => "dark_nolabels",
-            CartoDbStyle::LightLabelsOnly => "light_only_labels",
-            CartoDbStyle::DarkLabelsOnly => "dark_only_labels",
-        };
-        
-        // Use one of the available subdomains (a, b, c, d)
-        let subdomain = match tile_id.x % 4 {
-            0 => "a",
-            1 => "b", 
-            2 => "c",
-            _ => "d",
-        };
-        
-        format!(
-            "https://cartodb-basemaps-{}.global.ssl.fastly.net/{}/{}/{}/{}.png",
-            subdomain, style_name, tile_id.zoom, tile_id.x, tile_id.y
-        )
-    }
-
-    fn attribution(&self) -> Attribution {
-        Attribution {
-            text: "© OpenStreetMap © CartoDB",
-            url: "https://www.openstreetmap.org/copyright",
-            logo_light: None,
-            logo_dark: None,
-        }
-    }
-}
 
 pub struct Gui {
     radar_config: RadarConfig,
