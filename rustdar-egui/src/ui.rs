@@ -132,6 +132,19 @@ impl Gui {
     pub fn ui(&mut self, ctx: &egui::Context) -> Vec<GuiAction> {
         let mut actions = Vec::new();
 
+        self.check_auto_polls(&mut actions);
+
+        #[cfg(target_os = "android")]
+        self.render_mobile_ui(ctx, &mut actions);
+        #[cfg(not(target_os = "android"))]
+        self.render_desktop_ui(ctx, &mut actions);
+
+        actions
+    }
+
+    /// Check timers and emit fetch actions for auto-polling radar scans,
+    /// NWS alerts, and SPC discussions.
+    fn check_auto_polls(&mut self, actions: &mut Vec<GuiAction>) {
         // Auto-fetch on first load
         if !self.initial_fetch_done && !self.fetching {
             self.fetching = true;
@@ -177,13 +190,6 @@ impl Gui {
         {
             actions.push(GuiAction::FetchSpcDiscussions);
         }
-
-        #[cfg(target_os = "android")]
-        self.render_mobile_ui(ctx, &mut actions);
-        #[cfg(not(target_os = "android"))]
-        self.render_desktop_ui(ctx, &mut actions);
-
-        actions
     }
 
     /// Update the scan info (called from the app when scan is loaded)
