@@ -22,7 +22,6 @@ use rustdar_egui::{
 use rustdar_radar::render::{render_radar_to_image, render_level3_radial_to_image};
 use rustdar_radar::types::{RadarProduct, ScanInfo};
 use rustdar_radar::scan;
-use rustdar_radar::sites::get_radar_site;
 use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
 use rustdar_overlays::spc::discussion::SpcDiscussion;
 use rustdar_overlays::nws::alert::NwsAlert;
@@ -32,6 +31,9 @@ use chrono::NaiveDateTime;
 use nexrad_model::data::Scan;
 use nexrad_level3::model::Level3Message;
 use std::sync::mpsc::{Receiver, Sender};
+
+#[path = "app_fetch.rs"]
+mod fetch;
 
 type ScanResult = (u64, Result<(Scan, String, NaiveDateTime), String>);
 
@@ -258,139 +260,6 @@ impl App {
         }
     }
 
-    /// Load scan data from the fetched radar data
-    fn load_scan_data(
-        &mut self,
-        data: nexrad_model::data::Scan,
-        site: &str,
-        _requested_timestamp: chrono::NaiveDateTime,
-    ) -> ScanInfo {
-        let vcp_number = data.coverage_pattern_number().number();
-        let num_sweeps = data.sweeps().len();
-        log::info!("VCP: {}, {} sweeps", vcp_number, num_sweeps);
-
-        // Build a map of products to their available elevation angles
-        let mut product_elevations: HashMap<RadarProduct, Vec<f32>> = HashMap::new();
-
-        for (i, sweep) in data.sweeps().iter().enumerate() {
-            if let Some(first_radial) = sweep.radials().first() {
-                let raw_angle = first_radial.elevation_angle_degrees();
-                // Round to 1 decimal place so SAILS/MRLE repeat scans and
-                // split-cuts at the same nominal angle collapse to one entry.
-                let elev_angle = (raw_angle * 10.0).round() / 10.0;
-
-                // Check which products have data at this elevation
-                let mut products_found: Vec<&str> = Vec::new();
-                for product in RadarProduct::all() {
-                    if product.get_moment(first_radial).is_some() {
-                        products_found.push(product.code());
-                        product_elevations
-                            .entry(*product)
-                            .or_default()
-                            .push(elev_angle);
-                    }
-                }
-                log::info!(
-                    "  Sweep {:2}: raw={:.2}° rounded={:.1}° radials={} products=[{}]",
-                    i, raw_angle, elev_angle, sweep.radials().len(),
-                    products_found.join(", ")
-                );
-            } else {
-                log::warn!("  Sweep {:2}: no radials!", i);
-            }
-        }
-
-        // Sort and deduplicate elevation angles for each product
-        let mut product_elevations_sorted: HashMap<RadarProduct, Vec<f32>> = product_elevations
-            .into_iter()
-            .map(|(product, mut angles)| {
-                angles.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                angles.dedup();
-                log::info!(
-                    "  {} → {} unique elevations: {:?}",
-                    product.code(), angles.len(), angles
-                );
-                (product, angles)
-            })
-            .collect();
-
-        // Include Level III products in the available list.
-        // Actual elevation angles are populated as L3 data arrives.
-        for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
-            product_elevations_sorted
-                .entry(*l3_product)
-                .or_insert_with(Vec::new);
-        }
-
-        // Get list of available products, sorted by priority (Reflectivity first)
-        let mut available_products: Vec<RadarProduct> =
-            product_elevations_sorted.keys().copied().collect();
-        available_products.sort_by_key(|p| match p {
-            RadarProduct::Reflectivity => 0,
-            RadarProduct::Velocity => 1,
-            RadarProduct::SpectrumWidth => 2,
-            RadarProduct::DifferentialReflectivity => 3,
-            RadarProduct::CorrelationCoefficient => 4,
-            RadarProduct::DifferentialPhase => 5,
-            RadarProduct::NormalizedRotation => 6,
-            RadarProduct::StormRelativeVelocity => 7,
-            RadarProduct::SpecificDifferentialPhase => 8,
-            RadarProduct::EchoTops => 9,
-            RadarProduct::VerticallyIntegratedLiquid => 10,
-            RadarProduct::HydrometeorClassification => 11,
-            RadarProduct::PrecipitationRate => 12,
-        });
-
-        // Extract actual timestamp from the first radial's collection timestamp
-        // In the new API, we get timestamps from individual radials
-        let actual_timestamp = if let Some(first_sweep) = data.sweeps().first() {
-            if let Some(first_radial) = first_sweep.radials().first() {
-                let timestamp_ms = first_radial.collection_timestamp();
-                // Convert from milliseconds since epoch to NaiveDateTime
-                chrono::DateTime::from_timestamp_millis(timestamp_ms)
-                    .map(|dt| dt.naive_utc())
-                    .unwrap_or(_requested_timestamp)
-            } else {
-                _requested_timestamp
-            }
-        } else {
-            _requested_timestamp
-        };
-
-        self.scan_data = Some(Arc::new(data));
-
-        // Get radar site info, or create a default with unknown location.
-        // Use a static string to avoid leaking memory via Box::leak.
-        let radar_site = get_radar_site(site).unwrap_or_else(|| {
-            log::warn!("Unknown radar site '{}', using fallback location", site);
-            rustdar_radar::sites::RadarSite {
-                name: "UNKNOWN",
-                lat: 0.0,
-                lon: 0.0,
-                elev: 0,
-            }
-        });
-
-        let status = format!(
-            "Loaded {} products: {}",
-            available_products.len(),
-            available_products
-                .iter()
-                .map(|p| p.name())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-
-        ScanInfo {
-            site: radar_site,
-            timestamp: actual_timestamp,
-            vcp_number,
-            available_products,
-            product_elevations: product_elevations_sorted,
-            status,
-        }
-    }
-
     /// Create surface and initialize AppState for a given window and dimensions.
     async fn initialize_rendering_state(
         instance: &wgpu::Instance,
@@ -452,7 +321,8 @@ impl App {
                 match result {
                     Ok((data, site, timestamp)) => {
                         log::info!("Received scan data from background thread");
-                        let scan_info = self.load_scan_data(data, &site, timestamp);
+                        let scan_info = ScanInfo::from_scan(&data, &site, timestamp);
+                        self.scan_data = Some(Arc::new(data));
                         self.gui.set_scan_info(scan_info);
                         self.gui.set_loading_site(None);
                         // Invalidate last render so new data triggers a re-render
@@ -1026,9 +896,6 @@ impl App {
         surface_texture.present();
     }
 
-    /// Convert a local NaiveDateTime to a UTC NaiveDateTime.
-    /// Uses `.latest()` to pick the later valid interpretation during DST gaps,
-    /// which is less surprising than silently falling back to the current time.
     fn local_to_utc(timestamp: NaiveDateTime) -> NaiveDateTime {
         let local_dt = chrono::Local
             .from_local_datetime(&timestamp)
@@ -1076,14 +943,6 @@ impl App {
                     }
                     if let Some(w) = window { w.request_redraw(); }
                 });
-            }
-            GuiAction::SetScanInfo(scan_info) => {
-                log::info!(
-                    "Setting scan info: {} @ {}",
-                    scan_info.site.name,
-                    scan_info.timestamp
-                );
-                self.gui.set_scan_info(scan_info);
             }
             GuiAction::SwitchRadarSite(site) => {
                 log::info!("Switch radar site requested: {}", site);
@@ -1167,63 +1026,6 @@ impl App {
                     if let Some(w) = window {
                         w.request_redraw();
                     }
-                });
-            }
-        }
-    }
-
-    /// Spawn an async radar data fetch on the background runtime.
-    /// Handles generation tracking, result sending, and redraw requests.
-    fn spawn_fetch(&mut self, site: String, timestamp: NaiveDateTime) {
-        self.fetch_generation += 1;
-        let generation = self.fetch_generation;
-        let window = self.window.clone();
-        let sender = self.scan_sender.clone();
-        self.tokio_runtime.spawn(async move {
-            log::info!("Fetching {} @ {} UTC", site, timestamp);
-            let msg = match scan::get_scan(&site, timestamp).await {
-                Ok(data) => {
-                    log::info!("Fetched scan: {} @ {}", site, timestamp);
-                    Ok((data, site, timestamp))
-                }
-                Err(e) => {
-                    let err = format!("Failed to fetch radar scan: {:?}", e);
-                    log::error!("{}", err);
-                    Err(err)
-                }
-            };
-            let _ = sender.send((generation, msg));
-            if let Some(w) = window { w.request_redraw(); }
-        });
-    }
-
-    /// Spawn Level III product fetches for all supported Level III products.
-    /// Called after a Level II scan loads so the products are available
-    /// alongside the base moments.
-    fn spawn_level3_fetches(&self, site: &str, _timestamp: NaiveDateTime) {
-        let generation = self.fetch_generation;
-        for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
-            let Some(dirs) = l3_product.tgftp_dirs() else { continue };
-            for &dir in dirs {
-                let site = site.to_string();
-                let dir_str = dir.to_string();
-                let product = *l3_product;
-                let sender = self.level3_sender.clone();
-                let window = self.window.clone();
-                self.tokio_runtime.spawn(async move {
-                    log::info!("Fetching TGFTP {} for {}", dir_str, site);
-                    let result = match scan::get_tgftp_product(&site, &dir_str).await {
-                        Ok(msg) => {
-                            log::info!("Fetched TGFTP {} for {}", dir_str, site);
-                            Ok(msg)
-                        }
-                        Err(e) => {
-                            log::warn!("TGFTP {} fetch failed: {}", dir_str, e);
-                            Err(format!("{e}"))
-                        }
-                    };
-                    let _ = sender.send((generation, product, dir_str, result));
-                    if let Some(w) = window { w.request_redraw(); }
                 });
             }
         }
