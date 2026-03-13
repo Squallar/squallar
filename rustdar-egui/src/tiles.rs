@@ -1,7 +1,9 @@
 use walkers::{
     sources::{Attribution, TileSource},
-    TileId,
+    HttpTiles, TileId,
 };
+
+use crate::layers::LayerKind;
 
 /// CartoDB tile source variants.
 /// Base maps use `nolabels` so city/road names are not obscured by the radar
@@ -100,4 +102,107 @@ pub fn tile_to_lat(y: u32, zoom: u8) -> f64 {
         .sinh()
         .atan()
         .to_degrees()
+}
+
+// ---------------------------------------------------------------------------
+// MapTileState — shared map tile management
+// ---------------------------------------------------------------------------
+
+/// Shared map tile state across all panes.
+///
+/// Keeps both light and dark tile caches alive so theme toggles don't discard
+/// already-fetched tiles. Label-only tiles are lazily initialized when any
+/// pane enables the city-labels layer.
+pub struct MapTileState {
+    pub tiles_light: Option<HttpTiles>,
+    pub tiles_dark: Option<HttpTiles>,
+    pub label_tiles_light: Option<HttpTiles>,
+    pub label_tiles_dark: Option<HttpTiles>,
+    pub current_theme_is_dark: bool,
+}
+
+impl Default for MapTileState {
+    fn default() -> Self {
+        Self {
+            tiles_light: None,
+            tiles_dark: None,
+            label_tiles_light: None,
+            label_tiles_dark: None,
+            current_theme_is_dark: true,
+        }
+    }
+}
+
+impl MapTileState {
+    /// Ensure the base-map tiles for the current theme are initialized.
+    pub fn ensure_base_tiles(&mut self, is_dark: bool, ctx: &egui::Context) {
+        self.current_theme_is_dark = is_dark;
+        if is_dark {
+            if self.tiles_dark.is_none() {
+                self.tiles_dark = Some(HttpTiles::new(CartoDb::dark(), ctx.to_owned()));
+            }
+        } else if self.tiles_light.is_none() {
+            self.tiles_light = Some(HttpTiles::new(CartoDb::light(), ctx.to_owned()));
+        }
+    }
+
+    /// Ensure label-only tiles are initialized for the current theme.
+    pub fn ensure_label_tiles(&mut self, is_dark: bool, ctx: &egui::Context) {
+        if is_dark && self.label_tiles_dark.is_none() {
+            self.label_tiles_dark = Some(HttpTiles::new(CartoDb::dark_labels(), ctx.to_owned()));
+        } else if !is_dark && self.label_tiles_light.is_none() {
+            self.label_tiles_light = Some(HttpTiles::new(CartoDb::light_labels(), ctx.to_owned()));
+        }
+    }
+
+    /// Temporarily take the base tiles out of self for per-pane rendering.
+    pub fn take_base_tiles(&mut self) -> Option<HttpTiles> {
+        if self.current_theme_is_dark {
+            self.tiles_dark.take()
+        } else {
+            self.tiles_light.take()
+        }
+    }
+
+    /// Restore the base tiles after per-pane rendering.
+    pub fn restore_base_tiles(&mut self, tiles: Option<HttpTiles>) {
+        if self.current_theme_is_dark {
+            self.tiles_dark = tiles;
+        } else {
+            self.tiles_light = tiles;
+        }
+    }
+
+    /// Temporarily take the label tiles out of self for per-pane rendering.
+    pub fn take_label_tiles(&mut self) -> Option<HttpTiles> {
+        if self.current_theme_is_dark {
+            self.label_tiles_dark.take()
+        } else {
+            self.label_tiles_light.take()
+        }
+    }
+
+    /// Restore label tiles after per-pane rendering.
+    pub fn restore_label_tiles(&mut self, tiles: Option<HttpTiles>) {
+        if self.current_theme_is_dark {
+            self.label_tiles_dark = tiles;
+        } else {
+            self.label_tiles_light = tiles;
+        }
+    }
+
+    /// Check if any pane needs label tiles.
+    pub fn any_city_labels(panes: &[crate::pane::PaneState]) -> bool {
+        panes.iter().any(|p| p.layers.is_enabled(LayerKind::CityLabels))
+    }
+
+    /// Clear all tile state (called on suspend/graphics reset).
+    pub fn clear(&mut self) {
+        self.tiles_light = None;
+        self.tiles_dark = None;
+        self.label_tiles_light = None;
+        self.label_tiles_dark = None;
+        // Flip theme tracking to force tile recreation on next render
+        self.current_theme_is_dark = !self.current_theme_is_dark;
+    }
 }

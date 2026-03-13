@@ -2,17 +2,15 @@ use crate::actions::{GuiAction, RadarConfig};
 use crate::layers::{LayerKind, LayerManager};
 use crate::overlay_state::OverlayState;
 use crate::pane::{PaneId, PaneLayout, PaneState, RadarImageData, MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
+use crate::tiles::MapTileState;
 use chrono::Timelike;
 use egui::Context;
 use std::collections::{HashMap, HashSet};
-use walkers::HttpTiles;
 use rustdar_radar::types::{ImageBounds, RadarProduct, ScanInfo, IMAGE_SIZE, MAX_RANGE_KM};
 use rustdar_radar::sites::RADARS;
 use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
 use rustdar_overlays::spc::discussion::SpcDiscussion;
 use rustdar_overlays::nws::alert::NwsAlert;
-
-use crate::tiles::CartoDb;
 
 
 #[path = "ui_popups.rs"]
@@ -42,19 +40,14 @@ pub struct Gui {
     auto_poll_enabled: bool,
     initial_fetch_done: bool,
     initial_zoom_set: bool, // Track if we've already set the initial zoom
-    // Map tile state (shared across all panes)
-    tiles_light: Option<HttpTiles>,
-    tiles_dark: Option<HttpTiles>,
-    current_theme_is_dark: bool, // Track current theme
-    // City / road label overlay (shared)
-    label_tiles_light: Option<HttpTiles>,
-    label_tiles_dark: Option<HttpTiles>,
     // Track which site is currently loading
     loading_site: Option<String>,
     // Time dialog state
     show_time_dialog: bool,
     // Auto-poll interval in seconds (increases on failure, resets on success)
     poll_interval_secs: u64,
+    // --- Map tiles (shared across panes) ---
+    map_tiles: MapTileState,
     // User's GPS location for blue dot indicator (lat, lon)
     user_location: Option<(f64, f64)>,
     spc_outlooks: OverlayState<HashMap<(OutlookDay, OutlookProduct), SpcOutlook>>,
@@ -109,11 +102,7 @@ impl Gui {
             auto_poll_enabled: true,
             initial_fetch_done: false,
             initial_zoom_set: false,
-            tiles_light: None,
-            tiles_dark: None,
-            current_theme_is_dark: true, // Default to dark theme
-            label_tiles_light: None,
-            label_tiles_dark: None,
+            map_tiles: MapTileState::default(),
             loading_site: None,
             show_time_dialog: false,
             poll_interval_secs: 60,
@@ -399,41 +388,18 @@ impl Gui {
 
         // Detect current theme from egui context
         let is_dark_theme = ctx.style().visuals.dark_mode;
-        self.current_theme_is_dark = is_dark_theme;
 
-        // Lazily initialize tiles for each theme variant.
-        // Keeping both avoids discarding the tile cache on every theme toggle.
-        if is_dark_theme {
-            if self.tiles_dark.is_none() {
-                self.tiles_dark = Some(HttpTiles::new(CartoDb::dark(), ctx.to_owned()));
-            }
-        } else if self.tiles_light.is_none() {
-            self.tiles_light = Some(HttpTiles::new(CartoDb::light(), ctx.to_owned()));
-        }
-
-        // Lazily initialize label-only tiles if any pane uses city labels.
-        let any_city_labels = self.panes.iter().any(|p| p.layers.is_enabled(LayerKind::CityLabels));
+        // Initialize tiles via MapTileState
+        self.map_tiles.ensure_base_tiles(is_dark_theme, ctx);
+        let any_city_labels = MapTileState::any_city_labels(&self.panes);
         if any_city_labels {
-            if is_dark_theme && self.label_tiles_dark.is_none() {
-                self.label_tiles_dark = Some(HttpTiles::new(CartoDb::dark_labels(), ctx.to_owned()));
-            } else if !is_dark_theme && self.label_tiles_light.is_none() {
-                self.label_tiles_light = Some(HttpTiles::new(CartoDb::light_labels(), ctx.to_owned()));
-            }
+            self.map_tiles.ensure_label_tiles(is_dark_theme, ctx);
         }
 
         // Take tiles out of self so they can be reborrowed per-pane in the loop.
-        let mut tiles_owned = if is_dark_theme {
-            self.tiles_dark.take()
-        } else {
-            self.tiles_light.take()
-        };
-
-        let took_dark_labels = any_city_labels && is_dark_theme;
-        let took_light_labels = any_city_labels && !is_dark_theme;
-        let mut label_tiles: Option<HttpTiles> = if took_dark_labels {
-            self.label_tiles_dark.take()
-        } else if took_light_labels {
-            self.label_tiles_light.take()
+        let mut tiles_owned = self.map_tiles.take_base_tiles();
+        let mut label_tiles = if any_city_labels {
+            self.map_tiles.take_label_tiles()
         } else {
             None
         };
@@ -560,7 +526,7 @@ impl Gui {
                                 zoom,
                                 &pane.layers,
                                 &self.spc_outlooks.data,
-                                self.current_theme_is_dark,
+                                self.map_tiles.current_theme_is_dark,
                                 &mut pane.spc_overlay_caches,
                                 &self.spc_data_generation,
                             );
@@ -951,16 +917,9 @@ impl Gui {
             });
 
         // Restore tiles and label tiles
-        if is_dark_theme {
-            self.tiles_dark = tiles_owned;
-        } else {
-            self.tiles_light = tiles_owned;
-        }
-
-        if took_dark_labels {
-            self.label_tiles_dark = label_tiles;
-        } else if took_light_labels {
-            self.label_tiles_light = label_tiles;
+        self.map_tiles.restore_base_tiles(tiles_owned);
+        if any_city_labels {
+            self.map_tiles.restore_label_tiles(label_tiles);
         }
 
         actions
@@ -1474,13 +1433,8 @@ impl Gui {
         for pane in &mut self.panes {
             pane.clear_radar_image();
         }
-        self.tiles_light = None;
-        self.tiles_dark = None;
-        self.label_tiles_light = None;
-        self.label_tiles_dark = None;
+        self.map_tiles.clear();
         self.loading_site = None;
-        // Reset theme tracking to force tile recreation on next render
-        self.current_theme_is_dark = !self.current_theme_is_dark;
     }
 
     #[cfg(not(target_os = "android"))]
