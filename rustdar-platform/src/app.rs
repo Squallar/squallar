@@ -293,7 +293,6 @@ impl App {
         while let Ok(new_theme) = self.theme_receiver.try_recv() {
             if self.cached_dark_theme != Some(new_theme) {
                 self.cached_dark_theme = Some(new_theme);
-                // Theme changed, request redraw
                 if let Some(window) = self.window.as_ref() {
                     window.request_redraw();
                 }
@@ -303,7 +302,6 @@ impl App {
         // Check for GPS location updates (Android only)
         #[cfg(target_os = "android")]
         if let Some(ref receiver) = self.location_receiver {
-            // Drain all pending updates, keep only the latest
             let mut latest = None;
             while let Ok(loc) = receiver.try_recv() {
                 latest = Some(loc);
@@ -313,7 +311,61 @@ impl App {
             }
         }
 
-        // Check for received scan data (with generation check to discard stale results)
+        self.poll_data_channels();
+
+        // Attempt to handle minimizing window
+        if let Some(window) = self.window.as_ref()
+            && let Some(min) = window.is_minimized()
+            && min
+        {
+            log::debug!("Window is minimized");
+            return;
+        }
+
+        // Lazily initialize rendering state on first redraw after window creation.
+        if self.state.is_none() && self.window.is_some() {
+            let new_state = self.window.as_ref().map(|window| {
+                let size = window.inner_size();
+                pollster::block_on(Self::initialize_rendering_state(
+                    &self.instance,
+                    window,
+                    size.width.max(1),
+                    size.height.max(1),
+                ))
+            });
+            if let Some(state) = new_state {
+                self.state = Some(state);
+                self.restore_cached_render();
+            }
+        }
+
+        if self.state.is_none() || self.window.is_none() {
+            return;
+        }
+
+        // Setup egui and get GUI actions
+        let (screen_descriptor, gui_actions) = self.setup_egui_frame();
+
+        // Present the frame
+        self.present_frame(screen_descriptor);
+
+        // Handle GUI actions
+        for action in gui_actions {
+            log::info!("GUI action received: {}", action);
+            self.handle_gui_action(action, None);
+        }
+
+        // Request redraw only when there is pending background work or auto-poll is active
+        if self.pane_render.iter().any(|prs| prs.render_in_flight) || self.gui.is_auto_poll_active() {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
+    /// Poll all data channels for completed async results (scan, overlays).
+    fn poll_data_channels(&mut self) {
+        // Check for received scan data (with generation check)
         if let Ok((generation, result)) = self.scan_receiver.try_recv() {
             if generation < self.fetch_generation {
                 log::info!("Discarding stale scan result (gen {} < current {})", generation, self.fetch_generation);
@@ -325,15 +377,12 @@ impl App {
                         self.scan_data = Some(Arc::new(data));
                         self.gui.set_scan_info(scan_info);
                         self.gui.set_loading_site(None);
-                        // Invalidate last render so new data triggers a re-render
                         for prs in &mut self.pane_render {
                             prs.last_rendered = None;
                             prs.cached_render = None;
                             prs.render_in_flight = false;
                         }
-                        // Increment render generation so any in-flight renders are discarded
                         self.render_generation += 1;
-                        // Clear stale Level III data and fetch fresh products
                         self.level3_data.clear();
                         self.spawn_level3_fetches(&site, timestamp);
                         log::info!("Scan data loaded and UI updated");
@@ -368,90 +417,31 @@ impl App {
         }
 
         // Check for received NWS alerts data
-        {
-            if let Ok(result) = self.alert_receiver.try_recv() {
-                match result {
-                    Ok(alerts) => {
-                        log::info!("Received {} NWS alerts", alerts.len());
-                        self.gui.set_nws_alerts(alerts);
-                    }
-                    Err(e) => {
-                        log::error!("NWS alerts fetch failed: {}", e);
-                    }
+        if let Ok(result) = self.alert_receiver.try_recv() {
+            match result {
+                Ok(alerts) => {
+                    log::info!("Received {} NWS alerts", alerts.len());
+                    self.gui.set_nws_alerts(alerts);
                 }
-                self.gui.set_nws_fetching(false);
+                Err(e) => {
+                    log::error!("NWS alerts fetch failed: {}", e);
+                }
             }
+            self.gui.set_nws_fetching(false);
         }
 
         // Check for received SPC Mesoscale Discussion data
-        {
-            if let Ok(result) = self.discussion_receiver.try_recv() {
-                match result {
-                    Ok(discussions) => {
-                        log::info!("Received {} SPC Mesoscale Discussions", discussions.len());
-                        self.gui.set_spc_discussions(discussions);
-                    }
-                    Err(e) => {
-                        log::error!("SPC MD fetch failed: {}", e);
-                    }
+        if let Ok(result) = self.discussion_receiver.try_recv() {
+            match result {
+                Ok(discussions) => {
+                    log::info!("Received {} SPC Mesoscale Discussions", discussions.len());
+                    self.gui.set_spc_discussions(discussions);
                 }
-                self.gui.set_spc_md_fetching(false);
+                Err(e) => {
+                    log::error!("SPC MD fetch failed: {}", e);
+                }
             }
-        }
-
-        // Attempt to handle minimizing window
-        if let Some(window) = self.window.as_ref()
-            && let Some(min) = window.is_minimized()
-            && min
-        {
-            log::debug!("Window is minimized");
-            return;
-        }
-
-        // Check if we have the necessary resources
-        // Lazily initialize rendering state on first redraw after window creation.
-        // This keeps resumed() non-blocking, preventing ANR on Android foldable devices
-        // during configuration changes (fold/unfold).
-        if self.state.is_none() && self.window.is_some() {
-            let new_state = self.window.as_ref().map(|window| {
-                let size = window.inner_size();
-                pollster::block_on(Self::initialize_rendering_state(
-                    &self.instance,
-                    window,
-                    size.width.max(1),
-                    size.height.max(1),
-                ))
-            });
-            if let Some(state) = new_state {
-                self.state = Some(state);
-
-                // Restore the radar texture from cache if available.
-                // This avoids a multi-second re-render after suspend/resume.
-                self.restore_cached_render();
-            }
-        }
-
-        if self.state.is_none() || self.window.is_none() {
-            return;
-        }
-
-        // Setup egui and get GUI actions
-        let (screen_descriptor, gui_actions) = self.setup_egui_frame();
-
-        // Present the frame
-        self.present_frame(screen_descriptor);
-
-        // Handle GUI actions - no event_loop access in redraw, so exit via std::process::exit
-        for action in gui_actions {
-            log::info!("GUI action received: {}", action);
-            self.handle_gui_action(action, None);
-        }
-
-        // Request redraw only when there is pending background work or auto-poll is active
-        if self.pane_render.iter().any(|prs| prs.render_in_flight) || self.gui.is_auto_poll_active() {
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
+            self.gui.set_spc_md_fetching(false);
         }
     }
 
@@ -462,59 +452,66 @@ impl App {
     /// - OS display scaling (window.scale_factor())
     /// - Application scale factor (state.scale_factor)
     fn setup_egui_frame(&mut self) -> (ScreenDescriptor, Vec<GuiAction>) {
-        let state = self.state.as_mut().unwrap();
-        let window = self.window.as_ref().unwrap();
+        // Build screen descriptor, apply theme, and run the egui UI pass.
+        // Scoped so `state` is dropped before we call &mut self methods below.
+        let (screen_descriptor, gui_action) = {
+            let state = self.state.as_mut().unwrap();
+            let window = self.window.as_ref().unwrap();
 
-        // Calculate screen descriptor
-        let window_size = window.inner_size();
-        let css_to_canvas_scale_x = state.surface_config.width as f32 / window_size.width as f32;
-        let pixels_per_point =
-            window.scale_factor() as f32 * state.scale_factor * css_to_canvas_scale_x;
+            // Calculate screen descriptor
+            let window_size = window.inner_size();
+            let css_to_canvas_scale_x =
+                state.surface_config.width as f32 / window_size.width as f32;
+            let pixels_per_point =
+                window.scale_factor() as f32 * state.scale_factor * css_to_canvas_scale_x;
 
-        let screen_descriptor = ScreenDescriptor {
-            size_in_pixels: [state.surface_config.width, state.surface_config.height],
-            pixels_per_point,
-        };
+            let screen_descriptor = ScreenDescriptor {
+                size_in_pixels: [state.surface_config.width, state.surface_config.height],
+                pixels_per_point,
+            };
 
-        // Start egui frame
-        state.egui_renderer.begin_frame(window);
+            // Start egui frame
+            state.egui_renderer.begin_frame(window);
 
-        // Set theme based on OS preference
-        let detected_theme = window.theme();
-        let use_dark_theme = match detected_theme {
-            Some(theme) => {
-                // winit successfully detected the theme
-                matches!(theme, winit::window::Theme::Dark)
-            },
-            None => {
-                // winit couldn't detect theme - use cached value if available
-                // Otherwise detect using platform-specific methods and cache it
-                match self.cached_dark_theme {
-                    Some(cached) => cached,
-                    None => {
-                        let detected = Self::detect_system_dark_theme();
-                        self.cached_dark_theme = Some(detected);
-                        detected
+            // Set theme based on OS preference
+            let detected_theme = window.theme();
+            let use_dark_theme = match detected_theme {
+                Some(theme) => {
+                    // winit successfully detected the theme
+                    matches!(theme, winit::window::Theme::Dark)
+                },
+                None => {
+                    // winit couldn't detect theme - use cached value if available
+                    // Otherwise detect using platform-specific methods and cache it
+                    match self.cached_dark_theme {
+                        Some(cached) => cached,
+                        None => {
+                            let detected = Self::detect_system_dark_theme();
+                            self.cached_dark_theme = Some(detected);
+                            detected
+                        }
                     }
                 }
-            }
-        };
-        
-        // Only update egui visuals when the theme actually changes
-        if self.applied_visuals_dark != Some(use_dark_theme) {
-            self.applied_visuals_dark = Some(use_dark_theme);
-            let visuals = if use_dark_theme {
-                egui::Visuals::dark()
-            } else {
-                egui::Visuals::light()
             };
-            state
-                .egui_renderer
-                .context()
-                .set_visuals(visuals);
-        }
+            
+            // Only update egui visuals when the theme actually changes
+            if self.applied_visuals_dark != Some(use_dark_theme) {
+                self.applied_visuals_dark = Some(use_dark_theme);
+                let visuals = if use_dark_theme {
+                    egui::Visuals::dark()
+                } else {
+                    egui::Visuals::light()
+                };
+                state
+                    .egui_renderer
+                    .context()
+                    .set_visuals(visuals);
+            }
 
-        let gui_action = self.gui.ui(state.egui_renderer.context());
+            let gui_action = self.gui.ui(state.egui_renderer.context());
+
+            (screen_descriptor, gui_action)
+        };
 
         // Clean up old textures from previous frame
         // This allows the GPU to finish using them before we drop them
@@ -525,7 +522,16 @@ impl App {
             self.pane_render.push(PaneRenderState::new());
         }
 
-        // Poll for completed background render results (with generation check)
+        self.poll_render_results();
+        self.poll_level3_results();
+        self.dispatch_pane_renders();
+
+        (screen_descriptor, gui_action)
+    }
+
+    /// Poll for completed background render results and upload textures.
+    fn poll_render_results(&mut self) {
+        let ctx = self.state.as_ref().unwrap().egui_renderer.context();
         while let Ok((image_data, max_range_km, value_data, product, elevation, generation, pane_idx)) =
             self.render_result_receiver.try_recv()
         {
@@ -544,7 +550,6 @@ impl App {
                 }
 
                 self.texture_counter += 1;
-                let ctx = state.egui_renderer.context();
                 let color_image =
                     egui::ColorImage::from_rgba_unmultiplied([1800, 1800], &image_data);
                 let texture_name = format!("radar_image_{}", self.texture_counter);
@@ -577,8 +582,10 @@ impl App {
                 self.pane_render[pane_idx].last_rendered = Some((product, elevation));
             }
         }
+    }
 
-        // Poll for completed Level III fetch results
+    /// Poll for completed Level III fetch results and update scan info.
+    fn poll_level3_results(&mut self) {
         if let Ok((generation, product, tilt_code, result)) = self.level3_receiver.try_recv() {
             if generation < self.fetch_generation {
                 log::info!("Discarding stale Level III result (gen {} < current {})", generation, self.fetch_generation);
@@ -636,8 +643,10 @@ impl App {
                 }
             }
         }
+    }
 
-        // Check all panes for needed background renders
+    /// Check all panes for needed background renders and spawn render threads.
+    fn dispatch_pane_renders(&mut self) {
         for pane_idx in 0..self.gui.pane_count() {
             if let Some((product, elevation)) = self.gui.get_rendering_params_for_pane(pane_idx) {
                 let prs = &self.pane_render[pane_idx];
@@ -778,8 +787,6 @@ impl App {
                 self.pane_render[pane_idx].last_rendered = None;
             }
         }
-
-        (screen_descriptor, gui_action)
     }
 
     /// Restore the radar image from cached raw RGBA data.
