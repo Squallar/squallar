@@ -669,8 +669,8 @@ impl App {
                 && self.gui.get_rendering_params_for_pane(pane_idx).is_some()
             {
                 // Save the old texture to be cleaned up after this frame completes
-                if let Some((old_texture, _, _, _, _)) = self.gui.take_radar_image_for_pane(pane_idx) {
-                    self.old_textures.push(old_texture);
+                if let Some(old_img) = self.gui.take_radar_image_for_pane(pane_idx) {
+                    self.old_textures.push(old_img.texture);
                 }
 
                 self.texture_counter += 1;

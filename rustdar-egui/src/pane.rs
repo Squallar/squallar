@@ -9,12 +9,22 @@ use walkers::MapMemory;
 /// Identifies a pane in the multi-pane layout.
 pub type PaneId = usize;
 
+/// Holds the radar image texture and its associated metadata.
+#[derive(Clone)]
+pub struct RadarImageData {
+    pub texture: egui::TextureHandle,
+    pub lat: f64,
+    pub lon: f64,
+    pub max_range_km: f64,
+    pub value_data: Arc<Vec<f32>>,
+}
+
 /// Per-pane state: each pane independently selects a radar product,
 /// elevation, layer toggles, and maintains its own map viewport.
 pub struct PaneState {
     pub selected_product: RadarProduct,
     pub selected_elevation: f32,
-    pub radar_image: Option<(egui::TextureHandle, f64, f64, f64, Arc<Vec<f32>>)>,
+    pub radar_image: Option<RadarImageData>,
     pub cached_image_bounds: Option<ImageBounds>,
     pub hover_value: Option<String>,
     pub last_hover_pos: Option<egui::Pos2>,
@@ -76,7 +86,13 @@ impl PaneState {
         max_range_km: f64,
         value_data: Vec<f32>,
     ) {
-        self.radar_image = Some((texture, lat, lon, max_range_km, Arc::new(value_data)));
+        self.radar_image = Some(RadarImageData {
+            texture,
+            lat,
+            lon,
+            max_range_km,
+            value_data: Arc::new(value_data),
+        });
         self.cached_image_bounds = Some(ImageBounds::from_radar_site(lat, lon));
     }
 
@@ -87,9 +103,7 @@ impl PaneState {
     }
 
     /// Take the radar image, removing it from this pane.
-    pub fn take_radar_image(
-        &mut self,
-    ) -> Option<(egui::TextureHandle, f64, f64, f64, Arc<Vec<f32>>)> {
+    pub fn take_radar_image(&mut self) -> Option<RadarImageData> {
         self.radar_image.take()
     }
 }

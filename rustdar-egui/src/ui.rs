@@ -4,7 +4,7 @@ use crate::overlay_cache::{
     CachedFeature, OverlayLayerCache, ViewportKey,
     build_cached_features, draw_cached_features,
 };
-use crate::pane::{PaneId, PaneLayout, PaneState, MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
+use crate::pane::{PaneId, PaneLayout, PaneState, RadarImageData, MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
 use chrono::Timelike;
 use egui::Context;
 use std::collections::{HashMap, HashSet};
@@ -762,11 +762,11 @@ impl Gui {
 
                             // Overlay radar data if available
                             if pane.layers.is_enabled(LayerKind::Radar) {
-                            if let Some((ref texture, lat, lon, _max_range_km, ref value_data)) =
+                            if let Some(ref img) =
                                 radar_image
                             {
                                 let bounds = pane.cached_image_bounds
-                                    .unwrap_or_else(|| ImageBounds::from_radar_site(lat, lon));
+                                    .unwrap_or_else(|| ImageBounds::from_radar_site(img.lat, img.lon));
 
                                 let nw = projector.project(walkers::lat_lon(bounds.max_lat, bounds.min_lon)).to_pos2();
                                 let se = projector.project(walkers::lat_lon(bounds.min_lat, bounds.max_lon)).to_pos2();
@@ -786,8 +786,8 @@ impl Gui {
                                         let hover_lat = map_pos.y();
                                         let hover_lon = map_pos.x();
 
-                                        let lat1 = lat.to_radians();
-                                        let lon1 = lon.to_radians();
+                                        let lat1 = img.lat.to_radians();
+                                        let lon1 = img.lon.to_radians();
                                         let lat2 = hover_lat.to_radians();
                                         let lon2 = hover_lon.to_radians();
                                         let dlat = lat2 - lat1;
@@ -814,8 +814,8 @@ impl Gui {
                                             && py < IMAGE_SIZE as i32
                                         {
                                             let pixel_idx = py as usize * IMAGE_SIZE + px as usize;
-                                            if pixel_idx < value_data.len() {
-                                                let value = value_data[pixel_idx];
+                                            if pixel_idx < img.value_data.len() {
+                                                let value = img.value_data[pixel_idx];
                                                 if !value.is_nan() {
                                                     let product = pane.selected_product;
                                                     value_str = match product {
@@ -897,7 +897,7 @@ impl Gui {
 
                                 // Draw the radar image overlay
                                 ui.painter().image(
-                                    texture.id(),
+                                    img.texture.id(),
                                     rect,
                                     egui::Rect::from_min_max(
                                         egui::pos2(0.0, 0.0),
@@ -907,9 +907,9 @@ impl Gui {
                                 );
 
                                 // Draw a light grey circle showing the radar range
-                                let radar_center = projector.project(walkers::lat_lon(lat, lon)).to_pos2();
+                                let radar_center = projector.project(walkers::lat_lon(img.lat, img.lon)).to_pos2();
                                 let north_edge = projector.project(
-                                    walkers::lat_lon(lat + MAX_RANGE_KM / 111.32, lon)
+                                    walkers::lat_lon(img.lat + MAX_RANGE_KM / 111.32, img.lon)
                                 ).to_pos2();
                                 let range_radius_pixels = (radar_center.y - north_edge.y).abs();
                                 ui.painter().circle_stroke(
@@ -1605,17 +1605,17 @@ impl Gui {
     }
 
     /// Get the active pane's radar image.
-    pub fn get_radar_image(&self) -> &Option<(egui::TextureHandle, f64, f64, f64, Arc<Vec<f32>>)> {
+    pub fn get_radar_image(&self) -> &Option<RadarImageData> {
         &self.panes[self.active_pane].radar_image
     }
 
     /// Take the radar image from the active pane.
-    pub fn take_radar_image(&mut self) -> Option<(egui::TextureHandle, f64, f64, f64, Arc<Vec<f32>>)> {
+    pub fn take_radar_image(&mut self) -> Option<RadarImageData> {
         self.panes[self.active_pane].take_radar_image()
     }
 
     /// Take the radar image from a specific pane.
-    pub fn take_radar_image_for_pane(&mut self, pane_idx: PaneId) -> Option<(egui::TextureHandle, f64, f64, f64, Arc<Vec<f32>>)> {
+    pub fn take_radar_image_for_pane(&mut self, pane_idx: PaneId) -> Option<RadarImageData> {
         self.panes.get_mut(pane_idx).and_then(|p| p.take_radar_image())
     }
 
