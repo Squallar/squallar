@@ -63,6 +63,7 @@ impl super::App {
         self.poll_loop_scan_list_results();
         self.poll_loop_scan_download_results();
         self.poll_loop_render_results();
+        self.advance_loop_playback();
         self.dispatch_pane_renders();
         self.dispatch_loop_renders();
 
@@ -471,6 +472,41 @@ impl super::App {
                     max_range_km: rr.max_range_km,
                     value_data: Arc::new(rr.value_data),
                 });
+            }
+        }
+    }
+
+    /// Advance loop playback for all panes with active playing loops.
+    fn advance_loop_playback(&mut self) {
+        let now = std::time::Instant::now();
+        let interval = std::time::Duration::from_secs_f32(1.0 / self.gui.loop_speed_fps);
+
+        for pane_idx in 0..self.gui.pane_count() {
+            let Some(pane) = self.gui.pane_mut(pane_idx) else {
+                continue;
+            };
+            let Some(ls) = &mut pane.loop_state else {
+                continue;
+            };
+            if !ls.playing || ls.frames.is_empty() {
+                continue;
+            }
+
+            let should_advance = ls.last_advance
+                .map(|last| now.duration_since(last) >= interval)
+                .unwrap_or(true);
+
+            if should_advance {
+                ls.last_advance = Some(now);
+                // Skip to the next frame that has a rendered texture
+                let num_frames = ls.frames.len();
+                for offset in 1..=num_frames {
+                    let candidate = (ls.current_frame + offset) % num_frames;
+                    if ls.frames[candidate].texture.is_some() {
+                        ls.current_frame = candidate;
+                        break;
+                    }
+                }
             }
         }
     }
