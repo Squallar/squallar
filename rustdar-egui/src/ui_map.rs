@@ -322,7 +322,7 @@ pub(super) fn compute_hover_info(
         if pixel_idx < img.value_data.len() {
             let value = img.value_data[pixel_idx];
             if !value.is_nan() {
-                value_str = product.format_value(value);
+                value_str = format!("| {}", product.format_value(value));
             }
         }
     }
