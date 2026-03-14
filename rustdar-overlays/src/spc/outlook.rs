@@ -272,7 +272,7 @@ pub fn parse_geojson(
         // Simplify SPC outlook polygons at fetch time to reduce vertex
         // counts for rendering. SPC GeoJSON can have very detailed coastline
         // geometry that is expensive for triangulation.
-        crate::types::simplify_polygons(&mut polygons, 0.005);
+        crate::types::simplify_polygons(&mut polygons, crate::types::SIMPLIFY_EPSILON);
         if polygons.is_empty() {
             continue;
         }

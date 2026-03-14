@@ -1,3 +1,8 @@
+/// Default epsilon (degrees) for Ramer-Douglas-Peucker polygon simplification.
+/// ~0.005° ≈ 500 m — keeps shapes visually accurate at typical map zoom levels
+/// while significantly reducing vertex counts.
+pub const SIMPLIFY_EPSILON: f64 = 0.005;
+
 /// A single polygon ring: a sequence of (latitude, longitude) points.
 /// The first ring is the exterior, subsequent rings are holes.
 pub type GeoPolygonRing = Vec<(f64, f64)>;
