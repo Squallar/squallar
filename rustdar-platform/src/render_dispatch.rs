@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nexrad_level3::model::Level3Message;
 use rustdar_radar::render::{render_level3_message_to_image, render_radar_to_image};
@@ -7,6 +8,17 @@ use rustdar_radar::types::RadarProduct;
 
 use crate::WindowRef;
 use crate::channels::RenderResponse;
+use crate::constants::MAX_CONCURRENT_RENDERS;
+
+/// Drop guard that decrements an AtomicUsize counter on drop.
+/// Guarantees the counter is decremented even if the thread panics.
+pub(crate) struct RenderGuard(pub(crate) Arc<AtomicUsize>);
+
+impl Drop for RenderGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Per-pane render tracking state.
 pub struct PaneRenderState {
@@ -42,15 +54,18 @@ pub struct RenderDispatcher {
     pub render_generation: u64,
     /// Generation counter to discard stale fetch results from older requests.
     pub fetch_generation: u64,
+    /// Shared counter for concurrent background render threads.
+    pub renders_in_flight: Arc<AtomicUsize>,
 }
 
 impl RenderDispatcher {
-    pub fn new() -> Self {
+    pub fn new(renders_in_flight: Arc<AtomicUsize>) -> Self {
         Self {
             pane_render: vec![PaneRenderState::new()],
             level3_data: HashMap::new(),
             render_generation: 0,
             fetch_generation: 0,
+            renders_in_flight,
         }
     }
 
@@ -172,8 +187,17 @@ impl RenderDispatcher {
         window: Option<WindowRef>,
         render_fn: impl FnOnce() -> Option<(Vec<u8>, f64, Vec<f32>)> + Send + 'static,
     ) {
+        // Check concurrent render limit
+        let current = self.renders_in_flight.load(Ordering::Relaxed);
+        if current >= MAX_CONCURRENT_RENDERS {
+            return;
+        }
+        self.renders_in_flight.fetch_add(1, Ordering::Relaxed);
+        let guard = RenderGuard(Arc::clone(&self.renders_in_flight));
+
         let generation = self.render_generation;
         std::thread::spawn(move || {
+            let _guard = guard;
             if let Some((image, range, values)) = render_fn() {
                 let _ = sender.send(RenderResponse {
                     image_data: image,

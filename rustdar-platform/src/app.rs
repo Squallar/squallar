@@ -1,5 +1,6 @@
 use egui_wgpu::wgpu;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
@@ -63,6 +64,12 @@ pub struct App {
     http_client: reqwest::Client,
     // Downloaded scan data cache for loop frames, keyed by (pane_idx, timestamp).
     loop_scan_cache: std::collections::HashMap<usize, std::collections::HashMap<chrono::NaiveDateTime, Arc<nexrad_model::data::Scan>>>,
+    // Pending loop scan downloads per pane, waiting to be dispatched (throttled).
+    loop_pending_downloads: std::collections::HashMap<usize, Vec<(chrono::NaiveDateTime, nexrad_data::aws::archive::Identifier)>>,
+    // Number of loop scan downloads currently in flight per pane.
+    loop_downloads_in_flight: std::collections::HashMap<usize, usize>,
+    // Shared counter for background render threads in flight (loop + static renders).
+    renders_in_flight: Arc<AtomicUsize>,
     // Cached latest scan from auto-poll while viewing historic data.
     latest_cached_scan: Option<(Arc<nexrad_model::data::Scan>, ScanInfo, String, chrono::NaiveDateTime)>,
     // Set when a manual time navigation fetch is pending; triggers loop reinit after scan loads.
@@ -80,7 +87,8 @@ impl App {
         let instance = egui_wgpu::wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let input = InputHandler::new();
         let channels = ChannelHub::new();
-        let render = RenderDispatcher::new();
+        let renders_in_flight = Arc::new(AtomicUsize::new(0));
+        let render = RenderDispatcher::new(Arc::clone(&renders_in_flight));
         let platform = Box::new(platform::create_platform());
 
         let tokio_runtime = tokio::runtime::Runtime::new()
@@ -114,6 +122,9 @@ impl App {
             http_client,
             tokio_runtime,
             loop_scan_cache: std::collections::HashMap::new(),
+            loop_pending_downloads: std::collections::HashMap::new(),
+            loop_downloads_in_flight: std::collections::HashMap::new(),
+            renders_in_flight: Arc::new(AtomicUsize::new(0)),
             latest_cached_scan: None,
             manual_nav_pending: false,
         }

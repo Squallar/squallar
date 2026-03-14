@@ -89,8 +89,8 @@ pub struct LoopScanDownloadResponse {
     pub pane_idx: usize,
     /// UTC timestamp of the downloaded scan.
     pub timestamp: NaiveDateTime,
-    /// The decoded scan data.
-    pub scan: Arc<Scan>,
+    /// The decoded scan data, or `None` if the download failed.
+    pub scan: Option<Arc<Scan>>,
 }
 
 /// Result from rendering a single loop frame.

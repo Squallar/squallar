@@ -1,8 +1,11 @@
 use chrono::NaiveDateTime;
 use chrono::TimeZone;
+use std::sync::atomic::Ordering;
 use winit::event_loop::ActiveEventLoop;
 use rustdar_egui::actions::{GuiAction, OverlayRenderKind};
 use crate::channels::{ScanResponse, ScanData, Level3Response, OutlookResponse, OverlayType, OverlayRenderResponse};
+use crate::constants::MAX_CONCURRENT_RENDERS;
+use crate::render_dispatch::RenderGuard;
 use rustdar_radar::types::RadarProduct;
 use rustdar_radar::scan;
 
@@ -434,8 +437,10 @@ impl super::App {
         let site_lon = scan_info.site.lon;
         let scan_timestamp = scan_info.timestamp;
 
-        // Clear old cached scans for this pane
+        // Clear old cached scans and pending downloads for this pane
         self.loop_scan_cache.remove(&pane_idx);
+        self.loop_pending_downloads.remove(&pane_idx);
+        self.loop_downloads_in_flight.remove(&pane_idx);
 
         // Initialize loop state on the pane
         if let Some(pane) = self.gui.pane_mut(pane_idx) {
@@ -484,6 +489,9 @@ impl super::App {
         if let Some(pane) = self.gui.pane_mut(pane_idx) {
             pane.loop_state = None;
         }
+        self.loop_scan_cache.remove(&pane_idx);
+        self.loop_pending_downloads.remove(&pane_idx);
+        self.loop_downloads_in_flight.remove(&pane_idx);
     }
 
     /// Navigate by a relative time step (seconds). Positive = forward, negative = backward.
@@ -596,18 +604,18 @@ impl super::App {
         let sender = self.channels.loop_scan_download_sender.clone();
         let window = self.window.clone();
         self.tokio_runtime.spawn(async move {
-            match scan::download_scan(identifier).await {
-                Ok(scan_data) => {
-                    let _ = sender.send(crate::channels::LoopScanDownloadResponse {
-                        pane_idx,
-                        timestamp,
-                        scan: std::sync::Arc::new(scan_data),
-                    });
-                }
+            let scan = match scan::download_scan(identifier).await {
+                Ok(scan_data) => Some(std::sync::Arc::new(scan_data)),
                 Err(e) => {
                     log::error!("Loop scan download failed for pane {} @ {}: {:?}", pane_idx, timestamp, e);
+                    None
                 }
-            }
+            };
+            let _ = sender.send(crate::channels::LoopScanDownloadResponse {
+                pane_idx,
+                timestamp,
+                scan,
+            });
             super::notify_redraw(&window);
         });
     }
@@ -623,9 +631,18 @@ impl super::App {
         lat: f64,
         lon: f64,
     ) {
+        // Check concurrent render limit (shared with static pane renders)
+        let current = self.renders_in_flight.load(Ordering::Relaxed);
+        if current >= MAX_CONCURRENT_RENDERS {
+            return;
+        }
+        self.renders_in_flight.fetch_add(1, Ordering::Relaxed);
+        let guard = RenderGuard(std::sync::Arc::clone(&self.renders_in_flight));
+
         let sender = self.channels.loop_render_sender.clone();
         let window = self.window.clone();
         std::thread::spawn(move || {
+            let _guard = guard;
             match rustdar_radar::render::render_radar_to_image(&scan_data, elevation, product, lat, lon)
             {
                 Some((image, range, values)) => {

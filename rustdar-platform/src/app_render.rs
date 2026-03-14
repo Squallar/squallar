@@ -1,6 +1,8 @@
 use egui_wgpu::{ScreenDescriptor, wgpu};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use rustdar_egui::actions::GuiAction;
+use crate::constants::{MAX_CONCURRENT_RENDERS, MAX_LOOP_RENDER_BUDGET, MAX_CONCURRENT_LOOP_DOWNLOADS};
 
 impl super::App {
     /// Create screen descriptor and setup egui frame.
@@ -389,7 +391,7 @@ impl super::App {
     }
 
     /// Poll for loop scan listing results. Populates the pane's frame list
-    /// and kicks off downloads for each scan.
+    /// and kicks off downloads for each scan (throttled).
     fn poll_loop_scan_list_results(&mut self) {
         while let Ok(resp) = self.channels.loop_scan_list_receiver.try_recv() {
             let Some(pane) = self.gui.pane_mut(resp.pane_idx) else {
@@ -417,22 +419,58 @@ impl super::App {
 
             log::info!("Loop: populated {} frames for pane {}", resp.scans.len(), resp.pane_idx);
 
-            // Start downloading scans — we'll download all in parallel
-            for (ts, id) in resp.scans {
-                self.spawn_loop_scan_download(resp.pane_idx, ts, id);
-            }
+            // Store all scans as pending downloads and dispatch the first batch
+            self.loop_pending_downloads.insert(resp.pane_idx, resp.scans);
+            self.loop_downloads_in_flight.insert(resp.pane_idx, 0);
+            self.dispatch_pending_loop_downloads(resp.pane_idx);
         }
     }
 
     /// Poll for completed loop scan downloads. When a scan arrives, store it
-    /// in the loop_scan_cache and trigger a render if the frame needs one.
+    /// in the loop_scan_cache and dispatch the next pending download.
     fn poll_loop_scan_download_results(&mut self) {
+        let mut pane_completions: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
         while let Ok(resp) = self.channels.loop_scan_download_receiver.try_recv() {
-            // Cache the downloaded scan for rendering
-            self.loop_scan_cache
-                .entry(resp.pane_idx)
-                .or_default()
-                .insert(resp.timestamp, resp.scan);
+            // Cache the downloaded scan for rendering (skip failures)
+            if let Some(scan) = resp.scan {
+                self.loop_scan_cache
+                    .entry(resp.pane_idx)
+                    .or_default()
+                    .insert(resp.timestamp, scan);
+            }
+
+            // Track per-pane completion count for download throttling
+            *pane_completions.entry(resp.pane_idx).or_insert(0) += 1;
+        }
+        // Dispatch next pending downloads for panes that had completions
+        for (pane_idx, completed) in pane_completions {
+            if let Some(count) = self.loop_downloads_in_flight.get_mut(&pane_idx) {
+                *count = count.saturating_sub(completed);
+            }
+            self.dispatch_pending_loop_downloads(pane_idx);
+        }
+    }
+
+    /// Dispatch pending loop scan downloads up to the concurrency limit.
+    fn dispatch_pending_loop_downloads(&mut self, pane_idx: usize) {
+        let in_flight = *self.loop_downloads_in_flight.get(&pane_idx).unwrap_or(&0);
+        let slots = MAX_CONCURRENT_LOOP_DOWNLOADS.saturating_sub(in_flight);
+        if slots == 0 {
+            return;
+        }
+
+        let Some(pending) = self.loop_pending_downloads.get_mut(&pane_idx) else {
+            return;
+        };
+        let batch: Vec<_> = pending.drain(..slots.min(pending.len())).collect();
+        let spawned = batch.len();
+
+        for (ts, id) in batch {
+            self.spawn_loop_scan_download(pane_idx, ts, id);
+        }
+
+        if spawned > 0 {
+            *self.loop_downloads_in_flight.entry(pane_idx).or_insert(0) += spawned;
         }
     }
 
@@ -440,7 +478,10 @@ impl super::App {
     fn poll_loop_render_results(&mut self) {
         let ctx = self.state.as_ref().unwrap().egui_renderer.context();
         while let Ok(rr) = self.channels.loop_render_receiver.try_recv() {
-            let Some(pane) = self.gui.pane_mut(rr.pane_idx) else {
+            let pane_idx = rr.pane_idx;
+            let timestamp = rr.timestamp;
+
+            let Some(pane) = self.gui.pane_mut(pane_idx) else {
                 continue;
             };
             let Some(ls) = &mut pane.loop_state else {
@@ -479,6 +520,11 @@ impl super::App {
                 max_range_km: rr.max_range_km,
                 value_data: Arc::new(rr.value_data),
             });
+
+            // Free scan data from cache — no longer needed once texture is rendered
+            if let Some(cache) = self.loop_scan_cache.get_mut(&pane_idx) {
+                cache.remove(&timestamp);
+            }
         }
     }
 
@@ -541,7 +587,7 @@ impl super::App {
             let elevation = pane.selected_elevation;
 
             let num_frames = ls.frames.len();
-            let budget = num_frames.min(30);
+            let budget = num_frames.min(MAX_LOOP_RENDER_BUDGET);
             let current = ls.current_frame;
 
             let mut indices = Vec::with_capacity(budget);
@@ -579,8 +625,14 @@ impl super::App {
             }
         }
 
-        // Now mark in-flight and spawn renders
+        // Now mark in-flight and spawn renders, respecting concurrent limit
         for (pane_idx, frame_idx, ts, product, elevation, lat, lon) in to_render {
+            // Check concurrent render limit before each spawn
+            let current = self.renders_in_flight.load(Ordering::Relaxed);
+            if current >= MAX_CONCURRENT_RENDERS {
+                break;
+            }
+
             let scan_arc = {
                 let cache = self.loop_scan_cache.get(&pane_idx).unwrap();
                 Arc::clone(cache.get(&ts).unwrap())
