@@ -83,6 +83,7 @@ impl AutoPollState {
     }
 
     /// Seconds remaining until the next poll, if a timer is running.
+    #[cfg(not(target_os = "android"))]
     pub fn time_until_next(&self) -> Option<u64> {
         self.last_fetch_time.map(|t| {
             self.interval_secs.saturating_sub(t.elapsed().as_secs())

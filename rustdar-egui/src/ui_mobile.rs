@@ -1,7 +1,6 @@
 #![cfg(target_os = "android")]
 
 use crate::actions::GuiAction;
-use crate::pane::PaneState;
 
 /// Maximum time (seconds) between first tap release and second press
 /// for it to count as a double-tap.
@@ -22,7 +21,7 @@ const ZOOM_DRAG_SENSITIVITY: f32 = 150.0;
 /// 2. Within [`DOUBLE_TAP_TIMEOUT_S`], press down again and hold
 /// 3. Drag vertically: up = zoom in, down = zoom out
 #[derive(Clone)]
-pub(super) struct DoubleTapDragDetector {
+pub(crate) struct DoubleTapDragDetector {
     /// Time of the last completed tap (short press-release)
     last_tap_time: Option<f64>,
     /// Screen position of the last completed tap
