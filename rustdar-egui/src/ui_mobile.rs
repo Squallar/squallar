@@ -331,39 +331,40 @@ impl super::Gui {
         let map_actions = self.render_map(ctx);
         actions.extend(map_actions);
 
-        // Overlay detail pager popup (rendered after map so it floats on top)
-        self.render_overlay_popup(ctx);
-
-        // Floating hamburger button to open the menu (drawn last so it's on top)
+        // Floating hamburger button (uses Area so it participates in focus ordering
+        // and popup windows can layer above it)
         if !self.mobile.show_menu {
             let top_inset = self.safe_area_insets.0;
-            let btn_rect = egui::Rect::from_min_size(
-                egui::pos2(12.0, 48.0 + top_inset),
-                egui::vec2(48.0, 48.0),
-            );
-            let response = ctx.input(|i| i.pointer.any_click()
-                && i.pointer.interact_pos().map_or(false, |p| btn_rect.contains(p)));
-            let painter = ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                egui::Id::new("mobile_hamburger"),
-            ));
-            let bg_color = if ctx.style().visuals.dark_mode {
-                egui::Color32::from_rgba_unmultiplied(40, 40, 40, 220)
-            } else {
-                egui::Color32::from_rgba_unmultiplied(240, 240, 240, 230)
-            };
-            painter.rect_filled(btn_rect, 8.0, bg_color);
-            painter.text(
-                btn_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "\u{2630}",
-                egui::FontId::proportional(26.0),
-                ctx.style().visuals.text_color(),
-            );
-            if response {
-                self.mobile.show_menu = true;
-            }
+            egui::Area::new(egui::Id::new("mobile_hamburger"))
+                .order(egui::Order::Middle)
+                .fixed_pos(egui::pos2(12.0, 48.0 + top_inset))
+                .interactable(true)
+                .show(ctx, |ui| {
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(48.0, 48.0),
+                        egui::Sense::click(),
+                    );
+                    let bg_color = if ui.style().visuals.dark_mode {
+                        egui::Color32::from_rgba_unmultiplied(40, 40, 40, 220)
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(240, 240, 240, 230)
+                    };
+                    ui.painter().rect_filled(rect, 8.0, bg_color);
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "\u{2630}",
+                        egui::FontId::proportional(26.0),
+                        ui.style().visuals.text_color(),
+                    );
+                    if response.clicked() {
+                        self.mobile.show_menu = true;
+                    }
+                });
         }
+
+        // Overlay detail pager popup (rendered after hamburger so it floats on top)
+        self.render_overlay_popup(ctx);
     }
 
     fn render_mobile_status_bar(&mut self, ctx: &egui::Context) -> Option<GuiAction> {
