@@ -315,6 +315,7 @@ impl Gui {
                                 let datetime_str = format!("{} {}", self.time_dialog.date_string, self.time_dialog.time_string);
                                 if let Ok(timestamp) = chrono::NaiveDateTime::parse_from_str(&datetime_str, "%Y-%m-%d %H:%M:%S") {
                                     self.radar.config.timestamp = timestamp;
+                                    self.viewing_live = false;
                                     action = Some(GuiAction::FetchRadarScan(self.radar.config.clone()));
                                 }
                                 self.time_dialog.show = false;
