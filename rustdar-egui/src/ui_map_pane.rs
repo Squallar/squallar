@@ -80,14 +80,18 @@ pub(super) fn render_pane_map_content(
             &ctx.pane.nws_alert_texture,
         );
 
-        // Combine all clicked overlays into the pager list
+        // Combine all clicked overlays into the pager list (store stable IDs)
         if !clicked_mds.is_empty() || !clicked_alerts.is_empty() {
             let mut items: Vec<SelectedOverlay> = Vec::new();
             for idx in clicked_alerts {
-                items.push(SelectedOverlay::Alert(idx));
+                if let Some(alert) = ctx.overlays.nws_alerts.data.get(idx) {
+                    items.push(SelectedOverlay::Alert(alert.id.clone()));
+                }
             }
             for idx in clicked_mds {
-                items.push(SelectedOverlay::Discussion(idx));
+                if let Some(md) = ctx.overlays.spc_discussions.data.get(idx) {
+                    items.push(SelectedOverlay::Discussion(md.number));
+                }
             }
             ctx.overlays.selected_overlays = items;
             ctx.overlays.selected_overlay_page = 0;

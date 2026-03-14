@@ -51,10 +51,10 @@ impl<T> OverlayState<T> {
 /// Identifies a clicked overlay item for the detail popup pager.
 #[derive(Clone, Debug)]
 pub enum SelectedOverlay {
-    /// An NWS alert, identified by its index in `nws_alerts.data`.
-    Alert(usize),
-    /// An SPC Mesoscale Discussion, identified by its index in `spc_discussions.data`.
-    Discussion(usize),
+    /// An NWS alert, identified by its stable API ID string.
+    Alert(String),
+    /// An SPC Mesoscale Discussion, identified by its stable MD number.
+    Discussion(u32),
 }
 
 /// All shared overlay state: SPC outlooks, NWS alerts, SPC discussions,
@@ -105,6 +105,14 @@ impl OverlayData {
     pub fn set_nws_alerts(&mut self, alerts: Vec<NwsAlert>) {
         let current_ids: HashSet<String> = alerts.iter().map(|a| a.id.clone()).collect();
         self.hidden_alerts.retain(|id| current_ids.contains(id));
+        // Discard stale popup selections whose IDs no longer exist
+        self.selected_overlays.retain(|sel| match sel {
+            SelectedOverlay::Alert(id) => current_ids.contains(id),
+            _ => true,
+        });
+        if self.selected_overlay_page >= self.selected_overlays.len().max(1) {
+            self.selected_overlay_page = 0;
+        }
         self.nws_alerts.set_data(alerts);
     }
 
@@ -115,6 +123,15 @@ impl OverlayData {
 
     /// Store fetched SPC Mesoscale Discussions, replacing the previous set.
     pub fn set_spc_discussions(&mut self, discussions: Vec<SpcDiscussion>) {
+        // Discard stale popup selections whose MD numbers no longer exist
+        let current_numbers: HashSet<u32> = discussions.iter().map(|d| d.number).collect();
+        self.selected_overlays.retain(|sel| match sel {
+            SelectedOverlay::Discussion(num) => current_numbers.contains(num),
+            _ => true,
+        });
+        if self.selected_overlay_page >= self.selected_overlays.len().max(1) {
+            self.selected_overlay_page = 0;
+        }
         self.spc_discussions.set_data(discussions);
     }
 

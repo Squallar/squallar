@@ -158,13 +158,19 @@ impl super::Gui {
         let current = self.overlays.selected_overlays[page].clone();
 
         match current {
-            SelectedOverlay::Alert(idx) => {
-                let Some(alert) = self.overlays.nws_alerts.data.get(idx) else {
-                    self.overlays.selected_overlays.clear();
+            SelectedOverlay::Alert(ref alert_id) => {
+                let Some(alert) = self.overlays.nws_alerts.data.iter().find(|a| a.id == *alert_id) else {
+                    // Alert no longer exists (expired or refreshed away)
+                    self.overlays.selected_overlays.remove(page);
+                    if self.overlays.selected_overlays.is_empty() {
+                        self.overlays.selected_overlay_page = 0;
+                    } else if self.overlays.selected_overlay_page >= self.overlays.selected_overlays.len() {
+                        self.overlays.selected_overlay_page = self.overlays.selected_overlays.len() - 1;
+                    }
                     return;
                 };
 
-                let alert_id = alert.id.clone();
+                let alert_id_owned = alert_id.clone();
                 let [r, g, b, _] = alert.features.first()
                     .map(|f| f.stroke_rgba)
                     .unwrap_or([200, 200, 200, 255]);
@@ -186,7 +192,7 @@ impl super::Gui {
                 );
 
                 if hide_clicked {
-                    self.overlays.hidden_alerts.insert(alert_id);
+                    self.overlays.hidden_alerts.insert(alert_id_owned);
                     self.overlays.nws_alerts.data_generation =
                         self.overlays.nws_alerts.data_generation.wrapping_add(1);
                     // Remove this alert from the pager
@@ -202,9 +208,15 @@ impl super::Gui {
                     self.overlays.selected_overlay_page = 0;
                 }
             }
-            SelectedOverlay::Discussion(idx) => {
-                let Some(md) = self.overlays.spc_discussions.data.get(idx) else {
-                    self.overlays.selected_overlays.clear();
+            SelectedOverlay::Discussion(md_number) => {
+                let Some(md) = self.overlays.spc_discussions.data.iter().find(|d| d.number == md_number) else {
+                    // MD no longer exists
+                    self.overlays.selected_overlays.remove(page);
+                    if self.overlays.selected_overlays.is_empty() {
+                        self.overlays.selected_overlay_page = 0;
+                    } else if self.overlays.selected_overlay_page >= self.overlays.selected_overlays.len() {
+                        self.overlays.selected_overlay_page = self.overlays.selected_overlays.len() - 1;
+                    }
                     return;
                 };
 
