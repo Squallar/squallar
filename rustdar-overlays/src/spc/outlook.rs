@@ -185,106 +185,17 @@ pub fn parse_geojson(
     let mut expire: Option<NaiveDateTime> = None;
 
     for feature_val in features_array {
-        let properties = feature_val
-            .get("properties")
-            .ok_or_else(|| "Feature missing 'properties'".to_string())?;
-
-        let label = properties
-            .get("LABEL")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let label2 = properties
-            .get("LABEL2")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let fill_hex = properties
-            .get("fill")
-            .and_then(|v| v.as_str())
-            .unwrap_or("#888888");
-
-        let stroke_hex = properties
-            .get("stroke")
-            .and_then(|v| v.as_str())
-            .unwrap_or("#000000");
-
-        // Detect CIG hatching pattern from label
-        let hatch = match label.as_str() {
-            "CIG1" => HatchPattern::Cig1,
-            "CIG2" => HatchPattern::Cig2,
-            "CIG3" => HatchPattern::Cig3,
-            _ => HatchPattern::None,
+        let (feature, feat_valid, feat_expire) = match parse_outlook_feature(feature_val)? {
+            Some(result) => result,
+            None => continue,
         };
-
-        // CIG areas: use transparent fill + hatching; regular areas: semi-transparent fill
-        let fill_alpha = if hatch != HatchPattern::None { CIG_FILL_ALPHA } else { REGULAR_FILL_ALPHA };
-        let fill_rgba = super::colors::parse_hex_color(fill_hex, fill_alpha);
-        let stroke_rgba = super::colors::parse_hex_color(stroke_hex, 255);
-
-        // Parse valid/expire timestamps from the first feature
         if valid.is_none() {
-            if let Some(valid_str) = properties.get("VALID").and_then(|v| v.as_str()) {
-                valid = NaiveDateTime::parse_from_str(valid_str, "%Y%m%d%H%M").ok();
-            }
+            valid = feat_valid;
         }
         if expire.is_none() {
-            if let Some(expire_str) = properties.get("EXPIRE").and_then(|v| v.as_str()) {
-                expire = NaiveDateTime::parse_from_str(expire_str, "%Y%m%d%H%M").ok();
-            }
+            expire = feat_expire;
         }
-
-        // Parse geometry
-        let geometry = feature_val
-            .get("geometry")
-            .ok_or_else(|| "Feature missing 'geometry'".to_string())?;
-
-        let geo_type = geometry
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        let mut polygons = match geo_type {
-            "MultiPolygon" => parse_multi_polygon(geometry)?,
-            "Polygon" => vec![parse_polygon(geometry)?],
-            "GeometryCollection" => {
-                // Days 4-8 emit an empty GeometryCollection when there are no
-                // areas drawn (e.g. "Predictability Too Low"). Skip gracefully.
-                let geometries = geometry
-                    .get("geometries")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                if geometries == 0 {
-                    continue;
-                }
-                log::warn!("Non-empty GeometryCollection not supported, skipping");
-                continue;
-            }
-            other => {
-                log::warn!("Skipping unsupported geometry type: {}", other);
-                continue;
-            }
-        };
-
-        // Simplify SPC outlook polygons at fetch time to reduce vertex
-        // counts for rendering. SPC GeoJSON can have very detailed coastline
-        // geometry that is expensive for triangulation.
-        crate::types::simplify_polygons(&mut polygons, crate::types::SIMPLIFY_EPSILON);
-        if polygons.is_empty() {
-            continue;
-        }
-
-        features.push(OverlayFeature::new(
-            polygons,
-            fill_rgba,
-            stroke_rgba,
-            label,
-            label2,
-            hatch,
-        ));
+        features.push(feature);
     }
 
     Ok(SpcOutlook {
@@ -294,6 +205,100 @@ pub fn parse_geojson(
         expire,
         features,
     })
+}
+
+/// Parse a single GeoJSON feature into an `OverlayFeature` with optional timestamps.
+///
+/// Returns `None` for features that should be skipped (empty geometry, unsupported types).
+fn parse_outlook_feature(
+    feature_val: &serde_json::Value,
+) -> Result<Option<(OverlayFeature, Option<NaiveDateTime>, Option<NaiveDateTime>)>, String> {
+    let properties = feature_val
+        .get("properties")
+        .ok_or_else(|| "Feature missing 'properties'".to_string())?;
+
+    let label = properties
+        .get("LABEL")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let label2 = properties
+        .get("LABEL2")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let fill_hex = properties
+        .get("fill")
+        .and_then(|v| v.as_str())
+        .unwrap_or("#888888");
+
+    let stroke_hex = properties
+        .get("stroke")
+        .and_then(|v| v.as_str())
+        .unwrap_or("#000000");
+
+    // Detect CIG hatching pattern from label
+    let hatch = match label.as_str() {
+        "CIG1" => HatchPattern::Cig1,
+        "CIG2" => HatchPattern::Cig2,
+        "CIG3" => HatchPattern::Cig3,
+        _ => HatchPattern::None,
+    };
+
+    // CIG areas: use transparent fill + hatching; regular areas: semi-transparent fill
+    let fill_alpha = if hatch != HatchPattern::None { CIG_FILL_ALPHA } else { REGULAR_FILL_ALPHA };
+    let fill_rgba = super::colors::parse_hex_color(fill_hex, fill_alpha);
+    let stroke_rgba = super::colors::parse_hex_color(stroke_hex, 255);
+
+    let valid = properties
+        .get("VALID")
+        .and_then(|v| v.as_str())
+        .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y%m%d%H%M").ok());
+    let expire = properties
+        .get("EXPIRE")
+        .and_then(|v| v.as_str())
+        .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y%m%d%H%M").ok());
+
+    // Parse geometry
+    let geometry = feature_val
+        .get("geometry")
+        .ok_or_else(|| "Feature missing 'geometry'".to_string())?;
+
+    let geo_type = geometry
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let mut polygons = match geo_type {
+        "MultiPolygon" => parse_multi_polygon(geometry)?,
+        "Polygon" => vec![parse_polygon(geometry)?],
+        "GeometryCollection" => {
+            let geometries = geometry
+                .get("geometries")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            if geometries == 0 {
+                return Ok(None);
+            }
+            log::warn!("Non-empty GeometryCollection not supported, skipping");
+            return Ok(None);
+        }
+        other => {
+            log::warn!("Skipping unsupported geometry type: {}", other);
+            return Ok(None);
+        }
+    };
+
+    crate::types::simplify_polygons(&mut polygons, crate::types::SIMPLIFY_EPSILON);
+    if polygons.is_empty() {
+        return Ok(None);
+    }
+
+    let feature = OverlayFeature::new(polygons, fill_rgba, stroke_rgba, label, label2, hatch);
+    Ok(Some((feature, valid, expire)))
 }
 
 /// Parse a GeoJSON MultiPolygon geometry into our polygon type.
