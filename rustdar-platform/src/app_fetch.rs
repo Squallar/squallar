@@ -28,7 +28,7 @@ impl super::App {
                 }
             };
             let _ = sender.send(ScanResponse { generation, result: msg });
-            if let Some(w) = window { w.request_redraw(); }
+            super::notify_redraw(&window);
         });
     }
 
@@ -58,7 +58,7 @@ impl super::App {
                         }
                     };
                     let _ = sender.send(Level3Response { generation, product, tilt_code: dir_str, result });
-                    if let Some(w) = window { w.request_redraw(); }
+                    super::notify_redraw(&window);
                 });
             }
         }
@@ -129,7 +129,7 @@ impl super::App {
                             log::error!("Failed to check for new scans: {:?}", e);
                         }
                     }
-                    if let Some(w) = window { w.request_redraw(); }
+                    crate::app::notify_redraw(&window);
                 });
             }
             GuiAction::SwitchRadarSite(site) => {
@@ -166,9 +166,7 @@ impl super::App {
                                 .await
                                 .map_err(|e| format!("{e}"));
                         let _ = sender.send(OutlookResponse { day, product, result });
-                        if let Some(w) = window {
-                            w.request_redraw();
-                        }
+                        super::notify_redraw(&window);
                     });
                 }
             }
@@ -197,9 +195,7 @@ impl super::App {
                             .await
                             .map_err(|e| format!("{e}"));
                     let _ = sender.send(result);
-                    if let Some(w) = window {
-                        w.request_redraw();
-                    }
+                    super::notify_redraw(&window);
                 });
             }
             GuiAction::FetchSpcDiscussions | GuiAction::RefreshSpcDiscussions => {
@@ -214,9 +210,7 @@ impl super::App {
                             .await
                             .map_err(|e| format!("{e}"));
                     let _ = sender.send(result);
-                    if let Some(w) = window {
-                        w.request_redraw();
-                    }
+                    super::notify_redraw(&window);
                 });
             }
             _ => unreachable!(),

@@ -26,6 +26,14 @@ mod fetch;
 #[path = "app_render.rs"]
 mod render;
 
+/// Request a redraw if a window handle is available.
+/// Used by async tasks and event handlers that hold an `Option<WindowRef>`.
+pub(crate) fn notify_redraw(window: &Option<WindowRef>) {
+    if let Some(w) = window {
+        w.request_redraw();
+    }
+}
+
 pub struct App {
     instance: wgpu::Instance,
     state: Option<app_state::AppState>,
@@ -146,9 +154,7 @@ impl App {
 
         // Request redraw only when there is pending background work or auto-poll is active
         if self.render.any_render_in_flight() || self.gui.is_auto_poll_active() {
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
+            notify_redraw(&self.window);
         }
     }
 
@@ -157,9 +163,7 @@ impl App {
         if let Some(new_theme) = self.platform.poll_theme() {
             if self.cached_dark_theme != Some(new_theme) {
                 self.cached_dark_theme = Some(new_theme);
-                if let Some(window) = self.window.as_ref() {
-                    window.request_redraw();
-                }
+                notify_redraw(&self.window);
             }
         }
         if let Some((lat, lon)) = self.platform.poll_location() {
@@ -398,22 +402,17 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Resized(new_size) => {
                 self.handle_resized(new_size.width, new_size.height);
-                if let Some(window) = self.window.as_ref() {
-                    window.request_redraw();
-                }
+                notify_redraw(&self.window);
             }
             WindowEvent::ThemeChanged(_theme) => {
                 // Theme changed, clear cache so we re-detect on next frame
                 self.cached_dark_theme = None;
-                // Request redraw to update UI
-                if let Some(window) = self.window.as_ref() {
-                    window.request_redraw();
-                }
+                notify_redraw(&self.window);
             }
             _ => {
                 // For other events, request redraw only if egui needs it
-                if needs_repaint && let Some(window) = self.window.as_ref() {
-                    window.request_redraw();
+                if needs_repaint {
+                    notify_redraw(&self.window);
                 }
             }
         }

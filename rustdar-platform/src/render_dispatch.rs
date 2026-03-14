@@ -185,9 +185,7 @@ impl RenderDispatcher {
                     pane_idx,
                 });
             }
-            if let Some(window) = window {
-                window.request_redraw();
-            }
+            crate::app::notify_redraw(&window);
         });
         self.pane_render[pane_idx].render_in_flight = true;
     }
