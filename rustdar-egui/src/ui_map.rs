@@ -114,12 +114,12 @@ impl super::Gui {
                     // On Android, process double-tap-drag zoom only for the active pane
                     #[cfg(target_os = "android")]
                     if is_active {
-                        self.double_tap_detector.update(ctx, &mut pane.map_memory);
+                        self.mobile.double_tap_detector.update(ctx, &mut pane.map_memory);
                     }
 
                     #[cfg(target_os = "android")]
                     let is_zoom_dragging = if is_active {
-                        self.double_tap_detector.is_zooming()
+                        self.mobile.double_tap_detector.is_zooming()
                     } else {
                         false
                     };

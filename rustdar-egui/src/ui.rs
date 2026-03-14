@@ -25,6 +25,23 @@ mod map;
 #[cfg(target_os = "android")]
 use mobile::DoubleTapDragDetector;
 
+/// Android-only UI state: slide-out menu visibility and gesture detection.
+#[cfg(target_os = "android")]
+pub(super) struct MobileState {
+    pub show_menu: bool,
+    pub double_tap_detector: DoubleTapDragDetector,
+}
+
+#[cfg(target_os = "android")]
+impl Default for MobileState {
+    fn default() -> Self {
+        Self {
+            show_menu: false,
+            double_tap_detector: DoubleTapDragDetector::default(),
+        }
+    }
+}
+
 /// Radar fetch lifecycle state.
 pub(super) struct RadarState {
     pub config: RadarConfig,
@@ -102,12 +119,8 @@ pub struct Gui {
     pane_layout: PaneLayout,
     viewport_sync: bool,
     sync_layers: bool,
-    // Whether the mobile slide-out menu is open (Android only)
     #[cfg(target_os = "android")]
-    show_mobile_menu: bool,
-    // Double-tap-drag zoom gesture detector (Android only)
-    #[cfg(target_os = "android")]
-    double_tap_detector: DoubleTapDragDetector,
+    mobile: MobileState,
     // Safe area insets in logical pixels (top, bottom, left, right)
     // Used on Android to avoid drawing under system bars.
     safe_area_insets: (f32, f32, f32, f32),
@@ -154,9 +167,7 @@ impl Gui {
             viewport_sync: true,
             sync_layers: true,
             #[cfg(target_os = "android")]
-            show_mobile_menu: false,
-            #[cfg(target_os = "android")]
-            double_tap_detector: DoubleTapDragDetector::default(),
+            mobile: MobileState::default(),
             safe_area_insets: (0.0, 0.0, 0.0, 0.0),
         }
     }

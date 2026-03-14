@@ -148,7 +148,7 @@ impl super::Gui {
         self.render_md_popup(ctx);
 
         // Floating hamburger button to open the menu (drawn last so it's on top)
-        if !self.show_mobile_menu {
+        if !self.mobile.show_menu {
             let top_inset = self.safe_area_insets.0;
             let btn_rect = egui::Rect::from_min_size(
                 egui::pos2(12.0, 48.0 + top_inset),
@@ -174,7 +174,7 @@ impl super::Gui {
                 ctx.style().visuals.text_color(),
             );
             if response {
-                self.show_mobile_menu = true;
+                self.mobile.show_menu = true;
             }
         }
     }
@@ -237,7 +237,7 @@ impl super::Gui {
     /// Collapsible layers/controls panel for mobile (replaces bottom toolbar).
     fn render_mobile_layers_panel(&mut self, ctx: &egui::Context) -> Vec<GuiAction> {
         let mut actions = Vec::new();
-        if !self.show_mobile_menu {
+        if !self.mobile.show_menu {
             return actions;
         }
 
@@ -260,7 +260,7 @@ impl super::Gui {
                     ui.heading("Layers");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("\u{2715}").clicked() {
-                            self.show_mobile_menu = false;
+                            self.mobile.show_menu = false;
                         }
                     });
                 });
@@ -289,7 +289,7 @@ impl super::Gui {
                     // Time
                     if ui.button("\u{1f550}  Set Time...").clicked() {
                         self.time_dialog.show = true;
-                        self.show_mobile_menu = false; // close menu so dialog is visible
+                        self.mobile.show_menu = false; // close menu so dialog is visible
                     }
 
                     // Auto-poll
