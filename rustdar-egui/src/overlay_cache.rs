@@ -170,12 +170,18 @@ pub fn build_cached_features(
         return cached;
     }
 
-    // Pass 2: generate hatch lines.
-    // For each CIG level, collect screen-space polygons from *higher* CIG
-    // features to use as exclusion zones so lower-severity hatching doesn't
-    // show through higher-severity regions.
+    apply_hatch_lines(&mut cached, features);
 
-    // Collect all screen-space polygon vertex lists grouped by CIG level
+    cached
+}
+
+/// Pass 2 of cache building: generate hatch lines for CIG-hatched features.
+///
+/// For each CIG level, collects screen-space polygons from higher-CIG features
+/// as exclusion zones so lower-severity hatching doesn't show through
+/// higher-severity filled regions.
+fn apply_hatch_lines(cached: &mut [CachedFeature], features: &[OverlayFeature]) {
+    // Collect screen-space polygon vertex lists grouped by CIG level
     let mut cig2_polys: Vec<Vec<Pos2>> = Vec::new();
     let mut cig3_polys: Vec<Vec<Pos2>> = Vec::new();
     for (feat_idx, feature) in features.iter().enumerate() {
@@ -198,7 +204,7 @@ pub fn build_cached_features(
         }
     }
 
-    // Now generate hatch for each feature with appropriate exclusions
+    // Generate hatch for each feature with appropriate exclusions
     for (feat_idx, feature) in features.iter().enumerate() {
         if feature.hatch == HatchPattern::None {
             continue;
@@ -229,8 +235,6 @@ pub fn build_cached_features(
             }
         }
     }
-
-    cached
 }
 
 /// Build cached geometry for a single polygon exterior ring (without hatch — hatch is added in pass 2).
