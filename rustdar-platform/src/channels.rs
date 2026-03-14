@@ -7,34 +7,62 @@ use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
 use rustdar_radar::types::RadarProduct;
 use std::sync::mpsc::{Receiver, Sender};
 
-pub type ScanResult = (u64, Result<(Scan, String, NaiveDateTime), String>);
+/// Successful scan data returned from a background fetch.
+pub struct ScanData {
+    pub scan: Scan,
+    pub site: String,
+    pub timestamp: NaiveDateTime,
+}
 
-/// Result from background radar rendering: (image_data, max_range_km, value_data, product, elevation, generation, pane_idx)
-pub type RenderResult = (Vec<u8>, f64, Vec<f32>, RadarProduct, f32, u64, usize);
+/// Result from a background radar scan fetch, with generation tracking.
+pub struct ScanResponse {
+    pub generation: u64,
+    pub result: Result<ScanData, String>,
+}
 
-/// Result from a Level III product fetch: (generation, product, tilt_code, result)
-pub type Level3Result = (u64, RadarProduct, String, Result<Level3Message, String>);
+/// Result from a background radar render thread.
+pub struct RenderResponse {
+    pub image_data: Vec<u8>,
+    pub max_range_km: f64,
+    pub value_data: Vec<f32>,
+    pub product: RadarProduct,
+    pub elevation: f32,
+    pub generation: u64,
+    pub pane_idx: usize,
+}
 
-/// Result from a background SPC outlook fetch
-pub type OutlookResult = (OutlookDay, OutlookProduct, Result<SpcOutlook, String>);
+/// Result from a Level III product fetch.
+pub struct Level3Response {
+    pub generation: u64,
+    pub product: RadarProduct,
+    pub tilt_code: String,
+    pub result: Result<Level3Message, String>,
+}
 
-/// Result from a background NWS alerts fetch
+/// Result from a background SPC outlook fetch.
+pub struct OutlookResponse {
+    pub day: OutlookDay,
+    pub product: OutlookProduct,
+    pub result: Result<SpcOutlook, String>,
+}
+
+/// Result from a background NWS alerts fetch.
 pub type AlertResult = Result<Vec<NwsAlert>, String>;
 
-/// Result from a background SPC Mesoscale Discussion fetch
+/// Result from a background SPC Mesoscale Discussion fetch.
 pub type DiscussionResult = Result<Vec<SpcDiscussion>, String>;
 
 /// Centralized channel hub for all async communication between the App and
 /// background tasks (network fetches, radar rendering, etc.).
 pub struct ChannelHub {
-    pub scan_sender: Sender<ScanResult>,
-    pub scan_receiver: Receiver<ScanResult>,
-    pub render_sender: Sender<RenderResult>,
-    pub render_receiver: Receiver<RenderResult>,
-    pub level3_sender: Sender<Level3Result>,
-    pub level3_receiver: Receiver<Level3Result>,
-    pub outlook_sender: Sender<OutlookResult>,
-    pub outlook_receiver: Receiver<OutlookResult>,
+    pub scan_sender: Sender<ScanResponse>,
+    pub scan_receiver: Receiver<ScanResponse>,
+    pub render_sender: Sender<RenderResponse>,
+    pub render_receiver: Receiver<RenderResponse>,
+    pub level3_sender: Sender<Level3Response>,
+    pub level3_receiver: Receiver<Level3Response>,
+    pub outlook_sender: Sender<OutlookResponse>,
+    pub outlook_receiver: Receiver<OutlookResponse>,
     pub alert_sender: Sender<AlertResult>,
     pub alert_receiver: Receiver<AlertResult>,
     pub discussion_sender: Sender<DiscussionResult>,

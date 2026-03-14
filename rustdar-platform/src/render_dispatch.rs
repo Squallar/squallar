@@ -6,7 +6,7 @@ use rustdar_radar::render::{render_level3_radial_to_image, render_radar_to_image
 use rustdar_radar::types::RadarProduct;
 
 use crate::WindowRef;
-use crate::channels::RenderResult;
+use crate::channels::RenderResponse;
 
 /// Per-pane render tracking state.
 pub struct PaneRenderState {
@@ -116,7 +116,7 @@ impl RenderDispatcher {
         elevation: f32,
         lat: f64,
         lon: f64,
-        sender: std::sync::mpsc::Sender<RenderResult>,
+        sender: std::sync::mpsc::Sender<RenderResponse>,
         window: Option<WindowRef>,
     ) -> bool {
         let best_l3 = self
@@ -229,9 +229,15 @@ impl RenderDispatcher {
                 if let Some((image, range, values)) =
                     render_level3_radial_to_image(rp, product, lat, lon, scale, offset, lut)
                 {
-                    let _ = sender.send((
-                        image, range, values, product, elevation, generation, pane_idx,
-                    ));
+                    let _ = sender.send(RenderResponse {
+                        image_data: image,
+                        max_range_km: range,
+                        value_data: values,
+                        product,
+                        elevation,
+                        generation,
+                        pane_idx,
+                    });
                 } else {
                     log::warn!(
                         "L3 {:?}: render_level3_radial_to_image returned None",
@@ -256,7 +262,7 @@ impl RenderDispatcher {
         lat: f64,
         lon: f64,
         data: Arc<nexrad_model::data::Scan>,
-        sender: std::sync::mpsc::Sender<RenderResult>,
+        sender: std::sync::mpsc::Sender<RenderResponse>,
         window: Option<WindowRef>,
     ) {
         log::info!(
@@ -271,9 +277,15 @@ impl RenderDispatcher {
             if let Some((image, range, values)) =
                 render_radar_to_image(&data, elevation, product, lat, lon)
             {
-                let _ = sender.send((
-                    image, range, values, product, elevation, generation, pane_idx,
-                ));
+                let _ = sender.send(RenderResponse {
+                    image_data: image,
+                    max_range_km: range,
+                    value_data: values,
+                    product,
+                    elevation,
+                    generation,
+                    pane_idx,
+                });
             }
             if let Some(window) = window {
                 window.request_redraw();

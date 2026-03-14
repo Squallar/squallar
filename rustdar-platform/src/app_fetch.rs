@@ -1,4 +1,5 @@
 use chrono::{NaiveDateTime};
+use crate::channels::{ScanResponse, ScanData, Level3Response};
 use rustdar_radar::types::RadarProduct;
 use rustdar_radar::scan;
 
@@ -15,7 +16,7 @@ impl super::App {
             let msg = match scan::get_scan(&site, timestamp).await {
                 Ok(data) => {
                     log::info!("Fetched scan: {} @ {}", site, timestamp);
-                    Ok((data, site, timestamp))
+                    Ok(ScanData { scan: data, site, timestamp })
                 }
                 Err(e) => {
                     let err = format!("Failed to fetch radar scan: {:?}", e);
@@ -23,7 +24,7 @@ impl super::App {
                     Err(err)
                 }
             };
-            let _ = sender.send((generation, msg));
+            let _ = sender.send(ScanResponse { generation, result: msg });
             if let Some(w) = window { w.request_redraw(); }
         });
     }
@@ -53,7 +54,7 @@ impl super::App {
                             Err(format!("{e}"))
                         }
                     };
-                    let _ = sender.send((generation, product, dir_str, result));
+                    let _ = sender.send(Level3Response { generation, product, tilt_code: dir_str, result });
                     if let Some(w) = window { w.request_redraw(); }
                 });
             }

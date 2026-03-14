@@ -197,15 +197,17 @@ impl App {
     /// Poll all data channels for completed async results (scan, overlays).
     fn poll_data_channels(&mut self) {
         // Check for received scan data (with generation check)
-        if let Ok((generation, result)) = self.channels.scan_receiver.try_recv() {
-            if self.render.is_fetch_stale(generation) {
-                log::info!("Discarding stale scan result (gen {} < current {})", generation, self.render.fetch_generation);
+        if let Ok(scan_resp) = self.channels.scan_receiver.try_recv() {
+            if self.render.is_fetch_stale(scan_resp.generation) {
+                log::info!("Discarding stale scan result (gen {} < current {})", scan_resp.generation, self.render.fetch_generation);
             } else {
-                match result {
-                    Ok((data, site, timestamp)) => {
+                match scan_resp.result {
+                    Ok(scan_data) => {
                         log::info!("Received scan data from background thread");
-                        let scan_info = ScanInfo::from_scan(&data, &site, timestamp);
-                        self.scan_data = Some(Arc::new(data));
+                        let scan_info = ScanInfo::from_scan(&scan_data.scan, &scan_data.site, scan_data.timestamp);
+                        let site = scan_data.site;
+                        let timestamp = scan_data.timestamp;
+                        self.scan_data = Some(Arc::new(scan_data.scan));
                         self.gui.set_scan_info(scan_info);
                         self.gui.set_loading_site(None);
                         self.render.reset_panes();
@@ -224,15 +226,15 @@ impl App {
         // Check for received SPC outlook data
         {
             let mut any_received = false;
-            while let Ok((day, product, result)) = self.channels.outlook_receiver.try_recv() {
+            while let Ok(outlook_resp) = self.channels.outlook_receiver.try_recv() {
                 any_received = true;
-                match result {
+                match outlook_resp.result {
                     Ok(outlook) => {
-                        log::info!("Received SPC outlook: {:?} {:?}", day, product);
-                        self.gui.overlays.set_spc_outlook(day, product, outlook);
+                        log::info!("Received SPC outlook: {:?} {:?}", outlook_resp.day, outlook_resp.product);
+                        self.gui.overlays.set_spc_outlook(outlook_resp.day, outlook_resp.product, outlook);
                     }
                     Err(e) => {
-                        log::error!("SPC outlook fetch failed ({:?} {:?}): {}", day, product, e);
+                        log::error!("SPC outlook fetch failed ({:?} {:?}): {}", outlook_resp.day, outlook_resp.product, e);
                     }
                 }
             }
@@ -355,26 +357,25 @@ impl App {
     /// Poll for completed background render results and upload textures.
     fn poll_render_results(&mut self) {
         let ctx = self.state.as_ref().unwrap().egui_renderer.context();
-        while let Ok((image_data, max_range_km, value_data, product, elevation, generation, pane_idx)) =
-            self.channels.render_receiver.try_recv()
+        while let Ok(rr) = self.channels.render_receiver.try_recv()
         {
-            if pane_idx < self.render.pane_render.len() {
-                self.render.pane_render[pane_idx].render_in_flight = false;
+            if rr.pane_idx < self.render.pane_render.len() {
+                self.render.pane_render[rr.pane_idx].render_in_flight = false;
             }
 
-            if self.render.is_render_stale(generation) {
-                log::info!("Discarding stale render result (gen {} < current {})", generation, self.render.render_generation);
-            } else if pane_idx < self.gui.pane_count()
-                && self.gui.get_rendering_params_for_pane(pane_idx).is_some()
+            if self.render.is_render_stale(rr.generation) {
+                log::info!("Discarding stale render result (gen {} < current {})", rr.generation, self.render.render_generation);
+            } else if rr.pane_idx < self.gui.pane_count()
+                && self.gui.get_rendering_params_for_pane(rr.pane_idx).is_some()
             {
                 // Save the old texture to be cleaned up after this frame completes
-                if let Some(old_img) = self.gui.take_radar_image_for_pane(pane_idx) {
+                if let Some(old_img) = self.gui.take_radar_image_for_pane(rr.pane_idx) {
                     self.old_textures.push(old_img.texture);
                 }
 
                 self.texture_counter += 1;
                 let color_image =
-                    egui::ColorImage::from_rgba_unmultiplied([1800, 1800], &image_data);
+                    egui::ColorImage::from_rgba_unmultiplied([1800, 1800], &rr.image_data);
                 let texture_name = format!("radar_image_{}", self.texture_counter);
                 let texture = ctx.load_texture(
                     texture_name,
@@ -383,52 +384,52 @@ impl App {
                 );
 
                 // Cache the raw image data for fast restore after suspend/resume
-                self.render.pane_render[pane_idx].cached_render = Some((
-                    image_data,
-                    max_range_km,
-                    value_data.clone(),
-                    product,
-                    elevation,
+                self.render.pane_render[rr.pane_idx].cached_render = Some((
+                    rr.image_data,
+                    rr.max_range_km,
+                    rr.value_data.clone(),
+                    rr.product,
+                    rr.elevation,
                 ));
 
                 if let Some(scan_info) = self.gui.get_scan_info() {
                     self.gui.set_radar_image_for_pane(
-                        pane_idx,
+                        rr.pane_idx,
                         texture,
                         scan_info.site.lat,
                         scan_info.site.lon,
-                        max_range_km,
-                        value_data,
+                        rr.max_range_km,
+                        rr.value_data,
                     );
                 }
 
-                self.render.pane_render[pane_idx].last_rendered = Some((product, elevation));
+                self.render.pane_render[rr.pane_idx].last_rendered = Some((rr.product, rr.elevation));
             }
         }
     }
 
     /// Poll for completed Level III fetch results and update scan info.
     fn poll_level3_results(&mut self) {
-        if let Ok((generation, product, tilt_code, result)) = self.channels.level3_receiver.try_recv() {
-            if self.render.is_fetch_stale(generation) {
-                log::info!("Discarding stale Level III result (gen {} < current {})", generation, self.render.fetch_generation);
+        if let Ok(l3_resp) = self.channels.level3_receiver.try_recv() {
+            if self.render.is_fetch_stale(l3_resp.generation) {
+                log::info!("Discarding stale Level III result (gen {} < current {})", l3_resp.generation, self.render.fetch_generation);
             } else {
-                match result {
+                match l3_resp.result {
                     Ok(message) => {
                         let elevation = message.pdb.elevation_angle();
-                        log::info!("Level III {:?} {} fetched successfully (elevation={:.1}°)", product, tilt_code, elevation);
-                        self.render.level3_data.insert((product, tilt_code), Arc::new(message));
+                        log::info!("Level III {:?} {} fetched successfully (elevation={:.1}°)", l3_resp.product, l3_resp.tilt_code, elevation);
+                        self.render.level3_data.insert((l3_resp.product, l3_resp.tilt_code), Arc::new(message));
                         // Trigger a re-render for any pane viewing this product
                         for (idx, prs) in self.render.pane_render.iter_mut().enumerate() {
-                            if self.gui.get_rendering_params_for_pane(idx).map(|(p, _)| p) == Some(product) {
+                            if self.gui.get_rendering_params_for_pane(idx).map(|(p, _)| p) == Some(l3_resp.product) {
                                 prs.last_rendered = None;
                             }
                         }
                         // Add Level III products to the scan info's available list
                         if let Some(scan_info) = self.gui.get_scan_info() {
                             let mut info = scan_info.clone();
-                            if !info.available_products.contains(&product) {
-                                info.available_products.push(product);
+                            if !info.available_products.contains(&l3_resp.product) {
+                                info.available_products.push(l3_resp.product);
                                 info.available_products.sort_by_key(|p| p.sort_order());
                                 info.status = format!(
                                     "Loaded {} products: {}",
@@ -437,7 +438,7 @@ impl App {
                                 );
                             }
                             // Register the actual elevation angle from the PDB
-                            let elevations = info.product_elevations.entry(product).or_default();
+                            let elevations = info.product_elevations.entry(l3_resp.product).or_default();
                             let rounded_elev = (elevation * 10.0).round() / 10.0;
                             if !elevations.iter().any(|e| (e - rounded_elev).abs() < 0.05) {
                                 elevations.push(rounded_elev);
@@ -447,7 +448,7 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        log::warn!("Level III {:?} fetch failed: {}", product, e);
+                        log::warn!("Level III {:?} fetch failed: {}", l3_resp.product, e);
                     }
                 }
             }
@@ -651,7 +652,10 @@ impl App {
                 self.tokio_runtime.spawn(async move {
                     match scan::check_and_fetch_latest(&site, &utc_timestamp.date(), current_scan_timestamp).await {
                         Ok(Some((data, timestamp))) => {
-                            let _ = sender.send((generation, Ok((data, site, timestamp))));
+                            let _ = sender.send(crate::channels::ScanResponse {
+                                generation,
+                                result: Ok(crate::channels::ScanData { scan: data, site, timestamp }),
+                            });
                         }
                         Ok(None) => { /* already latest or no data */ }
                         Err(e) => {
@@ -690,7 +694,7 @@ impl App {
                             rustdar_overlays::spc::fetch::fetch_outlook(&client, day, product)
                                 .await
                                 .map_err(|e| format!("{e}"));
-                        let _ = sender.send((day, product, result));
+                        let _ = sender.send(crate::channels::OutlookResponse { day, product, result });
                         if let Some(w) = window {
                             w.request_redraw();
                         }
