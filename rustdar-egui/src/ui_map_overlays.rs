@@ -19,8 +19,7 @@ pub(super) struct OverlayDrawContext<'a> {
     projector: &'a walkers::Projector,
     screen_rect: egui::Rect,
     // Pre-computed click state (shared by discussion + alert drawing).
-    any_click: bool,
-    click_pos: Option<egui::Pos2>,
+    overlay_click_pos: Option<egui::Pos2>,
     click_on_ui: bool,
     pointer_available: bool,
 }
@@ -32,35 +31,25 @@ impl<'a> OverlayDrawContext<'a> {
         pointer_available: bool,
         pane_rect: egui::Rect,
         excluded_rects: &[egui::Rect],
-        is_zoom_dragging: bool,
+        overlay_click_pos: Option<egui::Pos2>,
     ) -> Self {
         let screen_rect = ui.max_rect();
 
-        // Pre-compute click detection once for all overlay passes.
-        let (any_click, click_pos) = ui.ctx().input(|i| {
-            (i.pointer.any_click(), i.pointer.interact_pos())
+        // Suppress overlay clicks when the click position is outside
+        // the map pane, on a floating UI element, or on a popup layer.
+        let click_on_ui = overlay_click_pos.is_some_and(|p| {
+            !pane_rect.contains(p)
+                || excluded_rects.iter().any(|r| r.contains(p))
+                || ui.ctx()
+                    .layer_id_at(p)
+                    .is_some_and(|l| l.order > egui::Order::Background)
         });
-        // Suppress overlay clicks when:
-        // - Click is outside the map pane rect (on panels, menu bar, status bar)
-        // - Click is on a floating UI element (hamburger button, popups)
-        // - A zoom-drag gesture is active (Android double-tap)
-        // - Click is on a higher-order egui layer (popup windows)
-        let click_on_ui = is_zoom_dragging
-            || (any_click
-                && click_pos.is_some_and(|p| {
-                    !pane_rect.contains(p)
-                        || excluded_rects.iter().any(|r| r.contains(p))
-                        || ui.ctx()
-                            .layer_id_at(p)
-                            .is_some_and(|l| l.order > egui::Order::Background)
-                }));
 
         Self {
             ui,
             projector,
             screen_rect,
-            any_click,
-            click_pos,
+            overlay_click_pos,
             click_on_ui,
             pointer_available,
         }
@@ -72,10 +61,10 @@ impl<'a> OverlayDrawContext<'a> {
         &self,
         features: &[rustdar_overlays::types::OverlayFeature],
     ) -> Option<usize> {
-        if !self.pointer_available || self.click_on_ui || !self.any_click {
+        if !self.pointer_available || self.click_on_ui {
             return None;
         }
-        let click_pos = self.click_pos?;
+        let click_pos = self.overlay_click_pos?;
         let geo = self.projector.unproject(egui::vec2(click_pos.x, click_pos.y));
         let lat = geo.y();
         let lon = geo.x();
@@ -146,10 +135,10 @@ impl<'a> OverlayDrawContext<'a> {
         }
 
         // Click detection in geo-coordinates
-        if !self.pointer_available || self.click_on_ui || !self.any_click {
+        if !self.pointer_available || self.click_on_ui {
             return Vec::new();
         }
-        let Some(click_pos) = self.click_pos else { return Vec::new() };
+        let Some(click_pos) = self.overlay_click_pos else { return Vec::new() };
         let geo = self.projector.unproject(egui::vec2(click_pos.x, click_pos.y));
         let lat = geo.y();
         let lon = geo.x();
@@ -201,10 +190,10 @@ impl<'a> OverlayDrawContext<'a> {
         }
 
         // Click detection in geo-coordinates
-        if !self.pointer_available || self.click_on_ui || !self.any_click {
+        if !self.pointer_available || self.click_on_ui {
             return Vec::new();
         }
-        let Some(click_pos) = self.click_pos else { return Vec::new() };
+        let Some(click_pos) = self.overlay_click_pos else { return Vec::new() };
         let geo = self.projector.unproject(egui::vec2(click_pos.x, click_pos.y));
         let lat = geo.y();
         let lon = geo.x();

@@ -17,7 +17,7 @@ const TAP_DISTANCE_MAX_PX: f32 = 20.0;
 /// Pixels of vertical drag per 1.0 zoom level change.
 const ZOOM_DRAG_SENSITIVITY: f32 = 150.0;
 /// Minimum hold duration (seconds) for a long press to be recognized.
-const LONG_PRESS_DURATION_S: f64 = 0.5;
+const LONG_PRESS_DURATION_S: f64 = 0.8;
 /// Maximum movement (pixels) during a long press before cancelling.
 const LONG_PRESS_MAX_MOVE_PX: f32 = 20.0;
 /// Vertical offset (pixels) from the touch point to the tooltip center.
@@ -30,10 +30,11 @@ pub(crate) const TOOLTIP_OFFSET_Y: f32 = 60.0;
 /// 3. Drag vertically: up = zoom in, down = zoom out
 #[derive(Clone)]
 pub(crate) struct DoubleTapDragDetector {
-    /// Time of the last completed tap (short press-release)
-    last_tap_time: Option<f64>,
-    /// Screen position of the last completed tap
-    last_tap_pos: Option<egui::Pos2>,
+    /// A tap that occurred but hasn't been confirmed as a single-tap yet.
+    /// Waits [`DOUBLE_TAP_TIMEOUT_S`] before promoting to `confirmed_tap_pos`.
+    pending_tap: Option<(f64, egui::Pos2)>,
+    /// A confirmed single tap this frame (no double-tap followed).
+    confirmed_tap_pos: Option<egui::Pos2>,
     /// Whether we are currently in a zoom-drag gesture
     zooming: bool,
     /// Starting Y position when zoom-drag began
@@ -49,8 +50,8 @@ pub(crate) struct DoubleTapDragDetector {
 impl Default for DoubleTapDragDetector {
     fn default() -> Self {
         Self {
-            last_tap_time: None,
-            last_tap_pos: None,
+            pending_tap: None,
+            confirmed_tap_pos: None,
             zooming: false,
             drag_start_y: 0.0,
             initial_zoom: 4.0,
@@ -63,7 +64,16 @@ impl Default for DoubleTapDragDetector {
 impl DoubleTapDragDetector {
     /// Process this frame's input and update the map zoom if a
     /// double-tap-drag gesture is active.
-    pub(super) fn update(&mut self, ctx: &egui::Context, map_memory: &mut walkers::MapMemory) {
+    ///
+    /// `map_rect` is the current pane's screen rect — taps outside it are
+    /// discarded so that sidebar buttons and other non-map UI don't become
+    /// deferred overlay clicks.
+    pub(super) fn update(
+        &mut self,
+        ctx: &egui::Context,
+        map_memory: &mut walkers::MapMemory,
+        map_rect: egui::Rect,
+    ) {
         let (pressed, released, down, pos, time) = ctx.input(|i| {
             (
                 i.pointer.primary_pressed(),
@@ -75,6 +85,17 @@ impl DoubleTapDragDetector {
         });
         let pos = pos.unwrap_or(egui::Pos2::ZERO);
 
+        // Clear last frame's confirmed tap
+        self.confirmed_tap_pos = None;
+
+        // Promote pending tap to confirmed if double-tap timeout elapsed
+        if let Some((tap_time, tap_pos)) = self.pending_tap {
+            if time - tap_time >= DOUBLE_TAP_TIMEOUT_S {
+                self.confirmed_tap_pos = Some(tap_pos);
+                self.pending_tap = None;
+            }
+        }
+
         if self.zooming {
             self.handle_zoom_drag(pos, down, map_memory);
             return;
@@ -84,6 +105,18 @@ impl DoubleTapDragDetector {
         }
         if released {
             self.handle_release(pos, time);
+            // Don't record taps on non-map UI (sidebar buttons, popups, etc.)
+            // — check now while the current frame's layout is still valid,
+            // rather than 0.4s later when the layout may have changed.
+            if self.pending_tap.is_some() {
+                let outside_map = !map_rect.contains(pos);
+                let on_floating_ui = ctx
+                    .layer_id_at(pos)
+                    .is_some_and(|l| l.order > egui::Order::Background);
+                if outside_map || on_floating_ui {
+                    self.pending_tap = None;
+                }
+            }
         }
     }
 
@@ -111,15 +144,14 @@ impl DoubleTapDragDetector {
         time: f64,
         map_memory: &mut walkers::MapMemory,
     ) {
-        if let (Some(last_time), Some(last_pos)) = (self.last_tap_time, self.last_tap_pos) {
-            let dt = time - last_time;
-            let dist = (pos - last_pos).length();
+        if let Some((tap_time, tap_pos)) = self.pending_tap {
+            let dt = time - tap_time;
+            let dist = (pos - tap_pos).length();
             if dt < DOUBLE_TAP_TIMEOUT_S && dist < DOUBLE_TAP_DISTANCE_PX {
                 self.zooming = true;
                 self.drag_start_y = pos.y;
                 self.initial_zoom = map_memory.zoom();
-                self.last_tap_time = None;
-                self.last_tap_pos = None;
+                self.pending_tap = None;
                 return;
             }
         }
@@ -132,17 +164,23 @@ impl DoubleTapDragDetector {
         let duration = time - self.press_time;
         let distance = (pos - self.press_pos).length();
         if duration < TAP_DURATION_MAX_S && distance < TAP_DISTANCE_MAX_PX {
-            self.last_tap_time = Some(time);
-            self.last_tap_pos = Some(pos);
+            self.pending_tap = Some((time, pos));
         } else {
-            self.last_tap_time = None;
-            self.last_tap_pos = None;
+            // Long press or drag — not a tap, don't record
         }
     }
 
     /// Whether a zoom-drag gesture is currently active.
     pub(super) fn is_zooming(&self) -> bool {
         self.zooming
+    }
+
+    /// Returns and consumes a confirmed single-tap position, if available.
+    ///
+    /// A tap is only confirmed after [`DOUBLE_TAP_TIMEOUT_S`] elapses without
+    /// a second press, ensuring double-tap-to-zoom doesn't trigger overlay popups.
+    pub(super) fn take_confirmed_tap(&mut self) -> Option<egui::Pos2> {
+        self.confirmed_tap_pos.take()
     }
 }
 
@@ -220,10 +258,16 @@ pub(crate) struct LongPressDetector {
     press_start: Option<f64>,
     /// Position where the current press started.
     press_pos: egui::Pos2,
+    /// Whether the long press has been recognized (hold threshold exceeded).
+    /// Once active, finger movement no longer cancels — the tooltip follows the finger.
+    active: bool,
 }
 
 impl LongPressDetector {
     /// Process this frame's input and return the held position if a long press is active.
+    ///
+    /// Once the hold threshold is exceeded, returns the **current** finger position
+    /// (not the initial press position), allowing the tooltip to follow the finger.
     pub(super) fn update(&mut self, ctx: &egui::Context) -> Option<egui::Pos2> {
         let (down, pos, time) = ctx.input(|i| {
             (
@@ -236,7 +280,13 @@ impl LongPressDetector {
 
         if !down {
             self.press_start = None;
+            self.active = false;
             return None;
+        }
+
+        // Already recognized — follow the finger
+        if self.active {
+            return Some(pos);
         }
 
         if self.press_start.is_none() {
@@ -245,7 +295,7 @@ impl LongPressDetector {
             return None;
         }
 
-        // Cancel if finger moved too far
+        // Cancel if finger moved too far (only before activation)
         if (pos - self.press_pos).length() > LONG_PRESS_MAX_MOVE_PX {
             self.press_start = None;
             return None;
@@ -253,7 +303,8 @@ impl LongPressDetector {
 
         let elapsed = time - self.press_start.unwrap();
         if elapsed >= LONG_PRESS_DURATION_S {
-            Some(self.press_pos)
+            self.active = true;
+            Some(pos)
         } else {
             None
         }

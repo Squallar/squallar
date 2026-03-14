@@ -100,7 +100,7 @@ impl super::Gui {
                     // On Android, process double-tap-drag zoom only for the active pane
                     #[cfg(target_os = "android")]
                     if is_active {
-                        self.mobile.double_tap_detector.update(ctx, &mut map_memory);
+                        self.mobile.double_tap_detector.update(ctx, &mut map_memory, pane_rect);
                     }
 
                     #[cfg(target_os = "android")]
@@ -119,6 +119,25 @@ impl super::Gui {
                     } else {
                         None
                     };
+
+                    // Compute overlay click position per-platform:
+                    // - Desktop: use egui's built-in click detection (instant)
+                    // - Android: use deferred single-tap from DoubleTapDragDetector
+                    //   (waits for double-tap timeout to avoid false popups)
+                    #[cfg(target_os = "android")]
+                    let overlay_click_pos = if is_active {
+                        self.mobile.double_tap_detector.take_confirmed_tap()
+                    } else {
+                        None
+                    };
+                    #[cfg(not(target_os = "android"))]
+                    let overlay_click_pos = ctx.input(|i| {
+                        if i.pointer.any_click() {
+                            i.pointer.interact_pos()
+                        } else {
+                            None
+                        }
+                    });
 
                     #[cfg(target_os = "android")]
                     let suppress_pan = is_zoom_dragging || long_press_pos.is_some();
@@ -160,9 +179,9 @@ impl super::Gui {
                                 scan_info_site_name: self.radar.scan_info.as_ref().map(|i| i.site.name),
                                 loading_site: &mut self.radar.loading_site,
                                 excluded_rects: excluded_rects.clone(),
-                                is_zoom_dragging,
                                 #[cfg(target_os = "android")]
                                 long_press_pos,
+                                overlay_click_pos,
                             };
 
                             pane_render::render_pane_map_content(ui, projector, zoom, &mut render_ctx);

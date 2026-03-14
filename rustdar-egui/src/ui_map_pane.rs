@@ -27,10 +27,12 @@ pub(super) struct PaneRenderCtx<'a> {
     pub scan_info_site_name: Option<&'a str>,
     pub loading_site: &'a mut Option<String>,
     pub excluded_rects: Vec<egui::Rect>,
-    pub is_zoom_dragging: bool,
     /// On Android, the screen position of an active long-press (for radar value tooltip).
-    #[cfg(target_os = "android")]
-    pub long_press_pos: Option<egui::Pos2>,
+    #[cfg(target_os = "android")]    pub long_press_pos: Option<egui::Pos2>,
+    /// Screen position of a confirmed overlay click/tap, or `None` if no overlay
+    /// click occurred this frame. On desktop this comes from egui's `any_click()`;
+    /// on Android from the deferred single-tap detector.
+    pub overlay_click_pos: Option<egui::Pos2>,
 }
 
 /// Render the map content for a single pane (SPC/NWS overlays, radar image,
@@ -49,7 +51,7 @@ pub(super) fn render_pane_map_content(
             ctx.pointer_available,
             ctx.pane_rect,
             &ctx.excluded_rects,
-            ctx.is_zoom_dragging,
+            ctx.overlay_click_pos,
         );
 
         // Draw SPC outlook textures (below radar)
