@@ -1,6 +1,7 @@
 use rustdar_overlays::render::layers::LayerManager;
 use crate::overlay_cache::OverlayTextureCache;
 use rustdar_radar::types::{ImageBounds, RadarProduct, ScanInfo};
+use chrono::NaiveDateTime;
 use std::sync::Arc;
 use walkers::MapMemory;
 
@@ -15,6 +16,32 @@ pub struct RadarImageData {
     pub lon: f64,
     pub max_range_km: f64,
     pub value_data: Arc<Vec<f32>>,
+}
+
+/// A single rendered frame in a radar loop.
+pub struct LoopFrame {
+    /// UTC timestamp of this scan.
+    pub timestamp: NaiveDateTime,
+    /// Rendered texture, `None` if not yet rendered or evicted.
+    pub texture: Option<RadarImageData>,
+    /// True while a background render is in progress for this frame.
+    pub render_in_flight: bool,
+}
+
+/// Per-pane loop playback state.
+pub struct LoopPlaybackState {
+    /// Whether the loop is actively playing (animating).
+    pub playing: bool,
+    /// Index of the currently displayed frame in `frames`.
+    pub current_frame: usize,
+    /// Ordered list of frames (oldest-first).
+    pub frames: Vec<LoopFrame>,
+    /// Lookback duration in seconds that was requested.
+    pub lookback_secs: u64,
+    /// True while the initial scan listing/fetch is in progress.
+    pub fetching: bool,
+    /// Instant of the last frame advance (for animation timing).
+    pub last_advance: Option<std::time::Instant>,
 }
 
 /// Per-pane state: each pane independently selects a radar product,
@@ -32,6 +59,8 @@ pub struct PaneState {
     pub spc_overlay_texture: OverlayTextureCache,
     pub nws_alert_texture: OverlayTextureCache,
     pub spc_md_texture: OverlayTextureCache,
+    /// Radar loop state: `Some` when loop mode is enabled for this pane.
+    pub loop_state: Option<LoopPlaybackState>,
 }
 
 impl PaneState {
@@ -50,6 +79,7 @@ impl PaneState {
             spc_overlay_texture: OverlayTextureCache::new(),
             nws_alert_texture: OverlayTextureCache::new(),
             spc_md_texture: OverlayTextureCache::new(),
+            loop_state: None,
         }
     }
 
