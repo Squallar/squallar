@@ -1007,6 +1007,24 @@ impl Gui {
     pub fn clear_graphics_state(&mut self) {
         for pane in &mut self.panes {
             pane.clear_radar_image();
+            // Clear loop frame textures so they get re-rendered on resume.
+            // The frame list and scan cache survive, so dispatch_loop_renders()
+            // will re-upload textures automatically.
+            if let Some(ls) = &mut pane.loop_state {
+                for frame in &mut ls.frames {
+                    frame.texture = None;
+                    frame.render_in_flight = false;
+                }
+            }
+            // Clear overlay texture caches — handles become invalid when the
+            // egui context is destroyed. needs_rerender() will trigger fresh
+            // background renders.
+            pane.spc_overlay_texture.current = None;
+            pane.spc_overlay_texture.render_in_flight = false;
+            pane.nws_alert_texture.current = None;
+            pane.nws_alert_texture.render_in_flight = false;
+            pane.spc_md_texture.current = None;
+            pane.spc_md_texture.render_in_flight = false;
         }
         self.map_tiles.clear();
         self.radar.loading_site = None;
