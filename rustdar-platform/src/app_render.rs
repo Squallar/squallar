@@ -439,7 +439,6 @@ impl super::App {
     /// Poll for completed loop frame render results and upload textures.
     fn poll_loop_render_results(&mut self) {
         let ctx = self.state.as_ref().unwrap().egui_renderer.context();
-        let scan_info = self.gui.get_scan_info().cloned();
         while let Ok(rr) = self.channels.loop_render_receiver.try_recv() {
             let Some(pane) = self.gui.pane_mut(rr.pane_idx) else {
                 continue;
@@ -447,6 +446,10 @@ impl super::App {
             let Some(ls) = &mut pane.loop_state else {
                 continue;
             };
+
+            // Capture lat/lon from the loop state (not global scan_info)
+            let lat = ls.site_lat;
+            let lon = ls.site_lon;
 
             // Find the matching frame by timestamp
             let Some(frame) = ls.frames.iter_mut().find(|f| f.timestamp == rr.timestamp) else {
@@ -464,15 +467,13 @@ impl super::App {
                 egui::TextureOptions::NEAREST,
             );
 
-            if let Some(si) = &scan_info {
-                frame.texture = Some(rustdar_egui::pane::RadarImageData {
-                    texture,
-                    lat: si.site.lat,
-                    lon: si.site.lon,
-                    max_range_km: rr.max_range_km,
-                    value_data: Arc::new(rr.value_data),
-                });
-            }
+            frame.texture = Some(rustdar_egui::pane::RadarImageData {
+                texture,
+                lat,
+                lon,
+                max_range_km: rr.max_range_km,
+                value_data: Arc::new(rr.value_data),
+            });
         }
     }
 
@@ -514,12 +515,8 @@ impl super::App {
     /// Dispatch renders for loop frames around the playhead that have
     /// downloaded scan data but no rendered texture yet.
     fn dispatch_loop_renders(&mut self) {
-        let Some(scan_info) = self.gui.get_scan_info().cloned() else {
-            return;
-        };
-
-        // Collect all (pane_idx, frame_idx, timestamp, product, elevation) that need rendering
-        let mut to_render: Vec<(usize, usize, chrono::NaiveDateTime, rustdar_radar::types::RadarProduct, f32)> = Vec::new();
+        // Collect all (pane_idx, frame_idx, timestamp, product, elevation, lat, lon) that need rendering
+        let mut to_render: Vec<(usize, usize, chrono::NaiveDateTime, rustdar_radar::types::RadarProduct, f32, f64, f64)> = Vec::new();
 
         for pane_idx in 0..self.gui.pane_count() {
             let Some(pane) = self.gui.pane_mut(pane_idx) else {
@@ -532,10 +529,11 @@ impl super::App {
                 continue;
             }
 
-            let (product, elevation) = match pane.get_rendering_params(Some(&scan_info)) {
-                Some(params) => params,
-                None => continue,
-            };
+            // Use the loop's stored site lat/lon and the pane's selected product/elevation
+            let site_lat = ls.site_lat;
+            let site_lon = ls.site_lon;
+            let product = pane.selected_product;
+            let elevation = pane.selected_elevation;
 
             let num_frames = ls.frames.len();
             let budget = num_frames.min(30);
@@ -567,13 +565,13 @@ impl super::App {
                 }
                 let Some(cache) = pane_cache else { continue };
                 if cache.contains_key(&frame.timestamp) {
-                    to_render.push((pane_idx, idx, frame.timestamp, product, elevation));
+                    to_render.push((pane_idx, idx, frame.timestamp, product, elevation, site_lat, site_lon));
                 }
             }
         }
 
         // Now mark in-flight and spawn renders
-        for (pane_idx, frame_idx, ts, product, elevation) in to_render {
+        for (pane_idx, frame_idx, ts, product, elevation, lat, lon) in to_render {
             let scan_arc = {
                 let cache = self.loop_scan_cache.get(&pane_idx).unwrap();
                 Arc::clone(cache.get(&ts).unwrap())
@@ -591,8 +589,8 @@ impl super::App {
                 scan_arc,
                 product,
                 elevation,
-                scan_info.site.lat,
-                scan_info.site.lon,
+                lat,
+                lon,
             );
         }
     }
