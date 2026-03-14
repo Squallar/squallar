@@ -25,6 +25,8 @@ pub(super) struct PaneRenderCtx<'a> {
     pub is_dark_theme: bool,
     pub scan_info_site_name: Option<&'a str>,
     pub loading_site: &'a mut Option<String>,
+    pub excluded_rects: Vec<egui::Rect>,
+    pub is_zoom_dragging: bool,
 }
 
 /// Render the map content for a single pane (SPC/NWS overlays, radar image,
@@ -41,6 +43,9 @@ pub(super) fn render_pane_map_content(
             ui,
             projector,
             ctx.pointer_available,
+            ctx.pane_rect,
+            &ctx.excluded_rects,
+            ctx.is_zoom_dragging,
         );
 
         // Draw SPC outlook textures (below radar)

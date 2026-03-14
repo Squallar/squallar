@@ -30,6 +30,9 @@ impl<'a> OverlayDrawContext<'a> {
         ui: &'a egui::Ui,
         projector: &'a walkers::Projector,
         pointer_available: bool,
+        pane_rect: egui::Rect,
+        excluded_rects: &[egui::Rect],
+        is_zoom_dragging: bool,
     ) -> Self {
         let screen_rect = ui.max_rect();
 
@@ -37,12 +40,20 @@ impl<'a> OverlayDrawContext<'a> {
         let (any_click, click_pos) = ui.ctx().input(|i| {
             (i.pointer.any_click(), i.pointer.interact_pos())
         });
-        let click_on_ui = any_click
-            && click_pos.is_some_and(|p| {
-                ui.ctx()
-                    .layer_id_at(p)
-                    .is_some_and(|l| l.order > egui::Order::Background)
-            });
+        // Suppress overlay clicks when:
+        // - Click is outside the map pane rect (on panels, menu bar, status bar)
+        // - Click is on a floating UI element (hamburger button, popups)
+        // - A zoom-drag gesture is active (Android double-tap)
+        // - Click is on a higher-order egui layer (popup windows)
+        let click_on_ui = is_zoom_dragging
+            || (any_click
+                && click_pos.is_some_and(|p| {
+                    !pane_rect.contains(p)
+                        || excluded_rects.iter().any(|r| r.contains(p))
+                        || ui.ctx()
+                            .layer_id_at(p)
+                            .is_some_and(|l| l.order > egui::Order::Background)
+                }));
 
         Self {
             ui,

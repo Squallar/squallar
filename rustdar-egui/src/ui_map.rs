@@ -52,6 +52,28 @@ impl super::Gui {
 
                 let pointer_available = self.dismiss_overlay_popups(ui.ctx());
 
+                // Collect rects for floating UI elements that overlay the map
+                // (e.g., hamburger button on Android). Clicks in these areas
+                // must not trigger overlay polygon hit-tests.
+                let excluded_rects: Vec<egui::Rect> = {
+                    #[cfg(target_os = "android")]
+                    {
+                        let mut rects = Vec::new();
+                        if !self.mobile.show_menu {
+                            let top_inset = self.safe_area_insets.0;
+                            rects.push(egui::Rect::from_min_size(
+                                egui::pos2(12.0, 48.0 + top_inset),
+                                egui::vec2(48.0, 48.0),
+                            ));
+                        }
+                        rects
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        Vec::new()
+                    }
+                };
+
                 for pane_idx in 0..pane_count {
                     let pane_rect = self.pane_layout.pane_rect(pane_idx, panel_rect);
                     let is_active = pane_idx == self.active_pane;
@@ -124,6 +146,8 @@ impl super::Gui {
                                 is_dark_theme,
                                 scan_info_site_name: self.radar.scan_info.as_ref().map(|i| i.site.name),
                                 loading_site: &mut self.radar.loading_site,
+                                excluded_rects: excluded_rects.clone(),
+                                is_zoom_dragging,
                             };
 
                             pane_render::render_pane_map_content(ui, projector, zoom, &mut render_ctx);
