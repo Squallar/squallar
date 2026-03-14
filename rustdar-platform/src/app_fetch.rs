@@ -704,4 +704,20 @@ impl super::App {
             );
         }
     }
+
+    /// Re-initialize radar loops on all panes that have an active loop.
+    /// Called after a manual time navigation to rebase loops around the new scan time.
+    pub(super) fn reinit_active_loops(&mut self) {
+        let mut to_reinit = Vec::new();
+        for pane_idx in 0..self.gui.pane_count() {
+            if let Some(pane) = self.gui.pane_mut(pane_idx) {
+                if let Some(ls) = &pane.loop_state {
+                    to_reinit.push((pane_idx, ls.lookback_secs));
+                }
+            }
+        }
+        for (pane_idx, lookback_secs) in to_reinit {
+            self.handle_enable_loop(pane_idx, lookback_secs);
+        }
+    }
 }
