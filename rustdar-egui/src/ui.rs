@@ -35,10 +35,46 @@ pub(super) struct RadarState {
 
 /// Auto-polling timer state.
 pub(super) struct AutoPollState {
-    pub last_fetch_time: Option<std::time::Instant>,
+    last_fetch_time: Option<std::time::Instant>,
     pub enabled: bool,
-    pub initial_fetch_done: bool,
-    pub interval_secs: u64,
+    initial_fetch_done: bool,
+    interval_secs: u64,
+}
+
+impl AutoPollState {
+    /// Record that a fetch was just dispatched.
+    pub fn record_fetch(&mut self) {
+        self.last_fetch_time = Some(std::time::Instant::now());
+    }
+
+    /// Call when a scan loads successfully — resets backoff to the base interval.
+    pub fn on_success(&mut self) {
+        self.interval_secs = 60;
+    }
+
+    /// Call on fetch failure — exponential backoff capped at 5 minutes.
+    pub fn on_error(&mut self) {
+        self.interval_secs = (self.interval_secs * 2).min(300);
+    }
+
+    /// Whether the poll timer has elapsed and a new check should fire.
+    pub fn should_poll(&self) -> bool {
+        self.enabled
+            && self.last_fetch_time
+                .is_some_and(|t| t.elapsed().as_secs() >= self.interval_secs)
+    }
+
+    /// Seconds remaining until the next poll, if a timer is running.
+    pub fn time_until_next(&self) -> Option<u64> {
+        self.last_fetch_time.map(|t| {
+            self.interval_secs.saturating_sub(t.elapsed().as_secs())
+        })
+    }
+
+    /// Whether auto-poll has started (initial fetch done) and is enabled.
+    pub fn is_active(&self) -> bool {
+        self.enabled && self.initial_fetch_done
+    }
 }
 
 /// Time editing dialog state.
@@ -145,16 +181,12 @@ impl Gui {
         if !self.auto_poll.initial_fetch_done && !self.radar.fetching {
             self.radar.fetching = true;
             self.auto_poll.initial_fetch_done = true;
-            self.auto_poll.last_fetch_time = Some(std::time::Instant::now());
+            self.auto_poll.record_fetch();
             actions.push(GuiAction::FetchRadarScan(self.radar.config.clone()));
         }
 
         // Poll for new scans at the current poll interval
-        if self.auto_poll.enabled
-            && !self.radar.fetching
-            && let Some(last_fetch) = self.auto_poll.last_fetch_time
-            && last_fetch.elapsed().as_secs() >= self.auto_poll.interval_secs
-        {
+        if self.auto_poll.should_poll() && !self.radar.fetching {
             // Check for new files without downloading
             let now = chrono::Local::now().naive_local();
             let current_scan_time = now
@@ -168,7 +200,7 @@ impl Gui {
             actions.push(GuiAction::CheckForNewScans(config));
 
             // Reset timer to avoid spamming checks
-            self.auto_poll.last_fetch_time = Some(std::time::Instant::now());
+            self.auto_poll.record_fetch();
         }
 
         // Auto-refresh NWS alerts every 2 minutes when any pane has an NWS layer enabled
@@ -192,8 +224,7 @@ impl Gui {
     pub fn set_scan_info(&mut self, info: ScanInfo) {
         self.radar.scan_info = Some(info);
         self.radar.fetching = false;
-        // Reset poll interval on success
-        self.auto_poll.interval_secs = 60;
+        self.auto_poll.on_success();
 
         // Only zoom to radar on the first scan load to avoid disrupting user navigation
         if !self.initial_zoom_set {
@@ -213,8 +244,7 @@ impl Gui {
     pub fn set_error(&mut self, error: String) {
         self.radar.error_message = Some(error);
         self.radar.fetching = false;
-        // Exponential backoff: double poll interval on failure, cap at 5 minutes
-        self.auto_poll.interval_secs = (self.auto_poll.interval_secs * 2).min(300);
+        self.auto_poll.on_error();
     }
 
     #[cfg(not(target_os = "android"))]
@@ -326,9 +356,7 @@ impl Gui {
                         ui.spinner();
                     } else if self.auto_poll.enabled {
                         // Show time until next poll with checkbox
-                        if let Some(last_fetch) = self.auto_poll.last_fetch_time {
-                            let elapsed = last_fetch.elapsed().as_secs();
-                            let remaining = self.auto_poll.interval_secs.saturating_sub(elapsed);
+                        if let Some(remaining) = self.auto_poll.time_until_next() {
                             ui.checkbox(&mut self.auto_poll.enabled, &format!("Auto-poll (next in {}s)", remaining));
                         } else {
                             ui.checkbox(&mut self.auto_poll.enabled, "Auto-poll");
@@ -1258,7 +1286,7 @@ impl Gui {
 
     /// Whether auto-poll is active and the event loop should keep waking
     pub fn is_auto_poll_active(&self) -> bool {
-        (self.auto_poll.enabled && self.auto_poll.initial_fetch_done)
+        self.auto_poll.is_active()
             || self.panes.iter().any(|p| p.layers.any_nws_enabled())
     }
 
