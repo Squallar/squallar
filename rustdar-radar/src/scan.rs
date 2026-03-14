@@ -237,6 +237,72 @@ pub async fn download_scan(identifier: Identifier) -> Result<Scan> {
     Ok(scan)
 }
 
+/// Find and download the adjacent scan (next or previous) relative to the
+/// given UTC timestamp. Returns `(Scan, actual_utc_timestamp)`.
+///
+/// For *forward*: returns the first scan strictly after `current_timestamp`.
+///   If none exists on that day, returns the latest available scan.
+/// For *backward*: returns the last scan strictly before `current_timestamp`.
+///   If none exists on that day, tries the previous day.
+pub async fn get_adjacent_scan(
+    site: &str,
+    current_timestamp: NaiveDateTime,
+    forward: bool,
+) -> Result<(Scan, NaiveDateTime)> {
+    let date = current_timestamp.date();
+
+    // Collect scans from the current day (and neighbor day for boundary cases).
+    let mut all: Vec<(NaiveDateTime, Identifier)> = Vec::new();
+
+    // Always list the current day
+    if let Some((metas, effective_date)) = list_files_with_fallback(site, &date).await? {
+        for m in &metas {
+            let Some(time_str) = m.name().split('_').nth(1) else { continue };
+            let Ok(time) = NaiveTime::parse_from_str(time_str, "%H%M%S") else { continue };
+            all.push((effective_date.and_time(time), m.clone()));
+        }
+    }
+
+    // For forward: also list the next day if near the boundary
+    // For backward: also list the previous day
+    let neighbor = if forward { date + Duration::days(1) } else { date - Duration::days(1) };
+    if let Some((metas, effective_date)) = list_files_with_fallback(site, &neighbor).await? {
+        for m in &metas {
+            let Some(time_str) = m.name().split('_').nth(1) else { continue };
+            let Ok(time) = NaiveTime::parse_from_str(time_str, "%H%M%S") else { continue };
+            all.push((effective_date.and_time(time), m.clone()));
+        }
+    }
+
+    all.sort_by_key(|(dt, _)| *dt);
+    all.dedup_by_key(|(dt, _)| *dt);
+
+    let pick = if forward {
+        // First scan strictly after current_timestamp
+        all.iter()
+            .find(|(dt, _)| *dt > current_timestamp)
+            .or_else(|| all.last()) // cap to latest available
+    } else {
+        // Last scan strictly before current_timestamp
+        all.iter()
+            .rev()
+            .find(|(dt, _)| *dt < current_timestamp)
+            .or_else(|| all.first()) // cap to earliest available
+    };
+
+    let Some((ts, ident)) = pick else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No adjacent scan found",
+        ).into());
+    };
+
+    let ts = *ts;
+    let downloaded = download_file(ident.clone()).await?;
+    let scan = downloaded.scan()?;
+    Ok((scan, ts))
+}
+
 // ---------------------------------------------------------------------------
 // Level III product fetching
 // ---------------------------------------------------------------------------
