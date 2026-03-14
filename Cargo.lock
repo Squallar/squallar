@@ -3781,6 +3781,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "egui",
+ "log",
  "rustdar-overlays",
  "rustdar-radar",
  "serde",
@@ -3845,6 +3846,7 @@ dependencies = [
  "openssl-sys",
  "rayon",
  "reqwest 0.12.24",
+ "serde",
  "thiserror 2.0.17",
 ]
 

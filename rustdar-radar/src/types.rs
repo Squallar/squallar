@@ -215,7 +215,7 @@ fn discover_product_elevations(scan: &Scan) -> HashMap<RadarProduct, Vec<f32>> {
 }
 
 /// Radar product types
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum RadarProduct {
     Reflectivity,
     Velocity,

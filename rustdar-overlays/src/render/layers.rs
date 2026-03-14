@@ -2,7 +2,7 @@ use crate::nws::alert::AlertCategory;
 use crate::spc::outlook::{OutlookDay, OutlookProduct};
 
 /// Identifies each toggleable overlay layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum LayerKind {
     Radar,
     SpcCategorical,

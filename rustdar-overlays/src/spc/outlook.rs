@@ -2,7 +2,7 @@ use chrono::NaiveDateTime;
 use crate::types::{GeoPolygon, HatchPattern, OverlayFeature, CIG_FILL_ALPHA, REGULAR_FILL_ALPHA};
 
 /// Which outlook day to request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum OutlookDay {
     Day1,
     Day2,
