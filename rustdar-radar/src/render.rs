@@ -315,66 +315,13 @@ fn render_nrot_to_image(
         return None;
     }
 
-    // Get velocity parameters from first radial with velocity data
-    let first_vel = radials.iter().find_map(|r| r.velocity())?;
-    let gate_count = first_vel.gate_count() as usize;
-    let first_gate_range = first_vel.first_gate_range_km();
-    let gate_interval = first_vel.gate_interval_km();
+    let (vel_grid, azimuths_deg, gate_count, first_gate_range, gate_interval) =
+        build_velocity_grid(radials)?;
+
     let actual_max_range = first_gate_range + gate_count as f64 * gate_interval;
-
-    // Build velocity grid: vel_grid[radial_idx][gate_idx] = velocity in m/s or NAN
-    let mut vel_grid: Vec<Vec<f64>> = Vec::with_capacity(num_radials);
-    let mut azimuths_deg: Vec<f64> = Vec::with_capacity(num_radials);
-
-    for radial in radials.iter() {
-        azimuths_deg.push(radial.azimuth_angle_degrees() as f64);
-        let mut gates = vec![f64::NAN; gate_count];
-        if let Some(moment) = radial.velocity() {
-            for (j, val) in moment.values().iter().enumerate().take(gate_count) {
-                if let nexrad_model::data::MomentValue::Value(v) = val {
-                    if !v.is_nan() && *v < 999.0 {
-                        gates[j] = *v as f64;
-                    }
-                }
-            }
-        }
-        vel_grid.push(gates);
-    }
-
     let avg_spacing_deg = 360.0 / num_radials as f64;
-    let avg_spacing_rad = avg_spacing_deg.to_radians();
 
-    const NROT_SCALE: f64 = 250.0;
-    const MIN_RANGE_KM: f64 = 5.0;
-
-    // Pre-compute NROT grid
-    let nrot_grid: Vec<Vec<f64>> = (0..num_radials)
-        .map(|i| {
-            let i_prev = if i == 0 { num_radials - 1 } else { i - 1 };
-            let i_next = if i == num_radials - 1 { 0 } else { i + 1 };
-
-            (0..gate_count)
-                .map(|j| {
-                    let range_km = first_gate_range + j as f64 * gate_interval;
-                    if range_km < MIN_RANGE_KM {
-                        return f64::NAN;
-                    }
-
-                    let v_prev = vel_grid[i_prev][j];
-                    let v_next = vel_grid[i_next][j];
-
-                    if v_prev.is_nan() || v_next.is_nan() {
-                        return f64::NAN;
-                    }
-
-                    let delta_v = v_next - v_prev;
-                    let range_m = range_km * 1000.0;
-                    let az_shear = delta_v / (range_m * 2.0 * avg_spacing_rad);
-                    az_shear * NROT_SCALE
-                })
-                .collect()
-        })
-        .collect();
+    let nrot_grid = compute_nrot_grid(&vel_grid, gate_count, first_gate_range, gate_interval, avg_spacing_deg);
 
     let output = render_with_projection(
         radar_lat, 0.0, actual_max_range, "NROT",
@@ -407,6 +354,85 @@ fn render_nrot_to_image(
         },
     );
     Some(output)
+}
+
+/// Extract velocity data from Level II radials into a 2D grid (azimuth × range).
+///
+/// Returns `(vel_grid, azimuths_deg, gate_count, first_gate_range_km, gate_interval_km)`.
+fn build_velocity_grid(
+    radials: &[Radial],
+) -> Option<(Vec<Vec<f64>>, Vec<f64>, usize, f64, f64)> {
+    let first_vel = radials.iter().find_map(|r| r.velocity())?;
+    let gate_count = first_vel.gate_count() as usize;
+    let first_gate_range = first_vel.first_gate_range_km();
+    let gate_interval = first_vel.gate_interval_km();
+
+    let mut vel_grid: Vec<Vec<f64>> = Vec::with_capacity(radials.len());
+    let mut azimuths_deg: Vec<f64> = Vec::with_capacity(radials.len());
+
+    for radial in radials.iter() {
+        azimuths_deg.push(radial.azimuth_angle_degrees() as f64);
+        let mut gates = vec![f64::NAN; gate_count];
+        if let Some(moment) = radial.velocity() {
+            for (j, val) in moment.values().iter().enumerate().take(gate_count) {
+                if let nexrad_model::data::MomentValue::Value(v) = val {
+                    if !v.is_nan() && *v < 999.0 {
+                        gates[j] = *v as f64;
+                    }
+                }
+            }
+        }
+        vel_grid.push(gates);
+    }
+
+    Some((vel_grid, azimuths_deg, gate_count, first_gate_range, gate_interval))
+}
+
+/// Compute NROT (azimuthal shear × scale) from a velocity grid.
+///
+/// For each gate, computes the azimuthal velocity derivative using adjacent
+/// azimuths, normalizes by range to remove beam-broadening effects, and
+/// scales by `NROT_SCALE`.
+fn compute_nrot_grid(
+    vel_grid: &[Vec<f64>],
+    gate_count: usize,
+    first_gate_range: f64,
+    gate_interval: f64,
+    avg_spacing_deg: f64,
+) -> Vec<Vec<f64>> {
+    const NROT_SCALE: f64 = 250.0;
+    const MIN_RANGE_KM: f64 = 5.0;
+
+    let num_radials = vel_grid.len();
+    let avg_spacing_rad = avg_spacing_deg.to_radians();
+
+    (0..num_radials)
+        .map(|i| {
+            let i_prev = if i == 0 { num_radials - 1 } else { i - 1 };
+            let i_next = if i == num_radials - 1 { 0 } else { i + 1 };
+
+            (0..gate_count)
+                .map(|j| {
+                    let range_km = first_gate_range + j as f64 * gate_interval;
+                    if range_km < MIN_RANGE_KM {
+                        return f64::NAN;
+                    }
+
+                    let v_prev = vel_grid[i_prev][j];
+                    let v_next = vel_grid[i_next][j];
+
+                    if v_prev.is_nan() || v_next.is_nan() {
+                        return f64::NAN;
+                    }
+
+                    let delta_v = v_next - v_prev;
+                    let range_m = range_km * 1000.0;
+                    let az_shear = delta_v / (range_m * 2.0 * avg_spacing_rad);
+                    az_shear * NROT_SCALE
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Render a Level III radial product to an image projected for geographic display.
