@@ -10,8 +10,8 @@ impl super::Gui {
         lines.push(format!("pane_count={}", self.pane_layout.pane_count));
         lines.push(format!("viewport_sync={}", self.viewport_sync));
         lines.push(format!("sync_layers={}", self.sync_layers));
-        lines.push(format!("auto_poll={}", self.auto_poll_enabled));
-        lines.push(format!("site={}", self.radar_config.site));
+        lines.push(format!("auto_poll={}", self.auto_poll.enabled));
+        lines.push(format!("site={}", self.radar.config.site));
         let content = lines.join("\n");
         let _ = std::fs::write(path, content);
     }
@@ -52,12 +52,12 @@ impl super::Gui {
                     self.sync_layers = value.trim() == "true";
                 }
                 "auto_poll" => {
-                    self.auto_poll_enabled = value.trim() == "true";
+                    self.auto_poll.enabled = value.trim() == "true";
                 }
                 "site" => {
                     let site = value.trim().to_string();
                     if !site.is_empty() {
-                        self.radar_config.site = site;
+                        self.radar.config.site = site;
                     }
                 }
                 _ => {}

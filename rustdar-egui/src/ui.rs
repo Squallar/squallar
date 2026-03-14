@@ -24,25 +24,35 @@ use mobile::DoubleTapDragDetector;
 
 use map_overlays::{draw_spc_overlays, draw_spc_discussions, draw_nws_alerts, draw_label_tiles_overlay};
 
+/// Radar fetch lifecycle state.
+pub(super) struct RadarState {
+    pub config: RadarConfig,
+    pub scan_info: Option<ScanInfo>,
+    pub fetching: bool,
+    pub error_message: Option<String>,
+    pub loading_site: Option<String>,
+}
+
+/// Auto-polling timer state.
+pub(super) struct AutoPollState {
+    pub last_fetch_time: Option<std::time::Instant>,
+    pub enabled: bool,
+    pub initial_fetch_done: bool,
+    pub interval_secs: u64,
+}
+
+/// Time editing dialog state.
+pub(super) struct TimeDialogState {
+    pub date_string: String,
+    pub time_string: String,
+    pub show: bool,
+}
+
 pub struct Gui {
-    radar_config: RadarConfig,
-    scan_info: Option<ScanInfo>,
-    fetching: bool,
-    error_message: Option<String>,
-    // Temporary strings for editing date/time components
-    date_string: String,
-    time_string: String,
-    // Auto-polling state
-    last_fetch_time: Option<std::time::Instant>,
-    auto_poll_enabled: bool,
-    initial_fetch_done: bool,
-    initial_zoom_set: bool, // Track if we've already set the initial zoom
-    // Track which site is currently loading
-    loading_site: Option<String>,
-    // Time dialog state
-    show_time_dialog: bool,
-    // Auto-poll interval in seconds (increases on failure, resets on success)
-    poll_interval_secs: u64,
+    radar: RadarState,
+    auto_poll: AutoPollState,
+    time_dialog: TimeDialogState,
+    initial_zoom_set: bool,
     // --- Map tiles (shared across panes) ---
     map_tiles: MapTileState,
     // User's GPS location for blue dot indicator (lat, lon)
@@ -79,20 +89,26 @@ impl Gui {
         let time_string = radar_config.timestamp.format("%H:%M:%S").to_string();
 
         Self {
-            radar_config,
-            scan_info: None,
-            fetching: false,
-            error_message: None,
-            date_string,
-            time_string,
-            last_fetch_time: None,
-            auto_poll_enabled: true,
-            initial_fetch_done: false,
+            radar: RadarState {
+                config: radar_config,
+                scan_info: None,
+                fetching: false,
+                error_message: None,
+                loading_site: None,
+            },
+            auto_poll: AutoPollState {
+                last_fetch_time: None,
+                enabled: true,
+                initial_fetch_done: false,
+                interval_secs: 60,
+            },
+            time_dialog: TimeDialogState {
+                date_string,
+                time_string,
+                show: false,
+            },
             initial_zoom_set: false,
             map_tiles: MapTileState::default(),
-            loading_site: None,
-            show_time_dialog: false,
-            poll_interval_secs: 60,
             user_location: None,
             overlays: OverlayData::default(),
             panes: vec![PaneState::new()],
@@ -126,18 +142,18 @@ impl Gui {
     /// NWS alerts, and SPC discussions.
     fn check_auto_polls(&mut self, actions: &mut Vec<GuiAction>) {
         // Auto-fetch on first load
-        if !self.initial_fetch_done && !self.fetching {
-            self.fetching = true;
-            self.initial_fetch_done = true;
-            self.last_fetch_time = Some(std::time::Instant::now());
-            actions.push(GuiAction::FetchRadarScan(self.radar_config.clone()));
+        if !self.auto_poll.initial_fetch_done && !self.radar.fetching {
+            self.radar.fetching = true;
+            self.auto_poll.initial_fetch_done = true;
+            self.auto_poll.last_fetch_time = Some(std::time::Instant::now());
+            actions.push(GuiAction::FetchRadarScan(self.radar.config.clone()));
         }
 
         // Poll for new scans at the current poll interval
-        if self.auto_poll_enabled
-            && !self.fetching
-            && let Some(last_fetch) = self.last_fetch_time
-            && last_fetch.elapsed().as_secs() >= self.poll_interval_secs
+        if self.auto_poll.enabled
+            && !self.radar.fetching
+            && let Some(last_fetch) = self.auto_poll.last_fetch_time
+            && last_fetch.elapsed().as_secs() >= self.auto_poll.interval_secs
         {
             // Check for new files without downloading
             let now = chrono::Local::now().naive_local();
@@ -147,12 +163,12 @@ impl Gui {
                 .unwrap_or(now);
 
             // Use current time for the check request
-            let mut config = self.radar_config.clone();
+            let mut config = self.radar.config.clone();
             config.timestamp = current_scan_time;
             actions.push(GuiAction::CheckForNewScans(config));
 
             // Reset timer to avoid spamming checks
-            self.last_fetch_time = Some(std::time::Instant::now());
+            self.auto_poll.last_fetch_time = Some(std::time::Instant::now());
         }
 
         // Auto-refresh NWS alerts every 2 minutes when any pane has an NWS layer enabled
@@ -174,10 +190,10 @@ impl Gui {
 
     /// Update the scan info (called from the app when scan is loaded)
     pub fn set_scan_info(&mut self, info: ScanInfo) {
-        self.scan_info = Some(info);
-        self.fetching = false;
+        self.radar.scan_info = Some(info);
+        self.radar.fetching = false;
         // Reset poll interval on success
-        self.poll_interval_secs = 60;
+        self.auto_poll.interval_secs = 60;
 
         // Only zoom to radar on the first scan load to avoid disrupting user navigation
         if !self.initial_zoom_set {
@@ -190,15 +206,15 @@ impl Gui {
 
     /// Set fetching status
     pub fn set_fetching(&mut self, fetching: bool) {
-        self.fetching = fetching;
+        self.radar.fetching = fetching;
     }
 
     /// Set an error message
     pub fn set_error(&mut self, error: String) {
-        self.error_message = Some(error);
-        self.fetching = false;
+        self.radar.error_message = Some(error);
+        self.radar.fetching = false;
         // Exponential backoff: double poll interval on failure, cap at 5 minutes
-        self.poll_interval_secs = (self.poll_interval_secs * 2).min(300);
+        self.auto_poll.interval_secs = (self.auto_poll.interval_secs * 2).min(300);
     }
 
     #[cfg(not(target_os = "android"))]
@@ -217,7 +233,7 @@ impl Gui {
                     ui.checkbox(self.panes[self.active_pane].layers.enabled_mut(LayerKind::CityLabels), "Show city labels");
                     ui.separator();
                     if ui.button("Time...").clicked() {
-                        self.show_time_dialog = true;
+                        self.time_dialog.show = true;
                         ui.close_kind(egui::UiKind::Menu);
                     }
                 });
@@ -228,7 +244,7 @@ impl Gui {
     fn render_time_dialog(&mut self, ctx: &Context) -> Option<GuiAction> {
         let mut action = None;
         
-        if self.show_time_dialog {
+        if self.time_dialog.show {
             egui::Window::new("Set Time")
                 .collapsible(false)
                 .resizable(false)
@@ -239,19 +255,19 @@ impl Gui {
                         ui.add_space(10.0);
                         
                         ui.label("Date:");
-                        ui.text_edit_singleline(&mut self.date_string);
+                        ui.text_edit_singleline(&mut self.time_dialog.date_string);
                         
                         ui.add_space(5.0);
                         
                         ui.label("Time:");
-                        ui.text_edit_singleline(&mut self.time_string);
+                        ui.text_edit_singleline(&mut self.time_dialog.time_string);
                         
                         ui.add_space(10.0);
                         
                         if ui.button("Use Current Time").clicked() {
-                            self.radar_config.timestamp = chrono::Local::now().naive_local();
-                            self.date_string = self.radar_config.timestamp.format("%Y-%m-%d").to_string();
-                            self.time_string = self.radar_config.timestamp.format("%H:%M:%S").to_string();
+                            self.radar.config.timestamp = chrono::Local::now().naive_local();
+                            self.time_dialog.date_string = self.radar.config.timestamp.format("%Y-%m-%d").to_string();
+                            self.time_dialog.time_string = self.radar.config.timestamp.format("%H:%M:%S").to_string();
                         }
                         
                         ui.add_space(15.0);
@@ -259,19 +275,19 @@ impl Gui {
                         ui.horizontal(|ui| {
                             if ui.button("OK").clicked() {
                                 // Try to parse the date and time strings
-                                let datetime_str = format!("{} {}", self.date_string, self.time_string);
+                                let datetime_str = format!("{} {}", self.time_dialog.date_string, self.time_dialog.time_string);
                                 if let Ok(timestamp) = chrono::NaiveDateTime::parse_from_str(&datetime_str, "%Y-%m-%d %H:%M:%S") {
-                                    self.radar_config.timestamp = timestamp;
-                                    action = Some(GuiAction::FetchRadarScan(self.radar_config.clone()));
+                                    self.radar.config.timestamp = timestamp;
+                                    action = Some(GuiAction::FetchRadarScan(self.radar.config.clone()));
                                 }
-                                self.show_time_dialog = false;
+                                self.time_dialog.show = false;
                             }
                             
                             if ui.button("Cancel").clicked() {
                                 // Restore the original strings from the current config
-                                self.date_string = self.radar_config.timestamp.format("%Y-%m-%d").to_string();
-                                self.time_string = self.radar_config.timestamp.format("%H:%M:%S").to_string();
-                                self.show_time_dialog = false;
+                                self.time_dialog.date_string = self.radar.config.timestamp.format("%Y-%m-%d").to_string();
+                                self.time_dialog.time_string = self.radar.config.timestamp.format("%H:%M:%S").to_string();
+                                self.time_dialog.show = false;
                             }
                         });
                     });
@@ -293,38 +309,38 @@ impl Gui {
 
                     // Refresh button
                     let refresh_button = ui.add_enabled(
-                        !self.fetching,
+                        !self.radar.fetching,
                         egui::Button::new("🔄").frame(false)
                     );
                     if refresh_button.clicked() {
-                        action = Some(GuiAction::FetchRadarScan(self.radar_config.clone()));
+                        action = Some(GuiAction::FetchRadarScan(self.radar.config.clone()));
                     }
                     refresh_button.on_hover_text("Refresh radar data");
 
                     ui.separator();
 
                     // Unified auto-poll checkbox and status
-                    if self.fetching {
+                    if self.radar.fetching {
                         ui.label("🔄");
                         ui.label("Downloading");
                         ui.spinner();
-                    } else if self.auto_poll_enabled {
+                    } else if self.auto_poll.enabled {
                         // Show time until next poll with checkbox
-                        if let Some(last_fetch) = self.last_fetch_time {
+                        if let Some(last_fetch) = self.auto_poll.last_fetch_time {
                             let elapsed = last_fetch.elapsed().as_secs();
-                            let remaining = self.poll_interval_secs.saturating_sub(elapsed);
-                            ui.checkbox(&mut self.auto_poll_enabled, &format!("Auto-poll (next in {}s)", remaining));
+                            let remaining = self.auto_poll.interval_secs.saturating_sub(elapsed);
+                            ui.checkbox(&mut self.auto_poll.enabled, &format!("Auto-poll (next in {}s)", remaining));
                         } else {
-                            ui.checkbox(&mut self.auto_poll_enabled, "Auto-poll");
+                            ui.checkbox(&mut self.auto_poll.enabled, "Auto-poll");
                         }
                     } else {
-                        ui.checkbox(&mut self.auto_poll_enabled, "Auto-poll");
+                        ui.checkbox(&mut self.auto_poll.enabled, "Auto-poll");
                     }
 
                     ui.separator();
 
                     // Scan information
-                    if let Some(scan_info) = &self.scan_info {
+                    if let Some(scan_info) = &self.radar.scan_info {
                         ui.label(format!(
                             "Scan: {} @ {} UTC ({} products)",
                             scan_info.site.name,
@@ -352,14 +368,14 @@ impl Gui {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Error message (if any)
                         let mut dismiss_error = false;
-                        if let Some(error_msg) = &self.error_message {
+                        if let Some(error_msg) = &self.radar.error_message {
                             if ui.button("✕").clicked() {
                                 dismiss_error = true;
                             }
                             ui.label(error_msg.as_str());
                             ui.label("❌");
                         }
-                        if dismiss_error { self.error_message = None; }
+                        if dismiss_error { self.radar.error_message = None; }
                     });
                 });
             });
@@ -455,7 +471,7 @@ impl Gui {
                     let mut pane = std::mem::take(&mut self.panes[pane_idx]);
 
                     // Determine the map center
-                    let center = if let Some(scan_info) = &self.scan_info {
+                    let center = if let Some(scan_info) = &self.radar.scan_info {
                         Position::new(scan_info.site.lon, scan_info.site.lat)
                     } else {
                         Position::new(-98.5795, 39.8283) // Geographic center of contiguous USA
@@ -639,11 +655,11 @@ impl Gui {
                                     let zoom = memory.zoom() as f32;
                                     let icon_size = (10.0 + zoom * 2.0).clamp(8.0, 24.0);
 
-                                    let is_current_site = self.scan_info.as_ref()
+                                    let is_current_site = self.radar.scan_info.as_ref()
                                         .map(|info| info.site.name == radar_site.name)
                                         .unwrap_or(false);
 
-                                    let is_loading = self.loading_site.as_ref()
+                                    let is_loading = self.radar.loading_site.as_ref()
                                         .map(|loading| loading == radar_site.name)
                                         .unwrap_or(false);
 
@@ -663,7 +679,7 @@ impl Gui {
                                     let response = ui.allocate_rect(icon_rect, egui::Sense::click());
 
                                     if response.clicked() {
-                                        self.loading_site = Some(radar_site.name.to_string());
+                                        self.radar.loading_site = Some(radar_site.name.to_string());
                                         actions.push(GuiAction::SwitchRadarSite(radar_site.name.to_string()));
                                     }
 
@@ -803,7 +819,7 @@ impl Gui {
 
         if pane.layers.is_enabled(LayerKind::Radar) {
             ui.indent(format!("{id_prefix}radar_controls"), |ui| {
-                if let Some(scan_info) = &self.scan_info {
+                if let Some(scan_info) = &self.radar.scan_info {
                     let prev_product = pane.selected_product;
                     egui::ComboBox::from_id_salt(format!("{id_prefix}product_sel"))
                         .selected_text(pane.selected_product.name())
@@ -1115,13 +1131,13 @@ impl Gui {
 
     /// Get the selected product and elevation for rendering (active pane).
     pub fn get_rendering_params(&self) -> Option<(RadarProduct, f32)> {
-        self.panes[self.active_pane].get_rendering_params(self.scan_info.as_ref())
+        self.panes[self.active_pane].get_rendering_params(self.radar.scan_info.as_ref())
     }
 
     /// Get the rendering params for a specific pane.
     pub fn get_rendering_params_for_pane(&self, pane_idx: PaneId) -> Option<(RadarProduct, f32)> {
         self.panes.get(pane_idx)
-            .and_then(|p| p.get_rendering_params(self.scan_info.as_ref()))
+            .and_then(|p| p.get_rendering_params(self.radar.scan_info.as_ref()))
     }
 
     /// Number of active panes.
@@ -1131,22 +1147,21 @@ impl Gui {
 
     /// Get the current radar config
     pub fn get_radar_config(&self) -> &RadarConfig {
-        &self.radar_config
+        &self.radar.config
     }
 
     /// Set the radar config
     pub fn set_radar_config(&mut self, config: RadarConfig) {
-        // Read timestamps before moving config
         let date = config.timestamp.format("%Y-%m-%d").to_string();
         let time = config.timestamp.format("%H:%M:%S").to_string();
-        self.radar_config = config;
-        self.date_string = date;
-        self.time_string = time;
+        self.radar.config = config;
+        self.time_dialog.date_string = date;
+        self.time_dialog.time_string = time;
     }
 
     /// Set which site is currently loading
     pub fn set_loading_site(&mut self, site: Option<String>) {
-        self.loading_site = site;
+        self.radar.loading_site = site;
     }
 
     /// Set the user's GPS location for the blue dot indicator
@@ -1177,7 +1192,7 @@ impl Gui {
 
     /// Get the current scan info
     pub fn get_scan_info(&self) -> Option<&ScanInfo> {
-        self.scan_info.as_ref()
+        self.radar.scan_info.as_ref()
     }
 
     /// Get the active pane's radar image.
@@ -1243,7 +1258,7 @@ impl Gui {
 
     /// Whether auto-poll is active and the event loop should keep waking
     pub fn is_auto_poll_active(&self) -> bool {
-        (self.auto_poll_enabled && self.initial_fetch_done)
+        (self.auto_poll.enabled && self.auto_poll.initial_fetch_done)
             || self.panes.iter().any(|p| p.layers.any_nws_enabled())
     }
 
@@ -1252,7 +1267,7 @@ impl Gui {
             pane.clear_radar_image();
         }
         self.map_tiles.clear();
-        self.loading_site = None;
+        self.radar.loading_site = None;
     }
 
     /// Propagate the interacted pane's viewport (zoom + position) to all other panes.

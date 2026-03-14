@@ -181,21 +181,21 @@ impl super::Gui {
                 ui.horizontal_centered(|ui| {
                     // Refresh button
                     let refresh_button = ui.add_enabled(
-                        !self.fetching,
+                        !self.radar.fetching,
                         egui::Button::new("\u{1f504}").min_size(egui::vec2(44.0, 32.0))
                     );
                     if refresh_button.clicked() {
-                        action = Some(GuiAction::FetchRadarScan(self.radar_config.clone()));
+                        action = Some(GuiAction::FetchRadarScan(self.radar.config.clone()));
                     }
                     refresh_button.on_hover_text("Refresh radar data");
 
                     ui.separator();
 
                     // Status indicator
-                    if self.fetching {
+                    if self.radar.fetching {
                         ui.label("\u{1f504} Loading...");
                         ui.spinner();
-                    } else if let Some(scan_info) = &self.scan_info {
+                    } else if let Some(scan_info) = &self.radar.scan_info {
                         ui.label(format!("{} @ {}",
                             scan_info.site.name,
                             scan_info.timestamp.format("%H:%M")
@@ -208,13 +208,13 @@ impl super::Gui {
 
                     // Error message (if any)
                     let mut dismiss_error = false;
-                    if let Some(error_msg) = &self.error_message {
+                    if let Some(error_msg) = &self.radar.error_message {
                         if ui.button("\u{2715}").clicked() {
                             dismiss_error = true;
                         }
                         ui.label(error_msg.as_str());
                     }
-                    if dismiss_error { self.error_message = None; }
+                    if dismiss_error { self.radar.error_message = None; }
                 });
             });
 
@@ -303,22 +303,22 @@ impl super::Gui {
 
                     // Refresh
                     if ui
-                        .add_enabled(!self.fetching, egui::Button::new("\u{1f504}  Refresh Radar"))
+                        .add_enabled(!self.radar.fetching, egui::Button::new("\u{1f504}  Refresh Radar"))
                         .clicked()
                     {
-                        actions.push(GuiAction::FetchRadarScan(self.radar_config.clone()));
+                        actions.push(GuiAction::FetchRadarScan(self.radar.config.clone()));
                     }
 
                     // Time
                     if ui.button("\u{1f550}  Set Time...").clicked() {
-                        self.show_time_dialog = true;
+                        self.time_dialog.show = true;
                         self.show_mobile_menu = false; // close menu so dialog is visible
                     }
 
                     // Auto-poll
-                    ui.checkbox(&mut self.auto_poll_enabled, "\u{23f0}  Auto-poll");
+                    ui.checkbox(&mut self.auto_poll.enabled, "\u{23f0}  Auto-poll");
 
-                    if self.fetching {
+                    if self.radar.fetching {
                         ui.horizontal(|ui| {
                             ui.spinner();
                             ui.label("Loading...");
