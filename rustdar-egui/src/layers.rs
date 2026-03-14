@@ -98,19 +98,15 @@ impl LayerKind {
     }
 }
 
-/// Per-layer state (enabled, and future: opacity).
+/// Per-layer state (enabled toggle).
 #[derive(Debug, Clone)]
 pub struct LayerState {
     pub enabled: bool,
-    pub opacity: f32,
 }
 
 impl LayerState {
     pub fn new(enabled: bool) -> Self {
-        Self {
-            enabled,
-            opacity: 1.0,
-        }
+        Self { enabled }
     }
 }
 
