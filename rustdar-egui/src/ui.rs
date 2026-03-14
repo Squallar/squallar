@@ -400,6 +400,9 @@ impl Gui {
     ) {
         self.render_radar_controls(ui, pane, combo_width, id_prefix);
 
+        // --- Time navigation (forward/back/live) ---
+        self.render_time_navigation(ui, actions);
+
         // --- Radar loop controls ---
         self.render_loop_controls(ui, pane, actions);
 
@@ -498,6 +501,78 @@ impl Gui {
                 }
             });
         }
+    }
+
+    /// Available time step options: (seconds, label). 0 = "one scan".
+    const TIME_STEP_OPTIONS: &[(i64, &str)] = &[
+        (0, "1 scan"),
+        (600, "10 min"),
+        (1800, "30 min"),
+        (3600, "1 hr"),
+        (7200, "2 hr"),
+        (21600, "6 hr"),
+        (43200, "12 hr"),
+    ];
+
+    /// Render forward / live / back navigation buttons with a time step dropdown.
+    fn render_time_navigation(
+        &mut self,
+        ui: &mut egui::Ui,
+        actions: &mut Vec<GuiAction>,
+    ) {
+        ui.add_space(4.0);
+
+        // Time step dropdown
+        let step_label = Self::TIME_STEP_OPTIONS
+            .iter()
+            .find(|(s, _)| *s == self.time_step_secs)
+            .map(|(_, l)| *l)
+            .unwrap_or("10 min");
+
+        ui.horizontal(|ui| {
+            ui.label("Step:");
+            egui::ComboBox::from_id_salt("time_step_sel")
+                .selected_text(step_label)
+                .show_ui(ui, |ui| {
+                    for &(secs, label) in Self::TIME_STEP_OPTIONS {
+                        ui.selectable_value(&mut self.time_step_secs, secs, label);
+                    }
+                });
+        });
+
+        // Navigation buttons
+        ui.horizontal(|ui| {
+            // Back button
+            if ui.button("\u{25c0} Back").clicked() {
+                self.viewing_live = false;
+                if self.time_step_secs == 0 {
+                    actions.push(GuiAction::NavigateOneScan { forward: false });
+                } else {
+                    actions.push(GuiAction::NavigateTime { step_secs: -self.time_step_secs });
+                }
+            }
+
+            // Live button — highlighted when NOT live to indicate "click to return"
+            let live_button = if self.viewing_live {
+                egui::Button::new("\u{23fa} Live")
+            } else {
+                egui::Button::new(
+                    egui::RichText::new("\u{23fa} Live").color(egui::Color32::WHITE)
+                ).fill(egui::Color32::from_rgb(200, 50, 50))
+            };
+            if ui.add(live_button).clicked() && !self.viewing_live {
+                actions.push(GuiAction::JumpToLive);
+            }
+
+            // Forward button — disabled when live
+            if ui.add_enabled(!self.viewing_live, egui::Button::new("Forward \u{25b6}")).clicked() {
+                if self.time_step_secs == 0 {
+                    actions.push(GuiAction::NavigateOneScan { forward: true });
+                } else {
+                    actions.push(GuiAction::NavigateTime { step_secs: self.time_step_secs });
+                }
+            }
+        });
     }
 
     /// Render radar loop controls: enable/disable, lookback slider, speed slider,
