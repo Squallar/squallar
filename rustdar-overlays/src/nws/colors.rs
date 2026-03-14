@@ -3,114 +3,75 @@ const FILL_ALPHA: u8 = 80;
 /// Stroke is fully opaque.
 const STROKE_ALPHA: u8 = 255;
 
+/// Alert color table entry: all keywords must match (case-insensitive),
+/// and the first matching entry wins (most specific entries come first).
+struct AlertColorEntry {
+    keywords: &'static [&'static str],
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+/// Priority-ordered color table for NWS alert event names.
+///
+/// Each entry's keywords are matched case-insensitively against the event
+/// name. The first entry where *all* keywords are found wins. More specific
+/// entries (e.g. "tornado" + "warning") must appear before less specific
+/// fallbacks (e.g. "warning" alone).
+static ALERT_COLORS: &[AlertColorEntry] = &[
+    // ── Warnings (most severe first) ──
+    AlertColorEntry { keywords: &["tornado", "warning"],           r: 255, g: 0,   b: 0   }, // Red
+    AlertColorEntry { keywords: &["severe thunderstorm", "warning"], r: 255, g: 165, b: 0   }, // Orange
+    AlertColorEntry { keywords: &["flash flood", "warning"],       r: 139, g: 0,   b: 0   }, // Dark red
+    AlertColorEntry { keywords: &["flood", "warning"],             r: 0,   g: 255, b: 0   }, // Green
+    AlertColorEntry { keywords: &["blizzard", "warning"],          r: 255, g: 69,  b: 0   }, // OrangeRed
+    AlertColorEntry { keywords: &["winter storm", "warning"],      r: 255, g: 105, b: 180 }, // Hot pink
+    AlertColorEntry { keywords: &["ice storm", "warning"],         r: 139, g: 0,   b: 139 }, // Dark magenta
+    AlertColorEntry { keywords: &["wind chill", "warning"],        r: 176, g: 196, b: 222 }, // Light steel blue
+    AlertColorEntry { keywords: &["high wind", "warning"],         r: 218, g: 165, b: 32  }, // Goldenrod
+    AlertColorEntry { keywords: &["excessive heat", "warning"],    r: 199, g: 21,  b: 133 }, // MediumVioletRed
+    AlertColorEntry { keywords: &["freeze", "warning"],            r: 72,  g: 61,  b: 139 }, // Dark slate blue
+    AlertColorEntry { keywords: &["fire", "warning"],              r: 255, g: 69,  b: 0   }, // OrangeRed
+    AlertColorEntry { keywords: &["dust storm", "warning"],        r: 255, g: 228, b: 196 }, // Bisque
+
+    // ── Watches ──
+    AlertColorEntry { keywords: &["tornado", "watch"],             r: 255, g: 255, b: 0   }, // Yellow
+    AlertColorEntry { keywords: &["severe thunderstorm", "watch"], r: 219, g: 112, b: 147 }, // PaleVioletRed
+    AlertColorEntry { keywords: &["flash flood", "watch"],         r: 46,  g: 139, b: 87  }, // Sea green
+    AlertColorEntry { keywords: &["flood", "watch"],               r: 46,  g: 139, b: 87  }, // Sea green
+    AlertColorEntry { keywords: &["winter storm", "watch"],        r: 70,  g: 130, b: 180 }, // Steel blue
+    AlertColorEntry { keywords: &["wind chill", "watch"],          r: 95,  g: 158, b: 160 }, // CadetBlue
+    AlertColorEntry { keywords: &["excessive heat", "watch"],      r: 128, g: 0,   b: 0   }, // Maroon
+    AlertColorEntry { keywords: &["fire", "watch"],                r: 255, g: 222, b: 173 }, // NavajoWhite
+
+    // ── Advisories / Statements ──
+    AlertColorEntry { keywords: &["wind advisory"],                r: 210, g: 180, b: 140 }, // Tan
+    AlertColorEntry { keywords: &["winter weather advisory"],      r: 123, g: 104, b: 238 }, // MediumSlateBlue
+    AlertColorEntry { keywords: &["frost advisory"],               r: 100, g: 149, b: 237 }, // CornflowerBlue
+    AlertColorEntry { keywords: &["heat advisory"],                r: 255, g: 127, b: 80  }, // Coral
+    AlertColorEntry { keywords: &["dense fog advisory"],           r: 112, g: 128, b: 144 }, // SlateGray
+    AlertColorEntry { keywords: &["flood advisory"],               r: 0,   g: 255, b: 127 }, // SpringGreen
+    AlertColorEntry { keywords: &["special weather statement"],    r: 255, g: 228, b: 181 }, // Moccasin
+
+    // ── Fallbacks by category suffix ──
+    AlertColorEntry { keywords: &["warning"],                      r: 255, g: 0,   b: 0   }, // Generic red
+    AlertColorEntry { keywords: &["watch"],                        r: 255, g: 255, b: 0   }, // Generic yellow
+    AlertColorEntry { keywords: &["advisory"],                     r: 255, g: 215, b: 0   }, // Generic gold
+    AlertColorEntry { keywords: &["statement"],                    r: 255, g: 215, b: 0   }, // Generic gold
+];
+
 /// Map an NWS alert event name to (fill_rgba, stroke_rgba) colors.
 ///
 /// Colors follow standard weather display conventions. The event name
-/// is matched case-insensitively by checking if it contains known substrings.
+/// is matched case-insensitively against the `ALERT_COLORS` table; the
+/// first entry where all keywords match wins.
 pub fn alert_color(event: &str) -> ([u8; 4], [u8; 4]) {
     let e = event.to_lowercase();
-
-    // ── Warnings (most severe first) ──
-    if e.contains("tornado") && e.contains("warning") {
-        return rgb(255, 0, 0); // Red
+    for entry in ALERT_COLORS {
+        if entry.keywords.iter().all(|kw| e.contains(kw)) {
+            return rgb(entry.r, entry.g, entry.b);
+        }
     }
-    if e.contains("severe thunderstorm") && e.contains("warning") {
-        return rgb(255, 165, 0); // Orange
-    }
-    if e.contains("flash flood") && e.contains("warning") {
-        return rgb(139, 0, 0); // Dark red
-    }
-    if e.contains("flood") && e.contains("warning") {
-        return rgb(0, 255, 0); // Green
-    }
-    if e.contains("blizzard") && e.contains("warning") {
-        return rgb(255, 69, 0); // OrangeRed
-    }
-    if e.contains("winter storm") && e.contains("warning") {
-        return rgb(255, 105, 180); // Hot pink
-    }
-    if e.contains("ice storm") && e.contains("warning") {
-        return rgb(139, 0, 139); // Dark magenta
-    }
-    if e.contains("wind chill") && e.contains("warning") {
-        return rgb(176, 196, 222); // Light steel blue
-    }
-    if e.contains("high wind") && e.contains("warning") {
-        return rgb(218, 165, 32); // Goldenrod
-    }
-    if e.contains("excessive heat") && e.contains("warning") {
-        return rgb(199, 21, 133); // MediumVioletRed
-    }
-    if e.contains("freeze") && e.contains("warning") {
-        return rgb(72, 61, 139); // Dark slate blue
-    }
-    if e.contains("fire") && e.contains("warning") {
-        return rgb(255, 69, 0); // OrangeRed
-    }
-    if e.contains("dust storm") && e.contains("warning") {
-        return rgb(255, 228, 196); // Bisque
-    }
-
-    // ── Watches ──
-    if e.contains("tornado") && e.contains("watch") {
-        return rgb(255, 255, 0); // Yellow
-    }
-    if e.contains("severe thunderstorm") && e.contains("watch") {
-        return rgb(219, 112, 147); // PaleVioletRed
-    }
-    if e.contains("flash flood") && e.contains("watch") {
-        return rgb(46, 139, 87); // Sea green
-    }
-    if e.contains("flood") && e.contains("watch") {
-        return rgb(46, 139, 87); // Sea green
-    }
-    if e.contains("winter storm") && e.contains("watch") {
-        return rgb(70, 130, 180); // Steel blue
-    }
-    if e.contains("wind chill") && e.contains("watch") {
-        return rgb(95, 158, 160); // CadetBlue
-    }
-    if e.contains("excessive heat") && e.contains("watch") {
-        return rgb(128, 0, 0); // Maroon
-    }
-    if e.contains("fire") && e.contains("watch") {
-        return rgb(255, 222, 173); // NavajoWhite
-    }
-
-    // ── Advisories / Statements ──
-    if e.contains("wind advisory") {
-        return rgb(210, 180, 140); // Tan
-    }
-    if e.contains("winter weather advisory") {
-        return rgb(123, 104, 238); // MediumSlateBlue
-    }
-    if e.contains("frost advisory") {
-        return rgb(100, 149, 237); // CornflowerBlue
-    }
-    if e.contains("heat advisory") {
-        return rgb(255, 127, 80); // Coral
-    }
-    if e.contains("dense fog advisory") {
-        return rgb(112, 128, 144); // SlateGray
-    }
-    if e.contains("flood advisory") {
-        return rgb(0, 255, 127); // SpringGreen
-    }
-    if e.contains("special weather statement") {
-        return rgb(255, 228, 181); // Moccasin
-    }
-
-    // ── Fallback by category suffix ──
-    if e.contains("warning") {
-        return rgb(255, 0, 0); // Generic red warning
-    }
-    if e.contains("watch") {
-        return rgb(255, 255, 0); // Generic yellow watch
-    }
-    if e.contains("advisory") || e.contains("statement") {
-        return rgb(255, 215, 0); // Generic gold advisory
-    }
-
     // Unknown event type
     rgb(200, 200, 200)
 }
