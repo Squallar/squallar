@@ -32,7 +32,7 @@ impl super::App {
     /// Spawn Level III product fetches for all supported Level III products.
     /// Called after a Level II scan loads so the products are available
     /// alongside the base moments.
-    pub(super) fn spawn_level3_fetches(&self, site: &str, _timestamp: NaiveDateTime) {
+    pub(super) fn spawn_level3_fetches(&self, site: &str) {
         let generation = self.render.fetch_generation;
         for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
             let Some(dirs) = l3_product.tgftp_dirs() else { continue };

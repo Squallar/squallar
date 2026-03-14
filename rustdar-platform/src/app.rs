@@ -207,12 +207,11 @@ impl App {
                         log::info!("Received scan data from background thread");
                         let scan_info = ScanInfo::from_scan(&scan_data.scan, &scan_data.site, scan_data.timestamp);
                         let site = scan_data.site;
-                        let timestamp = scan_data.timestamp;
                         self.scan_data = Some(Arc::new(scan_data.scan));
                         self.gui.set_scan_info(scan_info);
                         self.gui.set_loading_site(None);
                         self.render.reset_panes();
-                        self.spawn_level3_fetches(&site, timestamp);
+                        self.spawn_level3_fetches(&site);
                         log::info!("Scan data loaded and UI updated");
                     }
                     Err(error_msg) => {
