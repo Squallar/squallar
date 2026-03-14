@@ -231,8 +231,7 @@ fn render_radar_sites(
         let is_current_site = scan_info_site_name == Some(radar_site.name);
         let is_loading = loading_site
             .as_ref()
-            .map(|s| s == radar_site.name)
-            .unwrap_or(false);
+            .is_some_and(|s| s == radar_site.name);
 
         let icon_color = if is_loading {
             egui::Color32::from_rgb(160, 32, 240)
@@ -244,7 +243,6 @@ fn render_radar_sites(
 
         let icon_rect =
             egui::Rect::from_center_size(site_screen, egui::vec2(icon_size, icon_size));
-
         let response = ui.allocate_rect(icon_rect, egui::Sense::click());
 
         if response.clicked() {
@@ -252,42 +250,57 @@ fn render_radar_sites(
             actions.push(GuiAction::SwitchRadarSite(radar_site.name.to_string()));
         }
 
-        ui.painter()
-            .circle_filled(site_screen, icon_size / 2.0, icon_color);
-        ui.painter().circle_stroke(
-            site_screen,
-            icon_size / 2.0,
-            egui::Stroke::new(1.5, egui::Color32::WHITE),
-        );
-
-        let text_color = if is_dark_theme {
-            egui::Color32::WHITE
-        } else {
-            egui::Color32::BLACK
-        };
-
-        let text_pos = egui::pos2(site_screen.x, site_screen.y + icon_size / 2.0 + 3.0);
-
-        ui.painter().text(
-            text_pos,
-            egui::Align2::CENTER_TOP,
-            radar_site.name,
-            egui::FontId::monospace(font_size),
-            text_color,
-        );
+        draw_site_marker(ui, site_screen, icon_size, icon_color, radar_site.name, font_size, is_dark_theme);
 
         if response.hovered() {
-            let elev_str = match radar_site.elev {
-                Some(e) => format!("{} ft", e),
-                None => "N/A".to_string(),
-            };
-            let tooltip_text = format!(
-                "{}\nLat: {:.3}°, Lon: {:.3}°\nElev: {}",
-                radar_site.name, radar_site.lat, radar_site.lon, elev_str
-            );
-            response.on_hover_text(tooltip_text);
+            show_site_tooltip(response, radar_site);
         }
     }
+}
+
+/// Draw a single radar site marker (filled circle with outline and label).
+fn draw_site_marker(
+    ui: &egui::Ui,
+    center: egui::Pos2,
+    icon_size: f32,
+    color: egui::Color32,
+    name: &str,
+    font_size: f32,
+    is_dark_theme: bool,
+) {
+    ui.painter()
+        .circle_filled(center, icon_size / 2.0, color);
+    ui.painter().circle_stroke(
+        center,
+        icon_size / 2.0,
+        egui::Stroke::new(1.5, egui::Color32::WHITE),
+    );
+
+    let text_color = if is_dark_theme {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::BLACK
+    };
+    let text_pos = egui::pos2(center.x, center.y + icon_size / 2.0 + 3.0);
+    ui.painter().text(
+        text_pos,
+        egui::Align2::CENTER_TOP,
+        name,
+        egui::FontId::monospace(font_size),
+        text_color,
+    );
+}
+
+/// Show a tooltip with site coordinates and elevation.
+fn show_site_tooltip(response: egui::Response, site: &rustdar_radar::sites::RadarSite) {
+    let elev_str = match site.elev {
+        Some(e) => format!("{} ft", e),
+        None => "N/A".to_string(),
+    };
+    response.on_hover_text(format!(
+        "{}\nLat: {:.3}°, Lon: {:.3}°\nElev: {}",
+        site.name, site.lat, site.lon, elev_str
+    ));
 }
 
 /// Draw user location blue dot indicator.
