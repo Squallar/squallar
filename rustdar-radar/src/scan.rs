@@ -193,6 +193,50 @@ pub async fn check_and_fetch_latest(
     Ok(Some((scan, latest_dt)))
 }
 
+/// List all available scans within a time range, returning their timestamps
+/// and file identifiers sorted oldest-first.
+///
+/// Issues one S3 LIST per date in the range (at most 2–3 calls for 24h).
+pub async fn list_scans_for_range(
+    site: &str,
+    start: NaiveDateTime,
+    end: NaiveDateTime,
+) -> Result<Vec<(NaiveDateTime, Identifier)>> {
+    let mut results = Vec::new();
+    let mut date = start.date();
+    let end_date = end.date();
+
+    while date <= end_date {
+        if let Some((metas, effective_date)) = list_files_with_fallback(site, &date).await? {
+            for m in &metas {
+                let Some(time_str) = m.name().split('_').nth(1) else {
+                    continue;
+                };
+                let Ok(time) = NaiveTime::parse_from_str(time_str, "%H%M%S") else {
+                    continue;
+                };
+                let dt = effective_date.and_time(time);
+                if dt >= start && dt <= end {
+                    results.push((dt, m.clone()));
+                }
+            }
+        }
+        date += Duration::days(1);
+    }
+
+    results.sort_by_key(|(dt, _)| *dt);
+    results.dedup_by_key(|(dt, _)| *dt);
+    Ok(results)
+}
+
+/// Download a single scan by its file identifier.
+pub async fn download_scan(identifier: Identifier) -> Result<Scan> {
+    log::info!("Downloading scan \"{}\"...", identifier.name());
+    let downloaded_file = download_file(identifier).await?;
+    let scan = downloaded_file.scan()?;
+    Ok(scan)
+}
+
 // ---------------------------------------------------------------------------
 // Level III product fetching
 // ---------------------------------------------------------------------------
