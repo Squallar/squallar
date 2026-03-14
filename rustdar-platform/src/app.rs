@@ -190,7 +190,7 @@ impl App {
     /// Process all GUI actions emitted during this frame.
     fn process_gui_actions(&mut self, actions: Vec<GuiAction>) {
         for action in actions {
-            log::info!("GUI action received: {}", action);
+            log::debug!("GUI action received: {}", action);
             self.handle_gui_action(action, None);
         }
     }
@@ -200,7 +200,7 @@ impl App {
         // Check for received scan data (with generation check)
         if let Ok(scan_resp) = self.channels.scan_receiver.try_recv() {
             if self.render.is_fetch_stale(scan_resp.generation) {
-                log::info!("Discarding stale scan result (gen {} < current {})", scan_resp.generation, self.render.fetch_generation);
+                log::debug!("Discarding stale scan result (gen {} < current {})", scan_resp.generation, self.render.fetch_generation);
             } else {
                 match scan_resp.result {
                     Ok(scan_data) => {
@@ -344,7 +344,7 @@ impl App {
             }
 
             if self.render.is_render_stale(rr.generation) {
-                log::info!("Discarding stale render result (gen {} < current {})", rr.generation, self.render.render_generation);
+                log::debug!("Discarding stale render result (gen {} < current {})", rr.generation, self.render.render_generation);
             } else if rr.pane_idx < self.gui.pane_count()
                 && self.gui.get_rendering_params_for_pane(rr.pane_idx).is_some()
             {
@@ -392,7 +392,7 @@ impl App {
     fn poll_level3_results(&mut self) {
         if let Ok(l3_resp) = self.channels.level3_receiver.try_recv() {
             if self.render.is_fetch_stale(l3_resp.generation) {
-                log::info!("Discarding stale Level III result (gen {} < current {})", l3_resp.generation, self.render.fetch_generation);
+                log::debug!("Discarding stale Level III result (gen {} < current {})", l3_resp.generation, self.render.fetch_generation);
             } else {
                 match l3_resp.result {
                     Ok(message) => {

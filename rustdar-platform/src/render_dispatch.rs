@@ -142,57 +142,8 @@ impl RenderDispatcher {
         let generation = self.render_generation;
 
         std::thread::spawn(move || {
-            log::debug!(
-                "L3 {:?}: pdb product_code={}, thresholds={:?}, ps47_53={:?}",
-                product,
-                l3_msg.pdb.product_code,
-                l3_msg.pdb.thresholds,
-                l3_msg.pdb.product_specific_47_53
-            );
             // Extract radial packet from symbology
             let radial_packet = l3_msg.symbology.as_ref().and_then(|sym| {
-                log::debug!(
-                    "L3 {:?}: symbology has {} layers",
-                    product,
-                    sym.layers.len()
-                );
-                for (li, layer) in sym.layers.iter().enumerate() {
-                    log::debug!(
-                        "L3 {:?}: layer {} has {} packets",
-                        product,
-                        li,
-                        layer.packets.len()
-                    );
-                    for (pi, pkt) in layer.packets.iter().enumerate() {
-                        match pkt {
-                            DataPacket::DigitalRadial(rp) => {
-                                log::debug!(
-                                    "L3 {:?}: layer[{}].packet[{}] = DigitalRadial: radials={}, bins={}, scale_factor={}, is_legacy={}, first_range_bin={}",
-                                    product, li, pi, rp.radials.len(), rp.num_range_bins, rp.scale_factor, rp.is_legacy, rp.first_range_bin
-                                );
-                                if let Some(r0) = rp.radials.first() {
-                                    let non_zero: usize =
-                                        r0.gate_values.iter().filter(|&&v| v > 1).count();
-                                    let max_val =
-                                        r0.gate_values.iter().copied().max().unwrap_or(0);
-                                    log::debug!(
-                                        "L3 {:?}: first radial: start_angle={}, delta={}, gates={}, non_zero(>1)={}, max_gate_val={}, first_10={:?}",
-                                        product, r0.start_angle, r0.angle_delta, r0.gate_values.len(), non_zero, max_val,
-                                        &r0.gate_values[..r0.gate_values.len().min(10)]
-                                    );
-                                }
-                            }
-                            DataPacket::Raster(_) => {
-                                log::debug!(
-                                    "L3 {:?}: layer[{}].packet[{}] = Raster",
-                                    product,
-                                    li,
-                                    pi
-                                );
-                            }
-                        }
-                    }
-                }
                 sym.layers.iter().find_map(|layer| {
                     layer.packets.iter().find_map(|pkt| {
                         if let DataPacket::DigitalRadial(rp) = pkt {
@@ -203,7 +154,12 @@ impl RenderDispatcher {
                     })
                 })
             });
-            if radial_packet.is_none() {
+            if let Some(rp) = &radial_packet {
+                log::debug!(
+                    "L3 {:?}: radials={}, bins={}, legacy={}, scale_factor={}",
+                    product, rp.radials.len(), rp.num_range_bins, rp.is_legacy, rp.scale_factor
+                );
+            } else {
                 log::warn!(
                     "L3 {:?}: no radial packet found in symbology!",
                     product
@@ -223,8 +179,8 @@ impl RenderDispatcher {
                     None
                 };
                 log::debug!(
-                    "L3 {:?}: rendering with scale={}, offset={}, legacy={}, lut_len={:?}, gate_interval_km={}, first_gate_range_km={}",
-                    product, scale, offset, rp.is_legacy, lut.map(|l| l.len()), rp.gate_interval_km(), rp.first_gate_range_km()
+                    "L3 {:?}: rendering with scale={}, offset={}, legacy={}, lut_len={:?}",
+                    product, scale, offset, rp.is_legacy, lut.map(|l| l.len())
                 );
                 if let Some((image, range, values)) =
                     render_level3_radial_to_image(rp, product, lat, lon, scale, offset, lut)
