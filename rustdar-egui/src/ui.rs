@@ -122,6 +122,11 @@ pub struct Gui {
     pane_layout: PaneLayout,
     viewport_sync: bool,
     sync_layers: bool,
+    // --- Radar loop settings ---
+    /// How far back (in seconds) to fetch historical scans for the loop.
+    pub loop_lookback_secs: u64,
+    /// Animation speed in frames per second.
+    pub loop_speed_fps: f32,
     #[cfg(target_os = "android")]
     mobile: MobileState,
     // Safe area insets in logical pixels (top, bottom, left, right)
@@ -169,6 +174,8 @@ impl Gui {
             pane_layout: PaneLayout::default(),
             viewport_sync: true,
             sync_layers: true,
+            loop_lookback_secs: 3600, // default 1 hour
+            loop_speed_fps: 5.0,      // default 5 fps
             #[cfg(target_os = "android")]
             mobile: MobileState::default(),
             safe_area_insets: (0.0, 0.0, 0.0, 0.0),
