@@ -13,10 +13,13 @@ struct UiConfig {
     loop_lookback_secs: u64,
     #[serde(default = "default_loop_speed_fps")]
     loop_speed_fps: f32,
+    #[serde(default = "default_time_step_secs")]
+    time_step_secs: i64,
 }
 
 fn default_loop_lookback_secs() -> u64 { 3600 }
 fn default_loop_speed_fps() -> f32 { 5.0 }
+fn default_time_step_secs() -> i64 { 600 }
 
 impl super::Gui {
     /// Save UI layout configuration to a JSON file.
@@ -31,6 +34,7 @@ impl super::Gui {
             site: self.radar.config.site.clone(),
             loop_lookback_secs: self.loop_lookback_secs,
             loop_speed_fps: self.loop_speed_fps,
+            time_step_secs: self.time_step_secs,
         };
         if let Ok(json) = serde_json::to_string_pretty(&config) {
             let _ = std::fs::write(path, json);
@@ -71,6 +75,7 @@ impl super::Gui {
 
         self.loop_lookback_secs = config.loop_lookback_secs;
         self.loop_speed_fps = config.loop_speed_fps;
+        self.time_step_secs = config.time_step_secs;
     }
 
     /// Get the config directory path for persistence.
