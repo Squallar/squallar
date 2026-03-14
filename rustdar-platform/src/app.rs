@@ -229,7 +229,7 @@ impl App {
                 match result {
                     Ok(outlook) => {
                         log::info!("Received SPC outlook: {:?} {:?}", day, product);
-                        self.gui.set_spc_outlook(day, product, outlook);
+                        self.gui.overlays.set_spc_outlook(day, product, outlook);
                     }
                     Err(e) => {
                         log::error!("SPC outlook fetch failed ({:?} {:?}): {}", day, product, e);
@@ -237,7 +237,7 @@ impl App {
                 }
             }
             if any_received {
-                self.gui.set_spc_fetching(false);
+                self.gui.overlays.set_spc_fetching(false);
             }
         }
 
@@ -246,13 +246,13 @@ impl App {
             match result {
                 Ok(alerts) => {
                     log::info!("Received {} NWS alerts", alerts.len());
-                    self.gui.set_nws_alerts(alerts);
+                    self.gui.overlays.set_nws_alerts(alerts);
                 }
                 Err(e) => {
                     log::error!("NWS alerts fetch failed: {}", e);
                 }
             }
-            self.gui.set_nws_fetching(false);
+            self.gui.overlays.set_nws_fetching(false);
         }
 
         // Check for received SPC Mesoscale Discussion data
@@ -260,13 +260,13 @@ impl App {
             match result {
                 Ok(discussions) => {
                     log::info!("Received {} SPC Mesoscale Discussions", discussions.len());
-                    self.gui.set_spc_discussions(discussions);
+                    self.gui.overlays.set_spc_discussions(discussions);
                 }
                 Err(e) => {
                     log::error!("SPC MD fetch failed: {}", e);
                 }
             }
-            self.gui.set_spc_md_fetching(false);
+            self.gui.overlays.set_spc_md_fetching(false);
         }
     }
 
@@ -677,7 +677,7 @@ impl App {
             }
             GuiAction::FetchSpcOutlook { day, products } => {
                 log::info!("Fetching SPC outlooks for {:?}: {:?}", day, products);
-                self.gui.set_spc_fetching(true);
+                self.gui.overlays.set_spc_fetching(true);
                 let client = self.http_client.clone();
                 let sender = self.channels.outlook_sender.clone();
                 let window = self.window.clone();
@@ -709,7 +709,7 @@ impl App {
             }
             GuiAction::FetchNwsAlerts | GuiAction::RefreshNwsAlerts => {
                 log::info!("Fetching NWS active alerts");
-                self.gui.set_nws_fetching(true);
+                self.gui.overlays.set_nws_fetching(true);
                 let client = self.http_client.clone();
                 let sender = self.channels.alert_sender.clone();
                 let window = self.window.clone();
@@ -730,7 +730,7 @@ impl App {
             }
             GuiAction::FetchSpcDiscussions | GuiAction::RefreshSpcDiscussions => {
                 log::info!("Fetching SPC Mesoscale Discussions");
-                self.gui.set_spc_md_fetching(true);
+                self.gui.overlays.set_spc_md_fetching(true);
                 let client = self.http_client.clone();
                 let sender = self.channels.discussion_sender.clone();
                 let window = self.window.clone();

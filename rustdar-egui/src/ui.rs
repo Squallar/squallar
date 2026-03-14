@@ -1,16 +1,13 @@
 use crate::actions::{GuiAction, RadarConfig};
 use crate::layers::{LayerKind, LayerManager};
-use crate::overlay_state::OverlayState;
+use crate::overlay_state::OverlayData;
 use crate::pane::{PaneId, PaneLayout, PaneState, RadarImageData, MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
 use crate::tiles::MapTileState;
 use chrono::Timelike;
 use egui::Context;
-use std::collections::{HashMap, HashSet};
 use rustdar_radar::types::{ImageBounds, RadarProduct, ScanInfo, IMAGE_SIZE, MAX_RANGE_KM};
 use rustdar_radar::sites::RADARS;
-use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
-use rustdar_overlays::spc::discussion::SpcDiscussion;
-use rustdar_overlays::nws::alert::NwsAlert;
+use rustdar_overlays::spc::outlook::OutlookDay;
 
 
 #[path = "ui_popups.rs"]
@@ -50,17 +47,8 @@ pub struct Gui {
     map_tiles: MapTileState,
     // User's GPS location for blue dot indicator (lat, lon)
     user_location: Option<(f64, f64)>,
-    spc_outlooks: OverlayState<HashMap<(OutlookDay, OutlookProduct), SpcOutlook>>,
-    /// Per-product SPC data generation (keyed separately for cache invalidation).
-    spc_data_generation: HashMap<(OutlookDay, OutlookProduct), u64>,
-    nws_alerts: OverlayState<Vec<NwsAlert>>,
-    /// Index of the currently selected alert for detail popup.
-    selected_alert: Option<usize>,
-    /// Alert IDs hidden by the user (not rendered on the map).
-    hidden_alerts: HashSet<String>,
-    spc_discussions: OverlayState<Vec<SpcDiscussion>>,
-    /// Index of the currently selected MD for detail popup.
-    selected_md: Option<usize>,
+    // Overlay data (SPC outlooks, NWS alerts, SPC discussions)
+    pub overlays: OverlayData,
     // Multi-pane state
     panes: Vec<PaneState>,
     active_pane: PaneId,
@@ -106,13 +94,7 @@ impl Gui {
             show_time_dialog: false,
             poll_interval_secs: 60,
             user_location: None,
-            spc_outlooks: OverlayState::new(),
-            spc_data_generation: HashMap::new(),
-            nws_alerts: OverlayState::new(),
-            selected_alert: None,
-            hidden_alerts: HashSet::new(),
-            spc_discussions: OverlayState::new(),
-            selected_md: None,
+            overlays: OverlayData::default(),
             panes: vec![PaneState::new()],
             active_pane: 0,
             pane_layout: PaneLayout::default(),
@@ -175,16 +157,16 @@ impl Gui {
 
         // Auto-refresh NWS alerts every 2 minutes when any pane has an NWS layer enabled
         if self.panes.iter().any(|p| p.layers.any_nws_enabled())
-            && !self.nws_alerts.fetching
-            && self.nws_alerts.needs_refresh(120)
+            && !self.overlays.nws_alerts.fetching
+            && self.overlays.nws_alerts.needs_refresh(120)
         {
             actions.push(GuiAction::FetchNwsAlerts);
         }
 
         // Auto-refresh SPC Mesoscale Discussions every 2 minutes when any pane has it enabled
         if self.panes.iter().any(|p| p.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions))
-            && !self.spc_discussions.fetching
-            && self.spc_discussions.needs_refresh(120)
+            && !self.overlays.spc_discussions.fetching
+            && self.overlays.spc_discussions.needs_refresh(120)
         {
             actions.push(GuiAction::FetchSpcDiscussions);
         }
@@ -446,8 +428,8 @@ impl Gui {
                     };
 
                 // Dismiss overlay popups when clicking outside them (once, not per-pane)
-                let pointer_available = self.selected_alert.is_none()
-                    && self.selected_md.is_none();
+                let pointer_available = self.overlays.selected_alert.is_none()
+                    && self.overlays.selected_md.is_none();
                 if !pointer_available {
                     let click_pos = ctx.input(|i| {
                         if i.pointer.any_click() {
@@ -460,8 +442,8 @@ impl Gui {
                         let on_popup = ctx.layer_id_at(pos)
                             .is_some_and(|l| l.order > egui::Order::Background);
                         if !on_popup {
-                            self.selected_alert = None;
-                            self.selected_md = None;
+                            self.overlays.selected_alert = None;
+                            self.overlays.selected_md = None;
                         }
                     }
                 }
@@ -529,10 +511,10 @@ impl Gui {
                                 projector,
                                 zoom,
                                 &pane.layers,
-                                &self.spc_outlooks.data,
+                                &self.overlays.spc_outlooks.data,
                                 self.map_tiles.current_theme_is_dark,
                                 &mut pane.spc_overlay_caches,
-                                &self.spc_data_generation,
+                                &self.overlays.spc_data_generation,
                             );
 
                             // Overlay radar data if available
@@ -611,13 +593,13 @@ impl Gui {
                                 projector,
                                 zoom,
                                 &pane.layers,
-                                &self.spc_discussions.data,
+                                &self.overlays.spc_discussions.data,
                                 &mut pane.spc_md_overlay_cache,
-                                self.spc_discussions.data_generation,
+                                self.overlays.spc_discussions.data_generation,
                                 pointer_available,
                             );
                             if let Some(idx) = clicked_md {
-                                self.selected_md = Some(idx);
+                                self.overlays.selected_md = Some(idx);
                             }
 
                             // Draw NWS alert polygons
@@ -626,14 +608,14 @@ impl Gui {
                                 projector,
                                 zoom,
                                 &pane.layers,
-                                &self.nws_alerts.data,
-                                &self.hidden_alerts,
+                                &self.overlays.nws_alerts.data,
+                                &self.overlays.hidden_alerts,
                                 &mut pane.nws_overlay_cache,
-                                self.nws_alerts.data_generation,
+                                self.overlays.nws_alerts.data_generation,
                                 pointer_available,
                             );
                             if let Some(idx) = clicked_alert {
-                                self.selected_alert = Some(idx);
+                                self.overlays.selected_alert = Some(idx);
                             }
 
                             // Draw label-only tiles on top of the radar overlay
@@ -910,7 +892,7 @@ impl Gui {
             let is_enabled = pane.layers.is_enabled(*layer);
             if is_enabled && !was_enabled {
                 if let Some(product) = layer.to_outlook_product() {
-                    if !self.spc_outlooks.data.contains_key(&(day, product)) {
+                    if !self.overlays.spc_outlooks.data.contains_key(&(day, product)) {
                         actions.push(GuiAction::FetchSpcOutlook {
                             day,
                             products: vec![product],
@@ -923,12 +905,12 @@ impl Gui {
         if pane.layers.any_spc_enabled() {
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!self.spc_outlooks.fetching, egui::Button::new("\u{1f504} Refresh"))
+                    .add_enabled(!self.overlays.spc_outlooks.fetching, egui::Button::new("\u{1f504} Refresh"))
                     .clicked()
                 {
                     actions.push(GuiAction::RefreshSpcOutlooks);
                 }
-                if self.spc_outlooks.fetching {
+                if self.overlays.spc_outlooks.fetching {
                     ui.spinner();
                 }
             });
@@ -940,17 +922,17 @@ impl Gui {
         // --- SPC Mesoscale Discussions ---
         {
             let was_enabled = pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
-            let label = if self.spc_discussions.data.is_empty() {
+            let label = if self.overlays.spc_discussions.data.is_empty() {
                 "\u{1f4cb}  Mesoscale Disc.".to_string()
             } else {
-                format!("\u{1f4cb}  Mesoscale Disc. ({})", self.spc_discussions.data.len())
+                format!("\u{1f4cb}  Mesoscale Disc. ({})", self.overlays.spc_discussions.data.len())
             };
             ui.checkbox(
                 pane.layers.enabled_mut(LayerKind::SpcMesoscaleDiscussions),
                 label,
             );
             let is_enabled = pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
-            if is_enabled && !was_enabled && self.spc_discussions.data.is_empty() && !self.spc_discussions.fetching {
+            if is_enabled && !was_enabled && self.overlays.spc_discussions.data.is_empty() && !self.overlays.spc_discussions.fetching {
                 actions.push(GuiAction::FetchSpcDiscussions);
             }
         }
@@ -958,16 +940,16 @@ impl Gui {
         if pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions) {
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!self.spc_discussions.fetching, egui::Button::new("\u{1f504} Refresh"))
+                    .add_enabled(!self.overlays.spc_discussions.fetching, egui::Button::new("\u{1f504} Refresh"))
                     .clicked()
                 {
                     actions.push(GuiAction::RefreshSpcDiscussions);
                 }
-                if self.spc_discussions.fetching {
+                if self.overlays.spc_discussions.fetching {
                     ui.spinner();
                 }
             });
-            if let Some(t) = self.spc_discussions.fetch_time {
+            if let Some(t) = self.overlays.spc_discussions.fetch_time {
                 let secs_ago = t.elapsed().as_secs();
                 let label = if secs_ago < 60 {
                     format!("Updated {}s ago", secs_ago)
@@ -989,7 +971,7 @@ impl Gui {
             let was_enabled = pane.layers.is_enabled(*layer);
             ui.checkbox(pane.layers.enabled_mut(*layer), layer.display_name());
             let is_enabled = pane.layers.is_enabled(*layer);
-            if is_enabled && !was_enabled && self.nws_alerts.data.is_empty() && !self.nws_alerts.fetching {
+            if is_enabled && !was_enabled && self.overlays.nws_alerts.data.is_empty() && !self.overlays.nws_alerts.fetching {
                 actions.push(GuiAction::FetchNwsAlerts);
             }
         }
@@ -997,23 +979,23 @@ impl Gui {
         if pane.layers.any_nws_enabled() {
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!self.nws_alerts.fetching, egui::Button::new("\u{1f504} Refresh"))
+                    .add_enabled(!self.overlays.nws_alerts.fetching, egui::Button::new("\u{1f504} Refresh"))
                     .clicked()
                 {
                     actions.push(GuiAction::RefreshNwsAlerts);
                 }
-                if self.nws_alerts.fetching {
+                if self.overlays.nws_alerts.fetching {
                     ui.spinner();
                 }
             });
-            if !self.nws_alerts.data.is_empty() {
+            if !self.overlays.nws_alerts.data.is_empty() {
                 let categories = pane.layers.enabled_nws_categories();
-                let visible_count = self.nws_alerts.data.iter()
+                let visible_count = self.overlays.nws_alerts.data.iter()
                     .filter(|a| categories.contains(&a.category))
                     .count();
                 ui.label(format!("{} alerts shown", visible_count));
             }
-            if let Some(t) = self.nws_alerts.fetch_time {
+            if let Some(t) = self.overlays.nws_alerts.fetch_time {
                 let secs_ago = t.elapsed().as_secs();
                 let label = if secs_ago < 60 {
                     format!("Updated {}s ago", secs_ago)
@@ -1176,43 +1158,6 @@ impl Gui {
 
     pub fn set_user_location(&mut self, lat: f64, lon: f64) {
         self.user_location = Some((lat, lon));
-    }
-
-    /// Store a fetched SPC outlook in the cache.
-    pub fn set_spc_outlook(&mut self, day: OutlookDay, product: OutlookProduct, outlook: SpcOutlook) {
-        self.spc_outlooks.data.insert((day, product), outlook);
-        self.spc_outlooks.fetch_time = Some(std::time::Instant::now());
-        // Bump per-product data generation to invalidate cached overlay geometry
-        let generation = self.spc_data_generation.entry((day, product)).or_insert(0);
-        *generation = generation.wrapping_add(1);
-    }
-
-    /// Set whether an SPC fetch is currently in progress.
-    pub fn set_spc_fetching(&mut self, fetching: bool) {
-        self.spc_outlooks.fetching = fetching;
-    }
-
-    /// Store fetched NWS alerts, replacing the previous set.
-    pub fn set_nws_alerts(&mut self, alerts: Vec<NwsAlert>) {
-        // Prune hidden_alerts for IDs no longer present
-        let current_ids: HashSet<String> = alerts.iter().map(|a| a.id.clone()).collect();
-        self.hidden_alerts.retain(|id| current_ids.contains(id));
-        self.nws_alerts.set_data(alerts);
-    }
-
-    /// Set whether an NWS alerts fetch is currently in progress.
-    pub fn set_nws_fetching(&mut self, fetching: bool) {
-        self.nws_alerts.fetching = fetching;
-    }
-
-    /// Store fetched SPC Mesoscale Discussions, replacing the previous set.
-    pub fn set_spc_discussions(&mut self, discussions: Vec<SpcDiscussion>) {
-        self.spc_discussions.set_data(discussions);
-    }
-
-    /// Set whether an SPC MD fetch is currently in progress.
-    pub fn set_spc_md_fetching(&mut self, fetching: bool) {
-        self.spc_discussions.fetching = fetching;
     }
 
     /// Get the active pane's layer manager (immutable).

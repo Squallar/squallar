@@ -11,11 +11,11 @@ pub(super) fn format_iso_time(iso: &str) -> String {
 impl super::Gui {
     /// Render the NWS alert detail popup when an alert is selected.
     pub(super) fn render_alert_popup(&mut self, ctx: &egui::Context) {
-        let Some(idx) = self.selected_alert else {
+        let Some(idx) = self.overlays.selected_alert else {
             return;
         };
-        let Some(alert) = self.nws_alerts.data.get(idx) else {
-            self.selected_alert = None;
+        let Some(alert) = self.overlays.nws_alerts.data.get(idx) else {
+            self.overlays.selected_alert = None;
             return;
         };
 
@@ -106,25 +106,25 @@ impl super::Gui {
                 ui.add_space(6.0);
                 ui.separator();
                 if ui.button("\u{1f6ab}  Hide from map").clicked() {
-                    self.hidden_alerts.insert(alert_id.clone());
+                    self.overlays.hidden_alerts.insert(alert_id.clone());
                     // Invalidate NWS overlay caches so hidden alert disappears immediately
-                    self.nws_alerts.data_generation = self.nws_alerts.data_generation.wrapping_add(1);
-                    self.selected_alert = None;
+                    self.overlays.nws_alerts.data_generation = self.overlays.nws_alerts.data_generation.wrapping_add(1);
+                    self.overlays.selected_alert = None;
                 }
             });
 
         if !open {
-            self.selected_alert = None;
+            self.overlays.selected_alert = None;
         }
     }
 
     /// Render the SPC Mesoscale Discussion detail popup when an MD is selected.
     pub(super) fn render_md_popup(&mut self, ctx: &egui::Context) {
-        let Some(idx) = self.selected_md else {
+        let Some(idx) = self.overlays.selected_md else {
             return;
         };
-        let Some(md) = self.spc_discussions.data.get(idx) else {
-            self.selected_md = None;
+        let Some(md) = self.overlays.spc_discussions.data.get(idx) else {
+            self.overlays.selected_md = None;
             return;
         };
 
@@ -197,7 +197,7 @@ impl super::Gui {
             });
 
         if !open {
-            self.selected_md = None;
+            self.overlays.selected_md = None;
         }
     }
 }

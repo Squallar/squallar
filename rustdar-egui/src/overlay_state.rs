@@ -1,3 +1,8 @@
+use std::collections::{HashMap, HashSet};
+use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
+use rustdar_overlays::spc::discussion::SpcDiscussion;
+use rustdar_overlays::nws::alert::NwsAlert;
+
 /// Generic wrapper for overlay data that follows the fetch-cache-generation pattern.
 ///
 /// Each overlay type (SPC outlooks, NWS alerts, SPC discussions) has the same
@@ -40,5 +45,72 @@ impl<T> OverlayState<T> {
     pub fn needs_refresh(&self, interval_secs: u64) -> bool {
         self.fetch_time
             .map_or(true, |t| t.elapsed().as_secs() >= interval_secs)
+    }
+}
+
+/// All shared overlay state: SPC outlooks, NWS alerts, SPC discussions,
+/// and their selection/hidden state.
+pub struct OverlayData {
+    pub spc_outlooks: OverlayState<HashMap<(OutlookDay, OutlookProduct), SpcOutlook>>,
+    /// Per-product SPC data generation (keyed separately for cache invalidation).
+    pub spc_data_generation: HashMap<(OutlookDay, OutlookProduct), u64>,
+    pub nws_alerts: OverlayState<Vec<NwsAlert>>,
+    /// Index of the currently selected alert for detail popup.
+    pub selected_alert: Option<usize>,
+    /// Alert IDs hidden by the user (not rendered on the map).
+    pub hidden_alerts: HashSet<String>,
+    pub spc_discussions: OverlayState<Vec<SpcDiscussion>>,
+    /// Index of the currently selected MD for detail popup.
+    pub selected_md: Option<usize>,
+}
+
+impl Default for OverlayData {
+    fn default() -> Self {
+        Self {
+            spc_outlooks: OverlayState::new(),
+            spc_data_generation: HashMap::new(),
+            nws_alerts: OverlayState::new(),
+            selected_alert: None,
+            hidden_alerts: HashSet::new(),
+            spc_discussions: OverlayState::new(),
+            selected_md: None,
+        }
+    }
+}
+
+impl OverlayData {
+    /// Store a fetched SPC outlook in the cache.
+    pub fn set_spc_outlook(&mut self, day: OutlookDay, product: OutlookProduct, outlook: SpcOutlook) {
+        self.spc_outlooks.data.insert((day, product), outlook);
+        self.spc_outlooks.fetch_time = Some(std::time::Instant::now());
+        let generation = self.spc_data_generation.entry((day, product)).or_insert(0);
+        *generation = generation.wrapping_add(1);
+    }
+
+    /// Set whether an SPC fetch is currently in progress.
+    pub fn set_spc_fetching(&mut self, fetching: bool) {
+        self.spc_outlooks.fetching = fetching;
+    }
+
+    /// Store fetched NWS alerts, replacing the previous set.
+    pub fn set_nws_alerts(&mut self, alerts: Vec<NwsAlert>) {
+        let current_ids: HashSet<String> = alerts.iter().map(|a| a.id.clone()).collect();
+        self.hidden_alerts.retain(|id| current_ids.contains(id));
+        self.nws_alerts.set_data(alerts);
+    }
+
+    /// Set whether an NWS alerts fetch is currently in progress.
+    pub fn set_nws_fetching(&mut self, fetching: bool) {
+        self.nws_alerts.fetching = fetching;
+    }
+
+    /// Store fetched SPC Mesoscale Discussions, replacing the previous set.
+    pub fn set_spc_discussions(&mut self, discussions: Vec<SpcDiscussion>) {
+        self.spc_discussions.set_data(discussions);
+    }
+
+    /// Set whether an SPC MD fetch is currently in progress.
+    pub fn set_spc_md_fetching(&mut self, fetching: bool) {
+        self.spc_discussions.fetching = fetching;
     }
 }
