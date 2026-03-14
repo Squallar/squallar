@@ -145,6 +145,68 @@ fn subtract_polygon_from_segment(
 
 
 
+/// Pre-computed parameters for sweeping hatch scanlines across a polygon's AABB.
+struct ScanlineParams {
+    /// Direction vector along the hatch line.
+    dir_x: f32,
+    dir_y: f32,
+    /// Normal vector (perpendicular to hatch direction).
+    norm_x: f32,
+    norm_y: f32,
+    /// Projection range along the normal — sweep `t` from `min_proj` to `max_proj`.
+    min_proj: f32,
+    max_proj: f32,
+    /// Half-length of each scanline in the direction axis.
+    line_half_len: f32,
+    /// Center projection along the direction axis.
+    dir_center: f32,
+}
+
+impl ScanlineParams {
+    /// Compute scanline sweep parameters from a polygon's AABB and hatch angle.
+    fn new(polygon_pts: &[Pos2], angle_degrees: f32) -> Option<Self> {
+        let (min_x, min_y, max_x, max_y) = geo::aabb(polygon_pts);
+        if min_x >= max_x || min_y >= max_y {
+            return None;
+        }
+
+        let angle_rad = angle_degrees.to_radians();
+        let dir_x = angle_rad.cos();
+        let dir_y = -angle_rad.sin();
+        let norm_x = -dir_y;
+        let norm_y = dir_x;
+
+        let corners = [
+            Pos2::new(min_x, min_y),
+            Pos2::new(max_x, min_y),
+            Pos2::new(min_x, max_y),
+            Pos2::new(max_x, max_y),
+        ];
+
+        let (mut min_proj, mut max_proj) = (f32::MAX, f32::MIN);
+        let (mut min_dir_proj, mut max_dir_proj) = (f32::MAX, f32::MIN);
+        for c in &corners {
+            let np = c.x * norm_x + c.y * norm_y;
+            min_proj = min_proj.min(np);
+            max_proj = max_proj.max(np);
+            let dp = c.x * dir_x + c.y * dir_y;
+            min_dir_proj = min_dir_proj.min(dp);
+            max_dir_proj = max_dir_proj.max(dp);
+        }
+
+        Some(Self {
+            dir_x,
+            dir_y,
+            norm_x,
+            norm_y,
+            min_proj,
+            max_proj,
+            line_half_len: (max_dir_proj - min_dir_proj) * 0.5 + 10.0,
+            dir_center: (min_dir_proj + max_dir_proj) * 0.5,
+        })
+    }
+}
+
 /// Collect hatch line segments at a given angle, clipped to the polygon.
 fn collect_directional_hatch(
     out: &mut Vec<(Pos2, Pos2, bool)>,
@@ -152,56 +214,16 @@ fn collect_directional_hatch(
     angle_degrees: f32,
     dotted: bool,
 ) {
-    let mut min_x = f32::MAX;
-    let mut min_y = f32::MAX;
-    let mut max_x = f32::MIN;
-    let mut max_y = f32::MIN;
-    for pt in polygon_pts {
-        min_x = min_x.min(pt.x);
-        min_y = min_y.min(pt.y);
-        max_x = max_x.max(pt.x);
-        max_y = max_y.max(pt.y);
-    }
-    if min_x >= max_x || min_y >= max_y {
+    let Some(params) = ScanlineParams::new(polygon_pts, angle_degrees) else {
         return;
-    }
+    };
 
-    let angle_rad = angle_degrees.to_radians();
-    let dir_x = angle_rad.cos();
-    let dir_y = -angle_rad.sin();
-    let norm_x = -dir_y;
-    let norm_y = dir_x;
-
-    let corners = [
-        Pos2::new(min_x, min_y),
-        Pos2::new(max_x, min_y),
-        Pos2::new(min_x, max_y),
-        Pos2::new(max_x, max_y),
-    ];
-    let mut min_proj = f32::MAX;
-    let mut max_proj = f32::MIN;
-    for c in &corners {
-        let proj = c.x * norm_x + c.y * norm_y;
-        min_proj = min_proj.min(proj);
-        max_proj = max_proj.max(proj);
-    }
-
-    let mut min_dir_proj = f32::MAX;
-    let mut max_dir_proj = f32::MIN;
-    for c in &corners {
-        let proj = c.x * dir_x + c.y * dir_y;
-        min_dir_proj = min_dir_proj.min(proj);
-        max_dir_proj = max_dir_proj.max(proj);
-    }
-    let line_half_len = (max_dir_proj - min_dir_proj) * 0.5 + 10.0;
-    let dir_center = (min_dir_proj + max_dir_proj) * 0.5;
-
-    let mut t = min_proj;
-    while t <= max_proj {
-        let cx = norm_x * t + dir_x * dir_center;
-        let cy = norm_y * t + dir_y * dir_center;
-        let p1 = Pos2::new(cx - dir_x * line_half_len, cy - dir_y * line_half_len);
-        let p2 = Pos2::new(cx + dir_x * line_half_len, cy + dir_y * line_half_len);
+    let mut t = params.min_proj;
+    while t <= params.max_proj {
+        let cx = params.norm_x * t + params.dir_x * params.dir_center;
+        let cy = params.norm_y * t + params.dir_y * params.dir_center;
+        let p1 = Pos2::new(cx - params.dir_x * params.line_half_len, cy - params.dir_y * params.line_half_len);
+        let p2 = Pos2::new(cx + params.dir_x * params.line_half_len, cy + params.dir_y * params.line_half_len);
         let segments = geo::clip_line_to_polygon(p1, p2, polygon_pts);
         for (s1, s2) in segments {
             out.push((s1, s2, dotted));
