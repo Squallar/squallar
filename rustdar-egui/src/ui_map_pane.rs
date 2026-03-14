@@ -157,6 +157,9 @@ pub(super) fn render_pane_map_content(
                     zoom: qzoom,
                 });
             }
+            if !any_spc_enabled {
+                ctx.pane.spc_overlay_texture.current = None;
+            }
         }
 
         // SPC Mesoscale Discussions

@@ -80,9 +80,16 @@ impl<'a> OverlayDrawContext<'a> {
     /// Draw SPC convective outlook overlays (texture-based).
     pub fn draw_spc_overlays(
         &self,
-        _layers: &rustdar_overlays::render::layers::LayerManager,
+        layers: &rustdar_overlays::render::layers::LayerManager,
         spc_texture: &OverlayTextureCache,
     ) {
+        let any_enabled = layers
+            .spc_layers_for_day()
+            .iter()
+            .any(|lk| layers.is_enabled(*lk));
+        if !any_enabled {
+            return;
+        }
         if let Some(ref tex) = spc_texture.current {
             draw_overlay_texture(self.ui.painter(), self.projector, tex, self.screen_rect);
         }
