@@ -216,8 +216,8 @@ impl Gui {
             actions.push(GuiAction::FetchRadarScan(self.radar.config.clone()));
         }
 
-        // Poll for new scans at the current poll interval
-        if self.auto_poll.should_poll() && !self.radar.fetching {
+        // Poll for new scans at the current poll interval (only when viewing live)
+        if self.viewing_live && self.auto_poll.should_poll() && !self.radar.fetching {
             // Check for new files without downloading
             let now = chrono::Local::now().naive_local();
             let current_scan_time = now
