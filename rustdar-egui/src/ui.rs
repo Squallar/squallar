@@ -379,7 +379,7 @@ impl Gui {
 
     /// Render the layer controls shared by desktop and mobile panels.
     ///
-    /// Covers: radar product/elevation, SPC outlooks, SPC discussions,
+    /// Covers: radar product/elevation, radar loop, SPC outlooks, SPC discussions,
     /// NWS alerts, city labels, radar sites, and viewport sync toggles.
     fn render_layer_controls(
         &mut self,
@@ -390,6 +390,9 @@ impl Gui {
         actions: &mut Vec<GuiAction>,
     ) {
         self.render_radar_controls(ui, pane, combo_width, id_prefix);
+
+        // --- Radar loop controls ---
+        self.render_loop_controls(ui, pane, actions);
 
         ui.add_space(6.0);
         ui.separator();
@@ -483,6 +486,123 @@ impl Gui {
                     }
                 } else {
                     ui.label("No scan loaded");
+                }
+            });
+        }
+    }
+
+    /// Render radar loop controls: enable/disable, lookback slider, speed slider,
+    /// transport buttons (play/pause, step, seek), and frame progress.
+    fn render_loop_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        pane: &mut PaneState,
+        actions: &mut Vec<GuiAction>,
+    ) {
+        ui.add_space(4.0);
+        let loop_active = pane.loop_state.is_some();
+
+        // Enable/disable toggle
+        let mut enabled = loop_active;
+        if ui.checkbox(&mut enabled, "\u{1f501}  Radar Loop").changed() {
+            if enabled {
+                actions.push(GuiAction::EnableLoop {
+                    pane_idx: self.active_pane,
+                    lookback_secs: self.loop_lookback_secs,
+                });
+            } else {
+                actions.push(GuiAction::DisableLoop {
+                    pane_idx: self.active_pane,
+                });
+            }
+        }
+
+        if loop_active {
+            ui.indent("loop_controls", |ui| {
+                // Lookback duration slider
+                let mut lookback_mins = (self.loop_lookback_secs as f32 / 60.0).round();
+                ui.horizontal(|ui| {
+                    ui.label("Lookback:");
+                    if ui.add(egui::Slider::new(&mut lookback_mins, 5.0..=1440.0)
+                        .logarithmic(true)
+                        .suffix(" min")
+                        .clamping(egui::SliderClamping::Always)
+                    ).changed() {
+                        self.loop_lookback_secs = (lookback_mins * 60.0) as u64;
+                    }
+                });
+
+                // Speed slider
+                ui.horizontal(|ui| {
+                    ui.label("Speed:");
+                    ui.add(egui::Slider::new(&mut self.loop_speed_fps, 1.0..=30.0)
+                        .suffix(" fps")
+                        .clamping(egui::SliderClamping::Always)
+                    );
+                });
+
+                if let Some(ls) = &pane.loop_state {
+                    // Frame status
+                    let rendered = ls.frames.iter().filter(|f| f.texture.is_some()).count();
+                    let total = ls.frames.len();
+                    if ls.fetching {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Loading scan list...");
+                        });
+                    } else if total == 0 {
+                        ui.label("No frames found");
+                    } else {
+                        ui.label(format!("{}/{} frames rendered", rendered, total));
+
+                        // Transport controls
+                        ui.horizontal(|ui| {
+                            // Step backward
+                            if ui.button("\u{23ee}").on_hover_text("Previous frame").clicked() {
+                                actions.push(GuiAction::StepLoopFrame {
+                                    pane_idx: self.active_pane,
+                                    forward: false,
+                                });
+                            }
+
+                            // Play/pause
+                            let play_label = if ls.playing { "\u{23f8}" } else { "\u{25b6}" };
+                            let play_hover = if ls.playing { "Pause" } else { "Play" };
+                            if ui.button(play_label).on_hover_text(play_hover).clicked() {
+                                actions.push(GuiAction::ToggleLoopPlayback {
+                                    pane_idx: self.active_pane,
+                                });
+                            }
+
+                            // Step forward
+                            if ui.button("\u{23ed}").on_hover_text("Next frame").clicked() {
+                                actions.push(GuiAction::StepLoopFrame {
+                                    pane_idx: self.active_pane,
+                                    forward: true,
+                                });
+                            }
+                        });
+
+                        // Frame seek slider
+                        let mut frame_idx = ls.current_frame;
+                        if ui.add(egui::Slider::new(&mut frame_idx, 0..=(total - 1))
+                            .show_value(false)
+                        ).changed() {
+                            actions.push(GuiAction::SeekLoopFrame {
+                                pane_idx: self.active_pane,
+                                frame_index: frame_idx,
+                            });
+                        }
+
+                        // Current frame timestamp
+                        if let Some(frame) = ls.frames.get(ls.current_frame) {
+                            ui.label(
+                                egui::RichText::new(
+                                    frame.timestamp.format("%H:%M:%S UTC").to_string()
+                                ).small()
+                            );
+                        }
+                    }
                 }
             });
         }
