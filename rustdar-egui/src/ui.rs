@@ -591,14 +591,16 @@ impl Gui {
         let mut enabled = loop_active;
         if ui.checkbox(&mut enabled, "\u{1f501}  Radar Loop").changed() {
             if enabled {
-                actions.push(GuiAction::EnableLoop {
-                    pane_idx: self.active_pane,
-                    lookback_secs: self.loop_lookback_secs,
-                });
+                for pane_idx in self.loop_sync_targets() {
+                    actions.push(GuiAction::EnableLoop {
+                        pane_idx,
+                        lookback_secs: self.loop_lookback_secs,
+                    });
+                }
             } else {
-                actions.push(GuiAction::DisableLoop {
-                    pane_idx: self.active_pane,
-                });
+                for pane_idx in self.loop_sync_targets() {
+                    actions.push(GuiAction::DisableLoop { pane_idx });
+                }
             }
         }
 
@@ -616,10 +618,12 @@ impl Gui {
                         let new_secs = (lookback_mins * 60.0) as u64;
                         if new_secs != self.loop_lookback_secs {
                             self.loop_lookback_secs = new_secs;
-                            actions.push(GuiAction::EnableLoop {
-                                pane_idx: self.active_pane,
-                                lookback_secs: new_secs,
-                            });
+                            for pane_idx in self.loop_sync_targets() {
+                                actions.push(GuiAction::EnableLoop {
+                                    pane_idx,
+                                    lookback_secs: new_secs,
+                                });
+                            }
                         }
                     }
                 });
@@ -664,10 +668,12 @@ impl Gui {
                         ui.horizontal(|ui| {
                             // Step backward
                             if ui.button("\u{23ee}").on_hover_text("Previous frame").clicked() {
-                                actions.push(GuiAction::StepLoopFrame {
-                                    pane_idx: self.active_pane,
-                                    forward: false,
-                                });
+                                for pane_idx in self.loop_sync_targets() {
+                                    actions.push(GuiAction::StepLoopFrame {
+                                        pane_idx,
+                                        forward: false,
+                                    });
+                                }
                             }
 
                             // Play/pause
@@ -683,17 +689,19 @@ impl Gui {
                             let resp = ui.add_enabled(!rendering || ls.playing, play_btn)
                                 .on_hover_text(play_hover);
                             if resp.clicked() {
-                                actions.push(GuiAction::ToggleLoopPlayback {
-                                    pane_idx: self.active_pane,
-                                });
+                                for pane_idx in self.loop_sync_targets() {
+                                    actions.push(GuiAction::ToggleLoopPlayback { pane_idx });
+                                }
                             }
 
                             // Step forward
                             if ui.button("\u{23ed}").on_hover_text("Next frame").clicked() {
-                                actions.push(GuiAction::StepLoopFrame {
-                                    pane_idx: self.active_pane,
-                                    forward: true,
-                                });
+                                for pane_idx in self.loop_sync_targets() {
+                                    actions.push(GuiAction::StepLoopFrame {
+                                        pane_idx,
+                                        forward: true,
+                                    });
+                                }
                             }
                         });
 
@@ -702,10 +710,12 @@ impl Gui {
                         if ui.add(egui::Slider::new(&mut frame_idx, 0..=(total - 1))
                             .show_value(false)
                         ).changed() {
-                            actions.push(GuiAction::SeekLoopFrame {
-                                pane_idx: self.active_pane,
-                                frame_index: frame_idx,
-                            });
+                            for pane_idx in self.loop_sync_targets() {
+                                actions.push(GuiAction::SeekLoopFrame {
+                                    pane_idx,
+                                    frame_index: frame_idx,
+                                });
+                            }
                         }
 
                         // Current frame timestamp
@@ -882,6 +892,17 @@ impl Gui {
                 };
                 ui.label(egui::RichText::new(label).small().weak());
             }
+        }
+    }
+
+    /// Return the pane indices that loop actions should target.
+    /// When `sync_layers` is on and there are multiple panes, returns all pane indices;
+    /// otherwise returns only the active pane.
+    fn loop_sync_targets(&self) -> Vec<usize> {
+        if self.sync_layers && self.pane_layout.pane_count > 1 {
+            (0..self.pane_layout.pane_count).collect()
+        } else {
+            vec![self.active_pane]
         }
     }
 
