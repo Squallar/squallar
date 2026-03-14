@@ -63,6 +63,10 @@ pub struct App {
     http_client: reqwest::Client,
     // Downloaded scan data cache for loop frames, keyed by (pane_idx, timestamp).
     loop_scan_cache: std::collections::HashMap<usize, std::collections::HashMap<chrono::NaiveDateTime, Arc<nexrad_model::data::Scan>>>,
+    // Cached latest scan from auto-poll while viewing historic data.
+    latest_cached_scan: Option<(Arc<nexrad_model::data::Scan>, ScanInfo, String, chrono::NaiveDateTime)>,
+    // Set when a manual time navigation fetch is pending; triggers loop reinit after scan loads.
+    manual_nav_pending: bool,
 }
 
 impl Default for App {
@@ -110,6 +114,8 @@ impl App {
             http_client,
             tokio_runtime,
             loop_scan_cache: std::collections::HashMap::new(),
+            latest_cached_scan: None,
+            manual_nav_pending: false,
         }
     }
 
