@@ -499,6 +499,70 @@ pub fn render_level3_radial_to_image(
     Some((image, max_range, value_data))
 }
 
+/// Render a Level III message to an image, extracting render parameters from the
+/// message's symbology block and product description block.
+///
+/// This is the high-level entry point for Level III rendering that encapsulates
+/// all nexrad-level3 internal knowledge (radial packet extraction, scale/offset,
+/// LUT building). Callers only need to provide the decoded message, product type,
+/// and radar location.
+pub fn render_level3_message_to_image(
+    l3_msg: &nexrad_level3::model::Level3Message,
+    product: types::RadarProduct,
+    radar_lat: f64,
+    radar_lon: f64,
+) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+    use nexrad_level3::model::DataPacket;
+
+    // Extract radial packet from symbology layers
+    let radial_packet = l3_msg.symbology.as_ref().and_then(|sym| {
+        sym.layers.iter().find_map(|layer| {
+            layer.packets.iter().find_map(|pkt| {
+                if let DataPacket::DigitalRadial(rp) = pkt {
+                    Some(rp)
+                } else {
+                    None
+                }
+            })
+        })
+    });
+
+    let rp = match radial_packet {
+        Some(rp) => {
+            log::debug!(
+                "L3 {:?}: radials={}, bins={}, legacy={}, scale_factor={}",
+                product, rp.radials.len(), rp.num_range_bins, rp.is_legacy, rp.scale_factor
+            );
+            rp
+        }
+        None => {
+            log::warn!("L3 {:?}: no radial packet found in symbology!", product);
+            return None;
+        }
+    };
+
+    // Build scale, offset, and optional LUT from the product description block
+    let scale = l3_msg.pdb.data_scale();
+    let offset = l3_msg.pdb.data_offset();
+    let vil_lut = l3_msg.pdb.build_vil_lut();
+    let legacy_lut;
+    let lut: Option<&[f32]> = if vil_lut.is_some() {
+        vil_lut.as_deref()
+    } else if rp.is_legacy {
+        legacy_lut = l3_msg.pdb.decode_legacy_thresholds();
+        Some(legacy_lut.as_slice())
+    } else {
+        None
+    };
+
+    log::debug!(
+        "L3 {:?}: rendering with scale={}, offset={}, legacy={}, lut_len={:?}",
+        product, scale, offset, rp.is_legacy, lut.map(|l| l.len())
+    );
+
+    render_level3_radial_to_image(rp, product, radar_lat, radar_lon, scale, offset, lut)
+}
+
 /// Convert a Level III gate byte to a physical value, applying LUT or scale/offset
 /// and the knots→m/s conversion for SRV products.
 fn l3_physical_value(

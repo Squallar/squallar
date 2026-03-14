@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use nexrad_level3::model::{DataPacket, Level3Message};
-use rustdar_radar::render::{render_level3_radial_to_image, render_radar_to_image};
+use nexrad_level3::model::Level3Message;
+use rustdar_radar::render::{render_level3_message_to_image, render_radar_to_image};
 use rustdar_radar::types::RadarProduct;
 
 use crate::WindowRef;
@@ -142,64 +142,18 @@ impl RenderDispatcher {
         let generation = self.render_generation;
 
         std::thread::spawn(move || {
-            // Extract radial packet from symbology
-            let radial_packet = l3_msg.symbology.as_ref().and_then(|sym| {
-                sym.layers.iter().find_map(|layer| {
-                    layer.packets.iter().find_map(|pkt| {
-                        if let DataPacket::DigitalRadial(rp) = pkt {
-                            Some(rp)
-                        } else {
-                            None
-                        }
-                    })
-                })
-            });
-            if let Some(rp) = &radial_packet {
-                log::debug!(
-                    "L3 {:?}: radials={}, bins={}, legacy={}, scale_factor={}",
-                    product, rp.radials.len(), rp.num_range_bins, rp.is_legacy, rp.scale_factor
-                );
-            } else {
-                log::warn!(
-                    "L3 {:?}: no radial packet found in symbology!",
-                    product
-                );
-            }
-            if let Some(rp) = radial_packet {
-                let scale = l3_msg.pdb.data_scale();
-                let offset = l3_msg.pdb.data_offset();
-                let vil_lut = l3_msg.pdb.build_vil_lut();
-                let legacy_lut;
-                let lut: Option<&[f32]> = if vil_lut.is_some() {
-                    vil_lut.as_deref()
-                } else if rp.is_legacy {
-                    legacy_lut = l3_msg.pdb.decode_legacy_thresholds();
-                    Some(legacy_lut.as_slice())
-                } else {
-                    None
-                };
-                log::debug!(
-                    "L3 {:?}: rendering with scale={}, offset={}, legacy={}, lut_len={:?}",
-                    product, scale, offset, rp.is_legacy, lut.map(|l| l.len())
-                );
-                if let Some((image, range, values)) =
-                    render_level3_radial_to_image(rp, product, lat, lon, scale, offset, lut)
-                {
-                    let _ = sender.send(RenderResponse {
-                        image_data: image,
-                        max_range_km: range,
-                        value_data: values,
-                        product,
-                        elevation,
-                        generation,
-                        pane_idx,
-                    });
-                } else {
-                    log::warn!(
-                        "L3 {:?}: render_level3_radial_to_image returned None",
-                        product
-                    );
-                }
+            if let Some((image, range, values)) =
+                render_level3_message_to_image(&l3_msg, product, lat, lon)
+            {
+                let _ = sender.send(RenderResponse {
+                    image_data: image,
+                    max_range_km: range,
+                    value_data: values,
+                    product,
+                    elevation,
+                    generation,
+                    pane_idx,
+                });
             }
             if let Some(window) = window {
                 window.request_redraw();
