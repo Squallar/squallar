@@ -43,8 +43,6 @@ pub struct App {
     old_textures: Vec<egui::TextureHandle>,
     // Cache the detected theme to avoid calling detection every frame
     cached_dark_theme: Option<bool>,
-    // Track the last applied visuals theme to skip redundant set_visuals calls
-    applied_visuals_dark: Option<bool>,
     // Flag for deferred exit when event_loop isn't available during redraw
     exit_requested: bool,
     // Shared Tokio runtime for all async network requests
@@ -94,7 +92,6 @@ impl App {
             texture_counter: 0,
             old_textures: Vec::new(),
             cached_dark_theme: None,
-            applied_visuals_dark: None,
             exit_requested: false,
             http_client,
             tokio_runtime,
@@ -305,39 +302,18 @@ impl App {
             state.egui_renderer.begin_frame(window);
 
             // Set theme based on OS preference
-            let detected_theme = window.theme();
-            let use_dark_theme = match detected_theme {
-                Some(theme) => {
-                    // winit successfully detected the theme
-                    matches!(theme, winit::window::Theme::Dark)
-                },
-                None => {
-                    // winit couldn't detect theme - use cached value if available
-                    // Otherwise detect using platform-specific methods and cache it
-                    match self.cached_dark_theme {
-                        Some(cached) => cached,
-                        None => {
-                            let detected = self.platform.detect_dark_theme();
-                            self.cached_dark_theme = Some(detected);
-                            detected
-                        }
+            let use_dark_theme = match window.theme() {
+                Some(theme) => matches!(theme, winit::window::Theme::Dark),
+                None => match self.cached_dark_theme {
+                    Some(cached) => cached,
+                    None => {
+                        let detected = self.platform.detect_dark_theme();
+                        self.cached_dark_theme = Some(detected);
+                        detected
                     }
-                }
+                },
             };
-            
-            // Only update egui visuals when the theme actually changes
-            if self.applied_visuals_dark != Some(use_dark_theme) {
-                self.applied_visuals_dark = Some(use_dark_theme);
-                let visuals = if use_dark_theme {
-                    egui::Visuals::dark()
-                } else {
-                    egui::Visuals::light()
-                };
-                state
-                    .egui_renderer
-                    .context()
-                    .set_visuals(visuals);
-            }
+            state.egui_renderer.apply_theme(use_dark_theme);
 
             let gui_action = self.gui.ui(state.egui_renderer.context());
 
@@ -589,7 +565,6 @@ impl App {
             self.render.clear_for_surface_loss();
             self.gui.clear_graphics_state();
             self.state = None;
-            self.applied_visuals_dark = None;
             return;
         }
         let Some(surface_texture) = surface_texture else {
@@ -879,7 +854,6 @@ impl ApplicationHandler for App {
         // Leaving state alive would keep a wgpu surface referencing the destroyed window.
         self.window = None;
         self.state = None;
-        self.applied_visuals_dark = None;
     }
 
     fn window_event(

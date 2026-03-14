@@ -10,6 +10,7 @@ use winit::window::Window;
 pub struct EguiRenderer {
     state: State,
     renderer: Renderer,
+    applied_visuals_dark: Option<bool>,
 }
 
 impl EguiRenderer {
@@ -50,6 +51,7 @@ impl EguiRenderer {
         EguiRenderer {
             state: egui_state,
             renderer: egui_renderer,
+            applied_visuals_dark: None,
         }
     }
 
@@ -126,6 +128,19 @@ impl EguiRenderer {
     pub fn free_textures(&mut self, ids: &[egui::TextureId]) {
         for id in ids {
             self.renderer.free_texture(id);
+        }
+    }
+
+    /// Apply dark/light theme only when it actually changes.
+    pub fn apply_theme(&mut self, use_dark: bool) {
+        if self.applied_visuals_dark != Some(use_dark) {
+            self.applied_visuals_dark = Some(use_dark);
+            let visuals = if use_dark {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            };
+            self.context().set_visuals(visuals);
         }
     }
 }
