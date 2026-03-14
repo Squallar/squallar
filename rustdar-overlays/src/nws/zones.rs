@@ -74,6 +74,8 @@ pub async fn resolve_zone_geometries(
         const MAX_CONCURRENT_FETCHES: usize = 50;
 
         let results: Vec<_> = stream::iter(urls_to_fetch.into_iter().map(|url| {
+            // reqwest::Client is backed by an Arc internally, so cloning is
+            // just an Arc::clone (O(1) ref-count bump, no connection pool copy).
             let client = client.clone();
             async move {
                 let result = fetch_zone_geometry(&client, &url).await;
@@ -132,6 +134,15 @@ async fn fetch_zone_geometry(
     client: &reqwest::Client,
     url: &str,
 ) -> Option<Vec<GeoPolygon>> {
+    let json = fetch_zone_json(client, url).await?;
+    parse_zone_polygons(&json, url)
+}
+
+/// Send an HTTP GET for a single NWS zone and return the parsed JSON body.
+async fn fetch_zone_json(
+    client: &reqwest::Client,
+    url: &str,
+) -> Option<serde_json::Value> {
     let response = client
         .get(url)
         .header("Accept", "application/geo+json")
@@ -161,18 +172,22 @@ async fn fetch_zone_geometry(
         })
         .ok()?;
 
-    let json: serde_json::Value = serde_json::from_str(&text)
+    serde_json::from_str(&text)
         .map_err(|e| {
             log::debug!("Invalid JSON from zone {}: {}", url, e);
             e
         })
-        .ok()?;
+        .ok()
+}
 
-    // Zone API returns a Feature directly — geometry is at the top level
+/// Extract and simplify polygons from a NWS zone GeoJSON Feature.
+///
+/// Zone API returns a Feature directly — geometry is at the top level.
+/// County polygons are simplified because they have 100+ vertices each,
+/// too detailed for map rendering and expensive for ear-clip triangulation.
+fn parse_zone_polygons(json: &serde_json::Value, url: &str) -> Option<Vec<GeoPolygon>> {
     let polys = super::alert::parse_geometry(json.get("geometry"))?;
 
-    // Simplify county polygons (they have 100+ vertices each — too detailed
-    // for map rendering and very expensive for ear-clip triangulation).
     let simplified: Vec<GeoPolygon> = polys
         .into_iter()
         .map(|polygon| {
@@ -185,7 +200,12 @@ async fn fetch_zone_geometry(
         .filter(|p: &GeoPolygon| !p.is_empty())
         .collect();
 
-    if simplified.is_empty() { None } else { Some(simplified) }
+    if simplified.is_empty() {
+        log::debug!("Zone {} produced no polygons after simplification", url);
+        None
+    } else {
+        Some(simplified)
+    }
 }
 
 // ── Disk cache helpers ───────────────────────────────────────────────────
