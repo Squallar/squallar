@@ -28,6 +28,12 @@ pub trait PlatformBridge {
     /// Get the zone cache directory.
     fn zone_cache_dir(&self) -> Option<&std::path::Path>;
 
+    /// Set the config directory for UI config persistence.
+    fn set_config_dir(&mut self, dir: std::path::PathBuf);
+
+    /// Get the config directory.
+    fn config_dir(&self) -> Option<&std::path::Path>;
+
     /// Request application exit. Returns `true` if the platform requires
     /// `std::process::exit` (Android), `false` for normal event-loop exit.
     fn needs_process_exit(&self) -> bool;
@@ -45,6 +51,7 @@ pub trait PlatformBridge {
 pub struct DesktopPlatform {
     back_handler: Option<fn()>,
     zone_cache_dir: Option<std::path::PathBuf>,
+    config_dir: Option<std::path::PathBuf>,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -53,7 +60,16 @@ impl DesktopPlatform {
         Self {
             back_handler: None,
             zone_cache_dir: Self::default_zone_cache_dir(),
+            config_dir: Self::default_config_dir(),
         }
+    }
+
+    fn default_config_dir() -> Option<std::path::PathBuf> {
+        let base = std::env::var("XDG_CONFIG_HOME")
+            .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.config", h)))
+            .or_else(|_| std::env::var("LOCALAPPDATA"))
+            .ok()?;
+        Some(std::path::PathBuf::from(base).join("rustdar"))
     }
 
     fn default_zone_cache_dir() -> Option<std::path::PathBuf> {
@@ -108,6 +124,14 @@ impl PlatformBridge for DesktopPlatform {
         self.zone_cache_dir.as_deref()
     }
 
+    fn set_config_dir(&mut self, dir: std::path::PathBuf) {
+        self.config_dir = Some(dir);
+    }
+
+    fn config_dir(&self) -> Option<&std::path::Path> {
+        self.config_dir.as_deref()
+    }
+
     fn needs_process_exit(&self) -> bool {
         false
     }
@@ -122,6 +146,7 @@ pub struct AndroidPlatform {
     insets_querier: Option<fn() -> (f32, f32, f32, f32)>,
     back_handler: Option<fn()>,
     zone_cache_dir: Option<std::path::PathBuf>,
+    config_dir: Option<std::path::PathBuf>,
 }
 
 #[cfg(target_os = "android")]
@@ -151,6 +176,7 @@ impl AndroidPlatform {
             insets_querier: None,
             back_handler: None,
             zone_cache_dir: None,
+            config_dir: None,
         }
     }
 }
@@ -201,6 +227,14 @@ impl PlatformBridge for AndroidPlatform {
 
     fn zone_cache_dir(&self) -> Option<&std::path::Path> {
         self.zone_cache_dir.as_deref()
+    }
+
+    fn set_config_dir(&mut self, dir: std::path::PathBuf) {
+        self.config_dir = Some(dir);
+    }
+
+    fn config_dir(&self) -> Option<&std::path::Path> {
+        self.config_dir.as_deref()
     }
 
     fn needs_process_exit(&self) -> bool {

@@ -184,19 +184,5 @@ impl super::Gui {
         }
     }
 
-    /// Get the config directory path for persistence.
-    /// Returns None on Android (uses set_config_dir externally).
-    pub fn default_config_dir() -> Option<std::path::PathBuf> {
-        #[cfg(target_os = "android")]
-        { return None; }
 
-        #[cfg(not(target_os = "android"))]
-        {
-            let base = std::env::var("XDG_CONFIG_HOME")
-                .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.config", h)))
-                .or_else(|_| std::env::var("LOCALAPPDATA"))
-                .ok()?;
-            Some(std::path::PathBuf::from(base).join("rustdar"))
-        }
-    }
 }

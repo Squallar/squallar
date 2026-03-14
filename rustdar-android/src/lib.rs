@@ -419,6 +419,11 @@ fn android_main(app: AndroidApp) {
         .internal_data_path()
         .and_then(|p| p.parent().map(|root| root.join("cache").join("zones")));
 
+    // Derive the config directory before `app` is moved into the event loop.
+    let android_config_dir = app
+        .internal_data_path()
+        .map(|p| p.join("config"));
+
     // Create event loop with Android app
     let event_loop = winit::event_loop::EventLoop::builder()
         .with_android_app(app)
@@ -434,6 +439,11 @@ fn android_main(app: AndroidApp) {
     // Set zone geometry cache directory for persistent caching
     if let Some(cache_path) = android_zone_cache {
         platform_app.set_zone_cache_dir(cache_path);
+    }
+
+    // Set config directory for UI config persistence on Android.
+    if let Some(config_path) = android_config_dir {
+        platform_app.set_config_dir(config_path);
     }
 
     // Set up a callback to query system bar insets when the window is ready.

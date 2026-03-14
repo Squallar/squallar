@@ -101,8 +101,8 @@ impl App {
             .unwrap_or_default();
 
         let mut gui = Gui::new();
-        if let Some(config_dir) = Gui::default_config_dir() {
-            gui.load_ui_config(&config_dir);
+        if let Some(config_dir) = platform.config_dir() {
+            gui.load_ui_config(config_dir);
         }
 
         Self {
@@ -326,8 +326,8 @@ impl App {
     /// Request application exit - handles both GUI and keyboard exit requests
     fn request_exit(&mut self, event_loop: Option<&ActiveEventLoop>) {
         // Persist UI config before exiting
-        if let Some(config_dir) = Gui::default_config_dir() {
-            self.gui.save_ui_config(&config_dir);
+        if let Some(config_dir) = self.platform.config_dir() {
+            self.gui.save_ui_config(config_dir);
         }
         if let Some(event_loop) = event_loop {
             log::info!("Exiting application");
@@ -349,6 +349,16 @@ impl App {
     /// Override the zone geometry cache directory.
     pub fn set_zone_cache_dir(&mut self, dir: std::path::PathBuf) {
         self.platform.set_zone_cache_dir(dir);
+    }
+
+    /// Override the UI config directory and load config from it.
+    pub fn set_config_dir(&mut self, dir: std::path::PathBuf) {
+        self.platform.set_config_dir(dir);
+        // Load config now — on Android this is called after App::new(),
+        // so the initial load in new() had no config dir yet.
+        if let Some(config_dir) = self.platform.config_dir() {
+            self.gui.load_ui_config(config_dir);
+        }
     }
 
     /// Set a receiver for GPS location updates (Android only).
@@ -410,6 +420,11 @@ impl ApplicationHandler for App {
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         log::info!("App suspended — clearing graphics state");
+        // Save config on suspend — on Android this is the only reliable save
+        // point before the system may kill the process.
+        if let Some(config_dir) = self.platform.config_dir() {
+            self.gui.save_ui_config(config_dir);
+        }
         self.old_textures.clear();
         self.render.clear_last_rendered();
         self.texture_counter = 0;
