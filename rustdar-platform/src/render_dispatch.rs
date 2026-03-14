@@ -72,15 +72,9 @@ impl RenderDispatcher {
         self.level3_data.clear();
     }
 
-    /// Clear render state for suspend/resume (keeps cached_render intact).
-    pub fn clear_for_suspend(&mut self) {
-        for prs in &mut self.pane_render {
-            prs.last_rendered = None;
-        }
-    }
-
-    /// Clear render state on surface loss (graphics state destroyed).
-    pub fn clear_for_surface_loss(&mut self) {
+    /// Clear render state for suspend/resume or surface loss.
+    /// Keeps `cached_render` intact for instant texture restore.
+    pub fn clear_last_rendered(&mut self) {
         for prs in &mut self.pane_render {
             prs.last_rendered = None;
         }

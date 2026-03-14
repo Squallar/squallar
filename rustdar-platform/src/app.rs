@@ -359,7 +359,7 @@ impl ApplicationHandler for App {
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         log::info!("App suspended — clearing graphics state");
         self.old_textures.clear();
-        self.render.clear_for_suspend();
+        self.render.clear_last_rendered();
         self.texture_counter = 0;
         self.gui.clear_graphics_state();        // Keep cached_render intact so we can re-upload the texture
         // immediately on resume without re-rendering.        // Clear both window and state so resumed() creates fresh ones.

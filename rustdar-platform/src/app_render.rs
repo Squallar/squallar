@@ -291,7 +291,7 @@ impl super::App {
             // recreates it with a fresh surface.  Keep cached_render so the radar
             // image can be restored instantly.
             self.old_textures.clear();
-            self.render.clear_for_surface_loss();
+            self.render.clear_last_rendered();
             self.gui.clear_graphics_state();
             self.state = None;
             return;
