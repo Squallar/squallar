@@ -193,7 +193,7 @@ fn parse_zone_polygons(json: &serde_json::Value, url: &str) -> Option<Vec<GeoPol
         .map(|polygon| {
             polygon
                 .into_iter()
-                .map(|ring| crate::types::simplify_ring(&ring, crate::types::SIMPLIFY_EPSILON))
+                .map(|ring| crate::render::geo::simplify_ring(&ring, crate::types::SIMPLIFY_EPSILON))
                 .filter(|r| r.len() >= 3)
                 .collect()
         })

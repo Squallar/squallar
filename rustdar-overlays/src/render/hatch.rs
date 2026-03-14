@@ -1,7 +1,5 @@
-use egui::{Pos2};
-use rustdar_overlays::types::HatchPattern;
-
-use crate::geo;
+use super::geo;
+use crate::types::{HatchPattern, ScreenPoint};
 
 /// Spacing between hatch lines in screen pixels.
 const HATCH_SPACING: f32 = 10.0;
@@ -15,10 +13,10 @@ const HATCH_SPACING: f32 = 10.0;
 /// areas. Any hatch segment portions that fall inside an exclusion polygon
 /// are removed so that e.g. CIG1 hatching doesn't show through a CIG2 region.
 pub fn generate_hatch_lines(
-    polygon_pts: &[Pos2],
+    polygon_pts: &[ScreenPoint],
     pattern: HatchPattern,
-    exclusion_polygons: &[&[Pos2]],
-) -> Vec<(Pos2, Pos2, bool)> {
+    exclusion_polygons: &[&[ScreenPoint]],
+) -> Vec<(ScreenPoint, ScreenPoint, bool)> {
     if polygon_pts.len() < 3 || pattern == HatchPattern::None {
         return Vec::new();
     }
@@ -47,8 +45,8 @@ pub fn generate_hatch_lines(
 
 /// Remove portions of hatch segments that fall inside any exclusion polygon.
 fn subtract_exclusion_polygons(
-    lines: &mut Vec<(Pos2, Pos2, bool)>,
-    exclusions: &[&[Pos2]],
+    lines: &mut Vec<(ScreenPoint, ScreenPoint, bool)>,
+    exclusions: &[&[ScreenPoint]],
 ) {
     let mut result = Vec::with_capacity(lines.len());
     for &(p1, p2, dotted) in lines.iter() {
@@ -87,10 +85,10 @@ fn subtract_exclusion_polygons(
 
 /// Subtract a single polygon from a line segment, outputting remaining portions.
 fn subtract_polygon_from_segment(
-    p1: Pos2,
-    p2: Pos2,
-    polygon: &[Pos2],
-    out: &mut Vec<(Pos2, Pos2)>,
+    p1: ScreenPoint,
+    p2: ScreenPoint,
+    polygon: &[ScreenPoint],
+    out: &mut Vec<(ScreenPoint, ScreenPoint)>,
 ) {
     let dx = p2.x - p1.x;
     let dy = p2.y - p1.y;
@@ -132,12 +130,12 @@ fn subtract_polygon_from_segment(
             continue;
         }
         let mid_t = (t0 + t1) * 0.5;
-        let mid = Pos2::new(p1.x + dx * mid_t, p1.y + dy * mid_t);
+        let mid = ScreenPoint::new(p1.x + dx * mid_t, p1.y + dy * mid_t);
         if !geo::point_in_polygon(mid, polygon) {
             // This portion is outside the exclusion polygon — keep it
             out.push((
-                Pos2::new(p1.x + dx * t0, p1.y + dy * t0),
-                Pos2::new(p1.x + dx * t1, p1.y + dy * t1),
+                ScreenPoint::new(p1.x + dx * t0, p1.y + dy * t0),
+                ScreenPoint::new(p1.x + dx * t1, p1.y + dy * t1),
             ));
         }
     }
@@ -164,7 +162,7 @@ struct ScanlineParams {
 
 impl ScanlineParams {
     /// Compute scanline sweep parameters from a polygon's AABB and hatch angle.
-    fn new(polygon_pts: &[Pos2], angle_degrees: f32) -> Option<Self> {
+    fn new(polygon_pts: &[ScreenPoint], angle_degrees: f32) -> Option<Self> {
         let (min_x, min_y, max_x, max_y) = geo::aabb(polygon_pts);
         if min_x >= max_x || min_y >= max_y {
             return None;
@@ -177,10 +175,10 @@ impl ScanlineParams {
         let norm_y = dir_x;
 
         let corners = [
-            Pos2::new(min_x, min_y),
-            Pos2::new(max_x, min_y),
-            Pos2::new(min_x, max_y),
-            Pos2::new(max_x, max_y),
+            ScreenPoint::new(min_x, min_y),
+            ScreenPoint::new(max_x, min_y),
+            ScreenPoint::new(min_x, max_y),
+            ScreenPoint::new(max_x, max_y),
         ];
 
         let (mut min_proj, mut max_proj) = (f32::MAX, f32::MIN);
@@ -209,8 +207,8 @@ impl ScanlineParams {
 
 /// Collect hatch line segments at a given angle, clipped to the polygon.
 fn collect_directional_hatch(
-    out: &mut Vec<(Pos2, Pos2, bool)>,
-    polygon_pts: &[Pos2],
+    out: &mut Vec<(ScreenPoint, ScreenPoint, bool)>,
+    polygon_pts: &[ScreenPoint],
     angle_degrees: f32,
     dotted: bool,
 ) {
@@ -222,8 +220,8 @@ fn collect_directional_hatch(
     while t <= params.max_proj {
         let cx = params.norm_x * t + params.dir_x * params.dir_center;
         let cy = params.norm_y * t + params.dir_y * params.dir_center;
-        let p1 = Pos2::new(cx - params.dir_x * params.line_half_len, cy - params.dir_y * params.line_half_len);
-        let p2 = Pos2::new(cx + params.dir_x * params.line_half_len, cy + params.dir_y * params.line_half_len);
+        let p1 = ScreenPoint::new(cx - params.dir_x * params.line_half_len, cy - params.dir_y * params.line_half_len);
+        let p2 = ScreenPoint::new(cx + params.dir_x * params.line_half_len, cy + params.dir_y * params.line_half_len);
         let segments = geo::clip_line_to_polygon(p1, p2, polygon_pts);
         for (s1, s2) in segments {
             out.push((s1, s2, dotted));
@@ -231,4 +229,3 @@ fn collect_directional_hatch(
         t += HATCH_SPACING;
     }
 }
-

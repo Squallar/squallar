@@ -11,12 +11,12 @@
 //! invariant), so only vertex projection needs to run on cache misses.
 
 use egui::{Mesh, Pos2, Rect, Shape, Stroke};
-use rustdar_overlays::types::{GeoBounds, HatchPattern, OverlayFeature};
+use rustdar_overlays::render::geo as overlay_geo;
+use rustdar_overlays::render::hatch::generate_hatch_lines;
+use rustdar_overlays::types::{GeoBounds, HatchPattern, OverlayFeature, ScreenPoint};
 use walkers::Projector;
 
 use crate::geo;
-
-use crate::hatch::generate_hatch_lines;
 
 /// A viewport fingerprint used to decide whether cached geometry can be reused.
 ///
@@ -182,21 +182,21 @@ pub fn build_cached_features(
 /// higher-severity filled regions.
 fn apply_hatch_lines(cached: &mut [CachedFeature], features: &[OverlayFeature]) {
     // Collect screen-space polygon vertex lists grouped by CIG level
-    let mut cig2_polys: Vec<Vec<Pos2>> = Vec::new();
-    let mut cig3_polys: Vec<Vec<Pos2>> = Vec::new();
+    let mut cig2_polys: Vec<Vec<ScreenPoint>> = Vec::new();
+    let mut cig3_polys: Vec<Vec<ScreenPoint>> = Vec::new();
     for (feat_idx, feature) in features.iter().enumerate() {
         match feature.hatch {
             HatchPattern::Cig2 => {
                 for cp in &cached[feat_idx].polygons {
                     if cp.screen_pts.len() >= 3 {
-                        cig2_polys.push(cp.screen_pts.clone());
+                        cig2_polys.push(geo::slice_to_screen(&cp.screen_pts));
                     }
                 }
             }
             HatchPattern::Cig3 => {
                 for cp in &cached[feat_idx].polygons {
                     if cp.screen_pts.len() >= 3 {
-                        cig3_polys.push(cp.screen_pts.clone());
+                        cig3_polys.push(geo::slice_to_screen(&cp.screen_pts));
                     }
                 }
             }
@@ -211,7 +211,7 @@ fn apply_hatch_lines(cached: &mut [CachedFeature], features: &[OverlayFeature]) 
         }
 
         // Build the exclusion list: higher-CIG polygons that should mask this feature's hatch
-        let exclusions: Vec<&[Pos2]> = match feature.hatch {
+        let exclusions: Vec<&[ScreenPoint]> = match feature.hatch {
             HatchPattern::Cig1 => {
                 // CIG1 is masked by CIG2 and CIG3
                 cig2_polys.iter().map(|v| v.as_slice())
@@ -227,11 +227,11 @@ fn apply_hatch_lines(cached: &mut [CachedFeature], features: &[OverlayFeature]) 
 
         for cp in &mut cached[feat_idx].polygons {
             if cp.screen_pts.len() >= 3 {
-                cp.hatch_lines = generate_hatch_lines(
-                    &cp.screen_pts,
-                    feature.hatch,
-                    &exclusions,
-                );
+                let sp = geo::slice_to_screen(&cp.screen_pts);
+                cp.hatch_lines = generate_hatch_lines(&sp, feature.hatch, &exclusions)
+                    .into_iter()
+                    .map(|(a, b, d)| (geo::to_pos2(a), geo::to_pos2(b), d))
+                    .collect();
             }
         }
     }
@@ -289,7 +289,8 @@ fn project_and_cull(
         return None;
     }
 
-    let (min_x, min_y, max_x, max_y) = geo::aabb(&projected);
+    let sp = geo::slice_to_screen(&projected);
+    let (min_x, min_y, max_x, max_y) = overlay_geo::aabb(&sp);
     let poly_rect = Rect::from_min_max(egui::pos2(min_x, min_y), egui::pos2(max_x, max_y));
 
     if !screen_rect.expand(20.0).intersects(poly_rect) {

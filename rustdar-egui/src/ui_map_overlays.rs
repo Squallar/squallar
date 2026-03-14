@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use walkers::{HttpTiles, Texture, TileId, Tiles};
-use crate::layers::LayerKind;
+use rustdar_overlays::render::layers::LayerKind;
 use crate::overlay_cache::{
     CachedFeature, OverlayLayerCache, ViewportKey, MeshAccumulator,
     build_cached_features, draw_cached_features,
@@ -86,14 +86,18 @@ impl<'a> OverlayDrawContext<'a> {
             && self.any_click
             && self.click_pos.is_some_and(|p| {
                 poly.poly_rect.contains(p)
-                    && crate::geo::point_in_polygon(p, &poly.screen_pts)
+                    && {
+                        let sp = crate::geo::to_screen(p);
+                        let verts = crate::geo::slice_to_screen(&poly.screen_pts);
+                        rustdar_overlays::render::geo::point_in_polygon(sp, &verts)
+                    }
             })
     }
 
     /// Draw SPC convective outlook polygons on the map.
     pub fn draw_spc_overlays(
         &self,
-        layers: &crate::layers::LayerManager,
+        layers: &rustdar_overlays::render::layers::LayerManager,
         spc_outlooks: &HashMap<(OutlookDay, OutlookProduct), SpcOutlook>,
         caches: &mut HashMap<(OutlookDay, OutlookProduct), OverlayLayerCache>,
         data_generations: &HashMap<(OutlookDay, OutlookProduct), u64>,
@@ -146,7 +150,7 @@ impl<'a> OverlayDrawContext<'a> {
 impl OverlayDrawContext<'_> {
     pub fn draw_spc_discussions(
         &self,
-        layers: &crate::layers::LayerManager,
+        layers: &rustdar_overlays::render::layers::LayerManager,
         discussions: &[SpcDiscussion],
         cache: &mut OverlayLayerCache,
         data_gen: u64,
@@ -237,7 +241,7 @@ impl OverlayDrawContext<'_> {
     /// allowing the caller to open a detail popup.
     pub fn draw_nws_alerts(
         &self,
-        layers: &crate::layers::LayerManager,
+        layers: &rustdar_overlays::render::layers::LayerManager,
         nws_alerts: &[NwsAlert],
         hidden_alerts: &HashSet<String>,
         cache: &mut OverlayLayerCache,

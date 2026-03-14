@@ -1,7 +1,7 @@
 #![cfg(not(target_os = "android"))]
 
 use crate::actions::GuiAction;
-use crate::layers::LayerKind;
+use rustdar_overlays::render::layers::LayerKind;
 use crate::pane::PaneState;
 
 use egui::Context;

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
-use rustdar_overlays::spc::discussion::SpcDiscussion;
-use rustdar_overlays::nws::alert::NwsAlert;
+use crate::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
+use crate::spc::discussion::SpcDiscussion;
+use crate::nws::alert::NwsAlert;
 
 /// Generic wrapper for overlay data that follows the fetch-cache-generation pattern.
 ///

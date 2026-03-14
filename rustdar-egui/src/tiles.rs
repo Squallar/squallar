@@ -3,7 +3,7 @@ use walkers::{
     HttpTiles, TileId,
 };
 
-use crate::layers::LayerKind;
+use rustdar_overlays::render::layers::LayerKind;
 
 /// CartoDB tile source variants.
 /// Base maps use `nolabels` so city/road names are not obscured by the radar

@@ -1,6 +1,6 @@
 use crate::actions::GuiAction;
-use crate::layers::LayerKind;
-use crate::overlay_state::OverlayData;
+use rustdar_overlays::render::layers::LayerKind;
+use rustdar_overlays::render::overlay_state::OverlayData;
 use crate::pane::{PaneState, RadarImageData};
 use rustdar_radar::sites::RADARS;
 use rustdar_radar::types::{ImageBounds, MAX_RANGE_KM};

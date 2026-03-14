@@ -1,6 +1,6 @@
 use crate::actions::{GuiAction, RadarConfig};
-use crate::layers::{LayerKind, LayerManager};
-use crate::overlay_state::OverlayData;
+use rustdar_overlays::render::layers::{LayerKind, LayerManager};
+use rustdar_overlays::render::overlay_state::OverlayData;
 use crate::pane::{PaneId, PaneLayout, PaneState, RadarImageData, MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
 use crate::tiles::MapTileState;
 use chrono::Timelike;

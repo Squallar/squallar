@@ -292,7 +292,7 @@ fn parse_outlook_feature(
         }
     };
 
-    crate::types::simplify_polygons(&mut polygons, crate::types::SIMPLIFY_EPSILON);
+    crate::render::geo::simplify_polygons(&mut polygons, crate::types::SIMPLIFY_EPSILON);
     if polygons.is_empty() {
         return Ok(None);
     }

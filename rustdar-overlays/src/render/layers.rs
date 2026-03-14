@@ -1,5 +1,5 @@
-use rustdar_overlays::nws::alert::AlertCategory;
-use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct};
+use crate::nws::alert::AlertCategory;
+use crate::spc::outlook::{OutlookDay, OutlookProduct};
 
 /// Identifies each toggleable overlay layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

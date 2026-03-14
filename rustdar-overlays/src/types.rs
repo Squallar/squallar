@@ -1,3 +1,21 @@
+/// A 2D screen-space point.
+///
+/// Used in place of egui's `Pos2` so that geometry algorithms in this crate
+/// remain GUI-framework-agnostic.  Conversion to/from `egui::Pos2` is
+/// trivially implemented in the `rustdar-egui` crate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScreenPoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl ScreenPoint {
+    #[inline]
+    pub fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+}
+
 /// Default epsilon (degrees) for Ramer-Douglas-Peucker polygon simplification.
 /// ~0.005° ≈ 500 m — keeps shapes visually accurate at typical map zoom levels
 /// while significantly reducing vertex counts.
@@ -151,8 +169,8 @@ impl OverlayFeature {
         label2: String,
         hatch: HatchPattern,
     ) -> Self {
-        let triangulations = precompute_triangulations(&polygons);
-        let geo_bounds = compute_geo_bounds(&polygons);
+        let triangulations = crate::render::geo::precompute_triangulations(&polygons);
+        let geo_bounds = crate::render::geo::compute_geo_bounds(&polygons);
         Self {
             polygons,
             fill_rgba,
@@ -168,147 +186,7 @@ impl OverlayFeature {
     /// Recompute triangulation and geo-bounds from the current polygons.
     /// Call this after mutating `polygons` (e.g. after simplification).
     pub fn recompute_cache(&mut self) {
-        self.triangulations = precompute_triangulations(&self.polygons);
-        self.geo_bounds = compute_geo_bounds(&self.polygons);
+        self.triangulations = crate::render::geo::precompute_triangulations(&self.polygons);
+        self.geo_bounds = crate::render::geo::compute_geo_bounds(&self.polygons);
     }
-}
-
-/// Strip the GeoJSON closing duplicate (last == first) from a ring.
-fn strip_closing_dup(ring: &[(f64, f64)]) -> &[(f64, f64)] {
-    if ring.len() > 3 && ring.first() == ring.last() {
-        &ring[..ring.len() - 1]
-    } else {
-        ring
-    }
-}
-
-/// Pre-compute ear-clip triangulation for each polygon's exterior ring.
-fn precompute_triangulations(polygons: &[GeoPolygon]) -> Vec<Option<PrecomputedTriangulation>> {
-    polygons
-        .iter()
-        .map(|polygon| {
-            let exterior = polygon.first()?;
-            let ring = strip_closing_dup(exterior);
-            if ring.len() < 3 {
-                return None;
-            }
-            // Flatten to [lat0, lon0, lat1, lon1, ...] for earcutr
-            let coords: Vec<f64> = ring.iter().flat_map(|&(lat, lon)| [lat, lon]).collect();
-            let indices = earcutr::earcut(&coords, &[], 2).ok()?;
-            if indices.is_empty() {
-                return None;
-            }
-            Some(PrecomputedTriangulation {
-                indices: indices.into_iter().map(|i| i as u32).collect(),
-            })
-        })
-        .collect()
-}
-
-/// Compute the overall geographic bounding box for all polygons in a feature.
-fn compute_geo_bounds(polygons: &[GeoPolygon]) -> Option<GeoBounds> {
-    let mut min_lat = f64::MAX;
-    let mut max_lat = f64::MIN;
-    let mut min_lon = f64::MAX;
-    let mut max_lon = f64::MIN;
-    let mut any = false;
-
-    for polygon in polygons {
-        for ring in polygon {
-            for &(lat, lon) in ring {
-                min_lat = min_lat.min(lat);
-                max_lat = max_lat.max(lat);
-                min_lon = min_lon.min(lon);
-                max_lon = max_lon.max(lon);
-                any = true;
-            }
-        }
-    }
-
-    if any {
-        Some(GeoBounds {
-            min_lat,
-            max_lat,
-            min_lon,
-            max_lon,
-        })
-    } else {
-        None
-    }
-}
-
-// ── Shared geometry utilities ────────────────────────────────────────────
-
-/// Ramer-Douglas-Peucker polygon ring simplification.
-///
-/// Reduces vertex count by removing points within `epsilon` degrees of the
-/// line between their neighbours. An epsilon of ~0.005 (~500 m) keeps shapes
-/// visually accurate at typical map zoom levels while cutting vertex counts
-/// significantly.
-pub fn simplify_ring(ring: &GeoPolygonRing, epsilon: f64) -> GeoPolygonRing {
-    if ring.len() <= 3 {
-        return ring.clone();
-    }
-    rdp_simplify(ring, epsilon)
-}
-
-fn rdp_simplify(points: &[(f64, f64)], epsilon: f64) -> Vec<(f64, f64)> {
-    if points.len() <= 2 {
-        return points.to_vec();
-    }
-
-    let first = points[0];
-    let last = points[points.len() - 1];
-    let mut max_dist = 0.0_f64;
-    let mut max_idx = 0;
-
-    for (i, &pt) in points.iter().enumerate().skip(1).take(points.len() - 2) {
-        let d = perpendicular_distance(pt, first, last);
-        if d > max_dist {
-            max_dist = d;
-            max_idx = i;
-        }
-    }
-
-    if max_dist > epsilon {
-        let mut left = rdp_simplify(&points[..=max_idx], epsilon);
-        let right = rdp_simplify(&points[max_idx..], epsilon);
-        left.pop(); // Remove duplicate junction point
-        left.extend(right);
-        left
-    } else {
-        vec![first, last]
-    }
-}
-
-fn perpendicular_distance(
-    point: (f64, f64),
-    line_start: (f64, f64),
-    line_end: (f64, f64),
-) -> f64 {
-    let dx = line_end.0 - line_start.0;
-    let dy = line_end.1 - line_start.1;
-    let len_sq = dx * dx + dy * dy;
-    if len_sq < 1e-12 {
-        let px = point.0 - line_start.0;
-        let py = point.1 - line_start.1;
-        return (px * px + py * py).sqrt();
-    }
-    let num = ((point.0 - line_start.0) * dy - (point.1 - line_start.1) * dx).abs();
-    num / len_sq.sqrt()
-}
-
-/// Simplify all rings in all polygons of a feature's polygon set.
-pub fn simplify_polygons(polygons: &mut Vec<GeoPolygon>, epsilon: f64) {
-    for polygon in polygons.iter_mut() {
-        for ring in polygon.iter_mut() {
-            if ring.len() > 3 {
-                *ring = simplify_ring(ring, epsilon);
-            }
-        }
-        // Remove degenerate rings
-        polygon.retain(|r| r.len() >= 3);
-    }
-    // Remove empty polygons
-    polygons.retain(|p| !p.is_empty());
 }
