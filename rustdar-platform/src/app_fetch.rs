@@ -522,4 +522,68 @@ impl super::App {
             super::notify_redraw(&window);
         });
     }
+
+    /// Append a freshly-polled scan to any active loops, evicting frames past
+    /// the lookback window.
+    pub(super) fn append_scan_to_active_loops(
+        &mut self,
+        timestamp: chrono::NaiveDateTime,
+        scan: std::sync::Arc<nexrad_model::data::Scan>,
+    ) {
+        use rustdar_egui::pane::LoopFrame;
+
+        for pane_idx in 0..self.gui.pane_count() {
+            let Some(pane) = self.gui.pane_mut(pane_idx) else {
+                continue;
+            };
+            let Some(ls) = &mut pane.loop_state else {
+                continue;
+            };
+
+            // Skip if this timestamp already exists
+            if ls.frames.iter().any(|f| f.timestamp == timestamp) {
+                continue;
+            }
+
+            // Insert in sorted order
+            let insert_pos = ls.frames.partition_point(|f| f.timestamp < timestamp);
+            ls.frames.insert(insert_pos, LoopFrame {
+                timestamp,
+                texture: None,
+                render_in_flight: false,
+            });
+
+            // Cache the scan data for rendering
+            self.loop_scan_cache
+                .entry(pane_idx)
+                .or_default()
+                .insert(timestamp, std::sync::Arc::clone(&scan));
+
+            // Evict frames outside the lookback window
+            let lookback = chrono::Duration::seconds(ls.lookback_secs as i64);
+            if let Some(newest) = ls.frames.last().map(|f| f.timestamp) {
+                let cutoff = newest - lookback;
+                let old_len = ls.frames.len();
+                ls.frames.retain(|f| f.timestamp >= cutoff);
+                let removed = old_len - ls.frames.len();
+                if removed > 0 {
+                    // Adjust current_frame if needed
+                    if ls.current_frame >= ls.frames.len() {
+                        ls.current_frame = ls.frames.len().saturating_sub(1);
+                    }
+                    // Clean up evicted scan cache entries
+                    if let Some(cache) = self.loop_scan_cache.get_mut(&pane_idx) {
+                        cache.retain(|ts, _| *ts >= cutoff);
+                    }
+                }
+            }
+
+            log::info!(
+                "Appended scan {} to loop on pane {} ({} frames)",
+                timestamp,
+                pane_idx,
+                ls.frames.len()
+            );
+        }
+    }
 }

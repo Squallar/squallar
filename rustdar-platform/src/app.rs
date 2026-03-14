@@ -218,11 +218,17 @@ impl App {
                         log::info!("Received scan data from background thread");
                         let scan_info = ScanInfo::from_scan(&scan_data.scan, &scan_data.site, scan_data.timestamp);
                         let site = scan_data.site;
-                        self.scan_data = Some(Arc::new(scan_data.scan));
+                        let timestamp = scan_data.timestamp;
+                        let scan_arc = Arc::new(scan_data.scan);
+                        self.scan_data = Some(Arc::clone(&scan_arc));
                         self.gui.set_scan_info(scan_info);
                         self.gui.set_loading_site(None);
                         self.render.reset_panes();
                         self.spawn_level3_fetches(&site);
+
+                        // Append the new scan to any active loops
+                        self.append_scan_to_active_loops(timestamp, scan_arc);
+
                         log::info!("Scan data loaded and UI updated");
                     }
                     Err(error_msg) => {
