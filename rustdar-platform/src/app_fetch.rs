@@ -173,8 +173,8 @@ impl super::App {
                 }
             }
             GuiAction::RefreshSpcOutlooks => {
-                let day = self.gui.layers().spc_day;
-                let products = self.gui.layers().enabled_spc_products();
+                let day = self.gui.active_pane().layers.spc_day;
+                let products = self.gui.active_pane().layers.enabled_spc_products();
                 if !products.is_empty() {
                     self.handle_overlay_action(
                         GuiAction::FetchSpcOutlook { day, products },

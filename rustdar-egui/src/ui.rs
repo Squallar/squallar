@@ -627,9 +627,14 @@ impl Gui {
         }
     }
 
-    /// Get the selected product and elevation for rendering (active pane).
-    pub fn get_rendering_params(&self) -> Option<(RadarProduct, f32)> {
-        self.panes[self.active_pane].get_rendering_params(self.radar.scan_info.as_ref())
+    /// Get the active pane (immutable).
+    pub fn active_pane(&self) -> &PaneState {
+        &self.panes[self.active_pane]
+    }
+
+    /// Get the active pane (mutable).
+    pub fn active_pane_mut(&mut self) -> &mut PaneState {
+        &mut self.panes[self.active_pane]
     }
 
     /// Get the rendering params for a specific pane.
@@ -673,16 +678,6 @@ impl Gui {
         self.user_location = Some((lat, lon));
     }
 
-    /// Get the active pane's layer manager (immutable).
-    pub fn layers(&self) -> &LayerManager {
-        &self.panes[self.active_pane].layers
-    }
-
-    /// Get the active pane's layer manager (mutable).
-    pub fn layers_mut(&mut self) -> &mut LayerManager {
-        &mut self.panes[self.active_pane].layers
-    }
-
     /// Get a specific pane's layer manager (immutable).
     pub fn layers_for_pane(&self, pane_idx: PaneId) -> Option<&LayerManager> {
         self.panes.get(pane_idx).map(|p| &p.layers)
@@ -693,31 +688,16 @@ impl Gui {
         self.radar.scan_info.as_ref()
     }
 
-    /// Get the active pane's radar image.
-    pub fn get_radar_image(&self) -> &Option<RadarImageData> {
-        &self.panes[self.active_pane].radar_image
-    }
-
-    /// Take the radar image from the active pane.
-    pub fn take_radar_image(&mut self) -> Option<RadarImageData> {
-        self.panes[self.active_pane].take_radar_image()
-    }
-
     /// Take the radar image from a specific pane.
     pub fn take_radar_image_for_pane(&mut self, pane_idx: PaneId) -> Option<RadarImageData> {
         self.panes.get_mut(pane_idx).and_then(|p| p.take_radar_image())
     }
 
-    /// Set the radar image for the active pane.
-    pub fn set_radar_image(
-        &mut self,
-        texture: egui::TextureHandle,
-        lat: f64,
-        lon: f64,
-        max_range_km: f64,
-        value_data: Vec<f32>,
-    ) {
-        self.panes[self.active_pane].set_radar_image(texture, lat, lon, max_range_km, value_data);
+    /// Clear the radar image on a specific pane.
+    pub fn clear_radar_image_for_pane(&mut self, pane_idx: PaneId) {
+        if pane_idx < self.panes.len() {
+            self.panes[pane_idx].clear_radar_image();
+        }
     }
 
     /// Set the radar image for a specific pane.
@@ -732,25 +712,6 @@ impl Gui {
     ) {
         if let Some(pane) = self.panes.get_mut(pane_idx) {
             pane.set_radar_image(texture, lat, lon, max_range_km, value_data);
-        }
-    }
-
-    /// Clear the radar image on the active pane.
-    pub fn clear_radar_image(&mut self) {
-        self.panes[self.active_pane].clear_radar_image();
-    }
-
-    /// Clear the radar image on a specific pane.
-    pub fn clear_radar_image_for_pane(&mut self, pane_idx: PaneId) {
-        if pane_idx < self.panes.len() {
-            self.panes[pane_idx].clear_radar_image();
-        }
-    }
-
-    /// Clear the radar image on all panes.
-    pub fn clear_all_radar_images(&mut self) {
-        for pane in &mut self.panes {
-            pane.clear_radar_image();
         }
     }
 
