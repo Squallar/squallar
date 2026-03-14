@@ -106,75 +106,23 @@ impl ScanInfo {
     pub fn from_scan(data: &Scan, site: &str, requested_timestamp: NaiveDateTime) -> Self {
         let vcp_number = data.coverage_pattern_number().number();
 
-        // Build a map of products to their available elevation angles
-        let mut product_elevations: HashMap<RadarProduct, Vec<f32>> = HashMap::new();
-
-        for (i, sweep) in data.sweeps().iter().enumerate() {
-            if let Some(first_radial) = sweep.radials().first() {
-                let raw_angle = first_radial.elevation_angle_degrees();
-                // Round to 1 decimal place so SAILS/MRLE repeat scans and
-                // split-cuts at the same nominal angle collapse to one entry.
-                let elev_angle = (raw_angle * 10.0).round() / 10.0;
-
-                let mut products_found: Vec<&str> = Vec::new();
-                for product in RadarProduct::all() {
-                    if product.get_moment(first_radial).is_some() {
-                        products_found.push(product.code());
-                        product_elevations
-                            .entry(*product)
-                            .or_default()
-                            .push(elev_angle);
-                    }
-                }
-                log::info!(
-                    "  Sweep {:2}: raw={:.2}° rounded={:.1}° radials={} products=[{}]",
-                    i, raw_angle, elev_angle, sweep.radials().len(),
-                    products_found.join(", ")
-                );
-            } else {
-                log::warn!("  Sweep {:2}: no radials!", i);
-            }
-        }
-
-        // Sort and deduplicate elevation angles for each product
-        let mut product_elevations_sorted: HashMap<RadarProduct, Vec<f32>> = product_elevations
-            .into_iter()
-            .map(|(product, mut angles)| {
-                angles.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                angles.dedup();
-                log::info!(
-                    "  {} → {} unique elevations: {:?}",
-                    product.code(), angles.len(), angles
-                );
-                (product, angles)
-            })
-            .collect();
-
-        // Include Level III products in the available list.
-        for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
-            product_elevations_sorted
-                .entry(*l3_product)
-                .or_insert_with(Vec::new);
-        }
+        let product_elevations = discover_product_elevations(data);
 
         // Get list of available products, sorted by priority
         let mut available_products: Vec<RadarProduct> =
-            product_elevations_sorted.keys().copied().collect();
+            product_elevations.keys().copied().collect();
         available_products.sort_by_key(|p| p.sort_order());
 
         // Extract actual timestamp from the first radial's collection timestamp
-        let actual_timestamp = if let Some(first_sweep) = data.sweeps().first() {
-            if let Some(first_radial) = first_sweep.radials().first() {
-                let timestamp_ms = first_radial.collection_timestamp();
-                chrono::DateTime::from_timestamp_millis(timestamp_ms)
+        let actual_timestamp = data
+            .sweeps()
+            .first()
+            .and_then(|s| s.radials().first())
+            .and_then(|r| {
+                chrono::DateTime::from_timestamp_millis(r.collection_timestamp())
                     .map(|dt| dt.naive_utc())
-                    .unwrap_or(requested_timestamp)
-            } else {
-                requested_timestamp
-            }
-        } else {
-            requested_timestamp
-        };
+            })
+            .unwrap_or(requested_timestamp);
 
         let radar_site = get_radar_site(site).unwrap_or_else(|| {
             log::warn!("Unknown radar site '{}', using fallback location", site);
@@ -201,10 +149,67 @@ impl ScanInfo {
             timestamp: actual_timestamp,
             vcp_number,
             available_products,
-            product_elevations: product_elevations_sorted,
+            product_elevations,
             status,
         }
     }
+}
+
+/// Inspect all sweeps in a scan to discover which products exist and at which
+/// elevation angles. Rounds angles to 0.1° to collapse SAILS/MRLE duplicates.
+/// Level III products are included with empty elevation lists.
+fn discover_product_elevations(scan: &Scan) -> HashMap<RadarProduct, Vec<f32>> {
+    let mut product_elevations: HashMap<RadarProduct, Vec<f32>> = HashMap::new();
+
+    for (i, sweep) in scan.sweeps().iter().enumerate() {
+        if let Some(first_radial) = sweep.radials().first() {
+            let raw_angle = first_radial.elevation_angle_degrees();
+            // Round to 1 decimal place so SAILS/MRLE repeat scans and
+            // split-cuts at the same nominal angle collapse to one entry.
+            let elev_angle = (raw_angle * 10.0).round() / 10.0;
+
+            let mut products_found: Vec<&str> = Vec::new();
+            for product in RadarProduct::all() {
+                if product.get_moment(first_radial).is_some() {
+                    products_found.push(product.code());
+                    product_elevations
+                        .entry(*product)
+                        .or_default()
+                        .push(elev_angle);
+                }
+            }
+            log::info!(
+                "  Sweep {:2}: raw={:.2}° rounded={:.1}° radials={} products=[{}]",
+                i, raw_angle, elev_angle, sweep.radials().len(),
+                products_found.join(", ")
+            );
+        } else {
+            log::warn!("  Sweep {:2}: no radials!", i);
+        }
+    }
+
+    // Sort and deduplicate elevation angles for each product
+    for angles in product_elevations.values_mut() {
+        angles.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        angles.dedup();
+    }
+    for (product, angles) in &product_elevations {
+        log::info!(
+            "  {} → {} unique elevations: {:?}",
+            product.code(),
+            angles.len(),
+            angles
+        );
+    }
+
+    // Include Level III products with empty elevation lists
+    for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
+        product_elevations
+            .entry(*l3_product)
+            .or_insert_with(Vec::new);
+    }
+
+    product_elevations
 }
 
 /// Radar product types
