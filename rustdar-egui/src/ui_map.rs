@@ -6,7 +6,7 @@ use egui::Context;
 use rustdar_radar::types::{ImageBounds, RadarProduct, IMAGE_SIZE, MAX_RANGE_KM};
 use rustdar_radar::sites::RADARS;
 
-use super::map_overlays::{draw_spc_overlays, draw_spc_discussions, draw_nws_alerts, draw_label_tiles_overlay};
+use super::map_overlays::{OverlayDrawContext, draw_label_tiles_overlay};
 
 impl super::Gui {
     pub(super) fn render_map(&mut self, ctx: &Context) -> Vec<GuiAction> {
@@ -148,13 +148,16 @@ impl super::Gui {
                             let zoom = memory.zoom();
 
                             // Draw SPC outlook polygons (below radar)
-                            draw_spc_overlays(
+                            let overlay_ctx = OverlayDrawContext::new(
                                 ui,
                                 projector,
                                 zoom,
+                                self.map_tiles.current_theme_is_dark,
+                                pointer_available,
+                            );
+                            overlay_ctx.draw_spc_overlays(
                                 &pane.layers,
                                 &self.overlays.spc_outlooks.data,
-                                self.map_tiles.current_theme_is_dark,
                                 &mut pane.spc_overlay_caches,
                                 &self.overlays.spc_data_generation,
                             );
@@ -230,31 +233,23 @@ impl super::Gui {
                             } // end if radar layer enabled
 
                             // Draw SPC Mesoscale Discussion polygons
-                            let clicked_md = draw_spc_discussions(
-                                ui,
-                                projector,
-                                zoom,
+                            let clicked_md = overlay_ctx.draw_spc_discussions(
                                 &pane.layers,
                                 &self.overlays.spc_discussions.data,
                                 &mut pane.spc_md_overlay_cache,
                                 self.overlays.spc_discussions.data_generation,
-                                pointer_available,
                             );
                             if let Some(idx) = clicked_md {
                                 self.overlays.selected_md = Some(idx);
                             }
 
                             // Draw NWS alert polygons
-                            let clicked_alert = draw_nws_alerts(
-                                ui,
-                                projector,
-                                zoom,
+                            let clicked_alert = overlay_ctx.draw_nws_alerts(
                                 &pane.layers,
                                 &self.overlays.nws_alerts.data,
                                 &self.overlays.hidden_alerts,
                                 &mut pane.nws_overlay_cache,
                                 self.overlays.nws_alerts.data_generation,
-                                pointer_available,
                             );
                             if let Some(idx) = clicked_alert {
                                 self.overlays.selected_alert = Some(idx);
