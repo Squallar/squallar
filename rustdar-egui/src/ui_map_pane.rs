@@ -43,6 +43,24 @@ pub(super) fn render_pane_map_content(
     zoom: f64,
     ctx: &mut PaneRenderCtx<'_>,
 ) {
+    // Pre-compute radar site icon rects so overlay click detection can
+    // skip clicks that land on a site marker (sites take priority).
+    if ctx.pane.layers.is_enabled(LayerKind::RadarSites) {
+        let screen_rect = ui.max_rect();
+        let icon_size = (10.0 + zoom as f32 * 2.0).clamp(8.0, 24.0);
+        for site in &RADARS {
+            let pos = projector
+                .project(walkers::lat_lon(site.lat, site.lon))
+                .to_pos2();
+            if screen_rect.expand(100.0).contains(pos) {
+                ctx.excluded_rects.push(egui::Rect::from_center_size(
+                    pos,
+                    egui::vec2(icon_size, icon_size),
+                ));
+            }
+        }
+    }
+
     // --- Phase 1: immutable-ui work (overlays, radar image, labels) ---
     {
         let overlay_ctx = OverlayDrawContext::new(
