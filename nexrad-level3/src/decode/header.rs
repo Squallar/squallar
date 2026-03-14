@@ -3,56 +3,35 @@
 use crate::model::{MessageHeader, ProductDescriptionBlock};
 use crate::result::{Error, Result};
 
-/// Read a big-endian `i16` from `data` at the given offset.
-pub(crate) fn read_i16(data: &[u8], offset: usize) -> Result<i16> {
-    let bytes: [u8; 2] = data
-        .get(offset..offset + 2)
+/// Extract a `[u8; N]` slice from `data` at the given offset.
+fn read_bytes<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N]> {
+    data.get(offset..offset + N)
         .and_then(|s| s.try_into().ok())
         .ok_or(Error::UnexpectedEof {
             offset,
-            expected: 2,
+            expected: N,
             available: data.len().saturating_sub(offset),
-        })?;
-    Ok(i16::from_be_bytes(bytes))
+        })
+}
+
+/// Read a big-endian `i16` from `data` at the given offset.
+pub(crate) fn read_i16(data: &[u8], offset: usize) -> Result<i16> {
+    Ok(i16::from_be_bytes(read_bytes(data, offset)?))
 }
 
 /// Read a big-endian `u16` from `data` at the given offset.
 pub(crate) fn read_u16(data: &[u8], offset: usize) -> Result<u16> {
-    let bytes: [u8; 2] = data
-        .get(offset..offset + 2)
-        .and_then(|s| s.try_into().ok())
-        .ok_or(Error::UnexpectedEof {
-            offset,
-            expected: 2,
-            available: data.len().saturating_sub(offset),
-        })?;
-    Ok(u16::from_be_bytes(bytes))
+    Ok(u16::from_be_bytes(read_bytes(data, offset)?))
 }
 
 /// Read a big-endian `u32` from `data` at the given offset.
 pub(crate) fn read_u32(data: &[u8], offset: usize) -> Result<u32> {
-    let bytes: [u8; 4] = data
-        .get(offset..offset + 4)
-        .and_then(|s| s.try_into().ok())
-        .ok_or(Error::UnexpectedEof {
-            offset,
-            expected: 4,
-            available: data.len().saturating_sub(offset),
-        })?;
-    Ok(u32::from_be_bytes(bytes))
+    Ok(u32::from_be_bytes(read_bytes(data, offset)?))
 }
 
 /// Read a big-endian `i32` from `data` at the given offset.
 pub(crate) fn read_i32(data: &[u8], offset: usize) -> Result<i32> {
-    let bytes: [u8; 4] = data
-        .get(offset..offset + 4)
-        .and_then(|s| s.try_into().ok())
-        .ok_or(Error::UnexpectedEof {
-            offset,
-            expected: 4,
-            available: data.len().saturating_sub(offset),
-        })?;
-    Ok(i32::from_be_bytes(bytes))
+    Ok(i32::from_be_bytes(read_bytes(data, offset)?))
 }
 
 /// Decode the 18-byte Message Header.

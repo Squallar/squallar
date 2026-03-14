@@ -1,13 +1,11 @@
 //! Data model types for NEXRAD Level III products.
 
 mod header;
-mod product;
 mod radial;
 mod raster;
 mod symbology;
 
 pub use header::*;
-pub use product::*;
 pub use radial::*;
 pub use raster::*;
 pub use symbology::*;

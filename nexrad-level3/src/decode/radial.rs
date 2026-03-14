@@ -256,12 +256,12 @@ pub(crate) fn decode_generic_radial_packet(
     o = skip_xdr_param_list(data, o)?;
 
     // --- Components ---
-    let num_components = read_xdr_i32(data, o)?;
+    let num_components = read_i32(data, o)?;
     o += 4;
     o += 4; // skip "pointer" field (always present, value is meaningless)
 
     for ci in 0..num_components {
-        let comp_code = read_xdr_i32(data, o)?;
+        let comp_code = read_i32(data, o)?;
         o += 4;
 
         if comp_code == 1 {
@@ -299,11 +299,6 @@ pub(crate) fn decode_generic_radial_packet(
 // XDR helper functions
 // ---------------------------------------------------------------------------
 
-/// Read a big-endian i32 from XDR data.
-fn read_xdr_i32(data: &[u8], offset: usize) -> Result<i32> {
-    read_i32(data, offset)
-}
-
 /// Read a big-endian f32 from XDR data.
 fn read_xdr_f32(data: &[u8], offset: usize) -> Result<f32> {
     let bits = read_u32(data, offset)?;
@@ -339,7 +334,7 @@ fn skip_xdr_string(data: &[u8], offset: usize) -> Result<usize> {
 
 /// Skip an XDR parameter list: count(i32) + pointer(i32) + N × (string, string, [pointer]).
 fn skip_xdr_param_list(data: &[u8], mut offset: usize) -> Result<usize> {
-    let num = read_xdr_i32(data, offset)?;
+    let num = read_i32(data, offset)?;
     offset += 4;
     offset += 4; // skip pointer
 
@@ -375,7 +370,7 @@ fn decode_xdr_radial_component(
     o = skip_xdr_param_list(data, o)?;
 
     // Number of radials
-    let num_radials = read_xdr_i32(data, o)? as usize;
+    let num_radials = read_i32(data, o)? as usize;
     o += 4;
 
     let mut radials = Vec::with_capacity(num_radials);
@@ -388,14 +383,14 @@ fn decode_xdr_radial_component(
         o += 4;
         let width = read_xdr_f32(data, o)?;
         o += 4;
-        let num_bins = read_xdr_i32(data, o)? as usize;
+        let num_bins = read_i32(data, o)? as usize;
         o += 4;
 
         // Skip attributes string (e.g. "type = ushort; Unit = inches/hour")
         o = skip_xdr_string(data, o)?;
 
         // Data array: length prefix (i32) + N × i32 values
-        let arr_len = read_xdr_i32(data, o)? as usize;
+        let arr_len = read_i32(data, o)? as usize;
         o += 4;
 
         let data_end = o + arr_len * 4;
