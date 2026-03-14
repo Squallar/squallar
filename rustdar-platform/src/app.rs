@@ -606,21 +606,7 @@ impl App {
                             let mut info = scan_info.clone();
                             if !info.available_products.contains(&product) {
                                 info.available_products.push(product);
-                                info.available_products.sort_by_key(|p| match p {
-                                    RadarProduct::Reflectivity => 0,
-                                    RadarProduct::Velocity => 1,
-                                    RadarProduct::SpectrumWidth => 2,
-                                    RadarProduct::DifferentialReflectivity => 3,
-                                    RadarProduct::CorrelationCoefficient => 4,
-                                    RadarProduct::DifferentialPhase => 5,
-                                    RadarProduct::NormalizedRotation => 6,
-                                    RadarProduct::StormRelativeVelocity => 7,
-                                    RadarProduct::SpecificDifferentialPhase => 8,
-                                    RadarProduct::EchoTops => 9,
-                                    RadarProduct::VerticallyIntegratedLiquid => 10,
-                                    RadarProduct::HydrometeorClassification => 11,
-                                    RadarProduct::PrecipitationRate => 12,
-                                });
+                                info.available_products.sort_by_key(|p| p.sort_order());
                                 info.status = format!(
                                     "Loaded {} products: {}",
                                     info.available_products.len(),

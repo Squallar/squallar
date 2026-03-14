@@ -160,21 +160,7 @@ impl ScanInfo {
         // Get list of available products, sorted by priority
         let mut available_products: Vec<RadarProduct> =
             product_elevations_sorted.keys().copied().collect();
-        available_products.sort_by_key(|p| match p {
-            RadarProduct::Reflectivity => 0,
-            RadarProduct::Velocity => 1,
-            RadarProduct::SpectrumWidth => 2,
-            RadarProduct::DifferentialReflectivity => 3,
-            RadarProduct::CorrelationCoefficient => 4,
-            RadarProduct::DifferentialPhase => 5,
-            RadarProduct::NormalizedRotation => 6,
-            RadarProduct::StormRelativeVelocity => 7,
-            RadarProduct::SpecificDifferentialPhase => 8,
-            RadarProduct::EchoTops => 9,
-            RadarProduct::VerticallyIntegratedLiquid => 10,
-            RadarProduct::HydrometeorClassification => 11,
-            RadarProduct::PrecipitationRate => 12,
-        });
+        available_products.sort_by_key(|p| p.sort_order());
 
         // Extract actual timestamp from the first radial's collection timestamp
         let actual_timestamp = if let Some(first_sweep) = data.sweeps().first() {
@@ -292,6 +278,25 @@ impl RadarProduct {
             RadarProduct::PrecipitationRate,
             RadarProduct::NormalizedRotation,
         ]
+    }
+
+    /// Canonical sort key for ordering products in the UI.
+    pub fn sort_order(&self) -> u8 {
+        match self {
+            RadarProduct::Reflectivity => 0,
+            RadarProduct::Velocity => 1,
+            RadarProduct::SpectrumWidth => 2,
+            RadarProduct::DifferentialReflectivity => 3,
+            RadarProduct::CorrelationCoefficient => 4,
+            RadarProduct::DifferentialPhase => 5,
+            RadarProduct::NormalizedRotation => 6,
+            RadarProduct::StormRelativeVelocity => 7,
+            RadarProduct::SpecificDifferentialPhase => 8,
+            RadarProduct::EchoTops => 9,
+            RadarProduct::VerticallyIntegratedLiquid => 10,
+            RadarProduct::HydrometeorClassification => 11,
+            RadarProduct::PrecipitationRate => 12,
+        }
     }
 
     /// Whether this product comes from Level III data (as opposed to Level II base moments).
