@@ -89,6 +89,46 @@ impl super::App {
             GuiAction::RenderOverlay { pane_idx, overlay_kind, geo_bounds, width, height, data_generation, zoom } => {
                 self.spawn_overlay_render(pane_idx, overlay_kind, geo_bounds, width, height, data_generation, zoom);
             }
+            GuiAction::EnableLoop { pane_idx, lookback_secs } => {
+                self.handle_enable_loop(pane_idx, lookback_secs);
+            }
+            GuiAction::DisableLoop { pane_idx } => {
+                self.handle_disable_loop(pane_idx);
+            }
+            GuiAction::ToggleLoopPlayback { pane_idx } => {
+                if let Some(pane) = self.gui.pane_mut(pane_idx) {
+                    if let Some(ls) = &mut pane.loop_state {
+                        ls.playing = !ls.playing;
+                        if ls.playing {
+                            ls.last_advance = Some(std::time::Instant::now());
+                        }
+                    }
+                }
+            }
+            GuiAction::StepLoopFrame { pane_idx, forward } => {
+                if let Some(pane) = self.gui.pane_mut(pane_idx) {
+                    if let Some(ls) = &mut pane.loop_state {
+                        if !ls.frames.is_empty() {
+                            if forward {
+                                ls.current_frame = (ls.current_frame + 1) % ls.frames.len();
+                            } else if ls.current_frame == 0 {
+                                ls.current_frame = ls.frames.len() - 1;
+                            } else {
+                                ls.current_frame -= 1;
+                            }
+                        }
+                    }
+                }
+            }
+            GuiAction::SeekLoopFrame { pane_idx, frame_index } => {
+                if let Some(pane) = self.gui.pane_mut(pane_idx) {
+                    if let Some(ls) = &mut pane.loop_state {
+                        if frame_index < ls.frames.len() {
+                            ls.current_frame = frame_index;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -373,5 +413,113 @@ impl super::App {
             OverlayRenderKind::SpcDiscussions => &mut pane.spc_md_texture,
             OverlayRenderKind::NwsAlerts => &mut pane.nws_alert_texture,
         })
+    }
+
+    /// Enable radar loop for a pane: initializes loop state and spawns
+    /// an async task to list available scans in the lookback window.
+    fn handle_enable_loop(&mut self, pane_idx: usize, lookback_secs: u64) {
+        let Some(scan_info) = self.gui.get_scan_info() else { return };
+        let site = scan_info.site.name.to_string();
+
+        // Initialize loop state on the pane
+        if let Some(pane) = self.gui.pane_mut(pane_idx) {
+            pane.loop_state = Some(rustdar_egui::pane::LoopPlaybackState {
+                playing: false,
+                current_frame: 0,
+                frames: Vec::new(),
+                lookback_secs,
+                fetching: true,
+                last_advance: None,
+            });
+        }
+
+        // Compute UTC time range for the scan listing
+        let end = chrono::Utc::now().naive_utc();
+        let start = end - chrono::Duration::seconds(lookback_secs as i64);
+
+        let sender = self.channels.loop_scan_list_sender.clone();
+        let window = self.window.clone();
+        self.tokio_runtime.spawn(async move {
+            match scan::list_scans_for_range(&site, start, end).await {
+                Ok(scans) => {
+                    log::info!("Loop: found {} scans in range for pane {}", scans.len(), pane_idx);
+                    let _ = sender.send(crate::channels::LoopScanListResponse {
+                        pane_idx,
+                        scans,
+                    });
+                }
+                Err(e) => {
+                    log::error!("Loop scan listing failed: {:?}", e);
+                    // Send empty list so UI can show error state
+                    let _ = sender.send(crate::channels::LoopScanListResponse {
+                        pane_idx,
+                        scans: Vec::new(),
+                    });
+                }
+            }
+            super::notify_redraw(&window);
+        });
+    }
+
+    /// Disable radar loop for a pane: clears loop state and all cached frames.
+    fn handle_disable_loop(&mut self, pane_idx: usize) {
+        if let Some(pane) = self.gui.pane_mut(pane_idx) {
+            pane.loop_state = None;
+        }
+    }
+
+    /// Spawn a download task for a single loop frame scan.
+    pub(super) fn spawn_loop_scan_download(
+        &self,
+        pane_idx: usize,
+        timestamp: NaiveDateTime,
+        identifier: nexrad_data::aws::archive::Identifier,
+    ) {
+        let sender = self.channels.loop_scan_download_sender.clone();
+        let window = self.window.clone();
+        self.tokio_runtime.spawn(async move {
+            match scan::download_scan(identifier).await {
+                Ok(scan_data) => {
+                    let _ = sender.send(crate::channels::LoopScanDownloadResponse {
+                        pane_idx,
+                        timestamp,
+                        scan: std::sync::Arc::new(scan_data),
+                    });
+                }
+                Err(e) => {
+                    log::error!("Loop scan download failed for pane {} @ {}: {:?}", pane_idx, timestamp, e);
+                }
+            }
+            super::notify_redraw(&window);
+        });
+    }
+
+    /// Spawn a background render thread for a single loop frame.
+    pub(super) fn spawn_loop_frame_render(
+        &self,
+        pane_idx: usize,
+        timestamp: NaiveDateTime,
+        scan_data: std::sync::Arc<nexrad_model::data::Scan>,
+        product: rustdar_radar::types::RadarProduct,
+        elevation: f32,
+        lat: f64,
+        lon: f64,
+    ) {
+        let sender = self.channels.loop_render_sender.clone();
+        let window = self.window.clone();
+        std::thread::spawn(move || {
+            if let Some((image, range, values)) =
+                rustdar_radar::render::render_radar_to_image(&scan_data, elevation, product, lat, lon)
+            {
+                let _ = sender.send(crate::channels::LoopRenderResponse {
+                    pane_idx,
+                    timestamp,
+                    image_data: image,
+                    max_range_km: range,
+                    value_data: values,
+                });
+            }
+            super::notify_redraw(&window);
+        });
     }
 }
