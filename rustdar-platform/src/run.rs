@@ -13,6 +13,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .filter_level(log::LevelFilter::Info)
         .init();
 
+    // Suppress winit EventLoopClosed panics from background threads on exit.
+    // catch_unwind prevents crashes but the default hook still prints to stderr.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info.to_string();
+        if !msg.contains("EventLoopClosed") {
+            default_hook(info);
+        }
+    }));
+
     log::info!("Starting rustdar-platform (native)");
 
     let event_loop = create_event_loop();

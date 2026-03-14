@@ -674,6 +674,11 @@ impl Gui {
         &mut self.panes[self.active_pane]
     }
 
+    /// Get a specific pane by index (mutable), or `None` if out of bounds.
+    pub fn pane_mut(&mut self, idx: usize) -> Option<&mut PaneState> {
+        self.panes.get_mut(idx)
+    }
+
     /// Get the rendering params for a specific pane.
     pub fn get_rendering_params_for_pane(&self, pane_idx: PaneId) -> Option<(RadarProduct, f32)> {
         self.panes.get(pane_idx)

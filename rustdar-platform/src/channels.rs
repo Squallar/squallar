@@ -4,6 +4,7 @@ use nexrad_model::data::Scan;
 use rustdar_overlays::nws::alert::NwsAlert;
 use rustdar_overlays::spc::discussion::SpcDiscussion;
 use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
+use rustdar_overlays::types::GeoBounds;
 use rustdar_radar::types::RadarProduct;
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -52,6 +53,26 @@ pub type AlertResult = Result<Vec<NwsAlert>, String>;
 /// Result from a background SPC Mesoscale Discussion fetch.
 pub type DiscussionResult = Result<Vec<SpcDiscussion>, String>;
 
+/// Which overlay type an overlay render result belongs to.
+#[derive(Debug, Clone)]
+pub enum OverlayType {
+    SpcOutlook(OutlookDay, OutlookProduct),
+    SpcDiscussions,
+    NwsAlerts,
+}
+
+/// Result from a background overlay rasterization thread.
+pub struct OverlayRenderResponse {
+    pub image_data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub geo_bounds: GeoBounds,
+    pub overlay_type: OverlayType,
+    pub generation: u64,
+    pub pane_idx: usize,
+    pub zoom: i32,
+}
+
 /// Centralized channel hub for all async communication between the App and
 /// background tasks (network fetches, radar rendering, etc.).
 pub struct ChannelHub {
@@ -67,6 +88,8 @@ pub struct ChannelHub {
     pub alert_receiver: Receiver<AlertResult>,
     pub discussion_sender: Sender<DiscussionResult>,
     pub discussion_receiver: Receiver<DiscussionResult>,
+    pub overlay_render_sender: Sender<OverlayRenderResponse>,
+    pub overlay_render_receiver: Receiver<OverlayRenderResponse>,
 }
 
 impl ChannelHub {
@@ -77,6 +100,7 @@ impl ChannelHub {
         let (outlook_sender, outlook_receiver) = std::sync::mpsc::channel();
         let (alert_sender, alert_receiver) = std::sync::mpsc::channel();
         let (discussion_sender, discussion_receiver) = std::sync::mpsc::channel();
+        let (overlay_render_sender, overlay_render_receiver) = std::sync::mpsc::channel();
 
         Self {
             scan_sender,
@@ -91,6 +115,8 @@ impl ChannelHub {
             alert_receiver,
             discussion_sender,
             discussion_receiver,
+            overlay_render_sender,
+            overlay_render_receiver,
         }
     }
 }

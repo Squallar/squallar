@@ -1,4 +1,7 @@
-use crate::actions::GuiAction;
+use crate::actions::{GuiAction, OverlayRenderKind};
+use crate::overlay_cache::{
+    viewport_geo_bounds, current_quantized_zoom, OVERDRAW_FRACTION,
+};
 use rustdar_overlays::render::layers::LayerKind;
 use rustdar_overlays::render::overlay_state::OverlayData;
 use crate::pane::{PaneState, RadarImageData};
@@ -10,6 +13,7 @@ use super::super::map_overlays::{OverlayDrawContext, draw_label_tiles_overlay};
 
 /// Shared references needed for rendering a single pane's map content.
 pub(super) struct PaneRenderCtx<'a> {
+    pub pane_idx: usize,
     pub pane: &'a mut PaneState,
     pub overlays: &'a mut OverlayData,
     pub radar_image: &'a Option<RadarImageData>,
@@ -19,7 +23,6 @@ pub(super) struct PaneRenderCtx<'a> {
     pub pane_rect: egui::Rect,
     pub pointer_available: bool,
     pub is_dark_theme: bool,
-    pub current_theme_is_dark: bool,
     pub scan_info_site_name: Option<&'a str>,
     pub loading_site: &'a mut Option<String>,
 }
@@ -37,17 +40,13 @@ pub(super) fn render_pane_map_content(
         let overlay_ctx = OverlayDrawContext::new(
             ui,
             projector,
-            zoom,
-            ctx.current_theme_is_dark,
             ctx.pointer_available,
         );
 
-        // Draw SPC outlook polygons (below radar)
+        // Draw SPC outlook textures (below radar)
         overlay_ctx.draw_spc_overlays(
             &ctx.pane.layers,
-            &ctx.overlays.spc_outlooks.data,
-            &mut ctx.pane.spc_overlay_caches,
-            &ctx.overlays.spc_data_generation,
+            &ctx.pane.spc_overlay_texture,
         );
 
         // Overlay radar data if available
@@ -57,24 +56,22 @@ pub(super) fn render_pane_map_content(
             }
         }
 
-        // Draw SPC Mesoscale Discussion polygons
+        // Draw SPC Mesoscale Discussion textures + labels
         let clicked_md = overlay_ctx.draw_spc_discussions(
             &ctx.pane.layers,
             &ctx.overlays.spc_discussions.data,
-            &mut ctx.pane.spc_md_overlay_cache,
-            ctx.overlays.spc_discussions.data_generation,
+            &ctx.pane.spc_md_texture,
         );
         if let Some(idx) = clicked_md {
             ctx.overlays.selected_md = Some(idx);
         }
 
-        // Draw NWS alert polygons
+        // Draw NWS alert textures
         let clicked_alert = overlay_ctx.draw_nws_alerts(
             &ctx.pane.layers,
             &ctx.overlays.nws_alerts.data,
             &ctx.overlays.hidden_alerts,
-            &mut ctx.pane.nws_overlay_cache,
-            ctx.overlays.nws_alerts.data_generation,
+            &ctx.pane.nws_alert_texture,
         );
         if let Some(idx) = clicked_alert {
             ctx.overlays.selected_alert = Some(idx);
@@ -85,6 +82,78 @@ pub(super) fn render_pane_map_content(
             if let Some(ltiles) = ctx.label_tiles.as_mut() {
                 draw_label_tiles_overlay(ui, projector, zoom, ltiles);
             }
+        }
+
+        // --- Check if any overlays need background re-rendering ---
+        let screen_rect = ui.max_rect();
+        let viewport_bounds = viewport_geo_bounds(projector, screen_rect);
+        let qzoom = current_quantized_zoom(zoom);
+        // Compute render dimensions with overdraw
+        let w = (screen_rect.width() * (1.0 + 2.0 * OVERDRAW_FRACTION)) as u32;
+        let h = (screen_rect.height() * (1.0 + 2.0 * OVERDRAW_FRACTION)) as u32;
+
+        // SPC outlooks
+        {
+            let any_spc_enabled = ctx.pane.layers.spc_layers_for_day()
+                .iter()
+                .any(|lk| ctx.pane.layers.is_enabled(*lk));
+            let data_gen = ctx.overlays.combined_spc_data_generation();
+            if any_spc_enabled
+                && !ctx.pane.spc_overlay_texture.render_in_flight
+                && ctx.pane.spc_overlay_texture.needs_rerender(data_gen, qzoom, &viewport_bounds)
+            {
+                ctx.actions.push(GuiAction::RenderOverlay {
+                    pane_idx: ctx.pane_idx,
+                    overlay_kind: OverlayRenderKind::SpcOutlook,
+                    geo_bounds: viewport_bounds.clone(),
+                    width: w,
+                    height: h,
+                    data_generation: data_gen,
+                    zoom: qzoom,
+                });
+            }
+        }
+
+        // SPC Mesoscale Discussions
+        if ctx.pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions)
+            && !ctx.overlays.spc_discussions.data.is_empty()
+            && !ctx.pane.spc_md_texture.render_in_flight
+            && ctx.pane.spc_md_texture.needs_rerender(
+                ctx.overlays.spc_discussions.data_generation,
+                qzoom,
+                &viewport_bounds,
+            )
+        {
+            ctx.actions.push(GuiAction::RenderOverlay {
+                pane_idx: ctx.pane_idx,
+                overlay_kind: OverlayRenderKind::SpcDiscussions,
+                geo_bounds: viewport_bounds.clone(),
+                width: w,
+                height: h,
+                data_generation: ctx.overlays.spc_discussions.data_generation,
+                zoom: qzoom,
+            });
+        }
+
+        // NWS alerts
+        if ctx.pane.layers.any_nws_enabled()
+            && !ctx.overlays.nws_alerts.data.is_empty()
+            && !ctx.pane.nws_alert_texture.render_in_flight
+            && ctx.pane.nws_alert_texture.needs_rerender(
+                ctx.overlays.nws_alerts.data_generation,
+                qzoom,
+                &viewport_bounds,
+            )
+        {
+            ctx.actions.push(GuiAction::RenderOverlay {
+                pane_idx: ctx.pane_idx,
+                overlay_kind: OverlayRenderKind::NwsAlerts,
+                geo_bounds: viewport_bounds,
+                width: w,
+                height: h,
+                data_generation: ctx.overlays.nws_alerts.data_generation,
+                zoom: qzoom,
+            });
         }
     }
     // overlay_ctx (and its shared borrow of ui) is dropped here

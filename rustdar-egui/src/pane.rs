@@ -1,8 +1,6 @@
 use rustdar_overlays::render::layers::LayerManager;
-use crate::overlay_cache::OverlayLayerCache;
-use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct};
+use crate::overlay_cache::OverlayTextureCache;
 use rustdar_radar::types::{ImageBounds, RadarProduct, ScanInfo};
-use std::collections::HashMap;
 use std::sync::Arc;
 use walkers::MapMemory;
 
@@ -30,10 +28,10 @@ pub struct PaneState {
     pub last_hover_pos: Option<egui::Pos2>,
     pub layers: LayerManager,
     pub map_memory: MapMemory,
-    // Per-pane overlay projection caches (viewport-dependent).
-    pub spc_overlay_caches: HashMap<(OutlookDay, OutlookProduct), OverlayLayerCache>,
-    pub nws_overlay_cache: OverlayLayerCache,
-    pub spc_md_overlay_cache: OverlayLayerCache,
+    // Per-pane overlay texture caches (background-rendered).
+    pub spc_overlay_texture: OverlayTextureCache,
+    pub nws_alert_texture: OverlayTextureCache,
+    pub spc_md_texture: OverlayTextureCache,
 }
 
 impl PaneState {
@@ -49,9 +47,9 @@ impl PaneState {
             last_hover_pos: None,
             layers: LayerManager::new(),
             map_memory,
-            spc_overlay_caches: HashMap::new(),
-            nws_overlay_cache: OverlayLayerCache::new(),
-            spc_md_overlay_cache: OverlayLayerCache::new(),
+            spc_overlay_texture: OverlayTextureCache::new(),
+            nws_alert_texture: OverlayTextureCache::new(),
+            spc_md_texture: OverlayTextureCache::new(),
         }
     }
 

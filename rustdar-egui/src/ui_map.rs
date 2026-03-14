@@ -112,6 +112,7 @@ impl super::Gui {
                             let zoom = memory.zoom();
 
                             let mut render_ctx = pane_render::PaneRenderCtx {
+                                pane_idx,
                                 pane: &mut pane,
                                 overlays: &mut self.overlays,
                                 radar_image: &radar_image,
@@ -121,7 +122,6 @@ impl super::Gui {
                                 pane_rect,
                                 pointer_available,
                                 is_dark_theme,
-                                current_theme_is_dark: self.map_tiles.current_theme_is_dark,
                                 scan_info_site_name: self.radar.scan_info.as_ref().map(|i| i.site.name),
                                 loading_site: &mut self.radar.loading_site,
                             };

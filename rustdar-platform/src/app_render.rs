@@ -59,6 +59,7 @@ impl super::App {
 
         self.poll_render_results();
         self.poll_level3_results();
+        self.poll_overlay_render_results();
         self.dispatch_pane_renders();
 
         (screen_descriptor, gui_action)
@@ -174,6 +175,54 @@ impl super::App {
             elevations.sort_by(|a, b| a.partial_cmp(b).unwrap());
         }
         self.gui.set_scan_info(info);
+    }
+
+    /// Poll for completed overlay rasterization results and upload textures.
+    fn poll_overlay_render_results(&mut self) {
+        use rustdar_egui::overlay_cache::OverlayTextureData;
+        use crate::channels::OverlayType;
+
+        let ctx = self.state.as_ref().unwrap().egui_renderer.context();
+        while let Ok(resp) = self.channels.overlay_render_receiver.try_recv() {
+            let Some(pane) = self.gui.pane_mut(resp.pane_idx) else {
+                continue;
+            };
+
+            let cache = match resp.overlay_type {
+                OverlayType::SpcOutlook(..) => &mut pane.spc_overlay_texture,
+                OverlayType::SpcDiscussions => &mut pane.spc_md_texture,
+                OverlayType::NwsAlerts => &mut pane.nws_alert_texture,
+            };
+
+            cache.render_in_flight = false;
+
+            // Discard stale results
+            if resp.generation < cache.render_generation {
+                continue;
+            }
+
+            self.texture_counter += 1;
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [resp.width as usize, resp.height as usize],
+                &resp.image_data,
+            );
+            let tex_name = format!("overlay_{}_{}", resp.pane_idx, self.texture_counter);
+
+            // Save old texture for deferred cleanup
+            if let Some(old) = cache.current.take() {
+                self.old_textures.push(old.texture);
+            }
+
+            let texture = ctx.load_texture(tex_name, color_image, egui::TextureOptions::LINEAR);
+            cache.current = Some(OverlayTextureData {
+                texture,
+                geo_bounds: resp.geo_bounds,
+                data_generation: resp.generation,
+                render_zoom: resp.zoom,
+                width: resp.width,
+                height: resp.height,
+            });
+        }
     }
 
     /// Check all panes for needed background renders and spawn render threads.

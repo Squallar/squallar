@@ -113,4 +113,10 @@ impl OverlayData {
     pub fn set_spc_md_fetching(&mut self, fetching: bool) {
         self.spc_discussions.fetching = fetching;
     }
+
+    /// Combined SPC data generation — sum of all per-product generations.
+    /// Used as a single change-detection value for the unified SPC texture.
+    pub fn combined_spc_data_generation(&self) -> u64 {
+        self.spc_data_generation.values().sum()
+    }
 }

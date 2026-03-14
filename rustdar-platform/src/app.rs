@@ -30,7 +30,12 @@ mod render;
 /// Used by async tasks and event handlers that hold an `Option<WindowRef>`.
 pub(crate) fn notify_redraw(window: &Option<WindowRef>) {
     if let Some(w) = window {
-        w.request_redraw();
+        // Background threads may outlive the event loop on exit.
+        // request_redraw() panics on X11 when the loop is closed,
+        // so we catch and ignore that.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            w.request_redraw();
+        }));
     }
 }
 

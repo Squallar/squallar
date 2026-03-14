@@ -1,4 +1,5 @@
 use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct};
+use rustdar_overlays::types::GeoBounds;
 use chrono::NaiveDateTime;
 
 /// Configuration for radar site and time selection
@@ -44,6 +45,24 @@ pub enum GuiAction {
     FetchSpcDiscussions,
     /// Re-fetch SPC Mesoscale Discussions (manual refresh).
     RefreshSpcDiscussions,
+    /// Request a background overlay rasterization for a pane.
+    RenderOverlay {
+        pane_idx: usize,
+        overlay_kind: OverlayRenderKind,
+        geo_bounds: GeoBounds,
+        width: u32,
+        height: u32,
+        data_generation: u64,
+        zoom: i32,
+    },
+}
+
+/// Which overlay type to rasterize.
+#[derive(Debug, Clone)]
+pub enum OverlayRenderKind {
+    SpcOutlook,
+    SpcDiscussions,
+    NwsAlerts,
 }
 
 impl std::fmt::Display for GuiAction {
@@ -80,6 +99,9 @@ impl std::fmt::Display for GuiAction {
             }
             GuiAction::RefreshSpcDiscussions => {
                 write!(f, "Refresh SPC Mesoscale Discussions")
+            }
+            GuiAction::RenderOverlay { pane_idx, overlay_kind, .. } => {
+                write!(f, "Render overlay {:?} for pane {}", overlay_kind, pane_idx)
             }
         }
     }
