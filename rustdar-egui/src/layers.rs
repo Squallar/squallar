@@ -19,6 +19,24 @@ pub enum LayerKind {
 }
 
 impl LayerKind {
+    /// All layer kinds in canonical order.
+    pub const fn all() -> &'static [LayerKind] {
+        &[
+            LayerKind::Radar,
+            LayerKind::SpcCategorical,
+            LayerKind::SpcTornado,
+            LayerKind::SpcWind,
+            LayerKind::SpcHail,
+            LayerKind::SpcProbabilistic,
+            LayerKind::SpcMesoscaleDiscussions,
+            LayerKind::NwsWarnings,
+            LayerKind::NwsWatches,
+            LayerKind::NwsAdvisories,
+            LayerKind::CityLabels,
+            LayerKind::RadarSites,
+        ]
+    }
+
     /// Human-readable display name.
     pub fn display_name(self) -> &'static str {
         match self {

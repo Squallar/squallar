@@ -1046,20 +1046,7 @@ impl Gui {
         }
         let src = &self.panes[self.active_pane].layers;
         let spc_day = src.spc_day;
-        let snapshot: Vec<(LayerKind, bool)> = [
-            LayerKind::Radar,
-            LayerKind::SpcCategorical,
-            LayerKind::SpcTornado,
-            LayerKind::SpcWind,
-            LayerKind::SpcHail,
-            LayerKind::SpcProbabilistic,
-            LayerKind::SpcMesoscaleDiscussions,
-            LayerKind::NwsWarnings,
-            LayerKind::NwsWatches,
-            LayerKind::NwsAdvisories,
-            LayerKind::CityLabels,
-            LayerKind::RadarSites,
-        ]
+        let snapshot: Vec<(LayerKind, bool)> = LayerKind::all()
         .iter()
         .map(|&k| (k, src.is_enabled(k)))
         .collect();
