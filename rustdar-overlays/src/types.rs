@@ -5,6 +5,37 @@ pub type GeoPolygonRing = Vec<(f64, f64)>;
 /// A polygon with an exterior ring and optional holes.
 pub type GeoPolygon = Vec<GeoPolygonRing>;
 
+/// Parse GeoJSON polygon coordinate rings into a `GeoPolygon`.
+///
+/// GeoJSON format: `[ [ [lon, lat], ... ], ... ]`
+/// Returns `(lat, lon)` pairs per ring. Skips degenerate rings with fewer than 3 points.
+pub fn parse_polygon_coords(coords: &serde_json::Value) -> Option<GeoPolygon> {
+    let rings = coords.as_array()?;
+    let mut geo_rings = Vec::with_capacity(rings.len());
+
+    for ring in rings {
+        let points = ring.as_array()?;
+        let geo_ring: Vec<(f64, f64)> = points
+            .iter()
+            .filter_map(|pt| {
+                let arr = pt.as_array()?;
+                let lon = arr.first()?.as_f64()?;
+                let lat = arr.get(1)?.as_f64()?;
+                Some((lat, lon))
+            })
+            .collect();
+        if geo_ring.len() >= 3 {
+            geo_rings.push(geo_ring);
+        }
+    }
+
+    if geo_rings.is_empty() {
+        None
+    } else {
+        Some(geo_rings)
+    }
+}
+
 /// Hatching pattern for CIG (Conditional Intensity Group) areas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HatchPattern {

@@ -237,14 +237,14 @@ pub(crate) fn parse_geometry(geom: Option<&serde_json::Value>) -> Option<Vec<Geo
 
     match geom_type {
         "Polygon" => {
-            let poly = parse_polygon_coords(coords)?;
+            let poly = crate::types::parse_polygon_coords(coords)?;
             Some(vec![poly])
         }
         "MultiPolygon" => {
             let multi = coords.as_array()?;
             let polys: Vec<GeoPolygon> = multi
                 .iter()
-                .filter_map(|p| parse_polygon_coords(p))
+                .filter_map(|p| crate::types::parse_polygon_coords(p))
                 .collect();
             if polys.is_empty() { None } else { Some(polys) }
         }
@@ -253,31 +253,6 @@ pub(crate) fn parse_geometry(geom: Option<&serde_json::Value>) -> Option<Vec<Geo
             None
         }
     }
-}
-
-/// Parse a single polygon's coordinate rings.
-/// GeoJSON uses `[lon, lat]`; we store as `(lat, lon)`.
-fn parse_polygon_coords(coords: &serde_json::Value) -> Option<GeoPolygon> {
-    let rings = coords.as_array()?;
-    let mut geo_rings = Vec::with_capacity(rings.len());
-
-    for ring in rings {
-        let points = ring.as_array()?;
-        let geo_ring = points
-            .iter()
-            .filter_map(|pt| {
-                let arr = pt.as_array()?;
-                let lon = arr.first()?.as_f64()?;
-                let lat = arr.get(1)?.as_f64()?;
-                Some((lat, lon)) // (lat, lon) internal convention
-            })
-            .collect::<Vec<_>>();
-        if geo_ring.len() >= 3 {
-            geo_rings.push(geo_ring);
-        }
-    }
-
-    if geo_rings.is_empty() { None } else { Some(geo_rings) }
 }
 
 /// Extract a required string field, defaulting to empty string.

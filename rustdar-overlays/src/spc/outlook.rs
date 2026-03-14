@@ -306,7 +306,8 @@ fn parse_multi_polygon(geometry: &serde_json::Value) -> Result<Vec<GeoPolygon>, 
 
     let mut polygons = Vec::new();
     for polygon_coords in coords {
-        let poly = parse_polygon_coords(polygon_coords)?;
+        let poly = crate::types::parse_polygon_coords(polygon_coords)
+            .ok_or_else(|| "Invalid polygon coordinates".to_string())?;
         polygons.push(poly);
     }
     Ok(polygons)
@@ -317,36 +318,6 @@ fn parse_polygon(geometry: &serde_json::Value) -> Result<GeoPolygon, String> {
     let coords = geometry
         .get("coordinates")
         .ok_or_else(|| "Polygon missing 'coordinates'".to_string())?;
-    parse_polygon_coords(coords)
-}
-
-/// Parse polygon coordinate rings from a GeoJSON array.
-/// GeoJSON: [ [ [lon, lat], [lon, lat], ... ], ... ]
-/// Returns: Vec<Vec<(lat, lon)>>
-fn parse_polygon_coords(coords: &serde_json::Value) -> Result<GeoPolygon, String> {
-    let rings = coords
-        .as_array()
-        .ok_or_else(|| "Polygon coordinates not an array".to_string())?;
-
-    let mut polygon = Vec::new();
-    for ring in rings {
-        let points = ring
-            .as_array()
-            .ok_or_else(|| "Ring not an array".to_string())?;
-
-        let mut ring_pts = Vec::with_capacity(points.len());
-        for point in points {
-            let coords = point
-                .as_array()
-                .ok_or_else(|| "Point not an array".to_string())?;
-            if coords.len() < 2 {
-                continue;
-            }
-            let lon = coords[0].as_f64().unwrap_or(0.0);
-            let lat = coords[1].as_f64().unwrap_or(0.0);
-            ring_pts.push((lat, lon));
-        }
-        polygon.push(ring_pts);
-    }
-    Ok(polygon)
+    crate::types::parse_polygon_coords(coords)
+        .ok_or_else(|| "Invalid polygon coordinates".to_string())
 }
