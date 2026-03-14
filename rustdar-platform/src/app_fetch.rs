@@ -147,6 +147,21 @@ impl super::App {
         }
     }
 
+    /// Spawn an async overlay fetch task. Sends the future's result through
+    /// the given channel and requests a redraw when complete.
+    fn spawn_overlay_fetch<T: Send + 'static>(
+        &self,
+        sender: std::sync::mpsc::Sender<T>,
+        future: impl std::future::Future<Output = T> + Send + 'static,
+    ) {
+        let window = self.window.clone();
+        self.tokio_runtime.spawn(async move {
+            let result = future.await;
+            let _ = sender.send(result);
+            super::notify_redraw(&window);
+        });
+    }
+
     /// Handle overlay fetch/refresh actions (SPC outlooks, NWS alerts, SPC discussions).
     fn handle_overlay_action(&mut self, action: GuiAction) {
         match action {
@@ -155,18 +170,14 @@ impl super::App {
                 self.gui.overlays.set_spc_fetching(true);
                 let client = self.http_client.clone();
                 let sender = self.channels.outlook_sender.clone();
-                let window = self.window.clone();
                 for product in products {
                     let client = client.clone();
-                    let sender = sender.clone();
-                    let window = window.clone();
-                    self.tokio_runtime.spawn(async move {
+                    self.spawn_overlay_fetch(sender.clone(), async move {
                         let result =
                             rustdar_overlays::spc::fetch::fetch_outlook(&client, day, product)
                                 .await
                                 .map_err(|e| format!("{e}"));
-                        let _ = sender.send(OutlookResponse { day, product, result });
-                        super::notify_redraw(&window);
+                        OutlookResponse { day, product, result }
                     });
                 }
             }
@@ -183,34 +194,24 @@ impl super::App {
                 log::info!("Fetching NWS active alerts");
                 self.gui.overlays.set_nws_fetching(true);
                 let client = self.http_client.clone();
-                let sender = self.channels.alert_sender.clone();
-                let window = self.window.clone();
                 let zone_cache = self.platform.zone_cache_dir().map(|p| p.to_path_buf());
-                self.tokio_runtime.spawn(async move {
-                    let result =
-                        rustdar_overlays::nws::fetch::fetch_active_alerts(
-                            &client,
-                            zone_cache.as_deref(),
-                        )
-                            .await
-                            .map_err(|e| format!("{e}"));
-                    let _ = sender.send(result);
-                    super::notify_redraw(&window);
+                self.spawn_overlay_fetch(self.channels.alert_sender.clone(), async move {
+                    rustdar_overlays::nws::fetch::fetch_active_alerts(
+                        &client,
+                        zone_cache.as_deref(),
+                    )
+                        .await
+                        .map_err(|e| format!("{e}"))
                 });
             }
             GuiAction::FetchSpcDiscussions | GuiAction::RefreshSpcDiscussions => {
                 log::info!("Fetching SPC Mesoscale Discussions");
                 self.gui.overlays.set_spc_md_fetching(true);
                 let client = self.http_client.clone();
-                let sender = self.channels.discussion_sender.clone();
-                let window = self.window.clone();
-                self.tokio_runtime.spawn(async move {
-                    let result =
-                        rustdar_overlays::spc::fetch::fetch_active_discussions(&client)
-                            .await
-                            .map_err(|e| format!("{e}"));
-                    let _ = sender.send(result);
-                    super::notify_redraw(&window);
+                self.spawn_overlay_fetch(self.channels.discussion_sender.clone(), async move {
+                    rustdar_overlays::spc::fetch::fetch_active_discussions(&client)
+                        .await
+                        .map_err(|e| format!("{e}"))
                 });
             }
             _ => unreachable!(),
