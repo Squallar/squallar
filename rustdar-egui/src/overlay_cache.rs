@@ -20,7 +20,7 @@ fn quantize_zoom(zoom: f64) -> i32 {
 }
 
 /// Fraction of the texture dimension used as overdraw margin.
-pub const OVERDRAW_FRACTION: f32 = 0.5;
+pub const OVERDRAW_FRACTION: f32 = 1.0;
 
 /// When the accumulated pan exceeds this fraction of the overdraw margin,
 /// a fresh render is triggered so the texture stays ahead of the viewport.
