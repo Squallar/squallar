@@ -259,7 +259,24 @@ fn build_cached_polygon(
         return None;
     }
 
-    // Project all geo vertices to screen coordinates
+    let (projected, poly_rect) = project_and_cull(ring, projector, screen_rect)?;
+
+    let tri_indices = resolve_tri_indices(&projected, ring.len(), precomputed_tri);
+
+    Some(CachedPolygon {
+        screen_pts: projected,
+        tri_indices,
+        poly_rect,
+        hatch_lines: Vec::new(),
+    })
+}
+
+/// Project geo coordinates to screen space and cull off-screen / too-small polygons.
+fn project_and_cull(
+    ring: &[(f64, f64)],
+    projector: &Projector,
+    screen_rect: Rect,
+) -> Option<(Vec<Pos2>, Rect)> {
     let projected: Vec<Pos2> = ring
         .iter()
         .filter_map(|&(lat, lon)| {
@@ -272,42 +289,31 @@ fn build_cached_polygon(
         return None;
     }
 
-    // Compute AABB
     let (min_x, min_y, max_x, max_y) = geo::aabb(&projected);
     let poly_rect = Rect::from_min_max(egui::pos2(min_x, min_y), egui::pos2(max_x, max_y));
 
-    // Cull polygons whose screen AABB doesn't intersect the viewport
-    // (with a generous margin for stroke width)
     if !screen_rect.expand(20.0).intersects(poly_rect) {
         return None;
     }
-
-    // Skip polygons too small to meaningfully render
     if (max_x - min_x) < 2.0 && (max_y - min_y) < 2.0 {
         return None;
     }
 
-    // Determine triangle indices.
-    // If we have pre-computed triangulation AND all vertices survived projection
-    // (same count as ring), re-use the pre-computed indices directly.
-    let tri_indices = if let Some(tri) = precomputed_tri {
-        if projected.len() == ring.len() {
-            // Pre-computed indices map directly to the projected vertices
-            tri.indices.clone()
-        } else {
-            // Vertex count changed (some filtered by is_finite check) — re-triangulate
-            triangulate_screen(&projected)
-        }
-    } else {
-        triangulate_screen(&projected)
-    };
+    Some((projected, poly_rect))
+}
 
-    Some(CachedPolygon {
-        screen_pts: projected,
-        tri_indices,
-        poly_rect,
-        hatch_lines: Vec::new(),
-    })
+/// Resolve triangle indices, preferring pre-computed triangulation when vertex count matches.
+fn resolve_tri_indices(
+    projected: &[Pos2],
+    original_ring_len: usize,
+    precomputed: Option<&rustdar_overlays::types::PrecomputedTriangulation>,
+) -> Vec<u32> {
+    if let Some(tri) = precomputed {
+        if projected.len() == original_ring_len {
+            return tri.indices.clone();
+        }
+    }
+    triangulate_screen(projected)
 }
 
 /// Ear-clip triangulate in screen coordinates (fallback when pre-computed indices can't be used).
