@@ -526,17 +526,16 @@ impl super::App {
                 cache.remove(&timestamp);
             }
 
-            // Auto-start playback once all frames have rendered textures
+            // Auto-start playback once the current render batch is complete
             let pane = self.gui.pane_mut(pane_idx).unwrap();
             let ls = pane.loop_state.as_mut().unwrap();
-            if !ls.playing && !ls.frames.is_empty() {
-                let all_done = ls.frames.iter().all(|f| f.texture.is_some() || (!f.render_in_flight && f.texture.is_none()));
+            if !ls.render_ready && !ls.frames.is_empty() {
                 let any_rendered = ls.frames.iter().any(|f| f.texture.is_some());
-                let none_pending = !ls.frames.iter().any(|f| f.render_in_flight)
-                    && self.loop_pending_downloads.get(&pane_idx).map_or(true, |p| p.is_empty())
-                    && self.loop_downloads_in_flight.get(&pane_idx).copied().unwrap_or(0) == 0
-                    && self.loop_scan_cache.get(&pane_idx).map_or(true, |c| c.is_empty());
-                if all_done && any_rendered && none_pending {
+                let none_in_flight = !ls.frames.iter().any(|f| f.render_in_flight);
+                let downloads_done = self.loop_pending_downloads.get(&pane_idx).map_or(true, |p| p.is_empty())
+                    && self.loop_downloads_in_flight.get(&pane_idx).copied().unwrap_or(0) == 0;
+                if any_rendered && none_in_flight && downloads_done {
+                    ls.render_ready = true;
                     ls.playing = true;
                     ls.last_advance = Some(std::time::Instant::now());
                 }

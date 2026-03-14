@@ -637,7 +637,7 @@ impl Gui {
                     // Frame status
                     let rendered = ls.frames.iter().filter(|f| f.texture.is_some()).count();
                     let total = ls.frames.len();
-                    let rendering = total > 0 && rendered < total;
+                    let rendering = total > 0 && !ls.render_ready;
                     if ls.fetching {
                         ui.horizontal(|ui| {
                             ui.spinner();

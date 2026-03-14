@@ -40,6 +40,8 @@ pub struct LoopPlaybackState {
     pub lookback_secs: u64,
     /// True while the initial scan listing/fetch is in progress.
     pub fetching: bool,
+    /// True once the initial render batch is complete and playback can start.
+    pub render_ready: bool,
     /// Instant of the last frame advance (for animation timing).
     pub last_advance: Option<std::time::Instant>,
     /// Radar site latitude, captured at loop creation for rendering.
