@@ -55,6 +55,29 @@ pub enum GuiAction {
         data_generation: u64,
         zoom: i32,
     },
+    /// Enable radar loop for a pane — triggers historical scan listing + fetch.
+    EnableLoop {
+        pane_idx: usize,
+        lookback_secs: u64,
+    },
+    /// Disable radar loop for a pane and drop cached frames.
+    DisableLoop {
+        pane_idx: usize,
+    },
+    /// Toggle play/pause of the loop animation for a pane.
+    ToggleLoopPlayback {
+        pane_idx: usize,
+    },
+    /// Step the loop one frame forward or backward.
+    StepLoopFrame {
+        pane_idx: usize,
+        forward: bool,
+    },
+    /// Seek to a specific frame index in the loop.
+    SeekLoopFrame {
+        pane_idx: usize,
+        frame_index: usize,
+    },
 }
 
 /// Which overlay type to rasterize.
@@ -102,6 +125,21 @@ impl std::fmt::Display for GuiAction {
             }
             GuiAction::RenderOverlay { pane_idx, overlay_kind, .. } => {
                 write!(f, "Render overlay {:?} for pane {}", overlay_kind, pane_idx)
+            }
+            GuiAction::EnableLoop { pane_idx, lookback_secs } => {
+                write!(f, "Enable loop for pane {} ({}s lookback)", pane_idx, lookback_secs)
+            }
+            GuiAction::DisableLoop { pane_idx } => {
+                write!(f, "Disable loop for pane {}", pane_idx)
+            }
+            GuiAction::ToggleLoopPlayback { pane_idx } => {
+                write!(f, "Toggle loop playback for pane {}", pane_idx)
+            }
+            GuiAction::StepLoopFrame { pane_idx, forward } => {
+                write!(f, "Step loop frame for pane {} (forward={})", pane_idx, forward)
+            }
+            GuiAction::SeekLoopFrame { pane_idx, frame_index } => {
+                write!(f, "Seek loop to frame {} for pane {}", frame_index, pane_idx)
             }
         }
     }
