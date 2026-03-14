@@ -2,7 +2,7 @@ use egui_wgpu::{ScreenDescriptor, wgpu};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use rustdar_egui::actions::GuiAction;
-use crate::constants::{MAX_CONCURRENT_RENDERS, MAX_LOOP_RENDER_BUDGET, MAX_CONCURRENT_LOOP_DOWNLOADS};
+use crate::constants::{MAX_CONCURRENT_RENDERS, MAX_LOOP_RENDER_BUDGET, MAX_CONCURRENT_LOOP_DOWNLOADS, MAX_LOOP_FRAMES};
 
 impl super::App {
     /// Create screen descriptor and setup egui frame.
@@ -419,8 +419,31 @@ impl super::App {
 
             log::info!("Loop: populated {} frames for pane {}", resp.scans.len(), resp.pane_idx);
 
+            // Cap pending downloads to MAX_LOOP_FRAMES by evenly sampling
+            let mut scans = resp.scans;
+            if scans.len() > MAX_LOOP_FRAMES {
+                let total = scans.len();
+                let sampled: Vec<_> = (0..MAX_LOOP_FRAMES)
+                    .map(|i| {
+                        let idx = i * (total - 1) / (MAX_LOOP_FRAMES - 1);
+                        scans[idx].clone()
+                    })
+                    .collect();
+                // Update the frames list to match the sampled set
+                ls.frames = sampled.iter().map(|(ts, _)| rustdar_egui::pane::LoopFrame {
+                    timestamp: *ts,
+                    texture: None,
+                    render_in_flight: false,
+                }).collect();
+                if !ls.frames.is_empty() {
+                    ls.current_frame = ls.frames.len() - 1;
+                }
+                log::info!("Loop: sampled {} → {} frames for pane {}", total, MAX_LOOP_FRAMES, resp.pane_idx);
+                scans = sampled;
+            }
+
             // Store all scans as pending downloads and dispatch the first batch
-            self.loop_pending_downloads.insert(resp.pane_idx, resp.scans);
+            self.loop_pending_downloads.insert(resp.pane_idx, scans);
             self.loop_downloads_in_flight.insert(resp.pane_idx, 0);
             self.dispatch_pending_loop_downloads(resp.pane_idx);
         }
@@ -518,7 +541,7 @@ impl super::App {
                 lat,
                 lon,
                 max_range_km: rr.max_range_km,
-                value_data: Arc::new(rr.value_data),
+                value_data: Arc::new(Vec::new()), // Skip value_data for loop frames to save memory
             });
 
             // Free scan data from cache — no longer needed once texture is rendered
@@ -581,6 +604,40 @@ impl super::App {
     /// Dispatch renders for loop frames around the playhead that have
     /// downloaded scan data but no rendered texture yet.
     fn dispatch_loop_renders(&mut self) {
+        // Evict textures from frames far from the playhead to cap memory usage.
+        // Keep at most MAX_LOOP_RENDER_BUDGET textured frames per pane.
+        for pane_idx in 0..self.gui.pane_count() {
+            let Some(pane) = self.gui.pane_mut(pane_idx) else {
+                continue;
+            };
+            let Some(ls) = &mut pane.loop_state else {
+                continue;
+            };
+            let num_frames = ls.frames.len();
+            if num_frames == 0 {
+                continue;
+            }
+            let textured_count = ls.frames.iter().filter(|f| f.texture.is_some()).count();
+            if textured_count <= MAX_LOOP_RENDER_BUDGET {
+                continue;
+            }
+            // Build a list of textured frame indices sorted by distance from playhead
+            let current = ls.current_frame;
+            let mut textured_indices: Vec<usize> = ls.frames.iter().enumerate()
+                .filter(|(_, f)| f.texture.is_some())
+                .map(|(i, _)| i)
+                .collect();
+            textured_indices.sort_by_key(|&i| {
+                let fwd = (i + num_frames - current) % num_frames;
+                let bwd = (current + num_frames - i) % num_frames;
+                fwd.min(bwd)
+            });
+            // Drop textures beyond the budget (farthest from playhead)
+            for &idx in textured_indices.iter().skip(MAX_LOOP_RENDER_BUDGET) {
+                ls.frames[idx].texture = None;
+            }
+        }
+
         // Collect all (pane_idx, frame_idx, timestamp, product, elevation, lat, lon) that need rendering
         let mut to_render: Vec<(usize, usize, chrono::NaiveDateTime, rustdar_radar::types::RadarProduct, f32, f64, f64)> = Vec::new();
 

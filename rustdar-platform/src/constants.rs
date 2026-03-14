@@ -22,3 +22,10 @@ pub const MAX_LOOP_RENDER_BUDGET: usize = 30;
 pub const MAX_CONCURRENT_LOOP_DOWNLOADS: usize = 4;
 #[cfg(not(target_os = "android"))]
 pub const MAX_CONCURRENT_LOOP_DOWNLOADS: usize = 8;
+
+/// Maximum total number of loop frames kept per pane.
+/// Limits combined memory from textures and scan data.
+#[cfg(target_os = "android")]
+pub const MAX_LOOP_FRAMES: usize = 20;
+#[cfg(not(target_os = "android"))]
+pub const MAX_LOOP_FRAMES: usize = 60;
