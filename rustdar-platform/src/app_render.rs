@@ -60,7 +60,11 @@ impl super::App {
         self.poll_render_results();
         self.poll_level3_results();
         self.poll_overlay_render_results();
+        self.poll_loop_scan_list_results();
+        self.poll_loop_scan_download_results();
+        self.poll_loop_render_results();
         self.dispatch_pane_renders();
+        self.dispatch_loop_renders();
 
         (screen_descriptor, gui_action)
     }
@@ -381,5 +385,179 @@ impl super::App {
         state.queue.submit(Some(encoder.finish()));
         state.egui_renderer.free_textures(&textures_to_free);
         surface_texture.present();
+    }
+
+    /// Poll for loop scan listing results. Populates the pane's frame list
+    /// and kicks off downloads for each scan.
+    fn poll_loop_scan_list_results(&mut self) {
+        while let Ok(resp) = self.channels.loop_scan_list_receiver.try_recv() {
+            let Some(pane) = self.gui.pane_mut(resp.pane_idx) else {
+                continue;
+            };
+            let Some(ls) = &mut pane.loop_state else {
+                continue;
+            };
+            ls.fetching = false;
+
+            // Populate frames (oldest-first, matching scan listing order)
+            ls.frames = resp
+                .scans
+                .iter()
+                .map(|(ts, _id)| rustdar_egui::pane::LoopFrame {
+                    timestamp: *ts,
+                    texture: None,
+                    render_in_flight: false,
+                })
+                .collect();
+
+            if !ls.frames.is_empty() {
+                ls.current_frame = ls.frames.len() - 1; // start at newest
+            }
+
+            log::info!("Loop: populated {} frames for pane {}", resp.scans.len(), resp.pane_idx);
+
+            // Start downloading scans — we'll download all in parallel
+            for (ts, id) in resp.scans {
+                self.spawn_loop_scan_download(resp.pane_idx, ts, id);
+            }
+        }
+    }
+
+    /// Poll for completed loop scan downloads. When a scan arrives, store it
+    /// in the loop_scan_cache and trigger a render if the frame needs one.
+    fn poll_loop_scan_download_results(&mut self) {
+        while let Ok(resp) = self.channels.loop_scan_download_receiver.try_recv() {
+            // Cache the downloaded scan for rendering
+            self.loop_scan_cache
+                .entry(resp.pane_idx)
+                .or_default()
+                .insert(resp.timestamp, resp.scan);
+        }
+    }
+
+    /// Poll for completed loop frame render results and upload textures.
+    fn poll_loop_render_results(&mut self) {
+        let ctx = self.state.as_ref().unwrap().egui_renderer.context();
+        let scan_info = self.gui.get_scan_info().cloned();
+        while let Ok(rr) = self.channels.loop_render_receiver.try_recv() {
+            let Some(pane) = self.gui.pane_mut(rr.pane_idx) else {
+                continue;
+            };
+            let Some(ls) = &mut pane.loop_state else {
+                continue;
+            };
+
+            // Find the matching frame by timestamp
+            let Some(frame) = ls.frames.iter_mut().find(|f| f.timestamp == rr.timestamp) else {
+                continue;
+            };
+            frame.render_in_flight = false;
+
+            self.texture_counter += 1;
+            let color_image =
+                egui::ColorImage::from_rgba_unmultiplied([1800, 1800], &rr.image_data);
+            let texture_name = format!("loop_frame_{}", self.texture_counter);
+            let texture = ctx.load_texture(
+                texture_name,
+                color_image,
+                egui::TextureOptions::NEAREST,
+            );
+
+            if let Some(si) = &scan_info {
+                frame.texture = Some(rustdar_egui::pane::RadarImageData {
+                    texture,
+                    lat: si.site.lat,
+                    lon: si.site.lon,
+                    max_range_km: rr.max_range_km,
+                    value_data: Arc::new(rr.value_data),
+                });
+            }
+        }
+    }
+
+    /// Dispatch renders for loop frames around the playhead that have
+    /// downloaded scan data but no rendered texture yet.
+    fn dispatch_loop_renders(&mut self) {
+        let Some(scan_info) = self.gui.get_scan_info().cloned() else {
+            return;
+        };
+
+        // Collect all (pane_idx, frame_idx, timestamp, product, elevation) that need rendering
+        let mut to_render: Vec<(usize, usize, chrono::NaiveDateTime, rustdar_radar::types::RadarProduct, f32)> = Vec::new();
+
+        for pane_idx in 0..self.gui.pane_count() {
+            let Some(pane) = self.gui.pane_mut(pane_idx) else {
+                continue;
+            };
+            let Some(ls) = &pane.loop_state else {
+                continue;
+            };
+            if ls.frames.is_empty() {
+                continue;
+            }
+
+            let (product, elevation) = match pane.get_rendering_params(Some(&scan_info)) {
+                Some(params) => params,
+                None => continue,
+            };
+
+            let num_frames = ls.frames.len();
+            let budget = num_frames.min(30);
+            let current = ls.current_frame;
+
+            let mut indices = Vec::with_capacity(budget);
+            for offset in 0..budget {
+                let fwd = (current + offset) % num_frames;
+                if !indices.contains(&fwd) {
+                    indices.push(fwd);
+                }
+                if indices.len() >= budget {
+                    break;
+                }
+                let bwd = (current + num_frames - offset) % num_frames;
+                if !indices.contains(&bwd) {
+                    indices.push(bwd);
+                }
+                if indices.len() >= budget {
+                    break;
+                }
+            }
+
+            let pane_cache = self.loop_scan_cache.get(&pane_idx);
+            for &idx in &indices {
+                let frame = &ls.frames[idx];
+                if frame.texture.is_some() || frame.render_in_flight {
+                    continue;
+                }
+                let Some(cache) = pane_cache else { continue };
+                if cache.contains_key(&frame.timestamp) {
+                    to_render.push((pane_idx, idx, frame.timestamp, product, elevation));
+                }
+            }
+        }
+
+        // Now mark in-flight and spawn renders
+        for (pane_idx, frame_idx, ts, product, elevation) in to_render {
+            let scan_arc = {
+                let cache = self.loop_scan_cache.get(&pane_idx).unwrap();
+                Arc::clone(cache.get(&ts).unwrap())
+            };
+
+            if let Some(pane) = self.gui.pane_mut(pane_idx) {
+                if let Some(ls) = &mut pane.loop_state {
+                    ls.frames[frame_idx].render_in_flight = true;
+                }
+            }
+
+            self.spawn_loop_frame_render(
+                pane_idx,
+                ts,
+                scan_arc,
+                product,
+                elevation,
+                scan_info.site.lat,
+                scan_info.site.lon,
+            );
+        }
     }
 }
