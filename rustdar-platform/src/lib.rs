@@ -14,6 +14,7 @@ pub mod constants;
 pub mod egui_renderer;
 pub mod input;
 pub mod platform;
+pub mod render_dispatch;
 pub mod run;
 
 pub use crate::run::run;

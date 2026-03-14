@@ -7,10 +7,9 @@ impl super::App {
     /// Spawn an async radar data fetch on the background runtime.
     /// Handles generation tracking, result sending, and redraw requests.
     pub fn spawn_fetch(&mut self, site: String, timestamp: NaiveDateTime) {
-        self.fetch_generation += 1;
-        let generation = self.fetch_generation;
+        let generation = self.render.next_fetch_generation();
         let window = self.window.clone();
-        let sender = self.scan_sender.clone();
+        let sender = self.channels.scan_sender.clone();
         self.tokio_runtime.spawn(async move {
             log::info!("Fetching {} @ {} UTC", site, timestamp);
             let msg = match scan::get_scan(&site, timestamp).await {
@@ -33,14 +32,14 @@ impl super::App {
     /// Called after a Level II scan loads so the products are available
     /// alongside the base moments.
     pub(super) fn spawn_level3_fetches(&self, site: &str, _timestamp: NaiveDateTime) {
-        let generation = self.fetch_generation;
+        let generation = self.render.fetch_generation;
         for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
             let Some(dirs) = l3_product.tgftp_dirs() else { continue };
             for &dir in dirs {
                 let site = site.to_string();
                 let dir_str = dir.to_string();
                 let product = *l3_product;
-                let sender = self.level3_sender.clone();
+                let sender = self.channels.level3_sender.clone();
                 let window = self.window.clone();
                 self.tokio_runtime.spawn(async move {
                     log::info!("Fetching TGFTP {} for {}", dir_str, site);
