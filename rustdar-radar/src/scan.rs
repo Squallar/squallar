@@ -200,41 +200,20 @@ pub async fn check_and_fetch_latest(
 const LEVEL3_BUCKET_URL: &str = "https://unidata-nexrad-level3.s3.amazonaws.com";
 
 /// Errors that can occur during Level III fetch operations.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Level3FetchError {
     /// HTTP request failed.
-    Http(reqwest::Error),
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
     /// No matching product found on S3.
+    #[error("not found: {0}")]
     NotFound(String),
     /// Level III decoding failed.
-    Decode(nexrad_level3::result::Error),
+    #[error("decode error: {0}")]
+    Decode(#[from] nexrad_level3::result::Error),
     /// XML listing parse error.
+    #[error("XML parse error: {0}")]
     XmlParse(String),
-}
-
-impl std::fmt::Display for Level3FetchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Level3FetchError::Http(e) => write!(f, "HTTP error: {e}"),
-            Level3FetchError::NotFound(msg) => write!(f, "not found: {msg}"),
-            Level3FetchError::Decode(e) => write!(f, "decode error: {e}"),
-            Level3FetchError::XmlParse(msg) => write!(f, "XML parse error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for Level3FetchError {}
-
-impl From<reqwest::Error> for Level3FetchError {
-    fn from(e: reqwest::Error) -> Self {
-        Level3FetchError::Http(e)
-    }
-}
-
-impl From<nexrad_level3::result::Error> for Level3FetchError {
-    fn from(e: nexrad_level3::result::Error) -> Self {
-        Level3FetchError::Decode(e)
-    }
 }
 
 /// Convert a 4-letter ICAO radar site code (e.g. "KTLX") to the 3-letter
