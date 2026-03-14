@@ -10,7 +10,7 @@
 //! pre-computed in geo-coordinates at fetch time (topology is projection-
 //! invariant), so only vertex projection needs to run on cache misses.
 
-use egui::{Mesh, Pos2, Rect, Shape, Stroke};
+use egui::{Mesh, Pos2, Rect, Shape, Vec2};
 use rustdar_overlays::render::geo as overlay_geo;
 use rustdar_overlays::render::hatch::generate_hatch_lines;
 use rustdar_overlays::types::{GeoBounds, HatchPattern, OverlayFeature, ScreenPoint};
@@ -329,20 +329,25 @@ fn triangulate_screen(pts: &[Pos2]) -> Vec<u32> {
 
 // ── Drawing from cache ───────────────────────────────────────────────────
 
-/// Accumulates batched fill triangles, stroke segments, and hatch lines for
-/// efficient emission to an `egui::Painter` in a single pass.
+/// Accumulates batched fill triangles, stroke outlines, and hatch lines into
+/// GPU-ready meshes for efficient emission to an `egui::Painter`.
+///
+/// All geometry is tessellated into `egui::Mesh` instances rather than
+/// individual `Shape::line_segment()` calls.  This reduces the per-frame
+/// shape count from O(total_edges) to a constant 3 meshes (fill + stroke +
+/// hatch), eliminating egui's per-shape tessellation overhead.
 pub struct MeshAccumulator {
     pub fill_mesh: Mesh,
-    pub strokes: Vec<Shape>,
-    pub hatch_strokes: Vec<Shape>,
+    pub stroke_mesh: Mesh,
+    pub hatch_mesh: Mesh,
 }
 
 impl MeshAccumulator {
     pub fn new() -> Self {
         Self {
             fill_mesh: Mesh::default(),
-            strokes: Vec::new(),
-            hatch_strokes: Vec::new(),
+            stroke_mesh: Mesh::default(),
+            hatch_mesh: Mesh::default(),
         }
     }
 
@@ -369,13 +374,13 @@ impl MeshAccumulator {
             }
         }
 
-        // Stroke outline
+        // Stroke outline — tessellated into quads in stroke_mesh
         if stroke_color.a() > 0 {
-            let stroke = Stroke::new(stroke_width, stroke_color);
             let pts = &poly.screen_pts;
+            let half = stroke_width * 0.5;
             for i in 0..pts.len() {
                 let j = (i + 1) % pts.len();
-                self.strokes.push(Shape::line_segment([pts[i], pts[j]], stroke));
+                push_line_quad(&mut self.stroke_mesh, pts[i], pts[j], half, stroke_color);
             }
         }
     }
@@ -384,16 +389,9 @@ impl MeshAccumulator {
     pub fn append_hatch(&mut self, poly: &CachedPolygon, hatch_color: egui::Color32) {
         for &(p1, p2, dotted) in &poly.hatch_lines {
             if dotted {
-                self.hatch_strokes.extend(geo::dashed_line_shapes(
-                    p1,
-                    p2,
-                    Stroke::new(1.5, hatch_color),
-                ));
+                push_dashed_line_quads(&mut self.hatch_mesh, p1, p2, 1.5, hatch_color);
             } else {
-                self.hatch_strokes.push(Shape::line_segment(
-                    [p1, p2],
-                    Stroke::new(1.5, hatch_color),
-                ));
+                push_line_quad(&mut self.hatch_mesh, p1, p2, 0.75, hatch_color);
             }
         }
     }
@@ -403,8 +401,68 @@ impl MeshAccumulator {
         if !self.fill_mesh.vertices.is_empty() {
             painter.add(Shape::mesh(self.fill_mesh));
         }
-        painter.extend(self.strokes);
-        painter.extend(self.hatch_strokes);
+        if !self.stroke_mesh.vertices.is_empty() {
+            painter.add(Shape::mesh(self.stroke_mesh));
+        }
+        if !self.hatch_mesh.vertices.is_empty() {
+            painter.add(Shape::mesh(self.hatch_mesh));
+        }
+    }
+}
+
+/// Tessellate a single line segment into a screen-aligned quad (4 vertices, 6 indices)
+/// and push it into the given mesh.
+#[inline]
+fn push_line_quad(mesh: &mut Mesh, p1: Pos2, p2: Pos2, half_width: f32, color: egui::Color32) {
+    let d = Vec2::new(p2.x - p1.x, p2.y - p1.y);
+    let len_sq = d.x * d.x + d.y * d.y;
+    if len_sq < 0.01 {
+        return;
+    }
+    let inv_len = len_sq.sqrt().recip();
+    // Normal perpendicular to the line direction
+    let n = Vec2::new(-d.y * inv_len * half_width, d.x * inv_len * half_width);
+
+    let base = mesh.vertices.len() as u32;
+    let uv = egui::epaint::WHITE_UV;
+    mesh.vertices.extend_from_slice(&[
+        egui::epaint::Vertex { pos: Pos2::new(p1.x + n.x, p1.y + n.y), uv, color },
+        egui::epaint::Vertex { pos: Pos2::new(p1.x - n.x, p1.y - n.y), uv, color },
+        egui::epaint::Vertex { pos: Pos2::new(p2.x - n.x, p2.y - n.y), uv, color },
+        egui::epaint::Vertex { pos: Pos2::new(p2.x + n.x, p2.y + n.y), uv, color },
+    ]);
+    mesh.indices.extend_from_slice(&[
+        base, base + 1, base + 2,
+        base, base + 2, base + 3,
+    ]);
+}
+
+/// Tessellate a dashed line into quads within a mesh.
+fn push_dashed_line_quads(
+    mesh: &mut Mesh,
+    p1: Pos2,
+    p2: Pos2,
+    width: f32,
+    color: egui::Color32,
+) {
+    const DASH: f32 = 4.0;
+    const GAP: f32 = 4.0;
+    let dx = p2.x - p1.x;
+    let dy = p2.y - p1.y;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1.0 {
+        return;
+    }
+    let nx = dx / len;
+    let ny = dy / len;
+    let half = width * 0.5;
+    let mut t = 0.0_f32;
+    while t < len {
+        let end = (t + DASH).min(len);
+        let a = Pos2::new(p1.x + nx * t, p1.y + ny * t);
+        let b = Pos2::new(p1.x + nx * end, p1.y + ny * end);
+        push_line_quad(mesh, a, b, half, color);
+        t = end + GAP;
     }
 }
 
