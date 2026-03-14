@@ -214,6 +214,31 @@ fn compute_max_range(radials: &[Radial], product: types::RadarProduct) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Set up rendering infrastructure (projection + buffers), call the rendering
+/// closure, then convert buffers to output and log completion.
+fn render_with_projection(
+    radar_lat: f64,
+    radar_lon: f64,
+    actual_max_range: f64,
+    label: &str,
+    fill: impl FnOnce(&MercatorProjection, &RenderBuffers),
+) -> (Vec<u8>, f64, Vec<f32>) {
+    let bounds = types::ImageBounds::from_radar_site(radar_lat, radar_lon);
+    let proj = MercatorProjection::from_bounds(radar_lat, &bounds);
+    let bufs = RenderBuffers::new();
+
+    fill(&proj, &bufs);
+
+    let (image, max_range, value_data) = bufs.into_output(actual_max_range);
+    log::info!(
+        "{} rendering complete: actual_max_range={:.1}km, using max_range={:.1}km",
+        label,
+        actual_max_range,
+        max_range
+    );
+    (image, max_range, value_data)
+}
+
 // ── Public rendering functions ───────────────────────────────────────────────
 
 /// Render radar data to an image projected for geographic display.
@@ -235,49 +260,42 @@ pub fn render_radar_to_image(
         return render_nrot_to_image(radials, radar_lat);
     }
 
-    let bounds = types::ImageBounds::from_radar_site(radar_lat, radar_lon);
-    let proj = MercatorProjection::from_bounds(radar_lat, &bounds);
-    let bufs = RenderBuffers::new();
-
     let avg_azimuth_spacing = compute_azimuth_spacing(radials);
     let actual_max_range = compute_max_range(radials, product);
 
-    // Process radials in parallel
-    radials.par_iter().for_each(|radial| {
-        let azimuth = radial.azimuth_angle_degrees() as f64;
-        let ctx = RadialContext::new(azimuth, avg_azimuth_spacing / 2.0);
+    let output = render_with_projection(
+        radar_lat, radar_lon, actual_max_range, "Radar",
+        |proj, bufs| {
+            radials.par_iter().for_each(|radial| {
+                let azimuth = radial.azimuth_angle_degrees() as f64;
+                let ctx = RadialContext::new(azimuth, avg_azimuth_spacing / 2.0);
 
-        if let Some(moment) = product.get_moment(radial) {
-            let first_gate_range = moment.first_gate_range_km();
-            let gate_size = moment.gate_interval_km();
+                if let Some(moment) = product.get_moment(radial) {
+                    let first_gate_range = moment.first_gate_range_km();
+                    let gate_size = moment.gate_interval_km();
 
-            for (gate_idx, moment_value) in moment.values().iter().enumerate() {
-                let range_km = first_gate_range + (gate_idx as f64 * gate_size);
-                if range_km > types::MAX_RANGE_KM {
-                    break;
+                    for (gate_idx, moment_value) in moment.values().iter().enumerate() {
+                        let range_km = first_gate_range + (gate_idx as f64 * gate_size);
+                        if range_km > types::MAX_RANGE_KM {
+                            break;
+                        }
+
+                        let scaled_value = match moment_value {
+                            nexrad_model::data::MomentValue::Value(v) => *v,
+                            _ => continue,
+                        };
+                        if scaled_value >= 999.0 || scaled_value.is_nan() {
+                            continue;
+                        }
+
+                        let color = get_color_for_value(product, scaled_value);
+                        proj.render_gate(bufs, &ctx, range_km, gate_size, scaled_value, color);
+                    }
                 }
-
-                let scaled_value = match moment_value {
-                    nexrad_model::data::MomentValue::Value(v) => *v,
-                    _ => continue,
-                };
-                if scaled_value >= 999.0 || scaled_value.is_nan() {
-                    continue;
-                }
-
-                let color = get_color_for_value(product, scaled_value);
-                proj.render_gate(&bufs, &ctx, range_km, gate_size, scaled_value, color);
-            }
-        }
-    });
-
-    let (image, max_range, value_data) = bufs.into_output(actual_max_range);
-    log::info!(
-        "Radar rendering complete: actual_max_range={:.1}km, using max_range={:.1}km",
-        actual_max_range,
-        max_range
+            });
+        },
     );
-    Some((image, max_range, value_data))
+    Some(output)
 }
 
 /// Render NROT (Normalized Rotation) to an image.
@@ -358,41 +376,37 @@ fn render_nrot_to_image(
         })
         .collect();
 
-    let bounds = types::ImageBounds::from_radar_site(radar_lat, 0.0);
-    let proj = MercatorProjection::from_bounds(radar_lat, &bounds);
-    let bufs = RenderBuffers::new();
+    let output = render_with_projection(
+        radar_lat, 0.0, actual_max_range, "NROT",
+        |proj, bufs| {
+            nrot_grid.par_iter().enumerate().for_each(|(i, nrot_row)| {
+                let ctx = RadialContext::new(azimuths_deg[i], avg_spacing_deg / 2.0);
 
-    // Render NROT grid to image in parallel
-    nrot_grid.par_iter().enumerate().for_each(|(i, nrot_row)| {
-        let ctx = RadialContext::new(azimuths_deg[i], avg_spacing_deg / 2.0);
+                for (j, &nrot_val) in nrot_row.iter().enumerate() {
+                    if nrot_val.is_nan() {
+                        continue;
+                    }
 
-        for (j, &nrot_val) in nrot_row.iter().enumerate() {
-            if nrot_val.is_nan() {
-                continue;
-            }
+                    let range_km = first_gate_range + j as f64 * gate_interval;
+                    if range_km > types::MAX_RANGE_KM {
+                        break;
+                    }
 
-            let range_km = first_gate_range + j as f64 * gate_interval;
-            if range_km > types::MAX_RANGE_KM {
-                break;
-            }
+                    let scaled_value = nrot_val as f32;
+                    let color = get_color_for_value(
+                        types::RadarProduct::NormalizedRotation,
+                        scaled_value,
+                    );
+                    if color.3 == 0 {
+                        continue;
+                    }
 
-            let scaled_value = nrot_val as f32;
-            let color = get_color_for_value(types::RadarProduct::NormalizedRotation, scaled_value);
-            if color.3 == 0 {
-                continue;
-            }
-
-            proj.render_gate(&bufs, &ctx, range_km, gate_interval, scaled_value, color);
-        }
-    });
-
-    let (image, max_range, value_data) = bufs.into_output(actual_max_range);
-    log::info!(
-        "NROT rendering complete: actual_max_range={:.1}km, using max_range={:.1}km",
-        actual_max_range,
-        max_range
+                    proj.render_gate(bufs, &ctx, range_km, gate_interval, scaled_value, color);
+                }
+            });
+        },
     );
-    Some((image, max_range, value_data))
+    Some(output)
 }
 
 /// Render a Level III radial product to an image projected for geographic display.
@@ -425,44 +439,42 @@ pub fn render_level3_radial_to_image(
     let num_bins = radial_packet.num_range_bins as usize;
     let actual_max_range = first_gate_range + num_bins as f64 * gate_interval;
 
-    let bounds = types::ImageBounds::from_radar_site(radar_lat, radar_lon);
-    let proj = MercatorProjection::from_bounds(radar_lat, &bounds);
-    let bufs = RenderBuffers::new();
     let radials = &radial_packet.radials;
 
-    // Process radials in parallel
-    radials.par_iter().for_each(|radial_run| {
-        let azimuth = radial_run.start_angle as f64 + radial_run.angle_delta as f64 / 2.0;
-        let ctx = RadialContext::new(azimuth, radial_run.angle_delta as f64 / 2.0);
+    let output = render_with_projection(
+        radar_lat, radar_lon, actual_max_range, "Level III",
+        |proj, bufs| {
+            radials.par_iter().for_each(|radial_run| {
+                let azimuth =
+                    radial_run.start_angle as f64 + radial_run.angle_delta as f64 / 2.0;
+                let ctx = RadialContext::new(azimuth, radial_run.angle_delta as f64 / 2.0);
 
-        let bins_to_render = radial_run.gate_values.len().min(num_bins);
-        for (gate_idx, &gate_value) in radial_run.gate_values[..bins_to_render].iter().enumerate() {
-            if gate_value <= 1 {
-                continue;
-            }
+                let bins_to_render = radial_run.gate_values.len().min(num_bins);
+                for (gate_idx, &gate_value) in
+                    radial_run.gate_values[..bins_to_render].iter().enumerate()
+                {
+                    if gate_value <= 1 {
+                        continue;
+                    }
 
-            let physical_value = l3_physical_value(gate_value, product, scale, offset, lut);
-            if physical_value.is_nan() || physical_value >= 999.0 {
-                continue;
-            }
+                    let physical_value =
+                        l3_physical_value(gate_value, product, scale, offset, lut);
+                    if physical_value.is_nan() || physical_value >= 999.0 {
+                        continue;
+                    }
 
-            let range_km = first_gate_range + gate_idx as f64 * gate_interval;
-            if range_km > types::MAX_RANGE_KM {
-                break;
-            }
+                    let range_km = first_gate_range + gate_idx as f64 * gate_interval;
+                    if range_km > types::MAX_RANGE_KM {
+                        break;
+                    }
 
-            let color = get_color_for_value(product, physical_value);
-            proj.render_gate(&bufs, &ctx, range_km, gate_interval, physical_value, color);
-        }
-    });
-
-    let (image, max_range, value_data) = bufs.into_output(actual_max_range);
-    log::info!(
-        "Level III rendering complete: actual_max_range={:.1}km, using max_range={:.1}km",
-        actual_max_range,
-        max_range
+                    let color = get_color_for_value(product, physical_value);
+                    proj.render_gate(bufs, &ctx, range_km, gate_interval, physical_value, color);
+                }
+            });
+        },
     );
-    Some((image, max_range, value_data))
+    Some(output)
 }
 
 /// Render a Level III message to an image, extracting render parameters from the
