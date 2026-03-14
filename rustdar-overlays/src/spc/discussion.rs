@@ -199,23 +199,22 @@ fn extract_md_number(title: &str) -> Option<u32> {
 /// items with `<title>`, `<link>`, and `<description>` containing the full text
 /// including `LAT...LON` polygon coordinates.
 pub fn parse_md_rss(xml: &str) -> Result<Vec<SpcDiscussion>, String> {
-    // Simple XML parsing without a full XML library.
-    // The RSS format is straightforward: <item> elements with child <title>,
-    // <link>, and <description> elements.
+    let doc = roxmltree::Document::parse(xml)
+        .map_err(|e| format!("RSS parse error: {e}"))?;
     let mut discussions = Vec::new();
 
-    let mut remaining = xml;
-    while let Some(item_start) = remaining.find("<item>") {
-        let after_item = &remaining[item_start + 6..];
-        let Some(item_end) = after_item.find("</item>") else {
-            break;
+    for item in doc.descendants().filter(|n| n.has_tag_name("item")) {
+        let child_text = |tag: &str| -> String {
+            item.children()
+                .find(|n| n.has_tag_name(tag))
+                .and_then(|n| n.text())
+                .unwrap_or_default()
+                .trim()
+                .to_string()
         };
-        let item_body = &after_item[..item_end];
-        remaining = &after_item[item_end + 7..];
-
-        let title = extract_xml_text(item_body, "title").unwrap_or_default();
-        let link = extract_xml_text(item_body, "link").unwrap_or_default();
-        let description = extract_xml_text(item_body, "description").unwrap_or_default();
+        let title = child_text("title");
+        let link = child_text("link");
+        let description = child_text("description");
 
         // The description is often HTML-encoded; decode basic entities
         let text = strip_html_tags(&decode_html_entities(&description));
@@ -243,22 +242,6 @@ pub fn parse_md_rss(xml: &str) -> Result<Vec<SpcDiscussion>, String> {
     }
 
     Ok(discussions)
-}
-
-/// Extract text content from a simple XML element like `<tag>content</tag>`.
-fn extract_xml_text<'a>(xml: &'a str, tag: &str) -> Option<String> {
-    let open = format!("<{}", tag);
-    let close = format!("</{}>", tag);
-
-    let start = xml.find(&open)?;
-    let after_open = &xml[start + open.len()..];
-
-    // Skip past any attributes and the closing >
-    let content_start = after_open.find('>')? + 1;
-    let content = &after_open[content_start..];
-
-    let end = content.find(&close)?;
-    Some(content[..end].trim().to_string())
 }
 
 /// Decode common HTML entities found in RSS CDATA/description fields.
