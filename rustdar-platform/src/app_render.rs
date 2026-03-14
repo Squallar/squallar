@@ -457,6 +457,11 @@ impl super::App {
             };
             frame.render_in_flight = false;
 
+            // Empty image_data means the render failed (no matching sweep) — just clear the flag
+            if rr.image_data.is_empty() {
+                continue;
+            }
+
             self.texture_counter += 1;
             let color_image =
                 egui::ColorImage::from_rgba_unmultiplied([1800, 1800], &rr.image_data);
@@ -564,8 +569,12 @@ impl super::App {
                     continue;
                 }
                 let Some(cache) = pane_cache else { continue };
-                if cache.contains_key(&frame.timestamp) {
-                    to_render.push((pane_idx, idx, frame.timestamp, product, elevation, site_lat, site_lon));
+                if let Some(scan) = cache.get(&frame.timestamp) {
+                    // Snap elevation to closest available in this particular scan
+                    let Some(snapped) = rustdar_radar::render::find_closest_elevation(scan, product, elevation) else {
+                        continue;
+                    };
+                    to_render.push((pane_idx, idx, frame.timestamp, product, snapped, site_lat, site_lon));
                 }
             }
         }

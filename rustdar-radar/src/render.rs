@@ -155,6 +155,31 @@ impl RenderBuffers {
 
 // ── Sweep / azimuth helpers ──────────────────────────────────────────────────
 
+/// Find the closest available elevation angle in a scan for the given product.
+///
+/// Iterates all sweeps, rounds each elevation to 1 decimal place, keeps those
+/// that carry the requested product's moment data, and returns the one closest
+/// to `target_elevation`. Used by the loop renderer to snap the user's
+/// selected elevation to what's actually available in each historical scan.
+pub fn find_closest_elevation(
+    scan: &Scan,
+    product: types::RadarProduct,
+    target_elevation: f32,
+) -> Option<f32> {
+    scan.sweeps()
+        .iter()
+        .filter_map(|sweep| {
+            let r = sweep.radials().first()?;
+            let rounded = (r.elevation_angle_degrees() * 10.0).round() / 10.0;
+            product.get_moment(r).is_some().then_some(rounded)
+        })
+        .min_by(|a, b| {
+            ((*a - target_elevation).abs())
+                .partial_cmp(&((*b - target_elevation).abs()))
+                .unwrap()
+        })
+}
+
 /// Find the sweep whose first radial matches `elevation_angle` and carries the
 /// requested product's moment data.
 fn find_sweep<'a>(

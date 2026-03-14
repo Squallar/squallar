@@ -626,16 +626,27 @@ impl super::App {
         let sender = self.channels.loop_render_sender.clone();
         let window = self.window.clone();
         std::thread::spawn(move || {
-            if let Some((image, range, values)) =
-                rustdar_radar::render::render_radar_to_image(&scan_data, elevation, product, lat, lon)
+            match rustdar_radar::render::render_radar_to_image(&scan_data, elevation, product, lat, lon)
             {
-                let _ = sender.send(crate::channels::LoopRenderResponse {
-                    pane_idx,
-                    timestamp,
-                    image_data: image,
-                    max_range_km: range,
-                    value_data: values,
-                });
+                Some((image, range, values)) => {
+                    let _ = sender.send(crate::channels::LoopRenderResponse {
+                        pane_idx,
+                        timestamp,
+                        image_data: image,
+                        max_range_km: range,
+                        value_data: values,
+                    });
+                }
+                None => {
+                    // Send an empty response so render_in_flight gets cleared
+                    let _ = sender.send(crate::channels::LoopRenderResponse {
+                        pane_idx,
+                        timestamp,
+                        image_data: Vec::new(),
+                        max_range_km: 0.0,
+                        value_data: Vec::new(),
+                    });
+                }
             }
             super::notify_redraw(&window);
         });
