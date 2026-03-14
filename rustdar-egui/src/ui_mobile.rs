@@ -1,6 +1,8 @@
 #![cfg(target_os = "android")]
 
 use crate::actions::GuiAction;
+use crate::ui::{RadarImageData, PaneState};
+use rustdar_radar::types::ImageBounds;
 
 /// Maximum time (seconds) between first tap release and second press
 /// for it to count as a double-tap.
@@ -14,6 +16,12 @@ const TAP_DURATION_MAX_S: f64 = 0.3;
 const TAP_DISTANCE_MAX_PX: f32 = 20.0;
 /// Pixels of vertical drag per 1.0 zoom level change.
 const ZOOM_DRAG_SENSITIVITY: f32 = 150.0;
+/// Minimum hold duration (seconds) for a long press to be recognized.
+const LONG_PRESS_DURATION_S: f64 = 0.5;
+/// Maximum movement (pixels) during a long press before cancelling.
+const LONG_PRESS_MAX_MOVE_PX: f32 = 20.0;
+/// Vertical offset (pixels) from the touch point to the tooltip center.
+pub(crate) const TOOLTIP_OFFSET_Y: f32 = 60.0;
 
 /// Detects a "double-tap and drag" gesture commonly used on touch devices
 /// for one-handed zooming. The gesture flow is:
@@ -135,6 +143,120 @@ impl DoubleTapDragDetector {
     /// Whether a zoom-drag gesture is currently active.
     pub(super) fn is_zooming(&self) -> bool {
         self.zooming
+    }
+}
+
+
+/// Draw a floating tooltip above the finger during a long-press on mobile,
+/// showing the radar value at the touched position.
+#[cfg(target_os = "android")]
+pub fn draw_long_press_tooltip(
+    ui: &egui::Ui,
+    projector: &walkers::Projector,
+    img: &RadarImageData,
+    touch_pos: egui::Pos2,
+    pane: &PaneState,
+) {
+    use rustdar_radar::types::IMAGE_SIZE;
+
+    let bounds = pane
+        .cached_image_bounds
+        .unwrap_or_else(|| ImageBounds::from_radar_site(img.lat, img.lon));
+
+    let nw = projector
+        .project(walkers::lat_lon(bounds.max_lat, bounds.min_lon))
+        .to_pos2();
+    let se = projector
+        .project(walkers::lat_lon(bounds.min_lat, bounds.max_lon))
+        .to_pos2();
+    let image_rect = egui::Rect::from_two_pos(nw, se);
+
+    // Compute pixel coordinates inside the radar image
+    let frac_x = (touch_pos.x - image_rect.left()) / image_rect.width();
+    let frac_y = (touch_pos.y - image_rect.top()) / image_rect.height();
+    let px = (frac_x * IMAGE_SIZE as f32) as i32;
+    let py = (frac_y * IMAGE_SIZE as f32) as i32;
+
+    let mut text = String::new();
+    if px >= 0 && px < IMAGE_SIZE as i32 && py >= 0 && py < IMAGE_SIZE as i32 {
+        let pixel_idx = py as usize * IMAGE_SIZE + px as usize;
+        if pixel_idx < img.value_data.len() {
+            let value = img.value_data[pixel_idx];
+            if !value.is_nan() {
+                text = pane.selected_product.format_value(value);
+            }
+        }
+    }
+
+    if text.is_empty() {
+        text = "No data".into();
+    }
+
+    // Position tooltip above the finger
+    let tooltip_pos = egui::pos2(touch_pos.x, touch_pos.y - super::mobile::TOOLTIP_OFFSET_Y);
+
+    let painter = ui.painter();
+    let font = egui::FontId::proportional(14.0);
+    let galley = painter.layout_no_wrap(text, font, egui::Color32::WHITE);
+    let text_size = galley.size();
+    let padding = egui::vec2(8.0, 4.0);
+    let bg_rect = egui::Rect::from_center_size(
+        tooltip_pos,
+        text_size + padding * 2.0,
+    );
+
+    painter.rect_filled(bg_rect, 4.0, egui::Color32::from_black_alpha(200));
+    painter.galley(bg_rect.min + padding, galley, egui::Color32::WHITE);
+}
+
+
+/// Detects a long-press gesture on touch devices.
+///
+/// When the user holds a finger down for [`LONG_PRESS_DURATION_S`] without
+/// moving more than [`LONG_PRESS_MAX_MOVE_PX`], this reports the held position.
+#[derive(Clone, Default)]
+pub(crate) struct LongPressDetector {
+    /// Start time of the current press, or `None` if no finger is down.
+    press_start: Option<f64>,
+    /// Position where the current press started.
+    press_pos: egui::Pos2,
+}
+
+impl LongPressDetector {
+    /// Process this frame's input and return the held position if a long press is active.
+    pub(super) fn update(&mut self, ctx: &egui::Context) -> Option<egui::Pos2> {
+        let (down, pos, time) = ctx.input(|i| {
+            (
+                i.pointer.primary_down(),
+                i.pointer.interact_pos(),
+                i.time,
+            )
+        });
+        let pos = pos.unwrap_or(egui::Pos2::ZERO);
+
+        if !down {
+            self.press_start = None;
+            return None;
+        }
+
+        if self.press_start.is_none() {
+            self.press_start = Some(time);
+            self.press_pos = pos;
+            return None;
+        }
+
+        // Cancel if finger moved too far
+        if (pos - self.press_pos).length() > LONG_PRESS_MAX_MOVE_PX {
+            self.press_start = None;
+            return None;
+        }
+
+        let elapsed = time - self.press_start.unwrap();
+        if elapsed >= LONG_PRESS_DURATION_S {
+            Some(self.press_pos)
+        } else {
+            None
+        }
     }
 }
 

@@ -112,6 +112,19 @@ impl super::Gui {
                     #[cfg(not(target_os = "android"))]
                     let is_zoom_dragging = false;
 
+                    // On Android, detect long-press for radar value tooltip
+                    #[cfg(target_os = "android")]
+                    let long_press_pos = if is_active && !is_zoom_dragging {
+                        self.mobile.long_press_detector.update(ctx)
+                    } else {
+                        None
+                    };
+
+                    #[cfg(target_os = "android")]
+                    let suppress_pan = is_zoom_dragging || long_press_pos.is_some();
+                    #[cfg(not(target_os = "android"))]
+                    let suppress_pan = is_zoom_dragging;
+
                     // Create a child UI constrained to this pane's rect
                     let mut child_ui = ui.new_child(
                         egui::UiBuilder::new()
@@ -125,7 +138,7 @@ impl super::Gui {
                         .with_layer(tiles, 1.0)
                         .zoom_with_ctrl(false)
                         .panning(false)
-                        .drag_pan_buttons(if is_zoom_dragging {
+                        .drag_pan_buttons(if suppress_pan {
                             egui::DragPanButtons::empty()
                         } else {
                             egui::DragPanButtons::PRIMARY
@@ -148,6 +161,8 @@ impl super::Gui {
                                 loading_site: &mut self.radar.loading_site,
                                 excluded_rects: excluded_rects.clone(),
                                 is_zoom_dragging,
+                                #[cfg(target_os = "android")]
+                                long_press_pos,
                             };
 
                             pane_render::render_pane_map_content(ui, projector, zoom, &mut render_ctx);

@@ -5,6 +5,7 @@ use crate::overlay_cache::{
 use rustdar_overlays::render::layers::LayerKind;
 use rustdar_overlays::render::overlay_state::{OverlayData, SelectedOverlay};
 use crate::pane::{PaneState, RadarImageData};
+
 use rustdar_radar::sites::RADARS;
 use rustdar_radar::types::{ImageBounds, MAX_RANGE_KM};
 use walkers::HttpTiles;
@@ -27,6 +28,9 @@ pub(super) struct PaneRenderCtx<'a> {
     pub loading_site: &'a mut Option<String>,
     pub excluded_rects: Vec<egui::Rect>,
     pub is_zoom_dragging: bool,
+    /// On Android, the screen position of an active long-press (for radar value tooltip).
+    #[cfg(target_os = "android")]
+    pub long_press_pos: Option<egui::Pos2>,
 }
 
 /// Render the map content for a single pane (SPC/NWS overlays, radar image,
@@ -186,6 +190,16 @@ pub(super) fn render_pane_map_content(
     // Draw user location indicator (blue dot)
     if let Some((user_lat, user_lon)) = ctx.user_location {
         render_user_location(ui, projector, user_lat, user_lon);
+    }
+
+    // Mobile long-press tooltip: show radar value above the finger
+    #[cfg(target_os = "android")]
+    if let Some(touch_pos) = ctx.long_press_pos {
+        if ctx.pane_rect.contains(touch_pos) {
+            if let Some(img) = ctx.radar_image {
+                crate::ui::mobile::draw_long_press_tooltip(ui, projector, img, touch_pos, ctx.pane);
+            }
+        }
     }
 }
 

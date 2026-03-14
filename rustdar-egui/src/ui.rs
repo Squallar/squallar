@@ -23,13 +23,14 @@ mod desktop;
 mod map;
 
 #[cfg(target_os = "android")]
-use mobile::DoubleTapDragDetector;
+use mobile::{DoubleTapDragDetector, LongPressDetector};
 
 /// Android-only UI state: slide-out menu visibility and gesture detection.
 #[cfg(target_os = "android")]
 pub(super) struct MobileState {
     pub show_menu: bool,
     pub double_tap_detector: DoubleTapDragDetector,
+    pub long_press_detector: LongPressDetector,
 }
 
 #[cfg(target_os = "android")]
@@ -38,6 +39,7 @@ impl Default for MobileState {
         Self {
             show_menu: false,
             double_tap_detector: DoubleTapDragDetector::default(),
+            long_press_detector: LongPressDetector::default(),
         }
     }
 }
