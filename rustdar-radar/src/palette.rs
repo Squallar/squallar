@@ -2,456 +2,313 @@ use crate::types::RadarProduct;
 
 const TRANSPARENCY: u8 = 180;
 
-/// Get RGBA color for a radar value based on product type
+/// Ascending-threshold color scale. For value `v`, the color of the last
+/// entry whose threshold is <= `v` is returned.
+type ColorScale = &'static [(f32, (u8, u8, u8))];
+
+/// Look up the color for `value` in an ascending-threshold scale.
+fn scale_color(scale: ColorScale, value: f32) -> (u8, u8, u8) {
+    let mut color = scale[0].1;
+    for &(threshold, c) in scale {
+        if value >= threshold {
+            color = c;
+        } else {
+            break;
+        }
+    }
+    color
+}
+
+/// Get RGBA color for a radar value based on product type.
 pub fn get_color_for_value(product: RadarProduct, value: f32) -> (u8, u8, u8, u8) {
     match product {
-        RadarProduct::Reflectivity => reflectivity_color(value),
-        RadarProduct::Velocity => velocity_color(value),
-        RadarProduct::SpectrumWidth => spectrum_width_color(value),
-        RadarProduct::DifferentialReflectivity => zdr_color(value),
-        RadarProduct::CorrelationCoefficient => rho_color(value),
-        RadarProduct::DifferentialPhase => phi_color(value),
-        RadarProduct::StormRelativeVelocity => velocity_color(value),
-        RadarProduct::SpecificDifferentialPhase => kdp_color(value),
-        RadarProduct::EchoTops => echo_tops_color(value),
-        RadarProduct::VerticallyIntegratedLiquid => vil_color(value),
-        RadarProduct::HydrometeorClassification => hhc_color(value),
-        RadarProduct::PrecipitationRate => precip_rate_color(value),
-        RadarProduct::NormalizedRotation => nrot_color(value),
+        RadarProduct::Reflectivity => {
+            if value.is_nan() || value.is_infinite() || value < 0.0 {
+                return (0, 0, 0, 0);
+            }
+            let (r, g, b) = scale_color(REFLECTIVITY, value);
+            (r, g, b, TRANSPARENCY)
+        }
+        RadarProduct::Velocity | RadarProduct::StormRelativeVelocity => velocity_lookup(value),
+        RadarProduct::SpectrumWidth => {
+            if value < 0.0 {
+                return (0, 0, 0, 0);
+            }
+            let (r, g, b) = scale_color(SPECTRUM_WIDTH, value);
+            (r, g, b, TRANSPARENCY)
+        }
+        RadarProduct::DifferentialReflectivity => {
+            let (r, g, b) = scale_color(ZDR, value);
+            (r, g, b, TRANSPARENCY)
+        }
+        RadarProduct::CorrelationCoefficient => {
+            if value < 0.0 {
+                return (0, 0, 0, 0);
+            }
+            let (r, g, b) = scale_color(RHO, value);
+            (r, g, b, TRANSPARENCY)
+        }
+        RadarProduct::DifferentialPhase => {
+            let (r, g, b) = scale_color(PHI, value.rem_euclid(360.0));
+            (r, g, b, TRANSPARENCY)
+        }
+        RadarProduct::SpecificDifferentialPhase => {
+            let (r, g, b) = scale_color(KDP, value);
+            (r, g, b, TRANSPARENCY)
+        }
+        RadarProduct::EchoTops => {
+            if value < 5.0 {
+                return (0, 0, 0, 0);
+            }
+            let (r, g, b) = scale_color(ECHO_TOPS, value);
+            (r, g, b, TRANSPARENCY)
+        }
+        RadarProduct::VerticallyIntegratedLiquid => {
+            if value < 1.0 {
+                return (0, 0, 0, 0);
+            }
+            let (r, g, b) = scale_color(VIL, value);
+            (r, g, b, TRANSPARENCY)
+        }
+        RadarProduct::HydrometeorClassification => {
+            if value < 5.0 {
+                return (0, 0, 0, 0);
+            }
+            let (r, g, b) = scale_color(HHC, value);
+            (r, g, b, TRANSPARENCY)
+        }
+        RadarProduct::PrecipitationRate => {
+            if value < 0.01 {
+                return (0, 0, 0, 0);
+            }
+            let (r, g, b) = scale_color(PRECIP_RATE, value);
+            (r, g, b, TRANSPARENCY)
+        }
+        RadarProduct::NormalizedRotation => nrot_lookup(value),
     }
 }
 
-/// Reflectivity color scale (dBZ)
-/// Range: 0-95 dBZ with proper meteorological color scale
-fn reflectivity_color(dbz: f32) -> (u8, u8, u8, u8) {
-    // Handle invalid values
-    if dbz.is_nan() || dbz.is_infinite() {
-        return (0, 0, 0, 0); // Transparent
-    }
+/// m/s to mph conversion factor.
+const MS_TO_MPH: f32 = 2.23694;
 
-    // Values below 0 dBZ should be transparent (no precipitation)
-    if dbz < 0.0 {
-        return (0, 0, 0, 0); // Transparent
+/// Velocity color with m/s->mph conversion and bidirectional handling.
+fn velocity_lookup(velocity_ms: f32) -> (u8, u8, u8, u8) {
+    let mph = velocity_ms * MS_TO_MPH;
+    if !(-142.0..=141.0).contains(&mph) {
+        return (128, 0, 128, TRANSPARENCY); // Range folded
     }
-
-    let (r, g, b) = if dbz < 5.0 {
-        // Grey (very light precipitation)
-        let intensity = (dbz / 5.0 * 128.0) as u8;
-        (intensity, intensity, intensity)
-    } else if dbz < 10.0 {
-        // Transition from grey to light blue
-        let t = (dbz - 5.0) / 5.0; // 0 to 1
-        let grey = (128.0 * (1.0 - t)) as u8;
-        let blue = (200.0 * t) as u8;
-        (grey, grey + blue / 2, grey + blue)
-    } else if dbz < 15.0 {
-        // Light blue
-        (100, 150, 255)
-    } else if dbz < 20.0 {
-        // Blue
-        (0, 100, 255)
-    } else if dbz < 25.0 {
-        // Dark blue
-        (0, 50, 200)
-    } else if dbz < 30.0 {
-        // Green
-        (0, 255, 0)
-    } else if dbz < 35.0 {
-        // Dark green
-        (0, 200, 0)
-    } else if dbz < 40.0 {
-        // Yellow
-        (255, 255, 0)
-    } else if dbz < 45.0 {
-        // Orange
-        (255, 165, 0)
-    } else if dbz < 50.0 {
-        // Red
-        (255, 0, 0)
-    } else if dbz < 55.0 {
-        // Dark red
-        (200, 0, 0)
-    } else if dbz < 60.0 {
-        // Pink
-        (255, 192, 203)
-    } else if dbz < 65.0 {
-        // Hot pink
-        (255, 105, 180)
-    } else if dbz < 70.0 {
-        // Purple
-        (128, 0, 128)
-    } else if dbz < 75.0 {
-        // Dark purple
-        (75, 0, 130)
-    } else if dbz < 80.0 {
-        // Sky blue (hail signature)
-        (135, 206, 235)
-    } else if dbz < 85.0 {
-        // Light blue
-        (173, 216, 230)
-    } else if dbz < 90.0 {
-        // Orange (extreme)
-        (255, 140, 0)
-    } else if dbz < 95.0 {
-        // Dark orange
-        (255, 69, 0)
+    if (-5.0..=5.0).contains(&mph) {
+        return (128, 128, 128, TRANSPARENCY); // Near zero
+    }
+    let (r, g, b) = if mph > 0.0 {
+        scale_color(VELOCITY_OUTBOUND, mph)
     } else {
-        // White (extreme values above 95 dBZ)
-        (255, 255, 255)
+        scale_color(VELOCITY_INBOUND, mph.abs())
     };
-
     (r, g, b, TRANSPARENCY)
 }
 
-/// Velocity color scale (m/s)
-/// Custom velocity color scheme with clear visual gradients
-/// Negative = inbound (toward radar), Positive = outbound (away from radar)
-/// Note: Input is in m/s, thresholds are converted from mph
-fn velocity_color(velocity_ms: f32) -> (u8, u8, u8, u8) {
-    // Convert m/s to mph for threshold comparisons
-    let velocity_mph = velocity_ms * 2.23694;
-
-    let (r, g, b) = if !(-142.0..=141.0).contains(&velocity_mph) {
-        // Range folded / extreme values - stark purple
-        (128, 0, 128)
-    } else if (-5.0..=5.0).contains(&velocity_mph) {
-        // Near zero / calm - grey
-        (128, 128, 128)
-    }
-    // Positive (outbound - moving away from radar)
-    else if velocity_mph > 125.0 {
-        (139, 69, 19) // Brown
-    } else if velocity_mph > 100.0 {
-        (255, 140, 0) // Orange
-    } else if velocity_mph > 80.0 {
-        (255, 218, 185) // Peach
-    } else if velocity_mph > 55.0 {
-        (255, 192, 203) // Pink
-    } else if velocity_mph > 35.0 {
-        (255, 0, 0) // Bright red
-    } else if velocity_mph > 20.0 {
-        (139, 0, 0) // Dark red
-    } else if velocity_mph > 5.0 {
-        // Gradient from grey to dark red
-        let t = (velocity_mph - 5.0) / 15.0; // 0 to 1
-        let r = (128.0 + (139.0 - 128.0) * t) as u8;
-        let g = (128.0 * (1.0 - t)) as u8;
-        let b = (128.0 * (1.0 - t)) as u8;
-        (r, g, b)
-    }
-    // Negative (inbound - moving toward radar)
-    else if velocity_mph < -125.0 {
-        (255, 0, 255) // Fuchsia
-    } else if velocity_mph < -100.0 {
-        (0, 0, 255) // Blue
-    } else if velocity_mph < -80.0 {
-        (135, 206, 235) // Sky blue
-    } else if velocity_mph < -55.0 {
-        (173, 216, 230) // Light blue
-    } else if velocity_mph < -35.0 {
-        (0, 255, 0) // Bright green
-    } else if velocity_mph < -20.0 {
-        (0, 100, 0) // Dark green
-    } else {
-        // Gradient from dark green to grey (-20 to -5 mph)
-        let t = (velocity_mph + 20.0) / 15.0; // 0 to 1
-        let r = (128.0 * t) as u8;
-        let g = (100.0 + (128.0 - 100.0) * t) as u8;
-        let b = (128.0 * t) as u8;
-        (r, g, b)
-    };
-
-    (r, g, b, TRANSPARENCY)
-}
-
-/// Spectrum width color scale (m/s)
-fn spectrum_width_color(sw: f32) -> (u8, u8, u8, u8) {
-    if sw < 0.0 {
+/// NROT color with bidirectional cyclonic/anticyclonic handling.
+fn nrot_lookup(nrot: f32) -> (u8, u8, u8, u8) {
+    if nrot.is_nan() || nrot.is_infinite() || nrot.abs() < 0.3 {
         return (0, 0, 0, 0);
     }
-
-    let (r, g, b) = if sw < 2.0 {
-        (0, 100, 0) // Dark green (low turbulence)
-    } else if sw < 4.0 {
-        (0, 200, 0) // Green
-    } else if sw < 6.0 {
-        (255, 255, 0) // Yellow
-    } else if sw < 8.0 {
-        (255, 150, 0) // Orange
-    } else if sw < 10.0 {
-        (255, 0, 0) // Red
+    let (r, g, b) = if nrot > 0.0 {
+        scale_color(NROT_CYCLONIC, nrot)
     } else {
-        (150, 0, 0) // Dark red (high turbulence)
+        scale_color(NROT_ANTICYCLONIC, nrot.abs())
     };
-
     (r, g, b, TRANSPARENCY)
 }
 
-/// Differential reflectivity color scale (dB)
-fn zdr_color(zdr: f32) -> (u8, u8, u8, u8) {
-    let (r, g, b) = if zdr < -1.0 {
-        (100, 0, 100) // Purple
-    } else if zdr < 0.0 {
-        (0, 100, 255) // Blue
-    } else if zdr < 1.0 {
-        (0, 255, 0) // Green
-    } else if zdr < 2.0 {
-        (255, 255, 0) // Yellow
-    } else if zdr < 3.0 {
-        (255, 150, 0) // Orange
-    } else {
-        (255, 0, 0) // Red
-    };
+// ————————————————————————————————————————————————————————————————————
+// Color scale tables
+// ————————————————————————————————————————————————————————————————————
 
-    (r, g, b, TRANSPARENCY)
-}
+/// Reflectivity (dBZ). Gradient regions 0-10 dBZ approximated with discrete steps.
+static REFLECTIVITY: ColorScale = &[
+    (0.0,  (0, 0, 0)),         // Grey ramp start
+    (2.5,  (64, 64, 64)),      // Grey ramp midpoint
+    (5.0,  (128, 128, 128)),   // Grey ramp end / transition start
+    (7.5,  (64, 114, 164)),    // Grey -> blue midpoint
+    (10.0, (100, 150, 255)),   // Light blue
+    (15.0, (0, 100, 255)),     // Blue
+    (20.0, (0, 50, 200)),      // Dark blue
+    (25.0, (0, 255, 0)),       // Green
+    (30.0, (0, 200, 0)),       // Dark green
+    (35.0, (255, 255, 0)),     // Yellow
+    (40.0, (255, 165, 0)),     // Orange
+    (45.0, (255, 0, 0)),       // Red
+    (50.0, (200, 0, 0)),       // Dark red
+    (55.0, (255, 192, 203)),   // Pink
+    (60.0, (255, 105, 180)),   // Hot pink
+    (65.0, (128, 0, 128)),     // Purple
+    (70.0, (75, 0, 130)),      // Dark purple
+    (75.0, (135, 206, 235)),   // Sky blue (hail)
+    (80.0, (173, 216, 230)),   // Light blue
+    (85.0, (255, 140, 0)),     // Orange (extreme)
+    (90.0, (255, 69, 0)),      // Dark orange
+    (95.0, (255, 255, 255)),   // White (extreme > 95 dBZ)
+];
 
-/// Correlation coefficient color scale (0-1)
-fn rho_color(rho: f32) -> (u8, u8, u8, u8) {
-    if rho < 0.0 {
-        return (0, 0, 0, 0);
-    }
+/// Velocity outbound / positive (mph thresholds).
+/// Gradient 5-20 mph approximated with midpoint entry.
+static VELOCITY_OUTBOUND: ColorScale = &[
+    (5.0,   (128, 128, 128)), // Grey (just above near-zero band)
+    (12.5,  (133, 64, 64)),   // Grey -> dark red midpoint
+    (20.0,  (139, 0, 0)),     // Dark red
+    (35.0,  (255, 0, 0)),     // Bright red
+    (55.0,  (255, 192, 203)), // Pink
+    (80.0,  (255, 218, 185)), // Peach
+    (100.0, (255, 140, 0)),   // Orange
+    (125.0, (139, 69, 19)),   // Brown
+];
 
-    let (r, g, b) = if rho < 0.7 {
-        (255, 0, 0) // Red (low correlation - non-meteorological)
-    } else if rho < 0.8 {
-        (255, 150, 0) // Orange
-    } else if rho < 0.9 {
-        (255, 255, 0) // Yellow
-    } else if rho < 0.95 {
-        (0, 255, 0) // Green
-    } else {
-        (0, 150, 0) // Dark green (high correlation - pure rain)
-    };
+/// Velocity inbound / negative (thresholds are positive, applied to abs(mph)).
+/// Gradient 5-20 mph approximated with midpoint entry.
+static VELOCITY_INBOUND: ColorScale = &[
+    (5.0,   (128, 128, 128)), // Grey (just above near-zero band)
+    (12.5,  (64, 114, 64)),   // Grey -> dark green midpoint
+    (20.0,  (0, 100, 0)),     // Dark green
+    (35.0,  (0, 255, 0)),     // Bright green
+    (55.0,  (173, 216, 230)), // Light blue
+    (80.0,  (135, 206, 235)), // Sky blue
+    (100.0, (0, 0, 255)),     // Blue
+    (125.0, (255, 0, 255)),   // Fuchsia
+];
 
-    (r, g, b, TRANSPARENCY)
-}
+/// Spectrum width (m/s).
+static SPECTRUM_WIDTH: ColorScale = &[
+    (0.0,  (0, 100, 0)),   // Dark green (low turbulence)
+    (2.0,  (0, 200, 0)),   // Green
+    (4.0,  (255, 255, 0)), // Yellow
+    (6.0,  (255, 150, 0)), // Orange
+    (8.0,  (255, 0, 0)),   // Red
+    (10.0, (150, 0, 0)),   // Dark red (high turbulence)
+];
 
-/// Differential phase color scale (degrees)
-fn phi_color(phi: f32) -> (u8, u8, u8, u8) {
-    let normalized = phi.rem_euclid(360.0);
+/// Differential reflectivity ZDR (dB).
+static ZDR: ColorScale = &[
+    (f32::NEG_INFINITY, (100, 0, 100)), // Purple (< -1)
+    (-1.0, (0, 100, 255)),              // Blue
+    (0.0,  (0, 255, 0)),                // Green
+    (1.0,  (255, 255, 0)),              // Yellow
+    (2.0,  (255, 150, 0)),              // Orange
+    (3.0,  (255, 0, 0)),                // Red
+];
 
-    let (r, g, b) = if normalized < 60.0 {
-        (255, 0, 0) // Red
-    } else if normalized < 120.0 {
-        (255, 255, 0) // Yellow
-    } else if normalized < 180.0 {
-        (0, 255, 0) // Green
-    } else if normalized < 240.0 {
-        (0, 255, 255) // Cyan
-    } else if normalized < 300.0 {
-        (0, 0, 255) // Blue
-    } else {
-        (255, 0, 255) // Magenta
-    };
+/// Correlation coefficient (0-1).
+static RHO: ColorScale = &[
+    (0.0,  (255, 0, 0)),   // Red (non-meteorological)
+    (0.7,  (255, 150, 0)), // Orange
+    (0.8,  (255, 255, 0)), // Yellow
+    (0.9,  (0, 255, 0)),   // Green
+    (0.95, (0, 150, 0)),   // Dark green (pure rain)
+];
 
-    (r, g, b, TRANSPARENCY)
-}
+/// Differential phase (degrees, pre-wrapped to 0-360).
+static PHI: ColorScale = &[
+    (0.0,   (255, 0, 0)),   // Red
+    (60.0,  (255, 255, 0)), // Yellow
+    (120.0, (0, 255, 0)),   // Green
+    (180.0, (0, 255, 255)), // Cyan
+    (240.0, (0, 0, 255)),   // Blue
+    (300.0, (255, 0, 255)), // Magenta
+];
 
-/// Specific differential phase (KDP) color scale (°/km)
-/// Range: −2 to 10+ °/km
-fn kdp_color(kdp: f32) -> (u8, u8, u8, u8) {
-    let (r, g, b) = if kdp < -1.0 {
-        (100, 0, 150) // Purple (negative — unusual)
-    } else if kdp < 0.0 {
-        (0, 80, 255) // Blue
-    } else if kdp < 0.5 {
-        (100, 200, 100) // Light green
-    } else if kdp < 1.0 {
-        (0, 255, 0) // Green
-    } else if kdp < 2.0 {
-        (255, 255, 0) // Yellow
-    } else if kdp < 3.5 {
-        (255, 165, 0) // Orange
-    } else if kdp < 5.0 {
-        (255, 0, 0) // Red
-    } else if kdp < 7.0 {
-        (180, 0, 0) // Dark red
-    } else {
-        (200, 0, 200) // Magenta (extreme)
-    };
+/// Specific differential phase KDP (deg/km).
+static KDP: ColorScale = &[
+    (f32::NEG_INFINITY, (100, 0, 150)), // Purple (< -1, unusual)
+    (-1.0, (0, 80, 255)),               // Blue
+    (0.0,  (100, 200, 100)),            // Light green
+    (0.5,  (0, 255, 0)),                // Green
+    (1.0,  (255, 255, 0)),              // Yellow
+    (2.0,  (255, 165, 0)),              // Orange
+    (3.5,  (255, 0, 0)),                // Red
+    (5.0,  (180, 0, 0)),                // Dark red
+    (7.0,  (200, 0, 200)),              // Magenta (extreme)
+];
 
-    (r, g, b, TRANSPARENCY)
-}
+/// Enhanced Echo Tops (thousands of feet).
+static ECHO_TOPS: ColorScale = &[
+    (5.0,  (100, 100, 100)), // Grey (dispatcher handles < 5 as transparent)
+    (10.0, (0, 100, 255)),   // Blue
+    (15.0, (0, 200, 255)),   // Cyan
+    (20.0, (0, 255, 0)),     // Green
+    (25.0, (0, 200, 0)),     // Dark green
+    (30.0, (255, 255, 0)),   // Yellow
+    (35.0, (255, 200, 0)),   // Gold
+    (40.0, (255, 150, 0)),   // Orange
+    (45.0, (255, 0, 0)),     // Red
+    (50.0, (200, 0, 0)),     // Dark red
+    (55.0, (255, 0, 255)),   // Magenta
+    (60.0, (200, 0, 200)),   // Purple (extreme)
+];
 
-/// Enhanced Echo Tops color scale (thousands of feet)
-/// Range: 0–70+ kft
-fn echo_tops_color(kft: f32) -> (u8, u8, u8, u8) {
-    if kft < 5.0 {
-        return (0, 0, 0, 0); // Transparent (very low)
-    }
+/// Vertically Integrated Liquid (kg/m2).
+static VIL: ColorScale = &[
+    (1.0,  (100, 100, 100)), // Grey (dispatcher handles < 1 as transparent)
+    (5.0,  (0, 150, 255)),   // Light blue
+    (10.0, (0, 255, 0)),     // Green
+    (15.0, (0, 200, 0)),     // Dark green
+    (20.0, (255, 255, 0)),   // Yellow
+    (25.0, (255, 200, 0)),   // Gold
+    (30.0, (255, 150, 0)),   // Orange
+    (35.0, (255, 0, 0)),     // Red
+    (40.0, (200, 0, 0)),     // Dark red
+    (50.0, (255, 0, 255)),   // Magenta
+    (60.0, (200, 0, 200)),   // Purple (extreme)
+];
 
-    let (r, g, b) = if kft < 10.0 {
-        (100, 100, 100) // Grey
-    } else if kft < 15.0 {
-        (0, 100, 255) // Blue
-    } else if kft < 20.0 {
-        (0, 200, 255) // Cyan
-    } else if kft < 25.0 {
-        (0, 255, 0) // Green
-    } else if kft < 30.0 {
-        (0, 200, 0) // Dark green
-    } else if kft < 35.0 {
-        (255, 255, 0) // Yellow
-    } else if kft < 40.0 {
-        (255, 200, 0) // Gold
-    } else if kft < 45.0 {
-        (255, 150, 0) // Orange
-    } else if kft < 50.0 {
-        (255, 0, 0) // Red
-    } else if kft < 55.0 {
-        (200, 0, 0) // Dark red
-    } else if kft < 60.0 {
-        (255, 0, 255) // Magenta
-    } else {
-        (200, 0, 200) // Purple (extreme)
-    };
-
-    (r, g, b, TRANSPARENCY)
-}
-
-/// VIL (Vertically Integrated Liquid) color scale (kg/m²)
-/// Range: 0–80+ kg/m²
-fn vil_color(vil: f32) -> (u8, u8, u8, u8) {
-    if vil < 1.0 {
-        return (0, 0, 0, 0); // Transparent
-    }
-
-    let (r, g, b) = if vil < 5.0 {
-        (100, 100, 100) // Grey
-    } else if vil < 10.0 {
-        (0, 150, 255) // Light blue
-    } else if vil < 15.0 {
-        (0, 255, 0) // Green
-    } else if vil < 20.0 {
-        (0, 200, 0) // Dark green
-    } else if vil < 25.0 {
-        (255, 255, 0) // Yellow
-    } else if vil < 30.0 {
-        (255, 200, 0) // Gold
-    } else if vil < 35.0 {
-        (255, 150, 0) // Orange
-    } else if vil < 40.0 {
-        (255, 0, 0) // Red
-    } else if vil < 50.0 {
-        (200, 0, 0) // Dark red
-    } else if vil < 60.0 {
-        (255, 0, 255) // Magenta
-    } else {
-        (200, 0, 200) // Purple (extreme)
-    };
-
-    (r, g, b, TRANSPARENCY)
-}
-
-/// Hydrometeor Classification color scale (categorical)
-/// Values map to hydrometeor types per ICD table.
+/// Hydrometeor Classification (categorical per ICD table).
 /// 0=ND, 10=BI, 20=AP, 30=IC, 40=DS, 50=WS, 60=RA, 70=HR,
 /// 80=BD, 90=GR, 100=HA, 110=LH, 120=GH, 140=UK, 150=RF
-fn hhc_color(val: f32) -> (u8, u8, u8, u8) {
-    let (r, g, b) = if val < 5.0 {
-        return (0, 0, 0, 0); // ND (No Data) — transparent
-    } else if val < 15.0 {
-        (128, 128, 128) // BI (Biological) — grey
-    } else if val < 25.0 {
-        (128, 0, 128) // AP (Ground clutter) — purple
-    } else if val < 35.0 {
-        (173, 216, 230) // IC (Ice crystals) — light blue
-    } else if val < 45.0 {
-        (0, 100, 255) // DS (Dry snow) — blue
-    } else if val < 55.0 {
-        (0, 200, 255) // WS (Wet snow) — cyan
-    } else if val < 65.0 {
-        (0, 200, 0) // RA (Rain) — green
-    } else if val < 75.0 {
-        (0, 100, 0) // HR (Heavy rain) — dark green
-    } else if val < 85.0 {
-        (255, 255, 0) // BD (Big drops) — yellow
-    } else if val < 95.0 {
-        (255, 150, 0) // GR (Graupel) — orange
-    } else if val < 105.0 {
-        (255, 0, 0) // HA (Hail w/ rain) — red
-    } else if val < 115.0 {
-        (200, 0, 0) // LH (Large hail) — dark red
-    } else if val < 125.0 {
-        (255, 200, 200) // GH (Giant hail) — pink
-    } else if val < 145.0 {
-        (200, 200, 200) // UK (Unknown) — light grey
-    } else {
-        (100, 0, 150) // RF (Range folded) — dark purple
-    };
+static HHC: ColorScale = &[
+    (5.0,   (128, 128, 128)), // BI (Biological)
+    (15.0,  (128, 0, 128)),   // AP (Ground clutter)
+    (25.0,  (173, 216, 230)), // IC (Ice crystals)
+    (35.0,  (0, 100, 255)),   // DS (Dry snow)
+    (45.0,  (0, 200, 255)),   // WS (Wet snow)
+    (55.0,  (0, 200, 0)),     // RA (Rain)
+    (65.0,  (0, 100, 0)),     // HR (Heavy rain)
+    (75.0,  (255, 255, 0)),   // BD (Big drops)
+    (85.0,  (255, 150, 0)),   // GR (Graupel)
+    (95.0,  (255, 0, 0)),     // HA (Hail w/ rain)
+    (105.0, (200, 0, 0)),     // LH (Large hail)
+    (115.0, (255, 200, 200)), // GH (Giant hail)
+    (125.0, (200, 200, 200)), // UK (Unknown)
+    (145.0, (100, 0, 150)),   // RF (Range folded)
+];
 
-    (r, g, b, TRANSPARENCY)
-}
+/// Precipitation Rate (in/hr).
+static PRECIP_RATE: ColorScale = &[
+    (0.01, (100, 100, 100)), // Grey (very light; dispatcher handles < 0.01)
+    (0.1,  (0, 150, 255)),   // Light blue
+    (0.25, (0, 100, 255)),   // Blue
+    (0.5,  (0, 255, 0)),     // Green
+    (1.0,  (255, 255, 0)),   // Yellow
+    (2.0,  (255, 200, 0)),   // Gold
+    (3.0,  (255, 150, 0)),   // Orange
+    (4.0,  (255, 0, 0)),     // Red
+    (6.0,  (200, 0, 0)),     // Dark red
+    (8.0,  (255, 0, 255)),   // Magenta
+    (12.0, (200, 0, 200)),   // Purple (extreme)
+];
 
-/// Instantaneous Precipitation Rate color scale (in/hr)
-/// Range: 0–20+ in/hr
-fn precip_rate_color(rate: f32) -> (u8, u8, u8, u8) {
-    if rate < 0.01 {
-        return (0, 0, 0, 0); // Transparent (trace)
-    }
+/// NROT cyclonic / positive rotation (unitless).
+static NROT_CYCLONIC: ColorScale = &[
+    (0.3, (200, 200, 200)), // Light grey (weak)
+    (1.0, (255, 255, 0)),   // Yellow (significant)
+    (1.5, (255, 150, 0)),   // Orange
+    (2.5, (255, 0, 0)),     // Red (strong)
+    (4.0, (200, 0, 200)),   // Purple (extreme)
+];
 
-    let (r, g, b) = if rate < 0.1 {
-        (100, 100, 100) // Grey (very light)
-    } else if rate < 0.25 {
-        (0, 150, 255) // Light blue
-    } else if rate < 0.5 {
-        (0, 100, 255) // Blue
-    } else if rate < 1.0 {
-        (0, 255, 0) // Green
-    } else if rate < 2.0 {
-        (255, 255, 0) // Yellow
-    } else if rate < 3.0 {
-        (255, 200, 0) // Gold
-    } else if rate < 4.0 {
-        (255, 150, 0) // Orange
-    } else if rate < 6.0 {
-        (255, 0, 0) // Red
-    } else if rate < 8.0 {
-        (200, 0, 0) // Dark red
-    } else if rate < 12.0 {
-        (255, 0, 255) // Magenta
-    } else {
-        (200, 0, 200) // Purple (extreme)
-    };
-
-    (r, g, b, TRANSPARENCY)
-}
-
-/// Normalized Rotation (NROT) color scale (unitless)
-/// Diverging palette: blue = anticyclonic (negative), red = cyclonic (positive)
-/// Values near zero are transparent. >1.0 significant, >2.5 extreme.
-fn nrot_color(nrot: f32) -> (u8, u8, u8, u8) {
-    if nrot.is_nan() || nrot.is_infinite() {
-        return (0, 0, 0, 0);
-    }
-
-    // Values near zero — transparent (no significant rotation)
-    if nrot.abs() < 0.3 {
-        return (0, 0, 0, 0);
-    }
-
-    let (r, g, b) = if nrot > 4.0 {
-        (200, 0, 200) // Purple (extreme cyclonic)
-    } else if nrot > 2.5 {
-        (255, 0, 0) // Red (strong cyclonic)
-    } else if nrot > 1.5 {
-        (255, 150, 0) // Orange
-    } else if nrot > 1.0 {
-        (255, 255, 0) // Yellow (significant)
-    } else if nrot > 0.3 {
-        (200, 200, 200) // Light grey (weak positive)
-    } else if nrot < -4.0 {
-        (128, 0, 255) // Violet (extreme anticyclonic)
-    } else if nrot < -2.5 {
-        (0, 0, 255) // Blue (strong anticyclonic)
-    } else if nrot < -1.5 {
-        (0, 150, 255) // Light blue
-    } else if nrot < -1.0 {
-        (0, 255, 255) // Cyan (significant)
-    } else {
-        (160, 160, 160) // Grey (weak negative)
-    };
-
-    (r, g, b, TRANSPARENCY)
-}
+/// NROT anticyclonic / negative rotation (thresholds = abs values).
+static NROT_ANTICYCLONIC: ColorScale = &[
+    (0.3, (160, 160, 160)), // Grey (weak)
+    (1.0, (0, 255, 255)),   // Cyan (significant)
+    (1.5, (0, 150, 255)),   // Light blue
+    (2.5, (0, 0, 255)),     // Blue (strong)
+    (4.0, (128, 0, 255)),   // Violet (extreme)
+];
