@@ -9,6 +9,7 @@ pub type WindowRef = Arc<Window>;
 
 pub mod app;
 pub mod app_state;
+pub mod channels;
 pub mod constants;
 pub mod egui_renderer;
 pub mod input;

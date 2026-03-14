@@ -9,6 +9,7 @@ use winit::window::{Window, WindowId};
 
 use crate::WindowRef;
 use crate::app_state;
+use crate::channels::ChannelHub;
 use crate::constants::*;
 use crate::input::InputHandler;
 use crate::platform::{self, PlatformBridge};
@@ -20,29 +21,12 @@ use rustdar_egui::{
 use rustdar_radar::render::{render_radar_to_image, render_level3_radial_to_image};
 use rustdar_radar::types::{RadarProduct, ScanInfo};
 use rustdar_radar::scan;
-use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
-use rustdar_overlays::spc::discussion::SpcDiscussion;
-use rustdar_overlays::nws::alert::NwsAlert;
-use std::collections::HashMap;
 
 use chrono::NaiveDateTime;
-use nexrad_model::data::Scan;
-use nexrad_level3::model::Level3Message;
-use std::sync::mpsc::{Receiver, Sender};
 
 #[path = "app_fetch.rs"]
 mod fetch;
 
-type ScanResult = (u64, Result<(Scan, String, NaiveDateTime), String>);
-
-/// Result from background radar rendering: (image_data, max_range_km, value_data, product, elevation, generation, pane_idx)
-type RenderResult = (Vec<u8>, f64, Vec<f32>, RadarProduct, f32, u64, usize);
-
-/// Result from a Level III product fetch: (generation, product, tilt_code, result)
-type Level3Result = (u64, RadarProduct, String, Result<Level3Message, String>);
-
-/// Result from a background SPC outlook fetch
-type OutlookResult = (OutlookDay, OutlookProduct, Result<SpcOutlook, String>);
 
 /// Per-pane render tracking state.
 struct PaneRenderState {
@@ -65,11 +49,6 @@ impl PaneRenderState {
     }
 }
 
-/// Result from a background NWS alerts fetch
-type AlertResult = Result<Vec<NwsAlert>, String>;
-
-/// Result from a background SPC Mesoscale Discussion fetch
-type DiscussionResult = Result<Vec<SpcDiscussion>, String>;
 
 pub struct App {
     instance: wgpu::Instance,
@@ -78,6 +57,7 @@ pub struct App {
     gui: Gui,
     scan_data: Option<Arc<nexrad_model::data::Scan>>,
     input: InputHandler,
+    channels: ChannelHub,
     platform: Box<dyn PlatformBridge>,
     scan_receiver: Receiver<ScanResult>,
     scan_sender: Sender<ScanResult>,
@@ -109,15 +89,6 @@ pub struct App {
     tokio_runtime: tokio::runtime::Runtime,
     // Shared HTTP client for overlay data fetches (SPC, etc.)
     http_client: reqwest::Client,
-    // Channel for SPC outlook fetch results
-    outlook_receiver: Receiver<OutlookResult>,
-    outlook_sender: Sender<OutlookResult>,
-    // Channel for NWS alerts fetch results
-    alert_receiver: Receiver<AlertResult>,
-    alert_sender: Sender<AlertResult>,
-    // Channel for SPC Mesoscale Discussion fetch results
-    discussion_receiver: Receiver<DiscussionResult>,
-    discussion_sender: Sender<DiscussionResult>,
 }
 
 impl Default for App {
@@ -130,13 +101,7 @@ impl App {
     pub fn new() -> Self {
         let instance = egui_wgpu::wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let input = InputHandler::new();
-        let (scan_sender, scan_receiver) = std::sync::mpsc::channel();
-        let (render_result_sender, render_result_receiver) = std::sync::mpsc::channel();
-        let (outlook_sender, outlook_receiver) = std::sync::mpsc::channel();
-        let (alert_sender, alert_receiver) = std::sync::mpsc::channel();
-        let (discussion_sender, discussion_receiver) = std::sync::mpsc::channel();
-        let (level3_sender, level3_receiver) = std::sync::mpsc::channel();
-
+        let channels = ChannelHub::new();
         let platform = Box::new(platform::create_platform());
 
         let tokio_runtime = tokio::runtime::Runtime::new()
@@ -160,10 +125,7 @@ impl App {
             gui,
             scan_data: None,
             input,
-            scan_receiver,
-            scan_sender,
-            render_result_receiver,
-            render_result_sender,
+            channels,
             platform,
             pane_render: vec![PaneRenderState::new()],
             level3_data: HashMap::new(),
@@ -283,7 +245,7 @@ impl App {
     /// Poll all data channels for completed async results (scan, overlays).
     fn poll_data_channels(&mut self) {
         // Check for received scan data (with generation check)
-        if let Ok((generation, result)) = self.scan_receiver.try_recv() {
+        if let Ok((generation, result)) = self.channels.scan_receiver.try_recv() {
             if generation < self.fetch_generation {
                 log::info!("Discarding stale scan result (gen {} < current {})", generation, self.fetch_generation);
             } else {
@@ -316,7 +278,7 @@ impl App {
         // Check for received SPC outlook data
         {
             let mut any_received = false;
-            while let Ok((day, product, result)) = self.outlook_receiver.try_recv() {
+            while let Ok((day, product, result)) = self.channels.outlook_receiver.try_recv() {
                 any_received = true;
                 match result {
                     Ok(outlook) => {
@@ -334,7 +296,7 @@ impl App {
         }
 
         // Check for received NWS alerts data
-        if let Ok(result) = self.alert_receiver.try_recv() {
+        if let Ok(result) = self.channels.alert_receiver.try_recv() {
             match result {
                 Ok(alerts) => {
                     log::info!("Received {} NWS alerts", alerts.len());
@@ -348,7 +310,7 @@ impl App {
         }
 
         // Check for received SPC Mesoscale Discussion data
-        if let Ok(result) = self.discussion_receiver.try_recv() {
+        if let Ok(result) = self.channels.discussion_receiver.try_recv() {
             match result {
                 Ok(discussions) => {
                     log::info!("Received {} SPC Mesoscale Discussions", discussions.len());
@@ -450,7 +412,7 @@ impl App {
     fn poll_render_results(&mut self) {
         let ctx = self.state.as_ref().unwrap().egui_renderer.context();
         while let Ok((image_data, max_range_km, value_data, product, elevation, generation, pane_idx)) =
-            self.render_result_receiver.try_recv()
+            self.channels.render_receiver.try_recv()
         {
             if pane_idx < self.pane_render.len() {
                 self.pane_render[pane_idx].render_in_flight = false;
@@ -503,7 +465,7 @@ impl App {
 
     /// Poll for completed Level III fetch results and update scan info.
     fn poll_level3_results(&mut self) {
-        if let Ok((generation, product, tilt_code, result)) = self.level3_receiver.try_recv() {
+        if let Ok((generation, product, tilt_code, result)) = self.channels.level3_receiver.try_recv() {
             if generation < self.fetch_generation {
                 log::info!("Discarding stale Level III result (gen {} < current {})", generation, self.fetch_generation);
             } else {
@@ -872,7 +834,7 @@ impl App {
                 log::info!("Fetching SPC outlooks for {:?}: {:?}", day, products);
                 self.gui.set_spc_fetching(true);
                 let client = self.http_client.clone();
-                let sender = self.outlook_sender.clone();
+                let sender = self.channels.outlook_sender.clone();
                 let window = self.window.clone();
                 for product in products {
                     let client = client.clone();
@@ -904,7 +866,7 @@ impl App {
                 log::info!("Fetching NWS active alerts");
                 self.gui.set_nws_fetching(true);
                 let client = self.http_client.clone();
-                let sender = self.alert_sender.clone();
+                let sender = self.channels.alert_sender.clone();
                 let window = self.window.clone();
                 let zone_cache = self.platform.zone_cache_dir().map(|p| p.to_path_buf());
                 self.tokio_runtime.spawn(async move {
@@ -925,7 +887,7 @@ impl App {
                 log::info!("Fetching SPC Mesoscale Discussions");
                 self.gui.set_spc_md_fetching(true);
                 let client = self.http_client.clone();
-                let sender = self.discussion_sender.clone();
+                let sender = self.channels.discussion_sender.clone();
                 let window = self.window.clone();
                 self.tokio_runtime.spawn(async move {
                     let result =
