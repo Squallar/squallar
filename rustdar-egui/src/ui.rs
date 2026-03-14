@@ -122,6 +122,13 @@ pub struct Gui {
     pane_layout: PaneLayout,
     viewport_sync: bool,
     sync_layers: bool,
+    // --- Time navigation ---
+    /// True when displaying the most recent (live) scan; false when user has
+    /// navigated to a historical timestamp via the time steppers or Time dialog.
+    viewing_live: bool,
+    /// Selected time-step size for the forward/back navigation buttons (seconds).
+    /// `0` means "one scan" (navigate to adjacent scan).
+    pub time_step_secs: i64,
     // --- Radar loop settings ---
     /// How far back (in seconds) to fetch historical scans for the loop.
     pub loop_lookback_secs: u64,
@@ -174,6 +181,8 @@ impl Gui {
             pane_layout: PaneLayout::default(),
             viewport_sync: true,
             sync_layers: true,
+            viewing_live: true,
+            time_step_secs: 600, // default 10 min
             loop_lookback_secs: 3600, // default 1 hour
             loop_speed_fps: 5.0,      // default 5 fps
             #[cfg(target_os = "android")]
@@ -855,6 +864,16 @@ impl Gui {
 
     pub fn set_user_location(&mut self, lat: f64, lon: f64) {
         self.user_location = Some((lat, lon));
+    }
+
+    /// Whether the UI is showing the most recent (live) scan.
+    pub fn is_viewing_live(&self) -> bool {
+        self.viewing_live
+    }
+
+    /// Set live/historic viewing mode.
+    pub fn set_viewing_live(&mut self, live: bool) {
+        self.viewing_live = live;
     }
 
     /// Get a specific pane's layer manager (immutable).
