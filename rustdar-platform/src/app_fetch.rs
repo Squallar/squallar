@@ -101,9 +101,20 @@ impl super::App {
             GuiAction::ToggleLoopPlayback { pane_idx } => {
                 if let Some(pane) = self.gui.pane_mut(pane_idx) {
                     if let Some(ls) = &mut pane.loop_state {
-                        ls.playing = !ls.playing;
                         if ls.playing {
-                            ls.last_advance = Some(std::time::Instant::now());
+                            // Always allow pause
+                            ls.playing = false;
+                        } else {
+                            // Only allow play when all frames are done rendering
+                            let all_done = ls.frames.is_empty()
+                                || ls.frames.iter().all(|f| f.texture.is_some() || !f.render_in_flight);
+                            let none_pending = !ls.frames.iter().any(|f| f.render_in_flight)
+                                && self.loop_pending_downloads.get(&pane_idx).map_or(true, |p| p.is_empty())
+                                && self.loop_downloads_in_flight.get(&pane_idx).copied().unwrap_or(0) == 0;
+                            if all_done && none_pending {
+                                ls.playing = true;
+                                ls.last_advance = Some(std::time::Instant::now());
+                            }
                         }
                     }
                 }

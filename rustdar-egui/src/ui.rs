@@ -637,6 +637,7 @@ impl Gui {
                     // Frame status
                     let rendered = ls.frames.iter().filter(|f| f.texture.is_some()).count();
                     let total = ls.frames.len();
+                    let rendering = total > 0 && rendered < total;
                     if ls.fetching {
                         ui.horizontal(|ui| {
                             ui.spinner();
@@ -645,7 +646,19 @@ impl Gui {
                     } else if total == 0 {
                         ui.label("No frames found");
                     } else {
-                        ui.label(format!("{}/{} frames rendered", rendered, total));
+                        // Progress bar when rendering, plain text when done
+                        if rendering {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(format!("Rendering {}/{}...", rendered, total));
+                            });
+                            ui.add(
+                                egui::ProgressBar::new(rendered as f32 / total as f32)
+                                    .show_percentage()
+                            );
+                        } else {
+                            ui.label(format!("{}/{} frames rendered", rendered, total));
+                        }
 
                         // Transport controls
                         ui.horizontal(|ui| {
@@ -659,8 +672,17 @@ impl Gui {
 
                             // Play/pause
                             let play_label = if ls.playing { "\u{23f8}" } else { "\u{25b6}" };
-                            let play_hover = if ls.playing { "Pause" } else { "Play" };
-                            if ui.button(play_label).on_hover_text(play_hover).clicked() {
+                            let play_hover = if ls.playing {
+                                "Pause".to_string()
+                            } else if rendering {
+                                format!("Waiting for renders ({}/{})", rendered, total)
+                            } else {
+                                "Play".to_string()
+                            };
+                            let play_btn = egui::Button::new(play_label);
+                            let resp = ui.add_enabled(!rendering || ls.playing, play_btn)
+                                .on_hover_text(play_hover);
+                            if resp.clicked() {
                                 actions.push(GuiAction::ToggleLoopPlayback {
                                     pane_idx: self.active_pane,
                                 });
