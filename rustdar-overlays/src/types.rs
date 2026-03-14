@@ -3,6 +3,15 @@
 /// while significantly reducing vertex counts.
 pub const SIMPLIFY_EPSILON: f64 = 0.005;
 
+/// Fill alpha for CIG-hatched outlook areas (low opacity so hatching is visible).
+pub const CIG_FILL_ALPHA: u8 = 40;
+/// Fill alpha for regular (non-hatched) outlook areas.
+pub const REGULAR_FILL_ALPHA: u8 = 100;
+/// Fill alpha for NWS alert polygons.
+pub const NWS_FILL_ALPHA: u8 = 80;
+/// Stroke alpha (fully opaque) shared by all overlay types.
+pub const STROKE_ALPHA: u8 = 255;
+
 /// A single polygon ring: a sequence of (latitude, longitude) points.
 /// The first ring is the exterior, subsequent rings are holes.
 pub type GeoPolygonRing = Vec<(f64, f64)>;

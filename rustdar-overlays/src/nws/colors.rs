@@ -1,7 +1,4 @@
-/// Default fill alpha for alert polygons (semi-transparent).
-const FILL_ALPHA: u8 = 80;
-/// Stroke is fully opaque.
-const STROKE_ALPHA: u8 = 255;
+use crate::types::{NWS_FILL_ALPHA, STROKE_ALPHA};
 
 /// Alert color table entry: all keywords must match (case-insensitive),
 /// and the first matching entry wins (most specific entries come first).
@@ -78,7 +75,7 @@ pub fn alert_color(event: &str) -> ([u8; 4], [u8; 4]) {
 
 /// Helper: produce (fill_rgba, stroke_rgba) from an RGB triple.
 fn rgb(r: u8, g: u8, b: u8) -> ([u8; 4], [u8; 4]) {
-    ([r, g, b, FILL_ALPHA], [r, g, b, STROKE_ALPHA])
+    ([r, g, b, NWS_FILL_ALPHA], [r, g, b, STROKE_ALPHA])
 }
 
 #[cfg(test)]
@@ -88,19 +85,19 @@ mod tests {
     #[test]
     fn tornado_warning_is_red() {
         let (fill, stroke) = alert_color("Tornado Warning");
-        assert_eq!(fill, [255, 0, 0, FILL_ALPHA]);
+        assert_eq!(fill, [255, 0, 0, NWS_FILL_ALPHA]);
         assert_eq!(stroke, [255, 0, 0, STROKE_ALPHA]);
     }
 
     #[test]
     fn tornado_watch_is_yellow() {
         let (fill, _) = alert_color("Tornado Watch");
-        assert_eq!(fill, [255, 255, 0, FILL_ALPHA]);
+        assert_eq!(fill, [255, 255, 0, NWS_FILL_ALPHA]);
     }
 
     #[test]
     fn unknown_event_gets_default() {
         let (fill, _) = alert_color("Something New");
-        assert_eq!(fill, [200, 200, 200, FILL_ALPHA]);
+        assert_eq!(fill, [200, 200, 200, NWS_FILL_ALPHA]);
     }
 }

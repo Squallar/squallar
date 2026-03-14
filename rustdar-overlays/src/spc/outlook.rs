@@ -1,10 +1,5 @@
 use chrono::NaiveDateTime;
-use crate::types::{GeoPolygon, HatchPattern, OverlayFeature};
-
-/// Fill alpha for CIG-hatched areas (low opacity so hatching is visible).
-const CIG_FILL_ALPHA: u8 = 40;
-/// Fill alpha for regular (non-hatched) outlook areas.
-const REGULAR_FILL_ALPHA: u8 = 100;
+use crate::types::{GeoPolygon, HatchPattern, OverlayFeature, CIG_FILL_ALPHA, REGULAR_FILL_ALPHA};
 
 /// Which outlook day to request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
