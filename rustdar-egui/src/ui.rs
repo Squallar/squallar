@@ -527,8 +527,15 @@ impl Gui {
                         .logarithmic(true)
                         .suffix(" min")
                         .clamping(egui::SliderClamping::Always)
-                    ).changed() {
-                        self.loop_lookback_secs = (lookback_mins * 60.0) as u64;
+                    ).drag_stopped() {
+                        let new_secs = (lookback_mins * 60.0) as u64;
+                        if new_secs != self.loop_lookback_secs {
+                            self.loop_lookback_secs = new_secs;
+                            actions.push(GuiAction::EnableLoop {
+                                pane_idx: self.active_pane,
+                                lookback_secs: new_secs,
+                            });
+                        }
                     }
                 });
 

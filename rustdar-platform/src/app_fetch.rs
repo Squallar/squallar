@@ -421,6 +421,9 @@ impl super::App {
         let Some(scan_info) = self.gui.get_scan_info() else { return };
         let site = scan_info.site.name.to_string();
 
+        // Clear old cached scans for this pane
+        self.loop_scan_cache.remove(&pane_idx);
+
         // Initialize loop state on the pane
         if let Some(pane) = self.gui.pane_mut(pane_idx) {
             pane.loop_state = Some(rustdar_egui::pane::LoopPlaybackState {
