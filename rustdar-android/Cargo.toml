@@ -6,10 +6,9 @@ edition = "2024"
 # Android APK configuration for cargo-apk
 [package.metadata.android]
 package = "dev.mcswain.rustdar"
-label = "Rustdar"
 apk_name = "Rustdar"
 build_targets = ["aarch64-linux-android", "armv7-linux-androideabi", "i686-linux-android", "x86_64-linux-android"]
-min_sdk_version = 26
+min_sdk_version = 28
 target_sdk_version = 34
 theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
 
@@ -17,6 +16,9 @@ theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
 # instead of letting Android destroy and recreate the activity. Without this,
 # unfolding a Z Fold triggers a full activity relaunch that deadlocks the native
 # event loop and causes an ANR.
+[package.metadata.android.application]
+label = "Rustdar"
+
 [package.metadata.android.application.activity]
 config_changes = "orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|density|uiMode"
 

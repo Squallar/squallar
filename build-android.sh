@@ -130,10 +130,10 @@ else
         $(find "$JAVA_SRC_DIR" -name '*.java') 2>/dev/null || true
 fi
 
-# Compile JARs + our helper classes into a single classes.dex (min-api 26 matches our minSdkVersion)
+# Compile JARs + our helper classes into a single classes.dex (min-api 28 matches our minSdkVersion)
 echo "  Running d8..."
 HELPER_CLASSES=$(find "$JAVA_OUT_DIR" -name '*.class' 2>/dev/null)
-"$D8" --min-api 26 --output "$WORK_DIR" "$WORK_DIR/classes.jar" "$KOTLIN_STDLIB" $HELPER_CLASSES
+"$D8" --min-api 28 --output "$WORK_DIR" "$WORK_DIR/classes.jar" "$KOTLIN_STDLIB" $HELPER_CLASSES
 if [ ! -f "$WORK_DIR/classes.dex" ]; then
     echo "ERROR: d8 failed to produce classes.dex"
     exit 1
