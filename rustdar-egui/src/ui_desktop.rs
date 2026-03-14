@@ -2,8 +2,67 @@
 
 use crate::actions::GuiAction;
 use crate::layers::LayerKind;
+use crate::pane::PaneState;
 
 use egui::Context;
+use rustdar_radar::types::ScanInfo;
+
+fn render_auto_poll_status(
+    ui: &mut egui::Ui,
+    fetching: bool,
+    auto_poll: &mut super::AutoPollState,
+) {
+    if fetching {
+        ui.label("🔄");
+        ui.label("Downloading");
+        ui.spinner();
+    } else if auto_poll.enabled {
+        if let Some(remaining) = auto_poll.time_until_next() {
+            ui.checkbox(&mut auto_poll.enabled, &format!("Auto-poll (next in {}s)", remaining));
+        } else {
+            ui.checkbox(&mut auto_poll.enabled, "Auto-poll");
+        }
+    } else {
+        ui.checkbox(&mut auto_poll.enabled, "Auto-poll");
+    }
+}
+
+fn render_scan_info(ui: &mut egui::Ui, scan_info: Option<&ScanInfo>) {
+    if let Some(scan_info) = scan_info {
+        ui.label(format!(
+            "Scan: {} @ {} UTC ({} products)",
+            scan_info.site.name,
+            scan_info.timestamp.format("%Y-%m-%d %H:%M:%S"),
+            scan_info.available_products.len()
+        ));
+    } else {
+        ui.label("No scan loaded");
+    }
+}
+
+fn render_hover_info(ui: &mut egui::Ui, panes: &[PaneState]) {
+    let hover_info = panes.iter().find_map(|p| p.hover_value.as_ref());
+    if let Some(hover_info) = hover_info {
+        ui.label("📍");
+        ui.label(hover_info);
+    } else {
+        ui.label("");
+    }
+}
+
+fn render_error_display(ui: &mut egui::Ui, error_message: &mut Option<String>) {
+    let mut dismiss = false;
+    if let Some(msg) = error_message.as_deref() {
+        if ui.button("✕").clicked() {
+            dismiss = true;
+        }
+        ui.label(msg);
+        ui.label("❌");
+    }
+    if dismiss {
+        *error_message = None;
+    }
+}
 
 impl super::Gui {
     pub(super) fn render_menu_bar(&mut self, ctx: &Context, action: &mut Option<GuiAction>) {
@@ -50,61 +109,19 @@ impl super::Gui {
 
                     ui.separator();
 
-                    // Unified auto-poll checkbox and status
-                    if self.radar.fetching {
-                        ui.label("🔄");
-                        ui.label("Downloading");
-                        ui.spinner();
-                    } else if self.auto_poll.enabled {
-                        // Show time until next poll with checkbox
-                        if let Some(remaining) = self.auto_poll.time_until_next() {
-                            ui.checkbox(&mut self.auto_poll.enabled, &format!("Auto-poll (next in {}s)", remaining));
-                        } else {
-                            ui.checkbox(&mut self.auto_poll.enabled, "Auto-poll");
-                        }
-                    } else {
-                        ui.checkbox(&mut self.auto_poll.enabled, "Auto-poll");
-                    }
+                    render_auto_poll_status(ui, self.radar.fetching, &mut self.auto_poll);
 
                     ui.separator();
 
-                    // Scan information
-                    if let Some(scan_info) = &self.radar.scan_info {
-                        ui.label(format!(
-                            "Scan: {} @ {} UTC ({} products)",
-                            scan_info.site.name,
-                            scan_info.timestamp.format("%Y-%m-%d %H:%M:%S"),
-                            scan_info.available_products.len()
-                        ));
-                    } else {
-                        ui.label("No scan loaded");
-                    }
+                    render_scan_info(ui, self.radar.scan_info.as_ref());
 
                     ui.separator();
 
-                    // Hover information - show from whichever pane has data
-                    let hover_info = self.panes.iter()
-                        .find_map(|p| p.hover_value.as_ref());
-                    if let Some(hover_info) = hover_info {
-                        ui.label("📍");
-                        ui.label(hover_info);
-                    } else {
-                        // Add empty space when no hover info
-                        ui.label("");
-                    }
+                    render_hover_info(ui, &self.panes);
 
                     // Add flexible space to push error to the right
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Error message (if any)
-                        let mut dismiss_error = false;
-                        if let Some(error_msg) = &self.radar.error_message {
-                            if ui.button("✕").clicked() {
-                                dismiss_error = true;
-                            }
-                            ui.label(error_msg.as_str());
-                            ui.label("❌");
-                        }
-                        if dismiss_error { self.radar.error_message = None; }
+                        render_error_display(ui, &mut self.radar.error_message);
                     });
                 });
             });
