@@ -38,25 +38,7 @@ impl super::Gui {
             .show(ctx, |ui| {
                 let panel_rect = ui.max_rect();
 
-                // Activate pane on primary press (before rendering so drag/pan
-                // happens on the newly-active pane in the same frame).
-                if pane_count > 1 {
-                    if let Some(pos) = ui.ctx().input(|i| {
-                        if i.pointer.primary_pressed() {
-                            i.pointer.interact_pos()
-                        } else {
-                            None
-                        }
-                    }) {
-                        for idx in 0..pane_count {
-                            let rect = self.pane_layout.pane_rect(idx, panel_rect);
-                            if rect.contains(pos) && idx != self.active_pane {
-                                self.active_pane = idx;
-                                break;
-                            }
-                        }
-                    }
-                }
+                self.detect_active_pane_click(ui.ctx(), panel_rect);
 
                 // Snapshot viewport state before rendering for sync detection
                 let (pre_zooms, pre_positions): (Vec<f64>, Vec<Option<Position>>) =
@@ -68,26 +50,7 @@ impl super::Gui {
                         (vec![], vec![])
                     };
 
-                // Dismiss overlay popups when clicking outside them (once, not per-pane)
-                let pointer_available = self.overlays.selected_alert.is_none()
-                    && self.overlays.selected_md.is_none();
-                if !pointer_available {
-                    let click_pos = ctx.input(|i| {
-                        if i.pointer.any_click() {
-                            i.pointer.interact_pos()
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some(pos) = click_pos {
-                        let on_popup = ctx.layer_id_at(pos)
-                            .is_some_and(|l| l.order > egui::Order::Background);
-                        if !on_popup {
-                            self.overlays.selected_alert = None;
-                            self.overlays.selected_md = None;
-                        }
-                    }
-                }
+                let pointer_available = self.dismiss_overlay_popups(ui.ctx());
 
                 for pane_idx in 0..pane_count {
                     let pane_rect = self.pane_layout.pane_rect(pane_idx, panel_rect);
@@ -171,20 +134,8 @@ impl super::Gui {
                     pane.map_memory = map_memory;
                     self.panes[pane_idx] = pane;
 
-                    // Draw pane border when multi-pane
                     if pane_count > 1 {
-                        let border_color = if is_active {
-                            egui::Color32::from_rgb(60, 140, 255)
-                        } else {
-                            egui::Color32::from_rgba_unmultiplied(128, 128, 128, 100)
-                        };
-                        let stroke_width = if is_active { 2.0 } else { 1.0 };
-                        ui.painter().rect_stroke(
-                            pane_rect,
-                            0.0,
-                            egui::Stroke::new(stroke_width, border_color),
-                            egui::StrokeKind::Outside,
-                        );
+                        draw_pane_border(ui, pane_rect, is_active);
                     }
                 } // end pane loop
 
@@ -215,6 +166,69 @@ impl super::Gui {
 
         actions
     }
+
+    /// Detect which pane was clicked and make it the active pane.
+    fn detect_active_pane_click(&mut self, ctx: &Context, panel_rect: egui::Rect) {
+        if self.pane_layout.pane_count <= 1 {
+            return;
+        }
+        if let Some(pos) = ctx.input(|i| {
+            if i.pointer.primary_pressed() {
+                i.pointer.interact_pos()
+            } else {
+                None
+            }
+        }) {
+            for idx in 0..self.pane_layout.pane_count {
+                let rect = self.pane_layout.pane_rect(idx, panel_rect);
+                if rect.contains(pos) && idx != self.active_pane {
+                    self.active_pane = idx;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Dismiss overlay popups when clicking outside them.
+    /// Returns `true` when no popup is open (pointer is available for map interaction).
+    fn dismiss_overlay_popups(&mut self, ctx: &Context) -> bool {
+        let pointer_available = self.overlays.selected_alert.is_none()
+            && self.overlays.selected_md.is_none();
+        if !pointer_available {
+            let click_pos = ctx.input(|i| {
+                if i.pointer.any_click() {
+                    i.pointer.interact_pos()
+                } else {
+                    None
+                }
+            });
+            if let Some(pos) = click_pos {
+                let on_popup = ctx.layer_id_at(pos)
+                    .is_some_and(|l| l.order > egui::Order::Background);
+                if !on_popup {
+                    self.overlays.selected_alert = None;
+                    self.overlays.selected_md = None;
+                }
+            }
+        }
+        pointer_available
+    }
+}
+
+/// Draw a border around a pane rect, highlighted when active.
+fn draw_pane_border(ui: &mut egui::Ui, pane_rect: egui::Rect, is_active: bool) {
+    let border_color = if is_active {
+        egui::Color32::from_rgb(60, 140, 255)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(128, 128, 128, 100)
+    };
+    let stroke_width = if is_active { 2.0 } else { 1.0 };
+    ui.painter().rect_stroke(
+        pane_rect,
+        0.0,
+        egui::Stroke::new(stroke_width, border_color),
+        egui::StrokeKind::Outside,
+    );
 }
 
 /// Compute the hover information string for a cursor position over the radar image.
