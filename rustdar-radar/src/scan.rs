@@ -1,8 +1,27 @@
 use chrono::{Duration, NaiveDateTime, NaiveTime};
 
-use nexrad_data::aws::archive::{download_file, list_files};
+use nexrad_data::aws::archive::{download_file, list_files, Identifier};
 use nexrad_model::data::Scan;
 use nexrad_data::result::Result;
+
+/// List files for the given date, falling back to the previous day if empty.
+/// Returns `None` if both days are empty, otherwise `(files, effective_date)`.
+async fn list_files_with_fallback(
+    site: &str,
+    date: &chrono::NaiveDate,
+) -> Result<Option<(Vec<Identifier>, chrono::NaiveDate)>> {
+    let metas = list_files(site, date).await?;
+    if !metas.is_empty() {
+        return Ok(Some((metas, *date)));
+    }
+    let prev = *date - Duration::days(1);
+    log::info!("No files for {date}, trying previous day {prev}");
+    let prev_metas = list_files(site, &prev).await?;
+    if prev_metas.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((prev_metas, prev)))
+}
 
 /// Check for new radar files without downloading them
 /// Returns the timestamp of the latest available scan, or None if no files found
@@ -10,20 +29,8 @@ pub async fn check_latest_scan(
     site: &str,
     date: &chrono::NaiveDate,
 ) -> Result<Option<NaiveDateTime>> {
-    let metas = list_files(site, date).await?;
-
-    // If no files found for the requested date, try the previous day.
-    // This handles the period just after midnight UTC before new scans appear.
-    let (metas, effective_date) = if metas.is_empty() {
-        let prev = *date - Duration::days(1);
-        log::info!("No files for {date}, trying previous day {prev}");
-        let prev_metas = list_files(site, &prev).await?;
-        if prev_metas.is_empty() {
-            return Ok(None);
-        }
-        (prev_metas, prev)
-    } else {
-        (metas, *date)
+    let Some((metas, effective_date)) = list_files_with_fallback(site, date).await? else {
+        return Ok(None);
     };
 
     // Find the latest scan, using Option to avoid returning a spurious midnight time
@@ -44,25 +51,15 @@ pub async fn check_latest_scan(
 }
 
 pub async fn get_scan(site: &str, timestamp: NaiveDateTime) -> Result<Scan> {
-    let metas = list_files(site, &timestamp.date()).await?;
-
-    // If no files found for the requested date, try the previous day.
-    // This handles the period just after midnight UTC before new scans appear.
-    let (metas, fell_back) = if metas.is_empty() {
-        let prev = timestamp.date() - Duration::days(1);
-        log::info!("No files for {}, trying previous day {}", timestamp.date(), prev);
-        let prev_metas = list_files(site, &prev).await?;
-        if prev_metas.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No files found for the specified date or previous day.",
-            )
-            .into());
-        }
-        (prev_metas, true)
-    } else {
-        (metas, false)
+    let date = timestamp.date();
+    let Some((metas, effective_date)) = list_files_with_fallback(site, &date).await? else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No files found for the specified date or previous day.",
+        )
+        .into());
     };
+    let fell_back = effective_date != date;
 
     log::info!("Found {} files.", metas.len());
 
@@ -156,20 +153,8 @@ pub async fn check_and_fetch_latest(
     date: &chrono::NaiveDate,
     current_timestamp: Option<NaiveDateTime>,
 ) -> Result<Option<(Scan, NaiveDateTime)>> {
-    let metas = list_files(site, date).await?;
-
-    // If no files found for the requested date, try the previous day.
-    // This handles the period just after midnight UTC before new scans appear.
-    let (metas, effective_date) = if metas.is_empty() {
-        let prev = *date - Duration::days(1);
-        log::info!("No files for {date}, trying previous day {prev}");
-        let prev_metas = list_files(site, &prev).await?;
-        if prev_metas.is_empty() {
-            return Ok(None);
-        }
-        (prev_metas, prev)
-    } else {
-        (metas, *date)
+    let Some((metas, effective_date)) = list_files_with_fallback(site, date).await? else {
+        return Ok(None);
     };
 
     // Find the latest scan
