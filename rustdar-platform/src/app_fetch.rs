@@ -129,6 +129,15 @@ impl super::App {
                     }
                 }
             }
+            GuiAction::NavigateTime { step_secs } => {
+                self.handle_navigate_time(step_secs);
+            }
+            GuiAction::NavigateOneScan { forward } => {
+                self.handle_navigate_one_scan(forward);
+            }
+            GuiAction::JumpToLive => {
+                self.handle_jump_to_live();
+            }
         }
     }
 
@@ -469,6 +478,106 @@ impl super::App {
     fn handle_disable_loop(&mut self, pane_idx: usize) {
         if let Some(pane) = self.gui.pane_mut(pane_idx) {
             pane.loop_state = None;
+        }
+    }
+
+    /// Navigate by a relative time step (seconds). Positive = forward, negative = backward.
+    fn handle_navigate_time(&mut self, step_secs: i64) {
+        let Some(scan_info) = self.gui.get_scan_info() else { return };
+        let site = scan_info.site.name.to_string();
+        let current_utc = scan_info.timestamp;
+
+        let target = current_utc + chrono::Duration::seconds(step_secs);
+        let now_utc = chrono::Utc::now().naive_utc();
+
+        // Cap forward navigation to now; if capped, we're "live" again
+        let (target, is_live) = if step_secs > 0 && target >= now_utc {
+            (now_utc, true)
+        } else {
+            (target, false)
+        };
+
+        self.gui.set_viewing_live(is_live);
+        self.manual_nav_pending = true;
+
+        // Update the UI config timestamp (local time for display)
+        let local_ts = chrono::TimeZone::from_utc_datetime(&chrono::Local, &target).naive_local();
+        let mut config = self.gui.get_radar_config().clone();
+        config.timestamp = local_ts;
+        self.gui.set_radar_config(config);
+        self.gui.set_fetching(true);
+
+        self.spawn_fetch(site, target);
+    }
+
+    /// Navigate to the next or previous adjacent scan on AWS.
+    fn handle_navigate_one_scan(&mut self, forward: bool) {
+        let Some(scan_info) = self.gui.get_scan_info() else { return };
+        let site = scan_info.site.name.to_string();
+        let current_utc = scan_info.timestamp;
+
+        self.manual_nav_pending = true;
+        self.gui.set_fetching(true);
+
+        let generation = self.render.next_fetch_generation();
+        let sender = self.channels.scan_sender.clone();
+        let window = self.window.clone();
+
+        self.tokio_runtime.spawn(async move {
+            match scan::get_adjacent_scan(&site, current_utc, forward).await {
+                Ok((data, timestamp)) => {
+                    // If navigating forward and the result is the same as current, treat as live
+                    let _ = sender.send(crate::channels::ScanResponse {
+                        generation,
+                        result: Ok(crate::channels::ScanData { scan: data, site, timestamp }),
+                        is_auto_poll: false,
+                    });
+                }
+                Err(e) => {
+                    let err = format!("Failed to find adjacent scan: {:?}", e);
+                    log::error!("{}", err);
+                    let _ = sender.send(crate::channels::ScanResponse {
+                        generation,
+                        result: Err(err),
+                        is_auto_poll: false,
+                    });
+                }
+            }
+            super::notify_redraw(&window);
+        });
+    }
+
+    /// Jump back to live mode: apply any cached auto-poll scan, or fetch latest.
+    fn handle_jump_to_live(&mut self) {
+        self.gui.set_viewing_live(true);
+        self.manual_nav_pending = true;
+
+        if let Some((scan_arc, scan_info, site, timestamp)) = self.latest_cached_scan.take() {
+            log::info!("JumpToLive: using cached scan @ {}", timestamp);
+            self.scan_data = Some(scan_arc);
+
+            let local_ts = chrono::TimeZone::from_utc_datetime(&chrono::Local, &timestamp).naive_local();
+            let mut config = self.gui.get_radar_config().clone();
+            config.timestamp = local_ts;
+            self.gui.set_radar_config(config);
+            self.gui.set_scan_info(scan_info);
+            self.gui.set_loading_site(None);
+            self.render.reset_panes();
+            self.spawn_level3_fetches(&site);
+
+            self.manual_nav_pending = false;
+            self.reinit_active_loops();
+        } else {
+            // No cached scan — fetch latest
+            let now = chrono::Local::now().naive_local();
+            let mut config = self.gui.get_radar_config().clone();
+            config.timestamp = now;
+            self.gui.set_radar_config(config.clone());
+            self.gui.set_fetching(true);
+
+            let utc_timestamp = Self::local_to_utc(now);
+            let site = config.site;
+            self.spawn_fetch(site, utc_timestamp);
         }
     }
 
