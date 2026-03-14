@@ -126,10 +126,38 @@ impl App {
     }
 
     fn handle_redraw(&mut self) {
-        // Clear per-frame input state at the start of each frame
         self.input.clear_frame_state();
+        self.poll_platform_state();
+        self.poll_data_channels();
 
-        // Poll for platform-specific theme and location changes
+        // Skip rendering when minimized
+        if let Some(window) = self.window.as_ref()
+            && let Some(min) = window.is_minimized()
+            && min
+        {
+            log::debug!("Window is minimized");
+            return;
+        }
+
+        self.ensure_rendering_state();
+        if self.state.is_none() || self.window.is_none() {
+            return;
+        }
+
+        let (screen_descriptor, gui_actions) = self.setup_egui_frame();
+        self.present_frame(screen_descriptor);
+        self.process_gui_actions(gui_actions);
+
+        // Request redraw only when there is pending background work or auto-poll is active
+        if self.render.any_render_in_flight() || self.gui.is_auto_poll_active() {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
+    /// Poll for platform-specific theme and location changes.
+    fn poll_platform_state(&mut self) {
         if let Some(new_theme) = self.platform.poll_theme() {
             if self.cached_dark_theme != Some(new_theme) {
                 self.cached_dark_theme = Some(new_theme);
@@ -141,19 +169,10 @@ impl App {
         if let Some((lat, lon)) = self.platform.poll_location() {
             self.gui.set_user_location(lat, lon);
         }
+    }
 
-        self.poll_data_channels();
-
-        // Attempt to handle minimizing window
-        if let Some(window) = self.window.as_ref()
-            && let Some(min) = window.is_minimized()
-            && min
-        {
-            log::debug!("Window is minimized");
-            return;
-        }
-
-        // Lazily initialize rendering state on first redraw after window creation.
+    /// Lazily initialize wgpu rendering state on first redraw after window creation.
+    fn ensure_rendering_state(&mut self) {
         if self.state.is_none() && self.window.is_some() {
             let new_state = self.window.as_ref().map(|window| {
                 let size = window.inner_size();
@@ -169,28 +188,13 @@ impl App {
                 self.restore_cached_render();
             }
         }
+    }
 
-        if self.state.is_none() || self.window.is_none() {
-            return;
-        }
-
-        // Setup egui and get GUI actions
-        let (screen_descriptor, gui_actions) = self.setup_egui_frame();
-
-        // Present the frame
-        self.present_frame(screen_descriptor);
-
-        // Handle GUI actions
-        for action in gui_actions {
+    /// Process all GUI actions emitted during this frame.
+    fn process_gui_actions(&mut self, actions: Vec<GuiAction>) {
+        for action in actions {
             log::info!("GUI action received: {}", action);
             self.handle_gui_action(action, None);
-        }
-
-        // Request redraw only when there is pending background work or auto-poll is active
-        if self.render.any_render_in_flight() || self.gui.is_auto_poll_active() {
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
         }
     }
 
@@ -625,6 +629,24 @@ impl App {
 
     fn handle_gui_action(&mut self, action: GuiAction, event_loop: Option<&ActiveEventLoop>) {
         match action {
+            GuiAction::FetchRadarScan(_)
+            | GuiAction::CheckForNewScans(_)
+            | GuiAction::SwitchRadarSite(_) => self.handle_radar_action(action),
+            GuiAction::Exit => {
+                self.request_exit(event_loop);
+            }
+            GuiAction::FetchSpcOutlook { .. }
+            | GuiAction::RefreshSpcOutlooks
+            | GuiAction::FetchNwsAlerts
+            | GuiAction::RefreshNwsAlerts
+            | GuiAction::FetchSpcDiscussions
+            | GuiAction::RefreshSpcDiscussions => self.handle_overlay_action(action),
+        }
+    }
+
+    /// Handle radar data fetch/switch actions.
+    fn handle_radar_action(&mut self, action: GuiAction) {
+        match action {
             GuiAction::FetchRadarScan(radar_config) => {
                 log::info!(
                     "Fetch radar scan requested: {} @ {} (local)",
@@ -676,9 +698,13 @@ impl App {
                 let utc_timestamp = Self::local_to_utc(new_config.timestamp);
                 self.spawn_fetch(site, utc_timestamp);
             }
-            GuiAction::Exit => {
-                self.request_exit(event_loop);
-            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Handle overlay fetch/refresh actions (SPC outlooks, NWS alerts, SPC discussions).
+    fn handle_overlay_action(&mut self, action: GuiAction) {
+        match action {
             GuiAction::FetchSpcOutlook { day, products } => {
                 log::info!("Fetching SPC outlooks for {:?}: {:?}", day, products);
                 self.gui.overlays.set_spc_fetching(true);
@@ -705,9 +731,8 @@ impl App {
                 let day = self.gui.layers().spc_day;
                 let products = self.gui.layers().enabled_spc_products();
                 if !products.is_empty() {
-                    self.handle_gui_action(
+                    self.handle_overlay_action(
                         GuiAction::FetchSpcOutlook { day, products },
-                        event_loop,
                     );
                 }
             }
@@ -749,6 +774,7 @@ impl App {
                     }
                 });
             }
+            _ => unreachable!(),
         }
     }
 
