@@ -1,6 +1,11 @@
 use chrono::NaiveDateTime;
 use crate::types::{GeoPolygon, HatchPattern, OverlayFeature};
 
+/// Fill alpha for CIG-hatched areas (low opacity so hatching is visible).
+const CIG_FILL_ALPHA: u8 = 40;
+/// Fill alpha for regular (non-hatched) outlook areas.
+const REGULAR_FILL_ALPHA: u8 = 100;
+
 /// Which outlook day to request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OutlookDay {
@@ -220,7 +225,7 @@ pub fn parse_geojson(
         };
 
         // CIG areas: use transparent fill + hatching; regular areas: semi-transparent fill
-        let fill_alpha = if hatch != HatchPattern::None { 40 } else { 100 };
+        let fill_alpha = if hatch != HatchPattern::None { CIG_FILL_ALPHA } else { REGULAR_FILL_ALPHA };
         let fill_rgba = super::colors::parse_hex_color(fill_hex, fill_alpha);
         let stroke_rgba = super::colors::parse_hex_color(stroke_hex, 255);
 
