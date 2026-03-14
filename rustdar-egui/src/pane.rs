@@ -42,6 +42,10 @@ pub struct LoopPlaybackState {
     pub fetching: bool,
     /// Instant of the last frame advance (for animation timing).
     pub last_advance: Option<std::time::Instant>,
+    /// Radar site latitude, captured at loop creation for rendering.
+    pub site_lat: f64,
+    /// Radar site longitude, captured at loop creation for rendering.
+    pub site_lon: f64,
 }
 
 /// Per-pane state: each pane independently selects a radar product,

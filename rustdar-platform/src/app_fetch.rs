@@ -430,6 +430,9 @@ impl super::App {
     fn handle_enable_loop(&mut self, pane_idx: usize, lookback_secs: u64) {
         let Some(scan_info) = self.gui.get_scan_info() else { return };
         let site = scan_info.site.name.to_string();
+        let site_lat = scan_info.site.lat;
+        let site_lon = scan_info.site.lon;
+        let scan_timestamp = scan_info.timestamp;
 
         // Clear old cached scans for this pane
         self.loop_scan_cache.remove(&pane_idx);
@@ -443,11 +446,13 @@ impl super::App {
                 lookback_secs,
                 fetching: true,
                 last_advance: None,
+                site_lat,
+                site_lon,
             });
         }
 
-        // Compute UTC time range for the scan listing
-        let end = chrono::Utc::now().naive_utc();
+        // Use the current scan's timestamp as the loop end time (not wall clock)
+        let end = scan_timestamp;
         let start = end - chrono::Duration::seconds(lookback_secs as i64);
 
         let sender = self.channels.loop_scan_list_sender.clone();
