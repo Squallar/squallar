@@ -79,6 +79,17 @@ impl<'a> OverlayDrawContext<'a> {
         }
     }
 
+    /// Check whether the user clicked inside a cached polygon.
+    fn clicked_polygon(&self, poly: &crate::overlay_cache::CachedPolygon) -> bool {
+        self.pointer_available
+            && !self.click_on_ui
+            && self.any_click
+            && self.click_pos.is_some_and(|p| {
+                poly.poly_rect.contains(p)
+                    && crate::geo::point_in_polygon(p, &poly.screen_pts)
+            })
+    }
+
     /// Draw SPC convective outlook polygons on the map.
     pub fn draw_spc_overlays(
         &self,
@@ -209,13 +220,7 @@ impl OverlayDrawContext<'_> {
                 }
 
                 // Click detection
-                if self.pointer_available && !self.click_on_ui && clicked_index.is_none()
-                    && self.any_click
-                    && self.click_pos.is_some_and(|p| {
-                        cached_poly.poly_rect.contains(p)
-                            && crate::geo::point_in_polygon(p, &cached_poly.screen_pts)
-                    })
-                {
+                if clicked_index.is_none() && self.clicked_polygon(cached_poly) {
                     clicked_index = Some(md_idx);
                 }
             }
@@ -289,13 +294,7 @@ impl OverlayDrawContext<'_> {
                 acc.append_polygon(cached_poly, fill, stroke_color, 2.0);
 
                 // Click detection
-                if self.pointer_available && !self.click_on_ui && clicked_index.is_none()
-                    && self.any_click
-                    && self.click_pos.is_some_and(|p| {
-                        cached_poly.poly_rect.contains(p)
-                            && crate::geo::point_in_polygon(p, &cached_poly.screen_pts)
-                    })
-                {
+                if clicked_index.is_none() && self.clicked_polygon(cached_poly) {
                     clicked_index = Some(alert_idx);
                 }
             }
