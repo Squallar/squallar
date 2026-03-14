@@ -126,7 +126,7 @@ impl ScanInfo {
             })
             .unwrap_or(requested_timestamp);
 
-        let radar_site = get_radar_site(site).unwrap_or_else(|| {
+        let radar_site = get_radar_site(site).cloned().unwrap_or_else(|| {
             log::warn!("Unknown radar site '{}', using fallback location", site);
             RadarSite {
                 name: "UNKNOWN",
