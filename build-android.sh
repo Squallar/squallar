@@ -57,8 +57,8 @@ LIB_NAME=$(grep -A5 '^\[lib\]' rustdar-android/Cargo.toml | grep '^name' | head 
 if [ -z "$LIB_NAME" ]; then
     LIB_NAME="rustdar_android"
 fi
-APK="$APK_DIR/$LIB_NAME.apk"
-UNALIGNED_APK="$APK_DIR/$LIB_NAME-unaligned.apk"
+APK="$APK_DIR/Rustdar.apk"
+UNALIGNED_APK="$APK_DIR/Rustdar-unaligned.apk"
 
 if [ ! -f "$UNALIGNED_APK" ]; then
     echo "ERROR: cargo-apk did not produce $UNALIGNED_APK"

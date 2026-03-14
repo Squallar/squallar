@@ -1,10 +1,9 @@
+#![cfg(target_os = "android")]
+
 //! Android entry point for Rustdar Platform
 //! 
 //! This crate provides the Android-specific entry point and configuration
 //! for the Rustdar radar visualization application.
-
-// For non-Android targets, this crate has no code
-#![cfg_attr(not(target_os = "android"), allow(unused))]
 
 #[cfg(target_os = "android")]
 use winit::platform::android::activity::AndroidApp;

@@ -6,7 +6,8 @@ edition = "2024"
 # Android APK configuration for cargo-apk
 [package.metadata.android]
 package = "dev.mcswain.rustdar"
-label = "Rustdar Platform"
+label = "Rustdar"
+apk_name = "Rustdar"
 build_targets = ["aarch64-linux-android", "armv7-linux-androideabi", "i686-linux-android", "x86_64-linux-android"]
 min_sdk_version = 26
 target_sdk_version = 34
@@ -33,7 +34,7 @@ name = "android.permission.ACCESS_FINE_LOCATION"
 name = "android.permission.ACCESS_COARSE_LOCATION"
 
 [lib]
-name = "Rustdar"
+name = "rustdar_android"
 crate-type = ["cdylib"]
 path = "src/lib.rs"
 
