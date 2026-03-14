@@ -133,27 +133,9 @@ impl RenderDispatcher {
             pane_idx,
             product
         );
-        let generation = self.render_generation;
-
-        std::thread::spawn(move || {
-            if let Some((image, range, values)) =
-                render_level3_message_to_image(&l3_msg, product, lat, lon)
-            {
-                let _ = sender.send(RenderResponse {
-                    image_data: image,
-                    max_range_km: range,
-                    value_data: values,
-                    product,
-                    elevation,
-                    generation,
-                    pane_idx,
-                });
-            }
-            if let Some(window) = window {
-                window.request_redraw();
-            }
+        self.spawn_render(pane_idx, product, elevation, sender, window, move || {
+            render_level3_message_to_image(&l3_msg, product, lat, lon)
         });
-        self.pane_render[pane_idx].render_in_flight = true;
         true
     }
 
@@ -175,12 +157,24 @@ impl RenderDispatcher {
             product,
             elevation
         );
-        let generation = self.render_generation;
+        self.spawn_render(pane_idx, product, elevation, sender, window, move || {
+            render_radar_to_image(&data, elevation, product, lat, lon)
+        });
+    }
 
+    /// Shared thread dispatch for both Level II and Level III renders.
+    fn spawn_render(
+        &mut self,
+        pane_idx: usize,
+        product: RadarProduct,
+        elevation: f32,
+        sender: std::sync::mpsc::Sender<RenderResponse>,
+        window: Option<WindowRef>,
+        render_fn: impl FnOnce() -> Option<(Vec<u8>, f64, Vec<f32>)> + Send + 'static,
+    ) {
+        let generation = self.render_generation;
         std::thread::spawn(move || {
-            if let Some((image, range, values)) =
-                render_radar_to_image(&data, elevation, product, lat, lon)
-            {
+            if let Some((image, range, values)) = render_fn() {
                 let _ = sender.send(RenderResponse {
                     image_data: image,
                     max_range_km: range,
