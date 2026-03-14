@@ -209,19 +209,7 @@ impl PaneLayout {
                 egui::pos2(total_rect.right(), y + DIVIDER_HALF_WIDTH),
             );
             let id = egui::Id::new(("h_div", row_idx));
-            let response = ui.interact(divider_rect, id, egui::Sense::drag());
-            if response.dragged() {
-                let ratio_delta = response.drag_delta().y / total_rect.height();
-                let new_top = self.row_ratios[row_idx] + ratio_delta;
-                let new_bottom = self.row_ratios[row_idx + 1] - ratio_delta;
-                if new_top >= MIN_RATIO && new_bottom >= MIN_RATIO {
-                    self.row_ratios[row_idx] = new_top;
-                    self.row_ratios[row_idx + 1] = new_bottom;
-                }
-            }
-            if response.hovered() || response.dragged() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
-            }
+            drag_divider(ui, divider_rect, id, &mut self.row_ratios, row_idx, total_rect.height(), true);
         }
 
         // Vertical dividers (between columns in each row)
@@ -236,21 +224,41 @@ impl PaneLayout {
                     egui::pos2(col_x + DIVIDER_HALF_WIDTH, row_y + row_height),
                 );
                 let id = egui::Id::new(("v_div", row_idx, col_idx));
-                let response = ui.interact(divider_rect, id, egui::Sense::drag());
-                if response.dragged() {
-                    let ratio_delta = response.drag_delta().x / total_rect.width();
-                    let new_left = self.col_ratios[row_idx][col_idx] + ratio_delta;
-                    let new_right = self.col_ratios[row_idx][col_idx + 1] - ratio_delta;
-                    if new_left >= MIN_RATIO && new_right >= MIN_RATIO {
-                        self.col_ratios[row_idx][col_idx] = new_left;
-                        self.col_ratios[row_idx][col_idx + 1] = new_right;
-                    }
-                }
-                if response.hovered() || response.dragged() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                }
+                drag_divider(ui, divider_rect, id, &mut self.col_ratios[row_idx], col_idx, total_rect.width(), false);
             }
             row_y += row_height;
         }
+    }
+}
+
+/// Shared divider drag logic: interact, apply ratio delta, set cursor.
+/// `use_y_axis = true` for horizontal dividers (row splits), `false` for vertical (column splits).
+fn drag_divider(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: egui::Id,
+    ratios: &mut [f32],
+    idx: usize,
+    total_extent: f32,
+    use_y_axis: bool,
+) {
+    let response = ui.interact(rect, id, egui::Sense::drag());
+    if response.dragged() {
+        let delta = if use_y_axis { response.drag_delta().y } else { response.drag_delta().x };
+        let ratio_delta = delta / total_extent;
+        let new_a = ratios[idx] + ratio_delta;
+        let new_b = ratios[idx + 1] - ratio_delta;
+        if new_a >= MIN_RATIO && new_b >= MIN_RATIO {
+            ratios[idx] = new_a;
+            ratios[idx + 1] = new_b;
+        }
+    }
+    if response.hovered() || response.dragged() {
+        let cursor = if use_y_axis {
+            egui::CursorIcon::ResizeVertical
+        } else {
+            egui::CursorIcon::ResizeHorizontal
+        };
+        ui.ctx().set_cursor_icon(cursor);
     }
 }
