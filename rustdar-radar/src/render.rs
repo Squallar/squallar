@@ -153,6 +153,67 @@ impl RenderBuffers {
     }
 }
 
+// ── Sweep / azimuth helpers ──────────────────────────────────────────────────
+
+/// Find the sweep whose first radial matches `elevation_angle` and carries the
+/// requested product's moment data.
+fn find_sweep<'a>(
+    scan: &'a Scan,
+    product: types::RadarProduct,
+    elevation_angle: f32,
+) -> Option<&'a [Radial]> {
+    scan.sweeps().iter().find_map(|sweep| {
+        let matches = sweep
+            .radials()
+            .first()
+            .map(|r| {
+                let rounded = (r.elevation_angle_degrees() * 10.0).round() / 10.0;
+                (rounded - elevation_angle).abs() < 0.05 && product.get_moment(r).is_some()
+            })
+            .unwrap_or(false);
+        matches.then(|| sweep.radials())
+    })
+}
+
+/// Average azimuth spacing (degrees) between consecutive Level II radials.
+fn compute_azimuth_spacing(radials: &[Radial]) -> f64 {
+    let mut prev_azimuth: Option<f64> = None;
+    let mut spacing_sum = 0.0f64;
+    let mut spacing_count = 0u32;
+    for radial in radials {
+        let az = radial.azimuth_angle_degrees() as f64;
+        if let Some(prev) = prev_azimuth {
+            let mut diff = az - prev;
+            if diff < -180.0 {
+                diff += 360.0;
+            } else if diff > 180.0 {
+                diff -= 360.0;
+            }
+            spacing_sum += diff;
+            spacing_count += 1;
+        }
+        prev_azimuth = Some(az);
+    }
+    if spacing_count > 0 {
+        spacing_sum / spacing_count as f64
+    } else {
+        1.0
+    }
+}
+
+/// Maximum range (km) derived from the first radial that carries the given
+/// product's moment data.
+fn compute_max_range(radials: &[Radial], product: types::RadarProduct) -> f64 {
+    radials
+        .iter()
+        .find_map(|radial| {
+            let moment = product.get_moment(radial)?;
+            let gate_count = moment.gate_count() as usize;
+            Some(moment.first_gate_range_km() + gate_count as f64 * moment.gate_interval_km())
+        })
+        .unwrap_or(0.0)
+}
+
 // ── Public rendering functions ───────────────────────────────────────────────
 
 /// Render radar data to an image projected for geographic display.
@@ -167,61 +228,19 @@ pub fn render_radar_to_image(
     radar_lat: f64,
     radar_lon: f64,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
-    // Find the sweep that matches the requested elevation angle.
-    let target_sweep = data.sweeps().iter().find(|sweep| {
-        sweep
-            .radials()
-            .first()
-            .map(|r| {
-                let rounded = (r.elevation_angle_degrees() * 10.0).round() / 10.0;
-                (rounded - elevation_angle).abs() < 0.05 && product.get_moment(r).is_some()
-            })
-            .unwrap_or(false)
-    })?;
+    let radials = find_sweep(data, product, elevation_angle)?;
 
     // NROT is a derived product computed from velocity data
     if product == types::RadarProduct::NormalizedRotation {
-        return render_nrot_to_image(target_sweep.radials(), radar_lat);
+        return render_nrot_to_image(radials, radar_lat);
     }
 
     let bounds = types::ImageBounds::from_radar_site(radar_lat, radar_lon);
     let proj = MercatorProjection::from_bounds(radar_lat, &bounds);
     let bufs = RenderBuffers::new();
-    let radials = target_sweep.radials();
 
-    // Single-pass average azimuth spacing
-    let mut prev_azimuth: Option<f64> = None;
-    let mut spacing_sum = 0.0f64;
-    let mut spacing_count = 0u32;
-    for radial in radials.iter() {
-        let az = radial.azimuth_angle_degrees() as f64;
-        if let Some(prev) = prev_azimuth {
-            let mut diff = az - prev;
-            if diff < -180.0 {
-                diff += 360.0;
-            } else if diff > 180.0 {
-                diff -= 360.0;
-            }
-            spacing_sum += diff;
-            spacing_count += 1;
-        }
-        prev_azimuth = Some(az);
-    }
-    let avg_azimuth_spacing = if spacing_count > 0 {
-        spacing_sum / spacing_count as f64
-    } else {
-        1.0
-    };
-
-    // Compute max range from gate parameters
-    let actual_max_range = radials
-        .iter()
-        .find_map(|radial| {
-            let moment = product.get_moment(radial)?;
-            let gate_count = moment.gate_count() as usize;
-            Some(moment.first_gate_range_km() + gate_count as f64 * moment.gate_interval_km())
-        })
-        .unwrap_or(0.0);
+    let avg_azimuth_spacing = compute_azimuth_spacing(radials);
+    let actual_max_range = compute_max_range(radials, product);
 
     // Process radials in parallel
     radials.par_iter().for_each(|radial| {
