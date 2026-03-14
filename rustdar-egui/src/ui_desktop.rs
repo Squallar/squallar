@@ -2,7 +2,7 @@
 
 use crate::actions::GuiAction;
 use crate::layers::LayerKind;
-use crate::pane::{PaneLayout, PaneState, MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
+
 use egui::Context;
 
 impl super::Gui {
@@ -124,52 +124,7 @@ impl super::Gui {
                 ui.heading("Layers");
                 ui.separator();
 
-                // --- Pane selector (only when multi-pane) ---
-                if self.pane_layout.pane_count > 1 {
-                    ui.horizontal(|ui| {
-                        ui.label("Pane:");
-                        for i in 0..self.pane_layout.pane_count {
-                            let label = format!("{}", i + 1);
-                            if ui.selectable_label(self.active_pane == i, &label).clicked()
-                                && self.active_pane != i
-                            {
-                                self.panes[self.active_pane] = std::mem::take(&mut pane);
-                                self.active_pane = i;
-                                pane = std::mem::take(&mut self.panes[i]);
-                            }
-                        }
-                    });
-                    ui.separator();
-                }
-
-                // --- Pane count selector ---
-                {
-                    let max_panes = if cfg!(target_os = "android") {
-                        MAX_PANES_MOBILE
-                    } else {
-                        MAX_PANES_DESKTOP
-                    };
-                    ui.horizontal(|ui| {
-                        ui.label("Panes:");
-                        for count in 1..=max_panes {
-                            if ui.selectable_label(
-                                self.pane_layout.pane_count == count,
-                                format!("{count}"),
-                            ).clicked() && self.pane_layout.pane_count != count {
-                                self.panes[self.active_pane] = std::mem::take(&mut pane);
-                                while self.panes.len() < count {
-                                    self.panes.push(PaneState::new());
-                                }
-                                self.pane_layout = PaneLayout::for_count(count);
-                                if self.active_pane >= count {
-                                    self.active_pane = 0;
-                                }
-                                pane = std::mem::take(&mut self.panes[self.active_pane]);
-                            }
-                        }
-                    });
-                    ui.separator();
-                }
+                self.render_pane_selector(ui, &mut pane);
 
                 self.render_layer_controls(ui, &mut pane, 120.0, "d_", &mut actions);
             });

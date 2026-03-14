@@ -1,7 +1,7 @@
 #![cfg(target_os = "android")]
 
 use crate::actions::GuiAction;
-use crate::pane::{PaneLayout, PaneState, MAX_PANES_MOBILE};
+use crate::pane::PaneState;
 
 /// Detects a "double-tap and drag" gesture commonly used on touch devices
 /// for one-handed zooming. The gesture flow is:
@@ -254,43 +254,7 @@ impl super::Gui {
                 ui.separator();
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    // -- Pane count selector (mobile: 1-4) --
-                    {
-                        ui.horizontal(|ui| {
-                            ui.label("Panes:");
-                            for count in 1..=MAX_PANES_MOBILE {
-                                if ui.selectable_label(
-                                    self.pane_layout.pane_count == count,
-                                    format!("{count}"),
-                                ).clicked() && self.pane_layout.pane_count != count {
-                                    self.panes[self.active_pane] = std::mem::take(&mut pane);
-                                    while self.panes.len() < count {
-                                        self.panes.push(PaneState::new());
-                                    }
-                                    self.pane_layout = PaneLayout::for_count(count);
-                                    if self.active_pane >= count {
-                                        self.active_pane = 0;
-                                    }
-                                    pane = std::mem::take(&mut self.panes[self.active_pane]);
-                                }
-                            }
-                        });
-                        if self.pane_layout.pane_count > 1 {
-                            ui.horizontal(|ui| {
-                                ui.label("Pane:");
-                                for i in 0..self.pane_layout.pane_count {
-                                    if ui.selectable_label(self.active_pane == i, format!("{}", i + 1)).clicked()
-                                        && self.active_pane != i
-                                    {
-                                        self.panes[self.active_pane] = std::mem::take(&mut pane);
-                                        self.active_pane = i;
-                                        pane = std::mem::take(&mut self.panes[i]);
-                                    }
-                                }
-                            });
-                        }
-                        ui.separator();
-                    }
+                    self.render_pane_selector(ui, &mut pane);
 
                     self.render_layer_controls(ui, &mut pane, 180.0, "m_", &mut actions);
 

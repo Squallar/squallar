@@ -304,6 +304,57 @@ impl Gui {
         action
     }
 
+    /// Render pane count buttons and active-pane selector.
+    ///
+    /// Shared by desktop and mobile layers panels. The caller must pass the
+    /// currently-taken `pane` by mutable reference so this method can swap
+    /// it back into `self.panes` when the active pane changes.
+    fn render_pane_selector(
+        &mut self,
+        ui: &mut egui::Ui,
+        pane: &mut PaneState,
+    ) {
+        let max_panes = if cfg!(target_os = "android") {
+            MAX_PANES_MOBILE
+        } else {
+            MAX_PANES_DESKTOP
+        };
+        ui.horizontal(|ui| {
+            ui.label("Panes:");
+            for count in 1..=max_panes {
+                if ui.selectable_label(
+                    self.pane_layout.pane_count == count,
+                    format!("{count}"),
+                ).clicked() && self.pane_layout.pane_count != count {
+                    self.panes[self.active_pane] = std::mem::take(pane);
+                    while self.panes.len() < count {
+                        self.panes.push(PaneState::new());
+                    }
+                    self.pane_layout = PaneLayout::for_count(count);
+                    if self.active_pane >= count {
+                        self.active_pane = 0;
+                    }
+                    *pane = std::mem::take(&mut self.panes[self.active_pane]);
+                }
+            }
+        });
+        if self.pane_layout.pane_count > 1 {
+            ui.horizontal(|ui| {
+                ui.label("Pane:");
+                for i in 0..self.pane_layout.pane_count {
+                    if ui.selectable_label(self.active_pane == i, format!("{}", i + 1)).clicked()
+                        && self.active_pane != i
+                    {
+                        self.panes[self.active_pane] = std::mem::take(pane);
+                        self.active_pane = i;
+                        *pane = std::mem::take(&mut self.panes[i]);
+                    }
+                }
+            });
+        }
+        ui.separator();
+    }
+
 
     /// Render the layer controls shared by desktop and mobile panels.
     ///
