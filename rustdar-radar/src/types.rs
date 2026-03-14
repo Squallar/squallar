@@ -9,6 +9,8 @@ use crate::sites::get_radar_site;
 pub const IMAGE_SIZE: usize = 1800; // 1800x1800 pixels for radar image
 pub const MAX_RANGE_KM: f64 = 230.0; // NEXRAD max range ~230km
 pub const PIXELS_PER_KM: f64 = IMAGE_SIZE as f64 / (2.0 * MAX_RANGE_KM);
+/// m/s to mph conversion factor.
+pub const MS_TO_MPH: f32 = 2.23694;
 
 /// Convert latitude (in radians) to Web Mercator Y coordinate.
 /// Returns a unitless value; the scale is consistent for relative comparisons.
@@ -359,11 +361,11 @@ impl RadarProduct {
         match self {
             RadarProduct::Reflectivity => format!(" | Reflectivity: {:.1} dBZ", value),
             RadarProduct::Velocity | RadarProduct::StormRelativeVelocity => {
-                let mph = value * 2.23694;
+                let mph = value * MS_TO_MPH;
                 format!(" | {}: {:.1} mph", self.name(), mph)
             }
             RadarProduct::SpectrumWidth => {
-                let mph = value * 2.23694;
+                let mph = value * MS_TO_MPH;
                 format!(" | Spectrum Width: {:.1} mph", mph)
             }
             RadarProduct::DifferentialReflectivity => format!(" | Diff. Reflectivity: {:.2} dB", value),

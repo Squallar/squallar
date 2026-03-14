@@ -88,8 +88,7 @@ pub fn get_color_for_value(product: RadarProduct, value: f32) -> (u8, u8, u8, u8
     }
 }
 
-/// m/s to mph conversion factor.
-const MS_TO_MPH: f32 = 2.23694;
+use crate::types::MS_TO_MPH;
 
 /// Velocity color with m/s->mph conversion and bidirectional handling.
 fn velocity_lookup(velocity_ms: f32) -> (u8, u8, u8, u8) {
