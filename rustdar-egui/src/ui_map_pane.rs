@@ -80,7 +80,12 @@ pub(super) fn render_pane_map_content(
 
         // Overlay radar data if available
         if ctx.pane.layers.is_enabled(LayerKind::Radar) {
-            if let Some(img) = ctx.radar_image {
+            // When a loop is active, prefer the current loop frame's texture
+            let loop_img: Option<RadarImageData> = ctx.pane.loop_state.as_ref().and_then(|ls| {
+                ls.frames.get(ls.current_frame).and_then(|f| f.texture.clone())
+            });
+            let img_ref = loop_img.as_ref().or(ctx.radar_image.as_ref());
+            if let Some(img) = img_ref {
                 render_radar_overlay(ui, projector, img, ctx.pane, ctx.pane_rect);
             }
         }
