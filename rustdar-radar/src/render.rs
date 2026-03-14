@@ -8,6 +8,9 @@ use crate::types;
 // ── Shared rendering infrastructure ──────────────────────────────────────────
 
 /// Pre-computed Web Mercator projection constants for a radar station.
+///
+/// Derived from [`types::ImageBounds`] so the rendered pixel grid aligns
+/// exactly with the bounds reported to the UI layer.
 struct MercatorProjection {
     radar_lat_rad: f64,
     cos_radar_lat: f64,
@@ -17,21 +20,15 @@ struct MercatorProjection {
 }
 
 impl MercatorProjection {
-    fn new(radar_lat: f64) -> Self {
+    fn from_bounds(radar_lat: f64, bounds: &types::ImageBounds) -> Self {
         let radar_lat_rad = radar_lat.to_radians();
-        let cos_radar_lat = radar_lat_rad.cos();
-        let center_px = types::IMAGE_SIZE as f64 / 2.0;
-        let merc_y_top =
-            types::lat_rad_to_mercator_y(radar_lat_rad + types::MAX_RANGE_KM / 6371.0);
-        let merc_y_bottom =
-            types::lat_rad_to_mercator_y(radar_lat_rad - types::MAX_RANGE_KM / 6371.0);
-        let merc_y_scale = types::IMAGE_SIZE as f64 / (merc_y_top - merc_y_bottom);
         Self {
             radar_lat_rad,
-            cos_radar_lat,
-            center_px,
-            merc_y_top,
-            merc_y_scale,
+            cos_radar_lat: radar_lat_rad.cos(),
+            center_px: types::IMAGE_SIZE as f64 / 2.0,
+            merc_y_top: bounds.mercator_y_max,
+            merc_y_scale: types::IMAGE_SIZE as f64
+                / (bounds.mercator_y_max - bounds.mercator_y_min),
         }
     }
 
@@ -168,7 +165,7 @@ pub fn render_radar_to_image(
     elevation_angle: f32,
     product: types::RadarProduct,
     radar_lat: f64,
-    _radar_lon: f64,
+    radar_lon: f64,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     // Find the sweep that matches the requested elevation angle.
     let target_sweep = data.sweeps().iter().find(|sweep| {
@@ -187,7 +184,8 @@ pub fn render_radar_to_image(
         return render_nrot_to_image(target_sweep.radials(), radar_lat);
     }
 
-    let proj = MercatorProjection::new(radar_lat);
+    let bounds = types::ImageBounds::from_radar_site(radar_lat, radar_lon);
+    let proj = MercatorProjection::from_bounds(radar_lat, &bounds);
     let bufs = RenderBuffers::new();
     let radials = target_sweep.radials();
 
@@ -341,7 +339,8 @@ fn render_nrot_to_image(
         })
         .collect();
 
-    let proj = MercatorProjection::new(radar_lat);
+    let bounds = types::ImageBounds::from_radar_site(radar_lat, 0.0);
+    let proj = MercatorProjection::from_bounds(radar_lat, &bounds);
     let bufs = RenderBuffers::new();
 
     // Render NROT grid to image in parallel
@@ -393,7 +392,7 @@ pub fn render_level3_radial_to_image(
     radial_packet: &nexrad_level3::model::RadialPacket,
     product: types::RadarProduct,
     radar_lat: f64,
-    _radar_lon: f64,
+    radar_lon: f64,
     scale: f32,
     offset: f32,
     lut: Option<&[f32]>,
@@ -407,7 +406,8 @@ pub fn render_level3_radial_to_image(
     let num_bins = radial_packet.num_range_bins as usize;
     let actual_max_range = first_gate_range + num_bins as f64 * gate_interval;
 
-    let proj = MercatorProjection::new(radar_lat);
+    let bounds = types::ImageBounds::from_radar_site(radar_lat, radar_lon);
+    let proj = MercatorProjection::from_bounds(radar_lat, &bounds);
     let bufs = RenderBuffers::new();
     let radials = &radial_packet.radials;
 
