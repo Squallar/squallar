@@ -548,12 +548,12 @@ pub fn render_level3_message_to_image(
     // Build scale, offset, and optional LUT from the product description block
     let scale = l3_msg.pdb.data_scale();
     let offset = l3_msg.pdb.data_offset();
-    let vil_lut = l3_msg.pdb.build_vil_lut();
+    let vil_lut = build_vil_lut(&l3_msg.pdb);
     let legacy_lut;
     let lut: Option<&[f32]> = if vil_lut.is_some() {
         vil_lut.as_deref()
     } else if rp.is_legacy {
-        legacy_lut = l3_msg.pdb.decode_legacy_thresholds();
+        legacy_lut = decode_legacy_thresholds(&l3_msg.pdb);
         Some(legacy_lut.as_slice())
     } else {
         None
@@ -565,6 +565,87 @@ pub fn render_level3_message_to_image(
     );
 
     render_level3_radial_to_image(rp, product, radar_lat, radar_lon, scale, offset, lut)
+}
+
+/// Build a 256-entry look-up table for Digital VIL (product 134).
+///
+/// VIL uses a hybrid linear + logarithmic mapping encoded with
+/// NEXRAD-specific 16-bit floats (not IEEE-754).  The first five
+/// thresholds carry: lin_scale, lin_offset, log_start, log_scale,
+/// log_offset.  Gate values 2..log_start use a linear formula;
+/// gate values log_start..254 use an exponential formula.
+///
+/// Returns `None` when the product code is not 134.
+fn build_vil_lut(pdb: &nexrad_level3::model::ProductDescriptionBlock) -> Option<Vec<f32>> {
+    if pdb.product_code != 134 {
+        return None;
+    }
+    let lin_scale = nexrad_float16(pdb.thresholds[0]);
+    let lin_offset = nexrad_float16(pdb.thresholds[1]);
+    let log_start = pdb.thresholds[2] as usize;
+    let log_scale = nexrad_float16(pdb.thresholds[3]);
+    let log_offset = nexrad_float16(pdb.thresholds[4]);
+
+    let mut lut = vec![f32::NAN; 256];
+    // Gate 0 = below threshold, gate 1 = range folded → NaN
+    for i in 2..log_start.min(255) {
+        lut[i] = (i as f32 - lin_offset) / lin_scale;
+    }
+    for i in log_start.min(255)..255 {
+        lut[i] = ((i as f32 - log_offset) / log_scale).exp();
+    }
+    // Gate 255 is reserved
+    Some(lut)
+}
+
+/// Decode the 16 legacy data level thresholds into physical values.
+///
+/// For legacy products (e.g., code 56 SRM), each threshold `u16` encodes
+/// a physical value with flag bits in the high byte and the numeric value
+/// in the low byte. Returns a 16-element array where `NaN` means the
+/// level is not displayable (blank, threshold, no data, or range-folded).
+fn decode_legacy_thresholds(pdb: &nexrad_level3::model::ProductDescriptionBlock) -> [f32; 16] {
+    let mut lut = [f32::NAN; 16];
+    for (i, &t) in pdb.thresholds.iter().enumerate() {
+        let codes = (t >> 8) as u8;
+        let mut val = (t & 0xFF) as f32;
+
+        if codes & 0x80 != 0 {
+            // Special category: Blank, TH (below threshold),
+            // ND (no data), RF (range folded) → not displayable
+            continue;
+        } else if codes & 0x40 != 0 {
+            val *= 0.01;
+        } else if codes & 0x20 != 0 {
+            val *= 0.05;
+        } else if codes & 0x10 != 0 {
+            val *= 0.1;
+        }
+
+        if codes & 0x01 != 0 {
+            val = -val;
+        }
+
+        lut[i] = val;
+    }
+    lut
+}
+
+/// Decode a NEXRAD-specific 16-bit floating-point value.
+///
+/// Format: sign (bit 15), exponent (bits 14–10), fraction (bits 9–0).
+/// value = (-1)^sign × 2^(exp − 16) × (1 + frac/1024)  when exp ≠ 0
+/// value = (-1)^sign × frac / 512                        when exp = 0
+fn nexrad_float16(raw: u16) -> f32 {
+    let frac = (raw & 0x03FF) as f32;
+    let exp = ((raw >> 10) & 0x1F) as i32;
+    let sign = raw >> 15;
+    let value = if exp != 0 {
+        2f32.powi(exp - 16) * (1.0 + frac / 1024.0)
+    } else {
+        frac / 512.0
+    };
+    if sign != 0 { -value } else { value }
 }
 
 /// Convert a Level III gate byte to a physical value, applying LUT or scale/offset
