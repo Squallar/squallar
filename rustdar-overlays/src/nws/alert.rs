@@ -44,71 +44,27 @@ impl std::fmt::Display for AlertCategory {
     }
 }
 
-/// Severity level from the NWS API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AlertSeverity {
-    Extreme,
-    Severe,
-    Moderate,
-    Minor,
-    Unknown,
-}
+/// Generates a fieldless enum with a `from_str` method that maps variant names
+/// to values, falling back to `Unknown` for unrecognized strings.
+macro_rules! str_enum {
+    ($name:ident { $($variant:ident),+ $(,)? }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum $name { $($variant,)+ Unknown }
 
-impl AlertSeverity {
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "Extreme" => Self::Extreme,
-            "Severe" => Self::Severe,
-            "Moderate" => Self::Moderate,
-            "Minor" => Self::Minor,
-            _ => Self::Unknown,
+        impl $name {
+            pub fn from_str(s: &str) -> Self {
+                match s {
+                    $(stringify!($variant) => Self::$variant,)+
+                    _ => Self::Unknown,
+                }
+            }
         }
-    }
+    };
 }
 
-/// Urgency level from the NWS API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AlertUrgency {
-    Immediate,
-    Expected,
-    Future,
-    Past,
-    Unknown,
-}
-
-impl AlertUrgency {
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "Immediate" => Self::Immediate,
-            "Expected" => Self::Expected,
-            "Future" => Self::Future,
-            "Past" => Self::Past,
-            _ => Self::Unknown,
-        }
-    }
-}
-
-/// Certainty level from the NWS API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AlertCertainty {
-    Observed,
-    Likely,
-    Possible,
-    Unlikely,
-    Unknown,
-}
-
-impl AlertCertainty {
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "Observed" => Self::Observed,
-            "Likely" => Self::Likely,
-            "Possible" => Self::Possible,
-            "Unlikely" => Self::Unlikely,
-            _ => Self::Unknown,
-        }
-    }
-}
+str_enum!(AlertSeverity { Extreme, Severe, Moderate, Minor });
+str_enum!(AlertUrgency { Immediate, Expected, Future, Past });
+str_enum!(AlertCertainty { Observed, Likely, Possible, Unlikely });
 
 /// A single NWS weather alert with parsed metadata and renderable geometry.
 #[derive(Debug, Clone)]
