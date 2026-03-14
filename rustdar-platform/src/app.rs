@@ -207,7 +207,9 @@ impl App {
     /// Process all GUI actions emitted during this frame.
     fn process_gui_actions(&mut self, actions: Vec<GuiAction>) {
         for action in actions {
-            log::debug!("GUI action received: {}", action);
+            if !matches!(action, GuiAction::RenderOverlay { .. }) {
+                log::debug!("GUI action received: {}", action);
+            }
             self.handle_gui_action(action, None);
         }
     }
