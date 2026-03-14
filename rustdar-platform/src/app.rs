@@ -61,6 +61,8 @@ pub struct App {
     tokio_runtime: tokio::runtime::Runtime,
     // Shared HTTP client for overlay data fetches (SPC, etc.)
     http_client: reqwest::Client,
+    // Downloaded scan data cache for loop frames, keyed by (pane_idx, timestamp).
+    loop_scan_cache: std::collections::HashMap<usize, std::collections::HashMap<chrono::NaiveDateTime, Arc<nexrad_model::data::Scan>>>,
 }
 
 impl Default for App {
@@ -107,6 +109,7 @@ impl App {
             exit_requested: false,
             http_client,
             tokio_runtime,
+            loop_scan_cache: std::collections::HashMap::new(),
         }
     }
 
