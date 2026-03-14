@@ -1,4 +1,6 @@
 use rustdar_overlays::spc::colors::md_stroke_color;
+use rustdar_overlays::nws::alert::NwsAlert;
+use rustdar_overlays::spc::discussion::SpcDiscussion;
 
 /// Format an ISO 8601 timestamp into a shorter human-readable form.
 /// Falls back to displaying the raw string on parse errors.
@@ -47,6 +49,94 @@ fn show_detail_popup(
     !open
 }
 
+/// Render the content of an NWS alert detail popup.
+/// Returns `true` if the "Hide from map" button was clicked.
+fn alert_popup_content(ui: &mut egui::Ui, alert: &NwsAlert, accent: egui::Color32) -> bool {
+    // Headline
+    if let Some(headline) = &alert.headline {
+        ui.label(egui::RichText::new(headline).strong().size(if IS_MOBILE { 13.0 } else { 14.0 }));
+        ui.add_space(4.0);
+    }
+
+    // Metadata grid
+    egui::Grid::new("alert_meta").num_columns(2).show(ui, |ui| {
+        ui.label(egui::RichText::new("Areas:").strong());
+        ui.add(egui::Label::new(&alert.area_desc).wrap());
+        ui.end_row();
+
+        ui.label(egui::RichText::new("Issued by:").strong());
+        ui.add(egui::Label::new(&alert.sender_name).wrap());
+        ui.end_row();
+
+        ui.label(egui::RichText::new("Effective:").strong());
+        ui.label(format_iso_time(&alert.effective));
+        ui.end_row();
+
+        ui.label(egui::RichText::new("Expires:").strong());
+        ui.label(format_iso_time(&alert.expires));
+        ui.end_row();
+    });
+
+    ui.separator();
+
+    // Description (scrollable)
+    egui::ScrollArea::vertical()
+        .max_height(250.0)
+        .show(ui, |ui| {
+            ui.label(&alert.description);
+        });
+
+    // Instruction (emphasized)
+    if let Some(instruction) = &alert.instruction {
+        ui.add_space(4.0);
+        ui.separator();
+        ui.label(
+            egui::RichText::new(instruction)
+                .strong()
+                .color(accent),
+        );
+    }
+
+    ui.add_space(6.0);
+    ui.separator();
+    ui.button("\u{1f6ab}  Hide from map").clicked()
+}
+
+/// Render the content of an SPC Mesoscale Discussion popup.
+fn md_popup_content(ui: &mut egui::Ui, md: &SpcDiscussion, accent: egui::Color32) {
+    // Type badge
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(format!("Type: {}", md.md_type)).strong().color(accent));
+    });
+
+    // Concerning line
+    if let Some(ref concerning) = md.concerning {
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new(format!("Concerning: {}", concerning)).strong());
+    }
+
+    ui.add_space(4.0);
+    ui.separator();
+
+    // Full discussion text (scrollable)
+    egui::ScrollArea::vertical()
+        .max_height(if IS_MOBILE { 300.0 } else { 350.0 })
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(&md.text)
+                    .font(egui::FontId::monospace(if IS_MOBILE { 11.0 } else { 12.0 }))
+            );
+        });
+
+    ui.add_space(4.0);
+    ui.separator();
+
+    // Link to SPC
+    if !md.link.is_empty() {
+        ui.hyperlink_to("Open on SPC website", &md.link);
+    }
+}
+
 impl super::Gui {
     /// Render the NWS alert detail popup when an alert is selected.
     pub(super) fn render_alert_popup(&mut self, ctx: &egui::Context) {
@@ -58,16 +148,7 @@ impl super::Gui {
             return;
         };
 
-        // Clone data needed for the popup to avoid borrowing issues
         let alert_id = alert.id.clone();
-        let event = alert.event.clone();
-        let headline = alert.headline.clone();
-        let area_desc = alert.area_desc.clone();
-        let sender_name = alert.sender_name.clone();
-        let effective = alert.effective.clone();
-        let expires = alert.expires.clone();
-        let description = alert.description.clone();
-        let instruction = alert.instruction.clone();
         let [r, g, b, _] = alert.features.first()
             .map(|f| f.stroke_rgba)
             .unwrap_or([200, 200, 200, 255]);
@@ -77,59 +158,10 @@ impl super::Gui {
         let closed = show_detail_popup(
             ctx,
             "nws_alert_popup",
-            egui::RichText::new(&event).color(accent).strong(),
+            egui::RichText::new(&alert.event).color(accent).strong(),
             380.0,
             |ui| {
-                // Headline
-                if let Some(headline) = &headline {
-                    ui.label(egui::RichText::new(headline).strong().size(if IS_MOBILE { 13.0 } else { 14.0 }));
-                    ui.add_space(4.0);
-                }
-
-                // Metadata grid
-                egui::Grid::new("alert_meta").num_columns(2).show(ui, |ui| {
-                    ui.label(egui::RichText::new("Areas:").strong());
-                    ui.add(egui::Label::new(&area_desc).wrap());
-                    ui.end_row();
-
-                    ui.label(egui::RichText::new("Issued by:").strong());
-                    ui.add(egui::Label::new(&sender_name).wrap());
-                    ui.end_row();
-
-                    ui.label(egui::RichText::new("Effective:").strong());
-                    ui.label(format_iso_time(&effective));
-                    ui.end_row();
-
-                    ui.label(egui::RichText::new("Expires:").strong());
-                    ui.label(format_iso_time(&expires));
-                    ui.end_row();
-                });
-
-                ui.separator();
-
-                // Description (scrollable)
-                egui::ScrollArea::vertical()
-                    .max_height(250.0)
-                    .show(ui, |ui| {
-                        ui.label(&description);
-                    });
-
-                // Instruction (emphasized)
-                if let Some(instruction) = &instruction {
-                    ui.add_space(4.0);
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(instruction)
-                            .strong()
-                            .color(accent),
-                    );
-                }
-
-                ui.add_space(6.0);
-                ui.separator();
-                if ui.button("\u{1f6ab}  Hide from map").clicked() {
-                    hide_clicked = true;
-                }
+                hide_clicked = alert_popup_content(ui, alert, accent);
             },
         );
 
@@ -153,54 +185,18 @@ impl super::Gui {
             return;
         };
 
-        // Clone data to avoid borrow issues
-        let number = md.number;
-        let md_type = md.md_type;
-        let concerning = md.concerning.clone();
-        let text = md.text.clone();
-        let link = md.link.clone();
-        let stroke_rgba = md_stroke_color(&md_type);
+        let stroke_rgba = md_stroke_color(&md.md_type);
         let [r, g, b, _] = stroke_rgba;
         let accent = egui::Color32::from_rgb(r, g, b);
 
-        let title = format!("Mesoscale Discussion #{:04}", number);
+        let title = format!("Mesoscale Discussion #{:04}", md.number);
         let closed = show_detail_popup(
             ctx,
             "spc_md_popup",
             egui::RichText::new(&title).color(accent).strong(),
             420.0,
             |ui| {
-                // Type badge
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("Type: {}", md_type)).strong().color(accent));
-                });
-
-                // Concerning line
-                if let Some(ref concerning) = concerning {
-                    ui.add_space(2.0);
-                    ui.label(egui::RichText::new(format!("Concerning: {}", concerning)).strong());
-                }
-
-                ui.add_space(4.0);
-                ui.separator();
-
-                // Full discussion text (scrollable)
-                egui::ScrollArea::vertical()
-                    .max_height(if IS_MOBILE { 300.0 } else { 350.0 })
-                    .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new(&text)
-                                .font(egui::FontId::monospace(if IS_MOBILE { 11.0 } else { 12.0 }))
-                        );
-                    });
-
-                ui.add_space(4.0);
-                ui.separator();
-
-                // Link to SPC
-                if !link.is_empty() {
-                    ui.hyperlink_to("Open on SPC website", &link);
-                }
+                md_popup_content(ui, md, accent);
             },
         );
 
