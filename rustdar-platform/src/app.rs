@@ -7,13 +7,11 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::KeyCode;
 use winit::window::{Window, WindowId};
 
-#[cfg(target_os = "android")]
-use rustdar_android_theme as android_theme;
-
 use crate::WindowRef;
 use crate::app_state;
 use crate::constants::*;
 use crate::input::InputHandler;
+use crate::platform::{self, PlatformBridge};
 use chrono::TimeZone;
 use rustdar_egui::{
     Gui,
@@ -80,6 +78,7 @@ pub struct App {
     gui: Gui,
     scan_data: Option<Arc<nexrad_model::data::Scan>>,
     input: InputHandler,
+    platform: Box<dyn PlatformBridge>,
     scan_receiver: Receiver<ScanResult>,
     scan_sender: Sender<ScanResult>,
     // Channel for background radar render results
@@ -104,10 +103,6 @@ pub struct App {
     cached_dark_theme: Option<bool>,
     // Track the last applied visuals theme to skip redundant set_visuals calls
     applied_visuals_dark: Option<bool>,
-    // Channel to receive theme change notifications (Android only;
-    // desktop platforms use WindowEvent::ThemeChanged instead)
-    #[cfg(target_os = "android")]
-    theme_receiver: std::sync::mpsc::Receiver<bool>,
     // Flag for deferred exit when event_loop isn't available during redraw
     exit_requested: bool,
     // Shared Tokio runtime for all async network requests
@@ -123,19 +118,6 @@ pub struct App {
     // Channel for SPC Mesoscale Discussion fetch results
     discussion_receiver: Receiver<DiscussionResult>,
     discussion_sender: Sender<DiscussionResult>,
-    // Channel to receive GPS location updates (Android only)
-    #[cfg(target_os = "android")]
-    location_receiver: Option<std::sync::mpsc::Receiver<(f64, f64)>>,
-    // Persistent cache directory for NWS zone boundary geometries.
-    // Avoids re-fetching 1000+ zone HTTP requests on every app launch.
-    zone_cache_dir: Option<std::path::PathBuf>,
-    // Optional callback for back-button behavior (e.g. moveTaskToBack on Android).
-    // When None, back button exits the app.
-    back_handler: Option<fn()>,
-    // Optional callback to query system bar insets (returns logical top, bottom, left, right).
-    // Called during resumed() when the window is ready.
-    #[cfg(target_os = "android")]
-    insets_querier: Option<fn() -> (f32, f32, f32, f32)>,
 }
 
 impl Default for App {
@@ -155,15 +137,7 @@ impl App {
         let (discussion_sender, discussion_receiver) = std::sync::mpsc::channel();
         let (level3_sender, level3_receiver) = std::sync::mpsc::channel();
 
-        // Setup theme monitoring (Android only — desktop uses WindowEvent::ThemeChanged)
-        #[cfg(target_os = "android")]
-        let theme_receiver = {
-            let (theme_sender, theme_receiver) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                Self::monitor_theme_changes(theme_sender);
-            });
-            theme_receiver
-        };
+        let platform = Box::new(platform::create_platform());
 
         let tokio_runtime = tokio::runtime::Runtime::new()
             .expect("Failed to create Tokio runtime");
@@ -190,6 +164,7 @@ impl App {
             scan_sender,
             render_result_receiver,
             render_result_sender,
+            platform,
             pane_render: vec![PaneRenderState::new()],
             level3_data: HashMap::new(),
             level3_receiver,
@@ -200,8 +175,6 @@ impl App {
             old_textures: Vec::new(),
             cached_dark_theme: None,
             applied_visuals_dark: None,
-            #[cfg(target_os = "android")]
-            theme_receiver,
             exit_requested: false,
             http_client,
             outlook_sender,
@@ -211,52 +184,6 @@ impl App {
             discussion_sender,
             discussion_receiver,
             tokio_runtime,
-            zone_cache_dir: Self::default_zone_cache_dir(),
-            #[cfg(target_os = "android")]
-            location_receiver: None,
-            back_handler: None,
-            #[cfg(target_os = "android")]
-            insets_querier: None,
-        }
-    }
-
-    /// Detect system dark theme using the proper libraries for each platform
-    fn detect_system_dark_theme() -> bool {
-        #[cfg(target_os = "android")]
-        {
-            android_theme::detect_dark_theme()
-        }
-        
-        #[cfg(not(target_os = "android"))]
-        {
-            // Use dark-light crate for desktop platforms (Windows, macOS, Linux, BSDs)
-            match dark_light::detect() {
-                Ok(dark_light::Mode::Dark) => true,
-                Ok(dark_light::Mode::Light) => false,
-                Ok(dark_light::Mode::Unspecified) => false, // Default to light when unspecified
-                Err(_) => false, // Default to light on error
-            }
-        }
-    }
-
-    /// Monitor theme changes in a background thread (Android only)
-    #[cfg(target_os = "android")]
-    fn monitor_theme_changes(sender: std::sync::mpsc::Sender<bool>) {
-        // Initial detection
-        let mut last_theme = Self::detect_system_dark_theme();
-        let _ = sender.send(last_theme);
-        
-        // Poll for changes every 2 seconds
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            let current_theme = Self::detect_system_dark_theme();
-            if current_theme != last_theme {
-                last_theme = current_theme;
-                if sender.send(current_theme).is_err() {
-                    // Channel closed, exit the thread
-                    break;
-                }
-            }
         }
     }
 
@@ -288,9 +215,8 @@ impl App {
         // Clear per-frame input state at the start of each frame
         self.input.clear_frame_state();
 
-        // Check for theme changes from background thread (Android only)
-        #[cfg(target_os = "android")]
-        while let Ok(new_theme) = self.theme_receiver.try_recv() {
+        // Poll for platform-specific theme and location changes
+        if let Some(new_theme) = self.platform.poll_theme() {
             if self.cached_dark_theme != Some(new_theme) {
                 self.cached_dark_theme = Some(new_theme);
                 if let Some(window) = self.window.as_ref() {
@@ -298,17 +224,8 @@ impl App {
                 }
             }
         }
-
-        // Check for GPS location updates (Android only)
-        #[cfg(target_os = "android")]
-        if let Some(ref receiver) = self.location_receiver {
-            let mut latest = None;
-            while let Ok(loc) = receiver.try_recv() {
-                latest = Some(loc);
-            }
-            if let Some((lat, lon)) = latest {
-                self.gui.set_user_location(lat, lon);
-            }
+        if let Some((lat, lon)) = self.platform.poll_location() {
+            self.gui.set_user_location(lat, lon);
         }
 
         self.poll_data_channels();
@@ -486,7 +403,7 @@ impl App {
                     match self.cached_dark_theme {
                         Some(cached) => cached,
                         None => {
-                            let detected = Self::detect_system_dark_theme();
+                            let detected = self.platform.detect_dark_theme();
                             self.cached_dark_theme = Some(detected);
                             detected
                         }
@@ -989,7 +906,7 @@ impl App {
                 let client = self.http_client.clone();
                 let sender = self.alert_sender.clone();
                 let window = self.window.clone();
-                let zone_cache = self.zone_cache_dir.clone();
+                let zone_cache = self.platform.zone_cache_dir().map(|p| p.to_path_buf());
                 self.tokio_runtime.spawn(async move {
                     let result =
                         rustdar_overlays::nws::fetch::fetch_active_alerts(
@@ -1033,11 +950,9 @@ impl App {
         if let Some(event_loop) = event_loop {
             log::info!("Exiting application");
             event_loop.exit();
-            // On Android, event_loop.exit() just stops the event loop but
-            // leaves the NativeActivity window visible as a grey screen.
-            // Terminate the process to fully close the application.
-            #[cfg(target_os = "android")]
-            std::process::exit(0);
+            if self.platform.needs_process_exit() {
+                std::process::exit(0);
+            }
         } else {
             // Defer exit until the next event where event_loop is available
             self.exit_requested = true;
@@ -1045,52 +960,37 @@ impl App {
     }
 
     /// Set a callback to handle the back button (e.g. moveTaskToBack on Android).
-    /// When set, pressing back invokes this instead of exiting.
     pub fn set_back_handler(&mut self, handler: fn()) {
-        self.back_handler = Some(handler);
+        self.platform.set_back_handler(handler);
     }
 
     /// Override the zone geometry cache directory.
-    /// Called from the Android entry point with the app's internal data path.
     pub fn set_zone_cache_dir(&mut self, dir: std::path::PathBuf) {
-        self.zone_cache_dir = Some(dir);
-    }
-
-    /// Determine a platform-appropriate cache directory for zone geometries.
-    fn default_zone_cache_dir() -> Option<std::path::PathBuf> {
-        // On Android, set externally via set_zone_cache_dir()
-        #[cfg(target_os = "android")]
-        { return None; }
-
-        #[cfg(not(target_os = "android"))]
-        {
-            let base = std::env::var("XDG_CACHE_HOME")
-                .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.cache", h)))
-                .or_else(|_| std::env::var("LOCALAPPDATA"))
-                .ok()?;
-            Some(std::path::PathBuf::from(base).join("rustdar").join("zones"))
-        }
+        self.platform.set_zone_cache_dir(dir);
     }
 
     /// Set a receiver for GPS location updates (Android only).
-    /// Called from the Android entry point after starting a location polling thread.
     #[cfg(target_os = "android")]
     pub fn set_location_receiver(&mut self, receiver: std::sync::mpsc::Receiver<(f64, f64)>) {
-        self.location_receiver = Some(receiver);
+        use crate::platform::AndroidPlatform;
+        if let Some(android) = self.platform.as_any_mut().downcast_mut::<AndroidPlatform>() {
+            android.set_location_receiver(receiver);
+        }
     }
 
     /// Set safe area insets in logical pixels (top, bottom, left, right).
-    /// Called from the Android entry point to avoid drawing under system bars.
     #[cfg(target_os = "android")]
     pub fn set_safe_area_insets(&mut self, top: f32, bottom: f32, left: f32, right: f32) {
         self.gui.set_safe_area_insets(top, bottom, left, right);
     }
 
     /// Set a callback that queries system bar insets.
-    /// Called lazily during resumed() when the window is available.
     #[cfg(target_os = "android")]
     pub fn set_insets_querier(&mut self, querier: fn() -> (f32, f32, f32, f32)) {
-        self.insets_querier = Some(querier);
+        use crate::platform::AndroidPlatform;
+        if let Some(android) = self.platform.as_any_mut().downcast_mut::<AndroidPlatform>() {
+            android.set_insets_querier(querier);
+        }
     }
 
     fn handle_input_events(&mut self, event_loop: &ActiveEventLoop) {
@@ -1099,9 +999,7 @@ impl App {
         }
 
         if self.input.back_pressed() {
-            if let Some(handler) = self.back_handler {
-                handler();
-            } else {
+            if !self.platform.handle_back() {
                 self.request_exit(Some(event_loop));
             }
         }
@@ -1129,10 +1027,7 @@ impl ApplicationHandler for App {
         self.create_window(event_loop);
 
         // Query system bar insets now that the window is ready.
-        // On config changes (fold/unfold) the insets may differ.
-        #[cfg(target_os = "android")]
-        if let Some(querier) = self.insets_querier {
-            let (top, bottom, left, right) = querier();
+        if let Some((top, bottom, left, right)) = self.platform.query_insets() {
             self.gui.set_safe_area_insets(top, bottom, left, right);
         }
     }

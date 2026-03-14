@@ -75,7 +75,6 @@ pub struct Gui {
     double_tap_detector: DoubleTapDragDetector,
     // Safe area insets in logical pixels (top, bottom, left, right)
     // Used on Android to avoid drawing under system bars.
-    #[cfg(target_os = "android")]
     safe_area_insets: (f32, f32, f32, f32),
 }
 
@@ -123,7 +122,6 @@ impl Gui {
             show_mobile_menu: false,
             #[cfg(target_os = "android")]
             double_tap_detector: DoubleTapDragDetector::default(),
-            #[cfg(target_os = "android")]
             safe_area_insets: (0.0, 0.0, 0.0, 0.0),
         }
     }
@@ -1185,7 +1183,6 @@ impl Gui {
     /// Set the user's GPS location for the blue dot indicator
     /// Set safe area insets in logical pixels (top, bottom, left, right).
     /// On Android, this compensates for the status bar and navigation bar.
-    #[cfg(target_os = "android")]
     pub fn set_safe_area_insets(&mut self, top: f32, bottom: f32, left: f32, right: f32) {
         self.safe_area_insets = (top, bottom, left, right);
     }
