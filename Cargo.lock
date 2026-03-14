@@ -3784,6 +3784,8 @@ dependencies = [
  "egui",
  "rustdar-overlays",
  "rustdar-radar",
+ "serde",
+ "serde_json",
  "walkers",
 ]
 
