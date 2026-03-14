@@ -784,10 +784,7 @@ impl App {
     /// Set a receiver for GPS location updates (Android only).
     #[cfg(target_os = "android")]
     pub fn set_location_receiver(&mut self, receiver: std::sync::mpsc::Receiver<(f64, f64)>) {
-        use crate::platform::AndroidPlatform;
-        if let Some(android) = self.platform.as_any_mut().downcast_mut::<AndroidPlatform>() {
-            android.set_location_receiver(receiver);
-        }
+        self.platform.set_location_receiver(receiver);
     }
 
     /// Set safe area insets in logical pixels (top, bottom, left, right).
@@ -799,10 +796,7 @@ impl App {
     /// Set a callback that queries system bar insets.
     #[cfg(target_os = "android")]
     pub fn set_insets_querier(&mut self, querier: fn() -> (f32, f32, f32, f32)) {
-        use crate::platform::AndroidPlatform;
-        if let Some(android) = self.platform.as_any_mut().downcast_mut::<AndroidPlatform>() {
-            android.set_insets_querier(querier);
-        }
+        self.platform.set_insets_querier(querier);
     }
 
     fn handle_input_events(&mut self, event_loop: &ActiveEventLoop) {

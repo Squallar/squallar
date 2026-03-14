@@ -1,6 +1,6 @@
 /// Platform-specific behavior abstracted behind a common trait.
 /// Keeps `#[cfg(target_os = "android")]` blocks out of `app.rs`.
-pub trait PlatformBridge: std::any::Any {
+pub trait PlatformBridge {
     /// Poll for theme changes from the OS. Returns `Some(is_dark)` when
     /// a change is detected, `None` otherwise.
     fn poll_theme(&mut self) -> Option<bool>;
@@ -32,8 +32,11 @@ pub trait PlatformBridge: std::any::Any {
     /// `std::process::exit` (Android), `false` for normal event-loop exit.
     fn needs_process_exit(&self) -> bool;
 
-    /// Downcast support for platform-specific methods.
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+    /// Set a receiver for GPS location updates (Android only, no-op on desktop).
+    fn set_location_receiver(&mut self, _receiver: std::sync::mpsc::Receiver<(f64, f64)>) {}
+
+    /// Set a callback that queries system bar insets (Android only, no-op on desktop).
+    fn set_insets_querier(&mut self, _querier: fn() -> (f32, f32, f32, f32)) {}
 }
 
 // ── Desktop implementation ──────────────────────────────────────────────
@@ -108,10 +111,6 @@ impl PlatformBridge for DesktopPlatform {
     fn needs_process_exit(&self) -> bool {
         false
     }
-
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
 }
 
 // ── Android implementation ──────────────────────────────────────────────
@@ -153,14 +152,6 @@ impl AndroidPlatform {
             back_handler: None,
             zone_cache_dir: None,
         }
-    }
-
-    pub fn set_location_receiver(&mut self, receiver: std::sync::mpsc::Receiver<(f64, f64)>) {
-        self.location_receiver = Some(receiver);
-    }
-
-    pub fn set_insets_querier(&mut self, querier: fn() -> (f32, f32, f32, f32)) {
-        self.insets_querier = Some(querier);
     }
 }
 
@@ -216,8 +207,12 @@ impl PlatformBridge for AndroidPlatform {
         true
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
+    fn set_location_receiver(&mut self, receiver: std::sync::mpsc::Receiver<(f64, f64)>) {
+        self.location_receiver = Some(receiver);
+    }
+
+    fn set_insets_querier(&mut self, querier: fn() -> (f32, f32, f32, f32)) {
+        self.insets_querier = Some(querier);
     }
 }
 
