@@ -1,6 +1,7 @@
 use rustdar_overlays::spc::colors::md_stroke_color;
 use rustdar_overlays::nws::alert::NwsAlert;
 use rustdar_overlays::spc::discussion::SpcDiscussion;
+use rustdar_overlays::render::overlay_state::SelectedOverlay;
 
 /// Format an ISO 8601 timestamp into a shorter human-readable form.
 /// Falls back to displaying the raw string on parse errors.
@@ -138,70 +139,112 @@ fn md_popup_content(ui: &mut egui::Ui, md: &SpcDiscussion, accent: egui::Color32
 }
 
 impl super::Gui {
-    /// Render the NWS alert detail popup when an alert is selected.
-    pub(super) fn render_alert_popup(&mut self, ctx: &egui::Context) {
-        let Some(idx) = self.overlays.selected_alert else {
+    /// Render the overlay detail pager popup.
+    ///
+    /// Shows the currently selected overlay item (alert or MD) with
+    /// prev/next navigation when multiple overlays are stacked.
+    pub(super) fn render_overlay_popup(&mut self, ctx: &egui::Context) {
+        if self.overlays.selected_overlays.is_empty() {
             return;
-        };
-        let Some(alert) = self.overlays.nws_alerts.data.get(idx) else {
-            self.overlays.selected_alert = None;
-            return;
-        };
-
-        let alert_id = alert.id.clone();
-        let [r, g, b, _] = alert.features.first()
-            .map(|f| f.stroke_rgba)
-            .unwrap_or([200, 200, 200, 255]);
-        let accent = egui::Color32::from_rgb(r, g, b);
-
-        let mut hide_clicked = false;
-        let closed = show_detail_popup(
-            ctx,
-            "nws_alert_popup",
-            egui::RichText::new(&alert.event).color(accent).strong(),
-            380.0,
-            |ui| {
-                hide_clicked = alert_popup_content(ui, alert, accent);
-            },
-        );
-
-        if hide_clicked {
-            self.overlays.hidden_alerts.insert(alert_id);
-            self.overlays.nws_alerts.data_generation = self.overlays.nws_alerts.data_generation.wrapping_add(1);
-            self.overlays.selected_alert = None;
         }
-        if closed {
-            self.overlays.selected_alert = None;
+
+        // Clamp page index
+        let count = self.overlays.selected_overlays.len();
+        if self.overlays.selected_overlay_page >= count {
+            self.overlays.selected_overlay_page = count - 1;
+        }
+
+        let page = self.overlays.selected_overlay_page;
+        let current = self.overlays.selected_overlays[page].clone();
+
+        match current {
+            SelectedOverlay::Alert(idx) => {
+                let Some(alert) = self.overlays.nws_alerts.data.get(idx) else {
+                    self.overlays.selected_overlays.clear();
+                    return;
+                };
+
+                let alert_id = alert.id.clone();
+                let [r, g, b, _] = alert.features.first()
+                    .map(|f| f.stroke_rgba)
+                    .unwrap_or([200, 200, 200, 255]);
+                let accent = egui::Color32::from_rgb(r, g, b);
+
+                let mut hide_clicked = false;
+                let closed = show_detail_popup(
+                    ctx,
+                    "overlay_pager_popup",
+                    egui::RichText::new(&alert.event).color(accent).strong(),
+                    380.0,
+                    |ui| {
+                        if count > 1 {
+                            render_pager_nav(ui, page, count, &mut self.overlays.selected_overlay_page);
+                            ui.separator();
+                        }
+                        hide_clicked = alert_popup_content(ui, alert, accent);
+                    },
+                );
+
+                if hide_clicked {
+                    self.overlays.hidden_alerts.insert(alert_id);
+                    self.overlays.nws_alerts.data_generation =
+                        self.overlays.nws_alerts.data_generation.wrapping_add(1);
+                    // Remove this alert from the pager
+                    self.overlays.selected_overlays.remove(page);
+                    if self.overlays.selected_overlays.is_empty() {
+                        self.overlays.selected_overlay_page = 0;
+                    } else if self.overlays.selected_overlay_page >= self.overlays.selected_overlays.len() {
+                        self.overlays.selected_overlay_page = self.overlays.selected_overlays.len() - 1;
+                    }
+                }
+                if closed {
+                    self.overlays.selected_overlays.clear();
+                    self.overlays.selected_overlay_page = 0;
+                }
+            }
+            SelectedOverlay::Discussion(idx) => {
+                let Some(md) = self.overlays.spc_discussions.data.get(idx) else {
+                    self.overlays.selected_overlays.clear();
+                    return;
+                };
+
+                let stroke_rgba = md_stroke_color(&md.md_type);
+                let [r, g, b, _] = stroke_rgba;
+                let accent = egui::Color32::from_rgb(r, g, b);
+
+                let title = format!("Mesoscale Discussion #{:04}", md.number);
+                let closed = show_detail_popup(
+                    ctx,
+                    "overlay_pager_popup",
+                    egui::RichText::new(&title).color(accent).strong(),
+                    420.0,
+                    |ui| {
+                        if count > 1 {
+                            render_pager_nav(ui, page, count, &mut self.overlays.selected_overlay_page);
+                            ui.separator();
+                        }
+                        md_popup_content(ui, md, accent);
+                    },
+                );
+
+                if closed {
+                    self.overlays.selected_overlays.clear();
+                    self.overlays.selected_overlay_page = 0;
+                }
+            }
         }
     }
+}
 
-    /// Render the SPC Mesoscale Discussion detail popup when an MD is selected.
-    pub(super) fn render_md_popup(&mut self, ctx: &egui::Context) {
-        let Some(idx) = self.overlays.selected_md else {
-            return;
-        };
-        let Some(md) = self.overlays.spc_discussions.data.get(idx) else {
-            self.overlays.selected_md = None;
-            return;
-        };
-
-        let stroke_rgba = md_stroke_color(&md.md_type);
-        let [r, g, b, _] = stroke_rgba;
-        let accent = egui::Color32::from_rgb(r, g, b);
-
-        let title = format!("Mesoscale Discussion #{:04}", md.number);
-        let closed = show_detail_popup(
-            ctx,
-            "spc_md_popup",
-            egui::RichText::new(&title).color(accent).strong(),
-            420.0,
-            |ui| {
-                md_popup_content(ui, md, accent);
-            },
-        );
-
-        if closed {
-            self.overlays.selected_md = None;
+/// Render prev/next pager navigation controls.
+fn render_pager_nav(ui: &mut egui::Ui, page: usize, count: usize, current_page: &mut usize) {
+    ui.horizontal(|ui| {
+        if ui.add_enabled(page > 0, egui::Button::new("\u{25c0}")).clicked() {
+            *current_page = page.saturating_sub(1);
         }
-    }
+        ui.label(format!("{} / {}", page + 1, count));
+        if ui.add_enabled(page + 1 < count, egui::Button::new("\u{25b6}")).clicked() {
+            *current_page = page + 1;
+        }
+    });
 }

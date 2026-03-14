@@ -101,15 +101,15 @@ impl<'a> OverlayDrawContext<'a> {
 
     /// Draw SPC Mesoscale Discussion overlays (texture + labels + click).
     ///
-    /// Returns `Some(discussion_index)` if the user clicked on an MD polygon.
+    /// Returns indices of all discussions whose polygons contain the click point.
     pub fn draw_spc_discussions(
         &self,
         layers: &rustdar_overlays::render::layers::LayerManager,
         discussions: &[SpcDiscussion],
         md_texture: &OverlayTextureCache,
-    ) -> Option<usize> {
+    ) -> Vec<usize> {
         if !layers.is_enabled(LayerKind::SpcMesoscaleDiscussions) || discussions.is_empty() {
-            return None;
+            return Vec::new();
         }
 
         // Draw texture
@@ -147,12 +147,13 @@ impl<'a> OverlayDrawContext<'a> {
 
         // Click detection in geo-coordinates
         if !self.pointer_available || self.click_on_ui || !self.any_click {
-            return None;
+            return Vec::new();
         }
-        let click_pos = self.click_pos?;
+        let Some(click_pos) = self.click_pos else { return Vec::new() };
         let geo = self.projector.unproject(egui::vec2(click_pos.x, click_pos.y));
         let lat = geo.y();
         let lon = geo.x();
+        let mut hits = Vec::new();
         for (idx, md) in discussions.iter().enumerate() {
             for ring in &md.polygon {
                 if ring.len() < 3 {
@@ -172,25 +173,26 @@ impl<'a> OverlayDrawContext<'a> {
                     lat_rad_to_mercator_y(lat.to_radians()) as f32,
                 );
                 if rustdar_overlays::render::geo::point_in_polygon(point, &ring_sp) {
-                    return Some(idx);
+                    hits.push(idx);
+                    break; // one hit per MD is enough
                 }
             }
         }
-        None
+        hits
     }
 
     /// Draw NWS weather alert overlays (texture-based).
     ///
-    /// Returns `Some(alert_index)` if the user clicked on an alert polygon.
+    /// Returns indices of all alerts whose polygons contain the click point.
     pub fn draw_nws_alerts(
         &self,
         layers: &rustdar_overlays::render::layers::LayerManager,
         nws_alerts: &[NwsAlert],
         hidden_alerts: &HashSet<String>,
         alert_texture: &OverlayTextureCache,
-    ) -> Option<usize> {
+    ) -> Vec<usize> {
         if !layers.any_nws_enabled() || nws_alerts.is_empty() {
-            return None;
+            return Vec::new();
         }
 
         // Draw texture
@@ -200,14 +202,15 @@ impl<'a> OverlayDrawContext<'a> {
 
         // Click detection in geo-coordinates
         if !self.pointer_available || self.click_on_ui || !self.any_click {
-            return None;
+            return Vec::new();
         }
-        let click_pos = self.click_pos?;
+        let Some(click_pos) = self.click_pos else { return Vec::new() };
         let geo = self.projector.unproject(egui::vec2(click_pos.x, click_pos.y));
         let lat = geo.y();
         let lon = geo.x();
 
         let enabled_categories = layers.enabled_nws_categories();
+        let mut hits = Vec::new();
         for (alert_idx, alert) in nws_alerts.iter().enumerate() {
             if !enabled_categories.contains(&alert.category)
                 || hidden_alerts.contains(&alert.id)
@@ -216,11 +219,12 @@ impl<'a> OverlayDrawContext<'a> {
             }
             for feature in &alert.features {
                 if geo_point_in_feature(lat, lon, feature) {
-                    return Some(alert_idx);
+                    hits.push(alert_idx);
+                    break; // one hit per alert is enough
                 }
             }
         }
-        None
+        hits
     }
 }
 

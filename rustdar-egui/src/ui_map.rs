@@ -216,8 +216,7 @@ impl super::Gui {
     /// Dismiss overlay popups when clicking outside them.
     /// Returns `true` when no popup is open (pointer is available for map interaction).
     fn dismiss_overlay_popups(&mut self, ctx: &Context) -> bool {
-        let pointer_available = self.overlays.selected_alert.is_none()
-            && self.overlays.selected_md.is_none();
+        let pointer_available = self.overlays.selected_overlays.is_empty();
         if !pointer_available {
             let click_pos = ctx.input(|i| {
                 if i.pointer.any_click() {
@@ -230,8 +229,8 @@ impl super::Gui {
                 let on_popup = ctx.layer_id_at(pos)
                     .is_some_and(|l| l.order > egui::Order::Background);
                 if !on_popup {
-                    self.overlays.selected_alert = None;
-                    self.overlays.selected_md = None;
+                    self.overlays.selected_overlays.clear();
+                    self.overlays.selected_overlay_page = 0;
                 }
             }
         }

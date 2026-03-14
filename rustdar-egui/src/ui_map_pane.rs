@@ -3,7 +3,7 @@ use crate::overlay_cache::{
     viewport_geo_bounds, current_quantized_zoom, OVERDRAW_FRACTION,
 };
 use rustdar_overlays::render::layers::LayerKind;
-use rustdar_overlays::render::overlay_state::OverlayData;
+use rustdar_overlays::render::overlay_state::{OverlayData, SelectedOverlay};
 use crate::pane::{PaneState, RadarImageData};
 use rustdar_radar::sites::RADARS;
 use rustdar_radar::types::{ImageBounds, MAX_RANGE_KM};
@@ -62,24 +62,31 @@ pub(super) fn render_pane_map_content(
         }
 
         // Draw SPC Mesoscale Discussion textures + labels
-        let clicked_md = overlay_ctx.draw_spc_discussions(
+        let clicked_mds = overlay_ctx.draw_spc_discussions(
             &ctx.pane.layers,
             &ctx.overlays.spc_discussions.data,
             &ctx.pane.spc_md_texture,
         );
-        if let Some(idx) = clicked_md {
-            ctx.overlays.selected_md = Some(idx);
-        }
 
         // Draw NWS alert textures
-        let clicked_alert = overlay_ctx.draw_nws_alerts(
+        let clicked_alerts = overlay_ctx.draw_nws_alerts(
             &ctx.pane.layers,
             &ctx.overlays.nws_alerts.data,
             &ctx.overlays.hidden_alerts,
             &ctx.pane.nws_alert_texture,
         );
-        if let Some(idx) = clicked_alert {
-            ctx.overlays.selected_alert = Some(idx);
+
+        // Combine all clicked overlays into the pager list
+        if !clicked_mds.is_empty() || !clicked_alerts.is_empty() {
+            let mut items: Vec<SelectedOverlay> = Vec::new();
+            for idx in clicked_alerts {
+                items.push(SelectedOverlay::Alert(idx));
+            }
+            for idx in clicked_mds {
+                items.push(SelectedOverlay::Discussion(idx));
+            }
+            ctx.overlays.selected_overlays = items;
+            ctx.overlays.selected_overlay_page = 0;
         }
 
         // Draw label-only tiles on top of the radar overlay

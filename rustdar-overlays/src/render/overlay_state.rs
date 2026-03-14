@@ -48,6 +48,15 @@ impl<T> OverlayState<T> {
     }
 }
 
+/// Identifies a clicked overlay item for the detail popup pager.
+#[derive(Clone, Debug)]
+pub enum SelectedOverlay {
+    /// An NWS alert, identified by its index in `nws_alerts.data`.
+    Alert(usize),
+    /// An SPC Mesoscale Discussion, identified by its index in `spc_discussions.data`.
+    Discussion(usize),
+}
+
 /// All shared overlay state: SPC outlooks, NWS alerts, SPC discussions,
 /// and their selection/hidden state.
 pub struct OverlayData {
@@ -55,13 +64,13 @@ pub struct OverlayData {
     /// Per-product SPC data generation (keyed separately for cache invalidation).
     pub spc_data_generation: HashMap<(OutlookDay, OutlookProduct), u64>,
     pub nws_alerts: OverlayState<Vec<NwsAlert>>,
-    /// Index of the currently selected alert for detail popup.
-    pub selected_alert: Option<usize>,
+    /// Overlay items under the click point (alerts and MDs combined) for the pager popup.
+    pub selected_overlays: Vec<SelectedOverlay>,
+    /// Current page index within `selected_overlays`.
+    pub selected_overlay_page: usize,
     /// Alert IDs hidden by the user (not rendered on the map).
     pub hidden_alerts: HashSet<String>,
     pub spc_discussions: OverlayState<Vec<SpcDiscussion>>,
-    /// Index of the currently selected MD for detail popup.
-    pub selected_md: Option<usize>,
 }
 
 impl Default for OverlayData {
@@ -70,10 +79,10 @@ impl Default for OverlayData {
             spc_outlooks: OverlayState::new(),
             spc_data_generation: HashMap::new(),
             nws_alerts: OverlayState::new(),
-            selected_alert: None,
+            selected_overlays: Vec::new(),
+            selected_overlay_page: 0,
             hidden_alerts: HashSet::new(),
             spc_discussions: OverlayState::new(),
-            selected_md: None,
         }
     }
 }

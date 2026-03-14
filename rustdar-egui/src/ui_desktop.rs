@@ -178,10 +178,7 @@ impl super::Gui {
         let map_actions = self.render_map(ctx);
         actions.extend(map_actions);
 
-        // NWS alert detail popup (rendered after map so it floats on top)
-        self.render_alert_popup(ctx);
-
-        // SPC Mesoscale Discussion detail popup
-        self.render_md_popup(ctx);
+        // Overlay detail pager popup (rendered after map so it floats on top)
+        self.render_overlay_popup(ctx);
     }
 }
