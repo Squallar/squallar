@@ -773,6 +773,15 @@ impl Gui {
             || self.panes.iter().any(|p| p.layers.any_nws_enabled())
     }
 
+    /// Whether any pane has a loop that is playing or has in-flight work.
+    pub fn any_loop_active(&self) -> bool {
+        self.panes.iter().any(|p| {
+            p.loop_state.as_ref().is_some_and(|ls| {
+                ls.playing || ls.fetching || ls.frames.iter().any(|f| f.render_in_flight)
+            })
+        })
+    }
+
     pub fn clear_graphics_state(&mut self) {
         for pane in &mut self.panes {
             pane.clear_radar_image();

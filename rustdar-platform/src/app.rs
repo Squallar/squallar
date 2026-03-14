@@ -161,7 +161,7 @@ impl App {
         self.process_gui_actions(gui_actions);
 
         // Request redraw only when there is pending background work or auto-poll is active
-        if self.render.any_render_in_flight() || self.gui.is_auto_poll_active() {
+        if self.render.any_render_in_flight() || self.gui.is_auto_poll_active() || self.gui.any_loop_active() {
             notify_redraw(&self.window);
         }
     }
