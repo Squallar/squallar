@@ -122,7 +122,6 @@ pub fn build_cached_features(
     projector: &Projector,
     screen_rect: Rect,
     include_hatch: bool,
-    dark_theme: bool,
 ) -> Vec<CachedFeature> {
     // Compute geo bounds of the visible viewport by unprojecting screen corners
     let nw = projector.unproject(egui::vec2(screen_rect.left(), screen_rect.top()));
@@ -225,8 +224,6 @@ pub fn build_cached_features(
                 cp.hatch_lines = generate_hatch_lines(
                     &cp.screen_pts,
                     feature.hatch,
-                    screen_rect,
-                    dark_theme,
                     &exclusions,
                 );
             }

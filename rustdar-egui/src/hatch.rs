@@ -156,11 +156,8 @@ fn draw_directional_hatch(
 pub fn generate_hatch_lines(
     polygon_pts: &[Pos2],
     pattern: HatchPattern,
-    clip_rect: Rect,
-    dark_theme: bool,
     exclusion_polygons: &[&[Pos2]],
 ) -> Vec<(Pos2, Pos2, bool)> {
-    let _ = (clip_rect, dark_theme); // used by draw_hatch but not needed here
     if polygon_pts.len() < 3 || pattern == HatchPattern::None {
         return Vec::new();
     }

@@ -66,7 +66,6 @@ pub(super) fn draw_spc_overlays(
                 projector,
                 screen_rect,
                 true,
-                current_theme_is_dark,
             );
             cache.viewport_key = key;
             cache.data_generation = data_gen;
@@ -148,7 +147,6 @@ pub(super) fn draw_spc_discussions(
             &temp_features,
             projector,
             screen_rect,
-            false,
             false,
         );
         cache.viewport_key = key;
@@ -258,7 +256,6 @@ pub(super) fn draw_nws_alerts(
                 &alert.features,
                 projector,
                 screen_rect,
-                false,
                 false,
             );
             all_cached.extend(cached);
