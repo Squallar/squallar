@@ -27,7 +27,7 @@ impl super::App {
                     Err(err)
                 }
             };
-            let _ = sender.send(ScanResponse { generation, result: msg });
+            let _ = sender.send(ScanResponse { generation, result: msg, is_auto_poll: false });
             super::notify_redraw(&window);
         });
     }
@@ -165,6 +165,7 @@ impl super::App {
                             let _ = sender.send(crate::channels::ScanResponse {
                                 generation,
                                 result: Ok(crate::channels::ScanData { scan: data, site, timestamp }),
+                                is_auto_poll: true,
                             });
                         }
                         Ok(None) => { /* already latest or no data */ }

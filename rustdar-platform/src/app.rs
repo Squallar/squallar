@@ -221,21 +221,36 @@ impl App {
             } else {
                 match scan_resp.result {
                     Ok(scan_data) => {
-                        log::info!("Received scan data from background thread");
                         let scan_info = ScanInfo::from_scan(&scan_data.scan, &scan_data.site, scan_data.timestamp);
                         let site = scan_data.site;
                         let timestamp = scan_data.timestamp;
                         let scan_arc = Arc::new(scan_data.scan);
-                        self.scan_data = Some(Arc::clone(&scan_arc));
-                        self.gui.set_scan_info(scan_info);
-                        self.gui.set_loading_site(None);
-                        self.render.reset_panes();
-                        self.spawn_level3_fetches(&site);
 
-                        // Append the new scan to any active loops
-                        self.append_scan_to_active_loops(timestamp, scan_arc);
+                        // When auto-poll delivers a new scan while viewing historic data,
+                        // cache it silently for JumpToLive and loop growing.
+                        if scan_resp.is_auto_poll && !self.gui.is_viewing_live() {
+                            log::info!("Auto-poll: caching scan (historic mode) @ {}", timestamp);
+                            self.append_scan_to_active_loops(timestamp, Arc::clone(&scan_arc));
+                            self.latest_cached_scan = Some((scan_arc, scan_info, site, timestamp));
+                        } else {
+                            log::info!("Received scan data from background thread");
+                            self.scan_data = Some(Arc::clone(&scan_arc));
+                            self.gui.set_scan_info(scan_info);
+                            self.gui.set_loading_site(None);
+                            self.render.reset_panes();
+                            self.spawn_level3_fetches(&site);
 
-                        log::info!("Scan data loaded and UI updated");
+                            // Append the new scan to any active loops
+                            self.append_scan_to_active_loops(timestamp, Arc::clone(&scan_arc));
+
+                            // If this was a manual navigation, reinitialize active loops
+                            if self.manual_nav_pending {
+                                self.manual_nav_pending = false;
+                                self.reinit_active_loops();
+                            }
+
+                            log::info!("Scan data loaded and UI updated");
+                        }
                     }
                     Err(error_msg) => {
                         log::error!("Received error from background thread: {}", error_msg);

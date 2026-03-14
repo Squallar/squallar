@@ -21,6 +21,8 @@ pub struct ScanData {
 pub struct ScanResponse {
     pub generation: u64,
     pub result: Result<ScanData, String>,
+    /// True when this result originated from an auto-poll check (not manual navigation).
+    pub is_auto_poll: bool,
 }
 
 /// Result from a background radar render thread.
