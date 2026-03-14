@@ -411,59 +411,6 @@ pub fn render_level3_radial_to_image(
     let bufs = RenderBuffers::new();
     let radials = &radial_packet.radials;
 
-    // Debug: count total renderable gates across all radials
-    {
-        let mut total_gates = 0usize;
-        let mut below_thresh = 0usize;
-        let mut nan_or_999 = 0usize;
-        let mut out_of_range = 0usize;
-        let mut transparent_color = 0usize;
-        let mut rendered = 0usize;
-        for radial_run in radials.iter() {
-            let bins_to_render = radial_run.gate_values.len().min(num_bins);
-            for (gate_idx, &gate_value) in
-                radial_run.gate_values[..bins_to_render].iter().enumerate()
-            {
-                total_gates += 1;
-                if gate_value <= 1 {
-                    below_thresh += 1;
-                    continue;
-                }
-                let physical_value = l3_physical_value(gate_value, product, scale, offset, lut);
-                if physical_value.is_nan() || physical_value >= 999.0 {
-                    nan_or_999 += 1;
-                    continue;
-                }
-                let range_km = first_gate_range + gate_idx as f64 * gate_interval;
-                if range_km > types::MAX_RANGE_KM {
-                    out_of_range += 1;
-                    continue;
-                }
-                let color = get_color_for_value(product, physical_value);
-                if color.3 == 0 {
-                    transparent_color += 1;
-                    continue;
-                }
-                rendered += 1;
-            }
-        }
-        log::debug!(
-            "L3 {:?} gate stats: total={}, below_thresh(<=1)={}, nan_or_999={}, out_of_range(>{:.0}km)={}, transparent_color={}, renderable={}",
-            product, total_gates, below_thresh, nan_or_999, types::MAX_RANGE_KM, out_of_range, transparent_color, rendered
-        );
-        if let Some(r0) = radials.first() {
-            let mut samples = Vec::new();
-            let bins = r0.gate_values.len().min(num_bins);
-            for (i, &gv) in r0.gate_values[..bins].iter().enumerate() {
-                if gv > 1 && samples.len() < 5 {
-                    let pv = l3_physical_value(gv, product, scale, offset, lut);
-                    samples.push(format!("gate[{}]: raw={} -> phys={:.3}", i, gv, pv));
-                }
-            }
-            log::debug!("L3 {:?} sample values: {:?}", product, samples);
-        }
-    }
-
     // Process radials in parallel
     radials.par_iter().for_each(|radial_run| {
         let azimuth = radial_run.start_angle as f64 + radial_run.angle_delta as f64 / 2.0;
