@@ -321,6 +321,85 @@ fn triangulate_screen(pts: &[Pos2]) -> Vec<u32> {
 
 // ── Drawing from cache ───────────────────────────────────────────────────
 
+/// Accumulates batched fill triangles, stroke segments, and hatch lines for
+/// efficient emission to an `egui::Painter` in a single pass.
+pub struct MeshAccumulator {
+    pub fill_mesh: Mesh,
+    pub strokes: Vec<Shape>,
+    pub hatch_strokes: Vec<Shape>,
+}
+
+impl MeshAccumulator {
+    pub fn new() -> Self {
+        Self {
+            fill_mesh: Mesh::default(),
+            strokes: Vec::new(),
+            hatch_strokes: Vec::new(),
+        }
+    }
+
+    /// Append a single polygon's fill triangles and stroke outline.
+    pub fn append_polygon(
+        &mut self,
+        poly: &CachedPolygon,
+        fill: egui::Color32,
+        stroke_color: egui::Color32,
+        stroke_width: f32,
+    ) {
+        // Filled triangles
+        if !poly.tri_indices.is_empty() {
+            let base = self.fill_mesh.vertices.len() as u32;
+            for pt in &poly.screen_pts {
+                self.fill_mesh.vertices.push(egui::epaint::Vertex {
+                    pos: *pt,
+                    uv: egui::epaint::WHITE_UV,
+                    color: fill,
+                });
+            }
+            for &idx in &poly.tri_indices {
+                self.fill_mesh.indices.push(base + idx);
+            }
+        }
+
+        // Stroke outline
+        if stroke_color.a() > 0 {
+            let stroke = Stroke::new(stroke_width, stroke_color);
+            let pts = &poly.screen_pts;
+            for i in 0..pts.len() {
+                let j = (i + 1) % pts.len();
+                self.strokes.push(Shape::line_segment([pts[i], pts[j]], stroke));
+            }
+        }
+    }
+
+    /// Append hatch lines from a polygon.
+    pub fn append_hatch(&mut self, poly: &CachedPolygon, hatch_color: egui::Color32) {
+        for &(p1, p2, dotted) in &poly.hatch_lines {
+            if dotted {
+                self.hatch_strokes.extend(geo::dashed_line_shapes(
+                    p1,
+                    p2,
+                    Stroke::new(1.5, hatch_color),
+                ));
+            } else {
+                self.hatch_strokes.push(Shape::line_segment(
+                    [p1, p2],
+                    Stroke::new(1.5, hatch_color),
+                ));
+            }
+        }
+    }
+
+    /// Flush all accumulated geometry to the painter.
+    pub fn emit(self, painter: &egui::Painter) {
+        if !self.fill_mesh.vertices.is_empty() {
+            painter.add(Shape::mesh(self.fill_mesh));
+        }
+        painter.extend(self.strokes);
+        painter.extend(self.hatch_strokes);
+    }
+}
+
 /// Draw all cached features for a layer as filled polygons with stroke outlines.
 ///
 /// Batches all geometry into a single `egui::Mesh` per call and accumulates
@@ -332,9 +411,7 @@ pub fn draw_cached_features(
     screen_rect: Rect,
     hatch_color: egui::Color32,
 ) {
-    let mut fill_mesh = Mesh::default();
-    let mut strokes: Vec<Shape> = Vec::new();
-    let mut hatch_strokes: Vec<Shape> = Vec::new();
+    let mut acc = MeshAccumulator::new();
 
     for (feat_idx, cached_feat) in cached.iter().enumerate() {
         let src = match source_features.get(feat_idx) {
@@ -351,162 +428,12 @@ pub fn draw_cached_features(
             if !screen_rect.intersects(cached_poly.poly_rect) {
                 continue;
             }
-
-            // Append filled triangles to the batched mesh
-            if !cached_poly.tri_indices.is_empty() {
-                let base = fill_mesh.vertices.len() as u32;
-                for pt in &cached_poly.screen_pts {
-                    fill_mesh.vertices.push(egui::epaint::Vertex {
-                        pos: *pt,
-                        uv: egui::epaint::WHITE_UV,
-                        color: fill,
-                    });
-                }
-                for &idx in &cached_poly.tri_indices {
-                    fill_mesh.indices.push(base + idx);
-                }
-            }
-
-            // Accumulate stroke segments
+            acc.append_polygon(cached_poly, fill, stroke_color, 1.5);
             if sa > 0 {
-                let stroke = Stroke::new(1.5, stroke_color);
-                let pts = &cached_poly.screen_pts;
-                for i in 0..pts.len() {
-                    let j = (i + 1) % pts.len();
-                    strokes.push(Shape::line_segment([pts[i], pts[j]], stroke));
-                }
-            }
-
-            // Accumulate hatch lines
-            for &(p1, p2, dotted) in &cached_poly.hatch_lines {
-                if dotted {
-                    let dash_shapes = geo::dashed_line_shapes(
-                        p1,
-                        p2,
-                        Stroke::new(1.5, hatch_color),
-                    );
-                    hatch_strokes.extend(dash_shapes);
-                } else {
-                    hatch_strokes.push(Shape::line_segment(
-                        [p1, p2],
-                        Stroke::new(1.5, hatch_color),
-                    ));
-                }
+                acc.append_hatch(cached_poly, hatch_color);
             }
         }
     }
 
-    // Emit batched geometry
-    if !fill_mesh.vertices.is_empty() {
-        painter.add(Shape::mesh(fill_mesh));
-    }
-    painter.extend(strokes);
-    painter.extend(hatch_strokes);
-}
-
-/// Draw cached features for NWS alerts / SPC discussions that support click detection.
-///
-/// Returns `Some(source_index)` if a polygon was clicked.
-pub fn draw_cached_features_clickable(
-    ui: &egui::Ui,
-    cached: &[CachedFeature],
-    source_features_len: usize,
-    fill_colors: &[[u8; 4]],
-    stroke_colors: &[[u8; 4]],
-    stroke_width: f32,
-    screen_rect: Rect,
-    hatch_color: Option<egui::Color32>,
-    // Maps from cached feature index → source alert/discussion index
-    cached_to_source: &[usize],
-) -> Option<usize> {
-    let painter = ui.painter();
-    let mut fill_mesh = Mesh::default();
-    let mut strokes: Vec<Shape> = Vec::new();
-    let mut hatch_strokes: Vec<Shape> = Vec::new();
-    let mut clicked_index: Option<usize> = None;
-
-    for (feat_idx, cached_feat) in cached.iter().enumerate() {
-        let source_idx = cached_to_source.get(feat_idx).copied().unwrap_or(feat_idx);
-        if source_idx >= source_features_len {
-            continue;
-        }
-
-        let fill_rgba = fill_colors.get(feat_idx).copied().unwrap_or([0; 4]);
-        let stroke_rgba = stroke_colors.get(feat_idx).copied().unwrap_or([0; 4]);
-        let [r, g, b, a] = fill_rgba;
-        let fill = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
-        let [sr, sg, sb, sa] = stroke_rgba;
-        let stroke_color = egui::Color32::from_rgba_unmultiplied(sr, sg, sb, sa);
-
-        for cached_poly in &cached_feat.polygons {
-            if !screen_rect.intersects(cached_poly.poly_rect) {
-                continue;
-            }
-
-            // Filled triangles
-            if !cached_poly.tri_indices.is_empty() {
-                let base = fill_mesh.vertices.len() as u32;
-                for pt in &cached_poly.screen_pts {
-                    fill_mesh.vertices.push(egui::epaint::Vertex {
-                        pos: *pt,
-                        uv: egui::epaint::WHITE_UV,
-                        color: fill,
-                    });
-                }
-                for &idx in &cached_poly.tri_indices {
-                    fill_mesh.indices.push(base + idx);
-                }
-            }
-
-            // Stroke
-            if sa > 0 {
-                let stroke = Stroke::new(stroke_width, stroke_color);
-                let pts = &cached_poly.screen_pts;
-                for i in 0..pts.len() {
-                    let j = (i + 1) % pts.len();
-                    strokes.push(Shape::line_segment([pts[i], pts[j]], stroke));
-                }
-            }
-
-            // Hatch
-            if let Some(hc) = hatch_color {
-                for &(p1, p2, dotted) in &cached_poly.hatch_lines {
-                    if dotted {
-                        hatch_strokes.extend(geo::dashed_line_shapes(
-                            p1,
-                            p2,
-                            Stroke::new(1.5, hc),
-                        ));
-                    } else {
-                        hatch_strokes.push(Shape::line_segment(
-                            [p1, p2],
-                            Stroke::new(1.5, hc),
-                        ));
-                    }
-                }
-            }
-
-            // Click detection (only on the first click found)
-            if clicked_index.is_none() {
-                let clicked = ui.ctx().input(|i| {
-                    i.pointer.any_click()
-                        && i.pointer.interact_pos().is_some_and(|p| {
-                            cached_poly.poly_rect.contains(p)
-                                && geo::point_in_polygon(p, &cached_poly.screen_pts)
-                        })
-                });
-                if clicked {
-                    clicked_index = Some(source_idx);
-                }
-            }
-        }
-    }
-
-    if !fill_mesh.vertices.is_empty() {
-        painter.add(Shape::mesh(fill_mesh));
-    }
-    painter.extend(strokes);
-    painter.extend(hatch_strokes);
-
-    clicked_index
+    acc.emit(painter);
 }

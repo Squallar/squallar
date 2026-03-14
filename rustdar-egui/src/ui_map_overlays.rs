@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use walkers::{HttpTiles, Texture, TileId, Tiles};
 use crate::layers::LayerKind;
 use crate::overlay_cache::{
-    CachedFeature, OverlayLayerCache, ViewportKey,
+    CachedFeature, OverlayLayerCache, ViewportKey, MeshAccumulator,
     build_cached_features, draw_cached_features,
 };
 use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
@@ -157,44 +157,20 @@ pub(super) fn draw_spc_discussions(
 
     let mut clicked_index: Option<usize> = None;
     let painter = ui.painter();
-    let mut fill_mesh = egui::Mesh::default();
-    let mut strokes: Vec<egui::Shape> = Vec::new();
+    let mut acc = MeshAccumulator::new();
 
     for (md_idx, (md, cached_feat)) in discussions.iter().zip(cache.features.iter()).enumerate() {
         let [r, g, b, a] = md_fill_color(&md.md_type);
         let fill = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
-        let [sr, sg, sb, sa] = md_stroke_color(&md.md_type);
-        let stroke_color = egui::Color32::from_rgba_unmultiplied(sr, sg, sb, sa);
+        let [sr, sg, sb, _sa] = md_stroke_color(&md.md_type);
+        let stroke_color = egui::Color32::from_rgba_unmultiplied(sr, sg, sb, _sa);
 
         for cached_poly in &cached_feat.polygons {
             if !screen_rect.intersects(cached_poly.poly_rect) {
                 continue;
             }
 
-            // Fill triangles
-            if !cached_poly.tri_indices.is_empty() {
-                let base = fill_mesh.vertices.len() as u32;
-                for pt in &cached_poly.screen_pts {
-                    fill_mesh.vertices.push(egui::epaint::Vertex {
-                        pos: *pt,
-                        uv: egui::epaint::WHITE_UV,
-                        color: fill,
-                    });
-                }
-                for &idx in &cached_poly.tri_indices {
-                    fill_mesh.indices.push(base + idx);
-                }
-            }
-
-            // Stroke outline
-            if sa > 0 {
-                let stroke = egui::Stroke::new(2.0, stroke_color);
-                let pts = &cached_poly.screen_pts;
-                for i in 0..pts.len() {
-                    let j = (i + 1) % pts.len();
-                    strokes.push(egui::Shape::line_segment([pts[i], pts[j]], stroke));
-                }
-            }
+            acc.append_polygon(cached_poly, fill, stroke_color, 2.0);
 
             // MD number label at polygon centroid
             if !cached_poly.screen_pts.is_empty() {
@@ -212,9 +188,6 @@ pub(super) fn draw_spc_discussions(
             }
 
             // Click detection (SPC discussions)
-            // Reuse any_click/click_pos extracted once at the top to avoid
-            // per-polygon ctx.input() WRITE lock acquisition, which starves
-            // background threads (walkers tile IO) and causes a deadlock.
             if pointer_available && !click_on_ui && clicked_index.is_none()
                 && any_click
                 && click_pos.is_some_and(|p| {
@@ -227,10 +200,7 @@ pub(super) fn draw_spc_discussions(
         }
     }
 
-    if !fill_mesh.vertices.is_empty() {
-        painter.add(egui::Shape::mesh(fill_mesh));
-    }
-    painter.extend(strokes);
+    acc.emit(painter);
 
     clicked_index
 }
@@ -301,8 +271,7 @@ pub(super) fn draw_nws_alerts(
     let enabled_categories = layers.enabled_nws_categories();
     let mut clicked_index: Option<usize> = None;
     let painter = ui.painter();
-    let mut fill_mesh = egui::Mesh::default();
-    let mut strokes: Vec<egui::Shape> = Vec::new();
+    let mut acc = MeshAccumulator::new();
 
     // Walk the flat cache in the same alert→feature order it was built.
     let mut flat_idx = 0;
@@ -322,43 +291,17 @@ pub(super) fn draw_nws_alerts(
 
             let [r, g, b, a] = src_feature.fill_rgba;
             let fill = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
-            let [sr, sg, sb, sa] = src_feature.stroke_rgba;
-            let stroke_color = egui::Color32::from_rgba_unmultiplied(sr, sg, sb, sa);
+            let [sr, sg, sb, _sa] = src_feature.stroke_rgba;
+            let stroke_color = egui::Color32::from_rgba_unmultiplied(sr, sg, sb, _sa);
 
             for cached_poly in &cached_feat.polygons {
                 if !screen_rect.intersects(cached_poly.poly_rect) {
                     continue;
                 }
 
-                // Fill triangles
-                if !cached_poly.tri_indices.is_empty() {
-                    let base = fill_mesh.vertices.len() as u32;
-                    for pt in &cached_poly.screen_pts {
-                        fill_mesh.vertices.push(egui::epaint::Vertex {
-                            pos: *pt,
-                            uv: egui::epaint::WHITE_UV,
-                            color: fill,
-                        });
-                    }
-                    for &idx in &cached_poly.tri_indices {
-                        fill_mesh.indices.push(base + idx);
-                    }
-                }
-
-                // Stroke outline
-                if sa > 0 {
-                    let stroke = egui::Stroke::new(2.0, stroke_color);
-                    let pts = &cached_poly.screen_pts;
-                    for i in 0..pts.len() {
-                        let j = (i + 1) % pts.len();
-                        strokes.push(egui::Shape::line_segment([pts[i], pts[j]], stroke));
-                    }
-                }
+                acc.append_polygon(cached_poly, fill, stroke_color, 2.0);
 
                 // Click detection (NWS alerts)
-                // Reuse any_click/click_pos extracted once at the top to avoid
-                // per-polygon ctx.input() WRITE lock acquisition, which starves
-                // background threads (walkers tile IO) and causes a deadlock.
                 if pointer_available && !click_on_ui && clicked_index.is_none()
                     && any_click
                     && click_pos.is_some_and(|p| {
@@ -372,10 +315,7 @@ pub(super) fn draw_nws_alerts(
         }
     }
 
-    if !fill_mesh.vertices.is_empty() {
-        painter.add(egui::Shape::mesh(fill_mesh));
-    }
-    painter.extend(strokes);
+    acc.emit(painter);
 
     clicked_index
 }
