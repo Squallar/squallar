@@ -3,10 +3,23 @@
 use crate::actions::GuiAction;
 use crate::pane::PaneState;
 
+/// Maximum time (seconds) between first tap release and second press
+/// for it to count as a double-tap.
+const DOUBLE_TAP_TIMEOUT_S: f64 = 0.4;
+/// Maximum distance (pixels) between first and second tap positions
+/// for it to count as a double-tap.
+const DOUBLE_TAP_DISTANCE_PX: f32 = 50.0;
+/// Maximum duration (seconds) for a press-release to classify as a "tap".
+const TAP_DURATION_MAX_S: f64 = 0.3;
+/// Maximum movement (pixels) for a press-release to classify as a "tap".
+const TAP_DISTANCE_MAX_PX: f32 = 20.0;
+/// Pixels of vertical drag per 1.0 zoom level change.
+const ZOOM_DRAG_SENSITIVITY: f32 = 150.0;
+
 /// Detects a "double-tap and drag" gesture commonly used on touch devices
 /// for one-handed zooming. The gesture flow is:
 /// 1. Tap (short press-release)
-/// 2. Within 400 ms, press down again and hold
+/// 2. Within [`DOUBLE_TAP_TIMEOUT_S`], press down again and hold
 /// 3. Drag vertically: up = zoom in, down = zoom out
 #[derive(Clone)]
 pub(super) struct DoubleTapDragDetector {
@@ -61,7 +74,7 @@ impl DoubleTapDragDetector {
             } else {
                 // Drag up (negative dy) = zoom in, drag down = zoom out
                 let dy = pos.y - self.drag_start_y;
-                let zoom_delta = dy as f64 / 150.0;
+                let zoom_delta = dy as f64 / ZOOM_DRAG_SENSITIVITY as f64;
                 let new_zoom = (self.initial_zoom + zoom_delta).clamp(1.0, 19.0);
                 let _ = map_memory.set_zoom(new_zoom);
             }
@@ -73,7 +86,7 @@ impl DoubleTapDragDetector {
             if let (Some(last_time), Some(last_pos)) = (self.last_tap_time, self.last_tap_pos) {
                 let dt = time - last_time;
                 let dist = (pos - last_pos).length();
-                if dt < 0.4 && dist < 50.0 {
+                if dt < DOUBLE_TAP_TIMEOUT_S && dist < DOUBLE_TAP_DISTANCE_PX {
                     // Double-tap detected — enter zoom-drag mode
                     self.zooming = true;
                     self.drag_start_y = pos.y;
@@ -91,7 +104,7 @@ impl DoubleTapDragDetector {
             // Classify as a "tap" only if the press was short and didn't move far
             let duration = time - self.press_time;
             let distance = (pos - self.press_pos).length();
-            if duration < 0.3 && distance < 20.0 {
+            if duration < TAP_DURATION_MAX_S && distance < TAP_DISTANCE_MAX_PX {
                 self.last_tap_time = Some(time);
                 self.last_tap_pos = Some(pos);
             } else {
