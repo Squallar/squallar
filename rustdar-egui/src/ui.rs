@@ -379,9 +379,46 @@ impl Gui {
         id_prefix: &str,
         actions: &mut Vec<GuiAction>,
     ) {
-        let day = pane.layers.spc_day;
+        self.render_radar_controls(ui, pane, combo_width, id_prefix);
 
-        // --- Radar layer ---
+        ui.add_space(6.0);
+        ui.separator();
+
+        self.render_spc_outlook_controls(ui, pane, actions);
+
+        ui.add_space(6.0);
+        ui.separator();
+
+        self.render_spc_discussion_controls(ui, pane, actions);
+
+        ui.add_space(6.0);
+        ui.separator();
+
+        self.render_nws_alert_controls(ui, pane, actions);
+
+        ui.add_space(6.0);
+        ui.separator();
+
+        // --- Viewport sync ---
+        if self.pane_layout.pane_count > 1 {
+            ui.checkbox(&mut self.viewport_sync, "\u{1f517}  Sync Viewports");
+            ui.checkbox(&mut self.sync_layers, "\u{1f517}  Sync Layers");
+            ui.separator();
+        }
+
+        // --- Other overlays ---
+        ui.checkbox(pane.layers.enabled_mut(LayerKind::CityLabels), "\u{1f3f7}  City Labels");
+        ui.checkbox(pane.layers.enabled_mut(LayerKind::RadarSites), "\u{1f4e1}  Radar Sites");
+    }
+
+    /// Render radar layer toggle with product/elevation combo boxes.
+    fn render_radar_controls(
+        &self,
+        ui: &mut egui::Ui,
+        pane: &mut PaneState,
+        combo_width: f32,
+        id_prefix: &str,
+    ) {
         ui.checkbox(pane.layers.enabled_mut(LayerKind::Radar), "\u{1f6f0}  Radar");
 
         if pane.layers.is_enabled(LayerKind::Radar) {
@@ -439,11 +476,17 @@ impl Gui {
                 }
             });
         }
+    }
 
-        ui.add_space(6.0);
-        ui.separator();
+    /// Render SPC outlook day selector, layer toggles, and refresh button.
+    fn render_spc_outlook_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        pane: &mut PaneState,
+        actions: &mut Vec<GuiAction>,
+    ) {
+        let day = pane.layers.spc_day;
 
-        // --- SPC Outlooks ---
         ui.label("\u{26c8}  SPC Outlooks");
 
         ui.horizontal_wrapped(|ui| {
@@ -498,11 +541,15 @@ impl Gui {
                 }
             });
         }
+    }
 
-        ui.add_space(6.0);
-        ui.separator();
-
-        // --- SPC Mesoscale Discussions ---
+    /// Render SPC Mesoscale Discussion toggle, refresh button, and fetch time.
+    fn render_spc_discussion_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        pane: &mut PaneState,
+        actions: &mut Vec<GuiAction>,
+    ) {
         {
             let was_enabled = pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
             let label = if self.overlays.spc_discussions.data.is_empty() {
@@ -542,11 +589,15 @@ impl Gui {
                 ui.label(egui::RichText::new(label).small().weak());
             }
         }
+    }
 
-        ui.add_space(6.0);
-        ui.separator();
-
-        // --- NWS Alerts ---
+    /// Render NWS alert category toggles, refresh button, alert count, and fetch time.
+    fn render_nws_alert_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        pane: &mut PaneState,
+        actions: &mut Vec<GuiAction>,
+    ) {
         ui.label("\u{26a0}  NWS Alerts");
 
         let nws_layers = [LayerKind::NwsWarnings, LayerKind::NwsWatches, LayerKind::NwsAdvisories];
@@ -588,20 +639,6 @@ impl Gui {
                 ui.label(egui::RichText::new(label).small().weak());
             }
         }
-
-        ui.add_space(6.0);
-        ui.separator();
-
-        // --- Viewport sync ---
-        if self.pane_layout.pane_count > 1 {
-            ui.checkbox(&mut self.viewport_sync, "\u{1f517}  Sync Viewports");
-            ui.checkbox(&mut self.sync_layers, "\u{1f517}  Sync Layers");
-            ui.separator();
-        }
-
-        // --- Other overlays ---
-        ui.checkbox(pane.layers.enabled_mut(LayerKind::CityLabels), "\u{1f3f7}  City Labels");
-        ui.checkbox(pane.layers.enabled_mut(LayerKind::RadarSites), "\u{1f4e1}  Radar Sites");
     }
 
     /// Propagate layer settings from the active pane to all others (when sync is enabled).
