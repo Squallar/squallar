@@ -338,13 +338,12 @@ impl super::Gui {
                                     );
 
                                     if response.hovered() {
-                                        let tooltip_text = if radar_site.elev == -99999 {
-                                            format!("{}\nLat: {:.3}°, Lon: {:.3}°\nElev: N/A",
-                                                radar_site.name, radar_site.lat, radar_site.lon)
-                                        } else {
-                                            format!("{}\nLat: {:.3}°, Lon: {:.3}°\nElev: {} ft",
-                                                radar_site.name, radar_site.lat, radar_site.lon, radar_site.elev)
+                                        let elev_str = match radar_site.elev {
+                                            Some(e) => format!("{} ft", e),
+                                            None => "N/A".to_string(),
                                         };
+                                        let tooltip_text = format!("{}\nLat: {:.3}°, Lon: {:.3}°\nElev: {}",
+                                            radar_site.name, radar_site.lat, radar_site.lon, elev_str);
                                         response.on_hover_text(tooltip_text);
                                     }
                                 }

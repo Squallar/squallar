@@ -182,7 +182,7 @@ impl ScanInfo {
                 name: "UNKNOWN",
                 lat: 0.0,
                 lon: 0.0,
-                elev: 0,
+                elev: None,
             }
         });
 
