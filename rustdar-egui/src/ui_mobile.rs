@@ -69,49 +69,67 @@ impl DoubleTapDragDetector {
         let pos = pos.unwrap_or(egui::Pos2::ZERO);
 
         if self.zooming {
-            if !down {
-                self.zooming = false;
-            } else {
-                // Drag up (negative dy) = zoom in, drag down = zoom out
-                let dy = pos.y - self.drag_start_y;
-                let zoom_delta = dy as f64 / ZOOM_DRAG_SENSITIVITY as f64;
-                let new_zoom = (self.initial_zoom + zoom_delta).clamp(1.0, 19.0);
-                let _ = map_memory.set_zoom(new_zoom);
-            }
+            self.handle_zoom_drag(pos, down, map_memory);
             return;
         }
-
         if pressed {
-            // Check if this is the second tap of a double-tap
-            if let (Some(last_time), Some(last_pos)) = (self.last_tap_time, self.last_tap_pos) {
-                let dt = time - last_time;
-                let dist = (pos - last_pos).length();
-                if dt < DOUBLE_TAP_TIMEOUT_S && dist < DOUBLE_TAP_DISTANCE_PX {
-                    // Double-tap detected — enter zoom-drag mode
-                    self.zooming = true;
-                    self.drag_start_y = pos.y;
-                    self.initial_zoom = map_memory.zoom();
-                    self.last_tap_time = None;
-                    self.last_tap_pos = None;
-                    return;
-                }
-            }
-            self.press_time = time;
-            self.press_pos = pos;
+            self.handle_press(pos, time, map_memory);
         }
-
         if released {
-            // Classify as a "tap" only if the press was short and didn't move far
-            let duration = time - self.press_time;
-            let distance = (pos - self.press_pos).length();
-            if duration < TAP_DURATION_MAX_S && distance < TAP_DISTANCE_MAX_PX {
-                self.last_tap_time = Some(time);
-                self.last_tap_pos = Some(pos);
-            } else {
-                // Long press or drag — not a tap
+            self.handle_release(pos, time);
+        }
+    }
+
+    /// While zoom-dragging, apply vertical drag to map zoom or end the gesture.
+    fn handle_zoom_drag(
+        &mut self,
+        pos: egui::Pos2,
+        down: bool,
+        map_memory: &mut walkers::MapMemory,
+    ) {
+        if !down {
+            self.zooming = false;
+            return;
+        }
+        let dy = pos.y - self.drag_start_y;
+        let zoom_delta = dy as f64 / ZOOM_DRAG_SENSITIVITY as f64;
+        let new_zoom = (self.initial_zoom + zoom_delta).clamp(1.0, 19.0);
+        let _ = map_memory.set_zoom(new_zoom);
+    }
+
+    /// On press, check if this is the second tap of a double-tap sequence.
+    fn handle_press(
+        &mut self,
+        pos: egui::Pos2,
+        time: f64,
+        map_memory: &mut walkers::MapMemory,
+    ) {
+        if let (Some(last_time), Some(last_pos)) = (self.last_tap_time, self.last_tap_pos) {
+            let dt = time - last_time;
+            let dist = (pos - last_pos).length();
+            if dt < DOUBLE_TAP_TIMEOUT_S && dist < DOUBLE_TAP_DISTANCE_PX {
+                self.zooming = true;
+                self.drag_start_y = pos.y;
+                self.initial_zoom = map_memory.zoom();
                 self.last_tap_time = None;
                 self.last_tap_pos = None;
+                return;
             }
+        }
+        self.press_time = time;
+        self.press_pos = pos;
+    }
+
+    /// On release, classify the press-release as a tap or a drag/long-press.
+    fn handle_release(&mut self, pos: egui::Pos2, time: f64) {
+        let duration = time - self.press_time;
+        let distance = (pos - self.press_pos).length();
+        if duration < TAP_DURATION_MAX_S && distance < TAP_DISTANCE_MAX_PX {
+            self.last_tap_time = Some(time);
+            self.last_tap_pos = Some(pos);
+        } else {
+            self.last_tap_time = None;
+            self.last_tap_pos = None;
         }
     }
 
