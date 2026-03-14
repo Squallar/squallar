@@ -108,6 +108,51 @@ pub(super) fn render_pane_map_content(
     }
 }
 
+/// Update the hover value for a pane based on cursor position over the radar image.
+///
+/// Only recomputes when the cursor moves more than 0.5px from the last position.
+/// Clears hover state when the cursor leaves the pane.
+fn update_pane_hover_value(
+    ui: &egui::Ui,
+    projector: &walkers::Projector,
+    img: &RadarImageData,
+    pane: &mut PaneState,
+    pane_rect: egui::Rect,
+    image_rect: egui::Rect,
+) {
+    let Some(hover_pos) = ui.ctx().pointer_hover_pos() else {
+        pane.last_hover_pos = None;
+        pane.hover_value = None;
+        return;
+    };
+
+    if !pane_rect.contains(hover_pos) {
+        pane.last_hover_pos = None;
+        pane.hover_value = None;
+        return;
+    }
+
+    let pos_changed = pane
+        .last_hover_pos
+        .map(|last| (last - hover_pos).length() > 0.5)
+        .unwrap_or(true);
+    pane.last_hover_pos = Some(hover_pos);
+
+    if pos_changed {
+        let screen_vec = egui::vec2(hover_pos.x, hover_pos.y);
+        let map_pos = projector.unproject(screen_vec);
+
+        pane.hover_value = Some(super::compute_hover_info(
+            img,
+            map_pos.y(),
+            map_pos.x(),
+            hover_pos,
+            image_rect,
+            pane.selected_product,
+        ));
+    }
+}
+
 /// Render the radar image overlay, range ring, and hover tooltip.
 fn render_radar_overlay(
     ui: &egui::Ui,
@@ -128,39 +173,7 @@ fn render_radar_overlay(
         .to_pos2();
     let rect = egui::Rect::from_two_pos(nw, se);
 
-    // Hover: only compute for the pane the cursor is in
-    if let Some(hover_pos) = ui.ctx().pointer_hover_pos() {
-        if pane_rect.contains(hover_pos) {
-            let pos_changed = pane
-                .last_hover_pos
-                .map(|last| (last - hover_pos).length() > 0.5)
-                .unwrap_or(true);
-            pane.last_hover_pos = Some(hover_pos);
-
-            if pos_changed {
-                let screen_vec = egui::vec2(hover_pos.x, hover_pos.y);
-                let map_pos = projector.unproject(screen_vec);
-                let hover_lat = map_pos.y();
-                let hover_lon = map_pos.x();
-
-                pane.hover_value = Some(super::compute_hover_info(
-                    img,
-                    hover_lat,
-                    hover_lon,
-                    hover_pos,
-                    rect,
-                    pane.selected_product,
-                ));
-            }
-        } else {
-            // Cursor not in this pane
-            pane.last_hover_pos = None;
-            pane.hover_value = None;
-        }
-    } else {
-        pane.last_hover_pos = None;
-        pane.hover_value = None;
-    }
+    update_pane_hover_value(ui, projector, img, pane, pane_rect, rect);
 
     // Draw the radar image overlay
     ui.painter().image(
