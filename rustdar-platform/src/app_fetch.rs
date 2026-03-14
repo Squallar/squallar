@@ -308,9 +308,10 @@ impl super::App {
             max_lon: geo_bounds.max_lon + lon_range * overdraw,
         };
 
+        let Some(target_pane) = self.gui.pane(pane_idx) else { return };
         let overlay_type = match kind {
             OverlayRenderKind::SpcOutlook => OverlayType::SpcOutlook(
-                self.gui.active_pane().layers.spc_day,
+                target_pane.layers.spc_day,
                 // The texture combines all enabled products — just use Categorical as tag.
                 rustdar_overlays::spc::outlook::OutlookProduct::Categorical,
             ),
@@ -324,7 +325,7 @@ impl super::App {
         // Clone the data needed for the render closure
         match kind {
             OverlayRenderKind::SpcOutlook => {
-                let layers = &self.gui.active_pane().layers;
+                let layers = &target_pane.layers;
                 let day = layers.spc_day;
                 let mut features = Vec::new();
                 for lk in layers.spc_layers_for_day() {
@@ -387,7 +388,7 @@ impl super::App {
             }
             OverlayRenderKind::NwsAlerts => {
                 let alerts: Vec<_> = self.gui.overlays.nws_alerts.data.clone();
-                let enabled_categories = self.gui.active_pane().layers.enabled_nws_categories();
+                let enabled_categories = target_pane.layers.enabled_nws_categories();
                 let hidden_alerts = self.gui.overlays.hidden_alerts.clone();
                 std::thread::spawn(move || {
                     let image_data = rasterize::rasterize_nws_alerts(

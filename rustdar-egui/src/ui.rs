@@ -896,6 +896,11 @@ impl Gui {
         &mut self.panes[self.active_pane]
     }
 
+    /// Get a specific pane by index (immutable), or `None` if out of bounds.
+    pub fn pane(&self, idx: usize) -> Option<&PaneState> {
+        self.panes.get(idx)
+    }
+
     /// Get a specific pane by index (mutable), or `None` if out of bounds.
     pub fn pane_mut(&mut self, idx: usize) -> Option<&mut PaneState> {
         self.panes.get_mut(idx)
