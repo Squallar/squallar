@@ -9,7 +9,7 @@ use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
 use rustdar_overlays::spc::discussion::SpcDiscussion;
 use rustdar_overlays::spc::colors::{md_fill_color, md_stroke_color};
 use rustdar_overlays::nws::alert::NwsAlert;
-use rustdar_overlays::types::HatchPattern;
+use rustdar_overlays::types::{HatchPattern, OverlayFeature};
 use crate::tiles::{lon_to_tile_x, lat_to_tile_y, tile_to_lon, tile_to_lat};
 
 // ---------------------------------------------------------------------------
@@ -145,7 +145,7 @@ impl OverlayDrawContext<'_> {
         }
 
         if !cache.is_valid(&self.key, data_gen) {
-            let temp_features: Vec<rustdar_overlays::types::OverlayFeature> = discussions
+            let temp_features: Vec<OverlayFeature> = discussions
                 .iter()
                 .map(|md| {
                     let fill = md_fill_color(&md.md_type);
@@ -155,7 +155,7 @@ impl OverlayDrawContext<'_> {
                         .iter()
                         .map(|ring| vec![ring.clone()])
                         .collect();
-                    rustdar_overlays::types::OverlayFeature::new(
+                    OverlayFeature::new(
                         polygons,
                         fill,
                         stroke,
@@ -266,43 +266,37 @@ impl OverlayDrawContext<'_> {
         let mut acc = MeshAccumulator::new();
 
         // Walk the flat cache in the same alert→feature order it was built.
-        let mut flat_idx = 0;
-        for (alert_idx, alert) in nws_alerts.iter().enumerate() {
-            let skip = !enabled_categories.contains(&alert.category)
-                || hidden_alerts.contains(&alert.id);
-            for src_feature in &alert.features {
-                if flat_idx >= cache.features.len() {
-                    break;
-                }
-                let cached_feat = &cache.features[flat_idx];
-                flat_idx += 1;
+        for (alert_idx, src_feature, cached_feat) in
+            iter_alert_features(nws_alerts, &cache.features)
+        {
+            let alert = &nws_alerts[alert_idx];
+            if !enabled_categories.contains(&alert.category)
+                || hidden_alerts.contains(&alert.id)
+            {
+                continue;
+            }
 
-                if skip {
+            let [r, g, b, a] = src_feature.fill_rgba;
+            let fill = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+            let [sr, sg, sb, sa] = src_feature.stroke_rgba;
+            let stroke_color = egui::Color32::from_rgba_unmultiplied(sr, sg, sb, sa);
+
+            for cached_poly in &cached_feat.polygons {
+                if !self.screen_rect.intersects(cached_poly.poly_rect) {
                     continue;
                 }
 
-                let [r, g, b, a] = src_feature.fill_rgba;
-                let fill = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
-                let [sr, sg, sb, _sa] = src_feature.stroke_rgba;
-                let stroke_color = egui::Color32::from_rgba_unmultiplied(sr, sg, sb, _sa);
+                acc.append_polygon(cached_poly, fill, stroke_color, 2.0);
 
-                for cached_poly in &cached_feat.polygons {
-                    if !self.screen_rect.intersects(cached_poly.poly_rect) {
-                        continue;
-                    }
-
-                    acc.append_polygon(cached_poly, fill, stroke_color, 2.0);
-
-                    // Click detection
-                    if self.pointer_available && !self.click_on_ui && clicked_index.is_none()
-                        && self.any_click
-                        && self.click_pos.is_some_and(|p| {
-                            cached_poly.poly_rect.contains(p)
-                                && crate::geo::point_in_polygon(p, &cached_poly.screen_pts)
-                        })
-                    {
-                        clicked_index = Some(alert_idx);
-                    }
+                // Click detection
+                if self.pointer_available && !self.click_on_ui && clicked_index.is_none()
+                    && self.any_click
+                    && self.click_pos.is_some_and(|p| {
+                        cached_poly.poly_rect.contains(p)
+                            && crate::geo::point_in_polygon(p, &cached_poly.screen_pts)
+                    })
+                {
+                    clicked_index = Some(alert_idx);
                 }
             }
         }
@@ -311,6 +305,23 @@ impl OverlayDrawContext<'_> {
 
         clicked_index
     }
+}
+
+/// Iterate alert features paired with their cached geometry in flat order.
+///
+/// Yields `(alert_index, &OverlayFeature, &CachedFeature)` for each feature
+/// across all alerts, matching the same traversal order used when building
+/// the cache.
+fn iter_alert_features<'a>(
+    alerts: &'a [NwsAlert],
+    cached: &'a [CachedFeature],
+) -> impl Iterator<Item = (usize, &'a OverlayFeature, &'a CachedFeature)> {
+    alerts
+        .iter()
+        .enumerate()
+        .flat_map(|(idx, a)| a.features.iter().map(move |f| (idx, f)))
+        .zip(cached.iter())
+        .map(|((alert_idx, feature), cf)| (alert_idx, feature, cf))
 }
 
 /// Draw label-only map tiles on top of the radar overlay.
