@@ -8,7 +8,18 @@
 
 set -euo pipefail
 
-echo "Building Rustdar Platform for Android..."
+# ---------- Parse arguments ----------
+
+BUILD_PROFILE="debug"
+CARGO_RELEASE_FLAG=""
+for arg in "$@"; do
+    case "$arg" in
+        --release) BUILD_PROFILE="release"; CARGO_RELEASE_FLAG="--release" ;;
+        *) echo "Unknown argument: $arg"; echo "Usage: $0 [--release]"; exit 1 ;;
+    esac
+done
+
+echo "Building Rustdar Platform for Android ($BUILD_PROFILE)..."
 
 # ---------- Preflight checks ----------
 
@@ -46,11 +57,11 @@ done
 # ---------- Step 1: cargo apk build ----------
 
 cd rustdar-android
-echo "[1/4] Building native APK with cargo-apk..."
-cargo apk build --no-default-features
+echo "[1/4] Building native APK with cargo-apk ($BUILD_PROFILE)..."
+cargo apk build $CARGO_RELEASE_FLAG --no-default-features
 cd ..
 
-APK_DIR="target/debug/apk"
+APK_DIR="target/$BUILD_PROFILE/apk"
 
 # Derive APK filename from the lib name in Cargo.toml (cargo-apk uses this)
 LIB_NAME=$(grep -A5 '^\[lib\]' rustdar-android/Cargo.toml | grep '^name' | head -1 | sed 's/.*= *"\(.*\)"/\1/')
