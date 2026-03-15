@@ -197,9 +197,7 @@ pub fn draw_long_press_tooltip(
 ) {
     use rustdar_radar::types::IMAGE_SIZE;
 
-    let bounds = pane
-        .cached_image_bounds
-        .unwrap_or_else(|| ImageBounds::from_radar_site(img.lat, img.lon));
+    let bounds = ImageBounds::from_radar_site(img.lat, img.lon);
 
     let nw = projector
         .project(walkers::lat_lon(bounds.max_lat, bounds.min_lon))
