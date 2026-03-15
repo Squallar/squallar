@@ -7,7 +7,7 @@ use rustdar_overlays::render::overlay_state::{OverlayData, SelectedOverlay};
 use crate::pane::{PaneState, RadarImageData};
 
 use rustdar_radar::sites::RADARS;
-use rustdar_radar::types::{ImageBounds, MAX_RANGE_KM};
+use rustdar_radar::types::{MAX_RANGE_KM, ImageBounds};
 use walkers::HttpTiles;
 
 use super::super::map_overlays::{OverlayDrawContext, draw_label_tiles_overlay};
@@ -17,7 +17,6 @@ pub(super) struct PaneRenderCtx<'a> {
     pub pane_idx: usize,
     pub pane: &'a mut PaneState,
     pub overlays: &'a mut OverlayData,
-    pub radar_image: &'a Option<RadarImageData>,
     pub user_location: Option<(f64, f64)>,
     pub label_tiles: &'a mut Option<HttpTiles>,
     pub actions: &'a mut Vec<GuiAction>,
@@ -80,13 +79,8 @@ pub(super) fn render_pane_map_content(
 
         // Overlay radar data if available
         if ctx.pane.layers.is_enabled(LayerKind::Radar) {
-            // When a loop is active, prefer the current loop frame's texture
-            let loop_img: Option<RadarImageData> = ctx.pane.loop_state.as_ref().and_then(|ls| {
-                ls.frames.get(ls.current_frame).and_then(|f| f.texture.clone())
-            });
-            let img_ref = loop_img.as_ref().or(ctx.radar_image.as_ref());
-            if let Some(img) = img_ref {
-                render_radar_overlay(ui, projector, img, ctx.pane, ctx.pane_rect);
+            if let Some(img) = ctx.pane.active_image().cloned() {
+                render_radar_overlay(ui, projector, &img, ctx.pane, ctx.pane_rect);
             }
         }
 
@@ -228,8 +222,8 @@ pub(super) fn render_pane_map_content(
     #[cfg(target_os = "android")]
     if let Some(touch_pos) = ctx.long_press_pos {
         if ctx.pane_rect.contains(touch_pos) {
-            if let Some(img) = ctx.radar_image {
-                crate::ui::mobile::draw_long_press_tooltip(ui, projector, img, touch_pos, ctx.pane);
+            if let Some(img) = ctx.pane.active_image().cloned() {
+                crate::ui::mobile::draw_long_press_tooltip(ui, projector, &img, touch_pos, ctx.pane);
             }
         }
     }
@@ -288,9 +282,7 @@ fn render_radar_overlay(
     pane: &mut PaneState,
     pane_rect: egui::Rect,
 ) {
-    let bounds = pane
-        .cached_image_bounds
-        .unwrap_or_else(|| ImageBounds::from_radar_site(img.lat, img.lon));
+    let bounds = ImageBounds::from_radar_site(img.lat, img.lon);
 
     let nw = projector
         .project(walkers::lat_lon(bounds.max_lat, bounds.min_lon))

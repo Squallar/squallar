@@ -466,9 +466,10 @@ impl super::App {
             let Some(pane) = self.gui.pane_mut(resp.pane_idx) else {
                 continue;
             };
-            let Some(ls) = &mut pane.loop_state else {
+            let ls = &mut pane.loop_state;
+            if !ls.multi_frame {
                 continue;
-            };
+            }
             ls.fetching = false;
 
             // Populate frames (oldest-first, matching scan listing order)
@@ -585,9 +586,10 @@ impl super::App {
             let Some(pane) = self.gui.pane_mut(origin_pane) else {
                 continue;
             };
-            let Some(ls) = &mut pane.loop_state else {
+            let ls = &mut pane.loop_state;
+            if !ls.multi_frame {
                 continue;
-            };
+            }
 
             // Capture per-pane state needed for texture creation
             let lat = ls.site_lat;
@@ -638,7 +640,8 @@ impl super::App {
                     {
                         continue;
                     }
-                    let Some(sls) = &mut sibling.loop_state else { continue };
+                    let sls = &mut sibling.loop_state;
+                    if !sls.multi_frame { continue; }
                     let Some(sframe) = sls.frames.iter_mut().find(|f| f.timestamp == rr.timestamp) else {
                         continue;
                     };
@@ -659,8 +662,8 @@ impl super::App {
             // Mark panes as render_ready once their initial batch completes
             for pidx in 0..self.gui.pane_count() {
                 let Some(p) = self.gui.pane_mut(pidx) else { continue };
-                let Some(pls) = &mut p.loop_state else { continue };
-                if pls.render_ready || pls.frames.is_empty() {
+                let pls = &mut p.loop_state;
+                if !pls.multi_frame || pls.render_ready || pls.frames.is_empty() {
                     continue;
                 }
                 let any_rendered = pls.frames.iter().any(|f| f.texture.is_some());
@@ -687,9 +690,12 @@ impl super::App {
         let mut not_ready_panes: Vec<usize> = Vec::new();
         for idx in 0..pane_count {
             let Some(pane) = self.gui.pane(idx) else { continue };
-            let Some(ls) = &pane.loop_state else { continue };
-            if ls.playing {
-                continue; // Already playing
+            let ls = &pane.loop_state;
+            if !ls.multi_frame {
+                continue;
+            }
+            if ls.playback_started {
+                continue; // Already started (may be paused by user)
             }
             if ls.render_ready {
                 ready_panes.push(idx);
@@ -711,8 +717,9 @@ impl super::App {
         let now = std::time::Instant::now();
         for idx in ready_panes {
             let pane = self.gui.pane_mut(idx).unwrap();
-            let ls = pane.loop_state.as_mut().unwrap();
+            let ls = &mut pane.loop_state;
             ls.playing = true;
+            ls.playback_started = true;
             ls.last_advance = Some(now);
             // Align all panes to the last frame so they start from the same position
             if !ls.frames.is_empty() {
@@ -730,10 +737,8 @@ impl super::App {
             let Some(pane) = self.gui.pane_mut(pane_idx) else {
                 continue;
             };
-            let Some(ls) = &mut pane.loop_state else {
-                continue;
-            };
-            if !ls.playing || ls.frames.is_empty() {
+            let ls = &mut pane.loop_state;
+            if !ls.multi_frame || !ls.playing || ls.frames.is_empty() {
                 continue;
             }
 
@@ -765,9 +770,10 @@ impl super::App {
             let Some(pane) = self.gui.pane_mut(pane_idx) else {
                 continue;
             };
-            let Some(ls) = &mut pane.loop_state else {
+            let ls = &mut pane.loop_state;
+            if !ls.multi_frame {
                 continue;
-            };
+            }
             let num_frames = ls.frames.len();
             if num_frames == 0 {
                 continue;
@@ -805,10 +811,8 @@ impl super::App {
             let Some(pane) = self.gui.pane(pane_idx) else {
                 continue;
             };
-            let Some(ls) = &pane.loop_state else {
-                continue;
-            };
-            if ls.frames.is_empty() {
+            let ls = &pane.loop_state;
+            if !ls.multi_frame || ls.frames.is_empty() {
                 continue;
             }
 
@@ -858,7 +862,8 @@ impl super::App {
                         {
                             continue;
                         }
-                        let Some(sls) = &sibling.loop_state else { continue };
+                        let sls = &sibling.loop_state;
+                        if !sls.multi_frame { continue; }
                         if let Some(sframe) = sls.frames.iter().find(|f| f.timestamp == frame.timestamp) {
                             if sframe.texture.is_some() {
                                 found_sibling = Some(sibling_idx);
@@ -895,13 +900,13 @@ impl super::App {
             // Look up the texture from the source pane
             let cloned = {
                 let Some(src) = self.gui.pane(src_pane) else { continue };
-                let Some(sls) = &src.loop_state else { continue };
+                let sls = &src.loop_state;
                 let Some(sframe) = sls.frames.iter().find(|f| f.timestamp == timestamp) else { continue };
-                let Some(ref tex) = sframe.texture else { continue };
-                tex.clone()
+                let Some(tex) = sframe.texture.clone() else { continue };
+                tex
             };
             let Some(dest) = self.gui.pane_mut(dest_pane) else { continue };
-            let Some(dls) = &mut dest.loop_state else { continue };
+            let dls = &mut dest.loop_state;
             if let Some(dframe) = dls.frames.iter_mut().find(|f| f.timestamp == timestamp) {
                 dframe.texture = Some(cloned);
             }
@@ -918,9 +923,7 @@ impl super::App {
             let scan_arc = Arc::clone(self.loop_scan_cache.get(&ts).unwrap());
 
             if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                if let Some(ls) = &mut pane.loop_state {
-                    ls.frames[frame_idx].render_in_flight = true;
-                }
+                pane.loop_state.frames[frame_idx].render_in_flight = true;
             }
 
             self.spawn_loop_frame_render(

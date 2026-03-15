@@ -101,38 +101,35 @@ impl super::App {
             }
             GuiAction::ToggleLoopPlayback { pane_idx } => {
                 if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                    if let Some(ls) = &mut pane.loop_state {
-                        if ls.playing {
-                            // Always allow pause
-                            ls.playing = false;
-                        } else if ls.render_ready {
-                            ls.playing = true;
-                            ls.last_advance = Some(std::time::Instant::now());
-                        }
+                    let ls = &mut pane.loop_state;
+                    if ls.playing {
+                        // Always allow pause
+                        ls.playing = false;
+                    } else if ls.render_ready {
+                        ls.playing = true;
+                        ls.last_advance = Some(std::time::Instant::now());
                     }
                 }
             }
             GuiAction::StepLoopFrame { pane_idx, forward } => {
                 if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                    if let Some(ls) = &mut pane.loop_state {
-                        if !ls.frames.is_empty() {
-                            if forward {
-                                ls.current_frame = (ls.current_frame + 1) % ls.frames.len();
-                            } else if ls.current_frame == 0 {
-                                ls.current_frame = ls.frames.len() - 1;
-                            } else {
-                                ls.current_frame -= 1;
-                            }
+                    let ls = &mut pane.loop_state;
+                    if !ls.frames.is_empty() {
+                        if forward {
+                            ls.current_frame = (ls.current_frame + 1) % ls.frames.len();
+                        } else if ls.current_frame == 0 {
+                            ls.current_frame = ls.frames.len() - 1;
+                        } else {
+                            ls.current_frame -= 1;
                         }
                     }
                 }
             }
             GuiAction::SeekLoopFrame { pane_idx, frame_index } => {
                 if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                    if let Some(ls) = &mut pane.loop_state {
-                        if frame_index < ls.frames.len() {
-                            ls.current_frame = frame_index;
-                        }
+                    let ls = &mut pane.loop_state;
+                    if frame_index < ls.frames.len() {
+                        ls.current_frame = frame_index;
                     }
                 }
             }
@@ -199,6 +196,16 @@ impl super::App {
                 new_config.site = site.clone();
                 self.gui.set_radar_config(new_config.clone());
                 self.gui.set_loading_site(Some(site.clone()));
+
+                // Reset loop state on all panes so the old site's loop
+                // doesn't keep drawing over the new site.
+                for pane_idx in 0..self.gui.pane_count() {
+                    if let Some(pane) = self.gui.pane_mut(pane_idx) {
+                        pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new();
+                    }
+                }
+                self.loop_pending_downloads.clear();
+                self.loop_scan_cache.clear();
                 
                 let utc_timestamp = Self::local_to_utc(new_config.timestamp);
                 self.spawn_fetch(site, utc_timestamp);
@@ -450,17 +457,19 @@ impl super::App {
 
         // Initialize loop state on the pane
         if let Some(pane) = self.gui.pane_mut(pane_idx) {
-            pane.loop_state = Some(rustdar_egui::pane::LoopPlaybackState {
+            pane.loop_state = rustdar_egui::pane::LoopPlaybackState {
+                multi_frame: true,
                 playing: false,
                 current_frame: 0,
                 frames: Vec::new(),
                 lookback_secs,
                 fetching: true,
                 render_ready: false,
+                playback_started: false,
                 last_advance: None,
                 site_lat,
                 site_lon,
-            });
+            };
         }
 
         // Use the current scan's timestamp as the loop end time (not wall clock)
@@ -491,12 +500,17 @@ impl super::App {
         });
     }
 
-    /// Disable radar loop for a pane: clears loop state and all cached frames.
+    /// Disable radar loop for a pane: resets to single-frame mode.
     fn handle_disable_loop(&mut self, pane_idx: usize) {
         if let Some(pane) = self.gui.pane_mut(pane_idx) {
-            pane.loop_state = None;
+            pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new();
         }
         self.loop_pending_downloads.remove(&pane_idx);
+        // Clear last_rendered so dispatch_pane_renders will re-apply the
+        // cached static render (or spawn a fresh one) on the next frame.
+        if pane_idx < self.render.pane_render.len() {
+            self.render.pane_render[pane_idx].last_rendered = None;
+        }
         // Global scan cache and download tracking are left intact for other panes.
         // Stale entries are cleaned up lazily when no pane references them.
     }
@@ -692,9 +706,10 @@ impl super::App {
             let Some(pane) = self.gui.pane_mut(pane_idx) else {
                 continue;
             };
-            let Some(ls) = &mut pane.loop_state else {
+            let ls = &mut pane.loop_state;
+            if !ls.multi_frame {
                 continue;
-            };
+            }
 
             // Skip if this timestamp already exists
             if ls.frames.iter().any(|f| f.timestamp == timestamp) {
@@ -739,8 +754,8 @@ impl super::App {
         let mut to_reinit = Vec::new();
         for pane_idx in 0..self.gui.pane_count() {
             if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                if let Some(ls) = &pane.loop_state {
-                    to_reinit.push((pane_idx, ls.lookback_secs));
+                if pane.loop_state.multi_frame {
+                    to_reinit.push((pane_idx, pane.loop_state.lookback_secs));
                 }
             }
         }

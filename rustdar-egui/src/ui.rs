@@ -585,7 +585,7 @@ impl Gui {
         actions: &mut Vec<GuiAction>,
     ) {
         ui.add_space(4.0);
-        let loop_active = pane.loop_state.is_some();
+        let loop_active = pane.loop_state.multi_frame;
 
         // Enable/disable toggle
         let mut enabled = loop_active;
@@ -637,7 +637,8 @@ impl Gui {
                     );
                 });
 
-                if let Some(ls) = &pane.loop_state {
+                {
+                    let ls = &pane.loop_state;
                     // Frame status
                     let rendered = ls.frames.iter().filter(|f| f.texture.is_some()).count();
                     let total = ls.frames.len();
@@ -1056,9 +1057,8 @@ impl Gui {
     /// Whether any pane has a loop that is playing or has in-flight work.
     pub fn any_loop_active(&self) -> bool {
         self.panes.iter().any(|p| {
-            p.loop_state.as_ref().is_some_and(|ls| {
-                ls.playing || ls.fetching || ls.frames.iter().any(|f| f.render_in_flight)
-            })
+            let ls = &p.loop_state;
+            ls.multi_frame && (ls.playing || ls.fetching || ls.frames.iter().any(|f| f.render_in_flight))
         })
     }
 
@@ -1068,11 +1068,9 @@ impl Gui {
             // Clear loop frame textures so they get re-rendered on resume.
             // The frame list and scan cache survive, so dispatch_loop_renders()
             // will re-upload textures automatically.
-            if let Some(ls) = &mut pane.loop_state {
-                for frame in &mut ls.frames {
-                    frame.texture = None;
-                    frame.render_in_flight = false;
-                }
+            for frame in &mut pane.loop_state.frames {
+                frame.texture = None;
+                frame.render_in_flight = false;
             }
             // Clear overlay texture caches — handles become invalid when the
             // egui context is destroyed. needs_rerender() will trigger fresh

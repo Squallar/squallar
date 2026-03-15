@@ -1,6 +1,6 @@
 use rustdar_overlays::render::layers::LayerManager;
 use crate::overlay_cache::OverlayTextureCache;
-use rustdar_radar::types::{ImageBounds, RadarProduct, ScanInfo};
+use rustdar_radar::types::{RadarProduct, ScanInfo};
 use chrono::NaiveDateTime;
 use std::sync::Arc;
 use walkers::MapMemory;
@@ -29,7 +29,14 @@ pub struct LoopFrame {
 }
 
 /// Per-pane loop playback state.
+///
+/// Always present on every pane. In single-frame mode (`multi_frame == false`),
+/// `frames` holds at most one entry — the current static radar image. When the
+/// user enables loop mode, `multi_frame` is set to `true` and multiple
+/// historical frames are fetched and rendered.
 pub struct LoopPlaybackState {
+    /// Whether this pane is in multi-frame (animated loop) mode.
+    pub multi_frame: bool,
     /// Whether the loop is actively playing (animating).
     pub playing: bool,
     /// Index of the currently displayed frame in `frames`.
@@ -42,6 +49,9 @@ pub struct LoopPlaybackState {
     pub fetching: bool,
     /// True once the initial render batch is complete and playback can start.
     pub render_ready: bool,
+    /// True once playback has been auto-started after the initial render batch.
+    /// Prevents `sync_loop_playback_start` from overriding a user pause.
+    pub playback_started: bool,
     /// Instant of the last frame advance (for animation timing).
     pub last_advance: Option<std::time::Instant>,
     /// Radar site latitude, captured at loop creation for rendering.
@@ -55,8 +65,6 @@ pub struct LoopPlaybackState {
 pub struct PaneState {
     pub selected_product: RadarProduct,
     pub selected_elevation: f32,
-    pub radar_image: Option<RadarImageData>,
-    pub cached_image_bounds: Option<ImageBounds>,
     pub hover_value: Option<String>,
     pub last_hover_pos: Option<egui::Pos2>,
     pub layers: LayerManager,
@@ -65,8 +73,29 @@ pub struct PaneState {
     pub spc_overlay_texture: OverlayTextureCache,
     pub nws_alert_texture: OverlayTextureCache,
     pub spc_md_texture: OverlayTextureCache,
-    /// Radar loop state: `Some` when loop mode is enabled for this pane.
-    pub loop_state: Option<LoopPlaybackState>,
+    /// Radar display state. Always present; in single-frame mode holds at most
+    /// one frame (the current static radar image). In multi-frame mode holds
+    /// the full animated loop.
+    pub loop_state: LoopPlaybackState,
+}
+
+impl LoopPlaybackState {
+    /// Create a default single-frame (non-loop) state.
+    pub fn new() -> Self {
+        Self {
+            multi_frame: false,
+            playing: false,
+            current_frame: 0,
+            frames: Vec::new(),
+            lookback_secs: 0,
+            fetching: false,
+            render_ready: false,
+            playback_started: false,
+            last_advance: None,
+            site_lat: 0.0,
+            site_lon: 0.0,
+        }
+    }
 }
 
 impl PaneState {
@@ -76,8 +105,6 @@ impl PaneState {
         Self {
             selected_product: RadarProduct::Reflectivity,
             selected_elevation: 0.0,
-            radar_image: None,
-            cached_image_bounds: None,
             hover_value: None,
             last_hover_pos: None,
             layers: LayerManager::new(),
@@ -85,8 +112,15 @@ impl PaneState {
             spc_overlay_texture: OverlayTextureCache::new(),
             nws_alert_texture: OverlayTextureCache::new(),
             spc_md_texture: OverlayTextureCache::new(),
-            loop_state: None,
+            loop_state: LoopPlaybackState::new(),
         }
+    }
+
+    /// The currently active radar image (from loop frame or static render).
+    pub fn active_image(&self) -> Option<&RadarImageData> {
+        self.loop_state.frames
+            .get(self.loop_state.current_frame)
+            .and_then(|f| f.texture.as_ref())
     }
 
     /// Get rendering params for this pane (product + closest elevation).
@@ -111,7 +145,8 @@ impl PaneState {
         })
     }
 
-    /// Set the radar image to display on the map.
+    /// Set the radar image to display on the map (single-frame mode).
+    /// Replaces the current frames with a single frame holding the given texture.
     pub fn set_radar_image(
         &mut self,
         texture: egui::TextureHandle,
@@ -120,25 +155,42 @@ impl PaneState {
         max_range_km: f64,
         value_data: Vec<f32>,
     ) {
-        self.radar_image = Some(RadarImageData {
-            texture,
-            lat,
-            lon,
-            max_range_km,
-            value_data: Arc::new(value_data),
-        });
-        self.cached_image_bounds = Some(ImageBounds::from_radar_site(lat, lon));
+        if !self.loop_state.multi_frame {
+            self.loop_state.frames.clear();
+            self.loop_state.frames.push(LoopFrame {
+                timestamp: chrono::NaiveDateTime::default(),
+                texture: Some(RadarImageData {
+                    texture,
+                    lat,
+                    lon,
+                    max_range_km,
+                    value_data: Arc::new(value_data),
+                }),
+                render_in_flight: false,
+            });
+            self.loop_state.current_frame = 0;
+            self.loop_state.site_lat = lat;
+            self.loop_state.site_lon = lon;
+        }
     }
 
-    /// Clear the radar image.
+    /// Clear the radar image (single-frame mode).
     pub fn clear_radar_image(&mut self) {
-        self.radar_image = None;
-        self.cached_image_bounds = None;
+        if !self.loop_state.multi_frame {
+            self.loop_state.frames.clear();
+            self.loop_state.current_frame = 0;
+        }
     }
 
-    /// Take the radar image, removing it from this pane.
+    /// Take the radar image, removing it from this pane (single-frame mode).
     pub fn take_radar_image(&mut self) -> Option<RadarImageData> {
-        self.radar_image.take()
+        if !self.loop_state.multi_frame {
+            self.loop_state.frames
+                .first_mut()
+                .and_then(|f| f.texture.take())
+        } else {
+            None
+        }
     }
 }
 

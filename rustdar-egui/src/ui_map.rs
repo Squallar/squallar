@@ -87,9 +87,6 @@ impl super::Gui {
                         Position::new(-98.5795, 39.8283) // Geographic center of contiguous USA
                     };
 
-                    // Clone radar image data for use in closure
-                    let radar_image = pane.radar_image.clone();
-
                     // Clone user location for use in closure
                     let user_location = self.user_location;
 
@@ -169,7 +166,6 @@ impl super::Gui {
                                 pane_idx,
                                 pane: &mut pane,
                                 overlays: &mut self.overlays,
-                                radar_image: &radar_image,
                                 user_location,
                                 label_tiles: &mut label_tiles,
                                 actions: &mut actions,
