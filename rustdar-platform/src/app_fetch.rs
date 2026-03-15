@@ -89,8 +89,9 @@ impl super::App {
             | GuiAction::RefreshNwsAlerts
             | GuiAction::FetchSpcDiscussions
             | GuiAction::RefreshSpcDiscussions => self.handle_overlay_action(action),
-            GuiAction::RenderOverlay { pane_idx, overlay_kind, geo_bounds, width, height, data_generation, zoom } => {
-                self.spawn_overlay_render(pane_idx, overlay_kind, geo_bounds, width, height, data_generation, zoom);
+            GuiAction::RenderOverlay { .. } => {
+                // Handled in process_gui_actions() with deduplication
+                unreachable!("RenderOverlay should be intercepted by process_gui_actions");
             }
             GuiAction::EnableLoop { pane_idx, lookback_secs } => {
                 self.handle_enable_loop(pane_idx, lookback_secs);
@@ -278,9 +279,9 @@ impl super::App {
     }
 
     /// Spawn a background thread to rasterize overlay polygons via tiny-skia.
-    fn spawn_overlay_render(
+    pub(super) fn spawn_overlay_render(
         &mut self,
-        pane_idx: usize,
+        pane_indices: Vec<usize>,
         kind: OverlayRenderKind,
         geo_bounds: rustdar_overlays::types::GeoBounds,
         width: u32,
@@ -295,9 +296,11 @@ impl super::App {
             return;
         }
 
-        // Mark in-flight on the appropriate texture cache
-        if let Some(cache) = self.pane_overlay_cache_mut(pane_idx, &kind) {
-            cache.render_in_flight = true;
+        // Mark in-flight on the appropriate texture cache for all target panes
+        for &pidx in &pane_indices {
+            if let Some(cache) = self.pane_overlay_cache_mut(pidx, &kind) {
+                cache.render_in_flight = true;
+            }
         }
 
         // Expand geo_bounds by overdraw fraction, clamped to valid Mercator range
@@ -311,11 +314,12 @@ impl super::App {
             max_lon: geo_bounds.max_lon + lon_range * overdraw,
         };
 
-        let Some(target_pane) = self.gui.pane(pane_idx) else { return };
+        // Use the first target pane for data extraction (all synced panes share config)
+        let first_pane_idx = pane_indices[0];
+        let Some(target_pane) = self.gui.pane(first_pane_idx) else { return };
         let overlay_type = match kind {
             OverlayRenderKind::SpcOutlook => OverlayType::SpcOutlook(
                 target_pane.layers.spc_day,
-                // The texture combines all enabled products — just use Categorical as tag.
                 rustdar_overlays::spc::outlook::OutlookProduct::Categorical,
             ),
             OverlayRenderKind::SpcDiscussions => OverlayType::SpcDiscussions,
@@ -361,7 +365,7 @@ impl super::App {
                         geo_bounds: render_bounds,
                         overlay_type,
                         generation: data_generation,
-                        pane_idx,
+                        pane_indices,
                         zoom,
                     });
                     super::notify_redraw(&window);
@@ -383,7 +387,7 @@ impl super::App {
                         geo_bounds: render_bounds,
                         overlay_type,
                         generation: data_generation,
-                        pane_idx,
+                        pane_indices,
                         zoom,
                     });
                     super::notify_redraw(&window);
@@ -409,7 +413,7 @@ impl super::App {
                         geo_bounds: render_bounds,
                         overlay_type,
                         generation: data_generation,
-                        pane_idx,
+                        pane_indices,
                         zoom,
                     });
                     super::notify_redraw(&window);
@@ -441,10 +445,8 @@ impl super::App {
         let site_lon = scan_info.site.lon;
         let scan_timestamp = scan_info.timestamp;
 
-        // Clear old cached scans and pending downloads for this pane
-        self.loop_scan_cache.remove(&pane_idx);
+        // Clear pending downloads for this pane (global cache is kept for sharing)
         self.loop_pending_downloads.remove(&pane_idx);
-        self.loop_downloads_in_flight.remove(&pane_idx);
 
         // Initialize loop state on the pane
         if let Some(pane) = self.gui.pane_mut(pane_idx) {
@@ -494,9 +496,9 @@ impl super::App {
         if let Some(pane) = self.gui.pane_mut(pane_idx) {
             pane.loop_state = None;
         }
-        self.loop_scan_cache.remove(&pane_idx);
         self.loop_pending_downloads.remove(&pane_idx);
-        self.loop_downloads_in_flight.remove(&pane_idx);
+        // Global scan cache and download tracking are left intact for other panes.
+        // Stale entries are cleaned up lazily when no pane references them.
     }
 
     /// Navigate by a relative time step (seconds). Positive = forward, negative = backward.
@@ -683,6 +685,9 @@ impl super::App {
     ) {
         use rustdar_egui::pane::LoopFrame;
 
+        // Store in global cache for all panes to use
+        self.loop_scan_cache.insert(timestamp, std::sync::Arc::clone(&scan));
+
         for pane_idx in 0..self.gui.pane_count() {
             let Some(pane) = self.gui.pane_mut(pane_idx) else {
                 continue;
@@ -704,12 +709,6 @@ impl super::App {
                 render_in_flight: false,
             });
 
-            // Cache the scan data for rendering
-            self.loop_scan_cache
-                .entry(pane_idx)
-                .or_default()
-                .insert(timestamp, std::sync::Arc::clone(&scan));
-
             // Evict frames outside the lookback window
             let lookback = chrono::Duration::seconds(ls.lookback_secs as i64);
             if let Some(newest) = ls.frames.last().map(|f| f.timestamp) {
@@ -721,10 +720,6 @@ impl super::App {
                     // Adjust current_frame if needed
                     if ls.current_frame >= ls.frames.len() {
                         ls.current_frame = ls.frames.len().saturating_sub(1);
-                    }
-                    // Clean up evicted scan cache entries
-                    if let Some(cache) = self.loop_scan_cache.get_mut(&pane_idx) {
-                        cache.retain(|ts, _| *ts >= cutoff);
                     }
                 }
             }

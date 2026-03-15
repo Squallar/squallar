@@ -27,9 +27,9 @@ pub struct ScanResponse {
 
 /// Result from a background radar render thread.
 pub struct RenderResponse {
-    pub image_data: Vec<u8>,
+    pub image_data: Arc<Vec<u8>>,
     pub max_range_km: f64,
-    pub value_data: Vec<f32>,
+    pub value_data: Arc<Vec<f32>>,
     pub product: RadarProduct,
     pub elevation: f32,
     pub generation: u64,
@@ -73,7 +73,7 @@ pub struct OverlayRenderResponse {
     pub geo_bounds: GeoBounds,
     pub overlay_type: OverlayType,
     pub generation: u64,
-    pub pane_idx: usize,
+    pub pane_indices: Vec<usize>,
     pub zoom: i32,
 }
 

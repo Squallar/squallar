@@ -28,7 +28,7 @@ pub struct PaneRenderState {
     pub last_rendered: Option<(RadarProduct, f32)>,
     /// Cached raw RGBA + metadata from the last successful render so we can
     /// re-upload the texture instantly after suspend/resume without re-rendering.
-    pub cached_render: Option<(Vec<u8>, f64, Vec<f32>, RadarProduct, f32)>,
+    pub cached_render: Option<(Arc<Vec<u8>>, f64, Arc<Vec<f32>>, RadarProduct, f32)>,
 }
 
 impl PaneRenderState {
@@ -39,6 +39,19 @@ impl PaneRenderState {
             cached_render: None,
         }
     }
+}
+
+/// Cached radar render output, shared across panes that show the same product/elevation.
+pub struct CachedRenderOutput {
+    pub image_data: Arc<Vec<u8>>,
+    pub max_range_km: f64,
+    pub value_data: Arc<Vec<f32>>,
+}
+
+/// Quantize an elevation angle to tenths of a degree for cache key use.
+/// Matches the 0.01 tolerance used in `dispatch_pane_renders()`.
+fn elevation_key(elevation: f32) -> i32 {
+    (elevation * 10.0).round() as i32
 }
 
 /// Manages radar rendering dispatch and Level III data caching.
@@ -56,6 +69,9 @@ pub struct RenderDispatcher {
     pub fetch_generation: u64,
     /// Shared counter for concurrent background render threads.
     pub renders_in_flight: Arc<AtomicUsize>,
+    /// Cache of the latest render output per (product, elevation_tenths), shared
+    /// across panes that display the same product at the same elevation.
+    pub render_cache: HashMap<(RadarProduct, i32), CachedRenderOutput>,
 }
 
 impl RenderDispatcher {
@@ -66,6 +82,7 @@ impl RenderDispatcher {
             render_generation: 0,
             fetch_generation: 0,
             renders_in_flight,
+            render_cache: HashMap::new(),
         }
     }
 
@@ -85,6 +102,7 @@ impl RenderDispatcher {
         }
         self.render_generation += 1;
         self.level3_data.clear();
+        self.render_cache.clear();
     }
 
     /// Clear render state for suspend/resume or surface loss.
@@ -114,6 +132,16 @@ impl RenderDispatcher {
     /// Check if a render generation is stale.
     pub fn is_render_stale(&self, generation: u64) -> bool {
         generation < self.render_generation
+    }
+
+    /// Look up a cached render result for the given product and elevation.
+    pub fn get_cached_render(&self, product: RadarProduct, elevation: f32) -> Option<&CachedRenderOutput> {
+        self.render_cache.get(&(product, elevation_key(elevation)))
+    }
+
+    /// Store a render result in the cache for sharing across panes.
+    pub fn cache_render(&mut self, product: RadarProduct, elevation: f32, output: CachedRenderOutput) {
+        self.render_cache.insert((product, elevation_key(elevation)), output);
     }
 
     /// Spawn a Level III render for a pane if applicable.
@@ -200,9 +228,9 @@ impl RenderDispatcher {
             let _guard = guard;
             if let Some((image, range, values)) = render_fn() {
                 let _ = sender.send(RenderResponse {
-                    image_data: image,
+                    image_data: Arc::new(image),
                     max_range_km: range,
-                    value_data: values,
+                    value_data: Arc::new(values),
                     product,
                     elevation,
                     generation,

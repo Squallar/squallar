@@ -62,12 +62,14 @@ pub struct App {
     tokio_runtime: tokio::runtime::Runtime,
     // Shared HTTP client for overlay data fetches (SPC, etc.)
     http_client: reqwest::Client,
-    // Downloaded scan data cache for loop frames, keyed by (pane_idx, timestamp).
-    loop_scan_cache: std::collections::HashMap<usize, std::collections::HashMap<chrono::NaiveDateTime, Arc<nexrad_model::data::Scan>>>,
+    // Downloaded scan data cache for loop frames, keyed by timestamp (shared across panes).
+    loop_scan_cache: std::collections::HashMap<chrono::NaiveDateTime, Arc<nexrad_model::data::Scan>>,
+    // Timestamps currently being downloaded (to avoid duplicate downloads across panes).
+    loop_downloads_in_flight_set: std::collections::HashSet<chrono::NaiveDateTime>,
     // Pending loop scan downloads per pane, waiting to be dispatched (throttled).
     loop_pending_downloads: std::collections::HashMap<usize, Vec<(chrono::NaiveDateTime, nexrad_data::aws::archive::Identifier)>>,
-    // Number of loop scan downloads currently in flight per pane.
-    loop_downloads_in_flight: std::collections::HashMap<usize, usize>,
+    // Number of loop scan downloads currently in flight (global, not per-pane).
+    loop_downloads_in_flight: usize,
     // Shared counter for background render threads in flight (loop + static renders).
     renders_in_flight: Arc<AtomicUsize>,
     // Cached latest scan from auto-poll while viewing historic data.
@@ -122,8 +124,9 @@ impl App {
             http_client,
             tokio_runtime,
             loop_scan_cache: std::collections::HashMap::new(),
+            loop_downloads_in_flight_set: std::collections::HashSet::new(),
             loop_pending_downloads: std::collections::HashMap::new(),
-            loop_downloads_in_flight: std::collections::HashMap::new(),
+            loop_downloads_in_flight: 0,
             renders_in_flight: Arc::new(AtomicUsize::new(0)),
             latest_cached_scan: None,
             manual_nav_pending: false,
@@ -217,11 +220,49 @@ impl App {
 
     /// Process all GUI actions emitted during this frame.
     fn process_gui_actions(&mut self, actions: Vec<GuiAction>) {
+        use rustdar_egui::actions::OverlayRenderKind;
+
+        // Separate overlay render actions for deduplication
+        let mut overlay_renders: Vec<(usize, OverlayRenderKind, rustdar_overlays::types::GeoBounds, u32, u32, u64, i32)> = Vec::new();
+
         for action in actions {
-            if !matches!(action, GuiAction::RenderOverlay { .. }) {
+            if let GuiAction::RenderOverlay { pane_idx, overlay_kind, geo_bounds, width, height, data_generation, zoom } = action {
+                overlay_renders.push((pane_idx, overlay_kind, geo_bounds, width, height, data_generation, zoom));
+            } else {
                 log::debug!("GUI action received: {}", action);
+                self.handle_gui_action(action, None);
             }
-            self.handle_gui_action(action, None);
+        }
+
+        // Deduplicate overlay renders: when viewport_sync is on, group by
+        // (overlay_kind, zoom, data_generation, width, height) and spawn one render for all panes
+        if !overlay_renders.is_empty() {
+            if self.gui.is_viewport_sync() {
+                let mut grouped: std::collections::HashMap<
+                    (std::mem::Discriminant<OverlayRenderKind>, i32, u64, u32, u32),
+                    (OverlayRenderKind, rustdar_overlays::types::GeoBounds, u32, u32, u64, i32, Vec<usize>),
+                > = std::collections::HashMap::new();
+
+                for (pane_idx, kind, bounds, w, h, data_gen, zoom) in overlay_renders {
+                    let key = (std::mem::discriminant(&kind), zoom, data_gen, w, h);
+                    grouped.entry(key)
+                        .and_modify(|(_k, _b, _w, _h, _g, _z, panes)| {
+                            if !panes.contains(&pane_idx) {
+                                panes.push(pane_idx);
+                            }
+                        })
+                        .or_insert_with(|| (kind.clone(), bounds, w, h, data_gen, zoom, vec![pane_idx]));
+                }
+
+                for (_key, (kind, bounds, w, h, data_gen, zoom, pane_indices)) in grouped {
+                    log::debug!("Spawning overlay render for {:?} targeting {} panes", kind, pane_indices.len());
+                    self.spawn_overlay_render(pane_indices, kind, bounds, w, h, data_gen, zoom);
+                }
+            } else {
+                for (pane_idx, kind, bounds, w, h, data_gen, zoom) in overlay_renders {
+                    self.spawn_overlay_render(vec![pane_idx], kind, bounds, w, h, data_gen, zoom);
+                }
+            }
         }
     }
 

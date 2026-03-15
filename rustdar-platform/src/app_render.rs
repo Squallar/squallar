@@ -74,7 +74,7 @@ impl super::App {
 
     /// Poll for completed background render results and upload textures.
     fn poll_render_results(&mut self) {
-        let ctx = self.state.as_ref().unwrap().egui_renderer.context();
+        let ctx = self.state.as_ref().unwrap().egui_renderer.context().clone();
         while let Ok(rr) = self.channels.render_receiver.try_recv() {
             if rr.pane_idx < self.render.pane_render.len() {
                 self.render.pane_render[rr.pane_idx].render_in_flight = false;
@@ -91,42 +91,97 @@ impl super::App {
                 continue;
             }
 
-            // Save the old texture to be cleaned up after this frame completes
-            if let Some(old_img) = self.gui.take_radar_image_for_pane(rr.pane_idx) {
-                self.old_textures.push(old_img.texture);
+            // Extract fields to avoid borrow issues
+            let image_data = rr.image_data;
+            let max_range_km = rr.max_range_km;
+            let value_data = rr.value_data;
+            let product = rr.product;
+            let elevation = rr.elevation;
+            let origin_pane = rr.pane_idx;
+
+            // Cache the render output for sharing with other panes
+            self.render.cache_render(product, elevation, crate::render_dispatch::CachedRenderOutput {
+                image_data: Arc::clone(&image_data),
+                max_range_km,
+                value_data: Arc::clone(&value_data),
+            });
+
+            // Apply to the originating pane
+            self.apply_render_to_pane(&ctx, origin_pane, &image_data, max_range_km, &value_data, product, elevation);
+
+            // Broadcast to sibling panes that need the same product+elevation
+            let pane_count = self.gui.pane_count();
+            for other_idx in 0..pane_count {
+                if other_idx == origin_pane {
+                    continue;
+                }
+                let Some((other_product, other_elevation)) = self.gui.get_rendering_params_for_pane(other_idx) else {
+                    continue;
+                };
+                if other_product == product && (other_elevation - elevation).abs() <= 0.01 {
+                    let needs = other_idx < self.render.pane_render.len()
+                        && self.render.pane_render[other_idx]
+                            .last_rendered
+                            .map(|(lp, le)| lp != other_product || (le - other_elevation).abs() > 0.01)
+                            .unwrap_or(true);
+                    if needs {
+                        self.apply_render_to_pane(&ctx, other_idx, &image_data, max_range_km, &value_data, product, elevation);
+                    }
+                }
             }
+        }
+    }
 
-            self.texture_counter += 1;
-            let color_image =
-                egui::ColorImage::from_rgba_unmultiplied([1800, 1800], &rr.image_data);
-            let texture_name = format!("radar_image_{}", self.texture_counter);
-            let texture = ctx.load_texture(
-                texture_name,
-                color_image,
-                egui::TextureOptions::NEAREST,
-            );
+    /// Apply a rendered radar image to a specific pane (upload texture + update state).
+    fn apply_render_to_pane(
+        &mut self,
+        ctx: &egui::Context,
+        pane_idx: usize,
+        image_data: &Arc<Vec<u8>>,
+        max_range_km: f64,
+        value_data: &Arc<Vec<f32>>,
+        product: rustdar_radar::types::RadarProduct,
+        elevation: f32,
+    ) {
+        // Save the old texture to be cleaned up after this frame completes
+        if let Some(old_img) = self.gui.take_radar_image_for_pane(pane_idx) {
+            self.old_textures.push(old_img.texture);
+        }
 
-            // Cache the raw image data for fast restore after suspend/resume
-            self.render.pane_render[rr.pane_idx].cached_render = Some((
-                rr.image_data,
-                rr.max_range_km,
-                rr.value_data.clone(),
-                rr.product,
-                rr.elevation,
+        self.texture_counter += 1;
+        let color_image =
+            egui::ColorImage::from_rgba_unmultiplied([1800, 1800], image_data);
+        let texture_name = format!("radar_image_{}", self.texture_counter);
+        let texture = ctx.load_texture(
+            texture_name,
+            color_image,
+            egui::TextureOptions::NEAREST,
+        );
+
+        // Cache the raw image data for fast restore after suspend/resume
+        if pane_idx < self.render.pane_render.len() {
+            self.render.pane_render[pane_idx].cached_render = Some((
+                Arc::clone(image_data),
+                max_range_km,
+                Arc::clone(value_data),
+                product,
+                elevation,
             ));
+        }
 
-            if let Some(scan_info) = self.gui.get_scan_info() {
-                self.gui.set_radar_image_for_pane(
-                    rr.pane_idx,
-                    texture,
-                    scan_info.site.lat,
-                    scan_info.site.lon,
-                    rr.max_range_km,
-                    rr.value_data,
-                );
-            }
+        if let Some(scan_info) = self.gui.get_scan_info() {
+            self.gui.set_radar_image_for_pane(
+                pane_idx,
+                texture,
+                scan_info.site.lat,
+                scan_info.site.lon,
+                max_range_km,
+                value_data.to_vec(),
+            );
+        }
 
-            self.render.pane_render[rr.pane_idx].last_rendered = Some((rr.product, rr.elevation));
+        if pane_idx < self.render.pane_render.len() {
+            self.render.pane_render[pane_idx].last_rendered = Some((product, elevation));
         }
     }
 
@@ -191,49 +246,53 @@ impl super::App {
 
         let ctx = self.state.as_ref().unwrap().egui_renderer.context();
         while let Ok(resp) = self.channels.overlay_render_receiver.try_recv() {
-            let Some(pane) = self.gui.pane_mut(resp.pane_idx) else {
-                continue;
-            };
-
-            let cache = match resp.overlay_type {
-                OverlayType::SpcOutlook(..) => &mut pane.spc_overlay_texture,
-                OverlayType::SpcDiscussions => &mut pane.spc_md_texture,
-                OverlayType::NwsAlerts => &mut pane.nws_alert_texture,
-            };
-
-            cache.render_in_flight = false;
-
-            // Discard stale results
-            if resp.generation < cache.render_generation {
-                continue;
-            }
-
+            // Load texture once, then clone handle to all target panes
             self.texture_counter += 1;
             let color_image = egui::ColorImage::from_rgba_unmultiplied(
                 [resp.width as usize, resp.height as usize],
                 &resp.image_data,
             );
-            let tex_name = format!("overlay_{}_{}", resp.pane_idx, self.texture_counter);
-
-            // Save old texture for deferred cleanup
-            if let Some(old) = cache.current.take() {
-                self.old_textures.push(old.texture);
-            }
-
+            let tex_name = format!("overlay_{}", self.texture_counter);
             let texture = ctx.load_texture(tex_name, color_image, egui::TextureOptions::LINEAR);
-            cache.current = Some(OverlayTextureData {
-                texture,
-                geo_bounds: resp.geo_bounds,
-                data_generation: resp.generation,
-                render_zoom: resp.zoom,
-                width: resp.width,
-                height: resp.height,
-            });
+
+            for &pane_idx in &resp.pane_indices {
+                let Some(pane) = self.gui.pane_mut(pane_idx) else {
+                    continue;
+                };
+
+                let cache = match resp.overlay_type {
+                    OverlayType::SpcOutlook(..) => &mut pane.spc_overlay_texture,
+                    OverlayType::SpcDiscussions => &mut pane.spc_md_texture,
+                    OverlayType::NwsAlerts => &mut pane.nws_alert_texture,
+                };
+
+                cache.render_in_flight = false;
+
+                // Discard stale results
+                if resp.generation < cache.render_generation {
+                    continue;
+                }
+
+                // Save old texture for deferred cleanup
+                if let Some(old) = cache.current.take() {
+                    self.old_textures.push(old.texture);
+                }
+
+                cache.current = Some(OverlayTextureData {
+                    texture: texture.clone(),
+                    geo_bounds: resp.geo_bounds.clone(),
+                    data_generation: resp.generation,
+                    render_zoom: resp.zoom,
+                    width: resp.width,
+                    height: resp.height,
+                });
+            }
         }
     }
 
     /// Check all panes for needed background renders and spawn render threads.
     fn dispatch_pane_renders(&mut self) {
+        let ctx = self.state.as_ref().unwrap().egui_renderer.context().clone();
         for pane_idx in 0..self.gui.pane_count() {
             if let Some((product, elevation)) = self.gui.get_rendering_params_for_pane(pane_idx) {
                 let prs = &self.render.pane_render[pane_idx];
@@ -245,6 +304,16 @@ impl super::App {
                     .unwrap_or(true);
 
                 if needs_render && !prs.render_in_flight {
+                    // Check if another pane already rendered this product+elevation
+                    if let Some(cached) = self.render.get_cached_render(product, elevation) {
+                        let image_data = Arc::clone(&cached.image_data);
+                        let max_range_km = cached.max_range_km;
+                        let value_data = Arc::clone(&cached.value_data);
+                        log::info!("Reusing cached render for pane {}: {:?} at {:.1}°", pane_idx, product, elevation);
+                        self.apply_render_to_pane(&ctx, pane_idx, &image_data, max_range_km, &value_data, product, elevation);
+                        continue;
+                    }
+
                     if product.is_level3() {
                         if let Some(scan_info) = self.gui.get_scan_info() {
                             self.render.try_spawn_level3_render(
@@ -319,7 +388,7 @@ impl super::App {
                 scan_info.site.lat,
                 scan_info.site.lon,
                 max_range_km,
-                value_data.clone(),
+                value_data.to_vec(),
             );
             self.render.pane_render[pane_idx].last_rendered = Some((product, elevation));
         }
@@ -444,40 +513,36 @@ impl super::App {
 
             // Store all scans as pending downloads and dispatch the first batch
             self.loop_pending_downloads.insert(resp.pane_idx, scans);
-            self.loop_downloads_in_flight.insert(resp.pane_idx, 0);
             self.dispatch_pending_loop_downloads(resp.pane_idx);
         }
     }
 
     /// Poll for completed loop scan downloads. When a scan arrives, store it
-    /// in the loop_scan_cache and dispatch the next pending download.
+    /// in the global loop_scan_cache and dispatch next pending downloads.
     fn poll_loop_scan_download_results(&mut self) {
-        let mut pane_completions: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut completed_count = 0usize;
         while let Ok(resp) = self.channels.loop_scan_download_receiver.try_recv() {
-            // Cache the downloaded scan for rendering (skip failures)
-            if let Some(scan) = resp.scan {
-                self.loop_scan_cache
-                    .entry(resp.pane_idx)
-                    .or_default()
-                    .insert(resp.timestamp, scan);
-            }
+            self.loop_downloads_in_flight_set.remove(&resp.timestamp);
+            completed_count += 1;
 
-            // Track per-pane completion count for download throttling
-            *pane_completions.entry(resp.pane_idx).or_insert(0) += 1;
-        }
-        // Dispatch next pending downloads for panes that had completions
-        for (pane_idx, completed) in pane_completions {
-            if let Some(count) = self.loop_downloads_in_flight.get_mut(&pane_idx) {
-                *count = count.saturating_sub(completed);
+            // Cache the downloaded scan globally (skip failures)
+            if let Some(scan) = resp.scan {
+                self.loop_scan_cache.insert(resp.timestamp, scan);
             }
-            self.dispatch_pending_loop_downloads(pane_idx);
+        }
+        if completed_count > 0 {
+            self.loop_downloads_in_flight = self.loop_downloads_in_flight.saturating_sub(completed_count);
+            // Dispatch next pending downloads for all panes that have pending work
+            let pane_indices: Vec<usize> = self.loop_pending_downloads.keys().copied().collect();
+            for pane_idx in pane_indices {
+                self.dispatch_pending_loop_downloads(pane_idx);
+            }
         }
     }
 
     /// Dispatch pending loop scan downloads up to the concurrency limit.
     fn dispatch_pending_loop_downloads(&mut self, pane_idx: usize) {
-        let in_flight = *self.loop_downloads_in_flight.get(&pane_idx).unwrap_or(&0);
-        let slots = MAX_CONCURRENT_LOOP_DOWNLOADS.saturating_sub(in_flight);
+        let slots = MAX_CONCURRENT_LOOP_DOWNLOADS.saturating_sub(self.loop_downloads_in_flight);
         if slots == 0 {
             return;
         }
@@ -485,35 +550,50 @@ impl super::App {
         let Some(pending) = self.loop_pending_downloads.get_mut(&pane_idx) else {
             return;
         };
-        let batch: Vec<_> = pending.drain(..slots.min(pending.len())).collect();
+
+        // Filter out timestamps already cached or in flight
+        let mut batch = Vec::new();
+        while !pending.is_empty() && batch.len() < slots {
+            let (ts, _) = &pending[0];
+            if self.loop_scan_cache.contains_key(ts) || self.loop_downloads_in_flight_set.contains(ts) {
+                // Already have or fetching this timestamp — remove from pending
+                pending.remove(0);
+            } else {
+                batch.push(pending.remove(0));
+            }
+        }
         let spawned = batch.len();
 
         for (ts, id) in batch {
+            self.loop_downloads_in_flight_set.insert(ts);
             self.spawn_loop_scan_download(pane_idx, ts, id);
         }
 
         if spawned > 0 {
-            *self.loop_downloads_in_flight.entry(pane_idx).or_insert(0) += spawned;
+            self.loop_downloads_in_flight += spawned;
         }
     }
 
     /// Poll for completed loop frame render results and upload textures.
+    /// When sync_layers is on, broadcasts rendered textures to sibling panes
+    /// that need the same frame (matching product+elevation+timestamp).
     fn poll_loop_render_results(&mut self) {
         let ctx = self.state.as_ref().unwrap().egui_renderer.context();
         while let Ok(rr) = self.channels.loop_render_receiver.try_recv() {
-            let pane_idx = rr.pane_idx;
-            let timestamp = rr.timestamp;
+            let origin_pane = rr.pane_idx;
 
-            let Some(pane) = self.gui.pane_mut(pane_idx) else {
+            let Some(pane) = self.gui.pane_mut(origin_pane) else {
                 continue;
             };
             let Some(ls) = &mut pane.loop_state else {
                 continue;
             };
 
-            // Capture lat/lon from the loop state (not global scan_info)
+            // Capture per-pane state needed for texture creation
             let lat = ls.site_lat;
             let lon = ls.site_lon;
+            let origin_product = pane.selected_product;
+            let origin_elevation = pane.selected_elevation;
 
             // Find the matching frame by timestamp
             let Some(frame) = ls.frames.iter_mut().find(|f| f.timestamp == rr.timestamp) else {
@@ -537,31 +617,106 @@ impl super::App {
             );
 
             frame.texture = Some(rustdar_egui::pane::RadarImageData {
-                texture,
+                texture: texture.clone(),
                 lat,
                 lon,
                 max_range_km: rr.max_range_km,
-                value_data: Arc::new(Vec::new()), // Skip value_data for loop frames to save memory
+                value_data: Arc::new(Vec::new()),
             });
 
-            // Free scan data from cache — no longer needed once texture is rendered
-            if let Some(cache) = self.loop_scan_cache.get_mut(&pane_idx) {
-                cache.remove(&timestamp);
+            // Broadcast to sibling panes with matching product+elevation+timestamp
+            if self.gui.is_sync_layers() {
+                for sibling_idx in 0..self.gui.pane_count() {
+                    if sibling_idx == origin_pane {
+                        continue;
+                    }
+                    let Some(sibling) = self.gui.pane_mut(sibling_idx) else { continue };
+                    let sibling_product = sibling.selected_product;
+                    let sibling_elevation = sibling.selected_elevation;
+                    if sibling_product != origin_product
+                        || (sibling_elevation - origin_elevation).abs() > 0.01
+                    {
+                        continue;
+                    }
+                    let Some(sls) = &mut sibling.loop_state else { continue };
+                    let Some(sframe) = sls.frames.iter_mut().find(|f| f.timestamp == rr.timestamp) else {
+                        continue;
+                    };
+                    if sframe.texture.is_some() {
+                        continue;
+                    }
+                    sframe.render_in_flight = false;
+                    sframe.texture = Some(rustdar_egui::pane::RadarImageData {
+                        texture: texture.clone(),
+                        lat: sls.site_lat,
+                        lon: sls.site_lon,
+                        max_range_km: rr.max_range_km,
+                        value_data: Arc::new(Vec::new()),
+                    });
+                }
             }
 
-            // Auto-start playback once the current render batch is complete
-            let pane = self.gui.pane_mut(pane_idx).unwrap();
-            let ls = pane.loop_state.as_mut().unwrap();
-            if !ls.render_ready && !ls.frames.is_empty() {
-                let any_rendered = ls.frames.iter().any(|f| f.texture.is_some());
-                let none_in_flight = !ls.frames.iter().any(|f| f.render_in_flight);
-                let downloads_done = self.loop_pending_downloads.get(&pane_idx).map_or(true, |p| p.is_empty())
-                    && self.loop_downloads_in_flight.get(&pane_idx).copied().unwrap_or(0) == 0;
-                if any_rendered && none_in_flight && downloads_done {
-                    ls.render_ready = true;
-                    ls.playing = true;
-                    ls.last_advance = Some(std::time::Instant::now());
+            // Mark panes as render_ready once their initial batch completes
+            for pidx in 0..self.gui.pane_count() {
+                let Some(p) = self.gui.pane_mut(pidx) else { continue };
+                let Some(pls) = &mut p.loop_state else { continue };
+                if pls.render_ready || pls.frames.is_empty() {
+                    continue;
                 }
+                let any_rendered = pls.frames.iter().any(|f| f.texture.is_some());
+                let none_in_flight = !pls.frames.iter().any(|f| f.render_in_flight);
+                let pane_downloads_done = self.loop_pending_downloads.get(&pidx).map_or(true, |p| p.is_empty());
+                if any_rendered && none_in_flight && pane_downloads_done {
+                    pls.render_ready = true;
+                }
+            }
+        }
+
+        // Synchronized playback start: when sync_layers is on, wait for ALL
+        // looping panes to be render_ready before starting any of them.
+        self.sync_loop_playback_start();
+    }
+
+    /// Start loop playback for panes that are ready, synchronizing when sync_layers is on.
+    fn sync_loop_playback_start(&mut self) {
+        let pane_count = self.gui.pane_count();
+        let sync = self.gui.is_sync_layers() && pane_count > 1;
+
+        // Collect readiness status for all panes with active loops
+        let mut ready_panes: Vec<usize> = Vec::new();
+        let mut not_ready_panes: Vec<usize> = Vec::new();
+        for idx in 0..pane_count {
+            let Some(pane) = self.gui.pane(idx) else { continue };
+            let Some(ls) = &pane.loop_state else { continue };
+            if ls.playing {
+                continue; // Already playing
+            }
+            if ls.render_ready {
+                ready_panes.push(idx);
+            } else {
+                not_ready_panes.push(idx);
+            }
+        }
+
+        if ready_panes.is_empty() {
+            return;
+        }
+
+        // When syncing, only start if ALL looping panes are ready
+        if sync && !not_ready_panes.is_empty() {
+            return;
+        }
+
+        // Start all ready panes with the same instant and frame position
+        let now = std::time::Instant::now();
+        for idx in ready_panes {
+            let pane = self.gui.pane_mut(idx).unwrap();
+            let ls = pane.loop_state.as_mut().unwrap();
+            ls.playing = true;
+            ls.last_advance = Some(now);
+            // Align all panes to the last frame so they start from the same position
+            if !ls.frames.is_empty() {
+                ls.current_frame = ls.frames.len() - 1;
             }
         }
     }
@@ -640,9 +795,14 @@ impl super::App {
 
         // Collect all (pane_idx, frame_idx, timestamp, product, elevation, lat, lon) that need rendering
         let mut to_render: Vec<(usize, usize, chrono::NaiveDateTime, rustdar_radar::types::RadarProduct, f32, f64, f64)> = Vec::new();
+        // Frames that can be satisfied by cloning a sibling's texture: (dest_pane, frame_idx, source_pane, timestamp)
+        let mut to_clone: Vec<(usize, usize, usize, chrono::NaiveDateTime)> = Vec::new();
 
-        for pane_idx in 0..self.gui.pane_count() {
-            let Some(pane) = self.gui.pane_mut(pane_idx) else {
+        let sync = self.gui.is_sync_layers();
+        let pane_count = self.gui.pane_count();
+
+        for pane_idx in 0..pane_count {
+            let Some(pane) = self.gui.pane(pane_idx) else {
                 continue;
             };
             let Some(ls) = &pane.loop_state else {
@@ -652,7 +812,6 @@ impl super::App {
                 continue;
             }
 
-            // Use the loop's stored site lat/lon and the pane's selected product/elevation
             let site_lat = ls.site_lat;
             let site_lon = ls.site_lon;
             let product = pane.selected_product;
@@ -680,20 +839,71 @@ impl super::App {
                 }
             }
 
-            let pane_cache = self.loop_scan_cache.get(&pane_idx);
             for &idx in &indices {
                 let frame = &ls.frames[idx];
                 if frame.texture.is_some() || frame.render_in_flight {
                     continue;
                 }
-                let Some(cache) = pane_cache else { continue };
-                if let Some(scan) = cache.get(&frame.timestamp) {
+
+                // Check if a sibling pane already has this frame textured (same product+elevation+timestamp)
+                if sync {
+                    let mut found_sibling = None;
+                    for sibling_idx in 0..pane_count {
+                        if sibling_idx == pane_idx {
+                            continue;
+                        }
+                        let Some(sibling) = self.gui.pane(sibling_idx) else { continue };
+                        if sibling.selected_product != product
+                            || (sibling.selected_elevation - elevation).abs() > 0.01
+                        {
+                            continue;
+                        }
+                        let Some(sls) = &sibling.loop_state else { continue };
+                        if let Some(sframe) = sls.frames.iter().find(|f| f.timestamp == frame.timestamp) {
+                            if sframe.texture.is_some() {
+                                found_sibling = Some(sibling_idx);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(src) = found_sibling {
+                        to_clone.push((pane_idx, idx, src, frame.timestamp));
+                        continue;
+                    }
+                }
+
+                if let Some(scan) = self.loop_scan_cache.get(&frame.timestamp) {
                     // Snap elevation to closest available in this particular scan
                     let Some(snapped) = rustdar_radar::render::find_closest_elevation(scan, product, elevation) else {
                         continue;
                     };
+                    // Deduplicate: if another pane already queued a render for the same
+                    // (product, elevation, timestamp), skip — the broadcast in
+                    // poll_loop_render_results will deliver the texture to this pane.
+                    if sync && to_render.iter().any(|&(_, _, ts, p, el, _, _)| {
+                        ts == frame.timestamp && p == product && (el - snapped).abs() < 0.01
+                    }) {
+                        continue;
+                    }
                     to_render.push((pane_idx, idx, frame.timestamp, product, snapped, site_lat, site_lon));
                 }
+            }
+        }
+
+        // Apply cloned textures from sibling panes (no render needed)
+        for (dest_pane, _frame_idx, src_pane, timestamp) in to_clone {
+            // Look up the texture from the source pane
+            let cloned = {
+                let Some(src) = self.gui.pane(src_pane) else { continue };
+                let Some(sls) = &src.loop_state else { continue };
+                let Some(sframe) = sls.frames.iter().find(|f| f.timestamp == timestamp) else { continue };
+                let Some(ref tex) = sframe.texture else { continue };
+                tex.clone()
+            };
+            let Some(dest) = self.gui.pane_mut(dest_pane) else { continue };
+            let Some(dls) = &mut dest.loop_state else { continue };
+            if let Some(dframe) = dls.frames.iter_mut().find(|f| f.timestamp == timestamp) {
+                dframe.texture = Some(cloned);
             }
         }
 
@@ -705,10 +915,7 @@ impl super::App {
                 break;
             }
 
-            let scan_arc = {
-                let cache = self.loop_scan_cache.get(&pane_idx).unwrap();
-                Arc::clone(cache.get(&ts).unwrap())
-            };
+            let scan_arc = Arc::clone(self.loop_scan_cache.get(&ts).unwrap());
 
             if let Some(pane) = self.gui.pane_mut(pane_idx) {
                 if let Some(ls) = &mut pane.loop_state {

@@ -960,6 +960,16 @@ impl Gui {
         self.pane_layout.pane_count
     }
 
+    /// Whether viewport sync is enabled (all panes share the same map viewport).
+    pub fn is_viewport_sync(&self) -> bool {
+        self.viewport_sync
+    }
+
+    /// Whether layer sync is enabled (layer changes propagate to all panes).
+    pub fn is_sync_layers(&self) -> bool {
+        self.sync_layers
+    }
+
     /// Get the current radar config
     pub fn get_radar_config(&self) -> &RadarConfig {
         &self.radar.config
