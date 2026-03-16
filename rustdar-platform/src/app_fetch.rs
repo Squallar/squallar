@@ -14,7 +14,7 @@ impl super::App {
     /// Spawn an async radar data fetch on the background runtime.
     /// Handles generation tracking, result sending, and redraw requests.
     pub fn spawn_fetch(&mut self, site: String, timestamp: NaiveDateTime) {
-        let generation = self.render.next_fetch_generation();
+        let generation = self.render.next_fetch_generation(&site);
         let window = self.window.clone();
         let sender = self.channels.scan_sender.clone();
         self.tokio_runtime.spawn(async move {
@@ -22,7 +22,7 @@ impl super::App {
             let msg = match scan::get_scan(&site, timestamp).await {
                 Ok(data) => {
                     log::info!("Fetched scan: {} @ {}", site, timestamp);
-                    Ok(ScanData { scan: data, site, timestamp })
+                    Ok(ScanData { scan: data, site: site.clone(), timestamp })
                 }
                 Err(e) => {
                     let err = format!("Failed to fetch radar scan: {:?}", e);
@@ -30,7 +30,7 @@ impl super::App {
                     Err(err)
                 }
             };
-            let _ = sender.send(ScanResponse { generation, result: msg, is_auto_poll: false });
+            let _ = sender.send(ScanResponse { generation, site, result: msg, is_auto_poll: false });
             super::notify_redraw(&window);
         });
     }
@@ -39,7 +39,7 @@ impl super::App {
     /// Called after a Level II scan loads so the products are available
     /// alongside the base moments.
     pub(super) fn spawn_level3_fetches(&self, site: &str) {
-        let generation = self.render.fetch_generation;
+        let generation = self.render.fetch_generations.get(site).copied().unwrap_or(0);
         for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
             let Some(dirs) = l3_product.tgftp_dirs() else { continue };
             for &dir in dirs {
@@ -167,7 +167,7 @@ impl super::App {
                 let utc_timestamp = Self::local_to_utc(radar_config.timestamp);
                 let current_scan_timestamp = self.gui.get_scan_info().map(|info| info.timestamp);
 
-                let generation = self.render.next_fetch_generation();
+                let generation = self.render.next_fetch_generation(&radar_config.site);
                 let site = radar_config.site.clone();
                 let window = self.window.clone();
                 let sender = self.channels.scan_sender.clone();
@@ -177,6 +177,7 @@ impl super::App {
                         Ok(Some((data, timestamp))) => {
                             let _ = sender.send(crate::channels::ScanResponse {
                                 generation,
+                                site: site.clone(),
                                 result: Ok(crate::channels::ScanData { scan: data, site, timestamp }),
                                 is_auto_poll: true,
                             });
@@ -561,7 +562,7 @@ impl super::App {
         self.manual_nav_pending = true;
         self.gui.set_fetching(true);
 
-        let generation = self.render.next_fetch_generation();
+        let generation = self.render.next_fetch_generation(&site);
         let sender = self.channels.scan_sender.clone();
         let window = self.window.clone();
 
@@ -571,6 +572,7 @@ impl super::App {
                     // If navigating forward and the result is the same as current, treat as live
                     let _ = sender.send(crate::channels::ScanResponse {
                         generation,
+                        site: site.clone(),
                         result: Ok(crate::channels::ScanData { scan: data, site, timestamp }),
                         is_auto_poll: false,
                     });
@@ -580,6 +582,7 @@ impl super::App {
                     log::error!("{}", err);
                     let _ = sender.send(crate::channels::ScanResponse {
                         generation,
+                        site,
                         result: Err(err),
                         is_auto_poll: false,
                     });

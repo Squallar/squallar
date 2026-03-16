@@ -20,6 +20,8 @@ pub struct ScanData {
 /// Result from a background radar scan fetch, with generation tracking.
 pub struct ScanResponse {
     pub generation: u64,
+    /// Site this fetch was for (needed for per-site generation checking).
+    pub site: String,
     pub result: Result<ScanData, String>,
     /// True when this result originated from an auto-poll check (not manual navigation).
     pub is_auto_poll: bool,

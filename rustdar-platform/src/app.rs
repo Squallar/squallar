@@ -270,8 +270,8 @@ impl App {
     fn poll_data_channels(&mut self) {
         // Check for received scan data (with generation check)
         if let Ok(scan_resp) = self.channels.scan_receiver.try_recv() {
-            if self.render.is_fetch_stale(scan_resp.generation) {
-                log::debug!("Discarding stale scan result (gen {} < current {})", scan_resp.generation, self.render.fetch_generation);
+            if self.render.is_fetch_stale(&scan_resp.site, scan_resp.generation) {
+                log::debug!("Discarding stale scan result for {} (gen {})", scan_resp.site, scan_resp.generation);
             } else {
                 match scan_resp.result {
                     Ok(scan_data) => {

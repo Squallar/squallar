@@ -65,8 +65,8 @@ pub struct RenderDispatcher {
     pub level3_data: HashMap<(RadarProduct, String, String), Arc<Level3Message>>,
     /// Generation counter to discard stale render results after site/scan changes.
     pub render_generation: u64,
-    /// Generation counter to discard stale fetch results from older requests.
-    pub fetch_generation: u64,
+    /// Per-site fetch generation counters to discard stale fetch results.
+    pub fetch_generations: HashMap<String, u64>,
     /// Shared counter for concurrent background render threads.
     pub renders_in_flight: Arc<AtomicUsize>,
     /// Cache of the latest render output per (site, product, elevation_tenths), shared
@@ -80,7 +80,7 @@ impl RenderDispatcher {
             pane_render: vec![PaneRenderState::new()],
             level3_data: HashMap::new(),
             render_generation: 0,
-            fetch_generation: 0,
+            fetch_generations: HashMap::new(),
             renders_in_flight,
             render_cache: HashMap::new(),
         }
@@ -131,15 +131,16 @@ impl RenderDispatcher {
         self.pane_render.iter().any(|prs| prs.render_in_flight)
     }
 
-    /// Increment the fetch generation and return the new value.
-    pub fn next_fetch_generation(&mut self) -> u64 {
-        self.fetch_generation += 1;
-        self.fetch_generation
+    /// Increment the fetch generation for a site and return the new value.
+    pub fn next_fetch_generation(&mut self, site: &str) -> u64 {
+        let entry = self.fetch_generations.entry(site.to_string()).or_insert(0);
+        *entry += 1;
+        *entry
     }
 
-    /// Check if a fetch generation is stale.
-    pub fn is_fetch_stale(&self, generation: u64) -> bool {
-        generation < self.fetch_generation
+    /// Check if a fetch generation is stale for a site.
+    pub fn is_fetch_stale(&self, site: &str, generation: u64) -> bool {
+        self.fetch_generations.get(site).copied().unwrap_or(0) > generation
     }
 
     /// Check if a render generation is stale.

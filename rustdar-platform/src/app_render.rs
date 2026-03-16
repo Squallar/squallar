@@ -196,8 +196,8 @@ impl super::App {
             return;
         };
 
-        if self.render.is_fetch_stale(l3_resp.generation) {
-            log::debug!("Discarding stale Level III result (gen {} < current {})", l3_resp.generation, self.render.fetch_generation);
+        if self.render.is_fetch_stale(&l3_resp.site, l3_resp.generation) {
+            log::debug!("Discarding stale Level III result for {} (gen {})", l3_resp.site, l3_resp.generation);
             return;
         }
 

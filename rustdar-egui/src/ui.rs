@@ -917,15 +917,18 @@ impl Gui {
     }
 
     /// Propagate layer settings from the active pane to all others (when sync is enabled).
+    /// Also converges site and scan_info so all panes display the same radar site.
     fn propagate_layer_sync(&mut self) {
         if !self.sync_layers || self.pane_layout.pane_count <= 1 {
             return;
         }
-        let src = &self.panes[self.active_pane].layers;
-        let spc_day = src.spc_day;
+        let src = &self.panes[self.active_pane];
+        let spc_day = src.layers.spc_day;
+        let active_site = src.site.clone();
+        let active_scan_info = src.scan_info.clone();
         let snapshot: Vec<(LayerKind, bool)> = LayerKind::all()
         .iter()
-        .map(|&k| (k, src.is_enabled(k)))
+        .map(|&k| (k, src.layers.is_enabled(k)))
         .collect();
 
         for (idx, p) in self.panes.iter_mut().enumerate() {
@@ -936,6 +939,8 @@ impl Gui {
                 p.layers.set_enabled(kind, enabled);
             }
             p.layers.spc_day = spc_day;
+            p.site = active_site.clone();
+            p.scan_info = active_scan_info.clone();
         }
     }
 
