@@ -202,7 +202,9 @@ impl Gui {
             self.radar.fetching = true;
             self.auto_poll.initial_fetch_done = true;
             self.auto_poll.record_fetch();
-            actions.push(GuiAction::FetchRadarScan(self.radar.config.clone()));
+            let mut config = self.radar.config.clone();
+            config.site = self.active_pane().site.clone();
+            actions.push(GuiAction::FetchRadarScan(config));
         }
 
         // Poll for new scans at the current poll interval (only when any pane is viewing live)

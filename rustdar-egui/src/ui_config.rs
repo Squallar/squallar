@@ -25,7 +25,7 @@ struct PaneConfig {
 }
 
 fn default_site() -> String {
-    "KTLX".to_string()
+    String::new()
 }
 
 fn default_time_step() -> i64 {
@@ -54,7 +54,7 @@ impl Default for PaneConfig {
             selected_elevation: 0.0,
             layers,
             spc_day: OutlookDay::Day1,
-            site: "KTLX".to_string(),
+            site: String::new(),
             time_step_secs: 600,
         }
     }
@@ -183,7 +183,7 @@ impl super::Gui {
         self.auto_poll.enabled = config.auto_poll;
 
         if !config.site.is_empty() {
-            self.radar.config.site = config.site;
+            self.radar.config.site = config.site.clone();
         }
 
         self.loop_lookback_secs = config.loop_lookback_secs;
@@ -202,6 +202,8 @@ impl super::Gui {
             pane.layers.spc_day = pc.spc_day;
             if !pc.site.is_empty() {
                 pane.site = pc.site.clone();
+            } else if !config.site.is_empty() {
+                pane.site = config.site.clone();
             }
             pane.time_step_secs = pc.time_step_secs;
             for (&kind, &enabled) in &pc.layers {
