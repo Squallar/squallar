@@ -121,13 +121,6 @@ pub struct Gui {
     pane_layout: PaneLayout,
     viewport_sync: bool,
     sync_layers: bool,
-    // --- Time navigation ---
-    /// True when displaying the most recent (live) scan; false when user has
-    /// navigated to a historical timestamp via the time steppers or Time dialog.
-    viewing_live: bool,
-    /// Selected time-step size for the forward/back navigation buttons (seconds).
-    /// `0` means "one scan" (navigate to adjacent scan).
-    pub time_step_secs: i64,
     // --- Radar loop settings ---
     /// How far back (in seconds) to fetch historical scans for the loop.
     pub loop_lookback_secs: u64,
@@ -179,8 +172,6 @@ impl Gui {
             pane_layout: PaneLayout::default(),
             viewport_sync: true,
             sync_layers: true,
-            viewing_live: true,
-            time_step_secs: 600, // default 10 min
             loop_lookback_secs: 3600, // default 1 hour
             loop_speed_fps: 5.0,      // default 5 fps
             #[cfg(target_os = "android")]
@@ -214,19 +205,25 @@ impl Gui {
             actions.push(GuiAction::FetchRadarScan(self.radar.config.clone()));
         }
 
-        // Poll for new scans at the current poll interval (only when viewing live)
-        if self.viewing_live && self.auto_poll.should_poll() && !self.radar.fetching {
-            // Check for new files without downloading
+        // Poll for new scans at the current poll interval (only when any pane is viewing live)
+        if self.is_any_pane_live() && self.auto_poll.should_poll() && !self.radar.fetching {
+            // Check for new files without downloading — emit one check per unique live site
             let now = chrono::Local::now().naive_local();
             let current_scan_time = now
                 .with_second(0)
                 .and_then(|t| t.with_nanosecond(0))
                 .unwrap_or(now);
 
-            // Use current time for the check request
-            let mut config = self.radar.config.clone();
-            config.timestamp = current_scan_time;
-            actions.push(GuiAction::CheckForNewScans(config));
+            let mut seen_sites = std::collections::HashSet::new();
+            for pane in self.panes.iter().take(self.pane_layout.pane_count) {
+                if pane.viewing_live && seen_sites.insert(pane.site.clone()) {
+                    let config = RadarConfig {
+                        site: pane.site.clone(),
+                        timestamp: current_scan_time,
+                    };
+                    actions.push(GuiAction::CheckForNewScans(config));
+                }
+            }
 
             // Reset timer to avoid spamming checks
             self.auto_poll.record_fetch();
@@ -324,7 +321,9 @@ impl Gui {
                                 let datetime_str = format!("{} {}", self.time_dialog.date_string, self.time_dialog.time_string);
                                 if let Ok(timestamp) = chrono::NaiveDateTime::parse_from_str(&datetime_str, "%Y-%m-%d %H:%M:%S") {
                                     self.radar.config.timestamp = timestamp;
-                                    self.viewing_live = false;
+                                    if let Some(pane) = self.panes.get_mut(self.active_pane) {
+                                        pane.viewing_live = false;
+                                    }
                                     action = Some(GuiAction::FetchRadarScan(self.radar.config.clone()));
                                 }
                                 self.time_dialog.show = false;
@@ -367,8 +366,12 @@ impl Gui {
                     format!("{count}"),
                 ).clicked() && self.pane_layout.pane_count != count {
                     self.panes[self.active_pane] = std::mem::take(pane);
+                    let active_site = self.panes[self.active_pane].site.clone();
+                    let active_scan_info = self.panes[self.active_pane].scan_info.clone();
                     while self.panes.len() < count {
-                        self.panes.push(PaneState::new());
+                        let mut new_pane = PaneState::with_site(active_site.clone());
+                        new_pane.scan_info = active_scan_info.clone();
+                        self.panes.push(new_pane);
                     }
                     self.pane_layout = PaneLayout::for_count(count);
                     if self.active_pane >= count {
@@ -411,7 +414,7 @@ impl Gui {
         self.render_radar_controls(ui, pane, combo_width, id_prefix);
 
         // --- Time navigation (forward/back/live) ---
-        self.render_time_navigation(ui, actions);
+        self.render_time_navigation(ui, pane, actions);
 
         // --- Radar loop controls ---
         self.render_loop_controls(ui, pane, actions);
@@ -528,6 +531,7 @@ impl Gui {
     fn render_time_navigation(
         &mut self,
         ui: &mut egui::Ui,
+        pane: &mut PaneState,
         actions: &mut Vec<GuiAction>,
     ) {
         ui.add_space(4.0);
@@ -535,7 +539,7 @@ impl Gui {
         // Time step dropdown
         let step_label = Self::TIME_STEP_OPTIONS
             .iter()
-            .find(|(s, _)| *s == self.time_step_secs)
+            .find(|(s, _)| *s == pane.time_step_secs)
             .map(|(_, l)| *l)
             .unwrap_or("10 min");
 
@@ -545,41 +549,42 @@ impl Gui {
                 .selected_text(step_label)
                 .show_ui(ui, |ui| {
                     for &(secs, label) in Self::TIME_STEP_OPTIONS {
-                        ui.selectable_value(&mut self.time_step_secs, secs, label);
+                        ui.selectable_value(&mut pane.time_step_secs, secs, label);
                     }
                 });
         });
 
         // Navigation buttons
+        let active_pane_idx = self.active_pane;
         ui.horizontal(|ui| {
             // Back button
             if ui.button("\u{25c0} Back").clicked() {
-                self.viewing_live = false;
-                if self.time_step_secs == 0 {
-                    actions.push(GuiAction::NavigateOneScan { forward: false });
+                pane.viewing_live = false;
+                if pane.time_step_secs == 0 {
+                    actions.push(GuiAction::NavigateOneScan { pane_idx: active_pane_idx, forward: false });
                 } else {
-                    actions.push(GuiAction::NavigateTime { step_secs: -self.time_step_secs });
+                    actions.push(GuiAction::NavigateTime { pane_idx: active_pane_idx, step_secs: -pane.time_step_secs });
                 }
             }
 
             // Live button — highlighted when NOT live to indicate "click to return"
-            let live_button = if self.viewing_live {
+            let live_button = if pane.viewing_live {
                 egui::Button::new("\u{23fa} Live")
             } else {
                 egui::Button::new(
                     egui::RichText::new("\u{23fa} Live").color(egui::Color32::WHITE)
                 ).fill(egui::Color32::from_rgb(200, 50, 50))
             };
-            if ui.add(live_button).clicked() && !self.viewing_live {
-                actions.push(GuiAction::JumpToLive);
+            if ui.add(live_button).clicked() && !pane.viewing_live {
+                actions.push(GuiAction::JumpToLive { pane_idx: active_pane_idx });
             }
 
             // Forward button — disabled when live
-            if ui.add_enabled(!self.viewing_live, egui::Button::new("Forward \u{25b6}")).clicked() {
-                if self.time_step_secs == 0 {
-                    actions.push(GuiAction::NavigateOneScan { forward: true });
+            if ui.add_enabled(!pane.viewing_live, egui::Button::new("Forward \u{25b6}")).clicked() {
+                if pane.time_step_secs == 0 {
+                    actions.push(GuiAction::NavigateOneScan { pane_idx: active_pane_idx, forward: true });
                 } else {
-                    actions.push(GuiAction::NavigateTime { step_secs: self.time_step_secs });
+                    actions.push(GuiAction::NavigateTime { pane_idx: active_pane_idx, step_secs: pane.time_step_secs });
                 }
             }
         });
@@ -926,6 +931,8 @@ impl Gui {
         let spc_day = src.layers.spc_day;
         let active_site = src.site.clone();
         let active_scan_info = src.scan_info.clone();
+        let active_viewing_live = src.viewing_live;
+        let active_time_step_secs = src.time_step_secs;
         let snapshot: Vec<(LayerKind, bool)> = LayerKind::all()
         .iter()
         .map(|&k| (k, src.layers.is_enabled(k)))
@@ -941,6 +948,8 @@ impl Gui {
             p.layers.spc_day = spc_day;
             p.site = active_site.clone();
             p.scan_info = active_scan_info.clone();
+            p.viewing_live = active_viewing_live;
+            p.time_step_secs = active_time_step_secs;
         }
     }
 
@@ -1015,14 +1024,21 @@ impl Gui {
         self.user_location = Some((lat, lon));
     }
 
-    /// Whether the UI is showing the most recent (live) scan.
+    /// Whether the active pane is showing the most recent (live) scan.
     pub fn is_viewing_live(&self) -> bool {
-        self.viewing_live
+        self.panes.get(self.active_pane).is_some_and(|p| p.viewing_live)
     }
 
-    /// Set live/historic viewing mode.
-    pub fn set_viewing_live(&mut self, live: bool) {
-        self.viewing_live = live;
+    /// Whether any pane is viewing live (for auto-poll gating).
+    pub fn is_any_pane_live(&self) -> bool {
+        self.panes.iter().take(self.pane_layout.pane_count).any(|p| p.viewing_live)
+    }
+
+    /// Set live/historic viewing mode for a specific pane.
+    pub fn set_viewing_live_for_pane(&mut self, pane_idx: usize, live: bool) {
+        if let Some(pane) = self.panes.get_mut(pane_idx) {
+            pane.viewing_live = live;
+        }
     }
 
     /// Get a specific pane's layer manager (immutable).

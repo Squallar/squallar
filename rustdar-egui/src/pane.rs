@@ -69,6 +69,10 @@ pub struct PaneState {
     pub scan_info: Option<ScanInfo>,
     pub selected_product: RadarProduct,
     pub selected_elevation: f32,
+    /// Whether this pane is viewing the latest (live) data.
+    pub viewing_live: bool,
+    /// Time navigation step size in seconds (0 = single scan mode).
+    pub time_step_secs: i64,
     pub hover_value: Option<String>,
     pub last_hover_pos: Option<egui::Pos2>,
     pub layers: LayerManager,
@@ -116,6 +120,8 @@ impl PaneState {
             scan_info: None,
             selected_product: RadarProduct::Reflectivity,
             selected_elevation: 0.0,
+            viewing_live: true,
+            time_step_secs: 600,
             hover_value: None,
             last_hover_pos: None,
             layers: LayerManager::new(),

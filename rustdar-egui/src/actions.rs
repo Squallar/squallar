@@ -80,14 +80,18 @@ pub enum GuiAction {
     },
     /// Navigate forward or backward by a time step (seconds).
     NavigateTime {
+        pane_idx: usize,
         step_secs: i64,
     },
     /// Step to the next or previous adjacent scan.
     NavigateOneScan {
+        pane_idx: usize,
         forward: bool,
     },
     /// Jump back to live mode (display latest available scan).
-    JumpToLive,
+    JumpToLive {
+        pane_idx: usize,
+    },
 }
 
 /// Which overlay type to rasterize.
@@ -151,14 +155,14 @@ impl std::fmt::Display for GuiAction {
             GuiAction::SeekLoopFrame { pane_idx, frame_index } => {
                 write!(f, "Seek loop to frame {} for pane {}", frame_index, pane_idx)
             }
-            GuiAction::NavigateTime { step_secs } => {
-                write!(f, "Navigate time by {} seconds", step_secs)
+            GuiAction::NavigateTime { pane_idx, step_secs } => {
+                write!(f, "Navigate time by {} seconds for pane {}", step_secs, pane_idx)
             }
-            GuiAction::NavigateOneScan { forward } => {
-                write!(f, "Navigate one scan (forward={})", forward)
+            GuiAction::NavigateOneScan { pane_idx, forward } => {
+                write!(f, "Navigate one scan (forward={}) for pane {}", forward, pane_idx)
             }
-            GuiAction::JumpToLive => {
-                write!(f, "Jump to live")
+            GuiAction::JumpToLive { pane_idx } => {
+                write!(f, "Jump to live for pane {}", pane_idx)
             }
         }
     }

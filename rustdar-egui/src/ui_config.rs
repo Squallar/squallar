@@ -16,6 +16,20 @@ struct PaneConfig {
     /// Layer kind → enabled flag.
     layers: BTreeMap<LayerKind, bool>,
     spc_day: OutlookDay,
+    /// Radar site code for this pane (e.g. "KTLX").
+    #[serde(default = "default_site")]
+    site: String,
+    /// Time step size in seconds (0 = single scan mode).
+    #[serde(default = "default_time_step")]
+    time_step_secs: i64,
+}
+
+fn default_site() -> String {
+    "KTLX".to_string()
+}
+
+fn default_time_step() -> i64 {
+    600
 }
 
 impl Default for PaneConfig {
@@ -40,6 +54,8 @@ impl Default for PaneConfig {
             selected_elevation: 0.0,
             layers,
             spc_day: OutlookDay::Day1,
+            site: "KTLX".to_string(),
+            time_step_secs: 600,
         }
     }
 }
@@ -101,6 +117,8 @@ impl super::Gui {
                 },
                 layers,
                 spc_day: pane.layers.spc_day,
+                site: pane.site.clone(),
+                time_step_secs: pane.time_step_secs,
             }
         }).collect();
         let config = UiConfig {
@@ -112,7 +130,7 @@ impl super::Gui {
             site: self.radar.config.site.clone(),
             loop_lookback_secs: self.loop_lookback_secs,
             loop_speed_fps: fps,
-            time_step_secs: self.time_step_secs,
+            time_step_secs: self.panes.first().map(|p| p.time_step_secs).unwrap_or(600),
             panes: pane_configs,
         };
         match serde_json::to_string_pretty(&config) {
@@ -154,7 +172,8 @@ impl super::Gui {
         };
         let count = config.pane_count.clamp(1, max);
         while self.panes.len() < count {
-            self.panes.push(PaneState::new());
+            let site = config.panes.get(self.panes.len()).map(|pc| pc.site.clone()).unwrap_or_else(|| config.site.clone());
+            self.panes.push(PaneState::with_site(site));
         }
         self.pane_layout = PaneLayout::for_count(count);
         self.active_pane = if config.active_pane < count { config.active_pane } else { 0 };
@@ -169,15 +188,22 @@ impl super::Gui {
 
         self.loop_lookback_secs = config.loop_lookback_secs;
         self.loop_speed_fps = config.loop_speed_fps;
-        self.time_step_secs = config.time_step_secs;
 
         // Restore per-pane state.
         for (i, pane) in self.panes.iter_mut().enumerate().take(count) {
             let pc = config.panes.get(i);
-            let Some(pc) = pc else { continue };
+            let Some(pc) = pc else {
+                // Fall back to global time_step_secs for panes without PaneConfig
+                pane.time_step_secs = config.time_step_secs;
+                continue;
+            };
             pane.selected_product = pc.selected_product;
             pane.selected_elevation = pc.selected_elevation;
             pane.layers.spc_day = pc.spc_day;
+            if !pc.site.is_empty() {
+                pane.site = pc.site.clone();
+            }
+            pane.time_step_secs = pc.time_step_secs;
             for (&kind, &enabled) in &pc.layers {
                 pane.layers.set_enabled(kind, enabled);
             }

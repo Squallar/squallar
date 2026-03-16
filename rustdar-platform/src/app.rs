@@ -1,4 +1,5 @@
 use egui_wgpu::wgpu;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use winit::application::ApplicationHandler;
@@ -72,8 +73,8 @@ pub struct App {
     loop_downloads_in_flight: usize,
     // Shared counter for background render threads in flight (loop + static renders).
     renders_in_flight: Arc<AtomicUsize>,
-    // Cached latest scan from auto-poll while viewing historic data.
-    latest_cached_scan: Option<(Arc<nexrad_model::data::Scan>, ScanInfo, String, chrono::NaiveDateTime)>,
+    // Cached latest scan per site from auto-poll while panes on that site view historic data.
+    latest_cached_scans: HashMap<String, (Arc<nexrad_model::data::Scan>, ScanInfo, chrono::NaiveDateTime)>,
     // Set when a manual time navigation fetch is pending; triggers loop reinit after scan loads.
     manual_nav_pending: bool,
 }
@@ -128,7 +129,7 @@ impl App {
             loop_pending_downloads: std::collections::HashMap::new(),
             loop_downloads_in_flight: 0,
             renders_in_flight: Arc::new(AtomicUsize::new(0)),
-            latest_cached_scan: None,
+            latest_cached_scans: HashMap::new(),
             manual_nav_pending: false,
         }
     }
@@ -280,12 +281,19 @@ impl App {
                         let timestamp = scan_data.timestamp;
                         let scan_arc = Arc::new(scan_data.scan);
 
-                        // When auto-poll delivers a new scan while viewing historic data,
-                        // cache it silently for JumpToLive and loop growing.
-                        if scan_resp.is_auto_poll && !self.gui.is_viewing_live() {
+                        // When auto-poll delivers a new scan, check if any pane
+                        // on this site is viewing live. If all panes on this site
+                        // are historic, cache silently for JumpToLive.
+                        let any_pane_live_for_site = scan_resp.is_auto_poll && {
+                            let count = self.gui.pane_count();
+                            (0..count).any(|i| {
+                                self.gui.pane(i).is_some_and(|p| p.site == site && p.viewing_live)
+                            })
+                        };
+                        if scan_resp.is_auto_poll && !any_pane_live_for_site {
                             log::info!("Auto-poll: caching scan (historic mode) @ {}", timestamp);
                             self.append_scan_to_active_loops(timestamp, Arc::clone(&scan_arc));
-                            self.latest_cached_scan = Some((scan_arc, scan_info, site, timestamp));
+                            self.latest_cached_scans.insert(site, (scan_arc, scan_info, timestamp));
                         } else {
                             log::info!("Received scan data from background thread");
                             self.scan_data.insert(site.clone(), Arc::clone(&scan_arc));
