@@ -60,7 +60,7 @@ impl super::App {
                             Err(format!("{e}"))
                         }
                     };
-                    let _ = sender.send(Level3Response { generation, product, tilt_code: dir_str, result });
+                    let _ = sender.send(Level3Response { generation, product, tilt_code: dir_str, site, result });
                     super::notify_redraw(&window);
                 });
             }
@@ -604,7 +604,7 @@ impl super::App {
             self.gui.set_radar_config(config);
             self.gui.set_scan_info_for_site(&site, scan_info);
             self.gui.set_loading_site(None);
-            self.render.reset_panes();
+            self.render.reset_panes_for_site(&site, &self.gui);
             self.spawn_level3_fetches(&site);
 
             self.manual_nav_pending = false;

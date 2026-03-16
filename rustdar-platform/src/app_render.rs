@@ -99,8 +99,9 @@ impl super::App {
             let elevation = rr.elevation;
             let origin_pane = rr.pane_idx;
 
-            // Cache the render output for sharing with other panes
-            self.render.cache_render(product, elevation, crate::render_dispatch::CachedRenderOutput {
+            // Cache the render output for sharing with other panes on the same site
+            let origin_site = self.gui.pane(origin_pane).map(|p| p.site.clone()).unwrap_or_default();
+            self.render.cache_render(&origin_site, product, elevation, crate::render_dispatch::CachedRenderOutput {
                 image_data: Arc::clone(&image_data),
                 max_range_km,
                 value_data: Arc::clone(&value_data),
@@ -109,10 +110,14 @@ impl super::App {
             // Apply to the originating pane
             self.apply_render_to_pane(&ctx, origin_pane, &image_data, max_range_km, &value_data, product, elevation);
 
-            // Broadcast to sibling panes that need the same product+elevation
+            // Broadcast to sibling panes that need the same site+product+elevation
             let pane_count = self.gui.pane_count();
             for other_idx in 0..pane_count {
                 if other_idx == origin_pane {
+                    continue;
+                }
+                let other_site = self.gui.pane(other_idx).map(|p| p.site.clone()).unwrap_or_default();
+                if other_site != origin_site {
                     continue;
                 }
                 let Some((other_product, other_elevation)) = self.gui.get_rendering_params_for_pane(other_idx) else {
@@ -206,18 +211,22 @@ impl super::App {
 
         let elevation = message.pdb.elevation_angle();
         log::info!("Level III {:?} {} fetched successfully (elevation={:.1}°)", l3_resp.product, l3_resp.tilt_code, elevation);
-        self.render.level3_data.insert((l3_resp.product, l3_resp.tilt_code), Arc::new(message));
+        self.render.level3_data.insert((l3_resp.product, l3_resp.tilt_code.clone(), l3_resp.site.clone()), Arc::new(message));
 
-        // Trigger a re-render for any pane viewing this product
+        // Trigger a re-render for panes on the same site viewing this product
         for (idx, prs) in self.render.pane_render.iter_mut().enumerate() {
-            if self.gui.get_rendering_params_for_pane(idx).map(|(p, _)| p) == Some(l3_resp.product) {
+            let pane_matches_site = self.gui.pane(idx).is_some_and(|p| p.site == l3_resp.site);
+            if pane_matches_site && self.gui.get_rendering_params_for_pane(idx).map(|(p, _)| p) == Some(l3_resp.product) {
                 prs.last_rendered = None;
             }
         }
 
-        // Add Level III products to the scan info for all panes that have scan_info
-        // (L3 results apply to any pane that already loaded a scan for this site)
+        // Add Level III products to the scan info for panes on this site
         for pane_idx in 0..self.gui.pane_count() {
+            let pane_site = self.gui.pane(pane_idx).map(|p| p.site.clone()).unwrap_or_default();
+            if pane_site != l3_resp.site {
+                continue;
+            }
             let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
                 continue;
             };
@@ -312,8 +321,11 @@ impl super::App {
                     .unwrap_or(true);
 
                 if needs_render && !prs.render_in_flight {
-                    // Check if another pane already rendered this product+elevation
-                    if let Some(cached) = self.render.get_cached_render(product, elevation) {
+                    // Get the pane's site for cache lookups
+                    let pane_site = self.gui.pane(pane_idx).map(|p| p.site.clone()).unwrap_or_default();
+
+                    // Check if another pane already rendered this site+product+elevation
+                    if let Some(cached) = self.render.get_cached_render(&pane_site, product, elevation) {
                         let image_data = Arc::clone(&cached.image_data);
                         let max_range_km = cached.max_range_km;
                         let value_data = Arc::clone(&cached.value_data);
@@ -330,6 +342,7 @@ impl super::App {
                                 elevation,
                                 scan_info.site.lat,
                                 scan_info.site.lon,
+                                &pane_site,
                                 self.channels.render_sender.clone(),
                                 self.window.clone(),
                             );

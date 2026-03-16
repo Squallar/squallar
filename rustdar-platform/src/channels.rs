@@ -41,6 +41,7 @@ pub struct Level3Response {
     pub generation: u64,
     pub product: RadarProduct,
     pub tilt_code: String,
+    pub site: String,
     pub result: Result<Level3Message, String>,
 }
 

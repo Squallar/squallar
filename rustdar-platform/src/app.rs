@@ -291,7 +291,7 @@ impl App {
                             self.scan_data.insert(site.clone(), Arc::clone(&scan_arc));
                             self.gui.set_scan_info_for_site(&site, scan_info);
                             self.gui.set_loading_site(None);
-                            self.render.reset_panes();
+                            self.render.reset_panes_for_site(&site, &self.gui);
                             self.spawn_level3_fetches(&site);
 
                             // Append the new scan to any active loops

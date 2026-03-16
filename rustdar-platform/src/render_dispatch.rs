@@ -61,17 +61,17 @@ fn elevation_key(elevation: f32) -> i32 {
 pub struct RenderDispatcher {
     /// Per-pane render tracking (indexed by pane index).
     pub pane_render: Vec<PaneRenderState>,
-    /// Decoded Level III product data, keyed by (RadarProduct, tilt_code).
-    pub level3_data: HashMap<(RadarProduct, String), Arc<Level3Message>>,
+    /// Decoded Level III product data, keyed by (RadarProduct, tilt_code, site).
+    pub level3_data: HashMap<(RadarProduct, String, String), Arc<Level3Message>>,
     /// Generation counter to discard stale render results after site/scan changes.
     pub render_generation: u64,
     /// Generation counter to discard stale fetch results from older requests.
     pub fetch_generation: u64,
     /// Shared counter for concurrent background render threads.
     pub renders_in_flight: Arc<AtomicUsize>,
-    /// Cache of the latest render output per (product, elevation_tenths), shared
-    /// across panes that display the same product at the same elevation.
-    pub render_cache: HashMap<(RadarProduct, i32), CachedRenderOutput>,
+    /// Cache of the latest render output per (site, product, elevation_tenths), shared
+    /// across panes that display the same product at the same elevation on the same site.
+    pub render_cache: HashMap<(String, RadarProduct, i32), CachedRenderOutput>,
 }
 
 impl RenderDispatcher {
@@ -91,6 +91,19 @@ impl RenderDispatcher {
         while self.pane_render.len() < count {
             self.pane_render.push(PaneRenderState::new());
         }
+    }
+
+    /// Reset render state for panes on a specific site (e.g. after a new scan loads for that site).
+    pub fn reset_panes_for_site(&mut self, site: &str, gui: &rustdar_egui::Gui) {
+        for (idx, prs) in self.pane_render.iter_mut().enumerate() {
+            if gui.pane(idx).is_some_and(|p| p.site == site) {
+                prs.last_rendered = None;
+                prs.cached_render = None;
+                prs.render_in_flight = false;
+            }
+        }
+        self.level3_data.retain(|(_prod, _tilt, s), _| s != site);
+        self.render_cache.retain(|(s, _prod, _elev), _| s != site);
     }
 
     /// Reset all pane render state (e.g. after a new scan loads).
@@ -134,14 +147,14 @@ impl RenderDispatcher {
         generation < self.render_generation
     }
 
-    /// Look up a cached render result for the given product and elevation.
-    pub fn get_cached_render(&self, product: RadarProduct, elevation: f32) -> Option<&CachedRenderOutput> {
-        self.render_cache.get(&(product, elevation_key(elevation)))
+    /// Look up a cached render result for the given site, product, and elevation.
+    pub fn get_cached_render(&self, site: &str, product: RadarProduct, elevation: f32) -> Option<&CachedRenderOutput> {
+        self.render_cache.get(&(site.to_string(), product, elevation_key(elevation)))
     }
 
     /// Store a render result in the cache for sharing across panes.
-    pub fn cache_render(&mut self, product: RadarProduct, elevation: f32, output: CachedRenderOutput) {
-        self.render_cache.insert((product, elevation_key(elevation)), output);
+    pub fn cache_render(&mut self, site: &str, product: RadarProduct, elevation: f32, output: CachedRenderOutput) {
+        self.render_cache.insert((site.to_string(), product, elevation_key(elevation)), output);
     }
 
     /// Spawn a Level III render for a pane if applicable.
@@ -153,13 +166,14 @@ impl RenderDispatcher {
         elevation: f32,
         lat: f64,
         lon: f64,
+        site: &str,
         sender: std::sync::mpsc::Sender<RenderResponse>,
         window: Option<WindowRef>,
     ) -> bool {
         let best_l3 = self
             .level3_data
             .iter()
-            .filter(|((p, _), _)| *p == product)
+            .filter(|((p, _tilt, s), _)| *p == product && s == site)
             .min_by(|(_, a), (_, b)| {
                 let da = (a.pdb.elevation_angle() - elevation).abs();
                 let db = (b.pdb.elevation_angle() - elevation).abs();
