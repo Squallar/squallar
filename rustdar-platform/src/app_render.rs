@@ -169,7 +169,7 @@ impl super::App {
             ));
         }
 
-        if let Some(scan_info) = self.gui.get_scan_info() {
+        if let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) {
             self.gui.set_radar_image_for_pane(
                 pane_idx,
                 texture,
@@ -215,28 +215,36 @@ impl super::App {
             }
         }
 
-        // Add Level III products to the scan info's available list
-        let Some(scan_info) = self.gui.get_scan_info() else {
-            return;
-        };
-        let mut info = scan_info.clone();
-        if !info.available_products.contains(&l3_resp.product) {
-            info.available_products.push(l3_resp.product);
-            info.available_products.sort_by_key(|p| p.sort_order());
-            info.status = format!(
-                "Loaded {} products: {}",
-                info.available_products.len(),
-                info.available_products.iter().map(|p| p.name()).collect::<Vec<_>>().join(", ")
-            );
+        // Add Level III products to the scan info for all panes that have scan_info
+        // (L3 results apply to any pane that already loaded a scan for this site)
+        for pane_idx in 0..self.gui.pane_count() {
+            let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
+                continue;
+            };
+            let mut info = scan_info.clone();
+            let mut changed = false;
+            if !info.available_products.contains(&l3_resp.product) {
+                info.available_products.push(l3_resp.product);
+                info.available_products.sort_by_key(|p| p.sort_order());
+                info.status = format!(
+                    "Loaded {} products: {}",
+                    info.available_products.len(),
+                    info.available_products.iter().map(|p| p.name()).collect::<Vec<_>>().join(", ")
+                );
+                changed = true;
+            }
+            // Register the actual elevation angle from the PDB
+            let elevations = info.product_elevations.entry(l3_resp.product).or_default();
+            let rounded_elev = (elevation * 10.0).round() / 10.0;
+            if !elevations.iter().any(|e| (e - rounded_elev).abs() < 0.05) {
+                elevations.push(rounded_elev);
+                elevations.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                changed = true;
+            }
+            if changed {
+                self.gui.set_scan_info_for_pane(pane_idx, info);
+            }
         }
-        // Register the actual elevation angle from the PDB
-        let elevations = info.product_elevations.entry(l3_resp.product).or_default();
-        let rounded_elev = (elevation * 10.0).round() / 10.0;
-        if !elevations.iter().any(|e| (e - rounded_elev).abs() < 0.05) {
-            elevations.push(rounded_elev);
-            elevations.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        }
-        self.gui.set_scan_info(info);
     }
 
     /// Poll for completed overlay rasterization results and upload textures.
@@ -315,7 +323,7 @@ impl super::App {
                     }
 
                     if product.is_level3() {
-                        if let Some(scan_info) = self.gui.get_scan_info() {
+                        if let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) {
                             self.render.try_spawn_level3_render(
                                 pane_idx,
                                 product,
@@ -326,8 +334,8 @@ impl super::App {
                                 self.window.clone(),
                             );
                         }
-                    } else if let Some(data) = &self.scan_data {
-                        if let Some(scan_info) = self.gui.get_scan_info() {
+                    } else if let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) {
+                        if let Some(data) = self.scan_data.get(scan_info.site.name) {
                             self.render.spawn_level2_render(
                                 pane_idx,
                                 product,
@@ -358,9 +366,6 @@ impl super::App {
         let Some(state) = self.state.as_ref() else {
             return;
         };
-        let Some(scan_info) = self.gui.get_scan_info().cloned() else {
-            return;
-        };
 
         for pane_idx in 0..self.render.pane_render.len().min(self.gui.pane_count()) {
             let Some((ref image_data, max_range_km, ref value_data, product, elevation)) =
@@ -368,6 +373,12 @@ impl super::App {
             else {
                 continue;
             };
+
+            let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
+                continue;
+            };
+            let lat = scan_info.site.lat;
+            let lon = scan_info.site.lon;
 
             log::info!(
                 "Restoring cached radar image for pane {} ({:?} at {:.1}°) from memory",
@@ -385,8 +396,8 @@ impl super::App {
             self.gui.set_radar_image_for_pane(
                 pane_idx,
                 texture,
-                scan_info.site.lat,
-                scan_info.site.lon,
+                lat,
+                lon,
                 max_range_km,
                 value_data.to_vec(),
             );

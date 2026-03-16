@@ -29,7 +29,7 @@ pub enum GuiAction {
     Exit,
     FetchRadarScan(RadarConfig),
     CheckForNewScans(RadarConfig),
-    SwitchRadarSite(String), // Switch to a different radar site
+    SwitchRadarSite { site: String, pane_idx: usize }, // Switch to a different radar site
     /// Fetch SPC outlook product(s) for the given day.
     FetchSpcOutlook {
         day: OutlookDay,
@@ -112,8 +112,8 @@ impl std::fmt::Display for GuiAction {
                 "Check for new scans from {} at {}",
                 config.site, config.timestamp
             ),
-            GuiAction::SwitchRadarSite(site) => {
-                write!(f, "Switch to radar site {}", site)
+            GuiAction::SwitchRadarSite { site, pane_idx } => {
+                write!(f, "Switch pane {} to radar site {}", pane_idx, site)
             }
             GuiAction::FetchSpcOutlook { day, products } => {
                 write!(f, "Fetch SPC {} outlook ({} products)", day, products.len())

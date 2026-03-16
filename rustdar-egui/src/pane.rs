@@ -63,6 +63,10 @@ pub struct LoopPlaybackState {
 /// Per-pane state: each pane independently selects a radar product,
 /// elevation, layer toggles, and maintains its own map viewport.
 pub struct PaneState {
+    /// NEXRAD site code this pane is viewing (e.g. "KTLX").
+    pub site: String,
+    /// Product/elevation metadata for this pane's site.
+    pub scan_info: Option<ScanInfo>,
     pub selected_product: RadarProduct,
     pub selected_elevation: f32,
     pub hover_value: Option<String>,
@@ -100,9 +104,16 @@ impl LoopPlaybackState {
 
 impl PaneState {
     pub fn new() -> Self {
+        Self::with_site("KTLX".to_string())
+    }
+
+    /// Create a new pane viewing the given site.
+    pub fn with_site(site: String) -> Self {
         let mut map_memory = MapMemory::default();
         let _ = map_memory.set_zoom(4.0);
         Self {
+            site,
+            scan_info: None,
             selected_product: RadarProduct::Reflectivity,
             selected_elevation: 0.0,
             hover_value: None,
@@ -124,11 +135,8 @@ impl PaneState {
     }
 
     /// Get rendering params for this pane (product + closest elevation).
-    pub fn get_rendering_params(
-        &self,
-        scan_info: Option<&ScanInfo>,
-    ) -> Option<(RadarProduct, f32)> {
-        scan_info.and_then(|si| {
+    pub fn get_rendering_params(&self) -> Option<(RadarProduct, f32)> {
+        self.scan_info.as_ref().and_then(|si| {
             si.product_elevations
                 .get(&self.selected_product)
                 .and_then(|elevations| {

@@ -47,7 +47,6 @@ impl Default for MobileState {
 /// Radar fetch lifecycle state.
 pub(super) struct RadarState {
     pub config: RadarConfig,
-    pub scan_info: Option<ScanInfo>,
     pub fetching: bool,
     pub error_message: Option<String>,
     pub loading_site: Option<String>,
@@ -156,7 +155,6 @@ impl Gui {
         Self {
             radar: RadarState {
                 config: radar_config,
-                scan_info: None,
                 fetching: false,
                 error_message: None,
                 loading_site: None,
@@ -251,9 +249,13 @@ impl Gui {
         }
     }
 
-    /// Update the scan info (called from the app when scan is loaded)
-    pub fn set_scan_info(&mut self, info: ScanInfo) {
-        self.radar.scan_info = Some(info);
+    /// Update the scan info for all panes viewing the given site.
+    pub fn set_scan_info_for_site(&mut self, site: &str, info: ScanInfo) {
+        for pane in &mut self.panes {
+            if pane.site == site {
+                pane.scan_info = Some(info.clone());
+            }
+        }
         self.radar.fetching = false;
         self.auto_poll.on_success();
 
@@ -263,6 +265,13 @@ impl Gui {
                 let _ = pane.map_memory.set_zoom(7.0);
             }
             self.initial_zoom_set = true;
+        }
+    }
+
+    /// Update the scan info for a specific pane.
+    pub fn set_scan_info_for_pane(&mut self, pane_idx: usize, info: ScanInfo) {
+        if let Some(pane) = self.panes.get_mut(pane_idx) {
+            pane.scan_info = Some(info);
         }
     }
 
@@ -449,7 +458,7 @@ impl Gui {
 
         if pane.layers.is_enabled(LayerKind::Radar) {
             ui.indent(format!("{id_prefix}radar_controls"), |ui| {
-                if let Some(scan_info) = &self.radar.scan_info {
+                if let Some(scan_info) = &pane.scan_info {
                     let prev_product = pane.selected_product;
                     egui::ComboBox::from_id_salt(format!("{id_prefix}product_sel"))
                         .selected_text(pane.selected_product.name())
@@ -953,7 +962,7 @@ impl Gui {
     /// Get the rendering params for a specific pane.
     pub fn get_rendering_params_for_pane(&self, pane_idx: PaneId) -> Option<(RadarProduct, f32)> {
         self.panes.get(pane_idx)
-            .and_then(|p| p.get_rendering_params(self.radar.scan_info.as_ref()))
+            .and_then(|p| p.get_rendering_params())
     }
 
     /// Number of active panes.
@@ -1016,9 +1025,14 @@ impl Gui {
         self.panes.get(pane_idx).map(|p| &p.layers)
     }
 
-    /// Get the current scan info
+    /// Get the scan info for the active pane.
     pub fn get_scan_info(&self) -> Option<&ScanInfo> {
-        self.radar.scan_info.as_ref()
+        self.panes.get(self.active_pane).and_then(|p| p.scan_info.as_ref())
+    }
+
+    /// Get the scan info for a specific pane.
+    pub fn get_scan_info_for_pane(&self, pane_idx: usize) -> Option<&ScanInfo> {
+        self.panes.get(pane_idx).and_then(|p| p.scan_info.as_ref())
     }
 
     /// Take the radar image from a specific pane.

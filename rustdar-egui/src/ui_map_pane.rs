@@ -210,6 +210,7 @@ pub(super) fn render_pane_map_content(
             ctx.scan_info_site_name,
             ctx.loading_site,
             ctx.actions,
+            ctx.pane_idx,
         );
     }
 
@@ -332,6 +333,7 @@ fn render_radar_sites(
     scan_info_site_name: Option<&str>,
     loading_site: &mut Option<String>,
     actions: &mut Vec<GuiAction>,
+    pane_idx: usize,
 ) {
     let screen_rect = ui.max_rect();
     let zoom_f32 = zoom as f32;
@@ -366,7 +368,7 @@ fn render_radar_sites(
 
         if response.clicked() {
             *loading_site = Some(radar_site.name.to_string());
-            actions.push(GuiAction::SwitchRadarSite(radar_site.name.to_string()));
+            actions.push(GuiAction::SwitchRadarSite { site: radar_site.name.to_string(), pane_idx });
         }
 
         draw_site_marker(ui, site_screen, icon_size, icon_color, radar_site.name, font_size, is_dark_theme);

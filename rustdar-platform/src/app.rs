@@ -45,7 +45,7 @@ pub struct App {
     state: Option<app_state::AppState>,
     window: Option<WindowRef>,
     gui: Gui,
-    scan_data: Option<Arc<nexrad_model::data::Scan>>,
+    scan_data: std::collections::HashMap<String, Arc<nexrad_model::data::Scan>>,
     input: InputHandler,
     channels: ChannelHub,
     render: RenderDispatcher,
@@ -112,7 +112,7 @@ impl App {
             state: None,
             window: None,
             gui,
-            scan_data: None,
+            scan_data: std::collections::HashMap::new(),
             input,
             channels,
             render,
@@ -288,8 +288,8 @@ impl App {
                             self.latest_cached_scan = Some((scan_arc, scan_info, site, timestamp));
                         } else {
                             log::info!("Received scan data from background thread");
-                            self.scan_data = Some(Arc::clone(&scan_arc));
-                            self.gui.set_scan_info(scan_info);
+                            self.scan_data.insert(site.clone(), Arc::clone(&scan_arc));
+                            self.gui.set_scan_info_for_site(&site, scan_info);
                             self.gui.set_loading_site(None);
                             self.render.reset_panes();
                             self.spawn_level3_fetches(&site);

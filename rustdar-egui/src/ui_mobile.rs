@@ -394,7 +394,7 @@ impl super::Gui {
                     if self.radar.fetching {
                         ui.label("\u{1f504} Loading...");
                         ui.spinner();
-                    } else if let Some(scan_info) = &self.radar.scan_info {
+                    } else if let Some(scan_info) = self.panes.get(self.active_pane).and_then(|p| p.scan_info.as_ref()) {
                         ui.label(format!("{} @ {}",
                             scan_info.site.name,
                             scan_info.timestamp.format("%H:%M")

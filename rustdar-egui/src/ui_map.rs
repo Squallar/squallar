@@ -81,7 +81,7 @@ impl super::Gui {
                     let mut pane = std::mem::take(&mut self.panes[pane_idx]);
 
                     // Determine the map center
-                    let center = if let Some(scan_info) = &self.radar.scan_info {
+                    let center = if let Some(scan_info) = &pane.scan_info {
                         Position::new(scan_info.site.lon, scan_info.site.lat)
                     } else {
                         Position::new(-98.5795, 39.8283) // Geographic center of contiguous USA
@@ -161,6 +161,7 @@ impl super::Gui {
                         })
                         .show(&mut child_ui, |ui, projector, memory| {
                             let zoom = memory.zoom();
+                            let scan_info_site_name = pane.scan_info.as_ref().map(|i| i.site.name);
 
                             let mut render_ctx = pane_render::PaneRenderCtx {
                                 pane_idx,
@@ -172,7 +173,7 @@ impl super::Gui {
                                 pane_rect,
                                 pointer_available,
                                 is_dark_theme,
-                                scan_info_site_name: self.radar.scan_info.as_ref().map(|i| i.site.name),
+                                scan_info_site_name,
                                 loading_site: &mut self.radar.loading_site,
                                 excluded_rects: excluded_rects.clone(),
                                 #[cfg(target_os = "android")]

@@ -113,7 +113,7 @@ impl super::Gui {
 
                     ui.separator();
 
-                    render_scan_info(ui, self.radar.scan_info.as_ref());
+                    render_scan_info(ui, self.panes.get(self.active_pane).and_then(|p| p.scan_info.as_ref()));
 
                     ui.separator();
 

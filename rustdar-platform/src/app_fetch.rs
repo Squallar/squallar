@@ -79,7 +79,7 @@ impl super::App {
         match action {
             GuiAction::FetchRadarScan(_)
             | GuiAction::CheckForNewScans(_)
-            | GuiAction::SwitchRadarSite(_) => self.handle_radar_action(action),
+            | GuiAction::SwitchRadarSite { .. } => self.handle_radar_action(action),
             GuiAction::Exit => {
                 self.request_exit(event_loop);
             }
@@ -189,18 +189,26 @@ impl super::App {
                     crate::app::notify_redraw(&window);
                 });
             }
-            GuiAction::SwitchRadarSite(site) => {
-                log::info!("Switch radar site requested: {}", site);
+            GuiAction::SwitchRadarSite { site, pane_idx } => {
+                log::info!("Switch radar site requested: pane {} -> {}", pane_idx, site);
                 
                 let mut new_config = self.gui.get_radar_config().clone();
                 new_config.site = site.clone();
                 self.gui.set_radar_config(new_config.clone());
                 self.gui.set_loading_site(Some(site.clone()));
 
-                // Reset loop state on all panes so the old site's loop
-                // doesn't keep drawing over the new site.
-                for pane_idx in 0..self.gui.pane_count() {
+                if self.gui.is_sync_layers() {
+                    // Sync ON: update all panes to the new site
+                    for idx in 0..self.gui.pane_count() {
+                        if let Some(pane) = self.gui.pane_mut(idx) {
+                            pane.site = site.clone();
+                            pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new();
+                        }
+                    }
+                } else {
+                    // Sync OFF: only update the target pane
                     if let Some(pane) = self.gui.pane_mut(pane_idx) {
+                        pane.site = site.clone();
                         pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new();
                     }
                 }
@@ -588,13 +596,13 @@ impl super::App {
 
         if let Some((scan_arc, scan_info, site, timestamp)) = self.latest_cached_scan.take() {
             log::info!("JumpToLive: using cached scan @ {}", timestamp);
-            self.scan_data = Some(scan_arc);
+            self.scan_data.insert(site.clone(), scan_arc);
 
             let local_ts = chrono::TimeZone::from_utc_datetime(&chrono::Local, &timestamp).naive_local();
             let mut config = self.gui.get_radar_config().clone();
             config.timestamp = local_ts;
             self.gui.set_radar_config(config);
-            self.gui.set_scan_info(scan_info);
+            self.gui.set_scan_info_for_site(&site, scan_info);
             self.gui.set_loading_site(None);
             self.render.reset_panes();
             self.spawn_level3_fetches(&site);
