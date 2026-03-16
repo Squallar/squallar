@@ -4,7 +4,7 @@
 
 Rustdar is a cross-platform NEXRAD weather radar viewer built in Rust. It fetches real-time radar data from AWS, renders it onto a map, and runs on both desktop (Linux/macOS/Windows) and Android. The GUI uses **egui** with a **wgpu** rendering backend and **winit** for windowing.
 
-Ensure that any architecture or major change to the code is reflected in this document, as it serves as the single source of truth for project structure and conventions.
+Ensure that any architecture or major change to the code is reflected in this document, as it serves as the single source of truth for project structure and conventions. Also update features.md and data.md if any information there changes.
 
 ## Workspace Architecture
 
