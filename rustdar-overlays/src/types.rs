@@ -162,11 +162,6 @@ pub struct OverlayFeature {
     pub triangulations: Vec<Option<PrecomputedTriangulation>>,
     /// Geographic bounding box encompassing all polygons in this feature.
     pub geo_bounds: Option<GeoBounds>,
-    /// Optional geographic center point for screen-space hit-testing.
-    /// When set, click detection projects this point to screen coordinates
-    /// and checks pixel distance rather than doing polygon containment.
-    /// Used for point-marker overlays (e.g. storm reports).
-    pub click_center: Option<(f64, f64)>,
 }
 
 impl OverlayFeature {
@@ -194,25 +189,6 @@ impl OverlayFeature {
             hatch,
             triangulations,
             geo_bounds,
-            click_center: None,
-        }
-    }
-
-    /// Build a point feature for screen-space click detection.
-    ///
-    /// Has no polygons — hit-testing is done by projecting `click_center`
-    /// to screen space and checking pixel distance.
-    pub fn point(lat: f64, lon: f64) -> Self {
-        Self {
-            polygons: Vec::new(),
-            fill_rgba: [0; 4],
-            stroke_rgba: [0; 4],
-            label: String::new(),
-            label2: String::new(),
-            hatch: HatchPattern::None,
-            triangulations: Vec::new(),
-            geo_bounds: None,
-            click_center: Some((lat, lon)),
         }
     }
 

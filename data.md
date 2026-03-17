@@ -41,7 +41,7 @@ This document details which data sources are needed for this project. Not all ar
 | Mesoscale Discussions (MDs)            | ✅     |
 | Precipitation Discussions              | ❌     |
 | Watches (Tornado/Severe Tstorm)        | ❌     |
-| Storm Reports (preliminary & filtered) | ❌     |
+| Storm Reports (preliminary & filtered) | ✅     |
 | Fire Weather Outlooks                  | ❌     |
 | SPC Mesoanalysis graphics              | ❌     |
 | Sounding data / SPC skew-T parameters  | ❌     |

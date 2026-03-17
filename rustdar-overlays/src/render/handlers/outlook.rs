@@ -6,7 +6,7 @@ use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayKind, OverlayState,
     PopupContent, PopupSection, RasterizeContext, SelectedOverlay,
 };
-use crate::render::rasterize;
+use crate::render::rasterize::{self, RasterizeOutput};
 use crate::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
 use crate::types::GeoBounds;
 
@@ -125,7 +125,7 @@ impl OverlayHandler for SpcOutlookHandler {
     fn prepare_rasterize(
         &self,
         ctx: &RasterizeContext,
-    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> Vec<u8> + Send>> {
+    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>> {
         let day = ctx.spc_day;
         let mut features = Vec::new();
         for &product in &ctx.enabled_spc_products {
@@ -142,7 +142,8 @@ impl OverlayHandler for SpcOutlookHandler {
             [60, 60, 60, 180]
         };
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            rasterize::rasterize_spc_outlooks(&features, bounds, width, height, hatch_color)
+            let rgba = rasterize::rasterize_spc_outlooks(&features, bounds, width, height, hatch_color);
+            RasterizeOutput { rgba, hit_map: None }
         }))
     }
 

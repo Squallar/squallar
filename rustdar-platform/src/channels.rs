@@ -3,6 +3,7 @@ use nexrad_data::aws::archive::Identifier;
 use nexrad_level3::model::Level3Message;
 use nexrad_model::data::Scan;
 use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
+use rustdar_overlays::render::rasterize::HitMap;
 use rustdar_overlays::types::GeoBounds;
 use rustdar_radar::types::RadarProduct;
 use std::sync::mpsc::{Receiver, Sender};
@@ -55,6 +56,7 @@ pub struct OverlayRenderResponse {
     pub generation: u64,
     pub pane_indices: Vec<usize>,
     pub zoom: i32,
+    pub hit_map: Option<HitMap>,
 }
 
 /// Result from listing available scans for a loop time range.

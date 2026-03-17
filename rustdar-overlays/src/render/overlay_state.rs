@@ -5,6 +5,7 @@ use std::pin::Pin;
 use crate::nws::alert::AlertCategory;
 use crate::render::layers::LayerManager;
 use crate::spc::outlook::{OutlookDay, OutlookProduct};
+use crate::render::rasterize::RasterizeOutput;
 use crate::types::{GeoBounds, OverlayFeature, OverlayLabel};
 
 /// Format an ISO 8601 timestamp into a shorter human-readable form.
@@ -138,7 +139,7 @@ pub(crate) trait OverlayHandler {
     fn prepare_rasterize(
         &self,
         ctx: &RasterizeContext,
-    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> Vec<u8> + Send>>;
+    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>>;
 
     /// Create async fetch tasks for this overlay's data.
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask>;
@@ -279,7 +280,7 @@ impl OverlayRegistry {
         &self,
         kind: OverlayKind,
         ctx: &RasterizeContext,
-    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> Vec<u8> + Send>> {
+    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>> {
         self.handler(kind).and_then(|h| h.prepare_rasterize(ctx))
     }
 

@@ -5,7 +5,7 @@
 //! Rendering runs on a background thread; the resulting texture is displayed
 //! as a geo-positioned image on the map — identical to how radar images work.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::f64::consts::PI;
 
 use tiny_skia::{
@@ -13,10 +13,90 @@ use tiny_skia::{
 };
 
 use crate::nws::alert::{AlertCategory, NwsAlert};
+use crate::render::overlay_state::SelectedOverlay;
 use crate::spc::colors::{md_fill_color, md_stroke_color};
 use crate::spc::discussion::SpcDiscussion;
 use crate::spc::reports::{StormReport, StormReportKind};
 use crate::types::{GeoBounds, OverlayFeature};
+
+// ── Hit buffer types ─────────────────────────────────────────────────────
+
+/// Quarter-resolution hit buffer produced during rasterization.
+///
+/// Maps pixel regions to overlay item IDs so that click detection is
+/// pixel-perfect — the exact same pixels the rasterizer drew are clickable.
+/// Resolution is 1/4 of the texture in each axis to keep memory low.
+#[derive(Clone)]
+pub struct HitMap {
+    /// Quarter-resolution width.
+    pub width: u32,
+    /// Quarter-resolution height.
+    pub height: u32,
+    /// Sparse map: quarter-res pixel index (`qy * width + qx`) → list of
+    /// item IDs that cover that cell. Only occupied cells are stored.
+    cells: HashMap<u32, Vec<u32>>,
+    /// Maps item IDs used in `cells` to their `SelectedOverlay` values.
+    id_map: HashMap<u32, SelectedOverlay>,
+}
+
+impl HitMap {
+    /// Create an empty hit map with the given quarter-resolution dimensions.
+    pub fn new(full_width: u32, full_height: u32) -> Self {
+        Self {
+            width: (full_width + 3) / 4,
+            height: (full_height + 3) / 4,
+            cells: HashMap::new(),
+            id_map: HashMap::new(),
+        }
+    }
+
+    /// Register that `item_id` covers the full-resolution pixel `(px, py)`.
+    ///
+    /// Quantizes to quarter-res and records the ID in the sparse cell map.
+    pub fn record(&mut self, px: f32, py: f32, item_id: u32) {
+        let qx = (px as u32) / 4;
+        let qy = (py as u32) / 4;
+        if qx >= self.width || qy >= self.height {
+            return;
+        }
+        let idx = qy * self.width + qx;
+        let ids = self.cells.entry(idx).or_insert_with(|| Vec::with_capacity(1));
+        if !ids.contains(&item_id) {
+            ids.push(item_id);
+        }
+    }
+
+    /// Register the `SelectedOverlay` for a given item ID.
+    pub fn register_id(&mut self, item_id: u32, selected: SelectedOverlay) {
+        self.id_map.insert(item_id, selected);
+    }
+
+    /// Look up all overlay items at texture UV coordinates `(u, v)` in `[0, 1]`.
+    pub fn hit_test(&self, u: f32, v: f32) -> Vec<&SelectedOverlay> {
+        if u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0 {
+            return Vec::new();
+        }
+        let qx = ((u * self.width as f32) as u32).min(self.width.saturating_sub(1));
+        let qy = ((v * self.height as f32) as u32).min(self.height.saturating_sub(1));
+        let idx = qy * self.width + qx;
+        self.cells
+            .get(&idx)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| self.id_map.get(id))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Output from a rasterization function: RGBA pixels plus an optional hit buffer.
+pub struct RasterizeOutput {
+    /// RGBA pixel data (`width × height × 4` bytes).
+    pub rgba: Vec<u8>,
+    /// Optional hit buffer for pixel-perfect click detection.
+    pub hit_map: Option<HitMap>,
+}
 
 // ── Mercator projection helpers ──────────────────────────────────────────
 
@@ -265,9 +345,12 @@ pub fn rasterize_storm_reports(
     height: u32,
     zoom: f64,
     is_dark: bool,
-) -> Vec<u8> {
+) -> RasterizeOutput {
     let Some(mut pixmap) = Pixmap::new(width, height) else {
-        return vec![0u8; (width * height * 4) as usize];
+        return RasterizeOutput {
+            rgba: vec![0u8; (width * height * 4) as usize],
+            hit_map: None,
+        };
     };
     let mb = MercatorBounds::from_geo(bounds);
     let w = width as f32;
@@ -276,6 +359,8 @@ pub fn rasterize_storm_reports(
     let zoom_f32 = zoom as f32;
     let radius = (3.0 + zoom_f32 * 0.5).clamp(3.0, 10.0);
     let stroke_w = (radius * 0.3).clamp(0.5, 2.0);
+    // Hit radius includes the stroke outline for generous click targets.
+    let hit_radius = radius + stroke_w;
 
     let outline = if is_dark {
         Color::from_rgba8(255, 255, 255, 220)
@@ -283,7 +368,9 @@ pub fn rasterize_storm_reports(
         Color::from_rgba8(40, 40, 40, 220)
     };
 
-    for report in reports {
+    let mut hit_map = HitMap::new(width, height);
+
+    for (idx, report) in reports.iter().enumerate() {
         let (px, py) = mb.project(report.lat, report.lon, w, h);
         if px < -20.0 || px > w + 20.0 || py < -20.0 || py > h + 20.0 {
             continue;
@@ -307,10 +394,36 @@ pub fn rasterize_storm_reports(
             let stroke = Stroke { width: stroke_w, ..Stroke::default() };
             pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
         }
+
+        // Record hit cells for all quarter-res pixels within the hit radius.
+        let item_id = idx as u32;
+        hit_map.register_id(item_id, SelectedOverlay::StormReport { index: idx });
+        let min_x = (px - hit_radius).max(0.0) as i32;
+        let max_x = ((px + hit_radius) as i32).min(width as i32 - 1);
+        let min_y = (py - hit_radius).max(0.0) as i32;
+        let max_y = ((py + hit_radius) as i32).min(height as i32 - 1);
+        let r2 = hit_radius * hit_radius;
+        // Step by 4 since we only need one sample per quarter-res cell.
+        let mut sy = min_y;
+        while sy <= max_y {
+            let mut sx = min_x;
+            while sx <= max_x {
+                let dx = sx as f32 - px;
+                let dy = sy as f32 - py;
+                if dx * dx + dy * dy <= r2 {
+                    hit_map.record(sx as f32, sy as f32, item_id);
+                }
+                sx += 4;
+            }
+            sy += 4;
+        }
     }
 
     premultiplied_to_straight(pixmap.data_mut());
-    pixmap.take()
+    RasterizeOutput {
+        rgba: pixmap.take(),
+        hit_map: Some(hit_map),
+    }
 }
 
 // ── Feature rendering ────────────────────────────────────────────────────

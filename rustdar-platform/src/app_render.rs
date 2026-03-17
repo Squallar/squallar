@@ -215,6 +215,7 @@ impl super::App {
                 lon,
                 max_range_km,
             }),
+            hit_map: None,
         });
 
         if pane_idx < self.render.pane_render.len() {
@@ -330,6 +331,7 @@ impl super::App {
                     width: resp.width,
                     height: resp.height,
                     radar_meta: None,
+                    hit_map: resp.hit_map.clone(),
                 });
             }
         }
@@ -471,6 +473,7 @@ impl super::App {
                         lon,
                         max_range_km,
                     }),
+                    hit_map: None,
                 });
             }
             self.render.pane_render[pane_idx].last_rendered = Some((product, elevation));

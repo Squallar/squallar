@@ -5,7 +5,7 @@ use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayKind, OverlayState,
     PopupContent, PopupSection, RasterizeContext, SelectedOverlay,
 };
-use crate::render::rasterize;
+use crate::render::rasterize::{self, RasterizeOutput};
 use crate::spc::colors::md_stroke_color;
 use crate::spc::discussion::SpcDiscussion;
 use crate::types::{GeoBounds, OverlayLabel};
@@ -156,13 +156,14 @@ impl OverlayHandler for SpcDiscussionHandler {
     fn prepare_rasterize(
         &self,
         _ctx: &RasterizeContext,
-    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> Vec<u8> + Send>> {
+    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>> {
         if self.state.data.is_empty() {
             return None;
         }
         let discussions = self.state.data.clone();
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            rasterize::rasterize_spc_discussions(&discussions, bounds, width, height)
+            let rgba = rasterize::rasterize_spc_discussions(&discussions, bounds, width, height);
+            RasterizeOutput { rgba, hit_map: None }
         }))
     }
 

@@ -8,7 +8,7 @@ use crate::render::overlay_state::{
     PopupAction, PopupActionKind, PopupContent, PopupSection, RasterizeContext,
     SelectedOverlay, format_iso_time,
 };
-use crate::render::rasterize;
+use crate::render::rasterize::{self, RasterizeOutput};
 use crate::types::GeoBounds;
 
 /// Type-erased fetch result for NWS alerts.
@@ -171,7 +171,7 @@ impl OverlayHandler for NwsAlertHandler {
     fn prepare_rasterize(
         &self,
         ctx: &RasterizeContext,
-    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> Vec<u8> + Send>> {
+    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>> {
         if self.state.data.is_empty() {
             return None;
         }
@@ -179,14 +179,15 @@ impl OverlayHandler for NwsAlertHandler {
         let enabled_categories = ctx.enabled_nws_categories.clone();
         let hidden_alerts = self.hidden_alerts.clone();
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            rasterize::rasterize_nws_alerts(
+            let rgba = rasterize::rasterize_nws_alerts(
                 &alerts,
                 &enabled_categories,
                 &hidden_alerts,
                 bounds,
                 width,
                 height,
-            )
+            );
+            RasterizeOutput { rgba, hit_map: None }
         }))
     }
 

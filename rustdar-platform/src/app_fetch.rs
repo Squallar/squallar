@@ -337,9 +337,9 @@ impl super::App {
                     return;
                 };
                 std::thread::spawn(move || {
-                    let image_data = rasterize_fn(&render_bounds, width, height);
+                    let output = rasterize_fn(&render_bounds, width, height);
                     let _ = sender.send(OverlayRenderResponse {
-                        image_data,
+                        image_data: output.rgba,
                         width,
                         height,
                         geo_bounds: render_bounds,
@@ -347,6 +347,7 @@ impl super::App {
                         generation: data_generation,
                         pane_indices,
                         zoom,
+                        hit_map: output.hit_map,
                     });
                     super::notify_redraw(&window);
                 });
@@ -383,6 +384,7 @@ impl super::App {
                         generation: data_generation,
                         pane_indices,
                         zoom,
+                        hit_map: None,
                     });
                     super::notify_redraw(&window);
                 });

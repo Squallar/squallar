@@ -10,6 +10,7 @@ use std::f64::consts::PI;
 use std::sync::Arc;
 
 use rustdar_overlays::render::geo as overlay_geo;
+use rustdar_overlays::render::rasterize::HitMap;
 use rustdar_overlays::types::{GeoBounds, OverlayFeature, ScreenPoint};
 
 // ── Viewport state (reused for render-trigger detection) ─────────────────
@@ -59,6 +60,8 @@ pub struct OverlayTextureData {
     pub height: u32,
     /// Radar-specific metadata (None for non-radar overlays).
     pub radar_meta: Option<RadarTextureMeta>,
+    /// Optional hit buffer for pixel-perfect click detection on point overlays.
+    pub hit_map: Option<HitMap>,
 }
 
 /// Per-overlay-type texture cache for a single pane.
@@ -127,6 +130,21 @@ fn pan_exceeds_coverage(texture_bounds: &GeoBounds, viewport_bounds: &GeoBounds)
 
 // ── Drawing ──────────────────────────────────────────────────────────────
 
+/// Compute the screen-space rectangle for an overlay texture.
+pub fn overlay_texture_rect(
+    projector: &walkers::Projector,
+    tex: &OverlayTextureData,
+    _screen_rect: egui::Rect,
+) -> egui::Rect {
+    let nw = projector
+        .project(walkers::lat_lon(tex.geo_bounds.max_lat, tex.geo_bounds.min_lon))
+        .to_pos2();
+    let se = projector
+        .project(walkers::lat_lon(tex.geo_bounds.min_lat, tex.geo_bounds.max_lon))
+        .to_pos2();
+    egui::Rect::from_two_pos(nw, se)
+}
+
 /// Draw an overlay texture as a geo-positioned image on the map.
 ///
 /// This is the per-frame draw call — projects the texture's NW/SE corners
@@ -137,13 +155,7 @@ pub fn draw_overlay_texture(
     tex: &OverlayTextureData,
     screen_rect: egui::Rect,
 ) {
-    let nw = projector
-        .project(walkers::lat_lon(tex.geo_bounds.max_lat, tex.geo_bounds.min_lon))
-        .to_pos2();
-    let se = projector
-        .project(walkers::lat_lon(tex.geo_bounds.min_lat, tex.geo_bounds.max_lon))
-        .to_pos2();
-    let rect = egui::Rect::from_two_pos(nw, se);
+    let rect = overlay_texture_rect(projector, tex, screen_rect);
 
     // Skip if entirely off-screen
     if !screen_rect.intersects(rect) {

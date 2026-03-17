@@ -64,7 +64,6 @@ pub(super) fn render_pane_map_content(
         let overlay_ctx = OverlayDrawContext::new(
             ui,
             projector,
-            zoom,
             ctx.pointer_available,
             ctx.pane_rect,
             &ctx.excluded_rects,

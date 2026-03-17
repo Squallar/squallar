@@ -1,8 +1,6 @@
 //! SPC Storm Reports: fetch and parse today's preliminary tornado, hail, and
 //! wind reports from the SPC CSV endpoints.
 
-use crate::types::OverlayFeature;
-
 /// The kind of storm report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StormReportKind {
@@ -28,8 +26,6 @@ pub struct StormReport {
     pub lat: f64,
     pub lon: f64,
     pub comments: String,
-    /// Small circular polygon feature for click hit-testing.
-    pub feature: OverlayFeature,
 }
 
 const TORN_URL: &str = "https://www.spc.noaa.gov/climo/reports/today_torn.csv";
@@ -151,7 +147,6 @@ fn parse_csv(text: &str, kind: StormReportKind) -> Result<Vec<StormReport>, Stri
             location,
             county,
             state,
-            feature: OverlayFeature::point(lat, lon),
             lat,
             lon,
             comments,

@@ -48,7 +48,7 @@ Feature comparison across weather platforms. ✅ = implemented, ❌ = not implem
 | Mesoscale discussions             | Overlay | ❌         | ❌      | ✅      |
 | Watch/Warning polygons            | ✅      | ✅         | ❌      | ✅      |
 | Tornado/Severe/FFW polygons       | ✅      | ✅         | ❌      | ✅      |
-| Storm reports (prelim & filtered) | Overlay | ❌         | ✅      | ❌      |
+| Storm reports (prelim & filtered) | Overlay | ❌         | ✅      | ✅      |
 | SPC mesoanalysis parameters       | ❌      | ❌         | ✅      | ❌      |
 | Significant hail/tornado probs    | ❌      | ❌         | ✅      | ✅      |
 | Fire weather outlooks             | ❌      | ❌         | ❌      | ❌      |

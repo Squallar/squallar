@@ -4,7 +4,7 @@ use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayKind, OverlayState,
     PopupContent, PopupSection, RasterizeContext, SelectedOverlay,
 };
-use crate::render::rasterize;
+use crate::render::rasterize::{self, RasterizeOutput};
 use crate::spc::reports::{StormReport, StormReportKind};
 use crate::types::GeoBounds;
 
@@ -56,16 +56,9 @@ impl OverlayHandler for StormReportsHandler {
     }
 
     fn clickable_items(&self, _layers: &crate::render::layers::LayerManager) -> Vec<ClickableItem<'_>> {
-        self.state
-            .data
-            .iter()
-            .enumerate()
-            .map(|(i, report)| ClickableItem {
-                features: vec![&report.feature],
-                label: None,
-                id: SelectedOverlay::StormReport { index: i },
-            })
-            .collect()
+        // Storm reports use hit-buffer-based click detection, not polygon containment.
+        // No clickable items needed — hits come from the HitMap in the texture cache.
+        Vec::new()
     }
 
     fn popup_content(&self, selected: &SelectedOverlay) -> Option<PopupContent> {
@@ -142,7 +135,7 @@ impl OverlayHandler for StormReportsHandler {
     fn prepare_rasterize(
         &self,
         ctx: &RasterizeContext,
-    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> Vec<u8> + Send>> {
+    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>> {
         if self.state.data.is_empty() {
             return None;
         }
