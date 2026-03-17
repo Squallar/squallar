@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 chrono = "0.4.42"
 earcutr = "0.4"
+rustdar-units = { path = "../rustdar-units" }
 futures = "0.3"
 log = "0.4.28"
 reqwest = { version = "0.12", features = ["json"] }

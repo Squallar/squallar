@@ -3784,6 +3784,7 @@ dependencies = [
  "log",
  "rustdar-overlays",
  "rustdar-radar",
+ "rustdar-units",
  "serde",
  "serde_json",
  "walkers",
@@ -3800,6 +3801,7 @@ dependencies = [
  "openssl-sys",
  "reqwest 0.12.24",
  "roxmltree",
+ "rustdar-units",
  "serde",
  "serde_json",
  "tiny-skia 0.12.0",
@@ -3846,8 +3848,17 @@ dependencies = [
  "openssl-sys",
  "rayon",
  "reqwest 0.12.24",
+ "rustdar-units",
  "serde",
  "thiserror 2.0.17",
+]
+
+[[package]]
+name = "rustdar-units"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
 ]
 
 [[package]]
