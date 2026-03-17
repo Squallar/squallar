@@ -223,21 +223,6 @@ impl super::App {
         }
     }
 
-    /// Spawn an async overlay fetch task. Sends the future's result through
-    /// the given channel and requests a redraw when complete.
-    fn spawn_overlay_fetch<T: Send + 'static>(
-        &self,
-        sender: std::sync::mpsc::Sender<T>,
-        future: impl std::future::Future<Output = T> + Send + 'static,
-    ) {
-        let window = self.window.clone();
-        self.tokio_runtime.spawn(async move {
-            let result = future.await;
-            let _ = sender.send(result);
-            super::notify_redraw(&window);
-        });
-    }
-
     /// Handle overlay fetch/refresh actions for all overlay kinds.
     fn handle_overlay_action(&mut self, action: GuiAction) {
         match action {
@@ -250,60 +235,33 @@ impl super::App {
 
     /// Fetch overlay data for the given kind, resolving parameters from current state.
     fn fetch_overlay(&mut self, kind: OverlayKind) {
-        match kind {
-            OverlayKind::SpcOutlook => {
-                let day = self.gui.active_pane().layers.spc_day;
-                let products = self.gui.active_pane().layers.enabled_spc_products();
-                if products.is_empty() {
-                    return;
-                }
-                log::info!("Fetching SPC outlooks for {:?}: {:?}", day, products);
-                self.gui.overlays.set_spc_fetching(true);
-                let client = self.http_client.clone();
-                let sender = self.channels.overlay_fetch_sender.clone();
-                for product in products {
-                    let client = client.clone();
-                    self.spawn_overlay_fetch(sender.clone(), async move {
-                        let result =
-                            rustdar_overlays::spc::fetch::fetch_outlook(&client, day, product)
-                                .await
-                                .map_err(|e| format!("{e}"));
-                        OverlayFetchResult::SpcOutlook { day, product, result }
-                    });
-                }
-            }
-            OverlayKind::NwsAlerts => {
-                log::info!("Fetching NWS active alerts");
-                self.gui.overlays.set_nws_fetching(true);
-                let client = self.http_client.clone();
-                let zone_cache = self.platform.zone_cache_dir().map(|p| p.to_path_buf());
-                self.spawn_overlay_fetch(self.channels.overlay_fetch_sender.clone(), async move {
-                    OverlayFetchResult::NwsAlerts(
-                        rustdar_overlays::nws::fetch::fetch_active_alerts(
-                            &client,
-                            zone_cache.as_deref(),
-                        )
-                            .await
-                            .map_err(|e| format!("{e}"))
-                    )
-                });
-            }
-            OverlayKind::SpcDiscussions => {
-                log::info!("Fetching SPC Mesoscale Discussions");
-                self.gui.overlays.set_spc_md_fetching(true);
-                let client = self.http_client.clone();
-                self.spawn_overlay_fetch(self.channels.overlay_fetch_sender.clone(), async move {
-                    OverlayFetchResult::SpcDiscussions(
-                        rustdar_overlays::spc::fetch::fetch_active_discussions(&client)
-                            .await
-                            .map_err(|e| format!("{e}"))
-                    )
-                });
-            }
-            // Non-fetchable kinds are never dispatched here.
-            _ => {
-                log::warn!("fetch_overlay called with non-fetchable kind: {:?}", kind);
-            }
+        use rustdar_overlays::render::overlay_state::FetchConfig;
+
+        let pane = self.gui.active_pane();
+        let config = FetchConfig {
+            client: self.http_client.clone(),
+            zone_cache_dir: self.platform.zone_cache_dir().map(|p| p.to_path_buf()),
+            spc_day: pane.layers.spc_day,
+            spc_products: pane.layers.enabled_spc_products(),
+        };
+
+        let tasks = self.gui.overlays.create_fetch_tasks(kind, &config);
+        if tasks.is_empty() {
+            return;
+        }
+
+        log::info!("Fetching overlay data for {:?} ({} task(s))", kind, tasks.len());
+        self.gui.overlays.set_fetching(kind, true);
+
+        for task in tasks {
+            let sender = self.channels.overlay_fetch_sender.clone();
+            let window = self.window.clone();
+            let task_kind = task.kind;
+            self.tokio_runtime.spawn(async move {
+                let data = task.future.await;
+                let _ = sender.send(OverlayFetchResult { kind: task_kind, data });
+                super::notify_redraw(&window);
+            });
         }
     }
 
@@ -357,81 +315,28 @@ impl super::App {
 
         // Clone the data needed for the render closure
         match kind {
-            OverlayKind::SpcOutlook => {
-                let layers = &target_pane.layers;
-                let day = layers.spc_day;
-                let mut features = Vec::new();
-                for lk in layers.spc_layers_for_day() {
-                    if !layers.is_enabled(lk) {
-                        continue;
+            // Handler-backed texture overlays: use prepare_rasterize
+            OverlayKind::SpcOutlook
+            | OverlayKind::SpcDiscussions
+            | OverlayKind::NwsAlerts => {
+                let rctx = rustdar_overlays::render::overlay_state::RasterizeContext {
+                    is_dark: self.cached_dark_theme.unwrap_or(false),
+                    zoom: zoom as f64 / 32.0,
+                    spc_day: target_pane.layers.spc_day,
+                    enabled_spc_products: target_pane.layers.enabled_spc_products(),
+                    enabled_nws_categories: target_pane.layers.enabled_nws_categories(),
+                };
+                let Some(rasterize_fn) = self.gui.overlays.prepare_rasterize(kind, &rctx) else {
+                    // Nothing to render — clear in-flight
+                    for &pidx in &pane_indices {
+                        if let Some(pane) = self.gui.pane_mut(pidx) {
+                            pane.overlay_cache_mut(kind).render_in_flight = false;
+                        }
                     }
-                    let Some(product) = lk.to_outlook_product() else { continue };
-                    if let Some(outlook) = self.gui.overlays.spc_outlooks.data.get(&(day, product)) {
-                        features.extend(outlook.features.iter().cloned());
-                    }
-                }
-                let is_dark = self.cached_dark_theme.unwrap_or(false);
+                    return;
+                };
                 std::thread::spawn(move || {
-                    let hatch_color = if is_dark {
-                        [200, 200, 200, 180]
-                    } else {
-                        [60, 60, 60, 180]
-                    };
-                    let image_data = rasterize::rasterize_spc_outlooks(
-                        &features,
-                        &render_bounds,
-                        width,
-                        height,
-                        hatch_color,
-                    );
-                    let _ = sender.send(OverlayRenderResponse {
-                        image_data,
-                        width,
-                        height,
-                        geo_bounds: render_bounds,
-                        overlay_kind: kind,
-                        generation: data_generation,
-                        pane_indices,
-                        zoom,
-                    });
-                    super::notify_redraw(&window);
-                });
-            }
-            OverlayKind::SpcDiscussions => {
-                let discussions: Vec<_> = self.gui.overlays.spc_discussions.data.clone();
-                std::thread::spawn(move || {
-                    let image_data = rasterize::rasterize_spc_discussions(
-                        &discussions,
-                        &render_bounds,
-                        width,
-                        height,
-                    );
-                    let _ = sender.send(OverlayRenderResponse {
-                        image_data,
-                        width,
-                        height,
-                        geo_bounds: render_bounds,
-                        overlay_kind: kind,
-                        generation: data_generation,
-                        pane_indices,
-                        zoom,
-                    });
-                    super::notify_redraw(&window);
-                });
-            }
-            OverlayKind::NwsAlerts => {
-                let alerts: Vec<_> = self.gui.overlays.nws_alerts.data.clone();
-                let enabled_categories = target_pane.layers.enabled_nws_categories();
-                let hidden_alerts = self.gui.overlays.hidden_alerts.clone();
-                std::thread::spawn(move || {
-                    let image_data = rasterize::rasterize_nws_alerts(
-                        &alerts,
-                        &enabled_categories,
-                        &hidden_alerts,
-                        &render_bounds,
-                        width,
-                        height,
-                    );
+                    let image_data = rasterize_fn(&render_bounds, width, height);
                     let _ = sender.send(OverlayRenderResponse {
                         image_data,
                         width,

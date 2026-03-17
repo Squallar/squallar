@@ -1,6 +1,6 @@
 use crate::actions::{GuiAction, RadarConfig};
 use rustdar_overlays::render::layers::{LayerKind, LayerManager};
-use rustdar_overlays::render::overlay_state::{OverlayData, OverlayKind};
+use rustdar_overlays::render::overlay_state::{OverlayRegistry, OverlayKind};
 use crate::pane::{PaneId, PaneLayout, PaneState, MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
 use crate::tiles::MapTileState;
 use chrono::Timelike;
@@ -113,7 +113,7 @@ pub struct Gui {
     // User's GPS location for blue dot indicator (lat, lon)
     user_location: Option<(f64, f64)>,
     // Overlay data (SPC outlooks, NWS alerts, SPC discussions)
-    pub overlays: OverlayData,
+    pub overlays: OverlayRegistry,
     // Multi-pane state
     panes: Vec<PaneState>,
     active_pane: PaneId,
@@ -164,7 +164,7 @@ impl Gui {
             initial_zoom_set: false,
             map_tiles: MapTileState::default(),
             user_location: None,
-            overlays: OverlayData::default(),
+            overlays: OverlayRegistry::default(),
             panes: vec![PaneState::new()],
             active_pane: 0,
             pane_layout: PaneLayout::default(),
@@ -231,10 +231,10 @@ impl Gui {
 
         // Auto-refresh overlay data when layers are enabled and refresh interval elapsed
         for &kind in OverlayKind::all() {
-            if let Some(interval) = kind.auto_poll_interval() {
+            if let Some(interval) = self.overlays.auto_poll_interval(kind) {
                 if self.panes.iter().any(|p| kind.is_enabled(&p.layers))
-                    && !kind.is_fetching(&self.overlays)
-                    && kind.fetch_time(&self.overlays)
+                    && !self.overlays.is_fetching(kind)
+                    && self.overlays.fetch_time(kind)
                         .map_or(true, |t| t.elapsed().as_secs() >= interval)
                 {
                     actions.push(GuiAction::FetchOverlay(kind));
@@ -751,8 +751,6 @@ impl Gui {
         pane: &mut PaneState,
         actions: &mut Vec<GuiAction>,
     ) {
-        let day = pane.layers.spc_day;
-
         ui.label("\u{26c8}  SPC Outlooks");
 
         ui.horizontal_wrapped(|ui| {
@@ -779,24 +777,20 @@ impl Gui {
             let was_enabled = pane.layers.is_enabled(*layer);
             ui.checkbox(pane.layers.enabled_mut(*layer), layer.display_name());
             let is_enabled = pane.layers.is_enabled(*layer);
-            if is_enabled && !was_enabled {
-                if let Some(product) = layer.to_outlook_product() {
-                    if !self.overlays.spc_outlooks.data.contains_key(&(day, product)) {
-                        actions.push(GuiAction::FetchOverlay(OverlayKind::SpcOutlook));
-                    }
-                }
+            if is_enabled && !was_enabled && !self.overlays.is_fetching(OverlayKind::SpcOutlook) {
+                actions.push(GuiAction::FetchOverlay(OverlayKind::SpcOutlook));
             }
         }
 
         if pane.layers.any_spc_enabled() {
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!self.overlays.spc_outlooks.fetching, egui::Button::new("\u{1f504} Refresh"))
+                    .add_enabled(!self.overlays.is_fetching(OverlayKind::SpcOutlook), egui::Button::new("\u{1f504} Refresh"))
                     .clicked()
                 {
                     actions.push(GuiAction::RefreshOverlay(OverlayKind::SpcOutlook));
                 }
-                if self.overlays.spc_outlooks.fetching {
+                if self.overlays.is_fetching(OverlayKind::SpcOutlook) {
                     ui.spinner();
                 }
             });
@@ -812,17 +806,18 @@ impl Gui {
     ) {
         {
             let was_enabled = pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
-            let label = if self.overlays.spc_discussions.data.is_empty() {
+            let md_count = self.overlays.item_count(OverlayKind::SpcDiscussions);
+            let label = if md_count == 0 {
                 "\u{1f4cb}  Mesoscale Disc.".to_string()
             } else {
-                format!("\u{1f4cb}  Mesoscale Disc. ({})", self.overlays.spc_discussions.data.len())
+                format!("\u{1f4cb}  Mesoscale Disc. ({})", md_count)
             };
             ui.checkbox(
                 pane.layers.enabled_mut(LayerKind::SpcMesoscaleDiscussions),
                 label,
             );
             let is_enabled = pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
-            if is_enabled && !was_enabled && self.overlays.spc_discussions.data.is_empty() && !self.overlays.spc_discussions.fetching {
+            if is_enabled && !was_enabled && !self.overlays.has_data(OverlayKind::SpcDiscussions) && !self.overlays.is_fetching(OverlayKind::SpcDiscussions) {
                 actions.push(GuiAction::FetchOverlay(OverlayKind::SpcDiscussions));
             }
         }
@@ -830,16 +825,16 @@ impl Gui {
         if pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions) {
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!self.overlays.spc_discussions.fetching, egui::Button::new("\u{1f504} Refresh"))
+                    .add_enabled(!self.overlays.is_fetching(OverlayKind::SpcDiscussions), egui::Button::new("\u{1f504} Refresh"))
                     .clicked()
                 {
                     actions.push(GuiAction::RefreshOverlay(OverlayKind::SpcDiscussions));
                 }
-                if self.overlays.spc_discussions.fetching {
+                if self.overlays.is_fetching(OverlayKind::SpcDiscussions) {
                     ui.spinner();
                 }
             });
-            if let Some(t) = self.overlays.spc_discussions.fetch_time {
+            if let Some(t) = self.overlays.fetch_time(OverlayKind::SpcDiscussions) {
                 let secs_ago = t.elapsed().as_secs();
                 let label = if secs_ago < 60 {
                     format!("Updated {}s ago", secs_ago)
@@ -865,7 +860,7 @@ impl Gui {
             let was_enabled = pane.layers.is_enabled(*layer);
             ui.checkbox(pane.layers.enabled_mut(*layer), layer.display_name());
             let is_enabled = pane.layers.is_enabled(*layer);
-            if is_enabled && !was_enabled && self.overlays.nws_alerts.data.is_empty() && !self.overlays.nws_alerts.fetching {
+            if is_enabled && !was_enabled && !self.overlays.has_data(OverlayKind::NwsAlerts) && !self.overlays.is_fetching(OverlayKind::NwsAlerts) {
                 actions.push(GuiAction::FetchOverlay(OverlayKind::NwsAlerts));
             }
         }
@@ -873,23 +868,20 @@ impl Gui {
         if pane.layers.any_nws_enabled() {
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!self.overlays.nws_alerts.fetching, egui::Button::new("\u{1f504} Refresh"))
+                    .add_enabled(!self.overlays.is_fetching(OverlayKind::NwsAlerts), egui::Button::new("\u{1f504} Refresh"))
                     .clicked()
                 {
                     actions.push(GuiAction::RefreshOverlay(OverlayKind::NwsAlerts));
                 }
-                if self.overlays.nws_alerts.fetching {
+                if self.overlays.is_fetching(OverlayKind::NwsAlerts) {
                     ui.spinner();
                 }
             });
-            if !self.overlays.nws_alerts.data.is_empty() {
-                let categories = pane.layers.enabled_nws_categories();
-                let visible_count = self.overlays.nws_alerts.data.iter()
-                    .filter(|a| categories.contains(&a.category))
-                    .count();
+            if self.overlays.has_data(OverlayKind::NwsAlerts) {
+                let visible_count = self.overlays.clickable_items(OverlayKind::NwsAlerts, &pane.layers).len();
                 ui.label(format!("{} alerts shown", visible_count));
             }
-            if let Some(t) = self.overlays.nws_alerts.fetch_time {
+            if let Some(t) = self.overlays.fetch_time(OverlayKind::NwsAlerts) {
                 let secs_ago = t.elapsed().as_secs();
                 let label = if secs_ago < 60 {
                     format!("Updated {}s ago", secs_ago)

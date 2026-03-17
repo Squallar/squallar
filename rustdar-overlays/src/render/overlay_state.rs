@@ -1,11 +1,14 @@
-use std::collections::{HashMap, HashSet};
-use crate::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
-use crate::spc::discussion::SpcDiscussion;
-use crate::nws::alert::NwsAlert;
-use crate::types::{OverlayFeature, OverlayLabel};
+use std::any::Any;
+use std::future::Future;
+use std::pin::Pin;
+
+use crate::nws::alert::AlertCategory;
+use crate::render::layers::LayerManager;
+use crate::spc::outlook::{OutlookDay, OutlookProduct};
+use crate::types::{GeoBounds, OverlayFeature, OverlayLabel};
 
 /// Format an ISO 8601 timestamp into a shorter human-readable form.
-fn format_iso_time(iso: &str) -> String {
+pub(crate) fn format_iso_time(iso: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(iso)
         .map(|dt| dt.format("%b %d %Y %H:%M %Z").to_string())
         .unwrap_or_else(|_| iso.to_string())
@@ -80,265 +83,207 @@ pub struct ClickableItem<'a> {
     pub id: SelectedOverlay,
 }
 
-/// All shared overlay state: SPC outlooks, NWS alerts, SPC discussions,
-/// and their selection/hidden state.
-pub struct OverlayData {
-    pub spc_outlooks: OverlayState<HashMap<(OutlookDay, OutlookProduct), SpcOutlook>>,
-    /// Per-product SPC data generation (keyed separately for cache invalidation).
-    pub spc_data_generation: HashMap<(OutlookDay, OutlookProduct), u64>,
-    pub nws_alerts: OverlayState<Vec<NwsAlert>>,
-    /// Overlay items under the click point (alerts and MDs combined) for the pager popup.
-    pub selected_overlays: Vec<SelectedOverlay>,
-    /// Current page index within `selected_overlays`.
-    pub selected_overlay_page: usize,
-    /// Alert IDs hidden by the user (not rendered on the map).
-    pub hidden_alerts: HashSet<String>,
-    pub spc_discussions: OverlayState<Vec<SpcDiscussion>>,
+// ── Overlay handler trait ─────────────────────────────────────────────────
+
+/// Trait for overlay type handlers. Each fetchable overlay type implements this
+/// to encapsulate its data, fetch logic, render logic, and popup content.
+///
+/// Adding a new overlay only requires implementing this trait in a new handler
+/// struct and registering it in the `OverlayRegistry` constructor.
+pub(crate) trait OverlayHandler {
+    /// Which overlay kind this handler manages.
+    fn kind(&self) -> OverlayKind;
+
+    /// Current data generation counter for cache invalidation.
+    fn data_generation(&self) -> u64;
+
+    /// Whether any data has been fetched.
+    fn has_data(&self) -> bool;
+
+    /// Whether a fetch is currently in flight.
+    fn is_fetching(&self) -> bool;
+
+    /// Set the fetching flag.
+    fn set_fetching(&mut self, fetching: bool);
+
+    /// Timestamp of the last completed fetch.
+    fn fetch_time(&self) -> Option<std::time::Instant>;
+
+    /// Auto-poll interval in seconds, or `None` if this overlay doesn't auto-poll.
+    fn auto_poll_interval(&self) -> Option<u64> { None }
+
+    /// Number of loaded data items.
+    fn item_count(&self) -> usize { 0 }
+
+    /// Build clickable/labelled items for hit-testing on the map.
+    fn clickable_items(&self, layers: &LayerManager) -> Vec<ClickableItem<'_>>;
+
+    /// Build popup content for a selected overlay item.
+    /// Returns `None` if this handler doesn't own the given selection.
+    fn popup_content(&self, selected: &SelectedOverlay) -> Option<PopupContent>;
+
+    /// Handle a popup action button. Returns `true` if the item should be removed.
+    fn handle_popup_action(&mut self, _action: &PopupAction) -> bool { false }
+
+    /// Apply a type-erased fetch result. The handler downcasts to its expected type.
+    fn apply_fetch_result(&mut self, result: Box<dyn Any + Send>);
+
+    /// Remove stale selections that no longer exist in the handler's data.
+    fn retain_selections(&self, selections: &mut Vec<SelectedOverlay>);
+
+    /// Prepare a rasterization closure for background rendering.
+    /// Returns `None` if there's nothing to render.
+    fn prepare_rasterize(
+        &self,
+        ctx: &RasterizeContext,
+    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> Vec<u8> + Send>>;
+
+    /// Create async fetch tasks for this overlay's data.
+    fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask>;
 }
 
-impl Default for OverlayData {
+/// Context for creating overlay fetch tasks.
+pub struct FetchConfig {
+    pub client: reqwest::Client,
+    pub zone_cache_dir: Option<std::path::PathBuf>,
+    /// Currently selected SPC outlook day.
+    pub spc_day: OutlookDay,
+    /// SPC outlook products whose layers are enabled.
+    pub spc_products: Vec<OutlookProduct>,
+}
+
+/// Context for preparing overlay rasterization closures.
+pub struct RasterizeContext {
+    /// Whether the app is in dark theme.
+    pub is_dark: bool,
+    /// Current map zoom level.
+    pub zoom: f64,
+    /// Selected SPC outlook day.
+    pub spc_day: OutlookDay,
+    /// Enabled SPC outlook products for the current day.
+    pub enabled_spc_products: Vec<OutlookProduct>,
+    /// NWS alert categories currently enabled.
+    pub enabled_nws_categories: Vec<AlertCategory>,
+}
+
+/// An async fetch task produced by a handler.
+pub struct FetchTask {
+    pub kind: OverlayKind,
+    pub future: Pin<Box<dyn Future<Output = Box<dyn Any + Send>> + Send>>,
+}
+
+// ── Overlay registry ─────────────────────────────────────────────────────
+
+/// Central overlay state, replacing the old per-type fields.
+/// Contains registered overlay handlers and shared popup pager state.
+pub struct OverlayRegistry {
+    handlers: Vec<Box<dyn OverlayHandler>>,
+    /// Overlay items selected for the popup pager (from map clicks).
+    pub selected_overlays: Vec<SelectedOverlay>,
+    /// Current page in the popup pager.
+    pub selected_overlay_page: usize,
+}
+
+impl Default for OverlayRegistry {
     fn default() -> Self {
         Self {
-            spc_outlooks: OverlayState::new(),
-            spc_data_generation: HashMap::new(),
-            nws_alerts: OverlayState::new(),
+            handlers: super::handlers::create_handlers(),
             selected_overlays: Vec::new(),
             selected_overlay_page: 0,
-            hidden_alerts: HashSet::new(),
-            spc_discussions: OverlayState::new(),
         }
     }
 }
 
-impl OverlayData {
-    /// Store a fetched SPC outlook in the cache.
-    pub fn set_spc_outlook(&mut self, day: OutlookDay, product: OutlookProduct, outlook: SpcOutlook) {
-        self.spc_outlooks.data.insert((day, product), outlook);
-        self.spc_outlooks.fetch_time = Some(std::time::Instant::now());
-        let generation = self.spc_data_generation.entry((day, product)).or_insert(0);
-        *generation = generation.wrapping_add(1);
+impl OverlayRegistry {
+    fn handler(&self, kind: OverlayKind) -> Option<&dyn OverlayHandler> {
+        self.handlers.iter().find(|h| h.kind() == kind).map(|h| &**h)
     }
 
-    /// Set whether an SPC fetch is currently in progress.
-    pub fn set_spc_fetching(&mut self, fetching: bool) {
-        self.spc_outlooks.fetching = fetching;
-    }
-
-    /// Store fetched NWS alerts, replacing the previous set.
-    pub fn set_nws_alerts(&mut self, alerts: Vec<NwsAlert>) {
-        let current_ids: HashSet<String> = alerts.iter().map(|a| a.id.clone()).collect();
-        self.hidden_alerts.retain(|id| current_ids.contains(id));
-        // Discard stale popup selections whose IDs no longer exist
-        self.selected_overlays.retain(|sel| match sel {
-            SelectedOverlay::Alert(id) => current_ids.contains(id),
-            _ => true,
-        });
-        if self.selected_overlay_page >= self.selected_overlays.len().max(1) {
-            self.selected_overlay_page = 0;
+    fn handler_mut(&mut self, kind: OverlayKind) -> Option<&mut dyn OverlayHandler> {
+        for handler in &mut self.handlers {
+            if handler.kind() == kind {
+                return Some(&mut **handler);
+            }
         }
-        self.nws_alerts.set_data(alerts);
+        None
     }
 
-    /// Set whether an NWS alerts fetch is currently in progress.
-    pub fn set_nws_fetching(&mut self, fetching: bool) {
-        self.nws_alerts.fetching = fetching;
+    pub fn data_generation(&self, kind: OverlayKind) -> u64 {
+        self.handler(kind).map_or(0, |h| h.data_generation())
     }
 
-    /// Store fetched SPC Mesoscale Discussions, replacing the previous set.
-    pub fn set_spc_discussions(&mut self, discussions: Vec<SpcDiscussion>) {
-        // Discard stale popup selections whose MD numbers no longer exist
-        let current_numbers: HashSet<u32> = discussions.iter().map(|d| d.number).collect();
-        self.selected_overlays.retain(|sel| match sel {
-            SelectedOverlay::Discussion(num) => current_numbers.contains(num),
-            _ => true,
-        });
-        if self.selected_overlay_page >= self.selected_overlays.len().max(1) {
-            self.selected_overlay_page = 0;
-        }
-        self.spc_discussions.set_data(discussions);
+    pub fn has_data(&self, kind: OverlayKind) -> bool {
+        self.handler(kind).map_or(
+            matches!(kind, OverlayKind::Radar | OverlayKind::RadarSites),
+            |h| h.has_data(),
+        )
     }
 
-    /// Set whether an SPC MD fetch is currently in progress.
-    pub fn set_spc_md_fetching(&mut self, fetching: bool) {
-        self.spc_discussions.fetching = fetching;
+    pub fn is_fetching(&self, kind: OverlayKind) -> bool {
+        self.handler(kind).map_or(false, |h| h.is_fetching())
     }
 
-    /// Combined SPC data generation — sum of all per-product generations.
-    /// Used as a single change-detection value for the unified SPC texture.
-    pub fn combined_spc_data_generation(&self) -> u64 {
-        self.spc_data_generation.values().sum()
-    }
-
-    /// Apply a fetch result from the unified overlay fetch channel.
-    pub fn apply_fetch_result(&mut self, result: OverlayFetchResult) {
-        match result {
-            OverlayFetchResult::SpcOutlook { day, product, result } => {
-                match result {
-                    Ok(outlook) => {
-                        log::info!("Received SPC outlook: {:?} {:?}", day, product);
-                        self.set_spc_outlook(day, product, outlook);
-                    }
-                    Err(e) => {
-                        log::error!("SPC outlook fetch failed ({:?} {:?}): {}", day, product, e);
-                    }
-                }
-                self.set_spc_fetching(false);
-            }
-            OverlayFetchResult::NwsAlerts(result) => {
-                match result {
-                    Ok(alerts) => {
-                        log::info!("Received {} NWS alerts", alerts.len());
-                        self.set_nws_alerts(alerts);
-                    }
-                    Err(e) => {
-                        log::error!("NWS alerts fetch failed: {}", e);
-                    }
-                }
-                self.set_nws_fetching(false);
-            }
-            OverlayFetchResult::SpcDiscussions(result) => {
-                match result {
-                    Ok(discussions) => {
-                        log::info!("Received {} SPC Mesoscale Discussions", discussions.len());
-                        self.set_spc_discussions(discussions);
-                    }
-                    Err(e) => {
-                        log::error!("SPC MD fetch failed: {}", e);
-                    }
-                }
-                self.set_spc_md_fetching(false);
-            }
+    pub fn set_fetching(&mut self, kind: OverlayKind, fetching: bool) {
+        if let Some(h) = self.handler_mut(kind) {
+            h.set_fetching(fetching);
         }
     }
 
-    /// Build the popup content for the given selected overlay item.
-    /// Returns `None` if the item no longer exists in the data.
+    pub fn fetch_time(&self, kind: OverlayKind) -> Option<std::time::Instant> {
+        self.handler(kind).and_then(|h| h.fetch_time())
+    }
+
+    pub fn auto_poll_interval(&self, kind: OverlayKind) -> Option<u64> {
+        self.handler(kind).and_then(|h| h.auto_poll_interval())
+    }
+
+    pub fn item_count(&self, kind: OverlayKind) -> usize {
+        self.handler(kind).map_or(0, |h| h.item_count())
+    }
+
+    pub fn clickable_items(&self, kind: OverlayKind, layers: &LayerManager) -> Vec<ClickableItem<'_>> {
+        self.handler(kind).map_or_else(Vec::new, |h| h.clickable_items(layers))
+    }
+
+    /// Build popup content by asking each handler until one claims the selection.
     pub fn popup_content(&self, selected: &SelectedOverlay) -> Option<PopupContent> {
-        match selected {
-            SelectedOverlay::Alert(alert_id) => {
-                let alert = self.nws_alerts.data.iter().find(|a| a.id == *alert_id)?;
-                let [r, g, b, _] = alert.features.first()
-                    .map(|f| f.stroke_rgba)
-                    .unwrap_or([200, 200, 200, 255]);
+        self.handlers.iter().find_map(|h| h.popup_content(selected))
+    }
 
-                let mut sections = Vec::new();
-
-                // Headline
-                if let Some(headline) = &alert.headline {
-                    sections.push(PopupSection::Heading(headline.clone()));
-                }
-
-                // Metadata grid
-                sections.push(PopupSection::KeyValueGrid(vec![
-                    ("Areas".into(), alert.area_desc.clone()),
-                    ("Issued by".into(), alert.sender_name.clone()),
-                    ("Effective".into(), format_iso_time(&alert.effective)),
-                    ("Expires".into(), format_iso_time(&alert.expires)),
-                ]));
-
-                sections.push(PopupSection::Separator);
-
-                // Description
-                sections.push(PopupSection::ScrollableText {
-                    text: alert.description.clone(),
-                    monospace: false,
-                    max_height: 250.0,
-                });
-
-                // Instruction
-                if let Some(instruction) = &alert.instruction {
-                    sections.push(PopupSection::Separator);
-                    sections.push(PopupSection::ColoredText {
-                        text: instruction.clone(),
-                        rgb: [r, g, b],
-                        bold: true,
-                    });
-                }
-
-                Some(PopupContent {
-                    title: alert.event.clone(),
-                    accent_rgb: [r, g, b],
-                    width: 380.0,
-                    sections,
-                    actions: vec![PopupAction {
-                        label: "\u{1f6ab}  Hide from map".into(),
-                        target: selected.clone(),
-                        kind: PopupActionKind::HideFromMap,
-                    }],
-                })
+    /// Execute a popup action by routing to each handler.
+    pub fn handle_popup_action(&mut self, action: &PopupAction) -> bool {
+        for handler in &mut self.handlers {
+            if handler.handle_popup_action(action) {
+                return true;
             }
-            SelectedOverlay::Discussion(md_number) => {
-                use crate::spc::colors::md_stroke_color;
+        }
+        false
+    }
 
-                let md = self.spc_discussions.data.iter().find(|d| d.number == *md_number)?;
-                let [r, g, b, _] = md_stroke_color(&md.md_type);
-
-                let mut sections = Vec::new();
-
-                // Type badge
-                sections.push(PopupSection::ColoredText {
-                    text: format!("Type: {}", md.md_type),
-                    rgb: [r, g, b],
-                    bold: true,
-                });
-
-                // Concerning
-                if let Some(ref concerning) = md.concerning {
-                    sections.push(PopupSection::Heading(format!("Concerning: {}", concerning)));
-                }
-
-                sections.push(PopupSection::Separator);
-
-                // Discussion text
-                sections.push(PopupSection::ScrollableText {
-                    text: md.text.clone(),
-                    monospace: true,
-                    max_height: 350.0,
-                });
-
-                sections.push(PopupSection::Separator);
-
-                // Link
-                if !md.link.is_empty() {
-                    sections.push(PopupSection::Link {
-                        label: "Open on SPC website".into(),
-                        url: md.link.clone(),
-                    });
-                }
-
-                Some(PopupContent {
-                    title: format!("Mesoscale Discussion #{:04}", md.number),
-                    accent_rgb: [r, g, b],
-                    width: 420.0,
-                    sections,
-                    actions: Vec::new(),
-                })
-            }
-            SelectedOverlay::Outlook { label } => {
-                Some(PopupContent {
-                    title: format!("SPC Outlook: {label}"),
-                    accent_rgb: [200, 200, 100],
-                    width: 300.0,
-                    sections: vec![PopupSection::Text("Outlook detail coming soon.".into())],
-                    actions: Vec::new(),
-                })
-            }
+    /// Apply a type-erased fetch result from the unified overlay channel.
+    pub fn apply_fetch_result(&mut self, result: OverlayFetchResult) {
+        let kind = result.kind;
+        if let Some(idx) = self.handlers.iter().position(|h| h.kind() == kind) {
+            self.handlers[idx].apply_fetch_result(result.data);
+            self.handlers[idx].retain_selections(&mut self.selected_overlays);
+        }
+        if self.selected_overlay_page >= self.selected_overlays.len().max(1) {
+            self.selected_overlay_page = 0;
         }
     }
 
-    /// Execute a popup action. Returns `true` if the item should be removed from the pager.
-    pub fn handle_popup_action(&mut self, action: &PopupAction) -> bool {
-        match action.kind {
-            PopupActionKind::HideFromMap => {
-                if let SelectedOverlay::Alert(ref id) = action.target {
-                    self.hidden_alerts.insert(id.clone());
-                    self.nws_alerts.data_generation =
-                        self.nws_alerts.data_generation.wrapping_add(1);
-                    return true;
-                }
-                false
-            }
-        }
+    /// Prepare a rasterize closure for background overlay rendering.
+    pub fn prepare_rasterize(
+        &self,
+        kind: OverlayKind,
+        ctx: &RasterizeContext,
+    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> Vec<u8> + Send>> {
+        self.handler(kind).and_then(|h| h.prepare_rasterize(ctx))
+    }
+
+    /// Create async fetch tasks for the given overlay kind.
+    pub fn create_fetch_tasks(&self, kind: OverlayKind, ctx: &FetchConfig) -> Vec<FetchTask> {
+        self.handler(kind).map_or_else(Vec::new, |h| h.create_fetch_tasks(ctx))
     }
 }
 
@@ -417,160 +362,15 @@ impl OverlayKind {
             OverlayKind::UserLocation => true,
         }
     }
-
-    /// The current data generation counter for this overlay kind.
-    pub fn data_generation(self, overlays: &OverlayData) -> u64 {
-        match self {
-            OverlayKind::SpcOutlook => overlays.combined_spc_data_generation(),
-            OverlayKind::SpcDiscussions => overlays.spc_discussions.data_generation,
-            OverlayKind::NwsAlerts => overlays.nws_alerts.data_generation,
-            OverlayKind::Radar | OverlayKind::CityLabels
-            | OverlayKind::RadarSites | OverlayKind::UserLocation => 0,
-        }
-    }
-
-    /// Whether any data exists for this overlay kind.
-    pub fn has_data(self, overlays: &OverlayData) -> bool {
-        match self {
-            OverlayKind::SpcOutlook => !overlays.spc_outlooks.data.is_empty(),
-            OverlayKind::SpcDiscussions => !overlays.spc_discussions.data.is_empty(),
-            OverlayKind::NwsAlerts => !overlays.nws_alerts.data.is_empty(),
-            OverlayKind::RadarSites | OverlayKind::Radar => true,
-            OverlayKind::CityLabels
-            | OverlayKind::UserLocation => false,
-        }
-    }
-
-    /// Build the list of clickable/labelled items for this overlay kind.
-    ///
-    /// Encapsulates all per-overlay filtering (enabled layers, hidden alerts,
-    /// etc.) so the UI crate can draw and hit-test without knowing overlay types.
-    pub fn clickable_items<'a>(
-        self,
-        overlays: &'a OverlayData,
-        layers: &super::layers::LayerManager,
-    ) -> Vec<ClickableItem<'a>> {
-        match self {
-            OverlayKind::SpcOutlook => {
-                let day = layers.spc_day;
-                let mut items = Vec::new();
-                for lk in layers.spc_layers_for_day() {
-                    if !layers.is_enabled(lk) {
-                        continue;
-                    }
-                    let Some(product) = lk.to_outlook_product() else { continue };
-                    let Some(outlook) = overlays.spc_outlooks.data.get(&(day, product)) else { continue };
-                    for feature in &outlook.features {
-                        items.push(ClickableItem {
-                            features: vec![feature],
-                            label: None,
-                            id: SelectedOverlay::Outlook { label: feature.label.clone() },
-                        });
-                    }
-                }
-                items
-            }
-            OverlayKind::SpcDiscussions => {
-                use crate::spc::colors::md_stroke_color;
-
-                overlays.spc_discussions.data.iter().filter(|md| !md.polygon.is_empty()).map(|md| {
-                    // Compute centroid from the first ring for label placement
-                    let label = md.polygon.first()
-                        .filter(|ring| !ring.is_empty())
-                        .map(|ring| {
-                            let n = ring.len() as f64;
-                            let lat = ring.iter().map(|&(lat, _)| lat).sum::<f64>() / n;
-                            let lon = ring.iter().map(|&(_, lon)| lon).sum::<f64>() / n;
-                            OverlayLabel {
-                                lat,
-                                lon,
-                                text: format!("MD {}", md.number),
-                                color: md_stroke_color(&md.md_type),
-                            }
-                        });
-                    ClickableItem {
-                        features: vec![&md.feature],
-                        label,
-                        id: SelectedOverlay::Discussion(md.number),
-                    }
-                }).collect()
-            }
-            OverlayKind::NwsAlerts => {
-                let enabled_categories = layers.enabled_nws_categories();
-                overlays.nws_alerts.data.iter()
-                    .filter(|alert| {
-                        enabled_categories.contains(&alert.category)
-                            && !overlays.hidden_alerts.contains(&alert.id)
-                    })
-                    .map(|alert| ClickableItem {
-                        features: alert.features.iter().collect(),
-                        label: None,
-                        id: SelectedOverlay::Alert(alert.id.clone()),
-                    })
-                    .collect()
-            }
-            // Non-texture layers have no clickable polygon items.
-            OverlayKind::Radar | OverlayKind::CityLabels
-            | OverlayKind::RadarSites | OverlayKind::UserLocation => Vec::new(),
-        }
-    }
-
-    /// Auto-poll interval in seconds, or `None` if this kind doesn't auto-poll.
-    pub fn auto_poll_interval(self) -> Option<u64> {
-        match self {
-            OverlayKind::NwsAlerts | OverlayKind::SpcDiscussions => Some(120),
-            _ => None,
-        }
-    }
-
-    /// Whether a fetch is currently in flight for this overlay kind.
-    pub fn is_fetching(self, overlays: &OverlayData) -> bool {
-        match self {
-            OverlayKind::SpcOutlook => overlays.spc_outlooks.fetching,
-            OverlayKind::SpcDiscussions => overlays.spc_discussions.fetching,
-            OverlayKind::NwsAlerts => overlays.nws_alerts.fetching,
-            _ => false,
-        }
-    }
-
-    /// The last fetch timestamp for this overlay kind (if any data has been fetched).
-    pub fn fetch_time(self, overlays: &OverlayData) -> Option<std::time::Instant> {
-        match self {
-            OverlayKind::SpcOutlook => overlays.spc_outlooks.fetch_time,
-            OverlayKind::SpcDiscussions => overlays.spc_discussions.fetch_time,
-            OverlayKind::NwsAlerts => overlays.nws_alerts.fetch_time,
-            _ => None,
-        }
-    }
-
-    /// Whether this overlay type should be fetched the first time its layer is turned on.
-    pub fn should_fetch_on_enable(self) -> bool {
-        true
-    }
-
-    /// Number of items currently loaded for display.
-    pub fn item_count(self, overlays: &OverlayData) -> usize {
-        match self {
-            OverlayKind::SpcOutlook => overlays.spc_outlooks.data.len(),
-            OverlayKind::SpcDiscussions => overlays.spc_discussions.data.len(),
-            OverlayKind::NwsAlerts => overlays.nws_alerts.data.len(),
-            _ => 0,
-        }
-    }
 }
 
 // ── Unified overlay fetch result ──────────────────────────────────────────
 
-/// A fetch result from any overlay background task, sent through the unified
-/// overlay fetch channel. Replaces the previous per-type channels.
-pub enum OverlayFetchResult {
-    SpcOutlook {
-        day: OutlookDay,
-        product: OutlookProduct,
-        result: Result<SpcOutlook, String>,
-    },
-    NwsAlerts(Result<Vec<NwsAlert>, String>),
-    SpcDiscussions(Result<Vec<SpcDiscussion>, String>),
+/// A type-erased fetch result from any overlay handler, sent through the
+/// unified overlay fetch channel.
+pub struct OverlayFetchResult {
+    pub kind: OverlayKind,
+    pub data: Box<dyn Any + Send>,
 }
 
 // ── Popup content descriptors ─────────────────────────────────────────────

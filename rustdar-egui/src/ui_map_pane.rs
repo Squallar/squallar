@@ -4,7 +4,7 @@ use crate::overlay_cache::{
     OVERDRAW_FRACTION,
 };
 use rustdar_overlays::render::layers::LayerKind;
-use rustdar_overlays::render::overlay_state::{OverlayData, OverlayKind, SelectedOverlay};
+use rustdar_overlays::render::overlay_state::{OverlayRegistry, OverlayKind, SelectedOverlay};
 use crate::pane::{PaneState, RadarImageData};
 
 use rustdar_radar::sites::RADARS;
@@ -17,7 +17,7 @@ use super::super::map_overlays::{OverlayDrawContext, draw_label_tiles_overlay};
 pub(super) struct PaneRenderCtx<'a> {
     pub pane_idx: usize,
     pub pane: &'a mut PaneState,
-    pub overlays: &'a mut OverlayData,
+    pub overlays: &'a mut OverlayRegistry,
     pub user_location: Option<(f64, f64)>,
     pub label_tiles: &'a mut Option<HttpTiles>,
     pub actions: &'a mut Vec<GuiAction>,
@@ -82,7 +82,7 @@ pub(super) fn render_pane_map_content(
                 OverlayKind::SpcOutlook
                 | OverlayKind::SpcDiscussions
                 | OverlayKind::NwsAlerts => {
-                    let items = kind.clickable_items(ctx.overlays, &ctx.pane.layers);
+                    let items = ctx.overlays.clickable_items(kind, &ctx.pane.layers);
                     selected.extend(overlay_ctx.draw_overlay(
                         ctx.pane.overlay_cache(kind),
                         &items,
@@ -172,9 +172,9 @@ pub(super) fn render_pane_map_content(
             let data_gen = if kind == OverlayKind::RadarSites {
                 ctx.pane.radar_sites_render_gen
             } else {
-                kind.data_generation(ctx.overlays)
+                ctx.overlays.data_generation(kind)
             };
-            let has_data = kind.has_data(ctx.overlays);
+            let has_data = ctx.overlays.has_data(kind);
             let cache = ctx.pane.overlay_cache_mut(kind);
             if enabled
                 && has_data
