@@ -1,6 +1,7 @@
 mod alert;
 mod discussion;
 mod outlook;
+mod reports;
 
 use super::overlay_state::OverlayHandler;
 
@@ -10,5 +11,6 @@ pub(crate) fn create_handlers() -> Vec<Box<dyn OverlayHandler>> {
         Box::new(outlook::SpcOutlookHandler::new()),
         Box::new(discussion::SpcDiscussionHandler::new()),
         Box::new(alert::NwsAlertHandler::new()),
+        Box::new(reports::StormReportsHandler::new()),
     ]
 }

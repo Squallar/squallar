@@ -14,6 +14,7 @@ pub(super) struct OverlayDrawContext<'a> {
     ui: &'a egui::Ui,
     projector: &'a walkers::Projector,
     screen_rect: egui::Rect,
+    zoom: f64,
     // Pre-computed click state (shared by discussion + alert drawing).
     overlay_click_pos: Option<egui::Pos2>,
     click_on_ui: bool,
@@ -24,6 +25,7 @@ impl<'a> OverlayDrawContext<'a> {
     pub fn new(
         ui: &'a egui::Ui,
         projector: &'a walkers::Projector,
+        zoom: f64,
         pointer_available: bool,
         pane_rect: egui::Rect,
         excluded_rects: &[egui::Rect],
@@ -45,6 +47,7 @@ impl<'a> OverlayDrawContext<'a> {
             ui,
             projector,
             screen_rect,
+            zoom,
             overlay_click_pos,
             click_on_ui,
             pointer_available,
@@ -104,7 +107,22 @@ impl<'a> OverlayDrawContext<'a> {
 
         let mut hits = Vec::new();
         for item in items {
-            let hit = item.features.iter().any(|f| geo_point_in_feature(lat, lon, f));
+            let hit = item.features.iter().any(|f| {
+                // Point features: screen-space proximity check
+                if let Some((plat, plon)) = f.click_center {
+                    let screen = self
+                        .projector
+                        .project(walkers::lat_lon(plat, plon))
+                        .to_pos2();
+                    // Match the rendered circle radius from rasterize_storm_reports
+                    // plus a small padding for comfortable clicks.
+                    let z = self.zoom as f32;
+                    let r = (3.0 + z * 0.5).clamp(3.0, 10.0) + 4.0;
+                    return click_pos.distance_sq(screen) < r * r;
+                }
+                // Polygon features: geographic containment
+                geo_point_in_feature(lat, lon, f)
+            });
             if hit {
                 hits.push(item.id.clone());
             }

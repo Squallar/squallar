@@ -64,6 +64,7 @@ pub(super) fn render_pane_map_content(
         let overlay_ctx = OverlayDrawContext::new(
             ui,
             projector,
+            zoom,
             ctx.pointer_available,
             ctx.pane_rect,
             &ctx.excluded_rects,
@@ -81,7 +82,8 @@ pub(super) fn render_pane_map_content(
                 // Texture-based overlays: draw texture + clickable items
                 OverlayKind::SpcOutlook
                 | OverlayKind::SpcDiscussions
-                | OverlayKind::NwsAlerts => {
+                | OverlayKind::NwsAlerts
+                | OverlayKind::StormReports => {
                     let items = ctx.overlays.clickable_items(kind, &ctx.pane.layers);
                     selected.extend(overlay_ctx.draw_overlay(
                         ctx.pane.overlay_cache(kind),

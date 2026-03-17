@@ -15,6 +15,7 @@ use tiny_skia::{
 use crate::nws::alert::{AlertCategory, NwsAlert};
 use crate::spc::colors::{md_fill_color, md_stroke_color};
 use crate::spc::discussion::SpcDiscussion;
+use crate::spc::reports::{StormReport, StormReportKind};
 use crate::types::{GeoBounds, OverlayFeature};
 
 // ── Mercator projection helpers ──────────────────────────────────────────
@@ -246,6 +247,65 @@ pub fn rasterize_radar_sites(
                 paint.anti_alias = true;
                 pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
             }
+        }
+    }
+
+    premultiplied_to_straight(pixmap.data_mut());
+    pixmap.take()
+}
+
+/// Rasterize SPC storm report markers to an RGBA texture.
+///
+/// Draws filled circles at each report location, colour-coded by type:
+/// tornado = red, hail = green, wind = blue. Includes white outlines.
+pub fn rasterize_storm_reports(
+    reports: &[StormReport],
+    bounds: &GeoBounds,
+    width: u32,
+    height: u32,
+    zoom: f64,
+    is_dark: bool,
+) -> Vec<u8> {
+    let Some(mut pixmap) = Pixmap::new(width, height) else {
+        return vec![0u8; (width * height * 4) as usize];
+    };
+    let mb = MercatorBounds::from_geo(bounds);
+    let w = width as f32;
+    let h = height as f32;
+
+    let zoom_f32 = zoom as f32;
+    let radius = (3.0 + zoom_f32 * 0.5).clamp(3.0, 10.0);
+    let stroke_w = (radius * 0.3).clamp(0.5, 2.0);
+
+    let outline = if is_dark {
+        Color::from_rgba8(255, 255, 255, 220)
+    } else {
+        Color::from_rgba8(40, 40, 40, 220)
+    };
+
+    for report in reports {
+        let (px, py) = mb.project(report.lat, report.lon, w, h);
+        if px < -20.0 || px > w + 20.0 || py < -20.0 || py > h + 20.0 {
+            continue;
+        }
+
+        let fill = match report.kind {
+            StormReportKind::Tornado => Color::from_rgba8(220, 40, 40, 220),
+            StormReportKind::Hail => Color::from_rgba8(40, 180, 40, 220),
+            StormReportKind::Wind => Color::from_rgba8(40, 80, 220, 220),
+        };
+
+        let mut pb = PathBuilder::new();
+        pb.push_circle(px, py, radius);
+        if let Some(path) = pb.finish() {
+            let mut paint = Paint::default();
+            paint.set_color(fill);
+            paint.anti_alias = true;
+            pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+
+            paint.set_color(outline);
+            let stroke = Stroke { width: stroke_w, ..Stroke::default() };
+            pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
         }
     }
 

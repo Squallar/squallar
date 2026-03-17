@@ -444,6 +444,7 @@ impl Gui {
         // --- Other overlays ---
         ui.checkbox(pane.layers.enabled_mut(LayerKind::CityLabels), "\u{1f3f7}  City Labels");
         ui.checkbox(pane.layers.enabled_mut(LayerKind::RadarSites), "\u{1f4e1}  Radar Sites");
+        ui.checkbox(pane.layers.enabled_mut(LayerKind::StormReports), "\u{26a1}  Storm Reports");
     }
 
     /// Render radar layer toggle with product/elevation combo boxes.
