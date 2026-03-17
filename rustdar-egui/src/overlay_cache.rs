@@ -7,6 +7,7 @@
 //! `painter.image()` call per overlay type: truly near-zero cost.
 
 use std::f64::consts::PI;
+use std::sync::Arc;
 
 use rustdar_overlays::render::geo as overlay_geo;
 use rustdar_overlays::types::{GeoBounds, OverlayFeature, ScreenPoint};
@@ -28,6 +29,21 @@ const PAN_REBUILD_THRESHOLD: f32 = 0.7;
 
 // ── Texture cache ────────────────────────────────────────────────────────
 
+/// Radar-specific metadata stored alongside the overlay texture.
+///
+/// Non-radar overlays set `radar_meta: None`. Radar overlays carry hover
+/// value data, site coordinates, and range for per-frame range ring + tooltip.
+pub struct RadarTextureMeta {
+    /// Per-pixel values for hover tooltip lookup.
+    pub value_data: Arc<Vec<f32>>,
+    /// Radar site latitude.
+    pub lat: f64,
+    /// Radar site longitude.
+    pub lon: f64,
+    /// Maximum range in km (for range ring).
+    pub max_range_km: f64,
+}
+
 /// A rendered overlay texture and the geo bounds it covers.
 pub struct OverlayTextureData {
     /// The egui texture containing the rasterised overlay.
@@ -41,6 +57,8 @@ pub struct OverlayTextureData {
     /// Pixel dimensions of the texture.
     pub width: u32,
     pub height: u32,
+    /// Radar-specific metadata (None for non-radar overlays).
+    pub radar_meta: Option<RadarTextureMeta>,
 }
 
 /// Per-overlay-type texture cache for a single pane.

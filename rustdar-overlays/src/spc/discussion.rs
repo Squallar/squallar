@@ -1,4 +1,5 @@
-use crate::types::{GeoPolygon, GeoPolygonRing};
+use crate::types::{GeoPolygon, GeoPolygonRing, HatchPattern, OverlayFeature};
+use super::colors::{md_fill_color, md_stroke_color};
 
 /// Broad classification of a Mesoscale Discussion topic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -36,6 +37,8 @@ pub struct SpcDiscussion {
     pub md_type: MdType,
     /// Geographic polygon enclosing the discussion area.
     pub polygon: GeoPolygon,
+    /// Pre-built overlay feature for generic click detection and rendering.
+    pub feature: OverlayFeature,
     /// The "CONCERNING..." line, if present.
     pub concerning: Option<String>,
 }
@@ -230,6 +233,15 @@ pub fn parse_md_rss(xml: &str) -> Result<Vec<SpcDiscussion>, String> {
             continue; // Skip items we can't meaningfully display
         }
 
+        let feature = OverlayFeature::new(
+            vec![polygon.clone()],
+            md_fill_color(&md_type),
+            md_stroke_color(&md_type),
+            format!("MD {number}"),
+            String::new(),
+            HatchPattern::None,
+        );
+
         discussions.push(SpcDiscussion {
             number,
             title,
@@ -237,6 +249,7 @@ pub fn parse_md_rss(xml: &str) -> Result<Vec<SpcDiscussion>, String> {
             link,
             md_type,
             polygon,
+            feature,
             concerning,
         });
     }

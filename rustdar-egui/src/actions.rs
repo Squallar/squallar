@@ -1,4 +1,4 @@
-use rustdar_overlays::spc::outlook::{OutlookDay, OutlookProduct};
+use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_overlays::types::GeoBounds;
 use chrono::NaiveDateTime;
 
@@ -30,25 +30,14 @@ pub enum GuiAction {
     FetchRadarScan(RadarConfig),
     CheckForNewScans(RadarConfig),
     SwitchRadarSite { site: String, pane_idx: usize }, // Switch to a different radar site
-    /// Fetch SPC outlook product(s) for the given day.
-    FetchSpcOutlook {
-        day: OutlookDay,
-        products: Vec<OutlookProduct>,
-    },
-    /// Re-fetch all currently enabled SPC outlook layers.
-    RefreshSpcOutlooks,
-    /// Fetch all active NWS weather alerts.
-    FetchNwsAlerts,
-    /// Re-fetch NWS alerts (manual refresh).
-    RefreshNwsAlerts,
-    /// Fetch all active SPC Mesoscale Discussions.
-    FetchSpcDiscussions,
-    /// Re-fetch SPC Mesoscale Discussions (manual refresh).
-    RefreshSpcDiscussions,
+    /// Fetch overlay data for the given kind (initial load when layer enabled).
+    FetchOverlay(OverlayKind),
+    /// Re-fetch overlay data for the given kind (manual refresh).
+    RefreshOverlay(OverlayKind),
     /// Request a background overlay rasterization for a pane.
     RenderOverlay {
         pane_idx: usize,
-        overlay_kind: OverlayRenderKind,
+        overlay_kind: OverlayKind,
         geo_bounds: GeoBounds,
         width: u32,
         height: u32,
@@ -94,14 +83,6 @@ pub enum GuiAction {
     },
 }
 
-/// Which overlay type to rasterize.
-#[derive(Debug, Clone)]
-pub enum OverlayRenderKind {
-    SpcOutlook,
-    SpcDiscussions,
-    NwsAlerts,
-}
-
 impl std::fmt::Display for GuiAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -119,23 +100,11 @@ impl std::fmt::Display for GuiAction {
             GuiAction::SwitchRadarSite { site, pane_idx } => {
                 write!(f, "Switch pane {} to radar site {}", pane_idx, site)
             }
-            GuiAction::FetchSpcOutlook { day, products } => {
-                write!(f, "Fetch SPC {} outlook ({} products)", day, products.len())
+            GuiAction::FetchOverlay(kind) => {
+                write!(f, "Fetch overlay {:?}", kind)
             }
-            GuiAction::RefreshSpcOutlooks => {
-                write!(f, "Refresh SPC outlooks")
-            }
-            GuiAction::FetchNwsAlerts => {
-                write!(f, "Fetch NWS alerts")
-            }
-            GuiAction::RefreshNwsAlerts => {
-                write!(f, "Refresh NWS alerts")
-            }
-            GuiAction::FetchSpcDiscussions => {
-                write!(f, "Fetch SPC Mesoscale Discussions")
-            }
-            GuiAction::RefreshSpcDiscussions => {
-                write!(f, "Refresh SPC Mesoscale Discussions")
+            GuiAction::RefreshOverlay(kind) => {
+                write!(f, "Refresh overlay {:?}", kind)
             }
             GuiAction::RenderOverlay { pane_idx, overlay_kind, .. } => {
                 write!(f, "Render overlay {:?} for pane {}", overlay_kind, pane_idx)

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use rustdar_overlays::render::layers::LayerKind;
+use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_overlays::spc::outlook::OutlookDay;
 use rustdar_radar::types::RadarProduct;
 
@@ -22,6 +23,9 @@ struct PaneConfig {
     /// Time step size in seconds (0 = single scan mode).
     #[serde(default = "default_time_step")]
     time_step_secs: i64,
+    /// Visual stacking order for all map layers (bottom to top).
+    #[serde(default = "OverlayKind::default_draw_order")]
+    draw_order: Vec<OverlayKind>,
 }
 
 fn default_site() -> String {
@@ -56,6 +60,7 @@ impl Default for PaneConfig {
             spc_day: OutlookDay::Day1,
             site: String::new(),
             time_step_secs: 600,
+            draw_order: OverlayKind::default_draw_order(),
         }
     }
 }
@@ -119,6 +124,7 @@ impl super::Gui {
                 spc_day: pane.layers.spc_day,
                 site: pane.site.clone(),
                 time_step_secs: pane.time_step_secs,
+                draw_order: pane.draw_order.clone(),
             }
         }).collect();
         let config = UiConfig {
@@ -209,8 +215,29 @@ impl super::Gui {
             for (&kind, &enabled) in &pc.layers {
                 pane.layers.set_enabled(kind, enabled);
             }
+            pane.draw_order = reconcile_draw_order(&pc.draw_order);
         }
     }
+}
 
+/// Reconcile a saved draw order with the current set of known `OverlayKind` variants.
+///
+/// - Preserves the saved ordering for recognized variants.
+/// - Filters out any unknown/stale variants that no longer exist.
+/// - Appends any new variants (present in `default_draw_order` but missing from save)
+///   in their default relative order.
+fn reconcile_draw_order(saved: &[OverlayKind]) -> Vec<OverlayKind> {
+    let all_set: std::collections::HashSet<OverlayKind> =
+        OverlayKind::all().iter().copied().collect();
 
+    // Keep only recognized kinds, in saved order.
+    let mut result: Vec<OverlayKind> = saved.iter().copied().filter(|k| all_set.contains(k)).collect();
+
+    // Append any missing kinds (new variants added since save).
+    for &kind in OverlayKind::all() {
+        if !result.contains(&kind) {
+            result.push(kind);
+        }
+    }
+    result
 }

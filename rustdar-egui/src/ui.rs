@@ -1,7 +1,7 @@
 use crate::actions::{GuiAction, RadarConfig};
 use rustdar_overlays::render::layers::{LayerKind, LayerManager};
-use rustdar_overlays::render::overlay_state::OverlayData;
-use crate::pane::{PaneId, PaneLayout, PaneState, RadarImageData, MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
+use rustdar_overlays::render::overlay_state::{OverlayData, OverlayKind};
+use crate::pane::{PaneId, PaneLayout, PaneState, MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
 use crate::tiles::MapTileState;
 use chrono::Timelike;
 use egui::Context;
@@ -49,7 +49,6 @@ pub(super) struct RadarState {
     pub config: RadarConfig,
     pub fetching: bool,
     pub error_message: Option<String>,
-    pub loading_site: Option<String>,
 }
 
 /// Auto-polling timer state.
@@ -150,7 +149,6 @@ impl Gui {
                 config: radar_config,
                 fetching: false,
                 error_message: None,
-                loading_site: None,
             },
             auto_poll: AutoPollState {
                 last_fetch_time: None,
@@ -231,20 +229,17 @@ impl Gui {
             self.auto_poll.record_fetch();
         }
 
-        // Auto-refresh NWS alerts every 2 minutes when any pane has an NWS layer enabled
-        if self.panes.iter().any(|p| p.layers.any_nws_enabled())
-            && !self.overlays.nws_alerts.fetching
-            && self.overlays.nws_alerts.needs_refresh(120)
-        {
-            actions.push(GuiAction::FetchNwsAlerts);
-        }
-
-        // Auto-refresh SPC Mesoscale Discussions every 2 minutes when any pane has it enabled
-        if self.panes.iter().any(|p| p.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions))
-            && !self.overlays.spc_discussions.fetching
-            && self.overlays.spc_discussions.needs_refresh(120)
-        {
-            actions.push(GuiAction::FetchSpcDiscussions);
+        // Auto-refresh overlay data when layers are enabled and refresh interval elapsed
+        for &kind in OverlayKind::all() {
+            if let Some(interval) = kind.auto_poll_interval() {
+                if self.panes.iter().any(|p| kind.is_enabled(&p.layers))
+                    && !kind.is_fetching(&self.overlays)
+                    && kind.fetch_time(&self.overlays)
+                        .map_or(true, |t| t.elapsed().as_secs() >= interval)
+                {
+                    actions.push(GuiAction::FetchOverlay(kind));
+                }
+            }
         }
     }
 
@@ -774,10 +769,7 @@ impl Gui {
                 pane.layers.spc_day = new_day;
                 let products = pane.layers.enabled_spc_products();
                 if !products.is_empty() {
-                    actions.push(GuiAction::FetchSpcOutlook {
-                        day: new_day,
-                        products,
-                    });
+                    actions.push(GuiAction::FetchOverlay(OverlayKind::SpcOutlook));
                 }
             }
         });
@@ -790,10 +782,7 @@ impl Gui {
             if is_enabled && !was_enabled {
                 if let Some(product) = layer.to_outlook_product() {
                     if !self.overlays.spc_outlooks.data.contains_key(&(day, product)) {
-                        actions.push(GuiAction::FetchSpcOutlook {
-                            day,
-                            products: vec![product],
-                        });
+                        actions.push(GuiAction::FetchOverlay(OverlayKind::SpcOutlook));
                     }
                 }
             }
@@ -805,7 +794,7 @@ impl Gui {
                     .add_enabled(!self.overlays.spc_outlooks.fetching, egui::Button::new("\u{1f504} Refresh"))
                     .clicked()
                 {
-                    actions.push(GuiAction::RefreshSpcOutlooks);
+                    actions.push(GuiAction::RefreshOverlay(OverlayKind::SpcOutlook));
                 }
                 if self.overlays.spc_outlooks.fetching {
                     ui.spinner();
@@ -834,7 +823,7 @@ impl Gui {
             );
             let is_enabled = pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
             if is_enabled && !was_enabled && self.overlays.spc_discussions.data.is_empty() && !self.overlays.spc_discussions.fetching {
-                actions.push(GuiAction::FetchSpcDiscussions);
+                actions.push(GuiAction::FetchOverlay(OverlayKind::SpcDiscussions));
             }
         }
 
@@ -844,7 +833,7 @@ impl Gui {
                     .add_enabled(!self.overlays.spc_discussions.fetching, egui::Button::new("\u{1f504} Refresh"))
                     .clicked()
                 {
-                    actions.push(GuiAction::RefreshSpcDiscussions);
+                    actions.push(GuiAction::RefreshOverlay(OverlayKind::SpcDiscussions));
                 }
                 if self.overlays.spc_discussions.fetching {
                     ui.spinner();
@@ -877,7 +866,7 @@ impl Gui {
             ui.checkbox(pane.layers.enabled_mut(*layer), layer.display_name());
             let is_enabled = pane.layers.is_enabled(*layer);
             if is_enabled && !was_enabled && self.overlays.nws_alerts.data.is_empty() && !self.overlays.nws_alerts.fetching {
-                actions.push(GuiAction::FetchNwsAlerts);
+                actions.push(GuiAction::FetchOverlay(OverlayKind::NwsAlerts));
             }
         }
 
@@ -887,7 +876,7 @@ impl Gui {
                     .add_enabled(!self.overlays.nws_alerts.fetching, egui::Button::new("\u{1f504} Refresh"))
                     .clicked()
                 {
-                    actions.push(GuiAction::RefreshNwsAlerts);
+                    actions.push(GuiAction::RefreshOverlay(OverlayKind::NwsAlerts));
                 }
                 if self.overlays.nws_alerts.fetching {
                     ui.spinner();
@@ -935,6 +924,7 @@ impl Gui {
         let active_scan_info = src.scan_info.clone();
         let active_viewing_live = src.viewing_live;
         let active_time_step_secs = src.time_step_secs;
+        let active_draw_order = src.draw_order.clone();
         let snapshot: Vec<(LayerKind, bool)> = LayerKind::all()
         .iter()
         .map(|&k| (k, src.layers.is_enabled(k)))
@@ -952,6 +942,7 @@ impl Gui {
             p.scan_info = active_scan_info.clone();
             p.viewing_live = active_viewing_live;
             p.time_step_secs = active_time_step_secs;
+            p.draw_order = active_draw_order.clone();
         }
     }
 
@@ -1010,9 +1001,21 @@ impl Gui {
         self.time_dialog.time_string = time;
     }
 
-    /// Set which site is currently loading
-    pub fn set_loading_site(&mut self, site: Option<String>) {
-        self.radar.loading_site = site;
+    /// Clear loading_site on all panes viewing the given site.
+    pub fn clear_loading_site_for_site(&mut self, site: &str) {
+        for pane in &mut self.panes {
+            if pane.site == site {
+                pane.loading_site = None;
+                pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
+            }
+        }
+    }
+
+    /// Bump the RadarSites texture generation on all panes (e.g. on theme change).
+    pub fn bump_all_radar_sites_gen(&mut self) {
+        for pane in &mut self.panes {
+            pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
+        }
     }
 
     /// Set the user's GPS location for the blue dot indicator
@@ -1058,33 +1061,6 @@ impl Gui {
         self.panes.get(pane_idx).and_then(|p| p.scan_info.as_ref())
     }
 
-    /// Take the radar image from a specific pane.
-    pub fn take_radar_image_for_pane(&mut self, pane_idx: PaneId) -> Option<RadarImageData> {
-        self.panes.get_mut(pane_idx).and_then(|p| p.take_radar_image())
-    }
-
-    /// Clear the radar image on a specific pane.
-    pub fn clear_radar_image_for_pane(&mut self, pane_idx: PaneId) {
-        if pane_idx < self.panes.len() {
-            self.panes[pane_idx].clear_radar_image();
-        }
-    }
-
-    /// Set the radar image for a specific pane.
-    pub fn set_radar_image_for_pane(
-        &mut self,
-        pane_idx: PaneId,
-        texture: egui::TextureHandle,
-        lat: f64,
-        lon: f64,
-        max_range_km: f64,
-        value_data: Vec<f32>,
-    ) {
-        if let Some(pane) = self.panes.get_mut(pane_idx) {
-            pane.set_radar_image(texture, lat, lon, max_range_km, value_data);
-        }
-    }
-
     /// Whether auto-poll is active and the event loop should keep waking
     pub fn is_auto_poll_active(&self) -> bool {
         self.auto_poll.is_active()
@@ -1101,7 +1077,8 @@ impl Gui {
 
     pub fn clear_graphics_state(&mut self) {
         for pane in &mut self.panes {
-            pane.clear_radar_image();
+            pane.loading_site = None;
+            pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
             // Clear loop frame textures so they get re-rendered on resume.
             // The frame list and scan cache survive, so dispatch_loop_renders()
             // will re-upload textures automatically.
@@ -1112,15 +1089,12 @@ impl Gui {
             // Clear overlay texture caches — handles become invalid when the
             // egui context is destroyed. needs_rerender() will trigger fresh
             // background renders.
-            pane.spc_overlay_texture.current = None;
-            pane.spc_overlay_texture.render_in_flight = false;
-            pane.nws_alert_texture.current = None;
-            pane.nws_alert_texture.render_in_flight = false;
-            pane.spc_md_texture.current = None;
-            pane.spc_md_texture.render_in_flight = false;
+            for cache in pane.overlay_textures.values_mut() {
+                cache.current = None;
+                cache.render_in_flight = false;
+            }
         }
         self.map_tiles.clear();
-        self.radar.loading_site = None;
     }
 
     /// Propagate the interacted pane's viewport (zoom + position) to all other panes.

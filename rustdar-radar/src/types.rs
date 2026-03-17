@@ -6,7 +6,7 @@ use std::f64::consts::PI;
 use crate::sites::RadarSite;
 use crate::sites::get_radar_site;
 
-pub const IMAGE_SIZE: usize = 1800; // 1800x1800 pixels for radar image
+pub const IMAGE_SIZE: usize = 2048; // 2048x2048 pixels for radar image
 pub const MAX_RANGE_KM: f64 = 230.0; // NEXRAD max range ~230km
 pub const PIXELS_PER_KM: f64 = IMAGE_SIZE as f64 / (2.0 * MAX_RANGE_KM);
 /// m/s to mph conversion factor.

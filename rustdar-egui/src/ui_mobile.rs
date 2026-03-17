@@ -195,9 +195,21 @@ pub fn draw_long_press_tooltip(
     touch_pos: egui::Pos2,
     pane: &PaneState,
 ) {
+    draw_long_press_tooltip_raw(ui, projector, &img.value_data, img.lat, img.lon, touch_pos, pane);
+}
+
+pub fn draw_long_press_tooltip_raw(
+    ui: &egui::Ui,
+    projector: &walkers::Projector,
+    value_data: &[f32],
+    lat: f64,
+    lon: f64,
+    touch_pos: egui::Pos2,
+    pane: &PaneState,
+) {
     use rustdar_radar::types::IMAGE_SIZE;
 
-    let bounds = ImageBounds::from_radar_site(img.lat, img.lon);
+    let bounds = ImageBounds::from_radar_site(lat, lon);
 
     let nw = projector
         .project(walkers::lat_lon(bounds.max_lat, bounds.min_lon))
@@ -216,8 +228,8 @@ pub fn draw_long_press_tooltip(
     let mut text = String::new();
     if px >= 0 && px < IMAGE_SIZE as i32 && py >= 0 && py < IMAGE_SIZE as i32 {
         let pixel_idx = py as usize * IMAGE_SIZE + px as usize;
-        if pixel_idx < img.value_data.len() {
-            let value = img.value_data[pixel_idx];
+        if pixel_idx < value_data.len() {
+            let value = value_data[pixel_idx];
             if !value.is_nan() {
                 text = pane.selected_product.format_value(value);
             }

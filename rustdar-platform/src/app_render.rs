@@ -2,6 +2,7 @@ use egui_wgpu::{ScreenDescriptor, wgpu};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use rustdar_egui::actions::GuiAction;
+use rustdar_radar::types::IMAGE_SIZE;
 use crate::constants::{MAX_CONCURRENT_RENDERS, MAX_LOOP_RENDER_BUDGET, MAX_CONCURRENT_LOOP_DOWNLOADS, MAX_LOOP_FRAMES};
 
 impl super::App {
@@ -137,7 +138,7 @@ impl super::App {
         }
     }
 
-    /// Apply a rendered radar image to a specific pane (upload texture + update state).
+    /// Apply a rendered radar image to a specific pane (upload texture to overlay cache).
     fn apply_render_to_pane(
         &mut self,
         ctx: &egui::Context,
@@ -148,14 +149,31 @@ impl super::App {
         product: rustdar_radar::types::RadarProduct,
         elevation: f32,
     ) {
-        // Save the old texture to be cleaned up after this frame completes
-        if let Some(old_img) = self.gui.take_radar_image_for_pane(pane_idx) {
-            self.old_textures.push(old_img.texture);
+        use rustdar_egui::overlay_cache::{OverlayTextureData, RadarTextureMeta};
+        use rustdar_overlays::render::overlay_state::OverlayKind;
+        use rustdar_overlays::types::GeoBounds;
+        use rustdar_radar::types::ImageBounds;
+
+        // Extract site coordinates before mutable borrow
+        let (lat, lon) = {
+            let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
+                return;
+            };
+            (scan_info.site.lat, scan_info.site.lon)
+        };
+
+        // Clean up old radar overlay texture
+        let Some(pane) = self.gui.pane_mut(pane_idx) else {
+            return;
+        };
+        let cache = pane.overlay_cache_mut(OverlayKind::Radar);
+        if let Some(old) = cache.current.take() {
+            self.old_textures.push(old.texture);
         }
 
         self.texture_counter += 1;
         let color_image =
-            egui::ColorImage::from_rgba_unmultiplied([1800, 1800], image_data);
+            egui::ColorImage::from_rgba_unmultiplied([IMAGE_SIZE, IMAGE_SIZE], image_data);
         let texture_name = format!("radar_image_{}", self.texture_counter);
         let texture = ctx.load_texture(
             texture_name,
@@ -174,16 +192,30 @@ impl super::App {
             ));
         }
 
-        if let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) {
-            self.gui.set_radar_image_for_pane(
-                pane_idx,
-                texture,
-                scan_info.site.lat,
-                scan_info.site.lon,
+        // Store in overlay cache with radar metadata
+        let bounds = ImageBounds::from_radar_site(lat, lon);
+        let geo_bounds = GeoBounds {
+            min_lat: bounds.min_lat,
+            max_lat: bounds.max_lat,
+            min_lon: bounds.min_lon,
+            max_lon: bounds.max_lon,
+        };
+        let pane = self.gui.pane_mut(pane_idx).unwrap();
+        let cache = pane.overlay_cache_mut(OverlayKind::Radar);
+        cache.current = Some(OverlayTextureData {
+            texture,
+            geo_bounds,
+            data_generation: 0,
+            render_zoom: 0,
+            width: IMAGE_SIZE as u32,
+            height: IMAGE_SIZE as u32,
+            radar_meta: Some(RadarTextureMeta {
+                value_data: Arc::clone(value_data),
+                lat,
+                lon,
                 max_range_km,
-                value_data.to_vec(),
-            );
-        }
+            }),
+        });
 
         if pane_idx < self.render.pane_render.len() {
             self.render.pane_render[pane_idx].last_rendered = Some((product, elevation));
@@ -259,7 +291,6 @@ impl super::App {
     /// Poll for completed overlay rasterization results and upload textures.
     fn poll_overlay_render_results(&mut self) {
         use rustdar_egui::overlay_cache::OverlayTextureData;
-        use crate::channels::OverlayType;
 
         let ctx = self.state.as_ref().unwrap().egui_renderer.context();
         while let Ok(resp) = self.channels.overlay_render_receiver.try_recv() {
@@ -277,11 +308,7 @@ impl super::App {
                     continue;
                 };
 
-                let cache = match resp.overlay_type {
-                    OverlayType::SpcOutlook(..) => &mut pane.spc_overlay_texture,
-                    OverlayType::SpcDiscussions => &mut pane.spc_md_texture,
-                    OverlayType::NwsAlerts => &mut pane.nws_alert_texture,
-                };
+                let cache = pane.overlay_cache_mut(resp.overlay_kind);
 
                 cache.render_in_flight = false;
 
@@ -302,6 +329,7 @@ impl super::App {
                     render_zoom: resp.zoom,
                     width: resp.width,
                     height: resp.height,
+                    radar_meta: None,
                 });
             }
         }
@@ -363,8 +391,15 @@ impl super::App {
                     }
                 }
             } else if pane_idx < self.render.pane_render.len() {
-                // No rendering params for this pane, clear its image
-                self.gui.clear_radar_image_for_pane(pane_idx);
+                // No rendering params for this pane, clear its radar overlay texture
+                if let Some(pane) = self.gui.pane_mut(pane_idx) {
+                    let cache = pane.overlay_cache_mut(
+                        rustdar_overlays::render::overlay_state::OverlayKind::Radar,
+                    );
+                    if let Some(old) = cache.current.take() {
+                        self.old_textures.push(old.texture);
+                    }
+                }
                 self.render.pane_render[pane_idx].last_rendered = None;
             }
         }
@@ -376,6 +411,11 @@ impl super::App {
     /// avoid a multi-second background re-render.  Re-uploads the cached pixel
     /// data as a new GPU texture instantly.
     pub(super) fn restore_cached_render(&mut self) {
+        use rustdar_egui::overlay_cache::{OverlayTextureData, RadarTextureMeta};
+        use rustdar_overlays::render::overlay_state::OverlayKind;
+        use rustdar_overlays::types::GeoBounds;
+        use rustdar_radar::types::ImageBounds;
+
         let Some(state) = self.state.as_ref() else {
             return;
         };
@@ -402,18 +442,37 @@ impl super::App {
 
             self.texture_counter += 1;
             let ctx = state.egui_renderer.context();
-            let color_image = egui::ColorImage::from_rgba_unmultiplied([1800, 1800], image_data);
+            let color_image = egui::ColorImage::from_rgba_unmultiplied([IMAGE_SIZE, IMAGE_SIZE], image_data);
             let texture_name = format!("radar_image_{}", self.texture_counter);
             let texture = ctx.load_texture(texture_name, color_image, egui::TextureOptions::NEAREST);
 
-            self.gui.set_radar_image_for_pane(
-                pane_idx,
-                texture,
-                lat,
-                lon,
-                max_range_km,
-                value_data.to_vec(),
-            );
+            let bounds = ImageBounds::from_radar_site(lat, lon);
+            let geo_bounds = GeoBounds {
+                min_lat: bounds.min_lat,
+                max_lat: bounds.max_lat,
+                min_lon: bounds.min_lon,
+                max_lon: bounds.max_lon,
+            };
+            if let Some(pane) = self.gui.pane_mut(pane_idx) {
+                let cache = pane.overlay_cache_mut(OverlayKind::Radar);
+                if let Some(old) = cache.current.take() {
+                    self.old_textures.push(old.texture);
+                }
+                cache.current = Some(OverlayTextureData {
+                    texture,
+                    geo_bounds,
+                    data_generation: 0,
+                    render_zoom: 0,
+                    width: IMAGE_SIZE as u32,
+                    height: IMAGE_SIZE as u32,
+                    radar_meta: Some(RadarTextureMeta {
+                        value_data: Arc::clone(value_data),
+                        lat,
+                        lon,
+                        max_range_km,
+                    }),
+                });
+            }
             self.render.pane_render[pane_idx].last_rendered = Some((product, elevation));
         }
     }
@@ -634,7 +693,7 @@ impl super::App {
 
             self.texture_counter += 1;
             let color_image =
-                egui::ColorImage::from_rgba_unmultiplied([1800, 1800], &rr.image_data);
+                egui::ColorImage::from_rgba_unmultiplied([IMAGE_SIZE, IMAGE_SIZE], &rr.image_data);
             let texture_name = format!("loop_frame_{}", self.texture_counter);
             let texture = ctx.load_texture(
                 texture_name,

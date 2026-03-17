@@ -37,6 +37,15 @@ pub type GeoPolygonRing = Vec<(f64, f64)>;
 /// A polygon with an exterior ring and optional holes.
 pub type GeoPolygon = Vec<GeoPolygonRing>;
 
+/// A map label to be drawn at a geographic position.
+#[derive(Debug, Clone)]
+pub struct OverlayLabel {
+    pub lat: f64,
+    pub lon: f64,
+    pub text: String,
+    pub color: [u8; 4],
+}
+
 /// Parse GeoJSON polygon coordinate rings into a `GeoPolygon`.
 ///
 /// GeoJSON format: `[ [ [lon, lat], ... ], ... ]`

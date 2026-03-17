@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use rustdar_overlays::render::layers::LayerManager;
+use rustdar_overlays::render::overlay_state::OverlayKind;
 use crate::overlay_cache::OverlayTextureCache;
 use rustdar_radar::types::{RadarProduct, ScanInfo};
 use chrono::NaiveDateTime;
@@ -77,14 +79,21 @@ pub struct PaneState {
     pub last_hover_pos: Option<egui::Pos2>,
     pub layers: LayerManager,
     pub map_memory: MapMemory,
-    // Per-pane overlay texture caches (background-rendered).
-    pub spc_overlay_texture: OverlayTextureCache,
-    pub nws_alert_texture: OverlayTextureCache,
-    pub spc_md_texture: OverlayTextureCache,
+    /// Per-overlay-type texture caches (background-rendered), keyed by `OverlayKind`.
+    /// Only texture overlay kinds (SPC, NWS, discussions) have cache entries.
+    pub overlay_textures: HashMap<OverlayKind, OverlayTextureCache>,
+    /// Per-pane draw order (bottom to top). Controls the visual stacking of all
+    /// map layers. Persisted across sessions.
+    pub draw_order: Vec<OverlayKind>,
     /// Radar display state. Always present; in single-frame mode holds at most
     /// one frame (the current static radar image). In multi-frame mode holds
     /// the full animated loop.
     pub loop_state: LoopPlaybackState,
+    /// Which site is currently being loaded for this pane (transient loading indicator).
+    pub loading_site: Option<String>,
+    /// Generation counter for RadarSites texture invalidation.
+    /// Bumped when site, loading_site, or theme changes.
+    pub radar_sites_render_gen: u64,
 }
 
 impl LoopPlaybackState {
@@ -126,10 +135,14 @@ impl PaneState {
             last_hover_pos: None,
             layers: LayerManager::new(),
             map_memory,
-            spc_overlay_texture: OverlayTextureCache::new(),
-            nws_alert_texture: OverlayTextureCache::new(),
-            spc_md_texture: OverlayTextureCache::new(),
+            overlay_textures: OverlayKind::texture_overlays()
+                .iter()
+                .map(|&k| (k, OverlayTextureCache::new()))
+                .collect(),
+            draw_order: OverlayKind::default_draw_order(),
             loop_state: LoopPlaybackState::new(),
+            loading_site: None,
+            radar_sites_render_gen: 0,
         }
     }
 
@@ -138,6 +151,22 @@ impl PaneState {
         self.loop_state.frames
             .get(self.loop_state.current_frame)
             .and_then(|f| f.texture.as_ref())
+    }
+
+    /// Get the overlay texture cache for a given kind (read-only).
+    /// Returns `None` for non-texture overlay kinds.
+    pub fn overlay_cache(&self, kind: OverlayKind) -> Option<&OverlayTextureCache> {
+        if !kind.is_texture_overlay() {
+            return None;
+        }
+        self.overlay_textures.get(&kind)
+    }
+
+    /// Get the overlay texture cache for a given kind, inserting a default if absent.
+    /// Panics if called with a non-texture overlay kind.
+    pub fn overlay_cache_mut(&mut self, kind: OverlayKind) -> &mut OverlayTextureCache {
+        debug_assert!(kind.is_texture_overlay(), "overlay_cache_mut called with non-texture kind: {:?}", kind);
+        self.overlay_textures.entry(kind).or_insert_with(OverlayTextureCache::new)
     }
 
     /// Get rendering params for this pane (product + closest elevation).
@@ -159,53 +188,6 @@ impl PaneState {
         })
     }
 
-    /// Set the radar image to display on the map (single-frame mode).
-    /// Replaces the current frames with a single frame holding the given texture.
-    pub fn set_radar_image(
-        &mut self,
-        texture: egui::TextureHandle,
-        lat: f64,
-        lon: f64,
-        max_range_km: f64,
-        value_data: Vec<f32>,
-    ) {
-        if !self.loop_state.multi_frame {
-            self.loop_state.frames.clear();
-            self.loop_state.frames.push(LoopFrame {
-                timestamp: chrono::NaiveDateTime::default(),
-                texture: Some(RadarImageData {
-                    texture,
-                    lat,
-                    lon,
-                    max_range_km,
-                    value_data: Arc::new(value_data),
-                }),
-                render_in_flight: false,
-            });
-            self.loop_state.current_frame = 0;
-            self.loop_state.site_lat = lat;
-            self.loop_state.site_lon = lon;
-        }
-    }
-
-    /// Clear the radar image (single-frame mode).
-    pub fn clear_radar_image(&mut self) {
-        if !self.loop_state.multi_frame {
-            self.loop_state.frames.clear();
-            self.loop_state.current_frame = 0;
-        }
-    }
-
-    /// Take the radar image, removing it from this pane (single-frame mode).
-    pub fn take_radar_image(&mut self) -> Option<RadarImageData> {
-        if !self.loop_state.multi_frame {
-            self.loop_state.frames
-                .first_mut()
-                .and_then(|f| f.texture.take())
-        } else {
-            None
-        }
-    }
 }
 
 impl Default for PaneState {

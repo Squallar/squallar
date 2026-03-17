@@ -37,22 +37,6 @@ pub async fn fetch_outlook(
     parse_geojson(&json, day, product)
 }
 
-/// Fetch all available outlook products for a given day.
-/// Returns results for each product (some may fail independently).
-pub async fn fetch_all_for_day(
-    client: &reqwest::Client,
-    day: OutlookDay,
-) -> Vec<(OutlookProduct, Result<SpcOutlook, String>)> {
-    let products = available_products(day);
-    let mut results = Vec::new();
-
-    for product in products {
-        let result = fetch_outlook(client, day, product).await;
-        results.push((product, result));
-    }
-
-    results
-}
 
 /// Fetch all currently active SPC Mesoscale Discussions from the RSS feed.
 pub async fn fetch_active_discussions(

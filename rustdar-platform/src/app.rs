@@ -192,6 +192,7 @@ impl App {
         if let Some(new_theme) = self.platform.poll_theme() {
             if self.cached_dark_theme != Some(new_theme) {
                 self.cached_dark_theme = Some(new_theme);
+                self.gui.bump_all_radar_sites_gen();
                 notify_redraw(&self.window);
             }
         }
@@ -221,10 +222,10 @@ impl App {
 
     /// Process all GUI actions emitted during this frame.
     fn process_gui_actions(&mut self, actions: Vec<GuiAction>) {
-        use rustdar_egui::actions::OverlayRenderKind;
+        use rustdar_overlays::render::overlay_state::OverlayKind;
 
         // Separate overlay render actions for deduplication
-        let mut overlay_renders: Vec<(usize, OverlayRenderKind, rustdar_overlays::types::GeoBounds, u32, u32, u64, i32)> = Vec::new();
+        let mut overlay_renders: Vec<(usize, OverlayKind, rustdar_overlays::types::GeoBounds, u32, u32, u64, i32)> = Vec::new();
 
         for action in actions {
             if let GuiAction::RenderOverlay { pane_idx, overlay_kind, geo_bounds, width, height, data_generation, zoom } = action {
@@ -240,19 +241,19 @@ impl App {
         if !overlay_renders.is_empty() {
             if self.gui.is_viewport_sync() {
                 let mut grouped: std::collections::HashMap<
-                    (std::mem::Discriminant<OverlayRenderKind>, i32, u64, u32, u32),
-                    (OverlayRenderKind, rustdar_overlays::types::GeoBounds, u32, u32, u64, i32, Vec<usize>),
+                    (OverlayKind, i32, u64, u32, u32),
+                    (OverlayKind, rustdar_overlays::types::GeoBounds, u32, u32, u64, i32, Vec<usize>),
                 > = std::collections::HashMap::new();
 
                 for (pane_idx, kind, bounds, w, h, data_gen, zoom) in overlay_renders {
-                    let key = (std::mem::discriminant(&kind), zoom, data_gen, w, h);
+                    let key = (kind, zoom, data_gen, w, h);
                     grouped.entry(key)
                         .and_modify(|(_k, _b, _w, _h, _g, _z, panes)| {
                             if !panes.contains(&pane_idx) {
                                 panes.push(pane_idx);
                             }
                         })
-                        .or_insert_with(|| (kind.clone(), bounds, w, h, data_gen, zoom, vec![pane_idx]));
+                        .or_insert_with(|| (kind, bounds, w, h, data_gen, zoom, vec![pane_idx]));
                 }
 
                 for (_key, (kind, bounds, w, h, data_gen, zoom, pane_indices)) in grouped {
@@ -298,7 +299,7 @@ impl App {
                             log::info!("Received scan data from background thread");
                             self.scan_data.insert(site.clone(), Arc::clone(&scan_arc));
                             self.gui.set_scan_info_for_site(&site, scan_info);
-                            self.gui.set_loading_site(None);
+                            self.gui.clear_loading_site_for_site(&site);
                             self.render.reset_panes_for_site(&site, &self.gui);
                             self.spawn_level3_fetches(&site);
 
@@ -317,58 +318,15 @@ impl App {
                     Err(error_msg) => {
                         log::error!("Received error from background thread: {}", error_msg);
                         self.gui.set_error(error_msg);
-                        self.gui.set_loading_site(None);
+                        self.gui.clear_loading_site_for_site(&scan_resp.site);
                     }
                 }
             }
         }
 
-        // Check for received SPC outlook data
-        {
-            let mut any_received = false;
-            while let Ok(outlook_resp) = self.channels.outlook_receiver.try_recv() {
-                any_received = true;
-                match outlook_resp.result {
-                    Ok(outlook) => {
-                        log::info!("Received SPC outlook: {:?} {:?}", outlook_resp.day, outlook_resp.product);
-                        self.gui.overlays.set_spc_outlook(outlook_resp.day, outlook_resp.product, outlook);
-                    }
-                    Err(e) => {
-                        log::error!("SPC outlook fetch failed ({:?} {:?}): {}", outlook_resp.day, outlook_resp.product, e);
-                    }
-                }
-            }
-            if any_received {
-                self.gui.overlays.set_spc_fetching(false);
-            }
-        }
-
-        // Check for received NWS alerts data
-        if let Ok(result) = self.channels.alert_receiver.try_recv() {
-            match result {
-                Ok(alerts) => {
-                    log::info!("Received {} NWS alerts", alerts.len());
-                    self.gui.overlays.set_nws_alerts(alerts);
-                }
-                Err(e) => {
-                    log::error!("NWS alerts fetch failed: {}", e);
-                }
-            }
-            self.gui.overlays.set_nws_fetching(false);
-        }
-
-        // Check for received SPC Mesoscale Discussion data
-        if let Ok(result) = self.channels.discussion_receiver.try_recv() {
-            match result {
-                Ok(discussions) => {
-                    log::info!("Received {} SPC Mesoscale Discussions", discussions.len());
-                    self.gui.overlays.set_spc_discussions(discussions);
-                }
-                Err(e) => {
-                    log::error!("SPC MD fetch failed: {}", e);
-                }
-            }
-            self.gui.overlays.set_spc_md_fetching(false);
+        // Check for received overlay fetch results (unified channel)
+        while let Ok(result) = self.channels.overlay_fetch_receiver.try_recv() {
+            self.gui.overlays.apply_fetch_result(result);
         }
     }
 

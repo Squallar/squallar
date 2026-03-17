@@ -1,5 +1,4 @@
 use crate::actions::GuiAction;
-use crate::pane::RadarImageData;
 use crate::tiles::MapTileState;
 use egui::Context;
 use rustdar_radar::types::{RadarProduct, IMAGE_SIZE};
@@ -161,7 +160,6 @@ impl super::Gui {
                         })
                         .show(&mut child_ui, |ui, projector, memory| {
                             let zoom = memory.zoom();
-                            let scan_info_site_name = pane.scan_info.as_ref().map(|i| i.site.name);
 
                             let mut render_ctx = pane_render::PaneRenderCtx {
                                 pane_idx,
@@ -172,9 +170,6 @@ impl super::Gui {
                                 actions: &mut actions,
                                 pane_rect,
                                 pointer_available,
-                                is_dark_theme,
-                                scan_info_site_name,
-                                loading_site: &mut self.radar.loading_site,
                                 excluded_rects: excluded_rects.clone(),
                                 #[cfg(target_os = "android")]
                                 long_press_pos,
@@ -285,17 +280,19 @@ fn draw_pane_border(ui: &mut egui::Ui, pane_rect: egui::Rect, is_active: bool) {
     );
 }
 
-/// Compute the hover information string for a cursor position over the radar image.
-pub(super) fn compute_hover_info(
-    img: &RadarImageData,
+/// Compute hover info string from raw value data and site coordinates.
+pub(super) fn compute_hover_info_raw(
+    value_data: &[f32],
+    site_lat: f64,
+    site_lon: f64,
     hover_lat: f64,
     hover_lon: f64,
     hover_pos: egui::Pos2,
     rect: egui::Rect,
     product: RadarProduct,
 ) -> String {
-    let lat1 = img.lat.to_radians();
-    let lon1 = img.lon.to_radians();
+    let lat1 = site_lat.to_radians();
+    let lon1 = site_lon.to_radians();
     let lat2 = hover_lat.to_radians();
     let lon2 = hover_lon.to_radians();
     let dlat = lat2 - lat1;
@@ -316,8 +313,8 @@ pub(super) fn compute_hover_info(
 
     if px >= 0 && px < IMAGE_SIZE as i32 && py >= 0 && py < IMAGE_SIZE as i32 {
         let pixel_idx = py as usize * IMAGE_SIZE + px as usize;
-        if pixel_idx < img.value_data.len() {
-            let value = img.value_data[pixel_idx];
+        if pixel_idx < value_data.len() {
+            let value = value_data[pixel_idx];
             if !value.is_nan() {
                 value_str = format!("| {}", product.format_value(value));
             }

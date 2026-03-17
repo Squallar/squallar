@@ -2,8 +2,9 @@ use chrono::NaiveDateTime;
 use chrono::TimeZone;
 use std::sync::atomic::Ordering;
 use winit::event_loop::ActiveEventLoop;
-use rustdar_egui::actions::{GuiAction, OverlayRenderKind};
-use crate::channels::{ScanResponse, ScanData, Level3Response, OutlookResponse, OverlayType, OverlayRenderResponse};
+use rustdar_egui::actions::GuiAction;
+use crate::channels::{ScanResponse, ScanData, Level3Response, OverlayRenderResponse};
+use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
 use crate::constants::MAX_CONCURRENT_RENDERS;
 use crate::render_dispatch::RenderGuard;
 use rustdar_radar::types::RadarProduct;
@@ -83,12 +84,8 @@ impl super::App {
             GuiAction::Exit => {
                 self.request_exit(event_loop);
             }
-            GuiAction::FetchSpcOutlook { .. }
-            | GuiAction::RefreshSpcOutlooks
-            | GuiAction::FetchNwsAlerts
-            | GuiAction::RefreshNwsAlerts
-            | GuiAction::FetchSpcDiscussions
-            | GuiAction::RefreshSpcDiscussions => self.handle_overlay_action(action),
+            GuiAction::FetchOverlay(_)
+            | GuiAction::RefreshOverlay(_) => self.handle_overlay_action(action),
             GuiAction::RenderOverlay { .. } => {
                 // Handled in process_gui_actions() with deduplication
                 unreachable!("RenderOverlay should be intercepted by process_gui_actions");
@@ -196,20 +193,23 @@ impl super::App {
                 let mut new_config = self.gui.get_radar_config().clone();
                 new_config.site = site.clone();
                 self.gui.set_radar_config(new_config.clone());
-                self.gui.set_loading_site(Some(site.clone()));
 
                 if self.gui.is_sync_layers() {
                     // Sync ON: update all panes to the new site
                     for idx in 0..self.gui.pane_count() {
                         if let Some(pane) = self.gui.pane_mut(idx) {
+                            pane.loading_site = Some(site.clone());
                             pane.site = site.clone();
+                            pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
                             pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new();
                         }
                     }
                 } else {
                     // Sync OFF: only update the target pane
                     if let Some(pane) = self.gui.pane_mut(pane_idx) {
+                        pane.loading_site = Some(site.clone());
                         pane.site = site.clone();
+                        pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
                         pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new();
                     }
                 }
@@ -238,14 +238,29 @@ impl super::App {
         });
     }
 
-    /// Handle overlay fetch/refresh actions (SPC outlooks, NWS alerts, SPC discussions).
+    /// Handle overlay fetch/refresh actions for all overlay kinds.
     fn handle_overlay_action(&mut self, action: GuiAction) {
         match action {
-            GuiAction::FetchSpcOutlook { day, products } => {
+            GuiAction::FetchOverlay(kind) | GuiAction::RefreshOverlay(kind) => {
+                self.fetch_overlay(kind);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Fetch overlay data for the given kind, resolving parameters from current state.
+    fn fetch_overlay(&mut self, kind: OverlayKind) {
+        match kind {
+            OverlayKind::SpcOutlook => {
+                let day = self.gui.active_pane().layers.spc_day;
+                let products = self.gui.active_pane().layers.enabled_spc_products();
+                if products.is_empty() {
+                    return;
+                }
                 log::info!("Fetching SPC outlooks for {:?}: {:?}", day, products);
                 self.gui.overlays.set_spc_fetching(true);
                 let client = self.http_client.clone();
-                let sender = self.channels.outlook_sender.clone();
+                let sender = self.channels.overlay_fetch_sender.clone();
                 for product in products {
                     let client = client.clone();
                     self.spawn_overlay_fetch(sender.clone(), async move {
@@ -253,44 +268,42 @@ impl super::App {
                             rustdar_overlays::spc::fetch::fetch_outlook(&client, day, product)
                                 .await
                                 .map_err(|e| format!("{e}"));
-                        OutlookResponse { day, product, result }
+                        OverlayFetchResult::SpcOutlook { day, product, result }
                     });
                 }
             }
-            GuiAction::RefreshSpcOutlooks => {
-                let day = self.gui.active_pane().layers.spc_day;
-                let products = self.gui.active_pane().layers.enabled_spc_products();
-                if !products.is_empty() {
-                    self.handle_overlay_action(
-                        GuiAction::FetchSpcOutlook { day, products },
-                    );
-                }
-            }
-            GuiAction::FetchNwsAlerts | GuiAction::RefreshNwsAlerts => {
+            OverlayKind::NwsAlerts => {
                 log::info!("Fetching NWS active alerts");
                 self.gui.overlays.set_nws_fetching(true);
                 let client = self.http_client.clone();
                 let zone_cache = self.platform.zone_cache_dir().map(|p| p.to_path_buf());
-                self.spawn_overlay_fetch(self.channels.alert_sender.clone(), async move {
-                    rustdar_overlays::nws::fetch::fetch_active_alerts(
-                        &client,
-                        zone_cache.as_deref(),
+                self.spawn_overlay_fetch(self.channels.overlay_fetch_sender.clone(), async move {
+                    OverlayFetchResult::NwsAlerts(
+                        rustdar_overlays::nws::fetch::fetch_active_alerts(
+                            &client,
+                            zone_cache.as_deref(),
+                        )
+                            .await
+                            .map_err(|e| format!("{e}"))
                     )
-                        .await
-                        .map_err(|e| format!("{e}"))
                 });
             }
-            GuiAction::FetchSpcDiscussions | GuiAction::RefreshSpcDiscussions => {
+            OverlayKind::SpcDiscussions => {
                 log::info!("Fetching SPC Mesoscale Discussions");
                 self.gui.overlays.set_spc_md_fetching(true);
                 let client = self.http_client.clone();
-                self.spawn_overlay_fetch(self.channels.discussion_sender.clone(), async move {
-                    rustdar_overlays::spc::fetch::fetch_active_discussions(&client)
-                        .await
-                        .map_err(|e| format!("{e}"))
+                self.spawn_overlay_fetch(self.channels.overlay_fetch_sender.clone(), async move {
+                    OverlayFetchResult::SpcDiscussions(
+                        rustdar_overlays::spc::fetch::fetch_active_discussions(&client)
+                            .await
+                            .map_err(|e| format!("{e}"))
+                    )
                 });
             }
-            _ => unreachable!(),
+            // Non-fetchable kinds are never dispatched here.
+            _ => {
+                log::warn!("fetch_overlay called with non-fetchable kind: {:?}", kind);
+            }
         }
     }
 
@@ -298,7 +311,7 @@ impl super::App {
     pub(super) fn spawn_overlay_render(
         &mut self,
         pane_indices: Vec<usize>,
-        kind: OverlayRenderKind,
+        kind: OverlayKind,
         geo_bounds: rustdar_overlays::types::GeoBounds,
         width: u32,
         height: u32,
@@ -312,10 +325,15 @@ impl super::App {
             return;
         }
 
+        if !kind.is_texture_overlay() {
+            log::warn!("spawn_overlay_render called with non-texture kind: {:?}", kind);
+            return;
+        }
+
         // Mark in-flight on the appropriate texture cache for all target panes
         for &pidx in &pane_indices {
-            if let Some(cache) = self.pane_overlay_cache_mut(pidx, &kind) {
-                cache.render_in_flight = true;
+            if let Some(pane) = self.gui.pane_mut(pidx) {
+                pane.overlay_cache_mut(kind).render_in_flight = true;
             }
         }
 
@@ -333,21 +351,13 @@ impl super::App {
         // Use the first target pane for data extraction (all synced panes share config)
         let first_pane_idx = pane_indices[0];
         let Some(target_pane) = self.gui.pane(first_pane_idx) else { return };
-        let overlay_type = match kind {
-            OverlayRenderKind::SpcOutlook => OverlayType::SpcOutlook(
-                target_pane.layers.spc_day,
-                rustdar_overlays::spc::outlook::OutlookProduct::Categorical,
-            ),
-            OverlayRenderKind::SpcDiscussions => OverlayType::SpcDiscussions,
-            OverlayRenderKind::NwsAlerts => OverlayType::NwsAlerts,
-        };
 
         let sender = self.channels.overlay_render_sender.clone();
         let window = self.window.clone();
 
         // Clone the data needed for the render closure
         match kind {
-            OverlayRenderKind::SpcOutlook => {
+            OverlayKind::SpcOutlook => {
                 let layers = &target_pane.layers;
                 let day = layers.spc_day;
                 let mut features = Vec::new();
@@ -379,7 +389,7 @@ impl super::App {
                         width,
                         height,
                         geo_bounds: render_bounds,
-                        overlay_type,
+                        overlay_kind: kind,
                         generation: data_generation,
                         pane_indices,
                         zoom,
@@ -387,7 +397,7 @@ impl super::App {
                     super::notify_redraw(&window);
                 });
             }
-            OverlayRenderKind::SpcDiscussions => {
+            OverlayKind::SpcDiscussions => {
                 let discussions: Vec<_> = self.gui.overlays.spc_discussions.data.clone();
                 std::thread::spawn(move || {
                     let image_data = rasterize::rasterize_spc_discussions(
@@ -401,7 +411,7 @@ impl super::App {
                         width,
                         height,
                         geo_bounds: render_bounds,
-                        overlay_type,
+                        overlay_kind: kind,
                         generation: data_generation,
                         pane_indices,
                         zoom,
@@ -409,7 +419,7 @@ impl super::App {
                     super::notify_redraw(&window);
                 });
             }
-            OverlayRenderKind::NwsAlerts => {
+            OverlayKind::NwsAlerts => {
                 let alerts: Vec<_> = self.gui.overlays.nws_alerts.data.clone();
                 let enabled_categories = target_pane.layers.enabled_nws_categories();
                 let hidden_alerts = self.gui.overlays.hidden_alerts.clone();
@@ -427,7 +437,7 @@ impl super::App {
                         width,
                         height,
                         geo_bounds: render_bounds,
-                        overlay_type,
+                        overlay_kind: kind,
                         generation: data_generation,
                         pane_indices,
                         zoom,
@@ -435,21 +445,48 @@ impl super::App {
                     super::notify_redraw(&window);
                 });
             }
+            OverlayKind::RadarSites => {
+                let target_site = target_pane.site.clone();
+                let target_loading = target_pane.loading_site.clone();
+                let is_dark = self.cached_dark_theme.unwrap_or(false);
+                let actual_zoom = zoom as f64 / 32.0;
+                let sites: Vec<rasterize::RadarSiteInfo> = rustdar_radar::sites::RADARS.iter().map(|s| {
+                    rasterize::RadarSiteInfo {
+                        name: s.name.to_string(),
+                        lat: s.lat,
+                        lon: s.lon,
+                        is_current: s.name == target_site,
+                        is_loading: target_loading.as_deref() == Some(s.name),
+                    }
+                }).collect();
+                std::thread::spawn(move || {
+                    let image_data = rasterize::rasterize_radar_sites(
+                        &sites,
+                        &render_bounds,
+                        width,
+                        height,
+                        actual_zoom,
+                        is_dark,
+                    );
+                    let _ = sender.send(OverlayRenderResponse {
+                        image_data,
+                        width,
+                        height,
+                        geo_bounds: render_bounds,
+                        overlay_kind: kind,
+                        generation: data_generation,
+                        pane_indices,
+                        zoom,
+                    });
+                    super::notify_redraw(&window);
+                });
+            }
+            // Non-texture overlay kinds are never dispatched for background rendering.
+            OverlayKind::Radar | OverlayKind::CityLabels
+            | OverlayKind::UserLocation => {
+                log::warn!("spawn_overlay_render called with non-texture kind: {:?}", kind);
+            }
         }
-    }
-
-    /// Get a mutable reference to the appropriate overlay texture cache for a pane.
-    fn pane_overlay_cache_mut(
-        &mut self,
-        pane_idx: usize,
-        kind: &OverlayRenderKind,
-    ) -> Option<&mut rustdar_egui::overlay_cache::OverlayTextureCache> {
-        let pane = self.gui.pane_mut(pane_idx)?;
-        Some(match kind {
-            OverlayRenderKind::SpcOutlook => &mut pane.spc_overlay_texture,
-            OverlayRenderKind::SpcDiscussions => &mut pane.spc_md_texture,
-            OverlayRenderKind::NwsAlerts => &mut pane.nws_alert_texture,
-        })
     }
 
     /// Enable radar loop for a pane: initializes loop state and spawns
@@ -609,7 +646,7 @@ impl super::App {
             config.timestamp = local_ts;
             self.gui.set_radar_config(config);
             self.gui.set_scan_info_for_site(&pane_site, scan_info);
-            self.gui.set_loading_site(None);
+            self.gui.clear_loading_site_for_site(&pane_site);
             self.render.reset_panes_for_site(&pane_site, &self.gui);
             self.spawn_level3_fetches(&pane_site);
 

@@ -1,9 +1,10 @@
-use crate::actions::{GuiAction, OverlayRenderKind};
+use crate::actions::GuiAction;
 use crate::overlay_cache::{
-    viewport_geo_bounds, current_quantized_zoom, OVERDRAW_FRACTION,
+    viewport_geo_bounds, current_quantized_zoom, draw_overlay_texture,
+    OVERDRAW_FRACTION,
 };
 use rustdar_overlays::render::layers::LayerKind;
-use rustdar_overlays::render::overlay_state::{OverlayData, SelectedOverlay};
+use rustdar_overlays::render::overlay_state::{OverlayData, OverlayKind, SelectedOverlay};
 use crate::pane::{PaneState, RadarImageData};
 
 use rustdar_radar::sites::RADARS;
@@ -22,9 +23,6 @@ pub(super) struct PaneRenderCtx<'a> {
     pub actions: &'a mut Vec<GuiAction>,
     pub pane_rect: egui::Rect,
     pub pointer_available: bool,
-    pub is_dark_theme: bool,
-    pub scan_info_site_name: Option<&'a str>,
-    pub loading_site: &'a mut Option<String>,
     pub excluded_rects: Vec<egui::Rect>,
     /// On Android, the screen position of an active long-press (for radar value tooltip).
     #[cfg(target_os = "android")]    pub long_press_pos: Option<egui::Pos2>,
@@ -60,7 +58,8 @@ pub(super) fn render_pane_map_content(
         }
     }
 
-    // --- Phase 1: immutable-ui work (overlays, radar image, labels) ---
+    // --- Phase 1: immutable-ui work (ordered layer dispatch) ---
+    // RadarSites requires `allocate_rect` (&mut ui), so it is deferred to Phase 2.
     {
         let overlay_ctx = OverlayDrawContext::new(
             ui,
@@ -71,59 +70,91 @@ pub(super) fn render_pane_map_content(
             ctx.overlay_click_pos,
         );
 
-        // Draw SPC outlook textures (below radar)
-        overlay_ctx.draw_spc_overlays(
-            &ctx.pane.layers,
-            &ctx.pane.spc_overlay_texture,
-        );
+        let mut selected: Vec<SelectedOverlay> = Vec::new();
 
-        // Overlay radar data if available
-        if ctx.pane.layers.is_enabled(LayerKind::Radar) {
-            if let Some(img) = ctx.pane.active_image().cloned() {
-                render_radar_overlay(ui, projector, &img, ctx.pane, ctx.pane_rect);
+        let draw_order: Vec<OverlayKind> = ctx.pane.draw_order.clone();
+        for &kind in &draw_order {
+            if !kind.is_enabled(&ctx.pane.layers) {
+                continue;
+            }
+            match kind {
+                // Texture-based overlays: draw texture + clickable items
+                OverlayKind::SpcOutlook
+                | OverlayKind::SpcDiscussions
+                | OverlayKind::NwsAlerts => {
+                    let items = kind.clickable_items(ctx.overlays, &ctx.pane.layers);
+                    selected.extend(overlay_ctx.draw_overlay(
+                        ctx.pane.overlay_cache(kind),
+                        &items,
+                    ));
+                }
+                // Radar image layer — drawn from overlay texture cache
+                OverlayKind::Radar => {
+                    // Loop playback: draw the active loop frame instead
+                    if ctx.pane.loop_state.multi_frame {
+                        if let Some(img) = ctx.pane.active_image().cloned() {
+                            render_radar_overlay(ui, projector, &img, ctx.pane, ctx.pane_rect);
+                        }
+                    } else {
+                        // Extract metadata before drawing (avoids borrow conflict)
+                        let meta_snapshot = ctx.pane.overlay_cache(OverlayKind::Radar)
+                            .and_then(|c| c.current.as_ref())
+                            .and_then(|tex| tex.radar_meta.as_ref())
+                            .map(|m| (m.lat, m.lon, m.max_range_km, std::sync::Arc::clone(&m.value_data)));
+
+                        if let Some(ref tex) = ctx.pane.overlay_cache(OverlayKind::Radar).and_then(|c| c.current.as_ref()) {
+                            let screen_rect = ui.max_rect();
+                            draw_overlay_texture(ui.painter(), projector, tex, screen_rect);
+                        }
+
+                        // Per-frame: range ring + hover value from radar metadata
+                        if let Some((lat, lon, _max_range_km, value_data)) = meta_snapshot {
+                            render_radar_range_ring(ui, projector, lat, lon);
+                            update_pane_hover_value_from_meta(
+                                ui, projector, &value_data, lat, lon,
+                                ctx.pane, ctx.pane_rect,
+                            );
+                        }
+                    }
+                }
+                // City label tiles
+                OverlayKind::CityLabels => {
+                    if let Some(ltiles) = ctx.label_tiles.as_mut() {
+                        draw_label_tiles_overlay(ui, projector, zoom, ltiles);
+                    }
+                }
+                // Radar sites: texture + per-frame interactions
+                OverlayKind::RadarSites => {
+                    // Draw the pre-rasterized site circles texture
+                    if let Some(ref tex) = ctx.pane.overlay_cache(kind).and_then(|c| c.current.as_ref()) {
+                        let screen_rect = ui.max_rect();
+                        draw_overlay_texture(ui.painter(), projector, tex, screen_rect);
+                    }
+                    // Per-frame: clicks, tooltips, hover cursor
+                    handle_radar_site_interactions(
+                        ui,
+                        projector,
+                        zoom,
+                        ctx.pane,
+                        ctx.actions,
+                        ctx.pane_idx,
+                    );
+                }
+                // User location blue dot
+                OverlayKind::UserLocation => {
+                    if let Some((user_lat, user_lon)) = ctx.user_location {
+                        render_user_location(ui, projector, user_lat, user_lon);
+                    }
+                }
             }
         }
 
-        // Draw SPC Mesoscale Discussion textures + labels
-        let clicked_mds = overlay_ctx.draw_spc_discussions(
-            &ctx.pane.layers,
-            &ctx.overlays.spc_discussions.data,
-            &ctx.pane.spc_md_texture,
-        );
-
-        // Draw NWS alert textures
-        let clicked_alerts = overlay_ctx.draw_nws_alerts(
-            &ctx.pane.layers,
-            &ctx.overlays.nws_alerts.data,
-            &ctx.overlays.hidden_alerts,
-            &ctx.pane.nws_alert_texture,
-        );
-
-        // Combine all clicked overlays into the pager list (store stable IDs)
-        if !clicked_mds.is_empty() || !clicked_alerts.is_empty() {
-            let mut items: Vec<SelectedOverlay> = Vec::new();
-            for idx in clicked_alerts {
-                if let Some(alert) = ctx.overlays.nws_alerts.data.get(idx) {
-                    items.push(SelectedOverlay::Alert(alert.id.clone()));
-                }
-            }
-            for idx in clicked_mds {
-                if let Some(md) = ctx.overlays.spc_discussions.data.get(idx) {
-                    items.push(SelectedOverlay::Discussion(md.number));
-                }
-            }
-            ctx.overlays.selected_overlays = items;
+        if !selected.is_empty() {
+            ctx.overlays.selected_overlays = selected;
             ctx.overlays.selected_overlay_page = 0;
         }
 
-        // Draw label-only tiles on top of the radar overlay
-        if ctx.pane.layers.is_enabled(LayerKind::CityLabels) {
-            if let Some(ltiles) = ctx.label_tiles.as_mut() {
-                draw_label_tiles_overlay(ui, projector, zoom, ltiles);
-            }
-        }
-
-        // --- Check if any overlays need background re-rendering ---
+        // --- Check if any texture overlays need background re-rendering ---
         let screen_rect = ui.max_rect();
         let viewport_bounds = viewport_geo_bounds(projector, screen_rect);
         let qzoom = current_quantized_zoom(zoom);
@@ -131,19 +162,28 @@ pub(super) fn render_pane_map_content(
         let w = (screen_rect.width() * (1.0 + 2.0 * OVERDRAW_FRACTION)) as u32;
         let h = (screen_rect.height() * (1.0 + 2.0 * OVERDRAW_FRACTION)) as u32;
 
-        // SPC outlooks
-        {
-            let any_spc_enabled = ctx.pane.layers.spc_layers_for_day()
-                .iter()
-                .any(|lk| ctx.pane.layers.is_enabled(*lk));
-            let data_gen = ctx.overlays.combined_spc_data_generation();
-            if any_spc_enabled
-                && !ctx.pane.spc_overlay_texture.render_in_flight
-                && ctx.pane.spc_overlay_texture.needs_rerender(data_gen, qzoom, &viewport_bounds)
+        for &kind in OverlayKind::texture_overlays() {
+            // Radar rendering is driven by product/elevation changes (not viewport),
+            // handled by dispatch_pane_renders() in the platform crate.
+            if kind == OverlayKind::Radar {
+                continue;
+            }
+            let enabled = kind.is_enabled(&ctx.pane.layers);
+            let data_gen = if kind == OverlayKind::RadarSites {
+                ctx.pane.radar_sites_render_gen
+            } else {
+                kind.data_generation(ctx.overlays)
+            };
+            let has_data = kind.has_data(ctx.overlays);
+            let cache = ctx.pane.overlay_cache_mut(kind);
+            if enabled
+                && has_data
+                && !cache.render_in_flight
+                && cache.needs_rerender(data_gen, qzoom, &viewport_bounds)
             {
                 ctx.actions.push(GuiAction::RenderOverlay {
                     pane_idx: ctx.pane_idx,
-                    overlay_kind: OverlayRenderKind::SpcOutlook,
+                    overlay_kind: kind,
                     geo_bounds: viewport_bounds.clone(),
                     width: w,
                     height: h,
@@ -151,131 +191,34 @@ pub(super) fn render_pane_map_content(
                     zoom: qzoom,
                 });
             }
-            if !any_spc_enabled {
-                ctx.pane.spc_overlay_texture.current = None;
+            if !enabled {
+                cache.current = None;
             }
-        }
-
-        // SPC Mesoscale Discussions
-        if ctx.pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions)
-            && !ctx.overlays.spc_discussions.data.is_empty()
-            && !ctx.pane.spc_md_texture.render_in_flight
-            && ctx.pane.spc_md_texture.needs_rerender(
-                ctx.overlays.spc_discussions.data_generation,
-                qzoom,
-                &viewport_bounds,
-            )
-        {
-            ctx.actions.push(GuiAction::RenderOverlay {
-                pane_idx: ctx.pane_idx,
-                overlay_kind: OverlayRenderKind::SpcDiscussions,
-                geo_bounds: viewport_bounds.clone(),
-                width: w,
-                height: h,
-                data_generation: ctx.overlays.spc_discussions.data_generation,
-                zoom: qzoom,
-            });
-        }
-
-        // NWS alerts
-        if ctx.pane.layers.any_nws_enabled()
-            && !ctx.overlays.nws_alerts.data.is_empty()
-            && !ctx.pane.nws_alert_texture.render_in_flight
-            && ctx.pane.nws_alert_texture.needs_rerender(
-                ctx.overlays.nws_alerts.data_generation,
-                qzoom,
-                &viewport_bounds,
-            )
-        {
-            ctx.actions.push(GuiAction::RenderOverlay {
-                pane_idx: ctx.pane_idx,
-                overlay_kind: OverlayRenderKind::NwsAlerts,
-                geo_bounds: viewport_bounds,
-                width: w,
-                height: h,
-                data_generation: ctx.overlays.nws_alerts.data_generation,
-                zoom: qzoom,
-            });
         }
     }
     // overlay_ctx (and its shared borrow of ui) is dropped here
-
-    // --- Phase 2: mutable-ui work (radar sites need allocate_rect) ---
-    if ctx.pane.layers.is_enabled(LayerKind::RadarSites) {
-        render_radar_sites(
-            ui,
-            projector,
-            zoom,
-            ctx.is_dark_theme,
-            ctx.scan_info_site_name,
-            ctx.loading_site,
-            ctx.actions,
-            ctx.pane_idx,
-        );
-    }
-
-    // Draw user location indicator (blue dot)
-    if let Some((user_lat, user_lon)) = ctx.user_location {
-        render_user_location(ui, projector, user_lat, user_lon);
-    }
 
     // Mobile long-press tooltip: show radar value above the finger
     #[cfg(target_os = "android")]
     if let Some(touch_pos) = ctx.long_press_pos {
         if ctx.pane_rect.contains(touch_pos) {
-            if let Some(img) = ctx.pane.active_image().cloned() {
+            // Try overlay cache meta first (non-loop static render), then loop frame
+            let raw_meta = ctx.pane.overlay_cache(OverlayKind::Radar)
+                .and_then(|c| c.current.as_ref())
+                .and_then(|tex| tex.radar_meta.as_ref())
+                .map(|m| (m.lat, m.lon, std::sync::Arc::clone(&m.value_data)));
+            if let Some((lat, lon, value_data)) = raw_meta {
+                crate::ui::mobile::draw_long_press_tooltip_raw(
+                    ui, projector, &value_data, lat, lon, touch_pos, ctx.pane,
+                );
+            } else if let Some(img) = ctx.pane.active_image().cloned() {
                 crate::ui::mobile::draw_long_press_tooltip(ui, projector, &img, touch_pos, ctx.pane);
             }
         }
     }
 }
 
-/// Update the hover value for a pane based on cursor position over the radar image.
-///
-/// Only recomputes when the cursor moves more than 0.5px from the last position.
-/// Clears hover state when the cursor leaves the pane.
-fn update_pane_hover_value(
-    ui: &egui::Ui,
-    projector: &walkers::Projector,
-    img: &RadarImageData,
-    pane: &mut PaneState,
-    pane_rect: egui::Rect,
-    image_rect: egui::Rect,
-) {
-    let Some(hover_pos) = ui.ctx().pointer_hover_pos() else {
-        pane.last_hover_pos = None;
-        pane.hover_value = None;
-        return;
-    };
-
-    if !pane_rect.contains(hover_pos) {
-        pane.last_hover_pos = None;
-        pane.hover_value = None;
-        return;
-    }
-
-    let pos_changed = pane
-        .last_hover_pos
-        .map(|last| (last - hover_pos).length() > 0.5)
-        .unwrap_or(true);
-    pane.last_hover_pos = Some(hover_pos);
-
-    if pos_changed {
-        let screen_vec = egui::vec2(hover_pos.x, hover_pos.y);
-        let map_pos = projector.unproject(screen_vec);
-
-        pane.hover_value = Some(super::compute_hover_info(
-            img,
-            map_pos.y(),
-            map_pos.x(),
-            hover_pos,
-            image_rect,
-            pane.selected_product,
-        ));
-    }
-}
-
-/// Render the radar image overlay, range ring, and hover tooltip.
+/// Render the radar image overlay, range ring, and hover tooltip (loop playback path) (loop playback path).
 fn render_radar_overlay(
     ui: &egui::Ui,
     projector: &walkers::Projector,
@@ -293,9 +236,6 @@ fn render_radar_overlay(
         .to_pos2();
     let rect = egui::Rect::from_two_pos(nw, se);
 
-    update_pane_hover_value(ui, projector, img, pane, pane_rect, rect);
-
-    // Draw the radar image overlay
     ui.painter().image(
         img.texture.id(),
         rect,
@@ -303,15 +243,22 @@ fn render_radar_overlay(
         egui::Color32::WHITE,
     );
 
-    // Draw a light grey circle showing the radar range
+    render_radar_range_ring(ui, projector, img.lat, img.lon);
+    update_pane_hover_value_from_meta(ui, projector, &img.value_data, img.lat, img.lon, pane, pane_rect);
+}
+
+/// Draw only the range ring for a radar site (used with overlay-cache rendering).
+fn render_radar_range_ring(
+    ui: &egui::Ui,
+    projector: &walkers::Projector,
+    lat: f64,
+    lon: f64,
+) {
     let radar_center = projector
-        .project(walkers::lat_lon(img.lat, img.lon))
+        .project(walkers::lat_lon(lat, lon))
         .to_pos2();
     let north_edge = projector
-        .project(walkers::lat_lon(
-            img.lat + MAX_RANGE_KM / 111.32,
-            img.lon,
-        ))
+        .project(walkers::lat_lon(lat + MAX_RANGE_KM / 111.32, lon))
         .to_pos2();
     let range_radius_pixels = (radar_center.y - north_edge.y).abs();
     ui.painter().circle_stroke(
@@ -324,14 +271,70 @@ fn render_radar_overlay(
     );
 }
 
-/// Draw NEXRAD radar site icons on the map.
-fn render_radar_sites(
-    ui: &mut egui::Ui,
+/// Update hover value using radar metadata from the overlay cache.
+fn update_pane_hover_value_from_meta(
+    ui: &egui::Ui,
+    projector: &walkers::Projector,
+    value_data: &[f32],
+    lat: f64,
+    lon: f64,
+    pane: &mut PaneState,
+    pane_rect: egui::Rect,
+) {
+    let bounds = ImageBounds::from_radar_site(lat, lon);
+    let nw = projector
+        .project(walkers::lat_lon(bounds.max_lat, bounds.min_lon))
+        .to_pos2();
+    let se = projector
+        .project(walkers::lat_lon(bounds.min_lat, bounds.max_lon))
+        .to_pos2();
+    let image_rect = egui::Rect::from_two_pos(nw, se);
+
+    let Some(hover_pos) = ui.ctx().pointer_hover_pos() else {
+        pane.last_hover_pos = None;
+        pane.hover_value = None;
+        return;
+    };
+
+    if !pane_rect.contains(hover_pos) {
+        pane.last_hover_pos = None;
+        pane.hover_value = None;
+        return;
+    };
+
+    let pos_changed = pane
+        .last_hover_pos
+        .map(|last| (last - hover_pos).length() > 0.5)
+        .unwrap_or(true);
+    pane.last_hover_pos = Some(hover_pos);
+
+    if pos_changed {
+        let screen_vec = egui::vec2(hover_pos.x, hover_pos.y);
+        let map_pos = projector.unproject(screen_vec);
+
+        pane.hover_value = Some(super::compute_hover_info_raw(
+            value_data,
+            lat,
+            lon,
+            map_pos.y(),
+            map_pos.x(),
+            hover_pos,
+            image_rect,
+            pane.selected_product,
+        ));
+    }
+}
+
+/// Per-frame radar site label rendering and interaction detection.
+///
+/// The site circles and background pills are in the background-rasterized
+/// texture; this function draws text labels (tiny-skia cannot render text)
+/// and handles interactive hits (clicks → site switch, hover → tooltip/cursor).
+fn handle_radar_site_interactions(
+    ui: &egui::Ui,
     projector: &walkers::Projector,
     zoom: f64,
-    is_dark_theme: bool,
-    scan_info_site_name: Option<&str>,
-    loading_site: &mut Option<String>,
+    pane: &mut PaneState,
     actions: &mut Vec<GuiAction>,
     pane_idx: usize,
 ) {
@@ -339,6 +342,22 @@ fn render_radar_sites(
     let zoom_f32 = zoom as f32;
     let icon_size = (10.0 + zoom_f32 * 2.0).clamp(8.0, 24.0);
     let font_size = (icon_size * 0.6).clamp(8.0, 12.0);
+
+    let hover_pos = ui.ctx().pointer_hover_pos();
+    let click_pos = ui.ctx().input(|i| {
+        if i.pointer.any_click() {
+            i.pointer.interact_pos()
+        } else {
+            None
+        }
+    });
+
+    let is_dark = ui.ctx().style().visuals.dark_mode;
+    let text_color = if is_dark {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::BLACK
+    };
 
     for radar_site in &RADARS {
         let site_screen = projector
@@ -349,79 +368,50 @@ fn render_radar_sites(
             continue;
         }
 
-        let is_current_site = scan_info_site_name == Some(radar_site.name);
-        let is_loading = loading_site
-            .as_ref()
-            .is_some_and(|s| s == radar_site.name);
-
-        let icon_color = if is_loading {
-            egui::Color32::from_rgb(160, 32, 240)
-        } else if is_current_site {
-            egui::Color32::from_rgb(255, 100, 100)
-        } else {
-            egui::Color32::from_rgb(100, 150, 255)
-        };
+        // Draw the text label below the marker (background pill is in the texture)
+        if zoom >= 5.0 {
+            let text_pos = egui::pos2(site_screen.x, site_screen.y + icon_size / 2.0 + 3.0);
+            ui.painter().text(
+                text_pos,
+                egui::Align2::CENTER_TOP,
+                radar_site.name,
+                egui::FontId::monospace(font_size),
+                text_color,
+            );
+        }
 
         let icon_rect =
             egui::Rect::from_center_size(site_screen, egui::vec2(icon_size, icon_size));
-        let response = ui.allocate_rect(icon_rect, egui::Sense::click());
 
-        if response.clicked() {
-            *loading_site = Some(radar_site.name.to_string());
-            actions.push(GuiAction::SwitchRadarSite { site: radar_site.name.to_string(), pane_idx });
+        if let Some(pos) = click_pos {
+            if icon_rect.contains(pos) {
+                pane.loading_site = Some(radar_site.name.to_string());
+                pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
+                actions.push(GuiAction::SwitchRadarSite { site: radar_site.name.to_string(), pane_idx });
+            }
         }
 
-        draw_site_marker(ui, site_screen, icon_size, icon_color, radar_site.name, font_size, is_dark_theme);
-
-        if response.hovered() {
-            show_site_tooltip(response, radar_site);
+        if let Some(pos) = hover_pos {
+            if icon_rect.contains(pos) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                let elev_str = match radar_site.elev {
+                    Some(e) => format!("{} ft", e),
+                    None => "N/A".to_string(),
+                };
+                let tooltip_text = format!(
+                    "{}\nLat: {:.3}°, Lon: {:.3}°\nElev: {}",
+                    radar_site.name, radar_site.lat, radar_site.lon, elev_str
+                );
+                #[allow(deprecated)]
+                egui::show_tooltip_at_pointer(
+                    ui.ctx(),
+                    ui.layer_id(),
+                    egui::Id::new(("site_tooltip", radar_site.name)),
+                    |tooltip_ui| { tooltip_ui.label(tooltip_text); },
+                );
+            }
         }
     }
-}
-
-/// Draw a single radar site marker (filled circle with outline and label).
-fn draw_site_marker(
-    ui: &egui::Ui,
-    center: egui::Pos2,
-    icon_size: f32,
-    color: egui::Color32,
-    name: &str,
-    font_size: f32,
-    is_dark_theme: bool,
-) {
-    ui.painter()
-        .circle_filled(center, icon_size / 2.0, color);
-    ui.painter().circle_stroke(
-        center,
-        icon_size / 2.0,
-        egui::Stroke::new(1.5, egui::Color32::WHITE),
-    );
-
-    let text_color = if is_dark_theme {
-        egui::Color32::WHITE
-    } else {
-        egui::Color32::BLACK
-    };
-    let text_pos = egui::pos2(center.x, center.y + icon_size / 2.0 + 3.0);
-    ui.painter().text(
-        text_pos,
-        egui::Align2::CENTER_TOP,
-        name,
-        egui::FontId::monospace(font_size),
-        text_color,
-    );
-}
-
-/// Show a tooltip with site coordinates and elevation.
-fn show_site_tooltip(response: egui::Response, site: &rustdar_radar::sites::RadarSite) {
-    let elev_str = match site.elev {
-        Some(e) => format!("{} ft", e),
-        None => "N/A".to_string(),
-    };
-    response.on_hover_text(format!(
-        "{}\nLat: {:.3}°, Lon: {:.3}°\nElev: {}",
-        site.name, site.lat, site.lon, elev_str
-    ));
 }
 
 /// Draw user location blue dot indicator.

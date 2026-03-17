@@ -1,231 +1,201 @@
-use super::geo;
-use crate::types::{HatchPattern, ScreenPoint};
+use tiny_skia::{
+    Color, FillRule, LineCap, Mask, Paint, PathBuilder, Pixmap, Stroke, StrokeDash, Transform,
+};
 
-/// Spacing between hatch lines in screen pixels.
+use crate::types::{HatchPattern, OverlayFeature};
+use crate::render::rasterize::{MercatorBounds, build_polygon_path, strip_closing_dup};
+
+/// Spacing between hatch lines in pixels (matches existing HATCH_SPACING).
 const HATCH_SPACING: f32 = 10.0;
 
-/// Generate hatch line segments for a polygon without drawing them.
-///
-/// Returns `(start, end, is_dotted)` tuples suitable for caching.
-/// This avoids per-frame recomputation of scanline-polygon intersections.
-///
-/// `exclusion_polygons` are screen-space polygons from higher-severity CIG
-/// areas. Any hatch segment portions that fall inside an exclusion polygon
-/// are removed so that e.g. CIG1 hatching doesn't show through a CIG2 region.
-pub fn generate_hatch_lines(
-    polygon_pts: &[ScreenPoint],
+/// Generate and draw hatch lines within a clip mask.
+fn draw_hatch_lines_clipped(
+    pixmap: &mut Pixmap,
+    clip: &Mask,
     pattern: HatchPattern,
-    exclusion_polygons: &[&[ScreenPoint]],
-) -> Vec<(ScreenPoint, ScreenPoint, bool)> {
-    if polygon_pts.len() < 3 || pattern == HatchPattern::None {
-        return Vec::new();
-    }
+    hatch_color: [u8; 4],
+    poly_path: &tiny_skia::Path,
+) {
+    let bounds = poly_path.bounds();
+    let min_x = bounds.left();
+    let min_y = bounds.top();
+    let max_x = bounds.right();
+    let max_y = bounds.bottom();
 
-    let mut lines = Vec::new();
     match pattern {
         HatchPattern::Cig1 => {
-            collect_directional_hatch(&mut lines, polygon_pts, 45.0, true);
+            draw_directional_hatch(pixmap, clip, 45.0, true, hatch_color, min_x, min_y, max_x, max_y);
         }
         HatchPattern::Cig2 => {
-            collect_directional_hatch(&mut lines, polygon_pts, 135.0, false);
+            draw_directional_hatch(pixmap, clip, 135.0, false, hatch_color, min_x, min_y, max_x, max_y);
         }
         HatchPattern::Cig3 => {
-            collect_directional_hatch(&mut lines, polygon_pts, 45.0, false);
-            collect_directional_hatch(&mut lines, polygon_pts, 135.0, false);
+            draw_directional_hatch(pixmap, clip, 45.0, false, hatch_color, min_x, min_y, max_x, max_y);
+            draw_directional_hatch(pixmap, clip, 135.0, false, hatch_color, min_x, min_y, max_x, max_y);
         }
         HatchPattern::None => {}
     }
-
-    if !exclusion_polygons.is_empty() {
-        subtract_exclusion_polygons(&mut lines, exclusion_polygons);
-    }
-
-    lines
 }
 
-/// Remove portions of hatch segments that fall inside any exclusion polygon.
-fn subtract_exclusion_polygons(
-    lines: &mut Vec<(ScreenPoint, ScreenPoint, bool)>,
-    exclusions: &[&[ScreenPoint]],
-) {
-    let mut result = Vec::with_capacity(lines.len());
-    for &(p1, p2, dotted) in lines.iter() {
-        let mut segments = vec![(p1, p2)];
-        for &excl_poly in exclusions {
-            if excl_poly.len() < 3 {
-                continue;
-            }
-            // Quick AABB reject per exclusion polygon
-            let seg_min_x = segments.iter().map(|(a, b)| a.x.min(b.x)).fold(f32::MAX, f32::min);
-            let seg_max_x = segments.iter().map(|(a, b)| a.x.max(b.x)).fold(f32::MIN, f32::max);
-            let seg_min_y = segments.iter().map(|(a, b)| a.y.min(b.y)).fold(f32::MAX, f32::min);
-            let seg_max_y = segments.iter().map(|(a, b)| a.y.max(b.y)).fold(f32::MIN, f32::max);
-            let (ex_min_x, ex_min_y, ex_max_x, ex_max_y) = geo::aabb(excl_poly);
-            if seg_max_x < ex_min_x || seg_min_x > ex_max_x
-                || seg_max_y < ex_min_y || seg_min_y > ex_max_y
-            {
-                continue;
-            }
-
-            let mut next_segments = Vec::with_capacity(segments.len());
-            for (s1, s2) in segments {
-                subtract_polygon_from_segment(s1, s2, excl_poly, &mut next_segments);
-            }
-            segments = next_segments;
-            if segments.is_empty() {
-                break;
-            }
-        }
-        for (s1, s2) in segments {
-            result.push((s1, s2, dotted));
-        }
-    }
-    *lines = result;
-}
-
-/// Subtract a single polygon from a line segment, outputting remaining portions.
-fn subtract_polygon_from_segment(
-    p1: ScreenPoint,
-    p2: ScreenPoint,
-    polygon: &[ScreenPoint],
-    out: &mut Vec<(ScreenPoint, ScreenPoint)>,
-) {
-    let dx = p2.x - p1.x;
-    let dy = p2.y - p1.y;
-    let len_sq = dx * dx + dy * dy;
-    if len_sq < 1e-6 {
-        return;
-    }
-
-    // Find all intersection t-values with polygon edges
-    let n = polygon.len();
-    let mut ts = Vec::new();
-    for i in 0..n {
-        let a = polygon[i];
-        let b = polygon[(i + 1) % n];
-        let ex = b.x - a.x;
-        let ey = b.y - a.y;
-        let denom = dx * ey - dy * ex;
-        if denom.abs() < 1e-10 {
-            continue;
-        }
-        let t = ((a.x - p1.x) * ey - (a.y - p1.y) * ex) / denom;
-        let s = ((a.x - p1.x) * dy - (a.y - p1.y) * dx) / denom;
-        if s >= 0.0 && s <= 1.0 && t >= 0.0 && t <= 1.0 {
-            ts.push(t);
-        }
-    }
-    ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    ts.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
-
-    // Build intervals. Check inside/outside at each sub-segment midpoint.
-    let mut boundaries = vec![0.0_f32];
-    boundaries.extend_from_slice(&ts);
-    boundaries.push(1.0);
-
-    for w in boundaries.windows(2) {
-        let t0 = w[0];
-        let t1 = w[1];
-        if (t1 - t0) < 1e-6 {
-            continue;
-        }
-        let mid_t = (t0 + t1) * 0.5;
-        let mid = ScreenPoint::new(p1.x + dx * mid_t, p1.y + dy * mid_t);
-        if !geo::point_in_polygon(mid, polygon) {
-            // This portion is outside the exclusion polygon — keep it
-            out.push((
-                ScreenPoint::new(p1.x + dx * t0, p1.y + dy * t0),
-                ScreenPoint::new(p1.x + dx * t1, p1.y + dy * t1),
-            ));
-        }
-    }
-}
-
-
-
-/// Pre-computed parameters for sweeping hatch scanlines across a polygon's AABB.
-struct ScanlineParams {
-    /// Direction vector along the hatch line.
-    dir_x: f32,
-    dir_y: f32,
-    /// Normal vector (perpendicular to hatch direction).
-    norm_x: f32,
-    norm_y: f32,
-    /// Projection range along the normal — sweep `t` from `min_proj` to `max_proj`.
-    min_proj: f32,
-    max_proj: f32,
-    /// Half-length of each scanline in the direction axis.
-    line_half_len: f32,
-    /// Center projection along the direction axis.
-    dir_center: f32,
-}
-
-impl ScanlineParams {
-    /// Compute scanline sweep parameters from a polygon's AABB and hatch angle.
-    fn new(polygon_pts: &[ScreenPoint], angle_degrees: f32) -> Option<Self> {
-        let (min_x, min_y, max_x, max_y) = geo::aabb(polygon_pts);
-        if min_x >= max_x || min_y >= max_y {
-            return None;
-        }
-
-        let angle_rad = angle_degrees.to_radians();
-        let dir_x = angle_rad.cos();
-        let dir_y = -angle_rad.sin();
-        let norm_x = -dir_y;
-        let norm_y = dir_x;
-
-        let corners = [
-            ScreenPoint::new(min_x, min_y),
-            ScreenPoint::new(max_x, min_y),
-            ScreenPoint::new(min_x, max_y),
-            ScreenPoint::new(max_x, max_y),
-        ];
-
-        let (mut min_proj, mut max_proj) = (f32::MAX, f32::MIN);
-        let (mut min_dir_proj, mut max_dir_proj) = (f32::MAX, f32::MIN);
-        for c in &corners {
-            let np = c.x * norm_x + c.y * norm_y;
-            min_proj = min_proj.min(np);
-            max_proj = max_proj.max(np);
-            let dp = c.x * dir_x + c.y * dir_y;
-            min_dir_proj = min_dir_proj.min(dp);
-            max_dir_proj = max_dir_proj.max(dp);
-        }
-
-        Some(Self {
-            dir_x,
-            dir_y,
-            norm_x,
-            norm_y,
-            min_proj,
-            max_proj,
-            line_half_len: (max_dir_proj - min_dir_proj) * 0.5 + 10.0,
-            dir_center: (min_dir_proj + max_dir_proj) * 0.5,
-        })
-    }
-}
-
-/// Collect hatch line segments at a given angle, clipped to the polygon.
-fn collect_directional_hatch(
-    out: &mut Vec<(ScreenPoint, ScreenPoint, bool)>,
-    polygon_pts: &[ScreenPoint],
+/// Draw parallel hatch lines at a given angle within a clip mask.
+fn draw_directional_hatch(
+    pixmap: &mut Pixmap,
+    clip: &Mask,
     angle_degrees: f32,
     dotted: bool,
+    color: [u8; 4],
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
 ) {
-    let Some(params) = ScanlineParams::new(polygon_pts, angle_degrees) else {
-        return;
-    };
+    let angle_rad = angle_degrees.to_radians();
+    let dir_x = angle_rad.cos();
+    let dir_y = -angle_rad.sin();
+    let norm_x = -dir_y;
+    let norm_y = dir_x;
 
-    let mut t = params.min_proj;
-    while t <= params.max_proj {
-        let cx = params.norm_x * t + params.dir_x * params.dir_center;
-        let cy = params.norm_y * t + params.dir_y * params.dir_center;
-        let p1 = ScreenPoint::new(cx - params.dir_x * params.line_half_len, cy - params.dir_y * params.line_half_len);
-        let p2 = ScreenPoint::new(cx + params.dir_x * params.line_half_len, cy + params.dir_y * params.line_half_len);
-        let segments = geo::clip_line_to_polygon(p1, p2, polygon_pts);
-        for (s1, s2) in segments {
-            out.push((s1, s2, dotted));
+    let corners = [
+        (min_x, min_y), (max_x, min_y),
+        (min_x, max_y), (max_x, max_y),
+    ];
+
+    let (mut min_proj, mut max_proj) = (f32::MAX, f32::MIN);
+    let (mut min_dir, mut max_dir) = (f32::MAX, f32::MIN);
+    for &(cx, cy) in &corners {
+        let np = cx * norm_x + cy * norm_y;
+        min_proj = min_proj.min(np);
+        max_proj = max_proj.max(np);
+        let dp = cx * dir_x + cy * dir_y;
+        min_dir = min_dir.min(dp);
+        max_dir = max_dir.max(dp);
+    }
+    let half_len = (max_dir - min_dir) * 0.5 + 10.0;
+    let center = (min_dir + max_dir) * 0.5;
+
+    let mut paint = Paint::default();
+    paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
+    paint.anti_alias = true;
+
+    let mut stroke = Stroke {
+        width: if dotted { 1.5 } else { 1.0 },
+        line_cap: LineCap::Butt,
+        ..Stroke::default()
+    };
+    if dotted {
+        stroke.dash = StrokeDash::new(vec![4.0, 4.0], 0.0);
+    }
+
+    let mut t = min_proj;
+    while t <= max_proj {
+        let cx = norm_x * t + dir_x * center;
+        let cy = norm_y * t + dir_y * center;
+        let x1 = cx - dir_x * half_len;
+        let y1 = cy - dir_y * half_len;
+        let x2 = cx + dir_x * half_len;
+        let y2 = cy + dir_y * half_len;
+
+        let mut pb = PathBuilder::new();
+        pb.move_to(x1, y1);
+        pb.line_to(x2, y2);
+        if let Some(line_path) = pb.finish() {
+            pixmap.stroke_path(&line_path, &paint, &stroke, Transform::identity(), Some(clip));
         }
+
         t += HATCH_SPACING;
     }
+}
+
+/// Draw CIG hatch lines across all features, respecting exclusion zones.
+pub(crate) fn draw_hatch_pass(
+    pixmap: &mut Pixmap,
+    features: &[OverlayFeature],
+    mb: &MercatorBounds,
+    w: f32,
+    h: f32,
+    hatch_color: [u8; 4],
+) {
+    // Collect projected polygon points per CIG level for exclusion masks
+    let mut cig2_pts: Vec<Vec<(f32, f32)>> = Vec::new();
+    let mut cig3_pts: Vec<Vec<(f32, f32)>> = Vec::new();
+    // (feature_idx, path, projected_pts) for each hatched polygon
+    let mut all_hatched: Vec<(usize, tiny_skia::Path, Vec<(f32, f32)>)> = Vec::new();
+
+    for (idx, feature) in features.iter().enumerate() {
+        if feature.hatch == HatchPattern::None {
+            continue;
+        }
+        for polygon in &feature.polygons {
+            let Some(exterior) = polygon.first() else { continue };
+            let ring = strip_closing_dup(exterior);
+            let pts: Vec<(f32, f32)> = ring.iter().map(|&(lat, lon)| mb.project(lat, lon, w, h)).collect();
+            if let Some(path) = build_polygon_path(&pts) {
+                match feature.hatch {
+                    HatchPattern::Cig2 => cig2_pts.push(pts.clone()),
+                    HatchPattern::Cig3 => cig3_pts.push(pts.clone()),
+                    _ => {}
+                }
+                all_hatched.push((idx, path, pts));
+            }
+        }
+    }
+
+    let pw = pixmap.width();
+    let ph = pixmap.height();
+
+    for (idx, poly_path, pts) in &all_hatched {
+        let hatch = features[*idx].hatch;
+
+        let Some(mut mask) = Mask::new(pw, ph) else { continue };
+
+        let exclusion_pts: Vec<&[(f32, f32)]> = match hatch {
+            HatchPattern::Cig1 => cig2_pts.iter().chain(cig3_pts.iter()).map(|v| v.as_slice()).collect(),
+            HatchPattern::Cig2 => cig3_pts.iter().map(|v| v.as_slice()).collect(),
+            _ => Vec::new(),
+        };
+
+        if exclusion_pts.is_empty() {
+            mask.fill_path(poly_path, FillRule::EvenOdd, false, Transform::identity());
+        } else {
+            let Some(combined) = build_polygon_with_exclusions(pts, &exclusion_pts) else {
+                continue;
+            };
+            mask.fill_path(&combined, FillRule::EvenOdd, false, Transform::identity());
+        }
+
+        draw_hatch_lines_clipped(pixmap, &mask, hatch, hatch_color, poly_path);
+    }
+}
+
+
+/// Build a combined path: the polygon ring plus all exclusion rings.
+/// Using EvenOdd fill rule, overlapping regions cancel out — exclusions become holes.
+fn build_polygon_with_exclusions(
+    polygon_pts: &[(f32, f32)],
+    exclusions: &[&[(f32, f32)]],
+) -> Option<tiny_skia::Path> {
+    let mut pb = PathBuilder::new();
+
+    // Add the main polygon contour
+    if polygon_pts.len() >= 3 {
+        pb.move_to(polygon_pts[0].0, polygon_pts[0].1);
+        for &(x, y) in &polygon_pts[1..] {
+            pb.line_to(x, y);
+        }
+        pb.close();
+    }
+
+    // Add exclusion contours (EvenOdd rule makes them subtract)
+    for pts in exclusions {
+        if pts.len() < 3 {
+            continue;
+        }
+        pb.move_to(pts[0].0, pts[0].1);
+        for &(x, y) in &pts[1..] {
+            pb.line_to(x, y);
+        }
+        pb.close();
+    }
+
+    pb.finish()
 }
