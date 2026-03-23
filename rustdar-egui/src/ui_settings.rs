@@ -1,6 +1,6 @@
 use rustdar_units::{
-    DistanceUnit, HailSizeUnit, HeightUnit, PrecipRateUnit, SpeedUnit, TimezonePreference,
-    UserPreferences,
+    DistanceUnit, HailSizeUnit, HeightUnit, PrecipRateUnit, SpeedUnit, TemperatureUnit,
+    TimezonePreference, UserPreferences,
 };
 
 const IS_MOBILE: bool = cfg!(target_os = "android");
@@ -33,6 +33,7 @@ impl super::Gui {
                 ui.add_space(4.0);
 
                 unit_combo(ui, "Timezone", &mut self.preferences.timezone, TimezonePreference::ALL);
+                unit_combo(ui, "Temperature", &mut self.preferences.temperature, TemperatureUnit::ALL);
                 unit_combo(ui, "Speed", &mut self.preferences.speed, SpeedUnit::ALL);
                 unit_combo(ui, "Distance", &mut self.preferences.distance, DistanceUnit::ALL);
                 unit_combo(ui, "Height", &mut self.preferences.height, HeightUnit::ALL);
