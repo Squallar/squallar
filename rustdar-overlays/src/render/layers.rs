@@ -54,7 +54,7 @@ impl LayerKind {
             LayerKind::NwsWarnings => "Warnings",
             LayerKind::NwsWatches => "Watches",
             LayerKind::NwsAdvisories => "Advisories",
-            LayerKind::StormReports => "Storm Reports",
+            LayerKind::StormReports => "SPC Storm Reports",
             LayerKind::Metar => "METAR",
             LayerKind::CityLabels => "City Labels",
             LayerKind::RadarSites => "Radar Sites",

@@ -117,7 +117,7 @@ impl OverlayHandler for StormReportsHandler {
             sections.push(PopupSection::Text(report.comments.clone()));
         }
         Some(PopupContent {
-            title: format!("Storm Report: {kind_str}"),
+            title: format!("SPC Storm Report: {kind_str}"),
             accent_rgb: match report.kind {
                 StormReportKind::Tornado => [220, 40, 40],
                 StormReportKind::Hail => [40, 180, 40],
