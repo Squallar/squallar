@@ -319,8 +319,7 @@ impl super::App {
             OverlayKind::SpcOutlook
             | OverlayKind::SpcDiscussions
             | OverlayKind::NwsAlerts
-            | OverlayKind::StormReports
-            | OverlayKind::Metar => {
+            | OverlayKind::StormReports => {
                 let rctx = rustdar_overlays::render::overlay_state::RasterizeContext {
                     is_dark: self.cached_dark_theme.unwrap_or(false),
                     zoom: zoom as f64 / 32.0,
@@ -392,7 +391,7 @@ impl super::App {
             }
             // Non-texture overlay kinds are never dispatched for background rendering.
             OverlayKind::Radar | OverlayKind::CityLabels
-            | OverlayKind::UserLocation => {
+            | OverlayKind::UserLocation | OverlayKind::Metar => {
                 log::warn!("spawn_overlay_render called with non-texture kind: {:?}", kind);
             }
         }

@@ -3,6 +3,8 @@ use crate::overlay_cache::{
     viewport_geo_bounds, current_quantized_zoom, draw_overlay_texture,
     OVERDRAW_FRACTION,
 };
+use crate::point_painter::EguiPointPainter;
+use rustdar_overlays::render::draw::{DrawPointContext, HoverContext};
 use rustdar_overlays::render::layers::LayerKind;
 use rustdar_overlays::render::overlay_state::{OverlayRegistry, OverlayKind, SelectedOverlay};
 use crate::pane::{PaneState, RadarImageData};
@@ -85,12 +87,24 @@ pub(super) fn render_pane_map_content(
                 OverlayKind::SpcOutlook
                 | OverlayKind::SpcDiscussions
                 | OverlayKind::NwsAlerts
-                | OverlayKind::StormReports
-                | OverlayKind::Metar => {
+                | OverlayKind::StormReports => {
                     let items = ctx.overlays.clickable_items(kind, &ctx.pane.layers);
                     selected.extend(overlay_ctx.draw_overlay(
                         ctx.pane.overlay_cache(kind),
                         &items,
+                    ));
+                }
+                // Per-frame point overlay: METAR station model plots
+                OverlayKind::Metar => {
+                    selected.extend(render_per_frame_overlay(
+                        ui,
+                        projector,
+                        ctx.overlays,
+                        kind,
+                        zoom,
+                        ctx.preferences,
+                        ctx.overlay_click_pos,
+                        &ctx.excluded_rects,
                     ));
                 }
                 // Radar image layer — drawn from overlay texture cache
@@ -456,4 +470,101 @@ fn render_user_location(
             egui::Color32::from_rgb(30, 130, 255),
         );
     }
+}
+
+/// Per-frame rendering for point overlays (e.g. METAR station model plots).
+///
+/// Projects each point onto the screen, culls off-screen points, calls the
+/// handler's `draw_point()` via an `EguiPointPainter`, and handles click/hover
+/// detection using the handler-provided hit radius.
+fn render_per_frame_overlay(
+    ui: &egui::Ui,
+    projector: &walkers::Projector,
+    overlays: &OverlayRegistry,
+    kind: OverlayKind,
+    zoom: f64,
+    prefs: &UserPreferences,
+    overlay_click_pos: Option<egui::Pos2>,
+    excluded_rects: &[egui::Rect],
+) -> Vec<SelectedOverlay> {
+    let points = overlays.per_frame_points(kind);
+    if points.is_empty() {
+        return Vec::new();
+    }
+
+    let zoom_f32 = zoom as f32;
+    let is_dark = ui.ctx().style().visuals.dark_mode;
+    let draw_ctx = DrawPointContext { zoom: zoom_f32, is_dark };
+    let hit_radius = overlays.point_hit_radius(kind, zoom_f32);
+    let hover_ctx = HoverContext { prefs };
+
+    let screen_rect = ui.max_rect();
+    let margin = hit_radius + 40.0; // extra margin for station model elements
+    let expanded = screen_rect.expand(margin);
+
+    let painter = ui.painter();
+    let hover_pos = ui.ctx().pointer_hover_pos();
+
+    let mut selected = Vec::new();
+    let mut closest_hover: Option<(f32, u32)> = None; // (distance², id)
+
+    for pt in points {
+        let screen = projector
+            .project(walkers::lat_lon(pt.lat, pt.lon))
+            .to_pos2();
+
+        if !expanded.contains(screen) {
+            continue;
+        }
+
+        // Draw the point
+        let mut ep = EguiPointPainter {
+            painter,
+            center: screen,
+        };
+        overlays.draw_point(kind, pt.id, &mut ep, &draw_ctx);
+
+        // Click detection
+        if let Some(click_pos) = overlay_click_pos {
+            let dx = click_pos.x - screen.x;
+            let dy = click_pos.y - screen.y;
+            if dx * dx + dy * dy <= hit_radius * hit_radius {
+                let on_excluded = excluded_rects.iter().any(|r| r.contains(click_pos));
+                if !on_excluded {
+                    selected.push(pt.selection.clone());
+                }
+            }
+        }
+
+        // Hover detection
+        if let Some(hp) = hover_pos {
+            let dx = hp.x - screen.x;
+            let dy = hp.y - screen.y;
+            let d2 = dx * dx + dy * dy;
+            if d2 <= hit_radius * hit_radius {
+                if closest_hover.map_or(true, |(best_d2, _)| d2 < best_d2) {
+                    closest_hover = Some((d2, pt.id));
+                }
+            }
+        }
+    }
+
+    // Show tooltip for closest hovered point
+    if let Some((_, id)) = closest_hover {
+        if let Some(text) = overlays.hover_text(kind, id, &hover_ctx) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            #[allow(deprecated)]
+            egui::show_tooltip_at_pointer(
+                ui.ctx(),
+                ui.layer_id(),
+                egui::Id::new(("per_frame_overlay_hover", kind as u8)),
+                |tooltip_ui| {
+                    tooltip_ui.set_max_width(400.0);
+                    tooltip_ui.label(text);
+                },
+            );
+        }
+    }
+
+    selected
 }

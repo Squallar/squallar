@@ -3,11 +3,13 @@ use std::any::Any;
 use rustdar_units::UserPreferences;
 
 use crate::metar::types::MetarOb;
+use crate::render::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter};
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayKind, OverlayState,
     PopupContent, PopupSection, RasterizeContext, SelectedOverlay,
 };
-use crate::render::rasterize::{self, RasterizeOutput};
+use crate::render::rasterize::RasterizeOutput;
+use crate::render::station_model;
 use crate::types::GeoBounds;
 
 /// Type-erased fetch result for METAR observations.
@@ -15,13 +17,33 @@ pub(crate) struct MetarFetchResult(pub Result<Vec<MetarOb>, String>);
 
 pub(crate) struct MetarHandler {
     pub state: OverlayState<Vec<MetarOb>>,
+    cached_points: Vec<MapPoint>,
 }
 
 impl MetarHandler {
     pub fn new() -> Self {
         Self {
             state: OverlayState::new(),
+            cached_points: Vec::new(),
         }
+    }
+
+    /// Rebuild the `cached_points` vec from current observation data.
+    fn rebuild_points(&mut self) {
+        self.cached_points = self
+            .state
+            .data
+            .iter()
+            .enumerate()
+            .map(|(i, ob)| MapPoint {
+                lat: ob.lat,
+                lon: ob.lon,
+                id: i as u32,
+                selection: SelectedOverlay::Metar {
+                    station_id: ob.station_id.clone(),
+                },
+            })
+            .collect();
     }
 }
 
@@ -214,6 +236,7 @@ impl OverlayHandler for MetarHandler {
             }
         }
         self.state.fetching = false;
+        self.rebuild_points();
     }
 
     fn retain_selections(&self, selections: &mut Vec<SelectedOverlay>) {
@@ -234,17 +257,9 @@ impl OverlayHandler for MetarHandler {
 
     fn prepare_rasterize(
         &self,
-        ctx: &RasterizeContext,
+        _ctx: &RasterizeContext,
     ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>> {
-        if self.state.data.is_empty() {
-            return None;
-        }
-        let observations = self.state.data.clone();
-        let zoom = ctx.zoom;
-        let is_dark = ctx.is_dark;
-        Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            rasterize::rasterize_metar(&observations, bounds, width, height, zoom, is_dark)
-        }))
+        None // Metar uses per-frame rendering, not background rasterization
     }
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
@@ -257,5 +272,27 @@ impl OverlayHandler for MetarHandler {
                 Box::new(MetarFetchResult(result)) as Box<dyn Any + Send>
             }),
         }]
+    }
+
+    // ── Per-frame point rendering ─────────────────────────────────────
+
+    fn per_frame_points(&self) -> &[MapPoint] {
+        &self.cached_points
+    }
+
+    fn draw_point(&self, id: u32, painter: &mut dyn PointPainter, ctx: &DrawPointContext) {
+        if let Some(ob) = self.state.data.get(id as usize) {
+            station_model::draw_metar_station(ob, painter, ctx);
+        }
+    }
+
+    fn point_hit_radius(&self, zoom: f32) -> f32 {
+        station_model::hit_radius_for_zoom(zoom)
+    }
+
+    fn hover_text(&self, id: u32, ctx: &HoverContext<'_>) -> Option<String> {
+        self.state.data.get(id as usize).map(|ob| {
+            station_model::hover_text_for_metar(ob, ctx.prefs)
+        })
     }
 }

@@ -7,6 +7,7 @@ use rustdar_units::UserPreferences;
 use crate::nws::alert::AlertCategory;
 use crate::render::layers::LayerManager;
 use crate::spc::outlook::{OutlookDay, OutlookProduct};
+use crate::render::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter};
 use crate::render::rasterize::RasterizeOutput;
 use crate::types::{GeoBounds, OverlayFeature, OverlayLabel};
 
@@ -140,6 +141,22 @@ pub(crate) trait OverlayHandler {
 
     /// Create async fetch tasks for this overlay's data.
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask>;
+
+    // ── Per-frame point rendering (opt-in) ────────────────────────────
+
+    /// Return geographic points to be drawn per-frame by the UI crate.
+    /// Non-empty return opts this overlay into the per-frame rendering path.
+    fn per_frame_points(&self) -> &[MapPoint] { &[] }
+
+    /// Draw a single point using abstract drawing primitives.
+    /// Called by the UI crate for each visible point returned by `per_frame_points()`.
+    fn draw_point(&self, _id: u32, _painter: &mut dyn PointPainter, _ctx: &DrawPointContext) {}
+
+    /// Clickable radius in screen pixels for hit-testing around each point.
+    fn point_hit_radius(&self, _zoom: f32) -> f32 { 0.0 }
+
+    /// Tooltip text shown on hover. Return `None` to suppress the tooltip.
+    fn hover_text(&self, _id: u32, _ctx: &HoverContext<'_>) -> Option<String> { None }
 }
 
 /// Context for creating overlay fetch tasks.
@@ -285,6 +302,30 @@ impl OverlayRegistry {
     pub fn create_fetch_tasks(&self, kind: OverlayKind, ctx: &FetchConfig) -> Vec<FetchTask> {
         self.handler(kind).map_or_else(Vec::new, |h| h.create_fetch_tasks(ctx))
     }
+
+    // ── Per-frame point rendering delegates ───────────────────────────
+
+    /// Geographic points for per-frame rendering of the given overlay kind.
+    pub fn per_frame_points(&self, kind: OverlayKind) -> &[MapPoint] {
+        self.handler(kind).map_or(&[], |h| h.per_frame_points())
+    }
+
+    /// Draw a single point for the given overlay kind.
+    pub fn draw_point(&self, kind: OverlayKind, id: u32, painter: &mut dyn PointPainter, ctx: &DrawPointContext) {
+        if let Some(h) = self.handler(kind) {
+            h.draw_point(id, painter, ctx);
+        }
+    }
+
+    /// Clickable radius for the given overlay kind at the current zoom.
+    pub fn point_hit_radius(&self, kind: OverlayKind, zoom: f32) -> f32 {
+        self.handler(kind).map_or(0.0, |h| h.point_hit_radius(zoom))
+    }
+
+    /// Tooltip text for a point in the given overlay kind.
+    pub fn hover_text(&self, kind: OverlayKind, id: u32, ctx: &HoverContext<'_>) -> Option<String> {
+        self.handler(kind).and_then(|h| h.hover_text(id, ctx))
+    }
 }
 
 // ── Generic overlay kind ─────────────────────────────────────────────────
@@ -334,7 +375,6 @@ impl OverlayKind {
             OverlayKind::SpcDiscussions,
             OverlayKind::NwsAlerts,
             OverlayKind::StormReports,
-            OverlayKind::Metar,
             OverlayKind::RadarSites,
             OverlayKind::Radar,
         ]
@@ -342,7 +382,7 @@ impl OverlayKind {
 
     /// Whether this kind is a background-rasterized texture overlay.
     pub fn is_texture_overlay(self) -> bool {
-        matches!(self, OverlayKind::SpcOutlook | OverlayKind::SpcDiscussions | OverlayKind::NwsAlerts | OverlayKind::StormReports | OverlayKind::Metar | OverlayKind::RadarSites | OverlayKind::Radar)
+        matches!(self, OverlayKind::SpcOutlook | OverlayKind::SpcDiscussions | OverlayKind::NwsAlerts | OverlayKind::StormReports | OverlayKind::RadarSites | OverlayKind::Radar)
     }
 
     /// Default draw order (bottom to top) for a new pane.
