@@ -334,10 +334,86 @@ pub fn rasterize_radar_sites(
     pixmap.take()
 }
 
+// ── Storm report symbol helpers ───────────────────────────────────────
+
+/// Draw a tornado funnel symbol (inverted triangle) inside the circle.
+fn draw_tornado_symbol(pixmap: &mut Pixmap, px: f32, py: f32, r: f32, color: Color) {
+    let s = r * 0.6; // symbol half-size
+    let mut pb = PathBuilder::new();
+    // Inverted triangle: wide at top, narrow at bottom
+    pb.move_to(px - s, py - s * 0.7);
+    pb.line_to(px + s, py - s * 0.7);
+    pb.line_to(px, py + s * 0.9);
+    pb.close();
+    if let Some(path) = pb.finish() {
+        let mut paint = Paint::default();
+        paint.set_color(color);
+        paint.anti_alias = true;
+        pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    }
+}
+
+/// Draw a hail symbol (small filled circle with 4 radiating ticks).
+fn draw_hail_symbol(pixmap: &mut Pixmap, px: f32, py: f32, r: f32, color: Color) {
+    let core = r * 0.3;
+    let tick_inner = r * 0.35;
+    let tick_outer = r * 0.65;
+    let stroke_w = (r * 0.18).clamp(0.5, 1.5);
+
+    // Small filled circle in center
+    let mut pb = PathBuilder::new();
+    pb.push_circle(px, py, core);
+    if let Some(path) = pb.finish() {
+        let mut paint = Paint::default();
+        paint.set_color(color);
+        paint.anti_alias = true;
+        pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    }
+
+    // 4 radiating ticks at 45° angles
+    let mut paint = Paint::default();
+    paint.set_color(color);
+    paint.anti_alias = true;
+    let stroke = Stroke { width: stroke_w, line_cap: LineCap::Round, ..Stroke::default() };
+    let diag = std::f32::consts::FRAC_1_SQRT_2;
+    let offsets: [(f32, f32); 4] = [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)];
+    for (dx, dy) in offsets {
+        // Use diagonal offsets for a spiky look
+        let (adx, ady) = if dx.abs() > 0.5 { (dx, diag * dy.signum().max(0.3)) } else { (diag * dx.signum().max(0.3), dy) };
+        let _ = ady; let _ = adx;
+        let mut pb = PathBuilder::new();
+        pb.move_to(px + dx * tick_inner, py + dy * tick_inner);
+        pb.line_to(px + dx * tick_outer, py + dy * tick_outer);
+        if let Some(path) = pb.finish() {
+            pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+        }
+    }
+}
+
+/// Draw a wind symbol (right-pointing chevron/arrow).
+fn draw_wind_symbol(pixmap: &mut Pixmap, px: f32, py: f32, r: f32, color: Color) {
+    let s = r * 0.55;
+    let stroke_w = (r * 0.22).clamp(0.5, 2.0);
+
+    let mut pb = PathBuilder::new();
+    // Chevron: top-left to center-right to bottom-left
+    pb.move_to(px - s * 0.5, py - s);
+    pb.line_to(px + s * 0.5, py);
+    pb.line_to(px - s * 0.5, py + s);
+    if let Some(path) = pb.finish() {
+        let mut paint = Paint::default();
+        paint.set_color(color);
+        paint.anti_alias = true;
+        let stroke = Stroke { width: stroke_w, line_cap: LineCap::Round, ..Stroke::default() };
+        pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    }
+}
+
 /// Rasterize SPC storm report markers to an RGBA texture.
 ///
-/// Draws filled circles at each report location, colour-coded by type:
-/// tornado = red, hail = green, wind = blue. Includes white outlines.
+/// Draws circles with weather-type symbols at each report location,
+/// colour-coded by type: tornado = red, hail = green, wind = blue.
+/// At low zoom (small radius), falls back to filled dots.
 pub fn rasterize_storm_reports(
     reports: &[StormReport],
     bounds: &GeoBounds,
@@ -382,17 +458,34 @@ pub fn rasterize_storm_reports(
             StormReportKind::Wind => Color::from_rgba8(40, 80, 220, 220),
         };
 
+        let use_symbol = radius >= 5.0;
+
         let mut pb = PathBuilder::new();
         pb.push_circle(px, py, radius);
         if let Some(path) = pb.finish() {
             let mut paint = Paint::default();
-            paint.set_color(fill);
             paint.anti_alias = true;
-            pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
 
-            paint.set_color(outline);
-            let stroke = Stroke { width: stroke_w, ..Stroke::default() };
-            pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+            if use_symbol {
+                // Outline-only circle with symbol inside
+                paint.set_color(fill);
+                let stroke = Stroke { width: stroke_w, ..Stroke::default() };
+                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+
+                match report.kind {
+                    StormReportKind::Tornado => draw_tornado_symbol(&mut pixmap, px, py, radius, fill),
+                    StormReportKind::Hail => draw_hail_symbol(&mut pixmap, px, py, radius, fill),
+                    StormReportKind::Wind => draw_wind_symbol(&mut pixmap, px, py, radius, fill),
+                }
+            } else {
+                // Filled dot at low zoom (symbol too small to read)
+                paint.set_color(fill);
+                pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+
+                paint.set_color(outline);
+                let stroke = Stroke { width: stroke_w, ..Stroke::default() };
+                pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+            }
         }
 
         // Record hit cells for all quarter-res pixels within the hit radius.
