@@ -12,6 +12,7 @@ use tiny_skia::{
     Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, Transform,
 };
 
+use crate::metar::types::MetarOb;
 use crate::nws::alert::{AlertCategory, NwsAlert};
 use crate::render::overlay_state::SelectedOverlay;
 use crate::spc::colors::{md_fill_color, md_stroke_color};
@@ -404,6 +405,106 @@ pub fn rasterize_storm_reports(
         let max_y = ((py + hit_radius) as i32).min(height as i32 - 1);
         let r2 = hit_radius * hit_radius;
         // Step by 4 since we only need one sample per quarter-res cell.
+        let mut sy = min_y;
+        while sy <= max_y {
+            let mut sx = min_x;
+            while sx <= max_x {
+                let dx = sx as f32 - px;
+                let dy = sy as f32 - py;
+                if dx * dx + dy * dy <= r2 {
+                    hit_map.record(sx as f32, sy as f32, item_id);
+                }
+                sx += 4;
+            }
+            sy += 4;
+        }
+    }
+
+    premultiplied_to_straight(pixmap.data_mut());
+    RasterizeOutput {
+        rgba: pixmap.take(),
+        hit_map: Some(hit_map),
+    }
+}
+
+/// Rasterize METAR surface observation station markers to an RGBA texture.
+///
+/// Draws filled circles at each station location, colour-coded by flight category:
+/// VFR = green, MVFR = blue, IFR = red, LIFR = magenta. Includes theme-aware outlines.
+pub fn rasterize_metar(
+    observations: &[MetarOb],
+    bounds: &GeoBounds,
+    width: u32,
+    height: u32,
+    zoom: f64,
+    is_dark: bool,
+) -> RasterizeOutput {
+    let Some(mut pixmap) = Pixmap::new(width, height) else {
+        return RasterizeOutput {
+            rgba: vec![0u8; (width * height * 4) as usize],
+            hit_map: None,
+        };
+    };
+    let mb = MercatorBounds::from_geo(bounds);
+    let w = width as f32;
+    let h = height as f32;
+
+    let zoom_f32 = zoom as f32;
+    let radius = (3.0 + zoom_f32 * 0.4).clamp(3.0, 9.0);
+    let stroke_w = (radius * 0.3).clamp(0.5, 2.0);
+    let hit_radius = radius + stroke_w;
+
+    let outline = if is_dark {
+        Color::from_rgba8(255, 255, 255, 200)
+    } else {
+        Color::from_rgba8(40, 40, 40, 200)
+    };
+
+    // Default color when flight category is unknown.
+    let default_color = Color::from_rgba8(150, 150, 150, 220);
+
+    let mut hit_map = HitMap::new(width, height);
+
+    for (idx, ob) in observations.iter().enumerate() {
+        let (px, py) = mb.project(ob.lat, ob.lon, w, h);
+        if px < -20.0 || px > w + 20.0 || py < -20.0 || py > h + 20.0 {
+            continue;
+        }
+
+        let fill = ob
+            .flight_category
+            .map(|fc| {
+                let c = fc.color_rgba();
+                Color::from_rgba8(c[0], c[1], c[2], c[3])
+            })
+            .unwrap_or(default_color);
+
+        let mut pb = PathBuilder::new();
+        pb.push_circle(px, py, radius);
+        if let Some(path) = pb.finish() {
+            let mut paint = Paint::default();
+            paint.set_color(fill);
+            paint.anti_alias = true;
+            pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+
+            paint.set_color(outline);
+            let stroke = Stroke { width: stroke_w, ..Stroke::default() };
+            pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+        }
+
+        // Record hit cells for click detection.
+        let item_id = idx as u32;
+        hit_map.register_id(
+            item_id,
+            SelectedOverlay::Metar {
+                station_id: ob.station_id.clone(),
+            },
+        );
+        let min_x = (px - hit_radius).max(0.0) as i32;
+        let max_x = ((px + hit_radius) as i32).min(width as i32 - 1);
+        let min_y = (py - hit_radius).max(0.0) as i32;
+        let max_y = ((py + hit_radius) as i32).min(height as i32 - 1);
+        let r2 = hit_radius * hit_radius;
         let mut sy = min_y;
         while sy <= max_y {
             let mut sx = min_x;

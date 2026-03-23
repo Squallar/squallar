@@ -92,7 +92,7 @@ Feature comparison across weather platforms. ✅ = implemented, ❌ = not implem
 
 |            Feature             |  GR2A   | RadarScope | Rustdar |
 | ------------------------------ | ------- | ---------- | ------- |
-| METAR/ASOS station plots       | Overlay | ❌         | ❌      |
+| METAR/ASOS station plots       | Overlay | ❌         | ✅      |
 | Personal weather stations      | ❌      | ❌         | ❌      |
 | Mesonet data (OK, etc.)        | Overlay | ❌         | ❌      |
 | Buoy / marine obs              | ❌      | ❌         | ❌      |

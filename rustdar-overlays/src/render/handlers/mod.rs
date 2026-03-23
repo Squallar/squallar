@@ -1,5 +1,6 @@
 mod alert;
 mod discussion;
+mod metar;
 mod outlook;
 mod reports;
 
@@ -12,5 +13,6 @@ pub(crate) fn create_handlers() -> Vec<Box<dyn OverlayHandler>> {
         Box::new(discussion::SpcDiscussionHandler::new()),
         Box::new(alert::NwsAlertHandler::new()),
         Box::new(reports::StormReportsHandler::new()),
+        Box::new(metar::MetarHandler::new()),
     ]
 }

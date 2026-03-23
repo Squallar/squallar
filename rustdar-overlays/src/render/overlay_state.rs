@@ -66,6 +66,8 @@ pub enum SelectedOverlay {
     Outlook { label: String },
     /// An SPC storm report, identified by its index in the reports list.
     StormReport { index: usize },
+    /// A METAR surface observation, identified by station ICAO ID.
+    Metar { station_id: String },
 }
 
 /// An overlay item that can be clicked and optionally labelled on the map.
@@ -302,6 +304,7 @@ pub enum OverlayKind {
     SpcDiscussions,
     NwsAlerts,
     StormReports,
+    Metar,
     Radar,
     CityLabels,
     RadarSites,
@@ -317,6 +320,7 @@ impl OverlayKind {
             OverlayKind::SpcDiscussions,
             OverlayKind::NwsAlerts,
             OverlayKind::StormReports,
+            OverlayKind::Metar,
             OverlayKind::CityLabels,
             OverlayKind::RadarSites,
             OverlayKind::UserLocation,
@@ -330,6 +334,7 @@ impl OverlayKind {
             OverlayKind::SpcDiscussions,
             OverlayKind::NwsAlerts,
             OverlayKind::StormReports,
+            OverlayKind::Metar,
             OverlayKind::RadarSites,
             OverlayKind::Radar,
         ]
@@ -337,7 +342,7 @@ impl OverlayKind {
 
     /// Whether this kind is a background-rasterized texture overlay.
     pub fn is_texture_overlay(self) -> bool {
-        matches!(self, OverlayKind::SpcOutlook | OverlayKind::SpcDiscussions | OverlayKind::NwsAlerts | OverlayKind::StormReports | OverlayKind::RadarSites | OverlayKind::Radar)
+        matches!(self, OverlayKind::SpcOutlook | OverlayKind::SpcDiscussions | OverlayKind::NwsAlerts | OverlayKind::StormReports | OverlayKind::Metar | OverlayKind::RadarSites | OverlayKind::Radar)
     }
 
     /// Default draw order (bottom to top) for a new pane.
@@ -358,6 +363,7 @@ impl OverlayKind {
             }
             OverlayKind::NwsAlerts => layers.any_nws_enabled(),
             OverlayKind::StormReports => layers.is_enabled(LayerKind::StormReports),
+            OverlayKind::Metar => layers.is_enabled(LayerKind::Metar),
             OverlayKind::Radar => layers.is_enabled(LayerKind::Radar),
             OverlayKind::CityLabels => layers.is_enabled(LayerKind::CityLabels),
             OverlayKind::RadarSites => layers.is_enabled(LayerKind::RadarSites),

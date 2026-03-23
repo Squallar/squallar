@@ -58,7 +58,7 @@ This document details which data sources are needed for this project. Not all ar
 
 |                Data Source                 | Status |
 | ------------------------------------------ | ------ |
-| METAR/ASOS (surface obs)                   | ❌     |
+| METAR/ASOS (surface obs)                   | ✅     |
 | Upper-air soundings (RAOB)                 | ❌     |
 | Mesonets (state/regional surface networks) | ❌     |
 | Buoy / Marine obs                          | ❌     |

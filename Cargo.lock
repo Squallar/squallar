@@ -3796,6 +3796,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "earcutr",
+ "flate2",
  "futures",
  "log",
  "openssl-sys",

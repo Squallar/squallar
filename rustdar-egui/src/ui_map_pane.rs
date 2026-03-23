@@ -85,7 +85,8 @@ pub(super) fn render_pane_map_content(
                 OverlayKind::SpcOutlook
                 | OverlayKind::SpcDiscussions
                 | OverlayKind::NwsAlerts
-                | OverlayKind::StormReports => {
+                | OverlayKind::StormReports
+                | OverlayKind::Metar => {
                     let items = ctx.overlays.clickable_items(kind, &ctx.pane.layers);
                     selected.extend(overlay_ctx.draw_overlay(
                         ctx.pane.overlay_cache(kind),

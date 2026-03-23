@@ -456,6 +456,7 @@ impl Gui {
         ui.checkbox(pane.layers.enabled_mut(LayerKind::CityLabels), "\u{1f3f7}  City Labels");
         ui.checkbox(pane.layers.enabled_mut(LayerKind::RadarSites), "\u{1f4e1}  Radar Sites");
         ui.checkbox(pane.layers.enabled_mut(LayerKind::StormReports), "\u{26a1}  Storm Reports");
+        ui.checkbox(pane.layers.enabled_mut(LayerKind::Metar), "\u{1f321}  METAR");
     }
 
     /// Render radar layer toggle with product/elevation combo boxes.
@@ -1069,6 +1070,7 @@ impl Gui {
     pub fn is_auto_poll_active(&self) -> bool {
         self.auto_poll.is_active()
             || self.panes.iter().any(|p| p.layers.any_nws_enabled())
+            || self.panes.iter().any(|p| p.layers.is_enabled(LayerKind::Metar))
     }
 
     /// Whether any pane has a loop that is playing or has in-flight work.

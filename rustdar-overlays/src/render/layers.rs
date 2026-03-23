@@ -15,6 +15,7 @@ pub enum LayerKind {
     NwsWatches,
     NwsAdvisories,
     StormReports,
+    Metar,
     CityLabels,
     RadarSites,
 }
@@ -34,6 +35,7 @@ impl LayerKind {
             LayerKind::NwsWatches,
             LayerKind::NwsAdvisories,
             LayerKind::StormReports,
+            LayerKind::Metar,
             LayerKind::CityLabels,
             LayerKind::RadarSites,
         ]
@@ -53,6 +55,7 @@ impl LayerKind {
             LayerKind::NwsWatches => "Watches",
             LayerKind::NwsAdvisories => "Advisories",
             LayerKind::StormReports => "Storm Reports",
+            LayerKind::Metar => "METAR",
             LayerKind::CityLabels => "City Labels",
             LayerKind::RadarSites => "Radar Sites",
         }
@@ -142,6 +145,7 @@ impl LayerManager {
         layers.insert(LayerKind::NwsAdvisories, LayerState::new(true));
         layers.insert(LayerKind::NwsWarnings, LayerState::new(true));
         layers.insert(LayerKind::StormReports, LayerState::new(false));
+        layers.insert(LayerKind::Metar, LayerState::new(false));
         layers.insert(LayerKind::CityLabels, LayerState::new(true));
         layers.insert(LayerKind::RadarSites, LayerState::new(false));
 
