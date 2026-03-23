@@ -133,7 +133,7 @@ impl super::Gui {
         let current = self.overlays.selected_overlays[page].clone();
 
         // Build popup content from overlay data — if the item no longer exists, remove it
-        let Some(content) = self.overlays.popup_content(&current) else {
+        let Some(content) = self.overlays.popup_content(&current, &self.preferences) else {
             self.overlays.selected_overlays.remove(page);
             if self.overlays.selected_overlays.is_empty() {
                 self.overlays.selected_overlay_page = 0;

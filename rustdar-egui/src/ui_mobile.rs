@@ -1,7 +1,8 @@
 #![cfg(target_os = "android")]
 
 use crate::actions::GuiAction;
-use crate::ui::{RadarImageData, PaneState};
+use crate::ui::{PaneState, UserPreferences};
+use crate::pane::{RadarImageData};
 use rustdar_radar::types::ImageBounds;
 
 /// Maximum time (seconds) between first tap release and second press
@@ -194,8 +195,9 @@ pub fn draw_long_press_tooltip(
     img: &RadarImageData,
     touch_pos: egui::Pos2,
     pane: &PaneState,
+    prefs: &UserPreferences,
 ) {
-    draw_long_press_tooltip_raw(ui, projector, &img.value_data, img.lat, img.lon, touch_pos, pane);
+    draw_long_press_tooltip_raw(ui, projector, &img.value_data, img.lat, img.lon, touch_pos, pane, prefs);
 }
 
 pub fn draw_long_press_tooltip_raw(
@@ -206,6 +208,7 @@ pub fn draw_long_press_tooltip_raw(
     lon: f64,
     touch_pos: egui::Pos2,
     pane: &PaneState,
+    prefs: &UserPreferences,
 ) {
     use rustdar_radar::types::IMAGE_SIZE;
 
@@ -231,7 +234,7 @@ pub fn draw_long_press_tooltip_raw(
         if pixel_idx < value_data.len() {
             let value = value_data[pixel_idx];
             if !value.is_nan() {
-                text = pane.selected_product.format_value(value);
+                text = pane.selected_product.format_value(value, prefs);
             }
         }
     }
@@ -409,7 +412,7 @@ impl super::Gui {
                     } else if let Some(scan_info) = self.panes.get(self.active_pane).and_then(|p| p.scan_info.as_ref()) {
                         ui.label(format!("{} @ {}",
                             scan_info.site.name,
-                            scan_info.timestamp.format("%H:%M")
+                            self.preferences.timezone.format_naive_utc(scan_info.timestamp, "%H:%M")
                         ));
                     } else {
                         ui.label("No scan loaded");
@@ -488,6 +491,12 @@ impl super::Gui {
                     if ui.button("\u{1f550}  Set Time...").clicked() {
                         self.time_dialog.show = true;
                         self.mobile.show_menu = false; // close menu so dialog is visible
+                    }
+
+                    // Settings
+                    if ui.button("\u{2699}\u{fe0f}  Settings...").clicked() {
+                        self.show_settings = true;
+                        self.mobile.show_menu = false;
                     }
 
                     // Auto-poll

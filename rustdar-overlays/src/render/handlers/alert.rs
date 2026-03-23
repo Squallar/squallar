@@ -6,7 +6,7 @@ use crate::render::layers::LayerManager;
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayKind, OverlayState,
     PopupAction, PopupActionKind, PopupContent, PopupSection, RasterizeContext,
-    SelectedOverlay, format_iso_time,
+    SelectedOverlay,
 };
 use crate::render::rasterize::{self, RasterizeOutput};
 use crate::types::GeoBounds;
@@ -77,7 +77,7 @@ impl OverlayHandler for NwsAlertHandler {
             .collect()
     }
 
-    fn popup_content(&self, selected: &SelectedOverlay) -> Option<PopupContent> {
+    fn popup_content(&self, selected: &SelectedOverlay, prefs: &rustdar_units::UserPreferences) -> Option<PopupContent> {
         let SelectedOverlay::Alert(alert_id) = selected else { return None };
         let alert = self.state.data.iter().find(|a| a.id == *alert_id)?;
         let [r, g, b, _] = alert.features.first()
@@ -93,8 +93,8 @@ impl OverlayHandler for NwsAlertHandler {
         sections.push(PopupSection::KeyValueGrid(vec![
             ("Areas".into(), alert.area_desc.clone()),
             ("Issued by".into(), alert.sender_name.clone()),
-            ("Effective".into(), format_iso_time(&alert.effective)),
-            ("Expires".into(), format_iso_time(&alert.expires)),
+            ("Effective".into(), prefs.timezone.format_rfc3339(&alert.effective)),
+            ("Expires".into(), prefs.timezone.format_rfc3339(&alert.expires)),
         ]));
 
         sections.push(PopupSection::Separator);

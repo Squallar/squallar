@@ -1,6 +1,7 @@
 use chrono::NaiveDateTime;
 use nexrad_model::data::Radial;
 use nexrad_model::data::Scan;
+use rustdar_units::UserPreferences;
 use std::collections::HashMap;
 use std::f64::consts::PI;
 use crate::sites::RadarSite;
@@ -357,22 +358,25 @@ impl RadarProduct {
     }
 
     /// Format a radar product value for display (e.g. in a hover tooltip).
-    pub fn format_value(&self, value: f32) -> String {
+    pub fn format_value(&self, value: f32, prefs: &UserPreferences) -> String {
         match self {
             RadarProduct::Reflectivity => format!("Reflectivity: {:.1} dBZ", value),
             RadarProduct::Velocity | RadarProduct::StormRelativeVelocity => {
-                let mph = value * MS_TO_MPH;
-                format!("{}: {:.1} mph", self.name(), mph)
+                let converted = prefs.speed.convert_from_ms(value);
+                format!("{}: {:.1} {}", self.name(), converted, prefs.speed.suffix())
             }
             RadarProduct::SpectrumWidth => {
-                let mph = value * MS_TO_MPH;
-                format!("Spectrum Width: {:.1} mph", mph)
+                let converted = prefs.speed.convert_from_ms(value);
+                format!("Spectrum Width: {:.1} {}", converted, prefs.speed.suffix())
             }
             RadarProduct::DifferentialReflectivity => format!("Diff. Reflectivity: {:.2} dB", value),
             RadarProduct::CorrelationCoefficient => format!("Corr. Coefficient: {:.4}", value),
             RadarProduct::DifferentialPhase => format!("Diff. Phase: {:.1}°", value),
             RadarProduct::SpecificDifferentialPhase => format!("KDP: {:.2} °/km", value),
-            RadarProduct::EchoTops => format!("Echo Tops: {:.1} kft", value),
+            RadarProduct::EchoTops => {
+                let converted = prefs.height.convert_kft_to_kilo(value);
+                format!("Echo Tops: {:.1} {}", converted, prefs.height.kilo_suffix())
+            }
             RadarProduct::VerticallyIntegratedLiquid => format!("VIL: {:.1} kg/m²", value),
             RadarProduct::HydrometeorClassification => {
                 let class = match value as u16 {
@@ -394,7 +398,10 @@ impl RadarProduct {
                 };
                 format!("HHC: {class}")
             }
-            RadarProduct::PrecipitationRate => format!("Precip Rate: {:.2} in/hr", value),
+            RadarProduct::PrecipitationRate => {
+                let converted = prefs.precip_rate.convert_from_in_per_hr(value);
+                format!("Precip Rate: {:.2} {}", converted, prefs.precip_rate.suffix())
+            }
             RadarProduct::NormalizedRotation => format!("NROT: {:.2}", value),
         }
     }

@@ -2,18 +2,13 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 
+use rustdar_units::UserPreferences;
+
 use crate::nws::alert::AlertCategory;
 use crate::render::layers::LayerManager;
 use crate::spc::outlook::{OutlookDay, OutlookProduct};
 use crate::render::rasterize::RasterizeOutput;
 use crate::types::{GeoBounds, OverlayFeature, OverlayLabel};
-
-/// Format an ISO 8601 timestamp into a shorter human-readable form.
-pub(crate) fn format_iso_time(iso: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(iso)
-        .map(|dt| dt.format("%b %d %Y %H:%M %Z").to_string())
-        .unwrap_or_else(|_| iso.to_string())
-}
 
 /// Generic wrapper for overlay data that follows the fetch-cache-generation pattern.
 ///
@@ -123,7 +118,7 @@ pub(crate) trait OverlayHandler {
 
     /// Build popup content for a selected overlay item.
     /// Returns `None` if this handler doesn't own the given selection.
-    fn popup_content(&self, selected: &SelectedOverlay) -> Option<PopupContent>;
+    fn popup_content(&self, selected: &SelectedOverlay, prefs: &UserPreferences) -> Option<PopupContent>;
 
     /// Handle a popup action button. Returns `true` if the item should be removed.
     fn handle_popup_action(&mut self, _action: &PopupAction) -> bool { false }
@@ -249,8 +244,8 @@ impl OverlayRegistry {
     }
 
     /// Build popup content by asking each handler until one claims the selection.
-    pub fn popup_content(&self, selected: &SelectedOverlay) -> Option<PopupContent> {
-        self.handlers.iter().find_map(|h| h.popup_content(selected))
+    pub fn popup_content(&self, selected: &SelectedOverlay, prefs: &UserPreferences) -> Option<PopupContent> {
+        self.handlers.iter().find_map(|h| h.popup_content(selected, prefs))
     }
 
     /// Execute a popup action by routing to each handler.

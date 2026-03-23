@@ -84,7 +84,7 @@ impl OverlayHandler for SpcDiscussionHandler {
             .collect()
     }
 
-    fn popup_content(&self, selected: &SelectedOverlay) -> Option<PopupContent> {
+    fn popup_content(&self, selected: &SelectedOverlay, _prefs: &rustdar_units::UserPreferences) -> Option<PopupContent> {
         let SelectedOverlay::Discussion(md_number) = selected else { return None };
         let md = self.state.data.iter().find(|d| d.number == *md_number)?;
         let [r, g, b, _] = md_stroke_color(&md.md_type);

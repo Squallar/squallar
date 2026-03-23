@@ -1,5 +1,6 @@
 #![cfg(not(target_os = "android"))]
 
+use rustdar_units::UserPreferences;
 use crate::actions::GuiAction;
 use rustdar_overlays::render::layers::LayerKind;
 use crate::pane::PaneState;
@@ -27,12 +28,12 @@ fn render_auto_poll_status(
     }
 }
 
-fn render_scan_info(ui: &mut egui::Ui, scan_info: Option<&ScanInfo>) {
+fn render_scan_info(ui: &mut egui::Ui, scan_info: Option<&ScanInfo>, prefs: &UserPreferences) {
     if let Some(scan_info) = scan_info {
         ui.label(format!(
-            "Scan: {} @ {} UTC ({} products)",
+            "Scan: {} @ {} ({} products)",
             scan_info.site.name,
-            scan_info.timestamp.format("%Y-%m-%d %H:%M:%S"),
+            prefs.timezone.format_naive_utc(scan_info.timestamp, "%Y-%m-%d %H:%M:%S"),
             scan_info.available_products.len()
         ));
     } else {
@@ -83,6 +84,10 @@ impl super::Gui {
                         self.time_dialog.show = true;
                         ui.close_kind(egui::UiKind::Menu);
                     }
+                    if ui.button("Settings...").clicked() {
+                        self.show_settings = true;
+                        ui.close_kind(egui::UiKind::Menu);
+                    }
                 });
             });
         });
@@ -113,7 +118,7 @@ impl super::Gui {
 
                     ui.separator();
 
-                    render_scan_info(ui, self.panes.get(self.active_pane).and_then(|p| p.scan_info.as_ref()));
+                    render_scan_info(ui, self.panes.get(self.active_pane).and_then(|p| p.scan_info.as_ref()), &self.preferences);
 
                     ui.separator();
 

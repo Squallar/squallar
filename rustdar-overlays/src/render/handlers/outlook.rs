@@ -85,7 +85,7 @@ impl OverlayHandler for SpcOutlookHandler {
         items
     }
 
-    fn popup_content(&self, selected: &SelectedOverlay) -> Option<PopupContent> {
+    fn popup_content(&self, selected: &SelectedOverlay, _prefs: &rustdar_units::UserPreferences) -> Option<PopupContent> {
         let SelectedOverlay::Outlook { label } = selected else { return None };
         Some(PopupContent {
             title: format!("SPC Outlook: {label}"),

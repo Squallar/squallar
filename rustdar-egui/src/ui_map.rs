@@ -2,6 +2,7 @@ use crate::actions::GuiAction;
 use crate::tiles::MapTileState;
 use egui::Context;
 use rustdar_radar::types::{RadarProduct, IMAGE_SIZE};
+use rustdar_units::UserPreferences;
 
 #[path = "ui_map_pane.rs"]
 mod pane_render;
@@ -174,6 +175,7 @@ impl super::Gui {
                                 #[cfg(target_os = "android")]
                                 long_press_pos,
                                 overlay_click_pos,
+                                preferences: &self.preferences,
                             };
 
                             pane_render::render_pane_map_content(ui, projector, zoom, &mut render_ctx);
@@ -290,6 +292,7 @@ pub(super) fn compute_hover_info_raw(
     hover_pos: egui::Pos2,
     rect: egui::Rect,
     product: RadarProduct,
+    prefs: &UserPreferences,
 ) -> String {
     let lat1 = site_lat.to_radians();
     let lon1 = site_lon.to_radians();
@@ -316,13 +319,15 @@ pub(super) fn compute_hover_info_raw(
         if pixel_idx < value_data.len() {
             let value = value_data[pixel_idx];
             if !value.is_nan() {
-                value_str = format!("| {}", product.format_value(value));
+                value_str = format!("| {}", product.format_value(value, prefs));
             }
         }
     }
 
+    let distance = prefs.distance.convert_from_km(distance_km);
+
     format!(
-        "Lat: {:.4}°, Lon: {:.4}° | Range: {:.1}km, Az: {:.1}° {}",
-        hover_lat, hover_lon, distance_km, azimuth, value_str
+        "Lat: {:.4}\u{b0}, Lon: {:.4}\u{b0} | Range: {:.1}{}, Az: {:.1}\u{b0} {}",
+        hover_lat, hover_lon, distance, prefs.distance.suffix(), azimuth, value_str
     )
 }

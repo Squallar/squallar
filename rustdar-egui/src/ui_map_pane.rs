@@ -6,6 +6,7 @@ use crate::overlay_cache::{
 use rustdar_overlays::render::layers::LayerKind;
 use rustdar_overlays::render::overlay_state::{OverlayRegistry, OverlayKind, SelectedOverlay};
 use crate::pane::{PaneState, RadarImageData};
+use rustdar_units::UserPreferences;
 
 use rustdar_radar::sites::RADARS;
 use rustdar_radar::types::{MAX_RANGE_KM, ImageBounds};
@@ -30,6 +31,8 @@ pub(super) struct PaneRenderCtx<'a> {
     /// click occurred this frame. On desktop this comes from egui's `any_click()`;
     /// on Android from the deferred single-tap detector.
     pub overlay_click_pos: Option<egui::Pos2>,
+    /// User unit and timezone preferences.
+    pub preferences: &'a UserPreferences,
 }
 
 /// Render the map content for a single pane (SPC/NWS overlays, radar image,
@@ -94,7 +97,7 @@ pub(super) fn render_pane_map_content(
                     // Loop playback: draw the active loop frame instead
                     if ctx.pane.loop_state.multi_frame {
                         if let Some(img) = ctx.pane.active_image().cloned() {
-                            render_radar_overlay(ui, projector, &img, ctx.pane, ctx.pane_rect);
+                            render_radar_overlay(ui, projector, &img, ctx.pane, ctx.pane_rect, ctx.preferences);
                         }
                     } else {
                         // Extract metadata before drawing (avoids borrow conflict)
@@ -113,7 +116,7 @@ pub(super) fn render_pane_map_content(
                             render_radar_range_ring(ui, projector, lat, lon);
                             update_pane_hover_value_from_meta(
                                 ui, projector, &value_data, lat, lon,
-                                ctx.pane, ctx.pane_rect,
+                                ctx.pane, ctx.pane_rect, ctx.preferences,
                             );
                         }
                     }
@@ -139,6 +142,7 @@ pub(super) fn render_pane_map_content(
                         ctx.pane,
                         ctx.actions,
                         ctx.pane_idx,
+                        ctx.preferences,
                     );
                 }
                 // User location blue dot
@@ -210,10 +214,10 @@ pub(super) fn render_pane_map_content(
                 .map(|m| (m.lat, m.lon, std::sync::Arc::clone(&m.value_data)));
             if let Some((lat, lon, value_data)) = raw_meta {
                 crate::ui::mobile::draw_long_press_tooltip_raw(
-                    ui, projector, &value_data, lat, lon, touch_pos, ctx.pane,
+                    ui, projector, &value_data, lat, lon, touch_pos, ctx.pane, ctx.preferences,
                 );
             } else if let Some(img) = ctx.pane.active_image().cloned() {
-                crate::ui::mobile::draw_long_press_tooltip(ui, projector, &img, touch_pos, ctx.pane);
+                crate::ui::mobile::draw_long_press_tooltip(ui, projector, &img, touch_pos, ctx.pane, ctx.preferences);
             }
         }
     }
@@ -226,6 +230,7 @@ fn render_radar_overlay(
     img: &RadarImageData,
     pane: &mut PaneState,
     pane_rect: egui::Rect,
+    prefs: &UserPreferences,
 ) {
     let bounds = ImageBounds::from_radar_site(img.lat, img.lon);
 
@@ -245,7 +250,7 @@ fn render_radar_overlay(
     );
 
     render_radar_range_ring(ui, projector, img.lat, img.lon);
-    update_pane_hover_value_from_meta(ui, projector, &img.value_data, img.lat, img.lon, pane, pane_rect);
+    update_pane_hover_value_from_meta(ui, projector, &img.value_data, img.lat, img.lon, pane, pane_rect, prefs);
 }
 
 /// Draw only the range ring for a radar site (used with overlay-cache rendering).
@@ -281,6 +286,7 @@ fn update_pane_hover_value_from_meta(
     lon: f64,
     pane: &mut PaneState,
     pane_rect: egui::Rect,
+    prefs: &UserPreferences,
 ) {
     let bounds = ImageBounds::from_radar_site(lat, lon);
     let nw = projector
@@ -322,6 +328,7 @@ fn update_pane_hover_value_from_meta(
             hover_pos,
             image_rect,
             pane.selected_product,
+            prefs,
         ));
     }
 }
@@ -338,6 +345,7 @@ fn handle_radar_site_interactions(
     pane: &mut PaneState,
     actions: &mut Vec<GuiAction>,
     pane_idx: usize,
+    prefs: &UserPreferences,
 ) {
     let screen_rect = ui.max_rect();
     let zoom_f32 = zoom as f32;
@@ -396,7 +404,10 @@ fn handle_radar_site_interactions(
             if icon_rect.contains(pos) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 let elev_str = match radar_site.elev {
-                    Some(e) => format!("{} ft", e),
+                    Some(e) => {
+                        let converted = prefs.height.convert_from_feet(e as f32);
+                        format!("{:.0} {}", converted, prefs.height.suffix())
+                    }
                     None => "N/A".to_string(),
                 };
                 let tooltip_text = format!(

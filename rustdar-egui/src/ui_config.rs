@@ -5,6 +5,7 @@ use rustdar_overlays::render::layers::LayerKind;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_overlays::spc::outlook::OutlookDay;
 use rustdar_radar::types::RadarProduct;
+use rustdar_units::UserPreferences;
 
 use super::{PaneLayout, PaneState, MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
 
@@ -79,6 +80,8 @@ struct UiConfig {
     time_step_secs: i64,
     /// Per-pane persistent state (product, elevation, layers).
     panes: Vec<PaneConfig>,
+    /// User unit/timezone preferences.
+    preferences: UserPreferences,
 }
 
 impl Default for UiConfig {
@@ -94,6 +97,7 @@ impl Default for UiConfig {
             loop_speed_fps: 5.0,
             time_step_secs: 600,
             panes: vec![PaneConfig::default()],
+            preferences: UserPreferences::default(),
         }
     }
 }
@@ -138,6 +142,7 @@ impl super::Gui {
             loop_speed_fps: fps,
             time_step_secs: self.panes.first().map(|p| p.time_step_secs).unwrap_or(600),
             panes: pane_configs,
+            preferences: self.preferences.clone(),
         };
         match serde_json::to_string_pretty(&config) {
             Ok(json) => {
@@ -194,6 +199,7 @@ impl super::Gui {
 
         self.loop_lookback_secs = config.loop_lookback_secs;
         self.loop_speed_fps = config.loop_speed_fps;
+        self.preferences = config.preferences;
 
         // Restore per-pane state.
         for (i, pane) in self.panes.iter_mut().enumerate().take(count) {

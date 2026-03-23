@@ -1,5 +1,7 @@
 use std::any::Any;
 
+use rustdar_units::UserPreferences;
+
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayKind, OverlayState,
     PopupContent, PopupSection, RasterizeContext, SelectedOverlay,
@@ -61,7 +63,7 @@ impl OverlayHandler for StormReportsHandler {
         Vec::new()
     }
 
-    fn popup_content(&self, selected: &SelectedOverlay) -> Option<PopupContent> {
+    fn popup_content(&self, selected: &SelectedOverlay, prefs: &UserPreferences) -> Option<PopupContent> {
         let SelectedOverlay::StormReport { index } = selected else { return None };
         let report = self.state.data.get(*index)?;
         let kind_str = match report.kind {
@@ -69,9 +71,27 @@ impl OverlayHandler for StormReportsHandler {
             StormReportKind::Hail => "Hail",
             StormReportKind::Wind => "Wind",
         };
-        // Format HHMM → "HH:MM UTC"
+        // Format HHMM → "HH:MM UTC" (or local equivalent)
         let formatted_time = if report.time.len() == 4 {
-            format!("{}:{} UTC", &report.time[..2], &report.time[2..])
+            let hhmm = format!("{}:{}", &report.time[..2], &report.time[2..]);
+            match prefs.timezone {
+                rustdar_units::TimezonePreference::Utc => format!("{hhmm} UTC"),
+                rustdar_units::TimezonePreference::Local => {
+                    // HHMM is in UTC; parse and convert
+                    if let (Ok(h), Ok(m)) = (report.time[..2].parse::<u32>(), report.time[2..].parse::<u32>()) {
+                        let today = chrono::Utc::now().date_naive();
+                        if let Some(naive) = today.and_hms_opt(h, m, 0) {
+                            let utc_dt = chrono::TimeZone::from_utc_datetime(&chrono::Utc, &naive);
+                            let local_dt = utc_dt.with_timezone(&chrono::Local);
+                            local_dt.format("%H:%M %Z").to_string()
+                        } else {
+                            format!("{hhmm} UTC")
+                        }
+                    } else {
+                        format!("{hhmm} UTC")
+                    }
+                }
+            }
         } else {
             format!("{} UTC", report.time)
         };
@@ -81,8 +101,15 @@ impl OverlayHandler for StormReportsHandler {
         if let Some(mag) = report.magnitude {
             let mag_text = match report.kind {
                 StormReportKind::Tornado => format!("F/EF Scale: {mag}"),
-                StormReportKind::Hail => format!("Size: {:.2}\"", mag / 100.0),
-                StormReportKind::Wind => format!("Speed: {mag} kt"),
+                StormReportKind::Hail => {
+                    let inches = (mag / 100.0) as f32;
+                    let converted = prefs.hail_size.convert_from_inches(inches);
+                    format!("Size: {converted:.2}{}", prefs.hail_size.suffix())
+                }
+                StormReportKind::Wind => {
+                    let converted = prefs.speed.convert_from_knots(mag as f32);
+                    format!("Speed: {converted:.0} {}", prefs.speed.suffix())
+                }
             };
             sections.push(PopupSection::Text(mag_text));
         }

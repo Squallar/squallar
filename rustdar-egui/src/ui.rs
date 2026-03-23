@@ -7,6 +7,7 @@ use chrono::Timelike;
 use egui::Context;
 use rustdar_radar::types::{RadarProduct, ScanInfo};
 use rustdar_overlays::spc::outlook::OutlookDay;
+use rustdar_units::UserPreferences;
 
 
 #[path = "ui_popups.rs"]
@@ -21,6 +22,8 @@ mod map_overlays;
 mod desktop;
 #[path = "ui_map.rs"]
 mod map;
+#[path = "ui_settings.rs"]
+mod settings;
 
 #[cfg(target_os = "android")]
 use mobile::{DoubleTapDragDetector, LongPressDetector};
@@ -130,6 +133,10 @@ pub struct Gui {
     // Safe area insets in logical pixels (top, bottom, left, right)
     // Used on Android to avoid drawing under system bars.
     safe_area_insets: (f32, f32, f32, f32),
+    /// User unit and timezone preferences.
+    pub preferences: UserPreferences,
+    /// Whether the settings panel is open.
+    pub show_settings: bool,
 }
 
 impl Default for Gui {
@@ -175,6 +182,8 @@ impl Gui {
             #[cfg(target_os = "android")]
             mobile: MobileState::default(),
             safe_area_insets: (0.0, 0.0, 0.0, 0.0),
+            preferences: UserPreferences::default(),
+            show_settings: false,
         }
     }
 
@@ -188,6 +197,8 @@ impl Gui {
         self.render_mobile_ui(ctx, &mut actions);
         #[cfg(not(target_os = "android"))]
         self.render_desktop_ui(ctx, &mut actions);
+
+        self.render_settings(ctx);
 
         actions
     }
@@ -735,7 +746,7 @@ impl Gui {
                         if let Some(frame) = ls.frames.get(ls.current_frame) {
                             ui.label(
                                 egui::RichText::new(
-                                    frame.timestamp.format("%H:%M:%S UTC").to_string()
+                                    self.preferences.timezone.format_naive_utc(frame.timestamp, "%H:%M:%S")
                                 ).small()
                             );
                         }
