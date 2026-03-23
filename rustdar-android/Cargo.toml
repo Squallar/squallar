@@ -19,6 +19,10 @@ theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
 [package.metadata.android.application]
 label = "Rustdar"
 
+[package.metadata.android.signing.release]
+path = "../rustdar.jks"
+keystore_password = "rustdar"
+
 [package.metadata.android.application.activity]
 config_changes = "orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|density|uiMode"
 
