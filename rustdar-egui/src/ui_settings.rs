@@ -1,6 +1,6 @@
 use rustdar_units::{
     DistanceUnit, HailSizeUnit, HeightUnit, PrecipRateUnit, SpeedUnit, TemperatureUnit,
-    TimezonePreference, UserPreferences,
+    TimezonePreference, UserPreferences, UnitLabel,
 };
 
 const IS_MOBILE: bool = cfg!(target_os = "android");
@@ -72,28 +72,4 @@ fn unit_combo<T: Copy + PartialEq + UnitLabel>(
                 }
             });
     });
-}
-
-/// Trait for label display on unit enums.
-trait UnitLabel {
-    fn display_label(self) -> &'static str;
-}
-
-impl UnitLabel for SpeedUnit {
-    fn display_label(self) -> &'static str { SpeedUnit::label(self) }
-}
-impl UnitLabel for DistanceUnit {
-    fn display_label(self) -> &'static str { DistanceUnit::label(self) }
-}
-impl UnitLabel for HeightUnit {
-    fn display_label(self) -> &'static str { HeightUnit::label(self) }
-}
-impl UnitLabel for PrecipRateUnit {
-    fn display_label(self) -> &'static str { PrecipRateUnit::label(self) }
-}
-impl UnitLabel for HailSizeUnit {
-    fn display_label(self) -> &'static str { HailSizeUnit::label(self) }
-}
-impl UnitLabel for TimezonePreference {
-    fn display_label(self) -> &'static str { TimezonePreference::label(self) }
 }

@@ -1,6 +1,10 @@
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
+pub trait UnitLabel {
+    fn display_label(self) -> &'static str;
+}
+
 // ————————————————————————————————————————————————————————————————————
 // Unit enums
 // ————————————————————————————————————————————————————————————————————
@@ -71,6 +75,11 @@ impl SpeedUnit {
     }
 }
 
+
+impl UnitLabel for SpeedUnit {
+    fn display_label(self) -> &'static str { SpeedUnit::label(self) }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum DistanceUnit {
     #[default]
@@ -110,6 +119,10 @@ impl DistanceUnit {
             DistanceUnit::NauticalMiles => "Nautical miles",
         }
     }
+}
+
+    impl UnitLabel for DistanceUnit {
+    fn display_label(self) -> &'static str { DistanceUnit::label(self) }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -169,6 +182,10 @@ impl HeightUnit {
     }
 }
 
+impl UnitLabel for HeightUnit {
+    fn display_label(self) -> &'static str { HeightUnit::label(self) }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum PrecipRateUnit {
     #[default]
@@ -204,6 +221,12 @@ impl PrecipRateUnit {
         }
     }
 }
+
+
+impl UnitLabel for PrecipRateUnit {
+    fn display_label(self) -> &'static str { PrecipRateUnit::label(self) }
+}
+
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum HailSizeUnit {
@@ -244,6 +267,10 @@ impl HailSizeUnit {
             HailSizeUnit::Millimeters => "Millimeters",
         }
     }
+}
+
+impl UnitLabel for HailSizeUnit {
+    fn display_label(self) -> &'static str { HailSizeUnit::label(self) }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -288,6 +315,10 @@ impl TemperatureUnit {
             TemperatureUnit::Celsius => "Celsius",
         }
     }
+}
+
+impl UnitLabel for TemperatureUnit {
+    fn display_label(self) -> &'static str { TemperatureUnit::label(self) }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -353,6 +384,11 @@ impl TimezonePreference {
             }
         }
     }
+}
+
+
+impl UnitLabel for TimezonePreference {
+    fn display_label(self) -> &'static str { TimezonePreference::label(self) }
 }
 
 // ————————————————————————————————————————————————————————————————————
