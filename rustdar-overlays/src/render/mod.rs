@@ -1,3 +1,4 @@
+pub mod controls;
 pub mod draw;
 pub mod geo;
 pub(crate) mod handlers;
