@@ -4,18 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-chrono = "0.4.42"
-log = "0.4.28"
+chrono = "=0.4.42"
+log = "=0.4.28"
 rustdar-units = { path = "../rustdar-units" }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "=1.0.228", features = ["derive"] }
 nexrad-data = { version = "=1.0.0-rc.5", features = ["aws"] }
 nexrad-model = "=1.0.0-rc.2"
 nexrad-decode = "=1.0.0-rc.3"
 nexrad-level3 = { path = "../nexrad-level3" }
-rayon = "1.10"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-thiserror = "2"
+rayon = "=1.11.0"
+reqwest = { version = "=0.12.24", default-features = false, features = ["rustls-tls"] }
+thiserror = "=2.0.17"
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Force vendored OpenSSL for Android builds to avoid cross-compilation issues
-openssl-sys = { version = "0.9", features = ["vendored"] }
+openssl-sys = { version = "=0.9.110", features = ["vendored"] }

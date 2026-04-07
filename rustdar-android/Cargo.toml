@@ -46,12 +46,12 @@ path = "src/lib.rs"
 
 [target.'cfg(target_os = "android")'.dependencies]
 rustdar-platform = { path = "../rustdar-platform" }
-android_logger = "0.14"
-winit = { version = "0.30.12", features = ["android-native-activity"] }
-pollster = "0.3"
-log = "0.4.28"
-jni = "0.21"
-ndk-context = "0.1"
-rustls-platform-verifier = "0.6"
+android_logger = "=0.14.1"
+winit = { version = "=0.30.12", features = ["android-native-activity"] }
+pollster = "=0.3.0"
+log = "=0.4.28"
+jni = "=0.21.1"
+ndk-context = "=0.1.1"
+rustls-platform-verifier = "=0.6.2"
 # Force vendored OpenSSL for Android builds to avoid cross-compilation issues
-openssl-sys = { version = "0.9", features = ["vendored"] }
+openssl-sys = { version = "=0.9.110", features = ["vendored"] }
