@@ -237,12 +237,9 @@ impl super::App {
     fn fetch_overlay(&mut self, kind: OverlayKind) {
         use rustdar_overlays::render::overlay_state::FetchConfig;
 
-        let pane = self.gui.active_pane();
         let config = FetchConfig {
             client: self.http_client.clone(),
             zone_cache_dir: self.platform.zone_cache_dir().map(|p| p.to_path_buf()),
-            spc_day: pane.layers.spc_day,
-            spc_products: pane.layers.enabled_spc_products(),
         };
 
         let tasks = self.gui.overlays.create_fetch_tasks(kind, &config);
@@ -283,7 +280,7 @@ impl super::App {
             return;
         }
 
-        if !kind.is_texture_overlay() {
+        if self.gui.overlays.render_mode(kind) != Some(rustdar_overlays::render::overlay_state::RenderMode::Texture) {
             log::warn!("spawn_overlay_render called with non-texture kind: {:?}", kind);
             return;
         }
@@ -323,9 +320,6 @@ impl super::App {
                 let rctx = rustdar_overlays::render::overlay_state::RasterizeContext {
                     is_dark: self.cached_dark_theme.unwrap_or(false),
                     zoom: zoom as f64 / 32.0,
-                    spc_day: target_pane.layers.spc_day,
-                    enabled_spc_products: target_pane.layers.enabled_spc_products(),
-                    enabled_nws_categories: target_pane.layers.enabled_nws_categories(),
                 };
                 let Some(rasterize_fn) = self.gui.overlays.prepare_rasterize(kind, &rctx) else {
                     // Nothing to render — clear in-flight

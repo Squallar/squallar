@@ -1,8 +1,9 @@
+use std::sync::Arc;
 use walkers::{HttpTiles, Texture, TileId, Tiles};
 use crate::overlay_cache::{
     OverlayTextureCache, draw_overlay_texture, geo_point_in_feature,
 };
-use rustdar_overlays::render::overlay_state::{ClickableItem, SelectedOverlay};
+use rustdar_overlays::render::overlay_state::{ClickableItem, OverlayItem};
 use crate::tiles::{lon_to_tile_x, lat_to_tile_y, tile_to_lon, tile_to_lat};
 
 // ---------------------------------------------------------------------------
@@ -55,13 +56,13 @@ impl<'a> OverlayDrawContext<'a> {
     ///
     /// This is fully generic — the caller provides the texture cache and the
     /// pre-built `ClickableItem` list from `OverlayKind::clickable_items()`.
-    /// Returns `SelectedOverlay` IDs for all items whose polygons contain the
+    /// Returns `Arc<dyn OverlayItem>` for all items whose polygons contain the
     /// click point.
     pub fn draw_overlay(
         &self,
         texture: Option<&OverlayTextureCache>,
-        items: &[ClickableItem<'_>],
-    ) -> Vec<SelectedOverlay> {
+        items: &[ClickableItem],
+    ) -> Vec<Arc<dyn OverlayItem>> {
         // 1. Draw the pre-rasterized texture if available
         if let Some(ref tex) = texture.and_then(|c| c.current.as_ref()) {
             draw_overlay_texture(self.ui.painter(), self.projector, tex, self.screen_rect);
@@ -104,7 +105,7 @@ impl<'a> OverlayDrawContext<'a> {
                 if rect.width() > 0.0 && rect.height() > 0.0 {
                     let u = (click_pos.x - rect.left()) / rect.width();
                     let v = (click_pos.y - rect.top()) / rect.height();
-                    return hit_map.hit_test(u, v).into_iter().cloned().collect();
+                    return hit_map.hit_test(u, v);
                 }
             }
         }
@@ -122,7 +123,7 @@ impl<'a> OverlayDrawContext<'a> {
                 geo_point_in_feature(lat, lon, f)
             });
             if hit {
-                hits.push(item.id.clone());
+                hits.push(item.item.clone());
             }
         }
         hits

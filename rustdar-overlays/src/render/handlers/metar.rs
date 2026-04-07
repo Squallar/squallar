@@ -1,12 +1,14 @@
 use std::any::Any;
+use std::sync::Arc;
 
 use rustdar_units::UserPreferences;
 
 use crate::metar::types::MetarOb;
+use crate::render::controls::{ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext, PaneControlContextMut};
 use crate::render::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter};
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayKind, OverlayState,
-    PopupContent, PopupSection, RasterizeContext, SelectedOverlay,
+    ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
+    OverlayState, PopupContent, PopupSection, RasterizeContext, RenderMode,
 };
 use crate::render::rasterize::RasterizeOutput;
 use crate::render::station_model;
@@ -15,9 +17,148 @@ use crate::types::GeoBounds;
 /// Type-erased fetch result for METAR observations.
 pub(crate) struct MetarFetchResult(pub Result<Vec<MetarOb>, String>);
 
+/// Clickable item representing a single METAR observation.
+#[derive(Debug)]
+pub(crate) struct MetarItem {
+    pub ob: MetarOb,
+}
+
+impl OverlayItem for MetarItem {
+    fn kind(&self) -> OverlayKind {
+        OverlayKind::Metar
+    }
+
+    fn popup_content(&self, prefs: &UserPreferences) -> PopupContent {
+        let ob = &self.ob;
+
+        let mut kv = Vec::new();
+
+        if let Some(tc) = ob.temp_c {
+            let tf = tc * 9.0 / 5.0 + 32.0;
+            kv.push(("Temperature".into(), format!("{tf:.0}°F / {tc:.0}°C")));
+        }
+
+        if let Some(td) = ob.dewp_c {
+            let tdf = td * 9.0 / 5.0 + 32.0;
+            kv.push(("Dewpoint".into(), format!("{tdf:.0}°F / {td:.0}°C")));
+        }
+
+        {
+            let dir_str = ob
+                .wind_dir
+                .map(|d| format!("{d:03}°"))
+                .unwrap_or_else(|| "VRB".to_string());
+            let speed = ob.wind_speed_kt.unwrap_or(0);
+            let converted = prefs.speed.convert_from_knots(speed as f32);
+            let mut wind_text = format!("{dir_str} at {converted:.0} {}", prefs.speed.suffix());
+            if let Some(gust) = ob.wind_gust_kt {
+                let g_converted = prefs.speed.convert_from_knots(gust as f32);
+                wind_text.push_str(&format!(", gusts {g_converted:.0} {}", prefs.speed.suffix()));
+            }
+            kv.push(("Wind".into(), wind_text));
+        }
+
+        if let Some(vis) = ob.visibility_mi {
+            let vis_str = if vis >= 10.0 {
+                "10+ mi".to_string()
+            } else {
+                format!("{vis:.1} mi")
+            };
+            kv.push(("Visibility".into(), vis_str));
+        }
+
+        if let Some(alt) = ob.altimeter_hpa {
+            let in_hg = alt * 0.02953;
+            kv.push(("Altimeter".into(), format!("{in_hg:.2} inHg / {alt:.0} hPa")));
+        }
+
+        if let Some(fc) = ob.flight_category {
+            kv.push(("Flight Cat.".into(), fc.label().to_string()));
+        }
+
+        if !ob.clouds.is_empty() {
+            let cloud_str: Vec<String> = ob
+                .clouds
+                .iter()
+                .map(|c| {
+                    if let Some(base) = c.base_ft {
+                        let converted = prefs.height.convert_from_feet(base as f32);
+                        format!("{} {converted:.0}{}", c.cover, prefs.height.suffix())
+                    } else {
+                        c.cover.clone()
+                    }
+                })
+                .collect();
+            kv.push(("Clouds".into(), cloud_str.join(", ")));
+        }
+
+        if let Some(ref wx) = ob.wx_string {
+            kv.push(("Weather".into(), wx.clone()));
+        }
+
+        if let Some(elev) = ob.elev_m {
+            let elev_ft = elev * 3.28084;
+            let converted = prefs.height.convert_from_feet(elev_ft as f32);
+            kv.push((
+                "Elevation".into(),
+                format!("{converted:.0}{}", prefs.height.suffix()),
+            ));
+        }
+
+        if !ob.obs_time.is_empty() {
+            kv.push(("Obs Time".into(), prefs.timezone.format_rfc3339(&ob.obs_time)));
+        }
+
+        let accent_rgb = ob
+            .flight_category
+            .map(|fc| {
+                let c = fc.color_rgba();
+                [c[0], c[1], c[2]]
+            })
+            .unwrap_or([150, 150, 150]);
+
+        let mut sections = vec![PopupSection::KeyValueGrid(kv)];
+
+        if !ob.raw_ob.is_empty() {
+            sections.push(PopupSection::Separator);
+            sections.push(PopupSection::ScrollableText {
+                text: ob.raw_ob.clone(),
+                monospace: true,
+                max_height: 80.0,
+            });
+        }
+
+        let title = if ob.name == ob.station_id {
+            ob.station_id.clone()
+        } else {
+            format!("{} — {}", ob.station_id, ob.name)
+        };
+
+        PopupContent {
+            title,
+            accent_rgb,
+            width: 380.0,
+            sections,
+            actions: Vec::new(),
+        }
+    }
+
+    fn matches(&self, other: &dyn OverlayItem) -> bool {
+        other
+            .as_any()
+            .downcast_ref::<MetarItem>()
+            .is_some_and(|o| o.ob.station_id == self.ob.station_id)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 pub(crate) struct MetarHandler {
-    pub state: OverlayState<Vec<MetarOb>>,
+    pub state: OverlayState<Vec<Arc<MetarItem>>>,
     cached_points: Vec<MapPoint>,
+    pub enabled: bool,
 }
 
 impl MetarHandler {
@@ -25,6 +166,7 @@ impl MetarHandler {
         Self {
             state: OverlayState::new(),
             cached_points: Vec::new(),
+            enabled: false,
         }
     }
 
@@ -35,13 +177,11 @@ impl MetarHandler {
             .data
             .iter()
             .enumerate()
-            .map(|(i, ob)| MapPoint {
-                lat: ob.lat,
-                lon: ob.lon,
+            .map(|(i, item)| MapPoint {
+                lat: item.ob.lat,
+                lon: item.ob.lon,
                 id: i as u32,
-                selection: SelectedOverlay::Metar {
-                    station_id: ob.station_id.clone(),
-                },
+                selection: item.clone() as Arc<dyn OverlayItem>,
             })
             .collect();
     }
@@ -50,6 +190,18 @@ impl MetarHandler {
 impl OverlayHandler for MetarHandler {
     fn kind(&self) -> OverlayKind {
         OverlayKind::Metar
+    }
+
+    fn display_name(&self) -> &str {
+        "METAR Observations"
+    }
+
+    fn render_mode(&self) -> RenderMode {
+        RenderMode::PerFramePoint
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled
     }
 
     fn data_generation(&self) -> u64 {
@@ -77,148 +229,11 @@ impl OverlayHandler for MetarHandler {
     }
 
     fn auto_poll_interval(&self) -> Option<u64> {
-        Some(300) // Refresh every 5 minutes
+        Some(300)
     }
 
-    fn clickable_items(
-        &self,
-        _layers: &crate::render::layers::LayerManager,
-    ) -> Vec<ClickableItem<'_>> {
-        // Surface obs use hit-buffer-based click detection, not polygon containment.
+    fn clickable_items(&self) -> Vec<ClickableItem> {
         Vec::new()
-    }
-
-    fn popup_content(
-        &self,
-        selected: &SelectedOverlay,
-        prefs: &UserPreferences,
-    ) -> Option<PopupContent> {
-        let SelectedOverlay::Metar { station_id } = selected else {
-            return None;
-        };
-        let ob = self.state.data.iter().find(|o| o.station_id == *station_id)?;
-
-        let mut kv = Vec::new();
-
-        // Temperature (show both °F and °C)
-        if let Some(tc) = ob.temp_c {
-            let tf = tc * 9.0 / 5.0 + 32.0;
-            kv.push(("Temperature".into(), format!("{tf:.0}°F / {tc:.0}°C")));
-        }
-
-        // Dewpoint
-        if let Some(td) = ob.dewp_c {
-            let tdf = td * 9.0 / 5.0 + 32.0;
-            kv.push(("Dewpoint".into(), format!("{tdf:.0}°F / {td:.0}°C")));
-        }
-
-        // Wind
-        {
-            let dir_str = ob
-                .wind_dir
-                .map(|d| format!("{d:03}°"))
-                .unwrap_or_else(|| "VRB".to_string());
-            let speed = ob.wind_speed_kt.unwrap_or(0);
-            let converted = prefs.speed.convert_from_knots(speed as f32);
-            let mut wind_text = format!("{dir_str} at {converted:.0} {}", prefs.speed.suffix());
-            if let Some(gust) = ob.wind_gust_kt {
-                let g_converted = prefs.speed.convert_from_knots(gust as f32);
-                wind_text.push_str(&format!(", gusts {g_converted:.0} {}", prefs.speed.suffix()));
-            }
-            kv.push(("Wind".into(), wind_text));
-        }
-
-        // Visibility
-        if let Some(vis) = ob.visibility_mi {
-            let vis_str = if vis >= 10.0 {
-                "10+ mi".to_string()
-            } else {
-                format!("{vis:.1} mi")
-            };
-            kv.push(("Visibility".into(), vis_str));
-        }
-
-        // Altimeter
-        if let Some(alt) = ob.altimeter_hpa {
-            let in_hg = alt * 0.02953;
-            kv.push(("Altimeter".into(), format!("{in_hg:.2} inHg / {alt:.0} hPa")));
-        }
-
-        // Flight category
-        if let Some(fc) = ob.flight_category {
-            kv.push(("Flight Cat.".into(), fc.label().to_string()));
-        }
-
-        // Clouds
-        if !ob.clouds.is_empty() {
-            let cloud_str: Vec<String> = ob
-                .clouds
-                .iter()
-                .map(|c| {
-                    if let Some(base) = c.base_ft {
-                        let converted = prefs.height.convert_from_feet(base as f32);
-                        format!("{} {converted:.0}{}", c.cover, prefs.height.suffix())
-                    } else {
-                        c.cover.clone()
-                    }
-                })
-                .collect();
-            kv.push(("Clouds".into(), cloud_str.join(", ")));
-        }
-
-        // Present weather
-        if let Some(ref wx) = ob.wx_string {
-            kv.push(("Weather".into(), wx.clone()));
-        }
-
-        // Elevation
-        if let Some(elev) = ob.elev_m {
-            let elev_ft = elev * 3.28084;
-            let converted = prefs.height.convert_from_feet(elev_ft as f32);
-            kv.push((
-                "Elevation".into(),
-                format!("{converted:.0}{}", prefs.height.suffix()),
-            ));
-        }
-
-        // Observation time
-        if !ob.obs_time.is_empty() {
-            kv.push(("Obs Time".into(), prefs.timezone.format_rfc3339(&ob.obs_time)));
-        }
-
-        let accent_rgb = ob
-            .flight_category
-            .map(|fc| {
-                let c = fc.color_rgba();
-                [c[0], c[1], c[2]]
-            })
-            .unwrap_or([150, 150, 150]);
-
-        let mut sections = vec![PopupSection::KeyValueGrid(kv)];
-
-        // Raw METAR
-        if !ob.raw_ob.is_empty() {
-            sections.push(PopupSection::Separator);
-            sections.push(PopupSection::ScrollableText {
-                text: ob.raw_ob.clone(),
-                monospace: true,
-                max_height: 80.0,
-            });
-        }
-
-        let title = if ob.name == ob.station_id {
-            ob.station_id.clone()
-        } else {
-            format!("{} — {}", ob.station_id, ob.name)
-        };
-
-        Some(PopupContent {
-            title,
-            accent_rgb,
-            width: 380.0,
-            sections,
-            actions: Vec::new(),
-        })
     }
 
     fn apply_fetch_result(&mut self, result: Box<dyn Any + Send>) {
@@ -229,7 +244,11 @@ impl OverlayHandler for MetarHandler {
         match fetch.0 {
             Ok(observations) => {
                 log::info!("Received {} METAR observations", observations.len());
-                self.state.set_data(observations);
+                let items = observations
+                    .into_iter()
+                    .map(|ob| Arc::new(MetarItem { ob }))
+                    .collect();
+                self.state.set_data(items);
             }
             Err(e) => {
                 log::error!("METAR fetch failed: {e}");
@@ -239,19 +258,12 @@ impl OverlayHandler for MetarHandler {
         self.rebuild_points();
     }
 
-    fn retain_selections(&self, selections: &mut Vec<SelectedOverlay>) {
-        let ids: std::collections::HashSet<&str> = self
-            .state
-            .data
-            .iter()
-            .map(|o| o.station_id.as_str())
-            .collect();
-        selections.retain(|s| {
-            if let SelectedOverlay::Metar { station_id } = s {
-                ids.contains(station_id.as_str())
-            } else {
-                true
+    fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>) {
+        selections.retain(|sel| {
+            if sel.kind() != OverlayKind::Metar {
+                return true;
             }
+            self.state.data.iter().any(|item| item.matches(sel.as_ref()))
         });
     }
 
@@ -281,8 +293,8 @@ impl OverlayHandler for MetarHandler {
     }
 
     fn draw_point(&self, id: u32, painter: &mut dyn PointPainter, ctx: &DrawPointContext) {
-        if let Some(ob) = self.state.data.get(id as usize) {
-            station_model::draw_metar_station(ob, painter, ctx);
+        if let Some(item) = self.state.data.get(id as usize) {
+            station_model::draw_metar_station(&item.ob, painter, ctx);
         }
     }
 
@@ -291,8 +303,72 @@ impl OverlayHandler for MetarHandler {
     }
 
     fn hover_text(&self, id: u32, ctx: &HoverContext<'_>) -> Option<String> {
-        self.state.data.get(id as usize).map(|ob| {
-            station_model::hover_text_for_metar(ob, ctx.prefs)
+        self.state.data.get(id as usize).map(|item| {
+            station_model::hover_text_for_metar(&item.ob, ctx.prefs)
         })
+    }
+
+    fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
+        let count = self.state.data.len();
+        let label = if count == 0 {
+            "\u{1f321}  METAR".to_string()
+        } else {
+            format!("\u{1f321}  METAR ({count})")
+        };
+
+        let mut items = vec![
+            ControlItem::Toggle { id: "enabled", label, enabled: self.enabled },
+        ];
+
+        if self.enabled {
+            items.push(ControlItem::ButtonRow {
+                buttons: vec![ControlButton {
+                    id: "refresh",
+                    label: "\u{1f504} Refresh".into(),
+                    enabled: !self.state.fetching,
+                    highlight: false,
+                }],
+            });
+            if self.state.fetching {
+                items.push(ControlItem::InfoText { text: "Fetching\u{2026}".into() });
+            }
+            if let Some(t) = self.state.fetch_time {
+                let secs = t.elapsed().as_secs();
+                let text = if secs < 60 {
+                    format!("Updated {secs}s ago")
+                } else {
+                    format!("Updated {}m ago", secs / 60)
+                };
+                items.push(ControlItem::InfoText { text });
+            }
+        }
+
+        items
+    }
+
+    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneControlContextMut<'_>) -> ControlEffect {
+        match update.id {
+            "enabled" => {
+                if let ControlValue::Bool(val) = update.value {
+                    self.enabled = val;
+                    if val && !self.has_data() && !self.state.fetching {
+                        return ControlEffect::Fetch;
+                    }
+                }
+                ControlEffect::None
+            }
+            "refresh" => ControlEffect::Fetch,
+            _ => ControlEffect::None,
+        }
+    }
+
+    fn serialize_state(&self) -> serde_json::Value {
+        serde_json::json!({ "enabled": self.enabled })
+    }
+
+    fn deserialize_state(&mut self, value: serde_json::Value) {
+        if let Some(enabled) = value.get("enabled").and_then(|v| v.as_bool()) {
+            self.enabled = enabled;
+        }
     }
 }

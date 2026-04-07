@@ -2,7 +2,7 @@ use crate::types::{GeoPolygon, HatchPattern, OverlayFeature};
 use super::colors::alert_color;
 
 /// Broad classification of an NWS alert.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum AlertCategory {
     Warning,
     Watch,

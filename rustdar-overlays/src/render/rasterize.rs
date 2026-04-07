@@ -12,8 +12,10 @@ use tiny_skia::{
     Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, Transform,
 };
 
+use std::sync::Arc;
+
 use crate::nws::alert::{AlertCategory, NwsAlert};
-use crate::render::overlay_state::SelectedOverlay;
+use crate::render::overlay_state::OverlayItem;
 use crate::spc::colors::{md_fill_color, md_stroke_color};
 use crate::spc::discussion::SpcDiscussion;
 use crate::spc::reports::{StormReport, StormReportKind};
@@ -35,8 +37,8 @@ pub struct HitMap {
     /// Sparse map: quarter-res pixel index (`qy * width + qx`) → list of
     /// item IDs that cover that cell. Only occupied cells are stored.
     cells: HashMap<u32, Vec<u32>>,
-    /// Maps item IDs used in `cells` to their `SelectedOverlay` values.
-    id_map: HashMap<u32, SelectedOverlay>,
+    /// Maps item IDs used in `cells` to their `OverlayItem` values.
+    id_map: HashMap<u32, Arc<dyn OverlayItem>>,
 }
 
 impl HitMap {
@@ -66,13 +68,13 @@ impl HitMap {
         }
     }
 
-    /// Register the `SelectedOverlay` for a given item ID.
-    pub fn register_id(&mut self, item_id: u32, selected: SelectedOverlay) {
-        self.id_map.insert(item_id, selected);
+    /// Register the `OverlayItem` for a given item ID.
+    pub fn register_id(&mut self, item_id: u32, item: Arc<dyn OverlayItem>) {
+        self.id_map.insert(item_id, item);
     }
 
     /// Look up all overlay items at texture UV coordinates `(u, v)` in `[0, 1]`.
-    pub fn hit_test(&self, u: f32, v: f32) -> Vec<&SelectedOverlay> {
+    pub fn hit_test(&self, u: f32, v: f32) -> Vec<Arc<dyn OverlayItem>> {
         if u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0 {
             return Vec::new();
         }
@@ -83,7 +85,7 @@ impl HitMap {
             .get(&idx)
             .map(|ids| {
                 ids.iter()
-                    .filter_map(|id| self.id_map.get(id))
+                    .filter_map(|id| self.id_map.get(id).cloned())
                     .collect()
             })
             .unwrap_or_default()
@@ -416,6 +418,7 @@ fn draw_wind_symbol(pixmap: &mut Pixmap, px: f32, py: f32, r: f32, color: Color)
 /// At low zoom (small radius), falls back to filled dots.
 pub fn rasterize_storm_reports(
     reports: &[StormReport],
+    items: &[Arc<dyn OverlayItem>],
     bounds: &GeoBounds,
     width: u32,
     height: u32,
@@ -490,7 +493,9 @@ pub fn rasterize_storm_reports(
 
         // Record hit cells for all quarter-res pixels within the hit radius.
         let item_id = idx as u32;
-        hit_map.register_id(item_id, SelectedOverlay::StormReport { index: idx });
+        if let Some(item) = items.get(idx) {
+            hit_map.register_id(item_id, item.clone());
+        }
         let min_x = (px - hit_radius).max(0.0) as i32;
         let max_x = ((px + hit_radius) as i32).min(width as i32 - 1);
         let min_y = (py - hit_radius).max(0.0) as i32;

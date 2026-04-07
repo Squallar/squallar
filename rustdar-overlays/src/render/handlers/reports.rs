@@ -1,10 +1,12 @@
 use std::any::Any;
+use std::sync::Arc;
 
 use rustdar_units::UserPreferences;
 
+use crate::render::controls::{ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext, PaneControlContextMut};
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayKind, OverlayState,
-    PopupContent, PopupSection, RasterizeContext, SelectedOverlay,
+    ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
+    OverlayState, PopupContent, PopupSection, RasterizeContext, RenderMode,
 };
 use crate::render::rasterize::{self, RasterizeOutput};
 use crate::spc::reports::{StormReport, StormReportKind};
@@ -13,59 +15,20 @@ use crate::types::GeoBounds;
 /// Type-erased fetch result for SPC storm reports.
 pub(crate) struct StormReportsFetchResult(pub Result<Vec<StormReport>, String>);
 
-pub(crate) struct StormReportsHandler {
-    pub state: OverlayState<Vec<StormReport>>,
+/// Clickable item representing a single SPC storm report.
+#[derive(Debug)]
+pub(crate) struct StormReportItem {
+    pub report: StormReport,
+    pub index: usize,
 }
 
-impl StormReportsHandler {
-    pub fn new() -> Self {
-        Self {
-            state: OverlayState::new(),
-        }
-    }
-}
-
-impl OverlayHandler for StormReportsHandler {
+impl OverlayItem for StormReportItem {
     fn kind(&self) -> OverlayKind {
         OverlayKind::StormReports
     }
 
-    fn data_generation(&self) -> u64 {
-        self.state.data_generation    }
-
-    fn has_data(&self) -> bool {
-        !self.state.data.is_empty()
-    }
-
-    fn is_fetching(&self) -> bool {
-        self.state.fetching
-    }
-
-    fn set_fetching(&mut self, fetching: bool) {
-        self.state.fetching = fetching;
-    }
-
-    fn fetch_time(&self) -> Option<std::time::Instant> {
-        self.state.fetch_time
-    }
-
-    fn item_count(&self) -> usize {
-        self.state.data.len()
-    }
-
-    fn auto_poll_interval(&self) -> Option<u64> {
-        Some(300) // Refresh every 5 min
-    }
-
-    fn clickable_items(&self, _layers: &crate::render::layers::LayerManager) -> Vec<ClickableItem<'_>> {
-        // Storm reports use hit-buffer-based click detection, not polygon containment.
-        // No clickable items needed — hits come from the HitMap in the texture cache.
-        Vec::new()
-    }
-
-    fn popup_content(&self, selected: &SelectedOverlay, prefs: &UserPreferences) -> Option<PopupContent> {
-        let SelectedOverlay::StormReport { index } = selected else { return None };
-        let report = self.state.data.get(*index)?;
+    fn popup_content(&self, prefs: &UserPreferences) -> PopupContent {
+        let report = &self.report;
         let kind_str = match report.kind {
             StormReportKind::Tornado => "Tornado",
             StormReportKind::Hail => "Hail",
@@ -77,7 +40,6 @@ impl OverlayHandler for StormReportsHandler {
             match prefs.timezone {
                 rustdar_units::TimezonePreference::Utc => format!("{hhmm} UTC"),
                 rustdar_units::TimezonePreference::Local => {
-                    // HHMM is in UTC; parse and convert
                     if let (Ok(h), Ok(m)) = (report.time[..2].parse::<u32>(), report.time[2..].parse::<u32>()) {
                         let today = chrono::Utc::now().date_naive();
                         if let Some(naive) = today.and_hms_opt(h, m, 0) {
@@ -116,7 +78,7 @@ impl OverlayHandler for StormReportsHandler {
         if !report.comments.is_empty() {
             sections.push(PopupSection::Text(report.comments.clone()));
         }
-        Some(PopupContent {
+        PopupContent {
             title: format!("SPC Storm Report: {kind_str}"),
             accent_rgb: match report.kind {
                 StormReportKind::Tornado => [220, 40, 40],
@@ -126,7 +88,83 @@ impl OverlayHandler for StormReportsHandler {
             width: 350.0,
             sections,
             actions: Vec::new(),
-        })
+        }
+    }
+
+    fn matches(&self, other: &dyn OverlayItem) -> bool {
+        other
+            .as_any()
+            .downcast_ref::<StormReportItem>()
+            .is_some_and(|o| o.index == self.index)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+pub(crate) struct StormReportsHandler {
+    pub state: OverlayState<Vec<Arc<StormReportItem>>>,
+    pub enabled: bool,
+}
+
+impl StormReportsHandler {
+    pub fn new() -> Self {
+        Self {
+            state: OverlayState::new(),
+            enabled: false,
+        }
+    }
+}
+
+impl OverlayHandler for StormReportsHandler {
+    fn kind(&self) -> OverlayKind {
+        OverlayKind::StormReports
+    }
+
+    fn display_name(&self) -> &str {
+        "SPC Storm Reports"
+    }
+
+    fn render_mode(&self) -> RenderMode {
+        RenderMode::Texture
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn data_generation(&self) -> u64 {
+        self.state.data_generation
+    }
+
+    fn has_data(&self) -> bool {
+        !self.state.data.is_empty()
+    }
+
+    fn is_fetching(&self) -> bool {
+        self.state.fetching
+    }
+
+    fn set_fetching(&mut self, fetching: bool) {
+        self.state.fetching = fetching;
+    }
+
+    fn fetch_time(&self) -> Option<std::time::Instant> {
+        self.state.fetch_time
+    }
+
+    fn item_count(&self) -> usize {
+        self.state.data.len()
+    }
+
+    fn auto_poll_interval(&self) -> Option<u64> {
+        Some(300)
+    }
+
+    fn clickable_items(&self) -> Vec<ClickableItem> {
+        // Storm reports use hit-buffer-based click detection, not polygon containment.
+        Vec::new()
     }
 
     fn apply_fetch_result(&mut self, result: Box<dyn Any + Send>) {
@@ -137,9 +175,12 @@ impl OverlayHandler for StormReportsHandler {
         match fetch.0 {
             Ok(reports) => {
                 log::info!("Received {} storm reports", reports.len());
-                self.state.data = reports;
-                self.state.data_generation = self.state.data_generation.wrapping_add(1);
-                self.state.fetch_time = Some(std::time::Instant::now());
+                let items = reports
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, report)| Arc::new(StormReportItem { report, index: i }))
+                    .collect();
+                self.state.set_data(items);
             }
             Err(e) => {
                 log::error!("Storm reports fetch failed: {e}");
@@ -148,14 +189,15 @@ impl OverlayHandler for StormReportsHandler {
         self.state.fetching = false;
     }
 
-    fn retain_selections(&self, selections: &mut Vec<SelectedOverlay>) {
+    fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>) {
         let count = self.state.data.len();
-        selections.retain(|s| {
-            if let SelectedOverlay::StormReport { index } = s {
-                *index < count
-            } else {
-                true
+        selections.retain(|sel| {
+            if sel.kind() != OverlayKind::StormReports {
+                return true;
             }
+            sel.as_any()
+                .downcast_ref::<StormReportItem>()
+                .is_some_and(|r| r.index < count)
         });
     }
 
@@ -166,11 +208,12 @@ impl OverlayHandler for StormReportsHandler {
         if self.state.data.is_empty() {
             return None;
         }
-        let reports = self.state.data.clone();
+        let reports: Vec<StormReport> = self.state.data.iter().map(|i| i.report.clone()).collect();
+        let items: Vec<Arc<dyn OverlayItem>> = self.state.data.iter().map(|i| i.clone() as Arc<dyn OverlayItem>).collect();
         let zoom = ctx.zoom;
         let is_dark = ctx.is_dark;
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            rasterize::rasterize_storm_reports(&reports, bounds, width, height, zoom, is_dark)
+            rasterize::rasterize_storm_reports(&reports, &items, bounds, width, height, zoom, is_dark)
         }))
     }
 
@@ -184,5 +227,69 @@ impl OverlayHandler for StormReportsHandler {
                 Box::new(StormReportsFetchResult(result)) as Box<dyn Any + Send>
             }),
         }]
+    }
+
+    fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
+        let count = self.state.data.len();
+        let label = if count == 0 {
+            "\u{26a1}  SPC Storm Reports".to_string()
+        } else {
+            format!("\u{26a1}  SPC Storm Reports ({count})")
+        };
+
+        let mut items = vec![
+            ControlItem::Toggle { id: "enabled", label, enabled: self.enabled },
+        ];
+
+        if self.enabled {
+            items.push(ControlItem::ButtonRow {
+                buttons: vec![ControlButton {
+                    id: "refresh",
+                    label: "\u{1f504} Refresh".into(),
+                    enabled: !self.state.fetching,
+                    highlight: false,
+                }],
+            });
+            if self.state.fetching {
+                items.push(ControlItem::InfoText { text: "Fetching\u{2026}".into() });
+            }
+            if let Some(t) = self.state.fetch_time {
+                let secs = t.elapsed().as_secs();
+                let text = if secs < 60 {
+                    format!("Updated {secs}s ago")
+                } else {
+                    format!("Updated {}m ago", secs / 60)
+                };
+                items.push(ControlItem::InfoText { text });
+            }
+        }
+
+        items
+    }
+
+    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneControlContextMut<'_>) -> ControlEffect {
+        match update.id {
+            "enabled" => {
+                if let ControlValue::Bool(val) = update.value {
+                    self.enabled = val;
+                    if val && !self.has_data() && !self.state.fetching {
+                        return ControlEffect::Fetch;
+                    }
+                }
+                ControlEffect::None
+            }
+            "refresh" => ControlEffect::Fetch,
+            _ => ControlEffect::None,
+        }
+    }
+
+    fn serialize_state(&self) -> serde_json::Value {
+        serde_json::json!({ "enabled": self.enabled })
+    }
+
+    fn deserialize_state(&mut self, value: serde_json::Value) {
+        if let Some(enabled) = value.get("enabled").and_then(|v| v.as_bool()) {
+            self.enabled = enabled;
+        }
     }
 }

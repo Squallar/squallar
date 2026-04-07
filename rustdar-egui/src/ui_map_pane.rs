@@ -5,8 +5,8 @@ use crate::overlay_cache::{
 };
 use crate::point_painter::EguiPointPainter;
 use rustdar_overlays::render::draw::{DrawPointContext, HoverContext};
-use rustdar_overlays::render::layers::LayerKind;
-use rustdar_overlays::render::overlay_state::{OverlayRegistry, OverlayKind, SelectedOverlay};
+use std::sync::Arc;
+use rustdar_overlays::render::overlay_state::{OverlayRegistry, OverlayKind, OverlayItem, RenderMode};
 use crate::pane::{PaneState, RadarImageData};
 use rustdar_units::UserPreferences;
 
@@ -47,7 +47,7 @@ pub(super) fn render_pane_map_content(
 ) {
     // Pre-compute radar site icon rects so overlay click detection can
     // skip clicks that land on a site marker (sites take priority).
-    if ctx.pane.layers.is_enabled(LayerKind::RadarSites) {
+    if ctx.overlays.is_enabled(OverlayKind::RadarSites) {
         let screen_rect = ui.max_rect();
         let icon_size = (10.0 + zoom as f32 * 2.0).clamp(8.0, 24.0);
         for site in &RADARS {
@@ -75,39 +75,15 @@ pub(super) fn render_pane_map_content(
             ctx.overlay_click_pos,
         );
 
-        let mut selected: Vec<SelectedOverlay> = Vec::new();
+        let mut selected: Vec<Arc<dyn OverlayItem>> = Vec::new();
 
         let draw_order: Vec<OverlayKind> = ctx.pane.draw_order.clone();
         for &kind in &draw_order {
-            if !kind.is_enabled(&ctx.pane.layers) {
+            if !ctx.overlays.is_enabled(kind) {
                 continue;
             }
             match kind {
-                // Texture-based overlays: draw texture + clickable items
-                OverlayKind::SpcOutlook
-                | OverlayKind::SpcDiscussions
-                | OverlayKind::NwsAlerts
-                | OverlayKind::StormReports => {
-                    let items = ctx.overlays.clickable_items(kind, &ctx.pane.layers);
-                    selected.extend(overlay_ctx.draw_overlay(
-                        ctx.pane.overlay_cache(kind),
-                        &items,
-                    ));
-                }
-                // Per-frame point overlay: METAR station model plots
-                OverlayKind::Metar => {
-                    selected.extend(render_per_frame_overlay(
-                        ui,
-                        projector,
-                        ctx.overlays,
-                        kind,
-                        zoom,
-                        ctx.preferences,
-                        ctx.overlay_click_pos,
-                        &ctx.excluded_rects,
-                    ));
-                }
-                // Radar image layer — drawn from overlay texture cache
+                // Radar image layer — special handling for loop playback
                 OverlayKind::Radar => {
                     // Loop playback: draw the active loop frame instead
                     if ctx.pane.loop_state.multi_frame {
@@ -136,20 +112,18 @@ pub(super) fn render_pane_map_content(
                         }
                     }
                 }
-                // City label tiles
+                // City label tiles — walkers tile layer
                 OverlayKind::CityLabels => {
                     if let Some(ltiles) = ctx.label_tiles.as_mut() {
                         draw_label_tiles_overlay(ui, projector, zoom, ltiles);
                     }
                 }
-                // Radar sites: texture + per-frame interactions
+                // Radar sites: texture + per-frame interactions (text labels, clicks)
                 OverlayKind::RadarSites => {
-                    // Draw the pre-rasterized site circles texture
                     if let Some(ref tex) = ctx.pane.overlay_cache(kind).and_then(|c| c.current.as_ref()) {
                         let screen_rect = ui.max_rect();
                         draw_overlay_texture(ui.painter(), projector, tex, screen_rect);
                     }
-                    // Per-frame: clicks, tooltips, hover cursor
                     handle_radar_site_interactions(
                         ui,
                         projector,
@@ -164,6 +138,31 @@ pub(super) fn render_pane_map_content(
                 OverlayKind::UserLocation => {
                     if let Some((user_lat, user_lon)) = ctx.user_location {
                         render_user_location(ui, projector, user_lat, user_lon);
+                    }
+                }
+                // All other overlays dispatched by render mode
+                _ => {
+                    match ctx.overlays.render_mode(kind) {
+                        Some(RenderMode::Texture) => {
+                            let items = ctx.overlays.clickable_items(kind);
+                            selected.extend(overlay_ctx.draw_overlay(
+                                ctx.pane.overlay_cache(kind),
+                                &items,
+                            ));
+                        }
+                        Some(RenderMode::PerFramePoint) => {
+                            selected.extend(render_per_frame_overlay(
+                                ui,
+                                projector,
+                                ctx.overlays,
+                                kind,
+                                zoom,
+                                ctx.preferences,
+                                ctx.overlay_click_pos,
+                                &ctx.excluded_rects,
+                            ));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -182,13 +181,16 @@ pub(super) fn render_pane_map_content(
         let w = (screen_rect.width() * (1.0 + 2.0 * OVERDRAW_FRACTION)) as u32;
         let h = (screen_rect.height() * (1.0 + 2.0 * OVERDRAW_FRACTION)) as u32;
 
-        for &kind in OverlayKind::texture_overlays() {
+        for &kind in OverlayKind::all() {
+            if ctx.overlays.render_mode(kind) != Some(RenderMode::Texture) {
+                continue;
+            }
             // Radar rendering is driven by product/elevation changes (not viewport),
             // handled by dispatch_pane_renders() in the platform crate.
             if kind == OverlayKind::Radar {
                 continue;
             }
-            let enabled = kind.is_enabled(&ctx.pane.layers);
+            let enabled = ctx.overlays.is_enabled(kind);
             let data_gen = if kind == OverlayKind::RadarSites {
                 ctx.pane.radar_sites_render_gen
             } else {
@@ -486,7 +488,7 @@ fn render_per_frame_overlay(
     prefs: &UserPreferences,
     overlay_click_pos: Option<egui::Pos2>,
     excluded_rects: &[egui::Rect],
-) -> Vec<SelectedOverlay> {
+) -> Vec<Arc<dyn OverlayItem>> {
     let points = overlays.per_frame_points(kind);
     if points.is_empty() {
         return Vec::new();

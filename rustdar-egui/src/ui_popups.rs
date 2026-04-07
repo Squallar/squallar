@@ -132,16 +132,8 @@ impl super::Gui {
         let page = self.overlays.selected_overlay_page;
         let current = self.overlays.selected_overlays[page].clone();
 
-        // Build popup content from overlay data — if the item no longer exists, remove it
-        let Some(content) = self.overlays.popup_content(&current, &self.preferences) else {
-            self.overlays.selected_overlays.remove(page);
-            if self.overlays.selected_overlays.is_empty() {
-                self.overlays.selected_overlay_page = 0;
-            } else if self.overlays.selected_overlay_page >= self.overlays.selected_overlays.len() {
-                self.overlays.selected_overlay_page = self.overlays.selected_overlays.len() - 1;
-            }
-            return;
-        };
+        // Build popup content from overlay data
+        let content = self.overlays.popup_content(&*current, &self.preferences);
 
         let accent = egui::Color32::from_rgb(
             content.accent_rgb[0],

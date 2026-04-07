@@ -43,6 +43,23 @@ impl OutlookDay {
         }
     }
 
+    /// Returns the available outlook products for this day.
+    pub fn products(self) -> &'static [OutlookProduct] {
+        match self {
+            OutlookDay::Day1 | OutlookDay::Day2 => &[
+                OutlookProduct::Categorical,
+                OutlookProduct::Tornado,
+                OutlookProduct::Wind,
+                OutlookProduct::Hail,
+            ],
+            OutlookDay::Day3 => &[
+                OutlookProduct::Categorical,
+                OutlookProduct::Probabilistic,
+            ],
+            _ => &[OutlookProduct::Probabilistic],
+        }
+    }
+
     /// Whether this is an extended-range day (4-8).
     pub fn is_extended(self) -> bool {
         matches!(
@@ -72,7 +89,7 @@ impl std::fmt::Display for OutlookDay {
 }
 
 /// Which outlook product to request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum OutlookProduct {
     Categorical,
     Tornado,

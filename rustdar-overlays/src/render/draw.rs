@@ -9,9 +9,11 @@
 //! on screen. The UI crate handles lat/lon → screen projection; the overlay
 //! handler only specifies layout offsets.
 
+use std::sync::Arc;
+
 use rustdar_units::UserPreferences;
 
-use super::overlay_state::SelectedOverlay;
+use super::overlay_state::OverlayItem;
 
 /// Text anchor position relative to the draw point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,7 +41,7 @@ pub struct MapPoint {
     /// and `hover_text()`).
     pub id: u32,
     /// What to store in the selection list when the user clicks this point.
-    pub selection: SelectedOverlay,
+    pub selection: Arc<dyn OverlayItem>,
 }
 
 /// Abstract drawing surface for point-based overlays.

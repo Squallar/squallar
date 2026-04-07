@@ -3,8 +3,6 @@ use walkers::{
     HttpTiles, TileId,
 };
 
-use rustdar_overlays::render::layers::LayerKind;
-
 /// CartoDB tile source variants.
 /// Base maps use `nolabels` so city/road names are not obscured by the radar
 /// overlay. A separate `labels-only` layer is drawn on top of the radar.
@@ -189,11 +187,6 @@ impl MapTileState {
         } else {
             self.label_tiles_light = tiles;
         }
-    }
-
-    /// Check if any pane needs label tiles.
-    pub fn any_city_labels(panes: &[crate::pane::PaneState]) -> bool {
-        panes.iter().any(|p| p.layers.is_enabled(LayerKind::CityLabels))
     }
 
     /// Clear all tile state (called on suspend/graphics reset).

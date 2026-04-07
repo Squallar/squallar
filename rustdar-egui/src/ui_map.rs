@@ -1,6 +1,6 @@
 use crate::actions::GuiAction;
-use crate::tiles::MapTileState;
 use egui::Context;
+use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::types::{RadarProduct, IMAGE_SIZE};
 use rustdar_units::UserPreferences;
 
@@ -18,7 +18,7 @@ impl super::Gui {
 
         // Initialize tiles via MapTileState
         self.map_tiles.ensure_base_tiles(is_dark_theme, ctx);
-        let any_city_labels = MapTileState::any_city_labels(&self.panes);
+        let any_city_labels = self.overlays.is_enabled(OverlayKind::CityLabels);
         if any_city_labels {
             self.map_tiles.ensure_label_tiles(is_dark_theme, ctx);
         }

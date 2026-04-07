@@ -1,12 +1,12 @@
 use crate::actions::{GuiAction, RadarConfig};
-use rustdar_overlays::render::layers::{LayerKind, LayerManager};
+use rustdar_overlays::render::controls::{ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext, PaneControlContextMut};
+
 use rustdar_overlays::render::overlay_state::{OverlayRegistry, OverlayKind};
 use crate::pane::{PaneId, PaneLayout, PaneState, MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
 use crate::tiles::MapTileState;
 use chrono::Timelike;
 use egui::Context;
 use rustdar_radar::types::{RadarProduct, ScanInfo};
-use rustdar_overlays::spc::outlook::OutlookDay;
 use rustdar_units::UserPreferences;
 
 
@@ -145,6 +145,104 @@ impl Default for Gui {
     }
 }
 
+/// Render a single declarative [`ControlItem`] into the UI, collecting any
+/// resulting [`ControlUpdate`]s into `updates`.
+fn render_control_item(
+    ui: &mut egui::Ui,
+    kind: OverlayKind,
+    item: &ControlItem,
+    updates: &mut Vec<(OverlayKind, ControlUpdate)>,
+) {
+    match item {
+        ControlItem::Toggle { id, label, enabled } => {
+            let mut value = *enabled;
+            if ui.checkbox(&mut value, label.as_str()).changed() {
+                updates.push((kind, ControlUpdate { id, value: ControlValue::Bool(value) }));
+            }
+        }
+        ControlItem::Heading { text } => {
+            ui.label(text.as_str());
+        }
+        ControlItem::InfoText { text } => {
+            ui.label(egui::RichText::new(text.as_str()).small().weak());
+        }
+        ControlItem::ButtonRow { buttons } => {
+            let any_highlighted = buttons.iter().any(|b| b.highlight);
+            ui.horizontal_wrapped(|ui| {
+                for btn in buttons {
+                    let clicked = if any_highlighted {
+                        ui.add_enabled(
+                            btn.enabled,
+                            egui::Button::new(btn.label.as_str()).selected(btn.highlight),
+                        ).clicked()
+                    } else {
+                        ui.add_enabled(
+                            btn.enabled,
+                            egui::Button::new(btn.label.as_str()),
+                        ).clicked()
+                    };
+                    if clicked {
+                        updates.push((kind, ControlUpdate { id: btn.id, value: ControlValue::Action }));
+                    }
+                }
+            });
+        }
+        ControlItem::Separator => {
+            ui.separator();
+        }
+        ControlItem::Dropdown { id, label, options, selected } => {
+            let mut sel = selected.clone();
+            let original = sel.clone();
+            ui.horizontal(|ui| {
+                ui.label(label.as_str());
+                egui::ComboBox::from_id_salt(format!("{kind:?}_{id}"))
+                    .selected_text(sel.as_str())
+                    .show_ui(ui, |ui| {
+                        for (value, display) in options {
+                            ui.selectable_value(&mut sel, value.clone(), display.as_str());
+                        }
+                    });
+            });
+            if sel != original {
+                updates.push((kind, ControlUpdate { id, value: ControlValue::String(sel) }));
+            }
+        }
+        ControlItem::Slider { id, label, min, max, value, logarithmic, .. } => {
+            let mut val = *value;
+            let original = val;
+            ui.horizontal(|ui| {
+                ui.label(label.as_str());
+                let mut slider = egui::Slider::new(&mut val, *min..=*max);
+                if *logarithmic {
+                    slider = slider.logarithmic(true);
+                }
+                ui.add(slider);
+            });
+            if (val - original).abs() > f64::EPSILON {
+                updates.push((kind, ControlUpdate { id, value: ControlValue::Float(val) }));
+            }
+        }
+        ControlItem::Section { label, collapsible, expanded, items } => {
+            if *collapsible {
+                egui::CollapsingHeader::new(label.as_str())
+                    .default_open(*expanded)
+                    .show(ui, |ui| {
+                        for child in items {
+                            render_control_item(ui, kind, child, updates);
+                        }
+                    });
+            } else {
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new(label.as_str()).strong());
+                    for child in items {
+                        render_control_item(ui, kind, child, updates);
+                    }
+                });
+            }
+        }
+    }
+}
+
 impl Gui {
     pub fn new() -> Self {
         let radar_config = RadarConfig::default();
@@ -243,7 +341,7 @@ impl Gui {
         // Auto-refresh overlay data when layers are enabled and refresh interval elapsed
         for &kind in OverlayKind::all() {
             if let Some(interval) = self.overlays.auto_poll_interval(kind) {
-                if self.panes.iter().any(|p| kind.is_enabled(&p.layers))
+                if self.overlays.is_enabled(kind)
                     && !self.overlays.is_fetching(kind)
                     && self.overlays.fetch_time(kind)
                         .map_or(true, |t| t.elapsed().as_secs() >= interval)
@@ -430,17 +528,12 @@ impl Gui {
         ui.add_space(6.0);
         ui.separator();
 
-        self.render_spc_outlook_controls(ui, pane, actions);
-
-        ui.add_space(6.0);
-        ui.separator();
-
-        self.render_spc_discussion_controls(ui, pane, actions);
-
-        ui.add_space(6.0);
-        ui.separator();
-
-        self.render_nws_alert_controls(ui, pane, actions);
+        // --- Handler-backed overlay controls (generic) ---
+        #[cfg(target_os = "android")]
+        let is_mobile = true;
+        #[cfg(not(target_os = "android"))]
+        let is_mobile = false;
+        self.render_overlay_controls(ui, is_mobile, actions);
 
         ui.add_space(6.0);
         ui.separator();
@@ -452,14 +545,9 @@ impl Gui {
             ui.separator();
         }
 
-        // --- Other overlays ---
-        ui.checkbox(pane.layers.enabled_mut(LayerKind::CityLabels), "\u{1f3f7}  City Labels");
-        ui.checkbox(pane.layers.enabled_mut(LayerKind::RadarSites), "\u{1f4e1}  Radar Sites");
-        ui.checkbox(pane.layers.enabled_mut(LayerKind::StormReports), "\u{26a1}  SPC Storm Reports");
-        ui.checkbox(pane.layers.enabled_mut(LayerKind::Metar), "\u{1f321}  METAR");
     }
 
-    /// Render radar layer toggle with product/elevation combo boxes.
+    /// Render radar product/elevation combo boxes (shown when Radar is enabled).
     fn render_radar_controls(
         &self,
         ui: &mut egui::Ui,
@@ -467,9 +555,7 @@ impl Gui {
         combo_width: f32,
         id_prefix: &str,
     ) {
-        ui.checkbox(pane.layers.enabled_mut(LayerKind::Radar), "\u{1f6f0}  Radar");
-
-        if pane.layers.is_enabled(LayerKind::Radar) {
+        if self.overlays.is_enabled(OverlayKind::Radar) {
             ui.indent(format!("{id_prefix}radar_controls"), |ui| {
                 if let Some(scan_info) = &pane.scan_info {
                     let prev_product = pane.selected_product;
@@ -757,151 +843,62 @@ impl Gui {
         }
     }
 
-    /// Render SPC outlook day selector, layer toggles, and refresh button.
-    fn render_spc_outlook_controls(
+    /// Render controls for all handler-backed overlays generically.
+    ///
+    /// Iterates over registered overlay kinds in a fixed display order,
+    /// collects controls from each handler, renders them, and applies
+    /// any resulting control updates.
+    fn render_overlay_controls(
         &mut self,
         ui: &mut egui::Ui,
-        pane: &mut PaneState,
+        is_mobile: bool,
         actions: &mut Vec<GuiAction>,
     ) {
-        ui.label("\u{26c8}  SPC Outlooks");
+        const ORDER: &[OverlayKind] = &[
+            OverlayKind::Radar,
+            OverlayKind::SpcOutlook,
+            OverlayKind::SpcDiscussions,
+            OverlayKind::NwsAlerts,
+            OverlayKind::StormReports,
+            OverlayKind::Metar,
+            OverlayKind::CityLabels,
+            OverlayKind::RadarSites,
+            OverlayKind::UserLocation,
+        ];
 
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Day:");
-            let mut changed = false;
-            let mut new_day = pane.layers.spc_day;
-            for &d in OutlookDay::all() {
-                if ui.selectable_label(new_day == d, d.label()).clicked() {
-                    new_day = d;
-                    changed = true;
-                }
+        let ctx = PaneControlContext {
+            pane_idx: self.active_pane,
+            is_mobile,
+            pane_state: None,
+        };
+
+        // Phase 1: Render controls and collect updates
+        let mut updates: Vec<(OverlayKind, ControlUpdate)> = Vec::new();
+
+        for (i, &kind) in ORDER.iter().enumerate() {
+            if i > 0 {
+                ui.add_space(6.0);
+                ui.separator();
             }
-            if changed {
-                pane.layers.spc_day = new_day;
-                let products = pane.layers.enabled_spc_products();
-                if !products.is_empty() {
-                    actions.push(GuiAction::FetchOverlay(OverlayKind::SpcOutlook));
-                }
-            }
-        });
-
-        let spc_layers = pane.layers.spc_layers_for_day();
-        for layer in &spc_layers {
-            let was_enabled = pane.layers.is_enabled(*layer);
-            ui.checkbox(pane.layers.enabled_mut(*layer), layer.display_name());
-            let is_enabled = pane.layers.is_enabled(*layer);
-            if is_enabled && !was_enabled && !self.overlays.is_fetching(OverlayKind::SpcOutlook) {
-                actions.push(GuiAction::FetchOverlay(OverlayKind::SpcOutlook));
-            }
-        }
-
-        if pane.layers.any_spc_enabled() {
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(!self.overlays.is_fetching(OverlayKind::SpcOutlook), egui::Button::new("\u{1f504} Refresh"))
-                    .clicked()
-                {
-                    actions.push(GuiAction::RefreshOverlay(OverlayKind::SpcOutlook));
-                }
-                if self.overlays.is_fetching(OverlayKind::SpcOutlook) {
-                    ui.spinner();
-                }
-            });
-        }
-    }
-
-    /// Render SPC Mesoscale Discussion toggle, refresh button, and fetch time.
-    fn render_spc_discussion_controls(
-        &mut self,
-        ui: &mut egui::Ui,
-        pane: &mut PaneState,
-        actions: &mut Vec<GuiAction>,
-    ) {
-        {
-            let was_enabled = pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
-            let md_count = self.overlays.item_count(OverlayKind::SpcDiscussions);
-            let label = if md_count == 0 {
-                "\u{1f4cb}  Mesoscale Disc.".to_string()
-            } else {
-                format!("\u{1f4cb}  Mesoscale Disc. ({})", md_count)
-            };
-            ui.checkbox(
-                pane.layers.enabled_mut(LayerKind::SpcMesoscaleDiscussions),
-                label,
-            );
-            let is_enabled = pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions);
-            if is_enabled && !was_enabled && !self.overlays.has_data(OverlayKind::SpcDiscussions) && !self.overlays.is_fetching(OverlayKind::SpcDiscussions) {
-                actions.push(GuiAction::FetchOverlay(OverlayKind::SpcDiscussions));
+            let controls = self.overlays.controls(kind, &ctx);
+            for item in &controls {
+                render_control_item(ui, kind, item, &mut updates);
             }
         }
 
-        if pane.layers.is_enabled(LayerKind::SpcMesoscaleDiscussions) {
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(!self.overlays.is_fetching(OverlayKind::SpcDiscussions), egui::Button::new("\u{1f504} Refresh"))
-                    .clicked()
-                {
-                    actions.push(GuiAction::RefreshOverlay(OverlayKind::SpcDiscussions));
-                }
-                if self.overlays.is_fetching(OverlayKind::SpcDiscussions) {
-                    ui.spinner();
-                }
-            });
-            if let Some(t) = self.overlays.fetch_time(OverlayKind::SpcDiscussions) {
-                let secs_ago = t.elapsed().as_secs();
-                let label = if secs_ago < 60 {
-                    format!("Updated {}s ago", secs_ago)
-                } else {
-                    format!("Updated {}m ago", secs_ago / 60)
-                };
-                ui.label(egui::RichText::new(label).small().weak());
-            }
-        }
-    }
+        // Phase 2: Apply updates and handle effects
+        let mut pane_ctx = PaneControlContextMut {
+            pane_idx: self.active_pane,
+            pane_state: None,
+        };
 
-    /// Render NWS alert category toggles, refresh button, alert count, and fetch time.
-    fn render_nws_alert_controls(
-        &mut self,
-        ui: &mut egui::Ui,
-        pane: &mut PaneState,
-        actions: &mut Vec<GuiAction>,
-    ) {
-        ui.label("\u{26a0}  NWS Alerts");
-
-        let nws_layers = [LayerKind::NwsWarnings, LayerKind::NwsWatches, LayerKind::NwsAdvisories];
-        for layer in &nws_layers {
-            let was_enabled = pane.layers.is_enabled(*layer);
-            ui.checkbox(pane.layers.enabled_mut(*layer), layer.display_name());
-            let is_enabled = pane.layers.is_enabled(*layer);
-            if is_enabled && !was_enabled && !self.overlays.has_data(OverlayKind::NwsAlerts) && !self.overlays.is_fetching(OverlayKind::NwsAlerts) {
-                actions.push(GuiAction::FetchOverlay(OverlayKind::NwsAlerts));
-            }
-        }
-
-        if pane.layers.any_nws_enabled() {
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(!self.overlays.is_fetching(OverlayKind::NwsAlerts), egui::Button::new("\u{1f504} Refresh"))
-                    .clicked()
-                {
-                    actions.push(GuiAction::RefreshOverlay(OverlayKind::NwsAlerts));
+        for (kind, update) in updates {
+            let effect = self.overlays.apply_control(kind, &update, &mut pane_ctx);
+            match effect {
+                ControlEffect::Fetch => {
+                    actions.push(GuiAction::FetchOverlay(kind));
                 }
-                if self.overlays.is_fetching(OverlayKind::NwsAlerts) {
-                    ui.spinner();
-                }
-            });
-            if self.overlays.has_data(OverlayKind::NwsAlerts) {
-                let visible_count = self.overlays.clickable_items(OverlayKind::NwsAlerts, &pane.layers).len();
-                ui.label(format!("{} alerts shown", visible_count));
-            }
-            if let Some(t) = self.overlays.fetch_time(OverlayKind::NwsAlerts) {
-                let secs_ago = t.elapsed().as_secs();
-                let label = if secs_ago < 60 {
-                    format!("Updated {}s ago", secs_ago)
-                } else {
-                    format!("Updated {}m ago", secs_ago / 60)
-                };
-                ui.label(egui::RichText::new(label).small().weak());
+                ControlEffect::None => {}
             }
         }
     }
@@ -924,25 +921,18 @@ impl Gui {
             return;
         }
         let src = &self.panes[self.active_pane];
-        let spc_day = src.layers.spc_day;
         let active_site = src.site.clone();
         let active_scan_info = src.scan_info.clone();
         let active_viewing_live = src.viewing_live;
         let active_time_step_secs = src.time_step_secs;
         let active_draw_order = src.draw_order.clone();
-        let snapshot: Vec<(LayerKind, bool)> = LayerKind::all()
-        .iter()
-        .map(|&k| (k, src.layers.is_enabled(k)))
-        .collect();
 
+        // All overlay toggles live in the global OverlayRegistry, already shared.
+        // Sync only per-pane fields.
         for (idx, p) in self.panes.iter_mut().enumerate() {
             if idx == self.active_pane {
                 continue;
             }
-            for &(kind, enabled) in &snapshot {
-                p.layers.set_enabled(kind, enabled);
-            }
-            p.layers.spc_day = spc_day;
             p.site = active_site.clone();
             p.scan_info = active_scan_info.clone();
             p.viewing_live = active_viewing_live;
@@ -1051,11 +1041,6 @@ impl Gui {
         }
     }
 
-    /// Get a specific pane's layer manager (immutable).
-    pub fn layers_for_pane(&self, pane_idx: PaneId) -> Option<&LayerManager> {
-        self.panes.get(pane_idx).map(|p| &p.layers)
-    }
-
     /// Get the scan info for the active pane.
     pub fn get_scan_info(&self) -> Option<&ScanInfo> {
         self.panes.get(self.active_pane).and_then(|p| p.scan_info.as_ref())
@@ -1069,8 +1054,10 @@ impl Gui {
     /// Whether auto-poll is active and the event loop should keep waking
     pub fn is_auto_poll_active(&self) -> bool {
         self.auto_poll.is_active()
-            || self.panes.iter().any(|p| p.layers.any_nws_enabled())
-            || self.panes.iter().any(|p| p.layers.is_enabled(LayerKind::Metar))
+            || OverlayKind::all().iter().any(|&kind| {
+                self.overlays.auto_poll_interval(kind).is_some()
+                    && self.overlays.is_enabled(kind)
+            })
     }
 
     /// Whether any pane has a loop that is playing or has in-flight work.

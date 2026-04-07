@@ -2,7 +2,7 @@
 
 use rustdar_units::UserPreferences;
 use crate::actions::GuiAction;
-use rustdar_overlays::render::layers::LayerKind;
+use rustdar_overlays::render::overlay_state::OverlayKind;
 use crate::pane::PaneState;
 
 use egui::Context;
@@ -77,8 +77,14 @@ impl super::Gui {
                 });
 
                 ui.menu_button("View", |ui| {
-                    ui.checkbox(self.panes[self.active_pane].layers.enabled_mut(LayerKind::RadarSites), "Show radar sites");
-                    ui.checkbox(self.panes[self.active_pane].layers.enabled_mut(LayerKind::CityLabels), "Show city labels");
+                    let mut sites_enabled = self.overlays.is_enabled(OverlayKind::RadarSites);
+                    if ui.checkbox(&mut sites_enabled, "Show radar sites").changed() {
+                        self.overlays.set_enabled(OverlayKind::RadarSites, sites_enabled);
+                    }
+                    let mut labels_enabled = self.overlays.is_enabled(OverlayKind::CityLabels);
+                    if ui.checkbox(&mut labels_enabled, "Show city labels").changed() {
+                        self.overlays.set_enabled(OverlayKind::CityLabels, labels_enabled);
+                    }
                     ui.separator();
                     if ui.button("Time...").clicked() {
                         self.time_dialog.show = true;

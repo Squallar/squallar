@@ -1,0 +1,66 @@
+use std::any::Any;
+use std::sync::Arc;
+
+use crate::render::controls::{ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut};
+use crate::render::overlay_state::{OverlayHandler, OverlayItem, OverlayKind, RenderMode};
+
+/// Handler for the user's GPS location marker.
+///
+/// Manages toggle state. Rendering (blue dot) is done per-frame directly
+/// in the draw loop.
+pub(crate) struct UserLocationHandler {
+    pub enabled: bool,
+}
+
+impl UserLocationHandler {
+    pub fn new() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl OverlayHandler for UserLocationHandler {
+    fn kind(&self) -> OverlayKind { OverlayKind::UserLocation }
+    fn display_name(&self) -> &str { "My Location" }
+    fn render_mode(&self) -> RenderMode { RenderMode::PerFrameDirect }
+    fn default_enabled(&self) -> bool { true }
+    fn is_enabled(&self) -> bool { self.enabled }
+    fn set_enabled(&mut self, enabled: bool) { self.enabled = enabled; }
+
+    fn data_generation(&self) -> u64 { 0 }
+    fn has_data(&self) -> bool { true }
+    fn is_fetching(&self) -> bool { false }
+    fn set_fetching(&mut self, _fetching: bool) {}
+    fn fetch_time(&self) -> Option<std::time::Instant> { None }
+
+    fn apply_fetch_result(&mut self, _result: Box<dyn Any + Send>) {}
+    fn retain_selections(&self, _selections: &mut Vec<Arc<dyn OverlayItem>>) {}
+
+    fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
+        vec![
+            ControlItem::Toggle {
+                id: "enabled",
+                label: "\u{1f4cd}  My Location".to_string(),
+                enabled: self.enabled,
+            },
+        ]
+    }
+
+    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneControlContextMut<'_>) -> ControlEffect {
+        if update.id == "enabled" {
+            if let crate::render::controls::ControlValue::Bool(val) = update.value {
+                self.enabled = val;
+            }
+        }
+        ControlEffect::None
+    }
+
+    fn serialize_state(&self) -> serde_json::Value {
+        serde_json::json!({ "enabled": self.enabled })
+    }
+
+    fn deserialize_state(&mut self, value: serde_json::Value) {
+        if let Some(enabled) = value.get("enabled").and_then(|v| v.as_bool()) {
+            self.enabled = enabled;
+        }
+    }
+}

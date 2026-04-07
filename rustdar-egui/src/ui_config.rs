@@ -82,6 +82,9 @@ struct UiConfig {
     panes: Vec<PaneConfig>,
     /// User unit/timezone preferences.
     preferences: UserPreferences,
+    /// Handler-owned config state (overlay kind name → serialized state).
+    #[serde(default)]
+    overlay_states: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Default for UiConfig {
@@ -98,6 +101,7 @@ impl Default for UiConfig {
             time_step_secs: 600,
             panes: vec![PaneConfig::default()],
             preferences: UserPreferences::default(),
+            overlay_states: serde_json::Map::new(),
         }
     }
 }
@@ -113,10 +117,6 @@ impl super::Gui {
         // Guard against NaN/Infinity in f32 fields which cause serde_json to fail.
         let fps = if self.loop_speed_fps.is_finite() { self.loop_speed_fps } else { 5.0 };
         let pane_configs: Vec<PaneConfig> = self.panes.iter().map(|pane| {
-            let layers = LayerKind::all()
-                .iter()
-                .map(|&k| (k, pane.layers.is_enabled(k)))
-                .collect();
             PaneConfig {
                 selected_product: pane.selected_product,
                 selected_elevation: if pane.selected_elevation.is_finite() {
@@ -124,8 +124,8 @@ impl super::Gui {
                 } else {
                     0.0
                 },
-                layers,
-                spc_day: pane.layers.spc_day,
+                layers: BTreeMap::new(),
+                spc_day: OutlookDay::Day1,
                 site: pane.site.clone(),
                 time_step_secs: pane.time_step_secs,
                 draw_order: pane.draw_order.clone(),
@@ -143,6 +143,7 @@ impl super::Gui {
             time_step_secs: self.panes.first().map(|p| p.time_step_secs).unwrap_or(600),
             panes: pane_configs,
             preferences: self.preferences.clone(),
+            overlay_states: self.overlays.serialize_handler_states(),
         };
         match serde_json::to_string_pretty(&config) {
             Ok(json) => {
@@ -202,6 +203,10 @@ impl super::Gui {
         self.preferences = config.preferences;
 
         // Restore per-pane state.
+        // Migrate legacy per-pane Radar toggle from old `layers` map to the
+        // global RadarHandler, using the first pane's value (all panes were
+        // synced anyway when there was a per-pane layer manager).
+        let mut legacy_radar_enabled: Option<bool> = None;
         for (i, pane) in self.panes.iter_mut().enumerate().take(count) {
             let pc = config.panes.get(i);
             let Some(pc) = pc else {
@@ -211,17 +216,28 @@ impl super::Gui {
             };
             pane.selected_product = pc.selected_product;
             pane.selected_elevation = pc.selected_elevation;
-            pane.layers.spc_day = pc.spc_day;
             if !pc.site.is_empty() {
                 pane.site = pc.site.clone();
             } else if !config.site.is_empty() {
                 pane.site = config.site.clone();
             }
             pane.time_step_secs = pc.time_step_secs;
-            for (&kind, &enabled) in &pc.layers {
-                pane.layers.set_enabled(kind, enabled);
+            // Capture the first pane's legacy Radar toggle for migration.
+            if legacy_radar_enabled.is_none() {
+                if let Some(&enabled) = pc.layers.get(&LayerKind::Radar) {
+                    legacy_radar_enabled = Some(enabled);
+                }
             }
             pane.draw_order = reconcile_draw_order(&pc.draw_order);
+        }
+
+        // Restore handler-owned overlay states (backward-compatible: old configs have empty map)
+        if !config.overlay_states.is_empty() {
+            self.overlays.deserialize_handler_states(&config.overlay_states);
+        } else if let Some(enabled) = legacy_radar_enabled {
+            // Migrating from legacy config: no overlay_states saved yet.
+            // Apply the old per-pane Radar toggle to the global handler.
+            self.overlays.set_enabled(OverlayKind::Radar, enabled);
         }
     }
 }

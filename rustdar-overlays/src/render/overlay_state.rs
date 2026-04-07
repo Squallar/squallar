@@ -1,12 +1,12 @@
 use std::any::Any;
+use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use rustdar_units::UserPreferences;
 
-use crate::nws::alert::AlertCategory;
-use crate::render::layers::LayerManager;
-use crate::spc::outlook::{OutlookDay, OutlookProduct};
+use crate::render::controls::{ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut};
 use crate::render::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter};
 use crate::render::rasterize::RasterizeOutput;
 use crate::types::{GeoBounds, OverlayFeature, OverlayLabel};
@@ -56,44 +56,84 @@ impl<T> OverlayState<T> {
     }
 }
 
-/// Identifies a clicked overlay item for the detail popup pager.
-#[derive(Clone, Debug)]
-pub enum SelectedOverlay {
-    /// An NWS alert, identified by its stable API ID string.
-    Alert(String),
-    /// An SPC Mesoscale Discussion, identified by its stable MD number.
-    Discussion(u32),
-    /// An SPC convective outlook feature, identified by its short label.
-    Outlook { label: String },
-    /// An SPC storm report, identified by its index in the reports list.
-    StormReport { index: usize },
-    /// A METAR surface observation, identified by station ICAO ID.
-    Metar { station_id: String },
+/// How an overlay is rendered on the map.
+///
+/// Handlers declare their render mode; the draw loop dispatches generically
+/// based on this rather than matching on `OverlayKind` variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderMode {
+    /// Pre-rasterized to an RGBA texture on a background thread (SPC, NWS, Radar, etc.).
+    Texture,
+    /// Drawn each frame using the abstract [`PointPainter`] trait (METAR station models).
+    PerFramePoint,
+    /// Drawn each frame by the handler via framework-agnostic primitives (UserLocation).
+    PerFrameDirect,
+    /// Streaming tile layer managed by the map widget (BaseMap, CityLabels).
+    Tile,
+}
+
+/// A clickable overlay data item that can appear in the popup pager.
+///
+/// Replaces the old fixed `SelectedOverlay` enum. Handlers store their data as
+/// `Vec<Arc<T>>` where `T: OverlayItem`; when the user clicks, the `Arc` is
+/// cloned into the selection list as `Arc<dyn OverlayItem>`.
+pub trait OverlayItem: Send + Sync + Debug {
+    /// Which overlay kind this item belongs to.
+    fn kind(&self) -> OverlayKind;
+
+    /// Build the popup content for this item's detail view.
+    fn popup_content(&self, prefs: &UserPreferences) -> PopupContent;
+
+    /// Identity match: returns `true` if `other` represents the same logical
+    /// item (e.g. same alert ID, same MD number). Used by `retain_selections()`
+    /// to map old selections to refreshed data.
+    fn matches(&self, other: &dyn OverlayItem) -> bool;
+
+    /// Downcast to `&dyn Any` for concrete type comparisons in `matches()`.
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// An overlay item that can be clicked and optionally labelled on the map.
 ///
-/// Returned by `OverlayKind::clickable_items()` so that the UI crate can
+/// Returned by [`OverlayHandler::clickable_items()`] so that the UI crate can
 /// perform hit-testing and label drawing without knowing overlay-specific types.
-pub struct ClickableItem<'a> {
+pub struct ClickableItem {
     /// Renderable polygon features for hit-testing.
-    pub features: Vec<&'a OverlayFeature>,
+    pub features: Vec<OverlayFeature>,
     /// Optional map label to draw at a geographic position.
     pub label: Option<OverlayLabel>,
-    /// The stable identifier to store when the user clicks this item.
-    pub id: SelectedOverlay,
+    /// The data item to store when the user clicks this item.
+    pub item: Arc<dyn OverlayItem>,
 }
 
 // ── Overlay handler trait ─────────────────────────────────────────────────
 
-/// Trait for overlay type handlers. Each fetchable overlay type implements this
-/// to encapsulate its data, fetch logic, render logic, and popup content.
+/// Trait for overlay type handlers. Each overlay type implements this to
+/// encapsulate its data, fetch logic, render logic, UI controls, and popup
+/// content.
 ///
-/// Adding a new overlay only requires implementing this trait in a new handler
-/// struct and registering it in the `OverlayRegistry` constructor.
-pub(crate) trait OverlayHandler {
+/// Adding a new overlay only requires:
+/// 1. Implementing this trait in a new handler struct
+/// 2. Registering it in `create_handlers()`
+/// 3. Adding an `OverlayKind` variant
+///
+/// No changes to `rustdar-egui` or `rustdar-platform` are required.
+pub trait OverlayHandler: Send {
+    // ── Identity & metadata ───────────────────────────────────────────
+
     /// Which overlay kind this handler manages.
     fn kind(&self) -> OverlayKind;
+
+    /// Human-readable display name (e.g. "Radar", "NWS Alerts").
+    fn display_name(&self) -> &str;
+
+    /// How this overlay is rendered on the map.
+    fn render_mode(&self) -> RenderMode;
+
+    /// Whether this overlay is enabled by default in a new pane.
+    fn default_enabled(&self) -> bool { false }
+
+    // ── Data lifecycle ────────────────────────────────────────────────
 
     /// Current data generation counter for cache invalidation.
     fn data_generation(&self) -> u64;
@@ -116,40 +156,56 @@ pub(crate) trait OverlayHandler {
     /// Number of loaded data items.
     fn item_count(&self) -> usize { 0 }
 
-    /// Build clickable/labelled items for hit-testing on the map.
-    fn clickable_items(&self, layers: &LayerManager) -> Vec<ClickableItem<'_>>;
+    /// Whether this overlay is currently enabled (considering handler internal toggles).
+    ///
+    /// Replaces the old `OverlayKind::is_enabled(layers)` — each handler owns
+    /// its own toggle state and checks it here.
+    fn is_enabled(&self) -> bool { true }
 
-    /// Build popup content for a selected overlay item.
-    /// Returns `None` if this handler doesn't own the given selection.
-    fn popup_content(&self, selected: &SelectedOverlay, prefs: &UserPreferences) -> Option<PopupContent>;
+    /// Set the enabled state directly. Only meaningful for simple toggle handlers.
+    fn set_enabled(&mut self, _enabled: bool) {}
 
-    /// Handle a popup action button. Returns `true` if the item should be removed.
-    fn handle_popup_action(&mut self, _action: &PopupAction) -> bool { false }
+    // ── Fetching ──────────────────────────────────────────────────────
+
+    /// Create async fetch tasks for this overlay's data.
+    fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
+        let _ = ctx;
+        Vec::new()
+    }
 
     /// Apply a type-erased fetch result. The handler downcasts to its expected type.
     fn apply_fetch_result(&mut self, result: Box<dyn Any + Send>);
 
-    /// Remove stale selections that no longer exist in the handler's data.
-    fn retain_selections(&self, selections: &mut Vec<SelectedOverlay>);
+    // ── Rendering (texture mode) ──────────────────────────────────────
 
     /// Prepare a rasterization closure for background rendering.
     /// Returns `None` if there's nothing to render.
     fn prepare_rasterize(
         &self,
         ctx: &RasterizeContext,
-    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>>;
+    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>> {
+        let _ = ctx;
+        None
+    }
 
-    /// Create async fetch tasks for this overlay's data.
-    fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask>;
+    // ── Click & selection ─────────────────────────────────────────────
 
-    // ── Per-frame point rendering (opt-in) ────────────────────────────
+    /// Build clickable/labelled items for hit-testing on the map.
+    fn clickable_items(&self) -> Vec<ClickableItem> { Vec::new() }
+
+    /// Handle a popup action button. Returns `true` if the action was handled.
+    fn handle_popup_action(&mut self, _action: &PopupAction) -> bool { false }
+
+    /// Remove stale selections that no longer exist in the handler's data.
+    /// Keeps selections whose `matches()` still finds a corresponding item.
+    fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>);
+
+    // ── Per-frame point rendering (opt-in for PerFramePoint mode) ─────
 
     /// Return geographic points to be drawn per-frame by the UI crate.
-    /// Non-empty return opts this overlay into the per-frame rendering path.
     fn per_frame_points(&self) -> &[MapPoint] { &[] }
 
     /// Draw a single point using abstract drawing primitives.
-    /// Called by the UI crate for each visible point returned by `per_frame_points()`.
     fn draw_point(&self, _id: u32, _painter: &mut dyn PointPainter, _ctx: &DrawPointContext) {}
 
     /// Clickable radius in screen pixels for hit-testing around each point.
@@ -157,16 +213,73 @@ pub(crate) trait OverlayHandler {
 
     /// Tooltip text shown on hover. Return `None` to suppress the tooltip.
     fn hover_text(&self, _id: u32, _ctx: &HoverContext<'_>) -> Option<String> { None }
+
+    // ── Declarative UI controls ───────────────────────────────────────
+
+    /// Describe this overlay's UI controls declaratively.
+    /// The egui crate renders these generically.
+    fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> { Vec::new() }
+
+    /// Apply a control update from the UI. The handler interprets the
+    /// control `id` and `value` to update its internal state.
+    /// Returns a [`ControlEffect`] signalling any side-effects the caller
+    /// should perform (e.g. triggering a data fetch).
+    fn apply_control(&mut self, _update: &ControlUpdate, _ctx: &mut PaneControlContextMut<'_>) -> ControlEffect { ControlEffect::None }
+
+    // ── Per-pane state ────────────────────────────────────────────────
+
+    /// Create initial per-pane handler state (e.g. selected product, loop state).
+    /// Returns `None` if this handler has no per-pane state.
+    fn create_pane_state(&self) -> Option<Box<dyn Any + Send>> { None }
+
+    // ── Config persistence ────────────────────────────────────────────
+
+    /// Serialize this handler's global state for config persistence.
+    fn serialize_state(&self) -> serde_json::Value { serde_json::Value::Null }
+
+    /// Restore global state from a previously serialized value.
+    fn deserialize_state(&mut self, _value: serde_json::Value) {}
+
+    /// Serialize per-pane handler state.
+    fn serialize_pane_state(&self, _state: &dyn Any) -> serde_json::Value {
+        serde_json::Value::Null
+    }
+
+    /// Restore per-pane handler state from a serialized value.
+    fn deserialize_pane_state(&self, _value: serde_json::Value) -> Option<Box<dyn Any + Send>> {
+        None
+    }
+
+    // ── Loop support (opt-in) ─────────────────────────────────────────
+
+    /// Whether this overlay supports time-series loop animation.
+    fn supports_loop(&self) -> bool { false }
+
+    /// Create an async task that lists available frames for a time range.
+    /// Returns timestamps of available frames.
+    fn create_loop_list_task(
+        &self,
+        _ctx: &FetchConfig,
+        _start: chrono::NaiveDateTime,
+        _end: chrono::NaiveDateTime,
+    ) -> Option<FetchTask> {
+        None
+    }
+
+    /// Create an async task to download a single loop frame's data.
+    fn create_loop_frame_task(
+        &self,
+        _ctx: &FetchConfig,
+        _timestamp: chrono::NaiveDateTime,
+    ) -> Option<FetchTask> {
+        None
+    }
 }
 
 /// Context for creating overlay fetch tasks.
 pub struct FetchConfig {
     pub client: reqwest::Client,
     pub zone_cache_dir: Option<std::path::PathBuf>,
-    /// Currently selected SPC outlook day.
-    pub spc_day: OutlookDay,
-    /// SPC outlook products whose layers are enabled.
-    pub spc_products: Vec<OutlookProduct>,
 }
 
 /// Context for preparing overlay rasterization closures.
@@ -175,12 +288,6 @@ pub struct RasterizeContext {
     pub is_dark: bool,
     /// Current map zoom level.
     pub zoom: f64,
-    /// Selected SPC outlook day.
-    pub spc_day: OutlookDay,
-    /// Enabled SPC outlook products for the current day.
-    pub enabled_spc_products: Vec<OutlookProduct>,
-    /// NWS alert categories currently enabled.
-    pub enabled_nws_categories: Vec<AlertCategory>,
 }
 
 /// An async fetch task produced by a handler.
@@ -196,7 +303,7 @@ pub struct FetchTask {
 pub struct OverlayRegistry {
     handlers: Vec<Box<dyn OverlayHandler>>,
     /// Overlay items selected for the popup pager (from map clicks).
-    pub selected_overlays: Vec<SelectedOverlay>,
+    pub selected_overlays: Vec<Arc<dyn OverlayItem>>,
     /// Current page in the popup pager.
     pub selected_overlay_page: usize,
 }
@@ -225,15 +332,27 @@ impl OverlayRegistry {
         None
     }
 
+    /// Iterate over all registered handlers.
+    pub fn handlers(&self) -> impl Iterator<Item = &dyn OverlayHandler> {
+        self.handlers.iter().map(|h| &**h)
+    }
+
+    /// Get the handler for a specific overlay kind.
+    pub fn get_handler(&self, kind: OverlayKind) -> Option<&dyn OverlayHandler> {
+        self.handler(kind)
+    }
+
+    /// Get a mutable handler for a specific overlay kind.
+    pub fn get_handler_mut(&mut self, kind: OverlayKind) -> Option<&mut dyn OverlayHandler> {
+        self.handler_mut(kind)
+    }
+
     pub fn data_generation(&self, kind: OverlayKind) -> u64 {
         self.handler(kind).map_or(0, |h| h.data_generation())
     }
 
     pub fn has_data(&self, kind: OverlayKind) -> bool {
-        self.handler(kind).map_or(
-            matches!(kind, OverlayKind::Radar | OverlayKind::RadarSites),
-            |h| h.has_data(),
-        )
+        self.handler(kind).map_or(false, |h| h.has_data())
     }
 
     pub fn is_fetching(&self, kind: OverlayKind) -> bool {
@@ -258,23 +377,29 @@ impl OverlayRegistry {
         self.handler(kind).map_or(0, |h| h.item_count())
     }
 
-    pub fn clickable_items(&self, kind: OverlayKind, layers: &LayerManager) -> Vec<ClickableItem<'_>> {
-        self.handler(kind).map_or_else(Vec::new, |h| h.clickable_items(layers))
+    pub fn is_enabled(&self, kind: OverlayKind) -> bool {
+        self.handler(kind).map_or(false, |h| h.is_enabled())
     }
 
-    /// Build popup content by asking each handler until one claims the selection.
-    pub fn popup_content(&self, selected: &SelectedOverlay, prefs: &UserPreferences) -> Option<PopupContent> {
-        self.handlers.iter().find_map(|h| h.popup_content(selected, prefs))
-    }
-
-    /// Execute a popup action by routing to each handler.
-    pub fn handle_popup_action(&mut self, action: &PopupAction) -> bool {
-        for handler in &mut self.handlers {
-            if handler.handle_popup_action(action) {
-                return true;
-            }
+    pub fn set_enabled(&mut self, kind: OverlayKind, enabled: bool) {
+        if let Some(h) = self.handler_mut(kind) {
+            h.set_enabled(enabled);
         }
-        false
+    }
+
+    pub fn clickable_items(&self, kind: OverlayKind) -> Vec<ClickableItem> {
+        self.handler(kind).map_or_else(Vec::new, |h| h.clickable_items())
+    }
+
+    /// Build popup content for a selected overlay item.
+    pub fn popup_content(&self, selected: &dyn OverlayItem, prefs: &UserPreferences) -> PopupContent {
+        selected.popup_content(prefs)
+    }
+
+    /// Execute a popup action by routing to the owning handler.
+    pub fn handle_popup_action(&mut self, action: &PopupAction) -> bool {
+        let kind = action.target.kind();
+        self.handler_mut(kind).is_some_and(|h| h.handle_popup_action(action))
     }
 
     /// Apply a type-erased fetch result from the unified overlay channel.
@@ -303,6 +428,35 @@ impl OverlayRegistry {
         self.handler(kind).map_or_else(Vec::new, |h| h.create_fetch_tasks(ctx))
     }
 
+    /// Describe UI controls for the given overlay kind.
+    pub fn controls(&self, kind: OverlayKind, ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
+        self.handler(kind).map_or_else(Vec::new, |h| h.controls(ctx))
+    }
+
+    /// Apply a control update to the owner handler.
+    pub fn apply_control(&mut self, kind: OverlayKind, update: &ControlUpdate, ctx: &mut PaneControlContextMut<'_>) -> ControlEffect {
+        if let Some(h) = self.handler_mut(kind) {
+            h.apply_control(update, ctx)
+        } else {
+            ControlEffect::None
+        }
+    }
+
+    /// Get the render mode for the given overlay kind.
+    pub fn render_mode(&self, kind: OverlayKind) -> Option<RenderMode> {
+        self.handler(kind).map(|h| h.render_mode())
+    }
+
+    /// Get the display name for the given overlay kind.
+    pub fn display_name(&self, kind: OverlayKind) -> &str {
+        self.handler(kind).map_or("Unknown", |h| h.display_name())
+    }
+
+    /// Whether the given overlay kind is enabled.
+    pub fn default_enabled(&self, kind: OverlayKind) -> bool {
+        self.handler(kind).is_some_and(|h| h.default_enabled())
+    }
+
     // ── Per-frame point rendering delegates ───────────────────────────
 
     /// Geographic points for per-frame rendering of the given overlay kind.
@@ -325,6 +479,31 @@ impl OverlayRegistry {
     /// Tooltip text for a point in the given overlay kind.
     pub fn hover_text(&self, kind: OverlayKind, id: u32, ctx: &HoverContext<'_>) -> Option<String> {
         self.handler(kind).and_then(|h| h.hover_text(id, ctx))
+    }
+
+    // ── Config persistence ────────────────────────────────────────────
+
+    /// Serialize all handler states for config persistence.
+    /// Returns a map of overlay kind name → serialized state.
+    pub fn serialize_handler_states(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut map = serde_json::Map::new();
+        for h in &self.handlers {
+            let val = h.serialize_state();
+            if !val.is_null() {
+                map.insert(format!("{:?}", h.kind()), val);
+            }
+        }
+        map
+    }
+
+    /// Restore handler states from previously serialized data.
+    pub fn deserialize_handler_states(&mut self, states: &serde_json::Map<String, serde_json::Value>) {
+        for h in &mut self.handlers {
+            let key = format!("{:?}", h.kind());
+            if let Some(val) = states.get(&key) {
+                h.deserialize_state(val.clone());
+            }
+        }
     }
 }
 
@@ -368,47 +547,9 @@ impl OverlayKind {
         ]
     }
 
-    /// Only the overlay kinds that get rasterized to background textures.
-    pub const fn texture_overlays() -> &'static [OverlayKind] {
-        &[
-            OverlayKind::SpcOutlook,
-            OverlayKind::SpcDiscussions,
-            OverlayKind::NwsAlerts,
-            OverlayKind::StormReports,
-            OverlayKind::RadarSites,
-            OverlayKind::Radar,
-        ]
-    }
-
-    /// Whether this kind is a background-rasterized texture overlay.
-    pub fn is_texture_overlay(self) -> bool {
-        matches!(self, OverlayKind::SpcOutlook | OverlayKind::SpcDiscussions | OverlayKind::NwsAlerts | OverlayKind::StormReports | OverlayKind::RadarSites | OverlayKind::Radar)
-    }
-
     /// Default draw order (bottom to top) for a new pane.
     pub fn default_draw_order() -> Vec<OverlayKind> {
         Self::all().to_vec()
-    }
-
-    /// Whether the relevant layer(s) for this kind are enabled.
-    pub fn is_enabled(self, layers: &super::layers::LayerManager) -> bool {
-        use super::layers::LayerKind;
-        match self {
-            OverlayKind::SpcOutlook => layers
-                .spc_layers_for_day()
-                .iter()
-                .any(|lk| layers.is_enabled(*lk)),
-            OverlayKind::SpcDiscussions => {
-                layers.is_enabled(LayerKind::SpcMesoscaleDiscussions)
-            }
-            OverlayKind::NwsAlerts => layers.any_nws_enabled(),
-            OverlayKind::StormReports => layers.is_enabled(LayerKind::StormReports),
-            OverlayKind::Metar => layers.is_enabled(LayerKind::Metar),
-            OverlayKind::Radar => layers.is_enabled(LayerKind::Radar),
-            OverlayKind::CityLabels => layers.is_enabled(LayerKind::CityLabels),
-            OverlayKind::RadarSites => layers.is_enabled(LayerKind::RadarSites),
-            OverlayKind::UserLocation => true,
-        }
     }
 }
 
@@ -463,7 +604,7 @@ pub struct PopupAction {
     /// Button label.
     pub label: String,
     /// Which overlay item this action targets.
-    pub target: SelectedOverlay,
+    pub target: Arc<dyn OverlayItem>,
     /// The kind of action.
     pub kind: PopupActionKind,
 }

@@ -1,12 +1,13 @@
 use std::any::Any;
 use std::collections::HashSet;
+use std::sync::Arc;
 
-use crate::nws::alert::NwsAlert;
-use crate::render::layers::LayerManager;
+use crate::nws::alert::{AlertCategory, NwsAlert};
+use crate::render::controls::{ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext, PaneControlContextMut};
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayKind, OverlayState,
-    PopupAction, PopupActionKind, PopupContent, PopupSection, RasterizeContext,
-    SelectedOverlay,
+    ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
+    OverlayState, PopupAction, PopupActionKind, PopupContent, PopupSection, RasterizeContext,
+    RenderMode,
 };
 use crate::render::rasterize::{self, RasterizeOutput};
 use crate::types::GeoBounds;
@@ -14,72 +15,19 @@ use crate::types::GeoBounds;
 /// Type-erased fetch result for NWS alerts.
 pub(crate) struct NwsAlertFetchResult(pub Result<Vec<NwsAlert>, String>);
 
-pub(crate) struct NwsAlertHandler {
-    pub state: OverlayState<Vec<NwsAlert>>,
-    /// Alert IDs hidden by the user (not rendered on the map).
-    pub hidden_alerts: HashSet<String>,
+/// Clickable item representing a single NWS alert.
+#[derive(Debug)]
+pub(crate) struct AlertItem {
+    pub alert: NwsAlert,
 }
 
-impl NwsAlertHandler {
-    pub fn new() -> Self {
-        Self {
-            state: OverlayState::new(),
-            hidden_alerts: HashSet::new(),
-        }
-    }
-}
-
-impl OverlayHandler for NwsAlertHandler {
+impl OverlayItem for AlertItem {
     fn kind(&self) -> OverlayKind {
         OverlayKind::NwsAlerts
     }
 
-    fn data_generation(&self) -> u64 {
-        self.state.data_generation
-    }
-
-    fn has_data(&self) -> bool {
-        !self.state.data.is_empty()
-    }
-
-    fn is_fetching(&self) -> bool {
-        self.state.fetching
-    }
-
-    fn set_fetching(&mut self, fetching: bool) {
-        self.state.fetching = fetching;
-    }
-
-    fn fetch_time(&self) -> Option<std::time::Instant> {
-        self.state.fetch_time
-    }
-
-    fn auto_poll_interval(&self) -> Option<u64> {
-        Some(120)
-    }
-
-    fn item_count(&self) -> usize {
-        self.state.data.len()
-    }
-
-    fn clickable_items(&self, layers: &LayerManager) -> Vec<ClickableItem<'_>> {
-        let enabled_categories = layers.enabled_nws_categories();
-        self.state.data.iter()
-            .filter(|alert| {
-                enabled_categories.contains(&alert.category)
-                    && !self.hidden_alerts.contains(&alert.id)
-            })
-            .map(|alert| ClickableItem {
-                features: alert.features.iter().collect(),
-                label: None,
-                id: SelectedOverlay::Alert(alert.id.clone()),
-            })
-            .collect()
-    }
-
-    fn popup_content(&self, selected: &SelectedOverlay, prefs: &rustdar_units::UserPreferences) -> Option<PopupContent> {
-        let SelectedOverlay::Alert(alert_id) = selected else { return None };
-        let alert = self.state.data.iter().find(|a| a.id == *alert_id)?;
+    fn popup_content(&self, prefs: &rustdar_units::UserPreferences) -> PopupContent {
+        let alert = &self.alert;
         let [r, g, b, _] = alert.features.first()
             .map(|f| f.stroke_rgba)
             .unwrap_or([200, 200, 200, 255]);
@@ -114,24 +62,117 @@ impl OverlayHandler for NwsAlertHandler {
             });
         }
 
-        Some(PopupContent {
+        PopupContent {
             title: alert.event.clone(),
             accent_rgb: [r, g, b],
             width: 380.0,
             sections,
-            actions: vec![PopupAction {
-                label: "\u{1f6ab}  Hide from map".into(),
-                target: selected.clone(),
-                kind: PopupActionKind::HideFromMap,
-            }],
-        })
+            actions: Vec::new(), // TODO: re-add hide action with Arc<dyn OverlayItem>
+        }
+    }
+
+    fn matches(&self, other: &dyn OverlayItem) -> bool {
+        other
+            .as_any()
+            .downcast_ref::<AlertItem>()
+            .is_some_and(|o| o.alert.id == self.alert.id)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+pub(crate) struct NwsAlertHandler {
+    pub state: OverlayState<Vec<Arc<AlertItem>>>,
+    /// Alert IDs hidden by the user (not rendered on the map).
+    pub hidden_alerts: HashSet<String>,
+    /// Which alert categories are enabled.
+    pub enabled_categories: HashSet<AlertCategory>,
+}
+
+impl NwsAlertHandler {
+    pub fn new() -> Self {
+        let mut enabled = HashSet::new();
+        enabled.insert(AlertCategory::Warning);
+        enabled.insert(AlertCategory::Watch);
+        enabled.insert(AlertCategory::Advisory);
+        Self {
+            state: OverlayState::new(),
+            hidden_alerts: HashSet::new(),
+            enabled_categories: enabled,
+        }
+    }
+}
+
+impl OverlayHandler for NwsAlertHandler {
+    fn kind(&self) -> OverlayKind {
+        OverlayKind::NwsAlerts
+    }
+
+    fn display_name(&self) -> &str {
+        "NWS Alerts"
+    }
+
+    fn render_mode(&self) -> RenderMode {
+        RenderMode::Texture
+    }
+
+    fn default_enabled(&self) -> bool {
+        true
+    }
+
+    fn is_enabled(&self) -> bool {
+        !self.enabled_categories.is_empty()
+    }
+
+    fn data_generation(&self) -> u64 {
+        self.state.data_generation
+    }
+
+    fn has_data(&self) -> bool {
+        !self.state.data.is_empty()
+    }
+
+    fn is_fetching(&self) -> bool {
+        self.state.fetching
+    }
+
+    fn set_fetching(&mut self, fetching: bool) {
+        self.state.fetching = fetching;
+    }
+
+    fn fetch_time(&self) -> Option<std::time::Instant> {
+        self.state.fetch_time
+    }
+
+    fn auto_poll_interval(&self) -> Option<u64> {
+        Some(120)
+    }
+
+    fn item_count(&self) -> usize {
+        self.state.data.len()
+    }
+
+    fn clickable_items(&self) -> Vec<ClickableItem> {
+        self.state.data.iter()
+            .filter(|item| {
+                self.enabled_categories.contains(&item.alert.category)
+                    && !self.hidden_alerts.contains(&item.alert.id)
+            })
+            .map(|item| ClickableItem {
+                features: item.alert.features.clone(),
+                label: None,
+                item: item.clone() as Arc<dyn OverlayItem>,
+            })
+            .collect()
     }
 
     fn handle_popup_action(&mut self, action: &PopupAction) -> bool {
         match action.kind {
             PopupActionKind::HideFromMap => {
-                if let SelectedOverlay::Alert(ref id) = action.target {
-                    self.hidden_alerts.insert(id.clone());
+                if let Some(alert_item) = action.target.as_any().downcast_ref::<AlertItem>() {
+                    self.hidden_alerts.insert(alert_item.alert.id.clone());
                     self.state.data_generation = self.state.data_generation.wrapping_add(1);
                     return true;
                 }
@@ -148,10 +189,13 @@ impl OverlayHandler for NwsAlertHandler {
         match fetch.0 {
             Ok(alerts) => {
                 log::info!("Received {} NWS alerts", alerts.len());
-                // Clean hidden_alerts of IDs no longer present
                 let current_ids: HashSet<String> = alerts.iter().map(|a| a.id.clone()).collect();
                 self.hidden_alerts.retain(|id| current_ids.contains(id));
-                self.state.set_data(alerts);
+                let items = alerts
+                    .into_iter()
+                    .map(|alert| Arc::new(AlertItem { alert }))
+                    .collect();
+                self.state.set_data(items);
             }
             Err(e) => {
                 log::error!("NWS alerts fetch failed: {}", e);
@@ -160,23 +204,24 @@ impl OverlayHandler for NwsAlertHandler {
         self.state.fetching = false;
     }
 
-    fn retain_selections(&self, selections: &mut Vec<SelectedOverlay>) {
-        let current_ids: HashSet<&str> = self.state.data.iter().map(|a| a.id.as_str()).collect();
-        selections.retain(|sel| match sel {
-            SelectedOverlay::Alert(id) => current_ids.contains(id.as_str()),
-            _ => true,
+    fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>) {
+        selections.retain(|sel| {
+            if sel.kind() != OverlayKind::NwsAlerts {
+                return true;
+            }
+            self.state.data.iter().any(|item| item.matches(sel.as_ref()))
         });
     }
 
     fn prepare_rasterize(
         &self,
-        ctx: &RasterizeContext,
+        _ctx: &RasterizeContext,
     ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>> {
         if self.state.data.is_empty() {
             return None;
         }
-        let alerts = self.state.data.clone();
-        let enabled_categories = ctx.enabled_nws_categories.clone();
+        let alerts: Vec<NwsAlert> = self.state.data.iter().map(|i| i.alert.clone()).collect();
+        let enabled_categories: Vec<AlertCategory> = self.enabled_categories.iter().copied().collect();
         let hidden_alerts = self.hidden_alerts.clone();
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
             let rgba = rasterize::rasterize_nws_alerts(
@@ -207,5 +252,95 @@ impl OverlayHandler for NwsAlertHandler {
                 Box::new(NwsAlertFetchResult(result)) as Box<dyn Any + Send>
             }),
         }]
+    }
+
+    fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
+        let mut items = vec![
+            ControlItem::Heading { text: "\u{26a0}  NWS Alerts".into() },
+            ControlItem::Toggle {
+                id: "warnings",
+                label: "\u{26a0}  Warnings".into(),
+                enabled: self.enabled_categories.contains(&AlertCategory::Warning),
+            },
+            ControlItem::Toggle {
+                id: "watches",
+                label: "Watches".into(),
+                enabled: self.enabled_categories.contains(&AlertCategory::Watch),
+            },
+            ControlItem::Toggle {
+                id: "advisories",
+                label: "Advisories".into(),
+                enabled: self.enabled_categories.contains(&AlertCategory::Advisory),
+            },
+        ];
+
+        if self.is_enabled() {
+            items.push(ControlItem::ButtonRow {
+                buttons: vec![ControlButton {
+                    id: "refresh",
+                    label: "\u{1f504} Refresh".into(),
+                    enabled: !self.state.fetching,
+                    highlight: false,
+                }],
+            });
+            if self.state.fetching {
+                items.push(ControlItem::InfoText { text: "Fetching\u{2026}".into() });
+            }
+            if self.has_data() {
+                let visible = self.clickable_items().len();
+                items.push(ControlItem::InfoText { text: format!("{visible} alerts shown") });
+            }
+            if let Some(t) = self.state.fetch_time {
+                let secs = t.elapsed().as_secs();
+                let text = if secs < 60 {
+                    format!("Updated {secs}s ago")
+                } else {
+                    format!("Updated {}m ago", secs / 60)
+                };
+                items.push(ControlItem::InfoText { text });
+            }
+        }
+
+        items
+    }
+
+    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneControlContextMut<'_>) -> ControlEffect {
+        match update.id {
+            "warnings" | "watches" | "advisories" => {
+                let category = match update.id {
+                    "warnings" => AlertCategory::Warning,
+                    "watches" => AlertCategory::Watch,
+                    "advisories" => AlertCategory::Advisory,
+                    _ => return ControlEffect::None,
+                };
+                if let ControlValue::Bool(enabled) = update.value {
+                    let was_enabled = self.is_enabled();
+                    if enabled {
+                        self.enabled_categories.insert(category);
+                    } else {
+                        self.enabled_categories.remove(&category);
+                    }
+                    self.state.data_generation = self.state.data_generation.wrapping_add(1);
+                    if !was_enabled && self.is_enabled() && !self.has_data() && !self.state.fetching {
+                        return ControlEffect::Fetch;
+                    }
+                }
+                ControlEffect::None
+            }
+            "refresh" => ControlEffect::Fetch,
+            _ => ControlEffect::None,
+        }
+    }
+
+    fn serialize_state(&self) -> serde_json::Value {
+        serde_json::json!({
+            "enabled_categories": self.enabled_categories,
+        })
+    }
+
+    fn deserialize_state(&mut self, value: serde_json::Value) {
+        if let Some(cats) = value.get("enabled_categories").and_then(|v| serde_json::from_value(v.clone()).ok()) {
+            self.enabled_categories = cats;
+        }
     }
 }

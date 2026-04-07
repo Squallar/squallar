@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use rustdar_overlays::render::layers::LayerManager;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use crate::overlay_cache::OverlayTextureCache;
 use rustdar_radar::types::{RadarProduct, ScanInfo};
@@ -77,7 +76,6 @@ pub struct PaneState {
     pub time_step_secs: i64,
     pub hover_value: Option<String>,
     pub last_hover_pos: Option<egui::Pos2>,
-    pub layers: LayerManager,
     pub map_memory: MapMemory,
     /// Per-overlay-type texture caches (background-rendered), keyed by `OverlayKind`.
     /// Only texture overlay kinds (SPC, NWS, discussions) have cache entries.
@@ -133,9 +131,8 @@ impl PaneState {
             time_step_secs: 600,
             hover_value: None,
             last_hover_pos: None,
-            layers: LayerManager::new(),
             map_memory,
-            overlay_textures: OverlayKind::texture_overlays()
+            overlay_textures: OverlayKind::all()
                 .iter()
                 .map(|&k| (k, OverlayTextureCache::new()))
                 .collect(),
@@ -154,18 +151,12 @@ impl PaneState {
     }
 
     /// Get the overlay texture cache for a given kind (read-only).
-    /// Returns `None` for non-texture overlay kinds.
     pub fn overlay_cache(&self, kind: OverlayKind) -> Option<&OverlayTextureCache> {
-        if !kind.is_texture_overlay() {
-            return None;
-        }
         self.overlay_textures.get(&kind)
     }
 
     /// Get the overlay texture cache for a given kind, inserting a default if absent.
-    /// Panics if called with a non-texture overlay kind.
     pub fn overlay_cache_mut(&mut self, kind: OverlayKind) -> &mut OverlayTextureCache {
-        debug_assert!(kind.is_texture_overlay(), "overlay_cache_mut called with non-texture kind: {:?}", kind);
         self.overlay_textures.entry(kind).or_insert_with(OverlayTextureCache::new)
     }
 
