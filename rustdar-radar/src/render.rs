@@ -690,9 +690,12 @@ pub fn render_level3_message_to_image(
         }
     };
 
-    // Build scale, offset, and optional LUT from the product description block
-    let scale = l3_msg.pdb.data_scale();
-    let offset = l3_msg.pdb.data_offset();
+    // Build scale, offset, and optional LUT from the product description block.
+    // Prefer XDR-derived scale/offset from packet 28 attributes when available,
+    // since PDB thresholds don't encode IEEE-float values for some products
+    // (e.g. 134 DVL, 135 EET).
+    let scale = rp.xdr_data_scale.unwrap_or_else(|| l3_msg.pdb.data_scale());
+    let offset = rp.xdr_data_offset.unwrap_or_else(|| l3_msg.pdb.data_offset());
     let vil_lut = build_vil_lut(&l3_msg.pdb);
     let legacy_lut;
     let lut: Option<&[f32]> = if vil_lut.is_some() {
@@ -705,8 +708,8 @@ pub fn render_level3_message_to_image(
     };
 
     log::debug!(
-        "L3 {:?}: rendering with scale={}, offset={}, legacy={}, lut_len={:?}",
-        product, scale, offset, rp.is_legacy, lut.map(|l| l.len())
+        "L3 {:?}: rendering with scale={}, offset={}, legacy={}, lut_len={:?}, xdr_scale={:?}, xdr_offset={:?}",
+        product, scale, offset, rp.is_legacy, lut.map(|l| l.len()), rp.xdr_data_scale, rp.xdr_data_offset
     );
 
     render_level3_radial_to_image(rp, product, radar_lat, radar_lon, scale, offset, lut)

@@ -92,6 +92,8 @@ pub(crate) fn decode_digital_radial_packet(
             j_center,
             scale_factor,
             is_legacy: false,
+            xdr_data_scale: None,
+            xdr_data_offset: None,
             radials,
         },
         o,
@@ -194,6 +196,8 @@ pub(crate) fn decode_legacy_radial_packet(
             j_center,
             scale_factor,
             is_legacy: true,
+            xdr_data_scale: None,
+            xdr_data_offset: None,
             radials,
         },
         o,
@@ -289,6 +293,8 @@ pub(crate) fn decode_generic_radial_packet(
             j_center: 0,
             scale_factor: 1.0,
             is_legacy: false,
+            xdr_data_scale: None,
+            xdr_data_offset: None,
             radials: Vec::new(),
         },
         block_end,
@@ -332,6 +338,46 @@ fn skip_xdr_string(data: &[u8], offset: usize) -> Result<usize> {
     Ok(end)
 }
 
+/// Read an XDR string, returning the UTF-8 content and the offset after it.
+fn read_xdr_string(data: &[u8], offset: usize) -> Result<(String, usize)> {
+    let len = read_u32(data, offset)? as usize;
+    let padded = (len + 3) / 4 * 4;
+    let end = offset + 4 + padded;
+    if end > data.len() {
+        return Err(Error::UnexpectedEof {
+            offset,
+            expected: 4 + padded,
+            available: data.len().saturating_sub(offset),
+        });
+    }
+    let s = std::str::from_utf8(&data[offset + 4..offset + 4 + len])
+        .unwrap_or("")
+        .to_owned();
+    Ok((s, end))
+}
+
+/// Parse Scale and Offset from an XDR attributes string.
+///
+/// The string format is semicolon-separated key=value pairs, e.g.:
+/// `"type = ushort; Unit = kft; Scale = 10; Offset = 0"`
+fn parse_xdr_attrs(attrs: &str) -> (Option<f32>, Option<f32>) {
+    let mut scale = None;
+    let mut offset = None;
+    for part in attrs.split(';') {
+        let part = part.trim();
+        if let Some((key, val)) = part.split_once('=') {
+            let key = key.trim();
+            let val = val.trim();
+            match key {
+                "Scale" => scale = val.parse::<f32>().ok(),
+                "Offset" => offset = val.parse::<f32>().ok(),
+                _ => {}
+            }
+        }
+    }
+    (scale, offset)
+}
+
 /// Skip an XDR parameter list: count(i32) + pointer(i32) + N × (string, string, [pointer]).
 fn skip_xdr_param_list(data: &[u8], mut offset: usize) -> Result<usize> {
     let num = read_i32(data, offset)?;
@@ -363,7 +409,7 @@ fn decode_xdr_radial_component(
     // gate_width (float, meters) and first_gate (float, meters)
     let gate_width = read_xdr_f32(data, o)?;
     o += 4;
-    let _first_gate = read_xdr_f32(data, o)?;
+    let first_gate = read_xdr_f32(data, o)?;
     o += 4;
 
     // Skip radial-level parameters
@@ -375,8 +421,10 @@ fn decode_xdr_radial_component(
 
     let mut radials = Vec::with_capacity(num_radials);
     let mut max_bins: u16 = 0;
+    let mut xdr_data_scale: Option<f32> = None;
+    let mut xdr_data_offset: Option<f32> = None;
 
-    for _ in 0..num_radials {
+    for radial_idx in 0..num_radials {
         let azimuth = read_xdr_f32(data, o)?;
         o += 4;
         let _elevation = read_xdr_f32(data, o)?;
@@ -386,8 +434,17 @@ fn decode_xdr_radial_component(
         let num_bins = read_i32(data, o)? as usize;
         o += 4;
 
-        // Skip attributes string (e.g. "type = ushort; Unit = inches/hour")
-        o = skip_xdr_string(data, o)?;
+        // Read attributes string on first radial to extract Scale/Offset.
+        // All radials in a product share the same encoding.
+        if radial_idx == 0 {
+            let (attrs, new_o) = read_xdr_string(data, o)?;
+            o = new_o;
+            let (s, off) = parse_xdr_attrs(&attrs);
+            xdr_data_scale = s;
+            xdr_data_offset = off;
+        } else {
+            o = skip_xdr_string(data, o)?;
+        }
 
         // Data array: length prefix (i32) + N × i32 values
         let arr_len = read_i32(data, o)? as usize;
@@ -430,14 +487,23 @@ fn decode_xdr_radial_component(
         1.0
     };
 
+    // Convert first_gate from meters to range bins
+    let first_range_bin = if gate_width > 0.0 {
+        (first_gate / gate_width).round() as i16
+    } else {
+        0
+    };
+
     Ok((
         RadialPacket {
-            first_range_bin: 0,
+            first_range_bin,
             num_range_bins: max_bins,
             i_center: 0,
             j_center: 0,
             scale_factor,
             is_legacy: false,
+            xdr_data_scale,
+            xdr_data_offset,
             radials,
         },
         block_end.max(o),

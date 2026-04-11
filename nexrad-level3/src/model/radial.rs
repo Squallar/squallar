@@ -20,6 +20,11 @@ pub struct RadialPacket {
     /// Legacy packets have 4-bit gate values (0–15) that must be mapped through
     /// the PDB's threshold table, rather than using linear scale/offset.
     pub is_legacy: bool,
+    /// Data value scale factor extracted from XDR per-radial attributes (packet 28).
+    /// When present, physical_value = (gate_value - xdr_data_offset) / xdr_data_scale.
+    pub xdr_data_scale: Option<f32>,
+    /// Data value offset extracted from XDR per-radial attributes (packet 28).
+    pub xdr_data_offset: Option<f32>,
     /// The individual radials.
     pub radials: Vec<RadialRun>,
 }
