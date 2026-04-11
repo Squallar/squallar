@@ -198,11 +198,13 @@ static ZDR: ColorScale = &[
 
 /// Correlation coefficient (0-1).
 static RHO: ColorScale = &[
-    (0.0,  (255, 0, 0)),   // Red (non-meteorological)
-    (0.7,  (255, 150, 0)), // Orange
-    (0.8,  (255, 255, 0)), // Yellow
-    (0.9,  (0, 255, 0)),   // Green
-    (0.95, (0, 150, 0)),   // Dark green (pure rain)
+    (0.45,  (21, 19, 143)),   // Blue
+    (0.55, (51, 45, 216)), // Blue
+    (0.75,  (124, 121, 214)),   // Light blue
+    (0.8,  (127, 220, 25)), // Green
+    (0.9,  (255, 224, 0)), // Yellow
+    (0.96,  (255, 152, 0)),   // Orange
+    (0.98, (151, 5, 86)),   // Purple
 ];
 
 /// Differential phase (degrees, pre-wrapped to 0-360).
