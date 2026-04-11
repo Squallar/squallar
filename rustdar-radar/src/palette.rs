@@ -180,12 +180,19 @@ static SPECTRUM_WIDTH: ColorScale = &[
 
 /// Differential reflectivity ZDR (dB).
 static ZDR: ColorScale = &[
-    (f32::NEG_INFINITY, (100, 0, 100)), // Purple (< -1)
-    (-1.0, (0, 100, 255)),              // Blue
-    (0.0,  (0, 255, 0)),                // Green
-    (1.0,  (255, 255, 0)),              // Yellow
-    (2.0,  (255, 150, 0)),              // Orange
-    (3.0,  (255, 0, 0)),                // Red
+    (f32::NEG_INFINITY, (66, 66, 66)), // Dark grey
+    (-2.0, (132, 132, 132)),              // Light grey
+    (-1.0, (166, 166, 166)),              // Lighter greay
+    (0.0,  (123, 103, 163)),                // Purple
+    (0.2, (2, 8, 155)),                // Blue
+    (1.0,  (32, 202, 164)),              // Cyan
+    (1.5, (32, 217, 57)), // Green
+    (2.0,  (255, 242, 93)),              // Yellow
+    (2.5,  (255, 170, 76)),              // Orange
+    (3.0,  (216, 0, 0)),                // Red
+    (4.0,  (150, 0, 0)),                // Dark red
+    (5.0,  (247, 138, 194)),                // Pink
+    (5.5,  (255, 255, 255)),                // White
 ];
 
 /// Correlation coefficient (0-1).
