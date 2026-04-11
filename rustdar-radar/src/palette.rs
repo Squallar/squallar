@@ -93,12 +93,6 @@ use crate::types::MS_TO_MPH;
 /// Velocity color with m/s->mph conversion and bidirectional handling.
 fn velocity_lookup(velocity_ms: f32) -> (u8, u8, u8, u8) {
     let mph = velocity_ms * MS_TO_MPH;
-    if !(-142.0..=141.0).contains(&mph) {
-        return (128, 0, 128, TRANSPARENCY); // Range folded
-    }
-    if (-5.0..=5.0).contains(&mph) {
-        return (128, 128, 128, TRANSPARENCY); // Near zero
-    }
     let (r, g, b) = if mph > 0.0 {
         scale_color(VELOCITY_OUTBOUND, mph)
     } else {
@@ -151,29 +145,27 @@ static REFLECTIVITY: ColorScale = &[
 ];
 
 /// Velocity outbound / positive (mph thresholds).
-/// Gradient 5-20 mph approximated with midpoint entry.
 static VELOCITY_OUTBOUND: ColorScale = &[
-    (5.0,   (128, 128, 128)), // Grey (just above near-zero band)
-    (12.5,  (133, 64, 64)),   // Grey -> dark red midpoint
-    (20.0,  (139, 0, 0)),     // Dark red
-    (35.0,  (255, 0, 0)),     // Bright red
-    (55.0,  (255, 192, 203)), // Pink
-    (80.0,  (255, 218, 185)), // Peach
-    (100.0, (255, 140, 0)),   // Orange
-    (125.0, (139, 69, 19)),   // Brown
+    (0.0,      (100, 0, 0)),
+    (11.5078,  (110, 0, 0)),
+    (23.0156,  (140, 0, 0)),
+    (34.5234,  (165, 0, 0)),
+    (46.0312,  (190, 0, 0)),
+    (57.539,   (210, 0, 0)),
+    (69.0468,  (230, 0, 0)),
+    (80.5546,  (255, 0, 0)),
 ];
 
 /// Velocity inbound / negative (thresholds are positive, applied to abs(mph)).
-/// Gradient 5-20 mph approximated with midpoint entry.
 static VELOCITY_INBOUND: ColorScale = &[
-    (5.0,   (128, 128, 128)), // Grey (just above near-zero band)
-    (12.5,  (64, 114, 64)),   // Grey -> dark green midpoint
-    (20.0,  (0, 100, 0)),     // Dark green
-    (35.0,  (0, 255, 0)),     // Bright green
-    (55.0,  (173, 216, 230)), // Light blue
-    (80.0,  (135, 206, 235)), // Sky blue
-    (100.0, (0, 0, 255)),     // Blue
-    (125.0, (255, 0, 255)),   // Fuchsia
+    (0.0,      (0, 100, 0)),
+    (11.5078,  (0, 110, 0)),
+    (23.0156,  (0, 140, 0)),
+    (34.5234,  (0, 165, 0)),
+    (46.0312,  (0, 190, 0)),
+    (57.539,   (0, 210, 0)),
+    (69.0468,  (0, 230, 0)),
+    (80.5546,  (0, 255, 0)),
 ];
 
 /// Spectrum width (m/s).
