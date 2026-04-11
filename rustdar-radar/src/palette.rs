@@ -224,15 +224,19 @@ static PHI: ColorScale = &[
 
 /// Specific differential phase KDP (deg/km).
 static KDP: ColorScale = &[
-    (f32::NEG_INFINITY, (100, 0, 150)), // Purple (< -1, unusual)
-    (-1.0, (0, 80, 255)),               // Blue
-    (0.0,  (100, 200, 100)),            // Light green
-    (0.5,  (0, 255, 0)),                // Green
-    (1.0,  (255, 255, 0)),              // Yellow
-    (2.0,  (255, 165, 0)),              // Orange
-    (3.5,  (255, 0, 0)),                // Red
-    (5.0,  (180, 0, 0)),                // Dark red
-    (7.0,  (200, 0, 200)),              // Magenta (extreme)
+    (-2.0, (118, 118, 118)), // Grey
+    (-1.0, (75, 75, 75)),               // Dark grey
+    (-0.5,  (75, 0, 0)),            // Dark red
+    (0.0,  (121, 5, 29)),            // Red
+    (1.0,  (196, 100, 154)),              // Pink
+    (1.5, (125, 107, 152)),              // Purple
+    (2.0,  (91, 237, 232)),              // Cyan
+    (2.5, (20, 185, 50)),              // Green
+    (3.0, (10, 255, 10)),              // Bright green
+    (4.0,  (246, 246, 0)),                // Yellow
+    (5.0,  (250, 117, 19)),                // Orange
+    (6.0, (202, 92, 14)),              // Dark orange
+    (6.5, (175, 78, 11)),              // Darker orange
 ];
 
 /// Enhanced Echo Tops (thousands of feet).
