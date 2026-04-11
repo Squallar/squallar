@@ -178,12 +178,12 @@ static VELOCITY_INBOUND: ColorScale = &[
 
 /// Spectrum width (m/s).
 static SPECTRUM_WIDTH: ColorScale = &[
-    (0.0,  (0, 100, 0)),   // Dark green (low turbulence)
-    (2.0,  (0, 200, 0)),   // Green
-    (4.0,  (255, 255, 0)), // Yellow
-    (6.0,  (255, 150, 0)), // Orange
-    (8.0,  (255, 0, 0)),   // Red
-    (10.0, (150, 0, 0)),   // Dark red (high turbulence)
+    (0.0,  (118, 118, 118)),   // Dark grey
+    (2.0578,  (156, 156, 156)),   // Light grey
+    (4.1156,  (0, 187, 187)), // Cyan
+    (6.1733,  (255, 0, 0)), // Red
+    (8.2311,  (208, 112, 0)),   // Orange
+    (10.2889, (255, 255, 0)),   // Yellow
 ];
 
 /// Differential reflectivity ZDR (dB).
