@@ -208,12 +208,18 @@ static RHO: ColorScale = &[
 
 /// Differential phase (degrees, pre-wrapped to 0-360).
 static PHI: ColorScale = &[
-    (0.0,   (255, 0, 0)),   // Red
-    (60.0,  (255, 255, 0)), // Yellow
-    (120.0, (0, 255, 0)),   // Green
-    (180.0, (0, 255, 255)), // Cyan
-    (240.0, (0, 0, 255)),   // Blue
-    (300.0, (255, 0, 255)), // Magenta
+    (0.0,   (151, 151, 242)),   // Light Purple
+    (15.0, (113, 113, 205)), // Light blue
+    (30.0,  (62, 125, 249)), // Blue
+    (45.0,  (33, 67, 134)), // Blue
+    (60.0, (0, 249, 0)),   // Green
+    (75.0, (0, 134, 0)),   // Dark green
+    (90.0, (255, 249, 0)),   // Yellow
+    (105.0, (255, 137, 0)),   // Orange
+    (120.0, (255, 0, 0)),   // Red
+    (135.0, (173, 0, 0)),   // Dark red
+    (150.0, (252, 0, 252)), // Magenta
+    (165.0, (144, 0, 144)), // Dark magenta
 ];
 
 /// Specific differential phase KDP (deg/km).
