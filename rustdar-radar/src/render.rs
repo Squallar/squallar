@@ -282,7 +282,7 @@ pub fn render_radar_to_image(
 
     // NROT is a derived product computed from velocity data
     if product == types::RadarProduct::NormalizedRotation {
-        return render_nrot_to_image(radials, radar_lat);
+        return render_nrot_to_image(radials, radar_lat, radar_lon);
     }
 
     let avg_azimuth_spacing = compute_azimuth_spacing(radials);
@@ -334,6 +334,7 @@ pub fn render_radar_to_image(
 fn render_nrot_to_image(
     radials: &[Radial],
     radar_lat: f64,
+    radar_lon: f64,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     let num_radials = radials.len();
     if num_radials < 3 {
@@ -344,12 +345,15 @@ fn render_nrot_to_image(
         build_velocity_grid(radials)?;
 
     let actual_max_range = first_gate_range + gate_count as f64 * gate_interval;
+    let azimuths_rad: Vec<f64> = azimuths_deg.iter().map(|d| d.to_radians()).collect();
     let avg_spacing_deg = 360.0 / num_radials as f64;
 
-    let nrot_grid = compute_nrot_grid(&vel_grid, gate_count, first_gate_range, gate_interval, avg_spacing_deg);
+    let nrot_grid = compute_nrot_grid(&vel_grid, gate_count, first_gate_range, gate_interval, &azimuths_rad);
+
+    let nrot_grid = filter_nrot_grid(&nrot_grid, gate_count);
 
     let output = render_with_projection(
-        radar_lat, 0.0, actual_max_range, "NROT",
+        radar_lat, radar_lon, actual_max_range, "NROT",
         |proj, bufs| {
             nrot_grid.par_iter().enumerate().for_each(|(i, nrot_row)| {
                 let ctx = RadialContext::new(azimuths_deg[i], avg_spacing_deg / 2.0);
@@ -413,28 +417,86 @@ fn build_velocity_grid(
     Some((vel_grid, azimuths_deg, gate_count, first_gate_range, gate_interval))
 }
 
-/// Compute NROT (azimuthal shear × scale) from a velocity grid.
+/// Filter the NROT grid to remove isolated noise pixels.
 ///
-/// For each gate, computes the azimuthal velocity derivative using adjacent
-/// azimuths, normalizes by range to remove beam-broadening effects, and
-/// scales by `NROT_SCALE`.
+/// For each gate, requires at least `MIN_COHERENT` of the 25 neighbors
+/// (±2 azimuth × ±2 range) to be non-NaN and share the same sign as the
+/// center. Random noise has alternating signs and gets suppressed; real
+/// rotation couplets are spatially coherent and survive.
+fn filter_nrot_grid(nrot_grid: &[Vec<f64>], gate_count: usize) -> Vec<Vec<f64>> {
+    const HALF: i32 = 2;
+    const MIN_COHERENT: usize = 8;
+
+    let num_radials = nrot_grid.len() as i32;
+
+    (0..num_radials as usize)
+        .map(|i| {
+            (0..gate_count)
+                .map(|j| {
+                    let center = nrot_grid[i][j];
+                    if center.is_nan() {
+                        return f64::NAN;
+                    }
+                    let center_positive = center > 0.0;
+                    let mut count = 0usize;
+
+                    for da in -HALF..=HALF {
+                        let ai = ((i as i32 + da).rem_euclid(num_radials)) as usize;
+                        for dr in -HALF..=HALF {
+                            if da == 0 && dr == 0 {
+                                continue;
+                            }
+                            let rj = j as i32 + dr;
+                            if rj < 0 || rj >= gate_count as i32 {
+                                continue;
+                            }
+                            let v = nrot_grid[ai][rj as usize];
+                            if !v.is_nan() && (v > 0.0) == center_positive {
+                                count += 1;
+                            }
+                        }
+                    }
+
+                    if count >= MIN_COHERENT {
+                        center
+                    } else {
+                        f64::NAN
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Compute NROT via LLSD (Linear Least Squares Derivative).
+///
+/// For each gate, collects all velocity values within a circular neighborhood
+/// of `NEIGHBORHOOD_KM` radius and fits a linear regression V = a + b*θ
+/// where θ is the azimuthal offset in radians. The slope b is dV/dθ;
+/// dividing by range gives azimuthal shear (1/s), then scaled by `NROT_SCALE`.
+///
+/// This approach averages over ~50-100 gate pairs per point (at typical ranges),
+/// providing inherent noise suppression far superior to a 2-point central
+/// difference. No separate pre/post smoothing is needed.
 fn compute_nrot_grid(
     vel_grid: &[Vec<f64>],
     gate_count: usize,
     first_gate_range: f64,
     gate_interval: f64,
-    avg_spacing_deg: f64,
+    azimuths_rad: &[f64],
 ) -> Vec<Vec<f64>> {
     const NROT_SCALE: f64 = 250.0;
-    const MIN_RANGE_KM: f64 = 5.0;
+    const MIN_RANGE_KM: f64 = 10.0;
+    const NEIGHBORHOOD_KM: f64 = 2.0;
+    const MIN_POINTS: usize = 10;
 
     let num_radials = vel_grid.len();
-    let avg_spacing_rad = avg_spacing_deg.to_radians();
+    let rng_reach = (NEIGHBORHOOD_KM / gate_interval).ceil() as i32;
 
     (0..num_radials)
+        .into_par_iter()
         .map(|i| {
-            let i_prev = if i == 0 { num_radials - 1 } else { i - 1 };
-            let i_next = if i == num_radials - 1 { 0 } else { i + 1 };
+            let center_az = azimuths_rad[i];
 
             (0..gate_count)
                 .map(|j| {
@@ -443,16 +505,74 @@ fn compute_nrot_grid(
                         return f64::NAN;
                     }
 
-                    let v_prev = vel_grid[i_prev][j];
-                    let v_next = vel_grid[i_next][j];
+                    // Number of azimuths that fit within the neighborhood at this range
+                    let az_spacing_rad = 2.0 * PI / num_radials as f64;
+                    let arc_per_az_km = range_km * az_spacing_rad;
+                    let az_reach = (NEIGHBORHOOD_KM / arc_per_az_km).ceil() as i32;
 
-                    if v_prev.is_nan() || v_next.is_nan() {
+                    // LLSD: fit V = a + b*θ via least squares
+                    let mut sum_t = 0.0_f64;
+                    let mut sum_v = 0.0_f64;
+                    let mut sum_t2 = 0.0_f64;
+                    let mut sum_tv = 0.0_f64;
+                    let mut n = 0usize;
+
+                    for da in -az_reach..=az_reach {
+                        let ai =
+                            ((i as i32 + da).rem_euclid(num_radials as i32)) as usize;
+                        let mut dtheta = azimuths_rad[ai] - center_az;
+                        if dtheta > PI {
+                            dtheta -= 2.0 * PI;
+                        }
+                        if dtheta < -PI {
+                            dtheta += 2.0 * PI;
+                        }
+
+                        let az_dist_km = (range_km * dtheta).abs();
+
+                        for dr in -rng_reach..=rng_reach {
+                            let rj = j as i32 + dr;
+                            if rj < 0 || rj >= gate_count as i32 {
+                                continue;
+                            }
+
+                            let rng_dist_km = (dr as f64 * gate_interval).abs();
+                            let dist_sq =
+                                az_dist_km * az_dist_km + rng_dist_km * rng_dist_km;
+                            if dist_sq > NEIGHBORHOOD_KM * NEIGHBORHOOD_KM {
+                                continue;
+                            }
+
+                            let v = vel_grid[ai][rj as usize];
+                            if v.is_nan() {
+                                continue;
+                            }
+
+                            sum_t += dtheta;
+                            sum_v += v;
+                            sum_t2 += dtheta * dtheta;
+                            sum_tv += dtheta * v;
+                            n += 1;
+                        }
+                    }
+
+                    if n < MIN_POINTS {
                         return f64::NAN;
                     }
 
-                    let delta_v = v_next - v_prev;
+                    let nf = n as f64;
+                    let denom = nf * sum_t2 - sum_t * sum_t;
+                    if denom.abs() < 1e-20 {
+                        return f64::NAN;
+                    }
+
+                    // slope = dV/dθ (m/s per radian)
+                    let slope = (nf * sum_tv - sum_t * sum_v) / denom;
+
+                    // azimuthal shear = slope / range (1/s)
                     let range_m = range_km * 1000.0;
-                    let az_shear = delta_v / (range_m * 2.0 * avg_spacing_rad);
+                    let az_shear = slope / range_m;
+
                     az_shear * NROT_SCALE
                 })
                 .collect()

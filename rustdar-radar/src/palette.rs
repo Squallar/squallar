@@ -109,7 +109,7 @@ fn velocity_lookup(velocity_ms: f32) -> (u8, u8, u8, u8) {
 
 /// NROT color with bidirectional cyclonic/anticyclonic handling.
 fn nrot_lookup(nrot: f32) -> (u8, u8, u8, u8) {
-    if nrot.is_nan() || nrot.is_infinite() || nrot.abs() < 0.3 {
+    if nrot.is_nan() || nrot.is_infinite() || nrot.abs() < 0.5 {
         return (0, 0, 0, 0);
     }
     let (r, g, b) = if nrot > 0.0 {
@@ -296,18 +296,16 @@ static PRECIP_RATE: ColorScale = &[
 
 /// NROT cyclonic / positive rotation (unitless).
 static NROT_CYCLONIC: ColorScale = &[
-    (0.3, (200, 200, 200)), // Light grey (weak)
-    (1.0, (255, 255, 0)),   // Yellow (significant)
-    (1.5, (255, 150, 0)),   // Orange
-    (2.5, (255, 0, 0)),     // Red (strong)
-    (4.0, (200, 0, 200)),   // Purple (extreme)
+    (0.25, (0, 0, 255)),     // Blue (weak)
+    (1.0, (0, 255, 0)),      // Green (significant)
+    (1.5, (255, 150, 0)),    // Yellow (strong)
+    (2.0, (255, 0, 0)),      // Red (very strong)
+    (2.5, (255, 141, 161)),  // Pink (extreme)
+    (2.75, (255, 255, 255)), // White (oh fuck)
 ];
 
 /// NROT anticyclonic / negative rotation (thresholds = abs values).
 static NROT_ANTICYCLONIC: ColorScale = &[
-    (0.3, (160, 160, 160)), // Grey (weak)
-    (1.0, (0, 255, 255)),   // Cyan (significant)
-    (1.5, (0, 150, 255)),   // Light blue
-    (2.5, (0, 0, 255)),     // Blue (strong)
-    (4.0, (128, 0, 255)),   // Violet (extreme)
+    (0.25, (0, 255, 128)), // Aqua (weak)
+    (1.0, (0, 255, 0)),    // Green (significant)
 ];
