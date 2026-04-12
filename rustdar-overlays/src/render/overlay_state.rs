@@ -14,6 +14,21 @@ use crate::types::{GeoBounds, OverlayFeature, OverlayLabel};
 /// Closure type for background overlay rasterization.
 pub type RasterizeFn = Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>;
 
+/// A color scale legend for an overlay, analogous to `rustdar_radar::LegendScale`
+/// but defined in the overlays crate to avoid a dependency on rustdar-radar.
+pub struct OverlayLegend {
+    /// Sorted ascending (value, RGB) pairs defining the scale's color stops.
+    pub thresholds: Vec<(f32, [u8; 3])>,
+    /// Whether the rendered color bar should interpolate between stops.
+    pub is_gradient: bool,
+    /// Minimum value the color bar should span.
+    pub min_value: f32,
+    /// Maximum value the color bar should span.
+    pub max_value: f32,
+    /// Unit label (e.g. "J/kg").
+    pub unit_label: &'static str,
+}
+
 /// Generic wrapper for overlay data that follows the fetch-cache-generation pattern.
 ///
 /// Each overlay type (SPC outlooks, NWS alerts, SPC discussions) has the same
@@ -217,6 +232,14 @@ pub trait OverlayHandler: Send {
     /// Tooltip text shown on hover. Return `None` to suppress the tooltip.
     fn hover_text(&self, _id: u32, _ctx: &HoverContext<'_>) -> Option<String> { None }
 
+    /// Return a formatted hover value for the given lat/lon, or `None` if
+    /// this handler doesn't support gridded hover values.
+    fn hover_value_at(&self, _lat: f64, _lon: f64) -> Option<String> { None }
+
+    /// Return a color scale legend for display as a HUD, or `None` if
+    /// this overlay doesn't have a meaningful color scale.
+    fn legend(&self) -> Option<OverlayLegend> { None }
+
     // ── Declarative UI controls ───────────────────────────────────────
 
     /// Describe this overlay's UI controls declaratively.
@@ -394,6 +417,16 @@ impl OverlayRegistry {
         self.handler(kind).map_or_else(Vec::new, |h| h.clickable_items())
     }
 
+    /// Query gridded hover value for a specific overlay at the given lat/lon.
+    pub fn hover_value_at(&self, kind: OverlayKind, lat: f64, lon: f64) -> Option<String> {
+        self.handler(kind).and_then(|h| h.hover_value_at(lat, lon))
+    }
+
+    /// Get the color scale legend for an overlay, if it has one.
+    pub fn legend(&self, kind: OverlayKind) -> Option<OverlayLegend> {
+        self.handler(kind).and_then(|h| h.legend())
+    }
+
     /// Build popup content for a selected overlay item.
     pub fn popup_content(&self, selected: &dyn OverlayItem, prefs: &UserPreferences) -> PopupContent {
         selected.popup_content(prefs)
@@ -523,6 +556,7 @@ impl OverlayRegistry {
 /// requires adding a variant here and implementing the match arms below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum OverlayKind {
+    ModelData,
     SpcOutlook,
     SpcDiscussions,
     NwsAlerts,
@@ -540,6 +574,7 @@ impl OverlayKind {
     /// All registered layer kinds in default draw order.
     pub const fn all() -> &'static [OverlayKind] {
         &[
+            OverlayKind::ModelData,
             OverlayKind::SpcOutlook,
             OverlayKind::Radar,
             OverlayKind::SpcDiscussions,

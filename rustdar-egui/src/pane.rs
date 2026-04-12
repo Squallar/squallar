@@ -75,6 +75,8 @@ pub struct PaneState {
     /// Time navigation step size in seconds (0 = single scan mode).
     pub time_step_secs: i64,
     pub hover_value: Option<String>,
+    /// Hover tooltip text from overlay handlers (e.g. model data CIN value).
+    pub overlay_hover_value: Option<String>,
     pub last_hover_pos: Option<egui::Pos2>,
     pub map_memory: MapMemory,
     /// Per-overlay-type texture caches (background-rendered), keyed by `OverlayKind`.
@@ -136,6 +138,7 @@ impl PaneState {
             viewing_live: true,
             time_step_secs: 600,
             hover_value: None,
+            overlay_hover_value: None,
             last_hover_pos: None,
             map_memory,
             overlay_textures: OverlayKind::all()

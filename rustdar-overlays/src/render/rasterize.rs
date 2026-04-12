@@ -770,6 +770,8 @@ pub(crate) fn strip_closing_dup(ring: &[(f64, f64)]) -> &[(f64, f64)] {
     }
 }
 
+use crate::hrrr::HrrrGridData;
+
 /// Convert Mercator Y back to latitude (degrees).
 fn merc_y_to_lat(merc_y: f64) -> f64 {
     (2.0 * merc_y.exp().atan() - PI / 2.0).to_degrees()
@@ -785,5 +787,121 @@ fn premultiplied_to_straight(data: &mut [u8]) {
             pixel[1] = (pixel[1] as f32 * inv).min(255.0) as u8;
             pixel[2] = (pixel[2] as f32 * inv).min(255.0) as u8;
         }
+    }
+}
+
+// ── Model data (HRRR) rasterization ──────────────────────────────────────
+
+/// Rasterize HRRR model data (e.g. CIN) to an RGBA texture.
+///
+/// Each grid point is projected to the texture, and the cell around it is
+/// filled with the color-mapped value. The result is a smooth gridded field
+/// overlaid on the map.
+pub fn rasterize_model_data(
+    grid: &HrrrGridData,
+    bounds: &GeoBounds,
+    width: u32,
+    height: u32,
+) -> RasterizeOutput {
+    let size = (width * height * 4) as usize;
+    let mut rgba = vec![0u8; size];
+
+    if grid.values.is_empty() || width == 0 || height == 0 || grid.ni == 0 || grid.nj == 0 {
+        return RasterizeOutput {
+            rgba,
+            hit_map: None,
+        };
+    }
+
+    let mb = MercatorBounds::from_geo(bounds);
+    let w = width as f32;
+    let h = height as f32;
+    let ni = grid.ni;
+    let nj = grid.nj;
+    let total = ni * nj;
+
+    // Pre-project all grid points to pixel coordinates (one pass).
+    let mut px_coords: Vec<(f32, f32)> = Vec::with_capacity(total);
+    for i in 0..total {
+        if i >= grid.lats.len() || i >= grid.lons.len() {
+            px_coords.push((f32::NAN, f32::NAN));
+            continue;
+        }
+        let (px, py) = mb.project(grid.lats[i], grid.lons[i], w, h);
+        px_coords.push((px, py));
+    }
+
+    // Render each grid cell as a rectangle extending halfway to its neighbors.
+    for j in 0..nj {
+        for i in 0..ni {
+            let idx = j * ni + i;
+            if idx >= grid.values.len() {
+                continue;
+            }
+            let value = grid.values[idx];
+            let color = grid.parameter.color_for_value(value);
+            if color[3] == 0 {
+                continue;
+            }
+
+            let (cx, cy) = px_coords[idx];
+            if cx.is_nan() || cy.is_nan() {
+                continue;
+            }
+
+            // Compute cell half-extents from neighbor distances.
+            let dx_left = if i > 0 {
+                let (nx, _) = px_coords[idx - 1];
+                ((cx - nx).abs() * 0.55).max(0.5)
+            } else if i + 1 < ni {
+                let (nx, _) = px_coords[idx + 1];
+                ((nx - cx).abs() * 0.55).max(0.5)
+            } else {
+                1.0
+            };
+            let dx_right = if i + 1 < ni {
+                let (nx, _) = px_coords[idx + 1];
+                ((nx - cx).abs() * 0.55).max(0.5)
+            } else {
+                dx_left
+            };
+            let dy_up = if j > 0 {
+                let (_, ny) = px_coords[idx - ni];
+                ((cy - ny).abs() * 0.55).max(0.5)
+            } else if j + 1 < nj {
+                let (_, ny) = px_coords[idx + ni];
+                ((ny - cy).abs() * 0.55).max(0.5)
+            } else {
+                1.0
+            };
+            let dy_down = if j + 1 < nj {
+                let (_, ny) = px_coords[idx + ni];
+                ((ny - cy).abs() * 0.55).max(0.5)
+            } else {
+                dy_up
+            };
+
+            let x0 = ((cx - dx_left) as i32).max(0);
+            let y0 = ((cy - dy_up) as i32).max(0);
+            let x1 = ((cx + dx_right) as i32).min(width as i32 - 1);
+            let y1 = ((cy + dy_down) as i32).min(height as i32 - 1);
+
+            for y in y0..=y1 {
+                let row_offset = (y as u32 * width * 4) as usize;
+                for x in x0..=x1 {
+                    let offset = row_offset + (x as u32 * 4) as usize;
+                    // Overwrite — no blending between adjacent grid cells.
+                    rgba[offset] = color[0];
+                    rgba[offset + 1] = color[1];
+                    rgba[offset + 2] = color[2];
+                    rgba[offset + 3] = color[3];
+                }
+            }
+        }
+    }
+
+    RasterizeOutput {
+        rgba,
+        hit_map: None,
     }
 }

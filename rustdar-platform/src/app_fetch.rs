@@ -324,7 +324,8 @@ impl super::App {
             | OverlayKind::SpcDiscussions
             | OverlayKind::NwsAlerts
             | OverlayKind::StormReports
-            | OverlayKind::Lightning => {
+            | OverlayKind::Lightning
+            | OverlayKind::ModelData => {
                 let rctx = rustdar_overlays::render::overlay_state::RasterizeContext {
                     is_dark: self.cached_dark_theme.unwrap_or(false),
                     zoom: zoom as f64 / 32.0,

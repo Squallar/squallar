@@ -142,9 +142,19 @@ pub(super) fn render_pane_map_content(
                         render_user_location(ui, projector, user_lat, user_lon);
                     }
                 }
-                // Color scale legend (screen-space HUD)
+                // Color scale legend (screen-space HUD).
+                // Draw on a foreground layer so overlay textures can never
+                // paint over the bars regardless of egui shape batching.
                 OverlayKind::ColorScale => {
-                    render_color_scale(ui, ctx.pane, ctx.preferences);
+                    let fg_layer = egui::LayerId::new(
+                        egui::Order::Foreground,
+                        ui.id().with("color_scale"),
+                    );
+                    let mut fg_painter = ui.ctx().layer_painter(fg_layer);
+                    fg_painter.set_clip_rect(ctx.pane_rect);
+                    let pane_rect = ui.max_rect();
+                    render_color_scale(&fg_painter, pane_rect, ctx.pane, ctx.preferences);
+                    render_overlay_color_scales(&fg_painter, pane_rect, ctx.pane, ctx.overlays);
                 }
                 // All other overlays dispatched by render mode
                 _ => {
@@ -179,6 +189,25 @@ pub(super) fn render_pane_map_content(
         if !selected.is_empty() {
             ctx.overlays.selected_overlays = selected;
             ctx.overlays.selected_overlay_page = 0;
+        }
+
+        // --- Check overlay hover values (model data, etc.) ---
+        {
+            let hover_pos = ui.ctx().pointer_hover_pos();
+            ctx.pane.overlay_hover_value = None;
+            if let Some(pos) = hover_pos
+                && ctx.pane_rect.contains(pos) {
+                    let map_pos = projector.unproject(egui::vec2(pos.x, pos.y));
+                    let hover_lat = map_pos.y();
+                    let hover_lon = map_pos.x();
+                    for &kind in &draw_order {
+                        if ctx.overlays.is_enabled(kind)
+                            && let Some(text) = ctx.overlays.hover_value_at(kind, hover_lat, hover_lon) {
+                                ctx.pane.overlay_hover_value = Some(text);
+                                break;
+                            }
+                    }
+                }
         }
 
         // --- Check if any texture overlays need background re-rendering ---
@@ -583,7 +612,8 @@ fn draw_shadowed_text(
 
 /// Render the color scale legend bar for the current pane's radar product.
 fn render_color_scale(
-    ui: &egui::Ui,
+    painter: &egui::Painter,
+    pane_rect: egui::Rect,
     pane: &PaneState,
     prefs: &UserPreferences,
 ) {
@@ -592,8 +622,6 @@ fn render_color_scale(
     if legend.thresholds.len() < 2 {
         return;
     }
-    let pane_rect = ui.max_rect();
-    let painter = ui.painter();
 
     // Desktop: vertical bar on the right.  Mobile: horizontal bar on the bottom.
     #[cfg(target_os = "android")]
@@ -756,6 +784,174 @@ fn render_color_scale(
         let title_pos = egui::pos2(bar_rect.center().x, bar_rect.top() - 4.0);
         draw_shadowed_text(painter, title_pos, egui::Align2::CENTER_BOTTOM, unit, title_font);
     }
+}
+
+/// Render color scale legends for overlay layers that provide their own legend
+/// (e.g. model data CIN). Drawn to the left of the radar color scale.
+fn render_overlay_color_scales(
+    painter: &egui::Painter,
+    pane_rect: egui::Rect,
+    pane: &PaneState,
+    overlays: &OverlayRegistry,
+) {
+
+    #[cfg(target_os = "android")]
+    let is_mobile = true;
+    #[cfg(not(target_os = "android"))]
+    let is_mobile = false;
+
+    // Offset each overlay legend to the left of (desktop) or above (mobile) the radar scale.
+    let mut bar_offset = 0;
+
+    for &kind in &pane.draw_order {
+        if !overlays.is_enabled(kind) || kind == OverlayKind::ColorScale {
+            continue;
+        }
+        let Some(legend) = overlays.legend(kind) else {
+            continue;
+        };
+        if legend.thresholds.len() < 2 {
+            continue;
+        }
+
+        bar_offset += 1;
+        let offset_px = bar_offset as f32 * (SCALE_BAR_WIDTH + 40.0);
+
+        let bar_length = if is_mobile {
+            pane_rect.width() - SCALE_MARGIN * 2.0
+        } else {
+            pane_rect.height() - SCALE_MARGIN * 2.0 - SCALE_TITLE_MARGIN
+        };
+        if bar_length < 40.0 {
+            continue;
+        }
+
+        let bar_rect = if is_mobile {
+            let left = pane_rect.left() + SCALE_MARGIN;
+            let bottom = pane_rect.bottom() - SCALE_MARGIN - offset_px;
+            let top = bottom - SCALE_BAR_WIDTH;
+            egui::Rect::from_min_max(
+                egui::pos2(left, top),
+                egui::pos2(left + bar_length, bottom),
+            )
+        } else {
+            let right = pane_rect.right() - SCALE_MARGIN - offset_px;
+            let left = right - SCALE_BAR_WIDTH;
+            let bottom = pane_rect.bottom() - SCALE_MARGIN;
+            let top = bottom - bar_length;
+            egui::Rect::from_min_max(
+                egui::pos2(left, top),
+                egui::pos2(right, bottom),
+            )
+        };
+
+        let min_val = legend.min_value;
+        let max_val = legend.max_value;
+        let range = max_val - min_val;
+        if range.abs() < f32::EPSILON {
+            continue;
+        }
+
+        // Always gradient for overlay legends.
+        let steps = bar_length.ceil() as usize;
+        for i in 0..steps {
+            let t = i as f32 / (steps - 1).max(1) as f32;
+            let value = min_val + t * range;
+            let color = interpolate_legend_color(&legend.thresholds, value);
+            let [r, g, b] = color;
+            if is_mobile {
+                let x = bar_rect.left() + t * bar_rect.width();
+                let strip = egui::Rect::from_min_size(
+                    egui::pos2(x, bar_rect.top()),
+                    egui::vec2(2.0, SCALE_BAR_WIDTH),
+                );
+                painter.rect_filled(strip, 0.0, egui::Color32::from_rgb(r, g, b));
+            } else {
+                let y = bar_rect.bottom() - t * bar_rect.height();
+                let strip = egui::Rect::from_min_size(
+                    egui::pos2(bar_rect.left(), y - 1.0),
+                    egui::vec2(SCALE_BAR_WIDTH, 2.0),
+                );
+                painter.rect_filled(strip, 0.0, egui::Color32::from_rgb(r, g, b));
+            }
+        }
+
+        // Labels
+        let label_font = egui::FontId::proportional(SCALE_FONT_SIZE);
+        let title_font = egui::FontId::proportional(SCALE_TITLE_FONT_SIZE);
+
+        let mut label_positions: Vec<(f32, String)> = Vec::new();
+        for &(val, _) in &legend.thresholds {
+            let t = (val - min_val) / range;
+            let pixel_pos = if is_mobile {
+                bar_rect.left() + t * bar_rect.width()
+            } else {
+                bar_rect.bottom() - t * bar_rect.height()
+            };
+            label_positions.push((pixel_pos, format!("{val:.0}")));
+        }
+
+        let mut prev_pos: Option<f32> = None;
+        let thinned: Vec<(f32, &str)> = label_positions.iter().filter(|(pos, _)| {
+            if let Some(prev) = prev_pos
+                && (pos - prev).abs() < MIN_LABEL_SPACING
+            {
+                return false;
+            }
+            prev_pos = Some(*pos);
+            true
+        }).map(|(pos, text)| (*pos, text.as_str())).collect();
+
+        for (pixel_pos, text) in &thinned {
+            if is_mobile {
+                let pos = egui::pos2(*pixel_pos, bar_rect.top() - 2.0);
+                draw_shadowed_text(painter, pos, egui::Align2::CENTER_BOTTOM, text, label_font.clone());
+            } else {
+                let pos = egui::pos2(bar_rect.left() - 4.0, *pixel_pos);
+                draw_shadowed_text(painter, pos, egui::Align2::RIGHT_CENTER, text, label_font.clone());
+            }
+        }
+
+        // Title
+        let unit = legend.unit_label;
+        if is_mobile {
+            let title_pos = egui::pos2(bar_rect.left() - 4.0, bar_rect.center().y);
+            draw_shadowed_text(painter, title_pos, egui::Align2::RIGHT_CENTER, unit, title_font);
+        } else {
+            let title_pos = egui::pos2(bar_rect.center().x, bar_rect.top() - 4.0);
+            draw_shadowed_text(painter, title_pos, egui::Align2::CENTER_BOTTOM, unit, title_font);
+        }
+    }
+}
+
+/// Interpolate an RGB color from a sorted threshold list for a given value.
+fn interpolate_legend_color(thresholds: &[(f32, [u8; 3])], value: f32) -> [u8; 3] {
+    if thresholds.is_empty() {
+        return [0, 0, 0];
+    }
+    if value <= thresholds[0].0 {
+        return thresholds[0].1;
+    }
+    if value >= thresholds[thresholds.len() - 1].0 {
+        return thresholds[thresholds.len() - 1].1;
+    }
+    for i in 1..thresholds.len() {
+        if value <= thresholds[i].0 {
+            let (v0, c0) = thresholds[i - 1];
+            let (v1, c1) = thresholds[i];
+            let t = if (v1 - v0).abs() < f32::EPSILON {
+                0.0
+            } else {
+                (value - v0) / (v1 - v0)
+            };
+            return [
+                (c0[0] as f32 + (c1[0] as f32 - c0[0] as f32) * t) as u8,
+                (c0[1] as f32 + (c1[1] as f32 - c0[1] as f32) * t) as u8,
+                (c0[2] as f32 + (c1[2] as f32 - c0[2] as f32) * t) as u8,
+            ];
+        }
+    }
+    thresholds[thresholds.len() - 1].1
 }
 
 /// Context for per-frame point overlay rendering.

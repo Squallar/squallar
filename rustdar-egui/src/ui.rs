@@ -853,6 +853,7 @@ impl Gui {
     ) {
         const ORDER: &[OverlayKind] = &[
             OverlayKind::Radar,
+            OverlayKind::ModelData,
             OverlayKind::SpcOutlook,
             OverlayKind::SpcDiscussions,
             OverlayKind::NwsAlerts,

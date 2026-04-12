@@ -5,6 +5,7 @@ mod glm;
 mod labels;
 mod location;
 mod metar;
+mod model;
 mod outlook;
 mod radar;
 mod reports;
@@ -15,6 +16,7 @@ use super::overlay_state::OverlayHandler;
 /// Create the default set of overlay handlers.
 pub(crate) fn create_handlers() -> Vec<Box<dyn OverlayHandler>> {
     vec![
+        Box::new(model::ModelDataHandler::new()),
         Box::new(radar::RadarHandler::new()),
         Box::new(outlook::SpcOutlookHandler::new()),
         Box::new(discussion::SpcDiscussionHandler::new()),

@@ -1,4 +1,5 @@
 pub mod glm;
+pub mod hrrr;
 pub mod metar;
 pub mod nws;
 pub mod render;

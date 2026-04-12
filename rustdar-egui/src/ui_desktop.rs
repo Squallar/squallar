@@ -43,9 +43,15 @@ fn render_scan_info(ui: &mut egui::Ui, scan_info: Option<&ScanInfo>, prefs: &Use
 
 fn render_hover_info(ui: &mut egui::Ui, panes: &[PaneState]) {
     let hover_info = panes.iter().find_map(|p| p.hover_value.as_ref());
-    if let Some(hover_info) = hover_info {
+    let overlay_hover = panes.iter().find_map(|p| p.overlay_hover_value.as_ref());
+    if hover_info.is_some() || overlay_hover.is_some() {
         ui.label("📍");
-        ui.label(hover_info);
+        if let Some(info) = hover_info {
+            ui.label(info);
+        }
+        if let Some(info) = overlay_hover {
+            ui.label(info);
+        }
     } else {
         ui.label("");
     }
