@@ -107,7 +107,8 @@ pub(super) fn render_pane_map_content(
                         if let Some((lat, lon, _max_range_km, value_data)) = meta_snapshot {
                             render_radar_range_ring(ui, projector, lat, lon);
                             update_pane_hover_value_from_meta(
-                                ui, projector, &value_data, lat, lon,
+                                ui, projector,
+                                &RadarHoverData { value_data: &value_data, lat, lon },
                                 ctx.pane, ctx.pane_rect, ctx.preferences,
                             );
                         }
@@ -159,12 +160,14 @@ pub(super) fn render_pane_map_content(
                             selected.extend(render_per_frame_overlay(
                                 ui,
                                 projector,
-                                ctx.overlays,
-                                kind,
-                                zoom,
-                                ctx.preferences,
-                                ctx.overlay_click_pos,
-                                &ctx.excluded_rects,
+                                &PerFrameOverlayCtx {
+                                    overlays: ctx.overlays,
+                                    kind,
+                                    zoom,
+                                    prefs: ctx.preferences,
+                                    overlay_click_pos: ctx.overlay_click_pos,
+                                    excluded_rects: &ctx.excluded_rects,
+                                },
                             ));
                         }
                         _ => {}
@@ -272,7 +275,11 @@ fn render_radar_overlay(
     );
 
     render_radar_range_ring(ui, projector, img.lat, img.lon);
-    update_pane_hover_value_from_meta(ui, projector, &img.value_data, img.lat, img.lon, pane, pane_rect, prefs);
+    update_pane_hover_value_from_meta(
+        ui, projector,
+        &RadarHoverData { value_data: &img.value_data, lat: img.lat, lon: img.lon },
+        pane, pane_rect, prefs,
+    );
 }
 
 /// Draw only the range ring for a radar site (used with overlay-cache rendering).
@@ -299,18 +306,23 @@ fn render_radar_range_ring(
     );
 }
 
+/// Radar value data and site location for hover queries.
+struct RadarHoverData<'a> {
+    value_data: &'a [f32],
+    lat: f64,
+    lon: f64,
+}
+
 /// Update hover value using radar metadata from the overlay cache.
 fn update_pane_hover_value_from_meta(
     ui: &egui::Ui,
     projector: &walkers::Projector,
-    value_data: &[f32],
-    lat: f64,
-    lon: f64,
+    radar: &RadarHoverData<'_>,
     pane: &mut PaneState,
     pane_rect: egui::Rect,
     prefs: &UserPreferences,
 ) {
-    let bounds = ImageBounds::from_radar_site(lat, lon);
+    let bounds = ImageBounds::from_radar_site(radar.lat, radar.lon);
     let nw = projector
         .project(walkers::lat_lon(bounds.max_lat, bounds.min_lon))
         .to_pos2();
@@ -342,13 +354,15 @@ fn update_pane_hover_value_from_meta(
         let map_pos = projector.unproject(screen_vec);
 
         pane.hover_value = Some(super::compute_hover_info_raw(
-            value_data,
-            lat,
-            lon,
-            map_pos.y(),
-            map_pos.x(),
-            hover_pos,
-            image_rect,
+            radar.value_data,
+            &super::HoverInput {
+                site_lat: radar.lat,
+                site_lon: radar.lon,
+                hover_lat: map_pos.y(),
+                hover_lon: map_pos.x(),
+                hover_pos,
+                rect: image_rect,
+            },
             pane.selected_product,
             prefs,
         ));
@@ -744,6 +758,16 @@ fn render_color_scale(
     }
 }
 
+/// Context for per-frame point overlay rendering.
+struct PerFrameOverlayCtx<'a> {
+    overlays: &'a OverlayRegistry,
+    kind: OverlayKind,
+    zoom: f64,
+    prefs: &'a UserPreferences,
+    overlay_click_pos: Option<egui::Pos2>,
+    excluded_rects: &'a [egui::Rect],
+}
+
 /// Per-frame rendering for point overlays (e.g. METAR station model plots).
 ///
 /// Projects each point onto the screen, culls off-screen points, calls the
@@ -752,23 +776,18 @@ fn render_color_scale(
 fn render_per_frame_overlay(
     ui: &egui::Ui,
     projector: &walkers::Projector,
-    overlays: &OverlayRegistry,
-    kind: OverlayKind,
-    zoom: f64,
-    prefs: &UserPreferences,
-    overlay_click_pos: Option<egui::Pos2>,
-    excluded_rects: &[egui::Rect],
+    pf: &PerFrameOverlayCtx<'_>,
 ) -> Vec<Arc<dyn OverlayItem>> {
-    let points = overlays.per_frame_points(kind);
+    let points = pf.overlays.per_frame_points(pf.kind);
     if points.is_empty() {
         return Vec::new();
     }
 
-    let zoom_f32 = zoom as f32;
+    let zoom_f32 = pf.zoom as f32;
     let is_dark = ui.ctx().style().visuals.dark_mode;
     let draw_ctx = DrawPointContext { zoom: zoom_f32, is_dark };
-    let hit_radius = overlays.point_hit_radius(kind, zoom_f32);
-    let hover_ctx = HoverContext { prefs };
+    let hit_radius = pf.overlays.point_hit_radius(pf.kind, zoom_f32);
+    let hover_ctx = HoverContext { prefs: pf.prefs };
 
     let screen_rect = ui.max_rect();
     let margin = hit_radius + 40.0; // extra margin for station model elements
@@ -794,14 +813,14 @@ fn render_per_frame_overlay(
             painter,
             center: screen,
         };
-        overlays.draw_point(kind, pt.id, &mut ep, &draw_ctx);
+        pf.overlays.draw_point(pf.kind, pt.id, &mut ep, &draw_ctx);
 
         // Click detection
-        if let Some(click_pos) = overlay_click_pos {
+        if let Some(click_pos) = pf.overlay_click_pos {
             let dx = click_pos.x - screen.x;
             let dy = click_pos.y - screen.y;
             if dx * dx + dy * dy <= hit_radius * hit_radius {
-                let on_excluded = excluded_rects.iter().any(|r| r.contains(click_pos));
+                let on_excluded = pf.excluded_rects.iter().any(|r| r.contains(click_pos));
                 if !on_excluded {
                     selected.push(pt.selection.clone());
                 }
@@ -822,13 +841,13 @@ fn render_per_frame_overlay(
 
     // Show tooltip for closest hovered point
     if let Some((_, id)) = closest_hover
-        && let Some(text) = overlays.hover_text(kind, id, &hover_ctx) {
+        && let Some(text) = pf.overlays.hover_text(pf.kind, id, &hover_ctx) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             #[allow(deprecated)]
             egui::show_tooltip_at_pointer(
                 ui.ctx(),
                 ui.layer_id(),
-                egui::Id::new(("per_frame_overlay_hover", kind as u8)),
+                egui::Id::new(("per_frame_overlay_hover", pf.kind as u8)),
                 |tooltip_ui| {
                     tooltip_ui.set_max_width(400.0);
                     tooltip_ui.label(text);

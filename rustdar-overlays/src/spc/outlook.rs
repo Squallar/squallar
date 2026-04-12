@@ -202,7 +202,7 @@ pub fn parse_geojson(
     let mut expire: Option<NaiveDateTime> = None;
 
     for feature_val in features_array {
-        let (feature, feat_valid, feat_expire) = match parse_outlook_feature(feature_val)? {
+        let ParsedOutlookFeature { feature, valid: feat_valid, expire: feat_expire } = match parse_outlook_feature(feature_val)? {
             Some(result) => result,
             None => continue,
         };
@@ -224,12 +224,19 @@ pub fn parse_geojson(
     })
 }
 
+/// A parsed outlook feature with its optional validity window.
+struct ParsedOutlookFeature {
+    feature: OverlayFeature,
+    valid: Option<NaiveDateTime>,
+    expire: Option<NaiveDateTime>,
+}
+
 /// Parse a single GeoJSON feature into an `OverlayFeature` with optional timestamps.
 ///
 /// Returns `None` for features that should be skipped (empty geometry, unsupported types).
 fn parse_outlook_feature(
     feature_val: &serde_json::Value,
-) -> Result<Option<(OverlayFeature, Option<NaiveDateTime>, Option<NaiveDateTime>)>, String> {
+) -> Result<Option<ParsedOutlookFeature>, String> {
     let properties = feature_val
         .get("properties")
         .ok_or_else(|| "Feature missing 'properties'".to_string())?;
@@ -315,7 +322,7 @@ fn parse_outlook_feature(
     }
 
     let feature = OverlayFeature::new(polygons, fill_rgba, stroke_rgba, label, label2, hatch);
-    Ok(Some((feature, valid, expire)))
+    Ok(Some(ParsedOutlookFeature { feature, valid, expire }))
 }
 
 /// Parse a GeoJSON MultiPolygon geometry into our polygon type.

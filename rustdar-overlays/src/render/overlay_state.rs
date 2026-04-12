@@ -11,6 +11,9 @@ use crate::render::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter
 use crate::render::rasterize::RasterizeOutput;
 use crate::types::{GeoBounds, OverlayFeature, OverlayLabel};
 
+/// Closure type for background overlay rasterization.
+pub type RasterizeFn = Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>;
+
 /// Generic wrapper for overlay data that follows the fetch-cache-generation pattern.
 ///
 /// Each overlay type (SPC outlooks, NWS alerts, SPC discussions) has the same
@@ -183,7 +186,7 @@ pub trait OverlayHandler: Send {
     fn prepare_rasterize(
         &self,
         ctx: &RasterizeContext,
-    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>> {
+    ) -> Option<RasterizeFn> {
         let _ = ctx;
         None
     }
@@ -419,7 +422,7 @@ impl OverlayRegistry {
         &self,
         kind: OverlayKind,
         ctx: &RasterizeContext,
-    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>> {
+    ) -> Option<RasterizeFn> {
         self.handler(kind).and_then(|h| h.prepare_rasterize(ctx))
     }
 

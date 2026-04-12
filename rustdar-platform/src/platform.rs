@@ -112,10 +112,7 @@ impl PlatformBridge for DesktopPlatform {
     }
 
     fn detect_dark_theme(&self) -> bool {
-        match dark_light::detect() {
-            Ok(dark_light::Mode::Dark) => true,
-            _ => false,
-        }
+        matches!(dark_light::detect(), Ok(dark_light::Mode::Dark))
     }
 
     fn set_back_handler(&mut self, handler: fn()) {

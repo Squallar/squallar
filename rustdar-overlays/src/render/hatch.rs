@@ -17,21 +17,17 @@ fn draw_hatch_lines_clipped(
     poly_path: &tiny_skia::Path,
 ) {
     let bounds = poly_path.bounds();
-    let min_x = bounds.left();
-    let min_y = bounds.top();
-    let max_x = bounds.right();
-    let max_y = bounds.bottom();
 
     match pattern {
         HatchPattern::Cig1 => {
-            draw_directional_hatch(pixmap, clip, 45.0, true, hatch_color, min_x, min_y, max_x, max_y);
+            draw_directional_hatch(pixmap, clip, 45.0, true, hatch_color, bounds);
         }
         HatchPattern::Cig2 => {
-            draw_directional_hatch(pixmap, clip, 135.0, false, hatch_color, min_x, min_y, max_x, max_y);
+            draw_directional_hatch(pixmap, clip, 135.0, false, hatch_color, bounds);
         }
         HatchPattern::Cig3 => {
-            draw_directional_hatch(pixmap, clip, 45.0, false, hatch_color, min_x, min_y, max_x, max_y);
-            draw_directional_hatch(pixmap, clip, 135.0, false, hatch_color, min_x, min_y, max_x, max_y);
+            draw_directional_hatch(pixmap, clip, 45.0, false, hatch_color, bounds);
+            draw_directional_hatch(pixmap, clip, 135.0, false, hatch_color, bounds);
         }
         HatchPattern::None => {}
     }
@@ -44,11 +40,12 @@ fn draw_directional_hatch(
     angle_degrees: f32,
     dotted: bool,
     color: [u8; 4],
-    min_x: f32,
-    min_y: f32,
-    max_x: f32,
-    max_y: f32,
+    bounds: tiny_skia::Rect,
 ) {
+    let min_x = bounds.left();
+    let min_y = bounds.top();
+    let max_x = bounds.right();
+    let max_y = bounds.bottom();
     let angle_rad = angle_degrees.to_radians();
     let dir_x = angle_rad.cos();
     let dir_y = -angle_rad.sin();
@@ -115,11 +112,17 @@ pub(crate) fn draw_hatch_pass(
     h: f32,
     hatch_color: [u8; 4],
 ) {
+/// A polygon with CIG hatch info: feature index, projected path, and projected points.
+struct HatchedPolygon {
+    feature_idx: usize,
+    path: tiny_skia::Path,
+    points: Vec<(f32, f32)>,
+}
+
     // Collect projected polygon points per CIG level for exclusion masks
     let mut cig2_pts: Vec<Vec<(f32, f32)>> = Vec::new();
     let mut cig3_pts: Vec<Vec<(f32, f32)>> = Vec::new();
-    // (feature_idx, path, projected_pts) for each hatched polygon
-    let mut all_hatched: Vec<(usize, tiny_skia::Path, Vec<(f32, f32)>)> = Vec::new();
+    let mut all_hatched: Vec<HatchedPolygon> = Vec::new();
 
     for (idx, feature) in features.iter().enumerate() {
         if feature.hatch == HatchPattern::None {
@@ -135,7 +138,7 @@ pub(crate) fn draw_hatch_pass(
                     HatchPattern::Cig3 => cig3_pts.push(pts.clone()),
                     _ => {}
                 }
-                all_hatched.push((idx, path, pts));
+                all_hatched.push(HatchedPolygon { feature_idx: idx, path, points: pts });
             }
         }
     }
@@ -143,8 +146,8 @@ pub(crate) fn draw_hatch_pass(
     let pw = pixmap.width();
     let ph = pixmap.height();
 
-    for (idx, poly_path, pts) in &all_hatched {
-        let hatch = features[*idx].hatch;
+    for hp in &all_hatched {
+        let hatch = features[hp.feature_idx].hatch;
 
         let Some(mut mask) = Mask::new(pw, ph) else { continue };
 
@@ -155,15 +158,15 @@ pub(crate) fn draw_hatch_pass(
         };
 
         if exclusion_pts.is_empty() {
-            mask.fill_path(poly_path, FillRule::EvenOdd, false, Transform::identity());
+            mask.fill_path(&hp.path, FillRule::EvenOdd, false, Transform::identity());
         } else {
-            let Some(combined) = build_polygon_with_exclusions(pts, &exclusion_pts) else {
+            let Some(combined) = build_polygon_with_exclusions(&hp.points, &exclusion_pts) else {
                 continue;
             };
             mask.fill_path(&combined, FillRule::EvenOdd, false, Transform::identity());
         }
 
-        draw_hatch_lines_clipped(pixmap, &mask, hatch, hatch_color, poly_path);
+        draw_hatch_lines_clipped(pixmap, &mask, hatch, hatch_color, &hp.path);
     }
 }
 

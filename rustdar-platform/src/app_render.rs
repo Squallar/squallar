@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use rustdar_egui::actions::GuiAction;
 use rustdar_radar::types::IMAGE_SIZE;
 use crate::constants::{MAX_CONCURRENT_RENDERS, MAX_LOOP_RENDER_BUDGET, MAX_CONCURRENT_LOOP_DOWNLOADS, MAX_LOOP_FRAMES};
+use crate::render_dispatch::CachedPaneRender;
 
 impl super::App {
     /// Create screen descriptor and setup egui frame.
@@ -93,23 +94,25 @@ impl super::App {
             }
 
             // Extract fields to avoid borrow issues
-            let image_data = rr.image_data;
-            let max_range_km = rr.max_range_km;
-            let value_data = rr.value_data;
-            let product = rr.product;
-            let elevation = rr.elevation;
             let origin_pane = rr.pane_idx;
+            let render_result = crate::render_dispatch::CachedPaneRender {
+                image_data: rr.image_data,
+                max_range_km: rr.max_range_km,
+                value_data: rr.value_data,
+                product: rr.product,
+                elevation: rr.elevation,
+            };
 
             // Cache the render output for sharing with other panes on the same site
             let origin_site = self.gui.pane(origin_pane).map(|p| p.site.clone()).unwrap_or_default();
-            self.render.cache_render(&origin_site, product, elevation, crate::render_dispatch::CachedRenderOutput {
-                image_data: Arc::clone(&image_data),
-                max_range_km,
-                value_data: Arc::clone(&value_data),
+            self.render.cache_render(&origin_site, render_result.product, render_result.elevation, crate::render_dispatch::CachedRenderOutput {
+                image_data: Arc::clone(&render_result.image_data),
+                max_range_km: render_result.max_range_km,
+                value_data: Arc::clone(&render_result.value_data),
             });
 
             // Apply to the originating pane
-            self.apply_render_to_pane(&ctx, origin_pane, &image_data, max_range_km, &value_data, product, elevation);
+            self.apply_render_to_pane(&ctx, origin_pane, &render_result);
 
             // Broadcast to sibling panes that need the same site+product+elevation
             let pane_count = self.gui.pane_count();
@@ -124,14 +127,14 @@ impl super::App {
                 let Some((other_product, other_elevation)) = self.gui.get_rendering_params_for_pane(other_idx) else {
                     continue;
                 };
-                if other_product == product && (other_elevation - elevation).abs() <= 0.01 {
+                if other_product == render_result.product && (other_elevation - render_result.elevation).abs() <= 0.01 {
                     let needs = other_idx < self.render.pane_render.len()
                         && self.render.pane_render[other_idx]
                             .last_rendered
                             .map(|(lp, le)| lp != other_product || (le - other_elevation).abs() > 0.01)
                             .unwrap_or(true);
                     if needs {
-                        self.apply_render_to_pane(&ctx, other_idx, &image_data, max_range_km, &value_data, product, elevation);
+                        self.apply_render_to_pane(&ctx, other_idx, &render_result);
                     }
                 }
             }
@@ -143,11 +146,7 @@ impl super::App {
         &mut self,
         ctx: &egui::Context,
         pane_idx: usize,
-        image_data: &Arc<Vec<u8>>,
-        max_range_km: f64,
-        value_data: &Arc<Vec<f32>>,
-        product: rustdar_radar::types::RadarProduct,
-        elevation: f32,
+        render: &crate::render_dispatch::CachedPaneRender,
     ) {
         use rustdar_egui::overlay_cache::{OverlayTextureData, RadarTextureMeta};
         use rustdar_overlays::render::overlay_state::OverlayKind;
@@ -173,7 +172,7 @@ impl super::App {
 
         self.texture_counter += 1;
         let color_image =
-            egui::ColorImage::from_rgba_unmultiplied([IMAGE_SIZE, IMAGE_SIZE], image_data);
+            egui::ColorImage::from_rgba_unmultiplied([IMAGE_SIZE, IMAGE_SIZE], &render.image_data);
         let texture_name = format!("radar_image_{}", self.texture_counter);
         let texture = ctx.load_texture(
             texture_name,
@@ -183,13 +182,13 @@ impl super::App {
 
         // Cache the raw image data for fast restore after suspend/resume
         if pane_idx < self.render.pane_render.len() {
-            self.render.pane_render[pane_idx].cached_render = Some((
-                Arc::clone(image_data),
-                max_range_km,
-                Arc::clone(value_data),
-                product,
-                elevation,
-            ));
+            self.render.pane_render[pane_idx].cached_render = Some(CachedPaneRender {
+                image_data: Arc::clone(&render.image_data),
+                max_range_km: render.max_range_km,
+                value_data: Arc::clone(&render.value_data),
+                product: render.product,
+                elevation: render.elevation,
+            });
         }
 
         // Store in overlay cache with radar metadata
@@ -210,16 +209,16 @@ impl super::App {
             width: IMAGE_SIZE as u32,
             height: IMAGE_SIZE as u32,
             radar_meta: Some(RadarTextureMeta {
-                value_data: Arc::clone(value_data),
+                value_data: Arc::clone(&render.value_data),
                 lat,
                 lon,
-                max_range_km,
+                max_range_km: render.max_range_km,
             }),
             hit_map: None,
         });
 
         if pane_idx < self.render.pane_render.len() {
-            self.render.pane_render[pane_idx].last_rendered = Some((product, elevation));
+            self.render.pane_render[pane_idx].last_rendered = Some((render.product, render.elevation));
         }
     }
 
@@ -356,22 +355,29 @@ impl super::App {
 
                     // Check if another pane already rendered this site+product+elevation
                     if let Some(cached) = self.render.get_cached_render(&pane_site, product, elevation) {
-                        let image_data = Arc::clone(&cached.image_data);
-                        let max_range_km = cached.max_range_km;
-                        let value_data = Arc::clone(&cached.value_data);
+                        let render_result = crate::render_dispatch::CachedPaneRender {
+                            image_data: Arc::clone(&cached.image_data),
+                            max_range_km: cached.max_range_km,
+                            value_data: Arc::clone(&cached.value_data),
+                            product,
+                            elevation,
+                        };
                         log::info!("Reusing cached render for pane {}: {:?} at {:.1}°", pane_idx, product, elevation);
-                        self.apply_render_to_pane(&ctx, pane_idx, &image_data, max_range_km, &value_data, product, elevation);
+                        self.apply_render_to_pane(&ctx, pane_idx, &render_result);
                         continue;
                     }
 
                     if product.is_level3() {
                         if let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) {
-                            self.render.try_spawn_level3_render(
-                                pane_idx,
+                            let params = crate::render_dispatch::RenderParams {
                                 product,
                                 elevation,
-                                scan_info.site.lat,
-                                scan_info.site.lon,
+                                lat: scan_info.site.lat,
+                                lon: scan_info.site.lon,
+                            };
+                            self.render.try_spawn_level3_render(
+                                pane_idx,
+                                &params,
                                 &pane_site,
                                 self.channels.render_sender.clone(),
                                 self.window.clone(),
@@ -379,12 +385,15 @@ impl super::App {
                         }
                     } else if let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx)
                         && let Some(data) = self.scan_data.get(scan_info.site.name) {
-                            self.render.spawn_level2_render(
-                                pane_idx,
+                            let params = crate::render_dispatch::RenderParams {
                                 product,
                                 elevation,
-                                scan_info.site.lat,
-                                scan_info.site.lon,
+                                lat: scan_info.site.lat,
+                                lon: scan_info.site.lon,
+                            };
+                            self.render.spawn_level2_render(
+                                pane_idx,
+                                &params,
                                 Arc::clone(data),
                                 self.channels.render_sender.clone(),
                                 self.window.clone(),
@@ -422,11 +431,14 @@ impl super::App {
         };
 
         for pane_idx in 0..self.render.pane_render.len().min(self.gui.pane_count()) {
-            let Some((ref image_data, max_range_km, ref value_data, product, elevation)) =
+            let Some(ref cached) =
                 self.render.pane_render[pane_idx].cached_render
             else {
                 continue;
             };
+            let max_range_km = cached.max_range_km;
+            let product = cached.product;
+            let elevation = cached.elevation;
 
             let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
                 continue;
@@ -443,7 +455,7 @@ impl super::App {
 
             self.texture_counter += 1;
             let ctx = state.egui_renderer.context();
-            let color_image = egui::ColorImage::from_rgba_unmultiplied([IMAGE_SIZE, IMAGE_SIZE], image_data);
+            let color_image = egui::ColorImage::from_rgba_unmultiplied([IMAGE_SIZE, IMAGE_SIZE], &cached.image_data);
             let texture_name = format!("radar_image_{}", self.texture_counter);
             let texture = ctx.load_texture(texture_name, color_image, egui::TextureOptions::NEAREST);
 
@@ -467,7 +479,7 @@ impl super::App {
                     width: IMAGE_SIZE as u32,
                     height: IMAGE_SIZE as u32,
                     radar_meta: Some(RadarTextureMeta {
-                        value_data: Arc::clone(value_data),
+                        value_data: Arc::clone(&cached.value_data),
                         lat,
                         lon,
                         max_range_km,
@@ -1014,10 +1026,7 @@ impl super::App {
                 pane_idx,
                 ts,
                 scan_arc,
-                product,
-                elevation,
-                lat,
-                lon,
+                &crate::render_dispatch::RenderParams { product, elevation, lat, lon },
             );
         }
     }

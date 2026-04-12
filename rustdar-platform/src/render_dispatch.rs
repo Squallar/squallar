@@ -20,15 +20,24 @@ impl Drop for RenderGuard {
     }
 }
 
+/// Cached raw RGBA + metadata from the last successful render so we can
+/// re-upload the texture instantly after suspend/resume without re-rendering.
+pub struct CachedPaneRender {
+    pub image_data: Arc<Vec<u8>>,
+    pub max_range_km: f64,
+    pub value_data: Arc<Vec<f32>>,
+    pub product: RadarProduct,
+    pub elevation: f32,
+}
+
 /// Per-pane render tracking state.
 pub struct PaneRenderState {
     /// True while a background render is in progress for this pane.
     pub render_in_flight: bool,
     /// Last rendered radar parameters to detect changes.
     pub last_rendered: Option<(RadarProduct, f32)>,
-    /// Cached raw RGBA + metadata from the last successful render so we can
-    /// re-upload the texture instantly after suspend/resume without re-rendering.
-    pub cached_render: Option<(Arc<Vec<u8>>, f64, Arc<Vec<f32>>, RadarProduct, f32)>,
+    /// Cached render for instant texture restore after suspend/resume.
+    pub cached_render: Option<CachedPaneRender>,
 }
 
 impl Default for PaneRenderState {
@@ -163,16 +172,23 @@ impl RenderDispatcher {
     pub fn cache_render(&mut self, site: &str, product: RadarProduct, elevation: f32, output: CachedRenderOutput) {
         self.render_cache.insert((site.to_string(), product, elevation_key(elevation)), output);
     }
+}
 
+/// Parameters identifying a radar product to render at a specific location.
+pub struct RenderParams {
+    pub product: RadarProduct,
+    pub elevation: f32,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+impl RenderDispatcher {
     /// Spawn a Level III render for a pane if applicable.
     /// Returns `true` if a render was spawned.
     pub fn try_spawn_level3_render(
         &mut self,
         pane_idx: usize,
-        product: RadarProduct,
-        elevation: f32,
-        lat: f64,
-        lon: f64,
+        params: &RenderParams,
         site: &str,
         sender: std::sync::mpsc::Sender<RenderResponse>,
         window: Option<WindowRef>,
@@ -180,10 +196,10 @@ impl RenderDispatcher {
         let best_l3 = self
             .level3_data
             .iter()
-            .filter(|((p, _tilt, s), _)| *p == product && s == site)
+            .filter(|((p, _tilt, s), _)| *p == params.product && s == site)
             .min_by(|(_, a), (_, b)| {
-                let da = (a.pdb.elevation_angle() - elevation).abs();
-                let db = (b.pdb.elevation_angle() - elevation).abs();
+                let da = (a.pdb.elevation_angle() - params.elevation).abs();
+                let db = (b.pdb.elevation_angle() - params.elevation).abs();
                 da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(_, msg)| Arc::clone(msg));
@@ -192,12 +208,15 @@ impl RenderDispatcher {
             return false;
         };
 
+        let lat = params.lat;
+        let lon = params.lon;
+        let product = params.product;
         log::info!(
             "Spawning Level III render for pane {}: {:?}",
             pane_idx,
             product
         );
-        self.spawn_render(pane_idx, product, elevation, sender, window, move || {
+        self.spawn_render(pane_idx, params.product, params.elevation, sender, window, move || {
             render_level3_message_to_image(&l3_msg, product, lat, lon)
         });
         true
@@ -207,14 +226,15 @@ impl RenderDispatcher {
     pub fn spawn_level2_render(
         &mut self,
         pane_idx: usize,
-        product: RadarProduct,
-        elevation: f32,
-        lat: f64,
-        lon: f64,
+        params: &RenderParams,
         data: Arc<nexrad_model::data::Scan>,
         sender: std::sync::mpsc::Sender<RenderResponse>,
         window: Option<WindowRef>,
     ) {
+        let product = params.product;
+        let elevation = params.elevation;
+        let lat = params.lat;
+        let lon = params.lon;
         log::info!(
             "Spawning background render for pane {}: {:?} at {:.1}°",
             pane_idx,

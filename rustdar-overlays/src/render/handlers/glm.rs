@@ -12,9 +12,9 @@ use crate::render::controls::{
 };
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
-    OverlayState, PopupContent, PopupSection, RasterizeContext, RenderMode,
+    OverlayState, PopupContent, PopupSection, RasterizeContext, RasterizeFn, RenderMode,
 };
-use crate::render::rasterize::{self, RasterizeOutput};
+use crate::render::rasterize;
 use crate::types::GeoBounds;
 
 /// Clickable item representing a single GLM lightning flash.
@@ -249,7 +249,7 @@ impl OverlayHandler for GlmHandler {
     fn prepare_rasterize(
         &self,
         ctx: &RasterizeContext,
-    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>> {
+    ) -> Option<RasterizeFn> {
         if self.state.data.is_empty() {
             return None;
         }
@@ -262,7 +262,8 @@ impl OverlayHandler for GlmHandler {
         let now = Utc::now().naive_utc();
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
             rasterize::rasterize_glm_strikes(
-                &flashes, &items, bounds, width, height, zoom, is_dark, time_window_secs, now,
+                &flashes, &items, bounds, width, height,
+                &rasterize::GlmRenderParams { zoom, is_dark, time_window_secs, now },
             )
         }))
     }

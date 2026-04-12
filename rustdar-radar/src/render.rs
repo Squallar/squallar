@@ -341,29 +341,28 @@ fn render_nrot_to_image(
         return None;
     }
 
-    let (vel_grid, azimuths_deg, gate_count, first_gate_range, gate_interval) =
-        build_velocity_grid(radials)?;
+    let vg = build_velocity_grid(radials)?;
 
-    let actual_max_range = first_gate_range + gate_count as f64 * gate_interval;
-    let azimuths_rad: Vec<f64> = azimuths_deg.iter().map(|d| d.to_radians()).collect();
+    let actual_max_range = vg.first_gate_range_km + vg.gate_count as f64 * vg.gate_interval_km;
+    let azimuths_rad: Vec<f64> = vg.azimuths_deg.iter().map(|d| d.to_radians()).collect();
     let avg_spacing_deg = 360.0 / num_radials as f64;
 
-    let nrot_grid = compute_nrot_grid(&vel_grid, gate_count, first_gate_range, gate_interval, &azimuths_rad);
+    let nrot_grid = compute_nrot_grid(&vg.vel_grid, vg.gate_count, vg.first_gate_range_km, vg.gate_interval_km, &azimuths_rad);
 
-    let nrot_grid = filter_nrot_grid(&nrot_grid, gate_count);
+    let nrot_grid = filter_nrot_grid(&nrot_grid, vg.gate_count);
 
     let output = render_with_projection(
         radar_lat, radar_lon, actual_max_range, "NROT",
         |proj, bufs| {
             nrot_grid.par_iter().enumerate().for_each(|(i, nrot_row)| {
-                let ctx = RadialContext::new(azimuths_deg[i], avg_spacing_deg / 2.0);
+                let ctx = RadialContext::new(vg.azimuths_deg[i], avg_spacing_deg / 2.0);
 
                 for (j, &nrot_val) in nrot_row.iter().enumerate() {
                     if nrot_val.is_nan() {
                         continue;
                     }
 
-                    let range_km = first_gate_range + j as f64 * gate_interval;
+                    let range_km = vg.first_gate_range_km + j as f64 * vg.gate_interval_km;
                     if range_km > types::MAX_RANGE_KM {
                         break;
                     }
@@ -377,7 +376,7 @@ fn render_nrot_to_image(
                         continue;
                     }
 
-                    proj.render_gate(bufs, &ctx, range_km, gate_interval, scaled_value, color);
+                    proj.render_gate(bufs, &ctx, range_km, vg.gate_interval_km, scaled_value, color);
                 }
             });
         },
@@ -385,16 +384,21 @@ fn render_nrot_to_image(
     Some(output)
 }
 
+/// Extracted velocity data organized as a 2D grid (azimuth × range).
+struct VelocityGrid {
+    vel_grid: Vec<Vec<f64>>,
+    azimuths_deg: Vec<f64>,
+    gate_count: usize,
+    first_gate_range_km: f64,
+    gate_interval_km: f64,
+}
+
 /// Extract velocity data from Level II radials into a 2D grid (azimuth × range).
-///
-/// Returns `(vel_grid, azimuths_deg, gate_count, first_gate_range_km, gate_interval_km)`.
-fn build_velocity_grid(
-    radials: &[Radial],
-) -> Option<(Vec<Vec<f64>>, Vec<f64>, usize, f64, f64)> {
+fn build_velocity_grid(radials: &[Radial]) -> Option<VelocityGrid> {
     let first_vel = radials.iter().find_map(|r| r.velocity())?;
     let gate_count = first_vel.gate_count() as usize;
-    let first_gate_range = first_vel.first_gate_range_km();
-    let gate_interval = first_vel.gate_interval_km();
+    let first_gate_range_km = first_vel.first_gate_range_km();
+    let gate_interval_km = first_vel.gate_interval_km();
 
     let mut vel_grid: Vec<Vec<f64>> = Vec::with_capacity(radials.len());
     let mut azimuths_deg: Vec<f64> = Vec::with_capacity(radials.len());
@@ -413,7 +417,7 @@ fn build_velocity_grid(
         vel_grid.push(gates);
     }
 
-    Some((vel_grid, azimuths_deg, gate_count, first_gate_range, gate_interval))
+    Some(VelocityGrid { vel_grid, azimuths_deg, gate_count, first_gate_range_km, gate_interval_km })
 }
 
 /// Filter the NROT grid to remove isolated noise pixels.
@@ -735,11 +739,11 @@ fn build_vil_lut(pdb: &nexrad_level3::model::ProductDescriptionBlock) -> Option<
 
     let mut lut = vec![f32::NAN; 256];
     // Gate 0 = below threshold, gate 1 = range folded → NaN
-    for i in 2..log_start.min(255) {
-        lut[i] = (i as f32 - lin_offset) / lin_scale;
+    for (i, slot) in lut.iter_mut().enumerate().take(log_start.min(255)).skip(2) {
+        *slot = (i as f32 - lin_offset) / lin_scale;
     }
-    for i in log_start.min(255)..255 {
-        lut[i] = ((i as f32 - log_offset) / log_scale).exp();
+    for (i, slot) in lut.iter_mut().enumerate().take(255).skip(log_start.min(255)) {
+        *slot = ((i as f32 - log_offset) / log_scale).exp();
     }
     // Gate 255 is reserved
     Some(lut)

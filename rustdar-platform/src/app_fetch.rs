@@ -8,6 +8,15 @@ use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
 use crate::constants::MAX_CONCURRENT_RENDERS;
 use crate::render_dispatch::RenderGuard;
 use rustdar_radar::types::RadarProduct;
+
+/// Parameters for a background overlay rasterization request.
+pub(super) struct OverlayRenderRequest {
+    pub geo_bounds: rustdar_overlays::types::GeoBounds,
+    pub width: u32,
+    pub height: u32,
+    pub data_generation: u64,
+    pub zoom: i32,
+}
 use rustdar_radar::scan;
 
 impl super::App {
@@ -267,14 +276,12 @@ impl super::App {
         &mut self,
         pane_indices: Vec<usize>,
         kind: OverlayKind,
-        geo_bounds: rustdar_overlays::types::GeoBounds,
-        width: u32,
-        height: u32,
-        data_generation: u64,
-        zoom: i32,
+        req: OverlayRenderRequest,
     ) {
         use rustdar_overlays::render::rasterize;
         use rustdar_egui::overlay_cache::OVERDRAW_FRACTION;
+
+        let OverlayRenderRequest { geo_bounds, width, height, data_generation, zoom } = req;
 
         if width == 0 || height == 0 {
             return;
@@ -602,10 +609,7 @@ impl super::App {
         pane_idx: usize,
         timestamp: NaiveDateTime,
         scan_data: std::sync::Arc<nexrad_model::data::Scan>,
-        product: rustdar_radar::types::RadarProduct,
-        elevation: f32,
-        lat: f64,
-        lon: f64,
+        params: &crate::render_dispatch::RenderParams,
     ) {
         // Check concurrent render limit (shared with static pane renders)
         let current = self.renders_in_flight.load(Ordering::Relaxed);
@@ -615,6 +619,10 @@ impl super::App {
         self.renders_in_flight.fetch_add(1, Ordering::Relaxed);
         let guard = RenderGuard(std::sync::Arc::clone(&self.renders_in_flight));
 
+        let product = params.product;
+        let elevation = params.elevation;
+        let lat = params.lat;
+        let lon = params.lon;
         let sender = self.channels.loop_render_sender.clone();
         let window = self.window.clone();
         std::thread::spawn(move || {

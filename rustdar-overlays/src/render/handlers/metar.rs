@@ -8,11 +8,9 @@ use crate::render::controls::{ControlButton, ControlEffect, ControlItem, Control
 use crate::render::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter};
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
-    OverlayState, PopupContent, PopupSection, RasterizeContext, RenderMode,
+    OverlayState, PopupContent, PopupSection, RasterizeContext, RasterizeFn, RenderMode,
 };
-use crate::render::rasterize::RasterizeOutput;
 use crate::render::station_model;
-use crate::types::GeoBounds;
 
 /// Type-erased fetch result for METAR observations.
 pub(crate) struct MetarFetchResult(pub Result<Vec<MetarOb>, String>);
@@ -270,7 +268,7 @@ impl OverlayHandler for MetarHandler {
     fn prepare_rasterize(
         &self,
         _ctx: &RasterizeContext,
-    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>> {
+    ) -> Option<RasterizeFn> {
         None // Metar uses per-frame rendering, not background rasterization
     }
 

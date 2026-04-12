@@ -264,7 +264,7 @@ pub(crate) fn decode_generic_radial_packet(
     o += 4;
     o += 4; // skip "pointer" field (always present, value is meaningless)
 
-    for ci in 0..num_components {
+    if let Some(ci) = (0..num_components).next() {
         let comp_code = read_i32(data, o)?;
         o += 4;
 
@@ -281,7 +281,6 @@ pub(crate) fn decode_generic_radial_packet(
             ci + 1,
             num_components
         );
-        break;
     }
 
     // No radial component found — return empty packet so caller can handle gracefully

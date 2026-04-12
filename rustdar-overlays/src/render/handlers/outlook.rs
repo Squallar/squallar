@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::render::controls::{ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext, PaneControlContextMut};
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
-    OverlayState, PopupContent, PopupSection, RasterizeContext, RenderMode,
+    OverlayState, PopupContent, PopupSection, RasterizeContext, RasterizeFn, RenderMode,
 };
 use crate::render::rasterize::{self, RasterizeOutput};
 use crate::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
@@ -165,7 +165,7 @@ impl OverlayHandler for SpcOutlookHandler {
     fn prepare_rasterize(
         &self,
         ctx: &RasterizeContext,
-    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>> {
+    ) -> Option<RasterizeFn> {
         let day = self.selected_day;
         let mut features = Vec::new();
         for &product in &self.enabled_products {

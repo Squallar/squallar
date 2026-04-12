@@ -239,29 +239,48 @@ impl App {
         // (overlay_kind, zoom, data_generation, width, height) and spawn one render for all panes
         if !overlay_renders.is_empty() {
             if self.gui.is_viewport_sync() {
+                struct GroupedRender {
+                    kind: OverlayKind,
+                    bounds: rustdar_overlays::types::GeoBounds,
+                    width: u32,
+                    height: u32,
+                    data_gen: u64,
+                    zoom: i32,
+                    pane_indices: Vec<usize>,
+                }
+
                 let mut grouped: std::collections::HashMap<
                     (OverlayKind, i32, u64, u32, u32),
-                    (OverlayKind, rustdar_overlays::types::GeoBounds, u32, u32, u64, i32, Vec<usize>),
+                    GroupedRender,
                 > = std::collections::HashMap::new();
 
                 for (pane_idx, kind, bounds, w, h, data_gen, zoom) in overlay_renders {
                     let key = (kind, zoom, data_gen, w, h);
                     grouped.entry(key)
-                        .and_modify(|(_k, _b, _w, _h, _g, _z, panes)| {
-                            if !panes.contains(&pane_idx) {
-                                panes.push(pane_idx);
+                        .and_modify(|g| {
+                            if !g.pane_indices.contains(&pane_idx) {
+                                g.pane_indices.push(pane_idx);
                             }
                         })
-                        .or_insert_with(|| (kind, bounds, w, h, data_gen, zoom, vec![pane_idx]));
+                        .or_insert_with(|| GroupedRender {
+                            kind, bounds, width: w, height: h, data_gen, zoom,
+                            pane_indices: vec![pane_idx],
+                        });
                 }
 
-                for (_key, (kind, bounds, w, h, data_gen, zoom, pane_indices)) in grouped {
-                    log::debug!("Spawning overlay render for {:?} targeting {} panes", kind, pane_indices.len());
-                    self.spawn_overlay_render(pane_indices, kind, bounds, w, h, data_gen, zoom);
+                for (_key, g) in grouped {
+                    log::debug!("Spawning overlay render for {:?} targeting {} panes", g.kind, g.pane_indices.len());
+                    self.spawn_overlay_render(g.pane_indices, g.kind, fetch::OverlayRenderRequest {
+                        geo_bounds: g.bounds, width: g.width, height: g.height,
+                        data_generation: g.data_gen, zoom: g.zoom,
+                    });
                 }
             } else {
                 for (pane_idx, kind, bounds, w, h, data_gen, zoom) in overlay_renders {
-                    self.spawn_overlay_render(vec![pane_idx], kind, bounds, w, h, data_gen, zoom);
+                    self.spawn_overlay_render(vec![pane_idx], kind, fetch::OverlayRenderRequest {
+                        geo_bounds: bounds, width: w, height: h,
+                        data_generation: data_gen, zoom,
+                    });
                 }
             }
         }

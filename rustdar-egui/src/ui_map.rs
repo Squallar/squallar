@@ -282,22 +282,27 @@ fn draw_pane_border(ui: &mut egui::Ui, pane_rect: egui::Rect, is_active: bool) {
     );
 }
 
+/// Context for computing hover info from radar value data.
+pub(super) struct HoverInput {
+    pub site_lat: f64,
+    pub site_lon: f64,
+    pub hover_lat: f64,
+    pub hover_lon: f64,
+    pub hover_pos: egui::Pos2,
+    pub rect: egui::Rect,
+}
+
 /// Compute hover info string from raw value data and site coordinates.
 pub(super) fn compute_hover_info_raw(
     value_data: &[f32],
-    site_lat: f64,
-    site_lon: f64,
-    hover_lat: f64,
-    hover_lon: f64,
-    hover_pos: egui::Pos2,
-    rect: egui::Rect,
+    input: &HoverInput,
     product: RadarProduct,
     prefs: &UserPreferences,
 ) -> String {
-    let lat1 = site_lat.to_radians();
-    let lon1 = site_lon.to_radians();
-    let lat2 = hover_lat.to_radians();
-    let lon2 = hover_lon.to_radians();
+    let lat1 = input.site_lat.to_radians();
+    let lon1 = input.site_lon.to_radians();
+    let lat2 = input.hover_lat.to_radians();
+    let lon2 = input.hover_lon.to_radians();
     let dlat = lat2 - lat1;
     let dlon = lon2 - lon1;
     let a = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
@@ -309,8 +314,8 @@ pub(super) fn compute_hover_info_raw(
     let azimuth = (y.atan2(x).to_degrees() + 360.0) % 360.0;
 
     let mut value_str = String::new();
-    let frac_x = (hover_pos.x - rect.left()) / rect.width();
-    let frac_y = (hover_pos.y - rect.top()) / rect.height();
+    let frac_x = (input.hover_pos.x - input.rect.left()) / input.rect.width();
+    let frac_y = (input.hover_pos.y - input.rect.top()) / input.rect.height();
     let px = (frac_x * IMAGE_SIZE as f32) as i32;
     let py = (frac_y * IMAGE_SIZE as f32) as i32;
 
@@ -328,6 +333,6 @@ pub(super) fn compute_hover_info_raw(
 
     format!(
         "Lat: {:.4}\u{b0}, Lon: {:.4}\u{b0} | Range: {:.1}{}, Az: {:.1}\u{b0} {}",
-        hover_lat, hover_lon, distance, prefs.distance.suffix(), azimuth, value_str
+        input.hover_lat, input.hover_lon, distance, prefs.distance.suffix(), azimuth, value_str
     )
 }

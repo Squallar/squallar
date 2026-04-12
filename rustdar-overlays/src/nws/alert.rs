@@ -44,19 +44,21 @@ impl std::fmt::Display for AlertCategory {
     }
 }
 
-/// Generates a fieldless enum with a `from_str` method that maps variant names
+/// Generates a fieldless enum implementing `FromStr` that maps variant names
 /// to values, falling back to `Unknown` for unrecognized strings.
 macro_rules! str_enum {
     ($name:ident { $($variant:ident),+ $(,)? }) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub enum $name { $($variant,)+ Unknown }
 
-        impl $name {
-            pub fn from_str(s: &str) -> Self {
-                match s {
+        impl std::str::FromStr for $name {
+            type Err = std::convert::Infallible;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Ok(match s {
                     $(stringify!($variant) => Self::$variant,)+
                     _ => Self::Unknown,
-                }
+                })
             }
         }
     };
@@ -149,15 +151,12 @@ pub fn parse_alerts(json: &serde_json::Value) -> Vec<NwsAlert> {
             id: str_field(props, "id"),
             event,
             category,
-            severity: AlertSeverity::from_str(
-                props.get("severity").and_then(|v| v.as_str()).unwrap_or("Unknown"),
-            ),
-            urgency: AlertUrgency::from_str(
-                props.get("urgency").and_then(|v| v.as_str()).unwrap_or("Unknown"),
-            ),
-            certainty: AlertCertainty::from_str(
-                props.get("certainty").and_then(|v| v.as_str()).unwrap_or("Unknown"),
-            ),
+            severity: props.get("severity").and_then(|v| v.as_str()).unwrap_or("Unknown")
+                .parse().unwrap(),
+            urgency: props.get("urgency").and_then(|v| v.as_str()).unwrap_or("Unknown")
+                .parse().unwrap(),
+            certainty: props.get("certainty").and_then(|v| v.as_str()).unwrap_or("Unknown")
+                .parse().unwrap(),
             headline: opt_str_field(props, "headline"),
             description: str_field(props, "description"),
             instruction: opt_str_field(props, "instruction"),

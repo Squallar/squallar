@@ -6,9 +6,9 @@ use rustdar_units::UserPreferences;
 use crate::render::controls::{ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext, PaneControlContextMut};
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
-    OverlayState, PopupContent, PopupSection, RasterizeContext, RenderMode,
+    OverlayState, PopupContent, PopupSection, RasterizeContext, RasterizeFn, RenderMode,
 };
-use crate::render::rasterize::{self, RasterizeOutput};
+use crate::render::rasterize;
 use crate::spc::reports::{StormReport, StormReportKind};
 use crate::types::GeoBounds;
 
@@ -204,7 +204,7 @@ impl OverlayHandler for StormReportsHandler {
     fn prepare_rasterize(
         &self,
         ctx: &RasterizeContext,
-    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>> {
+    ) -> Option<RasterizeFn> {
         if self.state.data.is_empty() {
             return None;
         }

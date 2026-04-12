@@ -467,8 +467,7 @@ pub fn rasterize_storm_reports(
         let mut pb = PathBuilder::new();
         pb.push_circle(px, py, radius);
         if let Some(path) = pb.finish() {
-            let mut paint = Paint::default();
-            paint.anti_alias = true;
+            let mut paint = Paint { anti_alias: true, ..Paint::default() };
 
             if use_symbol {
                 // Outline-only circle with symbol inside
@@ -580,6 +579,14 @@ fn time_decay_color(age_secs: f64, window_secs: f64, is_dark: bool) -> [u8; 4] {
     [r, g, b, alpha]
 }
 
+/// Parameters for GLM lightning strike rasterization.
+pub struct GlmRenderParams {
+    pub zoom: f64,
+    pub is_dark: bool,
+    pub time_window_secs: f64,
+    pub now: chrono::NaiveDateTime,
+}
+
 /// Rasterize GLM lightning strikes to a texture with `HitMap` for click detection.
 pub fn rasterize_glm_strikes(
     flashes: &[GlmFlash],
@@ -587,10 +594,7 @@ pub fn rasterize_glm_strikes(
     bounds: &GeoBounds,
     width: u32,
     height: u32,
-    zoom: f64,
-    is_dark: bool,
-    time_window_secs: f64,
-    now: chrono::NaiveDateTime,
+    params: &GlmRenderParams,
 ) -> RasterizeOutput {
     let Some(mut pixmap) = Pixmap::new(width, height) else {
         return RasterizeOutput {
@@ -604,7 +608,7 @@ pub fn rasterize_glm_strikes(
     let mut hit_map = HitMap::new(width, height);
 
     // Scale bolt size with zoom (base ~12px at zoom 6, range 6-20px)
-    let zoom_f32 = zoom as f32;
+    let zoom_f32 = params.zoom as f32;
     let base_size = (zoom_f32 * 2.0).clamp(6.0, 20.0);
 
     for (i, flash) in flashes.iter().enumerate() {
@@ -617,8 +621,8 @@ pub fn rasterize_glm_strikes(
             continue;
         }
 
-        let age_secs = (now - flash.time).num_milliseconds().max(0) as f64 / 1000.0;
-        if age_secs > time_window_secs {
+        let age_secs = (params.now - flash.time).num_milliseconds().max(0) as f64 / 1000.0;
+        if age_secs > params.time_window_secs {
             continue;
         }
 
@@ -631,7 +635,7 @@ pub fn rasterize_glm_strikes(
         let energy_scale = (flash.energy.log10().clamp(-16.0, -12.0) + 16.0) / 4.0;
         let bolt_size = base_size * (0.8 + energy_scale * 0.4);
 
-        let rgba = time_decay_color(age_secs, time_window_secs, is_dark);
+        let rgba = time_decay_color(age_secs, params.time_window_secs, params.is_dark);
         draw_lightning_bolt(&mut pixmap, px, py, bolt_size, rgba);
 
         // Hit map registration

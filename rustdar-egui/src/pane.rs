@@ -94,6 +94,12 @@ pub struct PaneState {
     pub radar_sites_render_gen: u64,
 }
 
+impl Default for LoopPlaybackState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LoopPlaybackState {
     /// Create a default single-frame (non-loop) state.
     pub fn new() -> Self {

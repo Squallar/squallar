@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::render::controls::{ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext, PaneControlContextMut};
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
-    OverlayState, PopupContent, PopupSection, RasterizeContext, RenderMode,
+    OverlayState, PopupContent, PopupSection, RasterizeContext, RasterizeFn, RenderMode,
 };
 use crate::render::rasterize::{self, RasterizeOutput};
 use crate::spc::colors::md_stroke_color;
@@ -203,7 +203,7 @@ impl OverlayHandler for SpcDiscussionHandler {
     fn prepare_rasterize(
         &self,
         _ctx: &RasterizeContext,
-    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>> {
+    ) -> Option<RasterizeFn> {
         if self.state.data.is_empty() {
             return None;
         }

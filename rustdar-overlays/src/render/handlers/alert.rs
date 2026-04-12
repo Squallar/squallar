@@ -7,7 +7,7 @@ use crate::render::controls::{ControlButton, ControlEffect, ControlItem, Control
 use crate::render::overlay_state::{
     ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
     OverlayState, PopupAction, PopupActionKind, PopupContent, PopupSection, RasterizeContext,
-    RenderMode,
+    RasterizeFn, RenderMode,
 };
 use crate::render::rasterize::{self, RasterizeOutput};
 use crate::types::GeoBounds;
@@ -216,7 +216,7 @@ impl OverlayHandler for NwsAlertHandler {
     fn prepare_rasterize(
         &self,
         _ctx: &RasterizeContext,
-    ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>> {
+    ) -> Option<RasterizeFn> {
         if self.state.data.is_empty() {
             return None;
         }
