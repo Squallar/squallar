@@ -14,6 +14,7 @@ use tiny_skia::{
 
 use std::sync::Arc;
 
+use crate::glm::GlmFlash;
 use crate::nws::alert::{AlertCategory, NwsAlert};
 use crate::render::overlay_state::OverlayItem;
 use crate::spc::colors::{md_fill_color, md_stroke_color};
@@ -514,6 +515,146 @@ pub fn rasterize_storm_reports(
                 sx += 4;
             }
             sy += 4;
+        }
+    }
+
+    premultiplied_to_straight(pixmap.data_mut());
+    RasterizeOutput {
+        rgba: pixmap.take(),
+        hit_map: Some(hit_map),
+    }
+}
+
+// ── GLM Lightning rasterization ──────────────────────────────────────────
+
+/// Draw a lightning bolt symbol at the given center position.
+fn draw_lightning_bolt(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, rgba: [u8; 4]) {
+    let s = size * 0.5;
+    let mut pb = PathBuilder::new();
+    // Zigzag bolt shape (7 points)
+    pb.move_to(cx - s * 0.1, cy - s);
+    pb.line_to(cx + s * 0.35, cy - s);
+    pb.line_to(cx + s * 0.05, cy - s * 0.15);
+    pb.line_to(cx + s * 0.35, cy - s * 0.15);
+    pb.line_to(cx - s * 0.15, cy + s);
+    pb.line_to(cx + s * 0.05, cy + s * 0.15);
+    pb.line_to(cx - s * 0.25, cy + s * 0.15);
+    pb.close();
+
+    let Some(path) = pb.finish() else { return };
+    let paint = tiny_skia::Paint {
+        shader: tiny_skia::Shader::SolidColor(tiny_skia::Color::from_rgba8(
+            rgba[0], rgba[1], rgba[2], rgba[3],
+        )),
+        anti_alias: true,
+        ..Default::default()
+    };
+    pixmap.fill_path(
+        &path,
+        &paint,
+        tiny_skia::FillRule::Winding,
+        tiny_skia::Transform::identity(),
+        None,
+    );
+}
+
+/// Compute a time-decay color for a lightning flash.
+/// Recent flashes are bright white/yellow, older flashes fade toward orange/red.
+fn time_decay_color(age_secs: f64, window_secs: f64, is_dark: bool) -> [u8; 4] {
+    let t = (age_secs / window_secs).clamp(0.0, 1.0) as f32;
+    // Interpolate: recent → white/bright yellow, old → orange/red
+    let (r, g, b) = if t < 0.33 {
+        // White → bright yellow
+        let f = t / 0.33;
+        (255, (255.0 - f * 30.0) as u8, (255.0 - f * 200.0) as u8)
+    } else if t < 0.66 {
+        // Bright yellow → orange
+        let f = (t - 0.33) / 0.33;
+        (255, (225.0 - f * 90.0) as u8, (55.0 - f * 55.0) as u8)
+    } else {
+        // Orange → red
+        let f = (t - 0.66) / 0.34;
+        ((255.0 - f * 55.0) as u8, (135.0 - f * 85.0) as u8, 0)
+    };
+    let alpha = if is_dark { 230 } else { 200 };
+    [r, g, b, alpha]
+}
+
+/// Rasterize GLM lightning strikes to a texture with `HitMap` for click detection.
+pub fn rasterize_glm_strikes(
+    flashes: &[GlmFlash],
+    items: &[Arc<dyn OverlayItem>],
+    bounds: &GeoBounds,
+    width: u32,
+    height: u32,
+    zoom: f64,
+    is_dark: bool,
+    time_window_secs: f64,
+    now: chrono::NaiveDateTime,
+) -> RasterizeOutput {
+    let Some(mut pixmap) = Pixmap::new(width, height) else {
+        return RasterizeOutput {
+            rgba: vec![0u8; (width * height * 4) as usize],
+            hit_map: None,
+        };
+    };
+    let mb = MercatorBounds::from_geo(bounds);
+    let w = width as f32;
+    let h = height as f32;
+    let mut hit_map = HitMap::new(width, height);
+
+    // Scale bolt size with zoom (base ~12px at zoom 6, range 6-20px)
+    let zoom_f32 = zoom as f32;
+    let base_size = (zoom_f32 * 2.0).clamp(6.0, 20.0);
+
+    for (i, flash) in flashes.iter().enumerate() {
+        // Bounds check
+        if flash.lat < bounds.min_lat
+            || flash.lat > bounds.max_lat
+            || flash.lon < bounds.min_lon
+            || flash.lon > bounds.max_lon
+        {
+            continue;
+        }
+
+        let age_secs = (now - flash.time).num_milliseconds().max(0) as f64 / 1000.0;
+        if age_secs > time_window_secs {
+            continue;
+        }
+
+        let (px, py) = mb.project(flash.lat, flash.lon, w, h);
+        if px < -base_size || px > w + base_size || py < -base_size || py > h + base_size {
+            continue;
+        }
+
+        // Energy-based size scaling: bigger flashes get slightly larger bolts
+        let energy_scale = (flash.energy.log10().clamp(-16.0, -12.0) + 16.0) / 4.0;
+        let bolt_size = base_size * (0.8 + energy_scale * 0.4);
+
+        let rgba = time_decay_color(age_secs, time_window_secs, is_dark);
+        draw_lightning_bolt(&mut pixmap, px, py, bolt_size, rgba);
+
+        // Hit map registration
+        if let Some(item) = items.get(i) {
+            let item_id = i as u32;
+            hit_map.register_id(item_id, Arc::clone(item));
+            let r = bolt_size * 0.6;
+            let r2 = r * r;
+            let mut sy = (py - r) as i32;
+            let sy_end = (py + r) as i32;
+            while sy <= sy_end {
+                let mut sx = (px - r) as i32;
+                let sx_end = (px + r) as i32;
+                while sx <= sx_end {
+                    let dx = sx as f32 - px;
+                    let dy = sy as f32 - py;
+                    if dx * dx + dy * dy <= r2 {
+                        hit_map.record(sx as f32, sy as f32, item_id);
+                    }
+                    sx += 4;
+                }
+                sy += 4;
+            }
         }
     }
 

@@ -1,6 +1,7 @@
 mod alert;
 mod colorscale;
 mod discussion;
+mod glm;
 mod labels;
 mod location;
 mod metar;
@@ -19,6 +20,7 @@ pub(crate) fn create_handlers() -> Vec<Box<dyn OverlayHandler>> {
         Box::new(discussion::SpcDiscussionHandler::new()),
         Box::new(alert::NwsAlertHandler::new()),
         Box::new(reports::StormReportsHandler::new()),
+        Box::new(glm::GlmHandler::new()),
         Box::new(metar::MetarHandler::new()),
         Box::new(labels::CityLabelsHandler::new()),
         Box::new(sites::RadarSitesHandler::new()),

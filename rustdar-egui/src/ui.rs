@@ -860,6 +860,7 @@ impl Gui {
             OverlayKind::SpcDiscussions,
             OverlayKind::NwsAlerts,
             OverlayKind::StormReports,
+            OverlayKind::Lightning,
             OverlayKind::Metar,
             OverlayKind::CityLabels,
             OverlayKind::RadarSites,
