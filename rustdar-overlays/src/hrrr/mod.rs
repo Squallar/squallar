@@ -1,8 +1,8 @@
 //! HRRR model data fetch and types.
 //!
 //! Fetches HRRR f00 (analysis) fields from NOAA NOMADS server-side filter.
-//! Currently supports Convective Inhibition (CIN); designed to be extensible
-//! to CAPE, SRH, shear, etc. via `ModelParameter` enum variants.
+//! Supports CIN and CAPE parameters; extensible to SRH, shear, etc.
+//! via `ModelParameter` enum variants.
 
 pub mod fetch;
 
@@ -15,6 +15,12 @@ pub enum ModelParameter {
     SurfaceBasedCin,
     /// Mixed-Layer Convective Inhibition (180-0 mb above ground, J/kg, ≤ 0).
     MixedLayerCin,
+    /// Surface-Based Convective Available Potential Energy (J/kg, ≥ 0).
+    SurfaceBasedCape,
+    /// Mixed-Layer CAPE (180-0 mb above ground, J/kg, ≥ 0).
+    MixedLayerCape,
+    /// Most-Unstable CAPE (255-0 mb above ground, J/kg, ≥ 0).
+    MostUnstableCape,
 }
 
 impl ModelParameter {
@@ -23,6 +29,9 @@ impl ModelParameter {
         &[
             ModelParameter::SurfaceBasedCin,
             ModelParameter::MixedLayerCin,
+            ModelParameter::SurfaceBasedCape,
+            ModelParameter::MixedLayerCape,
+            ModelParameter::MostUnstableCape,
         ]
     }
 
@@ -30,14 +39,20 @@ impl ModelParameter {
     pub fn nomads_var(&self) -> &'static str {
         match self {
             ModelParameter::SurfaceBasedCin | ModelParameter::MixedLayerCin => "var_CIN",
+            ModelParameter::SurfaceBasedCape
+            | ModelParameter::MixedLayerCape
+            | ModelParameter::MostUnstableCape => "var_CAPE",
         }
     }
 
     /// NOMADS `lev_*` query parameter name.
     pub fn nomads_level(&self) -> &'static str {
         match self {
-            ModelParameter::SurfaceBasedCin => "lev_surface",
-            ModelParameter::MixedLayerCin => "lev_180-0_mb_above_ground",
+            ModelParameter::SurfaceBasedCin | ModelParameter::SurfaceBasedCape => "lev_surface",
+            ModelParameter::MixedLayerCin | ModelParameter::MixedLayerCape => {
+                "lev_180-0_mb_above_ground"
+            }
+            ModelParameter::MostUnstableCape => "lev_255-0_mb_above_ground",
         }
     }
 
@@ -46,6 +61,9 @@ impl ModelParameter {
         match self {
             ModelParameter::SurfaceBasedCin => "Surface-Based CIN",
             ModelParameter::MixedLayerCin => "Mixed-Layer CIN",
+            ModelParameter::SurfaceBasedCape => "Surface-Based CAPE",
+            ModelParameter::MixedLayerCape => "Mixed-Layer CAPE",
+            ModelParameter::MostUnstableCape => "Most-Unstable CAPE",
         }
     }
 
@@ -54,14 +72,15 @@ impl ModelParameter {
         match self {
             ModelParameter::SurfaceBasedCin => "SBCIN",
             ModelParameter::MixedLayerCin => "MLCIN",
+            ModelParameter::SurfaceBasedCape => "SBCAPE",
+            ModelParameter::MixedLayerCape => "MLCAPE",
+            ModelParameter::MostUnstableCape => "MUCAPE",
         }
     }
 
     /// Unit label for display.
     pub fn unit_label(&self) -> &'static str {
-        match self {
-            ModelParameter::SurfaceBasedCin | ModelParameter::MixedLayerCin => "J/kg",
-        }
+        "J/kg"
     }
 
     /// Format a grid value for hover tooltip display.
@@ -69,22 +88,16 @@ impl ModelParameter {
         if value.is_nan() {
             return String::new();
         }
-        match self {
-            ModelParameter::SurfaceBasedCin | ModelParameter::MixedLayerCin => {
-                format!("{}: {:.0} {}", self.short_name(), value, self.unit_label())
-            }
-        }
+        format!("{}: {:.0} {}", self.short_name(), value, self.unit_label())
     }
 
     /// Map a data value to an RGBA color for rendering.
-    ///
-    /// CIN values are typically ≤ 0 (inhibition). More negative = stronger cap.
-    /// Returns `[r, g, b, a]` with `a = 0` for transparent (no/negligible CIN).
     pub fn color_for_value(&self, value: f32) -> [u8; 4] {
         match self {
-            ModelParameter::SurfaceBasedCin | ModelParameter::MixedLayerCin => {
-                cin_color(value)
-            }
+            ModelParameter::SurfaceBasedCin | ModelParameter::MixedLayerCin => cin_color(value),
+            ModelParameter::SurfaceBasedCape
+            | ModelParameter::MixedLayerCape
+            | ModelParameter::MostUnstableCape => cape_color(value),
         }
     }
 
@@ -93,20 +106,35 @@ impl ModelParameter {
         match self {
             ModelParameter::SurfaceBasedCin => "sbcin",
             ModelParameter::MixedLayerCin => "mlcin",
+            ModelParameter::SurfaceBasedCape => "sbcape",
+            ModelParameter::MixedLayerCape => "mlcape",
+            ModelParameter::MostUnstableCape => "mucape",
         }
     }
 
     /// Color thresholds for the legend scale.
-    /// Returns `(value, [r, g, b])` pairs in ascending order (most negative first).
+    /// Returns `(value, [r, g, b])` pairs in ascending order.
     pub fn legend_thresholds(&self) -> Vec<(f32, [u8; 3])> {
         match self {
             ModelParameter::SurfaceBasedCin | ModelParameter::MixedLayerCin => {
                 vec![
-                    (-500.0, [128, 0, 128]),   // extreme: purple
-                    (-200.0, [220, 50, 50]),   // strong: red
-                    (-100.0, [255, 165, 0]),   // moderate: orange
-                    (-50.0,  [255, 255, 100]), // weak: yellow
-                    (-25.0,  [144, 238, 144]), // negligible: green
+                    (-500.0, [128, 0, 128]),
+                    (-200.0, [220, 50, 50]),
+                    (-100.0, [255, 165, 0]),
+                    (-50.0, [255, 255, 100]),
+                    (-25.0, [144, 238, 144]),
+                ]
+            }
+            ModelParameter::SurfaceBasedCape
+            | ModelParameter::MixedLayerCape
+            | ModelParameter::MostUnstableCape => {
+                vec![
+                    (250.0, [200, 230, 255]),
+                    (500.0, [100, 200, 100]),
+                    (1000.0, [255, 255, 0]),
+                    (2000.0, [255, 165, 0]),
+                    (3000.0, [220, 50, 50]),
+                    (5000.0, [180, 0, 200]),
                 ]
             }
         }
@@ -120,6 +148,9 @@ impl std::str::FromStr for ModelParameter {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             "mlcin" => ModelParameter::MixedLayerCin,
+            "sbcape" => ModelParameter::SurfaceBasedCape,
+            "mlcape" => ModelParameter::MixedLayerCape,
+            "mucape" => ModelParameter::MostUnstableCape,
             _ => ModelParameter::SurfaceBasedCin,
         })
     }
@@ -158,6 +189,38 @@ fn cin_color(value: f32) -> [u8; 4] {
         // Extreme cap: red → dark purple.
         let t = ((mag - 200.0) / 300.0).min(1.0);
         lerp_color([220, 50, 50, ALPHA], [128, 0, 128, ALPHA], t)
+    }
+}
+
+/// Color scale for CAPE (Convective Available Potential Energy).
+///
+/// CAPE values are ≥ 0 J/kg. Higher = more instability.
+/// - 0 to 250: transparent (negligible)
+/// - 250 to 500: light blue → green (weak)
+/// - 500 to 1000: green → yellow (moderate)
+/// - 1000 to 2000: yellow → orange (strong)
+/// - 2000 to 3000: orange → red (very strong)
+/// - 3000 to 5000+: red → purple (extreme)
+fn cape_color(value: f32) -> [u8; 4] {
+    const ALPHA: u8 = 160;
+
+    if value < 250.0 {
+        [0, 0, 0, 0]
+    } else if value < 500.0 {
+        let t = (value - 250.0) / 250.0;
+        lerp_color([200, 230, 255, ALPHA], [100, 200, 100, ALPHA], t)
+    } else if value < 1000.0 {
+        let t = (value - 500.0) / 500.0;
+        lerp_color([100, 200, 100, ALPHA], [255, 255, 0, ALPHA], t)
+    } else if value < 2000.0 {
+        let t = (value - 1000.0) / 1000.0;
+        lerp_color([255, 255, 0, ALPHA], [255, 165, 0, ALPHA], t)
+    } else if value < 3000.0 {
+        let t = (value - 2000.0) / 1000.0;
+        lerp_color([255, 165, 0, ALPHA], [220, 50, 50, ALPHA], t)
+    } else {
+        let t = ((value - 3000.0) / 2000.0).min(1.0);
+        lerp_color([220, 50, 50, ALPHA], [180, 0, 200, ALPHA], t)
     }
 }
 
