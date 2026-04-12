@@ -529,6 +529,7 @@ pub enum OverlayKind {
     CityLabels,
     RadarSites,
     UserLocation,
+    ColorScale,
 }
 
 impl OverlayKind {
@@ -544,6 +545,7 @@ impl OverlayKind {
             OverlayKind::CityLabels,
             OverlayKind::RadarSites,
             OverlayKind::UserLocation,
+            OverlayKind::ColorScale,
         ]
     }
 

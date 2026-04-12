@@ -1,4 +1,5 @@
 mod alert;
+mod colorscale;
 mod discussion;
 mod labels;
 mod location;
@@ -22,5 +23,6 @@ pub(crate) fn create_handlers() -> Vec<Box<dyn OverlayHandler>> {
         Box::new(labels::CityLabelsHandler::new()),
         Box::new(sites::RadarSitesHandler::new()),
         Box::new(location::UserLocationHandler::new()),
+        Box::new(colorscale::ColorScaleHandler::new()),
     ]
 }

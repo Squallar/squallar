@@ -385,7 +385,8 @@ impl super::App {
             }
             // Non-texture overlay kinds are never dispatched for background rendering.
             OverlayKind::Radar | OverlayKind::CityLabels
-            | OverlayKind::UserLocation | OverlayKind::Metar => {
+            | OverlayKind::UserLocation | OverlayKind::Metar
+            | OverlayKind::ColorScale => {
                 log::warn!("spawn_overlay_render called with non-texture kind: {:?}", kind);
             }
         }

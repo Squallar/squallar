@@ -10,8 +10,9 @@ use rustdar_overlays::render::overlay_state::{OverlayRegistry, OverlayKind, Over
 use crate::pane::{PaneState, RadarImageData};
 use rustdar_units::UserPreferences;
 
+use rustdar_radar::{get_color_for_value, get_legend_scale};
 use rustdar_radar::sites::RADARS;
-use rustdar_radar::types::{MAX_RANGE_KM, ImageBounds};
+use rustdar_radar::types::{MAX_RANGE_KM, ImageBounds, RadarProduct};
 use walkers::HttpTiles;
 
 use super::super::map_overlays::{OverlayDrawContext, draw_label_tiles_overlay};
@@ -139,6 +140,10 @@ pub(super) fn render_pane_map_content(
                     if let Some((user_lat, user_lon)) = ctx.user_location {
                         render_user_location(ui, projector, user_lat, user_lon);
                     }
+                }
+                // Color scale legend (screen-space HUD)
+                OverlayKind::ColorScale => {
+                    render_color_scale(ui, ctx.pane, ctx.preferences);
                 }
                 // All other overlays dispatched by render mode
                 _ => {
@@ -471,6 +476,274 @@ fn render_user_location(
             7.0,
             egui::Color32::from_rgb(30, 130, 255),
         );
+    }
+}
+
+// ── Color scale legend ────────────────────────────────────────────────────
+
+/// Bar width in logical pixels.
+const SCALE_BAR_WIDTH: f32 = 20.0;
+/// Margin from pane edge in logical pixels.
+const SCALE_MARGIN: f32 = 16.0;
+/// Extra margin reserved for the unit title above/beside the bar.
+const SCALE_TITLE_MARGIN: f32 = 16.0;
+/// Font size for value labels.
+const SCALE_FONT_SIZE: f32 = 11.0;
+/// Font size for the unit title label.
+const SCALE_TITLE_FONT_SIZE: f32 = 12.0;
+/// Outline offset for text shadow.
+const SHADOW_OFFSET: f32 = 1.0;
+/// Minimum pixel spacing between labels before thinning kicks in.
+const MIN_LABEL_SPACING: f32 = 14.0;
+
+/// Format a legend label value. For HHC uses category names; for others, a short numeric string.
+fn format_legend_value(product: RadarProduct, value: f32, prefs: &UserPreferences) -> String {
+    match product {
+        RadarProduct::HydrometeorClassification => {
+            match value as u16 {
+                5 => "Bio".into(),
+                15 => "AP".into(),
+                25 => "IC".into(),
+                35 => "DS".into(),
+                45 => "WS".into(),
+                55 => "RA".into(),
+                65 => "HR".into(),
+                75 => "BD".into(),
+                85 => "GR".into(),
+                95 => "HA".into(),
+                105 => "LH".into(),
+                115 => "GH".into(),
+                125 => "UK".into(),
+                145 => "RF".into(),
+                _ => format!("{value:.0}"),
+            }
+        }
+        RadarProduct::Velocity | RadarProduct::StormRelativeVelocity => {
+            let converted = prefs.speed.convert_from_ms(value);
+            format!("{converted:.0}")
+        }
+        RadarProduct::SpectrumWidth => {
+            let converted = prefs.speed.convert_from_ms(value);
+            format!("{converted:.0}")
+        }
+        RadarProduct::EchoTops => {
+            let converted = prefs.height.convert_kft_to_kilo(value);
+            format!("{converted:.0}")
+        }
+        RadarProduct::PrecipitationRate => {
+            let converted = prefs.precip_rate.convert_from_in_per_hr(value);
+            if converted < 1.0 { format!("{converted:.2}") }
+            else { format!("{converted:.1}") }
+        }
+        RadarProduct::CorrelationCoefficient => format!("{value:.2}"),
+        RadarProduct::DifferentialReflectivity
+        | RadarProduct::SpecificDifferentialPhase => format!("{value:.1}"),
+        _ => {
+            if value.fract().abs() < 0.01 { format!("{value:.0}") }
+            else { format!("{value:.1}") }
+        }
+    }
+}
+
+/// Draw text with a dark shadow for readability on the map.
+fn draw_shadowed_text(
+    painter: &egui::Painter,
+    pos: egui::Pos2,
+    anchor: egui::Align2,
+    text: &str,
+    font: egui::FontId,
+) {
+    painter.text(
+        pos + egui::vec2(SHADOW_OFFSET, SHADOW_OFFSET),
+        anchor,
+        text,
+        font.clone(),
+        egui::Color32::from_black_alpha(200),
+    );
+    painter.text(
+        pos,
+        anchor,
+        text,
+        font,
+        egui::Color32::WHITE,
+    );
+}
+
+/// Render the color scale legend bar for the current pane's radar product.
+fn render_color_scale(
+    ui: &egui::Ui,
+    pane: &PaneState,
+    prefs: &UserPreferences,
+) {
+    let product = pane.selected_product;
+    let legend = get_legend_scale(product);
+    if legend.thresholds.len() < 2 {
+        return;
+    }
+    let pane_rect = ui.max_rect();
+    let painter = ui.painter();
+
+    // Desktop: vertical bar on the right.  Mobile: horizontal bar on the bottom.
+    #[cfg(target_os = "android")]
+    let is_mobile = true;
+    #[cfg(not(target_os = "android"))]
+    let is_mobile = false;
+
+    let bar_length = if is_mobile {
+        pane_rect.width() - SCALE_MARGIN * 2.0
+    } else {
+        pane_rect.height() - SCALE_MARGIN * 2.0 - SCALE_TITLE_MARGIN
+    };
+
+    if bar_length < 40.0 {
+        return; // pane too small
+    }
+
+    // Compute bar rect
+    let bar_rect = if is_mobile {
+        // Horizontal bar along the bottom, origin at bottom-left
+        let left = pane_rect.left() + SCALE_MARGIN;
+        let bottom = pane_rect.bottom() - SCALE_MARGIN;
+        let top = bottom - SCALE_BAR_WIDTH;
+        egui::Rect::from_min_max(
+            egui::pos2(left, top),
+            egui::pos2(left + bar_length, bottom),
+        )
+    } else {
+        // Vertical bar along the right, origin at bottom-right
+        let right = pane_rect.right() - SCALE_MARGIN;
+        let left = right - SCALE_BAR_WIDTH;
+        let bottom = pane_rect.bottom() - SCALE_MARGIN;
+        let top = bottom - bar_length;
+        egui::Rect::from_min_max(
+            egui::pos2(left, top),
+            egui::pos2(right, bottom),
+        )
+    };
+
+    let min_val = legend.min_value;
+    let max_val = legend.max_value;
+    let range = max_val - min_val;
+    if range.abs() < f32::EPSILON {
+        return;
+    }
+
+    let n = legend.thresholds.len();
+
+    if legend.is_gradient {
+        // Gradient scales: per-pixel sampling for smooth interpolation.
+        let steps = bar_length.ceil() as usize;
+        for i in 0..steps {
+            let t = i as f32 / (steps - 1).max(1) as f32;
+            let value = min_val + t * range;
+            let (r, g, b, a) = get_color_for_value(product, value);
+            if a == 0 { continue; }
+            let color = egui::Color32::from_rgb(r, g, b);
+            // Use 2px wide strips to avoid sub-pixel gaps
+            if is_mobile {
+                let x = bar_rect.left() + t * bar_rect.width();
+                let strip = egui::Rect::from_min_size(
+                    egui::pos2(x, bar_rect.top()),
+                    egui::vec2(2.0, SCALE_BAR_WIDTH),
+                );
+                painter.rect_filled(strip, 0.0, color);
+            } else {
+                let y = bar_rect.bottom() - t * bar_rect.height();
+                let strip = egui::Rect::from_min_size(
+                    egui::pos2(bar_rect.left(), y - 1.0),
+                    egui::vec2(SCALE_BAR_WIDTH, 2.0),
+                );
+                painter.rect_filled(strip, 0.0, color);
+            }
+        }
+    } else {
+        // Discrete scales: equal-sized blocks, one per threshold.
+        for i in 0..n {
+            let (_, rgb) = legend.thresholds[i];
+            let color = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+
+            let t0 = i as f32 / n as f32;
+            let t1 = (i + 1) as f32 / n as f32;
+
+            if is_mobile {
+                let x0 = bar_rect.left() + t0 * bar_rect.width();
+                let x1 = bar_rect.left() + t1 * bar_rect.width();
+                let strip = egui::Rect::from_min_max(
+                    egui::pos2(x0, bar_rect.top()),
+                    egui::pos2(x1, bar_rect.bottom()),
+                );
+                painter.rect_filled(strip, 0.0, color);
+            } else {
+                let y0 = bar_rect.bottom() - t0 * bar_rect.height();
+                let y1 = bar_rect.bottom() - t1 * bar_rect.height();
+                let strip = egui::Rect::from_min_max(
+                    egui::pos2(bar_rect.left(), y1),
+                    egui::pos2(bar_rect.right(), y0),
+                );
+                painter.rect_filled(strip, 0.0, color);
+            }
+        }
+    }
+
+    // --- Labels: draw threshold values alongside the bar ---
+    let label_font = egui::FontId::proportional(SCALE_FONT_SIZE);
+    let title_font = egui::FontId::proportional(SCALE_TITLE_FONT_SIZE);
+
+    let mut label_positions: Vec<(f32, String)> = Vec::new();
+    for (i, &(val, _)) in legend.thresholds.iter().enumerate() {
+        let pixel_pos = if legend.is_gradient {
+            // Gradient: value-proportional positioning
+            let t = (val - min_val) / range;
+            if is_mobile {
+                bar_rect.left() + t * bar_rect.width()
+            } else {
+                bar_rect.bottom() - t * bar_rect.height()
+            }
+        } else {
+            // Discrete: index-based positioning (bottom/left edge of each block)
+            let t = i as f32 / n as f32;
+            if is_mobile {
+                bar_rect.left() + t * bar_rect.width()
+            } else {
+                bar_rect.bottom() - t * bar_rect.height()
+            }
+        };
+        let text = format_legend_value(product, val, prefs);
+        label_positions.push((pixel_pos, text));
+    }
+
+    // Filter out labels that are too close to the previous one
+    let mut prev_pos: Option<f32> = None;
+    let thinned: Vec<(f32, &str)> = label_positions.iter().filter(|(pos, _)| {
+        if let Some(prev) = prev_pos {
+            if (pos - prev).abs() < MIN_LABEL_SPACING {
+                return false;
+            }
+        }
+        prev_pos = Some(*pos);
+        true
+    }).map(|(pos, text)| (*pos, text.as_str())).collect();
+
+    for (pixel_pos, text) in &thinned {
+        if is_mobile {
+            // Labels above the bar
+            let pos = egui::pos2(*pixel_pos, bar_rect.top() - 2.0);
+            draw_shadowed_text(painter, pos, egui::Align2::CENTER_BOTTOM, text, label_font.clone());
+        } else {
+            // Labels to the left of the bar
+            let pos = egui::pos2(bar_rect.left() - 4.0, *pixel_pos);
+            draw_shadowed_text(painter, pos, egui::Align2::RIGHT_CENTER, text, label_font.clone());
+        }
+    }
+
+    // --- Title: unit label above the bar (desktop) or to the left (mobile) ---
+    let unit = product.unit_label(prefs);
+    if is_mobile {
+        let title_pos = egui::pos2(bar_rect.left() - 4.0, bar_rect.center().y);
+        draw_shadowed_text(painter, title_pos, egui::Align2::RIGHT_CENTER, unit, title_font);
+    } else {
+        let title_pos = egui::pos2(bar_rect.center().x, bar_rect.top() - 4.0);
+        draw_shadowed_text(painter, title_pos, egui::Align2::CENTER_BOTTOM, unit, title_font);
     }
 }
 

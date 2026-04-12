@@ -1,18 +1,33 @@
-use crate::types::RadarProduct;
+use crate::types::{RadarProduct, MS_TO_MPH};
 
 const TRANSPARENCY: u8 = 180;
 
 /// Ascending-threshold color scale. For value `v`, the color of the last
-/// entry whose threshold is <= `v` is returned.
-type ColorScale = &'static [(f32, (u8, u8, u8))];
+/// entry whose threshold is <= `v` is returned. The final boolean is if
+/// the scale should be a gradient (interpolated) or discrete steps.
+type ColorThresholds = &'static [(f32, (u8, u8, u8))];
+type ColorScale = &'static (ColorThresholds, bool);
 
 /// Look up the color for `value` in an ascending-threshold scale.
+/// When an entry's `gradient` flag is true, interpolates linearly from the
+/// previous entry's color to this entry's color across the threshold range.
 fn scale_color(scale: ColorScale, value: f32) -> (u8, u8, u8) {
-    let mut color = scale[0].1;
-    for &(threshold, c) in scale {
+    let &(thresholds, gradient) = scale;
+    let mut color = thresholds[0].1;
+    let mut last_threshold = thresholds[0].0;
+    for (i, &(threshold, c)) in thresholds.iter().enumerate() {
         if value >= threshold {
             color = c;
+            last_threshold = threshold;
         } else {
+            if gradient && i > 0 && threshold > last_threshold {
+                let t = (value - last_threshold) / (threshold - last_threshold);
+                return (
+                    (color.0 as f32 + (c.0 as f32 - color.0 as f32) * t) as u8,
+                    (color.1 as f32 + (c.1 as f32 - color.1 as f32) * t) as u8,
+                    (color.2 as f32 + (c.2 as f32 - color.2 as f32) * t) as u8,
+                );
+            }
             break;
         }
     }
@@ -88,8 +103,6 @@ pub fn get_color_for_value(product: RadarProduct, value: f32) -> (u8, u8, u8, u8
     }
 }
 
-use crate::types::MS_TO_MPH;
-
 /// Velocity color with m/s->mph conversion and bidirectional handling.
 fn velocity_lookup(velocity_ms: f32) -> (u8, u8, u8, u8) {
     let mph = velocity_ms * MS_TO_MPH;
@@ -119,7 +132,7 @@ fn nrot_lookup(nrot: f32) -> (u8, u8, u8, u8) {
 // ————————————————————————————————————————————————————————————————————
 
 /// Reflectivity (dBZ). Gradient regions 0-10 dBZ approximated with discrete steps.
-static REFLECTIVITY: ColorScale = &[
+static REFLECTIVITY: ColorScale = &(&[
     (0.0,  (0, 0, 0)),         // Grey ramp start
     (2.5,  (64, 64, 64)),      // Grey ramp midpoint
     (5.0,  (128, 128, 128)),   // Grey ramp end / transition start
@@ -142,10 +155,10 @@ static REFLECTIVITY: ColorScale = &[
     (85.0, (255, 140, 0)),     // Orange (extreme)
     (90.0, (255, 69, 0)),      // Dark orange
     (95.0, (255, 255, 255)),   // White (extreme > 95 dBZ)
-];
+], true);
 
 /// Velocity outbound / positive (mph thresholds).
-static VELOCITY_OUTBOUND: ColorScale = &[
+static VELOCITY_OUTBOUND: ColorScale = &(&[
     (0.0,      (100, 0, 0)),
     (11.5078,  (110, 0, 0)),
     (23.0156,  (140, 0, 0)),
@@ -154,10 +167,10 @@ static VELOCITY_OUTBOUND: ColorScale = &[
     (57.539,   (210, 0, 0)),
     (69.0468,  (230, 0, 0)),
     (80.5546,  (255, 0, 0)),
-];
+], true);
 
 /// Velocity inbound / negative (thresholds are positive, applied to abs(mph)).
-static VELOCITY_INBOUND: ColorScale = &[
+static VELOCITY_INBOUND: ColorScale = &(&[
     (0.0,      (0, 100, 0)),
     (11.5078,  (0, 110, 0)),
     (23.0156,  (0, 140, 0)),
@@ -166,20 +179,20 @@ static VELOCITY_INBOUND: ColorScale = &[
     (57.539,   (0, 210, 0)),
     (69.0468,  (0, 230, 0)),
     (80.5546,  (0, 255, 0)),
-];
+], true);
 
 /// Spectrum width (m/s).
-static SPECTRUM_WIDTH: ColorScale = &[
+static SPECTRUM_WIDTH: ColorScale = &(&[
     (0.0,  (118, 118, 118)),   // Dark grey
     (2.0578,  (156, 156, 156)),   // Light grey
     (4.1156,  (0, 187, 187)), // Cyan
     (6.1733,  (255, 0, 0)), // Red
     (8.2311,  (208, 112, 0)),   // Orange
     (10.2889, (255, 255, 0)),   // Yellow
-];
+], false);
 
 /// Differential reflectivity ZDR (dB).
-static ZDR: ColorScale = &[
+static ZDR: ColorScale = &(&[
     (f32::NEG_INFINITY, (66, 66, 66)), // Dark grey
     (-2.0, (132, 132, 132)),              // Light grey
     (-1.0, (166, 166, 166)),              // Lighter greay
@@ -193,10 +206,10 @@ static ZDR: ColorScale = &[
     (4.0,  (150, 0, 0)),                // Dark red
     (5.0,  (247, 138, 194)),                // Pink
     (5.5,  (255, 255, 255)),                // White
-];
+], true);
 
 /// Correlation coefficient (0-1).
-static RHO: ColorScale = &[
+static RHO: ColorScale = &(&[
     (0.45,  (21, 19, 143)),   // Blue
     (0.55, (51, 45, 216)), // Blue
     (0.75,  (124, 121, 214)),   // Light blue
@@ -204,10 +217,10 @@ static RHO: ColorScale = &[
     (0.9,  (255, 224, 0)), // Yellow
     (0.96,  (255, 152, 0)),   // Orange
     (0.98, (151, 5, 86)),   // Purple
-];
+], true);
 
 /// Differential phase (degrees, pre-wrapped to 0-360).
-static PHI: ColorScale = &[
+static PHI: ColorScale = &(&[
     (0.0,   (151, 151, 242)),   // Light Purple
     (15.0, (113, 113, 205)), // Light blue
     (30.0,  (62, 125, 249)), // Blue
@@ -220,10 +233,10 @@ static PHI: ColorScale = &[
     (135.0, (173, 0, 0)),   // Dark red
     (150.0, (252, 0, 252)), // Magenta
     (165.0, (144, 0, 144)), // Dark magenta
-];
+], true);
 
 /// Specific differential phase KDP (deg/km).
-static KDP: ColorScale = &[
+static KDP: ColorScale = &(&[
     (-2.0, (118, 118, 118)), // Grey
     (-1.0, (75, 75, 75)),               // Dark grey
     (-0.5,  (75, 0, 0)),            // Dark red
@@ -237,10 +250,10 @@ static KDP: ColorScale = &[
     (5.0,  (250, 117, 19)),                // Orange
     (6.0, (202, 92, 14)),              // Dark orange
     (6.5, (175, 78, 11)),              // Darker orange
-];
+], true);
 
 /// Enhanced Echo Tops (thousands of feet).
-static ECHO_TOPS: ColorScale = &[
+static ECHO_TOPS: ColorScale = &(&[
     (5.0,  (100, 100, 100)), // Grey (dispatcher handles < 5 as transparent)
     (10.0, (0, 100, 255)),   // Blue
     (15.0, (0, 200, 255)),   // Cyan
@@ -253,10 +266,10 @@ static ECHO_TOPS: ColorScale = &[
     (50.0, (200, 0, 0)),     // Dark red
     (55.0, (255, 0, 255)),   // Magenta
     (60.0, (200, 0, 200)),   // Purple (extreme)
-];
+], true);
 
 /// Vertically Integrated Liquid (kg/m2).
-static VIL: ColorScale = &[
+static VIL: ColorScale = &(&[
     (1.0,  (100, 100, 100)), // Grey (dispatcher handles < 1 as transparent)
     (5.0,  (0, 150, 255)),   // Light blue
     (10.0, (0, 255, 0)),     // Green
@@ -268,12 +281,12 @@ static VIL: ColorScale = &[
     (40.0, (200, 0, 0)),     // Dark red
     (50.0, (255, 0, 255)),   // Magenta
     (60.0, (200, 0, 200)),   // Purple (extreme)
-];
+], true);
 
 /// Hydrometeor Classification (categorical per ICD table).
 /// 0=ND, 10=BI, 20=AP, 30=IC, 40=DS, 50=WS, 60=RA, 70=HR,
 /// 80=BD, 90=GR, 100=HA, 110=LH, 120=GH, 140=UK, 150=RF
-static HHC: ColorScale = &[
+static HHC: ColorScale = &(&[
     (5.0,   (128, 128, 128)), // BI (Biological)
     (15.0,  (128, 0, 128)),   // AP (Ground clutter)
     (25.0,  (173, 216, 230)), // IC (Ice crystals)
@@ -288,10 +301,10 @@ static HHC: ColorScale = &[
     (115.0, (255, 200, 200)), // GH (Giant hail)
     (125.0, (200, 200, 200)), // UK (Unknown)
     (145.0, (100, 0, 150)),   // RF (Range folded)
-];
+], false);
 
 /// Precipitation Rate (in/hr).
-static PRECIP_RATE: ColorScale = &[
+static PRECIP_RATE: ColorScale = &(&[
     (0.01, (100, 100, 100)), // Grey (very light; dispatcher handles < 0.01)
     (0.1,  (0, 150, 255)),   // Light blue
     (0.25, (0, 100, 255)),   // Blue
@@ -303,20 +316,94 @@ static PRECIP_RATE: ColorScale = &[
     (6.0,  (200, 0, 0)),     // Dark red
     (8.0,  (255, 0, 255)),   // Magenta
     (12.0, (200, 0, 200)),   // Purple (extreme)
-];
+], true);
 
 /// NROT cyclonic / positive rotation (unitless).
-static NROT_CYCLONIC: ColorScale = &[
+static NROT_CYCLONIC: ColorScale = &(&[
     (0.25, (0, 0, 255)),     // Blue (weak)
     (1.0, (0, 255, 0)),      // Green (significant)
     (1.5, (255, 150, 0)),    // Yellow (strong)
     (2.0, (255, 0, 0)),      // Red (very strong)
     (2.5, (255, 141, 161)),  // Pink (extreme)
     (2.75, (255, 255, 255)), // White (oh fuck)
-];
+], true);
 
 /// NROT anticyclonic / negative rotation (thresholds = abs values).
-static NROT_ANTICYCLONIC: ColorScale = &[
+static NROT_ANTICYCLONIC: ColorScale = &(&[
     (0.25, (0, 255, 128)), // Aqua (weak)
     (1.0, (0, 255, 0)),    // Green (significant)
-];
+], true);
+
+// ————————————————————————————————————————————————————————————————————
+// Legend scale extraction
+// ————————————————————————————————————————————————————————————————————
+
+/// A color scale legend describing the threshold→color mapping for a radar product.
+/// Values are in the same units fed to `get_color_for_value()`.
+pub struct LegendScale {
+    /// Sorted ascending (value, RGB) pairs defining the scale's color stops.
+    pub thresholds: Vec<(f32, [u8; 3])>,
+    /// Whether the rendered color bar should interpolate between stops.
+    pub is_gradient: bool,
+    /// The minimum value the color bar should span.
+    pub min_value: f32,
+    /// The maximum value the color bar should span.
+    pub max_value: f32,
+}
+
+fn extract_scale(scale: ColorScale) -> LegendScale {
+    let &(thresholds, gradient) = scale;
+    let entries: Vec<(f32, [u8; 3])> = thresholds
+        .iter()
+        .filter(|(v, _)| v.is_finite())
+        .map(|&(v, (r, g, b))| (v, [r, g, b]))
+        .collect();
+    let min = entries.first().map_or(0.0, |e| e.0);
+    let max = entries.last().map_or(1.0, |e| e.0);
+    LegendScale { thresholds: entries, is_gradient: gradient, min_value: min, max_value: max }
+}
+
+/// Build a merged bidirectional scale from inbound (negative) and outbound (positive) tables.
+/// `inbound` thresholds are positive (applied to abs value); they are negated and reversed.
+/// The `unit_factor` converts from the table's unit domain to the input domain of
+/// `get_color_for_value()` (e.g. divide mph by `MS_TO_MPH` to get m/s for velocity).
+fn merge_bidirectional(inbound: ColorScale, outbound: ColorScale, unit_factor: f32) -> LegendScale {
+    let &(in_t, _) = inbound;
+    let &(out_t, gradient) = outbound;
+    let mut entries: Vec<(f32, [u8; 3])> = Vec::new();
+    // Inbound: negate and reverse (highest magnitude first → most negative)
+    for &(v, (r, g, b)) in in_t.iter().rev() {
+        entries.push((-v / unit_factor, [r, g, b]));
+    }
+    // Outbound
+    for &(v, (r, g, b)) in out_t.iter() {
+        entries.push((v / unit_factor, [r, g, b]));
+    }
+    let min = entries.first().map_or(0.0, |e| e.0);
+    let max = entries.last().map_or(1.0, |e| e.0);
+    LegendScale { thresholds: entries, is_gradient: gradient, min_value: min, max_value: max }
+}
+
+/// Get the legend scale description for a radar product.
+/// Threshold values are in the same unit domain as `get_color_for_value()`.
+pub fn get_legend_scale(product: RadarProduct) -> LegendScale {
+    match product {
+        RadarProduct::Reflectivity => extract_scale(REFLECTIVITY),
+        RadarProduct::Velocity | RadarProduct::StormRelativeVelocity => {
+            merge_bidirectional(VELOCITY_INBOUND, VELOCITY_OUTBOUND, MS_TO_MPH)
+        }
+        RadarProduct::SpectrumWidth => extract_scale(SPECTRUM_WIDTH),
+        RadarProduct::DifferentialReflectivity => extract_scale(ZDR),
+        RadarProduct::CorrelationCoefficient => extract_scale(RHO),
+        RadarProduct::DifferentialPhase => extract_scale(PHI),
+        RadarProduct::SpecificDifferentialPhase => extract_scale(KDP),
+        RadarProduct::EchoTops => extract_scale(ECHO_TOPS),
+        RadarProduct::VerticallyIntegratedLiquid => extract_scale(VIL),
+        RadarProduct::HydrometeorClassification => extract_scale(HHC),
+        RadarProduct::PrecipitationRate => extract_scale(PRECIP_RATE),
+        RadarProduct::NormalizedRotation => {
+            // Merge anticyclonic (negative) and cyclonic (positive), unit factor = 1.0 (unitless)
+            merge_bidirectional(NROT_ANTICYCLONIC, NROT_CYCLONIC, 1.0)
+        }
+    }
+}

@@ -864,6 +864,7 @@ impl Gui {
             OverlayKind::CityLabels,
             OverlayKind::RadarSites,
             OverlayKind::UserLocation,
+            OverlayKind::ColorScale,
         ];
 
         let ctx = PaneControlContext {

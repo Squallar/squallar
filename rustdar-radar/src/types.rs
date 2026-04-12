@@ -405,4 +405,22 @@ impl RadarProduct {
             RadarProduct::NormalizedRotation => format!("NROT: {:.2}", value),
         }
     }
+
+    /// Short unit label for this product (used in the color scale legend).
+    pub fn unit_label(&self, prefs: &UserPreferences) -> &'static str {
+        match self {
+            RadarProduct::Reflectivity => "dBZ",
+            RadarProduct::Velocity | RadarProduct::StormRelativeVelocity => prefs.speed.suffix(),
+            RadarProduct::SpectrumWidth => prefs.speed.suffix(),
+            RadarProduct::DifferentialReflectivity => "dB",
+            RadarProduct::CorrelationCoefficient => "CC",
+            RadarProduct::DifferentialPhase => "\u{00b0}",
+            RadarProduct::SpecificDifferentialPhase => "\u{00b0}/km",
+            RadarProduct::EchoTops => prefs.height.kilo_suffix(),
+            RadarProduct::VerticallyIntegratedLiquid => "kg/m\u{00b2}",
+            RadarProduct::HydrometeorClassification => "HHC",
+            RadarProduct::PrecipitationRate => prefs.precip_rate.suffix(),
+            RadarProduct::NormalizedRotation => "NROT",
+        }
+    }
 }

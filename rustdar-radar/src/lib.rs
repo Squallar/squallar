@@ -3,3 +3,5 @@ pub mod render;
 pub mod scan;
 pub mod sites;
 pub mod types;
+
+pub use palette::{LegendScale, get_color_for_value, get_legend_scale};
