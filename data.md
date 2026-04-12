@@ -4,98 +4,98 @@ This document details which data sources are needed for this project. Not all ar
 
 ## Radar Data
 
-|           Data Source           | Status |
-| ------------------------------- | ------ |
-| NEXRAD Level 2                  | ✅     |
-| NEXRAD Level 3                  | ✅     |
-| MRMS (Multi-Radar/Multi-Sensor) | ❌     |
+|           Data Source           | Status | Public Access |
+| ------------------------------- | ------ | ------------- |
+| NEXRAD Level 2                  | ✅     | ✅ Free — AWS Open Data (NOAA) |
+| NEXRAD Level 3                  | ✅     | ✅ Free — NOAA TGFTP |
+| MRMS (Multi-Radar/Multi-Sensor) | ❌     | ✅ Free — NCEP / Iowa State |
 
 ## Numerical Weather Prediction (NWP) Models
 
-|                 Model                  | Status |
-| -------------------------------------- | ------ |
-| HRRR (High-Resolution Rapid Refresh)   | ❌     |
-| RAP (Rapid Refresh)                    | ❌     |
-| NAM (North American Mesoscale)         | ❌     |
-| GFS (Global Forecast System)           | ❌     |
-| GEFS (Global Ensemble Forecast System) | ❌     |
-| SREF (Short-Range Ensemble Forecast)   | ❌     |
-| NBM (National Blend of Models)         | ❌     |
-| ECMWF (if licensing allows)            | ❌     |
-| HREF (High-Res Ensemble Forecast)      | ❌     |
+|                 Model                  | Status | Public Access |
+| -------------------------------------- | ------ | ------------- |
+| HRRR (High-Resolution Rapid Refresh)   | ❌     | ✅ Free — NOAA NOMADS / AWS Open Data |
+| RAP (Rapid Refresh)                    | ❌     | ✅ Free — NOAA NOMADS |
+| NAM (North American Mesoscale)         | ❌     | ✅ Free — NOAA NOMADS |
+| GFS (Global Forecast System)           | ❌     | ✅ Free — NOAA NOMADS |
+| GEFS (Global Ensemble Forecast System) | ❌     | ✅ Free — NOAA NOMADS |
+| SREF (Short-Range Ensemble Forecast)   | ❌     | ✅ Free — NOAA NOMADS |
+| NBM (National Blend of Models)         | ❌     | ✅ Free — NOAA NOMADS |
+| ECMWF (if licensing allows)            | ❌     | ⚠️ Restricted — paid license for high-res operational data |
+| HREF (High-Res Ensemble Forecast)      | ❌     | ✅ Free — NOAA NOMADS |
 
-|                    NWP Parameter                     | Status |
-| ---------------------------------------------------- | ------ |
-| Temperature, dewpoint, wind (surface + upper air)    | ❌     |
-| CAPE, CIN, SRH (Storm Relative Helicity), bulk shear | ❌     |
-| Simulated reflectivity, updraft helicity             | ❌     |
-| Precipitation (QPF), snow, ice                       | ❌     |
-| 500 mb heights/vorticity, jet stream, thickness      | ❌     |
-| Precipitable water (PWAT), LCL, LFC, EL              | ❌     |
+|                    NWP Parameter                     | Status | Public Access |
+| ---------------------------------------------------- | ------ | ------------- |
+| Temperature, dewpoint, wind (surface + upper air)    | ❌     | ✅ Derived from public models above |
+| CAPE, CIN, SRH (Storm Relative Helicity), bulk shear | ❌     | ✅ Derived from public models above |
+| Simulated reflectivity, updraft helicity             | ❌     | ✅ Derived from public models above |
+| Precipitation (QPF), snow, ice                       | ❌     | ✅ Derived from public models above |
+| 500 mb heights/vorticity, jet stream, thickness      | ❌     | ✅ Derived from public models above |
+| Precipitable water (PWAT), LCL, LFC, EL              | ❌     | ✅ Derived from public models above |
 
 ## SPC (Storm Prediction Center) Data
 
-|              Data Source               | Status |
-| -------------------------------------- | ------ |
-| Convective Outlooks (Day 1–8)          | ✅     |
-| Mesoscale Discussions (MDs)            | ✅     |
-| Precipitation Discussions              | ❌     |
-| Watches (Tornado/Severe Tstorm)        | ❌     |
-| Storm Reports (preliminary & filtered) | ✅     |
-| Fire Weather Outlooks                  | ❌     |
-| SPC Mesoanalysis graphics              | ❌     |
-| Sounding data / SPC skew-T parameters  | ❌     |
+|              Data Source               | Status | Public Access |
+| -------------------------------------- | ------ | ------------- |
+| Convective Outlooks (Day 1–8)          | ✅     | ✅ Free — SPC GeoJSON endpoints |
+| Mesoscale Discussions (MDs)            | ✅     | ✅ Free — SPC RSS feed |
+| Precipitation Discussions              | ❌     | ✅ Free — WPC website |
+| Watches (Tornado/Severe Tstorm)        | ❌     | ✅ Free — SPC / NWS API |
+| Storm Reports (preliminary & filtered) | ✅     | ✅ Free — SPC CSV files |
+| Fire Weather Outlooks                  | ❌     | ✅ Free — SPC GeoJSON endpoints |
+| SPC Mesoanalysis graphics              | ❌     | ✅ Free — SPC website (raster images) |
+| Sounding data / SPC skew-T parameters  | ❌     | ✅ Free — SPC / University of Wyoming |
 
 ## Weather Alerts & Warnings
 
-|                      Data Source                      | Status |
-| ----------------------------------------------------- | ------ |
-| NWS Alerts API                                        | ✅     |
-| Weather.gov API /alerts                               | ✅     |
-| Warning polygons (tornado, severe, flash flood, etc.) | ✅     |
+|                      Data Source                      | Status | Public Access |
+| ----------------------------------------------------- | ------ | ------------- |
+| NWS Alerts API                                        | ✅     | ✅ Free — api.weather.gov |
+| Weather.gov API /alerts                               | ✅     | ✅ Free — api.weather.gov |
+| Warning polygons (tornado, severe, flash flood, etc.) | ✅     | ✅ Free — NWS API zone geometries |
 
 ## Observational / Surface Data
 
-|                Data Source                 | Status |
-| ------------------------------------------ | ------ |
-| METAR/ASOS (surface obs)                   | ✅     |
-| Upper-air soundings (RAOB)                 | ❌     |
-| Mesonets (state/regional surface networks) | ❌     |
-| Buoy / Marine obs                          | ❌     |
-| ASOS 1-min data                            | ❌     |
-| Storm spotter reports (mPING)              | ❌     |
-| State traffic/weather cameras              | ❌     |
+|                Data Source                 | Status | Public Access |
+| ------------------------------------------ | ------ | ------------- |
+| METAR/ASOS (surface obs)                   | ✅     | ✅ Free — aviationweather.gov bulk cache |
+| Upper-air soundings (RAOB)                 | ❌     | ✅ Free — University of Wyoming / UCAR |
+| Mesonets (state/regional surface networks) | ❌     | ⚠️ Mixed — varies by state; some free (e.g. Oklahoma, Iowa), many restricted or paywalled |
+| Buoy / Marine obs                          | ❌     | ✅ Free — NDBC (NOAA) |
+| ASOS 1-min data                            | ❌     | ✅ Free — NCEI (NOAA) |
+| Storm spotter reports (mPING)              | ❌     | ✅ Free — NSSL mPING API |
+| State traffic/weather cameras              | ❌     | ⚠️ Mixed — varies by state DOT; many have public feeds, no unified API |
 
 ## Satellite Imagery
 
-|         Data Source         | Status |
-| --------------------------- | ------ |
-| GOES-16/18 (GOES-East/West) | ❌     |
-| Himawari (Pacific)          | ❌     |
-| Polar-orbiting (JPSS/VIIRS) | ❌     |
+|         Data Source         | Status | Public Access |
+| --------------------------- | ------ | ------------- |
+| GOES-16/18 (GOES-East/West) | ❌     | ✅ Free — AWS Open Data / NOAA CLASS |
+| Himawari (Pacific)          | ❌     | ✅ Free — JMA (may have usage terms) |
+| Polar-orbiting (JPSS/VIIRS) | ❌     | ✅ Free — NOAA CLASS |
 
 ## Lightning Data
 
-|             Data Source              | Status |
-| ------------------------------------ | ------ |
-| GLM (Geostationary Lightning Mapper) | ❌     |
-| Blitzortung                          | ❌     |
-| ENTLN / Vaisala / Allison House?     | ❌     |
+|             Data Source              | Status | Public Access |
+| ------------------------------------ | ------ | ------------- |
+| GLM (Geostationary Lightning Mapper) | ✅     | ✅ Free — AWS Open Data (NOAA) |
+| Blitzortung                          | ❌     | ⚠️ Community — free for non-commercial; requires registration, rate-limited API |
+| ENTLN / Vaisala / Allison House?     | ❌     | ❌ Paid — commercial license required |
 
 ## Climate & Historical Data
 
-|        Data Source        | Status |
-| ------------------------- | ------ |
-| Historical storm reports  | ❌     |
-| Climate normals & records | ❌     |
-| Historical radar archives | ✅     |
-| Reanalysis (ERA5, NARR)   | ❌     |
+|        Data Source        | Status | Public Access |
+| ------------------------- | ------ | ------------- |
+| Historical storm reports  | ❌     | ✅ Free — SPC archives |
+| Climate normals & records | ❌     | ✅ Free — NCEI (NOAA) |
+| Historical radar archives | ✅     | ✅ Free — AWS Open Data (NOAA) |
+| Reanalysis (ERA5, NARR)   | ❌     | ✅ Free — Copernicus CDS (free registration) / NCEP |
 
 ## Geographic / Base Layer Data
 
-|          Data Source          | Status |
-| ----------------------------- | ------ |
-| County/state/CWA boundaries   | ❌     |
-| Roads / terrain / topo        | ❌     |
-| Elevation / DEM               | ❌     |
-| Land use / population density | ❌     |
+|          Data Source          | Status | Public Access |
+| ----------------------------- | ------ | ------------- |
+| County/state/CWA boundaries   | ❌     | ✅ Free — Census TIGER / NWS shapefiles |
+| Roads / terrain / topo        | ❌     | ✅ Free — OpenStreetMap / USGS |
+| Elevation / DEM               | ❌     | ✅ Free — USGS / SRTM |
+| Land use / population density | ❌     | ✅ Free — USGS NLCD / Census |
