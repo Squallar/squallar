@@ -46,8 +46,8 @@ impl HitMap {
     /// Create an empty hit map with the given quarter-resolution dimensions.
     pub fn new(full_width: u32, full_height: u32) -> Self {
         Self {
-            width: (full_width + 3) / 4,
-            height: (full_height + 3) / 4,
+            width: full_width.div_ceil(4),
+            height: full_height.div_ceil(4),
             cells: HashMap::new(),
             id_map: HashMap::new(),
         }
@@ -76,7 +76,7 @@ impl HitMap {
 
     /// Look up all overlay items at texture UV coordinates `(u, v)` in `[0, 1]`.
     pub fn hit_test(&self, u: f32, v: f32) -> Vec<Arc<dyn OverlayItem>> {
-        if u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0 {
+        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
             return Vec::new();
         }
         let qx = ((u * self.width as f32) as u32).min(self.width.saturating_sub(1));

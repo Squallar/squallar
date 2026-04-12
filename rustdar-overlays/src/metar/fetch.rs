@@ -116,7 +116,7 @@ fn parse_metar_csv(csv: &str) -> Result<Vec<MetarOb>, String> {
     };
 
     // altim_in_hg means values are in inches of mercury; otherwise assume hPa.
-    let altim_is_inhg = columns.iter().any(|c| *c == "altim_in_hg");
+    let altim_is_inhg = columns.contains(&"altim_in_hg");
 
     let Some(i_station) = i_station else {
         return Err("Missing station_id/icaoId column".to_string());

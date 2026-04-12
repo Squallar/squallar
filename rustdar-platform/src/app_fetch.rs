@@ -708,11 +708,10 @@ impl super::App {
     pub(super) fn reinit_active_loops(&mut self) {
         let mut to_reinit = Vec::new();
         for pane_idx in 0..self.gui.pane_count() {
-            if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                if pane.loop_state.multi_frame {
+            if let Some(pane) = self.gui.pane_mut(pane_idx)
+                && pane.loop_state.multi_frame {
                     to_reinit.push((pane_idx, pane.loop_state.lookback_secs));
                 }
-            }
         }
         for (pane_idx, lookback_secs) in to_reinit {
             self.handle_enable_loop(pane_idx, lookback_secs);

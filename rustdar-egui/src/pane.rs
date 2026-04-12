@@ -157,7 +157,7 @@ impl PaneState {
 
     /// Get the overlay texture cache for a given kind, inserting a default if absent.
     pub fn overlay_cache_mut(&mut self, kind: OverlayKind) -> &mut OverlayTextureCache {
-        self.overlay_textures.entry(kind).or_insert_with(OverlayTextureCache::new)
+        self.overlay_textures.entry(kind).or_default()
     }
 
     /// Get rendering params for this pane (product + closest elevation).

@@ -19,7 +19,7 @@ fn render_auto_poll_status(
         ui.spinner();
     } else if auto_poll.enabled {
         if let Some(remaining) = auto_poll.time_until_next() {
-            ui.checkbox(&mut auto_poll.enabled, &format!("Auto-poll (next in {}s)", remaining));
+            ui.checkbox(&mut auto_poll.enabled, format!("Auto-poll (next in {}s)", remaining));
         } else {
             ui.checkbox(&mut auto_poll.enabled, "Auto-poll");
         }

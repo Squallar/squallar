@@ -160,18 +160,15 @@ async fn list_glm_files(
                 .map_err(|e| format!("Failed to parse S3 XML: {e}"))?;
 
             for node in doc.descendants() {
-                if node.tag_name().name() == "Key" {
-                    if let Some(key) = node.text() {
-                        if key.ends_with(".nc") {
+                if node.tag_name().name() == "Key"
+                    && let Some(key) = node.text()
+                        && key.ends_with(".nc") {
                             // Filter by start time encoded in filename
-                            if let Some(file_start) = parse_filename_start_time(key) {
-                                if file_start >= start && file_start <= end {
+                            if let Some(file_start) = parse_filename_start_time(key)
+                                && file_start >= start && file_start <= end {
                                     all_keys.push(key.to_string());
                                 }
-                            }
                         }
-                    }
-                }
             }
 
             // Check for truncation (pagination)

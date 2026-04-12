@@ -39,11 +39,10 @@ pub async fn check_latest_scan(
         let Some(time_str) = m.name().split('_').nth(1) else {
             continue;
         };
-        if let Ok(time) = NaiveTime::parse_from_str(time_str, "%H%M%S") {
-            if latest_time.map_or(true, |lt| time > lt) {
+        if let Ok(time) = NaiveTime::parse_from_str(time_str, "%H%M%S")
+            && latest_time.is_none_or(|lt| time > lt) {
                 latest_time = Some(time);
             }
-        }
     }
 
     // Only return Some if at least one filename parsed successfully
@@ -79,7 +78,7 @@ pub async fn get_scan(site: &str, timestamp: NaiveDateTime) -> Result<Scan> {
         };
 
         // Track the latest available scan
-        if latest_time.map_or(true, |lt| parsed_time > lt) {
+        if latest_time.is_none_or(|lt| parsed_time > lt) {
             latest_time = Some(parsed_time);
             latest_meta = Some(m);
         }
@@ -164,12 +163,11 @@ pub async fn check_and_fetch_latest(
         let Some(time_str) = m.name().split('_').nth(1) else {
             continue;
         };
-        if let Ok(time) = NaiveTime::parse_from_str(time_str, "%H%M%S") {
-            if latest_time.map_or(true, |lt| time > lt) {
+        if let Ok(time) = NaiveTime::parse_from_str(time_str, "%H%M%S")
+            && latest_time.is_none_or(|lt| time > lt) {
                 latest_time = Some(time);
                 latest_meta = Some(m);
             }
-        }
     }
 
     let (latest_time, latest_meta) = match (latest_time, latest_meta) {
@@ -180,7 +178,7 @@ pub async fn check_and_fetch_latest(
     let latest_dt = effective_date.and_time(latest_time);
 
     // Check if we already have this scan
-    let should_fetch = current_timestamp.map_or(true, |current| latest_dt > current);
+    let should_fetch = current_timestamp.is_none_or(|current| latest_dt > current);
     if !should_fetch {
         log::info!("Already have latest scan");
         return Ok(None);

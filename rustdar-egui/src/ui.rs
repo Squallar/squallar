@@ -340,15 +340,14 @@ impl Gui {
 
         // Auto-refresh overlay data when layers are enabled and refresh interval elapsed
         for &kind in OverlayKind::all() {
-            if let Some(interval) = self.overlays.auto_poll_interval(kind) {
-                if self.overlays.is_enabled(kind)
+            if let Some(interval) = self.overlays.auto_poll_interval(kind)
+                && self.overlays.is_enabled(kind)
                     && !self.overlays.is_fetching(kind)
                     && self.overlays.fetch_time(kind)
-                        .map_or(true, |t| t.elapsed().as_secs() >= interval)
+                        .is_none_or(|t| t.elapsed().as_secs() >= interval)
                 {
                     actions.push(GuiAction::FetchOverlay(kind));
                 }
-            }
         }
     }
 
@@ -577,8 +576,7 @@ impl Gui {
 
                     if let Some(elevations) =
                         scan_info.product_elevations.get(&pane.selected_product)
-                    {
-                        if !elevations.is_empty() {
+                        && !elevations.is_empty() {
                             let selected_angle = elevations
                                 .iter()
                                 .min_by(|a, b| {
@@ -604,7 +602,6 @@ impl Gui {
                                     }
                                 });
                         }
-                    }
                 } else {
                     ui.label("No scan loaded");
                 }

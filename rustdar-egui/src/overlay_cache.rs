@@ -74,6 +74,12 @@ pub struct OverlayTextureCache {
     pub render_generation: u64,
 }
 
+impl Default for OverlayTextureCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OverlayTextureCache {
     pub fn new() -> Self {
         Self {

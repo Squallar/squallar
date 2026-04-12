@@ -68,7 +68,7 @@ impl ImageBounds {
         let merc_y = lat_rad_to_mercator_y(lat.to_radians());
         let merc_frac = (merc_y - self.mercator_y_min) / (self.mercator_y_max - self.mercator_y_min);
 
-        if merc_frac < 0.0 || merc_frac > 1.0 || lon_frac < 0.0 || lon_frac > 1.0 {
+        if !(0.0..=1.0).contains(&merc_frac) || !(0.0..=1.0).contains(&lon_frac) {
             return None;
         }
 
@@ -209,7 +209,7 @@ fn discover_product_elevations(scan: &Scan) -> HashMap<RadarProduct, Vec<f32>> {
     for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
         product_elevations
             .entry(*l3_product)
-            .or_insert_with(Vec::new);
+            .or_default();
     }
 
     product_elevations

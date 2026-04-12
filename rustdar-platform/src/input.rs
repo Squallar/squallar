@@ -30,17 +30,13 @@ impl InputHandler {
                 event: key_event, ..
             } if key_event.state == ElementState::Pressed => {
                 // Check physical key for Escape
-                if let PhysicalKey::Code(keycode) = key_event.physical_key {
-                    if keycode == KeyCode::Escape {
+                if let PhysicalKey::Code(keycode) = key_event.physical_key
+                    && keycode == KeyCode::Escape {
                         self.escape_pressed = true;
                     }
-                }
                 // Check logical key for Android back button and browser back
-                match &key_event.logical_key {
-                    Key::Named(NamedKey::GoBack | NamedKey::BrowserBack) => {
-                        self.back_pressed = true;
-                    }
-                    _ => {}
+                if let Key::Named(NamedKey::GoBack | NamedKey::BrowserBack) = &key_event.logical_key {
+                    self.back_pressed = true;
                 }
                 true
             }

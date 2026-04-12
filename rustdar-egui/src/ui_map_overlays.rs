@@ -64,7 +64,7 @@ impl<'a> OverlayDrawContext<'a> {
         items: &[ClickableItem],
     ) -> Vec<Arc<dyn OverlayItem>> {
         // 1. Draw the pre-rasterized texture if available
-        if let Some(ref tex) = texture.and_then(|c| c.current.as_ref()) {
+        if let Some(tex) = texture.and_then(|c| c.current.as_ref()) {
             draw_overlay_texture(self.ui.painter(), self.projector, tex, self.screen_rect);
         }
 
@@ -99,8 +99,8 @@ impl<'a> OverlayDrawContext<'a> {
         };
 
         // If a hit buffer is available, use it for pixel-perfect detection.
-        if let Some(ref tex) = texture.and_then(|c| c.current.as_ref()) {
-            if let Some(ref hit_map) = tex.hit_map {
+        if let Some(tex) = texture.and_then(|c| c.current.as_ref())
+            && let Some(ref hit_map) = tex.hit_map {
                 let rect = crate::overlay_cache::overlay_texture_rect(self.projector, tex, self.screen_rect);
                 if rect.width() > 0.0 && rect.height() > 0.0 {
                     let u = (click_pos.x - rect.left()) / rect.width();
@@ -108,7 +108,6 @@ impl<'a> OverlayDrawContext<'a> {
                     return hit_map.hit_test(u, v);
                 }
             }
-        }
 
         // Fall back to geographic polygon containment.
         let geo = self

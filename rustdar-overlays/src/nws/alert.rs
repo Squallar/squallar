@@ -200,7 +200,7 @@ pub(crate) fn parse_geometry(geom: Option<&serde_json::Value>) -> Option<Vec<Geo
             let multi = coords.as_array()?;
             let polys: Vec<GeoPolygon> = multi
                 .iter()
-                .filter_map(|p| crate::types::parse_polygon_coords(p))
+                .filter_map(crate::types::parse_polygon_coords)
                 .collect();
             if polys.is_empty() { None } else { Some(polys) }
         }

@@ -46,11 +46,10 @@ impl OverlayHandler for UserLocationHandler {
     }
 
     fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneControlContextMut<'_>) -> ControlEffect {
-        if update.id == "enabled" {
-            if let crate::render::controls::ControlValue::Bool(val) = update.value {
+        if update.id == "enabled"
+            && let crate::render::controls::ControlValue::Bool(val) = update.value {
                 self.enabled = val;
             }
-        }
         ControlEffect::None
     }
 

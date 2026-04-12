@@ -325,7 +325,7 @@ impl super::App {
 
                 cache.current = Some(OverlayTextureData {
                     texture: texture.clone(),
-                    geo_bounds: resp.geo_bounds.clone(),
+                    geo_bounds: resp.geo_bounds,
                     data_generation: resp.generation,
                     render_zoom: resp.zoom,
                     width: resp.width,
@@ -377,8 +377,8 @@ impl super::App {
                                 self.window.clone(),
                             );
                         }
-                    } else if let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) {
-                        if let Some(data) = self.scan_data.get(scan_info.site.name) {
+                    } else if let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx)
+                        && let Some(data) = self.scan_data.get(scan_info.site.name) {
                             self.render.spawn_level2_render(
                                 pane_idx,
                                 product,
@@ -390,7 +390,6 @@ impl super::App {
                                 self.window.clone(),
                             );
                         }
-                    }
                 }
             } else if pane_idx < self.render.pane_render.len() {
                 // No rendering params for this pane, clear its radar overlay texture
@@ -754,7 +753,7 @@ impl super::App {
                 }
                 let any_rendered = pls.frames.iter().any(|f| f.texture.is_some());
                 let none_in_flight = !pls.frames.iter().any(|f| f.render_in_flight);
-                let pane_downloads_done = self.loop_pending_downloads.get(&pidx).map_or(true, |p| p.is_empty());
+                let pane_downloads_done = self.loop_pending_downloads.get(&pidx).is_none_or(|p| p.is_empty());
                 if any_rendered && none_in_flight && pane_downloads_done {
                     pls.render_ready = true;
                 }
@@ -950,12 +949,11 @@ impl super::App {
                         }
                         let sls = &sibling.loop_state;
                         if !sls.multi_frame { continue; }
-                        if let Some(sframe) = sls.frames.iter().find(|f| f.timestamp == frame.timestamp) {
-                            if sframe.texture.is_some() {
+                        if let Some(sframe) = sls.frames.iter().find(|f| f.timestamp == frame.timestamp)
+                            && sframe.texture.is_some() {
                                 found_sibling = Some(sibling_idx);
                                 break;
                             }
-                        }
                     }
                     if let Some(src) = found_sibling {
                         to_clone.push((pane_idx, idx, src, frame.timestamp));

@@ -55,6 +55,12 @@ pub struct DesktopPlatform {
 }
 
 #[cfg(not(target_os = "android"))]
+impl Default for DesktopPlatform {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DesktopPlatform {
     pub fn new() -> Self {
         Self {

@@ -31,6 +31,12 @@ pub struct PaneRenderState {
     pub cached_render: Option<(Arc<Vec<u8>>, f64, Arc<Vec<f32>>, RadarProduct, f32)>,
 }
 
+impl Default for PaneRenderState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PaneRenderState {
     pub fn new() -> Self {
         Self {

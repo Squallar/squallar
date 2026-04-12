@@ -138,7 +138,7 @@ fn parse_coord_token(token: &str) -> Option<(f64, f64)> {
         return None;
     }
     let len = token.len();
-    if len < 7 || len > 8 {
+    if !(7..=8).contains(&len) {
         return None;
     }
 
@@ -150,7 +150,7 @@ fn parse_coord_token(token: &str) -> Option<(f64, f64)> {
     let lon = -(lon_raw / 100.0); // Western Hemisphere
 
     // Basic sanity checks for CONUS coordinates
-    if lat < 15.0 || lat > 60.0 || lon > -50.0 || lon < -140.0 {
+    if !(15.0..=60.0).contains(&lat) || !(-140.0..=-50.0).contains(&lon) {
         return None;
     }
 

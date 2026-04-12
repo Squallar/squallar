@@ -326,7 +326,7 @@ fn skip_xdr_bytes(data: &[u8], offset: usize, n: usize) -> Result<usize> {
 /// Skip an XDR string (4-byte length prefix + padded-to-4 content).
 fn skip_xdr_string(data: &[u8], offset: usize) -> Result<usize> {
     let len = read_u32(data, offset)? as usize;
-    let padded = (len + 3) / 4 * 4;
+    let padded = len.div_ceil(4) * 4;
     let end = offset + 4 + padded;
     if end > data.len() {
         return Err(Error::UnexpectedEof {
@@ -341,7 +341,7 @@ fn skip_xdr_string(data: &[u8], offset: usize) -> Result<usize> {
 /// Read an XDR string, returning the UTF-8 content and the offset after it.
 fn read_xdr_string(data: &[u8], offset: usize) -> Result<(String, usize)> {
     let len = read_u32(data, offset)? as usize;
-    let padded = (len + 3) / 4 * 4;
+    let padded = len.div_ceil(4) * 4;
     let end = offset + 4 + padded;
     if end > data.len() {
         return Err(Error::UnexpectedEof {

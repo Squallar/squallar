@@ -182,11 +182,11 @@ pub fn find_closest_elevation(
 
 /// Find the sweep whose first radial matches `elevation_angle` and carries the
 /// requested product's moment data.
-fn find_sweep<'a>(
-    scan: &'a Scan,
+fn find_sweep(
+    scan: &Scan,
     product: types::RadarProduct,
     elevation_angle: f32,
-) -> Option<&'a [Radial]> {
+) -> Option<&[Radial]> {
     scan.sweeps().iter().find_map(|sweep| {
         let matches = sweep
             .radials()
@@ -404,11 +404,10 @@ fn build_velocity_grid(
         let mut gates = vec![f64::NAN; gate_count];
         if let Some(moment) = radial.velocity() {
             for (j, val) in moment.values().iter().enumerate().take(gate_count) {
-                if let nexrad_model::data::MomentValue::Value(v) = val {
-                    if !v.is_nan() && *v < 999.0 {
+                if let nexrad_model::data::MomentValue::Value(v) = val
+                    && !v.is_nan() && *v < 999.0 {
                         gates[j] = *v as f64;
                     }
-                }
             }
         }
         vel_grid.push(gates);

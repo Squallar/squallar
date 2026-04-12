@@ -52,7 +52,7 @@ impl<T> OverlayState<T> {
     /// Whether a refresh is due (no data yet, or `interval` has elapsed since last fetch).
     pub fn needs_refresh(&self, interval_secs: u64) -> bool {
         self.fetch_time
-            .map_or(true, |t| t.elapsed().as_secs() >= interval_secs)
+            .is_none_or(|t| t.elapsed().as_secs() >= interval_secs)
     }
 }
 
@@ -352,11 +352,11 @@ impl OverlayRegistry {
     }
 
     pub fn has_data(&self, kind: OverlayKind) -> bool {
-        self.handler(kind).map_or(false, |h| h.has_data())
+        self.handler(kind).is_some_and(|h| h.has_data())
     }
 
     pub fn is_fetching(&self, kind: OverlayKind) -> bool {
-        self.handler(kind).map_or(false, |h| h.is_fetching())
+        self.handler(kind).is_some_and(|h| h.is_fetching())
     }
 
     pub fn set_fetching(&mut self, kind: OverlayKind, fetching: bool) {
@@ -378,7 +378,7 @@ impl OverlayRegistry {
     }
 
     pub fn is_enabled(&self, kind: OverlayKind) -> bool {
-        self.handler(kind).map_or(false, |h| h.is_enabled())
+        self.handler(kind).is_some_and(|h| h.is_enabled())
     }
 
     pub fn set_enabled(&mut self, kind: OverlayKind, enabled: bool) {

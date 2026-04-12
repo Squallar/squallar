@@ -98,7 +98,7 @@ pub(super) fn render_pane_map_content(
                             .and_then(|tex| tex.radar_meta.as_ref())
                             .map(|m| (m.lat, m.lon, m.max_range_km, std::sync::Arc::clone(&m.value_data)));
 
-                        if let Some(ref tex) = ctx.pane.overlay_cache(OverlayKind::Radar).and_then(|c| c.current.as_ref()) {
+                        if let Some(tex) = ctx.pane.overlay_cache(OverlayKind::Radar).and_then(|c| c.current.as_ref()) {
                             let screen_rect = ui.max_rect();
                             draw_overlay_texture(ui.painter(), projector, tex, screen_rect);
                         }
@@ -121,7 +121,7 @@ pub(super) fn render_pane_map_content(
                 }
                 // Radar sites: texture + per-frame interactions (text labels, clicks)
                 OverlayKind::RadarSites => {
-                    if let Some(ref tex) = ctx.pane.overlay_cache(kind).and_then(|c| c.current.as_ref()) {
+                    if let Some(tex) = ctx.pane.overlay_cache(kind).and_then(|c| c.current.as_ref()) {
                         let screen_rect = ui.max_rect();
                         draw_overlay_texture(ui.painter(), projector, tex, screen_rect);
                     }
@@ -211,7 +211,7 @@ pub(super) fn render_pane_map_content(
                 ctx.actions.push(GuiAction::RenderOverlay {
                     pane_idx: ctx.pane_idx,
                     overlay_kind: kind,
-                    geo_bounds: viewport_bounds.clone(),
+                    geo_bounds: viewport_bounds,
                     width: w,
                     height: h,
                     data_generation: data_gen,
@@ -414,16 +414,15 @@ fn handle_radar_site_interactions(
         let icon_rect =
             egui::Rect::from_center_size(site_screen, egui::vec2(icon_size, icon_size));
 
-        if let Some(pos) = click_pos {
-            if icon_rect.contains(pos) {
+        if let Some(pos) = click_pos
+            && icon_rect.contains(pos) {
                 pane.loading_site = Some(radar_site.name.to_string());
                 pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
                 actions.push(GuiAction::SwitchRadarSite { site: radar_site.name.to_string(), pane_idx });
             }
-        }
 
-        if let Some(pos) = hover_pos {
-            if icon_rect.contains(pos) {
+        if let Some(pos) = hover_pos
+            && icon_rect.contains(pos) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 let elev_str = match radar_site.elev {
                     Some(e) => {
@@ -444,7 +443,6 @@ fn handle_radar_site_interactions(
                     |tooltip_ui| { tooltip_ui.label(tooltip_text); },
                 );
             }
-        }
     }
 }
 
@@ -715,11 +713,10 @@ fn render_color_scale(
     // Filter out labels that are too close to the previous one
     let mut prev_pos: Option<f32> = None;
     let thinned: Vec<(f32, &str)> = label_positions.iter().filter(|(pos, _)| {
-        if let Some(prev) = prev_pos {
-            if (pos - prev).abs() < MIN_LABEL_SPACING {
+        if let Some(prev) = prev_pos
+            && (pos - prev).abs() < MIN_LABEL_SPACING {
                 return false;
             }
-        }
         prev_pos = Some(*pos);
         true
     }).map(|(pos, text)| (*pos, text.as_str())).collect();
@@ -816,17 +813,16 @@ fn render_per_frame_overlay(
             let dx = hp.x - screen.x;
             let dy = hp.y - screen.y;
             let d2 = dx * dx + dy * dy;
-            if d2 <= hit_radius * hit_radius {
-                if closest_hover.map_or(true, |(best_d2, _)| d2 < best_d2) {
+            if d2 <= hit_radius * hit_radius
+                && closest_hover.is_none_or(|(best_d2, _)| d2 < best_d2) {
                     closest_hover = Some((d2, pt.id));
                 }
-            }
         }
     }
 
     // Show tooltip for closest hovered point
-    if let Some((_, id)) = closest_hover {
-        if let Some(text) = overlays.hover_text(kind, id, &hover_ctx) {
+    if let Some((_, id)) = closest_hover
+        && let Some(text) = overlays.hover_text(kind, id, &hover_ctx) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             #[allow(deprecated)]
             egui::show_tooltip_at_pointer(
@@ -839,7 +835,6 @@ fn render_per_frame_overlay(
                 },
             );
         }
-    }
 
     selected
 }

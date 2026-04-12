@@ -222,7 +222,7 @@ impl OverlayHandler for SpcDiscussionHandler {
             future: Box::pin(async move {
                 let result = crate::spc::fetch::fetch_active_discussions(&client)
                     .await
-                    .map_err(|e| format!("{e}"));
+                    .map_err(|e| e.to_string());
                 Box::new(SpcDiscussionFetchResult(result)) as Box<dyn Any + Send>
             }),
         }]

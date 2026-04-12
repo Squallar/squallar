@@ -223,11 +223,10 @@ impl super::Gui {
             }
             pane.time_step_secs = pc.time_step_secs;
             // Capture the first pane's legacy Radar toggle for migration.
-            if legacy_radar_enabled.is_none() {
-                if let Some(&enabled) = pc.layers.get(&LayerKind::Radar) {
+            if legacy_radar_enabled.is_none()
+                && let Some(&enabled) = pc.layers.get(&LayerKind::Radar) {
                     legacy_radar_enabled = Some(enabled);
                 }
-            }
             pane.draw_order = reconcile_draw_order(&pc.draw_order);
         }
 

@@ -189,13 +189,12 @@ impl App {
 
     /// Poll for platform-specific theme and location changes.
     fn poll_platform_state(&mut self) {
-        if let Some(new_theme) = self.platform.poll_theme() {
-            if self.cached_dark_theme != Some(new_theme) {
+        if let Some(new_theme) = self.platform.poll_theme()
+            && self.cached_dark_theme != Some(new_theme) {
                 self.cached_dark_theme = Some(new_theme);
                 self.gui.bump_all_radar_sites_gen();
                 notify_redraw(&self.window);
             }
-        }
         if let Some((lat, lon)) = self.platform.poll_location() {
             self.gui.set_user_location(lat, lon);
         }
@@ -391,11 +390,10 @@ impl App {
             self.request_exit(Some(event_loop));
         }
 
-        if self.input.back_pressed() {
-            if !self.platform.handle_back() {
+        if self.input.back_pressed()
+            && !self.platform.handle_back() {
                 self.request_exit(Some(event_loop));
             }
-        }
     }
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) {

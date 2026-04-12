@@ -248,7 +248,7 @@ impl OverlayHandler for NwsAlertHandler {
                     zone_cache.as_deref(),
                 )
                     .await
-                    .map_err(|e| format!("{e}"));
+                    .map_err(|e| e.to_string());
                 Box::new(NwsAlertFetchResult(result)) as Box<dyn Any + Send>
             }),
         }]

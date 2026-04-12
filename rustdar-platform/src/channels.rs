@@ -105,6 +105,12 @@ pub struct ChannelHub {
     pub loop_render_receiver: Receiver<LoopRenderResponse>,
 }
 
+impl Default for ChannelHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ChannelHub {
     pub fn new() -> Self {
         let (scan_sender, scan_receiver) = std::sync::mpsc::channel();

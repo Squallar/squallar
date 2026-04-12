@@ -203,7 +203,7 @@ impl OverlayHandler for SpcOutlookHandler {
                     future: Box::pin(async move {
                         let result = crate::spc::fetch::fetch_outlook(&client, day, product)
                             .await
-                            .map_err(|e| format!("{e}"));
+                            .map_err(|e| e.to_string());
                         Box::new(SpcOutlookFetchResult { day, product, result }) as Box<dyn Any + Send>
                     }),
                 }
