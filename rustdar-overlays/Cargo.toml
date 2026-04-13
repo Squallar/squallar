@@ -21,3 +21,6 @@ tiny-skia = "=0.12.0"
 [target.'cfg(target_os = "android")'.dependencies]
 # Force vendored OpenSSL for Android builds to avoid cross-compilation issues
 openssl-sys = { version = "=0.9.110", features = ["vendored"] }
+# proj-sys (via grib → proj) needs SQLite3 at build time, but the NDK sysroot
+# doesn't include SQLite3 development headers. Bundle it from source.
+libsqlite3-sys = { version = ">=0.28,<0.36", features = ["bundled"] }
