@@ -14,7 +14,7 @@ nexrad-decode = "=1.0.0-rc.3"
 nexrad-level3 = { path = "../nexrad-level3" }
 rayon = "=1.11.0"
 reqwest = { version = "=0.12.24", default-features = false, features = ["rustls-tls"] }
-thiserror = "=2.0.17"
+thiserror = "=2.0.18"
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Force vendored OpenSSL for Android builds to avoid cross-compilation issues
