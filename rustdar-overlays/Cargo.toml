@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 chrono = "=0.4.44"
 earcutr = "=0.5.0"
-flate2 = "=1.1.4"
+flate2 = "=1.1.9"
 grib = { version = "=0.15.1", default-features = true }
 rustdar-units = { path = "../rustdar-units" }
 futures = "=0.3.32"
