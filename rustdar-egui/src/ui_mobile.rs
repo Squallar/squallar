@@ -384,7 +384,7 @@ impl super::Gui {
         let mut action = None;
         let top_inset = self.safe_area_insets.0;
 
-        egui::TopBottomPanel::top("mobile_status_bar")
+        egui::Panel::top("mobile_status_bar")
             .min_height(32.0 + top_inset)
             .show_separator_line(true)
             .show(ctx, |ui| {
@@ -447,8 +447,8 @@ impl super::Gui {
 
         let mut pane = std::mem::take(&mut self.panes[self.active_pane]);
 
-        egui::SidePanel::left("mobile_layers_panel")
-            .default_width(260.0)
+        egui::Panel::left("mobile_layers_panel")
+            .default_size(260.0)
             .resizable(false)
             .show(ctx, |ui| {
                 // Safe-area top padding

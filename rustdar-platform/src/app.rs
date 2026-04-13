@@ -87,7 +87,7 @@ impl Default for App {
 
 impl App {
     pub fn new() -> Self {
-        let instance = egui_wgpu::wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = egui_wgpu::wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let input = InputHandler::new();
         let channels = ChannelHub::new();
         let renders_in_flight = Arc::new(AtomicUsize::new(0));

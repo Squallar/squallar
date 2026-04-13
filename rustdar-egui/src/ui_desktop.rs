@@ -73,7 +73,7 @@ fn render_error_display(ui: &mut egui::Ui, error_message: &mut Option<String>) {
 
 impl super::Gui {
     pub(super) fn render_menu_bar(&mut self, ctx: &Context, action: &mut Option<GuiAction>) {
-        egui::TopBottomPanel::top("menubar_container").show(ctx, |ui| {
+        egui::Panel::top("menubar_container").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Exit").clicked() {
@@ -108,7 +108,7 @@ impl super::Gui {
     pub(super) fn render_status_bar(&mut self, ctx: &Context) -> Option<GuiAction> {
         let mut action = None;
         
-        egui::TopBottomPanel::bottom("status_bar")
+        egui::Panel::bottom("status_bar")
             .show_separator_line(true)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -151,8 +151,8 @@ impl super::Gui {
         let mut actions = Vec::new();
         let mut pane = std::mem::take(&mut self.panes[self.active_pane]);
 
-        egui::SidePanel::left("layers_panel")
-            .default_width(170.0)
+        egui::Panel::left("layers_panel")
+            .default_size(170.0)
             .resizable(false)
             .show(ctx, |ui| {
                 ui.heading("Layers");

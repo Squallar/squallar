@@ -14,7 +14,7 @@ impl super::Gui {
         let mut actions = Vec::new();
 
         // Detect current theme from egui context
-        let is_dark_theme = ctx.style().visuals.dark_mode;
+        let is_dark_theme = ctx.global_style().visuals.dark_mode;
 
         // Initialize tiles via MapTileState
         self.map_tiles.ensure_base_tiles(is_dark_theme, ctx);
@@ -159,7 +159,7 @@ impl super::Gui {
                         } else {
                             egui::DragPanButtons::PRIMARY
                         })
-                        .show(&mut child_ui, |ui, projector, memory| {
+                        .show(&mut child_ui, |ui, _response, projector, memory| {
                             let zoom = memory.zoom();
 
                             let mut render_ctx = pane_render::PaneRenderCtx {

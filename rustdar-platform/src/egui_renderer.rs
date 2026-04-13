@@ -113,6 +113,7 @@ impl EguiRenderer {
             timestamp_writes: None,
             label: Some("egui main render pass"),
             occlusion_query_set: None,
+            multiview_mask: None,
         });
 
         self.renderer

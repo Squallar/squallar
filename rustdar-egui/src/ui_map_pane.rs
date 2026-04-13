@@ -426,7 +426,7 @@ fn handle_radar_site_interactions(
         }
     });
 
-    let is_dark = ui.ctx().style().visuals.dark_mode;
+    let is_dark = ui.ctx().global_style().visuals.dark_mode;
     let text_color = if is_dark {
         egui::Color32::WHITE
     } else {
@@ -980,7 +980,7 @@ fn render_per_frame_overlay(
     }
 
     let zoom_f32 = pf.zoom as f32;
-    let is_dark = ui.ctx().style().visuals.dark_mode;
+    let is_dark = ui.ctx().global_style().visuals.dark_mode;
     let draw_ctx = DrawPointContext { zoom: zoom_f32, is_dark };
     let hit_radius = pf.overlays.point_hit_radius(pf.kind, zoom_f32);
     let hover_ctx = HoverContext { prefs: pf.prefs };

@@ -497,17 +497,18 @@ impl super::App {
     /// the surface is *lost* and the caller must recreate rendering state.
     fn get_surface_texture(surface: &wgpu::Surface) -> (Option<wgpu::SurfaceTexture>, bool) {
         match surface.get_current_texture() {
-            Ok(texture) => (Some(texture), false),
-            Err(wgpu::SurfaceError::Outdated) => {
+            wgpu::CurrentSurfaceTexture::Success(texture)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => (Some(texture), false),
+            wgpu::CurrentSurfaceTexture::Outdated => {
                 log::warn!("wgpu surface outdated, skipping frame");
                 (None, false)
             }
-            Err(wgpu::SurfaceError::Lost) => {
+            wgpu::CurrentSurfaceTexture::Lost => {
                 log::warn!("wgpu surface lost (display change?), will recreate state");
                 (None, true)
             }
-            Err(err) => {
-                log::error!("Surface error: {:?}", err);
+            _ => {
+                log::error!("Surface error");
                 (None, false)
             }
         }

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use walkers::{HttpTiles, Texture, TileId, Tiles};
+use walkers::{HttpTiles, Tile, TileId, Tiles};
 use crate::overlay_cache::{
     OverlayTextureCache, draw_overlay_texture, geo_point_in_feature,
 };
@@ -186,7 +186,7 @@ pub(super) fn draw_label_tiles_overlay(
                     .to_pos2();
                 let rect = egui::Rect::from_two_pos(nw_screen, se_screen);
 
-                let Texture::Raster(ref tex) = twuv.texture;
+                let Tile::Raster(ref tex) = twuv.tile;
                 ui.painter().image(tex.id(), rect, twuv.uv, egui::Color32::WHITE);
             }
         }
