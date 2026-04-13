@@ -61,6 +61,7 @@ impl Default for DesktopPlatform {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 impl DesktopPlatform {
     pub fn new() -> Self {
         Self {
