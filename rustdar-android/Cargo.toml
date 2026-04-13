@@ -46,7 +46,7 @@ path = "src/lib.rs"
 
 [target.'cfg(target_os = "android")'.dependencies]
 rustdar-platform = { path = "../rustdar-platform" }
-android_logger = "=0.14.1"
+android_logger = "=0.15.1"
 winit = { version = "=0.30.13", features = ["android-native-activity"] }
 pollster = "=0.4.0"
 log = "=0.4.28"
