@@ -2964,9 +2964,9 @@ dependencies = [
 
 [[package]]
 name = "nexrad-data"
-version = "1.0.0-rc.5"
+version = "1.0.0-rc.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bad302572e116375fb0cca297ec8f56838b402c2589595b5b636a2643fcd4b2"
+checksum = "8ce26289c04c4736b662997d719b41f2343e700c4ed568f6cb4ba93d3bd923da"
 dependencies = [
  "bzip2 0.6.1",
  "chrono",
