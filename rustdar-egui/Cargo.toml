@@ -7,7 +7,7 @@ edition = "2024"
 rustdar-radar = { path = "../rustdar-radar" }
 rustdar-overlays = { path = "../rustdar-overlays" }
 rustdar-units = { path = "../rustdar-units" }
-chrono = "=0.4.42"
+chrono = "=0.4.44"
 egui = "=0.33.0"
 log = "=0.4.28"
 serde = { version = "=1.0.228", features = ["derive"] }
