@@ -34,7 +34,7 @@ tokio = { version = "=1.51.1", features = ["rt", "rt-multi-thread"] }
 winit = "=0.30.13"
 egui-winit = { version = "=0.33.0", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
 env_logger = "=0.11.8"
-wgpu = "=26.0.0"
+wgpu = "=26.0.1"
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Force vendored OpenSSL for Android builds to avoid cross-compilation issues
