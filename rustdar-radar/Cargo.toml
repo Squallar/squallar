@@ -18,4 +18,4 @@ thiserror = "=2.0.18"
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Force vendored OpenSSL for Android builds to avoid cross-compilation issues
-openssl-sys = { version = "=0.9.110", features = ["vendored"] }
+openssl-sys = { version = "=0.9.113", features = ["vendored"] }
