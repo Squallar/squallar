@@ -478,13 +478,13 @@ fn handle_radar_site_interactions(
                     "{}\nLat: {:.3}°, Lon: {:.3}°\nElev: {}",
                     radar_site.name, radar_site.lat, radar_site.lon, elev_str
                 );
-                #[allow(deprecated)]
-                egui::show_tooltip_at_pointer(
-                    ui.ctx(),
+                egui::Tooltip::always_open(
+                    ui.ctx().clone(),
                     ui.layer_id(),
                     egui::Id::new(("site_tooltip", radar_site.name)),
-                    |tooltip_ui| { tooltip_ui.label(tooltip_text); },
-                );
+                    egui::PopupAnchor::Pointer,
+                )
+                .show(|tooltip_ui| { tooltip_ui.label(tooltip_text); });
             }
     }
 }
@@ -1039,16 +1039,16 @@ fn render_per_frame_overlay(
     if let Some((_, id)) = closest_hover
         && let Some(text) = pf.overlays.hover_text(pf.kind, id, &hover_ctx) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            #[allow(deprecated)]
-            egui::show_tooltip_at_pointer(
-                ui.ctx(),
+            egui::Tooltip::always_open(
+                ui.ctx().clone(),
                 ui.layer_id(),
                 egui::Id::new(("per_frame_overlay_hover", pf.kind as u8)),
-                |tooltip_ui| {
-                    tooltip_ui.set_max_width(400.0);
-                    tooltip_ui.label(text);
-                },
-            );
+                egui::PopupAnchor::Pointer,
+            )
+            .width(400.0)
+            .show(|tooltip_ui| {
+                tooltip_ui.label(text);
+            });
         }
 
     selected
