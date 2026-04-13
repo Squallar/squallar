@@ -2,7 +2,8 @@
 //!
 //! Uses the NOMADS filter CGI to download a single GRIB2 field (e.g. CIN)
 //! for the latest HRRR f00 (analysis) run, keeping download size small
-//! (~200-500 KB).
+//! (~200-500 KB). Composite parameters (e.g. bulk shear) fetch multiple
+//! fields and merge them.
 
 use chrono::{NaiveDate, NaiveDateTime, Timelike, Utc};
 use grib::{Grib2SubmessageDecoder, LatLons};
@@ -18,6 +19,11 @@ const SUBREGION_RIGHT_LON: f64 = -60.0;
 
 /// Build the NOMADS filter URL for a specific HRRR run and parameter.
 fn nomads_url(param: &ModelParameter, run_hour: u8, date: NaiveDate) -> String {
+    nomads_url_raw(param.nomads_var(), param.nomads_level(), run_hour, date)
+}
+
+/// Build a NOMADS filter URL from explicit var/lev strings.
+fn nomads_url_raw(var: &str, lev: &str, run_hour: u8, date: NaiveDate) -> String {
     let date_str = date.format("%Y%m%d");
     format!(
         "https://nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_2d.pl\
@@ -30,8 +36,6 @@ fn nomads_url(param: &ModelParameter, run_hour: u8, date: NaiveDate) -> String {
          &leftlon={left}\
          &rightlon={right}\
          &bottomlat={bot}",
-        var = param.nomads_var(),
-        lev = param.nomads_level(),
         top = SUBREGION_TOP_LAT,
         bot = SUBREGION_BOT_LAT,
         left = SUBREGION_LEFT_LON,
@@ -196,4 +200,113 @@ async fn try_fetch(
     log::info!("Received {} bytes of GRIB2 data", bytes.len());
 
     parse_grib2(&bytes, *param)
+}
+
+/// Fetch a composite HRRR parameter (e.g. bulk shear) that requires
+/// multiple NOMADS fields merged into one grid.
+///
+/// Fetches each component sequentially, then combines them. For wind shear
+/// this means fetching U and V components and computing magnitude √(U²+V²).
+pub async fn fetch_composite_hrrr_data(
+    client: &reqwest::Client,
+    param: &ModelParameter,
+) -> HrrrFetchResult {
+    let parts = match param.composite_parts() {
+        Some(p) => p,
+        None => return fetch_hrrr_data(client, param).await,
+    };
+
+    let (date, hour) = latest_available_run();
+
+    match try_fetch_composite(client, param, &parts, date, hour).await {
+        Ok(data) => return HrrrFetchResult(Ok(data)),
+        Err(e) => {
+            log::warn!(
+                "HRRR composite fetch for {date} {hour:02}z failed: {e}, trying previous hour"
+            );
+        }
+    }
+
+    let (prev_date, prev_hour) = if hour == 0 {
+        (date - chrono::Duration::days(1), 23u8)
+    } else {
+        (date, hour - 1)
+    };
+
+    match try_fetch_composite(client, param, &parts, prev_date, prev_hour).await {
+        Ok(data) => HrrrFetchResult(Ok(data)),
+        Err(e) => {
+            log::error!("HRRR composite fallback fetch also failed: {e}");
+            HrrrFetchResult(Err(format!("HRRR composite fetch failed: {e}")))
+        }
+    }
+}
+
+/// Attempt a composite HRRR fetch for a specific run.
+async fn try_fetch_composite(
+    client: &reqwest::Client,
+    param: &ModelParameter,
+    parts: &[(&str, &str)],
+    date: NaiveDate,
+    hour: u8,
+) -> Result<HrrrGridData, String> {
+    let mut grids: Vec<HrrrGridData> = Vec::with_capacity(parts.len());
+
+    for (var, lev) in parts {
+        let url = nomads_url_raw(var, lev, hour, date);
+        log::info!("Fetching HRRR composite component {var} {lev} from {url}");
+
+        let response = client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed for {var}: {e}"))?;
+
+        if !response.status().is_success() {
+            return Err(format!("HTTP {} for {var}", response.status()));
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| format!("Failed to read body for {var}: {e}"))?;
+
+        log::info!("Received {} bytes for {var}", bytes.len());
+        grids.push(parse_grib2(&bytes, *param)?);
+    }
+
+    if grids.len() < 2 {
+        return Err("Composite requires at least 2 components".into());
+    }
+
+    // Merge: compute magnitude √(a² + b²) element-wise.
+    let base = &grids[0];
+    let other = &grids[1];
+
+    if base.values.len() != other.values.len() {
+        return Err(format!(
+            "Grid size mismatch: {} vs {}",
+            base.values.len(),
+            other.values.len()
+        ));
+    }
+
+    let values: Vec<f32> = base
+        .values
+        .iter()
+        .zip(other.values.iter())
+        .map(|(&u, &v)| (u * u + v * v).sqrt())
+        .collect();
+
+    Ok(HrrrGridData {
+        parameter: *param,
+        values,
+        lats: base.lats.clone(),
+        lons: base.lons.clone(),
+        ni: base.ni,
+        nj: base.nj,
+        bounds: base.bounds,
+        ref_time: base.ref_time,
+    })
 }

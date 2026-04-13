@@ -184,7 +184,11 @@ impl OverlayHandler for ModelDataHandler {
         vec![FetchTask {
             kind: OverlayKind::ModelData,
             future: Box::pin(async move {
-                let result = crate::hrrr::fetch::fetch_hrrr_data(&client, &param).await;
+                let result = if param.is_composite() {
+                    crate::hrrr::fetch::fetch_composite_hrrr_data(&client, &param).await
+                } else {
+                    crate::hrrr::fetch::fetch_hrrr_data(&client, &param).await
+                };
                 Box::new(result) as Box<dyn Any + Send>
             }),
         }]

@@ -136,12 +136,14 @@ cargo clippy --all-targets --all-features
 
 ### HRRR Model Data (`rustdar-overlays/src/hrrr/`)
 - Fetches HRRR f00 (analysis) GRIB2 fields via NOMADS server-side filter: `https://nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_2d.pl`. ~200–500KB per field.
-- `ModelParameter` enum: `SurfaceBasedCin` (var_CIN, lev_surface), `MixedLayerCin` (var_CIN, lev_180-0_mb_above_ground), `SurfaceBasedCape` (var_CAPE, lev_surface), `MixedLayerCape` (var_CAPE, lev_180-0_mb_above_ground), `MostUnstableCape` (var_CAPE, lev_255-0_mb_above_ground). Extensible to SRH/shear.
+- `ModelParameter` enum (16 variants): `SurfaceBasedCin` (var_CIN, lev_surface), `MixedLayerCin` (var_CIN, lev_180-0_mb_above_ground), `SurfaceBasedCape` (var_CAPE, lev_surface), `MixedLayerCape` (var_CAPE, lev_180-0_mb_above_ground), `MostUnstableCape` (var_CAPE, lev_255-0_mb_above_ground), `LiftedIndex` (var_LFTX, lev_500-1000_mb), `Srh1km` (var_HLCY, lev_1000-0_m_above_ground), `Srh3km` (var_HLCY, lev_3000-0_m_above_ground), `MaxUH2to5km` (var_MXUPHL, lev_2000-5000_m_above_ground), `MaxUH0to2km` (var_MXUPHL, lev_0-2000_m_above_ground), `BulkShear6km` (composite: var_VUCSH+var_VVCSH, lev_0-6000_m_above_ground, magnitude √(U²+V²)), `SurfaceWindGust` (var_GUST, lev_surface), `PrecipitableWater` (var_PWAT, lev_entire_atmosphere), `Temperature2m` (var_TMP, lev_2_m_above_ground), `Dewpoint2m` (var_DPT, lev_2_m_above_ground), `Visibility` (var_VIS, lev_surface).
+- Unit conversions via `convert_for_display()`: CIN/CAPE/SRH/UH are identity (J/kg or m²/s²), wind m/s→kt (×1.94384), temperature K→°F, PWAT kg/m²→inches (÷25.4), visibility m→miles (÷1609.344), lifted index identity (K delta ≡ °C delta).
+- Composite parameters: `BulkShear6km` has `is_composite()=true`, `composite_parts()` returns two `(var, lev)` pairs. `fetch_composite_hrrr_data()` fetches both GRIB2 fields sequentially and computes element-wise magnitude √(U²+V²).
 - Parsed via `grib` crate (=0.15.0, pure Rust GRIB2 decoder). `parse_grib2()` extracts lat/lon grid + decoded values + reference time.
 - `HrrrGridData` stores flat arrays (values, lats, lons) + grid dimensions (ni, nj) + geographic bounds + reference time.
 - Safe run selection: `latest_available_run()` targets `Utc::now() - 2h` (accounts for ~45–90min publication lag). Falls back to previous hour on 404.
-- Color scale: CIN uses transparent 0→−25, green→yellow −25→−50, yellow→orange −50→−100, orange→red −100→−200, red→purple −200→−500+ J/kg. CAPE uses transparent 0→250, light blue→green 250→500, green→yellow 500→1000, yellow→orange 1000→2000, orange→red 2000→3000, red→purple 3000→5000+ J/kg.
-- `ModelDataHandler` owns toggle + parameter dropdown (SBCIN/MLCIN/SBCAPE/MLCAPE/MUCAPE), auto-polls every 3600s. `hover_value_at()` does nearest-neighbor lookup on the grid.
+- Color scales: CIN (green→purple, magnitude), CAPE (blue→purple, 250–5000 J/kg), LI (green→purple, 0 to −10 °C), SRH (green→purple, 50–500 m²/s²), UH 2-5km (green→purple, 25–500), UH 0-2km (green→purple, 10–300), wind/shear (green→purple, 10–65 kt), PWAT (blue→red, 0.75–2.5 in), temperature (purple→red, 0–110 °F), dewpoint (brown→red, 30–75 °F), visibility (purple→green inverted, 0.5–10 mi).
+- `ModelDataHandler` owns toggle + parameter dropdown (16 options), auto-polls every 3600s. `hover_value_at()` does nearest-neighbor lookup on the grid then calls `format_value()` which applies unit conversion.
 - Rasterized to texture via `rasterize_model_data()` (projects each grid point through `MercatorBounds`, fills rectangles with color-mapped values).
 
 ## Key Constants
