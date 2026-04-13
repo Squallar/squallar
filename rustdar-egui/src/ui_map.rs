@@ -1,5 +1,4 @@
 use crate::actions::GuiAction;
-use egui::Context;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::types::{RadarProduct, IMAGE_SIZE};
 use rustdar_units::UserPreferences;
@@ -8,19 +7,20 @@ use rustdar_units::UserPreferences;
 mod pane_render;
 
 impl super::Gui {
-    pub(super) fn render_map(&mut self, ctx: &Context) -> Vec<GuiAction> {
+    pub(super) fn render_map(&mut self, ui: &mut egui::Ui) -> Vec<GuiAction> {
         use walkers::{Map, Position};
 
         let mut actions = Vec::new();
+        let ctx = ui.ctx().clone();
 
         // Detect current theme from egui context
         let is_dark_theme = ctx.global_style().visuals.dark_mode;
 
         // Initialize tiles via MapTileState
-        self.map_tiles.ensure_base_tiles(is_dark_theme, ctx);
+        self.map_tiles.ensure_base_tiles(is_dark_theme, &ctx);
         let any_city_labels = self.overlays.is_enabled(OverlayKind::CityLabels);
         if any_city_labels {
-            self.map_tiles.ensure_label_tiles(is_dark_theme, ctx);
+            self.map_tiles.ensure_label_tiles(is_dark_theme, &ctx);
         }
 
         // Take tiles out of self so they can be reborrowed per-pane in the loop.
@@ -35,7 +35,7 @@ impl super::Gui {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 let panel_rect = ui.max_rect();
 
                 self.detect_active_pane_click(ui.ctx(), panel_rect);
@@ -97,7 +97,7 @@ impl super::Gui {
                     // On Android, process double-tap-drag zoom only for the active pane
                     #[cfg(target_os = "android")]
                     if is_active {
-                        self.mobile.double_tap_detector.update(ctx, &mut map_memory, pane_rect);
+                        self.mobile.double_tap_detector.update(&ctx, &mut map_memory, pane_rect);
                     }
 
                     #[cfg(target_os = "android")]
@@ -112,7 +112,7 @@ impl super::Gui {
                     // On Android, detect long-press for radar value tooltip
                     #[cfg(target_os = "android")]
                     let long_press_pos = if is_active && !is_zoom_dragging {
-                        self.mobile.long_press_detector.update(ctx)
+                        self.mobile.long_press_detector.update(&ctx)
                     } else {
                         None
                     };
@@ -220,7 +220,7 @@ impl super::Gui {
     }
 
     /// Detect which pane was clicked and make it the active pane.
-    fn detect_active_pane_click(&mut self, ctx: &Context, panel_rect: egui::Rect) {
+    fn detect_active_pane_click(&mut self, ctx: &egui::Context, panel_rect: egui::Rect) {
         if self.pane_layout.pane_count <= 1 {
             return;
         }
@@ -243,7 +243,7 @@ impl super::Gui {
 
     /// Dismiss overlay popups when clicking outside them.
     /// Returns `true` when no popup is open (pointer is available for map interaction).
-    fn dismiss_overlay_popups(&mut self, ctx: &Context) -> bool {
+    fn dismiss_overlay_popups(&mut self, ctx: &egui::Context) -> bool {
         let pointer_available = self.overlays.selected_overlays.is_empty();
         if !pointer_available {
             let click_pos = ctx.input(|i| {

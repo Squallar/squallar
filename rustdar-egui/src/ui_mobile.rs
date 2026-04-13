@@ -325,23 +325,25 @@ impl LongPressDetector {
 }
 
 impl super::Gui {
-    pub(super) fn render_mobile_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<GuiAction>) {
+    pub(super) fn render_mobile_ui(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
+        let ctx = ui.ctx().clone();
+
         // Time dialog (shared between platforms)
-        if let Some(a) = self.render_time_dialog(ctx) {
+        if let Some(a) = self.render_time_dialog(&ctx) {
             actions.push(a);
         }
 
         // Mobile status bar (simplified)
-        if let Some(a) = self.render_mobile_status_bar(ctx) {
+        if let Some(a) = self.render_mobile_status_bar(ui) {
             actions.push(a);
         }
 
         // Collapsible layers panel
-        let layer_actions = self.render_mobile_layers_panel(ctx);
+        let layer_actions = self.render_mobile_layers_panel(ui);
         actions.extend(layer_actions);
 
         // Map in central panel
-        let map_actions = self.render_map(ctx);
+        let map_actions = self.render_map(ui);
         actions.extend(map_actions);
 
         // Floating hamburger button (uses Area so it participates in focus ordering
@@ -352,7 +354,7 @@ impl super::Gui {
                 .order(egui::Order::Middle)
                 .fixed_pos(egui::pos2(12.0, 48.0 + top_inset))
                 .interactable(true)
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     let (rect, response) = ui.allocate_exact_size(
                         egui::vec2(48.0, 48.0),
                         egui::Sense::click(),
@@ -377,17 +379,17 @@ impl super::Gui {
         }
 
         // Overlay detail pager popup (rendered after hamburger so it floats on top)
-        self.render_overlay_popup(ctx);
+        self.render_overlay_popup(&ctx);
     }
 
-    fn render_mobile_status_bar(&mut self, ctx: &egui::Context) -> Option<GuiAction> {
+    fn render_mobile_status_bar(&mut self, ui: &mut egui::Ui) -> Option<GuiAction> {
         let mut action = None;
         let top_inset = self.safe_area_insets.0;
 
         egui::Panel::top("mobile_status_bar")
-            .min_height(32.0 + top_inset)
+            .min_size(32.0 + top_inset)
             .show_separator_line(true)
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 // Add spacing to push content below the status bar cutout
                 if top_inset > 0.0 {
                     ui.add_space(top_inset);
@@ -436,7 +438,7 @@ impl super::Gui {
     }
 
     /// Collapsible layers/controls panel for mobile (replaces bottom toolbar).
-    fn render_mobile_layers_panel(&mut self, ctx: &egui::Context) -> Vec<GuiAction> {
+    fn render_mobile_layers_panel(&mut self, ui: &mut egui::Ui) -> Vec<GuiAction> {
         let mut actions = Vec::new();
         if !self.mobile.show_menu {
             return actions;
@@ -450,7 +452,7 @@ impl super::Gui {
         egui::Panel::left("mobile_layers_panel")
             .default_size(260.0)
             .resizable(false)
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 // Safe-area top padding
                 if top_inset > 0.0 {
                     ui.add_space(top_inset);

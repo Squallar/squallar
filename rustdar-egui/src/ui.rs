@@ -291,10 +291,19 @@ impl Gui {
 
         self.check_auto_polls(&mut actions);
 
+        // Create a root Ui so panel methods can use show_inside().
+        let mut root_ui = egui::Ui::new(
+            ctx.clone(),
+            egui::Id::new("rustdar_root"),
+            egui::UiBuilder::new()
+                .layer_id(egui::LayerId::background())
+                .max_rect(ctx.content_rect()),
+        );
+
         #[cfg(target_os = "android")]
-        self.render_mobile_ui(ctx, &mut actions);
+        self.render_mobile_ui(&mut root_ui, &mut actions);
         #[cfg(not(target_os = "android"))]
-        self.render_desktop_ui(ctx, &mut actions);
+        self.render_desktop_ui(&mut root_ui, &mut actions);
 
         self.render_settings(ctx);
 

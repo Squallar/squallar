@@ -5,7 +5,6 @@ use crate::actions::GuiAction;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use crate::pane::PaneState;
 
-use egui::Context;
 use rustdar_radar::types::ScanInfo;
 
 fn render_auto_poll_status(
@@ -72,8 +71,8 @@ fn render_error_display(ui: &mut egui::Ui, error_message: &mut Option<String>) {
 }
 
 impl super::Gui {
-    pub(super) fn render_menu_bar(&mut self, ctx: &Context, action: &mut Option<GuiAction>) {
-        egui::Panel::top("menubar_container").show(ctx, |ui| {
+    pub(super) fn render_menu_bar(&mut self, ui: &mut egui::Ui, action: &mut Option<GuiAction>) {
+        egui::Panel::top("menubar_container").show_inside(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Exit").clicked() {
@@ -105,12 +104,12 @@ impl super::Gui {
         });
     }
 
-    pub(super) fn render_status_bar(&mut self, ctx: &Context) -> Option<GuiAction> {
+    pub(super) fn render_status_bar(&mut self, ui: &mut egui::Ui) -> Option<GuiAction> {
         let mut action = None;
         
         egui::Panel::bottom("status_bar")
             .show_separator_line(true)
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
 
@@ -147,14 +146,14 @@ impl super::Gui {
     }
 
     /// Render the layers panel on the left side (desktop).
-    pub(super) fn render_layers_panel(&mut self, ctx: &Context) -> Vec<GuiAction> {
+    pub(super) fn render_layers_panel(&mut self, ui: &mut egui::Ui) -> Vec<GuiAction> {
         let mut actions = Vec::new();
         let mut pane = std::mem::take(&mut self.panes[self.active_pane]);
 
         egui::Panel::left("layers_panel")
             .default_size(170.0)
             .resizable(false)
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 ui.heading("Layers");
                 ui.separator();
 
@@ -169,33 +168,35 @@ impl super::Gui {
         actions
     }
 
-    pub(super) fn render_desktop_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<GuiAction>) {
+    pub(super) fn render_desktop_ui(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
+        let ctx = ui.ctx().clone();
+
         // Menu bar
         let mut action = None;
-        self.render_menu_bar(ctx, &mut action);
+        self.render_menu_bar(ui, &mut action);
         if let Some(a) = action {
             actions.push(a);
         }
 
         // Time dialog
-        if let Some(a) = self.render_time_dialog(ctx) {
+        if let Some(a) = self.render_time_dialog(&ctx) {
             actions.push(a);
         }
 
         // Bottom status bar - render first so it spans the full width
-        if let Some(a) = self.render_status_bar(ctx) {
+        if let Some(a) = self.render_status_bar(ui) {
             actions.push(a);
         }
 
         // Left panel for layer controls (replaces old right radar display panel)
-        let layer_actions = self.render_layers_panel(ctx);
+        let layer_actions = self.render_layers_panel(ui);
         actions.extend(layer_actions);
 
         // Map in central panel
-        let map_actions = self.render_map(ctx);
+        let map_actions = self.render_map(ui);
         actions.extend(map_actions);
 
         // Overlay detail pager popup (rendered after map so it floats on top)
-        self.render_overlay_popup(ctx);
+        self.render_overlay_popup(&ctx);
     }
 }
