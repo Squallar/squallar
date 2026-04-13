@@ -1,0 +1,16 @@
+[package]
+name = "rustdar-gps"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["serial"]
+serial = ["dep:serialport"]
+
+[dependencies]
+chrono = "=0.4.44"
+log = "=0.4.29"
+nmea = "=0.6.0"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.149"
+serialport = { version = "=4.9.0", optional = true }

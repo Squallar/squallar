@@ -5,9 +5,11 @@ pub trait PlatformBridge {
     /// a change is detected, `None` otherwise.
     fn poll_theme(&mut self) -> Option<bool>;
 
-    /// Poll for GPS location updates. Returns the latest `(lat, lon)` if
-    /// available.
-    fn poll_location(&mut self) -> Option<(f64, f64)>;
+    /// Poll for GPS fix updates. Returns the latest [`GpsFix`] if available.
+    fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix>;
+
+    /// Poll for compass heading updates. Returns degrees (0–360) if available.
+    fn poll_heading(&mut self) -> Option<f32>;
 
     /// Query system bar insets (top, bottom, left, right) in logical pixels.
     fn query_insets(&self) -> Option<(f32, f32, f32, f32)>;
@@ -38,11 +40,23 @@ pub trait PlatformBridge {
     /// `std::process::exit` (Android), `false` for normal event-loop exit.
     fn needs_process_exit(&self) -> bool;
 
-    /// Set a receiver for GPS location updates (Android only, no-op on desktop).
-    fn set_location_receiver(&mut self, _receiver: std::sync::mpsc::Receiver<(f64, f64)>) {}
+    /// Set a receiver for GPS fix updates (Android only, no-op on desktop).
+    fn set_gps_fix_receiver(&mut self, _receiver: std::sync::mpsc::Receiver<rustdar_gps::GpsFix>) {}
+
+    /// Set a receiver for compass heading updates (Android only, no-op on desktop).
+    fn set_heading_receiver(&mut self, _receiver: std::sync::mpsc::Receiver<f32>) {}
 
     /// Set a callback that queries system bar insets (Android only, no-op on desktop).
     fn set_insets_querier(&mut self, _querier: fn() -> (f32, f32, f32, f32)) {}
+
+    /// Start the desktop serial GPS reader (no-op on Android).
+    fn start_gps(&mut self, _config: &rustdar_gps::GpsConfig) {}
+
+    /// Stop the desktop serial GPS reader (no-op on Android).
+    fn stop_gps(&mut self) {}
+
+    /// Whether the desktop serial GPS reader is currently running.
+    fn gps_active(&self) -> bool { false }
 }
 
 // ── Desktop implementation ──────────────────────────────────────────────
@@ -52,6 +66,10 @@ pub struct DesktopPlatform {
     back_handler: Option<fn()>,
     zone_cache_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
+    /// Active serial GPS reader (dropped to stop).
+    gps_reader: Option<rustdar_gps::SerialGpsReader>,
+    /// Receives GPS fixes from the serial reader thread.
+    gps_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_gps::GpsFix>>,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -68,6 +86,8 @@ impl DesktopPlatform {
             back_handler: None,
             zone_cache_dir: Self::default_zone_cache_dir(),
             config_dir: Self::default_config_dir(),
+            gps_reader: None,
+            gps_fix_receiver: None,
         }
     }
 
@@ -95,8 +115,17 @@ impl PlatformBridge for DesktopPlatform {
         None
     }
 
-    fn poll_location(&mut self) -> Option<(f64, f64)> {
-        None // No GPS on desktop
+    fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix> {
+        let receiver = self.gps_fix_receiver.as_ref()?;
+        let mut latest = None;
+        while let Ok(fix) = receiver.try_recv() {
+            latest = Some(fix);
+        }
+        latest
+    }
+
+    fn poll_heading(&mut self) -> Option<f32> {
+        None // No compass on desktop
     }
 
     fn query_insets(&self) -> Option<(f32, f32, f32, f32)> {
@@ -139,6 +168,30 @@ impl PlatformBridge for DesktopPlatform {
     fn needs_process_exit(&self) -> bool {
         false
     }
+
+    fn start_gps(&mut self, config: &rustdar_gps::GpsConfig) {
+        // Stop any existing reader first
+        self.stop_gps();
+        let (tx, rx) = std::sync::mpsc::channel();
+        if let Some(reader) = rustdar_gps::SerialGpsReader::start(config, tx) {
+            self.gps_reader = Some(reader);
+            self.gps_fix_receiver = Some(rx);
+            log::info!("Desktop serial GPS reader started");
+        } else {
+            log::warn!("No GPS port found — serial GPS not started");
+        }
+    }
+
+    fn stop_gps(&mut self) {
+        if self.gps_reader.take().is_some() {
+            log::info!("Desktop serial GPS reader stopped");
+        }
+        self.gps_fix_receiver = None;
+    }
+
+    fn gps_active(&self) -> bool {
+        self.gps_reader.is_some()
+    }
 }
 
 // ── Android implementation ──────────────────────────────────────────────
@@ -146,7 +199,8 @@ impl PlatformBridge for DesktopPlatform {
 #[cfg(target_os = "android")]
 pub struct AndroidPlatform {
     theme_receiver: std::sync::mpsc::Receiver<bool>,
-    location_receiver: Option<std::sync::mpsc::Receiver<(f64, f64)>>,
+    gps_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_gps::GpsFix>>,
+    heading_receiver: Option<std::sync::mpsc::Receiver<f32>>,
     insets_querier: Option<fn() -> (f32, f32, f32, f32)>,
     back_handler: Option<fn()>,
     zone_cache_dir: Option<std::path::PathBuf>,
@@ -176,7 +230,8 @@ impl AndroidPlatform {
 
         Self {
             theme_receiver,
-            location_receiver: None,
+            gps_fix_receiver: None,
+            heading_receiver: None,
             insets_querier: None,
             back_handler: None,
             zone_cache_dir: None,
@@ -195,11 +250,20 @@ impl PlatformBridge for AndroidPlatform {
         latest
     }
 
-    fn poll_location(&mut self) -> Option<(f64, f64)> {
-        let receiver = self.location_receiver.as_ref()?;
+    fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix> {
+        let receiver = self.gps_fix_receiver.as_ref()?;
         let mut latest = None;
-        while let Ok(loc) = receiver.try_recv() {
-            latest = Some(loc);
+        while let Ok(fix) = receiver.try_recv() {
+            latest = Some(fix);
+        }
+        latest
+    }
+
+    fn poll_heading(&mut self) -> Option<f32> {
+        let receiver = self.heading_receiver.as_ref()?;
+        let mut latest = None;
+        while let Ok(heading) = receiver.try_recv() {
+            latest = Some(heading);
         }
         latest
     }
@@ -245,8 +309,12 @@ impl PlatformBridge for AndroidPlatform {
         true
     }
 
-    fn set_location_receiver(&mut self, receiver: std::sync::mpsc::Receiver<(f64, f64)>) {
-        self.location_receiver = Some(receiver);
+    fn set_gps_fix_receiver(&mut self, receiver: std::sync::mpsc::Receiver<rustdar_gps::GpsFix>) {
+        self.gps_fix_receiver = Some(receiver);
+    }
+
+    fn set_heading_receiver(&mut self, receiver: std::sync::mpsc::Receiver<f32>) {
+        self.heading_receiver = Some(receiver);
     }
 
     fn set_insets_querier(&mut self, querier: fn() -> (f32, f32, f32, f32)) {

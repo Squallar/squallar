@@ -2,12 +2,15 @@ use rustdar_units::{
     DistanceUnit, HailSizeUnit, HeightUnit, PrecipRateUnit, SpeedUnit, TemperatureUnit,
     TimezonePreference, UserPreferences, UnitLabel,
 };
+use rustdar_gps::HeadingSource;
+use crate::actions::GuiAction;
 
 const IS_MOBILE: bool = cfg!(target_os = "android");
 
 impl super::Gui {
     /// Render the settings window if `show_settings` is true.
-    pub(super) fn render_settings(&mut self, ctx: &egui::Context) {
+    #[allow(unused_variables)]
+    pub(super) fn render_settings(&mut self, ctx: &egui::Context, actions: &mut Vec<GuiAction>) {
         if !self.show_settings {
             return;
         }
@@ -44,8 +47,99 @@ impl super::Gui {
                 ui.separator();
                 ui.add_space(4.0);
 
+                // --- GPS section (desktop only) ---
+                #[cfg(not(target_os = "android"))]
+                {
+                    ui.heading("GPS");
+                    ui.add_space(4.0);
+
+                    // Port selection
+                    ui.horizontal(|ui| {
+                        ui.label("Port:");
+                        let current_label = self.gps_config.port_path.as_deref().unwrap_or("Auto-detect");
+                        egui::ComboBox::from_id_salt("gps_port")
+                            .selected_text(current_label)
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_value(&mut self.gps_config.port_path, None, "Auto-detect").changed() {}
+                                for port_info in rustdar_gps::detect_gps_ports() {
+                                    let label = format!("{} ({})", port_info.port_name, port_info.description);
+                                    let val = Some(port_info.port_name.clone());
+                                    ui.selectable_value(&mut self.gps_config.port_path, val, label);
+                                }
+                            });
+                    });
+
+                    // Baud rate
+                    ui.horizontal(|ui| {
+                        ui.label("Baud:");
+                        let baud_label = if self.gps_config.auto_baud() {
+                            "Auto-detect".to_string()
+                        } else {
+                            self.gps_config.baud_rate.to_string()
+                        };
+                        egui::ComboBox::from_id_salt("gps_baud")
+                            .selected_text(baud_label)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.gps_config.baud_rate, 0, "Auto-detect");
+                                for &rate in &[4800u32, 9600, 38400, 115200] {
+                                    ui.selectable_value(&mut self.gps_config.baud_rate, rate, rate.to_string());
+                                }
+                            });
+                    });
+
+                    ui.add_space(4.0);
+
+                    // Start/stop button
+                    // Note: gps_active state is only meaningful on desktop
+                    if ui.button("Connect GPS").clicked() {
+                        actions.push(GuiAction::StartGps {
+                            config: self.gps_config.clone(),
+                        });
+                    }
+                    if ui.button("Disconnect GPS").clicked() {
+                        actions.push(GuiAction::StopGps);
+                    }
+
+                    ui.add_space(4.0);
+
+                    // Fix status
+                    if let Some(ref fix) = self.user_fix {
+                        ui.label(format!("Fix: {}", fix.fix_quality.label()));
+                        if let Some(sats) = fix.satellites {
+                            ui.label(format!("Sats: {}", sats));
+                        }
+                    } else {
+                        ui.label("No GPS fix");
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                }
+
+                // --- Heading source (all platforms) ---
+                ui.horizontal(|ui| {
+                    ui.label("Heading:");
+                    egui::ComboBox::from_id_salt("heading_source")
+                        .selected_text(self.gps_config.heading_source.label())
+                        .show_ui(ui, |ui| {
+                            for &src in HeadingSource::ALL {
+                                ui.selectable_value(
+                                    &mut self.gps_config.heading_source,
+                                    src,
+                                    src.label(),
+                                );
+                            }
+                        });
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+
                 if ui.button("Reset to defaults").clicked() {
                     self.preferences = UserPreferences::default();
+                    self.gps_config = rustdar_gps::GpsConfig::default();
                 }
             });
 

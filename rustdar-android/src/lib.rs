@@ -63,9 +63,9 @@ fn request_location_permission() {
 }
 
 /// Try to retrieve the device's last known GPS location via `LocationManager`.
-/// Returns `Some((lat, lon))` on success or `None` if unavailable.
+/// Returns a [`GpsFix`] on success or `None` if unavailable.
 #[cfg(target_os = "android")]
-fn get_last_known_location() -> Option<(f64, f64)> {
+fn get_last_known_location() -> Option<rustdar_gps::GpsFix> {
     use jni::objects::{JObject, JValue};
     use jni::JavaVM;
 
@@ -123,7 +123,57 @@ fn get_last_known_location() -> Option<(f64, f64)> {
         if lat.abs() < 0.001 && lon.abs() < 0.001 {
             continue;
         }
-        return Some((lat, lon));
+
+        // Extract extended fix data
+        let altitude_m = env
+            .call_method(&location, "getAltitude", "()D", &[])
+            .and_then(|v| v.d())
+            .ok()
+            .filter(|_| {
+                env.call_method(&location, "hasAltitude", "()Z", &[])
+                    .and_then(|v| v.z())
+                    .unwrap_or(false)
+            });
+
+        let speed_mps = env
+            .call_method(&location, "getSpeed", "()F", &[])
+            .and_then(|v| v.f())
+            .ok()
+            .filter(|_| {
+                env.call_method(&location, "hasSpeed", "()Z", &[])
+                    .and_then(|v| v.z())
+                    .unwrap_or(false)
+            })
+            .map(|s| s as f64);
+
+        let heading_deg = env
+            .call_method(&location, "getBearing", "()F", &[])
+            .and_then(|v| v.f())
+            .ok()
+            .filter(|_| {
+                env.call_method(&location, "hasBearing", "()Z", &[])
+                    .and_then(|v| v.z())
+                    .unwrap_or(false)
+            })
+            .map(|b| b as f64);
+
+        let fix_quality = if *provider == "gps" {
+            rustdar_gps::FixQuality::Gps
+        } else {
+            rustdar_gps::FixQuality::Estimated
+        };
+
+        return Some(rustdar_gps::GpsFix {
+            latitude: lat,
+            longitude: lon,
+            altitude_m,
+            speed_mps,
+            heading_deg,
+            satellites: None, // Not available from getLastKnownLocation
+            fix_quality,
+            hdop: None,
+            timestamp: None,
+        });
     }
     None
 }
@@ -131,7 +181,7 @@ fn get_last_known_location() -> Option<(f64, f64)> {
 /// Start a background thread that polls GPS location and sends updates
 /// through the provided channel. Also handles permission requests.
 #[cfg(target_os = "android")]
-fn start_location_thread(sender: std::sync::mpsc::Sender<(f64, f64)>) {
+fn start_location_thread(sender: std::sync::mpsc::Sender<rustdar_gps::GpsFix>) {
     std::thread::spawn(move || {
         // Let the app fully initialise before doing JNI work
         std::thread::sleep(std::time::Duration::from_secs(3));
@@ -140,8 +190,8 @@ fn start_location_thread(sender: std::sync::mpsc::Sender<(f64, f64)>) {
 
         loop {
             if has_location_permission() {
-                if let Some((lat, lon)) = get_last_known_location() {
-                    if sender.send((lat, lon)).is_err() {
+                if let Some(fix) = get_last_known_location() {
+                    if sender.send(fix).is_err() {
                         break; // channel closed
                     }
                 }
@@ -305,6 +355,59 @@ pub fn move_task_to_back() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Compass heading via JNI (CompassHelper.java)
+// ---------------------------------------------------------------------------
+
+/// JClass for com.rustdar.CompassHelper, loaded once via PathClassLoader.
+#[cfg(target_os = "android")]
+static COMPASS_CLASS: std::sync::OnceLock<jni::objects::GlobalRef> = std::sync::OnceLock::new();
+
+/// Read the current compass heading from CompassHelper.getHeading().
+/// Returns `None` if the class wasn't loaded or no reading is available yet.
+#[cfg(target_os = "android")]
+fn get_compass_heading() -> Option<f32> {
+    use jni::JavaVM;
+
+    let global_ref = COMPASS_CLASS.get()?;
+    let ctx = ndk_context::android_context();
+    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) };
+    let Ok(vm) = vm else { return None };
+    let Ok(mut env) = vm.attach_current_thread() else { return None };
+
+    let cls = jni::objects::JClass::from(unsafe {
+        jni::objects::JObject::from_raw(global_ref.as_obj().as_raw())
+    });
+    let heading = env.call_static_method(cls, "getHeading", "()F", &[])
+        .ok()?
+        .f()
+        .ok()?;
+    if heading < 0.0 {
+        None // -1 means no reading yet
+    } else {
+        Some(heading)
+    }
+}
+
+/// Start a background thread that polls the compass heading every 200ms and
+/// sends updates through the provided channel.
+#[cfg(target_os = "android")]
+fn start_compass_thread(sender: std::sync::mpsc::Sender<f32>) {
+    std::thread::spawn(move || {
+        // Wait for CompassHelper to be initialized
+        std::thread::sleep(std::time::Duration::from_secs(4));
+
+        loop {
+            if let Some(heading) = get_compass_heading() {
+                if sender.send(heading).is_err() {
+                    break; // channel closed
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    });
+}
+
 /// Android main entry point
 /// 
 /// This function is called by the Android runtime when the app starts.
@@ -409,6 +512,41 @@ fn android_main(app: AndroidApp) {
                 }
             }
         }
+
+        // Register the CompassHelper for heading data.
+        {
+            let compass_name = env.new_string("com.rustdar.CompassHelper")
+                .expect("Failed to create CompassHelper class name");
+            match env.call_method(
+                &dex_loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[jni::objects::JValue::from(&compass_name)],
+            ) {
+                Ok(cls_val) => {
+                    let cls_obj = cls_val.l().expect("loadClass did not return object");
+                    let cls = jni::objects::JClass::from(cls_obj);
+                    let cls_global = env.new_global_ref(&cls);
+                    match env.call_static_method(
+                        cls,
+                        "register",
+                        "(Landroid/app/Activity;)V",
+                        &[jni::objects::JValue::from(&context)],
+                    ) {
+                        Ok(_) => {
+                            log::info!("CompassHelper registered");
+                            if let Ok(global) = cls_global {
+                                let _ = COMPASS_CLASS.set(global);
+                            }
+                        }
+                        Err(e) => log::warn!("CompassHelper.register() failed: {:?}", e),
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Could not load CompassHelper class: {:?}", e);
+                }
+            }
+        }
     }
 
     // Derive the Android cache directory for zone geometry caching.
@@ -461,7 +599,12 @@ fn android_main(app: AndroidApp) {
     // Start GPS location polling thread and wire it to the app
     let (location_sender, location_receiver) = std::sync::mpsc::channel();
     start_location_thread(location_sender);
-    platform_app.set_location_receiver(location_receiver);
+    platform_app.set_gps_fix_receiver(location_receiver);
+
+    // Start compass heading thread and wire it to the app
+    let (heading_sender, heading_receiver) = std::sync::mpsc::channel();
+    start_compass_thread(heading_sender);
+    platform_app.set_heading_receiver(heading_receiver);
     
     if let Err(e) = event_loop.run_app(&mut platform_app) {
         log::error!("Application error: {}", e);

@@ -7,6 +7,7 @@ edition = "2024"
 rustdar-radar = { path = "../rustdar-radar" }
 rustdar-overlays = { path = "../rustdar-overlays" }
 rustdar-units = { path = "../rustdar-units" }
+rustdar-gps = { path = "../rustdar-gps", default-features = false }
 chrono = "=0.4.44"
 egui = "=0.34.1"
 log = "=0.4.29"

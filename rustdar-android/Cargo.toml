@@ -53,5 +53,6 @@ log = "=0.4.29"
 jni = "=0.21.1"
 ndk-context = "=0.1.1"
 rustls-platform-verifier = "=0.6.2"
+rustdar-gps = { path = "../rustdar-gps" }
 # Force vendored OpenSSL for Android builds to avoid cross-compilation issues
 openssl-sys = { version = "=0.9.113", features = ["vendored"] }

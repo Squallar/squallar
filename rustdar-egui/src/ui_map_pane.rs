@@ -23,6 +23,8 @@ pub(super) struct PaneRenderCtx<'a> {
     pub pane: &'a mut PaneState,
     pub overlays: &'a mut OverlayRegistry,
     pub user_location: Option<(f64, f64)>,
+    pub user_heading: Option<f32>,
+    pub user_fix: Option<rustdar_gps::GpsFix>,
     pub label_tiles: &'a mut Option<HttpTiles>,
     pub actions: &'a mut Vec<GuiAction>,
     pub pane_rect: egui::Rect,
@@ -139,7 +141,7 @@ pub(super) fn render_pane_map_content(
                 // User location blue dot
                 OverlayKind::UserLocation => {
                     if let Some((user_lat, user_lon)) = ctx.user_location {
-                        render_user_location(ui, projector, user_lat, user_lon);
+                        render_user_location(ui, projector, user_lat, user_lon, ctx.user_heading, ctx.user_fix.as_ref());
                     }
                 }
                 // Color scale legend (screen-space HUD).
@@ -489,34 +491,100 @@ fn handle_radar_site_interactions(
     }
 }
 
-/// Draw user location blue dot indicator.
+/// Draw user location blue dot indicator with optional heading wedge and hover popup.
 fn render_user_location(
     ui: &egui::Ui,
     projector: &walkers::Projector,
     user_lat: f64,
     user_lon: f64,
+    heading: Option<f32>,
+    fix: Option<&rustdar_gps::GpsFix>,
 ) {
     let user_screen = projector
         .project(walkers::lat_lon(user_lat, user_lon))
         .to_pos2();
 
     let screen_rect = ui.max_rect();
-    if screen_rect.expand(50.0).contains(user_screen) {
-        ui.painter().circle_filled(
-            user_screen,
-            14.0,
-            egui::Color32::from_rgba_unmultiplied(30, 130, 255, 40),
-        );
-        ui.painter().circle_stroke(
-            user_screen,
-            7.0,
-            egui::Stroke::new(2.5, egui::Color32::WHITE),
-        );
-        ui.painter().circle_filled(
-            user_screen,
-            7.0,
-            egui::Color32::from_rgb(30, 130, 255),
-        );
+    if !screen_rect.expand(50.0).contains(user_screen) {
+        return;
+    }
+
+    let blue = egui::Color32::from_rgb(30, 130, 255);
+
+    // Draw heading wedge behind the dot if a heading is available
+    if let Some(heading_deg) = heading {
+        let wedge_radius = 28.0;
+        let half_angle = 22.5_f32.to_radians(); // 45° total wedge
+        let center_rad = (heading_deg - 90.0).to_radians(); // egui: 0° = right
+
+        let num_segments = 16;
+        let mut points = Vec::with_capacity(num_segments + 2);
+        points.push(user_screen);
+        for i in 0..=num_segments {
+            let t = i as f32 / num_segments as f32;
+            let angle = center_rad - half_angle + t * 2.0 * half_angle;
+            points.push(egui::pos2(
+                user_screen.x + wedge_radius * angle.cos(),
+                user_screen.y + wedge_radius * angle.sin(),
+            ));
+        }
+
+        let wedge_color = egui::Color32::from_rgba_unmultiplied(30, 130, 255, 60);
+        let wedge_stroke = egui::Color32::from_rgba_unmultiplied(30, 130, 255, 100);
+        ui.painter().add(egui::Shape::convex_polygon(
+            points,
+            wedge_color,
+            egui::Stroke::new(1.0, wedge_stroke),
+        ));
+    }
+
+    // Blue dot (same as before)
+    ui.painter().circle_filled(
+        user_screen,
+        14.0,
+        egui::Color32::from_rgba_unmultiplied(30, 130, 255, 40),
+    );
+    ui.painter().circle_stroke(
+        user_screen,
+        7.0,
+        egui::Stroke::new(2.5, egui::Color32::WHITE),
+    );
+    ui.painter().circle_filled(user_screen, 7.0, blue);
+
+    // Hover/tap popup with fix details
+    if let Some(fix) = fix {
+        let dot_rect = egui::Rect::from_center_size(user_screen, egui::vec2(28.0, 28.0));
+        if let Some(hover_pos) = ui.ctx().pointer_hover_pos() {
+            if dot_rect.contains(hover_pos) {
+                egui::Tooltip::always_open(
+                    ui.ctx().clone(),
+                    ui.layer_id(),
+                    egui::Id::new("gps_fix_tooltip"),
+                    egui::PopupAnchor::Pointer,
+                )
+                .show(|tooltip_ui| {
+                        tooltip_ui.label(format!("Lat: {:.5}°  Lon: {:.5}°", fix.latitude, fix.longitude));
+                        if let Some(alt) = fix.altitude_m {
+                            tooltip_ui.label(format!("Alt: {:.0} m", alt));
+                        }
+                        if let Some(speed) = fix.speed_mps {
+                            let speed_kts = speed * 1.94384;
+                            tooltip_ui.label(format!("Speed: {:.1} m/s ({:.1} kts)", speed, speed_kts));
+                        }
+                        if let Some(hdg) = fix.heading_deg {
+                            tooltip_ui.label(format!("Course: {:.0}°", hdg));
+                        }
+                        if let Some(sats) = fix.satellites {
+                            tooltip_ui.label(format!("Sats: {}", sats));
+                        }
+                        tooltip_ui.label(format!("Fix: {}", fix.fix_quality.label()));
+                        if let Some(hdop) = fix.hdop {
+                            tooltip_ui.label(format!("HDOP: {:.1}", hdop));
+                        }
+                    },
+                );
+            }
+        }
     }
 }
 

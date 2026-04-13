@@ -87,8 +87,14 @@ impl super::Gui {
                         Position::new(-98.5795, 39.8283) // Geographic center of contiguous USA
                     };
 
-                    // Clone user location for use in closure
-                    let user_location = self.user_location;
+                    // Clone user location and heading for use in closure
+                    let user_location = self.user_fix.as_ref().map(|f| (f.latitude, f.longitude));
+                    let user_heading = self.gps_config.heading_source.effective_heading(
+                        self.user_heading,
+                        self.user_fix.as_ref().and_then(|f| f.heading_deg),
+                        self.user_fix.as_ref().and_then(|f| f.speed_mps),
+                    );
+                    let user_fix = self.user_fix.clone();
 
                     // Take map_memory out so Map::new borrows it independently
                     // of the pane fields used in the render closure.
@@ -167,6 +173,8 @@ impl super::Gui {
                                 pane: &mut pane,
                                 overlays: &mut self.overlays,
                                 user_location,
+                                user_heading,
+                                user_fix: user_fix.clone(),
                                 label_tiles: &mut label_tiles,
                                 actions: &mut actions,
                                 pane_rect,

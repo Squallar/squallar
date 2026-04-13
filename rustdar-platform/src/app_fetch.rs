@@ -148,6 +148,12 @@ impl super::App {
             GuiAction::JumpToLive { pane_idx } => {
                 self.handle_jump_to_live(pane_idx);
             }
+            GuiAction::StartGps { config } => {
+                self.platform.start_gps(&config);
+            }
+            GuiAction::StopGps => {
+                self.platform.stop_gps();
+            }
         }
     }
 

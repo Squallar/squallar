@@ -85,6 +85,9 @@ struct UiConfig {
     /// Handler-owned config state (overlay kind name → serialized state).
     #[serde(default)]
     overlay_states: serde_json::Map<String, serde_json::Value>,
+    /// GPS configuration (serial port, baud, heading source).
+    #[serde(default)]
+    gps_config: rustdar_gps::GpsConfig,
 }
 
 impl Default for UiConfig {
@@ -102,6 +105,7 @@ impl Default for UiConfig {
             panes: vec![PaneConfig::default()],
             preferences: UserPreferences::default(),
             overlay_states: serde_json::Map::new(),
+            gps_config: rustdar_gps::GpsConfig::default(),
         }
     }
 }
@@ -144,6 +148,7 @@ impl super::Gui {
             panes: pane_configs,
             preferences: self.preferences.clone(),
             overlay_states: self.overlays.serialize_handler_states(),
+            gps_config: self.gps_config.clone(),
         };
         match serde_json::to_string_pretty(&config) {
             Ok(json) => {
@@ -201,6 +206,7 @@ impl super::Gui {
         self.loop_lookback_secs = config.loop_lookback_secs;
         self.loop_speed_fps = config.loop_speed_fps;
         self.preferences = config.preferences;
+        self.gps_config = config.gps_config;
 
         // Restore per-pane state.
         // Migrate legacy per-pane Radar toggle from old `layers` map to the

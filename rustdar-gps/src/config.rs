@@ -1,0 +1,91 @@
+use serde::{Deserialize, Serialize};
+
+/// How the effective heading (for the directional wedge) is determined
+/// when both compass and GPS bearing data are available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum HeadingSource {
+    /// Use GPS bearing when moving (>~5 mph), compass when stationary.
+    #[default]
+    Auto,
+    /// Use the device compass sensor exclusively.
+    CompassOnly,
+    /// Use GPS course-over-ground bearing exclusively.
+    GpsOnly,
+}
+
+impl HeadingSource {
+    pub const ALL: &[HeadingSource] = &[
+        HeadingSource::Auto,
+        HeadingSource::CompassOnly,
+        HeadingSource::GpsOnly,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            HeadingSource::Auto => "Auto",
+            HeadingSource::CompassOnly => "Compass only",
+            HeadingSource::GpsOnly => "GPS only",
+        }
+    }
+
+    /// Compute the effective heading from compass and GPS bearing inputs.
+    ///
+    /// - `compass_heading`: degrees from device compass sensor (0–360).
+    /// - `gps_bearing`: degrees course-over-ground from GPS (0–360).
+    /// - `speed_mps`: current ground speed in m/s from GPS.
+    pub fn effective_heading(
+        self,
+        compass_heading: Option<f32>,
+        gps_bearing: Option<f64>,
+        speed_mps: Option<f64>,
+    ) -> Option<f32> {
+        match self {
+            HeadingSource::Auto => {
+                // Use GPS bearing when moving faster than ~5 mph (2.2 m/s)
+                let moving = speed_mps.is_some_and(|s| s > 2.2);
+                if moving {
+                    if let Some(bearing) = gps_bearing {
+                        return Some(bearing as f32);
+                    }
+                }
+                compass_heading
+            }
+            HeadingSource::CompassOnly => compass_heading,
+            HeadingSource::GpsOnly => gps_bearing.map(|b| b as f32),
+        }
+    }
+}
+
+/// Configuration for GPS serial port connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GpsConfig {
+    /// Serial port path. `None` means auto-detect.
+    pub port_path: Option<String>,
+    /// Baud rate. 0 means auto-detect.
+    pub baud_rate: u32,
+    /// How the directional heading is determined.
+    pub heading_source: HeadingSource,
+}
+
+impl Default for GpsConfig {
+    fn default() -> Self {
+        Self {
+            port_path: None,
+            baud_rate: 0,
+            heading_source: HeadingSource::default(),
+        }
+    }
+}
+
+impl GpsConfig {
+    /// Whether baud rate should be auto-detected.
+    pub fn auto_baud(&self) -> bool {
+        self.baud_rate == 0
+    }
+
+    /// Whether the port should be auto-detected.
+    pub fn auto_port(&self) -> bool {
+        self.port_path.is_none()
+    }
+}

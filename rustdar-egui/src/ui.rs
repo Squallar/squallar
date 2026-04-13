@@ -113,8 +113,10 @@ pub struct Gui {
     initial_zoom_set: bool,
     // --- Map tiles (shared across panes) ---
     map_tiles: MapTileState,
-    // User's GPS location for blue dot indicator (lat, lon)
-    user_location: Option<(f64, f64)>,
+    // User's GPS fix (full data from GPS receiver or Android LocationManager)
+    user_fix: Option<rustdar_gps::GpsFix>,
+    // Compass heading in degrees (0–360), from device compass sensor
+    user_heading: Option<f32>,
     // Overlay data (SPC outlooks, NWS alerts, SPC discussions)
     pub overlays: OverlayRegistry,
     // Multi-pane state
@@ -137,6 +139,8 @@ pub struct Gui {
     pub preferences: UserPreferences,
     /// Whether the settings panel is open.
     pub show_settings: bool,
+    /// GPS configuration (port, baud, heading source).
+    pub gps_config: rustdar_gps::GpsConfig,
 }
 
 impl Default for Gui {
@@ -268,7 +272,8 @@ impl Gui {
             },
             initial_zoom_set: false,
             map_tiles: MapTileState::default(),
-            user_location: None,
+            user_fix: None,
+            user_heading: None,
             overlays: OverlayRegistry::default(),
             panes: vec![PaneState::new()],
             active_pane: 0,
@@ -282,6 +287,7 @@ impl Gui {
             safe_area_insets: (0.0, 0.0, 0.0, 0.0),
             preferences: UserPreferences::default(),
             show_settings: false,
+            gps_config: rustdar_gps::GpsConfig::default(),
         }
     }
 
@@ -305,7 +311,7 @@ impl Gui {
         #[cfg(not(target_os = "android"))]
         self.render_desktop_ui(&mut root_ui, &mut actions);
 
-        self.render_settings(ctx);
+        self.render_settings(ctx, &mut actions);
 
         actions
     }
@@ -1029,8 +1035,12 @@ impl Gui {
         self.safe_area_insets = (top, bottom, left, right);
     }
 
-    pub fn set_user_location(&mut self, lat: f64, lon: f64) {
-        self.user_location = Some((lat, lon));
+    pub fn set_gps_fix(&mut self, fix: rustdar_gps::GpsFix) {
+        self.user_fix = Some(fix);
+    }
+
+    pub fn set_user_heading(&mut self, heading: f32) {
+        self.user_heading = Some(heading);
     }
 
     /// Whether the active pane is showing the most recent (live) scan.

@@ -81,6 +81,12 @@ pub enum GuiAction {
     JumpToLive {
         pane_idx: usize,
     },
+    /// Start the desktop serial GPS reader with the given config.
+    StartGps {
+        config: rustdar_gps::GpsConfig,
+    },
+    /// Stop the desktop serial GPS reader.
+    StopGps,
 }
 
 impl std::fmt::Display for GuiAction {
@@ -132,6 +138,12 @@ impl std::fmt::Display for GuiAction {
             }
             GuiAction::JumpToLive { pane_idx } => {
                 write!(f, "Jump to live for pane {}", pane_idx)
+            }
+            GuiAction::StartGps { .. } => {
+                write!(f, "Start GPS")
+            }
+            GuiAction::StopGps => {
+                write!(f, "Stop GPS")
             }
         }
     }

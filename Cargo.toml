@@ -8,6 +8,7 @@ members = [
     "rustdar-radar",
     "rustdar-overlays",
     "rustdar-units",
+    "rustdar-gps",
     "nexrad-level3",
 ]
 

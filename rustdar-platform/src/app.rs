@@ -187,7 +187,7 @@ impl App {
         }
     }
 
-    /// Poll for platform-specific theme and location changes.
+    /// Poll for platform-specific theme, GPS fix, and compass heading changes.
     fn poll_platform_state(&mut self) {
         if let Some(new_theme) = self.platform.poll_theme()
             && self.cached_dark_theme != Some(new_theme) {
@@ -195,8 +195,11 @@ impl App {
                 self.gui.bump_all_radar_sites_gen();
                 notify_redraw(&self.window);
             }
-        if let Some((lat, lon)) = self.platform.poll_location() {
-            self.gui.set_user_location(lat, lon);
+        if let Some(fix) = self.platform.poll_gps_fix() {
+            self.gui.set_gps_fix(fix);
+        }
+        if let Some(heading) = self.platform.poll_heading() {
+            self.gui.set_user_heading(heading);
         }
     }
 
@@ -386,10 +389,16 @@ impl App {
         }
     }
 
-    /// Set a receiver for GPS location updates (Android only).
+    /// Set a receiver for GPS fix updates (Android only).
     #[cfg(target_os = "android")]
-    pub fn set_location_receiver(&mut self, receiver: std::sync::mpsc::Receiver<(f64, f64)>) {
-        self.platform.set_location_receiver(receiver);
+    pub fn set_gps_fix_receiver(&mut self, receiver: std::sync::mpsc::Receiver<rustdar_gps::GpsFix>) {
+        self.platform.set_gps_fix_receiver(receiver);
+    }
+
+    /// Set a receiver for compass heading updates (Android only).
+    #[cfg(target_os = "android")]
+    pub fn set_heading_receiver(&mut self, receiver: std::sync::mpsc::Receiver<f32>) {
+        self.platform.set_heading_receiver(receiver);
     }
 
     /// Set safe area insets in logical pixels (top, bottom, left, right).
