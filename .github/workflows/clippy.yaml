@@ -46,7 +46,7 @@ jobs:
         with:
           commit_message: "chore: Apply clippy fixes"
           commit_user_name: usa-reddragon-auto-commit[bot]
-          commit_user_email: 198527162+github-actions[bot]@users.noreply.github.com
-          commit_author: "usa-reddragon-auto-commit[bot] <198527162+github-actions[bot]@users.noreply.github.com>"
+          commit_user_email: 234130638+github-actions[bot]@users.noreply.github.com
+          commit_author: "usa-reddragon-auto-commit[bot] <234130638+github-actions[bot]@users.noreply.github.com>"
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features
