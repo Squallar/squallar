@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 chrono = "=0.4.44"
-log = "=0.4.28"
+log = "=0.4.29"
 rustdar-units = { path = "../rustdar-units" }
 serde = { version = "=1.0.228", features = ["derive"] }
 nexrad-data = { version = "=1.0.0-rc.7", features = ["aws"] }
