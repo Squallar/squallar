@@ -121,8 +121,8 @@ impl super::App {
                 if other_idx == origin_pane {
                     continue;
                 }
-                let other_site = self.gui.pane(other_idx).map(|p| p.site.clone()).unwrap_or_default();
-                if other_site != origin_site {
+                let matches_site = self.gui.pane(other_idx).map_or(false, |p| p.site == origin_site);
+                if !matches_site {
                     continue;
                 }
                 let Some((other_product, other_elevation)) = self.gui.get_rendering_params_for_pane(other_idx) else {
