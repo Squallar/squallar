@@ -11,6 +11,7 @@ const SETTINGS_POPUP_MIN_WIDTH_MOBILE: f32 = 250.0;
 const SETTINGS_POPUP_WIDTH_DESKTOP: f32 = 340.0;
 const SETTINGS_SMALL_SPACING: f32 = 4.0;
 const SETTINGS_LARGE_SPACING: f32 = 8.0;
+#[cfg(not(target_os = "android"))]
 const GPS_BAUD_RATES: &[u32] = &[4800, 9600, 38400, 115200];
 
 impl super::Gui {
