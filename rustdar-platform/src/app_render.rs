@@ -401,13 +401,19 @@ impl super::App {
                         }
                 }
             } else if pane_idx < self.render.pane_render.len() {
-                // No rendering params for this pane, clear its radar overlay texture
-                if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                    let cache = pane.overlay_cache_mut(
-                        rustdar_overlays::render::overlay_state::OverlayKind::Radar,
-                    );
-                    if let Some(old) = cache.current.take() {
-                        self.old_textures.push(old.texture);
+                // Only clear the radar texture if no scan data is loaded for this pane.
+                // When scan_info exists but get_rendering_params returns None, the pane
+                // is a Level III product waiting for elevation data — keep the old texture
+                // visible until the new render replaces it.
+                let has_scan = self.gui.pane(pane_idx).is_some_and(|p| p.scan_info.is_some());
+                if !has_scan {
+                    if let Some(pane) = self.gui.pane_mut(pane_idx) {
+                        let cache = pane.overlay_cache_mut(
+                            rustdar_overlays::render::overlay_state::OverlayKind::Radar,
+                        );
+                        if let Some(old) = cache.current.take() {
+                            self.old_textures.push(old.texture);
+                        }
                     }
                 }
                 self.render.pane_render[pane_idx].last_rendered = None;

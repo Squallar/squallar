@@ -117,6 +117,7 @@ impl RenderDispatcher {
                 prs.render_in_flight = false;
             }
         }
+        self.render_generation += 1;
         self.level3_data.retain(|(_prod, _tilt, s), _| s != site);
         self.render_cache.retain(|(s, _prod, _elev), _| s != site);
     }
