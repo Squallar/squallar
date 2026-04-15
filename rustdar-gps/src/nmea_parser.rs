@@ -1,3 +1,4 @@
+use crate::config::MIN_SPEED_FOR_BEARING_MPS;
 use crate::types::{FixQuality, GpsFix};
 use nmea::sentences::FixType;
 
@@ -49,7 +50,7 @@ impl NmeaState {
             .parser
             .true_course
             .map(|c| c as f64)
-            .filter(|_| speed_mps.is_some_and(|s| s > 0.5)); // bearing only meaningful when moving
+            .filter(|_| speed_mps.is_some_and(|s| s > MIN_SPEED_FOR_BEARING_MPS));
         let satellites = self.parser.num_of_fix_satellites.map(|n| n as u8);
         let hdop = self.parser.hdop;
 

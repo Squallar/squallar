@@ -1,5 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+/// Minimum ground speed (m/s) for GPS bearing to be considered meaningful.
+/// Below this, heading data is too noisy from a near-stationary receiver.
+pub(crate) const MIN_SPEED_FOR_BEARING_MPS: f64 = 0.5;
+
+/// Ground speed (m/s) above which the device is considered "moving" (~5 mph).
+/// Used by [`HeadingSource::Auto`] to switch from compass to GPS bearing.
+pub(crate) const MOVING_SPEED_THRESHOLD_MPS: f64 = 2.2;
+
 /// How the effective heading (for the directional wedge) is determined
 /// when both compass and GPS bearing data are available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -41,8 +49,7 @@ impl HeadingSource {
     ) -> Option<f32> {
         match self {
             HeadingSource::Auto => {
-                // Use GPS bearing when moving faster than ~5 mph (2.2 m/s)
-                let moving = speed_mps.is_some_and(|s| s > 2.2);
+                let moving = speed_mps.is_some_and(|s| s > MOVING_SPEED_THRESHOLD_MPS);
                 if moving {
                     if let Some(bearing) = gps_bearing {
                         return Some(bearing as f32);
