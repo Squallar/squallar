@@ -18,16 +18,35 @@ pub(super) struct OverlayRenderRequest {
     pub zoom: i32,
 }
 use rustdar_radar::scan;
+use std::future::Future;
+use std::sync::mpsc::Sender;
 
 impl super::App {
+
+    /// Spawn an async task on the Tokio runtime that sends its result through
+    /// a channel and requests a redraw when complete.
+    ///
+    /// The caller builds the full future (including error handling and result
+    /// construction). This helper handles cloning the window handle, spawning
+    /// on the runtime, sending the result, and calling `notify_redraw()`.
+    fn spawn_async_task<T: Send + 'static>(
+        &self,
+        sender: Sender<T>,
+        future: impl Future<Output = T> + Send + 'static,
+    ) {
+        let window = self.window.clone();
+        self.tokio_runtime.spawn(async move {
+            let result = future.await;
+            let _ = sender.send(result);
+            super::notify_redraw(&window);
+        });
+    }
 
     /// Spawn an async radar data fetch on the background runtime.
     /// Handles generation tracking, result sending, and redraw requests.
     pub fn spawn_fetch(&mut self, site: String, timestamp: NaiveDateTime) {
         let generation = self.render.next_fetch_generation(&site);
-        let window = self.window.clone();
-        let sender = self.channels.scan_sender.clone();
-        self.tokio_runtime.spawn(async move {
+        self.spawn_async_task(self.channels.scan_sender.clone(), async move {
             log::info!("Fetching {} @ {} UTC", site, timestamp);
             let msg = match scan::get_scan(&site, timestamp).await {
                 Ok(data) => {
@@ -40,8 +59,7 @@ impl super::App {
                     Err(err)
                 }
             };
-            let _ = sender.send(ScanResponse { generation, site, result: msg, is_auto_poll: false });
-            super::notify_redraw(&window);
+            ScanResponse { generation, site, result: msg, is_auto_poll: false }
         });
     }
 
@@ -56,9 +74,7 @@ impl super::App {
                 let site = site.to_string();
                 let dir_str = dir.to_string();
                 let product = *l3_product;
-                let sender = self.channels.level3_sender.clone();
-                let window = self.window.clone();
-                self.tokio_runtime.spawn(async move {
+                self.spawn_async_task(self.channels.level3_sender.clone(), async move {
                     log::info!("Fetching TGFTP {} for {}", dir_str, site);
                     let result = match scan::get_tgftp_product(&site, &dir_str).await {
                         Ok(msg) => {
@@ -70,8 +86,7 @@ impl super::App {
                             Err(format!("{e}"))
                         }
                     };
-                    let _ = sender.send(Level3Response { generation, product, tilt_code: dir_str, site, result });
-                    super::notify_redraw(&window);
+                    Level3Response { generation, product, tilt_code: dir_str, site, result }
                 });
             }
         }
@@ -184,6 +199,7 @@ impl super::App {
                 let window = self.window.clone();
                 let sender = self.channels.scan_sender.clone();
 
+                // Not using spawn_async_task: conditional send (only on new data)
                 self.tokio_runtime.spawn(async move {
                     match scan::check_and_fetch_latest(&site, &utc_timestamp.date(), current_scan_timestamp).await {
                         Ok(Some((data, timestamp))) => {
@@ -273,13 +289,10 @@ impl super::App {
         self.gui.overlays.set_fetching(kind, true);
 
         for task in tasks {
-            let sender = self.channels.overlay_fetch_sender.clone();
-            let window = self.window.clone();
             let task_kind = task.kind;
-            self.tokio_runtime.spawn(async move {
+            self.spawn_async_task(self.channels.overlay_fetch_sender.clone(), async move {
                 let data = task.future.await;
-                let _ = sender.send(OverlayFetchResult { kind: task_kind, data });
-                super::notify_redraw(&window);
+                OverlayFetchResult { kind: task_kind, data }
             });
         }
     }
@@ -455,27 +468,24 @@ impl super::App {
         let end = scan_timestamp;
         let start = end - chrono::Duration::seconds(lookback_secs as i64);
 
-        let sender = self.channels.loop_scan_list_sender.clone();
-        let window = self.window.clone();
-        self.tokio_runtime.spawn(async move {
+        self.spawn_async_task(self.channels.loop_scan_list_sender.clone(), async move {
             match scan::list_scans_for_range(&site, start, end).await {
                 Ok(scans) => {
                     log::info!("Loop: found {} scans in range for pane {}", scans.len(), pane_idx);
-                    let _ = sender.send(crate::channels::LoopScanListResponse {
+                    crate::channels::LoopScanListResponse {
                         pane_idx,
                         scans,
-                    });
+                    }
                 }
                 Err(e) => {
                     log::error!("Loop scan listing failed: {:?}", e);
                     // Send empty list so UI can show error state
-                    let _ = sender.send(crate::channels::LoopScanListResponse {
+                    crate::channels::LoopScanListResponse {
                         pane_idx,
                         scans: Vec::new(),
-                    });
+                    }
                 }
             }
-            super::notify_redraw(&window);
         });
     }
 
@@ -533,32 +543,28 @@ impl super::App {
         self.gui.set_fetching(true);
 
         let generation = self.render.next_fetch_generation(&site);
-        let sender = self.channels.scan_sender.clone();
-        let window = self.window.clone();
 
-        self.tokio_runtime.spawn(async move {
+        self.spawn_async_task(self.channels.scan_sender.clone(), async move {
             match scan::get_adjacent_scan(&site, current_utc, forward).await {
                 Ok((data, timestamp)) => {
-                    // If navigating forward and the result is the same as current, treat as live
-                    let _ = sender.send(crate::channels::ScanResponse {
+                    crate::channels::ScanResponse {
                         generation,
                         site: site.clone(),
                         result: Ok(crate::channels::ScanData { scan: data, site, timestamp }),
                         is_auto_poll: false,
-                    });
+                    }
                 }
                 Err(e) => {
                     let err = format!("Failed to find adjacent scan: {:?}", e);
                     log::error!("{}", err);
-                    let _ = sender.send(crate::channels::ScanResponse {
+                    crate::channels::ScanResponse {
                         generation,
                         site,
                         result: Err(err),
                         is_auto_poll: false,
-                    });
+                    }
                 }
             }
-            super::notify_redraw(&window);
         });
     }
 
@@ -606,9 +612,7 @@ impl super::App {
         timestamp: NaiveDateTime,
         identifier: nexrad_data::aws::archive::Identifier,
     ) {
-        let sender = self.channels.loop_scan_download_sender.clone();
-        let window = self.window.clone();
-        self.tokio_runtime.spawn(async move {
+        self.spawn_async_task(self.channels.loop_scan_download_sender.clone(), async move {
             let scan = match scan::download_scan(identifier).await {
                 Ok(scan_data) => Some(std::sync::Arc::new(scan_data)),
                 Err(e) => {
@@ -616,12 +620,11 @@ impl super::App {
                     None
                 }
             };
-            let _ = sender.send(crate::channels::LoopScanDownloadResponse {
+            crate::channels::LoopScanDownloadResponse {
                 pane_idx,
                 timestamp,
                 scan,
-            });
-            super::notify_redraw(&window);
+            }
         });
     }
 
