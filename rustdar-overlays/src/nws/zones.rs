@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::types::{GeoPolygon, HatchPattern, OverlayFeature};
 
@@ -8,6 +9,21 @@ use super::colors::alert_color;
 
 /// TTL for cached zone geometries (1 year in seconds).
 const CACHE_TTL_SECS: u64 = 365 * 24 * 3600;
+
+/// Guards first-per-session WARN log for zone cache write failures.
+static CACHE_WRITE_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Log a cache write failure at WARN level the first time, then DEBUG.
+fn log_cache_write_failure(msg: &str) {
+    if CACHE_WRITE_WARNED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        log::warn!("{msg} (further cache failures logged at debug level)");
+    } else {
+        log::debug!("{msg}");
+    }
+}
 
 /// A cached zone geometry entry, serialized to JSON on disk.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -256,7 +272,7 @@ async fn write_cached_zone(cache_dir: &Path, url: &str, polygons: &[GeoPolygon])
         return;
     };
     if let Err(e) = tokio::fs::create_dir_all(cache_dir).await {
-        log::debug!("Failed to create zone cache directory: {e}");
+        log_cache_write_failure(&format!("Failed to create zone cache directory: {e}"));
         return;
     }
     let entry = CachedZone {
@@ -267,9 +283,12 @@ async fn write_cached_zone(cache_dir: &Path, url: &str, polygons: &[GeoPolygon])
     match serde_json::to_string(&entry) {
         Ok(json) => {
             if let Err(e) = tokio::fs::write(&path, json).await {
-                log::debug!("Failed to write zone cache {}: {e}", path.display());
+                log_cache_write_failure(&format!(
+                    "Failed to write zone cache {}: {e}",
+                    path.display(),
+                ));
             }
         }
-        Err(e) => log::debug!("Failed to serialize zone cache: {e}"),
+        Err(e) => log_cache_write_failure(&format!("Failed to serialize zone cache: {e}")),
     }
 }
