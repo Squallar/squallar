@@ -529,8 +529,8 @@ fn render_user_location(
             ));
         }
 
-        let wedge_color = egui::Color32::from_rgba_unmultiplied(30, 130, 255, 60);
-        let wedge_stroke = egui::Color32::from_rgba_unmultiplied(30, 130, 255, 100);
+        let wedge_color = egui::Color32::from_rgba_unmultiplied(30, 130, 255, 140);
+        let wedge_stroke = egui::Color32::from_rgba_unmultiplied(30, 130, 255, 200);
         ui.painter().add(egui::Shape::convex_polygon(
             points,
             wedge_color,
