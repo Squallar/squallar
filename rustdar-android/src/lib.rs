@@ -186,7 +186,9 @@ fn get_last_known_location() -> Option<rustdar_gps::GpsFix> {
 /// through the provided channel. Also handles permission requests.
 #[cfg(target_os = "android")]
 fn start_location_thread(sender: std::sync::mpsc::Sender<rustdar_gps::GpsFix>) {
-    std::thread::spawn(move || {
+    std::thread::Builder::new()
+        .name("gps-location".into())
+        .spawn(move || {
         // Let the app fully initialise before doing JNI work
         std::thread::sleep(std::time::Duration::from_secs(3));
 
@@ -207,7 +209,7 @@ fn start_location_thread(sender: std::sync::mpsc::Sender<rustdar_gps::GpsFix>) {
 
             std::thread::sleep(std::time::Duration::from_secs(10));
         }
-    });
+    }).expect("failed to spawn gps-location thread");
 }
 
 /// Query the system window insets (status bar, navigation bar) in physical pixels.
@@ -414,7 +416,9 @@ fn get_compass_heading() -> Option<f32> {
 /// sends updates through the provided channel.
 #[cfg(target_os = "android")]
 fn start_compass_thread(sender: std::sync::mpsc::Sender<f32>) {
-    std::thread::spawn(move || {
+    std::thread::Builder::new()
+        .name("compass-heading".into())
+        .spawn(move || {
         // Wait for CompassHelper to be initialized
         std::thread::sleep(std::time::Duration::from_secs(4));
 
@@ -426,7 +430,7 @@ fn start_compass_thread(sender: std::sync::mpsc::Sender<f32>) {
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
-    });
+    }).expect("failed to spawn compass-heading thread");
 }
 
 /// Android main entry point

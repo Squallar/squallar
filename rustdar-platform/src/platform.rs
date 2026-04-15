@@ -217,7 +217,9 @@ impl AndroidPlatform {
         use rustdar_android_theme as android_theme;
 
         let (theme_sender, theme_receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        std::thread::Builder::new()
+            .name("theme-detect".into())
+            .spawn(move || {
             let mut last_theme = android_theme::detect_dark_theme();
             let _ = theme_sender.send(last_theme);
             loop {
@@ -230,7 +232,7 @@ impl AndroidPlatform {
                     }
                 }
             }
-        });
+        }).expect("failed to spawn theme-detect thread");
 
         Self {
             theme_receiver,

@@ -374,7 +374,9 @@ impl super::App {
                     }
                     return;
                 };
-                std::thread::spawn(move || {
+                std::thread::Builder::new()
+                    .name("overlay-render".into())
+                    .spawn(move || {
                     let output = rasterize_fn(&render_bounds, width, height);
                     let _ = sender.send(OverlayRenderResponse {
                         image_data: output.rgba,
@@ -388,7 +390,7 @@ impl super::App {
                         hit_map: output.hit_map,
                     });
                     super::notify_redraw(&window);
-                });
+                }).expect("failed to spawn overlay-render thread");
             }
             OverlayKind::RadarSites => {
                 let Some(target_pane) = self.gui.pane(first_pane_idx) else { return };
@@ -405,7 +407,9 @@ impl super::App {
                         is_loading: target_loading.as_deref() == Some(s.name),
                     }
                 }).collect();
-                std::thread::spawn(move || {
+                std::thread::Builder::new()
+                    .name("sites-render".into())
+                    .spawn(move || {
                     let image_data = rasterize::rasterize_radar_sites(
                         &sites,
                         &render_bounds,
@@ -426,7 +430,7 @@ impl super::App {
                         hit_map: None,
                     });
                     super::notify_redraw(&window);
-                });
+                }).expect("failed to spawn sites-render thread");
             }
             // Non-texture overlay kinds are never dispatched for background rendering.
             OverlayKind::Radar | OverlayKind::CityLabels
@@ -652,7 +656,9 @@ impl super::App {
         let lon = params.lon;
         let sender = self.channels.loop_render_sender.clone();
         let window = self.window.clone();
-        std::thread::spawn(move || {
+        std::thread::Builder::new()
+            .name("loop-render".into())
+            .spawn(move || {
             let _guard = guard;
             match rustdar_radar::render::render_radar_to_image(&scan_data, elevation, product, lat, lon)
             {
@@ -677,7 +683,7 @@ impl super::App {
                 }
             }
             super::notify_redraw(&window);
-        });
+        }).expect("failed to spawn loop-render thread");
     }
 
     /// Append a freshly-polled scan to any active loops, evicting frames past

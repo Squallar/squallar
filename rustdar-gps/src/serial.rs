@@ -146,9 +146,12 @@ impl SerialGpsReader {
 
         log::info!("Starting GPS reader on {} @ {} baud", port_name, baud);
 
-        std::thread::spawn(move || {
-            gps_read_loop(&port_name, baud, &fix_sender, &stop_rx);
-        });
+        std::thread::Builder::new()
+            .name("gps-serial".into())
+            .spawn(move || {
+                gps_read_loop(&port_name, baud, &fix_sender, &stop_rx);
+            })
+            .expect("failed to spawn gps-serial thread");
 
         Some(Self {
             _stop_signal: stop_tx,
