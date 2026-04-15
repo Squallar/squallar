@@ -614,28 +614,28 @@ impl super::App {
             }
 
             // Store all scans as pending downloads and dispatch the first batch
-            self.loop_pending_downloads.insert(resp.pane_idx, VecDeque::from(scans));
+            self.loop_mgr.insert_pending(resp.pane_idx, VecDeque::from(scans));
             self.dispatch_pending_loop_downloads(resp.pane_idx);
         }
     }
 
     /// Poll for completed loop scan downloads. When a scan arrives, store it
-    /// in the global loop_scan_cache and dispatch next pending downloads.
+    /// in the global scan cache and dispatch next pending downloads.
     fn poll_loop_scan_download_results(&mut self) {
         let mut completed_count = 0usize;
         while let Ok(resp) = self.channels.loop_scan_download_receiver.try_recv() {
-            self.loop_downloads_in_flight_set.remove(&resp.timestamp);
+            self.loop_mgr.complete_download(&resp.timestamp);
             completed_count += 1;
 
             // Cache the downloaded scan globally (skip failures)
             if let Some(scan) = resp.scan {
-                self.loop_scan_cache.insert(resp.timestamp, scan);
+                self.loop_mgr.cache_scan(resp.timestamp, scan);
             }
         }
         if completed_count > 0 {
-            self.loop_downloads_in_flight = self.loop_downloads_in_flight.saturating_sub(completed_count);
+            self.loop_mgr.complete_batch(completed_count);
             // Dispatch next pending downloads for all panes that have pending work
-            let pane_indices: Vec<usize> = self.loop_pending_downloads.keys().copied().collect();
+            let pane_indices = self.loop_mgr.pending_pane_indices();
             for pane_idx in pane_indices {
                 self.dispatch_pending_loop_downloads(pane_idx);
             }
@@ -644,12 +644,17 @@ impl super::App {
 
     /// Dispatch pending loop scan downloads up to the concurrency limit.
     fn dispatch_pending_loop_downloads(&mut self, pane_idx: usize) {
-        let slots = MAX_CONCURRENT_LOOP_DOWNLOADS.saturating_sub(self.loop_downloads_in_flight);
+        let slots = self.loop_mgr.available_slots(MAX_CONCURRENT_LOOP_DOWNLOADS);
         if slots == 0 {
             return;
         }
 
-        let Some(pending) = self.loop_pending_downloads.get_mut(&pane_idx) else {
+        // We need to look up cached/in_flight state while modifying pending queue.
+        // pending_downloads is part of loop_mgr, so we can't iterate via loop_mgr.pending_mut
+        // while also calling loop_mgr.is_cached(). We extract the queue completely, Process it, and put it back.
+        let mut pending = if let Some(queue) = self.loop_mgr.extract_pending(pane_idx) {
+            queue
+        } else {
             return;
         };
 
@@ -657,22 +662,26 @@ impl super::App {
         let mut batch = Vec::new();
         while !pending.is_empty() && batch.len() < slots {
             let (ts, _) = pending.front().unwrap();
-            if self.loop_scan_cache.contains_key(ts) || self.loop_downloads_in_flight_set.contains(ts) {
+            if self.loop_mgr.is_cached(ts) || self.loop_mgr.is_in_flight(ts) {
                 // Already have or fetching this timestamp — remove from pending
                 pending.pop_front();
             } else {
                 batch.push(pending.pop_front().unwrap());
             }
         }
+        
+        // Put the queue back
+        self.loop_mgr.insert_pending(pane_idx, pending);
+        
         let spawned = batch.len();
 
         for (ts, id) in batch {
-            self.loop_downloads_in_flight_set.insert(ts);
+            self.loop_mgr.mark_in_flight(ts);
             self.spawn_loop_scan_download(pane_idx, ts, id);
         }
 
         if spawned > 0 {
-            self.loop_downloads_in_flight += spawned;
+            self.loop_mgr.add_spawned(spawned);
         }
     }
 
@@ -769,7 +778,7 @@ impl super::App {
                 }
                 let any_rendered = pls.frames.iter().any(|f| f.texture.is_some());
                 let none_in_flight = !pls.frames.iter().any(|f| f.render_in_flight);
-                let pane_downloads_done = self.loop_pending_downloads.get(&pidx).is_none_or(|p| p.is_empty());
+                let pane_downloads_done = self.loop_mgr.is_pane_done(pidx);
                 if any_rendered && none_in_flight && pane_downloads_done {
                     pls.render_ready = true;
                 }
@@ -977,7 +986,7 @@ impl super::App {
                     }
                 }
 
-                if let Some(scan) = self.loop_scan_cache.get(&frame.timestamp) {
+                if let Some(scan) = self.loop_mgr.get_cached(&frame.timestamp) {
                     // Snap elevation to closest available in this particular scan
                     let Some(snapped) = rustdar_radar::render::find_closest_elevation(scan, product, elevation) else {
                         continue;
@@ -1020,7 +1029,7 @@ impl super::App {
                 break;
             }
 
-            let scan_arc = Arc::clone(self.loop_scan_cache.get(&ts).unwrap());
+            let scan_arc = Arc::clone(self.loop_mgr.get_cached(&ts).unwrap());
 
             if let Some(pane) = self.gui.pane_mut(pane_idx) {
                 pane.loop_state.frames[frame_idx].render_in_flight = true;

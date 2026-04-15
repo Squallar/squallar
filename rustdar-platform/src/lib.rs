@@ -13,6 +13,7 @@ pub mod channels;
 pub mod constants;
 pub mod egui_renderer;
 pub mod input;
+pub mod loop_downloads;
 pub mod platform;
 pub mod render_dispatch;
 pub mod run;

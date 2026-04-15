@@ -244,8 +244,7 @@ impl super::App {
                         pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new();
                     }
                 }
-                self.loop_pending_downloads.clear();
-                self.loop_scan_cache.clear();
+                self.loop_mgr.clear_all();
                 
                 let utc_timestamp = Self::local_to_utc(new_config.timestamp);
                 self.spawn_fetch(site, utc_timestamp);
@@ -451,7 +450,7 @@ impl super::App {
         let scan_timestamp = scan_info.timestamp;
 
         // Clear pending downloads for this pane (global cache is kept for sharing)
-        self.loop_pending_downloads.remove(&pane_idx);
+        self.loop_mgr.remove_pending(pane_idx);
 
         // Initialize loop state on the pane
         if let Some(pane) = self.gui.pane_mut(pane_idx) {
@@ -500,7 +499,7 @@ impl super::App {
         if let Some(pane) = self.gui.pane_mut(pane_idx) {
             pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new();
         }
-        self.loop_pending_downloads.remove(&pane_idx);
+        self.loop_mgr.remove_pending(pane_idx);
         // Clear last_rendered so dispatch_pane_renders will re-apply the
         // cached static render (or spawn a fresh one) on the next frame.
         if pane_idx < self.render.pane_render.len() {
@@ -696,7 +695,7 @@ impl super::App {
         use rustdar_egui::pane::LoopFrame;
 
         // Store in global cache for all panes to use
-        self.loop_scan_cache.insert(timestamp, std::sync::Arc::clone(&scan));
+        self.loop_mgr.cache_scan(timestamp, std::sync::Arc::clone(&scan));
 
         for pane_idx in 0..self.gui.pane_count() {
             let Some(pane) = self.gui.pane_mut(pane_idx) else {

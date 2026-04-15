@@ -1,6 +1,5 @@
 use egui_wgpu::wgpu;
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use winit::application::ApplicationHandler;
@@ -15,6 +14,7 @@ use crate::app_state;
 use crate::channels::ChannelHub;
 use crate::constants::*;
 use crate::input::InputHandler;
+use crate::loop_downloads::LoopDownloadManager;
 use crate::platform::{self, PlatformBridge};
 use crate::render_dispatch::RenderDispatcher;
 use rustdar_egui::{
@@ -64,14 +64,8 @@ pub struct App {
     tokio_runtime: tokio::runtime::Runtime,
     // Shared HTTP client for overlay data fetches (SPC, etc.)
     http_client: reqwest::Client,
-    // Downloaded scan data cache for loop frames, keyed by timestamp (shared across panes).
-    loop_scan_cache: std::collections::HashMap<chrono::NaiveDateTime, Arc<nexrad_model::data::Scan>>,
-    // Timestamps currently being downloaded (to avoid duplicate downloads across panes).
-    loop_downloads_in_flight_set: std::collections::HashSet<chrono::NaiveDateTime>,
-    // Pending loop scan downloads per pane, waiting to be dispatched (throttled).
-    loop_pending_downloads: std::collections::HashMap<usize, VecDeque<(chrono::NaiveDateTime, nexrad_data::aws::archive::Identifier)>>,
-    // Number of loop scan downloads currently in flight (global, not per-pane).
-    loop_downloads_in_flight: usize,
+    // Grouped loop download state: scan cache, in-flight tracking, and pending queues.
+    loop_mgr: LoopDownloadManager,
     // Shared counter for background render threads in flight (loop + static renders).
     renders_in_flight: Arc<AtomicUsize>,
     // Cached latest scan per site from auto-poll while panes on that site view historic data.
@@ -125,10 +119,7 @@ impl App {
             exit_requested: false,
             http_client,
             tokio_runtime,
-            loop_scan_cache: std::collections::HashMap::new(),
-            loop_downloads_in_flight_set: std::collections::HashSet::new(),
-            loop_pending_downloads: std::collections::HashMap::new(),
-            loop_downloads_in_flight: 0,
+            loop_mgr: LoopDownloadManager::new(),
             renders_in_flight: Arc::new(AtomicUsize::new(0)),
             latest_cached_scans: HashMap::new(),
             manual_nav_pending: false,
