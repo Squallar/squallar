@@ -15,10 +15,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Suppress winit EventLoopClosed panics from background threads on exit.
     // catch_unwind prevents crashes but the default hook still prints to stderr.
+    // Check the payload type directly rather than stringifying PanicInfo, which
+    // includes file paths and line numbers that can change across Rust versions.
+    // Both &str and String are checked because panic!() produces &str for
+    // literal messages and String for formatted messages.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let msg = info.to_string();
-        if !msg.contains("EventLoopClosed") {
+        let is_event_loop_closed = info
+            .payload()
+            .downcast_ref::<&str>()
+            .is_some_and(|s| s.contains("EventLoopClosed"))
+            || info
+                .payload()
+                .downcast_ref::<String>()
+                .is_some_and(|s| s.contains("EventLoopClosed"));
+        if !is_event_loop_closed {
             default_hook(info);
         }
     }));
