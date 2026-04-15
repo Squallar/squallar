@@ -68,10 +68,10 @@ pub async fn resolve_zone_geometries(
     );
 
     if !urls_to_fetch.is_empty() {
-        // Fetch zone geometries with bounded concurrency to avoid exhausting
-        // file descriptors on systems with low ulimits.
+        // Fetch zone geometries with bounded concurrency to be respectful of
+        // the NWS API and avoid exhausting file descriptors on low-ulimit systems.
         use futures::stream::{self, StreamExt};
-        const MAX_CONCURRENT_FETCHES: usize = 50;
+        const MAX_CONCURRENT_FETCHES: usize = 10;
 
         let results: Vec<_> = stream::iter(urls_to_fetch.into_iter().map(|url| {
             // reqwest::Client is backed by an Arc internally, so cloning is
