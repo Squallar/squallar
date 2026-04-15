@@ -564,7 +564,9 @@ fn compute_nrot_grid(
 
                     let nf = n as f64;
                     let denom = nf * sum_t2 - sum_t * sum_t;
-                    if denom.abs() < 1e-20 {
+                    // 1e-10 threshold: well above f64 epsilon (~2.2e-16) to reject
+                    // near-singular least-squares systems before catastrophic cancellation
+                    if denom.abs() < 1e-10 {
                         return f64::NAN;
                     }
 
