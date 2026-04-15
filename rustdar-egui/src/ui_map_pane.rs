@@ -1063,6 +1063,9 @@ fn render_per_frame_overlay(
     let screen_rect = ui.max_rect();
     let margin = hit_radius + 40.0; // extra margin for station model elements
     let expanded = screen_rect.expand(margin);
+    // Pre-compute viewport geo-bounds (with margin) so we can skip the
+    // expensive Mercator projection for points that are clearly off-screen.
+    let geo_bounds = viewport_geo_bounds(projector, expanded);
 
     let painter = ui.painter();
     let hover_pos = ui.ctx().pointer_hover_pos();
@@ -1071,6 +1074,15 @@ fn render_per_frame_overlay(
     let mut closest_hover: Option<(f32, u32)> = None; // (distance², id)
 
     for pt in points {
+        // Fast geo-bounds rejection before the costly projection.
+        if pt.lat < geo_bounds.min_lat
+            || pt.lat > geo_bounds.max_lat
+            || pt.lon < geo_bounds.min_lon
+            || pt.lon > geo_bounds.max_lon
+        {
+            continue;
+        }
+
         let screen = projector
             .project(walkers::lat_lon(pt.lat, pt.lon))
             .to_pos2();
