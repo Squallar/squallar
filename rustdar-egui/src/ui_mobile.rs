@@ -23,6 +23,10 @@ const LONG_PRESS_DURATION_S: f64 = 0.8;
 const LONG_PRESS_MAX_MOVE_PX: f32 = 20.0;
 /// Vertical offset (pixels) from the touch point to the tooltip center.
 pub(crate) const TOOLTIP_OFFSET_Y: f32 = 60.0;
+/// Default width of the layers panel on mobile.
+const LAYERS_PANEL_WIDTH: f32 = 260.0;
+/// Width of combo boxes in the layers panel on mobile.
+const COMBO_BOX_WIDTH: f32 = 180.0;
 
 /// Detects a "double-tap and drag" gesture commonly used on touch devices
 /// for one-handed zooming. The gesture flow is:
@@ -450,7 +454,7 @@ impl super::Gui {
         let mut pane = std::mem::take(&mut self.panes[self.active_pane]);
 
         egui::Panel::left("mobile_layers_panel")
-            .default_size(260.0)
+            .default_size(LAYERS_PANEL_WIDTH)
             .resizable(false)
             .show_inside(ui, |ui| {
                 // Safe-area top padding
@@ -472,7 +476,7 @@ impl super::Gui {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     self.render_pane_selector(ui, &mut pane);
 
-                    self.render_layer_controls(ui, &mut pane, 180.0, "m_", &mut actions);
+                    self.render_layer_controls(ui, &mut pane, COMBO_BOX_WIDTH, "m_", &mut actions);
 
                     ui.add_space(10.0);
                     ui.separator();

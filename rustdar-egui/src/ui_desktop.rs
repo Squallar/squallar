@@ -7,6 +7,9 @@ use crate::pane::PaneState;
 
 use rustdar_radar::types::ScanInfo;
 
+const LAYERS_PANEL_WIDTH: f32 = 170.0;
+const COMBO_BOX_WIDTH: f32 = 120.0;
+
 fn render_auto_poll_status(
     ui: &mut egui::Ui,
     fetching: bool,
@@ -152,7 +155,7 @@ impl super::Gui {
         let mut pane = std::mem::take(&mut self.panes[self.active_pane]);
 
         egui::Panel::left("layers_panel")
-            .default_size(170.0)
+            .default_size(LAYERS_PANEL_WIDTH)
             .resizable(false)
             .show_inside(ui, |ui| {
                 ui.heading("Layers");
@@ -161,7 +164,7 @@ impl super::Gui {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     self.render_pane_selector(ui, &mut pane);
 
-                    self.render_layer_controls(ui, &mut pane, 120.0, "d_", &mut actions);
+                    self.render_layer_controls(ui, &mut pane, COMBO_BOX_WIDTH, "d_", &mut actions);
                 });
             });
 
