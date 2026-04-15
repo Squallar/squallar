@@ -279,7 +279,7 @@ impl super::App {
             let rounded_elev = (elevation * 10.0).round() / 10.0;
             if !elevations.iter().any(|e| (e - rounded_elev).abs() < 0.05) {
                 elevations.push(rounded_elev);
-                elevations.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                elevations.sort_by(|a, b| a.total_cmp(b));
                 changed = true;
             }
             if changed {

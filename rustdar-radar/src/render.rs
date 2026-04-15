@@ -175,8 +175,7 @@ pub fn find_closest_elevation(
         })
         .min_by(|a, b| {
             ((*a - target_elevation).abs())
-                .partial_cmp(&((*b - target_elevation).abs()))
-                .unwrap()
+                .total_cmp(&((*b - target_elevation).abs()))
         })
 }
 

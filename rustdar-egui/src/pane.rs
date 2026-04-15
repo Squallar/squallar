@@ -200,8 +200,7 @@ impl PaneState {
                         .iter()
                         .min_by(|a, b| {
                             ((**a - self.selected_elevation).abs())
-                                .partial_cmp(&((**b - self.selected_elevation).abs()))
-                                .unwrap()
+                                .total_cmp(&((**b - self.selected_elevation).abs()))
                         })
                         .copied()
                 })

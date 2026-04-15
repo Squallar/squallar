@@ -607,10 +607,9 @@ impl Gui {
                                 .iter()
                                 .min_by(|a, b| {
                                     ((**a - pane.selected_elevation).abs())
-                                        .partial_cmp(
+                                        .total_cmp(
                                             &((**b - pane.selected_elevation).abs()),
                                         )
-                                        .unwrap()
                                 })
                                 .copied()
                                 .unwrap_or(0.0);

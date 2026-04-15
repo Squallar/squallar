@@ -171,7 +171,7 @@ fn discover_product_elevations(scan: &Scan) -> HashMap<RadarProduct, Vec<f32>> {
 
     // Sort and deduplicate elevation angles for each product
     for angles in product_elevations.values_mut() {
-        angles.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        angles.sort_by(|a, b| a.total_cmp(b));
         angles.dedup();
     }
     for (product, angles) in &product_elevations {
