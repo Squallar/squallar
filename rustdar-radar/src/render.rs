@@ -60,7 +60,7 @@ impl MercatorProjection {
         for r_step in 0..num_range_samples {
             let r = range_start + (range_end - range_start) * (r_step as f64 * inv_num_range);
             let dy_center = r * ctx.cos_az_center;
-            let dest_lat_rad = self.radar_lat_rad + dy_center / 6371.0;
+            let dest_lat_rad = self.radar_lat_rad + dy_center / types::EARTH_RADIUS_KM;
             let cos_correction = self.cos_radar_lat / dest_lat_rad.cos();
 
             for az_step in 0..num_az_samples {
@@ -72,7 +72,7 @@ impl MercatorProjection {
                 let dy_km = r * cos_az;
                 let px_i =
                     (self.center_px + dx_km * cos_correction * types::PIXELS_PER_KM) as i32;
-                let dest_lat_rad = self.radar_lat_rad + dy_km / 6371.0;
+                let dest_lat_rad = self.radar_lat_rad + dy_km / types::EARTH_RADIUS_KM;
                 let dest_merc_y = types::lat_rad_to_mercator_y(dest_lat_rad);
                 let py_i = ((self.merc_y_top - dest_merc_y) * self.merc_y_scale) as i32;
 

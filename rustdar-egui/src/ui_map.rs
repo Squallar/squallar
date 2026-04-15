@@ -1,6 +1,6 @@
 use crate::actions::GuiAction;
 use rustdar_overlays::render::overlay_state::OverlayKind;
-use rustdar_radar::types::{RadarProduct, IMAGE_SIZE};
+use rustdar_radar::types::{EARTH_RADIUS_KM, RadarProduct, IMAGE_SIZE};
 use rustdar_units::UserPreferences;
 
 #[path = "ui_map_pane.rs"]
@@ -315,7 +315,7 @@ pub(super) fn compute_hover_info_raw(
     let dlon = lon2 - lon1;
     let a = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
     let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
-    let distance_km = 6371.0 * c;
+    let distance_km = EARTH_RADIUS_KM * c;
 
     let y = dlon.sin() * lat2.cos();
     let x = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
