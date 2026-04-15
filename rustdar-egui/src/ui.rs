@@ -422,10 +422,12 @@ impl Gui {
         let mut action = None;
         
         if self.time_dialog.show {
+            let screen = ctx.input(|i| i.viewport_rect());
             egui::Window::new("Set Time")
                 .collapsible(false)
                 .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(screen.center())
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.heading("Select Time");

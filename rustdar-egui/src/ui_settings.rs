@@ -33,11 +33,12 @@ impl super::Gui {
         egui::Window::new("Settings")
             .id(egui::Id::new("settings_window"))
             .open(&mut open)
+            .order(egui::Order::Foreground)
             .collapsible(false)
-            .resizable(!IS_MOBILE)
+            .resizable(true)
             .default_width(popup_width)
-            .max_width(popup_width)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(screen.center())
             .show(ctx, |ui| {
                 ui.heading("Units");
                 ui.add_space(SETTINGS_SMALL_SPACING);

@@ -18,22 +18,15 @@ fn show_detail_popup(
     } else {
         desktop_width
     };
-    let popup_max_height = if IS_MOBILE {
-        (screen.height() - 80.0).max(200.0)
-    } else {
-        500.0
-    };
-
     let mut open = true;
     egui::Window::new(title)
         .id(egui::Id::new(id))
         .open(&mut open)
         .collapsible(false)
-        .resizable(!IS_MOBILE)
+        .resizable(true)
         .default_width(popup_width)
-        .max_width(popup_width)
-        .max_height(popup_max_height)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .pivot(egui::Align2::CENTER_CENTER)
+        .default_pos(screen.center())
         .order(egui::Order::Foreground)
         .show(ctx, |ui| body(ui));
 
