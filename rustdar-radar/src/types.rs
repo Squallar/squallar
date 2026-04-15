@@ -59,28 +59,6 @@ impl ImageBounds {
             mercator_y_max: lat_rad_to_mercator_y(max_lat.to_radians()),
         }
     }
-
-    /// Convert geographic coordinates to image pixel coordinates.
-    /// Uses Web Mercator Y mapping for the vertical axis.
-    /// Returns `(px, py)` or `None` if outside bounds.
-    pub fn geo_to_pixel(&self, lat: f64, lon: f64) -> Option<(usize, usize)> {
-        let lon_frac = (lon - self.min_lon) / (self.max_lon - self.min_lon);
-        let merc_y = lat_rad_to_mercator_y(lat.to_radians());
-        let merc_frac = (merc_y - self.mercator_y_min) / (self.mercator_y_max - self.mercator_y_min);
-
-        if !(0.0..=1.0).contains(&merc_frac) || !(0.0..=1.0).contains(&lon_frac) {
-            return None;
-        }
-
-        let px = (lon_frac * IMAGE_SIZE as f64) as usize;
-        let py = ((1.0 - merc_frac) * IMAGE_SIZE as f64) as usize;
-
-        if px < IMAGE_SIZE && py < IMAGE_SIZE {
-            Some((px, py))
-        } else {
-            None
-        }
-    }
 }
 
 /// Information about a loaded radar scan
