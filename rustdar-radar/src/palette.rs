@@ -219,20 +219,34 @@ static RHO: ColorScale = &(&[
     (0.98, (151, 5, 86)),   // Purple
 ], true);
 
-/// Differential phase (degrees, pre-wrapped to 0-360).
+/// Differential phase (degrees, pre-wrapped to 0-360). Cyclic scale covering
+/// the full 360° range at 15° increments, wrapping back toward the starting
+/// color so that 0° and 360° are visually continuous.
 static PHI: ColorScale = &(&[
-    (0.0,   (151, 151, 242)),   // Light Purple
-    (15.0, (113, 113, 205)), // Light blue
-    (30.0,  (62, 125, 249)), // Blue
-    (45.0,  (33, 67, 134)), // Blue
-    (60.0, (0, 249, 0)),   // Green
-    (75.0, (0, 134, 0)),   // Dark green
-    (90.0, (255, 249, 0)),   // Yellow
+    (0.0,   (151, 151, 242)), // Light purple
+    (15.0,  (113, 113, 205)), // Light blue-purple
+    (30.0,  (62, 125, 249)),  // Blue
+    (45.0,  (33, 67, 134)),   // Dark blue
+    (60.0,  (0, 249, 0)),     // Green
+    (75.0,  (0, 134, 0)),     // Dark green
+    (90.0,  (255, 249, 0)),   // Yellow
     (105.0, (255, 137, 0)),   // Orange
-    (120.0, (255, 0, 0)),   // Red
-    (135.0, (173, 0, 0)),   // Dark red
-    (150.0, (252, 0, 252)), // Magenta
-    (165.0, (144, 0, 144)), // Dark magenta
+    (120.0, (255, 0, 0)),     // Red
+    (135.0, (173, 0, 0)),     // Dark red
+    (150.0, (252, 0, 252)),   // Magenta
+    (165.0, (144, 0, 144)),   // Dark magenta
+    (180.0, (100, 0, 100)),   // Deep purple
+    (195.0, (60, 0, 130)),    // Indigo
+    (210.0, (30, 30, 180)),   // Blue-purple
+    (225.0, (0, 60, 200)),    // Medium blue
+    (240.0, (0, 120, 180)),   // Teal blue
+    (255.0, (0, 160, 130)),   // Teal
+    (270.0, (0, 180, 80)),    // Sea green
+    (285.0, (80, 200, 0)),    // Lime green
+    (300.0, (180, 220, 0)),   // Yellow-green
+    (315.0, (220, 200, 80)),  // Light gold
+    (330.0, (200, 180, 160)), // Warm grey
+    (345.0, (175, 165, 210)), // Lavender
 ], true);
 
 /// Specific differential phase KDP (deg/km).
