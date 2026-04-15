@@ -50,6 +50,10 @@ fn request_location_permission() {
     let Ok(mut env) = vm.attach_current_thread() else { return };
     let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
 
+    // requestPermissions() is Activity-only; context may be Application after resume.
+    let Ok(activity_class) = env.find_class("android/app/Activity") else { return };
+    if !env.is_instance_of(&activity, activity_class).unwrap_or(false) { return }
+
     let Ok(perm_str) = env.new_string("android.permission.ACCESS_FINE_LOCATION") else { return };
     let Ok(string_class) = env.find_class("java/lang/String") else { return };
     let Ok(perm_array) = env.new_object_array(1, &string_class, &perm_str) else { return };
@@ -222,6 +226,16 @@ pub fn get_system_insets() -> (f32, f32, f32, f32) {
     };
     let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
 
+    // After suspend/resume, ndk_context may return the Application instead of
+    // the Activity. getWindow() only exists on Activity, so bail out early.
+    let Ok(activity_class) = env.find_class("android/app/Activity") else {
+        return (0.0, 0.0, 0.0, 0.0);
+    };
+    if !env.is_instance_of(&activity, activity_class).unwrap_or(false) {
+        log::warn!("get_system_insets: context is not an Activity, skipping");
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+
     // Activity.getWindow().getDecorView().getRootWindowInsets()
     let window = match env.call_method(&activity, "getWindow", "()Landroid/view/Window;", &[]) {
         Ok(w) => match w.l() { Ok(w) => w, Err(_) => return (0.0, 0.0, 0.0, 0.0) },
@@ -348,6 +362,13 @@ pub fn move_task_to_back() {
         return;
     };
     let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
+
+    // moveTaskToBack() is Activity-only; context may be Application after resume.
+    let Ok(activity_class) = env.find_class("android/app/Activity") else { return };
+    if !env.is_instance_of(&activity, activity_class).unwrap_or(false) {
+        log::warn!("moveTaskToBack: context is not an Activity, skipping");
+        return;
+    }
 
     match env.call_method(&activity, "moveTaskToBack", "(Z)Z", &[jni::objects::JValue::from(true)]) {
         Ok(_) => log::info!("App moved to background"),
