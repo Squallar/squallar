@@ -34,7 +34,7 @@ fn show_detail_popup(
         .max_width(popup_width)
         .max_height(popup_max_height)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .order(egui::Order::Tooltip)
+        .order(egui::Order::Foreground)
         .show(ctx, |ui| body(ui));
 
     !open

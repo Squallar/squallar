@@ -156,7 +156,7 @@ pub(super) fn render_pane_map_content(
                 // paint over the bars regardless of egui shape batching.
                 OverlayKind::ColorScale => {
                     let fg_layer = egui::LayerId::new(
-                        egui::Order::Foreground,
+                        egui::Order::Background,
                         ui.id().with("color_scale"),
                     );
                     let mut fg_painter = ui.ctx().layer_painter(fg_layer);
