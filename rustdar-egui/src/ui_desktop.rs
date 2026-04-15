@@ -157,9 +157,11 @@ impl super::Gui {
                 ui.heading("Layers");
                 ui.separator();
 
-                self.render_pane_selector(ui, &mut pane);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.render_pane_selector(ui, &mut pane);
 
-                self.render_layer_controls(ui, &mut pane, 120.0, "d_", &mut actions);
+                    self.render_layer_controls(ui, &mut pane, 120.0, "d_", &mut actions);
+                });
             });
 
         self.panes[self.active_pane] = pane;
