@@ -23,7 +23,7 @@ impl super::App {
             // Calculate screen descriptor
             let window_size = window.inner_size();
             let css_to_canvas_scale_x =
-                state.surface_config.width as f32 / window_size.width as f32;
+                state.surface_config.width as f32 / window_size.width.max(1) as f32;
             let pixels_per_point =
                 window.scale_factor() as f32 * state.scale_factor * css_to_canvas_scale_x;
 
