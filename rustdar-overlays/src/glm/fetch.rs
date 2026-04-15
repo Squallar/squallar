@@ -24,9 +24,9 @@ impl GlmCache {
         });
     }
 
-    /// Get all cached flashes as a flat vec.
-    pub fn all_flashes(&self) -> Vec<GlmFlash> {
-        self.entries.values().flatten().cloned().collect()
+    /// Iterate over all cached flashes.
+    pub fn all_flashes(&self) -> impl Iterator<Item = &GlmFlash> {
+        self.entries.values().flatten()
     }
 
     /// Check whether a key is already cached.
@@ -89,9 +89,9 @@ pub async fn fetch_glm_flashes(
     }
 
     // Return all cached flashes within the window
-    let all = cache.all_flashes();
-    let filtered: Vec<GlmFlash> = all.into_iter()
+    let filtered: Vec<GlmFlash> = cache.all_flashes()
         .filter(|f| f.time >= cutoff && f.time <= now)
+        .cloned()
         .collect();
 
     log::info!("GLM: {} flashes in {:.0}s window", filtered.len(), time_window_secs);
