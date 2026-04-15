@@ -159,6 +159,7 @@ pub fn rasterize_spc_outlooks(
     hatch_color: [u8; 4],
 ) -> Vec<u8> {
     let Some(mut pixmap) = Pixmap::new(width, height) else {
+        log::error!("Pixmap allocation failed in rasterize_spc_outlooks ({}×{})", width, height);
         return vec![0u8; (width * height * 4) as usize];
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -185,6 +186,7 @@ pub fn rasterize_spc_discussions(
     height: u32,
 ) -> Vec<u8> {
     let Some(mut pixmap) = Pixmap::new(width, height) else {
+        log::error!("Pixmap allocation failed in rasterize_spc_discussions ({}×{})", width, height);
         return vec![0u8; (width * height * 4) as usize];
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -225,6 +227,7 @@ pub fn rasterize_nws_alerts(
     height: u32,
 ) -> Vec<u8> {
     let Some(mut pixmap) = Pixmap::new(width, height) else {
+        log::error!("Pixmap allocation failed in rasterize_nws_alerts ({}×{})", width, height);
         return vec![0u8; (width * height * 4) as usize];
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -266,6 +269,7 @@ pub fn rasterize_radar_sites(
     is_dark: bool,
 ) -> Vec<u8> {
     let Some(mut pixmap) = Pixmap::new(width, height) else {
+        log::error!("Pixmap allocation failed in rasterize_radar_sites ({}×{})", width, height);
         return vec![0u8; (width * height * 4) as usize];
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -427,6 +431,7 @@ pub fn rasterize_storm_reports(
     is_dark: bool,
 ) -> RasterizeOutput {
     let Some(mut pixmap) = Pixmap::new(width, height) else {
+        log::error!("Pixmap allocation failed in rasterize_storm_reports ({}×{})", width, height);
         return RasterizeOutput {
             rgba: vec![0u8; (width * height * 4) as usize],
             hit_map: None,
@@ -597,6 +602,7 @@ pub fn rasterize_glm_strikes(
     params: &GlmRenderParams,
 ) -> RasterizeOutput {
     let Some(mut pixmap) = Pixmap::new(width, height) else {
+        log::error!("Pixmap allocation failed in rasterize_glm_strikes ({}×{})", width, height);
         return RasterizeOutput {
             rgba: vec![0u8; (width * height * 4) as usize],
             hit_map: None,
