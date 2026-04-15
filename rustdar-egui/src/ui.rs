@@ -349,9 +349,10 @@ impl Gui {
                 .and_then(|t| t.with_nanosecond(0))
                 .unwrap_or(now);
 
-            let mut seen_sites = std::collections::HashSet::new();
+            let mut seen_sites: Vec<&str> = Vec::with_capacity(self.pane_layout.pane_count);
             for pane in self.panes.iter().take(self.pane_layout.pane_count) {
-                if pane.viewing_live && seen_sites.insert(pane.site.clone()) {
+                if pane.viewing_live && !seen_sites.contains(&pane.site.as_str()) {
+                    seen_sites.push(&pane.site);
                     let config = RadarConfig {
                         site: pane.site.clone(),
                         timestamp: current_scan_time,
