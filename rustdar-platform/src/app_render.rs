@@ -368,38 +368,34 @@ impl super::App {
                         continue;
                     }
 
+                    let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
+                        continue;
+                    };
+
+                    let params = crate::render_dispatch::RenderParams {
+                        product,
+                        elevation,
+                        lat: scan_info.site.lat,
+                        lon: scan_info.site.lon,
+                    };
+
                     if product.is_level3() {
-                        if let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) {
-                            let params = crate::render_dispatch::RenderParams {
-                                product,
-                                elevation,
-                                lat: scan_info.site.lat,
-                                lon: scan_info.site.lon,
-                            };
-                            self.render.try_spawn_level3_render(
-                                pane_idx,
-                                &params,
-                                &pane_site,
-                                self.channels.render_sender.clone(),
-                                self.window.clone(),
-                            );
-                        }
-                    } else if let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx)
-                        && let Some(data) = self.scan_data.get(scan_info.site.name) {
-                            let params = crate::render_dispatch::RenderParams {
-                                product,
-                                elevation,
-                                lat: scan_info.site.lat,
-                                lon: scan_info.site.lon,
-                            };
-                            self.render.spawn_level2_render(
-                                pane_idx,
-                                &params,
-                                Arc::clone(data),
-                                self.channels.render_sender.clone(),
-                                self.window.clone(),
-                            );
-                        }
+                        self.render.try_spawn_level3_render(
+                            pane_idx,
+                            &params,
+                            &pane_site,
+                            self.channels.render_sender.clone(),
+                            self.window.clone(),
+                        );
+                    } else if let Some(data) = self.scan_data.get(scan_info.site.name) {
+                        self.render.spawn_level2_render(
+                            pane_idx,
+                            &params,
+                            Arc::clone(data),
+                            self.channels.render_sender.clone(),
+                            self.window.clone(),
+                        );
+                    }
                 }
             } else if pane_idx < self.render.pane_render.len() {
                 // Only clear the radar texture if no scan data is loaded for this pane.
