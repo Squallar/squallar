@@ -239,54 +239,14 @@ impl App {
             }
         }
 
-        // Deduplicate overlay renders: when viewport_sync AND sync_layers are both on,
-        // group by (overlay_kind, zoom, data_generation, width, height) and spawn one render for all panes.
-        // When sync_layers is off, each pane may have different overlay configs, so no grouping.
         if !overlay_renders.is_empty() {
-            if self.gui.is_viewport_sync() && self.gui.is_sync_layers() {
-                struct GroupedRender {
-                    kind: OverlayKind,
-                    bounds: rustdar_overlays::types::GeoBounds,
-                    width: u32,
-                    height: u32,
-                    data_gen: u64,
-                    zoom: i32,
-                    pane_indices: Vec<usize>,
+            let should_group = self.gui.is_viewport_sync() && self.gui.is_sync_layers();
+            let grouped = deduplicate_overlay_renders(overlay_renders, should_group);
+            for (pane_indices, kind, req) in grouped {
+                if should_group {
+                    log::debug!("Spawning overlay render for {:?} targeting {} panes", kind, pane_indices.len());
                 }
-
-                let mut grouped: std::collections::HashMap<
-                    (OverlayKind, i32, u64, u32, u32),
-                    GroupedRender,
-                > = std::collections::HashMap::new();
-
-                for (pane_idx, kind, bounds, w, h, data_gen, zoom) in overlay_renders {
-                    let key = (kind, zoom, data_gen, w, h);
-                    grouped.entry(key)
-                        .and_modify(|g| {
-                            if !g.pane_indices.contains(&pane_idx) {
-                                g.pane_indices.push(pane_idx);
-                            }
-                        })
-                        .or_insert_with(|| GroupedRender {
-                            kind, bounds, width: w, height: h, data_gen, zoom,
-                            pane_indices: vec![pane_idx],
-                        });
-                }
-
-                for (_key, g) in grouped {
-                    log::debug!("Spawning overlay render for {:?} targeting {} panes", g.kind, g.pane_indices.len());
-                    self.spawn_overlay_render(g.pane_indices, g.kind, fetch::OverlayRenderRequest {
-                        geo_bounds: g.bounds, width: g.width, height: g.height,
-                        data_generation: g.data_gen, zoom: g.zoom,
-                    });
-                }
-            } else {
-                for (pane_idx, kind, bounds, w, h, data_gen, zoom) in overlay_renders {
-                    self.spawn_overlay_render(vec![pane_idx], kind, fetch::OverlayRenderRequest {
-                        geo_bounds: bounds, width: w, height: h,
-                        data_generation: data_gen, zoom,
-                    });
-                }
+                self.spawn_overlay_render(pane_indices, kind, req);
             }
         }
     }
@@ -442,6 +402,59 @@ impl App {
     }
 }
 
+/// Deduplicate overlay render requests.
+///
+/// When `should_group` is true (viewport sync + layer sync both on), groups requests
+/// by `(overlay_kind, zoom, data_generation, width, height)` and merges pane indices
+/// so one render serves multiple panes. When false, each request passes through as-is.
+fn deduplicate_overlay_renders(
+    overlay_renders: Vec<(usize, rustdar_overlays::render::overlay_state::OverlayKind, rustdar_overlays::types::GeoBounds, u32, u32, u64, i32)>,
+    should_group: bool,
+) -> Vec<(Vec<usize>, rustdar_overlays::render::overlay_state::OverlayKind, fetch::OverlayRenderRequest)> {
+    use rustdar_overlays::render::overlay_state::OverlayKind;
+
+    if !should_group {
+        return overlay_renders.into_iter().map(|(pane_idx, kind, bounds, w, h, data_gen, zoom)| {
+            (vec![pane_idx], kind, fetch::OverlayRenderRequest {
+                geo_bounds: bounds, width: w, height: h, data_generation: data_gen, zoom,
+            })
+        }).collect();
+    }
+
+    struct GroupedRender {
+        kind: OverlayKind,
+        bounds: rustdar_overlays::types::GeoBounds,
+        width: u32,
+        height: u32,
+        data_gen: u64,
+        zoom: i32,
+        pane_indices: Vec<usize>,
+    }
+
+    let mut grouped: HashMap<(OverlayKind, i32, u64, u32, u32), GroupedRender> = HashMap::new();
+
+    for (pane_idx, kind, bounds, w, h, data_gen, zoom) in overlay_renders {
+        let key = (kind, zoom, data_gen, w, h);
+        grouped.entry(key)
+            .and_modify(|g| {
+                if !g.pane_indices.contains(&pane_idx) {
+                    g.pane_indices.push(pane_idx);
+                }
+            })
+            .or_insert_with(|| GroupedRender {
+                kind, bounds, width: w, height: h, data_gen, zoom,
+                pane_indices: vec![pane_idx],
+            });
+    }
+
+    grouped.into_values().map(|g| {
+        (g.pane_indices, g.kind, fetch::OverlayRenderRequest {
+            geo_bounds: g.bounds, width: g.width, height: g.height,
+            data_generation: g.data_gen, zoom: g.zoom,
+        })
+    }).collect()
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         log::info!("App resumed");
@@ -514,5 +527,92 @@ impl ApplicationHandler for App {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustdar_overlays::render::overlay_state::OverlayKind;
+    use rustdar_overlays::types::GeoBounds;
+
+    fn bounds() -> GeoBounds {
+        GeoBounds { min_lat: 30.0, max_lat: 40.0, min_lon: -100.0, max_lon: -90.0 }
+    }
+
+    #[test]
+    fn test_dedup_empty() {
+        let result = deduplicate_overlay_renders(vec![], true);
+        assert!(result.is_empty());
+        let result = deduplicate_overlay_renders(vec![], false);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_dedup_single_render() {
+        let input = vec![(0, OverlayKind::Radar, bounds(), 800, 600, 1, 10)];
+
+        let result = deduplicate_overlay_renders(input.clone(), true);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, vec![0]);
+        assert_eq!(result[0].1, OverlayKind::Radar);
+        assert_eq!(result[0].2.width, 800);
+
+        let result = deduplicate_overlay_renders(input, false);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, vec![0]);
+    }
+
+    #[test]
+    fn test_dedup_no_grouping() {
+        let input = vec![
+            (0, OverlayKind::Radar, bounds(), 800, 600, 1, 10),
+            (1, OverlayKind::Radar, bounds(), 800, 600, 1, 10),
+            (2, OverlayKind::NwsAlerts, bounds(), 800, 600, 1, 10),
+        ];
+
+        let result = deduplicate_overlay_renders(input, false);
+        assert_eq!(result.len(), 3);
+        for entry in &result {
+            assert_eq!(entry.0.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_dedup_groups_same_key() {
+        let input = vec![
+            (0, OverlayKind::Radar, bounds(), 800, 600, 1, 10),
+            (1, OverlayKind::Radar, bounds(), 800, 600, 1, 10),
+        ];
+
+        let result = deduplicate_overlay_renders(input, true);
+        assert_eq!(result.len(), 1);
+        let mut panes = result[0].0.clone();
+        panes.sort();
+        assert_eq!(panes, vec![0, 1]);
+        assert_eq!(result[0].1, OverlayKind::Radar);
+    }
+
+    #[test]
+    fn test_dedup_different_keys() {
+        let input = vec![
+            (0, OverlayKind::Radar, bounds(), 800, 600, 1, 10),
+            (1, OverlayKind::NwsAlerts, bounds(), 800, 600, 1, 10),
+        ];
+
+        let result = deduplicate_overlay_renders(input, true);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_dedup_duplicate_pane_idx() {
+        let input = vec![
+            (0, OverlayKind::Radar, bounds(), 800, 600, 1, 10),
+            (0, OverlayKind::Radar, bounds(), 800, 600, 1, 10),
+        ];
+
+        let result = deduplicate_overlay_renders(input, true);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, vec![0]);
     }
 }
