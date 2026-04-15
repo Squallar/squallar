@@ -33,7 +33,6 @@ const COMBO_BOX_WIDTH: f32 = 180.0;
 /// 1. Tap (short press-release)
 /// 2. Within [`DOUBLE_TAP_TIMEOUT_S`], press down again and hold
 /// 3. Drag vertically: up = zoom in, down = zoom out
-#[derive(Clone)]
 #[derive(Clone, Default)]
 pub(crate) enum GestureState {
     #[default]
