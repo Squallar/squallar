@@ -1,3 +1,12 @@
+/// Drain all pending messages from `rx`, returning the last one (if any).
+fn drain_latest<T>(rx: &std::sync::mpsc::Receiver<T>) -> Option<T> {
+    let mut latest = None;
+    while let Ok(val) = rx.try_recv() {
+        latest = Some(val);
+    }
+    latest
+}
+
 /// Platform-specific behavior abstracted behind a common trait.
 /// Keeps `#[cfg(target_os = "android")]` blocks out of `app.rs`.
 pub trait PlatformBridge {
@@ -116,12 +125,7 @@ impl PlatformBridge for DesktopPlatform {
     }
 
     fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix> {
-        let receiver = self.gps_fix_receiver.as_ref()?;
-        let mut latest = None;
-        while let Ok(fix) = receiver.try_recv() {
-            latest = Some(fix);
-        }
-        latest
+        self.gps_fix_receiver.as_ref().and_then(drain_latest)
     }
 
     fn poll_heading(&mut self) -> Option<f32> {
@@ -243,29 +247,15 @@ impl AndroidPlatform {
 #[cfg(target_os = "android")]
 impl PlatformBridge for AndroidPlatform {
     fn poll_theme(&mut self) -> Option<bool> {
-        let mut latest = None;
-        while let Ok(theme) = self.theme_receiver.try_recv() {
-            latest = Some(theme);
-        }
-        latest
+        drain_latest(&self.theme_receiver)
     }
 
     fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix> {
-        let receiver = self.gps_fix_receiver.as_ref()?;
-        let mut latest = None;
-        while let Ok(fix) = receiver.try_recv() {
-            latest = Some(fix);
-        }
-        latest
+        self.gps_fix_receiver.as_ref().and_then(drain_latest)
     }
 
     fn poll_heading(&mut self) -> Option<f32> {
-        let receiver = self.heading_receiver.as_ref()?;
-        let mut latest = None;
-        while let Ok(heading) = receiver.try_recv() {
-            latest = Some(heading);
-        }
-        latest
+        self.heading_receiver.as_ref().and_then(drain_latest)
     }
 
     fn query_insets(&self) -> Option<(f32, f32, f32, f32)> {
