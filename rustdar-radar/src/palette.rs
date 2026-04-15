@@ -86,7 +86,7 @@ pub fn get_color_for_value(product: RadarProduct, value: f32) -> (u8, u8, u8, u8
             (r, g, b, TRANSPARENCY)
         }
         RadarProduct::HydrometeorClassification => {
-            if value < 5.0 {
+            if value < 10.0 {
                 return (0, 0, 0, 0);
             }
             let (r, g, b) = scale_color(HHC, value);
@@ -287,20 +287,20 @@ static VIL: ColorScale = &(&[
 /// 0=ND, 10=BI, 20=AP, 30=IC, 40=DS, 50=WS, 60=RA, 70=HR,
 /// 80=BD, 90=GR, 100=HA, 110=LH, 120=GH, 140=UK, 150=RF
 static HHC: ColorScale = &(&[
-    (5.0,   (128, 128, 128)), // BI (Biological)
-    (15.0,  (128, 0, 128)),   // AP (Ground clutter)
-    (25.0,  (173, 216, 230)), // IC (Ice crystals)
-    (35.0,  (0, 100, 255)),   // DS (Dry snow)
-    (45.0,  (0, 200, 255)),   // WS (Wet snow)
-    (55.0,  (0, 200, 0)),     // RA (Rain)
-    (65.0,  (0, 100, 0)),     // HR (Heavy rain)
-    (75.0,  (255, 255, 0)),   // BD (Big drops)
-    (85.0,  (255, 150, 0)),   // GR (Graupel)
-    (95.0,  (255, 0, 0)),     // HA (Hail w/ rain)
-    (105.0, (200, 0, 0)),     // LH (Large hail)
-    (115.0, (255, 200, 200)), // GH (Giant hail)
-    (125.0, (200, 200, 200)), // UK (Unknown)
-    (145.0, (100, 0, 150)),   // RF (Range folded)
+    (10.0,  (128, 128, 128)), // BI (Biological)
+    (20.0,  (128, 0, 128)),   // AP (Ground clutter)
+    (30.0,  (173, 216, 230)), // IC (Ice crystals)
+    (40.0,  (0, 100, 255)),   // DS (Dry snow)
+    (50.0,  (0, 200, 255)),   // WS (Wet snow)
+    (60.0,  (0, 200, 0)),     // RA (Rain)
+    (70.0,  (0, 100, 0)),     // HR (Heavy rain)
+    (80.0,  (255, 255, 0)),   // BD (Big drops)
+    (90.0,  (255, 150, 0)),   // GR (Graupel)
+    (100.0, (255, 0, 0)),     // HA (Hail w/ rain)
+    (110.0, (200, 0, 0)),     // LH (Large hail)
+    (120.0, (255, 200, 200)), // GH (Giant hail)
+    (140.0, (200, 200, 200)), // UK (Unknown)
+    (150.0, (100, 0, 150)),   // RF (Range folded)
 ], false);
 
 /// Precipitation Rate (in/hr).
