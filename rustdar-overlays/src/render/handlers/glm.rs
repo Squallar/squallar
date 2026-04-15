@@ -153,7 +153,7 @@ impl GlmHandler {
 
     /// Clear the file cache (needed when level selection changes).
     fn clear_cache(&self) {
-        let mut guard = self.cache.lock().unwrap();
+        let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         *guard = GlmCache::default();
     }
 }
@@ -280,7 +280,7 @@ impl OverlayHandler for GlmHandler {
             future: Box::pin(async move {
                 // Clone the cache out so we don't hold a std::sync::Mutex across await
                 let mut local_cache = {
-                    let guard = cache.lock().unwrap();
+                    let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
                     guard.clone()
                 };
                 let result = crate::glm::fetch::fetch_glm_flashes(
@@ -293,7 +293,7 @@ impl OverlayHandler for GlmHandler {
                 .await;
                 // Write the updated cache back
                 {
-                    let mut guard = cache.lock().unwrap();
+                    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
                     *guard = local_cache;
                 }
                 Box::new(GlmFetchResult(result)) as Box<dyn Any + Send>
