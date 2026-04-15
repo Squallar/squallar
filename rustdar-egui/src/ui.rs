@@ -367,12 +367,12 @@ impl Gui {
         // Auto-refresh overlay data when layers are enabled and refresh interval elapsed
         for &kind in OverlayKind::all() {
             if let Some(interval) = self.overlays.auto_poll_interval(kind)
-                && self.any_pane_has_overlay_enabled(kind)
+                && let Some(pane_idx) = self.first_pane_with_overlay_enabled(kind)
                     && !self.overlays.is_fetching(kind)
                     && self.overlays.fetch_time(kind)
                         .is_none_or(|t| t.elapsed().as_secs() >= interval)
                 {
-                    actions.push(GuiAction::FetchOverlay(kind));
+                    actions.push(GuiAction::FetchOverlay { kind, pane_idx });
                 }
         }
     }
@@ -928,7 +928,7 @@ impl Gui {
         for (kind, update) in updates {
             let effect = self.overlays.apply_control(kind, &update, &mut pane_ctx);
             if matches!(effect, ControlEffect::Fetch) {
-                actions.push(GuiAction::FetchOverlay(kind));
+                actions.push(GuiAction::FetchOverlay { kind, pane_idx: self.active_pane });
             }
         }
 
@@ -1008,6 +1008,14 @@ impl Gui {
         self.panes.iter()
             .take(self.pane_layout.pane_count)
             .any(|p| p.is_overlay_enabled(kind))
+    }
+
+    /// Returns the index of the first pane that has the given overlay kind enabled,
+    /// or `None` if no pane has it enabled.
+    pub fn first_pane_with_overlay_enabled(&self, kind: OverlayKind) -> Option<usize> {
+        self.panes.iter()
+            .take(self.pane_layout.pane_count)
+            .position(|p| p.is_overlay_enabled(kind))
     }
 
     /// Get the active pane (immutable).

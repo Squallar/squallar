@@ -108,8 +108,8 @@ impl super::App {
             GuiAction::Exit => {
                 self.request_exit(event_loop);
             }
-            GuiAction::FetchOverlay(_)
-            | GuiAction::RefreshOverlay(_) => self.handle_overlay_action(action),
+            GuiAction::FetchOverlay { .. }
+            | GuiAction::RefreshOverlay { .. } => self.handle_overlay_action(action),
             GuiAction::RenderOverlay { .. } => {
                 // Handled in process_gui_actions() with deduplication
                 unreachable!("RenderOverlay should be intercepted by process_gui_actions");
@@ -257,20 +257,22 @@ impl super::App {
     /// Handle overlay fetch/refresh actions for all overlay kinds.
     fn handle_overlay_action(&mut self, action: GuiAction) {
         match action {
-            GuiAction::FetchOverlay(kind) | GuiAction::RefreshOverlay(kind) => {
-                self.fetch_overlay(kind);
+            GuiAction::FetchOverlay { kind, pane_idx } | GuiAction::RefreshOverlay { kind, pane_idx } => {
+                self.fetch_overlay(kind, pane_idx);
             }
             _ => unreachable!(),
         }
     }
 
     /// Fetch overlay data for the given kind, resolving parameters from current state.
-    fn fetch_overlay(&mut self, kind: OverlayKind) {
+    fn fetch_overlay(&mut self, kind: OverlayKind, pane_idx: usize) {
         use rustdar_overlays::render::overlay_state::FetchConfig;
 
-        // Load the active pane's config so create_fetch_tasks reads the
+        // Load the requesting pane's config so create_fetch_tasks reads the
         // correct per-pane settings (e.g. selected model parameter, SPC day).
-        let pane_configs = self.gui.active_pane().overlay_configs.clone();
+        let pane_configs = self.gui.pane(pane_idx)
+            .map(|p| p.overlay_configs.clone())
+            .unwrap_or_default();
         if !pane_configs.is_empty() {
             self.gui.overlays.load_pane_configs(&pane_configs);
         }

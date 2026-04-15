@@ -31,9 +31,9 @@ pub enum GuiAction {
     CheckForNewScans(RadarConfig),
     SwitchRadarSite { site: String, pane_idx: usize }, // Switch to a different radar site
     /// Fetch overlay data for the given kind (initial load when layer enabled).
-    FetchOverlay(OverlayKind),
+    FetchOverlay { kind: OverlayKind, pane_idx: usize },
     /// Re-fetch overlay data for the given kind (manual refresh).
-    RefreshOverlay(OverlayKind),
+    RefreshOverlay { kind: OverlayKind, pane_idx: usize },
     /// Request a background overlay rasterization for a pane.
     RenderOverlay {
         pane_idx: usize,
@@ -106,11 +106,11 @@ impl std::fmt::Display for GuiAction {
             GuiAction::SwitchRadarSite { site, pane_idx } => {
                 write!(f, "Switch pane {} to radar site {}", pane_idx, site)
             }
-            GuiAction::FetchOverlay(kind) => {
-                write!(f, "Fetch overlay {:?}", kind)
+            GuiAction::FetchOverlay { kind, pane_idx } => {
+                write!(f, "Fetch overlay {:?} for pane {}", kind, pane_idx)
             }
-            GuiAction::RefreshOverlay(kind) => {
-                write!(f, "Refresh overlay {:?}", kind)
+            GuiAction::RefreshOverlay { kind, pane_idx } => {
+                write!(f, "Refresh overlay {:?} for pane {}", kind, pane_idx)
             }
             GuiAction::RenderOverlay { pane_idx, overlay_kind, .. } => {
                 write!(f, "Render overlay {:?} for pane {}", overlay_kind, pane_idx)
