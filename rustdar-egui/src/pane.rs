@@ -6,6 +6,8 @@ use chrono::NaiveDateTime;
 use std::sync::Arc;
 use walkers::MapMemory;
 
+const DEFAULT_PANE_ZOOM: f64 = 4.0;
+
 /// Identifies a pane in the multi-pane layout.
 pub type PaneId = usize;
 
@@ -136,7 +138,7 @@ impl PaneState {
     /// Create a new pane viewing the given site.
     pub fn with_site(site: String) -> Self {
         let mut map_memory = MapMemory::default();
-        let _ = map_memory.set_zoom(4.0);
+        let _ = map_memory.set_zoom(DEFAULT_PANE_ZOOM);
         Self {
             site,
             scan_info: None,

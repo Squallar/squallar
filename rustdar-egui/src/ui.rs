@@ -1,6 +1,8 @@
 use crate::actions::{GuiAction, RadarConfig};
 use rustdar_overlays::render::controls::{ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext, PaneControlContextMut};
 
+const DEFAULT_INITIAL_ZOOM: f64 = 7.0;
+
 use rustdar_overlays::render::overlay_state::{OverlayRegistry, OverlayKind};
 use crate::pane::{PaneId, PaneLayout, PaneState, MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
 use crate::tiles::MapTileState;
@@ -391,7 +393,7 @@ impl Gui {
         // Only zoom to radar on the first scan load to avoid disrupting user navigation
         if !self.initial_zoom_set {
             for pane in &mut self.panes {
-                let _ = pane.map_memory.set_zoom(7.0);
+                let _ = pane.map_memory.set_zoom(DEFAULT_INITIAL_ZOOM);
             }
             self.initial_zoom_set = true;
         }
