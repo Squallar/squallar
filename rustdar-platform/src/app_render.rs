@@ -599,7 +599,7 @@ impl super::App {
                 let total = scans.len();
                 let sampled: Vec<_> = (0..MAX_LOOP_FRAMES)
                     .map(|i| {
-                        let idx = i * (total - 1) / (MAX_LOOP_FRAMES - 1);
+                        let idx = i * (total - 1) / (MAX_LOOP_FRAMES - 1).max(1);
                         scans[idx].clone()
                     })
                     .collect();
