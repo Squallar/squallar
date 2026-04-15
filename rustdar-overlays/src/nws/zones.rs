@@ -54,7 +54,11 @@ pub async fn resolve_zone_geometries(
     let mut urls_to_fetch: Vec<String> = Vec::new();
 
     for url in &needed_urls {
-        if let Some(polys) = cache_dir.and_then(|dir| read_cached_zone(dir, url)) {
+        let cached = match cache_dir {
+            Some(dir) => read_cached_zone(dir, url).await,
+            None => None,
+        };
+        if let Some(polys) = cached {
             zone_cache.insert(url.clone(), polys);
         } else {
             urls_to_fetch.push(url.clone());
@@ -90,7 +94,7 @@ pub async fn resolve_zone_geometries(
             if let Some(polys) = result {
                 // Write to disk cache for next time
                 if let Some(dir) = cache_dir {
-                    write_cached_zone(dir, &url, &polys);
+                    write_cached_zone(dir, &url, &polys).await;
                 }
                 zone_cache.insert(url, polys);
             }
@@ -232,14 +236,14 @@ fn zone_cache_key(url: &str) -> Option<String> {
 /// Read a zone geometry from the disk cache.
 ///
 /// Returns `None` if the file is missing, corrupt, or older than the TTL.
-fn read_cached_zone(cache_dir: &Path, url: &str) -> Option<Vec<GeoPolygon>> {
+async fn read_cached_zone(cache_dir: &Path, url: &str) -> Option<Vec<GeoPolygon>> {
     let key = zone_cache_key(url)?;
     let path = cache_dir.join(format!("{key}.json"));
-    let data = std::fs::read_to_string(&path).ok()?;
+    let data = tokio::fs::read_to_string(&path).await.ok()?;
     let cached: CachedZone = serde_json::from_str(&data).ok()?;
 
     if unix_now().saturating_sub(cached.fetched_at) > CACHE_TTL_SECS {
-        let _ = std::fs::remove_file(&path);
+        let _ = tokio::fs::remove_file(&path).await;
         return None;
     }
 
@@ -247,11 +251,11 @@ fn read_cached_zone(cache_dir: &Path, url: &str) -> Option<Vec<GeoPolygon>> {
 }
 
 /// Write a zone geometry to the disk cache.
-fn write_cached_zone(cache_dir: &Path, url: &str, polygons: &[GeoPolygon]) {
+async fn write_cached_zone(cache_dir: &Path, url: &str, polygons: &[GeoPolygon]) {
     let Some(key) = zone_cache_key(url) else {
         return;
     };
-    if let Err(e) = std::fs::create_dir_all(cache_dir) {
+    if let Err(e) = tokio::fs::create_dir_all(cache_dir).await {
         log::debug!("Failed to create zone cache directory: {e}");
         return;
     }
@@ -262,7 +266,7 @@ fn write_cached_zone(cache_dir: &Path, url: &str, polygons: &[GeoPolygon]) {
     let path = cache_dir.join(format!("{key}.json"));
     match serde_json::to_string(&entry) {
         Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
+            if let Err(e) = tokio::fs::write(&path, json).await {
                 log::debug!("Failed to write zone cache {}: {e}", path.display());
             }
         }
