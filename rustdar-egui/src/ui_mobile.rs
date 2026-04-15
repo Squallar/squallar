@@ -34,18 +34,26 @@ const COMBO_BOX_WIDTH: f32 = 180.0;
 /// 2. Within [`DOUBLE_TAP_TIMEOUT_S`], press down again and hold
 /// 3. Drag vertically: up = zoom in, down = zoom out
 #[derive(Clone)]
+#[derive(Clone, Default)]
+pub(crate) enum GestureState {
+    #[default]
+    Idle,
+    WaitingForSecondTap {
+        tap_time: f64,
+        tap_pos: egui::Pos2,
+    },
+    ZoomDragging {
+        drag_start_y: f32,
+        initial_zoom: f64,
+    },
+}
+
+#[derive(Clone)]
 pub(crate) struct DoubleTapDragDetector {
-    /// A tap that occurred but hasn't been confirmed as a single-tap yet.
-    /// Waits [`DOUBLE_TAP_TIMEOUT_S`] before promoting to `confirmed_tap_pos`.
-    pending_tap: Option<(f64, egui::Pos2)>,
+    /// The current gesture state.
+    state: GestureState,
     /// A confirmed single tap this frame (no double-tap followed).
     confirmed_tap_pos: Option<egui::Pos2>,
-    /// Whether we are currently in a zoom-drag gesture
-    zooming: bool,
-    /// Starting Y position when zoom-drag began
-    drag_start_y: f32,
-    /// Map zoom level when zoom-drag began
-    initial_zoom: f64,
     /// Time when the current/last primary press started
     press_time: f64,
     /// Position where the current/last primary press started
@@ -55,11 +63,8 @@ pub(crate) struct DoubleTapDragDetector {
 impl Default for DoubleTapDragDetector {
     fn default() -> Self {
         Self {
-            pending_tap: None,
+            state: GestureState::Idle,
             confirmed_tap_pos: None,
-            zooming: false,
-            drag_start_y: 0.0,
-            initial_zoom: 4.0,
             press_time: 0.0,
             press_pos: egui::Pos2::ZERO,
         }
@@ -94,14 +99,14 @@ impl DoubleTapDragDetector {
         self.confirmed_tap_pos = None;
 
         // Promote pending tap to confirmed if double-tap timeout elapsed
-        if let Some((tap_time, tap_pos)) = self.pending_tap {
+        if let GestureState::WaitingForSecondTap { tap_time, tap_pos } = self.state {
             if time - tap_time >= DOUBLE_TAP_TIMEOUT_S {
                 self.confirmed_tap_pos = Some(tap_pos);
-                self.pending_tap = None;
+                self.state = GestureState::Idle;
             }
         }
 
-        if self.zooming {
+        if let GestureState::ZoomDragging { .. } = self.state {
             self.handle_zoom_drag(pos, down, map_memory);
             return;
         }
@@ -113,13 +118,13 @@ impl DoubleTapDragDetector {
             // Don't record taps on non-map UI (sidebar buttons, popups, etc.)
             // — check now while the current frame's layout is still valid,
             // rather than 0.4s later when the layout may have changed.
-            if self.pending_tap.is_some() {
+            if let GestureState::WaitingForSecondTap { .. } = self.state {
                 let outside_map = !map_rect.contains(pos);
                 let on_floating_ui = ctx
                     .layer_id_at(pos)
                     .is_some_and(|l| l.order > egui::Order::Background);
                 if outside_map || on_floating_ui {
-                    self.pending_tap = None;
+                    self.state = GestureState::Idle;
                 }
             }
         }
@@ -133,13 +138,15 @@ impl DoubleTapDragDetector {
         map_memory: &mut walkers::MapMemory,
     ) {
         if !down {
-            self.zooming = false;
+            self.state = GestureState::Idle;
             return;
         }
-        let dy = pos.y - self.drag_start_y;
-        let zoom_delta = dy as f64 / ZOOM_DRAG_SENSITIVITY as f64;
-        let new_zoom = (self.initial_zoom + zoom_delta).clamp(1.0, 19.0);
-        let _ = map_memory.set_zoom(new_zoom);
+        if let GestureState::ZoomDragging { drag_start_y, initial_zoom } = self.state {
+            let dy = pos.y - drag_start_y;
+            let zoom_delta = dy as f64 / ZOOM_DRAG_SENSITIVITY as f64;
+            let new_zoom = (initial_zoom + zoom_delta).clamp(1.0, 19.0);
+            let _ = map_memory.set_zoom(new_zoom);
+        }
     }
 
     /// On press, check if this is the second tap of a double-tap sequence.
@@ -149,14 +156,14 @@ impl DoubleTapDragDetector {
         time: f64,
         map_memory: &mut walkers::MapMemory,
     ) {
-        if let Some((tap_time, tap_pos)) = self.pending_tap {
+        if let GestureState::WaitingForSecondTap { tap_time, tap_pos } = self.state {
             let dt = time - tap_time;
             let dist = (pos - tap_pos).length();
             if dt < DOUBLE_TAP_TIMEOUT_S && dist < DOUBLE_TAP_DISTANCE_PX {
-                self.zooming = true;
-                self.drag_start_y = pos.y;
-                self.initial_zoom = map_memory.zoom();
-                self.pending_tap = None;
+                self.state = GestureState::ZoomDragging {
+                    drag_start_y: pos.y,
+                    initial_zoom: map_memory.zoom(),
+                };
                 return;
             }
         }
@@ -169,7 +176,10 @@ impl DoubleTapDragDetector {
         let duration = time - self.press_time;
         let distance = (pos - self.press_pos).length();
         if duration < TAP_DURATION_MAX_S && distance < TAP_DISTANCE_MAX_PX {
-            self.pending_tap = Some((time, pos));
+            self.state = GestureState::WaitingForSecondTap {
+                tap_time: time,
+                tap_pos: pos,
+            };
         } else {
             // Long press or drag — not a tap, don't record
         }
@@ -177,7 +187,7 @@ impl DoubleTapDragDetector {
 
     /// Whether a zoom-drag gesture is currently active.
     pub(super) fn is_zooming(&self) -> bool {
-        self.zooming
+        matches!(self.state, GestureState::ZoomDragging { .. })
     }
 
     /// Returns and consumes a confirmed single-tap position, if available.
