@@ -253,7 +253,7 @@ impl Gui {
         let date_string = radar_config.timestamp.format("%Y-%m-%d").to_string();
         let time_string = radar_config.timestamp.format("%H:%M:%S").to_string();
 
-        Self {
+        let mut gui = Self {
             radar: RadarState {
                 config: radar_config,
                 fetching: false,
@@ -288,7 +288,9 @@ impl Gui {
             preferences: UserPreferences::default(),
             show_settings: false,
             gps_config: rustdar_gps::GpsConfig::default(),
-        }
+        };
+        gui.initialize_pane_enabled();
+        gui
     }
 
     /// Create the UI using egui.
@@ -312,6 +314,15 @@ impl Gui {
         self.render_desktop_ui(&mut root_ui, &mut actions);
 
         self.render_settings(ctx, &mut actions);
+
+        // Ensure the handler state reflects the active pane's config at frame
+        // end, so any deferred actions (FetchOverlay, etc.) processed after the
+        // frame use the correct per-pane state.
+        let active = &self.panes[self.active_pane];
+        if !active.overlay_configs.is_empty() {
+            let configs = active.overlay_configs.clone();
+            self.overlays.load_pane_configs(&configs);
+        }
 
         actions
     }
@@ -356,7 +367,7 @@ impl Gui {
         // Auto-refresh overlay data when layers are enabled and refresh interval elapsed
         for &kind in OverlayKind::all() {
             if let Some(interval) = self.overlays.auto_poll_interval(kind)
-                && self.overlays.is_enabled(kind)
+                && self.any_pane_has_overlay_enabled(kind)
                     && !self.overlays.is_fetching(kind)
                     && self.overlays.fetch_time(kind)
                         .is_none_or(|t| t.elapsed().as_secs() >= interval)
@@ -547,7 +558,7 @@ impl Gui {
         let is_mobile = true;
         #[cfg(not(target_os = "android"))]
         let is_mobile = false;
-        self.render_overlay_controls(ui, is_mobile, actions);
+        self.render_overlay_controls(ui, pane, is_mobile, actions);
 
         ui.add_space(6.0);
         ui.separator();
@@ -569,7 +580,7 @@ impl Gui {
         combo_width: f32,
         id_prefix: &str,
     ) {
-        if self.overlays.is_enabled(OverlayKind::Radar) {
+        if pane.is_overlay_enabled(OverlayKind::Radar) {
             ui.indent(format!("{id_prefix}radar_controls"), |ui| {
                 if let Some(scan_info) = &pane.scan_info {
                     let prev_product = pane.selected_product;
@@ -857,12 +868,14 @@ impl Gui {
 
     /// Render controls for all handler-backed overlays generically.
     ///
-    /// Iterates over registered overlay kinds in a fixed display order,
-    /// collects controls from each handler, renders them, and applies
-    /// any resulting control updates.
+    /// Loads the active pane's overlay config snapshot into the handlers,
+    /// renders each handler's controls, applies updates, then saves the
+    /// resulting config back to the pane. This makes every sub-control
+    /// (categories, day, products, etc.) per-pane when Sync Layers is off.
     fn render_overlay_controls(
         &mut self,
         ui: &mut egui::Ui,
+        pane: &mut PaneState,
         is_mobile: bool,
         actions: &mut Vec<GuiAction>,
     ) {
@@ -881,13 +894,18 @@ impl Gui {
             OverlayKind::ColorScale,
         ];
 
+        // Load this pane's config snapshot into the handlers.
+        if !pane.overlay_configs.is_empty() {
+            self.overlays.load_pane_configs(&pane.overlay_configs);
+        }
+
         let ctx = PaneControlContext {
             pane_idx: self.active_pane,
             is_mobile,
             pane_state: None,
         };
 
-        // Phase 1: Render controls and collect updates
+        // Render controls and collect updates.
         let mut updates: Vec<(OverlayKind, ControlUpdate)> = Vec::new();
 
         for (i, &kind) in ORDER.iter().enumerate() {
@@ -896,12 +914,13 @@ impl Gui {
                 ui.separator();
             }
             let controls = self.overlays.controls(kind, &ctx);
+
             for item in &controls {
                 render_control_item(ui, kind, item, &mut updates);
             }
         }
 
-        // Phase 2: Apply updates and handle effects
+        // Apply updates and handle effects.
         let mut pane_ctx = PaneControlContextMut {
             pane_idx: self.active_pane,
             pane_state: None,
@@ -909,13 +928,14 @@ impl Gui {
 
         for (kind, update) in updates {
             let effect = self.overlays.apply_control(kind, &update, &mut pane_ctx);
-            match effect {
-                ControlEffect::Fetch => {
-                    actions.push(GuiAction::FetchOverlay(kind));
-                }
-                ControlEffect::None => {}
+            if matches!(effect, ControlEffect::Fetch) {
+                actions.push(GuiAction::FetchOverlay(kind));
             }
         }
+
+        // Save the (possibly mutated) handler state back to the pane.
+        pane.overlay_configs = self.overlays.save_pane_configs();
+        pane.enabled_overlays = self.overlays.save_enabled_map();
     }
 
     /// Return the pane indices that loop actions should target.
@@ -941,9 +961,12 @@ impl Gui {
         let active_viewing_live = src.viewing_live;
         let active_time_step_secs = src.time_step_secs;
         let active_draw_order = src.draw_order.clone();
+        let active_enabled_overlays = src.enabled_overlays.clone();
+        let active_overlay_configs = src.overlay_configs.clone();
+        let active_selected_product = src.selected_product;
+        let active_selected_elevation = src.selected_elevation;
 
-        // All overlay toggles live in the global OverlayRegistry, already shared.
-        // Sync only per-pane fields.
+        // Sync per-pane fields including enabled overlays, configs, and radar product/elevation.
         for (idx, p) in self.panes.iter_mut().enumerate() {
             if idx == self.active_pane {
                 continue;
@@ -953,7 +976,39 @@ impl Gui {
             p.viewing_live = active_viewing_live;
             p.time_step_secs = active_time_step_secs;
             p.draw_order = active_draw_order.clone();
+            p.enabled_overlays = active_enabled_overlays.clone();
+            p.overlay_configs = active_overlay_configs.clone();
+            p.selected_product = active_selected_product;
+            p.selected_elevation = active_selected_elevation;
         }
+    }
+
+    /// Initialize per-pane `enabled_overlays` from the current handler states.
+    ///
+    /// Called after `new()` and after `load_ui_config()` to populate any panes
+    /// whose `enabled_overlays` maps are empty (backward compatibility).
+    pub fn initialize_pane_enabled(&mut self) {
+        let defaults = self.overlays.build_enabled_map();
+        let default_configs = self.overlays.save_pane_configs();
+        for pane in &mut self.panes {
+            for (&kind, &enabled) in &defaults {
+                pane.enabled_overlays.entry(kind).or_insert(enabled);
+            }
+            // Seed overlay configs from handler defaults for panes with empty configs.
+            if pane.overlay_configs.is_empty() {
+                pane.overlay_configs = default_configs.clone();
+            }
+        }
+    }
+
+    /// Returns `true` if any pane has the given overlay kind enabled.
+    ///
+    /// Used for auto-poll decisions: we should fetch data for an overlay
+    /// if at least one pane wants to display it.
+    pub fn any_pane_has_overlay_enabled(&self, kind: OverlayKind) -> bool {
+        self.panes.iter()
+            .take(self.pane_layout.pane_count)
+            .any(|p| p.is_overlay_enabled(kind))
     }
 
     /// Get the active pane (immutable).
@@ -1075,7 +1130,7 @@ impl Gui {
         self.auto_poll.is_active()
             || OverlayKind::all().iter().any(|&kind| {
                 self.overlays.auto_poll_interval(kind).is_some()
-                    && self.overlays.is_enabled(kind)
+                    && self.any_pane_has_overlay_enabled(kind)
             })
     }
 

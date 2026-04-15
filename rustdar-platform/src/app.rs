@@ -238,10 +238,11 @@ impl App {
             }
         }
 
-        // Deduplicate overlay renders: when viewport_sync is on, group by
-        // (overlay_kind, zoom, data_generation, width, height) and spawn one render for all panes
+        // Deduplicate overlay renders: when viewport_sync AND sync_layers are both on,
+        // group by (overlay_kind, zoom, data_generation, width, height) and spawn one render for all panes.
+        // When sync_layers is off, each pane may have different overlay configs, so no grouping.
         if !overlay_renders.is_empty() {
-            if self.gui.is_viewport_sync() {
+            if self.gui.is_viewport_sync() && self.gui.is_sync_layers() {
                 struct GroupedRender {
                     kind: OverlayKind,
                     bounds: rustdar_overlays::types::GeoBounds,

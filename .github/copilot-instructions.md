@@ -59,6 +59,9 @@ cargo clippy --all-targets --all-features    # Lint (matches CI)
 
 ## Gotchas
 
+- **Per-pane overlay config swapping:** `OverlayHandler` state is global (one instance per `OverlayKind`), but each pane has its own config snapshot (`PaneState::overlay_configs`). Code that reads handler config must call `overlays.load_pane_configs()` first to swap the correct pane's settings into the handler. **Every call site** that touches handler config — `controls()`, `apply_control()`, `prepare_rasterize()`, `create_fetch_tasks()`, `clickable_items()`, `hover_value_at()`, `per_frame_points()`, `has_data()`, `data_generation()` — must be preceded by a config load for the relevant pane. After mutation (e.g. `apply_control`), call `save_pane_configs()` / `save_enabled_map()` to persist changes back to the pane.
+- **Handler `data_generation` must reflect config changes:** When a handler's config field affects rendering output (e.g. `selected_param`, `time_window_secs`, `satellite`), changing that field in `apply_control()` must bump `state.data_generation` (use `wrapping_add(1)`). Otherwise the per-pane `OverlayTextureCache` won't detect that a re-render is needed when configs differ between panes.
+- **Global data + per-pane config handlers:** If a handler fetches data globally but renders differently based on config (e.g. model data `selected_param`, GLM `time_window_secs`), either cache results per-config-key (like `ModelDataHandler::cached_grids`) or ensure `prepare_rasterize` captures the config at closure-build time. A single global data slot is insufficient when two panes need different views of the same overlay type.
 - **Deferred exit:** `GuiAction::Exit` sets a flag; actual exit on next `WindowEvent`. Android needs explicit `std::process::exit(0)`.
 - **Surface loss:** Drop `AppState` but keep `cached_render` in `PaneRenderState`. Next redraw recreates fresh surface.
 - **Lazy `AppState`:** Created on first `handle_redraw()`, not in `resumed()`, to prevent Android ANRs on fold/unfold.
@@ -85,3 +88,8 @@ cargo clippy --all-targets --all-features    # Lint (matches CI)
 5. Add rasterize function in `rasterize.rs` (follow `rasterize_nws_alerts()` pattern)
 6. Create handler in `handlers/` implementing `OverlayHandler` trait (follow existing handlers)
 7. Register in `handlers/mod.rs` `create_handlers()`
+8. **Per-pane correctness:** If the handler has config beyond `enabled` (e.g. selected parameter, day, time window), ensure:
+   - `apply_control()` bumps `state.data_generation` when any render-affecting config changes
+   - `serialize_state()` / `deserialize_state()` round-trip all config fields
+   - `prepare_rasterize()` captures config into the closure (don't rely on `&self` at render time)
+   - If different configs need different fetched data, cache per config key (see `ModelDataHandler::cached_grids`)

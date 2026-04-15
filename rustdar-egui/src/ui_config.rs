@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use rustdar_overlays::render::layers::LayerKind;
 use rustdar_overlays::render::overlay_state::OverlayKind;
@@ -27,6 +27,12 @@ struct PaneConfig {
     /// Visual stacking order for all map layers (bottom to top).
     #[serde(default = "OverlayKind::default_draw_order")]
     draw_order: Vec<OverlayKind>,
+    /// Per-pane overlay enabled state (master visibility per overlay kind).
+    #[serde(default)]
+    enabled_overlays: HashMap<OverlayKind, bool>,
+    /// Per-pane overlay handler config snapshots.
+    #[serde(default)]
+    overlay_configs: HashMap<OverlayKind, serde_json::Value>,
 }
 
 fn default_site() -> String {
@@ -62,6 +68,8 @@ impl Default for PaneConfig {
             site: String::new(),
             time_step_secs: 600,
             draw_order: OverlayKind::default_draw_order(),
+            enabled_overlays: HashMap::new(),
+            overlay_configs: HashMap::new(),
         }
     }
 }
@@ -133,6 +141,8 @@ impl super::Gui {
                 site: pane.site.clone(),
                 time_step_secs: pane.time_step_secs,
                 draw_order: pane.draw_order.clone(),
+                enabled_overlays: pane.enabled_overlays.clone(),
+                overlay_configs: pane.overlay_configs.clone(),
             }
         }).collect();
         let config = UiConfig {
@@ -234,6 +244,14 @@ impl super::Gui {
                     legacy_radar_enabled = Some(enabled);
                 }
             pane.draw_order = reconcile_draw_order(&pc.draw_order);
+            // Restore per-pane overlay enabled state.
+            if !pc.enabled_overlays.is_empty() {
+                pane.enabled_overlays = pc.enabled_overlays.clone();
+            }
+            // Restore per-pane overlay handler configs.
+            if !pc.overlay_configs.is_empty() {
+                pane.overlay_configs = pc.overlay_configs.clone();
+            }
         }
 
         // Restore handler-owned overlay states (backward-compatible: old configs have empty map)
@@ -244,6 +262,10 @@ impl super::Gui {
             // Apply the old per-pane Radar toggle to the global handler.
             self.overlays.set_enabled(OverlayKind::Radar, enabled);
         }
+
+        // Fill in any overlay kinds not yet in per-pane enabled maps
+        // (e.g. newly added overlays or first load after migration).
+        self.initialize_pane_enabled();
     }
 }
 

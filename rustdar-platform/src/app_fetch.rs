@@ -252,6 +252,13 @@ impl super::App {
     fn fetch_overlay(&mut self, kind: OverlayKind) {
         use rustdar_overlays::render::overlay_state::FetchConfig;
 
+        // Load the active pane's config so create_fetch_tasks reads the
+        // correct per-pane settings (e.g. selected model parameter, SPC day).
+        let pane_configs = self.gui.active_pane().overlay_configs.clone();
+        if !pane_configs.is_empty() {
+            self.gui.overlays.load_pane_configs(&pane_configs);
+        }
+
         let config = FetchConfig {
             client: self.http_client.clone(),
             zone_cache_dir: self.platform.zone_cache_dir().map(|p| p.to_path_buf()),
@@ -316,9 +323,16 @@ impl super::App {
             max_lon: geo_bounds.max_lon + lon_range * overdraw,
         };
 
-        // Use the first target pane for data extraction (all synced panes share config)
+        // Use the first target pane for data extraction (all synced panes share config).
+        // Clone the pane's overlay config before mutating the registry.
         let first_pane_idx = pane_indices[0];
-        let Some(target_pane) = self.gui.pane(first_pane_idx) else { return };
+        let pane_configs = {
+            let Some(target_pane) = self.gui.pane(first_pane_idx) else { return };
+            target_pane.overlay_configs.clone()
+        };
+        if !pane_configs.is_empty() {
+            self.gui.overlays.load_pane_configs(&pane_configs);
+        }
 
         let sender = self.channels.overlay_render_sender.clone();
         let window = self.window.clone();
@@ -362,6 +376,7 @@ impl super::App {
                 });
             }
             OverlayKind::RadarSites => {
+                let Some(target_pane) = self.gui.pane(first_pane_idx) else { return };
                 let target_site = target_pane.site.clone();
                 let target_loading = target_pane.loading_site.clone();
                 let is_dark = self.cached_dark_theme.unwrap_or(false);

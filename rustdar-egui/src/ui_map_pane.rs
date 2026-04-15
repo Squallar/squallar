@@ -48,9 +48,16 @@ pub(super) fn render_pane_map_content(
     zoom: f64,
     ctx: &mut PaneRenderCtx<'_>,
 ) {
+    // Load this pane's overlay config snapshot so handler queries
+    // (clickable_items, hover_value_at, per_frame_points, etc.) reflect
+    // the per-pane settings.
+    if !ctx.pane.overlay_configs.is_empty() {
+        ctx.overlays.load_pane_configs(&ctx.pane.overlay_configs);
+    }
+
     // Pre-compute radar site icon rects so overlay click detection can
     // skip clicks that land on a site marker (sites take priority).
-    if ctx.overlays.is_enabled(OverlayKind::RadarSites) {
+    if ctx.pane.is_overlay_enabled(OverlayKind::RadarSites) {
         let screen_rect = ui.max_rect();
         let icon_size = (10.0 + zoom as f32 * 2.0).clamp(8.0, 24.0);
         for site in &RADARS {
@@ -82,7 +89,7 @@ pub(super) fn render_pane_map_content(
 
         let draw_order: Vec<OverlayKind> = ctx.pane.draw_order.clone();
         for &kind in &draw_order {
-            if !ctx.overlays.is_enabled(kind) {
+            if !ctx.pane.is_overlay_enabled(kind) {
                 continue;
             }
             match kind {
@@ -203,7 +210,7 @@ pub(super) fn render_pane_map_content(
                     let hover_lat = map_pos.y();
                     let hover_lon = map_pos.x();
                     for &kind in &draw_order {
-                        if ctx.overlays.is_enabled(kind)
+                        if ctx.pane.is_overlay_enabled(kind)
                             && let Some(text) = ctx.overlays.hover_value_at(kind, hover_lat, hover_lon) {
                                 ctx.pane.overlay_hover_value = Some(text);
                                 break;
@@ -229,7 +236,7 @@ pub(super) fn render_pane_map_content(
             if kind == OverlayKind::Radar {
                 continue;
             }
-            let enabled = ctx.overlays.is_enabled(kind);
+            let enabled = ctx.pane.is_overlay_enabled(kind);
             let data_gen = if kind == OverlayKind::RadarSites {
                 ctx.pane.radar_sites_render_gen
             } else {
@@ -872,7 +879,7 @@ fn render_overlay_color_scales(
     let mut bar_offset = 0;
 
     for &kind in &pane.draw_order {
-        if !overlays.is_enabled(kind) || kind == OverlayKind::ColorScale {
+        if !pane.is_overlay_enabled(kind) || kind == OverlayKind::ColorScale {
             continue;
         }
         let Some(legend) = overlays.legend(kind) else {

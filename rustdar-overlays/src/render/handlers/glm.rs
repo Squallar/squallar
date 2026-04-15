@@ -403,7 +403,7 @@ impl OverlayHandler for GlmHandler {
                     let new_sat = SatelliteSelection::from_str(val);
                     if new_sat != self.satellite {
                         self.satellite = new_sat;
-                        // Satellite change needs a re-fetch
+                        self.state.data_generation = self.state.data_generation.wrapping_add(1);
                         return ControlEffect::Fetch;
                     }
                 }
@@ -412,6 +412,7 @@ impl OverlayHandler for GlmHandler {
             "time_window" => {
                 if let ControlValue::Float(mins) = update.value {
                     self.time_window_secs = (mins * 60.0).clamp(60.0, 1800.0);
+                    self.state.data_generation = self.state.data_generation.wrapping_add(1);
                     return ControlEffect::Fetch;
                 }
                 ControlEffect::None
@@ -419,6 +420,7 @@ impl OverlayHandler for GlmHandler {
             "show_events" => {
                 if let ControlValue::Bool(val) = update.value {
                     self.show_events = val;
+                    self.state.data_generation = self.state.data_generation.wrapping_add(1);
                     self.clear_cache();
                     return ControlEffect::Fetch;
                 }
@@ -427,6 +429,7 @@ impl OverlayHandler for GlmHandler {
             "show_groups" => {
                 if let ControlValue::Bool(val) = update.value {
                     self.show_groups = val;
+                    self.state.data_generation = self.state.data_generation.wrapping_add(1);
                     self.clear_cache();
                     return ControlEffect::Fetch;
                 }
@@ -435,6 +438,7 @@ impl OverlayHandler for GlmHandler {
             "show_flashes" => {
                 if let ControlValue::Bool(val) = update.value {
                     self.show_flashes = val;
+                    self.state.data_generation = self.state.data_generation.wrapping_add(1);
                     self.clear_cache();
                     return ControlEffect::Fetch;
                 }

@@ -82,13 +82,14 @@ impl super::Gui {
                 });
 
                 ui.menu_button("View", |ui| {
-                    let mut sites_enabled = self.overlays.is_enabled(OverlayKind::RadarSites);
+                    let pane = &mut self.panes[self.active_pane];
+                    let mut sites_enabled = pane.is_overlay_enabled(OverlayKind::RadarSites);
                     if ui.checkbox(&mut sites_enabled, "Show radar sites").changed() {
-                        self.overlays.set_enabled(OverlayKind::RadarSites, sites_enabled);
+                        pane.set_overlay_enabled(OverlayKind::RadarSites, sites_enabled);
                     }
-                    let mut labels_enabled = self.overlays.is_enabled(OverlayKind::CityLabels);
+                    let mut labels_enabled = pane.is_overlay_enabled(OverlayKind::CityLabels);
                     if ui.checkbox(&mut labels_enabled, "Show city labels").changed() {
-                        self.overlays.set_enabled(OverlayKind::CityLabels, labels_enabled);
+                        pane.set_overlay_enabled(OverlayKind::CityLabels, labels_enabled);
                     }
                     ui.separator();
                     if ui.button("Time...").clicked() {

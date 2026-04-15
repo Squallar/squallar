@@ -85,6 +85,13 @@ pub struct PaneState {
     /// Per-pane draw order (bottom to top). Controls the visual stacking of all
     /// map layers. Persisted across sessions.
     pub draw_order: Vec<OverlayKind>,
+    /// Per-pane overlay enabled state (master visibility for each overlay kind).
+    /// When `sync_layers` is on, this is propagated from the active pane to all others.
+    pub enabled_overlays: HashMap<OverlayKind, bool>,
+    /// Per-pane overlay handler config snapshots (serialized handler state per kind).
+    /// Swapped into/out of the global OverlayRegistry around access points so each
+    /// pane can independently configure overlay sub-controls (categories, day, etc.).
+    pub overlay_configs: HashMap<OverlayKind, serde_json::Value>,
     /// Radar display state. Always present; in single-frame mode holds at most
     /// one frame (the current static radar image). In multi-frame mode holds
     /// the full animated loop.
@@ -146,6 +153,8 @@ impl PaneState {
                 .map(|&k| (k, OverlayTextureCache::new()))
                 .collect(),
             draw_order: OverlayKind::default_draw_order(),
+            enabled_overlays: HashMap::new(),
+            overlay_configs: HashMap::new(),
             loop_state: LoopPlaybackState::new(),
             loading_site: None,
             radar_sites_render_gen: 0,
@@ -157,6 +166,18 @@ impl PaneState {
         self.loop_state.frames
             .get(self.loop_state.current_frame)
             .and_then(|f| f.texture.as_ref())
+    }
+
+    /// Whether this overlay is enabled for this pane.
+    ///
+    /// Falls back to `false` if the kind has no entry (uninitialised pane).
+    pub fn is_overlay_enabled(&self, kind: OverlayKind) -> bool {
+        self.enabled_overlays.get(&kind).copied().unwrap_or(false)
+    }
+
+    /// Set the per-pane enabled state for a given overlay kind.
+    pub fn set_overlay_enabled(&mut self, kind: OverlayKind, enabled: bool) {
+        self.enabled_overlays.insert(kind, enabled);
     }
 
     /// Get the overlay texture cache for a given kind (read-only).

@@ -493,6 +493,40 @@ impl OverlayRegistry {
         self.handler(kind).is_some_and(|h| h.default_enabled())
     }
 
+    /// Build a map of overlay kind → current handler enabled state.
+    ///
+    /// Used to initialize per-pane `enabled_overlays` from the handlers'
+    /// current state (after config deserialization).
+    pub fn build_enabled_map(&self) -> std::collections::HashMap<OverlayKind, bool> {
+        self.handlers.iter()
+            .map(|h| (h.kind(), h.is_enabled()))
+            .collect()
+    }
+
+    /// Snapshot each handler's current config state into a per-pane map.
+    pub fn save_pane_configs(&self) -> std::collections::HashMap<OverlayKind, serde_json::Value> {
+        self.handlers.iter()
+            .map(|h| (h.kind(), h.serialize_state()))
+            .collect()
+    }
+
+    /// Restore handler configs from a per-pane config snapshot.
+    /// Only overwrites handlers whose kind appears in the map.
+    pub fn load_pane_configs(&mut self, configs: &std::collections::HashMap<OverlayKind, serde_json::Value>) {
+        for h in &mut self.handlers {
+            if let Some(val) = configs.get(&h.kind()) {
+                h.deserialize_state(val.clone());
+            }
+        }
+    }
+
+    /// Snapshot each handler's `is_enabled()` into a map.
+    pub fn save_enabled_map(&self) -> std::collections::HashMap<OverlayKind, bool> {
+        self.handlers.iter()
+            .map(|h| (h.kind(), h.is_enabled()))
+            .collect()
+    }
+
     // ── Per-frame point rendering delegates ───────────────────────────
 
     /// Geographic points for per-frame rendering of the given overlay kind.

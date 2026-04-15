@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::hrrr::{HrrrFetchResult, HrrrGridData, ModelParameter};
@@ -17,6 +18,8 @@ pub(crate) struct ModelDataHandler {
     pub state: OverlayState<Option<Arc<HrrrGridData>>>,
     pub enabled: bool,
     pub selected_param: ModelParameter,
+    /// Per-parameter grid cache so different panes can render different parameters.
+    pub cached_grids: HashMap<ModelParameter, Arc<HrrrGridData>>,
 }
 
 impl ModelDataHandler {
@@ -25,6 +28,7 @@ impl ModelDataHandler {
             state: OverlayState::new(),
             enabled: false,
             selected_param: ModelParameter::SurfaceBasedCin,
+            cached_grids: HashMap::new(),
         }
     }
 }
@@ -55,7 +59,7 @@ impl OverlayHandler for ModelDataHandler {
     }
 
     fn has_data(&self) -> bool {
-        self.state.data.is_some()
+        self.cached_grids.contains_key(&self.selected_param)
     }
 
     fn is_fetching(&self) -> bool {
@@ -104,7 +108,10 @@ impl OverlayHandler for ModelDataHandler {
                     grid.nj,
                     grid.values.len(),
                 );
-                self.state.set_data(Some(Arc::new(grid)));
+                let param = grid.parameter;
+                let arc = Arc::new(grid);
+                self.cached_grids.insert(param, arc.clone());
+                self.state.set_data(Some(arc));
             }
             Err(e) => {
                 log::error!("HRRR fetch failed: {e}");
@@ -121,7 +128,7 @@ impl OverlayHandler for ModelDataHandler {
     }
 
     fn hover_value_at(&self, lat: f64, lon: f64) -> Option<String> {
-        let grid = self.state.data.as_ref()?;
+        let grid = self.cached_grids.get(&self.selected_param)?;
         // Quick bounds check.
         if lat < grid.bounds.min_lat || lat > grid.bounds.max_lat
             || lon < grid.bounds.min_lon || lon > grid.bounds.max_lon
@@ -172,7 +179,7 @@ impl OverlayHandler for ModelDataHandler {
         &self,
         _ctx: &RasterizeContext,
     ) -> Option<Box<dyn FnOnce(&GeoBounds, u32, u32) -> RasterizeOutput + Send>> {
-        let grid = self.state.data.as_ref()?.clone();
+        let grid = self.cached_grids.get(&self.selected_param)?.clone();
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
             rasterize::rasterize_model_data(&grid, bounds, width, height)
         }))
@@ -195,7 +202,7 @@ impl OverlayHandler for ModelDataHandler {
     }
 
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
-        let label = if let Some(grid) = &self.state.data {
+        let label = if let Some(grid) = self.cached_grids.get(&self.selected_param) {
             let time_str = grid.ref_time.format("%H:%Mz").to_string();
             format!("\u{1f321}\u{fe0f}  Model Data ({time_str})")
         } else {
@@ -267,6 +274,13 @@ impl OverlayHandler for ModelDataHandler {
                     let new_param: ModelParameter = val.parse().unwrap();
                     if new_param != self.selected_param {
                         self.selected_param = new_param;
+                        // If we already have cached data for this parameter,
+                        // bump data_generation to trigger a re-render without
+                        // a new fetch.
+                        if self.cached_grids.contains_key(&new_param) {
+                            self.state.data_generation = self.state.data_generation.wrapping_add(1);
+                            return ControlEffect::None;
+                        }
                         return ControlEffect::Fetch;
                     }
                 }
