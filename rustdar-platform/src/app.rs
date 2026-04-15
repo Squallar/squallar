@@ -379,7 +379,7 @@ impl App {
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) {
         let window = event_loop
-            .create_window(Window::default_attributes())
+            .create_window(Window::default_attributes().with_title("Rustdar"))
             .unwrap();
 
         let window = Arc::new(window);
