@@ -154,7 +154,6 @@ fn pan_exceeds_coverage(texture_bounds: &GeoBounds, viewport_bounds: &GeoBounds)
 pub fn overlay_texture_rect(
     projector: &walkers::Projector,
     tex: &OverlayTextureData,
-    _screen_rect: egui::Rect,
 ) -> egui::Rect {
     let nw = projector
         .project(walkers::lat_lon(tex.geo_bounds.max_lat, tex.geo_bounds.min_lon))
@@ -175,7 +174,7 @@ pub fn draw_overlay_texture(
     tex: &OverlayTextureData,
     screen_rect: egui::Rect,
 ) {
-    let rect = overlay_texture_rect(projector, tex, screen_rect);
+    let rect = overlay_texture_rect(projector, tex);
 
     // Skip if entirely off-screen
     if !screen_rect.intersects(rect) {

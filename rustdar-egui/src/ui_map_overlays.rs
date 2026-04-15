@@ -101,7 +101,7 @@ impl<'a> OverlayDrawContext<'a> {
         // If a hit buffer is available, use it for pixel-perfect detection.
         if let Some(tex) = texture.and_then(|c| c.current.as_ref())
             && let Some(ref hit_map) = tex.hit_map {
-                let rect = crate::overlay_cache::overlay_texture_rect(self.projector, tex, self.screen_rect);
+                let rect = crate::overlay_cache::overlay_texture_rect(self.projector, tex);
                 if rect.width() > 0.0 && rect.height() > 0.0 {
                     let u = (click_pos.x - rect.left()) / rect.width();
                     let v = (click_pos.y - rect.top()) / rect.height();
