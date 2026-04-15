@@ -6,6 +6,12 @@ use rustdar_gps::HeadingSource;
 use crate::actions::GuiAction;
 
 const IS_MOBILE: bool = cfg!(target_os = "android");
+const SETTINGS_POPUP_MARGIN: f32 = 32.0;
+const SETTINGS_POPUP_MIN_WIDTH_MOBILE: f32 = 250.0;
+const SETTINGS_POPUP_WIDTH_DESKTOP: f32 = 340.0;
+const SETTINGS_SMALL_SPACING: f32 = 4.0;
+const SETTINGS_LARGE_SPACING: f32 = 8.0;
+const GPS_BAUD_RATES: &[u32] = &[4800, 9600, 38400, 115200];
 
 impl super::Gui {
     /// Render the settings window if `show_settings` is true.
@@ -17,9 +23,9 @@ impl super::Gui {
 
         let screen = ctx.input(|i| i.viewport_rect());
         let popup_width = if IS_MOBILE {
-            (screen.width() - 32.0).max(250.0)
+            (screen.width() - SETTINGS_POPUP_MARGIN).max(SETTINGS_POPUP_MIN_WIDTH_MOBILE)
         } else {
-            340.0
+            SETTINGS_POPUP_WIDTH_DESKTOP
         };
 
         let mut open = true;
@@ -33,7 +39,7 @@ impl super::Gui {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.heading("Units");
-                ui.add_space(4.0);
+                ui.add_space(SETTINGS_SMALL_SPACING);
 
                 unit_combo(ui, "Timezone", &mut self.preferences.timezone, TimezonePreference::ALL);
                 unit_combo(ui, "Temperature", &mut self.preferences.temperature, TemperatureUnit::ALL);
@@ -43,15 +49,15 @@ impl super::Gui {
                 unit_combo(ui, "Precip rate", &mut self.preferences.precip_rate, PrecipRateUnit::ALL);
                 unit_combo(ui, "Hail size", &mut self.preferences.hail_size, HailSizeUnit::ALL);
 
-                ui.add_space(8.0);
+                ui.add_space(SETTINGS_LARGE_SPACING);
                 ui.separator();
-                ui.add_space(4.0);
+                ui.add_space(SETTINGS_SMALL_SPACING);
 
                 // --- GPS section (desktop only) ---
                 #[cfg(not(target_os = "android"))]
                 {
                     ui.heading("GPS");
-                    ui.add_space(4.0);
+                    ui.add_space(SETTINGS_SMALL_SPACING);
 
                     // Port selection
                     ui.horizontal(|ui| {
@@ -81,13 +87,13 @@ impl super::Gui {
                             .selected_text(baud_label)
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut self.gps_config.baud_rate, 0, "Auto-detect");
-                                for &rate in &[4800u32, 9600, 38400, 115200] {
+                                for &rate in GPS_BAUD_RATES {
                                     ui.selectable_value(&mut self.gps_config.baud_rate, rate, rate.to_string());
                                 }
                             });
                     });
 
-                    ui.add_space(4.0);
+                    ui.add_space(SETTINGS_SMALL_SPACING);
 
                     // Start/stop button
                     // Note: gps_active state is only meaningful on desktop
@@ -100,7 +106,7 @@ impl super::Gui {
                         actions.push(GuiAction::StopGps);
                     }
 
-                    ui.add_space(4.0);
+                    ui.add_space(SETTINGS_SMALL_SPACING);
 
                     // Fix status
                     if let Some(ref fix) = self.user_fix {
@@ -112,9 +118,9 @@ impl super::Gui {
                         ui.label("No GPS fix");
                     }
 
-                    ui.add_space(8.0);
+                    ui.add_space(SETTINGS_LARGE_SPACING);
                     ui.separator();
-                    ui.add_space(4.0);
+                    ui.add_space(SETTINGS_SMALL_SPACING);
                 }
 
                 // --- Heading source (all platforms) ---
@@ -133,9 +139,9 @@ impl super::Gui {
                         });
                 });
 
-                ui.add_space(8.0);
+                ui.add_space(SETTINGS_LARGE_SPACING);
                 ui.separator();
-                ui.add_space(4.0);
+                ui.add_space(SETTINGS_SMALL_SPACING);
 
                 if ui.button("Reset to defaults").clicked() {
                     self.preferences = UserPreferences::default();
