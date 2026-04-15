@@ -102,7 +102,7 @@ impl App {
             .timeout(std::time::Duration::from_secs(30))
             .user_agent("rustdar/1.0 (https://github.com/USA-RedDragon/rustdar)")
             .build()
-            .unwrap_or_default();
+            .expect("Failed to build HTTP client");
 
         let mut gui = Gui::new();
         if let Some(config_dir) = platform.config_dir() {
