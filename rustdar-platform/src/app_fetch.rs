@@ -307,7 +307,7 @@ impl super::App {
         req: OverlayRenderRequest,
     ) {
         use rustdar_overlays::render::rasterize;
-        use rustdar_egui::overlay_cache::OVERDRAW_FRACTION;
+        use rustdar_egui::overlay_cache::{OVERDRAW_FRACTION, ZOOM_QUANTIZATION_FACTOR};
 
         let OverlayRenderRequest { geo_bounds, width, height, data_generation, zoom } = req;
 
@@ -363,7 +363,7 @@ impl super::App {
             | OverlayKind::ModelData => {
                 let rctx = rustdar_overlays::render::overlay_state::RasterizeContext {
                     is_dark: self.cached_dark_theme.unwrap_or(false),
-                    zoom: zoom as f64 / 32.0,
+                    zoom: zoom as f64 / ZOOM_QUANTIZATION_FACTOR,
                 };
                 let Some(rasterize_fn) = self.gui.overlays.prepare_rasterize(kind, &rctx) else {
                     // Nothing to render — clear in-flight
@@ -397,7 +397,7 @@ impl super::App {
                 let target_site = target_pane.site.clone();
                 let target_loading = target_pane.loading_site.clone();
                 let is_dark = self.cached_dark_theme.unwrap_or(false);
-                let actual_zoom = zoom as f64 / 32.0;
+                let actual_zoom = zoom as f64 / ZOOM_QUANTIZATION_FACTOR;
                 let sites: Vec<rasterize::RadarSiteInfo> = rustdar_radar::sites::RADARS.iter().map(|s| {
                     rasterize::RadarSiteInfo {
                         name: s.name.to_string(),

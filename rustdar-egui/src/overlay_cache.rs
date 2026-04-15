@@ -15,10 +15,24 @@ use rustdar_overlays::types::{GeoBounds, OverlayFeature, ScreenPoint};
 
 // ── Viewport state (reused for render-trigger detection) ─────────────────
 
+/// Multiplier for zoom-level quantization.
+///
+/// Overlay textures are re-rasterized only when the quantized zoom changes,
+/// so this value controls the trade-off between render frequency and visual
+/// freshness.  32 (= 2^5) gives ~0.031 zoom-unit granularity per step:
+///
+/// - **Finer** (e.g. 64): triggers excessive rerenders during smooth zoom
+///   gestures, wasting CPU on nearly-identical textures.
+/// - **Coarser** (e.g. 16): misses visible zoom changes, leaving stale
+///   textures on screen until the next quantization boundary.
+///
+/// Used in [`quantize_zoom`] to encode and in `rustdar-platform` to decode
+/// back to `f64`.
+pub const ZOOM_QUANTIZATION_FACTOR: f64 = 32.0;
+
 /// Quantised zoom level for detecting when a re-render is needed.
-/// Encoded as `(zoom * 32.0).round() as i32` for sub-integer sensitivity.
 fn quantize_zoom(zoom: f64) -> i32 {
-    (zoom * 32.0).round() as i32
+    (zoom * ZOOM_QUANTIZATION_FACTOR).round() as i32
 }
 
 /// Fraction of the texture dimension used as overdraw margin.
