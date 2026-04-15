@@ -142,6 +142,19 @@ impl super::Gui {
                         }
                     });
 
+                    // Pre-filter: discard clicks that land on a floating dialog or popup
+                    // window. This is the canonical dialog-blocking gate for map
+                    // interactions. All handlers that receive overlay_click_pos from
+                    // PaneRenderCtx automatically inherit this protection.
+                    //
+                    // CONVENTION: New map click handlers MUST use overlay_click_pos from
+                    // PaneRenderCtx — never read raw click events via ctx.input() for
+                    // map-level interactions, as that bypasses dialog blocking.
+                    let overlay_click_pos = overlay_click_pos.filter(|&pos| {
+                        !ctx.layer_id_at(pos)
+                            .is_some_and(|l| l.order > egui::Order::Background)
+                    });
+
                     #[cfg(target_os = "android")]
                     let suppress_pan = is_zoom_dragging || long_press_pos.is_some();
                     #[cfg(not(target_os = "android"))]
@@ -239,6 +252,10 @@ impl super::Gui {
                 None
             }
         }) {
+            // Don't switch panes when the click lands on a floating dialog or popup.
+            if ctx.layer_id_at(pos).is_some_and(|l| l.order > egui::Order::Background) {
+                return;
+            }
             for idx in 0..self.pane_layout.pane_count {
                 let rect = self.pane_layout.pane_rect(idx, panel_rect);
                 if rect.contains(pos) && idx != self.active_pane {

@@ -15,7 +15,7 @@ use rustdar_radar::sites::RADARS;
 use rustdar_radar::types::{MAX_RANGE_KM, ImageBounds, RadarProduct};
 use walkers::HttpTiles;
 
-use super::super::map_overlays::{OverlayDrawContext, draw_label_tiles_overlay};
+use super::super::map_overlays::{OverlayDrawContext, draw_label_tiles_overlay, is_pos_blocked};
 
 /// Shared references needed for rendering a single pane's map content.
 pub(super) struct PaneRenderCtx<'a> {
@@ -143,6 +143,9 @@ pub(super) fn render_pane_map_content(
                         ctx.actions,
                         ctx.pane_idx,
                         ctx.preferences,
+                        ctx.overlay_click_pos,
+                        ctx.pane_rect,
+                        &ctx.excluded_rects,
                     );
                 }
                 // User location blue dot
@@ -186,6 +189,7 @@ pub(super) fn render_pane_map_content(
                                     prefs: ctx.preferences,
                                     overlay_click_pos: ctx.overlay_click_pos,
                                     excluded_rects: &ctx.excluded_rects,
+                                    pane_rect: ctx.pane_rect,
                                 },
                             ));
                         }
@@ -205,7 +209,8 @@ pub(super) fn render_pane_map_content(
             let hover_pos = ui.ctx().pointer_hover_pos();
             ctx.pane.overlay_hover_value = None;
             if let Some(pos) = hover_pos
-                && ctx.pane_rect.contains(pos) {
+                && ctx.pane_rect.contains(pos)
+                && !ui.ctx().layer_id_at(pos).is_some_and(|l| l.order > egui::Order::Background) {
                     let map_pos = projector.unproject(egui::vec2(pos.x, pos.y));
                     let hover_lat = map_pos.y();
                     let hover_lon = map_pos.x();
@@ -381,6 +386,13 @@ fn update_pane_hover_value_from_meta(
         return;
     };
 
+    // Suppress hover when cursor is over a floating dialog or popup window.
+    if ui.ctx().layer_id_at(hover_pos).is_some_and(|l| l.order > egui::Order::Background) {
+        pane.last_hover_pos = None;
+        pane.hover_value = None;
+        return;
+    }
+
     let pos_changed = pane
         .last_hover_pos
         .map(|last| (last - hover_pos).length() > 0.5)
@@ -412,6 +424,10 @@ fn update_pane_hover_value_from_meta(
 /// The site circles and background pills are in the background-rasterized
 /// texture; this function draws text labels (tiny-skia cannot render text)
 /// and handles interactive hits (clicks → site switch, hover → tooltip/cursor).
+///
+/// `overlay_click_pos` must be taken from `PaneRenderCtx::overlay_click_pos`
+/// (pre-filtered — dialog clicks are already stripped). Never pass a raw
+/// `ctx.input()` click position here.
 fn handle_radar_site_interactions(
     ui: &egui::Ui,
     projector: &walkers::Projector,
@@ -420,6 +436,9 @@ fn handle_radar_site_interactions(
     actions: &mut Vec<GuiAction>,
     pane_idx: usize,
     prefs: &UserPreferences,
+    overlay_click_pos: Option<egui::Pos2>,
+    pane_rect: egui::Rect,
+    excluded_rects: &[egui::Rect],
 ) {
     let screen_rect = ui.max_rect();
     let zoom_f32 = zoom as f32;
@@ -427,13 +446,7 @@ fn handle_radar_site_interactions(
     let font_size = (icon_size * 0.6).clamp(8.0, 12.0);
 
     let hover_pos = ui.ctx().pointer_hover_pos();
-    let click_pos = ui.ctx().input(|i| {
-        if i.pointer.any_click() {
-            i.pointer.interact_pos()
-        } else {
-            None
-        }
-    });
+    let click_pos = overlay_click_pos;
 
     let is_dark = ui.ctx().global_style().visuals.dark_mode;
     let text_color = if is_dark {
@@ -467,14 +480,16 @@ fn handle_radar_site_interactions(
             egui::Rect::from_center_size(site_screen, egui::vec2(icon_size, icon_size));
 
         if let Some(pos) = click_pos
-            && icon_rect.contains(pos) {
+            && icon_rect.contains(pos)
+            && !is_pos_blocked(ui.ctx(), pos, pane_rect, excluded_rects) {
                 pane.loading_site = Some(radar_site.name.to_string());
                 pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
                 actions.push(GuiAction::SwitchRadarSite { site: radar_site.name.to_string(), pane_idx });
             }
 
         if let Some(pos) = hover_pos
-            && icon_rect.contains(pos) {
+            && icon_rect.contains(pos)
+            && !is_pos_blocked(ui.ctx(), pos, pane_rect, excluded_rects) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 let elev_str = match radar_site.elev {
                     Some(e) => {
@@ -1035,8 +1050,11 @@ struct PerFrameOverlayCtx<'a> {
     kind: OverlayKind,
     zoom: f64,
     prefs: &'a UserPreferences,
+    /// Pre-filtered click position (dialog clicks already stripped).
+    /// See `PaneRenderCtx::overlay_click_pos` and the pre-filter in `ui_map.rs`.
     overlay_click_pos: Option<egui::Pos2>,
     excluded_rects: &'a [egui::Rect],
+    pane_rect: egui::Rect,
 }
 
 /// Per-frame rendering for point overlays (e.g. METAR station model plots).
@@ -1098,28 +1116,27 @@ fn render_per_frame_overlay(
         };
         pf.overlays.draw_point(pf.kind, pt.id, &mut ep, &draw_ctx);
 
-        // Click detection
+        // Click detection — layer blocking already applied by pre-filter in ui_map.rs.
         if let Some(click_pos) = pf.overlay_click_pos {
             let dx = click_pos.x - screen.x;
             let dy = click_pos.y - screen.y;
-            if dx * dx + dy * dy <= hit_radius * hit_radius {
-                let on_excluded = pf.excluded_rects.iter().any(|r| r.contains(click_pos));
-                if !on_excluded {
+            if dx * dx + dy * dy <= hit_radius * hit_radius
+                && !is_pos_blocked(ui.ctx(), click_pos, pf.pane_rect, pf.excluded_rects) {
                     selected.push(pt.selection.clone());
                 }
-            }
         }
 
-        // Hover detection
-        if let Some(hp) = hover_pos {
-            let dx = hp.x - screen.x;
-            let dy = hp.y - screen.y;
-            let d2 = dx * dx + dy * dy;
-            if d2 <= hit_radius * hit_radius
-                && closest_hover.is_none_or(|(best_d2, _)| d2 < best_d2) {
-                    closest_hover = Some((d2, pt.id));
-                }
-        }
+        // Hover detection — skip if cursor is over a dialog or outside the pane.
+        if let Some(hp) = hover_pos
+            && !is_pos_blocked(ui.ctx(), hp, pf.pane_rect, pf.excluded_rects) {
+                let dx = hp.x - screen.x;
+                let dy = hp.y - screen.y;
+                let d2 = dx * dx + dy * dy;
+                if d2 <= hit_radius * hit_radius
+                    && closest_hover.is_none_or(|(best_d2, _)| d2 < best_d2) {
+                        closest_hover = Some((d2, pt.id));
+                    }
+            }
     }
 
     // Show tooltip for closest hovered point

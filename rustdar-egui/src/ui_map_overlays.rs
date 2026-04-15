@@ -21,6 +21,33 @@ pub(super) struct OverlayDrawContext<'a> {
     pointer_available: bool,
 }
 
+/// Returns `true` when a screen-space position should be treated as "blocked"
+/// by a floating dialog or non-map UI element, meaning map interactions at
+/// that position must be suppressed.
+///
+/// Three conditions trigger blocking:
+/// 1. `pos` is outside the map pane rect (sidebar, status bar, etc.)
+/// 2. `pos` falls on an explicitly excluded rect (e.g. hamburger button)
+/// 3. `pos` is on an egui layer with order > `Background` (open dialog or popup window)
+///
+/// **Convention for new handlers:** pass every candidate click/hover position
+/// through this function before acting on it. Do **not** read raw click events
+/// from `ctx.input()` for map-level interactions — use the pre-filtered
+/// `PaneRenderCtx::overlay_click_pos` for clicks, and guard hover positions
+/// with this function.
+pub(super) fn is_pos_blocked(
+    ctx: &egui::Context,
+    pos: egui::Pos2,
+    pane_rect: egui::Rect,
+    excluded_rects: &[egui::Rect],
+) -> bool {
+    !pane_rect.contains(pos)
+        || excluded_rects.iter().any(|r| r.contains(pos))
+        || ctx
+            .layer_id_at(pos)
+            .is_some_and(|l| l.order > egui::Order::Background)
+}
+
 impl<'a> OverlayDrawContext<'a> {
     pub fn new(
         ui: &'a egui::Ui,
@@ -34,13 +61,8 @@ impl<'a> OverlayDrawContext<'a> {
 
         // Suppress overlay clicks when the click position is outside
         // the map pane, on a floating UI element, or on a popup layer.
-        let click_on_ui = overlay_click_pos.is_some_and(|p| {
-            !pane_rect.contains(p)
-                || excluded_rects.iter().any(|r| r.contains(p))
-                || ui.ctx()
-                    .layer_id_at(p)
-                    .is_some_and(|l| l.order > egui::Order::Background)
-        });
+        let click_on_ui = overlay_click_pos
+            .is_some_and(|p| is_pos_blocked(ui.ctx(), p, pane_rect, excluded_rects));
 
         Self {
             ui,
