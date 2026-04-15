@@ -1,4 +1,5 @@
 use egui_wgpu::{ScreenDescriptor, wgpu};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use rustdar_egui::actions::GuiAction;
@@ -617,7 +618,7 @@ impl super::App {
             }
 
             // Store all scans as pending downloads and dispatch the first batch
-            self.loop_pending_downloads.insert(resp.pane_idx, scans);
+            self.loop_pending_downloads.insert(resp.pane_idx, VecDeque::from(scans));
             self.dispatch_pending_loop_downloads(resp.pane_idx);
         }
     }
@@ -659,12 +660,12 @@ impl super::App {
         // Filter out timestamps already cached or in flight
         let mut batch = Vec::new();
         while !pending.is_empty() && batch.len() < slots {
-            let (ts, _) = &pending[0];
+            let (ts, _) = pending.front().unwrap();
             if self.loop_scan_cache.contains_key(ts) || self.loop_downloads_in_flight_set.contains(ts) {
                 // Already have or fetching this timestamp — remove from pending
-                pending.remove(0);
+                pending.pop_front();
             } else {
-                batch.push(pending.remove(0));
+                batch.push(pending.pop_front().unwrap());
             }
         }
         let spawned = batch.len();

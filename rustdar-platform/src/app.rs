@@ -1,5 +1,6 @@
 use egui_wgpu::wgpu;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use winit::application::ApplicationHandler;
@@ -68,7 +69,7 @@ pub struct App {
     // Timestamps currently being downloaded (to avoid duplicate downloads across panes).
     loop_downloads_in_flight_set: std::collections::HashSet<chrono::NaiveDateTime>,
     // Pending loop scan downloads per pane, waiting to be dispatched (throttled).
-    loop_pending_downloads: std::collections::HashMap<usize, Vec<(chrono::NaiveDateTime, nexrad_data::aws::archive::Identifier)>>,
+    loop_pending_downloads: std::collections::HashMap<usize, VecDeque<(chrono::NaiveDateTime, nexrad_data::aws::archive::Identifier)>>,
     // Number of loop scan downloads currently in flight (global, not per-pane).
     loop_downloads_in_flight: usize,
     // Shared counter for background render threads in flight (loop + static renders).
