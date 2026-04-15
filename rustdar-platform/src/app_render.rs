@@ -568,10 +568,10 @@ impl super::App {
                 continue;
             };
             let ls = &mut pane.loop_state;
-            if !ls.multi_frame {
+            if !ls.is_active() {
                 continue;
             }
-            ls.fetching = false;
+            ls.phase = rustdar_egui::pane::LoopPhase::Rendering;
 
             // Populate frames (oldest-first, matching scan listing order)
             ls.frames = resp
@@ -697,7 +697,7 @@ impl super::App {
                 continue;
             };
             let ls = &mut pane.loop_state;
-            if !ls.multi_frame {
+            if !ls.is_active() {
                 continue;
             }
 
@@ -751,7 +751,7 @@ impl super::App {
                         continue;
                     }
                     let sls = &mut sibling.loop_state;
-                    if !sls.multi_frame { continue; }
+                    if !sls.is_active() { continue; }
                     let Some(sframe) = sls.frames.iter_mut().find(|f| f.timestamp == rr.timestamp) else {
                         continue;
                     };
@@ -773,14 +773,14 @@ impl super::App {
             for pidx in 0..self.gui.pane_count() {
                 let Some(p) = self.gui.pane_mut(pidx) else { continue };
                 let pls = &mut p.loop_state;
-                if !pls.multi_frame || pls.render_ready || pls.frames.is_empty() {
+                if !pls.is_active() || pls.is_render_ready() || pls.frames.is_empty() {
                     continue;
                 }
                 let any_rendered = pls.frames.iter().any(|f| f.texture.is_some());
                 let none_in_flight = !pls.frames.iter().any(|f| f.render_in_flight);
                 let pane_downloads_done = self.loop_mgr.is_pane_done(pidx);
                 if any_rendered && none_in_flight && pane_downloads_done {
-                    pls.render_ready = true;
+                    pls.phase = rustdar_egui::pane::LoopPhase::Ready;
                 }
             }
         }
@@ -801,13 +801,13 @@ impl super::App {
         for idx in 0..pane_count {
             let Some(pane) = self.gui.pane(idx) else { continue };
             let ls = &pane.loop_state;
-            if !ls.multi_frame {
+            if !ls.is_active() {
                 continue;
             }
-            if ls.playback_started {
+            if ls.has_playback_started() {
                 continue; // Already started (may be paused by user)
             }
-            if ls.render_ready {
+            if ls.is_render_ready() {
                 ready_panes.push(idx);
             } else {
                 not_ready_panes.push(idx);
@@ -828,8 +828,7 @@ impl super::App {
         for idx in ready_panes {
             let pane = self.gui.pane_mut(idx).unwrap();
             let ls = &mut pane.loop_state;
-            ls.playing = true;
-            ls.playback_started = true;
+            ls.phase = rustdar_egui::pane::LoopPhase::Playing;
             ls.last_advance = Some(now);
             // Align all panes to the last frame so they start from the same position
             if !ls.frames.is_empty() {
@@ -848,7 +847,7 @@ impl super::App {
                 continue;
             };
             let ls = &mut pane.loop_state;
-            if !ls.multi_frame || !ls.playing || ls.frames.is_empty() {
+            if !ls.is_active() || !ls.is_playing() || ls.frames.is_empty() {
                 continue;
             }
 
@@ -881,7 +880,7 @@ impl super::App {
                 continue;
             };
             let ls = &mut pane.loop_state;
-            if !ls.multi_frame {
+            if !ls.is_active() {
                 continue;
             }
             let num_frames = ls.frames.len();
@@ -922,7 +921,7 @@ impl super::App {
                 continue;
             };
             let ls = &pane.loop_state;
-            if !ls.multi_frame || ls.frames.is_empty() {
+            if !ls.is_active() || ls.frames.is_empty() {
                 continue;
             }
 
@@ -973,7 +972,7 @@ impl super::App {
                             continue;
                         }
                         let sls = &sibling.loop_state;
-                        if !sls.multi_frame { continue; }
+                        if !sls.is_active() { continue; }
                         if let Some(sframe) = sls.frames.iter().find(|f| f.timestamp == frame.timestamp)
                             && sframe.texture.is_some() {
                                 found_sibling = Some(sibling_idx);

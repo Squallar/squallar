@@ -96,7 +96,7 @@ pub(super) fn render_pane_map_content(
                 // Radar image layer — special handling for loop playback
                 OverlayKind::Radar => {
                     // Loop playback: draw the active loop frame instead
-                    if ctx.pane.loop_state.multi_frame {
+                    if ctx.pane.loop_state.is_active() {
                         if let Some(img) = ctx.pane.active_image().cloned() {
                             render_radar_overlay(ui, projector, &img, ctx.pane, ctx.pane_rect, ctx.preferences);
                         }

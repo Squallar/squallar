@@ -720,7 +720,7 @@ impl Gui {
         actions: &mut Vec<GuiAction>,
     ) {
         ui.add_space(4.0);
-        let loop_active = pane.loop_state.multi_frame;
+        let loop_active = pane.loop_state.is_active();
 
         // Enable/disable toggle
         let mut enabled = loop_active;
@@ -777,8 +777,8 @@ impl Gui {
                     // Frame status
                     let rendered = ls.frames.iter().filter(|f| f.texture.is_some()).count();
                     let total = ls.frames.len();
-                    let rendering = total > 0 && !ls.render_ready;
-                    if ls.fetching {
+                    let rendering = total > 0 && !ls.is_render_ready();
+                    if ls.is_fetching() {
                         ui.horizontal(|ui| {
                             ui.spinner();
                             ui.label("Loading scan list...");
@@ -813,8 +813,8 @@ impl Gui {
                             }
 
                             // Play/pause
-                            let play_label = if ls.playing { "\u{23f8}" } else { "\u{25b6}" };
-                            let play_hover = if ls.playing {
+                            let play_label = if ls.is_playing() { "\u{23f8}" } else { "\u{25b6}" };
+                            let play_hover = if ls.is_playing() {
                                 "Pause".to_string()
                             } else if rendering {
                                 format!("Waiting for renders ({}/{})", rendered, total)
@@ -822,7 +822,7 @@ impl Gui {
                                 "Play".to_string()
                             };
                             let play_btn = egui::Button::new(play_label);
-                            let resp = ui.add_enabled(!rendering || ls.playing, play_btn)
+                            let resp = ui.add_enabled(!rendering || ls.is_playing(), play_btn)
                                 .on_hover_text(play_hover);
                             if resp.clicked() {
                                 for pane_idx in self.loop_sync_targets() {
@@ -1148,7 +1148,7 @@ impl Gui {
     pub fn any_loop_active(&self) -> bool {
         self.panes.iter().any(|p| {
             let ls = &p.loop_state;
-            ls.multi_frame && (ls.playing || ls.fetching || ls.frames.iter().any(|f| f.render_in_flight))
+            ls.is_active() && (ls.is_playing() || ls.is_fetching() || ls.frames.iter().any(|f| f.render_in_flight))
         })
     }
 

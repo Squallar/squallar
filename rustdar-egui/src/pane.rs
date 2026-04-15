@@ -31,30 +31,38 @@ pub struct LoopFrame {
     pub render_in_flight: bool,
 }
 
+/// The state phases for a radar loop playback instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopPhase {
+    /// Loop mode is disabled (single-frame mode).
+    Inactive,
+    /// Loop is enabled and waiting for the scan listing to complete.
+    FetchingScanList,
+    /// Scans listed and downloads/renders started, waiting to reach render budget.
+    Rendering,
+    /// Sufficient frames have rendered to allow playback, but playing is not started.
+    Ready,
+    /// Loop is actively playing/animating forward through frames.
+    Playing,
+    /// User paused the active loop (has enough rendered frames).
+    Paused,
+}
+
 /// Per-pane loop playback state.
 ///
-/// Always present on every pane. In single-frame mode (`multi_frame == false`),
+/// Always present on every pane. In single-frame mode (`phase == LoopPhase::Inactive`),
 /// `frames` holds at most one entry — the current static radar image. When the
-/// user enables loop mode, `multi_frame` is set to `true` and multiple
-/// historical frames are fetched and rendered.
+/// user enables loop mode, the phase transitions and multiple historical frames
+/// are fetched and rendered.
 pub struct LoopPlaybackState {
-    /// Whether this pane is in multi-frame (animated loop) mode.
-    pub multi_frame: bool,
-    /// Whether the loop is actively playing (animating).
-    pub playing: bool,
+    /// The current phase of the loop playback lifecycle.
+    pub phase: LoopPhase,
     /// Index of the currently displayed frame in `frames`.
     pub current_frame: usize,
     /// Ordered list of frames (oldest-first).
     pub frames: Vec<LoopFrame>,
     /// Lookback duration in seconds that was requested.
     pub lookback_secs: u64,
-    /// True while the initial scan listing/fetch is in progress.
-    pub fetching: bool,
-    /// True once the initial render batch is complete and playback can start.
-    pub render_ready: bool,
-    /// True once playback has been auto-started after the initial render batch.
-    /// Prevents `sync_loop_playback_start` from overriding a user pause.
-    pub playback_started: bool,
     /// Instant of the last frame advance (for animation timing).
     pub last_advance: Option<std::time::Instant>,
     /// Radar site latitude, captured at loop creation for rendering.
@@ -115,18 +123,52 @@ impl LoopPlaybackState {
     /// Create a default single-frame (non-loop) state.
     pub fn new() -> Self {
         Self {
-            multi_frame: false,
-            playing: false,
+            phase: LoopPhase::Inactive,
             current_frame: 0,
             frames: Vec::new(),
             lookback_secs: 0,
-            fetching: false,
-            render_ready: false,
-            playback_started: false,
             last_advance: None,
             site_lat: 0.0,
             site_lon: 0.0,
         }
+    }
+
+    /// Create a new initialized loop state starting the fetch phase.
+    pub fn new_for_loop(lookback_secs: u64, site_lat: f64, site_lon: f64) -> Self {
+        Self {
+            phase: LoopPhase::FetchingScanList,
+            current_frame: 0,
+            frames: Vec::new(),
+            lookback_secs,
+            last_advance: None,
+            site_lat,
+            site_lon,
+        }
+    }
+
+    /// True if the loop is active (`new_for_loop` was called; single frame mode uses `Inactive`).
+    pub fn is_active(&self) -> bool {
+        !matches!(self.phase, LoopPhase::Inactive)
+    }
+
+    /// True if actively playing back frames.
+    pub fn is_playing(&self) -> bool {
+        matches!(self.phase, LoopPhase::Playing)
+    }
+
+    /// True if enough frames have rendered for playback to be enabled.
+    pub fn is_render_ready(&self) -> bool {
+        matches!(self.phase, LoopPhase::Ready | LoopPhase::Playing | LoopPhase::Paused)
+    }
+
+    /// True during the initial scan list fetch.
+    pub fn is_fetching(&self) -> bool {
+        matches!(self.phase, LoopPhase::FetchingScanList)
+    }
+
+    /// True if playback was previously started (could be paused or playing).
+    pub fn has_playback_started(&self) -> bool {
+        matches!(self.phase, LoopPhase::Playing | LoopPhase::Paused)
     }
 }
 

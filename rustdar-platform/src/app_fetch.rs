@@ -123,12 +123,15 @@ impl super::App {
             GuiAction::ToggleLoopPlayback { pane_idx } => {
                 if let Some(pane) = self.gui.pane_mut(pane_idx) {
                     let ls = &mut pane.loop_state;
-                    if ls.playing {
-                        // Always allow pause
-                        ls.playing = false;
-                    } else if ls.render_ready {
-                        ls.playing = true;
-                        ls.last_advance = Some(std::time::Instant::now());
+                    match ls.phase {
+                        rustdar_egui::pane::LoopPhase::Playing => {
+                            ls.phase = rustdar_egui::pane::LoopPhase::Paused;
+                        }
+                        rustdar_egui::pane::LoopPhase::Ready | rustdar_egui::pane::LoopPhase::Paused => {
+                            ls.phase = rustdar_egui::pane::LoopPhase::Playing;
+                            ls.last_advance = Some(std::time::Instant::now());
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -454,19 +457,11 @@ impl super::App {
 
         // Initialize loop state on the pane
         if let Some(pane) = self.gui.pane_mut(pane_idx) {
-            pane.loop_state = rustdar_egui::pane::LoopPlaybackState {
-                multi_frame: true,
-                playing: false,
-                current_frame: 0,
-                frames: Vec::new(),
+            pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new_for_loop(
                 lookback_secs,
-                fetching: true,
-                render_ready: false,
-                playback_started: false,
-                last_advance: None,
                 site_lat,
                 site_lon,
-            };
+            );
         }
 
         // Use the current scan's timestamp as the loop end time (not wall clock)
@@ -702,7 +697,7 @@ impl super::App {
                 continue;
             };
             let ls = &mut pane.loop_state;
-            if !ls.multi_frame {
+            if !ls.is_active() {
                 continue;
             }
 
@@ -749,7 +744,7 @@ impl super::App {
         let mut to_reinit = Vec::new();
         for pane_idx in 0..self.gui.pane_count() {
             if let Some(pane) = self.gui.pane_mut(pane_idx)
-                && pane.loop_state.multi_frame {
+                && pane.loop_state.is_active() {
                     to_reinit.push((pane_idx, pane.loop_state.lookback_secs));
                 }
         }
