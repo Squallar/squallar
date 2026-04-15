@@ -67,7 +67,13 @@ impl OverlayItem for AlertItem {
             accent_rgb: [r, g, b],
             width: 380.0,
             sections,
-            actions: Vec::new(), // TODO: re-add hide action with Arc<dyn OverlayItem>
+            actions: vec![PopupAction {
+                label: "Hide from map".into(),
+                target: Arc::new(AlertItem {
+                    alert: alert.clone(),
+                }),
+                kind: PopupActionKind::HideFromMap,
+            }],
         }
     }
 
