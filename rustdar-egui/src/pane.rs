@@ -193,8 +193,9 @@ impl LoopPlaybackState {
             .is_some_and(|(p, e)| p == product && (e - elevation).abs() <= 0.01)
     }
 
-    /// Whether a finished render for `timestamp`, produced for `product`/`elevation`,
-    /// should be applied to this loop.
+    /// The index of the frame a finished render for `timestamp`, produced for
+    /// `product`/`elevation`, must be written to — or `None` if the result has to be
+    /// dropped.
     ///
     /// Two independent ways a result goes stale, and both must be checked:
     ///
@@ -208,17 +209,25 @@ impl LoopPlaybackState {
     ///   the current target is byte-identical to the pending one and safe to apply.
     /// - The frame is not expecting a result at all: the frame list was rebuilt, the
     ///   graphics state was cleared, or a sibling pane already supplied the texture.
-    pub fn accepts_render_result(
+    ///
+    /// Returns the *index* rather than a yes/no so the caller cannot look the frame up
+    /// a second time and land somewhere else. Timestamps are unique across a frame
+    /// list today, but only incidentally — a predicate answering "is some frame with
+    /// this timestamp in flight?" paired with a caller fetching "the frame with this
+    /// timestamp" is two lookups that are free to disagree, and the frame the
+    /// predicate cleared would then stay marked in flight forever.
+    pub fn frame_awaiting_render_result(
         &self,
         timestamp: NaiveDateTime,
         product: RadarProduct,
         elevation: f32,
-    ) -> bool {
-        self.is_rendered_for(product, elevation)
-            && self
-                .frames
-                .iter()
-                .any(|f| f.timestamp == timestamp && f.render_in_flight)
+    ) -> Option<usize> {
+        if !self.is_rendered_for(product, elevation) {
+            return None;
+        }
+        self.frames
+            .iter()
+            .position(|f| f.timestamp == timestamp && f.render_in_flight)
     }
 
     /// Point the loop's frame renders at `product`/`elevation`, discarding every
@@ -237,7 +246,7 @@ impl LoopPlaybackState {
     /// In-flight renders are un-marked as well, since nothing is owed to a frame whose
     /// target moved. That alone does *not* make their results stale — the same dispatch
     /// pass re-spawns and re-marks the frame — so rejecting them is
-    /// `accepts_render_result`'s job, via the target stamped on the response.
+    /// `frame_awaiting_render_result`'s job, via the target stamped on the response.
     pub fn retarget_renders(&mut self, product: RadarProduct, elevation: f32) -> bool {
         if self.is_rendered_for(product, elevation) {
             return false;
@@ -818,13 +827,43 @@ mod tests {
             state.frames[0].render_in_flight,
             "precondition: an in-flight-only guard would accept the stale result here"
         );
-        assert!(
-            !state.accepts_render_result(frame_ts, RadarProduct::Velocity, 0.5),
+        assert_eq!(
+            state.frame_awaiting_render_result(frame_ts, RadarProduct::Velocity, 0.5),
+            None,
             "a result for the abandoned target must be rejected"
         );
-        assert!(
-            state.accepts_render_result(frame_ts, RadarProduct::Reflectivity, 0.5),
+        assert_eq!(
+            state.frame_awaiting_render_result(frame_ts, RadarProduct::Reflectivity, 0.5),
+            Some(0),
             "the re-dispatched render for the current target is still accepted"
+        );
+    }
+
+    /// The accept check and the write must resolve to the same frame. The old shape
+    /// asked "is *some* frame with this timestamp in flight?" and left the caller to
+    /// fetch "the frame with this timestamp" — two lookups free to disagree, which
+    /// would clear one frame and leave the dispatched one marked in flight forever.
+    /// Returning the index makes disagreement unrepresentable.
+    #[test]
+    fn the_accepted_frame_is_the_one_that_is_in_flight() {
+        let mut state = loop_with_frames(3, 0);
+        state.retarget_renders(RadarProduct::Reflectivity, 0.5);
+
+        // Two frames sharing a timestamp. Deduplication upstream makes this
+        // unreachable today; nothing in this type enforces it.
+        let shared = state.frames[0].timestamp;
+        state.frames[2].timestamp = shared;
+        state.frames[2].render_in_flight = true;
+
+        assert_eq!(
+            state.frames.iter().position(|f| f.timestamp == shared),
+            Some(0),
+            "precondition: a timestamp-only lookup lands on the wrong frame"
+        );
+        assert_eq!(
+            state.frame_awaiting_render_result(shared, RadarProduct::Reflectivity, 0.5),
+            Some(2),
+            "the result must be written to the frame that was actually dispatched"
         );
     }
 
@@ -836,13 +875,16 @@ mod tests {
         let frame_ts = state.frames[0].timestamp;
 
         // Never dispatched, or already satisfied by a sibling pane's broadcast.
-        assert!(!state.accepts_render_result(frame_ts, RadarProduct::Reflectivity, 0.5));
+        let awaiting = |s: &LoopPlaybackState, t| {
+            s.frame_awaiting_render_result(t, RadarProduct::Reflectivity, 0.5)
+        };
+        assert_eq!(awaiting(&state, frame_ts), None);
         state.frames[0].texture = Some(dummy_texture(&ctx));
-        assert!(!state.accepts_render_result(frame_ts, RadarProduct::Reflectivity, 0.5));
+        assert_eq!(awaiting(&state, frame_ts), None);
 
         // A timestamp that is not in the frame list at all (list rebuilt since dispatch).
         state.frames[1].render_in_flight = true;
-        assert!(!state.accepts_render_result(ts(59), RadarProduct::Reflectivity, 0.5));
+        assert_eq!(awaiting(&state, ts(59)), None);
     }
 
     /// Eviction now keeps only render-set members, where the previous rule kept the

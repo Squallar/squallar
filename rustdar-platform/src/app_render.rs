@@ -708,18 +708,20 @@ impl super::App {
             // elevation it has since retargeted away from, or aimed at a frame that is
             // not awaiting one. Applying either paints an image the dispatcher then
             // treats as done, so the frame never corrects itself.
-            if !ls.accepts_render_result(rr.timestamp, rr.product, rr.elevation) {
+            //
+            // This resolves the frame in the same pass that vets the result: a separate
+            // lookup here could pick a different frame than the one the check cleared.
+            let Some(frame_idx) =
+                ls.frame_awaiting_render_result(rr.timestamp, rr.product, rr.elevation)
+            else {
                 continue;
-            }
+            };
 
             // Capture per-pane state needed for texture creation
             let lat = ls.site_lat;
             let lon = ls.site_lon;
 
-            // Find the matching frame by timestamp
-            let Some(frame) = ls.frames.iter_mut().find(|f| f.timestamp == rr.timestamp) else {
-                continue;
-            };
+            let frame = &mut ls.frames[frame_idx];
             frame.render_in_flight = false;
 
             // Empty image_data means the render failed (no matching sweep). Mark the
