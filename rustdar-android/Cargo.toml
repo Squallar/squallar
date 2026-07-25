@@ -52,7 +52,7 @@ pollster = { workspace = true }
 log = { workspace = true }
 jni = { workspace = true }
 ndk-context = { workspace = true }
-rustls-platform-verifier = "=0.6.2"
+rustls-platform-verifier = "=0.7.0"
 rustdar-gps = { workspace = true, features = ["serial"] }
 # Force vendored OpenSSL for Android builds to avoid cross-compilation issues
 openssl-sys = { workspace = true }
