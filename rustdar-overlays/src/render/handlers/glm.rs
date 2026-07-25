@@ -755,7 +755,6 @@ mod tests {
     fn info_texts(handler: &GlmHandler) -> Vec<String> {
         let ctx = PaneControlContext {
             pane_idx: 0,
-            is_mobile: false,
             pane_state: None,
         };
         handler
