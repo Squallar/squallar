@@ -112,9 +112,17 @@
  * So the shell generation is pinned **per client**, at the navigation, in
  * `clientShells`. Every subresource that client goes on to request is served
  * from the generation its navigation was answered from, whatever the meta
- * pointer has done since. `purgeCaches` retains every pinned generation, plus
- * the one immediately superseded — the second is what covers a worker that is
- * killed and restarted mid-load, taking `clientShells` with it.
+ * pointer has done since, and `purgeCaches` keeps every generation something is
+ * pinned to.
+ *
+ * The pin is written to the meta cache as well as held in memory, because a
+ * service worker is killed after about thirty seconds idle and everything in
+ * this file's module scope goes with it. Without the durable copy, a restart
+ * between a page's navigation and its wasm request puts that page back onto
+ * whatever is current — which is the mixed shell, arrived at by a different
+ * route. Retaining "the generation just superseded" was tried first and does
+ * not work: it keeps a cache that may have no reader while still allowing the
+ * deletion of one that does.
  */
 
 "use strict";
@@ -143,6 +151,9 @@ const SHELL_PREFIX = `rustdar-shell-v${SW_VERSION}-`;
 
 /* Key for the meta record. A synthetic URL: nothing is ever served from it. */
 const META_KEY = new URL("__rustdar_sw_meta__", ROOT).href;
+
+/* Key for the client pin record. Also synthetic. See `clientShells`. */
+const PINS_KEY = new URL("__rustdar_sw_pins__", ROOT).href;
 
 /*
  * The app shell, relative to ROOT.
@@ -420,9 +431,13 @@ function currentMeta() {
  * between any two of them, so "the current shell" has to mean "the shell this
  * client's navigation was answered from", not "the shell as of right now".
  *
- * Module state, so a worker killed for idleness loses it. That is why
- * `purgeCaches` also retains the generation it just superseded: a restart mid
- * page-load falls back to the previous shell rather than to a deleted one.
+ * Mirrored into the meta cache by `writePins`, because this map is module state
+ * and a service worker is killed after about thirty seconds idle. Losing it
+ * would put a page that navigated under one deploy back onto whatever is
+ * current for its glue and its wasm — the mixed shell this exists to prevent,
+ * reintroduced by the restart. A durable pin is also what makes the retention
+ * in `cachesToKeep` exact: the generations still in use are known rather than
+ * guessed at.
  */
 const clientShells = new Map();
 
@@ -439,19 +454,69 @@ async function openShellCache(name) {
   return caches.open(name);
 }
 
-/** Drop pins for clients that have gone away, so the map cannot grow forever. */
-async function forgetDepartedClients() {
-  if (clientShells.size === 0) return;
-  const live = new Set(
-    (await self.clients.matchAll({ includeUncontrolled: true, type: "window" })).map((c) => c.id),
+async function readPins() {
+  const cache = await caches.open(META_CACHE);
+  const stored = await cache.match(PINS_KEY);
+  if (!stored) return {};
+  try {
+    return await stored.json();
+  } catch {
+    return {};
+  }
+}
+
+async function writePins(pins) {
+  const cache = await caches.open(META_CACHE);
+  await cache.put(
+    PINS_KEY,
+    new Response(JSON.stringify(pins), {
+      headers: { "content-type": "application/json" },
+    }),
   );
-  for (const id of [...clientShells.keys()]) if (!live.has(id)) clientShells.delete(id);
+}
+
+/** The ids of every window this worker can see. */
+async function liveClientIds() {
+  const windows = await self.clients.matchAll({ includeUncontrolled: true, type: "window" });
+  return new Set(windows.map((c) => c.id));
+}
+
+/**
+ * Record `cacheName` as the generation serving `clientId`, durably.
+ *
+ * Departed clients are dropped in the same write, so the record is bounded by
+ * the number of open tabs rather than by how many have ever been opened.
+ * `keepId` is the client the current navigation is creating: it does not exist
+ * yet, so it is not in `live` and would otherwise be pruned immediately.
+ */
+async function pinClient(clientId, cacheName) {
+  clientShells.set(clientId, cacheName);
+
+  const live = await liveClientIds();
+  const pins = await readPins();
+  for (const id of Object.keys(pins)) {
+    if (id !== clientId && !live.has(id)) delete pins[id];
+  }
+  pins[clientId] = cacheName;
+  await writePins(pins);
+
+  for (const id of [...clientShells.keys()]) {
+    if (id !== clientId && !live.has(id)) clientShells.delete(id);
+  }
 }
 
 /** The shell generation `clientId` is pinned to, falling back to the current one. */
 async function shellCacheForClient(clientId) {
   if (clientId) {
-    const pinned = clientShells.get(clientId);
+    let pinned = clientShells.get(clientId);
+    if (!pinned) {
+      // Nothing in memory: either this client never navigated through this
+      // worker, or the worker has been restarted since it did. The second is
+      // the case that matters, and it is why the pin is written down.
+      const pins = await readPins();
+      pinned = pins[clientId];
+      if (pinned) clientShells.set(clientId, pinned);
+    }
     if (pinned) {
       const cache = await openShellCache(pinned);
       // A pin whose cache is gone falls through rather than failing: the
@@ -518,17 +583,18 @@ async function installShell(token, name = shellCacheName(token)) {
 }
 
 /**
- * The caches an install must not delete.
+ * The caches an install must not delete: the new shell, and every pinned one.
  *
- * Every pinned generation, because a live client is mid-load in it, and the
- * generation being superseded, because `clientShells` is module state that a
- * worker restart loses — after which the only thing standing between a
- * half-loaded page and a 404 is the previous shell still existing.
+ * Pins are read from storage rather than only from `clientShells`, so that a
+ * worker which restarted since a page loaded still knows that page's generation
+ * is in use. Retaining "the previous generation" instead was the first attempt
+ * and is strictly worse — it keeps a cache nothing may be reading while still
+ * being able to delete one that something is.
  */
-function cachesToKeep(newShellName, previousMeta) {
+async function cachesToKeep(newShellName) {
   const keep = new Set([META_CACHE, TILE_CACHE, newShellName]);
   for (const name of clientShells.values()) keep.add(name);
-  if (previousMeta && previousMeta.cacheName) keep.add(previousMeta.cacheName);
+  for (const name of Object.values(await readPins())) keep.add(name);
   return keep;
 }
 
@@ -642,7 +708,7 @@ function checkForUpdate({ force = false } = {}) {
     if (meta && meta.token === token) return;
 
     const name = await installShell(token);
-    await purgeCaches(cachesToKeep(name, meta));
+    await purgeCaches(await cachesToKeep(name));
 
     // Only announce a *replacement*. The first install has nothing to replace:
     // the page that triggered it is already running the code just cached, and
@@ -685,7 +751,7 @@ async function forceReinstall() {
 
   const name = `${shellCacheName(token)}-forced-${Date.now()}`;
   await installShell(token, name);
-  await purgeCaches(cachesToKeep(name, meta));
+  await purgeCaches(await cachesToKeep(name));
   if (meta) await notifyClients({ type: "rustdar:shell-updated", token });
   return name;
 }
@@ -721,13 +787,9 @@ async function serveShell(request, clientId, key) {
  * After this, it is settled for every subresource that client will request.
  */
 async function serveNavigation(event) {
-  // Prune before pinning: the client this navigation creates does not exist
-  // yet, so pruning afterwards would immediately drop the pin just taken.
-  await forgetDepartedClients();
-
   const meta = await currentMeta();
   const clientId = event.resultingClientId || event.clientId;
-  if (meta && meta.cacheName && clientId) clientShells.set(clientId, meta.cacheName);
+  if (meta && meta.cacheName && clientId) await pinClient(clientId, meta.cacheName);
 
   const cache = await openShellCache(meta && meta.cacheName);
   if (cache) {

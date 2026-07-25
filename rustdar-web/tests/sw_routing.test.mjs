@@ -498,23 +498,47 @@ describe("atomicity: one page load draws its shell from one deploy", () => {
     assert.deepEqual(generationOf(page), new Set(["B"]));
   });
 
-  it("retains the superseded generation so a worker restart mid-load is survivable", async () => {
+  it("keeps a client on its generation across a worker restart", async () => {
+    // A service worker is killed after about thirty seconds idle, and the pin
+    // is module state. If it only lived in memory, a restart between a page's
+    // navigation and its wasm request would put that page back onto whatever
+    // is current — the same mixed shell, reached by a different route.
+    //
+    // Retaining "the generation just superseded" instead does not fix this. It
+    // keeps deploy A alive, but the restarted worker has no idea this client
+    // belongs to A and serves it B regardless. Verified before the pin was made
+    // durable: the page navigated under A and was handed B's glue.
     const worker = await bootWorker({ tag: "A" });
     const client = worker.addClient();
     await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: client.id });
 
-    publishDeploy(worker.network, ORIGIN, "B");
-    await worker.message({ type: "rustdar:check-update" });
-
-    // The worker is killed for idleness. `clientShells` goes with it; the caches
-    // do not.
     const restarted = await restartWorker(worker);
-    const names = await restarted.cacheNames();
+    publishDeploy(restarted.network, ORIGIN, "B");
+    await restarted.message({ type: "rustdar:check-update" });
+
+    const glue = await restarted.fetch(new Request(shellUrl("pkg/rustdar_web.js")), {
+      clientId: client.id,
+    });
     assert.equal(
-      names.some((n) => n.includes("%22A%22")),
-      true,
-      `the superseded shell was deleted, so a page still loading it now 404s: ${names}`,
+      await (await glue.response).text(),
+      "pkg/rustdar_web.js::A",
+      "a page that navigated under deploy A was handed deploy B's glue after the \
+worker restarted; its index.html and its wasm now disagree",
     );
+  });
+
+  it("still moves a page that loads after the restart onto the new deploy", async () => {
+    // The durable pin must not become a way of pinning the whole browser to an
+    // old bundle. Only the client that navigated under it is held.
+    const worker = await bootWorker({ tag: "A" });
+    const first = worker.addClient();
+    await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: first.id });
+
+    const restarted = await restartWorker(worker);
+    publishDeploy(restarted.network, ORIGIN, "B");
+    await restarted.message({ type: "rustdar:check-update" });
+
+    assert.deepEqual(generationOf(await loadPage(restarted)), new Set(["B"]));
   });
 
   it("does not accumulate shell generations without limit", async () => {
@@ -711,6 +735,35 @@ describe("updates: a degraded version probe is visible and escapable", () => {
       generationOf(await loadPage(worker)),
       new Set(["B"]),
       "a forced reinstall must not depend on the probe it exists to work around",
+    );
+  });
+
+  it("does not rewrite a generation a live client is pinned to", async () => {
+    // A forced reinstall on an unversioned server produces the same token as
+    // the shell already installed. If it downloaded into the cache that token
+    // names, it would rewrite that shell's entries — and a page mid-load in it
+    // would find its wasm module replaced between the navigation and the
+    // instantiate. Which is the mixed shell again, this time caused by the
+    // mechanism meant to be the safe way out.
+    const network = new Network();
+    publishUnversionedDeploy(network, ORIGIN, "A");
+    const worker = await startWorker({ swUrl: SW_URL, network });
+    await worker.activate();
+
+    const client = worker.addClient();
+    const nav = await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: client.id });
+    assert.equal(await (await nav.response).text(), "::A");
+
+    publishUnversionedDeploy(worker.network, ORIGIN, "B");
+    await worker.message({ type: "rustdar:force-update" });
+
+    const wasm = await worker.fetch(new Request(shellUrl("pkg/rustdar_web_bg.wasm")), {
+      clientId: client.id,
+    });
+    assert.equal(
+      await (await wasm.response).text(),
+      "pkg/rustdar_web_bg.wasm::A",
+      "the forced reinstall overwrote the shell this page was loading from",
     );
   });
 

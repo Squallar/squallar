@@ -331,6 +331,24 @@ export class FetchEvent extends ExtendableEvent {
     this.handled = true;
     this.response = Promise.resolve(promise);
   }
+
+  /**
+   * Settle the response as well as the `waitUntil` work.
+   *
+   * The browser does not deliver a response until the promise given to
+   * `respondWith` resolves, so anything that promise does — such as recording
+   * which shell generation a navigation pinned — has completed by the time the
+   * page sees the response. Awaiting only `waitUntil` here let a test observe
+   * the worker mid-`respondWith`, which is a state no page can be in, and made
+   * assertions depend on how many microtask turns the test happened to take.
+   *
+   * Rejections are swallowed: a fetch that fails is an ordinary outcome the
+   * tests assert on directly.
+   */
+  async settle() {
+    if (this.response) await this.response.catch(() => {});
+    await super.settle();
+  }
 }
 
 class WindowClient {
