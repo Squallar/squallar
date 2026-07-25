@@ -173,10 +173,26 @@ impl RadialContext {
 /// Anything byte-comparing a native render must pin the thread count. wasm32 is
 /// single-threaded and so already reproducible.
 ///
-/// Cfg-splitting the wasm arm to a plain `Vec` was measured, not assumed: it is
-/// worth ~1% (Firefox 233 → 230 ms, Chromium 261 → 262 ms on a KTLX 0.5°
-/// reflectivity sweep at `IMAGE_SIZE` 1024) for a byte-identical image, which
-/// does not pay for two buffer types under one hot loop.
+/// The atomics are *not* load-bearing on wasm32, so cfg-splitting that arm to a
+/// plain buffer looks like a free win. It was measured per component, not
+/// assumed, against a real KTLX 0.5° reflectivity sweep (720 radials × 1832
+/// gates) at `IMAGE_SIZE` 1024, release, rasterizer isolated from WebGL/winit:
+///
+/// | what                                    | Firefox | Chromium |
+/// |-----------------------------------------|--------:|---------:|
+/// | whole render                            |  233 ms |   261 ms |
+/// | 28 M relaxed `store` vs plain `Vec<u32>`| 39 / 37 |  47 / 48 |
+/// | `into_output` shape, atomic vs plain    | 0.8/0.4 |  0.7/0.3 |
+/// | `RenderBuffers::new`, atomic vs plain   | 0.2/0.3 |  0.3/0.2 |
+///
+/// ~2.5 ms of a 233 ms frame — about 1%, the same 1% in both browsers. Built and
+/// measured end to end too, with the wasm arm on `Vec<Cell<u32>>`: Firefox
+/// 233 → 230 ms, Chromium 261 → 262 ms, byte-identical image. A 1% return does
+/// not pay for two divergent buffer types under one hot loop.
+///
+/// Those same numbers dispose of the theory that Firefox's `radar-render`
+/// penalty came from these atomics: Firefox rasterizes this sweep *faster* than
+/// Chromium, and relaxed atomic stores cost it 5% over plain ones.
 ///
 /// Most of the frame is the per-sample `(π/4 + lat/2).tan().ln()` in
 /// `types::lat_rad_to_mercator_y`: 28 M of those cost 660 ms in Firefox and

@@ -373,9 +373,15 @@ mod tests {
         }
     }
 
-    /// ~11 cm on the ground, deliberately far tighter than the 3 km grid: the
-    /// failure mode guarded against is systematic displacement (wrong earth
-    /// radius, dropped central meridian), which is tens of metres at minimum.
+    /// <= 11 cm anywhere on this grid, and that is a worst case over HRRR's
+    /// latitude span, not a flat figure: 1e-6° of latitude is 0.111 m
+    /// everywhere (1° ≈ 111.2 km), while 1e-6° of longitude (1° ≈ 111.32·cos φ
+    /// km) runs 0.104 m at 21°N down to 0.075 m at 48°N. Re-derive before
+    /// widening this for a grid that reaches further south.
+    ///
+    /// Deliberately far tighter than the 3 km spacing: the failure mode guarded
+    /// against is systematic displacement (wrong earth radius, dropped central
+    /// meridian), which is tens of metres at minimum.
     const HRRR_TOLERANCE_DEG: f64 = 1e-6;
 
     #[track_caller]

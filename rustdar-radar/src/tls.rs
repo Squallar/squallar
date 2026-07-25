@@ -9,13 +9,16 @@
 //! Two different alternatives get re-proposed, and they are wrong for two
 //! different reasons. Do not accept either.
 //!
-//! * `rustls-native-certs` / reqwest's `rustls-tls-native-roots` bundle nothing —
-//!   they *read* the platform store at startup and hand the certificates to
-//!   rustls, which then does the verifying. On Android that read is
-//!   `/system/etc/security/cacerts` directly, so it sees only the system store:
-//!   Network Security Config (`rustdar-android/android/network_security_config.xml`)
-//!   is not applied, and user-installed CAs, enterprise CAs and OS distrust
-//!   lists are all missed. Trust then diverges from what the device decided.
+//! * `rustls-native-certs` / reqwest's `rustls-tls-native-roots` bundle nothing,
+//!   but they collect certificates at startup and hand rustls a flat root list,
+//!   so **rustls** does the verifying and the platform verifier is out of the
+//!   loop. That is the objection: on Android `rustls-platform-verifier` goes
+//!   through JNI to `CertificateVerifier.verifyCertificateChain`, i.e. the
+//!   system TrustManager, which is what applies Network Security Config, user
+//!   and enterprise CAs and distrust lists — and its arm that would call
+//!   `load_native_certs()` is `not(target_os = "android")`. `rustls-native-certs`
+//!   does not read Android's trust store in any case: it defers to
+//!   `openssl-probe`, whose Android search path is the Termux bundle.
 //! * `webpki-roots` is the actual compiled-in snapshot, and that one gives the
 //!   binary an expiration date.
 //!
