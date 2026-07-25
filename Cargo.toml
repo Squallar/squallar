@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "rustdar-platform",
     "rustdar-frontend",
+    "rustdar-web",
     "rustdar-android",
     "rustdar-android-theme",
     "rustdar-egui",
@@ -32,6 +33,7 @@ rustdar-overlays = { path = "rustdar-overlays" }
 rustdar-platform = { path = "rustdar-platform" }
 rustdar-radar = { path = "rustdar-radar" }
 rustdar-units = { path = "rustdar-units" }
+rustdar-web = { path = "rustdar-web" }
 # Defaults off here because Cargo silently ignores a member's
 # `default-features = false` when the workspace entry leaves defaults on, and
 # rustdar-egui declares exactly that. rustdar-platform and rustdar-android opt

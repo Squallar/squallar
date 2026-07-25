@@ -1,0 +1,77 @@
+[package]
+name = "rustdar-web"
+version.workspace = true
+edition.workspace = true
+
+# The browser entry point: the wasm32 counterpart of rustdar-platform.
+#
+# It owns exactly what rustdar-platform owns for desktop — the entry function,
+# the concrete PlatformBridge, and the capabilities that bridge exposes — and
+# nothing else. All the windowing, rendering and fetching is rustdar-frontend's,
+# unchanged.
+#
+# The target is WebGL2, not WebGPU. Firefox has no stable WebGPU, and a build
+# that silently used WebGPU where it existed would be a second, separately
+# untested rendering path. `rustdar_frontend::app` pins `Backends::GL` for wasm32
+# for that reason.
+
+[lib]
+# `cdylib` is what wasm-bindgen links; `rlib` keeps the crate usable as a normal
+# dependency, which is what lets `cargo test --workspace` and rust-analyzer see
+# it on a native host.
+crate-type = ["cdylib", "rlib"]
+
+# Deliberately not browser-gated, though everything that *calls* them is.
+#
+# The parts of this crate that are pure logic — how a logical config key maps
+# onto a localStorage key, how a browser geolocation reading becomes a `GpsFix`
+# — compile and are tested on the native host. Gating the whole crate on wasm32
+# would have made those tests unreachable from `cargo test --workspace`, which
+# is the only place they would ever run: there is no wasm test runner here, so a
+# browser-only test is a test that never executes.
+[dependencies]
+# For the ConfigStore trait the localStorage backend implements, and the
+# UI_CONFIG_KEY the key-mapping tests pin.
+rustdar-egui = { workspace = true }
+# Types only (GpsFix) — the browser's Geolocation replaces the serial reader, so
+# the `serial` feature stays off here exactly as it does in rustdar-frontend.
+rustdar-gps = { workspace = true }
+log = { workspace = true }
+
+# The genuinely browser-only half: the entry point, the event loop, the bridge,
+# and every `web_sys` call. None of this has a native meaning, and declaring it
+# here keeps a native `cargo build` from pulling web-sys and wasm-bindgen into
+# the graph at all.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+rustdar-frontend = { workspace = true }
+winit = { workspace = true }
+# Pinned to what the egui/wgpu stack already resolves. wasm-bindgen and web-sys
+# have to agree with the copy egui-winit and wgpu link against or the generated
+# bindings do not line up; these move when that stack moves.
+wasm-bindgen = "=0.2.118"
+wasm-bindgen-futures = "=0.4.68"
+js-sys = "=0.3.95"
+console_error_panic_hook = "=0.1.7"
+console_log = "=1.0.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "=0.3.95"
+# web-sys gates every interface behind its own feature. Listing them explicitly
+# rather than taking a blanket set keeps the generated glue to what is used.
+features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "Storage",
+    "Navigator",
+    # Theme detection. Enabled transitively by winit today, but web-sys features
+    # are additive across the graph and relying on that would mean this crate
+    # breaks when an unrelated dependency drops the feature.
+    "MediaQueryList",
+    "Geolocation",
+    "Position",
+    "PositionError",
+    "PositionOptions",
+    "Coordinates",
+]

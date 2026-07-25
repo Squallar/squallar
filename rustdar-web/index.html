@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+    <title>Rustdar</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #101014;
+      }
+
+      /*
+       * The canvas is sized here, not in Rust. winit reads the element's CSS
+       * box and multiplies by devicePixelRatio to get the surface size, so
+       * `display: block` matters: an inline canvas gets a baseline gap under it
+       * and the page then scrolls by those few pixels forever.
+       */
+      #rustdar-canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+        outline: none;
+      }
+
+      #rustdar-status {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font: 14px/1.5 system-ui, sans-serif;
+        color: #9aa0aa;
+        text-align: center;
+        padding: 2rem;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      `tabindex` is what lets the canvas take keyboard focus at all. Without it
+      the canvas is not focusable, and every key event goes to the document
+      instead — the app would render but never see a keystroke.
+    -->
+    <canvas id="rustdar-canvas" tabindex="0"></canvas>
+    <div id="rustdar-status">Loading rustdar…</div>
+
+    <script type="module">
+      import init, { start } from "./pkg/rustdar_web.js";
+
+      const status = document.getElementById("rustdar-status");
+
+      try {
+        await init();
+        start();
+        // The canvas paints over this, but removing it means a failure after
+        // this point shows a blank page rather than a stale "Loading" message.
+        status.remove();
+      } catch (e) {
+        // `start` throws through wasm-bindgen as a JsValue; stringify whatever
+        // arrives rather than assuming an Error with a .message.
+        status.textContent = "rustdar failed to start: " + e;
+        console.error(e);
+      }
+    </script>
+  </body>
+</html>
