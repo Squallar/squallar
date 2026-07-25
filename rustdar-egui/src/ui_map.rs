@@ -38,6 +38,10 @@ impl super::Gui {
             .frame(egui::Frame::NONE)
             .show_inside(ui, |ui| {
                 let panel_rect = ui.max_rect();
+                #[cfg(test)]
+                {
+                    self.last_map_panel_rect = panel_rect;
+                }
 
                 // One color-scale orientation for the whole grid, resolved from
                 // the panel (not from each pane's rect) so every pane on screen

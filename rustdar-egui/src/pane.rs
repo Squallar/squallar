@@ -884,6 +884,35 @@ mod tests {
         // Only leaving the band flips it, in either direction.
         assert!(from_landscape.resolve(panel(1000.0, 1400.0)), "1.40 is clearly portrait");
         assert!(!from_portrait.resolve(panel(1000.0, 1000.0)), "1.00 is clearly not portrait");
+
+        // …and the flip is *recorded*, not just returned. If the memory froze
+        // at the seed, the band would be one-sided: the same in-band ratio
+        // would keep answering with the original orientation, and the bars
+        // would snap back the moment the resize came home.
+        assert!(
+            from_landscape.resolve(panel(1000.0, 1200.0)),
+            "having flipped to horizontal, 1.20 must now keep it"
+        );
+        assert!(
+            !from_portrait.resolve(panel(1000.0, 1200.0)),
+            "having flipped to vertical, the same 1.20 must keep that instead"
+        );
+    }
+
+    /// The seed ratio sits in the middle of the band, and both of its edges
+    /// matter: a first panel at 1.12 (a 16:9 laptop's two-pane split) is
+    /// vertical, one at 1.25 (16:10) is horizontal. Seeding at either band edge
+    /// instead would move one of them.
+    #[test]
+    fn the_first_panel_is_seeded_from_the_middle_of_the_band() {
+        assert!(
+            !ColorScaleOrientation::default().resolve(panel(1000.0, 1120.0)),
+            "1.12 is below the seed ratio"
+        );
+        assert!(
+            ColorScaleOrientation::default().resolve(panel(1000.0, 1250.0)),
+            "1.25 is above it"
+        );
     }
 
     /// A panel that has not been laid out yet must not seed the memory.
@@ -903,6 +932,15 @@ mod tests {
                 "the first real panel must still be free to seed, even at 1.25 \
                  where only the seed ratio (not the band edge) says portrait"
             );
+
+            // A degenerate rect arriving *later* — a collapsed or hidden panel
+            // mid-session — must hand back what is remembered, not a default.
+            // Answering `false` there would flip every bar for a frame.
+            assert!(
+                orientation.resolve(degenerate),
+                "a degenerate panel must report the remembered orientation"
+            );
+            assert!(orientation.resolve(panel(960.0, 1200.0)), "and not have disturbed it");
         }
     }
 

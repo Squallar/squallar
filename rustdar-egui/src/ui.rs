@@ -121,6 +121,10 @@ pub struct Gui {
     /// Remembered color-scale bar orientation for the map panel (hysteresis, so
     /// a resize near the boundary cannot make the bars hop).
     color_scale_orientation: ColorScaleOrientation,
+    /// The map panel rect the last frame laid its pane grid out in. Only read
+    /// by tests, which need the same rects `render_map` used.
+    #[cfg(test)]
+    last_map_panel_rect: egui::Rect,
     viewport_sync: bool,
     sync_layers: bool,
     // --- Radar loop settings ---
@@ -277,6 +281,8 @@ impl Gui {
             active_pane: 0,
             pane_layout: PaneLayout::default(),
             color_scale_orientation: ColorScaleOrientation::default(),
+            #[cfg(test)]
+            last_map_panel_rect: egui::Rect::ZERO,
             viewport_sync: true,
             sync_layers: true,
             loop_lookback_secs: 3600, // default 1 hour
@@ -1043,6 +1049,28 @@ impl Gui {
     /// Number of active panes.
     pub fn pane_count(&self) -> usize {
         self.pane_layout.pane_count
+    }
+
+    /// Split the map into `count` panes, as the settings UI's pane picker does.
+    #[cfg(test)]
+    pub(crate) fn set_pane_count_for_test(&mut self, count: usize) {
+        while self.panes.len() < count {
+            self.panes.push(PaneState::new());
+        }
+        self.pane_layout = PaneLayout::for_count(count);
+        if self.active_pane >= count {
+            self.active_pane = 0;
+        }
+    }
+
+    /// The pane rects the layout produces inside the map panel, as
+    /// `render_map` computes them.
+    #[cfg(test)]
+    pub(crate) fn pane_rects_for_test(&self) -> Vec<egui::Rect> {
+        let panel = self.last_map_panel_rect;
+        (0..self.pane_layout.pane_count)
+            .map(|idx| self.pane_layout.pane_rect(idx, panel))
+            .collect()
     }
 
     /// Whether viewport sync is enabled (all panes share the same map viewport).

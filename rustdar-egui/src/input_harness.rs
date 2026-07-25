@@ -80,13 +80,23 @@ pub(crate) struct InputHarness {
     /// Events queued for the next frame.
     events: Vec<egui::Event>,
     screen_rect: egui::Rect,
+    /// Every rect painted during the last frame, in paint order. Lets a test
+    /// assert on what was actually *drawn* rather than on an intermediate value
+    /// — the only way to pin that a resolved decision reached the renderer.
+    last_rects: Vec<egui::Rect>,
 }
 
 impl InputHarness {
     /// Build a harness with a fresh [`Gui`] and run enough frames for egui to
     /// settle (areas need a frame to register their rects).
     pub(crate) fn new() -> Self {
-        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN_SIZE);
+        Self::with_screen(SCREEN_SIZE)
+    }
+
+    /// A harness on a screen of the given size — e.g. a portrait phone, where
+    /// the pane grid and the panel disagree about which way up they are.
+    pub(crate) fn with_screen(size: egui::Vec2) -> Self {
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
         let mut harness = Self {
             ctx: egui::Context::default(),
             gui: Gui::new(),
@@ -101,9 +111,46 @@ impl InputHarness {
             time: 100.0,
             events: Vec::new(),
             screen_rect,
+            last_rects: Vec::new(),
         };
         harness.warm_up();
         harness
+    }
+
+    /// Split the map into `count` panes, as the settings UI does.
+    pub(crate) fn set_pane_count(&mut self, count: usize) {
+        self.gui.set_pane_count_for_test(count);
+        self.warm_up();
+    }
+
+    /// The pane rects the real layout produces inside the map panel.
+    pub(crate) fn pane_rects(&self) -> Vec<egui::Rect> {
+        self.gui.pane_rects_for_test()
+    }
+
+    /// The color-scale legend strips painted inside `pane`, classified by the
+    /// axis they were drawn along.
+    ///
+    /// `render_color_scale` paints the bar as a run of 2px strips: `(2, 20)`
+    /// for a bottom-edge bar, `(20, 2)` for a right-edge one
+    /// (`ui_map_pane.rs:632` — `SCALE_BAR_WIDTH` is 20). That signature is what
+    /// makes it possible to assert on the drawn result rather than on the value
+    /// that was supposed to produce it.
+    pub(crate) fn color_scale_strips(&self, pane: egui::Rect) -> (usize, usize) {
+        let mut horizontal = 0;
+        let mut vertical = 0;
+        for rect in &self.last_rects {
+            if !pane.contains(rect.center()) {
+                continue;
+            }
+            let (w, h) = (rect.width(), rect.height());
+            if (h - 20.0).abs() < 0.5 && w <= 4.0 {
+                horizontal += 1;
+            } else if (w - 20.0).abs() < 0.5 && h <= 4.0 {
+                vertical += 1;
+            }
+        }
+        (horizontal, vertical)
     }
 
     /// Run a few input-free frames so panels, areas and windows have registered
@@ -343,7 +390,15 @@ impl InputHarness {
             zoom: self.map_memory.zoom(),
         };
 
-        let _full_output = ctx.end_pass();
+        let full_output = ctx.end_pass();
+        self.last_rects = full_output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(rect_shape) => Some(rect_shape.rect),
+                _ => None,
+            })
+            .collect();
         outcome
     }
 }
@@ -997,6 +1052,57 @@ mod tests {
             );
             assert!(outcome.touch.suppress_pan, "frame {frame}");
         });
+    }
+
+    /// 8. **The panel decides which edge, and that decision reaches the paint.**
+    ///
+    ///    A portrait phone split into three panes (`[2, 1]`) is the case no
+    ///    per-pane threshold can get right: the two top panes come out clearly
+    ///    portrait and the bottom one clearly landscape, so keying on each
+    ///    pane's own rect paints two bottom bars and one right-hand bar on the
+    ///    same screen.
+    ///
+    ///    This asserts on the *painted strips*, not on the resolved value,
+    ///    because the resolved value was never the part at risk: what needed
+    ///    pinning was that `render_map` resolves from the panel, that the
+    ///    answer is threaded through `PaneRenderCtx`, and that neither renderer
+    ///    quietly recomputes it from the pane it happens to be drawing.
+    #[test]
+    fn every_pane_draws_its_color_scale_on_the_same_edge() {
+        let mut h = InputHarness::with_screen(egui::vec2(1080.0, 1273.0));
+        h.set_pane_count(3);
+        h.frame();
+
+        let panes = h.pane_rects();
+        assert_eq!(panes.len(), 3, "precondition: a [2, 1] grid");
+
+        // Preconditions, so this fails loudly rather than silently stopping
+        // being a test if the layout maths ever changes.
+        let ratio = |r: egui::Rect| r.height() / r.width();
+        assert!(
+            ratio(panes[0]) > 1.35,
+            "top panes must be clearly portrait, got {}",
+            ratio(panes[0])
+        );
+        assert!(
+            ratio(panes[2]) < 1.05,
+            "the bottom pane must be clearly landscape, got {} — otherwise the \
+             panes do not disagree and this test proves nothing",
+            ratio(panes[2])
+        );
+
+        for (idx, pane) in panes.iter().enumerate() {
+            let (horizontal, vertical) = h.color_scale_strips(*pane);
+            assert!(
+                horizontal > 0,
+                "pane {idx}: expected a bottom-edge colour bar, painted none"
+            );
+            assert_eq!(
+                vertical, 0,
+                "pane {idx}: painted a right-edge bar — the panes disagree, \
+                 which is the whole artefact the panel-keyed decision removes"
+            );
+        }
     }
 
     /// 7. A tap that lands on a floating dialog is filtered out by the
