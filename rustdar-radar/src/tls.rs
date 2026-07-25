@@ -88,10 +88,26 @@ pub fn client(user_agent: &str, timeout: std::time::Duration) -> reqwest::Client
 /// request is a `fetch()` call, so the browser owns the timeout, the trust store
 /// and the mixed-content policy that `https_only` stands in for elsewhere. The
 /// `timeout` argument is accepted and ignored to keep one signature across targets.
+///
+/// # Why the user agent is dropped too
+///
+/// A page cannot set `User-Agent`, and trying to is actively harmful. It is a
+/// forbidden header name: Chromium strips it silently, so the request stays a
+/// *simple* CORS request and succeeds. Firefox instead lets it through, which
+/// makes the request non-simple and forces a preflight `OPTIONS` — and a plain
+/// tile CDN does not answer preflights, so every basemap tile fails with
+/// "Access-Control-Allow-Origin missing" and the map renders on a blank
+/// background. One browser working and the other not, from one line, with no
+/// error on the working one.
+///
+/// So the argument is accepted and ignored here, exactly as `timeout` is. The
+/// browser sends its own `User-Agent`, which is the only thing it will ever
+/// send, and the tile provider's terms are satisfied by the `Referer` the
+/// browser attaches instead.
 #[cfg(target_arch = "wasm32")]
-pub fn client(user_agent: &str, _timeout: std::time::Duration) -> reqwest::ClientBuilder {
+pub fn client(_user_agent: &str, _timeout: std::time::Duration) -> reqwest::ClientBuilder {
     init();
-    reqwest::Client::builder().user_agent(user_agent.to_owned())
+    reqwest::Client::builder()
 }
 
 /// Build a client that sends **no** `User-Agent`.
