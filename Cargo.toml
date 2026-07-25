@@ -43,7 +43,7 @@ egui-wgpu = "=0.34.1"
 # Defaults off: rustdar-platform picks its own backend/clipboard feature set.
 egui-winit = { version = "=0.34.1", default-features = false }
 walkers = "=0.53.0"
-wgpu = "=29.0.1"
+wgpu = "=29.0.4"
 winit = "=0.30.13"
 
 # -- NEXRAD decoding --
