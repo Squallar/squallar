@@ -182,6 +182,25 @@ impl InputHarness {
         self.events.push(pointer_button(pos, false));
     }
 
+    /// The cursor left the window: `egui-winit` maps `WindowEvent::CursorLeft`
+    /// to a bare [`egui::Event::PointerGone`] and forgets the pointer position
+    /// (`egui-winit-0.34.1/src/lib.rs:340`). **No release is reported** — and
+    /// while the position is forgotten, a real mouse release happening outside
+    /// the window is dropped on the floor too (`lib.rs:796`), which is why
+    /// egui's `primary_down()` can stay latched across the excursion.
+    pub(crate) fn cursor_left(&mut self) {
+        self.events.push(egui::Event::PointerGone);
+    }
+
+    /// Raw device motion (`DeviceEvent::MouseMotion` → [`egui::Event::MouseMoved`]),
+    /// which `egui-winit` forwards while a button is held even with the cursor
+    /// outside the window (`lib.rs:759`). It carries a delta and **no
+    /// position**, so egui has nothing to put in `interact_pos()` on such a
+    /// frame.
+    pub(crate) fn mouse_moved_raw(&mut self, delta: egui::Vec2) {
+        self.events.push(egui::Event::MouseMoved(delta));
+    }
+
     // --- touch input (mirrors egui-winit's `on_touch`) ----------------------
 
     pub(crate) fn touch_start(&mut self, pos: egui::Pos2) {
@@ -295,7 +314,6 @@ fn touch(phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     /// Long enough for a deferred single tap to be confirmed
     /// (`DOUBLE_TAP_TIMEOUT_S` is 0.4s).
     const AFTER_DOUBLE_TAP_TIMEOUT: f64 = 0.5;
@@ -614,6 +632,88 @@ mod tests {
                 "frame {frame}: an expired pointer must not become a long press"
             );
         });
+    }
+
+    /// 6f. **PROBE D** — the desktop excursion. The button is held, the cursor
+    ///     leaves the window and comes back still held, and everything that
+    ///     arrives in between is a `PointerMoved`: no press, ever.
+    ///
+    ///     `egui-winit` maps `CursorLeft` to a bare `PointerGone` and forgets
+    ///     the pointer position, which also makes it drop a mouse release that
+    ///     happens outside the window — so egui's `primary_down()` stays
+    ///     latched right through the excursion. A latch that only a *press*
+    ///     could clear therefore stranded the pointer here exactly as a
+    ///     cancelled touch used to strand it: dead until the user clicked.
+    #[test]
+    fn pointer_returning_to_the_window_recovers_without_a_click() {
+        let mut h = InputHarness::new();
+        let inside = h.map_center();
+
+        h.mouse_press(inside);
+        let held = h.frames_for(10, 0.1);
+        assert_eq!(
+            held.touch.long_press_pos,
+            Some(inside),
+            "precondition: the pointer is live and held"
+        );
+
+        // The cursor leaves. Nothing says whether the button survived the trip,
+        // so the pointer must be distrusted for as long as it stays silent.
+        h.cursor_left();
+        let gone = h.frame_after(FRAME_DT);
+        assert_eq!(gone.touch.long_press_pos, None, "the held position must not stick");
+        assert!(!gone.touch.suppress_pan);
+
+        // It comes back, still dragging: five move events, no press among them.
+        let mut back = inside;
+        for step in 1..=5 {
+            back = inside + egui::vec2(12.0 * step as f32, 7.0 * step as f32);
+            h.mouse_move(back);
+            h.frame_after(FRAME_DT);
+        }
+
+        // Motion with the button down is proof the pointer is alive: holding
+        // still from here must produce a tooltip again. Before the un-latch
+        // rule this stayed `None` forever, however long the user waited.
+        let recovered = h.frames_for(10, 0.1);
+        assert_eq!(
+            recovered.touch.long_press_pos,
+            Some(back),
+            "a returning pointer must not stay dead until the next click"
+        );
+        assert!(recovered.touch.suppress_pan);
+    }
+
+    /// 6i. When motion un-latches a pointer whose position egui has thrown
+    ///     away, the reported position must be the last real one.
+    ///
+    ///     `PointerGone` clears egui's position from the *following* frame on,
+    ///     and `Event::MouseMoved` — raw device motion, which `egui-winit`
+    ///     forwards while a button is held even with the cursor outside the
+    ///     window — carries a delta and no position. So this frame has a live
+    ///     pointer and nothing for `interact_pos()` to return; falling back to
+    ///     `Pos2::ZERO` there would pin the gesture to the screen corner.
+    #[test]
+    fn motion_without_a_position_reports_the_last_real_one() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+
+        h.mouse_press(pos);
+        h.frame_after(FRAME_DT);
+
+        h.cursor_left();
+        h.frame_after(FRAME_DT);
+
+        // Raw motion keeps arriving; the button was never released.
+        h.mouse_moved_raw(egui::vec2(3.0, -2.0));
+        h.frame_after(FRAME_DT);
+
+        let held = h.frames_for(10, 0.1);
+        assert_eq!(
+            held.touch.long_press_pos,
+            Some(pos),
+            "with no position to be had, report the last real one — not the corner"
+        );
     }
 
     /// 7. A tap that lands on a floating dialog is filtered out by the

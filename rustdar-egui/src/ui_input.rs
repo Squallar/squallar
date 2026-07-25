@@ -84,12 +84,57 @@ pub(crate) struct PointerFrame {
 /// "button is down" immediately re-arms and the gesture comes back (for the long
 /// press, [`LONG_PRESS_DURATION_S`] later, pinned at the corner). So the fix is
 /// a latch: once a sequence ends without a release, the pointer is considered
-/// *lost*, and only a fresh press can clear that.
+/// *lost*.
+///
+/// # Un-latching
+///
+/// `PointerGone` is not only a cancelled touch. `egui-winit` emits it for
+/// `WindowEvent::CursorLeft` too (`egui-winit-0.34.1/src/lib.rs:342`), and it
+/// drops the pointer position at the same time — which means a mouse button
+/// *released* outside the window is discarded entirely, so egui's `down` stays
+/// latched there as well. A latch that only a press could clear therefore
+/// stranded the opposite case: hold the button, leave the window, come back
+/// still dragging, and every following frame is `PointerMoved` with no press in
+/// it, so the pointer stayed dead until the user clicked. That is the same
+/// stranding bug inverted, and it contradicts the very intent egui cites for
+/// not treating `PointerGone` as a release.
+///
+/// So the latch is cleared by two things: a fresh press, and **any pointer
+/// motion while the button is still held**. Motion is the definition of "not
+/// lost" — it is the same evidence the idle backstop below keys on, so the
+/// module has one rule rather than two. Crucially it does not weaken the
+/// cancellation fix: a genuinely cancelled touch is terminal, the finger is
+/// gone and the OS emits no further motion for it, so the latch holds for as
+/// long as it matters.
+///
+/// Two consequences worth knowing:
+/// * The un-latch is deliberately *not* conditioned on the sequence having
+///   been mouse-originated. Classifying the source needs integration-specific
+///   knowledge of which events precede a press, and getting it wrong on a
+///   backend we have not read (eframe's web canvas, iOS) would silently restore
+///   the original stranding bug on that platform. Keying on motion alone is
+///   correct everywhere without knowing the backend.
+/// * If a *second* finger is still down when the primary is cancelled,
+///   `egui-winit` clears `pointer_touch_id` and promotes that finger's moves to
+///   `PointerMoved` (`lib.rs:894`), so the gesture continues from the surviving
+///   finger instead of dying. A finger really is on the glass, and the sequence
+///   still terminates cleanly when it lifts, so this is the better of the two
+///   behaviours.
 #[derive(Clone, Default)]
 pub(crate) struct PointerTracker {
-    /// Set when a sequence ended without a release; cleared by the next press.
+    /// Set when a sequence ended without a release; cleared by the next press,
+    /// or by motion arriving while the button is still down.
     lost: bool,
     /// Last position egui actually reported (survives `PointerGone`).
+    ///
+    /// egui clears `interact_pos()` on the frame *after* a `PointerGone`
+    /// (`egui-0.34.1/src/input_state/mod.rs:1111`), and
+    /// [`egui::Event::MouseMoved`] — raw device motion, which `egui-winit`
+    /// forwards while a button is held even with the cursor outside the window
+    /// — carries a delta and no position. So a pointer can legitimately be
+    /// un-latched by motion on a frame where egui has no position to offer;
+    /// reporting the last real one keeps the gesture where the user left it
+    /// instead of teleporting it to the screen corner.
     last_pos: egui::Pos2,
     /// Wall-clock time of the last frame that carried any pointer activity.
     last_activity: Option<f64>,
@@ -102,6 +147,10 @@ impl PointerTracker {
     pub(crate) fn read(&mut self, ctx: &egui::Context) -> PointerFrame {
         ctx.input(|i| {
             let mut activity = false;
+            // egui has already folded this frame's events into `pointer` by the
+            // time we run, so this is the frame's *final* button state and is
+            // the same value `down` is derived from below.
+            let raw_down = i.pointer.primary_down();
 
             // Walk the events in order so a cancel followed by a fresh press
             // within one frame ends up armed, not lost.
@@ -129,9 +178,23 @@ impl PointerTracker {
                         activity = true;
                         self.lost = true;
                     }
-                    egui::Event::PointerMoved(_)
-                    | egui::Event::MouseMoved(_)
-                    | egui::Event::Touch { .. } => activity = true,
+                    // Motion means the pointer is demonstrably alive, whatever
+                    // made us give up on it — the cursor left and came back, or
+                    // the idle backstop fired under a finger that was merely
+                    // resting. Un-latch, so a returning pointer is not stranded
+                    // waiting for a click.
+                    //
+                    // Not gated on the button being down: `down` below already
+                    // requires `raw_down`, and `raw_down` can only go from false
+                    // to true on a press, which clears the latch anyway. So a
+                    // hover after a real release cannot resurrect a finished
+                    // sequence no matter what this arm does, and a guard here
+                    // would be unfalsifiable.
+                    egui::Event::PointerMoved(_) | egui::Event::MouseMoved(_) => {
+                        activity = true;
+                        self.lost = false;
+                    }
+                    egui::Event::Touch { .. } => activity = true,
                     _ => {}
                 }
             }
@@ -144,13 +207,12 @@ impl PointerTracker {
                 self.last_activity = Some(i.time);
             }
 
-            let raw_down = i.pointer.primary_down();
-
             // Backstop: if we believe a button is down but no pointer input at
             // all has arrived for a long time, the belief is stale. Latching
             // `lost` (rather than just ending one gesture) is what keeps the
             // long-press detector from picking the phantom finger straight back
-            // up.
+            // up; the motion rule above is what lets a still-live finger undo
+            // it without a lift.
             if raw_down
                 && i.time - self.last_activity.unwrap_or(i.time) >= POINTER_IDLE_TIMEOUT_S
             {
