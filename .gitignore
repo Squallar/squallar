@@ -3,3 +3,4 @@
 .env
 /.cargo/android-ndk-wrapper.cmake
 /.cargo/config.toml
+/.claude/worktrees/
