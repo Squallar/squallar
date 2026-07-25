@@ -1,5 +1,6 @@
 //! Fetch current METAR observations from the Aviation Weather Center bulk cache file.
 
+use std::cell::{Cell, RefCell};
 use std::io::Read;
 
 use flate2::read::GzDecoder;
@@ -35,13 +36,18 @@ pub async fn fetch_current_metars(
         .read_to_string(&mut csv_text)
         .map_err(|e| format!("Failed to decompress METAR cache: {e}"))?;
 
-    parse_metar_csv(&csv_text)
+    parse_metar_csv(&csv_text).map(|(obs, _)| obs)
 }
 
 /// Parse AWC METAR cache CSV into `MetarOb` structs.
 ///
 /// Supports both old ADDS/TDS column names and AWC v4 names via fallback mapping.
-fn parse_metar_csv(csv: &str) -> Result<Vec<MetarOb>, String> {
+///
+/// Returns the observations alongside the number of non-empty cells that failed
+/// to parse. That count is the tripwire for a silent upstream schema change —
+/// see the UNIT HAZARD note below — so it is a return value rather than only a
+/// log line, and tests assert on it.
+fn parse_metar_csv(csv: &str) -> Result<(Vec<MetarOb>, u32), String> {
     let mut lines = csv.lines();
 
     // Find the header line — skip comment/info lines.
@@ -73,6 +79,30 @@ fn parse_metar_csv(csv: &str) -> Result<Vec<MetarOb>, String> {
     let columns: Vec<&str> = header_line.split(',').map(|s| s.trim()).collect();
 
     // Find first matching column index for a list of candidate names.
+    //
+    // ── UNIT HAZARD — read before adding a candidate ──────────────────────
+    // This helper matches on *name only*, so appending a new upstream spelling
+    // to an existing list silently inherits whatever unit the other candidates
+    // carry. That is not hypothetical. Iowa Environmental Mesonet
+    // (`mesonet.agron.iastate.edu/api/1/currents.json?network=<ST>_ASOS`) is a
+    // plausible replacement feed, and three of its columns are the same
+    // quantity in a *different* representation:
+    //
+    //   * `tmpf` / `dwpf` are °F, not °C. Adding them to a `temp_c` list would
+    //     put °F into `temp_c`, and the render layer applies ×9/5+32 on top —
+    //     90 °F would display as 194 °F.
+    //   * `alti` is inHg, but the altimeter unit used to be inferred from the
+    //     literal string "altim_in_hg", so `alti` would have been read as hPa,
+    //     roughly 34× off.
+    //   * `sknt` is a float ("8.0"); `get_u16` parses `u16` and rejects it, so
+    //     every wind speed would quietly become `None`.
+    //
+    // Temperature and pressure are therefore resolved through `col_idx_unit`,
+    // which makes the unit a *required* part of each candidate — you cannot add
+    // a spelling without stating what it is measured in. The `sknt` shape is
+    // caught by the rejected-cell count returned from this function.
+    // Nothing here reads IEM today; this note exists so that adding it breaks
+    // loudly instead of quietly.
     let col_idx = |names: &[&str]| -> Option<usize> {
         for name in names {
             if let Some(i) = columns.iter().position(|c| *c == *name) {
@@ -85,13 +115,27 @@ fn parse_metar_csv(csv: &str) -> Result<Vec<MetarOb>, String> {
     let i_station = col_idx(&["station_id", "icaoId"]);
     let i_lat = col_idx(&["latitude", "lat"]);
     let i_lon = col_idx(&["longitude", "lon"]);
-    let i_temp = col_idx(&["temp_c", "temp"]);
-    let i_dewp = col_idx(&["dewpoint_c", "dewp"]);
+    let temp_col = col_idx_unit(
+        &columns,
+        &[("temp_c", TempUnit::Celsius), ("temp", TempUnit::Celsius)],
+    );
+    let dewp_col = col_idx_unit(
+        &columns,
+        &[("dewpoint_c", TempUnit::Celsius), ("dewp", TempUnit::Celsius)],
+    );
     let i_wdir = col_idx(&["wind_dir_degrees", "wdir"]);
     let i_wspd = col_idx(&["wind_speed_kt", "wspd"]);
     let i_wgst = col_idx(&["wind_gust_kt", "wgst"]);
     let i_vis = col_idx(&["visibility_statute_mi", "visib"]);
-    let i_altim = col_idx(&["altim_in_hg", "altim"]);
+    let altim_col = col_idx_unit(
+        &columns,
+        &[
+            // Old ADDS/TDS spells the unit into the name: inches of mercury.
+            ("altim_in_hg", PressureUnit::InHg),
+            // AWC v4 reports the altimeter setting in hectopascals.
+            ("altim", PressureUnit::Hpa),
+        ],
+    );
     let i_fltcat = col_idx(&["flight_category", "fltcat"]);
     let i_raw = col_idx(&["raw_text", "rawOb"]);
     let i_wx = col_idx(&["wx_string", "wxString"]);
@@ -115,9 +159,6 @@ fn parse_metar_csv(csv: &str) -> Result<Vec<MetarOb>, String> {
         pairs
     };
 
-    // altim_in_hg means values are in inches of mercury; otherwise assume hPa.
-    let altim_is_inhg = columns.contains(&"altim_in_hg");
-
     let Some(i_station) = i_station else {
         return Err("Missing station_id/icaoId column".to_string());
     };
@@ -130,6 +171,20 @@ fn parse_metar_csv(csv: &str) -> Result<Vec<MetarOb>, String> {
 
     let min_fields = i_station.max(i_lat).max(i_lon) + 1;
     let mut observations = Vec::new();
+
+    // Non-empty cells that fail to parse are counted rather than silently
+    // dropped. A whole column quietly turning into `None` — a unit or format
+    // change upstream, e.g. IEM's float `sknt` against a `u16` parse — is
+    // otherwise completely invisible. One summary line, not one per row.
+    let rejected = Cell::new(0u32);
+    let rejected_sample = RefCell::new(String::new());
+    let note_reject = |s: &str| {
+        rejected.set(rejected.get() + 1);
+        let mut sample = rejected_sample.borrow_mut();
+        if sample.is_empty() {
+            *sample = s.to_string();
+        }
+    };
 
     for line in lines {
         let trimmed = line.trim();
@@ -157,12 +212,30 @@ fn parse_metar_csv(csv: &str) -> Result<Vec<MetarOb>, String> {
         }
 
         let get_f64 = |idx: Option<usize>| -> Option<f64> {
-            idx.and_then(|i| fields.get(i))
-                .and_then(|s| if s.is_empty() { None } else { s.parse().ok() })
+            let s = *idx.and_then(|i| fields.get(i))?;
+            if s.is_empty() {
+                return None;
+            }
+            match s.parse() {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    note_reject(s);
+                    None
+                }
+            }
         };
         let get_u16 = |idx: Option<usize>| -> Option<u16> {
-            idx.and_then(|i| fields.get(i))
-                .and_then(|s| if s.is_empty() { None } else { s.parse().ok() })
+            let s = *idx.and_then(|i| fields.get(i))?;
+            if s.is_empty() {
+                return None;
+            }
+            match s.parse() {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    note_reject(s);
+                    None
+                }
+            }
         };
         let get_str = |idx: Option<usize>| -> String {
             idx.and_then(|i| fields.get(i))
@@ -176,9 +249,10 @@ fn parse_metar_csv(csv: &str) -> Result<Vec<MetarOb>, String> {
             .map(|s| s.to_string())
             .unwrap_or_else(|| station_id.clone());
 
-        let altimeter_hpa = get_f64(i_altim).map(|v| {
-            if altim_is_inhg { v * 33.8639 } else { v }
-        });
+        // The unit rides along with the column name, so a new spelling cannot
+        // inherit the wrong one. See the UNIT HAZARD note on `col_idx`.
+        let altimeter_hpa =
+            altim_col.and_then(|(i, unit)| get_f64(Some(i)).map(|v| unit.to_hpa(v)));
 
         let flight_category = i_fltcat
             .and_then(|i| fields.get(i))
@@ -212,8 +286,8 @@ fn parse_metar_csv(csv: &str) -> Result<Vec<MetarOb>, String> {
             lat,
             lon,
             elev_m: get_f64(i_elev),
-            temp_c: get_f64(i_temp),
-            dewp_c: get_f64(i_dewp),
+            temp_c: temp_col.and_then(|(i, u)| get_f64(Some(i)).map(|v| u.to_celsius(v))),
+            dewp_c: dewp_col.and_then(|(i, u)| get_f64(Some(i)).map(|v| u.to_celsius(v))),
             // NOT the raw column: `wind_dir_degrees=0` means calm *or* variable,
             // and reading it as a bearing pointed a barb due north for a quarter
             // of the feed. See `resolve_wind_dir`.
@@ -237,8 +311,71 @@ fn parse_metar_csv(csv: &str) -> Result<Vec<MetarOb>, String> {
         });
     }
 
+    if rejected.get() > 0 {
+        log::warn!(
+            "METAR cache: dropped {} non-empty cell(s) that failed to parse \
+             (first: {:?}) — a schema or unit change upstream?",
+            rejected.get(),
+            rejected_sample.borrow(),
+        );
+    }
+
     log::info!("Parsed {} METAR observations from cache", observations.len());
-    Ok(observations)
+    Ok((observations, rejected.get()))
+}
+
+// ── Column units ──────────────────────────────────────────────────────────
+//
+// These exist so a column's unit is stated where its *name* is declared,
+// instead of being inferred later from a string comparison. See the UNIT
+// HAZARD note in `parse_metar_csv`.
+
+/// The unit a temperature column's values are recorded in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TempUnit {
+    Celsius,
+    /// Not produced by AWC. Present so that wiring up a Fahrenheit feed
+    /// (IEM's `tmpf`/`dwpf`) requires converting rather than mislabelling.
+    #[allow(dead_code)]
+    Fahrenheit,
+}
+
+impl TempUnit {
+    fn to_celsius(self, v: f64) -> f64 {
+        match self {
+            TempUnit::Celsius => v,
+            TempUnit::Fahrenheit => (v - 32.0) * 5.0 / 9.0,
+        }
+    }
+}
+
+/// The unit a pressure/altimeter column's values are recorded in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PressureUnit {
+    Hpa,
+    InHg,
+}
+
+impl PressureUnit {
+    fn to_hpa(self, v: f64) -> f64 {
+        match self {
+            PressureUnit::Hpa => v,
+            PressureUnit::InHg => v * 33.8639,
+        }
+    }
+}
+
+/// First present column among `names`, with the unit bound to that spelling.
+///
+/// Unlike a bare candidate list, this cannot resolve a name to a unit it does
+/// not carry: every candidate must state its own.
+fn col_idx_unit<U: Copy>(columns: &[&str], names: &[(&str, U)]) -> Option<(usize, U)> {
+    names.iter().find_map(|(name, unit)| {
+        columns
+            .iter()
+            .position(|c| c == name)
+            .map(|i| (i, *unit))
+    })
 }
 
 // ── Wind direction ────────────────────────────────────────────────────────
@@ -390,7 +527,8 @@ mod tests {
     const SAMPLE: &str = include_str!("testdata/metars.sample.csv");
 
     fn sample() -> Vec<MetarOb> {
-        parse_metar_csv(SAMPLE).expect("fixture must parse")
+        let (obs, _) = parse_metar_csv(SAMPLE).expect("fixture must parse");
+        obs
     }
 
     fn station(id: &str) -> MetarOb {
@@ -609,5 +747,58 @@ mod tests {
             resolve_wind_dir(no_group, Some(360), Some(7)),
             Some(WindDir::Degrees(360))
         );
+    }
+
+    // ── Column units (see the UNIT HAZARD note on `col_idx`) ──────────────
+
+    /// `altim_in_hg` spells its unit into the name; `altim` does not and is hPa.
+    /// The unit must ride with the name, not be re-derived from a string test.
+    #[test]
+    fn the_altimeter_unit_comes_from_the_column_name_that_matched() {
+        let candidates = [
+            ("altim_in_hg", PressureUnit::InHg),
+            ("altim", PressureUnit::Hpa),
+        ];
+
+        let cols = ["station_id", "altim_in_hg"];
+        assert_eq!(col_idx_unit(&cols, &candidates).unwrap().1, PressureUnit::InHg);
+
+        let cols = ["station_id", "altim"];
+        assert_eq!(col_idx_unit(&cols, &candidates).unwrap().1, PressureUnit::Hpa);
+
+        // And it is actually applied: KEDU reports 29.86 inHg.
+        let hpa = station("KEDU").altimeter_hpa.unwrap();
+        assert!((hpa - 29.86 * 33.8639).abs() < 1e-6, "got {hpa} hPa");
+    }
+
+    /// A Fahrenheit column (IEM's `tmpf`) must convert, not be relabelled. If a
+    /// future author adds it to the candidate list, `col_idx_unit` forces them
+    /// to state the unit and this conversion is what runs.
+    #[test]
+    fn a_fahrenheit_temperature_column_would_be_converted_not_relabelled() {
+        assert!((TempUnit::Fahrenheit.to_celsius(90.0) - 32.222_222).abs() < 1e-5);
+        assert_eq!(TempUnit::Celsius.to_celsius(21.0), 21.0);
+        // AWC's own column is already Celsius and must pass through untouched.
+        assert_eq!(station("KEDU").temp_c, Some(20.0));
+    }
+
+    /// A cell that is present but unparseable is counted, so a column silently
+    /// emptying out (IEM's float `sknt` against a `u16` parse, or the `10+`
+    /// visibility this tripwire was built for) shows up instead of vanishing.
+    #[test]
+    fn unparseable_cells_are_counted_rather_than_silently_dropped() {
+        let (obs, rejected) = parse_metar_csv(SAMPLE).unwrap();
+        assert_eq!(rejected, 0, "the real AWC fixture parses cleanly");
+        assert!(!obs.is_empty());
+
+        // Same header, one row whose wind speed arrived as a float.
+        let mut lines = SAMPLE.lines();
+        let header = lines.next().unwrap();
+        let row = lines.next().unwrap().replace(",180,6,", ",180,8.0,");
+        let broken = format!("{header}\n{row}\n");
+
+        let (broken_obs, rejected) = parse_metar_csv(&broken).unwrap();
+        assert_eq!(broken_obs[0].wind_speed_kt, None, "a float knot value is rejected");
+        assert_eq!(rejected, 1, "and the rejection is counted, not swallowed");
     }
 }
