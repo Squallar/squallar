@@ -14,6 +14,29 @@ name: Build
 # does not fit all of them -- see the comments on each.
 #
 # Everything feeds `build-success`, which is the single required status check.
+#
+# =============================================================================
+# LANDING ORDER: DO NOT MERGE THIS BEFORE THE wgpu/WebGL FIX
+# =============================================================================
+#
+# `web-bundle` is red on main right now -- wgpu 30's `webgpu` feature collides
+# with the WebGL2 backend this project requires and wasm-bindgen aborts with
+# `duplicate string enums: GpuFilterMode`. That job is in `build-success.needs`,
+# and `Build success check` is a REQUIRED context in the repository ruleset
+# (id 14994623; required contexts are `Clippy`, `Build success check`, `Test`).
+#
+# So merging this before that fix turns every push and every pull request red,
+# and with `required_approving_review_count: 0` the practical effect is that
+# nothing merges at all -- while bypass actors keep committing to main several
+# times an hour, each producing another red run. The likely reaction is that
+# somebody deletes `Build success check` from the ruleset, which destroys the
+# gate this file exists to build.
+#
+# The fix is NOT to wrap `web-bundle` in `|| true` or `continue-on-error`, and
+# not to lift it out of `needs`: a deliverable that does not build should make
+# the required check red. That is the whole point. The fix is to land the wgpu
+# change first. This ordering is deliberate, not an oversight.
+# =============================================================================
 
 on:
   push:
@@ -24,7 +47,11 @@ permissions:
 
 concurrency:
   group: '${{ github.workflow }} @ ${{ github.ref }}'
-  cancel-in-progress: true
+  # Cancel superseded runs on branches, never on main. Bots push to main several
+  # times an hour; cancelling those runs leaves `build-success` red for a reason
+  # that has nothing to do with the code, and a cancelled run never reaches
+  # `deploy-pages`, so the site would rarely publish.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -114,12 +141,22 @@ jobs:
         # No `rustup target add` here: rust-toolchain.toml lists every
         # cross-target this matrix uses, so `rustup show` materialises the whole
         # set. That file is the single source of truth, which is what keeps a
-        # local build honest against CI -- adding a row here without adding the
-        # target there would fail loudly rather than silently using the host.
+        # local build honest against CI.
+        #
+        # The assertion is against `rustup target list --installed`, NOT
+        # `rustc --print target-list`. The latter enumerates every triple rustc
+        # knows how to name, installed or not, so it passes for
+        # `sparc64-unknown-netbsd` and would have let a row whose target is
+        # missing from rust-toolchain.toml fall through to a confusing "can't
+        # find crate for `std`" later in the job.
         run: |
+          set -euo pipefail
           rustup show active-toolchain || rustup toolchain install
           rustup show
-          rustc --print target-list | grep -qx '${{ matrix.target }}'
+          if ! rustup target list --installed | grep -qx '${{ matrix.target }}'; then
+            echo "::error::target ${{ matrix.target }} is not installed. Add it to the targets list in rust-toolchain.toml."
+            exit 1
+          fi
 
       # serialport links against libudev on Linux only; macOS and Windows need
       # nothing. Guarded rather than unconditional because `apt-get` does not
@@ -199,42 +236,58 @@ jobs:
         run: wasm-pack build rustdar-web --target web --release --no-typescript --no-pack
 
       # The servable root is `rustdar-web/` -- that is the directory
-      # `python3 -m http.server` is run from to get a working page -- so the
-      # artifact is that directory minus the Rust crate itself.
+      # `python3 -m http.server` is run from to get a working page.
       #
-      # Copied by exclusion rather than by naming index.html and pkg/ explicitly,
-      # so that static files added beside them later (manifest.webmanifest, a
-      # service worker, icons/) ship without this job needing an edit.
+      # Copied by ALLOWLIST, not by exclusion. rsync copies the working
+      # directory, not git's index, so an exclusion list publishes to the open
+      # internet anything an earlier step happened to leave lying around: a
+      # `.env`, a signing keystore, `.git/config`, stray notes. The tracked tree
+      # is clean today, which is exactly why this must not depend on it staying
+      # clean. Only extensions a browser actually loads are copied.
+      #
+      # The allowlist is by extension rather than by filename so that static
+      # files added beside index.html later -- a `manifest.webmanifest`, a
+      # service worker, `icons/` -- still ship without this job being edited.
+      # Anything skipped is printed, so a genuinely-needed asset with an
+      # unexpected extension is visible rather than silently missing.
       - name: Stage the servable directory
         shell: bash
         run: |
           set -euo pipefail
           rm -rf dist && mkdir -p dist
-          rsync -a \
-            --exclude='/src/' \
-            --exclude='/Cargo.toml' \
-            --exclude='/target/' \
-            --exclude='.gitignore' \
+          rsync -a --prune-empty-dirs \
+            --exclude='.git' --exclude='.git/**' \
+            --exclude='.env' --exclude='.env.*' \
+            --exclude='*.keystore' --exclude='*.jks' --exclude='*.pem' --exclude='*.key' \
+            --exclude='/src/' --exclude='/target/' \
+            --include='*/' \
+            --include='*.html' --include='*.htm' \
+            --include='*.js' --include='*.mjs' --include='*.map' \
+            --include='*.css' \
+            --include='*.wasm' \
+            --include='*.json' --include='*.webmanifest' \
+            --include='*.png' --include='*.jpg' --include='*.jpeg' --include='*.gif' \
+            --include='*.svg' --include='*.webp' --include='*.avif' --include='*.ico' \
+            --include='*.woff' --include='*.woff2' --include='*.ttf' \
+            --include='*.txt' \
+            --exclude='*' \
             rustdar-web/ dist/
+
           echo "Staged:"; find dist -type f | sort | sed 's/^/  /'
+          echo "Skipped (not published):"
+          diff <(cd rustdar-web && find . -type f | sort) <(cd dist && find . -type f | sort) \
+            | grep '^<' | sed 's/^< /  /' || true
+
           test -f dist/index.html
           test -f dist/pkg/rustdar_web.js
           test -f dist/pkg/rustdar_web_bg.wasm
 
-      # A project Pages site is served from https://<user>.github.io/rustdar/,
-      # not from the domain root. An absolute asset path works perfectly under
-      # `python3 -m http.server` (which serves from /) and 404s in production,
-      # giving a green deploy and a blank page. index.html currently imports
-      # `./pkg/rustdar_web.js`, which is correct; this keeps it that way.
+      # Scans every staged text asset, not just index.html -- see the script's
+      # docstring. The previous version of this step grepped index.html alone
+      # with a handful of patterns, which missed single quotes, `fetch("/`,
+      # `new URL("/`, CSS `url(/)`, and every file the PWA work is about to add.
       - name: Reject absolute asset paths
-        shell: bash
-        run: |
-          set -uo pipefail
-          if grep -nE '(src|href)="/|from "/|import\("/' dist/index.html; then
-            echo "::error::index.html references a root-absolute path. A project Pages site is served from a subpath, so this will 404 in production. Use ./ relative paths."
-            exit 1
-          fi
-          echo "ok: no root-absolute asset references in index.html"
+        run: python3 .github/scripts/check-relative-paths.py dist
 
       # Uploaded on every run, not just on main. It costs nothing, and it means a
       # pull request proves the artifact actually assembles instead of that being
@@ -245,31 +298,98 @@ jobs:
           path: dist
 
   # ---------------------------------------------------------------------------
-  # Android: the real cross-compile, both shipped ABIs
+  # Android tier 1: the cheap gate, no NDK, ~7 seconds
   # ---------------------------------------------------------------------------
   #
-  # There is deliberately no cheaper "no NDK" pre-check job here, and that is a
-  # decision worth recording because one is easy to reach for.
+  # (This rationale is inherited from the standalone android.yaml that this file
+  # absorbed, corrected where it was wrong. Kept here because it is the only
+  # written record of why the cheap tier exists.)
   #
-  # Such a job is only possible against a workspace member whose Android
-  # dependency closure is free of C. Today exactly one member qualifies:
-  # `rustdar-android-theme` (jni + ndk-context, both pure Rust), and a
-  # `cargo check -p rustdar-android-theme --target aarch64-linux-android` does
-  # reproduce the jni 0.21 -> 0.22 breakage in ~6 seconds with every ANDROID_*
-  # variable unset -- measured on this tree before the fix landed.
+  # Every Android source file in this repo is behind `#[cfg(target_os =
+  # "android")]`, so `cargo check --workspace` on the host compiles *none* of it
+  # and passes clean no matter how broken the JNI bridges are. The
+  # rustls-platform-verifier 0.6 -> 0.7 bump, and the jni 0.21 -> 0.22 bump it
+  # drags in, went green through Build, Clippy and Test while
+  # `./gradlew assembleDebug` was failing at `:app:buildRustLibDebug`.
   #
-  # It is not used, because that crate is a candidate for removal. If its JNI code
-  # is folded into `rustdar-android`, the only crate still holding JNI calls pulls
-  # reqwest -> rustls -> ring, which compiles C and therefore needs the NDK -- so
-  # the cheap tier becomes impossible rather than merely relocated. Worse, a job
-  # written as "check the C-free members for the Android target" would keep
-  # passing after the merge while no longer compiling a single JNI call: green for
-  # a reason unrelated to what it claims to verify. The rows below need the NDK
-  # anyway and cover strictly more, so the cheap tier buys speed, not coverage.
+  # `rustdar-android-theme`'s only Android dependencies are `jni` and
+  # `ndk-context`, both pure Rust, so this compiles with nothing but a rustup
+  # target: no NDK, no C toolchain, no `cargo install`. Measured at 7.1s on this
+  # tree with every ANDROID_* variable unset, and it reproduces both errors of the
+  # jni break (`JavaVM::from_raw(..).unwrap()`, one-argument `JObject::from_raw`).
   #
-  # If `rustdar-android-theme` survives, adding it back as a fast pre-check is
-  # reasonable -- but pin it to the crate that actually holds the JNI code, and
-  # make it fail loudly if that crate stops depending on `jni`.
+  # It earns its place by depending on almost nothing. Tier 2 below needs
+  # `cargo install cargo-ndk` to succeed AND the runner image to ship an NDK; when
+  # either breaks, this job still says whether the Android code itself compiles.
+  #
+  # PINNED to a named crate, which is what makes it safe. The generic phrasing --
+  # "check the workspace members that are free of C" -- would keep passing if this
+  # crate were absorbed into `rustdar-android`, while compiling zero JNI calls.
+  # The pinned form cannot: `cargo check -p` on a missing package fails with
+  # "package ID specification did not match any packages", so deleting the crate
+  # turns this red immediately rather than quietly green.
+  #
+  # TWO CORRECTIONS to claims previously made in this repo about this tier:
+  #
+  #   * "Nothing Android-specific is NDK-free any more" is false, and was false
+  #     when written: `android-dep-unification` below is Android-specific, has no
+  #     compile-time substitute, and needs nothing but `cargo tree`.
+  #   * "The tier cannot be reconstructed once rustdar-android-theme is gone" is
+  #     also false. `jni` 0.22 is `default = []` -- pure Rust, no JDK, no NDK --
+  #     and `ndk-context` is portable, so the JNI helpers type-check on the HOST
+  #     with no Android target at all once the cfg admits a feature:
+  #         #[cfg(any(target_os = "android", feature = "jni-typecheck"))]
+  #     Measured at 5.2s, and it checks every `env.call_method`, `jni_sig!` and
+  #     `JObject::from_raw` against the real jni API. That is strictly more
+  #     surface than this job covers, since it does not stop at one crate.
+  #
+  # That feature gate is the intended successor to this job:
+  #     cargo check -p rustdar-android --features jni-typecheck
+  # It is NOT used yet because the feature does not exist in the tree -- adding
+  # the row now would be a row that cannot pass. It belongs to the branch dropping
+  # `rustdar-android-theme`. When that lands, replace this job with the command
+  # above and delete the CRATE pin; until then this keeps the coverage alive.
+  # (`android_main` stays Android-only: it is the sole user of `AndroidApp`,
+  # winit and `rustls_platform_verifier::android`.)
+  android-jni-check:
+    name: Android JNI check (no NDK)
+    runs-on: ubuntu-24.04
+    env:
+      # The crate that holds the JNI call sites.
+      CRATE: rustdar-android-theme
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup show
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-android-jni-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-aarch64-linux-android-
+
+      # Without this the job would still pass if $CRATE stopped containing JNI
+      # code -- it would compile something harmless for the Android target and
+      # report success while verifying nothing. Asserting the dependency is what
+      # keeps the job's name true.
+      - name: Assert $CRATE still holds the JNI dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! cargo tree -p "$CRATE" --target aarch64-linux-android -e normal --prefix none \
+               | grep -qE '^jni v'; then
+            echo "::error::$CRATE no longer depends on jni, so this job no longer checks any JNI code. Repoint CRATE at the crate that does, or delete this job."
+            exit 1
+          fi
+          echo "ok: $CRATE depends on jni"
+
+      - name: cargo check (aarch64-linux-android, no NDK)
+        run: cargo check -p "$CRATE" --lib --target aarch64-linux-android
+
+  # ---------------------------------------------------------------------------
+  # Android tier 2: the real cross-compile, both shipped ABIs
   # ---------------------------------------------------------------------------
   #
   # A bare `cargo check --target aarch64-linux-android` does NOT work for
@@ -350,6 +470,15 @@ jobs:
   # uninitialised, and Android TLS setup becomes a no-op. Nothing fails at build
   # time; the first symptom is an on-device HTTPS failure against api.weather.gov.
   # Both crates' manifests document this lockstep at length; this asserts it.
+  #
+  # This job has NO compile-time substitute -- the broken state builds perfectly --
+  # and it is the cheapest job in this file: no NDK, no cross target, no
+  # `cargo install`, just a lockfile query. If Android coverage ever has to be cut
+  # for cost, this is the last thing that should go, not the first.
+  #
+  # Both shipped ABIs are checked. Resolution is per-target, so a dependency that
+  # unified on arm64 is not thereby unified on x86_64, and the emulator build is
+  # what most contributors run first.
   android-dep-unification:
     name: Android dependency unification
     runs-on: ubuntu-24.04
@@ -362,19 +491,21 @@ jobs:
         run: |
           set -uo pipefail
           fail=0
-          for crate in jni rustls-platform-verifier; do
-            # `cargo tree -i` prints one root line per resolved version.
-            versions="$(cargo tree -i "$crate" --target aarch64-linux-android \
-              -e normal --prefix none 2>/dev/null \
-              | grep -E "^${crate} v" | sort -u)"
-            count="$(printf '%s' "$versions" | grep -c . )" || true
-            if [ "$count" -ne 1 ]; then
-              echo "::error::expected exactly 1 version of ${crate} in the aarch64-linux-android graph, found ${count}"
-              printf '%s\n' "$versions"
-              fail=1
-            else
-              echo "ok: ${versions}"
-            fi
+          for target in aarch64-linux-android x86_64-linux-android; do
+            for crate in jni rustls-platform-verifier; do
+              # `cargo tree -i` prints one root line per resolved version.
+              versions="$(cargo tree -i "$crate" --target "$target" \
+                -e normal --prefix none 2>/dev/null \
+                | grep -E "^${crate} v" | sort -u)"
+              count="$(printf '%s' "$versions" | grep -c . )" || true
+              if [ "$count" -ne 1 ]; then
+                echo "::error::expected exactly 1 version of ${crate} in the ${target} graph, found ${count}"
+                printf '%s\n' "$versions"
+                fail=1
+              else
+                echo "ok [${target}]: ${versions}"
+              fi
+            done
           done
           exit "$fail"
 
@@ -434,8 +565,36 @@ jobs:
           fail=0
           for m in $members; do
             echo "::group::$m"
+
+            # `rustdar-android` and `rustdar-android-theme` compile to nothing on
+            # a host: the first opens with a crate-level
+            # `#![cfg(target_os = "android")]`, the second gates every item
+            # individually. Either way a host check of them compiles zero lines
+            # and would print a bare PASS -- green for a reason unrelated to what
+            # it claims, which is the exact anti-pattern this file argues against.
+            #
+            # Detected from two structural signals rather than a hardcoded list,
+            # so the label appears and disappears on its own:
+            #   * a crate root beginning `#![cfg(`, or
+            #   * a package with dependencies, none of them unconditional (every
+            #     one declared under a `[target.'cfg(...)'.dependencies]`).
+            root="$(cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg m "$m" '.packages[] | select(.name==$m) | .targets[]
+                                    | select(.kind | index("lib") or index("cdylib") or index("rlib"))
+                                    | .src_path' | head -1)"
+            gated="$(cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg m "$m" '.packages[] | select(.name==$m)
+                                    | (.dependencies | map(select(.kind != "dev"))) as $d
+                                    | if ($d | length) > 0
+                                        and (($d | map(select(.target == null)) | length) == 0)
+                                      then "yes" else "no" end')"
+            vacuous=""
+            if [ "$gated" = "yes" ] || { [ -n "$root" ] && [ -f "$root" ] && grep -qE '^\s*#!\[cfg\(' "$root"; }; then
+              vacuous=" (host-vacuous: compiles no code on this host; real coverage is the Android rows)"
+            fi
+
             if cargo check -p "$m" --all-targets; then
-              echo "PASS $m"
+              echo "PASS $m$vacuous"
             else
               echo "::error::$m does not build standalone with its own default features"
               fail=1
@@ -460,6 +619,7 @@ jobs:
     needs:
       - build
       - web-bundle
+      - android-jni-check
       - android
       - android-dep-unification
       - standalone
@@ -513,6 +673,22 @@ jobs:
       group: pages
       cancel-in-progress: false
     steps:
+      # REQUIRED, and not optional scaffolding: at the time of writing
+      # `GET /repos/USA-RedDragon/rustdar/pages` returns 404, i.e. no Pages site
+      # exists. `deploy-pages` needs one already present with
+      # `build_type: workflow` and will fail outright without it;
+      # `configure-pages` with `enablement: true` is what creates it, and it is
+      # idempotent once it has.
+      #
+      # It lives here rather than in `web-bundle` on purpose. Enablement needs
+      # `pages: write`, and `web-bundle` runs on pull requests including from
+      # forks -- that permission must not be reachable from an untrusted branch.
+      # Its `base_path` output is unused: every asset reference is relative, which
+      # the previous step enforces.
+      - name: Enable and configure Pages
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
+        with:
+          enablement: true
       - name: Deploy
         id: deployment
         uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
