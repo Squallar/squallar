@@ -1,8 +1,8 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use crate::render::controls::{ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut};
-use crate::render::overlay_state::{OverlayHandler, OverlayItem, OverlayKind, RenderMode};
+use crate::render::overlay_state::{
+    FetchPayload,OverlayHandler, OverlayItem, OverlayKind, RenderMode};
 
 /// Handler for the per-pane color scale legend.
 ///
@@ -32,7 +32,7 @@ impl OverlayHandler for ColorScaleHandler {
     fn set_fetching(&mut self, _fetching: bool) {}
     fn fetch_time(&self) -> Option<std::time::Instant> { None }
 
-    fn apply_fetch_result(&mut self, _result: Box<dyn Any + Send>) {}
+    fn apply_fetch_result(&mut self, _result: FetchPayload) {}
     fn retain_selections(&self, _selections: &mut Vec<Arc<dyn OverlayItem>>) {}
 
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {

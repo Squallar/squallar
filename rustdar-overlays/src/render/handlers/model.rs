@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -8,6 +7,7 @@ use crate::render::controls::{
     PaneControlContextMut,
 };
 use crate::render::overlay_state::{
+    FetchPayload,
     FetchConfig, FetchTask, OverlayHandler, OverlayKind, OverlayLegend, OverlayState,
     RasterizeContext, RenderMode,
 };
@@ -98,7 +98,7 @@ impl OverlayHandler for ModelDataHandler {
         Vec::new()
     }
 
-    fn apply_fetch_result(&mut self, result: Box<dyn Any + Send>) {
+    fn apply_fetch_result(&mut self, result: FetchPayload) {
         let Some(fetch) = result.downcast::<HrrrFetchResult>().ok() else {
             log::error!("ModelData handler received unexpected fetch result type");
             return;
@@ -205,7 +205,7 @@ impl OverlayHandler for ModelDataHandler {
                 } else {
                     crate::hrrr::fetch::fetch_hrrr_data(&client, &param).await
                 };
-                Box::new(result) as Box<dyn Any + Send>
+                Box::new(result) as FetchPayload
             }),
         }]
     }

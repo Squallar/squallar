@@ -192,7 +192,7 @@ pub trait OverlayHandler: Send {
     }
 
     /// Apply a type-erased fetch result. The handler downcasts to its expected type.
-    fn apply_fetch_result(&mut self, result: Box<dyn Any + Send>);
+    fn apply_fetch_result(&mut self, result: FetchPayload);
 
     // ── Rendering (texture mode) ──────────────────────────────────────
 
@@ -256,7 +256,7 @@ pub trait OverlayHandler: Send {
 
     /// Create initial per-pane handler state (e.g. selected product, loop state).
     /// Returns `None` if this handler has no per-pane state.
-    fn create_pane_state(&self) -> Option<Box<dyn Any + Send>> { None }
+    fn create_pane_state(&self) -> Option<FetchPayload> { None }
 
     // ── Config persistence ────────────────────────────────────────────
 
@@ -272,7 +272,7 @@ pub trait OverlayHandler: Send {
     }
 
     /// Restore per-pane handler state from a serialized value.
-    fn deserialize_pane_state(&self, _value: serde_json::Value) -> Option<Box<dyn Any + Send>> {
+    fn deserialize_pane_state(&self, _value: serde_json::Value) -> Option<FetchPayload> {
         None
     }
 
@@ -316,10 +316,47 @@ pub struct RasterizeContext {
     pub zoom: f64,
 }
 
+// ── Fetch-path thread bounds ─────────────────────────────────────────────
+//
+// The fetch path is `Send` on native and deliberately not on web.
+//
+// Native runs these futures on a multi-threaded tokio runtime, and
+// `tokio::spawn` *requires* `Send + 'static`, so the bound is load-bearing —
+// it is not decoration that can be dropped for portability. On wasm there is
+// one thread and reqwest's futures hold `Rc<RefCell<..>>` internally, so they
+// are `!Send` by construction and no amount of restructuring on our side
+// changes that.
+//
+// There are two bounds, not one: the future itself, and the type-erased
+// payload it produces, which crosses an `mpsc::Sender` back to the app.
+// Relaxing only the future leaves the payload rejecting compilation.
+//
+// **Do not relax the renderer's bounds to match.** `rustdar-frontend`'s
+// render dispatch spawns real OS threads and genuinely requires `Send` on
+// every target; an earlier version of this plan conflated the two paths, and
+// following it produces something that compiles for web while quietly
+// breaking desktop threading.
+
+/// The type-erased result a fetch produces, sent back over the overlay
+/// channel. `Send` on native (crosses threads), plain on web (one thread).
+#[cfg(not(target_arch = "wasm32"))]
+pub type FetchPayload = Box<dyn Any + Send>;
+/// See the native variant above.
+#[cfg(target_arch = "wasm32")]
+pub type FetchPayload = Box<dyn Any>;
+
+/// A boxed fetch future. `Send` on native so `tokio::spawn` accepts it; not
+/// on web, where reqwest's futures cannot be.
+#[cfg(not(target_arch = "wasm32"))]
+pub type TaskFuture = Pin<Box<dyn Future<Output = FetchPayload> + Send>>;
+/// See the native variant above.
+#[cfg(target_arch = "wasm32")]
+pub type TaskFuture = Pin<Box<dyn Future<Output = FetchPayload>>>;
+
 /// An async fetch task produced by a handler.
 pub struct FetchTask {
     pub kind: OverlayKind,
-    pub future: Pin<Box<dyn Future<Output = Box<dyn Any + Send>> + Send>>,
+    pub future: TaskFuture,
 }
 
 // ── Overlay registry ─────────────────────────────────────────────────────
@@ -635,7 +672,7 @@ impl OverlayKind {
 /// unified overlay fetch channel.
 pub struct OverlayFetchResult {
     pub kind: OverlayKind,
-    pub data: Box<dyn Any + Send>,
+    pub data: FetchPayload,
 }
 
 // ── Popup content descriptors ─────────────────────────────────────────────

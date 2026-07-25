@@ -24,21 +24,58 @@ use rustdar_radar::scan;
 use std::future::Future;
 use std::sync::mpsc::Sender;
 
+/// `Send` on native, no constraint on web.
+///
+/// The fetch path crosses threads on native — `tokio::spawn` *requires*
+/// `Send + 'static` on a multi-threaded runtime — and cannot on web, where
+/// reqwest's futures hold `Rc<RefCell<..>>` internally and are `!Send` by
+/// construction.
+///
+/// This exists so the bound can vary while the *code* does not: without it,
+/// every `spawn_async_task` caller would need a cfg'd twin, and twinned bodies
+/// drift. The blanket impls make it a no-op at every call site.
+///
+/// **This is the fetch path only.** `render_dispatch` spawns real OS threads
+/// and requires `Send` on every target — do not relax it to match. An earlier
+/// plan conflated the two, which yields something that compiles for web while
+/// quietly breaking desktop threading.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait MaybeSend: Send {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + ?Sized> MaybeSend for T {}
+
+/// See the native variant above.
+#[cfg(target_arch = "wasm32")]
+pub trait MaybeSend {}
+#[cfg(target_arch = "wasm32")]
+impl<T: ?Sized> MaybeSend for T {}
+
 impl super::App {
 
-    /// Spawn an async task on the Tokio runtime that sends its result through
-    /// a channel and requests a redraw when complete.
+    /// Spawn a detached future on whatever executor this target provides.
     ///
-    /// The caller builds the full future (including error handling and result
-    /// construction). This helper handles cloning the window handle, spawning
-    /// on the runtime, sending the result, and calling `notify_redraw()`.
-    fn spawn_async_task<T: Send + 'static>(
+    /// Two bodies because the executors genuinely differ — native has a
+    /// multi-threaded tokio runtime, the browser has its own event loop and no
+    /// threads. The `Send` bound rides on [`MaybeSend`] rather than being
+    /// written here, so the *callers* stay single-bodied.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn_detached(&self, future: impl Future<Output = ()> + MaybeSend + 'static) {
+        self.tokio_runtime.spawn(future);
+    }
+
+    /// See the native variant above.
+    #[cfg(target_arch = "wasm32")]
+    fn spawn_detached(&self, future: impl Future<Output = ()> + MaybeSend + 'static) {
+        wasm_bindgen_futures::spawn_local(future);
+    }
+
+    fn spawn_async_task<T: MaybeSend + 'static>(
         &self,
         sender: Sender<T>,
-        future: impl Future<Output = T> + Send + 'static,
+        future: impl Future<Output = T> + MaybeSend + 'static,
     ) {
         let window = self.window.clone();
-        self.tokio_runtime.spawn(async move {
+        self.spawn_detached(async move {
             let result = future.await;
             let _ = sender.send(result);
             super::notify_redraw(&window);
@@ -206,7 +243,7 @@ impl super::App {
                 let sender = self.channels.scan_sender.clone();
 
                 // Not using spawn_async_task: conditional send (only on new data)
-                self.tokio_runtime.spawn(async move {
+                self.spawn_detached(async move {
                     match scan::check_and_fetch_latest(&site, &utc_timestamp.date(), current_scan_timestamp).await {
                         Ok(Some((data, timestamp))) => {
                             let _ = sender.send(crate::channels::ScanResponse {

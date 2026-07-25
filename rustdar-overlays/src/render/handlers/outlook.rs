@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::render::controls::{ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext, PaneControlContextMut};
 use crate::render::overlay_state::{
+    FetchPayload,
     ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
     OverlayState, PopupContent, PopupSection, RasterizeContext, RasterizeFn, RenderMode,
 };
@@ -136,7 +137,7 @@ impl OverlayHandler for SpcOutlookHandler {
         items
     }
 
-    fn apply_fetch_result(&mut self, result: Box<dyn Any + Send>) {
+    fn apply_fetch_result(&mut self, result: FetchPayload) {
         let Some(fetch) = result.downcast::<SpcOutlookFetchResult>().ok() else {
             log::error!("SPC outlook handler received unexpected fetch result type");
             return;
@@ -204,7 +205,7 @@ impl OverlayHandler for SpcOutlookHandler {
                         let result = crate::spc::fetch::fetch_outlook(&client, day, product)
                             .await
                             .map_err(|e| e.to_string());
-                        Box::new(SpcOutlookFetchResult { day, product, result }) as Box<dyn Any + Send>
+                        Box::new(SpcOutlookFetchResult { day, product, result }) as FetchPayload
                     }),
                 }
             })

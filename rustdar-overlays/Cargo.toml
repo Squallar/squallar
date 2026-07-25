@@ -60,6 +60,14 @@ roxmltree = "=0.21.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tiny-skia = "=0.12.0"
+
+# `fs` is the only tokio feature this crate wants, and tokio rejects it outright
+# on wasm ("Only features sync,macros,io-util,rt,time are supported on wasm").
+# The browser has no filesystem, so the zone disk cache in `nws::zones` is
+# native-only and so is the dependency that backs it. Keep this target-gated:
+# an unconditional `features = ["fs"]` here is a hard build failure for the web
+# target, and it is the single blocker that gated the whole wasm port.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]

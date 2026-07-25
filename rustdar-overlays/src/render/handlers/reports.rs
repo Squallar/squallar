@@ -5,6 +5,7 @@ use rustdar_units::UserPreferences;
 
 use crate::render::controls::{ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext, PaneControlContextMut};
 use crate::render::overlay_state::{
+    FetchPayload,
     ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
     OverlayState, PopupContent, PopupSection, RasterizeContext, RasterizeFn, RenderMode,
 };
@@ -167,7 +168,7 @@ impl OverlayHandler for StormReportsHandler {
         Vec::new()
     }
 
-    fn apply_fetch_result(&mut self, result: Box<dyn Any + Send>) {
+    fn apply_fetch_result(&mut self, result: FetchPayload) {
         let Some(fetch) = result.downcast::<StormReportsFetchResult>().ok() else {
             log::error!("Storm reports handler received unexpected fetch result type");
             return;
@@ -224,7 +225,7 @@ impl OverlayHandler for StormReportsHandler {
             kind: OverlayKind::StormReports,
             future: Box::pin(async move {
                 let result = crate::spc::reports::fetch_storm_reports(&client).await;
-                Box::new(StormReportsFetchResult(result)) as Box<dyn Any + Send>
+                Box::new(StormReportsFetchResult(result)) as FetchPayload
             }),
         }]
     }

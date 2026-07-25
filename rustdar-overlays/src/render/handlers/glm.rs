@@ -14,6 +14,7 @@ use crate::render::controls::{
     PaneControlContextMut,
 };
 use crate::render::overlay_state::{
+    FetchPayload,
     ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
     OverlayState, PopupContent, PopupSection, RasterizeContext, RasterizeFn, RenderMode,
 };
@@ -476,7 +477,7 @@ impl OverlayHandler for GlmHandler {
         Vec::new()
     }
 
-    fn apply_fetch_result(&mut self, result: Box<dyn Any + Send>) {
+    fn apply_fetch_result(&mut self, result: FetchPayload) {
         let Some(fetch) = result.downcast::<GlmFetchResult>().ok() else {
             log::error!("GLM handler received unexpected fetch result type");
             return;
@@ -567,7 +568,7 @@ impl OverlayHandler for GlmHandler {
                     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
                     *guard = local_cache;
                 }
-                Box::new(GlmFetchResult(result)) as Box<dyn Any + Send>
+                Box::new(GlmFetchResult(result)) as FetchPayload
             }),
         }]
     }
@@ -1747,7 +1748,7 @@ mod tests {
         dead_feeds: Vec<DeadFeed>,
         parse_failures: Option<FetchFailures>,
         transport_failures: Option<FetchFailures>,
-    ) -> Box<dyn Any + Send> {
+    ) -> FetchPayload {
         Box::new(GlmFetchResult(Ok(crate::glm::GlmFetchOutcome {
             flashes: Vec::new(),
             dead_feeds,
@@ -1769,7 +1770,7 @@ mod tests {
     fn level_outcome(
         level_failures: Vec<LevelFailure>,
         evaluated_levels: Vec<(GlmSatellite, GlmDataLevel)>,
-    ) -> Box<dyn Any + Send> {
+    ) -> FetchPayload {
         Box::new(GlmFetchResult(Ok(crate::glm::GlmFetchOutcome {
             flashes: Vec::new(),
             dead_feeds: Vec::new(),

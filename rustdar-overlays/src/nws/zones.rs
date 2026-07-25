@@ -252,6 +252,7 @@ fn zone_cache_key(url: &str) -> Option<String> {
 /// Read a zone geometry from the disk cache.
 ///
 /// Returns `None` if the file is missing, corrupt, or older than the TTL.
+#[cfg(not(target_arch = "wasm32"))]
 async fn read_cached_zone(cache_dir: &Path, url: &str) -> Option<Vec<GeoPolygon>> {
     let key = zone_cache_key(url)?;
     let path = cache_dir.join(format!("{key}.json"));
@@ -267,6 +268,7 @@ async fn read_cached_zone(cache_dir: &Path, url: &str) -> Option<Vec<GeoPolygon>
 }
 
 /// Write a zone geometry to the disk cache.
+#[cfg(not(target_arch = "wasm32"))]
 async fn write_cached_zone(cache_dir: &Path, url: &str, polygons: &[GeoPolygon]) {
     let Some(key) = zone_cache_key(url) else {
         return;
@@ -292,3 +294,27 @@ async fn write_cached_zone(cache_dir: &Path, url: &str, polygons: &[GeoPolygon])
         Err(e) => log_cache_write_failure(&format!("Failed to serialize zone cache: {e}")),
     }
 }
+
+// ── Web: no filesystem ───────────────────────────────────────────────────
+//
+// The browser has no filesystem, so the disk cache degrades to "always miss,
+// never write" rather than being cfg'd out at the call sites. Keeping the
+// signatures identical means `fetch_zone_polygons` has exactly one body on
+// every target, so the caching *policy* — when a fetch is skipped, when a
+// result is stored — cannot drift between native and web.
+//
+// This is a real behavioural difference, not a stub: on web every zone is
+// re-fetched from `api.weather.gov` each session. Zone geometry is static
+// (the native TTL is a year), so the browser's own HTTP cache is the right
+// layer for this, and `rustdar-web` can revisit it via `ConfigStore` if
+// per-session refetching proves too costly.
+
+/// Always a miss: see the module note above.
+#[cfg(target_arch = "wasm32")]
+async fn read_cached_zone(_cache_dir: &Path, _url: &str) -> Option<Vec<GeoPolygon>> {
+    None
+}
+
+/// A no-op: see the module note above.
+#[cfg(target_arch = "wasm32")]
+async fn write_cached_zone(_cache_dir: &Path, _url: &str, _polygons: &[GeoPolygon]) {}

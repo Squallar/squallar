@@ -60,6 +60,9 @@ pub struct App {
     // Flag for deferred exit when event_loop isn't available during redraw
     exit_requested: bool,
     // Shared Tokio runtime for all async network requests
+    /// Native only. The browser supplies its own executor, so the web build
+    /// spawns via `wasm_bindgen_futures` instead — see `App::spawn_detached`.
+    #[cfg(not(target_arch = "wasm32"))]
     tokio_runtime: tokio::runtime::Runtime,
     // Shared HTTP client for overlay data fetches (SPC, etc.)
     http_client: reqwest::Client,
@@ -87,6 +90,7 @@ impl App {
         // static pane render paths (see `RenderDispatcher::renders_in_flight`).
         let render = RenderDispatcher::new();
 
+        #[cfg(not(target_arch = "wasm32"))]
         let tokio_runtime = tokio::runtime::Runtime::new()
             .expect("Failed to create Tokio runtime");
 
@@ -120,6 +124,7 @@ impl App {
             cached_dark_theme: None,
             exit_requested: false,
             http_client,
+            #[cfg(not(target_arch = "wasm32"))]
             tokio_runtime,
             loop_mgr: LoopDownloadManager::new(),
             latest_cached_scans: HashMap::new(),

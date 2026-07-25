@@ -26,7 +26,6 @@ reqwest = { workspace = true, features = ["json"] }
 chrono = { workspace = true }
 egui = { workspace = true }
 egui-wgpu = { workspace = true, features = ["winit"] }
-egui-winit = { workspace = true, features = ["clipboard", "links", "wayland", "x11"] }
 log = { workspace = true }
 # No `nexrad-data` here: the only thing this crate ever used from it was
 # `aws::archive::Identifier`, which now lives in `rustdar_radar::archive`
@@ -34,6 +33,26 @@ log = { workspace = true }
 nexrad-model = { workspace = true }
 nexrad-level3 = { workspace = true }
 pollster = { workspace = true }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 winit = { workspace = true }
 wgpu = { workspace = true }
+
+# tokio's multi-threaded runtime is native-only -- wasm rejects
+# `rt-multi-thread` outright ("Only features sync,macros,io-util,rt,time are
+# supported on wasm"). The browser gives us one thread and its own event loop,
+# so the web build spawns onto that instead. See `App::spawn_detached`.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+# `clipboard` pulls `arboard`, which has no wasm backend at all -- it fails to
+# compile rather than degrading. `wayland`/`x11` are likewise meaningless in a
+# browser. The web build keeps only `links`; the clipboard there is the
+# browser's own, reached through egui-winit's web path.
+# Android is deliberately grouped with native here, preserving exactly the
+# feature set it had before this split.
+egui-winit = { workspace = true, features = ["clipboard", "links", "wayland", "x11"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+egui-winit = { workspace = true, features = ["links"] }
+# Pinned to what the egui/wgpu stack already resolves (wasm-bindgen 0.2.118).
+# A newer wasm-bindgen-futures wants a newer wasm-bindgen and the resolver
+# rejects the pair outright, so this version moves when that stack moves.
+wasm-bindgen-futures = "=0.4.68"
