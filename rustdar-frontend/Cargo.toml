@@ -43,10 +43,9 @@ nexrad-model = { workspace = true }
 nexrad-level3 = { workspace = true }
 pollster = { workspace = true }
 winit = { workspace = true }
-# Every `wgpu::` path in this crate is reached through `egui_wgpu::wgpu`, the
-# re-export -- that is deliberate, and it is what keeps exactly one wgpu in the
-# graph. This entry is not there to be imported from; it exists to *choose wgpu's
-# features*, which egui-wgpu cannot express (it offers only the blanket
+# Every `wgpu::` value in this crate comes through `egui_wgpu::wgpu`, the
+# re-export. This entry is not there to be imported from; it exists to *choose
+# wgpu's features*, which egui-wgpu cannot express (it offers only the blanket
 # `wgpu/default`, and that drags in `webgpu`).
 #
 # `std` and `wgsl` are the target-independent half and are what egui-wgpu itself
@@ -116,3 +115,12 @@ egui-wgpu = { workspace = true, features = ["fragile-send-sync-non-atomic-wasm"]
 # A newer wasm-bindgen-futures wants a newer wasm-bindgen and the resolver
 # rejects the pair outright, so this version moves when that stack moves.
 wasm-bindgen-futures = "=0.4.76"
+
+# Target-gated for the reason rustdar-web's dev-dependencies are: a plain
+# `[dev-dependencies]` entry is built for every target under `--all-targets`.
+#
+# `syn` parses `src/app.rs` in `tests/wgpu_guard.rs`. Same 3.0.3 the proc-macro
+# crates already resolve, so this adds no package -- and being a dev-dependency
+# it reaches no shipped artifact.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+syn = { version = "=3.0.3", default-features = false, features = ["full", "parsing", "visit"] }

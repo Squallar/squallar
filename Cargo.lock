@@ -4090,6 +4090,7 @@ dependencies = [
  "rustdar-gps",
  "rustdar-overlays",
  "rustdar-radar",
+ "syn 3.0.3",
  "tokio",
  "wasm-bindgen-futures",
  "web-time",

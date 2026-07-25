@@ -55,12 +55,44 @@ fn instance_descriptor() -> wgpu::InstanceDescriptor {
     }
 }
 
+/// Fails the build when this crate's two `wgpu` paths are different copies; the
+/// notes below say why that matters, and `tests/wgpu_guard.rs` keeps this from
+/// being edited into something vacuous.
+///
+/// Scope is this crate only — a second wgpu reached by another member is
+/// invisible here, and to any Rust check. Nothing covers that today.
+const _: () = {
+    /// The `wgpu` entry in this crate's `Cargo.toml`.
+    type OurWgpu = ::wgpu::Instance;
+    /// The copy egui-wgpu links and renders through.
+    type EguiWgpu = egui_wgpu::wgpu::Instance;
+
+    #[diagnostic::on_unimplemented(
+        message = "egui-wgpu links a different copy of `wgpu` than this crate configures",
+        label = "this is egui-wgpu's `wgpu`, and it is not this crate's `wgpu`",
+        note = "the backend features in rustdar-frontend/Cargo.toml apply to this crate's \
+                copy, but rendering goes through egui-wgpu's; split, they configure nothing.",
+        note = "egui-wgpu pins a wgpu major, so wgpu cannot move alone: bump egui, \
+                egui-wgpu, egui-winit, walkers and wgpu together, and expect walkers to \
+                gate it — it pins an exact egui minor. `cargo tree -i wgpu` lists the \
+                copies that are in the graph now."
+    )]
+    trait IsOurWgpu {}
+
+    impl IsOurWgpu for OurWgpu {}
+
+    fn assert_is_our_wgpu<T: IsOurWgpu>() {}
+
+    let _: fn() = assert_is_our_wgpu::<EguiWgpu>;
+};
+
 /// Check at compile time that the manifest's backend selection survived.
 ///
 /// `Instance::enabled_backend_features` is a `const fn` over wgpu's own cfg
 /// aliases, so this is the real compiled-in set, not a restatement of it.
 /// Deliberately written `::wgpu::` rather than the `egui_wgpu::wgpu` re-export
-/// imported above: this is the one place that names the *direct* dependency.
+/// imported above: this and the guard above are the only places that name the
+/// *direct* dependency.
 ///
 /// Two failures it turns into build errors.
 ///
@@ -87,6 +119,9 @@ const _: () = {
          Firefox has no stable WebGPU; something re-enabled `wgpu/default`."
     );
 
+    // Only reachable when `web` is on and `webgl` is not. Dropping `webgl` on its
+    // own never gets here: it implies `wgpu/web`, which gates `wgpu::web_sys`, so
+    // egui-wgpu stops compiling first with E0433 and this crate is never built.
     #[cfg(target_arch = "wasm32")]
     assert!(
         enabled.contains(::wgpu::Backends::GL),
