@@ -72,6 +72,9 @@ pub(crate) struct FrameOutcome {
     /// [`PointerModality`] selects, through [`InteractionState`]. This is the
     /// only field that observes the gate.
     pub resolved: MapPointerFrame,
+    /// Pointer resolution the real UI gives a pane that is **not** active,
+    /// through the same gate.
+    pub resolved_inactive: MapPointerFrame,
     /// The modality in force for this frame.
     pub modality: PointerModality,
     /// Map zoom after the frame — observes the double-tap-drag zoom gesture on
@@ -456,6 +459,7 @@ impl InputHarness {
                 &mut self.resolved_map_memory,
                 self.pane_rect,
             ),
+            resolved_inactive: self.interaction.resolve_inactive(&ctx, modality),
             modality,
             zoom: self.map_memory.zoom(),
             resolved_zoom: self.resolved_map_memory.zoom(),
@@ -1455,33 +1459,116 @@ mod tests {
         assert!(dragged.resolved.suppress_pan, "the zoom drag owns the pointer");
     }
 
-    /// 12. **Picking up the mouse mid-gesture abandons the gesture.**
+    /// 12. **A gesture interrupted by a modality change is abandoned, and stays
+    ///     abandoned when the modality comes back.**
     ///
-    ///     A tap left waiting for its double-tap partner must not be confirmed
-    ///     0.4s later, after the user has switched to a mouse. That first tap
-    ///     is no longer a live claim on anything.
+    ///     A tap waiting for its double-tap partner is state held *inside* the
+    ///     detector. Merely switching to a mouse hides it, because the mouse
+    ///     branch never polls the detector at all — so the interesting case is
+    ///     the round trip. Without an explicit reset the pending tap is still
+    ///     sitting there when touch resumes, its 0.4s window long since
+    ///     elapsed, and the very next touch frame promotes it: an overlay click
+    ///     fires at a stale position the user last touched minutes ago.
+    ///
+    ///     Asserting only on the mouse leg would be satisfied by the branch
+    ///     structure alone and would prove nothing about the reset.
     #[test]
-    fn switching_to_a_mouse_abandons_a_half_finished_touch_gesture() {
+    fn a_touch_gesture_interrupted_by_a_mouse_does_not_resume_when_touch_returns() {
         let mut h = InputHarness::new();
-        let pos = h.map_center();
+        let stale = h.map_center();
 
-        let tapped = h.touch_tap(pos);
+        let tapped = h.touch_tap(stale);
         assert_eq!(tapped.modality, PointerModality::Touch);
         assert_eq!(
             tapped.resolved.overlay_click_pos, None,
             "precondition: the tap is pending, not yet confirmed"
         );
 
-        // The user picks up a mouse. Somewhere else entirely, so a stray
-        // confirmation would be visibly at the wrong place.
-        h.mouse_move(pos + egui::vec2(200.0, 0.0));
+        // The user picks up a mouse, somewhere else entirely.
+        let elsewhere = stale + egui::vec2(200.0, 0.0);
+        h.mouse_move(elsewhere);
         let switched = h.frame_after(FRAME_DT);
         assert_eq!(switched.modality, PointerModality::Mouse);
+        assert_eq!(
+            switched.resolved.overlay_click_pos, None,
+            "nothing should fire while the mouse is in charge"
+        );
+
+        // Well past the double-tap window, so a surviving pending tap is now
+        // eligible for promotion the moment the detector is polled again.
+        h.frames_for(5, 0.2);
+
+        // The finger comes back. This is the frame that would resurrect it.
+        h.touch_start(elsewhere);
+        let resumed = h.frame_after(FRAME_DT);
+        assert_eq!(
+            resumed.modality,
+            PointerModality::Touch,
+            "precondition: touch is driving again, so the detector is polled"
+        );
+        assert_eq!(
+            resumed.resolved.overlay_click_pos, None,
+            "the stale tap must not be promoted when touch resumes"
+        );
 
         let settled = h.frames_for(4, 0.2);
         assert_eq!(
             settled.resolved.overlay_click_pos, None,
-            "the abandoned tap must not surface once its window closes"
+            "and it must not surface on any later frame either"
+        );
+    }
+
+    /// 13. **Only the active pane sees a touch; every pane sees the mouse.**
+    ///
+    ///     The touch pipeline is single-pointer and stateful, so running it for
+    ///     more than one pane would mean several detectors racing over one
+    ///     finger. The mouse carries no such state, and resolving it for every
+    ///     pane is what lets a click land on an overlay in a pane that is not
+    ///     yet the active one — behaviour the desktop build always had.
+    #[test]
+    fn a_touch_reaches_only_the_active_pane_but_a_click_reaches_them_all() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+
+        let clicked = h.mouse_click(pos);
+        assert_eq!(clicked.modality, PointerModality::Mouse);
+        assert_eq!(
+            clicked.resolved.overlay_click_pos,
+            Some(pos),
+            "precondition: the active pane got the click"
+        );
+        assert_eq!(
+            clicked.resolved_inactive.overlay_click_pos,
+            Some(pos),
+            "a mouse click is resolved for every pane, not just the active one"
+        );
+
+        let mut h = InputHarness::new();
+
+        // The release frame is the one that separates the two branches: a
+        // touch release carries the synthetic `PointerButton{up}` that makes
+        // egui report a click, so the mouse path *would* return a position
+        // here. A later, event-free frame would let both branches agree on
+        // `None` and prove nothing.
+        let tapped = h.touch_tap(pos);
+        assert_eq!(tapped.modality, PointerModality::Touch);
+        assert_eq!(
+            tapped.mouse.overlay_click_pos,
+            Some(pos),
+            "precondition: on this frame the mouse path does resolve a click, \
+             so `None` below is the touch branch and not an empty frame"
+        );
+        assert_eq!(
+            tapped.resolved_inactive.overlay_click_pos, None,
+            "an inactive pane takes no part in a touch gesture"
+        );
+
+        // ...and the active pane still gets it, once the deferral elapses.
+        let confirmed = h.frame_after(AFTER_DOUBLE_TAP_TIMEOUT);
+        assert_eq!(
+            confirmed.resolved.overlay_click_pos,
+            Some(pos),
+            "the tap was deferred, not swallowed"
         );
     }
 
