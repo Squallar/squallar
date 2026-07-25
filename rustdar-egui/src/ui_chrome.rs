@@ -103,11 +103,15 @@ impl super::Gui {
 
     fn render_menu_bar_panel(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
         let model = self.menu_model();
-        let mut events = Vec::new();
+        let mut frame = ui_menu::MenuFrame::default();
         egui::Panel::top("menubar_container").show(ui, |ui| {
-            events = ui_menu::render_menu_bar(ui, &model);
+            frame = ui_menu::render_menu_bar(ui, &model);
         });
-        for event in events {
+
+        #[cfg(test)]
+        self.last_menu_leaves.extend(frame.drawn.iter().copied());
+
+        for event in frame.events {
             self.apply_menu_event(event, actions);
         }
     }
@@ -219,8 +223,25 @@ impl super::Gui {
     fn render_layers_panel(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
         let is_drawer = !self.layout.width.has_persistent_sidebar();
         let show_menu_in_panel = !self.layout.width.has_menu_bar();
+
+        // Built **before** the pane is taken out of `self`, exactly as
+        // `render_menu_bar_panel` does.
+        //
+        // `menu_model` reads `self.active_pane()`. Inside the panel closure the
+        // active pane has been replaced by `mem::take`'s default, whose
+        // `enabled_overlays` is empty, so every overlay toggle would read back
+        // `false` — the checkbox would render permanently unchecked and each
+        // click would emit `Toggled(kind, true)`, letting an overlay be turned
+        // on but never off. Compact is the only width that renders the drawer,
+        // so that was the phone layout.
+        let menu_model = if show_menu_in_panel {
+            Some(self.menu_model())
+        } else {
+            None
+        };
+
         let mut pane = std::mem::take(&mut self.panes[self.active_pane]);
-        let mut menu_events = Vec::new();
+        let mut menu_frame = ui_menu::MenuFrame::default();
 
         egui::Panel::left("layers_panel")
             .default_size(LAYERS_PANEL_WIDTH)
@@ -267,11 +288,10 @@ impl super::Gui {
                     // With no menu bar on screen, the menu lives here — the
                     // same model, rendered as a list. This is what used to be
                     // `ui_mobile.rs`'s hand-rolled "Controls" block.
-                    if show_menu_in_panel {
+                    if let Some(model) = menu_model.as_ref() {
                         ui.add_space(10.0);
                         ui.separator();
-                        let model = self.menu_model();
-                        menu_events = ui_menu::render_menu_drawer(ui, &model);
+                        menu_frame = ui_menu::render_menu_drawer(ui, model);
                     }
                 });
 
@@ -288,7 +308,10 @@ impl super::Gui {
         self.panes[self.active_pane] = pane;
         self.propagate_layer_sync();
 
-        for event in menu_events {
+        #[cfg(test)]
+        self.last_menu_leaves.extend(menu_frame.drawn.iter().copied());
+
+        for event in menu_frame.events {
             self.apply_menu_event(event, actions);
         }
     }

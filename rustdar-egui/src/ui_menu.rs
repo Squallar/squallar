@@ -63,62 +63,103 @@ pub(super) enum MenuEvent {
     Toggled(MenuToggle, bool),
 }
 
+/// One leaf a presentation actually put on screen.
+///
+/// Reported *by the renderer*, not reconstructed by a test from the model, for
+/// the same reason `ChromeOutput::excluded_rects` is an output of the chrome:
+/// a test that rebuilds the value it means to check cannot notice the renderer
+/// being handed a different one. `value` is the bool `ui.checkbox` was really
+/// given, and `rect` is where the widget landed, so a test can click it for
+/// real rather than assert on an intermediate.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DrawnMenuLeaf {
+    pub label: &'static str,
+    /// `Some(state)` for a toggle, `None` for a command or a submenu header.
+    pub value: Option<bool>,
+    pub rect: egui::Rect,
+}
+
+/// What one presentation produced this frame.
+#[derive(Default)]
+pub(super) struct MenuFrame {
+    pub events: Vec<MenuEvent>,
+    /// Every leaf drawn, in render order. See [`DrawnMenuLeaf`].
+    #[cfg(test)]
+    pub drawn: Vec<DrawnMenuLeaf>,
+}
+
+impl MenuFrame {
+    /// Record a leaf that was drawn. A no-op outside tests.
+    #[inline]
+    fn record(&mut self, _label: &'static str, _value: Option<bool>, _rect: egui::Rect) {
+        #[cfg(test)]
+        self.drawn.push(DrawnMenuLeaf {
+            label: _label,
+            value: _value,
+            rect: _rect,
+        });
+    }
+}
+
 /// Render the model as a horizontal menu bar with drop-downs.
 ///
 /// Used when there is room for one — see `WidthClass::has_menu_bar`.
-pub(super) fn render_menu_bar(ui: &mut egui::Ui, nodes: &[MenuNode]) -> Vec<MenuEvent> {
-    let mut events = Vec::new();
+pub(super) fn render_menu_bar(ui: &mut egui::Ui, nodes: &[MenuNode]) -> MenuFrame {
+    let mut out = MenuFrame::default();
     egui::MenuBar::new().ui(ui, |ui| {
         for node in nodes {
             match node {
                 MenuNode::Submenu { label, children } => {
-                    ui.menu_button(*label, |ui| {
-                        render_menu_items(ui, children, &mut events, true);
-                    });
+                    let header = ui
+                        .menu_button(*label, |ui| {
+                            render_menu_items(ui, children, &mut out, true);
+                        })
+                        .response;
+                    // The header's own rect, so a test can open the drop-down
+                    // the way a user does instead of reaching into egui memory.
+                    out.record(label, None, header.rect);
                 }
                 // A top-level leaf is unusual but has to render *somewhere*, or
                 // adding one would silently drop it from this presentation only
                 // — which is the failure this module exists to remove.
-                _ => render_menu_items(ui, std::slice::from_ref(node), &mut events, true),
+                _ => render_menu_items(ui, std::slice::from_ref(node), &mut out, true),
             }
         }
     });
-    events
+    out
 }
 
 /// Render the model as a flat vertical list, for the slide-out drawer.
 ///
 /// Used when there is no menu bar, and reached through the hamburger.
-pub(super) fn render_menu_drawer(ui: &mut egui::Ui, nodes: &[MenuNode]) -> Vec<MenuEvent> {
-    let mut events = Vec::new();
+pub(super) fn render_menu_drawer(ui: &mut egui::Ui, nodes: &[MenuNode]) -> MenuFrame {
+    let mut out = MenuFrame::default();
     for node in nodes {
         match node {
             MenuNode::Submenu { label, children } => {
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(*label).strong());
                 ui.indent(*label, |ui| {
-                    render_menu_items(ui, children, &mut events, false);
+                    render_menu_items(ui, children, &mut out, false);
                 });
             }
-            _ => render_menu_items(ui, std::slice::from_ref(node), &mut events, false),
+            _ => render_menu_items(ui, std::slice::from_ref(node), &mut out, false),
         }
     }
-    events
+    out
 }
 
 /// The shared leaf rendering. `in_menu` closes the drop-down after a command,
 /// which is only meaningful inside a real menu.
-fn render_menu_items(
-    ui: &mut egui::Ui,
-    nodes: &[MenuNode],
-    events: &mut Vec<MenuEvent>,
-    in_menu: bool,
-) {
+fn render_menu_items(ui: &mut egui::Ui, nodes: &[MenuNode], out: &mut MenuFrame, in_menu: bool) {
     for node in nodes {
         match node {
             MenuNode::Item { label, action } => {
-                if ui.button(*label).clicked() {
-                    events.push(MenuEvent::Invoked(*action));
+                let response = ui.button(*label);
+                out.record(label, None, response.rect);
+                if response.clicked() {
+                    out.events.push(MenuEvent::Invoked(*action));
                     if in_menu {
                         ui.close_kind(egui::UiKind::Menu);
                     }
@@ -130,8 +171,13 @@ fn render_menu_items(
                 value,
             } => {
                 let mut current = *value;
-                if ui.checkbox(&mut current, *label).changed() {
-                    events.push(MenuEvent::Toggled(*toggle, current));
+                let response = ui.checkbox(&mut current, *label);
+                // `*value`, not `current`: the state the checkbox was *handed*
+                // is what a test has to see, since a stale one renders
+                // unchecked and then emits `Toggled(.., true)` on every click.
+                out.record(label, Some(*value), response.rect);
+                if response.changed() {
+                    out.events.push(MenuEvent::Toggled(*toggle, current));
                 }
             }
             MenuNode::Separator => {
@@ -140,7 +186,7 @@ fn render_menu_items(
             // Nesting deeper than one level is not something either
             // presentation is built for; flatten rather than drop.
             MenuNode::Submenu { children, .. } => {
-                render_menu_items(ui, children, events, in_menu);
+                render_menu_items(ui, children, out, in_menu);
             }
         }
     }
@@ -216,7 +262,7 @@ impl super::Gui {
                 self.drawer_open = false;
             }
             MenuEvent::Toggled(MenuToggle::Overlay(kind), on) => {
-                self.active_pane_mut().set_overlay_enabled(kind, on);
+                self.set_active_pane_overlay(kind, on);
                 self.propagate_layer_sync();
             }
             MenuEvent::Toggled(MenuToggle::AutoPoll, on) => self.auto_poll.enabled = on,
@@ -242,8 +288,36 @@ mod tests {
         }
     }
 
-    /// Every command the model offers is handled. An unhandled entry is a
-    /// button that visibly does nothing, which is worse than a missing one.
+    /// Everything about `Gui` a menu entry is allowed to move, as one value.
+    ///
+    /// Deliberately coarse: the test below only needs "did dispatching this
+    /// entry change anything at all", and a fingerprint that has to be extended
+    /// for each new kind of effect is the point — a new entry whose effect is
+    /// invisible here is one whose effect is invisible to the user too.
+    fn state_fingerprint(gui: &Gui) -> String {
+        let mut overlays: Vec<(String, bool)> = gui
+            .active_pane()
+            .enabled_overlays
+            .iter()
+            .map(|(kind, on)| (format!("{kind:?}"), *on))
+            .collect();
+        overlays.sort();
+        format!(
+            "settings={} time={} drawer={} auto_poll={} overlays={overlays:?}",
+            gui.show_settings, gui.time_dialog.show, gui.drawer_open, gui.auto_poll.enabled,
+        )
+    }
+
+    /// Every command the model offers actually *does* something. An unhandled
+    /// entry is a button that visibly does nothing, which is worse than a
+    /// missing one.
+    ///
+    /// The claim has to be about the effect, not about the arm. `match` on
+    /// [`MenuEvent`] is exhaustive, so an arm necessarily exists for every
+    /// entry and merely calling `apply_menu_event` can only ever catch a panic
+    /// — `MenuAction::Exit => {}` and `RefreshRadar => {}` would both sail
+    /// through. So each entry must either emit a [`GuiAction`] or move
+    /// observable state.
     #[test]
     fn every_menu_entry_has_a_dispatcher_arm() {
         let mut gui = Gui::new();
@@ -256,8 +330,17 @@ mod tests {
         );
 
         for event in events {
+            let before = state_fingerprint(&gui);
             let mut actions = Vec::new();
             gui.apply_menu_event(event, &mut actions);
+            let after = state_fingerprint(&gui);
+
+            assert!(
+                !actions.is_empty() || after != before,
+                "{event:?} dispatched to a no-op: it emitted no GuiAction and \
+                 changed nothing observable, so the menu entry is a button that \
+                 does nothing when clicked"
+            );
         }
     }
 

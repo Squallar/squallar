@@ -48,8 +48,10 @@
 //! cancellation at all.
 
 use crate::Gui;
+use crate::ui::DrawnMenuLeaf;
 use crate::ui_input::{InteractionState, MapPointerFrame, TouchGestures};
 use crate::ui_layout::{ModalityLatch, PointerModality};
+use rustdar_overlays::render::overlay_state::OverlayKind;
 
 /// Viewport size used by the harness — a landscape desktop-ish window.
 const SCREEN_SIZE: egui::Vec2 = egui::vec2(1024.0, 768.0);
@@ -200,6 +202,23 @@ impl InputHarness {
         self.gui.excluded_rects_for_test().to_vec()
     }
 
+    /// Every menu leaf the last frame's chrome actually drew, whichever
+    /// presentation was on screen.
+    pub(crate) fn menu_leaves(&self) -> Vec<DrawnMenuLeaf> {
+        self.gui.menu_leaves_for_test().to_vec()
+    }
+
+    /// The leaf drawn under `label`, if the last frame drew one.
+    pub(crate) fn menu_leaf(&self, label: &str) -> Option<DrawnMenuLeaf> {
+        self.menu_leaves().into_iter().find(|l| l.label == label)
+    }
+
+    /// Whether the **live** active pane has `kind` on — the state the menu
+    /// checkbox claims to be showing.
+    pub(crate) fn overlay_enabled(&self, kind: OverlayKind) -> bool {
+        self.gui.active_pane().is_overlay_enabled(kind)
+    }
+
     /// Every rect painted during the last frame, in paint order.
     pub(crate) fn painted_rects(&self) -> &[egui::Rect] {
         &self.last_rects
@@ -283,6 +302,11 @@ impl InputHarness {
     /// The centre of the viewport, where modal dialogs are placed.
     pub(crate) fn screen_center(&self) -> egui::Pos2 {
         self.screen_rect.center()
+    }
+
+    /// The viewport the harness is reporting to egui.
+    pub(crate) fn screen_rect(&self) -> egui::Rect {
+        self.screen_rect
     }
 
     /// Mutable access to the UI under test (e.g. to open a dialog).
@@ -1803,6 +1827,230 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── The menu, in whichever presentation is on screen ─────────────────
+
+    /// A compact harness with the drawer open — the phone layout, and the only
+    /// width that renders the menu as a drawer list.
+    ///
+    /// Tall rather than phone-shaped on purpose: the drawer's menu sits below
+    /// the layer controls inside a `ScrollArea`, so on an 800pt screen it lays
+    /// out past the bottom edge and a synthetic click at its rect would land on
+    /// nothing at all — passing every "the overlay did not change" assertion
+    /// for the wrong reason. Only the *width* decides the presentation.
+    fn compact_with_drawer() -> InputHarness {
+        let mut h = InputHarness::with_screen(egui::vec2(420.0, 1200.0));
+        assert_eq!(
+            h.width_class(),
+            crate::ui_layout::WidthClass::Compact,
+            "precondition: the drawer presentation only exists below 600pt"
+        );
+        h.set_drawer_open(true);
+        h
+    }
+
+    /// The rect of a drawn menu leaf, checked to be somewhere a click can
+    /// actually reach it.
+    fn clickable_leaf(h: &InputHarness, label: &str) -> egui::Rect {
+        let leaf = h
+            .menu_leaf(label)
+            .unwrap_or_else(|| panic!("the menu did not draw {label:?}"));
+        assert!(
+            h.screen_rect().contains(leaf.rect.center()),
+            "{label:?} was laid out at {:?}, outside the {:?} viewport — a \
+             click there hits nothing and would pass for the wrong reason",
+            leaf.rect,
+            h.screen_rect()
+        );
+        leaf.rect
+    }
+
+    /// 17. **The drawer's checkboxes show the live pane's state.**
+    ///
+    ///     `render_layers_panel` `mem::take`s the active pane for the duration
+    ///     of the panel closure. `menu_model` reads `self.active_pane()`, so
+    ///     building the model *inside* that closure handed every overlay toggle
+    ///     the default pane's empty `enabled_overlays`: the checkbox rendered
+    ///     permanently unchecked, and `render_menu_items`'
+    ///     `let mut current = *value` meant every click emitted
+    ///     `Toggled(kind, true)` — an overlay could be turned on but never off.
+    ///
+    ///     Auto-poll escaped because it lives on `self.auto_poll` rather than
+    ///     on the pane, which is why the model's own unit tests stayed green.
+    ///     This one reads the bool the checkbox was actually handed.
+    #[test]
+    fn the_drawer_checkboxes_show_the_live_pane_not_a_default_one() {
+        let mut h = compact_with_drawer();
+        h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+        h.warm_up();
+
+        assert!(
+            h.overlay_enabled(OverlayKind::RadarSites),
+            "precondition: the live pane must really have the overlay on"
+        );
+
+        let drawn = h.menu_leaf("Show radar sites").expect(
+            "precondition: the compact drawer must draw the overlay toggles, \
+             or there is no checkbox to be wrong about",
+        );
+        assert_eq!(
+            drawn.value,
+            Some(true),
+            "the drawer drew the checkbox from a default pane, not the live \
+             one: it renders unchecked and every click turns the overlay *on*",
+        );
+
+        // Auto-poll is the control that never broke — asserting it alone would
+        // have passed throughout, so it is the contrast, not the claim.
+        assert_eq!(
+            h.menu_leaf("Auto-poll").map(|l| l.value),
+            Some(Some(true)),
+            "precondition: auto-poll defaults on and reads off `self`, so it \
+             was never affected by the pane being taken"
+        );
+    }
+
+    /// 18. **A checkbox in the drawer turns the overlay off, and it stays off.**
+    ///
+    ///     The end-to-end form of the test above, driven by a real click on the
+    ///     rect the renderer reported, and then *watched for several frames*.
+    ///
+    ///     The extra frames are the point. `apply_menu_event` used to write
+    ///     `PaneState::enabled_overlays` and nothing else, while
+    ///     `render_layer_controls` reloads the handlers from the pane's
+    ///     `overlay_configs` every frame and saves the enabled map back over
+    ///     the top — so the toggle flipped for exactly one frame and then
+    ///     reverted. Asserting straight after the click passes anyway; the
+    ///     user, who sees the frame after, never got the change at all.
+    ///
+    ///     It also pins that `render_menu_drawer`'s events reach
+    ///     `apply_menu_event` — on a compact screen the drawer is the only
+    ///     route to any of these toggles.
+    #[test]
+    fn clicking_a_drawer_checkbox_toggles_the_overlay_both_ways() {
+        let mut h = compact_with_drawer();
+        h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+        h.warm_up();
+        assert!(h.overlay_enabled(OverlayKind::RadarSites), "precondition");
+
+        h.mouse_click(clickable_leaf(&h, "Show radar sites").center());
+        assert!(
+            !h.overlay_enabled(OverlayKind::RadarSites),
+            "clicking a checked box left the overlay on — the drawer can turn \
+             an overlay on but never off"
+        );
+        for frame in 0..5 {
+            h.frame_after(FRAME_DT);
+            assert!(
+                !h.overlay_enabled(OverlayKind::RadarSites),
+                "the overlay came back on {} frame(s) after the click: the \
+                 toggle reached `enabled_overlays` but not `overlay_configs`, \
+                 so the layers panel reloaded it from the config and undid it",
+                frame + 1
+            );
+        }
+
+        // ...and back on, so this cannot pass by the click being read as an
+        // unconditional "off".
+        h.mouse_click(clickable_leaf(&h, "Show radar sites").center());
+        h.frames_for(5, FRAME_DT);
+        assert!(
+            h.overlay_enabled(OverlayKind::RadarSites),
+            "the toggle did not come back on"
+        );
+
+        // The checkbox on screen now agrees with the pane again — the two
+        // halves of the round trip, not just the state behind it.
+        assert_eq!(
+            h.menu_leaf("Show radar sites").map(|l| l.value),
+            Some(Some(true)),
+            "the pane is on but the drawer still draws the box unchecked"
+        );
+    }
+
+    /// 19. **The compact drawer carries the whole menu.**
+    ///
+    ///     Below 600pt there is no menu bar, so the drawer is the only route to
+    ///     Settings, Time, Exit, Refresh and every toggle. Disconnecting it —
+    ///     `show_menu_in_panel = false`, or a renderer that draws nothing —
+    ///     strands all of them behind nothing at all.
+    #[test]
+    fn the_compact_drawer_is_the_only_route_to_the_whole_menu() {
+        let h = compact_with_drawer();
+        let labels: Vec<&str> = h.menu_leaves().iter().map(|l| l.label).collect();
+
+        for wanted in [
+            "Refresh Radar",
+            "Exit",
+            "Show radar sites",
+            "Show city labels",
+            "Auto-poll",
+            "Time...",
+            "Settings...",
+        ] {
+            assert!(
+                labels.contains(&wanted),
+                "compact has no menu bar, so {wanted:?} is unreachable — drew {labels:?}"
+            );
+        }
+    }
+
+    /// 20. **Invoking a command from the drawer really dispatches it.**
+    ///
+    ///     A click on "Exit" has to become a `GuiAction::Exit`. `Exit` and
+    ///     `RefreshRadar` dispatch to a one-line arm, so a test that only walks
+    ///     the model and calls `apply_menu_event` proves nothing about them:
+    ///     an exhaustive `match` already guarantees the arm exists.
+    #[test]
+    fn a_command_invoked_from_the_drawer_reaches_the_dispatcher() {
+        let mut h = compact_with_drawer();
+        let exit = clickable_leaf(&h, "Exit");
+
+        h.mouse_click(exit.center());
+        assert!(
+            h.last_actions()
+                .iter()
+                .any(|a| matches!(a, crate::actions::GuiAction::Exit)),
+            "clicking Exit in the drawer emitted no Exit action ({} actions in all)",
+            h.last_actions().len()
+        );
+    }
+
+    /// 21. **The menu bar's events reach the dispatcher too.**
+    ///
+    ///     The other presentation, driven the way a user drives it: click the
+    ///     "View" header to open the drop-down, then click the checkbox inside
+    ///     it. Nothing here reaches into egui's menu memory.
+    #[test]
+    fn a_toggle_flipped_in_the_menu_bar_reaches_the_dispatcher() {
+        let mut h = InputHarness::with_screen(egui::vec2(1200.0, 800.0));
+        assert_eq!(
+            h.width_class(),
+            crate::ui_layout::WidthClass::Expanded,
+            "precondition: a menu bar needs 600pt or more"
+        );
+        h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+        h.warm_up();
+        assert!(h.overlay_enabled(OverlayKind::RadarSites), "precondition");
+
+        let view = clickable_leaf(&h, "View");
+        h.mouse_click(view.center());
+        h.frames_for(2, FRAME_DT);
+
+        assert_eq!(
+            h.menu_leaf("Show radar sites").map(|l| l.value),
+            Some(Some(true)),
+            "the open drop-down must draw the toggle, from the live pane"
+        );
+
+        h.mouse_click(clickable_leaf(&h, "Show radar sites").center());
+        h.frames_for(5, FRAME_DT);
+        assert!(
+            !h.overlay_enabled(OverlayKind::RadarSites),
+            "the menu bar's toggle never reached apply_menu_event, or was \
+             reverted by the layers panel on a later frame"
+        );
     }
 
     /// 16. A wide screen has a persistent sidebar and therefore no hamburger,

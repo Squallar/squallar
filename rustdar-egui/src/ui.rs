@@ -23,6 +23,9 @@ mod map_overlays;
 mod chrome;
 #[path = "ui_menu.rs"]
 mod ui_menu;
+/// What the menu presentations actually drew last frame, for the input harness.
+#[cfg(test)]
+pub(crate) use ui_menu::DrawnMenuLeaf;
 #[path = "ui_map.rs"]
 mod map;
 #[path = "ui_settings.rs"]
@@ -122,6 +125,12 @@ pub struct Gui {
     /// tests, which check they match what was painted.
     #[cfg(test)]
     last_excluded_rects: Vec<egui::Rect>,
+    /// Every menu leaf the last frame actually drew — whichever of the two
+    /// presentations was on screen — with the bool each checkbox was really
+    /// handed and the rect it landed in. Only read by tests, which need the
+    /// state the *renderer* saw rather than the model a test rebuilt.
+    #[cfg(test)]
+    last_menu_leaves: Vec<ui_menu::DrawnMenuLeaf>,
     viewport_sync: bool,
     sync_layers: bool,
     // --- Radar loop settings ---
@@ -292,6 +301,8 @@ impl Gui {
             widget_id_probes: Vec::new(),
             #[cfg(test)]
             last_excluded_rects: Vec::new(),
+            #[cfg(test)]
+            last_menu_leaves: Vec::new(),
             viewport_sync: true,
             sync_layers: true,
             loop_lookback_secs: 3600, // default 1 hour
@@ -320,7 +331,10 @@ impl Gui {
         // width or a modality of its own.
         self.layout = LayoutCtx::resolve(ctx, &mut self.modality, self.safe_area_insets);
         #[cfg(test)]
-        self.widget_id_probes.clear();
+        {
+            self.widget_id_probes.clear();
+            self.last_menu_leaves.clear();
+        }
 
         // Create a root Ui to host the panels. Since egui 0.35 the Context-taking
         // `Panel::show` is gone and panels are Ui-scoped only, so this root Ui is
@@ -995,6 +1009,31 @@ impl Gui {
         }
     }
 
+    /// Turn an overlay on or off for the active pane, the way the layers panel
+    /// does it.
+    ///
+    /// Writing `PaneState::enabled_overlays` alone is not enough and does not
+    /// survive a single frame. `render_layer_controls` reloads the handlers
+    /// from the pane's `overlay_configs` on every frame and then saves
+    /// `save_enabled_map()` straight back over `enabled_overlays`, so a change
+    /// that never reached the config is undone before the user sees it. The
+    /// layers panel is on screen exactly when the menu's toggles are reachable
+    /// — always on Expanded, and whenever the drawer is open otherwise — so
+    /// that covered every case.
+    fn set_active_pane_overlay(&mut self, kind: OverlayKind, on: bool) {
+        let configs = self.panes[self.active_pane].overlay_configs.clone();
+        if !configs.is_empty() {
+            self.overlays.load_pane_configs(&configs);
+        }
+        self.overlays.set_enabled(kind, on);
+
+        let configs = self.overlays.save_pane_configs();
+        let enabled = self.overlays.save_enabled_map();
+        let pane = &mut self.panes[self.active_pane];
+        pane.overlay_configs = configs;
+        pane.enabled_overlays = enabled;
+    }
+
     /// Propagate layer settings from the active pane to all others (when sync is enabled).
     /// Also converges site and scan_info so all panes display the same radar site.
     fn propagate_layer_sync(&mut self) {
@@ -1155,6 +1194,13 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn widget_id_probes(&self) -> &[(&'static str, egui::Id)] {
         &self.widget_id_probes
+    }
+
+    /// Every menu leaf the last frame actually drew, as the renderer reported
+    /// it — see [`ui_menu::DrawnMenuLeaf`].
+    #[cfg(test)]
+    pub(crate) fn menu_leaves_for_test(&self) -> &[ui_menu::DrawnMenuLeaf] {
+        &self.last_menu_leaves
     }
 
     /// Open or close the layers drawer, as the hamburger does.
