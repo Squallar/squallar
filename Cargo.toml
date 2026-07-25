@@ -83,21 +83,27 @@ chrono = "=0.4.45"
 flate2 = "=1.1.9"
 # MUST move in lockstep with `rustls-platform-verifier` in rustdar-android.
 #
-# `rustdar-android` hands JNI references to
-# `rustls_platform_verifier::android::init_with_refs`, so it must use the *same*
-# jni crate the verifier does. rpv 0.6.x wants `jni ^0.21`; rpv 0.7.x wants
+# `rustdar-android` hands a JNI `Env` and `JObject` to
+# `rustls_platform_verifier::android::init_with_env`, so it must use the *same*
+# jni crate the verifier does -- those are different types across a major bump,
+# and cargo will happily link both. rpv 0.6.x wants `jni ^0.21`; rpv 0.7.x wants
 # `^0.22`. Bumping one alone makes cargo resolve *two* verifier copies: reqwest's
-# clients read one, `init_with_refs` initialises the other, and **Android TLS
+# clients read one, `init_with_env` initialises the other, and **Android TLS
 # init silently does nothing** -- invisible until an on-device HTTPS request
-# fails. A renovate PR proposed exactly that split and it auto-merged cleanly.
+# fails, which is exactly the api.weather.gov path the Network Security Config
+# in `rustdar-android/android/` exists to keep working.
 #
-# STATUS (2026-07-25): the blocker has lifted. `reqwest 0.13.2` required rpv
-# `^0.6`, but **0.13.4 accepts `>=0.6.0, <0.8.0`**, so the 0.7.0 + jni 0.22.4
-# pair is now resolvable. It is deliberately NOT taken yet: the Gradle/NDK work
-# built and verified real APKs against 0.6.2, and moving the verifier deserves
-# its own change with those artifact checks re-run (the compiled Network
-# Security Config reference, the R8-surviving `org.rustls.platformverifier.*`
-# classes). Take both bumps together, or neither.
+# STATUS (2026-07-25): the pair has moved together to jni 0.22.4 + rpv 0.7.0.
+# `reqwest 0.13.4` accepts rpv `>=0.6.0, <0.8.0`, so this resolves to a single
+# verifier and a single jni; `cargo tree -i jni` is the check. The lockstep rule
+# is unchanged and still load-bearing -- a split is silent at build time, so
+# neither half may be bumped on its own.
+#
+# 0.22 is an API break, not just a version bump: `JavaVM::from_raw` is infallible,
+# `JObject::from_raw` takes an `&Env`, `attach_current_thread` hands out `&mut Env`
+# inside a closure, `GlobalRef` is now `Global<T>`, and method names/signatures
+# need `jni_str!`/`jni_sig!`. All of that is `#[cfg(target_os = "android")]`, so a
+# host `cargo check` compiles none of it -- see the android job in CI.
 jni = "=0.22.4"
 # egui 0.35 requires ^0.4.33.
 log = "=0.4.33"
