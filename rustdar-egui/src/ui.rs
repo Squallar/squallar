@@ -1063,6 +1063,12 @@ impl Gui {
         }
     }
 
+    /// The rect the pane grid was laid out in on the last frame.
+    #[cfg(test)]
+    pub(crate) fn map_panel_rect_for_test(&self) -> egui::Rect {
+        self.last_map_panel_rect
+    }
+
     /// The pane rects the layout produces inside the map panel, as
     /// `render_map` computes them.
     #[cfg(test)]

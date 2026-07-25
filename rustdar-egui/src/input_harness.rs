@@ -128,6 +128,11 @@ impl InputHarness {
         self.gui.pane_rects_for_test()
     }
 
+    /// The rect the pane grid is laid out in, as `render_map` sees it.
+    pub(crate) fn map_panel_rect(&self) -> egui::Rect {
+        self.gui.map_panel_rect_for_test()
+    }
+
     /// The color-scale legend strips painted inside `pane`, classified by the
     /// axis they were drawn along.
     ///
@@ -801,12 +806,11 @@ mod tests {
             h.frame_after(FRAME_DT);
         }
 
-        // The pointer is believed again (`down` is restored — see
-        // `tracker::motion_after_an_excursion_restores_down_but_not_arming`),
-        // but no *new* hold may open on an inferred button: the release that
-        // may have happened out of sight was discarded by the integration, so
-        // this could equally be a bare hover. A tooltip here would suppress
-        // panning until the user clicked.
+        // Coming back with nothing but motion is not enough to reopen: the
+        // release that may have happened out of sight was discarded by the
+        // integration (`lib.rs:796`), so this stream is indistinguishable from
+        // a bare hover. A tooltip here would suppress panning until the user
+        // clicked — see `ui_input::tests::an_excursion_is_terminal_until_a_press`.
         let hovering = h.frames_for(20, 0.1);
         assert_eq!(
             hovering.touch.long_press_pos, None,
@@ -1101,6 +1105,56 @@ mod tests {
                 vertical, 0,
                 "pane {idx}: painted a right-edge bar — the panes disagree, \
                  which is the whole artefact the panel-keyed decision removes"
+            );
+        }
+    }
+
+    /// 8b. **The panel is the key, not the active pane.**
+    ///
+    ///     The `[2, 1]` test above cannot see the difference: in that grid
+    ///     pane 0 is `panel_w/2 × panel_h/2`, which has the *same* aspect ratio
+    ///     as the panel, so keying on the panel and keying on the active pane
+    ///     agree by construction and its precondition is simultaneously a
+    ///     statement about both.
+    ///
+    ///     A 2-pane grid separates them: each pane is `panel_w/2 × panel_h`, so
+    ///     its ratio is exactly twice the panel's. At 1180×1000 the panel comes
+    ///     out landscape while both panes are emphatically portrait, and the
+    ///     two candidate keys give opposite answers.
+    #[test]
+    fn the_color_scale_axis_comes_from_the_panel_not_a_pane() {
+        let mut h = InputHarness::with_screen(egui::vec2(1180.0, 1000.0));
+        h.set_pane_count(2);
+        h.frame();
+
+        let panel = h.map_panel_rect();
+        let panes = h.pane_rects();
+        assert_eq!(panes.len(), 2);
+
+        let ratio = |r: egui::Rect| r.height() / r.width();
+        assert!(
+            ratio(panel) < 1.05,
+            "precondition: the panel must be clearly not portrait, got {}",
+            ratio(panel)
+        );
+        assert!(
+            ratio(panes[0]) > 1.35,
+            "precondition: each pane must be clearly portrait, got {} — \
+             otherwise panel and pane agree and this test proves nothing",
+            ratio(panes[0])
+        );
+
+        for (idx, pane) in panes.iter().enumerate() {
+            let (horizontal, vertical) = h.color_scale_strips(*pane);
+            assert!(
+                vertical > 0,
+                "pane {idx}: the landscape *panel* decides, so the bar belongs \
+                 on the right edge — painted none there"
+            );
+            assert_eq!(
+                horizontal, 0,
+                "pane {idx}: painted a bottom bar, i.e. the axis was taken from \
+                 the pane's own shape"
             );
         }
     }
