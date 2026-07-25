@@ -320,10 +320,15 @@ mod tests {
     /// (`DOUBLE_TAP_TIMEOUT_S` is 0.4s).
     const AFTER_DOUBLE_TAP_TIMEOUT: f64 = 0.5;
 
-    /// How long a "the gesture really ended" assertion must keep watching:
-    /// comfortably past `LONG_PRESS_DURATION_S` (0.8s), which is how long a
-    /// detector that re-arms itself off a stale pointer takes to come back.
-    const WATCH_PAST_LONG_PRESS: f64 = 2.5;
+    /// How long a "the gesture really ended" assertion must keep watching.
+    ///
+    /// It has to clear `LONG_PRESS_DURATION_S` (0.8s) by a wide margin — that
+    /// is how long a detector that re-arms itself off a stale pointer takes to
+    /// come back — and it also has to be long enough that a pointer which is
+    /// *supposed* to stay dead is watched over a realistic span rather than a
+    /// couple of seconds. Half a minute of frame-by-frame checking is cheap
+    /// here (the whole suite runs headless in well under a second).
+    const WATCH_PAST_LONG_PRESS: f64 = 30.0;
 
     /// 1. A single mouse click reports a click position at the clicked point
     ///    and never suppresses panning.
@@ -466,7 +471,7 @@ mod tests {
         );
     }
 
-    /// 6. **Regression test for the stranded zoom drag.** The OS cancels the
+    /// 6. **PROBE B — regression test for the stranded zoom drag.** The OS cancels the
     ///    touch mid-drag: only `PointerGone` arrives, no release, and egui keeps
     ///    reporting `pointer.down == true` forever. The gesture must still end,
     ///    or the map stays un-pannable until the app restarts.
@@ -511,8 +516,8 @@ mod tests {
         });
     }
 
-    /// 6b. The same cancellation, but during a long press: the tooltip position
-    ///     must not stick, and must not come back either.
+    /// 6b. **PROBE A** — the same cancellation, but during a long press: the
+    ///     tooltip position must not stick, and must not come back either.
     #[test]
     fn touch_cancelled_during_long_press_clears_it() {
         let mut h = InputHarness::new();
@@ -570,9 +575,10 @@ mod tests {
         assert!(dragged.zoom > zoom_before, "the drag must still be live");
     }
 
-    /// 6d. A zoom drag that keeps moving must never be cut off, however long it
-    ///     runs — a user framing a view can easily hold one for many seconds.
-    ///     (The pointer backstop is keyed on inactivity, not on gesture age.)
+    /// 6d. **PROBE C** — a zoom drag that keeps moving must never be cut off,
+    ///     however long it runs — a user framing a view can easily hold one for
+    ///     many seconds. (The pointer backstop is keyed on inactivity, not on
+    ///     gesture age, so this runs well past `POINTER_IDLE_TIMEOUT_S`.)
     #[test]
     fn long_active_zoom_drag_is_never_cut_off() {
         let mut h = InputHarness::new();
@@ -582,9 +588,9 @@ mod tests {
         h.touch_start(start);
         assert!(h.frame_after(0.05).touch.suppress_pan);
 
-        // 15 seconds of continuous dragging, well past any plausible backstop.
+        // 40 seconds of continuous dragging, well past any plausible backstop.
         let mut offset = 0.0_f32;
-        for step in 0..30 {
+        for step in 0..80 {
             offset = if step % 2 == 0 { 40.0 } else { -40.0 };
             h.touch_move(start + egui::vec2(0.0, offset));
             let frame = h.frame_after(0.5);

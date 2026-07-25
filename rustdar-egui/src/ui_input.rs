@@ -578,3 +578,116 @@ impl TouchGestures {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drives [`PointerTracker`] directly, one hand-built frame at a time.
+    ///
+    /// The end-to-end probes live in `input_harness.rs`; this is for the event
+    /// orderings that pipeline cannot easily produce — a `PointerButton` for a
+    /// button other than the primary one, in particular, which is the only way
+    /// a *release* can reach the tracker while egui still reports the primary
+    /// as down.
+    struct TrackerDriver {
+        ctx: egui::Context,
+        tracker: PointerTracker,
+        time: f64,
+    }
+
+    impl TrackerDriver {
+        fn new() -> Self {
+            Self {
+                ctx: egui::Context::default(),
+                tracker: PointerTracker::default(),
+                time: 100.0,
+            }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) -> PointerFrame {
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            };
+            self.ctx.begin_pass(raw_input);
+            let frame = self.tracker.read(&self.ctx);
+            let _ = self.ctx.end_pass();
+            self.time += 1.0 / 60.0;
+            frame
+        }
+    }
+
+    fn button(button: egui::PointerButton, pressed: bool, pos: egui::Pos2) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    /// Only a *press* re-arms a lost pointer. A release is not evidence that
+    /// the pointer came back — it is the opposite — so it must leave the latch
+    /// alone even when it arrives for a button egui is not tracking as down.
+    #[test]
+    fn a_release_does_not_re_arm_a_lost_pointer() {
+        let mut d = TrackerDriver::new();
+        let pos = egui::pos2(100.0, 100.0);
+
+        assert!(
+            d.frame(vec![
+                egui::Event::PointerMoved(pos),
+                button(egui::PointerButton::Primary, true, pos),
+            ])
+            .down,
+            "precondition: pressed and down"
+        );
+
+        // Cancelled: `PointerGone` with no release. egui goes on reporting the
+        // primary button as down from here.
+        assert!(
+            !d.frame(vec![egui::Event::PointerGone]).down,
+            "precondition: the cancelled pointer is distrusted"
+        );
+
+        // A secondary-button release arrives. It clears nothing in egui's
+        // primary `down`, and it says nothing about the primary finger.
+        assert!(
+            !d.frame(vec![button(egui::PointerButton::Secondary, false, pos)])
+                .down,
+            "a release must not resurrect a cancelled pointer"
+        );
+
+        // A press, however, does — that is a new sequence.
+        assert!(
+            d.frame(vec![button(egui::PointerButton::Primary, true, pos)])
+                .down,
+            "a fresh press re-arms"
+        );
+    }
+
+    /// Motion un-latches, but a sequence that really ended stays ended: the
+    /// pointer is only "down" while egui says a button is down *and* we still
+    /// believe it, so a bare hover after a release re-arms nothing.
+    #[test]
+    fn hovering_after_a_real_release_does_not_re_arm() {
+        let mut d = TrackerDriver::new();
+        let pos = egui::pos2(100.0, 100.0);
+
+        d.frame(vec![button(egui::PointerButton::Primary, true, pos)]);
+        // A normal touch-up: release *and* `PointerGone`, in that order.
+        d.frame(vec![
+            button(egui::PointerButton::Primary, false, pos),
+            egui::Event::PointerGone,
+        ]);
+
+        let hovered = d.frame(vec![egui::Event::PointerMoved(pos + egui::vec2(5.0, 5.0))]);
+        assert!(!hovered.down, "hovering is not holding");
+    }
+}
