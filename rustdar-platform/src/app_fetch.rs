@@ -636,13 +636,13 @@ impl super::App {
         scan_data: std::sync::Arc<nexrad_model::data::Scan>,
         params: &crate::render_dispatch::RenderParams,
     ) {
-        // Check concurrent render limit (shared with static pane renders)
-        let current = self.renders_in_flight.load(Ordering::Relaxed);
+        // Check concurrent render limit (the counter is shared with static pane renders)
+        let current = self.render.renders_in_flight.load(Ordering::Relaxed);
         if current >= MAX_CONCURRENT_RENDERS {
             return;
         }
-        self.renders_in_flight.fetch_add(1, Ordering::Relaxed);
-        let guard = RenderGuard(std::sync::Arc::clone(&self.renders_in_flight));
+        self.render.renders_in_flight.fetch_add(1, Ordering::Relaxed);
+        let guard = RenderGuard(std::sync::Arc::clone(&self.render.renders_in_flight));
 
         let product = params.product;
         let elevation = params.elevation;

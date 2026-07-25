@@ -1022,8 +1022,8 @@ impl super::App {
 
         // Now mark in-flight and spawn renders, respecting concurrent limit
         for (pane_idx, frame_idx, ts, product, elevation, lat, lon) in to_render {
-            // Check concurrent render limit before each spawn
-            let current = self.renders_in_flight.load(Ordering::Relaxed);
+            // Check concurrent render limit before each spawn (shared with static pane renders)
+            let current = self.render.renders_in_flight.load(Ordering::Relaxed);
             if current >= MAX_CONCURRENT_RENDERS {
                 break;
             }

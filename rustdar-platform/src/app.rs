@@ -1,7 +1,6 @@
 use egui_wgpu::wgpu;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
@@ -66,8 +65,6 @@ pub struct App {
     http_client: reqwest::Client,
     // Grouped loop download state: scan cache, in-flight tracking, and pending queues.
     loop_mgr: LoopDownloadManager,
-    // Shared counter for background render threads in flight (loop + static renders).
-    renders_in_flight: Arc<AtomicUsize>,
     // Cached latest scan per site from auto-poll while panes on that site view historic data.
     latest_cached_scans: HashMap<String, (Arc<nexrad_model::data::Scan>, ScanInfo, chrono::NaiveDateTime)>,
     // Set when a manual time navigation fetch is pending; triggers loop reinit after scan loads.
@@ -85,8 +82,9 @@ impl App {
         let instance = egui_wgpu::wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let input = InputHandler::new();
         let channels = ChannelHub::new();
-        let renders_in_flight = Arc::new(AtomicUsize::new(0));
-        let render = RenderDispatcher::new(Arc::clone(&renders_in_flight));
+        // Owns the single shared render-budget counter used by both the loop and
+        // static pane render paths (see `RenderDispatcher::renders_in_flight`).
+        let render = RenderDispatcher::new();
         let platform = Box::new(platform::create_platform());
 
         let tokio_runtime = tokio::runtime::Runtime::new()
@@ -120,7 +118,6 @@ impl App {
             http_client,
             tokio_runtime,
             loop_mgr: LoopDownloadManager::new(),
-            renders_in_flight: Arc::new(AtomicUsize::new(0)),
             latest_cached_scans: HashMap::new(),
             manual_nav_pending: false,
         }

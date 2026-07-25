@@ -83,20 +83,35 @@ pub struct RenderDispatcher {
     /// Per-site fetch generation counters to discard stale fetch results.
     pub fetch_generations: HashMap<String, u64>,
     /// Shared counter for concurrent background render threads.
+    ///
+    /// This is the single source of truth for the `MAX_CONCURRENT_RENDERS` budget and is
+    /// shared by *both* render paths: static pane renders (`spawn_render` below) and loop
+    /// frame renders (`App::spawn_loop_frame_render` / `App::dispatch_loop_renders`).
+    /// Never introduce a second counter — two independent counters would each enforce the
+    /// limit separately and allow up to 2x the intended number of concurrent 2048x2048
+    /// render threads (and the matching memory spike). All call sites must reach this
+    /// field, cloning the `Arc` only to hand a `RenderGuard` to a spawned thread.
     pub renders_in_flight: Arc<AtomicUsize>,
     /// Cache of the latest render output per (site, product, elevation_tenths), shared
     /// across panes that display the same product at the same elevation on the same site.
     pub render_cache: HashMap<(String, RadarProduct, i32), CachedRenderOutput>,
 }
 
+impl Default for RenderDispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RenderDispatcher {
-    pub fn new(renders_in_flight: Arc<AtomicUsize>) -> Self {
+    pub fn new() -> Self {
         Self {
             pane_render: vec![PaneRenderState::new()],
             level3_data: HashMap::new(),
             render_generation: 0,
             fetch_generations: HashMap::new(),
-            renders_in_flight,
+            // Owned here so there is exactly one render budget counter in the process.
+            renders_in_flight: Arc::new(AtomicUsize::new(0)),
             render_cache: HashMap::new(),
         }
     }
