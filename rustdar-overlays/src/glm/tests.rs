@@ -71,36 +71,36 @@ impl Default for GranuleSpec {
     }
 }
 
-fn scratch_path(tag: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "rustdar-glm-{tag}-{}-{:?}.nc",
-        std::process::id(),
-        std::thread::current().id()
-    ))
+/// Start a GLM-shaped granule.
+///
+/// Note there is no `add_dimension` step. NetCDF dimensions are a layer above
+/// HDF5, and a dataset's length here *is* its data length — which is what the
+/// ragged-column fixtures were expressing through mismatched dimensions all
+/// along. Writing the granule in memory also drops the temp-file dance the
+/// netCDF-C API forced, so the fixtures no longer collide on scratch paths.
+fn new_granule(time_coverage_start: &str) -> hdf5_pure::FileBuilder {
+    let mut w = hdf5_pure::FileBuilder::new();
+    w.set_attr(
+        "time_coverage_start",
+        hdf5_pure::AttrValue::String(time_coverage_start.into()),
+    );
+    w
 }
 
 fn synthetic_granule() -> Vec<u8> {
     granule(&GranuleSpec::default())
 }
 
-/// Build a GLM-shaped NetCDF4 granule in memory.
+/// Build a GLM-shaped granule in memory.
 fn granule(spec: &GranuleSpec) -> Vec<u8> {
-    let path = scratch_path("granule");
-    let _ = std::fs::remove_file(&path);
+    let mut file = new_granule(spec.time_coverage_start);
 
     {
-        let mut file = netcdf::create(&path).expect("create netcdf");
-        file.add_attribute("time_coverage_start", spec.time_coverage_start)
-            .expect("time_coverage_start");
-        file.add_dimension("number_of_events", 3).expect("event dim");
-        file.add_dimension("number_of_flashes", 2).expect("flash dim");
-
         // --- Event level: everything packed, as in the real product. -------
 
         add_short(
             &mut file,
             "event_lat",
-            "number_of_events",
             &spec.event_lat_raw,
             Packed {
                 scale: Some(COORD_SCALE),
@@ -112,7 +112,6 @@ fn granule(spec: &GranuleSpec) -> Vec<u8> {
         add_short(
             &mut file,
             "event_lon",
-            "number_of_events",
             &spec.event_lon_raw,
             Packed {
                 scale: Some(COORD_SCALE),
@@ -125,7 +124,6 @@ fn granule(spec: &GranuleSpec) -> Vec<u8> {
         add_short(
             &mut file,
             "event_time_offset",
-            "number_of_events",
             &[11048, -26192, 11048],
             Packed {
                 scale: Some(TIME_SCALE),
@@ -139,7 +137,6 @@ fn granule(spec: &GranuleSpec) -> Vec<u8> {
         add_short(
             &mut file,
             "event_energy",
-            "number_of_events",
             &[79, -1, 316],
             Packed {
                 scale: Some(EVENT_ENERGY_SCALE),
@@ -154,14 +151,12 @@ fn granule(spec: &GranuleSpec) -> Vec<u8> {
         add_float(
             &mut file,
             "flash_lat",
-            "number_of_flashes",
             &[39.033424, -22.65055],
             "degrees_north",
         );
         add_float(
             &mut file,
             "flash_lon",
-            "number_of_flashes",
             &[-66.48116, -52.769894],
             "degrees_east",
         );
@@ -169,7 +164,6 @@ fn granule(spec: &GranuleSpec) -> Vec<u8> {
         add_short(
             &mut file,
             "flash_area",
-            "number_of_flashes",
             &[1826, -25536],
             Packed {
                 scale: Some(AREA_SCALE),
@@ -181,7 +175,6 @@ fn granule(spec: &GranuleSpec) -> Vec<u8> {
         add_short(
             &mut file,
             "flash_energy",
-            "number_of_flashes",
             &[75, 8],
             Packed {
                 scale: Some(FLASH_ENERGY_SCALE),
@@ -193,7 +186,6 @@ fn granule(spec: &GranuleSpec) -> Vec<u8> {
         add_short(
             &mut file,
             "flash_time_offset_of_first_event",
-            "number_of_flashes",
             &[11048, 12461],
             Packed {
                 scale: Some(TIME_SCALE),
@@ -206,9 +198,7 @@ fn granule(spec: &GranuleSpec) -> Vec<u8> {
         // Deliberately no `event_area`: the L2 LCFA product has none.
     }
 
-    let bytes = std::fs::read(&path).expect("read back granule");
-    let _ = std::fs::remove_file(&path);
-    bytes
+    file.finish().expect("write granule")
 }
 
 struct Packed {
@@ -218,35 +208,35 @@ struct Packed {
     units: Option<&'static str>,
 }
 
-fn add_short(file: &mut netcdf::FileMut, name: &str, dim: &str, values: &[i16], packed: Packed) {
-    let mut var = file
-        .add_variable::<i16>(name, &[dim])
-        .unwrap_or_else(|e| panic!("add {name}: {e}"));
-    // Order matters: netCDF-C wants `_FillValue` before any data is written.
-    var.put_attribute("_Unsigned", "true").expect("_Unsigned");
+/// A packed `_Unsigned` short, the shape GLM uses for nearly everything.
+///
+/// `scale_factor`/`add_offset` arrive as `f32` because that is the width GLM
+/// declares them at, and are widened to `f64` before writing so the file holds
+/// exactly the number a `float` attribute decodes to. Writing the `f64`
+/// literal instead would be a subtly different constant.
+fn add_short(file: &mut hdf5_pure::FileBuilder, name: &str, values: &[i16], packed: Packed) {
+    let b = file.create_dataset(name);
+    b.with_i16_data(values);
+    b.set_attr("_Unsigned", hdf5_pure::AttrValue::String("true".into()));
     if let Some(f) = packed.fill {
-        var.put_attribute("_FillValue", f).expect("_FillValue");
+        b.set_attr("_FillValue", hdf5_pure::AttrValue::I64(i64::from(f)));
     }
     if let Some(s) = packed.scale {
-        var.put_attribute("scale_factor", s).expect("scale_factor");
+        b.set_attr("scale_factor", hdf5_pure::AttrValue::F64(f64::from(s)));
     }
     if let Some(o) = packed.offset {
-        var.put_attribute("add_offset", o).expect("add_offset");
+        b.set_attr("add_offset", hdf5_pure::AttrValue::F64(f64::from(o)));
     }
     if let Some(u) = packed.units {
-        var.put_attribute("units", u).expect("units");
+        b.set_attr("units", hdf5_pure::AttrValue::String(u.into()));
     }
-    var.put_values(values, ..)
-        .unwrap_or_else(|e| panic!("put {name}: {e}"));
 }
 
-fn add_float(file: &mut netcdf::FileMut, name: &str, dim: &str, values: &[f32], units: &str) {
-    let mut var = file
-        .add_variable::<f32>(name, &[dim])
-        .unwrap_or_else(|e| panic!("add {name}: {e}"));
-    var.put_attribute("units", units).expect("units");
-    var.put_values(values, ..)
-        .unwrap_or_else(|e| panic!("put {name}: {e}"));
+/// An unpacked `float` variable — GLM's `flash_lat`/`group_lat` shape.
+fn add_float(file: &mut hdf5_pure::FileBuilder, name: &str, values: &[f32], units: &str) {
+    let b = file.create_dataset(name);
+    b.with_f32_data(values);
+    b.set_attr("units", hdf5_pure::AttrValue::String(units.into()));
 }
 
 fn epoch_at(hour: u32) -> chrono::NaiveDateTime {
@@ -744,17 +734,12 @@ fn call_sites_use_the_documented_warning_keys() {
     //
     // If the call site added a satellite, the unqualified key below would never
     // be claimed by anyone and this assertion would fail.
-    let path = scratch_path("nolat");
-    let _ = std::fs::remove_file(&path);
-    {
-        let mut file = netcdf::create(&path).expect("create");
-        file.add_attribute("time_coverage_start", COVERAGE_START).expect("attr");
-        file.add_dimension("number_of_groups", 1).expect("dim");
-        add_float(&mut file, "group_lon", "number_of_groups", &[-97.0], "degrees_east");
+    let bytes = {
+        let mut file = new_granule(COVERAGE_START);
+        add_float(&mut file, "group_lon", &[-97.0], "degrees_east");
         // No `group_lat`.
-    }
-    let bytes = std::fs::read(&path).expect("read");
-    let _ = std::fs::remove_file(&path);
+        file.finish().expect("write")
+    };
     let _ = parse_glm_netcdf(&bytes, GoesEast, &[GlmDataLevel::Group]);
 
     assert!(
@@ -840,27 +825,20 @@ fn warning_keys_separate_the_conditions_that_must_not_mask_each_other() {
 /// Guards mutant M19 (remove the length check).
 #[test]
 fn mismatched_column_lengths_are_rejected() {
-    let path = scratch_path("ragged");
-    let _ = std::fs::remove_file(&path);
+    let mut file = new_granule(COVERAGE_START);
     {
-        let mut file = netcdf::create(&path).expect("create");
-        file.add_attribute("time_coverage_start", COVERAGE_START).expect("attr");
-        file.add_dimension("n", 3).expect("dim n");
-        file.add_dimension("short_n", 2).expect("dim short_n");
-
         let packed = || Packed {
             scale: Some(COORD_SCALE),
             offset: Some(LAT_OFFSET),
             fill: None,
             units: Some("degrees_north"),
         };
-        add_short(&mut file, "event_lat", "n", &[-13585, -13546, 11048], packed());
+        add_short(&mut file, "event_lat", &[-13585, -13546, 11048], packed());
         // One element short: the file is internally inconsistent.
-        add_short(&mut file, "event_lon", "short_n", &[-28583, -28577], packed());
+        add_short(&mut file, "event_lon", &[-28583, -28577], packed());
         add_short(
             &mut file,
             "event_time_offset",
-            "n",
             &[11048, 11048, 11048],
             Packed {
                 scale: Some(TIME_SCALE),
@@ -872,7 +850,6 @@ fn mismatched_column_lengths_are_rejected() {
         add_short(
             &mut file,
             "event_energy",
-            "n",
             &[79, 316, 79],
             Packed {
                 scale: Some(EVENT_ENERGY_SCALE),
@@ -882,8 +859,7 @@ fn mismatched_column_lengths_are_rejected() {
             },
         );
     }
-    let bytes = std::fs::read(&path).expect("read back");
-    let _ = std::fs::remove_file(&path);
+    let bytes = file.finish().expect("write");
 
     let err = parse_glm_netcdf(&bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Event])
         .expect_err("a ragged granule must not parse");
@@ -898,19 +874,12 @@ fn mismatched_column_lengths_are_rejected() {
 /// `flash_*` should leave the default-on group layer alone.
 #[test]
 fn one_broken_level_does_not_black_out_the_others() {
-    let path = scratch_path("halfbroken");
-    let _ = std::fs::remove_file(&path);
+    let mut file = new_granule(COVERAGE_START);
     {
-        let mut file = netcdf::create(&path).expect("create");
-        file.add_attribute("time_coverage_start", COVERAGE_START).expect("attr");
-        file.add_dimension("number_of_events", 2).expect("dim");
-        file.add_dimension("number_of_flashes", 2).expect("dim");
-        file.add_dimension("ragged", 1).expect("dim");
 
         add_short(
             &mut file,
             "event_lat",
-            "number_of_events",
             &[-13585, -13546],
             Packed {
                 scale: Some(COORD_SCALE),
@@ -922,7 +891,6 @@ fn one_broken_level_does_not_black_out_the_others() {
         add_short(
             &mut file,
             "event_lon",
-            "number_of_events",
             &[-28583, -28577],
             Packed {
                 scale: Some(COORD_SCALE),
@@ -934,7 +902,6 @@ fn one_broken_level_does_not_black_out_the_others() {
         add_short(
             &mut file,
             "event_time_offset",
-            "number_of_events",
             &[11048, 11048],
             Packed {
                 scale: Some(TIME_SCALE),
@@ -947,7 +914,6 @@ fn one_broken_level_does_not_black_out_the_others() {
         add_short(
             &mut file,
             "event_energy",
-            "number_of_events",
             &[79, 316],
             Packed {
                 scale: Some(EVENT_ENERGY_SCALE),
@@ -958,12 +924,11 @@ fn one_broken_level_does_not_black_out_the_others() {
         );
 
         // The flash level is internally ragged and cannot parse.
-        add_float(&mut file, "flash_lat", "number_of_flashes", &[39.0, 40.0], "degrees_north");
-        add_float(&mut file, "flash_lon", "ragged", &[-97.0], "degrees_east");
+        add_float(&mut file, "flash_lat", &[39.0, 40.0], "degrees_north");
+        add_float(&mut file, "flash_lon", &[-97.0], "degrees_east");
         add_short(
             &mut file,
             "flash_time_offset_of_first_event",
-            "number_of_flashes",
             &[11048, 12461],
             Packed {
                 scale: Some(TIME_SCALE),
@@ -975,7 +940,6 @@ fn one_broken_level_does_not_black_out_the_others() {
         add_short(
             &mut file,
             "flash_energy",
-            "number_of_flashes",
             &[75, 8],
             Packed {
                 scale: Some(FLASH_ENERGY_SCALE),
@@ -985,8 +949,7 @@ fn one_broken_level_does_not_black_out_the_others() {
             },
         );
     }
-    let bytes = std::fs::read(&path).expect("read back");
-    let _ = std::fs::remove_file(&path);
+    let bytes = file.finish().expect("write");
 
     let parsed = parse_glm_netcdf(
         &bytes,
@@ -1036,39 +999,34 @@ fn every_level_failing_is_a_file_failure_not_a_level_failure() {
 /// — otherwise every quiet sky would report a schema change.
 #[test]
 fn a_level_with_no_records_is_empty_not_broken() {
-    let path = scratch_path("emptylevel");
-    let _ = std::fs::remove_file(&path);
+    let mut file = new_granule(COVERAGE_START);
     {
-        let mut file = netcdf::create(&path).expect("create");
-        file.add_attribute("time_coverage_start", COVERAGE_START).expect("attr");
-        file.add_dimension("number_of_events", 0).expect("dim");
-        add_short(&mut file, "event_lat", "number_of_events", &[], Packed {
+        add_short(&mut file, "event_lat", &[], Packed {
             scale: Some(COORD_SCALE),
             offset: Some(LAT_OFFSET),
             fill: None,
             units: Some("degrees_north"),
         });
-        add_short(&mut file, "event_lon", "number_of_events", &[], Packed {
+        add_short(&mut file, "event_lon", &[], Packed {
             scale: Some(COORD_SCALE),
             offset: Some(LON_OFFSET_EAST),
             fill: None,
             units: Some("degrees_east"),
         });
-        add_short(&mut file, "event_time_offset", "number_of_events", &[], Packed {
+        add_short(&mut file, "event_time_offset", &[], Packed {
             scale: Some(TIME_SCALE),
             offset: Some(TIME_OFFSET),
             fill: None,
             units: Some(TIME_UNITS),
         });
-        add_short(&mut file, "event_energy", "number_of_events", &[], Packed {
+        add_short(&mut file, "event_energy", &[], Packed {
             scale: Some(EVENT_ENERGY_SCALE),
             offset: Some(ENERGY_OFFSET),
             fill: Some(-1),
             units: Some("J"),
         });
     }
-    let bytes = std::fs::read(&path).expect("read back");
-    let _ = std::fs::remove_file(&path);
+    let bytes = file.finish().expect("write");
 
     let parsed = parse_glm_netcdf(&bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Event])
         .expect("an empty level is a quiet sky, not a broken product");

@@ -1,9 +1,18 @@
 //! Tests for the GLM HDF5 subset reader.
 //!
-//! The oracle is the `netcdf` crate — the C netCDF/HDF5 stack that this crate
-//! exists to replace. It is a genuinely independent implementation: nothing in
-//! `rustdar-hdf5` shares code, constants or expected values with it. Expected
-//! numbers are never produced by this crate's own reader.
+//! The oracle **was** the `netcdf` crate — the C netCDF/HDF5 stack this crate
+//! exists to replace, and a genuinely independent implementation. It has since
+//! been removed from the workspace (it linked `netcdf-sys`, `netcdf-src`,
+//! `hdf5-metno-sys` and `hdf5-metno-src`, four bundled C/C++ builds that block
+//! wasm32 and iOS), so the comparison can no longer be run live.
+//!
+//! What is left behind is its verdict: the constants in [`GOLDEN_F32`],
+//! [`GOLDEN_I16`] and [`ALL_NAMES`] were **produced by the C library** while it
+//! was still a dependency, not by this crate's reader. Regenerating them from
+//! this crate would leave tests that assert only that the code agrees with
+//! itself, which is worth nothing. If the fixture is ever replaced, the
+//! replacement's expectations must come from an independent reader
+//! (`h5dump`, `ncdump`, `h5py`) and not from `cargo test` output.
 //!
 //! The fixture is a real GOES-19 GLM L2 granule from the public `noaa-goes19`
 //! S3 bucket (`GLM-L2-LCFA/2025/180/12/`), committed unmodified so these tests
@@ -14,73 +23,118 @@ use super::*;
 const FIXTURE: &[u8] =
     include_bytes!("../testdata/OR_GLM-L2-LCFA_G19_s20251801200000_e20251801200200_c20251801200212.nc");
 
-const FIXTURE_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/testdata/OR_GLM-L2-LCFA_G19_s20251801200000_e20251801200200_c20251801200212.nc"
-);
-
-/// Reads a variable through the C netCDF library.
-fn oracle_f32(name: &str) -> Vec<f32> {
-    let file = netcdf::open(FIXTURE_PATH).expect("netcdf could not open the fixture");
-    let var = file
-        .variable(name)
-        .unwrap_or_else(|| panic!("netcdf has no variable {name}"));
-    var.get_values::<f32, _>(netcdf::Extents::All)
-        .expect("netcdf could not read the variable")
-}
-
-fn oracle_i16(name: &str) -> Vec<i16> {
-    let file = netcdf::open(FIXTURE_PATH).expect("netcdf could not open the fixture");
-    let var = file
-        .variable(name)
-        .unwrap_or_else(|| panic!("netcdf has no variable {name}"));
-    var.get_values::<i16, _>(netcdf::Extents::All)
-        .expect("netcdf could not read the variable")
-}
-
-/// The spike's success criterion: `flash_lat` out of a real granule, matching
-/// the C implementation.
+/// FNV-1a over the raw IEEE / two's-complement bits of every element.
 ///
-/// `flash_lat` is stored as raw IEEE binary32 with no `scale_factor`,
-/// `add_offset` or `_FillValue`, so the comparison is **exact** — every bit of
-/// every value. There is no tolerance to hide a scaling error behind.
-#[test]
-fn flash_lat_matches_the_c_netcdf_library_exactly() {
-    let f = Hdf5File::parse(FIXTURE).expect("parse");
-    let ours = f.read_f32("flash_lat").expect("read flash_lat");
-    let theirs = oracle_f32("flash_lat");
-
-    assert_eq!(ours.len(), theirs.len(), "element count");
-    assert!(!theirs.is_empty(), "oracle returned no data");
-    assert_eq!(ours, theirs, "flash_lat values differ from netcdf");
+/// Exact, not tolerance-based: the fixture is unfiltered and unscaled, so any
+/// difference at all is a difference, and one flipped element in 2172 must not
+/// be able to hide behind an average.
+fn fingerprint(bytes: impl Iterator<Item = u8>) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
-#[test]
-fn flash_lon_matches_the_c_netcdf_library_exactly() {
-    let f = Hdf5File::parse(FIXTURE).expect("parse");
-    let ours = f.read_f32("flash_lon").expect("read flash_lon");
-    let theirs = oracle_f32("flash_lon");
-
-    assert_eq!(ours.len(), theirs.len(), "element count");
-    assert!(!theirs.is_empty(), "oracle returned no data");
-    assert_eq!(ours, theirs, "flash_lon values differ from netcdf");
+fn fp_f32(v: &[f32]) -> u64 {
+    fingerprint(v.iter().flat_map(|x| x.to_bits().to_le_bytes()))
 }
 
-/// `flash_lat` fits in a single 256-element chunk, so it cannot detect a bug in
-/// where a chunk's data lands in the output. `group_lat` has 2172 elements
-/// across nine chunks, so every chunk after the first must be placed at the
-/// right offset for this to pass.
+fn fp_i16(v: &[i16]) -> u64 {
+    fingerprint(v.iter().flat_map(|x| x.to_le_bytes()))
+}
+
+/// `(variable, element count, fingerprint)` as the C netCDF library read them.
+const GOLDEN_F32: &[(&str, usize, u64)] = &[
+    ("flash_lat", 148, 0x7a11_e1d4_0d07_9c07),
+    ("flash_lon", 148, 0x129d_fc4c_8ce8_6dce),
+    ("group_lat", 2172, 0xa4ac_24ad_533b_2499),
+];
+
+/// The packed case, compared as raw stored bits.
+const GOLDEN_I16: &[(&str, usize, u64)] = &[("flash_energy", 148, 0x1ec7_a75c_23d4_8991)];
+
+/// Every name in the root group: netCDF's 48 variables plus the 6 dimension
+/// scales it hides from `variables()`. Captured from the C library.
+const ALL_NAMES: &[&str] = &[
+    "algorithm_dynamic_input_data_container",
+    "algorithm_product_version_container",
+    "event_count",
+    "event_energy",
+    "event_id",
+    "event_lat",
+    "event_lon",
+    "event_parent_group_id",
+    "event_time_offset",
+    "flash_area",
+    "flash_count",
+    "flash_energy",
+    "flash_frame_time_offset_of_first_event",
+    "flash_frame_time_offset_of_last_event",
+    "flash_id",
+    "flash_lat",
+    "flash_lon",
+    "flash_quality_flag",
+    "flash_time_offset_of_first_event",
+    "flash_time_offset_of_last_event",
+    "flash_time_threshold",
+    "goes_lat_lon_projection",
+    "group_area",
+    "group_count",
+    "group_energy",
+    "group_frame_time_offset",
+    "group_id",
+    "group_lat",
+    "group_lon",
+    "group_parent_flash_id",
+    "group_quality_flag",
+    "group_time_offset",
+    "group_time_threshold",
+    "lat_field_of_view",
+    "lat_field_of_view_bounds",
+    "lightning_wavelength",
+    "lightning_wavelength_bounds",
+    "lon_field_of_view",
+    "lon_field_of_view_bounds",
+    "nominal_satellite_height",
+    "nominal_satellite_subpoint_lat",
+    "nominal_satellite_subpoint_lon",
+    "number_of_events",
+    "number_of_field_of_view_bounds",
+    "number_of_flashes",
+    "number_of_groups",
+    "number_of_time_bounds",
+    "number_of_wavelength_bounds",
+    "percent_navigated_L1b_events",
+    "percent_uncorrectable_L0_errors",
+    "processing_parm_version_container",
+    "product_time",
+    "product_time_bounds",
+    "yaw_flip_flag",
+];
+
+/// The spike's success criterion, now frozen: `flash_lat`, `flash_lon` and
+/// `group_lat` out of a real granule, bit for bit as the C library read them.
 ///
-/// This exists because a mutation that read the wrong component of the chunk
-/// b-tree key survived the `flash_lat` test.
+/// All three are raw IEEE binary32 with no `scale_factor`, `add_offset` or
+/// `_FillValue`, so the comparison is exact and there is no tolerance for a
+/// scaling error to hide behind.
+///
+/// `group_lat` is the important one. `flash_lat` fits in a single 256-element
+/// chunk, so it cannot detect a bug in *where* a chunk's data lands;
+/// `group_lat` spans 2172 elements across nine chunks, and every chunk after
+/// the first must be placed at the right offset for this to pass. It is here
+/// because a mutation that read the wrong component of the chunk b-tree key
+/// survived the `flash_lat` test.
 #[test]
-fn multi_chunk_group_lat_matches_the_c_netcdf_library_exactly() {
+fn float_variables_match_the_values_the_c_netcdf_library_read() {
     let f = Hdf5File::parse(FIXTURE).expect("parse");
-    let ours = f.read_f32("group_lat").expect("read group_lat");
-    let theirs = oracle_f32("group_lat");
-
-    assert_eq!(ours.len(), theirs.len(), "element count");
-    assert_eq!(ours, theirs, "group_lat values differ from netcdf");
+    for (name, len, hash) in GOLDEN_F32 {
+        let ours = f.read_f32(name).unwrap_or_else(|e| panic!("read {name}: {e}"));
+        assert_eq!(ours.len(), *len, "{name}: element count");
+        assert_eq!(fp_f32(&ours), *hash, "{name}: values differ from netCDF-C");
+    }
 }
 
 /// Guards the test above: if `group_lat` were ever stored as a single chunk,
@@ -114,69 +168,47 @@ fn group_lat_really_spans_several_chunks() {
 
 /// `flash_energy` is the packed case: `int16` tagged `_Unsigned = "true"` with
 /// a `scale_factor` and `add_offset`. This crate returns the raw stored bits,
-/// so it is compared against netcdf reading the same variable as raw `i16` —
-/// which bypasses the C library's implicit CF unpacking.
+/// so the frozen values are netcdf reading the same variable as raw `i16` —
+/// which bypassed the C library's implicit CF unpacking.
 #[test]
-fn flash_energy_raw_bits_match_the_c_netcdf_library_exactly() {
+fn packed_short_raw_bits_match_the_values_the_c_netcdf_library_read() {
     let f = Hdf5File::parse(FIXTURE).expect("parse");
-    let ours = f.read_i16("flash_energy").expect("read flash_energy");
-    let theirs = oracle_i16("flash_energy");
-
-    assert_eq!(ours.len(), theirs.len(), "element count");
-    assert!(!theirs.is_empty(), "oracle returned no data");
-    assert_eq!(ours, theirs, "flash_energy raw values differ from netcdf");
+    for (name, len, hash) in GOLDEN_I16 {
+        let ours = f.read_i16(name).unwrap_or_else(|e| panic!("read {name}: {e}"));
+        assert_eq!(ours.len(), *len, "{name}: element count");
+        assert_eq!(fp_i16(&ours), *hash, "{name}: raw values differ from netCDF-C");
+    }
 }
 
 /// The variable list comes from walking the fractal heap, so it must account
 /// for every link the C library can see. A heap walk that stopped early would
 /// quietly lose variables.
 ///
-/// This crate reports what is actually in the HDF5 group, which is netcdf's
-/// variables *plus* its dimensions: netCDF-4 backs each dimension with a real
+/// This crate reports what is actually in the HDF5 group, which is netcdf's 48
+/// variables *plus* its 6 dimensions: netCDF-4 backs each dimension with a real
 /// HDF5 dataset (a "dimension scale") and the C library hides those from
-/// `variables()`. Both sets are asserted, so neither a missing variable nor a
-/// stray extra name can pass.
+/// `variables()`. The whole set is asserted, so neither a missing variable nor
+/// a stray extra name can pass.
 #[test]
 fn variable_list_accounts_for_every_netcdf_variable_and_dimension() {
     let f = Hdf5File::parse(FIXTURE).expect("parse");
     let ours: std::collections::BTreeSet<&str> = f.variable_names().collect();
+    let expected: std::collections::BTreeSet<&str> = ALL_NAMES.iter().copied().collect();
 
-    let file = netcdf::open(FIXTURE_PATH).expect("open");
-    let vars: std::collections::BTreeSet<String> =
-        file.variables().map(|v| v.name()).collect();
-    let dims: std::collections::BTreeSet<String> =
-        file.dimensions().map(|d| d.name()).collect();
-
-    assert!(vars.len() > 40, "oracle found suspiciously few variables");
-    assert!(!dims.is_empty(), "oracle found no dimensions");
-
-    // Every netcdf variable must be present.
-    for v in &vars {
-        assert!(ours.contains(v.as_str()), "missing variable {v}");
-    }
-
-    // Anything extra must be a dimension scale, nothing else.
-    let expected: std::collections::BTreeSet<&str> = vars
-        .iter()
-        .chain(dims.iter())
-        .map(String::as_str)
-        .collect();
-    assert_eq!(ours, expected, "variable list differs from netcdf");
+    assert_eq!(expected.len(), 54, "the frozen name list lost an entry");
+    assert_eq!(ours, expected, "variable list differs from netCDF-C's");
 }
 
-/// Shape and type, again against the C library rather than against constants
-/// written down here.
+/// Shape and type. `[148]` and `F32` are what the C library reported for this
+/// variable.
 #[test]
 fn flash_lat_shape_and_type_match_the_c_netcdf_library() {
     let f = Hdf5File::parse(FIXTURE).expect("parse");
     let info = f.info("flash_lat").expect("info");
 
-    let file = netcdf::open(FIXTURE_PATH).expect("open");
-    let var = file.variable("flash_lat").expect("variable");
-
-    assert_eq!(info.dims, var.dimensions().iter().map(|d| d.len() as u64).collect::<Vec<_>>());
+    assert_eq!(info.dims, vec![148]);
     assert_eq!(info.dtype, DataType::F32);
-    assert_eq!(info.len(), oracle_f32("flash_lat").len() as u64);
+    assert_eq!(info.len(), 148);
 }
 
 /// The file really is the format this crate claims to target. If a future
@@ -403,3 +435,4 @@ fn an_unknown_variable_name_is_an_error() {
         Error::NoSuchVariable("no_such_thing".to_owned())
     );
 }
+

@@ -815,35 +815,6 @@ pub(crate) fn parse_glm_netcdf(
     parse_with_source(&file, satellite, levels)
 }
 
-/// Parse GLM data through the netCDF-C library.
-///
-/// Test-only, and temporary: it exists solely so [`super::difftests`] can run
-/// the *same* parser over a genuinely independent reader while both are in the
-/// tree. It goes away with the `netcdf` dependency.
-#[cfg(test)]
-pub(crate) fn parse_glm_netcdf_via_netcdf(
-    data: &[u8],
-    satellite: GlmSatellite,
-    levels: &[GlmDataLevel],
-) -> Result<GranuleParse, String> {
-    struct NcSource<'a>(netcdf::FileMem<'a>);
-
-    impl VarSource for NcSource<'_> {
-        fn read_unpacked(&self, name: &str) -> Result<Option<cf::UnpackedVar>, String> {
-            Ok(super::difftests::nc_raw_var(&self.0, name).map(|v| cf::unpack(&v, name)))
-        }
-        fn time_coverage_start(&self) -> Option<String> {
-            match self.0.attribute("time_coverage_start")?.value().ok()? {
-                netcdf::AttributeValue::Str(s) => Some(s),
-                _ => None,
-            }
-        }
-    }
-
-    let file = netcdf::open_mem(None, data).map_err(|e| format!("Failed to open NetCDF: {e}"))?;
-    parse_with_source(&NcSource(file), satellite, levels)
-}
-
 fn parse_with_source<S: VarSource>(
     file: &S,
     satellite: GlmSatellite,
@@ -1412,15 +1383,6 @@ mod tests {
         );
     }
 
-    /// Deletes the scratch file even if the test body panics.
-    struct TempNc(std::path::PathBuf);
-
-    impl Drop for TempNc {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-
     /// Every flash-level variable, so tests can omit "all of them".
     const FLASH_LEVEL_VARS: [&str; 5] = [
         "flash_lat",
@@ -1461,36 +1423,22 @@ mod tests {
     /// The `units` attributes are still declared, because a value whose unit is
     /// undeclared is reported as unknown.
     fn synthetic_glm_file(spec: Fixture<'_>) -> Vec<u8> {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let guard = TempNc(std::env::temp_dir().join(format!(
-            "rustdar-glm-test-{}-{unique}.nc",
-            std::process::id(),
-        )));
-        let path = &guard.0;
-        let _ = std::fs::remove_file(path);
+        let mut file = hdf5_pure::FileBuilder::new();
+        file.set_attr(
+            "time_coverage_start",
+            hdf5_pure::AttrValue::String("2026-07-24T12:00:00.0Z".into()),
+        );
 
         {
-            let mut file = netcdf::create(path).expect("create netcdf");
-            file.add_attribute("time_coverage_start", "2026-07-24T12:00:00.0Z")
-                .expect("add time_coverage_start");
-
-            file.add_dimension("number_of_flashes", 2).expect("flash dim");
-            file.add_dimension("number_of_events", 2).expect("event dim");
-            file.add_dimension("truncated", 1).expect("short dim");
-
-            let mut put = |name: &str, dim: &str, values: &[f32]| {
+            let mut put = |name: &str, values: &[f32]| {
                 if spec.omit.contains(&name) {
                     return;
                 }
-                let (dim, values) = if spec.short == Some(name) {
-                    ("truncated", &values[..1])
-                } else {
-                    (dim, values)
-                };
-                let mut var = file
-                    .add_variable::<f32>(name, &[dim])
-                    .unwrap_or_else(|e| panic!("add {name}: {e}"));
+                // A "short" column is one element instead of two: the length
+                // *is* the data here, so there are no dimensions to mismatch.
+                let values = if spec.short == Some(name) { &values[..1] } else { values };
+                let var = file.create_dataset(name);
+                var.with_f32_data(values);
                 // Declare units on the two fields that are unit-converted.
                 // These fixtures are about *column* presence, so the values are
                 // written already in rustdar's canonical units rather than the
@@ -1503,30 +1451,27 @@ mod tests {
                     _ => None,
                 };
                 if let Some(u) = units {
-                    var.put_attribute("units", u).expect("units");
+                    var.set_attr("units", hdf5_pure::AttrValue::String(u.into()));
                 }
-                var.put_values(values, ..)
-                    .unwrap_or_else(|e| panic!("put {name}: {e}"));
             };
 
-            put("flash_lat", "number_of_flashes", &[35.0, 36.0]);
-            put("flash_lon", "number_of_flashes", &[-97.0, -98.0]);
-            put("flash_energy", "number_of_flashes", &[1.0e-14, 2.0e-14]);
-            put("flash_area", "number_of_flashes", &[128.0, 256.0]);
+            put("flash_lat", &[35.0, 36.0]);
+            put("flash_lon", &[-97.0, -98.0]);
+            put("flash_energy", &[1.0e-14, 2.0e-14]);
+            put("flash_area", &[128.0, 256.0]);
             put(
                 "flash_time_offset_of_first_event",
-                "number_of_flashes",
                 &[1.0, 2.0],
             );
 
-            put("event_lat", "number_of_events", &[35.5, 36.5]);
-            put("event_lon", "number_of_events", &[-97.5, -98.5]);
-            put("event_energy", "number_of_events", &[3.0e-15, 4.0e-15]);
-            put("event_time_offset", "number_of_events", &[3.0, 4.0]);
+            put("event_lat", &[35.5, 36.5]);
+            put("event_lon", &[-97.5, -98.5]);
+            put("event_energy", &[3.0e-15, 4.0e-15]);
+            put("event_time_offset", &[3.0, 4.0]);
             // Note: no `event_area` — that is the point of the fixture.
         }
 
-        std::fs::read(path).expect("read back netcdf")
+        file.finish().expect("write fixture")
     }
 
     /// Records only, for tests that do not care about level failures.

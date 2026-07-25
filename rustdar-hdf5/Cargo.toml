@@ -11,8 +11,6 @@ edition.workspace = true
 [dependencies]
 thiserror.workspace = true
 
-[dev-dependencies]
-# The oracle. `netcdf` links the C libraries this crate exists to replace, so it
-# is a genuinely independent implementation to check numbers against. It is a
-# dev-dependency only: nothing in the shipped graph pulls it.
-netcdf = { version = "=0.12.0", features = ["static"] }
+# No dev-dependencies. The oracle used to be `netcdf`, but it linked the very
+# C stack this crate exists to avoid, so it has been removed from the
+# workspace. Its verdict lives on as the frozen constants in `src/tests.rs`.

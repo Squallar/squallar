@@ -6,8 +6,6 @@
 //! time window (default 5 minutes).
 
 mod cf;
-#[cfg(test)]
-mod difftests;
 pub mod fetch;
 mod h5;
 #[cfg(test)]

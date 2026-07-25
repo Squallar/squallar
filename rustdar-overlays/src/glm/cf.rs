@@ -1,12 +1,14 @@
-//! CF-convention unpacking for NetCDF variables.
+//! CF-convention unpacking for GLM variables.
 //!
 //! # Why this module exists
 //!
-//! The `netcdf` crate is a thin wrapper over the netCDF-C library and it
-//! **does not apply CF packing attributes**. `Variable::get_values::<f32>()`
-//! performs a *numeric type conversion* of the bytes on disk and nothing more
-//! — see the crate's own note on [`netcdf::Variable`]: "`scale_factor` and
-//! `offset_factor` and other attributes are not [considered]".
+//! An HDF5 reader hands back the bytes a variable stores and nothing more. The
+//! CF packing attributes that say what those bytes *mean* are ordinary
+//! attributes, and applying them is the caller's job. netCDF-C did not do it
+//! either — `Variable::get_values::<f32>()` performed a numeric type
+//! conversion of the bytes on disk and no more — which is the history this
+//! module was written from and the reason it long predates the pure-Rust
+//! reader.
 //!
 //! The GOES GLM L2 LCFA product stores nearly every quantity we care about as
 //! a *packed* 16-bit integer. Reading it without unpacking yields numbers that
@@ -16,9 +18,10 @@
 //!
 //! # The unpacking rules (this module is the specification)
 //!
-//! This crate is slated to be replaced by a pure-Rust HDF5 reader for the wasm
-//! build. That reader **must** implement the following, in this order, or it
-//! will silently reintroduce the same class of bug:
+//! Any reader feeding this module **must** produce its input in this order, or
+//! it will silently reintroduce the same class of bug. [`super::h5`] does steps
+//! 1 and 2, because only the reader can ask its library for a specific width;
+//! [`unpack`] does the rest:
 //!
 //! 1. **Read the raw storage values in the variable's declared type.** Do not
 //!    let the library widen a `short` to `float` for you before you have
@@ -31,7 +34,8 @@
 //!    that reads as a negative `i16` must be *bit-reinterpreted*, not negated:
 //!    `-13585_i16 as u16 == 51951`. This is the subtle step. On disk the HDF5
 //!    datatype really is `H5T_STD_I16LE`, so a reader that trusts the datatype
-//!    alone gets it wrong.
+//!    alone gets it wrong — the attribute, not the datatype, carries the
+//!    meaning.
 //!
 //!    `_Unsigned` is spelled as the *string* `"true"` in GLM files, but the
 //!    convention also permits a numeric `1`, so both are accepted.

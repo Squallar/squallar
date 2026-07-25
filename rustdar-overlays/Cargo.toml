@@ -34,15 +34,30 @@ grib = { version = "=0.15.1", default-features = false, features = [
 ] }
 rustdar-units = { workspace = true }
 futures = "=0.3.32"
+# GOES GLM granules. Replaces `netcdf`, which linked netcdf-sys, netcdf-src,
+# hdf5-metno-sys and hdf5-metno-src -- four bundled C/C++ builds that cannot
+# cross-compile to wasm32 or iOS, which is what kept the lightning overlay off
+# both. `hdf5-pure` is MIT, pure Rust, and its whole dependency graph is
+# `byteorder` + `flate2` (-> miniz_oxide); no `-sys` crate anywhere in it.
+#
+# GLM L2 LCFA files are NetCDF4, which *is* HDF5 -- every netCDF variable is an
+# HDF5 dataset in the root group and every attribute an HDF5 attribute on it --
+# so nothing above the HDF5 layer was being used. See `glm::h5`.
+#
+# Defaults are deliberately left ON (`std`, `checksum`, `deflate`) and NOT
+# hoisted into `[workspace.dependencies]`: Cargo silently ignores a member's
+# `default-features = false` when the workspace entry leaves defaults on, so a
+# shared pin is where an opt-out goes to die. `deflate` routes through flate2's
+# default `rust_backend` (miniz_oxide). Do NOT enable `fast-deflate`: it selects
+# `flate2/zlib-ng`, which is C and puts the whole problem back.
+hdf5-pure = "=0.24.0"
 log = { workspace = true }
-netcdf = { version = "=0.12.0", features = ["static"] }
 reqwest = { workspace = true, features = ["default", "json"] }
 roxmltree = "=0.21.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tiny-skia = "=0.12.0"
 tokio = { workspace = true, features = ["fs"] }
-hdf5-pure = "=0.24.0"
 
 [dev-dependencies]
 # Test-only: drives the `#[ignore]`d live-NOMADS checks. Not linked into any
