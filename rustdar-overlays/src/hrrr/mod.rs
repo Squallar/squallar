@@ -537,6 +537,13 @@ impl std::str::FromStr for ModelParameter {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
+            // "sbcin" is listed explicitly even though the fallback below
+            // yields the same value. Relying on that coincidence made the
+            // round-trip through `as_str()` look total when it was not, and
+            // hid every other unrecognised key: a corrupt or stale persisted
+            // parameter silently became SBCIN with nothing to distinguish it
+            // from a genuine SBCIN selection.
+            "sbcin" => ModelParameter::SurfaceBasedCin,
             "mlcin" => ModelParameter::MixedLayerCin,
             "sbcape" => ModelParameter::SurfaceBasedCape,
             "mlcape" => ModelParameter::MixedLayerCape,
@@ -552,7 +559,17 @@ impl std::str::FromStr for ModelParameter {
             "t2m" => ModelParameter::Temperature2m,
             "td2m" => ModelParameter::Dewpoint2m,
             "vis" => ModelParameter::Visibility,
-            _ => ModelParameter::SurfaceBasedCin,
+            // Deliberately still infallible: this parses persisted UI config,
+            // where refusing to start over one bad key would be worse than
+            // falling back. But the fallback is now audible.
+            other => {
+                log::warn!(
+                    "Unknown HRRR model parameter {other:?} in saved config; \
+                     falling back to {}",
+                    ModelParameter::SurfaceBasedCin.display_name(),
+                );
+                ModelParameter::SurfaceBasedCin
+            }
         })
     }
 }
@@ -981,6 +998,29 @@ mod tests {
             ModelParameter::PrecipitableWater.format_magnitude(25.4),
             "1.00 in",
         );
+    }
+
+    /// Every parameter must survive the config round-trip on its own merits.
+    ///
+    /// This passed before only because the unmatched-key fallback happened to
+    /// be SBCIN, the one key with no arm — so the coverage was accidental and
+    /// would have broken the moment the fallback changed.
+    #[test]
+    fn every_parameter_round_trips_through_its_config_key() {
+        for param in ModelParameter::all() {
+            let parsed: ModelParameter = param.as_str().parse().unwrap();
+            assert_eq!(parsed, *param, "key {:?} did not round-trip", param.as_str());
+        }
+    }
+
+    /// Config keys must be distinct, or a round-trip silently retargets.
+    #[test]
+    fn config_keys_are_unique() {
+        let mut keys: Vec<&str> = ModelParameter::all().iter().map(|p| p.as_str()).collect();
+        let total = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), total, "duplicate config key among {keys:?}");
     }
 
     /// A missing point has no reading to report.
