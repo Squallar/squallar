@@ -704,24 +704,22 @@ impl super::App {
                 continue;
             }
 
+            // Drop results the pane is no longer expecting — rendered for a product or
+            // elevation it has since retargeted away from, or aimed at a frame that is
+            // not awaiting one. Applying either paints an image the dispatcher then
+            // treats as done, so the frame never corrects itself.
+            if !ls.accepts_render_result(rr.timestamp, rr.product, rr.elevation) {
+                continue;
+            }
+
             // Capture per-pane state needed for texture creation
             let lat = ls.site_lat;
             let lon = ls.site_lon;
-            let origin_product = pane.selected_product;
-            let origin_elevation = pane.selected_elevation;
 
             // Find the matching frame by timestamp
             let Some(frame) = ls.frames.iter_mut().find(|f| f.timestamp == rr.timestamp) else {
                 continue;
             };
-            // Only a frame still marked in flight is expecting a result. Anything else
-            // means this render was invalidated while it ran — the pane retargeted to a
-            // different product/elevation, the frame list was rebuilt, graphics state was
-            // cleared, or a sibling already supplied the texture. Applying it would paint
-            // a stale image that the dispatcher then considers done.
-            if !frame.render_in_flight {
-                continue;
-            }
             frame.render_in_flight = false;
 
             // Empty image_data means the render failed (no matching sweep). Mark the
@@ -756,21 +754,22 @@ impl super::App {
                         continue;
                     }
                     let Some(sibling) = self.gui.pane_mut(sibling_idx) else { continue };
-                    let sibling_product = sibling.selected_product;
-                    let sibling_elevation = sibling.selected_elevation;
-                    if sibling_product != origin_product
-                        || (sibling_elevation - origin_elevation).abs() > 0.01
-                    {
-                        continue;
-                    }
                     let sls = &mut sibling.loop_state;
                     if !sls.is_active() { continue; }
+                    // Hand the image only to panes whose frames are keyed to exactly
+                    // what it depicts. Matching against the response rather than the
+                    // origin pane's live selection keeps a retarget on either side from
+                    // planting an image the receiving pane will never correct.
+                    if !sls.is_rendered_for(rr.product, rr.elevation) { continue; }
                     let Some(sframe) = sls.frames.iter_mut().find(|f| f.timestamp == rr.timestamp) else {
                         continue;
                     };
                     if sframe.texture.is_some() {
                         continue;
                     }
+                    // If the sibling had its own render running for this frame it is now
+                    // redundant: same target and timestamp means the same image, so its
+                    // result is simply dropped when it arrives.
                     sframe.render_in_flight = false;
                     sframe.texture = Some(rustdar_egui::pane::RadarImageData {
                         texture: texture.clone(),
@@ -1049,6 +1048,14 @@ impl super::App {
 
             let scan_arc = Arc::clone(self.loop_mgr.get_cached(&ts).unwrap());
 
+            // Stamp the render with the target its frame state is keyed to, so a result
+            // that outlives a retarget can be recognised as stale on arrival. Set by
+            // retarget_renders at the top of this same call, so it is always present.
+            let Some(target) = self.gui.pane(pane_idx).and_then(|p| p.loop_state.rendered_for)
+            else {
+                continue;
+            };
+
             // Only mark the frame in flight if a thread was actually spawned. If the
             // spawn is refused (budget taken between the check above and the one inside),
             // no LoopRenderResponse will ever arrive to clear the flag, and the frame
@@ -1058,6 +1065,7 @@ impl super::App {
                 ts,
                 scan_arc,
                 &crate::render_dispatch::RenderParams { product, elevation, lat, lon },
+                target,
             );
 
             if spawned && let Some(pane) = self.gui.pane_mut(pane_idx) {

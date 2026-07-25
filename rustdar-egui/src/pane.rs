@@ -187,6 +187,40 @@ impl LoopPlaybackState {
         matches!(self.phase, LoopPhase::Playing | LoopPhase::Paused)
     }
 
+    /// True if the frames' render state is keyed to exactly this product/elevation.
+    pub fn is_rendered_for(&self, product: RadarProduct, elevation: f32) -> bool {
+        self.rendered_for
+            .is_some_and(|(p, e)| p == product && (e - elevation).abs() <= 0.01)
+    }
+
+    /// Whether a finished render for `timestamp`, produced for `product`/`elevation`,
+    /// should be applied to this loop.
+    ///
+    /// Two independent ways a result goes stale, and both must be checked:
+    ///
+    /// - The pane retargeted while the render ran, so the image depicts a product or
+    ///   elevation the frames are no longer keyed to. Checking "is the frame still
+    ///   marked in flight?" cannot catch this: `retarget_renders` clears the mark, but
+    ///   the very same dispatch pass re-spawns the frame for the new target and marks it
+    ///   again, so the older render's result arrives to a frame that *is* in flight.
+    ///   Since a loop frame's image is fully determined by (timestamp, product,
+    ///   elevation), comparing the target is exact — a late result that still matches
+    ///   the current target is byte-identical to the pending one and safe to apply.
+    /// - The frame is not expecting a result at all: the frame list was rebuilt, the
+    ///   graphics state was cleared, or a sibling pane already supplied the texture.
+    pub fn accepts_render_result(
+        &self,
+        timestamp: NaiveDateTime,
+        product: RadarProduct,
+        elevation: f32,
+    ) -> bool {
+        self.is_rendered_for(product, elevation)
+            && self
+                .frames
+                .iter()
+                .any(|f| f.timestamp == timestamp && f.render_in_flight)
+    }
+
     /// Point the loop's frame renders at `product`/`elevation`, discarding every
     /// frame's render state if that differs from what the frames were last rendered
     /// for. Returns `true` if frames were invalidated.
@@ -200,14 +234,12 @@ impl LoopPlaybackState {
     /// to a product every scan has — and readiness counts retired frames as settled,
     /// so playback would animate with permanent holes.
     ///
-    /// In-flight renders are un-marked as well, which makes their results stale on
-    /// arrival (see the guard in `poll_loop_render_results`) so an old-product image
-    /// cannot land on a frame after the switch.
+    /// In-flight renders are un-marked as well, since nothing is owed to a frame whose
+    /// target moved. That alone does *not* make their results stale — the same dispatch
+    /// pass re-spawns and re-marks the frame — so rejecting them is
+    /// `accepts_render_result`'s job, via the target stamped on the response.
     pub fn retarget_renders(&mut self, product: RadarProduct, elevation: f32) -> bool {
-        if let Some((p, e)) = self.rendered_for
-            && p == product
-            && (e - elevation).abs() <= 0.01
-        {
+        if self.is_rendered_for(product, elevation) {
             return false;
         }
 
@@ -761,6 +793,77 @@ mod tests {
             state.render_set_indices(3).into_iter().collect::<HashSet<_>>()
         );
         assert!(state.render_set_settled(3, all_scans_available));
+    }
+
+    /// The defect the in-flight mark alone cannot catch. `retarget_renders` un-marks
+    /// the frame, but the *same* dispatch pass re-spawns it for the new target and
+    /// marks it again — so when the older render finishes first (it started seconds
+    /// earlier on the same workload) it arrives at a frame that is genuinely in
+    /// flight. Only the target stamped on the result identifies it as stale. Left
+    /// unchecked the frame keeps the previous product's image forever: the dispatcher
+    /// skips textured frames, readiness counts it settled, and the newer result is
+    /// then dropped because the frame is no longer marked.
+    #[test]
+    fn stale_result_is_rejected_after_the_frame_is_respawned() {
+        let mut state = loop_with_frames(3, 0);
+        state.retarget_renders(RadarProduct::Velocity, 0.5);
+        let frame_ts = state.frames[0].timestamp;
+        state.frames[0].render_in_flight = true; // render dispatched for Velocity
+
+        // User switches product; the same dispatch pass re-spawns and re-marks.
+        assert!(state.retarget_renders(RadarProduct::Reflectivity, 0.5));
+        state.frames[0].render_in_flight = true;
+
+        assert!(
+            state.frames[0].render_in_flight,
+            "precondition: an in-flight-only guard would accept the stale result here"
+        );
+        assert!(
+            !state.accepts_render_result(frame_ts, RadarProduct::Velocity, 0.5),
+            "a result for the abandoned target must be rejected"
+        );
+        assert!(
+            state.accepts_render_result(frame_ts, RadarProduct::Reflectivity, 0.5),
+            "the re-dispatched render for the current target is still accepted"
+        );
+    }
+
+    #[test]
+    fn results_for_frames_not_awaiting_one_are_rejected() {
+        let ctx = egui::Context::default();
+        let mut state = loop_with_frames(3, 0);
+        state.retarget_renders(RadarProduct::Reflectivity, 0.5);
+        let frame_ts = state.frames[0].timestamp;
+
+        // Never dispatched, or already satisfied by a sibling pane's broadcast.
+        assert!(!state.accepts_render_result(frame_ts, RadarProduct::Reflectivity, 0.5));
+        state.frames[0].texture = Some(dummy_texture(&ctx));
+        assert!(!state.accepts_render_result(frame_ts, RadarProduct::Reflectivity, 0.5));
+
+        // A timestamp that is not in the frame list at all (list rebuilt since dispatch).
+        state.frames[1].render_in_flight = true;
+        assert!(!state.accepts_render_result(ts(59), RadarProduct::Reflectivity, 0.5));
+    }
+
+    /// Eviction now keeps only render-set members, where the previous rule kept the
+    /// `budget` closest *textured* frames regardless of membership. Out-of-set
+    /// textures are frames the dispatcher will never refresh, so this is deliberate;
+    /// the visible effect is that scrubbing back to one blanks until it re-renders.
+    #[test]
+    fn eviction_drops_textured_frames_outside_the_render_set() {
+        let ctx = egui::Context::default();
+        let mut state = loop_with_frames(10, 0);
+        for idx in [2, 3, 4, 5] {
+            state.frames[idx].texture = Some(dummy_texture(&ctx));
+        }
+        assert_eq!(state.render_set_indices(3), vec![0, 1, 9]);
+
+        state.evict_textures_outside_render_set(3);
+
+        assert!(
+            state.frames.iter().all(|f| f.texture.is_none()),
+            "none of the textured frames were in the render set"
+        );
     }
 
     #[test]

@@ -79,6 +79,14 @@ pub struct LoopScanDownloadResponse {
 pub struct LoopRenderResponse {
     pub pane_idx: usize,
     pub timestamp: NaiveDateTime,
+    /// The pane's selected product when this render was dispatched.
+    pub product: RadarProduct,
+    /// The pane's *selected* elevation when this render was dispatched — not the
+    /// per-scan snapped angle the image was actually rendered at. Together with
+    /// `product` this is the render target key, compared against
+    /// `LoopPlaybackState::rendered_for` on arrival to reject results whose
+    /// selection the pane has since moved away from.
+    pub elevation: f32,
     pub image_data: Vec<u8>,
     pub max_range_km: f64,
     pub value_data: Vec<f32>,

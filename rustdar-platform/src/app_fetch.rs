@@ -633,12 +633,18 @@ impl super::App {
     /// Returns `true` if a render thread was spawned. `false` means the shared
     /// concurrency budget was exhausted and nothing was started — the caller must
     /// not mark the frame as in flight, since no response will arrive to clear it.
+    ///
+    /// `target` is the pane's current render target (`LoopPlaybackState::rendered_for`):
+    /// the *selected* product and elevation, as opposed to `params.elevation`, which is
+    /// snapped to a sweep in this frame's own scan. It is stamped on the response so a
+    /// result can be rejected if the pane retargets while the render runs.
     pub(super) fn spawn_loop_frame_render(
         &self,
         pane_idx: usize,
         timestamp: NaiveDateTime,
         scan_data: std::sync::Arc<nexrad_model::data::Scan>,
         params: &crate::render_dispatch::RenderParams,
+        target: (rustdar_radar::types::RadarProduct, f32),
     ) -> bool {
         // Check concurrent render limit (the counter is shared with static pane renders)
         let current = self.render.renders_in_flight.load(Ordering::Relaxed);
@@ -652,6 +658,7 @@ impl super::App {
         let elevation = params.elevation;
         let lat = params.lat;
         let lon = params.lon;
+        let (target_product, target_elevation) = target;
         let sender = self.channels.loop_render_sender.clone();
         let window = self.window.clone();
         std::thread::Builder::new()
@@ -664,6 +671,8 @@ impl super::App {
                     let _ = sender.send(crate::channels::LoopRenderResponse {
                         pane_idx,
                         timestamp,
+                        product: target_product,
+                        elevation: target_elevation,
                         image_data: image,
                         max_range_km: range,
                         value_data: values,
@@ -674,6 +683,8 @@ impl super::App {
                     let _ = sender.send(crate::channels::LoopRenderResponse {
                         pane_idx,
                         timestamp,
+                        product: target_product,
+                        elevation: target_elevation,
                         image_data: Vec::new(),
                         max_range_km: 0.0,
                         value_data: Vec::new(),
