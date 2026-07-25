@@ -268,6 +268,11 @@ impl InputHarness {
         self.gui.map_excluded_rects_for_test().to_vec()
     }
 
+    /// Whether the last frame's status bar included the hover readout.
+    pub(crate) fn status_bar_showed_hover(&self) -> bool {
+        self.gui.status_bar_showed_hover_for_test()
+    }
+
     /// Every rect painted during the last frame, in paint order.
     pub(crate) fn painted_rects(&self) -> &[egui::Rect] {
         &self.last_rects
@@ -2278,6 +2283,34 @@ mod tests {
             h.width_class(),
             crate::ui_layout::WidthClass::Compact,
             "570pt of content is Compact: the insets never reached the breakpoint"
+        );
+    }
+
+    /// 25. **The hover readout follows the pointer, not the window width.**
+    ///
+    ///     Hover is a thing a mouse does. Keying it on `WidthClass` conflates
+    ///     "small" with "touch" — exactly what the compile-time Android gate
+    ///     used to do — and gets both ends wrong: a 500pt desktop window loses
+    ///     a readout it can perfectly well use, and a 1400pt tablet is given a
+    ///     permanently empty one.
+    #[test]
+    fn the_hover_readout_follows_the_modality_not_the_width() {
+        // A narrow *desktop* window: compact, but there is a mouse.
+        let mut narrow = InputHarness::with_screen(egui::vec2(500.0, 800.0));
+        narrow.mouse_click(narrow.map_center());
+        assert_eq!(narrow.width_class(), crate::ui_layout::WidthClass::Compact);
+        assert!(
+            narrow.status_bar_showed_hover(),
+            "a compact window with a mouse lost its hover readout"
+        );
+
+        // A wide *touch* device: roomy, but nothing can hover.
+        let mut tablet = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        tablet.touch_tap(tablet.map_center());
+        assert_eq!(tablet.width_class(), crate::ui_layout::WidthClass::Expanded);
+        assert!(
+            !tablet.status_bar_showed_hover(),
+            "a touch device was given a hover readout that can never fill in"
         );
     }
 

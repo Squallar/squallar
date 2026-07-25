@@ -27,7 +27,7 @@
 //! could never collide only because the two files were never compiled together.
 
 use crate::actions::GuiAction;
-use crate::ui_layout::WidthClass;
+use crate::ui_layout::{PointerModality, WidthClass};
 use super::ui_menu;
 use rustdar_radar::types::ScanInfo;
 use rustdar_units::UserPreferences;
@@ -161,11 +161,24 @@ impl super::Gui {
 
     /// The status bar along the bottom.
     ///
-    /// Compact screens get the essentials only: there is no room for the
-    /// hover readout next to a scan summary, and hover has no meaning without
-    /// a mouse anyway.
+    /// Compact screens get the essentials only: there is no room for the long
+    /// scan summary and the auto-poll checkbox next to each other.
+    ///
+    /// The hover readout is a separate question and keys on the *modality*,
+    /// not the width. There is no hover without a pointing device, so a
+    /// touchscreen has nothing to show however wide it is — and a narrow
+    /// desktop window has a mouse and should keep it. Deciding both from
+    /// `WidthClass` is the same conflation of "small" with "touch" that
+    /// `cfg!(target_os = "android")` used to make: it cost a 500pt desktop
+    /// window its readout and gave a 1400pt tablet a permanently empty one.
     fn render_status_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
         let roomy = self.layout.width != WidthClass::Compact;
+        let has_hover = self.layout.modality == PointerModality::Mouse;
+
+        #[cfg(test)]
+        {
+            self.last_status_bar_showed_hover = has_hover;
+        }
 
         egui::Panel::bottom("status_bar")
             .show_separator_line(true)
@@ -200,7 +213,7 @@ impl super::Gui {
                         roomy,
                     );
 
-                    if roomy {
+                    if has_hover {
                         ui.separator();
                         render_hover_info(ui, &self.panes);
                     }

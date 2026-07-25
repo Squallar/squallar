@@ -147,6 +147,11 @@ pub struct Gui {
     /// stopping at the call site.
     #[cfg(test)]
     last_map_excluded_rects: Vec<egui::Rect>,
+    /// Whether the last frame's status bar included the hover readout. Only
+    /// read by tests, which check it follows the pointer modality rather than
+    /// the width class.
+    #[cfg(test)]
+    last_status_bar_showed_hover: bool,
     viewport_sync: bool,
     sync_layers: bool,
     // --- Radar loop settings ---
@@ -325,6 +330,8 @@ impl Gui {
             last_pane_options: Vec::new(),
             #[cfg(test)]
             last_map_excluded_rects: Vec::new(),
+            #[cfg(test)]
+            last_status_bar_showed_hover: false,
             viewport_sync: true,
             sync_layers: true,
             loop_lookback_secs: 3600, // default 1 hour
@@ -1252,6 +1259,12 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn map_excluded_rects_for_test(&self) -> &[egui::Rect] {
         &self.last_map_excluded_rects
+    }
+
+    /// Whether the last frame's status bar included the hover readout.
+    #[cfg(test)]
+    pub(crate) fn status_bar_showed_hover_for_test(&self) -> bool {
+        self.last_status_bar_showed_hover
     }
 
     /// Open or close the layers drawer, as the hamburger does.
