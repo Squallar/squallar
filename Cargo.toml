@@ -122,7 +122,7 @@ tokio = "=1.53.1"
 #     only what they additionally need (e.g. `json`) and never `default`.
 #
 # The provider is installed at runtime instead: see `rustdar_radar::tls`.
-reqwest = { version = "=0.13.2", default-features = false, features = [
+reqwest = { version = "=0.13.4", default-features = false, features = [
     "rustls-no-provider",
     "charset",
     "http2",
