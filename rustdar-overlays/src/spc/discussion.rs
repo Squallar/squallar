@@ -76,10 +76,9 @@ pub fn classify_md_type(text: &str) -> MdType {
 ///    34249641 34639588 35149575 35449600 35459680 35179718
 /// ```
 ///
-/// Each whitespace-separated token is 7-8 digits encoding lat×100 and lon×100.
-/// The latitude portion is the first 4 digits (or 3 if the token is 7 digits),
-/// the longitude portion is the remaining 4 digits. Longitude is negated
-/// (Western Hemisphere implied).
+/// Every whitespace-separated token is exactly 8 digits; see
+/// [`parse_coord_token`] for the encoding. Tokens that are not well formed are
+/// skipped rather than aborting the parse.
 ///
 /// Returns `None` if no valid polygon could be extracted.
 pub fn parse_lat_lon_polygon(text: &str) -> Option<GeoPolygonRing> {
@@ -94,9 +93,7 @@ pub fn parse_lat_lon_polygon(text: &str) -> Option<GeoPolygonRing> {
         let trimmed = line.trim();
         // Stop at empty lines or lines that look like prose/headers
         // (contain alphabetic chars that aren't part of coordinate data)
-        let has_coords = trimmed.split_whitespace().any(|tok| {
-            tok.len() >= 7 && tok.len() <= 8 && tok.chars().all(|c| c.is_ascii_digit())
-        });
+        let has_coords = trimmed.split_whitespace().any(is_coord_token);
         if !has_coords && !trimmed.is_empty() {
             break;
         }
@@ -128,26 +125,67 @@ pub fn parse_lat_lon_polygon(text: &str) -> Option<GeoPolygonRing> {
     Some(coords)
 }
 
-/// Parse a single coordinate token like "35179718" into (lat, lon).
+/// Longitude fields below this many hundredths of a degree had their leading
+/// `1` stripped by the NWS encoding (see [`parse_coord_token`]).
 ///
-/// Format: first 4 digits = lat × 100, last 4 digits = lon × 100.
-/// For 7-digit tokens: first 3 digits = lat × 100, last 4 digits = lon × 100.
-/// Longitude is negated (Western Hemisphere).
+/// A field of `6000` is 60.00°W and stands unshifted; `5999` would be 159.99°W
+/// once restored, which is outside the product domain and gets rejected by the
+/// range check. The threshold sits in that dead band: the easternmost point in
+/// the MD archive is 66.83°W (Caribou, ME) and NWS's own GIS service declares
+/// `xmax = -65.2554`, so no real product reaches 60°W.
+const LON_DROPPED_HUNDREDS_THRESHOLD: u32 = 6000;
+
+/// Is this token a well-formed `LAT...LON` coordinate token?
+///
+/// SPC coordinate tokens are fixed-width: exactly 8 ASCII digits.
+fn is_coord_token(token: &str) -> bool {
+    token.len() == 8 && token.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Parse a single coordinate token like `"35179718"` into `(lat, lon)`.
+///
+/// The token format is specified by NWS Instruction 10-517 (Aug 1, 2022),
+/// §6.3.4/§6.3.5, Figures 5-6, which define the `LAT...LON` field as `AAaaBBbb`:
+///
+/// > `AAaa`=Latitude north in degrees to two decimal places (without decimal
+/// > point), `BBbb`=Longitude west in degrees to two decimal places (without
+/// > decimal point and **without leading 1 west of 100 degrees west**).
+///
+/// <https://www.weather.gov/media/directives/010_pdfs/pd01005017curr.pdf>
+///
+/// So `35179718` is 35.17°N, 97.18°W, and 120.34°W is encoded as `2034` with
+/// its leading `1` dropped. Restoring that hundreds digit is what the shift
+/// below does. Without it every point west of 100°W decodes to a spot in the
+/// Atlantic and is discarded by the range check, which silently deletes or
+/// deforms the polygon of any discussion covering the western third of the
+/// country.
+///
+/// This runs on text fetched from the network, so it never panics: any token
+/// that is not exactly 8 ASCII digits, or that decodes outside the SPC product
+/// domain, yields `None` and is skipped by the caller. Per the directive the
+/// field is fixed-width and zero-padded, so there is no 7-digit form (104.50°W
+/// is `0450`, never `450`); a 7-digit token is malformed input.
+///
+/// One known consequence of decoding an intentionally lossy format: a corrupt
+/// token can now land on a plausible CONUS point instead of being rejected
+/// (`"35000100"` used to fail the range check at 1.00°W, and now reads as
+/// 35.00°N, 101.00°W). That is inherent to the encoding — the alternative is
+/// discarding a third of all discussions.
 fn parse_coord_token(token: &str) -> Option<(f64, f64)> {
-    if !token.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let len = token.len();
-    if !(7..=8).contains(&len) {
+    if !is_coord_token(token) {
         return None;
     }
 
-    let split = len - 4; // lat portion is everything except last 4 digits
-    let lat_raw: f64 = token[..split].parse::<f64>().ok()?;
-    let lon_raw: f64 = token[split..].parse::<f64>().ok()?;
+    let lat_hundredths: u32 = token[..4].parse().ok()?;
+    let mut lon_hundredths: u32 = token[4..].parse().ok()?;
 
-    let lat = lat_raw / 100.0;
-    let lon = -(lon_raw / 100.0); // Western Hemisphere
+    // Restore the leading "1" the directive drops west of 100 degrees west.
+    if lon_hundredths < LON_DROPPED_HUNDREDS_THRESHOLD {
+        lon_hundredths += 10_000;
+    }
+
+    let lat = f64::from(lat_hundredths) / 100.0;
+    let lon = -(f64::from(lon_hundredths) / 100.0); // Western Hemisphere
 
     // Basic sanity checks for CONUS coordinates
     if !(15.0..=60.0).contains(&lat) || !(-140.0..=-50.0).contains(&lon) {
@@ -307,11 +345,98 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_coord_token_7digit() {
-        // 9519755 → lat 9.51 (3-digit), lon -97.55
-        let (lat, lon) = parse_coord_token("9519755").unwrap();
-        assert!((lat - 9.51).abs() < 0.001);
-        assert!((lon - (-97.55)).abs() < 0.001);
+    fn test_parse_coord_token_rejects_7digit() {
+        // There is no 7-digit form: NWSI 10-517 specifies a fixed-width field
+        // that zero-pads the longitude (104.50°W is "0450", not "450"), and no
+        // 7-digit token appears anywhere in the MD archive. A 7-digit token is
+        // malformed input and must be skipped, not guessed at.
+        assert_eq!(parse_coord_token("9519755"), None);
+        assert_eq!(parse_coord_token("3517450"), None);
+    }
+
+    #[test]
+    fn test_parse_coord_token_west_of_100() {
+        // NWS drops the leading "1" from longitudes >= 100°W, so "2034" is
+        // 120.34°W. Real example: MD 1 of 2024, "the Sierra Nevada...from west
+        // of Tahoe into areas southeast of Yosemite".
+        let (lat, lon) = parse_coord_token("39282034").unwrap();
+        assert!((lat - 39.28).abs() < 0.001);
+        assert!((lon - (-120.34)).abs() < 0.001);
+
+        // Real example: MD 112 of 2024, "Northern Arizona".
+        let (lat, lon) = parse_coord_token("34611154").unwrap();
+        assert!((lat - 34.61).abs() < 0.001);
+        assert!((lon - (-111.54)).abs() < 0.001);
+
+        // Zero-padded form for 100-109.99°W.
+        let (lat, lon) = parse_coord_token("35060450").unwrap();
+        assert!((lat - 35.06).abs() < 0.001);
+        assert!((lon - (-104.50)).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_coord_token_lon_shift_boundary() {
+        // The exact edges of the dropped-"1" shift, derived from NWSI 10-517:
+        // the field carries longitude west without its leading 1 west of 100
+        // degrees west, so "0000" is 100.00°W (10000 with the 1 removed) while
+        // "9999" is a literal 99.99°W.
+        assert_eq!(parse_coord_token("35000000"), Some((35.00, -100.00)));
+        assert_eq!(parse_coord_token("35009999"), Some((35.00, -99.99)));
+
+        // First field that is NOT shifted. 60.00°W is far east of any real
+        // product (easternmost archived point is 66.83°W) but is inside the
+        // range check, so it must survive unshifted rather than become 160°W.
+        assert_eq!(parse_coord_token("35006000"), Some((35.00, -60.00)));
+
+        // One below the threshold: shifted to 159.99°W, then rejected as
+        // outside the product domain. Nothing in the archive lands here.
+        assert_eq!(parse_coord_token("35005999"), None);
+    }
+
+    #[test]
+    fn test_parse_coord_token_malformed_never_panics() {
+        // Malformed tokens return None instead of panicking or slicing at a
+        // non-char boundary. A panic here would run inside a background fetch
+        // task, where it is swallowed by the runtime and leaves the overlay
+        // stuck in its "fetching" state.
+        for token in [
+            "",
+            "3",
+            "351797",       // too short
+            "351797180",    // too long
+            "3517971a",     // non-digit
+            "-5179718",     // sign
+            "35 179718",    // space
+            "351797\u{e9}", // multi-byte char landing on the 8-byte boundary
+            "\u{e9}\u{e9}\u{e9}\u{e9}",
+            "99999999", // decodes out of domain
+            // Rejected on latitude (0.0 fails the 15..=60 gate) before the
+            // longitude is looked at — see the boundary test above for the
+            // lon field "0000" path.
+            "00000000",
+        ] {
+            assert_eq!(parse_coord_token(token), None, "token {token:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_lat_lon_polygon_western_md() {
+        // Tokens from the LAT...LON block of SPC MD 1 of 2024 (Sierra Nevada),
+        // in product order; the line wrapping and ATTN line are simplified.
+        let text = "ATTN...WFO...REV...STO...\n\
+                    \n\
+                    LAT...LON   39282034 38832002 38131950 37361936 37671975\n\
+                    38162027 38772070 39082082 39282034\n\
+                    \n\
+                    Trailing prose.";
+        let ring = parse_lat_lon_polygon(text).unwrap();
+        // All nine points must survive; none may be dropped as "out of range".
+        assert_eq!(ring.len(), 9);
+        for &(lat, lon) in &ring {
+            assert!((37.0..40.0).contains(&lat), "lat {lat}");
+            assert!((-121.0..-119.0).contains(&lon), "lon {lon}");
+        }
+        assert_eq!(ring.first(), ring.last());
     }
 
     #[test]
@@ -376,6 +501,51 @@ LAT...LON   35179718 34899754 34449768 34209745 35179718
         assert_eq!(discussions[0].md_type, MdType::Convective);
         assert!(discussions[0].concerning.is_some());
         assert!(!discussions[0].polygon.is_empty());
+    }
+
+    #[test]
+    fn test_parse_md_rss_plaintext_plus_cdata_description() {
+        // Hardcoded XML — no network. It mirrors the structure of spcmdrss.xml:
+        // <description> holds a plain-text summary and a CDATA section with the
+        // product body as sibling nodes, so this is what proves roxmltree merges
+        // the two and the polygon is reachable at all. Coordinates are from
+        // MD 1 of 2024 (Sierra Nevada), i.e. west of 100W.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0"><channel>
+  <item>
+    <link>https://www.spc.noaa.gov/products/md/md0001.html</link>
+    <title>SPC MD 0001</title>
+    <description>MD 0001 CONCERNING HEAVY SNOW... FOR THE SIERRA NEVADA
+    <![CDATA[<br /><a href="https://www.spc.noaa.gov/products/md/md0001.html"><img src="x.png" /></a><pre>
+
+Mesoscale Discussion 0001
+NWS Storm Prediction Center Norman OK
+
+Areas affected...the Sierra Nevada
+
+Concerning...Heavy snow
+
+ATTN...WFO...REV...STO...
+
+LAT...LON   39282034 38832002 38131950 37361936 37671975
+            38162027 38772070 39082082 39282034
+
+</pre>
+<a href="https://www.spc.noaa.gov/products/md/md0001.html">Read more</a>
+]]>
+    </description>
+  </item>
+</channel></rss>"#;
+
+        let discussions = parse_md_rss(xml).unwrap();
+        assert_eq!(discussions.len(), 1);
+        let md = &discussions[0];
+        assert_eq!(md.number, 1);
+        let ring = md.polygon.first().expect("polygon should be parsed from CDATA body");
+        assert_eq!(ring.len(), 9);
+        for &(_, lon) in ring {
+            assert!((-121.0..-119.0).contains(&lon), "lon {lon}");
+        }
     }
 
     #[test]
