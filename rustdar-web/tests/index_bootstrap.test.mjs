@@ -399,4 +399,29 @@ describe("foreground update check", () => {
   });
 });
 
+describe("forced update escape hatch", () => {
+  // =========================================================================
+
+  it("posts the force message to the controlling worker", async () => {
+    // The way out of a version probe that has stopped working. Without it, a
+    // server that starts refusing HEAD pins this app to the deploy that was
+    // current when it broke, indefinitely and silently.
+    const page = await runBootstrap();
+    page.serviceWorker.controller = page.worker();
+
+    assert.equal(typeof page.window.rustdarForceUpdate, "function", "no forced-update entry point");
+    assert.equal(page.window.rustdarForceUpdate(), true);
+    assert.deepEqual(page.posted, [{ type: "rustdar:force-update" }]);
+  });
+
+  it("says so rather than throwing when no worker is in control", async () => {
+    const page = await runBootstrap();
+    page.serviceWorker.controller = null;
+    assert.equal(page.window.rustdarForceUpdate(), false);
+    assert.equal(
+      page.warnings.some((w) => w.includes("no service worker")),
+      true,
+    );
+  });
+});
 // ===========================================================================

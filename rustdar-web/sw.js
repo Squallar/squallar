@@ -510,12 +510,40 @@ async function notifyClients(message) {
 let updateCheck = null;
 let lastCheckedAt = 0;
 
+/*
+ * Consecutive probe failures, and the warnings already emitted.
+ *
+ * Both are module state and therefore reset when the worker is killed, which
+ * makes them a floor rather than a count: a browser that is offline for a week
+ * will not accumulate to the threshold, because each restart starts again. That
+ * is the right way round. The failure worth shouting about is the one that
+ * persists *while the worker is alive and busy* — a server that has started
+ * refusing `HEAD`, which every navigation then re-probes and re-fails — and
+ * that one reaches the threshold within a single lifetime. Being offline is
+ * both temporary and already visible in the page's own offline banner.
+ */
+let probeFailures = 0;
+const PROBE_FAILURE_WARN_AFTER = 3;
+const warnedAbout = new Set();
+
+function warnOnce(key, ...args) {
+  if (warnedAbout.has(key)) return;
+  warnedAbout.add(key);
+  console.warn(...args);
+}
+
 /**
  * Probe for a new deploy and, if there is one, install it.
  *
  * Offline, or against a server with no validators, this is a no-op that leaves
  * the existing shell exactly as it was. It never deletes a working shell it
  * cannot replace.
+ *
+ * `force` bypasses the *time* throttle only. It cannot bypass the two ways this
+ * function legitimately declines to act — a probe that threw, and a server with
+ * no validators to compare — because in both cases there is genuinely no
+ * evidence that anything changed. Overriding that is what `forceReinstall()` is
+ * for, and it is a different operation: it does not ask whether to reinstall.
  */
 function checkForUpdate({ force = false } = {}) {
   if (updateCheck) return updateCheck;
@@ -529,9 +557,23 @@ function checkForUpdate({ force = false } = {}) {
     let token;
     try {
       token = await probeValidator();
+      probeFailures = 0;
     } catch (e) {
       // Offline, or the probe failed. Keep serving what we have.
       if (!meta) throw e;
+      // A shell is installed and cannot be checked. If that persists, this
+      // worker will serve the same deploy indefinitely with nothing on screen
+      // saying so — which for a severe-weather application means quietly
+      // running last month's code. Say so where a developer will see it.
+      if (++probeFailures >= PROBE_FAILURE_WARN_AFTER) {
+        console.warn(
+          `rustdar sw: the shell version probe has failed ${probeFailures} ` +
+            `times in a row (${e}). The cached shell cannot be checked for ` +
+            `updates and will keep being served. If this is not simply an ` +
+            `offline device, post {type:"rustdar:force-update"} to this ` +
+            `worker to reinstall the shell unconditionally.`,
+        );
+      }
       return;
     }
     lastCheckedAt = Date.now();
@@ -539,7 +581,15 @@ function checkForUpdate({ force = false } = {}) {
     // A server with no validators: install once, then leave it alone. There is
     // no signal here that could tell a new deploy from the old one.
     if (token === null) {
-      if (meta) return;
+      if (meta) {
+        warnOnce(
+          "unversioned",
+          'rustdar sw: the server sends neither ETag nor Last-Modified for the ' +
+            "wasm module, so a new deploy cannot be detected and the cached " +
+            'shell is pinned. Post {type:"rustdar:force-update"} to reinstall it.',
+        );
+        return;
+      }
       token = "unversioned";
     }
 
@@ -557,6 +607,41 @@ function checkForUpdate({ force = false } = {}) {
   });
 
   return updateCheck;
+}
+
+/**
+ * Reinstall the shell from the network without asking whether it changed.
+ *
+ * The escape hatch for a degraded probe. `checkForUpdate` compares a token
+ * against the stored one, so it is useless in exactly the cases where it is
+ * most needed: a server that has started answering `HEAD` with 405, or one that
+ * publishes no validators at all. Both leave `checkForUpdate` correctly
+ * concluding "no evidence of a change" forever.
+ *
+ * The download lands in a cache of its own even when the token is unchanged,
+ * because that token may name a generation live clients are pinned to and
+ * refetching into it would rewrite a shell out from under a page mid-load. The
+ * *token* recorded in the meta record is still the probe's, so the next
+ * ordinary check compares like with like and does not reinstall again.
+ */
+async function forceReinstall() {
+  if (updateCheck) await updateCheck.catch(() => {});
+
+  const meta = await currentMeta();
+  let token = null;
+  try {
+    token = await probeValidator();
+    probeFailures = 0;
+  } catch (e) {
+    console.warn("rustdar sw: forced reinstall could not probe the version:", e);
+  }
+  if (token === null) token = meta ? meta.token : "unversioned";
+
+  const name = `${shellCacheName(token)}-forced-${Date.now()}`;
+  await installShell(token, name);
+  await purgeCaches(cachesToKeep(name, meta));
+  if (meta) await notifyClients({ type: "rustdar:shell-updated", token });
+  return name;
 }
 
 // ---------------------------------------------------------------------------
@@ -751,6 +836,11 @@ self.addEventListener("message", (event) => {
     // A long-lived tab coming back to the foreground. Such a tab never
     // navigates, so this is its only chance to notice a deploy.
     event.waitUntil(checkForUpdate({ force: true }).catch(() => {}));
+  } else if (type === "rustdar:force-update") {
+    // Reinstall regardless of what the probe thinks. See `forceReinstall`.
+    event.waitUntil(
+      forceReinstall().catch((e) => console.warn("rustdar sw: forced reinstall failed:", e)),
+    );
   }
 });
 

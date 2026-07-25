@@ -35,7 +35,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { Network, publishDeploy, restartWorker, startWorker } from "./sw_harness.mjs";
+import {
+  Network,
+  publishDeploy,
+  publishUnversionedDeploy,
+  restartWorker,
+  startWorker,
+} from "./sw_harness.mjs";
 
 const ORIGIN = "https://rustdar.example/rustdar/";
 const SW_URL = `${ORIGIN}sw.js`;
@@ -557,6 +563,104 @@ describe("install: a shell is published whole or not at all", () => {
       ["HEAD"],
       `an unchanged deploy cost more than one HEAD: ${JSON.stringify(after)}`,
     );
+  });
+});
+
+describe("updates: a degraded version probe is visible and escapable", () => {
+  // =========================================================================
+
+  it("warns when the probe keeps failing rather than pinning the shell silently", async () => {
+    const worker = await bootWorker({ tag: "A" });
+    // The server starts refusing HEAD. `checkForUpdate` can no longer tell one
+    // deploy from another and correctly declines to act — forever.
+    publishDeploy(worker.network, ORIGIN, "B", { headStatus: 405 });
+
+    for (let i = 0; i < 4; i += 1) {
+      await worker.message({ type: "rustdar:check-update" });
+    }
+
+    assert.equal(
+      worker.warnings.some((w) => w.includes("shell version probe has failed")),
+      true,
+      `a permanently broken probe pinned the shell with no warning: ${JSON.stringify(worker.warnings)}`,
+    );
+  });
+
+  it("warns when the server publishes no validators to compare", async () => {
+    const network = new Network();
+    publishUnversionedDeploy(network, ORIGIN, "A");
+    const worker = await startWorker({ swUrl: SW_URL, network });
+    await worker.activate();
+
+    publishUnversionedDeploy(worker.network, ORIGIN, "B");
+    await worker.message({ type: "rustdar:check-update" });
+
+    assert.equal(
+      worker.warnings.some((w) => w.includes("neither ETag nor Last-Modified")),
+      true,
+      `an unversioned server pinned the shell with no warning: ${JSON.stringify(worker.warnings)}`,
+    );
+  });
+
+  it("reinstalls the shell on demand when the probe cannot tell it to", async () => {
+    // The escape hatch. `rustdar:check-update` is useless here by construction:
+    // it compares a token the probe cannot supply.
+    const network = new Network();
+    publishUnversionedDeploy(network, ORIGIN, "A");
+    const worker = await startWorker({ swUrl: SW_URL, network });
+    await worker.activate();
+    assert.deepEqual(generationOf(await loadPage(worker)), new Set(["A"]));
+
+    publishUnversionedDeploy(worker.network, ORIGIN, "B");
+    await worker.message({ type: "rustdar:check-update" });
+    assert.deepEqual(
+      generationOf(await loadPage(worker)),
+      new Set(["A"]),
+      "a check that cannot detect a change must not pretend it did",
+    );
+
+    await worker.message({ type: "rustdar:force-update" });
+    assert.deepEqual(
+      generationOf(await loadPage(worker)),
+      new Set(["B"]),
+      "the forced reinstall did not pick up the new deploy",
+    );
+  });
+
+  it("reinstalls on demand when the probe is refusing HEAD", async () => {
+    const worker = await bootWorker({ tag: "A" });
+    publishDeploy(worker.network, ORIGIN, "B", { headStatus: 405 });
+
+    await worker.message({ type: "rustdar:check-update" });
+    assert.deepEqual(generationOf(await loadPage(worker)), new Set(["A"]));
+
+    await worker.message({ type: "rustdar:force-update" });
+    assert.deepEqual(
+      generationOf(await loadPage(worker)),
+      new Set(["B"]),
+      "a forced reinstall must not depend on the probe it exists to work around",
+    );
+  });
+
+  it("does not reinstall twice when the forced install was already current", async () => {
+    const worker = await bootWorker({ tag: "A" });
+    await worker.message({ type: "rustdar:force-update" });
+
+    const before = worker.network.log.length;
+    await worker.message({ type: "rustdar:check-update" });
+    const after = worker.network.log.slice(before);
+    assert.deepEqual(
+      after.map((e) => e.method),
+      ["HEAD"],
+      `the ordinary check reinstalled after a force: ${JSON.stringify(after)}`,
+    );
+  });
+
+  it("keeps serving the shell when the probe fails and there is one installed", async () => {
+    const worker = await bootWorker({ tag: "A" });
+    worker.network.offline = true;
+    await worker.message({ type: "rustdar:check-update" });
+    assert.deepEqual(generationOf(await loadPage(worker)), new Set(["A"]));
   });
 });
 

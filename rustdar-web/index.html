@@ -283,6 +283,30 @@
             });
         });
 
+        // The escape hatch for a version probe that has stopped working.
+        //
+        // The worker detects a new deploy by comparing HTTP validators on the
+        // wasm module. A server that starts answering HEAD with 405, or that
+        // sends neither ETag nor Last-Modified, leaves it correctly concluding
+        // "nothing has changed" forever — and for a severe-weather application,
+        // silently serving last month's bundle is not an acceptable failure to
+        // have no way out of. This reinstalls the shell unconditionally.
+        //
+        // Deliberately a console entry point rather than a button: it costs an
+        // 11 MB download, the worker already warns to the console when the
+        // probe has been failing, and that is where someone diagnosing a stuck
+        // version is looking.
+        window.rustdarForceUpdate = function () {
+          var worker = navigator.serviceWorker.controller;
+          if (!worker) {
+            console.warn("rustdar: no service worker is controlling this page");
+            return false;
+          }
+          worker.postMessage({ type: "rustdar:force-update" });
+          console.info("rustdar: forced shell reinstall requested");
+          return true;
+        };
+
         // A tab left open on a radar loop never navigates, so it would never
         // otherwise notice a deploy. Coming back to the foreground is the one
         // reliable moment to look, and it is throttled so that flipping between
