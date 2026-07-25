@@ -10,7 +10,7 @@ rustdar-egui/src/input_harness.rs	879	873
 rustdar-egui/src/overlay_cache.rs	332	264
 rustdar-egui/src/pane.rs	867	814
 rustdar-egui/src/point_painter.rs	56	0
-rustdar-egui/src/tile_source.rs	200	191
+rustdar-egui/src/tile_source.rs	200	192
 rustdar-egui/src/tiles.rs	112	95
 rustdar-egui/src/ui.rs	944	457
 rustdar-egui/src/ui_chrome.rs	231	179
@@ -81,6 +81,7 @@ rustdar-overlays/src/spc/reports.rs	103	10
 rustdar-overlays/src/types.rs	77	21
 rustdar-platform/src/config_store.rs	71	65
 rustdar-platform/src/main.rs	6	0
+rustdar-platform/src/network_security_config.rs	146	143
 rustdar-platform/src/platform.rs	95	0
 rustdar-platform/src/run.rs	36	0
 rustdar-radar/src/archive.rs	551	412
