@@ -17,25 +17,18 @@ use rustdar_units::UserPreferences;
 mod popups;
 #[path = "ui_config.rs"]
 mod config;
-#[path = "ui_mobile.rs"]
-mod mobile;
 #[path = "ui_map_overlays.rs"]
 mod map_overlays;
-#[path = "ui_desktop.rs"]
-mod desktop;
+#[path = "ui_chrome.rs"]
+mod chrome;
+#[path = "ui_menu.rs"]
+mod ui_menu;
 #[path = "ui_map.rs"]
 mod map;
 #[path = "ui_settings.rs"]
 mod settings;
 
 use crate::ui_input::InteractionState;
-
-/// Android-only UI state: slide-out menu visibility.
-#[cfg(target_os = "android")]
-#[derive(Default)]
-pub(super) struct MobileState {
-    pub show_menu: bool,
-}
 
 /// Radar fetch lifecycle state.
 pub(super) struct RadarState {
@@ -76,7 +69,6 @@ impl AutoPollState {
     }
 
     /// Seconds remaining until the next poll, if a timer is running.
-    #[cfg(not(target_os = "android"))]
     pub fn time_until_next(&self) -> Option<u64> {
         self.last_fetch_time.map(|t| {
             self.interval_secs.saturating_sub(t.elapsed().as_secs())
@@ -127,8 +119,9 @@ pub struct Gui {
     pub loop_lookback_secs: u64,
     /// Animation speed in frames per second.
     pub loop_speed_fps: f32,
-    #[cfg(target_os = "android")]
-    mobile: MobileState,
+    /// Whether the slide-out layers drawer is open. Only consulted when the
+    /// layout has no persistent sidebar.
+    drawer_open: bool,
     // Safe area insets in logical pixels (top, bottom, left, right)
     // Used on Android to avoid drawing under system bars.
     safe_area_insets: (f32, f32, f32, f32),
@@ -289,8 +282,7 @@ impl Gui {
             sync_layers: true,
             loop_lookback_secs: 3600, // default 1 hour
             loop_speed_fps: 5.0,      // default 5 fps
-            #[cfg(target_os = "android")]
-            mobile: MobileState::default(),
+            drawer_open: false,
             safe_area_insets: (0.0, 0.0, 0.0, 0.0),
             modality: ModalityLatch::default(),
             layout: LayoutCtx::default(),
@@ -330,11 +322,19 @@ impl Gui {
                 .max_rect(self.layout.content_rect),
         );
 
-        #[cfg(target_os = "android")]
-        self.render_mobile_ui(&mut root_ui, &mut actions);
-        #[cfg(not(target_os = "android"))]
-        self.render_desktop_ui(&mut root_ui, &mut actions);
+        // Chrome first: panels claim space in call order, and what is left is
+        // the map's. See `ui_chrome.rs`.
+        let chrome = self.render_chrome(&mut root_ui);
+        actions.extend(chrome.actions);
 
+        if let Some(action) = self.render_time_dialog(ctx) {
+            actions.push(action);
+        }
+
+        actions.extend(self.render_map(&mut root_ui, &chrome.excluded_rects));
+
+        // Floating windows last, so they layer above the chrome and the map.
+        self.render_overlay_popup(ctx);
         self.render_settings(ctx, &mut actions);
 
         // Ensure the handler state reflects the active pane's config at frame

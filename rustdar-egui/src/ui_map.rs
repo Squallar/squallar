@@ -7,7 +7,11 @@ use rustdar_units::UserPreferences;
 mod pane_render;
 
 impl super::Gui {
-    pub(super) fn render_map(&mut self, ui: &mut egui::Ui) -> Vec<GuiAction> {
+    pub(super) fn render_map(
+        &mut self,
+        ui: &mut egui::Ui,
+        excluded_rects: &[egui::Rect],
+    ) -> Vec<GuiAction> {
         use walkers::{Map, Position};
 
         let mut actions = Vec::new();
@@ -66,27 +70,13 @@ impl super::Gui {
 
                 let pointer_available = self.dismiss_overlay_popups(ui.ctx());
 
-                // Collect rects for floating UI elements that overlay the map
-                // (e.g., hamburger button on Android). Clicks in these areas
-                // must not trigger overlay polygon hit-tests.
-                let excluded_rects: Vec<egui::Rect> = {
-                    #[cfg(target_os = "android")]
-                    {
-                        let mut rects = Vec::new();
-                        if !self.mobile.show_menu {
-                            let top_inset = self.safe_area_insets.0;
-                            rects.push(egui::Rect::from_min_size(
-                                egui::pos2(12.0, 48.0 + top_inset),
-                                egui::vec2(48.0, 48.0),
-                            ));
-                        }
-                        rects
-                    }
-                    #[cfg(not(target_os = "android"))]
-                    {
-                        Vec::new()
-                    }
-                };
+                // Rects of floating chrome drawn over the map (the hamburger).
+                // Clicks there must not become overlay polygon hit-tests.
+                //
+                // Supplied by the chrome that drew them rather than rebuilt
+                // here from a second copy of its position constants — the two
+                // copies could disagree silently, leaving a dead zone at the
+                // old position and a live one under the button.
 
                 for pane_idx in 0..pane_count {
                     let pane_rect = self.pane_layout.pane_rect(pane_idx, panel_rect);
@@ -193,7 +183,7 @@ impl super::Gui {
                                 pane_rect,
                                 horizontal_color_scale,
                                 pointer_available,
-                                excluded_rects: excluded_rects.clone(),
+                                excluded_rects: excluded_rects.to_vec(),
                                 long_press_pos: pointer.long_press_pos,
                                 overlay_click_pos,
                                 preferences: &self.preferences,

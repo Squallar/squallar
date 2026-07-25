@@ -63,6 +63,26 @@ impl WidthClass {
         }
     }
 
+    /// Whether a persistent menu bar is shown along the top.
+    pub(crate) fn has_menu_bar(self) -> bool {
+        self != Self::Compact
+    }
+
+    /// Whether the layers panel is always on screen, as opposed to a drawer
+    /// the user opens.
+    pub(crate) fn has_persistent_sidebar(self) -> bool {
+        self == Self::Expanded
+    }
+
+    /// Whether a hamburger button is drawn to open the layers drawer.
+    ///
+    /// The exact complement of [`Self::has_persistent_sidebar`]: the drawer
+    /// needs an opener precisely when the sidebar is not already there, and a
+    /// layout with neither would strand every layer control behind nothing.
+    pub(crate) fn has_hamburger(self) -> bool {
+        !self.has_persistent_sidebar()
+    }
+
     /// The largest pane count any device may hold, used when *loading* a config.
     ///
     /// Clamping a loaded config to the current device's limit silently destroys
@@ -411,6 +431,31 @@ mod tests {
         assert_eq!(WidthClass::from_width(600.0), WidthClass::Medium);
         assert_eq!(WidthClass::from_width(999.0), WidthClass::Medium);
         assert_eq!(WidthClass::from_width(1000.0), WidthClass::Expanded);
+    }
+
+    /// The chrome decisions are what the width class exists for, and each one
+    /// has to differ from at least one neighbour or the class is not carrying
+    /// its weight.
+    #[test]
+    fn each_width_class_picks_a_different_chrome() {
+        assert!(!WidthClass::Compact.has_menu_bar());
+        assert!(WidthClass::Medium.has_menu_bar());
+        assert!(WidthClass::Expanded.has_menu_bar());
+
+        assert!(!WidthClass::Compact.has_persistent_sidebar());
+        assert!(!WidthClass::Medium.has_persistent_sidebar());
+        assert!(WidthClass::Expanded.has_persistent_sidebar());
+
+        // The hamburger is exactly where the sidebar is not: a layout with
+        // neither strands every layer control behind nothing, and one with
+        // both wastes a button.
+        for class in [WidthClass::Compact, WidthClass::Medium, WidthClass::Expanded] {
+            assert_ne!(
+                class.has_hamburger(),
+                class.has_persistent_sidebar(),
+                "{class:?}: a drawer with no opener, or an opener with no drawer"
+            );
+        }
     }
 
     /// The pane picker narrows on a phone, and the two roomier classes agree —
