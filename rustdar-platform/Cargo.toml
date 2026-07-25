@@ -36,3 +36,8 @@ rustdar-android-theme = { workspace = true }
 [target.'cfg(not(target_os = "android"))'.dependencies]
 # Cross-platform theme detection for desktop platforms
 dark-light = "=2.0.0"
+# Turn on the settings pane's serial-GPS controls for desktop only. Android
+# builds the serial reader (see rustdar-gps/serial above) but has never shown
+# the port picker, and enabling the feature unconditionally here would leak it
+# there through rustdar-android — cargo features are additive across the graph.
+rustdar-egui = { workspace = true, features = ["gps-serial"] }

@@ -16,13 +16,10 @@ edition.workspace = true
 rustdar-egui = { workspace = true }
 rustdar-radar = { workspace = true }
 rustdar-overlays = { workspace = true }
-# Nothing here needs the serial reader — only GpsFix and GpsConfig. `serial` is
-# on because rustdar-egui's settings pane calls rustdar_gps::detect_gps_ports
-# while enabling nothing itself, so whoever builds it has to supply the feature;
-# rustdar-platform used to be the only crate that did. Removed in the commit
-# that gives rustdar-egui its own `gps-serial` feature, which is where the gate
-# belongs.
-rustdar-gps = { workspace = true, features = ["serial"] }
+# Types only (GpsFix, GpsConfig) — nothing here touches the serial reader, so
+# this crate stays free of the `serial` feature. The settings pane that does use
+# it turns on rustdar-egui/gps-serial instead, which is where the gate belongs.
+rustdar-gps = { workspace = true }
 reqwest = { workspace = true, features = ["default", "json"] }
 chrono = { workspace = true }
 egui = { workspace = true }

@@ -11,7 +11,7 @@ const SETTINGS_POPUP_MIN_WIDTH_MOBILE: f32 = 250.0;
 const SETTINGS_POPUP_WIDTH_DESKTOP: f32 = 340.0;
 const SETTINGS_SMALL_SPACING: f32 = 4.0;
 const SETTINGS_LARGE_SPACING: f32 = 8.0;
-#[cfg(not(target_os = "android"))]
+#[cfg(feature = "gps-serial")]
 const GPS_BAUD_RATES: &[u32] = &[4800, 9600, 38400, 115200];
 
 impl super::Gui {
@@ -58,8 +58,13 @@ impl super::Gui {
                 ui.separator();
                 ui.add_space(SETTINGS_SMALL_SPACING);
 
-                // --- GPS section (desktop only) ---
-                #[cfg(not(target_os = "android"))]
+                // --- GPS section (serial-capable targets only) ---
+                //
+                // Gated on the feature rather than on `not(android)` so that the
+                // gate matches the one on `detect_gps_ports` below. An OS cfg
+                // can never satisfy a feature cfg, and mismatching the two is
+                // what stopped this crate building standalone.
+                #[cfg(feature = "gps-serial")]
                 {
                     ui.heading("GPS");
                     ui.add_space(SETTINGS_SMALL_SPACING);
