@@ -41,9 +41,21 @@ const LONG_PRESS_MAX_MOVE_PX: f32 = 20.0;
 /// run: a drag that is still emitting motion is still real, however long it
 /// lasts, while a gesture whose input simply stopped arriving (the integration
 /// went away mid-sequence without ever sending a release or a cancel) is not.
-/// A finger resting perfectly still emits nothing, so this must stay far longer
-/// than any deliberate pause.
-const POINTER_IDLE_TIMEOUT_S: f64 = 10.0;
+///
+/// The feature that sets the floor here is the long-press radar-value tooltip:
+/// its *normal* operating state is a finger held deliberately still, emitting
+/// nothing at all, while the user reads a value. So this constant has to clear
+/// the longest hold a user might plausibly perform, not merely the longest
+/// pause inside a drag — at ten seconds the tooltip died under a finger that
+/// was still on the glass. A minute of literally zero pointer events with a
+/// finger down cannot happen on real capacitive hardware (jitter alone keeps
+/// `ACTION_MOVE` flowing), so anything that quiet really is a dead integration.
+///
+/// Expiry is recoverable: it latches `lost` (so the long-press detector cannot
+/// pick the phantom finger straight back up), but any subsequent pointer motion
+/// un-latches it — see [`PointerTracker`]. A hold that resumes moving therefore
+/// comes back on its own, without needing a lift and a fresh press.
+pub(crate) const POINTER_IDLE_TIMEOUT_S: f64 = 60.0;
 
 /// One frame's pointer facts, with `down` corrected for sequences that egui
 /// never ends. Produced by [`PointerTracker::read`].

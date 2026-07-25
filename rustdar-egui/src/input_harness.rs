@@ -314,6 +314,8 @@ fn touch(phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui_input::POINTER_IDLE_TIMEOUT_S;
+
     /// Long enough for a deferred single tap to be confirmed
     /// (`DOUBLE_TAP_TIMEOUT_S` is 0.4s).
     const AFTER_DOUBLE_TAP_TIMEOUT: f64 = 0.5;
@@ -618,8 +620,8 @@ mod tests {
         h.touch_move(start + egui::vec2(0.0, 40.0));
         assert!(h.frame_after(FRAME_DT).touch.suppress_pan);
 
-        // No events at all from here on.
-        let expired = h.frames_for(24, 0.5);
+        // No events at all from here on, for longer than the backstop allows.
+        let expired = h.frames_for((POINTER_IDLE_TIMEOUT_S / 0.5) as usize + 10, 0.5);
         assert!(
             !expired.touch.suppress_pan,
             "a pointer that stopped reporting must not hold the map hostage"
@@ -682,6 +684,66 @@ mod tests {
             "a returning pointer must not stay dead until the next click"
         );
         assert!(recovered.touch.suppress_pan);
+    }
+
+    /// 6g. **PROBE G** — recovery after the idle backstop fires. The finger was
+    ///     resting, the backstop stopped believing in it, and then it moves.
+    ///     Expiry latches (so the long press cannot pick a phantom finger back
+    ///     up), but the latch has to be undoable by the finger itself —
+    ///     otherwise a resumed drag needs a lift and a fresh press.
+    #[test]
+    fn pointer_recovers_from_idle_expiry_without_a_lift() {
+        let mut h = InputHarness::new();
+        let start = h.map_center();
+
+        h.touch_start(start);
+        assert!(h.frame_after(FRAME_DT).touch.long_press_pos.is_none());
+
+        // Total silence, past the backstop.
+        let expired = h.frames_for((POINTER_IDLE_TIMEOUT_S / 0.5) as usize + 10, 0.5);
+        assert_eq!(
+            expired.touch.long_press_pos, None,
+            "precondition: the backstop gave up on the pointer"
+        );
+        assert!(!expired.touch.suppress_pan);
+
+        // The finger was there all along, and starts moving again.
+        let resumed = start + egui::vec2(0.0, 60.0);
+        h.touch_move(resumed);
+        h.frame_after(FRAME_DT);
+
+        let recovered = h.frames_for(10, 0.1);
+        assert_eq!(
+            recovered.touch.long_press_pos,
+            Some(resumed),
+            "a resumed gesture must recover on its own, with no lift and no re-press"
+        );
+        assert!(recovered.touch.suppress_pan);
+    }
+
+    /// 6h. **PROBE H** — a deliberately still hold keeps its tooltip.
+    ///
+    ///     This is the case the idle backstop has to be sized against: reading
+    ///     a radar value means holding a finger in one place and emitting
+    ///     nothing at all, and half a minute of that is an ordinary thing to do.
+    #[test]
+    fn a_deliberately_still_hold_keeps_its_tooltip() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+
+        h.touch_start(pos);
+        let held = h.frames_for(10, 0.1);
+        assert_eq!(held.touch.long_press_pos, Some(pos), "precondition: long press");
+
+        // Not one event for thirty seconds; the finger has not moved a pixel.
+        h.assert_every_frame_for(30.0, 0.25, |frame, outcome| {
+            assert_eq!(
+                outcome.touch.long_press_pos,
+                Some(pos),
+                "frame {frame}: the tooltip must survive a still finger"
+            );
+            assert!(outcome.touch.suppress_pan, "frame {frame}");
+        });
     }
 
     /// 6i. When motion un-latches a pointer whose position egui has thrown
