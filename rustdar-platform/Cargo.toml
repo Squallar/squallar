@@ -12,7 +12,15 @@ path = "src/main.rs"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "rustdar_platform_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# rlib only. Both consumers -- the `rustdar-platform` bin here and
+# `rustdar-android`'s cdylib -- link this as a Rust library; nothing loads it as
+# a shared object or links it as a static archive.
+#
+# The `cdylib` that used to be listed was not free: Cargo builds every crate-type
+# declared on a lib target, so `cargo ndk build -p rustdar-android` also emitted
+# librustdar_platform_lib.so, and cargo-ndk copies every .so it finds into
+# jniLibs. That shipped a dead 1.8 MB library in each per-ABI APK.
+crate-type = ["rlib"]
 path = "src/lib.rs"
 
 [dependencies]
