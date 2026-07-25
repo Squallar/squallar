@@ -89,7 +89,6 @@ pub enum ControlValue {
 /// (e.g. show different products based on what data is available).
 pub struct PaneControlContext<'a> {
     pub pane_idx: usize,
-    pub is_mobile: bool,
     /// Per-pane handler state, if this handler created one via `create_pane_state()`.
     /// The handler downcasts this to its concrete state type.
     pub pane_state: Option<&'a dyn std::any::Any>,

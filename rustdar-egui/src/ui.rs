@@ -550,11 +550,7 @@ impl Gui {
         ui.separator();
 
         // --- Handler-backed overlay controls (generic) ---
-        #[cfg(target_os = "android")]
-        let is_mobile = true;
-        #[cfg(not(target_os = "android"))]
-        let is_mobile = false;
-        self.render_overlay_controls(ui, pane, is_mobile, actions);
+        self.render_overlay_controls(ui, pane, actions);
 
         ui.add_space(6.0);
         ui.separator();
@@ -871,7 +867,6 @@ impl Gui {
         &mut self,
         ui: &mut egui::Ui,
         pane: &mut PaneState,
-        is_mobile: bool,
         actions: &mut Vec<GuiAction>,
     ) {
         const ORDER: &[OverlayKind] = &[
@@ -896,7 +891,6 @@ impl Gui {
 
         let ctx = PaneControlContext {
             pane_idx: self.active_pane,
-            is_mobile,
             pane_state: None,
         };
 
