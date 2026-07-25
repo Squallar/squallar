@@ -82,15 +82,8 @@ pub fn draw_metar_station(ob: &MetarOb, painter: &mut dyn PointPainter, ctx: &Dr
         );
     }
 
-    if let Some(vis) = ob.visibility_mi {
-        let vis_text = if vis >= 10.0 {
-            "10".to_string()
-        } else if vis == vis.floor() {
-            format!("{vis:.0}")
-        } else {
-            format!("{vis:.1}")
-        };
-        painter.text(VIS_OFFSET, &vis_text, text_color, font_size * 0.85, TextAnchor::CenterRight);
+    if let Some(vis) = ob.visibility {
+        painter.text(VIS_OFFSET, &vis.label(), text_color, font_size * 0.85, TextAnchor::CenterRight);
     }
 
     if let Some(ref wx) = ob.wx_string {
@@ -123,12 +116,8 @@ pub fn hover_text_for_metar(ob: &MetarOb, prefs: &rustdar_units::UserPreferences
         }
     }
 
-    if let Some(vis) = ob.visibility_mi {
-        if vis >= 10.0 {
-            parts.push("10+SM".into());
-        } else {
-            parts.push(format!("{vis:.1}SM"));
-        }
+    if let Some(vis) = ob.visibility {
+        parts.push(format!("{}SM", vis.label()));
     }
 
     if let Some(speed) = ob.wind_speed_kt {
@@ -583,4 +572,100 @@ fn draw_wx_squall(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8; 4])
         [off[0] + 3.0, off[1] - 1.0],
         color, 1.5,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metar::types::Visibility;
+    use rustdar_units::{SpeedUnit, UserPreferences};
+
+    /// Records what the station model asked to be drawn, so tests can assert on
+    /// geometry and text without a real painter.
+    #[derive(Default)]
+    struct RecordingPainter {
+        texts: Vec<String>,
+        /// `(radius, width)` per circle outline.
+        strokes: Vec<(f32, f32)>,
+        /// `(from, to)` per line segment.
+        lines: Vec<([f32; 2], [f32; 2])>,
+    }
+
+    impl PointPainter for RecordingPainter {
+        fn circle_filled(&mut self, _o: [f32; 2], _r: f32, _c: [u8; 4]) {}
+        fn circle_stroke(&mut self, _o: [f32; 2], r: f32, _c: [u8; 4], w: f32) {
+            self.strokes.push((r, w));
+        }
+        fn text(&mut self, _o: [f32; 2], t: &str, _c: [u8; 4], _s: f32, _a: TextAnchor) {
+            self.texts.push(t.to_string());
+        }
+        fn line(&mut self, from: [f32; 2], to: [f32; 2], _c: [u8; 4], _w: f32) {
+            self.lines.push((from, to));
+        }
+        fn filled_polygon(&mut self, _p: &[[f32; 2]], _c: [u8; 4]) {}
+    }
+
+    fn ob(vis: Option<Visibility>) -> MetarOb {
+        MetarOb {
+            station_id: "KTST".into(),
+            name: "KTST".into(),
+            lat: 35.0,
+            lon: -97.0,
+            elev_m: None,
+            temp_c: None,
+            dewp_c: None,
+            wind_dir: None,
+            wind_speed_kt: None,
+            wind_gust_kt: None,
+            visibility: vis,
+            altimeter_hpa: None,
+            flight_category: None,
+            raw_ob: String::new(),
+            clouds: Vec::new(),
+            wx_string: None,
+            obs_time: String::new(),
+        }
+    }
+
+    fn knots() -> UserPreferences {
+        UserPreferences { speed: SpeedUnit::Knots, ..Default::default() }
+    }
+
+    fn plot(vis: Option<Visibility>) -> RecordingPainter {
+        let mut p = RecordingPainter::default();
+        let ctx = DrawPointContext { zoom: 12.0, is_dark: true };
+        draw_metar_station(&ob(vis), &mut p, &ctx);
+        p
+    }
+
+    /// Formerly `if vis >= 10.0 { "10" }` — a branch the discarded `10+` values
+    /// could never reach. It is reachable now, and it keeps the `+`.
+    #[test]
+    fn the_plot_shows_the_or_greater_marker() {
+        let p = plot(Some(Visibility { miles: 10.0, or_greater: true }));
+        assert!(p.texts.contains(&"10+".to_string()), "drew {:?}", p.texts);
+    }
+
+    /// And a measurement above 10 is not flattened into that bound.
+    #[test]
+    fn the_plot_does_not_flatten_a_measurement_into_the_bound() {
+        let p = plot(Some(Visibility { miles: 15.0, or_greater: false }));
+        assert!(p.texts.contains(&"15".to_string()), "drew {:?}", p.texts);
+        assert!(!p.texts.contains(&"10+".to_string()));
+    }
+
+    /// Formerly `if vis >= 10.0 { "10+SM" }`, unreachable for the same reason.
+    #[test]
+    fn hover_text_reports_unrestricted_visibility() {
+        let text =
+            hover_text_for_metar(&ob(Some(Visibility { miles: 10.0, or_greater: true })), &knots());
+        assert!(text.contains("10+SM"), "got {text:?}");
+    }
+
+    #[test]
+    fn hover_text_keeps_a_measurement_distinct_from_the_bound() {
+        let text =
+            hover_text_for_metar(&ob(Some(Visibility { miles: 15.0, or_greater: false })), &knots());
+        assert!(text.contains("15SM") && !text.contains("10+"), "got {text:?}");
+    }
 }

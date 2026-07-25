@@ -4,7 +4,7 @@ use std::io::Read;
 
 use flate2::read::GzDecoder;
 
-use super::types::{CloudLayer, FlightCategory, MetarOb};
+use super::types::{CloudLayer, FlightCategory, MetarOb, Visibility};
 
 const METAR_CACHE_URL: &str =
     "https://aviationweather.gov/data/cache/metars.cache.csv.gz";
@@ -214,7 +214,14 @@ fn parse_metar_csv(csv: &str) -> Result<Vec<MetarOb>, String> {
             wind_dir: get_u16(i_wdir),
             wind_speed_kt: get_u16(i_wspd),
             wind_gust_kt: get_u16(i_wgst),
-            visibility_mi: get_f64(i_vis),
+            // NOT `get_f64`: AWC writes an unrestricted visibility as `10+` /
+            // `6+`, which `f64::from_str` rejects. Those are 78.5% of the feed's
+            // non-empty values, so parsing them as a plain number blanked the
+            // field for four stations in five — and specifically for the ones
+            // with *good* visibility.
+            visibility: i_vis
+                .and_then(|i| fields.get(i))
+                .and_then(|s| Visibility::parse(s)),
             altimeter_hpa,
             flight_category,
             raw_ob: get_str(i_raw),
@@ -256,5 +263,97 @@ fn parse_flight_category(s: &str) -> Option<FlightCategory> {
         "IFR" => Some(FlightCategory::IFR),
         "LIFR" => Some(FlightCategory::LIFR),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Thirteen verbatim rows from a live `metars.cache.csv.gz`, chosen to cover
+    /// every shape the live-data bugs turned on: `10+`, `6+`, a fractional
+    /// measurement, a measurement above 10, an empty visibility, calm, fast and
+    /// slow `VRB`, a genuine northerly, an `RMK`-only `VRB`, a `000` bearing
+    /// carrying speed, metric `MPS`, and a report with no wind group at all.
+    const SAMPLE: &str = include_str!("testdata/metars.sample.csv");
+
+    fn sample() -> Vec<MetarOb> {
+        parse_metar_csv(SAMPLE).expect("fixture must parse")
+    }
+
+    fn station(id: &str) -> MetarOb {
+        sample()
+            .into_iter()
+            .find(|o| o.station_id == id)
+            .unwrap_or_else(|| panic!("fixture has no station {id}"))
+    }
+
+    #[test]
+    fn every_fixture_row_survives_parsing() {
+        assert_eq!(sample().len(), 13, "fixture rows must all be accepted");
+    }
+
+    /// `10+` and `6+` are 78.5% of the live feed's non-empty visibilities.
+    /// Parsing them straight into `f64` yields `Err`, and the `.ok()` that used
+    /// to follow turned four of every five stations blank.
+    #[test]
+    fn an_unrestricted_visibility_survives_its_trailing_plus() {
+        assert_eq!(
+            Visibility::parse("10+"),
+            Some(Visibility { miles: 10.0, or_greater: true })
+        );
+        assert_eq!(
+            Visibility::parse("6+"),
+            Some(Visibility { miles: 6.0, or_greater: true })
+        );
+        assert_eq!(station("KEDU").visibility.unwrap().miles, 10.0);
+        assert_eq!(station("LTAR").visibility.unwrap().miles, 6.0);
+    }
+
+    /// The `+` is the whole point: dropping it would make `10+` and a measured
+    /// `10` indistinguishable, which is what the stale `Option<f64>` did.
+    #[test]
+    fn or_greater_separates_a_bound_from_a_measurement() {
+        assert!(Visibility::parse("10+").unwrap().or_greater);
+        assert!(!Visibility::parse("15").unwrap().or_greater);
+        assert!(station("KEDU").visibility.unwrap().or_greater, "10+ is a bound");
+        assert!(!station("CYYH").visibility.unwrap().or_greater, "15SM is measured");
+        assert!(!station("KUZA").visibility.unwrap().or_greater, "2.5 is measured");
+    }
+
+    /// A measurement of 15 statute miles is not "10+"; the live cache carries 77
+    /// such rows (Canadian `15SM`, and metric reports converted from km), so the
+    /// `>= 10.0` branches were rare rather than strictly dead — and rendering
+    /// them as "10+" understated a real observation.
+    #[test]
+    fn a_measurement_above_ten_renders_as_itself_not_as_ten_plus() {
+        assert_eq!(Visibility::parse("15").unwrap().label(), "15");
+        assert_eq!(Visibility::parse("12.43").unwrap().label(), "12.4");
+        assert_eq!(station("CYYH").visibility.unwrap().label(), "15");
+    }
+
+    #[test]
+    fn visibility_labels_keep_the_plus_and_drop_the_pointless_decimal() {
+        let cases = [
+            ("10+", "10+"),
+            ("6+", "6+"),
+            ("15", "15"),
+            ("9", "9"),
+            ("2.5", "2.5"),
+            // Rust's `{:.1}` rounds half to even, as the previous formatting
+            // did; 1/4 SM has always shown as 0.2. Pinned, not endorsed.
+            ("0.25", "0.2"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(Visibility::parse(raw).unwrap().label(), want, "input {raw:?}");
+        }
+    }
+
+    #[test]
+    fn an_absent_or_nonsensical_visibility_is_none() {
+        for bad in ["", "   ", "+", "M1/4", "abc", "-3", "inf", "NaN"] {
+            assert_eq!(Visibility::parse(bad), None, "input {bad:?} must not parse");
+        }
+        assert_eq!(station("K20U").visibility, None, "K20U reports no visibility");
     }
 }

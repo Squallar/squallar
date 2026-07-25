@@ -30,6 +30,61 @@ impl FlightCategory {
     }
 }
 
+/// Reported horizontal visibility.
+///
+/// AWC's `visibility_statute_mi` column is *not* a plain number: an unrestricted
+/// report is written with a trailing `+` — `10+` for a US `10SM`, `6+` for an
+/// ICAO `9999` (10 km, ≈6.21 SM). Those two spellings are the **majority** of
+/// the feed (measured on a live cache: 3,569 of 4,549 non-empty values, 78.5%),
+/// so a bare `f64` cannot represent the column and parsing into one silently
+/// discards exactly the good-visibility reports.
+///
+/// [`or_greater`](Self::or_greater) keeps that distinction: `10+` is a *lower
+/// bound*, whereas a numeric `15` (Canadian `15SM`, or a metric report converted
+/// from km) is an actual measurement. Both occur — do not collapse them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Visibility {
+    /// Distance in statute miles. For an `or_greater` report this is the
+    /// reported floor, not the true visibility.
+    pub miles: f64,
+    /// True when the report was "this far or better" (`10+`, `6+`).
+    pub or_greater: bool,
+}
+
+impl Visibility {
+    /// Parse one `visibility_statute_mi` cell, honouring the trailing `+`.
+    ///
+    /// Returns `None` for empty, negative, non-finite, or unparseable values.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        let (digits, or_greater) = match s.strip_suffix('+') {
+            Some(rest) => (rest, true),
+            None => (s, false),
+        };
+        let miles: f64 = digits.parse().ok()?;
+        // Reject inf/NaN and negatives: `"inf"` and `"-1"` both parse as f64 but
+        // are not visibilities, and would poison the comparisons downstream.
+        if !miles.is_finite() || miles < 0.0 {
+            return None;
+        }
+        Some(Visibility { miles, or_greater })
+    }
+
+    /// Compact display form: `"10+"`, `"6+"`, `"15"`, `"2.5"`.
+    ///
+    /// Whole numbers lose the decimal so the station-model plot stays legible at
+    /// small font sizes; the `+` is never dropped, since losing it is the bug
+    /// this type exists to prevent.
+    pub fn label(self) -> String {
+        let n = if self.miles.fract() == 0.0 {
+            format!("{:.0}", self.miles)
+        } else {
+            format!("{:.1}", self.miles)
+        };
+        if self.or_greater { format!("{n}+") } else { n }
+    }
+}
+
 /// A cloud layer from a METAR observation.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct CloudLayer {
@@ -63,8 +118,8 @@ pub struct MetarOb {
     pub wind_speed_kt: Option<u16>,
     /// Wind gust in knots (None if no gusts).
     pub wind_gust_kt: Option<u16>,
-    /// Visibility string (e.g. "10+" or "3").
-    pub visibility_mi: Option<f64>,
+    /// Horizontal visibility, preserving AWC's "or greater" marker.
+    pub visibility: Option<Visibility>,
     /// Altimeter setting in hectopascals (hPa).
     pub altimeter_hpa: Option<f64>,
     /// Flight category (VFR/MVFR/IFR/LIFR).

@@ -56,13 +56,8 @@ impl OverlayItem for MetarItem {
             kv.push(("Wind".into(), wind_text));
         }
 
-        if let Some(vis) = ob.visibility_mi {
-            let vis_str = if vis >= 10.0 {
-                "10+ mi".to_string()
-            } else {
-                format!("{vis:.1} mi")
-            };
-            kv.push(("Visibility".into(), vis_str));
+        if let Some(vis) = ob.visibility {
+            kv.push(("Visibility".into(), format!("{} mi", vis.label())));
         }
 
         if let Some(alt) = ob.altimeter_hpa {
@@ -368,5 +363,72 @@ impl OverlayHandler for MetarHandler {
         if let Some(enabled) = value.get("enabled").and_then(|v| v.as_bool()) {
             self.enabled = enabled;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metar::types::Visibility;
+    use rustdar_units::SpeedUnit;
+
+    fn ob(vis: Option<Visibility>) -> MetarOb {
+        MetarOb {
+            station_id: "KTST".into(),
+            name: "KTST".into(),
+            lat: 35.0,
+            lon: -97.0,
+            elev_m: None,
+            temp_c: None,
+            dewp_c: None,
+            wind_dir: None,
+            wind_speed_kt: None,
+            wind_gust_kt: None,
+            visibility: vis,
+            altimeter_hpa: None,
+            flight_category: None,
+            raw_ob: String::new(),
+            clouds: Vec::new(),
+            wx_string: None,
+            obs_time: String::new(),
+        }
+    }
+
+    /// The popup's key-value rows, flattened for assertion.
+    fn rows(ob: MetarOb) -> Vec<(String, String)> {
+        let prefs = UserPreferences { speed: SpeedUnit::Knots, ..Default::default() };
+        MetarItem { ob }
+            .popup_content(&prefs)
+            .sections
+            .into_iter()
+            .find_map(|s| match s {
+                PopupSection::KeyValueGrid(kv) => Some(kv),
+                _ => None,
+            })
+            .expect("popup must carry a key-value grid")
+    }
+
+    fn field(ob: MetarOb, key: &str) -> Option<String> {
+        rows(ob).into_iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    /// Formerly `if vis >= 10.0 { "10+ mi" }` — unreachable, because `10+` was
+    /// exactly the value that failed to parse and became `None`.
+    #[test]
+    fn the_popup_reports_unrestricted_visibility() {
+        let vis = Some(Visibility { miles: 10.0, or_greater: true });
+        assert_eq!(field(ob(vis), "Visibility").as_deref(), Some("10+ mi"));
+    }
+
+    /// A 15 SM measurement is not the same claim as "10 or better".
+    #[test]
+    fn the_popup_keeps_a_measurement_distinct_from_the_bound() {
+        let vis = Some(Visibility { miles: 15.0, or_greater: false });
+        assert_eq!(field(ob(vis), "Visibility").as_deref(), Some("15 mi"));
+    }
+
+    #[test]
+    fn the_popup_omits_visibility_when_the_station_reports_none() {
+        assert_eq!(field(ob(None), "Visibility"), None);
     }
 }
