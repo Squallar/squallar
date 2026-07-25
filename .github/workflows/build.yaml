@@ -13,26 +13,26 @@ concurrency:
 jobs:
   build:
     name: Build
-    runs-on: rustdar-runner-set
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install Rust
         run: rustup default stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
       - name: Build
         run: cargo build --all-targets --all-features --workspace
 
   build-success:
     name: Build success check
-    # Aggregate gate: one status check to require in branch protection, so a new
-    # job added above cannot fail silently. `always()` is what makes it real --
-    # without it this job would be skipped (not failed) whenever a dependency
-    # fails, and a skipped check does not block.
-    #
-    # `needs` cannot cross workflows, so Clippy (clippy.yaml) is intentionally
-    # not covered here and must be required separately.
     if: always()
-    runs-on: rustdar-runner-set
+    runs-on: ubuntu-24.04
     needs: [build]
     steps:
       - name: Report job results
@@ -40,8 +40,6 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
         run: echo "$NEEDS"
-      # Expression-based rather than jq-based so this gate has no dependency on
-      # what happens to be installed in the runner image.
       - name: Fail if any job did not succeed
         if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}
         shell: bash

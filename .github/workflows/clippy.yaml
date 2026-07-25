@@ -14,7 +14,7 @@ concurrency:
 jobs:
   clippy:
     name: Clippy
-    runs-on: rustdar-runner-set
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -31,9 +31,14 @@ jobs:
         run: |
           rustup default stable
           rustup component add clippy
-
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features --fix || true
       - uses: stefanzweifel/git-auto-commit-action@04702edda442b2e678b25b537cec683a1493fcb9 # v7.1.0
