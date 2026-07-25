@@ -1,6 +1,6 @@
 //! Fetch GLM lightning flash data from AWS S3.
 //!
-//! Lists and downloads NetCDF4 files from the `noaa-goes16`/`noaa-goes18`
+//! Lists and downloads NetCDF4 files from the `noaa-goes19`/`noaa-goes18`
 //! public S3 buckets. Files are LCFA (Lightning Cluster-Filter Algorithm)
 //! Level 2 products, each covering ~20 seconds.
 
@@ -193,8 +193,9 @@ async fn list_glm_files(
 
 /// Parse the start timestamp from a GLM filename.
 ///
-/// Filename: `OR_GLM-L2-LCFA_G16_s20261120145200_e...nc`
+/// Filename: `OR_GLM-L2-LCFA_G19_s20261120145200_e...nc`
 /// The `s` field is `YYYYDDDHHMMSSf` where DDD = day of year, f = tenths of second.
+/// The `G{nn}` satellite token is not inspected, so this works for any GOES bird.
 fn parse_filename_start_time(key: &str) -> Option<NaiveDateTime> {
     // Find the `_s` field in the filename
     let filename = key.rsplit('/').next()?;

@@ -91,9 +91,9 @@ pub(crate) enum SatelliteSelection {
 impl SatelliteSelection {
     fn to_satellites(self) -> Vec<GlmSatellite> {
         match self {
-            SatelliteSelection::East => vec![GlmSatellite::Goes16East],
-            SatelliteSelection::West => vec![GlmSatellite::Goes18West],
-            SatelliteSelection::Both => vec![GlmSatellite::Goes16East, GlmSatellite::Goes18West],
+            SatelliteSelection::East => vec![GlmSatellite::GoesEast],
+            SatelliteSelection::West => vec![GlmSatellite::GoesWest],
+            SatelliteSelection::Both => vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
         }
     }
 
@@ -320,7 +320,7 @@ impl OverlayHandler for GlmHandler {
                 id: "satellite",
                 label: "Satellite".into(),
                 options: vec![
-                    ("east".into(), "GOES-16 (East)".into()),
+                    ("east".into(), "GOES-19 (East)".into()),
                     ("west".into(), "GOES-18 (West)".into()),
                     ("both".into(), "Both".into()),
                 ],

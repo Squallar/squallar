@@ -1,35 +1,41 @@
 //! GOES GLM (Geostationary Lightning Mapper) data types and fetch logic.
 //!
 //! Fetches Level 2 LCFA (Lightning Cluster-Filter Algorithm) flash data from
-//! the public `noaa-goes16` and `noaa-goes18` AWS S3 buckets. Each NetCDF4
+//! the public `noaa-goes19` and `noaa-goes18` AWS S3 buckets. Each NetCDF4
 //! file covers ~20 seconds of data; we aggregate flashes over a configurable
 //! time window (default 5 minutes).
 
 pub mod fetch;
 
-/// Which GOES satellite to fetch GLM data from.
+/// Which GOES orbital slot to fetch GLM data from.
+///
+/// Variants name the *slot*, not the spacecraft: NOAA rotates satellites through
+/// the East/West positions (GOES-19 replaced GOES-16 as GOES-East in April 2025),
+/// and the bucket must follow the operational satellite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GlmSatellite {
-    /// GOES-16 (GOES-East), covering roughly -25°W to -105°W.
-    Goes16East,
-    /// GOES-18 (GOES-West), covering roughly -105°W to 170°W.
-    Goes18West,
+    /// GOES-East (currently GOES-19), covering roughly -25°W to -105°W.
+    GoesEast,
+    /// GOES-West (currently GOES-18), covering roughly -105°W to 170°W.
+    GoesWest,
 }
 
 impl GlmSatellite {
-    /// S3 bucket name for this satellite.
+    /// S3 bucket name for the satellite currently operating this slot.
     pub fn bucket(self) -> &'static str {
         match self {
-            GlmSatellite::Goes16East => "noaa-goes16",
-            GlmSatellite::Goes18West => "noaa-goes18",
+            // GOES-16 was decommissioned as GOES-East in April 2025; the
+            // `noaa-goes16` bucket has no GLM data after 2025 day 097.
+            GlmSatellite::GoesEast => "noaa-goes19",
+            GlmSatellite::GoesWest => "noaa-goes18",
         }
     }
 
     /// Display name.
     pub fn display_name(self) -> &'static str {
         match self {
-            GlmSatellite::Goes16East => "GOES-16 (East)",
-            GlmSatellite::Goes18West => "GOES-18 (West)",
+            GlmSatellite::GoesEast => "GOES-19 (East)",
+            GlmSatellite::GoesWest => "GOES-18 (West)",
         }
     }
 }
