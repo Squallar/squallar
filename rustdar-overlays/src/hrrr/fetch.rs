@@ -1,9 +1,19 @@
 //! HRRR data fetching from NOAA NOMADS server-side filter.
 //!
 //! Uses the NOMADS filter CGI to download a single GRIB2 field (e.g. CIN)
-//! for the latest HRRR f00 (analysis) run, keeping download size small
-//! (~200-500 KB). Composite parameters (e.g. bulk shear) fetch multiple
-//! fields and merge them.
+//! from the latest available HRRR run. Most parameters come from f00 (the
+//! analysis); updraft helicity comes from f01 because its f00 accumulation
+//! window has zero length — see [`ModelParameter::forecast_hour`].
+//! Composite parameters (e.g. bulk shear) fetch multiple fields and merge
+//! them.
+//!
+//! Field selection (`var_*`/`lev_*`) is the only filtering that actually
+//! takes effect. NOMADS does **not** subset Lambert-conformal grids, so the
+//! `subregion`/`toplat`/`leftlon`/`rightlon`/`bottomlat` parameters below are
+//! inert: every response is the full 1799×1059 CONUS grid, 1.7–3.3 MB
+//! depending on the field's bit depth. That costs bandwidth but not
+//! correctness — `parse_grib2` derives bounds from the grid it is actually
+//! handed, never from the requested subregion.
 
 use chrono::{NaiveDate, NaiveDateTime, Timelike, Utc};
 use grib::{Grib2SubmessageDecoder, LatLons};
@@ -12,23 +22,41 @@ use super::{HrrrFetchResult, HrrrGridData, ModelParameter};
 use crate::types::GeoBounds;
 
 /// CONUS subregion bounds for the NOMADS filter request.
+///
+/// Inert for HRRR — see the module docs. Kept so the request still expresses
+/// the intended area of interest if NOMADS ever gains Lambert subsetting.
 const SUBREGION_TOP_LAT: f64 = 50.0;
 const SUBREGION_BOT_LAT: f64 = 20.0;
 const SUBREGION_LEFT_LON: f64 = -130.0;
 const SUBREGION_RIGHT_LON: f64 = -60.0;
 
 /// Build the NOMADS filter URL for a specific HRRR run and parameter.
+///
+/// The forecast hour comes from the parameter, not the caller: it is a
+/// property of what the field *means*, not of when we happen to ask.
 fn nomads_url(param: &ModelParameter, run_hour: u8, date: NaiveDate) -> String {
-    nomads_url_raw(param.nomads_var(), param.nomads_level(), run_hour, date)
+    nomads_url_raw(
+        param.nomads_var(),
+        param.nomads_level(),
+        run_hour,
+        date,
+        param.forecast_hour(),
+    )
 }
 
 /// Build a NOMADS filter URL from explicit var/lev strings.
-fn nomads_url_raw(var: &str, lev: &str, run_hour: u8, date: NaiveDate) -> String {
+fn nomads_url_raw(
+    var: &str,
+    lev: &str,
+    run_hour: u8,
+    date: NaiveDate,
+    forecast_hour: u8,
+) -> String {
     let date_str = date.format("%Y%m%d");
     format!(
         "https://nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_2d.pl\
          ?dir=%2Fhrrr.{date_str}%2Fconus\
-         &file=hrrr.t{run_hour:02}z.wrfsfcf00.grib2\
+         &file=hrrr.t{run_hour:02}z.wrfsfcf{forecast_hour:02}.grib2\
          &{var}=on\
          &{lev}=on\
          &subregion=\
@@ -78,14 +106,30 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
         .map_err(|e| format!("Cannot determine grid shape: {e}"))?;
 
     // Extract reference time before consuming the submessage for decoding.
+    //
+    // A malformed reference time is a hard error, not something to paper over.
+    // These previously fell back to `unwrap_or_default()`, i.e. 1970-01-01
+    // 00:00, which the pane control renders as "Model Data (00:00z)" — stale
+    // or corrupt data made to look merely oddly-timed. Refusing the message
+    // surfaces it as a fetch failure instead.
     let raw_time = submessage.temporal_raw_info();
     let t = &raw_time.ref_time_unchecked;
-    let ref_time = NaiveDateTime::new(
-        NaiveDate::from_ymd_opt(t.year as i32, t.month as u32, t.day as u32)
-            .unwrap_or_default(),
+    let ref_date = NaiveDate::from_ymd_opt(t.year as i32, t.month as u32, t.day as u32)
+        .ok_or_else(|| {
+            format!(
+                "GRIB2 reference date is not a real date: {}-{:02}-{:02}",
+                t.year, t.month, t.day
+            )
+        })?;
+    let ref_clock =
         chrono::NaiveTime::from_hms_opt(t.hour as u32, t.minute as u32, t.second as u32)
-            .unwrap_or_default(),
-    );
+            .ok_or_else(|| {
+                format!(
+                    "GRIB2 reference time is not a real time: {:02}:{:02}:{:02}",
+                    t.hour, t.minute, t.second
+                )
+            })?;
+    let ref_time = NaiveDateTime::new(ref_date, ref_clock);
 
     // Decode data values (may consume the submessage).
     let decoder =
@@ -125,6 +169,8 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
         max_lon,
     };
 
+    let (visible_points, value_range) = super::summarize_values(&values, param);
+
     Ok(HrrrGridData {
         parameter: param,
         values,
@@ -134,6 +180,9 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
         nj,
         bounds,
         ref_time,
+        forecast_hour: param.forecast_hour(),
+        visible_points,
+        value_range,
     })
 }
 
@@ -253,7 +302,7 @@ async fn try_fetch_composite(
     let mut grids: Vec<HrrrGridData> = Vec::with_capacity(parts.len());
 
     for (var, lev) in parts {
-        let url = nomads_url_raw(var, lev, hour, date);
+        let url = nomads_url_raw(var, lev, hour, date, param.forecast_hour());
         log::info!("Fetching HRRR composite component {var} {lev} from {url}");
 
         let response = client
@@ -299,6 +348,11 @@ async fn try_fetch_composite(
         .map(|(&u, &v)| (u * u + v * v).sqrt())
         .collect();
 
+    // Recomputed from the merged magnitudes: the summary each component grid
+    // carries describes that component alone, which says nothing about the
+    // vector magnitude the user actually sees.
+    let (visible_points, value_range) = super::summarize_values(&values, *param);
+
     Ok(HrrrGridData {
         parameter: *param,
         values,
@@ -308,5 +362,236 @@ async fn try_fetch_composite(
         nj: base.nj,
         bounds: base.bounds,
         ref_time: base.ref_time,
+        forecast_hour: base.forecast_hour,
+        visible_points,
+        value_range,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn url_for(param: ModelParameter) -> String {
+        nomads_url(&param, 3, NaiveDate::from_ymd_opt(2026, 7, 25).unwrap())
+    }
+
+    /// The exact level spellings HRRR uses. Taken verbatim from a real
+    /// `hrrr.t03z.wrfsfcf01.grib2.idx`:
+    ///
+    /// ```text
+    /// 45:...:MXUPHL:5000-2000 m above ground:0-1 hour max fcst:
+    /// 47:...:MXUPHL:2000-0 m above ground:0-1 hour max fcst:
+    /// ```
+    ///
+    /// NOMADS matches these literally. The ascending spellings this code
+    /// shipped with — `2000-5000` and `0-2000` — match no record and the
+    /// filter CGI answers HTTP 500 `invalid parameter`, which is why both UH
+    /// parameters were 100% broken.
+    #[test]
+    fn uh_level_strings_use_hrrrs_descending_bound_order() {
+        assert_eq!(
+            ModelParameter::MaxUH2to5km.nomads_level(),
+            "lev_5000-2000_m_above_ground",
+        );
+        assert_eq!(
+            ModelParameter::MaxUH0to2km.nomads_level(),
+            "lev_2000-0_m_above_ground",
+        );
+    }
+
+    /// Every parameter's `var_`/`lev_` pair, derived from the record it must
+    /// select in a real `hrrr.t03z.wrfsfcf00.grib2.idx` (UH from the `f01`
+    /// index, which spells its levels identically).
+    ///
+    /// There is no rule to infer here, which is the whole trap: HRRR orders
+    /// layer bounds inconsistently between fields — `HLCY:3000-0` and
+    /// `MXUPHL:5000-2000` put the top first, while `VUCSH:0-6000` and
+    /// `CAPE:0-3000 m` put the bottom first — and NOMADS matches the string
+    /// literally, with no near-miss handling. A level spelling can therefore
+    /// only be validated against the index verbatim.
+    const IDX_RECORDS: &[(ModelParameter, &str, &str)] = &[
+        (ModelParameter::SurfaceBasedCin, "CIN", "surface"),
+        (ModelParameter::MixedLayerCin, "CIN", "180-0 mb above ground"),
+        (ModelParameter::SurfaceBasedCape, "CAPE", "surface"),
+        (ModelParameter::MixedLayerCape, "CAPE", "180-0 mb above ground"),
+        (ModelParameter::MostUnstableCape, "CAPE", "255-0 mb above ground"),
+        (ModelParameter::LiftedIndex, "LFTX", "500-1000 mb"),
+        (ModelParameter::Srh1km, "HLCY", "1000-0 m above ground"),
+        (ModelParameter::Srh3km, "HLCY", "3000-0 m above ground"),
+        (ModelParameter::MaxUH2to5km, "MXUPHL", "5000-2000 m above ground"),
+        (ModelParameter::MaxUH0to2km, "MXUPHL", "2000-0 m above ground"),
+        (ModelParameter::SurfaceWindGust, "GUST", "surface"),
+        (
+            ModelParameter::PrecipitableWater,
+            "PWAT",
+            "entire atmosphere (considered as a single layer)",
+        ),
+        (ModelParameter::Temperature2m, "TMP", "2 m above ground"),
+        (ModelParameter::Dewpoint2m, "DPT", "2 m above ground"),
+        (ModelParameter::Visibility, "VIS", "surface"),
+    ];
+
+    /// NOMADS' filter query encodes an index field exactly as it appears in
+    /// the `.idx`, with spaces replaced by underscores.
+    fn as_query_terms(var: &str, level: &str) -> (String, String) {
+        (format!("var_{var}"), format!("lev_{}", level.replace(' ', "_")))
+    }
+
+    /// Pins every non-composite parameter to the index record it selects.
+    #[test]
+    fn every_parameter_selects_a_real_index_record() {
+        for &(param, var, level) in IDX_RECORDS {
+            let (want_var, want_lev) = as_query_terms(var, level);
+            assert_eq!(
+                param.nomads_var(),
+                want_var,
+                "{} must select `{var}:{level}`",
+                param.display_name(),
+            );
+            assert_eq!(
+                param.nomads_level(),
+                want_lev,
+                "{} must select `{var}:{level}`",
+                param.display_name(),
+            );
+        }
+    }
+
+    /// The table above is only a guard if it covers everything.
+    #[test]
+    fn the_index_table_covers_every_non_composite_parameter() {
+        for param in ModelParameter::all() {
+            if param.is_composite() {
+                continue;
+            }
+            assert!(
+                IDX_RECORDS.iter().any(|&(p, _, _)| p == *param),
+                "{} is not pinned to an index record",
+                param.display_name(),
+            );
+        }
+    }
+
+    /// Composite components select real index records too.
+    #[test]
+    fn composite_components_select_real_index_records() {
+        let parts = ModelParameter::BulkShear6km.composite_parts().unwrap();
+        let expected = [
+            ("VUCSH", "0-6000 m above ground"),
+            ("VVCSH", "0-6000 m above ground"),
+        ];
+        assert_eq!(parts.len(), expected.len());
+        for (&(got_var, got_lev), (var, level)) in parts.iter().zip(expected) {
+            let (want_var, want_lev) = as_query_terms(var, level);
+            assert_eq!(got_var, want_var);
+            assert_eq!(got_lev, want_lev);
+        }
+    }
+
+    /// f00 `MXUPHL` is a `0-0 day max fcst` — a maximum over a zero-length
+    /// window, which is identically 0.0 everywhere. Fixing only the level
+    /// string would turn an HTTP 500 into a permanently blank overlay, so the
+    /// request has to name a forecast hour with a real accumulation window.
+    #[test]
+    fn uh_requests_a_forecast_hour_with_a_nonzero_window() {
+        for param in [ModelParameter::MaxUH2to5km, ModelParameter::MaxUH0to2km] {
+            assert!(
+                param.forecast_hour() > 0,
+                "{} must not come from f00: its accumulation window there has \
+                 zero length and the field is constant 0.0",
+                param.display_name(),
+            );
+            assert!(param.is_windowed());
+        }
+    }
+
+    /// Everything else is instantaneous, so f00 is both valid and freshest.
+    #[test]
+    fn non_windowed_parameters_still_come_from_the_analysis() {
+        for param in ModelParameter::all() {
+            if param.is_windowed() {
+                continue;
+            }
+            assert_eq!(
+                param.forecast_hour(),
+                0,
+                "{} is instantaneous and should come from f00",
+                param.display_name(),
+            );
+        }
+    }
+
+    /// The forecast hour must reach the `file=` term; if it does not, the UH
+    /// fix silently reverts to the constant-zero f00 message.
+    #[test]
+    fn url_file_term_carries_the_parameters_forecast_hour() {
+        assert!(
+            url_for(ModelParameter::MaxUH2to5km).contains("wrfsfcf01.grib2"),
+            "UH must request f01",
+        );
+        assert!(
+            url_for(ModelParameter::MaxUH0to2km).contains("wrfsfcf01.grib2"),
+            "UH must request f01",
+        );
+        assert!(
+            url_for(ModelParameter::SurfaceBasedCin).contains("wrfsfcf00.grib2"),
+            "instantaneous fields must request f00",
+        );
+    }
+
+    #[test]
+    fn url_carries_run_date_hour_var_and_level() {
+        let url = url_for(ModelParameter::MaxUH2to5km);
+        assert!(url.contains("hrrr.20260725"), "{url}");
+        assert!(url.contains("hrrr.t03z."), "{url}");
+        assert!(url.contains("var_MXUPHL=on"), "{url}");
+        assert!(url.contains("lev_5000-2000_m_above_ground=on"), "{url}");
+    }
+
+    /// Composite components are fetched through a separate URL builder, which
+    /// must apply the same forecast hour rather than defaulting to f00.
+    #[test]
+    fn composite_components_share_the_parameters_forecast_hour() {
+        let param = ModelParameter::BulkShear6km;
+        let date = NaiveDate::from_ymd_opt(2026, 7, 25).unwrap();
+        for (var, lev) in param.composite_parts().unwrap() {
+            let url = nomads_url_raw(var, lev, 3, date, param.forecast_hour());
+            assert!(url.contains("wrfsfcf00.grib2"), "{url}");
+            assert!(url.contains(&format!("{var}=on")), "{url}");
+        }
+    }
+
+    /// Live end-to-end check against NOMADS. Ignored by default so CI stays
+    /// offline; this is the check that would have caught the original bug,
+    /// since every offline assertion above is only as good as the level
+    /// spellings being right.
+    ///
+    /// Run with: `cargo test -p rustdar-overlays -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "hits the live NOMADS filter CGI"]
+    async fn live_uh_fetch_returns_a_non_constant_field() {
+        let client = reqwest::Client::new();
+        for param in [ModelParameter::MaxUH2to5km, ModelParameter::MaxUH0to2km] {
+            let grid = match fetch_hrrr_data(&client, &param).await.0 {
+                Ok(g) => g,
+                Err(e) => panic!("{} fetch failed: {e}", param.display_name()),
+            };
+            let (lo, hi) = grid.value_range.expect("finite values");
+            println!(
+                "{}: f{:02}, {} pts, range {lo}..{hi}, {} visible",
+                param.display_name(),
+                grid.forecast_hour,
+                grid.values.len(),
+                grid.visible_points,
+            );
+            assert!(
+                lo < hi,
+                "{} decoded as a constant field ({lo}) — this is the f00 \
+                 zero-window failure the forecast-hour fix exists to avoid",
+                param.display_name(),
+            );
+            assert!(grid.blank_notice().is_none(), "{}", param.display_name());
+        }
+    }
 }

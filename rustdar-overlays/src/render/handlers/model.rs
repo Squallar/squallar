@@ -20,6 +20,9 @@ pub(crate) struct ModelDataHandler {
     pub selected_param: ModelParameter,
     /// Per-parameter grid cache so different panes can render different parameters.
     pub cached_grids: HashMap<ModelParameter, Arc<HrrrGridData>>,
+    /// Last fetch error, surfaced in the controls so a failed fetch is not
+    /// visible only in the log. Cleared by the next success.
+    pub last_error: Option<String>,
 }
 
 impl ModelDataHandler {
@@ -29,6 +32,7 @@ impl ModelDataHandler {
             enabled: false,
             selected_param: ModelParameter::SurfaceBasedCin,
             cached_grids: HashMap::new(),
+            last_error: None,
         }
     }
 }
@@ -108,13 +112,18 @@ impl OverlayHandler for ModelDataHandler {
                     grid.nj,
                     grid.values.len(),
                 );
+                if let Some(notice) = grid.blank_notice() {
+                    log::warn!("HRRR {}: {notice}", grid.parameter.short_name());
+                }
                 let param = grid.parameter;
                 let arc = Arc::new(grid);
                 self.cached_grids.insert(param, arc.clone());
                 self.state.set_data(Some(arc));
+                self.last_error = None;
             }
             Err(e) => {
                 log::error!("HRRR fetch failed: {e}");
+                self.last_error = Some(e);
             }
         }
         self.state.fetching = false;
@@ -202,11 +211,23 @@ impl OverlayHandler for ModelDataHandler {
     }
 
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
-        let label = if let Some(grid) = self.cached_grids.get(&self.selected_param) {
-            let time_str = grid.ref_time.format("%H:%Mz").to_string();
-            format!("\u{1f321}\u{fe0f}  Model Data ({time_str})")
-        } else {
-            "\u{1f321}\u{fe0f}  Model Data".to_string()
+        let grid = self.cached_grids.get(&self.selected_param);
+
+        // The toggle label carries the timestamp, so it is the one place a
+        // forecast-hour difference must not be hidden: showing a 0-1 h
+        // maximum's run time alone would read as an analysis valid *now*.
+        // Label f01+ with its valid time and the F-hour explicitly.
+        let label = match grid {
+            Some(g) if g.forecast_hour > 0 => format!(
+                "\u{1f321}\u{fe0f}  Model Data ({} F{:02})",
+                g.valid_time().format("%H:%Mz"),
+                g.forecast_hour,
+            ),
+            Some(g) => format!(
+                "\u{1f321}\u{fe0f}  Model Data ({})",
+                g.ref_time.format("%H:%Mz")
+            ),
+            None => "\u{1f321}\u{fe0f}  Model Data".to_string(),
         };
 
         let mut items = vec![ControlItem::Toggle {
@@ -248,6 +269,38 @@ impl OverlayHandler for ModelDataHandler {
                     format!("Updated {}m ago", secs / 60)
                 };
                 items.push(ControlItem::InfoText { text });
+            }
+
+            // A fetch that failed leaves the previous parameter's grid on
+            // screen, or nothing at all. Neither says "this is broken", so
+            // the log was the only place the HTTP 500 that made both UH
+            // parameters useless ever appeared.
+            if let Some(err) = &self.last_error {
+                items.push(ControlItem::InfoText {
+                    text: format!("\u{26a0} {err}"),
+                });
+            }
+
+            if let Some(grid) = self.cached_grids.get(&self.selected_param) {
+                // Windowed fields are maxima over a period, not readings at an
+                // instant. The F-hour in the label says *when*; this says
+                // *what*, because "UH2-5 at 04:00z" still invites reading it
+                // as a snapshot.
+                if grid.forecast_hour > 0 && self.selected_param.is_windowed() {
+                    items.push(ControlItem::InfoText {
+                        text: format!(
+                            "\u{2139} Maximum over {}\u{2013}{}, not an analysis field",
+                            grid.ref_time.format("%H:%Mz"),
+                            grid.valid_time().format("%H:%Mz"),
+                        ),
+                    });
+                }
+
+                // The failure this whole change exists to prevent: a grid that
+                // fetched and decoded perfectly, and paints nothing.
+                if let Some(notice) = grid.blank_notice() {
+                    items.push(ControlItem::InfoText { text: notice });
+                }
             }
         }
 

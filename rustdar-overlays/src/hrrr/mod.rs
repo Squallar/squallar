@@ -1,9 +1,12 @@
 //! HRRR model data fetch and types.
 //!
-//! Fetches HRRR f00 (analysis) fields from NOAA NOMADS server-side filter.
-//! Supports CIN, CAPE, SRH, bulk shear, wind gusts, lifted index, PWAT,
-//! temperature, dewpoint, updraft helicity, and visibility via the
-//! `ModelParameter` enum.
+//! Fetches HRRR fields from the NOAA NOMADS server-side filter. Supports CIN,
+//! CAPE, SRH, bulk shear, wind gusts, lifted index, PWAT, temperature,
+//! dewpoint, updraft helicity, and visibility via the `ModelParameter` enum.
+//!
+//! Most parameters are instantaneous and come from f00 (the analysis). The
+//! updraft-helicity parameters are *accumulations* and cannot: see
+//! [`ModelParameter::forecast_hour`].
 
 pub mod fetch;
 
@@ -81,6 +84,41 @@ impl ModelParameter {
         ]
     }
 
+    /// Which forecast hour of the run to fetch this parameter from.
+    ///
+    /// Nearly everything here is an instantaneous field, so f00 — the
+    /// analysis — is both available and the freshest possible answer.
+    ///
+    /// Updraft helicity is not instantaneous. `MXUPHL` is a *maximum over the
+    /// forecast period*, and at f00 that period has zero length: the `.idx`
+    /// entry reads `0-0 day max fcst`, and the message NOMADS returns is 212
+    /// bytes of GRIB2 whose Section 5 carries `nbits=0, R=0.0, E=0, D=0` — a
+    /// constant field of exactly 0.0 at all 1,905,141 points. It decodes
+    /// cleanly and renders as nothing at all, forever.
+    ///
+    /// f01 is the first forecast hour with a real accumulation window
+    /// (`0-1 hour max fcst`), so that is where UH has to come from. This costs
+    /// one hour of latency relative to the other parameters, which is why
+    /// [`HrrrGridData::forecast_hour`] is carried through to the UI rather
+    /// than being quietly dropped — a 0-1 h maximum must not be presented as
+    /// if it were the analysis.
+    pub fn forecast_hour(&self) -> u8 {
+        match self {
+            ModelParameter::MaxUH2to5km | ModelParameter::MaxUH0to2km => 1,
+            _ => 0,
+        }
+    }
+
+    /// Whether this parameter is an accumulation/maximum over a time window
+    /// rather than an instantaneous value. Such fields are only meaningful
+    /// from a forecast hour with a nonzero window (see `forecast_hour`).
+    pub fn is_windowed(&self) -> bool {
+        matches!(
+            self,
+            ModelParameter::MaxUH2to5km | ModelParameter::MaxUH0to2km
+        )
+    }
+
     /// Whether this parameter requires multiple NOMADS fetches that are
     /// merged into a single grid (e.g. U+V shear components → magnitude).
     pub fn is_composite(&self) -> bool {
@@ -137,8 +175,20 @@ impl ModelParameter {
             ModelParameter::LiftedIndex => "lev_500-1000_mb",
             ModelParameter::Srh1km => "lev_1000-0_m_above_ground",
             ModelParameter::Srh3km => "lev_3000-0_m_above_ground",
-            ModelParameter::MaxUH2to5km => "lev_2000-5000_m_above_ground",
-            ModelParameter::MaxUH0to2km => "lev_0-2000_m_above_ground",
+            // HRRR declares the MXUPHL layers top-bound-first — the `.idx`
+            // reads `MXUPHL:5000-2000 m above ground` and `MXUPHL:2000-0 m
+            // above ground`. NOMADS matches the level string literally, so the
+            // ascending spellings these once used ("2000-5000", "0-2000")
+            // selected no record and the filter CGI answered HTTP 500
+            // `invalid parameter` on every request.
+            //
+            // Do not "normalise" these to match the ascending layers elsewhere
+            // in this match: HRRR is not self-consistent about bound order
+            // (`VUCSH:0-6000` and `CAPE:0-3000 m` are bottom-first, `HLCY:3000-0`
+            // and these are top-first), so each spelling is only correct
+            // against the index record it selects.
+            ModelParameter::MaxUH2to5km => "lev_5000-2000_m_above_ground",
+            ModelParameter::MaxUH0to2km => "lev_2000-0_m_above_ground",
             ModelParameter::PrecipitableWater => {
                 "lev_entire_atmosphere_(considered_as_a_single_layer)"
             }
@@ -250,10 +300,20 @@ impl ModelParameter {
     }
 
     /// Format a grid value (in raw GRIB2 units) for hover tooltip display.
+    ///
+    /// Returns an empty string for a non-finite value: a missing grid point
+    /// has no reading to report.
     pub fn format_value(&self, value: f32) -> String {
-        if value.is_nan() {
+        if !value.is_finite() {
             return String::new();
         }
+        format!("{}: {}", self.short_name(), self.format_magnitude(value))
+    }
+
+    /// Format a grid value (raw GRIB2 units) as a bare magnitude with units,
+    /// e.g. `"0 m²/s²"` — no parameter name. Used where the parameter is
+    /// already named by surrounding text.
+    pub fn format_magnitude(&self, value: f32) -> String {
         let display = self.convert_for_display(value);
         match self {
             // 0 decimal places for most.
@@ -270,15 +330,15 @@ impl ModelParameter {
             | ModelParameter::SurfaceWindGust
             | ModelParameter::Temperature2m
             | ModelParameter::Dewpoint2m => {
-                format!("{}: {:.0} {}", self.short_name(), display, self.unit_label())
+                format!("{:.0} {}", display, self.unit_label())
             }
             // 1 decimal for LI.
             ModelParameter::LiftedIndex => {
-                format!("{}: {:.1} {}", self.short_name(), display, self.unit_label())
+                format!("{:.1} {}", display, self.unit_label())
             }
             // 2 decimal places for PWAT / visibility.
             ModelParameter::PrecipitableWater | ModelParameter::Visibility => {
-                format!("{}: {:.2} {}", self.short_name(), display, self.unit_label())
+                format!("{:.2} {}", display, self.unit_label())
             }
         }
     }
@@ -714,9 +774,205 @@ pub struct HrrrGridData {
     pub nj: usize,
     /// Geographic bounds enclosing all grid points.
     pub bounds: GeoBounds,
-    /// Model reference time (UTC).
+    /// Model reference time (UTC) — the run time, not the valid time.
     pub ref_time: chrono::NaiveDateTime,
+    /// Forecast hour this grid came from. 0 is the analysis; see
+    /// [`ModelParameter::forecast_hour`] for why UH is not 0.
+    pub forecast_hour: u8,
+    /// How many grid points map to a non-transparent colour, i.e. how many
+    /// will actually be painted. Computed once at parse time by
+    /// [`summarize_values`]; see [`HrrrGridData::blank_notice`].
+    pub visible_points: usize,
+    /// `(min, max)` over the finite values, or `None` if none are finite.
+    pub value_range: Option<(f32, f32)>,
+}
+
+impl HrrrGridData {
+    /// Valid time of this grid: the run time plus the forecast hour.
+    pub fn valid_time(&self) -> chrono::NaiveDateTime {
+        self.ref_time + chrono::Duration::hours(self.forecast_hour as i64)
+    }
+
+    /// Explain why this grid will render as nothing, when it will.
+    ///
+    /// A field that decodes perfectly but paints zero pixels is
+    /// indistinguishable on screen from a fetch that never happened, and that
+    /// ambiguity is precisely how a dead feed survives unnoticed. Anything
+    /// that reaches here has already parsed, so the honest report is not "it
+    /// broke" but "here is what the data says, and it says nothing" —
+    /// distinguishing a genuinely uniform field from one that merely never
+    /// crosses the lowest colour threshold, because those mean different
+    /// things to a forecaster.
+    ///
+    /// Returns `None` when at least one point is visible.
+    pub fn blank_notice(&self) -> Option<String> {
+        if self.visible_points > 0 {
+            return None;
+        }
+        let name = self.parameter.short_name();
+        Some(match self.value_range {
+            None => format!("\u{26a0} {name}: no usable values in the grid"),
+            Some((lo, hi)) if lo == hi => format!(
+                "\u{26a0} {name} is uniformly {} across all {} points \u{2014} nothing to draw",
+                self.parameter.format_magnitude(lo),
+                self.values.len(),
+            ),
+            Some((lo, hi)) => format!(
+                "\u{26a0} {name} never reaches the lowest colour threshold (range {} to {}) \u{2014} nothing to draw",
+                self.parameter.format_magnitude(lo),
+                self.parameter.format_magnitude(hi),
+            ),
+        })
+    }
+}
+
+/// Scan decoded grid values once for the render-coverage summary stored on
+/// [`HrrrGridData`]: how many points will actually be painted, and the range
+/// of the finite values.
+///
+/// Non-finite points are excluded from the range and never counted as
+/// visible — they are missing data, not readings.
+pub fn summarize_values(
+    values: &[f32],
+    param: ModelParameter,
+) -> (usize, Option<(f32, f32)>) {
+    let mut visible = 0usize;
+    let mut range: Option<(f32, f32)> = None;
+    for &v in values {
+        if !v.is_finite() {
+            continue;
+        }
+        if param.color_for_value(v)[3] != 0 {
+            visible += 1;
+        }
+        range = Some(match range {
+            Some((lo, hi)) => (lo.min(v), hi.max(v)),
+            None => (v, v),
+        });
+    }
+    (visible, range)
 }
 
 /// Type-erased fetch result wrapper for the overlay handler.
 pub struct HrrrFetchResult(pub Result<HrrrGridData, String>);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a 2×2 grid of `values` for `param`, summarised the same way the
+    /// fetch path summarises a real one.
+    fn grid(param: ModelParameter, values: Vec<f32>) -> HrrrGridData {
+        let n = values.len();
+        let (visible_points, value_range) = summarize_values(&values, param);
+        HrrrGridData {
+            parameter: param,
+            values,
+            lats: vec![35.0; n],
+            lons: vec![-97.0; n],
+            ni: n,
+            nj: 1,
+            bounds: GeoBounds {
+                min_lat: 35.0,
+                max_lat: 35.0,
+                min_lon: -97.0,
+                max_lon: -97.0,
+            },
+            ref_time: chrono::NaiveDate::from_ymd_opt(2026, 7, 25)
+                .unwrap()
+                .and_hms_opt(3, 0, 0)
+                .unwrap(),
+            forecast_hour: param.forecast_hour(),
+            visible_points,
+            value_range,
+        }
+    }
+
+    /// The f00 failure mode, reproduced: `MXUPHL` at f00 decodes to exactly
+    /// 0.0 at every point. It must announce itself rather than rendering an
+    /// empty map with no explanation.
+    #[test]
+    fn a_uniformly_zero_field_says_so_instead_of_rendering_nothing() {
+        let g = grid(ModelParameter::MaxUH2to5km, vec![0.0; 4]);
+        assert_eq!(g.visible_points, 0);
+        let notice = g.blank_notice().expect("blank grid must explain itself");
+        assert!(notice.contains("UH2-5"), "{notice}");
+        assert!(notice.contains("uniformly"), "{notice}");
+        assert!(notice.contains("0 m\u{b2}/s\u{b2}"), "{notice}");
+    }
+
+    /// A varying field that never crosses the lowest colour threshold is also
+    /// blank, but means something different — and must not be reported as
+    /// uniform.
+    #[test]
+    fn a_below_threshold_field_reports_its_range_not_uniformity() {
+        // uh_color is transparent below 25 m²/s².
+        let g = grid(ModelParameter::MaxUH2to5km, vec![1.0, 5.0, 9.0, 24.0]);
+        assert_eq!(g.visible_points, 0);
+        let notice = g.blank_notice().expect("blank grid must explain itself");
+        assert!(notice.contains("never reaches"), "{notice}");
+        assert!(notice.contains("1 m\u{b2}/s\u{b2}"), "{notice}");
+        assert!(notice.contains("24 m\u{b2}/s\u{b2}"), "{notice}");
+        assert!(!notice.contains("uniformly"), "{notice}");
+    }
+
+    /// A grid with anything visible is not blank and must stay quiet.
+    #[test]
+    fn a_field_with_visible_points_produces_no_notice() {
+        let g = grid(ModelParameter::MaxUH2to5km, vec![0.0, 0.0, 0.0, 120.0]);
+        assert_eq!(g.visible_points, 1);
+        assert_eq!(g.blank_notice(), None);
+    }
+
+    /// An all-missing grid has no range to report and must not claim one.
+    #[test]
+    fn an_all_nan_field_reports_no_usable_values() {
+        let g = grid(ModelParameter::MaxUH2to5km, vec![f32::NAN; 4]);
+        assert_eq!(g.visible_points, 0);
+        assert_eq!(g.value_range, None);
+        let notice = g.blank_notice().expect("blank grid must explain itself");
+        assert!(notice.contains("no usable values"), "{notice}");
+    }
+
+    #[test]
+    fn summarize_values_ignores_non_finite_points() {
+        let values = vec![f32::NAN, 100.0, f32::INFINITY, 200.0];
+        let (visible, range) = summarize_values(&values, ModelParameter::MaxUH2to5km);
+        assert_eq!(visible, 2, "NaN/inf must never count as painted points");
+        assert_eq!(range, Some((100.0, 200.0)));
+    }
+
+    /// UH is a 0-1 h maximum valid an hour after the run, so the UI must be
+    /// able to show a valid time that differs from the reference time.
+    #[test]
+    fn valid_time_advances_by_the_forecast_hour() {
+        let uh = grid(ModelParameter::MaxUH2to5km, vec![50.0]);
+        assert_eq!(uh.ref_time.format("%H:%Mz").to_string(), "03:00z");
+        assert_eq!(uh.valid_time().format("%H:%Mz").to_string(), "04:00z");
+
+        let cin = grid(ModelParameter::SurfaceBasedCin, vec![-100.0]);
+        assert_eq!(cin.valid_time(), cin.ref_time, "f00 is valid at its run time");
+    }
+
+    /// `format_value` keeps its tooltip prefix; `format_magnitude` is the bare
+    /// reading the blank notice embeds mid-sentence.
+    #[test]
+    fn format_magnitude_omits_the_name_that_format_value_prepends() {
+        let p = ModelParameter::MaxUH2to5km;
+        assert_eq!(p.format_magnitude(120.0), "120 m\u{b2}/s\u{b2}");
+        assert_eq!(p.format_value(120.0), "UH2-5: 120 m\u{b2}/s\u{b2}");
+        assert_eq!(
+            ModelParameter::PrecipitableWater.format_magnitude(25.4),
+            "1.00 in",
+        );
+    }
+
+    /// A missing point has no reading to report.
+    #[test]
+    fn format_value_is_empty_for_non_finite_readings() {
+        for p in ModelParameter::all() {
+            assert_eq!(p.format_value(f32::NAN), "", "{}", p.display_name());
+            assert_eq!(p.format_value(f32::INFINITY), "", "{}", p.display_name());
+        }
+    }
+}
