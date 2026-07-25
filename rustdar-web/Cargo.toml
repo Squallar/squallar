@@ -21,6 +21,33 @@ edition.workspace = true
 # it on a native host.
 crate-type = ["cdylib", "rlib"]
 
+# wasm-opt has to be told which wasm proposals rustc already used, or it refuses
+# the module it is handed.
+#
+# `wasm32-unknown-unknown` enables six target features by default -- check with
+# `rustc --print cfg --target wasm32-unknown-unknown` -- and rustc emits the
+# corresponding opcodes freely. `memory.copy` (bulk-memory) is the one that shows
+# up first, as
+# `[wasm-validator error] memory.copy operations require bulk memory operations`.
+# binaryen only assumes the MVP unless told otherwise, so every one of the six is
+# re-declared here. They enable *validation* of instructions already in the
+# module; they do not ask wasm-opt to introduce anything new.
+#
+# Keep this list in step with rustc's defaults. A toolchain bump that turns on a
+# seventh feature will fail here in exactly the same way, and the fix is to add
+# the matching `--enable-` flag rather than to drop `wasm-opt`: skipping the
+# optimizer measurably slows Chromium down (see the notes in `lib.rs`).
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = [
+    "-O",
+    "--enable-bulk-memory",
+    "--enable-multivalue",
+    "--enable-mutable-globals",
+    "--enable-nontrapping-float-to-int",
+    "--enable-reference-types",
+    "--enable-sign-ext",
+]
+
 # Deliberately not browser-gated, though everything that *calls* them is.
 #
 # The parts of this crate that are pure logic — how a logical config key maps

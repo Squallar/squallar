@@ -26,6 +26,14 @@ rustdar-gps = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 chrono = { workspace = true }
 egui = { workspace = true }
+# Defaults are off at the workspace level, because egui-wgpu's `default` set
+# contains `wgpu/default` -- and that contains `webgpu`, which this build must
+# never enable (see the workspace `wgpu` pin). Its other two default entries are
+# genuinely wanted, but both are dead outside one target, so they are requested
+# from the target sections below rather than everywhere:
+# `macos-window-resize-jitter-fix` is read only under
+# `cfg(all(target_os = "macos", feature = ...))`, and
+# `fragile-send-sync-non-atomic-wasm` only under `cfg(target_arch = "wasm32")`.
 egui-wgpu = { workspace = true, features = ["winit"] }
 log = { workspace = true }
 # No `nexrad-data` here: the only thing this crate ever used from it was
@@ -35,7 +43,19 @@ nexrad-model = { workspace = true }
 nexrad-level3 = { workspace = true }
 pollster = { workspace = true }
 winit = { workspace = true }
-wgpu = { workspace = true }
+# Every `wgpu::` path in this crate is reached through `egui_wgpu::wgpu`, the
+# re-export -- that is deliberate, and it is what keeps exactly one wgpu in the
+# graph. This entry is not there to be imported from; it exists to *choose wgpu's
+# features*, which egui-wgpu cannot express (it offers only the blanket
+# `wgpu/default`, and that drags in `webgpu`).
+#
+# `std` and `wgsl` are the target-independent half and are what egui-wgpu itself
+# asks for. The backends are per target, below. There is no `webgpu` on any
+# target: `rustdar_frontend::app` pins `Backends::GL` on wasm32 and Firefox has
+# no stable WebGPU, so compiling that backend would only add an untested second
+# rendering path -- and, until the workspace pin was fixed, a duplicate set of
+# WebGPU bindings that broke `wasm-bindgen` outright.
+wgpu = { workspace = true, features = ["std", "wgsl"] }
 
 # tokio's multi-threaded runtime is native-only -- wasm rejects
 # `rt-multi-thread` outright ("Only features sync,macros,io-util,rt,time are
@@ -50,9 +70,48 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 # Android is deliberately grouped with native here, preserving exactly the
 # feature set it had before this split.
 egui-winit = { workspace = true, features = ["clipboard", "links", "wayland", "x11"] }
+# `parking_lot` swaps wgpu's internal locks for parking_lot's. It only buys
+# anything where there are threads to contend, so the browser does not take it.
+wgpu = { workspace = true, features = ["parking_lot"] }
+
+# The native backend set, split the way wgpu's own build.rs splits it.
+#
+# Each of these features is a no-op on targets the corresponding backend does not
+# support -- wgpu-hal gates the actual implementations by target -- so listing
+# them per platform is documentation as much as it is resolution. It does keep
+# wgpu-core from enabling backends that could never run, which is what the old
+# blanket `wgpu/default` did.
+#
+# `vulkan` and `gles` are the pair wgpu itself calls the "native Vulkan"/"native
+# OpenGL" platforms. Note `gles` deliberately does NOT cover the browser: WebGL
+# is a separate `webgl` feature, requested in the wasm32 section below.
+[target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "android", target_os = "freebsd"))'.dependencies]
+wgpu = { workspace = true, features = ["vulkan", "gles"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { workspace = true, features = ["dx12"] }
+
+# Metal is the only backend wgpu will use on Apple targets without an explicit
+# MoltenVK/ANGLE opt-in (`vulkan-portability` / `angle`), neither of which this
+# project wants. `macos-window-resize-jitter-fix` is scoped here for the same
+# reason -- egui-wgpu reads it only under `cfg(target_os = "macos")`.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+egui-wgpu = { workspace = true, features = ["macos-window-resize-jitter-fix"] }
+wgpu = { workspace = true, features = ["metal"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 egui-winit = { workspace = true, features = ["links"] }
+# The whole browser backend set: WebGL2 and nothing else.
+#
+# `webgl` is what `Backends::GL` resolves to on wasm32; the native `gles` feature
+# explicitly excludes the browser, so this is not a duplicate of the section
+# above. `webgpu` is absent on purpose and must stay absent.
+#
+# `fragile-send-sync-non-atomic-wasm` makes egui-wgpu's `CallbackResources` the
+# concurrent `TypeMap` and wgpu's handles `Send + Sync` on a target that has no
+# threads to be unsound about. Without it the browser build stops compiling.
+wgpu = { workspace = true, features = ["webgl"] }
+egui-wgpu = { workspace = true, features = ["fragile-send-sync-non-atomic-wasm"] }
 # Pinned to what the egui/wgpu stack already resolves (wasm-bindgen 0.2.118).
 # A newer wasm-bindgen-futures wants a newer wasm-bindgen and the resolver
 # rejects the pair outright, so this version moves when that stack moves.

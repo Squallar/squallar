@@ -41,7 +41,14 @@ rustdar-gps = { path = "rustdar-gps", default-features = false }
 
 # -- UI stack (bump as a unit) --
 egui = "=0.35.0"
-egui-wgpu = "=0.35.0"
+# Defaults off, and it has to be off *here*: egui-wgpu's own `default` set is
+# `["fragile-send-sync-non-atomic-wasm", "macos-window-resize-jitter-fix",
+# "wgpu/default", "wgpu/webgl"]`, and `wgpu/default` contains `webgpu`. Left on,
+# egui-wgpu re-enables the WebGPU backend behind our back no matter what the
+# `wgpu` entry below says, because features are additive across the graph.
+# rustdar-frontend re-spells the two egui-wgpu features that are actually wanted
+# and drives wgpu's backend set directly instead. See rustdar-frontend/Cargo.toml.
+egui-wgpu = { version = "=0.35.0", default-features = false }
 # Defaults off: rustdar-platform picks its own backend/clipboard feature set.
 egui-winit = { version = "=0.35.0", default-features = false }
 walkers = "=0.56.0"
@@ -50,7 +57,35 @@ walkers = "=0.56.0"
 # and `SystemTime::now()` both *panic* on wasm32-unknown-unknown, and they
 # compile fine, so nothing catches this until the page runs.
 web-time = "=1.1.0"
-wgpu = "=30.0.0"
+# PINNED TO 29 ON PURPOSE. Do not let this follow the latest major.
+#
+# `egui-wgpu 0.35.0` declares `wgpu = "29.0"` -- i.e. `^29`, which **excludes
+# 30**. A `=30.0.0` pin here therefore never upgraded anything: cargo simply
+# resolved a *second* wgpu, and the graph carried 29.0.4 (egui-wgpu's) next to
+# 30.0.0 (ours). Nothing caught it because every `wgpu::` path in this workspace
+# is reached through `egui_wgpu::wgpu`, the re-export -- so the 30.0.0 copy had
+# no users, compiled fine, and changed no API. Native builds stayed green.
+#
+# What it broke was the web bundle. Both copies compile wgpu's *vendored*
+# WebGPU bindings (`src/backend/webgpu/webgpu_sys`, used because web-sys' own
+# WebGPU is unstable-gated), so wasm32 got two definitions of every WebGPU
+# string enum and `wasm-bindgen` aborted with
+# `duplicate string enums: GpuFilterMode`.
+#
+# Moving to wgpu 30 means moving egui-wgpu, which means moving egui, which
+# `walkers` pins to an exact minor -- the whole "bump as a unit" note above.
+# Until walkers ships against a newer egui, 29 is the only resolvable choice.
+#
+# Defaults must stay off *at the workspace level* -- the same trap `grib`,
+# `hdf5-pure` and `nexrad-data` carry notes about: cargo silently ignores a
+# member's `default-features = false` when the workspace entry leaves defaults
+# on. `default` here is
+# `["std", "parking_lot", "dx12", "metal", "gles", "vulkan", "wgsl", "webgpu"]`,
+# and `webgpu` is the one feature this project must never enable: the browser
+# target is WebGL2, Firefox has no stable WebGPU, and `rustdar_frontend::app`
+# pins `Backends::GL` on wasm32 so both browsers run the same tested path.
+# rustdar-frontend spells out the per-target backend set instead.
+wgpu = { version = "=29.0.4", default-features = false }
 winit = "=0.30.13"
 
 # -- NEXRAD decoding --
