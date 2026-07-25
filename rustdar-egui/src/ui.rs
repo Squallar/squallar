@@ -131,6 +131,12 @@ pub struct Gui {
     /// state the *renderer* saw rather than the model a test rebuilt.
     #[cfg(test)]
     last_menu_leaves: Vec<ui_menu::DrawnMenuLeaf>,
+    /// The pointer state `render_map` resolved for each pane on the last frame,
+    /// in pane order. Only read by tests — and the *only* honest way for one to
+    /// observe the modality gate, since resolving it a second time alongside
+    /// `Gui::ui` would assert on a replica.
+    #[cfg(test)]
+    last_pane_pointers: Vec<crate::ui_input::PanePointerProbe>,
     viewport_sync: bool,
     sync_layers: bool,
     // --- Radar loop settings ---
@@ -303,6 +309,8 @@ impl Gui {
             last_excluded_rects: Vec::new(),
             #[cfg(test)]
             last_menu_leaves: Vec::new(),
+            #[cfg(test)]
+            last_pane_pointers: Vec::new(),
             viewport_sync: true,
             sync_layers: true,
             loop_lookback_secs: 3600, // default 1 hour
@@ -334,6 +342,7 @@ impl Gui {
         {
             self.widget_id_probes.clear();
             self.last_menu_leaves.clear();
+            self.last_pane_pointers.clear();
         }
 
         // Create a root Ui to host the panels. Since egui 0.35 the Context-taking
@@ -1201,6 +1210,12 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn menu_leaves_for_test(&self) -> &[ui_menu::DrawnMenuLeaf] {
         &self.last_menu_leaves
+    }
+
+    /// The pointer state `render_map` resolved for each pane last frame.
+    #[cfg(test)]
+    pub(crate) fn pane_pointers_for_test(&self) -> &[crate::ui_input::PanePointerProbe] {
+        &self.last_pane_pointers
     }
 
     /// Open or close the layers drawer, as the hamburger does.

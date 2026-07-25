@@ -2,14 +2,29 @@
 //!
 //! Drives the real UI through a real [`egui::Context`] with hand-constructed
 //! [`egui::RawInput`] — no window, no winit, no wgpu. Each [`InputHarness::frame`]
-//! runs one full egui pass (`Gui::ui`, all panels, dialogs and map panes) and
-//! then resolves the pane pointer state through the *same* entry points that
-//! `ui_map.rs` uses:
+//! runs one full egui pass (`Gui::ui`, all panels, dialogs and map panes), and
+//! `render_map` records the pointer state it resolved for each pane on the way
+//! through. [`FrameOutcome::resolved`], [`FrameOutcome::resolved_inactive`],
+//! [`FrameOutcome::modality`] and [`FrameOutcome::resolved_zoom`] are reads of
+//! *that* — the shipped decision, not a second one taken here.
 //!
-//! * [`MapPointerFrame::from_mouse`] — the desktop path
-//! * [`TouchGestures::update`] — the Android path
+//! # Do not resolve anything a second time
 //!
-//! so a regression in either one fails here rather than on a device.
+//! The harness used to run `Gui::ui` and then separately drive its own
+//! [`ModalityLatch`](crate::ui_layout::ModalityLatch) and
+//! [`InteractionState`](crate::ui_input::InteractionState), asserting on those.
+//! Nothing ever compared the two, so the entire pointer suite validated a
+//! replica: `ui_map.rs` could pin the modality to either value, resolve every
+//! pane as inactive, or drop `overlay_click_pos` on the floor, and all 121
+//! assertions still passed. Anything that claims to be what the app does must
+//! be read back out of [`Gui`], the way `map_panel_rect`, `excluded_rects` and
+//! `widget_id_probes` already are.
+//!
+//! The two exceptions are [`FrameOutcome::mouse`] and [`FrameOutcome::touch`],
+//! which drive
+//! [`MapPointerFrame::from_mouse`] and [`TouchGestures::update`] directly to say
+//! what a given pipeline *would* have done with this frame. They are labelled
+//! ungated and no test may treat them as the app's behaviour.
 //!
 //! # Event fidelity
 //!
@@ -49,8 +64,8 @@
 
 use crate::Gui;
 use crate::ui::DrawnMenuLeaf;
-use crate::ui_input::{InteractionState, MapPointerFrame, TouchGestures};
-use crate::ui_layout::{ModalityLatch, PointerModality};
+use crate::ui_input::{MapPointerFrame, TouchGestures};
+use crate::ui_layout::PointerModality;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 
 /// Viewport size used by the harness — a landscape desktop-ish window.
@@ -70,20 +85,28 @@ pub(crate) struct FrameOutcome {
     pub mouse: MapPointerFrame,
     /// Pointer resolution from the touch pipeline, driven unconditionally.
     pub touch: MapPointerFrame,
-    /// Pointer resolution the **real UI** takes: whichever pipeline the latched
-    /// [`PointerModality`] selects, through [`InteractionState`]. This is the
-    /// only field that observes the gate.
+    /// The pointer state the **shipped** `render_map` resolved for the active
+    /// pane, read back out of `Gui` — not resolved a second time here.
+    ///
+    /// Everything below `resolved`, `resolved_inactive`, `modality` and
+    /// `resolved_zoom` is a *read of the real UI*. The harness used to drive
+    /// its own [`InteractionState`] and [`ModalityLatch`] beside `Gui::ui` and
+    /// assert on those instead, which meant the whole gesture suite validated a
+    /// replica: `ui_map.rs` could pin the modality to either value, resolve
+    /// every pane as inactive, or drop `overlay_click_pos` outright, and not
+    /// one assertion moved.
     pub resolved: MapPointerFrame,
-    /// Pointer resolution the real UI gives a pane that is **not** active,
-    /// through the same gate.
-    pub resolved_inactive: MapPointerFrame,
-    /// The modality in force for this frame.
+    /// The same, for a pane that is **not** the active one. `None` when the
+    /// layout has only one pane, since then there is no inactive pane to
+    /// observe — use [`InputHarness::set_pane_count`] to get one.
+    pub resolved_inactive: Option<MapPointerFrame>,
+    /// The modality `render_map` ran this frame under.
     pub modality: PointerModality,
     /// Map zoom after the frame — observes the double-tap-drag zoom gesture on
     /// the ungated `touch` path.
     pub zoom: f64,
-    /// Map zoom on the gated path, so a test can tell whether a *gesture the
-    /// gate should have blocked* moved the map.
+    /// The **active pane's real** map zoom, so a test can tell whether a
+    /// gesture the gate should have blocked moved the actual map.
     pub resolved_zoom: f64,
 }
 
@@ -91,19 +114,17 @@ pub(crate) struct FrameOutcome {
 pub(crate) struct InputHarness {
     ctx: egui::Context,
     gui: Gui,
-    /// Touch gesture detectors for the "active pane", as `ui_map.rs` keeps them.
+    /// Touch gesture detectors driving the **ungated** `touch` probe, so one
+    /// frame can be observed through that pipeline whatever the real UI chose.
+    /// The gated answer is read out of `Gui`, never resolved here.
     gestures: TouchGestures,
-    /// The modality-gated resolver, as `Gui` keeps it. Driven in parallel with
-    /// the two ungated paths so one frame can be observed all three ways.
-    interaction: InteractionState,
-    /// The latch feeding `interaction`, mirroring the one inside `Gui`.
-    modality: ModalityLatch,
-    /// Map viewport the zoom gesture acts on.
+    /// Map viewport the ungated zoom gesture acts on.
     map_memory: walkers::MapMemory,
-    /// A second viewport, so the gated path's zoom can be observed
-    /// independently of the ungated touch path's.
-    resolved_map_memory: walkers::MapMemory,
-    /// Screen rect of the active pane's map, used to reject taps on chrome.
+    /// Screen rect handed to the **ungated** touch probe, and the position
+    /// [`InputHarness::map_center`] reports. Roughly where the one-pane map
+    /// lands; the gated path uses the layout's real pane rect, so a test that
+    /// splits the panes must take its positions from
+    /// [`InputHarness::pane_rects`] instead.
     pane_rect: egui::Rect,
     /// Wall-clock time reported to egui, in seconds.
     time: f64,
@@ -138,10 +159,7 @@ impl InputHarness {
             ctx: egui::Context::default(),
             gui: Gui::new(),
             gestures: TouchGestures::default(),
-            interaction: InteractionState::default(),
-            modality: ModalityLatch::default(),
             map_memory: walkers::MapMemory::default(),
-            resolved_map_memory: walkers::MapMemory::default(),
             // The map occupies the middle of the window: inset generously so
             // the harness never depends on exact panel widths.
             pane_rect: egui::Rect::from_min_max(
@@ -516,30 +534,41 @@ impl InputHarness {
         let ctx = self.ctx.clone();
         ctx.begin_pass(raw_input);
 
-        // The real UI, panels, dialogs and map panes included.
+        // The real UI, panels, dialogs and map panes included. `render_map`
+        // resolves each pane's pointer state on the way through and records it.
         self.last_actions = self.gui.ui(&ctx);
 
-        // The same entry points `ui_map.rs` uses for the active pane. All of
-        // them funnel their click position through `filter_dialog_blocked`.
-        //
-        // `mouse` and `touch` drive each pipeline directly; `resolved` goes
-        // through the modality gate, exactly as `render_map` does.
-        let modality = self.modality.update(&ctx);
+        // `mouse` and `touch` drive each pipeline directly, bypassing the gate,
+        // so a test can say what a given pipeline *would* have done. They are
+        // the only two parallel probes left, and neither claims to be the app.
+        let mouse = MapPointerFrame::from_mouse(&ctx);
+        let touch = self
+            .gestures
+            .update(&ctx, &mut self.map_memory, self.pane_rect);
+
+        // Everything gated is read back out of the `Gui` that just ran.
+        let probes = self.gui.pane_pointers_for_test();
+        let active = probes
+            .iter()
+            .find(|p| p.is_active)
+            .copied()
+            .unwrap_or_else(|| {
+                panic!(
+                    "render_map recorded no active pane this frame ({} pane probe(s)) \
+                     — the pointer pipeline never ran, so nothing below means anything",
+                    probes.len()
+                )
+            });
+        let inactive = probes.iter().find(|p| !p.is_active).map(|p| p.frame);
+
         let outcome = FrameOutcome {
-            mouse: MapPointerFrame::from_mouse(&ctx),
-            touch: self
-                .gestures
-                .update(&ctx, &mut self.map_memory, self.pane_rect),
-            resolved: self.interaction.resolve_active(
-                &ctx,
-                modality,
-                &mut self.resolved_map_memory,
-                self.pane_rect,
-            ),
-            resolved_inactive: self.interaction.resolve_inactive(&ctx, modality),
-            modality,
+            mouse,
+            touch,
+            resolved: active.frame,
+            resolved_inactive: inactive,
+            modality: active.modality,
             zoom: self.map_memory.zoom(),
-            resolved_zoom: self.resolved_map_memory.zoom(),
+            resolved_zoom: self.gui.active_pane().map_memory.zoom(),
         };
 
         let full_output = ctx.end_pass();
@@ -1602,10 +1631,19 @@ mod tests {
     ///     finger. The mouse carries no such state, and resolving it for every
     ///     pane is what lets a click land on an overlay in a pane that is not
     ///     yet the active one — behaviour the desktop build always had.
+    ///
+    ///     Split into two real panes, because an inactive pane is not a thing
+    ///     that exists in a one-pane layout: `render_map` would resolve exactly
+    ///     one pane and there would be nothing to compare it against.
     #[test]
     fn a_touch_reaches_only_the_active_pane_but_a_click_reaches_them_all() {
         let mut h = InputHarness::new();
-        let pos = h.map_center();
+        h.set_pane_count(2);
+        let pos = h.pane_rects()[0].center();
+        assert!(
+            h.pane_rects().len() == 2 && !h.pane_rects()[1].contains(pos),
+            "precondition: two distinct panes, and the click lands in pane 0"
+        );
 
         let clicked = h.mouse_click(pos);
         assert_eq!(clicked.modality, PointerModality::Mouse);
@@ -1615,12 +1653,13 @@ mod tests {
             "precondition: the active pane got the click"
         );
         assert_eq!(
-            clicked.resolved_inactive.overlay_click_pos,
-            Some(pos),
+            clicked.resolved_inactive.map(|f| f.overlay_click_pos),
+            Some(Some(pos)),
             "a mouse click is resolved for every pane, not just the active one"
         );
 
         let mut h = InputHarness::new();
+        h.set_pane_count(2);
 
         // The release frame is the one that separates the two branches: a
         // touch release carries the synthetic `PointerButton{up}` that makes
@@ -1636,7 +1675,8 @@ mod tests {
              so `None` below is the touch branch and not an empty frame"
         );
         assert_eq!(
-            tapped.resolved_inactive.overlay_click_pos, None,
+            tapped.resolved_inactive.map(|f| f.overlay_click_pos),
+            Some(None),
             "an inactive pane takes no part in a touch gesture"
         );
 

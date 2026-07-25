@@ -628,11 +628,31 @@ pub(crate) struct MapPointerFrame {
     pub suppress_pan: bool,
 }
 
+/// One pane's resolved pointer state **as `render_map` actually used it**.
+///
+/// Recorded from the very locals that feed `PaneRenderCtx` and
+/// `Map::drag_pan_buttons`, so a test observes the decision the shipped
+/// renderer took rather than a second, parallel run of the same resolver. A
+/// harness that drives its own [`InteractionState`] alongside `Gui::ui` and
+/// then asserts on *that* validates a replica: every one of `ui_map.rs`'s
+/// pointer decisions can be broken without such a test noticing.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PanePointerProbe {
+    pub pane_idx: usize,
+    pub is_active: bool,
+    /// The modality `render_map` resolved for the frame, read from the same
+    /// local that selects the pipeline.
+    pub modality: crate::ui_layout::PointerModality,
+    pub frame: MapPointerFrame,
+}
+
 impl MapPointerFrame {
     /// A pane that takes no part in pointer interaction this frame.
-    // Only the Android pane loop has inactive panes; the desktop path resolves
-    // the mouse for every pane.
-    #[allow(dead_code)]
+    ///
+    /// Reached whenever a touch gesture is in play and the pane is not the one
+    /// that owns it — the touch pipeline is single-pointer and stateful, so it
+    /// runs for the active pane only. Nothing about that is Android-specific.
     pub(crate) fn inactive() -> Self {
         Self::default()
     }
