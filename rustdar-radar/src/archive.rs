@@ -1,34 +1,22 @@
 //! Anonymous S3 access to the NEXRAD Level II archive bucket.
 //!
-//! This is rustdar's own replacement for `nexrad_data::aws::archive`, which was
-//! the last thing in the workspace pulling `aws-lc-sys` into the graph:
-//! `nexrad-data`'s `aws` feature turns on `reqwest/rustls`, which resolves to
-//! `__rustls-aws-lc-rs`, which drags in a second C crypto stack alongside the
-//! *ring* one [`crate::tls`] already installs. Turning `aws` off deletes
-//! `Identifier`, `list_files` and `download_file` along with it, so they are
-//! reimplemented here against the same bucket, over the same client every other
-//! rustdar request uses.
+//! Reimplements the `nexrad_data::aws` surface (`Identifier`, `list_files`,
+//! `download_file`) so that crate's `aws` feature can stay off: it turns on
+//! `reqwest/rustls`, which resolves to `__rustls-aws-lc-rs` and drags
+//! `aws-lc-sys` in beside the *ring* stack [`crate::tls`] installs. Do not
+//! re-enable it, and do not answer the resulting trust-store question by
+//! bundling CA roots -- shipping our own gives the binary an expiration date.
+//! `nexrad-data` still does all the decoding; only the HTTP layer moved.
 //!
-//! `nexrad-data` is still a dependency and still does all the *decoding* --
-//! [`nexrad_data::volume::File`] and its `scan()` are untouched. Only the HTTP
-//! layer moved.
-//!
-//! # Why this needs no credentials
-//!
-//! `unidata-nexrad-level2` is a public, anonymously readable bucket: a bare
+//! `unidata-nexrad-level2` is anonymously readable: an unsigned
 //! `GET https://unidata-nexrad-level2.s3.amazonaws.com/?list-type=2&prefix=...`
-//! with no `Authorization` header returns `200` and a `ListBucketResult`. That
-//! is what keeps this module small -- there is no SigV4 canonical request, no
-//! credential chain and no clock skew handling, because an anonymous request is
-//! never signed. `nexrad-data` did not sign either.
+//! returns `200` and a `ListBucketResult`, so there is no SigV4, no credential
+//! chain and no clock-skew handling here. Upstream did not sign either.
 //!
-//! # Bucket layout
-//!
-//! Objects are keyed `YYYY/MM/DD/SITE/SITEYYYYMMDD_HHMMSS_V06`, so a listing for
-//! one site-day is a prefix query on `YYYY/MM/DD/SITE`. Alongside each volume
-//! file the bucket also carries a `..._V06_MDM` metadata sidecar; upstream
-//! returned those in the listing too and [`list_files`] deliberately still does
-//! (see the note on [`key_to_identifier`]).
+//! Objects are keyed `YYYY/MM/DD/SITE/SITEYYYYMMDD_HHMMSS_V06`, so one site-day
+//! is a prefix query on `YYYY/MM/DD/SITE`. Each volume has a `..._V06_MDM`
+//! metadata sidecar, which [`list_files`] returns too (see
+//! [`key_to_identifier`]).
 
 use std::sync::OnceLock;
 
@@ -37,68 +25,46 @@ use reqwest::StatusCode;
 use xml::reader::{EventReader, XmlEvent};
 
 /// The public NOAA/Unidata bucket holding Level II archive volumes.
-///
-/// Kept as a `const` because it is used in `const`-ish positions and
-/// [`crate::sources::DataSources`] holds its origins as `Cow`, which cannot be
-/// dereferenced in a constant. `archive_bucket_matches_the_declared_origin`
-/// pins the two together so this cannot drift.
+/// `archive_bucket_matches_the_declared_origin` pins this against
+/// [`crate::sources::DataSources`], which cannot hold it as a `const`.
 pub const ARCHIVE_BUCKET: &str = "unidata-nexrad-level2";
 
-/// How long a single archive request may take, end to end.
-///
-/// Upstream `nexrad-data` built its S3 client with **no** timeout, so a stalled
-/// connection hung the fetch task -- and with it the pane's "fetching" state --
-/// forever, with no error ever reaching the UI. This is the one error path this
-/// module adds that upstream did not have. It is deliberately generous: archive
-/// volumes run to ~9 MB, so this has to tolerate a slow link rather than merely
-/// a slow server, and it exists to bound a hang, not to enforce latency.
+/// How long a single archive request may take, end to end. Upstream had *no*
+/// timeout, so a stalled connection hung the fetch task, and the pane's
+/// "fetching" state, forever. Generous because volumes run to ~9 MB: this
+/// bounds a hang, it does not enforce latency.
 const ARCHIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Upper bound on `ListObjectsV2` pages followed for one listing.
-///
-/// Purely a liveness guard. A real site-day is 200-350 keys, i.e. a single
-/// page, and even a pathological one cannot approach 100 000; but the paging
-/// loop is driven by a token the server chooses, and a server that kept
-/// returning `IsTruncated` would otherwise spin forever inside a UI fetch.
+/// Upper bound on `ListObjectsV2` pages followed for one listing. A real
+/// site-day is 200-350 keys, i.e. one page; this only stops a server that keeps
+/// returning `IsTruncated` from spinning forever inside a UI fetch.
 const MAX_LIST_PAGES: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
-/// Failures reaching or interpreting the archive bucket.
-///
-/// This replaces the `nexrad_data::result::Error::AWS` variant, which is
-/// `#[cfg(feature = "aws")]` upstream and therefore disappears along with the
-/// feature. Every consumer in this workspace renders scan errors with `{:?}`,
-/// so the variants are shaped for a legible debug print rather than for
-/// matching.
+/// Failures reaching or interpreting the archive bucket. Consumers render
+/// these with `{:?}` rather than matching on them.
 #[derive(Debug, thiserror::Error)]
 pub enum ArchiveError {
-    /// The HTTP request could not be completed.
     #[error("S3 request failed: {0}")]
     Request(#[from] reqwest::Error),
 
-    /// The bucket answered `404` for the requested object.
-    ///
-    /// Kept distinct from [`ArchiveError::Status`] because upstream did the
-    /// same, and because "this volume is not in the archive" is an ordinary
-    /// outcome while "the bucket returned 503" is not.
+    /// Distinct from [`ArchiveError::Status`]: "not in the archive" is an
+    /// ordinary outcome, "the bucket returned 503" is not.
     #[error("S3 object not found: {0}")]
     NotFound(String),
 
-    /// The bucket answered with some other non-`200` status.
+    /// Any other non-`200`.
     #[error("S3 returned {status} for {url}{}", body.as_deref().map(|b| format!(": {b}")).unwrap_or_default())]
     Status {
-        /// The status the bucket returned.
         status: StatusCode,
-        /// The URL that was requested.
         url: String,
         /// The response body, when one could be read.
         body: Option<String>,
     },
 
-    /// A `ListObjectsV2` response could not be understood.
     #[error("malformed S3 listing: {0}")]
     MalformedListing(String),
 
@@ -107,42 +73,30 @@ pub enum ArchiveError {
     UnkeyableIdentifier(String),
 }
 
-/// Convenience alias for this module's fallible operations.
 pub type Result<T> = std::result::Result<T, ArchiveError>;
 
 // ---------------------------------------------------------------------------
 // Identifier
 // ---------------------------------------------------------------------------
 
-/// Identifying metadata for a NEXRAD archive volume file.
-///
-/// A faithful port of `nexrad_data::aws::archive::Identifier`: a newtype over
-/// the bare object *name* (not the full key), with the site and collection time
-/// recovered by fixed-offset slicing of that name. The derive list is
-/// upstream's plus `Debug`, which upstream omitted: the frontend logs an
-/// identifier when a loop frame fails to download, and every consumer in this
-/// workspace renders errors with `{:?}`.
-///
-/// Names look like `KTLX20240520_000004_V06`: four characters of site, eight of
-/// `%Y%m%d`, a separator, then six of `%H%M%S`.
+/// A NEXRAD archive volume file, named but not keyed: a newtype over the bare
+/// object *name*, with site and collection time recovered by fixed-offset
+/// slicing. Names look like `KTLX20240520_000004_V06` -- four characters of
+/// site, eight of `%Y%m%d`, a separator, then six of `%H%M%S`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct Identifier(String);
 
 impl Identifier {
-    /// Constructs a new identifier from the provided name.
     pub fn new(name: String) -> Self {
         Identifier(name)
     }
 
-    /// The file name.
     pub fn name(&self) -> &str {
         &self.0
     }
 
-    /// The radar site this file was produced at, e.g. `KDMX`.
-    ///
-    /// `get(0..4)` rather than indexing: names come from bucket keys, so a
-    /// short or non-ASCII name must yield `None` rather than panic.
+    /// The radar site, e.g. `KDMX`. `get` rather than indexing: names come
+    /// from bucket keys, so a short or non-ASCII one must not panic.
     pub fn site(&self) -> Option<&str> {
         self.0.get(0..4)
     }
@@ -166,12 +120,9 @@ impl Identifier {
 
 /// Build the `ListObjectsV2` URL for one page of a prefix query.
 ///
-/// Every parameter goes through `query_pairs_mut`, which percent-encodes.
-/// Upstream interpolated the prefix straight into a format string, which is
-/// safe for the `YYYY/MM/DD/SITE` prefixes this module builds but is not safe
-/// for the continuation token: tokens are opaque base64-ish blobs that routinely
-/// contain `/` and can contain `+` and `=`, and an unencoded `+` would reach S3
-/// as a space and be rejected.
+/// Everything goes through `query_pairs_mut` because continuation tokens are
+/// opaque blobs that routinely contain `/` and can contain `+` and `=`; an
+/// unencoded `+` reaches S3 as a space and the page is rejected.
 pub(crate) fn list_url(
     bucket: &str,
     prefix: &str,
@@ -194,12 +145,8 @@ pub(crate) fn list_url(
     Ok(url.into())
 }
 
-/// Build the object URL for a full bucket key.
-///
-/// The key is interpolated rather than encoded, matching upstream. Archive keys
-/// are drawn from `[A-Za-z0-9_/]` -- date, site and volume name -- so there is
-/// nothing to encode, and encoding would have to leave the `/` separators alone
-/// anyway.
+/// Build the object URL for a full bucket key. The key is interpolated, not
+/// encoded: archive keys are drawn from `[A-Za-z0-9_/]`.
 fn object_url(bucket: &str, key: &str) -> String {
     crate::sources::DataSources::s3_object_url(bucket, key)
 }
@@ -209,20 +156,11 @@ fn day_prefix(site: &str, date: &NaiveDate) -> String {
     format!("{}/{}", date.format("%Y/%m/%d"), site)
 }
 
-/// Recover a volume name from a full bucket key.
-///
-/// Upstream is `key.split('/').skip(4).collect::<String>()`, and this reproduces
-/// it exactly, including two behaviours that look like accidents but are load
-/// bearing downstream:
-///
-/// * The four skipped segments are `YYYY`, `MM`, `DD` and `SITE`. A key with
-///   fewer than five segments yields an empty name, and `crate::scan` already
-///   skips identifiers whose name has no `_`-separated time field, so an
-///   unexpected key is dropped rather than fatal.
-/// * `collect::<String>()` concatenates any remaining segments *without*
-///   re-inserting the `/`. No archive key has a sixth segment, so this never
-///   fires; it is preserved so that if one ever appears, this module and the
-///   upstream it replaced agree.
+/// Recover a volume name from a full bucket key. Reproduces upstream exactly,
+/// including two load-bearing details: a key with fewer than five segments
+/// yields an empty name (which `crate::scan` then skips, so an unexpected key
+/// is dropped rather than fatal), and `collect` concatenates any trailing
+/// segments *without* re-inserting the `/`.
 fn key_to_identifier(key: &str) -> Identifier {
     Identifier::new(key.split('/').skip(4).collect::<String>())
 }
@@ -234,11 +172,10 @@ fn key_to_identifier(key: &str) -> Identifier {
 /// One page of a `ListObjectsV2` response.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ListPage {
-    /// Keys in the order S3 returned them, which is UTF-8 binary order.
+    /// In the order S3 returned them, which is UTF-8 binary order.
     keys: Vec<String>,
-    /// Whether S3 says more keys match the prefix than fit in this page.
     truncated: bool,
-    /// The cursor for the next page, present exactly when `truncated`.
+    /// Present exactly when `truncated`.
     next_token: Option<String>,
 }
 
@@ -250,17 +187,14 @@ enum Field {
     NextToken,
 }
 
-/// Parse one `ListBucketResult` document.
+/// Parse one `ListBucketResult` document. Only `Contents/Key`, `IsTruncated`
+/// and `NextContinuationToken` are read.
 ///
-/// Only `Contents/Key`, `IsTruncated` and `NextContinuationToken` are read; the
-/// sizes, ETags and timestamps upstream also parsed were never used by
-/// `list_files`, which reduced every object to its key.
-///
-/// `Key` is only captured inside `Contents` so that the document's own
-/// `<Prefix>`/`<Name>` and any `CommonPrefixes` cannot be mistaken for objects.
-/// Character data is accumulated rather than assigned, because an XML parser is
-/// free to split text across several events at entity boundaries -- and
-/// continuation tokens are long enough to hit that.
+/// `Key` is captured only inside `Contents`, so the document's own
+/// `<Prefix>`/`<Name>` and any `CommonPrefixes` are not mistaken for objects.
+/// Character data is accumulated rather than assigned: an XML parser may split
+/// text across several events, and continuation tokens are long enough to hit
+/// that.
 fn parse_list_page(body: &str) -> Result<ListPage> {
     let mut page = ListPage::default();
     let mut field: Option<Field> = None;
@@ -312,28 +246,17 @@ fn parse_list_page(body: &str) -> Result<ListPage> {
     Ok(page)
 }
 
-/// Follow `NextContinuationToken` until the listing is complete.
+/// Follow `NextContinuationToken` until the listing is complete. `fetch_page`
+/// takes the fully-built URL so a test can see what would have gone on the wire.
 ///
-/// `fetch_page` receives the fully-built URL and returns the response body, so
-/// a test can observe exactly what would have gone on the wire -- in particular
-/// whether the token actually reached the query string, which is a separate
-/// mistake from failing to thread it through this loop.
+/// Deliberately unlike upstream, which returned
+/// `AWSError::TruncatedListObjectsResponse` rather than paging. Measured
+/// against the live bucket, the busiest site-days sampled (2011-04-27/KBMX,
+/// 2013-05-20/KTLX) were 311 and 323 keys against a 1000-key page, so neither
+/// path normally fires.
 ///
-/// **This is where the behaviour differs from `nexrad-data` on purpose.**
-/// Upstream issued a single request and returned
-/// `AWSError::TruncatedListObjectsResponse` whenever `IsTruncated` came back
-/// true, so a listing that did not fit one page was a hard error rather than a
-/// short result. Paging instead is strictly a superset: every listing upstream
-/// could serve, this serves identically (one request, same keys, same order),
-/// and the listings upstream refused now succeed. In practice the archive's
-/// prefix scheme keeps a site-day to 200-350 keys, so neither path fires --
-/// measured against the live bucket, the busiest days sampled
-/// (2011-04-27/KBMX, 2013-05-20/KTLX) were 311 and 323 keys against a 1000-key
-/// page.
-///
-/// Paging keys off `IsTruncated`, not off the presence of a token: S3 sends
-/// both together, but keying off the token alone would turn a final page that
-/// echoed one into an infinite loop.
+/// Paging keys off `IsTruncated`, not off the presence of a token: a final page
+/// that echoed a stale token would otherwise loop forever.
 pub(crate) async fn collect_keys<F, Fut>(
     bucket: &str,
     prefix: &str,
@@ -376,30 +299,26 @@ where
 
 /// The shared, pooled client for every archive request.
 ///
-/// Built through [`crate::tls::client`], which is what installs the *ring*
-/// crypto provider — with `rustls-no-provider` there is no compiled-in default,
-/// and `ClientBuilder::build` panics without one. Routing through that
-/// constructor rather than `reqwest::Client::builder()` is the whole reason
-/// this module can exist without re-introducing a bundled root store.
+/// Must be built through [`crate::tls::client`], which installs the *ring*
+/// provider: under `rustls-no-provider` there is no compiled-in default and
+/// `ClientBuilder::build` panics without one. That constructor is also what
+/// keeps this module off a bundled root store.
 ///
-/// One client for the process, as upstream had: `list_scans_for_range` issues a
-/// listing per day and a loop replay downloads a volume per frame, so losing
-/// connection reuse here would be a real regression.
+/// One client per process: `list_scans_for_range` lists per day and a loop
+/// replay downloads a volume per frame, so losing connection reuse would hurt.
 pub(crate) fn shared_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         crate::tls::client(crate::tls::USER_AGENT, ARCHIVE_TIMEOUT)
             .build()
-            // Matches upstream, which also panicked here. A client that cannot
-            // be constructed is a build-configuration fault, not a runtime
-            // condition any caller could recover from.
+            // A client that cannot be constructed is a build-configuration
+            // fault, not something a caller could recover from.
             .unwrap_or_else(|e| panic!("failed to build the archive HTTP client: {e}"))
     })
 }
 
-/// How a response status should be interpreted.
-///
-/// Split out from the request so the mapping is testable without a socket.
+/// How a response status should be interpreted. Split out from the request so
+/// the mapping is testable without a socket.
 #[derive(Debug, PartialEq, Eq)]
 enum StatusClass {
     /// `200`: the body is the object.
@@ -410,11 +329,9 @@ enum StatusClass {
     Failed,
 }
 
-/// Classify an S3 response status.
-///
-/// Only `200` is success, matching upstream: a `206` or a `304` means something
-/// asked for a partial or conditional fetch that this module never requests, so
-/// treating it as a complete body would hand a truncated volume to the decoder.
+/// Only `200` is success: this module never requests a partial or conditional
+/// fetch, so treating a `206`/`304` as a body would hand the decoder a
+/// truncated volume.
 fn classify(status: StatusCode) -> StatusClass {
     match status {
         StatusCode::OK => StatusClass::Ok,
@@ -425,13 +342,10 @@ fn classify(status: StatusCode) -> StatusClass {
 
 /// GET a URL and return the body as text, or an error describing the status.
 ///
-/// Upstream's `list_objects` never looked at the status at all: it fed whatever
-/// came back to the XML parser, so a `403` or a `503` produced an *empty
-/// listing* rather than an error. `crate::scan::list_files_with_fallback` reads
-/// an empty listing as "no data for this date", falls back to the previous day,
-/// gets the same empty result and reports "no scans available" -- an outage
-/// rendered as an absence. Checking the status here is the second deliberate
-/// departure from upstream.
+/// The status check is deliberate: upstream fed any body to the XML parser, so
+/// a `403` or `503` parsed as an *empty listing*, which
+/// `crate::scan::list_files_with_fallback` reads as "no data for this date" --
+/// an outage rendered to the user as an absence of weather.
 pub(crate) async fn get_text(client: &reqwest::Client, url: String) -> Result<String> {
     let response = client.get(&url).send().await?;
     match classify(response.status()) {
@@ -445,12 +359,7 @@ pub(crate) async fn get_text(client: &reqwest::Client, url: String) -> Result<St
     }
 }
 
-/// GET a URL and return the body as bytes.
-///
-/// The binary counterpart of [`get_text`], with the same status handling: a
-/// `404` is [`ArchiveError::NotFound`] and anything else non-`200` is
-/// [`ArchiveError::Status`], so a bucket outage cannot be mistaken for an
-/// absent object.
+/// The binary counterpart of [`get_text`], with the same status handling.
 pub(crate) async fn get_bytes(client: &reqwest::Client, url: String) -> Result<Vec<u8>> {
     let response = client.get(&url).send().await?;
     match classify(response.status()) {
@@ -464,27 +373,21 @@ pub(crate) async fn get_bytes(client: &reqwest::Client, url: String) -> Result<V
     }
 }
 
-// NOTE: there is deliberately no byte-range helper here. The one consumer of
-// HTTP `Range` in this workspace is `rustdar_overlays::hrrr::fetch`, and it
-// needs semantics this module's `classify` cannot express: a `200` there means
-// the server ignored the header and is about to stream a ~130 MB file, which is
-// a hard error rather than something to slice locally. Keeping that logic next
-// to the `.idx` arithmetic that produces the range is what makes the two
-// testable together.
+// No byte-range helper here on purpose: `rustdar_overlays::hrrr::fetch` needs
+// semantics `classify` cannot express -- a `200` to a `Range` request means the
+// server ignored the header and is about to stream ~130 MB, which is an error
+// there rather than a body to slice locally.
 
 // ---------------------------------------------------------------------------
 // Public surface
 // ---------------------------------------------------------------------------
 
-/// List data files for the specified site and date.
-///
-/// Returns an index of the volumes the archive holds for that site-day, in the
-/// bucket's own key order, which is what `crate::scan` relies on when it breaks
-/// ties between a volume and its `_MDM` sidecar by taking the first match.
+/// The volumes the archive holds for one site-day, in the bucket's own key
+/// order -- `crate::scan` relies on that order to break the tie between a
+/// volume and its `_MDM` sidecar by taking the first match.
 pub async fn list_files(site: &str, date: &NaiveDate) -> Result<Vec<Identifier>> {
-    // Resolved before the first `.await` so that merely polling this future
-    // once installs the crypto provider; `crate::tls` has a probe that depends
-    // on exactly that.
+    // Before the first `.await`, so that merely polling this future installs
+    // the crypto provider. `crate::tls` has a probe that depends on it.
     let client = shared_client();
     let prefix = day_prefix(site, date);
 
@@ -495,10 +398,8 @@ pub async fn list_files(site: &str, date: &NaiveDate) -> Result<Vec<Identifier>>
     Ok(keys.iter().map(|key| key_to_identifier(key)).collect())
 }
 
-/// Download the volume file a given identifier names.
-///
-/// Returns the encoded contents wrapped in [`nexrad_data::volume::File`], which
-/// still owns decompression and decoding.
+/// Download the volume an identifier names. [`nexrad_data::volume::File`] still
+/// owns decompression and decoding.
 pub async fn download_file(identifier: Identifier) -> Result<nexrad_data::volume::File> {
     let client = shared_client();
 
@@ -554,10 +455,8 @@ mod tests {
         assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2024-05-20 00:00:04");
     }
 
-    /// A name too short to slice must yield `None`, not panic.
-    ///
-    /// `key_to_identifier` produces an empty name for any key that does not have
-    /// the expected five segments, so this is reachable from a real listing.
+    /// A name too short to slice must yield `None`, not panic —
+    /// `key_to_identifier` emits an empty name for any unexpected key shape.
     #[test]
     fn identifier_rejects_names_it_cannot_slice() {
         for name in ["", "KTL", "KTLX", "KTLX2024"] {
@@ -571,22 +470,17 @@ mod tests {
 
     // -- key -> name --------------------------------------------------------
 
-    /// The four leading key segments are dropped and nothing else is.
-    ///
-    /// Off-by-one in either direction is caught: `skip(3)` leaves the site
-    /// glued to the front, `skip(5)` empties the name.
+    /// Fails on an off-by-one either way: `skip(3)` leaves the site glued to
+    /// the front, `skip(5)` empties the name.
     #[test]
     fn key_to_identifier_drops_exactly_the_date_and_site_segments() {
         let id = key_to_identifier("2024/05/20/KTLX/KTLX20240520_000004_V06");
         assert_eq!(id.name(), "KTLX20240520_000004_V06");
     }
 
-    /// `_MDM` sidecars are returned, not filtered.
-    ///
-    /// `crate::scan` depends on this: it parses a time out of every name and
-    /// breaks ties by taking the first, and the bucket orders `..._V06` before
-    /// `..._V06_MDM`. Filtering them here would be a behaviour change even
-    /// though it looks like a cleanup.
+    /// `_MDM` sidecars are returned, not filtered: `crate::scan` breaks ties by
+    /// taking the first name, and the bucket orders `..._V06` before
+    /// `..._V06_MDM`. Filtering here looks like a cleanup but changes behaviour.
     #[test]
     fn key_to_identifier_keeps_mdm_sidecars() {
         let id = key_to_identifier("2024/05/20/KTLX/KTLX20240520_000004_V06_MDM");
@@ -595,10 +489,7 @@ mod tests {
 
     // -- URLs ---------------------------------------------------------------
 
-    /// The listing prefix is the date-partitioned `%Y/%m/%d/SITE` form, with
-    /// zero-padded month and day.
-    ///
-    /// A single-digit month is the case that distinguishes `%Y/%m/%d` from a
+    /// The single-digit month is the case that distinguishes `%Y/%m/%d` from a
     /// hand-rolled `{}/{}/{}`.
     #[test]
     fn day_prefix_is_zero_padded_and_date_partitioned() {
@@ -612,8 +503,7 @@ mod tests {
         let url = list_url("bkt", "2024/05/20/KTLX", None, None).expect("url");
         assert!(url.starts_with("https://bkt.s3.amazonaws.com/?"), "{url}");
         assert!(url.contains("list-type=2"), "{url}");
-        // `query_pairs_mut` percent-encodes the separators; the live bucket
-        // accepts that form (verified against the real endpoint).
+        // The live bucket accepts the percent-encoded separators.
         assert!(url.contains("prefix=2024%2F05%2F20%2FKTLX"), "{url}");
         assert!(
             !url.contains("continuation-token"),
@@ -630,12 +520,9 @@ mod tests {
         assert!(capped.contains("max-keys=7"), "{capped}");
     }
 
-    /// The continuation token reaches the query string, percent-encoded.
-    ///
-    /// Real tokens contain `/` and can contain `+` and `=`. An unencoded `+`
-    /// arrives at S3 as a space and the page is rejected, which is a distinct
-    /// failure from never sending the token at all -- both produce a short
-    /// listing, so both need their own assertion.
+    /// Real tokens contain `/` and can contain `+` and `=`; an unencoded `+`
+    /// arrives at S3 as a space and the page is rejected. That is a distinct
+    /// failure from never sending the token, so both are asserted.
     #[test]
     fn list_url_percent_encodes_the_continuation_token() {
         let token = "abc/def+ghi=";
@@ -661,11 +548,9 @@ mod tests {
 
     // -- status classification ---------------------------------------------
 
-    /// Only `200` is a body; `404` is its own outcome; everything else fails.
-    ///
-    /// The non-200 2xx entries are the point: an implementation using
-    /// `is_success()` or `error_for_status()` would accept `206 Partial
-    /// Content` and hand a truncated volume to the decoder.
+    /// The non-200 2xx entries are the point: `is_success()` or
+    /// `error_for_status()` would accept `206 Partial Content` and hand a
+    /// truncated volume to the decoder.
     #[test]
     fn only_200_is_treated_as_a_complete_body() {
         assert_eq!(classify(StatusCode::OK), StatusClass::Ok);
@@ -714,7 +599,6 @@ mod tests {
         )
     }
 
-    /// Keys, the truncation flag and the cursor all come out of the document.
     #[test]
     fn parse_list_page_reads_keys_flag_and_cursor() {
         let page = parse_list_page(&listing(&["a/b/c/d/one", "a/b/c/d/two"], Some("TOK")))
@@ -724,7 +608,6 @@ mod tests {
         assert_eq!(page.next_token.as_deref(), Some("TOK"));
     }
 
-    /// A final page reports no truncation and no cursor.
     #[test]
     fn parse_list_page_reads_a_final_page() {
         let page = parse_list_page(&listing(&["a/b/c/d/one"], None)).expect("parses");
@@ -733,14 +616,11 @@ mod tests {
         assert_eq!(page.next_token, None);
     }
 
-    /// A `<Key>` is only an object when it sits inside `<Contents>`.
-    ///
-    /// The fixture plants one in an `<Error>` block and adds a
-    /// `<CommonPrefixes>` entry, because a plain `ListBucketResult` contains no
-    /// stray `<Key>` at all -- a test using the unmodified fixture would assert
-    /// the guard while proving only that the fixture has nothing to guard
-    /// against. Without `if in_contents` the phantom key is returned as a
-    /// volume and `crate::scan` tries to download it.
+    /// A `<Key>` is only an object inside `<Contents>`. The fixture plants one
+    /// in an `<Error>` block and adds a `<CommonPrefixes>` entry, because a
+    /// plain `ListBucketResult` has no stray `<Key>` to guard against. Without
+    /// `if in_contents` the phantom key is returned and `crate::scan` tries to
+    /// download it.
     #[test]
     fn parse_list_page_only_takes_keys_inside_contents() {
         let doc = listing(&["a/b/c/d/real"], None).replacen(
@@ -758,10 +638,8 @@ mod tests {
         );
     }
 
-    /// An empty listing is an empty result, not an error.
-    ///
-    /// `crate::scan::list_files_with_fallback` distinguishes "no files today"
-    /// from a failure, and rolls back a day on the former.
+    /// An empty listing is an empty result, not an error:
+    /// `crate::scan::list_files_with_fallback` rolls back a day on the former.
     #[test]
     fn parse_list_page_reads_an_empty_listing() {
         let page = parse_list_page(&listing(&[], None)).expect("parses");
@@ -772,9 +650,8 @@ mod tests {
     // -- pagination ---------------------------------------------------------
 
     /// Drive `collect_keys` over canned pages, recording the URLs requested.
-    ///
-    /// Returns `(keys, urls)`. `pollster` is not available here, so the future
-    /// is driven by hand -- it never yields, because the fetcher is immediate.
+    /// The future is driven by hand (no `pollster` here); it never yields,
+    /// because the fetcher is immediate.
     fn paginate(pages: Vec<std::result::Result<String, ArchiveError>>) -> (Result<Vec<String>>, Vec<String>) {
         let urls = std::cell::RefCell::new(Vec::new());
         let remaining = std::cell::RefCell::new(std::collections::VecDeque::from(pages));
@@ -800,12 +677,9 @@ mod tests {
         (outcome, urls.into_inner())
     }
 
-    /// A truncated listing is followed to completion, in order.
-    ///
-    /// The fixture is three pages, so this observes the token being threaded
-    /// *between* pages and not just once. It fails if the continuation token is
-    /// dropped (one page, two keys), if paging stops early (four keys), or if
-    /// pages are gathered out of order.
+    /// Three pages, so the token is observed threading *between* pages. Fails
+    /// if the token is dropped (one page, two keys), if paging stops early
+    /// (four keys), or if pages are gathered out of order.
     #[test]
     fn pagination_follows_the_cursor_across_every_page() {
         let (keys, urls) = paginate(vec![
@@ -844,11 +718,8 @@ mod tests {
         );
     }
 
-    /// An untruncated page ends the listing even if a cursor is echoed.
-    ///
-    /// Guards the loop condition specifically: an implementation that paged
-    /// while `next_token.is_some()` would request forever here, since the
-    /// fixture only supplies one page and every later fetch errors.
+    /// An untruncated page ends the listing even if a cursor is echoed: paging
+    /// while `next_token.is_some()` would request forever here.
     #[test]
     fn pagination_stops_on_the_truncation_flag_not_the_cursor() {
         let body = listing(&["a/b/c/d/k1"], None)
@@ -858,11 +729,8 @@ mod tests {
         assert_eq!(urls.len(), 1, "followed a cursor on an untruncated page");
     }
 
-    /// A truncated page with no cursor is an error, not a short listing.
-    ///
-    /// This is the case upstream turned into `TruncatedListObjectsResponse`.
-    /// Returning the partial result instead would be the silent data loss this
-    /// module exists to avoid.
+    /// A truncated page with no cursor is an error: returning the partial
+    /// result would be silent data loss.
     #[test]
     fn pagination_refuses_to_truncate_silently() {
         let body = listing(&["a/b/c/d/k1"], None).replace(
@@ -911,10 +779,9 @@ mod tests {
 
     // -- response handling --------------------------------------------------
     //
-    // `classify` is a pure function and is covered above, but nothing there
-    // proves `get_text` still *consults* it. These drive the real reqwest path
-    // against a one-shot loopback server: hermetic (port 0 on 127.0.0.1, one
-    // connection, no external network) but a genuine HTTP round trip.
+    // `classify` is covered above, but nothing there proves `get_text` still
+    // *consults* it. These drive the real reqwest path against a one-shot
+    // loopback server: hermetic, but a genuine HTTP round trip.
 
     /// Serve exactly one canned HTTP response and return the URL to hit.
     fn serve_once(response: String) -> String {
@@ -940,12 +807,10 @@ mod tests {
         )
     }
 
-    /// A cleartext-capable client.
-    ///
-    /// [`super::client`] sets `https_only`, which these loopback URLs cannot
-    /// satisfy. `tls::init()` is still required: with `rustls-no-provider` and
-    /// `aws-lc-rs` out of the graph, `build()` panics without a provider
-    /// regardless of the scheme actually used.
+    /// A cleartext-capable client: [`super::client`] sets `https_only`, which
+    /// loopback URLs cannot satisfy. `tls::init()` is still required — with
+    /// `rustls-no-provider` and `aws-lc-rs` out of the graph, `build()` panics
+    /// without a provider whatever scheme is used.
     fn loopback_client() -> reqwest::Client {
         crate::tls::init();
         reqwest::Client::builder()
@@ -954,8 +819,6 @@ mod tests {
             .expect("client")
     }
 
-    /// A `200` yields the body.
-    ///
     /// The counterweight to the two below: without it, a `get_text` that
     /// errored on everything would satisfy them both.
     #[tokio::test]
@@ -967,15 +830,9 @@ mod tests {
         assert_eq!(body, "<ListBucketResult/>");
     }
 
-    /// A `503` is an error, not an empty listing.
-    ///
-    /// This is the upstream bug in its original form: `nexrad-data` never
-    /// looked at the status, so a throttled or broken S3 handed its `<Error>`
-    /// document to the XML parser, which found no `<Contents>` and returned
-    /// zero objects. `crate::scan::list_files_with_fallback` reads zero objects
-    /// as "nothing recorded for this date", rolls back a day, gets the same
-    /// answer and reports no data available -- an outage shown to the user as
-    /// an absence of weather.
+    /// A `503` is an error, not an empty listing. This is the upstream bug:
+    /// zero objects reads as "nothing recorded for this date", so an outage
+    /// was shown to the user as an absence of weather.
     #[tokio::test]
     async fn get_text_reports_a_server_error_instead_of_an_empty_listing() {
         let url = serve_once(http_response(
@@ -993,7 +850,6 @@ mod tests {
         }
     }
 
-    /// A `404` is reported as an absence, distinctly from other failures.
     #[tokio::test]
     async fn get_text_reports_a_404_as_not_found() {
         let url = serve_once(http_response(
@@ -1014,12 +870,9 @@ mod tests {
     // Run with:
     //   cargo test -p rustdar-radar --lib -- --ignored --nocapture archive::tests::live_
 
-    /// End-to-end against the real bucket: list, download, decode.
-    ///
-    /// Nothing here is stubbed. It fails if the prefix scheme is wrong (empty
-    /// listing), if the key derivation is wrong (404), if the anonymous-access
-    /// assumption is wrong (403), or if the bytes that come back are not a
-    /// decodable Archive II volume.
+    /// End-to-end against the real bucket. Fails if the prefix scheme is wrong
+    /// (empty listing), the key derivation is wrong (404), anonymous access
+    /// stops working (403), or the bytes are not a decodable Archive II volume.
     #[ignore = "hits the live unidata-nexrad-level2 S3 bucket"]
     #[tokio::test]
     async fn live_archive_lists_downloads_and_decodes_a_volume() {
@@ -1032,7 +885,7 @@ mod tests {
             files.len()
         );
 
-        // The `_MDM` sidecars are in the listing on purpose; a volume is what
+        // The `_MDM` sidecars are in the listing on purpose; only a volume
         // decodes.
         let volume = files
             .iter()
@@ -1056,13 +909,10 @@ mod tests {
         assert!(sweeps > 0, "decoded a volume with no sweeps");
     }
 
-    /// Paging against real S3 reproduces the unpaginated listing exactly.
-    ///
-    /// This is the assertion the offline fixture cannot make: it proves the
-    /// continuation token rustls-encoded into a real query string is accepted
-    /// by S3 and advances the cursor, rather than being ignored (which would
-    /// loop on page one) or rejected. A real site-day is ~235 keys against a
-    /// 1000-key default page, so the small `max-keys` is what makes the
+    /// Paging against real S3 reproduces the unpaginated listing exactly: the
+    /// token is accepted and advances the cursor, rather than being ignored
+    /// (looping on page one) or rejected. A real site-day is ~235 keys against
+    /// a 1000-key default page, so the small `max-keys` is what makes the
     /// truncation path reachable at all.
     #[ignore = "hits the live unidata-nexrad-level2 S3 bucket"]
     #[tokio::test]
@@ -1103,8 +953,6 @@ mod tests {
         );
     }
 
-    /// A key the bucket does not hold is reported as an absence, not a body.
-    ///
     /// Fails if the 404 branch is dropped in favour of `error_for_status()`
     /// (wrong variant) or, worse, if a 404 body is handed back as volume data.
     #[ignore = "hits the live unidata-nexrad-level2 S3 bucket"]
@@ -1123,8 +971,6 @@ mod tests {
         );
     }
 
-    /// The bucket really is readable with no credentials.
-    ///
     /// The claim this whole module rests on: no SigV4, no credential chain. If
     /// the bucket ever required signing, every other live test would fail with
     /// a confusing decode error while this one names the cause.

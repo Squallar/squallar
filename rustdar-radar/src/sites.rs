@@ -1251,7 +1251,6 @@ pub const RADARS: [RadarSite; 207] = [
     },
 ];
 
-/// Get the lat/lon coordinates for a NEXRAD radar site
 pub fn get_radar_site(site: &str) -> Option<&'static RadarSite> {
     use std::collections::HashMap;
     use std::sync::LazyLock;

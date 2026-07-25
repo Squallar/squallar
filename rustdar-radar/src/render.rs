@@ -8,23 +8,14 @@ use seq_fallback::*;
 /// Sequential stand-ins for the two rayon entry points this module uses.
 ///
 /// wasm32-unknown-unknown is single-threaded: rayon compiles there but cannot
-/// build a thread pool, so the parallel iterators are not an option. This keeps
-/// the *call sites* identical rather than cfg'ing four rasterization loops,
-/// which is what would actually rot — the loops are the hot path and the two
-/// copies would drift.
-///
-/// The closures need no changes: rayon requires `Fn + Send + Sync`, which is
-/// strictly stronger than the `FnMut` these want, so anything that satisfied
-/// rayon satisfies this.
-///
-/// Native keeps rayon. This is a cfg split, not a removal — radar
-/// rasterization is the hot path on desktop and a sequential fallback silently
-/// becoming the native arm would be a large regression that no test notices.
+/// build a thread pool. Keeping the call sites identical avoids cfg'ing four
+/// rasterization loops, which would then drift. The closures need no changes —
+/// rayon requires `Fn + Send + Sync`, strictly stronger than the `FnMut` these
+/// want.
 #[cfg(target_arch = "wasm32")]
 mod seq_fallback {
-    /// Stands in for `rayon::prelude::ParallelSlice::par_iter`.
-    ///
-    /// Implemented on `[T]` only; `Vec<T>` reaches it through deref.
+    /// Stands in for `rayon::prelude::ParallelSlice::par_iter`. Implemented on
+    /// `[T]` only; `Vec<T>` reaches it through deref.
     pub trait ParIterFallback<T> {
         fn par_iter<'a>(&'a self) -> impl Iterator<Item = &'a T>
         where
@@ -60,10 +51,8 @@ use crate::types;
 
 // ── Shared rendering infrastructure ──────────────────────────────────────────
 
-/// Pre-computed Web Mercator projection constants for a radar station.
-///
-/// Derived from [`types::ImageBounds`] so the rendered pixel grid aligns
-/// exactly with the bounds reported to the UI layer.
+/// Pre-computed Web Mercator projection constants, derived from
+/// [`types::ImageBounds`] so the pixel grid aligns with the bounds the UI gets.
 struct MercatorProjection {
     radar_lat_rad: f64,
     cos_radar_lat: f64,
@@ -85,7 +74,6 @@ impl MercatorProjection {
         }
     }
 
-    /// Render a single radar gate cell into the atomic buffers.
     fn render_gate(
         &self,
         bufs: &RenderBuffers,
@@ -173,57 +161,26 @@ impl RadialContext {
 
 /// Paired atomic image and value buffers for parallel rendering.
 ///
-/// The atomics are load-bearing on native: `render_gate` is reached from a
-/// `par_iter` over radials, and two radials routinely land on the same pixel.
+/// Load-bearing on native: `render_gate` runs under a `par_iter` over radials
+/// and two radials routinely land on the same pixel. The overlap is *defined*
+/// but not *deterministic* — the last relaxed store wins, and which radial
+/// stores last is scheduling, so a native render differs between runs (five
+/// runs over one KTLX sweep, five hashes; `RAYON_NUM_THREADS=1`, one hash).
+/// Anything byte-comparing a native render must pin the thread count. wasm32 is
+/// single-threaded and so already reproducible.
 ///
-/// They make that overlap *defined*, not *deterministic*. The last relaxed
-/// store wins, and which radial stores last is thread scheduling, so the native
-/// image differs between runs of the same scan: five runs over one KTLX sweep
-/// gave five distinct hashes, while pinning `RAYON_NUM_THREADS=1` gave the same
-/// hash every time. Anything that wants to byte-compare a native render — a
-/// golden-image test, a cache key over pixels, a reproducible export — has to
-/// pin the thread count or it will flake. wasm32 is single-threaded and so is
-/// reproducible as it stands.
+/// Cfg-splitting the wasm arm to a plain `Vec` was measured, not assumed: it is
+/// worth ~1% (Firefox 233 → 230 ms, Chromium 261 → 262 ms on a KTLX 0.5°
+/// reflectivity sweep at `IMAGE_SIZE` 1024) for a byte-identical image, which
+/// does not pay for two buffer types under one hot loop.
 ///
-/// They are *not* load-bearing on wasm32, which is single-threaded — the
-/// `seq_fallback` above exists for exactly that reason — so a cfg-split to
-/// `Vec<u32>` there is an obvious-looking win, and was measured rather than
-/// assumed. It is not worth taking. Against a real KTLX 0.5° reflectivity
-/// sweep (720 radials × 1832 gates) at `IMAGE_SIZE` 1024, in a release build
-/// with the rasterizer isolated from WebGL and winit:
-///
-/// | what                                   | Firefox | Chromium |
-/// |----------------------------------------|--------:|---------:|
-/// | whole render                           |  233 ms |   261 ms |
-/// | 28 M relaxed `store` vs plain `Vec<u32>`| 39 / 37 |  47 / 48 |
-/// | `into_output` shape, atomic vs plain   | 0.8/0.4 |  0.7/0.3 |
-/// | `RenderBuffers::new`, atomic vs plain  | 0.2/0.3 |  0.3/0.2 |
-///
-/// That totals roughly 2.5 ms of a 233 ms frame — about 1%, and the same 1% in
-/// both browsers. The split was then built and measured end to end rather than
-/// inferred from those parts: with the wasm arm on `Vec<Cell<u32>>`, Firefox
-/// went 233 → 230 ms and Chromium 261 → 262 ms, for a byte-identical image. The
-/// cost of the split is two divergent buffer types under one hot loop; a 1%
-/// return does not pay for it.
-///
-/// The same measurements dispose of the theory that Firefox's reported 5.7×
-/// penalty on `radar-render` comes from these atomics. It does not: Firefox
-/// rasterizes this sweep *faster* than Chromium does, and relaxed atomic stores
-/// cost it 5% over plain ones.
-///
-/// That penalty has since been re-measured in the assembled web bundle, against
-/// one pinned sweep rather than whatever volume was newest at the time, and it
-/// is not there: Firefox 159 ms minimum against Chromium's 174 ms, a matched-pair
-/// median ratio of 0.88. The 5.7× was a measurement artifact. See `rustdar-web`'s
-/// crate docs for the table and for what made the original number wrong.
-///
-/// Where the frame actually goes is the per-sample transcendental in
-/// `types::lat_rad_to_mercator_y` — `(π/4 + lat/2).tan().ln()`, once per
-/// azimuth sample. 28 M of those cost 660 ms in Firefox and 597 ms in Chromium
-/// against 29 ms and 37 ms for the same loop without them, which puts this one
-/// call at most of the render on both. Reducing it means changing the arithmetic,
-/// and every pixel of the output is a function of that arithmetic, so it is not
-/// a change that can be made bit-identical — hence not made here.
+/// Most of the frame is the per-sample `(π/4 + lat/2).tan().ln()` in
+/// `types::lat_rad_to_mercator_y`: 28 M of those cost 660 ms in Firefox and
+/// 597 ms in Chromium against 29 ms and 37 ms for the same loop without them.
+/// Reducing it means changing the arithmetic every output pixel depends on, so
+/// it cannot be done bit-identically. Firefox's reported 5.7× `radar-render`
+/// penalty was a measurement artifact — re-measured on a pinned sweep it is
+/// 159 ms against Chromium's 174 ms; see `rustdar-web`'s crate docs.
 struct RenderBuffers {
     image: Vec<AtomicU32>,
     values: Vec<AtomicU32>,
@@ -260,12 +217,9 @@ impl RenderBuffers {
 
 // ── Sweep / azimuth helpers ──────────────────────────────────────────────────
 
-/// Find the closest available elevation angle in a scan for the given product.
-///
-/// Iterates all sweeps, rounds each elevation to 1 decimal place, keeps those
-/// that carry the requested product's moment data, and returns the one closest
-/// to `target_elevation`. Used by the loop renderer to snap the user's
-/// selected elevation to what's actually available in each historical scan.
+/// The available elevation angle (rounded to 0.1°) closest to
+/// `target_elevation` that carries this product. The loop renderer uses it to
+/// snap the selected elevation to what each historical scan actually holds.
 pub fn find_closest_elevation(
     scan: &Scan,
     product: types::RadarProduct,
@@ -343,8 +297,6 @@ fn compute_max_range(radials: &[Radial], product: types::RadarProduct) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Set up rendering infrastructure (projection + buffers), call the rendering
-/// closure, then convert buffers to output and log completion.
 fn render_with_projection(
     radar_lat: f64,
     radar_lon: f64,
@@ -370,11 +322,9 @@ fn render_with_projection(
 
 // ── Public rendering functions ───────────────────────────────────────────────
 
-/// Render radar data to an image projected for geographic display.
-/// Returns (image_data, max_range_km, value_data) where:
-/// - image_data: RGBA pixel data in geographic coordinate system
-/// - max_range_km: actual radar range
-/// - value_data: actual radar values at each pixel (f32::NAN for no data)
+/// Render radar data to an image projected for geographic display. Returns
+/// `(RGBA pixels, max_range_km, per-pixel values)`; a value is `f32::NAN` where
+/// there is no data.
 pub fn render_radar_to_image(
     data: &Scan,
     elevation_angle: f32,
@@ -384,7 +334,6 @@ pub fn render_radar_to_image(
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     let radials = find_sweep(data, product, elevation_angle)?;
 
-    // NROT is a derived product computed from velocity data
     if product == types::RadarProduct::NormalizedRotation {
         return render_nrot_to_image(radials, radar_lat, radar_lon);
     }
@@ -427,14 +376,9 @@ pub fn render_radar_to_image(
     Some(output)
 }
 
-/// Render NROT (Normalized Rotation) to an image.
-///
-/// Computes azimuthal shear from Level II velocity data and normalizes by range.
-/// The algorithm:
-/// 1. Extracts velocity values into a 2D grid (azimuth × range)
-/// 2. For each gate, computes the azimuthal velocity derivative using adjacent azimuths
-/// 3. Normalizes by range to remove beam-broadening effects
-/// 4. Scales to produce unitless values where >1.0 is significant, >2.5 is extreme
+/// Render NROT (Normalized Rotation): azimuthal shear derived from Level II
+/// velocity, normalized by range to remove beam broadening and scaled to a
+/// unitless field where >1.0 is significant and >2.5 extreme.
 fn render_nrot_to_image(
     radials: &[Radial],
     radar_lat: f64,
@@ -488,7 +432,7 @@ fn render_nrot_to_image(
     Some(output)
 }
 
-/// Extracted velocity data organized as a 2D grid (azimuth × range).
+/// Velocity as a 2D grid (azimuth × range).
 struct VelocityGrid {
     vel_grid: Vec<Vec<f64>>,
     azimuths_deg: Vec<f64>,
@@ -497,7 +441,6 @@ struct VelocityGrid {
     gate_interval_km: f64,
 }
 
-/// Extract velocity data from Level II radials into a 2D grid (azimuth × range).
 fn build_velocity_grid(radials: &[Radial]) -> Option<VelocityGrid> {
     let first_vel = radials.iter().find_map(|r| r.velocity())?;
     let gate_count = first_vel.gate_count() as usize;
@@ -524,12 +467,9 @@ fn build_velocity_grid(radials: &[Radial]) -> Option<VelocityGrid> {
     Some(VelocityGrid { vel_grid, azimuths_deg, gate_count, first_gate_range_km, gate_interval_km })
 }
 
-/// Filter the NROT grid to remove isolated noise pixels.
-///
-/// For each gate, requires at least `MIN_COHERENT` of the 25 neighbors
-/// (±2 azimuth × ±2 range) to be non-NaN and share the same sign as the
-/// center. Random noise has alternating signs and gets suppressed; real
-/// rotation couplets are spatially coherent and survive.
+/// Drop isolated noise: a gate survives only if `MIN_COHERENT` of its 25
+/// neighbours (±2 azimuth × ±2 range) are non-NaN and share its sign. Noise has
+/// alternating signs; real rotation couplets are spatially coherent.
 fn filter_nrot_grid(nrot_grid: &[Vec<f64>], gate_count: usize) -> Vec<Vec<f64>> {
     const HALF: i32 = 2;
     const MIN_COHERENT: usize = 8;
@@ -575,16 +515,13 @@ fn filter_nrot_grid(nrot_grid: &[Vec<f64>], gate_count: usize) -> Vec<Vec<f64>> 
         .collect()
 }
 
-/// Compute NROT via LLSD (Linear Least Squares Derivative).
+/// Compute NROT via LLSD (Linear Least Squares Derivative): per gate, fit
+/// `V = a + b*θ` over the velocities within `NEIGHBORHOOD_KM`, where θ is the
+/// azimuthal offset in radians; `b / range` is azimuthal shear (1/s), scaled by
+/// `NROT_SCALE`.
 ///
-/// For each gate, collects all velocity values within a circular neighborhood
-/// of `NEIGHBORHOOD_KM` radius and fits a linear regression V = a + b*θ
-/// where θ is the azimuthal offset in radians. The slope b is dV/dθ;
-/// dividing by range gives azimuthal shear (1/s), then scaled by `NROT_SCALE`.
-///
-/// This approach averages over ~50-100 gate pairs per point (at typical ranges),
-/// providing inherent noise suppression far superior to a 2-point central
-/// difference. No separate pre/post smoothing is needed.
+/// Averaging over the ~50-100 gate pairs this reaches at typical ranges is why
+/// no separate pre- or post-smoothing is needed.
 fn compute_nrot_grid(
     vel_grid: &[Vec<f64>],
     gate_count: usize,
@@ -612,12 +549,11 @@ fn compute_nrot_grid(
                         return f64::NAN;
                     }
 
-                    // Number of azimuths that fit within the neighborhood at this range
+                    // Azimuths that fit in the neighborhood at this range.
                     let az_spacing_rad = 2.0 * PI / num_radials as f64;
                     let arc_per_az_km = range_km * az_spacing_rad;
                     let az_reach = (NEIGHBORHOOD_KM / arc_per_az_km).ceil() as i32;
 
-                    // LLSD: fit V = a + b*θ via least squares
                     let mut sum_t = 0.0_f64;
                     let mut sum_v = 0.0_f64;
                     let mut sum_t2 = 0.0_f64;
@@ -669,8 +605,8 @@ fn compute_nrot_grid(
 
                     let nf = n as f64;
                     let denom = nf * sum_t2 - sum_t * sum_t;
-                    // 1e-10 threshold: well above f64 epsilon (~2.2e-16) to reject
-                    // near-singular least-squares systems before catastrophic cancellation
+                    // Well above f64 epsilon (~2.2e-16): rejects near-singular
+                    // systems before catastrophic cancellation.
                     if denom.abs() < 1e-10 {
                         return f64::NAN;
                     }
@@ -689,18 +625,12 @@ fn compute_nrot_grid(
         .collect()
 }
 
-/// Render a Level III radial product to an image projected for geographic display.
+/// Render a Level III radial product, as [`render_radar_to_image`] does for a
+/// Level II `Scan`.
 ///
-/// Uses the same Web Mercator projection and atomic-buffer approach as
-/// [`render_radar_to_image`], but reads from a Level III [`RadialPacket`]
-/// instead of a Level II `Scan`.
-///
-/// For digital products, `scale` and `offset` convert raw gate bytes to physical
-/// values: `physical = (gate_byte - offset) / scale`.
-///
-/// When `lut` is provided it overrides scale/offset: the gate value is used as
-/// an index directly.  This covers both legacy 4-bit products (16-entry LUT)
-/// and special digital products like VIL (256-entry LUT).
+/// For digital products `physical = (gate_byte - offset) / scale`. A `lut`
+/// overrides that and indexes on the gate value directly, covering legacy 4-bit
+/// products (16 entries) and VIL (256 entries).
 pub fn render_level3_radial_to_image(
     radial_packet: &nexrad_level3::model::RadialPacket,
     product: types::RadarProduct,
@@ -757,13 +687,9 @@ pub fn render_level3_radial_to_image(
     Some(output)
 }
 
-/// Render a Level III message to an image, extracting render parameters from the
-/// message's symbology block and product description block.
-///
-/// This is the high-level entry point for Level III rendering that encapsulates
-/// all nexrad-level3 internal knowledge (radial packet extraction, scale/offset,
-/// LUT building). Callers only need to provide the decoded message, product type,
-/// and radar location.
+/// Render a Level III message, taking the radial packet, scale/offset and LUT
+/// out of its symbology and product description blocks. Keeps every
+/// nexrad-level3 internal out of the callers.
 pub fn render_level3_message_to_image(
     l3_msg: &nexrad_level3::model::Level3Message,
     product: types::RadarProduct,
@@ -772,7 +698,6 @@ pub fn render_level3_message_to_image(
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     use nexrad_level3::model::DataPacket;
 
-    // Extract radial packet from symbology layers
     let radial_packet = l3_msg.symbology.as_ref().and_then(|sym| {
         sym.layers.iter().find_map(|layer| {
             layer.packets.iter().find_map(|pkt| {
@@ -799,10 +724,8 @@ pub fn render_level3_message_to_image(
         }
     };
 
-    // Build scale, offset, and optional LUT from the product description block.
-    // Prefer XDR-derived scale/offset from packet 28 attributes when available,
-    // since PDB thresholds don't encode IEEE-float values for some products
-    // (e.g. 134 DVL, 135 EET).
+    // Prefer the XDR scale/offset from packet 28 attributes: PDB thresholds do
+    // not encode IEEE floats for some products (134 DVL, 135 EET).
     let scale = rp.xdr_data_scale.unwrap_or_else(|| l3_msg.pdb.data_scale());
     let offset = rp.xdr_data_offset.unwrap_or_else(|| l3_msg.pdb.data_offset());
     let vil_lut = build_vil_lut(&l3_msg.pdb);
@@ -824,15 +747,13 @@ pub fn render_level3_message_to_image(
     render_level3_radial_to_image(rp, product, radar_lat, radar_lon, scale, offset, lut)
 }
 
-/// Build a 256-entry look-up table for Digital VIL (product 134).
+/// Build a 256-entry look-up table for Digital VIL (product 134), `None` for
+/// anything else.
 ///
-/// VIL uses a hybrid linear + logarithmic mapping encoded with
-/// NEXRAD-specific 16-bit floats (not IEEE-754).  The first five
-/// thresholds carry: lin_scale, lin_offset, log_start, log_scale,
-/// log_offset.  Gate values 2..log_start use a linear formula;
-/// gate values log_start..254 use an exponential formula.
-///
-/// Returns `None` when the product code is not 134.
+/// VIL is a hybrid linear + logarithmic mapping encoded in NEXRAD 16-bit floats
+/// (not IEEE-754). Thresholds 0..5 carry lin_scale, lin_offset, log_start,
+/// log_scale, log_offset; gates 2..log_start are linear, log_start..254
+/// exponential.
 fn build_vil_lut(pdb: &nexrad_level3::model::ProductDescriptionBlock) -> Option<Vec<f32>> {
     if pdb.product_code != 134 {
         return None;
@@ -857,10 +778,9 @@ fn build_vil_lut(pdb: &nexrad_level3::model::ProductDescriptionBlock) -> Option<
 
 /// Decode the 16 legacy data level thresholds into physical values.
 ///
-/// For legacy products (e.g., code 56 SRM), each threshold `u16` encodes
-/// a physical value with flag bits in the high byte and the numeric value
-/// in the low byte. Returns a 16-element array where `NaN` means the
-/// level is not displayable (blank, threshold, no data, or range-folded).
+/// For legacy products (e.g. code 56 SRM) each threshold `u16` carries flag
+/// bits in the high byte and the value in the low byte. `NaN` marks a level
+/// that is not displayable.
 fn decode_legacy_thresholds(pdb: &nexrad_level3::model::ProductDescriptionBlock) -> [f32; 16] {
     let mut lut = [f32::NAN; 16];
     for (i, &t) in pdb.thresholds.iter().enumerate() {
@@ -868,8 +788,7 @@ fn decode_legacy_thresholds(pdb: &nexrad_level3::model::ProductDescriptionBlock)
         let mut val = (t & 0xFF) as f32;
 
         if codes & 0x80 != 0 {
-            // Special category: Blank, TH (below threshold),
-            // ND (no data), RF (range folded) → not displayable
+            // Blank, TH (below threshold), ND (no data) or RF (range folded).
             continue;
         } else if codes & 0x40 != 0 {
             val *= 0.01;
@@ -888,11 +807,10 @@ fn decode_legacy_thresholds(pdb: &nexrad_level3::model::ProductDescriptionBlock)
     lut
 }
 
-/// Decode a NEXRAD-specific 16-bit floating-point value.
-///
-/// Format: sign (bit 15), exponent (bits 14–10), fraction (bits 9–0).
-/// value = (-1)^sign × 2^(exp − 16) × (1 + frac/1024)  when exp ≠ 0
-/// value = (-1)^sign × frac / 512                        when exp = 0
+/// Decode a NEXRAD-specific 16-bit float: sign (bit 15), exponent (14–10),
+/// fraction (9–0).
+/// `value = (-1)^sign × 2^(exp − 16) × (1 + frac/1024)` when exp ≠ 0,
+/// `value = (-1)^sign × frac / 512` when exp = 0.
 fn nexrad_float16(raw: u16) -> f32 {
     let frac = (raw & 0x03FF) as f32;
     let exp = ((raw >> 10) & 0x1F) as i32;
@@ -905,8 +823,8 @@ fn nexrad_float16(raw: u16) -> f32 {
     if sign != 0 { -value } else { value }
 }
 
-/// Convert a Level III gate byte to a physical value, applying LUT or scale/offset
-/// and the knots→m/s conversion for SRV products.
+/// Level III gate byte to physical value, via LUT or scale/offset. SRV is
+/// converted knots → m/s.
 fn l3_physical_value(
     gate_value: u16,
     product: types::RadarProduct,

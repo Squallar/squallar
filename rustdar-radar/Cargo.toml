@@ -12,31 +12,21 @@ nexrad-data = { workspace = true }
 nexrad-model = { workspace = true }
 nexrad-decode = { workspace = true }
 nexrad-level3 = { workspace = true }
-# TLS backend comes from the workspace pin; nothing extra is needed here.
 reqwest = { workspace = true }
 thiserror = { workspace = true }
-# ListObjectsV2 response parsing in `archive`. Pure Rust (xml-rs), and a direct
-# dependency here only because `nexrad-data`'s `aws` feature used to pull the
-# same crate in transitively for the same job -- the crate count is unchanged.
+# ListObjectsV2 response parsing in `archive`. Pure Rust (xml-rs).
 xml = "=1.3.0"
 
-# Used by `tls` to build the process-wide *ring* provider. Direct dependency
-# because this crate is the lowest one in the graph that can reach a TLS
-# handshake (see `tls`), so it is where the provider gets installed.
+# `tls` installs the process-wide *ring* provider here: this is the lowest crate
+# in the graph that reaches a TLS handshake.
 #
-# Off on wasm32 on purpose. There, reqwest gates every TLS dependency out and
-# goes through the browser's `fetch()`, so trust decisions and revocation are the
-# browser's and update with it. Pulling rustls in anyway would put `ring` -- the
-# workspace's one C dependency -- into a graph that has no use for it.
+# Off on wasm32: reqwest goes through the browser's `fetch()` there, so pulling
+# rustls in would add `ring` -- the workspace's one C dependency -- for nothing.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rustls = { workspace = true }
 # wasm32-unknown-unknown is single-threaded: rayon compiles there but cannot
 # build a pool. `render.rs` carries a sequential fallback for the web arm.
-# rayon stays native because rasterization is the hot path on desktop -- this
-# is a cfg split, not a removal.
 rayon = "=1.12.0"
 
 [dev-dependencies]
-# Test-only: drives the `#[ignore]`d live TLS check in `tls`. Not linked into any
-# shipped binary.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

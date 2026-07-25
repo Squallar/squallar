@@ -8,21 +8,12 @@ use crate::sites::RadarSite;
 use crate::sites::get_radar_site;
 
 /// Side length, in pixels, of the square radar image every render produces.
+/// An RGBA texture is `IMAGE_SIZE² × 4` bytes; a static pane render keeps an
+/// `f32` value grid alongside it, doubling that.
 ///
-/// Sets the cost of a radar frame. An RGBA texture is `IMAGE_SIZE² × 4` bytes;
-/// a *static* pane render keeps an `f32` value grid alongside it for hover
-/// readout, doubling that, while loop frames carry the texture alone.
-///
-/// | target  | IMAGE_SIZE | texture | + value grid |
-/// |---------|-----------:|--------:|-------------:|
-/// | desktop |       2048 |  16 MiB |       32 MiB |
-/// | android |       2048 |  16 MiB |       32 MiB |
-/// | wasm32  |       1024 |   4 MiB |        8 MiB |
-///
-/// wasm32 halves the side because the whole linear memory is capped at 4 GiB and
-/// WebGL2 only guarantees `max_texture_dimension_2d == 2048` — at 2048² a radar
-/// frame sits exactly on the limit, leaving nothing spare for the overlay
-/// textures that have to coexist with it.
+/// wasm32 halves the side: WebGL2 only guarantees
+/// `max_texture_dimension_2d == 2048`, so a 2048² frame sits exactly on the
+/// limit with nothing spare for the overlay textures beside it.
 #[cfg(target_arch = "wasm32")]
 pub const IMAGE_SIZE: usize = 1024;
 #[cfg(not(target_arch = "wasm32"))]
@@ -35,32 +26,25 @@ pub const EARTH_RADIUS_KM: f64 = 6371.0;
 /// m/s to mph conversion factor.
 pub const MS_TO_MPH: f32 = 2.23694;
 
-/// Convert latitude (in radians) to Web Mercator Y coordinate.
-/// Returns a unitless value; the scale is consistent for relative comparisons.
 #[inline]
 pub(crate) fn lat_rad_to_mercator_y(lat_rad: f64) -> f64 {
     (PI / 4.0 + lat_rad / 2.0).tan().ln()
 }
 
-/// Geographic bounds of the rendered radar image.
-/// The image pixels are linearly spaced in Web Mercator Y and longitude,
-/// matching the projection used by slippy-map tile providers (CartoDB, OSM).
+/// Geographic bounds of the rendered radar image. Pixels are linearly spaced
+/// in Web Mercator Y and longitude, matching slippy-map tile providers.
 #[derive(Debug, Clone, Copy)]
 pub struct ImageBounds {
     pub min_lat: f64,
     pub max_lat: f64,
     pub min_lon: f64,
     pub max_lon: f64,
-    /// Mercator Y value corresponding to `min_lat` (south edge).
     pub mercator_y_min: f64,
-    /// Mercator Y value corresponding to `max_lat` (north edge).
     pub mercator_y_max: f64,
 }
 
 impl ImageBounds {
-    /// Compute the geographic bounds of a radar image centered on a site.
-    /// Uses `MAX_RANGE_KM` to define the image extent. The vertical axis
-    /// is mapped in Web Mercator Y so the image aligns with slippy-map tiles.
+    /// Extent is `MAX_RANGE_KM` in every direction from the site.
     pub fn from_radar_site(radar_lat: f64, radar_lon: f64) -> Self {
         let radar_lat_rad = radar_lat.to_radians();
         let lat_deg_per_km = 1.0 / 111.32;
@@ -83,40 +67,31 @@ impl ImageBounds {
     }
 }
 
-/// Information about a loaded radar scan
 #[derive(Debug, Clone)]
 pub struct ScanInfo {
-    /// The radar site code
     pub site: RadarSite,
-    /// The actual timestamp of the scan data
+    /// From the first radial's collection timestamp, not the request.
     pub timestamp: NaiveDateTime,
     /// Volume Coverage Pattern number (e.g. 212, 215, 35)
     pub vcp_number: u16,
-    /// Available products in this scan
     pub available_products: Vec<RadarProduct>,
-    /// Map of product to available elevation angles (sorted)
+    /// Elevation angles per product, sorted ascending.
     pub product_elevations: HashMap<RadarProduct, Vec<f32>>,
-    /// Status message
     pub status: String,
 }
 
 impl ScanInfo {
-    /// Build a `ScanInfo` by inspecting every sweep/radial in the scan.
-    ///
-    /// This discovers which radar products are present and at which elevation
-    /// angles. Level III products are added to the available list with empty
-    /// elevation vectors (populated later as L3 data arrives).
+    /// Level III products are listed with empty elevation vectors, filled in
+    /// later as L3 data arrives.
     pub fn from_scan(data: &Scan, site: &str, requested_timestamp: NaiveDateTime) -> Self {
         let vcp_number = data.coverage_pattern_number().number();
 
         let product_elevations = discover_product_elevations(data);
 
-        // Get list of available products, sorted by priority
         let mut available_products: Vec<RadarProduct> =
             product_elevations.keys().copied().collect();
         available_products.sort_by_key(|p| p.sort_order());
 
-        // Extract actual timestamp from the first radial's collection timestamp
         let actual_timestamp = data
             .sweeps()
             .first()
@@ -158,17 +133,14 @@ impl ScanInfo {
     }
 }
 
-/// Inspect all sweeps in a scan to discover which products exist and at which
-/// elevation angles. Rounds angles to 0.1° to collapse SAILS/MRLE duplicates.
-/// Level III products are included with empty elevation lists.
+/// Rounds elevation angles to 0.1° so SAILS/MRLE repeat scans and split cuts
+/// at the same nominal angle collapse to one entry.
 fn discover_product_elevations(scan: &Scan) -> HashMap<RadarProduct, Vec<f32>> {
     let mut product_elevations: HashMap<RadarProduct, Vec<f32>> = HashMap::new();
 
     for (i, sweep) in scan.sweeps().iter().enumerate() {
         if let Some(first_radial) = sweep.radials().first() {
             let raw_angle = first_radial.elevation_angle_degrees();
-            // Round to 1 decimal place so SAILS/MRLE repeat scans and
-            // split-cuts at the same nominal angle collapse to one entry.
             let elev_angle = (raw_angle * 10.0).round() / 10.0;
 
             let mut products_found: Vec<&str> = Vec::new();
@@ -191,7 +163,6 @@ fn discover_product_elevations(scan: &Scan) -> HashMap<RadarProduct, Vec<f32>> {
         }
     }
 
-    // Sort and deduplicate elevation angles for each product
     for angles in product_elevations.values_mut() {
         angles.sort_by(|a, b| a.total_cmp(b));
         angles.dedup();
@@ -205,7 +176,6 @@ fn discover_product_elevations(scan: &Scan) -> HashMap<RadarProduct, Vec<f32>> {
         );
     }
 
-    // Include Level III products with empty elevation lists
     for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
         product_elevations
             .entry(*l3_product)
@@ -215,7 +185,6 @@ fn discover_product_elevations(scan: &Scan) -> HashMap<RadarProduct, Vec<f32>> {
     product_elevations
 }
 
-/// Radar product types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum RadarProduct {
     Reflectivity,
@@ -288,7 +257,7 @@ impl RadarProduct {
         ]
     }
 
-    /// Canonical sort key for ordering products in the UI.
+    /// Order products are listed in the UI.
     pub fn sort_order(&self) -> u8 {
         match self {
             RadarProduct::Reflectivity => 0,
@@ -307,7 +276,6 @@ impl RadarProduct {
         }
     }
 
-    /// Whether this product comes from Level III data (as opposed to Level II base moments).
     pub fn is_level3(&self) -> bool {
         matches!(
             self,
@@ -320,26 +288,15 @@ impl RadarProduct {
         )
     }
 
-    /// The AWIPS product IDs to fetch for this product, one per tilt.
+    /// The AWIPS product IDs to fetch for this product, one per tilt. These key
+    /// the `unidata-nexrad-level3` bucket (`TLX_N0S_2026_07_25_...`). `None`
+    /// for Level II products.
     ///
-    /// These key the `unidata-nexrad-level3` bucket — `TLX_N0S_2026_07_25_...`
-    /// — and replace the TGFTP directory names (`56rm0`, `176pr`, …) rustdar
-    /// used before. TGFTP sends no `Access-Control-Allow-Origin`, so the web
-    /// build cannot read it; see [`crate::level3`].
-    ///
-    /// Returns `None` for Level II products, which come from the base moments.
-    ///
-    /// # Storm-relative velocity is one tilt, not four
-    ///
-    /// TGFTP served `56rm0`–`56rm3`. Only `N0S` still exists: NWS removed the
-    /// higher SRM tilts from NOAAPort (SCN 22-96), and every CORS-clean source
-    /// is NOAAPort-derived, so `N1S`/`N2S`/`N3S` have had nothing written to
-    /// them since 2020. Listing them here would produce three permanently
-    /// failing fetches per scan and three empty tilt entries in the UI.
-    ///
-    /// Do **not** fill the gap by pointing a higher tilt at `N0S`: storm-
-    /// relative velocity is elevation-specific, and a 0.5° field labelled as
-    /// 1.5° is a wrong answer rather than a missing one.
+    /// Storm-relative velocity is one tilt, not four: NWS removed the higher
+    /// SRM tilts from NOAAPort (SCN 22-96), so nothing has been written to
+    /// `N1S`/`N2S`/`N3S` since 2020. Do not fill the gap by pointing a higher
+    /// tilt at `N0S` — SRM is elevation-specific, so a 0.5° field labelled 1.5°
+    /// is a wrong answer rather than a missing one.
     pub fn level3_products(&self) -> Option<&'static [&'static str]> {
         match self {
             RadarProduct::StormRelativeVelocity => Some(&["N0S"]),
@@ -352,8 +309,7 @@ impl RadarProduct {
         }
     }
 
-    /// Get the moment data for this product from a radial.
-    /// Centralizes the product → accessor mapping in one place.
+    /// The moment data for this product on a radial.
     pub fn get_moment<'a>(&self, radial: &'a Radial) -> Option<&'a nexrad_model::data::MomentData> {
         match self {
             RadarProduct::Reflectivity => radial.reflectivity(),
@@ -362,9 +318,8 @@ impl RadarProduct {
             RadarProduct::DifferentialReflectivity => radial.differential_reflectivity(),
             RadarProduct::CorrelationCoefficient => radial.correlation_coefficient(),
             RadarProduct::DifferentialPhase => radial.differential_phase(),
-            // NROT is derived from velocity data
+            // NROT is derived from velocity
             RadarProduct::NormalizedRotation => radial.velocity(),
-            // Level III products don't come from Level II radials
             RadarProduct::StormRelativeVelocity
             | RadarProduct::SpecificDifferentialPhase
             | RadarProduct::EchoTops
