@@ -39,7 +39,16 @@ val jniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
 // This is the snippet from the crate's README, translated to the Kotlin DSL and
 // using Gradle's bundled Groovy JsonSlurper rather than kotlinx-serialization so
 // that no buildscript classpath dependency is needed.
-fun RepositoryHandler.rustlsPlatformVerifier(): MavenArtifactRepository {
+//
+// The version is read from the repo layout rather than declared as
+// `latest.release` (which is what the README suggests). Dynamic version selection
+// needs a `maven-metadata.xml` to enumerate versions, and the bundled repo ships
+// only `maven-metadata-local.xml` — so `latest.release` fails to resolve outright.
+// Listing the version directory gets the same "track whatever Cargo resolved"
+// behaviour without depending on metadata that is not there.
+data class RustlsVerifier(val mavenDir: File, val version: String)
+
+val rustlsVerifier: RustlsVerifier = run {
     val metadataJson = providers.exec {
         commandLine(
             "cargo", "metadata",
@@ -63,16 +72,34 @@ fun RepositoryHandler.rustlsPlatformVerifier(): MavenArtifactRepository {
     val mavenDir = File(manifestPath.parentFile, "maven")
     require(mavenDir.isDirectory) { "Expected bundled Maven repo at $mavenDir" }
 
-    return maven {
-        url = uri(mavenDir)
-        // The bundled repo has no Gradle module metadata or POM-based variant info;
-        // resolve straight from the AAR artifact.
-        metadataSources { artifact() }
-    }
+    val version = File(mavenDir, "rustls/rustls-platform-verifier")
+        .listFiles { f: File -> f.isDirectory }
+        ?.map { it.name }
+        ?.maxOrNull()
+        ?: error("No versions of rustls:rustls-platform-verifier found under $mavenDir")
+
+    RustlsVerifier(mavenDir, version)
 }
 
 repositories {
-    rustlsPlatformVerifier()
+    // google() and mavenCentral() must be repeated here, not just in settings.
+    // Declaring any project-level repository makes Gradle use the project's list
+    // instead of the settings list, so omitting them leaves AGP's own
+    // dependencies — notably the kotlin-stdlib its built-in Kotlin support adds to
+    // the runtime classpath — resolvable only from the rustls repo, where they
+    // obviously are not.
+    google()
+    mavenCentral()
+    maven {
+        url = uri(rustlsVerifier.mavenDir)
+        // mavenPom() is what carries `<packaging>aar</packaging>`; without it
+        // Gradle looks for a .jar that does not exist. artifact() is the fallback
+        // for a version directory that somehow has no POM.
+        metadataSources {
+            mavenPom()
+            artifact()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +135,29 @@ val keystoreProps: Properties? = run {
 // address space, so armeabi-v7a/x86 builds would OOM rather than merely run slow.
 //
 // Override for a one-off local build with `-PabiFilter=arm64-v8a`.
+// ---------------------------------------------------------------------------
+// NDK location
+// ---------------------------------------------------------------------------
+//
+// Resolved explicitly rather than read back off the `android {}` block: AGP 9
+// removed `android.ndkDirectory`, and cargo-ndk is a plain subprocess that finds
+// the NDK only through the environment. Deriving both from one pinned version
+// here is what keeps the Rust and Java halves of the build on the same NDK.
+val ndkVersionPin = "27.3.13750724"
+
+val androidSdkDir: File = run {
+    val sdkDirProp = rootProject.file("local.properties")
+        .takeIf { it.isFile }
+        ?.let { f -> Properties().apply { f.inputStream().use { load(it) } }.getProperty("sdk.dir") }
+    val path = sdkDirProp
+        ?: System.getenv("ANDROID_HOME")
+        ?: System.getenv("ANDROID_SDK_ROOT")
+        ?: error("Android SDK not found. Set sdk.dir in local.properties, or ANDROID_HOME.")
+    File(path)
+}
+
+val ndkDir: File = File(androidSdkDir, "ndk/$ndkVersionPin")
+
 val allAbis = listOf("arm64-v8a", "x86_64")
 val selectedAbis: List<String> = (project.findProperty("abiFilter") as String?)
     ?.split(",")?.map(String::trim)?.filter(String::isNotEmpty)
@@ -117,7 +167,7 @@ val selectedAbis: List<String> = (project.findProperty("abiFilter") as String?)
 android {
     namespace = "dev.mcswain.rustdar"
     compileSdk = 36
-    ndkVersion = "27.3.13750724"
+    ndkVersion = ndkVersionPin
 
     defaultConfig {
         applicationId = "dev.mcswain.rustdar"
@@ -246,6 +296,19 @@ fun cargoNdkTask(name: String, cargoProfile: String): TaskProvider<Exec> = tasks
     if (cargoProfile == "release") args += "--release"
     commandLine = args
 
+    // Point cargo-ndk at the same NDK the `android {}` block pins, rather than
+    // letting it pick up whatever ANDROID_NDK_HOME happens to be exported. Without
+    // this the Rust and Java halves of the build can silently use different NDKs,
+    // and CI -- where no such variable is set -- fails with cargo-ndk's own
+    // "couldn't find NDK" rather than anything actionable.
+    doFirst {
+        require(ndkDir.isDirectory) {
+            "NDK $ndkVersionPin not found at $ndkDir. Install it with:\n" +
+                "  sdkmanager --install \"ndk;$ndkVersionPin\""
+        }
+    }
+    environment("ANDROID_NDK_HOME", ndkDir.absolutePath)
+
     // Full workspace-crate closure of rustdar-android on aarch64-linux-android
     // (regenerate with `cargo metadata --filter-platform aarch64-linux-android`).
     // A crate missing from this list leaves the task UP-TO-DATE after edits to it,
@@ -299,8 +362,13 @@ tasks.named("clean").configure {
 }
 
 dependencies {
-    // The Kotlin CertificateVerifier the Rust side reaches over JNI. Version is
-    // whatever the resolved `rustls-platform-verifier-android` crate bundles, so
-    // it tracks the Cargo dependency automatically instead of being pinned twice.
-    implementation("rustls:rustls-platform-verifier:latest.release")
+    // The Kotlin CertificateVerifier the Rust side reaches over JNI. The version
+    // is whatever the resolved `rustls-platform-verifier-android` crate bundles,
+    // so it tracks the Cargo dependency rather than being pinned in two places.
+    //
+    // kotlin-stdlib, which this needs at runtime, is not declared in the AAR's POM
+    // and does not have to be declared here either: AGP 9's built-in Kotlin
+    // support puts it on the runtime classpath. That is precisely the manual
+    // kotlin-stdlib download build-android.sh used to do before calling d8.
+    implementation("rustls:rustls-platform-verifier:${rustlsVerifier.version}")
 }

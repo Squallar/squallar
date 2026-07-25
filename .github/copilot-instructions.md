@@ -35,7 +35,7 @@ Overlay fetching uses `OverlayRegistry::create_fetch_tasks()` → handler-specif
 - **Pinned crate versions:** `nexrad-data =1.0.0-rc.5`, `nexrad-model =1.0.0-rc.2`, `nexrad-decode =1.0.0-rc.3`. Don't upgrade without testing.
 - **Config:** `ui.json` saved/loaded from `XDG_CONFIG_HOME/rustdar` or `~/.config/rustdar`. Uses `#[serde(default)]` for backward compatibility.
 - **No web target.** Native adapter limits only.
-- **Android:** `#[cfg(target_os = "android")]` gates in `rustdar-platform` and Cargo.toml deps. Requires `openssl-sys` with `vendored` feature.
+- **Android:** `#[cfg(target_os = "android")]` gates in `rustdar-platform` and Cargo.toml deps. TLS is `rustls` + `rustls-platform-verifier` over the OS trust store; there is no OpenSSL and no bundled root store.
 
 ## Build & Run
 
@@ -44,8 +44,14 @@ cargo build --workspace                      # Desktop (needs libasound2-dev on 
 cargo run -p rustdar-platform
 cargo clippy --all-targets --all-features    # Lint (matches CI)
 
-./build-android.sh                           # Android APK (needs cargo-apk, NDK, d8)
+cd rustdar-android/android && ./gradlew assembleRelease   # Android APK (needs SDK + NDK)
+cd rustdar-android/android && ./gradlew bundleRelease     # Android .aab
 ```
+
+Android is built by Gradle + cargo-ndk, not cargo-apk. The Gradle project lives in
+`rustdar-android/android/`; it stages `librustdar_android.so` into `jniLibs` for
+`arm64-v8a` and `x86_64`, and compiles `res/xml/network_security_config.xml` into
+the resource table so the manifest can reference it.
 
 ## Architecture Patterns
 

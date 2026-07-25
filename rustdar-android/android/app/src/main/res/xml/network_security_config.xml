@@ -19,7 +19,7 @@
       because a DEX at the APK root needs no resource table entry; an `res/xml/`
       file does. Adding it to the ZIP would have achieved nothing.
 
-  ---------------------------------------------------------------------------
+  ===========================================================================
   Why the base config permits cleartext while every rustdar domain forbids it
 
   rustls-platform-verifier issue #221: on Android, certificates whose revocation
@@ -41,9 +41,12 @@
   Hence: `cleartextTrafficPermitted="true"` in base-config, so the platform's own
   revocation fetches succeed, and `false` per-domain for every host rustdar
   actually talks to, so none of rustdar's own traffic can travel in the clear.
-  Application code is not trusted to get this right on its own -- every client is
-  additionally built with `.https_only(true)` (see rustdar_radar::tls::client) --
+  Application code is not trusted to get this right on its own (every client is
+  additionally built with `.https_only(true)`, see rustdar_radar::tls::client),
   but this file is what makes it the OS's decision rather than ours.
+
+  NB: an XML comment may not contain a double hyphen, and aapt2 parses this file
+  for real. Keep prose here free of them or the resource build fails.
 
   includeSubdomains is set where a host family is used (*.noaa.gov, *.weather.gov)
   and omitted where the exact host is fixed.
