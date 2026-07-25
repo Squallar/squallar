@@ -52,7 +52,11 @@ use rustdar_radar::sources::DataSources;
 use super::{HrrrFetchResult, HrrrGridData, ModelParameter, lambert};
 use crate::types::GeoBounds;
 
-/// How long a single HRRR request may take.
+/// How long a single HRRR request may take **in this module's live tests**.
+///
+/// Production does not use this: the model handler fetches with `ctx.client`,
+/// which the application builds with a 30 s timeout. See [`hrrr_client`].
+#[cfg(test)]
 const HRRR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 // ---------------------------------------------------------------------------
@@ -116,10 +120,31 @@ pub fn parse_idx(text: &str) -> Vec<IdxRecord> {
 ///
 /// Matching is on `var` **and** `level` together. Either alone is ambiguous:
 /// HRRR carries five `CAPE` records at different levels and two `CIN`s, and
-/// `surface` appears on dozens of variables. The first match wins, which is
-/// the lowest-numbered record — for the fields rustdar requests there is
-/// exactly one match, and `every_parameter_selects_exactly_one_record` is what
-/// keeps that true.
+/// `surface` appears on dozens of variables.
+///
+/// # `(var, level)` is not unique, and the tie-break is positional
+///
+/// The first match wins, i.e. the lowest-numbered record. That is *not* a
+/// property of the index — a real `hrrr.tHHz.wrfsfcf01.grib2.idx` contains two
+/// pairs that repeat, distinguished only by the forecast description this
+/// function does not look at:
+///
+/// ```text
+///  8:…:REFD:263 K level:1 hour fcst:        44:…:REFD:263 K level:0-1 hour max fcst:
+/// 68:…:WEASD:surface:1 hour fcst:           85:…:WEASD:surface:0-1 hour acc fcst:
+/// ```
+///
+/// Neither is a field rustdar requests, so the selection is unambiguous for
+/// every `ModelParameter` today — and that is checked, against the live index,
+/// by `live_every_parameter_selects_exactly_one_record`. It is checked rather
+/// than assumed because picking the first `REFD:263 K level` would take the
+/// instantaneous field where a caller asking for a maximum wanted record 44:
+/// the same class of error as the constant-zero f00 `MXUPHL`, and just as
+/// quiet.
+///
+/// [`IdxRecord::forecast`] is parsed and carried for exactly this reason: it is
+/// the disambiguator, unused only because nothing needs it yet. A parameter
+/// whose pair does repeat must match on it as well, not rely on record order.
 pub fn byte_range(
     records: &[IdxRecord],
     var: &str,
@@ -207,6 +232,29 @@ fn grid_latlons<R>(submessage: &SubMessage<'_, R>) -> Result<Vec<(f64, f64)>, St
     }
 }
 
+/// The one-submessage guard, as a value test so it can be asserted without a
+/// GRIB2 record.
+///
+/// `!= 1` and not `< 1`: **zero** and **two** are different bugs and both must
+/// be refused. Zero means the range delimited nothing; two means it spanned a
+/// record boundary, and that is the dangerous one — two concatenated records
+/// decode fine as a *sequence*, and the pre-migration `iter().next()` took the
+/// first and discarded the rest, producing a plausible grid for whichever
+/// field happened to come first.
+///
+/// Relaxing this to `< 1` restores exactly that behaviour, and until this was
+/// a function the only thing that would have noticed was an `#[ignore]`d live
+/// test.
+fn exactly_one_submessage(count: usize) -> Result<(), String> {
+    if count != 1 {
+        return Err(format!(
+            "expected exactly one GRIB2 submessage, found {count} — the byte \
+             range does not delimit a single record",
+        ));
+    }
+    Ok(())
+}
+
 /// Parse GRIB2 bytes into `HrrrGridData`.
 ///
 /// # One submessage
@@ -225,13 +273,7 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
     // Counted in its own pass, before any `SubMessage` is held: grib's
     // iterator borrows the reader through a `RefCell`, and advancing it while
     // a submessage is alive panics with "RefCell already borrowed".
-    let count = grib2.iter().count();
-    if count != 1 {
-        return Err(format!(
-            "expected exactly one GRIB2 submessage, found {count} — the byte \
-             range does not delimit a single record",
-        ));
-    }
+    exactly_one_submessage(grib2.iter().count())?;
 
     let (_index, submessage) = grib2
         .iter()
@@ -551,12 +593,23 @@ async fn try_fetch_composite(
     })
 }
 
-/// Build the client HRRR fetches use.
+/// Build the client the **live tests in this module** use.
 ///
-/// S3 allows a `User-Agent` on its preflight (`Access-Control-Allow-Headers:
-/// user-agent`, verified), so the ordinary client is fine here — unlike the
-/// METAR feed. See `rustdar_radar::tls::simple_client`.
-pub fn hrrr_client() -> Result<reqwest::Client, String> {
+/// Not what production fetches with: the model handler passes `ctx.client`,
+/// the application-wide client from `rustdar_frontend`, whose timeout is 30 s.
+/// This one exists because those tests have no `FetchConfig` to take a client
+/// from, and it allows [`HRRR_TIMEOUT`] — deliberately generous, because a
+/// test that fetches four ~1 MB ranged records back to back is not the
+/// interactive path and a timeout there is noise rather than signal.
+///
+/// It is `#[cfg(test)]` so that difference cannot be mistaken for production
+/// guidance, which is what the previous wording read like.
+///
+/// The `User-Agent` is fine on this origin, unlike on IEM and SPC: S3 answers
+/// the preflight `200` with `Access-Control-Allow-Headers: user-agent`. That
+/// evidence lives with the origin, in `rustdar_radar::sources`.
+#[cfg(test)]
+fn hrrr_client() -> Result<reqwest::Client, String> {
     rustdar_radar::tls::client(rustdar_radar::tls::USER_AGENT, HRRR_TIMEOUT)
         .build()
         .map_err(|e| format!("could not build the HRRR client: {e}"))
@@ -828,6 +881,61 @@ mod tests {
         }
     }
 
+    /// Zero and two submessages are both refused, and one is accepted.
+    ///
+    /// The guard used to be inline in `parse_grib2`, reachable only with real
+    /// GRIB2 bytes, so the only thing that would have noticed `count != 1`
+    /// being relaxed to `count < 1` was an `#[ignore]`d live test. `< 1`
+    /// restores exactly the pre-migration behaviour: two concatenated records
+    /// decode fine as a sequence and the first one silently wins, which is a
+    /// correct-looking grid for the wrong field.
+    #[test]
+    fn only_a_single_submessage_is_accepted() {
+        assert!(exactly_one_submessage(1).is_ok(), "one record must be accepted");
+
+        let none = exactly_one_submessage(0).expect_err("zero records must be refused");
+        assert!(none.contains("found 0"), "{none}");
+
+        let two = exactly_one_submessage(2).expect_err("two records must be refused");
+        assert!(two.contains("found 2"), "{two}");
+        assert!(two.contains("exactly one GRIB2 submessage"), "{two}");
+
+        // The failure mode a `< 1` guard would let through.
+        assert!(exactly_one_submessage(3).is_err());
+    }
+
+    /// `(var, level)` is not unique in a real index, and the tie-break is
+    /// positional.
+    ///
+    /// These four lines are verbatim from
+    /// `hrrr.20260725/conus/hrrr.t14z.wrfsfcf01.grib2.idx`. Neither pair is a
+    /// field rustdar requests — `live_every_parameter_selects_exactly_one_record`
+    /// is what keeps that true — but the behaviour when a pair *does* repeat is
+    /// pinned here rather than left to be discovered, because taking record 8
+    /// where a caller wanted record 44 swaps an instantaneous field for a
+    /// windowed maximum without any error.
+    #[test]
+    fn a_repeated_var_and_level_resolves_to_the_lowest_numbered_record() {
+        const AMBIGUOUS: &str = "\
+8:2668643:d=2026072514:REFD:263 K level:1 hour fcst:
+44:27615521:d=2026072514:REFD:263 K level:0-1 hour max fcst:
+68:42378051:d=2026072514:WEASD:surface:1 hour fcst:
+85:58942796:d=2026072514:WEASD:surface:0-1 hour acc fcst:
+";
+        let records = parse_idx(AMBIGUOUS);
+        assert_eq!(records.len(), 4);
+
+        // The forecast field is what distinguishes them, and it is parsed —
+        // it is the disambiguator a future caller would need.
+        assert_eq!(records[0].forecast, "1 hour fcst");
+        assert_eq!(records[1].forecast, "0-1 hour max fcst");
+
+        let (start, _) = byte_range(&records, "REFD", "263 K level").unwrap();
+        assert_eq!(start, 2_668_643, "the first match must win, i.e. record 8");
+        let (start, _) = byte_range(&records, "WEASD", "surface").unwrap();
+        assert_eq!(start, 42_378_051, "the first match must win, i.e. record 68");
+    }
+
     /// The previous run rolls back over midnight instead of underflowing.
     ///
     /// `hour` is a `u8` and `latest_available_run` returns 0 for the whole
@@ -858,6 +966,95 @@ mod tests {
     }
 
     // ── Live checks ───────────────────────────────────────────────────────
+
+    /// Every parameter rustdar requests selects exactly one record of the real
+    /// index.
+    ///
+    /// [`byte_range`] matches on `(var, level)` and takes the first hit. That
+    /// is only safe while no parameter's pair repeats — and pairs *do* repeat
+    /// in the real index (`REFD:263 K level`, `WEASD:surface`), distinguished
+    /// only by a forecast description `byte_range` never reads. So this is the
+    /// invariant the whole selection rests on, and it is a property of NCEP's
+    /// index rather than of rustdar's code: it can be broken by an upstream
+    /// change with no commit here at all.
+    ///
+    /// The `byte_range` doc used to cite this test by name while it did not
+    /// exist.
+    ///
+    /// Run with:
+    ///   `cargo test -p rustdar-overlays -- --ignored --nocapture live_every_parameter`
+    #[tokio::test]
+    #[ignore = "hits the live noaa-hrrr-bdp-pds S3 bucket"]
+    async fn live_every_parameter_selects_exactly_one_record() {
+        let client = hrrr_client().expect("client");
+        let sources = DataSources::production();
+        let (date, hour) = latest_available_run();
+
+        // f00 and f01: the windowed parameters live in f01 and the rest in
+        // f00, and the two indexes do not carry the same record set.
+        for forecast_hour in [0u8, 1] {
+            let url = sources.hrrr_idx_url(&date, hour, forecast_hour);
+            let text = match client.get(&url).send().await.and_then(|r| r.error_for_status()) {
+                Ok(r) => r.text().await.expect("index body"),
+                Err(_) => {
+                    let (prev_date, prev_hour) = previous_run(date, hour);
+                    client
+                        .get(sources.hrrr_idx_url(&prev_date, prev_hour, forecast_hour))
+                        .send()
+                        .await
+                        .expect("index request")
+                        .error_for_status()
+                        .expect("index status")
+                        .text()
+                        .await
+                        .expect("index body")
+                }
+            };
+            let records = parse_idx(&text);
+            assert!(records.len() > 100, "f{forecast_hour:02} index parsed to {} records", records.len());
+
+            // Control: the ambiguity this is guarding against is real in this
+            // very index, so a "no pair ever repeats" reading of a pass below
+            // would be wrong.
+            let repeated = records
+                .iter()
+                .filter(|r| {
+                    records
+                        .iter()
+                        .filter(|o| o.var == r.var && o.level == r.level)
+                        .count()
+                        > 1
+                })
+                .map(|r| format!("{}:{}", r.var, r.level))
+                .collect::<std::collections::BTreeSet<_>>();
+            println!("f{forecast_hour:02}: {} records, repeated pairs: {repeated:?}", records.len());
+
+            for param in ModelParameter::all() {
+                if param.forecast_hour() != forecast_hour {
+                    continue;
+                }
+                let pairs = param.composite_parts().unwrap_or_else(|| {
+                    vec![(param.grib_var(), param.grib_level())]
+                });
+                for (var, level) in pairs {
+                    let matches = records
+                        .iter()
+                        .filter(|r| r.var == var && r.level == level)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        matches.len(),
+                        1,
+                        "{} selects {} record(s) for {var}:{level} in f{forecast_hour:02} — \
+                         byte_range takes the first, so this is a silent wrong-field read; \
+                         match on IdxRecord::forecast as well. Candidates: {:?}",
+                        param.display_name(),
+                        matches.len(),
+                        matches.iter().map(|r| (r.number, &r.forecast)).collect::<Vec<_>>(),
+                    );
+                }
+            }
+        }
+    }
 
     /// The full S3 path, end to end, for a representative spread of fields.
     ///
