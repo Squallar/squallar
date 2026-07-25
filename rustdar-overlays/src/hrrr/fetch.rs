@@ -147,6 +147,22 @@ fn latest_available_run() -> (NaiveDate, u8) {
     (safe_time.date(), safe_time.time().hour() as u8)
 }
 
+/// The run one hour before this one, rolling back over midnight.
+///
+/// `hour` is a `u8`, so a bare `hour - 1` panics in debug and wraps to 255 in
+/// release for the 00Z run — which [`latest_available_run`] returns for the
+/// whole 02:00–02:59 UTC hour, every day. The wrap-around was already handled
+/// correctly at both production call sites and open-coded at both; centralising
+/// it is what stops the next caller from writing the subtraction again, which
+/// is exactly what the two live tests here had done.
+fn previous_run(date: NaiveDate, hour: u8) -> (NaiveDate, u8) {
+    if hour == 0 {
+        (date - chrono::Duration::days(1), 23)
+    } else {
+        (date, hour - 1)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GRIB2 decoding
 // ---------------------------------------------------------------------------
@@ -401,11 +417,7 @@ pub async fn fetch_hrrr_data(
         }
     }
 
-    let (prev_date, prev_hour) = if hour == 0 {
-        (date - chrono::Duration::days(1), 23u8)
-    } else {
-        (date, hour - 1)
-    };
+    let (prev_date, prev_hour) = previous_run(date, hour);
 
     match try_fetch(client, sources, param, prev_date, prev_hour).await {
         Ok(data) => HrrrFetchResult(Ok(data)),
@@ -460,11 +472,7 @@ pub async fn fetch_composite_hrrr_data(
         }
     }
 
-    let (prev_date, prev_hour) = if hour == 0 {
-        (date - chrono::Duration::days(1), 23u8)
-    } else {
-        (date, hour - 1)
-    };
+    let (prev_date, prev_hour) = previous_run(date, hour);
 
     match try_fetch_composite(client, sources, param, &parts, prev_date, prev_hour).await {
         Ok(data) => HrrrFetchResult(Ok(data)),
@@ -820,6 +828,24 @@ mod tests {
         }
     }
 
+    /// The previous run rolls back over midnight instead of underflowing.
+    ///
+    /// `hour` is a `u8` and `latest_available_run` returns 0 for the whole
+    /// 02:00–02:59 UTC hour, so `hour - 1` is a guaranteed daily panic in debug
+    /// and a wrap to run "255z" in release. Both fallback paths and both live
+    /// tests used to open-code the subtraction; only production guarded it.
+    #[test]
+    fn the_previous_run_rolls_back_over_midnight() {
+        let day = NaiveDate::from_ymd_opt(2026, 7, 25).unwrap();
+        let before = NaiveDate::from_ymd_opt(2026, 7, 24).unwrap();
+        assert_eq!(previous_run(day, 0), (before, 23), "00Z must fall back to 23Z yesterday");
+        assert_eq!(previous_run(day, 1), (day, 0));
+        assert_eq!(previous_run(day, 14), (day, 13));
+        // The first day of a month, where the date arithmetic is not just -1.
+        let first = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        assert_eq!(previous_run(first, 0), (NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(), 23));
+    }
+
     /// The forecast hour must reach the object key; if it does not, the UH fix
     /// silently reverts to the constant-zero f00 record.
     #[test]
@@ -885,7 +911,31 @@ mod tests {
                 "{} decoded as a constant field ({lo})",
                 param.display_name(),
             );
-            assert!(grid.blank_notice().is_none(), "{}", param.display_name());
+
+            // Deliberately NOT `assert!(grid.blank_notice().is_none())`.
+            //
+            // That asserts on the weather. `blank_notice` reports "nothing
+            // will be painted", and on a quiet day Max UH 2-5 km peaks below
+            // `uh_color`'s lowest threshold of 25 m²/s²: the CONUS-wide max
+            // was 22.1 on 2026-07-25 and this test — documented as the check
+            // the migration lives or dies on — went red, with nothing broken.
+            // A headline gate that fails every quiet hour is one nobody reads
+            // within a week.
+            //
+            // The two failures it was reaching for are the *other* two
+            // `blank_notice` cases, and both are already asserted above:
+            //
+            //   * "no usable values in the grid" — `value_range` is `None`,
+            //     caught by the `.expect("finite values")`.
+            //   * "uniformly X across all points" — the constant-zero f00 UH
+            //     record the forecast-hour fix exists to avoid, caught by
+            //     `lo < hi`.
+            //
+            // What is left is exactly "the atmosphere was quiet", so it is
+            // reported rather than asserted.
+            if let Some(notice) = grid.blank_notice() {
+                println!("  {notice}");
+            }
 
             // The Lambert grid must cover CONUS. Corner latitudes/longitudes
             // for HRRR's domain are published: SW corner 21.14 N, 237.28 E.
@@ -941,9 +991,14 @@ mod tests {
 
         let one = match fetch_record(&client, &sources, date, hour, 0, "CIN", "surface").await {
             Ok(b) => b,
-            Err(_) => fetch_record(&client, &sources, date, hour - 1, 0, "CIN", "surface")
-                .await
-                .expect("CIN fetch"),
+            Err(_) => {
+                // `previous_run`, not `hour - 1`: `hour` is 0 for the whole
+                // 02:00-02:59 UTC hour, and the subtraction panics there.
+                let (prev_date, prev_hour) = previous_run(date, hour);
+                fetch_record(&client, &sources, prev_date, prev_hour, 0, "CIN", "surface")
+                    .await
+                    .expect("CIN fetch")
+            }
         };
 
         // Control: one record must parse.
@@ -975,10 +1030,20 @@ mod tests {
         let sources = DataSources::production();
         let (date, hour) = latest_available_run();
 
-        let bytes = fetch_record(&client, &sources, date, hour, 0, "CIN", "surface")
-            .await
-            .or(fetch_record(&client, &sources, date, hour - 1, 0, "CIN", "surface").await)
-            .expect("CIN fetch");
+        // `match`, not `.or(..await)`: `Result::or` takes its argument by
+        // value, so the fallback future was awaited unconditionally — a second
+        // ~1 MB range request on every run, even when the first succeeded. And
+        // `hour - 1` panics for the whole 02:00-02:59 UTC hour, when
+        // `latest_available_run` yields 0.
+        let bytes = match fetch_record(&client, &sources, date, hour, 0, "CIN", "surface").await {
+            Ok(b) => b,
+            Err(_) => {
+                let (prev_date, prev_hour) = previous_run(date, hour);
+                fetch_record(&client, &sources, prev_date, prev_hour, 0, "CIN", "surface")
+                    .await
+                    .expect("CIN fetch")
+            }
+        };
 
         println!("surface CIN record: {} bytes", bytes.len());
         // NOMADS returned 2.27 MB for the same field; the operational record
