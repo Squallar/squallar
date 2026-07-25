@@ -18,7 +18,7 @@ thiserror = { workspace = true }
 # ListObjectsV2 response parsing in `archive`. Pure Rust (xml-rs), and a direct
 # dependency here only because `nexrad-data`'s `aws` feature used to pull the
 # same crate in transitively for the same job -- the crate count is unchanged.
-xml = "=1.2.1"
+xml = "=1.3.0"
 
 # Used by `tls` to build the process-wide *ring* provider. Direct dependency
 # because this crate is the lowest one in the graph that can reach a TLS
