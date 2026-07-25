@@ -29,13 +29,19 @@ android_logger = "=0.15.1"
 # mobile text input, which rustdar has none of, and it forces an AppCompat theme --
 # which changes what getRootWindowInsets() reports, shifting the map's
 # excluded_rects and breaking click hit-testing against overlays. It would also add
-# a C++ build. ndk_context is initialized under both backends, so all the JNI
-# bridges in this crate work either way; there is simply nothing to gain.
+# a C++ build. Both backends hand `android_main` the same `AndroidApp`, so the
+# Activity the JNI bridges below reach through works either way; there is simply
+# nothing to gain.
 winit = { workspace = true, features = ["android-native-activity"] }
 pollster = { workspace = true }
 log = { workspace = true }
 jni = { workspace = true }
-ndk-context = { workspace = true }
+# NB: no `ndk-context`. This crate deliberately does not use it. android-activity
+# 0.6 registers `Activity.getApplication()` as the ndk_context "context" (0.5
+# registered the Activity), and `getWindow`, `moveTaskToBack` and
+# `requestPermissions` are all Activity-only -- reached through the Application
+# they silently do nothing. `android_main` has the real Activity and stashes a
+# global ref to it; see the `JAVA` static in src/lib.rs.
 # MUST stay on the major that reqwest resolves. reqwest 0.13.4 accepts
 # `rustls-platform-verifier >=0.6.0, <0.8.0`, so 0.7.0 is the single copy today.
 # Pinning this away from what reqwest resolves does not replace the verifier --
@@ -57,11 +63,13 @@ ndk-context = { workspace = true }
 rustls-platform-verifier = "=0.7.0"
 rustdar-gps = { workspace = true, features = ["serial"] }
 
-# Host-only, opt-in copies of the four dependencies the JNI helpers actually
+# Host-only, opt-in copies of the three dependencies the JNI helpers actually
 # need. See the `jni-typecheck` feature below for why they exist.
+#
+# `ndk-context` used to be a fourth. It is gone from both lists deliberately --
+# see the note next to `jni` above.
 [target.'cfg(not(target_os = "android"))'.dependencies]
 jni = { workspace = true, optional = true }
-ndk-context = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
 rustdar-gps = { workspace = true, optional = true }
 
@@ -76,8 +84,8 @@ rustdar-gps = { workspace = true, optional = true }
 # C.
 #
 # The JNI helpers themselves need none of that. `jni` 0.22 is `default = []` and
-# pure Rust; `ndk-context` is a portable static; `log` and `rustdar-gps` (without
-# `serial`) build anywhere. So this feature widens the crate-level cfg to let
+# pure Rust; `log` and `rustdar-gps` (without `serial`) build anywhere. So this
+# feature widens the crate-level cfg to let
 # every helper *except* `android_main` compile for the host, where rustc checks
 # each `env.call_method`, `jni_sig!` and `JObject::from_raw` against the real jni
 # API in a couple of seconds:
@@ -88,4 +96,4 @@ rustdar-gps = { workspace = true, optional = true }
 # covered, and it needs nothing but a stable toolchain -- no rustup target, even.
 # It does not replace the cargo-ndk job: `android_main`, the winit Android
 # backend and the linked `.so` are still only exercised there.
-jni-typecheck = ["dep:jni", "dep:ndk-context", "dep:log", "dep:rustdar-gps"]
+jni-typecheck = ["dep:jni", "dep:log", "dep:rustdar-gps"]

@@ -18,38 +18,97 @@ use winit::platform::android::activity::AndroidApp;
 // JNI location helper functions (Android only)
 // ---------------------------------------------------------------------------
 
-/// Wrap the process `JavaVM` that `ndk_context` holds.
+/// The process `JavaVM` and a global reference to the real `Activity`, captured
+/// once at the top of [`android_main`].
 ///
-/// jni 0.22 made `JavaVM::from_raw` infallible, but it *asserts* the pointer is
-/// non-null where 0.21 returned a `Result`. Checking here keeps the pre-0.22
-/// behaviour of falling back to a default instead of panicking if `ndk_context`
-/// has not been initialised yet -- these helpers run on background threads where
-/// a panic would silently take out GPS or compass polling.
-fn android_vm() -> Option<jni::vm::JavaVM> {
-    let vm = ndk_context::android_context().vm();
-    if vm.is_null() {
-        return None;
-    }
-    // SAFETY: non-null, and `ndk_context` guarantees it is the process JavaVM.
-    Some(unsafe { jni::vm::JavaVM::from_raw(vm.cast()) })
+/// **Deliberately not `ndk_context`.** `ndk_context::android_context().context()`
+/// is not the Activity on the `android-activity` version this build pins:
+///
+/// * 0.5 called `initialize_android_context(jvm, activity)` with
+///   `activity = (*na).clazz` — the `NativeActivity` itself.
+/// * 0.6 calls `initialize_android_context(vm, app_global)` where `app_global`
+///   is `get_application(env, jni_activity)`, i.e. **`Activity.getApplication()`**
+///   (`android-activity-0.6.1/src/init.rs`, `init_android_main_thread`).
+///
+/// The jni 0.22 bump pinned this: `rustls-platform-verifier 0.7` needs
+/// `jni ^0.22`, and `android-activity` only accepts `jni 0.22` from 0.6.1.
+///
+/// The distinction is load-bearing, and it is not the situational
+/// "may be the Application after suspend/resume" the old comments here claimed.
+/// Under 0.6 it is the Application from the very first call, on every API level,
+/// and it never changes. Three methods this module needs are declared on
+/// `Activity` and simply do not exist on `Application`:
+///
+/// | method              | used by                     | symptom when called on Application |
+/// |---------------------|-----------------------------|------------------------------------|
+/// | `getWindow`         | [`get_system_insets`]       | insets always `(0,0,0,0)`, so the map's `excluded_rects` ignore cutouts and nav bars |
+/// | `moveTaskToBack`    | [`move_task_to_back`]       | back-to-minimise dead on API 28–32 (33+ goes through `BackHandler`) |
+/// | `requestPermissions`| [`request_location_permission`] | the location dialog is never shown, so GPS stays off |
+///
+/// `getResources`, `getSystemService` and `checkSelfPermission` are `Context`
+/// methods and would work off either object. They use the Activity too, so
+/// there is one answer to "which object is this", and because the Activity's
+/// `Resources` track the current configuration where the Application's need not.
+///
+/// Holding this ourselves is also what makes the graceful degradation these
+/// helpers document *achievable*. `ndk_context::android_context()` is
+/// `ANDROID_CONTEXT.expect("android context was not initialized")`: a helper
+/// built on it cannot fall back when the context is missing, because it has
+/// already panicked. A `OnceLock` returns `None` instead, which matters because
+/// these run on the GPS and compass threads where an unwind takes the feature
+/// out silently.
+///
+/// # These calls do not run on the Android main thread
+///
+/// Worth stating plainly, because until this fix the three Activity-only
+/// bridges bailed out before reaching Java at all, and now they do not: none of
+/// them runs on the UI thread. `get_system_insets` is called from the winit
+/// event-loop thread, and the location bridges from the `gps-location` thread.
+/// The consequences are per-call and are documented at each of them; the shared
+/// part is that "it compiled and the object is right" is not the same as "the
+/// framework expects this call here", and neither of those is testable without
+/// a device.
+static JAVA: std::sync::OnceLock<JavaContext> = std::sync::OnceLock::new();
+
+/// See [`JAVA`].
+struct JavaContext {
+    vm: jni::vm::JavaVM,
+    /// A *global* reference, so it stays valid on the GPS and compass threads.
+    /// A local ref would be scoped to the `android_main` frame that created it.
+    activity: jni::objects::Global<jni::objects::JObject<'static>>,
+}
+
+/// Attach the calling thread to the JVM and run `f`.
+///
+/// `None` if [`android_main`] has not reached its JNI setup block yet, or if the
+/// thread could not be attached. Every caller degrades to a default rather than
+/// propagating a failure.
+fn with_env<T>(f: impl FnOnce(&mut jni::Env<'_>) -> T) -> Option<T> {
+    let java = JAVA.get()?;
+    java.vm
+        .attach_current_thread(|env| -> jni::errors::Result<T> { Ok(f(env)) })
+        .ok()
+}
+
+/// As [`with_env`], but also hands `f` the [`Activity`][JAVA] global ref.
+fn with_activity<T>(
+    f: impl FnOnce(&mut jni::Env<'_>, &jni::objects::JObject<'static>) -> T,
+) -> Option<T> {
+    let activity = &JAVA.get()?.activity;
+    with_env(|env| f(env, activity))
 }
 
 /// Check whether the app has been granted ACCESS_FINE_LOCATION.
 fn has_location_permission() -> bool {
-    use jni::objects::{JObject, JValue};
+    use jni::objects::JValue;
     use jni::{jni_sig, jni_str};
 
-    let ctx = ndk_context::android_context();
-    let Some(vm) = android_vm() else { return false };
-    let context = ctx.context();
-
-    vm.attach_current_thread(|env| -> jni::errors::Result<bool> {
-        let activity = unsafe { JObject::from_raw(env, context.cast()) };
-
+    // checkSelfPermission is a Context method, so the Activity serves fine.
+    with_activity(|env, activity| -> jni::errors::Result<bool> {
         let perm = env.new_string("android.permission.ACCESS_FINE_LOCATION")?;
         let granted = env
             .call_method(
-                &activity,
+                activity,
                 jni_str!("checkSelfPermission"),
                 jni_sig!("(Ljava/lang/String;)I"),
                 &[JValue::from(&perm)],
@@ -57,73 +116,87 @@ fn has_location_permission() -> bool {
             .i()?;
         Ok(granted == 0) // PERMISSION_GRANTED == 0
     })
+    .and_then(Result::ok)
     .unwrap_or(false)
 }
 
 /// Request the ACCESS_FINE_LOCATION runtime permission.
-/// This shows the system permission dialog. The result is asynchronous;
-/// poll `has_location_permission()` afterwards to check the outcome.
-fn request_location_permission() {
-    use jni::objects::{JObject, JValue};
+///
+/// Shows the system permission dialog. The result is asynchronous; poll
+/// [`has_location_permission`] afterwards to check the outcome.
+///
+/// Returns whether the JNI call was actually made. That is not the same as
+/// "the user granted it" — it is the caller's cue that the request happened at
+/// all, so a failure to reach `Activity.requestPermissions` is not mistaken for
+/// a dialog the user dismissed. See [`start_location_thread`].
+///
+/// # This is called off the main thread, and that is not a supported context
+///
+/// `Activity.requestPermissions` goes on to `startActivityForResult` and sets
+/// `mHasCurrentPermissionsRequest` without synchronisation. The framework
+/// expects both on the UI thread; this runs on the `gps-location` thread. It is
+/// not a `checkThread()` assertion, so it does not throw — it is simply outside
+/// what the framework guarantees, and whether the dialog appears can depend on
+/// where the Activity is in its lifecycle when the call lands.
+///
+/// **That is why the caller retries, and why the retry must not be
+/// "simplified" to a single attempt.** A `false` here is a request that did not
+/// happen; treating it as a request the user declined is exactly the bug this
+/// replaced. See the bounded loop in [`start_location_thread`].
+fn request_location_permission() -> bool {
+    use jni::objects::JValue;
     use jni::{jni_sig, jni_str};
 
-    let ctx = ndk_context::android_context();
-    let Some(vm) = android_vm() else { return };
-    let context = ctx.context();
-
-    let _ = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
-        let activity = unsafe { JObject::from_raw(env, context.cast()) };
-
-        // requestPermissions() is Activity-only; context may be Application after resume.
-        let activity_class = env.find_class(jni_str!("android/app/Activity"))?;
-        if !env.is_instance_of(&activity, &activity_class).unwrap_or(false) {
-            return Ok(());
-        }
-
+    // requestPermissions() is Activity-only -- see [`JAVA`] for why this used to
+    // be reached through `ndk_context` and therefore never ran.
+    let result = with_activity(|env, activity| -> jni::errors::Result<()> {
         let perm_str = env.new_string("android.permission.ACCESS_FINE_LOCATION")?;
         let string_class = env.find_class(jni_str!("java/lang/String"))?;
         let perm_array = env.new_object_array(1, &string_class, &perm_str)?;
 
-        let _ = env.call_method(
-            &activity,
+        env.call_method(
+            activity,
             jni_str!("requestPermissions"),
             jni_sig!("([Ljava/lang/String;I)V"),
             &[JValue::from(&perm_array), JValue::Int(1)],
-        );
+        )?;
         Ok(())
     });
+
+    match result {
+        Some(Ok(())) => true,
+        Some(Err(e)) => {
+            log::warn!("requestPermissions failed: {e:?}");
+            false
+        }
+        None => {
+            log::warn!("requestPermissions: no Activity yet, or JNI attach failed");
+            false
+        }
+    }
 }
 
 /// Try to retrieve the device's last known GPS location via `LocationManager`.
 /// Returns a [`GpsFix`] on success or `None` if unavailable.
 fn get_last_known_location() -> Option<rustdar_gps::GpsFix> {
-    let ctx = ndk_context::android_context();
-    let vm = android_vm()?;
-    let context = ctx.context();
-
-    vm.attach_current_thread(|env| -> jni::errors::Result<Option<rustdar_gps::GpsFix>> {
-        Ok(last_known_location_with(env, context))
-    })
-    .ok()
-    .flatten()
+    with_activity(last_known_location_with).flatten()
 }
 
 /// Body of [`get_last_known_location`], split out so it can keep using `?` on
 /// `Option` inside the `Env` closure that jni 0.22's attachment API requires.
 fn last_known_location_with(
     env: &mut jni::Env<'_>,
-    context: *mut std::ffi::c_void,
+    activity: &jni::objects::JObject<'_>,
 ) -> Option<rustdar_gps::GpsFix> {
-    use jni::objects::{JObject, JValue};
+    use jni::objects::JValue;
     use jni::{jni_sig, jni_str};
 
-    let activity = unsafe { JObject::from_raw(env, context.cast()) };
-
     // LocationManager lm = context.getSystemService("location");
+    // getSystemService is a Context method, so the Activity works here.
     let service_name = env.new_string("location").ok()?;
     let lm = env
         .call_method(
-            &activity,
+            activity,
             jni_str!("getSystemService"),
             jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
             &[JValue::from(&service_name)],
@@ -232,7 +305,27 @@ fn start_location_thread(sender: std::sync::mpsc::Sender<rustdar_gps::GpsFix>) {
         // Let the app fully initialise before doing JNI work
         std::thread::sleep(std::time::Duration::from_secs(3));
 
-        let mut permission_requested = false;
+        // Counts requests that *actually reached* Activity.requestPermissions,
+        // not attempts. The old code set a `permission_requested` flag after the
+        // first call whether or not anything happened, and because that call was
+        // reaching the Application rather than the Activity (see [`JAVA`]) the
+        // dialog was never shown and never retried: GPS was off for the life of
+        // the process unless the permission was granted from Settings.
+        //
+        // Bounded, because Android stops showing the dialog after the user has
+        // declined twice and silently auto-denies from then on. Retrying past
+        // that is pure noise.
+        //
+        // Retrying *up to* it is not belt-and-braces, and this is the part not
+        // to collapse back into a single call: `request_location_permission`
+        // reaches `Activity.requestPermissions` from this thread, which is not
+        // the UI thread and not a context the framework supports (see that
+        // function). The first attempt fires three seconds in and can land
+        // before the Activity is resumed. The counter only advances when the
+        // call actually got through, so a dropped attempt costs one more pass
+        // of this loop rather than the whole feature.
+        const MAX_PERMISSION_REQUESTS: u32 = 2;
+        let mut requests_made = 0u32;
 
         loop {
             if has_location_permission() {
@@ -241,10 +334,11 @@ fn start_location_thread(sender: std::sync::mpsc::Sender<rustdar_gps::GpsFix>) {
                 {
                     break; // channel closed
                 }
-            } else if !permission_requested {
+            } else if requests_made < MAX_PERMISSION_REQUESTS {
                 log::info!("Requesting ACCESS_FINE_LOCATION permission");
-                request_location_permission();
-                permission_requested = true;
+                if request_location_permission() {
+                    requests_made += 1;
+                }
             }
 
             std::thread::sleep(std::time::Duration::from_secs(10));
@@ -254,42 +348,42 @@ fn start_location_thread(sender: std::sync::mpsc::Sender<rustdar_gps::GpsFix>) {
 
 /// Query the system window insets (status bar, navigation bar) in physical pixels.
 /// Returns (top, bottom, left, right) inset values.
+///
+/// # Called from the winit thread, not the UI thread
+///
+/// `View`/`ViewRootImpl` are main-thread-only by contract. `getWindowInsets`
+/// happens not to `checkThread()`, so this does not throw — but what it returns
+/// is whatever `ViewRootImpl` last computed, not a fresh measurement. Before
+/// the first layout that is the null this function already guards for, which is
+/// exactly why [`android_main`] defers the query to a callback fired on the
+/// first `resumed()` rather than calling it at startup.
+///
+/// The practical consequence is a stale read after a configuration change until
+/// the next layout, not a wrong-object read. Prior to the [`JAVA`] fix this
+/// returned `(0,0,0,0)` unconditionally, so any real value is new behaviour
+/// that has not been observed on a device.
 pub fn get_system_insets() -> (f32, f32, f32, f32) {
-    let ctx = ndk_context::android_context();
-    let Some(vm) = android_vm() else {
-        return (0.0, 0.0, 0.0, 0.0);
-    };
-    let context = ctx.context();
-
-    vm.attach_current_thread(|env| -> jni::errors::Result<(f32, f32, f32, f32)> {
-        Ok(system_insets_with(env, context))
-    })
-    .unwrap_or((0.0, 0.0, 0.0, 0.0))
+    with_activity(system_insets_with).unwrap_or((0.0, 0.0, 0.0, 0.0))
 }
 
 /// Body of [`get_system_insets`], split out so it can `return` early from inside
 /// the `Env` closure that jni 0.22's attachment API requires.
 fn system_insets_with(
     env: &mut jni::Env<'_>,
-    context: *mut std::ffi::c_void,
+    activity: &jni::objects::JObject<'_>,
 ) -> (f32, f32, f32, f32) {
-    use jni::objects::{JObject, JValue};
+    use jni::objects::JValue;
     use jni::{jni_sig, jni_str};
 
-    let activity = unsafe { JObject::from_raw(env, context.cast()) };
-
-    // After suspend/resume, ndk_context may return the Application instead of
-    // the Activity. getWindow() only exists on Activity, so bail out early.
-    let Ok(activity_class) = env.find_class(jni_str!("android/app/Activity")) else {
-        return (0.0, 0.0, 0.0, 0.0);
-    };
-    if !env.is_instance_of(&activity, &activity_class).unwrap_or(false) {
-        log::warn!("get_system_insets: context is not an Activity, skipping");
-        return (0.0, 0.0, 0.0, 0.0);
-    }
-
+    // `activity` is the real Activity -- see [`JAVA`]. This used to take
+    // whatever `ndk_context` held and guard with `is_instance_of(_, Activity)`,
+    // which on android-activity 0.6 is the Application and so failed every
+    // single time: the insets returned here were unconditionally (0,0,0,0), on
+    // every API level, and the map laid its excluded_rects out against a
+    // full-bleed rect that ignored cutouts and the navigation bar.
+    //
     // Activity.getWindow().getDecorView().getRootWindowInsets()
-    let window = match env.call_method(&activity, jni_str!("getWindow"), jni_sig!("()Landroid/view/Window;"), &[]) {
+    let window = match env.call_method(activity, jni_str!("getWindow"), jni_sig!("()Landroid/view/Window;"), &[]) {
         Ok(w) => match w.l() { Ok(w) => w, Err(_) => return (0.0, 0.0, 0.0, 0.0) },
         Err(_) => return (0.0, 0.0, 0.0, 0.0),
     };
@@ -375,20 +469,16 @@ fn android_api_level(env: &mut jni::Env<'_>) -> i32 {
 
 /// Get the display density (pixels per dp) for converting physical to logical pixels.
 fn get_display_density() -> f32 {
-    use jni::objects::JObject;
     use jni::{jni_sig, jni_str};
 
-    let ctx = ndk_context::android_context();
-    let Some(vm) = android_vm() else { return 1.0 };
-    let context = ctx.context();
-
-    vm.attach_current_thread(|env| -> jni::errors::Result<f32> {
-        let activity = unsafe { JObject::from_raw(env, context.cast()) };
-
+    // getResources is a Context method, so this worked on the Application too --
+    // but the Activity's Resources are the ones that track the current
+    // configuration, which is what a density reading wants.
+    with_activity(|env, activity| -> jni::errors::Result<f32> {
         // activity.getResources().getDisplayMetrics().density
         let resources = env
             .call_method(
-                &activity,
+                activity,
                 jni_str!("getResources"),
                 jni_sig!("()Landroid/content/res/Resources;"),
                 &[],
@@ -405,6 +495,7 @@ fn get_display_density() -> f32 {
         env.get_field(&metrics, jni_str!("density"), jni_sig!("F"))?
             .f()
     })
+    .and_then(Result::ok)
     .unwrap_or(1.0)
 }
 
@@ -420,34 +511,27 @@ fn get_display_density() -> f32 {
 /// `dark-light` answers this on every other platform. It compiles for Android
 /// and returns a wrong answer there, which is why this exists at all.
 ///
-/// Every failure path answers `false` (light) rather than propagating. Note that
-/// this is *not* a no-VM safety net: `ndk_context::android_context()` panics on
-/// its own `expect` if the context was never initialised, one line before
-/// [`android_vm`] gets to check anything, and android-activity always hands over
-/// a non-null VM pointer. The null check is defence in depth, not a path that
-/// runs.
+/// Every failure path answers `false` (light) rather than propagating, and here
+/// that fallback is reachable rather than decorative: [`with_activity`] yields
+/// `None` before [`android_main`] has stashed the Activity, and the theme poll
+/// thread can call this at any time. This used to read `ndk_context`, where the
+/// equivalent guard could never fire — `ndk_context::android_context()` panics
+/// on its own `expect` if the context was never initialised, one line before
+/// anything got to check a pointer.
 pub fn detect_dark_theme() -> bool {
-    use jni::objects::JObject;
     use jni::{jni_sig, jni_str};
 
-    let ctx = ndk_context::android_context();
-    let Some(vm) = android_vm() else { return false };
-    let context_ptr = ctx.context();
-
-    let ui_mode = vm.attach_current_thread(|env| -> jni::errors::Result<i32> {
-        // This is the *Application*, not the Activity -- `ndk_context` stores
-        // `get_application(env, activity)`. That is fine here and only here:
-        // `getResources()` is declared on `Context`, so it resolves on either.
-        // It is also why this path keeps working while the Activity-only bridges
-        // in this file (`get_system_insets`, `move_task_to_back`,
-        // `request_location_permission`) bail out on their `is_instance_of`
-        // check. Do not copy this call shape to an Activity method.
-        let context = unsafe { JObject::from_raw(env, context_ptr.cast()) };
-
+    // `getResources()` is declared on `Context`, so this resolved off the
+    // Application that `ndk_context` hands out and was the one bridge in this
+    // file that had never been broken by it. It goes through the Activity now
+    // for the same reason the others do (see [`JAVA`]) -- one answer to "which
+    // object is this" -- and with a small gain: the Activity's `Resources`
+    // track the current configuration, which is exactly what is being read.
+    let ui_mode = with_activity(|env, activity| -> jni::errors::Result<i32> {
         // Context.getResources().getConfiguration().uiMode
         let resources = env
             .call_method(
-                &context,
+                activity,
                 jni_str!("getResources"),
                 jni_sig!("()Landroid/content/res/Resources;"),
                 &[],
@@ -466,7 +550,9 @@ pub fn detect_dark_theme() -> bool {
             .i()
     });
 
-    let Ok(ui_mode) = ui_mode else { return false };
+    // `Option<Result<_>>`: the outer `None` is "no Activity yet, or the thread
+    // would not attach", the inner `Err` is a JNI failure. Both mean light.
+    let Some(Ok(ui_mode)) = ui_mode else { return false };
 
     // Configuration.UI_MODE_NIGHT_MASK / UI_MODE_NIGHT_YES.
     const UI_MODE_NIGHT_MASK: i32 = 0x30;
@@ -475,43 +561,35 @@ pub fn detect_dark_theme() -> bool {
     (ui_mode & UI_MODE_NIGHT_MASK) == UI_MODE_NIGHT_YES
 }
 
-/// Minimize the app by calling Activity.moveTaskToBack(true) via JNI.
-/// This keeps the app alive in recents with a proper thumbnail instead
-/// of killing the process (which leaves a white box in recents).
+/// Minimize the app by calling `Activity.moveTaskToBack(true)` via JNI.
+///
+/// This keeps the app alive in recents with a proper thumbnail instead of
+/// killing the process (which leaves a white box in recents).
+///
+/// This is the **only** path to minimise on API 28–32. `BackHandler.java`
+/// covers 33+, where back arrives through `OnBackInvokedDispatcher`; below that
+/// `KEYCODE_BACK` comes in over the native input queue and the frontend calls
+/// this. `PlatformBridge::handle_back` reports `true` as soon as a handler is
+/// installed, so a no-op here reads to the frontend as a handled press and the
+/// button does nothing at all — which is what happened while this was reaching
+/// the Application instead of the Activity. See [`JAVA`].
 pub fn move_task_to_back() {
-    use jni::objects::{JObject, JValue};
+    use jni::objects::JValue;
     use jni::{jni_sig, jni_str};
 
-    let ctx = ndk_context::android_context();
-    let Some(vm) = android_vm() else {
-        log::warn!("moveTaskToBack: failed to get JavaVM");
-        return;
-    };
-    let context = ctx.context();
-
-    let attached = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
-        let activity = unsafe { JObject::from_raw(env, context.cast()) };
-
-        // moveTaskToBack() is Activity-only; context may be Application after resume.
-        let activity_class = env.find_class(jni_str!("android/app/Activity"))?;
-        if !env.is_instance_of(&activity, &activity_class).unwrap_or(false) {
-            log::warn!("moveTaskToBack: context is not an Activity, skipping");
-            return Ok(());
-        }
-
+    let called = with_activity(|env, activity| {
         match env.call_method(
-            &activity,
+            activity,
             jni_str!("moveTaskToBack"),
             jni_sig!("(Z)Z"),
             &[JValue::Bool(true)],
         ) {
             Ok(_) => log::info!("App moved to background"),
-            Err(e) => log::warn!("moveTaskToBack failed: {:?}", e),
+            Err(e) => log::warn!("moveTaskToBack failed: {e:?}"),
         }
-        Ok(())
     });
-    if attached.is_err() {
-        log::warn!("moveTaskToBack: failed to attach JNI thread");
+    if called.is_none() {
+        log::warn!("moveTaskToBack: no Activity yet, or JNI attach failed");
     }
 }
 
@@ -533,15 +611,14 @@ fn get_compass_heading() -> Option<f32> {
     use jni::{jni_sig, jni_str};
 
     let global_ref = COMPASS_CLASS.get()?;
-    let vm = android_vm()?;
 
-    let heading = vm
-        .attach_current_thread(|env| -> jni::errors::Result<f32> {
-            let cls: &JClass<'static> = global_ref;
-            env.call_static_method(cls, jni_str!("getHeading"), jni_sig!("()F"), &[])?
-                .f()
-        })
-        .ok()?;
+    let heading = with_env(|env| {
+        let cls: &JClass<'static> = global_ref;
+        env.call_static_method(cls, jni_str!("getHeading"), jni_sig!("()F"), &[])
+            .and_then(|v| v.f())
+            .ok()
+    })
+    .flatten()?;
 
     if heading < 0.0 {
         None // -1 means no reading yet
@@ -683,6 +760,31 @@ fn android_main(app: AndroidApp) {
             // reach the Activity.
             let context = unsafe { JObject::from_raw(env, activity_ptr) };
             let activity = unsafe { JObject::from_raw(env, activity_ptr) };
+
+            // Stash the Activity for the JNI helpers above, *before* anything
+            // that can fail: this is the only point in the process where the
+            // real Activity is available. `ndk_context` cannot substitute for
+            // it -- android-activity 0.6 registers `Activity.getApplication()`
+            // there, and `getWindow` / `moveTaskToBack` / `requestPermissions`
+            // do not exist on `Application`. See [`JAVA`].
+            match env.new_global_ref(&activity) {
+                Ok(global) => {
+                    // `JavaVM` is a handle onto a process-wide singleton, so the
+                    // clone is the same VM this closure is attached through.
+                    let _ = JAVA.set(JavaContext {
+                        vm: vm.clone(),
+                        activity: global,
+                    });
+                }
+                // Not fatal on its own -- TLS and the event loop still work --
+                // but insets, back-to-minimise and the location permission
+                // prompt are all gone, so say which.
+                Err(e) => log::error!(
+                    "Could not take a global ref to the Activity ({e:?}); \
+                     window insets, back-to-minimise and the GPS permission \
+                     prompt will be unavailable"
+                ),
+            }
 
             rustls_platform_verifier::android::init_with_env(env, context)
                 .expect("Failed to initialize rustls-platform-verifier");

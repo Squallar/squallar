@@ -4042,7 +4042,6 @@ dependencies = [
  "android_logger",
  "jni",
  "log",
- "ndk-context",
  "pollster",
  "rustdar-frontend",
  "rustdar-gps",
