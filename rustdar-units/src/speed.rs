@@ -19,7 +19,6 @@ impl SpeedUnit {
         SpeedUnit::Knots,
     ];
 
-    /// Convert a value in m/s to this unit.
     pub fn convert_from_ms(self, value: f32) -> f32 {
         match self {
             SpeedUnit::Mph => value * 2.23694,
@@ -29,7 +28,6 @@ impl SpeedUnit {
         }
     }
 
-    /// Convert a value in knots to this unit.
     pub fn convert_from_knots(self, value: f32) -> f32 {
         match self {
             SpeedUnit::Mph => value * 1.15078,
@@ -39,7 +37,6 @@ impl SpeedUnit {
         }
     }
 
-    /// Convert a value in mph to this unit.
     pub fn convert_from_mph(self, value: f32) -> f32 {
         match self {
             SpeedUnit::Mph => value,

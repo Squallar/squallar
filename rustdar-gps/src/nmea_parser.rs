@@ -2,11 +2,8 @@ use crate::config::MIN_SPEED_FOR_BEARING_MPS;
 use crate::types::{FixQuality, GpsFix};
 use nmea::sentences::FixType;
 
-/// Accumulated state from parsing NMEA sentences.
-///
-/// NMEA data arrives across multiple sentence types (GGA, RMC, GSA, VTG).
-/// This struct collects fields from each and produces a [`GpsFix`] when a
-/// position-bearing sentence (GGA or RMC) completes.
+/// A fix is spread across several sentence types (GGA, RMC, GSA, VTG), so
+/// fields accumulate here until a position-bearing one completes.
 pub(crate) struct NmeaState {
     parser: nmea::Nmea,
 }
@@ -18,19 +15,15 @@ impl NmeaState {
         }
     }
 
-    /// Feed a single NMEA sentence line (including the `$` prefix and `*XX`
-    /// checksum). Returns `Some(GpsFix)` when enough data is available for a
-    /// position fix.
+    /// `sentence` must keep its `$` prefix and `*XX` checksum.
     pub fn feed_sentence(&mut self, sentence: &str) -> Option<GpsFix> {
         if self.parser.parse(sentence).is_err() {
             return None;
         }
 
-        // Only produce a fix if we have a valid position
         let lat = self.parser.latitude?;
         let lon = self.parser.longitude?;
 
-        // Map nmea's fix quality to our enum
         let fix_quality = match self.parser.fix_type {
             Some(FixType::Invalid) | None => FixQuality::None,
             Some(FixType::Gps) => FixQuality::Gps,
@@ -43,7 +36,6 @@ impl NmeaState {
             Some(FixType::Simulation) => FixQuality::Simulation,
         };
 
-        // Build a fix from what's available
         let altitude_m = self.parser.altitude.map(|a| a as f64);
         let speed_mps = self.parser.speed_over_ground.map(|knots| knots as f64 * 0.514444);
         let heading_deg = self

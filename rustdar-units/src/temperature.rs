@@ -15,7 +15,6 @@ impl TemperatureUnit {
         TemperatureUnit::Celsius,
     ];
 
-    /// Convert a value in °F to this unit.
     pub fn convert_from_f(self, value: f64) -> f64 {
         match self {
             TemperatureUnit::Fahrenheit => value,
@@ -23,7 +22,6 @@ impl TemperatureUnit {
         }
     }
 
-    /// Convert a value in °C to this unit.
     pub fn convert_from_c(self, value: f64) -> f64 {
         match self {
             TemperatureUnit::Fahrenheit => value * 9.0 / 5.0 + 32.0,

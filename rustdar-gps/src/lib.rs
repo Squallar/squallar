@@ -1,7 +1,6 @@
 mod config;
-// NMEA sentence parsing exists solely to feed the serial reader, so it shares
-// that feature's gate. Without this it is dead code on every target that turns
-// `serial` off -- wasm and iOS -- and warns on every build there.
+// Gated with the reader it feeds: otherwise it is dead code, and a warning, on
+// every build that turns `serial` off (wasm, iOS).
 #[cfg(feature = "serial")]
 mod nmea_parser;
 mod types;

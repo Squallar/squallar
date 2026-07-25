@@ -31,11 +31,8 @@ impl FixQuality {
     }
 }
 
-/// A GPS position fix with optional extended data.
-///
-/// Core fields (`latitude`, `longitude`, `fix_quality`) are always present.
-/// Extended fields come from different NMEA sentences and may not be available
-/// depending on the receiver and fix state.
+/// A GPS position fix. The `Option` fields come from different NMEA sentences
+/// and depend on the receiver and fix state.
 #[derive(Debug, Clone, Default)]
 pub struct GpsFix {
     /// Latitude in decimal degrees (positive = North).
@@ -59,7 +56,6 @@ pub struct GpsFix {
 }
 
 impl GpsFix {
-    /// Create a minimal fix from just latitude and longitude.
     pub fn from_lat_lon(latitude: f64, longitude: f64) -> Self {
         Self {
             latitude,

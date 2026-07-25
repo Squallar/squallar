@@ -17,7 +17,6 @@ impl HailSizeUnit {
         HailSizeUnit::Millimeters,
     ];
 
-    /// Convert a value in inches to this unit.
     pub fn convert_from_inches(self, value: f32) -> f32 {
         match self {
             HailSizeUnit::Inches => value,

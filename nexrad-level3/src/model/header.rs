@@ -20,9 +20,6 @@ pub struct MessageHeader {
 }
 
 /// The 102-byte Product Description Block (ICD 2620001 Figure 3-6).
-///
-/// Contains radar site location, product parameters, and threshold/scaling
-/// information needed to convert raw gate values to physical units.
 #[derive(Debug, Clone)]
 pub struct ProductDescriptionBlock {
     /// Block divider (always -1).
@@ -77,41 +74,33 @@ pub struct ProductDescriptionBlock {
 }
 
 impl ProductDescriptionBlock {
-    /// Compute the linear scale factor for digital product gate values.
+    /// Scale in `physical = (gate - offset) / scale`, stored by digital
+    /// products (codes 94+) as a big-endian IEEE 754 float over thresholds 0–1.
     ///
-    /// For digital products (codes 94+), the scale is stored in threshold
-    /// entries as a big-endian IEEE 754 float spanning halfwords 0–1.
-    /// Returns the scale used in: `physical = (gate - offset) / scale`.
-    ///
-    /// Some products (e.g. 134 DVL, 135 EET) don't use IEEE-float thresholds;
-    /// their threshold bytes decode to subnormal/negative garbage.  In that
-    /// case the gate values already ARE the physical values, so we return 1.0.
+    /// Products such as 134 DVL and 135 EET do not use IEEE-float thresholds —
+    /// theirs decode to subnormal/negative garbage. Their gate values already
+    /// ARE physical, hence the 1.0 fallback.
     pub fn data_scale(&self) -> f32 {
         let hw0 = self.thresholds[0];
         let hw1 = self.thresholds[1];
         let bits = ((hw0 as u32) << 16) | (hw1 as u32);
         let val = f32::from_bits(bits);
-        // Valid IEEE-float scale must be a positive normal number.
-        // Subnormal / inf / nan / zero / negative → identity scale.
         if val.is_normal() && val > 0.0 { val } else { 1.0 }
     }
 
-    /// Compute the linear offset for digital product gate values.
-    ///
-    /// Same IEEE-float encoding caveat as [`data_scale`](Self::data_scale).
+    /// Offset from thresholds 2–3. Same IEEE-float caveat as
+    /// [`data_scale`](Self::data_scale).
     pub fn data_offset(&self) -> f32 {
         let hw2 = self.thresholds[2];
         let hw3 = self.thresholds[3];
         let bits = ((hw2 as u32) << 16) | (hw3 as u32);
         let val = f32::from_bits(bits);
-        // Accept normal floats and exact zero (valid offset).
-        // Subnormal / inf / nan → identity offset.
+        // Exact zero is a legitimate offset; subnormal/inf/nan are not.
         if val.is_normal() || val == 0.0 { val } else { 0.0 }
     }
 
-    /// The elevation angle in degrees, extracted from product-specific fields.
-    /// For elevation-based products, halfword 30 (product_specific_3) contains
-    /// the elevation angle scaled by 10.
+    /// Elevation-based products put the angle in halfword 30
+    /// (`product_specific_3`), scaled by 10.
     pub fn elevation_angle(&self) -> f32 {
         self.product_specific_3 as f32 / 10.0
     }

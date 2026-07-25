@@ -46,25 +46,21 @@ pub(crate) fn decode_symbology_block(
         while o + 2 <= layer_end && o + 2 <= data.len() {
             let packet_code = read_u16(data, o)?;
             match packet_code {
-                // Legacy Radial Data Array (packet code 0xAF1F).
-                // Uses RLE encoding and halfword size fields. Gate values are
-                // 4-bit (0–15) and need threshold table mapping.
+                // Legacy Radial Data Array: RLE, halfword sizes, 4-bit gates.
                 0xAF1F => {
                     let (radial_packet, new_offset) =
                         super::radial::decode_legacy_radial_packet(data, o)?;
                     packets.push(DataPacket::DigitalRadial(radial_packet));
                     o = new_offset;
                 }
-                // Digital Radial Data Array (packet code 16).
-                // Raw 8-bit gate values with byte size fields.
+                // Digital Radial Data Array: raw 8-bit gates, byte sizes.
                 16 => {
                     let (radial_packet, new_offset) =
                         super::radial::decode_digital_radial_packet(data, o)?;
                     packets.push(DataPacket::DigitalRadial(radial_packet));
                     o = new_offset;
                 }
-                // Generic Data Component (packet code 28).
-                // Contains a self-describing header with radial or raster data.
+                // Generic Data Component: self-describing XDR.
                 28 => {
                     match super::radial::decode_generic_radial_packet(data, o) {
                         Ok((radial_packet, new_offset)) => {
@@ -82,7 +78,7 @@ pub(crate) fn decode_symbology_block(
                     }
                 }
                 _ => {
-                    // Skip unknown packet types by advancing to the end of this layer
+                    // No length field to skip by, so abandon the layer.
                     log::warn!(
                         "Skipping unknown data packet code 0x{:04X} at offset {}",
                         packet_code,
@@ -94,7 +90,7 @@ pub(crate) fn decode_symbology_block(
             }
         }
 
-        // Ensure we don't fall behind the expected layer end
+        // A short-reading packet must not leave the next layer misaligned.
         o = o.max(layer_end);
 
         layers.push(DataLayer {

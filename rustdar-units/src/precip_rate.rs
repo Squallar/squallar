@@ -15,7 +15,6 @@ impl PrecipRateUnit {
         PrecipRateUnit::MillimetersPerHour,
     ];
 
-    /// Convert a value in inches/hour to this unit.
     pub fn convert_from_in_per_hr(self, value: f32) -> f32 {
         match self {
             PrecipRateUnit::InchesPerHour => value,

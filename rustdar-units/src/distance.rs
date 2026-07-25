@@ -17,7 +17,6 @@ impl DistanceUnit {
         DistanceUnit::NauticalMiles,
     ];
 
-    /// Convert a value in kilometers to this unit.
     pub fn convert_from_km(self, value: f64) -> f64 {
         match self {
             DistanceUnit::Kilometers => value,

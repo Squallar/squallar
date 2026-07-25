@@ -3,7 +3,6 @@
 use crate::model::{MessageHeader, ProductDescriptionBlock};
 use crate::result::{Error, Result};
 
-/// Extract a `[u8; N]` slice from `data` at the given offset.
 fn read_bytes<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N]> {
     data.get(offset..offset + N)
         .and_then(|s| s.try_into().ok())
@@ -14,31 +13,25 @@ fn read_bytes<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N]> {
         })
 }
 
-/// Read a big-endian `i16` from `data` at the given offset.
 pub(crate) fn read_i16(data: &[u8], offset: usize) -> Result<i16> {
     Ok(i16::from_be_bytes(read_bytes(data, offset)?))
 }
 
-/// Read a big-endian `u16` from `data` at the given offset.
 pub(crate) fn read_u16(data: &[u8], offset: usize) -> Result<u16> {
     Ok(u16::from_be_bytes(read_bytes(data, offset)?))
 }
 
-/// Read a big-endian `u32` from `data` at the given offset.
 pub(crate) fn read_u32(data: &[u8], offset: usize) -> Result<u32> {
     Ok(u32::from_be_bytes(read_bytes(data, offset)?))
 }
 
-/// Read a big-endian `i32` from `data` at the given offset.
 pub(crate) fn read_i32(data: &[u8], offset: usize) -> Result<i32> {
     Ok(i32::from_be_bytes(read_bytes(data, offset)?))
 }
 
-/// Decode the 18-byte Message Header.
+/// Decode the 18-byte Message Header; returns it and the offset after it.
 ///
-/// Returns the decoded header and the byte offset immediately after it.
-///
-/// ICD 2620001 Figure 3-3 (Message Header):
+/// ICD 2620001 Figure 3-3:
 /// ```text
 /// Halfword  Field
 /// 1         Message Code (i16)
@@ -80,12 +73,10 @@ pub(crate) fn decode_message_header(data: &[u8]) -> Result<(MessageHeader, usize
     ))
 }
 
-/// Decode the 102-byte Product Description Block (PDB).
+/// Decode the 102-byte Product Description Block, which starts immediately
+/// after the message header.
 ///
-/// The PDB starts immediately after the message header and contains radar
-/// site location, product parameters, data thresholds, and symbology offsets.
-///
-/// ICD 2620001 Figure 3-6 layout (halfword numbers):
+/// ICD 2620001 Figure 3-6 (halfword numbers):
 /// ```text
 /// HW 1      Block divider (-1)
 /// HW 2-3    Latitude (i32, 1/1000 degree)

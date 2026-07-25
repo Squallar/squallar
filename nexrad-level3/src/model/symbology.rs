@@ -1,10 +1,7 @@
 //! Symbology block types for Level III product display data.
 
-/// The product symbology block containing display data layers.
-///
-/// The symbology block is the primary data-carrying structure in a Level III
-/// product message. It contains one or more data layers, each holding data
-/// packets (radial arrays, raster grids, text, vectors, etc.).
+/// The data-carrying block of a Level III message: layers of data packets
+/// (radial arrays, raster grids, text, vectors).
 #[derive(Debug, Clone)]
 pub struct SymbologyBlock {
     /// Block ID (always 1 for symbology).

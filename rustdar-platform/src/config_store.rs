@@ -1,7 +1,4 @@
-//! Filesystem-backed [`ConfigStore`].
-//!
-//! Lives here rather than in the UI crate because having a filesystem at all is
-//! a property of the platform. Desktop, Android and iOS share this backend; the
+//! Filesystem-backed [`ConfigStore`], shared by desktop, Android and iOS. The
 //! web build never compiles it and supplies a `localStorage` one instead.
 
 use rustdar_egui::config_store::ConfigStore;
@@ -21,7 +18,6 @@ impl FileConfigStore {
         self.dir.join(format!("{}.json", key))
     }
 
-    /// The directory this store writes into.
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -43,8 +39,7 @@ impl ConfigStore for FileConfigStore {
     }
 
     fn store(&self, key: &str, value: &str) -> Result<(), String> {
-        // Created on write rather than up front: a store that is never written
-        // to should not leave an empty directory behind.
+        // On write, not up front: an unwritten store leaves no empty directory.
         if let Err(e) = std::fs::create_dir_all(&self.dir) {
             return Err(format!("failed to create config dir {:?}: {}", self.dir, e));
         }
@@ -57,7 +52,7 @@ impl ConfigStore for FileConfigStore {
 mod tests {
     use super::*;
 
-    /// A temp directory that removes itself, so these tests leave nothing behind.
+    /// A temp directory that removes itself on drop.
     struct TempDir(PathBuf);
 
     impl TempDir {
@@ -90,8 +85,6 @@ mod tests {
         assert_eq!(store.load("ui"), Some("{\"a\":1}".to_string()));
     }
 
-    /// The key must select the file, or two different configs would overwrite
-    /// each other.
     #[test]
     fn different_keys_do_not_collide() {
         let dir = TempDir::new("keys");
@@ -104,8 +97,7 @@ mod tests {
         assert_eq!(store.load("other").as_deref(), Some("second"));
     }
 
-    /// The on-disk name is load-bearing: existing installs have a `ui.json` and
-    /// must keep loading it after this refactor.
+    /// The on-disk name is load-bearing: existing installs have a `ui.json`.
     #[test]
     fn the_ui_key_maps_to_ui_json() {
         let dir = TempDir::new("filename");
@@ -119,8 +111,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&on_disk).unwrap(), "payload");
     }
 
-    /// Writing must work when the directory does not exist yet — that is the
-    /// first-run path on every platform.
+    /// The first-run path on every platform.
     #[test]
     fn store_creates_a_missing_directory() {
         let dir = TempDir::new("mkdir");

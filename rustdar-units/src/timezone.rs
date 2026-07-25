@@ -20,8 +20,7 @@ impl TimezonePreference {
         }
     }
 
-    /// Format a `NaiveDateTime` that is known to be in UTC, converting to the
-    /// user's preferred timezone. Appends a timezone indicator.
+    /// `ts` must already be UTC. Appends a timezone indicator.
     pub fn format_naive_utc(self, ts: NaiveDateTime, fmt: &str) -> String {
         match self {
             TimezonePreference::Utc => {
@@ -30,15 +29,14 @@ impl TimezonePreference {
             TimezonePreference::Local => {
                 let utc_dt = chrono::TimeZone::from_utc_datetime(&chrono::Utc, &ts);
                 let local_dt = utc_dt.with_timezone(&chrono::Local);
-                // Use %Z for timezone abbreviation (e.g. "CDT", "EST")
+                // %Z is the abbreviation: "CDT", "EST".
                 let extended_fmt = format!("{} %Z", fmt);
                 local_dt.format(&extended_fmt).to_string()
             }
         }
     }
 
-    /// Format an RFC 3339 / ISO 8601 timestamp string into a human-readable
-    /// form in the user's preferred timezone.
+    /// Returns `iso` unchanged if it does not parse.
     pub fn format_rfc3339(self, iso: &str) -> String {
         let Ok(dt) = chrono::DateTime::parse_from_rfc3339(iso) else {
             return iso.to_string();
@@ -55,8 +53,7 @@ impl TimezonePreference {
         }
     }
 
-    /// Convert a naive UTC datetime to the user's display timezone (as naive).
-    /// Useful for populating time-picker fields.
+    /// UTC in, display timezone out, both naive — for time-picker fields.
     pub fn utc_to_display(self, ts: NaiveDateTime) -> NaiveDateTime {
         match self {
             TimezonePreference::Utc => ts,

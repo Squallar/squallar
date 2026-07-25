@@ -1,18 +1,15 @@
 use serde::{Deserialize, Serialize};
 
-/// Minimum ground speed (m/s) for GPS bearing to be considered meaningful.
-/// Below this, heading data is too noisy from a near-stationary receiver.
-///
-/// Read only by `nmea_parser`, so it carries the same gate.
+/// Below this ground speed (m/s), course-over-ground from a near-stationary
+/// receiver is noise. Gated because only `nmea_parser` reads it.
 #[cfg(feature = "serial")]
 pub(crate) const MIN_SPEED_FOR_BEARING_MPS: f64 = 0.5;
 
-/// Ground speed (m/s) above which the device is considered "moving" (~5 mph).
-/// Used by [`HeadingSource::Auto`] to switch from compass to GPS bearing.
+/// Ground speed (m/s) above which the device counts as "moving" (~5 mph).
 pub(crate) const MOVING_SPEED_THRESHOLD_MPS: f64 = 2.2;
 
-/// How the effective heading (for the directional wedge) is determined
-/// when both compass and GPS bearing data are available.
+/// How the directional wedge picks a heading when both compass and GPS bearing
+/// are available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum HeadingSource {
     /// Use GPS bearing when moving (>~5 mph), compass when stationary.
@@ -39,11 +36,7 @@ impl HeadingSource {
         }
     }
 
-    /// Compute the effective heading from compass and GPS bearing inputs.
-    ///
-    /// - `compass_heading`: degrees from device compass sensor (0–360).
-    /// - `gps_bearing`: degrees course-over-ground from GPS (0–360).
-    /// - `speed_mps`: current ground speed in m/s from GPS.
+    /// Headings in degrees (0–360), speed in m/s.
     pub fn effective_heading(
         self,
         compass_heading: Option<f32>,
@@ -65,7 +58,6 @@ impl HeadingSource {
     }
 }
 
-/// Configuration for GPS serial port connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[derive(Default)]

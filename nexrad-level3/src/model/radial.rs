@@ -1,9 +1,7 @@
 //! Digital radial data array types for Level III products.
 
-/// A decoded Digital Radial Data Array (packet code 16 / 0xAF1F).
-///
-/// This is the primary data format for elevation-based Level III products
-/// such as Storm-Relative Velocity (N0S) and Specific Differential Phase (N0K).
+/// A decoded Digital Radial Data Array (packet code 16 / 0xAF1F) — the format
+/// used by elevation-based products such as N0S and N0K.
 #[derive(Debug, Clone)]
 pub struct RadialPacket {
     /// Index of the first range bin (distance from radar).
@@ -16,14 +14,13 @@ pub struct RadialPacket {
     pub j_center: i16,
     /// Scale factor (number of pixels per range bin).
     pub scale_factor: f32,
-    /// Whether this packet was decoded from a legacy (0xAF1F) RLE format.
-    /// Legacy packets have 4-bit gate values (0–15) that must be mapped through
-    /// the PDB's threshold table, rather than using linear scale/offset.
+    /// Legacy (0xAF1F) RLE format: 4-bit gate values (0–15) that go through the
+    /// PDB's threshold table, not a linear scale/offset.
     pub is_legacy: bool,
-    /// Data value scale factor extracted from XDR per-radial attributes (packet 28).
-    /// When present, physical_value = (gate_value - xdr_data_offset) / xdr_data_scale.
+    /// From the packet-28 XDR per-radial attributes. When present,
+    /// `physical = (gate - xdr_data_offset) / xdr_data_scale`.
     pub xdr_data_scale: Option<f32>,
-    /// Data value offset extracted from XDR per-radial attributes (packet 28).
+    /// See [`xdr_data_scale`](Self::xdr_data_scale).
     pub xdr_data_offset: Option<f32>,
     /// The individual radials.
     pub radials: Vec<RadialRun>,
@@ -36,25 +33,16 @@ pub struct RadialRun {
     pub start_angle: f32,
     /// Azimuth angular width in degrees.
     pub angle_delta: f32,
-    /// Raw gate values. For 1-byte products values are 0–255; for 2-byte
-    /// products (e.g. EET, DPR via packet code 28) values are 0–65535.
-    /// Interpretation depends on product type and the PDB's
-    /// threshold/scale/offset values.
+    /// Raw gate values: 0–255 for 1-byte products, 0–65535 for 2-byte ones
+    /// (EET, DPR via packet 28). Meaningless without the PDB's
+    /// threshold/scale/offset.
     pub gate_values: Vec<u16>,
 }
 
 impl RadialPacket {
-    /// Range in km of each gate bin.
-    ///
-    /// Digital radial products typically encode bins at 0.25 km or 1.0 km spacing.
-    /// The scale_factor from the packet header encodes pixels-per-bin at the
-    /// product's native resolution.
-    ///
-    /// For standard 230 km range products at 0.25 km resolution:
-    /// `gate_interval_km ≈ 1.0 / scale_factor` when scale_factor represents
-    /// pixels per range-bin at the product's configured resolution.
-    ///
-    /// If scale_factor is 0 or very small, falls back to 1.0 km default.
+    /// Range in km per gate bin: `1.0 / scale_factor`, since the packet header
+    /// carries pixels-per-bin at the product's native resolution (typically
+    /// 0.25 km or 1.0 km). Falls back to 1.0 km when the factor is ~0.
     pub fn gate_interval_km(&self) -> f64 {
         if self.scale_factor > 0.01 {
             1.0 / self.scale_factor as f64

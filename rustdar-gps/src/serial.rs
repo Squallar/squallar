@@ -8,8 +8,8 @@ use crate::config::GpsConfig;
 use crate::nmea_parser::NmeaState;
 use crate::types::GpsFix;
 
-/// Known USB vendor/product IDs for common GPS receiver chipsets and
-/// USB-to-serial adapters frequently used with GPS modules.
+/// USB VID/PIDs of common GPS chipsets and the USB-serial adapters GPS modules
+/// are usually wired through. `None` PID matches every product from that vendor.
 const GPS_VID_PIDS: &[(u16, Option<u16>)] = &[
     (0x1546, None),        // u-blox
     (0x067B, None),        // Prolific (PL2303)
@@ -22,17 +22,13 @@ const GPS_VID_PIDS: &[(u16, Option<u16>)] = &[
 /// Common baud rates for GPS devices, ordered by likelihood.
 const COMMON_BAUDS: &[u32] = &[9600, 4800, 38400, 115200];
 
-/// Information about a detected serial port that may be a GPS device.
 #[derive(Debug, Clone)]
 pub struct GpsPortInfo {
     pub port_name: String,
     pub description: String,
 }
 
-/// Scan for serial ports that are likely GPS receivers.
-///
-/// First returns ports matching known GPS USB VID/PIDs, then all other
-/// serial ports. The caller can present these to the user for selection.
+/// Ports matching a known GPS VID/PID first, then every other serial port.
 pub fn detect_gps_ports() -> Vec<GpsPortInfo> {
     let Ok(ports) = serialport::available_ports() else {
         return Vec::new();
@@ -86,10 +82,7 @@ pub fn detect_gps_ports() -> Vec<GpsPortInfo> {
     gps_ports
 }
 
-/// Try to detect the baud rate of a GPS device on a given port.
-///
-/// Opens the port at each common rate, reads for a short window, and checks
-/// if any valid NMEA sentences (`$` prefix) appear.
+/// Probe each rate in [`COMMON_BAUDS`] for a line starting with `$`.
 fn detect_baud(port_name: &str) -> Option<u32> {
     for &baud in COMMON_BAUDS {
         let port = serialport::new(port_name, baud)
@@ -100,7 +93,6 @@ fn detect_baud(port_name: &str) -> Option<u32> {
         let mut reader = std::io::BufReader::new(port);
         let mut buf = String::new();
 
-        // Read a few lines and check for NMEA `$` prefix
         for _ in 0..5 {
             buf.clear();
             if reader.read_line(&mut buf).is_ok() && buf.starts_with('$') {
@@ -111,23 +103,15 @@ fn detect_baud(port_name: &str) -> Option<u32> {
     None
 }
 
-/// Manages a serial GPS connection on a background thread.
-///
-/// Spawns a reader thread that opens the serial port, reads NMEA sentences,
-/// and sends [`GpsFix`] updates through the provided channel. Handles
-/// disconnection with automatic reconnect attempts.
+/// Owns the reader thread; reconnects on its own after a disconnect.
 pub struct SerialGpsReader {
     /// Dropping the sender signals the reader thread to stop.
     _stop_signal: mpsc::Sender<()>,
 }
 
 impl SerialGpsReader {
-    /// Start reading GPS data from a serial port.
-    ///
-    /// If `config.port_path` is `None`, auto-detects the port.
-    /// If `config.baud_rate` is 0, auto-detects the baud rate.
-    ///
-    /// Returns `None` if no suitable port could be found.
+    /// Auto-detects port and baud where `config` leaves them unset. `None` when
+    /// no port was found — detection failure, not an error.
     pub fn start(config: &GpsConfig, fix_sender: mpsc::Sender<GpsFix>) -> Option<Self> {
         let port_name = if let Some(ref path) = config.port_path {
             path.clone()
@@ -166,7 +150,6 @@ fn gps_read_loop(
     stop_rx: &mpsc::Receiver<()>,
 ) {
     loop {
-        // Check for stop signal
         if stop_rx.try_recv().is_ok() {
             log::info!("GPS reader stopping (signal received)");
             return;
@@ -183,7 +166,7 @@ fn gps_read_loop(
             }
             Err(e) => {
                 log::warn!("Failed to open GPS port {}: {}. Retrying in 5s", port_name, e);
-                // Wait 5 seconds before retry, checking for stop signal
+                // 5s retry, sliced so the stop signal is still seen promptly.
                 for _ in 0..50 {
                     if stop_rx.try_recv().is_ok() {
                         return;
@@ -219,7 +202,7 @@ fn gps_read_loop(
                         }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    // Normal timeout, just continue
+                    // A quiet receiver, not a disconnect: do not reconnect.
                     continue;
                 }
                 Err(e) => {
@@ -229,7 +212,7 @@ fn gps_read_loop(
             }
         }
 
-        // Reconnect delay with stop-signal check
+        // 5s reconnect delay, sliced the same way.
         for _ in 0..50 {
             if stop_rx.try_recv().is_ok() {
                 return;

@@ -8,26 +8,16 @@ name = "rustdar-platform"
 path = "src/main.rs"
 
 [lib]
-# The `_lib` suffix may seem redundant but it is necessary
-# to make the lib name unique and wouldn't conflict with the bin name.
-# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+# The `_lib` suffix keeps the lib name from colliding with the bin name, which
+# only breaks on Windows: https://github.com/rust-lang/cargo/issues/8519
 name = "rustdar_platform_lib"
-# rlib only. Both consumers -- the `rustdar-platform` bin here and
-# `rustdar-android`'s cdylib -- link this as a Rust library; nothing loads it as
-# a shared object or links it as a static archive.
-#
-# The `cdylib` that used to be listed was not free: Cargo builds every crate-type
-# declared on a lib target, so `cargo ndk build -p rustdar-android` also emitted
-# librustdar_platform_lib.so, and cargo-ndk copies every .so it finds into
-# jniLibs. That shipped a dead 1.8 MB library in each per-ABI APK.
+# rlib only. Adding `cdylib` makes cargo-ndk emit and copy
+# librustdar_platform_lib.so into jniLibs -- a dead 1.8 MB per ABI.
 crate-type = ["rlib"]
 path = "src/lib.rs"
 
 [dependencies]
-# The portable application. Everything else here is entry-point scaffolding or
-# a platform capability the frontend asks for through a trait.
 rustdar-frontend = { workspace = true }
-# For the ConfigStore trait the filesystem store implements.
 rustdar-egui = { workspace = true }
 rustdar-gps = { workspace = true, features = ["serial"] }
 log = { workspace = true }
@@ -36,22 +26,14 @@ winit = { workspace = true }
 env_logger = "=0.11.11"
 
 [dev-dependencies]
-# For src/network_security_config.rs, which asserts that the Android Network
-# Security Config covers exactly the origins declared here and nowhere else.
-# A dev-dependency, not a dependency: nothing at runtime reads that file.
+# Both only for src/network_security_config.rs, which is `#[cfg(test)]`.
 rustdar-radar = { workspace = true }
-# TileSource, to derive the basemap hosts from the tile URLs themselves rather
-# than restating them.
 walkers = { workspace = true }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-# Cross-platform theme detection for desktop platforms. Android has no entry
-# here: this crate is `#![forbid(unsafe_code)]`, and reading the Android theme
-# means a JNI call. `rustdar-android` owns that read and injects it through
-# `PlatformBridge::set_theme_detector` — see `platform.rs`.
+# No Android entry: reading the Android theme is a JNI call and this crate is
+# `#![forbid(unsafe_code)]`, so `rustdar-android` injects it instead.
 dark-light = "=2.0.0"
-# Turn on the settings pane's serial-GPS controls for desktop only. Android
-# builds the serial reader (see rustdar-gps/serial above) but has never shown
-# the port picker, and enabling the feature unconditionally here would leak it
-# there through rustdar-android — cargo features are additive across the graph.
+# Desktop-only, because cargo features are additive across the graph: enabling
+# `gps-serial` unconditionally would leak the port picker into the Android UI.
 rustdar-egui = { workspace = true, features = ["gps-serial"] }

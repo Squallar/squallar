@@ -1,6 +1,5 @@
 use winit::event_loop::{ControlFlow, EventLoop};
 
-/// Create and configure a new event loop
 fn create_event_loop() -> EventLoop<()> {
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -8,24 +7,19 @@ fn create_event_loop() -> EventLoop<()> {
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // Install the rustls crypto provider before anything can open a socket.
-    // Belt-and-braces: every client constructor in the workspace also calls this
-    // (see `rustdar_radar::tls`), so a missing call here does not break TLS. It
-    // is here so the provider is chosen at a predictable point rather than by
-    // whichever background task happens to fetch first.
+    // Pin the rustls provider at a predictable point rather than letting
+    // whichever background task fetches first choose it. Redundant — every
+    // client constructor calls this too (see `rustdar_radar::tls`).
     rustdar_frontend::tls::init();
 
-    // Initialize logger for native platforms
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
         .init();
 
-    // Suppress winit EventLoopClosed panics from background threads on exit.
-    // catch_unwind prevents crashes but the default hook still prints to stderr.
-    // Check the payload type directly rather than stringifying PanicInfo, which
-    // includes file paths and line numbers that can change across Rust versions.
-    // Both &str and String are checked because panic!() produces &str for
-    // literal messages and String for formatted messages.
+    // Swallow the EventLoopClosed panics background threads raise on exit.
+    // Matched on the payload, not a stringified PanicInfo (whose paths and line
+    // numbers shift across Rust versions); both &str and String because
+    // `panic!()` produces &str for literals and String for formatted messages.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let is_event_loop_closed = info

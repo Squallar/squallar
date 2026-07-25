@@ -1,33 +1,20 @@
 //! Keeps the Android Network Security Config in step with the origins rustdar
-//! actually fetches from.
+//! fetches from.
 //!
-//! `rustdar-android/android/app/.../res/xml/network_security_config.xml` sets
-//! `cleartextTrafficPermitted="false"` per domain, over a `base-config` that
-//! permits cleartext so Android's own TrustManager can fetch the plain-HTTP CRL
-//! that `api.weather.gov`'s Let's Encrypt chain publishes. That arrangement only
-//! delivers what it advertises while the per-domain list covers every host the
-//! app talks to: an origin missing from it falls through to `base-config` and is
-//! allowed to travel in the clear.
+//! `.../res/xml/network_security_config.xml` denies cleartext per domain over a
+//! `base-config` that *permits* it, because Android's own TrustManager fetches
+//! the plain-HTTP CRL published by `api.weather.gov`'s Let's Encrypt chain. So
+//! an origin missing from the per-domain list falls through to `base-config`
+//! and is allowed to travel in the clear.
 //!
-//! Nothing enforced that, and the file had drifted in both directions —
-//! `aviationweather.gov` was still listed after METAR moved off it, and its
-//! replacement `mesonet.agron.iastate.edu` had never been added, so the one
-//! live METAR origin was the one not covered. Nothing broke, because every
-//! client is also built with `.https_only(true)`; the defence in depth the file
-//! exists to provide simply was not being applied to it.
+//! The assertions run both ways: a live origin with no XML entry fails, and an
+//! XML entry no origin needs fails too. One-way would have missed the stale
+//! `aviationweather.gov` entry, and it was the stale entry that made the list
+//! look maintained while the live METAR host went uncovered.
 //!
-//! So this module is a test, and the assertion runs **both ways**: an origin
-//! declared in [`rustdar_radar::sources::DataSources`] with no entry in the XML
-//! fails, and an entry in the XML that no origin needs fails too. A one-way
-//! check would have caught the missing IEM host but not the stale
-//! aviationweather.gov entry, and it was the stale entry that made the list look
-//! maintained.
-//!
-//! It lives here rather than in `rustdar-android` because that crate is
-//! `#![cfg(target_os = "android")]` and compiles to nothing on the host, so a
-//! test in it would never run in CI.
+//! Not in `rustdar-android`: that crate is `#![cfg(target_os = "android")]` and
+//! compiles to nothing on the host, so a test in it never runs in CI.
 
-/// Path to the config, relative to this crate's manifest directory.
 #[cfg(test)]
 const CONFIG_PATH: &str =
     "../rustdar-android/android/app/src/main/res/xml/network_security_config.xml";
@@ -42,8 +29,8 @@ struct DomainRule {
 
 #[cfg(test)]
 impl DomainRule {
-    /// Whether this rule governs `host`, by Android's matching rule: an exact
-    /// match always, and any subdomain when `includeSubdomains` is set.
+    /// Android's rule: exact match always, subdomains only with
+    /// `includeSubdomains`.
     fn covers(&self, host: &str) -> bool {
         host == self.host
             || (self.include_subdomains && host.ends_with(&format!(".{}", self.host)))
@@ -51,18 +38,12 @@ impl DomainRule {
 }
 
 /// Pull every `<domain …>host</domain>` out of the config.
-///
-/// Hand-rolled rather than pulling in an XML parser as a dev-dependency: the
-/// grammar here is one element with one optional attribute, and the file is
-/// checked in next to this test. `aapt2` is the parser whose opinion actually
-/// matters, and it validates the same file on every Android build.
 #[cfg(test)]
 fn parse_domains(xml: &str) -> Vec<DomainRule> {
     let mut out = Vec::new();
     let mut rest = xml;
 
-    // Comments first: the file documents each entry, and those comments name
-    // hosts. Scanning them as if they were elements would invent rules.
+    // Strip comments first: they name hosts, which would parse as rules.
     let mut stripped = String::with_capacity(xml.len());
     while let Some(start) = rest.find("<!--") {
         stripped.push_str(&rest[..start]);
@@ -112,7 +93,6 @@ mod tests {
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
     }
 
-    /// The host of a URL, without scheme, port or path.
     fn host_of(url: &str) -> String {
         url.split_once("://")
             .map(|(_, rest)| rest)
@@ -123,12 +103,8 @@ mod tests {
             .to_ascii_lowercase()
     }
 
-    /// Every host the shipped application issues a request to.
-    ///
-    /// Derived from the declarations rather than restated: that is the whole
-    /// point. S3 buckets go through [`DataSources::s3_object_url`] so the
-    /// `BUCKET.s3.amazonaws.com` shape comes from the same code the fetchers
-    /// use, and the tile hosts come from the `TileSource` implementations.
+    /// Every host the shipped app requests, derived from the declarations
+    /// rather than restated — that is the whole point.
     fn live_hosts() -> BTreeSet<String> {
         let s = DataSources::production();
         let mut hosts = BTreeSet::new();
@@ -148,8 +124,7 @@ mod tests {
             hosts.insert(host_of(base));
         }
 
-        // Basemap and label tiles. `tile_url` picks a subdomain from `x % 4`, so
-        // walk all four and take them all.
+        // `tile_url` picks a subdomain from `x % 4`, so walk all four.
         for style in [
             rustdar_egui::tiles::CartoDb::light(),
             rustdar_egui::tiles::CartoDb::dark(),
@@ -207,11 +182,6 @@ mod tests {
         assert!(!exact.covers("other.mesonet.agron.iastate.edu"));
     }
 
-    /// Every origin the app fetches from must be denied cleartext by name.
-    ///
-    /// A host missing here is not a hypothetical: it falls through to
-    /// `base-config`, which permits cleartext so the platform can fetch
-    /// api.weather.gov's CRL.
     #[test]
     fn every_live_origin_is_covered_by_the_network_security_config() {
         let rules = parse_domains(&config_xml());
@@ -228,11 +198,6 @@ mod tests {
         );
     }
 
-    /// And nothing may be listed that no origin needs.
-    ///
-    /// This is the half that catches a *stale* entry. `aviationweather.gov` sat
-    /// in this file long after METAR stopped using it, and a list with dead
-    /// entries in it reads as maintained when it is not.
     #[test]
     fn the_network_security_config_lists_nothing_unused() {
         let hosts = live_hosts();
@@ -249,17 +214,9 @@ mod tests {
         );
     }
 
-    /// Every `<domain>` must carry `includeSubdomains="true"`.
-    ///
-    /// Not a style rule: Android Lint raises `NetworkSecurityConfig` /
-    /// "Missing includeSubdomains attribute" as a **fatal** error, so an entry
-    /// without it fails `lintVitalRelease` and takes `assembleRelease` down
-    /// with it. It is also the safer default here, because a bare host leaves
-    /// its subdomains falling through to a `base-config` that permits
-    /// cleartext on purpose.
-    ///
-    /// This one fails in `cargo test`, in seconds, rather than five minutes
-    /// into a release build.
+    /// Android Lint's `NetworkSecurityConfig` / "Missing includeSubdomains" is
+    /// a *fatal* error: an entry without it fails `lintVitalRelease` and takes
+    /// `assembleRelease` with it.
     #[test]
     fn every_domain_entry_sets_include_subdomains() {
         let narrow: Vec<_> = parse_domains(&config_xml())
@@ -275,9 +232,8 @@ mod tests {
         );
     }
 
-    /// The base config must keep permitting cleartext, and every domain block
-    /// must keep denying it. Inverting either silently breaks HTTPS to
-    /// api.weather.gov or silently allows plaintext to rustdar's own origins.
+    /// Inverting either half silently breaks HTTPS to api.weather.gov or
+    /// silently allows plaintext to rustdar's own origins.
     #[test]
     fn base_permits_cleartext_and_every_domain_block_denies_it() {
         let xml = config_xml();

@@ -12,7 +12,6 @@ pub enum HeightUnit {
 impl HeightUnit {
     pub const ALL: &[HeightUnit] = &[HeightUnit::Feet, HeightUnit::Meters];
 
-    /// Convert a value in feet to this unit.
     pub fn convert_from_feet(self, value: f32) -> f32 {
         match self {
             HeightUnit::Feet => value,
@@ -20,14 +19,13 @@ impl HeightUnit {
         }
     }
 
-    /// Convert a value in thousands of feet (kft) to this unit.
-    /// Returns the value in the base unit (feet or meters), not thousands.
+    /// Returns the base unit (feet or meters), not thousands of it.
     pub fn convert_from_kft(self, value: f32) -> f32 {
         let feet = value * 1000.0;
         self.convert_from_feet(feet)
     }
 
-    /// Suffix for base height values (feet or meters).
+    /// Base units.
     pub fn suffix(self) -> &'static str {
         match self {
             HeightUnit::Feet => "ft",
@@ -35,7 +33,7 @@ impl HeightUnit {
         }
     }
 
-    /// Suffix for kilo-height values (kft or km).
+    /// Thousands: kft or km.
     pub fn kilo_suffix(self) -> &'static str {
         match self {
             HeightUnit::Feet => "kft",
@@ -43,7 +41,6 @@ impl HeightUnit {
         }
     }
 
-    /// Convert a value in kft to the equivalent kilo-unit (kft or km).
     pub fn convert_kft_to_kilo(self, value: f32) -> f32 {
         match self {
             HeightUnit::Feet => value,
