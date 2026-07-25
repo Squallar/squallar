@@ -30,33 +30,48 @@
 //! origin.
 //!
 //! Build `--release` before judging performance. Workspace code is `opt-level =
-//! 0` in the dev profile, and radar rasterization is roughly 2.5x slower there:
-//! measured in Firefox, 2349 ms per Level II frame dev against 899-962 ms
-//! release. Chromium runs the same release job in 162 ms.
+//! 0` in the dev profile, and radar rasterization is roughly 2.5x slower there —
+//! 2349 ms per Level II frame against a release figure in the 160-190 ms range.
 //!
-//! # The Firefox/Chromium gap on `radar-render`
+//! # The Firefox/Chromium gap on `radar-render`: there isn't one
 //!
-//! That 5.7x is **not** the rasterizer's `Vec<AtomicU32>`, which is what the
-//! numbers above were first read as suggesting. Driven directly — a real KTLX
-//! 0.5° sweep through `rustdar_radar::render`, release, in a module carrying
-//! nothing else — Firefox rasterizes it in 233 ms against Chromium's 261 ms,
-//! and produces a byte-identical image. Relaxed atomic stores cost Firefox 5%
-//! over plain ones and Chromium nothing. The full table is on
-//! `rustdar_radar::render`'s `RenderBuffers`.
+//! This section used to record Firefox at 899-962 ms per Level II frame against
+//! Chromium's 162 ms — a 5.7x penalty — and treat it as the crate's open
+//! performance question. **It does not reproduce.**
 //!
-//! Three other theories for the gap were measured and are also dead: module
-//! size (a 5.3 MB padded module rasterized in 197-245 ms, no worse than a
-//! 69 KB one), `wasm-opt` (skipping it left Firefox unchanged and made
-//! *Chromium* slower), and headless-vs-headed under Xvfb (233 ms either way).
-//! Disabling Firefox's optimizing wasm JIT costs 2x, which is the only
-//! Firefox-specific effect found and does not reach 5.7x.
+//! Measured in the assembled bundle, both browsers driving this page against the
+//! *same* archived sweep (`KTLX20260725_191018_V06`, 9 067 340 bytes), release,
+//! `IMAGE_SIZE` 1024:
 //!
-//! So the gap has not been explained, only relocated: it is something about
-//! this crate's assembled bundle rather than the rasterizer in it. Reproducing
-//! it needs the bundle, and the bundle does not currently build — `wasm-bindgen`
-//! 0.2.126 aborts with `duplicate string enums: GpuFilterMode` on the wgpu
-//! web-sys bindings. That is the thing to fix first; the next measurement is
-//! blocked behind it.
+//! | browser                          |  n | min    | median |
+//! |----------------------------------|---:|-------:|-------:|
+//! | Chromium (headless, SwiftShader) | 19 | 174 ms | 191 ms |
+//! | Firefox (headed on Xvfb, NVIDIA) | 10 | 159 ms | 183 ms |
+//!
+//! Run as interleaved pairs, so each comparison shares a contention window, the
+//! median Firefox/Chromium ratio is **0.88**. Firefox is slightly *faster* —
+//! which is what the isolated harness had already found (233 ms against 261 ms)
+//! and was disbelieved because the assembled app seemed to say otherwise. It
+//! does not. There is no Firefox-specific penalty in this bundle to fix.
+//!
+//! Two things are needed to get a number that means anything, and the original
+//! measurement had neither.
+//!
+//! **Pin the input.** The app loads whichever volume is newest, so two browsers
+//! started minutes apart rasterize two different sweeps with different gate
+//! counts. Comparing across them measures the weather. These runs went through a
+//! caching proxy, so the second browser replayed the first one's bytes.
+//!
+//! **Watch the machine.** These runs shared a 32-core box with an unrelated
+//! build fleet at load 26-72, and single samples there spanned 174-508 ms in
+//! *Chromium alone* — a wider spread than the effect being chased. Minima and
+//! matched pairs are the figures that survive that; one timing off a busy
+//! machine is not evidence, and a 5.7x built from two of them is most likely
+//! just the load at the two moments they were taken.
+//!
+//! Still true, and the actual place the frame goes on *both* browsers:
+//! `rustdar_radar::types::lat_rad_to_mercator_y`. See `rustdar_radar::render`'s
+//! `RenderBuffers`.
 //!
 //! [`PlatformBridge`]: rustdar_frontend::platform::PlatformBridge
 

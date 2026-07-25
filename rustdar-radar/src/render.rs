@@ -206,11 +206,16 @@ impl RadialContext {
 /// cost of the split is two divergent buffer types under one hot loop; a 1%
 /// return does not pay for it.
 ///
-/// The same measurements dispose of the theory that Firefox's 5.7× penalty on
-/// `radar-render` comes from these atomics. It does not: Firefox rasterizes
-/// this sweep *faster* than Chromium does, and relaxed atomic stores cost it
-/// 5% over plain ones. See `rustdar-web`'s crate docs for what is and is not
-/// still open there.
+/// The same measurements dispose of the theory that Firefox's reported 5.7×
+/// penalty on `radar-render` comes from these atomics. It does not: Firefox
+/// rasterizes this sweep *faster* than Chromium does, and relaxed atomic stores
+/// cost it 5% over plain ones.
+///
+/// That penalty has since been re-measured in the assembled web bundle, against
+/// one pinned sweep rather than whatever volume was newest at the time, and it
+/// is not there: Firefox 159 ms minimum against Chromium's 174 ms, a matched-pair
+/// median ratio of 0.88. The 5.7× was a measurement artifact. See `rustdar-web`'s
+/// crate docs for the table and for what made the original number wrong.
 ///
 /// Where the frame actually goes is the per-sample transcendental in
 /// `types::lat_rad_to_mercator_y` — `(π/4 + lat/2).tan().ln()`, once per
