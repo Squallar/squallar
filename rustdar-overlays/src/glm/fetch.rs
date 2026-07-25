@@ -65,8 +65,26 @@ pub async fn fetch_glm_flashes(
     let mut new_entries: Vec<(String, Vec<GlmFlash>)> = Vec::new();
 
     for &sat in satellites {
-        let keys = list_glm_files(client, sat, start, now).await?;
-        let new_keys: Vec<&str> = keys.iter()
+        let listing = list_glm_files(client, sat, start, now).await?;
+
+        // A listing that returns no objects *at all* means the feed itself is
+        // gone (dead bucket, renamed product path, satellite rotated out of the
+        // slot) — not merely a quiet sky. GOES-East silently rendered nothing
+        // for over a year because `noaa-goes16` went dead and zero files looked
+        // exactly like zero lightning. Surface it loudly; a listing that returns
+        // objects but no in-window flashes stays silent, since that is normal.
+        if listing.objects_seen == 0 {
+            log::warn!(
+                "GLM: no objects at all in bucket '{}' for {} under prefixes [{}] — \
+                 the upstream feed appears dead (satellite rotated out of this slot?), \
+                 not simply quiet",
+                sat.bucket(),
+                sat.display_name(),
+                listing.prefixes.join(", "),
+            );
+        }
+
+        let new_keys: Vec<&str> = listing.keys.iter()
             .filter(|k| !cache.contains_key(k.as_str()))
             .map(|k| k.as_str())
             .collect();
@@ -98,6 +116,18 @@ pub async fn fetch_glm_flashes(
     Ok(filtered)
 }
 
+/// Result of listing S3 for one satellite, with enough context to tell an
+/// absent feed apart from a quiet one.
+struct GlmListing {
+    /// Keys that are `.nc` files whose encoded start time falls in the window.
+    keys: Vec<String>,
+    /// Total objects S3 returned across all prefixes, before any filtering.
+    /// Zero means the bucket/prefix has nothing in it whatsoever.
+    objects_seen: usize,
+    /// Prefixes queried, for diagnostics.
+    prefixes: Vec<String>,
+}
+
 /// List GLM LCFA file keys on S3 for the given time range.
 ///
 /// S3 path: `GLM-L2-LCFA/{year}/{day_of_year}/{hour}/`
@@ -107,9 +137,10 @@ async fn list_glm_files(
     satellite: GlmSatellite,
     start: NaiveDateTime,
     end: NaiveDateTime,
-) -> Result<Vec<String>, String> {
+) -> Result<GlmListing, String> {
     let bucket = satellite.bucket();
     let mut all_keys = Vec::new();
+    let mut objects_seen = 0usize;
 
     // Collect all (year, doy, hour) tuples we need to query
     let mut prefixes = Vec::new();
@@ -161,14 +192,16 @@ async fn list_glm_files(
 
             for node in doc.descendants() {
                 if node.tag_name().name() == "Key"
-                    && let Some(key) = node.text()
-                        && key.ends_with(".nc") {
+                    && let Some(key) = node.text() {
+                        objects_seen += 1;
+                        if key.ends_with(".nc") {
                             // Filter by start time encoded in filename
                             if let Some(file_start) = parse_filename_start_time(key)
                                 && file_start >= start && file_start <= end {
                                     all_keys.push(key.to_string());
                                 }
                         }
+                    }
             }
 
             // Check for truncation (pagination)
@@ -188,7 +221,11 @@ async fn list_glm_files(
         }
     }
 
-    Ok(all_keys)
+    Ok(GlmListing {
+        keys: all_keys,
+        objects_seen,
+        prefixes,
+    })
 }
 
 /// Parse the start timestamp from a GLM filename.
