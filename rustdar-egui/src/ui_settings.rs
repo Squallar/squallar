@@ -5,10 +5,10 @@ use rustdar_units::{
 use rustdar_gps::HeadingSource;
 use crate::actions::GuiAction;
 
-const IS_MOBILE: bool = cfg!(target_os = "android");
-const SETTINGS_POPUP_MARGIN: f32 = 32.0;
-const SETTINGS_POPUP_MIN_WIDTH_MOBILE: f32 = 250.0;
-const SETTINGS_POPUP_WIDTH_DESKTOP: f32 = 340.0;
+/// Width of the settings window when there is room for a fixed-width one.
+/// Narrower screens get a full-bleed window instead — see
+/// [`crate::ui_layout::LayoutCtx::dialog_width`].
+const SETTINGS_POPUP_ROOMY_WIDTH: f32 = 340.0;
 const SETTINGS_SMALL_SPACING: f32 = 4.0;
 const SETTINGS_LARGE_SPACING: f32 = 8.0;
 #[cfg(feature = "gps-serial")]
@@ -22,12 +22,7 @@ impl super::Gui {
             return;
         }
 
-        let screen = ctx.input(|i| i.viewport_rect());
-        let popup_width = if IS_MOBILE {
-            (screen.width() - SETTINGS_POPUP_MARGIN).max(SETTINGS_POPUP_MIN_WIDTH_MOBILE)
-        } else {
-            SETTINGS_POPUP_WIDTH_DESKTOP
-        };
+        let popup_width = self.layout.dialog_width(SETTINGS_POPUP_ROOMY_WIDTH);
 
         let mut open = true;
         egui::Window::new("Settings")
@@ -41,7 +36,7 @@ impl super::Gui {
             // deliberately not compensated.
             .default_width(popup_width)
             .pivot(egui::Align2::CENTER_CENTER)
-            .default_pos(screen.center())
+            .default_pos(self.layout.dialog_center())
             .show(ctx, |ui| {
                 ui.heading("Units");
                 ui.add_space(SETTINGS_SMALL_SPACING);

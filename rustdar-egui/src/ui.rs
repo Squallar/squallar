@@ -4,10 +4,9 @@ use rustdar_overlays::render::controls::{ControlEffect, ControlItem, ControlUpda
 const DEFAULT_INITIAL_ZOOM: f64 = 7.0;
 
 use rustdar_overlays::render::overlay_state::{OverlayRegistry, OverlayKind};
-use crate::pane::{
-    ColorScaleOrientation, PaneId, PaneLayout, PaneState, MAX_PANES_DESKTOP, MAX_PANES_MOBILE,
-};
+use crate::pane::{ColorScaleOrientation, PaneId, PaneLayout, PaneState};
 use crate::tiles::MapTileState;
+use crate::ui_layout::LayoutCtx;
 use chrono::Timelike;
 use egui::Context;
 use rustdar_radar::types::{RadarProduct, ScanInfo};
@@ -137,6 +136,9 @@ pub struct Gui {
     // Safe area insets in logical pixels (top, bottom, left, right)
     // Used on Android to avoid drawing under system bars.
     safe_area_insets: (f32, f32, f32, f32),
+    /// This frame's resolved layout. Written once at the top of [`Gui::ui`] and
+    /// read by everything below it; never recomputed further down.
+    layout: LayoutCtx,
     /// User unit and timezone preferences.
     pub preferences: UserPreferences,
     /// Whether the settings panel is open.
@@ -290,6 +292,7 @@ impl Gui {
             #[cfg(target_os = "android")]
             mobile: MobileState::default(),
             safe_area_insets: (0.0, 0.0, 0.0, 0.0),
+            layout: LayoutCtx::default(),
             preferences: UserPreferences::default(),
             show_settings: false,
             gps_config: rustdar_gps::GpsConfig::default(),
@@ -304,15 +307,25 @@ impl Gui {
 
         self.check_auto_polls(&mut actions);
 
+        // Resolve the frame's layout exactly once, before anything draws. Every
+        // responsive decision below reads `self.layout`; nothing recomputes a
+        // width or a modality of its own.
+        self.layout = LayoutCtx::resolve(ctx, self.safe_area_insets);
+
         // Create a root Ui to host the panels. Since egui 0.35 the Context-taking
         // `Panel::show` is gone and panels are Ui-scoped only, so this root Ui is
         // the only way in.
+        //
+        // The root rect is the *content* rect, so every `Panel` nested inside it
+        // is inset from the system bars and the notch for free. That is what
+        // replaced the hand-rolled `add_space(top_inset)` calls the mobile UI
+        // used to carry at each panel's top edge.
         let mut root_ui = egui::Ui::new(
             ctx.clone(),
             egui::Id::new("rustdar_root"),
             egui::UiBuilder::new()
                 .layer_id(egui::LayerId::background())
-                .max_rect(ctx.content_rect()),
+                .max_rect(self.layout.content_rect),
         );
 
         #[cfg(target_os = "android")]
@@ -427,12 +440,14 @@ impl Gui {
         let mut action = None;
         
         if self.time_dialog.show {
-            let screen = ctx.input(|i| i.viewport_rect());
             egui::Window::new("Set Time")
                 .collapsible(false)
                 .resizable(false)
                 .pivot(egui::Align2::CENTER_CENTER)
-                .default_pos(screen.center())
+                // Centred in the content rect, not the viewport: on a device
+                // with a notch or a nav bar those differ, and centring on the
+                // viewport puts the dialog partly underneath them.
+                .default_pos(self.layout.dialog_center())
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.heading("Select Time");
@@ -494,11 +509,7 @@ impl Gui {
         ui: &mut egui::Ui,
         pane: &mut PaneState,
     ) {
-        let max_panes = if cfg!(target_os = "android") {
-            MAX_PANES_MOBILE
-        } else {
-            MAX_PANES_DESKTOP
-        };
+        let max_panes = self.layout.width.max_panes();
         ui.horizontal(|ui| {
             ui.label("Panes:");
             for count in 1..=max_panes {

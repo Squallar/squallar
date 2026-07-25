@@ -7,6 +7,7 @@ pub mod tile_source;
 pub mod tiles;
 mod ui;
 pub(crate) mod ui_input;
+pub(crate) mod ui_layout;
 
 #[cfg(test)]
 mod input_harness;

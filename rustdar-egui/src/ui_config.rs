@@ -9,7 +9,9 @@ use rustdar_overlays::spc::outlook::OutlookDay;
 use rustdar_radar::types::RadarProduct;
 use rustdar_units::UserPreferences;
 
-use super::{PaneLayout, PaneState, MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
+use super::PaneLayout;
+use super::PaneState;
+use crate::ui_layout::WidthClass;
 
 /// Serializable per-pane state persisted across sessions.
 #[derive(Serialize, Deserialize)]
@@ -185,12 +187,13 @@ impl super::Gui {
             }
         };
 
-        let max = if cfg!(target_os = "android") {
-            MAX_PANES_MOBILE
-        } else {
-            MAX_PANES_DESKTOP
-        };
-        let count = config.pane_count.clamp(1, max);
+        // Clamp to the *absolute* maximum, not the current screen's. Clamping
+        // to what this device would offer silently destroys the user's layout:
+        // a 5-pane config opened once on a phone comes back as 4 panes and is
+        // written back as 4 on the next save. The config is shared state, so it
+        // is clamped to what the format allows; the pane picker does the
+        // per-device narrowing at the point of *editing*.
+        let count = config.pane_count.clamp(1, WidthClass::max_panes_absolute());
         while self.panes.len() < count {
             let site = config.panes.get(self.panes.len()).map(|pc| pc.site.clone()).unwrap_or_else(|| config.site.clone());
             self.panes.push(PaneState::with_site(site));

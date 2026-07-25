@@ -1,23 +1,30 @@
 use rustdar_overlays::render::overlay_state::{PopupContent, PopupSection};
 
-const IS_MOBILE: bool = cfg!(target_os = "android");
+use crate::ui_layout::{LayoutCtx, WidthClass};
 
-/// Show a centered detail popup window with platform-appropriate sizing.
+/// Body text sizes, picked from the width class rather than the target OS: a
+/// narrow window on a desktop wants the tighter type just as much as a phone
+/// does, and a tablet does not.
+fn heading_size(layout: &LayoutCtx) -> f32 {
+    if layout.width == WidthClass::Compact { 13.0 } else { 14.0 }
+}
+
+fn monospace_size(layout: &LayoutCtx) -> f32 {
+    if layout.width == WidthClass::Compact { 11.0 } else { 12.0 }
+}
+
+/// Show a centered detail popup window sized for the current layout.
 ///
 /// Returns `true` if the user closed the popup (via the X button).
 fn show_detail_popup(
     ctx: &egui::Context,
+    layout: &LayoutCtx,
     id: &str,
     title: egui::RichText,
-    desktop_width: f32,
+    roomy_width: f32,
     body: impl FnOnce(&mut egui::Ui),
 ) -> bool {
-    let screen = ctx.input(|i| i.viewport_rect());
-    let popup_width = if IS_MOBILE {
-        (screen.width() - 32.0).max(200.0)
-    } else {
-        desktop_width
-    };
+    let popup_width = layout.dialog_width(roomy_width);
     let mut open = true;
     egui::Window::new(title)
         .id(egui::Id::new(id))
@@ -27,14 +34,14 @@ fn show_detail_popup(
         // Since egui 0.35 (#7725, "rework `Window` margins") this is the window's
         // OUTER width — it used to size the content. Content is now narrower by
         // 2 x (`spacing.window_margin` + `visuals.window_stroke`), 14px at the
-        // stock theme. Deliberately not compensated: on mobile `popup_width` is
-        // `screen - 32`, which reads as "a 16px gutter each side", and only the
-        // new meaning actually delivers that. Adding 14 back would restore the
-        // old content width but hardcode a theme-derived constant that rots the
-        // moment the style changes.
+        // stock theme. Deliberately not compensated: when compact `popup_width`
+        // is `content - 32`, which reads as "a 16px gutter each side", and only
+        // the new meaning actually delivers that. Adding 14 back would restore
+        // the old content width but hardcode a theme-derived constant that rots
+        // the moment the style changes.
         .default_width(popup_width)
         .pivot(egui::Align2::CENTER_CENTER)
-        .default_pos(screen.center())
+        .default_pos(layout.dialog_center())
         .order(egui::Order::Foreground)
         .show(ctx, |ui| body(ui));
 
@@ -44,6 +51,7 @@ fn show_detail_popup(
 /// Render popup sections generically. Returns indices of triggered actions.
 fn render_popup_sections(
     ui: &mut egui::Ui,
+    layout: &LayoutCtx,
     content: &PopupContent,
 ) -> Vec<usize> {
     let mut triggered = Vec::new();
@@ -54,7 +62,7 @@ fn render_popup_sections(
                 ui.label(
                     egui::RichText::new(text)
                         .strong()
-                        .size(if IS_MOBILE { 13.0 } else { 14.0 }),
+                        .size(heading_size(layout)),
                 );
                 ui.add_space(4.0);
             }
@@ -84,7 +92,7 @@ fn render_popup_sections(
                     .show(ui, |ui| {
                         let rt = if *monospace {
                             egui::RichText::new(text)
-                                .font(egui::FontId::monospace(if IS_MOBILE { 11.0 } else { 12.0 }))
+                                .font(egui::FontId::monospace(monospace_size(layout)))
                         } else {
                             egui::RichText::new(text)
                         };
@@ -144,8 +152,10 @@ impl super::Gui {
         );
 
         let mut triggered_actions: Vec<usize> = Vec::new();
+        let layout = self.layout;
         let closed = show_detail_popup(
             ctx,
+            &layout,
             "overlay_pager_popup",
             egui::RichText::new(&content.title).color(accent).strong(),
             content.width,
@@ -154,7 +164,7 @@ impl super::Gui {
                     render_pager_nav(ui, page, count, &mut self.overlays.selected_overlay_page);
                     ui.separator();
                 }
-                triggered_actions = render_popup_sections(ui, &content);
+                triggered_actions = render_popup_sections(ui, &layout, &content);
             },
         );
 
