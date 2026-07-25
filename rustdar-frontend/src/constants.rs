@@ -5,10 +5,10 @@ pub const RENDER_WIDTH: u32 = 1920;
 pub const RENDER_HEIGHT: u32 = 1080;
 
 /// Maximum number of concurrent background radar render threads (loop + static).
-/// Android devices have much less RAM, so we cap aggressively to avoid OOM.
-#[cfg(target_os = "android")]
+/// Handhelds have much less RAM, so we cap aggressively to avoid OOM.
+#[cfg(mobile)]
 pub const MAX_CONCURRENT_RENDERS: usize = 3;
-#[cfg(not(target_os = "android"))]
+#[cfg(not(mobile))]
 pub const MAX_CONCURRENT_RENDERS: usize = 6;
 
 /// Maximum number of loop frames to consider for rendering per dispatch cycle.
@@ -19,15 +19,15 @@ pub const MAX_CONCURRENT_RENDERS: usize = 6;
 /// this — not `MAX_LOOP_FRAMES` — the binding term in the per-pane texture budget.
 #[cfg(target_arch = "wasm32")]
 pub const MAX_LOOP_RENDER_BUDGET: usize = 8;
-#[cfg(all(not(target_arch = "wasm32"), target_os = "android"))]
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
 pub const MAX_LOOP_RENDER_BUDGET: usize = 12;
-#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
 pub const MAX_LOOP_RENDER_BUDGET: usize = 30;
 
 /// Maximum number of concurrent loop scan downloads per pane.
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 pub const MAX_CONCURRENT_LOOP_DOWNLOADS: usize = 4;
-#[cfg(not(target_os = "android"))]
+#[cfg(not(mobile))]
 pub const MAX_CONCURRENT_LOOP_DOWNLOADS: usize = 8;
 
 /// Maximum total number of loop frames kept per pane.
@@ -39,19 +39,24 @@ pub const MAX_CONCURRENT_LOOP_DOWNLOADS: usize = 8;
 ///
 /// # The shape of the `cfg` cascade
 ///
-/// The `not(target_arch = "wasm32")` guard on the desktop and android arms is
+/// The `not(target_arch = "wasm32")` guard on the desktop and mobile arms is
 /// load-bearing, and no build on a machine without a wasm target can show it.
-/// wasm32 is the only target where `target_arch = "wasm32"` and
-/// `not(target_os = "android")` are true at once: drop that guard and the cascade
-/// stays equivalent everywhere it is compiled today, while wasm32 gets two
-/// definitions of the same constant and fails with `error[E0428]`. `cfg` arms have
-/// no ordering and no fallthrough, so exclusivity is the only thing keeping them
-/// apart. Every constant below follows the same three-arm shape for that reason.
+/// wasm32 is the only target where `target_arch = "wasm32"` and `not(mobile)`
+/// are true at once: drop that guard and the cascade stays equivalent everywhere
+/// it is compiled today, while wasm32 gets two definitions of the same constant
+/// and fails with `error[E0428]`. `cfg` arms have no ordering and no
+/// fallthrough, so exclusivity is the only thing keeping them apart. Every
+/// constant below follows the same three-arm shape for that reason.
+///
+/// `mobile` is emitted by this crate's `build.rs` for Android and iOS. It
+/// replaced `target_os = "android"` because the distinction being made is how
+/// much memory the device has, not which OS it runs — and iOS needs the same
+/// answer. Every target that exists today selects exactly the arm it did before.
 #[cfg(target_arch = "wasm32")]
 pub const MAX_LOOP_FRAMES: usize = 12;
-#[cfg(all(not(target_arch = "wasm32"), target_os = "android"))]
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
 pub const MAX_LOOP_FRAMES: usize = 20;
-#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
 pub const MAX_LOOP_FRAMES: usize = 60;
 
 /// Ceiling on what one pane's loop textures may occupy, in bytes.
@@ -70,16 +75,16 @@ pub const MAX_LOOP_FRAMES: usize = 60;
 /// | target  | held | textured | frame size | total   | budget  |
 /// |---------|-----:|---------:|-----------:|--------:|--------:|
 /// | desktop |   60 |       30 |     16 MiB | 480 MiB | 512 MiB |
-/// | android |   20 |       12 |     16 MiB | 192 MiB | 256 MiB |
+/// | mobile  |   20 |       12 |     16 MiB | 192 MiB | 256 MiB |
 /// | wasm32  |   12 |        8 |      4 MiB |  32 MiB |  48 MiB |
 ///
 /// wasm32's is the tight one: the whole linear memory is capped at 4 GiB, and the
 /// loop is only one of several things competing for it.
 #[cfg(target_arch = "wasm32")]
 pub const LOOP_TEXTURE_BUDGET_BYTES: usize = 48 * 1024 * 1024;
-#[cfg(all(not(target_arch = "wasm32"), target_os = "android"))]
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
 pub const LOOP_TEXTURE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
-#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
 pub const LOOP_TEXTURE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// Maximum number of entries kept in `RenderDispatcher::render_cache`.
@@ -93,10 +98,29 @@ pub const LOOP_TEXTURE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 /// Sized to comfortably exceed the pane count (`MAX_PANES_DESKTOP` is 6,
 /// `MAX_PANES_MOBILE` is 4) so the panes on screen can never evict each other,
 /// with a little headroom for switching back and forth.
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 pub const MAX_RENDER_CACHE_ENTRIES: usize = 6;
-#[cfg(not(target_os = "android"))]
+#[cfg(not(mobile))]
 pub const MAX_RENDER_CACHE_ENTRIES: usize = 8;
+
+/// A handheld target must have been given the `mobile` cfg.
+///
+/// This is the control on `build.rs` actually running. If it is deleted, or the
+/// manifest stops pointing at it, or its condition is wrong, `mobile` is simply
+/// never set — and every cascade above then silently selects the *desktop* arm.
+/// On a phone that means `MAX_CONCURRENT_RENDERS` 6 instead of 3 and a 512 MiB
+/// texture budget instead of 256 MiB, which is an OOM, not a warning.
+///
+/// `rustc-check-cfg` alone does not cover this: a missing build script turns
+/// each `mobile` arm into an `unexpected_cfgs` warning, and nothing in CI turns
+/// warnings into failures (`clippy.yaml` ends with a bare `cargo clippy`). This
+/// does not depend on CI — the build simply stops.
+#[cfg(all(any(target_os = "android", target_os = "ios"), not(mobile)))]
+compile_error!(
+    "the `mobile` cfg is not set on a handheld target: rustdar-frontend's \
+     build.rs did not run, or its target list is wrong. Without it this crate \
+     would compile desktop memory budgets into a mobile build."
+);
 
 /// Sanity of the `cfg` cascades above, checked at compile time so the arm a future
 /// wasm build selects is validated the moment that target exists — a `#[test]` only
