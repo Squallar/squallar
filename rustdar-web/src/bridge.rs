@@ -120,6 +120,20 @@ impl PlatformBridge for WebPlatform {
         &self,
         attributes: winit::window::WindowAttributes,
     ) -> winit::window::WindowAttributes {
+        // Deliberately no `with_inner_size`.
+        //
+        // It would not do what it looks like it does. winit's web backend
+        // reports `inner_size()` from a `current_size` cell that starts at zero
+        // and is written *only* by the ResizeObserver it installs on the canvas;
+        // `with_inner_size` sets the element's size but never touches that cell.
+        // So the size is zero for the first frame or two regardless, and the app
+        // has to tolerate that — see the zero-size guard in `App::handle_redraw`,
+        // which is the actual fix.
+        //
+        // Worse, setting it here writes an inline `width`/`height` in pixels,
+        // which outranks the stylesheet's `width: 100%` and pins the canvas to
+        // its startup size forever. The page would then stop responding to
+        // browser window resizes entirely.
         attributes
             .with_canvas(Some(self.canvas.clone()))
             // Without this, the browser's own handling of the events egui has

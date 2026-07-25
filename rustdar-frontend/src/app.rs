@@ -214,6 +214,28 @@ impl App {
             return;
         }
 
+        // Skip rendering a window with no area.
+        //
+        // On web this is the *normal* state of the first frame or two, not an
+        // edge case: winit's web backend serves `inner_size()` from a cell that
+        // starts at zero and is written only when the ResizeObserver it installs
+        // on the canvas first fires, which is after the initial redraw.
+        //
+        // Rendering anyway does not fail cleanly. The surface gets configured at
+        // one pixel, egui lays the UI out inside a degenerate rect, and the map
+        // code then unprojects that rect into latitudes far outside the world —
+        // `draw_label_tiles_overlay` turns those into a tile index of `u32::MAX`
+        // and panics on the `+ 1`. On wasm a panic is unrecoverable, so the app
+        // dies on frame one and the resize that would have fixed everything
+        // never arrives.
+        if let Some(window) = self.window.as_ref() {
+            let size = window.inner_size();
+            if size.width == 0 || size.height == 0 {
+                log::debug!("Window has zero area ({}x{}); skipping frame", size.width, size.height);
+                return;
+            }
+        }
+
         self.ensure_rendering_state();
         if self.state.is_none() || self.window.is_none() {
             return;
