@@ -43,6 +43,12 @@ pub struct PendingDownloads {
     pub queue: VecDeque<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)>,
 }
 
+impl Default for LoopDownloadManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LoopDownloadManager {
     pub fn new() -> Self {
         Self {
