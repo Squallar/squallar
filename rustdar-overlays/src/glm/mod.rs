@@ -113,6 +113,30 @@ pub struct DeadFeed {
     pub prefixes: Vec<String>,
 }
 
+/// Files that downloaded but could not be parsed.
+///
+/// A granule that fails to parse is as invisible to the user as a granule that
+/// never existed — the map just goes blank — but it arrives through a different
+/// door than [`DeadFeed`]: the S3 listing is perfectly healthy. A product-wide
+/// schema change (a renamed variable) shows up here, not in the listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseFailures {
+    /// Files that were downloaded and attempted this poll.
+    pub attempted: usize,
+    /// How many of those failed.
+    pub failed: usize,
+    /// One representative error, so the report can say *why*.
+    pub sample_error: String,
+}
+
+impl ParseFailures {
+    /// Every single file failed: nothing rendered, and the cause is systematic
+    /// rather than a corrupt granule here and there.
+    pub fn is_total(&self) -> bool {
+        self.attempted > 0 && self.failed == self.attempted
+    }
+}
+
 /// What one GLM fetch produced.
 pub struct GlmFetchOutcome {
     pub flashes: Vec<GlmFlash>,
@@ -122,6 +146,14 @@ pub struct GlmFetchOutcome {
     /// message can be edge-triggered against the previous poll instead of
     /// repeating every 20 seconds.
     pub dead_feeds: Vec<DeadFeed>,
+    /// Satellites this fetch actually asked about.
+    ///
+    /// Required to interpret `dead_feeds`: a satellite absent from `dead_feeds`
+    /// is only alive if it was *queried*. Without this, deselecting a dead
+    /// satellite in the dropdown reads as the feed recovering.
+    pub queried: Vec<GlmSatellite>,
+    /// Download/parse failures this poll, if any.
+    pub parse_failures: Option<ParseFailures>,
 }
 
 /// Type-erased fetch result for GLM lightning data.

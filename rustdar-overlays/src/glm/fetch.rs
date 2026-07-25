@@ -8,7 +8,9 @@ use std::collections::HashMap;
 
 use chrono::{NaiveDateTime, TimeDelta, Utc};
 
-use super::{DeadFeed, GlmDataLevel, GlmFetchOutcome, GlmFlash, GlmSatellite};
+use super::{
+    DeadFeed, GlmDataLevel, GlmFetchOutcome, GlmFlash, GlmSatellite, ParseFailures,
+};
 
 /// Cached GLM file data keyed by S3 object key.
 #[derive(Default, Clone)]
@@ -58,6 +60,16 @@ pub async fn fetch_glm_flashes(
     levels: &[GlmDataLevel],
     cache: &mut GlmCache,
 ) -> Result<GlmFetchOutcome, String> {
+    // The zero-object warning below assumes the queried range is wide enough to
+    // always cover an already-published granule. That assumption is the UI's
+    // slider minimum; keep a caller from quietly invalidating it.
+    debug_assert!(
+        time_window_secs >= 45.0,
+        "GLM time window {time_window_secs}s is below S3 publish latency; the \
+         zero-object check would report a live feed as dead. See \
+         GLM_MIN_TIME_WINDOW_SECS.",
+    );
+
     let now = Utc::now().naive_utc();
     let window = TimeDelta::milliseconds((time_window_secs * 1000.0) as i64);
     let start = now - window;
@@ -69,6 +81,8 @@ pub async fn fetch_glm_flashes(
     // List & download new files for each satellite
     let mut new_entries: Vec<(String, Vec<GlmFlash>)> = Vec::new();
     let mut dead_feeds = Vec::new();
+    let mut attempted = 0usize;
+    let mut parse_errors: Vec<String> = Vec::new();
 
     for &sat in satellites {
         let listing = list_glm_files(client, sat, start, now).await?;
@@ -98,8 +112,10 @@ pub async fn fetch_glm_flashes(
         log::info!("Downloading {} new GLM files from {}", new_keys.len(), sat.display_name());
 
         // Download in concurrent batches of 20
-        let results = download_and_parse_batch(client, sat, &new_keys, levels).await;
-        for (key, flashes) in results {
+        attempted += new_keys.len();
+        let batch = download_and_parse_batch(client, sat, &new_keys, levels).await;
+        parse_errors.extend(batch.errors);
+        for (key, flashes) in batch.entries {
             new_entries.push((key, flashes));
         }
     }
@@ -116,7 +132,22 @@ pub async fn fetch_glm_flashes(
         .collect();
 
     log::info!("GLM: {} flashes in {:.0}s window", filtered.len(), time_window_secs);
-    Ok(GlmFetchOutcome { flashes: filtered, dead_feeds })
+
+    // Parse failures are *reported*, not logged here, for the same reason dead
+    // feeds are: only the caller knows what the previous poll looked like, and
+    // only the caller can put it on screen.
+    let parse_failures = parse_errors.first().map(|sample| ParseFailures {
+        attempted,
+        failed: parse_errors.len(),
+        sample_error: sample.clone(),
+    });
+
+    Ok(GlmFetchOutcome {
+        flashes: filtered,
+        dead_feeds,
+        queried: satellites.to_vec(),
+        parse_failures,
+    })
 }
 
 /// Result of listing S3 for one satellite, with enough context to tell an
@@ -301,13 +332,22 @@ fn parse_filename_start_time(key: &str) -> Option<NaiveDateTime> {
     Some(NaiveDateTime::new(date, time))
 }
 
+/// Outcome of one download batch: what parsed, and what did not.
+struct BatchOutcome {
+    entries: Vec<(String, Vec<GlmFlash>)>,
+    /// One message per file that failed. Returned rather than only logged: a
+    /// batch where *every* file fails renders exactly like a quiet sky, so the
+    /// count has to reach the UI, not just the log.
+    errors: Vec<String>,
+}
+
 /// Download and parse a batch of GLM NetCDF files concurrently.
 async fn download_and_parse_batch(
     client: &reqwest::Client,
     satellite: GlmSatellite,
     keys: &[&str],
     levels: &[GlmDataLevel],
-) -> Vec<(String, Vec<GlmFlash>)> {
+) -> BatchOutcome {
     use futures::stream::StreamExt;
 
     let bucket = satellite.bucket();
@@ -319,20 +359,31 @@ async fn download_and_parse_batch(
         let lvls = levels_owned.clone();
         async move {
             match download_and_parse_one(&client, &url, satellite, &lvls).await {
-                Ok(flashes) => Some((key_owned, flashes)),
+                Ok(flashes) => Ok((key_owned, flashes)),
                 Err(e) => {
-                    log::warn!("Failed to fetch GLM file {key_owned}: {e}");
-                    None
+                    // Per-file detail stays at debug: with 20 files in flight,
+                    // warning on each turns a single schema change into a wall
+                    // of identical lines. The aggregate is reported instead.
+                    log::debug!("Failed to fetch GLM file {key_owned}: {e}");
+                    Err(format!("{key_owned}: {e}"))
                 }
             }
         }
     }).collect();
 
-    futures::stream::iter(futs)
+    let results: Vec<Result<(String, Vec<GlmFlash>), String>> = futures::stream::iter(futs)
         .buffer_unordered(20)
-        .filter_map(|r| async { r })
         .collect()
-        .await
+        .await;
+
+    let mut outcome = BatchOutcome { entries: Vec::new(), errors: Vec::new() };
+    for result in results {
+        match result {
+            Ok(entry) => outcome.entries.push(entry),
+            Err(e) => outcome.errors.push(e),
+        }
+    }
+    outcome
 }
 
 /// Download a single GLM NetCDF file and parse data from it.
@@ -461,10 +512,14 @@ fn parse_level_records(
         }
     }
 
-    // Area is the one genuinely optional column: events have none at all, so
-    // `vars.area` is `None` there and we never look. When a level that should
-    // have one is missing it, degrade to no area rather than blanking the whole
-    // overlay — area is presentational, unlike position and time — but say so.
+    // Area is the one genuinely optional column, and the criterion is the
+    // product's own schema, not how load-bearing the field feels: events have no
+    // area variable at all, so `vars.area` is `None` there and we never look.
+    // Every level always has lat/lon/energy/time, so their absence is drift and
+    // is refused above — including energy, whose loss would otherwise be
+    // *silently* absorbed by the rasterizer as a uniform minimum bolt size.
+    // When a level that should have an area is missing one, degrade to no area
+    // instead of failing the file, but say so.
     let areas = match vars.area {
         Some(name) => match read_optional_f32(file, name)? {
             Some(values) if values.len() == count => Some(values),
@@ -606,17 +661,39 @@ mod tests {
         }
     }
 
+    /// Every flash-level variable, so tests can omit "all of them".
+    const FLASH_LEVEL_VARS: [&str; 5] = [
+        "flash_lat",
+        "flash_lon",
+        "flash_energy",
+        "flash_area",
+        "flash_time_offset_of_first_event",
+    ];
+
+    /// The error a missing variable must produce, verbatim.
+    fn absent_variable_error(name: &str) -> String {
+        format!("GLM file has no '{name}' variable (product schema change?)")
+    }
+
+    #[derive(Default)]
+    struct Fixture<'a> {
+        /// Variables to leave out entirely, simulating a schema change.
+        omit: &'a [&'a str],
+        /// Variable to write against a deliberately shorter dimension,
+        /// simulating a corrupt or restructured file.
+        short: Option<&'a str>,
+    }
+
     /// Build a minimal in-memory GLM-shaped NetCDF4 file: flashes carry an
     /// area variable, events deliberately do not (mirroring the real product).
-    /// Names listed in `omit` are left out, to simulate a product schema change.
     ///
     /// NOTE: this fixture writes plain unpacked `f32`. The real product stores
     /// these as `short` with `_Unsigned`, `scale_factor` and `add_offset`, so
-    /// the assertions below deliberately do not pin the *scaling* behaviour —
+    /// the assertions below deliberately do not pin absolute *values* —
     /// see the TODO on `GlmFlash::area`. `fix/glm-cf-unpacking` owns the CF
     /// unpacking work and should extend this fixture to packed shorts; changing
     /// it here would collide with that branch.
-    fn synthetic_glm_file(omit: &[&str]) -> Vec<u8> {
+    fn synthetic_glm_file(spec: Fixture<'_>) -> Vec<u8> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let guard = TempNc(std::env::temp_dir().join(format!(
@@ -633,11 +710,17 @@ mod tests {
 
             file.add_dimension("number_of_flashes", 2).expect("flash dim");
             file.add_dimension("number_of_events", 2).expect("event dim");
+            file.add_dimension("truncated", 1).expect("short dim");
 
             let mut put = |name: &str, dim: &str, values: &[f32]| {
-                if omit.contains(&name) {
+                if spec.omit.contains(&name) {
                     return;
                 }
+                let (dim, values) = if spec.short == Some(name) {
+                    ("truncated", &values[..1])
+                } else {
+                    (dim, values)
+                };
                 let mut var = file
                     .add_variable::<f32>(name, &[dim])
                     .unwrap_or_else(|e| panic!("add {name}: {e}"));
@@ -665,19 +748,27 @@ mod tests {
         std::fs::read(path).expect("read back netcdf")
     }
 
+    fn parse_flashes(bytes: &[u8]) -> Result<Vec<GlmFlash>, String> {
+        parse_glm_netcdf(bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Flash])
+    }
+
     #[test]
     fn flash_level_reports_area_and_event_level_reports_none() {
-        let bytes = synthetic_glm_file(&[]);
+        let bytes = synthetic_glm_file(Fixture::default());
 
-        let flashes = parse_glm_netcdf(
-            &bytes,
-            GlmSatellite::GoesEast,
-            &[GlmDataLevel::Flash],
-        )
-        .expect("parse flash level");
+        let flashes = parse_flashes(&bytes).expect("parse flash level");
         assert_eq!(flashes.len(), 2);
-        assert!(flashes[0].area.is_some());
-        assert!(flashes[1].area.is_some());
+        // Pin that the *right column* was read, in order, without pinning the
+        // absolute scale (which `fix/glm-cf-unpacking` will change): the fixture
+        // writes a strictly increasing area, and any positive scaling preserves
+        // that ordering.
+        let areas: Vec<f32> = flashes.iter().map(|f| f.area.expect("flash area")).collect();
+        assert!(
+            areas[0] < areas[1],
+            "area column should track the file's increasing values, got {areas:?}"
+        );
+        // ...and that it is not silently the energy or lat column.
+        assert!(areas.iter().all(|a| *a > 1.0), "got {areas:?}");
 
         let events = parse_glm_netcdf(
             &bytes,
@@ -699,6 +790,12 @@ mod tests {
 
     /// A required variable disappearing from the product must fail the parse,
     /// not quietly yield zeros or an empty result set.
+    ///
+    /// Asserts the error *verbatim*. Containment is not enough: with the
+    /// required-variable gate removed, the length check downstream also errors
+    /// and its message interpolates both the offending name and `vars.lat`, so a
+    /// `contains(missing)` assertion passes on entirely the wrong error and the
+    /// two gates shadow each other.
     #[test]
     fn missing_required_variable_is_an_error_not_a_silent_default() {
         for missing in [
@@ -707,17 +804,40 @@ mod tests {
             "flash_energy",
             "flash_time_offset_of_first_event",
         ] {
-            let bytes = synthetic_glm_file(&[missing]);
-            let result =
-                parse_glm_netcdf(&bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Flash]);
-            let err = result.expect_err(
+            let bytes = synthetic_glm_file(Fixture { omit: &[missing], ..Default::default() });
+            let err = parse_flashes(&bytes).expect_err(
                 "a missing required variable must surface, not read back as an empty column",
             );
-            assert!(
-                err.contains(missing),
-                "error should name the absent variable, got: {err}"
-            );
+            assert_eq!(err, absent_variable_error(missing));
         }
+    }
+
+    /// The case only the required-variable gate can catch.
+    ///
+    /// When an entire level vanishes, every column is equally absent, so no
+    /// length mismatch exists for the downstream check to trip on. Reverting
+    /// `read_required_f32` to `Ok(Vec::new())` makes this parse cleanly into
+    /// zero records — a blank map reported as success.
+    #[test]
+    fn a_whole_level_vanishing_is_an_error_not_zero_records() {
+        let bytes = synthetic_glm_file(Fixture { omit: &FLASH_LEVEL_VARS, ..Default::default() });
+        let err = parse_flashes(&bytes)
+            .expect_err("an entirely absent level must not read as 'no lightning'");
+        assert_eq!(err, absent_variable_error("flash_lat"));
+    }
+
+    /// Same case for the f64 reader, which has its own absence path.
+    #[test]
+    fn a_missing_time_variable_alone_is_an_error() {
+        let bytes = synthetic_glm_file(Fixture {
+            // Omit lat/lon/energy too, so no length mismatch can mask the
+            // time_offset gate; lat is read first, so target time directly by
+            // leaving the others present but equally sized.
+            omit: &["flash_time_offset_of_first_event"],
+            ..Default::default()
+        });
+        let err = parse_flashes(&bytes).expect_err("absent time variable must surface");
+        assert_eq!(err, absent_variable_error("flash_time_offset_of_first_event"));
     }
 
     /// Energy in particular used to fall back to 0.0, which the rasterizer turns
@@ -725,18 +845,54 @@ mod tests {
     /// data loss that looked like a normal render.
     #[test]
     fn missing_energy_does_not_default_to_zero() {
-        let bytes = synthetic_glm_file(&["flash_energy"]);
-        assert!(
-            parse_glm_netcdf(&bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Flash]).is_err()
-        );
+        let bytes = synthetic_glm_file(Fixture {
+            omit: &["flash_energy"],
+            ..Default::default()
+        });
+        let err = parse_flashes(&bytes).expect_err("absent energy must surface");
+        assert_eq!(err, absent_variable_error("flash_energy"));
     }
 
-    /// Area is presentational, so losing it degrades the popup rather than the
-    /// whole overlay: the flashes still parse, they just carry no area.
+    /// The length check is a separate gate from the required-variable gate and
+    /// needs its own coverage: a variable that is *present but short* is
+    /// corruption, and indexing past it would panic.
+    #[test]
+    fn a_short_required_column_is_rejected() {
+        for short in ["flash_lon", "flash_energy", "flash_time_offset_of_first_event"] {
+            let bytes = synthetic_glm_file(Fixture { short: Some(short), ..Default::default() });
+            let err = parse_flashes(&bytes)
+                .expect_err("a short column must be rejected, not indexed past");
+            assert_eq!(
+                err,
+                format!(
+                    "GLM variable length mismatch: '{short}' has 1 values but 'flash_lat' has 2"
+                ),
+            );
+        }
+    }
+
+    /// A short *optional* column degrades instead of failing the file, and must
+    /// not hand back a half-length area column.
+    #[test]
+    fn a_short_area_column_degrades_to_no_area() {
+        let bytes = synthetic_glm_file(Fixture {
+            short: Some("flash_area"),
+            ..Default::default()
+        });
+        let flashes = parse_flashes(&bytes).expect("a short area must not fail the file");
+        assert_eq!(flashes.len(), 2);
+        assert!(flashes.iter().all(|f| f.area.is_none()));
+    }
+
+    /// Area is the one optional column, so losing it degrades the popup rather
+    /// than the whole overlay: the flashes still parse, they just carry no area.
     #[test]
     fn missing_optional_area_degrades_without_failing_the_file() {
-        let bytes = synthetic_glm_file(&["flash_area"]);
-        let flashes = parse_glm_netcdf(&bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Flash])
+        let bytes = synthetic_glm_file(Fixture {
+            omit: &["flash_area"],
+            ..Default::default()
+        });
+        let flashes = parse_flashes(&bytes)
             .expect("a missing area must not blank the whole overlay");
         assert_eq!(flashes.len(), 2);
         assert!(flashes.iter().all(|f| f.area.is_none()));
