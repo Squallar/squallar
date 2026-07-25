@@ -136,11 +136,7 @@ pub async fn fetch_glm_flashes(
     // Parse failures are *reported*, not logged here, for the same reason dead
     // feeds are: only the caller knows what the previous poll looked like, and
     // only the caller can put it on screen.
-    let parse_failures = parse_errors.first().map(|sample| ParseFailures {
-        attempted,
-        failed: parse_errors.len(),
-        sample_error: sample.clone(),
-    });
+    let parse_failures = summarize_parse_failures(attempted, parse_errors);
 
     Ok(GlmFetchOutcome {
         flashes: filtered,
@@ -376,14 +372,38 @@ async fn download_and_parse_batch(
         .collect()
         .await;
 
-    let mut outcome = BatchOutcome { entries: Vec::new(), errors: Vec::new() };
-    for result in results {
-        match result {
-            Ok(entry) => outcome.entries.push(entry),
-            Err(e) => outcome.errors.push(e),
+    BatchOutcome::from_results(results)
+}
+
+impl BatchOutcome {
+    /// Split per-file results into what parsed and what did not.
+    ///
+    /// Separated from the async download so the partition is reachable from a
+    /// test: this is the step that used to discard every error into a log line.
+    fn from_results(results: Vec<Result<(String, Vec<GlmFlash>), String>>) -> Self {
+        let mut outcome = BatchOutcome { entries: Vec::new(), errors: Vec::new() };
+        for result in results {
+            match result {
+                Ok(entry) => outcome.entries.push(entry),
+                Err(e) => outcome.errors.push(e),
+            }
         }
+        outcome
     }
-    outcome
+}
+
+/// Reduce a poll's per-file errors to the report the UI consumes.
+///
+/// `None` means every attempted file parsed. Pure, so the classification that
+/// decides whether the user sees "all N files failed" is testable without a
+/// network round trip.
+fn summarize_parse_failures(attempted: usize, errors: Vec<String>) -> Option<ParseFailures> {
+    let sample_error = errors.first()?.clone();
+    Some(ParseFailures {
+        attempted,
+        failed: errors.len(),
+        sample_error,
+    })
 }
 
 /// Download a single GLM NetCDF file and parse data from it.
@@ -869,6 +889,40 @@ mod tests {
                 ),
             );
         }
+    }
+
+    /// Every per-file error must survive the batch partition. This is the step
+    /// that previously discarded them all into `log::warn!` + `None`, which is
+    /// why a total parse failure reached the user as "Updated 0s ago".
+    #[test]
+    fn batch_partition_keeps_every_error() {
+        let outcome = BatchOutcome::from_results(vec![
+            Ok(("a.nc".into(), Vec::new())),
+            Err("b.nc: boom".into()),
+            Err("c.nc: boom".into()),
+        ]);
+        assert_eq!(outcome.entries.len(), 1);
+        assert_eq!(outcome.errors, vec!["b.nc: boom", "c.nc: boom"]);
+    }
+
+    #[test]
+    fn summarize_parse_failures_reports_none_when_everything_parsed() {
+        assert!(summarize_parse_failures(12, Vec::new()).is_none());
+    }
+
+    /// The total/partial distinction drives both the log severity and the panel
+    /// wording, so pin it on the boundary rather than trusting the caller.
+    #[test]
+    fn summarize_parse_failures_distinguishes_total_from_partial() {
+        let partial = summarize_parse_failures(3, vec!["a".into(), "b".into()])
+            .expect("failures present");
+        assert_eq!((partial.failed, partial.attempted), (2, 3));
+        assert!(!partial.is_total());
+        assert_eq!(partial.sample_error, "a", "should keep the first error as the sample");
+
+        let total = summarize_parse_failures(3, vec!["a".into(), "b".into(), "c".into()])
+            .expect("failures present");
+        assert!(total.is_total(), "every attempted file failed");
     }
 
     /// A short *optional* column degrades instead of failing the file, and must
