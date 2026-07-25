@@ -34,7 +34,7 @@ pollster = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 winit = { workspace = true }
 egui-winit = { workspace = true, features = ["clipboard", "links", "wayland", "x11"] }
-env_logger = "=0.11.10"
+env_logger = "=0.11.11"
 wgpu = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
