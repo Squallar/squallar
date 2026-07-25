@@ -1603,6 +1603,51 @@ mod loop_dispatch_tests {
         assert!(!ls.is_fetching(), "and the loop has stopped reading as fetching");
     }
 
+    /// The cap has to *sample* the window, not truncate it. Taking the first
+    /// `MAX_LOOP_FRAMES` or the last `MAX_LOOP_FRAMES` satisfies the cap and the
+    /// frames-vs-queue agreement above equally well, and gives a loop that animates
+    /// only the oldest or the newest slice of the lookback the user asked for —
+    /// which plays smoothly and looks entirely correct.
+    #[test]
+    fn a_long_listing_is_sampled_evenly_across_its_whole_span() {
+        let ctx = egui::Context::default();
+        let mut ls = loop_on(&ctx, "KTLX", &[]);
+        // Several times the cap, and not a multiple of it, so no exact stride
+        // exists and the endpoints still have to be deliberate.
+        let total = MAX_LOOP_FRAMES * 3 + 7;
+        let scans: Vec<_> = (0..total as u32)
+            .map(|i| (ts(i), identifier(&format!("KTLX2024010{}_V06", i))))
+            .collect();
+
+        accept_scan_listing(&mut ls, "KTLX", scans).expect("accepted");
+
+        // `ts` is one minute per listing position, so a frame's minute *is* the
+        // position it was sampled from, and the gaps below are index strides.
+        let picked: Vec<i64> = ls
+            .frames
+            .iter()
+            .map(|f| (f.timestamp - ts(0)).num_minutes())
+            .collect();
+
+        assert_eq!(picked.len(), MAX_LOOP_FRAMES);
+        assert_eq!(picked[0], 0, "the oldest scan in the window is kept");
+        assert_eq!(
+            picked[MAX_LOOP_FRAMES - 1],
+            total as i64 - 1,
+            "and the newest, or the loop stops short of the scan the pane is showing"
+        );
+
+        let strides: Vec<i64> = picked.windows(2).map(|w| w[1] - w[0]).collect();
+        let min = *strides.iter().min().expect("more than one frame");
+        let max = *strides.iter().max().unwrap();
+        assert!(min > 0, "strictly increasing, so no scan is sampled twice");
+        assert!(
+            max - min <= 1,
+            "strides ran {min}..={max}; the sample must be evenly spaced, or the \
+             loop covers only part of its own lookback window"
+        );
+    }
+
     /// A finished download is filed under the site it was fetched from, which the
     /// response carries. The requesting pane is not consulted — its loop may have
     /// been rebuilt for another site while the download ran, and filing under that
