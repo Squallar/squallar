@@ -1,77 +1,11 @@
-/// Drain all pending messages from `rx`, returning the last one (if any).
-fn drain_latest<T>(rx: &std::sync::mpsc::Receiver<T>) -> Option<T> {
-    let mut latest = None;
-    while let Ok(val) = rx.try_recv() {
-        latest = Some(val);
-    }
-    latest
-}
+//! Concrete [`PlatformBridge`] implementations.
+//!
+//! The trait itself lives in `rustdar-frontend`. These live here, next to the
+//! entry points that construct them, so the portable crate never has to name a
+//! per-OS type — see [`rustdar_frontend::platform`] for why that direction
+//! matters.
 
-/// Platform-specific behavior abstracted behind a common trait.
-/// Keeps `#[cfg(target_os = "android")]` blocks out of `app.rs`.
-pub trait PlatformBridge {
-    /// Poll for theme changes from the OS. Returns `Some(is_dark)` when
-    /// a change is detected, `None` otherwise.
-    fn poll_theme(&mut self) -> Option<bool>;
-
-    /// Poll for GPS fix updates. Returns the latest [`GpsFix`] if available.
-    fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix>;
-
-    /// Poll for compass heading updates. Returns degrees (0–360) if available.
-    fn poll_heading(&mut self) -> Option<f32>;
-
-    /// Query system bar insets (top, bottom, left, right) in logical pixels.
-    fn query_insets(&self) -> Option<(f32, f32, f32, f32)>;
-
-    /// Handle the back button press. Returns `true` if the platform consumed
-    /// the event (e.g. Android moveTaskToBack), `false` if the app should exit.
-    fn handle_back(&self) -> bool;
-
-    /// Detect the current system dark theme preference.
-    fn detect_dark_theme(&self) -> bool;
-
-    /// Set a callback for back-button behavior.
-    fn set_back_handler(&mut self, handler: fn());
-
-    /// Set persistent cache directory for zone geometries.
-    fn set_zone_cache_dir(&mut self, dir: std::path::PathBuf);
-
-    /// Get the zone cache directory.
-    fn zone_cache_dir(&self) -> Option<&std::path::Path>;
-
-    /// Set the config directory for UI config persistence.
-    fn set_config_dir(&mut self, dir: std::path::PathBuf);
-
-    /// Where to persist UI configuration, or `None` if this platform has not
-    /// been told yet (Android learns its data path only after startup).
-    ///
-    /// Returns a store rather than a directory so the trait carries no
-    /// filesystem assumption: a web bridge hands back a `localStorage` backend,
-    /// which has no path to return.
-    fn config_store(&self) -> Option<Box<dyn rustdar_egui::config_store::ConfigStore>>;
-
-    /// Request application exit. Returns `true` if the platform requires
-    /// `std::process::exit` (Android), `false` for normal event-loop exit.
-    fn needs_process_exit(&self) -> bool;
-
-    /// Set a receiver for GPS fix updates (Android only, no-op on desktop).
-    fn set_gps_fix_receiver(&mut self, _receiver: std::sync::mpsc::Receiver<rustdar_gps::GpsFix>) {}
-
-    /// Set a receiver for compass heading updates (Android only, no-op on desktop).
-    fn set_heading_receiver(&mut self, _receiver: std::sync::mpsc::Receiver<f32>) {}
-
-    /// Set a callback that queries system bar insets (Android only, no-op on desktop).
-    fn set_insets_querier(&mut self, _querier: fn() -> (f32, f32, f32, f32)) {}
-
-    /// Start the desktop serial GPS reader (no-op on Android).
-    fn start_gps(&mut self, _config: &rustdar_gps::GpsConfig) {}
-
-    /// Stop the desktop serial GPS reader (no-op on Android).
-    fn stop_gps(&mut self) {}
-
-    /// Whether the desktop serial GPS reader is currently running.
-    fn gps_active(&self) -> bool { false }
-}
+use rustdar_frontend::platform::{PlatformBridge, drain_latest};
 
 // ── Desktop implementation ──────────────────────────────────────────────
 

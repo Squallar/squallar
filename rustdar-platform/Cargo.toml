@@ -16,26 +16,16 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 path = "src/lib.rs"
 
 [dependencies]
+# The portable application. Everything else here is entry-point scaffolding or
+# a platform capability the frontend asks for through a trait.
+rustdar-frontend = { workspace = true }
+# For the ConfigStore trait the filesystem store implements.
 rustdar-egui = { workspace = true }
-rustdar-radar = { workspace = true }
-rustdar-overlays = { workspace = true }
-reqwest = { workspace = true, features = ["default", "json"] }
 rustdar-gps = { workspace = true, features = ["serial"] }
-bytemuck = { version = "=1.25.0", features = ["derive"] }
-chrono = { workspace = true }
-egui = { workspace = true }
-egui-wgpu = { workspace = true, features = ["winit"] }
 log = { workspace = true }
-nexrad-data = { workspace = true }
-nexrad-model = { workspace = true }
-nexrad-decode = { workspace = true }
-nexrad-level3 = { workspace = true }
 pollster = { workspace = true }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 winit = { workspace = true }
-egui-winit = { workspace = true, features = ["clipboard", "links", "wayland", "x11"] }
 env_logger = "=0.11.10"
-wgpu = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Force vendored OpenSSL for Android builds to avoid cross-compilation issues

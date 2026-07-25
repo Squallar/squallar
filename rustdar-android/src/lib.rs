@@ -594,7 +594,7 @@ fn android_main(app: AndroidApp) {
         .expect("Failed to create event loop");
 
     // Create and run the platform app
-    let mut platform_app = rustdar_platform_lib::app::App::new(Box::new(
+    let mut platform_app = rustdar_frontend::app::App::new(Box::new(
         rustdar_platform_lib::platform::create_platform(),
     ));
 

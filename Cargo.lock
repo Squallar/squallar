@@ -4239,6 +4239,7 @@ dependencies = [
  "ndk-context",
  "openssl-sys",
  "pollster",
+ "rustdar-frontend",
  "rustdar-gps",
  "rustdar-platform",
  "rustls-platform-verifier",
@@ -4267,6 +4268,29 @@ dependencies = [
  "serde",
  "serde_json",
  "walkers",
+]
+
+[[package]]
+name = "rustdar-frontend"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "egui",
+ "egui-wgpu",
+ "egui-winit",
+ "log",
+ "nexrad-data",
+ "nexrad-level3",
+ "nexrad-model",
+ "pollster",
+ "reqwest 0.12.24",
+ "rustdar-egui",
+ "rustdar-gps",
+ "rustdar-overlays",
+ "rustdar-radar",
+ "tokio",
+ "wgpu",
+ "winit",
 ]
 
 [[package]]
@@ -4313,28 +4337,15 @@ dependencies = [
 name = "rustdar-platform"
 version = "0.1.0"
 dependencies = [
- "bytemuck",
- "chrono",
  "dark-light",
- "egui",
- "egui-wgpu",
- "egui-winit",
  "env_logger",
  "log",
- "nexrad-data",
- "nexrad-decode",
- "nexrad-level3",
- "nexrad-model",
  "openssl-sys",
  "pollster",
- "reqwest 0.12.24",
  "rustdar-android-theme",
  "rustdar-egui",
+ "rustdar-frontend",
  "rustdar-gps",
- "rustdar-overlays",
- "rustdar-radar",
- "tokio",
- "wgpu",
  "winit",
 ]
 

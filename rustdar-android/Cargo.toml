@@ -46,6 +46,9 @@ path = "src/lib.rs"
 
 [target.'cfg(target_os = "android")'.dependencies]
 rustdar-platform = { workspace = true }
+# App itself lives in the portable crate; rustdar-platform supplies only the
+# Android PlatformBridge this entry point hands it.
+rustdar-frontend = { workspace = true }
 android_logger = "=0.15.1"
 winit = { workspace = true, features = ["android-native-activity"] }
 pollster = { workspace = true }

@@ -1,0 +1,38 @@
+[package]
+name = "rustdar-frontend"
+version.workspace = true
+edition.workspace = true
+
+# The portable half of the application: windowing, rendering, fetching and app
+# state. "Portable" here means winit-portable, not windowing-free — this crate
+# owns the single renderer that desktop, web (wasm32 + WebGL2), Android and iOS
+# all share, so depending on winit/wgpu/egui is expected.
+#
+# What it deliberately does NOT contain is any per-OS code: no entry point, no
+# concrete PlatformBridge. Those live in rustdar-platform, which depends on this
+# crate. Adding a dependency back on rustdar-platform would be a cycle.
+
+[dependencies]
+rustdar-egui = { workspace = true }
+rustdar-radar = { workspace = true }
+rustdar-overlays = { workspace = true }
+# Nothing here needs the serial reader — only GpsFix and GpsConfig. `serial` is
+# on because rustdar-egui's settings pane calls rustdar_gps::detect_gps_ports
+# while enabling nothing itself, so whoever builds it has to supply the feature;
+# rustdar-platform used to be the only crate that did. Removed in the commit
+# that gives rustdar-egui its own `gps-serial` feature, which is where the gate
+# belongs.
+rustdar-gps = { workspace = true, features = ["serial"] }
+reqwest = { workspace = true, features = ["default", "json"] }
+chrono = { workspace = true }
+egui = { workspace = true }
+egui-wgpu = { workspace = true, features = ["winit"] }
+egui-winit = { workspace = true, features = ["clipboard", "links", "wayland", "x11"] }
+log = { workspace = true }
+nexrad-data = { workspace = true }
+nexrad-model = { workspace = true }
+nexrad-level3 = { workspace = true }
+pollster = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+winit = { workspace = true }
+wgpu = { workspace = true }

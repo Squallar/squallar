@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "rustdar-platform",
+    "rustdar-frontend",
     "rustdar-android",
     "rustdar-android-theme",
     "rustdar-egui",
@@ -27,6 +28,7 @@ edition = "2024"
 nexrad-level3 = { path = "nexrad-level3" }
 rustdar-android-theme = { path = "rustdar-android-theme" }
 rustdar-egui = { path = "rustdar-egui" }
+rustdar-frontend = { path = "rustdar-frontend" }
 rustdar-overlays = { path = "rustdar-overlays" }
 rustdar-platform = { path = "rustdar-platform" }
 rustdar-radar = { path = "rustdar-radar" }
