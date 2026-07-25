@@ -446,12 +446,15 @@ impl super::App {
     /// Enable radar loop for a pane: initializes loop state and spawns
     /// an async task to list available scans in the lookback window.
     fn handle_enable_loop(&mut self, pane_idx: usize, lookback_secs: u64) {
-        let Some(scan_info) = self.gui.get_scan_info() else { return };
-        // The whole site value, so the loop's render-target code and the coordinates
-        // it projects with cannot come from different sites.
-        let radar_site = scan_info.site.clone();
+        // Every parameter of the loop comes from the pane the loop is being built
+        // for. `reinit_active_loops` calls this for each looping pane in turn, so
+        // reading the *active* pane instead pointed every loop at one site's
+        // geometry and one site's scan times, under each pane's own label.
+        let Some(LoopInit { site: radar_site, end }) = loop_init_for_pane(self.gui.panes(), pane_idx)
+        else {
+            return;
+        };
         let site = radar_site.name.to_string();
-        let scan_timestamp = scan_info.timestamp;
 
         // Clear pending downloads for this pane (global cache is kept for sharing)
         self.loop_mgr.remove_pending(pane_idx);
@@ -462,8 +465,6 @@ impl super::App {
                 rustdar_egui::pane::LoopPlaybackState::new_for_loop(lookback_secs, &radar_site);
         }
 
-        // Use the current scan's timestamp as the loop end time (not wall clock)
-        let end = scan_timestamp;
         let start = end - chrono::Duration::seconds(lookback_secs as i64);
 
         self.spawn_async_task(self.channels.loop_scan_list_sender.clone(), async move {
@@ -744,6 +745,36 @@ impl super::App {
     }
 }
 
+/// The two things a loop is built from, both read from the pane it belongs to.
+///
+/// One struct rather than two return values because they must come from a single
+/// pane's `ScanInfo`: the site fixes the geometry every frame is projected with
+/// *and* the site the frame list is listed from, and `end` is that same site's
+/// current scan time. Mixing panes gives a loop that lists one site's scans and
+/// draws them at another's coordinates.
+struct LoopInit {
+    /// The whole site value, so the loop's render-target code and the coordinates
+    /// it projects with cannot come from different sites.
+    site: rustdar_radar::sites::RadarSite,
+    /// The newest scan time the loop covers — the pane's own current scan, not
+    /// wall clock, so the loop ends where the pane is actually looking.
+    end: NaiveDateTime,
+}
+
+/// Read `pane_idx`'s loop parameters, or `None` if that pane has no scan loaded.
+///
+/// Indexes `panes` rather than taking a pane, so "which pane" is decided here and
+/// tested here. The active pane is deliberately not consulted: `reinit_active_loops`
+/// runs this for every looping pane, and a loop that took the active pane's site
+/// would show that site's data under its own pane's label.
+fn loop_init_for_pane(panes: &[rustdar_egui::pane::PaneState], pane_idx: usize) -> Option<LoopInit> {
+    let scan_info = panes.get(pane_idx)?.scan_info.as_ref()?;
+    Some(LoopInit {
+        site: scan_info.site.clone(),
+        end: scan_info.timestamp,
+    })
+}
+
 /// Append a frame for a scan polled from `site` at `timestamp` to every active
 /// loop that is on that site.
 ///
@@ -826,6 +857,7 @@ mod loop_pane_tests {
     use super::*;
     use rustdar_egui::pane::{LoopPlaybackState, PaneState};
     use rustdar_radar::sites::RadarSite;
+    use rustdar_radar::types::{RadarProduct, ScanInfo};
 
     fn ts(minute: u32) -> NaiveDateTime {
         chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
@@ -836,6 +868,20 @@ mod loop_pane_tests {
 
     fn site(name: &'static str, lat: f64, lon: f64) -> RadarSite {
         RadarSite { name, lat, lon, elev: None }
+    }
+
+    /// A pane showing `site`'s scan at `timestamp`.
+    fn pane_showing(site: RadarSite, timestamp: NaiveDateTime) -> PaneState {
+        let mut pane = PaneState::with_site(site.name.to_string());
+        pane.scan_info = Some(ScanInfo {
+            site,
+            timestamp,
+            vcp_number: 212,
+            available_products: vec![RadarProduct::Reflectivity],
+            product_elevations: std::collections::HashMap::new(),
+            status: String::new(),
+        });
+        pane
     }
 
     /// A pane with an active loop on `site`, holding frames at the given minutes.
@@ -850,6 +896,48 @@ mod loop_pane_tests {
 
     fn frame_times(pane: &PaneState) -> Vec<NaiveDateTime> {
         pane.loop_state.frames.iter().map(|f| f.timestamp).collect()
+    }
+
+    /// The defect: `handle_enable_loop` read the *active* pane's scan info and
+    /// `reinit_active_loops` then applied it to every looping pane, so a pane on
+    /// another site silently showed the active pane's radar under its own label.
+    #[test]
+    fn a_loop_is_built_from_its_own_panes_scan_not_the_active_panes() {
+        // Pane 0 is the active one in every real call path that reaches here.
+        let panes = [
+            pane_showing(site("KTLX", 35.33, -97.27), ts(10)),
+            pane_showing(site("KOUN", 35.23, -97.46), ts(25)),
+        ];
+
+        let init = loop_init_for_pane(&panes, 1).expect("pane 1 has a scan");
+        assert_eq!(init.site.name, "KOUN", "the loop must be built for pane 1's site");
+        assert_eq!(init.site.lat, 35.23, "and pane 1's geometry");
+        assert_eq!(init.site.lon, -97.46);
+        assert_eq!(
+            init.end,
+            ts(25),
+            "the loop ends at pane 1's own scan time, which is also the end of the \
+             range its scan list is requested for"
+        );
+
+        // Pane 0 still reads as itself, so the two are genuinely distinguishable.
+        let active = loop_init_for_pane(&panes, 0).expect("pane 0 has a scan");
+        assert_eq!(active.site.name, "KTLX");
+        assert_eq!(active.end, ts(10));
+    }
+
+    /// A pane with nothing loaded yet has no loop parameters, and must not borrow
+    /// another pane's.
+    #[test]
+    fn a_pane_with_no_scan_yields_no_loop() {
+        let mut panes = [
+            pane_showing(site("KTLX", 35.33, -97.27), ts(10)),
+            pane_showing(site("KOUN", 35.23, -97.46), ts(25)),
+        ];
+        panes[1].scan_info = None;
+
+        assert!(loop_init_for_pane(&panes, 1).is_none());
+        assert!(loop_init_for_pane(&panes, 7).is_none(), "and neither does a pane that does not exist");
     }
 
     /// The defect this half of the site fix exists for. Auto-poll delivers one
