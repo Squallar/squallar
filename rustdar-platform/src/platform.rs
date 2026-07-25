@@ -42,8 +42,13 @@ pub trait PlatformBridge {
     /// Set the config directory for UI config persistence.
     fn set_config_dir(&mut self, dir: std::path::PathBuf);
 
-    /// Get the config directory.
-    fn config_dir(&self) -> Option<&std::path::Path>;
+    /// Where to persist UI configuration, or `None` if this platform has not
+    /// been told yet (Android learns its data path only after startup).
+    ///
+    /// Returns a store rather than a directory so the trait carries no
+    /// filesystem assumption: a web bridge hands back a `localStorage` backend,
+    /// which has no path to return.
+    fn config_store(&self) -> Option<Box<dyn rustdar_egui::config_store::ConfigStore>>;
 
     /// Request application exit. Returns `true` if the platform requires
     /// `std::process::exit` (Android), `false` for normal event-loop exit.
@@ -165,8 +170,10 @@ impl PlatformBridge for DesktopPlatform {
         self.config_dir = Some(dir);
     }
 
-    fn config_dir(&self) -> Option<&std::path::Path> {
-        self.config_dir.as_deref()
+    fn config_store(&self) -> Option<Box<dyn rustdar_egui::config_store::ConfigStore>> {
+        self.config_dir
+            .clone()
+            .map(|dir| Box::new(crate::config_store::FileConfigStore::new(dir)) as Box<_>)
     }
 
     fn needs_process_exit(&self) -> bool {
@@ -293,8 +300,10 @@ impl PlatformBridge for AndroidPlatform {
         self.config_dir = Some(dir);
     }
 
-    fn config_dir(&self) -> Option<&std::path::Path> {
-        self.config_dir.as_deref()
+    fn config_store(&self) -> Option<Box<dyn rustdar_egui::config_store::ConfigStore>> {
+        self.config_dir
+            .clone()
+            .map(|dir| Box::new(crate::config_store::FileConfigStore::new(dir)) as Box<_>)
     }
 
     fn needs_process_exit(&self) -> bool {

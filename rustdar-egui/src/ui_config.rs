@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
+use crate::config_store::{ConfigStore, UI_CONFIG_KEY};
+
 use rustdar_overlays::render::layers::LayerKind;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_overlays::spc::outlook::OutlookDay;
@@ -119,13 +121,8 @@ impl Default for UiConfig {
 }
 
 impl super::Gui {
-    /// Save UI layout configuration to a JSON file.
-    pub fn save_ui_config(&self, config_dir: &std::path::Path) {
-        if let Err(e) = std::fs::create_dir_all(config_dir) {
-            log::error!("Failed to create config dir {:?}: {}", config_dir, e);
-            return;
-        }
-        let path = config_dir.join("ui.json");
+    /// Save UI layout configuration to `store`.
+    pub fn save_ui_config(&self, store: &dyn ConfigStore) {
         // Guard against NaN/Infinity in f32 fields which cause serde_json to fail.
         let fps = if self.loop_speed_fps.is_finite() { self.loop_speed_fps } else { 5.0 };
         let pane_configs: Vec<PaneConfig> = self.panes.iter().map(|pane| {
@@ -162,8 +159,8 @@ impl super::Gui {
         };
         match serde_json::to_string_pretty(&config) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    log::error!("Failed to write config to {:?}: {}", path, e);
+                if let Err(e) = store.store(UI_CONFIG_KEY, &json) {
+                    log::error!("Failed to write config: {}", e);
                 }
             }
             Err(e) => {
@@ -172,22 +169,18 @@ impl super::Gui {
         }
     }
 
-    /// Load UI layout configuration from a JSON file.
-    pub fn load_ui_config(&mut self, config_dir: &std::path::Path) {
-        let path = config_dir.join("ui.json");
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) => {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    log::warn!("Failed to read config {:?}: {}", path, e);
-                }
-                return;
-            }
+    /// Load UI layout configuration from `store`.
+    ///
+    /// A missing or unparseable config leaves `self` untouched, so the caller
+    /// keeps whatever defaults it was constructed with.
+    pub fn load_ui_config(&mut self, store: &dyn ConfigStore) {
+        let Some(content) = store.load(UI_CONFIG_KEY) else {
+            return;
         };
         let config = match serde_json::from_str::<UiConfig>(&content) {
             Ok(c) => c,
             Err(e) => {
-                log::warn!("Failed to parse config {:?}: {}", path, e);
+                log::warn!("Failed to parse config: {}", e);
                 return;
             }
         };
@@ -289,4 +282,80 @@ fn reconcile_draw_order(saved: &[OverlayKind]) -> Vec<OverlayKind> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config_store::{ConfigStore, MemoryConfigStore, UI_CONFIG_KEY};
+
+    /// Settings the user changed must come back after a save/load cycle.
+    ///
+    /// Every asserted field is first checked to *differ* from what a fresh
+    /// `Gui` starts with. Without that guard this test would still pass if
+    /// `load_ui_config` did nothing at all, since the default would supply the
+    /// expected value on its own.
+    #[test]
+    fn changed_settings_survive_a_save_and_load() {
+        let store = MemoryConfigStore::default();
+
+        let baseline = crate::Gui::new();
+        assert_ne!(baseline.loop_lookback_secs, 7200);
+        assert_ne!(baseline.loop_speed_fps, 12.5);
+        assert!(baseline.viewport_sync, "default is on; test flips it off");
+
+        let mut gui = crate::Gui::new();
+        gui.loop_lookback_secs = 7200;
+        gui.loop_speed_fps = 12.5;
+        gui.viewport_sync = false;
+        gui.save_ui_config(&store);
+
+        let mut restored = crate::Gui::new();
+        restored.load_ui_config(&store);
+
+        assert_eq!(restored.loop_lookback_secs, 7200);
+        assert_eq!(restored.loop_speed_fps, 12.5);
+        assert!(!restored.viewport_sync);
+    }
+
+    /// Loading from a store with nothing in it must leave the defaults alone
+    /// rather than zeroing them — this is every first run.
+    #[test]
+    fn an_empty_store_leaves_defaults_untouched() {
+        let store = MemoryConfigStore::default();
+        let mut gui = crate::Gui::new();
+        let expected = gui.loop_lookback_secs;
+
+        gui.load_ui_config(&store);
+
+        assert_eq!(gui.loop_lookback_secs, expected);
+    }
+
+    /// A corrupt config must not wipe the user's session or panic.
+    #[test]
+    fn unparseable_config_is_ignored() {
+        let store = MemoryConfigStore::default();
+        store.store(UI_CONFIG_KEY, "{ not json").unwrap();
+
+        let mut gui = crate::Gui::new();
+        let expected = gui.loop_lookback_secs;
+        gui.load_ui_config(&store);
+
+        assert_eq!(gui.loop_lookback_secs, expected);
+    }
+
+    /// Saving writes under the shared key, which is what the filesystem backend
+    /// maps onto `ui.json`.
+    #[test]
+    fn save_writes_under_the_ui_key() {
+        let store = MemoryConfigStore::default();
+        assert!(store.load(UI_CONFIG_KEY).is_none());
+
+        crate::Gui::new().save_ui_config(&store);
+
+        let written = store.load(UI_CONFIG_KEY).expect("config should be stored");
+        assert!(
+            serde_json::from_str::<super::UiConfig>(&written).is_ok(),
+            "stored blob should parse back as a UiConfig"
+        );
+    }
 }

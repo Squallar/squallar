@@ -97,8 +97,8 @@ impl App {
             .expect("Failed to build HTTP client");
 
         let mut gui = Gui::new();
-        if let Some(config_dir) = platform.config_dir() {
-            gui.load_ui_config(config_dir);
+        if let Some(store) = platform.config_store() {
+            gui.load_ui_config(store.as_ref());
         }
 
         Self {
@@ -306,8 +306,8 @@ impl App {
     /// Request application exit - handles both GUI and keyboard exit requests
     fn request_exit(&mut self, event_loop: Option<&ActiveEventLoop>) {
         // Persist UI config before exiting
-        if let Some(config_dir) = self.platform.config_dir() {
-            self.gui.save_ui_config(config_dir);
+        if let Some(store) = self.platform.config_store() {
+            self.gui.save_ui_config(store.as_ref());
         }
         if let Some(event_loop) = event_loop {
             log::info!("Exiting application");
@@ -336,8 +336,8 @@ impl App {
         self.platform.set_config_dir(dir);
         // Load config now — on Android this is called after App::new(),
         // so the initial load in new() had no config dir yet.
-        if let Some(config_dir) = self.platform.config_dir() {
-            self.gui.load_ui_config(config_dir);
+        if let Some(store) = self.platform.config_store() {
+            self.gui.load_ui_config(store.as_ref());
         }
     }
 
@@ -456,8 +456,8 @@ impl ApplicationHandler for App {
         log::info!("App suspended — clearing graphics state");
         // Save config on suspend — on Android this is the only reliable save
         // point before the system may kill the process.
-        if let Some(config_dir) = self.platform.config_dir() {
-            self.gui.save_ui_config(config_dir);
+        if let Some(store) = self.platform.config_store() {
+            self.gui.save_ui_config(store.as_ref());
         }
         self.old_textures.clear();
         self.render.clear_last_rendered();
