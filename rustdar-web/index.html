@@ -4,6 +4,31 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
     <title>Rustdar</title>
+    <meta
+      name="description"
+      content="Live NEXRAD Level II and Level III radar, NWS alerts, storm reports and surface observations."
+    />
+
+    <!--
+      Every URL on this page is relative. The deployed site is served from
+      https://<user>.github.io/rustdar/ and development happens at the root of
+      `python3 -m http.server`, so an absolute `/manifest.webmanifest` would work
+      locally and 404 in production. `tests/pwa_assets.rs` fails the build if a
+      root-relative URL appears here.
+    -->
+    <link rel="manifest" href="manifest.webmanifest" />
+    <meta name="theme-color" content="#101014" />
+    <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png" />
+    <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+    <!--
+      `mobile-web-app-capable` is the standard name; iOS still only honours the
+      `apple-` prefixed one, so both are here.
+    -->
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="rustdar" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
     <style>
       html,
       body {
@@ -40,6 +65,76 @@
         padding: 2rem;
         pointer-events: none;
       }
+
+      /*
+       * The offline banner.
+       *
+       * rustdar caches its own code but never caches weather data, so losing
+       * the network does not produce a stale radar image — it produces no new
+       * one. The danger is that "no new one" is invisible: a basemap still
+       * draws, the last sweep is still on screen, and an empty map reads as
+       * clear skies rather than as a dead feed. This bar exists so that it
+       * cannot be misread. It is not dismissible while offline.
+       */
+      #rustdar-offline {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 20;
+        padding: calc(0.5rem + env(safe-area-inset-top)) 1rem 0.5rem;
+        background: #92400e;
+        color: #fff8ec;
+        font: 600 13px/1.35 system-ui, sans-serif;
+        text-align: center;
+        box-shadow: 0 1px 6px rgb(0 0 0 / 45%);
+        /* Never swallow a drag on the map underneath. */
+        pointer-events: none;
+      }
+
+      #rustdar-offline[hidden] {
+        display: none;
+      }
+
+      #rustdar-update {
+        position: fixed;
+        z-index: 20;
+        right: 0.75rem;
+        bottom: calc(0.75rem + env(safe-area-inset-bottom));
+        max-width: min(22rem, calc(100vw - 1.5rem));
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.625rem 0.75rem;
+        border: 1px solid #2e3a4b;
+        border-radius: 0.5rem;
+        background: #171b22;
+        color: #dfe4ec;
+        font: 13px/1.35 system-ui, sans-serif;
+        box-shadow: 0 4px 16px rgb(0 0 0 / 55%);
+      }
+
+      #rustdar-update[hidden] {
+        display: none;
+      }
+
+      #rustdar-update button {
+        font: inherit;
+        cursor: pointer;
+        border-radius: 0.3rem;
+        border: 1px solid #33507a;
+        background: #1d3557;
+        color: #eaf2ff;
+        padding: 0.3rem 0.65rem;
+        white-space: nowrap;
+      }
+
+      #rustdar-update button.secondary {
+        border-color: #2e3a4b;
+        background: transparent;
+        color: #9aa0aa;
+        padding: 0.3rem 0.5rem;
+      }
     </style>
   </head>
   <body>
@@ -50,6 +145,163 @@
     -->
     <canvas id="rustdar-canvas" tabindex="0"></canvas>
     <div id="rustdar-status">Loading rustdar…</div>
+
+    <div id="rustdar-offline" role="status" aria-live="assertive" hidden>
+      Offline — radar, alerts and observations have stopped updating. Anything on
+      screen is from before the connection dropped.
+    </div>
+
+    <div id="rustdar-update" role="status" aria-live="polite" hidden>
+      <span>A new version of rustdar is ready.</span>
+      <button type="button" id="rustdar-update-reload">Reload</button>
+      <button type="button" class="secondary" id="rustdar-update-dismiss" aria-label="Dismiss">
+        ✕
+      </button>
+    </div>
+
+    <!--
+      A classic script, not a module, and deliberately ahead of the bootstrap
+      below: if `./pkg/rustdar_web.js` is missing or fails to parse, the module
+      script never executes a single statement. The offline banner and the
+      service worker must not be collateral damage of that, because an
+      unbootable app is exactly when a user most needs to be told what is wrong.
+    -->
+    <script>
+      (function () {
+        "use strict";
+
+        var offlineBanner = document.getElementById("rustdar-offline");
+        var updateBanner = document.getElementById("rustdar-update");
+
+        // `navigator.onLine === false` is definitive: the browser has no route.
+        // `true` is only optimistic — it cannot see a captive portal or a
+        // black-holed uplink. So this bar is a floor on honesty, not a
+        // guarantee; a fetch that fails while `onLine` is true still surfaces
+        // through the application's own error handling.
+        function paintConnectivity() {
+          offlineBanner.hidden = navigator.onLine !== false;
+        }
+
+        window.addEventListener("online", paintConnectivity);
+        window.addEventListener("offline", paintConnectivity);
+        paintConnectivity();
+
+        document
+          .getElementById("rustdar-update-dismiss")
+          .addEventListener("click", function () {
+            updateBanner.hidden = true;
+          });
+
+        if (!("serviceWorker" in navigator)) return;
+
+        var reloading = false;
+        var registration = null;
+        // Set only when the user has accepted the update prompt and a waiting
+        // worker has been told to take over.
+        var takeoverRequested = false;
+
+        // `controllerchange` fires for two very different reasons, and reloading
+        // on both is wrong.
+        //
+        // The first is the worker's own `clients.claim()` on a first visit:
+        // this page went from uncontrolled to controlled, which is routine and
+        // means nothing changed. Reloading there would make every first visit
+        // load the app twice — an 11 MB module fetched, discarded and fetched
+        // again, which is the opposite of what a service worker is for.
+        //
+        // The second is a waiting worker taking over after the user pressed
+        // Reload. That one, and only that one, is worth acting on.
+        navigator.serviceWorker.addEventListener("controllerchange", function () {
+          if (!takeoverRequested || reloading) return;
+          reloading = true;
+          window.location.reload();
+        });
+
+        document
+          .getElementById("rustdar-update-reload")
+          .addEventListener("click", function () {
+            updateBanner.hidden = true;
+            if (registration && registration.waiting) {
+              // A new *worker* is parked. Let it through, then reload on
+              // `controllerchange`.
+              takeoverRequested = true;
+              registration.waiting.postMessage({ type: "rustdar:skip-waiting" });
+              return;
+            }
+            // A new *shell* is already cached by the current worker; a plain
+            // reload picks it up.
+            reloading = true;
+            window.location.reload();
+          });
+
+        function showUpdate() {
+          updateBanner.hidden = false;
+        }
+
+        navigator.serviceWorker.addEventListener("message", function (event) {
+          if (event.data && event.data.type === "rustdar:shell-updated") {
+            showUpdate();
+          }
+        });
+
+        function watchForWaitingWorker(reg) {
+          // A worker parked in `waiting` means this page is controlled by an
+          // older one. On the very first visit there is no controller and
+          // nothing to update to.
+          if (reg.waiting && navigator.serviceWorker.controller) showUpdate();
+          reg.addEventListener("updatefound", function () {
+            var incoming = reg.installing;
+            if (!incoming) return;
+            incoming.addEventListener("statechange", function () {
+              if (incoming.state === "installed" && navigator.serviceWorker.controller) {
+                showUpdate();
+              }
+            });
+          });
+        }
+
+        // Registration waits for `load`, and that is not just politeness. The
+        // worker's first act is to precache the shell, including an 11 MB wasm
+        // module that this page is *already downloading*. Starting it earlier
+        // races the two against each other; starting it after `load` means the
+        // module is in the HTTP cache and the worker's revalidating request
+        // comes back 304 instead of fetching 11 MB a second time.
+        window.addEventListener("load", function () {
+          // `./sw.js` resolves against the document, so the registration lands
+          // on `/rustdar/sw.js` with scope `/rustdar/` when deployed and on
+          // `/sw.js` with scope `/` locally. Neither is spelled out anywhere.
+          navigator.serviceWorker
+            .register("./sw.js")
+            .then(function (reg) {
+              registration = reg;
+              watchForWaitingWorker(reg);
+            })
+            .catch(function (err) {
+              // An insecure origin, a blocked worker, or a 404 on sw.js. The
+              // application works without it; only offline support is lost.
+              console.warn("rustdar: service worker registration failed:", err);
+            });
+        });
+
+        // A tab left open on a radar loop never navigates, so it would never
+        // otherwise notice a deploy. Coming back to the foreground is the one
+        // reliable moment to look, and it is throttled so that flipping between
+        // tabs does not turn into a poll.
+        var lastCheck = 0;
+        document.addEventListener("visibilitychange", function () {
+          if (document.visibilityState !== "visible") return;
+          var now = Date.now();
+          if (now - lastCheck < 15 * 60 * 1000) return;
+          lastCheck = now;
+          if (registration) registration.update().catch(function () {});
+          if (navigator.serviceWorker.controller) {
+            navigator.serviceWorker.controller.postMessage({
+              type: "rustdar:check-update",
+            });
+          }
+        });
+      })();
+    </script>
 
     <script type="module">
       import init, { start } from "./pkg/rustdar_web.js";
