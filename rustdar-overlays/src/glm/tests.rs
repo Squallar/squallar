@@ -1073,7 +1073,7 @@ fn all_requested_levels_are_returned_together() {
 /// synthetic fixtures above cannot reproduce.
 const REAL_GRANULE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../rustdar-hdf5/testdata/",
+    "/testdata/",
     "OR_GLM-L2-LCFA_G19_s20251801200000_e20251801200200_c20251801200212.nc"
 );
 
