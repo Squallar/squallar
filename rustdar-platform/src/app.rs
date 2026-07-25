@@ -216,11 +216,13 @@ impl App {
         use rustdar_overlays::render::overlay_state::OverlayKind;
 
         // Separate overlay render actions for deduplication
-        let mut overlay_renders: Vec<(usize, OverlayKind, rustdar_overlays::types::GeoBounds, u32, u32, u64, i32)> = Vec::new();
+        let mut overlay_renders: Vec<(usize, OverlayKind, fetch::OverlayRenderRequest)> = Vec::new();
 
         for action in actions {
-            if let GuiAction::RenderOverlay { pane_idx, overlay_kind, geo_bounds, width, height, data_generation, zoom } = action {
-                overlay_renders.push((pane_idx, overlay_kind, geo_bounds, width, height, data_generation, zoom));
+            if let GuiAction::RenderOverlay { pane_idx, overlay_kind, geo_bounds, texture, data_generation, zoom } = action {
+                overlay_renders.push((pane_idx, overlay_kind, fetch::OverlayRenderRequest {
+                    geo_bounds, texture, data_generation, zoom,
+                }));
             } else {
                 log::debug!("GUI action received: {}", action);
                 self.handle_gui_action(action, None);
@@ -395,34 +397,34 @@ impl App {
 /// When `should_group` is true (viewport sync + layer sync both on), groups requests
 /// by `(overlay_kind, zoom, data_generation, width, height)` and merges pane indices
 /// so one render serves multiple panes. When false, each request passes through as-is.
+///
+/// The overdraw fraction is deliberately absent from the key. It is a function of the
+/// pane's size and the one adapter limit, so two requests that already agree on width
+/// and height cannot disagree about it — keying on it would only add a field that is
+/// always equal when the rest are.
 fn deduplicate_overlay_renders(
-    overlay_renders: Vec<(usize, rustdar_overlays::render::overlay_state::OverlayKind, rustdar_overlays::types::GeoBounds, u32, u32, u64, i32)>,
+    overlay_renders: Vec<(usize, rustdar_overlays::render::overlay_state::OverlayKind, fetch::OverlayRenderRequest)>,
     should_group: bool,
 ) -> Vec<(Vec<usize>, rustdar_overlays::render::overlay_state::OverlayKind, fetch::OverlayRenderRequest)> {
     use rustdar_overlays::render::overlay_state::OverlayKind;
 
     if !should_group {
-        return overlay_renders.into_iter().map(|(pane_idx, kind, bounds, w, h, data_gen, zoom)| {
-            (vec![pane_idx], kind, fetch::OverlayRenderRequest {
-                geo_bounds: bounds, width: w, height: h, data_generation: data_gen, zoom,
-            })
-        }).collect();
+        return overlay_renders
+            .into_iter()
+            .map(|(pane_idx, kind, req)| (vec![pane_idx], kind, req))
+            .collect();
     }
 
     struct GroupedRender {
         kind: OverlayKind,
-        bounds: rustdar_overlays::types::GeoBounds,
-        width: u32,
-        height: u32,
-        data_gen: u64,
-        zoom: i32,
+        req: fetch::OverlayRenderRequest,
         pane_indices: Vec<usize>,
     }
 
     let mut grouped: HashMap<(OverlayKind, i32, u64, u32, u32), GroupedRender> = HashMap::new();
 
-    for (pane_idx, kind, bounds, w, h, data_gen, zoom) in overlay_renders {
-        let key = (kind, zoom, data_gen, w, h);
+    for (pane_idx, kind, req) in overlay_renders {
+        let key = (kind, req.zoom, req.data_generation, req.texture.width, req.texture.height);
         grouped.entry(key)
             .and_modify(|g| {
                 if !g.pane_indices.contains(&pane_idx) {
@@ -430,17 +432,13 @@ fn deduplicate_overlay_renders(
                 }
             })
             .or_insert_with(|| GroupedRender {
-                kind, bounds, width: w, height: h, data_gen, zoom,
+                kind,
+                req,
                 pane_indices: vec![pane_idx],
             });
     }
 
-    grouped.into_values().map(|g| {
-        (g.pane_indices, g.kind, fetch::OverlayRenderRequest {
-            geo_bounds: g.bounds, width: g.width, height: g.height,
-            data_generation: g.data_gen, zoom: g.zoom,
-        })
-    }).collect()
+    grouped.into_values().map(|g| (g.pane_indices, g.kind, g.req)).collect()
 }
 
 impl ApplicationHandler for App {
@@ -521,11 +519,27 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustdar_egui::overlay_cache::OverlayTexturePlan;
     use rustdar_overlays::render::overlay_state::OverlayKind;
     use rustdar_overlays::types::GeoBounds;
 
     fn bounds() -> GeoBounds {
         GeoBounds { min_lat: 30.0, max_lat: 40.0, min_lon: -100.0, max_lon: -90.0 }
+    }
+
+    /// A request as `process_gui_actions` builds one: unexpanded viewport bounds
+    /// plus a texture plan.
+    fn req(w: u32, h: u32, overdraw: f32, data_gen: u64, zoom: i32) -> fetch::OverlayRenderRequest {
+        fetch::OverlayRenderRequest {
+            geo_bounds: bounds(),
+            texture: OverlayTexturePlan { width: w, height: h, overdraw },
+            data_generation: data_gen,
+            zoom,
+        }
+    }
+
+    fn entry(pane: usize, kind: OverlayKind) -> (usize, OverlayKind, fetch::OverlayRenderRequest) {
+        (pane, kind, req(800, 600, 1.0, 1, 10))
     }
 
     #[test]
@@ -538,15 +552,13 @@ mod tests {
 
     #[test]
     fn test_dedup_single_render() {
-        let input = vec![(0, OverlayKind::Radar, bounds(), 800, 600, 1, 10)];
-
-        let result = deduplicate_overlay_renders(input.clone(), true);
+        let result = deduplicate_overlay_renders(vec![entry(0, OverlayKind::Radar)], true);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, vec![0]);
         assert_eq!(result[0].1, OverlayKind::Radar);
-        assert_eq!(result[0].2.width, 800);
+        assert_eq!(result[0].2.texture.width, 800);
 
-        let result = deduplicate_overlay_renders(input, false);
+        let result = deduplicate_overlay_renders(vec![entry(0, OverlayKind::Radar)], false);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, vec![0]);
     }
@@ -554,24 +566,21 @@ mod tests {
     #[test]
     fn test_dedup_no_grouping() {
         let input = vec![
-            (0, OverlayKind::Radar, bounds(), 800, 600, 1, 10),
-            (1, OverlayKind::Radar, bounds(), 800, 600, 1, 10),
-            (2, OverlayKind::NwsAlerts, bounds(), 800, 600, 1, 10),
+            entry(0, OverlayKind::Radar),
+            entry(1, OverlayKind::Radar),
+            entry(2, OverlayKind::NwsAlerts),
         ];
 
         let result = deduplicate_overlay_renders(input, false);
         assert_eq!(result.len(), 3);
-        for entry in &result {
-            assert_eq!(entry.0.len(), 1);
+        for e in &result {
+            assert_eq!(e.0.len(), 1);
         }
     }
 
     #[test]
     fn test_dedup_groups_same_key() {
-        let input = vec![
-            (0, OverlayKind::Radar, bounds(), 800, 600, 1, 10),
-            (1, OverlayKind::Radar, bounds(), 800, 600, 1, 10),
-        ];
+        let input = vec![entry(0, OverlayKind::Radar), entry(1, OverlayKind::Radar)];
 
         let result = deduplicate_overlay_renders(input, true);
         assert_eq!(result.len(), 1);
@@ -583,10 +592,7 @@ mod tests {
 
     #[test]
     fn test_dedup_different_keys() {
-        let input = vec![
-            (0, OverlayKind::Radar, bounds(), 800, 600, 1, 10),
-            (1, OverlayKind::NwsAlerts, bounds(), 800, 600, 1, 10),
-        ];
+        let input = vec![entry(0, OverlayKind::Radar), entry(1, OverlayKind::NwsAlerts)];
 
         let result = deduplicate_overlay_renders(input, true);
         assert_eq!(result.len(), 2);
@@ -594,13 +600,28 @@ mod tests {
 
     #[test]
     fn test_dedup_duplicate_pane_idx() {
-        let input = vec![
-            (0, OverlayKind::Radar, bounds(), 800, 600, 1, 10),
-            (0, OverlayKind::Radar, bounds(), 800, 600, 1, 10),
-        ];
+        let input = vec![entry(0, OverlayKind::Radar), entry(0, OverlayKind::Radar)];
 
         let result = deduplicate_overlay_renders(input, true);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, vec![0]);
+    }
+
+    /// Panes of different sizes must not share one render: the survivor's plan would
+    /// be applied to a pane it was not sized for. Width is part of the key, and the
+    /// overdraw that travels with it has to survive grouping intact.
+    #[test]
+    fn test_dedup_keeps_differently_sized_panes_apart() {
+        let input = vec![
+            (0, OverlayKind::Radar, req(2048, 600, 0.28, 1, 10)),
+            (1, OverlayKind::Radar, req(2400, 600, 1.0, 1, 10)),
+        ];
+
+        let mut result = deduplicate_overlay_renders(input, true);
+        assert_eq!(result.len(), 2, "different texture widths are different renders");
+        result.sort_by_key(|e| e.2.texture.width);
+        assert_eq!(result[0].2.texture.width, 2048);
+        assert_eq!(result[0].2.texture.overdraw, 0.28, "the clamped plan's overdraw survived grouping");
+        assert_eq!(result[1].2.texture.overdraw, 1.0);
     }
 }

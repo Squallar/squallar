@@ -38,9 +38,13 @@ pub enum GuiAction {
     RenderOverlay {
         pane_idx: usize,
         overlay_kind: OverlayKind,
+        /// The *unexpanded* viewport. The renderer grows it by
+        /// `texture.overdraw` — never by `OVERDRAW_FRACTION`, which the adapter
+        /// may not have been able to honour.
         geo_bounds: GeoBounds,
-        width: u32,
-        height: u32,
+        /// Pixel dimensions and the overdraw they were sized for, already
+        /// reconciled with the adapter's `max_texture_dimension_2d`.
+        texture: crate::overlay_cache::OverlayTexturePlan,
         data_generation: u64,
         zoom: i32,
     },

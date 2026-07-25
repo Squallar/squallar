@@ -1,7 +1,7 @@
 use crate::actions::GuiAction;
 use crate::overlay_cache::{
     viewport_geo_bounds, current_quantized_zoom, draw_overlay_texture,
-    OVERDRAW_FRACTION,
+    plan_overlay_texture,
 };
 use crate::point_painter::EguiPointPainter;
 use rustdar_overlays::render::draw::{DrawPointContext, HoverContext};
@@ -244,9 +244,13 @@ pub(super) fn render_pane_map_content(
         let screen_rect = ui.max_rect();
         let viewport_bounds = viewport_geo_bounds(projector, screen_rect);
         let qzoom = current_quantized_zoom(zoom);
-        // Compute render dimensions with overdraw
-        let w = (screen_rect.width() * (1.0 + 2.0 * OVERDRAW_FRACTION)) as u32;
-        let h = (screen_rect.height() * (1.0 + 2.0 * OVERDRAW_FRACTION)) as u32;
+        // Compute render dimensions with as much overdraw as the adapter's texture
+        // limit allows. `max_texture_side` is `max_texture_dimension_2d`, handed to
+        // egui when the renderer was built; egui only `debug_assert!`s the bound in
+        // `load_texture`, so a release build that ignored it would reach
+        // `Device::create_texture` and fail as a wgpu validation error at runtime.
+        let max_texture_side = ui.ctx().input(|i| i.max_texture_side) as u32;
+        let tex_plan = plan_overlay_texture(screen_rect, max_texture_side);
 
         for &kind in OverlayKind::all() {
             if ctx.overlays.render_mode(kind) != Some(RenderMode::Texture) {
@@ -274,8 +278,7 @@ pub(super) fn render_pane_map_content(
                     pane_idx: ctx.pane_idx,
                     overlay_kind: kind,
                     geo_bounds: viewport_bounds,
-                    width: w,
-                    height: h,
+                    texture: tex_plan,
                     data_generation: data_gen,
                     zoom: qzoom,
                 });

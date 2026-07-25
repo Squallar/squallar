@@ -11,9 +11,12 @@ use rustdar_radar::types::RadarProduct;
 
 /// Parameters for a background overlay rasterization request.
 pub(super) struct OverlayRenderRequest {
+    /// The pane's viewport, *before* overdraw is applied.
     pub geo_bounds: rustdar_overlays::types::GeoBounds,
-    pub width: u32,
-    pub height: u32,
+    /// Pixel dimensions and the overdraw fraction they were sized for, already
+    /// reconciled with the adapter's `max_texture_dimension_2d` by
+    /// `rustdar_egui::overlay_cache::plan_overlay_texture`.
+    pub texture: rustdar_egui::overlay_cache::OverlayTexturePlan,
     pub data_generation: u64,
     pub zoom: i32,
 }
@@ -309,9 +312,10 @@ impl super::App {
         req: OverlayRenderRequest,
     ) {
         use rustdar_overlays::render::rasterize;
-        use rustdar_egui::overlay_cache::{OVERDRAW_FRACTION, ZOOM_QUANTIZATION_FACTOR};
+        use rustdar_egui::overlay_cache::ZOOM_QUANTIZATION_FACTOR;
 
-        let OverlayRenderRequest { geo_bounds, width, height, data_generation, zoom } = req;
+        let OverlayRenderRequest { geo_bounds, texture, data_generation, zoom } = req;
+        let (width, height) = (texture.width, texture.height);
 
         if width == 0 || height == 0 {
             return;
@@ -329,10 +333,13 @@ impl super::App {
             }
         }
 
-        // Expand geo_bounds by overdraw fraction, clamped to valid Mercator range
+        // Expand geo_bounds by the overdraw the texture was actually sized for,
+        // clamped to valid Mercator range. Using `OVERDRAW_FRACTION` here instead
+        // would claim coverage the pixels do not have whenever the adapter's
+        // texture limit forced the plan to give overdraw up.
         let lat_range = geo_bounds.max_lat - geo_bounds.min_lat;
         let lon_range = geo_bounds.max_lon - geo_bounds.min_lon;
-        let overdraw = OVERDRAW_FRACTION as f64;
+        let overdraw = texture.overdraw as f64;
         let render_bounds = rustdar_overlays::types::GeoBounds {
             min_lat: (geo_bounds.min_lat - lat_range * overdraw).max(-85.05),
             max_lat: (geo_bounds.max_lat + lat_range * overdraw).min(85.05),

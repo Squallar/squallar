@@ -35,12 +35,86 @@ fn quantize_zoom(zoom: f64) -> i32 {
     (zoom * ZOOM_QUANTIZATION_FACTOR).round() as i32
 }
 
-/// Fraction of the texture dimension used as overdraw margin.
+/// Overdraw the renderer *asks* for, as a fraction of the viewport dimension,
+/// on each side of the viewport.
+///
+/// This is a request, not a promise. A texture wide enough for `1.0` on both
+/// sides is three viewports across, and no adapter is obliged to allocate one:
+/// WebGL2 only guarantees `max_texture_dimension_2d == 2048`, which a viewport
+/// wider than 682 points already blows past. [`plan_overlay_texture`] cuts the
+/// fraction back to whatever the adapter can actually hold, and the reduced
+/// value — never this constant — is what the rest of the pipeline works from.
 pub const OVERDRAW_FRACTION: f32 = 1.0;
 
 /// When the accumulated pan exceeds this fraction of the overdraw margin,
 /// a fresh render is triggered so the texture stays ahead of the viewport.
 const PAN_REBUILD_THRESHOLD: f32 = 0.7;
+
+/// The texture an overlay render should actually allocate.
+///
+/// Produced by [`plan_overlay_texture`], which is the single place that reconciles
+/// [`OVERDRAW_FRACTION`] with the adapter's texture-size limit. `overdraw` is the
+/// fraction the dimensions were computed from, and every consumer must expand geo
+/// bounds by *that* number rather than the constant — see [`plan_overlay_texture`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OverlayTexturePlan {
+    /// Texture width in pixels. Never exceeds the adapter's `max_texture_side`.
+    pub width: u32,
+    /// Texture height in pixels. Never exceeds the adapter's `max_texture_side`.
+    pub height: u32,
+    /// Overdraw actually afforded, per side, as a fraction of the viewport
+    /// dimension. `<= OVERDRAW_FRACTION`, and `0.0` when the viewport alone
+    /// already fills the adapter's limit.
+    pub overdraw: f32,
+}
+
+/// Size the overlay texture for `screen_rect`, giving up overdraw rather than
+/// exceeding `max_texture_side`.
+///
+/// `max_texture_side` is the adapter's `max_texture_dimension_2d`, which reaches
+/// here through egui: `egui_winit::State::new` is handed `device.limits()`, and
+/// `ui.ctx().input(|i| i.max_texture_side)` reads it back. On a desktop adapter it
+/// is 8192–32768 and nothing is given up; the WebGL2 floor of 2048 is the case
+/// this exists for.
+///
+/// Overdraw is the free variable because the alternative — keeping the full
+/// three-viewport coverage and shrinking the pixels — makes the overlay blurrier
+/// the wider the window gets, which is exactly backwards. Cutting overdraw keeps
+/// one texel per point and costs only re-render frequency.
+///
+/// The returned `overdraw` is load-bearing, not diagnostic: it is what the geo
+/// bounds get expanded by, so the texture's coverage and its pixel count describe
+/// the same rectangle. Expanding by [`OVERDRAW_FRACTION`] after the pixels were
+/// clamped would claim ground the texture does not cover, and
+/// [`pan_exceeds_coverage`] would then hold off re-rendering over that gap.
+pub fn plan_overlay_texture(screen_rect: egui::Rect, max_texture_side: u32) -> OverlayTexturePlan {
+    let screen_w = screen_rect.width().max(0.0);
+    let screen_h = screen_rect.height().max(0.0);
+    let max_side = max_texture_side.max(1);
+
+    // Largest overdraw this axis can afford: `side * (1 + 2f) == max_side`.
+    // Negative when the viewport alone overflows the limit, hence the `max(0.0)`.
+    let affordable = |side: f32| {
+        if side <= 0.0 {
+            OVERDRAW_FRACTION
+        } else {
+            (max_side as f32 / side - 1.0) / 2.0
+        }
+    };
+    let overdraw = OVERDRAW_FRACTION
+        .min(affordable(screen_w))
+        .min(affordable(screen_h))
+        .max(0.0);
+
+    let scale = 1.0 + 2.0 * overdraw;
+    // The `min` is belt-and-braces against float rounding pushing an exactly-fitting
+    // axis one texel over; the arithmetic above already targets `max_side`.
+    OverlayTexturePlan {
+        width: ((screen_w * scale) as u32).min(max_side),
+        height: ((screen_h * scale) as u32).min(max_side),
+        overdraw,
+    }
+}
 
 // ── Texture cache ────────────────────────────────────────────────────────
 
@@ -135,11 +209,36 @@ impl OverlayTextureCache {
 
 /// Returns `true` if the viewport has panned far enough outside the texture's
 /// geo bounds that a re-render is warranted (PAN_REBUILD_THRESHOLD of margin).
+///
+/// The overdraw band is *measured*, not assumed: it is half of whatever the
+/// texture covers beyond the viewport. That is the whole point — once
+/// [`plan_overlay_texture`] is free to cut the overdraw back to fit the adapter's
+/// texture limit, no constant in this file describes the band any more, and a
+/// check written against [`OVERDRAW_FRACTION`] would credit a clamped texture with
+/// coverage it never had and sit on a stale image while the viewport panned off it.
+/// Reading the band off the bounds the render actually used cannot drift from them.
+///
+/// Both ranges come from the same zoom: [`OverlayTextureCache::needs_rerender`]
+/// returns early when the quantised zoom differs, so `viewport_bounds` spans the
+/// same ground per pixel as it did at render time. A pane that has since *grown*
+/// yields a negative band, and hence a negative margin, which trips the comparison
+/// immediately — correct, because the texture no longer covers the viewport.
 fn pan_exceeds_coverage(texture_bounds: &GeoBounds, viewport_bounds: &GeoBounds) -> bool {
     let tex_lat_range = texture_bounds.max_lat - texture_bounds.min_lat;
     let tex_lon_range = texture_bounds.max_lon - texture_bounds.min_lon;
-    let margin_lat = tex_lat_range * OVERDRAW_FRACTION as f64 * PAN_REBUILD_THRESHOLD as f64;
-    let margin_lon = tex_lon_range * OVERDRAW_FRACTION as f64 * PAN_REBUILD_THRESHOLD as f64;
+    let view_lat_range = viewport_bounds.max_lat - viewport_bounds.min_lat;
+    let view_lon_range = viewport_bounds.max_lon - viewport_bounds.min_lon;
+
+    // Overdraw actually present on each side of the viewport.
+    let band_lat = (tex_lat_range - view_lat_range) / 2.0;
+    let band_lon = (tex_lon_range - view_lon_range) / 2.0;
+
+    // Headroom left when the pan has consumed PAN_REBUILD_THRESHOLD of the band.
+    // Crossing into it is what triggers the rebuild, leaving the rest of the band
+    // to cover the viewport while the new texture rasterises.
+    let headroom = 1.0 - PAN_REBUILD_THRESHOLD as f64;
+    let margin_lat = band_lat * headroom;
+    let margin_lon = band_lon * headroom;
 
     // If viewport extends beyond texture bounds minus the margin threshold, re-render
     viewport_bounds.min_lat < texture_bounds.min_lat + margin_lat
@@ -243,4 +342,252 @@ pub fn viewport_geo_bounds(projector: &walkers::Projector, screen_rect: egui::Re
 /// Compute the quantised zoom level for render-trigger comparisons.
 pub fn current_quantized_zoom(zoom: f64) -> i32 {
     quantize_zoom(zoom)
+}
+
+#[cfg(test)]
+mod texture_budget_tests {
+    use super::*;
+
+    /// `max_texture_dimension_2d` on a desktop adapter. wgpu's `Limits::default()`
+    /// promises 8192; real GPUs report 16384 or more. Either way, nothing here is
+    /// allowed to shrink at that size.
+    const DESKTOP_LIMIT: u32 = 8192;
+    /// WebGL2's guaranteed floor, and the whole reason clamping exists.
+    const WEBGL2_LIMIT: u32 = 2048;
+
+    fn pane(w: f32, h: f32) -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h))
+    }
+
+    /// Right after a render: the texture covers `viewport ± overdraw` on all four
+    /// sides, and the viewport has not moved.
+    fn freshly_rendered(viewport: &GeoBounds, overdraw: f64) -> GeoBounds {
+        let lat = (viewport.max_lat - viewport.min_lat) * overdraw;
+        let lon = (viewport.max_lon - viewport.min_lon) * overdraw;
+        GeoBounds {
+            min_lat: viewport.min_lat - lat,
+            max_lat: viewport.max_lat + lat,
+            min_lon: viewport.min_lon - lon,
+            max_lon: viewport.max_lon + lon,
+        }
+    }
+
+    fn viewport() -> GeoBounds {
+        GeoBounds { min_lat: 30.0, max_lat: 40.0, min_lon: -100.0, max_lon: -90.0 }
+    }
+
+    /// Slide a viewport south (negative) or north (positive) by `d` degrees.
+    fn panned_lat(viewport: &GeoBounds, d: f64) -> GeoBounds {
+        GeoBounds { min_lat: viewport.min_lat + d, max_lat: viewport.max_lat + d, ..*viewport }
+    }
+
+    fn panned_lon(viewport: &GeoBounds, d: f64) -> GeoBounds {
+        GeoBounds { min_lon: viewport.min_lon + d, max_lon: viewport.max_lon + d, ..*viewport }
+    }
+
+    // ── plan_overlay_texture ─────────────────────────────────────────────
+
+    /// The constraint being ported for: a pane only 683 points wide already asks for
+    /// 2049 px at the full overdraw, one past WebGL2's guarantee. egui only
+    /// `debug_assert!`s that bound, so a release wasm build would sail into
+    /// `Device::create_texture` and fail there instead.
+    #[test]
+    fn a_pane_that_would_overflow_the_limit_gives_up_overdraw_instead() {
+        let unclamped = 683.0 * (1.0 + 2.0 * OVERDRAW_FRACTION);
+        assert!(
+            unclamped as u32 > WEBGL2_LIMIT,
+            "fixture must actually cross the limit: {unclamped} vs {WEBGL2_LIMIT}"
+        );
+
+        let plan = plan_overlay_texture(pane(683.0, 400.0), WEBGL2_LIMIT);
+        assert!(plan.width <= WEBGL2_LIMIT, "width {} exceeds the limit", plan.width);
+        assert!(plan.height <= WEBGL2_LIMIT, "height {} exceeds the limit", plan.height);
+        assert!(
+            plan.overdraw < OVERDRAW_FRACTION,
+            "overdraw {} should have been cut back from {OVERDRAW_FRACTION}",
+            plan.overdraw
+        );
+        // The dimensions and the overdraw describe the same rectangle.
+        assert_eq!(plan.width, (683.0 * (1.0 + 2.0 * plan.overdraw)) as u32);
+        assert_eq!(plan.height, (400.0 * (1.0 + 2.0 * plan.overdraw)) as u32);
+    }
+
+    /// A realistic browser window: 1440 x 900 points against WebGL2's floor.
+    #[test]
+    fn a_full_size_browser_pane_stays_within_the_limit() {
+        let plan = plan_overlay_texture(pane(1440.0, 900.0), WEBGL2_LIMIT);
+        assert!(plan.width <= WEBGL2_LIMIT && plan.height <= WEBGL2_LIMIT);
+        // Width is the binding axis, so it lands on the limit exactly.
+        assert_eq!(plan.width, WEBGL2_LIMIT);
+        // ...and the *same* fraction sizes the other axis, so the texture stays
+        // proportional to the pane rather than stretching.
+        assert_eq!(plan.height, (900.0 * (1.0 + 2.0 * plan.overdraw)) as u32);
+        assert!(plan.overdraw > 0.0 && plan.overdraw < OVERDRAW_FRACTION);
+    }
+
+    /// The binding axis is whichever needs the most texels, not always width.
+    #[test]
+    fn the_taller_axis_can_be_the_binding_one() {
+        let plan = plan_overlay_texture(pane(400.0, 1400.0), WEBGL2_LIMIT);
+        assert!(plan.width <= WEBGL2_LIMIT && plan.height <= WEBGL2_LIMIT);
+        assert_eq!(plan.height, WEBGL2_LIMIT);
+        assert!(plan.overdraw < OVERDRAW_FRACTION);
+    }
+
+    /// Desktop must not change. A desktop adapter's limit is far above anything a
+    /// window can demand, so the plan is bit-for-bit what the old constant produced.
+    #[test]
+    fn a_desktop_adapter_limit_changes_nothing() {
+        for (w, h) in [(683.0, 400.0), (1920.0, 1080.0), (2560.0, 1440.0), (100.0, 100.0)] {
+            let plan = plan_overlay_texture(pane(w, h), DESKTOP_LIMIT);
+            assert_eq!(
+                plan.overdraw, OVERDRAW_FRACTION,
+                "{w}x{h} should keep the full overdraw on a desktop adapter"
+            );
+            assert_eq!(plan.width, (w * (1.0 + 2.0 * OVERDRAW_FRACTION)) as u32);
+            assert_eq!(plan.height, (h * (1.0 + 2.0 * OVERDRAW_FRACTION)) as u32);
+        }
+    }
+
+    /// Past the point where the viewport alone fills the limit there is no overdraw
+    /// left to give up, and the dimensions must still not overflow. Both axes are
+    /// oversized here so the clamp on each is genuinely exercised.
+    #[test]
+    fn a_pane_wider_than_the_limit_falls_back_to_zero_overdraw() {
+        let rect = pane(3000.0, 2500.0);
+        assert!(
+            rect.width().min(rect.height()) > WEBGL2_LIMIT as f32,
+            "fixture must overflow on both axes for both clamps to be reached"
+        );
+        let plan = plan_overlay_texture(rect, WEBGL2_LIMIT);
+        assert_eq!(plan.overdraw, 0.0, "nothing left to give up");
+        assert_eq!(plan.width, WEBGL2_LIMIT);
+        assert_eq!(plan.height, WEBGL2_LIMIT);
+    }
+
+    /// Only the axis that actually overflows is truncated; the other keeps its
+    /// natural size. Clamping both to the limit would stretch the overlay.
+    #[test]
+    fn only_the_overflowing_axis_is_truncated() {
+        let plan = plan_overlay_texture(pane(3000.0, 900.0), WEBGL2_LIMIT);
+        assert_eq!(plan.overdraw, 0.0);
+        assert_eq!(plan.width, WEBGL2_LIMIT, "the overflowing axis is cut to the limit");
+        assert_eq!(plan.height, 900, "the axis that fits keeps its own size");
+    }
+
+    /// A zero-area pane must not produce a NaN fraction or a garbage dimension.
+    #[test]
+    fn a_degenerate_pane_produces_a_finite_plan() {
+        let plan = plan_overlay_texture(pane(0.0, 0.0), WEBGL2_LIMIT);
+        assert!(plan.overdraw.is_finite());
+        assert_eq!((plan.width, plan.height), (0, 0));
+    }
+
+    // ── pan_exceeds_coverage ─────────────────────────────────────────────
+
+    /// The check the cache exists for. Before this was measured from the bounds it
+    /// compared `tex_range * OVERDRAW_FRACTION * PAN_REBUILD_THRESHOLD`, and with a
+    /// three-viewport texture that margin (2.1 viewports) swallowed the whole
+    /// overdraw band — so this returned `true` the instant the render landed and
+    /// every overlay re-rasterised on every frame.
+    #[test]
+    fn a_texture_that_just_rendered_covers_its_own_viewport() {
+        let vp = viewport();
+        let tex = freshly_rendered(&vp, OVERDRAW_FRACTION as f64);
+        assert!(
+            !pan_exceeds_coverage(&tex, &vp),
+            "a texture rendered for this very viewport cannot already be out of coverage"
+        );
+    }
+
+    /// Past `PAN_REBUILD_THRESHOLD` of the band, on every edge.
+    #[test]
+    fn panning_most_of_the_way_across_the_band_triggers_a_rebuild() {
+        let vp = viewport();
+        let band = 10.0 * OVERDRAW_FRACTION as f64; // one viewport height/width
+        let tex = freshly_rendered(&vp, OVERDRAW_FRACTION as f64);
+        let past = band * (PAN_REBUILD_THRESHOLD as f64 + 0.05);
+        let short = band * (PAN_REBUILD_THRESHOLD as f64 - 0.05);
+
+        for d in [past, -past] {
+            assert!(pan_exceeds_coverage(&tex, &panned_lat(&vp, d)), "lat pan {d} must rebuild");
+            assert!(pan_exceeds_coverage(&tex, &panned_lon(&vp, d)), "lon pan {d} must rebuild");
+        }
+        for d in [short, -short] {
+            assert!(!pan_exceeds_coverage(&tex, &panned_lat(&vp, d)), "lat pan {d} is still covered");
+            assert!(!pan_exceeds_coverage(&tex, &panned_lon(&vp, d)), "lon pan {d} is still covered");
+        }
+    }
+
+    /// The invariant clamping would otherwise break. A texture whose overdraw was cut
+    /// to 0.2 tolerates far less pan than one with the full 1.0 — and the check has to
+    /// notice, or the cache holds a stale image over ground it never rasterised.
+    #[test]
+    fn a_clamped_texture_runs_out_of_coverage_sooner_than_a_full_one() {
+        let vp = viewport();
+        let clamped = freshly_rendered(&vp, 0.2);
+        let full = freshly_rendered(&vp, OVERDRAW_FRACTION as f64);
+
+        // 0.2 of a 10 degree viewport is a 2 degree band; 0.7 of that is 1.4.
+        let pan = panned_lat(&vp, -1.6);
+        assert!(
+            pan_exceeds_coverage(&clamped, &pan),
+            "a 2-degree band cannot absorb a 1.6-degree pan"
+        );
+        assert!(
+            !pan_exceeds_coverage(&full, &pan),
+            "precondition: the same pan is comfortably inside a full-overdraw texture, \
+             so only the coverage measurement distinguishes these"
+        );
+    }
+
+    /// A texture with no overdraw at all — what a pane wider than the adapter's limit
+    /// gets — must rebuild on any pan whatsoever.
+    #[test]
+    fn a_zero_overdraw_texture_rebuilds_on_the_slightest_pan() {
+        let vp = viewport();
+        let tex = freshly_rendered(&vp, 0.0);
+        assert!(pan_exceeds_coverage(&tex, &panned_lat(&vp, -0.001)));
+        assert!(pan_exceeds_coverage(&tex, &panned_lon(&vp, 0.001)));
+    }
+
+    /// A pane that grew since its texture was rasterised is no longer covered, even
+    /// without panning. The measured band goes negative and trips the comparison.
+    #[test]
+    fn a_pane_that_outgrew_its_texture_rebuilds() {
+        let vp = viewport();
+        let tex = freshly_rendered(&vp, 0.1);
+        let grown = GeoBounds { min_lat: 20.0, max_lat: 50.0, min_lon: -110.0, max_lon: -80.0 };
+        assert!(
+            grown.max_lat - grown.min_lat > tex.max_lat - tex.min_lat,
+            "fixture must actually outgrow the texture"
+        );
+        assert!(pan_exceeds_coverage(&tex, &grown));
+    }
+
+    // ── the two together ─────────────────────────────────────────────────
+
+    /// End to end: plan a texture against a small limit, expand the geo bounds by the
+    /// fraction the plan reports (exactly as `spawn_overlay_render` does), and the
+    /// coverage check agrees it is fresh. Expanding by `OVERDRAW_FRACTION` instead —
+    /// the bug clamping would introduce — claims ground the pixels never covered.
+    #[test]
+    fn the_plans_overdraw_is_what_the_coverage_check_reads_back() {
+        let vp = viewport();
+        let plan = plan_overlay_texture(pane(1440.0, 900.0), WEBGL2_LIMIT);
+        assert!(plan.overdraw < OVERDRAW_FRACTION, "fixture must be a clamped one");
+
+        let honest = freshly_rendered(&vp, plan.overdraw as f64);
+        assert!(!pan_exceeds_coverage(&honest, &vp));
+
+        // The band the honest texture really has, and a pan that overruns it.
+        let band = 10.0 * plan.overdraw as f64;
+        let overrun = panned_lat(&vp, -(band * 0.95));
+        assert!(pan_exceeds_coverage(&honest, &overrun));
+
+        // Had the bounds been expanded by the unclamped constant, the same pan would
+        // have looked comfortably covered — the stale-overlay failure mode.
+        let overclaimed = freshly_rendered(&vp, OVERDRAW_FRACTION as f64);
+        assert!(!pan_exceeds_coverage(&overclaimed, &overrun));
+    }
 }
