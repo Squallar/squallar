@@ -133,11 +133,20 @@ pub const GLM_MAX_TIME_WINDOW_SECS: f64 = 1800.0;
 /// Below this many files in the window, "everything failed" is not a claim
 /// worth making.
 ///
-/// Granules land every 20 s and the poll interval is also 20 s, so a typical
-/// poll has very few uncached files — often one. Without a floor, a single
-/// corrupt granule arriving on a quiet tick reads as "100% failure", which is
-/// how a one-off becomes a product-schema alarm.
-const MIN_FILES_FOR_TOTAL_VERDICT: usize = 3;
+/// Two, not three, and the difference matters at the slider minimum. Measured
+/// against live granules, `in_window` is exactly `floor(window / 20) - 1` and is
+/// stable tick to tick, so a 60 s window holds exactly 2 files. A floor of 3
+/// would put `is_total` permanently out of reach there: a user watching live
+/// convection at the 1-minute setting would get "2/2 files failed to parse"
+/// with no "(product change?)" hint and the partial log line instead of the
+/// escalated one — withholding the diagnostic precisely when the ratio is
+/// unambiguous.
+///
+/// Two still does the job it was added for. The primary defence is the
+/// denominator itself ([`FetchFailures::in_window`] counts the whole window,
+/// not this poll's downloads), which already keeps one bad granule at 1/N; this
+/// floor is belt-and-braces against a degenerate single-file window.
+const MIN_FILES_FOR_TOTAL_VERDICT: usize = 2;
 
 /// Files that were expected to contribute to the current window but did not.
 ///

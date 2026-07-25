@@ -599,6 +599,12 @@ impl OverlayHandler for GlmHandler {
             // they would not download, or they would not parse. The S3 listing
             // is healthy in both cases, so nothing above catches them, and the
             // two are reported separately because they indict different things.
+            //
+            // Both can be shown at once (some files failed each way), but two
+            // *totals* cannot: each file yields exactly one FileError, so the
+            // two counts partition the failures and at most one can equal
+            // `in_window`. The "All N …" wordings are therefore mutually
+            // exclusive by construction, not by luck.
             for (kind, state) in
                 [(FailureKind::Parse, &self.parse), (FailureKind::Transport, &self.transport)]
             {
