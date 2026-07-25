@@ -13,8 +13,12 @@
 //!
 //! # Event fidelity
 //!
-//! The pointer helpers emit exactly the event sequences `egui-winit` 0.34
-//! produces, which is what makes the cancellation test meaningful:
+//! The pointer helpers emit exactly the event sequences the real integrations
+//! produce, which is what makes the cancellation tests meaningful. They do not
+//! agree with each other, and the disagreements are the whole reason the
+//! tracker is shaped the way it is.
+//!
+//! `egui-winit` 0.34.1 (`src/lib.rs`):
 //!
 //! | winit event                | emitted here                                          |
 //! |----------------------------|-------------------------------------------------------|
@@ -22,10 +26,24 @@
 //! | `TouchPhase::Moved`        | `Touch{Move}`, `PointerMoved`                         |
 //! | `TouchPhase::Ended`        | `Touch{End}`, `PointerButton{up}`, `PointerGone`      |
 //! | `TouchPhase::Cancelled`    | `Touch{Cancel}`, `PointerGone` — **no release**       |
+//! | `WindowEvent::CursorLeft`  | `PointerGone` alone — and the position is forgotten,  |
+//! |                            | so a release out there is dropped (`lib.rs:796`)      |
 //!
-//! Note the last row: a cancelled touch never reports a release, and egui does
-//! not clear `pointer.down` on `PointerGone`, so any gesture that only exits on
-//! "pointer up" stays stuck forever.
+//! eframe 0.34.1's web canvas (`src/web/events.rs`):
+//!
+//! | DOM event     | emitted here                                                |
+//! |---------------|-------------------------------------------------------------|
+//! | `touchstart`  | `PointerButton{down}` **then** `Touch{Start}` — order flipped |
+//! | `touchmove`   | `PointerMoved`, `Touch{Move}`                               |
+//! | `touchend`    | `PointerButton{up}`, `PointerGone`, `Touch{End}`            |
+//! | `touchcancel` | `Touch{Cancel}` **alone** — no release, no `PointerGone`    |
+//! | `mousemove`   | `PointerMoved`                                              |
+//!
+//! Two rows carry the weight. A cancelled touch never reports a release and
+//! egui does not clear `pointer.down` on `PointerGone`, so any gesture that
+//! only exits on "pointer up" stays stuck forever — and on the web there is no
+//! `PointerGone` either, so a tracker keying on that alone never notices the
+//! cancellation at all.
 
 use crate::Gui;
 use crate::ui_input::{MapPointerFrame, TouchGestures};
@@ -192,13 +210,51 @@ impl InputHarness {
         self.events.push(egui::Event::PointerGone);
     }
 
-    /// Raw device motion (`DeviceEvent::MouseMotion` → [`egui::Event::MouseMoved`]),
-    /// which `egui-winit` forwards while a button is held even with the cursor
-    /// outside the window (`lib.rs:759`). It carries a delta and **no
-    /// position**, so egui has nothing to put in `interact_pos()` on such a
-    /// frame.
+    /// Raw device motion (`DeviceEvent::MouseMotion` → [`egui::Event::MouseMoved`]).
+    /// It carries a delta and **no position**, so egui has nothing to put in
+    /// `interact_pos()` on such a frame.
+    ///
+    /// No integration in this workspace actually produces this:
+    /// `egui-winit`'s `on_mouse_motion` (`lib.rs:759`) is reachable only from
+    /// `DeviceEvent`, and `rustdar-platform/src/egui_renderer.rs:59` forwards
+    /// `on_window_event` only. It is here to exercise the tracker's defensive
+    /// position fallback, and to prove a delta with no coordinates cannot
+    /// resurrect a cancelled touch.
     pub(crate) fn mouse_moved_raw(&mut self, delta: egui::Vec2) {
         self.events.push(egui::Event::MouseMoved(delta));
+    }
+
+    // --- web input (mirrors eframe 0.34.1's canvas listeners) ---------------
+
+    /// `touchstart`, as eframe's web canvas emits it: the primary
+    /// `PointerButton{pressed}` **first**, then `push_touches(Start)`
+    /// (`eframe/src/web/events.rs:676`) — the opposite order to `egui-winit`,
+    /// which is why the tracker correlates the pair over the whole frame.
+    pub(crate) fn web_touch_start(&mut self, pos: egui::Pos2) {
+        self.events.push(pointer_button(pos, true));
+        self.events.push(touch(egui::TouchPhase::Start, pos));
+    }
+
+    /// `touchmove` (`events.rs:709`): a bare `PointerMoved`, with the raw touch
+    /// pushed alongside it.
+    pub(crate) fn web_touch_move(&mut self, pos: egui::Pos2) {
+        self.events.push(egui::Event::PointerMoved(pos));
+        self.events.push(touch(egui::TouchPhase::Move, pos));
+    }
+
+    /// `touchcancel` (`events.rs:788`): `push_touches(Cancel)` and **nothing
+    /// else** — no release, no `PointerGone`. egui's `primary_down()` therefore
+    /// stays latched `true` with no event ever clearing it, so a tracker that
+    /// keys cancellation on `PointerGone` alone never fires at all here.
+    pub(crate) fn web_touch_cancel(&mut self, pos: egui::Pos2) {
+        self.events.push(touch(egui::TouchPhase::Cancel, pos));
+    }
+
+    /// `mousemove` (`events.rs:627`): a bare `PointerMoved`. Note this reaches
+    /// the canvas whether or not any touch is involved, which is what makes a
+    /// motion-based un-latch dangerous after a cancellation on the web.
+    pub(crate) fn web_mouse_move(&mut self, pos: egui::Pos2) {
+        self.events.push(egui::Event::PointerMoved(pos));
     }
 
     // --- touch input (mirrors egui-winit's `on_touch`) ----------------------
@@ -314,7 +370,17 @@ fn touch(phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui_input::POINTER_IDLE_TIMEOUT_S;
+
+    /// The two durations that bracket the idle backstop, deliberately **not**
+    /// derived from `POINTER_IDLE_TIMEOUT_S`.
+    ///
+    /// A probe that sizes its own loop off the constant under test cannot
+    /// notice that constant changing — it just moves with it, and both a 32s
+    /// and a 600s backstop pass. These are absolute claims about the behaviour
+    /// instead: a still hold must survive the first, and a pointer that has
+    /// gone silent must not survive the second.
+    const HOLD_MUST_SURVIVE_S: f64 = 45.0;
+    const SILENCE_MUST_EXPIRE_S: f64 = 90.0;
 
     /// Long enough for a deferred single tap to be confirmed
     /// (`DOUBLE_TAP_TIMEOUT_S` is 0.4s).
@@ -627,7 +693,7 @@ mod tests {
         assert!(h.frame_after(FRAME_DT).touch.suppress_pan);
 
         // No events at all from here on, for longer than the backstop allows.
-        let expired = h.frames_for((POINTER_IDLE_TIMEOUT_S / 0.5) as usize + 10, 0.5);
+        let expired = h.frames_for((SILENCE_MUST_EXPIRE_S / 0.5) as usize, 0.5);
         assert!(
             !expired.touch.suppress_pan,
             "a pointer that stopped reporting must not hold the map hostage"
@@ -680,16 +746,197 @@ mod tests {
             h.frame_after(FRAME_DT);
         }
 
-        // Motion with the button down is proof the pointer is alive: holding
-        // still from here must produce a tooltip again. Before the un-latch
-        // rule this stayed `None` forever, however long the user waited.
-        let recovered = h.frames_for(10, 0.1);
+        // The pointer is believed again (`down` is restored — see
+        // `tracker::motion_after_an_excursion_restores_down_but_not_arming`),
+        // but no *new* hold may open on an inferred button: the release that
+        // may have happened out of sight was discarded by the integration, so
+        // this could equally be a bare hover. A tooltip here would suppress
+        // panning until the user clicked.
+        let hovering = h.frames_for(20, 0.1);
         assert_eq!(
-            recovered.touch.long_press_pos,
-            Some(back),
-            "a returning pointer must not stay dead until the next click"
+            hovering.touch.long_press_pos, None,
+            "a returning pointer must not open a hold nobody pressed for"
         );
-        assert!(recovered.touch.suppress_pan);
+        assert!(!hovering.touch.suppress_pan);
+
+        // And it is not wedged either: one real press restores everything.
+        h.mouse_press(back);
+        let pressed = h.frames_for(10, 0.1);
+        assert_eq!(pressed.touch.long_press_pos, Some(back));
+        assert!(pressed.touch.suppress_pan);
+    }
+
+    /// 6f-R1. **PROBE R1** — a cancelled touch must not be resurrected by a
+    ///        bare `PointerMoved`.
+    ///
+    ///        After a cancel, egui's `primary_down()` is latched `true` with
+    ///        nothing left that will ever clear it, so the tracker's distrust
+    ///        is the only thing standing between that and a phantom gesture.
+    ///        Motion keeps arriving regardless — `egui-winit` clears
+    ///        `pointer_touch_id` on cancel (`lib.rs:922`) and then admits the
+    ///        *next* finger's moves as `PointerMoved` with no press
+    ///        (`lib.rs:894`, `lib.rs:906`) — so "a cancel is followed by
+    ///        silence" is true of that finger, not of the pointer stream.
+    #[test]
+    fn motion_after_a_cancel_does_not_resurrect_the_pointer() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+
+        h.touch_start(pos);
+        assert_eq!(
+            h.frames_for(10, 0.1).touch.long_press_pos,
+            Some(pos),
+            "precondition: long press active"
+        );
+
+        h.touch_cancel(pos);
+        assert_eq!(h.frame_after(FRAME_DT).touch.long_press_pos, None);
+
+        // A second finger, still on the glass, moves.
+        h.mouse_move(pos + egui::vec2(90.0, 60.0));
+        h.frame_after(FRAME_DT);
+
+        h.assert_every_frame_for(WATCH_PAST_LONG_PRESS, 0.1, |frame, outcome| {
+            assert_eq!(
+                outcome.touch.long_press_pos, None,
+                "frame {frame}: motion is not the cancelled finger coming back"
+            );
+            assert!(!outcome.touch.suppress_pan, "frame {frame}");
+        });
+    }
+
+    /// 6f-R2. **PROBE R2** — the same, for `MouseMoved`: a delta with no
+    ///        coordinates at all. This is the worst resurrection vector,
+    ///        because the phantom would land at `last_pos` — exactly where the
+    ///        OS took the touch away.
+    #[test]
+    fn positionless_motion_after_a_cancel_does_not_resurrect_the_pointer() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+
+        h.touch_start(pos);
+        assert_eq!(h.frames_for(10, 0.1).touch.long_press_pos, Some(pos));
+
+        h.touch_cancel(pos);
+        assert_eq!(h.frame_after(FRAME_DT).touch.long_press_pos, None);
+
+        h.mouse_moved_raw(egui::vec2(2.0, 1.0));
+        h.frame_after(FRAME_DT);
+
+        h.assert_every_frame_for(WATCH_PAST_LONG_PRESS, 0.1, |frame, outcome| {
+            assert_eq!(
+                outcome.touch.long_press_pos, None,
+                "frame {frame}: a cancelled touch must not come back at its own last position"
+            );
+            assert!(!outcome.touch.suppress_pan, "frame {frame}");
+        });
+    }
+
+    /// 6f-R3. **PROBE R3** — and for a cancelled *zoom drag*: motion must not
+    ///        hand the map back to a gesture the OS took away.
+    #[test]
+    fn motion_after_a_cancelled_zoom_drag_does_not_restore_it() {
+        let mut h = InputHarness::new();
+        let start = h.map_center();
+
+        h.touch_tap(start);
+        h.touch_start(start);
+        assert!(h.frame_after(0.05).touch.suppress_pan, "precondition: zoom drag");
+
+        h.touch_cancel(start);
+        assert!(!h.frame_after(FRAME_DT).touch.suppress_pan);
+
+        h.mouse_move(start + egui::vec2(0.0, 80.0));
+        h.frame_after(FRAME_DT);
+
+        h.assert_every_frame_for(WATCH_PAST_LONG_PRESS, 0.1, |frame, outcome| {
+            assert!(
+                !outcome.touch.suppress_pan,
+                "frame {frame}: the map must stay pannable after a cancelled drag"
+            );
+            assert_eq!(outcome.touch.long_press_pos, None, "frame {frame}");
+        });
+    }
+
+    /// 6f-R4. **PROBE R4** — a cancellation on the web, which arrives as a bare
+    ///        `Touch{Cancel}`.
+    ///
+    ///        eframe 0.34.1's `install_touchcancel` pushes `push_touches(Cancel)`
+    ///        and nothing else (`eframe/src/web/events.rs:788`): no release, no
+    ///        `PointerGone`. Keying cancellation on `PointerGone` alone never
+    ///        fired here at all — the map stayed un-pannable behind a stuck
+    ///        tooltip until the idle backstop, a minute later. Browsers fire
+    ///        `touchcancel` routinely (scroll takeover, page hide, too many
+    ///        contact points).
+    #[test]
+    fn web_touch_cancel_releases_the_map() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+
+        h.web_touch_start(pos);
+        h.frame_after(FRAME_DT);
+        // A little jitter, as a real finger produces — and as a browser
+        // delivers it, so the cancellation below is not reached through an
+        // artificially silent stream.
+        h.web_touch_move(pos + egui::vec2(2.0, 1.0));
+        assert_eq!(
+            h.frames_for(10, 0.1).touch.long_press_pos,
+            Some(pos + egui::vec2(2.0, 1.0)),
+            "precondition: long press active"
+        );
+
+        h.web_touch_cancel(pos + egui::vec2(2.0, 1.0));
+        let cancelled = h.frame_after(FRAME_DT);
+        assert_eq!(
+            cancelled.touch.long_press_pos, None,
+            "a bare Touch{{Cancel}} is the whole cancellation signal on the web"
+        );
+        assert!(!cancelled.touch.suppress_pan);
+
+        // `mousemove` on the canvas is a bare `PointerMoved` and does not care
+        // that a touch was involved — it must not undo the cancellation.
+        h.web_mouse_move(pos + egui::vec2(70.0, 40.0));
+        h.frame_after(FRAME_DT);
+
+        h.assert_every_frame_for(WATCH_PAST_LONG_PRESS, 0.1, |frame, outcome| {
+            assert_eq!(outcome.touch.long_press_pos, None, "frame {frame}");
+            assert!(!outcome.touch.suppress_pan, "frame {frame}");
+        });
+    }
+
+    /// 6f-R5. **PROBE R5** — the button was released *outside* the window.
+    ///
+    ///        `egui-winit` drops a mouse release while the cursor is out of the
+    ///        window (`lib.rs:796` needs a position it no longer has), so egui
+    ///        reports the button as down forever afterwards. Coming back is
+    ///        then indistinguishable from coming back still holding it, which
+    ///        is why no hold may arm on the strength of motion alone.
+    #[test]
+    fn a_release_outside_the_window_does_not_return_as_a_hold() {
+        let mut h = InputHarness::new();
+        let inside = h.map_center();
+
+        h.mouse_press(inside);
+        h.frame_after(FRAME_DT);
+
+        // Out of the window; the release that happens out there never arrives.
+        h.cursor_left();
+        h.frame_after(FRAME_DT);
+
+        // Back in, hovering, nothing held.
+        h.mouse_move(inside + egui::vec2(30.0, 20.0));
+        h.frame_after(FRAME_DT);
+
+        h.assert_every_frame_for(WATCH_PAST_LONG_PRESS, 0.1, |frame, outcome| {
+            assert_eq!(
+                outcome.touch.long_press_pos, None,
+                "frame {frame}: hovering must not become a hold"
+            );
+            assert!(
+                !outcome.touch.suppress_pan,
+                "frame {frame}: a phantom hold would kill panning until the next click"
+            );
+        });
     }
 
     /// 6g. **PROBE G** — recovery after the idle backstop fires. The finger was
@@ -706,7 +953,7 @@ mod tests {
         assert!(h.frame_after(FRAME_DT).touch.long_press_pos.is_none());
 
         // Total silence, past the backstop.
-        let expired = h.frames_for((POINTER_IDLE_TIMEOUT_S / 0.5) as usize + 10, 0.5);
+        let expired = h.frames_for((SILENCE_MUST_EXPIRE_S / 0.5) as usize, 0.5);
         assert_eq!(
             expired.touch.long_press_pos, None,
             "precondition: the backstop gave up on the pointer"
@@ -742,7 +989,7 @@ mod tests {
         assert_eq!(held.touch.long_press_pos, Some(pos), "precondition: long press");
 
         // Not one event for thirty seconds; the finger has not moved a pixel.
-        h.assert_every_frame_for(30.0, 0.25, |frame, outcome| {
+        h.assert_every_frame_for(HOLD_MUST_SURVIVE_S, 0.25, |frame, outcome| {
             assert_eq!(
                 outcome.touch.long_press_pos,
                 Some(pos),
@@ -750,38 +997,6 @@ mod tests {
             );
             assert!(outcome.touch.suppress_pan, "frame {frame}");
         });
-    }
-
-    /// 6i. When motion un-latches a pointer whose position egui has thrown
-    ///     away, the reported position must be the last real one.
-    ///
-    ///     `PointerGone` clears egui's position from the *following* frame on,
-    ///     and `Event::MouseMoved` — raw device motion, which `egui-winit`
-    ///     forwards while a button is held even with the cursor outside the
-    ///     window — carries a delta and no position. So this frame has a live
-    ///     pointer and nothing for `interact_pos()` to return; falling back to
-    ///     `Pos2::ZERO` there would pin the gesture to the screen corner.
-    #[test]
-    fn motion_without_a_position_reports_the_last_real_one() {
-        let mut h = InputHarness::new();
-        let pos = h.map_center();
-
-        h.mouse_press(pos);
-        h.frame_after(FRAME_DT);
-
-        h.cursor_left();
-        h.frame_after(FRAME_DT);
-
-        // Raw motion keeps arriving; the button was never released.
-        h.mouse_moved_raw(egui::vec2(3.0, -2.0));
-        h.frame_after(FRAME_DT);
-
-        let held = h.frames_for(10, 0.1);
-        assert_eq!(
-            held.touch.long_press_pos,
-            Some(pos),
-            "with no position to be had, report the last real one — not the corner"
-        );
     }
 
     /// 7. A tap that lands on a floating dialog is filtered out by the
