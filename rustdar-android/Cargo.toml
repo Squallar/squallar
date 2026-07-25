@@ -3,43 +3,18 @@ name = "rustdar-android"
 version.workspace = true
 edition.workspace = true
 
-# Android APK configuration for cargo-apk
-[package.metadata.android]
-package = "dev.mcswain.rustdar"
-apk_name = "Rustdar"
-build_targets = ["aarch64-linux-android"]
-min_sdk_version = 28
-target_sdk_version = 34
-theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
-
-# Handle configuration changes (orientation, screen size, fold/unfold, etc.) in-app
-# instead of letting Android destroy and recreate the activity. Without this,
-# unfolding a Z Fold triggers a full activity relaunch that deadlocks the native
-# event loop and causes an ANR.
-[package.metadata.android.application]
-label = "Rustdar"
-
-[package.metadata.android.signing.release]
-path = "../rustdar.jks"
-keystore_password = "rustdar"
-
-[package.metadata.android.application.activity]
-config_changes = "orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|density|uiMode"
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.INTERNET"
-[[package.metadata.android.uses_permission]]
-name = "android.permission.ACCESS_NETWORK_STATE"
-[[package.metadata.android.uses_permission]]
-name = "android.permission.WRITE_EXTERNAL_STORAGE"
-[[package.metadata.android.uses_permission]]
-name = "android.permission.READ_EXTERNAL_STORAGE"
-[[package.metadata.android.uses_permission]]
-name = "android.permission.ACCESS_FINE_LOCATION"
-[[package.metadata.android.uses_permission]]
-name = "android.permission.ACCESS_COARSE_LOCATION"
+# The APK is built by Gradle, from `android/`. Everything that used to live here
+# as `[package.metadata.android]` -- package name, SDK levels, theme, permissions,
+# configChanges, signing -- is now in `android/app/build.gradle.kts` and
+# `android/app/src/main/AndroidManifest.xml`, which is what made it possible to
+# set `android:networkSecurityConfig` at all. See
+# `android/app/src/main/res/xml/network_security_config.xml` for why that matters.
+#
+# Build with:  cd android && ./gradlew assembleRelease   (or bundleRelease for .aab)
 
 [lib]
+# NativeActivity resolves `android_main` out of librustdar_android.so; the name
+# here is what `android.app.lib_name` in the manifest must match.
 name = "rustdar_android"
 crate-type = ["cdylib"]
 path = "src/lib.rs"
@@ -50,13 +25,23 @@ rustdar-platform = { workspace = true }
 # Android PlatformBridge this entry point hands it.
 rustdar-frontend = { workspace = true }
 android_logger = "=0.15.1"
+# native-activity, deliberately, not game-activity. GameActivity exists to provide
+# mobile text input, which rustdar has none of, and it forces an AppCompat theme --
+# which changes what getRootWindowInsets() reports, shifting the map's
+# excluded_rects and breaking click hit-testing against overlays. It would also add
+# a C++ build. ndk_context is initialized under both backends, so all the JNI
+# bridges in this crate work either way; there is simply nothing to gain.
 winit = { workspace = true, features = ["android-native-activity"] }
 pollster = { workspace = true }
 log = { workspace = true }
 jni = { workspace = true }
 ndk-context = { workspace = true }
-# Pinned to the version reqwest 0.13.2 resolves, so `android::init_with_refs`
+# Pinned to the version reqwest 0.13.2 resolves, so `android::init_with_env`
 # below talks to the same verifier instance reqwest's clients read from. 0.6.2
 # wants jni ^0.21, which is the workspace pin -- 0.7.x would require jni ^0.22.
+#
+# Its Kotlin half ships as an AAR inside the `rustls-platform-verifier-android`
+# crate's registry checkout; `android/app/build.gradle.kts` locates that via
+# `cargo metadata` and adds it as a Maven repo.
 rustls-platform-verifier = "=0.6.2"
 rustdar-gps = { workspace = true, features = ["serial"] }

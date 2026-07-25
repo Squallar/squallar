@@ -2,10 +2,12 @@
 <!--
   Android Network Security Config for rustdar.
 
-  NOT WIRED UP YET. This file is inert until the build can emit
-  `android:networkSecurityConfig="@xml/network_security_config"` on <application>
-  and can compile this into the APK's resource table. `cargo-apk`, which builds
-  the APK today, can do neither:
+  Referenced by android:networkSecurityConfig on <application> in
+  AndroidManifest.xml, and compiled into resources.arsc by aapt2 as part of the
+  Gradle build.
+
+  This file is why that Gradle build exists. cargo-apk, which built the APK
+  before, could not deliver it:
 
     * Its AndroidManifest generator has a fixed attribute set on <application>
       (debuggable, theme, extractNativeLibs, usesCleartextTraffic, label, icon,
@@ -13,12 +15,9 @@
       table in Cargo.toml has no passthrough for arbitrary attributes.
     * The attribute's value is a *resource reference*, so the file has to be
       compiled by aapt2 into `resources.arsc` and given a resource ID. The
-      existing `classes.dex` injection in build-android.sh works because a DEX at
-      the APK root needs no resource table entry; an `res/xml/` file does. Adding
-      it to the ZIP achieves nothing on its own.
-
-  So this is blocked on the Gradle migration, which is the decisive reason for
-  that migration rather than build ergonomics.
+      `classes.dex` injection that build-android.sh used to do worked only
+      because a DEX at the APK root needs no resource table entry; an `res/xml/`
+      file does. Adding it to the ZIP would have achieved nothing.
 
   ---------------------------------------------------------------------------
   Why the base config permits cleartext while every rustdar domain forbids it

@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- All six permissions the cargo-apk metadata declared, unchanged. -->
+    <!-- HTTPS to api.weather.gov, the NEXRAD archive, and basemap tiles. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <!-- LocationManager.getLastKnownLocation() in rustdar-android's GPS thread. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <application
+        android:label="Rustdar"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:allowBackup="true"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+
+        android:networkSecurityConfig="@xml/network_security_config"
+
+        android:hasCode="true">
+
+        <!--
+          android:networkSecurityConfig is the entire reason this build moved off
+          cargo-apk. See res/xml/network_security_config.xml for the full rationale;
+          in short, Android's TrustManager fetches api.weather.gov's CRL over plain
+          HTTP (Let's Encrypt R13 publishes no OCSP responder at all), and that fetch
+          is subject to this app's own cleartext policy. Blocking cleartext app-wide
+          therefore breaks HTTPS to weather.gov rather than hardening it.
+
+          The attribute value is a *resource reference*: aapt2 must compile that XML
+          into resources.arsc and assign it an ID. That is what cargo-apk could not
+          do, and why injecting the file into the APK zip was never going to work.
+
+          Deliberately NOT set here: android:usesCleartextTraffic. Android ignores
+          that flag whenever a networkSecurityConfig is present, so spelling it
+          "false" would read like a guarantee the platform is not honouring. The
+          config file is the single source of truth: cleartext permitted in
+          base-config so the platform's own revocation fetches succeed, and denied
+          per-domain for every host rustdar itself talks to.
+        -->
+
+        <activity
+            android:name="android.app.NativeActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|density|uiMode">
+
+            <!--
+              uiMode in that list is load-bearing and easy to drop as "cosmetic".
+              Without it a dark/light switch — and, on a foldable, an unfold —
+              tears down and recreates the Activity underneath a running native
+              event loop, which deadlocks and ANRs instead of relaunching cleanly.
+              The Rust side handles all of these in-app: theme via the polling
+              thread in rustdar-platform, size via the normal resize path.
+            -->
+
+            <!-- NativeActivity dlsym()s android_main out of this .so. The name is
+                 rustdar-android's [lib] name, i.e. librustdar_android.so. -->
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="rustdar_android" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

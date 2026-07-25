@@ -1,0 +1,13 @@
+.gradle/
+build/
+app/build/
+local.properties
+
+# Staged by the cargo-ndk tasks, never authored.
+app/src/main/jniLibs/
+
+# Signing material and its passwords. Never commit.
+keystore.properties
+app/keystore.properties
+*.jks
+*.keystore
