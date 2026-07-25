@@ -487,7 +487,11 @@ mod tests {
         scale: Option<f32>,
         offset: Option<f32>,
         fill: Option<i16>,
-        valid_range: Option<(i16, i16)>,
+        /// Written verbatim, element count and all. A `Vec` rather than a pair
+        /// because the *shape* of this attribute is itself under test: a
+        /// `valid_range` that is not exactly two elements is malformed and must
+        /// be ignored, and a pair could not express one.
+        valid_range: Option<Vec<i16>>,
         units: Option<&'a str>,
     }
 
@@ -529,8 +533,8 @@ mod tests {
             if let Some(f) = spec.fill {
                 var.put_attribute("_FillValue", f).expect("_FillValue");
             }
-            if let Some((lo, hi)) = spec.valid_range {
-                var.put_attribute("valid_range", vec![lo, hi]).expect("valid_range");
+            if let Some(range) = &spec.valid_range {
+                var.put_attribute("valid_range", range.clone()).expect("valid_range");
             }
             if let Some(s) = spec.scale {
                 var.put_attribute("scale_factor", s).expect("scale_factor");
@@ -542,6 +546,25 @@ mod tests {
                 var.put_attribute("units", u).expect("units");
             }
             var.put_values(spec.values, ..).expect("put values");
+        }
+        let bytes = std::fs::read(&path).expect("read back");
+        let _ = std::fs::remove_file(&path);
+        bytes
+    }
+
+    /// Write a single unpacked `float` variable — GLM's `group_lat`/`flash_lat`
+    /// shape — and hand back its bytes.
+    fn float_var_file(values: &[f32], units: Option<&str>) -> Vec<u8> {
+        let path = scratch_path("float");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut file = netcdf::create(&path).expect("create");
+            file.add_dimension("n", values.len()).expect("dim");
+            let mut var = file.add_variable::<f32>("v", &["n"]).expect("add var");
+            if let Some(u) = units {
+                var.put_attribute("units", u).expect("units");
+            }
+            var.put_values(values, ..).expect("put");
         }
         let bytes = std::fs::read(&path).expect("read back");
         let _ = std::fs::remove_file(&path);
@@ -625,7 +648,7 @@ mod tests {
         let bytes = short_var_file(&ShortVar {
             values: &[100, -3, 200], // -3 == 65533 unsigned, above the 65530 cap
             unsigned: true,
-            valid_range: Some((0, -6)),
+            valid_range: Some(vec![0, -6]),
             scale: Some(1.0),
             ..Default::default()
         });
@@ -670,21 +693,150 @@ mod tests {
     /// half of the product that looked fine and hid the bug.
     #[test]
     fn float_variable_passes_through_unchanged() {
-        let path = scratch_path("float");
-        let _ = std::fs::remove_file(&path);
-        {
-            let mut file = netcdf::create(&path).expect("create");
-            file.add_dimension("n", 3).expect("dim");
-            let mut var = file.add_variable::<f32>("v", &["n"]).expect("add var");
-            var.put_attribute("units", "degrees_north").expect("units");
-            var.put_values(&[39.033424_f32, -22.65055, 55.2922], ..).expect("put");
-        }
-        let bytes = std::fs::read(&path).expect("read back");
-        let _ = std::fs::remove_file(&path);
+        let bytes =
+            float_var_file(&[39.033424_f32, -22.65055, 55.2922], Some("degrees_north"));
 
         let v = read_v(&bytes);
         assert_eq!(v.values[0], Some(f64::from(39.033424_f32)));
         assert_eq!(v.values[1], Some(f64::from(-22.65055_f32)));
         assert_eq!(v.values[2], Some(f64::from(55.2922_f32)));
+    }
+
+    /// An inverted `valid_range` is refused, not honoured.
+    ///
+    /// The trap is that "inverted" is only decidable *after* `_Unsigned`
+    /// reinterpretation, and the two orderings look the same in the signed
+    /// domain the file is written in. GLM's real range is `0s, -6s`, which is
+    /// `0..=65530` — fine. Transpose it to `-6s, 0s` and it becomes
+    /// `65530..=0`, which matches nothing: every value in the variable would be
+    /// marked missing and the layer would go dark with no error anywhere.
+    ///
+    /// A future reader that checks `lo > hi` in the *signed* domain gets this
+    /// exactly backwards — it would accept the inverted range and reject the
+    /// real one.
+    #[test]
+    fn an_inverted_valid_range_is_refused_rather_than_emptying_the_variable() {
+        let inverted = read_v(&short_var_file(&ShortVar {
+            // `-6` on disk, i.e. raw 65530 — the value that would sit exactly on
+            // the cap if the transposed range were honoured.
+            values: &[100, 200, -6],
+            unsigned: true,
+            valid_range: Some(vec![-6, 0]), // == 65530..=0 once reinterpreted
+            scale: Some(1.0),
+            ..Default::default()
+        }));
+        assert_eq!(
+            inverted.values,
+            vec![Some(100.0), Some(200.0), Some(65530.0)],
+            "an inverted range must be dropped, not applied; applying it empties \
+             the variable and renders identically to a quiet sky"
+        );
+
+        // The same two bounds the right way round are the real GLM attribute,
+        // and they must still be enforced — refusing inverted ranges is not
+        // licence to stop checking ranges.
+        let correct = read_v(&short_var_file(&ShortVar {
+            values: &[100, 200, -3], // -3 == 65533, past the 65530 cap
+            unsigned: true,
+            valid_range: Some(vec![0, -6]),
+            scale: Some(1.0),
+            ..Default::default()
+        }));
+        assert_eq!(correct.values, vec![Some(100.0), Some(200.0), None]);
+
+        // Inversion is refused on a plainly signed variable too — nothing about
+        // the check is specific to `_Unsigned`, it is just where it bites.
+        let signed = read_v(&short_var_file(&ShortVar {
+            values: &[-20, 0, 20],
+            unsigned: false,
+            valid_range: Some(vec![10, 5]),
+            scale: Some(1.0),
+            ..Default::default()
+        }));
+        assert_eq!(signed.values, vec![Some(-20.0), Some(0.0), Some(20.0)]);
+    }
+
+    /// `valid_range` is defined as exactly two elements. Anything else is
+    /// malformed and is ignored wholesale.
+    ///
+    /// Ignoring is the safe direction — it can only mark *fewer* values missing,
+    /// never invent an empty variable — and it is the direction a reader has to
+    /// choose deliberately. Quietly taking the first two elements of a longer
+    /// attribute would apply a range the file never declared; reaching for
+    /// `bounds[1]` of a shorter one is an outright panic on a granule the user
+    /// cannot control.
+    #[test]
+    fn a_valid_range_that_is_not_two_elements_is_ignored() {
+        // Three elements. The first two happen to be the real GLM range, so
+        // honouring them would drop 65533 and look entirely plausible.
+        let three = read_v(&short_var_file(&ShortVar {
+            values: &[100, -3],
+            unsigned: true,
+            valid_range: Some(vec![0, -6, 99]),
+            scale: Some(1.0),
+            ..Default::default()
+        }));
+        assert_eq!(
+            three.values,
+            vec![Some(100.0), Some(65533.0)],
+            "a 3-element valid_range is malformed; its first two elements are \
+             not a range the file declared"
+        );
+
+        // One element: there is no upper bound to read at all.
+        let one = read_v(&short_var_file(&ShortVar {
+            values: &[100, -3],
+            unsigned: true,
+            valid_range: Some(vec![0]),
+            scale: Some(1.0),
+            ..Default::default()
+        }));
+        assert_eq!(one.values, vec![Some(100.0), Some(65533.0)]);
+    }
+
+    /// A value that unpacks to NaN or ±inf is missing, not a measurement.
+    ///
+    /// Two ways in, and both are real. A packed variable can carry coefficients
+    /// that overflow the arithmetic — the values here are deliberately absurd,
+    /// but nothing in the format prevents them and `raw * scale + offset` has no
+    /// other guard. And a genuine `float` variable (GLM's `flash_lat`) can hold
+    /// NaN on disk directly, where CF's fill machinery never sees it because no
+    /// `_FillValue` was declared.
+    ///
+    /// Publishing either is worse than dropping it: `rasterize` sizes bolts by
+    /// `energy.log10()` and positions them by lat/lon, so a NaN propagates into
+    /// the projection instead of announcing itself.
+    #[test]
+    fn non_finite_unpacked_values_are_missing_not_published() {
+        // 100 * inf == inf, and 0 * inf == NaN — both non-finite, by different
+        // routes through the same expression.
+        let overflowed = read_v(&short_var_file(&ShortVar {
+            values: &[100, 0],
+            unsigned: true,
+            scale: Some(f32::INFINITY),
+            ..Default::default()
+        }));
+        assert_eq!(
+            overflowed.values,
+            vec![None, None],
+            "a value that unpacked to inf/NaN must not reach a caller as a number"
+        );
+
+        // The offset is the other half of the same expression.
+        let offset_nan = read_v(&short_var_file(&ShortVar {
+            values: &[100],
+            unsigned: true,
+            scale: Some(1.0),
+            offset: Some(f32::NAN),
+            ..Default::default()
+        }));
+        assert_eq!(offset_nan.values, vec![None]);
+
+        // Unpacked `float` storage, where there is no arithmetic to blame.
+        let raw = read_v(&float_var_file(
+            &[1.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+            Some("degrees_north"),
+        ));
+        assert_eq!(raw.values, vec![Some(1.5), None, None, None]);
     }
 }
