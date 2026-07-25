@@ -25,8 +25,12 @@ futures = "=0.3.33"
 # GOES GLM granules. GLM L2 LCFA files are NetCDF4, i.e. plain HDF5 (every
 # netCDF variable is an HDF5 dataset in the root group), so `glm::h5` reads them
 # without a netCDF layer. Pure Rust; no `-sys` crate, unlike `netcdf`.
-# Do NOT enable `fast-deflate`: it selects `flate2/zlib-ng`, which is C and
-# breaks wasm32/iOS cross-compilation.
+# Defaults are deliberately ON here (`std`, `checksum`, `deflate`) and must not
+# be hoisted into `[workspace.dependencies]`: Cargo silently ignores a member's
+# `default-features = false` when the workspace entry leaves defaults on. GLM L2
+# LCFA granules are deflate-compressed, so dropping `deflate` takes the lightning
+# overlay dark. Do NOT enable `fast-deflate` either: it selects `flate2/zlib-ng`,
+# which is C and breaks wasm32/iOS cross-compilation.
 hdf5-pure = "=0.24.0"
 log = { workspace = true }
 # `json` only, NOT `default`: reqwest's `default-tls` aliases `rustls` with
@@ -47,7 +51,12 @@ tiny-skia = "=0.12.0"
 tokio = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
-# Drives the `#[ignore]`d live-NOMADS checks.
+# Drives the `#[ignore]`d live-network checks (IEM and the S3 buckets).
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
+# Deliberately empty. `libsqlite3-sys` was pinned here with `features =
+# ["bundled"]` because proj-sys (grib -> proj) needs SQLite3 headers the NDK
+# sysroot does not ship; re-enabling grib's `gridpoints-proj` brings that back
+# and breaks the Android build. `openssl-sys` was pinned with `features =
+# ["vendored"]`; nothing links OpenSSL any more.

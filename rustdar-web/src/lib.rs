@@ -31,9 +31,25 @@
 //! **There is no Firefox/Chromium gap on `radar-render`.** An earlier claim of
 //! 899-962 ms in Firefox against 162 ms in Chromium (5.7x) does not reproduce.
 //! Both browsers against the same archived sweep (`KTLX20260725_191018_V06`,
-//! release, `IMAGE_SIZE` 1024) give median 188 ms Firefox / 191 ms Chromium, and
-//! across 12 interleaved pairs the median Firefox/Chromium ratio is 0.88 —
-//! Firefox is slightly faster, matching the isolated harness (233 vs 261 ms).
+//! 9 067 340 bytes, release, `IMAGE_SIZE` 1024):
+//!
+//! | browser                          |  n | min    | median |
+//! |----------------------------------|---:|-------:|-------:|
+//! | Chromium (headless, SwiftShader) | 23 | 174 ms | 191 ms |
+//! | Firefox (headed on Xvfb, NVIDIA) | 14 | 159 ms | 188 ms |
+//!
+//! The controlled comparison is the 12 runs that went as **interleaved pairs**,
+//! one browser straight after the other so both meet the same contention: there
+//! the median Firefox/Chromium ratio is **0.88**. Firefox is slightly faster,
+//! matching the isolated harness (233 vs 261 ms).
+//!
+//! The GPUs are deliberately unmatched — headless Firefox has no WebGL2 here, so
+//! Chromium ran headless on SwiftShader and Firefox headed on the host NVIDIA.
+//! That would wreck a comparison of frame *presentation* and does not touch this
+//! one: `radar-render` is the CPU-side rasterizer, it runs to a `Vec<u8>` on the
+//! main thread with no GPU call in the timed region. It also cuts *against* the
+//! conclusion — the browser on real hardware is the flattered one, and it is the
+//! one already winning.
 //!
 //! The original number was taken without pinning the input (the app loads
 //! whichever volume is newest, so two browsers started minutes apart rasterize

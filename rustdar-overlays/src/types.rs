@@ -68,9 +68,9 @@ pub fn parse_polygon_coords(coords: &serde_json::Value) -> Option<GeoPolygon> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HatchPattern {
     None,
-    /// Dotted, 135° (backslash).
+    /// Dotted, 45° (forward slash).
     Cig1,
-    /// Solid, 45° (forward slash).
+    /// Solid, 135° (backslash).
     Cig2,
     /// Solid, both directions (cross-hatch).
     Cig3,

@@ -90,7 +90,8 @@ pub enum OutlookProduct {
     Tornado,
     Wind,
     Hail,
-    /// Day 2/3 combined probabilistic product.
+    /// Combined probabilistic product. Day 3 and days 4-8 only; days 1-2 carry
+    /// the four hazard-specific products instead.
     Probabilistic,
 }
 

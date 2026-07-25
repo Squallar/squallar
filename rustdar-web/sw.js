@@ -72,8 +72,9 @@ const META_KEY = new URL("__rustdar_sw_meta__", ROOT).href;
 const PINS_KEY = new URL("__rustdar_sw_pins__", ROOT).href;
 
 /*
- * The app shell, relative to ROOT. 10,538,077 B (10.05 MiB) shipped: wasm
- * 10,161,914 B + glue 117,911 B.
+ * The app shell, relative to ROOT. Nine entries, but the wasm module
+ * (10,161,914 B) and its glue (117,911 B) are essentially all of it — index.html
+ * and the icons together are under 260 KB.
  *
  * `""` is the directory index (`new URL("", ROOT)` is ROOT) and is the single
  * entry every navigation is answered from. `index.html` is deliberately not
@@ -398,8 +399,9 @@ async function installShell(token, name = shellCacheName(token)) {
    * Against `ETag` + `max-age=600`, a first visit is bodyless 304s except the
    * wasm module in Chromium, which 304s and then issues a full GET: the page
    * instantiated it with `WebAssembly.instantiateStreaming`, which keeps the
-   * compiled result and no reusable body. Chromium therefore transfers the 10 MiB
-   * module twice on a first visit and never again; Firefox transfers it once.
+   * compiled result and no reusable body. Chromium therefore transfers the
+   * ~10 MB module twice on a first visit and never again; Firefox transfers it
+   * once.
    * Not fixable here. Caching the module opportunistically in the fetch handler
    * would remove the second transfer and break atomicity — the module would be
    * cached separately from the glue that has to match it.

@@ -12,6 +12,10 @@ use seq_fallback::*;
 /// rasterization loops, which would then drift. The closures need no changes —
 /// rayon requires `Fn + Send + Sync`, strictly stronger than the `FnMut` these
 /// want.
+///
+/// This is a cfg split, **not** a removal: rasterization is the hot path on
+/// desktop, and this fallback silently becoming the native arm is a large
+/// regression that no test catches.
 #[cfg(target_arch = "wasm32")]
 mod seq_fallback {
     /// Stands in for `rayon::prelude::ParallelSlice::par_iter`. Implemented on
@@ -179,8 +183,9 @@ impl RadialContext {
 /// 597 ms in Chromium against 29 ms and 37 ms for the same loop without them.
 /// Reducing it means changing the arithmetic every output pixel depends on, so
 /// it cannot be done bit-identically. Firefox's reported 5.7× `radar-render`
-/// penalty was a measurement artifact — re-measured on a pinned sweep it is
-/// 159 ms against Chromium's 174 ms; see `rustdar-web`'s crate docs.
+/// penalty was a measurement artifact — re-measured on a pinned sweep it is a
+/// 159 ms *minimum* against Chromium's 174 ms, a matched-pair median ratio of
+/// 0.88; see `rustdar-web`'s crate docs for the medians and the method.
 struct RenderBuffers {
     image: Vec<AtomicU32>,
     values: Vec<AtomicU32>,
@@ -467,9 +472,10 @@ fn build_velocity_grid(radials: &[Radial]) -> Option<VelocityGrid> {
     Some(VelocityGrid { vel_grid, azimuths_deg, gate_count, first_gate_range_km, gate_interval_km })
 }
 
-/// Drop isolated noise: a gate survives only if `MIN_COHERENT` of its 25
-/// neighbours (±2 azimuth × ±2 range) are non-NaN and share its sign. Noise has
-/// alternating signs; real rotation couplets are spatially coherent.
+/// Drop isolated noise: a gate survives only if at least `MIN_COHERENT` of its
+/// 24 neighbours (±2 azimuth × ±2 range, centre excluded) are non-NaN and share
+/// its sign. Noise has alternating signs; real rotation couplets are spatially
+/// coherent.
 fn filter_nrot_grid(nrot_grid: &[Vec<f64>], gate_count: usize) -> Vec<Vec<f64>> {
     const HALF: i32 = 2;
     const MIN_COHERENT: usize = 8;

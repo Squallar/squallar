@@ -1,14 +1,23 @@
 //! Process-wide TLS setup.
 //!
-//! **rustdar ships no root store, and must not start.** `reqwest` is pinned
-//! workspace-wide to `rustls-no-provider` — `rustls-platform-verifier` with no
-//! crypto provider compiled in and no bundled roots — so the OS decides trust at
-//! handshake time (Android `TrustManager`, Windows CryptoAPI, Apple
-//! `SecTrustEvaluateWithError`, system cert dirs elsewhere). `rustls-native-certs`,
-//! `rustls-tls-native-roots` and webpki-roots are all rejected for the same
-//! reason: they snapshot a root store into the binary, which bypasses Android's
-//! Network Security Config and OS distrust lists and gives the binary an
-//! expiration date.
+//! **rustdar does not own the trust decision, and must not start owning it.**
+//! `reqwest` is pinned workspace-wide to `rustls-no-provider` —
+//! `rustls-platform-verifier` with no crypto provider compiled in — so the *OS*
+//! evaluates the chain at handshake time: Android `TrustManager`, Windows
+//! CryptoAPI, Apple `SecTrustEvaluateWithError`, system cert dirs elsewhere.
+//!
+//! Two different alternatives get re-proposed, and they are wrong for two
+//! different reasons. Do not accept either.
+//!
+//! * `rustls-native-certs` / reqwest's `rustls-tls-native-roots` bundle nothing —
+//!   they *read* the platform store at startup and hand the certificates to
+//!   rustls, which then does the verifying. On Android that read is
+//!   `/system/etc/security/cacerts` directly, so it sees only the system store:
+//!   Network Security Config (`rustdar-android/android/network_security_config.xml`)
+//!   is not applied, and user-installed CAs, enterprise CAs and OS distrust
+//!   lists are all missed. Trust then diverges from what the device decided.
+//! * `webpki-roots` is the actual compiled-in snapshot, and that one gives the
+//!   binary an expiration date.
 //!
 //! Because no provider is compiled in, one has to be installed at runtime —
 //! [`init`]. Two ways to get that wrong:

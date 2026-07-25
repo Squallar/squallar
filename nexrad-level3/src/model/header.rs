@@ -24,9 +24,9 @@ pub struct MessageHeader {
 pub struct ProductDescriptionBlock {
     /// Block divider (always -1).
     pub block_divider: i16,
-    /// Radar site latitude in degrees (scaled from millionths).
+    /// Radar site latitude in degrees (scaled from thousandths).
     pub latitude: f64,
-    /// Radar site longitude in degrees (scaled from millionths).
+    /// Radar site longitude in degrees (scaled from thousandths).
     pub longitude: f64,
     /// Radar site height in feet above MSL.
     pub height: i16,

@@ -192,7 +192,7 @@
         // on a first visit — routine, nothing changed — and for a waiting worker
         // taking over after Reload. Only the second is worth acting on;
         // reloading on the first makes every first visit fetch, discard and
-        // refetch the 10 MiB module.
+        // refetch the ~10 MB module.
         navigator.serviceWorker.addEventListener("controllerchange", function () {
           if (!takeoverRequested || reloading) return;
           reloading = true;
@@ -243,7 +243,7 @@
         }
 
         // Waiting for `load` is not politeness. The worker's first act is to
-        // precache the shell, including the 10 MiB wasm module this page is
+        // precache the shell, including the ~10 MB wasm module this page is
         // already downloading; registering earlier races the two, registering
         // after means the module is in the HTTP cache and the worker's
         // revalidation comes back 304.
@@ -269,7 +269,7 @@
         // leaves the worker correctly concluding "nothing changed" forever.
         //
         // A console entry point rather than a button, deliberately: it costs a
-        // 10 MiB download, and the worker already warns to the console when the
+        // ~10 MB download, and the worker already warns to the console when the
         // probe has been failing.
         window.rustdarForceUpdate = function () {
           var worker = navigator.serviceWorker.controller;

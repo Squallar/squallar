@@ -57,7 +57,9 @@ impl<T> OverlayState<T> {
         self.data_generation = self.data_generation.wrapping_add(1);
     }
 
-    /// True when no data has been fetched at all.
+    /// True when nothing has been fetched yet, **or** `interval_secs` has
+    /// elapsed since the last fetch. The second branch is how every
+    /// auto-polling overlay refreshes.
     pub fn needs_refresh(&self, interval_secs: u64) -> bool {
         self.fetch_time
             .is_none_or(|t| t.elapsed().as_secs() >= interval_secs)
