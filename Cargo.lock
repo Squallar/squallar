@@ -4186,6 +4186,8 @@ dependencies = [
  "rustdar-egui",
  "rustdar-frontend",
  "rustdar-gps",
+ "rustdar-radar",
+ "serde_json",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

@@ -102,3 +102,19 @@ features = [
     "PositionOptions",
     "Coordinates",
 ]
+
+# For `tests/pwa_assets.rs`, which gates the static PWA assets shipped next to
+# the bundle: the manifest, the service worker, index.html and the icons.
+#
+# Target-gated for the same reason the block above is, but the other way round.
+# `rustdar-radar` pulls in reqwest and a TLS stack and has no wasm32 build, and
+# a plain `[dev-dependencies]` entry is built for every target when clippy or
+# cargo is run with `--all-targets`. Gating it keeps
+# `cargo clippy --target wasm32-unknown-unknown -p rustdar-web --all-targets`
+# working, and the test itself is `#![cfg(not(target_arch = "wasm32"))]`.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# The single declaration of every network origin rustdar reads from. The test
+# derives the hostnames the service worker must never cache from it, so the two
+# cannot drift apart.
+rustdar-radar = { workspace = true }
+serde_json = { workspace = true }
