@@ -133,11 +133,28 @@ impl SatelliteSelection {
     }
 }
 
+/// Shortest lightning aggregation window the UI allows, in seconds.
+///
+/// Do not lower this below ~45 s without revisiting the zero-object warning in
+/// `glm::fetch`. A window this short makes the S3 query cover a single hour
+/// prefix, and that prefix is empty until the hour's first granule publishes
+/// (27–30 s after the boundary, measured live). The warning treats "no objects
+/// at all" as a dead feed, so a minimum window below the publish latency would
+/// fire a spurious "feed dead" warning at the top of every hour. The 60 s floor
+/// leaves roughly 30 s of headroom.
+const GLM_MIN_TIME_WINDOW_SECS: f64 = 60.0;
+
+/// Longest lightning aggregation window the UI allows, in seconds (30 minutes).
+const GLM_MAX_TIME_WINDOW_SECS: f64 = 1800.0;
+
+const SECS_PER_MIN: f64 = 60.0;
+
 pub(crate) struct GlmHandler {
     pub state: OverlayState<Vec<Arc<GlmFlashItem>>>,
     pub enabled: bool,
     pub satellite: SatelliteSelection,
-    /// Time window in seconds (60–1800).
+    /// Time window in seconds, clamped to
+    /// [`GLM_MIN_TIME_WINDOW_SECS`]..=[`GLM_MAX_TIME_WINDOW_SECS`].
     pub time_window_secs: f64,
     /// Which data hierarchy levels to include.
     pub show_events: bool,
@@ -346,13 +363,14 @@ impl OverlayHandler for GlmHandler {
                 selected: self.satellite.as_str().into(),
             });
 
-            // Time window slider: 1–30 minutes (60–1800 seconds)
-            let mins = self.time_window_secs / 60.0;
+            // Time window slider, in minutes. The minimum is load-bearing —
+            // see GLM_MIN_TIME_WINDOW_SECS before lowering it.
+            let mins = self.time_window_secs / SECS_PER_MIN;
             items.push(ControlItem::Slider {
                 id: "time_window",
                 label: "Time Window".into(),
-                min: 1.0,
-                max: 30.0,
+                min: GLM_MIN_TIME_WINDOW_SECS / SECS_PER_MIN,
+                max: GLM_MAX_TIME_WINDOW_SECS / SECS_PER_MIN,
                 value: mins,
                 logarithmic: true,
                 format: "{:.0} min".into(),
@@ -430,7 +448,8 @@ impl OverlayHandler for GlmHandler {
             }
             "time_window" => {
                 if let ControlValue::Float(mins) = update.value {
-                    self.time_window_secs = (mins * 60.0).clamp(60.0, 1800.0);
+                    self.time_window_secs = (mins * SECS_PER_MIN)
+                        .clamp(GLM_MIN_TIME_WINDOW_SECS, GLM_MAX_TIME_WINDOW_SECS);
                     self.state.data_generation = self.state.data_generation.wrapping_add(1);
                     return ControlEffect::Fetch;
                 }
@@ -487,7 +506,8 @@ impl OverlayHandler for GlmHandler {
             self.satellite = SatelliteSelection::from_str(sat);
         }
         if let Some(tw) = value.get("time_window_secs").and_then(|v| v.as_f64()) {
-            self.time_window_secs = tw.clamp(60.0, 1800.0);
+            self.time_window_secs =
+                tw.clamp(GLM_MIN_TIME_WINDOW_SECS, GLM_MAX_TIME_WINDOW_SECS);
         }
         if let Some(v) = value.get("show_events").and_then(|v| v.as_bool()) {
             self.show_events = v;

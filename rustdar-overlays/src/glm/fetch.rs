@@ -142,7 +142,27 @@ async fn list_glm_files(
     let mut all_keys = Vec::new();
     let mut objects_seen = 0usize;
 
-    // Collect all (year, doy, hour) tuples we need to query
+    // Collect all (year, doy, hour) tuples we need to query.
+    //
+    // This emits a *single* prefix whenever `start` and `end` fall in the same
+    // UTC hour — with a 60 s window at 00:14:00, iteration 1 pushes `.../00/`,
+    // `t` then clamps to `end` and iteration 2 dedups and breaks. So the
+    // zero-object warning below can be looking at one young hour prefix, and
+    // does not get to assume a previous, already-populated hour is in the set.
+    //
+    // What keeps that from crying wolf at the top of every hour is a coupling
+    // worth stating explicitly:
+    //
+    //     GLM_MIN_TIME_WINDOW_SECS  >  S3 publish latency for the hour's first object
+    //
+    // The single-prefix case requires `now >= hour_start + window`, and the
+    // 00:00:00 granule of each hour lands 27–30 s after the boundary (measured
+    // across two consecutive live hours on noaa-goes19; worst case in that
+    // sample was 41 s for a mid-hour file). With the minimum window at 60 s the
+    // prefix always holds at least one object by the time a single-prefix query
+    // is possible, leaving ~30 s of headroom. Lowering the slider minimum below
+    // roughly 45 s would reintroduce a spurious "feed dead" warning once an
+    // hour; see GLM_MIN_TIME_WINDOW_SECS in render::handlers::glm.
     let mut prefixes = Vec::new();
     let mut t = start;
     loop {
