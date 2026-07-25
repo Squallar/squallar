@@ -76,6 +76,13 @@ pub struct LoopPlaybackState {
     pub site_lat: f64,
     /// Radar site longitude, captured at loop creation for rendering.
     pub site_lon: f64,
+    /// The (product, elevation) every frame's render state was produced for, or
+    /// `None` before the first dispatch. The user can change the pane's product
+    /// or elevation at any time, and both pieces of per-frame render state are
+    /// judgements about that selection — a `texture` shows that product, and a
+    /// `render_failed` flag means "this scan carries no sweep for that product".
+    /// When the selection moves, both are stale; see `retarget_renders`.
+    pub rendered_for: Option<(RadarProduct, f32)>,
 }
 
 /// Per-pane state: each pane independently selects a radar product,
@@ -137,6 +144,7 @@ impl LoopPlaybackState {
             last_advance: None,
             site_lat: 0.0,
             site_lon: 0.0,
+            rendered_for: None,
         }
     }
 
@@ -150,6 +158,7 @@ impl LoopPlaybackState {
             last_advance: None,
             site_lat,
             site_lon,
+            rendered_for: None,
         }
     }
 
@@ -176,6 +185,64 @@ impl LoopPlaybackState {
     /// True if playback was previously started (could be paused or playing).
     pub fn has_playback_started(&self) -> bool {
         matches!(self.phase, LoopPhase::Playing | LoopPhase::Paused)
+    }
+
+    /// Point the loop's frame renders at `product`/`elevation`, discarding every
+    /// frame's render state if that differs from what the frames were last rendered
+    /// for. Returns `true` if frames were invalidated.
+    ///
+    /// Both pieces of per-frame render state are only meaningful relative to a
+    /// selection: a `texture` depicts one product at one elevation, and a
+    /// `render_failed` flag records that the frame's scan carries no sweep for that
+    /// product. The user can change either at any time from the pane's combo boxes,
+    /// which write straight through to the pane. Without this, a frame retired under
+    /// a product that only some scans carry would stay blank forever after switching
+    /// to a product every scan has — and readiness counts retired frames as settled,
+    /// so playback would animate with permanent holes.
+    ///
+    /// In-flight renders are un-marked as well, which makes their results stale on
+    /// arrival (see the guard in `poll_loop_render_results`) so an old-product image
+    /// cannot land on a frame after the switch.
+    pub fn retarget_renders(&mut self, product: RadarProduct, elevation: f32) -> bool {
+        if let Some((p, e)) = self.rendered_for
+            && p == product
+            && (e - elevation).abs() <= 0.01
+        {
+            return false;
+        }
+
+        // Nothing to discard before the first dispatch — frames start blank.
+        let had_previous_target = self.rendered_for.is_some();
+        self.rendered_for = Some((product, elevation));
+        if !had_previous_target {
+            return false;
+        }
+
+        for frame in &mut self.frames {
+            frame.texture = None;
+            frame.render_in_flight = false;
+            frame.render_failed = false;
+        }
+        true
+    }
+
+    /// Drop textures outside the intended render set once more than `budget` frames
+    /// are textured, capping loop memory.
+    ///
+    /// Deliberately shares `render_set_indices` with the dispatcher and the readiness
+    /// check: an eviction rule that disagreed with the dispatcher could drop the
+    /// texture of a frame that is about to be re-rendered, churning renders forever.
+    pub fn evict_textures_outside_render_set(&mut self, budget: usize) {
+        let textured = self.frames.iter().filter(|f| f.texture.is_some()).count();
+        if textured <= budget {
+            return;
+        }
+        let keep = self.render_set_indices(budget);
+        for (idx, frame) in self.frames.iter_mut().enumerate() {
+            if !keep.contains(&idx) {
+                frame.texture = None;
+            }
+        }
     }
 
     /// Indices of the frames the renderer intends to have textured: up to `budget`
@@ -602,6 +669,112 @@ mod tests {
         state.frames[1].render_failed = true;
         state.frames[2].render_failed = true;
         assert!(state.render_set_settled(12, all_scans_available));
+    }
+
+    /// Nothing has been rendered before the first dispatch, so adopting a target is
+    /// not an invalidation.
+    #[test]
+    fn retarget_is_a_noop_before_the_first_dispatch() {
+        let mut state = loop_with_frames(3, 0);
+        assert_eq!(state.rendered_for, None);
+        assert!(!state.retarget_renders(RadarProduct::Reflectivity, 0.5));
+        assert_eq!(state.rendered_for, Some((RadarProduct::Reflectivity, 0.5)));
+    }
+
+    #[test]
+    fn retarget_keeps_frames_when_the_selection_is_unchanged() {
+        let ctx = egui::Context::default();
+        let mut state = loop_with_frames(3, 0);
+        state.retarget_renders(RadarProduct::Reflectivity, 0.5);
+        state.frames[0].texture = Some(dummy_texture(&ctx));
+
+        assert!(!state.retarget_renders(RadarProduct::Reflectivity, 0.5));
+        assert!(state.frames[0].texture.is_some());
+        // Elevation jitter below the tolerance used elsewhere is not a change.
+        assert!(!state.retarget_renders(RadarProduct::Reflectivity, 0.505));
+        assert!(state.frames[0].texture.is_some());
+    }
+
+    /// `texture` and `render_failed` are both judgements about one product at one
+    /// elevation, and the pane's combo boxes can change that at any time. A frame
+    /// retired under a product only some scans carry must come back when the user
+    /// switches to a product every scan carries — otherwise it stays blank forever
+    /// while readiness counts it as settled, and playback animates with holes.
+    #[test]
+    fn retarget_discards_frame_state_that_judged_the_old_product() {
+        let ctx = egui::Context::default();
+        let mut state = loop_with_frames(4, 0);
+        state.retarget_renders(RadarProduct::Velocity, 0.5);
+        state.frames[0].texture = Some(dummy_texture(&ctx));
+        // Retired because their scans carry no Velocity sweep. Readiness counts
+        // retired frames as settled (see `failed_frames_do_not_block_readiness`),
+        // so left alone these would animate as permanent holes under any product.
+        state.frames[1].render_failed = true;
+        state.frames[2].render_failed = true;
+        // Still rendering Velocity when the user switches away.
+        state.frames[3].render_in_flight = true;
+
+        assert!(state.retarget_renders(RadarProduct::Reflectivity, 0.5));
+        assert!(state.frames.iter().all(|f| f.texture.is_none()));
+        assert!(state.frames.iter().all(|f| !f.render_failed));
+        // In-flight renders are un-marked so their old-product results are rejected
+        // on arrival rather than painted onto a retargeted frame.
+        assert!(state.frames.iter().all(|f| !f.render_in_flight));
+
+        // And the loop must render the whole set again before it can be Ready.
+        assert!(!state.render_set_settled(12, all_scans_available));
+    }
+
+    #[test]
+    fn retarget_reacts_to_an_elevation_change() {
+        let ctx = egui::Context::default();
+        let mut state = loop_with_frames(3, 0);
+        state.retarget_renders(RadarProduct::Reflectivity, 0.5);
+        state.frames[0].texture = Some(dummy_texture(&ctx));
+
+        assert!(state.retarget_renders(RadarProduct::Reflectivity, 1.5));
+        assert!(state.frames[0].texture.is_none());
+        assert_eq!(state.rendered_for, Some((RadarProduct::Reflectivity, 1.5)));
+    }
+
+    /// Eviction must keep exactly the render set. A rule that disagreed with the
+    /// dispatcher would drop textures for frames about to be re-rendered.
+    #[test]
+    fn eviction_keeps_exactly_the_render_set() {
+        let ctx = egui::Context::default();
+        let mut state = loop_with_frames(10, 4);
+        for frame in &mut state.frames {
+            frame.texture = Some(dummy_texture(&ctx));
+        }
+
+        state.evict_textures_outside_render_set(3);
+
+        let textured: HashSet<usize> = state
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.texture.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            textured,
+            state.render_set_indices(3).into_iter().collect::<HashSet<_>>()
+        );
+        assert!(state.render_set_settled(3, all_scans_available));
+    }
+
+    #[test]
+    fn eviction_is_a_noop_within_budget() {
+        let ctx = egui::Context::default();
+        let mut state = loop_with_frames(10, 0);
+        // Textured, but deliberately far from the playhead and outside the render set.
+        state.frames[5].texture = Some(dummy_texture(&ctx));
+        state.frames[6].texture = Some(dummy_texture(&ctx));
+
+        state.evict_textures_outside_render_set(3);
+
+        assert!(state.frames[5].texture.is_some());
+        assert!(state.frames[6].texture.is_some());
     }
 
     /// Frames outside the budgeted window around the playhead are never rendered,

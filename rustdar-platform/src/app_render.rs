@@ -71,6 +71,7 @@ impl super::App {
         self.advance_loop_playback();
         self.dispatch_pane_renders();
         self.dispatch_loop_renders();
+        self.update_loop_readiness();
 
         (screen_descriptor, gui_action)
     }
@@ -713,6 +714,14 @@ impl super::App {
             let Some(frame) = ls.frames.iter_mut().find(|f| f.timestamp == rr.timestamp) else {
                 continue;
             };
+            // Only a frame still marked in flight is expecting a result. Anything else
+            // means this render was invalidated while it ran — the pane retargeted to a
+            // different product/elevation, the frame list was rebuilt, graphics state was
+            // cleared, or a sibling already supplied the texture. Applying it would paint
+            // a stale image that the dispatcher then considers done.
+            if !frame.render_in_flight {
+                continue;
+            }
             frame.render_in_flight = false;
 
             // Empty image_data means the render failed (no matching sweep). Mark the
@@ -772,27 +781,37 @@ impl super::App {
                     });
                 }
             }
+        }
+    }
 
-            // Mark panes as render_ready once their initial batch completes
-            for pidx in 0..self.gui.pane_count() {
-                let loop_mgr = &self.loop_mgr;
-                let pane_downloads_done = loop_mgr.is_pane_done(pidx);
-                let Some(p) = self.gui.pane_mut(pidx) else { continue };
-                let pls = &mut p.loop_state;
-                if !pls.is_active() || pls.is_render_ready() || pls.frames.is_empty() {
-                    continue;
-                }
-                let any_rendered = pls.frames.iter().any(|f| f.texture.is_some());
-                // Every frame we intend to render must be settled — not merely "nothing
-                // in flight this instant". The render budget is shared with static pane
-                // renders, so part of the batch can be starved and not yet spawned; that
-                // must keep the loop out of Ready instead of animating blank frames.
-                let batch_settled = pls.render_set_settled(MAX_LOOP_RENDER_BUDGET, |f| {
-                    loop_mgr.is_cached(&f.timestamp)
-                });
-                if any_rendered && batch_settled && pane_downloads_done {
-                    pls.phase = rustdar_egui::pane::LoopPhase::Ready;
-                }
+    /// Promote loops from `Rendering` to `Ready` once every frame they intend to
+    /// render has settled, then start playback for the panes that are ready.
+    ///
+    /// Runs once per frame after dispatch rather than inside the render-response
+    /// drain. Several things that settle a batch never produce a render response —
+    /// a frame retired as unrenderable, a texture cloned from a sibling pane, the
+    /// render set shifting as the playhead moves — so a loop can be complete with
+    /// nothing left to receive. A second pane whose frames are all satisfied by
+    /// sibling clones spawns no renders at all, and would never be promoted.
+    pub(super) fn update_loop_readiness(&mut self) {
+        for pidx in 0..self.gui.pane_count() {
+            let loop_mgr = &self.loop_mgr;
+            let pane_downloads_done = loop_mgr.is_pane_done(pidx);
+            let Some(p) = self.gui.pane_mut(pidx) else { continue };
+            let pls = &mut p.loop_state;
+            if !pls.is_active() || pls.is_render_ready() || pls.frames.is_empty() {
+                continue;
+            }
+            let any_rendered = pls.frames.iter().any(|f| f.texture.is_some());
+            // Every frame we intend to render must be settled — not merely "nothing
+            // in flight this instant". The render budget is shared with static pane
+            // renders, so part of the batch can be starved and not yet spawned; that
+            // must keep the loop out of Ready instead of animating blank frames.
+            let batch_settled = pls.render_set_settled(MAX_LOOP_RENDER_BUDGET, |f| {
+                loop_mgr.is_cached(&f.timestamp)
+            });
+            if any_rendered && batch_settled && pane_downloads_done {
+                pls.phase = rustdar_egui::pane::LoopPhase::Ready;
             }
         }
 
@@ -884,39 +903,31 @@ impl super::App {
     /// Dispatch renders for loop frames around the playhead that have
     /// downloaded scan data but no rendered texture yet.
     fn dispatch_loop_renders(&mut self) {
-        // Evict textures from frames far from the playhead to cap memory usage.
-        // Keep at most MAX_LOOP_RENDER_BUDGET textured frames per pane.
         for pane_idx in 0..self.gui.pane_count() {
             let Some(pane) = self.gui.pane_mut(pane_idx) else {
                 continue;
             };
+            let product = pane.selected_product;
+            let elevation = pane.selected_elevation;
             let ls = &mut pane.loop_state;
-            if !ls.is_active() {
+            if !ls.is_active() || ls.frames.is_empty() {
                 continue;
             }
-            let num_frames = ls.frames.len();
-            if num_frames == 0 {
+
+            // The pane's product/elevation combo boxes write straight through, so
+            // pick the change up here: every texture depicts the old product and
+            // every render_failed flag judged the old product. Invalidating leaves
+            // nothing to evict.
+            if ls.retarget_renders(product, elevation) {
+                log::debug!(
+                    "Loop: pane {} retargeted to {:?} at {:.1}°, re-rendering all frames",
+                    pane_idx, product, elevation
+                );
                 continue;
             }
-            let textured_count = ls.frames.iter().filter(|f| f.texture.is_some()).count();
-            if textured_count <= MAX_LOOP_RENDER_BUDGET {
-                continue;
-            }
-            // Build a list of textured frame indices sorted by distance from playhead
-            let current = ls.current_frame;
-            let mut textured_indices: Vec<usize> = ls.frames.iter().enumerate()
-                .filter(|(_, f)| f.texture.is_some())
-                .map(|(i, _)| i)
-                .collect();
-            textured_indices.sort_by_key(|&i| {
-                let fwd = (i + num_frames - current) % num_frames;
-                let bwd = (current + num_frames - i) % num_frames;
-                fwd.min(bwd)
-            });
-            // Drop textures beyond the budget (farthest from playhead)
-            for &idx in textured_indices.iter().skip(MAX_LOOP_RENDER_BUDGET) {
-                ls.frames[idx].texture = None;
-            }
+
+            // Evict textures from frames far from the playhead to cap memory usage.
+            ls.evict_textures_outside_render_set(MAX_LOOP_RENDER_BUDGET);
         }
 
         // Collect all (pane_idx, frame_idx, timestamp, product, elevation, lat, lon) that need rendering
