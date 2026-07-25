@@ -131,7 +131,7 @@ reqwest = { version = "=0.13.4", default-features = false, features = [
 # `ring` supplies the crypto for the above. It is the workspace's one remaining C
 # dependency and that is the intended end state: a single `cc` invocation, no cmake
 # and no bindgen. `default-features = false` keeps rustls' own `aws-lc-rs` default off.
-rustls = { version = "=0.23.38", default-features = false, features = ["ring", "std"] }
+rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std"] }
 
 # NOTE for future dependency-bump PRs: `openssl-sys` used to be pinned here with
 # `features = ["vendored"]` for Android, whose NDK sysroot has no usable system
