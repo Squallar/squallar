@@ -54,7 +54,7 @@ nexrad-model = "=1.0.0-rc.2"
 # -- shared third-party --
 chrono = "=0.4.45"
 flate2 = "=1.1.9"
-jni = "=0.21.1"
+jni = "=0.22.4"
 # egui 0.35 requires ^0.4.33.
 log = "=0.4.33"
 ndk-context = "=0.1.1"
