@@ -14,10 +14,52 @@ use super::{
     GlmSatellite, LevelFailure,
 };
 
+/// One downloaded granule: what it parsed to, and when it is from.
+///
+/// The second field is the whole point of this type existing. While an entry was
+/// a bare `Vec<GlmFlash>`, the only clock a granule had was its own contents, so
+/// "downloaded, and legitimately empty" and "not downloaded" were the same thing
+/// to any predicate over that vector. A quiet granule therefore failed every
+/// retention test, was evicted the instant it was cached, and was re-listed and
+/// re-downloaded on the next poll — forever, for as long as the listing offered
+/// it. An empty parse is a normal, fully-successful result (see
+/// `a_level_with_no_records_is_empty_not_broken`), and is the *usual* result when
+/// the user has selected only one level or the sky is quiet, so that was a whole
+/// listing window re-fetched every 20 s poll.
+#[derive(Clone)]
+struct CachedGranule {
+    /// Records parsed at the levels the user selected. Empty is normal.
+    flashes: Vec<GlmFlash>,
+    /// The newest instant this granule can vouch for, and the only thing
+    /// [`GlmCache::evict_before`] reads.
+    ///
+    /// Derived once, at insert, by [`CachedGranule::new`]. Kept as a field
+    /// rather than recomputed so that eviction asks one question of one value
+    /// and cannot be re-tempted into a predicate that an empty collection
+    /// answers "no" to.
+    newest: NaiveDateTime,
+}
+
+impl CachedGranule {
+    /// Age a granule against its newest flash, falling back to the start time
+    /// its own S3 key encodes when it holds no flashes to be aged by.
+    ///
+    /// The two sources agree by construction and are not alternatives to each
+    /// other: a granule spans ~20 s from the start time it is keyed by, so its
+    /// records all land at or after `granule_start`, and taking the max is the
+    /// same answer the old `any(|f| f.time >= cutoff)` gave for every granule
+    /// that had any records at all. The fallback is what is new, and it applies
+    /// to exactly the case that had no answer before.
+    fn new(granule_start: NaiveDateTime, flashes: Vec<GlmFlash>) -> Self {
+        let newest = flashes.iter().map(|f| f.time).max().unwrap_or(granule_start);
+        CachedGranule { flashes, newest }
+    }
+}
+
 /// Cached GLM file data keyed by S3 object key.
 #[derive(Default, Clone)]
 pub struct GlmCache {
-    entries: HashMap<String, Vec<GlmFlash>>,
+    entries: HashMap<String, CachedGranule>,
 }
 
 impl GlmCache {
@@ -34,26 +76,77 @@ impl GlmCache {
     /// the user asked for. The same instant is passed to `flashes_in_window`, so
     /// the two stages agree on the boundary and a flash cannot be kept by one
     /// and dropped by the other.
+    ///
+    /// The comparison is against [`CachedGranule::newest`] rather than a search
+    /// over the flashes, which is what lets a granule that parsed to *no*
+    /// records age out on the same schedule as a populated one instead of being
+    /// evicted on the spot. `>= cutoff` on a stored maximum is exactly `any(|f|
+    /// f.time >= cutoff)` whenever there is a flash to find, so nothing about
+    /// the populated cases moved.
     pub fn evict_before(&mut self, cutoff: NaiveDateTime) {
-        self.entries.retain(|_key, flashes| {
-            flashes.iter().any(|f| f.time >= cutoff)
-        });
+        self.entries.retain(|_key, granule| granule.newest >= cutoff);
     }
 
     /// Iterate over all cached flashes.
     pub fn all_flashes(&self) -> impl Iterator<Item = &GlmFlash> {
-        self.entries.values().flatten()
+        self.entries.values().flat_map(|g| &g.flashes)
     }
 
     /// Check whether a key is already cached.
+    ///
+    /// True for a granule that parsed to nothing, which is the point:
+    /// [`plan_downloads`] reads this to decide what to fetch, and a granule we
+    /// have already downloaded and found empty must not be fetched again.
     pub fn contains_key(&self, key: &str) -> bool {
         self.entries.contains_key(key)
     }
 
     /// Insert parsed flashes for a given S3 key.
-    pub fn insert(&mut self, key: String, flashes: Vec<GlmFlash>) {
-        self.entries.insert(key, flashes);
+    ///
+    /// `granule_start` is the instant the granule is keyed by — see
+    /// [`granule_start_of`]. It is required rather than inferred because a
+    /// granule with no records has nothing to infer it from, and that case is
+    /// precisely the one this cache used to get wrong.
+    pub fn insert(&mut self, key: String, granule_start: NaiveDateTime, flashes: Vec<GlmFlash>) {
+        self.entries.insert(key, CachedGranule::new(granule_start, flashes));
     }
+}
+
+/// Fold this poll's parsed granules into the cache.
+///
+/// Every granule that parsed is cached, and a granule that parsed to *no*
+/// records is cached exactly like one that parsed to a thousand: it was
+/// downloaded, and the answer was "nothing here". Filtering the empties out here
+/// looks like an obvious saving and is the same bug from the other end —
+/// [`plan_downloads`] would re-queue every one of them on the next poll.
+///
+/// Extracted for the reason [`plan_downloads`] and [`build_outcome`] were:
+/// inline in the async fetch this loop sat behind a network round trip, where no
+/// test could tell "cached the empties" from "skipped the empties".
+fn cache_granules(
+    cache: &mut GlmCache,
+    entries: Vec<(String, Vec<GlmFlash>)>,
+    now: NaiveDateTime,
+) {
+    for (key, flashes) in entries {
+        let granule_start = granule_start_of(&key, now);
+        cache.insert(key, granule_start, flashes);
+    }
+}
+
+/// The instant a granule is aged against, taken from the S3 key it was listed
+/// under.
+///
+/// GLM keys carry their own start time and [`list_glm_files`] admits a key only
+/// when that time parses *and* falls in the window, so the fallback is
+/// unreachable for anything a poll actually listed. It exists, and is `now`
+/// rather than anything that ages out immediately, because the failure mode of
+/// an undatable granule must be "expires one window from now" and never "is
+/// re-downloaded every poll" — which is the defect this whole shape exists to
+/// remove. Pinning it to `now` also keeps it from being the other bug: an entry
+/// that is never evicted grows the cache without bound.
+fn granule_start_of(key: &str, now: NaiveDateTime) -> NaiveDateTime {
+    parse_filename_start_time(key).unwrap_or(now)
 }
 
 /// Fetch GLM data from one or both satellites for the given time window.
@@ -127,9 +220,7 @@ pub async fn fetch_glm_flashes(
     }
 
     // Insert new data into cache
-    for (key, flashes) in std::mem::take(&mut acc.entries) {
-        cache.insert(key, flashes);
-    }
+    cache_granules(cache, std::mem::take(&mut acc.entries), now);
 
     // Return all cached flashes within the window
     let filtered = flashes_in_window(cache, cutoff, now);
@@ -1635,9 +1726,11 @@ mod tests {
     fn poll_plan_separates_window_size_from_work_to_do() {
         let keys: Vec<String> = (0..12).map(|i| format!("k{i}.nc")).collect();
 
+        // Deliberately empty granules: this is the steady state a quiet sky
+        // produces, and it must read as "already downloaded".
         let mut cache = GlmCache::default();
         for key in keys.iter().take(9) {
-            cache.insert(key.clone(), Vec::new());
+            cache.insert(key.clone(), t0(), Vec::new());
         }
 
         let mut tally = PollTally::default();
@@ -1657,7 +1750,7 @@ mod tests {
         // which is what a 20 s poll against 20 s granules looks like.
         let mut cache = GlmCache::default();
         for key in keys.iter().take(11) {
-            cache.insert(key.clone(), Vec::new());
+            cache.insert(key.clone(), t0(), Vec::new());
         }
         let mut tally = PollTally::default();
         let new_keys = plan_downloads(&keys, &cache, &mut tally);
@@ -1688,6 +1781,18 @@ mod tests {
             .unwrap()
     }
 
+    /// A wall clock that shares no instant with any fixture S3 key.
+    ///
+    /// Load-bearing, and the hard way round: `t0()` is 2026-07-24, which is day
+    /// of year *205* — the same day the `..._s2026205....nc` fixture keys encode.
+    /// Handing `granule_start_of` a `now` of `t0()` therefore made "dated from
+    /// the key" and "dated from the wall clock" produce the identical answer,
+    /// and a mutant that ignored the key outright survived the whole suite. Any
+    /// fixture that feeds a `now` alongside a real key must use this.
+    fn wall_clock_unlike_keys() -> NaiveDateTime {
+        t0() + TimeDelta::hours(3) + TimeDelta::minutes(7)
+    }
+
     /// A flash whose only interesting property is when it happened.
     fn flash_at(time: NaiveDateTime) -> GlmFlash {
         GlmFlash {
@@ -1708,6 +1813,25 @@ mod tests {
         keys
     }
 
+    /// Cache a granule that parsed to at least one record, dating it the way S3
+    /// does: a granule is keyed by the *start* of the ~20 s span it covers, so
+    /// its records land at or after that instant.
+    ///
+    /// Deriving the start from the fixture's own contents keeps every populated
+    /// fixture internally consistent — a start later than the granule's own
+    /// flashes would model a file that cannot exist, and would let retention
+    /// hang on a timestamp the contents contradict. A granule with *no* records
+    /// has no start of its own to derive, which is the entire defect, so those
+    /// fixtures state one explicitly through [`GlmCache::insert`].
+    fn cache_granule(cache: &mut GlmCache, key: &str, flashes: Vec<GlmFlash>) {
+        let start = flashes
+            .iter()
+            .map(|f| f.time)
+            .min()
+            .expect("use GlmCache::insert directly for a granule that parsed to nothing");
+        cache.insert(key.to_string(), start, flashes);
+    }
+
     /// `cutoff` is *inclusive*. A granule whose newest flash lands exactly on
     /// the window edge is inside the window the user asked for, and evicting it
     /// throws away a file we would immediately re-download.
@@ -1720,13 +1844,15 @@ mod tests {
     fn evict_before_keeps_a_granule_sitting_exactly_on_the_cutoff() {
         let cutoff = t0();
         let mut cache = GlmCache::default();
-        cache.insert("exactly_at.nc".into(), vec![flash_at(cutoff)]);
-        cache.insert(
-            "one_tick_before.nc".into(),
+        cache_granule(&mut cache, "exactly_at.nc", vec![flash_at(cutoff)]);
+        cache_granule(
+            &mut cache,
+            "one_tick_before.nc",
             vec![flash_at(cutoff - TimeDelta::milliseconds(1))],
         );
-        cache.insert(
-            "one_tick_after.nc".into(),
+        cache_granule(
+            &mut cache,
+            "one_tick_after.nc",
             vec![flash_at(cutoff + TimeDelta::milliseconds(1))],
         );
 
@@ -1751,7 +1877,7 @@ mod tests {
         let fresh = cutoff + TimeDelta::seconds(10);
 
         let mut cache = GlmCache::default();
-        cache.insert("straddles.nc".into(), vec![flash_at(stale), flash_at(fresh)]);
+        cache_granule(&mut cache, "straddles.nc", vec![flash_at(stale), flash_at(fresh)]);
 
         cache.evict_before(cutoff);
 
@@ -1784,8 +1910,9 @@ mod tests {
         // Everything is stale.
         let mut cache = GlmCache::default();
         for i in 1..=3 {
-            cache.insert(
-                format!("old{i}.nc"),
+            cache_granule(
+                &mut cache,
+                &format!("old{i}.nc"),
                 vec![flash_at(t0() - TimeDelta::minutes(i))],
             );
         }
@@ -1798,8 +1925,9 @@ mod tests {
         // Nothing is stale.
         let mut cache = GlmCache::default();
         for i in 1..=3 {
-            cache.insert(
-                format!("new{i}.nc"),
+            cache_granule(
+                &mut cache,
+                &format!("new{i}.nc"),
                 vec![flash_at(t0() + TimeDelta::minutes(i))],
             );
         }
@@ -1812,29 +1940,198 @@ mod tests {
         );
     }
 
-    /// A granule that parsed to *zero* records is evicted on the very next
-    /// poll, because "no flash is in window" and "no flash at all" are the same
-    /// predicate here.
+    /// A granule that parsed to *zero* records is aged by its own start time,
+    /// not thrown away for having nothing to argue with.
     ///
-    /// Pinned as an observation, not an endorsement: an empty parse is a normal
-    /// condition (see `a_level_with_no_records_is_empty_not_broken`), so the
-    /// consequence is that every quiet granule is re-downloaded on every poll
-    /// for as long as it stays in the listing window. That costs bandwidth, not
-    /// correctness — the flash count is right either way — which is why it is
-    /// recorded here rather than changed under a coverage commit. A fix belongs
-    /// in `plan_downloads`/the cache representation (remembering "downloaded and
-    /// empty" as distinct from "not downloaded"), and it will land by making
-    /// this assertion fail.
+    /// History, because the inversion here is the point. This test previously
+    /// asserted the opposite — that an empty granule is evicted on the very next
+    /// poll, because "no flash is in window" and "no flash at all" were the same
+    /// predicate to `any(|f| f.time >= cutoff)`. It was pinned as an
+    /// observation, not an endorsement: an empty parse is a normal condition
+    /// (see `a_level_with_no_records_is_empty_not_broken`) and the usual one
+    /// when the user has selected a single level or the sky is quiet, so the
+    /// consequence was that every quiet granule was re-downloaded on every poll
+    /// for as long as it stayed in the listing window — at the 30-minute maximum
+    /// window, roughly 90 granules × ~250 KB ≈ 22 MB re-fetched every 20 s.
+    /// That cost bandwidth, not correctness, which is why the round that found
+    /// it recorded it here instead of changing it under a coverage commit.
+    ///
+    /// The note said a fix belonged in the cache representation, remembering
+    /// "downloaded and empty" as distinct from "not downloaded", and that it
+    /// would land by making the old assertion fail. [`CachedGranule::newest`] is
+    /// that fix, and this is that assertion, inverted.
     #[test]
-    fn evict_before_drops_a_granule_that_parsed_to_no_records() {
+    fn evict_before_ages_an_empty_granule_by_its_own_start_time() {
+        let start = t0();
         let mut cache = GlmCache::default();
-        cache.insert("quiet.nc".into(), Vec::new());
-        cache.evict_before(t0() - TimeDelta::days(365));
+        cache.insert("quiet.nc".into(), start, Vec::new());
 
+        // A cutoff far behind the granule: an empty granule inside the window
+        // is downloaded data, and must survive exactly like a populated one.
+        cache.evict_before(start - TimeDelta::days(365));
+        assert!(
+            cache.contains_key("quiet.nc"),
+            "an empty parse is a successful download; evicting it here is what \
+             re-fetched the whole listing window every poll"
+        );
+
+        // ...and it is not immortal either: past its own start it goes, on the
+        // same schedule a populated granule would.
+        cache.evict_before(start + TimeDelta::milliseconds(1));
         assert!(
             !cache.contains_key("quiet.nc"),
-            "known wart: an empty granule cannot prove it is in window, so it is \
-             evicted and re-downloaded next poll"
+            "an empty granule that never expires is the opposite bug: a cache \
+             that grows without bound"
+        );
+    }
+
+    /// An empty granule ages out on *exactly* the same schedule as a populated
+    /// one — the fix must not buy retention by making quiet granules special.
+    ///
+    /// Both granules below cover the same instant. Whatever cutoff keeps or
+    /// drops one has to keep or drop the other, at every tick, or "downloaded
+    /// and empty" has merely traded one wrong lifetime for another.
+    #[test]
+    fn an_empty_granule_ages_out_on_the_same_schedule_as_a_populated_one() {
+        let start = t0();
+        let tick = TimeDelta::milliseconds(1);
+
+        for cutoff in [start - tick, start, start + tick] {
+            let mut cache = GlmCache::default();
+            cache.insert("quiet.nc".into(), start, Vec::new());
+            cache_granule(&mut cache, "busy.nc", vec![flash_at(start)]);
+
+            cache.evict_before(cutoff);
+
+            assert_eq!(
+                cache.contains_key("quiet.nc"),
+                cache.contains_key("busy.nc"),
+                "at cutoff {cutoff} the empty granule and the populated one that \
+                 covers the same instant disagreed: quiet={}, busy={}",
+                cache.contains_key("quiet.nc"),
+                cache.contains_key("busy.nc"),
+            );
+        }
+    }
+
+    /// The defect end to end: cache → evict → plan. A granule downloaded once
+    /// and found empty must not be re-queued while it is still in window, and
+    /// must be gone once it is not.
+    ///
+    /// This is the assertion that would catch a regression to re-fetching.
+    /// `evict_before` and `plan_downloads` are the two halves — eviction is what
+    /// used to drop the entry and `plan_downloads` is what then re-queued it, so
+    /// pinning either alone leaves the loop reachable.
+    #[test]
+    fn a_quiet_granule_is_downloaded_once_not_once_per_poll() {
+        // A real GLM key, so the granule is dated the way production dates it.
+        let key = "GLM-L2-LCFA/2026/205/12/\
+                   OR_GLM-L2-LCFA_G19_s20262051200000_e20262051200200_c20262051200214.nc";
+        let start = parse_filename_start_time(key).expect("fixture key must be datable");
+        let listing = vec![key.to_string()];
+
+        // Poll 1: nothing cached, so it is queued and downloaded. It parses to
+        // no records — a quiet 20 s over the ocean.
+        let mut cache = GlmCache::default();
+        let mut tally = PollTally::default();
+        assert_eq!(
+            plan_downloads(&listing, &cache, &mut tally).len(),
+            1,
+            "an uncached granule must be downloaded once"
+        );
+        // `now` is deliberately nowhere near the key's own time, so a granule
+        // dated from the wall clock instead of from its key is visible here
+        // rather than hidden behind two fixtures that happen to coincide.
+        cache.insert(key.to_string(), granule_start_of(key, wall_clock_unlike_keys()), Vec::new());
+
+        // Polls 2..n, still inside the window: the listing keeps offering it and
+        // the cache must keep answering "already have it". Every one of these
+        // was a ~250 KB re-download.
+        for poll in 1..=5 {
+            let cutoff = start - TimeDelta::minutes(30) + TimeDelta::seconds(20 * poll);
+            cache.evict_before(cutoff);
+            let mut tally = PollTally::default();
+            assert!(
+                plan_downloads(&listing, &cache, &mut tally).is_empty(),
+                "poll {poll}: a granule already downloaded and found empty was \
+                 re-queued — this is the every-poll re-fetch, back"
+            );
+            assert_eq!(tally.in_window, 1, "it is still in the window, just not new work");
+        }
+
+        // Past the cutoff it leaves, like any other granule. It is out of the
+        // listing by then too, so nothing re-queues it.
+        cache.evict_before(start + TimeDelta::milliseconds(1));
+        assert!(
+            !cache.contains_key(key),
+            "a stale empty granule must be evicted, or the cache never shrinks"
+        );
+    }
+
+    /// Every granule a poll parsed reaches the cache, empty ones included.
+    ///
+    /// Dropping the empties here is the same defect from the other end: they
+    /// would never be cached, so `plan_downloads` would re-queue them on the
+    /// next poll and every poll after it, exactly as if eviction had removed
+    /// them.
+    #[test]
+    fn cache_granules_keeps_the_empty_ones_too() {
+        let busy = "GLM-L2-LCFA/2026/205/12/\
+                    OR_GLM-L2-LCFA_G19_s20262051200000_e20262051200200_c20262051200214.nc";
+        let quiet = "GLM-L2-LCFA/2026/205/12/\
+                     OR_GLM-L2-LCFA_G19_s20262051200200_e20262051200400_c20262051200414.nc";
+        // Not `t0()`: see `wall_clock_unlike_keys`. A `now` that coincides with
+        // the keys' own times hides a granule dated from the clock instead.
+        let now = wall_clock_unlike_keys();
+
+        let mut cache = GlmCache::default();
+        cache_granules(
+            &mut cache,
+            vec![
+                (busy.to_string(), vec![flash_at(t0())]),
+                (quiet.to_string(), Vec::new()),
+            ],
+            now,
+        );
+
+        assert!(cache.contains_key(busy));
+        assert!(
+            cache.contains_key(quiet),
+            "a granule that downloaded and parsed to nothing is still downloaded"
+        );
+
+        // And it is dated from its key, not from `now` — so it ages by when the
+        // data is from, the same as the populated one beside it.
+        cache.evict_before(
+            parse_filename_start_time(quiet).expect("fixture key") + TimeDelta::milliseconds(1),
+        );
+        assert!(!cache.contains_key(quiet), "the empty granule ages by its own start time");
+    }
+
+    /// The fallback in [`granule_start_of`] is unreachable for anything a poll
+    /// listed, and must stay bounded rather than become either bug it replaced.
+    #[test]
+    fn granule_start_comes_from_the_key_and_falls_back_to_now() {
+        // Not `t0()`: see `wall_clock_unlike_keys`. With the two equal, "read the
+        // key" and "ignore the key" are indistinguishable and this test proves
+        // nothing.
+        let now = wall_clock_unlike_keys();
+        let key = "GLM-L2-LCFA/2026/205/12/\
+                   OR_GLM-L2-LCFA_G19_s20262051200000_e20262051200200_c20262051200214.nc";
+        assert_eq!(
+            granule_start_of(key, now),
+            chrono::NaiveDate::from_yo_opt(2026, 205)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap(),
+            "a listed key carries its own start time; `now` must not be reached"
+        );
+
+        assert_eq!(
+            granule_start_of("not-a-glm-key.nc", now),
+            now,
+            "an undatable granule expires one window from now — never instantly \
+             (re-fetched every poll) and never not at all (unbounded cache)"
         );
     }
 
@@ -1851,8 +2148,9 @@ mod tests {
         let tick = TimeDelta::milliseconds(1);
 
         let mut cache = GlmCache::default();
-        cache.insert(
-            "spread.nc".into(),
+        cache_granule(
+            &mut cache,
+            "spread.nc",
             vec![
                 flash_at(cutoff - tick),
                 flash_at(cutoff),
@@ -1888,7 +2186,7 @@ mod tests {
         let ahead = t0() + TimeDelta::minutes(3);
 
         let mut cache = GlmCache::default();
-        cache.insert("granule.nc".into(), vec![flash_at(t0()), flash_at(ahead)]);
+        cache_granule(&mut cache, "granule.nc", vec![flash_at(t0()), flash_at(ahead)]);
 
         // The clock steps back: `now` lands between the two cached flashes.
         let now = t0() + TimeDelta::minutes(1);
