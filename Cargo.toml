@@ -50,7 +50,7 @@ walkers = "=0.56.0"
 # and `SystemTime::now()` both *panic* on wasm32-unknown-unknown, and they
 # compile fine, so nothing catches this until the page runs.
 web-time = "=1.1.0"
-wgpu = "=29.0.4"
+wgpu = "=30.0.0"
 winit = "=0.30.13"
 
 # -- NEXRAD decoding --
