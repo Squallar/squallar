@@ -45,11 +45,11 @@
 //!
 //! | browser                          |  n | min    | median |
 //! |----------------------------------|---:|-------:|-------:|
-//! | Chromium (headless, SwiftShader) | 19 | 174 ms | 191 ms |
-//! | Firefox (headed on Xvfb, NVIDIA) | 10 | 159 ms | 183 ms |
+//! | Chromium (headless, SwiftShader) | 23 | 174 ms | 191 ms |
+//! | Firefox (headed on Xvfb, NVIDIA) | 14 | 159 ms | 188 ms |
 //!
-//! Run as interleaved pairs, so each comparison shares a contention window, the
-//! median Firefox/Chromium ratio is **0.88**. Firefox is slightly *faster* —
+//! Run as 12 interleaved pairs, so each comparison shares a contention window,
+//! the median Firefox/Chromium ratio is **0.88**. Firefox is slightly *faster* —
 //! which is what the isolated harness had already found (233 ms against 261 ms)
 //! and was disbelieved because the assembled app seemed to say otherwise. It
 //! does not. There is no Firefox-specific penalty in this bundle to fix.
