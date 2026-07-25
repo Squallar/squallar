@@ -660,7 +660,7 @@ impl super::App {
     /// that need the same frame (matching product+elevation+timestamp).
     fn poll_loop_render_results(&mut self) {
         let ctx = self.state.as_ref().unwrap().egui_renderer.context();
-        while let Ok(rr) = self.channels.loop_render_receiver.try_recv() {
+        while let Ok(mut rr) = self.channels.loop_render_receiver.try_recv() {
             let origin_pane = rr.pane_idx;
 
             let Some(pane) = self.gui.pane_mut(origin_pane) else {
@@ -687,17 +687,25 @@ impl super::App {
             };
             frame.render_in_flight = false;
 
-            // Empty image_data means the render failed (no matching sweep). Mark the
-            // frame so the dispatcher stops retrying it and readiness stops waiting on it.
-            if rr.image_data.is_empty() {
+            // No image means the render failed (no matching sweep). Mark the frame so
+            // the dispatcher stops retrying it and readiness stops waiting on it.
+            //
+            // `take`n rather than moved out of `rr`: the sibling broadcast below hands
+            // the *whole response* to `broadcast_sweep`, and that is deliberate — the
+            // receiver's half of the sweep comparison must be resolved from the
+            // receiver's own scan, never filled in from a loose `f32` at the call site.
+            // Partially moving `rr` here would make `&rr` unavailable there and invite
+            // exactly that inlining.
+            let Some(color_image) = rr.image.take() else {
                 frame.render_failed = true;
                 continue;
-            }
+            };
 
             self.texture_counter += 1;
-            let color_image =
-                egui::ColorImage::from_rgba_unmultiplied([IMAGE_SIZE, IMAGE_SIZE], &rr.image_data);
             let texture_name = format!("loop_frame_{}", self.texture_counter);
+            // `color_image` is the only copy of this frame's pixels on this thread —
+            // the renderer's RGBA buffer was dropped on the worker — and it is moved
+            // into the texture manager here rather than copied.
             let texture = ctx.load_texture(
                 texture_name,
                 color_image,
@@ -1679,14 +1687,19 @@ mod loop_dispatch_tests {
         let koun = loop_on(&ctx, "KOUN", &[]);
 
         // A KTLX pane finished a render of the 0.5° sweep for this timestamp.
+        //
+        // `image` is `Some`, not `None`: a response carrying no image is retired as
+        // `render_failed` before the broadcast loop is reached, so a `None` fixture
+        // would put `broadcast_sweep` in a state the response path never hands it.
+        // The pixels themselves are irrelevant here — this seam reads only `snapped`,
+        // `timestamp` and `target` — so a 1x1 image stands in for a full frame.
         let rr = crate::channels::LoopRenderResponse {
             pane_idx: 0,
             timestamp: ts(0),
             target: target("KOUN", 0.5),
             snapped: 0.5,
-            image_data: vec![0; 4],
+            image: Some(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
             max_range_km: 100.0,
-            value_data: Vec::new(),
         };
 
         let sweep = broadcast_sweep(&mgr, &koun, &rr);

@@ -7,7 +7,7 @@ use crate::channels::{ScanResponse, ScanData, Level3Response, OverlayRenderRespo
 use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
 use crate::constants::MAX_CONCURRENT_RENDERS;
 use crate::render_dispatch::RenderGuard;
-use rustdar_radar::types::RadarProduct;
+use rustdar_radar::types::{IMAGE_SIZE, RadarProduct};
 
 /// Parameters for a background overlay rasterization request.
 pub(super) struct OverlayRenderRequest {
@@ -670,32 +670,42 @@ impl super::App {
             .name("loop-render".into())
             .spawn(move || {
             let _guard = guard;
-            match rustdar_radar::render::render_radar_to_image(&scan_data, snapped, product, lat, lon)
-            {
-                Some((image, range, values)) => {
-                    let _ = sender.send(crate::channels::LoopRenderResponse {
-                        pane_idx,
-                        timestamp,
-                        target,
-                        snapped,
-                        image_data: image,
-                        max_range_km: range,
-                        value_data: values,
-                    });
+            // A failed render still has to be sent, so render_in_flight gets cleared.
+            let rendered =
+                rustdar_radar::render::render_radar_to_image(&scan_data, snapped, product, lat, lon);
+            let (image, max_range_km) = match rendered {
+                Some((rgba, range, _values)) => {
+                    // Convert here rather than on the main thread, and let `rgba` drop
+                    // at the end of this scope so only one of the two buffers is ever
+                    // in the channel. `values` is dropped outright: loop frames store
+                    // an empty value grid, so shipping 16 MiB of hover data per frame
+                    // only to discard it on arrival is pure waste.
+                    match loop_frame_image(&rgba) {
+                        Some(image) => (Some(image), range),
+                        None => {
+                            log::error!(
+                                "Loop render for pane {pane_idx} produced {} bytes, expected {}",
+                                rgba.len(),
+                                IMAGE_SIZE * IMAGE_SIZE * 4
+                            );
+                            (None, 0.0)
+                        }
+                    }
                 }
-                None => {
-                    // Send an empty response so render_in_flight gets cleared
-                    let _ = sender.send(crate::channels::LoopRenderResponse {
-                        pane_idx,
-                        timestamp,
-                        target,
-                        snapped,
-                        image_data: Vec::new(),
-                        max_range_km: 0.0,
-                        value_data: Vec::new(),
-                    });
-                }
-            }
+                None => (None, 0.0),
+            };
+            // One send site for both outcomes, so `snapped` cannot come to differ
+            // between them. It describes the render that was dispatched — the sweep
+            // `render_params` resolved — and stays true of a response carrying no
+            // image, which is what makes it safe to set outside the match.
+            let _ = sender.send(crate::channels::LoopRenderResponse {
+                pane_idx,
+                timestamp,
+                target,
+                snapped,
+                image,
+                max_range_km,
+            });
             super::notify_redraw(&window);
         }).expect("failed to spawn loop-render thread");
         true
@@ -733,6 +743,23 @@ impl super::App {
             self.handle_enable_loop(pane_idx, lookback_secs);
         }
     }
+}
+
+/// Convert a renderer RGBA buffer into egui's pixel layout, or `None` if it is not
+/// the `IMAGE_SIZE²` image the renderer is supposed to produce.
+///
+/// The length check is not defensive padding. `ColorImage::from_rgba_unmultiplied`
+/// asserts on a mismatch, and this now runs on the render worker rather than the
+/// main thread: a panic there kills only that thread, so no `LoopRenderResponse`
+/// would ever arrive, `render_in_flight` would never clear, and the frame would stay
+/// blank and be skipped for the life of the loop. Returning `None` routes a
+/// malformed buffer down the same path as "no matching sweep", which the dispatcher
+/// already knows how to retire.
+fn loop_frame_image(rgba: &[u8]) -> Option<egui::ColorImage> {
+    if rgba.len() != IMAGE_SIZE * IMAGE_SIZE * 4 {
+        return None;
+    }
+    Some(egui::ColorImage::from_rgba_unmultiplied([IMAGE_SIZE, IMAGE_SIZE], rgba))
 }
 
 /// The scan listing a freshly-built loop needs, and the site it must be requested
@@ -1104,5 +1131,43 @@ mod loop_pane_tests {
             panes[0].loop_state.frames.get(panes[0].loop_state.current_frame).is_some(),
             "and resolve to one, which is what the pane renders through"
         );
+    }
+}
+
+#[cfg(test)]
+mod loop_frame_image_tests {
+    use super::*;
+
+    /// A well-formed buffer converts, and keeps the dimensions the rest of the loop
+    /// machinery assumes.
+    #[test]
+    fn a_full_size_buffer_converts() {
+        let rgba = vec![0u8; IMAGE_SIZE * IMAGE_SIZE * 4];
+        let image = loop_frame_image(&rgba).expect("a correctly sized buffer must convert");
+        assert_eq!(image.size, [IMAGE_SIZE, IMAGE_SIZE]);
+        assert_eq!(image.pixels.len(), IMAGE_SIZE * IMAGE_SIZE);
+    }
+
+    /// The reason the guard exists: on the worker thread the assert inside
+    /// `from_rgba_unmultiplied` would kill the thread silently, no response would be
+    /// sent, and the frame would sit `render_in_flight` forever.
+    #[test]
+    fn a_malformed_buffer_is_rejected_rather_than_panicking() {
+        let short = IMAGE_SIZE * IMAGE_SIZE * 4 - 4;
+        let long = IMAGE_SIZE * IMAGE_SIZE * 4 + 4;
+        assert!(loop_frame_image(&vec![0u8; short]).is_none(), "short buffer");
+        assert!(loop_frame_image(&vec![0u8; long]).is_none(), "long buffer");
+        assert!(loop_frame_image(&[]).is_none(), "empty buffer");
+    }
+
+    /// Pixel values survive the conversion — a frame that converted to transparent
+    /// black would render as nothing and look exactly like a frame that never rendered.
+    #[test]
+    fn pixel_values_survive_the_conversion() {
+        let mut rgba = vec![0u8; IMAGE_SIZE * IMAGE_SIZE * 4];
+        rgba[0..4].copy_from_slice(&[10, 20, 30, 255]);
+        let image = loop_frame_image(&rgba).unwrap();
+        assert_eq!(image.pixels[0], egui::Color32::from_rgba_unmultiplied(10, 20, 30, 255));
+        assert_ne!(image.pixels[0], egui::Color32::TRANSPARENT);
     }
 }

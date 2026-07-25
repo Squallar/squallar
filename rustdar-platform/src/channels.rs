@@ -109,10 +109,25 @@ pub struct LoopRenderResponse {
     /// of the scan as well as the selection, so a pane taking this image via the
     /// sibling broadcast has to check it against what *its* scan resolves the same
     /// selection to — see `LoopPlaybackState::frame_accepting_broadcast`.
+    ///
+    /// Set unconditionally, on the failure path too: it describes the render that was
+    /// *dispatched*, and there is only one send site to set it from.
     pub snapped: f32,
-    pub image_data: Vec<u8>,
+    /// The finished image, already in egui's pixel layout, or `None` when the scan
+    /// carried no matching sweep and there is nothing to show.
+    ///
+    /// Deliberately not the renderer's `Vec<u8>`. Converting on the render thread
+    /// means the RGBA buffer and its `Color32` copy — `IMAGE_SIZE² × 4` bytes each,
+    /// 16 MiB apiece at 2048² — never coexist on the main thread, which then holds
+    /// exactly one buffer and moves it straight into `Context::load_texture`. The
+    /// worker's own transient pair is bounded by `MAX_CONCURRENT_RENDERS` and is off
+    /// the frame-pacing path.
+    ///
+    /// `None` replaces the previous empty-`Vec` sentinel; the meaning is unchanged.
+    /// The receiver `take`s it rather than moving it out, so the rest of the response
+    /// stays borrowable for `broadcast_sweep`.
+    pub image: Option<egui::ColorImage>,
     pub max_range_km: f64,
-    pub value_data: Vec<f32>,
 }
 
 /// Centralized channel hub for all async communication between the App and
