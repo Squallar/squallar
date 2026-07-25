@@ -17,13 +17,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 
-# Single source of truth for every version pin shared by more than one member,
-# plus the whole UI stack. egui, egui-wgpu, egui-winit, walkers and wgpu MUST be
-# bumped together: walkers pins an exact egui minor, and egui-wgpu/egui-winit
-# only ever match their own egui. Keeping them here makes that lockstep visible
-# and stops a member from drifting onto a second copy of egui.
 [workspace.dependencies]
-# -- internal crates --
 nexrad-level3 = { path = "nexrad-level3" }
 rustdar-egui = { path = "rustdar-egui" }
 rustdar-frontend = { path = "rustdar-frontend" }
@@ -32,174 +26,42 @@ rustdar-platform = { path = "rustdar-platform" }
 rustdar-radar = { path = "rustdar-radar" }
 rustdar-units = { path = "rustdar-units" }
 rustdar-web = { path = "rustdar-web" }
-# Defaults off here because Cargo silently ignores a member's
-# `default-features = false` when the workspace entry leaves defaults on, and
-# rustdar-egui declares exactly that. rustdar-platform and rustdar-android opt
-# the serial reader back in with `features = ["serial"]` — including on Android,
-# where serialport does build and is in the shipped aarch64 graph.
 rustdar-gps = { path = "rustdar-gps", default-features = false }
 
-# -- UI stack (bump as a unit) --
 egui = "=0.35.0"
-# Defaults off, and it has to be off *here*: egui-wgpu's own `default` set is
-# `["fragile-send-sync-non-atomic-wasm", "macos-window-resize-jitter-fix",
-# "wgpu/default", "wgpu/webgl"]`, and `wgpu/default` contains `webgpu`. Left on,
-# egui-wgpu re-enables the WebGPU backend behind our back no matter what the
-# `wgpu` entry below says, because features are additive across the graph.
-# rustdar-frontend re-spells the two egui-wgpu features that are actually wanted
-# and drives wgpu's backend set directly instead. See rustdar-frontend/Cargo.toml.
 egui-wgpu = { version = "=0.35.0", default-features = false }
-# Defaults off: rustdar-platform picks its own backend/clipboard feature set.
 egui-winit = { version = "=0.35.0", default-features = false }
 walkers = "=0.56.0"
-# Drop-in for `std::time`: re-exports the std types verbatim on native, and
-# backs them with `performance.now()` / `Date.now()` on wasm. `Instant::now()`
-# and `SystemTime::now()` both *panic* on wasm32-unknown-unknown, and they
-# compile fine, so nothing catches this until the page runs.
 web-time = "=1.1.0"
-# PINNED TO 29 ON PURPOSE. Do not let this follow the latest major.
-#
-# `egui-wgpu 0.35.0` declares `wgpu = "29.0"` -- i.e. `^29`, which **excludes
-# 30**. A `=30.0.0` pin here therefore never upgraded anything: cargo simply
-# resolved a *second* wgpu, and the graph carried 29.0.4 (egui-wgpu's) next to
-# 30.0.0 (ours). Nothing caught it because every `wgpu::` path in this workspace
-# is reached through `egui_wgpu::wgpu`, the re-export -- so the 30.0.0 copy had
-# no users, compiled fine, and changed no API. Native builds stayed green.
-#
-# What it broke was the web bundle. Both copies compile wgpu's *vendored*
-# WebGPU bindings (`src/backend/webgpu/webgpu_sys`, used because web-sys' own
-# WebGPU is unstable-gated), so wasm32 got two definitions of every WebGPU
-# string enum and `wasm-bindgen` aborted with
-# `duplicate string enums: GpuFilterMode`.
-#
-# Turning defaults off on a wgpu *30* entry does clear the duplicate-enum error
-# -- the 30 copy then stops compiling `webgpu_sys` -- so it looks like a fix. It
-# is not one. The graph still carries two wgpus, the bundle still ships the
-# WebGPU surface out of egui-wgpu's copy, and, worst of the three, the backend
-# features on that entry configure **the copy nobody runs**: the app reaches wgpu
-# through `egui_wgpu::wgpu`, which is the 29 copy, so `webgl`/`vulkan`/`dx12` set
-# on a 30 entry are inert. Since egui-wgpu requires `^29`, wgpu 30 can never
-# become the sole copy, and there is no way to control the backend set at all
-# while it is in the graph. Reverting is not the tidier of two fixes; it is the
-# only one that leaves the features reachable.
-#
-# Moving to wgpu 30 means moving egui-wgpu, which means moving egui, which
-# `walkers` pins to an exact minor -- the whole "bump as a unit" note above.
-# Until walkers ships against a newer egui, 29 is the only resolvable choice.
-# `.github/renovate.json` now groups all five and caps wgpu at `<30` so this
-# cannot land as a lone PR again; lift that cap in the same PR that moves egui.
-#
-# Defaults must stay off *at the workspace level* -- the same trap `grib`,
-# `hdf5-pure` and `nexrad-data` carry notes about: cargo silently ignores a
-# member's `default-features = false` when the workspace entry leaves defaults
-# on. `default` here is
-# `["std", "parking_lot", "dx12", "metal", "gles", "vulkan", "wgsl", "webgpu"]`,
-# and `webgpu` is the one feature this project must never enable: the browser
-# target is WebGL2, Firefox has no stable WebGPU, and `rustdar_frontend::app`
-# pins `Backends::GL` on wasm32 so both browsers run the same tested path.
-# rustdar-frontend spells out the per-target backend set instead.
 wgpu = { version = "=29.0.4", default-features = false }
 winit = "=0.30.13"
 
-# -- NEXRAD decoding --
-#
-# Decoding only. `default-features = false` drops the `aws` feature, which is
-# `["reqwest", "xml", "once_cell"]` and pins `reqwest/rustls` -- an alias for
-# `__rustls-aws-lc-rs`. That was the workspace's sole enabler of the `aws-lc-rs`
-# feature on rustls and so the sole reason `aws-lc-sys`, a second C crypto
-# stack, was in the graph at all. `rustdar_radar::archive` reimplements the
-# narrow surface that feature provided (`Identifier`, `list_files`,
-# `download_file`) over the platform-verifier client in `rustdar_radar::tls`.
-#
-# `nexrad-model` is the other half of the crate's own default set and is what
-# `volume::File::scan()` is gated on, so it has to be spelled out here. `volume`
-# itself is ungated.
-#
-# Defaults must stay off *at the workspace level*: Cargo silently ignores a
-# member's `default-features = false` when the workspace entry leaves defaults
-# on, and `default` here would pull `aws` straight back in.
 nexrad-data = { version = "=1.0.0-rc.7", default-features = false, features = [
     "nexrad-model",
 ] }
 nexrad-decode = "=1.0.0-rc.3"
 nexrad-model = "=1.0.0-rc.2"
 
-# -- shared third-party --
 chrono = "=0.4.45"
 flate2 = "=1.1.9"
-# MUST move in lockstep with `rustls-platform-verifier` in rustdar-android.
-#
-# `rustdar-android` hands a JNI `Env` and `JObject` to
-# `rustls_platform_verifier::android::init_with_env`, so it must use the *same*
-# jni crate the verifier does -- those are different types across a major bump,
-# and cargo will happily link both. rpv 0.6.x wants `jni ^0.21`; rpv 0.7.x wants
-# `^0.22`. Bumping one alone makes cargo resolve *two* verifier copies: reqwest's
-# clients read one, `init_with_env` initialises the other, and **Android TLS
-# init silently does nothing** -- invisible until an on-device HTTPS request
-# fails, which is exactly the api.weather.gov path the Network Security Config
-# in `rustdar-android/android/` exists to keep working.
-#
-# STATUS (2026-07-25): the pair has moved together to jni 0.22.4 + rpv 0.7.0.
-# `reqwest 0.13.4` accepts rpv `>=0.6.0, <0.8.0`, so this resolves to a single
-# verifier and a single jni; `cargo tree -i jni` is the check. The lockstep rule
-# is unchanged and still load-bearing -- a split is silent at build time, so
-# neither half may be bumped on its own.
-#
-# 0.22 is an API break, not just a version bump: `JavaVM::from_raw` is infallible,
-# `JObject::from_raw` takes an `&Env`, `attach_current_thread` hands out `&mut Env`
-# inside a closure, `GlobalRef` is now `Global<T>`, and method names/signatures
-# need `jni_str!`/`jni_sig!`. All of that is `#[cfg(target_os = "android")]`, so a
-# host `cargo check` compiles none of it -- see the android job in CI.
+
 jni = "=0.22.4"
-# egui 0.35 requires ^0.4.33.
 log = "=0.4.33"
-# `ndk-context` used to be pinned here for rustdar-android(-theme). No member
-# depends on it any more: android-activity 0.6 puts `Activity.getApplication()`
-# in it rather than the Activity, so the JNI bridges that need Activity-only
-# methods stash the real one from `android_main` instead. It is still in
-# Cargo.lock, as android-activity's own transitive dependency.
+
 pollster = "=1.0.1"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 thiserror = "=2.0.19"
 tokio = "=1.53.1"
-# One TLS backend for the whole workspace, pinned here rather than per member so
-# no crate can quietly opt back into a different one.
-#
-# `rustls-no-provider` is `rustls-platform-verifier` *without* a bundled crypto
-# provider: the OS decides trust at runtime (Android TrustManager, Windows CryptoAPI,
-# Apple SecTrustEvaluateWithError, OpenSSL cert dirs on other unixes). Nothing here
-# ships a root store, so the binary has no expiration date and picks up OS distrust
-# lists, enterprise CAs and user CAs for free.
-#
-# Two things about this line are load-bearing and easy to undo by accident:
-#
-#   * `rustls-no-provider` exists ONLY in reqwest 0.13. reqwest 0.12 has no
-#     `rustls-platform-verifier` support at all -- its `rustls-tls` means
-#     `rustls-tls-webpki-roots`, i.e. a bundled root bundle. Do not downgrade.
-#   * The feature list re-spells reqwest's `default` set MINUS `default-tls`.
-#     `default-tls` is an alias for `rustls` (= platform verifier + aws-lc-rs),
-#     so enabling `default` anywhere drags `aws-lc-sys` back in. Members must add
-#     only what they additionally need (e.g. `json`) and never `default`.
-#
-# The provider is installed at runtime instead: see `rustdar_radar::tls`.
+
 reqwest = { version = "=0.13.4", default-features = false, features = [
     "rustls-no-provider",
     "charset",
     "http2",
     "system-proxy",
 ] }
-# `ring` supplies the crypto for the above. It is the workspace's one remaining C
-# dependency and that is the intended end state: a single `cc` invocation, no cmake
-# and no bindgen. `default-features = false` keeps rustls' own `aws-lc-rs` default off.
-rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std"] }
 
-# NOTE for future dependency-bump PRs: `openssl-sys` used to be pinned here with
-# `features = ["vendored"]` for Android, whose NDK sysroot has no usable system
-# copy. **Nothing links OpenSSL any more** -- TLS is rustls +
-# rustls-platform-verifier via the `reqwest` pin above -- so re-adding it would
-# reintroduce a C/C++ build that cannot cross-compile to wasm32 or iOS, for no
-# consumer. Same for a `reqwest` downgrade to 0.12.x: see the note above.
+rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std"] }
 
 [profile.dev]
 # Only optimize dependencies (not workspace code) to preserve debuggability
