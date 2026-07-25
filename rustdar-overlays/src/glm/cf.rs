@@ -67,10 +67,56 @@
 //!    see [`super::fetch::normalize_longitude`] for what the West range means
 //!    for consumers.
 
-use netcdf::AttributeValue;
-use netcdf::types::{IntType, NcVariableType};
+use std::collections::BTreeMap;
 
-/// A variable read out of a NetCDF file with CF packing applied.
+/// Backend-neutral storage type of a variable.
+///
+/// The only distinction CF unpacking needs is whether the bits on disk are a
+/// *signed* integer (and how wide), because that is the only case `_Unsigned`
+/// reinterprets. Natively unsigned storage and floats are already correct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VarType {
+    /// Signed integer storage, width in bytes (1, 2, 4 or 8).
+    SignedInt(u8),
+    /// Natively unsigned integer storage — never reinterpreted.
+    UnsignedInt,
+    /// IEEE float storage — never reinterpreted.
+    Float,
+}
+
+/// Backend-neutral attribute value.
+///
+/// Every numeric attribute is widened to `f64` on the way in, scalar and
+/// vector alike, because CF only ever compares them numerically. Keeping the
+/// original width would mean re-deriving this distinction in each backend.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CfAttr {
+    /// A numeric attribute, scalar or vector.
+    Nums(Vec<f64>),
+    /// A text attribute.
+    Str(String),
+}
+
+/// A variable's raw storage values plus the metadata CF unpacking needs.
+///
+/// This is the seam between "get the bytes off disk" (backend-specific) and
+/// "decide what they mean" (this module). Steps 1 and 2 of the rules above —
+/// read in the declared type, then bit-reinterpret through `_Unsigned` — are
+/// the backend's job, because only the backend knows how to ask its library
+/// for a specific width. Everything after that is [`unpack`].
+pub(crate) struct RawVar {
+    /// Raw stored values, already bit-reinterpreted through `_Unsigned`.
+    pub raw: Vec<f64>,
+    /// The declared storage type, needed to reinterpret `_FillValue` and
+    /// `valid_range` into the same domain as `raw`.
+    pub vartype: VarType,
+    /// Whether `_Unsigned` applied. Carried separately because `raw` has
+    /// already been reinterpreted but the *attributes* have not.
+    pub unsigned: bool,
+    pub attrs: BTreeMap<String, CfAttr>,
+}
+
+/// A variable read out of a GLM file with CF packing applied.
 pub(crate) struct UnpackedVar {
     /// One entry per element. `None` means the file marked the element
     /// missing, via `_FillValue` or `valid_range`.
@@ -80,38 +126,24 @@ pub(crate) struct UnpackedVar {
     pub units: Option<String>,
 }
 
-/// Read a 1-D variable and apply CF packing conventions.
+/// Apply CF packing conventions to a variable's raw storage values.
 ///
-/// Returns `Ok(None)` when the variable is absent from the file. That is a
-/// different condition from "present but all-missing" and callers must not
-/// conflate them: the L2 LCFA product has no `event_area` variable at all,
-/// which is a property of the product, not of the granule.
-pub(crate) fn read_unpacked(
-    file: &netcdf::File,
-    name: &str,
-) -> Result<Option<UnpackedVar>, String> {
-    let Some(var) = file.variable(name) else {
-        return Ok(None);
-    };
-
-    // Step 2: does this variable use the signed-storage/unsigned-meaning
-    // convention? Decided before any values are read, because the answer
-    // changes how they must be read.
-    let unsigned = attr(&var, "_Unsigned").is_some_and(|v| attr_is_true(&v));
-    let vartype = var.vartype();
-
-    // Step 1 + 2: raw storage values, bit-reinterpreted through `_Unsigned`.
-    let raw = read_raw(&var, name, vartype.clone(), unsigned)?;
+/// Steps 3 to 5 of the rules at the top of this module; the backend has
+/// already done steps 1 and 2 and handed over a [`RawVar`].
+pub(crate) fn unpack(var: &RawVar, name: &str) -> UnpackedVar {
+    let RawVar { raw, vartype, unsigned, attrs } = var;
+    let (vartype, unsigned) = (*vartype, *unsigned);
+    let attr = |n: &str| attrs.get(n).cloned();
 
     // Step 3: missing-value markers, normalized into the same raw domain.
-    let fill = attr(&var, "_FillValue")
+    let fill = attr("_FillValue")
         .and_then(|v| attr_as_f64(&v))
-        .map(|v| reinterpret_unsigned(v, &vartype, unsigned));
+        .map(|v| reinterpret_unsigned(v, vartype, unsigned));
     // CF also defines `valid_min`/`valid_max` as an alternative spelling. GLM
     // uses neither, so they are deliberately unsupported rather than
     // speculatively implemented; a reader porting this must add them if the
     // product it targets uses them.
-    let valid_range = attr(&var, "valid_range").and_then(|v| {
+    let valid_range = attr("valid_range").and_then(|v| {
         let bounds = attr_as_f64_vec(&v);
         if bounds.len() != 2 {
             // Ignoring a malformed range is the safe direction — it only means
@@ -123,8 +155,8 @@ pub(crate) fn read_unpacked(
             );
             return None;
         }
-        let lo = reinterpret_unsigned(bounds[0], &vartype, unsigned);
-        let hi = reinterpret_unsigned(bounds[1], &vartype, unsigned);
+        let lo = reinterpret_unsigned(bounds[0], vartype, unsigned);
+        let hi = reinterpret_unsigned(bounds[1], vartype, unsigned);
         if lo > hi {
             // An inverted range would mark *every* value missing, silently
             // emptying the variable. Refuse it instead.
@@ -138,16 +170,17 @@ pub(crate) fn read_unpacked(
     });
 
     // Step 4: packing coefficients. Absent means identity, never zero.
-    let scale = attr(&var, "scale_factor").and_then(|v| attr_as_f64(&v));
-    let offset = attr(&var, "add_offset").and_then(|v| attr_as_f64(&v));
+    let scale = attr("scale_factor").and_then(|v| attr_as_f64(&v));
+    let offset = attr("add_offset").and_then(|v| attr_as_f64(&v));
 
-    let units = attr(&var, "units").and_then(|v| match v {
-        AttributeValue::Str(s) => Some(s),
-        _ => None,
+    let units = attr("units").and_then(|v| match v {
+        CfAttr::Str(s) => Some(s),
+        CfAttr::Nums(_) => None,
     });
 
     let values = raw
-        .into_iter()
+        .iter()
+        .copied()
         .map(|r| {
             if fill.is_some_and(|f| r == f) {
                 return None;
@@ -168,91 +201,36 @@ pub(crate) fn read_unpacked(
         })
         .collect();
 
-    Ok(Some(UnpackedVar { values, units }))
+    UnpackedVar { values, units }
 }
 
-/// Read a variable's values into the raw (pre-scale) domain as `f64`,
-/// reinterpreting the bits through `_Unsigned` where required.
-///
-/// `f64` holds every `u32`/`i32` and every 16-bit value exactly, so nothing is
-/// lost for the integer types CF packing actually uses.
-fn read_raw(
-    var: &netcdf::Variable,
-    name: &str,
-    vartype: NcVariableType,
-    unsigned: bool,
-) -> Result<Vec<f64>, String> {
-    let err = |e: netcdf::Error| format!("Failed to read {name}: {e}");
-
-    // Only *signed* integer storage needs the reinterpretation. Natively
-    // unsigned storage (NC_USHORT and friends) and floats are already correct,
-    // and netCDF-C widens them to f64 without loss of meaning.
-    if unsigned && let NcVariableType::Int(int_type) = vartype {
-        return Ok(match int_type {
-            IntType::I8 => var
-                .get_values::<i8, _>(..)
-                .map_err(err)?
-                .into_iter()
-                .map(|v| f64::from(v as u8))
-                .collect(),
-            IntType::I16 => var
-                .get_values::<i16, _>(..)
-                .map_err(err)?
-                .into_iter()
-                .map(|v| f64::from(v as u16))
-                .collect(),
-            IntType::I32 => var
-                .get_values::<i32, _>(..)
-                .map_err(err)?
-                .into_iter()
-                .map(|v| f64::from(v as u32))
-                .collect(),
-            IntType::I64 => var
-                .get_values::<i64, _>(..)
-                .map_err(err)?
-                .into_iter()
-                .map(|v| v as u64 as f64)
-                .collect(),
-            // Already unsigned on disk: nothing to reinterpret.
-            _ => var.get_values::<f64, _>(..).map_err(err)?,
-        });
-    }
-
-    var.get_values::<f64, _>(..).map_err(err)
-}
-
-/// Bit-reinterpret a raw value that netCDF reported through its *signed*
-/// declared type but which the file means as unsigned.
+/// Bit-reinterpret a raw value that the file stores in a *signed* type but
+/// means as unsigned.
 ///
 /// This is the step that fixes `-13585 → 51951`. Note it is a bit
 /// reinterpretation, not `abs()` and not a negation.
-fn reinterpret_unsigned(raw: f64, vartype: &NcVariableType, unsigned: bool) -> f64 {
+pub(crate) fn reinterpret_unsigned(raw: f64, vartype: VarType, unsigned: bool) -> f64 {
     if !unsigned {
         return raw;
     }
-    let NcVariableType::Int(int_type) = vartype else {
+    let VarType::SignedInt(bytes) = vartype else {
+        // Natively unsigned storage and floats are already correct.
         return raw;
     };
     let bits = raw as i64;
-    match int_type {
-        IntType::I8 => f64::from(bits as i8 as u8),
-        IntType::I16 => f64::from(bits as i16 as u16),
-        IntType::I32 => f64::from(bits as i32 as u32),
-        IntType::I64 => bits as u64 as f64,
-        // Already unsigned on disk.
-        _ => raw,
+    match bytes {
+        1 => f64::from(bits as i8 as u8),
+        2 => f64::from(bits as i16 as u16),
+        4 => f64::from(bits as i32 as u32),
+        _ => bits as u64 as f64,
     }
-}
-
-fn attr(var: &netcdf::Variable, name: &str) -> Option<AttributeValue> {
-    var.attribute(name)?.value().ok()
 }
 
 /// `_Unsigned` is spelled `"true"` in GLM files. The convention also allows a
 /// numeric `1`, and some producers write `"1"`, so accept all of them.
-fn attr_is_true(v: &AttributeValue) -> bool {
+pub(crate) fn attr_is_true(v: &CfAttr) -> bool {
     match v {
-        AttributeValue::Str(s) => {
+        CfAttr::Str(s) => {
             let s = s.trim();
             s.eq_ignore_ascii_case("true") || s == "1"
         }
@@ -264,34 +242,16 @@ fn attr_is_true(v: &AttributeValue) -> bool {
 ///
 /// NetCDF4 writers frequently store a logically-scalar attribute as a
 /// length-1 vector, so the vector variants are accepted as scalars too.
-fn attr_as_f64(v: &AttributeValue) -> Option<f64> {
+fn attr_as_f64(v: &CfAttr) -> Option<f64> {
     attr_as_f64_vec(v).first().copied()
 }
 
-fn attr_as_f64_vec(v: &AttributeValue) -> Vec<f64> {
-    use AttributeValue as A;
+fn attr_as_f64_vec(v: &CfAttr) -> Vec<f64> {
     match v {
-        A::Uchar(x) => vec![f64::from(*x)],
-        A::Schar(x) => vec![f64::from(*x)],
-        A::Ushort(x) => vec![f64::from(*x)],
-        A::Short(x) => vec![f64::from(*x)],
-        A::Uint(x) => vec![f64::from(*x)],
-        A::Int(x) => vec![f64::from(*x)],
-        A::Ulonglong(x) => vec![*x as f64],
-        A::Longlong(x) => vec![*x as f64],
-        A::Float(x) => vec![f64::from(*x)],
-        A::Double(x) => vec![*x],
-        A::Uchars(x) => x.iter().copied().map(f64::from).collect(),
-        A::Schars(x) => x.iter().copied().map(f64::from).collect(),
-        A::Ushorts(x) => x.iter().copied().map(f64::from).collect(),
-        A::Shorts(x) => x.iter().copied().map(f64::from).collect(),
-        A::Uints(x) => x.iter().copied().map(f64::from).collect(),
-        A::Ints(x) => x.iter().copied().map(f64::from).collect(),
-        A::Ulonglongs(x) => x.iter().map(|&v| v as f64).collect(),
-        A::Longlongs(x) => x.iter().map(|&v| v as f64).collect(),
-        A::Floats(x) => x.iter().copied().map(f64::from).collect(),
-        A::Doubles(x) => x.to_vec(),
-        A::Str(_) | A::Strs(_) => Vec::new(),
+        CfAttr::Nums(x) => x.clone(),
+        // A text attribute is never a number. Returning empty (rather than
+        // parsing the string) keeps `_FillValue = "n/a"` from becoming 0.
+        CfAttr::Str(_) => Vec::new(),
     }
 }
 
@@ -360,12 +320,12 @@ mod tests {
     /// `noaa-goes19` granule `OR_GLM-L2-LCFA_G19_s20262051200000_...`.
     #[test]
     fn unsigned_short_above_32767_reinterprets_not_negates() {
-        let ty = NcVariableType::Int(IntType::I16);
-        assert_eq!(reinterpret_unsigned(-13585.0, &ty, true), 51951.0);
+        let ty = VarType::SignedInt(2);
+        assert_eq!(reinterpret_unsigned(-13585.0, ty, true), 51951.0);
         // Without `_Unsigned` the same bits stay negative.
-        assert_eq!(reinterpret_unsigned(-13585.0, &ty, false), -13585.0);
+        assert_eq!(reinterpret_unsigned(-13585.0, ty, false), -13585.0);
         // Values below 32768 are unaffected either way.
-        assert_eq!(reinterpret_unsigned(11048.0, &ty, true), 11048.0);
+        assert_eq!(reinterpret_unsigned(11048.0, ty, true), 11048.0);
 
         // ...and unpacking it must land on a real latitude in Ohio, not on
         // whatever `-13585 * scale + offset` would produce.
@@ -380,54 +340,48 @@ mod tests {
     /// match, so the fill would be scaled and published as a real number.
     #[test]
     fn fill_and_valid_range_reinterpret_through_unsigned() {
-        let ty = NcVariableType::Int(IntType::I16);
-        assert_eq!(reinterpret_unsigned(-1.0, &ty, true), 65535.0);
-        assert_eq!(reinterpret_unsigned(-6.0, &ty, true), 65530.0);
-        assert_eq!(reinterpret_unsigned(0.0, &ty, true), 0.0);
+        let ty = VarType::SignedInt(2);
+        assert_eq!(reinterpret_unsigned(-1.0, ty, true), 65535.0);
+        assert_eq!(reinterpret_unsigned(-6.0, ty, true), 65530.0);
+        assert_eq!(reinterpret_unsigned(0.0, ty, true), 0.0);
     }
 
     #[test]
     fn unsigned_reinterpretation_covers_the_other_int_widths() {
+        assert_eq!(reinterpret_unsigned(-1.0, VarType::SignedInt(1), true), 255.0);
         assert_eq!(
-            reinterpret_unsigned(-1.0, &NcVariableType::Int(IntType::I8), true),
-            255.0
+            reinterpret_unsigned(-1.0, VarType::SignedInt(4), true),
+            4_294_967_295.0
         );
         assert_eq!(
-            reinterpret_unsigned(-1.0, &NcVariableType::Int(IntType::I32), true),
-            4_294_967_295.0
+            reinterpret_unsigned(-1.0, VarType::SignedInt(8), true),
+            18_446_744_073_709_551_615.0
         );
         // Native unsigned storage is already correct and must be left alone.
         assert_eq!(
-            reinterpret_unsigned(65535.0, &NcVariableType::Int(IntType::U16), true),
+            reinterpret_unsigned(65535.0, VarType::UnsignedInt, true),
             65535.0
         );
         // Floats are never reinterpreted.
-        assert_eq!(
-            reinterpret_unsigned(
-                -13585.0,
-                &NcVariableType::Float(netcdf::types::FloatType::F32),
-                true
-            ),
-            -13585.0
-        );
+        assert_eq!(reinterpret_unsigned(-13585.0, VarType::Float, true), -13585.0);
     }
 
     #[test]
     fn unsigned_attribute_accepts_string_and_numeric_spellings() {
-        assert!(attr_is_true(&AttributeValue::Str("true".into())));
-        assert!(attr_is_true(&AttributeValue::Str("True".into())));
-        assert!(attr_is_true(&AttributeValue::Str("1".into())));
-        assert!(attr_is_true(&AttributeValue::Uchar(1)));
-        assert!(!attr_is_true(&AttributeValue::Str("false".into())));
-        assert!(!attr_is_true(&AttributeValue::Uchar(0)));
+        assert!(attr_is_true(&CfAttr::Str("true".into())));
+        assert!(attr_is_true(&CfAttr::Str("True".into())));
+        assert!(attr_is_true(&CfAttr::Str("1".into())));
+        assert!(attr_is_true(&CfAttr::Nums(vec![1.0])));
+        assert!(!attr_is_true(&CfAttr::Str("false".into())));
+        assert!(!attr_is_true(&CfAttr::Nums(vec![0.0])));
     }
 
     #[test]
     fn scalar_attributes_written_as_length_one_vectors_still_read() {
-        assert_eq!(attr_as_f64(&AttributeValue::Float(0.5)), Some(0.5));
-        assert_eq!(attr_as_f64(&AttributeValue::Floats(vec![0.5])), Some(0.5));
-        assert_eq!(attr_as_f64(&AttributeValue::Short(-1)), Some(-1.0));
-        assert_eq!(attr_as_f64(&AttributeValue::Str("nope".into())), None);
+        assert_eq!(attr_as_f64(&CfAttr::Nums(vec![0.5])), Some(0.5));
+        assert_eq!(attr_as_f64(&CfAttr::Nums(vec![0.5, 9.0])), Some(0.5));
+        assert_eq!(attr_as_f64(&CfAttr::Nums(vec![-1.0])), Some(-1.0));
+        assert_eq!(attr_as_f64(&CfAttr::Str("nope".into())), None);
     }
 
     #[test]
@@ -509,71 +463,60 @@ mod tests {
         }
     }
 
-    /// A unique scratch path, so tests can run in parallel.
-    fn scratch_path(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "rustdar-glm-{tag}-{}-{:?}.nc",
-            std::process::id(),
-            std::thread::current().id()
-        ))
-    }
-
-    /// Write a single packed variable to a NetCDF4 file and hand back its bytes.
+    /// Write a single packed variable to an HDF5 file and hand back its bytes.
+    ///
+    /// `scale_factor` and `add_offset` are declared `f32` here because that is
+    /// what GLM stores, and the value is widened to `f64` before it is written
+    /// so the file holds *exactly* the number a `float` attribute would decode
+    /// to. Writing `152601.9_f64` instead would be a different constant from
+    /// the `152601.859375` the real product yields, and the expectations below
+    /// are pinned to the real one.
     fn short_var_file(spec: &ShortVar<'_>) -> Vec<u8> {
-        let path = scratch_path("short");
-        let _ = std::fs::remove_file(&path);
-        {
-            let mut file = netcdf::create(&path).expect("create netcdf");
-            file.add_dimension("n", spec.values.len()).expect("dim");
-            let mut var = file.add_variable::<i16>("v", &["n"]).expect("add var");
-            // Attributes first: netCDF-C wants `_FillValue` set before data.
-            if spec.unsigned {
-                var.put_attribute("_Unsigned", "true").expect("_Unsigned");
-            }
-            if let Some(f) = spec.fill {
-                var.put_attribute("_FillValue", f).expect("_FillValue");
-            }
-            if let Some(range) = &spec.valid_range {
-                var.put_attribute("valid_range", range.clone()).expect("valid_range");
-            }
-            if let Some(s) = spec.scale {
-                var.put_attribute("scale_factor", s).expect("scale_factor");
-            }
-            if let Some(o) = spec.offset {
-                var.put_attribute("add_offset", o).expect("add_offset");
-            }
-            if let Some(u) = spec.units {
-                var.put_attribute("units", u).expect("units");
-            }
-            var.put_values(spec.values, ..).expect("put values");
+        let mut w = hdf5_pure::FileBuilder::new();
+        let b = w.create_dataset("v");
+        b.with_i16_data(spec.values);
+        if spec.unsigned {
+            b.set_attr("_Unsigned", hdf5_pure::AttrValue::String("true".into()));
         }
-        let bytes = std::fs::read(&path).expect("read back");
-        let _ = std::fs::remove_file(&path);
-        bytes
+        if let Some(f) = spec.fill {
+            b.set_attr("_FillValue", hdf5_pure::AttrValue::I64(i64::from(f)));
+        }
+        if let Some(range) = &spec.valid_range {
+            b.set_attr(
+                "valid_range",
+                hdf5_pure::AttrValue::I64Array(range.iter().map(|&v| i64::from(v)).collect()),
+            );
+        }
+        if let Some(s) = spec.scale {
+            b.set_attr("scale_factor", hdf5_pure::AttrValue::F64(f64::from(s)));
+        }
+        if let Some(o) = spec.offset {
+            b.set_attr("add_offset", hdf5_pure::AttrValue::F64(f64::from(o)));
+        }
+        if let Some(u) = spec.units {
+            b.set_attr("units", hdf5_pure::AttrValue::String(u.into()));
+        }
+        w.finish().expect("write packed fixture")
     }
 
     /// Write a single unpacked `float` variable — GLM's `group_lat`/`flash_lat`
     /// shape — and hand back its bytes.
     fn float_var_file(values: &[f32], units: Option<&str>) -> Vec<u8> {
-        let path = scratch_path("float");
-        let _ = std::fs::remove_file(&path);
-        {
-            let mut file = netcdf::create(&path).expect("create");
-            file.add_dimension("n", values.len()).expect("dim");
-            let mut var = file.add_variable::<f32>("v", &["n"]).expect("add var");
-            if let Some(u) = units {
-                var.put_attribute("units", u).expect("units");
-            }
-            var.put_values(values, ..).expect("put");
+        let mut w = hdf5_pure::FileBuilder::new();
+        let b = w.create_dataset("v");
+        b.with_f32_data(values);
+        if let Some(u) = units {
+            b.set_attr("units", hdf5_pure::AttrValue::String(u.into()));
         }
-        let bytes = std::fs::read(&path).expect("read back");
-        let _ = std::fs::remove_file(&path);
-        bytes
+        w.finish().expect("write float fixture")
     }
 
     fn read_v(bytes: &[u8]) -> UnpackedVar {
-        let file = netcdf::open_mem(None, bytes).expect("open_mem");
-        read_unpacked(&file, "v").expect("read").expect("variable present")
+        super::super::h5::Granule::open(bytes)
+            .expect("open")
+            .read_unpacked("v")
+            .expect("read")
+            .expect("variable present")
     }
 
     /// The headline regression: a `u16` above 32767 arrives from netCDF-C as a

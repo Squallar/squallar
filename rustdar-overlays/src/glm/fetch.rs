@@ -782,28 +782,83 @@ const EVENT_VARS: LevelVars = LevelVars {
     level: GlmDataLevel::Event,
 };
 
-/// Parse GLM data from NetCDF4 bytes in memory.
+/// Where variables come from.
+///
+/// The GLM parser is written against this rather than a concrete reader so the
+/// pure-Rust reader and the netCDF-C library can be driven through *identical*
+/// parsing, unit conversion and time handling. That is what makes the
+/// differential tests in [`super::difftests`] meaningful: any difference they
+/// find is a difference in the reader, because there is only one parser.
+pub(crate) trait VarSource {
+    /// Read a variable with CF packing applied, or `Ok(None)` if it is absent.
+    fn read_unpacked(&self, name: &str) -> Result<Option<cf::UnpackedVar>, String>;
+    /// The `time_coverage_start` global attribute, verbatim.
+    fn time_coverage_start(&self) -> Option<String>;
+}
+
+impl VarSource for super::h5::Granule {
+    fn read_unpacked(&self, name: &str) -> Result<Option<cf::UnpackedVar>, String> {
+        super::h5::Granule::read_unpacked(self, name)
+    }
+    fn time_coverage_start(&self) -> Option<String> {
+        self.global_str("time_coverage_start")
+    }
+}
+
+/// Parse GLM data from NetCDF4/HDF5 bytes in memory.
 pub(crate) fn parse_glm_netcdf(
     data: &[u8],
     satellite: GlmSatellite,
     levels: &[GlmDataLevel],
 ) -> Result<GranuleParse, String> {
-    let file = netcdf::open_mem(None, data)
-        .map_err(|e| format!("Failed to open NetCDF: {e}"))?;
+    let file = super::h5::Granule::open(data)?;
+    parse_with_source(&file, satellite, levels)
+}
 
+/// Parse GLM data through the netCDF-C library.
+///
+/// Test-only, and temporary: it exists solely so [`super::difftests`] can run
+/// the *same* parser over a genuinely independent reader while both are in the
+/// tree. It goes away with the `netcdf` dependency.
+#[cfg(test)]
+pub(crate) fn parse_glm_netcdf_via_netcdf(
+    data: &[u8],
+    satellite: GlmSatellite,
+    levels: &[GlmDataLevel],
+) -> Result<GranuleParse, String> {
+    struct NcSource<'a>(netcdf::FileMem<'a>);
+
+    impl VarSource for NcSource<'_> {
+        fn read_unpacked(&self, name: &str) -> Result<Option<cf::UnpackedVar>, String> {
+            Ok(super::difftests::nc_raw_var(&self.0, name).map(|v| cf::unpack(&v, name)))
+        }
+        fn time_coverage_start(&self) -> Option<String> {
+            match self.0.attribute("time_coverage_start")?.value().ok()? {
+                netcdf::AttributeValue::Str(s) => Some(s),
+                _ => None,
+            }
+        }
+    }
+
+    let file = netcdf::open_mem(None, data).map_err(|e| format!("Failed to open NetCDF: {e}"))?;
+    parse_with_source(&NcSource(file), satellite, levels)
+}
+
+fn parse_with_source<S: VarSource>(
+    file: &S,
+    satellite: GlmSatellite,
+    levels: &[GlmDataLevel],
+) -> Result<GranuleParse, String> {
     // Read the time origin from global attribute. Every `*_time_offset`
     // variable also names its own epoch in its `units` attribute, and in every
     // granule inspected the two agree exactly (`time_coverage_start` =
     // "2026-07-24T12:00:00.0Z", `event_time_offset:units` = "seconds since
     // 2026-07-24 12:00:00.000"). The per-variable epoch wins where present —
     // see `parse_level_records` — and this is the fallback.
-    let time_origin = file.attribute("time_coverage_start")
-        .and_then(|a| a.value().ok())
-        .and_then(|v| match v {
-            netcdf::AttributeValue::Str(s) => Some(s),
-            _ => None,
-        })
-        .and_then(|s| cf::parse_cf_epoch(&s))
+    let time_origin = file
+        .time_coverage_start()
+        .as_deref()
+        .and_then(cf::parse_cf_epoch)
         .ok_or_else(|| "Missing or invalid time_coverage_start attribute".to_string())?;
 
     let mut all_records = Vec::new();
@@ -819,7 +874,7 @@ pub(crate) fn parse_glm_netcdf(
         // are independent variable sets and the user selects them
         // independently, so a schema change confined to `flash_*` should not
         // black out the default-on group layer as well.
-        match parse_level_records(&file, vars, &time_origin, satellite) {
+        match parse_level_records(file, vars, &time_origin, satellite) {
             Ok(records) => all_records.extend(records),
             Err(e) => {
                 warn_once(
@@ -905,8 +960,8 @@ const ENERGY_UNITS: &[(&str, f64)] = &[("j", 1.0), ("joule", 1.0), ("joules", 1.
 /// packing conventions the `netcdf` crate does not. See that module for the
 /// rules; the short version is that most GLM variables are `_Unsigned` packed
 /// shorts and reading them raw yields meaningless numbers.
-fn parse_level_records(
-    file: &netcdf::File,
+fn parse_level_records<S: VarSource>(
+    file: &S,
     vars: &LevelVars,
     time_origin: &chrono::NaiveDateTime,
     satellite: GlmSatellite,
@@ -1136,11 +1191,11 @@ fn warn_missing_variable_once(name: &'static str) {
 /// as a schema change fails whole granules over one bad record, and treating
 /// an absent column as "all values missing" is the silence this branch exists
 /// to remove.
-fn read_required_unpacked(
-    file: &netcdf::File,
+fn read_required_unpacked<S: VarSource>(
+    file: &S,
     name: &'static str,
 ) -> Result<cf::UnpackedVar, String> {
-    match cf::read_unpacked(file, name)? {
+    match file.read_unpacked(name)? {
         Some(var) => Ok(var),
         None => {
             warn_missing_variable_once(name);
@@ -1154,11 +1209,11 @@ fn read_required_unpacked(
 /// Returns `Ok(None)` when absent, but still reports it: the *declared*
 /// optionality lives in [`LevelVars::area`], so reaching here with a name in
 /// hand means we asked for something the product used to have.
-fn read_optional_unpacked(
-    file: &netcdf::File,
+fn read_optional_unpacked<S: VarSource>(
+    file: &S,
     name: &'static str,
 ) -> Result<Option<cf::UnpackedVar>, String> {
-    let var = cf::read_unpacked(file, name)?;
+    let var = file.read_unpacked(name)?;
     if var.is_none() {
         warn_missing_variable_once(name);
     }

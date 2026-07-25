@@ -42,6 +42,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tiny-skia = "=0.12.0"
 tokio = { workspace = true, features = ["fs"] }
+hdf5-pure = "=0.24.0"
 
 [dev-dependencies]
 # Test-only: drives the `#[ignore]`d live-NOMADS checks. Not linked into any

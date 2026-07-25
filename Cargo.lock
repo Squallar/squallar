@@ -1955,6 +1955,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hdf5-pure"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b1689a97f81fbf3d951258cc3935ee76e1de6401db4558056a47f7657bcf92b"
+dependencies = [
+ "byteorder",
+ "flate2",
+]
+
+[[package]]
 name = "heapless"
 version = "0.7.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4413,6 +4423,7 @@ dependencies = [
  "flate2",
  "futures",
  "grib",
+ "hdf5-pure",
  "log",
  "netcdf",
  "openssl-sys",
