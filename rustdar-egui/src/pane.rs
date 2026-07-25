@@ -29,6 +29,13 @@ pub struct LoopFrame {
     pub texture: Option<RadarImageData>,
     /// True while a background render is in progress for this frame.
     pub render_in_flight: bool,
+    /// True once a render for this frame has been attempted and produced nothing
+    /// (no matching sweep for the selected product/elevation, or the render itself
+    /// failed). Terminal for this frame's current scan data: the dispatcher stops
+    /// retrying it, and it no longer holds up loop readiness. Without this, an
+    /// unrenderable frame would either be re-spawned every frame forever or wedge
+    /// the loop in `Rendering` permanently.
+    pub render_failed: bool,
 }
 
 /// The state phases for a radar loop playback instance.
@@ -169,6 +176,63 @@ impl LoopPlaybackState {
     /// True if playback was previously started (could be paused or playing).
     pub fn has_playback_started(&self) -> bool {
         matches!(self.phase, LoopPhase::Playing | LoopPhase::Paused)
+    }
+
+    /// Indices of the frames the renderer intends to have textured: up to `budget`
+    /// frames, walking outward from the playhead (forward first, then backward).
+    ///
+    /// This is the "intended render set". The dispatcher spawns renders for exactly
+    /// these frames, and readiness waits for exactly these frames, so both must use
+    /// this function — if they disagree, readiness can fire over frames that were
+    /// never rendered. `budget` is clamped to the frame count.
+    pub fn render_set_indices(&self, budget: usize) -> Vec<usize> {
+        let num_frames = self.frames.len();
+        let budget = num_frames.min(budget);
+        let current = self.current_frame;
+
+        let mut indices = Vec::with_capacity(budget);
+        for offset in 0..budget {
+            let fwd = (current + offset) % num_frames;
+            if !indices.contains(&fwd) {
+                indices.push(fwd);
+            }
+            if indices.len() >= budget {
+                break;
+            }
+            let bwd = (current + num_frames - offset) % num_frames;
+            if !indices.contains(&bwd) {
+                indices.push(bwd);
+            }
+            if indices.len() >= budget {
+                break;
+            }
+        }
+        indices
+    }
+
+    /// True when no frame in the intended render set is still waiting on a texture.
+    ///
+    /// This is deliberately *not* "nothing is in flight right now". The concurrent
+    /// render budget is shared with static pane renders, so a batch of loop frames
+    /// can be starved: only some spawn, those finish, and for an instant nothing is
+    /// in flight even though most of the set is still blank. Treating that as ready
+    /// makes playback animate mostly-empty frames. A frame is settled only if it has
+    /// a texture, or nothing is going to produce one for it (no render in flight, and
+    /// either it has been ruled out via `render_failed` or its scan has not
+    /// downloaded yet — the latter is gated separately by the download check).
+    ///
+    /// `scan_available` reports whether the frame's scan data has been downloaded;
+    /// that cache lives outside the pane, so the caller supplies it.
+    pub fn render_set_settled(
+        &self,
+        budget: usize,
+        scan_available: impl Fn(&LoopFrame) -> bool,
+    ) -> bool {
+        self.render_set_indices(budget).into_iter().all(|idx| {
+            let frame = &self.frames[idx];
+            frame.texture.is_some()
+                || (!frame.render_in_flight && (frame.render_failed || !scan_available(frame)))
+        })
     }
 }
 
@@ -406,5 +470,153 @@ fn drag_divider(
             egui::CursorIcon::ResizeHorizontal
         };
         ui.ctx().set_cursor_icon(cursor);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn ts(minute: u32) -> NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, minute, 0)
+            .unwrap()
+    }
+
+    /// A 1x1 texture handle. `egui::Context` allocates textures through its own
+    /// texture manager, so this needs no window, GPU, or renderer.
+    fn dummy_texture(ctx: &egui::Context) -> RadarImageData {
+        let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
+        RadarImageData {
+            texture: ctx.load_texture("test", image, egui::TextureOptions::NEAREST),
+            lat: 0.0,
+            lon: 0.0,
+            max_range_km: 100.0,
+            value_data: Arc::new(Vec::new()),
+        }
+    }
+
+    fn loop_with_frames(count: usize, current_frame: usize) -> LoopPlaybackState {
+        let mut state = LoopPlaybackState::new_for_loop(3600, 35.0, -97.0);
+        state.phase = LoopPhase::Rendering;
+        state.frames = (0..count)
+            .map(|i| LoopFrame {
+                timestamp: ts(i as u32),
+                texture: None,
+                render_in_flight: false,
+                render_failed: false,
+            })
+            .collect();
+        state.current_frame = current_frame;
+        state
+    }
+
+    /// Every frame's scan has downloaded.
+    fn all_scans_available(_: &LoopFrame) -> bool {
+        true
+    }
+
+    #[test]
+    fn render_set_walks_outward_from_playhead() {
+        let state = loop_with_frames(8, 0);
+        // Forward first, then backward (wrapping), alternating.
+        assert_eq!(state.render_set_indices(5), vec![0, 1, 7, 2, 6]);
+    }
+
+    #[test]
+    fn render_set_is_capped_and_deduplicated() {
+        let state = loop_with_frames(4, 2);
+        let indices = state.render_set_indices(12);
+        assert_eq!(indices.len(), 4, "cannot exceed the frame count");
+        assert_eq!(
+            indices.iter().copied().collect::<HashSet<_>>(),
+            (0..4).collect::<HashSet<_>>(),
+            "every frame covered exactly once"
+        );
+
+        assert!(state.render_set_indices(0).is_empty());
+        assert!(loop_with_frames(0, 0).render_set_indices(6).is_empty());
+    }
+
+    /// Regression: the render budget is shared with static pane renders, so a loop
+    /// batch can be starved — only some frames spawn, they finish, and for a moment
+    /// nothing is in flight while most of the set is still blank. The old predicate
+    /// ("no frame is in flight") called that ready and animated blank frames.
+    #[test]
+    fn starved_frames_block_readiness() {
+        let ctx = egui::Context::default();
+        let mut state = loop_with_frames(4, 0);
+        // One frame rendered; the rest never got a slot, so nothing is in flight.
+        state.frames[0].texture = Some(dummy_texture(&ctx));
+
+        assert!(
+            !state.frames.iter().any(|f| f.render_in_flight),
+            "precondition: the old 'nothing in flight' predicate would pass here"
+        );
+        assert!(
+            !state.render_set_settled(12, all_scans_available),
+            "frames that are pending but not yet spawned must block readiness"
+        );
+    }
+
+    #[test]
+    fn fully_rendered_batch_is_settled() {
+        let ctx = egui::Context::default();
+        let mut state = loop_with_frames(4, 0);
+        for frame in &mut state.frames {
+            frame.texture = Some(dummy_texture(&ctx));
+        }
+        assert!(state.render_set_settled(12, all_scans_available));
+    }
+
+    #[test]
+    fn in_flight_frames_block_readiness() {
+        let ctx = egui::Context::default();
+        let mut state = loop_with_frames(3, 0);
+        state.frames[0].texture = Some(dummy_texture(&ctx));
+        state.frames[1].texture = Some(dummy_texture(&ctx));
+        state.frames[2].render_in_flight = true;
+        assert!(!state.render_set_settled(12, all_scans_available));
+    }
+
+    /// A frame whose scan has not downloaded cannot be rendered yet, so it must not
+    /// block readiness — download progress is gated separately by the pending queue.
+    #[test]
+    fn undownloaded_frames_do_not_block_readiness() {
+        let ctx = egui::Context::default();
+        let mut state = loop_with_frames(3, 0);
+        state.frames[0].texture = Some(dummy_texture(&ctx));
+        let downloaded = state.frames[0].timestamp;
+        assert!(state.render_set_settled(12, |f| f.timestamp == downloaded));
+    }
+
+    /// A frame that has been ruled out (render attempted and produced nothing) must
+    /// not block readiness forever, or the loop would wedge in `Rendering`.
+    #[test]
+    fn failed_frames_do_not_block_readiness() {
+        let ctx = egui::Context::default();
+        let mut state = loop_with_frames(3, 0);
+        state.frames[0].texture = Some(dummy_texture(&ctx));
+        state.frames[1].render_failed = true;
+        state.frames[2].render_failed = true;
+        assert!(state.render_set_settled(12, all_scans_available));
+    }
+
+    /// Frames outside the budgeted window around the playhead are never rendered,
+    /// so they must not hold up readiness either.
+    #[test]
+    fn frames_outside_the_render_set_do_not_block_readiness() {
+        let ctx = egui::Context::default();
+        let mut state = loop_with_frames(10, 0);
+        for &idx in &state.render_set_indices(3) {
+            state.frames[idx].texture = Some(dummy_texture(&ctx));
+        }
+        assert!(state.render_set_settled(3, all_scans_available));
+        assert!(
+            !state.render_set_settled(10, all_scans_available),
+            "widening the budget pulls blank frames back into the set"
+        );
     }
 }

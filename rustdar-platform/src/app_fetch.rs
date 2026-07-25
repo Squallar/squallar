@@ -629,17 +629,21 @@ impl super::App {
     }
 
     /// Spawn a background render thread for a single loop frame.
+    ///
+    /// Returns `true` if a render thread was spawned. `false` means the shared
+    /// concurrency budget was exhausted and nothing was started — the caller must
+    /// not mark the frame as in flight, since no response will arrive to clear it.
     pub(super) fn spawn_loop_frame_render(
         &self,
         pane_idx: usize,
         timestamp: NaiveDateTime,
         scan_data: std::sync::Arc<nexrad_model::data::Scan>,
         params: &crate::render_dispatch::RenderParams,
-    ) {
+    ) -> bool {
         // Check concurrent render limit (the counter is shared with static pane renders)
         let current = self.render.renders_in_flight.load(Ordering::Relaxed);
         if current >= MAX_CONCURRENT_RENDERS {
-            return;
+            return false;
         }
         self.render.renders_in_flight.fetch_add(1, Ordering::Relaxed);
         let guard = RenderGuard(std::sync::Arc::clone(&self.render.renders_in_flight));
@@ -678,6 +682,7 @@ impl super::App {
             }
             super::notify_redraw(&window);
         }).expect("failed to spawn loop-render thread");
+        true
     }
 
     /// Append a freshly-polled scan to any active loops, evicting frames past
@@ -712,6 +717,7 @@ impl super::App {
                 timestamp,
                 texture: None,
                 render_in_flight: false,
+                render_failed: false,
             });
 
             // Evict frames outside the lookback window

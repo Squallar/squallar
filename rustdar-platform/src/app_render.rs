@@ -581,6 +581,7 @@ impl super::App {
                     timestamp: *ts,
                     texture: None,
                     render_in_flight: false,
+                    render_failed: false,
                 })
                 .collect();
 
@@ -605,6 +606,7 @@ impl super::App {
                     timestamp: *ts,
                     texture: None,
                     render_in_flight: false,
+                    render_failed: false,
                 }).collect();
                 if !ls.frames.is_empty() {
                     ls.current_frame = ls.frames.len() - 1;
@@ -713,8 +715,10 @@ impl super::App {
             };
             frame.render_in_flight = false;
 
-            // Empty image_data means the render failed (no matching sweep) — just clear the flag
+            // Empty image_data means the render failed (no matching sweep). Mark the
+            // frame so the dispatcher stops retrying it and readiness stops waiting on it.
             if rr.image_data.is_empty() {
+                frame.render_failed = true;
                 continue;
             }
 
@@ -771,15 +775,22 @@ impl super::App {
 
             // Mark panes as render_ready once their initial batch completes
             for pidx in 0..self.gui.pane_count() {
+                let loop_mgr = &self.loop_mgr;
+                let pane_downloads_done = loop_mgr.is_pane_done(pidx);
                 let Some(p) = self.gui.pane_mut(pidx) else { continue };
                 let pls = &mut p.loop_state;
                 if !pls.is_active() || pls.is_render_ready() || pls.frames.is_empty() {
                     continue;
                 }
                 let any_rendered = pls.frames.iter().any(|f| f.texture.is_some());
-                let none_in_flight = !pls.frames.iter().any(|f| f.render_in_flight);
-                let pane_downloads_done = self.loop_mgr.is_pane_done(pidx);
-                if any_rendered && none_in_flight && pane_downloads_done {
+                // Every frame we intend to render must be settled — not merely "nothing
+                // in flight this instant". The render budget is shared with static pane
+                // renders, so part of the batch can be starved and not yet spawned; that
+                // must keep the loop out of Ready instead of animating blank frames.
+                let batch_settled = pls.render_set_settled(MAX_LOOP_RENDER_BUDGET, |f| {
+                    loop_mgr.is_cached(&f.timestamp)
+                });
+                if any_rendered && batch_settled && pane_downloads_done {
                     pls.phase = rustdar_egui::pane::LoopPhase::Ready;
                 }
             }
@@ -912,6 +923,9 @@ impl super::App {
         let mut to_render: Vec<(usize, usize, chrono::NaiveDateTime, rustdar_radar::types::RadarProduct, f32, f64, f64)> = Vec::new();
         // Frames that can be satisfied by cloning a sibling's texture: (dest_pane, frame_idx, source_pane, timestamp)
         let mut to_clone: Vec<(usize, usize, usize, chrono::NaiveDateTime)> = Vec::new();
+        // Frames whose scan carries no sweep for the selected product: (pane_idx, frame_idx).
+        // Recorded so they stop being retried and stop holding up readiness.
+        let mut to_mark_failed: Vec<(usize, usize)> = Vec::new();
 
         let sync = self.gui.is_sync_layers();
         let pane_count = self.gui.pane_count();
@@ -930,31 +944,13 @@ impl super::App {
             let product = pane.selected_product;
             let elevation = pane.selected_elevation;
 
-            let num_frames = ls.frames.len();
-            let budget = num_frames.min(MAX_LOOP_RENDER_BUDGET);
-            let current = ls.current_frame;
-
-            let mut indices = Vec::with_capacity(budget);
-            for offset in 0..budget {
-                let fwd = (current + offset) % num_frames;
-                if !indices.contains(&fwd) {
-                    indices.push(fwd);
-                }
-                if indices.len() >= budget {
-                    break;
-                }
-                let bwd = (current + num_frames - offset) % num_frames;
-                if !indices.contains(&bwd) {
-                    indices.push(bwd);
-                }
-                if indices.len() >= budget {
-                    break;
-                }
-            }
+            // The intended render set — shared with the readiness check so the two
+            // cannot drift apart (see `LoopPlaybackState::render_set_settled`).
+            let indices = ls.render_set_indices(MAX_LOOP_RENDER_BUDGET);
 
             for &idx in &indices {
                 let frame = &ls.frames[idx];
-                if frame.texture.is_some() || frame.render_in_flight {
+                if frame.texture.is_some() || frame.render_in_flight || frame.render_failed {
                     continue;
                 }
 
@@ -988,6 +984,9 @@ impl super::App {
                 if let Some(scan) = self.loop_mgr.get_cached(&frame.timestamp) {
                     // Snap elevation to closest available in this particular scan
                     let Some(snapped) = rustdar_radar::render::find_closest_elevation(scan, product, elevation) else {
+                        // This scan has no sweep carrying the selected product at all.
+                        // Nothing will ever render it, so retire the frame.
+                        to_mark_failed.push((pane_idx, idx));
                         continue;
                     };
                     // Deduplicate: if another pane already queued a render for the same
@@ -1000,6 +999,15 @@ impl super::App {
                     }
                     to_render.push((pane_idx, idx, frame.timestamp, product, snapped, site_lat, site_lon));
                 }
+            }
+        }
+
+        // Retire frames that cannot be rendered at the selected product/elevation
+        for (pane_idx, frame_idx) in to_mark_failed {
+            if let Some(pane) = self.gui.pane_mut(pane_idx)
+                && let Some(frame) = pane.loop_state.frames.get_mut(frame_idx)
+            {
+                frame.render_failed = true;
             }
         }
 
@@ -1020,7 +1028,7 @@ impl super::App {
             }
         }
 
-        // Now mark in-flight and spawn renders, respecting concurrent limit
+        // Now spawn renders and mark the frames in flight, respecting concurrent limit
         for (pane_idx, frame_idx, ts, product, elevation, lat, lon) in to_render {
             // Check concurrent render limit before each spawn (shared with static pane renders)
             let current = self.render.renders_in_flight.load(Ordering::Relaxed);
@@ -1030,16 +1038,20 @@ impl super::App {
 
             let scan_arc = Arc::clone(self.loop_mgr.get_cached(&ts).unwrap());
 
-            if let Some(pane) = self.gui.pane_mut(pane_idx) {
-                pane.loop_state.frames[frame_idx].render_in_flight = true;
-            }
-
-            self.spawn_loop_frame_render(
+            // Only mark the frame in flight if a thread was actually spawned. If the
+            // spawn is refused (budget taken between the check above and the one inside),
+            // no LoopRenderResponse will ever arrive to clear the flag, and the frame
+            // would stay blank and be skipped forever.
+            let spawned = self.spawn_loop_frame_render(
                 pane_idx,
                 ts,
                 scan_arc,
                 &crate::render_dispatch::RenderParams { product, elevation, lat, lon },
             );
+
+            if spawned && let Some(pane) = self.gui.pane_mut(pane_idx) {
+                pane.loop_state.frames[frame_idx].render_in_flight = true;
+            }
         }
     }
 }
