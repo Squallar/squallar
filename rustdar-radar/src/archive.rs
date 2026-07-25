@@ -37,6 +37,11 @@ use reqwest::StatusCode;
 use xml::reader::{EventReader, XmlEvent};
 
 /// The public NOAA/Unidata bucket holding Level II archive volumes.
+///
+/// Kept as a `const` because it is used in `const`-ish positions and
+/// [`crate::sources::DataSources`] holds its origins as `Cow`, which cannot be
+/// dereferenced in a constant. `archive_bucket_matches_the_declared_origin`
+/// pins the two together so this cannot drift.
 pub const ARCHIVE_BUCKET: &str = "unidata-nexrad-level2";
 
 /// How long a single archive request may take, end to end.
@@ -167,7 +172,7 @@ impl Identifier {
 /// for the continuation token: tokens are opaque base64-ish blobs that routinely
 /// contain `/` and can contain `+` and `=`, and an unencoded `+` would reach S3
 /// as a space and be rejected.
-fn list_url(
+pub(crate) fn list_url(
     bucket: &str,
     prefix: &str,
     max_keys: Option<u32>,
@@ -196,7 +201,7 @@ fn list_url(
 /// nothing to encode, and encoding would have to leave the `/` separators alone
 /// anyway.
 fn object_url(bucket: &str, key: &str) -> String {
-    format!("https://{bucket}.s3.amazonaws.com/{key}")
+    crate::sources::DataSources::s3_object_url(bucket, key)
 }
 
 /// The prefix under which one site's volumes for one day are stored.
@@ -329,7 +334,7 @@ fn parse_list_page(body: &str) -> Result<ListPage> {
 /// Paging keys off `IsTruncated`, not off the presence of a token: S3 sends
 /// both together, but keying off the token alone would turn a final page that
 /// echoed one into an infinite loop.
-async fn collect_keys<F, Fut>(
+pub(crate) async fn collect_keys<F, Fut>(
     bucket: &str,
     prefix: &str,
     max_keys: Option<u32>,
@@ -380,7 +385,7 @@ where
 /// One client for the process, as upstream had: `list_scans_for_range` issues a
 /// listing per day and a loop replay downloads a volume per frame, so losing
 /// connection reuse here would be a real regression.
-fn shared_client() -> &'static reqwest::Client {
+pub(crate) fn shared_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         crate::tls::client(crate::tls::USER_AGENT, ARCHIVE_TIMEOUT)
@@ -427,7 +432,7 @@ fn classify(status: StatusCode) -> StatusClass {
 /// gets the same empty result and reports "no scans available" -- an outage
 /// rendered as an absence. Checking the status here is the second deliberate
 /// departure from upstream.
-async fn get_text(client: &reqwest::Client, url: String) -> Result<String> {
+pub(crate) async fn get_text(client: &reqwest::Client, url: String) -> Result<String> {
     let response = client.get(&url).send().await?;
     match classify(response.status()) {
         StatusClass::Ok => Ok(response.text().await?),
@@ -438,6 +443,65 @@ async fn get_text(client: &reqwest::Client, url: String) -> Result<String> {
             Err(ArchiveError::Status { status, url, body })
         }
     }
+}
+
+/// GET a URL and return the body as bytes.
+///
+/// The binary counterpart of [`get_text`], with the same status handling: a
+/// `404` is [`ArchiveError::NotFound`] and anything else non-`200` is
+/// [`ArchiveError::Status`], so a bucket outage cannot be mistaken for an
+/// absent object.
+pub(crate) async fn get_bytes(client: &reqwest::Client, url: String) -> Result<Vec<u8>> {
+    let response = client.get(&url).send().await?;
+    match classify(response.status()) {
+        StatusClass::Ok => Ok(response.bytes().await?.to_vec()),
+        StatusClass::NotFound => Err(ArchiveError::NotFound(url)),
+        StatusClass::Failed => {
+            let status = response.status();
+            let body = response.text().await.ok();
+            Err(ArchiveError::Status { status, url, body })
+        }
+    }
+}
+
+/// GET a byte range of an object.
+///
+/// `start` and `end` are inclusive, matching HTTP's `Range: bytes=start-end`.
+///
+/// **`206 Partial Content` is the success status here, not `200`.** [`classify`]
+/// deliberately treats `206` as a failure for whole-object fetches — a partial
+/// body handed to a volume decoder is a truncated file — so this path cannot
+/// reuse it. A server that ignores the `Range` header answers `200` with the
+/// *whole* object; that is accepted, because the caller slicing what it asked
+/// for still gets the right bytes, but it is logged since it means the transfer
+/// saving did not happen.
+pub(crate) async fn get_range(
+    client: &reqwest::Client,
+    url: String,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>> {
+    let response = client
+        .get(&url)
+        .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+        .send()
+        .await?;
+    let status = response.status();
+    if status == StatusCode::PARTIAL_CONTENT {
+        return Ok(response.bytes().await?.to_vec());
+    }
+    if status == StatusCode::OK {
+        log::warn!("{url} ignored the Range header and returned the whole object");
+        let all = response.bytes().await?;
+        let start = (start as usize).min(all.len());
+        let end = ((end as usize) + 1).min(all.len());
+        return Ok(all[start..end].to_vec());
+    }
+    if status == StatusCode::NOT_FOUND {
+        return Err(ArchiveError::NotFound(url));
+    }
+    let body = response.text().await.ok();
+    Err(ArchiveError::Status { status, url, body })
 }
 
 // ---------------------------------------------------------------------------

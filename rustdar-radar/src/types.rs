@@ -320,17 +320,34 @@ impl RadarProduct {
         )
     }
 
-    /// The TGFTP directory names for all available tilts of this product.
-    /// Used to fetch from `https://tgftp.nws.noaa.gov/SL.us008001/DF.of/DC.radar/DS.{dir}/SI.{site}/sn.last`.
-    /// Returns `None` for Level II products.
-    pub fn tgftp_dirs(&self) -> Option<&'static [&'static str]> {
+    /// The AWIPS product IDs to fetch for this product, one per tilt.
+    ///
+    /// These key the `unidata-nexrad-level3` bucket — `TLX_N0S_2026_07_25_...`
+    /// — and replace the TGFTP directory names (`56rm0`, `176pr`, …) rustdar
+    /// used before. TGFTP sends no `Access-Control-Allow-Origin`, so the web
+    /// build cannot read it; see [`crate::level3`].
+    ///
+    /// Returns `None` for Level II products, which come from the base moments.
+    ///
+    /// # Storm-relative velocity is one tilt, not four
+    ///
+    /// TGFTP served `56rm0`–`56rm3`. Only `N0S` still exists: NWS removed the
+    /// higher SRM tilts from NOAAPort (SCN 22-96), and every CORS-clean source
+    /// is NOAAPort-derived, so `N1S`/`N2S`/`N3S` have had nothing written to
+    /// them since 2020. Listing them here would produce three permanently
+    /// failing fetches per scan and three empty tilt entries in the UI.
+    ///
+    /// Do **not** fill the gap by pointing a higher tilt at `N0S`: storm-
+    /// relative velocity is elevation-specific, and a 0.5° field labelled as
+    /// 1.5° is a wrong answer rather than a missing one.
+    pub fn level3_products(&self) -> Option<&'static [&'static str]> {
         match self {
-            RadarProduct::StormRelativeVelocity => Some(&["56rm0", "56rm1", "56rm2", "56rm3"]),
-            RadarProduct::SpecificDifferentialPhase => Some(&["163k0"]),
-            RadarProduct::EchoTops => Some(&["135et"]),
-            RadarProduct::VerticallyIntegratedLiquid => Some(&["134il"]),
-            RadarProduct::HydrometeorClassification => Some(&["177hh"]),
-            RadarProduct::PrecipitationRate => Some(&["176pr"]),
+            RadarProduct::StormRelativeVelocity => Some(&["N0S"]),
+            RadarProduct::SpecificDifferentialPhase => Some(&["N0K"]),
+            RadarProduct::EchoTops => Some(&["EET"]),
+            RadarProduct::VerticallyIntegratedLiquid => Some(&["DVL"]),
+            RadarProduct::HydrometeorClassification => Some(&["HHC"]),
+            RadarProduct::PrecipitationRate => Some(&["DPR"]),
             _ => None,
         }
     }

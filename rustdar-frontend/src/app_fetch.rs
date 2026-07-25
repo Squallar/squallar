@@ -109,24 +109,24 @@ impl super::App {
     pub(super) fn spawn_level3_fetches(&self, site: &str) {
         let generation = self.render.fetch_generations.get(site).copied().unwrap_or(0);
         for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
-            let Some(dirs) = l3_product.tgftp_dirs() else { continue };
-            for &dir in dirs {
+            let Some(codes) = l3_product.level3_products() else { continue };
+            for &code in codes {
                 let site = site.to_string();
-                let dir_str = dir.to_string();
+                let code_str = code.to_string();
                 let product = *l3_product;
                 self.spawn_async_task(self.channels.level3_sender.clone(), async move {
-                    log::info!("Fetching TGFTP {} for {}", dir_str, site);
-                    let result = match scan::get_tgftp_product(&site, &dir_str).await {
+                    log::info!("Fetching Level III {} for {}", code_str, site);
+                    let result = match scan::get_level3_product(&site, &code_str).await {
                         Ok(msg) => {
-                            log::info!("Fetched TGFTP {} for {}", dir_str, site);
+                            log::info!("Fetched Level III {} for {}", code_str, site);
                             Ok(msg)
                         }
                         Err(e) => {
-                            log::warn!("TGFTP {} fetch failed: {}", dir_str, e);
+                            log::warn!("Level III {} fetch failed: {}", code_str, e);
                             Err(format!("{e}"))
                         }
                     };
-                    Level3Response { generation, product, tilt_code: dir_str, site, result }
+                    Level3Response { generation, product, tilt_code: code_str, site, result }
                 });
             }
         }

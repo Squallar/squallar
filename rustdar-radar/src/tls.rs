@@ -94,6 +94,37 @@ pub fn client(user_agent: &str, _timeout: std::time::Duration) -> reqwest::Clien
     reqwest::Client::builder().user_agent(user_agent.to_owned())
 }
 
+/// Build a client that sends **no** `User-Agent`.
+///
+/// For origins whose CORS preflight fails. In a browser, any non-safelisted
+/// request header — and `User-Agent` is one — upgrades the request from
+/// "simple" to preflighted, so the browser sends `OPTIONS` first and refuses to
+/// issue the real request unless that answers 2xx with the method and header
+/// allowed.
+///
+/// `mesonet.agron.iastate.edu` answers `405 Method Not Allowed` to `OPTIONS`
+/// while answering the plain `GET` with `Access-Control-Allow-Origin: *`. So
+/// the METAR feed is reachable from the web build *only* as a simple request,
+/// and adding a `User-Agent` for politeness would break it — silently, and only
+/// on wasm, where nothing else in the workspace would notice.
+///
+/// See [`crate::sources::DataSources::metar_sends_user_agent`], which is where
+/// that rule is recorded per origin.
+///
+/// Everything else [`client`] configures still applies.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn simple_client(timeout: std::time::Duration) -> reqwest::ClientBuilder {
+    init();
+    reqwest::Client::builder().timeout(timeout).https_only(true)
+}
+
+/// wasm32 build of [`simple_client`]. See [`client`] for why the timeout goes.
+#[cfg(target_arch = "wasm32")]
+pub fn simple_client(_timeout: std::time::Duration) -> reqwest::ClientBuilder {
+    init();
+    reqwest::Client::builder()
+}
+
 /// Whether the installed default provider is *ring*.
 ///
 /// Compares the address of the provider's `secure_random`, which is a distinct

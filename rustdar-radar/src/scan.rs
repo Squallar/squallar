@@ -5,7 +5,7 @@ use nexrad_model::data::Scan;
 
 /// Errors from locating, downloading or decoding an archive scan.
 ///
-/// Shaped like the neighbouring [`Level3FetchError`]: one variant per layer, so
+/// Shaped like the neighbouring [`crate::level3::Level3Error`]: one variant per layer, so
 /// a `{:?}` in the frontend's log line says which one failed. Every consumer
 /// formats rather than matches.
 #[derive(Debug, thiserror::Error)]
@@ -355,59 +355,26 @@ pub async fn get_adjacent_scan(
 // Level III product fetching
 // ---------------------------------------------------------------------------
 
-/// Errors that can occur during Level III fetch operations.
-#[derive(Debug, thiserror::Error)]
-pub enum Level3FetchError {
-    /// HTTP request failed.
-    #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
-    /// No matching product found.
-    #[error("not found: {0}")]
-    NotFound(String),
-    /// Level III decoding failed.
-    #[error("decode error: {0}")]
-    Decode(#[from] nexrad_level3::result::Error),
-}
-
-use nexrad_level3::model::Level3Message;
-
-// ---------------------------------------------------------------------------
-// TGFTP (NWS) Level III product fetching
-// ---------------------------------------------------------------------------
-
-const TGFTP_BASE_URL: &str = "https://tgftp.nws.noaa.gov/SL.us008001/DF.of/DC.radar";
-
-/// Fetch the latest Level III product from NWS TGFTP.
+/// Fetch the latest Level III product for a site.
 ///
-/// The `sn.last` endpoint always returns the most recent product, so no
-/// listing or timestamp matching is needed.
+/// Thin wrapper over [`crate::level3::fetch_latest_product`] that supplies the
+/// production origins and the current UTC time, keeping the two Level II/III
+/// entry points side by side. `product` is an AWIPS ID such as `"N0S"`; see
+/// [`crate::types::RadarProduct::level3_products`].
 ///
-/// `tgftp_dir` is the directory component, e.g. `"56rm0"` for SRM tilt 0.
-/// `site` is the 4-letter ICAO code (e.g. `"KTLX"`) — lowercased for the URL.
-pub async fn get_tgftp_product(
+/// This replaces `get_tgftp_product`. TGFTP's `sn.last` needed no listing, but
+/// TGFTP is unreachable from a browser — see [`crate::level3`] for what
+/// changed and why.
+pub async fn get_level3_product(
     site: &str,
-    tgftp_dir: &str,
-) -> std::result::Result<Level3Message, Level3FetchError> {
-    let site_lower = site.to_lowercase();
-    let url = format!(
-        "{TGFTP_BASE_URL}/DS.{tgftp_dir}/SI.{site_lower}/sn.last"
-    );
-
-    log::info!("Fetching TGFTP product: {url}");
-    let client = crate::tls::client(
-        crate::tls::USER_AGENT,
-        std::time::Duration::from_secs(30),
+    product: &str,
+) -> std::result::Result<nexrad_level3::model::Level3Message, crate::level3::Level3Error> {
+    crate::tls::init();
+    crate::level3::fetch_latest_product(
+        &crate::sources::DataSources::production(),
+        site,
+        product,
+        chrono::Utc::now().naive_utc(),
     )
-    .build()?;
-    let resp = client.get(&url).send().await?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(Level3FetchError::NotFound(format!(
-            "TGFTP product DS.{tgftp_dir} not found for {site}"
-        )));
-    }
-    let resp = resp.error_for_status()?;
-    let bytes = resp.bytes().await?;
-
-    let message = nexrad_level3::decode::decode_product(&bytes)?;
-    Ok(message)
+    .await
 }
