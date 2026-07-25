@@ -12,29 +12,48 @@ use winit::platform::android::activity::AndroidApp;
 // JNI location helper functions (Android only)
 // ---------------------------------------------------------------------------
 
+/// Wrap the process `JavaVM` that `ndk_context` holds.
+///
+/// jni 0.22 made `JavaVM::from_raw` infallible, but it *asserts* the pointer is
+/// non-null where 0.21 returned a `Result`. Checking here keeps the pre-0.22
+/// behaviour of falling back to a default instead of panicking if `ndk_context`
+/// has not been initialised yet -- these helpers run on background threads where
+/// a panic would silently take out GPS or compass polling.
+#[cfg(target_os = "android")]
+fn android_vm() -> Option<jni::vm::JavaVM> {
+    let vm = ndk_context::android_context().vm();
+    if vm.is_null() {
+        return None;
+    }
+    // SAFETY: non-null, and `ndk_context` guarantees it is the process JavaVM.
+    Some(unsafe { jni::vm::JavaVM::from_raw(vm.cast()) })
+}
+
 /// Check whether the app has been granted ACCESS_FINE_LOCATION.
 #[cfg(target_os = "android")]
 fn has_location_permission() -> bool {
-    use jni::objects::JObject;
-    use jni::JavaVM;
+    use jni::objects::{JObject, JValue};
+    use jni::{jni_sig, jni_str};
 
     let ctx = ndk_context::android_context();
-    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) };
-    let Ok(vm) = vm else { return false };
-    let Ok(mut env) = vm.attach_current_thread() else { return false };
-    let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
+    let Some(vm) = android_vm() else { return false };
+    let context = ctx.context();
 
-    let Ok(perm) = env.new_string("android.permission.ACCESS_FINE_LOCATION") else { return false };
-    let result = env.call_method(
-        &activity,
-        "checkSelfPermission",
-        "(Ljava/lang/String;)I",
-        &[jni::objects::JValue::from(&perm)],
-    );
-    match result {
-        Ok(val) => val.i().unwrap_or(-1) == 0, // PERMISSION_GRANTED == 0
-        Err(_) => false,
-    }
+    vm.attach_current_thread(|env| -> jni::errors::Result<bool> {
+        let activity = unsafe { JObject::from_raw(env, context.cast()) };
+
+        let perm = env.new_string("android.permission.ACCESS_FINE_LOCATION")?;
+        let granted = env
+            .call_method(
+                &activity,
+                jni_str!("checkSelfPermission"),
+                jni_sig!("(Ljava/lang/String;)I"),
+                &[JValue::from(&perm)],
+            )?
+            .i()?;
+        Ok(granted == 0) // PERMISSION_GRANTED == 0
+    })
+    .unwrap_or(false)
 }
 
 /// Request the ACCESS_FINE_LOCATION runtime permission.
@@ -43,48 +62,69 @@ fn has_location_permission() -> bool {
 #[cfg(target_os = "android")]
 fn request_location_permission() {
     use jni::objects::{JObject, JValue};
-    use jni::JavaVM;
+    use jni::{jni_sig, jni_str};
 
     let ctx = ndk_context::android_context();
-    let Ok(vm) = (unsafe { JavaVM::from_raw(ctx.vm().cast()) }) else { return };
-    let Ok(mut env) = vm.attach_current_thread() else { return };
-    let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
+    let Some(vm) = android_vm() else { return };
+    let context = ctx.context();
 
-    // requestPermissions() is Activity-only; context may be Application after resume.
-    let Ok(activity_class) = env.find_class("android/app/Activity") else { return };
-    if !env.is_instance_of(&activity, activity_class).unwrap_or(false) { return }
+    let _ = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
+        let activity = unsafe { JObject::from_raw(env, context.cast()) };
 
-    let Ok(perm_str) = env.new_string("android.permission.ACCESS_FINE_LOCATION") else { return };
-    let Ok(string_class) = env.find_class("java/lang/String") else { return };
-    let Ok(perm_array) = env.new_object_array(1, &string_class, &perm_str) else { return };
+        // requestPermissions() is Activity-only; context may be Application after resume.
+        let activity_class = env.find_class(jni_str!("android/app/Activity"))?;
+        if !env.is_instance_of(&activity, &activity_class).unwrap_or(false) {
+            return Ok(());
+        }
 
-    let _ = env.call_method(
-        &activity,
-        "requestPermissions",
-        "([Ljava/lang/String;I)V",
-        &[JValue::from(&perm_array), JValue::from(1i32)],
-    );
+        let perm_str = env.new_string("android.permission.ACCESS_FINE_LOCATION")?;
+        let string_class = env.find_class(jni_str!("java/lang/String"))?;
+        let perm_array = env.new_object_array(1, &string_class, &perm_str)?;
+
+        let _ = env.call_method(
+            &activity,
+            jni_str!("requestPermissions"),
+            jni_sig!("([Ljava/lang/String;I)V"),
+            &[JValue::from(&perm_array), JValue::Int(1)],
+        );
+        Ok(())
+    });
 }
 
 /// Try to retrieve the device's last known GPS location via `LocationManager`.
 /// Returns a [`GpsFix`] on success or `None` if unavailable.
 #[cfg(target_os = "android")]
 fn get_last_known_location() -> Option<rustdar_gps::GpsFix> {
-    use jni::objects::{JObject, JValue};
-    use jni::JavaVM;
-
     let ctx = ndk_context::android_context();
-    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
-    let mut env = vm.attach_current_thread().ok()?;
-    let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
+    let vm = android_vm()?;
+    let context = ctx.context();
+
+    vm.attach_current_thread(|env| -> jni::errors::Result<Option<rustdar_gps::GpsFix>> {
+        Ok(last_known_location_with(env, context))
+    })
+    .ok()
+    .flatten()
+}
+
+/// Body of [`get_last_known_location`], split out so it can keep using `?` on
+/// `Option` inside the `Env` closure that jni 0.22's attachment API requires.
+#[cfg(target_os = "android")]
+fn last_known_location_with(
+    env: &mut jni::Env<'_>,
+    context: *mut std::ffi::c_void,
+) -> Option<rustdar_gps::GpsFix> {
+    use jni::objects::{JObject, JValue};
+    use jni::{jni_sig, jni_str};
+
+    let activity = unsafe { JObject::from_raw(env, context.cast()) };
 
     // LocationManager lm = context.getSystemService("location");
     let service_name = env.new_string("location").ok()?;
     let lm = env
         .call_method(
             &activity,
-            "getSystemService",
-            "(Ljava/lang/String;)Ljava/lang/Object;",
+            jni_str!("getSystemService"),
+            jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
             &[JValue::from(&service_name)],
         )
         .ok()?
@@ -99,8 +139,8 @@ fn get_last_known_location() -> Option<rustdar_gps::GpsFix> {
         let provider_str = env.new_string(provider).ok()?;
         let location = env.call_method(
             &lm,
-            "getLastKnownLocation",
-            "(Ljava/lang/String;)Landroid/location/Location;",
+            jni_str!("getLastKnownLocation"),
+            jni_sig!("(Ljava/lang/String;)Landroid/location/Location;"),
             &[JValue::from(&provider_str)],
         );
         // getLastKnownLocation throws SecurityException without permission
@@ -113,12 +153,12 @@ fn get_last_known_location() -> Option<rustdar_gps::GpsFix> {
         }
 
         let lat = env
-            .call_method(&location, "getLatitude", "()D", &[])
+            .call_method(&location, jni_str!("getLatitude"), jni_sig!("()D"), &[])
             .ok()?
             .d()
             .ok()?;
         let lon = env
-            .call_method(&location, "getLongitude", "()D", &[])
+            .call_method(&location, jni_str!("getLongitude"), jni_sig!("()D"), &[])
             .ok()?
             .d()
             .ok()?;
@@ -130,32 +170,32 @@ fn get_last_known_location() -> Option<rustdar_gps::GpsFix> {
 
         // Extract extended fix data
         let altitude_m = env
-            .call_method(&location, "getAltitude", "()D", &[])
+            .call_method(&location, jni_str!("getAltitude"), jni_sig!("()D"), &[])
             .and_then(|v| v.d())
             .ok()
             .filter(|_| {
-                env.call_method(&location, "hasAltitude", "()Z", &[])
+                env.call_method(&location, jni_str!("hasAltitude"), jni_sig!("()Z"), &[])
                     .and_then(|v| v.z())
                     .unwrap_or(false)
             });
 
         let speed_mps = env
-            .call_method(&location, "getSpeed", "()F", &[])
+            .call_method(&location, jni_str!("getSpeed"), jni_sig!("()F"), &[])
             .and_then(|v| v.f())
             .ok()
             .filter(|_| {
-                env.call_method(&location, "hasSpeed", "()Z", &[])
+                env.call_method(&location, jni_str!("hasSpeed"), jni_sig!("()Z"), &[])
                     .and_then(|v| v.z())
                     .unwrap_or(false)
             })
             .map(|s| s as f64);
 
         let heading_deg = env
-            .call_method(&location, "getBearing", "()F", &[])
+            .call_method(&location, jni_str!("getBearing"), jni_sig!("()F"), &[])
             .and_then(|v| v.f())
             .ok()
             .filter(|_| {
-                env.call_method(&location, "hasBearing", "()Z", &[])
+                env.call_method(&location, jni_str!("hasBearing"), jni_sig!("()Z"), &[])
                     .and_then(|v| v.z())
                     .unwrap_or(false)
             })
@@ -196,10 +236,10 @@ fn start_location_thread(sender: std::sync::mpsc::Sender<rustdar_gps::GpsFix>) {
 
         loop {
             if has_location_permission() {
-                if let Some(fix) = get_last_known_location() {
-                    if sender.send(fix).is_err() {
-                        break; // channel closed
-                    }
+                if let Some(fix) = get_last_known_location()
+                    && sender.send(fix).is_err()
+                {
+                    break; // channel closed
                 }
             } else if !permission_requested {
                 log::info!("Requesting ACCESS_FINE_LOCATION permission");
@@ -216,39 +256,51 @@ fn start_location_thread(sender: std::sync::mpsc::Sender<rustdar_gps::GpsFix>) {
 /// Returns (top, bottom, left, right) inset values.
 #[cfg(target_os = "android")]
 pub fn get_system_insets() -> (f32, f32, f32, f32) {
-    use jni::objects::{JObject, JValue};
-    use jni::JavaVM;
-
     let ctx = ndk_context::android_context();
-    let Ok(vm) = (unsafe { JavaVM::from_raw(ctx.vm().cast()) }) else {
+    let Some(vm) = android_vm() else {
         return (0.0, 0.0, 0.0, 0.0);
     };
-    let Ok(mut env) = vm.attach_current_thread() else {
-        return (0.0, 0.0, 0.0, 0.0);
-    };
-    let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
+    let context = ctx.context();
+
+    vm.attach_current_thread(|env| -> jni::errors::Result<(f32, f32, f32, f32)> {
+        Ok(system_insets_with(env, context))
+    })
+    .unwrap_or((0.0, 0.0, 0.0, 0.0))
+}
+
+/// Body of [`get_system_insets`], split out so it can `return` early from inside
+/// the `Env` closure that jni 0.22's attachment API requires.
+#[cfg(target_os = "android")]
+fn system_insets_with(
+    env: &mut jni::Env<'_>,
+    context: *mut std::ffi::c_void,
+) -> (f32, f32, f32, f32) {
+    use jni::objects::{JObject, JValue};
+    use jni::{jni_sig, jni_str};
+
+    let activity = unsafe { JObject::from_raw(env, context.cast()) };
 
     // After suspend/resume, ndk_context may return the Application instead of
     // the Activity. getWindow() only exists on Activity, so bail out early.
-    let Ok(activity_class) = env.find_class("android/app/Activity") else {
+    let Ok(activity_class) = env.find_class(jni_str!("android/app/Activity")) else {
         return (0.0, 0.0, 0.0, 0.0);
     };
-    if !env.is_instance_of(&activity, activity_class).unwrap_or(false) {
+    if !env.is_instance_of(&activity, &activity_class).unwrap_or(false) {
         log::warn!("get_system_insets: context is not an Activity, skipping");
         return (0.0, 0.0, 0.0, 0.0);
     }
 
     // Activity.getWindow().getDecorView().getRootWindowInsets()
-    let window = match env.call_method(&activity, "getWindow", "()Landroid/view/Window;", &[]) {
+    let window = match env.call_method(&activity, jni_str!("getWindow"), jni_sig!("()Landroid/view/Window;"), &[]) {
         Ok(w) => match w.l() { Ok(w) => w, Err(_) => return (0.0, 0.0, 0.0, 0.0) },
         Err(_) => return (0.0, 0.0, 0.0, 0.0),
     };
-    let decor = match env.call_method(&window, "getDecorView", "()Landroid/view/View;", &[]) {
+    let decor = match env.call_method(&window, jni_str!("getDecorView"), jni_sig!("()Landroid/view/View;"), &[]) {
         Ok(v) => match v.l() { Ok(v) => v, Err(_) => return (0.0, 0.0, 0.0, 0.0) },
         Err(_) => return (0.0, 0.0, 0.0, 0.0),
     };
     let insets_obj = match env.call_method(
-        &decor, "getRootWindowInsets", "()Landroid/view/WindowInsets;", &[]
+        &decor, jni_str!("getRootWindowInsets"), jni_sig!("()Landroid/view/WindowInsets;"), &[]
     ) {
         Ok(i) => match i.l() {
             Ok(i) if !i.is_null() => i,
@@ -259,36 +311,36 @@ pub fn get_system_insets() -> (f32, f32, f32, f32) {
 
     // On API 30+, use getInsets(WindowInsets.Type.systemBars())
     // On older APIs, use getSystemWindowInset*()
-    let (top, bottom, left, right) = if android_api_level() >= 30 {
+    let (top, bottom, left, right) = if android_api_level(env) >= 30 {
         // WindowInsets.Type.systemBars() returns a bitmask
-        let type_class = match env.find_class("android/view/WindowInsets$Type") {
+        let type_class = match env.find_class(jni_str!("android/view/WindowInsets$Type")) {
             Ok(c) => c,
-            Err(_) => return get_legacy_insets(&mut env, &insets_obj),
+            Err(_) => return get_legacy_insets(env, &insets_obj),
         };
-        let type_mask = match env.call_static_method(type_class, "systemBars", "()I", &[]) {
-            Ok(v) => match v.i() { Ok(v) => v, Err(_) => return get_legacy_insets(&mut env, &insets_obj) },
-            Err(_) => return get_legacy_insets(&mut env, &insets_obj),
+        let type_mask = match env.call_static_method(&type_class, jni_str!("systemBars"), jni_sig!("()I"), &[]) {
+            Ok(v) => match v.i() { Ok(v) => v, Err(_) => return get_legacy_insets(env, &insets_obj) },
+            Err(_) => return get_legacy_insets(env, &insets_obj),
         };
         let insets_result = env.call_method(
-            &insets_obj, "getInsets", "(I)Landroid/graphics/Insets;",
-            &[JValue::from(type_mask)],
+            &insets_obj, jni_str!("getInsets"), jni_sig!("(I)Landroid/graphics/Insets;"),
+            &[JValue::Int(type_mask)],
         );
         match insets_result {
             Ok(val) => {
                 let insets = match val.l() {
                     Ok(i) if !i.is_null() => i,
-                    _ => return get_legacy_insets(&mut env, &insets_obj),
+                    _ => return get_legacy_insets(env, &insets_obj),
                 };
-                let t = env.get_field(&insets, "top", "I").map(|v| v.i().unwrap_or(0)).unwrap_or(0);
-                let b = env.get_field(&insets, "bottom", "I").map(|v| v.i().unwrap_or(0)).unwrap_or(0);
-                let l = env.get_field(&insets, "left", "I").map(|v| v.i().unwrap_or(0)).unwrap_or(0);
-                let r = env.get_field(&insets, "right", "I").map(|v| v.i().unwrap_or(0)).unwrap_or(0);
+                let t = env.get_field(&insets, jni_str!("top"), jni_sig!("I")).map(|v| v.i().unwrap_or(0)).unwrap_or(0);
+                let b = env.get_field(&insets, jni_str!("bottom"), jni_sig!("I")).map(|v| v.i().unwrap_or(0)).unwrap_or(0);
+                let l = env.get_field(&insets, jni_str!("left"), jni_sig!("I")).map(|v| v.i().unwrap_or(0)).unwrap_or(0);
+                let r = env.get_field(&insets, jni_str!("right"), jni_sig!("I")).map(|v| v.i().unwrap_or(0)).unwrap_or(0);
                 (t as f32, b as f32, l as f32, r as f32)
             }
-            Err(_) => get_legacy_insets(&mut env, &insets_obj),
+            Err(_) => get_legacy_insets(env, &insets_obj),
         }
     } else {
-        get_legacy_insets(&mut env, &insets_obj)
+        get_legacy_insets(env, &insets_obj)
     };
 
     (top, bottom, left, right)
@@ -296,27 +348,31 @@ pub fn get_system_insets() -> (f32, f32, f32, f32) {
 
 /// Fallback for Android < API 30: use deprecated getSystemWindowInset*() methods.
 #[cfg(target_os = "android")]
-fn get_legacy_insets(env: &mut jni::AttachGuard<'_>, insets_obj: &jni::objects::JObject<'_>) -> (f32, f32, f32, f32) {
-    let top = env.call_method(insets_obj, "getSystemWindowInsetTop", "()I", &[])
+fn get_legacy_insets(env: &mut jni::Env<'_>, insets_obj: &jni::objects::JObject<'_>) -> (f32, f32, f32, f32) {
+    use jni::{jni_sig, jni_str};
+
+    let top = env.call_method(insets_obj, jni_str!("getSystemWindowInsetTop"), jni_sig!("()I"), &[])
         .map(|v| v.i().unwrap_or(0)).unwrap_or(0);
-    let bottom = env.call_method(insets_obj, "getSystemWindowInsetBottom", "()I", &[])
+    let bottom = env.call_method(insets_obj, jni_str!("getSystemWindowInsetBottom"), jni_sig!("()I"), &[])
         .map(|v| v.i().unwrap_or(0)).unwrap_or(0);
-    let left = env.call_method(insets_obj, "getSystemWindowInsetLeft", "()I", &[])
+    let left = env.call_method(insets_obj, jni_str!("getSystemWindowInsetLeft"), jni_sig!("()I"), &[])
         .map(|v| v.i().unwrap_or(0)).unwrap_or(0);
-    let right = env.call_method(insets_obj, "getSystemWindowInsetRight", "()I", &[])
+    let right = env.call_method(insets_obj, jni_str!("getSystemWindowInsetRight"), jni_sig!("()I"), &[])
         .map(|v| v.i().unwrap_or(0)).unwrap_or(0);
     (top as f32, bottom as f32, left as f32, right as f32)
 }
 
 /// Get the Android API level.
+///
+/// Takes the caller's `Env` rather than attaching its own: jni 0.22 attachments
+/// push a JNI stack frame, and nesting one inside `system_insets_with` would put
+/// the local references it is holding out of the top frame.
 #[cfg(target_os = "android")]
-fn android_api_level() -> i32 {
-    use jni::JavaVM;
-    let ctx = ndk_context::android_context();
-    let Ok(vm) = (unsafe { JavaVM::from_raw(ctx.vm().cast()) }) else { return 0 };
-    let Ok(mut env) = vm.attach_current_thread() else { return 0 };
-    let Ok(build_class) = env.find_class("android/os/Build$VERSION") else { return 0 };
-    env.get_static_field(build_class, "SDK_INT", "I")
+fn android_api_level(env: &mut jni::Env<'_>) -> i32 {
+    use jni::{jni_sig, jni_str};
+
+    let Ok(build_class) = env.find_class(jni_str!("android/os/Build$VERSION")) else { return 0 };
+    env.get_static_field(&build_class, jni_str!("SDK_INT"), jni_sig!("I"))
         .map(|v| v.i().unwrap_or(0))
         .unwrap_or(0)
 }
@@ -325,25 +381,36 @@ fn android_api_level() -> i32 {
 #[cfg(target_os = "android")]
 fn get_display_density() -> f32 {
     use jni::objects::JObject;
-    use jni::JavaVM;
+    use jni::{jni_sig, jni_str};
 
     let ctx = ndk_context::android_context();
-    let Ok(vm) = (unsafe { JavaVM::from_raw(ctx.vm().cast()) }) else { return 1.0 };
-    let Ok(mut env) = vm.attach_current_thread() else { return 1.0 };
-    let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
+    let Some(vm) = android_vm() else { return 1.0 };
+    let context = ctx.context();
 
-    // activity.getResources().getDisplayMetrics().density
-    let resources = match env.call_method(&activity, "getResources", "()Landroid/content/res/Resources;", &[]) {
-        Ok(r) => match r.l() { Ok(r) => r, Err(_) => return 1.0 },
-        Err(_) => return 1.0,
-    };
-    let metrics = match env.call_method(&resources, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;", &[]) {
-        Ok(m) => match m.l() { Ok(m) => m, Err(_) => return 1.0 },
-        Err(_) => return 1.0,
-    };
-    env.get_field(&metrics, "density", "F")
-        .map(|v| v.f().unwrap_or(1.0))
-        .unwrap_or(1.0)
+    vm.attach_current_thread(|env| -> jni::errors::Result<f32> {
+        let activity = unsafe { JObject::from_raw(env, context.cast()) };
+
+        // activity.getResources().getDisplayMetrics().density
+        let resources = env
+            .call_method(
+                &activity,
+                jni_str!("getResources"),
+                jni_sig!("()Landroid/content/res/Resources;"),
+                &[],
+            )?
+            .l()?;
+        let metrics = env
+            .call_method(
+                &resources,
+                jni_str!("getDisplayMetrics"),
+                jni_sig!("()Landroid/util/DisplayMetrics;"),
+                &[],
+            )?
+            .l()?;
+        env.get_field(&metrics, jni_str!("density"), jni_sig!("F"))?
+            .f()
+    })
+    .unwrap_or(1.0)
 }
 
 /// Minimize the app by calling Activity.moveTaskToBack(true) via JNI.
@@ -351,30 +418,39 @@ fn get_display_density() -> f32 {
 /// of killing the process (which leaves a white box in recents).
 #[cfg(target_os = "android")]
 pub fn move_task_to_back() {
-    use jni::objects::JObject;
-    use jni::JavaVM;
+    use jni::objects::{JObject, JValue};
+    use jni::{jni_sig, jni_str};
 
     let ctx = ndk_context::android_context();
-    let Ok(vm) = (unsafe { JavaVM::from_raw(ctx.vm().cast()) }) else {
+    let Some(vm) = android_vm() else {
         log::warn!("moveTaskToBack: failed to get JavaVM");
         return;
     };
-    let Ok(mut env) = vm.attach_current_thread() else {
+    let context = ctx.context();
+
+    let attached = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
+        let activity = unsafe { JObject::from_raw(env, context.cast()) };
+
+        // moveTaskToBack() is Activity-only; context may be Application after resume.
+        let activity_class = env.find_class(jni_str!("android/app/Activity"))?;
+        if !env.is_instance_of(&activity, &activity_class).unwrap_or(false) {
+            log::warn!("moveTaskToBack: context is not an Activity, skipping");
+            return Ok(());
+        }
+
+        match env.call_method(
+            &activity,
+            jni_str!("moveTaskToBack"),
+            jni_sig!("(Z)Z"),
+            &[JValue::Bool(true)],
+        ) {
+            Ok(_) => log::info!("App moved to background"),
+            Err(e) => log::warn!("moveTaskToBack failed: {:?}", e),
+        }
+        Ok(())
+    });
+    if attached.is_err() {
         log::warn!("moveTaskToBack: failed to attach JNI thread");
-        return;
-    };
-    let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
-
-    // moveTaskToBack() is Activity-only; context may be Application after resume.
-    let Ok(activity_class) = env.find_class("android/app/Activity") else { return };
-    if !env.is_instance_of(&activity, activity_class).unwrap_or(false) {
-        log::warn!("moveTaskToBack: context is not an Activity, skipping");
-        return;
-    }
-
-    match env.call_method(&activity, "moveTaskToBack", "(Z)Z", &[jni::objects::JValue::from(true)]) {
-        Ok(_) => log::info!("App moved to background"),
-        Err(e) => log::warn!("moveTaskToBack failed: {:?}", e),
     }
 }
 
@@ -382,29 +458,32 @@ pub fn move_task_to_back() {
 // Compass heading via JNI (CompassHelper.java)
 // ---------------------------------------------------------------------------
 
-/// JClass for com.rustdar.CompassHelper, loaded once via PathClassLoader.
+/// JClass for com.rustdar.CompassHelper, loaded once via the app class loader.
+///
+/// jni 0.22: `Global` is generic over the Java type it references, so this keeps
+/// its `JClass`-ness and no longer needs an unsafe re-wrap to call statics on it.
 #[cfg(target_os = "android")]
-static COMPASS_CLASS: std::sync::OnceLock<jni::objects::GlobalRef> = std::sync::OnceLock::new();
+static COMPASS_CLASS: std::sync::OnceLock<jni::objects::Global<jni::objects::JClass<'static>>> =
+    std::sync::OnceLock::new();
 
 /// Read the current compass heading from CompassHelper.getHeading().
 /// Returns `None` if the class wasn't loaded or no reading is available yet.
 #[cfg(target_os = "android")]
 fn get_compass_heading() -> Option<f32> {
-    use jni::JavaVM;
+    use jni::objects::JClass;
+    use jni::{jni_sig, jni_str};
 
     let global_ref = COMPASS_CLASS.get()?;
-    let ctx = ndk_context::android_context();
-    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) };
-    let Ok(vm) = vm else { return None };
-    let Ok(mut env) = vm.attach_current_thread() else { return None };
+    let vm = android_vm()?;
 
-    let cls = jni::objects::JClass::from(unsafe {
-        jni::objects::JObject::from_raw(global_ref.as_obj().as_raw())
-    });
-    let heading = env.call_static_method(cls, "getHeading", "()F", &[])
-        .ok()?
-        .f()
+    let heading = vm
+        .attach_current_thread(|env| -> jni::errors::Result<f32> {
+            let cls: &JClass<'static> = global_ref;
+            env.call_static_method(cls, jni_str!("getHeading"), jni_sig!("()F"), &[])?
+                .f()
+        })
         .ok()?;
+
     if heading < 0.0 {
         None // -1 means no reading yet
     } else {
@@ -423,10 +502,10 @@ fn start_compass_thread(sender: std::sync::mpsc::Sender<f32>) {
         std::thread::sleep(std::time::Duration::from_secs(4));
 
         loop {
-            if let Some(heading) = get_compass_heading() {
-                if sender.send(heading).is_err() {
-                    break; // channel closed
-                }
+            if let Some(heading) = get_compass_heading()
+                && sender.send(heading).is_err()
+            {
+                break; // channel closed
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
@@ -448,32 +527,36 @@ fn start_compass_thread(sender: std::sync::mpsc::Sender<f32>) {
 /// [`ClassLoader`]: <https://developer.android.com/reference/java/lang/ClassLoader>
 #[cfg(target_os = "android")]
 fn register_java_helper(
-    env: &mut jni::AttachGuard<'_>,
+    env: &mut jni::Env<'_>,
     loader: &jni::objects::JObject<'_>,
     activity: &jni::objects::JObject<'_>,
     class_name: &str,
-) -> Option<jni::objects::GlobalRef> {
+) -> Option<jni::objects::Global<jni::objects::JClass<'static>>> {
     use jni::objects::{JClass, JValue};
+    use jni::{jni_sig, jni_str};
 
     let name = env.new_string(class_name).ok()?;
     let cls_obj = env
         .call_method(
             loader,
-            "loadClass",
-            "(Ljava/lang/String;)Ljava/lang/Class;",
+            jni_str!("loadClass"),
+            jni_sig!("(Ljava/lang/String;)Ljava/lang/Class;"),
             &[JValue::from(&name)],
         )
         .and_then(|v| v.l())
         .inspect_err(|e| log::warn!("Could not load {}: {:?}", class_name, e))
         .ok()?;
 
-    // Taken before the value is consumed by the JClass conversion below.
-    let global = env.new_global_ref(&cls_obj).ok();
+    // jni 0.22: `cast_local` is the checked replacement for the old
+    // `JClass::from(JObject)` conversion, and it borrows rather than consumes,
+    // so the global ref can be taken from the typed handle directly.
+    let cls = env.cast_local::<JClass>(cls_obj).ok()?;
+    let global = env.new_global_ref(&cls).ok();
 
     match env.call_static_method(
-        JClass::from(cls_obj),
-        "register",
-        "(Landroid/app/Activity;)V",
+        &cls,
+        jni_str!("register"),
+        jni_sig!("(Landroid/app/Activity;)V"),
         &[JValue::from(activity)],
     ) {
         Ok(_) => {
@@ -525,41 +608,52 @@ fn android_main(app: AndroidApp) {
     // (`android:hasCode="true"`), so the app loader is now the correct one and
     // that whole workaround is gone.
     {
-        use jni::JavaVM;
         use jni::objects::JObject;
+        use jni::vm::JavaVM;
+        use jni::{jni_sig, jni_str};
 
-        let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr() as *mut jni::sys::JavaVM) }
-            .expect("Failed to get JavaVM");
-        let mut env = vm
-            .attach_current_thread()
-            .expect("Failed to attach JNI thread");
+        // jni 0.22: `from_raw` is infallible and registers the process-wide
+        // `JavaVM` singleton; the environment is only handed out as a `&mut Env`
+        // borrowed for the body of the attachment closure.
+        let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr() as *mut jni::sys::JavaVM) };
+        let activity_ptr = app.activity_as_ptr() as jni::sys::jobject;
 
-        // Two handles onto the same jobject. `JObject::from_raw` only wraps the
-        // pointer -- it takes no ownership and deletes no local reference when
-        // dropped -- and `init_with_env` consumes the handle it is passed, so the
-        // second is what the helper registrations below use to reach the Activity.
-        let context = unsafe { JObject::from_raw(app.activity_as_ptr() as jni::sys::jobject) };
-        let activity = unsafe { JObject::from_raw(app.activity_as_ptr() as jni::sys::jobject) };
+        vm.attach_current_thread(|env| -> jni::errors::Result<()> {
+            // Two handles onto the same jobject. `JObject::from_raw` only wraps
+            // the pointer -- it takes no ownership and deletes no local reference
+            // when dropped -- and `init_with_env` consumes the handle it is
+            // passed, so the second is what the helper registrations below use to
+            // reach the Activity.
+            let context = unsafe { JObject::from_raw(env, activity_ptr) };
+            let activity = unsafe { JObject::from_raw(env, activity_ptr) };
 
-        rustls_platform_verifier::android::init_with_env(&mut env, context)
-            .expect("Failed to initialize rustls-platform-verifier");
-        log::info!("rustls-platform-verifier initialized");
+            rustls_platform_verifier::android::init_with_env(env, context)
+                .expect("Failed to initialize rustls-platform-verifier");
+            log::info!("rustls-platform-verifier initialized");
 
-        let loader = env
-            .call_method(&activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
-            .and_then(|v| v.l())
-            .expect("Context.getClassLoader() failed");
+            let loader = env
+                .call_method(
+                    &activity,
+                    jni_str!("getClassLoader"),
+                    jni_sig!("()Ljava/lang/ClassLoader;"),
+                    &[],
+                )
+                .and_then(|v| v.l())
+                .expect("Context.getClassLoader() failed");
 
-        // Back gesture on API 33+: back bypasses the native input queue and goes
-        // through OnBackInvokedDispatcher. Unhandled, NativeActivity calls
-        // finish() and the process dies; the helper minimises instead.
-        register_java_helper(&mut env, &loader, &activity, "com.rustdar.BackHandler");
+            // Back gesture on API 33+: back bypasses the native input queue and
+            // goes through OnBackInvokedDispatcher. Unhandled, NativeActivity
+            // calls finish() and the process dies; the helper minimises instead.
+            register_java_helper(env, &loader, &activity, "com.rustdar.BackHandler");
 
-        if let Some(cls) =
-            register_java_helper(&mut env, &loader, &activity, "com.rustdar.CompassHelper")
-        {
-            let _ = COMPASS_CLASS.set(cls);
-        }
+            if let Some(cls) =
+                register_java_helper(env, &loader, &activity, "com.rustdar.CompassHelper")
+            {
+                let _ = COMPASS_CLASS.set(cls);
+            }
+            Ok(())
+        })
+        .expect("Failed to attach JNI thread");
     }
 
     // Derive the Android cache directory for zone geometry caching.
