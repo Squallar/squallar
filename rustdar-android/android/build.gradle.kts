@@ -4,5 +4,5 @@
 // AGP 8.x binds to, so an 8.x plugin fails at apply-time against the wrapper
 // version pinned in gradle/wrapper/gradle-wrapper.properties.
 plugins {
-    id("com.android.application") version "9.3.0" apply false
+    id("com.android.application") version "9.3.1" apply false
 }
