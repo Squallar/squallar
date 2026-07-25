@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -8,7 +9,7 @@ use rustdar_radar::types::RadarProduct;
 
 use crate::WindowRef;
 use crate::channels::RenderResponse;
-use crate::constants::MAX_CONCURRENT_RENDERS;
+use crate::constants::{MAX_CONCURRENT_RENDERS, MAX_RENDER_CACHE_ENTRIES};
 
 /// Drop guard that decrements an AtomicUsize counter on drop.
 /// Guarantees the counter is decremented even if the thread panics.
@@ -63,6 +64,94 @@ pub struct CachedRenderOutput {
     pub value_data: Arc<Vec<f32>>,
 }
 
+/// `(site, product, elevation_tenths)` — see [`elevation_key`].
+pub type RenderCacheKey = (String, RadarProduct, i32);
+
+/// Bounded least-recently-used cache of render outputs shared between panes.
+///
+/// Each entry is an `IMAGE_SIZE²` RGBA image plus an `IMAGE_SIZE²` `f32` value
+/// grid — 32 MiB apiece at 2048² — and before this was bounded the only thing
+/// that ever dropped one was `reset_panes*`, so switching product or elevation
+/// grew the cache without limit.
+///
+/// The recency queue holds exactly the keys of `entries`, each exactly once,
+/// oldest use first. Every method that touches one touches the other; the pair
+/// is private so no caller can desynchronise them.
+pub struct RenderCache {
+    entries: HashMap<RenderCacheKey, CachedRenderOutput>,
+    recency: VecDeque<RenderCacheKey>,
+    capacity: usize,
+}
+
+impl RenderCache {
+    /// `capacity` is floored at 1 — a zero-capacity cache would evict every entry
+    /// on the way in, which is a silent way to disable pane sharing entirely.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            recency: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Move `key` to the most-recently-used end. No-op if absent.
+    fn touch(&mut self, key: &RenderCacheKey) {
+        if let Some(pos) = self.recency.iter().position(|k| k == key) {
+            let k = self.recency.remove(pos).expect("position() just yielded it");
+            self.recency.push_back(k);
+        }
+    }
+
+    /// Look up an entry, marking it most-recently-used.
+    ///
+    /// Takes `&mut self` deliberately: a lookup that did not count as a use would
+    /// let the pane currently on screen age out while an unwatched one survived.
+    pub fn get(&mut self, key: &RenderCacheKey) -> Option<&CachedRenderOutput> {
+        if !self.entries.contains_key(key) {
+            return None;
+        }
+        self.touch(key);
+        self.entries.get(key)
+    }
+
+    /// Insert an entry, evicting the least recently used until within capacity.
+    pub fn insert(&mut self, key: RenderCacheKey, value: CachedRenderOutput) {
+        if self.entries.insert(key.clone(), value).is_some() {
+            // Replacing an existing entry: it is already in `recency`, just refresh it.
+            self.touch(&key);
+        } else {
+            self.recency.push_back(key);
+        }
+        while self.entries.len() > self.capacity {
+            let Some(oldest) = self.recency.pop_front() else { break };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    /// Drop every entry whose key fails `keep`.
+    pub fn retain(&mut self, keep: impl Fn(&RenderCacheKey) -> bool) {
+        self.entries.retain(|k, _| keep(k));
+        self.recency.retain(|k| keep(k));
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.recency.clear();
+    }
+
+    #[cfg(test)]
+    pub fn entry_count(&self) -> usize {
+        debug_assert_eq!(self.entries.len(), self.recency.len(), "recency queue out of step");
+        self.entries.len()
+    }
+
+    /// Keys ordered least- to most-recently-used.
+    #[cfg(test)]
+    pub fn recency_order(&self) -> Vec<RenderCacheKey> {
+        self.recency.iter().cloned().collect()
+    }
+}
+
 /// Quantize an elevation angle to tenths of a degree for cache key use.
 ///
 /// Coarser than `rustdar_egui::pane::ELEVATION_TOLERANCE`, deliberately: that is a
@@ -98,7 +187,11 @@ pub struct RenderDispatcher {
     pub renders_in_flight: Arc<AtomicUsize>,
     /// Cache of the latest render output per (site, product, elevation_tenths), shared
     /// across panes that display the same product at the same elevation on the same site.
-    pub render_cache: HashMap<(String, RadarProduct, i32), CachedRenderOutput>,
+    ///
+    /// Bounded by `MAX_RENDER_CACHE_ENTRIES` on an LRU policy: it is a sharing cache
+    /// for the panes on screen, not a history, and each entry costs `IMAGE_SIZE² × 8`
+    /// bytes.
+    pub render_cache: RenderCache,
 }
 
 impl Default for RenderDispatcher {
@@ -116,7 +209,7 @@ impl RenderDispatcher {
             fetch_generations: HashMap::new(),
             // Owned here so there is exactly one render budget counter in the process.
             renders_in_flight: Arc::new(AtomicUsize::new(0)),
-            render_cache: HashMap::new(),
+            render_cache: RenderCache::new(MAX_RENDER_CACHE_ENTRIES),
         }
     }
 
@@ -138,7 +231,7 @@ impl RenderDispatcher {
         }
         self.render_generation += 1;
         self.level3_data.retain(|(_prod, _tilt, s), _| s != site);
-        self.render_cache.retain(|(s, _prod, _elev), _| s != site);
+        self.render_cache.retain(|(s, _prod, _elev)| s != site);
     }
 
     /// Reset all pane render state (e.g. after a new scan loads).
@@ -184,7 +277,10 @@ impl RenderDispatcher {
     }
 
     /// Look up a cached render result for the given site, product, and elevation.
-    pub fn get_cached_render(&self, site: &str, product: RadarProduct, elevation: f32) -> Option<&CachedRenderOutput> {
+    ///
+    /// `&mut self` because a hit counts as a use for the LRU: a pane that keeps
+    /// reusing its cached render must not age out behind one nobody is looking at.
+    pub fn get_cached_render(&mut self, site: &str, product: RadarProduct, elevation: f32) -> Option<&CachedRenderOutput> {
         self.render_cache.get(&(site.to_string(), product, elevation_key(elevation)))
     }
 
@@ -303,5 +399,138 @@ impl RenderDispatcher {
             crate::app::notify_redraw(&window);
         }).expect("failed to spawn radar-render thread");
         self.pane_render[pane_idx].render_in_flight = true;
+    }
+}
+
+#[cfg(test)]
+mod render_cache_tests {
+    use super::*;
+
+    fn key(site: &str, elevation_tenths: i32) -> RenderCacheKey {
+        (site.to_string(), RadarProduct::Reflectivity, elevation_tenths)
+    }
+
+    /// A distinguishable entry — `max_range_km` doubles as the identity so a test
+    /// can tell which render it got back.
+    fn output(range: f64) -> CachedRenderOutput {
+        CachedRenderOutput {
+            image_data: Arc::new(Vec::new()),
+            max_range_km: range,
+            value_data: Arc::new(Vec::new()),
+        }
+    }
+
+    /// The bound the cache exists for. Before this it was a bare `HashMap` that only
+    /// `reset_panes*` ever shrank, so cycling products grew it without limit at
+    /// ~32 MiB per entry.
+    #[test]
+    fn inserting_past_capacity_evicts_instead_of_growing() {
+        let mut cache = RenderCache::new(3);
+        for i in 0..10 {
+            cache.insert(key("KTLX", i), output(i as f64));
+        }
+        assert_eq!(cache.entry_count(), 3, "capacity must bound the cache");
+        // The three newest survived; everything older is gone.
+        assert!(cache.get(&key("KTLX", 9)).is_some());
+        assert!(cache.get(&key("KTLX", 8)).is_some());
+        assert!(cache.get(&key("KTLX", 7)).is_some());
+        assert!(cache.get(&key("KTLX", 6)).is_none());
+        assert!(cache.get(&key("KTLX", 0)).is_none());
+    }
+
+    /// Least *recently used*, not least recently inserted. A pane that keeps reading
+    /// its entry must not lose it to one nobody has touched since it was written.
+    #[test]
+    fn a_read_protects_an_entry_from_eviction() {
+        let mut cache = RenderCache::new(3);
+        cache.insert(key("KTLX", 0), output(0.0));
+        cache.insert(key("KTLX", 1), output(1.0));
+        cache.insert(key("KTLX", 2), output(2.0));
+
+        // Touch the oldest, making the *second* oldest the eviction candidate.
+        assert!(cache.get(&key("KTLX", 0)).is_some());
+        cache.insert(key("KTLX", 3), output(3.0));
+
+        assert!(cache.get(&key("KTLX", 0)).is_some(), "the read should have saved it");
+        assert!(cache.get(&key("KTLX", 1)).is_none(), "untouched since insert, so it goes");
+        assert_eq!(cache.entry_count(), 3);
+    }
+
+    /// Re-inserting an existing key replaces the value and refreshes its position,
+    /// rather than queueing the key a second time and corrupting the eviction order.
+    #[test]
+    fn reinserting_a_key_replaces_it_without_duplicating_it() {
+        let mut cache = RenderCache::new(2);
+        cache.insert(key("KTLX", 0), output(0.0));
+        cache.insert(key("KTLX", 1), output(1.0));
+        cache.insert(key("KTLX", 0), output(99.0));
+
+        assert_eq!(cache.entry_count(), 2, "a replacement is not a new entry");
+        assert_eq!(cache.recency_order(), vec![key("KTLX", 1), key("KTLX", 0)]);
+        assert_eq!(cache.get(&key("KTLX", 0)).unwrap().max_range_km, 99.0);
+
+        // With `0` refreshed, `1` is now the oldest and is what a third insert evicts.
+        cache.insert(key("KTLX", 2), output(2.0));
+        assert!(cache.get(&key("KTLX", 1)).is_none());
+        assert!(cache.get(&key("KTLX", 0)).is_some());
+    }
+
+    /// `reset_panes_for_site` drops one site's entries. The recency queue has to lose
+    /// them too, or it later evicts a key that is no longer in the map while the real
+    /// oldest entry survives.
+    #[test]
+    fn retain_drops_keys_from_the_recency_queue_as_well() {
+        let mut cache = RenderCache::new(4);
+        cache.insert(key("KTLX", 0), output(0.0));
+        cache.insert(key("KOUN", 1), output(1.0));
+        cache.insert(key("KTLX", 2), output(2.0));
+
+        cache.retain(|(site, _, _)| site != "KTLX");
+
+        assert_eq!(cache.entry_count(), 1);
+        assert_eq!(cache.recency_order(), vec![key("KOUN", 1)]);
+
+        // Fill past capacity; KOUN is the oldest real entry and must be the one to go.
+        for i in 10..14 {
+            cache.insert(key("KDDC", i), output(i as f64));
+        }
+        assert_eq!(cache.entry_count(), 4);
+        assert!(cache.get(&key("KOUN", 1)).is_none());
+        assert!(cache.get(&key("KDDC", 13)).is_some());
+    }
+
+    #[test]
+    fn clear_empties_both_halves() {
+        let mut cache = RenderCache::new(4);
+        cache.insert(key("KTLX", 0), output(0.0));
+        cache.insert(key("KTLX", 1), output(1.0));
+        cache.clear();
+        assert_eq!(cache.entry_count(), 0);
+        assert!(cache.recency_order().is_empty());
+    }
+
+    /// A zero capacity would evict every entry on the way in, silently disabling the
+    /// cross-pane sharing the cache exists for.
+    #[test]
+    fn capacity_is_floored_at_one() {
+        let mut cache = RenderCache::new(0);
+        cache.insert(key("KTLX", 0), output(0.0));
+        assert_eq!(cache.entry_count(), 1);
+        assert!(cache.get(&key("KTLX", 0)).is_some());
+    }
+
+    /// The shipped bound must leave room for every pane that can be on screen at
+    /// once, or the panes evict each other and every layout change re-renders.
+    #[test]
+    fn the_configured_capacity_covers_a_full_pane_layout() {
+        let max_panes = if cfg!(target_os = "android") {
+            rustdar_egui::pane::MAX_PANES_MOBILE
+        } else {
+            rustdar_egui::pane::MAX_PANES_DESKTOP
+        };
+        assert!(
+            MAX_RENDER_CACHE_ENTRIES >= max_panes,
+            "cache holds {MAX_RENDER_CACHE_ENTRIES} but {max_panes} panes can be shown"
+        );
     }
 }

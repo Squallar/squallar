@@ -29,3 +29,19 @@ pub const MAX_CONCURRENT_LOOP_DOWNLOADS: usize = 8;
 pub const MAX_LOOP_FRAMES: usize = 20;
 #[cfg(not(target_os = "android"))]
 pub const MAX_LOOP_FRAMES: usize = 60;
+
+/// Maximum number of entries kept in `RenderDispatcher::render_cache`.
+///
+/// The cache exists so panes showing the same site/product/elevation share one
+/// render; it is not a history. Each entry holds an RGBA image and a matching
+/// `f32` value grid — `IMAGE_SIZE² × 8` bytes, 32 MiB at 2048² — and until this
+/// bound existed the only thing that ever removed one was `reset_panes*`, so a
+/// user cycling products accumulated them without limit.
+///
+/// Sized to comfortably exceed the pane count (`MAX_PANES_DESKTOP` is 6,
+/// `MAX_PANES_MOBILE` is 4) so the panes on screen can never evict each other,
+/// with a little headroom for switching back and forth.
+#[cfg(target_os = "android")]
+pub const MAX_RENDER_CACHE_ENTRIES: usize = 6;
+#[cfg(not(target_os = "android"))]
+pub const MAX_RENDER_CACHE_ENTRIES: usize = 8;
