@@ -459,6 +459,7 @@ impl super::App {
         if let Some(pane) = self.gui.pane_mut(pane_idx) {
             pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new_for_loop(
                 lookback_secs,
+                site.clone(),
                 site_lat,
                 site_lon,
             );
@@ -635,16 +636,18 @@ impl super::App {
     /// not mark the frame as in flight, since no response will arrive to clear it.
     ///
     /// `target` is the pane's current render target (`LoopPlaybackState::rendered_for`):
-    /// the *selected* product and elevation, as opposed to `params.elevation`, which is
-    /// snapped to a sweep in this frame's own scan. It is stamped on the response so a
-    /// result can be rejected if the pane retargets while the render runs.
+    /// the loop's site plus the *selected* product and elevation, as opposed to
+    /// `params.elevation`, which is snapped to a sweep in this frame's own scan, and
+    /// `params.lat`/`params.lon`, which are that same site's coordinates. It is stamped
+    /// on the response so a result can be rejected if the pane retargets — or the loop
+    /// is rebuilt for another site — while the render runs.
     pub(super) fn spawn_loop_frame_render(
         &self,
         pane_idx: usize,
         timestamp: NaiveDateTime,
         scan_data: std::sync::Arc<nexrad_model::data::Scan>,
         params: &crate::render_dispatch::RenderParams,
-        target: (rustdar_radar::types::RadarProduct, f32),
+        target: rustdar_egui::pane::RenderTarget,
     ) -> bool {
         // Check concurrent render limit (the counter is shared with static pane renders)
         let current = self.render.renders_in_flight.load(Ordering::Relaxed);
@@ -658,7 +661,6 @@ impl super::App {
         let elevation = params.elevation;
         let lat = params.lat;
         let lon = params.lon;
-        let (target_product, target_elevation) = target;
         let sender = self.channels.loop_render_sender.clone();
         let window = self.window.clone();
         std::thread::Builder::new()
@@ -671,8 +673,7 @@ impl super::App {
                     let _ = sender.send(crate::channels::LoopRenderResponse {
                         pane_idx,
                         timestamp,
-                        product: target_product,
-                        elevation: target_elevation,
+                        target,
                         image_data: image,
                         max_range_km: range,
                         value_data: values,
@@ -683,8 +684,7 @@ impl super::App {
                     let _ = sender.send(crate::channels::LoopRenderResponse {
                         pane_idx,
                         timestamp,
-                        product: target_product,
-                        elevation: target_elevation,
+                        target,
                         image_data: Vec::new(),
                         max_range_km: 0.0,
                         value_data: Vec::new(),

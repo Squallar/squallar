@@ -2,6 +2,7 @@ use chrono::NaiveDateTime;
 use nexrad_data::aws::archive::Identifier;
 use nexrad_level3::model::Level3Message;
 use nexrad_model::data::Scan;
+use rustdar_egui::pane::RenderTarget;
 use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
 use rustdar_overlays::render::rasterize::HitMap;
 use rustdar_overlays::types::GeoBounds;
@@ -79,14 +80,12 @@ pub struct LoopScanDownloadResponse {
 pub struct LoopRenderResponse {
     pub pane_idx: usize,
     pub timestamp: NaiveDateTime,
-    /// The pane's selected product when this render was dispatched.
-    pub product: RadarProduct,
-    /// The pane's *selected* elevation when this render was dispatched — not the
-    /// per-scan snapped angle the image was actually rendered at. Together with
-    /// `product` this is the render target key, compared against
-    /// `LoopPlaybackState::rendered_for` on arrival to reject results whose
-    /// selection the pane has since moved away from.
-    pub elevation: f32,
+    /// The render target this render was dispatched for: the loop's site plus the
+    /// pane's *selected* product and elevation — not the per-scan snapped angle the
+    /// image was actually rendered at. Compared against
+    /// `LoopPlaybackState::rendered_for` on arrival to reject results whose target the
+    /// pane has since moved away from.
+    pub target: RenderTarget,
     pub image_data: Vec<u8>,
     pub max_range_km: f64,
     pub value_data: Vec<f32>,

@@ -704,16 +704,14 @@ impl super::App {
                 continue;
             }
 
-            // Drop results the pane is no longer expecting — rendered for a product or
-            // elevation it has since retargeted away from, or aimed at a frame that is
-            // not awaiting one. Applying either paints an image the dispatcher then
-            // treats as done, so the frame never corrects itself.
+            // Drop results the pane is no longer expecting — rendered for a site,
+            // product or elevation it has since retargeted away from, or aimed at a
+            // frame that is not awaiting one. Applying either paints an image the
+            // dispatcher then treats as done, so the frame never corrects itself.
             //
             // This resolves the frame in the same pass that vets the result: a separate
             // lookup here could pick a different frame than the one the check cleared.
-            let Some(frame_idx) =
-                ls.frame_awaiting_render_result(rr.timestamp, rr.product, rr.elevation)
-            else {
+            let Some(frame_idx) = ls.frame_awaiting_render_result(rr.timestamp, &rr.target) else {
                 continue;
             };
 
@@ -759,10 +757,13 @@ impl super::App {
                     let sls = &mut sibling.loop_state;
                     if !sls.is_active() { continue; }
                     // Hand the image only to panes whose frames are keyed to exactly
-                    // what it depicts. Matching against the response rather than the
-                    // origin pane's live selection keeps a retarget on either side from
-                    // planting an image the receiving pane will never correct.
-                    if !sls.is_rendered_for(rr.product, rr.elevation) { continue; }
+                    // what it depicts, site included — the sibling positions the texture
+                    // with its *own* `site_lat`/`site_lon`, so an image projected for
+                    // another site would be drawn in the wrong place. Matching against
+                    // the response rather than the origin pane's live selection keeps a
+                    // retarget on either side from planting an image the receiving pane
+                    // will never correct.
+                    if !sls.is_rendered_for(&rr.target) { continue; }
                     let Some(sframe) = sls.frames.iter_mut().find(|f| f.timestamp == rr.timestamp) else {
                         continue;
                     };
@@ -1053,7 +1054,10 @@ impl super::App {
             // Stamp the render with the target its frame state is keyed to, so a result
             // that outlives a retarget can be recognised as stale on arrival. Set by
             // retarget_renders at the top of this same call, so it is always present.
-            let Some(target) = self.gui.pane(pane_idx).and_then(|p| p.loop_state.rendered_for)
+            let Some(target) = self
+                .gui
+                .pane(pane_idx)
+                .and_then(|p| p.loop_state.rendered_for.clone())
             else {
                 continue;
             };

@@ -38,6 +38,50 @@ pub struct LoopFrame {
     pub render_failed: bool,
 }
 
+/// Tolerance for comparing two selected elevation angles, matching the snapping
+/// tolerance the render dispatcher uses when picking a sweep for a selection.
+const ELEVATION_TOLERANCE: f32 = 0.01;
+
+/// Everything besides a frame's timestamp that determines the image a loop frame
+/// renders to: the radar site whose coordinates set the projection, and the
+/// product/elevation selection that picks the sweep.
+///
+/// This is the render target key. It is stored on `LoopPlaybackState::rendered_for`,
+/// stamped onto every dispatched render, and compared on arrival so a result
+/// produced for one target is never painted onto frames keyed to another.
+///
+/// `site` is the site the loop's *geometry* was captured for — the same lookup that
+/// produced `LoopPlaybackState::site_lat`/`site_lon`, which is what
+/// `render_radar_to_image` actually projects with. It is deliberately not the pane's
+/// live `site` field: the two can drift (a pane's site is re-synced from the active
+/// pane without rebuilding its loop), and it is the geometry the image depends on.
+///
+/// No `PartialEq` on purpose — `elevation` is an `f32` carried straight from a combo
+/// box, so `==` would be the wrong comparison. Use [`RenderTarget::matches`].
+#[derive(Clone, Debug)]
+pub struct RenderTarget {
+    /// NEXRAD site code supplying the projection geometry (e.g. "KTLX").
+    pub site: String,
+    pub product: RadarProduct,
+    /// The pane's *selected* elevation, not the per-scan snapped sweep angle.
+    pub elevation: f32,
+}
+
+impl RenderTarget {
+    pub fn new(site: impl Into<String>, product: RadarProduct, elevation: f32) -> Self {
+        Self { site: site.into(), product, elevation }
+    }
+
+    /// Whether two targets name the same image. Site and product are exact;
+    /// elevation is compared within `ELEVATION_TOLERANCE`, since the selection is
+    /// an `f32` that round-trips through the UI and the scan's own sweep angles.
+    pub fn matches(&self, other: &RenderTarget) -> bool {
+        self.site == other.site
+            && self.product == other.product
+            && (self.elevation - other.elevation).abs() <= ELEVATION_TOLERANCE
+    }
+}
+
 /// The state phases for a radar loop playback instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopPhase {
@@ -72,17 +116,28 @@ pub struct LoopPlaybackState {
     pub lookback_secs: u64,
     /// Instant of the last frame advance (for animation timing).
     pub last_advance: Option<std::time::Instant>,
+    /// NEXRAD site code the loop's geometry belongs to, captured at loop creation
+    /// from the same lookup as `site_lat`/`site_lon`. Every frame in this loop is
+    /// rendered and positioned with those coordinates, so this — not the pane's
+    /// live `site` field — is the site half of the render target.
+    pub site: String,
     /// Radar site latitude, captured at loop creation for rendering.
     pub site_lat: f64,
     /// Radar site longitude, captured at loop creation for rendering.
     pub site_lon: f64,
-    /// The (product, elevation) every frame's render state was produced for, or
-    /// `None` before the first dispatch. The user can change the pane's product
-    /// or elevation at any time, and both pieces of per-frame render state are
+    /// The [`RenderTarget`] every frame's render state was produced for, or `None`
+    /// before the first dispatch. The user can change the pane's product or
+    /// elevation at any time, and both pieces of per-frame render state are
     /// judgements about that selection — a `texture` shows that product, and a
     /// `render_failed` flag means "this scan carries no sweep for that product".
     /// When the selection moves, both are stale; see `retarget_renders`.
-    pub rendered_for: Option<(RadarProduct, f32)>,
+    ///
+    /// The site rides along so the target is the *whole* key a frame's image is
+    /// determined by. A loop is rebuilt from scratch when the pane changes site, so
+    /// this half never moves under a live loop — it exists to make results and
+    /// sibling broadcasts carrying another site's geometry impossible to apply,
+    /// rather than merely improbable.
+    pub rendered_for: Option<RenderTarget>,
 }
 
 /// Per-pane state: each pane independently selects a radar product,
@@ -135,6 +190,9 @@ impl Default for LoopPlaybackState {
 
 impl LoopPlaybackState {
     /// Create a default single-frame (non-loop) state.
+    ///
+    /// The site fields are placeholders: the state is `Inactive` with no frames, so
+    /// nothing is ever rendered or accepted against them.
     pub fn new() -> Self {
         Self {
             phase: LoopPhase::Inactive,
@@ -142,6 +200,7 @@ impl LoopPlaybackState {
             frames: Vec::new(),
             lookback_secs: 0,
             last_advance: None,
+            site: String::new(),
             site_lat: 0.0,
             site_lon: 0.0,
             rendered_for: None,
@@ -149,13 +208,23 @@ impl LoopPlaybackState {
     }
 
     /// Create a new initialized loop state starting the fetch phase.
-    pub fn new_for_loop(lookback_secs: u64, site_lat: f64, site_lon: f64) -> Self {
+    ///
+    /// `site`, `site_lat` and `site_lon` must come from the same site lookup: the
+    /// coordinates are what frames are rendered with, and the code is what identifies
+    /// them in the render target.
+    pub fn new_for_loop(
+        lookback_secs: u64,
+        site: impl Into<String>,
+        site_lat: f64,
+        site_lon: f64,
+    ) -> Self {
         Self {
             phase: LoopPhase::FetchingScanList,
             current_frame: 0,
             frames: Vec::new(),
             lookback_secs,
             last_advance: None,
+            site: site.into(),
             site_lat,
             site_lon,
             rendered_for: None,
@@ -187,26 +256,25 @@ impl LoopPlaybackState {
         matches!(self.phase, LoopPhase::Playing | LoopPhase::Paused)
     }
 
-    /// True if the frames' render state is keyed to exactly this product/elevation.
-    pub fn is_rendered_for(&self, product: RadarProduct, elevation: f32) -> bool {
-        self.rendered_for
-            .is_some_and(|(p, e)| p == product && (e - elevation).abs() <= 0.01)
+    /// True if the frames' render state is keyed to exactly this target.
+    pub fn is_rendered_for(&self, target: &RenderTarget) -> bool {
+        self.rendered_for.as_ref().is_some_and(|t| t.matches(target))
     }
 
     /// The index of the frame a finished render for `timestamp`, produced for
-    /// `product`/`elevation`, must be written to — or `None` if the result has to be
-    /// dropped.
+    /// `target`, must be written to — or `None` if the result has to be dropped.
     ///
     /// Two independent ways a result goes stale, and both must be checked:
     ///
-    /// - The pane retargeted while the render ran, so the image depicts a product or
-    ///   elevation the frames are no longer keyed to. Checking "is the frame still
-    ///   marked in flight?" cannot catch this: `retarget_renders` clears the mark, but
-    ///   the very same dispatch pass re-spawns the frame for the new target and marks it
-    ///   again, so the older render's result arrives to a frame that *is* in flight.
-    ///   Since a loop frame's image is fully determined by (timestamp, product,
-    ///   elevation), comparing the target is exact — a late result that still matches
-    ///   the current target is byte-identical to the pending one and safe to apply.
+    /// - The pane retargeted while the render ran, so the image depicts a site,
+    ///   product or elevation the frames are no longer keyed to. Checking "is the
+    ///   frame still marked in flight?" cannot catch this: `retarget_renders` clears
+    ///   the mark, but the very same dispatch pass re-spawns the frame for the new
+    ///   target and marks it again, so the older render's result arrives to a frame
+    ///   that *is* in flight. Since a loop frame's image is fully determined by
+    ///   (timestamp, site, product, elevation), comparing the target is exact — a late
+    ///   result that still matches the current target is byte-identical to the pending
+    ///   one and safe to apply.
     /// - The frame is not expecting a result at all: the frame list was rebuilt, the
     ///   graphics state was cleared, or a sibling pane already supplied the texture.
     ///
@@ -219,10 +287,9 @@ impl LoopPlaybackState {
     pub fn frame_awaiting_render_result(
         &self,
         timestamp: NaiveDateTime,
-        product: RadarProduct,
-        elevation: f32,
+        target: &RenderTarget,
     ) -> Option<usize> {
-        if !self.is_rendered_for(product, elevation) {
+        if !self.is_rendered_for(target) {
             return None;
         }
         self.frames
@@ -247,14 +314,19 @@ impl LoopPlaybackState {
     /// target moved. That alone does *not* make their results stale — the same dispatch
     /// pass re-spawns and re-marks the frame — so rejecting them is
     /// `frame_awaiting_render_result`'s job, via the target stamped on the response.
+    ///
+    /// Only the product and elevation are parameters: the target's site is the loop's
+    /// own `site`, which is fixed for the life of a `LoopPlaybackState`. A pane that
+    /// changes site gets a whole new loop state rather than a retarget.
     pub fn retarget_renders(&mut self, product: RadarProduct, elevation: f32) -> bool {
-        if self.is_rendered_for(product, elevation) {
+        let target = RenderTarget::new(self.site.clone(), product, elevation);
+        if self.is_rendered_for(&target) {
             return false;
         }
 
         // Nothing to discard before the first dispatch — frames start blank.
         let had_previous_target = self.rendered_for.is_some();
-        self.rendered_for = Some((product, elevation));
+        self.rendered_for = Some(target);
         if !had_previous_target {
             return false;
         }
@@ -606,8 +678,15 @@ mod tests {
         }
     }
 
+    /// The site every test loop is built for, unless it is explicitly given another.
+    const SITE: &str = "KTLX";
+
     fn loop_with_frames(count: usize, current_frame: usize) -> LoopPlaybackState {
-        let mut state = LoopPlaybackState::new_for_loop(3600, 35.0, -97.0);
+        loop_for_site(SITE, count, current_frame)
+    }
+
+    fn loop_for_site(site: &str, count: usize, current_frame: usize) -> LoopPlaybackState {
+        let mut state = LoopPlaybackState::new_for_loop(3600, site, 35.0, -97.0);
         state.phase = LoopPhase::Rendering;
         state.frames = (0..count)
             .map(|i| LoopFrame {
@@ -624,6 +703,11 @@ mod tests {
     /// Every frame's scan has downloaded.
     fn all_scans_available(_: &LoopFrame) -> bool {
         true
+    }
+
+    /// The target a render result carries, as stamped by `spawn_loop_frame_render`.
+    fn target(site: &str, product: RadarProduct, elevation: f32) -> RenderTarget {
+        RenderTarget::new(site, product, elevation)
     }
 
     #[test]
@@ -717,9 +801,10 @@ mod tests {
     #[test]
     fn retarget_is_a_noop_before_the_first_dispatch() {
         let mut state = loop_with_frames(3, 0);
-        assert_eq!(state.rendered_for, None);
+        assert!(state.rendered_for.is_none());
         assert!(!state.retarget_renders(RadarProduct::Reflectivity, 0.5));
-        assert_eq!(state.rendered_for, Some((RadarProduct::Reflectivity, 0.5)));
+        let adopted = state.rendered_for.as_ref().expect("target adopted");
+        assert!(adopted.matches(&target(SITE, RadarProduct::Reflectivity, 0.5)));
     }
 
     #[test]
@@ -775,7 +860,136 @@ mod tests {
 
         assert!(state.retarget_renders(RadarProduct::Reflectivity, 1.5));
         assert!(state.frames[0].texture.is_none());
-        assert_eq!(state.rendered_for, Some((RadarProduct::Reflectivity, 1.5)));
+        let retargeted = state.rendered_for.as_ref().expect("target adopted");
+        assert!(retargeted.matches(&target(SITE, RadarProduct::Reflectivity, 1.5)));
+    }
+
+    /// The render target is the *whole* key a frame's image is determined by, and the
+    /// site is half the geometry: `render_radar_to_image` projects around the site's
+    /// coordinates, so the same scan at the same product and elevation is a different
+    /// image per site. Without the site in the key, "a loop frame's image is fully
+    /// determined by (timestamp, product, elevation)" is simply false, and the target
+    /// comparison stops being exact.
+    #[test]
+    fn a_result_rendered_for_another_site_is_rejected() {
+        let mut state = loop_with_frames(3, 0);
+        state.retarget_renders(RadarProduct::Reflectivity, 0.5);
+        let frame_ts = state.frames[0].timestamp;
+        state.frames[0].render_in_flight = true;
+
+        assert_eq!(
+            state.frame_awaiting_render_result(
+                frame_ts,
+                &target(SITE, RadarProduct::Reflectivity, 0.5)
+            ),
+            Some(0),
+            "the loop's own site is accepted"
+        );
+        assert_eq!(
+            state.frame_awaiting_render_result(
+                frame_ts,
+                &target("KOUN", RadarProduct::Reflectivity, 0.5)
+            ),
+            None,
+            "an image projected around another site's coordinates must be rejected"
+        );
+    }
+
+    /// The site-change path. Switching site tears the loop down and builds a new one
+    /// (`LoopPlaybackState::new()` then `new_for_loop`), which is what closes this
+    /// today — but only incidentally: once the new loop has listed its scans, adopted
+    /// the same product/elevation and re-marked a frame in flight, an old render still
+    /// running for the previous site would be accepted on nothing but a timestamp
+    /// match. Two sites' volume times colliding to the second is unlikely, not
+    /// impossible, and the frame-list contents are not ours to guarantee.
+    #[test]
+    fn a_rebuilt_loop_rejects_the_previous_sites_in_flight_result() {
+        let mut old = loop_with_frames(3, 0);
+        old.retarget_renders(RadarProduct::Reflectivity, 0.5);
+        let frame_ts = old.frames[0].timestamp;
+        old.frames[0].render_in_flight = true;
+        let in_flight_target = old.rendered_for.clone().expect("dispatched target");
+
+        // User switches site: the loop is rebuilt for the new site and reaches the
+        // same state — same timestamp, same selection, frame dispatched again.
+        let mut rebuilt = loop_for_site("KOUN", 3, 0);
+        rebuilt.retarget_renders(RadarProduct::Reflectivity, 0.5);
+        rebuilt.frames[0].render_in_flight = true;
+
+        assert_eq!(
+            rebuilt.frames[0].timestamp, frame_ts,
+            "precondition: the rebuilt loop lists a frame at the same timestamp"
+        );
+        assert_eq!(
+            rebuilt.frame_awaiting_render_result(frame_ts, &in_flight_target),
+            None,
+            "the old site's render must not be painted onto the new site's frame"
+        );
+        assert_eq!(
+            rebuilt.frame_awaiting_render_result(
+                frame_ts,
+                &target("KOUN", RadarProduct::Reflectivity, 0.5)
+            ),
+            Some(0),
+            "the new site's own render is still accepted"
+        );
+    }
+
+    /// The sibling broadcast hands one pane's finished texture to every other pane
+    /// keyed to the same target, positioning it with the *receiving* pane's
+    /// `site_lat`/`site_lon`. A pane whose loop geometry is another site would draw
+    /// the image in the wrong place, so the site has to be part of that match too.
+    #[test]
+    fn a_sibling_on_another_site_does_not_accept_the_broadcast() {
+        let mut sibling = loop_for_site("KOUN", 3, 0);
+        sibling.retarget_renders(RadarProduct::Reflectivity, 0.5);
+
+        assert!(
+            !sibling.is_rendered_for(&target(SITE, RadarProduct::Reflectivity, 0.5)),
+            "same product and elevation, different geometry"
+        );
+        assert!(sibling.is_rendered_for(&target("KOUN", RadarProduct::Reflectivity, 0.5)));
+    }
+
+    /// Elevation is still compared with tolerance, and the site exactly.
+    #[test]
+    fn target_matching_tolerates_elevation_jitter_only() {
+        let base = target(SITE, RadarProduct::Reflectivity, 0.5);
+        assert!(base.matches(&target(SITE, RadarProduct::Reflectivity, 0.505)));
+        assert!(!base.matches(&target(SITE, RadarProduct::Reflectivity, 1.5)));
+        assert!(!base.matches(&target(SITE, RadarProduct::Velocity, 0.5)));
+        assert!(!base.matches(&target("KOUN", RadarProduct::Reflectivity, 0.5)));
+    }
+
+    /// Item 2: the accept check and the write must resolve to the same frame. The old
+    /// shape asked "is *some* frame with this timestamp in flight?" and left the caller
+    /// to fetch "the frame with this timestamp" — two lookups free to disagree, which
+    /// would clear one frame and leave the dispatched one marked in flight forever.
+    /// Returning the index makes disagreement unrepresentable.
+    #[test]
+    fn the_accepted_frame_is_the_one_that_is_in_flight() {
+        let mut state = loop_with_frames(3, 0);
+        state.retarget_renders(RadarProduct::Reflectivity, 0.5);
+
+        // Two frames sharing a timestamp. Deduplication upstream makes this
+        // unreachable today; nothing in this type enforces it.
+        let shared = state.frames[0].timestamp;
+        state.frames[2].timestamp = shared;
+        state.frames[2].render_in_flight = true;
+
+        assert_eq!(
+            state.frames.iter().position(|f| f.timestamp == shared),
+            Some(0),
+            "precondition: a timestamp-only lookup lands on the wrong frame"
+        );
+        assert_eq!(
+            state.frame_awaiting_render_result(
+                shared,
+                &target(SITE, RadarProduct::Reflectivity, 0.5)
+            ),
+            Some(2),
+            "the result must be written to the frame that was actually dispatched"
+        );
     }
 
     /// Eviction must keep exactly the render set. A rule that disagreed with the
@@ -828,42 +1042,17 @@ mod tests {
             "precondition: an in-flight-only guard would accept the stale result here"
         );
         assert_eq!(
-            state.frame_awaiting_render_result(frame_ts, RadarProduct::Velocity, 0.5),
+            state.frame_awaiting_render_result(frame_ts, &target(SITE, RadarProduct::Velocity, 0.5)),
             None,
             "a result for the abandoned target must be rejected"
         );
         assert_eq!(
-            state.frame_awaiting_render_result(frame_ts, RadarProduct::Reflectivity, 0.5),
+            state.frame_awaiting_render_result(
+                frame_ts,
+                &target(SITE, RadarProduct::Reflectivity, 0.5)
+            ),
             Some(0),
             "the re-dispatched render for the current target is still accepted"
-        );
-    }
-
-    /// The accept check and the write must resolve to the same frame. The old shape
-    /// asked "is *some* frame with this timestamp in flight?" and left the caller to
-    /// fetch "the frame with this timestamp" — two lookups free to disagree, which
-    /// would clear one frame and leave the dispatched one marked in flight forever.
-    /// Returning the index makes disagreement unrepresentable.
-    #[test]
-    fn the_accepted_frame_is_the_one_that_is_in_flight() {
-        let mut state = loop_with_frames(3, 0);
-        state.retarget_renders(RadarProduct::Reflectivity, 0.5);
-
-        // Two frames sharing a timestamp. Deduplication upstream makes this
-        // unreachable today; nothing in this type enforces it.
-        let shared = state.frames[0].timestamp;
-        state.frames[2].timestamp = shared;
-        state.frames[2].render_in_flight = true;
-
-        assert_eq!(
-            state.frames.iter().position(|f| f.timestamp == shared),
-            Some(0),
-            "precondition: a timestamp-only lookup lands on the wrong frame"
-        );
-        assert_eq!(
-            state.frame_awaiting_render_result(shared, RadarProduct::Reflectivity, 0.5),
-            Some(2),
-            "the result must be written to the frame that was actually dispatched"
         );
     }
 
@@ -874,17 +1063,16 @@ mod tests {
         state.retarget_renders(RadarProduct::Reflectivity, 0.5);
         let frame_ts = state.frames[0].timestamp;
 
+        let current = target(SITE, RadarProduct::Reflectivity, 0.5);
+
         // Never dispatched, or already satisfied by a sibling pane's broadcast.
-        let awaiting = |s: &LoopPlaybackState, t| {
-            s.frame_awaiting_render_result(t, RadarProduct::Reflectivity, 0.5)
-        };
-        assert_eq!(awaiting(&state, frame_ts), None);
+        assert_eq!(state.frame_awaiting_render_result(frame_ts, &current), None);
         state.frames[0].texture = Some(dummy_texture(&ctx));
-        assert_eq!(awaiting(&state, frame_ts), None);
+        assert_eq!(state.frame_awaiting_render_result(frame_ts, &current), None);
 
         // A timestamp that is not in the frame list at all (list rebuilt since dispatch).
         state.frames[1].render_in_flight = true;
-        assert_eq!(awaiting(&state, ts(59)), None);
+        assert_eq!(state.frame_awaiting_render_result(ts(59), &current), None);
     }
 
     /// Eviction now keeps only render-set members, where the previous rule kept the
