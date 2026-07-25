@@ -700,6 +700,19 @@ fn draw_shadowed_text(
     );
 }
 
+/// Whether a pane's color scale bars should be horizontal (along the bottom)
+/// rather than vertical (along the right edge).
+///
+/// This is keyed on the pane's aspect ratio, not on the platform: panes are
+/// laid out in a grid, so a desktop window can produce portrait panes and a
+/// tablet/landscape phone can produce landscape ones. A portrait pane gets the
+/// bottom bar (what a phone has always shown), a landscape pane the right-hand
+/// bar (what desktop has always shown), so the common single-pane case on each
+/// platform is unchanged.
+fn horizontal_color_scale(pane_rect: egui::Rect) -> bool {
+    pane_rect.height() > pane_rect.width()
+}
+
 /// Render the color scale legend bar for the current pane's radar product.
 fn render_color_scale(
     painter: &egui::Painter,
@@ -713,13 +726,15 @@ fn render_color_scale(
         return;
     }
 
-    // Desktop: vertical bar on the right.  Mobile: horizontal bar on the bottom.
-    #[cfg(target_os = "android")]
-    let is_mobile = true;
-    #[cfg(not(target_os = "android"))]
-    let is_mobile = false;
+    // Orientation follows the pane's shape, not the platform (a pane in a
+    // multi-pane grid can be any shape on any target): a portrait pane gets a
+    // horizontal bar along the bottom, a landscape pane a vertical bar on the
+    // right. Either way the bar spans the pane's *shorter* axis and its 20px
+    // thickness eats into the longer one, so it obscures as little map as
+    // possible. See `horizontal_color_scale()`.
+    let horizontal = horizontal_color_scale(pane_rect);
 
-    let bar_length = if is_mobile {
+    let bar_length = if horizontal {
         pane_rect.width() - SCALE_MARGIN * 2.0
     } else {
         pane_rect.height() - SCALE_MARGIN * 2.0 - SCALE_TITLE_MARGIN
@@ -730,7 +745,7 @@ fn render_color_scale(
     }
 
     // Compute bar rect
-    let bar_rect = if is_mobile {
+    let bar_rect = if horizontal {
         // Horizontal bar along the bottom, origin at bottom-left
         let left = pane_rect.left() + SCALE_MARGIN;
         let bottom = pane_rect.bottom() - SCALE_MARGIN;
@@ -770,7 +785,7 @@ fn render_color_scale(
             if a == 0 { continue; }
             let color = egui::Color32::from_rgb(r, g, b);
             // Use 2px wide strips to avoid sub-pixel gaps
-            if is_mobile {
+            if horizontal {
                 let x = bar_rect.left() + t * bar_rect.width();
                 let strip = egui::Rect::from_min_size(
                     egui::pos2(x, bar_rect.top()),
@@ -795,7 +810,7 @@ fn render_color_scale(
             let t0 = i as f32 / n as f32;
             let t1 = (i + 1) as f32 / n as f32;
 
-            if is_mobile {
+            if horizontal {
                 let x0 = bar_rect.left() + t0 * bar_rect.width();
                 let x1 = bar_rect.left() + t1 * bar_rect.width();
                 let strip = egui::Rect::from_min_max(
@@ -824,7 +839,7 @@ fn render_color_scale(
         let pixel_pos = if legend.is_gradient {
             // Gradient: value-proportional positioning
             let t = (val - min_val) / range;
-            if is_mobile {
+            if horizontal {
                 bar_rect.left() + t * bar_rect.width()
             } else {
                 bar_rect.bottom() - t * bar_rect.height()
@@ -832,7 +847,7 @@ fn render_color_scale(
         } else {
             // Discrete: index-based positioning (bottom/left edge of each block)
             let t = i as f32 / n as f32;
-            if is_mobile {
+            if horizontal {
                 bar_rect.left() + t * bar_rect.width()
             } else {
                 bar_rect.bottom() - t * bar_rect.height()
@@ -854,7 +869,7 @@ fn render_color_scale(
     }).map(|(pos, text)| (*pos, text.as_str())).collect();
 
     for (pixel_pos, text) in &thinned {
-        if is_mobile {
+        if horizontal {
             // Labels above the bar
             let pos = egui::pos2(*pixel_pos, bar_rect.top() - 2.0);
             draw_shadowed_text(painter, pos, egui::Align2::CENTER_BOTTOM, text, label_font.clone());
@@ -867,7 +882,7 @@ fn render_color_scale(
 
     // --- Title: unit label above the bar (desktop) or to the left (mobile) ---
     let unit = product.unit_label(prefs);
-    if is_mobile {
+    if horizontal {
         let title_pos = egui::pos2(bar_rect.left() - 4.0, bar_rect.center().y);
         draw_shadowed_text(painter, title_pos, egui::Align2::RIGHT_CENTER, unit, title_font);
     } else {
@@ -885,12 +900,11 @@ fn render_overlay_color_scales(
     overlays: &OverlayRegistry,
 ) {
 
-    #[cfg(target_os = "android")]
-    let is_mobile = true;
-    #[cfg(not(target_os = "android"))]
-    let is_mobile = false;
+    // Same geometry-keyed orientation as the radar color scale.
+    let horizontal = horizontal_color_scale(pane_rect);
 
-    // Offset each overlay legend to the left of (desktop) or above (mobile) the radar scale.
+    // Offset each overlay legend to the left of (vertical) or above
+    // (horizontal) the radar scale.
     let mut bar_offset = 0;
 
     for &kind in &pane.draw_order {
@@ -907,7 +921,7 @@ fn render_overlay_color_scales(
         bar_offset += 1;
         let offset_px = bar_offset as f32 * (SCALE_BAR_WIDTH + 40.0);
 
-        let bar_length = if is_mobile {
+        let bar_length = if horizontal {
             pane_rect.width() - SCALE_MARGIN * 2.0
         } else {
             pane_rect.height() - SCALE_MARGIN * 2.0 - SCALE_TITLE_MARGIN
@@ -916,7 +930,7 @@ fn render_overlay_color_scales(
             continue;
         }
 
-        let bar_rect = if is_mobile {
+        let bar_rect = if horizontal {
             let left = pane_rect.left() + SCALE_MARGIN;
             let bottom = pane_rect.bottom() - SCALE_MARGIN - offset_px;
             let top = bottom - SCALE_BAR_WIDTH;
@@ -949,7 +963,7 @@ fn render_overlay_color_scales(
             let value = min_val + t * range;
             let color = interpolate_legend_color(&legend.thresholds, value);
             let [r, g, b] = color;
-            if is_mobile {
+            if horizontal {
                 let x = bar_rect.left() + t * bar_rect.width();
                 let strip = egui::Rect::from_min_size(
                     egui::pos2(x, bar_rect.top()),
@@ -973,7 +987,7 @@ fn render_overlay_color_scales(
         let mut label_positions: Vec<(f32, String)> = Vec::new();
         for &(val, _) in &legend.thresholds {
             let t = (val - min_val) / range;
-            let pixel_pos = if is_mobile {
+            let pixel_pos = if horizontal {
                 bar_rect.left() + t * bar_rect.width()
             } else {
                 bar_rect.bottom() - t * bar_rect.height()
@@ -993,7 +1007,7 @@ fn render_overlay_color_scales(
         }).map(|(pos, text)| (*pos, text.as_str())).collect();
 
         for (pixel_pos, text) in &thinned {
-            if is_mobile {
+            if horizontal {
                 let pos = egui::pos2(*pixel_pos, bar_rect.top() - 2.0);
                 draw_shadowed_text(painter, pos, egui::Align2::CENTER_BOTTOM, text, label_font.clone());
             } else {
@@ -1004,7 +1018,7 @@ fn render_overlay_color_scales(
 
         // Title
         let unit = legend.unit_label;
-        if is_mobile {
+        if horizontal {
             let title_pos = egui::pos2(bar_rect.left() - 4.0, bar_rect.center().y);
             draw_shadowed_text(painter, title_pos, egui::Align2::RIGHT_CENTER, unit, title_font);
         } else {
