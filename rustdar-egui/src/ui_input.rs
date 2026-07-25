@@ -68,20 +68,8 @@ pub(crate) struct PointerFrame {
     /// Whether a real finger/button is still down — **not** egui's raw
     /// `pointer.primary_down()`, see [`PointerTracker`].
     pub down: bool,
-    /// Whether a *new* gesture may arm on this frame.
-    ///
-    /// `down` can be true on evidence that something is moving without evidence
-    /// that a button is still held: after a `PointerGone` the integration
-    /// discards a release that happens out of sight
-    /// (`egui-winit-0.34.1/src/lib.rs:796`), so a pointer that comes back
-    /// hovering is indistinguishable from one that comes back still dragging,
-    /// and egui reports `down` for both. That is enough to carry an existing
-    /// gesture across the gap, and deliberately not enough to start one — a
-    /// hold that armed there would suppress panning behind a tooltip the user
-    /// never asked for, and only a click would clear it.
-    pub can_arm: bool,
-    /// Pointer position; falls back to the last position egui reported rather
-    /// than to the origin, since `PointerGone` clears egui's latest position.
+    /// Pointer position. egui's `interact_pos()`, which is `Some` on every
+    /// frame where `down` is true — see [`PointerTracker::read`].
     pub pos: egui::Pos2,
     /// Wall-clock time of this frame, in seconds.
     pub time: f64,
@@ -112,78 +100,82 @@ pub(crate) struct PointerFrame {
 ///
 /// # Why we lost it decides what can bring it back
 ///
-/// The three ways a sequence can stop being trustworthy are *not*
+/// The two ways a sequence can stop being trustworthy are *not*
 /// interchangeable, and collapsing them into one boolean is how this module
-/// previously grew a hole in each direction. See [`LostCause`]: a cancelled
-/// touch is terminal, a `PointerGone` leaves the button state unknowable, and
-/// an idle expiry never actually said the pointer went anywhere.
+/// grew a hole in each direction. See [`LostCause`]: the pointer *going away*
+/// is terminal, while an idle expiry never said the pointer went anywhere at
+/// all and is undone by the next sign of life.
 ///
-/// `PointerGone` in particular is not only a cancelled touch. `egui-winit`
-/// emits it for `WindowEvent::CursorLeft` too
-/// (`egui-winit-0.34.1/src/lib.rs:340`), dropping the pointer position at the
-/// same time — which makes it discard a mouse release that happens outside the
-/// window (`lib.rs:796`), so egui's `down` stays latched there as well. A latch
-/// only a press could clear therefore stranded that case: hold the button,
-/// leave, come back still dragging, and every following frame is a
-/// `PointerMoved` with no press in it. But un-latching on motion
-/// *unconditionally* is worse, because after a touch cancellation egui's
-/// `down` is stale-`true` forever and motion does keep coming — from the next
-/// finger (`lib.rs:894` admits it once `lib.rs:922` has cleared
-/// `pointer_touch_id`), from a mouse on a hybrid device, or from `mousemove` on
-/// the web. That resurrects the phantom-at-a-stale-position this whole module
-/// exists to prevent.
+/// The tempting middle position — "motion means the pointer came back, so
+/// un-latch" — is wrong, and wrong in the direction that resurrects the bug
+/// this module exists for. After a touch cancellation egui's `down` is
+/// stale-`true` forever and motion keeps arriving: from the next finger
+/// (`lib.rs:894` admits it once `lib.rs:922` has cleared `pointer_touch_id`),
+/// from a mouse on a hybrid device, or from `mousemove` on the web. None of
+/// that is the cancelled finger returning, and treating it as such puts a
+/// phantom hold at the position the OS took the touch away from.
 ///
-/// So motion un-latches, but never past a cancellation, and never all the way:
-/// see [`PointerFrame::can_arm`].
+/// The excursion case (`CursorLeft`, `egui-winit-0.34.1/src/lib.rs:340`) is
+/// genuinely undecidable rather than merely unproven: the integration drops a
+/// release that happens out of the window (`lib.rs:796`), so a pointer that
+/// hovers back in is indistinguishable from one that comes back still dragging,
+/// and egui reports `down` for both. Terminal-until-a-press picks the benign
+/// failure — the user re-presses to carry on — over the malignant one, a hold
+/// nobody asked for suppressing panning until they click.
 ///
 /// # Identifying a cancellation
 ///
-/// This does not need per-backend knowledge — the evidence is in the stream:
+/// This does not need per-backend knowledge, which matters because the two
+/// backends behave differently:
 ///
-/// * `egui-winit` pushes `Touch{phase: Cancel}` (`lib.rs:874`) in the same
-///   frame as the cancel's `PointerGone` (`lib.rs:924`); a `CursorLeft`
-///   `PointerGone` never has one. So a `PointerGone` sharing a frame with a
-///   cancel is a cancellation, and one on its own is an excursion.
+/// * `egui-winit` pairs a cancel with a `PointerGone` (`lib.rs:924`), which is
+///   enough on its own — both mean the pointer went away, and both are
+///   terminal.
 /// * eframe 0.34.1's web canvas emits **nothing else at all** for
 ///   `touchcancel` — `install_touchcancel` is one `push_touches(Cancel)` with
 ///   no release and no `PointerGone` (`eframe/src/web/events.rs:788`). Keying
 ///   only on `PointerGone` therefore never fired on the web *at all*: the map
-///   stayed un-pannable with a stuck tooltip until the idle backstop, minutes
-///   later. So a raw `Touch{Cancel}` also acts on its own — but only for the
-///   finger we positively identified as backing the emulated pointer, so a
-///   *secondary* finger's cancel still cannot kill a live gesture.
+///   stayed un-pannable behind a stuck tooltip until the idle backstop, a
+///   minute later. So a raw `Touch{Cancel}` also acts on its own — but only for
+///   the finger positively identified as backing the emulated pointer, so a
+///   *secondary* finger's cancel cannot kill a live gesture.
+///
+/// # Identifying the finger
 ///
 /// The primary touch id is adopted from the `Touch{Start}` sharing a frame with
-/// the press that opened the sequence. Both integrations emit that pair; only
-/// the order differs (winit `Touch{Start}` first, web the press first), so the
-/// correlation is computed over the whole frame rather than in event order.
+/// the press that *opens* a sequence. Three things make that fiddlier than it
+/// sounds, and each has bitten:
+///
+/// * The two integrations emit the pair in opposite orders (winit
+///   `Touch{Start}` first, web the press first), so the correlation is computed
+///   over the whole frame rather than in event order.
+/// * eframe re-emits a primary press for **every** `touchstart`, including a
+///   second finger's, at the *first* finger's position (`events.rs:676`;
+///   `primary_touch_pos` keeps the stored primary for as long as it appears in
+///   `touches()`). A frame like that carries the *new* finger's `Touch{Start}`,
+///   so "the press frame's touch id is the primary" hands the identity to the
+///   wrong finger. Hence adoption only on a press that opens a sequence.
+/// * Whole gestures can arrive batched into one `RawInput`. eframe's touch
+///   listeners only request a repaint (`events.rs:695`) rather than running a
+///   frame synchronously, so every DOM event between two animation frames lands
+///   together — and on a map app decoding tiles those frames are long. A
+///   `touchstart` and its `touchcancel` in the same frame is an ordinary
+///   browser gesture takeover, so "the finger this frame belongs to" has to
+///   include one adopted *by* this frame.
 #[derive(Clone, Default)]
 pub(crate) struct PointerTracker {
     /// Why egui's latched `down` is not currently believed, if it is not.
     lost: Option<LostCause>,
-    /// Set when `down` was restored by motion after a [`LostCause::Gone`]: we
-    /// know something is moving, but not that a button is still held. Cleared
-    /// only by a real press. Drives [`PointerFrame::can_arm`].
-    unconfirmed: bool,
+    /// Whether a press has opened a sequence that no release has closed.
+    ///
+    /// Not the same as egui's `down`, which stays latched through exactly the
+    /// failures this type exists for; this is only used to tell a press that
+    /// *opens* a sequence from one emitted part-way through an existing one.
+    sequence_live: bool,
     /// The touch id backing egui's emulated pointer, when this sequence started
     /// from a touch. `None` for mouse sequences, and whenever we did not see
     /// the `Touch{Start}` that opened the sequence.
     primary_touch: Option<egui::TouchId>,
-    /// Last position egui actually reported (survives `PointerGone`).
-    ///
-    /// egui clears `interact_pos()` on the frame *after* a `PointerGone`
-    /// (`egui-0.34.1/src/input_state/mod.rs:1111`), so a frame can restore
-    /// `down` while egui has no position to offer — but only via
-    /// [`egui::Event::MouseMoved`], which carries a delta and no position.
-    /// **Nothing in this workspace currently produces `MouseMoved`**:
-    /// `egui-winit`'s `on_mouse_motion` (`lib.rs:759`) is only reached from
-    /// `DeviceEvent`, which `rustdar-platform/src/egui_renderer.rs:59` does not
-    /// forward, and eframe's web `mousemove` pushes `PointerMoved`. So this
-    /// fallback is **defensive**, exercised by the harness rather than by any
-    /// live integration — kept because `Pos2::ZERO` in its place would pin a
-    /// gesture to the screen corner, which is the exact failure this module
-    /// was written to stop.
-    last_pos: egui::Pos2,
     /// Wall-clock time of the last frame that carried any pointer activity.
     last_activity: Option<f64>,
 }
@@ -191,29 +183,34 @@ pub(crate) struct PointerTracker {
 /// Why [`PointerTracker`] stopped believing egui's latched `down`.
 ///
 /// The distinction is the whole point: it decides what is allowed to bring the
-/// pointer back, and each variant answers a different question about what we
+/// pointer back, and each variant answers a different question about what was
 /// actually observed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LostCause {
-    /// The touch backing the emulated pointer was cancelled by the OS or the
-    /// browser. **Terminal** — only a fresh press clears it. Motion after a
-    /// cancellation is some *other* input source (the next finger, a mouse on
-    /// a hybrid device, `mousemove` on the web); treating it as proof the
-    /// cancelled finger came back is what resurrects a phantom gesture at the
-    /// position the OS took the touch away from.
-    Cancelled,
-    /// A bare `PointerGone`: the pointer left the window. A release that
-    /// happened while it was away was discarded by the integration, so we
-    /// genuinely cannot tell a still-held button from one that was let go out
-    /// of sight — and egui reports `down` either way. Motion restores `down`,
-    /// because something is demonstrably there, but leaves the sequence
-    /// *unconfirmed*: no new gesture may arm off an inferred button.
+    /// The pointer *went away* without a release — a cancelled touch, or the
+    /// cursor leaving the window. **Terminal: only a fresh press clears it.**
+    ///
+    /// Both halves report the same thing, that the input we were following is
+    /// no longer there, and neither leaves any way to tell later motion apart
+    /// from a different input source. A cancelled finger is gone for good; a
+    /// departed cursor may or may not still have its button held, and the
+    /// integration threw away the evidence.
     Gone,
     /// The idle backstop fired: nothing whatsoever arrived for
-    /// [`POINTER_IDLE_TIMEOUT_S`]. Nothing ever said the pointer went away —
-    /// this is only a timer running out under a finger that was resting — and
-    /// a missed release always arrives with a `PointerGone` or a cancel, both
-    /// of which take precedence. So motion restores trust completely.
+    /// [`POINTER_IDLE_TIMEOUT_S`]. **Motion undoes it.**
+    ///
+    /// Nothing ever said the pointer went away — this is a timer running out
+    /// under a finger that was resting, which is the long-press tooltip's
+    /// normal operating state. It is only reached when no [`LostCause::Gone`]
+    /// is already latched, and no integration we have read drops a release
+    /// without also reporting the departure: `egui-winit` clears
+    /// `pointer_pos_in_points` at three sites and all three push `PointerGone`,
+    /// and eframe's web `touchend` pushes both the release and `PointerGone`.
+    /// (Not a universal guarantee: eframe installs no `pointercancel` handler,
+    /// so a browser firing `pointercancel` instead of `pointerup` would drop a
+    /// release silently. Reaching a bad state from there needs that *and* a
+    /// full [`POINTER_IDLE_TIMEOUT_S`] of silence *and* the cursor never
+    /// leaving the canvas.)
     Idle,
 }
 
@@ -230,57 +227,59 @@ impl PointerTracker {
             let raw_down = i.pointer.primary_down();
 
             // --- order-independent frame facts ------------------------------
-            // Integrations disagree about ordering within a frame (egui-winit
-            // pushes `Touch{Start}` before the press it belongs to, eframe's web
-            // canvas after it), so anything that has to correlate two events of
-            // one frame is decided here rather than in the ordered walk below.
-            let primary_at_entry = self.primary_touch;
+            // The integrations disagree about ordering within a frame, and a
+            // whole gesture can arrive batched into one of them, so anything
+            // that correlates two events of a frame is decided here rather than
+            // in the ordered walk below. See `PointerTracker`.
             let mut touch_started = None;
-            let mut any_cancel = false;
-            let mut primary_cancel = false;
             for event in &i.events {
-                if let egui::Event::Touch { id, phase, .. } = event {
-                    match phase {
-                        egui::TouchPhase::Start => {
-                            touch_started.get_or_insert(*id);
-                        }
-                        egui::TouchPhase::Cancel => {
-                            any_cancel = true;
-                            primary_cancel |= Some(*id) == primary_at_entry;
-                        }
-                        _ => {}
-                    }
+                if let egui::Event::Touch { id, phase: egui::TouchPhase::Start, .. } = event {
+                    // First wins: eframe picks the primary as
+                    // `all_touches.first()` and pushes changed touches in the
+                    // same order (`web/input.rs:30`, `:85`).
+                    touch_started.get_or_insert(*id);
                 }
             }
-            // A `PointerGone` sharing a frame with a cancel is a cancellation —
-            // unless we positively know the cancel belonged to a different
-            // finger, in which case the `PointerGone` is something else. When we
-            // never identified a primary finger we assume the worse of the two,
-            // because over-classifying costs a re-press and under-classifying
-            // costs a phantom gesture.
-            let gone_is_cancel = any_cancel && (primary_cancel || primary_at_entry.is_none());
+            // The finger this frame's events belong to: the one already being
+            // followed, or — when the frame opens the sequence — the one
+            // starting in it. Both halves are needed: a `touchstart` and its
+            // `touchcancel` batched together would otherwise be compared
+            // against an identity this frame is only just adopting.
+            let frame_primary = self.primary_touch.or(touch_started);
 
             // Walk the events in order so a cancel followed by a fresh press
             // within one frame ends up armed, not lost.
             for event in &i.events {
                 match event {
-                    egui::Event::PointerButton { pressed, .. } => {
+                    egui::Event::PointerButton { pressed, button, .. } => {
                         activity = true;
-                        if *pressed {
-                            self.lost = None;
-                            self.unconfirmed = false;
-                            // Adopt the finger that opened this sequence. Only
-                            // when we are not already following one: eframe's
-                            // web canvas re-emits a primary press for *every*
-                            // touchstart including a second finger's
-                            // (`events.rs:676`), and that frame carries the
-                            // second finger's `Touch{Start}`.
-                            if self.primary_touch.is_none() {
-                                self.primary_touch = touch_started;
+                        // Only the primary button drives the sequence. `down`
+                        // is `primary_down()`, so a right- or middle-click says
+                        // nothing about whether the input we are tracking is
+                        // still there: letting one clear the latch would revive
+                        // a loss that is meant to be terminal, and letting one
+                        // close the sequence would drop the finger id that is
+                        // the entire cancellation signal on the web.
+                        if *button == egui::PointerButton::Primary {
+                            if *pressed {
+                                // Adopt the finger only on a press that *opens*
+                                // a sequence — not on eframe's re-emitted press
+                                // for a second finger. "Opens" cannot be "we
+                                // hold no finger", because a `Gone` leaves the
+                                // old id in place with no release to clear it.
+                                if !self.sequence_live || self.lost.is_some() {
+                                    self.primary_touch = touch_started;
+                                }
+                                self.lost = None;
+                                self.sequence_live = true;
+                            } else {
+                                // Closing the sequence is all a release has to
+                                // do — the next press re-adopts from scratch,
+                                // so clearing `primary_touch` here as well
+                                // would be a second mechanism for the same
+                                // thing, and an untestable one.
+                                self.sequence_live = false;
                             }
-                        } else {
-                            // A real release ends the sequence outright.
-                            self.primary_touch = None;
                         }
                     }
                     // The pointer vanished without a release: a cancelled touch,
@@ -289,55 +288,31 @@ impl PointerTracker {
                     // it changes nothing.
                     egui::Event::PointerGone => {
                         activity = true;
-                        self.lost = Some(if gone_is_cancel {
-                            self.primary_touch = None;
-                            LostCause::Cancelled
-                        } else {
-                            LostCause::Gone
-                        });
+                        self.lost = Some(LostCause::Gone);
                     }
                     // A raw `Touch{Cancel}` acts on its own **only** for the
-                    // finger we identified as backing the emulated pointer, so
-                    // a secondary finger's cancel can never kill a live
-                    // gesture. This is the whole cancellation path on the web,
-                    // where `touchcancel` emits no release and no `PointerGone`
+                    // finger backing the emulated pointer, so a secondary
+                    // finger's cancel can never kill a live gesture. This is the
+                    // whole cancellation path on the web, where `touchcancel`
+                    // emits no release and no `PointerGone`
                     // (`eframe/src/web/events.rs:788`).
                     egui::Event::Touch { id, phase, .. } => {
                         activity = true;
-                        if *phase == egui::TouchPhase::Cancel
-                            && Some(*id) == primary_at_entry
-                        {
-                            self.lost = Some(LostCause::Cancelled);
-                            self.primary_touch = None;
+                        if *phase == egui::TouchPhase::Cancel && Some(*id) == frame_primary {
+                            self.lost = Some(LostCause::Gone);
                         }
                     }
-                    // Motion says something is there. What that is worth
-                    // depends entirely on why we stopped believing the pointer
-                    // — see [`LostCause`].
+                    // Motion is a sign of life, which undoes a timer running out
+                    // but says nothing about a pointer that reported itself
+                    // gone — see [`LostCause`].
                     egui::Event::PointerMoved(_) | egui::Event::MouseMoved(_) => {
                         activity = true;
-                        match self.lost {
-                            // Terminal. Motion after a cancellation is some
-                            // other input source, not the cancelled finger.
-                            Some(LostCause::Cancelled) => {}
-                            // Something is moving, but the button state is now
-                            // inferred rather than observed.
-                            Some(LostCause::Gone) => {
-                                self.lost = None;
-                                self.unconfirmed = true;
-                            }
-                            // Nothing ever said the pointer left; it was just
-                            // still. Full trust.
-                            Some(LostCause::Idle) => self.lost = None,
-                            None => {}
+                        if self.lost == Some(LostCause::Idle) {
+                            self.lost = None;
                         }
                     }
                     _ => {}
                 }
-            }
-
-            if let Some(pos) = i.pointer.interact_pos() {
-                self.last_pos = pos;
             }
 
             if activity || self.last_activity.is_none() {
@@ -362,12 +337,28 @@ impl PointerTracker {
                 self.lost = Some(LostCause::Idle);
             }
 
+            let down = raw_down && self.lost.is_none();
+
+            // egui only lacks a position between a `PointerGone` and the next
+            // positional event (`egui-0.34.1/src/input_state/mod.rs:1111`,
+            // `:1208`) — and that is exactly the window in which a
+            // `LostCause::Gone` is latched, so `down` is false throughout it.
+            // The assertion is the guard: if a future policy lets something
+            // clear the latch without a position, every gesture would silently
+            // start being reported at the screen corner, which is the failure
+            // this module was written to stop.
+            let pos = i.pointer.interact_pos();
+            debug_assert!(
+                pos.is_some() || !down,
+                "pointer is down with no position: something cleared `lost` \
+                 without positional evidence"
+            );
+
             PointerFrame {
                 pressed: i.pointer.primary_pressed(),
                 released: i.pointer.primary_released(),
-                down: raw_down && self.lost.is_none(),
-                can_arm: !self.unconfirmed,
-                pos: self.last_pos,
+                down,
+                pos: pos.unwrap_or_default(),
                 time: i.time,
             }
         })
@@ -586,7 +577,7 @@ impl LongPressDetector {
     /// egui's raw `pointer.down`, a cancelled touch would re-arm the hold every
     /// [`LONG_PRESS_DURATION_S`] forever.
     pub(crate) fn update(&mut self, input: PointerFrame) -> Option<egui::Pos2> {
-        let PointerFrame { down, can_arm, pos, time, .. } = input;
+        let PointerFrame { down, pos, time, .. } = input;
 
         if !down {
             self.press_start = None;
@@ -600,12 +591,6 @@ impl LongPressDetector {
         }
 
         if self.press_start.is_none() {
-            // A hold must start from an *observed* press, never from an
-            // inferred one: see [`PointerFrame::can_arm`]. A gesture already
-            // under way is unaffected — this only refuses to open a new one.
-            if !can_arm {
-                return None;
-            }
             self.press_start = Some(time);
             self.press_pos = pos;
             return None;
@@ -796,62 +781,32 @@ mod tests {
         ]
     }
 
-    /// After a `PointerGone` the pointer is distrusted, but motion says
-    /// *something* is there. `down` comes back so a gesture in flight is not
-    /// cut off — and `can_arm` does not, because a release that happened while
-    /// the cursor was out of the window was discarded by the integration
-    /// (`lib.rs:796`), leaving egui's `down` stale-`true` whether the user is
-    /// still holding the button or hovering with nothing pressed.
+    /// A `PointerGone` is terminal until a press, whichever kind it was.
+    ///
+    /// For the excursion half this is a policy choice between two failures, and
+    /// it takes the benign one. The integration discards a release that happens
+    /// out of the window (`lib.rs:796`), so a cursor that comes back hovering
+    /// and one that comes back still dragging are the same event stream: the
+    /// cost of being wrong one way is re-pressing to carry on, and the other
+    /// way is a hold nobody asked for suppressing panning until they click.
     #[test]
-    fn motion_after_an_excursion_restores_down_but_not_arming() {
+    fn an_excursion_is_terminal_until_a_press() {
         let mut d = TrackerDriver::new();
         let pos = egui::pos2(100.0, 100.0);
 
-        let pressed = d.frame(vec![button(egui::PointerButton::Primary, true, pos)]);
-        assert!(pressed.down && pressed.can_arm, "a real press confirms both");
+        assert!(d.frame(vec![button(egui::PointerButton::Primary, true, pos)]).down);
+        assert!(!d.frame(vec![egui::Event::PointerGone]).down);
+
+        for step in 1..=4 {
+            let moved = d.frame(vec![egui::Event::PointerMoved(
+                pos + egui::vec2(4.0 * step as f32, 0.0),
+            )]);
+            assert!(!moved.down, "step {step}: motion is not evidence of a held button");
+        }
 
         assert!(
-            !d.frame(vec![egui::Event::PointerGone]).down,
-            "precondition: the excursion is distrusted"
-        );
-
-        let returned = d.frame(vec![egui::Event::PointerMoved(pos + egui::vec2(4.0, 0.0))]);
-        assert!(returned.down, "something is moving, so the pointer is there");
-        assert!(
-            !returned.can_arm,
-            "but nothing observed says a button is still held"
-        );
-
-        // It stays inferred for as long as no press arrives...
-        let still = d.frame(vec![egui::Event::PointerMoved(pos + egui::vec2(8.0, 0.0))]);
-        assert!(still.down && !still.can_arm);
-
-        // ...and a real press is what settles it.
-        let repressed = d.frame(vec![button(egui::PointerButton::Primary, true, pos)]);
-        assert!(repressed.down && repressed.can_arm);
-    }
-
-    /// Positionless motion (`MouseMoved` is a delta) on a frame where
-    /// `PointerGone` has already cleared egui's position must report the last
-    /// real position, not the origin. Defensive: nothing in this workspace
-    /// emits `MouseMoved` (see [`PointerTracker::last_pos`]), so this is the
-    /// only place the fallback is exercised.
-    #[test]
-    fn positionless_motion_reports_the_last_real_position() {
-        let mut d = TrackerDriver::new();
-        let pos = egui::pos2(240.0, 310.0);
-
-        d.frame(vec![
-            egui::Event::PointerMoved(pos),
-            button(egui::PointerButton::Primary, true, pos),
-        ]);
-        d.frame(vec![egui::Event::PointerGone]);
-
-        let moved = d.frame(vec![egui::Event::MouseMoved(egui::vec2(2.0, 1.0))]);
-        assert!(moved.down, "raw motion with the button down is a live pointer");
-        assert_eq!(
-            moved.pos, pos,
-            "with no position to be had, report the last real one — not the corner"
+            d.frame(vec![button(egui::PointerButton::Primary, true, pos)]).down,
+            "a real press is what brings it back"
         );
     }
 
@@ -913,6 +868,169 @@ mod tests {
         );
     }
 
+    /// A whole gesture can arrive in one frame.
+    ///
+    /// eframe's touch listeners only request a repaint (`events.rs:695`)
+    /// instead of running a frame synchronously, so every DOM event between two
+    /// animation frames lands in a single `RawInput` — and on a map app
+    /// decoding tiles those frames are long. A browser taking the gesture over
+    /// on the first move (an iOS Safari edge swipe, Android Chrome
+    /// pull-to-refresh) delivers `touchstart` and `touchcancel` exactly that
+    /// way. Comparing the cancel against the identity held at frame *entry*
+    /// misses it, even though the adoption has already run earlier in the same
+    /// walk.
+    #[test]
+    fn a_touchstart_and_touchcancel_in_one_frame_is_a_cancellation() {
+        let mut d = TrackerDriver::new();
+        let pos = egui::pos2(100.0, 100.0);
+
+        let batched = d.frame(vec![
+            button(egui::PointerButton::Primary, true, pos),
+            touch(3, egui::TouchPhase::Start, pos),
+            touch(3, egui::TouchPhase::Cancel, pos),
+        ]);
+        assert!(
+            !batched.down,
+            "the finger this frame adopted is the finger this frame cancelled"
+        );
+        assert!(
+            !d.frame(vec![egui::Event::PointerMoved(pos + egui::vec2(40.0, 0.0))]).down,
+            "and it is terminal like any other cancellation"
+        );
+    }
+
+    /// Non-primary buttons must not touch the sequence at all.
+    ///
+    /// `down` is `primary_down()`, so a right-click says nothing about the
+    /// finger or left button being tracked. A press that cleared the latch
+    /// would revive a loss documented as terminal, while egui's `down` is still
+    /// stale-`true`.
+    #[test]
+    fn a_non_primary_press_does_not_revive_a_lost_pointer() {
+        let mut d = TrackerDriver::new();
+        let pos = egui::pos2(100.0, 100.0);
+
+        assert!(d.frame(touch_down(0, pos)).down);
+        assert!(!d.frame(vec![touch(0, egui::TouchPhase::Cancel, pos)]).down);
+
+        for b in [egui::PointerButton::Secondary, egui::PointerButton::Middle] {
+            assert!(
+                !d.frame(vec![button(b, true, pos)]).down,
+                "{b:?} press must not resurrect a cancelled pointer"
+            );
+        }
+    }
+
+    /// …and a non-primary *release* must not close the sequence either.
+    ///
+    /// Closing it would let the very next press re-adopt — and eframe emits a
+    /// press for every `touchstart`, so a second finger arriving after a
+    /// right-button release would take the identity. The finger id is the
+    /// entire cancellation signal on the web, so losing it that way makes the
+    /// real finger's cancel invisible.
+    #[test]
+    fn a_non_primary_release_does_not_close_the_sequence() {
+        let mut d = TrackerDriver::new();
+        let pos = egui::pos2(100.0, 100.0);
+
+        assert!(d.frame(touch_down(0, pos)).down);
+        assert!(
+            d.frame(vec![button(egui::PointerButton::Secondary, false, pos)]).down,
+            "a right-button release is not this sequence ending"
+        );
+
+        // eframe's re-emitted press for a second finger.
+        let second = pos + egui::vec2(80.0, 0.0);
+        d.frame(vec![
+            button(egui::PointerButton::Primary, true, pos),
+            touch(1, egui::TouchPhase::Start, second),
+        ]);
+
+        assert!(
+            d.frame(vec![touch(1, egui::TouchPhase::Cancel, second)]).down,
+            "the second finger must not have taken the identity"
+        );
+        assert!(
+            !d.frame(vec![touch(0, egui::TouchPhase::Cancel, pos)]).down,
+            "the original finger must still be recognised when it is cancelled"
+        );
+    }
+
+    /// A mouse click inside the window emits **no** `PointerGone`
+    /// (`egui-winit-0.34.1/src/lib.rs:791` pushes the button event alone), so
+    /// the release is the only thing that says the sequence ended. If it did
+    /// not close it, the next press would be treated as mid-sequence and the
+    /// finger opening it would never be adopted — on a hybrid device, a click
+    /// followed by a touch.
+    #[test]
+    fn a_mouse_release_lets_the_next_touch_adopt_its_finger() {
+        let mut d = TrackerDriver::new();
+        let pos = egui::pos2(100.0, 100.0);
+
+        d.frame(vec![button(egui::PointerButton::Primary, true, pos)]);
+        d.frame(vec![button(egui::PointerButton::Primary, false, pos)]);
+
+        assert!(d.frame(touch_down(2, pos)).down, "a finger, now");
+        assert!(
+            !d.frame(vec![touch(2, egui::TouchPhase::Cancel, pos)]).down,
+            "the touch that opened this sequence must have been adopted"
+        );
+    }
+
+    /// An excursion leaves no release behind to close the sequence, so the next
+    /// press has to be able to adopt its own finger anyway. Otherwise the old,
+    /// **recycled** id sticks — and a different finger carrying it, cancelled
+    /// anywhere on screen, kills a live sequence it has nothing to do with.
+    #[test]
+    fn a_new_sequence_after_an_excursion_adopts_its_own_finger() {
+        let mut d = TrackerDriver::new();
+        let pos = egui::pos2(100.0, 100.0);
+
+        assert!(d.frame(touch_down(0, pos)).down);
+        // Mid-sequence excursion: `PointerGone` with no release at all.
+        assert!(!d.frame(vec![egui::Event::PointerGone]).down);
+
+        // A new touch, with a different id.
+        assert!(d.frame(touch_down(1, pos)).down);
+
+        assert!(
+            d.frame(vec![touch(0, egui::TouchPhase::Cancel, pos)]).down,
+            "the stale id must no longer be able to cancel anything"
+        );
+        assert!(
+            !d.frame(vec![touch(1, egui::TouchPhase::Cancel, pos)]).down,
+            "and the finger actually in play must be"
+        );
+    }
+
+    /// When two fingers start in one frame, the first is the primary — that is
+    /// what eframe picks (`all_touches.first()`, `web/input.rs:30`) and it
+    /// pushes changed touches in the same order (`:85`).
+    #[test]
+    fn the_first_touch_start_in_a_frame_is_the_primary() {
+        let mut d = TrackerDriver::new();
+        let pos = egui::pos2(100.0, 100.0);
+
+        assert!(
+            d.frame(vec![
+                button(egui::PointerButton::Primary, true, pos),
+                touch(5, egui::TouchPhase::Start, pos),
+                touch(6, egui::TouchPhase::Start, pos + egui::vec2(60.0, 0.0)),
+            ])
+            .down
+        );
+
+        assert!(
+            d.frame(vec![touch(6, egui::TouchPhase::Cancel, pos + egui::vec2(60.0, 0.0))])
+                .down,
+            "the second finger is not the primary"
+        );
+        assert!(
+            !d.frame(vec![touch(5, egui::TouchPhase::Cancel, pos)]).down,
+            "the first one is"
+        );
+    }
+
     /// A *secondary* finger's cancel must still do nothing: it is not the touch
     /// backing the emulated pointer, and killing the primary's live gesture is
     /// the failure the old "never act on raw `Touch{Cancel}`" rule was
@@ -926,7 +1044,6 @@ mod tests {
 
         let after = d.frame(vec![touch(1, egui::TouchPhase::Cancel, pos + egui::vec2(80.0, 0.0))]);
         assert!(after.down, "another finger's cancellation is not ours");
-        assert!(after.can_arm);
     }
 
     /// The idle backstop may only *add* a reason to distrust the pointer.
