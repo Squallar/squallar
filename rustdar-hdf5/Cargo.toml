@@ -1,0 +1,18 @@
+[package]
+name = "rustdar-hdf5"
+version.workspace = true
+edition.workspace = true
+
+# Deliberately dependency-free apart from `thiserror` (a build-time proc macro).
+# The whole point of this crate is to read the HDF5 subset that GOES GLM L2
+# files use without linking libhdf5 / libnetcdf, so that rustdar can target
+# wasm32 and iOS. Adding a dependency with a `build.rs` that compiles C would
+# defeat it.
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+# The oracle. `netcdf` links the C libraries this crate exists to replace, so it
+# is a genuinely independent implementation to check numbers against. It is a
+# dev-dependency only: nothing in the shipped graph pulls it.
+netcdf = { version = "=0.12.0", features = ["static"] }

@@ -4397,6 +4397,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustdar-hdf5"
+version = "0.1.0"
+dependencies = [
+ "netcdf",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rustdar-overlays"
 version = "0.1.0"
 dependencies = [

@@ -5,6 +5,7 @@ members = [
     "rustdar-android",
     "rustdar-android-theme",
     "rustdar-egui",
+    "rustdar-hdf5",
     "rustdar-radar",
     "rustdar-overlays",
     "rustdar-units",
