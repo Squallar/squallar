@@ -1,147 +1,65 @@
 /*
- * rustdar's service worker.
+ * rustdar's service worker: shell cached, weather data never cached, basemap
+ * tiles cached aggressively.
  *
- * ============================================================================
- * The one rule this file exists to enforce
- * ============================================================================
+ * "Never" is literal — the worker does not call `respondWith()` for weather
+ * data, so no code here *can* write it to a cache. Those fetches fail offline
+ * and index.html shows a banner. Routing is default-deny, so a new entry in
+ * `rustdar_radar::sources::DataSources` is uncached with no change here.
  *
- * rustdar is a live weather application. A cached radar sweep, alert polygon or
- * METAR that the UI presents as current is worse than no application at all:
- * someone opening this during severe weather and seeing a two-hour-old
- * reflectivity scan, with nothing on screen saying so, is the specific harm this
- * worker is written to make impossible.
+ * Tiles are the exception because a slippy-map tile has no time dimension.
+ * CartoDB serves them `Cache-Control: public, max-age=15552000` (180 days) and
+ * `tileFreshFor` honours that number rather than inventing one.
  *
- * So the policy is not "cache carefully". It is:
+ * Every URL resolves against `ROOT`, so the same bytes work at `/rustdar/`
+ * (Pages) and at `/` (http.server).
  *
- *   * The **app shell** — index.html, the wasm-bindgen glue, the wasm module,
- *     the manifest and the icons — is cached. That is what makes the page load
- *     instantly and survive a flaky connection, and none of it carries a
- *     timestamp a user could misread.
+ * SHELL VERSIONING. The browser only reinstalls a worker whose *own* bytes
+ * changed, and these do not change when the wasm module does. Hashing the bundle
+ * in would need a build step that rewrites this file, and the Pages deployment
+ * is not ours to change — so the version is discovered at runtime instead:
+ * `probeValidator()` HEADs the wasm module and tokenises the validators the
+ * server already sends. A changed token refetches the whole shell into a *new*
+ * cache and moves the meta pointer only once that completes. `SW_VERSION`
+ * versions this file's logic and is bumped by hand.
  *
- *   * **Weather data is never cached, ever.** Not network-first, not
- *     stale-while-revalidate, not "cached with a staleness header". The worker
- *     does not call `respondWith()` for those requests at all, so the browser
- *     does its ordinary networking and this file is not even in the path. That
- *     is a stronger guarantee than `respondWith(fetch(req))`, because there is
- *     no code here that *could* write such a response to a cache.
+ * MIXED SHELLS are what per-client pinning exists to prevent. A page load is
+ * three fetches seconds apart (navigation, glue, wasm) and a deploy can land
+ * between any two. Only one direction of a glue/wasm mismatch is loud:
  *
- *     Offline, those fetches fail. That is the honest answer, and index.html
- *     renders an explicit offline banner so the failure is visible rather than
- *     inferred from an empty map.
+ *   old glue + new wasm  ->  LinkError at instantiate.
+ *   new glue + old wasm  ->  instantiates cleanly, the page paints, then dies at
+ *                            the first closure dispatch (a winit event or rAF)
+ *                            with `TypeError: wasm.__wasm_bindgen_func_elem_12978
+ *                            is not a function`. The glue reads trampolines off
+ *                            `wasm.` lazily, so nothing surfaces at load.
  *
- *   * **Basemap tiles are the one exception** and are cached aggressively. A
- *     slippy-map tile has no time dimension: `dark_nolabels/7/29/52.png` is the
- *     same picture of the same coastline today and next year, so a cached one
- *     cannot misrepresent current conditions the way a cached radar scan can.
- *     They are also the most expensive thing here to refetch. CartoDB itself
- *     says so — it serves them with `Cache-Control: public, max-age=15552000`
- *     (180 days), and `tileFetch` below honours exactly that number rather than
- *     inventing its own.
+ * wasm-bindgen 0.2.126 names closure trampolines after the compiled
+ * function-table index, so an *interface* change renames all 15 of them; an
+ * ordinary code change emits byte-identical glue and is harmless.
  *
- * Routing is **default-deny**: `routeFor()` returns `network` unless a request
- * positively matches the shell list or the basemap tile pattern. A new data
- * source added to `rustdar_radar::sources::DataSources` is therefore uncached
- * by default, with no change needed here. `NEVER_CACHE_HOSTS` is defence in
- * depth on top of that, checked first, and `tests/pwa_assets.rs` pins it
- * against `DataSources::production()` so the two cannot drift.
+ * So the generation is pinned per client at the navigation, navigations are
+ * served cache-first, and the pin is written to the meta cache as well as held
+ * in memory — the worker is killed after ~30s idle, and a restart between a
+ * page's navigation and its wasm request would otherwise put that page back onto
+ * whatever is current. Retaining "the generation just superseded" instead was
+ * tried and is strictly worse: it keeps a cache that may have no reader while
+ * still allowing deletion of one that does.
  *
- * ============================================================================
- * Serving from a subpath
- * ============================================================================
- *
- * The deployed page lives at `https://<user>.github.io/rustdar/`; development
- * happens at the root of `python3 -m http.server`. Nothing in this file is
- * written as an absolute path. Every URL is resolved against `ROOT`, which is
- * the directory this script was served from, so the same bytes work at
- * `/rustdar/` and at `/`.
- *
- * ============================================================================
- * How updates land
- * ============================================================================
- *
- * The classic failure of a precaching worker is pinning an old bundle forever:
- * the browser only reinstalls a worker whose *own bytes* changed, and this
- * file's bytes do not change when the 11 MB wasm module does. Hashing the
- * bundle into a constant here would fix that, but only with a build step that
- * rewrites this file — and the Pages deployment is not ours to change.
- *
- * So the shell version is discovered at runtime instead. `probeValidator()`
- * issues a `HEAD` for the wasm module and forms a token from the HTTP
- * validators the server already sends (`ETag` on GitHub Pages, `Last-Modified` +
- * `Content-Length` on `http.server`). One round trip, no body. The token names
- * the shell cache, so:
- *
- *   * token unchanged  -> the cached shell is current, nothing is transferred.
- *   * token changed    -> a new deploy. The whole shell is refetched into a
- *                         *new* cache, and only once that has completed is the
- *                         meta pointer moved. An interrupted update leaves the
- *                         previous complete shell in place; there is no window
- *                         in which half of one deploy is mixed with half of
- *                         another.
- *
- * This separates the two versions that people usually conflate:
- *
- *   * `SW_VERSION` below versions *this file's logic*, and is bumped by hand.
- *   * the validator token versions *the deployed content*, and moves by itself.
- *
- * ============================================================================
- * What happens to a client mid-session
- * ============================================================================
- *
- * Nothing is swapped underneath it. The running page keeps the wasm instance it
- * already booted — hot-swapping a weather app's code under the user is both
- * impossible (the module is instantiated) and undesirable. The worker finishes
- * the download in the background and posts `rustdar:shell-updated` to every
- * window, and index.html raises a small, dismissible "Reload" affordance. The
- * new version lands on the next navigation, at a moment the user chose.
- *
- * Navigations are served **cache-first**, which is deliberate and is the other
- * half of atomicity. A network-first navigation would hand a fresh index.html
- * to a client that then loads the *cached* glue and wasm — a wasm-bindgen
- * version mismatch and a blank page. The shell is consistent or it is not
- * served; it is never mixed.
- *
- * "Never mixed" is a claim about a *page load*, not about a moment in time, and
- * that distinction is load-bearing. A page load is not atomic: the navigation,
- * the glue and the 11 MB module are three separate fetches, seconds apart, and
- * a deploy can land in between. Resolving "the current shell" independently for
- * each of them is therefore not enough — it was in fact how this worker used to
- * hand a page index.html from one deploy and its wasm from the next, and the
- * symptom was the exact wasm-bindgen mismatch above.
- *
- * So the shell generation is pinned **per client**, at the navigation, in
- * `clientShells`. Every subresource that client goes on to request is served
- * from the generation its navigation was answered from, whatever the meta
- * pointer has done since, and `purgeCaches` keeps every generation something is
- * pinned to.
- *
- * The pin is written to the meta cache as well as held in memory, because a
- * service worker is killed after about thirty seconds idle and everything in
- * this file's module scope goes with it. Without the durable copy, a restart
- * between a page's navigation and its wasm request puts that page back onto
- * whatever is current — which is the mixed shell, arrived at by a different
- * route. Retaining "the generation just superseded" was tried first and does
- * not work: it keeps a cache that may have no reader while still allowing the
- * deletion of one that does.
+ * A client mid-session is never swapped; it gets `rustdar:shell-updated` and
+ * index.html offers a Reload.
  */
 
 "use strict";
 
-/*
- * Bump when the logic in this file changes. It only names caches; the deployed
- * content's version is the validator token, discovered at runtime.
- */
+/* Names caches only. The deployed content's version is the validator token. */
 const SW_VERSION = 2;
 
 /*
- * The directory this worker was served from, with a trailing slash:
- * `https://user.github.io/rustdar/` deployed, `http://127.0.0.1:8000/` locally.
- *
- * `self.registration.scope` would usually say the same thing, but it is not
- * available while the module body is evaluating in every engine, and it can be
- * widened past the script's directory with a `Service-Worker-Allowed` header.
- * The script's own location is the thing the relative asset paths below are
- * actually relative to.
+ * The directory this worker was served from, with a trailing slash. Not
+ * `self.registration.scope`: that is unavailable in some engines while the module
+ * body evaluates, and `Service-Worker-Allowed` can widen it past the script's
+ * directory, which the relative asset paths below are relative to.
  */
 const ROOT = new URL("./", self.location.href);
 
@@ -149,23 +67,19 @@ const META_CACHE = `rustdar-meta-v${SW_VERSION}`;
 const TILE_CACHE = `rustdar-basemap-v${SW_VERSION}`;
 const SHELL_PREFIX = `rustdar-shell-v${SW_VERSION}-`;
 
-/* Key for the meta record. A synthetic URL: nothing is ever served from it. */
+/* Synthetic keys for the meta and client-pin records; nothing is served from them. */
 const META_KEY = new URL("__rustdar_sw_meta__", ROOT).href;
-
-/* Key for the client pin record. Also synthetic. See `clientShells`. */
 const PINS_KEY = new URL("__rustdar_sw_pins__", ROOT).href;
 
 /*
- * The app shell, relative to ROOT.
+ * The app shell, relative to ROOT. 10,538,077 B (10.05 MiB) shipped: wasm
+ * 10,161,914 B + glue 117,911 B.
  *
- * `""` is the directory index — `new URL("", ROOT)` is ROOT itself — and it is
- * the single entry every navigation is answered from, whether the user asked
- * for `/rustdar/`, `/rustdar/index.html` or `/rustdar/?station=KTLX`.
- * `index.html` is deliberately *not* listed separately: caching the same bytes
- * under two keys is how the two copies end up from different deploys.
- *
- * `pkg/` is what `wasm-pack build --target web` emits. The `.d.ts` files and
- * `package.json` it also writes are build-time artefacts and are not listed.
+ * `""` is the directory index (`new URL("", ROOT)` is ROOT) and is the single
+ * entry every navigation is answered from. `index.html` is deliberately not
+ * listed too: caching the same bytes under two keys is how the two copies end up
+ * from different deploys. `pkg/` is what `wasm-pack build --target web` emits;
+ * its `.d.ts` and `package.json` are build-time artefacts.
  */
 const SHELL_PATHS = [
   "",
@@ -187,51 +101,29 @@ const SHELL_VERSION_PROBE = new URL("pkg/rustdar_web_bg.wasm", ROOT).href;
 
 /*
  * Every origin `rustdar_radar::sources::DataSources::production()` reads from.
- *
- * Listing them is belt and braces: `routeFor()` is default-deny, so omitting a
- * host from this set would not cause it to be cached. The set exists so that
- * the policy is stated where a reader looks for it, and so that
- * `tests/pwa_assets.rs` can pin it against the Rust declaration and fail when a
- * new data source is added without anyone thinking about this file.
- *
- * The `.amazonaws.com` / `.noaa.gov` / `.weather.gov` suffix rules below cover
- * bucket and subdomain changes that do not reach this list.
+ * Belt and braces on top of default-deny, but `tests/pwa_assets.rs` pins the set
+ * against the Rust declaration, so a new data source cannot be added without
+ * someone reading this file.
  */
 const NEVER_CACHE_HOSTS = new Set([
-  // NEXRAD Level II archive volumes.
   "unidata-nexrad-level2.s3.amazonaws.com",
-  // NEXRAD Level II real-time chunks.
   "unidata-nexrad-level2-chunks.s3.amazonaws.com",
-  // NEXRAD Level III products.
   "unidata-nexrad-level3.s3.amazonaws.com",
-  // HRRR model output.
   "noaa-hrrr-bdp-pds.s3.amazonaws.com",
-  // GOES-East / GOES-West granules, for GLM lightning.
   "noaa-goes19.s3.amazonaws.com",
   "noaa-goes18.s3.amazonaws.com",
-  // NWS public API: active alerts and zone geometry.
   "api.weather.gov",
-  // Storm Prediction Center: outlooks, mesoscale discussions, storm reports.
   "www.spc.noaa.gov",
-  // Iowa Environmental Mesonet: current ASOS/METAR observations.
   "mesonet.agron.iastate.edu",
 ]);
 
 /* CartoDB's four tile subdomains, as `rustdar_egui::tiles::CartoDb` builds them. */
 const BASEMAP_HOST = /^cartodb-basemaps-[a-d]\.global\.ssl\.fastly\.net$/;
 
-/*
- * How many tiles to keep. At CartoDB's ~15-25 KB per 256px PNG this is roughly
- * 12-20 MB, which is a fraction of a browser's per-origin quota and about two
- * screenfuls of continental US at every zoom a user is likely to visit in a
- * session.
- */
+/* ~15-25 KB per 256px PNG, so roughly 12-20 MB. */
 const TILE_CACHE_MAX = 700;
 
-/* Fall-back freshness for a tile whose response carries no `Cache-Control`. */
 const TILE_DEFAULT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
-
-/* Don't re-probe for a new deploy more often than this. */
 const UPDATE_PROBE_INTERVAL_MS = 60 * 1000;
 
 // ---------------------------------------------------------------------------
@@ -239,22 +131,11 @@ const UPDATE_PROBE_INTERVAL_MS = 60 * 1000;
 // ---------------------------------------------------------------------------
 
 /**
- * Reduce a hostname to the form the rules below are written against.
- *
- * Two spellings of the same host reach here and neither is exotic:
- *
- *   * `api.weather.gov.` — the fully-qualified form, with the root label
- *     spelled out. `new URL()` accepts it and preserves the dot, DNS resolves
- *     it to the identical server, and `"api.weather.gov."` is not a member of
- *     `NEVER_CACHE_HOSTS` and does not end with `".weather.gov"`.
- *   * `API.Weather.GOV` — `new URL()` lowercases the host itself, so this only
- *     matters for a direct call, but hostnames are case-insensitive and the
- *     comparisons below are not.
- *
- * Neither was ever cacheable: `routeFor` is default-deny and both fall through
- * to `network`. They are normalised anyway because this function is the layer
- * that *states* the policy, and a future rule that leans on it must not inherit
- * a hole that only the default is currently covering.
+ * `new URL()` preserves the root label of a fully-qualified `api.weather.gov.`,
+ * which is neither in `NEVER_CACHE_HOSTS` nor a `".weather.gov"` suffix match.
+ * Case only matters for a direct call, since `new URL()` lowercases the host.
+ * Default-deny already catches both; normalising here keeps a future rule that
+ * leans on this from inheriting a hole only the default covers.
  */
 function normalizeHost(hostname) {
   let host = String(hostname).toLowerCase();
@@ -265,8 +146,8 @@ function normalizeHost(hostname) {
 function isWeatherDataHost(hostname) {
   const host = normalizeHost(hostname);
   if (NEVER_CACHE_HOSTS.has(host)) return true;
-  // Suffix rules so a bucket rename or a new NWS subdomain is still never
-  // cached without this file having to be updated first.
+  // Suffix rules so a bucket rename or a new NWS subdomain is still never cached
+  // without this file having to be updated first.
   return (
     host === "amazonaws.com" ||
     host.endsWith(".amazonaws.com") ||
@@ -278,17 +159,13 @@ function isWeatherDataHost(hostname) {
 }
 
 function isBasemapTile(url) {
-  // The extension is matched case-insensitively because a URL path is
-  // case-sensitive and `.PNG` is the same picture. The host is what actually
-  // confines this rule, and it is an exact match against CartoDB's four
-  // subdomains — the extension only distinguishes a tile from the other things
-  // that host serves.
+  // The host is what confines this rule; the extension only distinguishes a tile
+  // from the other things that host serves, so `.PNG` matches too.
   return BASEMAP_HOST.test(normalizeHost(url.hostname)) && /\.png$/i.test(url.pathname);
 }
 
 function isShellAsset(url) {
-  // Compare without the query string or fragment so a cache-busted
-  // `?v=2` still resolves to the shell entry it names.
+  // Query and fragment dropped so a cache-busted `?v=2` still resolves.
   return SHELL_URL_SET.has(url.origin + url.pathname);
 }
 
@@ -315,31 +192,30 @@ function routeFor({ url, method = "GET", mode = "no-cors" }) {
     return "network";
   }
 
-  // `chrome-extension:`, `data:`, `blob:` and friends: `cache.put` rejects on
-  // them anyway, and they are none of this worker's business.
+  // Defence in depth, currently unreachable and untestable: a `blob:` pathname
+  // is the inner URL, never under `ROOT.pathname`, so default-deny already
+  // answers every non-http(s) scheme. Removing it is an equivalent mutant. Keep
+  // it for a future rule that matches on something other than the path.
   if (u.protocol !== "http:" && u.protocol !== "https:") return "network";
 
-  // Credentials in the URL. Nothing rustdar issues has them, so their presence
-  // means the request was not built by this application, and a cache entry keyed
-  // by a URL carrying a password is a bad thing to own regardless of what the
-  // host is.
+  // Nothing rustdar issues carries credentials, so their presence means the
+  // request was not built by this application — and a cache entry keyed by a URL
+  // containing a password is a bad thing to own regardless of host.
   if (u.username || u.password) return "network";
 
-  // Checked before anything else that could say "yes", so no later rule can
-  // reach a data origin. This is not redundant with the default-deny below: it
-  // is what keeps the two rules that *do* say yes — a same-origin navigation
-  // and a same-origin shell asset — from matching a weather origin if rustdar
-  // is ever served from one, behind a proxy or on a shared host.
+  // First, so no later rule can reach a data origin. Not redundant with
+  // default-deny: it stops the two rules that *do* say yes from matching a
+  // weather origin if rustdar is ever served from one, behind a proxy or on a
+  // shared host.
   if (isWeatherDataHost(u.hostname)) return "network";
 
   if (isBasemapTile(u)) return "tile";
 
-  // `ROOT.pathname` always ends in a slash, so this is a directory containment
-  // test and not a prefix match: `/rustdar/` does not match `/rustdar-old/x`.
-  // Without it, a user-site deploy at `https://<user>.github.io/` — which the
-  // relative-URL work exists to support — would answer navigations for every
-  // other project on that origin with rustdar's index.html. Service-worker
-  // scope confines this today; scope is not the thing that should be relied on.
+  // `ROOT.pathname` ends in a slash, so this is directory containment, not a
+  // prefix match: `/rustdar/` does not match `/rustdar-old/x`. Without it a
+  // user-site deploy at `https://<user>.github.io/` would answer navigations for
+  // every other project on that origin with rustdar's index.html. Worker scope
+  // confines this today; scope is not the thing to rely on.
   if (u.origin === ROOT.origin && u.pathname.startsWith(ROOT.pathname)) {
     if (mode === "navigate") return "navigate";
     if (isShellAsset(u)) return "shell";
@@ -354,18 +230,14 @@ function routeFor({ url, method = "GET", mode = "no-cors" }) {
 // ---------------------------------------------------------------------------
 
 /**
- * Form a version token from a response's HTTP validators.
- *
  * Both sides of every comparison come from a `HEAD` issued by
- * `probeValidator()`, never from a stored `GET`, so the token is not sensitive
- * to the header differences between the two (notably `Content-Length` under
- * content negotiation).
+ * `probeValidator()`, never from a stored `GET`, so the token is insensitive to
+ * the header differences between the two (notably `Content-Length` under content
+ * negotiation).
  *
- * `null` means the server publishes no validators at all. rustdar's two real
- * targets both do — GitHub Pages sends `ETag`, `http.server` sends
- * `Last-Modified` and `Content-Length` — but on a server that does not, updates
- * cannot be detected this way and the shell is left alone rather than
- * re-downloaded on every load.
+ * `null` means the server publishes no validators, in which case updates cannot
+ * be detected and the shell is left alone rather than re-downloaded on every
+ * load. Pages sends `ETag`; `http.server` sends `Last-Modified` + `Content-Length`.
  */
 function validatorToken(response) {
   const etag = response.headers.get("etag");
@@ -377,8 +249,8 @@ function validatorToken(response) {
 }
 
 async function probeValidator() {
-  // `no-store` so the browser's own HTTP cache cannot answer this and hide a
-  // new deploy behind a `max-age` that has not expired.
+  // `no-store` so the browser's own HTTP cache cannot answer this and hide a new
+  // deploy behind an unexpired `max-age`.
   const response = await fetch(SHELL_VERSION_PROBE, {
     method: "HEAD",
     cache: "no-store",
@@ -412,10 +284,7 @@ async function writeMeta(meta) {
   );
 }
 
-/*
- * The published meta record, memoised so the hot path is one cache lookup
- * rather than a meta read per subresource. Cleared whenever the pointer moves.
- */
+/* Memoised so the hot path is one cache lookup, not a meta read per subresource. */
 let metaPromise = null;
 
 function currentMeta() {
@@ -424,29 +293,17 @@ function currentMeta() {
 }
 
 /*
- * Which shell generation each live client is being served from.
- *
- * Keyed by the client id the navigation created. This is the whole of the
- * atomicity guarantee: a page load spans several fetches and a deploy can land
- * between any two of them, so "the current shell" has to mean "the shell this
- * client's navigation was answered from", not "the shell as of right now".
- *
- * Mirrored into the meta cache by `writePins`, because this map is module state
- * and a service worker is killed after about thirty seconds idle. Losing it
- * would put a page that navigated under one deploy back onto whatever is
- * current for its glue and its wasm — the mixed shell this exists to prevent,
- * reintroduced by the restart. A durable pin is also what makes the retention
- * in `cachesToKeep` exact: the generations still in use are known rather than
- * guessed at.
+ * Which shell generation each live client is being served from, keyed by the
+ * client id its navigation created. Mirrored into the meta cache by `writePins`,
+ * since this is module state and the worker is killed after ~30s idle. The
+ * durable copy is also what makes `cachesToKeep` exact rather than a guess.
  */
 const clientShells = new Map();
 
 /**
- * Open a named shell cache, or null if it is not there any more.
- *
- * `caches.open` creates on demand, which is the wrong behaviour here: opening a
- * purged generation would silently manufacture an empty cache, every lookup in
- * it would miss, and the entry would sit in storage forever. Ask first.
+ * `caches.open` creates on demand, so opening a purged generation would silently
+ * manufacture an empty cache that every lookup misses and that sits in storage
+ * forever. Ask first; null means gone.
  */
 async function openShellCache(name) {
   if (!name) return null;
@@ -475,19 +332,16 @@ async function writePins(pins) {
   );
 }
 
-/** The ids of every window this worker can see. */
 async function liveClientIds() {
   const windows = await self.clients.matchAll({ includeUncontrolled: true, type: "window" });
   return new Set(windows.map((c) => c.id));
 }
 
 /**
- * Record `cacheName` as the generation serving `clientId`, durably.
- *
- * Departed clients are dropped in the same write, so the record is bounded by
- * the number of open tabs rather than by how many have ever been opened.
- * `keepId` is the client the current navigation is creating: it does not exist
- * yet, so it is not in `live` and would otherwise be pruned immediately.
+ * Record `cacheName` as the generation serving `clientId`, durably. Departed
+ * clients are pruned in the same write, bounding the record by open tabs rather
+ * than by tabs ever opened; `clientId` is exempt because the navigation creating
+ * it has not finished, so it is not yet in `live`.
  */
 async function pinClient(clientId, cacheName) {
   clientShells.set(clientId, cacheName);
@@ -510,17 +364,16 @@ async function shellCacheForClient(clientId) {
   if (clientId) {
     let pinned = clientShells.get(clientId);
     if (!pinned) {
-      // Nothing in memory: either this client never navigated through this
-      // worker, or the worker has been restarted since it did. The second is
-      // the case that matters, and it is why the pin is written down.
+      // Either this client never navigated through this worker, or the worker
+      // restarted since it did. The second is why the pin is written down.
       const pins = await readPins();
       pinned = pins[clientId];
       if (pinned) clientShells.set(clientId, pinned);
     }
     if (pinned) {
       const cache = await openShellCache(pinned);
-      // A pin whose cache is gone falls through rather than failing: the
-      // network is always a correct answer, just a slower one.
+      // A pin whose cache is gone falls through: the network is always a correct
+      // answer, just a slower one.
       if (cache) return cache;
     }
   }
@@ -529,51 +382,35 @@ async function shellCacheForClient(clientId) {
 }
 
 /**
- * Download the whole shell into a cache named for `token`, then publish it.
- *
- * The publish is the `writeMeta` at the end, and it is the only step that makes
- * the new shell visible. `addAll` is all-or-nothing: it rejects without writing
- * anything if any request fails or answers non-2xx, so a partially downloaded
- * deploy can never be published.
+ * Download the whole shell into a cache named for `token`, then publish it. The
+ * trailing `writeMeta` is the publish and the only step that makes the new shell
+ * visible; `addAll` is all-or-nothing, so a partially downloaded deploy can never
+ * be published.
  */
 async function installShell(token, name = shellCacheName(token)) {
   const cache = await caches.open(name);
   /*
-   * `no-cache`, not `reload`. Both bypass a stale `max-age` — GitHub Pages
-   * serves `max-age=600`, so a plain fetch could rebuild the shell out of the
-   * *previous* deploy's bytes and store them under the new token, which is the
-   * pinned-bundle bug wearing a different hat.
+   * `no-cache`, not `reload`. Both bypass a stale `max-age` (Pages serves
+   * `max-age=600`, so a plain fetch could rebuild the shell out of the previous
+   * deploy's bytes under the new token), but `reload` downloads unconditionally
+   * where `no-cache` revalidates for a 304.
    *
-   * The difference is what happens when nothing changed. `reload` downloads
-   * unconditionally; `no-cache` revalidates, so an unchanged asset costs a 304
-   * and no body. Measured on a first visit against a server sending `ETag` and
-   * `max-age=600`, which is what Pages sends:
-   *
-   *   index.html, the glue, the manifest and the icons  ->  304, no body
-   *   the wasm module, Firefox                          ->  304, no body
-   *   the wasm module, Chromium                         ->  304, then a full GET
-   *
-   * That last line is not something this file can fix, and it is worth knowing
-   * before someone "optimises" it. The page instantiates the module with
-   * `WebAssembly.instantiateStreaming`, and Chromium keeps the compiled result
-   * rather than a reusable response body: it answers the revalidation, finds it
-   * has no body to reuse, and refetches unconditionally. So a first visit in
-   * Chromium transfers the 11 MB twice — once for the page, once for this cache
-   * — and never again on any subsequent visit. Firefox transfers it once.
-   *
-   * The alternative, caching the module opportunistically when the fetch
-   * handler first serves it instead of precaching it here, removes the second
-   * transfer but breaks atomicity: the module would then be cached separately
-   * from the glue that has to match it, which is a wasm-bindgen version
-   * mismatch and a blank page. One extra transfer, once, is the cheaper bug.
+   * Against `ETag` + `max-age=600`, a first visit is bodyless 304s except the
+   * wasm module in Chromium, which 304s and then issues a full GET: the page
+   * instantiated it with `WebAssembly.instantiateStreaming`, which keeps the
+   * compiled result and no reusable body. Chromium therefore transfers the 10 MiB
+   * module twice on a first visit and never again; Firefox transfers it once.
+   * Not fixable here. Caching the module opportunistically in the fetch handler
+   * would remove the second transfer and break atomicity — the module would be
+   * cached separately from the glue that has to match it.
    */
   try {
     await cache.addAll(SHELL_URLS.map((u) => new Request(u, { cache: "no-cache" })));
   } catch (e) {
     // `addAll` writes nothing when it rejects, but `caches.open` above already
-    // created the cache. Left behind, it is an empty entry that
-    // `openShellCache` would treat as a real generation and that a later
-    // install under the same token would find pre-existing. Take it back out.
+    // created the cache. Left behind, `openShellCache` would treat it as a real
+    // generation and a later install under the same token would find it
+    // pre-existing.
     await caches.delete(name);
     throw e;
   }
@@ -584,12 +421,8 @@ async function installShell(token, name = shellCacheName(token)) {
 
 /**
  * The caches an install must not delete: the new shell, and every pinned one.
- *
- * Pins are read from storage rather than only from `clientShells`, so that a
- * worker which restarted since a page loaded still knows that page's generation
- * is in use. Retaining "the previous generation" instead was the first attempt
- * and is strictly worse — it keeps a cache nothing may be reading while still
- * being able to delete one that something is.
+ * Pins come from storage, not just `clientShells`, so a restarted worker still
+ * knows a live page's generation is in use.
  */
 async function cachesToKeep(newShellName) {
   const keep = new Set([META_CACHE, TILE_CACHE, newShellName]);
@@ -615,24 +448,16 @@ async function notifyClients(message) {
   for (const client of windows) client.postMessage(message);
 }
 
-/*
- * In-flight guard: concurrent navigations must share one probe, not race to
- * download 11 MB twice.
- */
+/* In-flight guard: concurrent navigations share one probe rather than racing. */
 let updateCheck = null;
 let lastCheckedAt = 0;
 
 /*
- * Consecutive probe failures, and the warnings already emitted.
- *
- * Both are module state and therefore reset when the worker is killed, which
- * makes them a floor rather than a count: a browser that is offline for a week
- * will not accumulate to the threshold, because each restart starts again. That
- * is the right way round. The failure worth shouting about is the one that
- * persists *while the worker is alive and busy* — a server that has started
- * refusing `HEAD`, which every navigation then re-probes and re-fails — and
- * that one reaches the threshold within a single lifetime. Being offline is
- * both temporary and already visible in the page's own offline banner.
+ * Module state, so a restart resets the count. Deliberate: the failure worth
+ * shouting about is one that persists while the worker is alive and busy (a
+ * server that has started refusing `HEAD`, re-probed by every navigation), and
+ * that reaches the threshold within one lifetime. Being offline is temporary and
+ * already visible in the page's offline banner.
  */
 let probeFailures = 0;
 const PROBE_FAILURE_WARN_AFTER = 3;
@@ -645,17 +470,12 @@ function warnOnce(key, ...args) {
 }
 
 /**
- * Probe for a new deploy and, if there is one, install it.
+ * Probe for a new deploy and, if there is one, install it. Never deletes a
+ * working shell it cannot replace.
  *
- * Offline, or against a server with no validators, this is a no-op that leaves
- * the existing shell exactly as it was. It never deletes a working shell it
- * cannot replace.
- *
- * `force` bypasses the *time* throttle only. It cannot bypass the two ways this
- * function legitimately declines to act — a probe that threw, and a server with
- * no validators to compare — because in both cases there is genuinely no
- * evidence that anything changed. Overriding that is what `forceReinstall()` is
- * for, and it is a different operation: it does not ask whether to reinstall.
+ * `force` bypasses the *time* throttle only — not a probe that threw or a server
+ * with no validators, since in both cases there is genuinely no evidence
+ * anything changed. `forceReinstall()` is the operation that does not ask.
  */
 function checkForUpdate({ force = false } = {}) {
   if (updateCheck) return updateCheck;
@@ -673,10 +493,9 @@ function checkForUpdate({ force = false } = {}) {
     } catch (e) {
       // Offline, or the probe failed. Keep serving what we have.
       if (!meta) throw e;
-      // A shell is installed and cannot be checked. If that persists, this
-      // worker will serve the same deploy indefinitely with nothing on screen
-      // saying so — which for a severe-weather application means quietly
-      // running last month's code. Say so where a developer will see it.
+      // A shell that is installed and cannot be checked will be served
+      // indefinitely with nothing on screen saying so — for a severe-weather
+      // application, quietly running last month's code.
       if (++probeFailures >= PROBE_FAILURE_WARN_AFTER) {
         console.warn(
           `rustdar sw: the shell version probe has failed ${probeFailures} ` +
@@ -690,8 +509,8 @@ function checkForUpdate({ force = false } = {}) {
     }
     lastCheckedAt = Date.now();
 
-    // A server with no validators: install once, then leave it alone. There is
-    // no signal here that could tell a new deploy from the old one.
+    // No validators: install once, then leave it alone. Nothing here could tell
+    // a new deploy from the old one.
     if (token === null) {
       if (meta) {
         warnOnce(
@@ -710,9 +529,8 @@ function checkForUpdate({ force = false } = {}) {
     const name = await installShell(token);
     await purgeCaches(await cachesToKeep(name));
 
-    // Only announce a *replacement*. The first install has nothing to replace:
-    // the page that triggered it is already running the code just cached, and
-    // telling it to reload would be a lie.
+    // Only announce a *replacement*. The page that triggered a first install is
+    // already running the code just cached, so telling it to reload would lie.
     if (meta) await notifyClients({ type: "rustdar:shell-updated", token });
   })().finally(() => {
     updateCheck = null;
@@ -722,19 +540,15 @@ function checkForUpdate({ force = false } = {}) {
 }
 
 /**
- * Reinstall the shell from the network without asking whether it changed.
- *
- * The escape hatch for a degraded probe. `checkForUpdate` compares a token
- * against the stored one, so it is useless in exactly the cases where it is
- * most needed: a server that has started answering `HEAD` with 405, or one that
- * publishes no validators at all. Both leave `checkForUpdate` correctly
- * concluding "no evidence of a change" forever.
+ * The escape hatch for a degraded probe: a server answering `HEAD` with 405, or
+ * publishing no validators, leaves `checkForUpdate` correctly concluding "no
+ * evidence of a change" forever.
  *
  * The download lands in a cache of its own even when the token is unchanged,
  * because that token may name a generation live clients are pinned to and
  * refetching into it would rewrite a shell out from under a page mid-load. The
- * *token* recorded in the meta record is still the probe's, so the next
- * ordinary check compares like with like and does not reinstall again.
+ * *token* recorded in meta is still the probe's, so the next ordinary check
+ * compares like with like.
  */
 async function forceReinstall() {
   if (updateCheck) await updateCheck.catch(() => {});
@@ -761,11 +575,9 @@ async function forceReinstall() {
 // ---------------------------------------------------------------------------
 
 /**
- * Serve a shell asset from the generation `clientId` is pinned to.
- *
- * `clientId` is the empty string for a request whose client the browser cannot
- * name, which falls back to the current generation — correct, because such a
- * request is not part of a page load this worker pinned.
+ * `clientId` is the empty string for a request the browser cannot attribute,
+ * which falls back to the current generation — correct, because such a request
+ * is not part of a page load this worker pinned.
  */
 async function serveShell(request, clientId, key) {
   const cache = await shellCacheForClient(clientId);
@@ -773,18 +585,14 @@ async function serveShell(request, clientId, key) {
     const hit = await cache.match(key ?? request, { ignoreSearch: true });
     if (hit) return hit;
   }
-  // No shell yet (first visit, or an update that has not finished): the network
-  // is the source of truth and nothing is written here. `checkForUpdate` owns
-  // every write to the shell cache, so this path cannot publish a stray entry.
+  // No shell yet (first visit, or an unfinished update). Nothing is written
+  // here: `checkForUpdate` owns every write to the shell cache.
   return fetch(request);
 }
 
 /**
- * Answer a navigation, and pin the answering generation to the new client.
- *
- * The pin is taken here and nowhere else, because this is the only point in a
- * page load at which "which deploy is this page" is still an open question.
- * After this, it is settled for every subresource that client will request.
+ * The pin is taken here and nowhere else: this is the only point in a page load
+ * at which "which deploy is this page" is still open.
  */
 async function serveNavigation(event) {
   const meta = await currentMeta();
@@ -799,7 +607,7 @@ async function serveNavigation(event) {
   return fetch(event.request);
 }
 
-/** Milliseconds a cached tile is good for, per the response's own headers. */
+/** How long a cached tile is good for, per the response's own `Cache-Control`. */
 function tileFreshFor(response) {
   const control = response.headers.get("cache-control") || "";
   const match = /(?:^|,)\s*max-age\s*=\s*(\d+)/i.exec(control);
@@ -808,22 +616,18 @@ function tileFreshFor(response) {
 }
 
 function tileIsStale(response) {
-  // An opaque response (a `no-cors` fetch) exposes no headers at all. There is
-  // nothing to reason about, and a basemap tile does not go dangerously wrong
-  // with age, so it is kept.
+  // An opaque (`no-cors`) response exposes no headers, and a basemap tile does
+  // not go dangerously wrong with age.
   if (response.type === "opaque") return false;
 
   const date = response.headers.get("date");
-  // A readable response with no `Date` is treated as stale rather than as
-  // fresh. Freshness here is an assertion about age, and with no clock in the
-  // response there is nothing to assert it from; declining to answer used to
-  // mean such an entry was never revalidated for as long as it existed. The
-  // cost of the other direction is one conditional request — this is
-  // stale-while-revalidate, so the cached tile is still served immediately.
+  // No clock, nothing to assert freshness from. Treating that as fresh used to
+  // mean such an entry was never revalidated for as long as it existed; the cost
+  // of this direction is one conditional request, since the cached tile is still
+  // served immediately.
   if (!date) return true;
 
   const age = Date.now() - Date.parse(date);
-  // An unparseable `Date` is the same situation as an absent one.
   if (!Number.isFinite(age)) return true;
   return age > tileFreshFor(response);
 }
@@ -838,11 +642,9 @@ async function cacheTile(cache, request, response) {
 }
 
 /**
- * Cache-first, with revalidation once the origin's own `max-age` has passed.
- *
- * Serving the stale copy while revalidating is safe here in a way it would
- * never be for weather data: the worst outcome is one screen drawn with last
- * month's rendering of the same coastline.
+ * Cache-first, revalidating once the origin's own `max-age` has passed. Serving
+ * stale is safe here in a way it never would be for weather data: the worst
+ * outcome is last month's rendering of the same coastline.
  */
 async function serveTile(event) {
   const cache = await caches.open(TILE_CACHE);
@@ -868,23 +670,13 @@ async function serveTile(event) {
 }
 
 /*
- * Trim bookkeeping.
- *
- * `cache.keys()` walks every entry, so it is amortised over a batch of writes
- * rather than paid per tile. The subtlety is that this counter is module state
- * and a service worker is killed after roughly thirty seconds idle — far more
- * often than a user finishes panning a map.
- *
- * Counting alone was therefore not a bound at all. A user panning slowly enough
- * to fetch fewer than `TILE_TRIM_BATCH` new tiles per worker lifetime never
- * reached the threshold, the counter went back to zero with the worker, and the
- * basemap cache grew without limit — which is quota pressure, which is what
- * makes the shell's all-or-nothing `addAll` fail.
- *
- * `trimmedThisLifetime` closes it: the first tile written by any worker
- * instance always pays for a full check. A restart is now the event that
- * guarantees a trim rather than the event that skips one, and within a single
- * lifetime the cache can exceed `TILE_CACHE_MAX` by at most one batch.
+ * `cache.keys()` walks every entry, so trimming is amortised over a batch.
+ * Counting alone was not a bound: the counter is module state, the worker dies
+ * after ~30s idle, and a user panning slowly enough to fetch fewer than
+ * `TILE_TRIM_BATCH` tiles per lifetime never reached the threshold, so the cache
+ * grew without limit — quota pressure, which is what makes the shell's
+ * all-or-nothing `addAll` fail. `trimmedThisLifetime` makes the first tile
+ * written by any instance pay for a full check.
  */
 const TILE_TRIM_BATCH = 50;
 let tilePutsSinceTrim = 0;
@@ -899,8 +691,8 @@ async function trimTiles() {
   const keys = await cache.keys();
   const excess = keys.length - TILE_CACHE_MAX;
   if (excess <= 0) return;
-  // Cache.keys() yields insertion order, so the head is the oldest. FIFO rather
-  // than LRU: tracking access times would mean a write per read.
+  // `Cache.keys()` yields insertion order, so the head is the oldest. FIFO
+  // rather than LRU: tracking access times would mean a write per read.
   await Promise.all(keys.slice(0, excess).map((k) => cache.delete(k)));
 }
 
@@ -909,28 +701,23 @@ async function trimTiles() {
 // ---------------------------------------------------------------------------
 
 self.addEventListener("install", () => {
-  // Nothing here. Precaching during install would make a flaky network fail the
+  // Deliberately empty. Precaching here would let a flaky network fail the
   // installation, and `skipWaiting()` would swap the controller under a running
-  // page. Both are handled deliberately elsewhere: the shell is installed by
-  // `checkForUpdate()` on activate, and the swap waits for the user to accept
+  // page. `checkForUpdate()` on activate installs the shell; the swap waits for
   // the reload prompt (see the `message` handler).
 });
 
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     (async () => {
-      // Control the page that registered us, so the update channel works on the
-      // very first visit instead of only after a reload.
+      // Claim the registering page so the update channel works on the first
+      // visit rather than only after a reload.
       await self.clients.claim();
-      // Bound the tile cache at every version change as well as at every worker
-      // start. Cheap — one `keys()` walk — and it is the one moment at which
-      // this worker is certain to be running and not in a hurry.
       await trimTiles().catch(() => {});
       try {
         await checkForUpdate({ force: true });
       } catch {
-        // First visit while offline. There is nothing to cache and nothing to
-        // do; the next navigation tries again.
+        // First visit while offline. The next navigation tries again.
       }
     })(),
   );
@@ -945,13 +732,9 @@ self.addEventListener("fetch", (event) => {
 
   switch (route) {
     case "navigate":
-      // Every page load is a chance to notice a new deploy. `waitUntil` keeps
-      // the worker alive for the probe without delaying the response.
-      //
-      // Ordering matters: `serveNavigation` reads the meta pointer and pins the
-      // new client to it, and it must do so against the pointer as it stands
-      // *now*. `respondWith` is called first so that the pin is taken before
-      // the probe above can move the pointer underneath it.
+      // Order matters: `respondWith` runs `serveNavigation`, which reads the
+      // meta pointer and pins the new client to it, before the probe below can
+      // move that pointer underneath it.
       event.respondWith(serveNavigation(event));
       event.waitUntil(checkForUpdate().catch(() => {}));
       return;
@@ -962,9 +745,8 @@ self.addEventListener("fetch", (event) => {
       event.respondWith(serveTile(event));
       return;
     default:
-      // "network": return without calling respondWith. The browser performs its
-      // ordinary networking and this worker is not in the request path at all.
-      // Every weather-data request in the application ends here.
+      // "network": no `respondWith`, so this worker is not in the request path
+      // at all. Every weather-data request ends here.
       return;
   }
 });
@@ -972,15 +754,14 @@ self.addEventListener("fetch", (event) => {
 self.addEventListener("message", (event) => {
   const type = event.data && event.data.type;
   if (type === "rustdar:skip-waiting") {
-    // The user accepted the reload prompt. Only now is it safe to replace the
-    // controller: the page is about to be torn down anyway.
+    // The reload prompt was accepted, so the page is about to be torn down and
+    // replacing the controller is safe.
     self.skipWaiting();
   } else if (type === "rustdar:check-update") {
-    // A long-lived tab coming back to the foreground. Such a tab never
-    // navigates, so this is its only chance to notice a deploy.
+    // A long-lived tab returning to the foreground never navigates, so this is
+    // its only chance to notice a deploy.
     event.waitUntil(checkForUpdate({ force: true }).catch(() => {}));
   } else if (type === "rustdar:force-update") {
-    // Reinstall regardless of what the probe thinks. See `forceReinstall`.
     event.waitUntil(
       forceReinstall().catch((e) => console.warn("rustdar sw: forced reinstall failed:", e)),
     );
@@ -988,15 +769,9 @@ self.addEventListener("message", (event) => {
 });
 
 /*
- * Test hook.
- *
- * `tests/sw_routing.test.mjs` loads this file's shipped bytes into a scope that
- * models a ServiceWorkerGlobalScope, calls `routeFor` directly, and drives the
- * `fetch`, `activate` and `message` handlers above. Asserting against the
- * shipped worker is the only way to test the policy that actually runs; a
- * re-implementation in the test would assert only that the test agrees with
- * itself. `rustdar-web/tests/sw_behaviour.rs` runs that suite under
- * `cargo test`, so it gates the same builds every other test here gates.
+ * Test hook. `tests/sw_routing.test.mjs` loads these shipped bytes into a scope
+ * modelling a ServiceWorkerGlobalScope and drives the handlers directly;
+ * `tests/sw_behaviour.rs` runs that suite under `cargo test`.
  */
 self.__rustdarSwInternals = {
   ROOT,

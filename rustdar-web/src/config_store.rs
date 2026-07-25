@@ -4,34 +4,24 @@
 //! by path: `localStorage` is a flat string-to-string map with no directories
 //! and no filenames, so there is nothing here for a `&Path` to mean.
 
-/// Prefix every key is written under.
-///
-/// An artifact served from a shared origin — a project page, a preview
-/// deployment, a `localhost` port reused between projects — sees the same
-/// `localStorage` as every other app on that origin. A bare `"ui"` key would
-/// collide with any of them. The prefix is not security, it is namespacing.
+/// Namespacing, not security: a shared origin (project page, preview deploy,
+/// reused `localhost` port) sees one `localStorage` for every app on it, and a
+/// bare `"ui"` would collide.
 const KEY_PREFIX: &str = "rustdar.";
 
-/// Map a logical config key onto the `localStorage` key it occupies.
+/// Map a logical config key onto its `localStorage` key.
 ///
-/// Split out from the store itself, and public, so it can be tested without a
-/// browser: the `Storage` object only exists on wasm32, but the naming rule is
-/// ordinary string handling and is the part that would break silently if it
-/// changed — an altered prefix does not fail, it just quietly stops finding
-/// every layout the previous build saved.
+/// Split out and public so it is testable without a browser. An altered prefix
+/// does not fail; it quietly stops finding every layout the previous build saved.
 pub fn storage_key(key: &str) -> String {
     format!("{KEY_PREFIX}{key}")
 }
 
 /// A [`ConfigStore`] that persists into `window.localStorage`.
 ///
-/// Holds the `Storage` handle rather than re-reaching for it per call. The
-/// handle is obtained once in [`LocalStorageConfigStore::new`], which is also
-/// where the failure is absorbed: `localStorage` throws rather than returning
-/// null when the user has blocked site data, and in a sandboxed iframe the
-/// access throws on every attempt. Both are configuration-is-unavailable, which
-/// the trait already models as "load returns None, store returns Err" — neither
-/// is allowed to stop the app.
+/// The handle is obtained once in [`LocalStorageConfigStore::new`], which is
+/// also where failure is absorbed: `localStorage` *throws* rather than returning
+/// null when site data is blocked or the page is a sandboxed iframe.
 #[cfg(target_arch = "wasm32")]
 pub struct LocalStorageConfigStore {
     storage: web_sys::Storage,
@@ -40,16 +30,10 @@ pub struct LocalStorageConfigStore {
 #[cfg(target_arch = "wasm32")]
 impl LocalStorageConfigStore {
     /// Obtain the backing store, or `None` where the browser refuses access.
-    ///
-    /// Returning `Option` rather than papering over the failure with a
-    /// no-op store keeps the "is there anywhere to persist?" question answered
-    /// in one place — `PlatformBridge::config_store` already returns an
-    /// `Option`, and the caller already treats `None` as "use defaults".
     pub fn new() -> Option<Self> {
-        // Three things can fail here and all three mean the same thing, so they
-        // collapse into one `ok()?` chain: no window (we are not on a page),
-        // the getter throwing (site data blocked, or a sandboxed iframe), and
-        // the getter succeeding with null (specified, if unusual).
+        // Three distinct failures, all meaning "nowhere to persist": no window,
+        // the getter throwing (site data blocked, sandboxed iframe), and the
+        // getter returning null.
         let storage = web_sys::window()?.local_storage().ok()??;
         Some(Self { storage })
     }
@@ -58,18 +42,16 @@ impl LocalStorageConfigStore {
 #[cfg(target_arch = "wasm32")]
 impl rustdar_egui::config_store::ConfigStore for LocalStorageConfigStore {
     fn load(&self, key: &str) -> Option<String> {
-        // `get_item` returns Err only if the store has become inaccessible
-        // since construction, and Ok(None) for a key that was never written.
-        // The trait says to report both as None, so the whole thing folds.
+        // Err (store became inaccessible) and Ok(None) (never written) both
+        // report as None per the trait, so the chain folds.
         self.storage.get_item(&storage_key(key)).ok()?
     }
 
     fn store(&self, key: &str, value: &str) -> Result<(), String> {
         self.storage
             .set_item(&storage_key(key), value)
-            // The JsValue carries the DOMException; `QuotaExceededError` is the
-            // one that actually happens, when the origin's ~5 MB budget is full.
-            // Stringified rather than matched because no caller branches on it.
+            // `QuotaExceededError` (origin's ~5 MB budget full) is the one that
+            // happens. Stringified because no caller branches on it.
             .map_err(|e| format!("localStorage write failed: {e:?}"))
     }
 }
@@ -79,25 +61,20 @@ mod tests {
     use super::*;
     use rustdar_egui::config_store::UI_CONFIG_KEY;
 
-    /// The prefix is applied. Without it the key would be a bare `"ui"` in an
-    /// origin-wide namespace shared with every other app on the host.
     #[test]
     fn keys_are_namespaced_to_rustdar() {
         assert_eq!(storage_key(UI_CONFIG_KEY), "rustdar.ui");
     }
 
-    /// Distinct logical keys stay distinct once prefixed — the mapping has to be
-    /// injective or two configs would overwrite each other.
+    /// The mapping has to be injective or two configs overwrite each other.
     #[test]
     fn distinct_keys_stay_distinct() {
         assert_ne!(storage_key("ui"), storage_key("other"));
     }
 
-    /// The prefix is a prefix, not a replacement: the logical key has to survive
-    /// into the stored name, and it has to be at the *end*. A mapping that
-    /// merely contained the key — `"rustdar.layout.v1"` — would still read back
-    /// consistently within one build while silently orphaning every layout saved
-    /// by the previous one.
+    /// The logical key must survive verbatim and at the *end*. A mapping that
+    /// merely contained it (`"rustdar.layout.v1"`) reads back consistently
+    /// within one build while orphaning everything the previous one saved.
     #[test]
     fn the_logical_key_survives_verbatim_at_the_end() {
         let mapped = storage_key("layout");

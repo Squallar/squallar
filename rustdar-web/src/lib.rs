@@ -7,15 +7,9 @@
 //! entry point, the concrete [`PlatformBridge`] and the capabilities that bridge
 //! exposes. Everything visible on the page belongs to `rustdar-frontend`.
 //!
-//! # WebGL2, not WebGPU
-//!
-//! Firefox has no stable WebGPU. A build that took WebGPU where it was
-//! available would run one rendering path in Chrome and another in Firefox off
-//! the same binary, and only one of them would ever be exercised during
-//! development. `rustdar_frontend::app` pins `Backends::GL` on wasm32 so both
-//! browsers run the path that was actually tested.
-//!
-//! # Building and running
+//! WebGL2, not WebGPU: Firefox has no stable WebGPU, and taking WebGPU where it
+//! exists would give the same binary two rendering paths with only one ever
+//! exercised. `rustdar_frontend::app` pins `Backends::GL` on wasm32.
 //!
 //! ```text
 //! cd rustdar-web
@@ -26,67 +20,29 @@
 //!
 //! `--target web` is required: `index.html` loads `./pkg/rustdar_web.js` as an
 //! ES module and calls the exported [`start`]. It must be *served*, not opened
-//! as a `file://` URL — wasm instantiation and the tile fetches both need a real
-//! origin.
+//! as `file://`.
 //!
-//! Build `--release` before judging performance. Workspace code is `opt-level =
-//! 0` in the dev profile, and radar rasterization is roughly 2.5x slower there —
-//! 2349 ms per Level II frame against a release figure in the 160-190 ms range.
+//! # Performance
 //!
-//! # The Firefox/Chromium gap on `radar-render`: there isn't one
+//! Measure in `--release`. Workspace code is `opt-level = 0` in dev and radar
+//! rasterization is ~2.5x slower there: 2349 ms per Level II frame against
+//! 160-190 ms.
 //!
-//! This section used to record Firefox at 899-962 ms per Level II frame against
-//! Chromium's 162 ms — a 5.7x penalty — and treat it as the crate's open
-//! performance question. **It does not reproduce.**
+//! **There is no Firefox/Chromium gap on `radar-render`.** An earlier claim of
+//! 899-962 ms in Firefox against 162 ms in Chromium (5.7x) does not reproduce.
+//! Both browsers against the same archived sweep (`KTLX20260725_191018_V06`,
+//! release, `IMAGE_SIZE` 1024) give median 188 ms Firefox / 191 ms Chromium, and
+//! across 12 interleaved pairs the median Firefox/Chromium ratio is 0.88 —
+//! Firefox is slightly faster, matching the isolated harness (233 vs 261 ms).
 //!
-//! Measured in the assembled bundle, both browsers driving this page against the
-//! *same* archived sweep (`KTLX20260725_191018_V06`, 9 067 340 bytes), release,
-//! `IMAGE_SIZE` 1024:
+//! The original number was taken without pinning the input (the app loads
+//! whichever volume is newest, so two browsers started minutes apart rasterize
+//! different sweeps) and on a 32-core box at load 26-72, where single samples
+//! spanned 174-508 ms in Chromium alone. Pin the volume and interleave the runs
+//! before quoting a ratio.
 //!
-//! | browser                          |  n | min    | median |
-//! |----------------------------------|---:|-------:|-------:|
-//! | Chromium (headless, SwiftShader) | 23 | 174 ms | 191 ms |
-//! | Firefox (headed on Xvfb, NVIDIA) | 14 | 159 ms | 188 ms |
-//!
-//! Those are two different analyses and should be read as two. The table is
-//! every sample each browser produced, pooled; the *n* differ because Firefox
-//! needs a headed X server and lost runs to a display-allocation race. Pooled
-//! medians across unequal, non-simultaneous samples are only suggestive on a
-//! loaded machine. The controlled comparison is the subset that ran as **12
-//! interleaved pairs**, one browser immediately after the other so both meet the
-//! same contention: there the median Firefox/Chromium ratio is **0.88**.
-//!
-//! Both say the same thing, which is the point of quoting both. Firefox is
-//! slightly *faster* — as the isolated harness had already found (233 ms against
-//! 261 ms) and was disbelieved because the assembled app seemed to contradict
-//! it. It does not. There is no Firefox-specific penalty in this bundle to fix.
-//!
-//! The GPUs are deliberately not matched: Chromium runs headless on SwiftShader,
-//! Firefox headed on the host NVIDIA, because headless Firefox has no WebGL2 at
-//! all here. That asymmetry would wreck a comparison of frame *presentation* and
-//! does not touch this one — `radar-render` is the CPU-side rasterizer, it runs
-//! to a `Vec<u8>` on the main thread with no GPU call in the timed region, and
-//! the GPU only ever sees the finished image. It also cuts the wrong way for the
-//! conclusion: the browser on real hardware would be the flattered one, and it is
-//! the one already winning.
-//!
-//! Two things are needed to get a number that means anything, and the original
-//! measurement had neither.
-//!
-//! **Pin the input.** The app loads whichever volume is newest, so two browsers
-//! started minutes apart rasterize two different sweeps with different gate
-//! counts. Comparing across them measures the weather. These runs went through a
-//! caching proxy, so the second browser replayed the first one's bytes.
-//!
-//! **Watch the machine.** These runs shared a 32-core box with an unrelated
-//! build fleet at load 26-72, and single samples there spanned 174-508 ms in
-//! *Chromium alone* — a wider spread than the effect being chased. Minima and
-//! matched pairs are the figures that survive that; one timing off a busy
-//! machine is not evidence, and a 5.7x built from two of them is most likely
-//! just the load at the two moments they were taken.
-//!
-//! Still true, and the actual place the frame goes on *both* browsers:
-//! `rustdar_radar::types::lat_rad_to_mercator_y`. See `rustdar_radar::render`'s
+//! The hot spot on both browsers is
+//! `rustdar_radar::types::lat_rad_to_mercator_y`; see `rustdar_radar::render`'s
 //! `RenderBuffers`.
 //!
 //! [`PlatformBridge`]: rustdar_frontend::platform::PlatformBridge

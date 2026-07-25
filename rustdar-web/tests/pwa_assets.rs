@@ -1,32 +1,13 @@
-//! Gates on the PWA assets that ship next to the wasm bundle.
+//! Gates on the static PWA assets: `manifest.webmanifest`, `sw.js`,
+//! `index.html`, `icons/`. Nothing in the Rust build reads them, so the two
+//! silent failures worth catching mechanically are a root-relative URL (works at
+//! `python3 -m http.server`, 404s under `https://<user>.github.io/rustdar/`) and
+//! a new [`DataSources`] entry nobody thought to deny in `sw.js`.
 //!
-//! `manifest.webmanifest`, `sw.js`, `index.html` and `icons/` are static files.
-//! Nothing in the Rust build reads them, so without these tests the only thing
-//! standing between a typo and a broken deploy is someone opening the page. The
-//! two failures worth catching mechanically are the ones that are silent:
-//!
-//!   * a root-relative URL, which works at `python3 -m http.server` and 404s
-//!     under `https://<user>.github.io/rustdar/`; and
-//!   * a new entry in [`DataSources`] that nobody thought to deny in `sw.js`.
-//!
-//! Everything here reads the shipped file and compares it against something
-//! independent — the PWA spec's installability thresholds, the bytes of the PNG
-//! itself, or the Rust declaration of the network origins. No test builds its
-//! own fixture and then asserts the fixture's own contents back.
-//!
-//! # What this file cannot do
-//!
-//! Every test here reads text. None of them runs anything, so none of them can
-//! say whether the worker *behaves* the way its declarations imply: the caching
-//! policy could be deleted outright and these would all still pass, because the
-//! constants they read would be untouched.
-//!
-//! The behavioural gates are `tests/sw_routing.test.mjs` and
-//! `tests/index_bootstrap.test.mjs`, which execute the shipped `sw.js` and the
-//! shipped bootstrap script against a model of the browser. `sw_behaviour.rs`
-//! runs both under `cargo test`. When adding a gate, the question to ask is
-//! which of the two kinds it is — a claim about what a file *says* belongs
-//! here, a claim about what it *does* belongs there.
+//! Every test here reads *text*. A claim about what a file says belongs here; a
+//! claim about what it *does* belongs in `tests/sw_routing.test.mjs` or
+//! `tests/index_bootstrap.test.mjs`, which `sw_behaviour.rs` runs. The caching
+//! policy could be deleted outright and everything here would still pass.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeSet;
@@ -283,11 +264,8 @@ fn index_html_carries_an_explicit_offline_state() {
 // service worker
 // ---------------------------------------------------------------------------
 
-/// The fields of [`DataSources`], as its `Debug` prints them.
-///
-/// Pinned so that adding an origin to the Rust declaration fails here and forces
-/// a decision about `sw.js` rather than silently shipping a source the worker
-/// has never been told about.
+/// Pinned so adding an origin to the Rust declaration fails here and forces a
+/// decision about `sw.js`.
 #[test]
 fn data_sources_has_the_fields_the_worker_was_written_against() {
     let debug = format!("{:?}", DataSources::production());
@@ -325,20 +303,12 @@ fn data_sources_has_the_fields_the_worker_was_written_against() {
     );
 }
 
-/// The deny list names every production origin.
-///
-/// This gates the *declaration*, not the behaviour, and the distinction matters
-/// enough to be in the name. Nothing here runs the worker, so nothing here can
-/// tell you that a radar sweep is refused — only that the list has not drifted
-/// from [`DataSources::production`]. Deleting the `NEVER_CACHE_HOSTS` check from
-/// `routeFor` leaves this test green.
-///
-/// The behavioural gate is in `tests/sw_routing.test.mjs`, under
-/// "keeps the deny list load-bearing even when rustdar is served from a data
-/// origin". It runs the shipped worker from a scope rooted at
-/// `https://api.weather.gov/rustdar/` — the one configuration in which that
-/// check is the only thing preventing a weather response from being cached, and
-/// therefore the one configuration in which deleting it is observable.
+/// Gates the *declaration*, not the behaviour: deleting the `NEVER_CACHE_HOSTS`
+/// check from `routeFor` leaves this green. The behavioural gate is in
+/// `tests/sw_routing.test.mjs` ("keeps the deny list load-bearing even when
+/// rustdar is served from a data origin"), which roots the worker at
+/// `https://api.weather.gov/rustdar/` — the one configuration where that check
+/// is the only thing preventing a weather response from being cached.
 #[test]
 fn the_worker_states_every_production_data_origin_in_its_deny_list() {
     let denied = js_string_list(SERVICE_WORKER, "const NEVER_CACHE_HOSTS = new Set([");
@@ -373,11 +343,9 @@ fn the_worker_states_every_production_data_origin_in_its_deny_list() {
 
 #[test]
 fn the_worker_shell_list_cannot_name_a_cross_origin_asset() {
-    // This is the structural half of the guarantee. `routeFor` only returns
-    // "shell" for a URL built from SHELL_PATHS against the worker's own
-    // directory, so as long as every entry is a relative path with no scheme
-    // and no leading slash, the shell rule is incapable of matching any origin
-    // other than the one the app is served from — weather origins included.
+    // `routeFor` builds shell URLs from SHELL_PATHS against the worker's own
+    // directory, so while every entry is relative with no scheme and no leading
+    // slash the shell rule cannot match any other origin.
     for path in js_string_list(SERVICE_WORKER, "const SHELL_PATHS = [") {
         assert!(
             !path.starts_with('/'),

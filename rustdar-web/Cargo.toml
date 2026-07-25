@@ -3,40 +3,22 @@ name = "rustdar-web"
 version.workspace = true
 edition.workspace = true
 
-# The browser entry point: the wasm32 counterpart of rustdar-platform.
-#
-# It owns exactly what rustdar-platform owns for desktop — the entry function,
-# the concrete PlatformBridge, and the capabilities that bridge exposes — and
-# nothing else. All the windowing, rendering and fetching is rustdar-frontend's,
-# unchanged.
-#
-# The target is WebGL2, not WebGPU. Firefox has no stable WebGPU, and a build
-# that silently used WebGPU where it existed would be a second, separately
-# untested rendering path. `rustdar_frontend::app` pins `Backends::GL` for wasm32
-# for that reason.
-
 [lib]
 # `cdylib` is what wasm-bindgen links; `rlib` keeps the crate usable as a normal
-# dependency, which is what lets `cargo test --workspace` and rust-analyzer see
-# it on a native host.
+# dependency so `cargo test --workspace` and rust-analyzer see it on a host.
 crate-type = ["cdylib", "rlib"]
 
-# wasm-opt has to be told which wasm proposals rustc already used, or it refuses
-# the module it is handed.
-#
-# `wasm32-unknown-unknown` enables six target features by default -- check with
-# `rustc --print cfg --target wasm32-unknown-unknown` -- and rustc emits the
-# corresponding opcodes freely. `memory.copy` (bulk-memory) is the one that shows
-# up first, as
+# binaryen assumes the wasm MVP unless told otherwise, so every target feature
+# rustc enables by default for wasm32-unknown-unknown (six of them; check with
+# `rustc --print cfg --target wasm32-unknown-unknown`) has to be re-declared or
+# wasm-opt rejects the module -- bulk-memory first, as
 # `[wasm-validator error] memory.copy operations require bulk memory operations`.
-# binaryen only assumes the MVP unless told otherwise, so every one of the six is
-# re-declared here. They enable *validation* of instructions already in the
-# module; they do not ask wasm-opt to introduce anything new.
+# These enable *validation* of instructions already present; they introduce
+# nothing.
 #
-# Keep this list in step with rustc's defaults. A toolchain bump that turns on a
-# seventh feature will fail here in exactly the same way, and the fix is to add
-# the matching `--enable-` flag rather than to drop `wasm-opt`: skipping the
-# optimizer measurably slows Chromium down (see the notes in `lib.rs`).
+# A toolchain bump that turns on a seventh feature fails the same way. Add the
+# matching `--enable-` flag rather than dropping wasm-opt: skipping it measurably
+# slows Chromium down.
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = [
     "-O",
@@ -48,27 +30,18 @@ wasm-opt = [
     "--enable-sign-ext",
 ]
 
-# Deliberately not browser-gated, though everything that *calls* them is.
-#
-# The parts of this crate that are pure logic — how a logical config key maps
-# onto a localStorage key, how a browser geolocation reading becomes a `GpsFix`
-# — compile and are tested on the native host. Gating the whole crate on wasm32
-# would have made those tests unreachable from `cargo test --workspace`, which
-# is the only place they would ever run: there is no wasm test runner here, so a
-# browser-only test is a test that never executes.
+# Not wasm32-gated on purpose. The pure-logic parts (config key mapping,
+# geolocation reading -> GpsFix) compile and are tested on the host; there is no
+# wasm test runner here, so gating the crate would make those tests never run.
 [dependencies]
-# For the ConfigStore trait the localStorage backend implements, and the
-# UI_CONFIG_KEY the key-mapping tests pin.
 rustdar-egui = { workspace = true }
-# Types only (GpsFix) — the browser's Geolocation replaces the serial reader, so
-# the `serial` feature stays off here exactly as it does in rustdar-frontend.
+# Types only (GpsFix). The browser's Geolocation replaces the serial reader, so
+# the `serial` feature stays off, as in rustdar-frontend.
 rustdar-gps = { workspace = true }
 log = { workspace = true }
 
-# The genuinely browser-only half: the entry point, the event loop, the bridge,
-# and every `web_sys` call. None of this has a native meaning, and declaring it
-# here keeps a native `cargo build` from pulling web-sys and wasm-bindgen into
-# the graph at all.
+# Browser-only, and gated so a native `cargo build` does not pull web-sys and
+# wasm-bindgen into the graph at all.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 rustdar-frontend = { workspace = true }
 winit = { workspace = true }
@@ -103,18 +76,12 @@ features = [
     "Coordinates",
 ]
 
-# For `tests/pwa_assets.rs`, which gates the static PWA assets shipped next to
-# the bundle: the manifest, the service worker, index.html and the icons.
-#
-# Target-gated for the same reason the block above is, but the other way round.
-# `rustdar-radar` pulls in reqwest and a TLS stack and has no wasm32 build, and
-# a plain `[dev-dependencies]` entry is built for every target when clippy or
-# cargo is run with `--all-targets`. Gating it keeps
-# `cargo clippy --target wasm32-unknown-unknown -p rustdar-web --all-targets`
-# working, and the test itself is `#![cfg(not(target_arch = "wasm32"))]`.
+# For `tests/pwa_assets.rs`. Target-gated because rustdar-radar pulls reqwest and
+# a TLS stack and has no wasm32 build, and a plain `[dev-dependencies]` entry is
+# built for every target under `--all-targets` -- which would break
+# `cargo clippy --target wasm32-unknown-unknown -p rustdar-web --all-targets`.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-# The single declaration of every network origin rustdar reads from. The test
-# derives the hostnames the service worker must never cache from it, so the two
-# cannot drift apart.
+# The single declaration of every network origin rustdar reads from; the test
+# derives the service worker's never-cache hostnames from it.
 rustdar-radar = { workspace = true }
 serde_json = { workspace = true }

@@ -1,18 +1,10 @@
-//! The browser's [`PlatformBridge`].
-//!
-//! The web counterpart of `rustdar_platform::platform::DesktopPlatform`. Most of
-//! the trait is capabilities a browser tab simply does not have — no system bar
-//! insets, no back button, no process to exit, no filesystem to cache zone
-//! geometry in — so most of this file is honest `None`s, and the trait's
-//! defaults cover the rest.
+//! The browser's [`PlatformBridge`], counterpart of
+//! `rustdar_platform::platform::DesktopPlatform`. Most of the trait is
+//! capabilities a tab does not have, so most of this file is honest `None`s.
 
 use rustdar_frontend::platform::{PlatformBridge, drain_latest};
 use winit::platform::web::WindowAttributesExtWebSys;
 
-/// The media query that decides light vs dark.
-///
-/// The same query the browser exposes to CSS, so the app follows the OS
-/// preference through exactly the mechanism the rest of the page would.
 const DARK_SCHEME_QUERY: &str = "(prefers-color-scheme: dark)";
 
 pub struct WebPlatform {
@@ -68,12 +60,9 @@ impl PlatformBridge for WebPlatform {
         self.gps_fix_receiver = Some(receiver);
     }
 
-    /// The browser exposes no compass to a plain page.
-    ///
-    /// `DeviceOrientationEvent` exists but needs a secure context and, on iOS, a
-    /// separate user-gesture-gated permission request. Left unimplemented rather
-    /// than half-implemented: `HeadingSource` already falls back to the GPS
-    /// bearing when no compass reports, which is the correct behaviour here.
+    /// `DeviceOrientationEvent` needs a secure context and, on iOS, a separate
+    /// gesture-gated permission. `HeadingSource` already falls back to the GPS
+    /// bearing when no compass reports.
     fn poll_heading(&mut self) -> Option<f32> {
         None
     }
@@ -90,20 +79,17 @@ impl PlatformBridge for WebPlatform {
 
     fn set_back_handler(&mut self, _handler: fn()) {}
 
-    /// No filesystem, so no zone geometry cache. The overlay layer already
-    /// treats the absence as "fetch every time", which is what a browser does
-    /// anyway — its HTTP cache sits underneath and does the same job.
+    /// No filesystem, so no zone cache. The overlay layer treats the absence as
+    /// "fetch every time" and the browser's HTTP cache sits underneath.
     fn set_zone_cache_dir(&mut self, _dir: std::path::PathBuf) {}
 
     fn zone_cache_dir(&self) -> Option<&std::path::Path> {
         None
     }
 
-    /// `localStorage` has no directory to point at, so this is inert.
-    ///
-    /// It is not an oversight that this does nothing: the store is available
-    /// from the first frame, which is why `config_store` never returns `None`
-    /// for "not told where yet" the way the Android bridge does.
+    /// Inert, not an oversight: `localStorage` is available from the first
+    /// frame, which is why `config_store` never returns `None` for "not told
+    /// where yet" the way the Android bridge does.
     fn set_config_dir(&mut self, _dir: std::path::PathBuf) {}
 
     fn config_store(&self) -> Option<Box<dyn rustdar_egui::config_store::ConfigStore>> {
@@ -120,29 +106,19 @@ impl PlatformBridge for WebPlatform {
         &self,
         attributes: winit::window::WindowAttributes,
     ) -> winit::window::WindowAttributes {
-        // Deliberately no `with_inner_size`.
-        //
-        // It would not do what it looks like it does. winit's web backend
-        // reports `inner_size()` from a `current_size` cell that starts at zero
-        // and is written *only* by the ResizeObserver it installs on the canvas;
-        // `with_inner_size` sets the element's size but never touches that cell.
-        // So the size is zero for the first frame or two regardless, and the app
-        // has to tolerate that — see the zero-size guard in `App::handle_redraw`,
-        // which is the actual fix.
-        //
-        // Worse, setting it here writes an inline `width`/`height` in pixels,
-        // which outranks the stylesheet's `width: 100%` and pins the canvas to
-        // its startup size forever. The page would then stop responding to
-        // browser window resizes entirely.
+        // No `with_inner_size`, deliberately. winit's web backend reports
+        // `inner_size()` from a cell written only by its ResizeObserver, so the
+        // size is zero for the first frame or two either way (the zero-size
+        // guard in `App::handle_redraw` is the actual fix) — and setting it
+        // writes an inline pixel `width`/`height` that outranks the stylesheet's
+        // `width: 100%`, pinning the canvas to its startup size forever.
         attributes
             .with_canvas(Some(self.canvas.clone()))
-            // Without this, the browser's own handling of the events egui has
-            // already consumed still runs: scrolling the map scrolls the page,
-            // and a drag starts a native text selection over the canvas.
+            // Otherwise the browser also handles events egui already consumed:
+            // scrolling the map scrolls the page, dragging selects text.
             .with_prevent_default(true)
-            // The canvas is already in the document — `index.html` owns the
-            // layout. Appending would add a *second* one, and the page would
-            // render into an element that nothing has sized.
+            // The canvas is already in the document; appending adds a second one
+            // that nothing has sized.
             .with_append(false)
     }
 }

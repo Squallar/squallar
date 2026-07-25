@@ -1,28 +1,12 @@
 //! Runs the JavaScript behaviour suites under `cargo test`.
 //!
-//! # Why this file exists
+//! The caching policy lives in `sw.js` and index.html's bootstrap, which no Rust
+//! code executes; `pwa_assets` only reads them as text. This shim puts the suites
+//! that actually run them under `cargo test --workspace`, which is what CI runs.
 //!
-//! `sw.js` and the bootstrap script in `index.html` are the two places where
-//! rustdar decides what may be cached, and both are JavaScript that no Rust code
-//! ever executes. [`pwa_assets`] reads them as text, which catches a stale
-//! declaration and nothing else — it cannot tell whether the worker actually
-//! refuses to cache a radar sweep, because it never runs it.
-//!
-//! `tests/sw_routing.test.mjs` and `tests/index_bootstrap.test.mjs` do run them,
-//! against a scope that models the browser's. But a test suite that no gate
-//! invokes is worth about as much as no suite: it passes silently on the machine
-//! of whoever last remembered it existed. This shim puts both under
-//! `cargo test --workspace`, which is what CI runs, so a change that breaks the
-//! caching policy fails the same build every other test here fails.
-//!
-//! # Missing Node is a failure, not a skip
-//!
-//! A skip would put this straight back where it started — green on a machine
-//! that never checked. `node --test` has been stable since Node 20 and needs no
-//! `package.json`, no lockfile, no `node_modules` and no network: the suites
-//! import nothing outside this directory. If Node is genuinely unavailable, the
-//! failure below says exactly that rather than pretending the policy was
-//! verified.
+//! Missing Node is a failure, not a skip — a skip is green on a machine that
+//! never checked. `node --test` has been stable since Node 20 and needs no
+//! packages, lockfile or network.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::path::PathBuf;
@@ -95,11 +79,8 @@ fn the_page_bootstrap_reports_connectivity_and_updates() {
     run_suite("tests/index_bootstrap.test.mjs");
 }
 
-/// Every `*.test.mjs` in this directory is run by one of the tests above.
-///
 /// Adding a suite and forgetting to invoke it is the failure mode this whole
-/// file exists to prevent, so it is worth one assertion rather than trusting
-/// that nobody will.
+/// file exists to prevent.
 #[test]
 fn every_javascript_suite_is_actually_invoked() {
     let driver = include_str!("sw_behaviour.rs");
