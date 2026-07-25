@@ -6,4 +6,7 @@ pub mod tiles;
 mod ui;
 pub(crate) mod ui_input;
 
+#[cfg(test)]
+mod input_harness;
+
 pub use ui::Gui;
