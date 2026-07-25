@@ -33,6 +33,28 @@ mod settings;
 
 use crate::ui_input::InteractionState;
 
+/// One pane-count button the picker drew, as it was drawn. See
+/// [`ui_menu::DrawnMenuLeaf`] for the same shape and the reason for it.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PaneOptionProbe {
+    pub count: usize,
+    pub selected: bool,
+    pub rect: egui::Rect,
+}
+
+/// What the status bar drew, rather than the flags that decided it.
+#[cfg(test)]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct StatusBarProbe {
+    /// The scan summary text, verbatim — long or short form.
+    pub scan_text: String,
+    /// The auto-poll checkbox's rect, when one was drawn.
+    pub auto_poll: Option<egui::Rect>,
+    /// Whether the hover readout was drawn.
+    pub hover: bool,
+}
+
 /// Radar fetch lifecycle state.
 pub(super) struct RadarState {
     pub config: RadarConfig,
@@ -137,21 +159,19 @@ pub struct Gui {
     /// `Gui::ui` would assert on a replica.
     #[cfg(test)]
     last_pane_pointers: Vec<crate::ui_input::PanePointerProbe>,
-    /// The pane counts the picker offered on the last frame. Only read by
-    /// tests, which check the *picker* narrows on a phone while the config
-    /// clamp does not.
+    /// The pane-count buttons the picker actually drew last frame. Only read by
+    /// tests, which check the picker narrows on a phone while the config clamp
+    /// does not, and that clicking one takes effect.
     #[cfg(test)]
-    last_pane_options: Vec<usize>,
+    last_pane_options: Vec<PaneOptionProbe>,
     /// The excluded rects `render_map` was actually handed. Only read by tests,
     /// which check the chrome's rects reach the map's click filter rather than
     /// stopping at the call site.
     #[cfg(test)]
     last_map_excluded_rects: Vec<egui::Rect>,
-    /// Whether the last frame's status bar included the hover readout. Only
-    /// read by tests, which check it follows the pointer modality rather than
-    /// the width class.
+    /// What the last frame's status bar actually drew. Only read by tests.
     #[cfg(test)]
-    last_status_bar_showed_hover: bool,
+    last_status_bar: StatusBarProbe,
     viewport_sync: bool,
     sync_layers: bool,
     // --- Radar loop settings ---
@@ -331,7 +351,7 @@ impl Gui {
             #[cfg(test)]
             last_map_excluded_rects: Vec::new(),
             #[cfg(test)]
-            last_status_bar_showed_hover: false,
+            last_status_bar: StatusBarProbe::default(),
             viewport_sync: true,
             sync_layers: true,
             loop_lookback_secs: 3600, // default 1 hour
@@ -364,6 +384,11 @@ impl Gui {
             self.widget_id_probes.clear();
             self.last_menu_leaves.clear();
             self.last_pane_pointers.clear();
+            // Cleared like the rest: the picker only draws when the layers
+            // panel is on screen, so a stale value would report buttons that
+            // are not there — a compact layout with the drawer shut offers
+            // nothing at all.
+            self.last_pane_options.clear();
         }
 
         // Create a root Ui to host the panels. Since egui 0.35 the Context-taking
@@ -576,19 +601,24 @@ impl Gui {
         pane: &mut PaneState,
     ) {
         let max_panes = self.layout.width.max_panes();
-        // The options really offered, reported rather than recomputed by a
-        // test from the same width class it is checking.
-        #[cfg(test)]
-        {
-            self.last_pane_options = (1..=max_panes).collect();
-        }
         ui.horizontal(|ui| {
             ui.label("Panes:");
             for count in 1..=max_panes {
-                if ui.selectable_label(
+                let button = ui.selectable_label(
                     self.pane_layout.pane_count == count,
                     format!("{count}"),
-                ).clicked() && self.pane_layout.pane_count != count {
+                );
+                // The button that was drawn: which count, whether it read as
+                // selected, and where it landed so a test can click it. A probe
+                // built from `max_panes` instead would be a restatement of the
+                // line above and could not see the loop at all.
+                #[cfg(test)]
+                self.last_pane_options.push(PaneOptionProbe {
+                    count,
+                    selected: self.pane_layout.pane_count == count,
+                    rect: button.rect,
+                });
+                if button.clicked() && self.pane_layout.pane_count != count {
                     self.panes[self.active_pane] = std::mem::take(pane);
                     let active_site = self.panes[self.active_pane].site.clone();
                     let active_scan_info = self.panes[self.active_pane].scan_info.clone();
@@ -1050,16 +1080,12 @@ impl Gui {
     }
 
     /// Turn an overlay on or off for the active pane, the way the layers panel
-    /// does it.
+    /// does.
     ///
-    /// Writing `PaneState::enabled_overlays` alone is not enough and does not
-    /// survive a single frame. `render_layer_controls` reloads the handlers
-    /// from the pane's `overlay_configs` on every frame and then saves
-    /// `save_enabled_map()` straight back over `enabled_overlays`, so a change
-    /// that never reached the config is undone before the user sees it. The
-    /// layers panel is on screen exactly when the menu's toggles are reachable
-    /// — always on Expanded, and whenever the drawer is open otherwise — so
-    /// that covered every case.
+    /// Both halves must be written: `render_layer_controls` reloads the
+    /// handlers from `overlay_configs` every frame and saves the enabled map
+    /// back over `enabled_overlays`, so a change that never reached the config
+    /// is undone on the next frame.
     fn set_active_pane_overlay(&mut self, kind: OverlayKind, on: bool) {
         let configs = self.panes[self.active_pane].overlay_configs.clone();
         if !configs.is_empty() {
@@ -1249,9 +1275,9 @@ impl Gui {
         &self.last_pane_pointers
     }
 
-    /// The pane counts the picker offered on the last frame.
+    /// The pane-count buttons the picker drew on the last frame.
     #[cfg(test)]
-    pub(crate) fn pane_options_for_test(&self) -> &[usize] {
+    pub(crate) fn pane_options_for_test(&self) -> &[PaneOptionProbe] {
         &self.last_pane_options
     }
 
@@ -1261,10 +1287,44 @@ impl Gui {
         &self.last_map_excluded_rects
     }
 
-    /// Whether the last frame's status bar included the hover readout.
+    /// What the last frame's status bar drew.
     #[cfg(test)]
-    pub(crate) fn status_bar_showed_hover_for_test(&self) -> bool {
-        self.last_status_bar_showed_hover
+    pub(crate) fn status_bar_for_test(&self) -> &StatusBarProbe {
+        &self.last_status_bar
+    }
+
+    /// Which pane is currently active.
+    #[cfg(test)]
+    pub(crate) fn active_pane_index_for_test(&self) -> PaneId {
+        self.active_pane
+    }
+
+    /// Turn layer sync between panes on or off, as its checkbox does.
+    #[cfg(test)]
+    pub(crate) fn set_sync_layers_for_test(&mut self, on: bool) {
+        self.sync_layers = on;
+    }
+
+    /// Set one pane's overlay state, writing the config as well as the enabled
+    /// map — `render_layer_controls` reloads the handlers from the config every
+    /// frame, so a write to `enabled_overlays` alone is undone immediately.
+    #[cfg(test)]
+    pub(crate) fn set_overlay_on_pane_for_test(
+        &mut self,
+        idx: usize,
+        kind: OverlayKind,
+        on: bool,
+    ) {
+        let configs = self.panes[idx].overlay_configs.clone();
+        if !configs.is_empty() {
+            self.overlays.load_pane_configs(&configs);
+        }
+        self.overlays.set_enabled(kind, on);
+        let configs = self.overlays.save_pane_configs();
+        let enabled = self.overlays.save_enabled_map();
+        let pane = &mut self.panes[idx];
+        pane.overlay_configs = configs;
+        pane.enabled_overlays = enabled;
     }
 
     /// Open or close the layers drawer, as the hamburger does.

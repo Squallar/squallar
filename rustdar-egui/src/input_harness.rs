@@ -10,21 +10,15 @@
 //!
 //! # Do not resolve anything a second time
 //!
-//! The harness used to run `Gui::ui` and then separately drive its own
-//! [`ModalityLatch`](crate::ui_layout::ModalityLatch) and
-//! [`InteractionState`](crate::ui_input::InteractionState), asserting on those.
-//! Nothing ever compared the two, so the entire pointer suite validated a
-//! replica: `ui_map.rs` could pin the modality to either value, resolve every
-//! pane as inactive, or drop `overlay_click_pos` on the floor, and all 121
-//! assertions still passed. Anything that claims to be what the app does must
-//! be read back out of [`Gui`], the way `map_panel_rect`, `excluded_rects` and
-//! `widget_id_probes` already are.
+//! This harness used to drive its own `ModalityLatch` and `InteractionState`
+//! beside `Gui::ui` and assert on those. Nothing compared the two, so the
+//! pointer suite validated a replica and every pointer decision in `ui_map.rs`
+//! could be broken with it green. Anything claiming to be what the app does
+//! must be read back out of [`Gui`].
 //!
-//! The two exceptions are [`FrameOutcome::mouse`] and [`FrameOutcome::touch`],
-//! which drive
-//! [`MapPointerFrame::from_mouse`] and [`TouchGestures::update`] directly to say
-//! what a given pipeline *would* have done with this frame. They are labelled
-//! ungated and no test may treat them as the app's behaviour.
+//! [`FrameOutcome::mouse`] and [`FrameOutcome::touch`] are the exceptions: they
+//! drive each pipeline directly to say what it *would* have done. They are
+//! ungated and no test may read them as the app's behaviour.
 //!
 //! # Event fidelity
 //!
@@ -85,28 +79,18 @@ pub(crate) struct FrameOutcome {
     pub mouse: MapPointerFrame,
     /// Pointer resolution from the touch pipeline, driven unconditionally.
     pub touch: MapPointerFrame,
-    /// The pointer state the **shipped** `render_map` resolved for the active
-    /// pane, read back out of `Gui` — not resolved a second time here.
-    ///
-    /// Everything below `resolved`, `resolved_inactive`, `modality` and
-    /// `resolved_zoom` is a *read of the real UI*. The harness used to drive
-    /// its own [`InteractionState`] and [`ModalityLatch`] beside `Gui::ui` and
-    /// assert on those instead, which meant the whole gesture suite validated a
-    /// replica: `ui_map.rs` could pin the modality to either value, resolve
-    /// every pane as inactive, or drop `overlay_click_pos` outright, and not
-    /// one assertion moved.
+    /// What the shipped `render_map` resolved for the active pane, read back
+    /// out of `Gui`. See the module note.
     pub resolved: MapPointerFrame,
-    /// The same, for a pane that is **not** the active one. `None` when the
-    /// layout has only one pane, since then there is no inactive pane to
-    /// observe — use [`InputHarness::set_pane_count`] to get one.
+    /// The same for a non-active pane. `None` in a one-pane layout, where
+    /// there is no inactive pane to observe.
     pub resolved_inactive: Option<MapPointerFrame>,
     /// The modality `render_map` ran this frame under.
     pub modality: PointerModality,
-    /// Map zoom after the frame — observes the double-tap-drag zoom gesture on
-    /// the ungated `touch` path.
+    /// Map zoom after the frame, on the ungated `touch` path.
     pub zoom: f64,
-    /// The **active pane's real** map zoom, so a test can tell whether a
-    /// gesture the gate should have blocked moved the actual map.
+    /// The active pane's real map zoom, so a test can tell whether a gesture
+    /// the gate should have blocked moved the actual map.
     pub resolved_zoom: f64,
 }
 
@@ -173,6 +157,15 @@ impl InputHarness {
             max_texture_side: None,
             last_actions: Vec::new(),
         };
+        harness.warm_up();
+        // The first frame's `check_auto_polls` starts the initial fetch and
+        // nothing here ever completes it, so without this every harness runs
+        // with `fetching` latched true forever: the refresh button is
+        // permanently `add_enabled(false)`, the status bar shows a spinner
+        // instead of the auto-poll checkbox, and `FetchRadarScan`'s click path
+        // is unreachable. Settling it puts the harness in the steady state the
+        // app spends its life in rather than a transient no test intended.
+        harness.gui.set_fetching(false);
         harness.warm_up();
         harness
     }
@@ -258,9 +251,51 @@ impl InputHarness {
         self.gui.active_pane().is_overlay_enabled(kind)
     }
 
-    /// The pane counts the picker offered on the last frame.
-    pub(crate) fn pane_options(&self) -> Vec<usize> {
+    /// Whether pane `idx` has `kind` on, whichever pane is active.
+    pub(crate) fn overlay_enabled_on(&self, idx: usize, kind: OverlayKind) -> bool {
+        self.gui
+            .pane(idx)
+            .unwrap_or_else(|| panic!("no pane {idx}"))
+            .is_overlay_enabled(kind)
+    }
+
+    /// Which pane is currently active.
+    pub(crate) fn active_pane_index(&self) -> usize {
+        self.gui.active_pane_index_for_test()
+    }
+
+    /// Turn layer sync between panes on or off.
+    pub(crate) fn set_sync_layers(&mut self, on: bool) {
+        self.gui.set_sync_layers_for_test(on);
+        self.warm_up();
+    }
+
+    /// Whether layer sync between panes is on.
+    pub(crate) fn sync_layers(&self) -> bool {
+        self.gui.is_sync_layers()
+    }
+
+    /// Set one pane's overlay state directly, writing both the enabled map and
+    /// the config the layers panel reloads from each frame — otherwise the
+    /// next frame undoes it.
+    pub(crate) fn set_overlay_on_pane(&mut self, idx: usize, kind: OverlayKind, on: bool) {
+        self.gui.set_overlay_on_pane_for_test(idx, kind, on);
+        self.warm_up();
+    }
+
+    /// The pane-count buttons the picker drew on the last frame.
+    pub(crate) fn pane_options(&self) -> Vec<crate::ui::PaneOptionProbe> {
         self.gui.pane_options_for_test().to_vec()
+    }
+
+    /// Just the counts, in draw order.
+    pub(crate) fn pane_option_counts(&self) -> Vec<usize> {
+        self.pane_options().iter().map(|o| o.count).collect()
+    }
+
+    /// The number of panes the layout is currently split into.
+    pub(crate) fn pane_count(&self) -> usize {
+        self.gui.pane_count()
     }
 
     /// The excluded rects `render_map` was actually handed on the last frame.
@@ -268,9 +303,39 @@ impl InputHarness {
         self.gui.map_excluded_rects_for_test().to_vec()
     }
 
-    /// Whether the last frame's status bar included the hover readout.
-    pub(crate) fn status_bar_showed_hover(&self) -> bool {
-        self.gui.status_bar_showed_hover_for_test()
+    /// What the last frame's status bar drew.
+    pub(crate) fn status_bar(&self) -> crate::ui::StatusBarProbe {
+        self.gui.status_bar_for_test().clone()
+    }
+
+    /// Deliver a scan for `site`, through the host's own delivery path.
+    ///
+    /// `Gui::set_scan_info_for_site` is what the app calls when a fetch
+    /// completes: it fills the matching panes, clears `fetching` *and* calls
+    /// `auto_poll.on_success()`. Hand-rolling those would leave the harness in
+    /// a state the app never reaches.
+    pub(crate) fn load_scan(&mut self, site: &str) {
+        let radar_site = rustdar_radar::sites::get_radar_site(site).expect("unknown radar site");
+        let info = rustdar_radar::types::ScanInfo {
+            site: radar_site.clone(),
+            timestamp: chrono::NaiveDate::from_ymd_opt(2026, 7, 24)
+                .unwrap()
+                .and_hms_opt(18, 30, 0)
+                .unwrap(),
+            vcp_number: 212,
+            available_products: vec![
+                rustdar_radar::types::RadarProduct::Reflectivity,
+                rustdar_radar::types::RadarProduct::Velocity,
+            ],
+            product_elevations: Default::default(),
+            status: String::new(),
+        };
+        // The host matches panes by site, so point them at it first.
+        for pane in self.gui.panes_mut() {
+            pane.site = site.to_owned();
+        }
+        self.gui.set_scan_info_for_site(site, info);
+        self.warm_up();
     }
 
     /// Every rect painted during the last frame, in paint order.
@@ -1983,17 +2048,11 @@ mod tests {
 
     /// 17. **The drawer's checkboxes show the live pane's state.**
     ///
-    ///     `render_layers_panel` `mem::take`s the active pane for the duration
-    ///     of the panel closure. `menu_model` reads `self.active_pane()`, so
-    ///     building the model *inside* that closure handed every overlay toggle
-    ///     the default pane's empty `enabled_overlays`: the checkbox rendered
-    ///     permanently unchecked, and `render_menu_items`'
-    ///     `let mut current = *value` meant every click emitted
-    ///     `Toggled(kind, true)` — an overlay could be turned on but never off.
-    ///
-    ///     Auto-poll escaped because it lives on `self.auto_poll` rather than
-    ///     on the pane, which is why the model's own unit tests stayed green.
-    ///     This one reads the bool the checkbox was actually handed.
+    ///     Building the model inside the panel closure handed every overlay
+    ///     toggle the `mem::take`n pane's empty `enabled_overlays`, so the box
+    ///     rendered unchecked and each click emitted `Toggled(kind, true)`.
+    ///     Auto-poll escaped it by living on `self`, which is why the model's
+    ///     own unit tests stayed green.
     #[test]
     fn the_drawer_checkboxes_show_the_live_pane_not_a_default_one() {
         let mut h = compact_with_drawer();
@@ -2028,20 +2087,11 @@ mod tests {
 
     /// 18. **A checkbox in the drawer turns the overlay off, and it stays off.**
     ///
-    ///     The end-to-end form of the test above, driven by a real click on the
-    ///     rect the renderer reported, and then *watched for several frames*.
-    ///
-    ///     The extra frames are the point. `apply_menu_event` used to write
-    ///     `PaneState::enabled_overlays` and nothing else, while
-    ///     `render_layer_controls` reloads the handlers from the pane's
-    ///     `overlay_configs` every frame and saves the enabled map back over
-    ///     the top — so the toggle flipped for exactly one frame and then
-    ///     reverted. Asserting straight after the click passes anyway; the
-    ///     user, who sees the frame after, never got the change at all.
-    ///
-    ///     It also pins that `render_menu_drawer`'s events reach
-    ///     `apply_menu_event` — on a compact screen the drawer is the only
-    ///     route to any of these toggles.
+    ///     The watched frames are the point: `apply_menu_event` used to write
+    ///     `enabled_overlays` only, and the layers panel reloaded the config
+    ///     over it on the next frame. Asserting straight after the click
+    ///     passes; the user, who sees the frame after, never got the change.
+    ///     Also pins that `render_menu_drawer`'s events reach the dispatcher.
     #[test]
     fn clicking_a_drawer_checkbox_toggles_the_overlay_both_ways() {
         let mut h = compact_with_drawer();
@@ -2054,6 +2104,17 @@ mod tests {
             !h.overlay_enabled(OverlayKind::RadarSites),
             "clicking a checked box left the overlay on — the drawer can turn \
              an overlay on but never off"
+        );
+
+        // On the click frame itself the probe must report the state the
+        // checkbox was *handed*, not the one the click produced. Recording
+        // egui's post-click `current` instead would make a checkbox that
+        // renders stale look correct on exactly the frame that matters.
+        assert_eq!(
+            h.menu_leaf("Show radar sites").map(|l| l.value),
+            Some(Some(true)),
+            "the probe recorded the post-click value, so it can no longer show \
+             a checkbox being drawn from the wrong state"
         );
         for frame in 0..5 {
             h.frame_after(FRAME_DT);
@@ -2081,6 +2142,196 @@ mod tests {
             h.menu_leaf("Show radar sites").map(|l| l.value),
             Some(Some(true)),
             "the pane is on but the drawer still draws the box unchecked"
+        );
+    }
+
+    /// A compact drawer harness split into two panes, with pane 1 made active
+    /// the way a user does it — by tapping that pane on the map.
+    fn compact_drawer_with_pane_1_active() -> InputHarness {
+        let mut h = InputHarness::with_screen(egui::vec2(420.0, 1200.0));
+        h.set_pane_count(2);
+
+        // Tap pane 1 with the drawer shut, so the map has the full width and
+        // the two pane rects are unambiguous.
+        let target = h.pane_rects()[1].center();
+        h.mouse_click(target);
+        h.warm_up();
+        assert_eq!(
+            h.active_pane_index(),
+            1,
+            "precondition: tapping pane 1 must make it active, or this fixture \
+             is testing pane 0 twice"
+        );
+
+        h.set_drawer_open(true);
+        h
+    }
+
+    /// 27. **"The live active pane" means the active one, not pane 0.**
+    ///
+    ///     With `active_pane` stuck at 0 in every fixture, both `menu_model`
+    ///     reading `&self.panes[0]` and `set_active_pane_overlay` writing it
+    ///     survived. In the app: pane 1 active, tap a toggle in the drawer, the
+    ///     overlay lands on pane 0. Sync is off so the panes can disagree —
+    ///     with it on it copies the write back and hides the bug.
+    #[test]
+    fn the_menu_reads_and_writes_the_active_pane_not_pane_zero() {
+        let mut h = compact_drawer_with_pane_1_active();
+        h.set_sync_layers(false);
+
+        // The panes must disagree about **two** kinds, not one.
+        //
+        // `RadarSites` is the kind being toggled, and `set_enabled` overwrites
+        // it whichever config was loaded — so on its own it cannot show the
+        // *read* going to the wrong pane. `CityLabels` is the witness:
+        // `serialize_state` carries `enabled`, so loading pane 0's configs
+        // imports pane 0's on/off state for every kind except the one being
+        // set, and pane 1's city labels would silently go out.
+        h.set_overlay_on_pane(0, OverlayKind::RadarSites, false);
+        h.set_overlay_on_pane(0, OverlayKind::CityLabels, false);
+        h.set_overlay_on_pane(1, OverlayKind::RadarSites, true);
+        h.set_overlay_on_pane(1, OverlayKind::CityLabels, true);
+        h.warm_up();
+        assert!(
+            h.overlay_enabled_on(1, OverlayKind::RadarSites)
+                && !h.overlay_enabled_on(0, OverlayKind::RadarSites)
+                && h.overlay_enabled_on(1, OverlayKind::CityLabels)
+                && !h.overlay_enabled_on(0, OverlayKind::CityLabels),
+            "precondition: the panes must disagree about both kinds"
+        );
+
+        // The checkbox must show pane 1's state, not pane 0's.
+        assert_eq!(
+            h.menu_leaf("Show radar sites").map(|l| l.value),
+            Some(Some(true)),
+            "the drawer drew pane 0's state while pane 1 is active"
+        );
+
+        // ...and clicking it must write to pane 1, leaving pane 0 alone.
+        h.mouse_click(clickable_leaf(&h, "Show radar sites").center());
+        h.frames_for(5, FRAME_DT);
+        assert!(
+            !h.overlay_enabled_on(1, OverlayKind::RadarSites),
+            "the toggle did not reach the active pane"
+        );
+        assert!(
+            !h.overlay_enabled_on(0, OverlayKind::RadarSites),
+            "the toggle wrote to pane 0, which is not the active pane"
+        );
+
+        // The untouched kind must be untouched — on the active pane, and on
+        // the one that was not being edited.
+        assert!(
+            h.overlay_enabled_on(1, OverlayKind::CityLabels),
+            "toggling radar sites on pane 1 also turned its city labels off: \
+             the config was read from pane 0, which had them off"
+        );
+        assert!(
+            !h.overlay_enabled_on(0, OverlayKind::CityLabels),
+            "pane 0's city labels changed, though it is not the active pane"
+        );
+    }
+
+    /// 29. **A menu toggle saves the active pane's *own* overlay config.**
+    ///
+    ///     `render_pane_map_content` loads each pane's config as it draws it,
+    ///     so mid-frame the handlers hold the last-drawn pane's settings.
+    ///     `set_active_pane_overlay` then snapshots the handlers onto the
+    ///     active pane — and `serialize_state` carries `enabled`, so a
+    ///     snapshot taken against the wrong pane's config silently rewrites
+    ///     every *other* overlay kind's on/off flag on the active pane.
+    ///
+    ///     Two separate things keep the handlers correct at that moment: the
+    ///     reload at the end of `Gui::ui`, and the load at the top of
+    ///     `set_active_pane_overlay`. Either alone is sufficient, so **neither
+    ///     is individually killable** — removing just one is an equivalent
+    ///     mutant. Removing both fails here, and only here.
+    ///
+    ///     Medium with the drawer shut: anywhere the layers panel is on screen
+    ///     it reloads the active pane's config every frame and hides this.
+    #[test]
+    fn a_menu_toggle_loads_the_active_panes_config_before_saving_it() {
+        let mut h = InputHarness::with_screen(egui::vec2(800.0, 900.0));
+        assert_eq!(h.width_class(), crate::ui_layout::WidthClass::Medium);
+        h.set_pane_count(2);
+        h.set_sync_layers(false);
+        assert_eq!(
+            h.active_pane_index(),
+            0,
+            "precondition: pane 0 active, so the *last drawn* pane 1 is the one \
+             whose config is left in the handlers"
+        );
+
+        h.set_overlay_on_pane(0, OverlayKind::CityLabels, true);
+        h.set_overlay_on_pane(1, OverlayKind::CityLabels, false);
+        h.set_overlay_on_pane(0, OverlayKind::RadarSites, false);
+        h.warm_up();
+        assert!(
+            h.pane_options().is_empty(),
+            "precondition: no layers panel, or its reload masks this"
+        );
+
+        h.mouse_click(clickable_leaf(&h, "View").center());
+        h.frames_for(2, FRAME_DT);
+        h.mouse_click(clickable_leaf(&h, "Show radar sites").center());
+        h.frames_for(5, FRAME_DT);
+
+        assert!(
+            h.overlay_enabled_on(0, OverlayKind::RadarSites),
+            "precondition: the toggle must have taken effect"
+        );
+        assert!(
+            h.overlay_enabled_on(0, OverlayKind::CityLabels),
+            "the active pane's city labels were overwritten by pane 1's config: \
+             the handlers were saved without loading the active pane first"
+        );
+    }
+
+    /// 28. **A menu toggle propagates to the other panes when sync is on.**
+    ///
+    ///     Driven on Medium with the drawer shut — the only layout where the
+    ///     menu is on screen and the layers panel is not. Anywhere else
+    ///     `render_layers_panel` calls `propagate_layer_sync` itself every
+    ///     frame and masks the arm: a compact-drawer version of this test
+    ///     passes with the call deleted.
+    #[test]
+    fn a_menu_toggle_propagates_to_the_other_panes_when_sync_is_on() {
+        let mut h = InputHarness::with_screen(egui::vec2(800.0, 900.0));
+        assert_eq!(
+            h.width_class(),
+            crate::ui_layout::WidthClass::Medium,
+            "precondition: Medium is menubar-yes, sidebar-no"
+        );
+        h.set_pane_count(2);
+        h.mouse_click(h.pane_rects()[1].center());
+        h.warm_up();
+        assert_eq!(h.active_pane_index(), 1, "precondition: pane 1 is active");
+
+        assert!(h.sync_layers(), "precondition: layer sync is on by default");
+        assert!(
+            h.pane_options().is_empty(),
+            "precondition: the layers panel must NOT be on screen, or its own \
+             `propagate_layer_sync` masks the arm under test"
+        );
+
+        h.set_overlay_on_pane(0, OverlayKind::RadarSites, false);
+        h.set_overlay_on_pane(1, OverlayKind::RadarSites, false);
+        h.warm_up();
+
+        // Through the menu bar: open "View", then tick the box.
+        h.mouse_click(clickable_leaf(&h, "View").center());
+        h.frames_for(2, FRAME_DT);
+        h.mouse_click(clickable_leaf(&h, "Show radar sites").center());
+        h.frames_for(5, FRAME_DT);
+
+        assert!(
+            h.overlay_enabled_on(1, OverlayKind::RadarSites),
+            "precondition: the active pane must have taken the toggle"
+        );
+        assert!(
+            h.overlay_enabled_on(0, OverlayKind::RadarSites),
+            "the toggle did not propagate to the other pane, though layer sync \
+             is on"
         );
     }
 
@@ -2170,12 +2421,10 @@ mod tests {
 
     /// 22. **The pane picker narrows on a phone; the config clamp does not.**
     ///
-    ///     The two limits are deliberately different, and each has to be read
-    ///     by the right code. `WidthClass::max_panes()`'s *values* were already
-    ///     pinned as constants, but nothing checked the picker consulted the
-    ///     width class at all — offering the desktop range on a 420pt screen
-    ///     survived the whole suite. The complementary half, that a wide layout
-    ///     survives being loaded on a phone, is pinned in `ui_config.rs`.
+    ///     The two limits differ deliberately and each has to be read by the
+    ///     right code. The values were pinned as constants, but nothing checked
+    ///     the picker consulted the width class at all. The other half — a wide
+    ///     layout surviving a load on a phone — is pinned in `ui_config.rs`.
     #[test]
     fn the_pane_picker_offers_fewer_panes_on_a_phone_than_on_a_desktop() {
         use crate::pane::{MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
@@ -2188,19 +2437,19 @@ mod tests {
             "precondition"
         );
         assert_eq!(
-            compact.pane_options(),
+            compact.pane_option_counts(),
             (1..=MAX_PANES_MOBILE).collect::<Vec<_>>(),
             "the picker offered the desktop range on a phone"
         );
 
-        let expanded = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        let mut expanded = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
         assert_eq!(
             expanded.width_class(),
             crate::ui_layout::WidthClass::Expanded,
             "precondition"
         );
         assert_eq!(
-            expanded.pane_options(),
+            expanded.pane_option_counts(),
             (1..=MAX_PANES_DESKTOP).collect::<Vec<_>>(),
             "the picker narrowed a desktop to the phone range"
         );
@@ -2209,21 +2458,55 @@ mod tests {
         // clippy would fold to `true` — and a precondition that is true by
         // construction is not one.
         assert!(
-            compact.pane_options().len() < expanded.pane_options().len(),
+            compact.pane_option_counts().len() < expanded.pane_option_counts().len(),
             "precondition: the two ranges must differ, or both assertions above \
              are satisfied by one constant"
+        );
+
+        // The buttons must be real: exactly one reads as selected, and it is
+        // the count actually in force. A probe rebuilt from `max_panes` would
+        // agree with the range above while the loop drew nothing.
+        let selected: Vec<usize> = expanded
+            .pane_options()
+            .iter()
+            .filter(|o| o.selected)
+            .map(|o| o.count)
+            .collect();
+        assert_eq!(
+            selected,
+            vec![expanded.pane_count()],
+            "the picker's selected button must be the live pane count"
+        );
+
+        // ...and clicking one takes effect, which is the half no probe of the
+        // *offered range* can reach.
+        let three = expanded
+            .pane_options()
+            .iter()
+            .find(|o| o.count == 3)
+            .expect("the desktop range must include 3")
+            .rect;
+        assert_ne!(expanded.pane_count(), 3, "precondition");
+        expanded.mouse_click(three.center());
+        expanded.warm_up();
+        assert_eq!(
+            expanded.pane_count(),
+            3,
+            "clicking a pane-count button did not change the layout"
+        );
+        assert_eq!(
+            expanded.pane_rects().len(),
+            3,
+            "the map still laid out the old number of panes"
         );
     }
 
     /// 23. **Host safe-area insets reach the chrome.**
     ///
-    ///     The Android host pushes its `WindowInsets` through
-    ///     `Gui::set_safe_area_insets`, `LayoutCtx::resolve` folds them into
-    ///     `content_rect`, and the root `Ui` is built on that rect so every
-    ///     nested `Panel` clears the notch and the system bars for free. That
-    ///     last hop was untested: dropping `.max_rect(..)` from the root `Ui`
-    ///     leaves the chrome drawing under the status bar, and the whole suite
-    ///     passed because nothing ever set an inset.
+    ///     `set_safe_area_insets` -> `LayoutCtx::resolve` -> the root `Ui`'s
+    ///     rect, which is what insets every nested `Panel`. That last hop was
+    ///     untested: dropping `.max_rect(..)` leaves the chrome under the
+    ///     status bar, and nothing in the suite ever set an inset.
     #[test]
     fn host_safe_area_insets_inset_the_chrome() {
         const TOP: f32 = 60.0;
@@ -2264,11 +2547,8 @@ mod tests {
 
     /// 24. **Insets move the breakpoint, not just the padding.**
     ///
-    ///     The width class is taken from the *content* width, so a window that
-    ///     is Medium by its raw size is Compact once the host's side insets are
-    ///     accounted for. Pinned end to end here, through `Gui::ui`, rather
-    ///     than only on `shrink_to_content` — that is the half that proves
-    ///     `Gui::safe_area_insets` is actually threaded into the resolve.
+    ///     Through `Gui::ui` rather than only on `shrink_to_content`, which is
+    ///     what proves `Gui::safe_area_insets` is threaded into the resolve.
     #[test]
     fn host_insets_move_the_breakpoint_through_the_real_ui() {
         let mut h = InputHarness::with_screen(egui::vec2(610.0, 900.0));
@@ -2288,11 +2568,8 @@ mod tests {
 
     /// 25. **The hover readout follows the pointer, not the window width.**
     ///
-    ///     Hover is a thing a mouse does. Keying it on `WidthClass` conflates
-    ///     "small" with "touch" — exactly what the compile-time Android gate
-    ///     used to do — and gets both ends wrong: a 500pt desktop window loses
-    ///     a readout it can perfectly well use, and a 1400pt tablet is given a
-    ///     permanently empty one.
+    ///     Keying it on `WidthClass` gets both ends wrong: a 500pt desktop
+    ///     window loses a readout it can use, a 1400pt tablet gets an empty one.
     #[test]
     fn the_hover_readout_follows_the_modality_not_the_width() {
         // A narrow *desktop* window: compact, but there is a mouse.
@@ -2300,7 +2577,7 @@ mod tests {
         narrow.mouse_click(narrow.map_center());
         assert_eq!(narrow.width_class(), crate::ui_layout::WidthClass::Compact);
         assert!(
-            narrow.status_bar_showed_hover(),
+            narrow.status_bar().hover,
             "a compact window with a mouse lost its hover readout"
         );
 
@@ -2309,8 +2586,55 @@ mod tests {
         tablet.touch_tap(tablet.map_center());
         assert_eq!(tablet.width_class(), crate::ui_layout::WidthClass::Expanded);
         assert!(
-            !tablet.status_bar_showed_hover(),
+            !tablet.status_bar().hover,
             "a touch device was given a hover readout that can never fill in"
+        );
+    }
+
+    /// 26. **A compact bar drops the long summary and the auto-poll box.**
+    ///
+    ///     The half left unpinned when one flag became two: inverting `roomy`
+    ///     crammed both into a 420pt phone bar and stripped both from a 1400pt
+    ///     desktop, suite green. Asserted on the text drawn, not the flag.
+    #[test]
+    fn a_compact_status_bar_drops_the_long_summary_and_the_auto_poll_box() {
+        let mut phone = InputHarness::with_screen(egui::vec2(420.0, 900.0));
+        phone.load_scan("KABR");
+        assert_eq!(phone.width_class(), crate::ui_layout::WidthClass::Compact);
+        let compact_bar = phone.status_bar();
+
+        let mut desk = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        desk.load_scan("KABR");
+        assert_eq!(desk.width_class(), crate::ui_layout::WidthClass::Expanded);
+        let roomy_bar = desk.status_bar();
+
+        assert!(
+            compact_bar.auto_poll.is_none(),
+            "the auto-poll checkbox was crammed into a compact status bar"
+        );
+        assert!(
+            roomy_bar.auto_poll.is_some(),
+            "a desktop status bar lost its auto-poll checkbox"
+        );
+
+        // Both forms name the site, so the difference is the *detail*: only the
+        // long form carries the date and the product count.
+        assert!(
+            compact_bar.scan_text.contains("KABR") && roomy_bar.scan_text.contains("KABR"),
+            "precondition: both forms should name the site, got {:?} and {:?}",
+            compact_bar.scan_text,
+            roomy_bar.scan_text
+        );
+        assert!(
+            roomy_bar.scan_text.contains("2 products") && roomy_bar.scan_text.contains("2026-07-24"),
+            "the roomy bar dropped the long scan summary: {:?}",
+            roomy_bar.scan_text
+        );
+        assert!(
+            !compact_bar.scan_text.contains("products")
+                && !compact_bar.scan_text.contains("2026-07-24"),
+            "the compact bar drew the long scan summary: {:?}",
+            compact_bar.scan_text
         );
     }
 

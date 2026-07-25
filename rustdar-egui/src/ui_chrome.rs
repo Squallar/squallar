@@ -161,24 +161,19 @@ impl super::Gui {
 
     /// The status bar along the bottom.
     ///
-    /// Compact screens get the essentials only: there is no room for the long
-    /// scan summary and the auto-poll checkbox next to each other.
+    /// `roomy` is about horizontal space: the long scan summary and the
+    /// auto-poll checkbox do not fit side by side on a phone.
     ///
-    /// The hover readout is a separate question and keys on the *modality*,
-    /// not the width. There is no hover without a pointing device, so a
-    /// touchscreen has nothing to show however wide it is — and a narrow
-    /// desktop window has a mouse and should keep it. Deciding both from
-    /// `WidthClass` is the same conflation of "small" with "touch" that
-    /// `cfg!(target_os = "android")` used to make: it cost a 500pt desktop
-    /// window its readout and gave a 1400pt tablet a permanently empty one.
+    /// The hover readout is a different question and keys on the *modality*.
+    /// There is no hover without a pointing device, so a touchscreen has
+    /// nothing to show however wide it is, and a narrow desktop window has a
+    /// mouse and should keep it.
     fn render_status_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {
         let roomy = self.layout.width != WidthClass::Compact;
         let has_hover = self.layout.modality == PointerModality::Mouse;
 
         #[cfg(test)]
-        {
-            self.last_status_bar_showed_hover = has_hover;
-        }
+        let mut probe = super::StatusBarProbe::default();
 
         egui::Panel::bottom("status_bar")
             .show_separator_line(true)
@@ -198,13 +193,20 @@ impl super::Gui {
                     ui.separator();
 
                     if roomy {
-                        render_auto_poll_status(ui, self.radar.fetching, &mut self.auto_poll);
+                        let drawn =
+                            render_auto_poll_status(ui, self.radar.fetching, &mut self.auto_poll);
+                        #[cfg(test)]
+                        {
+                            probe.auto_poll = drawn;
+                        }
+                        #[cfg(not(test))]
+                        let _ = drawn;
                         ui.separator();
                     } else if self.radar.fetching {
                         ui.spinner();
                     }
 
-                    render_scan_info(
+                    let scan_text = render_scan_info(
                         ui,
                         self.panes
                             .get(self.active_pane)
@@ -212,10 +214,20 @@ impl super::Gui {
                         &self.preferences,
                         roomy,
                     );
+                    #[cfg(test)]
+                    {
+                        probe.scan_text = scan_text;
+                    }
+                    #[cfg(not(test))]
+                    let _ = scan_text;
 
                     if has_hover {
                         ui.separator();
                         render_hover_info(ui, &self.panes);
+                        #[cfg(test)]
+                        {
+                            probe.hover = true;
+                        }
                     }
 
                     // Flexible space pushes the error to the right.
@@ -227,6 +239,11 @@ impl super::Gui {
                     );
                 });
             });
+
+        #[cfg(test)]
+        {
+            self.last_status_bar = probe;
+        }
     }
 
     /// The layers panel, in whichever of its two forms this width calls for.
@@ -237,16 +254,10 @@ impl super::Gui {
         let is_drawer = !self.layout.width.has_persistent_sidebar();
         let show_menu_in_panel = !self.layout.width.has_menu_bar();
 
-        // Built **before** the pane is taken out of `self`, exactly as
-        // `render_menu_bar_panel` does.
-        //
-        // `menu_model` reads `self.active_pane()`. Inside the panel closure the
-        // active pane has been replaced by `mem::take`'s default, whose
-        // `enabled_overlays` is empty, so every overlay toggle would read back
-        // `false` — the checkbox would render permanently unchecked and each
-        // click would emit `Toggled(kind, true)`, letting an overlay be turned
-        // on but never off. Compact is the only width that renders the drawer,
-        // so that was the phone layout.
+        // Built before the pane is taken, as `render_menu_bar_panel` does:
+        // `menu_model` reads `self.active_pane()`, and inside the closure that
+        // is `mem::take`'s default, whose `enabled_overlays` is empty. Every
+        // toggle would render unchecked and emit `Toggled(kind, true)`.
         let menu_model = if show_menu_in_panel {
             Some(self.menu_model())
         } else {
@@ -330,61 +341,54 @@ impl super::Gui {
     }
 }
 
+/// Returns the checkbox's rect when one was drawn — while a fetch is running
+/// there is a spinner instead.
 fn render_auto_poll_status(
     ui: &mut egui::Ui,
     fetching: bool,
     auto_poll: &mut super::AutoPollState,
-) {
+) -> Option<egui::Rect> {
     if fetching {
         ui.label("\u{1f504}");
         ui.label("Downloading");
         ui.spinner();
-    } else if auto_poll.enabled {
-        if let Some(remaining) = auto_poll.time_until_next() {
-            ui.checkbox(
-                &mut auto_poll.enabled,
-                format!("Auto-poll (next in {}s)", remaining),
-            );
-        } else {
-            ui.checkbox(&mut auto_poll.enabled, "Auto-poll");
-        }
-    } else {
-        ui.checkbox(&mut auto_poll.enabled, "Auto-poll");
+        return None;
     }
+    let label = match auto_poll.time_until_next() {
+        Some(remaining) if auto_poll.enabled => format!("Auto-poll (next in {}s)", remaining),
+        _ => "Auto-poll".to_owned(),
+    };
+    Some(ui.checkbox(&mut auto_poll.enabled, label).rect)
 }
 
 /// The scan summary. `roomy` picks the long form; a compact bar has room for
-/// the site and the time and nothing else.
+/// the site and the time and nothing else. Returns the text it drew.
 fn render_scan_info(
     ui: &mut egui::Ui,
     scan_info: Option<&ScanInfo>,
     prefs: &UserPreferences,
     roomy: bool,
-) {
-    match scan_info {
-        Some(scan_info) if roomy => {
-            ui.label(format!(
-                "Scan: {} @ {} ({} products)",
-                scan_info.site.name,
-                prefs
-                    .timezone
-                    .format_naive_utc(scan_info.timestamp, "%Y-%m-%d %H:%M:%S"),
-                scan_info.available_products.len()
-            ));
-        }
-        Some(scan_info) => {
-            ui.label(format!(
-                "{} @ {}",
-                scan_info.site.name,
-                prefs
-                    .timezone
-                    .format_naive_utc(scan_info.timestamp, "%H:%M")
-            ));
-        }
-        None => {
-            ui.label("No scan loaded");
-        }
-    }
+) -> String {
+    let text = match scan_info {
+        Some(scan_info) if roomy => format!(
+            "Scan: {} @ {} ({} products)",
+            scan_info.site.name,
+            prefs
+                .timezone
+                .format_naive_utc(scan_info.timestamp, "%Y-%m-%d %H:%M:%S"),
+            scan_info.available_products.len()
+        ),
+        Some(scan_info) => format!(
+            "{} @ {}",
+            scan_info.site.name,
+            prefs
+                .timezone
+                .format_naive_utc(scan_info.timestamp, "%H:%M")
+        ),
+        None => "No scan loaded".to_owned(),
+    };
+    ui.label(&text);
+    text
 }
 
 fn render_hover_info(ui: &mut egui::Ui, panes: &[PaneState]) {
