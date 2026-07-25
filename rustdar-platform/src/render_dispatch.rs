@@ -64,7 +64,11 @@ pub struct CachedRenderOutput {
 }
 
 /// Quantize an elevation angle to tenths of a degree for cache key use.
-/// Matches the 0.01 tolerance used in `dispatch_pane_renders()`.
+///
+/// Coarser than `rustdar_egui::pane::ELEVATION_TOLERANCE`, deliberately: that is a
+/// pairwise comparison, this has to be a hashable bucket, and no exact bucketing
+/// agrees with a tolerance at the edges. Tenths is finer than any real sweep spacing,
+/// so two selections that compare equal never land in different buckets in practice.
 fn elevation_key(elevation: f32) -> i32 {
     (elevation * 10.0).round() as i32
 }

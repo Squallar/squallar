@@ -447,9 +447,10 @@ impl super::App {
     /// an async task to list available scans in the lookback window.
     fn handle_enable_loop(&mut self, pane_idx: usize, lookback_secs: u64) {
         let Some(scan_info) = self.gui.get_scan_info() else { return };
-        let site = scan_info.site.name.to_string();
-        let site_lat = scan_info.site.lat;
-        let site_lon = scan_info.site.lon;
+        // The whole site value, so the loop's render-target code and the coordinates
+        // it projects with cannot come from different sites.
+        let radar_site = scan_info.site.clone();
+        let site = radar_site.name.to_string();
         let scan_timestamp = scan_info.timestamp;
 
         // Clear pending downloads for this pane (global cache is kept for sharing)
@@ -457,12 +458,8 @@ impl super::App {
 
         // Initialize loop state on the pane
         if let Some(pane) = self.gui.pane_mut(pane_idx) {
-            pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new_for_loop(
-                lookback_secs,
-                site.clone(),
-                site_lat,
-                site_lon,
-            );
+            pane.loop_state =
+                rustdar_egui::pane::LoopPlaybackState::new_for_loop(lookback_secs, &radar_site);
         }
 
         // Use the current scan's timestamp as the loop end time (not wall clock)

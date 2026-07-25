@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use rustdar_egui::actions::GuiAction;
+use rustdar_egui::pane::{ELEVATION_TOLERANCE, RenderTarget};
 use rustdar_radar::types::IMAGE_SIZE;
 use crate::constants::{MAX_CONCURRENT_RENDERS, MAX_LOOP_RENDER_BUDGET, MAX_CONCURRENT_LOOP_DOWNLOADS, MAX_LOOP_FRAMES};
 use crate::render_dispatch::CachedPaneRender;
@@ -129,11 +130,11 @@ impl super::App {
                 let Some((other_product, other_elevation)) = self.gui.get_rendering_params_for_pane(other_idx) else {
                     continue;
                 };
-                if other_product == render_result.product && (other_elevation - render_result.elevation).abs() <= 0.01 {
+                if other_product == render_result.product && (other_elevation - render_result.elevation).abs() <= ELEVATION_TOLERANCE {
                     let needs = other_idx < self.render.pane_render.len()
                         && self.render.pane_render[other_idx]
                             .last_rendered
-                            .map(|(lp, le)| lp != other_product || (le - other_elevation).abs() > 0.01)
+                            .map(|(lp, le)| lp != other_product || (le - other_elevation).abs() > ELEVATION_TOLERANCE)
                             .unwrap_or(true);
                     if needs {
                         self.apply_render_to_pane(&ctx, other_idx, &render_result);
@@ -347,7 +348,7 @@ impl super::App {
                 let needs_render = prs
                     .last_rendered
                     .map(|(last_prod, last_elev)| {
-                        last_prod != product || (last_elev - elevation).abs() > 0.01
+                        last_prod != product || (last_elev - elevation).abs() > ELEVATION_TOLERANCE
                     })
                     .unwrap_or(true);
 
@@ -700,26 +701,24 @@ impl super::App {
                 continue;
             };
             let ls = &mut pane.loop_state;
-            if !ls.is_active() {
-                continue;
-            }
+
+            // The coordinates the image was projected around. Read before the frame is
+            // borrowed, and carried to every pane that ends up with this texture — the
+            // target's site is checked on each hand-off, so this describes the image
+            // for all of them rather than being re-guessed per receiver.
+            let lat = ls.site_lat;
+            let lon = ls.site_lon;
 
             // Drop results the pane is no longer expecting — rendered for a site,
             // product or elevation it has since retargeted away from, or aimed at a
             // frame that is not awaiting one. Applying either paints an image the
             // dispatcher then treats as done, so the frame never corrects itself.
             //
-            // This resolves the frame in the same pass that vets the result: a separate
-            // lookup here could pick a different frame than the one the check cleared.
-            let Some(frame_idx) = ls.frame_awaiting_render_result(rr.timestamp, &rr.target) else {
+            // Resolves the frame in the same pass that vets the result, and hands back
+            // the frame rather than its index so there is nothing here to re-derive.
+            let Some(frame) = ls.frame_awaiting_render_result_mut(rr.timestamp, &rr.target) else {
                 continue;
             };
-
-            // Capture per-pane state needed for texture creation
-            let lat = ls.site_lat;
-            let lon = ls.site_lon;
-
-            let frame = &mut ls.frames[frame_idx];
             frame.render_in_flight = false;
 
             // Empty image_data means the render failed (no matching sweep). Mark the
@@ -754,30 +753,31 @@ impl super::App {
                         continue;
                     }
                     let Some(sibling) = self.gui.pane_mut(sibling_idx) else { continue };
-                    let sls = &mut sibling.loop_state;
-                    if !sls.is_active() { continue; }
                     // Hand the image only to panes whose frames are keyed to exactly
-                    // what it depicts, site included — the sibling positions the texture
-                    // with its *own* `site_lat`/`site_lon`, so an image projected for
-                    // another site would be drawn in the wrong place. Matching against
-                    // the response rather than the origin pane's live selection keeps a
-                    // retarget on either side from planting an image the receiving pane
-                    // will never correct.
-                    if !sls.is_rendered_for(&rr.target) { continue; }
-                    let Some(sframe) = sls.frames.iter_mut().find(|f| f.timestamp == rr.timestamp) else {
+                    // what it depicts, site included. Matching against the response
+                    // rather than the origin pane's live selection keeps a retarget on
+                    // either side from planting an image the receiving pane will never
+                    // correct. The decision — and the frame it resolves to — lives in
+                    // `LoopPlaybackState` so it stays in step with the donor test the
+                    // dispatcher applies before suppressing a pane's own render.
+                    let Some(sframe) = sibling
+                        .loop_state
+                        .frame_accepting_broadcast_mut(rr.timestamp, &rr.target)
+                    else {
                         continue;
                     };
-                    if sframe.texture.is_some() {
-                        continue;
-                    }
                     // If the sibling had its own render running for this frame it is now
                     // redundant: same target and timestamp means the same image, so its
                     // result is simply dropped when it arrives.
                     sframe.render_in_flight = false;
                     sframe.texture = Some(rustdar_egui::pane::RadarImageData {
                         texture: texture.clone(),
-                        lat: sls.site_lat,
-                        lon: sls.site_lon,
+                        // The origin's coordinates — the ones this image was actually
+                        // projected around. Equal to the receiver's, since the target
+                        // match above pins both loops to the same site; stating the
+                        // provenance keeps that a consequence rather than a coincidence.
+                        lat,
+                        lon,
                         max_range_km: rr.max_range_km,
                         value_data: Arc::new(Vec::new()),
                     });
@@ -932,10 +932,14 @@ impl super::App {
             ls.evict_textures_outside_render_set(MAX_LOOP_RENDER_BUDGET);
         }
 
-        // Collect all (pane_idx, frame_idx, timestamp, product, elevation, lat, lon) that need rendering
-        let mut to_render: Vec<(usize, usize, chrono::NaiveDateTime, rustdar_radar::types::RadarProduct, f32, f64, f64)> = Vec::new();
-        // Frames that can be satisfied by cloning a sibling's texture: (dest_pane, frame_idx, source_pane, timestamp)
-        let mut to_clone: Vec<(usize, usize, usize, chrono::NaiveDateTime)> = Vec::new();
+        // Renders to spawn. `target` is the pane's render target (site + selected
+        // product/elevation); `snapped` is that selection resolved to a sweep angle
+        // present in this frame's own scan, which is what the renderer is given.
+        let mut to_render: Vec<LoopRenderRequest> = Vec::new();
+        // Frames that can be satisfied by cloning a sibling's texture. Both frame
+        // indices are resolved here and used as-is below — re-finding either by
+        // timestamp would be a second lookup free to disagree with this one.
+        let mut to_clone: Vec<LoopCloneRequest> = Vec::new();
         // Frames whose scan carries no sweep for the selected product: (pane_idx, frame_idx).
         // Recorded so they stop being retried and stop holding up readiness.
         let mut to_mark_failed: Vec<(usize, usize)> = Vec::new();
@@ -957,6 +961,13 @@ impl super::App {
             let product = pane.selected_product;
             let elevation = pane.selected_elevation;
 
+            // Set by `retarget_renders` in the loop above for every active, non-empty
+            // loop. Carried through the plan so the dedup, the donor search and the
+            // dispatch stamp all read the one value instead of re-deriving it.
+            let Some(target) = ls.rendered_for.clone() else {
+                continue;
+            };
+
             // The intended render set — shared with the readiness check so the two
             // cannot drift apart (see `LoopPlaybackState::render_set_settled`).
             let indices = ls.render_set_indices(MAX_LOOP_RENDER_BUDGET);
@@ -967,29 +978,26 @@ impl super::App {
                     continue;
                 }
 
-                // Check if a sibling pane already has this frame textured (same product+elevation+timestamp)
+                // Take a sibling's texture instead of rendering, but only from a loop
+                // keyed to the same target. Same test the response-path broadcast
+                // applies, so the two cannot disagree about who may serve this frame.
                 if sync {
-                    let mut found_sibling = None;
-                    for sibling_idx in 0..pane_count {
-                        if sibling_idx == pane_idx {
-                            continue;
-                        }
-                        let Some(sibling) = self.gui.pane(sibling_idx) else { continue };
-                        if sibling.selected_product != product
-                            || (sibling.selected_elevation - elevation).abs() > 0.01
-                        {
-                            continue;
-                        }
-                        let sls = &sibling.loop_state;
-                        if !sls.is_active() { continue; }
-                        if let Some(sframe) = sls.frames.iter().find(|f| f.timestamp == frame.timestamp)
-                            && sframe.texture.is_some() {
-                                found_sibling = Some(sibling_idx);
-                                break;
-                            }
-                    }
-                    if let Some(src) = found_sibling {
-                        to_clone.push((pane_idx, idx, src, frame.timestamp));
+                    let donor = (0..pane_count)
+                        .filter(|&s| s != pane_idx)
+                        .find_map(|sibling_idx| {
+                            let sibling = self.gui.pane(sibling_idx)?;
+                            let src_frame = sibling
+                                .loop_state
+                                .frame_donatable_to(frame.timestamp, &target)?;
+                            Some((sibling_idx, src_frame))
+                        });
+                    if let Some((src_pane, src_frame)) = donor {
+                        to_clone.push(LoopCloneRequest {
+                            dest_pane: pane_idx,
+                            dest_frame: idx,
+                            src_pane,
+                            src_frame,
+                        });
                         continue;
                     }
                 }
@@ -1003,14 +1011,20 @@ impl super::App {
                         continue;
                     };
                     // Deduplicate: if another pane already queued a render for the same
-                    // (product, elevation, timestamp), skip — the broadcast in
+                    // target and timestamp, skip — the broadcast in
                     // poll_loop_render_results will deliver the texture to this pane.
-                    if sync && to_render.iter().any(|&(_, _, ts, p, el, _, _)| {
-                        ts == frame.timestamp && p == product && (el - snapped).abs() < 0.01
-                    }) {
+                    if sync && render_already_queued(&to_render, frame.timestamp, &target, snapped) {
                         continue;
                     }
-                    to_render.push((pane_idx, idx, frame.timestamp, product, snapped, site_lat, site_lon));
+                    to_render.push(LoopRenderRequest {
+                        pane_idx,
+                        frame_idx: idx,
+                        timestamp: frame.timestamp,
+                        target: target.clone(),
+                        snapped,
+                        site_lat,
+                        site_lon,
+                    });
                 }
             }
         }
@@ -1024,59 +1038,169 @@ impl super::App {
             }
         }
 
-        // Apply cloned textures from sibling panes (no render needed)
-        for (dest_pane, _frame_idx, src_pane, timestamp) in to_clone {
-            // Look up the texture from the source pane
+        // Apply cloned textures from sibling panes (no render needed). Both indices
+        // were resolved during planning; nothing since has reordered either frame list
+        // (`to_mark_failed` only sets a flag), so they are used directly.
+        for req in to_clone {
             let cloned = {
-                let Some(src) = self.gui.pane(src_pane) else { continue };
-                let sls = &src.loop_state;
-                let Some(sframe) = sls.frames.iter().find(|f| f.timestamp == timestamp) else { continue };
+                let Some(src) = self.gui.pane(req.src_pane) else { continue };
+                let Some(sframe) = src.loop_state.frames.get(req.src_frame) else { continue };
                 let Some(tex) = sframe.texture.clone() else { continue };
                 tex
             };
-            let Some(dest) = self.gui.pane_mut(dest_pane) else { continue };
-            let dls = &mut dest.loop_state;
-            if let Some(dframe) = dls.frames.iter_mut().find(|f| f.timestamp == timestamp) {
+            let Some(dest) = self.gui.pane_mut(req.dest_pane) else { continue };
+            if let Some(dframe) = dest.loop_state.frames.get_mut(req.dest_frame) {
                 dframe.texture = Some(cloned);
             }
         }
 
         // Now spawn renders and mark the frames in flight, respecting concurrent limit
-        for (pane_idx, frame_idx, ts, product, elevation, lat, lon) in to_render {
+        for req in to_render {
             // Check concurrent render limit before each spawn (shared with static pane renders)
             let current = self.render.renders_in_flight.load(Ordering::Relaxed);
             if current >= MAX_CONCURRENT_RENDERS {
                 break;
             }
 
-            let scan_arc = Arc::clone(self.loop_mgr.get_cached(&ts).unwrap());
-
-            // Stamp the render with the target its frame state is keyed to, so a result
-            // that outlives a retarget can be recognised as stale on arrival. Set by
-            // retarget_renders at the top of this same call, so it is always present.
-            let Some(target) = self
-                .gui
-                .pane(pane_idx)
-                .and_then(|p| p.loop_state.rendered_for.clone())
-            else {
-                continue;
-            };
+            let scan_arc = Arc::clone(self.loop_mgr.get_cached(&req.timestamp).unwrap());
 
             // Only mark the frame in flight if a thread was actually spawned. If the
             // spawn is refused (budget taken between the check above and the one inside),
             // no LoopRenderResponse will ever arrive to clear the flag, and the frame
             // would stay blank and be skipped forever.
+            //
+            // `req.target` is the target the frame state was keyed to when this request
+            // was planned, and is stamped on the response so a result that outlives a
+            // retarget is recognised as stale on arrival.
             let spawned = self.spawn_loop_frame_render(
-                pane_idx,
-                ts,
+                req.pane_idx,
+                req.timestamp,
                 scan_arc,
-                &crate::render_dispatch::RenderParams { product, elevation, lat, lon },
-                target,
+                &crate::render_dispatch::RenderParams {
+                    product: req.target.product,
+                    elevation: req.snapped,
+                    lat: req.site_lat,
+                    lon: req.site_lon,
+                },
+                req.target,
             );
 
-            if spawned && let Some(pane) = self.gui.pane_mut(pane_idx) {
-                pane.loop_state.frames[frame_idx].render_in_flight = true;
+            if spawned && let Some(pane) = self.gui.pane_mut(req.pane_idx) {
+                pane.loop_state.frames[req.frame_idx].render_in_flight = true;
             }
         }
+    }
+}
+
+/// A loop frame render the dispatcher intends to spawn.
+struct LoopRenderRequest {
+    pane_idx: usize,
+    frame_idx: usize,
+    timestamp: chrono::NaiveDateTime,
+    /// The pane's render target: site plus *selected* product and elevation.
+    target: RenderTarget,
+    /// `target.elevation` resolved to a sweep angle this frame's own scan carries.
+    /// This is what the renderer is handed; the target is what the result is keyed on.
+    snapped: f32,
+    site_lat: f64,
+    site_lon: f64,
+}
+
+/// A loop frame that a sibling pane's already-rendered texture can satisfy.
+struct LoopCloneRequest {
+    dest_pane: usize,
+    dest_frame: usize,
+    src_pane: usize,
+    src_frame: usize,
+}
+
+/// Whether `queued` already covers a render for `timestamp` at `target`.
+///
+/// Suppressing a pane's own render here is a promise that the queued render's result
+/// will be broadcast to it, so this must test exactly what
+/// `LoopPlaybackState::frame_accepting_broadcast` tests — the whole target, site
+/// included. A site-blind check suppresses the render of a pane the broadcast will
+/// then refuse, and the frame is served by neither path.
+///
+/// `snapped` is compared as well: two loops on the same target can still resolve the
+/// selection to different sweeps if their scans for this timestamp differ, and those
+/// are different images.
+fn render_already_queued(
+    queued: &[LoopRenderRequest],
+    timestamp: chrono::NaiveDateTime,
+    target: &RenderTarget,
+    snapped: f32,
+) -> bool {
+    queued.iter().any(|r| {
+        r.timestamp == timestamp
+            && r.target.matches(target)
+            && (r.snapped - snapped).abs() < ELEVATION_TOLERANCE
+    })
+}
+
+#[cfg(test)]
+mod loop_dispatch_tests {
+    use super::*;
+    use rustdar_radar::types::RadarProduct;
+
+    fn ts(minute: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, minute, 0)
+            .unwrap()
+    }
+
+    fn target(site: &str, elevation: f32) -> RenderTarget {
+        RenderTarget::new(site, RadarProduct::Reflectivity, elevation)
+    }
+
+    fn queued(target: RenderTarget, timestamp: chrono::NaiveDateTime, snapped: f32) -> LoopRenderRequest {
+        LoopRenderRequest {
+            pane_idx: 0,
+            frame_idx: 0,
+            timestamp,
+            target,
+            snapped,
+            site_lat: 35.0,
+            site_lon: -97.0,
+        }
+    }
+
+    /// The behaviour the dedup exists for: one render serves both panes.
+    #[test]
+    fn a_queued_render_for_the_same_target_suppresses_a_duplicate() {
+        let q = vec![queued(target("KTLX", 0.5), ts(0), 0.48)];
+        assert!(render_already_queued(&q, ts(0), &target("KTLX", 0.5), 0.48));
+        // Selection jitter within tolerance is the same target.
+        assert!(render_already_queued(&q, ts(0), &target("KTLX", 0.505), 0.48));
+    }
+
+    /// The defect: suppressing here promises a broadcast that
+    /// `frame_accepting_broadcast` refuses across sites, leaving the frame served by
+    /// neither path — and pushing the pane into the site-blind clone path instead.
+    #[test]
+    fn a_queued_render_for_another_site_suppresses_nothing() {
+        let q = vec![queued(target("KTLX", 0.5), ts(0), 0.48)];
+        assert!(
+            !render_already_queued(&q, ts(0), &target("KOUN", 0.5), 0.48),
+            "a pane on another site must still render its own frame"
+        );
+    }
+
+    #[test]
+    fn a_queued_render_at_another_timestamp_or_sweep_suppresses_nothing() {
+        let q = vec![queued(target("KTLX", 0.5), ts(0), 0.48)];
+        assert!(!render_already_queued(&q, ts(1), &target("KTLX", 0.5), 0.48));
+        // Same target, but the two scans resolved the selection to different sweeps,
+        // so the images differ.
+        assert!(!render_already_queued(&q, ts(0), &target("KTLX", 0.5), 1.5));
+        assert!(!render_already_queued(&[], ts(0), &target("KTLX", 0.5), 0.48));
+    }
+
+    #[test]
+    fn a_queued_render_for_another_product_suppresses_nothing() {
+        let q = vec![queued(target("KTLX", 0.5), ts(0), 0.48)];
+        let velocity = RenderTarget::new("KTLX", RadarProduct::Velocity, 0.5);
+        assert!(!render_already_queued(&q, ts(0), &velocity, 0.48));
     }
 }
