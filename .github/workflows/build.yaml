@@ -147,6 +147,12 @@ jobs:
       # directory, not git's index, so an exclusion list would publish whatever
       # an earlier step left lying around. By extension rather than filename so
       # that a manifest or service worker added later still ships.
+      #
+      # `/tests/` is excluded because the allowlist is by extension and has no
+      # directory sense: the PWA work added three `.mjs` files under it, and
+      # without this they were staged and published. The three top-level source
+      # directories are named rather than a blanket rule, so a new servable
+      # directory (`icons/`, say) still ships without an edit here.
       - name: Stage the servable directory
         shell: bash
         run: |
@@ -156,7 +162,7 @@ jobs:
             --exclude='.git' --exclude='.git/**' \
             --exclude='.env' --exclude='.env.*' \
             --exclude='*.keystore' --exclude='*.jks' --exclude='*.pem' --exclude='*.key' \
-            --exclude='/src/' --exclude='/target/' \
+            --exclude='/src/' --exclude='/target/' --exclude='/tests/' \
             --include='*/' \
             --include='*.html' --include='*.htm' \
             --include='*.js' --include='*.mjs' --include='*.map' \
@@ -221,13 +227,16 @@ jobs:
           key: ${{ runner.os }}-cargo-android-jni-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-android-jni-
 
-      # An unknown feature already errors. What that misses is the feature
-      # surviving while emptied to `[]`, which would leave this job compiling the
-      # crate with every helper cfg'd out and reporting success.
+      # This job compiles nothing unless BOTH halves hold, and an unknown feature
+      # name is the only one of the two cargo already errors on. Each half can
+      # break silently on its own and leave the job green over zero lines:
       #
-      # NOTE: `cargo tree` reads manifests, not sources, so this guards the
-      # dependency half only. Narrowing lib.rs's `#![cfg(...)]` back to
-      # `target_os = "android"` alone would still pass here and compile nothing.
+      #   * the feature emptied to `[]` -- deps gone, cfg still open;
+      #   * lib.rs's `#![cfg(...)]` narrowed back to `target_os = "android"`
+      #     alone -- deps still there, every helper cfg'd out.
+      #
+      # `cargo tree` reads manifests and never opens a source file, so it cannot
+      # see the second. The grep is what covers it.
       - name: Assert the feature still pulls in the JNI layer
         shell: bash
         run: |
@@ -238,6 +247,17 @@ jobs:
             exit 1
           fi
           echo "ok: jni-typecheck pulls jni into the host graph"
+
+      - name: Assert the crate root still opens under the feature
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=rustdar-android/src/lib.rs
+          if ! grep -qE '^\s*#!\[cfg\(.*feature\s*=\s*"jni-typecheck".*\)\]' "$root"; then
+            echo "::error::${root}'s crate-level #![cfg(...)] no longer names the jni-typecheck feature, so this job compiles zero lines and proves nothing. Restore the cfg or delete this job."
+            exit 1
+          fi
+          echo "ok: the crate root opens under jni-typecheck"
 
       - name: cargo check -p rustdar-android --features jni-typecheck
         run: cargo check -p rustdar-android --features jni-typecheck
@@ -299,42 +319,72 @@ jobs:
           # -P must track minSdk in android/app/build.gradle.kts.
           cargo ndk -t '${{ matrix.abi }}' -P 28 build -p rustdar-android --lib
 
-  # The Android failure no compiler can see.
+  # The failures no compiler can see: one crate resolved to two versions.
   #
-  # Bumping `jni` or `rustls-platform-verifier` alone still compiles -- cargo
-  # resolves two copies of the verifier. `rustdar-android` then initialises one
-  # while every reqwest client reads the other, uninitialised, and Android TLS
-  # setup becomes a no-op whose first symptom is an on-device HTTPS failure.
+  # Not Android-specific despite where it used to live (`android.yaml`). Three
+  # crates, each with its own history:
   #
-  # Both ABIs, because resolution is per-target.
-  android-dep-unification:
-    name: Android dependency unification
+  #   * `jni` / `rustls-platform-verifier` -- bumping either alone still
+  #     compiles. `rustdar-android` initialises one verifier while every reqwest
+  #     client reads the other, uninitialised, and Android TLS setup becomes a
+  #     no-op whose first symptom is an on-device HTTPS failure.
+  #
+  #   * `wgpu` -- renovate once bumped the workspace pin to 30.0.0 while
+  #     egui-wgpu 0.35 pins ^29, and cargo resolved a second copy rather than
+  #     failing. The 30.0.0 copy had no users, so the per-target backend
+  #     selection in `rustdar-frontend/Cargo.toml` -- the only place `webgpu` is
+  #     held off -- applied to an inert copy, and on wasm32 both copies compiled
+  #     WebGPU bindings until wasm-bindgen aborted.
+  #
+  # The `const _` guard in `rustdar-frontend/src/app.rs` does not cover the wgpu
+  # case: it is a per-crate identity check, so a duplicate introduced through a
+  # sibling member leaves `cargo check -p rustdar-frontend` clean with both
+  # copies resolved. This is the only graph-wide coverage.
+  #
+  # Per-target, because resolution is.
+  dep-unification:
+    name: Dependency unification
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
         run: rustup show
-      - name: Assert exactly one jni and one rustls-platform-verifier
+      - name: Assert exactly one resolved version of each pinned crate
         shell: bash
         run: |
           set -uo pipefail
           fail=0
-          for target in aarch64-linux-android x86_64-linux-android; do
-            for crate in jni rustls-platform-verifier; do
-              # `cargo tree -i` prints one root line per resolved version.
-              versions="$(cargo tree -i "$crate" --target "$target" \
-                -e normal --prefix none 2>/dev/null \
-                | grep -E "^${crate} v" | sort -u)"
+          check() {
+            crate="$1"; shift
+            for target in "$@"; do
+              # cargo tree exits non-zero with "specification '<crate>' is
+              # ambiguous" when two copies are resolved -- the very state this
+              # asserts against. Captured and checked rather than sent to
+              # /dev/null, so it reports as itself instead of as "found 0".
+              out="$(cargo tree -i "$crate" --target "$target" -e normal --prefix none 2>&1)"
+              rc=$?
+              if [ "$rc" -ne 0 ]; then
+                echo "::error::cargo tree -i ${crate} --target ${target} failed (exit ${rc}). An ambiguous specification means more than one version resolved, which is itself the failure:"
+                printf '%s\n' "$out" | sed 's/^/    /'
+                fail=1
+                continue
+              fi
+              versions="$(printf '%s\n' "$out" | grep -E "^${crate} v" | sort -u)"
               count="$(printf '%s' "$versions" | grep -c . )" || true
               if [ "$count" -ne 1 ]; then
                 echo "::error::expected exactly 1 version of ${crate} in the ${target} graph, found ${count}"
-                printf '%s\n' "$versions"
+                printf '%s\n' "$versions" | sed 's/^/    /'
                 fail=1
               else
                 echo "ok [${target}]: ${versions}"
               fi
             done
-          done
+          }
+
+          check jni                      aarch64-linux-android x86_64-linux-android
+          check rustls-platform-verifier aarch64-linux-android x86_64-linux-android
+          check wgpu                     x86_64-unknown-linux-gnu wasm32-unknown-unknown aarch64-linux-android
+
           exit "$fail"
 
   # Every member on its own, with its own default features.
@@ -410,7 +460,194 @@ jobs:
           done
           exit "$fail"
 
-  # The one required status check from this workflow.
+  # Clippy, absorbed from clippy.yaml, and Test, absorbed from test.yaml.
+  #
+  # They live here so `deploy-pages` can name them in `needs`. Across workflows
+  # it could not: the only cross-workflow mechanism is `workflow_run`, which runs
+  # against the default branch's workflow definition and does not inherit the
+  # triggering run's conclusion without extra plumbing -- another way to publish
+  # a failing build while reporting success. One workflow removes the problem
+  # rather than guarding it.
+  #
+  # The job names are unchanged, so the `Clippy` and `Test` required contexts in
+  # the repository ruleset still resolve.
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Generate GitHub App Token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          client-id: ${{ secrets.AUTO_COMMIT_APP_ID }}
+          private-key: ${{ secrets.AUTO_COMMIT_APP_KEY }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+      # `rustup show` materialises the channel, `clippy` and the cross-targets in
+      # rust-toolchain.toml, which the verification steps below need.
+      - name: Install Rust
+        run: rustup show
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-clippy-
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked --version ^4
+      - name: Apply Clippy autofixes
+        run: cargo clippy --all-targets --all-features --fix || true
+
+      # The gate on the autofix. Nothing below this runs if it fails, and that
+      # includes the commit+push.
+      #
+      # This bot pushes straight to main, and previously committed
+      # unconditionally, re-running clippy only *after* the push -- so a rewrite
+      # that broke the build was already on main before anything noticed.
+      #
+      # The cross arms are checked too, not just the host. `--fix` only sees the
+      # host cfg arms but edits shared source that the Android and wasm arms also
+      # compile, so a "redundant" clone it drops can break a call site behind
+      # `#[cfg(target_os = "android")]` invisibly.
+      - name: Verify the autofixed tree still builds (host)
+        run: cargo build --workspace --all-targets --all-features
+      - name: Verify the autofixed tree still builds (wasm32)
+        run: cargo check -p rustdar-web --lib --target wasm32-unknown-unknown
+      - name: Verify the autofixed tree still builds (Android arm64-v8a)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Read in the shell: GitHub's `env` context does not carry runner OS
+          # variables, so `${{ env.ANDROID_NDK_LATEST_HOME }}` is empty.
+          export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          if [ -z "$ANDROID_NDK_HOME" ] || [ ! -d "$ANDROID_NDK_HOME" ]; then
+            echo "::error::No Android NDK on this runner. Refusing to auto-commit a tree whose Android arm was never compiled."
+            exit 1
+          fi
+          cargo ndk -t arm64-v8a -P 28 check -p rustdar-android --lib
+
+      - uses: stefanzweifel/git-auto-commit-action@4a55954c782fc1ea30b9056cd3e7a2b40ca8887d # v7.2.0
+        with:
+          commit_message: "chore: Apply clippy fixes"
+          commit_user_name: usa-reddragon-auto-commit[bot]
+          commit_user_email: 234130638+github-actions[bot]@users.noreply.github.com
+          commit_author: "usa-reddragon-auto-commit[bot] <234130638+github-actions[bot]@users.noreply.github.com>"
+      # The gating run. `-D warnings` goes here and not on the `--fix` step, so
+      # the bot still autofixes what it can and the build fails only on the rest.
+      #
+      # This is what makes `unexpected_cfgs` load-bearing: a `rustdar-frontend`
+      # build script that stopped emitting the `mobile` cfg produced warnings
+      # nobody failed on, and Android and iOS silently took desktop memory
+      # budgets.
+      #
+      # `--all-features` enables `rustdar-android/jni-typecheck`, so this lints
+      # the JNI layer -- invisible to Clippy until that feature existed.
+      #
+      # Remaining gap: this is the *host* cfg of that code. The Android target
+      # has no lint gate, and `cargo ndk clippy` reports 3 warnings from arms
+      # only Android compiles. Adding that row means fixing those first.
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Generate GitHub App Token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          client-id: ${{ secrets.AUTO_COMMIT_APP_ID }}
+          private-key: ${{ secrets.AUTO_COMMIT_APP_KEY }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Install Rust + llvm-tools
+        run: |
+          rustup show
+          rustup component add llvm-tools-preview
+          cargo install cargo-llvm-cov
+      - name: Run tests
+        run: cargo llvm-cov --no-report
+      - name: Generate coverage reports
+        if: always()
+        run: |
+          cargo llvm-cov report --lcov --output-path lcov.info
+          cargo llvm-cov report --html --output-dir coverage
+      - name: Upload HTML coverage report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-html
+          path: coverage/html
+          retention-days: 14
+      - name: Comment coverage on pull request
+        if: always() && github.event_name == 'pull_request'
+        # Coverage is informational and never gates, so a failure to report it
+        # must not turn the pull request red.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ ! -s lcov.info ]; then
+            echo "No coverage report was produced, skipping comment"
+            exit 0
+          fi
+          .github/scripts/coverage-summary.sh lcov.info > "$RUNNER_TEMP/current.tsv"
+          git diff --name-only "$BASE_SHA"...HEAD > "$RUNNER_TEMP/changed.txt"
+          .github/scripts/coverage-comment.sh \
+            "$RUNNER_TEMP/current.tsv" \
+            .github/coverage-baseline.tsv \
+            "$RUNNER_TEMP/changed.txt" > "$RUNNER_TEMP/comment.md"
+          gh pr comment "$PR" --body-file "$RUNNER_TEMP/comment.md" --edit-last --create-if-none
+      - name: Update coverage badge and baseline
+        if: github.ref == 'refs/heads/main'
+        run: |
+          .github/scripts/coverage-badge.sh lcov.info .github/badges/coverage.svg
+          .github/scripts/coverage-summary.sh lcov.info > .github/coverage-baseline.tsv
+          if git diff --quiet -- .github/badges/coverage.svg .github/coverage-baseline.tsv; then
+            echo "Coverage unchanged, nothing to commit"
+            exit 0
+          fi
+          git config user.name 'usa-reddragon-auto-commit[bot]'
+          git config user.email '234130638+github-actions[bot]@users.noreply.github.com'
+          git add .github/badges/coverage.svg .github/coverage-baseline.tsv
+          git commit -m 'chore: update coverage badge and baseline [skip ci]'
+          # Rebase before pushing. This workflow does not cancel superseded runs
+          # on main, so two runs can reach this step at once and the loser would
+          # otherwise fail on a non-fast-forward and take `build-success` -- and
+          # therefore the deploy -- down with it.
+          git pull --rebase origin main
+          git push
+
+  # The one required status check.
   #
   # `needs` on a matrix job covers all its rows. `skipped` and `cancelled` count
   # as failures: a job that did not run has verified nothing. Adding a job above
@@ -424,8 +661,10 @@ jobs:
       - web-bundle
       - android-jni-check
       - android
-      - android-dep-unification
+      - dep-unification
       - standalone
+      - clippy
+      - test
     steps:
       - name: Report job results
         shell: bash
