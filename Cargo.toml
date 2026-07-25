@@ -98,7 +98,7 @@ flate2 = "=1.1.9"
 # its own change with those artifact checks re-run (the compiled Network
 # Security Config reference, the R8-surviving `org.rustls.platformverifier.*`
 # classes). Take both bumps together, or neither.
-jni = "=0.21.1"
+jni = "=0.22.4"
 # egui 0.35 requires ^0.4.33.
 log = "=0.4.33"
 ndk-context = "=0.1.1"
