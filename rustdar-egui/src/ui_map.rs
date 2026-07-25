@@ -39,6 +39,13 @@ impl super::Gui {
             .show_inside(ui, |ui| {
                 let panel_rect = ui.max_rect();
 
+                // One color-scale orientation for the whole grid, resolved from
+                // the panel (not from each pane's rect) so every pane on screen
+                // agrees and dragging a divider cannot flip the bars. See
+                // `ColorScaleOrientation`.
+                let horizontal_color_scale =
+                    self.color_scale_orientation.resolve(panel_rect);
+
                 self.detect_active_pane_click(ui.ctx(), panel_rect);
 
                 // Snapshot viewport state before rendering for sync detection
@@ -159,6 +166,7 @@ impl super::Gui {
                                 label_tiles: &mut label_tiles,
                                 actions: &mut actions,
                                 pane_rect,
+                                horizontal_color_scale,
                                 pointer_available,
                                 excluded_rects: excluded_rects.clone(),
                                 #[cfg(target_os = "android")]

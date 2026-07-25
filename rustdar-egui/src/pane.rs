@@ -630,6 +630,79 @@ pub struct PaneLayout {
 const MIN_RATIO: f32 = 0.15;
 const DIVIDER_HALF_WIDTH: f32 = 4.0;
 
+/// Height/width ratio at which the color scale bars *take up* the horizontal
+/// (bottom-edge) orientation, having been vertical.
+const COLOR_SCALE_HORIZONTAL_ENTER: f32 = 1.35;
+/// Height/width ratio at which they *give it up* again.
+///
+/// The gap between this and [`COLOR_SCALE_HORIZONTAL_ENTER`] is the whole point:
+/// a single threshold — whatever its value — is a point the layout can be parked
+/// on or dragged across, and 1.2 sat 4% away from a 16:10 laptop's two-pane
+/// split and landed exactly on a 4:3 five-pane one. A ratio inside this band
+/// changes nothing at all; only leaving it flips the bars.
+const COLOR_SCALE_HORIZONTAL_EXIT: f32 = 1.05;
+/// Ratio used for the very first decision, when there is no previous
+/// orientation to keep. Sits in the middle of the band.
+const COLOR_SCALE_SEED_RATIO: f32 = 1.2;
+
+/// The color scale bars' orientation for the whole map panel, remembered across
+/// frames so it has hysteresis instead of a bare threshold.
+///
+/// # Why the panel and not each pane
+///
+/// The orientation used to be decided per pane, from the pane's own rect. That
+/// is a defensible reading of "the bar should span the pane's shorter axis", but
+/// it has two failures a threshold cannot fix:
+///
+/// * **Mixed orientations on one screen.** A three-pane `[2, 1]` grid on a
+///   portrait phone gives two tall panes (h/w ≈ 2.0) and one wide one
+///   (h/w ≈ 1.0), so the same screen showed two bottom bars and one right-hand
+///   bar. No threshold helps: the panes genuinely disagree.
+/// * **Divider drags.** Dragging a divider changes pane rects continuously, so
+///   any per-pane threshold is something the user can scrub back and forth
+///   across, hopping the bars mid-drag.
+///
+/// Keying on the panel — the rect the whole grid is laid out in — fixes both
+/// outright. Every pane on a screen agrees by construction, and the panel rect
+/// does not move when a divider is dragged, so dragging cannot flip anything at
+/// all. What is left is window resizes and device rotation, which is what the
+/// hysteresis band above is for.
+///
+/// The single-pane case, which is the overwhelmingly common one on every
+/// platform, is unchanged: there the panel *is* the pane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ColorScaleOrientation {
+    /// `None` until the first usable panel rect has been seen.
+    horizontal: Option<bool>,
+}
+
+impl ColorScaleOrientation {
+    /// Resolve the orientation for this frame's `panel_rect`, remembering it.
+    ///
+    /// Returns `true` for horizontal bars along the bottom edge, `false` for
+    /// vertical bars along the right edge. Call once per frame, before the pane
+    /// loop, and pass the result to every pane.
+    pub fn resolve(&mut self, panel_rect: egui::Rect) -> bool {
+        let (w, h) = (panel_rect.width(), panel_rect.height());
+        // A degenerate or not-yet-laid-out panel must not seed the memory with
+        // a decision that then sticks through the hysteresis band.
+        if !(w.is_finite() && h.is_finite()) || w <= 0.0 || h <= 0.0 {
+            return self.horizontal.unwrap_or(false);
+        }
+
+        let ratio = h / w;
+        let horizontal = match self.horizontal {
+            None => ratio > COLOR_SCALE_SEED_RATIO,
+            // Already horizontal: keep it until the panel is clearly not portrait.
+            Some(true) => ratio > COLOR_SCALE_HORIZONTAL_EXIT,
+            // Already vertical: take it up only when the panel is clearly portrait.
+            Some(false) => ratio > COLOR_SCALE_HORIZONTAL_ENTER,
+        };
+        self.horizontal = Some(horizontal);
+        horizontal
+    }
+}
+
 impl Default for PaneLayout {
     fn default() -> Self {
         Self::for_count(1)
@@ -761,6 +834,77 @@ fn drag_divider(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// A panel `w` by `h` logical pixels.
+    fn panel(w: f32, h: f32) -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h))
+    }
+
+    /// The orientation follows the panel's shape: landscape windows get the
+    /// vertical (right-edge) bar, portrait ones the horizontal (bottom) bar.
+    #[test]
+    fn color_scale_orientation_follows_the_panel_shape() {
+        // Every landscape desktop/laptop aspect, and a landscape phone.
+        for (w, h) in [(1920.0, 1080.0), (1920.0, 1200.0), (1280.0, 1024.0), (2340.0, 1080.0)] {
+            assert!(
+                !ColorScaleOrientation::default().resolve(panel(w, h)),
+                "{w}x{h} is landscape: the bar belongs on the right edge"
+            );
+        }
+        // Phone and tablet portrait.
+        for (w, h) in [(1080.0, 2340.0), (1200.0, 1920.0), (1200.0, 1600.0)] {
+            assert!(
+                ColorScaleOrientation::default().resolve(panel(w, h)),
+                "{w}x{h} is portrait: the bar belongs along the bottom"
+            );
+        }
+    }
+
+    /// The decision is sticky inside the band, which is what makes it
+    /// hysteresis rather than a threshold: a panel resized back and forth
+    /// across the middle of the band never flips.
+    #[test]
+    fn color_scale_orientation_is_sticky_inside_the_band() {
+        // Seeded landscape, then resized to well inside the band (h/w = 1.25,
+        // the ratio a 16:10 laptop's two-pane split used to sit at).
+        let mut from_landscape = ColorScaleOrientation::default();
+        assert!(!from_landscape.resolve(panel(1920.0, 1080.0)));
+        assert!(!from_landscape.resolve(panel(960.0, 1200.0)), "1.25 is inside the band");
+        assert!(!from_landscape.resolve(panel(1000.0, 1200.0)), "1.20, exactly the old threshold");
+        assert!(!from_landscape.resolve(panel(1000.0, 1100.0)), "1.10, still inside");
+
+        // Seeded portrait, walked through the identical ratios: it keeps the
+        // *other* answer. Same input, different history — that is hysteresis.
+        let mut from_portrait = ColorScaleOrientation::default();
+        assert!(from_portrait.resolve(panel(1080.0, 2340.0)));
+        assert!(from_portrait.resolve(panel(960.0, 1200.0)));
+        assert!(from_portrait.resolve(panel(1000.0, 1200.0)));
+        assert!(from_portrait.resolve(panel(1000.0, 1100.0)));
+
+        // Only leaving the band flips it, in either direction.
+        assert!(from_landscape.resolve(panel(1000.0, 1400.0)), "1.40 is clearly portrait");
+        assert!(!from_portrait.resolve(panel(1000.0, 1000.0)), "1.00 is clearly not portrait");
+    }
+
+    /// A panel that has not been laid out yet must not seed the memory.
+    ///
+    /// Both degenerate rects give a NaN ratio, which compares false against
+    /// everything — so without the guard they quietly record "vertical", and
+    /// the first *real* panel is then judged against the band's far edge
+    /// instead of the seed ratio. The panel below is deliberately inside the
+    /// band, where that difference shows.
+    #[test]
+    fn color_scale_orientation_ignores_a_degenerate_panel() {
+        for degenerate in [egui::Rect::ZERO, egui::Rect::NOTHING] {
+            let mut orientation = ColorScaleOrientation::default();
+            assert!(!orientation.resolve(degenerate));
+            assert!(
+                orientation.resolve(panel(960.0, 1200.0)),
+                "the first real panel must still be free to seed, even at 1.25 \
+                 where only the seed ratio (not the band edge) says portrait"
+            );
+        }
+    }
 
     fn ts(minute: u32) -> NaiveDateTime {
         chrono::NaiveDate::from_ymd_opt(2024, 1, 1)

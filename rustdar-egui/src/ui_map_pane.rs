@@ -28,6 +28,10 @@ pub(super) struct PaneRenderCtx<'a> {
     pub label_tiles: &'a mut Option<HttpTiles>,
     pub actions: &'a mut Vec<GuiAction>,
     pub pane_rect: egui::Rect,
+    /// Whether this frame's color scale bars run along the bottom edge
+    /// (`true`) or the right edge (`false`). Resolved once for the whole map
+    /// panel by `ColorScaleOrientation`, so every pane agrees.
+    pub horizontal_color_scale: bool,
     pub pointer_available: bool,
     pub excluded_rects: Vec<egui::Rect>,
     /// On Android, the screen position of an active long-press (for radar value tooltip).
@@ -165,8 +169,20 @@ pub(super) fn render_pane_map_content(
                     let mut fg_painter = ui.ctx().layer_painter(fg_layer);
                     fg_painter.set_clip_rect(ctx.pane_rect);
                     let pane_rect = ui.max_rect();
-                    render_color_scale(&fg_painter, pane_rect, ctx.pane, ctx.preferences);
-                    render_overlay_color_scales(&fg_painter, pane_rect, ctx.pane, ctx.overlays);
+                    render_color_scale(
+                        &fg_painter,
+                        pane_rect,
+                        ctx.horizontal_color_scale,
+                        ctx.pane,
+                        ctx.preferences,
+                    );
+                    render_overlay_color_scales(
+                        &fg_painter,
+                        pane_rect,
+                        ctx.horizontal_color_scale,
+                        ctx.pane,
+                        ctx.overlays,
+                    );
                 }
                 // All other overlays dispatched by render mode
                 _ => {
@@ -700,33 +716,16 @@ fn draw_shadowed_text(
     );
 }
 
-/// How much taller than wide a pane must be for its color scales to switch to
-/// the horizontal (bottom) orientation.
-///
-/// A bare `height > width` test flips as a divider is dragged through square,
-/// and a 2-pane split of a 16:9 window lands right there (~960x1000), so the
-/// bars would hop between the bottom and right edges mid-drag. Requiring a
-/// clearly portrait pane keeps the common layouts well clear of the boundary:
-/// a phone pane is ~2.0, and panes of any grid on a landscape window are <= 1.0.
-const PORTRAIT_SCALE_RATIO: f32 = 1.2;
-
-/// Whether a pane's color scale bars should be horizontal (along the bottom)
-/// rather than vertical (along the right edge).
-///
-/// This is keyed on the pane's aspect ratio, not on the platform: panes are
-/// laid out in a grid, so a desktop window can produce portrait panes and a
-/// tablet/landscape phone can produce landscape ones. A portrait pane gets the
-/// bottom bar (what a phone has always shown), anything else the right-hand bar
-/// (what desktop has always shown), so the common single-pane case on each
-/// platform is unchanged.
-fn horizontal_color_scale(pane_rect: egui::Rect) -> bool {
-    pane_rect.height() > pane_rect.width() * PORTRAIT_SCALE_RATIO
-}
-
 /// Render the color scale legend bar for the current pane's radar product.
+///
+/// `horizontal` is the panel-wide orientation resolved by
+/// `pane::ColorScaleOrientation` — deliberately *not* recomputed from
+/// `pane_rect` here, so that every pane in the grid draws its bars on the same
+/// edge and dragging a divider cannot flip them.
 fn render_color_scale(
     painter: &egui::Painter,
     pane_rect: egui::Rect,
+    horizontal: bool,
     pane: &PaneState,
     prefs: &UserPreferences,
 ) {
@@ -736,14 +735,11 @@ fn render_color_scale(
         return;
     }
 
-    // Orientation follows the pane's shape, not the platform (a pane in a
-    // multi-pane grid can be any shape on any target): a portrait pane gets a
-    // horizontal bar along the bottom, a landscape pane a vertical bar on the
-    // right. Either way the bar spans the pane's *shorter* axis and its 20px
-    // thickness eats into the longer one, so it obscures as little map as
-    // possible. See `horizontal_color_scale()`.
-    let horizontal = horizontal_color_scale(pane_rect);
-
+    // Orientation follows the map panel's shape, not the platform (a grid can
+    // be any shape on any target): a portrait panel gets horizontal bars along
+    // the bottom, a landscape one vertical bars on the right, so the bar spans
+    // the shorter axis and its 20px thickness eats into the longer one.
+    // See `pane::ColorScaleOrientation`.
     let bar_length = if horizontal {
         pane_rect.width() - SCALE_MARGIN * 2.0
     } else {
@@ -906,13 +902,11 @@ fn render_color_scale(
 fn render_overlay_color_scales(
     painter: &egui::Painter,
     pane_rect: egui::Rect,
+    // Same panel-wide orientation as the radar color scale.
+    horizontal: bool,
     pane: &PaneState,
     overlays: &OverlayRegistry,
 ) {
-
-    // Same geometry-keyed orientation as the radar color scale.
-    let horizontal = horizontal_color_scale(pane_rect);
-
     // Offset each overlay legend to the left of (vertical) or above
     // (horizontal) the radar scale.
     let mut bar_offset = 0;

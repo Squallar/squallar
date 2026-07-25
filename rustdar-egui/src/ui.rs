@@ -4,7 +4,9 @@ use rustdar_overlays::render::controls::{ControlEffect, ControlItem, ControlUpda
 const DEFAULT_INITIAL_ZOOM: f64 = 7.0;
 
 use rustdar_overlays::render::overlay_state::{OverlayRegistry, OverlayKind};
-use crate::pane::{PaneId, PaneLayout, PaneState, MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
+use crate::pane::{
+    ColorScaleOrientation, PaneId, PaneLayout, PaneState, MAX_PANES_DESKTOP, MAX_PANES_MOBILE,
+};
 use crate::tiles::MapTileState;
 use chrono::Timelike;
 use egui::Context;
@@ -116,6 +118,9 @@ pub struct Gui {
     panes: Vec<PaneState>,
     active_pane: PaneId,
     pane_layout: PaneLayout,
+    /// Remembered color-scale bar orientation for the map panel (hysteresis, so
+    /// a resize near the boundary cannot make the bars hop).
+    color_scale_orientation: ColorScaleOrientation,
     viewport_sync: bool,
     sync_layers: bool,
     // --- Radar loop settings ---
@@ -271,6 +276,7 @@ impl Gui {
             panes: vec![PaneState::new()],
             active_pane: 0,
             pane_layout: PaneLayout::default(),
+            color_scale_orientation: ColorScaleOrientation::default(),
             viewport_sync: true,
             sync_layers: true,
             loop_lookback_secs: 3600, // default 1 hour
