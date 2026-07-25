@@ -17,6 +17,14 @@ impl super::Gui {
         let mut actions = Vec::new();
         let ctx = ui.ctx().clone();
 
+        // What the map was *handed*, so a test can check the chrome's rects
+        // actually arrive here. They reach every click handler from
+        // `PaneRenderCtx::excluded_rects` below.
+        #[cfg(test)]
+        {
+            self.last_map_excluded_rects = excluded_rects.to_vec();
+        }
+
         // Detect current theme from egui context
         let is_dark_theme = ctx.global_style().visuals.dark_mode;
 

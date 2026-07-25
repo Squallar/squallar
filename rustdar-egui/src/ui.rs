@@ -137,6 +137,16 @@ pub struct Gui {
     /// `Gui::ui` would assert on a replica.
     #[cfg(test)]
     last_pane_pointers: Vec<crate::ui_input::PanePointerProbe>,
+    /// The pane counts the picker offered on the last frame. Only read by
+    /// tests, which check the *picker* narrows on a phone while the config
+    /// clamp does not.
+    #[cfg(test)]
+    last_pane_options: Vec<usize>,
+    /// The excluded rects `render_map` was actually handed. Only read by tests,
+    /// which check the chrome's rects reach the map's click filter rather than
+    /// stopping at the call site.
+    #[cfg(test)]
+    last_map_excluded_rects: Vec<egui::Rect>,
     viewport_sync: bool,
     sync_layers: bool,
     // --- Radar loop settings ---
@@ -311,6 +321,10 @@ impl Gui {
             last_menu_leaves: Vec::new(),
             #[cfg(test)]
             last_pane_pointers: Vec::new(),
+            #[cfg(test)]
+            last_pane_options: Vec::new(),
+            #[cfg(test)]
+            last_map_excluded_rects: Vec::new(),
             viewport_sync: true,
             sync_layers: true,
             loop_lookback_secs: 3600, // default 1 hour
@@ -555,6 +569,12 @@ impl Gui {
         pane: &mut PaneState,
     ) {
         let max_panes = self.layout.width.max_panes();
+        // The options really offered, reported rather than recomputed by a
+        // test from the same width class it is checking.
+        #[cfg(test)]
+        {
+            self.last_pane_options = (1..=max_panes).collect();
+        }
         ui.horizontal(|ui| {
             ui.label("Panes:");
             for count in 1..=max_panes {
@@ -730,18 +750,22 @@ impl Gui {
             ui.label("Step:");
             // Prefixed like the rest. It used to be bare, which was only safe
             // because the desktop and mobile panels could never both exist.
-            #[cfg(test)]
-            probes.push((
-                "time_step_sel",
-                ui.make_persistent_id(format!("{id_prefix}time_step_sel")),
-            ));
-            egui::ComboBox::from_id_salt(format!("{id_prefix}time_step_sel"))
+            let combo = egui::ComboBox::from_id_salt(format!("{id_prefix}time_step_sel"))
                 .selected_text(step_label)
                 .show_ui(ui, |ui| {
                     for &(secs, label) in Self::TIME_STEP_OPTIONS {
                         ui.selectable_value(&mut pane.time_step_secs, secs, label);
                     }
                 });
+            // Report the id the combo box really resolved, rather than building
+            // a second one from the same format string: the two could disagree
+            // silently, and a test comparing reconstructions either side of a
+            // resize would then prove nothing about the state egui actually
+            // keyed on. `layers_scroll` does the same.
+            #[cfg(test)]
+            probes.push(("time_step_sel", combo.response.id));
+            #[cfg(not(test))]
+            let _ = combo;
         });
 
         // Navigation buttons
@@ -1216,6 +1240,18 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn pane_pointers_for_test(&self) -> &[crate::ui_input::PanePointerProbe] {
         &self.last_pane_pointers
+    }
+
+    /// The pane counts the picker offered on the last frame.
+    #[cfg(test)]
+    pub(crate) fn pane_options_for_test(&self) -> &[usize] {
+        &self.last_pane_options
+    }
+
+    /// The excluded rects `render_map` was handed on the last frame.
+    #[cfg(test)]
+    pub(crate) fn map_excluded_rects_for_test(&self) -> &[egui::Rect] {
+        &self.last_map_excluded_rects
     }
 
     /// Open or close the layers drawer, as the hamburger does.

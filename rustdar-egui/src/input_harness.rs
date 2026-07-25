@@ -195,6 +195,17 @@ impl InputHarness {
         self.warm_up();
     }
 
+    /// Whether egui has a real widget registered under `id` from the last
+    /// frame.
+    ///
+    /// This is what stops an id probe from shadowing: a probe that reported a
+    /// constant, or an id rebuilt from a format string the widget no longer
+    /// uses, compares equal to itself across a resize and pins nothing. If
+    /// egui knows the id, the widget really is keyed on it.
+    pub(crate) fn widget_exists(&self, id: egui::Id) -> bool {
+        self.ctx.read_response(id).is_some()
+    }
+
     /// The scroll offset egui has stored under `id`, if any.
     ///
     /// Reading it back through the *probed* id is what makes the breakpoint
@@ -235,6 +246,16 @@ impl InputHarness {
     /// checkbox claims to be showing.
     pub(crate) fn overlay_enabled(&self, kind: OverlayKind) -> bool {
         self.gui.active_pane().is_overlay_enabled(kind)
+    }
+
+    /// The pane counts the picker offered on the last frame.
+    pub(crate) fn pane_options(&self) -> Vec<usize> {
+        self.gui.pane_options_for_test().to_vec()
+    }
+
+    /// The excluded rects `render_map` was actually handed on the last frame.
+    pub(crate) fn map_excluded_rects(&self) -> Vec<egui::Rect> {
+        self.gui.map_excluded_rects_for_test().to_vec()
     }
 
     /// Every rect painted during the last frame, in paint order.
@@ -1721,6 +1742,21 @@ mod tests {
              compares two empty lists and passes for free"
         );
 
+        // Every probed id must be one egui actually knows. Without this a
+        // probe reporting a constant — or an id rebuilt from a format string
+        // the widget itself no longer uses — would compare equal to itself on
+        // both sides of the resize and prove nothing at all.
+        let combo_id = expanded
+            .iter()
+            .find(|(name, _)| *name == "time_step_sel")
+            .expect("precondition: the time step combo must report an id")
+            .1;
+        assert!(
+            h.widget_exists(combo_id),
+            "the time_step_sel probe reported an id egui has no widget for, so \
+             it is a reconstruction rather than the combo box's own"
+        );
+
         // Put real egui state behind one of those ids, so the comparison below
         // is backed by something that would visibly be lost. Reading it through
         // the probed id also pins that the panel really does key its scroll
@@ -1807,11 +1843,35 @@ mod tests {
              reconstructed rather than reported"
         );
 
+        // The chrome reporting a rect is only half of it: the map has to be
+        // handed it. `render_map(&mut root_ui, &[])` leaves every assertion
+        // above true and the button transparent to clicks.
+        assert_eq!(
+            h.map_excluded_rects(),
+            rects,
+            "the chrome's rects never reached render_map, so nothing downstream \
+             can exclude the button from a map click"
+        );
+
+        // ...and the button is on a layer above the map, which is the *other*
+        // half of `is_pos_blocked`. Each half masks the other: with only one
+        // mutated the tap is still caught, and with both it falls through to
+        // the map. So each is claimed separately.
+        assert!(
+            h.is_floating_layer_at(button.center()),
+            "the hamburger dropped to a background layer: `is_pos_blocked`'s \
+             layer check no longer sees it"
+        );
+
         // With the drawer open the button is gone, and so is its exclusion.
         h.set_drawer_open(true);
         assert!(
             h.excluded_rects().is_empty(),
             "an open drawer replaces the button, so nothing should be excluded"
+        );
+        assert!(
+            h.map_excluded_rects().is_empty(),
+            "and the map must be told so too"
         );
     }
 
@@ -2090,6 +2150,53 @@ mod tests {
             !h.overlay_enabled(OverlayKind::RadarSites),
             "the menu bar's toggle never reached apply_menu_event, or was \
              reverted by the layers panel on a later frame"
+        );
+    }
+
+    /// 22. **The pane picker narrows on a phone; the config clamp does not.**
+    ///
+    ///     The two limits are deliberately different, and each has to be read
+    ///     by the right code. `WidthClass::max_panes()`'s *values* were already
+    ///     pinned as constants, but nothing checked the picker consulted the
+    ///     width class at all — offering the desktop range on a 420pt screen
+    ///     survived the whole suite. The complementary half, that a wide layout
+    ///     survives being loaded on a phone, is pinned in `ui_config.rs`.
+    #[test]
+    fn the_pane_picker_offers_fewer_panes_on_a_phone_than_on_a_desktop() {
+        use crate::pane::{MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
+
+        let mut compact = InputHarness::with_screen(egui::vec2(420.0, 1200.0));
+        compact.set_drawer_open(true);
+        assert_eq!(
+            compact.width_class(),
+            crate::ui_layout::WidthClass::Compact,
+            "precondition"
+        );
+        assert_eq!(
+            compact.pane_options(),
+            (1..=MAX_PANES_MOBILE).collect::<Vec<_>>(),
+            "the picker offered the desktop range on a phone"
+        );
+
+        let expanded = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        assert_eq!(
+            expanded.width_class(),
+            crate::ui_layout::WidthClass::Expanded,
+            "precondition"
+        );
+        assert_eq!(
+            expanded.pane_options(),
+            (1..=MAX_PANES_DESKTOP).collect::<Vec<_>>(),
+            "the picker narrowed a desktop to the phone range"
+        );
+
+        // Compared as *rendered* ranges rather than as the two constants, which
+        // clippy would fold to `true` — and a precondition that is true by
+        // construction is not one.
+        assert!(
+            compact.pane_options().len() < expanded.pane_options().len(),
+            "precondition: the two ranges must differ, or both assertions above \
+             are satisfied by one constant"
         );
     }
 

@@ -320,6 +320,55 @@ mod tests {
         assert!(!restored.viewport_sync);
     }
 
+    /// A pane layout wider than a phone offers survives the round trip.
+    ///
+    /// This is the data-loss bug the clamp exists to prevent, asserted at the
+    /// call site rather than on the constant. `max_panes_absolute()`'s *value*
+    /// was already pinned in `ui_layout`, but nothing checked that
+    /// `load_ui_config` used it: reverting the clamp to
+    /// `WidthClass::Compact.max_panes()` — the precise regression — passed the
+    /// whole suite. A 6-pane desktop layout opened once on a phone came back as
+    /// 4 and was written back as 4 on the next save.
+    #[test]
+    fn a_pane_layout_wider_than_a_phone_offers_survives_the_round_trip() {
+        use crate::pane::{MAX_PANES_DESKTOP, MAX_PANES_MOBILE};
+        use crate::ui_layout::WidthClass;
+
+        assert!(
+            MAX_PANES_DESKTOP > WidthClass::Compact.max_panes(),
+            "precondition: the saved layout must be wider than a compact screen \
+             would offer, or the clamp under test is never reached"
+        );
+
+        let store = MemoryConfigStore::default();
+        let mut gui = crate::Gui::new();
+        gui.set_pane_count_for_test(MAX_PANES_DESKTOP);
+        gui.save_ui_config(&store);
+
+        let mut restored = crate::Gui::new();
+        restored.load_ui_config(&store);
+        assert_eq!(
+            restored.pane_count(),
+            MAX_PANES_DESKTOP,
+            "the config was clamped to the current device's limit, so the \
+             user's layout is gone and the next save writes the truncated one"
+        );
+
+        // Saving it again must not quietly narrow it either — the round trip
+        // is what turns a one-off clamp into permanent data loss.
+        let second = MemoryConfigStore::default();
+        restored.save_ui_config(&second);
+        let mut again = crate::Gui::new();
+        again.load_ui_config(&second);
+        assert_eq!(again.pane_count(), MAX_PANES_DESKTOP);
+
+        assert_ne!(
+            MAX_PANES_DESKTOP, MAX_PANES_MOBILE,
+            "precondition: the two limits must differ, or nothing above can \
+             tell a correct clamp from the broken one"
+        );
+    }
+
     /// Loading from a store with nothing in it must leave the defaults alone
     /// rather than zeroing them — this is every first run.
     #[test]
