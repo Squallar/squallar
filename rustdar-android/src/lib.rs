@@ -594,7 +594,9 @@ fn android_main(app: AndroidApp) {
         .expect("Failed to create event loop");
 
     // Create and run the platform app
-    let mut platform_app = rustdar_platform_lib::app::App::new();
+    let mut platform_app = rustdar_platform_lib::app::App::new(Box::new(
+        rustdar_platform_lib::platform::create_platform(),
+    ));
 
     // Wire up Android back button to minimize instead of exit
     platform_app.set_back_handler(move_task_to_back);

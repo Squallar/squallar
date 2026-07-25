@@ -14,7 +14,7 @@ use crate::channels::ChannelHub;
 use crate::constants::*;
 use crate::input::InputHandler;
 use crate::loop_downloads::LoopDownloadManager;
-use crate::platform::{self, PlatformBridge};
+use crate::platform::PlatformBridge;
 use crate::render_dispatch::RenderDispatcher;
 use rustdar_egui::{
     Gui,
@@ -71,21 +71,21 @@ pub struct App {
     manual_nav_pending: bool,
 }
 
-impl Default for App {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl App {
-    pub fn new() -> Self {
+    /// Build the application around a caller-supplied platform bridge.
+    ///
+    /// The bridge is injected rather than constructed here so that this type
+    /// stays free of any per-OS code: the concrete [`PlatformBridge`] impls
+    /// live alongside their entry points, and only the entry point knows which
+    /// one to build. Without that inversion the app layer and the platform
+    /// layer would have to depend on each other.
+    pub fn new(platform: Box<dyn PlatformBridge>) -> Self {
         let instance = egui_wgpu::wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let input = InputHandler::new();
         let channels = ChannelHub::new();
         // Owns the single shared render-budget counter used by both the loop and
         // static pane render paths (see `RenderDispatcher::renders_in_flight`).
         let render = RenderDispatcher::new();
-        let platform = Box::new(platform::create_platform());
 
         let tokio_runtime = tokio::runtime::Runtime::new()
             .expect("Failed to create Tokio runtime");

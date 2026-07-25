@@ -37,7 +37,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Starting rustdar-platform (native)");
 
     let event_loop = create_event_loop();
-    let mut app = crate::app::App::new();
+    let mut app = crate::app::App::new(Box::new(crate::platform::create_platform()));
     event_loop
         .run_app(&mut app)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
