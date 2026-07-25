@@ -7,7 +7,27 @@ use std::f64::consts::PI;
 use crate::sites::RadarSite;
 use crate::sites::get_radar_site;
 
-pub const IMAGE_SIZE: usize = 2048; // 2048x2048 pixels for radar image
+/// Side length, in pixels, of the square radar image every render produces.
+///
+/// Sets the cost of a radar frame. An RGBA texture is `IMAGE_SIZE² × 4` bytes;
+/// a *static* pane render keeps an `f32` value grid alongside it for hover
+/// readout, doubling that, while loop frames carry the texture alone.
+///
+/// | target  | IMAGE_SIZE | texture | + value grid |
+/// |---------|-----------:|--------:|-------------:|
+/// | desktop |       2048 |  16 MiB |       32 MiB |
+/// | android |       2048 |  16 MiB |       32 MiB |
+/// | wasm32  |       1024 |   4 MiB |        8 MiB |
+///
+/// wasm32 halves the side because the whole linear memory is capped at 4 GiB and
+/// WebGL2 only guarantees `max_texture_dimension_2d == 2048` — at 2048² a radar
+/// frame sits exactly on the limit, leaving nothing spare for the overlay
+/// textures that have to coexist with it.
+#[cfg(target_arch = "wasm32")]
+pub const IMAGE_SIZE: usize = 1024;
+#[cfg(not(target_arch = "wasm32"))]
+pub const IMAGE_SIZE: usize = 2048;
+
 pub const MAX_RANGE_KM: f64 = 230.0; // NEXRAD max range ~230km
 pub const PIXELS_PER_KM: f64 = IMAGE_SIZE as f64 / (2.0 * MAX_RANGE_KM);
 /// Mean radius of Earth in kilometers.
