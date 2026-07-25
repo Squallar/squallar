@@ -702,14 +702,29 @@ mod tests {
         assert_eq!(page.next_token, None);
     }
 
-    /// The document's own `<Prefix>` and `<Name>` are not objects.
+    /// A `<Key>` is only an object when it sits inside `<Contents>`.
     ///
-    /// A parser that captured every `<Key>`-adjacent text node, or that read
-    /// `Key` outside `Contents`, would inflate the listing with metadata.
+    /// The fixture plants one in an `<Error>` block and adds a
+    /// `<CommonPrefixes>` entry, because a plain `ListBucketResult` contains no
+    /// stray `<Key>` at all -- a test using the unmodified fixture would assert
+    /// the guard while proving only that the fixture has nothing to guard
+    /// against. Without `if in_contents` the phantom key is returned as a
+    /// volume and `crate::scan` tries to download it.
     #[test]
-    fn parse_list_page_ignores_document_level_elements() {
-        let page = parse_list_page(&listing(&["a/b/c/d/one"], None)).expect("parses");
-        assert_eq!(page.keys.len(), 1, "picked up a non-Contents element");
+    fn parse_list_page_only_takes_keys_inside_contents() {
+        let doc = listing(&["a/b/c/d/real"], None).replacen(
+            "<Contents>",
+            "<CommonPrefixes><Prefix>2024/05/20/KTLX/</Prefix></CommonPrefixes>\
+             <Error><Code>NoSuchKey</Code><Key>a/b/c/d/phantom</Key></Error>\
+             <Contents>",
+            1,
+        );
+        let page = parse_list_page(&doc).expect("parses");
+        assert_eq!(
+            page.keys,
+            vec!["a/b/c/d/real"],
+            "captured a Key from outside Contents"
+        );
     }
 
     /// An empty listing is an empty result, not an error.
@@ -861,6 +876,106 @@ mod tests {
         let err = keys.expect_err("a failed page must not be reported as the end of the listing");
         assert!(matches!(err, ArchiveError::Status { .. }), "{err:?}");
         assert_eq!(urls.len(), 2);
+    }
+
+    // -- response handling --------------------------------------------------
+    //
+    // `classify` is a pure function and is covered above, but nothing there
+    // proves `get_text` still *consults* it. These drive the real reqwest path
+    // against a one-shot loopback server: hermetic (port 0 on 127.0.0.1, one
+    // connection, no external network) but a genuine HTTP round trip.
+
+    /// Serve exactly one canned HTTP response and return the URL to hit.
+    fn serve_once(response: String) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut scratch = [0u8; 4096];
+                let _ = stream.read(&mut scratch);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}/")
+    }
+
+    fn http_response(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/xml\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A cleartext-capable client.
+    ///
+    /// [`super::client`] sets `https_only`, which these loopback URLs cannot
+    /// satisfy. `tls::init()` is still required: with `rustls-no-provider` and
+    /// `aws-lc-rs` out of the graph, `build()` panics without a provider
+    /// regardless of the scheme actually used.
+    fn loopback_client() -> reqwest::Client {
+        crate::tls::init();
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client")
+    }
+
+    /// A `200` yields the body.
+    ///
+    /// The counterweight to the two below: without it, a `get_text` that
+    /// errored on everything would satisfy them both.
+    #[tokio::test]
+    async fn get_text_returns_the_body_on_200() {
+        let url = serve_once(http_response("200 OK", "<ListBucketResult/>"));
+        let body = get_text(&loopback_client(), url)
+            .await
+            .expect("200 should yield a body");
+        assert_eq!(body, "<ListBucketResult/>");
+    }
+
+    /// A `503` is an error, not an empty listing.
+    ///
+    /// This is the upstream bug in its original form: `nexrad-data` never
+    /// looked at the status, so a throttled or broken S3 handed its `<Error>`
+    /// document to the XML parser, which found no `<Contents>` and returned
+    /// zero objects. `crate::scan::list_files_with_fallback` reads zero objects
+    /// as "nothing recorded for this date", rolls back a day, gets the same
+    /// answer and reports no data available -- an outage shown to the user as
+    /// an absence of weather.
+    #[tokio::test]
+    async fn get_text_reports_a_server_error_instead_of_an_empty_listing() {
+        let url = serve_once(http_response(
+            "503 Service Unavailable",
+            "<Error><Code>SlowDown</Code></Error>",
+        ));
+        let err = get_text(&loopback_client(), url)
+            .await
+            .expect_err("a 503 body must not be returned as a listing");
+        match err {
+            ArchiveError::Status { status, .. } => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    /// A `404` is reported as an absence, distinctly from other failures.
+    #[tokio::test]
+    async fn get_text_reports_a_404_as_not_found() {
+        let url = serve_once(http_response(
+            "404 Not Found",
+            "<Error><Code>NoSuchKey</Code></Error>",
+        ));
+        let err = get_text(&loopback_client(), url)
+            .await
+            .expect_err("a 404 must not be returned as a body");
+        assert!(
+            matches!(err, ArchiveError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
     }
 
     // -- live ---------------------------------------------------------------
