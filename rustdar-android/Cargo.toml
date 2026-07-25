@@ -52,5 +52,5 @@ ndk-context = { workspace = true }
 # Its Kotlin half ships as an AAR inside the `rustls-platform-verifier-android`
 # crate's registry checkout; `android/app/build.gradle.kts` locates that via
 # `cargo metadata` and adds it as a Maven repo.
-rustls-platform-verifier = "=0.6.2"
+rustls-platform-verifier = "=0.7.0"
 rustdar-gps = { workspace = true, features = ["serial"] }
