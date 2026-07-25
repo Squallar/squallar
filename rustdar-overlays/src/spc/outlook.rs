@@ -1,7 +1,6 @@
 use chrono::NaiveDateTime;
 use crate::types::{GeoPolygon, HatchPattern, OverlayFeature, CIG_FILL_ALPHA, REGULAR_FILL_ALPHA};
 
-/// Which outlook day to request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum OutlookDay {
     Day1,
@@ -15,7 +14,6 @@ pub enum OutlookDay {
 }
 
 impl OutlookDay {
-    /// Returns all outlook day variants.
     pub fn all() -> &'static [OutlookDay] {
         &[
             OutlookDay::Day1,
@@ -29,7 +27,6 @@ impl OutlookDay {
         ]
     }
 
-    /// Short label ("1", "2", … "8") for UI display.
     pub fn label(self) -> &'static str {
         match self {
             OutlookDay::Day1 => "1",
@@ -43,7 +40,6 @@ impl OutlookDay {
         }
     }
 
-    /// Returns the available outlook products for this day.
     pub fn products(self) -> &'static [OutlookProduct] {
         match self {
             OutlookDay::Day1 | OutlookDay::Day2 => &[
@@ -60,7 +56,7 @@ impl OutlookDay {
         }
     }
 
-    /// Whether this is an extended-range day (4-8).
+    /// Days 4-8: a separate endpoint with one product. See [`outlook_url`].
     pub fn is_extended(self) -> bool {
         matches!(
             self,
@@ -88,7 +84,6 @@ impl std::fmt::Display for OutlookDay {
     }
 }
 
-/// Which outlook product to request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum OutlookProduct {
     Categorical,
@@ -111,7 +106,6 @@ impl std::fmt::Display for OutlookProduct {
     }
 }
 
-/// A parsed SPC convective outlook.
 #[derive(Debug, Clone)]
 pub struct SpcOutlook {
     pub day: OutlookDay,
@@ -121,20 +115,16 @@ pub struct SpcOutlook {
     pub features: Vec<OverlayFeature>,
 }
 
-/// Build the SPC GeoJSON URL for the given day and product.
-///
-/// The origin comes from
-/// [`DataSources::spc_base`](rustdar_radar::sources::DataSources::spc_base)
-/// rather than a literal, so SPC is covered by the same origin table as every
-/// other feed — including the check that no production URL points at an origin
-/// the browser cannot reach.
+/// Origin must come from
+/// [`DataSources::spc_base`](rustdar_radar::sources::DataSources::spc_base),
+/// never a literal, or SPC escapes the origin table's browser-reachability check.
 pub fn outlook_url(
     sources: &rustdar_radar::sources::DataSources,
     day: OutlookDay,
     product: OutlookProduct,
 ) -> String {
     let base = &sources.spc_base;
-    // Days 4-8 use a separate extended-range endpoint
+    // Days 4-8 live under a separate extended-range path.
     if day.is_extended() {
         let n = match day {
             OutlookDay::Day4 => 4,
@@ -159,7 +149,7 @@ pub fn outlook_url(
         (OutlookDay::Day1 | OutlookDay::Day2, OutlookProduct::Tornado) => "_torn",
         (OutlookDay::Day1 | OutlookDay::Day2, OutlookProduct::Wind) => "_wind",
         (OutlookDay::Day1 | OutlookDay::Day2, OutlookProduct::Hail) => "_hail",
-        // Day 3 uses combined probabilistic endpoint for all hazard types
+        // Day 3 serves every hazard from the one combined `_prob` endpoint.
         (_, OutlookProduct::Tornado)
         | (_, OutlookProduct::Wind)
         | (_, OutlookProduct::Hail)
@@ -169,29 +159,16 @@ pub fn outlook_url(
     format!("{base}/products/outlook/{day_str}{product_str}.lyr.geojson")
 }
 
-/// Parse an SPC GeoJSON response into an `SpcOutlook`.
-///
-/// The GeoJSON has this structure:
+/// Feed shape — property names and casing are SPC's:
 /// ```json
-/// {
-///   "type": "FeatureCollection",
-///   "features": [
-///     {
-///       "type": "Feature",
-///       "geometry": { "type": "MultiPolygon", "coordinates": [[[[lon, lat], ...]]] },
-///       "properties": {
-///         "LABEL": "SLGT",
-///         "LABEL2": "Slight Risk",
-///         "fill": "#FFE066",
-///         "stroke": "#DDAA00",
-///         "VALID": "202603062000",
-///         "EXPIRE": "202603071200",
-///         ...
-///       }
-///     }
-///   ]
-/// }
+/// { "features": [ {
+///     "geometry": { "type": "MultiPolygon", "coordinates": [[[[lon, lat], ...]]] },
+///     "properties": {
+///       "LABEL": "SLGT", "LABEL2": "Slight Risk",
+///       "fill": "#FFE066", "stroke": "#DDAA00",
+///       "VALID": "202603062000", "EXPIRE": "202603071200" } } ] }
 /// ```
+/// `VALID`/`EXPIRE` are `%Y%m%d%H%M`, no zone marker.
 pub fn parse_geojson(
     json: &serde_json::Value,
     day: OutlookDay,
@@ -229,16 +206,13 @@ pub fn parse_geojson(
     })
 }
 
-/// A parsed outlook feature with its optional validity window.
 struct ParsedOutlookFeature {
     feature: OverlayFeature,
     valid: Option<NaiveDateTime>,
     expire: Option<NaiveDateTime>,
 }
 
-/// Parse a single GeoJSON feature into an `OverlayFeature` with optional timestamps.
-///
-/// Returns `None` for features that should be skipped (empty geometry, unsupported types).
+/// `None` means skip: empty geometry or an unsupported geometry type.
 fn parse_outlook_feature(
     feature_val: &serde_json::Value,
 ) -> Result<Option<ParsedOutlookFeature>, String> {
@@ -268,7 +242,7 @@ fn parse_outlook_feature(
         .and_then(|v| v.as_str())
         .unwrap_or("#000000");
 
-    // Detect CIG hatching pattern from label
+    // Hatching is signalled only by the LABEL text; there is no dedicated field.
     let hatch = match label.as_str() {
         "CIG1" => HatchPattern::Cig1,
         "CIG2" => HatchPattern::Cig2,
@@ -276,7 +250,6 @@ fn parse_outlook_feature(
         _ => HatchPattern::None,
     };
 
-    // CIG areas: use transparent fill + hatching; regular areas: semi-transparent fill
     let fill_alpha = if hatch != HatchPattern::None { CIG_FILL_ALPHA } else { REGULAR_FILL_ALPHA };
     let fill_rgba = super::colors::parse_hex_color(fill_hex, fill_alpha);
     let stroke_rgba = super::colors::parse_hex_color(stroke_hex, 255);
@@ -290,7 +263,6 @@ fn parse_outlook_feature(
         .and_then(|v| v.as_str())
         .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y%m%d%H%M").ok());
 
-    // Parse geometry
     let geometry = feature_val
         .get("geometry")
         .ok_or_else(|| "Feature missing 'geometry'".to_string())?;
@@ -330,8 +302,7 @@ fn parse_outlook_feature(
     Ok(Some(ParsedOutlookFeature { feature, valid, expire }))
 }
 
-/// Parse a GeoJSON MultiPolygon geometry into our polygon type.
-/// GeoJSON coordinates are [longitude, latitude] — we convert to (lat, lon).
+/// GeoJSON is `[lon, lat]`; output is `(lat, lon)`.
 fn parse_multi_polygon(geometry: &serde_json::Value) -> Result<Vec<GeoPolygon>, String> {
     let coords = geometry
         .get("coordinates")
@@ -347,7 +318,6 @@ fn parse_multi_polygon(geometry: &serde_json::Value) -> Result<Vec<GeoPolygon>, 
     Ok(polygons)
 }
 
-/// Parse a GeoJSON Polygon geometry.
 fn parse_polygon(geometry: &serde_json::Value) -> Result<GeoPolygon, String> {
     let coords = geometry
         .get("coordinates")

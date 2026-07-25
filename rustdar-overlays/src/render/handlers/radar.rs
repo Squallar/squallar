@@ -4,12 +4,9 @@ use crate::render::controls::{ControlEffect, ControlItem, ControlUpdate, PaneCon
 use crate::render::overlay_state::{
     FetchPayload,OverlayHandler, OverlayItem, OverlayKind, RenderMode};
 
-/// Handler for the radar image layer.
-///
-/// Currently manages only toggle state. Radar fetching, rendering, and per-frame
-/// decorations (range ring, hover value) remain in `rustdar-platform` and
-/// `rustdar-egui` — this handler serves as the toggle/config owner so that
-/// `LayerManager` can be fully retired.
+/// Toggle and config state only. Radar fetching, rendering and per-frame
+/// decorations live in `rustdar-platform` and `rustdar-egui`; this exists so
+/// radar's toggle lives with every other layer's.
 pub(crate) struct RadarHandler {
     pub enabled: bool,
 }

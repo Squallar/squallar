@@ -1,7 +1,6 @@
 use crate::types::{NWS_FILL_ALPHA, STROKE_ALPHA};
 
-/// Alert color table entry: all keywords must match (case-insensitive),
-/// and the first matching entry wins (most specific entries come first).
+/// All keywords must match; first matching entry wins.
 struct AlertColorEntry {
     keywords: &'static [&'static str],
     r: u8,
@@ -10,21 +9,15 @@ struct AlertColorEntry {
 }
 
 impl AlertColorEntry {
-    /// True if every keyword appears in the already-lowercased event name.
+    /// `lowercased_event` must already be lowercased; keywords are not.
     fn matches(&self, lowercased_event: &str) -> bool {
         self.keywords.iter().all(|kw| lowercased_event.contains(kw))
     }
 }
 
-/// Priority-ordered color table for current NWS alert event names.
-///
-/// Each entry's keywords are matched case-insensitively against the event
-/// name. The first entry where *all* keywords are found wins. More specific
-/// entries (e.g. "tornado" + "warning") must appear before less specific
-/// fallbacks (e.g. "warning" alone).
-///
-/// Every entry here must match at least one real event name in
-/// `event_types.txt`; see `every_live_entry_matches_a_real_event`.
+/// **Order is load-bearing**: specific entries ("tornado" + "warning") must
+/// precede less specific ones ("warning"). Every entry must match a real name
+/// in `event_types.txt` — see `every_live_entry_matches_a_real_event`.
 static ALERT_COLORS: &[AlertColorEntry] = &[
     // ── Warnings (most severe first) ──
     AlertColorEntry { keywords: &["tornado", "warning"],           r: 255, g: 0,   b: 0   }, // Red (reserved)
@@ -69,18 +62,14 @@ static ALERT_COLORS: &[AlertColorEntry] = &[
     AlertColorEntry { keywords: &["special weather statement"],    r: 255, g: 228, b: 181 }, // Moccasin
 ];
 
-/// Retired NWS product names, kept so archived and replayed feeds still render.
+/// Names NWS hazard simplification retired: "Excessive Heat Warning/Watch" →
+/// "Extreme Heat Warning/Watch"; "Wind Chill Warning/Watch/Advisory" →
+/// "Extreme Cold Warning/Watch" and "Cold Weather Advisory". Archives and
+/// third-party mirrors still carry them.
 ///
-/// NWS hazard simplification renamed several products: "Excessive Heat
-/// Warning/Watch" became "Extreme Heat Warning/Watch", and "Wind Chill
-/// Warning/Watch/Advisory" became "Extreme Cold Warning/Watch" and "Cold
-/// Weather Advisory". These names no longer appear in the live feed, but the
-/// alert archives and some third-party mirrors still carry them, so they keep
-/// the same colors as their modern equivalents rather than being deleted.
-///
-/// Consulted only after `ALERT_COLORS` and before the generic fallbacks, so a
-/// retired name can never shadow a live product. Every entry here must match
-/// *no* current event name; see `retired_entries_are_actually_retired`.
+/// Consulted after `ALERT_COLORS` and before the fallbacks, so a retired name
+/// can never shadow a live product. Each must match *no* current event name;
+/// see `retired_entries_are_actually_retired`.
 static RETIRED_ALERT_COLORS: &[AlertColorEntry] = &[
     AlertColorEntry { keywords: &["excessive heat", "warning"],    r: 199, g: 21,  b: 133 }, // = Extreme Heat Warning
     AlertColorEntry { keywords: &["excessive heat", "watch"],      r: 128, g: 0,   b: 0   }, // = Extreme Heat Watch
@@ -89,12 +78,9 @@ static RETIRED_ALERT_COLORS: &[AlertColorEntry] = &[
     AlertColorEntry { keywords: &["wind chill advisory"],          r: 175, g: 238, b: 238 }, // = Cold Weather Advisory
 ];
 
-/// Last-resort colors keyed off the product suffix.
-///
-/// These deliberately avoid the reserved tornado colors. An unrecognised
-/// warning is still painted as something severe, but it must never be
-/// mistakable for a tornado warning — that mistake is exactly what a silent
-/// upstream rename used to cause.
+/// Keyed off the product suffix. Must avoid the reserved tornado colours: an
+/// unrecognised warning still reads as severe, but must never be mistakable
+/// for a tornado warning. A silent upstream rename lands here.
 static FALLBACK_COLORS: &[AlertColorEntry] = &[
     AlertColorEntry { keywords: &["warning"],                      r: 178, g: 34,  b: 34  }, // Firebrick
     AlertColorEntry { keywords: &["watch"],                        r: 240, g: 230, b: 140 }, // Khaki
@@ -102,15 +88,11 @@ static FALLBACK_COLORS: &[AlertColorEntry] = &[
     AlertColorEntry { keywords: &["statement"],                    r: 245, g: 222, b: 179 }, // Wheat
 ];
 
-/// Color for an event name that matched nothing at all.
+/// Reserved for "no styling at all"; no table entry may use it.
 const UNKNOWN_EVENT: (u8, u8, u8) = (200, 200, 200);
 
-/// Map an NWS alert event name to (fill_rgba, stroke_rgba) colors.
-///
-/// Colors follow standard weather display conventions. The event name is
-/// matched case-insensitively against `ALERT_COLORS`, then the retired-name
-/// aliases, then the generic suffix fallbacks; the first entry where all
-/// keywords match wins.
+/// Returns `(fill_rgba, stroke_rgba)`. Tries `ALERT_COLORS`, then the retired
+/// aliases, then the suffix fallbacks; first all-keyword match wins.
 pub fn alert_color(event: &str) -> ([u8; 4], [u8; 4]) {
     let e = event.to_lowercase();
     for entry in ALERT_COLORS
@@ -126,7 +108,6 @@ pub fn alert_color(event: &str) -> ([u8; 4], [u8; 4]) {
     rgb(r, g, b)
 }
 
-/// Helper: produce (fill_rgba, stroke_rgba) from an RGB triple.
 fn rgb(r: u8, g: u8, b: u8) -> ([u8; 4], [u8; 4]) {
     ([r, g, b, NWS_FILL_ALPHA], [r, g, b, STROKE_ALPHA])
 }
@@ -135,20 +116,15 @@ fn rgb(r: u8, g: u8, b: u8) -> ([u8; 4], [u8; 4]) {
 mod tests {
     use super::*;
 
-    /// Real NWS event names, captured from `api.weather.gov`. See the header of
-    /// `event_types.txt` for provenance and refresh instructions.
+    /// Real event names captured from `api.weather.gov`; provenance and refresh
+    /// instructions are in the file's own header.
     const EVENT_TYPES_FIXTURE: &str = include_str!("event_types.txt");
 
-    /// Colors reserved for the single most urgent product in their tier.
-    ///
-    /// Nothing else may render as these values: an operator glancing at the map
-    /// has to be able to trust that pure red means a tornado is on the ground.
-    /// `only_tornado_warning_is_pure_red` enforces this across every real event
-    /// name in the fixture.
+    /// Reserved: nothing else may render as these. Pure red must mean a tornado
+    /// is on the ground.
     const TORNADO_WARNING_RED: (u8, u8, u8) = (255, 0, 0);
     const TORNADO_WATCH_YELLOW: (u8, u8, u8) = (255, 255, 0);
 
-    /// The checked-in sample of real NWS event names.
     fn sample_events() -> Vec<&'static str> {
         EVENT_TYPES_FIXTURE
             .lines()
@@ -157,7 +133,6 @@ mod tests {
             .collect()
     }
 
-    /// Just the RGB triple, dropping the alpha channel.
     fn rgb_of(event: &str) -> (u8, u8, u8) {
         let (fill, _) = alert_color(event);
         (fill[0], fill[1], fill[2])
@@ -165,8 +140,8 @@ mod tests {
 
     #[test]
     fn fixture_is_populated() {
-        // Guards the tests below: an empty or mis-parsed fixture would make
-        // every "for each real event" assertion vacuously pass.
+        // An empty or mis-parsed fixture makes every "for each real event"
+        // assertion below pass vacuously.
         let events = sample_events();
         assert!(
             events.len() > 100,
@@ -200,10 +175,8 @@ mod tests {
 
     #[test]
     fn extreme_heat_is_not_tornado_coloured() {
-        // NWS retired "Excessive Heat Warning/Watch" in favour of "Extreme
-        // Heat Warning/Watch". While the table still keyed off the retired
-        // name, these fell through to the generic suffix rows and were painted
-        // byte-identically to a tornado warning and tornado watch.
+        // Keyed off the retired "Excessive Heat" name, these fell through to
+        // the suffix rows and painted byte-identically to tornado red/yellow.
         assert_eq!(rgb_of("Extreme Heat Warning"), (199, 21, 133));
         assert_eq!(rgb_of("Extreme Heat Watch"), (128, 0, 0));
         assert_ne!(rgb_of("Extreme Heat Warning"), TORNADO_WARNING_RED);
@@ -212,8 +185,7 @@ mod tests {
 
     #[test]
     fn extreme_cold_is_not_tornado_coloured() {
-        // Same rename, same failure mode: "Wind Chill Warning/Watch" became
-        // "Extreme Cold Warning/Watch" and "Cold Weather Advisory".
+        // Same failure mode via the "Wind Chill" rename.
         assert_eq!(rgb_of("Extreme Cold Warning"), (176, 196, 222));
         assert_eq!(rgb_of("Extreme Cold Watch"), (95, 158, 160));
         assert_eq!(rgb_of("Cold Weather Advisory"), (175, 238, 238));
@@ -223,18 +195,15 @@ mod tests {
 
     #[test]
     fn red_flag_warning_has_its_own_colour() {
-        // The fire-weather warning product is named "Red Flag Warning"; it
-        // contains neither "fire" nor any other specific keyword, so it used
-        // to land on the generic red row.
+        // "Red Flag Warning" contains no specific keyword — not even "fire" —
+        // so it used to land on the generic red row.
         assert_eq!(rgb_of("Red Flag Warning"), (210, 105, 30));
         assert_ne!(rgb_of("Red Flag Warning"), TORNADO_WARNING_RED);
-        // Its watch-tier counterpart keeps a distinct colour.
         assert_ne!(rgb_of("Red Flag Warning"), rgb_of("Fire Weather Watch"));
     }
 
     #[test]
     fn retired_names_still_render_like_their_replacements() {
-        // Archived feeds may still carry the old names.
         assert_eq!(rgb_of("Excessive Heat Warning"), rgb_of("Extreme Heat Warning"));
         assert_eq!(rgb_of("Excessive Heat Watch"), rgb_of("Extreme Heat Watch"));
         assert_eq!(rgb_of("Wind Chill Warning"), rgb_of("Extreme Cold Warning"));
@@ -272,10 +241,8 @@ mod tests {
 
     #[test]
     fn semantically_distinct_hazards_have_distinct_colours() {
-        // One representative per hazard/severity class that we deliberately
-        // style. Events in the same family and tier (e.g. Flood Warning vs
-        // Coastal Flood Warning) are intentionally allowed to share a colour
-        // and so appear only once here.
+        // One representative per styled hazard/severity class. Same family and
+        // tier (Flood Warning vs Coastal Flood Warning) may share a colour.
         const DISTINCT: &[&str] = &[
             "Tornado Warning",
             "Tornado Watch",
@@ -332,8 +299,6 @@ mod tests {
 
     #[test]
     fn nothing_shares_the_unknown_colour() {
-        // The grey fallback should mean "we have no styling for this", so no
-        // styled entry may collide with it.
         for entry in ALERT_COLORS.iter().chain(RETIRED_ALERT_COLORS).chain(FALLBACK_COLORS) {
             assert_ne!(
                 (entry.r, entry.g, entry.b),
@@ -348,11 +313,9 @@ mod tests {
 
     #[test]
     fn every_live_entry_matches_a_real_event() {
-        // The failure mode this guards: NWS renames a product, the keywords
-        // here stop matching anything, and the affected alerts silently fall
-        // through to a generic colour. Nothing panics and no test fails --
-        // the map just quietly starts lying. Asserting that every row still
-        // matches a real event name turns the next rename into a test failure.
+        // Turns the next upstream rename into a test failure. Otherwise the
+        // keywords stop matching, the alerts fall through to a generic colour,
+        // nothing panics, and the map quietly starts lying.
         let events = sample_events();
         for entry in ALERT_COLORS.iter().chain(FALLBACK_COLORS) {
             let matched = events
@@ -372,8 +335,8 @@ mod tests {
 
     #[test]
     fn every_live_entry_is_reachable() {
-        // A row can also go dead by being fully shadowed by an earlier row,
-        // which the match-a-real-event check above would not catch.
+        // A row can also die by being fully shadowed by an earlier row, which
+        // the match-a-real-event check above does not catch.
         let events = sample_events();
         for (i, entry) in ALERT_COLORS.iter().enumerate() {
             let wins = events.iter().any(|e| {
@@ -390,9 +353,8 @@ mod tests {
 
     #[test]
     fn retired_entries_are_actually_retired() {
-        // If one of these starts matching a live product name, the alias is no
-        // longer harmless: it could shadow a real entry, and it means the
-        // product was un-retired and belongs back in ALERT_COLORS.
+        // A retired alias that starts matching a live name can shadow a real
+        // entry, and means the product was un-retired.
         let events = sample_events();
         for entry in RETIRED_ALERT_COLORS {
             let live: Vec<&&str> = events
@@ -411,9 +373,7 @@ mod tests {
 
     #[test]
     fn no_real_event_is_left_unstyled_by_severity() {
-        // Every real warning/watch/advisory/statement must at least reach a
-        // suffix fallback rather than the "unknown" grey, so severity is
-        // always legible even for products we do not style individually.
+        // Severity must stay legible even for products styled only by suffix.
         for event in sample_events() {
             let lower = event.to_lowercase();
             let has_suffix = ["warning", "watch", "advisory", "statement"]

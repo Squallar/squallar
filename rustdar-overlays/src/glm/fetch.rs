@@ -1,8 +1,7 @@
 //! Fetch GLM lightning flash data from AWS S3.
 //!
-//! Lists and downloads NetCDF4 files from the `noaa-goes19`/`noaa-goes18`
-//! public S3 buckets. Files are LCFA (Lightning Cluster-Filter Algorithm)
-//! Level 2 products, each covering ~20 seconds.
+//! Lists and downloads L2 LCFA NetCDF4 files from the `noaa-goes19`/
+//! `noaa-goes18` public buckets. Each granule covers ~20 seconds.
 
 use std::collections::HashMap;
 
@@ -15,17 +14,6 @@ use super::{
 };
 
 /// One downloaded granule: what it parsed to, and when it is from.
-///
-/// The second field is the whole point of this type existing. While an entry was
-/// a bare `Vec<GlmFlash>`, the only clock a granule had was its own contents, so
-/// "downloaded, and legitimately empty" and "not downloaded" were the same thing
-/// to any predicate over that vector. A quiet granule therefore failed every
-/// retention test, was evicted the instant it was cached, and was re-listed and
-/// re-downloaded on the next poll — forever, for as long as the listing offered
-/// it. An empty parse is a normal, fully-successful result (see
-/// `a_level_with_no_records_is_empty_not_broken`), and is the *usual* result when
-/// the user has selected only one level or the sky is quiet, so that was a whole
-/// listing window re-fetched every 20 s poll.
 #[derive(Clone)]
 struct CachedGranule {
     /// Records parsed at the levels the user selected. Empty is normal.
@@ -33,23 +21,18 @@ struct CachedGranule {
     /// The newest instant this granule can vouch for, and the only thing
     /// [`GlmCache::evict_before`] reads.
     ///
-    /// Derived once, at insert, by [`CachedGranule::new`]. Kept as a field
-    /// rather than recomputed so that eviction asks one question of one value
-    /// and cannot be re-tempted into a predicate that an empty collection
-    /// answers "no" to.
+    /// A stored field, not a predicate over `flashes`: an empty granule is a
+    /// successful download, and any predicate over the vector answers "not in
+    /// window" for it, which re-downloads every quiet granule on every poll.
     newest: NaiveDateTime,
 }
 
 impl CachedGranule {
     /// Age a granule against its newest flash, falling back to the start time
-    /// its own S3 key encodes when it holds no flashes to be aged by.
+    /// its own S3 key encodes when it holds no flashes.
     ///
-    /// The two sources agree by construction and are not alternatives to each
-    /// other: a granule spans ~20 s from the start time it is keyed by, so its
-    /// records all land at or after `granule_start`, and taking the max is the
-    /// same answer the old `any(|f| f.time >= cutoff)` gave for every granule
-    /// that had any records at all. The fallback is what is new, and it applies
-    /// to exactly the case that had no answer before.
+    /// A granule spans ~20 s from the start time it is keyed by, so its records
+    /// all land at or after `granule_start`.
     fn new(granule_start: NaiveDateTime, flashes: Vec<GlmFlash>) -> Self {
         let newest = flashes.iter().map(|f| f.time).max().unwrap_or(granule_start);
         CachedGranule { flashes, newest }
@@ -65,24 +48,12 @@ pub struct GlmCache {
 impl GlmCache {
     /// Remove cached entries whose flashes are entirely outside the time window.
     ///
-    /// Granule granularity, deliberately: an entry is one downloaded file, and
-    /// keeping half of one would mean re-downloading it to get the half back.
-    /// So a file survives as long as *one* flash in it is still in window, stale
-    /// siblings and all, and [`flashes_in_window`] does the per-flash narrowing
-    /// afterwards. Tightening this to `all` would evict a granule that straddles
-    /// the cutoff — the newest-but-one file, every single poll.
+    /// Granule granularity: an entry is one downloaded file, so a file survives
+    /// as long as *one* flash in it is in window and [`flashes_in_window`] does
+    /// the per-flash narrowing. Tightening this to `all` would evict the
+    /// granule straddling the cutoff — the newest-but-one file — every poll.
     ///
-    /// `cutoff` is inclusive: a flash landing exactly on it is inside the window
-    /// the user asked for. The same instant is passed to `flashes_in_window`, so
-    /// the two stages agree on the boundary and a flash cannot be kept by one
-    /// and dropped by the other.
-    ///
-    /// The comparison is against [`CachedGranule::newest`] rather than a search
-    /// over the flashes, which is what lets a granule that parsed to *no*
-    /// records age out on the same schedule as a populated one instead of being
-    /// evicted on the spot. `>= cutoff` on a stored maximum is exactly `any(|f|
-    /// f.time >= cutoff)` whenever there is a flash to find, so nothing about
-    /// the populated cases moved.
+    /// `cutoff` is inclusive, and the same instant goes to `flashes_in_window`.
     pub fn evict_before(&mut self, cutoff: NaiveDateTime) {
         self.entries.retain(|_key, granule| granule.newest >= cutoff);
     }
@@ -94,19 +65,16 @@ impl GlmCache {
 
     /// Check whether a key is already cached.
     ///
-    /// True for a granule that parsed to nothing, which is the point:
-    /// [`plan_downloads`] reads this to decide what to fetch, and a granule we
-    /// have already downloaded and found empty must not be fetched again.
+    /// True for a granule that parsed to nothing: [`plan_downloads`] reads this,
+    /// and an already-downloaded empty granule must not be fetched again.
     pub fn contains_key(&self, key: &str) -> bool {
         self.entries.contains_key(key)
     }
 
     /// Insert parsed flashes for a given S3 key.
     ///
-    /// `granule_start` is the instant the granule is keyed by — see
-    /// [`granule_start_of`]. It is required rather than inferred because a
-    /// granule with no records has nothing to infer it from, and that case is
-    /// precisely the one this cache used to get wrong.
+    /// `granule_start` is passed rather than inferred because a granule with no
+    /// records has nothing to infer it from. See [`granule_start_of`].
     pub fn insert(&mut self, key: String, granule_start: NaiveDateTime, flashes: Vec<GlmFlash>) {
         self.entries.insert(key, CachedGranule::new(granule_start, flashes));
     }
@@ -114,15 +82,8 @@ impl GlmCache {
 
 /// Fold this poll's parsed granules into the cache.
 ///
-/// Every granule that parsed is cached, and a granule that parsed to *no*
-/// records is cached exactly like one that parsed to a thousand: it was
-/// downloaded, and the answer was "nothing here". Filtering the empties out here
-/// looks like an obvious saving and is the same bug from the other end —
-/// [`plan_downloads`] would re-queue every one of them on the next poll.
-///
-/// Extracted for the reason [`plan_downloads`] and [`build_outcome`] were:
-/// inline in the async fetch this loop sat behind a network round trip, where no
-/// test could tell "cached the empties" from "skipped the empties".
+/// Empty granules are cached like any other. Filtering them out here would make
+/// [`plan_downloads`] re-queue every one of them on the next poll.
 fn cache_granules(
     cache: &mut GlmCache,
     entries: Vec<(String, Vec<GlmFlash>)>,
@@ -137,29 +98,18 @@ fn cache_granules(
 /// The instant a granule is aged against, taken from the S3 key it was listed
 /// under.
 ///
-/// GLM keys carry their own start time and [`list_glm_files`] admits a key only
-/// when that time parses *and* falls in the window, so the fallback is
-/// unreachable for anything a poll actually listed. It exists, and is `now`
-/// rather than anything that ages out immediately, because the failure mode of
-/// an undatable granule must be "expires one window from now" and never "is
-/// re-downloaded every poll" — which is the defect this whole shape exists to
-/// remove. Pinning it to `now` also keeps it from being the other bug: an entry
-/// that is never evicted grows the cache without bound.
+/// The fallback is unreachable for anything a poll listed ([`list_glm_files`]
+/// admits a key only when its time parses and is in window). It is `now` so an
+/// undatable granule expires one window out — never instantly (re-downloaded
+/// every poll) and never not at all (unbounded cache).
 fn granule_start_of(key: &str, now: NaiveDateTime) -> NaiveDateTime {
     parse_filename_start_time(key).unwrap_or(now)
 }
 
 /// Fetch GLM data from one or both satellites for the given time window.
 ///
-/// - Lists S3 objects covering the time range
-/// - Downloads only files not already in `cache`
-/// - Parses NetCDF4 to extract lat/lon/energy/area/time at selected levels
-/// - Returns all observations within the time window, plus any satellite whose
-///   listing was completely empty
-///
-/// Empty listings are *reported*, not logged, here: the caller holds the
-/// previous poll's state and can therefore say something only when the feed
-/// changes, instead of once every poll forever.
+/// Empty listings are *reported*, not logged: only the caller holds the previous
+/// poll's state and can edge-trigger the message.
 pub async fn fetch_glm_flashes(
     client: &reqwest::Client,
     satellites: &[GlmSatellite],
@@ -168,8 +118,7 @@ pub async fn fetch_glm_flashes(
     cache: &mut GlmCache,
 ) -> Result<GlmFetchOutcome, String> {
     // The zero-object warning below assumes the queried range is wide enough to
-    // always cover an already-published granule. That assumption is the UI's
-    // slider minimum; keep a caller from quietly invalidating it.
+    // always cover an already-published granule.
     debug_assert!(
         time_window_secs >= GLM_MIN_TIME_WINDOW_SECS,
         "GLM time window {time_window_secs}s is below GLM_MIN_TIME_WINDOW_SECS \
@@ -193,12 +142,10 @@ pub async fn fetch_glm_flashes(
     for &sat in satellites {
         let listing = list_glm_files(client, sat, start, now).await?;
 
-        // A listing that returns no objects *at all* means the feed itself is
-        // gone (dead bucket, renamed product path, satellite rotated out of the
-        // slot) — not merely a quiet sky. GOES-East silently rendered nothing
-        // for over a year because `noaa-goes16` went dead and zero files looked
-        // exactly like zero lightning. A listing that returns objects but no
-        // in-window flashes is normal and stays silent.
+        // Zero objects means the feed is gone (dead bucket, renamed path,
+        // satellite rotated out of the slot), not a quiet sky: GOES-East
+        // rendered nothing for over a year once `noaa-goes16` went dead.
+        // Objects present but no in-window flashes is normal and stays silent.
         if listing.objects_seen == 0 {
             dead_feeds.push(DeadFeed {
                 satellite: sat,
@@ -227,37 +174,21 @@ pub async fn fetch_glm_flashes(
 
     log::info!("GLM: {} flashes in {:.0}s window", filtered.len(), time_window_secs);
 
-    // Failures are *reported*, not logged here, for the same reason dead feeds
-    // are: only the caller knows what the previous poll looked like, and only
-    // the caller can put it on screen.
+    // Reported, not logged, for the same reason dead feeds are.
     Ok(build_outcome(filtered, dead_feeds, satellites.to_vec(), &tally, acc))
 }
 
 /// Select the cached flashes that fall inside this poll's window.
 ///
-/// The second half of a two-stage narrowing. [`GlmCache::evict_before`] works at
-/// *granule* granularity and keeps a whole file as long as one of its flashes is
-/// still in window; this is what then discards the individual stale flashes
-/// inside a file that was kept. Neither stage subsumes the other, and dropping
-/// either one is invisible on screen — too many bolts and too few both just look
-/// like weather.
+/// The per-flash half of a two-stage narrowing; [`GlmCache::evict_before`] does
+/// the per-granule half and neither subsumes the other.
 ///
-/// Both bounds are inclusive and both are load-bearing:
-///
-/// * `>= cutoff` is what makes the retained-granule case correct. `cutoff` is
-///   the same instant `evict_before` was handed, so a flash exactly on it is
-///   inside the window the user asked for, not one tick outside it.
-/// * `<= now` bounds the window from *above*, which is not the redundant clause
-///   it looks like. `now` is wall-clock and sampled once at the top of the poll,
-///   so it can sit behind the data in two ways: a granule covers ~20 s and is
-///   listed by its start time, so its last flashes can be stamped after `now`;
-///   and an NTP step backwards can put `now` behind flashes already cached. In
-///   both cases the flash stays cached and simply appears on the next poll —
-///   which is exactly why removing this clause is silent.
-///
-/// Extracted for the same reason [`plan_downloads`] and [`build_outcome`] were:
-/// inline in the async fetch it sat behind a network round trip where no test
-/// could reach either bound.
+/// Both bounds are inclusive and both are load-bearing. `<= now` is not
+/// redundant: `now` is wall-clock sampled once per poll and can sit behind the
+/// data — a granule is listed by its start time and spans ~20 s, so its last
+/// flashes can be stamped after `now`, and an NTP step backwards does the same.
+/// Such flashes stay cached and appear next poll, which is why dropping this
+/// clause is silent.
 fn flashes_in_window(
     cache: &GlmCache,
     cutoff: NaiveDateTime,
@@ -272,11 +203,9 @@ fn flashes_in_window(
 
 /// Assemble the outcome a poll reports.
 ///
-/// Extracted for the same reason the denominator was: this is where each error
-/// bucket is bound to the field the UI reads, and inline in the async fetch it
-/// was a struct literal no test could reach — the two `summarize_failures` calls
-/// could be swapped, turning every 503 into "product change?", with the suite
-/// green. Pure, so the binding is pinned by a test.
+/// Pure and separate from the async fetch so a test can pin which error bucket
+/// lands in which field — swapping the two `summarize_failures` calls turns
+/// every 503 into "product change?".
 fn build_outcome(
     flashes: Vec<GlmFlash>,
     dead_feeds: Vec<DeadFeed>,
@@ -290,9 +219,8 @@ fn build_outcome(
         queried,
         parse_failures: summarize_failures(tally.in_window, acc.parse_errors),
         transport_failures: summarize_failures(tally.in_window, acc.transport_errors),
-        // Deliberately not routed through `summarize_failures`: a level failure
-        // has no meaningful file-count denominator. It is not "3 of 14 files
-        // broke", it is "this layer is gone from the product".
+        // Not routed through `summarize_failures`: a level failure has no
+        // file-count denominator.
         level_failures: acc.level_failures,
         evaluated_levels: acc.evaluated_levels,
     }
@@ -300,12 +228,6 @@ fn build_outcome(
 
 /// What one poll accumulated across satellites, before it is shaped into the
 /// outcome the UI reads.
-///
-/// Exists for the same reason `plan_downloads` and `build_outcome` do: folding a
-/// batch into the running totals used to be four bare `extend` calls inside the
-/// async fetch, where no test could reach them. Dropping any one of them — the
-/// level failures especially — silently reinstates the bug it was added to
-/// report.
 #[derive(Default)]
 struct PollAccumulator {
     entries: Vec<(String, Vec<GlmFlash>)>,
@@ -314,12 +236,10 @@ struct PollAccumulator {
     level_failures: Vec<LevelFailure>,
     /// (satellite, level) pairs this poll actually gathered evidence about.
     ///
-    /// A level can only be found broken by parsing a granule, so a poll that
-    /// downloads nothing new — routine, since the 20 s poll interval races the
-    /// ~20 s granule cadence — learns nothing about any level. Without this the
-    /// caller cannot tell "this layer is healthy again" from "we did not look",
-    /// and would announce a recovery that never happened every time the two
-    /// clocks slipped past each other.
+    /// A level is only found broken by parsing, so a poll that downloads nothing
+    /// new learns nothing — routine, since the 20 s poll interval races the
+    /// ~20 s granule cadence. Without this, "healthy again" and "did not look"
+    /// are indistinguishable to the caller.
     evaluated_levels: Vec<(GlmSatellite, GlmDataLevel)>,
 }
 
@@ -330,9 +250,8 @@ impl PollAccumulator {
         self.transport_errors.extend(batch.transport_errors);
         self.level_failures.extend(batch.level_failures);
 
-        // Evidence requires a granule that actually parsed. A batch where every
-        // file failed to download or open tells us nothing about the levels
-        // inside them, so it must not read as levels being healthy.
+        // Evidence requires a granule that actually parsed: a batch where every
+        // file failed says nothing about the levels inside them.
         if !batch.entries.is_empty() {
             for &level in levels {
                 self.evaluated_levels.push((satellite, level));
@@ -352,16 +271,10 @@ struct PollTally {
 
 /// Decide what to download, and record what the window contains.
 ///
-/// The tally is updated *here* rather than by the caller so that exactly one
-/// expression in the codebase defines the failure denominator. The caller sits
-/// inside a network round trip and cannot be unit-tested, so leaving it to pick
-/// between `keys.len()` and `new_keys.len()` would put the decision somewhere
-/// no test can reach — which is how the biased denominator survived review.
-///
-/// The two counts are deliberately different and must stay that way: cached
-/// successes drop out of the returned keys while failures are never cached and
-/// are retried every poll, so using the download count as the denominator makes
-/// a single persistent failure look like a total outage after a few ticks.
+/// The tally counts every listed key, not the returned ones, and the two must
+/// stay different: cached successes drop out of the returned keys while failures
+/// are never cached and are retried every poll, so a download-count denominator
+/// makes one persistent failure look like a total outage after a few ticks.
 fn plan_downloads<'a>(
     keys: &'a [String],
     cache: &GlmCache,
@@ -374,8 +287,7 @@ fn plan_downloads<'a>(
         .collect()
 }
 
-/// Result of listing S3 for one satellite, with enough context to tell an
-/// absent feed apart from a quiet one.
+/// Result of listing S3 for one satellite.
 struct GlmListing {
     /// Keys that are `.nc` files whose encoded start time falls in the window.
     keys: Vec<String>,
@@ -400,27 +312,18 @@ async fn list_glm_files(
     let mut all_keys = Vec::new();
     let mut objects_seen = 0usize;
 
-    // Collect all (year, doy, hour) tuples we need to query.
+    // Collect all (year, doy, hour) tuples we need to query. This emits a
+    // *single* prefix when `start` and `end` share a UTC hour, so the
+    // zero-object warning can be looking at one young hour prefix.
     //
-    // This emits a *single* prefix whenever `start` and `end` fall in the same
-    // UTC hour — with a 60 s window at 00:14:00, iteration 1 pushes `.../00/`,
-    // `t` then clamps to `end` and iteration 2 dedups and breaks. So the
-    // zero-object warning below can be looking at one young hour prefix, and
-    // does not get to assume a previous, already-populated hour is in the set.
-    //
-    // What keeps that from crying wolf at the top of every hour is a coupling
-    // worth stating explicitly:
+    // Required coupling:
     //
     //     GLM_MIN_TIME_WINDOW_SECS  >  S3 publish latency for the hour's first object
     //
-    // The single-prefix case requires `now >= hour_start + window`, and the
-    // 00:00:00 granule of each hour lands 27–30 s after the boundary (measured
+    // The hour's 00:00:00 granule lands 27–30 s after the boundary (measured
     // across two consecutive live hours on noaa-goes19; worst case in that
-    // sample was 41 s for a mid-hour file). With the minimum window at 60 s the
-    // prefix always holds at least one object by the time a single-prefix query
-    // is possible, leaving ~30 s of headroom. Lowering the slider minimum below
-    // roughly 45 s would reintroduce a spurious "feed dead" warning once an
-    // hour; see GLM_MIN_TIME_WINDOW_SECS in render::handlers::glm.
+    // sample 41 s for a mid-hour file), and a single-prefix query requires
+    // `now >= hour_start + window`, so a 60 s minimum leaves ~30 s of headroom.
     let mut prefixes = Vec::new();
     let mut t = start;
     loop {
@@ -493,8 +396,8 @@ async fn list_glm_files(
             }
 
             // A truncated response with no usable continuation token would
-            // otherwise re-issue the identical first-page request forever,
-            // inside an async fetch task with no timeout. Stop and say why.
+            // re-issue the identical first-page request forever, inside an
+            // async task with no timeout.
             let next = doc.descendants()
                 .find(|n| n.tag_name().name() == "NextContinuationToken")
                 .and_then(|n| n.text())
@@ -536,11 +439,9 @@ async fn list_glm_files(
 /// The `s` field is `YYYYDDDHHMMSSf` where DDD = day of year, f = tenths of second.
 /// The `G{nn}` satellite token is not inspected, so this works for any GOES bird.
 fn parse_filename_start_time(key: &str) -> Option<NaiveDateTime> {
-    // Find the `_s` field in the filename
     let filename = key.rsplit('/').next()?;
     let s_idx = filename.find("_s")?;
     let s_field = &filename[s_idx + 2..];
-    // Extract YYYYDDDHHMMSSf (14 chars)
     if s_field.len() < 14 {
         return None;
     }
@@ -561,14 +462,13 @@ struct BatchOutcome {
     entries: Vec<(String, Vec<GlmFlash>)>,
     /// One message per file that downloaded but would not parse. Returned
     /// rather than only logged: a batch where *every* file fails renders
-    /// exactly like a quiet sky, so the count has to reach the UI.
+    /// exactly like a quiet sky.
     parse_errors: Vec<String>,
     /// One message per file that never arrived. Tracked separately so a network
     /// problem is never reported as a product schema change.
     transport_errors: Vec<String>,
     /// Levels that failed inside files that otherwise parsed, deduplicated per
-    /// (satellite, level). A schema change hits every granule in the window
-    /// identically, so reporting it once per file would be noise.
+    /// (satellite, level).
     level_failures: Vec<LevelFailure>,
 }
 
@@ -592,9 +492,9 @@ async fn download_and_parse_batch(
             match download_and_parse_one(&client, &url, satellite, &lvls).await {
                 Ok(parsed) => Ok((key_owned, parsed)),
                 Err(e) => {
-                    // Per-file detail stays at debug: with 20 files in flight,
-                    // warning on each turns a single schema change into a wall
-                    // of identical lines. The aggregate is reported instead.
+                    // Debug, not warn: with 20 files in flight a single schema
+                    // change would produce a wall of identical lines. The
+                    // aggregate is reported instead.
                     log::debug!("Failed to fetch GLM file {key_owned}: {}", e.message());
                     let labelled = format!("{key_owned}: {}", e.message());
                     Err(match e {
@@ -617,8 +517,7 @@ async fn download_and_parse_batch(
 impl BatchOutcome {
     /// Split per-file results into what parsed and what did not.
     ///
-    /// Separated from the async download so the partition is reachable from a
-    /// test: this is the step that used to discard every error into a log line.
+    /// Separated from the async download so the partition is testable.
     fn from_results(results: Vec<Result<(String, GranuleParse), FileError>>) -> Self {
         let mut outcome = BatchOutcome {
             entries: Vec::new(),
@@ -629,10 +528,9 @@ impl BatchOutcome {
         for result in results {
             match result {
                 Ok((key, parsed)) => {
-                    // One batch is one satellite, so within this loop the level
-                    // is what discriminates. The satellite is compared anyway:
-                    // it is the identity `LevelFailure` is keyed on, and the
-                    // accumulator does merge across satellites.
+                    // One batch is one satellite, but the satellite is compared
+                    // anyway: it is part of `LevelFailure`'s identity and the
+                    // accumulator merges across satellites.
                     for failure in parsed.level_failures {
                         if !outcome.level_failures.iter().any(|f: &LevelFailure| {
                             f.satellite == failure.satellite && f.level == failure.level
@@ -650,22 +548,13 @@ impl BatchOutcome {
     }
 }
 
-/// Why one file did not contribute.
+/// Why one file did not contribute. A file that arrives and will not parse
+/// indicts the product; a file that never arrives indicts the network.
 ///
-/// The distinction is the whole point: a file that arrives and will not parse
-/// indicts the product, a file that never arrives indicts the network, and
-/// telling a user their GLM product changed because S3 returned 503 SlowDown to
-/// a 20-way concurrent GET burst is a false alarm of exactly the kind this
-/// branch exists to remove.
-///
-/// Classification is by *stage*, not by content, which has one known blind
-/// spot: a captive portal or proxy that answers 200 with an HTML error page
-/// produces bytes that fail to parse, and those are reported as `Parse` —
-/// "product change?" — when the real cause is the network. Distinguishing that
-/// would mean sniffing the body for the NetCDF magic number. Left alone
-/// deliberately: it misreports a transient local-network condition, whereas
-/// classifying by content risks misreading a genuine product change as a
-/// network fault, which is the failure this branch is built to prevent.
+/// Classified by *stage*, not by content, with one known blind spot: a captive
+/// portal answering 200 with an HTML error page is reported as `Parse`.
+/// Accepted deliberately — sniffing the body for the NetCDF magic number risks
+/// misreading a genuine product change as a network fault.
 #[derive(Debug)]
 enum FileError {
     /// Connection failure, non-2xx status, or a truncated body.
@@ -686,8 +575,7 @@ impl FileError {
 ///
 /// `in_window` is every file the listing placed in the window, not just the
 /// ones downloaded this tick — see [`FetchFailures::in_window`]. `None` means
-/// nothing failed. Pure, so the classification that decides whether the user
-/// sees "everything failed" is testable without a network round trip.
+/// nothing failed.
 fn summarize_failures(in_window: usize, errors: Vec<String>) -> Option<FetchFailures> {
     let sample_error = errors.first()?.clone();
     Some(FetchFailures {
@@ -697,8 +585,8 @@ fn summarize_failures(in_window: usize, errors: Vec<String>) -> Option<FetchFail
     })
 }
 
-/// Fetch the raw bytes of one object. Every failure here is a transport
-/// failure, by construction — the function has no idea what the bytes mean.
+/// Fetch the raw bytes of one object. Every failure here is a transport failure
+/// by construction.
 async fn download_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
     client.get(url)
         .send()
@@ -714,10 +602,8 @@ async fn download_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, 
 
 /// Download a single GLM NetCDF file and parse data from it.
 ///
-/// The two stages are split so the transport/parse classification is carried by
-/// the type system at exactly two call sites, rather than repeated at each
-/// error site where one could drift. Mislabelling a 503 as a parse failure
-/// tells the user their product changed when S3 merely throttled them.
+/// Split so the transport/parse classification happens at exactly two call
+/// sites rather than at each error site, where one could drift.
 async fn download_and_parse_one(
     client: &reqwest::Client,
     url: &str,
@@ -728,8 +614,7 @@ async fn download_and_parse_one(
     parse_downloaded_file(&bytes, satellite, levels)
 }
 
-/// Parse bytes that already arrived. Any failure here is a parse failure, and
-/// the split from the download makes that testable without a network round trip.
+/// Parse bytes that already arrived. Any failure here is a parse failure.
 fn parse_downloaded_file(
     bytes: &[u8],
     satellite: GlmSatellite,
@@ -768,11 +653,8 @@ const GROUP_VARS: LevelVars = LevelVars {
     level: GlmDataLevel::Group,
 };
 
-// The L2 LCFA product has no `event_area` variable: an event is a single
-// sensor pixel detection, and only groups and flashes carry area coverage
-// (confirmed against a live `noaa-goes19` GLM-L2-LCFA granule). Asking for a
-// non-existent variable used to yield an all-zero column, so every event
-// popup reported "0.0 km²".
+// The L2 LCFA product has no `event_area` variable — only groups and flashes
+// carry area coverage (confirmed against a live `noaa-goes19` granule).
 const EVENT_VARS: LevelVars = LevelVars {
     lat: "event_lat",
     lon: "event_lon",
@@ -784,11 +666,9 @@ const EVENT_VARS: LevelVars = LevelVars {
 
 /// Where variables come from.
 ///
-/// The GLM parser is written against this rather than a concrete reader so the
-/// pure-Rust reader and the netCDF-C library can be driven through *identical*
-/// parsing, unit conversion and time handling. That is what makes the
-/// differential tests in [`super::difftests`] meaningful: any difference they
-/// find is a difference in the reader, because there is only one parser.
+/// The parser is written against this so multiple readers share *identical*
+/// parsing, unit conversion and time handling — any difference a differential
+/// test finds is then a difference in the reader.
 pub(crate) trait VarSource {
     /// Read a variable with CF packing applied, or `Ok(None)` if it is absent.
     fn read_unpacked(&self, name: &str) -> Result<Option<cf::UnpackedVar>, String>;
@@ -820,12 +700,11 @@ fn parse_with_source<S: VarSource>(
     satellite: GlmSatellite,
     levels: &[GlmDataLevel],
 ) -> Result<GranuleParse, String> {
-    // Read the time origin from global attribute. Every `*_time_offset`
-    // variable also names its own epoch in its `units` attribute, and in every
-    // granule inspected the two agree exactly (`time_coverage_start` =
-    // "2026-07-24T12:00:00.0Z", `event_time_offset:units` = "seconds since
-    // 2026-07-24 12:00:00.000"). The per-variable epoch wins where present —
-    // see `parse_level_records` — and this is the fallback.
+    // Fallback epoch. Every `*_time_offset` variable also names its own epoch
+    // in `units`, and in every granule inspected the two agree exactly
+    // (`time_coverage_start` = "2026-07-24T12:00:00.0Z", `units` = "seconds
+    // since 2026-07-24 12:00:00.000"). The per-variable epoch wins where
+    // present — see `parse_level_records`.
     let time_origin = file
         .time_coverage_start()
         .as_deref()
@@ -841,10 +720,8 @@ fn parse_with_source<S: VarSource>(
             GlmDataLevel::Group => &GROUP_VARS,
             GlmDataLevel::Event => &EVENT_VARS,
         };
-        // One level failing must not take the others with it. The three levels
-        // are independent variable sets and the user selects them
-        // independently, so a schema change confined to `flash_*` should not
-        // black out the default-on group layer as well.
+        // One level failing must not take the others with it: the three are
+        // independent variable sets, selected independently.
         match parse_level_records(file, vars, &time_origin, satellite) {
             Ok(records) => all_records.extend(records),
             Err(e) => {
@@ -865,26 +742,18 @@ fn parse_with_source<S: VarSource>(
         }
     }
 
-    // Every requested level failing means the granule itself is unusable, so it
-    // is reported as a failed *file* — which is what it is, and what puts it in
-    // the "N/M files failed to parse" count the panel already renders.
-    //
-    // The first underlying error is propagated verbatim rather than summarised.
-    // It becomes `FetchFailures::sample_error`, which reaches the operator
-    // through `log::warn!` in the handler (the panel itself renders only
-    // counts), so "GLM file has no 'flash_lat' variable (product schema
-    // change?)" is worth far more there than a tally of how many levels failed.
+    // Every requested level failing makes the granule unusable, so it is
+    // reported as a failed *file* and joins the "N/M files failed to parse"
+    // count. The first error is propagated verbatim: it becomes
+    // `FetchFailures::sample_error`, the only place the operator sees a cause.
     if !failures.is_empty() && failures.len() == levels.len() {
         return Err(failures.swap_remove(0).sample_error);
     }
 
     // A *partial* failure keeps the healthy levels and reports the broken one
-    // separately. Neither parent of this code did both: returning `Err` here
-    // would discard perfectly good group records over a flash-only schema
-    // change, and returning a bare `Ok` — as the first cut of this did — leaves
-    // the Flashes layer empty with nothing on screen to explain it, because
-    // `Ok` means `parse_failures: None` means the panel says everything is
-    // fine. `LevelFailure` is the third channel that makes both possible.
+    // through `level_failures`. `Err` would discard good group records over a
+    // flash-only schema change; a bare `Ok` means `parse_failures: None`, which
+    // the panel reads as "everything is fine" while the layer sits empty.
     Ok(GranuleParse { records: all_records, level_failures: failures })
 }
 
@@ -900,11 +769,8 @@ pub(crate) struct GranuleParse {
 /// Unit spellings accepted for `*_area`, mapped to the multiplier that turns
 /// them into km² — the unit [`GlmFlash::area`] documents and the popup labels.
 ///
-/// The L2 LCFA product declares `flash_area:units = "m2"`, so the values are
-/// **square metres** and must be divided by a million. Reading the packed
-/// count straight out of the file and labelling it "km²" was wrong twice over:
-/// a flash of raw count 1826 was shown as "1826.0 km²" when it is really
-/// 1826 × 152601.9 m² = 278.7 km².
+/// The L2 LCFA product declares `flash_area:units = "m2"`: raw count 1826
+/// is 1826 × 152601.9 m² = 278.7 km², not "1826.0 km²".
 const AREA_UNITS: &[(&str, f64)] = &[
     ("m2", 1e-6),
     ("m^2", 1e-6),
@@ -920,37 +786,32 @@ const AREA_UNITS: &[(&str, f64)] = &[
 /// them into joules.
 ///
 /// GLM declares `units = "J"` with a scale factor around 1e-16, so real values
-/// land between roughly 1e-15 and 1e-12 J. Deliberately no SI prefixes here:
-/// case-folding would make "mJ" and "MJ" collide, and a silent factor of 1e9
-/// is exactly the failure this module exists to prevent.
+/// land between roughly 1e-15 and 1e-12 J. No SI prefixes: lookup is
+/// case-folded, so "mJ" and "MJ" would collide into a silent factor of 1e9.
 const ENERGY_UNITS: &[(&str, f64)] = &[("j", 1.0), ("joule", 1.0), ("joules", 1.0)];
 
 /// Parse records for one GLM hierarchy level from the NetCDF file.
 ///
-/// Every variable goes through [`cf::read_unpacked`], which applies the CF
-/// packing conventions the `netcdf` crate does not. See that module for the
-/// rules; the short version is that most GLM variables are `_Unsigned` packed
-/// shorts and reading them raw yields meaningless numbers.
+/// Every variable goes through CF unpacking (see [`super::cf`]): most GLM
+/// variables are `_Unsigned` packed shorts and reading them raw yields
+/// meaningless numbers.
 fn parse_level_records<S: VarSource>(
     file: &S,
     vars: &LevelVars,
     time_origin: &chrono::NaiveDateTime,
     satellite: GlmSatellite,
 ) -> Result<Vec<GlmFlash>, String> {
-    // Required *columns*. Absence here is a product schema change, and it is
-    // loud: `read_required_unpacked` warns once per variable and fails the
-    // level. That is a different condition from an absent *value*, which
-    // arrives quietly as a `None` inside `UnpackedVar::values` — see the note
-    // on [`read_required_unpacked`].
+    // Required *columns*: absence is a schema change and fails the level. An
+    // absent *value* is a different condition and arrives quietly as `None`
+    // inside `UnpackedVar::values`.
     let lats = read_required_unpacked(file, vars.lat)?;
     let lons = read_required_unpacked(file, vars.lon)?;
     let energies = read_required_unpacked(file, vars.energy)?;
     let times = read_required_unpacked(file, vars.time_offset)?;
 
     // Every variable at a level shares one dimension (`number_of_flashes`,
-    // `number_of_groups`, `number_of_events`), so a short column is never
-    // legitimate — it means a corrupt or restructured file. Reject it instead
-    // of padding the tail with zeros.
+    // `number_of_groups`, `number_of_events`), so a short column means a
+    // corrupt or restructured file.
     let count = lats.values.len();
     for (name, len) in [
         (vars.lon, lons.values.len()),
@@ -965,14 +826,9 @@ fn parse_level_records<S: VarSource>(
         }
     }
 
-    // Area is the one genuinely optional column, and the criterion is the
-    // product's own schema, not how load-bearing the field feels: events have no
-    // area variable at all, so `vars.area` is `None` there and we never look.
-    // Every level always has lat/lon/energy/time, so their absence is drift and
-    // is refused above — including energy, whose loss would otherwise be
-    // *silently* absorbed by the rasterizer as a uniform minimum bolt size.
-    // When a level that should have an area is missing one, degrade to no area
-    // instead of failing the file, but say so.
+    // Area is the one optional column: events have no area variable, so
+    // `vars.area` is `None` there and we never look. A level that should have
+    // one but does not degrades to no area rather than failing the file.
     let areas = match vars.area {
         Some(name) => match read_optional_unpacked(file, name)? {
             Some(v) if v.values.len() == count => Some(v),
@@ -990,10 +846,8 @@ fn parse_level_records<S: VarSource>(
         None => None,
     };
 
-    // The time axis names its own epoch and unit. Prefer them over the
-    // granule-level `time_coverage_start`: in every granule inspected the two
-    // agree, and reading the variable's own metadata means they cannot
-    // silently drift apart.
+    // The time axis names its own epoch and unit, and wins over the
+    // granule-level `time_coverage_start` so the two cannot silently drift.
     let time_units = match times.units.as_deref() {
         Some(u) => cf::parse_time_units(u).ok_or_else(|| {
             format!(
@@ -1015,10 +869,9 @@ fn parse_level_records<S: VarSource>(
         );
     }
 
-    // Unit resolution is scoped to the field it describes. `None` means "this
-    // product declares a unit we cannot convert", which makes the *descriptive*
-    // field unknown — it must not take position and time down with it, and it
-    // must not take the other two hierarchy levels down either.
+    // Unit resolution is scoped to the field it describes: `None` makes that
+    // descriptive field unknown, and must not take position, time or the other
+    // hierarchy levels down with it.
     let energy_to_j = unit_multiplier(satellite, vars.energy, Some(&energies), ENERGY_UNITS, "J");
     let area_to_km2 = unit_multiplier(
         satellite,
@@ -1033,11 +886,8 @@ fn parse_level_records<S: VarSource>(
     let mut off_globe = 0usize;
 
     for i in 0..count {
-        // A `_FillValue` in any of the three fields that place a strike in
-        // space and time makes the detection unusable, so the record is
-        // dropped rather than published with a fabricated number. This
-        // matches how the rest of rustdar treats rows it cannot parse (see
-        // `spc::discussion`, `metar::fetch`).
+        // A `_FillValue` in any field that places a strike in space and time
+        // makes the detection unusable; drop it rather than fabricate a number.
         let (Some(lat), Some(lon), Some(offset)) =
             (lats.values[i], lons.values[i], times.values[i])
         else {
@@ -1047,35 +897,20 @@ fn parse_level_records<S: VarSource>(
 
         let lon = normalize_longitude(lon);
 
-        // Backstop against a coordinate that unpacked to nonsense. Note this
-        // only really guards latitude now: longitude has a legitimate
-        // wrap-around above, so a mis-unpacked longitude can land back inside
-        // the valid interval. Latitude has no such convention, and it is what
-        // caught the original bug — the unfixed code produced -94°.
+        // Backstop against a coordinate that unpacked to nonsense. Effectively
+        // guards latitude only: the wrap above can carry a mis-unpacked
+        // longitude back into the valid interval.
         if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
             off_globe += 1;
             continue;
         }
 
-        // Energy and area are descriptive, not locating: a strike whose
-        // brightness the product did not report is still a real strike at a
-        // real place and time, so the record survives and the field reads
-        // `None`.
-        //
-        // Never zero, and never a skipped record. `flash_energy` and
-        // `event_energy` carry `_FillValue = -1s`, so a *value* can be absent
-        // in a column that is present, and the three obvious handlings are all
-        // wrong: substituting a default reintroduces `0f32.log10()` = -inf and
-        // draws unknown as the smallest possible bolt (the tempting one, and
-        // the exact bug `Option` was introduced to remove); failing the file
-        // passes a granule-wide verdict on one record, for a condition the
-        // product defines per record; skipping the record deletes a real,
-        // located strike over a descriptive field, which is the same mistake as
-        // rejecting GOES-West longitudes.
-        //
-        // `Option<f32>` is the fourth option, and the column stays *required*
-        // above — a renamed or absent `*_energy` still fails loudly. Required
-        // column, optional value.
+        // Energy and area are descriptive, not locating: an unreported value
+        // leaves the field `None` and keeps the record. Never zero — `0f32
+        // .log10()` is -inf and `rasterize` draws unknown as the smallest
+        // possible bolt. `flash_energy`/`event_energy` carry
+        // `_FillValue = -1s`, so a value can be absent in a present column:
+        // required column, optional value.
         let energy = column_value(Some(&energies), i)
             .zip(energy_to_j)
             .map(|(v, to_j)| (v * to_j) as f32);
@@ -1083,16 +918,10 @@ fn parse_level_records<S: VarSource>(
             .zip(area_to_km2)
             .map(|(v, to_km2)| (v * to_km2) as f32);
 
-        // Microseconds, not milliseconds. GLM's time `scale_factor` is
-        // 3.814756e-4 s, so consecutive representable instants are 0.38 ms
-        // apart: truncating to whole milliseconds collapses roughly three in
-        // five adjacent pairs onto the same timestamp, with a worst-case error
-        // of a full millisecond against a 0.38 ms quantum. Microseconds leave
-        // 381 µs of separation, which is sufficient rather than merely better.
-        //
-        // It also interacts with the unit multiplier above: on a `milliseconds
-        // since` axis the sub-millisecond offsets — which is where the granule
-        // boundary sits — would all truncate to zero.
+        // Microseconds, not milliseconds: GLM's time `scale_factor` is
+        // 3.814756e-4 s, so representable instants are 0.38 ms apart and
+        // millisecond truncation collapses adjacent ones. On a `milliseconds
+        // since` axis it would truncate the sub-millisecond offsets to zero.
         let micros = (offset * time_units.seconds_per_unit * 1e6) as i64;
         let time = time_units.epoch + TimeDelta::microseconds(micros);
 
@@ -1122,13 +951,8 @@ fn parse_level_records<S: VarSource>(
 /// Report a variable the product was expected to have but does not, once per
 /// variable per process.
 ///
-/// A variable vanishing from the product is a permanent schema change, not a
-/// transient condition, so repeating the message on every 20-second poll would
-/// bury it in exactly the way that let the original bug survive a year.
-///
 /// Not satellite-qualified, unlike the unit warnings: the variable *set* is a
-/// property of the product schema, and naming the bird would imply a
-/// per-satellite condition that this is not.
+/// property of the product schema, not of a bird.
 fn warn_missing_variable_once(name: &'static str) {
     warn_once(
         missing_variable_key(name),
@@ -1141,27 +965,16 @@ fn warn_missing_variable_once(name: &'static str) {
 
 /// Read a variable the level cannot do without, with CF unpacking applied.
 ///
-/// This is the *column presence* half of a two-level distinction that both
-/// halves of this module needed and neither could express alone:
+/// The *column presence* half of a two-level distinction:
 ///
-/// * **The variable is absent from the file.** A schema change — permanent,
-///   affects every record, and nothing downstream can compensate. Warned once
-///   and failed here. The previous `Ok(Vec::new())` fallback is the mechanism
-///   that produced "Area: 0.0 km²" for a year: a variable that does not exist
-///   read back as an empty column and callers padded it with zeros. The same
-///   silence would turn a renamed `flash_energy` into every bolt drawing at
-///   minimum size, or a renamed `flash_lat` into "no lightning anywhere".
+/// * **Variable absent from the file** — a schema change. Warned once and
+///   failed here. Returning an empty column instead is what produced
+///   "Area: 0.0 km²" for a year, callers having padded it with zeros.
 ///
-/// * **An individual value is `_FillValue`** (or outside `valid_range`). A
-///   per-record condition the product deliberately defines — `flash_area`,
-///   `group_area`, `flash_energy` and `event_energy` all carry
-///   `_FillValue = -1s`. Quiet, and carried as a `None` inside
-///   [`cf::UnpackedVar::values`] for the caller to decide per field.
-///
-/// Conflating the two costs something either way round: treating a fill value
-/// as a schema change fails whole granules over one bad record, and treating
-/// an absent column as "all values missing" is the silence this branch exists
-/// to remove.
+/// * **An individual value is `_FillValue`** (or outside `valid_range`) — a
+///   per-record condition the product defines: `flash_area`, `group_area`,
+///   `flash_energy` and `event_energy` all carry `_FillValue = -1s`. Carried
+///   quietly as a `None` inside [`cf::UnpackedVar::values`].
 fn read_required_unpacked<S: VarSource>(
     file: &S,
     name: &'static str,
@@ -1177,9 +990,9 @@ fn read_required_unpacked<S: VarSource>(
 
 /// Read a variable a level may legitimately lack, with CF unpacking applied.
 ///
-/// Returns `Ok(None)` when absent, but still reports it: the *declared*
-/// optionality lives in [`LevelVars::area`], so reaching here with a name in
-/// hand means we asked for something the product used to have.
+/// Returns `Ok(None)` when absent, but still reports it: declared optionality
+/// lives in [`LevelVars::area`], so reaching here means we asked for something
+/// the product used to have.
 fn read_optional_unpacked<S: VarSource>(
     file: &S,
     name: &'static str,
@@ -1203,11 +1016,10 @@ fn read_optional_unpacked<S: VarSource>(
 /// | GOES-West (G18)       | -203.56                | -203.56 …  -70.44  |
 ///
 /// GOES-West therefore runs past the antimeridian: a real detection at
-/// 172.72°E is stored as -187.28. Rejecting those as out-of-range deleted 60
-/// of 3228 events in the granule this was measured on, and did so *selectively* —
-/// `group_lon`/`flash_lon` are genuine floats already wrapped, reaching
-/// +172.90 in that same file, so the groups and flashes survived while their
-/// own constituent events were thrown away.
+/// 172.72°E is stored as -187.28. Rejecting those as out-of-range deleted 60 of
+/// 3228 events in the granule this was measured on, and *selectively* —
+/// `group_lon`/`flash_lon` are genuine floats, already wrapped, reaching
+/// +172.90 in the same file.
 ///
 /// One wrap is enough for any offset the product uses; anything further out is
 /// left alone so the range check downstream still sees it.
@@ -1224,10 +1036,9 @@ pub(super) fn normalize_longitude(lon: f64) -> f64 {
 /// Value of a column at `i`, or `None` if the variable is absent from the
 /// product, the column is short, or the element is `_FillValue`.
 ///
-/// Collapsing those three into one `None` is deliberate *here* and only here:
-/// by this point the column-level conditions have already been reported by
-/// [`read_required_unpacked`]/[`read_optional_unpacked`], and what the caller
-/// needs per record is simply whether there is a number.
+/// Collapsing the three into one `None` is safe only here: the column-level
+/// conditions have already been reported by
+/// [`read_required_unpacked`]/[`read_optional_unpacked`].
 fn column_value(column: Option<&cf::UnpackedVar>, i: usize) -> Option<f64> {
     column?.values.get(i).copied().flatten()
 }
@@ -1235,25 +1046,17 @@ fn column_value(column: Option<&cf::UnpackedVar>, i: usize) -> Option<f64> {
 /// Resolve the multiplier converting a variable's declared `units` into the
 /// unit rustdar stores and displays, or `None` if that cannot be done.
 ///
-/// The contract is deliberately symmetric: **a value is reported only when the
-/// file says what unit it is in and we can convert that unit.** Both an absent
-/// `units` attribute and an unrecognized one yield `None`, i.e. "unknown".
+/// The contract is symmetric: **a value is reported only when the file says
+/// what unit it is in and we can convert that unit.** Both an absent `units`
+/// attribute and an unrecognized one yield `None`. Assuming an absent one is
+/// canonical would report `flash_area` — shipped as `m2` — a million times too
+/// large, silently.
 ///
-/// The earlier asymmetry was worse than either branch alone. An absent
-/// attribute assumed the value was already canonical, so a dropped `units` on
-/// `flash_area` — which the product ships as `m2` — would have silently
-/// reported areas a million times too large; a merely *misspelled* one failed
-/// the whole granule. A dropped attribute and a renamed one are the same kind
-/// of upstream change and should not diverge that sharply.
+/// Failure is scoped to the field: losing `*_area`/`*_energy` costs a popup row
+/// and must not cost the strike its position, time, or the other levels.
 ///
-/// Failure is scoped to the field. `*_area` and `*_energy` are descriptive, so
-/// losing them costs a popup row; it must not cost the strike its position and
-/// time, nor take the other two hierarchy levels with it.
-///
-/// Diagnostics name the satellite. Both birds can be enabled at once and they
-/// are separate product streams that can diverge, so an operator needs to know
-/// which one changed — and keying on it means a problem appearing on one slot
-/// does not suppress the warning for the other.
+/// Diagnostics name the satellite: the two birds are separate product streams
+/// that can diverge, so a problem on one must not suppress the other's warning.
 fn unit_multiplier(
     satellite: GlmSatellite,
     name: &str,
@@ -1261,9 +1064,8 @@ fn unit_multiplier(
     table: &[(&str, f64)],
     canonical: &str,
 ) -> Option<f64> {
-    // No column at all is a product property, not an anomaly: the L2 LCFA
-    // product simply has no `event_area`. Nothing to report and nothing to
-    // warn about — a genuinely *missing* variable was already reported by
+    // No column at all is a product property, not an anomaly: there is no
+    // `event_area`. A genuinely *missing* variable was already reported by
     // `read_optional_unpacked`.
     let column = column?;
     let sat = satellite.display_name();
@@ -1293,43 +1095,32 @@ fn unit_multiplier(
     found
 }
 
-/// Dedup key for "a hierarchy level would not parse".
-///
-/// Keyed on the satellite as well as the level: the two birds are separate
-/// product streams that can diverge, so a change hitting one must not suppress
-/// the report for the other.
+/// Dedup key for "a hierarchy level would not parse". Satellite-qualified: a
+/// change hitting one bird must not suppress the report for the other.
 pub(super) fn level_parse_key(satellite: GlmSatellite, lat_var: &str) -> String {
     format!("{}:level-parse:{lat_var}", satellite.bucket())
 }
 
-/// Dedup key for "a variable the product used to have is gone".
-///
-/// Deliberately *not* satellite-qualified: the variable set is a property of
-/// the product schema, so naming the bird would imply a per-satellite condition
-/// this is not, and would report the same schema fact twice.
+/// Dedup key for "a variable the product used to have is gone". Deliberately
+/// *not* satellite-qualified: the variable set is a property of the product
+/// schema, so qualifying it would report the same fact twice.
 pub(super) fn missing_variable_key(name: &str) -> String {
     format!("variable-absent:{name}")
 }
 
-/// Dedup key for "this variable declares a unit we cannot convert".
-///
-/// Keyed on the satellite *and* the offending spelling, so a second, different
-/// bad spelling still reports, and so does the same one on the other bird.
+/// Dedup key for "this variable declares a unit we cannot convert". Keyed on
+/// the satellite *and* the offending spelling, so a second bad spelling still
+/// reports, and so does the same one on the other bird.
 pub(super) fn units_key(satellite: GlmSatellite, name: &str, spelling: &str) -> String {
     format!("{}:{name}:units:{spelling}", satellite.bucket())
 }
 
 /// Log a warning the first time a given key is seen, then stay quiet.
 ///
-/// GLM polls every 20 seconds across up to two satellites, so an upstream
-/// schema change would otherwise produce an unbounded stream of identical
-/// lines and bury itself. The conditions this guards are all permanent once
-/// they appear.
-///
-/// The single registry for the module: absent-variable reports
-/// ([`warn_missing_variable_once`]), unit problems and level-parse failures
-/// all key into it, so one condition can never crowd out another and each is
-/// reported exactly once.
+/// GLM polls every 20 s across up to two satellites, and the conditions this
+/// guards are permanent once they appear. The single registry for the module:
+/// absent-variable reports, unit problems and level-parse failures all key
+/// into it, so one condition can never crowd out another.
 pub(crate) fn warn_once(key: String, message: &str) {
     if claim_warning(key) {
         log::warn!("{message}");
@@ -1338,10 +1129,8 @@ pub(crate) fn warn_once(key: String, message: &str) {
 
 /// Record `key` as seen and report whether this is the first time.
 ///
-/// Split out from [`warn_once`] so the deduplication can be tested without a
-/// log capture — in particular that distinct keys really are distinct, which
-/// is what stops a problem on one satellite from suppressing the warning for
-/// the other.
+/// Split out from [`warn_once`] so deduplication is testable without a log
+/// capture.
 pub(crate) fn claim_warning(key: String) -> bool {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
@@ -1414,14 +1203,10 @@ mod tests {
     /// Build a minimal in-memory GLM-shaped NetCDF4 file: flashes carry an
     /// area variable, events deliberately do not (mirroring the real product).
     ///
-    /// NOTE: this fixture writes plain unpacked `f32` in already-canonical
-    /// units, deliberately. Its subject is *column presence* — which variables
-    /// a level requires, and what happens when one is missing or short — not
-    /// the CF packing. The real `_Unsigned`/`scale_factor`/`add_offset` shapes
-    /// are exercised against packed shorts in `glm::tests`, so duplicating them
-    /// here would only couple these tests to constants they do not care about.
-    /// The `units` attributes are still declared, because a value whose unit is
-    /// undeclared is reported as unknown.
+    /// Writes plain unpacked `f32` in canonical units: the subject here is
+    /// *column presence*, not CF packing, which `glm::tests` covers against
+    /// packed shorts. `units` is still declared — an undeclared unit is
+    /// reported as unknown.
     fn synthetic_glm_file(spec: Fixture<'_>) -> Vec<u8> {
         let mut file = hdf5_pure::FileBuilder::new();
         file.set_attr(
@@ -1439,12 +1224,7 @@ mod tests {
                 let values = if spec.short == Some(name) { &values[..1] } else { values };
                 let var = file.create_dataset(name);
                 var.with_f32_data(values);
-                // Declare units on the two fields that are unit-converted.
-                // These fixtures are about *column* presence, so the values are
-                // written already in rustdar's canonical units rather than the
-                // product's packed `m2` — but they must still say so, because a
-                // value whose unit is undeclared is reported as unknown. The
-                // real packing is exercised in `glm::tests`.
+                // Only the two unit-converted fields need a `units` attribute.
                 let units = match name {
                     n if n.ends_with("_area") => Some("km2"),
                     n if n.ends_with("_energy") => Some("J"),
@@ -1494,17 +1274,11 @@ mod tests {
 
         let flashes = parse_flashes(&bytes).expect("parse flash level");
         assert_eq!(flashes.len(), 2);
-        // Pin that the *right column* was read, in order, without pinning the
-        // absolute scale, which is the fixture's own and not the product's. The
-        // fixture
-        // writes area = [128, 256], a ratio of exactly 2; lat is [35, 36] and
-        // lon is [-97, -98], so a ratio test excludes both, and a pure scaling
-        // preserves it (`flash_area` has add_offset = 0 in the real product).
-        // The `> 1.0` floor then excludes the energy column, which is ~1e-14.
-        //
-        // Note this is a supporting check: the authoritative protection against
-        // sourcing area from the wrong variable is
-        // `only_group_and_flash_levels_declare_an_area_variable`.
+        // Pins that the right column was read, in order, without pinning the
+        // fixture's own scale: area = [128, 256] has a ratio of exactly 2,
+        // which lat [35, 36] and lon [-97, -98] do not, and which a pure
+        // scaling preserves (`flash_area` has add_offset = 0 in the product).
+        // The `> 1.0` floor excludes the ~1e-14 energy column.
         let areas: Vec<f32> = flashes.iter().map(|f| f.area.expect("flash area")).collect();
         assert!(
             (areas[1] / areas[0] - 2.0).abs() < 1e-3,
@@ -1519,8 +1293,7 @@ mod tests {
         )
         .expect("parse event level");
         assert_eq!(events.len(), 2);
-        // Previously this silently produced Some(0.0) via `unwrap_or(&0.0)`,
-        // which the popup rendered as "Area: 0.0 km²".
+        // Fails if events fall back to Some(0.0), rendered as "Area: 0.0 km²".
         assert!(
             events.iter().all(|e| e.area.is_none()),
             "events must not report a fabricated area"
@@ -1533,11 +1306,9 @@ mod tests {
     /// A required variable disappearing from the product must fail the parse,
     /// not quietly yield zeros or an empty result set.
     ///
-    /// Asserts the error *verbatim*. Containment is not enough: with the
-    /// required-variable gate removed, the length check downstream also errors
-    /// and its message interpolates both the offending name and `vars.lat`, so a
-    /// `contains(missing)` assertion passes on entirely the wrong error and the
-    /// two gates shadow each other.
+    /// Verbatim, not `contains`: with the required-variable gate removed the
+    /// downstream length check also errors, and its message interpolates both
+    /// the offending name and `vars.lat`, so the two gates shadow each other.
     #[test]
     fn missing_required_variable_is_an_error_not_a_silent_default() {
         for missing in [
@@ -1554,12 +1325,10 @@ mod tests {
         }
     }
 
-    /// The case only the required-variable gate can catch.
-    ///
-    /// When an entire level vanishes, every column is equally absent, so no
-    /// length mismatch exists for the downstream check to trip on. Reverting
-    /// `read_required_f32` to `Ok(Vec::new())` makes this parse cleanly into
-    /// zero records — a blank map reported as success.
+    /// The case only the required-variable gate can catch: with every column
+    /// equally absent there is no length mismatch to trip the downstream check.
+    /// Fails if an absent variable reads back as an empty column, which parses
+    /// cleanly into zero records — a blank map reported as success.
     #[test]
     fn a_whole_level_vanishing_is_an_error_not_zero_records() {
         let bytes = synthetic_glm_file(Fixture { omit: &FLASH_LEVEL_VARS, ..Default::default() });
@@ -1568,11 +1337,9 @@ mod tests {
         assert_eq!(err, absent_variable_error("flash_lat"));
     }
 
-    /// Same case for the f64 reader, which has its own absence path.
-    ///
-    /// Only the time variable is omitted; the other columns stay present and
-    /// equally sized, so no length mismatch exists to mask the gate. The
-    /// verbatim assertion is what proves which gate fired.
+    /// Only the time variable is omitted, so the other columns stay equally
+    /// sized and no length mismatch can mask the gate. The verbatim assertion
+    /// proves which gate fired.
     #[test]
     fn a_missing_time_variable_alone_is_an_error() {
         let bytes = synthetic_glm_file(Fixture {
@@ -1583,9 +1350,9 @@ mod tests {
         assert_eq!(err, absent_variable_error("flash_time_offset_of_first_event"));
     }
 
-    /// Energy in particular used to fall back to 0.0, which the rasterizer turns
-    /// into `0f32.log10()` = -inf and draws as a minimum-size bolt — a total
-    /// data loss that looked like a normal render.
+    /// Fails if energy falls back to 0.0, which the rasterizer turns into
+    /// `0f32.log10()` = -inf and draws as a minimum-size bolt — total data loss
+    /// that looks like a normal render.
     #[test]
     fn missing_energy_does_not_default_to_zero() {
         let bytes = synthetic_glm_file(Fixture {
@@ -1596,9 +1363,8 @@ mod tests {
         assert_eq!(err, absent_variable_error("flash_energy"));
     }
 
-    /// The length check is a separate gate from the required-variable gate and
-    /// needs its own coverage: a variable that is *present but short* is
-    /// corruption, and indexing past it would panic.
+    /// A separate gate from the required-variable one: a *present but short*
+    /// variable is corruption, and indexing past it would panic.
     #[test]
     fn a_short_required_column_is_rejected() {
         for short in ["flash_lon", "flash_energy", "flash_time_offset_of_first_event"] {
@@ -1609,10 +1375,9 @@ mod tests {
         }
     }
 
-    /// Every per-file error must survive the batch partition, sorted into the
-    /// right bucket. This is the step that previously discarded them all into
-    /// `log::warn!` + `None`, which is why a total parse failure reached the
-    /// user as "Updated 0s ago".
+    /// Every per-file error must survive the batch partition, in the right
+    /// bucket. Fails if errors are discarded into a log line, which is what
+    /// made a total parse failure read as "Updated 0s ago".
     #[test]
     fn batch_partition_keeps_every_error_and_separates_the_kinds() {
         let outcome = BatchOutcome::from_results(vec![
@@ -1665,9 +1430,8 @@ mod tests {
         }
     }
 
-    /// The accumulator is where a batch becomes the poll's totals. Dropping any
-    /// bucket here is invisible from the async fetch that calls it, and dropping
-    /// the level bucket reinstates the round-2 regression whole.
+    /// Fails if the accumulator drops any bucket — invisible from the async
+    /// fetch that calls it.
     #[test]
     fn the_accumulator_forwards_every_bucket() {
         let mut acc = PollAccumulator::default();
@@ -1696,9 +1460,8 @@ mod tests {
         );
     }
 
-    /// ...but only a granule that actually parsed is evidence. A batch where
-    /// every file failed tells us nothing about the levels inside them, and
-    /// treating that as evidence would announce a recovery on an outage.
+    /// ...but only a granule that actually parsed is evidence: treating a batch
+    /// where every file failed as evidence announces a recovery on an outage.
     #[test]
     fn a_batch_that_parsed_nothing_is_not_evidence() {
         let mut acc = PollAccumulator::default();
@@ -1718,16 +1481,15 @@ mod tests {
         );
     }
 
-    /// The failure denominator counts the whole window, not just this poll's
-    /// downloads. Successes are cached and stop being re-downloaded; failures
-    /// are retried every poll. Conflating the two is what made one corrupt
+    /// The failure denominator counts the whole window, not this poll's
+    /// downloads. Fails if the two are conflated, which makes one corrupt
     /// granule read as "1/1 — everything failed" after a few ticks.
     #[test]
     fn poll_plan_separates_window_size_from_work_to_do() {
         let keys: Vec<String> = (0..12).map(|i| format!("k{i}.nc")).collect();
 
-        // Deliberately empty granules: this is the steady state a quiet sky
-        // produces, and it must read as "already downloaded".
+        // Empty granules: the steady state a quiet sky produces, which must
+        // read as "already downloaded".
         let mut cache = GlmCache::default();
         for key in keys.iter().take(9) {
             cache.insert(key.clone(), t0(), Vec::new());
@@ -1764,12 +1526,8 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Retention: `GlmCache::evict_before` and `flashes_in_window`.
-    //
-    // These two decide which lightning survives a poll, and every way of
-    // getting them wrong renders identically — a quiet sky. Neither had a
-    // test, so an off-by-one on either boundary, or dropping either stage
-    // outright, left the suite green.
+    // Retention: `GlmCache::evict_before` and `flashes_in_window`. Every way
+    // of getting these wrong renders identically — a quiet sky.
     // ---------------------------------------------------------------------
 
     /// An arbitrary but fixed instant to hang the retention tests off, so they
@@ -1783,12 +1541,10 @@ mod tests {
 
     /// A wall clock that shares no instant with any fixture S3 key.
     ///
-    /// Load-bearing, and the hard way round: `t0()` is 2026-07-24, which is day
-    /// of year *205* — the same day the `..._s2026205....nc` fixture keys encode.
-    /// Handing `granule_start_of` a `now` of `t0()` therefore made "dated from
-    /// the key" and "dated from the wall clock" produce the identical answer,
-    /// and a mutant that ignored the key outright survived the whole suite. Any
-    /// fixture that feeds a `now` alongside a real key must use this.
+    /// `t0()` is 2026-07-24 = day of year 205, the same day the
+    /// `..._s2026205....nc` fixture keys encode, so passing it as `now` makes
+    /// "dated from the key" and "dated from the wall clock" indistinguishable.
+    /// Any fixture feeding a `now` alongside a real key must use this.
     fn wall_clock_unlike_keys() -> NaiveDateTime {
         t0() + TimeDelta::hours(3) + TimeDelta::minutes(7)
     }
@@ -1817,12 +1573,8 @@ mod tests {
     /// does: a granule is keyed by the *start* of the ~20 s span it covers, so
     /// its records land at or after that instant.
     ///
-    /// Deriving the start from the fixture's own contents keeps every populated
-    /// fixture internally consistent — a start later than the granule's own
-    /// flashes would model a file that cannot exist, and would let retention
-    /// hang on a timestamp the contents contradict. A granule with *no* records
-    /// has no start of its own to derive, which is the entire defect, so those
-    /// fixtures state one explicitly through [`GlmCache::insert`].
+    /// A granule with no records has no start to derive, so those fixtures must
+    /// state one explicitly through [`GlmCache::insert`].
     fn cache_granule(cache: &mut GlmCache, key: &str, flashes: Vec<GlmFlash>) {
         let start = flashes
             .iter()
@@ -1832,14 +1584,12 @@ mod tests {
         cache.insert(key.to_string(), start, flashes);
     }
 
-    /// `cutoff` is *inclusive*. A granule whose newest flash lands exactly on
-    /// the window edge is inside the window the user asked for, and evicting it
-    /// throws away a file we would immediately re-download.
+    /// `cutoff` is *inclusive*: a granule whose newest flash lands exactly on
+    /// the edge would otherwise be evicted and immediately re-downloaded.
     ///
-    /// The tick either side is deliberately one millisecond: GLM times unpack
-    /// through a `0.0003814756 s` scale factor, so sub-second differences are
-    /// the resolution this boundary is actually exercised at, not a contrived
-    /// epsilon.
+    /// The tick either side is one millisecond because GLM times unpack through
+    /// a `0.0003814756 s` scale factor — sub-second is the real resolution here,
+    /// not a contrived epsilon.
     #[test]
     fn evict_before_keeps_a_granule_sitting_exactly_on_the_cutoff() {
         let cutoff = t0();
@@ -1865,11 +1615,10 @@ mod tests {
         );
     }
 
-    /// Eviction is per *granule*, not per flash. A file straddling the cutoff —
-    /// which the newest-but-one file does on essentially every poll, since a
-    /// granule spans ~20 s — must be kept whole; `flashes_in_window` is what
-    /// then hides the stale half. Tightening this to "all flashes in window"
-    /// would evict a live file every tick and re-download it every tick.
+    /// Eviction is per *granule*, not per flash. A granule spans ~20 s, so the
+    /// newest-but-one file straddles the cutoff on essentially every poll;
+    /// tightening this to "all flashes in window" evicts and re-downloads a
+    /// live file every tick.
     #[test]
     fn evict_before_keeps_a_granule_that_straddles_the_cutoff() {
         let cutoff = t0();
@@ -1893,12 +1642,9 @@ mod tests {
         assert!(times.contains(&stale) && times.contains(&fresh));
     }
 
-    /// The two ends of the range, and the degenerate case in between.
-    ///
-    /// "Evict nothing" and "evict everything" are the two shapes that make the
-    /// method look like it works while doing neither: a no-op eviction grows the
-    /// cache without bound and keeps hours-old bolts on screen, and a
-    /// clear-everything eviction re-downloads the whole window every poll.
+    /// The two ends of the range, and the degenerate case in between. A no-op
+    /// eviction grows the cache without bound; a clear-everything eviction
+    /// re-downloads the whole window every poll.
     #[test]
     fn evict_before_handles_an_empty_cache_and_both_extremes() {
         // Empty cache: must not panic, must stay empty.
@@ -1940,26 +1686,11 @@ mod tests {
         );
     }
 
-    /// A granule that parsed to *zero* records is aged by its own start time,
-    /// not thrown away for having nothing to argue with.
+    /// A granule that parsed to *zero* records is aged by its own start time.
     ///
-    /// History, because the inversion here is the point. This test previously
-    /// asserted the opposite — that an empty granule is evicted on the very next
-    /// poll, because "no flash is in window" and "no flash at all" were the same
-    /// predicate to `any(|f| f.time >= cutoff)`. It was pinned as an
-    /// observation, not an endorsement: an empty parse is a normal condition
-    /// (see `a_level_with_no_records_is_empty_not_broken`) and the usual one
-    /// when the user has selected a single level or the sky is quiet, so the
-    /// consequence was that every quiet granule was re-downloaded on every poll
-    /// for as long as it stayed in the listing window — at the 30-minute maximum
-    /// window, roughly 90 granules × ~250 KB ≈ 22 MB re-fetched every 20 s.
-    /// That cost bandwidth, not correctness, which is why the round that found
-    /// it recorded it here instead of changing it under a coverage commit.
-    ///
-    /// The note said a fix belonged in the cache representation, remembering
-    /// "downloaded and empty" as distinct from "not downloaded", and that it
-    /// would land by making the old assertion fail. [`CachedGranule::newest`] is
-    /// that fix, and this is that assertion, inverted.
+    /// Fails if eviction goes back to a predicate over the flashes, which
+    /// evicts every empty granule immediately: at the 30-minute maximum window
+    /// that re-fetched roughly 90 granules × ~250 KB ≈ 22 MB every 20 s.
     #[test]
     fn evict_before_ages_an_empty_granule_by_its_own_start_time() {
         let start = t0();
@@ -1986,11 +1717,8 @@ mod tests {
     }
 
     /// An empty granule ages out on *exactly* the same schedule as a populated
-    /// one — the fix must not buy retention by making quiet granules special.
-    ///
-    /// Both granules below cover the same instant. Whatever cutoff keeps or
-    /// drops one has to keep or drop the other, at every tick, or "downloaded
-    /// and empty" has merely traded one wrong lifetime for another.
+    /// one covering the same instant — retention must not be bought by making
+    /// quiet granules special.
     #[test]
     fn an_empty_granule_ages_out_on_the_same_schedule_as_a_populated_one() {
         let start = t0();
@@ -2014,14 +1742,9 @@ mod tests {
         }
     }
 
-    /// The defect end to end: cache → evict → plan. A granule downloaded once
-    /// and found empty must not be re-queued while it is still in window, and
-    /// must be gone once it is not.
-    ///
-    /// This is the assertion that would catch a regression to re-fetching.
-    /// `evict_before` and `plan_downloads` are the two halves — eviction is what
-    /// used to drop the entry and `plan_downloads` is what then re-queued it, so
-    /// pinning either alone leaves the loop reachable.
+    /// End to end: cache → evict → plan. Both halves are needed — eviction is
+    /// what drops the entry and `plan_downloads` is what re-queues it — so
+    /// pinning either alone leaves the re-fetch loop reachable.
     #[test]
     fn a_quiet_granule_is_downloaded_once_not_once_per_poll() {
         // A real GLM key, so the granule is dated the way production dates it.
@@ -2039,14 +1762,12 @@ mod tests {
             1,
             "an uncached granule must be downloaded once"
         );
-        // `now` is deliberately nowhere near the key's own time, so a granule
-        // dated from the wall clock instead of from its key is visible here
-        // rather than hidden behind two fixtures that happen to coincide.
+        // `now` is nowhere near the key's own time — see
+        // `wall_clock_unlike_keys`.
         cache.insert(key.to_string(), granule_start_of(key, wall_clock_unlike_keys()), Vec::new());
 
         // Polls 2..n, still inside the window: the listing keeps offering it and
-        // the cache must keep answering "already have it". Every one of these
-        // was a ~250 KB re-download.
+        // the cache must keep answering "already have it" (~250 KB per miss).
         for poll in 1..=5 {
             let cutoff = start - TimeDelta::minutes(30) + TimeDelta::seconds(20 * poll);
             cache.evict_before(cutoff);
@@ -2068,20 +1789,15 @@ mod tests {
         );
     }
 
-    /// Every granule a poll parsed reaches the cache, empty ones included.
-    ///
-    /// Dropping the empties here is the same defect from the other end: they
-    /// would never be cached, so `plan_downloads` would re-queue them on the
-    /// next poll and every poll after it, exactly as if eviction had removed
-    /// them.
+    /// Every granule a poll parsed reaches the cache, empty ones included:
+    /// dropping them here makes `plan_downloads` re-queue them every poll.
     #[test]
     fn cache_granules_keeps_the_empty_ones_too() {
         let busy = "GLM-L2-LCFA/2026/205/12/\
                     OR_GLM-L2-LCFA_G19_s20262051200000_e20262051200200_c20262051200214.nc";
         let quiet = "GLM-L2-LCFA/2026/205/12/\
                      OR_GLM-L2-LCFA_G19_s20262051200200_e20262051200400_c20262051200414.nc";
-        // Not `t0()`: see `wall_clock_unlike_keys`. A `now` that coincides with
-        // the keys' own times hides a granule dated from the clock instead.
+        // Not `t0()`: see `wall_clock_unlike_keys`.
         let now = wall_clock_unlike_keys();
 
         let mut cache = GlmCache::default();
@@ -2100,8 +1816,7 @@ mod tests {
             "a granule that downloaded and parsed to nothing is still downloaded"
         );
 
-        // And it is dated from its key, not from `now` — so it ages by when the
-        // data is from, the same as the populated one beside it.
+        // And it is dated from its key, not from `now`.
         cache.evict_before(
             parse_filename_start_time(quiet).expect("fixture key") + TimeDelta::milliseconds(1),
         );
@@ -2112,9 +1827,7 @@ mod tests {
     /// listed, and must stay bounded rather than become either bug it replaced.
     #[test]
     fn granule_start_comes_from_the_key_and_falls_back_to_now() {
-        // Not `t0()`: see `wall_clock_unlike_keys`. With the two equal, "read the
-        // key" and "ignore the key" are indistinguishable and this test proves
-        // nothing.
+        // Not `t0()`: see `wall_clock_unlike_keys`.
         let now = wall_clock_unlike_keys();
         let key = "GLM-L2-LCFA/2026/205/12/\
                    OR_GLM-L2-LCFA_G19_s20262051200000_e20262051200200_c20262051200214.nc";
@@ -2135,12 +1848,9 @@ mod tests {
         );
     }
 
-    /// Both window bounds are inclusive, and both are load-bearing.
-    ///
-    /// Losing the lower bound shows hours-old bolts inside a granule that was
-    /// legitimately retained; losing the upper bound publishes flashes stamped
-    /// after the instant the poll claims to describe. Neither is visible on
-    /// screen, which is why they are pinned at the exact tick.
+    /// Both window bounds are inclusive and both are load-bearing: losing the
+    /// lower one shows hours-old bolts inside a retained granule, losing the
+    /// upper one publishes flashes stamped after the poll's own instant.
     #[test]
     fn the_window_filter_includes_both_bounds() {
         let cutoff = t0();
@@ -2171,15 +1881,10 @@ mod tests {
         );
     }
 
-    /// Wall-clock time is not monotonic, and this poll samples it once with
-    /// `Utc::now()`. An NTP step backwards — or a laptop resuming from sleep
-    /// with a stale RTC — puts `now` *behind* flashes already in the cache.
-    ///
-    /// The required behaviour is that such flashes are hidden from the poll and
-    /// nothing more: they must stay cached, so the moment the clock recovers
-    /// they reappear without a re-download. The upper bound is what makes the
-    /// first half true; the *inclusive* lower bound in `evict_before` is what
-    /// makes the second half true.
+    /// An NTP step backwards (or a resume with a stale RTC) puts `now` behind
+    /// flashes already cached. They must be hidden from the poll and nothing
+    /// more — still cached, so they reappear without a re-download when the
+    /// clock recovers.
     #[test]
     fn a_backwards_clock_hides_flashes_without_losing_them() {
         let window = TimeDelta::minutes(5);
@@ -2223,10 +1928,9 @@ mod tests {
         LevelFailure { satellite, level, sample_error: format!("{level:?} broke") }
     }
 
-    /// Every bucket must land in its own field. Swapping two makes every 503
-    /// read as "product change?"; *dropping* the level bucket restores the
-    /// round-2 regression whole, since an unreported level failure is exactly
-    /// the silence `LevelFailure` was added to break.
+    /// Every bucket must land in its own field: swapping two makes every 503
+    /// read as "product change?", dropping the level bucket makes a broken
+    /// layer silent.
     #[test]
     fn build_outcome_binds_each_bucket_to_its_own_field() {
         let tally = PollTally { in_window: 12 };
@@ -2234,11 +1938,9 @@ mod tests {
             parse_errors: vec!["a.nc: GLM file has no 'flash_lat' variable".into()],
             transport_errors: vec!["b.nc: HTTP status error: 503".into()],
             level_failures: vec![level_failure(GlmSatellite::GoesWest, GlmDataLevel::Flash)],
-            // Deliberately a *superset* of the failures: Group was evaluated
-            // and found healthy. Identical sets would let `evaluated_levels` be
-            // derived from `level_failures` — "evidence from asking, not from
-            // parsing" — which at integration level degenerates into a layer
-            // that can never clear.
+            // A *superset* of the failures: Group was evaluated and found
+            // healthy. Identical sets would let `evaluated_levels` be derived
+            // from `level_failures`, giving a layer that can never clear.
             evaluated_levels: vec![
                 (GlmSatellite::GoesWest, GlmDataLevel::Flash),
                 (GlmSatellite::GoesWest, GlmDataLevel::Group),
@@ -2258,8 +1960,7 @@ mod tests {
         );
         assert_eq!(outcome.queried, vec![GlmSatellite::GoesEast]);
 
-        // The level bucket is carried through untouched — not summarised into a
-        // file count, and not dropped.
+        // Carried through untouched: not summarised into a file count.
         assert_eq!(
             outcome.level_failures,
             vec![level_failure(GlmSatellite::GoesWest, GlmDataLevel::Flash)],
@@ -2342,20 +2043,14 @@ mod tests {
     /// A download that never lands is a *transport* failure, all the way out
     /// through `download_and_parse_one`.
     ///
-    /// Hermetic: port 1 on loopback is the privileged `tcpmux` port and is not
-    /// listening, so the connection is refused immediately. No server is started
-    /// and no external network is touched. This is the end-to-end half of the
-    /// classification — without it, tagging the download stage `Parse` compiles,
-    /// passes, and tells users their GLM product changed whenever S3 throttles.
+    /// Hermetic: loopback port 1 (`tcpmux`) is not listening, so the connection
+    /// is refused immediately.
     #[test]
     fn an_unreachable_host_is_a_transport_failure() {
         // `reqwest` is pinned to `rustls-no-provider`, so `build()` panics with
-        // "No provider set" unless a crypto provider is already installed. This
-        // test used to get one for free from `aws-lc-rs`, which reqwest linked
-        // in via `nexrad-data`'s `aws` feature; with that feature gone the
-        // provider has to be installed deliberately, exactly as production does
-        // it. `tls::client` is not used here because it sets `https_only`, and
-        // the cleartext loopback URL below is the whole point of the test.
+        // "No provider set" unless a crypto provider is installed first.
+        // `tls::client` is not used because it sets `https_only`, and the
+        // cleartext loopback URL below is the point of the test.
         rustdar_radar::tls::init();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2387,7 +2082,7 @@ mod tests {
     }
 
     /// The total/partial distinction drives both the log severity and the panel
-    /// wording, so pin it on the boundary rather than trusting the caller.
+    /// wording.
     #[test]
     fn summarize_failures_distinguishes_total_from_partial() {
         let partial = summarize_failures(12, vec!["a".into(), "b".into()])
@@ -2406,13 +2101,9 @@ mod tests {
         summarize_failures(in_window, errors).expect("failures present")
     }
 
-    /// The floor, asserted against literals.
-    ///
-    /// Deliberately *not* parameterised on `MIN_FILES_FOR_TOTAL_VERDICT`: a loop
-    /// over `1..CONST` is empty when the constant is 1 and passes vacuously, so
-    /// the constant could be reverted to a value that restores the "All 1 files
-    /// failed" defect with the suite green. The literals below are the
-    /// behaviour; the constant is just where it is written down.
+    /// The floor, asserted against literals rather than
+    /// `MIN_FILES_FOR_TOTAL_VERDICT`: a loop over `1..CONST` is empty when the
+    /// constant is 1 and passes vacuously.
     #[test]
     fn total_verdict_needs_more_than_one_file() {
         assert!(
@@ -2454,8 +2145,7 @@ mod tests {
         assert!(flashes.iter().all(|f| f.area.is_none()));
     }
 
-    /// Area is the one optional column, so losing it degrades the popup rather
-    /// than the whole overlay: the flashes still parse, they just carry no area.
+    /// Losing the one optional column degrades the popup, not the whole overlay.
     #[test]
     fn missing_optional_area_degrades_without_failing_the_file() {
         let bytes = synthetic_glm_file(Fixture {

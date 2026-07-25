@@ -1,83 +1,56 @@
 //! CF-convention unpacking for GLM variables.
 //!
-//! # Why this module exists
-//!
-//! An HDF5 reader hands back the bytes a variable stores and nothing more. The
-//! CF packing attributes that say what those bytes *mean* are ordinary
-//! attributes, and applying them is the caller's job. netCDF-C did not do it
-//! either — `Variable::get_values::<f32>()` performed a numeric type
-//! conversion of the bytes on disk and no more — which is the history this
-//! module was written from and the reason it long predates the pure-Rust
-//! reader.
-//!
-//! The GOES GLM L2 LCFA product stores nearly every quantity we care about as
-//! a *packed* 16-bit integer. Reading it without unpacking yields numbers that
-//! are not merely imprecise, they are meaningless. `event_lat` reads back as
-//! `-13585.0`; the real latitude is `38.967°N`. Every event-level strike was
-//! being plotted at a garbage coordinate.
+//! The GOES GLM L2 LCFA product stores nearly every quantity as a *packed*
+//! 16-bit integer, and neither an HDF5 reader nor netCDF-C applies the CF
+//! attributes that say what those bytes mean. Unpacked, `event_lat` reads back
+//! as `-13585.0` where the real latitude is `38.967°N`.
 //!
 //! # The unpacking rules (this module is the specification)
 //!
-//! Any reader feeding this module **must** produce its input in this order, or
-//! it will silently reintroduce the same class of bug. [`super::h5`] does steps
-//! 1 and 2, because only the reader can ask its library for a specific width;
-//! [`unpack`] does the rest:
+//! Order matters. [`super::h5`] does steps 1 and 2 — only the reader can ask
+//! its library for a specific width — and [`unpack`] does the rest:
 //!
-//! 1. **Read the raw storage values in the variable's declared type.** Do not
-//!    let the library widen a `short` to `float` for you before you have
-//!    looked at `_Unsigned` — once it is a float the sign bit is baked in.
+//! 1. **Read the raw storage values in the variable's declared type.** Once a
+//!    `short` has been widened to `float` the sign bit is baked in.
 //!
-//! 2. **Apply `_Unsigned`.** NetCDF-3 has no unsigned types, so the convention
-//!    (inherited by NetCDF-4 files written through the classic model, which is
-//!    what NOAA ships) is to declare the variable `short` and attach
-//!    `_Unsigned = "true"`. The stored bits are then a `u16`, and a raw value
-//!    that reads as a negative `i16` must be *bit-reinterpreted*, not negated:
-//!    `-13585_i16 as u16 == 51951`. This is the subtle step. On disk the HDF5
-//!    datatype really is `H5T_STD_I16LE`, so a reader that trusts the datatype
-//!    alone gets it wrong — the attribute, not the datatype, carries the
-//!    meaning.
+//! 2. **Apply `_Unsigned`.** NetCDF-3 has no unsigned types, so NOAA declares
+//!    the variable `short` and attaches `_Unsigned = "true"`. A raw value that
+//!    reads as a negative `i16` must be *bit-reinterpreted*, not negated:
+//!    `-13585_i16 as u16 == 51951`. On disk the HDF5 datatype really is
+//!    `H5T_STD_I16LE` — the attribute, not the datatype, carries the meaning.
 //!
-//!    `_Unsigned` is spelled as the *string* `"true"` in GLM files, but the
-//!    convention also permits a numeric `1`, so both are accepted.
+//!    GLM spells it as the *string* `"true"`; the convention also permits a
+//!    numeric `1`, so both are accepted.
 //!
 //! 3. **Apply `_FillValue` and `valid_range` in the raw (post-`_Unsigned`,
-//!    pre-scale) domain.** These attributes are stored in the variable's
-//!    declared type, so they carry the same signed/unsigned trap: GLM writes
-//!    `_FillValue = -1s` and `valid_range = 0s, -6s`, which under `_Unsigned`
-//!    mean `65535` and `0..=65530`. Comparing against `-1` would never match.
-//!    A value that is fill or out of range is **missing** — it must not be
-//!    scaled and published as a number.
+//!    pre-scale) domain.** They are stored in the declared type and carry the
+//!    same trap: GLM writes `_FillValue = -1s` and `valid_range = 0s, -6s`,
+//!    which under `_Unsigned` mean `65535` and `0..=65530`. Fill or
+//!    out-of-range values are **missing** and must not be scaled and published.
 //!
-//! 4. **Only then apply `raw * scale_factor + add_offset`.** Either attribute
-//!    may be absent; a missing `scale_factor` means 1 and a missing
-//!    `add_offset` means 0. Both are commonly stored as `float` even on a
-//!    `short` variable, so the arithmetic is done in `f64` to avoid
-//!    accumulating error.
+//! 4. **Only then apply `raw * scale_factor + add_offset`.** A missing
+//!    `scale_factor` means 1 and a missing `add_offset` means 0. Both are
+//!    commonly stored as `float` even on a `short` variable; the arithmetic is
+//!    done in `f64`.
 //!
 //! 5. **Variables genuinely stored as `float`/`double` with no packing
-//!    attributes pass through untouched.** In GLM, `group_lat`/`group_lon` and
-//!    `flash_lat`/`flash_lon` are real `float` degrees — which is exactly why
-//!    the group and flash levels looked plausible on screen and masked the
-//!    fact that the event level was broken.
+//!    attributes pass through untouched.** `group_lat`/`group_lon` and
+//!    `flash_lat`/`flash_lon` are real `float` degrees, which is why those
+//!    levels looked plausible while the event level was garbage.
 //!
-//! 6. **Never hardcode the constants.** `scale_factor`, `add_offset` and the
-//!    time epoch legitimately differ between product versions and between
-//!    spacecraft. `event_lon:add_offset` tracks the satellite sub-point, so it
-//!    is `-141.56` for the GOES-East slot (both G16 and G19 — it follows the
-//!    orbital position, not the spacecraft) but `-203.56` for GOES-West (G18).
-//!    That is a 62° difference, and it moves the *valid interval* too: East
-//!    unpacks to -141.56…-8.44 while West unpacks to -203.56…-70.44, running
-//!    past the antimeridian. Read the constants from the file, every time, and
-//!    see [`super::fetch::normalize_longitude`] for what the West range means
-//!    for consumers.
+//! 6. **Never hardcode the constants.** `event_lon:add_offset` tracks the
+//!    satellite sub-point: `-141.56` for the GOES-East slot (G16 and G19 alike
+//!    — it follows the orbital position) and `-203.56` for GOES-West (G18).
+//!    That moves the valid interval too — East unpacks to -141.56…-8.44, West
+//!    to -203.56…-70.44, past the antimeridian. See
+//!    [`super::fetch::normalize_longitude`].
 
 use std::collections::BTreeMap;
 
 /// Backend-neutral storage type of a variable.
 ///
-/// The only distinction CF unpacking needs is whether the bits on disk are a
-/// *signed* integer (and how wide), because that is the only case `_Unsigned`
-/// reinterprets. Natively unsigned storage and floats are already correct.
+/// Only signed integers (and their width) matter: they are the sole case
+/// `_Unsigned` reinterprets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VarType {
     /// Signed integer storage, width in bytes (1, 2, 4 or 8).
@@ -90,9 +63,8 @@ pub(crate) enum VarType {
 
 /// Backend-neutral attribute value.
 ///
-/// Every numeric attribute is widened to `f64` on the way in, scalar and
-/// vector alike, because CF only ever compares them numerically. Keeping the
-/// original width would mean re-deriving this distinction in each backend.
+/// Numeric attributes are widened to `f64` on the way in, scalar and vector
+/// alike: CF only ever compares them numerically.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum CfAttr {
     /// A numeric attribute, scalar or vector.
@@ -103,11 +75,8 @@ pub(crate) enum CfAttr {
 
 /// A variable's raw storage values plus the metadata CF unpacking needs.
 ///
-/// This is the seam between "get the bytes off disk" (backend-specific) and
-/// "decide what they mean" (this module). Steps 1 and 2 of the rules above —
-/// read in the declared type, then bit-reinterpret through `_Unsigned` — are
-/// the backend's job, because only the backend knows how to ask its library
-/// for a specific width. Everything after that is [`unpack`].
+/// The seam between "get the bytes off disk" (the backend does steps 1 and 2)
+/// and "decide what they mean" ([`unpack`] does the rest).
 pub(crate) struct RawVar {
     /// Raw stored values, already bit-reinterpreted through `_Unsigned`.
     pub raw: Vec<f64>,
@@ -143,16 +112,13 @@ pub(crate) fn unpack(var: &RawVar, name: &str) -> UnpackedVar {
     let fill = attr("_FillValue")
         .and_then(|v| attr_as_f64(&v))
         .map(|v| reinterpret_unsigned(v, vartype, unsigned));
-    // CF also defines `valid_min`/`valid_max` as an alternative spelling. GLM
-    // uses neither, so they are deliberately unsupported rather than
-    // speculatively implemented; a reader porting this must add them if the
-    // product it targets uses them.
+    // CF's alternative `valid_min`/`valid_max` spelling is unsupported: GLM
+    // uses neither.
     let valid_range = attr("valid_range").and_then(|v| {
         let bounds = attr_as_f64_vec(&v);
         if bounds.len() != 2 {
-            // Ignoring a malformed range is the safe direction — it only means
-            // fewer values are marked missing — but it is never expected, so
-            // say so rather than dropping it silently.
+            // Ignoring a malformed range is the safe direction: it can only
+            // mark *fewer* values missing.
             log::warn!(
                 "GLM {name}: valid_range has {} element(s), expected 2; ignoring it",
                 bounds.len()
@@ -162,8 +128,8 @@ pub(crate) fn unpack(var: &RawVar, name: &str) -> UnpackedVar {
         let lo = reinterpret_unsigned(bounds[0], vartype, unsigned);
         let hi = reinterpret_unsigned(bounds[1], vartype, unsigned);
         if lo > hi {
-            // An inverted range would mark *every* value missing, silently
-            // emptying the variable. Refuse it instead.
+            // An inverted range matches nothing and would silently empty the
+            // variable.
             log::warn!(
                 "GLM {name}: valid_range is inverted ({lo}..{hi}) after _Unsigned \
                  reinterpretation; ignoring it rather than discarding every value"
@@ -209,10 +175,7 @@ pub(crate) fn unpack(var: &RawVar, name: &str) -> UnpackedVar {
 }
 
 /// Bit-reinterpret a raw value that the file stores in a *signed* type but
-/// means as unsigned.
-///
-/// This is the step that fixes `-13585 → 51951`. Note it is a bit
-/// reinterpretation, not `abs()` and not a negation.
+/// means as unsigned: `-13585 → 51951`. Not `abs()` and not a negation.
 pub(crate) fn reinterpret_unsigned(raw: f64, vartype: VarType, unsigned: bool) -> f64 {
     if !unsigned {
         return raw;
@@ -244,8 +207,8 @@ pub(crate) fn attr_is_true(v: &CfAttr) -> bool {
 
 /// Coerce a scalar numeric attribute to `f64`.
 ///
-/// NetCDF4 writers frequently store a logically-scalar attribute as a
-/// length-1 vector, so the vector variants are accepted as scalars too.
+/// NetCDF4 writers frequently store a logically-scalar attribute as a length-1
+/// vector, so vectors are accepted as scalars too.
 fn attr_as_f64(v: &CfAttr) -> Option<f64> {
     attr_as_f64_vec(v).first().copied()
 }
@@ -271,11 +234,10 @@ pub(crate) struct TimeUnits {
 /// Parse a CF time `units` string such as
 /// `"seconds since 2026-07-24 12:00:00.000"`.
 ///
-/// GLM's `*_time_offset` variables carry exactly this, and the epoch they
-/// name is the granule's `time_coverage_start`. Reading the epoch from the
-/// variable rather than assuming it keeps the two from silently diverging —
-/// and the unit multiplier means a future switch to `milliseconds since`
-/// cannot quietly shift every strike by three orders of magnitude.
+/// GLM's `*_time_offset` variables carry exactly this, naming the granule's
+/// `time_coverage_start`. Reading the epoch from the variable keeps the two
+/// from silently diverging, and the unit multiplier means a future switch to
+/// `milliseconds since` cannot quietly shift every strike by 1e3.
 pub(crate) fn parse_time_units(units: &str) -> Option<TimeUnits> {
     let (unit, epoch) = units.split_once(" since ")?;
 
@@ -316,12 +278,11 @@ pub(crate) fn parse_cf_epoch(s: &str) -> Option<chrono::NaiveDateTime> {
 mod tests {
     use super::*;
 
-    /// The single most important line in this module: a packed `u16` above
-    /// 32767 reads back from netCDF as a *negative* `i16`, and turning it into
-    /// the right unsigned number is a bit reinterpretation.
+    /// A packed `u16` above 32767 reads back as a *negative* `i16`; recovering
+    /// it is a bit reinterpretation.
     ///
-    /// The values here are the first real `event_lat` sample from
-    /// `noaa-goes19` granule `OR_GLM-L2-LCFA_G19_s20262051200000_...`.
+    /// Values are the first real `event_lat` sample from `noaa-goes19` granule
+    /// `OR_GLM-L2-LCFA_G19_s20262051200000_...`.
     #[test]
     fn unsigned_short_above_32767_reinterprets_not_negates() {
         let ty = VarType::SignedInt(2);
@@ -331,8 +292,7 @@ mod tests {
         // Values below 32768 are unaffected either way.
         assert_eq!(reinterpret_unsigned(11048.0, ty, true), 11048.0);
 
-        // ...and unpacking it must land on a real latitude in Ohio, not on
-        // whatever `-13585 * scale + offset` would produce.
+        // ...and it must unpack to a real latitude in Ohio.
         let lat: f64 = 51951.0 * 0.00203128 + -66.56;
         assert!((lat - 38.967).abs() < 1e-3, "got {lat}");
         let wrong: f64 = -13585.0 * 0.00203128 + -66.56;
@@ -340,8 +300,8 @@ mod tests {
     }
 
     /// `_FillValue = -1s` under `_Unsigned` means 65535, and `valid_range =
-    /// 0s, -6s` means `0..=65530`. Comparing in the signed domain would never
-    /// match, so the fill would be scaled and published as a real number.
+    /// 0s, -6s` means `0..=65530`. A signed-domain comparison never matches, so
+    /// the fill gets scaled and published as a real number.
     #[test]
     fn fill_and_valid_range_reinterpret_through_unsigned() {
         let ty = VarType::SignedInt(2);
@@ -429,13 +389,10 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // File-backed tests.
-    //
-    // These build real NetCDF4 files through the same library that reads the
-    // GOES granules, so they exercise the actual read path rather than a
-    // reimplementation of it. A unit test on `reinterpret_unsigned` alone
-    // could not catch the case that mattered: netCDF-C happily widening a
-    // packed `short` to `f32` before anyone looked at `_Unsigned`.
+    // File-backed tests: real NetCDF4 files through the same library that
+    // reads the GOES granules, so the whole read path is exercised. A unit
+    // test on `reinterpret_unsigned` alone cannot catch a reader that widens a
+    // packed `short` before anyone looks at `_Unsigned`.
     // ---------------------------------------------------------------------
 
     /// Description of a packed 16-bit variable, mirroring how GLM writes one.
@@ -445,10 +402,8 @@ mod tests {
         scale: Option<f32>,
         offset: Option<f32>,
         fill: Option<i16>,
-        /// Written verbatim, element count and all. A `Vec` rather than a pair
-        /// because the *shape* of this attribute is itself under test: a
-        /// `valid_range` that is not exactly two elements is malformed and must
-        /// be ignored, and a pair could not express one.
+        /// Written verbatim, element count and all — a `Vec` rather than a pair
+        /// because a malformed (not-exactly-two) `valid_range` is under test.
         valid_range: Option<Vec<i16>>,
         units: Option<&'a str>,
     }
@@ -469,12 +424,10 @@ mod tests {
 
     /// Write a single packed variable to an HDF5 file and hand back its bytes.
     ///
-    /// `scale_factor` and `add_offset` are declared `f32` here because that is
-    /// what GLM stores, and the value is widened to `f64` before it is written
-    /// so the file holds *exactly* the number a `float` attribute would decode
-    /// to. Writing `152601.9_f64` instead would be a different constant from
-    /// the `152601.859375` the real product yields, and the expectations below
-    /// are pinned to the real one.
+    /// `scale_factor`/`add_offset` are taken as `f32` — GLM's width — and
+    /// widened before writing, so the file holds exactly what a `float`
+    /// attribute decodes to. `152601.9_f64` is a different constant from the
+    /// `152601.859375` the real product yields.
     fn short_var_file(spec: &ShortVar<'_>) -> Vec<u8> {
         let mut w = hdf5_pure::FileBuilder::new();
         let b = w.create_dataset("v");
@@ -523,10 +476,9 @@ mod tests {
             .expect("variable present")
     }
 
-    /// The headline regression: a `u16` above 32767 arrives from netCDF-C as a
-    /// negative `i16`, and must come out of the unpacker as the right
-    /// latitude. `51951` is stored as `-13585`; the real granule's first
-    /// `event_lat` is exactly this.
+    /// A `u16` above 32767 arrives as a negative `i16` and must come out of the
+    /// unpacker as the right latitude. `51951` is stored as `-13585`, which is
+    /// the real granule's first `event_lat`.
     #[test]
     fn packed_unsigned_short_above_32767_unpacks_correctly_from_a_file() {
         let bytes = short_var_file(&ShortVar {
@@ -546,7 +498,7 @@ mod tests {
         // Below 32767 the signed and unsigned readings agree.
         assert!((got[2] - (-44.11)).abs() < 1e-2, "got {}", got[2]);
 
-        // And the number the unfixed code produced is not a latitude at all.
+        // The unreinterpreted reading is not a latitude at all.
         assert!(got[0] > 0.0 && got[0] < 90.0);
     }
 
@@ -563,9 +515,8 @@ mod tests {
         assert_eq!(read_v(&bytes).values[0], Some(-13585.0));
     }
 
-    /// `_FillValue = -1s` under `_Unsigned` means 65535. Comparing in the
-    /// signed domain would miss it and publish `65535 * scale + offset` as if
-    /// it were a measurement.
+    /// `_FillValue = -1s` under `_Unsigned` means 65535. A signed-domain
+    /// comparison misses it and publishes `65535 * scale + offset`.
     #[test]
     fn fill_value_becomes_missing_not_a_number() {
         let bytes = short_var_file(&ShortVar {
@@ -636,8 +587,7 @@ mod tests {
     }
 
     /// Variables genuinely stored as `float` with no packing attributes — GLM's
-    /// `group_lat`/`flash_lat` — must come through bit-for-bit. This is the
-    /// half of the product that looked fine and hid the bug.
+    /// `group_lat`/`flash_lat` — must come through bit-for-bit.
     #[test]
     fn float_variable_passes_through_unchanged() {
         let bytes =
@@ -651,16 +601,11 @@ mod tests {
 
     /// An inverted `valid_range` is refused, not honoured.
     ///
-    /// The trap is that "inverted" is only decidable *after* `_Unsigned`
-    /// reinterpretation, and the two orderings look the same in the signed
-    /// domain the file is written in. GLM's real range is `0s, -6s`, which is
-    /// `0..=65530` — fine. Transpose it to `-6s, 0s` and it becomes
-    /// `65530..=0`, which matches nothing: every value in the variable would be
-    /// marked missing and the layer would go dark with no error anywhere.
-    ///
-    /// A future reader that checks `lo > hi` in the *signed* domain gets this
-    /// exactly backwards — it would accept the inverted range and reject the
-    /// real one.
+    /// "Inverted" is only decidable *after* `_Unsigned` reinterpretation: GLM's
+    /// real range `0s, -6s` is `0..=65530`, while the transposed `-6s, 0s` is
+    /// `65530..=0`, which matches nothing and empties the variable. A `lo > hi`
+    /// check in the *signed* domain gets this exactly backwards — it accepts
+    /// the inverted range and rejects the real one.
     #[test]
     fn an_inverted_valid_range_is_refused_rather_than_emptying_the_variable() {
         let inverted = read_v(&short_var_file(&ShortVar {
@@ -680,8 +625,7 @@ mod tests {
         );
 
         // The same two bounds the right way round are the real GLM attribute,
-        // and they must still be enforced — refusing inverted ranges is not
-        // licence to stop checking ranges.
+        // and must still be enforced.
         let correct = read_v(&short_var_file(&ShortVar {
             values: &[100, 200, -3], // -3 == 65533, past the 65530 cap
             unsigned: true,
@@ -691,8 +635,7 @@ mod tests {
         }));
         assert_eq!(correct.values, vec![Some(100.0), Some(200.0), None]);
 
-        // Inversion is refused on a plainly signed variable too — nothing about
-        // the check is specific to `_Unsigned`, it is just where it bites.
+        // Inversion is refused on a plainly signed variable too.
         let signed = read_v(&short_var_file(&ShortVar {
             values: &[-20, 0, 20],
             unsigned: false,
@@ -703,19 +646,14 @@ mod tests {
         assert_eq!(signed.values, vec![Some(-20.0), Some(0.0), Some(20.0)]);
     }
 
-    /// `valid_range` is defined as exactly two elements. Anything else is
-    /// malformed and is ignored wholesale.
-    ///
-    /// Ignoring is the safe direction — it can only mark *fewer* values missing,
-    /// never invent an empty variable — and it is the direction a reader has to
-    /// choose deliberately. Quietly taking the first two elements of a longer
-    /// attribute would apply a range the file never declared; reaching for
-    /// `bounds[1]` of a shorter one is an outright panic on a granule the user
-    /// cannot control.
+    /// `valid_range` is defined as exactly two elements; anything else is
+    /// malformed and ignored wholesale. Taking the first two of a longer
+    /// attribute applies a range the file never declared, and `bounds[1]` of a
+    /// shorter one panics on a granule the user cannot control.
     #[test]
     fn a_valid_range_that_is_not_two_elements_is_ignored() {
-        // Three elements. The first two happen to be the real GLM range, so
-        // honouring them would drop 65533 and look entirely plausible.
+        // Three elements, whose first two are the real GLM range — honouring
+        // them would drop 65533 and look plausible.
         let three = read_v(&short_var_file(&ShortVar {
             values: &[100, -3],
             unsigned: true,
@@ -741,22 +679,16 @@ mod tests {
         assert_eq!(one.values, vec![Some(100.0), Some(65533.0)]);
     }
 
-    /// A value that unpacks to NaN or ±inf is missing, not a measurement.
+    /// A value that unpacks to NaN or ±inf is missing, not a measurement. Two
+    /// routes in: coefficients that overflow `raw * scale + offset`, and a
+    /// genuine `float` variable (GLM's `flash_lat`) holding NaN on disk with no
+    /// `_FillValue` declared, where CF's fill machinery never sees it.
     ///
-    /// Two ways in, and both are real. A packed variable can carry coefficients
-    /// that overflow the arithmetic — the values here are deliberately absurd,
-    /// but nothing in the format prevents them and `raw * scale + offset` has no
-    /// other guard. And a genuine `float` variable (GLM's `flash_lat`) can hold
-    /// NaN on disk directly, where CF's fill machinery never sees it because no
-    /// `_FillValue` was declared.
-    ///
-    /// Publishing either is worse than dropping it: `rasterize` sizes bolts by
-    /// `energy.log10()` and positions them by lat/lon, so a NaN propagates into
-    /// the projection instead of announcing itself.
+    /// A published NaN propagates into the projection instead of announcing
+    /// itself — `rasterize` sizes bolts by `energy.log10()`.
     #[test]
     fn non_finite_unpacked_values_are_missing_not_published() {
-        // 100 * inf == inf, and 0 * inf == NaN — both non-finite, by different
-        // routes through the same expression.
+        // 100 * inf == inf, 0 * inf == NaN.
         let overflowed = read_v(&short_var_file(&ShortVar {
             values: &[100, 0],
             unsigned: true,

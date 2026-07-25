@@ -1,14 +1,11 @@
-//! NWS-style station model plot rendering via [`PointPainter`].
+//! NWS-style station model plots. Field placement is the standard convention,
+//! not a layout choice:
 //!
-//! Draws METAR surface observations as standard meteorological station model
-//! plots with three progressive detail tiers based on map zoom level:
-//!
-//! - **Tier 1** (zoom < 6): flight-category-coloured filled circle.
-//! - **Tier 2** (zoom 6–9): circle + temperature (upper-left) + dewpoint
-//!   (lower-left) + wind barb.
-//! - **Tier 3** (zoom ≥ 10): full station model — all of tier 2 plus altimeter
-//!   (upper-right), visibility (left), present weather symbol, and station ID
-//!   (lower-right).
+//! - **Tier 1** (zoom < 6): flight-category circle only.
+//! - **Tier 2** (zoom 6–9): + temperature (upper-left), dewpoint (lower-left),
+//!   wind barb.
+//! - **Tier 3** (zoom ≥ 10): + altimeter (upper-right), visibility (left),
+//!   present weather symbol, station ID (lower-right).
 
 use crate::metar::types::{CloudLayer, FlightCategory, MetarOb, WindDir};
 use crate::render::draw::{DrawPointContext, PointPainter, TextAnchor};
@@ -38,7 +35,6 @@ const BARB_STROKE_WIDTH: f32 = 1.5;
 
 // ── Public entry point ────────────────────────────────────────────────────
 
-/// Draw a complete station model plot for a single METAR observation.
 pub fn draw_metar_station(ob: &MetarOb, painter: &mut dyn PointPainter, ctx: &DrawPointContext) {
     let zoom = ctx.zoom;
     let fc_color = flight_category_color(ob.flight_category);
@@ -46,14 +42,14 @@ pub fn draw_metar_station(ob: &MetarOb, painter: &mut dyn PointPainter, ctx: &Dr
     let font_size = font_size_for_zoom(zoom);
     let circle_r = circle_radius_for_zoom(zoom);
 
-    // ── Tier 1: cloud cover / flight category circle ──────────────────
+    // ── Tier 1 ────────────────────────────────────────────────────────
     draw_cloud_cover_circle(painter, ob, fc_color, circle_r, ctx.is_dark);
 
     if zoom < TIER2_ZOOM {
         return;
     }
 
-    // ── Tier 2: temperature + dewpoint + wind barb ────────────────────
+    // ── Tier 2 ────────────────────────────────────────────────────────
     if let Some(tc) = ob.temp_c {
         let tf = tc * 9.0 / 5.0 + 32.0;
         painter.text(TEMP_OFFSET, &format!("{tf:.0}"), text_color, font_size, TextAnchor::BottomRight);
@@ -70,8 +66,10 @@ pub fn draw_metar_station(ob: &MetarOb, painter: &mut dyn PointPainter, ctx: &Dr
         return;
     }
 
-    // ── Tier 3: altimeter, visibility, wx, station ID ─────────────────
+    // ── Tier 3 ────────────────────────────────────────────────────────
     if let Some(alt) = ob.altimeter_hpa {
+        // Station-model convention: the altimeter is plotted as the last three
+        // digits of the inHg value in hundredths, so 30.04 inHg prints "004".
         let in_hg_tenths = ((alt * 0.02953 * 100.0).round() as i32) % 1000;
         painter.text(
             ALTIMETER_OFFSET,
@@ -93,16 +91,14 @@ pub fn draw_metar_station(ob: &MetarOb, painter: &mut dyn PointPainter, ctx: &Dr
     painter.text(ID_OFFSET, &ob.station_id, text_color, font_size * 0.75, TextAnchor::TopLeft);
 }
 
-/// Clickable/hoverable radius for a station at the given zoom.
 pub fn hit_radius_for_zoom(zoom: f32) -> f32 {
     if zoom < TIER2_ZOOM {
         circle_radius_for_zoom(zoom) + 2.0
     } else {
-        30.0 // Larger hit area when full model is displayed
+        30.0 // Must cover the whole plotted model, not just the circle.
     }
 }
 
-/// Build a short hover tooltip string for a METAR observation.
 pub fn hover_text_for_metar(ob: &MetarOb, prefs: &rustdar_units::UserPreferences) -> String {
     let mut parts = vec![ob.station_id.clone()];
 
@@ -165,20 +161,17 @@ fn draw_cloud_cover_circle(
     let outline_color = if is_dark { [255, 255, 255, 180] } else { [40, 40, 40, 180] };
 
     if fill_fraction >= 0.99 {
-        // OVC — fully filled
+        // OVC
         painter.circle_filled([0.0, 0.0], radius, fc_color);
     } else if fill_fraction <= 0.01 {
-        // CLR/SKC — empty, outline only
-        // (draw nothing for fill)
+        // CLR/SKC: outline only.
     } else if fill_fraction >= 0.5 {
-        // BKN — filled circle with a vertical open slice on the right
+        // BKN: filled, with an open slice on the right faked by overpainting
+        // in the background colour — `PointPainter` has no arc primitive.
         painter.circle_filled([0.0, 0.0], radius, fc_color);
-        // Approximate the open slice with a small unfilled region:
-        // Draw the background color over the right side
         let bg = if is_dark { [30, 30, 30, 230] } else { [245, 245, 245, 230] };
         let open_fraction = 1.0 - fill_fraction;
         let half_w = radius * open_fraction * 2.0;
-        // Cover the right portion with background-colored half
         let pts: [[f32; 2]; 4] = [
             [radius - half_w, -radius],
             [radius, -radius],
@@ -187,8 +180,7 @@ fn draw_cloud_cover_circle(
         ];
         painter.filled_polygon(&pts, bg);
     } else {
-        // FEW/SCT — partially filled from the left
-        // Fill portion from -radius to the fill boundary
+        // FEW/SCT: partially filled from the left.
         let fill_x = -radius + 2.0 * radius * fill_fraction;
         let pts: [[f32; 2]; 4] = [
             [-radius, -radius * 0.8],
@@ -199,13 +191,13 @@ fn draw_cloud_cover_circle(
         painter.filled_polygon(&pts, fc_color);
     }
 
-    // Outline in flight category color
     painter.circle_stroke([0.0, 0.0], radius, fc_color, 1.5);
-    // Thin outline for contrast
+    // Second, thinner ring: contrast against the map underneath.
     painter.circle_stroke([0.0, 0.0], radius, outline_color, 0.5);
 }
 
-/// Cloud cover fraction from the highest cloud layer coverage.
+/// The *greatest* coverage of any layer, in oktas-as-fraction. Not the highest
+/// layer: sky cover is reported cumulatively, so the top layer is the total.
 fn cloud_cover_fraction(clouds: &[CloudLayer]) -> f32 {
     let mut max_fraction = 0.0_f32;
     for layer in clouds {
@@ -224,19 +216,13 @@ fn cloud_cover_fraction(clouds: &[CloudLayer]) -> f32 {
 
 // ── Wind barb ─────────────────────────────────────────────────────────────
 
-/// Draw a standard WMO wind barb extending from the station circle.
-///
-/// The barb staff extends in the direction the wind blows FROM.
-/// - Pennant (filled triangle) = 50 kt
-/// - Full barb (line) = 10 kt
-/// - Half barb (short line) = 5 kt
-/// - Calm (speed 0 or None) = larger circle outline, no staff
-/// - Variable direction = that circle plus a second concentric ring
+/// Standard WMO barb. The staff points in the direction the wind blows FROM.
+/// Pennant (filled triangle) = 50 kt, full barb = 10 kt, half barb = 5 kt.
+/// Calm draws a larger ring and no staff; variable adds a second ring.
 ///
 /// A staff is drawn only for [`WindDir::Degrees`]. Defaulting a missing or
-/// variable direction to `0` would point the barb due north — which is what a
-/// quarter of the AWC feed used to render, since AWC encodes both calm and
-/// variable as `wind_dir_degrees=0`.
+/// variable direction to `0` points the barb due north, which is how a quarter
+/// of the AWC feed used to render.
 fn draw_wind_barb(
     painter: &mut dyn PointPainter,
     wind_dir: Option<WindDir>,
@@ -249,33 +235,30 @@ fn draw_wind_barb(
     // No direction to point: calm, variable, or no wind data at all.
     let Some(dir_deg) = wind_dir.and_then(WindDir::bearing) else {
         painter.circle_stroke([0.0, 0.0], circle_radius + 2.0, color, 1.0);
-        // A variable wind is a real wind, so mark it apart from dead calm
-        // rather than letting a gusty VRB18KT look like nothing at all.
+        // A variable wind is a real wind: a gusty VRB18KT must not read as calm.
         if wind_dir == Some(WindDir::Variable) {
             painter.circle_stroke([0.0, 0.0], circle_radius + 4.5, color, 1.0);
         }
         return;
     };
 
-    // Calm — no barb, just a slightly larger circle
+    // Below 3 kt the convention is calm: ring, no barb.
     if speed < 3 {
         painter.circle_stroke([0.0, 0.0], circle_radius + 2.0, color, 1.0);
         return;
     }
 
     let dir_deg = dir_deg as f32;
-    // Wind direction is where wind comes FROM — barb points that direction
-    let dir_rad = (dir_deg - 90.0).to_radians(); // Rotate so 0° (north) points up
+    // -90 puts 0° (north) up-screen; the staff then runs toward the FROM bearing.
+    let dir_rad = (dir_deg - 90.0).to_radians();
 
     let (sin_d, cos_d) = dir_rad.sin_cos();
 
-    // Staff endpoint (from circle edge outward)
     let staff_start_x = cos_d * circle_radius;
     let staff_start_y = sin_d * circle_radius;
     let staff_end_x = cos_d * (circle_radius + BARB_STAFF_LENGTH);
     let staff_end_y = sin_d * (circle_radius + BARB_STAFF_LENGTH);
 
-    // Draw staff
     painter.line(
         [staff_start_x, staff_start_y],
         [staff_end_x, staff_end_y],
@@ -283,7 +266,7 @@ fn draw_wind_barb(
         BARB_STROKE_WIDTH,
     );
 
-    // Decompose speed into pennants (50kt), full barbs (10kt), half barbs (5kt)
+    // 50 / 10 / 5 kt; a remainder of 3 or more rounds up to a half barb.
     let mut remaining = speed;
     let pennants = remaining / 50;
     remaining %= 50;
@@ -291,14 +274,14 @@ fn draw_wind_barb(
     remaining %= 10;
     let half_barbs = if remaining >= 3 { 1 } else { 0 };
 
-    // Perpendicular direction for barb lines (always to the left when facing the wind)
+    // Barbs sit on the left of the staff facing the wind — Northern Hemisphere
+    // convention; the Southern Hemisphere mirrors it.
     let perp_x = -sin_d;
     let perp_y = cos_d;
 
-    // Start drawing from the end of the staff, working inward
-    let mut pos = 0.0_f32; // Distance from staff end back toward center
+    // Distance back from the staff end; barbs fill inward from the tip.
+    let mut pos = 0.0_f32;
 
-    // Pennants
     for _ in 0..pennants {
         let base_x = staff_end_x - cos_d * pos;
         let base_y = staff_end_y - sin_d * pos;
@@ -314,7 +297,6 @@ fn draw_wind_barb(
         pos += PENNANT_WIDTH + 1.0;
     }
 
-    // Full barbs
     for _ in 0..full_barbs {
         let base_x = staff_end_x - cos_d * pos;
         let base_y = staff_end_y - sin_d * pos;
@@ -325,9 +307,9 @@ fn draw_wind_barb(
         pos += BARB_SPACING;
     }
 
-    // Half barb
     if half_barbs > 0 {
-        // If this is the only barb, offset it slightly from the end
+        // A lone half barb is inset from the tip, per convention, so 5 kt is
+        // not confusable with a full barb.
         if pennants == 0 && full_barbs == 0 {
             pos += BARB_SPACING;
         }
@@ -342,21 +324,14 @@ fn draw_wind_barb(
 
 // ── Present weather symbols (vector-drawn WMO standard) ───────────────────
 //
-// WMO present weather symbols are NOT Unicode characters — they are
-// specialized meteorological glyphs that must be drawn as vector graphics.
-// Each symbol is composed of lines, dots, circles, and filled polygons
-// rendered via the `PointPainter` trait at a given offset from center.
-//
-// Symbol scale: drawn within a ~10×10 pixel bounding box centered on `off`.
+// WMO present-weather symbols have no Unicode equivalents, so each is drawn
+// from primitives inside a ~10×10 px box centred on `off`.
 
-/// Draw the WMO present weather symbol for a METAR wx_string.
-///
-/// Parses the METAR present weather group and draws the most significant
-/// phenomenon as a standard WMO symbol using line/circle primitives.
+/// **Order is load-bearing**: the branches run most- to least-significant
+/// phenomenon, and several codes are substrings of others.
 fn draw_wx_symbol(painter: &mut dyn PointPainter, off: [f32; 2], wx: &str, color: [u8; 4]) {
     let wx_upper = wx.to_uppercase();
 
-    // Dispatch to drawing function for most significant phenomenon
     if wx_upper.contains("TS") {
         draw_wx_thunderstorm(painter, off, color);
     } else if wx_upper.contains("FZRA") {
@@ -418,9 +393,7 @@ fn draw_wx_drizzle(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8; 4]
 /// Snow (SN/SG): a six-pointed asterisk (3 crossing lines)
 fn draw_wx_snow(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8; 4]) {
     let r = 4.0_f32;
-    // Vertical
     painter.line([off[0], off[1] - r], [off[0], off[1] + r], color, 1.2);
-    // 60° diagonals
     let dx = r * 0.866; // cos(30°)
     let dy = r * 0.5;   // sin(30°)
     painter.line([off[0] - dx, off[1] - dy], [off[0] + dx, off[1] + dy], color, 1.2);
@@ -435,9 +408,7 @@ fn draw_wx_snow_heavy(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8;
 
 /// Freezing rain (FZRA): rain dot with a small arc/line above
 fn draw_wx_freezing_rain(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8; 4]) {
-    // Rain dot
     painter.circle_filled([off[0], off[1] + 1.0], 2.0, color);
-    // "S"-curve freezing indicator above
     painter.line(
         [off[0] - 3.0, off[1] - 4.0],
         [off[0], off[1] - 2.0],
@@ -453,7 +424,6 @@ fn draw_wx_freezing_rain(painter: &mut dyn PointPainter, off: [f32; 2], color: [
 /// Freezing drizzle (FZDZ): drizzle comma with freezing indicator
 fn draw_wx_freezing_drizzle(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8; 4]) {
     draw_wx_drizzle(painter, [off[0], off[1] + 1.5], color);
-    // "S"-curve above
     painter.line(
         [off[0] - 3.0, off[1] - 4.0],
         [off[0], off[1] - 2.0],
@@ -478,7 +448,6 @@ fn draw_wx_ice_pellets(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8
 
 /// Hail (GR/GS): open triangle with a line underneath
 fn draw_wx_hail(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8; 4]) {
-    // Triangle outline via lines
     painter.line(
         [off[0], off[1] - 4.0],
         [off[0] - 3.5, off[1] + 2.0],
@@ -494,7 +463,6 @@ fn draw_wx_hail(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8; 4]) {
         [off[0] + 3.5, off[1] + 2.0],
         color, 1.2,
     );
-    // Horizontal line beneath
     painter.line(
         [off[0] - 3.5, off[1] + 4.5],
         [off[0] + 3.5, off[1] + 4.5],
@@ -504,7 +472,6 @@ fn draw_wx_hail(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8; 4]) {
 
 /// Thunderstorm (TS): arrow pointing right, with a kink (lightning bolt shape)
 fn draw_wx_thunderstorm(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8; 4]) {
-    // Lightning bolt: zigzag from top to bottom
     let pts = [
         [off[0] + 1.0, off[1] - 5.0],
         [off[0] - 2.0, off[1] - 1.0],
@@ -514,7 +481,6 @@ fn draw_wx_thunderstorm(painter: &mut dyn PointPainter, off: [f32; 2], color: [u
     for i in 0..pts.len() - 1 {
         painter.line(pts[i], pts[i + 1], color, 1.5);
     }
-    // Small arrowhead at bottom
     painter.line(
         [off[0] - 2.0, off[1] + 3.0],
         [off[0] - 0.5, off[1] + 2.0],
@@ -557,7 +523,6 @@ fn draw_wx_haze(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8; 4]) {
 
 /// Smoke (FU/VA): a curved hook rising upward
 fn draw_wx_smoke(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8; 4]) {
-    // Rising curve: small "S" shaped smoke wisp
     painter.line(
         [off[0], off[1] + 4.0],
         [off[0] + 2.0, off[1] + 1.0],
@@ -577,13 +542,11 @@ fn draw_wx_smoke(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8; 4]) 
 
 /// Squall (SQ): arrow-like symbol pointing up-right
 fn draw_wx_squall(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8; 4]) {
-    // Vertical staff
     painter.line(
         [off[0], off[1] + 4.0],
         [off[0], off[1] - 4.0],
         color, 1.5,
     );
-    // Arrowhead at top
     painter.line(
         [off[0], off[1] - 4.0],
         [off[0] - 3.0, off[1] - 1.0],
@@ -602,8 +565,6 @@ mod tests {
     use crate::metar::types::Visibility;
     use rustdar_units::{SpeedUnit, UserPreferences};
 
-    /// Records what the station model asked to be drawn, so tests can assert on
-    /// geometry and text without a real painter.
     #[derive(Default)]
     struct RecordingPainter {
         texts: Vec<String>,
@@ -668,15 +629,13 @@ mod tests {
         p
     }
 
-    /// Formerly `if vis >= 10.0 { "10" }` — a branch the discarded `10+` values
-    /// could never reach. It is reachable now, and it keeps the `+`.
+    /// Fails if the plot drops the `+` from an "or greater" visibility.
     #[test]
     fn the_plot_shows_the_or_greater_marker() {
         let p = plot(Some(Visibility { miles: 10.0, or_greater: true }));
         assert!(p.texts.contains(&"10+".to_string()), "drew {:?}", p.texts);
     }
 
-    /// And a measurement above 10 is not flattened into that bound.
     #[test]
     fn the_plot_does_not_flatten_a_measurement_into_the_bound() {
         let p = plot(Some(Visibility { miles: 15.0, or_greater: false }));
@@ -684,7 +643,6 @@ mod tests {
         assert!(!p.texts.contains(&"10+".to_string()));
     }
 
-    /// Formerly `if vis >= 10.0 { "10+SM" }`, unreachable for the same reason.
     #[test]
     fn hover_text_reports_unrestricted_visibility() {
         let text =
@@ -707,13 +665,13 @@ mod tests {
         p
     }
 
-    /// A barb staff runs outward from the circle; nothing else in the barb does.
+    /// The staff is always the first line drawn.
     fn staff_end(p: &RecordingPainter) -> Option<[f32; 2]> {
         p.lines.first().map(|(_, to)| *to)
     }
 
-    /// The bug: 93 of 4,933 measured rows were variable winds at 3 kt or more,
-    /// and every one drew a staff pointing due north.
+    /// Fails if VRB draws a staff. 93 of 4,933 measured rows were variable at
+    /// 3 kt or more, and every one pointed due north.
     #[test]
     fn a_variable_wind_draws_no_staff_however_hard_it_blows() {
         for speed in [3, 6, 18, 25] {
@@ -731,7 +689,7 @@ mod tests {
         assert!(barb(None, None).lines.is_empty());
     }
 
-    /// A variable wind is a real wind; it must not look identical to dead calm.
+    /// Fails if variable renders identically to dead calm.
     #[test]
     fn a_variable_wind_is_marked_apart_from_dead_calm() {
         let calm = barb(Some(WindDir::Calm), Some(0));
@@ -741,17 +699,16 @@ mod tests {
         assert_ne!(vrb.strokes[0].0, vrb.strokes[1].0, "the rings differ in size");
     }
 
-    /// The counterpart: a real 360° wind still gets a staff, pointing north.
+    /// The counterpart: 360° is a real bearing and must still draw a staff.
     #[test]
     fn a_genuine_northerly_still_draws_a_northward_staff() {
         let p = barb(Some(WindDir::Degrees(360)), Some(10));
         let end = staff_end(&p).expect("360° is a bearing and must draw a staff");
-        // Screen space: north is -y, and the staff runs from the circle outward.
+        // Screen space: north is -y.
         assert!(end[0].abs() < 1e-3, "a northerly staff has no x component: {end:?}");
         assert!(end[1] < -5.0, "a northerly staff points up-screen: {end:?}");
     }
 
-    /// Direction still drives the staff — this is what regressed silently.
     #[test]
     fn the_staff_follows_the_reported_bearing() {
         let east = staff_end(&barb(Some(WindDir::Degrees(90)), Some(10))).unwrap();
@@ -763,9 +720,7 @@ mod tests {
 
     // ── Hover text ────────────────────────────────────────────────────────
 
-    /// The `"VRB"` fallback used to be unreachable: AWC never leaves the
-    /// direction column empty for a variable wind, so `wind_dir` was always
-    /// `Some(0)` and the hover read "000°".
+    /// Fails if the hover reads "000°" for a variable wind.
     #[test]
     fn hover_text_says_vrb_for_a_variable_wind() {
         let text =

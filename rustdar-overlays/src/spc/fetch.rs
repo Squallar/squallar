@@ -2,31 +2,25 @@
 //!
 //! # The requests must stay "simple"
 //!
+//! Probed with curl 2026-07-25 on `/products/spcmdrss.xml`,
+//! `/products/outlook/*.lyr.geojson` and `/climo/reports/today_*.csv`:
 //! `www.spc.noaa.gov` answers a plain `GET` with `Access-Control-Allow-Origin: *`
-//! but answers `OPTIONS` with `403` and **no CORS headers at all** — verified
-//! 2026-07-25 for `/products/spcmdrss.xml`, `/products/outlook/*.lyr.geojson`
-//! and `/climo/reports/today_*.csv`. That is the same shape as the Iowa
-//! Environmental Mesonet, which answers `405`.
-//!
-//! So any non-safelisted request header — `User-Agent` included — turns the
-//! `GET` into a preflighted request the browser never gets past, and outlooks,
-//! mesoscale discussions and storm reports go silently missing on web only.
-//! These three fetches used to share the application's ordinary
-//! `User-Agent`-bearing client. They now use [`spc_client`].
+//! but answers `OPTIONS` with `403` and **no CORS headers at all** (IEM answers
+//! `405`, same shape). Any non-safelisted request header — `User-Agent`
+//! included — turns the `GET` into a preflight the browser never gets past, and
+//! outlooks, MDs and storm reports go silently missing on web only. Use
+//! [`spc_client`], never `ctx.client`.
 
 use rustdar_radar::sources::DataSources;
 
 use super::discussion::{SpcDiscussion, parse_md_rss};
 use super::outlook::{OutlookDay, OutlookProduct, SpcOutlook, outlook_url, parse_geojson};
 
-/// How long an SPC request may take.
 const SPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The client every SPC fetch must use.
-///
-/// **Not `ctx.client`** — see the module docs. Split out so the choice is
-/// assertable rather than restated at three handler call sites, and driven by
-/// [`DataSources::spc_sends_user_agent`] so the rule lives with the origin.
+/// The client every SPC fetch must use — **not `ctx.client`**, see module docs.
+/// Driven by [`DataSources::spc_sends_user_agent`] so the rule lives with the
+/// origin, and so the choice is assertable in one place.
 pub fn spc_client(sources: &DataSources) -> Result<reqwest::Client, String> {
     sources
         .spc_client(SPC_TIMEOUT)
@@ -34,12 +28,10 @@ pub fn spc_client(sources: &DataSources) -> Result<reqwest::Client, String> {
         .map_err(|e| format!("could not build the SPC client: {e}"))
 }
 
-/// The mesoscale discussion RSS feed.
 fn md_rss_url(sources: &DataSources) -> String {
     format!("{}/products/spcmdrss.xml", sources.spc_base)
 }
 
-/// Fetch an SPC outlook product and parse it into an `SpcOutlook`.
 pub async fn fetch_outlook(
     client: &reqwest::Client,
     sources: &DataSources,
@@ -75,7 +67,6 @@ pub async fn fetch_outlook(
 }
 
 
-/// Fetch all currently active SPC Mesoscale Discussions from the RSS feed.
 pub async fn fetch_active_discussions(
     client: &reqwest::Client,
     sources: &DataSources,
@@ -104,10 +95,9 @@ pub async fn fetch_active_discussions(
     parse_md_rss(&text)
 }
 
-/// Which products are available for a given day.
 pub fn available_products(day: OutlookDay) -> Vec<OutlookProduct> {
     if day.is_extended() {
-        // Days 4-8: single "any severe" probabilistic product
+        // Days 4-8 publish one "any severe" probabilistic product only.
         return vec![OutlookProduct::Probabilistic];
     }
     match day {
@@ -130,13 +120,8 @@ mod tests {
     use super::*;
     use crate::spc::reports::{StormReportKind, report_url};
 
-    /// SPC must be fetched with a client that carries no `User-Agent`.
-    ///
-    /// SPC was missing from both evidence tables in `DataSources` while three
-    /// handlers fetched it through the shared `User-Agent`-bearing client. It
-    /// answers `GET` with `ACAO: *` and `OPTIONS` with `403` and no CORS
-    /// headers, so outlooks, mesoscale discussions and storm reports were
-    /// preflighted out of existence in the browser — and nowhere else.
+    /// Fails if SPC is fetched with a `User-Agent`-bearing client, which
+    /// preflights outlooks, MDs and storm reports out of existence on web only.
     #[test]
     fn the_spc_client_sends_no_user_agent() {
         let client = spc_client(&DataSources::production()).expect("the SPC client must build");
@@ -148,7 +133,7 @@ mod tests {
         );
     }
 
-    /// …and the origin's recorded rule is what decides that, not a constant.
+    /// Fails if the rule is a constant rather than the origin's recorded one.
     #[test]
     fn the_spc_client_follows_the_origins_recorded_rule() {
         let sources = DataSources { spc_sends_user_agent: true, ..DataSources::production() };
@@ -159,13 +144,8 @@ mod tests {
         );
     }
 
-    /// Every SPC URL is built from `spc_base`, so pointing that field at a mock
-    /// moves all of them.
-    ///
-    /// This is what makes `spc_base` load-bearing: it was a declared field no
-    /// URL was built from, which meant the origin table's own "no production
-    /// origin is one the browser cannot reach" check was inspecting a string
-    /// nothing used.
+    /// Fails if any SPC URL bypasses `spc_base`. Without this the origin
+    /// table's reachability check inspects a string no URL is built from.
     #[test]
     fn every_spc_url_comes_from_the_declared_origin() {
         let sources = DataSources {
@@ -189,9 +169,8 @@ mod tests {
         }
     }
 
-    /// The production paths, transcribed from the endpoints probed live on
-    /// 2026-07-25. Hardcoded expectations, so threading `spc_base` through
-    /// cleanly while mangling a path still fails.
+    /// Paths transcribed from the endpoints probed live 2026-07-25. Hardcoded,
+    /// so threading `spc_base` cleanly while mangling a path still fails.
     #[test]
     fn the_production_spc_paths_are_the_ones_that_were_probed() {
         let s = DataSources::production();

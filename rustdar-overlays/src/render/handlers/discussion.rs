@@ -11,10 +11,8 @@ use crate::spc::colors::md_stroke_color;
 use crate::spc::discussion::SpcDiscussion;
 use crate::types::{GeoBounds, OverlayLabel};
 
-/// Type-erased fetch result for SPC Mesoscale Discussions.
 pub(crate) struct SpcDiscussionFetchResult(pub Result<Vec<SpcDiscussion>, String>);
 
-/// Clickable item representing a single SPC Mesoscale Discussion.
 #[derive(Debug)]
 pub(crate) struct DiscussionItem {
     pub md: SpcDiscussion,
@@ -191,11 +189,9 @@ impl OverlayHandler for SpcDiscussionHandler {
 
     fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>) {
         selections.retain(|sel| {
-            // Keep non-discussion selections
             if sel.kind() != OverlayKind::SpcDiscussions {
                 return true;
             }
-            // Keep only if still in our data
             self.state.data.iter().any(|item| item.matches(sel.as_ref()))
         });
     }
@@ -216,7 +212,7 @@ impl OverlayHandler for SpcDiscussionHandler {
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
         log::info!("Fetching SPC Mesoscale Discussions");
-        // NOT `ctx.client` — SPC answers OPTIONS with 403, so a `User-Agent`
+        // NOT `ctx.client`: SPC answers OPTIONS with 403, so a `User-Agent`
         // makes this fail in the browser. See `spc::fetch`.
         let client = match crate::spc::fetch::spc_client(&ctx.sources) {
             Ok(c) => c,

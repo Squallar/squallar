@@ -5,10 +5,9 @@ use tiny_skia::{
 use crate::types::{HatchPattern, OverlayFeature};
 use crate::render::rasterize::{MercatorBounds, build_polygon_path, strip_closing_dup};
 
-/// Spacing between hatch lines in pixels (matches existing HATCH_SPACING).
+/// Pixels.
 const HATCH_SPACING: f32 = 10.0;
 
-/// Generate and draw hatch lines within a clip mask.
 fn draw_hatch_lines_clipped(
     pixmap: &mut Pixmap,
     clip: &Mask,
@@ -33,7 +32,8 @@ fn draw_hatch_lines_clipped(
     }
 }
 
-/// Draw parallel hatch lines at a given angle within a clip mask.
+/// `angle_degrees` is math convention; `dir_y` is negated for screen y-down,
+/// so 45° draws as a forward slash and 135° as a backslash.
 fn draw_directional_hatch(
     pixmap: &mut Pixmap,
     clip: &Mask,
@@ -103,7 +103,8 @@ fn draw_directional_hatch(
     }
 }
 
-/// Draw CIG hatch lines across all features, respecting exclusion zones.
+/// A higher CIG level's area is excluded from lower levels' hatching, so
+/// nested outlook areas do not accumulate overlapping line sets.
 pub(crate) fn draw_hatch_pass(
     pixmap: &mut Pixmap,
     features: &[OverlayFeature],
@@ -112,14 +113,12 @@ pub(crate) fn draw_hatch_pass(
     h: f32,
     hatch_color: [u8; 4],
 ) {
-/// A polygon with CIG hatch info: feature index, projected path, and projected points.
 struct HatchedPolygon {
     feature_idx: usize,
     path: tiny_skia::Path,
     points: Vec<(f32, f32)>,
 }
 
-    // Collect projected polygon points per CIG level for exclusion masks
     let mut cig2_pts: Vec<Vec<(f32, f32)>> = Vec::new();
     let mut cig3_pts: Vec<Vec<(f32, f32)>> = Vec::new();
     let mut all_hatched: Vec<HatchedPolygon> = Vec::new();
@@ -171,15 +170,14 @@ struct HatchedPolygon {
 }
 
 
-/// Build a combined path: the polygon ring plus all exclusion rings.
-/// Using EvenOdd fill rule, overlapping regions cancel out — exclusions become holes.
+/// One path holding the ring and every exclusion ring. **Must be filled with
+/// `FillRule::EvenOdd`**: that is what turns the exclusions into holes.
 fn build_polygon_with_exclusions(
     polygon_pts: &[(f32, f32)],
     exclusions: &[&[(f32, f32)]],
 ) -> Option<tiny_skia::Path> {
     let mut pb = PathBuilder::new();
 
-    // Add the main polygon contour
     if polygon_pts.len() >= 3 {
         pb.move_to(polygon_pts[0].0, polygon_pts[0].1);
         for &(x, y) in &polygon_pts[1..] {
@@ -188,7 +186,6 @@ fn build_polygon_with_exclusions(
         pb.close();
     }
 
-    // Add exclusion contours (EvenOdd rule makes them subtract)
     for pts in exclusions {
         if pts.len() < 3 {
             continue;

@@ -1,51 +1,29 @@
 //! Which IEM ASOS networks a viewport needs.
 //!
-//! The Iowa Environmental Mesonet serves current observations one *network* at
-//! a time, and its ASOS networks are per-state: `OK_ASOS`, `TX_ASOS`, and so
-//! on. A state's worth of observations is ~72 KB of JSON, so a viewport is
-//! served by fetching the handful of states it overlaps.
+//! IEM's ASOS networks are per-state (`OK_ASOS`, `TX_ASOS`, ...) at ~72 KB of
+//! JSON each. `?networkclass=ASOS` fetches everything in one request but is
+//! **54 MB, served ungzipped** — and it returns valid JSON, so nothing
+//! downstream would notice the switch. Do not use it.
 //!
-//! The alternative — `?networkclass=ASOS`, one request for everything — is
-//! **54 MB and served ungzipped**. It is not an option, and because it returns
-//! perfectly valid JSON nothing downstream would notice if someone switched to
-//! it; [`crate::metar::fetch`]'s URL test is the guard.
-//!
-//! # Where these numbers come from
-//!
-//! Every bound below is decoded from the `extent` column of IEM's own
-//! `https://mesonet.agron.iastate.edu/api/1/networks.json`, which gives each
-//! network a PostGIS polygon in EPSG:4326. They are the extents of the
-//! *stations in the network*, not political borders, so they are exactly the
-//! right thing to test a viewport against — and they are IEM's numbers rather
-//! than a hand-copied gazetteer.
-//!
-//! `networks_table_matches_iems_own_extents` re-fetches that endpoint and
-//! checks this table against it, so drift shows up as a test failure rather
-//! than as a state quietly dropping out of the map.
+//! Bounds below are decoded from the `extent` column of
+//! `https://mesonet.agron.iastate.edu/api/1/networks.json` (PostGIS polygon,
+//! EPSG:4326). They are *station* extents, not political borders.
 
 use crate::types::GeoBounds;
 
-/// One IEM ASOS network and the extent of its stations.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StateNetwork {
     /// Two-letter postal code; the network id is `{state}_ASOS`.
     pub state: &'static str,
-    /// Southernmost station latitude.
     pub min_lat: f64,
-    /// Northernmost station latitude.
     pub max_lat: f64,
-    /// Westernmost station longitude.
     pub min_lon: f64,
-    /// Easternmost station longitude.
     pub max_lon: f64,
 }
 
 impl StateNetwork {
-    /// Whether this network's stations could fall inside `view`.
-    ///
-    /// A plain bounding-box overlap. Deliberately inclusive: a false positive
-    /// costs one 72 KB request, a false negative silently drops every station
-    /// in a state.
+    /// Inclusive on purpose: a false positive costs one 72 KB request, a false
+    /// negative silently drops every station in a state.
     pub fn intersects(&self, view: &GeoBounds) -> bool {
         self.min_lat <= view.max_lat
             && self.max_lat >= view.min_lat
@@ -53,8 +31,7 @@ impl StateNetwork {
             && self.max_lon >= view.min_lon
     }
 
-    /// Great-circle-ish distance from the network's centre to a point, in
-    /// degrees. Used only to rank networks, never to decide membership.
+    /// Degrees, not km. Ranks networks; never decides membership.
     fn centre_distance(&self, lat: f64, lon: f64) -> f64 {
         let clat = (self.min_lat + self.max_lat) / 2.0;
         let clon = (self.min_lon + self.max_lon) / 2.0;
@@ -62,23 +39,12 @@ impl StateNetwork {
     }
 }
 
-/// Most networks to fetch for one viewport.
-///
-/// A fully zoomed-out map overlaps every entry in [`NETWORKS`], which would be
-/// 54 requests and ~3.9 MB. At that zoom the station plot is unreadable
-/// anyway, so the nearest [`MAX_NETWORKS`] to the viewport centre are taken and
-/// the rest dropped. This is a *transfer* cap, not a correctness rule — see
-/// [`networks_for_viewport`].
+/// Transfer cap, not a correctness rule. A zoomed-out map overlaps all of
+/// [`NETWORKS`]: 54 requests, ~3.9 MB, at a zoom where the plot is unreadable.
 pub const MAX_NETWORKS: usize = 12;
 
-/// The viewport to assume when none is known yet.
-///
-/// The first overlay fetch can be issued before any frame has been rendered,
-/// so there is no map extent to scope by. Rather than fetch nothing — which
-/// renders as "no observations" and looks like an outage — this stands in for
-/// "somewhere in the United States" and lets [`MAX_NETWORKS`] pick the states
-/// nearest its centre. It is a fallback, not a default the app should rely on:
-/// once a frame has been drawn the real viewport is used.
+/// Stands in when the first overlay fetch precedes the first rendered frame, so
+/// there is no map extent yet. Fetching nothing looks like an outage.
 pub const DEFAULT_VIEWPORT: GeoBounds = GeoBounds {
     min_lat: 30.0,
     max_lat: 45.0,
@@ -86,19 +52,13 @@ pub const DEFAULT_VIEWPORT: GeoBounds = GeoBounds {
     max_lon: -85.0,
 };
 
-/// The state ASOS networks IEM publishes, with the extents it publishes them
-/// with.
+/// Decoded from `networks.json` on 2026-07-25. 54 entries: 50 states plus AS,
+/// GU, PR, VI. There is no `DC_ASOS`; those stations sit in `VA_ASOS`/`MD_ASOS`.
 ///
-/// Decoded from `networks.json` on 2026-07-25. 54 entries: the 50 states plus
-/// American Samoa, Guam, Puerto Rico and the US Virgin Islands. There is no
-/// `DC_ASOS`; the District's stations sit in `VA_ASOS` and `MD_ASOS`.
-///
-/// Two entries are wider than their territory: `AK` (-176.75..174.22) and `GU`
-/// (144.70..166.74) both span the antimeridian, so IEM's axis-aligned extent
-/// for them is enormous. They are stored as published rather than "corrected",
-/// because the consequence is only an occasional extra request, and inventing
-/// tighter numbers here would be exactly the hand-transcription this table
-/// exists to avoid.
+/// `AK` (-176.75..174.22) and `GU` (144.70..166.74) span the antimeridian, so
+/// IEM's axis-aligned extents for them are enormous. Stored as published: the
+/// cost is an occasional extra request, and tightening them by hand is the
+/// transcription this table exists to avoid.
 pub const NETWORKS: &[StateNetwork] = &[
     StateNetwork { state: "AK", min_lat: 51.7780, max_lat: 71.3826, min_lon: -176.7460, max_lon: 174.2169 },
     StateNetwork { state: "AL", min_lat: 28.9500, max_lat: 34.9600, min_lon: -88.3456, max_lon: -85.0289 },
@@ -156,12 +116,8 @@ pub const NETWORKS: &[StateNetwork] = &[
     StateNetwork { state: "WY", min_lat: 40.9374, max_lat: 45.0117, min_lon: -111.1424, max_lon: -104.0302 },
 ];
 
-/// The state codes to fetch for a viewport, nearest-first, capped at
-/// [`MAX_NETWORKS`].
-///
-/// Ordering matters only because of the cap: without it the result would be an
-/// unordered set. Nearest-to-centre is the ranking because the station a user
-/// is looking at is the one nearest the middle of their screen.
+/// Nearest-first, capped at [`MAX_NETWORKS`]. Ordering matters only because of
+/// the cap.
 pub fn networks_for_viewport(view: &GeoBounds) -> Vec<&'static str> {
     let clat = (view.min_lat + view.max_lat) / 2.0;
     let clon = (view.min_lon + view.max_lon) / 2.0;
@@ -185,27 +141,16 @@ mod tests {
         GeoBounds { min_lat, max_lat, min_lon, max_lon }
     }
 
-    /// A viewport over central Oklahoma must fetch Oklahoma.
-    ///
-    /// The bounds are KTLX's neighbourhood (35.33 N, 97.28 W) padded by a
-    /// degree — an ordinary radar view.
+    /// Bounds are KTLX (35.33 N, 97.28 W) padded by a degree.
     #[test]
     fn a_viewport_over_a_state_selects_that_state() {
         let states = networks_for_viewport(&view(34.3, 36.3, -98.3, -96.3));
         assert!(states.contains(&"OK"), "got {states:?}");
     }
 
-    /// ...and must not fetch states nowhere near it. This is the half that
-    /// makes the scoping worth doing.
-    ///
-    /// The assertion is on the **exact set**, and on its being well under
-    /// [`MAX_NETWORKS`], for a specific reason: a version of
-    /// `networks_for_viewport` that skipped the intersection test entirely
-    /// still excludes Maine and American Samoa from an Oklahoma view, because
-    /// the nearest-first cap does that on its own. Naming only the absent
-    /// states therefore asserts what the *cap* guarantees, not what the
-    /// *filter* does. Requiring the result to be exactly `{OK, TX}` — two
-    /// networks against a cap of twelve — cannot be satisfied by the cap.
+    /// Asserts the **exact set**, not just absent states: with the intersection
+    /// test removed entirely, the nearest-first cap alone still excludes ME and
+    /// AS from an Oklahoma view. Two networks against a cap of twelve cannot be.
     #[test]
     fn a_viewport_over_a_state_skips_distant_states() {
         let mut states = networks_for_viewport(&view(34.3, 36.3, -98.3, -96.3));
@@ -225,10 +170,8 @@ mod tests {
         }
     }
 
-    /// A viewport straddling a border fetches both sides.
-    ///
-    /// The Red River at ~33.9 N separates Oklahoma from Texas; a view spanning
-    /// it needs both networks or half the stations vanish.
+    /// The Red River (~33.9 N) separates OK from TX; a view spanning it needs
+    /// both networks or half the stations vanish.
     #[test]
     fn a_viewport_straddling_a_border_selects_both_states() {
         let states = networks_for_viewport(&view(33.2, 34.6, -98.0, -96.5));
@@ -236,8 +179,7 @@ mod tests {
         assert!(states.contains(&"TX"), "got {states:?}");
     }
 
-    /// The cap holds for a whole-country view, which would otherwise be 54
-    /// requests and ~3.9 MB.
+    /// Uncapped, a whole-country view is 54 requests and ~3.9 MB.
     #[test]
     fn a_continental_viewport_is_capped() {
         let states = networks_for_viewport(&view(24.0, 50.0, -125.0, -66.0));
@@ -249,9 +191,8 @@ mod tests {
         assert!(!states.is_empty());
     }
 
-    /// The cap keeps the *nearest* networks, not the first ones in table
-    /// order. The table is alphabetical, so a truncation without the sort
-    /// would return AK/AL/AR/AS/AZ... for a view centred on Kansas.
+    /// Fails if the truncation loses its sort: the table is alphabetical, so
+    /// that returns AK/AL/AR/AS/AZ... for a view centred on Kansas.
     #[test]
     fn the_cap_keeps_the_networks_nearest_the_viewport_centre() {
         // Centred on Kansas, wide enough to overlap far more than the cap.
@@ -266,9 +207,7 @@ mod tests {
         assert_eq!(states[0], "KS", "nearest-first ordering: {states:?}");
     }
 
-    /// Overlap is inclusive at the edge: a viewport touching a network's
-    /// boundary still selects it. An exclusive comparison drops the stations
-    /// exactly on the seam.
+    /// Fails if the comparison is exclusive, which drops stations on the seam.
     #[test]
     fn overlap_is_inclusive_at_the_boundary() {
         let ok = NETWORKS.iter().find(|n| n.state == "OK").unwrap();
@@ -279,8 +218,6 @@ mod tests {
         assert!(!ok.intersects(&clear), "a gap is not an overlap");
     }
 
-    /// The table must stay well-formed: two-letter codes, no duplicates, and
-    /// no inverted bounds.
     #[test]
     fn the_network_table_is_well_formed() {
         assert_eq!(NETWORKS.len(), 54, "50 states + AS, GU, PR, VI");
@@ -303,11 +240,8 @@ mod tests {
         assert!(!seen.contains("DC"));
     }
 
-    /// Spot-checks against geography, independent of IEM: each state's extent
-    /// must contain a well-known airport in that state.
-    ///
-    /// Coordinates are published airport reference points, not values derived
-    /// from this table.
+    /// Coordinates are published airport reference points, independent of IEM
+    /// and not derived from this table.
     #[test]
     fn each_spot_checked_extent_contains_a_known_airport_in_that_state() {
         // (state, airport, lat, lon)

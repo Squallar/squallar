@@ -1,8 +1,4 @@
-/// A 2D screen-space point.
-///
-/// Used in place of egui's `Pos2` so that geometry algorithms in this crate
-/// remain GUI-framework-agnostic.  Conversion to/from `egui::Pos2` is
-/// trivially implemented in the `rustdar-egui` crate.
+/// A 2D screen-space point. Not `egui::Pos2`: keeps this crate GUI-agnostic.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScreenPoint {
     pub x: f32,
@@ -16,25 +12,18 @@ impl ScreenPoint {
     }
 }
 
-/// Default epsilon (degrees) for Ramer-Douglas-Peucker polygon simplification.
-/// ~0.005° ≈ 500 m — keeps shapes visually accurate at typical map zoom levels
-/// while significantly reducing vertex counts.
+/// Ramer-Douglas-Peucker epsilon, degrees. 0.005° ≈ 500 m.
 pub const SIMPLIFY_EPSILON: f64 = 0.005;
 
-/// Fill alpha for CIG-hatched outlook areas (low opacity so hatching is visible).
+/// Deliberately low so the hatch lines stay visible through the fill.
 pub const CIG_FILL_ALPHA: u8 = 40;
-/// Fill alpha for regular (non-hatched) outlook areas.
 pub const REGULAR_FILL_ALPHA: u8 = 100;
-/// Fill alpha for NWS alert polygons.
 pub const NWS_FILL_ALPHA: u8 = 80;
-/// Stroke alpha (fully opaque) shared by all overlay types.
 pub const STROKE_ALPHA: u8 = 255;
 
-/// A single polygon ring: a sequence of (latitude, longitude) points.
-/// The first ring is the exterior, subsequent rings are holes.
+/// Ring of (latitude, longitude) points. First ring is exterior, rest are holes.
 pub type GeoPolygonRing = Vec<(f64, f64)>;
 
-/// A polygon with an exterior ring and optional holes.
 pub type GeoPolygon = Vec<GeoPolygonRing>;
 
 /// A map label to be drawn at a geographic position.
@@ -46,10 +35,8 @@ pub struct OverlayLabel {
     pub color: [u8; 4],
 }
 
-/// Parse GeoJSON polygon coordinate rings into a `GeoPolygon`.
-///
-/// GeoJSON format: `[ [ [lon, lat], ... ], ... ]`
-/// Returns `(lat, lon)` pairs per ring. Skips degenerate rings with fewer than 3 points.
+/// GeoJSON is `[[[lon, lat], ...], ...]`; output is `(lat, lon)`. Order swaps.
+/// Rings with fewer than 3 points are dropped.
 pub fn parse_polygon_coords(coords: &serde_json::Value) -> Option<GeoPolygon> {
     let rings = coords.as_array()?;
     let mut geo_rings = Vec::with_capacity(rings.len());
@@ -77,20 +64,19 @@ pub fn parse_polygon_coords(coords: &serde_json::Value) -> Option<GeoPolygon> {
     }
 }
 
-/// Hatching pattern for CIG (Conditional Intensity Group) areas.
+/// CIG (Conditional Intensity Group) hatching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HatchPattern {
-    /// No hatching — standard filled polygon.
     None,
-    /// CIG1: dotted hatch lines angled to the left (135° / backslash direction).
+    /// Dotted, 135° (backslash).
     Cig1,
-    /// CIG2: solid hatch lines angled to the right (45° / forward-slash direction).
+    /// Solid, 45° (forward slash).
     Cig2,
-    /// CIG3: solid hatch lines in both directions (cross-hatch).
+    /// Solid, both directions (cross-hatch).
     Cig3,
 }
 
-/// Geographic bounding box for quick viewport culling.
+/// Geographic bounding box for viewport culling.
 #[derive(Debug, Clone, Copy)]
 pub struct GeoBounds {
     pub min_lat: f64,
@@ -100,7 +86,7 @@ pub struct GeoBounds {
 }
 
 impl GeoBounds {
-    /// Compute bounds from a set of (lat, lon) points.
+    /// Points are `(lat, lon)`.
     pub fn from_points(pts: &[(f64, f64)]) -> Option<Self> {
         if pts.is_empty() {
             return None;
@@ -123,7 +109,6 @@ impl GeoBounds {
         })
     }
 
-    /// Check whether this bounds intersects another.
     pub fn intersects(&self, other: &GeoBounds) -> bool {
         self.min_lat <= other.max_lat
             && self.max_lat >= other.min_lat
@@ -132,44 +117,32 @@ impl GeoBounds {
     }
 }
 
-/// Pre-computed triangulation for a single polygon ring.
-/// Indices refer to the exterior ring vertices (with GeoJSON closing
-/// duplicate stripped). Computed once at fetch time and reused across frames.
+/// Computed once at fetch time, reused across frames.
 #[derive(Debug, Clone)]
 pub struct PrecomputedTriangulation {
-    /// Triangle indices into the ring's vertex list.
+    /// Indices into the exterior ring, GeoJSON closing duplicate stripped.
     pub indices: Vec<u32>,
 }
 
-/// A renderable overlay feature with geometry, styling, and metadata.
 #[derive(Debug, Clone)]
 pub struct OverlayFeature {
     /// One or more polygons (from GeoJSON MultiPolygon).
     pub polygons: Vec<GeoPolygon>,
-    /// Fill color as RGBA (alpha controls transparency).
     pub fill_rgba: [u8; 4],
-    /// Stroke/outline color as RGBA.
     pub stroke_rgba: [u8; 4],
-    /// Short label (e.g. "SLGT", "0.05", "CIG1").
+    /// Short label, e.g. "SLGT", "0.05", "CIG1".
     pub label: String,
-    /// Human-readable label (e.g. "Slight Risk", "5% Tornado Risk").
+    /// Long label, e.g. "Slight Risk", "5% Tornado Risk".
     pub label2: String,
-    /// Hatching pattern for CIG areas.
     pub hatch: HatchPattern,
-    /// Pre-computed triangulation for each polygon's exterior ring.
-    /// Indexed parallel to `polygons` — `triangulations[i]` corresponds
-    /// to `polygons[i][0]` (the exterior ring).
+    /// Parallel to `polygons`: `triangulations[i]` is for `polygons[i][0]`.
     pub triangulations: Vec<Option<PrecomputedTriangulation>>,
-    /// Geographic bounding box encompassing all polygons in this feature.
     pub geo_bounds: Option<GeoBounds>,
 }
 
 impl OverlayFeature {
-    /// Build a new `OverlayFeature` and pre-compute triangulation + geo-bounds.
-    ///
-    /// Triangulation is computed once in geo-coordinates (the topology is
-    /// projection-invariant, so the same index buffer works after any
-    /// linear coordinate transform such as Mercator projection).
+    /// Triangulates in geo-coordinates: topology is projection-invariant, so the
+    /// index buffer survives Mercator projection.
     pub fn new(
         polygons: Vec<GeoPolygon>,
         fill_rgba: [u8; 4],
@@ -192,8 +165,7 @@ impl OverlayFeature {
         }
     }
 
-    /// Recompute triangulation and geo-bounds from the current polygons.
-    /// Call this after mutating `polygons` (e.g. after simplification).
+    /// Call after mutating `polygons` (e.g. simplification).
     pub fn recompute_cache(&mut self) {
         self.triangulations = crate::render::geo::precompute_triangulations(&self.polygons);
         self.geo_bounds = crate::render::geo::compute_geo_bounds(&self.polygons);

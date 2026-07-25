@@ -8,15 +8,15 @@ use crate::types::{GeoPolygon, HatchPattern, OverlayFeature};
 use super::alert::NwsAlert;
 use super::colors::alert_color;
 
-/// TTL for cached zone geometries (1 year in seconds).
+/// One year. Zone boundaries are effectively static.
 #[cfg(not(target_arch = "wasm32"))]
 const CACHE_TTL_SECS: u64 = 365 * 24 * 3600;
 
-/// Guards first-per-session WARN log for zone cache write failures.
 #[cfg(not(target_arch = "wasm32"))]
 static CACHE_WRITE_WARNED: AtomicBool = AtomicBool::new(false);
 
-/// Log a cache write failure at WARN level the first time, then DEBUG.
+/// WARN once per session, then DEBUG: a bad cache dir fails on every zone, and
+/// 1000+ identical warnings drown the log.
 #[cfg(not(target_arch = "wasm32"))]
 fn log_cache_write_failure(msg: &str) {
     if CACHE_WRITE_WARNED
@@ -29,32 +29,23 @@ fn log_cache_write_failure(msg: &str) {
     }
 }
 
-/// A cached zone geometry entry, serialized to JSON on disk.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedZone {
-    /// Unix timestamp (seconds since epoch) when this entry was fetched.
+    /// Unix seconds.
     fetched_at: u64,
-    /// Simplified polygon data for the zone.
+    /// Already simplified.
     polygons: Vec<GeoPolygon>,
 }
 
-/// Resolve zone/county geometries for alerts that have no inline polygon.
-///
-/// Fetches boundary polygons from the NWS zones API for each `affectedZones`
-/// URL, then builds `OverlayFeature`s and populates each alert's `features`.
-/// Zone URLs are deduplicated so each county is fetched at most once.
-/// Fetches run concurrently for speed.
-///
-/// When `cache_dir` is provided, zone geometries are cached on disk to avoid
-/// re-fetching 1000+ HTTP requests on every app launch. Cached entries expire
-/// after 1 year.
+/// Fills in `features` for alerts that carry only `affectedZones`. URLs are
+/// deduplicated, so each county is fetched at most once. Without `cache_dir`
+/// this is 1000+ requests on every launch.
 pub async fn resolve_zone_geometries(
     client: &reqwest::Client,
     alerts: &mut [NwsAlert],
     cache_dir: Option<&Path>,
 ) {
-    // Collect unique zone URLs needed (only for alerts with no features yet)
     let mut needed_urls: Vec<String> = Vec::new();
     for alert in alerts.iter() {
         if alert.features.is_empty() && !alert.affected_zones.is_empty() {
@@ -70,7 +61,6 @@ pub async fn resolve_zone_geometries(
         return;
     }
 
-    // Check disk cache first to avoid unnecessary HTTP requests
     let mut zone_cache: HashMap<String, Vec<GeoPolygon>> = HashMap::new();
     let mut urls_to_fetch: Vec<String> = Vec::new();
 
@@ -93,14 +83,13 @@ pub async fn resolve_zone_geometries(
     );
 
     if !urls_to_fetch.is_empty() {
-        // Fetch zone geometries with bounded concurrency to be respectful of
-        // the NWS API and avoid exhausting file descriptors on low-ulimit systems.
+        // Bounded: unbounded exhausts file descriptors on low-ulimit systems.
         use futures::stream::{self, StreamExt};
         const MAX_CONCURRENT_FETCHES: usize = 10;
 
         let results: Vec<_> = stream::iter(urls_to_fetch.into_iter().map(|url| {
-            // reqwest::Client is backed by an Arc internally, so cloning is
-            // just an Arc::clone (O(1) ref-count bump, no connection pool copy).
+            // reqwest::Client is Arc-backed: this is a ref-count bump, not a
+            // connection-pool copy.
             let client = client.clone();
             async move {
                 let result = fetch_zone_geometry(&client, &url).await;
@@ -113,7 +102,6 @@ pub async fn resolve_zone_geometries(
 
         for (url, result) in results {
             if let Some(polys) = result {
-                // Write to disk cache for next time
                 if let Some(dir) = cache_dir {
                     write_cached_zone(dir, &url, &polys).await;
                 }
@@ -128,7 +116,6 @@ pub async fn resolve_zone_geometries(
         needed_urls.len()
     );
 
-    // Populate features for zone-based alerts
     for alert in alerts.iter_mut() {
         if !alert.features.is_empty() || alert.affected_zones.is_empty() {
             continue;
@@ -151,10 +138,6 @@ pub async fn resolve_zone_geometries(
     }
 }
 
-/// Fetch polygon geometry for a single NWS zone/county.
-///
-/// The NWS zones API returns a GeoJSON Feature (not FeatureCollection)
-/// with the zone's boundary polygon in the `geometry` field.
 async fn fetch_zone_geometry(
     client: &reqwest::Client,
     url: &str,
@@ -163,7 +146,6 @@ async fn fetch_zone_geometry(
     parse_zone_polygons(&json, url)
 }
 
-/// Send an HTTP GET for a single NWS zone and return the parsed JSON body.
 async fn fetch_zone_json(
     client: &reqwest::Client,
     url: &str,
@@ -205,11 +187,9 @@ async fn fetch_zone_json(
         .ok()
 }
 
-/// Extract and simplify polygons from a NWS zone GeoJSON Feature.
-///
-/// Zone API returns a Feature directly — geometry is at the top level.
-/// County polygons are simplified because they have 100+ vertices each,
-/// too detailed for map rendering and expensive for ear-clip triangulation.
+/// The zones API returns a bare Feature, not a FeatureCollection: `geometry`
+/// is at the top level. County rings run 100+ vertices each, which is finer
+/// than the map shows and expensive to ear-clip, so they are simplified here.
 fn parse_zone_polygons(json: &serde_json::Value, url: &str) -> Option<Vec<GeoPolygon>> {
     let polys = super::alert::parse_geometry(json.get("geometry"))?;
 
@@ -235,7 +215,6 @@ fn parse_zone_polygons(json: &serde_json::Value, url: &str) -> Option<Vec<GeoPol
 
 // ── Disk cache helpers ───────────────────────────────────────────────────
 
-/// Current unix timestamp in seconds.
 #[cfg(not(target_arch = "wasm32"))]
 fn unix_now() -> u64 {
     web_time::SystemTime::now()
@@ -244,9 +223,8 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Extract a cache-friendly key from a NWS zone URL.
-///
-/// E.g. `https://api.weather.gov/zones/county/TXC113` → `"county_TXC113"`.
+/// `https://api.weather.gov/zones/county/TXC113` → `"county_TXC113"`. The kind
+/// must stay in the key: the same id exists under several zone kinds.
 #[cfg(not(target_arch = "wasm32"))]
 fn zone_cache_key(url: &str) -> Option<String> {
     let trimmed = url.trim_end_matches('/');
@@ -256,9 +234,7 @@ fn zone_cache_key(url: &str) -> Option<String> {
     Some(format!("{kind}_{id}"))
 }
 
-/// Read a zone geometry from the disk cache.
-///
-/// Returns `None` if the file is missing, corrupt, or older than the TTL.
+/// `None` if missing, corrupt, or past the TTL.
 #[cfg(not(target_arch = "wasm32"))]
 async fn read_cached_zone(cache_dir: &Path, url: &str) -> Option<Vec<GeoPolygon>> {
     let key = zone_cache_key(url)?;
@@ -274,7 +250,6 @@ async fn read_cached_zone(cache_dir: &Path, url: &str) -> Option<Vec<GeoPolygon>
     Some(cached.polygons)
 }
 
-/// Write a zone geometry to the disk cache.
 #[cfg(not(target_arch = "wasm32"))]
 async fn write_cached_zone(cache_dir: &Path, url: &str, polygons: &[GeoPolygon]) {
     let Some(key) = zone_cache_key(url) else {
@@ -304,24 +279,16 @@ async fn write_cached_zone(cache_dir: &Path, url: &str, polygons: &[GeoPolygon])
 
 // ── Web: no filesystem ───────────────────────────────────────────────────
 //
-// The browser has no filesystem, so the disk cache degrades to "always miss,
-// never write" rather than being cfg'd out at the call sites. Keeping the
-// signatures identical means `fetch_zone_polygons` has exactly one body on
-// every target, so the caching *policy* — when a fetch is skipped, when a
-// result is stored — cannot drift between native and web.
+// Same signatures rather than cfg at the call sites, so the caching *policy*
+// has one body on every target and cannot drift between native and web.
 //
-// This is a real behavioural difference, not a stub: on web every zone is
-// re-fetched from `api.weather.gov` each session. Zone geometry is static
-// (the native TTL is a year), so the browser's own HTTP cache is the right
-// layer for this, and `rustdar-web` can revisit it via `ConfigStore` if
-// per-session refetching proves too costly.
+// Real behavioural difference, not a stub: on web every zone is re-fetched
+// each session, and the browser's own HTTP cache is the layer that absorbs it.
 
-/// Always a miss: see the module note above.
 #[cfg(target_arch = "wasm32")]
 async fn read_cached_zone(_cache_dir: &Path, _url: &str) -> Option<Vec<GeoPolygon>> {
     None
 }
 
-/// A no-op: see the module note above.
 #[cfg(target_arch = "wasm32")]
 async fn write_cached_zone(_cache_dir: &Path, _url: &str, _polygons: &[GeoPolygon]) {}

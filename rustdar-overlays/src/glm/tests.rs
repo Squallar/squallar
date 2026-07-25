@@ -1,15 +1,11 @@
 //! End-to-end tests for the GLM parse path against synthetic granules.
 //!
-//! The fixture below is shaped like a real GOES GLM L2 LCFA file: event-level
+//! The fixture is shaped like a real GOES GLM L2 LCFA file: event-level
 //! coordinates, times and energies are `_Unsigned` packed shorts with
 //! `scale_factor`/`add_offset`; flash-level coordinates are genuine `float`
-//! degrees; areas are packed shorts declared in `m2`. Every constant here was
-//! copied out of live granules — `noaa-goes19` and `noaa-goes18`,
-//! `GLM-L2-LCFA/2026/205/12/OR_GLM-L2-LCFA_G{19,18}_s20262051200000_*.nc` — so
-//! the fixture cannot drift away from the product it stands in for.
-//!
-//! The packing rules being verified are documented in [`super::cf`]; the
-//! policy applied on top of them lives in [`super::fetch`].
+//! degrees; areas are packed shorts declared in `m2`. Every constant was copied
+//! out of live `noaa-goes19`/`noaa-goes18` granules
+//! (`GLM-L2-LCFA/2026/205/12/OR_GLM-L2-LCFA_G{19,18}_s20262051200000_*.nc`).
 
 use super::fetch::{claim_warning, normalize_longitude, parse_glm_netcdf};
 use super::{GlmDataLevel, GlmSatellite};
@@ -73,11 +69,8 @@ impl Default for GranuleSpec {
 
 /// Start a GLM-shaped granule.
 ///
-/// Note there is no `add_dimension` step. NetCDF dimensions are a layer above
-/// HDF5, and a dataset's length here *is* its data length — which is what the
-/// ragged-column fixtures were expressing through mismatched dimensions all
-/// along. Writing the granule in memory also drops the temp-file dance the
-/// netCDF-C API forced, so the fixtures no longer collide on scratch paths.
+/// No `add_dimension` step: NetCDF dimensions are a layer above HDF5, so a
+/// dataset's length here *is* its data length.
 fn new_granule(time_coverage_start: &str) -> hdf5_pure::FileBuilder {
     let mut w = hdf5_pure::FileBuilder::new();
     w.set_attr(
@@ -210,10 +203,9 @@ struct Packed {
 
 /// A packed `_Unsigned` short, the shape GLM uses for nearly everything.
 ///
-/// `scale_factor`/`add_offset` arrive as `f32` because that is the width GLM
-/// declares them at, and are widened to `f64` before writing so the file holds
-/// exactly the number a `float` attribute decodes to. Writing the `f64`
-/// literal instead would be a subtly different constant.
+/// `scale_factor`/`add_offset` arrive as `f32` — GLM's declared width — and are
+/// widened before writing, so the file holds exactly what a `float` attribute
+/// decodes to. An `f64` literal would be a subtly different constant.
 fn add_short(file: &mut hdf5_pure::FileBuilder, name: &str, values: &[i16], packed: Packed) {
     let b = file.create_dataset(name);
     b.with_i16_data(values);
@@ -266,8 +258,8 @@ fn flashes_of(bytes: &[u8]) -> Vec<super::GlmFlash> {
 // Unpacking
 // =====================================================================
 
-/// The bug in one assertion: before CF unpacking, `event_lat` read back as
-/// `-13585.0` and every event-level strike was drawn at a garbage coordinate.
+/// Fails if CF unpacking is skipped: `event_lat` then reads back as `-13585.0`
+/// and every event-level strike is drawn at a garbage coordinate.
 #[test]
 fn event_level_coordinates_unpack_to_real_positions() {
     let events = events_of(&synthetic_granule());
@@ -283,8 +275,7 @@ fn event_level_coordinates_unpack_to_real_positions() {
 }
 
 /// `event_time_offset` raw 11048 is `4.2145 s` before `add_offset`; the CF
-/// value is `4.2145 - 5.0 = -0.7855 s` from `time_coverage_start`. Dropping
-/// either the scale or the offset moves the strike by hours or by seconds.
+/// value is `4.2145 - 5.0 = -0.7855 s` from `time_coverage_start`.
 #[test]
 fn event_times_unpack_against_the_declared_epoch() {
     let events = events_of(&synthetic_granule());
@@ -305,14 +296,9 @@ fn event_times_unpack_against_the_declared_epoch() {
     }));
 }
 
-/// The time axis names its own epoch in `units`. When that disagrees with the
-/// granule-level `time_coverage_start`, the variable's own metadata wins —
-/// otherwise a producer moving one and not the other shifts every strike
-/// silently.
-///
-/// Guards mutant M18 (ignore the per-variable epoch, always use
-/// `time_coverage_start`), which the default fixture cannot catch because
-/// there the two agree.
+/// When the time axis's own `units` epoch disagrees with the granule-level
+/// `time_coverage_start`, the variable wins. Fails if the per-variable epoch is
+/// ignored — which the default fixture cannot catch, the two agreeing there.
 #[test]
 fn per_variable_epoch_wins_over_time_coverage_start() {
     let bytes = granule(&GranuleSpec {
@@ -330,9 +316,8 @@ fn per_variable_epoch_wins_over_time_coverage_start() {
     );
 }
 
-/// With no `units` on the time axis there is still a second authority in the
-/// file — the global `time_coverage_start` — so this falls back rather than
-/// failing.
+/// With no `units` on the time axis, fall back to the global
+/// `time_coverage_start` rather than failing.
 #[test]
 fn absent_time_units_fall_back_to_time_coverage_start() {
     let bytes = granule(&GranuleSpec { time_units: None, ..Default::default() });
@@ -340,11 +325,9 @@ fn absent_time_units_fall_back_to_time_coverage_start() {
     assert_eq!((events[0].time - epoch()).num_milliseconds(), -785);
 }
 
-/// A `units` string that is *present but uninterpretable* is a different case
-/// from an absent one, and must not quietly fall back: the attribute is making
-/// a claim we cannot read, so guessing seconds-since-coverage-start would be
-/// inventing an epoch. `cf` pins that the string does not parse; this pins what
-/// `parse_level_records` does about it.
+/// A `units` string that is *present but uninterpretable* must not fall back
+/// like an absent one: that would invent an epoch. `cf` pins that the string
+/// does not parse; this pins what `parse_level_records` does about it.
 #[test]
 fn uninterpretable_time_units_fail_rather_than_guessing() {
     let bytes = granule(&GranuleSpec {
@@ -356,13 +339,8 @@ fn uninterpretable_time_units_fail_rather_than_guessing() {
     assert!(err.contains("time units"), "the error must say why: {err}");
 }
 
-/// The unit multiplier on the time axis is load-bearing, not decoration.
-///
-/// Every other fixture says `"seconds since"`, so the `* seconds_per_unit`
-/// factor could be deleted with the suite still green — while `cf`'s module doc
-/// claims outright that "a future switch to `milliseconds since` cannot quietly
-/// shift every strike by three orders of magnitude". This is that claim,
-/// enforced.
+/// The only fixture not on a `"seconds since"` axis, so it is the one that
+/// keeps `* seconds_per_unit` from being deletable with the suite green.
 #[test]
 fn a_millisecond_time_axis_is_scaled_not_misread() {
     let bytes = granule(&GranuleSpec {
@@ -382,8 +360,7 @@ fn a_millisecond_time_axis_is_scaled_not_misread() {
 }
 
 /// Flash-level `lat`/`lon` are real `float` degrees with no packing
-/// attributes. They must survive untouched — this is the half of the product
-/// that always looked right and hid the event-level breakage.
+/// attributes, and must survive untouched.
 #[test]
 fn flash_level_float_coordinates_pass_through_unchanged() {
     let flashes = flashes_of(&synthetic_granule());
@@ -413,16 +390,12 @@ fn longitudes_past_the_antimeridian_wrap_rather_than_vanish() {
     assert!((normalize_longitude(-180.000001) - 179.999999).abs() < 1e-9);
     assert!((normalize_longitude(180.000001) - (-179.999999)).abs() < 1e-9);
 
-    // The ±540 cutoff, pinned from both sides. Anything beyond it is left
-    // alone so the range check downstream still sees it — wrapping it would
-    // launder nonsense into a plausible-looking coordinate.
+    // The ±540 cutoff, pinned from both sides. Beyond it, values are left alone
+    // so the downstream range check still sees them.
     //
-    // The window is deliberately generous. `add_offset` is `sub_point - 66.56`
-    // and a sub-point is within ±180, so any geostationary slot's interval
-    // lies inside ±246.56 and a single wrap always suffices. Tightening the
-    // window toward that bound would make the guard catch more mis-unpacked
-    // longitudes; it is left wide here because the recorded behaviour should
-    // change deliberately rather than drift.
+    // The window is generous: `add_offset` is `sub_point - 66.56` and a
+    // sub-point is within ±180, so any geostationary slot's interval lies
+    // inside ±246.56 and one wrap always suffices.
     assert_eq!(normalize_longitude(-450.0), -90.0, "inside the window: wraps");
     assert_eq!(normalize_longitude(-540.0), -180.0, "the boundary itself wraps");
     assert_eq!(normalize_longitude(-540.001), -540.001, "just outside: left alone");
@@ -431,18 +404,14 @@ fn longitudes_past_the_antimeridian_wrap_rather_than_vanish() {
     assert_eq!(normalize_longitude(-1000.0), -1000.0);
 }
 
-/// Normalization applies to longitude only. Latitude has no analogous
-/// convention — `event_lat:add_offset` is -66.56 on both slots and both epochs
-/// sampled, so the unpackable interval is ±66.56 and no wrap is even
-/// representable. An out-of-range latitude is therefore always a fault, and
-/// the guard in `parse_level_records` is what catches it.
+/// Normalization applies to longitude only. `event_lat:add_offset` is -66.56 on
+/// both slots and both epochs sampled, so the unpackable interval is ±66.56 and
+/// no wrap is representable — an out-of-range latitude is always a fault.
 #[test]
 fn latitude_is_never_wrapped() {
-    // ~305°, chosen so that a ±360 wrap would land at -54.5° — comfortably
-    // *inside* the valid interval. Any smaller out-of-range latitude makes this
-    // test vacuous: a single wrap cannot carry a value from outside ±90 to
-    // inside it unless it starts beyond ±270, so a fixture at, say, 105° would
-    // be dropped whether or not latitude were normalized.
+    // ~305°, so a ±360 wrap would land at -54.5°, inside the valid interval.
+    // Anything below ±270 makes this vacuous: it would be dropped whether or
+    // not latitude were normalized.
     let bytes = granule(&GranuleSpec { lat_offset: 200.0, ..Default::default() });
     assert!(
         events_of(&bytes).is_empty(),
@@ -451,14 +420,12 @@ fn latitude_is_never_wrapped() {
 }
 
 /// GOES-West stores longitude in a frame running past the antimeridian, so a
-/// real strike at 172.72°E is on disk as -187.28. Dropping those as
-/// "out of range" deleted 60 of 3228 events in the granule this was measured
-/// on — and deleted them *selectively*, since `group_lon`/`flash_lon` are
-/// already-wrapped floats that survived, leaving groups and flashes on the map
-/// with their own constituent events removed.
+/// real strike at 172.72°E is on disk as -187.28. Dropping those as out of
+/// range deleted 60 of 3228 events in the granule this was measured on, and
+/// *selectively* — `group_lon`/`flash_lon` are already-wrapped floats and
+/// survived, leaving groups on the map with their own events removed.
 ///
-/// Guards mutant M16 (delete the coordinate guard) from the other side: the
-/// guard must not fire here.
+/// The coordinate guard must not fire here.
 #[test]
 fn goes_west_events_past_the_antimeridian_are_kept() {
     let bytes = granule(&GranuleSpec {
@@ -483,8 +450,8 @@ fn goes_west_events_past_the_antimeridian_are_kept() {
     assert!(events.iter().all(|e| (-180.0..=180.0).contains(&e.lon)));
 }
 
-/// The guard still has to earn its keep: a coordinate that unpacked to
-/// nonsense must not reach the map. Guards mutant M16 from the near side.
+/// ...and the other side of the same guard: a coordinate that unpacked to
+/// nonsense must not reach the map.
 #[test]
 fn coordinates_that_are_not_on_the_globe_are_dropped() {
     let bytes = granule(&GranuleSpec {
@@ -504,11 +471,10 @@ fn coordinates_that_are_not_on_the_globe_are_dropped() {
 // Missing data
 // =====================================================================
 
-/// A `_FillValue` on a descriptive field does not invalidate a located strike,
-/// so the record survives — with the field reported as *unknown*, not as a
-/// number. Zero is not available as a sentinel: every GLM energy variable's
-/// `add_offset` alone is 2.85e-16, so zero is out of band, and `rasterize`
-/// would draw it as the smallest real bolt.
+/// A `_FillValue` on a descriptive field leaves the record, with the field
+/// reported as unknown. Zero is not available as a sentinel: every GLM energy
+/// variable's `add_offset` alone is 2.85e-16, so zero is out of band, and
+/// `rasterize` would draw it as the smallest real bolt.
 #[test]
 fn fill_valued_energy_becomes_unknown_without_dropping_the_record() {
     let events = events_of(&synthetic_granule());
@@ -519,9 +485,9 @@ fn fill_valued_energy_becomes_unknown_without_dropping_the_record() {
     assert_eq!(events[1].energy, None, "a fill energy must not become a number");
 }
 
-/// The L2 LCFA product has no `event_area` variable at all. An absent variable
-/// is a property of the product, not a corrupt granule, so events still parse —
-/// and report no area rather than "0.0 km²".
+/// The L2 LCFA product has no `event_area` variable at all — a property of the
+/// product, not a corrupt granule. Events still parse, reporting no area rather
+/// than "0.0 km²".
 #[test]
 fn absent_event_area_variable_reports_unknown_not_zero() {
     let events = events_of(&synthetic_granule());
@@ -529,9 +495,9 @@ fn absent_event_area_variable_reports_unknown_not_zero() {
     assert!(events.iter().all(|e| e.area.is_none()));
 }
 
-/// `flash_area` is a packed count declared in `m2`. The popup labels km², so
-/// the parse must both unpack *and* convert. The unfixed code showed the raw
-/// count (1826) under a km² label — wrong by a factor of ~6.6.
+/// `flash_area` is a packed count declared in `m2` and the popup labels km², so
+/// the parse must both unpack *and* convert. Fails if the raw count (1826)
+/// reaches the km² label — wrong by a factor of ~6.6.
 #[test]
 fn flash_area_unpacks_from_m2_counts_into_km2() {
     let flashes = flashes_of(&synthetic_granule());
@@ -551,11 +517,8 @@ fn flash_area_unpacks_from_m2_counts_into_km2() {
 // Unit policy
 // =====================================================================
 
-/// A `units` string we cannot convert makes that *field* unknown. It must not
-/// be silently accepted as if it were the canonical unit.
-///
-/// Guards mutant M15 (accept unknown units and use the value anyway), which
-/// left the whole "refuse to guess" design unverified.
+/// A `units` string we cannot convert makes that *field* unknown; fails if the
+/// value is used anyway as if it were canonical.
 #[test]
 fn unconvertible_area_units_make_the_field_unknown() {
     let bytes = granule(&GranuleSpec {
@@ -572,10 +535,8 @@ fn unconvertible_area_units_make_the_field_unknown() {
 }
 
 /// An *absent* `units` attribute is treated exactly like an unconvertible one.
-///
-/// The earlier asymmetry was the dangerous half: assuming an unlabelled value
-/// was already km² would have reported `flash_area` a million times too large,
-/// silently, while a merely misspelled unit blacked out the granule.
+/// Assuming an unlabelled value is already km² reports `flash_area` a million
+/// times too large, silently.
 #[test]
 fn absent_area_units_are_treated_the_same_as_unconvertible_ones() {
     let bytes = granule(&GranuleSpec { area_units: None, ..Default::default() });
@@ -588,10 +549,9 @@ fn absent_area_units_are_treated_the_same_as_unconvertible_ones() {
     );
 }
 
-/// The unit contract applies to energy exactly as it does to area. Without
-/// this the whole check could be deleted from `*_energy` and the suite would
-/// stay green — and the scenario is not hypothetical: if NOAA re-declared
-/// `units = "fJ"`, femtojoules would publish as joules, off by 1e15, putting
+/// The unit contract applies to energy as to area; without this the check could
+/// be deleted from `*_energy` with the suite green. If NOAA re-declared
+/// `units = "fJ"`, femtojoules would publish as joules — off by 1e15, putting
 /// every bolt at the size ceiling.
 #[test]
 fn unconvertible_energy_units_make_the_field_unknown() {
@@ -610,8 +570,7 @@ fn unconvertible_energy_units_make_the_field_unknown() {
     assert!(flashes.iter().all(|f| f.area.is_some()));
 }
 
-/// Absent energy units are treated the same as unconvertible ones, matching
-/// the symmetric contract used for area.
+/// Absent energy units are treated the same as unconvertible ones.
 #[test]
 fn absent_energy_units_are_treated_the_same_as_unconvertible_ones() {
     let bytes = granule(&GranuleSpec { energy_units: None, ..Default::default() });
@@ -620,9 +579,8 @@ fn absent_energy_units_are_treated_the_same_as_unconvertible_ones() {
     assert!(flashes.iter().all(|f| f.energy.is_none()));
 }
 
-/// Unit trouble on one field must not damage the others, and must not damage
-/// position or time. A `flash_area` schema change used to black out every
-/// level of the whole granule.
+/// Unit trouble on one field must not damage the others, nor position or time.
+/// Fails if a `flash_area` schema change blacks out the whole granule.
 #[test]
 fn unit_trouble_is_scoped_to_the_field_it_describes() {
     let bytes = granule(&GranuleSpec {
@@ -642,8 +600,7 @@ fn unit_trouble_is_scoped_to_the_field_it_describes() {
     assert_eq!(events.len(), 2);
 }
 
-/// Schema-change warnings fire once and then stay quiet — GLM polls every 20
-/// seconds across two satellites, so repeating them would bury the message.
+/// Schema-change warnings fire once and then stay quiet.
 #[test]
 fn the_warning_registry_reports_each_key_once() {
     let key = format!("registry-probe:{:?}", std::thread::current().id());
@@ -652,9 +609,8 @@ fn the_warning_registry_reports_each_key_once() {
     assert!(!claim_warning(key), "and keep staying quiet");
 }
 
-/// The builders are only half the guarantee: every call site can be rewritten
-/// inline, and the invariants the builders document are only real if the code
-/// that warns actually uses them.
+/// Pinning the key builders leaves every call site free to inline a different
+/// key, so pin the call sites too.
 #[test]
 fn call_sites_use_the_documented_warning_keys() {
     use super::fetch::{level_parse_key, missing_variable_key, units_key};
@@ -662,8 +618,7 @@ fn call_sites_use_the_documented_warning_keys() {
 
     // Asserted against the *registry*, not the log: `claim_warning` returns
     // false for a key already taken, which is deterministic under parallelism
-    // in a way that counting log lines is not. Pinning the builders alone left
-    // every call site free to inline a different key.
+    // in a way that counting log lines is not.
 
     // --- level_parse_key: satellite- and level-qualified ------------------
     //
@@ -712,9 +667,8 @@ fn call_sites_use_the_documented_warning_keys() {
 
     // --- units_key: the *absent* branch keys the same way ------------------
     //
-    // A separate call site from the unrecognized-spelling branch above, and it
-    // was free to use its own unqualified key. `flash_energy` + absent on West
-    // is a combination no other test produces.
+    // A separate call site from the unrecognized-spelling branch above.
+    // `flash_energy` + absent on West is produced by no other test.
     let no_energy_units = granule(&GranuleSpec {
         energy_units: None,
         ..Default::default()
@@ -748,12 +702,11 @@ fn call_sites_use_the_documented_warning_keys() {
     );
 }
 
-/// The dedup keys are what decide *which* conditions can crowd each other out,
-/// so their shape is behaviour, not formatting.
+/// The dedup keys decide which conditions can crowd each other out, so their
+/// shape is behaviour, not formatting.
 ///
-/// Asserted on the builders directly rather than by counting log lines: the
-/// registry is process-global and other tests parse granules in parallel, so a
-/// counting test against these keys is racy. The builders are pure.
+/// Asserted on the pure builders rather than by counting log lines: the
+/// registry is process-global and other tests parse granules in parallel.
 #[test]
 fn warning_keys_separate_the_conditions_that_must_not_mask_each_other() {
     use super::fetch::{level_parse_key, missing_variable_key, units_key};
@@ -794,8 +747,8 @@ fn warning_keys_separate_the_conditions_that_must_not_mask_each_other() {
         "one absent variable must not mask another"
     );
 
-    // ...but an absent variable is a property of the product schema, not of a
-    // satellite, so it is deliberately reported once across both.
+    // ...but an absent variable is a property of the product schema, so it is
+    // reported once across both birds.
     assert_eq!(
         missing_variable_key("event_energy"),
         missing_variable_key("event_energy"),
@@ -818,11 +771,9 @@ fn warning_keys_separate_the_conditions_that_must_not_mask_each_other() {
 // Structural failures
 // =====================================================================
 
-/// Every variable at a level shares one dimension, so a short column is never
-/// legitimate — it means a corrupt or restructured file, and pairing index `i`
-/// of one variable with index `i` of another would fabricate positions.
-///
-/// Guards mutant M19 (remove the length check).
+/// Every variable at a level shares one dimension, so a short column means a
+/// corrupt or restructured file: pairing index `i` across variables would
+/// fabricate positions.
 #[test]
 fn mismatched_column_lengths_are_rejected() {
     let mut file = new_granule(COVERAGE_START);
@@ -870,8 +821,7 @@ fn mismatched_column_lengths_are_rejected() {
 }
 
 /// A level that cannot be parsed must not take the other levels with it: the
-/// user selects the three independently, and a schema change confined to
-/// `flash_*` should leave the default-on group layer alone.
+/// user selects the three independently.
 #[test]
 fn one_broken_level_does_not_black_out_the_others() {
     let mut file = new_granule(COVERAGE_START);
@@ -962,11 +912,8 @@ fn one_broken_level_does_not_black_out_the_others() {
     assert_eq!(parsed.records.len(), 2);
     assert!(parsed.records.iter().all(|r| r.level == GlmDataLevel::Event));
 
-    // Half two, and the half that is easy to lose: the broken level is
-    // *reported*. Returning a bare `Ok` here would mean `parse_failures: None`,
-    // which the panel reads as "everything is fine" — the Flashes layer would
-    // empty out with nothing on screen to explain it, and a notice already up
-    // would log "recovered". Keeping the records is only half the job.
+    // Half two: the broken level is *reported*. A bare `Ok` means
+    // `parse_failures: None`, which the panel reads as "everything is fine".
     assert_eq!(parsed.level_failures.len(), 1, "the broken level must be reported");
     assert_eq!(parsed.level_failures[0].level, GlmDataLevel::Flash);
     assert_eq!(parsed.level_failures[0].satellite, GlmSatellite::GoesEast);
@@ -991,12 +938,9 @@ fn every_level_failing_is_a_file_failure_not_a_level_failure() {
     assert!(err.contains("time units"), "the verbatim cause must survive: {err}");
 }
 
-/// A level with zero records is normal, not a failure.
-///
-/// The real product uses unlimited dimensions, so a quiet 20-second granule
-/// genuinely carries `number_of_flashes = 0`. That must parse to an empty list
-/// rather than tripping the required-column check or the level-failure channel
-/// — otherwise every quiet sky would report a schema change.
+/// A level with zero records is normal, not a failure: the product uses
+/// unlimited dimensions, so a quiet 20-second granule genuinely carries
+/// `number_of_flashes = 0` and must not trip the required-column check.
 #[test]
 fn a_level_with_no_records_is_empty_not_broken() {
     let mut file = new_granule(COVERAGE_START);
@@ -1034,8 +978,7 @@ fn a_level_with_no_records_is_empty_not_broken() {
     assert!(parsed.level_failures.is_empty(), "a quiet sky must not report a failure");
 }
 
-/// A healthy granule reports no level failures at all — the channel must stay
-/// quiet in the common case or the panel notice becomes noise.
+/// A healthy granule reports no level failures at all.
 #[test]
 fn a_healthy_granule_reports_no_level_failures() {
     let parsed = parse_glm_netcdf(
@@ -1047,8 +990,7 @@ fn a_healthy_granule_reports_no_level_failures() {
     assert!(parsed.level_failures.is_empty());
 }
 
-/// Requesting several levels at once returns all of them, which is how the
-/// overlay actually calls this.
+/// Requesting several levels at once returns all of them.
 #[test]
 fn all_requested_levels_are_returned_together() {
     let bytes = synthetic_granule();
@@ -1078,9 +1020,8 @@ const REAL_GRANULE: &str = concat!(
 );
 
 /// FNV-1a over the IEEE bits of every unpacked value, with `None` distinct from
-/// any real number. Exact rather than tolerance-based: the data is unfiltered,
-/// so any difference at all is a difference, and a single flipped element in
-/// 5941 must not be able to hide behind an average.
+/// any real number. Exact rather than tolerance-based, so a single flipped
+/// element in 5941 cannot hide behind an average.
 pub(super) fn fingerprint(values: &[Option<f64>]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for x in values {
@@ -1095,15 +1036,12 @@ pub(super) fn fingerprint(values: &[Option<f64>]) -> u64 {
 /// `(variable, element count, missing count, fingerprint, units)`.
 ///
 /// **These numbers were produced by the netCDF-C library**, not by the reader
-/// they check — captured by `difftests::print_golden_fingerprints_from_netcdf`
-/// while `netcdf` was still a dependency, and left behind as the permanent
-/// record of that comparison once the C oracle was removed. Regenerating them
-/// with the pure-Rust reader would make this test assert only that the code
-/// agrees with itself.
-/// Note the zero in every "missing" column: this granule happens to carry no
+/// they check. Do not regenerate them with the pure-Rust reader — that would
+/// assert only that the code agrees with itself.
+///
+/// The "missing" column is zero throughout: this granule carries no
 /// `_FillValue` or out-of-range elements, so it does **not** exercise the
-/// masking rules. Those are covered against synthetic fixtures in
-/// `cf::tests`; do not read this table as evidence for them.
+/// masking rules. Those are covered in `cf::tests`.
 const GOLDEN: &[(&str, usize, usize, u64, &str)] = &[
     ("flash_lat", 148, 0, 0x25a7_2e49_ab40_a2c5, "degrees_north"),
     ("flash_lon", 148, 0, 0x737b_cf67_3941_900c, "degrees_east"),
@@ -1139,8 +1077,8 @@ const GOLDEN: &[(&str, usize, usize, u64, &str)] = &[
     ),
 ];
 
-/// The migration's permanent gate: the pure-Rust reader must still reproduce,
-/// exactly, what the C library produced on a real granule.
+/// The pure-Rust reader must reproduce, exactly, what the C library produced
+/// on a real granule.
 #[test]
 fn real_granule_unpacks_to_the_values_the_c_netcdf_library_produced() {
     let bytes = std::fs::read(REAL_GRANULE).expect("read the committed GLM granule");
@@ -1166,10 +1104,9 @@ fn real_granule_unpacks_to_the_values_the_c_netcdf_library_produced() {
     }
 }
 
-/// The fingerprints above would still pass if every packed variable had
-/// quietly become a plain float, so pin the storage as well: these must remain
-/// `_Unsigned` 16-bit shorts with a `scale_factor`, or the golden test is
-/// checking a code path the product no longer uses.
+/// The fingerprints above still pass if every packed variable becomes a plain
+/// float, so pin the storage too: these must stay `_Unsigned` 16-bit shorts
+/// with a `scale_factor`, or the golden test checks an unused code path.
 #[test]
 fn the_real_granule_still_exercises_packed_unsigned_shorts() {
     use super::cf::VarType;
@@ -1196,16 +1133,9 @@ fn the_real_granule_still_exercises_packed_unsigned_shorts() {
 /// The overlay end to end on a real granule: bytes off S3 in, plottable
 /// lightning out.
 ///
-/// Every assertion here is a property of the *physical world or the product
-/// spec*, not of the reader — a granule of real GLM data has to land on the
-/// globe, in GOES-East's field of view, inside its own 20-second window, with
-/// energies in the joule range GLM actually reports. A reader that produced
-/// self-consistent nonsense (the failure mode CF unpacking has) would satisfy
-/// the fingerprint test above only because the fingerprints came from netCDF-C;
-/// it could not satisfy this one at all.
-///
-/// This is the test that answers "does the lightning overlay still work",
-/// rather than "does it still return the same bytes".
+/// Every assertion is a property of the physical world or the product spec, not
+/// of the reader, so self-consistent nonsense (CF unpacking's failure mode)
+/// cannot satisfy it.
 #[test]
 fn a_real_granule_parses_into_plottable_lightning() {
     let bytes = std::fs::read(REAL_GRANULE).expect("read the committed GLM granule");
@@ -1230,16 +1160,14 @@ fn a_real_granule_parses_into_plottable_lightning() {
         assert_eq!(n, want, "{level:?} count");
     }
 
-    // The granule's `time_coverage_start` is 2025-06-29 12:00:00, and its time
+    // The granule's `time_coverage_start` is 2025-06-29 12:00:00 and its time
     // axis spans exactly [-5 s, +20 s] around that: every `*_time_offset` is a
     // u16 with `scale_factor = 0.0003814756` and `add_offset = -5.0`, so
     // `0 -> -5.000` and `65535 -> +20.000`.
     //
-    // The lower bound really is negative, and that is the product, not a bug:
-    // a flash is a temporal cluster whose first event can fall slightly before
-    // the granule boundary, so GLM offsets the axis to keep it representable.
-    // This granule contains such a record at 11:59:58.967, and netCDF-C
-    // produced the same timestamp for it, bit for bit.
+    // The negative lower bound is the product, not a bug: a flash is a temporal
+    // cluster whose first event can fall before the granule boundary. This
+    // granule holds such a record at 11:59:58.967.
     let start = chrono::NaiveDate::from_ymd_opt(2025, 6, 29)
         .unwrap()
         .and_hms_opt(12, 0, 0)
@@ -1251,10 +1179,9 @@ fn a_real_granule_parses_into_plottable_lightning() {
         assert!(r.lat.is_finite() && r.lon.is_finite(), "non-finite position");
         assert!((-90.0..=90.0).contains(&r.lat), "latitude off the globe: {}", r.lat);
         assert!((-180.0..=180.0).contains(&r.lon), "longitude off the globe: {}", r.lon);
-        // GOES-East sits over -75.2°; nothing it sees is in the eastern
-        // hemisphere or off Australia. This is what catches an `add_offset`
-        // that was skipped or applied twice -- the values stay finite and
-        // in-range, they just land in the wrong ocean.
+        // GOES-East sits over -75.2°. Catches an `add_offset` skipped or
+        // applied twice: the values stay finite and in-range, they just land in
+        // the wrong ocean.
         assert!(
             (-160.0..=10.0).contains(&r.lon),
             "outside GOES-East's field of view: {}",
@@ -1268,8 +1195,8 @@ fn a_real_granule_parses_into_plottable_lightning() {
 
         if let Some(e) = r.energy {
             // GLM reports radiant energy around 1e-15 J. A missing
-            // `scale_factor` would put this at ~1e4 (the raw count) and a
-            // doubled one at ~1e-31.
+            // `scale_factor` puts this at ~1e4 (the raw count), a doubled one
+            // at ~1e-31.
             assert!(
                 (1e-16..1e-10).contains(&e),
                 "energy outside the range GLM reports: {e}"

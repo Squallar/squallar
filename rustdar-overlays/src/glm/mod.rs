@@ -1,9 +1,8 @@
 //! GOES GLM (Geostationary Lightning Mapper) data types and fetch logic.
 //!
-//! Fetches Level 2 LCFA (Lightning Cluster-Filter Algorithm) flash data from
-//! the public `noaa-goes19` and `noaa-goes18` AWS S3 buckets. Each NetCDF4
-//! file covers ~20 seconds of data; we aggregate flashes over a configurable
-//! time window (default 5 minutes).
+//! Level 2 LCFA (Lightning Cluster-Filter Algorithm) data from the public
+//! `noaa-goes19`/`noaa-goes18` S3 buckets. Each NetCDF4 granule covers ~20 s;
+//! flashes are aggregated over a configurable window (default 5 minutes).
 
 mod cf;
 pub mod fetch;
@@ -14,14 +13,11 @@ mod tests;
 /// Which GOES orbital slot to fetch GLM data from.
 ///
 /// Variants name the *slot*, not the spacecraft: NOAA rotates satellites through
-/// the East/West positions (GOES-19 replaced GOES-16 as GOES-East in April 2025),
-/// and the bucket must follow the operational satellite.
+/// the East/West positions (GOES-19 replaced GOES-16 as GOES-East in April 2025).
 ///
-/// Deliberately not `Serialize`/`Deserialize`: nothing persists this type.
-/// The only GLM setting written to `ui.json` is the satellite *selection*,
-/// which round-trips through hand-rolled lowercase strings in
-/// `render::handlers::glm`. Adding derives here would advertise a wire format
-/// that does not exist and make variant renames look load-bearing.
+/// Not `Serialize`/`Deserialize`: nothing persists this type. `ui.json` stores
+/// only the satellite *selection*, as lowercase strings owned by
+/// `render::handlers::glm`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlmSatellite {
     /// GOES-East (currently GOES-19), covering roughly -25°W to -105°W.
@@ -34,8 +30,7 @@ impl GlmSatellite {
     /// S3 bucket name for the satellite currently operating this slot.
     pub fn bucket(self) -> &'static str {
         match self {
-            // GOES-16 was decommissioned as GOES-East in April 2025; the
-            // `noaa-goes16` bucket has no GLM data after 2025 day 097.
+            // `noaa-goes16` has no GLM data after 2025 day 097.
             GlmSatellite::GoesEast => "noaa-goes19",
             GlmSatellite::GoesWest => "noaa-goes18",
         }
@@ -52,8 +47,7 @@ impl GlmSatellite {
 
 /// GLM detection hierarchy level.
 ///
-/// Not serialized: the UI persists three independent `show_*` booleans, not
-/// this enum. See the note on [`GlmSatellite`].
+/// Not serialized: the UI persists three independent `show_*` booleans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlmDataLevel {
     /// Individual pixel detections (~2ms resolution, highest density).
@@ -81,28 +75,21 @@ pub struct GlmFlash {
     pub lon: f64,
     /// Radiant energy in joules, when the product reports one.
     ///
-    /// `None` means *unknown*, and callers must not substitute a number for
-    /// it. Zero is not available as a sentinel: every GLM energy variable
-    /// carries `add_offset = 2.8515e-16`, so the smallest value the product
-    /// can express is 2.85e-16 J and zero is out of band. It is also not
-    /// harmless — `rasterize` sizes bolts by `energy.log10()`, and 0.0 clamps
-    /// to the bottom of that window, drawing "unknown" as "weakest".
+    /// `None` means unknown; do not substitute 0.0. Every GLM energy variable
+    /// carries `add_offset = 2.8515e-16`, so zero is out of band, and
+    /// `rasterize` sizes bolts by `energy.log10()` — 0.0 draws "unknown" as
+    /// "weakest".
     ///
-    /// The *column* is required: a renamed or absent `*_energy` variable is a
-    /// schema change and fails the level loudly. Only a per-record
-    /// `_FillValue` reaches here as `None`. See `fetch::parse_level_records`.
+    /// The *column* is required and an absent one fails the level; only a
+    /// per-record `_FillValue` reaches here as `None`.
     pub energy: Option<f32>,
     /// Area in km², when the product reports one.
     ///
-    /// The product stores this as an `_Unsigned` packed `short` with
-    /// `scale_factor = 152601.9` and `units = "m2"`; `fetch` applies the CF
-    /// unpacking and converts to km² using the file's own `units` attribute,
-    /// so the unit named here is the unit held here.
+    /// Stored as an `_Unsigned` packed `short` with `scale_factor = 152601.9`
+    /// and `units = "m2"`; `fetch` unpacks and converts to km².
     ///
-    /// `None` at [`GlmDataLevel::Event`]: the L2 LCFA product carries only
-    /// `group_area` and `flash_area`. An event is a single sensor pixel and
-    /// has no area variable, so any number here would be invented. Also
-    /// `None` for a per-record `_FillValue`.
+    /// `None` at [`GlmDataLevel::Event`]: the L2 LCFA product has only
+    /// `group_area` and `flash_area`. Also `None` for a per-record `_FillValue`.
     pub area: Option<f32>,
     /// UTC timestamp.
     pub time: chrono::NaiveDateTime,
@@ -114,9 +101,7 @@ pub struct GlmFlash {
 
 /// A satellite whose S3 listing came back with no objects whatsoever.
 ///
-/// Distinct from "no flashes": the files themselves are absent, so the feed is
-/// gone rather than the sky being quiet. Carries the detail needed to make the
-/// report actionable without the reporting code having to re-derive it.
+/// Distinct from "no flashes": the files themselves are absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeadFeed {
     pub satellite: GlmSatellite,
@@ -127,16 +112,10 @@ pub struct DeadFeed {
 
 /// Shortest lightning aggregation window the UI allows, in seconds.
 ///
-/// Do not lower this below ~45 s without revisiting the zero-object warning in
-/// [`fetch`]. A window this short makes the S3 query cover a single hour prefix,
-/// and that prefix is empty until the hour's first granule publishes (27–30 s
-/// after the boundary, measured live). The warning treats "no objects at all" as
-/// a dead feed, so a minimum window below the publish latency would fire a
-/// spurious "feed dead" warning at the top of every hour. The 60 s floor leaves
-/// roughly 30 s of headroom.
-///
-/// Lives here rather than in the UI handler so `fetch` can assert on it instead
-/// of restating the number in prose.
+/// Must stay above the S3 publish latency of the hour's first granule (27–30 s
+/// after the boundary, measured live). A shorter window queries a single hour
+/// prefix, which is empty until then, and [`fetch`]'s zero-object check would
+/// read that as a dead feed once an hour. Do not lower below ~45 s.
 pub const GLM_MIN_TIME_WINDOW_SECS: f64 = 60.0;
 
 /// Longest lightning aggregation window the UI allows, in seconds (30 minutes).
@@ -145,35 +124,22 @@ pub const GLM_MAX_TIME_WINDOW_SECS: f64 = 1800.0;
 /// Below this many files in the window, "everything failed" is not a claim
 /// worth making.
 ///
-/// Two, not three, and the difference matters at the slider minimum. Measured
-/// against live granules, `in_window` is exactly `floor(window / 20) - 1` and is
-/// stable tick to tick, so a 60 s window holds exactly 2 files. A floor of 3
-/// would put `is_total` permanently out of reach there: a user watching live
-/// convection at the 1-minute setting would get "2/2 files failed to parse"
-/// with no "(product change?)" hint and the partial log line instead of the
-/// escalated one — withholding the diagnostic precisely when the ratio is
-/// unambiguous.
-///
-/// Two still does the job it was added for. The primary defence is the
-/// denominator itself ([`FetchFailures::in_window`] counts the whole window,
-/// not this poll's downloads), which already keeps one bad granule at 1/N; this
-/// floor is belt-and-braces against a degenerate single-file window.
+/// Two, not three: measured against live granules `in_window` is exactly
+/// `floor(window / 20) - 1`, so the 60 s slider minimum holds exactly 2 files
+/// and a floor of 3 would put `is_total` permanently out of reach there.
 const MIN_FILES_FOR_TOTAL_VERDICT: usize = 2;
 
 /// Files that were expected to contribute to the current window but did not.
 ///
-/// A granule that fails is as invisible to the user as one that never existed —
-/// the map just goes blank — but it arrives through a different door than
-/// [`DeadFeed`]: the S3 listing is perfectly healthy.
+/// Unlike [`DeadFeed`], the S3 listing is healthy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchFailures {
     /// Every file the listing placed inside the current time window.
     ///
-    /// Deliberately *not* "files downloaded this poll". Successful parses are
-    /// cached and drop out of subsequent polls while failures are never cached
-    /// and are retried forever, so a per-poll denominator shrinks toward the
-    /// failures themselves and every persistent failure eventually reads as
-    /// total. Counting the whole window keeps the ratio stable.
+    /// Deliberately *not* "files downloaded this poll": successful parses are
+    /// cached and drop out of later polls while failures are never cached and
+    /// are retried forever, so a per-poll denominator makes every persistent
+    /// failure eventually read as total.
     pub in_window: usize,
     /// How many of those are currently failing.
     pub failed: usize,
@@ -191,17 +157,10 @@ impl FetchFailures {
 
 /// A hierarchy level that would not parse, inside files that otherwise did.
 ///
-/// Third failure shape, and it needed its own: [`DeadFeed`] is "the files are
-/// absent", [`FetchFailures`] is "the files are present and unusable", and this
-/// is "the files are present and usable, but one *layer* inside them is not".
-///
-/// It cannot be folded into either. Counting it as a failed file would make
-/// `is_total()` announce "all N files failed to parse" while groups and events
-/// are still drawing on the map. Leaving it out — which is what the first cut
-/// of the level-tolerant parse did — means a `flash_*` schema change empties
-/// the Flashes layer with nothing on screen to say why, which is the exact
-/// failure mode this whole area of the code exists to prevent, just scoped to
-/// one layer instead of the whole overlay.
+/// The third failure shape: [`DeadFeed`] is "files absent", [`FetchFailures`]
+/// is "files present and unusable", this is "files usable, one *layer* is not".
+/// Counting it as a failed file would make `is_total()` announce "all N files
+/// failed to parse" while the other layers are still drawing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LevelFailure {
     pub satellite: GlmSatellite,
@@ -215,39 +174,30 @@ pub struct GlmFetchOutcome {
     pub flashes: Vec<GlmFlash>,
     /// Enabled satellites whose listing returned zero objects this poll.
     ///
-    /// Reported by the handler rather than by the fetch itself, so that the
-    /// message can be edge-triggered against the previous poll instead of
-    /// repeating every 20 seconds.
+    /// Reported rather than logged here so the handler can edge-trigger the
+    /// message against the previous poll instead of repeating it every 20 s.
     pub dead_feeds: Vec<DeadFeed>,
     /// Satellites this fetch actually asked about.
     ///
-    /// Required to interpret `dead_feeds`: a satellite absent from `dead_feeds`
-    /// is only alive if it was *queried*. Without this, deselecting a dead
-    /// satellite in the dropdown reads as the feed recovering.
+    /// Required to interpret `dead_feeds`: absence from `dead_feeds` only means
+    /// alive if the satellite was queried. Without this, deselecting a dead
+    /// satellite reads as the feed recovering.
     pub queried: Vec<GlmSatellite>,
-    /// Files that downloaded but would not parse.
-    ///
-    /// Kept separate from `transport_failures` because the two mean opposite
-    /// things: a file that arrives and will not parse points at the *product*
-    /// (a renamed variable, a restructured schema), while a file that never
-    /// arrives points at the *network*. Reporting a 503 as a schema change is
-    /// its own kind of false alarm.
+    /// Files that downloaded but would not parse — suspect the product.
     pub parse_failures: Option<FetchFailures>,
-    /// Files that could not be downloaded at all (connection errors, non-2xx).
+    /// Files that could not be downloaded at all (connection errors, non-2xx)
+    /// — suspect the network. Never merged with `parse_failures`.
     pub transport_failures: Option<FetchFailures>,
     /// Hierarchy levels that failed to parse in files that otherwise parsed.
     ///
-    /// Deduplicated per (satellite, level): a schema change affects every
-    /// granule in the window identically, so the count of files it appears in
-    /// carries no information the user needs.
+    /// Deduplicated per (satellite, level): a schema change hits every granule
+    /// in the window identically.
     pub level_failures: Vec<LevelFailure>,
     /// (satellite, level) pairs this poll actually learned something about.
     ///
-    /// Required to interpret `level_failures`, exactly as `queried` is required
-    /// to interpret `dead_feeds`: a pair absent from `level_failures` is only
-    /// *healthy* if it was evaluated. A poll that downloaded no new granules
-    /// evaluates nothing, and calling that a recovery would be a false
-    /// statement about the layer the user is most likely investigating.
+    /// Required to interpret `level_failures` as `queried` is for `dead_feeds`.
+    /// A poll that downloaded no new granules evaluates nothing, and must not
+    /// read as a recovery.
     pub evaluated_levels: Vec<(GlmSatellite, GlmDataLevel)>,
 }
 

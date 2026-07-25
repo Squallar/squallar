@@ -13,24 +13,16 @@ use crate::render::overlay_state::{
 };
 use crate::render::station_model;
 
-/// Type-erased fetch result for METAR observations.
 pub(crate) struct MetarFetchResult(pub Result<Vec<MetarOb>, String>);
 
-/// How long a METAR fetch may take.
 const METAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The client this handler's fetches use.
-///
 /// **Not `ctx.client`.** The shared client sends a `User-Agent`, which makes
-/// the request non-simple; the browser then preflights, and IEM answers
-/// `OPTIONS` with `405 Method Not Allowed`, so the real request is never
-/// issued. Native and `curl` see none of that.
-///
-/// Split out of `create_fetch_tasks` so the choice is assertable —
-/// `the_metar_client_sends_no_user_agent` is what pins it. The rule itself
-/// lives on the origin, in
+/// the request non-simple; the browser then preflights and IEM answers
+/// `OPTIONS` with `405`, so the GET is never issued. Native and `curl` see
+/// none of this. The rule is read from
 /// [`DataSources::metar_sends_user_agent`](rustdar_radar::sources::DataSources::metar_sends_user_agent),
-/// and is read here rather than restated.
+/// not restated here.
 fn metar_client(
     sources: &rustdar_radar::sources::DataSources,
 ) -> Result<reqwest::Client, String> {
@@ -40,7 +32,6 @@ fn metar_client(
         .map_err(|e| format!("could not build the METAR client: {e}"))
 }
 
-/// Clickable item representing a single METAR observation.
 #[derive(Debug)]
 pub(crate) struct MetarItem {
     pub ob: MetarOb,
@@ -189,7 +180,7 @@ impl MetarHandler {
         }
     }
 
-    /// Rebuild the `cached_points` vec from current observation data.
+    /// Must run after every `set_data`: `MapPoint::id` indexes `state.data`.
     fn rebuild_points(&mut self) {
         self.cached_points = self
             .state
@@ -290,7 +281,7 @@ impl OverlayHandler for MetarHandler {
         &self,
         _ctx: &RasterizeContext,
     ) -> Option<RasterizeFn> {
-        None // Metar uses per-frame rendering, not background rasterization
+        None // PerFramePoint mode; nothing is rasterized in the background.
     }
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
@@ -411,17 +402,9 @@ mod tests {
     use crate::metar::types::Visibility;
     use rustdar_units::SpeedUnit;
 
-    /// The client this handler fetches with must carry no `User-Agent`.
-    ///
-    /// The invariant the preflight fix is *for*, asserted on the client the
-    /// handler actually builds. Previously nothing read
-    /// `metar_sends_user_agent` except the test asserting it was `false`, and
-    /// replacing this construction with `tls::client(USER_AGENT, ..)` left the
-    /// whole suite green.
-    ///
-    /// It would also still work today, on every target, because the wasm
-    /// `tls::client` drops the `User-Agent` too — so the rule's only defence
-    /// was an unrelated `#[cfg]` coincidence. This is the direct assertion.
+    /// Asserted on the client the handler actually builds, because native
+    /// `tls::client` is the only thing that adds a `User-Agent` — the wasm one
+    /// drops it, so a wasm-only check passes on a broken native client.
     #[test]
     fn the_metar_client_sends_no_user_agent() {
         let client = metar_client(&rustdar_radar::sources::DataSources::production())
@@ -434,11 +417,8 @@ mod tests {
         );
     }
 
-    /// …and it is the origin's recorded rule that decides that, not a constant.
-    ///
-    /// Without this, a `metar_client` hardwired to `simple_client` would pass
-    /// the test above while `metar_sends_user_agent` went back to being read by
-    /// nothing.
+    /// Fails if `metar_client` is hardwired to `simple_client`, which passes
+    /// the test above while `metar_sends_user_agent` is read by nothing.
     #[test]
     fn the_metar_client_follows_the_origins_recorded_rule() {
         let sources = rustdar_radar::sources::DataSources {
@@ -482,7 +462,6 @@ mod tests {
         }
     }
 
-    /// The popup's key-value rows, flattened for assertion.
     fn rows(ob: MetarOb) -> Vec<(String, String)> {
         let prefs = UserPreferences { speed: SpeedUnit::Knots, ..Default::default() };
         MetarItem { ob }
@@ -500,15 +479,12 @@ mod tests {
         rows(ob).into_iter().find(|(k, _)| k == key).map(|(_, v)| v)
     }
 
-    /// Formerly `if vis >= 10.0 { "10+ mi" }` — unreachable, because `10+` was
-    /// exactly the value that failed to parse and became `None`.
     #[test]
     fn the_popup_reports_unrestricted_visibility() {
         let vis = Some(Visibility { miles: 10.0, or_greater: true });
         assert_eq!(field(ob(vis), "Visibility").as_deref(), Some("10+ mi"));
     }
 
-    /// A 15 SM measurement is not the same claim as "10 or better".
     #[test]
     fn the_popup_keeps_a_measurement_distinct_from_the_bound() {
         let vis = Some(Visibility { miles: 15.0, or_greater: false });
@@ -520,8 +496,7 @@ mod tests {
         assert_eq!(field(ob(None), "Visibility"), None);
     }
 
-    /// The `"VRB"` fallback was unreachable: AWC always fills the direction
-    /// column, so a variable wind rendered as the bearing "000°".
+    /// Fails if a variable wind renders as the bearing "000°".
     #[test]
     fn the_popup_says_vrb_for_a_variable_wind() {
         let wind = field(wind_ob(Some(WindDir::Variable), Some(6), None), "Wind").unwrap();

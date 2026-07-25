@@ -8,90 +8,46 @@ web-time = { workspace = true }
 chrono = { workspace = true }
 earcutr = "=0.5.0"
 flate2 = { workspace = true }
-# Defaults OFF, and deliberately not hoisted into `[workspace.dependencies]`:
-# Cargo silently ignores a member's `default-features = false` when the
-# workspace entry leaves defaults on, so a shared pin here would quietly link
-# the C/C++ stack back in with everything still compiling. grib has exactly one
-# consumer, so the pin stays local where the opt-out is guaranteed to apply.
-#
-# grib's default feature set pulls `openjpeg-sys`, `libaec-sys` and `proj`
-# (-> `proj-sys` -> `libsqlite3-sys`, `link-cplusplus`). None of those
-# cross-compile to wasm32 or iOS. Dropping them costs:
-#
-#   * `jpeg2000-unpack-with-openjpeg` — JPEG2000 (data representation template
-#     5.40/5.40000). HRRR does not use it: its section 5 is DRT 5.3, complex
-#     packing with spatial differencing, which is pure Rust in grib.
-#   * `ccsds-unpack-with-libaec` — AEC/CCSDS (DRT 5.42). Not used by HRRR.
-#   * `gridpoints-proj` — lat/lon computation for grid templates 3.20 (polar
-#     stereographic) and 3.30 (Lambert conformal). HRRR *is* 3.30, so this one
-#     is not free: `hrrr::lambert` reimplements it in pure Rust and
-#     `hrrr::fetch::grid_latlons` routes template 3.30 to it.
-#
-# `png-unpack-with-png-crate` and `time-calculation` are kept: both are pure
-# Rust, and `time-calculation` backs `temporal_raw_info()` in the fetch path.
+# Keep this pin local: Cargo ignores a member's `default-features = false` when
+# the workspace entry leaves defaults on.
+# grib defaults pull `openjpeg-sys`, `libaec-sys`, `proj` (-> `proj-sys` ->
+# `libsqlite3-sys`, `link-cplusplus`); none cross-compile to wasm32 or iOS.
+# Dropped features are unused by HRRR except `gridpoints-proj`: HRRR is grid
+# template 3.30 (Lambert conformal), reimplemented in `hrrr::lambert`.
+# HRRR section 5 is DRT 5.3 (pure Rust in grib), not 5.40/5.42.
+# `time-calculation` backs `temporal_raw_info()`.
 grib = { version = "=0.16.0", default-features = false, features = [
     "png-unpack-with-png-crate",
     "time-calculation",
 ] }
 rustdar-units = { workspace = true }
 futures = "=0.3.33"
-# GOES GLM granules. Replaces `netcdf`, which linked netcdf-sys, netcdf-src,
-# hdf5-metno-sys and hdf5-metno-src -- four bundled C/C++ builds that cannot
-# cross-compile to wasm32 or iOS, which is what kept the lightning overlay off
-# both. `hdf5-pure` is MIT, pure Rust, and its whole dependency graph is
-# `byteorder` + `flate2` (-> miniz_oxide); no `-sys` crate anywhere in it.
-#
-# GLM L2 LCFA files are NetCDF4, which *is* HDF5 -- every netCDF variable is an
-# HDF5 dataset in the root group and every attribute an HDF5 attribute on it --
-# so nothing above the HDF5 layer was being used. See `glm::h5`.
-#
-# Defaults are deliberately left ON (`std`, `checksum`, `deflate`) and NOT
-# hoisted into `[workspace.dependencies]`: Cargo silently ignores a member's
-# `default-features = false` when the workspace entry leaves defaults on, so a
-# shared pin is where an opt-out goes to die. `deflate` routes through flate2's
-# default `rust_backend` (miniz_oxide). Do NOT enable `fast-deflate`: it selects
-# `flate2/zlib-ng`, which is C and puts the whole problem back.
+# GOES GLM granules. GLM L2 LCFA files are NetCDF4, i.e. plain HDF5 (every
+# netCDF variable is an HDF5 dataset in the root group), so `glm::h5` reads them
+# without a netCDF layer. Pure Rust; no `-sys` crate, unlike `netcdf`.
+# Do NOT enable `fast-deflate`: it selects `flate2/zlib-ng`, which is C and
+# breaks wasm32/iOS cross-compilation.
 hdf5-pure = "=0.24.0"
 log = { workspace = true }
-# `json` only. NOT `default`: reqwest's default set includes `default-tls`, which
-# is an alias for `rustls` (platform verifier *plus* aws-lc-rs) and would put
-# `aws-lc-sys` back in the graph. The TLS backend comes from the workspace pin.
+# `json` only, NOT `default`: reqwest's `default-tls` aliases `rustls` with
+# aws-lc-rs, pulling `aws-lc-sys` in. TLS backend comes from the workspace pin.
 reqwest = { workspace = true, features = ["json"] }
 roxmltree = "=0.21.1"
-# Promoted from dev-dependencies. This crate now reads two things from it that
-# belong to the whole application rather than to radar: `sources::DataSources`,
-# which declares every network origin in one place, and `tls`, which owns the
-# client construction (including the no-User-Agent variant the METAR feed
-# needs -- see `metar::fetch`). `rustdar-radar` does not depend on this crate,
-# so there is no cycle.
+# For `sources::DataSources` and `tls` (incl. the no-User-Agent client METAR/SPC
+# need -- see `metar::fetch`). No cycle: `rustdar-radar` does not depend on this.
 rustdar-radar = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tiny-skia = "=0.12.0"
 
-# `fs` is the only tokio feature this crate wants, and tokio rejects it outright
-# on wasm ("Only features sync,macros,io-util,rt,time are supported on wasm").
-# The browser has no filesystem, so the zone disk cache in `nws::zones` is
-# native-only and so is the dependency that backs it. Keep this target-gated:
-# an unconditional `features = ["fs"]` here is a hard build failure for the web
-# target, and it is the single blocker that gated the whole wasm port.
+# Must stay target-gated: tokio rejects `fs` on wasm ("Only features
+# sync,macros,io-util,rt,time are supported on wasm") -- a hard build failure.
+# Backs the native-only zone disk cache in `nws::zones`.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
-# Test-only: drives the `#[ignore]`d live-NOMADS checks. Not linked into any
-# shipped binary.
+# Drives the `#[ignore]`d live-NOMADS checks.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-# NOTE: `rustdar-radar` used to be pinned here, test-only, purely so two tests
-# could reach `tls::client`. It is a real dependency now (see above).
 
 [target.'cfg(target_os = "android")'.dependencies]
-# NOTE: `openssl-sys` used to be pinned here with `features = ["vendored"]` to get
-# a cross-compilable OpenSSL for the NDK. Nothing links OpenSSL any more -- TLS is
-# rustls + rustls-platform-verifier via the workspace `reqwest` pin -- so the
-# vendored build is gone along with its C toolchain requirement.
-#
-# NOTE: `libsqlite3-sys` used to be pinned here with `features = ["bundled"]`,
-# because proj-sys (via grib -> proj) needed SQLite3 headers the NDK sysroot
-# does not ship. grib no longer pulls proj (see the `grib` pin above), so
-# nothing in this crate's graph needs SQLite3 and the workaround is gone.

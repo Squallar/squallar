@@ -13,10 +13,8 @@ use crate::render::overlay_state::{
 use crate::render::rasterize::{self, RasterizeOutput};
 use crate::types::GeoBounds;
 
-/// Type-erased fetch result for NWS alerts.
 pub(crate) struct NwsAlertFetchResult(pub Result<Vec<NwsAlert>, String>);
 
-/// Clickable item representing a single NWS alert.
 #[derive(Debug)]
 pub(crate) struct AlertItem {
     pub alert: NwsAlert,
@@ -92,9 +90,10 @@ impl OverlayItem for AlertItem {
 
 pub(crate) struct NwsAlertHandler {
     pub state: OverlayState<Vec<Arc<AlertItem>>>,
-    /// Alert IDs hidden by the user (not rendered on the map).
+    /// User-dismissed alert IDs. Pruned on refetch so an ID reused upstream
+    /// does not stay hidden forever.
     pub hidden_alerts: HashSet<String>,
-    /// Which alert categories are enabled.
+    /// Empty means the whole overlay is off — see `is_enabled`.
     pub enabled_categories: HashSet<AlertCategory>,
 }
 

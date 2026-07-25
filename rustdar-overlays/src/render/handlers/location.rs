@@ -4,10 +4,7 @@ use crate::render::controls::{ControlEffect, ControlItem, ControlUpdate, PaneCon
 use crate::render::overlay_state::{
     FetchPayload,OverlayHandler, OverlayItem, OverlayKind, RenderMode};
 
-/// Handler for the user's GPS location marker.
-///
-/// Manages toggle state. Rendering (blue dot) is done per-frame directly
-/// in the draw loop.
+/// Toggle state only: the draw loop renders the marker per frame.
 pub(crate) struct UserLocationHandler {
     pub enabled: bool,
 }

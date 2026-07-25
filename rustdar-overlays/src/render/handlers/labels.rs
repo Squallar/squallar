@@ -4,10 +4,8 @@ use crate::render::controls::{ControlEffect, ControlItem, ControlUpdate, PaneCon
 use crate::render::overlay_state::{
     FetchPayload,OverlayHandler, OverlayItem, OverlayKind, RenderMode};
 
-/// Handler for the city labels tile layer.
-///
-/// This handler only manages toggle state — actual tile rendering is handled
-/// by the walkers integration in `rustdar-egui`.
+/// Toggle state only: the tiles are rendered by the walkers integration in
+/// `rustdar-egui`.
 pub(crate) struct CityLabelsHandler {
     pub enabled: bool,
 }

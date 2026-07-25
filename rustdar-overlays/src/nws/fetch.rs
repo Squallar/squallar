@@ -5,13 +5,9 @@ use super::zones::resolve_zone_geometries;
 
 const NWS_ALERTS_URL: &str = "https://api.weather.gov/alerts/active?status=actual";
 
-/// Fetch all active NWS alerts and parse them into `NwsAlert` structs.
-///
-/// Calls `GET /alerts/active?status=actual` on the NWS API.
-/// The `reqwest::Client` must have a `User-Agent` header configured.
-///
-/// `zone_cache_dir` is an optional path to a directory for caching zone
-/// boundary geometries on disk, avoiding 1000+ HTTP requests on each launch.
+/// Unlike SPC and IEM, api.weather.gov *requires* a `User-Agent`; `client` must
+/// carry one. `zone_cache_dir` backs the on-disk zone-geometry cache, without
+/// which each launch issues 1000+ requests.
 pub async fn fetch_active_alerts(
     client: &reqwest::Client,
     zone_cache_dir: Option<&Path>,
@@ -42,7 +38,7 @@ pub async fn fetch_active_alerts(
 
     let mut alerts = parse_alerts(&json);
 
-    // Resolve zone/county geometries for alerts that only have zone references
+    // Many alerts carry zone references instead of geometry.
     resolve_zone_geometries(client, &mut alerts, zone_cache_dir).await;
 
     Ok(alerts)

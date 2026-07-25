@@ -4,11 +4,8 @@ use crate::render::controls::{ControlEffect, ControlItem, ControlUpdate, PaneCon
 use crate::render::overlay_state::{
     FetchPayload,OverlayHandler, OverlayItem, OverlayKind, RenderMode};
 
-/// Handler for NEXRAD radar site markers.
-///
-/// Manages toggle state. Rasterization and per-frame interaction (text labels,
-/// site clicking) are handled in `rustdar-egui` via the texture + interactions
-/// code path in the draw loop.
+/// Toggle state only. Rasterization and per-frame interaction (text labels,
+/// site clicking) happen in `rustdar-egui`.
 pub(crate) struct RadarSitesHandler {
     pub enabled: bool,
 }

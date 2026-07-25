@@ -1,9 +1,7 @@
 //! Rasterize overlay polygons to RGBA textures using tiny-skia.
 //!
-//! This module renders overlay features (SPC outlooks, NWS alerts, mesoscale
-//! discussions) into RGBA pixel buffers suitable for upload as egui textures.
-//! Rendering runs on a background thread; the resulting texture is displayed
-//! as a geo-positioned image on the map — identical to how radar images work.
+//! Runs on a background thread; the texture is then geo-positioned on the map
+//! the same way a radar image is.
 
 use std::collections::{HashMap, HashSet};
 use std::f64::consts::PI;
@@ -24,26 +22,20 @@ use crate::types::{GeoBounds, OverlayFeature};
 
 // ── Hit buffer types ─────────────────────────────────────────────────────
 
-/// Quarter-resolution hit buffer produced during rasterization.
-///
-/// Maps pixel regions to overlay item IDs so that click detection is
-/// pixel-perfect — the exact same pixels the rasterizer drew are clickable.
-/// Resolution is 1/4 of the texture in each axis to keep memory low.
+/// Click detection against the pixels the rasterizer actually drew. Stored at
+/// 1/4 resolution per axis, and sparsely, to keep memory down.
 #[derive(Clone)]
 pub struct HitMap {
-    /// Quarter-resolution width.
+    /// Quarter-resolution, not texture width.
     pub width: u32,
-    /// Quarter-resolution height.
     pub height: u32,
-    /// Sparse map: quarter-res pixel index (`qy * width + qx`) → list of
-    /// item IDs that cover that cell. Only occupied cells are stored.
+    /// `qy * width + qx` → covering item IDs. Occupied cells only.
     cells: HashMap<u32, Vec<u32>>,
-    /// Maps item IDs used in `cells` to their `OverlayItem` values.
     id_map: HashMap<u32, Arc<dyn OverlayItem>>,
 }
 
 impl HitMap {
-    /// Create an empty hit map with the given quarter-resolution dimensions.
+    /// Takes *full*-resolution dimensions and quarters them.
     pub fn new(full_width: u32, full_height: u32) -> Self {
         Self {
             width: full_width.div_ceil(4),
@@ -53,9 +45,7 @@ impl HitMap {
         }
     }
 
-    /// Register that `item_id` covers the full-resolution pixel `(px, py)`.
-    ///
-    /// Quantizes to quarter-res and records the ID in the sparse cell map.
+    /// `(px, py)` is in full-resolution pixels.
     pub fn record(&mut self, px: f32, py: f32, item_id: u32) {
         let qx = (px as u32) / 4;
         let qy = (py as u32) / 4;
@@ -69,12 +59,11 @@ impl HitMap {
         }
     }
 
-    /// Register the `OverlayItem` for a given item ID.
     pub fn register_id(&mut self, item_id: u32, item: Arc<dyn OverlayItem>) {
         self.id_map.insert(item_id, item);
     }
 
-    /// Look up all overlay items at texture UV coordinates `(u, v)` in `[0, 1]`.
+    /// `(u, v)` are texture UVs in `[0, 1]`.
     pub fn hit_test(&self, u: f32, v: f32) -> Vec<Arc<dyn OverlayItem>> {
         if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
             return Vec::new();
@@ -93,26 +82,23 @@ impl HitMap {
     }
 }
 
-/// Output from a rasterization function: RGBA pixels plus an optional hit buffer.
 pub struct RasterizeOutput {
-    /// RGBA pixel data (`width × height × 4` bytes).
+    /// `width × height × 4` bytes, straight (not premultiplied) alpha.
     pub rgba: Vec<u8>,
-    /// Optional hit buffer for pixel-perfect click detection.
     pub hit_map: Option<HitMap>,
 }
 
 // ── Mercator projection helpers ──────────────────────────────────────────
 
-/// Convert latitude (radians) to Web Mercator Y.
 #[inline]
 fn lat_rad_to_mercator_y(lat_rad: f64) -> f64 {
     (PI / 4.0 + lat_rad / 2.0).tan().ln()
 }
 
-/// Maximum latitude for Web Mercator projection (≈85.05°).
+/// Web Mercator's own limit; the projection diverges past it.
 const MAX_MERCATOR_LAT: f64 = 85.05;
 
-/// Mercator bounds for the texture: lat/lon extent plus pre-computed Mercator Y.
+/// Mercator Y for both edges is precomputed once per texture.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MercatorBounds {
     min_lon: f64,
@@ -133,14 +119,14 @@ impl MercatorBounds {
         }
     }
 
-    /// Project a (lat, lon) pair to pixel coordinates within the texture.
+    /// To texture pixel coordinates.
     #[inline]
     pub(crate) fn project(&self, lat: f64, lon: f64, w: f32, h: f32) -> (f32, f32) {
         let lon_frac = (lon - self.min_lon) / (self.max_lon - self.min_lon);
         let merc_y = lat_rad_to_mercator_y(lat.to_radians());
         let merc_frac = (merc_y - self.merc_y_min) / (self.merc_y_max - self.merc_y_min);
         let px = (lon_frac * w as f64) as f32;
-        // Y axis is inverted (top = north = max mercator Y)
+        // Y is inverted: top of texture = north = max Mercator Y.
         let py = ((1.0 - merc_frac) * h as f64) as f32;
         (px, py)
     }
@@ -148,9 +134,7 @@ impl MercatorBounds {
 
 // ── Public API ───────────────────────────────────────────────────────────
 
-/// Rasterize SPC outlook features to an RGBA texture.
-///
-/// `hatch_color` is the [R,G,B,A] used for CIG hatch lines (theme-dependent).
+/// `hatch_color` is theme-dependent, so it cannot live in the feature.
 pub fn rasterize_spc_outlooks(
     features: &[OverlayFeature],
     bounds: &GeoBounds,
@@ -166,19 +150,17 @@ pub fn rasterize_spc_outlooks(
     let w = width as f32;
     let h = height as f32;
 
-    // Pass 1: fill + stroke all polygons
+    // Two passes: hatching must go over every fill, including fills drawn by
+    // features later in the list.
     for feature in features {
         draw_feature(&mut pixmap, feature, &mb, w, h);
     }
-
-    // Pass 2: CIG hatch lines with exclusion
     crate::render::hatch::draw_hatch_pass(&mut pixmap, features, &mb, w, h, hatch_color);
 
     premultiplied_to_straight(pixmap.data_mut());
     pixmap.take()
 }
 
-/// Rasterize SPC Mesoscale Discussion polygons to an RGBA texture.
 pub fn rasterize_spc_discussions(
     discussions: &[SpcDiscussion],
     bounds: &GeoBounds,
@@ -214,10 +196,7 @@ pub fn rasterize_spc_discussions(
     pixmap.take()
 }
 
-/// Rasterize NWS alert polygons to an RGBA texture.
-///
-/// Only alerts whose category is in `enabled_categories` and whose ID is not
-/// in `hidden_ids` are rendered.
+/// Renders only alerts in `enabled_categories` and not in `hidden_ids`.
 pub fn rasterize_nws_alerts(
     alerts: &[NwsAlert],
     enabled_categories: &[AlertCategory],
@@ -247,7 +226,7 @@ pub fn rasterize_nws_alerts(
     pixmap.take()
 }
 
-/// Radar site descriptor for texture rasterization (decoupled from `rustdar-radar`).
+/// Deliberately not `rustdar_radar`'s site type: keeps this crate decoupled.
 pub struct RadarSiteInfo {
     pub name: String,
     pub lat: f64,
@@ -256,10 +235,6 @@ pub struct RadarSiteInfo {
     pub is_loading: bool,
 }
 
-/// Rasterize NEXRAD radar site markers to an RGBA texture.
-///
-/// Draws filled circles with white outlines and site-name labels for each site
-/// visible within the given geo bounds.  Current/loading sites are colour-coded.
 pub fn rasterize_radar_sites(
     sites: &[RadarSiteInfo],
     bounds: &GeoBounds,
@@ -288,7 +263,7 @@ pub fn rasterize_radar_sites(
 
     for site in sites {
         let (px, py) = mb.project(site.lat, site.lon, w, h);
-        // Skip sites outside the texture (with margin for label)
+        // 50 px of slack so a site just off-texture still contributes its label.
         if px < -50.0 || px > w + 50.0 || py < -50.0 || py > h + 50.0 {
             continue;
         }
@@ -301,7 +276,6 @@ pub fn rasterize_radar_sites(
             Color::from_rgba8(100, 150, 255, 255) // blue
         };
 
-        // Filled circle
         let mut pb = PathBuilder::new();
         pb.push_circle(px, py, radius);
         if let Some(path) = pb.finish() {
@@ -310,15 +284,13 @@ pub fn rasterize_radar_sites(
             paint.anti_alias = true;
             pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
 
-            // White outline
             paint.set_color(Color::from_rgba8(255, 255, 255, 255));
             let stroke = Stroke { width: stroke_w, ..Stroke::default() };
             pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
         }
 
-        // Label below the circle — tiny-skia cannot render text, so draw a
-        // small background pill and the label is handled per-frame by egui.
-        // Only draw the background pill at higher zoom levels where labels show.
+        // tiny-skia cannot render text: only the background pill is baked in,
+        // and egui draws the label over it per frame.
         if zoom >= 5.0 {
             let label_w = site.name.len() as f32 * 5.5 + 4.0;
             let label_h = 10.0;
@@ -343,11 +315,10 @@ pub fn rasterize_radar_sites(
 
 // ── Storm report symbol helpers ───────────────────────────────────────
 
-/// Draw a tornado funnel symbol (inverted triangle) inside the circle.
+/// Tornado: funnel, i.e. an inverted triangle.
 fn draw_tornado_symbol(pixmap: &mut Pixmap, px: f32, py: f32, r: f32, color: Color) {
     let s = r * 0.6; // symbol half-size
     let mut pb = PathBuilder::new();
-    // Inverted triangle: wide at top, narrow at bottom
     pb.move_to(px - s, py - s * 0.7);
     pb.line_to(px + s, py - s * 0.7);
     pb.line_to(px, py + s * 0.9);
@@ -360,14 +331,13 @@ fn draw_tornado_symbol(pixmap: &mut Pixmap, px: f32, py: f32, r: f32, color: Col
     }
 }
 
-/// Draw a hail symbol (small filled circle with 4 radiating ticks).
+/// Hail: filled core with four radiating ticks.
 fn draw_hail_symbol(pixmap: &mut Pixmap, px: f32, py: f32, r: f32, color: Color) {
     let core = r * 0.3;
     let tick_inner = r * 0.35;
     let tick_outer = r * 0.65;
     let stroke_w = (r * 0.18).clamp(0.5, 1.5);
 
-    // Small filled circle in center
     let mut pb = PathBuilder::new();
     pb.push_circle(px, py, core);
     if let Some(path) = pb.finish() {
@@ -377,7 +347,6 @@ fn draw_hail_symbol(pixmap: &mut Pixmap, px: f32, py: f32, r: f32, color: Color)
         pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
     }
 
-    // 4 radiating ticks at 45° angles
     let mut paint = Paint::default();
     paint.set_color(color);
     paint.anti_alias = true;
@@ -385,7 +354,6 @@ fn draw_hail_symbol(pixmap: &mut Pixmap, px: f32, py: f32, r: f32, color: Color)
     let diag = std::f32::consts::FRAC_1_SQRT_2;
     let offsets: [(f32, f32); 4] = [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)];
     for (dx, dy) in offsets {
-        // Use diagonal offsets for a spiky look
         let (adx, ady) = if dx.abs() > 0.5 { (dx, diag * dy.signum().max(0.3)) } else { (diag * dx.signum().max(0.3), dy) };
         let _ = ady; let _ = adx;
         let mut pb = PathBuilder::new();
@@ -397,13 +365,12 @@ fn draw_hail_symbol(pixmap: &mut Pixmap, px: f32, py: f32, r: f32, color: Color)
     }
 }
 
-/// Draw a wind symbol (right-pointing chevron/arrow).
+/// Wind: right-pointing chevron.
 fn draw_wind_symbol(pixmap: &mut Pixmap, px: f32, py: f32, r: f32, color: Color) {
     let s = r * 0.55;
     let stroke_w = (r * 0.22).clamp(0.5, 2.0);
 
     let mut pb = PathBuilder::new();
-    // Chevron: top-left to center-right to bottom-left
     pb.move_to(px - s * 0.5, py - s);
     pb.line_to(px + s * 0.5, py);
     pb.line_to(px - s * 0.5, py + s);
@@ -416,11 +383,8 @@ fn draw_wind_symbol(pixmap: &mut Pixmap, px: f32, py: f32, r: f32, color: Color)
     }
 }
 
-/// Rasterize SPC storm report markers to an RGBA texture.
-///
-/// Draws circles with weather-type symbols at each report location,
-/// colour-coded by type: tornado = red, hail = green, wind = blue.
-/// At low zoom (small radius), falls back to filled dots.
+/// Tornado = red, hail = green, wind = blue. Below a 5 px radius the symbols
+/// are unreadable, so it falls back to filled dots.
 pub fn rasterize_storm_reports(
     reports: &[StormReport],
     items: &[Arc<dyn OverlayItem>],
@@ -444,7 +408,7 @@ pub fn rasterize_storm_reports(
     let zoom_f32 = zoom as f32;
     let radius = (3.0 + zoom_f32 * 0.5).clamp(3.0, 10.0);
     let stroke_w = (radius * 0.3).clamp(0.5, 2.0);
-    // Hit radius includes the stroke outline for generous click targets.
+    // Includes the stroke, so the outline itself is clickable.
     let hit_radius = radius + stroke_w;
 
     let outline = if is_dark {
@@ -475,7 +439,6 @@ pub fn rasterize_storm_reports(
             let mut paint = Paint { anti_alias: true, ..Paint::default() };
 
             if use_symbol {
-                // Outline-only circle with symbol inside
                 paint.set_color(fill);
                 let stroke = Stroke { width: stroke_w, ..Stroke::default() };
                 pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
@@ -486,7 +449,6 @@ pub fn rasterize_storm_reports(
                     StormReportKind::Wind => draw_wind_symbol(&mut pixmap, px, py, radius, fill),
                 }
             } else {
-                // Filled dot at low zoom (symbol too small to read)
                 paint.set_color(fill);
                 pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
 
@@ -496,7 +458,6 @@ pub fn rasterize_storm_reports(
             }
         }
 
-        // Record hit cells for all quarter-res pixels within the hit radius.
         let item_id = idx as u32;
         if let Some(item) = items.get(idx) {
             hit_map.register_id(item_id, item.clone());
@@ -506,7 +467,7 @@ pub fn rasterize_storm_reports(
         let min_y = (py - hit_radius).max(0.0) as i32;
         let max_y = ((py + hit_radius) as i32).min(height as i32 - 1);
         let r2 = hit_radius * hit_radius;
-        // Step by 4 since we only need one sample per quarter-res cell.
+        // Step 4: one sample per quarter-res cell.
         let mut sy = min_y;
         while sy <= max_y {
             let mut sx = min_x;
@@ -531,11 +492,9 @@ pub fn rasterize_storm_reports(
 
 // ── GLM Lightning rasterization ──────────────────────────────────────────
 
-/// Draw a lightning bolt symbol at the given center position.
 fn draw_lightning_bolt(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, rgba: [u8; 4]) {
     let s = size * 0.5;
     let mut pb = PathBuilder::new();
-    // Zigzag bolt shape (7 points)
     pb.move_to(cx - s * 0.1, cy - s);
     pb.line_to(cx + s * 0.35, cy - s);
     pb.line_to(cx + s * 0.05, cy - s * 0.15);
@@ -562,21 +521,16 @@ fn draw_lightning_bolt(pixmap: &mut Pixmap, cx: f32, cy: f32, size: f32, rgba: [
     );
 }
 
-/// Compute a time-decay color for a lightning flash.
-/// Recent flashes are bright white/yellow, older flashes fade toward orange/red.
+/// Age ramp: white → yellow → orange → red, in thirds of `window_secs`.
 fn time_decay_color(age_secs: f64, window_secs: f64, is_dark: bool) -> [u8; 4] {
     let t = (age_secs / window_secs).clamp(0.0, 1.0) as f32;
-    // Interpolate: recent → white/bright yellow, old → orange/red
     let (r, g, b) = if t < 0.33 {
-        // White → bright yellow
         let f = t / 0.33;
         (255, (255.0 - f * 30.0) as u8, (255.0 - f * 200.0) as u8)
     } else if t < 0.66 {
-        // Bright yellow → orange
         let f = (t - 0.33) / 0.33;
         (255, (225.0 - f * 90.0) as u8, (55.0 - f * 55.0) as u8)
     } else {
-        // Orange → red
         let f = (t - 0.66) / 0.34;
         ((255.0 - f * 55.0) as u8, (135.0 - f * 85.0) as u8, 0)
     };
@@ -584,22 +538,15 @@ fn time_decay_color(age_secs: f64, window_secs: f64, is_dark: bool) -> [u8; 4] {
     [r, g, b, alpha]
 }
 
-/// Map a GLM radiant energy onto the 0…1 bolt-size channel.
+/// GLM radiant energy → 0…1 bolt-size channel.
 ///
-/// The clamp window is in joules. It covers event and group energies well,
-/// though it is not the full range — flash energies run past the top of it
-/// (about a sixth of the flashes in a sampled GOES-West granule exceed
-/// 1e-12 J), so the largest flashes share a size.
+/// The 1e-16…1e-12 J clamp window covers event and group energies but not all
+/// flash energies: about a sixth of flashes in a sampled GOES-West granule
+/// exceed 1e-12 J, so the largest share a size. Input must be CF-unpacked —
+/// raw packed counts (tens to thousands) clamp to the top for every strike.
 ///
-/// Before CF unpacking was added, this field held raw packed counts in the
-/// tens-to-thousands, whose `log10` clamped to the *top* of the window for
-/// every strike — so this scaling silently did nothing at all and every bolt
-/// drew at maximum size.
-///
-/// `None` means the product did not report an energy, and it draws at the
-/// neutral midpoint. It must not collapse to either end of the channel: 0.0
-/// would render "unknown" as "weakest" — the exact defect that motivated
-/// making the field an `Option` — and 1.0 would render it as "strongest".
+/// `None` draws at the midpoint and must not collapse to either end: 0.0
+/// renders "unknown" as "weakest", 1.0 as "strongest".
 fn energy_size_scale(energy: Option<f32>) -> f32 {
     match energy {
         Some(e) => (e.log10().clamp(-16.0, -12.0) + 16.0) / 4.0,
@@ -607,7 +554,6 @@ fn energy_size_scale(energy: Option<f32>) -> f32 {
     }
 }
 
-/// Parameters for GLM lightning strike rasterization.
 pub struct GlmRenderParams {
     pub zoom: f64,
     pub is_dark: bool,
@@ -615,7 +561,6 @@ pub struct GlmRenderParams {
     pub now: chrono::NaiveDateTime,
 }
 
-/// Rasterize GLM lightning strikes to a texture with `HitMap` for click detection.
 pub fn rasterize_glm_strikes(
     flashes: &[GlmFlash],
     items: &[Arc<dyn OverlayItem>],
@@ -636,12 +581,11 @@ pub fn rasterize_glm_strikes(
     let h = height as f32;
     let mut hit_map = HitMap::new(width, height);
 
-    // Scale bolt size with zoom (base ~12px at zoom 6, range 6-20px)
+    // ~12 px at zoom 6, clamped to 6-20 px.
     let zoom_f32 = params.zoom as f32;
     let base_size = (zoom_f32 * 2.0).clamp(6.0, 20.0);
 
     for (i, flash) in flashes.iter().enumerate() {
-        // Bounds check
         if flash.lat < bounds.min_lat
             || flash.lat > bounds.max_lat
             || flash.lon < bounds.min_lon
@@ -665,7 +609,6 @@ pub fn rasterize_glm_strikes(
         let rgba = time_decay_color(age_secs, params.time_window_secs, params.is_dark);
         draw_lightning_bolt(&mut pixmap, px, py, bolt_size, rgba);
 
-        // Hit map registration
         if let Some(item) = items.get(i) {
             let item_id = i as u32;
             hit_map.register_id(item_id, Arc::clone(item));
@@ -698,9 +641,8 @@ pub fn rasterize_glm_strikes(
 
 // ── Feature rendering ────────────────────────────────────────────────────
 
-/// Draw a single overlay feature (fill + stroke for each polygon).
 fn draw_feature(pixmap: &mut Pixmap, feature: &OverlayFeature, mb: &MercatorBounds, w: f32, h: f32) {
-    // Geo-AABB cull: skip features entirely outside the texture bounds
+    // Geo-AABB cull before any projection work.
     if let Some(ref fb) = feature.geo_bounds {
         let tb = GeoBounds {
             min_lat: merc_y_to_lat(mb.merc_y_min),
@@ -732,17 +674,15 @@ fn draw_feature(pixmap: &mut Pixmap, feature: &OverlayFeature, mb: &MercatorBoun
 
 // ── Path building helpers ────────────────────────────────────────────────
 
-/// Compute a stroke width that scales down when the polygon is small on screen.
-/// `base` is the desired width at close zoom; the result is clamped to [0.5, base].
+/// Thins the stroke below 40 px minimum dimension, so a small polygon is not
+/// swallowed by its own outline. `base` is the width at close zoom.
 fn scaled_stroke_width(path: &tiny_skia::Path, base: f32) -> f32 {
     let b = path.bounds();
     let min_dim = b.width().min(b.height());
-    // Below 40px diameter, start thinning the stroke proportionally
     (min_dim / 40.0 * base).clamp(0.5, base)
 }
 
-/// Build a closed polygon path from projected screen points.
-/// Returns `None` if the path is degenerate (too few points or zero area).
+/// `None` for degenerate paths, which tiny-skia cannot fill.
 pub(crate) fn build_polygon_path(pts: &[(f32, f32)]) -> Option<tiny_skia::Path> {
     if pts.len() < 3 {
         return None;
@@ -754,7 +694,6 @@ pub(crate) fn build_polygon_path(pts: &[(f32, f32)]) -> Option<tiny_skia::Path> 
     }
     pb.close();
     let path = pb.finish()?;
-    // Skip degenerate paths that tiny-skia cannot fill
     let b = path.bounds();
     if b.width() < 0.1 || b.height() < 0.1 {
         return None;
@@ -762,7 +701,6 @@ pub(crate) fn build_polygon_path(pts: &[(f32, f32)]) -> Option<tiny_skia::Path> 
     Some(path)
 }
 
-/// Fill a path with the given RGBA color.
 fn fill_path(pixmap: &mut Pixmap, path: &tiny_skia::Path, rgba: [u8; 4]) {
     if rgba[3] == 0 {
         return;
@@ -773,7 +711,6 @@ fn fill_path(pixmap: &mut Pixmap, path: &tiny_skia::Path, rgba: [u8; 4]) {
     pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
 }
 
-/// Stroke a path with the given RGBA color and width.
 fn stroke_path(pixmap: &mut Pixmap, path: &tiny_skia::Path, rgba: [u8; 4], width: f32) {
     let mut paint = Paint::default();
     paint.set_color(Color::from_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]));
@@ -788,7 +725,7 @@ fn stroke_path(pixmap: &mut Pixmap, path: &tiny_skia::Path, rgba: [u8; 4], width
 
 // ── Utilities ────────────────────────────────────────────────────────────
 
-/// Strip GeoJSON closing duplicate (last == first) from a ring.
+/// Drops GeoJSON's closing duplicate vertex (last == first).
 pub(crate) fn strip_closing_dup(ring: &[(f64, f64)]) -> &[(f64, f64)] {
     if ring.len() > 3 && ring.first() == ring.last() {
         &ring[..ring.len() - 1]
@@ -799,12 +736,13 @@ pub(crate) fn strip_closing_dup(ring: &[(f64, f64)]) -> &[(f64, f64)] {
 
 use crate::hrrr::HrrrGridData;
 
-/// Convert Mercator Y back to latitude (degrees).
+/// Returns degrees.
 fn merc_y_to_lat(merc_y: f64) -> f64 {
     (2.0 * merc_y.exp().atan() - PI / 2.0).to_degrees()
 }
 
-/// Convert premultiplied RGBA (tiny-skia's format) to straight alpha (egui's format).
+/// tiny-skia writes premultiplied alpha; egui expects straight. Every
+/// rasterizer here must call this before returning the buffer.
 fn premultiplied_to_straight(data: &mut [u8]) {
     for pixel in data.chunks_exact_mut(4) {
         let a = pixel[3] as f32;
@@ -819,11 +757,8 @@ fn premultiplied_to_straight(data: &mut [u8]) {
 
 // ── Model data (HRRR) rasterization ──────────────────────────────────────
 
-/// Rasterize HRRR model data (e.g. CIN) to an RGBA texture.
-///
-/// Each grid point is projected to the texture, and the cell around it is
-/// filled with the color-mapped value. The result is a smooth gridded field
-/// overlaid on the map.
+/// Writes pixels directly rather than going through tiny-skia: one filled
+/// rectangle per grid point, sized from its neighbour spacing.
 pub fn rasterize_model_data(
     grid: &HrrrGridData,
     bounds: &GeoBounds,
@@ -847,7 +782,7 @@ pub fn rasterize_model_data(
     let nj = grid.nj;
     let total = ni * nj;
 
-    // Pre-project all grid points to pixel coordinates (one pass).
+    // Pre-project once: the cell loop reads each neighbour several times.
     let mut px_coords: Vec<(f32, f32)> = Vec::with_capacity(total);
     for i in 0..total {
         if i >= grid.lats.len() || i >= grid.lons.len() {
@@ -858,7 +793,6 @@ pub fn rasterize_model_data(
         px_coords.push((px, py));
     }
 
-    // Render each grid cell as a rectangle extending halfway to its neighbors.
     for j in 0..nj {
         for i in 0..ni {
             let idx = j * ni + i;
@@ -876,7 +810,8 @@ pub fn rasterize_model_data(
                 continue;
             }
 
-            // Compute cell half-extents from neighbor distances.
+            // Half-extents from neighbour spacing. 0.55, not 0.50: a slight
+            // overlap hides seams between adjacent cells.
             let dx_left = if i > 0 {
                 let (nx, _) = px_coords[idx - 1];
                 ((cx - nx).abs() * 0.55).max(0.5)
@@ -938,16 +873,12 @@ mod glm_energy_tests {
     use super::*;
     use crate::glm::{GlmDataLevel, GlmFlash, GlmSatellite};
 
-    /// Weakest and strongest energies the size channel distinguishes.
+    /// The ends of the clamp window.
     const WEAKEST: f32 = 1e-16;
     const STRONGEST: f32 = 1e-12;
 
-    /// An unreported energy must not be drawn as an extreme.
-    ///
-    /// `GlmFlash::energy` became an `Option` precisely because the previous
-    /// `0.0` sentinel reached this function: `0.0f32.log10()` is `-inf`, which
-    /// clamps to the bottom of the window and renders "unknown" as "weakest".
-    /// `1.0` would be the mirror-image lie.
+    /// Fails if an unreported energy renders as an extreme. A `0.0` sentinel
+    /// does: `0.0f32.log10()` is `-inf`, which clamps to the window floor.
     #[test]
     fn unknown_energy_draws_between_the_extremes() {
         let unknown = energy_size_scale(None);
@@ -966,8 +897,8 @@ mod glm_energy_tests {
         );
     }
 
-    /// The old `0.0` sentinel is still out of band, so if it ever comes back it
-    /// lands on the floor rather than anywhere sensible.
+    /// A reinstated `0.0` sentinel lands on the floor, indistinguishable from
+    /// the weakest real strike.
     #[test]
     fn zero_energy_would_clamp_to_the_floor() {
         assert_eq!(energy_size_scale(Some(0.0)), 0.0);
@@ -977,7 +908,6 @@ mod glm_energy_tests {
     #[test]
     fn energy_scale_is_monotonic_and_clamped() {
         assert!(energy_size_scale(Some(1e-14)) > energy_size_scale(Some(1e-15)));
-        // Beyond either end of the window everything shares a size.
         assert_eq!(energy_size_scale(Some(1e-20)), 0.0);
         assert_eq!(energy_size_scale(Some(1e-9)), 1.0);
     }
@@ -1009,15 +939,13 @@ mod glm_energy_tests {
                 now: flash.time,
             },
         );
-        // Count painted pixels: bolt size is the only thing varying here, so
-        // this is a proxy for the size the strike was drawn at.
+        // Bolt size is the only thing varying, so painted-pixel count is a
+        // proxy for the size the strike was drawn at.
         out.rgba.chunks_exact(4).filter(|px| px[3] > 0).count()
     }
 
     /// Pins the *wiring*, not just the mapping: an unreported energy has to
-    /// reach the canvas as a mid-size bolt. A regression that reinstated the
-    /// `0.0` sentinel would draw it at the minimum, and this is the assertion
-    /// that would notice.
+    /// reach the canvas as a mid-size bolt.
     #[test]
     fn unknown_energy_renders_larger_than_the_weakest_strike() {
         let unknown = render_one(None);
@@ -1048,7 +976,7 @@ mod model_nan_tests {
         max_lon: -96.9,
     };
 
-    /// A 2x2 HRRR grid over `BOUNDS`, summarised as the fetch path would.
+    /// 2x2 over `BOUNDS`, summarised the way the fetch path does.
     fn grid(parameter: ModelParameter, values: Vec<f32>) -> HrrrGridData {
         let (visible_points, value_range) = crate::hrrr::summarize_values(&values, parameter);
         HrrrGridData {
@@ -1074,19 +1002,14 @@ mod model_nan_tests {
         out.rgba.chunks_exact(4).filter(|px| px[3] > 0).count()
     }
 
-    /// A missing grid point must not be painted at all.
+    /// Fails if a NaN grid point paints. The ramps in `hrrr/mod.rs` are
+    /// descending `if` chains ending in an unguarded `else`: NaN fails every
+    /// comparison and lands there, where `f32::min` returns the non-NaN
+    /// operand — so an unguarded missing point renders as the *most extreme*
+    /// value, under a tooltip that `format_value` leaves blank.
     ///
-    /// Every ramp in `hrrr/mod.rs` is a descending `if` chain ending in an
-    /// unguarded `else`. NaN fails every comparison, so it reaches the final
-    /// branch, where `((NaN - 200.0) / 300.0).min(1.0)` is `1.0` — `f32::min`
-    /// returns the non-NaN operand. Without a guard a missing point renders as
-    /// the *most extreme* value on the scale, and `format_value` returns
-    /// nothing for NaN, so the tooltip goes blank over the most alarming pixel
-    /// on the map.
-    ///
-    /// Not reachable while every HRRR field ships Section 6
-    /// `bitmap_indicator = 255`, but it becomes live the moment NOMADS ships a
-    /// bitmapped field.
+    /// Unreachable while every HRRR field ships Section 6
+    /// `bitmap_indicator = 255`; live the moment NOMADS ships a bitmapped one.
     #[test]
     fn a_missing_grid_point_paints_nothing() {
         for parameter in ModelParameter::all() {
@@ -1100,7 +1023,7 @@ mod model_nan_tests {
         }
     }
 
-    /// The NaN test must not pass merely because the fixture draws nothing.
+    /// Without this, the NaN test passes on a fixture that draws nothing.
     #[test]
     fn the_fixture_paints_when_values_are_present() {
         let alarming = grid(ModelParameter::SurfaceBasedCin, vec![-400.0; 4]);
@@ -1110,8 +1033,7 @@ mod model_nan_tests {
         );
     }
 
-    /// NaN must not merely be *some* colour — it must specifically not be the
-    /// extreme one it used to be.
+    /// Fails if NaN is merely *some* colour rather than fully transparent.
     #[test]
     fn nan_does_not_take_the_extreme_branch_of_any_ramp() {
         for parameter in ModelParameter::all() {
@@ -1123,8 +1045,7 @@ mod model_nan_tests {
                 parameter.display_name(),
             );
 
-            // A value that legitimately saturates this ramp's top branch —
-            // precisely what NaN used to be indistinguishable from.
+            // A value that legitimately saturates this ramp's top branch.
             let extreme = match parameter {
                 ModelParameter::SurfaceBasedCin | ModelParameter::MixedLayerCin => -600.0,
                 ModelParameter::LiftedIndex => -20.0,
@@ -1141,8 +1062,7 @@ mod model_nan_tests {
         }
     }
 
-    /// Infinities take the same path as NaN through the ramps and are equally
-    /// not readings.
+    /// Infinities take the same path as NaN through the ramps.
     #[test]
     fn infinite_values_paint_nothing_either() {
         for parameter in ModelParameter::all() {
@@ -1157,13 +1077,12 @@ mod model_nan_tests {
         }
     }
 
-    /// The grid-shape guard pads `px_coords` with NaN when `ni * nj` exceeds
-    /// the coordinate arrays; those points must be skipped, not projected
-    /// somewhere arbitrary.
+    /// `px_coords` is NaN-padded when `ni * nj` exceeds the coordinate arrays;
+    /// those points must be skipped, not projected somewhere arbitrary.
     #[test]
     fn a_grid_shape_mismatch_does_not_paint_padded_points() {
         let mut g = grid(ModelParameter::SurfaceBasedCin, vec![-400.0; 4]);
-        // Claim a 4x4 grid while supplying only 4 coordinates and 4 values.
+        // Claim 4x4 while supplying only 4 coordinates and 4 values.
         g.ni = 4;
         g.nj = 4;
         let out = rasterize_model_data(&g, &BOUNDS, 64, 64);

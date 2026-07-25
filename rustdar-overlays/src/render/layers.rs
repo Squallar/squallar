@@ -1,7 +1,7 @@
 use crate::nws::alert::AlertCategory;
 use crate::spc::outlook::{OutlookDay, OutlookProduct};
 
-/// Identifies each toggleable overlay layer.
+/// Finer-grained than `OverlayKind`: one variant per user-facing toggle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum LayerKind {
     Radar,
@@ -22,7 +22,7 @@ pub enum LayerKind {
 }
 
 impl LayerKind {
-    /// All layer kinds in canonical order.
+    /// Order here is the order the layer list is presented in.
     pub const fn all() -> &'static [LayerKind] {
         &[
             LayerKind::Radar,
@@ -43,7 +43,6 @@ impl LayerKind {
         ]
     }
 
-    /// Human-readable display name.
     pub fn display_name(self) -> &'static str {
         match self {
             LayerKind::Radar => "Radar",
@@ -64,7 +63,6 @@ impl LayerKind {
         }
     }
 
-    /// Whether this layer is an SPC outlook product.
     pub fn is_spc(self) -> bool {
         matches!(
             self,
@@ -76,7 +74,6 @@ impl LayerKind {
         )
     }
 
-    /// Whether this layer is an NWS alerts layer.
     pub fn is_nws(self) -> bool {
         matches!(
             self,
@@ -84,7 +81,7 @@ impl LayerKind {
         )
     }
 
-    /// Convert to the corresponding `AlertCategory`, if this is an NWS layer.
+    /// `None` for non-NWS layers.
     pub fn to_alert_category(self) -> Option<AlertCategory> {
         match self {
             LayerKind::NwsWarnings => Some(AlertCategory::Warning),
@@ -94,7 +91,7 @@ impl LayerKind {
         }
     }
 
-    /// Convert to the corresponding `OutlookProduct`, if this is an SPC layer.
+    /// `None` for non-SPC layers.
     pub fn to_outlook_product(self) -> Option<OutlookProduct> {
         match self {
             LayerKind::SpcCategorical => Some(OutlookProduct::Categorical),
@@ -107,7 +104,6 @@ impl LayerKind {
     }
 }
 
-/// Per-layer state (enabled toggle).
 #[derive(Debug, Clone)]
 pub struct LayerState {
     pub enabled: bool,
@@ -119,10 +115,9 @@ impl LayerState {
     }
 }
 
-/// Manages the set of overlay layers and their toggle states.
 pub struct LayerManager {
+    /// `BTreeMap`, so iteration follows `LayerKind`'s `Ord` and is stable.
     layers: std::collections::BTreeMap<LayerKind, LayerState>,
-    /// Which SPC outlook day is selected.
     pub spc_day: OutlookDay,
 }
 
@@ -178,19 +173,18 @@ impl LayerManager {
         }
     }
 
-    /// Get a mutable reference to the enabled flag for use with egui checkbox.
+    /// Inserts a disabled entry if the layer is unknown, so egui always has a
+    /// `&mut bool` to bind a checkbox to.
     pub fn enabled_mut(&mut self, kind: LayerKind) -> &mut bool {
         &mut self.layers.entry(kind).or_insert(LayerState::new(false)).enabled
     }
 
-    /// Returns true if any SPC outlook layer is enabled.
     pub fn any_spc_enabled(&self) -> bool {
         self.layers
             .iter()
             .any(|(kind, state)| kind.is_spc() && state.enabled)
     }
 
-    /// Get all currently enabled SPC product types.
     pub fn enabled_spc_products(&self) -> Vec<OutlookProduct> {
         self.layers
             .iter()
@@ -199,14 +193,12 @@ impl LayerManager {
             .collect()
     }
 
-    /// Returns true if any NWS alerts layer is enabled.
     pub fn any_nws_enabled(&self) -> bool {
         self.layers
             .iter()
             .any(|(kind, state)| kind.is_nws() && state.enabled)
     }
 
-    /// Get all currently enabled NWS alert categories.
     pub fn enabled_nws_categories(&self) -> Vec<AlertCategory> {
         self.layers
             .iter()
@@ -215,9 +207,8 @@ impl LayerManager {
             .collect()
     }
 
-    /// Return the SPC-relevant `LayerKind` variants for the current day.
-    /// Day 1-2 have separate tornado/wind/hail; Day 3 uses combined probabilistic;
-    /// Days 4-8 only have a single probabilistic product.
+    /// Days 1-2 publish separate tornado/wind/hail; day 3 only a combined
+    /// probabilistic; days 4-8 one probabilistic product.
     pub fn spc_layers_for_day(&self) -> Vec<LayerKind> {
         if self.spc_day.is_extended() {
             return vec![LayerKind::SpcProbabilistic];

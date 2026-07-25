@@ -12,14 +12,12 @@ use crate::render::rasterize::{self, RasterizeOutput};
 use crate::spc::outlook::{OutlookDay, OutlookProduct, SpcOutlook};
 use crate::types::GeoBounds;
 
-/// Type-erased fetch result for SPC outlook data.
 pub(crate) struct SpcOutlookFetchResult {
     pub day: OutlookDay,
     pub product: OutlookProduct,
     pub result: Result<SpcOutlook, String>,
 }
 
-/// Clickable item representing a single SPC outlook feature.
 #[derive(Debug)]
 pub(crate) struct OutlookItem {
     pub label: String,
@@ -54,13 +52,13 @@ impl OverlayItem for OutlookItem {
 
 pub(crate) struct SpcOutlookHandler {
     pub state: OverlayState<HashMap<(OutlookDay, OutlookProduct), SpcOutlook>>,
-    /// Per-product data generation counters for fine-grained cache invalidation.
+    /// Per product, so one product's refetch does not invalidate the others.
     per_product_generation: HashMap<(OutlookDay, OutlookProduct), u64>,
-    /// Bumped when config (selected day, product set) changes without a data fetch.
+    /// Bumped when day or product set changes without any fetch, which still
+    /// changes what gets drawn.
     config_generation: u64,
-    /// Currently selected outlook day.
     pub selected_day: OutlookDay,
-    /// Which outlook products are enabled.
+    /// Empty means the whole overlay is off — see `is_enabled`.
     pub enabled_products: HashSet<OutlookProduct>,
 }
 
@@ -71,7 +69,7 @@ impl SpcOutlookHandler {
             per_product_generation: HashMap::new(),
             config_generation: 0,
             selected_day: OutlookDay::Day1,
-            enabled_products: HashSet::new(), // disabled by default
+            enabled_products: HashSet::new(),
         }
     }
 
@@ -160,7 +158,7 @@ impl OverlayHandler for SpcOutlookHandler {
     }
 
     fn retain_selections(&self, _selections: &mut Vec<Arc<dyn OverlayItem>>) {
-        // Outlook selections are always valid (label-based, not ID-based)
+        // Nothing to prune: outlook items match on label, not on a data ID.
     }
 
     fn prepare_rasterize(
@@ -195,7 +193,7 @@ impl OverlayHandler for SpcOutlookHandler {
         let day = self.selected_day;
         let products: Vec<OutlookProduct> = self.enabled_products.iter().copied().collect();
         log::info!("Fetching SPC outlooks for {:?}: {:?}", day, products);
-        // NOT `ctx.client` — SPC answers OPTIONS with 403, so a `User-Agent`
+        // NOT `ctx.client`: SPC answers OPTIONS with 403, so a `User-Agent`
         // makes every one of these fail in the browser. See `spc::fetch`.
         let client = match crate::spc::fetch::spc_client(&ctx.sources) {
             Ok(c) => c,
@@ -228,7 +226,6 @@ impl OverlayHandler for SpcOutlookHandler {
             ControlItem::Heading { text: "\u{26c8}  SPC Outlooks".into() },
         ];
 
-        // Day selector buttons
         let buttons: Vec<ControlButton> = OutlookDay::all().iter().map(|&d| {
             let id: &'static str = match d {
                 OutlookDay::Day1 => "day1",
@@ -249,7 +246,7 @@ impl OverlayHandler for SpcOutlookHandler {
         }).collect();
         items.push(ControlItem::ButtonRow { buttons });
 
-        // Product toggles for current day
+        // Only the products the selected day actually publishes.
         for &product in self.selected_day.products() {
             let id: &'static str = match product {
                 OutlookProduct::Categorical => "cat",
@@ -265,7 +262,6 @@ impl OverlayHandler for SpcOutlookHandler {
             });
         }
 
-        // Refresh button + fetching indicator when enabled
         if self.is_enabled() {
             items.push(ControlItem::ButtonRow {
                 buttons: vec![ControlButton {
@@ -299,7 +295,8 @@ impl OverlayHandler for SpcOutlookHandler {
                 };
                 if new_day != self.selected_day {
                     self.selected_day = new_day;
-                    // Remove products not valid for the new day
+                    // Days publish different product sets; drop the ones the
+                    // new day has no endpoint for.
                     let valid: HashSet<OutlookProduct> = new_day.products().iter().copied().collect();
                     self.enabled_products.retain(|p| valid.contains(p));
                     self.config_generation = self.config_generation.wrapping_add(1);

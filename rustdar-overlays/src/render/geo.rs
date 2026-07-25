@@ -1,13 +1,9 @@
-//! Screen-space geometry utilities.
-//!
-//! Pure geometry algorithms operating on [`ScreenPoint`] coordinates.
-//! These are GUI-framework-agnostic — the `rustdar-egui` crate provides
-//! thin conversion wrappers to bridge `egui::Pos2` ↔ `ScreenPoint`.
+//! Geometry utilities. GUI-framework-agnostic: `rustdar-egui` bridges
+//! `egui::Pos2` ↔ [`ScreenPoint`].
 
 use crate::types::{GeoBounds, GeoPolygon, GeoPolygonRing, PrecomputedTriangulation, ScreenPoint};
 
-/// Ray-casting (even-odd rule) point-in-polygon test.
-/// Returns `true` if `point` lies inside the polygon defined by `vertices`.
+/// Ray casting, even-odd rule. Behaviour on the boundary is unspecified.
 pub fn point_in_polygon(point: ScreenPoint, vertices: &[ScreenPoint]) -> bool {
     let n = vertices.len();
     if n < 3 {
@@ -32,12 +28,8 @@ pub fn point_in_polygon(point: ScreenPoint, vertices: &[ScreenPoint]) -> bool {
 
 // ── Shared geometry utilities ────────────────────────────────────────────
 
-/// Ramer-Douglas-Peucker polygon ring simplification.
-///
-/// Reduces vertex count by removing points within `epsilon` degrees of the
-/// line between their neighbours. An epsilon of ~0.005 (~500 m) keeps shapes
-/// visually accurate at typical map zoom levels while cutting vertex counts
-/// significantly.
+/// Ramer-Douglas-Peucker. `epsilon` is in **degrees**, not metres or pixels;
+/// 0.005 ≈ 500 m. See [`crate::types::SIMPLIFY_EPSILON`].
 pub fn simplify_ring(ring: &GeoPolygonRing, epsilon: f64) -> GeoPolygonRing {
     if ring.len() <= 3 {
         return ring.clone();
@@ -66,7 +58,7 @@ fn rdp_simplify(points: &[(f64, f64)], epsilon: f64) -> Vec<(f64, f64)> {
     if max_dist > epsilon {
         let mut left = rdp_simplify(&points[..=max_idx], epsilon);
         let right = rdp_simplify(&points[max_idx..], epsilon);
-        left.pop(); // Remove duplicate junction point
+        left.pop(); // The junction point appears in both halves.
         left.extend(right);
         left
     } else {
@@ -91,7 +83,7 @@ fn perpendicular_distance(
     num / len_sq.sqrt()
 }
 
-/// Simplify all rings in all polygons of a feature's polygon set.
+/// Also drops rings and polygons that simplification made degenerate.
 pub fn simplify_polygons(polygons: &mut Vec<GeoPolygon>, epsilon: f64) {
     for polygon in polygons.iter_mut() {
         for ring in polygon.iter_mut() {
@@ -99,15 +91,13 @@ pub fn simplify_polygons(polygons: &mut Vec<GeoPolygon>, epsilon: f64) {
                 *ring = simplify_ring(ring, epsilon);
             }
         }
-        // Remove degenerate rings
         polygon.retain(|r| r.len() >= 3);
     }
-    // Remove empty polygons
     polygons.retain(|p| !p.is_empty());
 }
 
 
-/// Strip the GeoJSON closing duplicate (last == first) from a ring.
+/// Drops GeoJSON's closing duplicate vertex (last == first).
 fn strip_closing_dup(ring: &[(f64, f64)]) -> &[(f64, f64)] {
     if ring.len() > 3 && ring.first() == ring.last() {
         &ring[..ring.len() - 1]
@@ -116,7 +106,7 @@ fn strip_closing_dup(ring: &[(f64, f64)]) -> &[(f64, f64)] {
     }
 }
 
-/// Pre-compute ear-clip triangulation for each polygon's exterior ring.
+/// Exterior rings only — holes are not triangulated.
 pub fn precompute_triangulations(polygons: &[GeoPolygon]) -> Vec<Option<PrecomputedTriangulation>> {
     polygons
         .iter()
@@ -126,7 +116,7 @@ pub fn precompute_triangulations(polygons: &[GeoPolygon]) -> Vec<Option<Precompu
             if ring.len() < 3 {
                 return None;
             }
-            // Flatten to [lat0, lon0, lat1, lon1, ...] for earcutr
+            // earcutr wants a flat [lat0, lon0, lat1, lon1, ...] with dim 2.
             let coords: Vec<f64> = ring.iter().flat_map(|&(lat, lon)| [lat, lon]).collect();
             let indices = earcutr::earcut(&coords, &[], 2).ok()?;
             if indices.is_empty() {
@@ -139,7 +129,7 @@ pub fn precompute_triangulations(polygons: &[GeoPolygon]) -> Vec<Option<Precompu
         .collect()
 }
 
-/// Compute the overall geographic bounding box for all polygons in a feature.
+/// `None` when there is not a single vertex.
 pub fn compute_geo_bounds(polygons: &[GeoPolygon]) -> Option<GeoBounds> {
     let mut min_lat = f64::MAX;
     let mut max_lat = f64::MIN;

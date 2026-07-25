@@ -18,10 +18,10 @@ pub(crate) struct ModelDataHandler {
     pub state: OverlayState<Option<Arc<HrrrGridData>>>,
     pub enabled: bool,
     pub selected_param: ModelParameter,
-    /// Per-parameter grid cache so different panes can render different parameters.
+    /// Keyed per parameter so different panes can show different ones.
     pub cached_grids: HashMap<ModelParameter, Arc<HrrrGridData>>,
-    /// Last fetch error, surfaced in the controls so a failed fetch is not
-    /// visible only in the log. Cleared by the next success.
+    /// Surfaced in the controls; otherwise a failed fetch appears only in the
+    /// log. Cleared by the next success.
     pub last_error: Option<String>,
 }
 
@@ -87,15 +87,13 @@ impl OverlayHandler for ModelDataHandler {
     }
 
     fn auto_poll_interval(&self) -> Option<u64> {
-        // HRRR updates hourly; refresh every 3600s.
-        Some(3600)
+        Some(3600) // HRRR runs hourly.
     }
 
     fn clickable_items(
         &self,
     ) -> Vec<crate::render::overlay_state::ClickableItem> {
-        // Model data grids are not clickable.
-        Vec::new()
+        Vec::new() // Gridded, not feature-based; hover uses `hover_value_at`.
     }
 
     fn apply_fetch_result(&mut self, result: FetchPayload) {
@@ -138,14 +136,13 @@ impl OverlayHandler for ModelDataHandler {
 
     fn hover_value_at(&self, lat: f64, lon: f64) -> Option<String> {
         let grid = self.cached_grids.get(&self.selected_param)?;
-        // Quick bounds check.
         if lat < grid.bounds.min_lat || lat > grid.bounds.max_lat
             || lon < grid.bounds.min_lon || lon > grid.bounds.max_lon
         {
             return None;
         }
-        // Nearest-neighbor lookup: find grid point closest to (lat, lon).
-        // HRRR grid is ~3 km, so nearest-neighbor is sufficient for tooltips.
+        // Nearest neighbour, not interpolation: the HRRR grid is ~3 km, finer
+        // than a tooltip needs. Linear scan over the whole grid.
         let mut best_dist_sq = f64::MAX;
         let mut best_val = f32::NAN;
         for (i, &value) in grid.values.iter().enumerate() {
@@ -160,7 +157,7 @@ impl OverlayHandler for ModelDataHandler {
                 best_val = value;
             }
         }
-        // Only show if the nearest point is within ~5 km (~0.05° at mid-latitudes).
+        // ~0.05° ≈ 5 km at mid-latitudes.
         if best_dist_sq > 0.05 * 0.05 {
             return None;
         }
@@ -215,10 +212,8 @@ impl OverlayHandler for ModelDataHandler {
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
         let grid = self.cached_grids.get(&self.selected_param);
 
-        // The toggle label carries the timestamp, so it is the one place a
-        // forecast-hour difference must not be hidden: showing a 0-1 h
-        // maximum's run time alone would read as an analysis valid *now*.
-        // Label f01+ with its valid time and the F-hour explicitly.
+        // f01+ must show its *valid* time and F-hour: a 0-1 h maximum labelled
+        // with the run time alone reads as an analysis valid now.
         let label = match grid {
             Some(g) if g.forecast_hour > 0 => format!(
                 "\u{1f321}\u{fe0f}  Model Data ({} F{:02})",
@@ -273,10 +268,8 @@ impl OverlayHandler for ModelDataHandler {
                 items.push(ControlItem::InfoText { text });
             }
 
-            // A fetch that failed leaves the previous parameter's grid on
-            // screen, or nothing at all. Neither says "this is broken", so
-            // the log was the only place the HTTP 500 that made both UH
-            // parameters useless ever appeared.
+            // A failed fetch leaves the previous parameter's grid on screen, or
+            // nothing. Neither reads as "broken".
             if let Some(err) = &self.last_error {
                 items.push(ControlItem::InfoText {
                     text: format!("\u{26a0} {err}"),
@@ -284,10 +277,8 @@ impl OverlayHandler for ModelDataHandler {
             }
 
             if let Some(grid) = self.cached_grids.get(&self.selected_param) {
-                // Windowed fields are maxima over a period, not readings at an
-                // instant. The F-hour in the label says *when*; this says
-                // *what*, because "UH2-5 at 04:00z" still invites reading it
-                // as a snapshot.
+                // Windowed fields are maxima over a period, not instantaneous
+                // readings; "UH2-5 at 04:00z" alone reads as a snapshot.
                 if grid.forecast_hour > 0 && self.selected_param.is_windowed() {
                     items.push(ControlItem::InfoText {
                         text: format!(
@@ -298,8 +289,7 @@ impl OverlayHandler for ModelDataHandler {
                     });
                 }
 
-                // The failure this whole change exists to prevent: a grid that
-                // fetched and decoded perfectly, and paints nothing.
+                // A grid can fetch and decode perfectly and still paint nothing.
                 if let Some(notice) = grid.blank_notice() {
                     items.push(ControlItem::InfoText { text: notice });
                 }
@@ -329,9 +319,8 @@ impl OverlayHandler for ModelDataHandler {
                     let new_param: ModelParameter = val.parse().unwrap();
                     if new_param != self.selected_param {
                         self.selected_param = new_param;
-                        // If we already have cached data for this parameter,
-                        // bump data_generation to trigger a re-render without
-                        // a new fetch.
+                        // Cached parameters re-render on a generation bump
+                        // alone; no refetch.
                         if self.cached_grids.contains_key(&new_param) {
                             self.state.data_generation = self.state.data_generation.wrapping_add(1);
                             return ControlEffect::None;
@@ -396,7 +385,6 @@ mod tests {
         }
     }
 
-    /// An enabled handler showing `parameter`, holding `values` for it.
     fn handler(parameter: ModelParameter, values: Vec<f32>) -> ModelDataHandler {
         let mut h = ModelDataHandler::new();
         h.enabled = true;
@@ -412,7 +400,6 @@ mod tests {
         })
     }
 
-    /// The toggle label, which is where the timestamp lives.
     fn toggle_label(h: &ModelDataHandler) -> String {
         controls_of(h)
             .into_iter()
@@ -423,7 +410,6 @@ mod tests {
             .expect("a toggle")
     }
 
-    /// Every `InfoText` line, in order.
     fn info_lines(h: &ModelDataHandler) -> Vec<String> {
         controls_of(h)
             .into_iter()
@@ -434,8 +420,8 @@ mod tests {
             .collect()
     }
 
-    /// UH comes from f01, so it is valid an hour after the run. Labelling it
-    /// with the run time alone would present a forecast as the analysis.
+    /// Fails if a forecast is labelled with its run time. UH comes from f01, so
+    /// it is valid an hour after the run.
     #[test]
     fn a_forecast_hour_is_visible_in_the_toggle_label() {
         let label = toggle_label(&handler(ModelParameter::MaxUH2to5km, vec![120.0]));
@@ -444,7 +430,7 @@ mod tests {
         assert!(!label.contains("03:00z"), "run time must not stand in: {label}");
     }
 
-    /// Analysis fields must not grow a forecast suffix.
+    /// The counterpart: analysis fields must not grow an F-hour suffix.
     #[test]
     fn an_analysis_field_is_labelled_with_its_run_time_only() {
         let label = toggle_label(&handler(ModelParameter::SurfaceBasedCin, vec![-400.0]));
@@ -452,8 +438,7 @@ mod tests {
         assert!(!label.contains("F0"), "{label}");
     }
 
-    /// "UH2-5 at 04:00z" still invites reading as a snapshot; it is a maximum
-    /// over the whole hour and has to say so.
+    /// Fails if a windowed field does not state its accumulation window.
     #[test]
     fn a_windowed_parameter_states_its_accumulation_window() {
         let lines = info_lines(&handler(ModelParameter::MaxUH2to5km, vec![120.0]));
@@ -475,8 +460,7 @@ mod tests {
         );
     }
 
-    /// The failure this change exists to prevent: a grid that fetched and
-    /// decoded perfectly and paints nothing must not do so quietly.
+    /// Fails if a grid that decoded perfectly and paints nothing stays silent.
     #[test]
     fn a_blank_overlay_explains_itself_in_the_controls() {
         let lines = info_lines(&handler(ModelParameter::MaxUH2to5km, vec![0.0; 8]));
@@ -488,15 +472,15 @@ mod tests {
         assert!(notice.contains("0 m\u{b2}/s\u{b2}"), "{notice}");
     }
 
-    /// A field with data must stay quiet, or the notice is just noise.
+    /// The counterpart: a populated field must stay quiet, or it is just noise.
     #[test]
     fn a_populated_overlay_reports_no_problem() {
         let lines = info_lines(&handler(ModelParameter::MaxUH2to5km, vec![120.0, 0.0]));
         assert!(!lines.iter().any(|l| l.contains('\u{26a0}')), "{lines:?}");
     }
 
-    /// The HTTP 500 that made both UH parameters useless appeared only in the
-    /// log. An enabled overlay with no data has to say why.
+    /// Fails if a fetch error is only logged. An HTTP 500 once made both UH
+    /// parameters useless with nothing on screen to say so.
     #[test]
     fn a_fetch_error_is_reported_in_the_controls() {
         let mut h = ModelDataHandler::new();

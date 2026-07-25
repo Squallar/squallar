@@ -1,7 +1,7 @@
 use crate::types::{GeoPolygon, HatchPattern, OverlayFeature};
 use super::colors::alert_color;
 
-/// Broad classification of an NWS alert.
+/// Not an NWS field: derived from the `event` string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum AlertCategory {
     Warning,
@@ -11,7 +11,6 @@ pub enum AlertCategory {
 }
 
 impl AlertCategory {
-    /// Derive category from the event name string.
     pub fn from_event(event: &str) -> Self {
         let lower = event.to_lowercase();
         if lower.contains("warning") {
@@ -44,8 +43,8 @@ impl std::fmt::Display for AlertCategory {
     }
 }
 
-/// Generates a fieldless enum implementing `FromStr` that maps variant names
-/// to values, falling back to `Unknown` for unrecognized strings.
+/// Fieldless enum whose `FromStr` is infallible: unrecognised strings become
+/// `Unknown`, so an added NWS value never drops an alert.
 macro_rules! str_enum {
     ($name:ident { $($variant:ident),+ $(,)? }) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -68,7 +67,6 @@ str_enum!(AlertSeverity { Extreme, Severe, Moderate, Minor });
 str_enum!(AlertUrgency { Immediate, Expected, Future, Past });
 str_enum!(AlertCertainty { Observed, Likely, Possible, Unlikely });
 
-/// A single NWS weather alert with parsed metadata and renderable geometry.
 #[derive(Debug, Clone)]
 pub struct NwsAlert {
     pub id: String,
@@ -86,18 +84,14 @@ pub struct NwsAlert {
     pub expires: String,
     pub onset: Option<String>,
     pub ends: Option<String>,
-    /// Zone URLs for zone-based alerts (used to resolve county geometries).
     pub affected_zones: Vec<String>,
-    /// Renderable polygon features (reuses the shared OverlayFeature type).
-    /// May be empty initially for zone-based alerts until zone geometries are resolved.
+    /// Empty until `zones::resolve_zone_geometries` runs, for zone-based alerts.
     pub features: Vec<OverlayFeature>,
 }
 
-/// Parse a NWS alerts GeoJSON response into a list of `NwsAlert`.
-///
-/// Expects a GeoJSON `FeatureCollection` from `api.weather.gov/alerts/active`.
-/// Alerts with null geometry are included with empty features; their zone
-/// geometries can be resolved later via `zones::resolve_zone_geometries`.
+/// A GeoJSON `FeatureCollection` from `api.weather.gov/alerts/active`. Many
+/// alerts (watches especially) carry `"geometry": null` and only
+/// `affectedZones` URLs; those are kept with no features for `zones` to fill in.
 pub fn parse_alerts(json: &serde_json::Value) -> Vec<NwsAlert> {
     let Some(features) = json.get("features").and_then(|v| v.as_array()) else {
         log::warn!("NWS alerts response missing 'features' array");
@@ -117,14 +111,12 @@ pub fn parse_alerts(json: &serde_json::Value) -> Vec<NwsAlert> {
             continue;
         }
 
-        // Parse geometry — may be null for zone-based alerts (watches, etc.)
         let polygons = parse_geometry(feature.get("geometry")).unwrap_or_default();
         let has_geometry = !polygons.is_empty();
 
-        // Parse affected zones for alerts without inline geometry
         let affected_zones = parse_affected_zones(props);
 
-        // Skip if no geometry AND no zone references — nothing to render
+        // Neither geometry nor zone references: nothing to render.
         if !has_geometry && affected_zones.is_empty() {
             continue;
         }
@@ -143,8 +135,7 @@ pub fn parse_alerts(json: &serde_json::Value) -> Vec<NwsAlert> {
                 HatchPattern::None,
             )]
         } else {
-            // Will be populated later by zone geometry resolution
-            Vec::new()
+            Vec::new() // Filled in by zone geometry resolution.
         };
 
         alerts.push(NwsAlert {
@@ -183,8 +174,7 @@ pub fn parse_alerts(json: &serde_json::Value) -> Vec<NwsAlert> {
     alerts
 }
 
-/// Parse a GeoJSON geometry object into our internal polygon representation.
-/// Returns `None` if geometry is null or unsupported.
+/// `None` for null or unsupported geometry.
 pub(crate) fn parse_geometry(geom: Option<&serde_json::Value>) -> Option<Vec<GeoPolygon>> {
     let geom = geom?.as_object()?;
     let geom_type = geom.get("type")?.as_str()?;
@@ -210,7 +200,6 @@ pub(crate) fn parse_geometry(geom: Option<&serde_json::Value>) -> Option<Vec<Geo
     }
 }
 
-/// Extract a required string field, defaulting to empty string.
 fn str_field(obj: &serde_json::Value, key: &str) -> String {
     obj.get(key)
         .and_then(|v| v.as_str())
@@ -218,14 +207,12 @@ fn str_field(obj: &serde_json::Value, key: &str) -> String {
         .to_string()
 }
 
-/// Extract an optional string field.
 fn opt_str_field(obj: &serde_json::Value, key: &str) -> Option<String> {
     obj.get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
 }
 
-/// Parse `affectedZones` URLs from an alert's properties.
 fn parse_affected_zones(props: &serde_json::Value) -> Vec<String> {
     props
         .get("affectedZones")

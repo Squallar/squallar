@@ -1,5 +1,4 @@
-/// Parse a hex color string like "#RRGGBB" into [r, g, b, a].
-/// Returns a default grey on parse failure.
+/// `"#RRGGBB"` or `"RRGGBB"`. Falls back to grey rather than failing.
 pub fn parse_hex_color(hex: &str, alpha: u8) -> [u8; 4] {
     let hex = hex.trim_start_matches('#');
     if hex.len() < 6 {
@@ -13,7 +12,6 @@ pub fn parse_hex_color(hex: &str, alpha: u8) -> [u8; 4] {
 
 use super::discussion::MdType;
 
-/// Fill color for an SPC Mesoscale Discussion polygon based on topic.
 pub fn md_fill_color(md_type: &MdType) -> [u8; 4] {
     match md_type {
         MdType::Convective => [255, 180, 50, 60],
@@ -22,7 +20,6 @@ pub fn md_fill_color(md_type: &MdType) -> [u8; 4] {
     }
 }
 
-/// Stroke color for an SPC Mesoscale Discussion polygon based on topic.
 pub fn md_stroke_color(md_type: &MdType) -> [u8; 4] {
     match md_type {
         MdType::Convective => [255, 180, 50, 200],

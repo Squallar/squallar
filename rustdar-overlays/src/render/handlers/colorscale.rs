@@ -4,10 +4,8 @@ use crate::render::controls::{ControlEffect, ControlItem, ControlUpdate, PaneCon
 use crate::render::overlay_state::{
     FetchPayload,OverlayHandler, OverlayItem, OverlayKind, RenderMode};
 
-/// Handler for the per-pane color scale legend.
-///
-/// Manages toggle state only. Rendering is done per-frame directly
-/// in the draw loop (screen-space HUD element, not geo-projected).
+/// Toggle state only: the legend is a screen-space HUD element, not
+/// geo-projected, so the draw loop renders it directly.
 pub(crate) struct ColorScaleHandler {
     pub enabled: bool,
 }

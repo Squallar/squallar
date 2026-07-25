@@ -1,7 +1,5 @@
-//! SPC Storm Reports: fetch and parse today's preliminary tornado, hail, and
-//! wind reports from the SPC CSV endpoints.
+//! Today's preliminary tornado, hail and wind reports, from three SPC CSVs.
 
-/// The kind of storm report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StormReportKind {
     Tornado,
@@ -9,16 +7,13 @@ pub enum StormReportKind {
     Wind,
 }
 
-/// A single SPC preliminary storm report.
 #[derive(Debug, Clone)]
 pub struct StormReport {
     pub kind: StormReportKind,
-    /// Time in HHMM UTC format (e.g. "1339").
+    /// HHMM UTC, e.g. "1339".
     pub time: String,
-    /// Magnitude field — meaning depends on `kind`:
-    /// - Tornado: F/EF scale string (e.g. "EF0") or `None` for "UNK"
-    /// - Hail: size in hundredths of inches (e.g. 100 = 1.00")
-    /// - Wind: speed in knots, or `None` for "UNK"
+    /// Unit depends on `kind`: tornado = F/EF number; hail = hundredths of an
+    /// inch (100 = 1.00"); wind = knots. `None` for the feed's "UNK".
     pub magnitude: Option<f64>,
     pub location: String,
     pub county: String,
@@ -28,12 +23,9 @@ pub struct StormReport {
     pub comments: String,
 }
 
-/// Today's preliminary report CSV for one kind.
-///
-/// The origin comes from
+/// Origin must come from
 /// [`DataSources::spc_base`](rustdar_radar::sources::DataSources::spc_base),
-/// not a literal, so these three are covered by the origin table like every
-/// other feed.
+/// never a literal, or these three escape the origin table.
 pub(crate) fn report_url(
     sources: &rustdar_radar::sources::DataSources,
     kind: StormReportKind,
@@ -46,9 +38,7 @@ pub(crate) fn report_url(
     format!("{}/climo/reports/today_{name}.csv", sources.spc_base)
 }
 
-/// Fetch today's tornado, hail, and wind reports from SPC in parallel.
-///
-/// `client` must be the preflight-safe client — see [`crate::spc::fetch::spc_client`].
+/// `client` must be the preflight-safe [`crate::spc::fetch::spc_client`].
 pub async fn fetch_storm_reports(
     client: &reqwest::Client,
     sources: &rustdar_radar::sources::DataSources,
@@ -102,16 +92,12 @@ async fn fetch_csv(
     parse_csv(&text, kind)
 }
 
-/// Parse a SPC storm report CSV (header + data rows).
-///
-/// CSV format: `Time,{F_Scale|Size|Speed},Location,County,State,Lat,Lon,Comments`
-/// Lat/Lon are decimal degrees. The Comments field may contain commas, so we
-/// split at most 7 commas and take the remainder as comments.
+/// `Time,{F_Scale|Size|Speed},Location,County,State,Lat,Lon,Comments`, lat/lon
+/// in decimal degrees. Comments may contain commas, hence `splitn(8, ',')`.
 fn parse_csv(text: &str, kind: StormReportKind) -> Result<Vec<StormReport>, String> {
     let mut reports = Vec::new();
 
     for (i, line) in text.lines().enumerate() {
-        // Skip the header row
         if i == 0 {
             continue;
         }
@@ -120,7 +106,6 @@ fn parse_csv(text: &str, kind: StormReportKind) -> Result<Vec<StormReport>, Stri
             continue;
         }
 
-        // Split into at most 8 parts (7 commas) — comments may contain commas
         let parts: Vec<&str> = line.splitn(8, ',').collect();
         if parts.len() < 7 {
             continue;
@@ -141,7 +126,6 @@ fn parse_csv(text: &str, kind: StormReportKind) -> Result<Vec<StormReport>, Stri
             Err(_) => continue,
         };
 
-        // Skip reports with clearly invalid coordinates
         if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
             continue;
         }

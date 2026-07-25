@@ -57,13 +57,8 @@ impl OverlayItem for GlmFlashItem {
             ("Latitude".into(), format!("{:.4}°", f.lat)),
             ("Longitude".into(), format!("{:.4}°", f.lon)),
         ];
-        // Energy and area are omitted when the product did not report them —
-        // events have no area variable at all, and a `_FillValue` or an
-        // unconvertible `units` leaves the field unknown. An absent row says
-        // "not reported"; a "0.0 km²" row would claim a measurement.
-        //
-        // Both units are now the units named: `fetch` applies CF unpacking and
-        // converts area from the file's declared `m2` to km².
+        // Omitted when the product did not report them: an absent row says
+        // "not reported", a "0.0 km²" row would claim a measurement.
         if let Some(energy) = f.energy {
             grid.push(("Energy".into(), format!("{energy:.2e} J")));
         }
@@ -99,11 +94,9 @@ impl OverlayItem for GlmFlashItem {
 
 /// Which satellites to query for GLM data.
 ///
-/// The persisted form is the lowercase string produced by [`Self::as_str`] and
-/// read back by [`Self::from_str`] (see `serialize_state`/`deserialize_state`
-/// below) — it is also the dropdown's option id. Deriving serde here would
-/// define a *second*, incompatible encoding (`"East"` rather than `"east"`)
-/// that nothing reads, so the derives are deliberately absent.
+/// Persisted as the lowercase string from [`Self::as_str`], which is also the
+/// dropdown's option id. No serde derives: they would define a second,
+/// incompatible encoding (`"East"`, not `"east"`) that nothing reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SatelliteSelection {
     East,
@@ -154,26 +147,21 @@ pub(crate) struct GlmHandler {
     pub cache: Arc<std::sync::Mutex<GlmCache>>,
     /// Satellites whose last listing returned no objects at all.
     ///
-    /// Kept across polls so the log message can fire on the transition into and
-    /// out of the dead state rather than on every poll, and so the condition can
-    /// be shown in the control panel — a user who never reads logcat is exactly
-    /// the person the original year-long outage went unnoticed by.
+    /// Kept across polls so the log fires on the transition rather than every
+    /// poll, and so the panel can show the condition.
     dead_feeds: Vec<DeadFeed>,
     /// Per-kind failure state — see [`GlmHandler::report_failures`].
     parse: FailureState,
     transport: FailureState,
     /// Hierarchy levels that stopped parsing while the files themselves are
-    /// fine. Kept across polls for the same reason as `dead_feeds`: so the log
-    /// fires on the transition rather than every 20 seconds, and so the panel
-    /// can say which layer is missing.
+    /// fine. Kept across polls for the same reason as `dead_feeds`.
     level_failures: Vec<LevelFailure>,
 }
 
 /// What a batch of failures means, reduced to the states worth *announcing*.
 ///
-/// Deliberately carries no counts: a batch that fails 7 files then 9 files has
-/// not changed in any way a user needs told twice, and edge-triggering on raw
-/// counts would flap.
+/// Carries no counts: edge-triggering on raw counts flaps (7 files then 9 is
+/// not a change a user needs told twice).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum FailureHealth {
     #[default]
@@ -192,8 +180,8 @@ struct FailureState {
     detail: Option<FetchFailures>,
 }
 
-/// Which door a failure came through. The two are never merged, because they
-/// point at opposite causes and suggest opposite actions.
+/// Which door a failure came through. Never merged: opposite causes, opposite
+/// actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailureKind {
     /// Files arrived and would not parse — suspect the product.
@@ -239,24 +227,14 @@ impl GlmHandler {
 
     /// Log level-parse *changes* only, and keep the current set for the panel.
     ///
-    /// Edge-triggered like [`Self::report_feed_changes`], and for the same
-    /// reason: a schema change is permanent, so an unconditional warning would
-    /// emit ~180 identical lines an hour and bury itself.
+    /// Edge-triggered: a schema change is permanent, so an unconditional
+    /// warning emits ~180 identical lines an hour and buries itself.
     ///
-    /// `evaluated` is what makes "recovered" a claim we are entitled to make,
-    /// and it is needed in *both* dimensions this failure is keyed on.
-    ///
-    /// On the satellite axis the hazard is the one [`Self::report_feed_changes`]
-    /// documents: deselecting a satellite whose layer is broken must not read as
-    /// that layer healing. On the level axis it is the same — deselect Flashes
-    /// and nothing asks about flashes any more.
-    ///
-    /// And there is a third case neither dropdown causes: a poll that downloads
-    /// no new granules. Level failures can only be discovered by parsing, so
-    /// such a poll evaluates nothing at all — and with a 20 s poll interval
-    /// racing a ~20 s granule cadence, those polls are routine rather than
-    /// exceptional. Without this guard the panel notice blinks off and the log
-    /// claims a recovery, every time the two clocks slip past each other.
+    /// `evaluated` is what entitles us to say "recovered", on both axes this
+    /// failure is keyed on. Deselecting a satellite or a level means nothing
+    /// asks about it any more; and a poll that downloads no new granules
+    /// evaluates nothing at all — routine, with a 20 s poll interval racing a
+    /// ~20 s granule cadence.
     fn report_level_failures(
         &mut self,
         evaluated: &[(GlmSatellite, GlmDataLevel)],
@@ -306,19 +284,12 @@ impl GlmHandler {
         self.level_failures = next;
     }
 
-    /// Log feed-liveness *changes* only.
+    /// Log feed-liveness *changes* only: one warning when a feed goes dark, one
+    /// recovery notice when it comes back. At a 20 s poll interval an
+    /// unconditional warning is ~180 identical lines an hour per satellite.
     ///
-    /// At a 20-second poll interval, warning unconditionally would emit ~180
-    /// identical lines per hour per satellite for as long as the outage lasts,
-    /// which is cry-wolf in a quieter register: correct, and ignored. Report the
-    /// edges instead — one warning when a feed goes dark, one recovery notice
-    /// when it comes back.
-    ///
-    /// `queried` is what makes "recovered" a claim we are entitled to make.
-    /// Absence from `current` only means "alive" for a satellite that was
-    /// actually asked; for one the dropdown stopped selecting, it means nothing,
-    /// and saying "feed recovered" would be a categorically false statement
-    /// about the feed the user is most likely investigating.
+    /// `queried` is what entitles us to say "recovered": absence from `current`
+    /// means "alive" only for a satellite that was actually asked.
     fn report_feed_changes(&mut self, queried: &[GlmSatellite], current: Vec<DeadFeed>) {
         for feed in &current {
             if !self.dead_feeds.iter().any(|d| d.satellite == feed.satellite) {
@@ -359,11 +330,10 @@ impl GlmHandler {
     /// Announce failure *transitions* for one kind, and keep the detail for the
     /// panel.
     ///
-    /// A granule that downloads but will not parse is exactly as invisible as a
-    /// granule that was never published — the map goes blank either way — but it
-    /// arrives with a perfectly healthy S3 listing, so `dead_feeds` says nothing
-    /// about it. Without this, a renamed variable reads to the user as "Updated
-    /// 0s ago" over an empty map: the original bug, one layer up.
+    /// A granule that downloads but will not parse blanks the map exactly like
+    /// one that was never published, but its S3 listing is healthy so
+    /// `dead_feeds` says nothing about it — without this the user sees
+    /// "Updated 0s ago" over an empty map.
     fn report_failures(&mut self, kind: FailureKind, failures: Option<FetchFailures>) {
         let health = match &failures {
             None => FailureHealth::Ok,
@@ -652,15 +622,14 @@ impl OverlayHandler for GlmHandler {
                 items.push(ControlItem::InfoText { text });
             }
 
-            // The whole point of detecting these is that someone notices. Logs
-            // alone did not manage that for a year, so say it where the toggle
-            // lives: an empty map with no explanation is the failure mode being
-            // fixed, and it has two causes that look identical on screen.
+            // An empty map with no explanation has three causes that look
+            // identical on screen. Logs alone did not get one of them noticed
+            // for a year, so each is stated where the toggle lives.
 
-            // Cause 1: the files were never published. Only mention satellites
-            // the current selection actually queries — `dead_feeds` deliberately
-            // remembers deselected ones so they do not read as recovered, but
-            // reporting those here would be stale.
+            // Cause 1: the files were never published. Only satellites the
+            // current selection queries — `dead_feeds` remembers deselected
+            // ones so they do not read as recovered, but showing those is
+            // stale.
             let selected = self.satellite.to_satellites();
             for feed in self.dead_feeds.iter().filter(|f| selected.contains(&f.satellite)) {
                 items.push(ControlItem::InfoText {
@@ -672,16 +641,13 @@ impl OverlayHandler for GlmHandler {
                 });
             }
 
-            // Cause 2: the files were published but never became usable — either
-            // they would not download, or they would not parse. The S3 listing
-            // is healthy in both cases, so nothing above catches them, and the
-            // two are reported separately because they indict different things.
+            // Cause 2: the files were published but would not download or would
+            // not parse. The S3 listing is healthy in both cases, and the two
+            // are reported separately because they indict different things.
             //
-            // Both can be shown at once (some files failed each way), but two
-            // *totals* cannot: each file yields exactly one FileError, so the
-            // two counts partition the failures and at most one can equal
-            // `in_window`. The "All N …" wordings are therefore mutually
-            // exclusive by construction, not by luck.
+            // Both can show at once, but two *totals* cannot: each file yields
+            // exactly one FileError, so the counts partition the failures and
+            // at most one can equal `in_window`.
             for (kind, state) in
                 [(FailureKind::Parse, &self.parse), (FailureKind::Transport, &self.transport)]
             {
@@ -705,19 +671,13 @@ impl OverlayHandler for GlmHandler {
             }
 
             // Cause 3: the files are fine and one *layer* inside them is not.
-            // Nothing above catches this — the granule parsed, so it is not a
-            // failed file, and the listing is healthy, so it is not a dead
-            // feed. Without this the Flashes toggle stays on, the layer stays
-            // empty, and the panel reports no problem at all.
+            // The granule parsed, so it is not a failed file, and the listing
+            // is healthy, so it is not a dead feed.
             //
-            // Filtered on *both* selection dimensions, for the reason cause 1
-            // filters on one: `level_failures` deliberately remembers verdicts
-            // it could not re-examine, so that deselecting something does not
-            // read as it healing — but a remembered verdict about a layer the
-            // user has switched off is stale, and would otherwise sit there
-            // indefinitely. `clear_cache()` on a level toggle guarantees the
-            // layer is never re-evaluated while deselected, so nothing else
-            // would ever take the notice down.
+            // Filtered on *both* selection dimensions: `level_failures`
+            // remembers verdicts it could not re-examine, and `clear_cache()`
+            // on a level toggle guarantees a deselected layer is never
+            // re-evaluated, so nothing else would ever take the notice down.
             let selected = self.satellite.to_satellites();
             let levels = self.active_levels();
             for failure in self
@@ -903,12 +863,9 @@ mod tests {
         }
     }
 
-    /// An unreported energy omits the row rather than printing a number.
-    ///
-    /// This is the user-visible half of the reason `GlmFlash::energy` is an
-    /// `Option`: an `unwrap_or(0.0)` here would render "0.00e0 J", which
-    /// claims a measurement GLM cannot even express — every energy variable's
-    /// `add_offset` alone is 2.85e-16.
+    /// An unreported energy omits the row rather than printing a number: an
+    /// `unwrap_or(0.0)` renders "0.00e0 J", claiming a measurement GLM cannot
+    /// express — every energy variable's `add_offset` alone is 2.85e-16.
     #[test]
     fn popup_omits_the_energy_row_when_energy_is_unknown() {
         let with = grid_keys(&item(GlmDataLevel::Flash, Some(1.0e-14), Some(278.65)));
@@ -921,16 +878,15 @@ mod tests {
         );
     }
 
-    /// Locating fields are never optional, so they must survive whatever the
-    /// descriptive fields do.
+    /// Locating fields survive whatever the descriptive fields do.
     #[test]
     fn popup_always_reports_position_even_with_both_fields_unknown() {
         let ks = grid_keys(&item(GlmDataLevel::Event, None, None));
         assert_eq!(ks, vec!["Type", "Latitude", "Longitude"], "rows: {ks:?}");
     }
 
-    /// Reported values are rendered in the units the fields document — joules
-    /// and km², not raw packed counts or square metres.
+    /// Values render in the units the fields document — joules and km², not
+    /// raw packed counts or square metres.
     #[test]
     fn popup_renders_reported_values_in_the_documented_units() {
         let r = rows(&item(GlmDataLevel::Flash, Some(7.5e-14), Some(300.0)));
@@ -967,8 +923,7 @@ mod tests {
     const BOTH: [GlmSatellite; 2] = [GlmSatellite::GoesEast, GlmSatellite::GoesWest];
     const WEST_ONLY: [GlmSatellite; 1] = [GlmSatellite::GoesWest];
 
-    /// A dead feed must be visible without reading logs — that is the failure
-    /// mode the whole change exists to prevent.
+    /// A dead feed must be visible without reading logs.
     #[test]
     fn dead_feed_is_surfaced_in_the_control_panel() {
         let mut handler = GlmHandler::new();
@@ -996,8 +951,8 @@ mod tests {
         );
     }
 
-    /// Edge-triggering is the point: repeated polls in the same state must not
-    /// accumulate, and re-entering the dead state must be reportable again.
+    /// Repeated polls in the same state must not accumulate, and re-entering
+    /// the dead state must be reportable again.
     #[test]
     fn repeated_polls_do_not_accumulate_feed_state() {
         let mut handler = GlmHandler::new();
@@ -1017,7 +972,7 @@ mod tests {
     }
 
     /// A failed fetch tells us nothing about liveness, so the previous verdict
-    /// must stand rather than being cleared into a false recovery.
+    /// must stand.
     #[test]
     fn failed_fetch_leaves_feed_verdict_untouched() {
         let mut handler = GlmHandler::new();
@@ -1029,9 +984,8 @@ mod tests {
         assert_eq!(handler.dead_feeds, vec![dead_east()]);
     }
 
-    /// Deselecting a dead satellite must not read as recovery. The user
-    /// switching to West to work around a dead East is the *likely* reaction to
-    /// the notice, and it must not make the log contradict itself.
+    /// Deselecting a dead satellite must not read as recovery — switching to
+    /// West to work around a dead East is the likely reaction to the notice.
     #[test]
     fn deselecting_a_dead_satellite_is_not_a_recovery() {
         let mut handler = GlmHandler::new();
@@ -1055,9 +1009,8 @@ mod tests {
         );
     }
 
-    /// Because the verdict is retained rather than cleared, switching back does
-    /// not re-fire the "is dead" warning — no alternating dead/recovered pairs
-    /// driven purely by dropdown clicks.
+    /// Switching back does not re-fire the "is dead" warning — no alternating
+    /// dead/recovered pairs driven purely by dropdown clicks.
     #[test]
     fn reselecting_a_still_dead_satellite_does_not_re_report_it() {
         let mut handler = GlmHandler::new();
@@ -1097,8 +1050,8 @@ mod tests {
         FetchFailures { in_window: 12, failed, sample_error: "boom".into() }
     }
 
-    /// The scenario that motivated this: a healthy S3 listing, every granule
-    /// failing to parse, and previously nothing on screen but "Updated 0s ago".
+    /// A healthy S3 listing with every granule failing to parse must not read
+    /// as "Updated 0s ago".
     #[test]
     fn total_parse_failure_is_surfaced_in_the_control_panel() {
         let mut handler = GlmHandler::new();
@@ -1146,8 +1099,8 @@ mod tests {
         );
     }
 
-    /// Health is tracked as a category so that a fluctuating failure count does
-    /// not re-announce itself every poll.
+    /// Health is a category, so a fluctuating failure count does not
+    /// re-announce itself every poll.
     #[test]
     fn parse_health_does_not_flap_on_changing_counts() {
         let mut handler = GlmHandler::new();
@@ -1158,7 +1111,7 @@ mod tests {
             assert_eq!(handler.parse.health, FailureHealth::Partial);
         }
 
-        // Escalation to total is a real change and does update the category.
+        // Escalation to total is a real change.
         handler.report_failures(FailureKind::Parse, Some(total_failure()));
         assert_eq!(handler.parse.health, FailureHealth::Total);
     }
@@ -1189,8 +1142,7 @@ mod tests {
         );
     }
 
-    /// The two kinds track independently: a network blip must not clear or mask
-    /// a live parse problem.
+    /// A network blip must not clear or mask a live parse problem.
     #[test]
     fn parse_and_transport_failures_are_tracked_independently() {
         let mut handler = GlmHandler::new();
@@ -1211,9 +1163,8 @@ mod tests {
 
     // ---- Log-output tests -------------------------------------------------
     //
-    // Edge-triggering is the stated purpose of the dead-feed and failure
-    // reporting, and it is only observable in the log. Without capturing the
-    // log, both edge-trigger guards can be deleted with the suite still green.
+    // Edge-triggering is only observable in the log; without capturing it, both
+    // edge-trigger guards can be deleted with the suite still green.
 
     /// Captures records into `LOG_RECORDS` for assertion.
     struct CaptureLogger;
@@ -1222,9 +1173,8 @@ mod tests {
     /// Serializes the log-observing tests, which necessarily share one global
     /// logger.
     static LOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    /// Only records from this thread are captured. The test harness runs other
-    /// tests in parallel and several of them log; without this filter their
-    /// output lands in the buffer and the counts below become nondeterministic.
+    /// Only records from this thread are captured: other tests run in parallel
+    /// and log, which would make the counts below nondeterministic.
     static CAPTURE_THREAD: std::sync::Mutex<Option<std::thread::ThreadId>> =
         std::sync::Mutex::new(None);
 
@@ -1250,8 +1200,8 @@ mod tests {
         static INIT: std::sync::Once = std::sync::Once::new();
         let _serial = LOG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         INIT.call_once(|| {
-            // If another logger is already installed the capture stays empty and
-            // the assertions below fail loudly, which is the right outcome.
+            // If another logger is already installed the capture stays empty
+            // and the assertions below fail loudly.
             let _ = log::set_logger(&CaptureLogger);
             log::set_max_level(log::LevelFilter::Trace);
         });
@@ -1271,9 +1221,8 @@ mod tests {
     /// `warn_once` must actually consult the registry.
     ///
     /// Uses a key nothing else can touch: the registry is process-global and
-    /// other tests parse granules in parallel, so counting lines against a key
-    /// the real paths also produce is inherently racy. The *key shapes* those
-    /// paths build are pinned separately, in `glm::fetch`.
+    /// other tests parse granules in parallel. The key *shapes* the real paths
+    /// build are pinned separately.
     #[test]
     fn warn_once_reports_a_condition_exactly_once() {
         let key = format!("handler-dedup-probe:{:?}", std::thread::current().id());
@@ -1305,9 +1254,7 @@ mod tests {
 
     /// A layer that stops parsing while the granules stay healthy must show up
     /// on screen. Nothing else catches it: the file parsed, so it is not a
-    /// parse failure, and the listing is fine, so it is not a dead feed. Before
-    /// this channel existed the Flashes toggle stayed on, the layer stayed
-    /// empty, and the panel reported no problem whatsoever.
+    /// parse failure, and the listing is fine, so it is not a dead feed.
     #[test]
     fn a_failed_level_is_surfaced_in_the_control_panel() {
         let mut handler = GlmHandler::new();
@@ -1334,9 +1281,8 @@ mod tests {
         );
     }
 
-    /// Same edge-triggering discipline as dead feeds: a schema change is
-    /// permanent, so an unconditional warning would emit ~180 identical lines
-    /// an hour and bury itself.
+    /// Same edge-triggering as dead feeds: an unconditional warning emits ~180
+    /// identical lines an hour and buries itself.
     #[test]
     fn a_failed_level_warns_once_then_recovers_once() {
         let logs = captured_logs(|| {
@@ -1355,11 +1301,10 @@ mod tests {
         assert_eq!(count_containing(&logs, "parsing again"), 1, "{logs:?}");
     }
 
-    /// A notice about a layer the user has switched off is stale. The verdict
-    /// is still *kept* — deselecting must not read as recovery — but it stops
-    /// being shown, and nothing else would ever take it down: `clear_cache()`
-    /// on a level toggle guarantees the layer is never re-evaluated while
-    /// deselected, so the notice would sit there for the process lifetime.
+    /// A notice about a layer the user switched off is stale, but the verdict
+    /// is still kept — deselecting must not read as recovery. Nothing else
+    /// would take the notice down: `clear_cache()` on a level toggle means a
+    /// deselected layer is never re-evaluated.
     #[test]
     fn a_failed_level_the_user_switched_off_is_not_shown_but_is_remembered() {
         let mut handler = GlmHandler::new();
@@ -1385,8 +1330,7 @@ mod tests {
         );
     }
 
-    /// A level failure on a deselected satellite is not the user's problem, and
-    /// reporting it would be stale the moment they switched.
+    /// A level failure on a deselected satellite is stale and not shown.
     #[test]
     fn a_failed_level_on_a_deselected_satellite_is_not_shown() {
         let mut handler = GlmHandler::new();
@@ -1401,13 +1345,9 @@ mod tests {
     }
 
     /// A poll that downloads no new granules evaluates nothing, so it must not
-    /// read as a recovery.
-    ///
-    /// This needs no user action to hit: level failures can only be found by
-    /// parsing, and a 20 s poll interval against a ~20 s granule cadence means
-    /// polls that find nothing new are routine. Without the guard the panel
-    /// notice blinks off and the log claims a recovery, every time the two
-    /// clocks slip past each other.
+    /// read as a recovery. Needs no user action to hit: with a 20 s poll
+    /// interval against a ~20 s granule cadence, polls that find nothing new
+    /// are routine.
     #[test]
     fn a_poll_with_no_new_granules_is_not_a_recovery() {
         let logs = captured_logs(|| {
@@ -1452,8 +1392,7 @@ mod tests {
     }
 
     /// Deselecting the satellite whose layer is broken must not read as that
-    /// layer healing — the same hazard `report_feed_changes` guards, on the axis
-    /// `LevelFailure` adds.
+    /// layer healing.
     #[test]
     fn deselecting_a_satellite_is_not_a_level_recovery() {
         let west_only: [(GlmSatellite, GlmDataLevel); 1] =
@@ -1493,14 +1432,10 @@ mod tests {
         assert_eq!(count_containing(&logs, "parsing again"), 0, "{logs:?}");
     }
 
-    /// Two layers can break on the same satellite, and every predicate here has
-    /// to compare the level as well as the bird.
-    ///
-    /// `known` on the satellite alone means the second layer's warning is
-    /// swallowed by the first. `still_failing` on the satellite alone is worse:
-    /// a carried Flash verdict is silently deleted the moment Group fails,
-    /// with no recovery log and no evidence — destroying exactly the verdict
-    /// the evidence guard exists to preserve.
+    /// Two layers can break on the same satellite, so every predicate must
+    /// compare the level as well as the bird. `known` on the satellite alone
+    /// swallows the second layer's warning; `still_failing` on the satellite
+    /// alone silently deletes a carried Flash verdict when Group fails.
     #[test]
     fn two_levels_failing_on_one_satellite_are_tracked_separately() {
         let east_flash = flash_level_gone();
@@ -1529,17 +1464,14 @@ mod tests {
             assert!(texts.iter().any(|t| t.contains("Groups")), "{texts:?}");
         });
 
-        // Each layer earns its own warning; the second is not masked by the first.
+        // Each layer earns its own warning.
         assert_eq!(count_containing(&logs, "the Flashes layer"), 1, "{logs:?}");
         assert_eq!(count_containing(&logs, "the Groups layer"), 1, "{logs:?}");
     }
 
-    /// The mirror of the above: the *same* layer breaking on *both* birds.
-    ///
-    /// `known` compared on the level alone masks the second satellite's
-    /// warning; `still_failing` on the level alone deletes the first
-    /// satellite's carried verdict. The two predicates have to compare the
-    /// whole identity, and each axis needs its own fixture to prove it.
+    /// The mirror of the above: the *same* layer on *both* birds. `known` on
+    /// the level alone masks the second satellite's warning; `still_failing` on
+    /// the level alone deletes the first satellite's carried verdict.
     #[test]
     fn one_level_failing_on_both_satellites_is_tracked_separately() {
         let east = flash_level_gone();
@@ -1559,8 +1491,8 @@ mod tests {
             handler.report_level_failures(&FLASH_EVALUATED, vec![east.clone(), west.clone()]);
             assert_eq!(handler.level_failures.len(), 2, "both birds must be tracked");
 
-            // Now only West is evaluated, and only West fails. East was not
-            // looked at, so its verdict must be carried rather than dropped.
+            // Only West is evaluated and only West fails, so East's verdict
+            // must be carried rather than dropped.
             handler.report_level_failures(&west_only, vec![west.clone()]);
             assert!(
                 handler.level_failures.contains(&east),
@@ -1575,10 +1507,9 @@ mod tests {
         assert_eq!(count_containing(&logs, "parsing again"), 0, "{logs:?}");
     }
 
-    /// A carried verdict must survive an *unrelated* level failing on the same
-    /// satellite. This is the `still_failing` half: `previous` is East/Flash
-    /// with no evidence, `current` is East/Group, and comparing only the
-    /// satellite drops East/Flash on the floor.
+    /// The `still_failing` half: `previous` is East/Flash with no evidence,
+    /// `current` is East/Group, and comparing only the satellite drops
+    /// East/Flash on the floor.
     #[test]
     fn an_unrelated_level_failing_does_not_delete_a_carried_verdict() {
         let east_flash = flash_level_gone();
@@ -1593,8 +1524,8 @@ mod tests {
         let logs = captured_logs(|| {
             let mut handler = GlmHandler::new();
             handler.report_level_failures(&FLASH_EVALUATED, vec![east_flash.clone()]);
-            // Only Group was evaluated this poll, and only Group failed. Flash
-            // was not looked at, so its verdict must be carried, not dropped.
+            // Only Group was evaluated and only Group failed, so Flash's
+            // verdict must be carried.
             handler.report_level_failures(&group_only, vec![east_group]);
 
             assert!(
@@ -1612,7 +1543,7 @@ mod tests {
     }
 
     /// The guard must not swallow a *genuine* recovery: evidence present and no
-    /// failure reported is exactly the case that should clear.
+    /// failure reported.
     #[test]
     fn evidence_without_failure_is_a_real_recovery() {
         let logs = captured_logs(|| {
@@ -1624,8 +1555,7 @@ mod tests {
         assert_eq!(count_containing(&logs, "parsing again"), 1, "{logs:?}");
     }
 
-    /// The two reports are different claims and must not be conflated: a level
-    /// failure leaves the *file* count clean, because the file did parse.
+    /// A level failure leaves the *file* count clean — the file did parse.
     #[test]
     fn a_level_failure_is_not_counted_as_a_failed_file() {
         let mut handler = GlmHandler::new();
@@ -1639,9 +1569,8 @@ mod tests {
         );
     }
 
-    /// A dead feed warns once, not once per poll. At a 20 s interval the
-    /// unguarded version emits ~180 lines an hour for as long as the outage
-    /// lasts.
+    /// A dead feed warns once, not once per poll (~180 lines an hour at a 20 s
+    /// interval).
     #[test]
     fn dead_feed_warns_once_across_many_polls() {
         let logs = captured_logs(|| {
@@ -1680,8 +1609,8 @@ mod tests {
         assert_eq!(count_containing(&logs, "feed is dead"), 2, "{logs:?}");
     }
 
-    /// The reviewer's probe: deselecting a dead satellite must produce no log
-    /// output at all — not a recovery, not a repeat warning.
+    /// Deselecting a dead satellite must produce no log output at all — not a
+    /// recovery, not a repeat warning.
     #[test]
     fn deselecting_a_dead_satellite_logs_nothing() {
         let logs = captured_logs(|| {
@@ -1701,8 +1630,7 @@ mod tests {
         );
     }
 
-    /// The category guard is what stops a fluctuating count from re-announcing
-    /// itself; without it these ten polls emit ten warnings.
+    /// Without the category guard these ten polls emit ten warnings.
     #[test]
     fn fluctuating_failure_counts_warn_once() {
         let logs = captured_logs(|| {
@@ -1739,9 +1667,8 @@ mod tests {
 
     // ---- Seam tests -------------------------------------------------------
     //
-    // Everything above drives the private reporting methods directly. These
-    // drive apply_fetch_result with a populated outcome, which is the only path
-    // production ever takes.
+    // Everything above drives the private reporting methods directly. These go
+    // through apply_fetch_result, the only path production takes.
 
     fn outcome(
         queried: Vec<GlmSatellite>,
@@ -1760,13 +1687,9 @@ mod tests {
         })))
     }
 
-    /// The same seam, carrying the level-failure fields.
-    ///
-    /// A separate helper rather than four more parameters on `outcome`, but the
-    /// lesson is the shared one: a fixture that models a seam has to carry
-    /// *every* field that crosses it. `outcome` hardcoding these two to empty is
-    /// why the only production call of the whole level-failure feature could be
-    /// deleted with the suite green.
+    /// The same seam, carrying the level-failure fields — which `outcome`
+    /// hardcodes to empty, leaving the only production call of the
+    /// level-failure feature deletable with the suite green.
     fn level_outcome(
         level_failures: Vec<LevelFailure>,
         evaluated_levels: Vec<(GlmSatellite, GlmDataLevel)>,
@@ -1782,13 +1705,11 @@ mod tests {
         })))
     }
 
-    /// The Ok arm must forward *both* level fields, and forward them separately.
-    ///
-    /// Three ways to sever this, all of which used to leave the suite green:
-    /// passing `&[]` for the evidence (a level failure could then never clear,
-    /// so one transient pins "⚠ Flashes unavailable" for the process lifetime),
-    /// passing `Vec::new()` for the failures (the notice never appears), and
-    /// deleting the call outright (the feature is dead).
+    /// The Ok arm must forward *both* level fields, separately. Three ways to
+    /// sever it: `&[]` for the evidence (a failure can then never clear, so one
+    /// transient pins "⚠ Flashes unavailable" for the process lifetime),
+    /// `Vec::new()` for the failures (the notice never appears), and deleting
+    /// the call outright.
     #[test]
     fn apply_fetch_result_forwards_both_level_fields() {
         let mut handler = GlmHandler::new();
@@ -1814,9 +1735,8 @@ mod tests {
             "a poll that evaluated nothing must not clear the verdict"
         );
 
-        // 3. Evidence with no failure clears it. This is what a severed
-        //    evidence set breaks: `&[]` makes `looked` permanently false and
-        //    the notice becomes unclearable.
+        // 3. Evidence with no failure clears it. `&[]` makes `looked`
+        //    permanently false and the notice unclearable.
         handler.apply_fetch_result(level_outcome(Vec::new(), FLASH_EVALUATED.to_vec()));
         assert!(
             handler.level_failures.is_empty(),
@@ -1861,9 +1781,7 @@ mod tests {
             "transport failures must survive the seam, got {texts:?}"
         );
 
-        // Now East recovers, which is only correct because `queried` said we
-        // asked. A seam that drops `queried` carries the dead verdict forward
-        // instead of clearing it.
+        // East recovers, which is only correct because `queried` says we asked.
         handler.apply_fetch_result(outcome(
             vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
             Vec::new(),

@@ -13,13 +13,13 @@ use crate::render::rasterize;
 use crate::spc::reports::{StormReport, StormReportKind};
 use crate::types::GeoBounds;
 
-/// Type-erased fetch result for SPC storm reports.
 pub(crate) struct StormReportsFetchResult(pub Result<Vec<StormReport>, String>);
 
-/// Clickable item representing a single SPC storm report.
 #[derive(Debug)]
 pub(crate) struct StormReportItem {
     pub report: StormReport,
+    /// The reports feed carries no IDs, so position in the fetch is the only
+    /// identity available. It is what `matches()` and the hit map both key on.
     pub index: usize,
 }
 
@@ -35,7 +35,8 @@ impl OverlayItem for StormReportItem {
             StormReportKind::Hail => "Hail",
             StormReportKind::Wind => "Wind",
         };
-        // Format HHMM → "HH:MM UTC" (or local equivalent)
+        // The feed gives HHMM with no date, so local conversion has to assume
+        // today's date.
         let formatted_time = if report.time.len() == 4 {
             let hhmm = format!("{}:{}", &report.time[..2], &report.time[2..]);
             match prefs.timezone {
@@ -164,8 +165,7 @@ impl OverlayHandler for StormReportsHandler {
     }
 
     fn clickable_items(&self) -> Vec<ClickableItem> {
-        // Storm reports use hit-buffer-based click detection, not polygon containment.
-        Vec::new()
+        Vec::new() // Clicks resolve through the rasterizer's `HitMap` instead.
     }
 
     fn apply_fetch_result(&mut self, result: FetchPayload) {
@@ -220,7 +220,7 @@ impl OverlayHandler for StormReportsHandler {
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
         log::info!("Fetching SPC storm reports");
-        // NOT `ctx.client` — SPC answers OPTIONS with 403, so a `User-Agent`
+        // NOT `ctx.client`: SPC answers OPTIONS with 403, so a `User-Agent`
         // makes all three CSVs fail in the browser. See `spc::fetch`.
         let client = match crate::spc::fetch::spc_client(&ctx.sources) {
             Ok(c) => c,
