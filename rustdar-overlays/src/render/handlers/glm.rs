@@ -48,15 +48,21 @@ impl OverlayItem for GlmFlashItem {
             GlmDataLevel::Flash => "GLM Lightning Flash",
         };
 
+        let mut grid = vec![
+            ("Type".into(), f.level.display_name().into()),
+            ("Latitude".into(), format!("{:.4}°", f.lat)),
+            ("Longitude".into(), format!("{:.4}°", f.lon)),
+            ("Energy".into(), format!("{:.2e} J", f.energy)),
+        ];
+        // Events have no area in the L2 LCFA product; omit the row rather than
+        // showing a placeholder zero.
+        if let Some(area) = f.area {
+            grid.push(("Area".into(), format!("{area:.1} km²")));
+        }
+
         let sections = vec![
             PopupSection::Text(format!("{time_str} — {}", f.satellite.display_name())),
-            PopupSection::KeyValueGrid(vec![
-                ("Type".into(), f.level.display_name().into()),
-                ("Latitude".into(), format!("{:.4}°", f.lat)),
-                ("Longitude".into(), format!("{:.4}°", f.lon)),
-                ("Energy".into(), format!("{:.2e} J", f.energy)),
-                ("Area".into(), format!("{:.1} km²", f.area)),
-            ]),
+            PopupSection::KeyValueGrid(grid),
         ];
 
         PopupContent {
@@ -478,6 +484,67 @@ impl OverlayHandler for GlmHandler {
         }
         if let Some(v) = value.get("show_flashes").and_then(|v| v.as_bool()) {
             self.show_flashes = v;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(level: GlmDataLevel, area: Option<f32>) -> GlmFlashItem {
+        GlmFlashItem {
+            flash: GlmFlash {
+                lat: 35.0,
+                lon: -97.0,
+                energy: 1.0e-14,
+                area,
+                time: chrono::NaiveDate::from_ymd_opt(2026, 7, 24)
+                    .unwrap()
+                    .and_hms_opt(12, 0, 0)
+                    .unwrap(),
+                satellite: GlmSatellite::GoesEast,
+                level,
+            },
+            index: 0,
+        }
+    }
+
+    fn grid_keys(item: &GlmFlashItem) -> Vec<String> {
+        let prefs = UserPreferences {
+            timezone: rustdar_units::TimezonePreference::Utc,
+            ..UserPreferences::default()
+        };
+        item.popup_content(&prefs)
+            .sections
+            .into_iter()
+            .filter_map(|s| match s {
+                PopupSection::KeyValueGrid(rows) => Some(rows),
+                _ => None,
+            })
+            .flatten()
+            .map(|(k, _)| k)
+            .collect()
+    }
+
+    #[test]
+    fn event_popup_omits_area_row() {
+        let keys = grid_keys(&item(GlmDataLevel::Event, None));
+        assert!(
+            !keys.iter().any(|k| k == "Area"),
+            "events have no area in the L2 LCFA product, got rows {keys:?}"
+        );
+        assert!(keys.iter().any(|k| k == "Energy"));
+    }
+
+    #[test]
+    fn flash_and_group_popups_keep_area_row() {
+        for level in [GlmDataLevel::Flash, GlmDataLevel::Group] {
+            let keys = grid_keys(&item(level, Some(128.0)));
+            assert!(
+                keys.iter().any(|k| k == "Area"),
+                "{level:?} must still display area, got rows {keys:?}"
+            );
         }
     }
 }

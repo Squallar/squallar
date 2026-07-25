@@ -276,7 +276,9 @@ struct LevelVars {
     lat: &'static str,
     lon: &'static str,
     energy: &'static str,
-    area: &'static str,
+    /// Name of the area variable, or `None` if the level has no area in the
+    /// L2 LCFA product. Only groups and flashes report area coverage.
+    area: Option<&'static str>,
     time_offset: &'static str,
     level: GlmDataLevel,
 }
@@ -285,7 +287,7 @@ const FLASH_VARS: LevelVars = LevelVars {
     lat: "flash_lat",
     lon: "flash_lon",
     energy: "flash_energy",
-    area: "flash_area",
+    area: Some("flash_area"),
     time_offset: "flash_time_offset_of_first_event",
     level: GlmDataLevel::Flash,
 };
@@ -294,16 +296,21 @@ const GROUP_VARS: LevelVars = LevelVars {
     lat: "group_lat",
     lon: "group_lon",
     energy: "group_energy",
-    area: "group_area",
+    area: Some("group_area"),
     time_offset: "group_time_offset",
     level: GlmDataLevel::Group,
 };
 
+// The L2 LCFA product has no `event_area` variable: an event is a single
+// sensor pixel detection, and only groups and flashes carry area coverage
+// (confirmed against a live `noaa-goes19` GLM-L2-LCFA granule). Asking for a
+// non-existent variable used to yield an all-zero column, so every event
+// popup reported "0.0 km²".
 const EVENT_VARS: LevelVars = LevelVars {
     lat: "event_lat",
     lon: "event_lon",
     energy: "event_energy",
-    area: "event_area",
+    area: None,
     time_offset: "event_time_offset",
     level: GlmDataLevel::Event,
 };
@@ -350,7 +357,10 @@ fn parse_level_records(
     let lats = read_var_f32(file, vars.lat)?;
     let lons = read_var_f32(file, vars.lon)?;
     let energies = read_var_f32(file, vars.energy)?;
-    let areas = read_var_f32(file, vars.area)?;
+    let areas = match vars.area {
+        Some(name) => Some(read_var_f32(file, name)?),
+        None => None,
+    };
     let time_offsets = read_var_f64_or_f32(file, vars.time_offset)?;
 
     let count = lats.len();
@@ -367,7 +377,10 @@ fn parse_level_records(
             lat: lats[i] as f64,
             lon: lons[i] as f64,
             energy: *energies.get(i).unwrap_or(&0.0),
-            area: *areas.get(i).unwrap_or(&0.0),
+            // `None` when the level has no area variable at all, and also when
+            // the column came up short — better to omit the row than to invent
+            // a zero.
+            area: areas.as_ref().and_then(|a| a.get(i).copied()),
             time,
             satellite,
             level: vars.level,
@@ -417,4 +430,100 @@ fn urlencoded(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only groups and flashes carry area coverage in the L2 LCFA product.
+    #[test]
+    fn only_group_and_flash_levels_declare_an_area_variable() {
+        assert_eq!(FLASH_VARS.area, Some("flash_area"));
+        assert_eq!(GROUP_VARS.area, Some("group_area"));
+        assert_eq!(
+            EVENT_VARS.area, None,
+            "the GLM L2 LCFA product has no `event_area` variable"
+        );
+    }
+
+    /// Build a minimal in-memory GLM-shaped NetCDF4 file: flashes carry an
+    /// area variable, events deliberately do not (mirroring the real product).
+    fn synthetic_glm_file() -> Vec<u8> {
+        let path = std::env::temp_dir().join(format!(
+            "rustdar-glm-test-{}-{:?}.nc",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut file = netcdf::create(&path).expect("create netcdf");
+            file.add_attribute("time_coverage_start", "2026-07-24T12:00:00.0Z")
+                .expect("add time_coverage_start");
+
+            file.add_dimension("number_of_flashes", 2).expect("flash dim");
+            file.add_dimension("number_of_events", 2).expect("event dim");
+
+            let mut put = |name: &str, dim: &str, values: &[f32]| {
+                let mut var = file
+                    .add_variable::<f32>(name, &[dim])
+                    .unwrap_or_else(|e| panic!("add {name}: {e}"));
+                var.put_values(values, ..)
+                    .unwrap_or_else(|e| panic!("put {name}: {e}"));
+            };
+
+            put("flash_lat", "number_of_flashes", &[35.0, 36.0]);
+            put("flash_lon", "number_of_flashes", &[-97.0, -98.0]);
+            put("flash_energy", "number_of_flashes", &[1.0e-14, 2.0e-14]);
+            put("flash_area", "number_of_flashes", &[128.0, 256.0]);
+            put(
+                "flash_time_offset_of_first_event",
+                "number_of_flashes",
+                &[1.0, 2.0],
+            );
+
+            put("event_lat", "number_of_events", &[35.5, 36.5]);
+            put("event_lon", "number_of_events", &[-97.5, -98.5]);
+            put("event_energy", "number_of_events", &[3.0e-15, 4.0e-15]);
+            put("event_time_offset", "number_of_events", &[3.0, 4.0]);
+            // Note: no `event_area` — that is the point of the fixture.
+        }
+
+        let bytes = std::fs::read(&path).expect("read back netcdf");
+        let _ = std::fs::remove_file(&path);
+        bytes
+    }
+
+    #[test]
+    fn flash_level_reports_area_and_event_level_reports_none() {
+        let bytes = synthetic_glm_file();
+
+        let flashes = parse_glm_netcdf(
+            &bytes,
+            GlmSatellite::GoesEast,
+            &[GlmDataLevel::Flash],
+        )
+        .expect("parse flash level");
+        assert_eq!(flashes.len(), 2);
+        assert_eq!(flashes[0].area, Some(128.0));
+        assert_eq!(flashes[1].area, Some(256.0));
+
+        let events = parse_glm_netcdf(
+            &bytes,
+            GlmSatellite::GoesEast,
+            &[GlmDataLevel::Event],
+        )
+        .expect("parse event level");
+        assert_eq!(events.len(), 2);
+        // Previously this silently produced Some(0.0) via `unwrap_or(&0.0)`,
+        // which the popup rendered as "Area: 0.0 km²".
+        assert!(
+            events.iter().all(|e| e.area.is_none()),
+            "events must not report a fabricated area"
+        );
+        // The rest of the event record must still parse.
+        assert!((events[0].lat - 35.5).abs() < 1e-4);
+        assert!((events[0].lon - (-97.5)).abs() < 1e-4);
+    }
 }

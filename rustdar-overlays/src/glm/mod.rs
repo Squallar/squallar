@@ -68,8 +68,13 @@ pub struct GlmFlash {
     pub lon: f64,
     /// Radiant energy in joules.
     pub energy: f32,
-    /// Area in km².
-    pub area: f32,
+    /// Area in km², when the product reports one.
+    ///
+    /// `None` at [`GlmDataLevel::Event`]: the L2 LCFA product only carries
+    /// `group_area` and `flash_area`. Individual events are single sensor
+    /// pixels and have no area variable, so reporting a number there would be
+    /// a fabrication.
+    pub area: Option<f32>,
     /// UTC timestamp.
     pub time: chrono::NaiveDateTime,
     /// Which satellite observed this.
