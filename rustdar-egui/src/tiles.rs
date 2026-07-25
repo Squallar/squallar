@@ -1,6 +1,7 @@
+use crate::tile_source::HttpsTiles;
 use walkers::{
     sources::{Attribution, TileSource},
-    HttpTiles, TileId,
+    TileId,
 };
 
 /// CartoDB tile source variants.
@@ -112,10 +113,10 @@ pub fn tile_to_lat(y: u32, zoom: u8) -> f64 {
 /// already-fetched tiles. Label-only tiles are lazily initialized when any
 /// pane enables the city-labels layer.
 pub struct MapTileState {
-    pub tiles_light: Option<HttpTiles>,
-    pub tiles_dark: Option<HttpTiles>,
-    pub label_tiles_light: Option<HttpTiles>,
-    pub label_tiles_dark: Option<HttpTiles>,
+    pub tiles_light: Option<HttpsTiles>,
+    pub tiles_dark: Option<HttpsTiles>,
+    pub label_tiles_light: Option<HttpsTiles>,
+    pub label_tiles_dark: Option<HttpsTiles>,
     pub current_theme_is_dark: bool,
 }
 
@@ -137,24 +138,24 @@ impl MapTileState {
         self.current_theme_is_dark = is_dark;
         if is_dark {
             if self.tiles_dark.is_none() {
-                self.tiles_dark = Some(HttpTiles::new(CartoDb::dark(), ctx.to_owned()));
+                self.tiles_dark = Some(HttpsTiles::new(CartoDb::dark(), ctx.to_owned()));
             }
         } else if self.tiles_light.is_none() {
-            self.tiles_light = Some(HttpTiles::new(CartoDb::light(), ctx.to_owned()));
+            self.tiles_light = Some(HttpsTiles::new(CartoDb::light(), ctx.to_owned()));
         }
     }
 
     /// Ensure label-only tiles are initialized for the current theme.
     pub fn ensure_label_tiles(&mut self, is_dark: bool, ctx: &egui::Context) {
         if is_dark && self.label_tiles_dark.is_none() {
-            self.label_tiles_dark = Some(HttpTiles::new(CartoDb::dark_labels(), ctx.to_owned()));
+            self.label_tiles_dark = Some(HttpsTiles::new(CartoDb::dark_labels(), ctx.to_owned()));
         } else if !is_dark && self.label_tiles_light.is_none() {
-            self.label_tiles_light = Some(HttpTiles::new(CartoDb::light_labels(), ctx.to_owned()));
+            self.label_tiles_light = Some(HttpsTiles::new(CartoDb::light_labels(), ctx.to_owned()));
         }
     }
 
     /// Temporarily take the base tiles out of self for per-pane rendering.
-    pub fn take_base_tiles(&mut self) -> Option<HttpTiles> {
+    pub fn take_base_tiles(&mut self) -> Option<HttpsTiles> {
         if self.current_theme_is_dark {
             self.tiles_dark.take()
         } else {
@@ -163,7 +164,7 @@ impl MapTileState {
     }
 
     /// Restore the base tiles after per-pane rendering.
-    pub fn restore_base_tiles(&mut self, tiles: Option<HttpTiles>) {
+    pub fn restore_base_tiles(&mut self, tiles: Option<HttpsTiles>) {
         if self.current_theme_is_dark {
             self.tiles_dark = tiles;
         } else {
@@ -172,7 +173,7 @@ impl MapTileState {
     }
 
     /// Temporarily take the label tiles out of self for per-pane rendering.
-    pub fn take_label_tiles(&mut self) -> Option<HttpTiles> {
+    pub fn take_label_tiles(&mut self) -> Option<HttpsTiles> {
         if self.current_theme_is_dark {
             self.label_tiles_dark.take()
         } else {
@@ -181,7 +182,7 @@ impl MapTileState {
     }
 
     /// Restore label tiles after per-pane rendering.
-    pub fn restore_label_tiles(&mut self, tiles: Option<HttpTiles>) {
+    pub fn restore_label_tiles(&mut self, tiles: Option<HttpsTiles>) {
         if self.current_theme_is_dark {
             self.label_tiles_dark = tiles;
         } else {

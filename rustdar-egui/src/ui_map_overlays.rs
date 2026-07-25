@@ -1,5 +1,6 @@
 use std::sync::Arc;
-use walkers::{HttpTiles, Tile, TileId, Tiles};
+use crate::tile_source::HttpsTiles;
+use walkers::{Tile, TileId, Tiles};
 use crate::overlay_cache::{
     OverlayTextureCache, draw_overlay_texture, geo_point_in_feature,
 };
@@ -160,7 +161,7 @@ pub(super) fn draw_label_tiles_overlay(
     ui: &egui::Ui,
     projector: &walkers::Projector,
     zoom: f64,
-    tiles: &mut HttpTiles,
+    tiles: &mut HttpsTiles,
 ) {
     let tile_zoom = zoom.round() as u8;
     let n = 2u32.pow(tile_zoom as u32);

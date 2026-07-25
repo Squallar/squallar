@@ -29,3 +29,44 @@ log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 walkers = { workspace = true }
+# Channels and the concurrency-bounded tile fetch loop in `tile_source`. Same
+# pin as rustdar-overlays; walkers uses this version too, so it is already in the
+# graph either way.
+futures = "=0.3.32"
+# Bounded tile cache with LRU eviction. Pinned to the version walkers already
+# resolves, so this adds no new node to the dependency graph.
+lru = "=0.18.1"
+# Basemap tiles go through the workspace TLS pin like every other rustdar
+# request. No extra features: `tile_source` needs neither `json` nor `default`,
+# and `default` would re-enable `default-tls` (= platform verifier + aws-lc-rs)
+# and drag `aws-lc-sys` back in.
+#
+# This dependency is the entire point of `tile_source`: `walkers::HttpTiles`
+# builds its own reqwest 0.12 client with `rustls-tls`, i.e. bundled
+# `webpki-roots`, and offers no way to replace it.
+reqwest = { workspace = true }
+
+# The tile IO runtime. Native only, and *not* in the shared `[dependencies]`
+# table: tokio rejects most of its feature set on wasm outright
+# (`compile_error!("Only features sync,macros,io-util,rt,time are supported on
+# wasm.")`), so a target-gated entry is the only way to depend on it without
+# making this crate the reason wasm32 stops building. wasm gets `spawn_local`
+# below instead.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["rt", "sync", "net", "time"] }
+
+# The wasm half of the same split: no threads, no tokio: the fetch loop runs on
+# the browser's event loop and `reqwest` becomes `fetch()`, which also means the
+# browser's trust store rather than anything shipped in the artifact.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "=0.4.68"
+
+[dev-dependencies]
+# Test-only. `image` encodes the PNG fixtures the loopback tile server serves, so
+# the decode path is exercised on a real image whose exact pixels are known
+# rather than on a checked-in blob. Same version walkers already resolves;
+# `png` only, since that is the one format the fixtures use.
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+# Drives the async tile tests and the `#[ignore]`d live CartoDB fetch. Not linked
+# into any shipped binary.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

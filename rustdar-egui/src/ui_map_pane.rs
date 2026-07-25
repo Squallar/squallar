@@ -13,7 +13,7 @@ use rustdar_units::UserPreferences;
 use rustdar_radar::{get_color_for_value, get_legend_scale};
 use rustdar_radar::sites::RADARS;
 use rustdar_radar::types::{MAX_RANGE_KM, ImageBounds, RadarProduct};
-use walkers::HttpTiles;
+use crate::tile_source::HttpsTiles;
 
 use super::super::map_overlays::{OverlayDrawContext, draw_label_tiles_overlay, is_pos_blocked};
 
@@ -25,7 +25,7 @@ pub(super) struct PaneRenderCtx<'a> {
     pub user_location: Option<(f64, f64)>,
     pub user_heading: Option<f32>,
     pub user_fix: Option<rustdar_gps::GpsFix>,
-    pub label_tiles: &'a mut Option<HttpTiles>,
+    pub label_tiles: &'a mut Option<HttpsTiles>,
     pub actions: &'a mut Vec<GuiAction>,
     pub pane_rect: egui::Rect,
     /// Whether this frame's color scale bars run along the bottom edge

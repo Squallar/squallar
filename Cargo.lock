@@ -4108,14 +4108,20 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "egui",
+ "futures",
+ "image",
  "log",
+ "lru",
+ "reqwest 0.13.2",
  "rustdar-gps",
  "rustdar-overlays",
  "rustdar-radar",
  "rustdar-units",
  "serde",
  "serde_json",
+ "tokio",
  "walkers",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]
