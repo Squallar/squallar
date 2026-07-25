@@ -2,6 +2,7 @@ use egui_wgpu::wgpu;
 use std::collections::HashMap;
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
+#[cfg(not(target_arch = "wasm32"))]
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
@@ -11,7 +12,11 @@ use winit::window::{Window, WindowId};
 use crate::WindowRef;
 use crate::app_state;
 use crate::channels::ChannelHub;
-use crate::constants::*;
+// Only the default window size is used here, and only by the native arm of
+// `create_window` — the web build takes its size from the canvas. A glob import
+// would go unused on wasm32 and warn.
+#[cfg(not(target_arch = "wasm32"))]
+use crate::constants::{RENDER_HEIGHT, RENDER_WIDTH};
 use crate::input::InputHandler;
 use crate::loop_downloads::LoopDownloadManager;
 use crate::platform::PlatformBridge;
@@ -27,6 +32,28 @@ mod fetch;
 
 #[path = "app_render.rs"]
 mod render;
+
+/// Which wgpu backends this build will consider.
+///
+/// Native keeps reading `WGPU_BACKEND` from the environment. The browser has no
+/// environment to read, and the choice there is not open: this build targets
+/// WebGL2, so WebGPU has to be *excluded* rather than merely deprioritised.
+/// Left in, wgpu would select it wherever it exists — which is Chrome but not
+/// Firefox — and the two browsers would then run different, separately-broken
+/// rendering paths off the same binary.
+#[cfg(not(target_arch = "wasm32"))]
+fn instance_descriptor() -> wgpu::InstanceDescriptor {
+    wgpu::InstanceDescriptor::new_without_display_handle_from_env()
+}
+
+/// See the native variant above.
+#[cfg(target_arch = "wasm32")]
+fn instance_descriptor() -> wgpu::InstanceDescriptor {
+    wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::GL,
+        ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
+    }
+}
 
 /// Request a redraw if a window handle is available.
 /// Used by async tasks and event handlers that hold an `Option<WindowRef>`.
@@ -64,6 +91,14 @@ pub struct App {
     /// spawns via `wasm_bindgen_futures` instead — see `App::spawn_detached`.
     #[cfg(not(target_arch = "wasm32"))]
     tokio_runtime: tokio::runtime::Runtime,
+    /// Web only. Set while the async adapter/device request is in flight.
+    ///
+    /// Native resolves that request inside `ensure_rendering_state` and never
+    /// needs to remember anything across frames; the browser forbids blocking,
+    /// so the renderer arrives on a later frame and something has to hold the
+    /// receiver until it does.
+    #[cfg(target_arch = "wasm32")]
+    pending_state: Option<std::sync::mpsc::Receiver<app_state::AppState>>,
     // Shared HTTP client for overlay data fetches (SPC, etc.)
     http_client: reqwest::Client,
     // Grouped loop download state: scan cache, in-flight tracking, and pending queues.
@@ -89,7 +124,7 @@ impl App {
     /// one to build. Without that inversion the app layer and the platform
     /// layer would have to depend on each other.
     pub fn new(platform: Box<dyn PlatformBridge>) -> Self {
-        let instance = egui_wgpu::wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let instance = egui_wgpu::wgpu::Instance::new(instance_descriptor());
         let input = InputHandler::new();
         let channels = ChannelHub::new();
         // Owns the single shared render-budget counter used by both the loop and
@@ -132,6 +167,8 @@ impl App {
             http_client,
             #[cfg(not(target_arch = "wasm32"))]
             tokio_runtime,
+            #[cfg(target_arch = "wasm32")]
+            pending_state: None,
             loop_mgr: LoopDownloadManager::new(),
             latest_cached_scans: HashMap::new(),
             manual_nav_pending: false,
@@ -209,6 +246,7 @@ impl App {
     }
 
     /// Lazily initialize wgpu rendering state on first redraw after window creation.
+    #[cfg(not(target_arch = "wasm32"))]
     fn ensure_rendering_state(&mut self) {
         if self.state.is_none() && self.window.is_some() {
             let new_state = self.window.as_ref().map(|window| {
@@ -225,6 +263,64 @@ impl App {
                 self.restore_cached_render();
             }
         }
+    }
+
+    /// See the native variant above.
+    ///
+    /// The browser cannot block on a future. `pollster::block_on` here would
+    /// spin forever rather than deadlock loudly: the executor that resolves an
+    /// adapter request *is* the event loop being blocked, so the future it is
+    /// waiting on can never be polled. The request is therefore spawned and its
+    /// result collected on a later frame, which is the whole reason this arm is
+    /// a state machine and the native one is a straight line.
+    #[cfg(target_arch = "wasm32")]
+    fn ensure_rendering_state(&mut self) {
+        // A request already in flight: collect it if it has landed.
+        if let Some(rx) = self.pending_state.as_ref() {
+            match rx.try_recv() {
+                Ok(state) => {
+                    self.pending_state = None;
+                    self.state = Some(state);
+                    self.restore_cached_render();
+                }
+                // Still running — nothing to do until the redraw it will post.
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                // The task was dropped without sending. Clearing the slot lets a
+                // later frame retry instead of wedging forever on a dead
+                // receiver, which is what leaving it in place would do.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.pending_state = None,
+            }
+            return;
+        }
+
+        if self.state.is_some() {
+            return;
+        }
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+
+        let size = window.inner_size();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.pending_state = Some(rx);
+
+        let instance = self.instance.clone();
+        let redraw_target = self.window.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let state = Self::initialize_rendering_state(
+                &instance,
+                &window,
+                size.width.max(1),
+                size.height.max(1),
+            )
+            .await;
+            let _ = tx.send(state);
+            // The frame that kicked this off returned without a renderer, and
+            // under `ControlFlow::Wait` nothing schedules another frame on its
+            // own. Without this redraw the app would sit on a blank canvas
+            // holding a perfectly good `AppState` it never collects.
+            notify_redraw(&redraw_target);
+        });
     }
 
     /// Process all GUI actions emitted during this frame.
@@ -397,11 +493,20 @@ impl App {
     }
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) {
-        let window = event_loop
-            .create_window(Window::default_attributes().with_title("Rustdar"))
-            .unwrap();
+        // The bridge gets to amend the attributes because the web backend has to
+        // bind its canvas here and nowhere else. See `PlatformBridge::window_attributes`.
+        let attributes = self
+            .platform
+            .window_attributes(Window::default_attributes().with_title("Rustdar"));
+        let window = event_loop.create_window(attributes).unwrap();
 
         let window = Arc::new(window);
+        // Native opens at a fixed default size. On web the canvas already has
+        // whatever size the page's layout gave it, and overriding that with a
+        // 1920x1080 backing store would both ignore the layout and, at a
+        // devicePixelRatio above 1, ask for a surface past WebGL2's texture
+        // ceiling — which is a validation error, not a clamp.
+        #[cfg(not(target_arch = "wasm32"))]
         let _ = window.request_inner_size(PhysicalSize::new(RENDER_WIDTH, RENDER_HEIGHT));
         self.window = Some(window.clone());
 
@@ -487,6 +592,14 @@ impl ApplicationHandler for App {
         // Leaving state alive would keep a wgpu surface referencing the destroyed window.
         self.window = None;
         self.state = None;
+        // An init in flight targets the window just dropped. Leaving the
+        // receiver in place would let `ensure_rendering_state` collect an
+        // `AppState` holding a surface for a destroyed window and treat it as
+        // current, which is worse than starting the request over.
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.pending_state = None;
+        }
     }
 
     fn window_event(

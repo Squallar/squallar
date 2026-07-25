@@ -67,6 +67,21 @@ pub trait PlatformBridge {
     /// `std::process::exit` (Android), `false` for normal event-loop exit.
     fn needs_process_exit(&self) -> bool;
 
+    /// Adjust the attributes the main window is created with.
+    ///
+    /// Defaulted because only the web bridge has anything to add: winit's web
+    /// backend has to be told which `<canvas>` the window *is* before the window
+    /// exists, and that element is a `web_sys` type this crate cannot name
+    /// without taking a browser dependency on every target. Returning the
+    /// attributes unchanged is the correct behaviour everywhere else, so this is
+    /// a hook rather than a required method.
+    fn window_attributes(
+        &self,
+        attributes: winit::window::WindowAttributes,
+    ) -> winit::window::WindowAttributes {
+        attributes
+    }
+
     /// Set a receiver for GPS fix updates (Android only, no-op on desktop).
     fn set_gps_fix_receiver(&mut self, _receiver: std::sync::mpsc::Receiver<rustdar_gps::GpsFix>) {}
 

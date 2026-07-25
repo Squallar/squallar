@@ -413,9 +413,7 @@ impl super::App {
                     }
                     return;
                 };
-                std::thread::Builder::new()
-                    .name("overlay-render".into())
-                    .spawn(move || {
+                crate::offload::offload("overlay-render", move || {
                     let output = rasterize_fn(&render_bounds, width, height);
                     let _ = sender.send(OverlayRenderResponse {
                         image_data: output.rgba,
@@ -429,7 +427,7 @@ impl super::App {
                         hit_map: output.hit_map,
                     });
                     super::notify_redraw(&window);
-                }).expect("failed to spawn overlay-render thread");
+                });
             }
             OverlayKind::RadarSites => {
                 let Some(target_pane) = self.gui.pane(first_pane_idx) else { return };
@@ -446,9 +444,7 @@ impl super::App {
                         is_loading: target_loading.as_deref() == Some(s.name),
                     }
                 }).collect();
-                std::thread::Builder::new()
-                    .name("sites-render".into())
-                    .spawn(move || {
+                crate::offload::offload("sites-render", move || {
                     let image_data = rasterize::rasterize_radar_sites(
                         &sites,
                         &render_bounds,
@@ -469,7 +465,7 @@ impl super::App {
                         hit_map: None,
                     });
                     super::notify_redraw(&window);
-                }).expect("failed to spawn sites-render thread");
+                });
             }
             // Non-texture overlay kinds are never dispatched for background rendering.
             OverlayKind::Radar | OverlayKind::CityLabels
@@ -696,9 +692,7 @@ impl super::App {
         let crate::render_dispatch::RenderParams { product, elevation: snapped, lat, lon } = params;
         let sender = self.channels.loop_render_sender.clone();
         let window = self.window.clone();
-        std::thread::Builder::new()
-            .name("loop-render".into())
-            .spawn(move || {
+        crate::offload::offload("loop-render", move || {
             let _guard = guard;
             // A failed render still has to be sent, so render_in_flight gets cleared.
             let rendered =
@@ -742,7 +736,7 @@ impl super::App {
                 max_range_km,
             });
             super::notify_redraw(&window);
-        }).expect("failed to spawn loop-render thread");
+        });
         true
     }
 

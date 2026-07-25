@@ -10,16 +10,58 @@ const MIN_SIZE: u32 = 1;
 fn select_surface_format(capabilities: &wgpu::SurfaceCapabilities) -> wgpu::TextureFormat {
     if capabilities.formats.is_empty() {
         // Fallback to a common format
-        wgpu::TextureFormat::Rgba8UnormSrgb
-    } else {
-        capabilities
-            .formats
-            .iter()
-            .find(|&&format| format == wgpu::TextureFormat::Bgra8Unorm)
-            .copied()
-            .unwrap_or(capabilities.formats[0])
+        return wgpu::TextureFormat::Rgba8UnormSrgb;
     }
+    // WebGL2 presents the canvas through a plain, non-sRGB default framebuffer.
+    // Configuring an sRGB swapchain on top of that makes the browser apply the
+    // transfer function a second time over the one egui has already baked into
+    // its vertex colours; the failure is washed-out output, not a validation
+    // error, so nothing reports it. Native has a real sRGB-capable swapchain and
+    // keeps the existing preference untouched.
+    #[cfg(target_arch = "wasm32")]
+    if let Some(&format) = capabilities.formats.iter().find(|f| !f.is_srgb()) {
+        return format;
+    }
+    capabilities
+        .formats
+        .iter()
+        .find(|&&format| format == wgpu::TextureFormat::Bgra8Unorm)
+        .copied()
+        .unwrap_or(capabilities.formats[0])
 }
+
+/// The limit set to request from the adapter.
+///
+/// Native asks for the adapter's real limits so desktop GPUs can use textures
+/// far larger than any portable floor. WebGL2 cannot express most of wgpu's
+/// limit set at all, so requesting the adapter's limits verbatim there fails the
+/// device request outright. The web arm starts from the WebGL2 downlevel
+/// defaults and lifts *only* the resolution back to what the adapter actually
+/// reports — `max_texture_dimension_2d` is the one limit the overlay planner
+/// reads, and pinning it to the 2048 spec floor would cost resolution on every
+/// browser that offers more.
+#[cfg(not(target_arch = "wasm32"))]
+fn device_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
+    adapter.limits()
+}
+
+/// See the native variant above.
+#[cfg(target_arch = "wasm32")]
+fn device_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
+    wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits())
+}
+
+/// How the surface presents.
+///
+/// `Fifo` is the only present mode WebGL2 actually has — the browser paces
+/// presentation through `requestAnimationFrame` and wgpu's other modes have
+/// nothing to map onto. Naming it explicitly keeps the web build off
+/// `AutoVsync`'s negotiation, which has no meaningful choice to make here.
+#[cfg(not(target_arch = "wasm32"))]
+const PRESENT_MODE: wgpu::PresentMode = wgpu::PresentMode::AutoVsync;
+/// See the native variant above.
+#[cfg(target_arch = "wasm32")]
+const PRESENT_MODE: wgpu::PresentMode = wgpu::PresentMode::Fifo;
 
 pub struct AppState {
     pub device: wgpu::Device,
@@ -50,9 +92,10 @@ impl AppState {
             .expect("Failed to find an appropriate adapter");
 
         let features = wgpu::Features::empty();
-        // Get the adapter's actual limits instead of forcing WebGL2 limits
-        // This allows us to use higher resolution textures and surfaces on native platforms
-        let limits = adapter.limits();
+        // Native takes the adapter's actual limits so it is not held to a
+        // portable floor; the web arm reconciles them with what WebGL2 can
+        // express. See `device_limits`.
+        let limits = device_limits(&adapter);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
@@ -80,7 +123,7 @@ impl AppState {
             format: swapchain_format,
             width,
             height,
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode: PRESENT_MODE,
             desired_maximum_frame_latency: 2,
             alpha_mode: swapchain_capabilities.alpha_modes[0],
             view_formats: vec![],

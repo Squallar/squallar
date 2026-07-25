@@ -381,9 +381,7 @@ impl RenderDispatcher {
         let guard = RenderGuard(Arc::clone(&self.renders_in_flight));
 
         let generation = self.render_generation;
-        std::thread::Builder::new()
-            .name("radar-render".into())
-            .spawn(move || {
+        crate::offload::offload("radar-render", move || {
             let _guard = guard;
             if let Some((image, range, values)) = render_fn() {
                 let _ = sender.send(RenderResponse {
@@ -397,7 +395,7 @@ impl RenderDispatcher {
                 });
             }
             crate::app::notify_redraw(&window);
-        }).expect("failed to spawn radar-render thread");
+        });
         self.pane_render[pane_idx].render_in_flight = true;
     }
 }
