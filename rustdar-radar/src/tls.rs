@@ -9,16 +9,21 @@
 //! Two different alternatives get re-proposed, and they are wrong for two
 //! different reasons. Do not accept either.
 //!
-//! * `rustls-native-certs` / reqwest's `rustls-tls-native-roots` bundle nothing,
-//!   but they collect certificates at startup and hand rustls a flat root list,
-//!   so **rustls** does the verifying and the platform verifier is out of the
-//!   loop. That is the objection: on Android `rustls-platform-verifier` goes
-//!   through JNI to `CertificateVerifier.verifyCertificateChain`, i.e. the
-//!   system TrustManager, which is what applies Network Security Config, user
-//!   and enterprise CAs and distrust lists — and its arm that would call
-//!   `load_native_certs()` is `not(target_os = "android")`. `rustls-native-certs`
-//!   does not read Android's trust store in any case: it defers to
-//!   `openssl-probe`, whose Android search path is the Termux bundle.
+//! * `rustls-native-certs` (and reqwest's pre-0.13 `rustls-tls-native-roots`,
+//!   which the 0.13.4 pin no longer has) bundles nothing, but it collects
+//!   certificates at startup and hands rustls a flat root list, so **rustls**
+//!   does the verifying and the platform verifier is out of the loop. That is
+//!   the objection: on Android `rustls-platform-verifier` goes through JNI to
+//!   `CertificateVerifier.verifyCertificateChain`, i.e. the system TrustManager,
+//!   which is what applies Network Security Config, user and enterprise CAs and
+//!   distrust lists — and its arm that would call `load_native_certs()` is
+//!   `not(target_os = "android")`.
+//!
+//!   On Android it is not even a subtly different answer. `rustls-native-certs`
+//!   defers to `openssl-probe`, whose only Android locations are the Termux
+//!   bundle and an `/etc/ssl/certs` fallback; neither is Android's trust store,
+//!   so it returns whatever happens to sit at those two paths rather than the
+//!   platform's roots.
 //! * `webpki-roots` is the actual compiled-in snapshot, and that one gives the
 //!   binary an expiration date.
 //!

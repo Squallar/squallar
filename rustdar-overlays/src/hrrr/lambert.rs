@@ -373,11 +373,12 @@ mod tests {
         }
     }
 
-    /// <= 11 cm anywhere on this grid, and that is a worst case over HRRR's
-    /// latitude span, not a flat figure: 1e-6° of latitude is 0.111 m
-    /// everywhere (1° ≈ 111.2 km), while 1e-6° of longitude (1° ≈ 111.32·cos φ
-    /// km) runs 0.104 m at 21°N down to 0.075 m at 48°N. Re-derive before
-    /// widening this for a grid that reaches further south.
+    /// <= 11 cm anywhere on this grid: 1e-6° of latitude is 0.111 m at every
+    /// latitude (1° ≈ 111.2 km), while 1e-6° of longitude (1° ≈ 111.32·cos φ km)
+    /// runs 0.104 m at 21°N down to 0.075 m at 48°N. The latitude term
+    /// therefore sets the bound, and it is constant — even at the equator, where
+    /// the longitude term peaks at 0.1113 m, the worst case moves by 0.12 mm. So
+    /// this holds worldwide and needs no re-derivation for another domain.
     ///
     /// Deliberately far tighter than the 3 km spacing: the failure mode guarded
     /// against is systematic displacement (wrong earth radius, dropped central
