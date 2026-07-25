@@ -347,7 +347,23 @@ impl ModelParameter {
     ///
     /// Converts to display units first so all color thresholds are in
     /// human-readable units.
+    ///
+    /// A missing grid point renders as nothing. Every ramp below is a
+    /// descending `if` chain ending in an unguarded `else`, and NaN fails
+    /// every comparison, so control would otherwise fall through to the final
+    /// branch — where `((NaN - 200.0) / 300.0).min(1.0)` evaluates to `1.0`,
+    /// because `f32::min` returns the non-NaN operand. A missing point would
+    /// paint the *most extreme* colour on the scale: opaque dark purple for
+    /// CIN, >110 °F red for temperature. `format_value` already returns
+    /// nothing for NaN, so the tooltip would go blank over the most alarming
+    /// pixel on the map.
+    ///
+    /// The guard lives here rather than at the call site so that every
+    /// consumer of the ramps is covered by construction.
     pub fn color_for_value(&self, value: f32) -> [u8; 4] {
+        if !value.is_finite() {
+            return [0, 0, 0, 0];
+        }
         match self {
             // CIN is special: works with raw negative values.
             ModelParameter::SurfaceBasedCin | ModelParameter::MixedLayerCin => cin_color(value),
