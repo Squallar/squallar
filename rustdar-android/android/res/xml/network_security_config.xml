@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android Network Security Config for rustdar.
+
+  NOT WIRED UP YET. This file is inert until the build can emit
+  `android:networkSecurityConfig="@xml/network_security_config"` on <application>
+  and can compile this into the APK's resource table. `cargo-apk`, which builds
+  the APK today, can do neither:
+
+    * Its AndroidManifest generator has a fixed attribute set on <application>
+      (debuggable, theme, extractNativeLibs, usesCleartextTraffic, label, icon,
+      hasCode, meta-data). `networkSecurityConfig` is not in it, and the metadata
+      table in Cargo.toml has no passthrough for arbitrary attributes.
+    * The attribute's value is a *resource reference*, so the file has to be
+      compiled by aapt2 into `resources.arsc` and given a resource ID. The
+      existing `classes.dex` injection in build-android.sh works because a DEX at
+      the APK root needs no resource table entry; an `res/xml/` file does. Adding
+      it to the ZIP achieves nothing on its own.
+
+  So this is blocked on the Gradle migration, which is the decisive reason for
+  that migration rather than build ergonomics.
+
+  ---------------------------------------------------------------------------
+  Why the base config permits cleartext while every rustdar domain forbids it
+
+  rustls-platform-verifier issue #221: on Android, certificates whose revocation
+  data is published over plain HTTP fail to verify when the app forbids cleartext
+  traffic. Android's TrustManager fetches the CRL itself, and that fetch is
+  subject to the app's own network security policy; when it is blocked the
+  verifier cannot prove the certificate is unrevoked and rejects it. The cause is
+  the blocked fetch, not a hard-fail revocation policy.
+
+  api.weather.gov is exactly that shape. Verified against the live endpoint:
+
+      issuer  = C=US, O=Let's Encrypt, CN=R13
+      AIA     = CA Issuers - URI:http://r13.i.lencr.org/   (no OCSP URI at all)
+      CRL DP  = URI:http://r13.c.lencr.org/32.crl          (cleartext)
+
+  With no OCSP responder to fall back on, that cleartext CRL is the only
+  revocation source, so blocking cleartext app-wide breaks HTTPS to weather.gov.
+
+  Hence: `cleartextTrafficPermitted="true"` in base-config, so the platform's own
+  revocation fetches succeed, and `false` per-domain for every host rustdar
+  actually talks to, so none of rustdar's own traffic can travel in the clear.
+  Application code is not trusted to get this right on its own -- every client is
+  additionally built with `.https_only(true)` (see rustdar_radar::tls::client) --
+  but this file is what makes it the OS's decision rather than ours.
+
+  includeSubdomains is set where a host family is used (*.noaa.gov, *.weather.gov)
+  and omitted where the exact host is fixed.
+-->
+<network-security-config>
+    <!-- Permits the platform's own cleartext CRL/AIA fetches. Does NOT permit
+         rustdar's traffic: every domain below overrides it back to false. -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <!-- System store only, and explicitly no bundled roots: trust must
+                 stay revocable by the OS and updatable without a new binary.
+                 `user` is deliberately absent from the *default*; add it in a
+                 debug-only overlay if you need to MITM for debugging. -->
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!-- NWS / NOAA: alerts, zones, METAR, SPC, HRRR, Level III over TGFTP. -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">weather.gov</domain>
+        <domain includeSubdomains="true">noaa.gov</domain>
+        <domain includeSubdomains="true">aviationweather.gov</domain>
+    </domain-config>
+
+    <!-- NEXRAD Level II archive and realtime chunks, via nexrad-data. -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">s3.amazonaws.com</domain>
+    </domain-config>
+
+    <!-- Basemap and label tiles (walkers -> CartoDB via Fastly). -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">global.ssl.fastly.net</domain>
+        <domain includeSubdomains="true">openstreetmap.org</domain>
+    </domain-config>
+</network-security-config>
