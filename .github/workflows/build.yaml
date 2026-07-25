@@ -30,6 +30,19 @@ jobs:
           # `--all-features` is on the desktop rows and only there. It enables
           # `rustdar-gps/serial` and `rustdar-android/jni-typecheck`, neither of
           # which belongs in a wasm or iOS graph.
+          #
+          # These rows stay off the rust-cross container even though it ships
+          # stds for three of the four triples. Reasons differ per row:
+          #
+          #   * Windows -- genuinely not in the image. It carries the gnullvm
+          #     triples only, and rustdar ships MSVC.
+          #   * macOS -- `aarch64-apple-darwin` and osxcross ARE in the image,
+          #     but this row is a full `--all-targets` build, so it *links*, and
+          #     linking a wgpu/winit GUI through osxcross is unproven here. The
+          #     iOS row is a `check` and never links, which is why it can move.
+          #   * wasm -- `wasm32-unknown-unknown` IS in the image. Kept on the
+          #     host so the bundle's wasm-pack version stays pinned in this file
+          #     (see `web-bundle`) rather than floating with the image tag.
           - name: Linux x86_64
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
@@ -147,15 +160,14 @@ jobs:
         run: |
           rustup show
           rustup target add wasm32-unknown-unknown
-      # Only what rust-cache does not do: it deliberately leaves `~/.cargo/bin`
-      # alone (it strips rustup shims), so the `cargo install` below would
-      # rebuild from source every run without this.
+      # rust-cache does cache `${CARGO_HOME}/bin` -- `cache-bin` defaults to
+      # true -- but its key hashes every Cargo.lock in the repo, so any
+      # dependency bump would rebuild wasm-pack from source. This key names only
+      # the tool and its version, so it survives lockfile churn. `cache-bin` is
+      # turned off below so the two do not store the same directory twice.
       #
-      # The key is job-specific. It used to be the same
-      # `<os>-cargo-wasm32-unknown-unknown-<lock>` as the matrix's wasm row,
-      # which does not cache `~/.cargo/bin` -- whichever job saved first defined
-      # the entry, so this one could restore a bin-less cache and pay the full
-      # wasm-pack build anyway.
+      # The key is also job-specific. It used to collide with the matrix wasm
+      # row's, and whichever saved first defined the entry.
       - name: Cache cargo-installed binaries
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -167,6 +179,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: web-bundle
+          cache-bin: "false"
       - name: Install wasm-pack
         run: cargo install wasm-pack --locked --version ^0.15
 
@@ -328,6 +341,10 @@ jobs:
         run: |
           set -euo pipefail
           echo "RUSTUP_TOOLCHAIN=${RUST_VERSION:?the rust-cross image must set RUST_VERSION}" >> "$GITHUB_ENV"
+      # Host rows run `stable`, container rows run the image's pin. Print it so
+      # an Android-only version failure is diagnosable from the log alone.
+      - name: Show the active toolchain
+        run: rustup show
       - name: Install system deps
         run: |
           apt-get update
@@ -558,9 +575,14 @@ jobs:
           required=(Clippy Test)
           deadline=$(( $(date +%s) + 1800 ))
           while :; do
+            # `.app.slug == "github-actions"` matters: check-run names are not
+            # reserved, so any installed app could publish a *successful*
+            # "Clippy" last and mask the real one. Filtering to the Actions app
+            # closes the only direction this was not already failing closed in.
             runs="$(gh api --paginate \
               "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs" \
-              --jq '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv')"
+              --jq '.check_runs[] | select(.app.slug == "github-actions")
+                    | [.name, .status, (.conclusion // "")] | @tsv')"
             pending=0
             bad=0
             for name in "${required[@]}"; do
@@ -595,17 +617,33 @@ jobs:
       # Pages is enabled by hand, deliberately -- there is no
       # `actions/configure-pages` here. Until it has been, `deploy-pages` fails
       # on an opaque 404, so say what to do instead.
+      #
+      # Only a 404 means "not enabled". Swallowing every error would report a
+      # 403 or a 5xx as a configuration problem and send someone to a settings
+      # page that is already correct.
       - name: Check Pages is enabled
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          if ! gh api "repos/${GITHUB_REPOSITORY}/pages" >/dev/null 2>&1; then
-            echo "::error::GitHub Pages is not enabled for ${GITHUB_REPOSITORY}. Enable it under Settings -> Pages with Source = GitHub Actions, then re-run this job. It is not enabled automatically."
-            exit 1
-          fi
-          echo "ok: Pages is enabled"
+          body="$(mktemp)"
+          code="$(curl -sS -o "$body" -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL:-https://api.github.com}/repos/${GITHUB_REPOSITORY}/pages")"
+          case "$code" in
+            200)
+              echo "ok: Pages is enabled" ;;
+            404)
+              echo "::error::GitHub Pages is not enabled for ${GITHUB_REPOSITORY}. Enable it under Settings -> Pages with Source = GitHub Actions, then re-run this job. It is not enabled automatically."
+              exit 1 ;;
+            *)
+              echo "::error::could not determine whether Pages is enabled for ${GITHUB_REPOSITORY} (HTTP ${code}). That is not necessarily a configuration problem -- check token permissions and API status before changing Settings."
+              cat "$body"
+              exit 1 ;;
+          esac
 
       - name: Deploy
         id: deployment

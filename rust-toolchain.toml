@@ -5,8 +5,8 @@ components = ["clippy"]
 
 # No `targets` list. The Android and iOS rows build in the rust-cross container,
 # which ships those stds; the host rows `rustup target add` what they need.
-# Listing them here made every checkout materialise four cross stds, including
-# an iOS one no Linux developer can link against.
+# Listing them here made every checkout of this repo materialise four cross
+# stds, including an iOS one no Linux developer can link against.
 #
 # NB: container jobs set RUSTUP_TOOLCHAIN from the image's own RUST_VERSION to
 # override `channel` above -- obeying it there would fetch a different toolchain
