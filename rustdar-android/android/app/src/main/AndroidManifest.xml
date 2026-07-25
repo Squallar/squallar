@@ -1,25 +1,49 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- All six permissions the cargo-apk metadata declared, unchanged. -->
     <!-- HTTPS to api.weather.gov, the NEXRAD archive, and basemap tiles. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <!-- LocationManager.getLastKnownLocation() in rustdar-android's GPS thread. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
+    <!--
+      WRITE_EXTERNAL_STORAGE and READ_EXTERNAL_STORAGE used to be declared here,
+      carried over verbatim from the cargo-apk metadata. Nothing in the app has
+      ever touched external storage: the zone cache goes to getCacheDir() and the
+      UI config to the internal data path, both derived from
+      AndroidApp::internal_data_path() in android_main, and neither needs a
+      permission. Declaring them cost a line in the Play listing and on the
+      install screen for a capability the app does not use.
+    -->
+
     <application
         android:label="Rustdar"
         android:icon="@android:drawable/sym_def_app_icon"
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
 
         android:networkSecurityConfig="@xml/network_security_config"
 
         android:hasCode="true">
+
+        <!--
+          allowBackup is false, and that is a downgrade from the "true" this
+          inherited from cargo-apk. With no fullBackupContent or
+          dataExtractionRules to scope it, "true" means Android uploads the whole
+          internal data directory to the user's Google Backup: the UI config, and
+          the zone-geometry cache under getCacheDir(). None of it is worth
+          restoring — the cache is re-fetched on demand and the config is a
+          handful of unit preferences — and the last-known-location handling
+          means the data is more sensitive than it is useful.
+
+          If backup is wanted later, add it deliberately: android:allowBackup
+          plus an android:dataExtractionRules (API 31+) and
+          android:fullBackupContent (below 31) that name the config and exclude
+          the cache. Turning the flag back on without those is what this comment
+          exists to prevent.
+        -->
 
         <!--
           android:networkSecurityConfig is the entire reason this build moved off

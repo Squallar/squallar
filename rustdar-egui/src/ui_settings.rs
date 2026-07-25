@@ -16,7 +16,20 @@ const GPS_BAUD_RATES: &[u32] = &[4800, 9600, 38400, 115200];
 
 impl super::Gui {
     /// Render the settings window if `show_settings` is true.
-    #[allow(unused_variables)]
+    ///
+    /// `actions` is only ever pushed to from the `gps-serial` section below, so
+    /// without that feature it is an untouched `&mut Vec` and both
+    /// `unused_variables` and `clippy::ptr_arg` fire. Taking `&mut [GuiAction]`
+    /// as `ptr_arg` suggests is not an option — the feature-enabled build needs
+    /// `push` — so the lints are allowed, but only in the configuration that
+    /// provokes them. `cfg_attr` rather than a bare `allow` so that if the
+    /// serial build later stops using `actions` the warning comes back.
+    ///
+    /// This is also why the lint went unnoticed: `rustdar-platform` enables
+    /// `gps-serial` only for `cfg(not(target_os = "android"))`, so host CI never
+    /// compiles the configuration that warns. It shows up only under
+    /// `cargo ndk … clippy`.
+    #[cfg_attr(not(feature = "gps-serial"), allow(unused_variables, clippy::ptr_arg))]
     pub(super) fn render_settings(&mut self, ctx: &egui::Context, actions: &mut Vec<GuiAction>) {
         if !self.show_settings {
             return;

@@ -24,17 +24,28 @@
 }
 -keep class com.rustdar.CompassHelper {
     public static void register(android.app.Activity);
-    public static void unregister();
     public static float getHeading();
 }
+# `unregister` is deliberately absent from that list. It used to be kept here
+# and called from nowhere -- the rotation-vector listener stayed registered at
+# SENSOR_DELAY_UI for the life of the process, including after the app was
+# minimised. CompassHelper now drives it from ActivityLifecycleCallbacks, so
+# there is a real caller inside the class and R8 keeps it on its own.
 
 # ---------------------------------------------------------------------------
-# NativeActivity
+# Rules that used to be here, and why they are not
 # ---------------------------------------------------------------------------
-# Named as a string in AndroidManifest.xml and instantiated reflectively by the
-# framework.
--keep class android.app.NativeActivity { *; }
-
-# Keep the annotation that guards CompassHelper's API-33-only branch so R8's
-# optimizer does not mistake the guarded call for unconditionally reachable.
--keepattributes *Annotation*
+# `-keep class android.app.NativeActivity { *; }` kept nothing. NativeActivity
+# is a framework class on the boot classpath and is not in this app's DEX, so
+# there is no class member for R8 to retain. What actually matters is the
+# no-arg constructor the framework instantiates by name from the manifest, and
+# aapt2 already emits `-keep class android.app.NativeActivity { <init>(); }`
+# into the generated aapt_rules.txt from the <activity> element itself.
+#
+# `-keepattributes *Annotation*` was justified in a comment as protecting
+# "CompassHelper's API-33-only branch". That branch is not in CompassHelper --
+# @TargetApi(33) is on BackHandler.registerBackCallback -- and @TargetApi is
+# CLASS-retention, so it does not survive to runtime and takes no part in R8's
+# reachability analysis either way. The attributes anything here does need
+# (RuntimeVisibleAnnotations, Signature, InnerClasses, ...) are already kept by
+# proguard-android-optimize.txt, which this build lists first.

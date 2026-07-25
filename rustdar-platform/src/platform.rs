@@ -7,6 +7,14 @@
 
 use rustdar_frontend::platform::{PlatformBridge, drain_latest};
 
+/// Callback that reads the system bar insets as `(top, bottom, left, right)`.
+///
+/// Named so the `Option<…>` field below is not a bare four-tuple-returning fn
+/// pointer, which `clippy::type_complexity` rejects. The canonical signature is
+/// [`PlatformBridge::set_insets_querier`]; this is only an alias for it.
+#[cfg(target_os = "android")]
+type InsetsQuerier = fn() -> (f32, f32, f32, f32);
+
 // ── Desktop implementation ──────────────────────────────────────────────
 
 #[cfg(not(target_os = "android"))]
@@ -154,7 +162,7 @@ pub struct AndroidPlatform {
     theme_receiver: Option<std::sync::mpsc::Receiver<bool>>,
     gps_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_gps::GpsFix>>,
     heading_receiver: Option<std::sync::mpsc::Receiver<f32>>,
-    insets_querier: Option<fn() -> (f32, f32, f32, f32)>,
+    insets_querier: Option<InsetsQuerier>,
     back_handler: Option<fn()>,
     zone_cache_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
@@ -269,7 +277,7 @@ impl PlatformBridge for AndroidPlatform {
         self.heading_receiver = Some(receiver);
     }
 
-    fn set_insets_querier(&mut self, querier: fn() -> (f32, f32, f32, f32)) {
+    fn set_insets_querier(&mut self, querier: InsetsQuerier) {
         self.insets_querier = Some(querier);
     }
 
