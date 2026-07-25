@@ -391,19 +391,48 @@ fn parse_level_records(
     time_origin: &chrono::NaiveDateTime,
     satellite: GlmSatellite,
 ) -> Result<Vec<GlmFlash>, String> {
-    let lats = read_var_f32(file, vars.lat)?;
-    let lons = read_var_f32(file, vars.lon)?;
-    let energies = read_var_f32(file, vars.energy)?;
+    let lats = read_required_f32(file, vars.lat)?;
+    let lons = read_required_f32(file, vars.lon)?;
+    let energies = read_required_f32(file, vars.energy)?;
+    let time_offsets = read_required_f64_or_f32(file, vars.time_offset)?;
+
+    // Every variable at a level shares one dimension (`number_of_flashes`,
+    // `number_of_groups`, `number_of_events`), so a short column is never
+    // legitimate — it means a corrupt or restructured file. Reject it instead
+    // of padding the tail with zeros.
+    let count = lats.len();
+    for (name, len) in [
+        (vars.lon, lons.len()),
+        (vars.energy, energies.len()),
+        (vars.time_offset, time_offsets.len()),
+    ] {
+        if len != count {
+            return Err(format!(
+                "GLM variable length mismatch: '{name}' has {len} values but '{}' has {count}",
+                vars.lat,
+            ));
+        }
+    }
+
+    // Area is the one genuinely optional column: events have none at all, so
+    // `vars.area` is `None` there and we never look. When a level that should
+    // have one is missing it, degrade to no area rather than blanking the whole
+    // overlay — area is presentational, unlike position and time — but say so.
     let areas = match vars.area {
-        Some(name) => Some(read_var_f32(file, name)?),
+        Some(name) => match read_optional_f32(file, name)? {
+            Some(values) if values.len() == count => Some(values),
+            Some(values) => {
+                log::warn!(
+                    "GLM: '{name}' has {} values but '{}' has {count}; omitting area",
+                    values.len(),
+                    vars.lat,
+                );
+                None
+            }
+            None => None,
+        },
         None => None,
     };
-    let time_offsets = read_var_f64_or_f32(file, vars.time_offset)?;
-
-    let count = lats.len();
-    if lons.len() != count || time_offsets.len() != count {
-        return Err(format!("Variable length mismatch for {} in GLM file", vars.lat));
-    }
 
     let mut records = Vec::with_capacity(count);
     for i in 0..count {
@@ -413,11 +442,8 @@ fn parse_level_records(
         records.push(GlmFlash {
             lat: lats[i] as f64,
             lon: lons[i] as f64,
-            energy: *energies.get(i).unwrap_or(&0.0),
-            // `None` when the level has no area variable at all, and also when
-            // the column came up short — better to omit the row than to invent
-            // a zero.
-            area: areas.as_ref().and_then(|a| a.get(i).copied()),
+            energy: energies[i],
+            area: areas.as_ref().map(|a| a[i]),
             time,
             satellite,
             level: vars.level,
@@ -427,21 +453,61 @@ fn parse_level_records(
     Ok(records)
 }
 
-/// Read a 1-D f32 variable from a NetCDF file. Returns empty vec if not found.
-fn read_var_f32(file: &netcdf::File, name: &str) -> Result<Vec<f32>, String> {
-    let var = match file.variable(name) {
-        Some(v) => v,
-        None => return Ok(Vec::new()),
+/// Report a variable the product was expected to have but does not, once per
+/// variable per process.
+///
+/// A variable vanishing from the product is a permanent schema change, not a
+/// transient condition, so repeating the message on every 20-second poll would
+/// bury it in exactly the way that let the original bug survive a year.
+fn warn_missing_variable_once(name: &'static str) {
+    static WARNED: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    if warned.insert(name) {
+        log::warn!(
+            "GLM: variable '{name}' is absent from the L2 LCFA file — the product \
+             schema has changed and this field can no longer be read"
+        );
+    }
+}
+
+/// Read a 1-D f32 variable that the level cannot do without.
+///
+/// Absence is an error, deliberately. The previous `Ok(Vec::new())` fallback is
+/// the mechanism that produced "Area: 0.0 km²" for a year: a variable that does
+/// not exist read back as an empty column, and callers padded it with zeros. The
+/// same silence would turn a renamed `flash_energy` into every bolt drawing at
+/// minimum size, or a renamed `flash_lat` into "no lightning anywhere".
+fn read_required_f32(file: &netcdf::File, name: &'static str) -> Result<Vec<f32>, String> {
+    let Some(var) = file.variable(name) else {
+        warn_missing_variable_once(name);
+        return Err(format!("GLM file has no '{name}' variable (product schema change?)"));
     };
     var.get_values::<f32, _>(..)
         .map_err(|e| format!("Failed to read {name}: {e}"))
 }
 
-/// Read a 1-D variable as f64 (trying f64 first, then f32).
-fn read_var_f64_or_f32(file: &netcdf::File, name: &str) -> Result<Vec<f64>, String> {
-    let var = match file.variable(name) {
-        Some(v) => v,
-        None => return Ok(Vec::new()),
+/// Read a 1-D f32 variable that a level may legitimately lack.
+///
+/// Returns `Ok(None)` when absent, but still reports it: the *declared*
+/// optionality lives in [`LevelVars::area`], so reaching here with a name in
+/// hand means we asked for something the product used to have.
+fn read_optional_f32(file: &netcdf::File, name: &'static str) -> Result<Option<Vec<f32>>, String> {
+    let Some(var) = file.variable(name) else {
+        warn_missing_variable_once(name);
+        return Ok(None);
+    };
+    var.get_values::<f32, _>(..)
+        .map(Some)
+        .map_err(|e| format!("Failed to read {name}: {e}"))
+}
+
+/// Read a required 1-D variable as f64 (trying f64 first, then f32).
+fn read_required_f64_or_f32(file: &netcdf::File, name: &'static str) -> Result<Vec<f64>, String> {
+    let Some(var) = file.variable(name) else {
+        warn_missing_variable_once(name);
+        return Err(format!("GLM file has no '{name}' variable (product schema change?)"));
     };
     // Try f64 first
     if let Ok(vals) = var.get_values::<f64, _>(..) {
@@ -484,18 +550,37 @@ mod tests {
         );
     }
 
+    /// Deletes the scratch file even if the test body panics.
+    struct TempNc(std::path::PathBuf);
+
+    impl Drop for TempNc {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     /// Build a minimal in-memory GLM-shaped NetCDF4 file: flashes carry an
     /// area variable, events deliberately do not (mirroring the real product).
-    fn synthetic_glm_file() -> Vec<u8> {
-        let path = std::env::temp_dir().join(format!(
-            "rustdar-glm-test-{}-{:?}.nc",
+    /// Names listed in `omit` are left out, to simulate a product schema change.
+    ///
+    /// NOTE: this fixture writes plain unpacked `f32`. The real product stores
+    /// these as `short` with `_Unsigned`, `scale_factor` and `add_offset`, so
+    /// the assertions below deliberately do not pin the *scaling* behaviour —
+    /// see the TODO on `GlmFlash::area`. `fix/glm-cf-unpacking` owns the CF
+    /// unpacking work and should extend this fixture to packed shorts; changing
+    /// it here would collide with that branch.
+    fn synthetic_glm_file(omit: &[&str]) -> Vec<u8> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let guard = TempNc(std::env::temp_dir().join(format!(
+            "rustdar-glm-test-{}-{unique}.nc",
             std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        )));
+        let path = &guard.0;
+        let _ = std::fs::remove_file(path);
 
         {
-            let mut file = netcdf::create(&path).expect("create netcdf");
+            let mut file = netcdf::create(path).expect("create netcdf");
             file.add_attribute("time_coverage_start", "2026-07-24T12:00:00.0Z")
                 .expect("add time_coverage_start");
 
@@ -503,6 +588,9 @@ mod tests {
             file.add_dimension("number_of_events", 2).expect("event dim");
 
             let mut put = |name: &str, dim: &str, values: &[f32]| {
+                if omit.contains(&name) {
+                    return;
+                }
                 let mut var = file
                     .add_variable::<f32>(name, &[dim])
                     .unwrap_or_else(|e| panic!("add {name}: {e}"));
@@ -527,14 +615,12 @@ mod tests {
             // Note: no `event_area` — that is the point of the fixture.
         }
 
-        let bytes = std::fs::read(&path).expect("read back netcdf");
-        let _ = std::fs::remove_file(&path);
-        bytes
+        std::fs::read(path).expect("read back netcdf")
     }
 
     #[test]
     fn flash_level_reports_area_and_event_level_reports_none() {
-        let bytes = synthetic_glm_file();
+        let bytes = synthetic_glm_file(&[]);
 
         let flashes = parse_glm_netcdf(
             &bytes,
@@ -543,8 +629,8 @@ mod tests {
         )
         .expect("parse flash level");
         assert_eq!(flashes.len(), 2);
-        assert_eq!(flashes[0].area, Some(128.0));
-        assert_eq!(flashes[1].area, Some(256.0));
+        assert!(flashes[0].area.is_some());
+        assert!(flashes[1].area.is_some());
 
         let events = parse_glm_netcdf(
             &bytes,
@@ -562,5 +648,53 @@ mod tests {
         // The rest of the event record must still parse.
         assert!((events[0].lat - 35.5).abs() < 1e-4);
         assert!((events[0].lon - (-97.5)).abs() < 1e-4);
+    }
+
+    /// A required variable disappearing from the product must fail the parse,
+    /// not quietly yield zeros or an empty result set.
+    #[test]
+    fn missing_required_variable_is_an_error_not_a_silent_default() {
+        for missing in [
+            "flash_lat",
+            "flash_lon",
+            "flash_energy",
+            "flash_time_offset_of_first_event",
+        ] {
+            let bytes = synthetic_glm_file(&[missing]);
+            let result =
+                parse_glm_netcdf(&bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Flash]);
+            let err = result.expect_err(
+                "a missing required variable must surface, not read back as an empty column",
+            );
+            assert!(
+                err.contains(missing),
+                "error should name the absent variable, got: {err}"
+            );
+        }
+    }
+
+    /// Energy in particular used to fall back to 0.0, which the rasterizer turns
+    /// into `0f32.log10()` = -inf and draws as a minimum-size bolt — a total
+    /// data loss that looked like a normal render.
+    #[test]
+    fn missing_energy_does_not_default_to_zero() {
+        let bytes = synthetic_glm_file(&["flash_energy"]);
+        assert!(
+            parse_glm_netcdf(&bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Flash]).is_err()
+        );
+    }
+
+    /// Area is presentational, so losing it degrades the popup rather than the
+    /// whole overlay: the flashes still parse, they just carry no area.
+    #[test]
+    fn missing_optional_area_degrades_without_failing_the_file() {
+        let bytes = synthetic_glm_file(&["flash_area"]);
+        let flashes = parse_glm_netcdf(&bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Flash])
+            .expect("a missing area must not blank the whole overlay");
+        assert_eq!(flashes.len(), 2);
+        assert!(flashes.iter().all(|f| f.area.is_none()));
+        // Position and energy are untouched.
+        assert!((flashes[0].lat - 35.0).abs() < 1e-4);
+        assert!(flashes[0].energy > 0.0);
     }
 }
