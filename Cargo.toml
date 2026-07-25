@@ -67,7 +67,7 @@ tokio = "=1.51.1"
 # spells out what it wants (`default` == reqwest's own default feature set).
 reqwest = { version = "=0.12.24", default-features = false }
 # Android needs a vendored OpenSSL; the NDK sysroot has no usable system copy.
-openssl-sys = { version = "=0.9.113", features = ["vendored"] }
+openssl-sys = { version = "=0.9.117", features = ["vendored"] }
 
 [profile.dev]
 # Only optimize dependencies (not workspace code) to preserve debuggability
