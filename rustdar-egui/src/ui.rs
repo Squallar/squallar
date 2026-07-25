@@ -1112,6 +1112,23 @@ impl Gui {
             .collect()
     }
 
+    /// Turn a texture overlay on for every pane, as ticking its layer toggle does.
+    ///
+    /// The handler's own state has to be written back into each pane's
+    /// `overlay_configs`, not just into `enabled_overlays`: every frame reloads the
+    /// registry from the pane's configs and then saves the enabled map back out, so
+    /// a pane whose config still says "off" turns itself off again on the next frame.
+    #[cfg(test)]
+    pub(crate) fn enable_overlay_for_test(&mut self, kind: OverlayKind) {
+        self.overlays.set_enabled(kind, true);
+        let configs = self.overlays.save_pane_configs();
+        let enabled = self.overlays.save_enabled_map();
+        for pane in &mut self.panes {
+            pane.overlay_configs = configs.clone();
+            pane.enabled_overlays = enabled.clone();
+        }
+    }
+
     /// Whether viewport sync is enabled (all panes share the same map viewport).
     pub fn is_viewport_sync(&self) -> bool {
         self.viewport_sync

@@ -86,6 +86,13 @@ pub(crate) struct InputHarness {
     /// assert on what was actually *drawn* rather than on an intermediate value
     /// — the only way to pin that a resolved decision reached the renderer.
     last_rects: Vec<egui::Rect>,
+    /// `RawInput::max_texture_side` — what `egui_winit` is handed from
+    /// `device.limits().max_texture_dimension_2d`, and what
+    /// `plan_overlay_texture` reads back through `ui.ctx().input(..)`.
+    /// `None` leaves egui on its own default of 2048.
+    max_texture_side: Option<usize>,
+    /// The [`GuiAction`]s `Gui::ui` returned from the last frame.
+    last_actions: Vec<crate::actions::GuiAction>,
 }
 
 impl InputHarness {
@@ -114,9 +121,27 @@ impl InputHarness {
             events: Vec::new(),
             screen_rect,
             last_rects: Vec::new(),
+            max_texture_side: None,
+            last_actions: Vec::new(),
         };
         harness.warm_up();
         harness
+    }
+
+    /// Report `side` as the adapter's `max_texture_dimension_2d`, the way
+    /// `EguiRenderer::new` reports the real device's limit to `egui_winit`.
+    ///
+    /// This is how a WebGL2-class limit is exercised without a wasm target: the
+    /// number reaches `plan_overlay_texture` through exactly the path it does in
+    /// the real app, `RawInput` -> `InputState` -> `ui.ctx().input(..)`.
+    pub(crate) fn set_max_texture_side(&mut self, side: usize) {
+        self.max_texture_side = Some(side);
+        self.warm_up();
+    }
+
+    /// The actions the last frame's `Gui::ui` emitted.
+    pub(crate) fn last_actions(&self) -> &[crate::actions::GuiAction] {
+        &self.last_actions
     }
 
     /// Split the map into `count` panes, as the settings UI does.
@@ -375,6 +400,7 @@ impl InputHarness {
             screen_rect: Some(self.screen_rect),
             time: Some(self.time),
             events: std::mem::take(&mut self.events),
+            max_texture_side: self.max_texture_side,
             ..Default::default()
         };
 
@@ -385,7 +411,7 @@ impl InputHarness {
         ctx.begin_pass(raw_input);
 
         // The real UI, panels, dialogs and map panes included.
-        let _actions = self.gui.ui(&ctx);
+        self.last_actions = self.gui.ui(&ctx);
 
         // The same two entry points `ui_map.rs` uses for the active pane. Both
         // funnel their click position through `filter_dialog_blocked`.
@@ -1242,5 +1268,98 @@ mod tests {
         h.touch_tap(pos);
         let confirmed = h.frame_after(AFTER_DOUBLE_TAP_TIMEOUT);
         assert_eq!(confirmed.touch.overlay_click_pos, Some(pos));
+    }
+
+    // ── Overlay texture budget ───────────────────────────────────────────
+
+    use crate::actions::GuiAction;
+    use rustdar_overlays::render::overlay_state::OverlayKind;
+
+    /// The texture plans the last frame asked for.
+    fn requested_plans(h: &InputHarness) -> Vec<crate::overlay_cache::OverlayTexturePlan> {
+        h.last_actions()
+            .iter()
+            .filter_map(|a| match a {
+                GuiAction::RenderOverlay { texture, .. } => Some(*texture),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A harness with a texture overlay switched on, so the map pane emits
+    /// `RenderOverlay`. `RadarSites` is the one overlay whose `has_data` is
+    /// unconditionally true, so it needs no fetch to reach the render path.
+    fn harness_requesting_overlays() -> InputHarness {
+        let mut h = InputHarness::new();
+        h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+        h.warm_up();
+        h
+    }
+
+    /// The whole point of the change, exercised through the real UI: the number the
+    /// adapter reports reaches `plan_overlay_texture` via `RawInput` and bounds what
+    /// the pane asks for. Forcing the limit is how a WebGL2-class device is tested
+    /// without a wasm target.
+    #[test]
+    fn a_small_adapter_limit_bounds_what_the_pane_requests() {
+        // The smallest limit egui itself tolerates: `TextureAtlas::new` asserts
+        // `size[0] >= 1024`, so a WebGL2 2048 cannot be halved further here. Still
+        // well under what this pane asks for unclamped.
+        const LIMIT: u32 = 1024;
+
+        let mut h = harness_requesting_overlays();
+        let unclamped = requested_plans(&h);
+        assert!(
+            !unclamped.is_empty(),
+            "fixture must actually reach the render path — no RenderOverlay was emitted"
+        );
+        assert!(
+            unclamped.iter().any(|p| p.width > LIMIT || p.height > LIMIT),
+            "fixture must cross the limit before it is imposed, else the clamp is never \
+             exercised; got {unclamped:?}"
+        );
+
+        h.set_max_texture_side(LIMIT as usize);
+        let clamped = requested_plans(&h);
+        assert!(!clamped.is_empty(), "still expected a render request after clamping");
+        for plan in &clamped {
+            assert!(
+                plan.width <= LIMIT && plan.height <= LIMIT,
+                "requested {}x{} against a {LIMIT} limit",
+                plan.width,
+                plan.height
+            );
+            assert!(
+                plan.overdraw < crate::overlay_cache::OVERDRAW_FRACTION,
+                "overdraw must have been given up to fit"
+            );
+        }
+    }
+
+    /// Desktop is untouched: a limit no window can reach leaves the full overdraw in
+    /// place, so the plan is what the pre-clamp arithmetic produced.
+    #[test]
+    fn a_desktop_class_limit_leaves_the_request_alone() {
+        let mut h = harness_requesting_overlays();
+        let default_limit = requested_plans(&h);
+
+        h.set_max_texture_side(16384);
+        let desktop = requested_plans(&h);
+        assert!(!desktop.is_empty());
+        for plan in &desktop {
+            assert_eq!(
+                plan.overdraw,
+                crate::overlay_cache::OVERDRAW_FRACTION,
+                "a desktop adapter must not cost any overdraw"
+            );
+        }
+        // egui's own default is 2048, which this pane already exceeds — so the two
+        // sets differ, which is what makes the assertion above about the limit
+        // rather than about the pane being small.
+        assert_ne!(
+            default_limit, desktop,
+            "precondition: egui's 2048 default must clamp this pane, or this test \
+             proves nothing about the limit being read at all"
+        );
     }
 }
