@@ -1,6 +1,7 @@
 name: Test
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -14,8 +15,20 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
+      - name: Generate GitHub App Token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        id: app-token
+        with:
+          client-id: ${{ secrets.AUTO_COMMIT_APP_ID }}
+          private-key: ${{ secrets.AUTO_COMMIT_APP_KEY }}
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -29,5 +42,52 @@ jobs:
           rustup default stable
           rustup component add llvm-tools-preview
           cargo install cargo-llvm-cov
-      - name: Generate coverage
-        run: cargo llvm-cov --lcov --output-path lcov.info
+      - name: Run tests
+        run: cargo llvm-cov --no-report
+      - name: Generate coverage reports
+        if: always()
+        run: |
+          cargo llvm-cov report --lcov --output-path lcov.info
+          cargo llvm-cov report --html --output-dir coverage
+      - name: Upload HTML coverage report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-html
+          path: coverage/html
+          retention-days: 14
+      - name: Comment coverage on pull request
+        if: always() && github.event_name == 'pull_request'
+        # Coverage is informational and never gates, so a failure to report it
+        # must not turn the pull request red.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if [ ! -s lcov.info ]; then
+            echo "No coverage report was produced, skipping comment"
+            exit 0
+          fi
+          .github/scripts/coverage-summary.sh lcov.info > "$RUNNER_TEMP/current.tsv"
+          git diff --name-only "$BASE_SHA"...HEAD > "$RUNNER_TEMP/changed.txt"
+          .github/scripts/coverage-comment.sh \
+            "$RUNNER_TEMP/current.tsv" \
+            .github/coverage-baseline.tsv \
+            "$RUNNER_TEMP/changed.txt" > "$RUNNER_TEMP/comment.md"
+          gh pr comment "$PR" --body-file "$RUNNER_TEMP/comment.md" --edit-last --create-if-none
+      - name: Update coverage badge and baseline
+        if: github.ref == 'refs/heads/main'
+        run: |
+          .github/scripts/coverage-badge.sh lcov.info .github/badges/coverage.svg
+          .github/scripts/coverage-summary.sh lcov.info > .github/coverage-baseline.tsv
+          if git diff --quiet -- .github/badges/coverage.svg .github/coverage-baseline.tsv; then
+            echo "Coverage unchanged, nothing to commit"
+            exit 0
+          fi
+          git config user.name 'usa-reddragon-auto-commit[bot]'
+          git config user.email '234130638+github-actions[bot]@users.noreply.github.com'
+          git add .github/badges/coverage.svg .github/coverage-baseline.tsv
+          git commit -m 'chore: update coverage badge and baseline [skip ci]'
+          git push

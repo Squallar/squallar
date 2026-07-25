@@ -1,4 +1,6 @@
 /target
+/coverage
+/lcov.info
 *.jks
 .env
 /.cargo/android-ndk-wrapper.cmake
