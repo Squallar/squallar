@@ -105,7 +105,7 @@
  * that distinction is load-bearing. A page load is not atomic: the navigation,
  * the glue and the 11 MB module are three separate fetches, seconds apart, and
  * a deploy can land in between. Resolving "the current shell" independently for
- * each of them is therefore not enough - it was in fact how this worker used to
+ * each of them is therefore not enough — it was in fact how this worker used to
  * hand a page index.html from one deploy and its wasm from the next, and the
  * symptom was the exact wasm-bindgen mismatch above.
  *
@@ -113,7 +113,7 @@
  * `clientShells`. Every subresource that client goes on to request is served
  * from the generation its navigation was answered from, whatever the meta
  * pointer has done since. `purgeCaches` retains every pinned generation, plus
- * the one immediately superseded - the second is what covers a worker that is
+ * the one immediately superseded — the second is what covers a worker that is
  * killed and restarted mid-load, taking `clientShells` with it.
  */
 
@@ -227,22 +227,52 @@ const UPDATE_PROBE_INTERVAL_MS = 60 * 1000;
 // Routing
 // ---------------------------------------------------------------------------
 
+/**
+ * Reduce a hostname to the form the rules below are written against.
+ *
+ * Two spellings of the same host reach here and neither is exotic:
+ *
+ *   * `api.weather.gov.` — the fully-qualified form, with the root label
+ *     spelled out. `new URL()` accepts it and preserves the dot, DNS resolves
+ *     it to the identical server, and `"api.weather.gov."` is not a member of
+ *     `NEVER_CACHE_HOSTS` and does not end with `".weather.gov"`.
+ *   * `API.Weather.GOV` — `new URL()` lowercases the host itself, so this only
+ *     matters for a direct call, but hostnames are case-insensitive and the
+ *     comparisons below are not.
+ *
+ * Neither was ever cacheable: `routeFor` is default-deny and both fall through
+ * to `network`. They are normalised anyway because this function is the layer
+ * that *states* the policy, and a future rule that leans on it must not inherit
+ * a hole that only the default is currently covering.
+ */
+function normalizeHost(hostname) {
+  let host = String(hostname).toLowerCase();
+  while (host.endsWith(".")) host = host.slice(0, -1);
+  return host;
+}
+
 function isWeatherDataHost(hostname) {
-  if (NEVER_CACHE_HOSTS.has(hostname)) return true;
+  const host = normalizeHost(hostname);
+  if (NEVER_CACHE_HOSTS.has(host)) return true;
   // Suffix rules so a bucket rename or a new NWS subdomain is still never
   // cached without this file having to be updated first.
   return (
-    hostname === "amazonaws.com" ||
-    hostname.endsWith(".amazonaws.com") ||
-    hostname === "noaa.gov" ||
-    hostname.endsWith(".noaa.gov") ||
-    hostname === "weather.gov" ||
-    hostname.endsWith(".weather.gov")
+    host === "amazonaws.com" ||
+    host.endsWith(".amazonaws.com") ||
+    host === "noaa.gov" ||
+    host.endsWith(".noaa.gov") ||
+    host === "weather.gov" ||
+    host.endsWith(".weather.gov")
   );
 }
 
 function isBasemapTile(url) {
-  return BASEMAP_HOST.test(url.hostname) && url.pathname.endsWith(".png");
+  // The extension is matched case-insensitively because a URL path is
+  // case-sensitive and `.PNG` is the same picture. The host is what actually
+  // confines this rule, and it is an exact match against CartoDB's four
+  // subdomains — the extension only distinguishes a tile from the other things
+  // that host serves.
+  return BASEMAP_HOST.test(normalizeHost(url.hostname)) && /\.png$/i.test(url.pathname);
 }
 
 function isShellAsset(url) {
@@ -278,12 +308,28 @@ function routeFor({ url, method = "GET", mode = "no-cors" }) {
   // them anyway, and they are none of this worker's business.
   if (u.protocol !== "http:" && u.protocol !== "https:") return "network";
 
-  // Checked before anything else, so no later rule can reach a data origin.
+  // Credentials in the URL. Nothing rustdar issues has them, so their presence
+  // means the request was not built by this application, and a cache entry keyed
+  // by a URL carrying a password is a bad thing to own regardless of what the
+  // host is.
+  if (u.username || u.password) return "network";
+
+  // Checked before anything else that could say "yes", so no later rule can
+  // reach a data origin. This is not redundant with the default-deny below: it
+  // is what keeps the two rules that *do* say yes — a same-origin navigation
+  // and a same-origin shell asset — from matching a weather origin if rustdar
+  // is ever served from one, behind a proxy or on a shared host.
   if (isWeatherDataHost(u.hostname)) return "network";
 
   if (isBasemapTile(u)) return "tile";
 
-  if (u.origin === ROOT.origin) {
+  // `ROOT.pathname` always ends in a slash, so this is a directory containment
+  // test and not a prefix match: `/rustdar/` does not match `/rustdar-old/x`.
+  // Without it, a user-site deploy at `https://<user>.github.io/` — which the
+  // relative-URL work exists to support — would answer navigations for every
+  // other project on that origin with rustdar's index.html. Service-worker
+  // scope confines this today; scope is not the thing that should be relied on.
+  if (u.origin === ROOT.origin && u.pathname.startsWith(ROOT.pathname)) {
     if (mode === "navigate") return "navigate";
     if (isShellAsset(u)) return "shell";
   }
@@ -476,7 +522,7 @@ async function installShell(token, name = shellCacheName(token)) {
  *
  * Every pinned generation, because a live client is mid-load in it, and the
  * generation being superseded, because `clientShells` is module state that a
- * worker restart loses - after which the only thing standing between a
+ * worker restart loses — after which the only thing standing between a
  * half-loaded page and a 404 is the previous shell still existing.
  */
 function cachesToKeep(newShellName, previousMeta) {
@@ -652,7 +698,7 @@ async function forceReinstall() {
  * Serve a shell asset from the generation `clientId` is pinned to.
  *
  * `clientId` is the empty string for a request whose client the browser cannot
- * name, which falls back to the current generation - correct, because such a
+ * name, which falls back to the current generation — correct, because such a
  * request is not part of a page load this worker pinned.
  */
 async function serveShell(request, clientId, key) {
@@ -815,7 +861,7 @@ self.addEventListener("activate", (event) => {
       // very first visit instead of only after a reload.
       await self.clients.claim();
       // Bound the tile cache at every version change as well as at every worker
-      // start. Cheap - one `keys()` walk - and it is the one moment at which
+      // start. Cheap — one `keys()` walk — and it is the one moment at which
       // this worker is certain to be running and not in a hurry.
       await trimTiles().catch(() => {});
       try {
@@ -882,10 +928,13 @@ self.addEventListener("message", (event) => {
 /*
  * Test hook.
  *
- * `tests/sw_routing.test.mjs` evaluates this file in a sandbox and calls
- * `routeFor` directly. Asserting against the shipped worker is the only way to
- * test the policy that actually runs; a re-implementation in the test would
- * assert only that the test agrees with itself.
+ * `tests/sw_routing.test.mjs` loads this file's shipped bytes into a scope that
+ * models a ServiceWorkerGlobalScope, calls `routeFor` directly, and drives the
+ * `fetch`, `activate` and `message` handlers above. Asserting against the
+ * shipped worker is the only way to test the policy that actually runs; a
+ * re-implementation in the test would assert only that the test agrees with
+ * itself. `rustdar-web/tests/sw_behaviour.rs` runs that suite under
+ * `cargo test`, so it gates the same builds every other test here gates.
  */
 self.__rustdarSwInternals = {
   ROOT,
@@ -899,6 +948,7 @@ self.__rustdarSwInternals = {
   isWeatherDataHost,
   isBasemapTile,
   isShellAsset,
+  normalizeHost,
   validatorToken,
   tileFreshFor,
   tileIsStale,

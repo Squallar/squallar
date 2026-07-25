@@ -156,6 +156,29 @@ describe("routing: weather data is default-deny", () => {
     }
   });
 
+  it("normalises a host before deciding, so the deny list is not spelling-sensitive", async () => {
+    const worker = await bootWorker();
+    const { isWeatherDataHost } = worker.internals;
+
+    // The mechanism behind the spellings above. Kept separate because the
+    // default-deny in `routeFor` would mask a regression here — this is the
+    // layer a future rule would lean on, and it has to be sound on its own.
+    for (const host of [
+      "api.weather.gov.",
+      "API.WEATHER.GOV",
+      "Api.Weather.Gov.",
+      "mesonet.agron.iastate.edu.",
+      "unidata-nexrad-level2.s3.amazonaws.com.",
+      "WWW.SPC.NOAA.GOV.",
+    ]) {
+      assert.equal(isWeatherDataHost(host), true, `${host} must be recognised as a data host`);
+    }
+
+    for (const host of ["api.weather.gov.evil.example", "weather.gov.attacker.test", "notweather.gov"]) {
+      assert.equal(isWeatherDataHost(host), false, `${host} is not a data host`);
+    }
+  });
+
   it("keeps the deny list load-bearing even when rustdar is served from a data origin", async () => {
     // The point of this test.
     //
@@ -236,11 +259,56 @@ describe("routing: the basemap tile rule is confined to CartoDB", () => {
     }
   });
 
+  it("refuses a tile URL carrying credentials", async () => {
+    const worker = await bootWorker();
+    assert.equal(
+      worker.internals.routeFor({
+        url: "https://user:secret@cartodb-basemaps-a.global.ssl.fastly.net/dark/7/29/52.png",
+      }),
+      "network",
+      "a cache entry keyed by a URL containing a password must not be created",
+    );
+  });
+
+  it("treats the extension case-insensitively on a host that is genuinely CartoDB", async () => {
+    const worker = await bootWorker();
+    assert.equal(
+      worker.internals.routeFor({
+        url: "https://cartodb-basemaps-b.global.ssl.fastly.net/dark_nolabels/7/29/52.PNG",
+      }),
+      "tile",
+    );
+  });
 });
 
 // ===========================================================================
 describe("routing: the shell rule is confined to the deploy directory", () => {
   // =========================================================================
+
+  it("answers navigations only under the directory the worker was served from", async () => {
+    const worker = await bootWorker();
+    const { routeFor } = worker.internals;
+
+    assert.equal(routeFor({ url: ORIGIN, mode: "navigate" }), "navigate");
+    assert.equal(routeFor({ url: `${ORIGIN}?station=KTLX`, mode: "navigate" }), "navigate");
+    assert.equal(routeFor({ url: `${ORIGIN}index.html`, mode: "navigate" }), "navigate");
+
+    // A user-site deploy at `https://<user>.github.io/` shares its origin with
+    // every other project that user publishes. Answering their navigations with
+    // rustdar's index.html would replace those sites with this one.
+    for (const url of [
+      "https://rustdar.example/somewhere/else",
+      "https://rustdar.example/",
+      "https://rustdar.example/rustdar-old/index.html",
+      "https://rustdar.example/rustdarn't/",
+    ]) {
+      assert.equal(
+        routeFor({ url, mode: "navigate" }),
+        "network",
+        `${url} is outside the deploy directory and must not be answered from the shell`,
+      );
+    }
+  });
 
   it("recognises a shell asset regardless of a cache-busting query", async () => {
     const worker = await bootWorker();
@@ -358,6 +426,7 @@ describe("shell: navigations and subresources are cache-first", () => {
   });
 });
 
+// ===========================================================================
 describe("atomicity: one page load draws its shell from one deploy", () => {
   // =========================================================================
 
@@ -485,6 +554,7 @@ describe("atomicity: one page load draws its shell from one deploy", () => {
   });
 });
 
+// ===========================================================================
 describe("install: a shell is published whole or not at all", () => {
   // =========================================================================
 
@@ -567,6 +637,7 @@ describe("install: a shell is published whole or not at all", () => {
   });
 });
 
+// ===========================================================================
 describe("updates: a degraded version probe is visible and escapable", () => {
   // =========================================================================
 
@@ -665,6 +736,7 @@ describe("updates: a degraded version probe is visible and escapable", () => {
   });
 });
 
+// ===========================================================================
 describe("tiles: the basemap cache stays bounded", () => {
   // =========================================================================
 
@@ -779,10 +851,6 @@ describe("tiles: the basemap cache stays bounded", () => {
   });
 });
 
-// ===========================================================================
-// ===========================================================================
-// ===========================================================================
-// ===========================================================================
 // ===========================================================================
 describe("lifecycle", () => {
   // =========================================================================
