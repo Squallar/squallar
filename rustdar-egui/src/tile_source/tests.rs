@@ -28,8 +28,10 @@ use egui::Context;
 use walkers::sources::{Attribution, TileSource};
 use walkers::{Tile, TileId, TilePiece, Tiles};
 
-use super::{HttpsTiles, TILE_CACHE_ENTRIES, interpolate_from_lower_zoom, tile_client,
-    tile_id_is_valid};
+use super::{
+    HttpsTiles, MAX_PARALLEL_DOWNLOADS, TILE_CACHE_ENTRIES, interpolate_from_lower_zoom,
+    tile_client, tile_id_is_valid,
+};
 use crate::tiles::CartoDb;
 
 // ---------------------------------------------------------------------------
@@ -87,6 +89,19 @@ fn fixture_png() -> Vec<u8> {
 fn whole_tile_uv() -> egui::Rect {
     egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
 }
+
+/// The two tuning values, restated as literals.
+///
+/// Deliberately *not* read from [`super::TILE_CACHE_ENTRIES`] and
+/// [`super::MAX_PARALLEL_DOWNLOADS`]. A test that took its expectation from the
+/// constant it is checking would move in lockstep with any change to it and
+/// could never fail — the first version of
+/// [`no_more_than_the_concurrency_limit_is_downloaded_at_once`] did exactly
+/// that, and a mutant raising the limit from 6 to 64 sailed through it.
+/// [`the_tuning_constants_are_the_ones_walkers_uses`] is what ties these back to
+/// the code.
+const EXPECTED_CACHE_ENTRIES: usize = 256;
+const EXPECTED_PARALLEL_DOWNLOADS: usize = 6;
 
 // ---------------------------------------------------------------------------
 // A loopback tile server
@@ -1012,6 +1027,65 @@ fn an_arriving_tile_requests_a_repaint() {
     );
 }
 
+/// No more than [`super::MAX_PARALLEL_DOWNLOADS`] downloads are in flight.
+///
+/// Tile providers throttle or ban clients that exceed their limits, so this is a
+/// term of use rather than a tuning choice — and it is invisible to every other
+/// test here, all of which stay well under the cap.
+///
+/// The server parks every connection, so nothing ever completes and the number
+/// of requests it has seen *is* the number in flight. Far more distinct tiles are
+/// asked for than the limit allows, so a raised limit shows up as a higher count
+/// rather than as no difference at all.
+#[test]
+fn no_more_than_the_concurrency_limit_is_downloaded_at_once() {
+    let server = TileServer::start(Behaviour::Hang);
+    let ctx = Context::default();
+    let mut tiles = loopback_tiles(&server, &ctx);
+
+    let wanted = (EXPECTED_PARALLEL_DOWNLOADS * 12) as u32;
+    let mut ask = || {
+        for x in 0..wanted {
+            tiles.at(TileId { x, y: 0, zoom: 8 });
+        }
+    };
+
+    assert!(
+        server.wait_for_requests(EXPECTED_PARALLEL_DOWNLOADS, &mut ask),
+        "the downloads never ramped up to the limit"
+    );
+
+    // Keep asking for all of them; the count must not climb past the limit.
+    let deadline = Instant::now() + SETTLE;
+    while Instant::now() < deadline {
+        ask();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    assert_eq!(
+        server.request_count(),
+        EXPECTED_PARALLEL_DOWNLOADS,
+        "more downloads were started at once than the limit allows"
+    );
+}
+
+/// The cache bound and the concurrency limit are the values walkers uses.
+///
+/// This is the one place the constants are compared to a literal, which is what
+/// keeps every other test that spends them from being self-fulfilling.
+#[test]
+fn the_tuning_constants_are_the_ones_walkers_uses() {
+    assert_eq!(
+        MAX_PARALLEL_DOWNLOADS, EXPECTED_PARALLEL_DOWNLOADS,
+        "the parallel-download limit is a provider term of use, not a dial"
+    );
+    assert_eq!(
+        TILE_CACHE_ENTRIES.get(),
+        EXPECTED_CACHE_ENTRIES,
+        "the tile cache bound is what keeps texture memory finite"
+    );
+}
+
 /// The cache stops growing at its bound.
 ///
 /// This is a wiring check rather than a test of LRU itself: what it pins is that
@@ -1024,7 +1098,7 @@ fn the_tile_cache_is_bounded() {
     let ctx = Context::default();
     let mut tiles = loopback_tiles(&server, &ctx);
 
-    let capacity = TILE_CACHE_ENTRIES.get();
+    let capacity = EXPECTED_CACHE_ENTRIES;
     let attempts = capacity as u32 + 64;
 
     let reached = pump_until(DEFAULT_TIMEOUT, || {
