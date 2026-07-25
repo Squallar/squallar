@@ -138,6 +138,13 @@ impl LoopDownloadManager {
     }
 
     /// Reset all loop download state. Used on site switch to avoid stale data.
+    ///
+    /// The undispatched queues go with the rest. Keeping them would not corrupt
+    /// anything now that the site travels with the queue — a leftover download
+    /// still files under the site it was listed for — but every loop this call
+    /// precedes is about to be rebuilt and re-listed, so those entries are network
+    /// spent on files nobody asked for. "Clear all" leaving one field populated is
+    /// also the kind of thing the next reader has to re-derive; it does not.
     pub fn clear_all(&mut self) {
         self.scan_cache.clear();
         self.in_flight_set.clear();
@@ -149,6 +156,7 @@ impl LoopDownloadManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nexrad_data::aws::archive::Identifier;
     use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
 
     fn ts(minute: u32) -> chrono::NaiveDateTime {
@@ -252,19 +260,38 @@ mod tests {
 
     /// A site switch drops every site's cached data, not just the one switched away
     /// from — the loops are all rebuilt.
+    ///
+    /// Including the undispatched queues, which the assertions below cover
+    /// explicitly. Leaving those behind is not a correctness bug — the site travels
+    /// with the queue, so a leftover download still files under the site it was
+    /// listed for — but it is network spent on files no rebuilt loop asked for, and
+    /// a `clear_all` that quietly leaves one field populated is a trap for whoever
+    /// reads it next. Pinning it makes the choice deliberate either way.
     #[test]
     fn clear_all_empties_every_sites_state() {
         let mut mgr = LoopDownloadManager::new();
         mgr.cache_scan("KTLX", ts(0), scan());
         mgr.cache_scan("KOUN", ts(0), scan());
         mgr.mark_in_flight("KTLX", ts(1));
+        mgr.insert_pending(0, PendingDownloads {
+            site: "KTLX".to_string(),
+            queue: [(ts(2), Identifier::new("KTLX20240101_000200_V06".to_string()))]
+                .into_iter()
+                .collect(),
+        });
         mgr.add_spawned(2);
+        assert!(!mgr.is_pane_done(0), "precondition: pane 0 has a download queued");
 
         mgr.clear_all();
 
         assert!(!mgr.is_cached("KTLX", &ts(0)));
         assert!(!mgr.is_cached("KOUN", &ts(0)));
         assert!(!mgr.is_in_flight("KTLX", &ts(1)));
+        assert!(mgr.is_pane_done(0), "and no pane is still owed a download");
+        assert!(
+            mgr.pending_pane_indices().is_empty(),
+            "with no queue entry left behind to be dispatched after the switch"
+        );
         assert_eq!(mgr.available_slots(4), 4);
     }
 }
