@@ -909,9 +909,25 @@ mod loop_pane_tests {
         RadarSite { name, lat, lon, elev: None }
     }
 
-    /// A pane showing `site`'s scan at `timestamp`.
+    /// The site every `pane_showing` pane has already switched *to*, and whose scan
+    /// has not landed yet. Deliberately not a site any test here builds a loop from.
+    const SWITCHED_TO: &str = "KFWS";
+
+    /// A pane showing `site`'s scan at `timestamp`, with its live `site` field
+    /// already moved on to [`SWITCHED_TO`].
+    ///
+    /// That divergence is the window `begin_loop_for_pane`'s own doc describes: the
+    /// pane's `site` field changes the instant the user picks a new radar, while
+    /// `scan_info` still holds the previous site's scan until the new one loads. The
+    /// loop must be built from the `scan_info` — the one place where the code, the
+    /// coordinates and the timestamp all come from the same radar.
+    ///
+    /// Handing the pane a `site` equal to `scan_info.site.name` would make the two
+    /// interchangeable, and every assertion below would hold just as well for a
+    /// `begin_loop_for_pane` that read the wrong one.
     fn pane_showing(site: RadarSite, timestamp: NaiveDateTime) -> PaneState {
-        let mut pane = PaneState::with_site(site.name.to_string());
+        assert_ne!(site.name, SWITCHED_TO, "the fixture's divergence must be real");
+        let mut pane = PaneState::with_site(SWITCHED_TO.to_string());
         pane.scan_info = Some(ScanInfo {
             site,
             timestamp,
@@ -949,9 +965,15 @@ mod loop_pane_tests {
         ];
         let mut mgr = LoopDownloadManager::new();
 
+        assert_eq!(panes[1].site, SWITCHED_TO, "precondition: pane 1's live site has already moved");
+
         let req = begin_loop_for_pane(&mut panes, &mut mgr, 1, 600).expect("pane 1 has a scan");
 
-        assert_eq!(req.site, "KOUN", "the listing must be requested for pane 1's site");
+        // Pane 1's *scan_info* site, which is neither the active pane's site nor its
+        // own live `site` field. Both are in reach at the listing site and both are
+        // wrong: the identifiers this listing returns are cached and projected with
+        // the coordinates that came out of the same `scan_info`.
+        assert_eq!(req.site, "KOUN", "the listing must be requested for pane 1's loaded scan's site");
         assert_eq!(
             req.end,
             ts(25),
