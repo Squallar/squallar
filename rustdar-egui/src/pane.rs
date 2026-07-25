@@ -294,10 +294,12 @@ impl LoopPlaybackState {
     ///   target and marks it again, so the older render's result arrives to a frame
     ///   that *is* in flight. Comparing the target catches it, and a late result that
     ///   still matches the current target is safe to apply: the target fixes every
-    ///   render input except the scan, and the scan for a given timestamp does not
-    ///   change under a live loop, so the pending render would produce the same image.
-    ///   (What the target cannot vouch for is the scan *itself* being this loop's —
-    ///   see [`RenderTarget`].)
+    ///   render input except the scan, and the scan for a given `(site, timestamp)`
+    ///   does not change under a live loop, so the pending render would produce the
+    ///   same image. That qualifier is load-bearing rather than pedantic — the cache is
+    ///   keyed on timestamp alone and `cache_scan` inserts unconditionally, so a second
+    ///   site's scan at a colliding timestamp overwrites the first. See
+    ///   [`RenderTarget`] for why this key cannot see that.
     /// - The frame is not expecting a result at all: the frame list was rebuilt, the
     ///   graphics state was cleared, or a sibling pane already supplied the texture.
     ///
@@ -1135,6 +1137,37 @@ mod tests {
         );
     }
 
+    /// The donor mirror of `a_textured_frame_does_not_accept_a_broadcast`, and the
+    /// guard is load-bearing in a way that does not announce itself: offering an
+    /// untextured frame makes the dispatcher queue a clone and skip its own render,
+    /// the clone then finds no texture to copy, and the frame ends up untextured, not
+    /// in flight and not failed — which `render_set_settled` scores as unsettled, so
+    /// the loop never reaches `Ready`. It cannot self-correct either, because a donor
+    /// frame outside the donor's own render set is never rendered, so the empty offer
+    /// repeats every pass. Exactly the "served by neither" failure the paired donor
+    /// and acceptance tests exist to prevent.
+    #[test]
+    fn an_untextured_frame_is_not_donatable() {
+        let ctx = egui::Context::default();
+        let mut donor = loop_with_frames(3, 0);
+        donor.retarget_renders(RadarProduct::Reflectivity, 0.5);
+        let current = target(SITE, RadarProduct::Reflectivity, 0.5);
+        let frame_ts = donor.frames[0].timestamp;
+
+        assert_eq!(
+            donor.frame_donatable_to(frame_ts, &current),
+            None,
+            "a blank frame has nothing to give"
+        );
+        // Being mid-render is not having an image either.
+        donor.frames[0].render_in_flight = true;
+        assert_eq!(donor.frame_donatable_to(frame_ts, &current), None);
+
+        donor.frames[0].render_in_flight = false;
+        donor.frames[0].texture = Some(dummy_texture(&ctx));
+        assert_eq!(donor.frame_donatable_to(frame_ts, &current), Some(0));
+    }
+
     /// A frame that already has an image gains nothing from an identical one, and
     /// overwriting it churns texture handles.
     #[test]
@@ -1196,6 +1229,41 @@ mod tests {
         // The mark was cleared on frame 2, not on the other frame with this timestamp.
         assert!(!state.frames[2].render_in_flight);
         assert_eq!(state.frame_awaiting_render_result(shared, &current), None);
+    }
+
+    /// The broadcast half of the same property. This is the accessor the response path
+    /// actually calls, and duplicate timestamps are no more structurally prevented for
+    /// it than for the render-result accessor.
+    #[test]
+    fn the_broadcast_accessor_hands_back_the_frame_that_was_chosen() {
+        let ctx = egui::Context::default();
+        let mut state = loop_with_frames(3, 0);
+        state.retarget_renders(RadarProduct::Reflectivity, 0.5);
+        let current = target(SITE, RadarProduct::Reflectivity, 0.5);
+
+        // Two frames at one timestamp, the first already textured — so the frame that
+        // may take a broadcast is the *second*, not the one a plain lookup would reach.
+        let shared = state.frames[0].timestamp;
+        state.frames[2].timestamp = shared;
+        state.frames[0].texture = Some(dummy_texture(&ctx));
+
+        assert_eq!(
+            state.frames.iter().position(|f| f.timestamp == shared),
+            Some(0),
+            "precondition: a timestamp-only lookup lands on the textured frame"
+        );
+        assert_eq!(state.frame_accepting_broadcast(shared, &current), Some(2));
+
+        let frame = state
+            .frame_accepting_broadcast_mut(shared, &current)
+            .expect("frame handed back");
+        frame.texture = Some(dummy_texture(&ctx));
+        assert!(state.frames[2].texture.is_some(), "frame 2 received the texture");
+        assert_eq!(
+            state.frame_accepting_broadcast(shared, &current),
+            None,
+            "and nothing at this timestamp wants another"
+        );
     }
 
     /// Elevation is still compared with tolerance, and the site exactly.

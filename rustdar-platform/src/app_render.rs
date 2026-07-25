@@ -982,15 +982,12 @@ impl super::App {
                 // keyed to the same target. Same test the response-path broadcast
                 // applies, so the two cannot disagree about who may serve this frame.
                 if sync {
-                    let donor = (0..pane_count)
-                        .filter(|&s| s != pane_idx)
-                        .find_map(|sibling_idx| {
-                            let sibling = self.gui.pane(sibling_idx)?;
-                            let src_frame = sibling
-                                .loop_state
-                                .frame_donatable_to(frame.timestamp, &target)?;
-                            Some((sibling_idx, src_frame))
-                        });
+                    let donor = find_donor(
+                        (0..pane_count).filter_map(|i| self.gui.pane(i).map(|p| (i, &p.loop_state))),
+                        pane_idx,
+                        frame.timestamp,
+                        &target,
+                    );
                     if let Some((src_pane, src_frame)) = donor {
                         to_clone.push(LoopCloneRequest {
                             dest_pane: pane_idx,
@@ -1076,12 +1073,7 @@ impl super::App {
                 req.pane_idx,
                 req.timestamp,
                 scan_arc,
-                &crate::render_dispatch::RenderParams {
-                    product: req.target.product,
-                    elevation: req.snapped,
-                    lat: req.site_lat,
-                    lon: req.site_lon,
-                },
+                &req.render_params(),
                 req.target,
             );
 
@@ -1097,13 +1089,34 @@ struct LoopRenderRequest {
     pane_idx: usize,
     frame_idx: usize,
     timestamp: chrono::NaiveDateTime,
-    /// The pane's render target: site plus *selected* product and elevation.
+    /// The pane's render target: site plus *selected* product and elevation. What the
+    /// result is keyed on — never what the renderer is given. See `render_params`.
     target: RenderTarget,
     /// `target.elevation` resolved to a sweep angle this frame's own scan carries.
-    /// This is what the renderer is handed; the target is what the result is keyed on.
     snapped: f32,
     site_lat: f64,
     site_lon: f64,
+}
+
+impl LoopRenderRequest {
+    /// The inputs the renderer is handed.
+    ///
+    /// `elevation` is the *snapped* sweep angle, never `target.elevation`. The two are
+    /// adjacent and both plausible, so the choice is made here once and asserted in
+    /// tests rather than re-made at the call site. They are not interchangeable:
+    /// `find_closest_elevation` returns the nearest sweep in this frame's own scan,
+    /// which can sit arbitrarily far from the selection, while `find_sweep` only
+    /// matches within 0.05°. Passing the selection would return `None` for every frame
+    /// whose nearest sweep is further away than that — an empty response, and a frame
+    /// retired as unrenderable that renders perfectly well.
+    fn render_params(&self) -> crate::render_dispatch::RenderParams {
+        crate::render_dispatch::RenderParams {
+            product: self.target.product,
+            elevation: self.snapped,
+            lat: self.site_lat,
+            lon: self.site_lon,
+        }
+    }
 }
 
 /// A loop frame that a sibling pane's already-rendered texture can satisfy.
@@ -1114,6 +1127,30 @@ struct LoopCloneRequest {
     src_frame: usize,
 }
 
+/// The `(pane, frame)` that can serve `timestamp` for a pane keyed to `target`
+/// without a new render, or `None` if nobody can.
+///
+/// `target` is the *receiver's* — the one pane whose frame is being filled — and it is
+/// the only one in scope here on purpose. Every candidate is asked about that same
+/// target. Asking a candidate about its own `rendered_for` instead would compare it to
+/// itself and always agree, which is precisely how a loop on one site comes to donate
+/// to a loop on another; taking one target for all candidates makes that mis-wiring
+/// unrepresentable rather than merely wrong.
+///
+/// `receiver` is skipped: a pane cannot serve itself, and the frame being filled is by
+/// definition untextured.
+fn find_donor<'a>(
+    loops: impl IntoIterator<Item = (usize, &'a rustdar_egui::pane::LoopPlaybackState)>,
+    receiver: usize,
+    timestamp: chrono::NaiveDateTime,
+    target: &RenderTarget,
+) -> Option<(usize, usize)> {
+    loops
+        .into_iter()
+        .filter(|&(idx, _)| idx != receiver)
+        .find_map(|(idx, ls)| Some((idx, ls.frame_donatable_to(timestamp, target)?)))
+}
+
 /// Whether `queued` already covers a render for `timestamp` at `target`.
 ///
 /// Suppressing a pane's own render here is a promise that the queued render's result
@@ -1122,9 +1159,16 @@ struct LoopCloneRequest {
 /// included. A site-blind check suppresses the render of a pane the broadcast will
 /// then refuse, and the frame is served by neither path.
 ///
-/// `snapped` is compared as well: two loops on the same target can still resolve the
-/// selection to different sweeps if their scans for this timestamp differ, and those
-/// are different images.
+/// `snapped` is compared as well, which is strictly stronger than what
+/// `frame_accepting_broadcast` tests — it does not look at the sweep at all. That
+/// asymmetry is safe only in this direction: suppression implies acceptance, never the
+/// reverse. Two loops on the same target cannot currently resolve the selection to
+/// different sweeps, because the scan cache is keyed on timestamp alone and hands both
+/// of them the same `Arc<Scan>`. If that key ever gains a site — the fix this file's
+/// `RenderTarget` docs point at — the hole is the *broadcast*, not this: it would hand
+/// over a differently-snapped image, drop the receiver's own in-flight render as
+/// redundant, and leave the wrong sweep in place permanently. Whoever re-keys the
+/// cache has to give `frame_accepting_broadcast` a sweep comparison in the same change.
 fn render_already_queued(
     queued: &[LoopRenderRequest],
     timestamp: chrono::NaiveDateTime,
@@ -1134,13 +1178,15 @@ fn render_already_queued(
     queued.iter().any(|r| {
         r.timestamp == timestamp
             && r.target.matches(target)
-            && (r.snapped - snapped).abs() < ELEVATION_TOLERANCE
+            && (r.snapped - snapped).abs() <= ELEVATION_TOLERANCE
     })
 }
 
 #[cfg(test)]
 mod loop_dispatch_tests {
     use super::*;
+    use rustdar_egui::pane::{LoopFrame, LoopPhase, LoopPlaybackState};
+    use rustdar_radar::sites::RadarSite;
     use rustdar_radar::types::RadarProduct;
 
     fn ts(minute: u32) -> chrono::NaiveDateTime {
@@ -1152,6 +1198,36 @@ mod loop_dispatch_tests {
 
     fn target(site: &str, elevation: f32) -> RenderTarget {
         RenderTarget::new(site, RadarProduct::Reflectivity, elevation)
+    }
+
+    /// A loop on `site` with three frames, retargeted to Reflectivity at 0.5, and
+    /// with `textured` already rendered.
+    fn loop_on(ctx: &egui::Context, site: &'static str, textured: &[usize]) -> LoopPlaybackState {
+        let mut ls = LoopPlaybackState::new_for_loop(
+            3600,
+            &RadarSite { name: site, lat: 35.0, lon: -97.0, elev: None },
+        );
+        ls.phase = LoopPhase::Rendering;
+        ls.frames = (0..3)
+            .map(|i| LoopFrame {
+                timestamp: ts(i),
+                texture: None,
+                render_in_flight: false,
+                render_failed: false,
+            })
+            .collect();
+        ls.retarget_renders(RadarProduct::Reflectivity, 0.5);
+        for &i in textured {
+            let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
+            ls.frames[i].texture = Some(rustdar_egui::pane::RadarImageData {
+                texture: ctx.load_texture("test", image, egui::TextureOptions::NEAREST),
+                lat: 35.0,
+                lon: -97.0,
+                max_range_km: 100.0,
+                value_data: Arc::new(Vec::new()),
+            });
+        }
+        ls
     }
 
     fn queued(target: RenderTarget, timestamp: chrono::NaiveDateTime, snapped: f32) -> LoopRenderRequest {
@@ -1202,5 +1278,61 @@ mod loop_dispatch_tests {
         let q = vec![queued(target("KTLX", 0.5), ts(0), 0.48)];
         let velocity = RenderTarget::new("KTLX", RadarProduct::Velocity, 0.5);
         assert!(!render_already_queued(&q, ts(0), &velocity, 0.48));
+    }
+
+    /// The wiring the donor search exists to get right: every candidate is judged
+    /// against the *receiver's* target. Judging each against its own would compare it
+    /// to itself, always agree, and put a KTLX image into a KOUN loop.
+    #[test]
+    fn a_donor_is_judged_against_the_receiving_panes_target() {
+        let ctx = egui::Context::default();
+        let ktlx = loop_on(&ctx, "KTLX", &[1]);
+        let koun = loop_on(&ctx, "KOUN", &[]);
+        let loops = [(0usize, &ktlx), (1usize, &koun)];
+
+        // Pane 1 (KOUN) asks. Pane 0 has the frame textured, but on another site.
+        assert_eq!(
+            find_donor(loops, 1, ts(1), koun.rendered_for.as_ref().unwrap()),
+            None,
+            "a KTLX loop must not serve a KOUN loop"
+        );
+        // The same candidate judged against its own target would have agreed.
+        assert_eq!(
+            find_donor(loops, 1, ts(1), ktlx.rendered_for.as_ref().unwrap()),
+            Some((0, 1)),
+            "precondition: only the target argument distinguishes these"
+        );
+    }
+
+    #[test]
+    fn a_donor_on_the_same_target_is_found_and_never_the_receiver_itself() {
+        let ctx = egui::Context::default();
+        let a = loop_on(&ctx, "KTLX", &[2]);
+        let b = loop_on(&ctx, "KTLX", &[]);
+        let loops = [(0usize, &a), (1usize, &b)];
+        let want = b.rendered_for.as_ref().unwrap();
+
+        assert_eq!(find_donor(loops, 1, ts(2), want), Some((0, 2)));
+        // Pane 0 asking for the same frame is not offered its own texture.
+        assert_eq!(find_donor(loops, 0, ts(2), want), None);
+        // Nobody has a frame at this timestamp textured.
+        assert_eq!(find_donor(loops, 1, ts(0), want), None);
+    }
+
+    /// `target.elevation` is the pane's selection; `snapped` is the sweep this frame's
+    /// scan actually carries. `find_sweep` only matches within 0.05°, so handing the
+    /// renderer the selection retires every frame whose nearest sweep is further away.
+    #[test]
+    fn the_renderer_is_given_the_snapped_sweep_not_the_selection() {
+        // A selection of 0.5 that snapped to a 1.4° sweep — well outside find_sweep's
+        // 0.05° window, so the two are not interchangeable.
+        let req = queued(target("KTLX", 0.5), ts(0), 1.4);
+        let params = req.render_params();
+
+        assert_eq!(params.elevation, 1.4, "the sweep the scan carries");
+        assert_ne!(params.elevation, req.target.elevation);
+        assert_eq!(params.product, RadarProduct::Reflectivity);
+        assert_eq!(params.lat, 35.0);
+        assert_eq!(params.lon, -97.0);
     }
 }
