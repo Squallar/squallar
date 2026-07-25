@@ -53,31 +53,20 @@ jobs:
               -p nexrad-level3 -p rustdar-units -p rustdar-gps -p rustdar-radar
               -p rustdar-overlays -p rustdar-egui -p rustdar-frontend -p rustdar-web
 
-          # `check` and scoped: there is no iOS entry-point crate, so nothing
-          # links. rustdar-frontend still pulls the portable stack and carries
-          # the `mobile` cfg iOS takes its memory budget from. On macOS because
-          # `ring` compiles C and cc-rs shells out to `xcrun`.
-          - name: iOS aarch64
-            runner: macos-15
-            target: aarch64-apple-ios
-            cmd: cargo check -p rustdar-frontend --lib --target aarch64-apple-ios
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
         shell: bash
-        # rust-toolchain.toml is the source of truth; `rustup show` materialises
-        # it. Asserted against `target list --installed`, not
-        # `rustc --print target-list` -- the latter names uninstalled triples,
-        # so a missing one would surface later as "can't find crate for `std`".
+        # No `rustup target list --installed` assertion here: next to a
+        # `rustup target add` it could only fire on a typo that `add` already
+        # rejects. The container rows assert instead, where nothing adds the
+        # target and the check is really about what the image ships.
         run: |
           set -euo pipefail
           rustup show active-toolchain || rustup toolchain install
+          rustup target add '${{ matrix.target }}'
           rustup show
-          if ! rustup target list --installed | grep -qx '${{ matrix.target }}'; then
-            echo "::error::target ${{ matrix.target }} is not installed. Add it to the targets list in rust-toolchain.toml."
-            exit 1
-          fi
 
       # serialport links libudev on Linux only; `apt-get` does not exist on the
       # other two runners.
@@ -87,22 +76,61 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libudev-dev
 
-      # The target is part of the key: registry contents differ per target, so a
-      # single key had every row racing to save one incomplete entry.
-      - name: Cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-${{ matrix.target }}-
-            ${{ runner.os }}-cargo-
+          key: ${{ matrix.target }}
 
       - name: ${{ matrix.cmd }}
         shell: bash
         run: ${{ matrix.cmd }}
+
+  # iOS, in the rust-cross container on a Linux runner.
+  #
+  # `check` and scoped to rustdar-frontend: there is no iOS entry-point crate,
+  # so nothing links. rustdar-frontend still pulls the portable stack and
+  # carries the `mobile` cfg iOS takes its memory budget from.
+  #
+  # The image supplies the iPhoneOS SDK (IOS_SDKROOT=/opt/ios-sdk/iPhoneOS.sdk),
+  # the `arm64-apple-ios-clang` wrapper and
+  # CARGO_TARGET_AARCH64_APPLE_IOS_LINKER, which is what `ring`'s build script
+  # needs -- on a bare Linux runner it fails looking for `xcrun`. This replaces
+  # a macos-15 row that GitHub bills at 10x.
+  ios:
+    name: iOS aarch64
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/usa-reddragon/rust-cross:1.94.1@sha256:9828c3887547d0c20f216084e8bf3f4a39b05c93ff3ac07d6f527acaa9dcb312
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Use the image's toolchain
+        shell: bash
+        # rust-toolchain.toml says `channel = "stable"`. Obeying that here would
+        # make rustup fetch a *different* toolchain, which has none of the
+        # image's preinstalled targets -- the whole point of the container.
+        # RUSTUP_TOOLCHAIN overrides the file. Read from the image's own
+        # RUST_VERSION so an image bump carries itself.
+        run: |
+          set -euo pipefail
+          echo "RUSTUP_TOOLCHAIN=${RUST_VERSION:?the rust-cross image must set RUST_VERSION}" >> "$GITHUB_ENV"
+      - name: Assert the image still ships the iOS target and SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup show
+          if ! rustup target list --installed | grep -qx aarch64-apple-ios; then
+            echo "::error::the rust-cross image no longer ships aarch64-apple-ios std."
+            exit 1
+          fi
+          if [ ! -d "${IOS_SDKROOT:-}" ]; then
+            echo "::error::IOS_SDKROOT='${IOS_SDKROOT:-}' is not a directory; the image no longer carries the iPhoneOS SDK."
+            exit 1
+          fi
+          echo "ok: target installed, SDK at ${IOS_SDKROOT}"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: aarch64-apple-ios
+      - name: cargo check (aarch64-apple-ios)
+        run: cargo check -p rustdar-frontend --lib --target aarch64-apple-ios
 
   # The web deliverable. `cargo check --target wasm32-unknown-unknown` is not a
   # web gate: binding generation is a step cargo never runs, and that is where
@@ -116,20 +144,29 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
-        run: rustup show
-      # `~/.cargo/bin` and the install ledger are cached so `cargo install`
-      # below is a no-op on a hit instead of a source build.
-      - name: Cache cargo
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
+      # Only what rust-cache does not do: it deliberately leaves `~/.cargo/bin`
+      # alone (it strips rustup shims), so the `cargo install` below would
+      # rebuild from source every run without this.
+      #
+      # The key is job-specific. It used to be the same
+      # `<os>-cargo-wasm32-unknown-unknown-<lock>` as the matrix's wasm row,
+      # which does not cache `~/.cargo/bin` -- whichever job saved first defined
+      # the entry, so this one could restore a bin-less cache and pay the full
+      # wasm-pack build anyway.
+      - name: Cache cargo-installed binaries
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
             ~/.cargo/bin
             ~/.cargo/.crates.toml
             ~/.cargo/.crates2.json
-          key: ${{ runner.os }}-cargo-wasm32-unknown-unknown-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-wasm32-unknown-unknown-
+          key: ${{ runner.os }}-cargobin-web-bundle-wasm-pack-0.15
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: web-bundle
       - name: Install wasm-pack
         run: cargo install wasm-pack --locked --version ^0.15
 
@@ -165,6 +202,31 @@ jobs:
           test -f dist/sw.js
           test -f dist/manifest.webmanifest
 
+      # `cache.addAll` is all-or-nothing, so one shell path missing from the
+      # artifact means the worker never installs and the site is silently not a
+      # PWA. `pwa_assets.rs` checks SHELL_PATHS against the source tree; this
+      # checks the staged tree, which is what actually ships -- a new top-level
+      # asset would pass there and fail here.
+      - name: Assert the service worker's shell list is all staged
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, sys
+          src = open("rustdar-web/sw.js").read()
+          m = re.search(r"const SHELL_PATHS = \[(.*?)\];", src, re.S)
+          if not m:
+              sys.exit("::error::could not parse SHELL_PATHS out of rustdar-web/sw.js")
+          paths = re.findall(r'"([^"]*)"', m.group(1))
+          if len(paths) < 2:
+              sys.exit("::error::SHELL_PATHS parsed as near-empty (%d entries); the parse is wrong or the list was gutted" % len(paths))
+          missing = [p for p in paths
+                     if not os.path.isfile(os.path.join("dist", p or "index.html"))]
+          if missing:
+              sys.exit("::error::the service worker precaches paths that are not in the artifact: %s" % ", ".join(missing))
+          print("ok: all %d SHELL_PATHS entries are staged" % len(paths))
+          PY
+
       # A project Pages site is served from a subpath, so a root-absolute
       # reference works under `python3 -m http.server` and 404s in production.
       - name: Reject absolute asset paths
@@ -189,39 +251,44 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
         run: rustup show
-      - name: Cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-android-jni-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-android-jni-
+          key: android-jni
 
-      # This job is worthless unless the crate body actually compiles here, and
+      # This job is worthless unless the JNI code actually compiles here, and
       # every cheaper way of checking that is fakeable. `cargo tree` reads
       # manifests and never opens a source file. Grepping the `#![cfg(...)]` for
-      # the feature name passes for `all(...)`, for
-      # `not(feature = "jni-typecheck")`, and for the name appearing in a
-      # trailing comment -- each of which compiles nothing -- and fails on a
-      # correct cfg reformatted across lines, because grep is line-oriented and
-      # the attribute is not.
+      # the feature name passes for `all(...)` and for `not(feature = ...)`,
+      # both of which compile nothing, and fails on a correct cfg reformatted
+      # across lines.
       #
-      # So compile it and require a `compile_error!` to fire. No cfg spelling
-      # can fake that.
-      - name: Assert the crate body compiles on this host
+      # So compile it and require a `compile_error!` to fire. The canary goes
+      # *inside a JNI helper body*, not at end of file: at EOF it only proves
+      # the crate root opened, and re-gating all the helpers back to
+      # `#[cfg(target_os = "android")]` -- the exact shape this job exists to
+      # catch -- leaves the file compiling with the whole JNI layer gone while
+      # an EOF canary still fires.
+      - name: Assert the JNI layer compiles on this host
         shell: bash
         run: |
           set -euo pipefail
           root=rustdar-android/src/lib.rs
+          anchor='fn has_location_permission() -> bool {'
+          if ! grep -qF "$anchor" "$root"; then
+            echo "::error::canary anchor not found in ${root}: '${anchor}'. Repoint it at another JNI helper body -- it must sit inside code only the JNI layer compiles."
+            exit 1
+          fi
           cp "$root" "$root.orig"
           trap 'mv -f "$root.orig" "$root"' EXIT
-          printf '\ncompile_error!("rustdar jni-typecheck canary");\n' >> "$root"
+          awk -v a="$anchor" '
+            { print }
+            !done && index($0, a) { print "    compile_error!(\"rustdar jni-typecheck canary\");"; done = 1 }
+          ' "$root.orig" > "$root"
           out="$(cargo check -p rustdar-android --features jni-typecheck 2>&1 || true)"
           if printf '%s' "$out" | grep -q 'rustdar jni-typecheck canary'; then
-            echo "ok: the canary fired, so the crate body is compiled on this host"
+            echo "ok: the canary fired, so the JNI layer is compiled on this host"
           else
-            echo "::error::a compile_error! appended to ${root} did not fire, so this job type-checks none of it. The crate-level #![cfg(...)] no longer opens under the jni-typecheck feature, or the feature no longer supplies the host deps."
+            echo "::error::a compile_error! placed inside has_location_permission did not fire, so this job type-checks none of the JNI layer. Either the crate-level #![cfg(...)] no longer opens under jni-typecheck, or the helpers have been re-gated behind #[cfg(target_os = \"android\")]."
             printf '%s\n' "$out"
             exit 1
           fi
@@ -237,9 +304,15 @@ jobs:
   # path. `build`, not `check`, and `-P 28` must track minSdk: at the default
   # platform level the sysroot lacks symbols the graphics/JNI stack links
   # against, so a check there can pass while Gradle fails.
+  #
+  # In the rust-cross container: it ships the NDK (ANDROID_NDK_ROOT), cargo-ndk
+  # and both android stds, which removes a `cargo install cargo-ndk` from every
+  # run and the dance of discovering the runner's NDK path.
   android:
     name: Android ${{ matrix.abi }}
     runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/usa-reddragon/rust-cross:1.94.1@sha256:9828c3887547d0c20f216084e8bf3f4a39b05c93ff3ac07d6f527acaa9dcb312
     strategy:
       fail-fast: false
       matrix:
@@ -250,36 +323,36 @@ jobs:
             target: x86_64-linux-android
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Rust
-        run: rustup show
+      - name: Use the image's toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "RUSTUP_TOOLCHAIN=${RUST_VERSION:?the rust-cross image must set RUST_VERSION}" >> "$GITHUB_ENV"
       - name: Install system deps
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libudev-dev
-      - name: Cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+          apt-get update
+          apt-get install -y --no-install-recommends libudev-dev
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-${{ matrix.target }}-
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked --version ^4
+          key: ${{ matrix.target }}
       - name: cargo ndk build (${{ matrix.abi }})
         shell: bash
         run: |
           set -euo pipefail
-          # Read in the shell: GitHub's `env` context does not carry runner OS
-          # variables, so `${{ env.ANDROID_NDK_LATEST_HOME }}` expands to empty.
-          export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_ROOT:-}}}"
           # Hard failure, never a skip: a silently-skipped cross-compile reads
-          # as coverage on the PR page while verifying nothing.
-          if [ -z "$ANDROID_NDK_HOME" ] || [ ! -d "$ANDROID_NDK_HOME" ]; then
-            echo "::error::No Android NDK on this runner (ANDROID_NDK_HOME='${ANDROID_NDK_HOME}'). Refusing to pass without cross-compiling."
+          # as coverage on the PR page while verifying nothing. Inside the
+          # container these are the image's own guarantees, so this fails if an
+          # image change quietly drops one rather than degrading to a no-op.
+          if [ ! -d "${ANDROID_NDK_HOME:-}" ]; then
+            echo "::error::ANDROID_NDK_HOME='${ANDROID_NDK_HOME:-}' is not a directory; the rust-cross image no longer carries the NDK."
+            exit 1
+          fi
+          if ! command -v cargo-ndk >/dev/null; then
+            echo "::error::cargo-ndk is not on PATH; the rust-cross image no longer ships it."
+            exit 1
+          fi
+          if ! rustup target list --installed | grep -qx '${{ matrix.target }}'; then
+            echo "::error::the rust-cross image no longer ships ${{ matrix.target }} std."
             exit 1
           fi
           echo "Using NDK at $ANDROID_NDK_HOME"
@@ -361,14 +434,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libudev-dev
-      - name: Cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-standalone-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: standalone
       - name: Build each workspace member alone
         shell: bash
         run: |
@@ -413,199 +481,6 @@ jobs:
           done
           exit "$fail"
 
-  # Clippy and Test live here, not in workflows of their own, so `deploy-pages`
-  # can reach them through `build-success`. `workflow_run` is the only
-  # cross-workflow mechanism and it does not inherit the triggering run's
-  # conclusion without extra plumbing. Job names are unchanged, so the existing
-  # required contexts still resolve.
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - name: Generate GitHub App Token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        id: app-token
-        with:
-          client-id: ${{ secrets.AUTO_COMMIT_APP_ID }}
-          private-key: ${{ secrets.AUTO_COMMIT_APP_KEY }}
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          token: ${{ steps.app-token.outputs.token }}
-      - name: Install Rust
-        run: rustup show
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libudev-dev
-      - name: Cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-clippy-
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked --version ^4
-      - name: Apply Clippy autofixes
-        run: cargo clippy --all-targets --all-features --fix || true
-
-      # The gate on the autofix: nothing below runs if these fail, including the
-      # commit and push. This bot pushes straight to main and previously
-      # committed unconditionally, re-running clippy only afterwards.
-      #
-      # The cross arms are checked too. `--fix` only sees the host cfg arms but
-      # edits shared source the Android and wasm arms also compile, so a
-      # "redundant" clone it drops can break a call site behind
-      # `#[cfg(target_os = "android")]` invisibly.
-      - name: Verify the autofixed tree still builds (host)
-        run: cargo build --workspace --all-targets --all-features
-      - name: Verify the autofixed tree still builds (wasm32)
-        run: cargo check -p rustdar-web --lib --target wasm32-unknown-unknown
-      - name: Verify the autofixed tree still builds (Android arm64-v8a)
-        shell: bash
-        run: |
-          set -euo pipefail
-          export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_ROOT:-}}}"
-          if [ -z "$ANDROID_NDK_HOME" ] || [ ! -d "$ANDROID_NDK_HOME" ]; then
-            echo "::error::No Android NDK on this runner. Refusing to auto-commit a tree whose Android arm was never compiled."
-            exit 1
-          fi
-          cargo ndk -t arm64-v8a -P 28 check -p rustdar-android --lib
-
-      - uses: stefanzweifel/git-auto-commit-action@4a55954c782fc1ea30b9056cd3e7a2b40ca8887d # v7.2.0
-        with:
-          commit_message: "chore: Apply clippy fixes"
-          commit_user_name: usa-reddragon-auto-commit[bot]
-          commit_user_email: 234130638+github-actions[bot]@users.noreply.github.com
-          commit_author: "usa-reddragon-auto-commit[bot] <234130638+github-actions[bot]@users.noreply.github.com>"
-
-      # `-D warnings` goes here and not on the `--fix` step, so the bot still
-      # autofixes what it can and the build fails only on the rest. This is also
-      # what makes `unexpected_cfgs` load-bearing: a build script that stopped
-      # emitting the `mobile` cfg produced warnings nobody failed on, and
-      # Android and iOS silently took desktop memory budgets.
-      #
-      # Gap: this is the host cfg. The Android target has no lint gate, and
-      # `cargo ndk clippy` reports 3 warnings from arms only Android compiles.
-      - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-  test:
-    name: Test
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      - name: Generate GitHub App Token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        id: app-token
-        with:
-          client-id: ${{ secrets.AUTO_COMMIT_APP_ID }}
-          private-key: ${{ secrets.AUTO_COMMIT_APP_KEY }}
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          token: ${{ steps.app-token.outputs.token }}
-          fetch-depth: 0
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libudev-dev
-      - name: Cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-      - name: Install Rust + llvm-tools
-        run: |
-          rustup show
-          rustup component add llvm-tools-preview
-          cargo install cargo-llvm-cov
-      - name: Run tests
-        run: cargo llvm-cov --no-report
-      - name: Generate coverage reports
-        if: always()
-        run: |
-          cargo llvm-cov report --lcov --output-path lcov.info
-          cargo llvm-cov report --html --output-dir coverage
-      - name: Upload HTML coverage report
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: coverage-html
-          path: coverage/html
-          retention-days: 14
-      - name: Comment coverage on pull request
-        if: always() && github.event_name == 'pull_request'
-        # Coverage is informational and never gates, so failing to report it
-        # must not turn the pull request red.
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          if [ ! -s lcov.info ]; then
-            echo "No coverage report was produced, skipping comment"
-            exit 0
-          fi
-          .github/scripts/coverage-summary.sh lcov.info > "$RUNNER_TEMP/current.tsv"
-          git diff --name-only "$BASE_SHA"...HEAD > "$RUNNER_TEMP/changed.txt"
-          .github/scripts/coverage-comment.sh \
-            "$RUNNER_TEMP/current.tsv" \
-            .github/coverage-baseline.tsv \
-            "$RUNNER_TEMP/changed.txt" > "$RUNNER_TEMP/comment.md"
-          gh pr comment "$PR" --body-file "$RUNNER_TEMP/comment.md" --edit-last --create-if-none
-
-      # Retried against a moving main. This workflow does not cancel superseded
-      # runs on main, so two can reach this step at once, and the ruleset
-      # forbids non-fast-forward -- losing the race means redoing the work.
-      #
-      # Reset-and-regenerate, not rebase. Both files are whole-file rewrites and
-      # a pure function of lcov.info, so two runs conflict on every line of both
-      # and a rebase aborts the step; regenerating on top of whatever main now
-      # holds always produces the right answer and cannot conflict.
-      #
-      # Untracked files survive `reset --hard`, so lcov.info persists.
-      - name: Update coverage badge and baseline
-        if: github.ref == 'refs/heads/main'
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name 'usa-reddragon-auto-commit[bot]'
-          git config user.email '234130638+github-actions[bot]@users.noreply.github.com'
-          for attempt in 1 2 3 4 5; do
-            git fetch --quiet origin main
-            git reset --quiet --hard FETCH_HEAD
-            .github/scripts/coverage-badge.sh lcov.info .github/badges/coverage.svg
-            .github/scripts/coverage-summary.sh lcov.info > .github/coverage-baseline.tsv
-            if git diff --quiet -- .github/badges/coverage.svg .github/coverage-baseline.tsv; then
-              echo "Coverage unchanged, nothing to commit"
-              exit 0
-            fi
-            git add .github/badges/coverage.svg .github/coverage-baseline.tsv
-            git commit --quiet -m 'chore: update coverage badge and baseline [skip ci]'
-            if git push --quiet origin HEAD:main; then
-              echo "pushed on attempt ${attempt}"
-              exit 0
-            fi
-            echo "push rejected on attempt ${attempt}; another run landed first, retrying"
-          done
-          echo "::error::could not land the coverage update after 5 attempts"
-          exit 1
-
   # The one required status check. `needs` on a matrix job covers all its rows.
   # `skipped` and `cancelled` count as failures: a job that did not run has
   # verified nothing. Adding a job above means adding it here.
@@ -615,13 +490,12 @@ jobs:
     runs-on: ubuntu-24.04
     needs:
       - build
+      - ios
       - web-bundle
       - android-jni-check
       - android
       - dep-unification
       - standalone
-      - clippy
-      - test
     steps:
       - name: Report job results
         shell: bash
@@ -636,9 +510,9 @@ jobs:
           exit 1
 
   # Deploys the artifact `web-bundle` uploaded in this same run; nothing is
-  # rebuilt. `needs: build-success` is what makes that safe -- build-success is
-  # `always()` and fails when any job above failed, so a failure anywhere skips
-  # this.
+  # rebuilt. `needs: build-success` covers every job in this workflow. Clippy
+  # and Test are separate workflows and cannot appear in `needs`, so they are
+  # gated by the check-run poll below.
   #
   # `push` to `main` only. A pull request must never publish: `pull_request`
   # runs for forks, and `pages: write` / `id-token: write` must not be reachable
@@ -650,6 +524,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      checks: read
       pages: write
       id-token: write
     environment:
@@ -661,14 +536,77 @@ jobs:
       group: pages
       cancel-in-progress: false
     steps:
-      # Required, not scaffolding: no Pages site exists yet and `deploy-pages`
-      # fails outright without one carrying `build_type: workflow`. Here rather
-      # than in `web-bundle` because enablement needs `pages: write` and
-      # `web-bundle` runs on pull requests including from forks.
-      - name: Enable and configure Pages
-        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
-        with:
-          enablement: true
+      # Fails closed four ways: a non-success conclusion, a check that never
+      # reported before the deadline, a check still running at the deadline, and
+      # any API error (`set -e` plus `gh` exiting non-zero).
+      #
+      # "never reported" is the case that matters. Testing `conclusion !=
+      # 'failure'` would pass for a check that does not exist, which is exactly
+      # what a deleted or renamed workflow looks like.
+      #
+      # Requires that Clippy and Test do not cancel on main -- see the
+      # concurrency block in each. A cancelled run concludes `cancelled` and
+      # blocks the deploy, which is correct but would fire constantly if bots
+      # kept superseding them.
+      - name: Require Clippy and Test to have passed on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(Clippy Test)
+          deadline=$(( $(date +%s) + 1800 ))
+          while :; do
+            runs="$(gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs" \
+              --jq '.check_runs[] | [.name, .status, (.conclusion // "")] | @tsv')"
+            pending=0
+            bad=0
+            for name in "${required[@]}"; do
+              line="$(printf '%s\n' "$runs" | awk -F'\t' -v n="$name" '$1==n' | tail -1)"
+              if [ -z "$line" ]; then
+                echo "waiting: '${name}' has not reported on ${SHA} yet"
+                pending=1
+                continue
+              fi
+              status="$(printf '%s' "$line" | cut -f2)"
+              conclusion="$(printf '%s' "$line" | cut -f3)"
+              if [ "$status" != "completed" ]; then
+                echo "waiting: '${name}' is ${status}"
+                pending=1
+              elif [ "$conclusion" != "success" ]; then
+                echo "::error::'${name}' concluded '${conclusion}' on ${SHA}. Refusing to publish."
+                bad=1
+              else
+                echo "ok: '${name}' succeeded"
+              fi
+            done
+            if [ "$bad" -eq 1 ]; then exit 1; fi
+            if [ "$pending" -eq 0 ]; then break; fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::timed out after 30m waiting for ${required[*]} to report on ${SHA}. Refusing to publish a build whose lint and test status is unknown."
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "Clippy and Test both succeeded on ${SHA}."
+
+      # Pages is enabled by hand, deliberately -- there is no
+      # `actions/configure-pages` here. Until it has been, `deploy-pages` fails
+      # on an opaque 404, so say what to do instead.
+      - name: Check Pages is enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh api "repos/${GITHUB_REPOSITORY}/pages" >/dev/null 2>&1; then
+            echo "::error::GitHub Pages is not enabled for ${GITHUB_REPOSITORY}. Enable it under Settings -> Pages with Source = GitHub Actions, then re-run this job. It is not enabled automatically."
+            exit 1
+          fi
+          echo "ok: Pages is enabled"
+
       - name: Deploy
         id: deployment
         uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

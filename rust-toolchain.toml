@@ -3,21 +3,11 @@
 channel = "stable"
 components = ["clippy"]
 
-# The cross-targets the Build matrix compiles. Listed here rather than as
-# `rustup target add` lines so a local checkout and CI agree by construction;
-# the matrix asserts each row's triple is installed before it builds.
+# No `targets` list. The Android and iOS rows build in the rust-cross container,
+# which ships those stds; the host rows `rustup target add` what they need.
+# Listing them here made every checkout materialise four cross stds, including
+# an iOS one no Linux developer can link against.
 #
-# Host triples are absent on purpose: each comes with the toolchain on the
-# machine that is that host, and naming them would make every macOS developer
-# fetch a Windows std.
-targets = [
-    # rustdar-web's cdylib.
-    "wasm32-unknown-unknown",
-    # `allAbis` in rustdar-android/android/app/build.gradle.kts. The rustup
-    # target is necessary but not sufficient -- anything pulling `ring` needs
-    # the NDK too.
-    "aarch64-linux-android",
-    "x86_64-linux-android",
-    # Needs the iPhoneOS SDK, so only buildable on macOS or an SDK container.
-    "aarch64-apple-ios",
-]
+# NB: container jobs set RUSTUP_TOOLCHAIN from the image's own RUST_VERSION to
+# override `channel` above -- obeying it there would fetch a different toolchain
+# that has none of the image's targets.
