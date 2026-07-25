@@ -100,5 +100,29 @@ pub struct GlmFlash {
     pub level: GlmDataLevel,
 }
 
+/// A satellite whose S3 listing came back with no objects whatsoever.
+///
+/// Distinct from "no flashes": the files themselves are absent, so the feed is
+/// gone rather than the sky being quiet. Carries the detail needed to make the
+/// report actionable without the reporting code having to re-derive it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadFeed {
+    pub satellite: GlmSatellite,
+    pub bucket: &'static str,
+    /// The S3 prefixes that were queried and returned nothing.
+    pub prefixes: Vec<String>,
+}
+
+/// What one GLM fetch produced.
+pub struct GlmFetchOutcome {
+    pub flashes: Vec<GlmFlash>,
+    /// Enabled satellites whose listing returned zero objects this poll.
+    ///
+    /// Reported by the handler rather than by the fetch itself, so that the
+    /// message can be edge-triggered against the previous poll instead of
+    /// repeating every 20 seconds.
+    pub dead_feeds: Vec<DeadFeed>,
+}
+
 /// Type-erased fetch result for GLM lightning data.
-pub struct GlmFetchResult(pub Result<Vec<GlmFlash>, String>);
+pub struct GlmFetchResult(pub Result<GlmFetchOutcome, String>);

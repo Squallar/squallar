@@ -5,7 +5,7 @@ use chrono::Utc;
 use rustdar_units::UserPreferences;
 
 use crate::glm::fetch::GlmCache;
-use crate::glm::{GlmDataLevel, GlmFetchResult, GlmFlash, GlmSatellite};
+use crate::glm::{DeadFeed, GlmDataLevel, GlmFetchResult, GlmFlash, GlmSatellite};
 use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
     PaneControlContextMut,
@@ -162,6 +162,13 @@ pub(crate) struct GlmHandler {
     pub show_flashes: bool,
     /// Cached S3 file data for incremental fetching.
     pub cache: Arc<std::sync::Mutex<GlmCache>>,
+    /// Satellites whose last listing returned no objects at all.
+    ///
+    /// Kept across polls so the log message can fire on the transition into and
+    /// out of the dead state rather than on every poll, and so the condition can
+    /// be shown in the control panel — a user who never reads logcat is exactly
+    /// the person the original year-long outage went unnoticed by.
+    dead_feeds: Vec<DeadFeed>,
 }
 
 impl GlmHandler {
@@ -175,7 +182,40 @@ impl GlmHandler {
             show_groups: true,
             show_flashes: true,
             cache: Arc::new(std::sync::Mutex::new(GlmCache::default())),
+            dead_feeds: Vec::new(),
         }
+    }
+
+    /// Log feed-liveness *changes* only.
+    ///
+    /// At a 20-second poll interval, warning unconditionally would emit ~180
+    /// identical lines per hour per satellite for as long as the outage lasts,
+    /// which is cry-wolf in a quieter register: correct, and ignored. Report the
+    /// edges instead — one warning when a feed goes dark, one recovery notice
+    /// when it comes back.
+    fn report_feed_changes(&mut self, current: Vec<DeadFeed>) {
+        for feed in &current {
+            if !self.dead_feeds.iter().any(|d| d.satellite == feed.satellite) {
+                log::warn!(
+                    "GLM: {} feed is dead — bucket '{}' returned no objects at all under \
+                     prefixes [{}]. Not a quiet sky: the files themselves are absent \
+                     (satellite rotated out of this slot?).",
+                    feed.satellite.display_name(),
+                    feed.bucket,
+                    feed.prefixes.join(", "),
+                );
+            }
+        }
+        for previous in &self.dead_feeds {
+            if !current.iter().any(|d| d.satellite == previous.satellite) {
+                log::info!(
+                    "GLM: {} feed recovered — bucket '{}' is returning objects again",
+                    previous.satellite.display_name(),
+                    previous.bucket,
+                );
+            }
+        }
+        self.dead_feeds = current;
     }
 
     /// Build the list of active data levels from the checkbox flags.
@@ -254,9 +294,11 @@ impl OverlayHandler for GlmHandler {
             return;
         };
         match fetch.0 {
-            Ok(flashes) => {
-                log::info!("Received {} GLM lightning flashes", flashes.len());
-                let items = flashes
+            Ok(outcome) => {
+                log::info!("Received {} GLM lightning flashes", outcome.flashes.len());
+                self.report_feed_changes(outcome.dead_feeds);
+                let items = outcome
+                    .flashes
                     .into_iter()
                     .enumerate()
                     .map(|(i, flash)| Arc::new(GlmFlashItem { flash, index: i }))
@@ -264,6 +306,8 @@ impl OverlayHandler for GlmHandler {
                 self.state.set_data(items);
             }
             Err(e) => {
+                // A failed fetch says nothing about feed liveness, so leave the
+                // previous verdict standing rather than reporting a recovery.
                 log::error!("GLM fetch failed: {e}");
             }
         }
@@ -414,6 +458,20 @@ impl OverlayHandler for GlmHandler {
                     format!("Updated {}m ago", secs / 60)
                 };
                 items.push(ControlItem::InfoText { text });
+            }
+
+            // The whole point of detecting a dead feed is that someone notices.
+            // Logs alone did not manage that for a year, so say it where the
+            // toggle lives: an empty map with no explanation is the failure mode
+            // being fixed.
+            for feed in &self.dead_feeds {
+                items.push(ControlItem::InfoText {
+                    text: format!(
+                        "\u{26a0} No data from {}: bucket '{}' is empty",
+                        feed.satellite.display_name(),
+                        feed.bucket,
+                    ),
+                });
             }
         }
 
@@ -579,5 +637,91 @@ mod tests {
                 "{level:?} must still display area, got rows {keys:?}"
             );
         }
+    }
+
+    fn dead_east() -> DeadFeed {
+        DeadFeed {
+            satellite: GlmSatellite::GoesEast,
+            bucket: "noaa-goes16",
+            prefixes: vec!["GLM-L2-LCFA/2026/206/02/".into()],
+        }
+    }
+
+    fn info_texts(handler: &GlmHandler) -> Vec<String> {
+        let ctx = PaneControlContext {
+            pane_idx: 0,
+            is_mobile: false,
+            pane_state: None,
+        };
+        handler
+            .controls(&ctx)
+            .into_iter()
+            .filter_map(|i| match i {
+                ControlItem::InfoText { text } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A dead feed must be visible without reading logs — that is the failure
+    /// mode the whole change exists to prevent.
+    #[test]
+    fn dead_feed_is_surfaced_in_the_control_panel() {
+        let mut handler = GlmHandler::new();
+        handler.enabled = true;
+        handler.report_feed_changes(vec![dead_east()]);
+
+        let texts = info_texts(&handler);
+        assert!(
+            texts.iter().any(|t| t.contains("noaa-goes16") && t.contains("GOES-19 (East)")),
+            "control panel should name the empty bucket, got {texts:?}"
+        );
+    }
+
+    #[test]
+    fn recovered_feed_clears_the_control_panel_notice() {
+        let mut handler = GlmHandler::new();
+        handler.enabled = true;
+        handler.report_feed_changes(vec![dead_east()]);
+        handler.report_feed_changes(Vec::new());
+
+        let texts = info_texts(&handler);
+        assert!(
+            !texts.iter().any(|t| t.contains("noaa-goes16")),
+            "notice should clear once the feed returns, got {texts:?}"
+        );
+    }
+
+    /// Edge-triggering is the point: repeated polls in the same state must not
+    /// accumulate, and re-entering the dead state must be reportable again.
+    #[test]
+    fn repeated_polls_do_not_accumulate_feed_state() {
+        let mut handler = GlmHandler::new();
+        handler.enabled = true;
+
+        for _ in 0..5 {
+            handler.report_feed_changes(vec![dead_east()]);
+        }
+        assert_eq!(handler.dead_feeds.len(), 1);
+        assert_eq!(info_texts(&handler).iter().filter(|t| t.contains("noaa-goes16")).count(), 1);
+
+        handler.report_feed_changes(Vec::new());
+        assert!(handler.dead_feeds.is_empty());
+
+        handler.report_feed_changes(vec![dead_east()]);
+        assert_eq!(handler.dead_feeds.len(), 1);
+    }
+
+    /// A failed fetch tells us nothing about liveness, so the previous verdict
+    /// must stand rather than being cleared into a false recovery.
+    #[test]
+    fn failed_fetch_leaves_feed_verdict_untouched() {
+        let mut handler = GlmHandler::new();
+        handler.enabled = true;
+        handler.report_feed_changes(vec![dead_east()]);
+
+        handler.apply_fetch_result(Box::new(GlmFetchResult(Err("network down".into()))));
+
+        assert_eq!(handler.dead_feeds, vec![dead_east()]);
     }
 }

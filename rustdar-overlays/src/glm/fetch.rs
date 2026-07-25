@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use chrono::{NaiveDateTime, TimeDelta, Utc};
 
-use super::{GlmDataLevel, GlmFlash, GlmSatellite};
+use super::{DeadFeed, GlmDataLevel, GlmFetchOutcome, GlmFlash, GlmSatellite};
 
 /// Cached GLM file data keyed by S3 object key.
 #[derive(Default, Clone)]
@@ -45,14 +45,19 @@ impl GlmCache {
 /// - Lists S3 objects covering the time range
 /// - Downloads only files not already in `cache`
 /// - Parses NetCDF4 to extract lat/lon/energy/area/time at selected levels
-/// - Returns all observations within the time window
+/// - Returns all observations within the time window, plus any satellite whose
+///   listing was completely empty
+///
+/// Empty listings are *reported*, not logged, here: the caller holds the
+/// previous poll's state and can therefore say something only when the feed
+/// changes, instead of once every poll forever.
 pub async fn fetch_glm_flashes(
     client: &reqwest::Client,
     satellites: &[GlmSatellite],
     time_window_secs: f64,
     levels: &[GlmDataLevel],
     cache: &mut GlmCache,
-) -> Result<Vec<GlmFlash>, String> {
+) -> Result<GlmFetchOutcome, String> {
     let now = Utc::now().naive_utc();
     let window = TimeDelta::milliseconds((time_window_secs * 1000.0) as i64);
     let start = now - window;
@@ -63,6 +68,7 @@ pub async fn fetch_glm_flashes(
 
     // List & download new files for each satellite
     let mut new_entries: Vec<(String, Vec<GlmFlash>)> = Vec::new();
+    let mut dead_feeds = Vec::new();
 
     for &sat in satellites {
         let listing = list_glm_files(client, sat, start, now).await?;
@@ -71,17 +77,14 @@ pub async fn fetch_glm_flashes(
         // gone (dead bucket, renamed product path, satellite rotated out of the
         // slot) — not merely a quiet sky. GOES-East silently rendered nothing
         // for over a year because `noaa-goes16` went dead and zero files looked
-        // exactly like zero lightning. Surface it loudly; a listing that returns
-        // objects but no in-window flashes stays silent, since that is normal.
+        // exactly like zero lightning. A listing that returns objects but no
+        // in-window flashes is normal and stays silent.
         if listing.objects_seen == 0 {
-            log::warn!(
-                "GLM: no objects at all in bucket '{}' for {} under prefixes [{}] — \
-                 the upstream feed appears dead (satellite rotated out of this slot?), \
-                 not simply quiet",
-                sat.bucket(),
-                sat.display_name(),
-                listing.prefixes.join(", "),
-            );
+            dead_feeds.push(DeadFeed {
+                satellite: sat,
+                bucket: sat.bucket(),
+                prefixes: listing.prefixes.clone(),
+            });
         }
 
         let new_keys: Vec<&str> = listing.keys.iter()
@@ -113,7 +116,7 @@ pub async fn fetch_glm_flashes(
         .collect();
 
     log::info!("GLM: {} flashes in {:.0}s window", filtered.len(), time_window_secs);
-    Ok(filtered)
+    Ok(GlmFetchOutcome { flashes: filtered, dead_feeds })
 }
 
 /// Result of listing S3 for one satellite, with enough context to tell an
