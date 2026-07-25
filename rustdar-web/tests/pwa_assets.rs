@@ -13,6 +13,20 @@
 //! independent — the PWA spec's installability thresholds, the bytes of the PNG
 //! itself, or the Rust declaration of the network origins. No test builds its
 //! own fixture and then asserts the fixture's own contents back.
+//!
+//! # What this file cannot do
+//!
+//! Every test here reads text. None of them runs anything, so none of them can
+//! say whether the worker *behaves* the way its declarations imply: the caching
+//! policy could be deleted outright and these would all still pass, because the
+//! constants they read would be untouched.
+//!
+//! The behavioural gates are `tests/sw_routing.test.mjs` and
+//! `tests/index_bootstrap.test.mjs`, which execute the shipped `sw.js` and the
+//! shipped bootstrap script against a model of the browser. `sw_behaviour.rs`
+//! runs both under `cargo test`. When adding a gate, the question to ask is
+//! which of the two kinds it is — a claim about what a file *says* belongs
+//! here, a claim about what it *does* belongs there.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeSet;
@@ -294,6 +308,9 @@ fn data_sources_has_the_fields_the_worker_was_written_against() {
         "nws_api_base",
         "spc_base",
         "iem_base",
+        // Not origins: flags selecting which TLS client the SPC and METAR
+        // fetches use. Listed so this set stays an exact match on the struct,
+        // which is what makes a *new origin* impossible to add unnoticed.
         "metar_sends_user_agent",
         "spc_sends_user_agent",
     ]
@@ -308,8 +325,22 @@ fn data_sources_has_the_fields_the_worker_was_written_against() {
     );
 }
 
+/// The deny list names every production origin.
+///
+/// This gates the *declaration*, not the behaviour, and the distinction matters
+/// enough to be in the name. Nothing here runs the worker, so nothing here can
+/// tell you that a radar sweep is refused — only that the list has not drifted
+/// from [`DataSources::production`]. Deleting the `NEVER_CACHE_HOSTS` check from
+/// `routeFor` leaves this test green.
+///
+/// The behavioural gate is in `tests/sw_routing.test.mjs`, under
+/// "keeps the deny list load-bearing even when rustdar is served from a data
+/// origin". It runs the shipped worker from a scope rooted at
+/// `https://api.weather.gov/rustdar/` — the one configuration in which that
+/// check is the only thing preventing a weather response from being cached, and
+/// therefore the one configuration in which deleting it is observable.
 #[test]
-fn the_worker_denies_every_production_data_origin_by_name() {
+fn the_worker_states_every_production_data_origin_in_its_deny_list() {
     let denied = js_string_list(SERVICE_WORKER, "const NEVER_CACHE_HOSTS = new Set([");
     assert!(
         !denied.is_empty(),
