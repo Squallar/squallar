@@ -87,7 +87,13 @@ impl OverlayItem for GlmFlashItem {
 }
 
 /// Which satellites to query for GLM data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// The persisted form is the lowercase string produced by [`Self::as_str`] and
+/// read back by [`Self::from_str`] (see `serialize_state`/`deserialize_state`
+/// below) — it is also the dropdown's option id. Deriving serde here would
+/// define a *second*, incompatible encoding (`"East"` rather than `"east"`)
+/// that nothing reads, so the derives are deliberately absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SatelliteSelection {
     East,
     West,

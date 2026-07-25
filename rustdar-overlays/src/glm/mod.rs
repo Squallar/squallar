@@ -12,7 +12,13 @@ pub mod fetch;
 /// Variants name the *slot*, not the spacecraft: NOAA rotates satellites through
 /// the East/West positions (GOES-19 replaced GOES-16 as GOES-East in April 2025),
 /// and the bucket must follow the operational satellite.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// Deliberately not `Serialize`/`Deserialize`: nothing persists this type.
+/// The only GLM setting written to `ui.json` is the satellite *selection*,
+/// which round-trips through hand-rolled lowercase strings in
+/// `render::handlers::glm`. Adding derives here would advertise a wire format
+/// that does not exist and make variant renames look load-bearing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlmSatellite {
     /// GOES-East (currently GOES-19), covering roughly -25°W to -105°W.
     GoesEast,
@@ -41,7 +47,10 @@ impl GlmSatellite {
 }
 
 /// GLM detection hierarchy level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// Not serialized: the UI persists three independent `show_*` booleans, not
+/// this enum. See the note on [`GlmSatellite`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlmDataLevel {
     /// Individual pixel detections (~2ms resolution, highest density).
     Event,
