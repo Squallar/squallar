@@ -3,10 +3,14 @@ build/
 app/build/
 local.properties
 
-# Staged by the cargo-ndk tasks, never authored.
+# Where the cargo-ndk tasks used to stage the native libraries. They now write
+# per build type under app/build/jniLibs/, covered by app/build/ above. Kept so a
+# checkout that still has the old directory does not offer it up for commit;
+# `./gradlew clean` deletes it.
 app/src/main/jniLibs/
 
 # Signing material and its passwords. Never commit.
+# keystore.properties.example is the committed template and is NOT matched here.
 keystore.properties
 app/keystore.properties
 *.jks

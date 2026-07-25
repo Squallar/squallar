@@ -19,7 +19,42 @@ plugins {
 // below has to be pointed at, not the workspace root.
 val rustWorkspaceRoot = rootProject.layout.projectDirectory.dir("../..")
 val rustCrateManifest = rootProject.layout.projectDirectory.file("../Cargo.toml")
-val jniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
+
+// ---------------------------------------------------------------------------
+// Native-library staging
+// ---------------------------------------------------------------------------
+//
+// One staging directory *per build type*, and that separation is a correctness
+// requirement, not tidiness. It used to be a single shared `src/main/jniLibs`,
+// and the consequence was that a release APK could silently ship the debug
+// library -- no error, no warning, `BUILD SUCCESSFUL`:
+//
+//   clean && assembleRelease   ->  jniLibs holds the release .so   (~15.9 MB)
+//   assembleDebug              ->  jniLibs now holds the debug .so (~23.1 MB)
+//   assembleRelease            ->  BUILD SUCCESSFUL, and the APK carries the
+//                                  *debug* .so, byte for byte
+//
+// Gradle does re-run `buildRustLibRelease` there -- the shared directory is
+// declared as an output of both tasks, so writing it from one leaves the other
+// out of date. The task then exits 0 without doing anything, because cargo-ndk
+// only copies its build product into `-o` when the source is *newer* than what
+// is already at the destination (`is_fresh`: `src <= dest` means skip). The
+// release .so is older than the debug .so that was staged after it, so the copy
+// is skipped and `mergeReleaseNativeLibs` packages whatever it finds.
+//
+// The reverse direction is the same bug and ships an LTO'd, stripped release
+// library inside a debuggable APK.
+//
+// Under `layout.buildDirectory` rather than `src/`, so `clean` removes it as
+// part of deleting the build directory. Nothing here is authored.
+fun jniLibsDirFor(buildType: String): Directory =
+    layout.buildDirectory.dir("jniLibs/$buildType").get()
+
+// Where the shared staging directory used to be. Nothing writes to it any more,
+// but it is also AGP's *default* `main` jniLibs source directory, so a copy left
+// behind by a pre-fix build would still be packaged. `clean` removes it, and the
+// `main` source set is emptied in the `android {}` block below.
+val legacyJniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
 
 // ---------------------------------------------------------------------------
 // rustls-platform-verifier Kotlin component
@@ -108,17 +143,24 @@ repositories {
 //
 // Reads `android/keystore.properties` (or `android/app/keystore.properties`) so a
 // release build produces a signed artifact without passing
-// `-Pandroid.injected.signing.*` on the command line. Expected keys:
+// `-Pandroid.injected.signing.*` on the command line.
 //
-//   storeFile=path/to/release.jks      (relative paths resolve against android/)
-//   storePassword=...
-//   keyAlias=...
-//   keyPassword=...
+// `android/keystore.properties.example` is the committed template: it documents
+// every key and carries the `keytool -genkeypair` invocation that produces a
+// keystore. Both the real file and `*.jks` are gitignored, because the password
+// has to appear in it in the clear.
 //
-// Gitignored. If absent, release builds fall back to unsigned with a warning —
-// which is what happens on a fresh clone, since the old cargo-apk config's
-// keystore (`../rustdar.jks`, password in cleartext in Cargo.toml) was never
-// committed and that password must be treated as burned.
+// If absent, release builds still succeed but emit `…-release-unsigned.apk`,
+// which Android will not install. That is the failure mode worth naming: the
+// obvious workaround is to sideload the *debug* APK instead, and that build is
+// `debuggable="true"` under the stock `CN=Android Debug` key. The warning is
+// raised from the release assemble tasks (below) rather than here, so it lands
+// at the end of the build it actually applies to instead of on every
+// invocation, including `assembleDebug`.
+//
+// The old cargo-apk keystore (`../rustdar.jks`, password in cleartext in
+// Cargo.toml) was never committed, but that password is in git history and must
+// be treated as burned.
 val keystoreProps: Properties? = run {
     val found = listOf(rootProject.file("keystore.properties"), file("keystore.properties"))
         .firstOrNull { it.isFile }
@@ -236,11 +278,6 @@ android {
             )
             if (keystoreProps != null) {
                 signingConfig = signingConfigs.getByName("release")
-            } else {
-                logger.warn(
-                    "[rustdar] No android/keystore.properties found; release artifacts will be unsigned.\n" +
-                        "  Create android/keystore.properties with storeFile/storePassword/keyAlias/keyPassword."
-                )
             }
         }
     }
@@ -250,9 +287,13 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    // The cdylib is staged into src/main/jniLibs/<abi>/librustdar_android.so by the
-    // cargo-ndk tasks below; AGP packages whatever it finds there.
-    sourceSets["main"].jniLibs.directories += "src/main/jniLibs"
+    // The cdylib is staged per build type, and wired to the matching variant in
+    // the `androidComponents.onVariants` block below -- never through `main`,
+    // which every variant would inherit. Emptying `main` is what makes that
+    // stick: `src/main/jniLibs` is AGP's built-in default for this source set,
+    // so leaving it populated would let a stale library from a pre-fix build
+    // back into both APKs regardless of what the variant sources say.
+    sourceSets["main"].jniLibs.directories.clear()
 
     packaging {
         jniLibs {
@@ -270,12 +311,16 @@ android {
 // Replaces build-android.sh. Two tasks so the cargo profile can differ per build
 // type while each stays independently incremental.
 //
+// `buildType` names both the cargo profile and the staging directory, and those
+// two must not be allowed to drift apart: one directory shared between profiles
+// is exactly the bug described at `jniLibsDirFor` above.
+//
 // NOTE the package is `rustdar-android`, not `rustdar-platform`. `android_main` —
 // the symbol NativeActivity dlsym()s after loading the .so named by the
 // `android.app.lib_name` manifest meta-data — is defined in rustdar-android.
 // rustdar-platform is a plain dependency of it and its own cdylib has no entry
 // point, so building that instead yields a library the app cannot start from.
-fun cargoNdkTask(name: String, cargoProfile: String): TaskProvider<Exec> = tasks.register<Exec>(name) {
+fun cargoNdkTask(name: String, buildType: String): TaskProvider<Exec> = tasks.register<Exec>(name) {
     workingDir = rustWorkspaceRoot.asFile
 
     // Pin the NDK link platform to minSdk. cargo-ndk otherwise defaults to a much
@@ -283,17 +328,18 @@ fun cargoNdkTask(name: String, cargoProfile: String): TaskProvider<Exec> = tasks
     // graphics/JNI stack links against.
     val ndkPlatform = (android.defaultConfig.minSdk ?: 28).toString()
     val abis = selectedAbis
+    val stagingDir = jniLibsDirFor(buildType)
 
     val args = mutableListOf("cargo", "ndk")
     abis.forEach { args += listOf("-t", it) }
     args += listOf(
         "-P", ndkPlatform,
-        "-o", jniLibsDir.asFile.absolutePath,
+        "-o", stagingDir.asFile.absolutePath,
         "build",
         "-p", "rustdar-android",
         "--lib",
     )
-    if (cargoProfile == "release") args += "--release"
+    if (buildType == "release") args += "--release"
     commandLine = args
 
     // Point cargo-ndk at the same NDK the `android {}` block pins, rather than
@@ -334,8 +380,12 @@ fun cargoNdkTask(name: String, cargoProfile: String): TaskProvider<Exec> = tasks
     inputs.file(rustWorkspaceRoot.file("Cargo.lock"))
     inputs.file(rustWorkspaceRoot.file("rust-toolchain.toml"))
     inputs.property("abis", abis)
-    inputs.property("profile", cargoProfile)
-    abis.forEach { outputs.dir(jniLibsDir.dir(it)) }
+    inputs.property("profile", buildType)
+    // The whole staging directory, not one entry per ABI: with `-PabiFilter` the
+    // set of ABIs varies between invocations, and declaring only the selected
+    // ones would leave a library from a previous, wider run in place and
+    // undeclared. Gradle removes stale output files it owns.
+    outputs.dir(stagingDir)
 }
 
 val buildRustLibDebug = cargoNdkTask("buildRustLibDebug", "debug")
@@ -349,15 +399,57 @@ androidComponents.beforeVariants { variantBuilder ->
 
 androidComponents.onVariants { variant ->
     val cap = variant.name.replaceFirstChar { it.uppercase() }
-    val provider = if (variant.buildType == "release") buildRustLibRelease else buildRustLibDebug
+    val buildType = variant.buildType ?: "debug"
+    val provider = if (buildType == "release") buildRustLibRelease else buildRustLibDebug
+
+    // Give *this* variant the staging directory its own cargo profile writes to.
+    // Per-variant rather than through `sourceSets["main"]`: a `main` entry is
+    // inherited by every variant, which is how one directory ended up being both
+    // the debug and the release native-library source.
+    //
+    // `error()` rather than `?.`: a silently skipped wiring here produces an APK
+    // with no native library in it at all, which installs and then dies in
+    // dlopen at launch. Fail at configuration time instead.
+    val jniLibsSources = variant.sources.jniLibs
+        ?: error("Variant ${variant.name}: no jniLibs source set to attach the cargo-ndk output to.")
+    jniLibsSources.addStaticSourceDirectory(jniLibsDirFor(buildType).asFile.absolutePath)
+
     // Covers both the APK path and the .aab path — bundle assembly consumes the
     // same merged native-libs output.
     tasks.matching { it.name == "merge${cap}JniLibFolders" }.configureEach { dependsOn(provider) }
     tasks.matching { it.name == "merge${cap}NativeLibs" }.configureEach { dependsOn(provider) }
+
+    // Say so, loudly and at the end, when a release artifact came out unsigned.
+    // See the `keystoreProps` block for why that matters more than it looks.
+    if (buildType == "release" && keystoreProps == null) {
+        tasks.matching { it.name == "assemble$cap" || it.name == "bundle$cap" }.configureEach {
+            doLast {
+                logger.warn(
+                    "\n[rustdar] $name: NO SIGNING KEY -- this artifact is UNSIGNED and " +
+                        "Android will refuse to install it.\n" +
+                        "  Do not sideload the debug APK instead: it is debuggable and signed with " +
+                        "the stock 'CN=Android Debug' key.\n" +
+                        "  Fix: cp android/keystore.properties.example android/keystore.properties " +
+                        "and follow the keytool command in it.\n"
+                )
+            }
+        }
+    }
 }
 
-tasks.named("clean").configure {
-    doLast { jniLibsDir.asFile.deleteRecursively() }
+// The staged libraries live under the build directory now, so `clean` already
+// removes them. What is left to clean is the *old* shared location, which a
+// pre-fix checkout may still have on disk.
+//
+// This is `delete(...)` on the Delete task rather than the `doLast { … }` that
+// used to be here, and the difference is not cosmetic: that block deleted a
+// directory the cargo-ndk tasks write, with no ordering constraint between them,
+// so `./gradlew clean assembleDebug` in one invocation could stage the library
+// and then delete it -- or not -- depending on task scheduling. Declaring it as
+// an input to `clean` lets Gradle see the relationship instead of racing it. No
+// task writes to this path any more, so there is nothing left to race.
+tasks.named<Delete>("clean").configure {
+    delete(legacyJniLibsDir)
 }
 
 dependencies {
