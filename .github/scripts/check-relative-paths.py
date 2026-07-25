@@ -1,21 +1,13 @@
 #!/usr/bin/env python3
 """Reject root-absolute URL references in a staged GitHub Pages tree.
 
-A project Pages site is served from https://<user>.github.io/<repo>/, not from
-the domain root. Every asset reference therefore has to be relative. An absolute
-path works perfectly under `python3 -m http.server` (which serves from /) and
-404s in production, so the failure mode is a green deploy and a blank page.
+A project Pages site is served from a subpath, so an absolute path works under
+`python3 -m http.server` and 404s in production: a green deploy and a blank
+page. Scans every staged text asset, not just index.html -- `start_url: "/"`
+breaks installability and `caches.addAll(["/"])` caches the wrong origin path,
+and neither is in index.html.
 
-This scans *every* text asset in the staged tree rather than index.html alone.
-The staging step copies by allowlist, so a service worker and a web app manifest
-arriving later are published without this job being edited -- which means they
-have to be scanned without this job being edited too. `start_url: "/"` in a
-manifest silently breaks installability, and `caches.addAll(["/"])` in a service
-worker caches the wrong origin path; neither is in index.html.
-
-Exits non-zero on the first tree that has any violation, and also if it was
-handed nothing to scan -- a scanner that silently examines zero files is the
-failure mode this whole job exists to prevent.
+Exits non-zero on any violation, and also if it was handed nothing to scan.
 """
 
 import json

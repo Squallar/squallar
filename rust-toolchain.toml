@@ -3,31 +3,21 @@
 channel = "stable"
 components = ["clippy"]
 
-# The cross-targets the Build matrix compiles, listed here rather than as
-# `rustup target add` lines in the workflow so that a local checkout and CI agree
-# by construction. `rustup show` in the repo materialises this whole set, so a
-# developer can run any matrix row's command without first discovering which
-# target it needs.
+# The cross-targets the Build matrix compiles. Listed here rather than as
+# `rustup target add` lines so a local checkout and CI agree by construction;
+# the matrix asserts each row's triple is installed before it builds.
 #
-# Host targets are deliberately absent: x86_64-unknown-linux-gnu,
-# aarch64-apple-darwin and x86_64-pc-windows-msvc come with the toolchain on the
-# machine that is that host, and naming them here would make every macOS
-# developer download a Windows std they will never build against.
-#
-# Adding a row to .github/workflows/build.yaml means adding its triple here. The
-# matrix asserts the triple is known to rustc before it builds, so the two
-# drifting apart fails the row rather than silently falling back to the host.
+# Host triples are absent on purpose: each comes with the toolchain on the
+# machine that is that host, and naming them would make every macOS developer
+# fetch a Windows std.
 targets = [
-    # Browser build: rustdar-web's cdylib.
+    # rustdar-web's cdylib.
     "wasm32-unknown-unknown",
-    # The two ABIs in `allAbis` in rustdar-android/android/app/build.gradle.kts.
-    # These need the NDK to build anything that pulls `ring`; the rustup target
-    # alone is necessary but not sufficient. See the Android job's comments.
+    # `allAbis` in rustdar-android/android/app/build.gradle.kts. The rustup
+    # target is necessary but not sufficient -- anything pulling `ring` needs
+    # the NDK too.
     "aarch64-linux-android",
     "x86_64-linux-android",
-    # Device iOS. Needs the iPhoneOS SDK (`ring` compiles C and cc-rs shells out
-    # to `xcrun`), so it is only buildable on a macOS host or in a container
-    # carrying the SDK. Listed anyway: `rustup target add` is what makes the
-    # triple resolvable at all, and a macOS developer can build the row locally.
+    # Needs the iPhoneOS SDK, so only buildable on macOS or an SDK container.
     "aarch64-apple-ios",
 ]
