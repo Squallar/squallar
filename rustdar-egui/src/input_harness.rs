@@ -1751,6 +1751,60 @@ mod tests {
         );
     }
 
+    /// 16b. **The map keeps usable space at every breakpoint.**
+    ///
+    ///      Panels claim space in call order and the map gets the remainder, so
+    ///      chrome that is too greedy — or ordered wrongly — squeezes the map
+    ///      toward zero. That rect feeds pane hit-testing, `excluded_rects` and
+    ///      overlay texture sizing, so a degenerate one is silent everywhere
+    ///      rather than obviously broken in one place.
+    #[test]
+    fn the_map_keeps_usable_space_at_every_breakpoint() {
+        for (size, expected) in [
+            (egui::vec2(420.0, 800.0), crate::ui_layout::WidthClass::Compact),
+            (egui::vec2(800.0, 800.0), crate::ui_layout::WidthClass::Medium),
+            (egui::vec2(1400.0, 900.0), crate::ui_layout::WidthClass::Expanded),
+        ] {
+            let mut h = InputHarness::with_screen(size);
+            assert_eq!(
+                h.width_class(),
+                expected,
+                "precondition: {size:?} should be {expected:?}"
+            );
+
+            for drawer in [false, true] {
+                h.set_drawer_open(drawer);
+                let panel = h.map_panel_rect();
+                assert!(
+                    panel.width() > 100.0 && panel.height() > 100.0,
+                    "{expected:?} (drawer_open={drawer}): the map was squeezed to \
+                     {:?} x {:?} — the chrome claimed nearly everything",
+                    panel.width(),
+                    panel.height()
+                );
+                // The status bar is present at every width, so the map never
+                // gets the full height. This is what stops the bounds above
+                // passing on a frame where no chrome rendered at all.
+                assert!(
+                    panel.height() < size.y,
+                    "{expected:?} (drawer_open={drawer}): the map got the full \
+                     height, so the status bar claimed nothing"
+                );
+
+                // A left panel is showing exactly when the sidebar is
+                // persistent or the drawer is open; only then is the map
+                // narrower than the screen.
+                let has_left_panel = expected == crate::ui_layout::WidthClass::Expanded || drawer;
+                assert_eq!(
+                    panel.width() < size.x,
+                    has_left_panel,
+                    "{expected:?} (drawer_open={drawer}): the map's width does \
+                     not agree with whether a left panel should be showing"
+                );
+            }
+        }
+    }
+
     /// 16. A wide screen has a persistent sidebar and therefore no hamburger,
     ///     so nothing is excluded — the complement of the test above.
     #[test]
