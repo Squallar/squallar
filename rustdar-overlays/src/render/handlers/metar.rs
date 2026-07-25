@@ -16,6 +16,30 @@ use crate::render::station_model;
 /// Type-erased fetch result for METAR observations.
 pub(crate) struct MetarFetchResult(pub Result<Vec<MetarOb>, String>);
 
+/// How long a METAR fetch may take.
+const METAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The client this handler's fetches use.
+///
+/// **Not `ctx.client`.** The shared client sends a `User-Agent`, which makes
+/// the request non-simple; the browser then preflights, and IEM answers
+/// `OPTIONS` with `405 Method Not Allowed`, so the real request is never
+/// issued. Native and `curl` see none of that.
+///
+/// Split out of `create_fetch_tasks` so the choice is assertable —
+/// `the_metar_client_sends_no_user_agent` is what pins it. The rule itself
+/// lives on the origin, in
+/// [`DataSources::metar_sends_user_agent`](rustdar_radar::sources::DataSources::metar_sends_user_agent),
+/// and is read here rather than restated.
+fn metar_client(
+    sources: &rustdar_radar::sources::DataSources,
+) -> Result<reqwest::Client, String> {
+    sources
+        .metar_client(METAR_TIMEOUT)
+        .build()
+        .map_err(|e| format!("could not build the METAR client: {e}"))
+}
+
 /// Clickable item representing a single METAR observation.
 #[derive(Debug)]
 pub(crate) struct MetarItem {
@@ -270,17 +294,11 @@ impl OverlayHandler for MetarHandler {
     }
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
-        // NOT `ctx.client`: the shared client sends a `User-Agent`, and IEM
-        // answers a CORS preflight with 405, so any request carrying one never
-        // leaves the browser. See `rustdar_radar::tls::simple_client`.
-        let client = match rustdar_radar::tls::simple_client(
-            std::time::Duration::from_secs(60),
-        )
-        .build()
-        {
+        // NOT `ctx.client` — see `metar_client`.
+        let client = match metar_client(&ctx.sources) {
             Ok(c) => c,
             Err(e) => {
-                log::error!("could not build the METAR client: {e}");
+                log::error!("{e}");
                 return Vec::new();
             }
         };
@@ -392,6 +410,47 @@ mod tests {
     use super::*;
     use crate::metar::types::Visibility;
     use rustdar_units::SpeedUnit;
+
+    /// The client this handler fetches with must carry no `User-Agent`.
+    ///
+    /// The invariant the preflight fix is *for*, asserted on the client the
+    /// handler actually builds. Previously nothing read
+    /// `metar_sends_user_agent` except the test asserting it was `false`, and
+    /// replacing this construction with `tls::client(USER_AGENT, ..)` left the
+    /// whole suite green.
+    ///
+    /// It would also still work today, on every target, because the wasm
+    /// `tls::client` drops the `User-Agent` too — so the rule's only defence
+    /// was an unrelated `#[cfg]` coincidence. This is the direct assertion.
+    #[test]
+    fn the_metar_client_sends_no_user_agent() {
+        let client = metar_client(&rustdar_radar::sources::DataSources::production())
+            .expect("the METAR client must build");
+        assert!(
+            !rustdar_radar::tls::sends_user_agent(&client),
+            "the METAR client carries a User-Agent, so the browser preflights \
+             the GET and IEM answers OPTIONS with 405 — the observations \
+             silently never arrive, and only on web",
+        );
+    }
+
+    /// …and it is the origin's recorded rule that decides that, not a constant.
+    ///
+    /// Without this, a `metar_client` hardwired to `simple_client` would pass
+    /// the test above while `metar_sends_user_agent` went back to being read by
+    /// nothing.
+    #[test]
+    fn the_metar_client_follows_the_origins_recorded_rule() {
+        let sources = rustdar_radar::sources::DataSources {
+            metar_sends_user_agent: true,
+            ..rustdar_radar::sources::DataSources::production()
+        };
+        let client = metar_client(&sources).expect("the METAR client must build");
+        assert!(
+            rustdar_radar::tls::sends_user_agent(&client),
+            "metar_client ignores DataSources::metar_sends_user_agent",
+        );
+    }
 
     fn ob(vis: Option<Visibility>) -> MetarOb {
         wind_ob(None, None, vis)

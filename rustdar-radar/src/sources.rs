@@ -41,19 +41,33 @@
 //! api.weather.gov        OPTIONS -> 200, Allow-Methods: GET,       Allow-Headers: API-Key, User-Agent
 //! ```
 //!
-//! **Iowa Environmental Mesonet does not.** Its `OPTIONS` answers `405 Method
-//! Not Allowed` with `Allow: GET` and no `Access-Control-Allow-Methods`, so a
-//! preflight fails outright even though the plain `GET` carries `ACAO: *`:
+//! **Two do not**, and they fail the same way: the plain `GET` carries
+//! `ACAO: *`, so `curl` and every native build are perfectly happy, while
+//! `OPTIONS` is refused and no browser ever issues the real request. Verified
+//! 2026-07-25:
 //!
 //! ```text
 //! mesonet.agron.iastate.edu  GET     -> 200, Access-Control-Allow-Origin: *
-//! mesonet.agron.iastate.edu  OPTIONS -> 405 Method Not Allowed
+//! mesonet.agron.iastate.edu  OPTIONS -> 405 Method Not Allowed, Allow: GET, no ACA-Methods
+//!
+//! www.spc.noaa.gov           GET     -> 200, Access-Control-Allow-Origin: *
+//! www.spc.noaa.gov           OPTIONS -> 403 (CloudFront), no CORS headers at all
 //! ```
 //!
-//! So METAR requests must stay *simple*: no `User-Agent`, no custom headers.
-//! [`Self::metar_sends_user_agent`] is that rule, stated where the origin is
-//! declared rather than buried in the fetch function, and
-//! [`crate::tls::simple_client`] is the client that honours it.
+//! The SPC result holds for every path rustdar reads — `/products/spcmdrss.xml`,
+//! `/products/outlook/*.lyr.geojson` and `/climo/reports/today_*.csv` all
+//! answered `200` + `ACAO: *` to `GET` and `403` to `OPTIONS`.
+//!
+//! So METAR *and* SPC requests must stay **simple**: no `User-Agent`, no custom
+//! headers. [`Self::metar_sends_user_agent`] and [`Self::spc_sends_user_agent`]
+//! are that rule, stated where the origins are declared rather than buried in
+//! four fetch functions; [`Self::metar_client`] and [`Self::spc_client`] are
+//! how production reads it, and [`crate::tls::simple_client`] is what they
+//! resolve to.
+//!
+//! Recording the rule for one preflight-hostile origin and omitting the other
+//! is worse than having no table, so a new origin belongs in **both** tables
+//! above or in neither.
 
 use std::borrow::Cow;
 
@@ -91,7 +105,18 @@ pub struct DataSources {
     ///
     /// `false` for [`Self::production`]: see the module docs. Sending one turns
     /// the request into a preflight, and IEM answers `405` to `OPTIONS`.
+    ///
+    /// Read by [`Self::metar_client`], which is where it becomes load-bearing.
     pub metar_sends_user_agent: bool,
+    /// Whether SPC requests may carry a `User-Agent`.
+    ///
+    /// `false` for [`Self::production`], for exactly the reason above: SPC's
+    /// CloudFront answers `OPTIONS` with `403` and no CORS headers, so a
+    /// `User-Agent` makes outlooks, mesoscale discussions and storm reports
+    /// unreachable from the browser — and only from the browser.
+    ///
+    /// Read by [`Self::spc_client`].
+    pub spc_sends_user_agent: bool,
 }
 
 impl Default for DataSources {
@@ -117,7 +142,27 @@ impl DataSources {
             spc_base: Cow::Borrowed("https://www.spc.noaa.gov"),
             iem_base: Cow::Borrowed("https://mesonet.agron.iastate.edu"),
             metar_sends_user_agent: false,
+            spc_sends_user_agent: false,
         }
+    }
+
+    /// The client the METAR feed must be fetched with.
+    ///
+    /// Reads [`Self::metar_sends_user_agent`] rather than hardcoding
+    /// `simple_client`, so the rule recorded on the origin is the rule the
+    /// request obeys. Every METAR fetch goes through here.
+    pub fn metar_client(&self, timeout: std::time::Duration) -> reqwest::ClientBuilder {
+        crate::tls::client_for(self.metar_sends_user_agent, timeout)
+    }
+
+    /// The client SPC outlooks, mesoscale discussions and storm reports must be
+    /// fetched with.
+    ///
+    /// Reads [`Self::spc_sends_user_agent`]. These three used to share the
+    /// application's ordinary `User-Agent`-bearing client, which is exactly the
+    /// shape that fails only in the browser.
+    pub fn spc_client(&self, timeout: std::time::Duration) -> reqwest::ClientBuilder {
+        crate::tls::client_for(self.spc_sends_user_agent, timeout)
     }
 
     /// `https://{bucket}.s3.amazonaws.com/{key}`.
@@ -296,13 +341,65 @@ mod tests {
     }
 
     /// The preflight rule is a property of the origin, so it is recorded on the
-    /// origin. Production must not send a `User-Agent` to IEM.
+    /// origin. Production must not send a `User-Agent` to IEM or to SPC.
     #[test]
-    fn production_keeps_metar_requests_preflight_free() {
+    fn production_keeps_preflight_hostile_origins_preflight_free() {
+        let s = DataSources::production();
         assert!(
-            !DataSources::production().metar_sends_user_agent,
+            !s.metar_sends_user_agent,
             "IEM answers 405 to OPTIONS; a User-Agent turns the GET into a \
              preflight and the request never happens in a browser",
+        );
+        assert!(
+            !s.spc_sends_user_agent,
+            "SPC answers 403 to OPTIONS with no CORS headers; a User-Agent \
+             makes outlooks, MDs and storm reports unreachable from the web build",
+        );
+    }
+
+    /// The rule must reach the client, not just sit in a field.
+    ///
+    /// Before this, `metar_sends_user_agent` was read by exactly one thing —
+    /// the test asserting it was `false` — and no production code consulted it.
+    /// The invariant that matters is the one asserted here: the client these
+    /// origins are actually fetched with carries no `User-Agent`.
+    ///
+    /// Note what this does *not* rest on. Both fetches would work today even if
+    /// the wrong client were chosen, because the wasm `tls::client` drops the
+    /// `User-Agent` for every client, making it byte-identical to
+    /// `simple_client` on the one target where the rule matters. That identity
+    /// is a coincidence of one `#[cfg]` arm, not a property of CORS.
+    #[test]
+    fn the_preflight_hostile_origins_get_a_client_with_no_user_agent() {
+        let s = DataSources::production();
+        let t = std::time::Duration::from_secs(1);
+        assert!(
+            !crate::tls::sends_user_agent(&s.metar_client(t).build().expect("client")),
+            "the METAR client carries a User-Agent; IEM's OPTIONS answers 405",
+        );
+        assert!(
+            !crate::tls::sends_user_agent(&s.spc_client(t).build().expect("client")),
+            "the SPC client carries a User-Agent; SPC's OPTIONS answers 403",
+        );
+    }
+
+    /// …and the fields are what decide it.
+    ///
+    /// The counterweight to the test above: without this, a `metar_client` that
+    /// ignored its field and always returned `simple_client` would pass, and
+    /// the recorded rule would be decoration again.
+    #[test]
+    fn flipping_the_preflight_rule_changes_the_client() {
+        let t = std::time::Duration::from_secs(1);
+        let metar = DataSources { metar_sends_user_agent: true, ..DataSources::production() };
+        let spc = DataSources { spc_sends_user_agent: true, ..DataSources::production() };
+        assert!(
+            crate::tls::sends_user_agent(&metar.metar_client(t).build().expect("client")),
+            "metar_client does not read metar_sends_user_agent",
+        );
+        assert!(
+            crate::tls::sends_user_agent(&spc.spc_client(t).build().expect("client")),
+            "spc_client does not read spc_sends_user_agent",
         );
     }
 

@@ -118,14 +118,17 @@ pub fn client(_user_agent: &str, _timeout: std::time::Duration) -> reqwest::Clie
 /// issue the real request unless that answers 2xx with the method and header
 /// allowed.
 ///
-/// `mesonet.agron.iastate.edu` answers `405 Method Not Allowed` to `OPTIONS`
-/// while answering the plain `GET` with `Access-Control-Allow-Origin: *`. So
-/// the METAR feed is reachable from the web build *only* as a simple request,
-/// and adding a `User-Agent` for politeness would break it — silently, and only
-/// on wasm, where nothing else in the workspace would notice.
+/// Two of rustdar's origins are like this. `mesonet.agron.iastate.edu` answers
+/// `405 Method Not Allowed` to `OPTIONS`, and `www.spc.noaa.gov` answers `403`
+/// with no CORS headers at all — both while answering the plain `GET` with
+/// `Access-Control-Allow-Origin: *`. So those feeds are reachable from the web
+/// build *only* as simple requests, and adding a `User-Agent` for politeness
+/// would break them — silently, and only on wasm, where nothing else in the
+/// workspace would notice.
 ///
-/// See [`crate::sources::DataSources::metar_sends_user_agent`], which is where
-/// that rule is recorded per origin.
+/// See [`crate::sources::DataSources`], which is where that rule is recorded
+/// per origin, and prefer [`client_for`] over calling this directly so the
+/// choice stays driven by the recorded rule.
 ///
 /// Everything else [`client`] configures still applies.
 #[cfg(not(target_arch = "wasm32"))]
@@ -139,6 +142,61 @@ pub fn simple_client(timeout: std::time::Duration) -> reqwest::ClientBuilder {
 pub fn simple_client(_timeout: std::time::Duration) -> reqwest::ClientBuilder {
     init();
     reqwest::Client::builder()
+}
+
+/// Pick between [`client`] and [`simple_client`] from an origin's preflight
+/// rule.
+///
+/// This is the *only* place the choice is made, so no call site has to
+/// remember which origins tolerate a `User-Agent`. The boolean comes from
+/// [`crate::sources::DataSources`] — see
+/// [`metar_client`](crate::sources::DataSources::metar_client) and
+/// [`spc_client`](crate::sources::DataSources::spc_client), which are how
+/// production reaches this.
+///
+/// # This is not self-evidently load-bearing on wasm today
+///
+/// The wasm builds of [`client`] and [`simple_client`] are byte-identical: a
+/// page cannot set `User-Agent`, so the wasm `client` drops it too (see
+/// [`client`]). Picking the wrong one therefore breaks nothing *right now*.
+/// It is still the rule, because that identity is a property of one `#[cfg]`
+/// arm and not of the CORS problem this exists to avoid — restore a
+/// `User-Agent` to the wasm client, on any target where a header can be set,
+/// and the METAR and SPC layers go dark in the browser with no error on
+/// native. [`sends_user_agent`] is what pins it.
+pub fn client_for(
+    sends_user_agent: bool,
+    timeout: std::time::Duration,
+) -> reqwest::ClientBuilder {
+    if sends_user_agent {
+        client(USER_AGENT, timeout)
+    } else {
+        simple_client(timeout)
+    }
+}
+
+/// Whether this client attaches a `User-Agent` to every request it issues.
+///
+/// `reqwest::Client` exposes no getter for its default headers, so this reads
+/// them out of the `Debug` representation, which prints `default_headers`
+/// unconditionally:
+///
+/// ```text
+/// Client { .., default_headers: {"accept": "*/*", "user-agent": "rustdar/1.0 (..)"}, .. }
+/// Client { .., default_headers: {"accept": "*/*"}, .. }
+/// ```
+///
+/// Observed rather than derived, and for the same reason
+/// `client_rejects_cleartext_urls` observes `https_only` behaviourally: the
+/// configuration is write-only, and asserting on a value the test itself
+/// supplied would prove nothing. A request cannot be used to observe it —
+/// both constructors set `https_only(true)`, so a loopback `http://` server
+/// is rejected before any header is written.
+///
+/// Always `false` on wasm32, which is correct: a page cannot set the header
+/// and the browser supplies its own.
+pub fn sends_user_agent(client: &reqwest::Client) -> bool {
+    format!("{client:?}").contains("\"user-agent\"")
 }
 
 /// Whether the installed default provider is *ring*.
@@ -296,6 +354,65 @@ mod tests {
             !rejected_by_scheme_check(&client, "https://api.weather.gov/"),
             "an https:// request was rejected by the scheme check; it is \
              rejecting more than cleartext"
+        );
+    }
+
+    // ── The preflight rule ────────────────────────────────────────────────
+    //
+    // These three run as a set. `sends_user_agent` reads a `Debug` string, so
+    // on its own it could be a constant in either direction; the pair below
+    // pins it from both sides, and `client_for` is then asserted to route to
+    // the right constructor. Without the first two, a `sends_user_agent` that
+    // always returned `false` would satisfy every "must not send a UA"
+    // assertion in the workspace.
+
+    /// [`super::client`] does attach the User-Agent it is given.
+    #[test]
+    fn the_ordinary_client_sends_a_user_agent() {
+        let c = super::client(super::USER_AGENT, std::time::Duration::from_secs(1))
+            .build()
+            .expect("client should build");
+        assert!(
+            super::sends_user_agent(&c),
+            "client() built something with no User-Agent; api.weather.gov \
+             rejects requests without one",
+        );
+    }
+
+    /// [`super::simple_client`] does not.
+    ///
+    /// This is the whole reason that constructor exists: IEM answers `OPTIONS`
+    /// with `405` and SPC with `403`, so a `User-Agent` turns the `GET` into a
+    /// preflight the browser never gets past.
+    #[test]
+    fn the_simple_client_sends_no_user_agent() {
+        let c = super::simple_client(std::time::Duration::from_secs(1))
+            .build()
+            .expect("client should build");
+        assert!(
+            !super::sends_user_agent(&c),
+            "simple_client() attached a User-Agent, which makes every request \
+             to a preflight-hostile origin fail in the browser",
+        );
+    }
+
+    /// [`super::client_for`] routes to those two, and reads its argument.
+    ///
+    /// Fails if the branch is inverted or collapsed to one constructor — which
+    /// is the mutation that would silently re-break the METAR and SPC layers on
+    /// web while leaving native untouched.
+    #[test]
+    fn client_for_routes_on_the_preflight_rule() {
+        let t = std::time::Duration::from_secs(1);
+        let permitted = super::client_for(true, t).build().expect("client");
+        let forbidden = super::client_for(false, t).build().expect("client");
+        assert!(
+            super::sends_user_agent(&permitted),
+            "client_for(true) must give the User-Agent-bearing client",
+        );
+        assert!(
+            !super::sends_user_agent(&forbidden),
+            "client_for(false) must give the preflight-safe client",
         );
     }
 
