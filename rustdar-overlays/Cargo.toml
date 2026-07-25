@@ -9,7 +9,7 @@ earcutr = "=0.5.0"
 flate2 = { workspace = true }
 grib = { version = "=0.15.1", default-features = true }
 rustdar-units = { workspace = true }
-futures = "=0.3.32"
+futures = "=0.3.33"
 log = { workspace = true }
 netcdf = { version = "=0.12.0", features = ["static"] }
 reqwest = { workspace = true, features = ["default", "json"] }
