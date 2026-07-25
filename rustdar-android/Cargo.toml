@@ -36,9 +36,18 @@ pollster = { workspace = true }
 log = { workspace = true }
 jni = { workspace = true }
 ndk-context = { workspace = true }
-# Pinned to the version reqwest 0.13.2 resolves, so `android::init_with_env`
-# below talks to the same verifier instance reqwest's clients read from. 0.6.2
-# wants jni ^0.21, which is the workspace pin -- 0.7.x would require jni ^0.22.
+# MUST stay on the major that reqwest resolves. reqwest 0.13.2 requires
+# `rustls-platform-verifier ^0.6`, so bumping this to 0.7 does not replace the
+# verifier -- it adds a second copy. `android::init_with_env` would then
+# initialize the 0.7 instance while every reqwest client keeps reading the
+# uninitialized 0.6 one, and Android TLS setup silently becomes a no-op. Nothing
+# fails at build time; the first symptom is an HTTPS request failing on-device,
+# which is exactly the api.weather.gov path the Network Security Config in
+# `android/` exists to keep working.
+#
+# The jni bump travels with it (0.7.x wants jni ^0.22 against the workspace's
+# ^0.21) and is equally not to be taken alone. Renovate has proposed this pair;
+# both halves land together once reqwest requires ^0.7, or not at all.
 #
 # Its Kotlin half ships as an AAR inside the `rustls-platform-verifier-android`
 # crate's registry checkout; `android/app/build.gradle.kts` locates that via
