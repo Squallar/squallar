@@ -157,6 +157,59 @@ impl InputHarness {
         harness
     }
 
+    /// Resize the viewport, as dragging a window edge or rotating a device
+    /// does, and settle. This is how a test crosses a layout breakpoint.
+    pub(crate) fn set_screen(&mut self, size: egui::Vec2) {
+        self.screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        self.warm_up();
+    }
+
+    /// The egui `Id`s the last frame's layers panel resolved.
+    pub(crate) fn widget_id_probes(&self) -> Vec<(&'static str, egui::Id)> {
+        self.gui.widget_id_probes().to_vec()
+    }
+
+    /// Open or close the layers drawer, as tapping the hamburger does.
+    pub(crate) fn set_drawer_open(&mut self, open: bool) {
+        self.gui.set_drawer_open(open);
+        self.warm_up();
+    }
+
+    /// The scroll offset egui has stored under `id`, if any.
+    ///
+    /// Reading it back through the *probed* id is what makes the breakpoint
+    /// test real: if the panel stopped salting its `ScrollArea`, the state
+    /// would live under some other id and this returns `None`.
+    pub(crate) fn scroll_offset(&self, id: egui::Id) -> Option<egui::Vec2> {
+        egui::scroll_area::State::load(&self.ctx, id).map(|s| s.offset)
+    }
+
+    /// Scroll the widget under `pos`, as a wheel or a two-finger drag does.
+    pub(crate) fn scroll_at(&mut self, pos: egui::Pos2, delta: egui::Vec2) {
+        self.events.push(egui::Event::PointerMoved(pos));
+        self.events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta,
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::default(),
+        });
+    }
+
+    /// The floating-chrome rects the last frame excluded from map clicks.
+    pub(crate) fn excluded_rects(&self) -> Vec<egui::Rect> {
+        self.gui.excluded_rects_for_test().to_vec()
+    }
+
+    /// Every rect painted during the last frame, in paint order.
+    pub(crate) fn painted_rects(&self) -> &[egui::Rect] {
+        &self.last_rects
+    }
+
+    /// The width class the UI resolved for the last frame.
+    pub(crate) fn width_class(&self) -> crate::ui_layout::WidthClass {
+        self.gui.layout_for_test().width
+    }
+
     /// Report `side` as the adapter's `max_texture_dimension_2d`, the way
     /// `EguiRenderer::new` reports the real device's limit to `egui_winit`.
     ///
@@ -1569,6 +1622,145 @@ mod tests {
             confirmed.resolved.overlay_click_pos,
             Some(pos),
             "the tap was deferred, not swallowed"
+        );
+    }
+
+    // ── Responsive layout ────────────────────────────────────────────────
+
+    /// 14. **Crossing a breakpoint must not move any widget's egui `Id`.**
+    ///
+    ///     egui keys widget memory — combo open state, scroll offsets, panel
+    ///     sizes — on `Id`. An `Id` derived from anything layout-dependent
+    ///     therefore looks like a *different widget* on the other side of a
+    ///     resize, and every one of those becomes a silent reset: the user
+    ///     drags a window edge and their scroll position jumps to the top.
+    ///
+    ///     This compares the `Id`s the panel actually resolved on two runs
+    ///     rather than restating the constants that produced them, so it fails
+    ///     for a layout-keyed `Id` however that keying was introduced.
+    #[test]
+    fn crossing_a_breakpoint_does_not_move_any_widget_id() {
+        let mut h = InputHarness::with_screen(egui::vec2(1200.0, 800.0));
+        // The drawer is what shows the panel below the sidebar breakpoint;
+        // opening it up front means the panel is on screen for both runs.
+        h.set_drawer_open(true);
+
+        assert_eq!(
+            h.width_class(),
+            crate::ui_layout::WidthClass::Expanded,
+            "precondition: start above the sidebar breakpoint"
+        );
+        let expanded = h.widget_id_probes();
+        assert!(
+            !expanded.is_empty(),
+            "precondition: the panel must have reported some ids, or this test \
+             compares two empty lists and passes for free"
+        );
+
+        // Put real egui state behind one of those ids, so the comparison below
+        // is backed by something that would visibly be lost. Reading it through
+        // the probed id also pins that the panel really does key its scroll
+        // area on that id rather than on a positional auto-id.
+        let scroll_id = expanded
+            .iter()
+            .find(|(name, _)| *name == "layers_scroll")
+            .expect("precondition: the scroll area must report an id")
+            .1;
+        h.scroll_at(egui::pos2(80.0, 400.0), egui::vec2(0.0, -120.0));
+        h.frames_for(3, FRAME_DT);
+        let scrolled = h.scroll_offset(scroll_id);
+        assert!(
+            scrolled.is_some_and(|o| o.y > 0.0),
+            "precondition: the layers panel must have actually scrolled under \
+             the probed id, got {scrolled:?}"
+        );
+
+        h.set_screen(egui::vec2(800.0, 800.0));
+        h.set_drawer_open(true);
+        assert_eq!(
+            h.width_class(),
+            crate::ui_layout::WidthClass::Medium,
+            "precondition: the resize really did cross the 1000pt breakpoint"
+        );
+        let medium = h.widget_id_probes();
+
+        assert_eq!(
+            expanded, medium,
+            "a widget id moved with the layout: everything egui remembers under \
+             it — scroll offset, combo state — is silently discarded on resize"
+        );
+        assert_eq!(
+            h.scroll_offset(scroll_id),
+            scrolled,
+            "the scroll position must survive the resize"
+        );
+
+        // ...and across the 600pt breakpoint too, where the menu bar goes away
+        // and the panel header is the only chrome left above the controls.
+        h.set_screen(egui::vec2(500.0, 800.0));
+        h.set_drawer_open(true);
+        assert_eq!(
+            h.width_class(),
+            crate::ui_layout::WidthClass::Compact,
+            "precondition: the resize crossed the 600pt breakpoint"
+        );
+        assert_eq!(
+            expanded,
+            h.widget_id_probes(),
+            "the compact layout must reuse the same ids as well"
+        );
+    }
+
+    /// 15. **The hamburger's rect is reported by the code that draws it.**
+    ///
+    ///     A tap on the button must not also be a tap on the map underneath.
+    ///     `ui_map.rs` used to rebuild this rect from its own copy of the
+    ///     position constants, which could disagree with the button silently.
+    #[test]
+    fn the_hamburger_excludes_its_own_rect_from_map_clicks() {
+        let mut h = InputHarness::with_screen(egui::vec2(500.0, 800.0));
+        assert_eq!(
+            h.width_class(),
+            crate::ui_layout::WidthClass::Compact,
+            "precondition: a compact screen has a hamburger and no sidebar"
+        );
+
+        let rects = h.excluded_rects();
+        assert_eq!(
+            rects.len(),
+            1,
+            "precondition: exactly the hamburger should be excluded, got {rects:?}"
+        );
+        let button = rects[0];
+
+        // The rect must be where the button was actually painted, not merely
+        // non-empty: a stale copy of the constants would still produce a rect.
+        assert!(
+            h.painted_rects().iter().any(|r| {
+                (r.center() - button.center()).length() < 1.0 && r.width() == button.width()
+            }),
+            "the excluded rect does not match any painted rect — it was \
+             reconstructed rather than reported"
+        );
+
+        // With the drawer open the button is gone, and so is its exclusion.
+        h.set_drawer_open(true);
+        assert!(
+            h.excluded_rects().is_empty(),
+            "an open drawer replaces the button, so nothing should be excluded"
+        );
+    }
+
+    /// 16. A wide screen has a persistent sidebar and therefore no hamburger,
+    ///     so nothing is excluded — the complement of the test above.
+    #[test]
+    fn a_wide_screen_has_no_floating_chrome_to_exclude() {
+        let h = InputHarness::with_screen(egui::vec2(1200.0, 800.0));
+        assert_eq!(h.width_class(), crate::ui_layout::WidthClass::Expanded);
+        assert!(
+            h.excluded_rects().is_empty(),
+            "a persistent sidebar claims panel space rather than floating over \
+             the map, so it excludes nothing"
         );
     }
 

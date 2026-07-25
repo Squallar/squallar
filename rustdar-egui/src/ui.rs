@@ -112,6 +112,16 @@ pub struct Gui {
     /// by tests, which need the same rects `render_map` used.
     #[cfg(test)]
     last_map_panel_rect: egui::Rect,
+    /// egui `Id`s the last frame's layers panel actually resolved, in render
+    /// order. Only read by tests, which compare them either side of a resize:
+    /// an `Id` that moved with the layout silently discards the widget memory
+    /// egui keyed on it.
+    #[cfg(test)]
+    widget_id_probes: Vec<(&'static str, egui::Id)>,
+    /// The floating-chrome rects the last frame's chrome reported. Only read by
+    /// tests, which check they match what was painted.
+    #[cfg(test)]
+    last_excluded_rects: Vec<egui::Rect>,
     viewport_sync: bool,
     sync_layers: bool,
     // --- Radar loop settings ---
@@ -278,6 +288,10 @@ impl Gui {
             color_scale_orientation: ColorScaleOrientation::default(),
             #[cfg(test)]
             last_map_panel_rect: egui::Rect::ZERO,
+            #[cfg(test)]
+            widget_id_probes: Vec::new(),
+            #[cfg(test)]
+            last_excluded_rects: Vec::new(),
             viewport_sync: true,
             sync_layers: true,
             loop_lookback_secs: 3600, // default 1 hour
@@ -305,6 +319,8 @@ impl Gui {
         // responsive decision below reads `self.layout`; nothing recomputes a
         // width or a modality of its own.
         self.layout = LayoutCtx::resolve(ctx, &mut self.modality, self.safe_area_insets);
+        #[cfg(test)]
+        self.widget_id_probes.clear();
 
         // Create a root Ui to host the panels. Since egui 0.35 the Context-taking
         // `Panel::show` is gone and panels are Ui-scoped only, so this root Ui is
@@ -326,6 +342,10 @@ impl Gui {
         // the map's. See `ui_chrome.rs`.
         let chrome = self.render_chrome(&mut root_ui);
         actions.extend(chrome.actions);
+        #[cfg(test)]
+        {
+            self.last_excluded_rects = chrome.excluded_rects.clone();
+        }
 
         if let Some(action) = self.render_time_dialog(ctx) {
             actions.push(action);
@@ -568,7 +588,7 @@ impl Gui {
         self.render_radar_controls(ui, pane, combo_width, id_prefix);
 
         // --- Time navigation (forward/back/live) ---
-        self.render_time_navigation(ui, pane, actions);
+        self.render_time_navigation(ui, pane, id_prefix, actions);
 
         // --- Radar loop controls ---
         self.render_loop_controls(ui, pane, actions);
@@ -669,8 +689,11 @@ impl Gui {
         &mut self,
         ui: &mut egui::Ui,
         pane: &mut PaneState,
+        id_prefix: &str,
         actions: &mut Vec<GuiAction>,
     ) {
+        #[cfg(test)]
+        let probes = &mut self.widget_id_probes;
         ui.add_space(4.0);
 
         // Time step dropdown
@@ -682,7 +705,14 @@ impl Gui {
 
         ui.horizontal(|ui| {
             ui.label("Step:");
-            egui::ComboBox::from_id_salt("time_step_sel")
+            // Prefixed like the rest. It used to be bare, which was only safe
+            // because the desktop and mobile panels could never both exist.
+            #[cfg(test)]
+            probes.push((
+                "time_step_sel",
+                ui.make_persistent_id(format!("{id_prefix}time_step_sel")),
+            ));
+            egui::ComboBox::from_id_salt(format!("{id_prefix}time_step_sel"))
                 .selected_text(step_label)
                 .show_ui(ui, |ui| {
                     for &(secs, label) in Self::TIME_STEP_OPTIONS {
@@ -1113,6 +1143,30 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn map_panel_rect_for_test(&self) -> egui::Rect {
         self.last_map_panel_rect
+    }
+
+    /// The floating-chrome rects the last frame excluded from map clicks.
+    #[cfg(test)]
+    pub(crate) fn excluded_rects_for_test(&self) -> &[egui::Rect] {
+        &self.last_excluded_rects
+    }
+
+    /// The egui `Id`s the last frame's layers panel resolved.
+    #[cfg(test)]
+    pub(crate) fn widget_id_probes(&self) -> &[(&'static str, egui::Id)] {
+        &self.widget_id_probes
+    }
+
+    /// Open or close the layers drawer, as the hamburger does.
+    #[cfg(test)]
+    pub(crate) fn set_drawer_open(&mut self, open: bool) {
+        self.drawer_open = open;
+    }
+
+    /// This frame's resolved layout, for tests asserting on the breakpoint.
+    #[cfg(test)]
+    pub(crate) fn layout_for_test(&self) -> LayoutCtx {
+        self.layout
     }
 
     /// The pane rects the layout produces inside the map panel, as

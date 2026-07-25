@@ -241,7 +241,20 @@ impl super::Gui {
                 });
                 ui.separator();
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                // An explicit salt rather than egui's positional auto-id.
+                //
+                // This is defensive, not a fix for a live bug: the two header
+                // forms happen to allocate the same number of ids today (the
+                // drawer's close button is nested inside the `horizontal`, so
+                // it does not advance this Ui's counter), and the breakpoint
+                // test confirms the auto-id would currently be stable too. The
+                // salt makes that independent of *how many widgets precede it*,
+                // which is what an unrelated edit to the header would otherwise
+                // silently change — costing the user their scroll position on
+                // every resize, with nothing to point at.
+                let scroll = egui::ScrollArea::vertical()
+                    .id_salt("layers_scroll")
+                    .show(ui, |ui| {
                     self.render_pane_selector(ui, &mut pane);
                     self.render_layer_controls(
                         ui,
@@ -261,6 +274,15 @@ impl super::Gui {
                         menu_events = ui_menu::render_menu_drawer(ui, &model);
                     }
                 });
+
+                // Report the id egui really used, rather than reconstructing
+                // it: the test that pins id stability across a breakpoint has
+                // to be reading the same id the scroll state is stored under,
+                // or it proves nothing about that state surviving.
+                #[cfg(test)]
+                self.widget_id_probes.push(("layers_scroll", scroll.id));
+                #[cfg(not(test))]
+                let _ = scroll;
             });
 
         self.panes[self.active_pane] = pane;
