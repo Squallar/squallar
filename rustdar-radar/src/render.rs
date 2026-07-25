@@ -172,6 +172,41 @@ impl RadialContext {
 }
 
 /// Paired atomic image and value buffers for parallel rendering.
+///
+/// The atomics are load-bearing on native: `render_gate` is reached from a
+/// `par_iter` over radials, and two radials routinely land on the same pixel.
+///
+/// They are *not* load-bearing on wasm32, which is single-threaded — the
+/// `seq_fallback` above exists for exactly that reason — so a cfg-split to
+/// `Vec<u32>` there is an obvious-looking win, and was measured rather than
+/// assumed. It is not worth taking. Against a real KTLX 0.5° reflectivity
+/// sweep (720 radials × 1832 gates) at `IMAGE_SIZE` 1024, in a release build
+/// with the rasterizer isolated from WebGL and winit:
+///
+/// | what                                   | Firefox | Chromium |
+/// |----------------------------------------|--------:|---------:|
+/// | whole render                           |  233 ms |   261 ms |
+/// | 28 M relaxed `store` vs plain `Vec<u32>`| 39 / 37 |  47 / 48 |
+/// | `into_output` shape, atomic vs plain   | 0.8/0.4 |  0.7/0.3 |
+/// | `RenderBuffers::new`, atomic vs plain  | 0.2/0.3 |  0.3/0.2 |
+///
+/// That totals roughly 2.5 ms of a 233 ms frame — about 1%, and the same 1% in
+/// both browsers. The cost of the split is two divergent buffer types under one
+/// hot loop; the return does not pay for it.
+///
+/// The same measurements dispose of the theory that Firefox's 5.7× penalty on
+/// `radar-render` comes from these atomics. It does not: Firefox rasterizes
+/// this sweep *faster* than Chromium does, and relaxed atomic stores cost it
+/// 5% over plain ones. See `rustdar-web`'s crate docs for what is and is not
+/// still open there.
+///
+/// Where the frame actually goes is the per-sample transcendental in
+/// `types::lat_rad_to_mercator_y` — `(π/4 + lat/2).tan().ln()`, once per
+/// azimuth sample. 28 M of those cost 660 ms in Firefox and 597 ms in Chromium
+/// against 29 ms and 37 ms for the same loop without them, which puts this one
+/// call at most of the render on both. Reducing it means changing the arithmetic,
+/// and every pixel of the output is a function of that arithmetic, so it is not
+/// a change that can be made bit-identical — hence not made here.
 struct RenderBuffers {
     image: Vec<AtomicU32>,
     values: Vec<AtomicU32>,
