@@ -56,4 +56,4 @@ egui-winit = { workspace = true, features = ["links"] }
 # Pinned to what the egui/wgpu stack already resolves (wasm-bindgen 0.2.118).
 # A newer wasm-bindgen-futures wants a newer wasm-bindgen and the resolver
 # rejects the pair outright, so this version moves when that stack moves.
-wasm-bindgen-futures = "=0.4.68"
+wasm-bindgen-futures = "=0.4.76"
