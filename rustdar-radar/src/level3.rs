@@ -218,6 +218,105 @@ pub async fn fetch_latest_product(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::RadarProduct;
+
+    /// The AWIPS product ID and Level III message code for every product
+    /// rustdar renders from Level III data.
+    ///
+    /// Transcribed from NWS 2620001 (ICD for the RPG to Class 1 User), product
+    /// list. **Nothing here is derived from
+    /// [`RadarProduct::level3_products`]** — that is the whole point of the
+    /// table. It is keyed by `RadarProduct` rather than by AWIPS ID so it can
+    /// contradict the mapping: keyed by ID it could only ever agree, because
+    /// `DVL` decodes as message code 134 no matter which product asked for it.
+    ///
+    /// | product | AWIPS | message code | field |
+    /// |---|---|---|---|
+    /// | Storm Relative Velocity | `N0S` | 56 | Storm Relative Mean Radial Velocity |
+    /// | Specific Differential Phase | `N0K` | 163 | Specific Differential Phase |
+    /// | Echo Tops | `EET` | 135 | Enhanced Echo Tops |
+    /// | Vertically Integrated Liquid | `DVL` | 134 | Digital Vertically Integrated Liquid |
+    /// | Hydrometeor Classification | `HHC` | 177 | Hybrid Hydrometeor Classification |
+    /// | Precipitation Rate | `DPR` | 176 | Digital Instantaneous Precipitation Rate |
+    const ICD: &[(RadarProduct, &str, i16)] = &[
+        (RadarProduct::StormRelativeVelocity, "N0S", 56),
+        (RadarProduct::SpecificDifferentialPhase, "N0K", 163),
+        (RadarProduct::EchoTops, "EET", 135),
+        (RadarProduct::VerticallyIntegratedLiquid, "DVL", 134),
+        (RadarProduct::HydrometeorClassification, "HHC", 177),
+        (RadarProduct::PrecipitationRate, "DPR", 176),
+    ];
+
+    /// The ICD row for a product, or `None` if it has none.
+    fn icd_row(product: &RadarProduct) -> Option<&'static (RadarProduct, &'static str, i16)> {
+        ICD.iter().find(|(p, ..)| p == product)
+    }
+
+    /// Every Level III product must request the AWIPS ID the ICD gives for the
+    /// field rustdar renders it as.
+    ///
+    /// `every_level3_product_has_at_least_one_awips_code` checks only the
+    /// *shape* of the string — three characters, uppercase or digit — so it is
+    /// just as happy with `DVL` under Echo Tops as with `EET`. That swap does
+    /// not crash and does not even fail to decode: the Echo Tops pane fetches
+    /// Digital VIL, [`crate::render`]'s VIL look-up table keys on the *decoded*
+    /// product code 134 and so helps the wrong bytes decode cleanly in kg/m²,
+    /// and the Echo Tops palette then paints a 62 kg/m² VIL core and reports
+    /// "Echo Tops: 62.0 kft". Plausible numbers, plausible colours, wrong field,
+    /// no error anywhere.
+    ///
+    /// So the mapping is pinned per product against [`ICD`], transcribed from
+    /// the ICD rather than read back out of the code under test.
+    #[test]
+    fn each_level3_product_requests_the_awips_id_the_icd_gives_it() {
+        for product in RadarProduct::all() {
+            let Some(&(_, want, _)) = icd_row(product) else {
+                assert!(
+                    !product.is_level3(),
+                    "{} is Level III but has no row in the ICD table; add one \
+                     rather than leaving the mapping unpinned",
+                    product.name(),
+                );
+                continue;
+            };
+            assert!(
+                product.is_level3(),
+                "{} has an ICD row but is not reported as Level III",
+                product.name(),
+            );
+            let codes = product
+                .level3_products()
+                .unwrap_or_else(|| panic!("{} names no product code", product.name()));
+            assert_eq!(
+                codes,
+                [want],
+                "{} requests {codes:?}; the ICD gives {want} for that field",
+                product.name(),
+            );
+        }
+    }
+
+    /// The table must cover every Level III product and nothing else, so the
+    /// loop above cannot pass by skipping a product it forgot to list.
+    #[test]
+    fn the_icd_table_covers_exactly_the_level3_products() {
+        let level3: Vec<_> = RadarProduct::all().iter().filter(|p| p.is_level3()).collect();
+        assert_eq!(
+            ICD.len(),
+            level3.len(),
+            "the ICD table has {} rows for {} Level III products",
+            ICD.len(),
+            level3.len(),
+        );
+        // Distinct AWIPS IDs: a table that named one ID twice would let two
+        // products agree with it while pointing at the same field.
+        for (i, (_, code, _)) in ICD.iter().enumerate() {
+            assert!(
+                !ICD[..i].iter().any(|(_, other, _)| other == code),
+                "{code} appears twice in the ICD table",
+            );
+        }
+    }
 
     /// The rule is "drop the leading letter", not "strip a leading K".
     ///
@@ -325,7 +424,6 @@ mod tests {
     /// code, which would silently render an always-empty layer.
     #[test]
     fn every_level3_product_has_at_least_one_awips_code() {
-        use crate::types::RadarProduct;
         for product in RadarProduct::all() {
             let codes = product.level3_products();
             if product.is_level3() {
@@ -357,7 +455,6 @@ mod tests {
     /// renders — reintroduces three fetches that can only ever fail.
     #[test]
     fn the_discontinued_srm_tilts_are_not_requested() {
-        use crate::types::RadarProduct;
         let codes = RadarProduct::StormRelativeVelocity
             .level3_products()
             .expect("SRM is Level III");
@@ -377,50 +474,55 @@ mod tests {
 
     /// Every product rustdar asks for genuinely fetches and decodes.
     ///
-    /// This is the check that the migration works end to end: it lists the
-    /// live bucket, downloads the newest object, and decodes it — the exact
-    /// path the application takes. Nothing here is stubbed.
+    /// This is the check that the migration works end to end: for each Level
+    /// III product it takes the AWIPS ID out of
+    /// [`RadarProduct::level3_products`] — the mapping production fetches with,
+    /// not a literal repeated here — then lists the live bucket, downloads the
+    /// newest object and decodes it. Nothing is stubbed.
     ///
-    /// The decoded product code is compared against a table transcribed from
-    /// the NWS ICD (message codes), *not* recomputed from the AWIPS ID by the
-    /// code under test, so a wrong code mapping fails rather than agreeing
-    /// with itself.
+    /// The decoded message code is checked against [`ICD`] keyed by **product**.
+    /// That is what makes a wrong product→ID mapping fail here: keyed by AWIPS
+    /// ID instead, the table could only ever agree with the fetch, because
+    /// `DVL` decodes as 134 whichever product asked for it. Swap `EET` and
+    /// `DVL` in `level3_products` and this test downloads Digital VIL for Echo
+    /// Tops and sees 134 where the ICD says 135.
     #[ignore = "hits the live unidata-nexrad-level3 S3 bucket"]
     #[tokio::test]
     async fn live_every_requested_product_fetches_and_decodes() {
-        // AWIPS ID -> the Level III message code its product carries.
-        // From NWS 2620001 (ICD for the RPG to Class 1 User), product list.
-        const EXPECTED_CODE: &[(&str, i16)] = &[
-            ("N0S", 56),  // Storm Relative Mean Radial Velocity
-            ("N0K", 163), // Specific Differential Phase
-            ("EET", 135), // Enhanced Echo Tops
-            ("DVL", 134), // Digital Vertically Integrated Liquid
-            ("HHC", 177), // Hybrid Hydrometeor Classification
-            ("DPR", 176), // Digital Instantaneous Precipitation Rate
-        ];
-
         let sources = DataSources::production();
         let now = chrono::Utc::now().naive_utc();
 
-        for &(code, want_message_code) in EXPECTED_CODE {
-            let msg = fetch_latest_product(&sources, "KTLX", code, now)
-                .await
-                .unwrap_or_else(|e| panic!("{code} fetch failed: {e}"));
-            let got = msg.header.message_code;
-            println!(
-                "{code}: message_code={got}, product_code={}, symbology={}",
-                msg.pdb.product_code,
-                msg.symbology.is_some(),
-            );
-            assert_eq!(
-                got, want_message_code,
-                "{code} decoded as message code {got}, expected {want_message_code}",
-            );
-            assert!(
-                msg.symbology.is_some(),
-                "{code} decoded with no symbology block — the object arrived \
-                 but carries no display data",
-            );
+        for product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
+            let &(_, _, want_message_code) = icd_row(product)
+                .unwrap_or_else(|| panic!("{} has no ICD row", product.name()));
+            let codes = product
+                .level3_products()
+                .unwrap_or_else(|| panic!("{} names no product code", product.name()));
+
+            for &code in codes {
+                let msg = fetch_latest_product(&sources, "KTLX", code, now)
+                    .await
+                    .unwrap_or_else(|e| panic!("{} fetch of {code} failed: {e}", product.name()));
+                let got = msg.header.message_code;
+                println!(
+                    "{} -> {code}: message_code={got}, product_code={}, symbology={}",
+                    product.name(),
+                    msg.pdb.product_code,
+                    msg.symbology.is_some(),
+                );
+                assert_eq!(
+                    got, want_message_code,
+                    "{} fetches {code}, which decoded as message code {got}; \
+                     the ICD gives {want_message_code} for {}",
+                    product.name(),
+                    product.name(),
+                );
+                assert!(
+                    msg.symbology.is_some(),
+                    "{code} decoded with no symbology block — the object arrived \
+                     but carries no display data",
+                );
+            }
         }
     }
 
