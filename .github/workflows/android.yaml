@@ -22,33 +22,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Tier 1: no NDK, no C toolchain, a few seconds. `rustdar-android-theme` depends
-  # only on `jni` + `ndk-context`, both pure Rust, so this compiles with nothing but
-  # a rustup target. It alone would have caught the reported build break, whose
-  # first two errors (`JavaVM::from_raw(..).unwrap()`, one-arg `JObject::from_raw`)
-  # are in this crate. Kept as a separate job so the signal survives even if the
-  # NDK job below breaks on toolchain/image drift.
-  android-theme-check:
-    name: Android theme check (no NDK)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Rust
-        run: |
-          rustup default stable
-          rustup target add aarch64-linux-android
-      - name: Cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-      - name: cargo check (aarch64-linux-android)
-        run: cargo check -p rustdar-android-theme --target aarch64-linux-android
+  # An `android-theme-check` job used to sit here, cross-compiling the NDK-free
+  # `rustdar-android-theme` crate for aarch64 in seconds as a fast tier-1 canary.
+  # That crate is gone -- its function is now `rustdar_android::detect_dark_theme`.
+  #
+  # The signal is still available without an NDK, and covers strictly more than
+  # the old job did:
+  #
+  #     cargo check -p rustdar-android --features jni-typecheck
+  #
+  # See that feature's comment in `rustdar-android/Cargo.toml`. Wiring it up as a
+  # job is deliberately left to whoever owns this file next.
 
-  # Tier 2: the full cross-compile of the crate that actually produces
+  # The full cross-compile of the crate that actually produces
   # librustdar_android.so. This one needs the NDK, because `ring` (via reqwest ->
   # rustls) has a build script that compiles C and a bare `cargo check --target
   # aarch64-linux-android` will fail in it with no cross linker/sysroot. cargo-ndk
@@ -92,8 +78,7 @@ jobs:
             exit 1
           fi
           echo "Using NDK at $ANDROID_NDK_HOME"
-          cargo ndk -t arm64-v8a -t x86_64 check \
-            -p rustdar-android -p rustdar-android-theme
+          cargo ndk -t arm64-v8a -t x86_64 check -p rustdar-android
 
   # The *silent* half of the same failure. Bumping `jni` or
   # `rustls-platform-verifier` alone still compiles: cargo just links two copies of
@@ -133,7 +118,7 @@ jobs:
     name: Android success check
     if: always()
     runs-on: ubuntu-24.04
-    needs: [android-theme-check, android-check, android-dep-unification]
+    needs: [android-check, android-dep-unification]
     steps:
       - name: Report job results
         shell: bash

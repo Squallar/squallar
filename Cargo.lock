@@ -4102,14 +4102,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustdar-android-theme"
-version = "0.1.0"
-dependencies = [
- "jni",
- "ndk-context",
-]
-
-[[package]]
 name = "rustdar-egui"
 version = "0.1.0"
 dependencies = [
@@ -4198,7 +4190,6 @@ dependencies = [
  "env_logger",
  "log",
  "pollster",
- "rustdar-android-theme",
  "rustdar-egui",
  "rustdar-frontend",
  "rustdar-gps",

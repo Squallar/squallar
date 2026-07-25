@@ -18,7 +18,7 @@ Cargo workspace (`resolver = "2"`, edition 2024) with seven crates:
 | `rustdar-radar` | Radar data: AWS Level II fetching, TGFTP Level III fetching, 2048×2048 RGBA rendering via Web Mercator, `ColorScale` palettes, 207 NEXRAD sites, `RadarProduct` enum (13 variants). |
 | `rustdar-overlays` | Weather overlay data + render-agnostic logic. SPC outlooks, Mesoscale Discussions, NWS alerts, HRRR model data, METAR observations, storm reports. `OverlayHandler` trait + `OverlayRegistry` for type-erased overlay management. Rasterized to textures via tiny-skia. |
 | `nexrad-level3` | Level III product decoder (WMO headers, zlib/BZ2, radial packets). Product-specific LUT/threshold decoding lives in `rustdar-radar`. |
-| `rustdar-android` / `rustdar-android-theme` | Android entry point + JNI theme detection. Desktop stubs provided. |
+| `rustdar-android` | Android entry point (`cdylib`, `android_main`). Owns every JNI bridge — insets, compass, location, back handling, theme detection — and injects the callback-shaped ones into the `PlatformBridge` that `rustdar-platform` constructs. |
 
 ## Data Flow
 
@@ -28,7 +28,7 @@ Overlay fetching uses `OverlayRegistry::create_fetch_tasks()` → handler-specif
 
 ## Key Conventions
 
-- **`#![warn(clippy::all)]` and `#![forbid(unsafe_code)]`** on `rustdar-platform` and `nexrad-level3`. Only `rustdar-android-theme` uses `unsafe` (JNI).
+- **`#![warn(clippy::all)]` and `#![forbid(unsafe_code)]`** on `rustdar-platform`, `rustdar-frontend`, `rustdar-web` and `nexrad-level3`. `rustdar-android` is the only crate that uses `unsafe` (JNI) — which is *why* Android capabilities reach `rustdar-platform` as injected `fn` pointers rather than direct calls.
 - **CI:** `cargo clippy --fix` auto-applied, then strict clippy re-run. Always pass `cargo clippy --all-targets --all-features`.
 - **Generation counters** (`fetch_generation`, `render_generation`) guard against stale results. Increment before spawning; discard results with generation < current.
 - **`#[path]` submodule pattern:** Large files split via `#[path = "ui_xxx.rs"] mod xxx;`. Extracted methods use `impl super::Gui {}` with `pub(super)` visibility.

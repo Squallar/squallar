@@ -35,12 +35,11 @@ pollster = { workspace = true }
 winit = { workspace = true }
 env_logger = "=0.11.11"
 
-[target.'cfg(target_os = "android")'.dependencies]
-# Android theme detection
-rustdar-android-theme = { workspace = true }
-
 [target.'cfg(not(target_os = "android"))'.dependencies]
-# Cross-platform theme detection for desktop platforms
+# Cross-platform theme detection for desktop platforms. Android has no entry
+# here: this crate is `#![forbid(unsafe_code)]`, and reading the Android theme
+# means a JNI call. `rustdar-android` owns that read and injects it through
+# `PlatformBridge::set_theme_detector` — see `platform.rs`.
 dark-light = "=2.0.0"
 # Turn on the settings pane's serial-GPS controls for desktop only. Android
 # builds the serial reader (see rustdar-gps/serial above) but has never shown

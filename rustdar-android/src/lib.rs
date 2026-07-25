@@ -1,7 +1,13 @@
-#![cfg(target_os = "android")]
+// The `jni-typecheck` feature compiles everything below except `android_main`
+// for the host, so the JNI bodies get type-checked without an NDK. See the
+// feature's comment in Cargo.toml.
+#![cfg(any(target_os = "android", feature = "jni-typecheck"))]
+// Under that feature there is no `android_main`, so every helper it is the sole
+// caller of looks dead. They are not; they just have no host entry point.
+#![cfg_attr(not(target_os = "android"), allow(dead_code))]
 
 //! Android entry point for Rustdar Platform
-//! 
+//!
 //! This crate provides the Android-specific entry point and configuration
 //! for the Rustdar radar visualization application.
 
@@ -19,7 +25,6 @@ use winit::platform::android::activity::AndroidApp;
 /// behaviour of falling back to a default instead of panicking if `ndk_context`
 /// has not been initialised yet -- these helpers run on background threads where
 /// a panic would silently take out GPS or compass polling.
-#[cfg(target_os = "android")]
 fn android_vm() -> Option<jni::vm::JavaVM> {
     let vm = ndk_context::android_context().vm();
     if vm.is_null() {
@@ -30,7 +35,6 @@ fn android_vm() -> Option<jni::vm::JavaVM> {
 }
 
 /// Check whether the app has been granted ACCESS_FINE_LOCATION.
-#[cfg(target_os = "android")]
 fn has_location_permission() -> bool {
     use jni::objects::{JObject, JValue};
     use jni::{jni_sig, jni_str};
@@ -59,7 +63,6 @@ fn has_location_permission() -> bool {
 /// Request the ACCESS_FINE_LOCATION runtime permission.
 /// This shows the system permission dialog. The result is asynchronous;
 /// poll `has_location_permission()` afterwards to check the outcome.
-#[cfg(target_os = "android")]
 fn request_location_permission() {
     use jni::objects::{JObject, JValue};
     use jni::{jni_sig, jni_str};
@@ -93,7 +96,6 @@ fn request_location_permission() {
 
 /// Try to retrieve the device's last known GPS location via `LocationManager`.
 /// Returns a [`GpsFix`] on success or `None` if unavailable.
-#[cfg(target_os = "android")]
 fn get_last_known_location() -> Option<rustdar_gps::GpsFix> {
     let ctx = ndk_context::android_context();
     let vm = android_vm()?;
@@ -108,7 +110,6 @@ fn get_last_known_location() -> Option<rustdar_gps::GpsFix> {
 
 /// Body of [`get_last_known_location`], split out so it can keep using `?` on
 /// `Option` inside the `Env` closure that jni 0.22's attachment API requires.
-#[cfg(target_os = "android")]
 fn last_known_location_with(
     env: &mut jni::Env<'_>,
     context: *mut std::ffi::c_void,
@@ -224,7 +225,6 @@ fn last_known_location_with(
 
 /// Start a background thread that polls GPS location and sends updates
 /// through the provided channel. Also handles permission requests.
-#[cfg(target_os = "android")]
 fn start_location_thread(sender: std::sync::mpsc::Sender<rustdar_gps::GpsFix>) {
     std::thread::Builder::new()
         .name("gps-location".into())
@@ -254,7 +254,6 @@ fn start_location_thread(sender: std::sync::mpsc::Sender<rustdar_gps::GpsFix>) {
 
 /// Query the system window insets (status bar, navigation bar) in physical pixels.
 /// Returns (top, bottom, left, right) inset values.
-#[cfg(target_os = "android")]
 pub fn get_system_insets() -> (f32, f32, f32, f32) {
     let ctx = ndk_context::android_context();
     let Some(vm) = android_vm() else {
@@ -270,7 +269,6 @@ pub fn get_system_insets() -> (f32, f32, f32, f32) {
 
 /// Body of [`get_system_insets`], split out so it can `return` early from inside
 /// the `Env` closure that jni 0.22's attachment API requires.
-#[cfg(target_os = "android")]
 fn system_insets_with(
     env: &mut jni::Env<'_>,
     context: *mut std::ffi::c_void,
@@ -347,7 +345,6 @@ fn system_insets_with(
 }
 
 /// Fallback for Android < API 30: use deprecated getSystemWindowInset*() methods.
-#[cfg(target_os = "android")]
 fn get_legacy_insets(env: &mut jni::Env<'_>, insets_obj: &jni::objects::JObject<'_>) -> (f32, f32, f32, f32) {
     use jni::{jni_sig, jni_str};
 
@@ -367,7 +364,6 @@ fn get_legacy_insets(env: &mut jni::Env<'_>, insets_obj: &jni::objects::JObject<
 /// Takes the caller's `Env` rather than attaching its own: jni 0.22 attachments
 /// push a JNI stack frame, and nesting one inside `system_insets_with` would put
 /// the local references it is holding out of the top frame.
-#[cfg(target_os = "android")]
 fn android_api_level(env: &mut jni::Env<'_>) -> i32 {
     use jni::{jni_sig, jni_str};
 
@@ -378,7 +374,6 @@ fn android_api_level(env: &mut jni::Env<'_>) -> i32 {
 }
 
 /// Get the display density (pixels per dp) for converting physical to logical pixels.
-#[cfg(target_os = "android")]
 fn get_display_density() -> f32 {
     use jni::objects::JObject;
     use jni::{jni_sig, jni_str};
@@ -413,10 +408,76 @@ fn get_display_density() -> f32 {
     .unwrap_or(1.0)
 }
 
+/// Read the OS dark-theme preference out of `Configuration.uiMode`.
+///
+/// Handed to the Android `PlatformBridge` by [`android_main`] rather than called
+/// from it. `rustdar-platform`, which owns that bridge, is
+/// `#![forbid(unsafe_code)]` and could not host a JNI call even if it wanted to
+/// — and it cannot depend on this crate to borrow one, because this crate is the
+/// cdylib that depends on *it*. Injecting a `fn()` is the same inversion
+/// `set_insets_querier` and `set_back_handler` already use.
+///
+/// `dark-light` answers this on every other platform. It compiles for Android
+/// and returns a wrong answer there, which is why this exists at all.
+///
+/// Every failure path answers `false` (light) rather than propagating. Note that
+/// this is *not* a no-VM safety net: `ndk_context::android_context()` panics on
+/// its own `expect` if the context was never initialised, one line before
+/// [`android_vm`] gets to check anything, and android-activity always hands over
+/// a non-null VM pointer. The null check is defence in depth, not a path that
+/// runs.
+pub fn detect_dark_theme() -> bool {
+    use jni::objects::JObject;
+    use jni::{jni_sig, jni_str};
+
+    let ctx = ndk_context::android_context();
+    let Some(vm) = android_vm() else { return false };
+    let context_ptr = ctx.context();
+
+    let ui_mode = vm.attach_current_thread(|env| -> jni::errors::Result<i32> {
+        // This is the *Application*, not the Activity -- `ndk_context` stores
+        // `get_application(env, activity)`. That is fine here and only here:
+        // `getResources()` is declared on `Context`, so it resolves on either.
+        // It is also why this path keeps working while the Activity-only bridges
+        // in this file (`get_system_insets`, `move_task_to_back`,
+        // `request_location_permission`) bail out on their `is_instance_of`
+        // check. Do not copy this call shape to an Activity method.
+        let context = unsafe { JObject::from_raw(env, context_ptr.cast()) };
+
+        // Context.getResources().getConfiguration().uiMode
+        let resources = env
+            .call_method(
+                &context,
+                jni_str!("getResources"),
+                jni_sig!("()Landroid/content/res/Resources;"),
+                &[],
+            )?
+            .l()?;
+        let configuration = env
+            .call_method(
+                &resources,
+                jni_str!("getConfiguration"),
+                jni_sig!("()Landroid/content/res/Configuration;"),
+                &[],
+            )?
+            .l()?;
+
+        env.get_field(&configuration, jni_str!("uiMode"), jni_sig!("I"))?
+            .i()
+    });
+
+    let Ok(ui_mode) = ui_mode else { return false };
+
+    // Configuration.UI_MODE_NIGHT_MASK / UI_MODE_NIGHT_YES.
+    const UI_MODE_NIGHT_MASK: i32 = 0x30;
+    const UI_MODE_NIGHT_YES: i32 = 0x20;
+
+    (ui_mode & UI_MODE_NIGHT_MASK) == UI_MODE_NIGHT_YES
+}
+
 /// Minimize the app by calling Activity.moveTaskToBack(true) via JNI.
 /// This keeps the app alive in recents with a proper thumbnail instead
 /// of killing the process (which leaves a white box in recents).
-#[cfg(target_os = "android")]
 pub fn move_task_to_back() {
     use jni::objects::{JObject, JValue};
     use jni::{jni_sig, jni_str};
@@ -462,13 +523,11 @@ pub fn move_task_to_back() {
 ///
 /// jni 0.22: `Global` is generic over the Java type it references, so this keeps
 /// its `JClass`-ness and no longer needs an unsafe re-wrap to call statics on it.
-#[cfg(target_os = "android")]
 static COMPASS_CLASS: std::sync::OnceLock<jni::objects::Global<jni::objects::JClass<'static>>> =
     std::sync::OnceLock::new();
 
 /// Read the current compass heading from CompassHelper.getHeading().
 /// Returns `None` if the class wasn't loaded or no reading is available yet.
-#[cfg(target_os = "android")]
 fn get_compass_heading() -> Option<f32> {
     use jni::objects::JClass;
     use jni::{jni_sig, jni_str};
@@ -493,7 +552,6 @@ fn get_compass_heading() -> Option<f32> {
 
 /// Start a background thread that polls the compass heading every 200ms and
 /// sends updates through the provided channel.
-#[cfg(target_os = "android")]
 fn start_compass_thread(sender: std::sync::mpsc::Sender<f32>) {
     std::thread::Builder::new()
         .name("compass-heading".into())
@@ -525,7 +583,6 @@ fn start_compass_thread(sender: std::sync::mpsc::Sender<f32>) {
 /// packaged in the app. `Context.getClassLoader()` is the app loader and does.
 ///
 /// [`ClassLoader`]: <https://developer.android.com/reference/java/lang/ClassLoader>
-#[cfg(target_os = "android")]
 fn register_java_helper(
     env: &mut jni::Env<'_>,
     loader: &jni::objects::JObject<'_>,
@@ -704,6 +761,11 @@ fn android_main(app: AndroidApp) {
         log::info!("Safe area insets (logical): top={}, bottom={}, left={}, right={}", result.0, result.1, result.2, result.3);
         result
     });
+
+    // Hand the bridge the JNI theme read. NativeActivity never emits
+    // WindowEvent::ThemeChanged, so the bridge polls this to notice a
+    // light/dark switch; it also answers the initial query on the first frame.
+    platform_app.set_theme_detector(detect_dark_theme);
 
     // Start GPS location polling thread and wire it to the app
     let (location_sender, location_receiver) = std::sync::mpsc::channel();

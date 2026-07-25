@@ -143,7 +143,15 @@ impl PlatformBridge for DesktopPlatform {
 
 #[cfg(target_os = "android")]
 pub struct AndroidPlatform {
-    theme_receiver: std::sync::mpsc::Receiver<bool>,
+    /// Reads the OS dark-theme preference. `None` until `rustdar-android`
+    /// injects it — this crate is `#![forbid(unsafe_code)]` and the read is a
+    /// JNI call, so the reader cannot live here. See
+    /// [`PlatformBridge::set_theme_detector`].
+    theme_detector: Option<fn() -> bool>,
+    /// Theme changes seen by the poll thread `set_theme_detector` starts.
+    /// `None` until then, which is also what makes `poll_theme` inert on a
+    /// build that never wires a detector up.
+    theme_receiver: Option<std::sync::mpsc::Receiver<bool>>,
     gps_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_gps::GpsFix>>,
     heading_receiver: Option<std::sync::mpsc::Receiver<f32>>,
     insets_querier: Option<fn() -> (f32, f32, f32, f32)>,
@@ -153,30 +161,18 @@ pub struct AndroidPlatform {
 }
 
 #[cfg(target_os = "android")]
+impl Default for AndroidPlatform {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(target_os = "android")]
 impl AndroidPlatform {
     pub fn new() -> Self {
-        use rustdar_android_theme as android_theme;
-
-        let (theme_sender, theme_receiver) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("theme-detect".into())
-            .spawn(move || {
-            let mut last_theme = android_theme::detect_dark_theme();
-            let _ = theme_sender.send(last_theme);
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                let current = android_theme::detect_dark_theme();
-                if current != last_theme {
-                    last_theme = current;
-                    if theme_sender.send(current).is_err() {
-                        break;
-                    }
-                }
-            }
-        }).expect("failed to spawn theme-detect thread");
-
         Self {
-            theme_receiver,
+            theme_detector: None,
+            theme_receiver: None,
             gps_fix_receiver: None,
             heading_receiver: None,
             insets_querier: None,
@@ -190,7 +186,7 @@ impl AndroidPlatform {
 #[cfg(target_os = "android")]
 impl PlatformBridge for AndroidPlatform {
     fn poll_theme(&mut self) -> Option<bool> {
-        drain_latest(&self.theme_receiver)
+        self.theme_receiver.as_ref().and_then(drain_latest)
     }
 
     fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix> {
@@ -215,7 +211,28 @@ impl PlatformBridge for AndroidPlatform {
     }
 
     fn detect_dark_theme(&self) -> bool {
-        rustdar_android_theme::detect_dark_theme()
+        match self.theme_detector {
+            Some(detect) => detect(),
+            None => {
+                // Say something. This is the one injected capability whose
+                // absence is invisible: a missing back handler kills the app on
+                // Back, missing insets put the UI under the status bar, but a
+                // missing theme detector just looks like a working app to
+                // anyone not in dark mode. There is no second source to fall
+                // back to either -- `cached_dark_theme` is only reset by
+                // `WindowEvent::ThemeChanged`, which NativeActivity never
+                // emits, so the poll channel is the sole theme input here.
+                log::warn!(
+                    "no theme detector installed; assuming light. \
+                     android_main must call set_theme_detector before run_app"
+                );
+                debug_assert!(
+                    false,
+                    "AndroidPlatform::detect_dark_theme with no detector injected"
+                );
+                false
+            }
+        }
     }
 
     fn set_back_handler(&mut self, handler: fn()) {
@@ -254,6 +271,35 @@ impl PlatformBridge for AndroidPlatform {
 
     fn set_insets_querier(&mut self, querier: fn() -> (f32, f32, f32, f32)) {
         self.insets_querier = Some(querier);
+    }
+
+    /// Take the JNI theme reader and start polling it.
+    ///
+    /// NativeActivity gets no `WindowEvent::ThemeChanged`, so a light/dark
+    /// switch is only ever visible by re-reading `Configuration.uiMode`. The
+    /// polling loop, its exit condition and the reasoning for sampling
+    /// unconditionally all live in [`spawn_state_poller`] — it is plain Rust
+    /// with no JNI in it, and it is tested there.
+    fn set_theme_detector(&mut self, detector: fn() -> bool) {
+        if self.theme_receiver.is_some() {
+            // Assigning the detector here anyway would leave the synchronous
+            // path on the new one while the running thread keeps calling the
+            // old — so refuse the whole call rather than half-apply it.
+            log::warn!("theme detector already installed; ignoring the second one");
+            return;
+        }
+        self.theme_detector = Some(detector);
+
+        match rustdar_frontend::platform::spawn_state_poller(
+            "theme-detect",
+            std::time::Duration::from_secs(2),
+            detector,
+        ) {
+            Ok(receiver) => self.theme_receiver = Some(receiver),
+            // Not fatal: `detect_dark_theme` still answers synchronously, so the
+            // app opens in the right theme and simply will not track changes.
+            Err(e) => log::error!("could not start theme polling, theme will not track changes: {e}"),
+        }
     }
 }
 

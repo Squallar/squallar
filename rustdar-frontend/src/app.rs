@@ -503,6 +503,11 @@ impl App {
         self.platform.set_insets_querier(querier);
     }
 
+    /// Set a callback that reads the OS dark-theme preference (Android only).
+    pub fn set_theme_detector(&mut self, detector: fn() -> bool) {
+        self.platform.set_theme_detector(detector);
+    }
+
     fn handle_input_events(&mut self, event_loop: &ActiveEventLoop) {
         if self.input.key_pressed(KeyCode::Escape) {
             self.request_exit(Some(event_loop));
