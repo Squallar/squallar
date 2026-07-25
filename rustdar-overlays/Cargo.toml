@@ -7,7 +7,31 @@ edition.workspace = true
 chrono = { workspace = true }
 earcutr = "=0.5.0"
 flate2 = { workspace = true }
-grib = { version = "=0.15.1", default-features = true }
+# Defaults OFF, and deliberately not hoisted into `[workspace.dependencies]`:
+# Cargo silently ignores a member's `default-features = false` when the
+# workspace entry leaves defaults on, so a shared pin here would quietly link
+# the C/C++ stack back in with everything still compiling. grib has exactly one
+# consumer, so the pin stays local where the opt-out is guaranteed to apply.
+#
+# grib's default feature set pulls `openjpeg-sys`, `libaec-sys` and `proj`
+# (-> `proj-sys` -> `libsqlite3-sys`, `link-cplusplus`). None of those
+# cross-compile to wasm32 or iOS. Dropping them costs:
+#
+#   * `jpeg2000-unpack-with-openjpeg` — JPEG2000 (data representation template
+#     5.40/5.40000). HRRR does not use it: its section 5 is DRT 5.3, complex
+#     packing with spatial differencing, which is pure Rust in grib.
+#   * `ccsds-unpack-with-libaec` — AEC/CCSDS (DRT 5.42). Not used by HRRR.
+#   * `gridpoints-proj` — lat/lon computation for grid templates 3.20 (polar
+#     stereographic) and 3.30 (Lambert conformal). HRRR *is* 3.30, so this one
+#     is not free: `hrrr::lambert` reimplements it in pure Rust and
+#     `hrrr::fetch::grid_latlons` routes template 3.30 to it.
+#
+# `png-unpack-with-png-crate` and `time-calculation` are kept: both are pure
+# Rust, and `time-calculation` backs `temporal_raw_info()` in the fetch path.
+grib = { version = "=0.15.1", default-features = false, features = [
+    "png-unpack-with-png-crate",
+    "time-calculation",
+] }
 rustdar-units = { workspace = true }
 futures = "=0.3.32"
 log = { workspace = true }
@@ -27,6 +51,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 [target.'cfg(target_os = "android")'.dependencies]
 # Force vendored OpenSSL for Android builds to avoid cross-compilation issues
 openssl-sys = { workspace = true }
-# proj-sys (via grib → proj) needs SQLite3 at build time, but the NDK sysroot
-# doesn't include SQLite3 development headers. Bundle it from source.
-libsqlite3-sys = { version = "=0.35.0", features = ["bundled"] }
+# NOTE: `libsqlite3-sys` used to be pinned here with `features = ["bundled"]`,
+# because proj-sys (via grib -> proj) needed SQLite3 headers the NDK sysroot
+# does not ship. grib no longer pulls proj (see the `grib` pin above), so
+# nothing in this crate's graph needs SQLite3 and the workaround is gone.

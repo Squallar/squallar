@@ -9,6 +9,7 @@
 //! [`ModelParameter::forecast_hour`].
 
 pub mod fetch;
+pub mod lambert;
 
 use crate::types::GeoBounds;
 

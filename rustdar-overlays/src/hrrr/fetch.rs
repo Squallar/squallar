@@ -9,16 +9,29 @@
 //!
 //! Field selection (`var_*`/`lev_*`) is the only filtering that actually
 //! takes effect. NOMADS does **not** subset Lambert-conformal grids, so the
-//! `subregion`/`toplat`/`leftlon`/`rightlon`/`bottomlat` parameters below are
-//! inert: every response is the full 1799×1059 CONUS grid, 1.7–3.3 MB
-//! depending on the field's bit depth. That costs bandwidth but not
+//! `subregion`/`toplat`/`leftlon`/`rightlon`/`bottomlat` parameters below do
+//! not reduce the area: every response is the full 1799×1059 CONUS grid,
+//! 1.7–3.3 MB depending on the field's bit depth. That costs bandwidth but not
 //! correctness — `parse_grib2` derives bounds from the grid it is actually
 //! handed, never from the requested subregion.
+//!
+//! They are not, however, *inert*. Passing `subregion` at all makes NOMADS
+//! re-encode the record through wgrib2 instead of streaming the operational
+//! bytes, which has two visible effects:
+//!
+//!   * the data representation template changes from 5.3 (complex packing with
+//!     spatial differencing) to 5.0 (simple packing) — both pure Rust in grib,
+//!     so neither needs the JPEG2000 or CCSDS features this crate drops;
+//!   * `Lo1` is re-rounded from 237280472 to 237280471 microdegrees, which
+//!     rotates the computed grid by ~1.1e-6° at the far corner. Harmless,
+//!     because the projection anchors on whatever `Lo1` the file states, but
+//!     see `hrrr::lambert`'s fixture docs before re-deriving any test constant
+//!     from a downloaded file.
 
 use chrono::{NaiveDate, NaiveDateTime, Timelike, Utc};
-use grib::{Grib2SubmessageDecoder, LatLons};
+use grib::{Grib2SubmessageDecoder, GridDefinitionTemplateValues, LatLons, SubMessage};
 
-use super::{HrrrFetchResult, HrrrGridData, ModelParameter};
+use super::{HrrrFetchResult, HrrrGridData, ModelParameter, lambert};
 use crate::types::GeoBounds;
 
 /// CONUS subregion bounds for the NOMADS filter request.
@@ -100,6 +113,46 @@ fn latest_available_run() -> (NaiveDate, u8) {
     (date, hour)
 }
 
+/// Lat/lon of every grid point of a submessage, in scanning-mode order.
+///
+/// `grib` is built with `default-features = false` so it links no C or C++ —
+/// see `rustdar-overlays/Cargo.toml`. That drops its `gridpoints-proj` feature,
+/// and with it the *only* implementation of `latlons()` for grid definition
+/// template 3.30 (Lambert conformal): grib returns `NotSupported` instead.
+///
+/// HRRR is template 3.30 for every field, so without the branch below every
+/// HRRR fetch would fail here. [`lambert::latlons`] is the pure-Rust
+/// replacement. Any other template still goes through grib, which handles the
+/// regular lat/lon and Gaussian ones with no PROJ involvement.
+fn grid_latlons<R>(submessage: &SubMessage<'_, R>) -> Result<Vec<(f64, f64)>, String> {
+    let grid_def = submessage.grid_def();
+    let template = GridDefinitionTemplateValues::try_from(grid_def)
+        .map_err(|e| format!("Cannot read grid definition: {e}"))?;
+
+    match template {
+        GridDefinitionTemplateValues::Template30(ref lambert_grid) => {
+            let points = lambert::latlons(lambert_grid)?;
+            // Same guard grib applies to its own iterators: section 3 states
+            // how many points there are, and a mismatch means the grid we
+            // walked is not the grid the data was packed against.
+            let declared = grid_def.num_points() as usize;
+            if points.len() != declared {
+                return Err(format!(
+                    "Lambert grid point count mismatch: {declared} declared in \
+                     section 3 vs {} computed",
+                    points.len(),
+                ));
+            }
+            Ok(points)
+        }
+        _ => Ok(submessage
+            .latlons()
+            .map_err(|e| format!("Cannot compute grid lat/lons: {e}"))?
+            .map(|(lat, lon)| (f64::from(lat), f64::from(lon)))
+            .collect()),
+    }
+}
+
 /// Parse GRIB2 bytes into `HrrrGridData`.
 fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, String> {
     let grib2 = grib::from_reader(std::io::Cursor::new(bytes))
@@ -112,10 +165,7 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
         .ok_or_else(|| "No submessages in GRIB2 data".to_string())?;
 
     // Collect lat/lon grid points first (borrows submessage, releases on collect).
-    let latlon_pairs: Vec<(f32, f32)> = submessage
-        .latlons()
-        .map_err(|e| format!("Cannot compute grid lat/lons: {e}"))?
-        .collect();
+    let latlon_pairs = grid_latlons(&submessage)?;
 
     // Get grid dimensions.
     let (ni, nj) = submessage
@@ -169,8 +219,6 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
     let mut max_lon = f64::MIN;
 
     for &(lat, lon) in &latlon_pairs {
-        let lat = lat as f64;
-        let lon = lon as f64;
         lats.push(lat);
         lons.push(lon);
         if lat < min_lat { min_lat = lat; }
