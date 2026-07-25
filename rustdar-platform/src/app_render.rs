@@ -1572,10 +1572,20 @@ mod loop_dispatch_tests {
     /// The frame list and the download queue are the two halves of one plan: every
     /// frame must have a download queued, or it never settles and the loop hangs in
     /// `Rendering`. That has to survive the sampling that caps long listings.
+    ///
+    /// Taking the listing also has to *advance* the phase. This is the one fixture
+    /// that starts where a real loop starts — `FetchingScanList`, set by
+    /// `new_for_loop` and left there until its listing lands — so a missing advance
+    /// reads as a loop still fetching rather than as a value already in place.
+    /// Left in `FetchingScanList`, `is_fetching()` never goes false: the pane keeps
+    /// its "fetching" label and keeps asking for continuous repaints forever.
     #[test]
     fn the_frame_list_and_the_download_queue_describe_the_same_scans() {
         let ctx = egui::Context::default();
         let mut ls = loop_on(&ctx, "KTLX", &[]);
+        ls.phase = LoopPhase::FetchingScanList;
+        assert!(ls.is_fetching(), "precondition: a loop awaiting its listing");
+
         let scans: Vec<_> = (0..(MAX_LOOP_FRAMES as u32 + 40))
             .map(|i| (ts(i), identifier(&format!("KTLX2024010{}_V06", i))))
             .collect();
@@ -1590,6 +1600,7 @@ mod loop_dispatch_tests {
         );
         assert_eq!(ls.current_frame, ls.frames.len() - 1, "playback starts at the newest");
         assert_eq!(ls.phase, LoopPhase::Rendering);
+        assert!(!ls.is_fetching(), "and the loop has stopped reading as fetching");
     }
 
     /// A finished download is filed under the site it was fetched from, which the
