@@ -360,3 +360,168 @@ impl OverlayHandler for ModelDataHandler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::GeoBounds;
+
+    const RUN_HOUR: u32 = 3;
+
+    fn grid(parameter: ModelParameter, values: Vec<f32>) -> HrrrGridData {
+        let n = values.len();
+        let (visible_points, value_range) = crate::hrrr::summarize_values(&values, parameter);
+        HrrrGridData {
+            parameter,
+            values,
+            lats: vec![35.0; n],
+            lons: vec![-97.0; n],
+            ni: n,
+            nj: 1,
+            bounds: GeoBounds {
+                min_lat: 35.0,
+                max_lat: 35.0,
+                min_lon: -97.0,
+                max_lon: -97.0,
+            },
+            ref_time: chrono::NaiveDate::from_ymd_opt(2026, 7, 25)
+                .unwrap()
+                .and_hms_opt(RUN_HOUR, 0, 0)
+                .unwrap(),
+            forecast_hour: parameter.forecast_hour(),
+            visible_points,
+            value_range,
+        }
+    }
+
+    /// An enabled handler showing `parameter`, holding `values` for it.
+    fn handler(parameter: ModelParameter, values: Vec<f32>) -> ModelDataHandler {
+        let mut h = ModelDataHandler::new();
+        h.enabled = true;
+        h.selected_param = parameter;
+        h.apply_fetch_result(Box::new(HrrrFetchResult(Ok(grid(parameter, values)))));
+        h
+    }
+
+    fn controls_of(h: &ModelDataHandler) -> Vec<ControlItem> {
+        h.controls(&PaneControlContext {
+            pane_idx: 0,
+            pane_state: None,
+        })
+    }
+
+    /// The toggle label, which is where the timestamp lives.
+    fn toggle_label(h: &ModelDataHandler) -> String {
+        controls_of(h)
+            .into_iter()
+            .find_map(|i| match i {
+                ControlItem::Toggle { label, .. } => Some(label),
+                _ => None,
+            })
+            .expect("a toggle")
+    }
+
+    /// Every `InfoText` line, in order.
+    fn info_lines(h: &ModelDataHandler) -> Vec<String> {
+        controls_of(h)
+            .into_iter()
+            .filter_map(|i| match i {
+                ControlItem::InfoText { text } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// UH comes from f01, so it is valid an hour after the run. Labelling it
+    /// with the run time alone would present a forecast as the analysis.
+    #[test]
+    fn a_forecast_hour_is_visible_in_the_toggle_label() {
+        let label = toggle_label(&handler(ModelParameter::MaxUH2to5km, vec![120.0]));
+        assert!(label.contains("F01"), "{label}");
+        assert!(label.contains("04:00z"), "forecast valid time expected: {label}");
+        assert!(!label.contains("03:00z"), "run time must not stand in: {label}");
+    }
+
+    /// Analysis fields must not grow a forecast suffix.
+    #[test]
+    fn an_analysis_field_is_labelled_with_its_run_time_only() {
+        let label = toggle_label(&handler(ModelParameter::SurfaceBasedCin, vec![-400.0]));
+        assert!(label.contains("03:00z"), "{label}");
+        assert!(!label.contains("F0"), "{label}");
+    }
+
+    /// "UH2-5 at 04:00z" still invites reading as a snapshot; it is a maximum
+    /// over the whole hour and has to say so.
+    #[test]
+    fn a_windowed_parameter_states_its_accumulation_window() {
+        let lines = info_lines(&handler(ModelParameter::MaxUH2to5km, vec![120.0]));
+        let note = lines
+            .iter()
+            .find(|l| l.contains("Maximum over"))
+            .unwrap_or_else(|| panic!("no window note in {lines:?}"));
+        assert!(note.contains("03:00z"), "{note}");
+        assert!(note.contains("04:00z"), "{note}");
+        assert!(note.contains("not an analysis"), "{note}");
+    }
+
+    #[test]
+    fn an_analysis_field_has_no_window_note() {
+        let lines = info_lines(&handler(ModelParameter::SurfaceBasedCin, vec![-400.0]));
+        assert!(
+            !lines.iter().any(|l| l.contains("Maximum over")),
+            "{lines:?}",
+        );
+    }
+
+    /// The failure this change exists to prevent: a grid that fetched and
+    /// decoded perfectly and paints nothing must not do so quietly.
+    #[test]
+    fn a_blank_overlay_explains_itself_in_the_controls() {
+        let lines = info_lines(&handler(ModelParameter::MaxUH2to5km, vec![0.0; 8]));
+        let notice = lines
+            .iter()
+            .find(|l| l.contains("uniformly"))
+            .unwrap_or_else(|| panic!("a blank overlay said nothing: {lines:?}"));
+        assert!(notice.contains("UH2-5"), "{notice}");
+        assert!(notice.contains("0 m\u{b2}/s\u{b2}"), "{notice}");
+    }
+
+    /// A field with data must stay quiet, or the notice is just noise.
+    #[test]
+    fn a_populated_overlay_reports_no_problem() {
+        let lines = info_lines(&handler(ModelParameter::MaxUH2to5km, vec![120.0, 0.0]));
+        assert!(!lines.iter().any(|l| l.contains('\u{26a0}')), "{lines:?}");
+    }
+
+    /// The HTTP 500 that made both UH parameters useless appeared only in the
+    /// log. An enabled overlay with no data has to say why.
+    #[test]
+    fn a_fetch_error_is_reported_in_the_controls() {
+        let mut h = ModelDataHandler::new();
+        h.enabled = true;
+        h.selected_param = ModelParameter::MaxUH2to5km;
+        h.apply_fetch_result(Box::new(HrrrFetchResult(Err("HTTP 500".into()))));
+
+        let lines = info_lines(&h);
+        assert!(
+            lines.iter().any(|l| l.contains("HTTP 500")),
+            "fetch error must be surfaced, got {lines:?}",
+        );
+    }
+
+    /// A recovered fetch must clear the stale error.
+    #[test]
+    fn a_successful_fetch_clears_a_previous_error() {
+        let mut h = ModelDataHandler::new();
+        h.enabled = true;
+        h.selected_param = ModelParameter::MaxUH2to5km;
+        h.apply_fetch_result(Box::new(HrrrFetchResult(Err("HTTP 500".into()))));
+        h.apply_fetch_result(Box::new(HrrrFetchResult(Ok(grid(
+            ModelParameter::MaxUH2to5km,
+            vec![120.0],
+        )))));
+
+        let lines = info_lines(&h);
+        assert!(!lines.iter().any(|l| l.contains("HTTP 500")), "{lines:?}");
+    }
+}
