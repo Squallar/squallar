@@ -107,12 +107,9 @@ pub async fn fetch_glm_flashes(
             });
         }
 
-        in_window += listing.keys.len();
-
-        let new_keys: Vec<&str> = listing.keys.iter()
-            .filter(|k| !cache.contains_key(k.as_str()))
-            .map(|k| k.as_str())
-            .collect();
+        let plan = plan_downloads(&listing.keys, cache);
+        in_window += plan.in_window;
+        let new_keys = plan.new_keys;
 
         if new_keys.is_empty() {
             continue;
@@ -151,6 +148,33 @@ pub async fn fetch_glm_flashes(
         parse_failures: summarize_failures(in_window, parse_errors),
         transport_failures: summarize_failures(in_window, transport_errors),
     })
+}
+
+/// What one satellite's listing means for this poll.
+struct PollPlan<'a> {
+    /// Every key the listing placed in the window — the failure-ratio
+    /// denominator.
+    in_window: usize,
+    /// The subset that still has to be downloaded.
+    new_keys: Vec<&'a str>,
+}
+
+/// Decide what to download, and what the window contains.
+///
+/// The two numbers are deliberately different and must stay that way: cached
+/// successes drop out of `new_keys` while failures are never cached and are
+/// retried every poll, so using `new_keys.len()` as the denominator makes a
+/// single persistent failure look like a total outage after a few ticks. Pure,
+/// so that distinction is testable without touching the network.
+fn plan_downloads<'a>(keys: &'a [String], cache: &GlmCache) -> PollPlan<'a> {
+    PollPlan {
+        in_window: keys.len(),
+        new_keys: keys
+            .iter()
+            .filter(|k| !cache.contains_key(k.as_str()))
+            .map(|k| k.as_str())
+            .collect(),
+    }
 }
 
 /// Result of listing S3 for one satellite, with enough context to tell an
@@ -449,23 +473,34 @@ fn summarize_failures(in_window: usize, errors: Vec<String>) -> Option<FetchFail
     })
 }
 
+/// Fetch the raw bytes of one object. Every failure here is a transport
+/// failure, by construction — the function has no idea what the bytes mean.
+async fn download_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
+    client.get(url)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP error: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("HTTP status error: {e}"))?
+        .bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("Failed to read body: {e}"))
+}
+
 /// Download a single GLM NetCDF file and parse data from it.
+///
+/// The two stages are split so the transport/parse classification is carried by
+/// the type system at exactly two call sites, rather than repeated at each
+/// error site where one could drift. Mislabelling a 503 as a parse failure
+/// tells the user their product changed when S3 merely throttled them.
 async fn download_and_parse_one(
     client: &reqwest::Client,
     url: &str,
     satellite: GlmSatellite,
     levels: &[GlmDataLevel],
 ) -> Result<Vec<GlmFlash>, FileError> {
-    let bytes = client.get(url)
-        .send()
-        .await
-        .map_err(|e| FileError::Transport(format!("HTTP error: {e}")))?
-        .error_for_status()
-        .map_err(|e| FileError::Transport(format!("HTTP status error: {e}")))?
-        .bytes()
-        .await
-        .map_err(|e| FileError::Transport(format!("Failed to read body: {e}")))?;
-
+    let bytes = download_bytes(client, url).await.map_err(FileError::Transport)?;
     parse_glm_netcdf(&bytes, satellite, levels).map_err(FileError::Parse)
 }
 
@@ -969,6 +1004,42 @@ mod tests {
             outcome.transport_errors,
             vec!["c.nc: HTTP status error: 503"],
             "a 503 is a network problem and must never be counted as a parse failure"
+        );
+    }
+
+    /// The failure denominator counts the whole window, not just this poll's
+    /// downloads. Successes are cached and stop being re-downloaded; failures
+    /// are retried every poll. Conflating the two is what made one corrupt
+    /// granule read as "1/1 — everything failed" after a few ticks.
+    #[test]
+    fn poll_plan_separates_window_size_from_work_to_do() {
+        let keys: Vec<String> = (0..12).map(|i| format!("k{i}.nc")).collect();
+
+        let mut cache = GlmCache::default();
+        for key in keys.iter().take(9) {
+            cache.insert(key.clone(), Vec::new());
+        }
+
+        let plan = plan_downloads(&keys, &cache);
+        assert_eq!(
+            plan.in_window, 12,
+            "the window still contains every listed file, cached or not"
+        );
+        assert_eq!(plan.new_keys.len(), 3, "only the uncached ones need downloading");
+
+        // The pathological steady state: everything cached but one straggler,
+        // which is what a 20 s poll against 20 s granules looks like.
+        let mut cache = GlmCache::default();
+        for key in keys.iter().take(11) {
+            cache.insert(key.clone(), Vec::new());
+        }
+        let plan = plan_downloads(&keys, &cache);
+        assert_eq!(plan.new_keys.len(), 1);
+        let report = summarize_failures(plan.in_window, vec!["k11.nc: boom".into()])
+            .expect("one failure");
+        assert!(
+            !report.is_total(),
+            "one straggler failing must never read as a total outage, got {report:?}"
         );
     }
 
