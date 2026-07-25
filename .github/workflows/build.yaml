@@ -21,3 +21,58 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Build
         run: cargo build --all-targets --all-features --workspace
+
+  test:
+    name: Test
+    runs-on: rustdar-runner-set
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install Rust
+        run: rustup default stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # This invocation MUST stay workspace-scoped. Do not "optimise" it into
+      # per-crate jobs (`cargo test -p <crate>`): `cargo test -p rustdar-egui`
+      # does not even compile. rustdar-egui declares rustdar-gps with
+      # `default-features = false`, but rustdar-egui/src/ui_settings.rs calls
+      # `rustdar_gps::detect_gps_ports()`, which is gated behind rustdar-gps's
+      # `serial` feature. Only workspace-wide feature unification saves it:
+      # rustdar-gps is itself a workspace member, so `--workspace` selects it with
+      # its default features (`serial`), and the unified feature set is what
+      # rustdar-egui ends up compiling against.
+      #
+      # Deliberately no `--all-features` here (unlike the build job above).
+      # `serial` is currently the only feature in the whole workspace and it is
+      # already enabled by default, so `--all-features` would buy exactly zero
+      # extra coverage today. What it would do is hard-code "always link
+      # serialport" -- a native, host-only dependency -- into the test command,
+      # which breaks the moment a wasm or iOS target job reuses it.
+      - name: Test
+        run: cargo test --workspace
+
+  build-success:
+    name: Build success check
+    # Aggregate gate: one status check to require in branch protection, so a new
+    # job added above cannot fail silently. `always()` is what makes it real --
+    # without it this job would be skipped (not failed) whenever a dependency
+    # fails, and a skipped check does not block.
+    #
+    # `needs` cannot cross workflows, so Clippy (clippy.yaml) is intentionally
+    # not covered here and must be required separately.
+    if: always()
+    runs-on: rustdar-runner-set
+    needs: [build, test]
+    steps:
+      - name: Report job results
+        shell: bash
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: echo "$NEEDS"
+      # Expression-based rather than jq-based so this gate has no dependency on
+      # what happens to be installed in the runner image.
+      - name: Fail if any job did not succeed
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}
+        shell: bash
+        run: |
+          echo "::error::One or more required jobs did not succeed; see the results printed above."
+          exit 1
