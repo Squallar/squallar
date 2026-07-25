@@ -27,10 +27,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           token: ${{ steps.app-token.outputs.token }}
+      # `rustup show` materialises the channel, `clippy`, and every cross-target
+      # in rust-toolchain.toml -- which this job now needs, because it verifies
+      # the wasm and Android arms before letting the bot commit.
       - name: Install Rust
-        run: |
-          rustup default stable
-          rustup component add clippy
+        run: rustup show
       - name: Install system deps
         run: |
           sudo apt-get update
@@ -41,10 +42,51 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-clippy-
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked --version ^4
       - name: Apply Clippy autofixes
         run: cargo clippy --all-targets --all-features --fix || true
+
+      # ---------------------------------------------------------------------
+      # The gate on the autofix. Nothing below this runs if it fails, and that
+      # includes the commit+push.
+      # ---------------------------------------------------------------------
+      #
+      # This bot pushes straight to main. Before, it committed unconditionally
+      # and re-ran clippy *after* the push, so the only thing that had ever
+      # inspected the rewritten tree at push time was `--fix` itself. A rewrite
+      # that broke the build was already on main by the time anything noticed.
+      #
+      # Host-only verification is not enough here, and the reason is specific to
+      # this repo: `--fix` runs on the host, so it only ever *sees* the host cfg
+      # arms -- but the edits it makes land in shared source that the Android and
+      # wasm arms also compile. Dropping a "redundant" clone or narrowing a
+      # parameter type is invisible to the host build and can still break a call
+      # site behind `#[cfg(target_os = "android")]`, which is exactly the class of
+      # break the Build matrix exists for. Checking the cross arms costs one
+      # cargo-ndk install and two `check`s; pushing a broken main costs more.
+      #
+      # `check`, not `build`: this is verifying that a source rewrite still
+      # compiles, and linking adds nothing to that.
+      - name: Verify the autofixed tree still builds (host)
+        run: cargo build --workspace --all-targets --all-features
+      - name: Verify the autofixed tree still builds (wasm32)
+        run: cargo check -p rustdar-web --lib --target wasm32-unknown-unknown
+      - name: Verify the autofixed tree still builds (Android arm64-v8a)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Read in the shell: GitHub's `env` context does not carry runner OS
+          # variables, so `${{ env.ANDROID_NDK_LATEST_HOME }}` is empty.
+          export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_ROOT:-}}}"
+          if [ -z "$ANDROID_NDK_HOME" ] || [ ! -d "$ANDROID_NDK_HOME" ]; then
+            echo "::error::No Android NDK on this runner. Refusing to auto-commit a tree whose Android arm was never compiled."
+            exit 1
+          fi
+          cargo ndk -t arm64-v8a -P 28 check -p rustdar-android --lib
+
       - uses: stefanzweifel/git-auto-commit-action@4a55954c782fc1ea30b9056cd3e7a2b40ca8887d # v7.2.0
         with:
           commit_message: "chore: Apply clippy fixes"
