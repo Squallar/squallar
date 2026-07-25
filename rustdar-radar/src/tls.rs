@@ -14,16 +14,24 @@
 //! * `reqwest::ClientBuilder::build` reads `CryptoProvider::get_default()` and,
 //!   with `rustls-no-provider`, `panic!("No provider set")` if it is absent. The
 //!   panic lands wherever the *first* client happens to be built -- which for
-//!   `nexrad-data` is inside a `once_cell::sync::Lazy`, i.e. on the first S3
-//!   request, long after startup. Any test that does not open a socket passes.
+//!   [`crate::archive`] is inside a `OnceLock`, i.e. on the first S3 request,
+//!   long after startup. Any test that does not open a socket passes.
 //! * Installing late is just as bad as not installing: whoever builds the first
 //!   client wins, and every client built afterwards silently keeps that provider.
 //!
 //! Rather than rely on entry points remembering to call [`init`] early enough,
 //! every path in this workspace that can reach a client construction calls it
-//! first: [`crate::scan`] wraps `nexrad-data`'s two network entry points, and
-//! [`client`] is the only constructor the application uses. Entry points call it
-//! too, which is belt-and-braces rather than the load-bearing guarantee.
+//! first: [`client`] is the only constructor the application uses, including
+//! from [`crate::archive`], and [`crate::scan`] additionally calls [`init`] at
+//! the top of its two network wrappers. Entry points call it too, which is
+//! belt-and-braces rather than the load-bearing guarantee.
+//!
+//! Until the archive moved off `nexrad-data`'s `aws` feature, this was less
+//! load-bearing than it looked: that feature pinned `reqwest/rustls`, which
+//! compiled `aws-lc-rs` in, and a client built without [`init`] silently used
+//! *that* instead of panicking. With `aws-lc-sys` out of the graph the panic is
+//! real, which is why two `rustdar-overlays` tests that built their own client
+//! had to start calling [`init`].
 
 /// The User-Agent every rustdar client sends.
 ///
@@ -113,10 +121,10 @@ mod tests {
     /// `async fn` body does not execute until polled, so a test that merely
     /// *creates* the future would pass even if the prologue were deleted.
     ///
-    /// The poll is expected to panic: `nexrad-data` builds its client and starts
-    /// DNS resolution inside the first poll, and hyper's resolver needs a tokio
-    /// reactor this crate has no dependency on. That panic happens *after* the
-    /// `tls::init()` we are testing for, so it is caught and discarded rather
+    /// The poll is expected to panic: `crate::archive` builds its client and
+    /// starts DNS resolution inside the first poll, and hyper's resolver needs a
+    /// tokio reactor this crate has no dependency on. That panic happens *after*
+    /// the `tls::init()` we are testing for, so it is caught and discarded rather
     /// than worked around -- the side effect is what the probe asserts on, and
     /// no request is ever issued.
     fn poll_once<F: Future>(fut: F) {
@@ -133,11 +141,12 @@ mod tests {
 
     /// `init` installs *ring*, not `aws-lc-rs`.
     ///
-    /// `aws-lc-rs` is currently still in the graph (`nexrad-data` pins
-    /// `reqwest/rustls`), so "a provider is installed" is not a meaningful
-    /// assertion on its own -- reqwest would fall back to `aws-lc-rs` and
-    /// everything would still work. Naming the backend is the assertion that
-    /// actually distinguishes the two.
+    /// `aws-lc-rs` is no longer in the graph, so this can no longer fail by
+    /// picking up the other backend. It still names the backend rather than
+    /// asserting "a provider is installed", because that is what would catch
+    /// `aws-lc-rs` coming *back* -- any dependency re-enabling `reqwest/rustls`
+    /// would restore both the crate and the silent fallback that used to make
+    /// this assertion necessary.
     #[test]
     fn init_installs_ring() {
         super::init();
@@ -261,9 +270,9 @@ mod tests {
             .build()
             .expect("client should build");
 
-        // Pins down *which* provider carried the handshake. aws-lc-rs is still
-        // in the graph via nexrad-data, so without this the test would pass just
-        // as happily on the fallback provider.
+        // Pins down *which* provider carried the handshake. Now that aws-lc-rs
+        // is out of the graph this cannot silently be the other backend, but it
+        // is the assertion that would notice if it came back.
         assert!(
             super::default_is_ring(),
             "handshake would not be carried by ring"
@@ -312,6 +321,11 @@ mod tests {
         run_probe("tls::tests::probe_list_files_installs_ring");
     }
 
+    #[test]
+    fn archive_installs_provider_in_a_fresh_process() {
+        run_probe("tls::tests::probe_archive_list_files_installs_ring");
+    }
+
     /// Building the app's client must install the provider by itself.
     ///
     /// Fails if the `init()` call is removed from [`super::client`].
@@ -349,6 +363,33 @@ mod tests {
         assert!(
             super::default_is_ring(),
             "scan::list_files did not install ring before its first await"
+        );
+    }
+
+    /// The archive module must install the provider on its own, without the
+    /// `crate::scan` wrapper's belt-and-braces `tls::init()` in front of it.
+    ///
+    /// This is the probe that actually pins `crate::archive` to [`super::client`].
+    /// `probe_list_files_installs_ring` goes through `scan::list_files`, which
+    /// calls `init()` itself, so it would still pass if `archive` built its
+    /// client with a bare `reqwest::Client::builder()` -- and that client would
+    /// then panic with "No provider set" for anyone who reached `archive`
+    /// directly.
+    ///
+    /// Fails if `archive::shared_client` stops going through [`super::client`].
+    #[test]
+    #[ignore = "spawned by archive_installs_provider_in_a_fresh_process"]
+    fn probe_archive_list_files_installs_ring() {
+        assert!(
+            !super::default_is_ring(),
+            "a provider was already installed before the probe ran; \
+             this probe is only meaningful in a fresh process"
+        );
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        poll_once(crate::archive::list_files("KTLX", &date));
+        assert!(
+            super::default_is_ring(),
+            "archive::list_files did not install ring before its first await"
         );
     }
 }

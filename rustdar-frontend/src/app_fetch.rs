@@ -598,7 +598,7 @@ impl super::App {
         pane_idx: usize,
         site: String,
         timestamp: NaiveDateTime,
-        identifier: nexrad_data::aws::archive::Identifier,
+        identifier: rustdar_radar::archive::Identifier,
     ) {
         self.spawn_async_task(self.channels.loop_scan_download_sender.clone(), async move {
             let scan = match scan::download_scan(identifier).await {
@@ -894,7 +894,7 @@ fn append_polled_frame(
 mod loop_pane_tests {
     use super::*;
     use crate::loop_downloads::LoopDownloadManager;
-    use nexrad_data::aws::archive::Identifier;
+    use rustdar_radar::archive::Identifier;
     use rustdar_egui::pane::{LoopPlaybackState, PaneState};
     use rustdar_radar::sites::RadarSite;
     use rustdar_radar::types::{RadarProduct, ScanInfo};

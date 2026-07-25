@@ -1,22 +1,46 @@
 use chrono::{Duration, NaiveDateTime, NaiveTime};
 
-use nexrad_data::aws::archive::Identifier;
+use crate::archive::Identifier;
 use nexrad_model::data::Scan;
-use nexrad_data::result::Result;
 
-// `nexrad-data`'s two network entry points, wrapped so that every call installs
+/// Errors from locating, downloading or decoding an archive scan.
+///
+/// Shaped like the neighbouring [`Level3FetchError`]: one variant per layer, so
+/// a `{:?}` in the frontend's log line says which one failed. Every consumer
+/// formats rather than matches.
+#[derive(Debug, thiserror::Error)]
+pub enum ScanError {
+    /// Listing or downloading from the archive bucket failed.
+    #[error(transparent)]
+    Archive(#[from] crate::archive::ArchiveError),
+    /// `nexrad-data` could not decode the downloaded volume.
+    #[error(transparent)]
+    Decode(#[from] nexrad_data::result::Error),
+    /// The archive holds nothing matching the request.
+    ///
+    /// An ordinary outcome — a site with no data for a date, or a navigation
+    /// step past the end of the archive — not a failure to reach the bucket.
+    #[error("{0}")]
+    NoScan(String),
+}
+
+/// Convenience alias for this module's Level II operations.
+pub type Result<T> = std::result::Result<T, ScanError>;
+
+// The archive's two network entry points, wrapped so that every call installs
 // the TLS crypto provider first.
 //
-// These deliberately shadow the upstream names: every call site below reads as a
-// plain `list_files(..)` / `download_file(..)` and is routed through
+// These deliberately shadow the names in `crate::archive`: every call site below
+// reads as a plain `list_files(..)` / `download_file(..)` and is routed through
 // `tls::init()` whether or not whoever wrote it knew about TLS. The alternative
 // -- calling `tls::init()` from each of the seven call sites -- is one `git
 // revert` away from a graph where some paths are covered and some are not.
 //
-// The client these reach is built inside a `once_cell::sync::Lazy` in
-// `nexrad-data`, so it is constructed on the first S3 request rather than at
-// startup. With `rustls-no-provider` and no provider installed, that is a
-// `panic!("No provider set")` on first use. See `crate::tls`.
+// Since `crate::archive` builds its client through `tls::client`, which installs
+// the provider itself, these `init()` calls are now belt-and-braces rather than
+// the load-bearing guarantee they were when the client was constructed inside
+// `nexrad-data`'s `once_cell::sync::Lazy` and could not be reached from here.
+// `crate::tls` probes both paths in fresh processes.
 //
 // `pub(crate)` rather than private so the `tls` probe can poll one of them.
 
@@ -25,14 +49,14 @@ pub(crate) async fn list_files(
     date: &chrono::NaiveDate,
 ) -> Result<Vec<Identifier>> {
     crate::tls::init();
-    nexrad_data::aws::archive::list_files(site, date).await
+    Ok(crate::archive::list_files(site, date).await?)
 }
 
 pub(crate) async fn download_file(
     identifier: Identifier,
 ) -> Result<nexrad_data::volume::File> {
     crate::tls::init();
-    nexrad_data::aws::archive::download_file(identifier).await
+    Ok(crate::archive::download_file(identifier).await?)
 }
 
 /// List files for the given date, falling back to the previous day if empty.
@@ -83,11 +107,9 @@ pub async fn check_latest_scan(
 pub async fn get_scan(site: &str, timestamp: NaiveDateTime) -> Result<Scan> {
     let date = timestamp.date();
     let Some((metas, effective_date)) = list_files_with_fallback(site, &date).await? else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "No files found for the specified date or previous day.",
-        )
-        .into());
+        return Err(ScanError::NoScan(
+            "No files found for the specified date or previous day.".to_string(),
+        ));
     };
     let fell_back = effective_date != date;
 
@@ -320,10 +342,7 @@ pub async fn get_adjacent_scan(
     };
 
     let Some((ts, ident)) = pick else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "No adjacent scan found",
-        ).into());
+        return Err(ScanError::NoScan("No adjacent scan found".to_string()));
     };
 
     let ts = *ts;

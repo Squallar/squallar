@@ -1144,7 +1144,7 @@ impl super::App {
 fn accept_scan_listing(
     ls: &mut rustdar_egui::pane::LoopPlaybackState,
     site: &str,
-    scans: Vec<(chrono::NaiveDateTime, nexrad_data::aws::archive::Identifier)>,
+    scans: Vec<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)>,
 ) -> Option<PendingDownloads> {
     if !ls.is_active() || ls.site != site {
         return None;
@@ -1439,7 +1439,7 @@ fn render_already_queued(
 mod loop_dispatch_tests {
     use super::*;
     use crate::loop_downloads::LoopDownloadManager;
-    use nexrad_data::aws::archive::Identifier;
+    use rustdar_radar::archive::Identifier;
     use nexrad_model::data::{
         MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
     };

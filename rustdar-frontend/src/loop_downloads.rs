@@ -40,7 +40,7 @@ pub struct PendingDownloads {
     /// this site's files, and the scan each becomes is cached under it.
     pub site: String,
     /// Scans still to download, oldest-first.
-    pub queue: VecDeque<(chrono::NaiveDateTime, nexrad_data::aws::archive::Identifier)>,
+    pub queue: VecDeque<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)>,
 }
 
 impl LoopDownloadManager {
@@ -156,7 +156,7 @@ impl LoopDownloadManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nexrad_data::aws::archive::Identifier;
+    use rustdar_radar::archive::Identifier;
     use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
 
     fn ts(minute: u32) -> chrono::NaiveDateTime {

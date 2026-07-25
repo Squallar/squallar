@@ -50,7 +50,25 @@ wgpu = "=29.0.4"
 winit = "=0.30.13"
 
 # -- NEXRAD decoding --
-nexrad-data = { version = "=1.0.0-rc.7", features = ["aws"] }
+#
+# Decoding only. `default-features = false` drops the `aws` feature, which is
+# `["reqwest", "xml", "once_cell"]` and pins `reqwest/rustls` -- an alias for
+# `__rustls-aws-lc-rs`. That was the workspace's sole enabler of the `aws-lc-rs`
+# feature on rustls and so the sole reason `aws-lc-sys`, a second C crypto
+# stack, was in the graph at all. `rustdar_radar::archive` reimplements the
+# narrow surface that feature provided (`Identifier`, `list_files`,
+# `download_file`) over the platform-verifier client in `rustdar_radar::tls`.
+#
+# `nexrad-model` is the other half of the crate's own default set and is what
+# `volume::File::scan()` is gated on, so it has to be spelled out here. `volume`
+# itself is ungated.
+#
+# Defaults must stay off *at the workspace level*: Cargo silently ignores a
+# member's `default-features = false` when the workspace entry leaves defaults
+# on, and `default` here would pull `aws` straight back in.
+nexrad-data = { version = "=1.0.0-rc.7", default-features = false, features = [
+    "nexrad-model",
+] }
 nexrad-decode = "=1.0.0-rc.3"
 nexrad-model = "=1.0.0-rc.2"
 

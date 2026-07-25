@@ -1,3 +1,4 @@
+pub mod archive;
 mod palette;
 pub mod render;
 pub mod scan;

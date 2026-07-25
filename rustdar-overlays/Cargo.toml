@@ -66,6 +66,13 @@ tokio = { workspace = true, features = ["fs"] }
 # Test-only: drives the `#[ignore]`d live-NOMADS checks. Not linked into any
 # shipped binary.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Test-only, and only for `rustdar_radar::tls`. This crate never builds its own
+# `reqwest::Client` in production -- callers hand one in, and the frontend gets
+# it from `tls::client` -- but two tests do, and with `rustls-no-provider` that
+# panics unless the process-wide provider is installed first. Depending on the
+# one module that installs it beats naming a crypto backend in a second place;
+# `rustdar-radar` does not depend on this crate, so there is no cycle.
+rustdar-radar = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # NOTE: `openssl-sys` used to be pinned here with `features = ["vendored"]` to get

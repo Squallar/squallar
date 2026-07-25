@@ -28,7 +28,9 @@ egui = { workspace = true }
 egui-wgpu = { workspace = true, features = ["winit"] }
 egui-winit = { workspace = true, features = ["clipboard", "links", "wayland", "x11"] }
 log = { workspace = true }
-nexrad-data = { workspace = true }
+# No `nexrad-data` here: the only thing this crate ever used from it was
+# `aws::archive::Identifier`, which now lives in `rustdar_radar::archive`
+# alongside the S3 access that produces it.
 nexrad-model = { workspace = true }
 nexrad-level3 = { workspace = true }
 pollster = { workspace = true }

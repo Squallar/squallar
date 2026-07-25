@@ -2349,6 +2349,14 @@ mod tests {
     /// passes, and tells users their GLM product changed whenever S3 throttles.
     #[test]
     fn an_unreachable_host_is_a_transport_failure() {
+        // `reqwest` is pinned to `rustls-no-provider`, so `build()` panics with
+        // "No provider set" unless a crypto provider is already installed. This
+        // test used to get one for free from `aws-lc-rs`, which reqwest linked
+        // in via `nexrad-data`'s `aws` feature; with that feature gone the
+        // provider has to be installed deliberately, exactly as production does
+        // it. `tls::client` is not used here because it sets `https_only`, and
+        // the cleartext loopback URL below is the whole point of the test.
+        rustdar_radar::tls::init();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

@@ -658,7 +658,15 @@ mod tests {
     #[tokio::test]
     #[ignore = "hits the live NOMADS filter CGI"]
     async fn live_uh_fetch_returns_a_non_constant_field() {
-        let client = reqwest::Client::new();
+        // Builds the client the way the application does, which is also what
+        // installs the crypto provider: with `rustls-no-provider` and no
+        // `aws-lc-rs` left in the graph, a bare `Client::new()` panics here.
+        let client = rustdar_radar::tls::client(
+            rustdar_radar::tls::USER_AGENT,
+            std::time::Duration::from_secs(120),
+        )
+        .build()
+        .expect("client");
         for param in [ModelParameter::MaxUH2to5km, ModelParameter::MaxUH0to2km] {
             let grid = match fetch_hrrr_data(&client, &param).await.0 {
                 Ok(g) => g,

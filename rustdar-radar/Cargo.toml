@@ -16,6 +16,10 @@ rayon = "=1.11.0"
 # TLS backend comes from the workspace pin; nothing extra is needed here.
 reqwest = { workspace = true }
 thiserror = { workspace = true }
+# ListObjectsV2 response parsing in `archive`. Pure Rust (xml-rs), and a direct
+# dependency here only because `nexrad-data`'s `aws` feature used to pull the
+# same crate in transitively for the same job -- the crate count is unchanged.
+xml = "=1.2.1"
 
 # Used by `tls` to build the process-wide *ring* provider. Direct dependency
 # because this crate is the lowest one in the graph that can reach a TLS
