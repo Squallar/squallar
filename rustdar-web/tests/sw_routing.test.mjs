@@ -37,6 +37,7 @@ import { describe, it } from "node:test";
 
 import {
   Network,
+  opaqueResponse,
   publishDeploy,
   publishUnversionedDeploy,
   restartWorker,
@@ -661,6 +662,120 @@ describe("updates: a degraded version probe is visible and escapable", () => {
     worker.network.offline = true;
     await worker.message({ type: "rustdar:check-update" });
     assert.deepEqual(generationOf(await loadPage(worker)), new Set(["A"]));
+  });
+});
+
+describe("tiles: the basemap cache stays bounded", () => {
+  // =========================================================================
+
+  /** Fetch `count` distinct tiles through the worker. */
+  async function fetchTiles(worker, count, offset = 0) {
+    for (let i = 0; i < count; i += 1) {
+      const url = `https://cartodb-basemaps-a.global.ssl.fastly.net/dark_nolabels/7/${offset + i}/52.png`;
+      worker.network.serve(
+        url,
+        () =>
+          new Response(`tile ${offset + i}`, {
+            status: 200,
+            headers: { date: new Date().toUTCString(), "cache-control": "public, max-age=15552000" },
+          }),
+      );
+      await worker.fetch(new Request(url));
+    }
+  }
+
+  it("caches a tile and serves it back without touching the network", async () => {
+    const worker = await bootWorker();
+    await fetchTiles(worker, 1);
+    const before = worker.network.log.length;
+    const event = await worker.fetch(
+      new Request("https://cartodb-basemaps-a.global.ssl.fastly.net/dark_nolabels/7/0/52.png"),
+    );
+    assert.equal(event.handled, true);
+    assert.equal(await (await event.response).text(), "tile 0");
+    assert.equal(worker.network.log.length, before, "a cached tile was refetched");
+  });
+
+  it("enforces the bound across worker restarts, not just within one lifetime", async () => {
+    // A service worker is killed after roughly thirty seconds idle. A user
+    // panning slowly adds a handful of tiles per lifetime, so a bound that only
+    // triggers after a fixed number of writes *within* a lifetime is never
+    // reached, and the cache grows without limit until it takes the quota with
+    // it — which is what makes the shell's all-or-nothing install fail.
+    let worker = await bootWorker();
+    const { TILE_CACHE_MAX, TILE_TRIM_BATCH } = worker.internals;
+
+    const perLifetime = 10;
+    assert.ok(perLifetime < TILE_TRIM_BATCH, "this test must stay under the batch threshold");
+
+    const lifetimes = Math.ceil((TILE_CACHE_MAX + 200) / perLifetime);
+    for (let i = 0; i < lifetimes; i += 1) {
+      await fetchTiles(worker, perLifetime, i * perLifetime);
+      worker = await restartWorker(worker);
+    }
+
+    const tiles = worker.caches.countEntries((n) => n.startsWith("rustdar-basemap-"));
+    assert.ok(
+      tiles <= TILE_CACHE_MAX + TILE_TRIM_BATCH,
+      `the basemap cache holds ${tiles} tiles; the bound is ${TILE_CACHE_MAX} \
+(+ at most one ${TILE_TRIM_BATCH}-entry batch of overshoot)`,
+    );
+  });
+
+  it("evicts oldest-first so the tiles just fetched survive", async () => {
+    let worker = await bootWorker();
+    const { TILE_CACHE_MAX } = worker.internals;
+    await fetchTiles(worker, TILE_CACHE_MAX + 100);
+    worker = await restartWorker(worker);
+    await fetchTiles(worker, 1, 10_000);
+
+    const urls = worker.cachedUrls().filter((u) => u.includes("cartodb-basemaps"));
+    assert.equal(
+      urls.some((u) => u.endsWith("/7/10000/52.png")),
+      true,
+      "the most recently fetched tile was evicted",
+    );
+    assert.equal(
+      urls.some((u) => u.endsWith("/7/0/52.png")),
+      false,
+      "the oldest tile survived while newer ones were evicted",
+    );
+  });
+
+  it("revalidates a cached tile that carries no usable Date", async () => {
+    const worker = await bootWorker();
+    const { tileIsStale } = worker.internals;
+
+    assert.equal(
+      tileIsStale(new Response("t", { status: 200 })),
+      true,
+      "a readable response with no Date cannot be shown to be fresh, so it must revalidate",
+    );
+    assert.equal(
+      tileIsStale(new Response("t", { status: 200, headers: { date: "not a date" } })),
+      true,
+    );
+    assert.equal(
+      tileIsStale(
+        new Response("t", {
+          status: 200,
+          headers: { date: new Date().toUTCString(), "cache-control": "max-age=15552000" },
+        }),
+      ),
+      false,
+    );
+    // An opaque response exposes no headers at all. There is nothing to reason
+    // about and a coastline does not go dangerously wrong with age.
+    assert.equal(tileIsStale(opaqueResponse()), false);
+  });
+
+  it("honours the origin's own max-age rather than inventing one", async () => {
+    const worker = await bootWorker();
+    const { tileFreshFor } = worker.internals;
+    assert.equal(
+      tileFreshFor(new Response("t", { headers: { "cache-control": "public, max-age=15552000" } })),
+      15552000 * 1000,
+    );
   });
 });
 

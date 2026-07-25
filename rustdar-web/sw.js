@@ -700,13 +700,24 @@ function tileFreshFor(response) {
 }
 
 function tileIsStale(response) {
-  const date = response.headers.get("date");
   // An opaque response (a `no-cors` fetch) exposes no headers at all. There is
   // nothing to reason about, and a basemap tile does not go dangerously wrong
   // with age, so it is kept.
-  if (!date) return false;
+  if (response.type === "opaque") return false;
+
+  const date = response.headers.get("date");
+  // A readable response with no `Date` is treated as stale rather than as
+  // fresh. Freshness here is an assertion about age, and with no clock in the
+  // response there is nothing to assert it from; declining to answer used to
+  // mean such an entry was never revalidated for as long as it existed. The
+  // cost of the other direction is one conditional request — this is
+  // stale-while-revalidate, so the cached tile is still served immediately.
+  if (!date) return true;
+
   const age = Date.now() - Date.parse(date);
-  return Number.isFinite(age) && age > tileFreshFor(response);
+  // An unparseable `Date` is the same situation as an absent one.
+  if (!Number.isFinite(age)) return true;
+  return age > tileFreshFor(response);
 }
 
 async function cacheTile(cache, request, response) {
@@ -748,12 +759,32 @@ async function serveTile(event) {
   return response;
 }
 
+/*
+ * Trim bookkeeping.
+ *
+ * `cache.keys()` walks every entry, so it is amortised over a batch of writes
+ * rather than paid per tile. The subtlety is that this counter is module state
+ * and a service worker is killed after roughly thirty seconds idle — far more
+ * often than a user finishes panning a map.
+ *
+ * Counting alone was therefore not a bound at all. A user panning slowly enough
+ * to fetch fewer than `TILE_TRIM_BATCH` new tiles per worker lifetime never
+ * reached the threshold, the counter went back to zero with the worker, and the
+ * basemap cache grew without limit — which is quota pressure, which is what
+ * makes the shell's all-or-nothing `addAll` fail.
+ *
+ * `trimmedThisLifetime` closes it: the first tile written by any worker
+ * instance always pays for a full check. A restart is now the event that
+ * guarantees a trim rather than the event that skips one, and within a single
+ * lifetime the cache can exceed `TILE_CACHE_MAX` by at most one batch.
+ */
+const TILE_TRIM_BATCH = 50;
 let tilePutsSinceTrim = 0;
+let trimmedThisLifetime = false;
 
 async function trimTiles() {
-  // `keys()` walks the whole cache, so amortise it rather than paying it per
-  // tile. The cache is allowed to overshoot TILE_CACHE_MAX by up to one batch.
-  if (++tilePutsSinceTrim < 50) return;
+  if (trimmedThisLifetime && ++tilePutsSinceTrim < TILE_TRIM_BATCH) return;
+  trimmedThisLifetime = true;
   tilePutsSinceTrim = 0;
 
   const cache = await caches.open(TILE_CACHE);
@@ -783,6 +814,10 @@ self.addEventListener("activate", (event) => {
       // Control the page that registered us, so the update channel works on the
       // very first visit instead of only after a reload.
       await self.clients.claim();
+      // Bound the tile cache at every version change as well as at every worker
+      // start. Cheap - one `keys()` walk - and it is the one moment at which
+      // this worker is certain to be running and not in a hurry.
+      await trimTiles().catch(() => {});
       try {
         await checkForUpdate({ force: true });
       } catch {
@@ -856,6 +891,9 @@ self.__rustdarSwInternals = {
   ROOT,
   SHELL_URLS,
   NEVER_CACHE_HOSTS,
+  TILE_CACHE,
+  TILE_CACHE_MAX,
+  TILE_TRIM_BATCH,
   SHELL_PREFIX,
   routeFor,
   isWeatherDataHost,
@@ -863,4 +901,5 @@ self.__rustdarSwInternals = {
   isShellAsset,
   validatorToken,
   tileFreshFor,
+  tileIsStale,
 };
