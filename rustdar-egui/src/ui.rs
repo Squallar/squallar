@@ -6,7 +6,7 @@ const DEFAULT_INITIAL_ZOOM: f64 = 7.0;
 use rustdar_overlays::render::overlay_state::{OverlayRegistry, OverlayKind};
 use crate::pane::{ColorScaleOrientation, PaneId, PaneLayout, PaneState};
 use crate::tiles::MapTileState;
-use crate::ui_layout::LayoutCtx;
+use crate::ui_layout::{LayoutCtx, ModalityLatch};
 use chrono::Timelike;
 use egui::Context;
 use rustdar_radar::types::{RadarProduct, ScanInfo};
@@ -28,17 +28,13 @@ mod map;
 #[path = "ui_settings.rs"]
 mod settings;
 
-#[cfg(target_os = "android")]
-use crate::ui_input::TouchGestures;
+use crate::ui_input::InteractionState;
 
-/// Android-only UI state: slide-out menu visibility and gesture detection.
+/// Android-only UI state: slide-out menu visibility.
 #[cfg(target_os = "android")]
 #[derive(Default)]
 pub(super) struct MobileState {
     pub show_menu: bool,
-    /// Touch gesture detectors (double-tap-drag zoom, long press).
-    /// Platform-independent — see [`crate::ui_input`].
-    pub gestures: TouchGestures,
 }
 
 /// Radar fetch lifecycle state.
@@ -136,9 +132,13 @@ pub struct Gui {
     // Safe area insets in logical pixels (top, bottom, left, right)
     // Used on Android to avoid drawing under system bars.
     safe_area_insets: (f32, f32, f32, f32),
+    /// Remembers whether a mouse or a finger is driving, across frames.
+    modality: ModalityLatch,
     /// This frame's resolved layout. Written once at the top of [`Gui::ui`] and
     /// read by everything below it; never recomputed further down.
     layout: LayoutCtx,
+    /// Pointer/gesture resolution for the map, gated on the modality.
+    interaction: InteractionState,
     /// User unit and timezone preferences.
     pub preferences: UserPreferences,
     /// Whether the settings panel is open.
@@ -292,7 +292,9 @@ impl Gui {
             #[cfg(target_os = "android")]
             mobile: MobileState::default(),
             safe_area_insets: (0.0, 0.0, 0.0, 0.0),
+            modality: ModalityLatch::default(),
             layout: LayoutCtx::default(),
+            interaction: InteractionState::default(),
             preferences: UserPreferences::default(),
             show_settings: false,
             gps_config: rustdar_gps::GpsConfig::default(),
@@ -310,7 +312,7 @@ impl Gui {
         // Resolve the frame's layout exactly once, before anything draws. Every
         // responsive decision below reads `self.layout`; nothing recomputes a
         // width or a modality of its own.
-        self.layout = LayoutCtx::resolve(ctx, self.safe_area_insets);
+        self.layout = LayoutCtx::resolve(ctx, &mut self.modality, self.safe_area_insets);
 
         // Create a root Ui to host the panels. Since egui 0.35 the Context-taking
         // `Panel::show` is gone and panels are Ui-scoped only, so this root Ui is

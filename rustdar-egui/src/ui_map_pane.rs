@@ -34,8 +34,9 @@ pub(super) struct PaneRenderCtx<'a> {
     pub horizontal_color_scale: bool,
     pub pointer_available: bool,
     pub excluded_rects: Vec<egui::Rect>,
-    /// On Android, the screen position of an active long-press (for radar value tooltip).
-    #[cfg(target_os = "android")]    pub long_press_pos: Option<egui::Pos2>,
+    /// Screen position of an active long-press (for the radar value tooltip),
+    /// or `None`. Only the touch pipeline ever produces one.
+    pub long_press_pos: Option<egui::Pos2>,
     /// Screen position of a confirmed overlay click/tap, or `None` if no overlay
     /// click occurred this frame. On desktop this comes from egui's `any_click()`;
     /// on Android from the deferred single-tap detector.
@@ -290,22 +291,27 @@ pub(super) fn render_pane_map_content(
     }
     // overlay_ctx (and its shared borrow of ui) is dropped here
 
-    // Mobile long-press tooltip: show radar value above the finger
-    #[cfg(target_os = "android")]
-    if let Some(touch_pos) = ctx.long_press_pos {
-        if ctx.pane_rect.contains(touch_pos) {
-            // Try overlay cache meta first (non-loop static render), then loop frame
-            let raw_meta = ctx.pane.overlay_cache(OverlayKind::Radar)
-                .and_then(|c| c.current.as_ref())
-                .and_then(|tex| tex.radar_meta.as_ref())
-                .map(|m| (m.lat, m.lon, std::sync::Arc::clone(&m.value_data)));
-            if let Some((lat, lon, value_data)) = raw_meta {
-                crate::ui::mobile::draw_long_press_tooltip_raw(
-                    ui, projector, &value_data, lat, lon, touch_pos, ctx.pane, ctx.preferences,
-                );
-            } else if let Some(img) = ctx.pane.active_image().cloned() {
-                crate::ui::mobile::draw_long_press_tooltip(ui, projector, &img, touch_pos, ctx.pane, ctx.preferences);
-            }
+    // Long-press tooltip: show the radar value above the finger. Reached only
+    // when the touch pipeline ran this frame, which is now a runtime decision
+    // (`InteractionState`) rather than a target one — a touchscreen laptop and
+    // a phone browser both get here.
+    if let Some(touch_pos) = ctx.long_press_pos
+        && ctx.pane_rect.contains(touch_pos)
+    {
+        // Try overlay cache meta first (non-loop static render), then loop frame
+        let raw_meta = ctx.pane.overlay_cache(OverlayKind::Radar)
+            .and_then(|c| c.current.as_ref())
+            .and_then(|tex| tex.radar_meta.as_ref())
+            .map(|m| (m.lat, m.lon, std::sync::Arc::clone(&m.value_data)));
+        if let Some((lat, lon, value_data)) = raw_meta {
+            draw_long_press_tooltip(
+                ui, projector, &value_data, lat, lon, touch_pos, ctx.pane, ctx.preferences,
+            );
+        } else if let Some(img) = ctx.pane.active_image().cloned() {
+            draw_long_press_tooltip(
+                ui, projector, &img.value_data, img.lat, img.lon, touch_pos, ctx.pane,
+                ctx.preferences,
+            );
         }
     }
 }
@@ -1176,4 +1182,73 @@ fn render_per_frame_overlay(
         }
 
     selected
+}
+
+/// Vertical offset (points) from the touch point to the tooltip centre, so the
+/// tooltip sits above the finger rather than under it.
+const TOOLTIP_OFFSET_Y: f32 = 60.0;
+
+/// Draw a floating tooltip above the finger during a long press, showing the
+/// radar value at the touched position.
+///
+/// Reached only from the touch pipeline. It used to live in `ui_mobile.rs`
+/// behind `cfg(target_os = "android")`, which is why it was unreachable on a
+/// touchscreen laptop and in a phone browser; the gate is now the runtime
+/// modality, so this is plain platform-independent drawing code.
+#[allow(clippy::too_many_arguments)]
+fn draw_long_press_tooltip(
+    ui: &egui::Ui,
+    projector: &walkers::Projector,
+    value_data: &[f32],
+    lat: f64,
+    lon: f64,
+    touch_pos: egui::Pos2,
+    pane: &PaneState,
+    prefs: &UserPreferences,
+) {
+    use rustdar_radar::types::{ImageBounds, IMAGE_SIZE};
+
+    let bounds = ImageBounds::from_radar_site(lat, lon);
+
+    let nw = projector
+        .project(walkers::lat_lon(bounds.max_lat, bounds.min_lon))
+        .to_pos2();
+    let se = projector
+        .project(walkers::lat_lon(bounds.min_lat, bounds.max_lon))
+        .to_pos2();
+    let image_rect = egui::Rect::from_two_pos(nw, se);
+
+    // Compute pixel coordinates inside the radar image
+    let frac_x = (touch_pos.x - image_rect.left()) / image_rect.width();
+    let frac_y = (touch_pos.y - image_rect.top()) / image_rect.height();
+    let px = (frac_x * IMAGE_SIZE as f32) as i32;
+    let py = (frac_y * IMAGE_SIZE as f32) as i32;
+
+    let mut text = String::new();
+    if px >= 0 && px < IMAGE_SIZE as i32 && py >= 0 && py < IMAGE_SIZE as i32 {
+        let pixel_idx = py as usize * IMAGE_SIZE + px as usize;
+        if pixel_idx < value_data.len() {
+            let value = value_data[pixel_idx];
+            if !value.is_nan() {
+                text = pane.selected_product.format_value(value, prefs);
+            }
+        }
+    }
+
+    if text.is_empty() {
+        text = "No data".into();
+    }
+
+    // Position tooltip above the finger
+    let tooltip_pos = egui::pos2(touch_pos.x, touch_pos.y - TOOLTIP_OFFSET_Y);
+
+    let painter = ui.painter();
+    let font = egui::FontId::proportional(14.0);
+    let galley = painter.layout_no_wrap(text, font, egui::Color32::WHITE);
+    let text_size = galley.size();
+    let padding = egui::vec2(8.0, 4.0);
+    let bg_rect = egui::Rect::from_center_size(tooltip_pos, text_size + padding * 2.0);
+
+    painter.rect_filled(bg_rect, 4.0, egui::Color32::from_black_alpha(200));
+    painter.galley(bg_rect.min + padding, galley, egui::Color32::WHITE);
 }

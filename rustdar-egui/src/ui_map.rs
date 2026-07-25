@@ -1,5 +1,4 @@
 use crate::actions::GuiAction;
-use crate::ui_input::MapPointerFrame;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::types::{EARTH_RADIUS_KM, RadarProduct, IMAGE_SIZE};
 use rustdar_units::UserPreferences;
@@ -33,6 +32,9 @@ impl super::Gui {
         };
 
         let pane_count = self.pane_layout.pane_count;
+        // Resolved once for the frame, before the pane loop: every pane must
+        // agree about what is pointing at the screen.
+        let modality = self.layout.modality;
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
@@ -112,9 +114,11 @@ impl super::Gui {
                     // of the pane fields used in the render closure.
                     let mut map_memory = std::mem::take(&mut pane.map_memory);
 
-                    // Resolve this pane's pointer state for the frame:
-                    // - Desktop: egui's built-in click detection (instant)
-                    // - Android: the touch gesture pipeline for the active pane
+                    // Resolve this pane's pointer state for the frame. Which
+                    // pipeline runs is a *runtime* decision, taken once per
+                    // frame by `LayoutCtx` and enforced by `InteractionState`:
+                    // - Mouse: egui's built-in click detection (instant)
+                    // - Touch: the gesture pipeline for the active pane
                     //   (deferred single-tap so double-tap-to-zoom doesn't open
                     //   popups, plus zoom-drag and long-press)
                     //
@@ -127,14 +131,16 @@ impl super::Gui {
                     // CONVENTION: New map click handlers MUST use overlay_click_pos from
                     // PaneRenderCtx — never read raw click events via ctx.input() for
                     // map-level interactions, as that bypasses dialog blocking.
-                    #[cfg(target_os = "android")]
                     let pointer = if is_active {
-                        self.mobile.gestures.update(&ctx, &mut map_memory, pane_rect)
+                        self.interaction.resolve_active(
+                            &ctx,
+                            modality,
+                            &mut map_memory,
+                            pane_rect,
+                        )
                     } else {
-                        MapPointerFrame::inactive()
+                        self.interaction.resolve_inactive(&ctx, modality)
                     };
-                    #[cfg(not(target_os = "android"))]
-                    let pointer = MapPointerFrame::from_mouse(&ctx);
 
                     let overlay_click_pos = pointer.overlay_click_pos;
                     let suppress_pan = pointer.suppress_pan;
@@ -188,7 +194,6 @@ impl super::Gui {
                                 horizontal_color_scale,
                                 pointer_available,
                                 excluded_rects: excluded_rects.clone(),
-                                #[cfg(target_os = "android")]
                                 long_press_pos: pointer.long_press_pos,
                                 overlay_click_pos,
                                 preferences: &self.preferences,

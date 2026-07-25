@@ -75,6 +75,87 @@ impl WidthClass {
     }
 }
 
+/// What is driving the pointer, latched across frames.
+///
+/// Seeded from `Context::os()` and then overridden by whatever real input
+/// arrives, so a Bluetooth mouse on a tablet and a touchscreen on a laptop both
+/// end up right. Independent of [`WidthClass`] on purpose: a 1400pt Android
+/// tablet is Expanded *and* Touch, a 500pt desktop window is Compact *and*
+/// Mouse. Collapsing the two axes into one "is mobile" boolean is what the old
+/// `cfg!(target_os = "android")` did, and it gets both of those cases wrong.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PointerModality {
+    /// The default is the conservative one, matching `LayoutCtx::default()`:
+    /// assuming a mouse costs a touch user one gesture, whereas assuming touch
+    /// costs a mouse user their map panning (see `InteractionState`).
+    #[default]
+    Mouse,
+    Touch,
+}
+
+/// Remembers the current [`PointerModality`] between frames.
+///
+/// # Why not `has_touch_screen()`
+///
+/// egui's `InputState::has_touch_screen()` is `any_touches() || <a latched
+/// flag>`, and that flag is set the first time a touch is ever seen and never
+/// cleared. One stray palm on a hybrid laptop's touchscreen therefore puts the
+/// whole session into touch mode permanently — including the 400ms tap deferral
+/// on every subsequent mouse click. This latch moves in *both* directions: the
+/// next real mouse event takes it back.
+///
+/// # Why frames, not events
+///
+/// A touch does not arrive as a lone `Touch` event. `egui-winit` maps one
+/// `TouchPhase::Started` to `Touch{Start}` **plus** `PointerMoved` **plus**
+/// `PointerButton{down}`, and eframe's web canvas emits `PointerButton{down}`
+/// *before* `Touch{Start}`. So a per-event rule that treats `PointerButton` as
+/// mouse evidence would flip to Mouse on the same frame every touch flips it to
+/// Touch, and the answer would depend on event order. Instead the whole frame
+/// is classified: a frame containing any `Touch` event is touch evidence and
+/// yields no mouse evidence at all.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ModalityLatch {
+    current: Option<PointerModality>,
+}
+
+impl ModalityLatch {
+    /// Read this frame's events and return the modality now in force.
+    pub(crate) fn update(&mut self, ctx: &egui::Context) -> PointerModality {
+        if let Some(seen) = ctx.input(|i| frame_evidence(&i.events)) {
+            self.current = Some(seen);
+        }
+        // Seed from the OS only until real input has spoken. `Unknown` is wasm,
+        // where the user agent could be either — start it on Mouse and let the
+        // first touch correct it, which costs a phone user one tap's deferral
+        // rather than costing every desktop user 400ms forever.
+        self.current.unwrap_or(match ctx.os() {
+            egui::os::OperatingSystem::Android | egui::os::OperatingSystem::IOS => {
+                PointerModality::Touch
+            }
+            _ => PointerModality::Mouse,
+        })
+    }
+}
+
+/// Classify one frame's events. `None` means the frame said nothing about the
+/// modality (no pointer input at all), so the latch keeps its previous answer.
+fn frame_evidence(events: &[egui::Event]) -> Option<PointerModality> {
+    let mut saw_mouse = false;
+    for event in events {
+        match event {
+            // Any touch in the frame settles it outright — see the type docs
+            // for why this beats the pointer events it arrives alongside.
+            egui::Event::Touch { .. } => return Some(PointerModality::Touch),
+            egui::Event::PointerMoved(_)
+            | egui::Event::PointerButton { .. }
+            | egui::Event::MouseWheel { .. } => saw_mouse = true,
+            _ => {}
+        }
+    }
+    saw_mouse.then_some(PointerModality::Mouse)
+}
+
 /// One frame's resolved layout facts. Computed once per frame at the top of
 /// `Gui::ui` and passed down; nothing below recomputes it.
 #[derive(Clone, Copy, Debug)]
@@ -83,6 +164,7 @@ pub(crate) struct LayoutCtx {
     /// insets. Everything (root `Ui`, dialogs, breakpoints) keys off this.
     pub content_rect: egui::Rect,
     pub width: WidthClass,
+    pub modality: PointerModality,
 }
 
 impl Default for LayoutCtx {
@@ -98,6 +180,7 @@ impl Default for LayoutCtx {
         Self {
             content_rect: egui::Rect::ZERO,
             width: WidthClass::Compact,
+            modality: PointerModality::Mouse,
         }
     }
 }
@@ -115,12 +198,17 @@ impl LayoutCtx {
     /// but that wiring lives in the host crate, and this type is the single
     /// source of truth either way, so nothing below has to know which route
     /// they took.
-    pub(crate) fn resolve(ctx: &egui::Context, extra_insets: (f32, f32, f32, f32)) -> Self {
+    pub(crate) fn resolve(
+        ctx: &egui::Context,
+        latch: &mut ModalityLatch,
+        extra_insets: (f32, f32, f32, f32),
+    ) -> Self {
         let (top, bottom, left, right) = extra_insets;
         let content_rect = shrink_to_content(ctx.content_rect(), top, bottom, left, right);
         Self {
             content_rect,
             width: WidthClass::from_width(content_rect.width()),
+            modality: latch.update(ctx),
         }
     }
 
@@ -169,6 +257,150 @@ fn shrink_to_content(rect: egui::Rect, top: f32, bottom: f32, left: f32, right: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ctx_with(events: Vec<egui::Event>, os: egui::os::OperatingSystem) -> egui::Context {
+        let ctx = egui::Context::default();
+        ctx.set_os(os);
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1024.0, 768.0),
+            )),
+            events,
+            ..Default::default()
+        });
+        ctx
+    }
+
+    fn touch_event(phase: egui::TouchPhase) -> egui::Event {
+        egui::Event::Touch {
+            device_id: egui::TouchDeviceId(0),
+            id: egui::TouchId(0),
+            phase,
+            pos: egui::pos2(10.0, 10.0),
+            force: None,
+        }
+    }
+
+    fn mouse_button_event() -> egui::Event {
+        egui::Event::PointerButton {
+            pos: egui::pos2(10.0, 10.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    /// A touch flips the latch even though the same frame also carries the
+    /// `PointerButton` that `egui-winit` synthesises for it. This is the case a
+    /// per-event rule gets wrong.
+    #[test]
+    fn a_touch_frame_beats_the_pointer_events_it_arrives_with() {
+        let mut latch = ModalityLatch::default();
+        let ctx = ctx_with(
+            vec![
+                touch_event(egui::TouchPhase::Start),
+                egui::Event::PointerMoved(egui::pos2(10.0, 10.0)),
+                mouse_button_event(),
+            ],
+            egui::os::OperatingSystem::Nix,
+        );
+        assert_eq!(latch.update(&ctx), PointerModality::Touch);
+    }
+
+    /// eframe's web canvas emits the `PointerButton` *before* the `Touch`, so
+    /// the answer must not depend on which came first.
+    #[test]
+    fn a_touch_frame_is_touch_whatever_order_the_events_came_in() {
+        let mut latch = ModalityLatch::default();
+        let ctx = ctx_with(
+            vec![mouse_button_event(), touch_event(egui::TouchPhase::Start)],
+            egui::os::OperatingSystem::Nix,
+        );
+        assert_eq!(latch.update(&ctx), PointerModality::Touch);
+    }
+
+    /// The whole point of not using `has_touch_screen()`: one stray touch on a
+    /// hybrid laptop must not cost the user touch-mode forever.
+    #[test]
+    fn a_stray_touch_does_not_latch_a_hybrid_laptop_into_touch_mode() {
+        let mut latch = ModalityLatch::default();
+
+        let touched = ctx_with(
+            vec![touch_event(egui::TouchPhase::Start)],
+            egui::os::OperatingSystem::Nix,
+        );
+        assert_eq!(latch.update(&touched), PointerModality::Touch);
+
+        let moused = ctx_with(
+            vec![egui::Event::PointerMoved(egui::pos2(40.0, 40.0))],
+            egui::os::OperatingSystem::Nix,
+        );
+        assert_eq!(
+            latch.update(&moused),
+            PointerModality::Mouse,
+            "the next real mouse movement must take the session back"
+        );
+    }
+
+    /// An input-free frame says nothing, so the previous answer stands. Without
+    /// this the modality would flap back to the OS seed every idle frame.
+    #[test]
+    fn an_input_free_frame_keeps_the_previous_modality() {
+        let mut latch = ModalityLatch::default();
+
+        let touched = ctx_with(
+            vec![touch_event(egui::TouchPhase::Start)],
+            egui::os::OperatingSystem::Nix,
+        );
+        assert_eq!(latch.update(&touched), PointerModality::Touch);
+
+        let idle = ctx_with(vec![], egui::os::OperatingSystem::Nix);
+        assert_eq!(latch.update(&idle), PointerModality::Touch);
+    }
+
+    /// Non-pointer events are not mouse evidence. A phone with a Bluetooth
+    /// keyboard must not be talked out of touch mode by typing.
+    #[test]
+    fn keyboard_input_is_not_evidence_of_a_mouse() {
+        let mut latch = ModalityLatch::default();
+
+        let touched = ctx_with(
+            vec![touch_event(egui::TouchPhase::Start)],
+            egui::os::OperatingSystem::Nix,
+        );
+        assert_eq!(latch.update(&touched), PointerModality::Touch);
+
+        let typed = ctx_with(
+            vec![egui::Event::Text("a".into())],
+            egui::os::OperatingSystem::Nix,
+        );
+        assert_eq!(latch.update(&typed), PointerModality::Touch);
+    }
+
+    /// Before any input arrives the OS is the only hint there is.
+    #[test]
+    fn the_os_seeds_the_modality_until_real_input_arrives() {
+        let mut latch = ModalityLatch::default();
+        let android = ctx_with(vec![], egui::os::OperatingSystem::Android);
+        assert_eq!(latch.update(&android), PointerModality::Touch);
+
+        let mut latch = ModalityLatch::default();
+        let mac = ctx_with(vec![], egui::os::OperatingSystem::Mac);
+        assert_eq!(latch.update(&mac), PointerModality::Mouse);
+    }
+
+    /// ...and real input beats the seed, which is the case a plain
+    /// `cfg!(target_os)` cannot express: a mouse plugged into a tablet.
+    #[test]
+    fn real_input_overrides_the_os_seed() {
+        let mut latch = ModalityLatch::default();
+        let android_with_mouse = ctx_with(
+            vec![egui::Event::PointerMoved(egui::pos2(5.0, 5.0))],
+            egui::os::OperatingSystem::Android,
+        );
+        assert_eq!(latch.update(&android_with_mouse), PointerModality::Mouse);
+    }
 
     /// The breakpoints are absolute claims, written as literals rather than
     /// derived from the constants, so moving a constant fails here instead of
@@ -219,6 +451,7 @@ mod tests {
                 egui::pos2(380.0, 800.0),
             ),
             width: WidthClass::Compact,
+            modality: PointerModality::Touch,
         };
         assert_eq!(layout.dialog_width(340.0), 360.0 - 32.0);
         assert_eq!(layout.dialog_center(), egui::pos2(200.0, 420.0));
@@ -231,6 +464,7 @@ mod tests {
         let layout = LayoutCtx {
             content_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0)),
             width: WidthClass::Expanded,
+            modality: PointerModality::Mouse,
         };
         assert_eq!(layout.dialog_width(340.0), 340.0);
     }
@@ -241,6 +475,7 @@ mod tests {
         let layout = LayoutCtx {
             content_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(180.0, 400.0)),
             width: WidthClass::Compact,
+            modality: PointerModality::Touch,
         };
         assert_eq!(layout.dialog_width(340.0), 200.0);
     }
@@ -297,7 +532,8 @@ mod tests {
             "precondition: egui applied the RawInput inset itself"
         );
 
-        let layout = LayoutCtx::resolve(&ctx, (10.0, 0.0, 0.0, 0.0));
+        let mut latch = ModalityLatch::default();
+        let layout = LayoutCtx::resolve(&ctx, &mut latch, (10.0, 0.0, 0.0, 0.0));
         assert_eq!(
             layout.content_rect.top(),
             60.0,

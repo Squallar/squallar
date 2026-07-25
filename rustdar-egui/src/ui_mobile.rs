@@ -1,95 +1,15 @@
 #![cfg(target_os = "android")]
 
 use crate::actions::GuiAction;
-use crate::ui::{PaneState, UserPreferences};
-use crate::pane::{RadarImageData};
-use rustdar_radar::types::ImageBounds;
 
 // Gesture detection (double-tap-drag zoom, long press) lives in
 // `crate::ui_input` — it is pure egui pointer/time logic with no Android APIs,
 // so it stays compilable and testable on every target.
 
-/// Vertical offset (pixels) from the touch point to the tooltip center.
-pub(crate) const TOOLTIP_OFFSET_Y: f32 = 60.0;
 /// Default width of the layers panel on mobile.
 const LAYERS_PANEL_WIDTH: f32 = 260.0;
 /// Width of combo boxes in the layers panel on mobile.
 const COMBO_BOX_WIDTH: f32 = 180.0;
-
-/// Draw a floating tooltip above the finger during a long-press on mobile,
-/// showing the radar value at the touched position.
-#[cfg(target_os = "android")]
-pub fn draw_long_press_tooltip(
-    ui: &egui::Ui,
-    projector: &walkers::Projector,
-    img: &RadarImageData,
-    touch_pos: egui::Pos2,
-    pane: &PaneState,
-    prefs: &UserPreferences,
-) {
-    draw_long_press_tooltip_raw(ui, projector, &img.value_data, img.lat, img.lon, touch_pos, pane, prefs);
-}
-
-pub fn draw_long_press_tooltip_raw(
-    ui: &egui::Ui,
-    projector: &walkers::Projector,
-    value_data: &[f32],
-    lat: f64,
-    lon: f64,
-    touch_pos: egui::Pos2,
-    pane: &PaneState,
-    prefs: &UserPreferences,
-) {
-    use rustdar_radar::types::IMAGE_SIZE;
-
-    let bounds = ImageBounds::from_radar_site(lat, lon);
-
-    let nw = projector
-        .project(walkers::lat_lon(bounds.max_lat, bounds.min_lon))
-        .to_pos2();
-    let se = projector
-        .project(walkers::lat_lon(bounds.min_lat, bounds.max_lon))
-        .to_pos2();
-    let image_rect = egui::Rect::from_two_pos(nw, se);
-
-    // Compute pixel coordinates inside the radar image
-    let frac_x = (touch_pos.x - image_rect.left()) / image_rect.width();
-    let frac_y = (touch_pos.y - image_rect.top()) / image_rect.height();
-    let px = (frac_x * IMAGE_SIZE as f32) as i32;
-    let py = (frac_y * IMAGE_SIZE as f32) as i32;
-
-    let mut text = String::new();
-    if px >= 0 && px < IMAGE_SIZE as i32 && py >= 0 && py < IMAGE_SIZE as i32 {
-        let pixel_idx = py as usize * IMAGE_SIZE + px as usize;
-        if pixel_idx < value_data.len() {
-            let value = value_data[pixel_idx];
-            if !value.is_nan() {
-                text = pane.selected_product.format_value(value, prefs);
-            }
-        }
-    }
-
-    if text.is_empty() {
-        text = "No data".into();
-    }
-
-    // Position tooltip above the finger
-    let tooltip_pos = egui::pos2(touch_pos.x, touch_pos.y - super::mobile::TOOLTIP_OFFSET_Y);
-
-    let painter = ui.painter();
-    let font = egui::FontId::proportional(14.0);
-    let galley = painter.layout_no_wrap(text, font, egui::Color32::WHITE);
-    let text_size = galley.size();
-    let padding = egui::vec2(8.0, 4.0);
-    let bg_rect = egui::Rect::from_center_size(
-        tooltip_pos,
-        text_size + padding * 2.0,
-    );
-
-    painter.rect_filled(bg_rect, 4.0, egui::Color32::from_black_alpha(200));
-    painter.galley(bg_rect.min + padding, galley, egui::Color32::WHITE);
-}
-
 
 impl super::Gui {
     pub(super) fn render_mobile_ui(&mut self, ui: &mut egui::Ui, actions: &mut Vec<GuiAction>) {

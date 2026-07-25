@@ -48,7 +48,8 @@
 //! cancellation at all.
 
 use crate::Gui;
-use crate::ui_input::{MapPointerFrame, TouchGestures};
+use crate::ui_input::{InteractionState, MapPointerFrame, TouchGestures};
+use crate::ui_layout::{ModalityLatch, PointerModality};
 
 /// Viewport size used by the harness — a landscape desktop-ish window.
 const SCREEN_SIZE: egui::Vec2 = egui::vec2(1024.0, 768.0);
@@ -59,12 +60,26 @@ const FRAME_DT: f64 = 1.0 / 60.0;
 /// The pane pointer state produced by one harness frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct FrameOutcome {
-    /// Pointer resolution taken by the desktop build (egui click detection).
+    /// Pointer resolution from the mouse path, driven unconditionally.
+    ///
+    /// This and `touch` bypass the modality gate on purpose — they exercise
+    /// each pipeline directly, whatever is actually pointing at the screen.
+    /// For what the app really does with this frame's input, use `resolved`.
     pub mouse: MapPointerFrame,
-    /// Pointer resolution taken by the Android build (touch gesture pipeline).
+    /// Pointer resolution from the touch pipeline, driven unconditionally.
     pub touch: MapPointerFrame,
-    /// Map zoom after the frame — observes the double-tap-drag zoom gesture.
+    /// Pointer resolution the **real UI** takes: whichever pipeline the latched
+    /// [`PointerModality`] selects, through [`InteractionState`]. This is the
+    /// only field that observes the gate.
+    pub resolved: MapPointerFrame,
+    /// The modality in force for this frame.
+    pub modality: PointerModality,
+    /// Map zoom after the frame — observes the double-tap-drag zoom gesture on
+    /// the ungated `touch` path.
     pub zoom: f64,
+    /// Map zoom on the gated path, so a test can tell whether a *gesture the
+    /// gate should have blocked* moved the map.
+    pub resolved_zoom: f64,
 }
 
 /// Drives [`Gui::ui`] frame by frame with synthetic input.
@@ -73,8 +88,16 @@ pub(crate) struct InputHarness {
     gui: Gui,
     /// Touch gesture detectors for the "active pane", as `ui_map.rs` keeps them.
     gestures: TouchGestures,
+    /// The modality-gated resolver, as `Gui` keeps it. Driven in parallel with
+    /// the two ungated paths so one frame can be observed all three ways.
+    interaction: InteractionState,
+    /// The latch feeding `interaction`, mirroring the one inside `Gui`.
+    modality: ModalityLatch,
     /// Map viewport the zoom gesture acts on.
     map_memory: walkers::MapMemory,
+    /// A second viewport, so the gated path's zoom can be observed
+    /// independently of the ungated touch path's.
+    resolved_map_memory: walkers::MapMemory,
     /// Screen rect of the active pane's map, used to reject taps on chrome.
     pane_rect: egui::Rect,
     /// Wall-clock time reported to egui, in seconds.
@@ -110,7 +133,10 @@ impl InputHarness {
             ctx: egui::Context::default(),
             gui: Gui::new(),
             gestures: TouchGestures::default(),
+            interaction: InteractionState::default(),
+            modality: ModalityLatch::default(),
             map_memory: walkers::MapMemory::default(),
+            resolved_map_memory: walkers::MapMemory::default(),
             // The map occupies the middle of the window: inset generously so
             // the harness never depends on exact panel widths.
             pane_rect: egui::Rect::from_min_max(
@@ -413,14 +439,26 @@ impl InputHarness {
         // The real UI, panels, dialogs and map panes included.
         self.last_actions = self.gui.ui(&ctx);
 
-        // The same two entry points `ui_map.rs` uses for the active pane. Both
-        // funnel their click position through `filter_dialog_blocked`.
+        // The same entry points `ui_map.rs` uses for the active pane. All of
+        // them funnel their click position through `filter_dialog_blocked`.
+        //
+        // `mouse` and `touch` drive each pipeline directly; `resolved` goes
+        // through the modality gate, exactly as `render_map` does.
+        let modality = self.modality.update(&ctx);
         let outcome = FrameOutcome {
             mouse: MapPointerFrame::from_mouse(&ctx),
             touch: self
                 .gestures
                 .update(&ctx, &mut self.map_memory, self.pane_rect),
+            resolved: self.interaction.resolve_active(
+                &ctx,
+                modality,
+                &mut self.resolved_map_memory,
+                self.pane_rect,
+            ),
+            modality,
             zoom: self.map_memory.zoom(),
+            resolved_zoom: self.resolved_map_memory.zoom(),
         };
 
         let full_output = ctx.end_pass();
@@ -1268,6 +1306,183 @@ mod tests {
         h.touch_tap(pos);
         let confirmed = h.frame_after(AFTER_DOUBLE_TAP_TIMEOUT);
         assert_eq!(confirmed.touch.overlay_click_pos, Some(pos));
+    }
+
+    // ── The modality gate ────────────────────────────────────────────────
+    //
+    // These are the only tests that read `FrameOutcome::resolved`. The `mouse`
+    // and `touch` fields deliberately bypass the gate, so asserting on them
+    // here would prove nothing about it.
+
+    /// 9. **A slow mouse press is not a long press.**
+    ///
+    ///    `LongPressDetector` keys purely on "primary down for 0.8s", so under
+    ///    a mouse it fires on an ordinary slow click — and because a long press
+    ///    raises `suppress_pan`, it takes the drag away from the map. Every map
+    ///    pan starts with the button going down and staying down, so an ungated
+    ///    detector breaks mouse panning outright.
+    ///
+    ///    The `touch` assertion is the contrast that stops this being vacuous:
+    ///    the identical input *does* drive the detector when it is not gated,
+    ///    so what the test observes is the gate and not a dead detector.
+    #[test]
+    fn a_slow_mouse_press_never_becomes_a_long_press() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+
+        h.mouse_press(pos);
+        let held = {
+            h.frame_after(FRAME_DT);
+            h.frames_for(10, 0.1)
+        };
+
+        assert_eq!(
+            held.modality,
+            PointerModality::Mouse,
+            "precondition: mouse events must have latched the mouse modality"
+        );
+        assert_eq!(
+            held.touch.long_press_pos,
+            Some(pos),
+            "precondition: ungated, this input really does trip the detector — \
+             otherwise the assertion below is satisfied by nothing happening"
+        );
+
+        assert_eq!(
+            held.resolved.long_press_pos, None,
+            "the gate must keep the long-press detector off a mouse"
+        );
+        assert!(
+            !held.resolved.suppress_pan,
+            "a held mouse button must still pan the map"
+        );
+    }
+
+    /// 10. **A mouse click is not deferred.**
+    ///
+    ///     The touch path withholds every tap for `DOUBLE_TAP_TIMEOUT_S` so a
+    ///     double-tap can claim it. Under a mouse that is 400ms of latency on
+    ///     every overlay click, for a gesture a mouse cannot even perform.
+    #[test]
+    fn a_mouse_click_reports_immediately_rather_than_after_the_tap_window() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+
+        let clicked = h.mouse_click(pos);
+        assert_eq!(clicked.modality, PointerModality::Mouse);
+        assert_eq!(
+            clicked.resolved.overlay_click_pos,
+            Some(pos),
+            "the click must land on the frame it happened"
+        );
+        assert_eq!(
+            clicked.touch.overlay_click_pos, None,
+            "precondition: the touch pipeline would still be deferring it, so \
+             the assertion above is about the gate"
+        );
+    }
+
+    /// 10b. The touch path keeps its deferral, so the test above is a statement
+    ///      about the modality and not about the deferral having been deleted.
+    #[test]
+    fn a_real_touch_tap_is_still_deferred_through_the_gate() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+
+        let tapped = h.touch_tap(pos);
+        assert_eq!(
+            tapped.modality,
+            PointerModality::Touch,
+            "precondition: touch events latch the touch modality"
+        );
+        assert_eq!(tapped.resolved.overlay_click_pos, None, "still deferred");
+
+        let confirmed = h.frame_after(AFTER_DOUBLE_TAP_TIMEOUT);
+        assert_eq!(confirmed.resolved.overlay_click_pos, Some(pos));
+    }
+
+    /// 11. **A mouse double-click does not enter a zoom drag.**
+    ///
+    ///     Double-clicking is an ordinary thing to do with a mouse.
+    ///     `DoubleTapDragDetector` would read it as the opening of a
+    ///     double-tap-drag and start scrubbing the zoom with vertical motion.
+    #[test]
+    fn a_mouse_double_click_does_not_start_a_zoom_drag() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+
+        let before = h.frame_after(FRAME_DT).resolved_zoom;
+
+        // Two clicks well inside the double-tap window, then drag downwards
+        // while still held — the exact shape of the touch zoom gesture.
+        h.mouse_click(pos);
+        h.mouse_press(pos);
+        h.frame_after(0.05);
+        h.mouse_move(pos + egui::vec2(0.0, 150.0));
+        let dragged = h.frame_after(FRAME_DT);
+
+        assert_eq!(dragged.modality, PointerModality::Mouse);
+        assert_eq!(
+            dragged.resolved_zoom, before,
+            "a mouse double-click-drag must not scrub the map zoom"
+        );
+        assert!(
+            !dragged.resolved.suppress_pan,
+            "and it must leave panning to the map"
+        );
+    }
+
+    /// 11b. The same gesture on the ungated touch path *does* zoom, so the test
+    ///      above is not simply asserting that the gesture never works.
+    #[test]
+    fn the_same_drag_does_zoom_when_it_really_is_a_touch() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+
+        let before = h.frame_after(FRAME_DT).resolved_zoom;
+
+        h.touch_tap(pos);
+        h.touch_start(pos);
+        h.frame_after(0.05);
+        h.touch_move(pos + egui::vec2(0.0, 150.0));
+        let dragged = h.frame_after(FRAME_DT);
+
+        assert_eq!(dragged.modality, PointerModality::Touch);
+        assert_ne!(
+            dragged.resolved_zoom, before,
+            "the touch gesture must reach the map through the gate"
+        );
+        assert!(dragged.resolved.suppress_pan, "the zoom drag owns the pointer");
+    }
+
+    /// 12. **Picking up the mouse mid-gesture abandons the gesture.**
+    ///
+    ///     A tap left waiting for its double-tap partner must not be confirmed
+    ///     0.4s later, after the user has switched to a mouse. That first tap
+    ///     is no longer a live claim on anything.
+    #[test]
+    fn switching_to_a_mouse_abandons_a_half_finished_touch_gesture() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+
+        let tapped = h.touch_tap(pos);
+        assert_eq!(tapped.modality, PointerModality::Touch);
+        assert_eq!(
+            tapped.resolved.overlay_click_pos, None,
+            "precondition: the tap is pending, not yet confirmed"
+        );
+
+        // The user picks up a mouse. Somewhere else entirely, so a stray
+        // confirmation would be visibly at the wrong place.
+        h.mouse_move(pos + egui::vec2(200.0, 0.0));
+        let switched = h.frame_after(FRAME_DT);
+        assert_eq!(switched.modality, PointerModality::Mouse);
+
+        let settled = h.frames_for(4, 0.2);
+        assert_eq!(
+            settled.resolved.overlay_click_pos, None,
+            "the abandoned tap must not surface once its window closes"
+        );
     }
 
     // ── Overlay texture budget ───────────────────────────────────────────

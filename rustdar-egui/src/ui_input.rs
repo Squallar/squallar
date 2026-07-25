@@ -702,6 +702,85 @@ impl TouchGestures {
     }
 }
 
+/// Owns the touch gesture detectors and decides, per frame, whether they run
+/// at all.
+///
+/// # Why the gate exists
+///
+/// Both detectors were written for a finger and misfire on a mouse. This was
+/// verified, not assumed:
+///
+/// * [`LongPressDetector`] keys purely on "the primary button is down for
+///   [`LONG_PRESS_DURATION_S`]". A user who holds the left button still for a
+///   moment before dragging — an ordinary slow click, and the *start of every
+///   map pan* — trips it, which raises `suppress_pan` and takes the drag away
+///   from the map. Running it under a mouse breaks mouse panning outright.
+/// * [`DoubleTapDragDetector`] defers every single tap by
+///   [`DOUBLE_TAP_TIMEOUT_S`] so that a double-tap can claim it. On a mouse
+///   that is 400ms of latency added to every overlay click, and a double-click
+///   — a completely ordinary thing to do with a mouse — silently enters a
+///   zoom-drag instead.
+///
+/// So the modality is not a cosmetic choice about which code path is tidier:
+/// running the touch pipeline under a mouse is a functional regression in two
+/// separate places, and running the mouse path under a finger loses
+/// double-tap-zoom and the long-press tooltip.
+#[derive(Clone, Default)]
+pub(crate) struct InteractionState {
+    gestures: TouchGestures,
+    /// The modality the last frame ran under, so a change can be noticed.
+    last_modality: Option<crate::ui_layout::PointerModality>,
+}
+
+impl InteractionState {
+    /// Resolve the **active** pane's pointer state for this frame.
+    ///
+    /// `map_memory` is the active pane's viewport; the zoom-drag gesture writes
+    /// to it directly.
+    pub(crate) fn resolve_active(
+        &mut self,
+        ctx: &egui::Context,
+        modality: crate::ui_layout::PointerModality,
+        map_memory: &mut walkers::MapMemory,
+        pane_rect: egui::Rect,
+    ) -> MapPointerFrame {
+        use crate::ui_layout::PointerModality;
+
+        // A modality change abandons any gesture in flight. Without this a
+        // half-formed gesture — a first tap waiting for its partner, or a
+        // `LostCause` latch — survives the switch and resolves against input it
+        // was never watching. The user put the finger down and picked up a
+        // mouse; nothing about that first tap is still true.
+        if self.last_modality != Some(modality) {
+            self.gestures = TouchGestures::default();
+            self.last_modality = Some(modality);
+        }
+
+        match modality {
+            PointerModality::Touch => self.gestures.update(ctx, map_memory, pane_rect),
+            PointerModality::Mouse => MapPointerFrame::from_mouse(ctx),
+        }
+    }
+
+    /// Resolve a pane that is **not** the active one.
+    ///
+    /// The touch pipeline is single-pointer and stateful, so it only ever runs
+    /// for the pane that owns the gesture. The mouse has no such state, so it
+    /// is resolved for every pane exactly as the desktop build always did —
+    /// which is what lets a click land on an overlay in a pane before that
+    /// pane becomes active.
+    pub(crate) fn resolve_inactive(
+        &self,
+        ctx: &egui::Context,
+        modality: crate::ui_layout::PointerModality,
+    ) -> MapPointerFrame {
+        match modality {
+            crate::ui_layout::PointerModality::Touch => MapPointerFrame::inactive(),
+            crate::ui_layout::PointerModality::Mouse => MapPointerFrame::from_mouse(ctx),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
