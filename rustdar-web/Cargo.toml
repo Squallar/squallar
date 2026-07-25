@@ -48,14 +48,14 @@ winit = { workspace = true }
 # Pinned to what the egui/wgpu stack already resolves. wasm-bindgen and web-sys
 # have to agree with the copy egui-winit and wgpu link against or the generated
 # bindings do not line up; these move when that stack moves.
-wasm-bindgen = "=0.2.118"
-wasm-bindgen-futures = "=0.4.68"
-js-sys = "=0.3.95"
+wasm-bindgen = "=0.2.126"
+wasm-bindgen-futures = "=0.4.76"
+js-sys = "=0.3.103"
 console_error_panic_hook = "=0.1.7"
 console_log = "=1.0.0"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
-version = "=0.3.95"
+version = "=0.3.103"
 # web-sys gates every interface behind its own feature. Listing them explicitly
 # rather than taking a blanket set keeps the generated glue to what is used.
 features = [
