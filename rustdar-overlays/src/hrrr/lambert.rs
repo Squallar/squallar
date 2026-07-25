@@ -1,75 +1,49 @@
 //! Lambert Conformal Conic projection, in pure Rust.
 //!
-//! # Why this exists
+//! `grib` can do this for GRIB2 template 3.30, but only behind `gridpoints-proj`,
+//! which links PROJ (`proj-sys`, `libsqlite3-sys`, `link-cplusplus` — none of
+//! which cross-compile to wasm32 or iOS). With `default-features = false`,
+//! `Template3_30::latlons()` falls into grib's catch-all and returns
+//! `GribError::NotSupported`. HRRR is *entirely* template 3.30, so that kills
+//! every HRRR fetch.
 //!
-//! The `grib` crate can compute grid point lat/lons for GRIB2 grid definition
-//! template 3.30 (Lambert conformal) — but only behind its `gridpoints-proj`
-//! feature, which links PROJ. PROJ drags in `proj-sys`, `libsqlite3-sys` and
-//! `link-cplusplus`, and those C/C++ dependencies cannot cross-compile to
-//! `wasm32` or iOS. Building `grib` with `default-features = false` drops them,
-//! and with them `Template3_30`'s `latlons()` arm: the template falls into
-//! grib's `#[cfg(not(feature = "gridpoints-proj"))]` catch-all and returns
-//! `GribError::NotSupported`.
-//!
-//! HRRR is *entirely* template 3.30, so that would kill every HRRR fetch. This
-//! module reimplements the projection so it does not.
-//!
-//! # What it computes
-//!
-//! Exactly what `grib` used to hand PROJ, namely
+//! Reproduces what grib handed PROJ:
 //!
 //! ```text
 //! +a=<a> +b=<b> +proj=lcc +lat_0=<LaD> +lon_0=<LoV> +lat_1=<Latin1> +lat_2=<Latin2>
 //! ```
 //!
-//! grib's PROJ path forward-projects the grid's *first* point (La1/Lo1) to get
-//! the corner in projected metres, steps by Dx/Dy in metres, then inverse
-//! projects every step back to lat/lon. [`latlons`] reproduces that sequence,
-//! which is why both a forward and an inverse are implemented here rather than
-//! just the inverse.
+//! and the same sequence: forward-project the grid's first point (La1/Lo1), step
+//! by Dx/Dy in metres, inverse-project each step. That is why both directions are
+//! implemented, not just the inverse.
 //!
-//! # The math
+//! Math is Snyder, *Map Projections — A Working Manual* (USGS PP 1395) ch. 15.
+//! The ellipsoidal formulation is used throughout and reduces exactly to the
+//! spherical one at zero eccentricity, which is HRRR's case.
 //!
-//! Snyder, *Map Projections — A Working Manual* (USGS Professional Paper 1395),
-//! chapter 15 "Lambert Conformal Conic". The ellipsoidal formulation is used
-//! throughout; it reduces exactly to the spherical one when the eccentricity is
-//! zero, which is the case for HRRR (see [`LambertConformalConic::new`]).
-//!
-//! Both the secant case (`lat_1 != lat_2`) and the tangent case
-//! (`lat_1 == lat_2`, where Snyder eq. 15-4 for the cone constant is 0/0 and
-//! must be replaced by its limit `n = sin(lat_1)`) are implemented. **HRRR is
-//! the tangent case** — its Latin1 and Latin2 are both 38.5° — so the tangent
-//! limit is not an edge case here, it is the only path HRRR ever takes.
+//! **HRRR is the TANGENT case** — Latin1 == Latin2 == 38.5° — where Snyder
+//! eq. 15-4 for the cone constant is 0/0 and must be replaced by its limit
+//! `n = sin(lat_1)`. The secant branch is implemented but unexercised by real
+//! input.
 
 use grib::{GridPointIndex, def::grib2::template::Template3_30};
 
-/// Below this separation (in radians) the two standard parallels are treated as
-/// coincident and the tangent limit `n = sin(lat_1)` is used.
+/// Below this parallel separation the tangent limit `n = sin(lat_1)` is used.
 ///
 /// GRIB2 stores Latin1/Latin2 as integer microdegrees, so the smallest non-zero
-/// separation representable is 1e-6° = 1.745e-8 rad. This threshold sits an
-/// order of magnitude below that, so a genuinely secant grid is never mistaken
-/// for a tangent one. It still guards the secant formula against catastrophic
-/// cancellation: as `lat_1 -> lat_2` both the numerator and denominator of
-/// eq. 15-4 approach zero, and below this separation the tangent limit is more
-/// accurate than the ratio of two near-zero differences.
+/// separation representable is 1e-6° = 1.745e-8 rad — an order of magnitude
+/// above this, so a genuinely secant grid is never mistaken for a tangent one.
 const TANGENT_EPSILON_RAD: f64 = 1e-9;
 
-/// Convergence threshold for the ellipsoidal latitude iteration, in radians.
-/// 1e-12 rad is ~6 micrometres on the ground — far below any meaningful
-/// tolerance, and reached in a handful of iterations for terrestrial
-/// eccentricities.
+/// ~6 micrometres on the ground.
 const LATITUDE_ITERATION_TOLERANCE_RAD: f64 = 1e-12;
 
-/// Iteration cap for the ellipsoidal latitude solve. Terrestrial eccentricities
-/// converge in well under ten passes; the cap only exists so a pathological
-/// ellipsoid cannot hang a fetch.
+/// Terrestrial eccentricities converge in under ten passes; the cap only stops a
+/// pathological ellipsoid hanging a fetch.
 const MAX_LATITUDE_ITERATIONS: usize = 32;
 
-/// A Lambert Conformal Conic projection.
-///
 /// Constructed from the same six parameters PROJ's `+proj=lcc` takes, so it can
-/// be checked against PROJ directly. See [`LambertConformalConic::new`].
+/// be checked against PROJ directly.
 #[derive(Debug, Clone, Copy)]
 pub struct LambertConformalConic {
     /// Semi-major axis, metres.
@@ -90,13 +64,12 @@ pub struct LambertConformalConic {
 impl LambertConformalConic {
     /// Build a projection from ellipsoid axes and the four angular parameters.
     ///
-    /// * `a`, `b` — semi-major and semi-minor axes in metres. `a == b` gives a
-    ///   sphere. **HRRR's GRIB2 section 3 carries earth-shape code 6**, which
-    ///   WMO Code Table 3.2 defines as "spherical with radius 6,371,229.0 m" —
-    ///   *not* the 6,371,200 m of code 8, and not an ellipsoid. Getting this
-    ///   wrong displaces the whole grid by tens of metres without making it
-    ///   look wrong. Callers should take the radii from
-    ///   `EarthShape::radii()` rather than hardcoding, as [`latlons`] does.
+    /// * `a`, `b` — semi-major and semi-minor axes in metres; `a == b` gives a
+    ///   sphere. **HRRR's GRIB2 section 3 carries earth-shape code 6**, which WMO
+    ///   Code Table 3.2 defines as a sphere of radius **6,371,229.0 m** — not the
+    ///   6,371,200 m of code 8 that most HRRR write-ups quote, and not an
+    ///   ellipsoid. Getting it wrong displaces the whole grid by tens of metres
+    ///   without looking wrong. Take the radii from `EarthShape::radii()`.
     /// * `lat_0` — latitude of origin (GRIB2 `LaD`), degrees.
     /// * `lon_0` — central meridian (GRIB2 `LoV`), degrees. May be given in
     ///   either 0..360 or -180..180 form.
@@ -147,8 +120,8 @@ impl LambertConformalConic {
         let t1 = Self::t(phi1, e);
 
         let n = if (phi1 - phi2).abs() < TANGENT_EPSILON_RAD {
-            // Tangent cone. Snyder eq. 15-4 is 0/0 here; its limit as
-            // lat_2 -> lat_1 is sin(lat_1). This is the branch HRRR takes.
+            // Tangent cone: Snyder eq. 15-4 is 0/0, limit is sin(lat_1). The only
+            // branch HRRR takes.
             phi1.sin()
         } else {
             // Secant cone, Snyder eq. 15-4.
@@ -267,12 +240,10 @@ impl LambertConformalConic {
     }
 }
 
-/// Wrap radians into `-pi..=pi`.
-///
-/// GRIB2 stores LoV and Lo1 as unsigned microdegrees (HRRR: 262500000 and
-/// 237280472, i.e. 262.5° and 237.28°), so their difference is already small —
-/// but a grid straddling the antimeridian would not be, and `theta` must be the
-/// *short* way round for the forward projection to land in the right quadrant.
+/// Wrap radians into `-pi..=pi`. `theta` must be the *short* way round or the
+/// forward projection lands in the wrong quadrant for a grid straddling the
+/// antimeridian. (GRIB2 stores LoV/Lo1 as unsigned microdegrees; HRRR's are
+/// 262500000 and 237280472.)
 fn normalize_radians(mut r: f64) -> f64 {
     use std::f64::consts::{PI, TAU};
     if !r.is_finite() {
@@ -292,12 +263,8 @@ fn normalize_longitude_degrees(lon: f64) -> f64 {
     (lon + 540.0).rem_euclid(360.0) - 180.0
 }
 
-/// Compute lat/lon for every point of a template 3.30 (Lambert conformal) grid.
-///
-/// This is the drop-in replacement for `grib`'s PROJ-backed
-/// `<Template3_30 as LatLons>::latlons`, and deliberately mirrors its sequence:
-/// forward-project the first grid point, walk the grid in projected metres
-/// using Dx/Dy signed by the scanning mode, then inverse-project each step.
+/// Drop-in replacement for grib's PROJ-backed
+/// `<Template3_30 as LatLons>::latlons`, mirroring its sequence exactly.
 ///
 /// Points come back in scanning-mode order — the same order as the decoded data
 /// values — because the iteration is driven by grib's own
@@ -355,46 +322,23 @@ pub fn latlons(grid: &Template3_30) -> Result<Vec<(f64, f64)>, String> {
 mod tests {
     use super::*;
 
-    // ------------------------------------------------------------------
-    // Independently-sourced reference values.
-    //
-    // Nothing below is computed with the code under test. Provenance is
-    // recorded per constant; the three sources are:
-    //
-    //   (A) The HRRR GRIB2 file itself. Section 3 states La1/Lo1 — the lat/lon
-    //       of grid point (0,0) — so the file hands us the expected value for
-    //       one corner outright.
-    //   (B) PROJ 9.8.1 (`proj -I +proj=lcc ...`, system binary, PROJ release of
-    //       2026-04-10). This is a separate C implementation, and specifically
-    //       the one `grib`'s `gridpoints-proj` feature delegated to, so it is
-    //       the exact behaviour this module must preserve.
-    //   (C) The EPSG Guidance Note 7-2 published worked example for
-    //       "Lambert Conic Conformal (2SP)" (EPSG method 9802), whose expected
-    //       coordinates are printed in the document.
-    // ------------------------------------------------------------------
+    // Nothing below is computed with the code under test. Three sources:
+    //   (A) the HRRR GRIB2 file's own section 3 (La1/Lo1 is grid point (0,0));
+    //   (B) PROJ 9.8.1, the C implementation grib's `gridpoints-proj` delegated
+    //       to and therefore the behaviour this module must preserve;
+    //   (C) the EPSG Guidance Note 7-2 worked example for "Lambert Conic
+    //       Conformal (2SP)" (method 9802).
 
     /// HRRR CONUS grid definition, transcribed field-for-field from GRIB2
-    /// section 3 (81 octets, template 3.30) of a **raw operational** HRRR file:
-    /// `hrrr.t12z.wrfsfcf00.grib2` (2026-07-24 12Z, CIN/surface), fetched
-    /// without any `subregion` argument so NOMADS streams the record through
-    /// untouched.
-    ///
-    /// These are also the values `wgrib2 -grid` reports for any HRRR CONUS
-    /// file, and match NOAA's published HRRR domain specification:
+    /// section 3 of a **raw operational** file (`hrrr.t12z.wrfsfcf00.grib2`,
+    /// 2026-07-24 12Z), fetched with no `subregion` so NOMADS streams it
+    /// untouched. Matches `wgrib2 -grid` and NOAA's published domain:
     /// 1799x1059, 3 km, LoV 262.5, LaD/Latin1/Latin2 38.5.
     ///
-    /// # If you re-derive this from what the app actually downloads, read this
-    ///
-    /// You will get a *different* `Lo1` and the corner assertions will fail by
-    /// a hair. That is expected and is not a projection bug — see
-    /// [`the_nomads_filter_reencodes_lo1_by_one_microdegree`], which pins the
-    /// other value. The app's request carries `subregion=&toplat=...`, which
-    /// makes NOMADS re-encode the record through wgrib2 rather than stream it;
-    /// re-encoding re-rounds `Lo1` from 237280472 to 237280471 microdegrees.
-    /// The projection anchors on whatever `Lo1` the file states, so both are
-    /// correct in production; this fixture uses the operational value because
-    /// that is the canonical, published grid definition and does not depend on
-    /// NOMADS' tooling.
+    /// A NOMADS filter-CGI download gives a different `Lo1` and the corner
+    /// assertions fail by a hair — see
+    /// [`the_nomads_filter_reencodes_lo1_by_one_microdegree`]. Both are correct;
+    /// the projection anchors on whatever `Lo1` the file states.
     fn hrrr_conus_grid() -> Template3_30 {
         use grib::def::grib2::template::param_set;
         Template3_30 {
@@ -429,20 +373,9 @@ mod tests {
         }
     }
 
-    /// Tolerance for HRRR grid-point comparisons, in degrees.
-    ///
-    /// **On the ground this is about 11 cm.** One degree of latitude is
-    /// ~111.2 km everywhere, so 1e-6° = 0.111 m. One degree of longitude is
-    /// ~111.32*cos(lat) km, which over HRRR's 21°..48° span is 103.9 km down to
-    /// 74.5 km, so 1e-6° of longitude is between 0.104 m and 0.075 m. The
-    /// bound is therefore <= 0.111 m anywhere on the grid.
-    ///
-    /// This is far tighter than the ~3 km grid spacing and far tighter than any
-    /// rendering could resolve, but it is deliberately not slack: the failure
-    /// mode this guards against is a *systematic* displacement (wrong earth
-    /// radius, dropped central meridian), which shifts points by tens of metres
-    /// at minimum — two to six orders of magnitude above this bound. A loose
-    /// tolerance would hide exactly the bug worth catching.
+    /// ~11 cm on the ground, deliberately far tighter than the 3 km grid: the
+    /// failure mode guarded against is systematic displacement (wrong earth
+    /// radius, dropped central meridian), which is tens of metres at minimum.
     const HRRR_TOLERANCE_DEG: f64 = 1e-6;
 
     #[track_caller]
@@ -467,17 +400,11 @@ mod tests {
         j * grid.ni as usize + i
     }
 
-    /// **Source (A) — the file's own section 3.**
+    /// **Source (A) — the file's own section 3.** No external tool in the loop.
     ///
-    /// La1/Lo1 *is* the lat/lon of grid point (0,0): 21.138123°N,
-    /// 237.280472°E = -122.719528°E. Reproducing it is a check the data hands
-    /// us for free, with no external tool in the loop at all.
-    ///
-    /// Note what this does *not* prove. `latlons` forward-projects La1/Lo1 and
-    /// immediately inverse-projects the same point, so corner (0,0) is
-    /// algebraically invariant under any change to the earth radius, and
-    /// nearly so under changes to LaD. That is precisely why the far-corner
-    /// tests below exist and why this one is not sufficient on its own.
+    /// Not sufficient alone: `latlons` forward-projects La1/Lo1 and immediately
+    /// inverse-projects it, so corner (0,0) is algebraically invariant under any
+    /// change to the earth radius. Hence the far-corner tests below.
     #[test]
     fn first_grid_point_reproduces_the_files_own_la1_lo1() {
         let grid = hrrr_conus_grid();
@@ -485,8 +412,7 @@ mod tests {
         assert_eq!(points.len(), 1799 * 1059);
         assert_latlon_close(
             points[0],
-            // Straight from section 3: La1 = 21138123, Lo1 = 237280472,
-            // both in microdegrees, longitude wrapped to -180..180.
+            // Section 3: La1 = 21138123, Lo1 = 237280472 microdegrees.
             (21.138123, 237.280472 - 360.0),
             HRRR_TOLERANCE_DEG,
             "grid point (0,0) vs the file's La1/Lo1",
@@ -549,23 +475,21 @@ mod tests {
         }
     }
 
-    /// The grid the app actually downloads has a different `Lo1`, and it also
-    /// projects correctly.
+    /// The `Lo1` the retired NOMADS filter path produced, which also projects
+    /// correctly.
     ///
-    /// `nomads_url` always appends `subregion=&toplat=...&leftlon=...`. Those
-    /// arguments do not subset a Lambert grid — the response is always the full
-    /// 1799x1059 CONUS field — but they are *not* inert: they make NOMADS
-    /// re-encode the record through wgrib2 instead of streaming it, and the
-    /// re-encode re-rounds `Lo1` from 237280472 to **237280471** microdegrees.
-    /// (It also re-packs the data from DRT 5.3 to DRT 5.0; both are pure Rust
-    /// in grib, which is why dropping JPEG2000 and CCSDS is safe either way.)
+    /// That request always carried `subregion=&toplat=...&leftlon=...`. Those do
+    /// not subset a Lambert grid — the response was always the full 1799x1059
+    /// CONUS field — but they were not inert: NOMADS re-encoded the record
+    /// through wgrib2 rather than streaming it, re-rounding `Lo1` from 237280472
+    /// to **237280471** microdegrees and re-packing DRT 5.3 to DRT 5.0. S3 serves
+    /// the operational bytes, so the live decode path sees 5.3. grib handles both
+    /// in pure Rust, which is why dropping JPEG2000 and CCSDS is safe either way.
     ///
-    /// One microdegree of `Lo1` is ~10 cm at the anchor, but it is a *rotation*
-    /// of the whole grid about the cone apex, so it grows with distance: at the
-    /// NE corner the two encodings differ by 1.12e-6°, which is just over
-    /// [`HRRR_TOLERANCE_DEG`]. Hence this is its own fixture rather than a
-    /// looser tolerance on the shared one — a tolerance wide enough to accept
-    /// both would be wide enough to hide a real error.
+    /// One microdegree of `Lo1` is ~10 cm at the anchor but rotates the grid
+    /// about the cone apex, so at the NE corner the two encodings differ by
+    /// 1.12e-6° — just over [`HRRR_TOLERANCE_DEG`]. Hence a separate fixture: a
+    /// tolerance wide enough for both would hide a real error.
     ///
     /// **Source (B) — PROJ 9.8.1**, same procedure as
     /// [`HRRR_CORNERS_FROM_PROJ`] but anchored at Lo1 = 237.280471:
@@ -604,9 +528,8 @@ mod tests {
             );
         }
 
-        // And the trap itself: the two encodings really do disagree by more
-        // than the shared tolerance at the far corner, so swapping one fixture
-        // for the other silently is not an option.
+        // The two encodings really do disagree by more than the shared tolerance
+        // at the far corner, so the fixtures cannot be swapped silently.
         let operational = latlons(&hrrr_conus_grid()).unwrap();
         let ne = index_of(&grid, 1798, 1058);
         let delta = (points[ne].1 - operational[ne].1).abs();
@@ -622,13 +545,9 @@ mod tests {
         );
     }
 
-    /// The grid must actually cover CONUS, in the orientation HRRR states.
-    ///
     /// A projection can agree with PROJ at sampled points and still be indexed
-    /// wrongly — transposed axes, or a sign flip on Dy — so this asserts the
-    /// gross shape independently: scanning mode 0b0100_0000 scans +i (west to
-    /// east) and +j (south to north), so latitude must increase with j and the
-    /// full-grid extent must bracket the continental US.
+    /// wrongly (transposed axes, sign flip on Dy). Scanning mode 0b0100_0000
+    /// scans +i west-to-east and +j south-to-north.
     #[test]
     fn grid_spans_conus_in_the_stated_scan_order() {
         let grid = hrrr_conus_grid();
@@ -648,9 +567,8 @@ mod tests {
             min_lon = min_lon.min(lon);
             max_lon = max_lon.max(lon);
         }
-        // NOAA's published HRRR CONUS domain: roughly 21.1N-52.6N,
-        // 134.1W-60.9W. Bracketed loosely — this test is about gross
-        // orientation, the tight numbers are the PROJ test's job.
+        // NOAA's published HRRR CONUS domain: ~21.1N-52.6N, 134.1W-60.9W.
+        // Loose on purpose; the tight numbers are the PROJ test's job.
         assert!(
             (21.0..22.0).contains(&min_lat) && (52.0..53.0).contains(&max_lat),
             "latitude span {min_lat}..{max_lat} is not the HRRR CONUS domain",
@@ -661,14 +579,8 @@ mod tests {
         );
     }
 
-    /// Round trip: inverse then forward must land back on the original grid
-    /// index, to well under a grid cell.
-    ///
-    /// This is independent of every reference value above — it only asserts
-    /// that `forward` and `inverse` are mutual inverses and that the grid walk
-    /// is consistent — so it catches an internally-consistent-but-wrong
-    /// parameterisation only in combination with the PROJ test, and catches
-    /// forward/inverse asymmetry that the PROJ test cannot see at all.
+    /// Independent of every reference value above: asserts only that `forward`
+    /// and `inverse` are mutual inverses, which the PROJ test cannot see.
     #[test]
     fn forward_of_inverse_returns_the_original_grid_index() {
         let grid = hrrr_conus_grid();
@@ -689,17 +601,11 @@ mod tests {
         }
     }
 
-    /// **Hand-worked invariant, no external source needed.**
-    ///
-    /// The projection origin is by construction the point `(lon_0, lat_0)`:
-    /// at `phi = lat_0`, `rho = rho0` (eq. 15-1a is eq. 15-1 evaluated there),
-    /// and at `lambda = lon_0`, `theta = 0`. So eq. 14-1/14-2 give
-    /// `x = rho0*sin(0) = 0` and `y = rho0 - rho0*cos(0) = 0`.
-    ///
-    /// Therefore `inverse(0, 0) == (lat_0, lon_0)` exactly, for *any* valid
-    /// parameter set. A cone constant, scale factor or origin radius that is
-    /// individually wrong but self-consistent can survive a single-point check
-    /// elsewhere; it cannot survive this one across all four cases below.
+    /// **Hand-worked invariant.** At `phi = lat_0`, `rho = rho0`; at
+    /// `lambda = lon_0`, `theta = 0`; so eq. 14-1/14-2 give `x = y = 0` and
+    /// `inverse(0, 0) == (lat_0, lon_0)` exactly for any valid parameter set.
+    /// A self-consistent but individually wrong cone constant, scale factor or
+    /// origin radius survives a single-point check but not this across all four.
     #[test]
     fn projection_origin_inverts_to_lat0_lon0() {
         let cases: &[(f64, f64, f64, f64, f64, f64, &str)] = &[
@@ -719,15 +625,10 @@ mod tests {
         }
     }
 
-    /// **Hand-worked invariant.**
-    ///
-    /// For a tangent cone the cone constant is `sin(lat_1)`. HRRR's standard
-    /// parallel is 38.5°, so `n = sin(38.5°) = 0.6225146366376195`, computed
-    /// here from `f64::sin` rather than from any projection code.
-    ///
-    /// This matters because the tangent branch is the *only* branch HRRR uses,
-    /// and because it is the branch whose formula is not the textbook one —
-    /// Snyder eq. 15-4 is 0/0 at `lat_1 == lat_2` and would give NaN.
+    /// **Hand-worked invariant.** `n = sin(38.5°) = 0.6225146366376195`, from
+    /// `f64::sin` rather than from any projection code. The tangent branch is the
+    /// only one HRRR uses and the one whose formula is not the textbook one —
+    /// Snyder eq. 15-4 is 0/0 at `lat_1 == lat_2` and gives NaN.
     #[test]
     fn tangent_cone_constant_is_sin_of_the_standard_parallel() {
         let tangent =
@@ -743,15 +644,10 @@ mod tests {
 
     /// The tangent cone constant must come from **Latin1, not LaD**.
     ///
-    /// Every other test in this file uses HRRR or an HRRR-shaped fixture, where
-    /// `LaD == Latin1 == Latin2 == 38.5°`. Under that coincidence
-    /// `n = sin(LaD)` and `n = sin(Latin1)` are indistinguishable, so mutating
-    /// one into the other survives the whole suite — the code was right but
-    /// unpinned. GRIB2 template 3.30 carries LaD and Latin1/Latin2 as separate
-    /// fields and does not require them to agree, so this fixture separates
-    /// them: LaD = 45°, Latin1 = Latin2 = 30°.
-    ///
-    /// `n` must therefore be `sin(30°) = 0.5`, not `sin(45°) = 0.7071`.
+    /// Every other fixture here is HRRR-shaped, where `LaD == Latin1 == Latin2
+    /// == 38.5°`, so `sin(LaD)` and `sin(Latin1)` are indistinguishable and that
+    /// mutation survives the whole suite. Template 3.30 does not require them to
+    /// agree, so this separates them: LaD = 45°, Latin1 = Latin2 = 30°.
     ///
     /// **Source (B) — PROJ 9.8.1:**
     ///
@@ -770,8 +666,7 @@ mod tests {
     /// ```
     ///
     /// The last row is the origin invariant, which holds under the mutation too
-    /// (rho0 is built from the same `n`, so the apex moves with it) — which is
-    /// exactly why the other three rows are needed.
+    /// (rho0 is built from the same `n`), hence the other three rows.
     #[test]
     fn tangent_cone_constant_follows_latin1_not_lad() {
         let p = LambertConformalConic::new(6_371_229.0, 6_371_229.0, 45.0, -97.5, 30.0, 30.0)
@@ -808,12 +703,8 @@ mod tests {
         }
     }
 
-    /// The secant formula must agree with the tangent limit as the parallels
-    /// close up — i.e. the two branches are one continuous function, not two
-    /// unrelated ones.
-    ///
-    /// Expected values come from `f64::sin` of the mean parallel, not from the
-    /// projection.
+    /// The two branches must be one continuous function. Expected values come
+    /// from `f64::sin` of the mean parallel, not from the projection.
     #[test]
     fn secant_cone_constant_approaches_the_tangent_limit() {
         for delta in [1.0_f64, 0.1, 0.01, 0.001] {
@@ -821,10 +712,8 @@ mod tests {
             let secant =
                 LambertConformalConic::new(6_371_229.0, 6_371_229.0, 38.5, 262.5, lat1, lat2)
                     .unwrap();
-            // For a sphere the exact secant cone constant is
-            // ln(cos φ1 / cos φ2) / ln(tan(π/4+φ2/2) / tan(π/4+φ1/2)); as
-            // δ -> 0 this tends to sin(38.5°). The error is O(δ²), so a
-            // δ²-scaled bound is the honest assertion here.
+            // The secant cone constant tends to sin(38.5°) as δ -> 0 with error
+            // O(δ²), so the bound is δ²-scaled.
             let expected = 38.5_f64.to_radians().sin();
             let bound = 1e-3 * delta * delta;
             assert!(
@@ -834,8 +723,7 @@ mod tests {
                 delta / 2.0,
                 secant.n,
             );
-            // And it must genuinely take the secant branch, not silently fall
-            // into the tangent one.
+            // And it must genuinely take the secant branch.
             assert_ne!(
                 secant.n, expected,
                 "delta={delta} was absorbed by the tangent epsilon",
@@ -843,20 +731,11 @@ mod tests {
         }
     }
 
-    /// Exchanging the two standard parallels must change nothing.
-    ///
-    /// This is recorded as a test because it is the one obvious "mutation" of
-    /// this code that is *not* a bug: `n` (eq. 15-4) is antisymmetric in both
-    /// its numerator and denominator under the swap, so it is unchanged, and
-    /// `F` (eq. 15-2) is by construction identical whether computed from
-    /// parallel 1 or parallel 2 — that equality is what defines `n`. So a test
-    /// suite cannot distinguish the two orderings, and should not be expected
-    /// to.
-    ///
-    /// PROJ 9.8.1 agrees: the EPSG example below evaluates to
-    /// (293676.579980462, 77650.942538947) with the published parallel order
-    /// and (293676.579980462, 77650.942538950) with them swapped — 3 nm apart,
-    /// i.e. floating-point noise.
+    /// Swapping the standard parallels is the one obvious mutation here that is
+    /// *not* a bug: eq. 15-4 is antisymmetric in numerator and denominator, and
+    /// eq. 15-2 gives the same `F` from either parallel by construction. No test
+    /// suite can distinguish the orderings. PROJ 9.8.1 agrees — the EPSG example
+    /// below differs by 3 nm between the two orders.
     #[test]
     fn exchanging_the_standard_parallels_is_a_no_op() {
         let a = 6_378_206.400;
@@ -887,11 +766,10 @@ mod tests {
     /// **Source (C) — EPSG Guidance Note 7-2, method 9802
     /// "Lambert Conic Conformal (2SP)", published worked example.**
     ///
-    /// This is the secant *and* ellipsoidal path, which HRRR never exercises
-    /// (HRRR is tangent on a sphere) and which grib's own upstream test does
-    /// not exercise either — its only Lambert fixture, `ds.critfireo.bin`, is
-    /// also tangent, at Latin1 = Latin2 = 25°. Without this test the secant and
-    /// ellipsoid branches would ship completely unverified.
+    /// The secant *and* ellipsoidal path, which no real input exercises: HRRR is
+    /// tangent on a sphere, and grib's only upstream Lambert fixture
+    /// (`ds.critfireo.bin`) is also tangent, at Latin1 = Latin2 = 25°. Without
+    /// this the secant and ellipsoid branches ship unverified.
     ///
     /// From the EPSG guidance note:
     ///
@@ -909,14 +787,11 @@ mod tests {
     ///     Northing N =  254759.80 US survey feet
     /// ```
     ///
-    /// This module has no false easting/northing (grib's PROJ string has none
-    /// either), so the false origin offsets are applied here in the test.
-    /// 1 US survey foot = 1200/3937 m exactly.
+    /// This module has no false easting/northing (nor does grib's PROJ string),
+    /// so the offsets are applied in the test. 1 US survey foot = 1200/3937 m.
     ///
-    /// Cross-check: PROJ 9.8.1 gives (293676.579980, 77650.942539) m for the
-    /// same input, versus (293676.5791, 77650.9423) m from the published
-    /// figures — agreement to under a millimetre, so sources (B) and (C)
-    /// corroborate each other.
+    /// PROJ 9.8.1 gives (293676.579980, 77650.942539) m against the published
+    /// (293676.5791, 77650.9423) m — sub-millimetre, so (B) and (C) corroborate.
     #[test]
     fn secant_ellipsoidal_matches_the_epsg_published_worked_example() {
         const US_SURVEY_FOOT_M: f64 = 1200.0 / 3937.0;
@@ -969,18 +844,9 @@ mod tests {
         );
     }
 
-    /// The eccentricity must be load-bearing, not decorative.
-    ///
-    /// [`secant_ellipsoidal_matches_the_epsg_published_worked_example`] passes
-    /// to 6 mm. That is only meaningful if a *spherical* projection with the
-    /// same semi-major axis would visibly fail the same check — otherwise the
-    /// ellipsoidal machinery in [`LambertConformalConic::t`],
-    /// [`LambertConformalConic::m`] and the iterative branch of
-    /// [`LambertConformalConic::inverse`] could all be dead code and nobody
-    /// would know.
-    ///
-    /// Measured separation at the EPSG test point is ~332 m in northing; the
-    /// 100 m bound below is a floor on that, not a fitted value.
+    /// Without this, the ellipsoidal machinery could be dead code and the EPSG
+    /// test would still pass. Measured separation at the EPSG test point is
+    /// ~332 m in northing; the 100 m bound is a floor, not a fitted value.
     #[test]
     fn dropping_the_eccentricity_would_fail_the_epsg_example() {
         const US_SURVEY_FOOT_M: f64 = 1200.0 / 3937.0;
@@ -1005,8 +871,6 @@ mod tests {
              test point — the eccentricity is not reaching the projection",
         );
 
-        // Concretely: the spherical answer misses the published northing by
-        // far more than the 0.02 US survey foot the ellipsoidal one meets.
         let sphere_northing_usft = sy / US_SURVEY_FOOT_M;
         assert!(
             (sphere_northing_usft - 254_759.80).abs() > 100.0,
@@ -1015,8 +879,7 @@ mod tests {
              so that test proves nothing about the ellipsoidal path",
         );
 
-        // And the ellipsoidal inverse must undo the ellipsoidal forward — the
-        // iteration must converge, not merely run.
+        // The iteration must converge, not merely run.
         let (lat, lon) = ellipsoid.inverse(ex, ey);
         assert!(
             (lat - 28.5).abs() < 1e-9 && (lon + 96.0).abs() < 1e-9,
@@ -1096,18 +959,11 @@ mod tests {
         assert!(latlons(&grid).is_err(), "unknown Code Table 3.2 value must error");
     }
 
-    /// Longitude must land in -180..180, agreeing with grib's
-    /// `normalize_latlon` over the range either one can actually be handed.
-    ///
-    /// Not a bit-for-bit clone of grib: grib uses `(lon + 540) % 360 - 180`,
-    /// where Rust's `%` is a remainder that keeps the sign of the dividend, so
-    /// grib returns out-of-range values below -540° (grib maps -600° to -240°).
-    /// This uses `rem_euclid`, which is a true modulus and maps -600° to +120°,
-    /// the correct answer. The two agree everywhere above -540°, which covers
-    /// every longitude a GRIB2 grid can encode — Lo1 and LoV are unsigned
-    /// microdegrees, so the inputs are 0..360 before any arithmetic, and the
-    /// inverse only ever adds `lon_0`. The divergence is therefore unreachable
-    /// from `latlons`; the cases below stay inside the shared range.
+    /// Deliberately not a bit-for-bit clone of grib's `normalize_latlon`: grib's
+    /// `(lon + 540) % 360 - 180` keeps the sign of the dividend and returns
+    /// out-of-range values below -540° (-600° -> -240°), where `rem_euclid`
+    /// gives the correct +120°. The two agree above -540°, which covers every
+    /// longitude a GRIB2 grid can encode, so the divergence is unreachable here.
     #[test]
     fn longitude_normalization_lands_in_the_expected_half_open_range() {
         for (input, expected) in [

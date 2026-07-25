@@ -1,12 +1,9 @@
 //! HRRR model data fetch and types.
 //!
-//! Fetches HRRR fields from the NOAA NOMADS server-side filter. Supports CIN,
-//! CAPE, SRH, bulk shear, wind gusts, lifted index, PWAT, temperature,
-//! dewpoint, updraft helicity, and visibility via the `ModelParameter` enum.
-//!
-//! Most parameters are instantaneous and come from f00 (the analysis). The
-//! updraft-helicity parameters are *accumulations* and cannot: see
-//! [`ModelParameter::forecast_hour`].
+//! Fields are byte-ranged out of the `noaa-hrrr-bdp-pds` S3 bucket; see
+//! [`fetch`]. Most parameters are instantaneous and come from f00 (the
+//! analysis). The updraft-helicity parameters are accumulations and cannot —
+//! see [`ModelParameter::forecast_hour`].
 
 pub mod fetch;
 pub mod lambert;
@@ -42,7 +39,7 @@ pub enum ModelParameter {
 
     // --- Wind ---
     /// 0-6 km Bulk Wind Shear magnitude (GRIB U+V m/s → display kt).
-    /// Composite parameter requiring two NOMADS fetches.
+    /// Composite: two records merged into one grid.
     BulkShear6km,
     /// Surface Wind Gust (GRIB m/s → display kt).
     SurfaceWindGust,
@@ -85,24 +82,18 @@ impl ModelParameter {
         ]
     }
 
-    /// Which forecast hour of the run to fetch this parameter from.
+    /// Which forecast hour of the run to fetch this parameter from. f00, the
+    /// analysis, for every instantaneous field.
     ///
-    /// Nearly everything here is an instantaneous field, so f00 — the
-    /// analysis — is both available and the freshest possible answer.
+    /// **`MXUPHL` at f00 is identically 0.0 everywhere.** It is a maximum over
+    /// the forecast period, and at f00 that period has zero length: the `.idx`
+    /// entry reads `0-0 day max fcst` and the record is 212 bytes of GRIB2 whose
+    /// Section 5 carries `nbits=0, R=0.0, E=0, D=0` — a constant field at all
+    /// 1,905,141 points. It decodes cleanly and renders as nothing, forever.
     ///
-    /// Updraft helicity is not instantaneous. `MXUPHL` is a *maximum over the
-    /// forecast period*, and at f00 that period has zero length: the `.idx`
-    /// entry reads `0-0 day max fcst`, and the message NOMADS returns is 212
-    /// bytes of GRIB2 whose Section 5 carries `nbits=0, R=0.0, E=0, D=0` — a
-    /// constant field of exactly 0.0 at all 1,905,141 points. It decodes
-    /// cleanly and renders as nothing at all, forever.
-    ///
-    /// f01 is the first forecast hour with a real accumulation window
-    /// (`0-1 hour max fcst`), so that is where UH has to come from. This costs
-    /// one hour of latency relative to the other parameters, which is why
-    /// [`HrrrGridData::forecast_hour`] is carried through to the UI rather
-    /// than being quietly dropped — a 0-1 h maximum must not be presented as
-    /// if it were the analysis.
+    /// f01 is the first hour with a real window (`0-1 hour max fcst`). That
+    /// costs an hour of latency, which is why [`HrrrGridData::forecast_hour`]
+    /// reaches the UI: a 0-1 h maximum must not be presented as the analysis.
     pub fn forecast_hour(&self) -> u8 {
         match self {
             ModelParameter::MaxUH2to5km | ModelParameter::MaxUH0to2km => 1,
@@ -110,9 +101,8 @@ impl ModelParameter {
         }
     }
 
-    /// Whether this parameter is an accumulation/maximum over a time window
-    /// rather than an instantaneous value. Such fields are only meaningful
-    /// from a forecast hour with a nonzero window (see `forecast_hour`).
+    /// Accumulation/maximum rather than instantaneous. Only meaningful from a
+    /// forecast hour with a nonzero window — see [`Self::forecast_hour`].
     pub fn is_windowed(&self) -> bool {
         matches!(
             self,
@@ -139,12 +129,10 @@ impl ModelParameter {
         }
     }
 
-    /// The GRIB2 variable abbreviation, exactly as the `.idx` spells it.
-    ///
-    /// These are matched **literally** against the index sidecar — see
-    /// [`crate::hrrr::fetch::byte_range`] — so they are the index's strings,
-    /// not a normalised form of them. Panics for composite parameters; use
-    /// [`Self::composite_parts`] instead.
+    /// The GRIB2 variable abbreviation, exactly as the `.idx` spells it — these
+    /// are matched literally by [`crate::hrrr::fetch::byte_range`], not
+    /// normalised. Panics for composite parameters; use
+    /// [`Self::composite_parts`].
     pub fn grib_var(&self) -> &'static str {
         match self {
             ModelParameter::SurfaceBasedCin | ModelParameter::MixedLayerCin => "CIN",
@@ -181,18 +169,12 @@ impl ModelParameter {
             ModelParameter::LiftedIndex => "500-1000 mb",
             ModelParameter::Srh1km => "1000-0 m above ground",
             ModelParameter::Srh3km => "3000-0 m above ground",
-            // HRRR declares the MXUPHL layers top-bound-first — the `.idx`
-            // reads `MXUPHL:5000-2000 m above ground` and `MXUPHL:2000-0 m
-            // above ground`. The index is matched literally, so the ascending
-            // spellings these once used ("2000-5000", "0-2000") select no
-            // record at all; against NOMADS that produced an HTTP 500 on every
-            // request, and against the index it produces "record not found".
-            //
-            // Do not "normalise" these to match the ascending layers elsewhere
-            // in this match: HRRR is not self-consistent about bound order
+            // MXUPHL layers are top-bound-first in the `.idx`. Do not
+            // "normalise" them to match the ascending layers elsewhere in this
+            // match: HRRR is not self-consistent about bound order
             // (`VUCSH:0-6000` and `CAPE:0-3000 m` are bottom-first, `HLCY:3000-0`
-            // and these are top-first), so each spelling is only correct
-            // against the index record it selects.
+            // and these are top-first) and the index is matched literally, so an
+            // ascending spelling selects no record at all.
             ModelParameter::MaxUH2to5km => "5000-2000 m above ground",
             ModelParameter::MaxUH0to2km => "2000-0 m above ground",
             ModelParameter::PrecipitableWater => {
@@ -352,18 +334,12 @@ impl ModelParameter {
     /// Converts to display units first so all color thresholds are in
     /// human-readable units.
     ///
-    /// A missing grid point renders as nothing. Every ramp below is a
-    /// descending `if` chain ending in an unguarded `else`, and NaN fails
-    /// every comparison, so control would otherwise fall through to the final
-    /// branch — where `((NaN - 200.0) / 300.0).min(1.0)` evaluates to `1.0`,
-    /// because `f32::min` returns the non-NaN operand. A missing point would
-    /// paint the *most extreme* colour on the scale: opaque dark purple for
-    /// CIN, >110 °F red for temperature. `format_value` already returns
-    /// nothing for NaN, so the tooltip would go blank over the most alarming
-    /// pixel on the map.
-    ///
-    /// The guard lives here rather than at the call site so that every
-    /// consumer of the ramps is covered by construction.
+    /// The NaN guard is load-bearing. Every ramp below is a descending `if`
+    /// chain ending in an unguarded `else`, NaN fails every comparison, and
+    /// `((NaN - 200.0) / 300.0).min(1.0)` is `1.0` because `f32::min` returns the
+    /// non-NaN operand — so a missing point would paint the *most extreme*
+    /// colour on the scale (opaque dark purple for CIN, >110 °F red for
+    /// temperature) under a tooltip `format_value` leaves blank.
     pub fn color_for_value(&self, value: f32) -> [u8; 4] {
         if !value.is_finite() {
             return [0, 0, 0, 0];
@@ -541,12 +517,9 @@ impl std::str::FromStr for ModelParameter {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
-            // "sbcin" is listed explicitly even though the fallback below
-            // yields the same value. Relying on that coincidence made the
-            // round-trip through `as_str()` look total when it was not, and
-            // hid every other unrecognised key: a corrupt or stale persisted
-            // parameter silently became SBCIN with nothing to distinguish it
-            // from a genuine SBCIN selection.
+            // Explicit even though the fallback yields the same value: relying
+            // on the coincidence made the `as_str()` round-trip look total when
+            // it was not, and hid every unrecognised key behind a silent SBCIN.
             "sbcin" => ModelParameter::SurfaceBasedCin,
             "mlcin" => ModelParameter::MixedLayerCin,
             "sbcape" => ModelParameter::SurfaceBasedCape,
@@ -563,9 +536,8 @@ impl std::str::FromStr for ModelParameter {
             "t2m" => ModelParameter::Temperature2m,
             "td2m" => ModelParameter::Dewpoint2m,
             "vis" => ModelParameter::Visibility,
-            // Deliberately still infallible: this parses persisted UI config,
-            // where refusing to start over one bad key would be worse than
-            // falling back. But the fallback is now audible.
+            // Deliberately infallible — this parses persisted UI config, where
+            // refusing to start over one bad key is worse — but audible.
             other => {
                 log::warn!(
                     "Unknown HRRR model parameter {other:?} in saved config; \
@@ -830,18 +802,14 @@ impl HrrrGridData {
         self.ref_time + chrono::Duration::hours(self.forecast_hour as i64)
     }
 
-    /// Explain why this grid will render as nothing, when it will.
+    /// Explain why this grid will render as nothing, when it will. `None` when
+    /// at least one point is visible.
     ///
     /// A field that decodes perfectly but paints zero pixels is
-    /// indistinguishable on screen from a fetch that never happened, and that
-    /// ambiguity is precisely how a dead feed survives unnoticed. Anything
-    /// that reaches here has already parsed, so the honest report is not "it
-    /// broke" but "here is what the data says, and it says nothing" —
-    /// distinguishing a genuinely uniform field from one that merely never
-    /// crosses the lowest colour threshold, because those mean different
-    /// things to a forecaster.
-    ///
-    /// Returns `None` when at least one point is visible.
+    /// indistinguishable on screen from a fetch that never happened, which is
+    /// how a dead feed survives unnoticed. Distinguishes a genuinely uniform
+    /// field from one that never crosses the lowest colour threshold — those
+    /// mean different things to a forecaster.
     pub fn blank_notice(&self) -> Option<String> {
         if self.visible_points > 0 {
             return None;
@@ -863,12 +831,9 @@ impl HrrrGridData {
     }
 }
 
-/// Scan decoded grid values once for the render-coverage summary stored on
-/// [`HrrrGridData`]: how many points will actually be painted, and the range
-/// of the finite values.
-///
-/// Non-finite points are excluded from the range and never counted as
-/// visible — they are missing data, not readings.
+/// One pass for the render-coverage summary on [`HrrrGridData`]: how many
+/// points will be painted, and the range of the finite values. Non-finite points
+/// are missing data, not readings — excluded from both.
 pub fn summarize_values(
     values: &[f32],
     param: ModelParameter,

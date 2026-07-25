@@ -1,39 +1,23 @@
 //! Every network origin rustdar reads from, declared in one place.
 //!
-//! Origins used to be `const` string literals sitting next to the fetch code
-//! that used them, which made "can the web build reach all of this?" a question
-//! you could only answer by grepping. This module is the answer: one struct,
-//! one production instance, and a `CORS` column that says why each origin was
-//! chosen.
+//! The web build issues every request through `fetch()`, so the server decides
+//! whether the response is readable. An origin that answers `200` to `curl` but
+//! omits `Access-Control-Allow-Origin` is unusable from the browser; the only
+//! fixes are a proxy (rejected — the web build must not require a server) or a
+//! different origin. Everything declared below answers `ACAO: *`.
 //!
-//! # The browser constraint
+//! Per-origin evidence, verified 2026-07-25 by `curl -H 'Origin: …'` including
+//! preflight. **Not re-derivable by reading code; re-probe before changing.**
 //!
-//! rustdar's web build issues every request through the browser's `fetch()`,
-//! which means the *server* decides whether the response is readable. An origin
-//! that answers `200` to `curl` but omits `Access-Control-Allow-Origin` is
-//! unusable from the browser, and no amount of client-side work changes that —
-//! the only fixes are a proxy (rejected: the web build must not require a
-//! server) or a different origin.
+//! Unreachable, replaced:
 //!
-//! Three origins rustdar used to depend on are unusable this way. Verified
-//! 2026-07-25 with `curl -H 'Origin: https://example.com'`:
+//! ```text
+//! tgftp.nws.noaa.gov     no ACAO (403 with an Origin: header)  -> level3_bucket
+//! nomads.ncep.noaa.gov   no ACAO                               -> hrrr_bucket
+//! aviationweather.gov    no ACAO                               -> iem_base
+//! ```
 //!
-//! | Origin | `ACAO` | Verdict |
-//! |---|---|---|
-//! | `tgftp.nws.noaa.gov` | absent (and `403` with an `Origin:` header) | replaced by [`Self::level3_bucket`] |
-//! | `nomads.ncep.noaa.gov` | absent | replaced by [`Self::hrrr_bucket`] |
-//! | `aviationweather.gov` | absent | replaced by [`Self::iem_base`] |
-//!
-//! Everything below answers `Access-Control-Allow-Origin: *`.
-//!
-//! # Preflight is *not* uniformly harmless
-//!
-//! A request carrying a non-safelisted header — which `User-Agent` is — stops
-//! being a "simple request" and the browser sends a `OPTIONS` preflight first.
-//! The response to *that* must be 2xx and must allow the method and header, or
-//! the real request is never sent.
-//!
-//! Most of rustdar's origins handle this correctly:
+//! Preflight-tolerant:
 //!
 //! ```text
 //! unidata-nexrad-level3  OPTIONS -> 200, Allow-Methods: GET, HEAD, Allow-Headers: user-agent
@@ -41,63 +25,34 @@
 //! api.weather.gov        OPTIONS -> 200, Allow-Methods: GET,       Allow-Headers: API-Key, User-Agent
 //! ```
 //!
-//! **Two do not**, and they fail the same way: the plain `GET` carries
-//! `ACAO: *`, so `curl` and every native build are perfectly happy, while
-//! `OPTIONS` is refused and no browser ever issues the real request. Verified
-//! 2026-07-25:
+//! Preflight-**hostile** — plain `GET` carries `ACAO: *`, so curl and every
+//! native build are happy while no browser ever issues the real request:
 //!
 //! ```text
-//! mesonet.agron.iastate.edu  GET     -> 200, Access-Control-Allow-Origin: *
-//! mesonet.agron.iastate.edu  OPTIONS -> 405 Method Not Allowed, Allow: GET, no ACA-Methods
-//!
-//! www.spc.noaa.gov           GET     -> 200, Access-Control-Allow-Origin: *
-//! www.spc.noaa.gov           OPTIONS -> 403 (CloudFront), no CORS headers at all
+//! mesonet.agron.iastate.edu  GET -> 200 ACAO: *   OPTIONS -> 405, Allow: GET, no ACA-Methods
+//! www.spc.noaa.gov           GET -> 200 ACAO: *   OPTIONS -> 403 (CloudFront), no CORS headers
 //! ```
 //!
-//! The SPC result holds for every path rustdar reads — `/products/spcmdrss.xml`,
-//! `/products/outlook/*.lyr.geojson` and `/climo/reports/today_*.csv` all
-//! answered `200` + `ACAO: *` to `GET` and `403` to `OPTIONS`.
+//! The SPC result holds for every path rustdar reads (`/products/spcmdrss.xml`,
+//! `/products/outlook/*.lyr.geojson`, `/climo/reports/today_*.csv`), and was
+//! confirmed in headless Chromium rather than only inferred: each URL was
+//! `fetch()`ed plain (200, readable) and again with a non-safelisted header
+//! (BLOCKED), with `unidata-nexrad-level3.s3` as the control that a preflighted
+//! cross-origin request *can* succeed from that page.
 //!
-//! Confirmed in a real browser, not only inferred from the headers. Headless
-//! Chromium, page served from `http://127.0.0.1`, `fetch()` issued twice per
-//! URL — once plain and once carrying a non-safelisted header to force the
-//! preflight:
-//!
-//! ```text
-//! spc /products/spcmdrss.xml            simple 200 readable   preflighted BLOCKED
-//! spc /products/outlook/…lyr.geojson    simple 200 readable   preflighted BLOCKED
-//! spc /climo/reports/today_torn.csv     simple 200 readable   preflighted BLOCKED
-//! mesonet.agron.iastate.edu  currents   simple 200 readable   preflighted BLOCKED
-//! unidata-nexrad-level3.s3   (control)                        preflighted 200 readable
-//! ```
-//!
-//! The S3 line is the control: a preflighted cross-origin request *can*
-//! succeed from that page, so the four `BLOCKED` results are the origins'
-//! behaviour and not the probe's.
-//!
-//! So METAR *and* SPC requests must stay **simple**: no `User-Agent`, no custom
+//! So METAR and SPC requests must stay **simple**: no `User-Agent`, no custom
 //! headers. [`Self::metar_sends_user_agent`] and [`Self::spc_sends_user_agent`]
-//! are that rule, stated where the origins are declared rather than buried in
-//! four fetch functions; [`Self::metar_client`] and [`Self::spc_client`] are
-//! how production reads it, and [`crate::tls::simple_client`] is what they
-//! resolve to.
-//!
-//! Recording the rule for one preflight-hostile origin and omitting the other
-//! is worse than having no table, so a new origin belongs in **both** tables
-//! above or in neither.
+//! record that per origin; [`Self::metar_client`] and [`Self::spc_client`] read
+//! it. A new origin belongs in both tables above or in neither.
 
 use std::borrow::Cow;
 
-/// A borrowed-or-owned origin string.
-///
 /// `Cow` rather than `&'static str` so a test can point one field at a local
-/// mock server without every other field having to be allocated too.
+/// mock server without allocating the rest.
 pub type Source = Cow<'static, str>;
 
-/// The set of network origins rustdar reads from.
-///
-/// Construct with [`DataSources::production`]. Fields are public so a test can
-/// override exactly one origin and leave the rest alone.
+/// The set of network origins rustdar reads from. Construct with
+/// [`DataSources::production`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataSources {
     /// NEXRAD Level II archive volumes. Keys are `YYYY/MM/DD/SITE/NAME`.
@@ -118,21 +73,12 @@ pub struct DataSources {
     pub spc_base: Source,
     /// Iowa Environmental Mesonet: current ASOS/METAR observations.
     pub iem_base: Source,
-    /// Whether METAR requests may carry a `User-Agent`.
-    ///
-    /// `false` for [`Self::production`]: see the module docs. Sending one turns
-    /// the request into a preflight, and IEM answers `405` to `OPTIONS`.
-    ///
-    /// Read by [`Self::metar_client`], which is where it becomes load-bearing.
+    /// `false` in production: IEM answers `OPTIONS` with `405`, so a
+    /// `User-Agent` makes the request preflighted and it never happens.
     pub metar_sends_user_agent: bool,
-    /// Whether SPC requests may carry a `User-Agent`.
-    ///
-    /// `false` for [`Self::production`], for exactly the reason above: SPC's
-    /// CloudFront answers `OPTIONS` with `403` and no CORS headers, so a
-    /// `User-Agent` makes outlooks, mesoscale discussions and storm reports
-    /// unreachable from the browser — and only from the browser.
-    ///
-    /// Read by [`Self::spc_client`].
+    /// `false` in production: SPC's CloudFront answers `OPTIONS` with `403` and
+    /// no CORS headers, so a `User-Agent` makes outlooks, MDs and storm reports
+    /// unreachable from the browser and only from the browser.
     pub spc_sends_user_agent: bool,
 }
 
@@ -143,10 +89,7 @@ impl Default for DataSources {
 }
 
 impl DataSources {
-    /// The origins the shipped application uses.
-    ///
-    /// Every one of these answers `Access-Control-Allow-Origin: *`, so the web
-    /// build reaches all of them without a proxy.
+    /// The origins the shipped application uses. All answer `ACAO: *`.
     pub const fn production() -> Self {
         Self {
             level2_bucket: Cow::Borrowed("unidata-nexrad-level2"),
@@ -163,21 +106,14 @@ impl DataSources {
         }
     }
 
-    /// The client the METAR feed must be fetched with.
-    ///
-    /// Reads [`Self::metar_sends_user_agent`] rather than hardcoding
-    /// `simple_client`, so the rule recorded on the origin is the rule the
-    /// request obeys. Every METAR fetch goes through here.
+    /// Every METAR fetch goes through here, so the rule recorded on the origin
+    /// is the rule the request obeys.
     pub fn metar_client(&self, timeout: std::time::Duration) -> reqwest::ClientBuilder {
         crate::tls::client_for(self.metar_sends_user_agent, timeout)
     }
 
-    /// The client SPC outlooks, mesoscale discussions and storm reports must be
-    /// fetched with.
-    ///
-    /// Reads [`Self::spc_sends_user_agent`]. These three used to share the
-    /// application's ordinary `User-Agent`-bearing client, which is exactly the
-    /// shape that fails only in the browser.
+    /// For SPC outlooks, mesoscale discussions and storm reports. These three
+    /// used to share the ordinary `User-Agent`-bearing client.
     pub fn spc_client(&self, timeout: std::time::Duration) -> reqwest::ClientBuilder {
         crate::tls::client_for(self.spc_sends_user_agent, timeout)
     }
@@ -199,11 +135,9 @@ impl DataSources {
     /// The flat key prefix for one site/product/day in the Level III bucket.
     ///
     /// The bucket has **no directory structure and no `sn.last`**: keys are
-    /// `TLX_N0S_2026_07_25_01_20_27`, so "the latest product" is the last key
-    /// of a prefix listing rather than a fixed filename.
-    ///
-    /// `site3` is the **three**-letter site code — `TLX`, not `KTLX`. See
-    /// [`crate::level3::site_code`].
+    /// `TLX_N0S_2026_07_25_01_20_27`, so "the latest product" is the last key of
+    /// a prefix listing. `site3` is the **three**-letter code — `TLX`, not
+    /// `KTLX`. See [`crate::level3::site_code`].
     pub fn level3_day_prefix(site3: &str, product: &str, date: &chrono::NaiveDate) -> String {
         format!("{site3}_{product}_{}", date.format("%Y_%m_%d"))
     }
@@ -221,12 +155,9 @@ impl DataSources {
         Self::s3_object_url(&self.hrrr_bucket, &Self::hrrr_key(date, run_hour, forecast_hour))
     }
 
-    /// URL of the `.idx` sidecar listing that GRIB2 file's records and their
-    /// byte offsets.
-    ///
-    /// This is what makes the S3 path cheaper than the NOMADS filter it
-    /// replaces: fetch ~9 KB of index, then `Range:`-request the one record
-    /// wanted instead of having a CGI re-pack and stream the whole field.
+    /// The `.idx` sidecar listing that GRIB2 file's records and byte offsets.
+    /// ~9 KB, then a `Range:` request for the one record wanted — which is what
+    /// makes the S3 path cheaper than the NOMADS filter CGI it replaces.
     pub fn hrrr_idx_url(&self, date: &chrono::NaiveDate, run_hour: u8, forecast_hour: u8) -> String {
         format!(
             "{}.idx",
@@ -260,12 +191,9 @@ mod tests {
         NaiveDate::from_ymd_opt(2026, 7, 25).unwrap()
     }
 
-    /// The three origins this module exists to get rid of must not reappear in
-    /// any production URL.
-    ///
-    /// Each of them answers `curl` fine and is invisible to every other test in
-    /// the workspace; the only symptom of a regression is that the web build
-    /// silently loses a layer.
+    /// The three no-ACAO origins must not reappear in a production URL. Each
+    /// answers `curl` fine, so the only symptom of a regression is the web build
+    /// silently losing a layer.
     #[test]
     fn no_production_origin_is_one_the_browser_cannot_reach() {
         let s = DataSources::production();
@@ -292,11 +220,9 @@ mod tests {
         }
     }
 
-    /// Level III keys are flat and carry no `sn.last`, so the prefix is the
-    /// whole addressing scheme.
-    ///
-    /// The expected string is the shape of a key observed in the live bucket
-    /// (`TLX_N0S_2026_07_25_17_23_22`), truncated at the day.
+    /// Level III keys are flat with no `sn.last`, so the prefix is the whole
+    /// addressing scheme. Expected string is a live key
+    /// (`TLX_N0S_2026_07_25_17_23_22`) truncated at the day.
     #[test]
     fn a_level3_prefix_is_site_product_and_an_underscored_date() {
         assert_eq!(
@@ -339,11 +265,8 @@ mod tests {
         assert!(s.hrrr_idx_url(&date(), 3, 0).ends_with("wrfsfcf00.grib2.idx"));
     }
 
-    /// `network=<ST>_ASOS`, never `networkclass=ASOS`.
-    ///
-    /// The two differ by a factor of 750 in transfer size (72 KB vs 54 MB,
-    /// measured), and the wrong one still returns valid JSON — so nothing
-    /// downstream would notice.
+    /// `network=<ST>_ASOS`, never `networkclass=ASOS`: 72 KB vs 54 MB measured,
+    /// and the wrong one still returns valid JSON.
     #[test]
     fn metar_is_scoped_to_one_state_not_the_whole_network() {
         let url = DataSources::production().metar_state_url("OK");
@@ -357,8 +280,7 @@ mod tests {
         );
     }
 
-    /// The preflight rule is a property of the origin, so it is recorded on the
-    /// origin. Production must not send a `User-Agent` to IEM or to SPC.
+    /// Production must not send a `User-Agent` to IEM or to SPC.
     #[test]
     fn production_keeps_preflight_hostile_origins_preflight_free() {
         let s = DataSources::production();
@@ -374,18 +296,12 @@ mod tests {
         );
     }
 
-    /// The rule must reach the client, not just sit in a field.
+    /// The rule must reach the client, not just sit in a field: it was once read
+    /// only by the test asserting it was `false`.
     ///
-    /// Before this, `metar_sends_user_agent` was read by exactly one thing —
-    /// the test asserting it was `false` — and no production code consulted it.
-    /// The invariant that matters is the one asserted here: the client these
-    /// origins are actually fetched with carries no `User-Agent`.
-    ///
-    /// Note what this does *not* rest on. Both fetches would work today even if
-    /// the wrong client were chosen, because the wasm `tls::client` drops the
-    /// `User-Agent` for every client, making it byte-identical to
-    /// `simple_client` on the one target where the rule matters. That identity
-    /// is a coincidence of one `#[cfg]` arm, not a property of CORS.
+    /// Both fetches would work today even with the wrong client, because the
+    /// wasm `tls::client` drops the `User-Agent` anyway — a coincidence of one
+    /// `#[cfg]` arm, not a property of CORS.
     #[test]
     fn the_preflight_hostile_origins_get_a_client_with_no_user_agent() {
         let s = DataSources::production();
@@ -400,11 +316,8 @@ mod tests {
         );
     }
 
-    /// …and the fields are what decide it.
-    ///
-    /// The counterweight to the test above: without this, a `metar_client` that
-    /// ignored its field and always returned `simple_client` would pass, and
-    /// the recorded rule would be decoration again.
+    /// Counterweight to the test above: without it, a `metar_client` that
+    /// ignored its field and always returned `simple_client` would pass.
     #[test]
     fn flipping_the_preflight_rule_changes_the_client() {
         let t = std::time::Duration::from_secs(1);

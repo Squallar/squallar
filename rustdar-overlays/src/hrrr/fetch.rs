@@ -1,16 +1,12 @@
 //! HRRR data fetching from the `noaa-hrrr-bdp-pds` S3 bucket.
 //!
-//! This replaces the NOMADS filter CGI
-//! (`nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_2d.pl`), which sends no
-//! `Access-Control-Allow-Origin` and is therefore unreachable from rustdar's
-//! web build. Verified 2026-07-25 with `curl -H 'Origin: https://example.com'`:
-//! `200`, and no CORS headers at all.
+//! Replaces the NOMADS filter CGI
+//! (`nomads.ncep.noaa.gov/cgi-bin/filter_hrrr_2d.pl`), which answers `200` with
+//! no `Access-Control-Allow-Origin` at all (verified 2026-07-25 with
+//! `curl -H 'Origin: …'`) and is therefore unreachable from the web build.
 //!
-//! # How a single field is fetched without a server
-//!
-//! NOMADS' whole purpose was server-side subsetting: ask for one variable, get
-//! one GRIB2 record. S3 serves whole files, but every HRRR GRIB2 file has an
-//! `.idx` sidecar — ~9 KB of text listing each record's byte offset:
+//! S3 serves whole files, but every HRRR GRIB2 file has an `.idx` sidecar —
+//! ~9 KB of text listing each record's byte offset:
 //!
 //! ```text
 //! 105:63110198:d=2026072514:CAPE:surface:anl:
@@ -18,32 +14,23 @@
 //! 107:64861905:d=2026072514:PWAT:entire atmosphere (considered as a single layer):anl:
 //! ```
 //!
-//! So the subsetting becomes: fetch the index, find the record, and issue an
-//! HTTP `Range` request for the bytes between its offset and the next one.
-//! Two requests instead of one, but the second is the only large one and it is
-//! **smaller** than what NOMADS returned — 1.03 MB against 2.27 MB for the
-//! same field, measured. The difference is packing: passing `subregion` to the
-//! filter CGI (which rustdar did, for a subsetting HRRR never actually
-//! supported) made NOMADS re-encode the record through wgrib2, turning data
-//! representation template **5.3** — complex packing with spatial differencing
-//! — into **5.0**, simple packing. S3 serves the operational bytes, so the
-//! decode path now sees 5.3. Both are pure Rust in `grib`; neither needs the
-//! JPEG2000 or CCSDS features this crate drops.
+//! so subsetting becomes: fetch the index, find the record, `Range`-request the
+//! bytes to the next offset. Two requests, but the large one is *smaller* than
+//! NOMADS' — 1.03 MB against 2.27 MB for the same field, measured.
 //!
-//! One consequence worth knowing when reading `hrrr::lambert`'s fixtures: the
-//! NOMADS re-encode also re-rounded `Lo1` from 237280472 to 237280471
-//! microdegrees. S3 carries the operational 237280472. The projection anchors
-//! on whatever `Lo1` the file states, so this changes nothing about
-//! correctness, but a test constant derived from a NOMADS download is off by
-//! one microdegree against an S3 one.
+//! That difference is packing. The old request carried `subregion=`, which made
+//! NOMADS re-encode through wgrib2, turning data representation template **5.3**
+//! (complex packing with spatial differencing) into **5.0** (simple packing) and
+//! re-rounding `Lo1` from 237280472 to 237280471 microdegrees. S3 serves the
+//! operational bytes, so the live path decodes **5.3** and `Lo1` 237280472; a
+//! test constant taken from a NOMADS download is off by one microdegree. grib
+//! handles 5.0 and 5.3 in pure Rust — neither needs the JPEG2000 or CCSDS
+//! features this crate drops.
 //!
-//! # The grid did not change
-//!
-//! It is tempting to assume dropping a "subregion" parameter enlarges the
-//! grid. It does not: NOMADS never subset Lambert-conformal grids in the first
-//! place, so both paths return the full 1799×1059 CONUS grid — 1,905,141
-//! points. `parse_grib2` derives its bounds from the grid it is handed and
-//! never from a requested region, so nothing downstream needed changing.
+//! Dropping `subregion` did **not** enlarge the grid: NOMADS never subset
+//! Lambert-conformal grids, so both paths return the full 1799x1059 CONUS grid
+//! (1,905,141 points), and `parse_grib2` derives bounds from the grid it is
+//! handed rather than from a requested region.
 
 use chrono::{NaiveDate, NaiveDateTime, Timelike, Utc};
 use grib::{Grib2SubmessageDecoder, GridDefinitionTemplateValues, LatLons, SubMessage};
@@ -52,10 +39,7 @@ use rustdar_radar::sources::DataSources;
 use super::{HrrrFetchResult, HrrrGridData, ModelParameter, lambert};
 use crate::types::GeoBounds;
 
-/// How long a single HRRR request may take **in this module's live tests**.
-///
-/// Production does not use this: the model handler fetches with `ctx.client`,
-/// which the application builds with a 30 s timeout. See [`hrrr_client`].
+/// Live tests only. Production fetches with `ctx.client` (30 s).
 #[cfg(test)]
 const HRRR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -78,17 +62,11 @@ pub struct IdxRecord {
     pub forecast: String,
 }
 
-/// Parse a GRIB2 `.idx` sidecar.
-///
-/// The format is colon-separated:
 /// `number:offset:d=YYYYMMDDHH:VAR:LEVEL:FORECAST:`
 ///
-/// The level field **contains colons in no HRRR record but contains spaces,
-/// parentheses and hyphens in many**, so splitting is positional and bounded:
-/// exactly the first three fields and the last two are structural, and
-/// everything is taken by index rather than by scanning for delimiters.
-/// Malformed lines are skipped rather than failing the parse — a trailing
-/// blank line is normal.
+/// No HRRR level field contains a colon, though many contain spaces,
+/// parentheses and hyphens, so fields are taken by index. Malformed lines are
+/// skipped; a trailing blank line is normal.
 pub fn parse_idx(text: &str) -> Vec<IdxRecord> {
     text.lines()
         .filter_map(|line| {
@@ -111,40 +89,28 @@ pub fn parse_idx(text: &str) -> Vec<IdxRecord> {
         .collect()
 }
 
-/// The inclusive byte range holding one record, for an HTTP `Range` header.
+/// The inclusive byte range holding one record. The final record has no
+/// successor, so its end is `None` and the caller asks for an open-ended range.
 ///
-/// A record runs from its own offset to one byte before the *next* record's.
-/// The final record has no successor, so its end is unknown from the index
-/// alone and `None` is returned for the end — the caller asks for an
-/// open-ended range.
+/// Matches on `var` **and** `level`: HRRR carries five `CAPE` records at
+/// different levels and two `CIN`s, and `surface` appears on dozens of
+/// variables.
 ///
-/// Matching is on `var` **and** `level` together. Either alone is ambiguous:
-/// HRRR carries five `CAPE` records at different levels and two `CIN`s, and
-/// `surface` appears on dozens of variables.
-///
-/// # `(var, level)` is not unique, and the tie-break is positional
-///
-/// The first match wins, i.e. the lowest-numbered record. That is *not* a
-/// property of the index — a real `hrrr.tHHz.wrfsfcf01.grib2.idx` contains two
-/// pairs that repeat, distinguished only by the forecast description this
-/// function does not look at:
+/// **`(var, level)` is not unique**, and the tie-break is positional (first,
+/// i.e. lowest-numbered, match). A real `wrfsfcf01` index repeats two pairs,
+/// distinguished only by the forecast description this function ignores:
 ///
 /// ```text
 ///  8:…:REFD:263 K level:1 hour fcst:        44:…:REFD:263 K level:0-1 hour max fcst:
 /// 68:…:WEASD:surface:1 hour fcst:           85:…:WEASD:surface:0-1 hour acc fcst:
 /// ```
 ///
-/// Neither is a field rustdar requests, so the selection is unambiguous for
-/// every `ModelParameter` today — and that is checked, against the live index,
-/// by `live_every_parameter_selects_exactly_one_record`. It is checked rather
-/// than assumed because picking the first `REFD:263 K level` would take the
-/// instantaneous field where a caller asking for a maximum wanted record 44:
-/// the same class of error as the constant-zero f00 `MXUPHL`, and just as
-/// quiet.
-///
-/// [`IdxRecord::forecast`] is parsed and carried for exactly this reason: it is
-/// the disambiguator, unused only because nothing needs it yet. A parameter
-/// whose pair does repeat must match on it as well, not rely on record order.
+/// rustdar requests neither, and
+/// `live_every_parameter_selects_exactly_one_record` checks that against the
+/// live index rather than assuming it — taking the instantaneous `REFD` where a
+/// caller wanted the maximum is the same quiet class of error as the
+/// constant-zero f00 `MXUPHL`. [`IdxRecord::forecast`] is carried as the
+/// disambiguator for a parameter whose pair does repeat.
 pub fn byte_range(
     records: &[IdxRecord],
     var: &str,
@@ -174,12 +140,9 @@ fn latest_available_run() -> (NaiveDate, u8) {
 
 /// The run one hour before this one, rolling back over midnight.
 ///
-/// `hour` is a `u8`, so a bare `hour - 1` panics in debug and wraps to 255 in
-/// release for the 00Z run — which [`latest_available_run`] returns for the
-/// whole 02:00–02:59 UTC hour, every day. The wrap-around was already handled
-/// correctly at both production call sites and open-coded at both; centralising
-/// it is what stops the next caller from writing the subtraction again, which
-/// is exactly what the two live tests here had done.
+/// `hour` is a `u8`, so a bare `hour - 1` panics in debug and wraps to 255 for
+/// the 00Z run — which [`latest_available_run`] returns for the whole
+/// 02:00-02:59 UTC hour, every day.
 fn previous_run(date: NaiveDate, hour: u8) -> (NaiveDate, u8) {
     if hour == 0 {
         (date - chrono::Duration::days(1), 23)
@@ -194,15 +157,11 @@ fn previous_run(date: NaiveDate, hour: u8) -> (NaiveDate, u8) {
 
 /// Lat/lon of every grid point of a submessage, in scanning-mode order.
 ///
-/// `grib` is built with `default-features = false` so it links no C or C++ —
-/// see `rustdar-overlays/Cargo.toml`. That drops its `gridpoints-proj` feature,
-/// and with it the *only* implementation of `latlons()` for grid definition
-/// template 3.30 (Lambert conformal): grib returns `NotSupported` instead.
-///
-/// HRRR is template 3.30 for every field, so without the branch below every
-/// HRRR fetch would fail here. [`lambert::latlons`] is the pure-Rust
-/// replacement. Any other template still goes through grib, which handles the
-/// regular lat/lon and Gaussian ones with no PROJ involvement.
+/// `grib` is built with `default-features = false` (no C/C++), which drops
+/// `gridpoints-proj` and with it the only `latlons()` for template 3.30 —
+/// grib returns `NotSupported`. HRRR is 3.30 for every field, so without the
+/// [`lambert::latlons`] branch below every HRRR fetch fails here. Other
+/// templates still go through grib, which needs no PROJ for them.
 fn grid_latlons<R>(submessage: &SubMessage<'_, R>) -> Result<Vec<(f64, f64)>, String> {
     let grid_def = submessage.grid_def();
     let template = GridDefinitionTemplateValues::try_from(grid_def)
@@ -211,8 +170,7 @@ fn grid_latlons<R>(submessage: &SubMessage<'_, R>) -> Result<Vec<(f64, f64)>, St
     match template {
         GridDefinitionTemplateValues::Template30(ref lambert_grid) => {
             let points = lambert::latlons(lambert_grid)?;
-            // Same guard grib applies to its own iterators: section 3 states
-            // how many points there are, and a mismatch means the grid we
+            // A mismatch against section 3's declared count means the grid we
             // walked is not the grid the data was packed against.
             let declared = grid_def.num_points() as usize;
             if points.len() != declared {
@@ -232,19 +190,10 @@ fn grid_latlons<R>(submessage: &SubMessage<'_, R>) -> Result<Vec<(f64, f64)>, St
     }
 }
 
-/// The one-submessage guard, as a value test so it can be asserted without a
-/// GRIB2 record.
-///
-/// `!= 1` and not `< 1`: **zero** and **two** are different bugs and both must
-/// be refused. Zero means the range delimited nothing; two means it spanned a
-/// record boundary, and that is the dangerous one — two concatenated records
-/// decode fine as a *sequence*, and the pre-migration `iter().next()` took the
-/// first and discarded the rest, producing a plausible grid for whichever
-/// field happened to come first.
-///
-/// Relaxing this to `< 1` restores exactly that behaviour, and until this was
-/// a function the only thing that would have noticed was an `#[ignore]`d live
-/// test.
+/// `!= 1`, not `< 1`. Zero means the range delimited nothing; **two** means it
+/// spanned a record boundary, which is the dangerous one — concatenated records
+/// decode fine as a sequence, and taking the first produces a plausible grid for
+/// the wrong field. Relaxing to `< 1` restores that bug.
 fn exactly_one_submessage(count: usize) -> Result<(), String> {
     if count != 1 {
         return Err(format!(
@@ -257,22 +206,17 @@ fn exactly_one_submessage(count: usize) -> Result<(), String> {
 
 /// Parse GRIB2 bytes into `HrrrGridData`.
 ///
-/// # One submessage
-///
-/// The bytes handed here must be exactly one GRIB2 record carrying exactly one
-/// submessage, and that is now *checked* rather than assumed. Under NOMADS the
-/// server guaranteed it. Under byte-ranging the guarantee comes from this
-/// crate's own arithmetic in [`byte_range`], and an off-by-one there would
-/// silently deliver two records — of which the old `iter().next()` would have
-/// decoded the first and thrown the rest away, producing a plausible grid for
-/// the wrong field. Refusing is the only safe answer.
+/// The bytes must be exactly one record with exactly one submessage, and that is
+/// checked rather than assumed: NOMADS guaranteed it server-side, byte-ranging
+/// guarantees it only via [`byte_range`]'s arithmetic, and an off-by-one there
+/// delivers two records that decode to a plausible grid for the wrong field.
 fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, String> {
     let grib2 = grib::from_reader(std::io::Cursor::new(bytes))
         .map_err(|e| format!("GRIB2 parse error: {e}"))?;
 
-    // Counted in its own pass, before any `SubMessage` is held: grib's
-    // iterator borrows the reader through a `RefCell`, and advancing it while
-    // a submessage is alive panics with "RefCell already borrowed".
+    // Its own pass, before any `SubMessage` is held: grib's iterator borrows the
+    // reader through a `RefCell`, so advancing it while a submessage is alive
+    // panics with "RefCell already borrowed".
     exactly_one_submessage(grib2.iter().count())?;
 
     let (_index, submessage) = grib2
@@ -280,21 +224,17 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
         .next()
         .ok_or_else(|| "No submessages in GRIB2 data".to_string())?;
 
-    // Collect lat/lon grid points first (borrows submessage, releases on collect).
+    // Borrows submessage, releases on collect.
     let latlon_pairs = grid_latlons(&submessage)?;
 
-    // Get grid dimensions.
     let (ni, nj) = submessage
         .grid_shape()
         .map_err(|e| format!("Cannot determine grid shape: {e}"))?;
 
-    // Extract reference time before consuming the submessage for decoding.
-    //
-    // A malformed reference time is a hard error, not something to paper over.
-    // These previously fell back to `unwrap_or_default()`, i.e. 1970-01-01
-    // 00:00, which the pane control renders as "Model Data (00:00z)" — stale
-    // or corrupt data made to look merely oddly-timed. Refusing the message
-    // surfaces it as a fetch failure instead.
+    // Read before the submessage is consumed for decoding. A malformed reference
+    // time is a hard error: `unwrap_or_default()` gives 1970-01-01 00:00, which
+    // the pane control renders as "Model Data (00:00z)" — corrupt data made to
+    // look merely oddly-timed.
     let raw_time = submessage.temporal_raw_info();
     let t = &raw_time.ref_time_unchecked;
     let ref_date = NaiveDate::from_ymd_opt(t.year as i32, t.month as u32, t.day as u32)
@@ -314,13 +254,10 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
             })?;
     let ref_time = NaiveDateTime::new(ref_date, ref_clock);
 
-    // Decode data values (may consume the submessage).
-    //
-    // S3 serves the operational encoding, DRT 5.3 (complex packing with
-    // spatial differencing), where NOMADS' filter re-encoded to 5.0. Both are
-    // pure Rust in grib and `dispatch()` picks by template, so this call is
-    // unchanged — but it is the line that would fail if the feature set in
-    // Cargo.toml were ever trimmed further.
+    // S3 serves the operational DRT 5.3 (complex packing with spatial
+    // differencing); NOMADS re-encoded to 5.0. `dispatch()` picks by template
+    // and both are pure Rust in grib, but this is the line that fails if the
+    // feature set in Cargo.toml is trimmed further.
     let decoder =
         Grib2SubmessageDecoder::from(submessage).map_err(|e| format!("Decode init error: {e}"))?;
     let values: Vec<f32> = decoder
@@ -422,8 +359,7 @@ async fn fetch_record(
         .await
         .map_err(|e| format!("range request failed: {e}"))?;
 
-    // 206 is the expected success. A 200 means the server ignored `Range` and
-    // sent the whole 130 MB file; that is not something to quietly accept.
+    // A 200 means the server ignored `Range` and is sending the whole 130 MB.
     if response.status() == reqwest::StatusCode::OK {
         return Err(format!(
             "{grib_url} ignored the Range header and would return the whole file"
@@ -573,9 +509,8 @@ async fn try_fetch_composite(
         .map(|(&u, &v)| (u * u + v * v).sqrt())
         .collect();
 
-    // Recomputed from the merged magnitudes: the summary each component grid
-    // carries describes that component alone, which says nothing about the
-    // vector magnitude the user actually sees.
+    // Recomputed from the merged magnitudes: each component's own summary says
+    // nothing about the vector magnitude the user sees.
     let (visible_points, value_range) = super::summarize_values(&values, *param);
 
     Ok(HrrrGridData {
@@ -593,21 +528,12 @@ async fn try_fetch_composite(
     })
 }
 
-/// Build the client the **live tests in this module** use.
+/// The client the **live tests in this module** use, `#[cfg(test)]` so it cannot
+/// be mistaken for production (which passes `ctx.client`, timeout 30 s).
 ///
-/// Not what production fetches with: the model handler passes `ctx.client`,
-/// the application-wide client from `rustdar_frontend`, whose timeout is 30 s.
-/// This one exists because those tests have no `FetchConfig` to take a client
-/// from, and it allows [`HRRR_TIMEOUT`] — deliberately generous, because a
-/// test that fetches four ~1 MB ranged records back to back is not the
-/// interactive path and a timeout there is noise rather than signal.
-///
-/// It is `#[cfg(test)]` so that difference cannot be mistaken for production
-/// guidance, which is what the previous wording read like.
-///
-/// The `User-Agent` is fine on this origin, unlike on IEM and SPC: S3 answers
-/// the preflight `200` with `Access-Control-Allow-Headers: user-agent`. That
-/// evidence lives with the origin, in `rustdar_radar::sources`.
+/// A `User-Agent` is fine on this origin, unlike IEM and SPC: S3 answers the
+/// preflight `200` with `Access-Control-Allow-Headers: user-agent`. See
+/// `rustdar_radar::sources`.
 #[cfg(test)]
 fn hrrr_client() -> Result<reqwest::Client, String> {
     rustdar_radar::tls::client(rustdar_radar::tls::USER_AGENT, HRRR_TIMEOUT)
@@ -644,11 +570,7 @@ mod tests {
 
     // ── Index parsing ─────────────────────────────────────────────────────
 
-    /// Fields come out at the right positions, including a level carrying
-    /// spaces and parentheses.
-    ///
-    /// Expected values are read off the fixture text by eye, not produced by
-    /// the parser.
+    /// Expected values are read off the fixture by eye, not from the parser.
     #[test]
     fn an_idx_line_splits_into_number_offset_var_and_level() {
         let r = records();
@@ -746,9 +668,8 @@ mod tests {
         );
     }
 
-    /// A level spelling that matches nothing must fail loudly rather than
-    /// fall back to a near miss. This is the failure mode the ascending
-    /// `2000-5000` spellings had.
+    /// An unmatched spelling must fail loudly rather than fall back to a near
+    /// miss — the failure mode the ascending `2000-5000` spellings had.
     #[test]
     fn an_unmatched_variable_or_level_yields_no_range() {
         let r = records();
@@ -759,16 +680,13 @@ mod tests {
 
     // ── Parameter → index record ──────────────────────────────────────────
 
-    /// Every parameter's `(var, level)` pair, transcribed **verbatim** from a
-    /// real `hrrr.t14z.wrfsfcf00.grib2.idx` (UH from the `f01` index, which
-    /// spells its levels identically).
+    /// Transcribed **verbatim** from a real `hrrr.t14z.wrfsfcf00.grib2.idx` (UH
+    /// from the `f01` index, which spells its levels identically).
     ///
-    /// There is no rule to infer here, which is the whole trap: HRRR orders
-    /// layer bounds inconsistently between fields — `HLCY:3000-0` and
-    /// `MXUPHL:5000-2000` put the top first, while `VUCSH:0-6000` and
-    /// `CAPE:0-3000 m` put the bottom first — and the index is matched
-    /// literally, with no near-miss handling. A level spelling can therefore
-    /// only be validated against the index verbatim.
+    /// There is no rule to infer: HRRR orders layer bounds inconsistently
+    /// between fields — `HLCY:3000-0` and `MXUPHL:5000-2000` put the top first,
+    /// `VUCSH:0-6000` and `CAPE:0-3000 m` the bottom — and matching is literal
+    /// with no near-miss handling.
     const IDX_RECORDS: &[(ModelParameter, &str, &str)] = &[
         (ModelParameter::SurfaceBasedCin, "CIN", "surface"),
         (ModelParameter::MixedLayerCin, "CIN", "180-0 mb above ground"),
@@ -792,10 +710,6 @@ mod tests {
     ];
 
     /// Pins every non-composite parameter to the index record it selects.
-    ///
-    /// The comparison is now direct — the accessor returns the index's own
-    /// string, with no `var_`/`lev_` encoding in between — so there is no
-    /// transformation that could agree with itself.
     #[test]
     fn every_parameter_selects_a_real_index_record() {
         for &(param, var, level) in IDX_RECORDS {
@@ -881,14 +795,9 @@ mod tests {
         }
     }
 
-    /// Zero and two submessages are both refused, and one is accepted.
-    ///
-    /// The guard used to be inline in `parse_grib2`, reachable only with real
-    /// GRIB2 bytes, so the only thing that would have noticed `count != 1`
-    /// being relaxed to `count < 1` was an `#[ignore]`d live test. `< 1`
-    /// restores exactly the pre-migration behaviour: two concatenated records
-    /// decode fine as a sequence and the first one silently wins, which is a
-    /// correct-looking grid for the wrong field.
+    /// Relaxing `count != 1` to `count < 1` lets two concatenated records decode
+    /// as a sequence with the first silently winning — a correct-looking grid
+    /// for the wrong field. Only an `#[ignore]`d live test used to catch that.
     #[test]
     fn only_a_single_submessage_is_accepted() {
         assert!(exactly_one_submessage(1).is_ok(), "one record must be accepted");
@@ -904,16 +813,11 @@ mod tests {
         assert!(exactly_one_submessage(3).is_err());
     }
 
-    /// `(var, level)` is not unique in a real index, and the tie-break is
-    /// positional.
-    ///
-    /// These four lines are verbatim from
-    /// `hrrr.20260725/conus/hrrr.t14z.wrfsfcf01.grib2.idx`. Neither pair is a
-    /// field rustdar requests — `live_every_parameter_selects_exactly_one_record`
-    /// is what keeps that true — but the behaviour when a pair *does* repeat is
-    /// pinned here rather than left to be discovered, because taking record 8
+    /// Four verbatim lines from
+    /// `hrrr.20260725/conus/hrrr.t14z.wrfsfcf01.grib2.idx` where `(var, level)`
+    /// repeats. Neither pair is a field rustdar requests, but taking record 8
     /// where a caller wanted record 44 swaps an instantaneous field for a
-    /// windowed maximum without any error.
+    /// windowed maximum with no error, so the tie-break is pinned.
     #[test]
     fn a_repeated_var_and_level_resolves_to_the_lowest_numbered_record() {
         const AMBIGUOUS: &str = "\
@@ -925,8 +829,8 @@ mod tests {
         let records = parse_idx(AMBIGUOUS);
         assert_eq!(records.len(), 4);
 
-        // The forecast field is what distinguishes them, and it is parsed —
-        // it is the disambiguator a future caller would need.
+        // The forecast field distinguishes them and is parsed, so a future
+        // caller has a disambiguator.
         assert_eq!(records[0].forecast, "1 hour fcst");
         assert_eq!(records[1].forecast, "0-1 hour max fcst");
 
@@ -936,12 +840,9 @@ mod tests {
         assert_eq!(start, 42_378_051, "the first match must win, i.e. record 68");
     }
 
-    /// The previous run rolls back over midnight instead of underflowing.
-    ///
     /// `hour` is a `u8` and `latest_available_run` returns 0 for the whole
-    /// 02:00–02:59 UTC hour, so `hour - 1` is a guaranteed daily panic in debug
-    /// and a wrap to run "255z" in release. Both fallback paths and both live
-    /// tests used to open-code the subtraction; only production guarded it.
+    /// 02:00-02:59 UTC hour, so an unguarded `hour - 1` is a daily debug panic
+    /// and a wrap to run "255z" in release.
     #[test]
     fn the_previous_run_rolls_back_over_midnight() {
         let day = NaiveDate::from_ymd_opt(2026, 7, 25).unwrap();
@@ -967,22 +868,12 @@ mod tests {
 
     // ── Live checks ───────────────────────────────────────────────────────
 
-    /// Every parameter rustdar requests selects exactly one record of the real
-    /// index.
+    /// The invariant the whole selection rests on, and a property of NCEP's
+    /// index rather than of rustdar's code — an upstream change can break it
+    /// with no commit here. [`byte_range`] takes the first `(var, level)` hit,
+    /// which is only safe while no requested pair repeats.
     ///
-    /// [`byte_range`] matches on `(var, level)` and takes the first hit. That
-    /// is only safe while no parameter's pair repeats — and pairs *do* repeat
-    /// in the real index (`REFD:263 K level`, `WEASD:surface`), distinguished
-    /// only by a forecast description `byte_range` never reads. So this is the
-    /// invariant the whole selection rests on, and it is a property of NCEP's
-    /// index rather than of rustdar's code: it can be broken by an upstream
-    /// change with no commit here at all.
-    ///
-    /// The `byte_range` doc used to cite this test by name while it did not
-    /// exist.
-    ///
-    /// Run with:
-    ///   `cargo test -p rustdar-overlays -- --ignored --nocapture live_every_parameter`
+    /// `cargo test -p rustdar-overlays -- --ignored --nocapture live_every_parameter`
     #[tokio::test]
     #[ignore = "hits the live noaa-hrrr-bdp-pds S3 bucket"]
     async fn live_every_parameter_selects_exactly_one_record() {
@@ -990,8 +881,8 @@ mod tests {
         let sources = DataSources::production();
         let (date, hour) = latest_available_run();
 
-        // f00 and f01: the windowed parameters live in f01 and the rest in
-        // f00, and the two indexes do not carry the same record set.
+        // The two indexes do not carry the same record set: windowed parameters
+        // live in f01, the rest in f00.
         for forecast_hour in [0u8, 1] {
             let url = sources.hrrr_idx_url(&date, hour, forecast_hour);
             let text = match client.get(&url).send().await.and_then(|r| r.error_for_status()) {
@@ -1056,15 +947,11 @@ mod tests {
         }
     }
 
-    /// The full S3 path, end to end, for a representative spread of fields.
+    /// The full S3 path end to end: real index, real byte range, real `Range`
+    /// request, decoding the operational DRT 5.3 bytes S3 serves. NOMADS
+    /// re-encoded to 5.0, so 5.3 was never exercised before the migration.
     ///
-    /// This is the check the migration lives or dies on: it fetches the real
-    /// index, computes a real byte range, issues a real `Range` request, and
-    /// decodes the operational DRT 5.3 bytes S3 serves (NOMADS re-encoded to
-    /// 5.0, so this path was never exercised before).
-    ///
-    /// Run with:
-    ///   `cargo test -p rustdar-overlays -- --ignored --nocapture live_hrrr`
+    /// `cargo test -p rustdar-overlays -- --ignored --nocapture live_hrrr`
     #[tokio::test]
     #[ignore = "hits the live noaa-hrrr-bdp-pds S3 bucket"]
     async fn live_hrrr_fetches_and_decodes_from_s3() {
@@ -1095,9 +982,8 @@ mod tests {
                 grid.ref_time,
             );
 
-            // The full CONUS grid, which is what both NOMADS and S3 return.
-            // 1799 x 1059 is HRRR's operational grid, from the model's own
-            // documentation.
+            // 1799 x 1059 is HRRR's published operational grid; both NOMADS and
+            // S3 return all of it.
             assert_eq!(grid.ni, 1799, "{}", param.display_name());
             assert_eq!(grid.nj, 1059, "{}", param.display_name());
             assert_eq!(grid.values.len(), 1_905_141, "{}", param.display_name());
@@ -1109,33 +995,18 @@ mod tests {
                 param.display_name(),
             );
 
-            // Deliberately NOT `assert!(grid.blank_notice().is_none())`.
-            //
-            // That asserts on the weather. `blank_notice` reports "nothing
-            // will be painted", and on a quiet day Max UH 2-5 km peaks below
-            // `uh_color`'s lowest threshold of 25 m²/s²: the CONUS-wide max
-            // was 22.1 on 2026-07-25 and this test — documented as the check
-            // the migration lives or dies on — went red, with nothing broken.
-            // A headline gate that fails every quiet hour is one nobody reads
-            // within a week.
-            //
-            // The two failures it was reaching for are the *other* two
-            // `blank_notice` cases, and both are already asserted above:
-            //
-            //   * "no usable values in the grid" — `value_range` is `None`,
-            //     caught by the `.expect("finite values")`.
-            //   * "uniformly X across all points" — the constant-zero f00 UH
-            //     record the forecast-hour fix exists to avoid, caught by
-            //     `lo < hi`.
-            //
-            // What is left is exactly "the atmosphere was quiet", so it is
-            // reported rather than asserted.
+            // Deliberately NOT `assert!(grid.blank_notice().is_none())`: that
+            // asserts on the weather. On a quiet day Max UH 2-5 km peaks below
+            // `uh_color`'s lowest threshold of 25 m²/s² (CONUS max was 22.1 on
+            // 2026-07-25) and this went red with nothing broken. The other two
+            // `blank_notice` cases are already covered above — no usable values
+            // by `.expect("finite values")`, and the constant-zero f00 UH record
+            // by `lo < hi`.
             if let Some(notice) = grid.blank_notice() {
                 println!("  {notice}");
             }
 
-            // The Lambert grid must cover CONUS. Corner latitudes/longitudes
-            // for HRRR's domain are published: SW corner 21.14 N, 237.28 E.
+            // Published HRRR domain: SW corner 21.14 N, 237.28 E.
             assert!(
                 grid.bounds.min_lat < 25.0 && grid.bounds.max_lat > 47.0,
                 "{} bounds {:?} do not span CONUS",
@@ -1161,24 +1032,16 @@ mod tests {
         let (lo, hi) = grid.value_range.expect("finite values");
         println!("bulk shear: {} pts, range {lo}..{hi}", grid.values.len());
         assert_eq!(grid.values.len(), 1_905_141);
-        // A magnitude is non-negative by construction; if the merge had
-        // returned one component instead, negatives would appear.
+        // Negatives would mean the merge returned one component, not a
+        // magnitude.
         assert!(lo >= 0.0, "a vector magnitude cannot be negative, got {lo}");
         assert!(hi > 0.0);
     }
 
-    /// `parse_grib2` refuses bytes carrying more than one record.
-    ///
-    /// This is the guard that makes a byte-range arithmetic bug loud instead
-    /// of silent: two concatenated records decode fine as a *sequence*, and
-    /// the previous `iter().next()` would have taken the first and discarded
-    /// the rest — a correct-looking grid for whichever field happened to come
-    /// first.
-    ///
-    /// Built from a real record fetched here rather than a committed fixture,
-    /// because a single HRRR record is ~1 MB and there is nothing to be gained
-    /// from storing one. The single-record case is asserted first, so a
-    /// `parse_grib2` that rejected *everything* would fail rather than pass.
+    /// The guard that makes a byte-range arithmetic bug loud. Built from a live
+    /// record rather than a committed fixture (one HRRR record is ~1 MB). The
+    /// single-record case is asserted first, so a `parse_grib2` that rejected
+    /// everything would fail rather than pass.
     #[tokio::test]
     #[ignore = "hits the live noaa-hrrr-bdp-pds S3 bucket"]
     async fn live_parse_grib2_refuses_more_than_one_submessage() {
@@ -1189,8 +1052,8 @@ mod tests {
         let one = match fetch_record(&client, &sources, date, hour, 0, "CIN", "surface").await {
             Ok(b) => b,
             Err(_) => {
-                // `previous_run`, not `hour - 1`: `hour` is 0 for the whole
-                // 02:00-02:59 UTC hour, and the subtraction panics there.
+                // `previous_run`, not `hour - 1`, which panics for the whole
+                // 02:00-02:59 UTC hour.
                 let (prev_date, prev_hour) = previous_run(date, hour);
                 fetch_record(&client, &sources, prev_date, prev_hour, 0, "CIN", "surface")
                     .await
@@ -1214,12 +1077,8 @@ mod tests {
         );
     }
 
-    /// The byte range really is a small fraction of the file.
-    ///
-    /// This is the reason for the whole `.idx` dance, and it is measured
-    /// rather than asserted from theory: if a future change dropped the
-    /// `Range` header, everything above would still pass while transferring
-    /// ~130 MB per field.
+    /// Dropping the `Range` header leaves everything above passing while
+    /// transferring ~130 MB per field, so the size is measured.
     #[tokio::test]
     #[ignore = "hits the live noaa-hrrr-bdp-pds S3 bucket"]
     async fn live_a_ranged_record_is_a_small_fraction_of_the_file() {
@@ -1227,11 +1086,9 @@ mod tests {
         let sources = DataSources::production();
         let (date, hour) = latest_available_run();
 
-        // `match`, not `.or(..await)`: `Result::or` takes its argument by
-        // value, so the fallback future was awaited unconditionally — a second
-        // ~1 MB range request on every run, even when the first succeeded. And
-        // `hour - 1` panics for the whole 02:00-02:59 UTC hour, when
-        // `latest_available_run` yields 0.
+        // `match`, not `.or(..await)`: `Result::or` takes its argument by value,
+        // so the fallback future was awaited unconditionally — a second ~1 MB
+        // range request on every run.
         let bytes = match fetch_record(&client, &sources, date, hour, 0, "CIN", "surface").await {
             Ok(b) => b,
             Err(_) => {
@@ -1243,15 +1100,13 @@ mod tests {
         };
 
         println!("surface CIN record: {} bytes", bytes.len());
-        // NOMADS returned 2.27 MB for the same field; the operational record
-        // is ~1.03 MB. Bound it well clear of both a whole file (~130 MB) and
-        // an empty response.
+        // Operational record ~1.03 MB (NOMADS returned 2.27 MB for the same
+        // field). Bounded clear of a whole file (~130 MB) and of an empty one.
         assert!(
             (100_000..8_000_000).contains(&bytes.len()),
             "{} bytes is not a single GRIB2 record",
             bytes.len(),
         );
-        // And it must be a GRIB2 message, not an error page.
         assert_eq!(&bytes[..4], b"GRIB", "range did not start at a record boundary");
     }
 }
