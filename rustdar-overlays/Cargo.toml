@@ -34,7 +34,7 @@ grib = { version = "=0.15.1", default-features = false, features = [
     "time-calculation",
 ] }
 rustdar-units = { workspace = true }
-futures = "=0.3.32"
+futures = "=0.3.33"
 # GOES GLM granules. Replaces `netcdf`, which linked netcdf-sys, netcdf-src,
 # hdf5-metno-sys and hdf5-metno-src -- four bundled C/C++ builds that cannot
 # cross-compile to wasm32 or iOS, which is what kept the lightning overlay off

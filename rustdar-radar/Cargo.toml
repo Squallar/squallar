@@ -34,7 +34,7 @@ rustls = { workspace = true }
 # build a pool. `render.rs` carries a sequential fallback for the web arm.
 # rayon stays native because rasterization is the hot path on desktop -- this
 # is a cfg split, not a removal.
-rayon = "=1.11.0"
+rayon = "=1.12.0"
 
 [dev-dependencies]
 # Test-only: drives the `#[ignore]`d live TLS check in `tls`. Not linked into any

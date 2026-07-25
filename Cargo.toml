@@ -77,17 +77,31 @@ nexrad-decode = "=1.0.0-rc.3"
 nexrad-model = "=1.0.0-rc.2"
 
 # -- shared third-party --
-chrono = "=0.4.44"
+chrono = "=0.4.45"
 flate2 = "=1.1.9"
+# PINNED TO 0.21.x DELIBERATELY -- do not take a 0.22 bump on its own.
+#
+# `rustdar-android` hands JNI references to
+# `rustls_platform_verifier::android::init_with_refs`, so it must use the *same*
+# jni crate version the verifier does. rustls-platform-verifier 0.6.2 requires
+# `jni ^0.21`, and 0.6.2 is what `reqwest 0.13.2` resolves (it requires
+# `rustls-platform-verifier ^0.6`).
+#
+# A renovate PR bumped this to 0.22.4 together with rpv 0.7.0. That pairing is
+# self-consistent but incompatible with reqwest 0.13: cargo would resolve *two*
+# verifier copies, reqwest's clients would read the 0.6 one, and
+# `init_with_refs` would initialise the 0.7 one -- Android TLS init silently
+# doing nothing until an on-device request failed. Both bumps land together, or
+# neither, and only once reqwest requires ^0.7.
 jni = "=0.21.1"
 # egui 0.35 requires ^0.4.33.
 log = "=0.4.33"
 ndk-context = "=0.1.1"
 pollster = "=0.4.0"
-serde = { version = "=1.0.228", features = ["derive"] }
-serde_json = "=1.0.149"
-thiserror = "=2.0.18"
-tokio = "=1.51.1"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+thiserror = "=2.0.19"
+tokio = "=1.53.1"
 # One TLS backend for the whole workspace, pinned here rather than per member so
 # no crate can quietly opt back into a different one.
 #
@@ -118,6 +132,13 @@ reqwest = { version = "=0.13.2", default-features = false, features = [
 # dependency and that is the intended end state: a single `cc` invocation, no cmake
 # and no bindgen. `default-features = false` keeps rustls' own `aws-lc-rs` default off.
 rustls = { version = "=0.23.38", default-features = false, features = ["ring", "std"] }
+
+# NOTE for future dependency-bump PRs: `openssl-sys` used to be pinned here with
+# `features = ["vendored"]` for Android, whose NDK sysroot has no usable system
+# copy. **Nothing links OpenSSL any more** -- TLS is rustls +
+# rustls-platform-verifier via the `reqwest` pin above -- so re-adding it would
+# reintroduce a C/C++ build that cannot cross-compile to wasm32 or iOS, for no
+# consumer. Same for a `reqwest` downgrade to 0.12.x: see the note above.
 
 [profile.dev]
 # Only optimize dependencies (not workspace code) to preserve debuggability
