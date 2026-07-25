@@ -43,7 +43,7 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - name: Run Clippy
+      - name: Apply Clippy autofixes
         run: cargo clippy --all-targets --all-features --fix || true
       - uses: stefanzweifel/git-auto-commit-action@4a55954c782fc1ea30b9056cd3e7a2b40ca8887d # v7.2.0
         with:
@@ -51,5 +51,13 @@ jobs:
           commit_user_name: usa-reddragon-auto-commit[bot]
           commit_user_email: 234130638+github-actions[bot]@users.noreply.github.com
           commit_author: "usa-reddragon-auto-commit[bot] <234130638+github-actions[bot]@users.noreply.github.com>"
+      # The gating run. `-D warnings` goes here and not on the --fix step above,
+      # so the bot still gets to autofix what it can and the build fails only on
+      # what it could not.
+      #
+      # This is also what makes the `unexpected_cfgs` lint load-bearing: a
+      # `rustdar-frontend` build script that stopped emitting the `mobile` cfg
+      # previously produced warnings nobody failed on, and Android and iOS
+      # silently took the desktop memory budgets.
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --all-targets --all-features -- -D warnings

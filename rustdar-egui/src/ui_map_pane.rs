@@ -140,18 +140,7 @@ pub(super) fn render_pane_map_content(
                         let screen_rect = ui.max_rect();
                         draw_overlay_texture(ui.painter(), projector, tex, screen_rect);
                     }
-                    handle_radar_site_interactions(
-                        ui,
-                        projector,
-                        zoom,
-                        ctx.pane,
-                        ctx.actions,
-                        ctx.pane_idx,
-                        ctx.preferences,
-                        ctx.overlay_click_pos,
-                        ctx.pane_rect,
-                        &ctx.excluded_rects,
-                    );
+                    handle_radar_site_interactions(ui, projector, zoom, ctx);
                 }
                 // User location blue dot
                 OverlayKind::UserLocation => {
@@ -457,21 +446,32 @@ fn handle_radar_site_interactions(
     ui: &egui::Ui,
     projector: &walkers::Projector,
     zoom: f64,
-    pane: &mut PaneState,
-    actions: &mut Vec<GuiAction>,
-    pane_idx: usize,
-    prefs: &UserPreferences,
-    overlay_click_pos: Option<egui::Pos2>,
-    pane_rect: egui::Rect,
-    excluded_rects: &[egui::Rect],
+    ctx: &mut PaneRenderCtx<'_>,
 ) {
+    // Everything below used to arrive as seven separate parameters, all of
+    // them copied out of `PaneRenderCtx` at the single call site. Destructuring
+    // borrows the fields disjointly, so `pane` and `actions` stay mutable while
+    // `excluded_rects` is read.
+    let PaneRenderCtx {
+        pane,
+        actions,
+        pane_idx,
+        preferences: prefs,
+        overlay_click_pos,
+        pane_rect,
+        excluded_rects,
+        ..
+    } = ctx;
+    let pane_idx = *pane_idx;
+    let pane_rect = *pane_rect;
+
     let screen_rect = ui.max_rect();
     let zoom_f32 = zoom as f32;
     let icon_size = (10.0 + zoom_f32 * 2.0).clamp(8.0, 24.0);
     let font_size = (icon_size * 0.6).clamp(8.0, 12.0);
 
     let hover_pos = ui.ctx().pointer_hover_pos();
-    let click_pos = overlay_click_pos;
+    let click_pos = *overlay_click_pos;
 
     let is_dark = ui.ctx().global_style().visuals.dark_mode;
     let text_color = if is_dark {
