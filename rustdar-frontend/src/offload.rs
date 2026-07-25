@@ -44,7 +44,11 @@ pub fn offload(name: &'static str, job: impl FnOnce() + Send + 'static) {
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = name;
+        // Timed because this is the one arm where the cost lands on the frame.
+        // The number is what decides whether a worker is needed and how many, so
+        // it is logged rather than estimated.
+        let started = web_time::Instant::now();
         job();
+        log::info!("{name} took {} ms on the main thread", started.elapsed().as_millis());
     }
 }
