@@ -35,7 +35,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { Network, publishDeploy, startWorker } from "./sw_harness.mjs";
+import { Network, publishDeploy, restartWorker, startWorker } from "./sw_harness.mjs";
 
 const ORIGIN = "https://rustdar.example/rustdar/";
 const SW_URL = `${ORIGIN}sw.js`;
@@ -348,6 +348,215 @@ describe("shell: navigations and subresources are cache-first", () => {
     // No activate: nothing has been installed.
     const event = await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: "c1" });
     assert.equal(await (await event.response).text(), "::A");
+  });
+});
+
+describe("atomicity: one page load draws its shell from one deploy", () => {
+  // =========================================================================
+
+  it("keeps a client on its own generation when a deploy lands mid-load", async () => {
+    // Reproduces the failure this pinning exists to fix. Before it, the
+    // navigation came from deploy A, the meta pointer moved while the page was
+    // still parsing, and the wasm module arrived from deploy B — a
+    // wasm-bindgen mismatch, and deploy A had already been deleted so there was
+    // no way back.
+    const worker = await bootWorker({ tag: "A" });
+    const client = worker.addClient();
+
+    const nav = await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: client.id });
+    const glue = await worker.fetch(new Request(shellUrl("pkg/rustdar_web.js")), {
+      clientId: client.id,
+    });
+
+    // Deploy B lands, via the message index.html sends on visibilitychange.
+    publishDeploy(worker.network, ORIGIN, "B");
+    await worker.message({ type: "rustdar:check-update" });
+
+    const wasm = await worker.fetch(new Request(shellUrl("pkg/rustdar_web_bg.wasm")), {
+      clientId: client.id,
+    });
+
+    const bodies = {
+      document: await (await nav.response).text(),
+      glue: await (await glue.response).text(),
+      wasm: await (await wasm.response).text(),
+    };
+    assert.deepEqual(
+      generationOf(bodies),
+      new Set(["A"]),
+      `this page load mixed deploys: ${JSON.stringify(bodies)}`,
+    );
+  });
+
+  it("keeps a client on its generation when the deploy lands mid-request", async () => {
+    // The same race, wound tighter: the install completes while the page's
+    // wasm request is already in the worker.
+    const worker = await bootWorker({ tag: "A" });
+    const client = worker.addClient();
+    await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: client.id });
+
+    publishDeploy(worker.network, ORIGIN, "B");
+    const release = worker.network.hold(shellUrl("pkg/rustdar_web_bg.wasm"));
+    const update = worker.message({ type: "rustdar:check-update" });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    release();
+    await update;
+
+    const wasm = await worker.fetch(new Request(shellUrl("pkg/rustdar_web_bg.wasm")), {
+      clientId: client.id,
+    });
+    assert.equal(await (await wasm.response).text(), "pkg/rustdar_web_bg.wasm::A");
+  });
+
+  it("gives a page that loads after the update the new deploy, whole", async () => {
+    // The pin must not become a way of pinning everyone to the old bundle
+    // forever. A fresh navigation is a fresh decision.
+    const worker = await bootWorker({ tag: "A" });
+    const first = worker.addClient();
+    await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: first.id });
+
+    publishDeploy(worker.network, ORIGIN, "B");
+    await worker.message({ type: "rustdar:check-update" });
+
+    const page = await loadPage(worker);
+    assert.deepEqual(generationOf(page), new Set(["B"]));
+  });
+
+  it("retains the superseded generation so a worker restart mid-load is survivable", async () => {
+    const worker = await bootWorker({ tag: "A" });
+    const client = worker.addClient();
+    await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: client.id });
+
+    publishDeploy(worker.network, ORIGIN, "B");
+    await worker.message({ type: "rustdar:check-update" });
+
+    // The worker is killed for idleness. `clientShells` goes with it; the caches
+    // do not.
+    const restarted = await restartWorker(worker);
+    const names = await restarted.cacheNames();
+    assert.equal(
+      names.some((n) => n.includes("%22A%22")),
+      true,
+      `the superseded shell was deleted, so a page still loading it now 404s: ${names}`,
+    );
+  });
+
+  it("does not accumulate shell generations without limit", async () => {
+    const worker = await bootWorker({ tag: "A" });
+    for (const tag of ["B", "C", "D", "E"]) {
+      publishDeploy(worker.network, ORIGIN, tag);
+      await worker.message({ type: "rustdar:check-update" });
+    }
+    const shells = (await worker.cacheNames()).filter((n) => n.startsWith("rustdar-shell-"));
+    assert.ok(
+      shells.length <= 2,
+      `${shells.length} shell caches are being retained with no client pinned to them: ${shells}`,
+    );
+  });
+
+  it("prunes the pin when the client goes away", async () => {
+    const worker = await bootWorker({ tag: "A" });
+    const client = worker.addClient();
+    await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: client.id });
+
+    // The tab is closed, then a new one opens and a deploy lands.
+    worker.removeClient(client);
+    publishDeploy(worker.network, ORIGIN, "B");
+    await worker.message({ type: "rustdar:check-update" });
+
+    const second = worker.addClient();
+    await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: second.id });
+    publishDeploy(worker.network, ORIGIN, "C");
+    await worker.message({ type: "rustdar:check-update" });
+
+    const shells = (await worker.cacheNames()).filter((n) => n.startsWith("rustdar-shell-"));
+    assert.equal(
+      shells.some((n) => n.includes("%22A%22")),
+      false,
+      `deploy A is still retained for a client that no longer exists: ${shells}`,
+    );
+  });
+});
+
+describe("install: a shell is published whole or not at all", () => {
+  // =========================================================================
+
+  it("publishes nothing when one shell asset is missing", async () => {
+    const network = new Network();
+    publishDeploy(network, ORIGIN, "A");
+    // The deploy forgot the manifest — precisely what a Pages workflow that
+    // copies `sw.js` but not `manifest.webmanifest` produces.
+    network.serve(shellUrl("manifest.webmanifest"), new Response("nope", { status: 404 }));
+
+    const worker = await startWorker({ swUrl: SW_URL, network });
+    await worker.activate();
+
+    const names = await worker.cacheNames();
+    assert.equal(
+      names.some((n) => n.startsWith("rustdar-shell-")),
+      false,
+      `a shell cache was left behind by a failed install: ${names}`,
+    );
+
+    // And the page still works, straight from the network.
+    const event = await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: "c1" });
+    assert.equal(await (await event.response).text(), "::A");
+  });
+
+  it("keeps the working shell when an update fails halfway", async () => {
+    const worker = await bootWorker({ tag: "A" });
+    publishDeploy(worker.network, ORIGIN, "B");
+    worker.network.serve(shellUrl("icons/icon-512.png"), new Response("gone", { status: 500 }));
+
+    await worker.message({ type: "rustdar:check-update" });
+
+    const page = await loadPage(worker);
+    assert.deepEqual(
+      generationOf(page),
+      new Set(["A"]),
+      "a failed update must leave the previous complete shell serving",
+    );
+  });
+
+  it("does not announce the first install as an update", async () => {
+    const network = new Network();
+    publishDeploy(network, ORIGIN, "A");
+    const worker = await startWorker({ swUrl: SW_URL, network });
+    const client = worker.addClient();
+    await worker.activate();
+    assert.deepEqual(
+      client.messages,
+      [],
+      "the first install has nothing to replace; a reload prompt there is a lie",
+    );
+  });
+
+  it("announces a replacement to every open window", async () => {
+    const worker = await bootWorker({ tag: "A" });
+    const one = worker.addClient();
+    const two = worker.addClient();
+    publishDeploy(worker.network, ORIGIN, "B");
+    await worker.message({ type: "rustdar:check-update" });
+
+    for (const client of [one, two]) {
+      assert.equal(
+        client.messages.some((m) => m.type === "rustdar:shell-updated"),
+        true,
+        "an open window was not told a new version is ready",
+      );
+    }
+  });
+
+  it("re-downloads nothing when the deploy has not changed", async () => {
+    const worker = await bootWorker({ tag: "A" });
+    const before = worker.network.log.length;
+    await worker.message({ type: "rustdar:check-update" });
+    const after = worker.network.log.slice(before);
+    assert.deepEqual(
+      after.map((e) => e.method),
+      ["HEAD"],
+      `an unchanged deploy cost more than one HEAD: ${JSON.stringify(after)}`,
+    );
   });
 });
 

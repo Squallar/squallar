@@ -100,6 +100,21 @@
  * to a client that then loads the *cached* glue and wasm — a wasm-bindgen
  * version mismatch and a blank page. The shell is consistent or it is not
  * served; it is never mixed.
+ *
+ * "Never mixed" is a claim about a *page load*, not about a moment in time, and
+ * that distinction is load-bearing. A page load is not atomic: the navigation,
+ * the glue and the 11 MB module are three separate fetches, seconds apart, and
+ * a deploy can land in between. Resolving "the current shell" independently for
+ * each of them is therefore not enough - it was in fact how this worker used to
+ * hand a page index.html from one deploy and its wasm from the next, and the
+ * symptom was the exact wasm-bindgen mismatch above.
+ *
+ * So the shell generation is pinned **per client**, at the navigation, in
+ * `clientShells`. Every subresource that client goes on to request is served
+ * from the generation its navigation was answered from, whatever the meta
+ * pointer has done since. `purgeCaches` retains every pinned generation, plus
+ * the one immediately superseded - the second is what covers a worker that is
+ * killed and restarted mid-load, taking `clientShells` with it.
  */
 
 "use strict";
@@ -108,7 +123,7 @@
  * Bump when the logic in this file changes. It only names caches; the deployed
  * content's version is the validator token, discovered at runtime.
  */
-const SW_VERSION = 1;
+const SW_VERSION = 2;
 
 /*
  * The directory this worker was served from, with a trailing slash:
@@ -341,20 +356,65 @@ async function writeMeta(meta) {
 }
 
 /*
- * The shell cache for the currently published deploy, memoised so the hot path
- * is one `caches.open` rather than a meta read per subresource. Cleared
- * whenever the meta pointer moves.
+ * The published meta record, memoised so the hot path is one cache lookup
+ * rather than a meta read per subresource. Cleared whenever the pointer moves.
  */
-let shellCachePromise = null;
+let metaPromise = null;
 
-function currentShellCache() {
-  if (!shellCachePromise) {
-    shellCachePromise = (async () => {
-      const meta = await readMeta();
-      return meta ? caches.open(meta.cacheName) : null;
-    })();
+function currentMeta() {
+  if (!metaPromise) metaPromise = readMeta();
+  return metaPromise;
+}
+
+/*
+ * Which shell generation each live client is being served from.
+ *
+ * Keyed by the client id the navigation created. This is the whole of the
+ * atomicity guarantee: a page load spans several fetches and a deploy can land
+ * between any two of them, so "the current shell" has to mean "the shell this
+ * client's navigation was answered from", not "the shell as of right now".
+ *
+ * Module state, so a worker killed for idleness loses it. That is why
+ * `purgeCaches` also retains the generation it just superseded: a restart mid
+ * page-load falls back to the previous shell rather than to a deleted one.
+ */
+const clientShells = new Map();
+
+/**
+ * Open a named shell cache, or null if it is not there any more.
+ *
+ * `caches.open` creates on demand, which is the wrong behaviour here: opening a
+ * purged generation would silently manufacture an empty cache, every lookup in
+ * it would miss, and the entry would sit in storage forever. Ask first.
+ */
+async function openShellCache(name) {
+  if (!name) return null;
+  if (!(await caches.has(name))) return null;
+  return caches.open(name);
+}
+
+/** Drop pins for clients that have gone away, so the map cannot grow forever. */
+async function forgetDepartedClients() {
+  if (clientShells.size === 0) return;
+  const live = new Set(
+    (await self.clients.matchAll({ includeUncontrolled: true, type: "window" })).map((c) => c.id),
+  );
+  for (const id of [...clientShells.keys()]) if (!live.has(id)) clientShells.delete(id);
+}
+
+/** The shell generation `clientId` is pinned to, falling back to the current one. */
+async function shellCacheForClient(clientId) {
+  if (clientId) {
+    const pinned = clientShells.get(clientId);
+    if (pinned) {
+      const cache = await openShellCache(pinned);
+      // A pin whose cache is gone falls through rather than failing: the
+      // network is always a correct answer, just a slower one.
+      if (cache) return cache;
+    }
   }
-  return shellCachePromise;
+  const meta = await currentMeta();
+  return openShellCache(meta && meta.cacheName);
 }
 
 /**
@@ -365,8 +425,7 @@ function currentShellCache() {
  * anything if any request fails or answers non-2xx, so a partially downloaded
  * deploy can never be published.
  */
-async function installShell(token) {
-  const name = shellCacheName(token);
+async function installShell(token, name = shellCacheName(token)) {
   const cache = await caches.open(name);
   /*
    * `no-cache`, not `reload`. Both bypass a stale `max-age` — GitHub Pages
@@ -397,10 +456,34 @@ async function installShell(token) {
    * from the glue that has to match it, which is a wasm-bindgen version
    * mismatch and a blank page. One extra transfer, once, is the cheaper bug.
    */
-  await cache.addAll(SHELL_URLS.map((u) => new Request(u, { cache: "no-cache" })));
+  try {
+    await cache.addAll(SHELL_URLS.map((u) => new Request(u, { cache: "no-cache" })));
+  } catch (e) {
+    // `addAll` writes nothing when it rejects, but `caches.open` above already
+    // created the cache. Left behind, it is an empty entry that
+    // `openShellCache` would treat as a real generation and that a later
+    // install under the same token would find pre-existing. Take it back out.
+    await caches.delete(name);
+    throw e;
+  }
   await writeMeta({ token, cacheName: name, installedAt: Date.now() });
-  shellCachePromise = null;
+  metaPromise = null;
   return name;
+}
+
+/**
+ * The caches an install must not delete.
+ *
+ * Every pinned generation, because a live client is mid-load in it, and the
+ * generation being superseded, because `clientShells` is module state that a
+ * worker restart loses - after which the only thing standing between a
+ * half-loaded page and a 404 is the previous shell still existing.
+ */
+function cachesToKeep(newShellName, previousMeta) {
+  const keep = new Set([META_CACHE, TILE_CACHE, newShellName]);
+  for (const name of clientShells.values()) keep.add(name);
+  if (previousMeta && previousMeta.cacheName) keep.add(previousMeta.cacheName);
+  return keep;
 }
 
 async function purgeCaches(keep) {
@@ -441,7 +524,7 @@ function checkForUpdate({ force = false } = {}) {
   }
 
   updateCheck = (async () => {
-    const meta = await readMeta();
+    const meta = await currentMeta();
 
     let token;
     try {
@@ -463,7 +546,7 @@ function checkForUpdate({ force = false } = {}) {
     if (meta && meta.token === token) return;
 
     const name = await installShell(token);
-    await purgeCaches(new Set([META_CACHE, TILE_CACHE, name]));
+    await purgeCaches(cachesToKeep(name, meta));
 
     // Only announce a *replacement*. The first install has nothing to replace:
     // the page that triggered it is already running the code just cached, and
@@ -480,8 +563,15 @@ function checkForUpdate({ force = false } = {}) {
 // Fetch strategies
 // ---------------------------------------------------------------------------
 
-async function serveShell(request, key) {
-  const cache = await currentShellCache();
+/**
+ * Serve a shell asset from the generation `clientId` is pinned to.
+ *
+ * `clientId` is the empty string for a request whose client the browser cannot
+ * name, which falls back to the current generation - correct, because such a
+ * request is not part of a page load this worker pinned.
+ */
+async function serveShell(request, clientId, key) {
+  const cache = await shellCacheForClient(clientId);
   if (cache) {
     const hit = await cache.match(key ?? request, { ignoreSearch: true });
     if (hit) return hit;
@@ -490,6 +580,30 @@ async function serveShell(request, key) {
   // is the source of truth and nothing is written here. `checkForUpdate` owns
   // every write to the shell cache, so this path cannot publish a stray entry.
   return fetch(request);
+}
+
+/**
+ * Answer a navigation, and pin the answering generation to the new client.
+ *
+ * The pin is taken here and nowhere else, because this is the only point in a
+ * page load at which "which deploy is this page" is still an open question.
+ * After this, it is settled for every subresource that client will request.
+ */
+async function serveNavigation(event) {
+  // Prune before pinning: the client this navigation creates does not exist
+  // yet, so pruning afterwards would immediately drop the pin just taken.
+  await forgetDepartedClients();
+
+  const meta = await currentMeta();
+  const clientId = event.resultingClientId || event.clientId;
+  if (meta && meta.cacheName && clientId) clientShells.set(clientId, meta.cacheName);
+
+  const cache = await openShellCache(meta && meta.cacheName);
+  if (cache) {
+    const hit = await cache.match(ROOT.href, { ignoreSearch: true });
+    if (hit) return hit;
+  }
+  return fetch(event.request);
 }
 
 /** Milliseconds a cached tile is good for, per the response's own headers. */
@@ -605,11 +719,16 @@ self.addEventListener("fetch", (event) => {
     case "navigate":
       // Every page load is a chance to notice a new deploy. `waitUntil` keeps
       // the worker alive for the probe without delaying the response.
+      //
+      // Ordering matters: `serveNavigation` reads the meta pointer and pins the
+      // new client to it, and it must do so against the pointer as it stands
+      // *now*. `respondWith` is called first so that the pin is taken before
+      // the probe above can move the pointer underneath it.
+      event.respondWith(serveNavigation(event));
       event.waitUntil(checkForUpdate().catch(() => {}));
-      event.respondWith(serveShell(event.request, ROOT.href));
       return;
     case "shell":
-      event.respondWith(serveShell(event.request));
+      event.respondWith(serveShell(event.request, event.clientId));
       return;
     case "tile":
       event.respondWith(serveTile(event));
@@ -647,6 +766,7 @@ self.__rustdarSwInternals = {
   ROOT,
   SHELL_URLS,
   NEVER_CACHE_HOSTS,
+  SHELL_PREFIX,
   routeFor,
   isWeatherDataHost,
   isBasemapTile,
