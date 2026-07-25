@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use rustdar_units::UserPreferences;
 
-use crate::metar::types::MetarOb;
+use crate::metar::types::{MetarOb, WindDir};
 use crate::render::controls::{ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext, PaneControlContextMut};
 use crate::render::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter};
 use crate::render::overlay_state::{
@@ -42,13 +42,14 @@ impl OverlayItem for MetarItem {
         }
 
         {
-            let dir_str = ob
-                .wind_dir
-                .map(|d| format!("{d:03}°"))
-                .unwrap_or_else(|| "VRB".to_string());
             let speed = ob.wind_speed_kt.unwrap_or(0);
             let converted = prefs.speed.convert_from_knots(speed as f32);
-            let mut wind_text = format!("{dir_str} at {converted:.0} {}", prefs.speed.suffix());
+            // "CALM at 0 kt" reads as a malfunction; calm has no speed to give.
+            let mut wind_text = match ob.wind_dir {
+                Some(WindDir::Calm) => "Calm".to_string(),
+                Some(dir) => format!("{} at {converted:.0} {}", dir.label(), prefs.speed.suffix()),
+                None => format!("{converted:.0} {}", prefs.speed.suffix()),
+            };
             if let Some(gust) = ob.wind_gust_kt {
                 let g_converted = prefs.speed.convert_from_knots(gust as f32);
                 wind_text.push_str(&format!(", gusts {g_converted:.0} {}", prefs.speed.suffix()));
@@ -373,6 +374,14 @@ mod tests {
     use rustdar_units::SpeedUnit;
 
     fn ob(vis: Option<Visibility>) -> MetarOb {
+        wind_ob(None, None, vis)
+    }
+
+    fn wind_ob(
+        dir: Option<WindDir>,
+        speed: Option<u16>,
+        vis: Option<Visibility>,
+    ) -> MetarOb {
         MetarOb {
             station_id: "KTST".into(),
             name: "KTST".into(),
@@ -381,8 +390,8 @@ mod tests {
             elev_m: None,
             temp_c: None,
             dewp_c: None,
-            wind_dir: None,
-            wind_speed_kt: None,
+            wind_dir: dir,
+            wind_speed_kt: speed,
             wind_gust_kt: None,
             visibility: vis,
             altimeter_hpa: None,
@@ -430,5 +439,26 @@ mod tests {
     #[test]
     fn the_popup_omits_visibility_when_the_station_reports_none() {
         assert_eq!(field(ob(None), "Visibility"), None);
+    }
+
+    /// The `"VRB"` fallback was unreachable: AWC always fills the direction
+    /// column, so a variable wind rendered as the bearing "000°".
+    #[test]
+    fn the_popup_says_vrb_for_a_variable_wind() {
+        let wind = field(wind_ob(Some(WindDir::Variable), Some(6), None), "Wind").unwrap();
+        assert_eq!(wind, "VRB at 6 kt");
+        assert!(!wind.contains("000"), "a variable wind is not a 000° bearing");
+    }
+
+    #[test]
+    fn the_popup_says_calm_without_inventing_a_direction() {
+        let wind = field(wind_ob(Some(WindDir::Calm), Some(0), None), "Wind").unwrap();
+        assert_eq!(wind, "Calm");
+    }
+
+    #[test]
+    fn the_popup_keeps_a_real_bearing() {
+        let wind = field(wind_ob(Some(WindDir::Degrees(360)), Some(3), None), "Wind").unwrap();
+        assert_eq!(wind, "360° at 3 kt");
     }
 }

@@ -10,7 +10,7 @@
 //!   (upper-right), visibility (left), present weather symbol, and station ID
 //!   (lower-right).
 
-use crate::metar::types::{CloudLayer, FlightCategory, MetarOb};
+use crate::metar::types::{CloudLayer, FlightCategory, MetarOb, WindDir};
 use crate::render::draw::{DrawPointContext, PointPainter, TextAnchor};
 
 // ── Zoom tier thresholds ──────────────────────────────────────────────────
@@ -121,9 +121,14 @@ pub fn hover_text_for_metar(ob: &MetarOb, prefs: &rustdar_units::UserPreferences
     }
 
     if let Some(speed) = ob.wind_speed_kt {
-        let dir_str = ob.wind_dir.map(|d| format!("{d:03}°")).unwrap_or_else(|| "VRB".into());
         let converted = prefs.speed.convert_from_knots(speed as f32);
-        parts.push(format!("{dir_str} {converted:.0}{}", prefs.speed.suffix()));
+        match ob.wind_dir {
+            Some(WindDir::Calm) => parts.push("CALM".into()),
+            Some(dir) => {
+                parts.push(format!("{} {converted:.0}{}", dir.label(), prefs.speed.suffix()))
+            }
+            None => parts.push(format!("{converted:.0}{}", prefs.speed.suffix())),
+        }
     }
 
     if let Some(fc) = ob.flight_category {
@@ -226,14 +231,31 @@ fn cloud_cover_fraction(clouds: &[CloudLayer]) -> f32 {
 /// - Full barb (line) = 10 kt
 /// - Half barb (short line) = 5 kt
 /// - Calm (speed 0 or None) = larger circle outline, no staff
+/// - Variable direction = that circle plus a second concentric ring
+///
+/// A staff is drawn only for [`WindDir::Degrees`]. Defaulting a missing or
+/// variable direction to `0` would point the barb due north — which is what a
+/// quarter of the AWC feed used to render, since AWC encodes both calm and
+/// variable as `wind_dir_degrees=0`.
 fn draw_wind_barb(
     painter: &mut dyn PointPainter,
-    wind_dir: Option<u16>,
+    wind_dir: Option<WindDir>,
     wind_speed: Option<u16>,
     circle_radius: f32,
     color: [u8; 4],
 ) {
     let speed = wind_speed.unwrap_or(0);
+
+    // No direction to point: calm, variable, or no wind data at all.
+    let Some(dir_deg) = wind_dir.and_then(WindDir::bearing) else {
+        painter.circle_stroke([0.0, 0.0], circle_radius + 2.0, color, 1.0);
+        // A variable wind is a real wind, so mark it apart from dead calm
+        // rather than letting a gusty VRB18KT look like nothing at all.
+        if wind_dir == Some(WindDir::Variable) {
+            painter.circle_stroke([0.0, 0.0], circle_radius + 4.5, color, 1.0);
+        }
+        return;
+    };
 
     // Calm — no barb, just a slightly larger circle
     if speed < 3 {
@@ -241,7 +263,7 @@ fn draw_wind_barb(
         return;
     }
 
-    let dir_deg = wind_dir.unwrap_or(0) as f32;
+    let dir_deg = dir_deg as f32;
     // Wind direction is where wind comes FROM — barb points that direction
     let dir_rad = (dir_deg - 90.0).to_radians(); // Rotate so 0° (north) points up
 
@@ -606,6 +628,14 @@ mod tests {
     }
 
     fn ob(vis: Option<Visibility>) -> MetarOb {
+        wind_ob(None, None, vis)
+    }
+
+    fn wind_ob(
+        dir: Option<WindDir>,
+        speed: Option<u16>,
+        vis: Option<Visibility>,
+    ) -> MetarOb {
         MetarOb {
             station_id: "KTST".into(),
             name: "KTST".into(),
@@ -614,8 +644,8 @@ mod tests {
             elev_m: None,
             temp_c: None,
             dewp_c: None,
-            wind_dir: None,
-            wind_speed_kt: None,
+            wind_dir: dir,
+            wind_speed_kt: speed,
             wind_gust_kt: None,
             visibility: vis,
             altimeter_hpa: None,
@@ -667,5 +697,94 @@ mod tests {
         let text =
             hover_text_for_metar(&ob(Some(Visibility { miles: 15.0, or_greater: false })), &knots());
         assert!(text.contains("15SM") && !text.contains("10+"), "got {text:?}");
+    }
+
+    // ── Wind barb ─────────────────────────────────────────────────────────
+
+    fn barb(dir: Option<WindDir>, speed: Option<u16>) -> RecordingPainter {
+        let mut p = RecordingPainter::default();
+        draw_wind_barb(&mut p, dir, speed, 5.0, [0, 0, 0, 255]);
+        p
+    }
+
+    /// A barb staff runs outward from the circle; nothing else in the barb does.
+    fn staff_end(p: &RecordingPainter) -> Option<[f32; 2]> {
+        p.lines.first().map(|(_, to)| *to)
+    }
+
+    /// The bug: 93 of 4,933 measured rows were variable winds at 3 kt or more,
+    /// and every one drew a staff pointing due north.
+    #[test]
+    fn a_variable_wind_draws_no_staff_however_hard_it_blows() {
+        for speed in [3, 6, 18, 25] {
+            let p = barb(Some(WindDir::Variable), Some(speed));
+            assert!(
+                p.lines.is_empty(),
+                "VRB at {speed} kt must not draw a directional staff"
+            );
+        }
+    }
+
+    #[test]
+    fn calm_and_no_wind_data_draw_no_staff_either() {
+        assert!(barb(Some(WindDir::Calm), Some(0)).lines.is_empty());
+        assert!(barb(None, None).lines.is_empty());
+    }
+
+    /// A variable wind is a real wind; it must not look identical to dead calm.
+    #[test]
+    fn a_variable_wind_is_marked_apart_from_dead_calm() {
+        let calm = barb(Some(WindDir::Calm), Some(0));
+        let vrb = barb(Some(WindDir::Variable), Some(6));
+        assert_eq!(calm.strokes.len(), 1, "calm draws one ring");
+        assert_eq!(vrb.strokes.len(), 2, "variable adds a second ring");
+        assert_ne!(vrb.strokes[0].0, vrb.strokes[1].0, "the rings differ in size");
+    }
+
+    /// The counterpart: a real 360° wind still gets a staff, pointing north.
+    #[test]
+    fn a_genuine_northerly_still_draws_a_northward_staff() {
+        let p = barb(Some(WindDir::Degrees(360)), Some(10));
+        let end = staff_end(&p).expect("360° is a bearing and must draw a staff");
+        // Screen space: north is -y, and the staff runs from the circle outward.
+        assert!(end[0].abs() < 1e-3, "a northerly staff has no x component: {end:?}");
+        assert!(end[1] < -5.0, "a northerly staff points up-screen: {end:?}");
+    }
+
+    /// Direction still drives the staff — this is what regressed silently.
+    #[test]
+    fn the_staff_follows_the_reported_bearing() {
+        let east = staff_end(&barb(Some(WindDir::Degrees(90)), Some(10))).unwrap();
+        assert!(east[0] > 5.0 && east[1].abs() < 1e-3, "090° points right: {east:?}");
+
+        let south = staff_end(&barb(Some(WindDir::Degrees(180)), Some(10))).unwrap();
+        assert!(south[1] > 5.0 && south[0].abs() < 1e-3, "180° points down: {south:?}");
+    }
+
+    // ── Hover text ────────────────────────────────────────────────────────
+
+    /// The `"VRB"` fallback used to be unreachable: AWC never leaves the
+    /// direction column empty for a variable wind, so `wind_dir` was always
+    /// `Some(0)` and the hover read "000°".
+    #[test]
+    fn hover_text_says_vrb_for_a_variable_wind() {
+        let text =
+            hover_text_for_metar(&wind_ob(Some(WindDir::Variable), Some(6), None), &knots());
+        assert!(text.contains("VRB 6kt"), "got {text:?}");
+        assert!(!text.contains("000"), "a variable wind is not a 000° bearing: {text:?}");
+    }
+
+    #[test]
+    fn hover_text_says_calm_rather_than_a_direction_and_a_zero() {
+        let text = hover_text_for_metar(&wind_ob(Some(WindDir::Calm), Some(0), None), &knots());
+        assert!(text.contains("CALM"), "got {text:?}");
+        assert!(!text.contains("000"), "got {text:?}");
+    }
+
+    #[test]
+    fn hover_text_keeps_a_real_bearing() {
+        let text =
+            hover_text_for_metar(&wind_ob(Some(WindDir::Degrees(360)), Some(3), None), &knots());
+        assert!(text.contains("360° 3kt"), "got {text:?}");
     }
 }

@@ -85,6 +85,50 @@ impl Visibility {
     }
 }
 
+/// Reported wind direction.
+///
+/// AWC writes `wind_dir_degrees=0` for **both** calm and variable winds and
+/// never leaves it empty for either, so the column alone cannot separate "no
+/// wind" from "direction changing" from a genuine northerly — which AWC reports
+/// as `360`, never `0`. On a live cache 1,249 of 4,933 rows (25.3%) carried
+/// `wind_dir_degrees=0`; treating those as a bearing points a wind barb due
+/// north for every one of them.
+///
+/// The raw METAR text in the same row states the case explicitly (`00000KT`
+/// versus `VRBnnKT`), so [`crate::metar::fetch`] reads it from there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindDir {
+    /// Calm: no wind and therefore no direction (`00000KT`).
+    Calm,
+    /// Variable: a real wind whose direction is not steady (`VRBnnKT`).
+    Variable,
+    /// A definite bearing in degrees true, 1–360.
+    Degrees(u16),
+}
+
+impl WindDir {
+    /// Short display form: `"CALM"`, `"VRB"`, `"180°"`.
+    pub fn label(self) -> String {
+        match self {
+            WindDir::Calm => "CALM".to_string(),
+            WindDir::Variable => "VRB".to_string(),
+            WindDir::Degrees(d) => format!("{d:03}°"),
+        }
+    }
+
+    /// The bearing to point a wind barb along, or `None` when there is no
+    /// direction to point (calm or variable).
+    ///
+    /// Callers must not substitute a default: `unwrap_or(0)` here is exactly the
+    /// bug that drew a due-north barb for a quarter of the feed.
+    pub fn bearing(self) -> Option<u16> {
+        match self {
+            WindDir::Calm | WindDir::Variable => None,
+            WindDir::Degrees(d) => Some(d),
+        }
+    }
+}
+
 /// A cloud layer from a METAR observation.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct CloudLayer {
@@ -112,8 +156,9 @@ pub struct MetarOb {
     pub temp_c: Option<f64>,
     /// Dewpoint in degrees Celsius.
     pub dewp_c: Option<f64>,
-    /// Wind direction in degrees true (None if calm or variable).
-    pub wind_dir: Option<u16>,
+    /// Wind direction: calm, variable, or a bearing. `None` when the report
+    /// carries no wind data at all.
+    pub wind_dir: Option<WindDir>,
     /// Wind speed in knots.
     pub wind_speed_kt: Option<u16>,
     /// Wind gust in knots (None if no gusts).

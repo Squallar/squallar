@@ -4,7 +4,7 @@ use std::io::Read;
 
 use flate2::read::GzDecoder;
 
-use super::types::{CloudLayer, FlightCategory, MetarOb, Visibility};
+use super::types::{CloudLayer, FlightCategory, MetarOb, Visibility, WindDir};
 
 const METAR_CACHE_URL: &str =
     "https://aviationweather.gov/data/cache/metars.cache.csv.gz";
@@ -203,6 +203,9 @@ fn parse_metar_csv(csv: &str) -> Result<Vec<MetarOb>, String> {
             })
             .collect();
 
+        let raw_ob = get_str(i_raw);
+        let wind_speed_kt = get_u16(i_wspd);
+
         observations.push(MetarOb {
             station_id,
             name,
@@ -211,8 +214,11 @@ fn parse_metar_csv(csv: &str) -> Result<Vec<MetarOb>, String> {
             elev_m: get_f64(i_elev),
             temp_c: get_f64(i_temp),
             dewp_c: get_f64(i_dewp),
-            wind_dir: get_u16(i_wdir),
-            wind_speed_kt: get_u16(i_wspd),
+            // NOT the raw column: `wind_dir_degrees=0` means calm *or* variable,
+            // and reading it as a bearing pointed a barb due north for a quarter
+            // of the feed. See `resolve_wind_dir`.
+            wind_dir: resolve_wind_dir(&raw_ob, get_u16(i_wdir), wind_speed_kt),
+            wind_speed_kt,
             wind_gust_kt: get_u16(i_wgst),
             // NOT `get_f64`: AWC writes an unrestricted visibility as `10+` /
             // `6+`, which `f64::from_str` rejects. Those are 78.5% of the feed's
@@ -224,7 +230,7 @@ fn parse_metar_csv(csv: &str) -> Result<Vec<MetarOb>, String> {
                 .and_then(|s| Visibility::parse(s)),
             altimeter_hpa,
             flight_category,
-            raw_ob: get_str(i_raw),
+            raw_ob,
             clouds,
             wx_string,
             obs_time: get_str(i_time),
@@ -233,6 +239,112 @@ fn parse_metar_csv(csv: &str) -> Result<Vec<MetarOb>, String> {
 
     log::info!("Parsed {} METAR observations from cache", observations.len());
     Ok(observations)
+}
+
+// ── Wind direction ────────────────────────────────────────────────────────
+
+/// Decide a report's wind direction, preferring the raw METAR text.
+///
+/// The `wind_dir_degrees` column cannot answer this on its own: AWC writes `0`
+/// for calm *and* for variable and never leaves it empty for either, while a
+/// genuine northerly is reported as `360`. The raw report says which it is
+/// outright — `00000KT` versus `VRBnnKT` — so that is the primary source.
+///
+/// The column is the fallback for reports with no parseable wind group (60 of
+/// 4,933 rows in the measured cache, 59 of them with an empty direction).
+/// Measured over that same cache the two sources agreed on **4,873 of 4,873**
+/// rows that had both, so the fallback rule below is the column's convention
+/// applied faithfully, not a second guess.
+fn resolve_wind_dir(
+    raw_ob: &str,
+    csv_dir: Option<u16>,
+    csv_speed: Option<u16>,
+) -> Option<WindDir> {
+    if let Some((dir, speed)) = raw_wind_group(raw_ob) {
+        return Some(classify_wind(dir, speed));
+    }
+    csv_dir.map(|d| classify_wind(Some(d), csv_speed.unwrap_or(0)))
+}
+
+/// Turn a `(direction, speed)` pair into the three-way distinction.
+///
+/// `dir == None` means the source said `VRB` explicitly.
+fn classify_wind(dir: Option<u16>, speed: u16) -> WindDir {
+    match dir {
+        None => WindDir::Variable,
+        Some(0) if speed == 0 => WindDir::Calm,
+        // A `000` bearing with a non-zero speed is not a legal METAR direction —
+        // `000` is reserved for calm. Two Canadian AUTO stations reported
+        // `00025KT` and `00022KT` in the measured cache. Whatever the sensor
+        // meant, it is not "due north", so refuse to draw a bearing for it.
+        Some(0) => WindDir::Variable,
+        Some(d) => WindDir::Degrees(d),
+    }
+}
+
+/// Extract `(direction, speed)` from a raw METAR's wind group.
+///
+/// Returns the direction as `None` for an explicit `VRB`.
+///
+/// Scanning stops at `RMK`/`TEMPO`/`BECMG`/`NOSIG`, because those sections
+/// carry *other* winds: `GCGM` reports `00000KT` but has `R09/VRB07G21KT` in
+/// its remarks, so a plain substring search for "VRB" would call a dead-calm
+/// station variable. Taking the first match also keeps forecast groups such as
+/// `... 04004KT ... TEMPO VRB15G25KT` from overriding the observed wind.
+fn raw_wind_group(raw_ob: &str) -> Option<(Option<u16>, u16)> {
+    for token in raw_ob.split_whitespace() {
+        if matches!(token, "RMK" | "TEMPO" | "BECMG" | "NOSIG") {
+            return None;
+        }
+        if let Some(found) = parse_wind_token(token) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Parse one `dddffKT` / `VRBffKT` token (optionally `Gff`, in KT/MPS/KMH).
+///
+/// Speed units are deliberately not converted: only the direction is read
+/// here, and the speed is used solely to separate calm from variable.
+fn parse_wind_token(token: &str) -> Option<(Option<u16>, u16)> {
+    let body = token
+        .strip_suffix("KT")
+        .or_else(|| token.strip_suffix("MPS"))
+        .or_else(|| token.strip_suffix("KMH"))?;
+
+    // Drop the gust suffix; it plays no part in the direction.
+    let body = match body.split_once('G') {
+        Some((before, gust)) => {
+            if gust.is_empty() || !gust.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            before
+        }
+        None => body,
+    };
+
+    let (dir, speed_digits) = match body.strip_prefix("VRB") {
+        Some(rest) => (None, rest),
+        None => {
+            if body.len() < 5 {
+                return None;
+            }
+            let (d, rest) = body.split_at(3);
+            if !d.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            (Some(d.parse::<u16>().ok()?), rest)
+        }
+    };
+
+    if !(2..=3).contains(&speed_digits.len())
+        || !speed_digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+
+    Some((dir, speed_digits.parse().ok()?))
 }
 
 /// Parse a single CSV line, handling quoted fields.
@@ -355,5 +467,147 @@ mod tests {
             assert_eq!(Visibility::parse(bad), None, "input {bad:?} must not parse");
         }
         assert_eq!(station("K20U").visibility, None, "K20U reports no visibility");
+    }
+
+    // ── Wind: calm vs variable vs a real bearing ──────────────────────────
+
+    /// AWC writes `wind_dir_degrees=0` for calm *and* variable and never leaves
+    /// it empty for either — 1,249 of 4,933 rows in the measured cache. Reading
+    /// it as a bearing pointed a barb due north for all of them.
+    #[test]
+    fn a_zero_direction_column_never_becomes_a_northerly_bearing() {
+        for id in ["LTAR", "KUZA", "KHHV", "KGOP", "K8A1", "GCGM", "CWHO"] {
+            let dir = station(id).wind_dir.expect("fixture rows carry wind data");
+            assert_ne!(
+                dir,
+                WindDir::Degrees(0),
+                "{id} reports wind_dir_degrees=0, which is not a bearing"
+            );
+            assert_eq!(dir.bearing(), None, "{id} must not offer a barb direction");
+        }
+    }
+
+    /// `00000KT` is calm; `VRBnnKT` is a real wind with no steady direction.
+    #[test]
+    fn calm_and_variable_are_told_apart() {
+        assert_eq!(station("KUZA").wind_dir, Some(WindDir::Calm));
+        assert_eq!(station("KHHV").wind_dir, Some(WindDir::Calm));
+        assert_eq!(station("LTAR").wind_dir, Some(WindDir::Variable));
+        assert_eq!(station("KGOP").wind_dir, Some(WindDir::Variable));
+    }
+
+    /// 202 of the 295 variable reports in the measured cache blow at 1–2 kt, so
+    /// inferring "variable" from a speed threshold would miss two thirds of them.
+    /// The raw text says `VRB` outright.
+    #[test]
+    fn a_slow_variable_wind_is_still_variable() {
+        let k8a1 = station("K8A1");
+        assert_eq!(k8a1.wind_speed_kt, Some(2), "K8A1 reports VRB02KT");
+        assert_eq!(k8a1.wind_dir, Some(WindDir::Variable));
+    }
+
+    /// The counterpart: a genuine northerly is reported as 360, never 0, and
+    /// must keep its bearing.
+    #[test]
+    fn a_genuine_northerly_keeps_its_bearing() {
+        let ktri = station("KTRI");
+        assert_eq!(ktri.wind_dir, Some(WindDir::Degrees(360)));
+        assert_eq!(ktri.wind_dir.unwrap().bearing(), Some(360));
+    }
+
+    #[test]
+    fn ordinary_bearings_pass_through_including_metric_reports() {
+        assert_eq!(station("KEDU").wind_dir, Some(WindDir::Degrees(180)));
+        assert_eq!(station("K20U").wind_dir, Some(WindDir::Degrees(190)));
+        assert_eq!(station("CYYH").wind_dir, Some(WindDir::Degrees(40)));
+        assert_eq!(
+            station("UUBW").wind_dir,
+            Some(WindDir::Degrees(340)),
+            "34002MPS is a bearing even though the speed is metric"
+        );
+    }
+
+    /// GCGM reports `00000KT` but carries `R09/VRB07G21KT` in its remarks. A
+    /// substring search for "VRB" would call a dead-calm station variable.
+    #[test]
+    fn a_vrb_confined_to_the_remarks_does_not_make_the_station_variable() {
+        assert!(station("GCGM").raw_ob.contains("VRB"), "fixture must keep the trap");
+        assert_eq!(station("GCGM").wind_dir, Some(WindDir::Calm));
+    }
+
+    /// Forecast groups carry their own winds; only the observed group counts.
+    #[test]
+    fn a_forecast_group_does_not_override_the_observed_wind() {
+        let raw = "METAR LFBI 250530Z AUTO 04004KT 340V080 9999 NCD 19/09 \
+                   Q1009 TEMPO VRB15G25KT 4000 TSRA BKN070CB";
+        assert_eq!(resolve_wind_dir(raw, Some(40), Some(4)), Some(WindDir::Degrees(40)));
+    }
+
+    /// `000` is reserved for calm, so a `000` bearing carrying 25 kt is not a
+    /// northerly — two Canadian AUTO stations report exactly this.
+    #[test]
+    fn a_zero_bearing_with_speed_is_not_treated_as_north() {
+        let cwho = station("CWHO");
+        assert_eq!(cwho.wind_speed_kt, Some(25), "CWHO reports 00025KT");
+        assert_eq!(cwho.wind_dir, Some(WindDir::Variable));
+        assert_eq!(cwho.wind_dir.unwrap().bearing(), None);
+    }
+
+    /// 59 of 4,933 rows report no wind at all. That is unknown, not calm.
+    #[test]
+    fn a_report_without_any_wind_data_has_no_direction() {
+        let k40u = station("K40U");
+        assert!(raw_wind_group(&k40u.raw_ob).is_none(), "K40U has no wind group");
+        assert_eq!(k40u.wind_dir, None);
+        assert_eq!(k40u.wind_speed_kt, None);
+    }
+
+    // ── Wind group tokenizer ──────────────────────────────────────────────
+
+    #[test]
+    fn wind_tokens_are_recognised_by_shape_not_by_substring() {
+        assert_eq!(parse_wind_token("18006KT"), Some((Some(180), 6)));
+        assert_eq!(parse_wind_token("36003KT"), Some((Some(360), 3)));
+        assert_eq!(parse_wind_token("00000KT"), Some((Some(0), 0)));
+        assert_eq!(parse_wind_token("VRB03KT"), Some((None, 3)));
+        assert_eq!(parse_wind_token("VRB06G13KT"), Some((None, 6)));
+        assert_eq!(parse_wind_token("34002MPS"), Some((Some(340), 2)));
+        assert_eq!(parse_wind_token("120100KMH"), Some((Some(120), 100)));
+
+        // Not wind groups.
+        let rejects = [
+            "E00000KT",
+            "R09/VRB07G21KT",
+            "9999",
+            "A2986",
+            "18006",
+            "VRBKT",
+            "18006G",
+            "1800X6KT",
+        ];
+        for bad in rejects {
+            assert_eq!(parse_wind_token(bad), None, "{bad:?} is not a wind group");
+        }
+    }
+
+    /// The observed wind precedes `RMK`; anything after it belongs to remarks.
+    #[test]
+    fn scanning_for_the_wind_group_stops_at_the_remarks_marker() {
+        let raw = "METAR CWHO 250500Z AUTO RMK AO1 SLP105 18006KT";
+        assert_eq!(raw_wind_group(raw), None, "a wind inside RMK is not the observed wind");
+    }
+
+    /// The column agreed with the raw text on 4,873 of 4,873 measured rows, so
+    /// the fallback applies the column's own convention rather than guessing.
+    #[test]
+    fn the_column_is_the_fallback_when_the_raw_text_has_no_wind_group() {
+        let no_group = "METAR K40U 250535Z AUTO 10SM CLR 25/09 A3027";
+        assert_eq!(resolve_wind_dir(no_group, None, None), None);
+        assert_eq!(resolve_wind_dir(no_group, Some(0), Some(0)), Some(WindDir::Calm));
+        assert_eq!(resolve_wind_dir(no_group, Some(0), Some(7)), Some(WindDir::Variable));
+        assert_eq!(
+            resolve_wind_dir(no_group, Some(360), Some(7)),
+            Some(WindDir::Degrees(360))
+        );
     }
 }
