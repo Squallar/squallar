@@ -519,18 +519,42 @@ mod render_cache_tests {
         assert!(cache.get(&key("KTLX", 0)).is_some());
     }
 
-    /// The shipped bound must leave room for every pane that can be on screen at
-    /// once, or the panes evict each other and every layout change re-renders.
+    /// The cache the dispatcher actually builds must hold every pane that can be on
+    /// screen at once, or the panes evict each other and every layout change
+    /// re-renders.
+    ///
+    /// Asserted by filling a real `RenderDispatcher` rather than by comparing
+    /// `MAX_RENDER_CACHE_ENTRIES` against the pane limit. Those two constants can
+    /// both be right while the dispatcher hands `RenderCache::new` something else
+    /// entirely — a comparison of constants observes the *intent*, and this is the
+    /// one place the intent is wired up.
     #[test]
-    fn the_configured_capacity_covers_a_full_pane_layout() {
+    fn the_dispatchers_own_cache_holds_every_pane_on_screen() {
         let max_panes = if cfg!(target_os = "android") {
             rustdar_egui::pane::MAX_PANES_MOBILE
         } else {
             rustdar_egui::pane::MAX_PANES_DESKTOP
         };
+        let sites: Vec<String> = (0..max_panes).map(|i| format!("SITE{i}")).collect();
         assert!(
-            MAX_RENDER_CACHE_ENTRIES >= max_panes,
-            "cache holds {MAX_RENDER_CACHE_ENTRIES} but {max_panes} panes can be shown"
+            MAX_RENDER_CACHE_ENTRIES >= sites.len(),
+            "precondition: the bound itself is too small — {MAX_RENDER_CACHE_ENTRIES} \
+             entries for {} panes",
+            sites.len()
         );
+
+        let mut dispatcher = RenderDispatcher::new();
+        for (i, site) in sites.iter().enumerate() {
+            dispatcher.cache_render(site, RadarProduct::Reflectivity, 0.5, output(i as f64));
+        }
+
+        // A full screen of panes, each on its own site: none may have evicted another.
+        for (i, site) in sites.iter().enumerate() {
+            let hit = dispatcher.get_cached_render(site, RadarProduct::Reflectivity, 0.5);
+            let Some(hit) = hit else {
+                panic!("{site} was evicted with only {} panes' worth cached", sites.len());
+            };
+            assert_eq!(hit.max_range_km, i as f64, "{site} came back as another pane's render");
+        }
     }
 }

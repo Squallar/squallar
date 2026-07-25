@@ -333,7 +333,10 @@ impl super::App {
             }
         }
 
-        let render_bounds = overdraw_bounds(&geo_bounds, texture.overdraw);
+        // The plan answers this itself. There is no fraction to pass, so the one
+        // substitution that would break the cache — `OVERDRAW_FRACTION` in place of
+        // what the adapter actually allowed — cannot be written here.
+        let render_bounds = texture.coverage(&geo_bounds);
 
         // Use the first target pane for data extraction (all synced panes share config).
         // Clone the pane's overlay config before mutating the registry.
@@ -733,31 +736,6 @@ impl super::App {
     }
 }
 
-/// Grow a viewport by `overdraw` of its own size on each side, clamped to the
-/// Mercator-valid latitude range.
-///
-/// `overdraw` must be the fraction the *texture* was sized for
-/// (`OverlayTexturePlan::overdraw`), never `OVERDRAW_FRACTION`. The two differ
-/// whenever the adapter's `max_texture_dimension_2d` forced the plan to give
-/// overdraw up, and the bounds returned here become the texture's recorded
-/// coverage — so expanding by the unclamped constant would tell
-/// `pan_exceeds_coverage` the texture reaches ground it never rasterised, and it
-/// would hold off re-rendering while the viewport panned onto it.
-fn overdraw_bounds(
-    viewport: &rustdar_overlays::types::GeoBounds,
-    overdraw: f32,
-) -> rustdar_overlays::types::GeoBounds {
-    let lat_range = viewport.max_lat - viewport.min_lat;
-    let lon_range = viewport.max_lon - viewport.min_lon;
-    let overdraw = overdraw as f64;
-    rustdar_overlays::types::GeoBounds {
-        min_lat: (viewport.min_lat - lat_range * overdraw).max(-85.05),
-        max_lat: (viewport.max_lat + lat_range * overdraw).min(85.05),
-        min_lon: viewport.min_lon - lon_range * overdraw,
-        max_lon: viewport.max_lon + lon_range * overdraw,
-    }
-}
-
 /// Convert a renderer RGBA buffer into egui's pixel layout, or `None` if it is not
 /// the `IMAGE_SIZE²` image the renderer is supposed to produce.
 ///
@@ -1144,72 +1122,6 @@ mod loop_pane_tests {
             panes[0].loop_state.frames.get(panes[0].loop_state.current_frame).is_some(),
             "and resolve to one, which is what the pane renders through"
         );
-    }
-}
-
-#[cfg(test)]
-mod overdraw_bounds_tests {
-    use super::*;
-    use rustdar_egui::overlay_cache::{OVERDRAW_FRACTION, plan_overlay_texture};
-    use rustdar_overlays::types::GeoBounds;
-
-    fn viewport() -> GeoBounds {
-        GeoBounds { min_lat: 30.0, max_lat: 40.0, min_lon: -100.0, max_lon: -90.0 }
-    }
-
-    /// The plan's own fraction sizes the bounds, so pixels and coverage describe the
-    /// same rectangle. A clamped plan must produce visibly tighter bounds than the
-    /// unclamped constant would.
-    #[test]
-    fn the_bounds_grow_by_the_plans_overdraw_not_the_constant() {
-        // A 1440pt-wide pane against WebGL2's floor: the plan has to give overdraw up.
-        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1440.0, 900.0));
-        let plan = plan_overlay_texture(rect, 2048);
-        assert!(
-            plan.overdraw < OVERDRAW_FRACTION,
-            "fixture must be a clamped plan, else this test cannot tell the two apart"
-        );
-
-        let honest = overdraw_bounds(&viewport(), plan.overdraw);
-        let overclaimed = overdraw_bounds(&viewport(), OVERDRAW_FRACTION);
-
-        // 10 degrees of viewport, grown by the plan's fraction on each side.
-        assert!((honest.min_lat - (30.0 - 10.0 * plan.overdraw as f64)).abs() < 1e-9);
-        assert!((honest.max_lon - (-90.0 + 10.0 * plan.overdraw as f64)).abs() < 1e-9);
-        assert!(
-            honest.min_lat > overclaimed.min_lat,
-            "the clamped plan must claim strictly less ground than the constant would"
-        );
-        assert!(honest.max_lat < overclaimed.max_lat);
-        assert!(honest.min_lon > overclaimed.min_lon);
-        assert!(honest.max_lon < overclaimed.max_lon);
-    }
-
-    /// Zero overdraw — a pane wider than the adapter's whole texture limit — must
-    /// leave the viewport exactly as it is rather than defaulting to a margin.
-    #[test]
-    fn zero_overdraw_leaves_the_viewport_untouched() {
-        let vp = viewport();
-        let bounds = overdraw_bounds(&vp, 0.0);
-        assert_eq!(
-            (bounds.min_lat, bounds.max_lat, bounds.min_lon, bounds.max_lon),
-            (vp.min_lat, vp.max_lat, vp.min_lon, vp.max_lon)
-        );
-    }
-
-    /// Latitude is clamped to the Mercator-valid range; longitude is not, because
-    /// the map wraps.
-    #[test]
-    fn latitude_is_clamped_to_the_mercator_range() {
-        let polar = GeoBounds { min_lat: -80.0, max_lat: 80.0, min_lon: -10.0, max_lon: 10.0 };
-        assert!(
-            80.0 + 160.0 * OVERDRAW_FRACTION as f64 > 85.05,
-            "fixture must actually overrun the clamp"
-        );
-        let bounds = overdraw_bounds(&polar, OVERDRAW_FRACTION);
-        assert_eq!(bounds.max_lat, 85.05);
-        assert_eq!(bounds.min_lat, -85.05);
-        assert_eq!(bounds.min_lon, -10.0 - 20.0 * OVERDRAW_FRACTION as f64);
     }
 }
 
