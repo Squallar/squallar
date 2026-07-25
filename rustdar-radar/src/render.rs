@@ -176,6 +176,15 @@ impl RadialContext {
 /// The atomics are load-bearing on native: `render_gate` is reached from a
 /// `par_iter` over radials, and two radials routinely land on the same pixel.
 ///
+/// They make that overlap *defined*, not *deterministic*. The last relaxed
+/// store wins, and which radial stores last is thread scheduling, so the native
+/// image differs between runs of the same scan: five runs over one KTLX sweep
+/// gave five distinct hashes, while pinning `RAYON_NUM_THREADS=1` gave the same
+/// hash every time. Anything that wants to byte-compare a native render — a
+/// golden-image test, a cache key over pixels, a reproducible export — has to
+/// pin the thread count or it will flake. wasm32 is single-threaded and so is
+/// reproducible as it stands.
+///
 /// They are *not* load-bearing on wasm32, which is single-threaded — the
 /// `seq_fallback` above exists for exactly that reason — so a cfg-split to
 /// `Vec<u32>` there is an obvious-looking win, and was measured rather than
@@ -191,8 +200,11 @@ impl RadialContext {
 /// | `RenderBuffers::new`, atomic vs plain  | 0.2/0.3 |  0.3/0.2 |
 ///
 /// That totals roughly 2.5 ms of a 233 ms frame — about 1%, and the same 1% in
-/// both browsers. The cost of the split is two divergent buffer types under one
-/// hot loop; the return does not pay for it.
+/// both browsers. The split was then built and measured end to end rather than
+/// inferred from those parts: with the wasm arm on `Vec<Cell<u32>>`, Firefox
+/// went 233 → 230 ms and Chromium 261 → 262 ms, for a byte-identical image. The
+/// cost of the split is two divergent buffer types under one hot loop; a 1%
+/// return does not pay for it.
 ///
 /// The same measurements dispose of the theory that Firefox's 5.7× penalty on
 /// `radar-render` comes from these atomics. It does not: Firefox rasterizes
