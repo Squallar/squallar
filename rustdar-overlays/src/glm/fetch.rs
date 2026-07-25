@@ -8,9 +8,10 @@ use std::collections::HashMap;
 
 use chrono::{NaiveDateTime, TimeDelta, Utc};
 
+use super::cf;
 use super::{
     DeadFeed, FetchFailures, GLM_MIN_TIME_WINDOW_SECS, GlmDataLevel, GlmFetchOutcome, GlmFlash,
-    GlmSatellite,
+    GlmSatellite, LevelFailure,
 };
 
 /// Cached GLM file data keyed by S3 object key.
@@ -80,10 +81,8 @@ pub async fn fetch_glm_flashes(
     cache.evict_before(cutoff);
 
     // List & download new files for each satellite
-    let mut new_entries: Vec<(String, Vec<GlmFlash>)> = Vec::new();
+    let mut acc = PollAccumulator::default();
     let mut dead_feeds = Vec::new();
-    let mut parse_errors: Vec<String> = Vec::new();
-    let mut transport_errors: Vec<String> = Vec::new();
     let mut tally = PollTally::default();
 
     for &sat in satellites {
@@ -112,15 +111,11 @@ pub async fn fetch_glm_flashes(
 
         // Download in concurrent batches of 20
         let batch = download_and_parse_batch(client, sat, &new_keys, levels).await;
-        parse_errors.extend(batch.parse_errors);
-        transport_errors.extend(batch.transport_errors);
-        for (key, flashes) in batch.entries {
-            new_entries.push((key, flashes));
-        }
+        acc.absorb(sat, levels, batch);
     }
 
     // Insert new data into cache
-    for (key, flashes) in new_entries {
+    for (key, flashes) in std::mem::take(&mut acc.entries) {
         cache.insert(key, flashes);
     }
 
@@ -135,14 +130,7 @@ pub async fn fetch_glm_flashes(
     // Failures are *reported*, not logged here, for the same reason dead feeds
     // are: only the caller knows what the previous poll looked like, and only
     // the caller can put it on screen.
-    Ok(build_outcome(
-        filtered,
-        dead_feeds,
-        satellites.to_vec(),
-        &tally,
-        parse_errors,
-        transport_errors,
-    ))
+    Ok(build_outcome(filtered, dead_feeds, satellites.to_vec(), &tally, acc))
 }
 
 /// Assemble the outcome a poll reports.
@@ -157,15 +145,63 @@ fn build_outcome(
     dead_feeds: Vec<DeadFeed>,
     queried: Vec<GlmSatellite>,
     tally: &PollTally,
-    parse_errors: Vec<String>,
-    transport_errors: Vec<String>,
+    acc: PollAccumulator,
 ) -> GlmFetchOutcome {
     GlmFetchOutcome {
         flashes,
         dead_feeds,
         queried,
-        parse_failures: summarize_failures(tally.in_window, parse_errors),
-        transport_failures: summarize_failures(tally.in_window, transport_errors),
+        parse_failures: summarize_failures(tally.in_window, acc.parse_errors),
+        transport_failures: summarize_failures(tally.in_window, acc.transport_errors),
+        // Deliberately not routed through `summarize_failures`: a level failure
+        // has no meaningful file-count denominator. It is not "3 of 14 files
+        // broke", it is "this layer is gone from the product".
+        level_failures: acc.level_failures,
+        evaluated_levels: acc.evaluated_levels,
+    }
+}
+
+/// What one poll accumulated across satellites, before it is shaped into the
+/// outcome the UI reads.
+///
+/// Exists for the same reason `plan_downloads` and `build_outcome` do: folding a
+/// batch into the running totals used to be four bare `extend` calls inside the
+/// async fetch, where no test could reach them. Dropping any one of them — the
+/// level failures especially — silently reinstates the bug it was added to
+/// report.
+#[derive(Default)]
+struct PollAccumulator {
+    entries: Vec<(String, Vec<GlmFlash>)>,
+    parse_errors: Vec<String>,
+    transport_errors: Vec<String>,
+    level_failures: Vec<LevelFailure>,
+    /// (satellite, level) pairs this poll actually gathered evidence about.
+    ///
+    /// A level can only be found broken by parsing a granule, so a poll that
+    /// downloads nothing new — routine, since the 20 s poll interval races the
+    /// ~20 s granule cadence — learns nothing about any level. Without this the
+    /// caller cannot tell "this layer is healthy again" from "we did not look",
+    /// and would announce a recovery that never happened every time the two
+    /// clocks slipped past each other.
+    evaluated_levels: Vec<(GlmSatellite, GlmDataLevel)>,
+}
+
+impl PollAccumulator {
+    /// Fold one satellite's batch in.
+    fn absorb(&mut self, satellite: GlmSatellite, levels: &[GlmDataLevel], batch: BatchOutcome) {
+        self.parse_errors.extend(batch.parse_errors);
+        self.transport_errors.extend(batch.transport_errors);
+        self.level_failures.extend(batch.level_failures);
+
+        // Evidence requires a granule that actually parsed. A batch where every
+        // file failed to download or open tells us nothing about the levels
+        // inside them, so it must not read as levels being healthy.
+        if !batch.entries.is_empty() {
+            for &level in levels {
+                self.evaluated_levels.push((satellite, level));
+            }
+        }
+        self.entries.extend(batch.entries);
     }
 }
 
@@ -393,6 +429,10 @@ struct BatchOutcome {
     /// One message per file that never arrived. Tracked separately so a network
     /// problem is never reported as a product schema change.
     transport_errors: Vec<String>,
+    /// Levels that failed inside files that otherwise parsed, deduplicated per
+    /// (satellite, level). A schema change hits every granule in the window
+    /// identically, so reporting it once per file would be noise.
+    level_failures: Vec<LevelFailure>,
 }
 
 /// Download and parse a batch of GLM NetCDF files concurrently.
@@ -413,7 +453,7 @@ async fn download_and_parse_batch(
         let lvls = levels_owned.clone();
         async move {
             match download_and_parse_one(&client, &url, satellite, &lvls).await {
-                Ok(flashes) => Ok((key_owned, flashes)),
+                Ok(parsed) => Ok((key_owned, parsed)),
                 Err(e) => {
                     // Per-file detail stays at debug: with 20 files in flight,
                     // warning on each turns a single schema change into a wall
@@ -429,7 +469,7 @@ async fn download_and_parse_batch(
         }
     }).collect();
 
-    let results: Vec<Result<(String, Vec<GlmFlash>), FileError>> = futures::stream::iter(futs)
+    let results: Vec<Result<(String, GranuleParse), FileError>> = futures::stream::iter(futs)
         .buffer_unordered(20)
         .collect()
         .await;
@@ -442,15 +482,29 @@ impl BatchOutcome {
     ///
     /// Separated from the async download so the partition is reachable from a
     /// test: this is the step that used to discard every error into a log line.
-    fn from_results(results: Vec<Result<(String, Vec<GlmFlash>), FileError>>) -> Self {
+    fn from_results(results: Vec<Result<(String, GranuleParse), FileError>>) -> Self {
         let mut outcome = BatchOutcome {
             entries: Vec::new(),
             parse_errors: Vec::new(),
             transport_errors: Vec::new(),
+            level_failures: Vec::new(),
         };
         for result in results {
             match result {
-                Ok(entry) => outcome.entries.push(entry),
+                Ok((key, parsed)) => {
+                    // One batch is one satellite, so within this loop the level
+                    // is what discriminates. The satellite is compared anyway:
+                    // it is the identity `LevelFailure` is keyed on, and the
+                    // accumulator does merge across satellites.
+                    for failure in parsed.level_failures {
+                        if !outcome.level_failures.iter().any(|f: &LevelFailure| {
+                            f.satellite == failure.satellite && f.level == failure.level
+                        }) {
+                            outcome.level_failures.push(failure);
+                        }
+                    }
+                    outcome.entries.push((key, parsed.records));
+                }
                 Err(FileError::Parse(e)) => outcome.parse_errors.push(e),
                 Err(FileError::Transport(e)) => outcome.transport_errors.push(e),
             }
@@ -532,7 +586,7 @@ async fn download_and_parse_one(
     url: &str,
     satellite: GlmSatellite,
     levels: &[GlmDataLevel],
-) -> Result<Vec<GlmFlash>, FileError> {
+) -> Result<GranuleParse, FileError> {
     let bytes = download_bytes(client, url).await.map_err(FileError::Transport)?;
     parse_downloaded_file(&bytes, satellite, levels)
 }
@@ -543,7 +597,7 @@ fn parse_downloaded_file(
     bytes: &[u8],
     satellite: GlmSatellite,
     levels: &[GlmDataLevel],
-) -> Result<Vec<GlmFlash>, FileError> {
+) -> Result<GranuleParse, FileError> {
     parse_glm_netcdf(bytes, satellite, levels).map_err(FileError::Parse)
 }
 
@@ -592,23 +646,31 @@ const EVENT_VARS: LevelVars = LevelVars {
 };
 
 /// Parse GLM data from NetCDF4 bytes in memory.
-fn parse_glm_netcdf(data: &[u8], satellite: GlmSatellite, levels: &[GlmDataLevel]) -> Result<Vec<GlmFlash>, String> {
+pub(crate) fn parse_glm_netcdf(
+    data: &[u8],
+    satellite: GlmSatellite,
+    levels: &[GlmDataLevel],
+) -> Result<GranuleParse, String> {
     let file = netcdf::open_mem(None, data)
         .map_err(|e| format!("Failed to open NetCDF: {e}"))?;
 
-    // Read the time origin from global attribute
+    // Read the time origin from global attribute. Every `*_time_offset`
+    // variable also names its own epoch in its `units` attribute, and in every
+    // granule inspected the two agree exactly (`time_coverage_start` =
+    // "2026-07-24T12:00:00.0Z", `event_time_offset:units` = "seconds since
+    // 2026-07-24 12:00:00.000"). The per-variable epoch wins where present —
+    // see `parse_level_records` — and this is the fallback.
     let time_origin = file.attribute("time_coverage_start")
         .and_then(|a| a.value().ok())
         .and_then(|v| match v {
             netcdf::AttributeValue::Str(s) => Some(s),
             _ => None,
         })
-        .and_then(|s| {
-            chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.fZ").ok()
-        })
+        .and_then(|s| cf::parse_cf_epoch(&s))
         .ok_or_else(|| "Missing or invalid time_coverage_start attribute".to_string())?;
 
     let mut all_records = Vec::new();
+    let mut failures: Vec<LevelFailure> = Vec::new();
 
     for level in levels {
         let vars = match level {
@@ -616,34 +678,121 @@ fn parse_glm_netcdf(data: &[u8], satellite: GlmSatellite, levels: &[GlmDataLevel
             GlmDataLevel::Group => &GROUP_VARS,
             GlmDataLevel::Event => &EVENT_VARS,
         };
-        let records = parse_level_records(&file, vars, &time_origin, satellite)?;
-        all_records.extend(records);
+        // One level failing must not take the others with it. The three levels
+        // are independent variable sets and the user selects them
+        // independently, so a schema change confined to `flash_*` should not
+        // black out the default-on group layer as well.
+        match parse_level_records(&file, vars, &time_origin, satellite) {
+            Ok(records) => all_records.extend(records),
+            Err(e) => {
+                warn_once(
+                    level_parse_key(satellite, vars.lat),
+                    &format!(
+                        "GLM {}: {} level could not be parsed: {e}",
+                        satellite.display_name(),
+                        vars.level.display_name(),
+                    ),
+                );
+                failures.push(LevelFailure {
+                    satellite,
+                    level: *level,
+                    sample_error: e,
+                });
+            }
+        }
     }
 
-    Ok(all_records)
+    // Every requested level failing means the granule itself is unusable, so it
+    // is reported as a failed *file* — which is what it is, and what puts it in
+    // the "N/M files failed to parse" count the panel already renders.
+    //
+    // The first underlying error is propagated verbatim rather than summarised.
+    // It becomes `FetchFailures::sample_error`, which reaches the operator
+    // through `log::warn!` in the handler (the panel itself renders only
+    // counts), so "GLM file has no 'flash_lat' variable (product schema
+    // change?)" is worth far more there than a tally of how many levels failed.
+    if !failures.is_empty() && failures.len() == levels.len() {
+        return Err(failures.swap_remove(0).sample_error);
+    }
+
+    // A *partial* failure keeps the healthy levels and reports the broken one
+    // separately. Neither parent of this code did both: returning `Err` here
+    // would discard perfectly good group records over a flash-only schema
+    // change, and returning a bare `Ok` — as the first cut of this did — leaves
+    // the Flashes layer empty with nothing on screen to explain it, because
+    // `Ok` means `parse_failures: None` means the panel says everything is
+    // fine. `LevelFailure` is the third channel that makes both possible.
+    Ok(GranuleParse { records: all_records, level_failures: failures })
 }
 
+/// One granule's worth of parsed records, plus any level that did not parse.
+#[derive(Debug)]
+pub(crate) struct GranuleParse {
+    pub records: Vec<GlmFlash>,
+    /// Empty in the overwhelmingly common case. Non-empty means some levels
+    /// parsed and others did not — see [`LevelFailure`].
+    pub level_failures: Vec<LevelFailure>,
+}
+
+/// Unit spellings accepted for `*_area`, mapped to the multiplier that turns
+/// them into km² — the unit [`GlmFlash::area`] documents and the popup labels.
+///
+/// The L2 LCFA product declares `flash_area:units = "m2"`, so the values are
+/// **square metres** and must be divided by a million. Reading the packed
+/// count straight out of the file and labelling it "km²" was wrong twice over:
+/// a flash of raw count 1826 was shown as "1826.0 km²" when it is really
+/// 1826 × 152601.9 m² = 278.7 km².
+const AREA_UNITS: &[(&str, f64)] = &[
+    ("m2", 1e-6),
+    ("m^2", 1e-6),
+    ("m**2", 1e-6),
+    ("meter2", 1e-6),
+    ("meters2", 1e-6),
+    ("km2", 1.0),
+    ("km^2", 1.0),
+    ("km**2", 1.0),
+];
+
+/// Unit spellings accepted for `*_energy`, mapped to the multiplier that turns
+/// them into joules.
+///
+/// GLM declares `units = "J"` with a scale factor around 1e-16, so real values
+/// land between roughly 1e-15 and 1e-12 J. Deliberately no SI prefixes here:
+/// case-folding would make "mJ" and "MJ" collide, and a silent factor of 1e9
+/// is exactly the failure this module exists to prevent.
+const ENERGY_UNITS: &[(&str, f64)] = &[("j", 1.0), ("joule", 1.0), ("joules", 1.0)];
+
 /// Parse records for one GLM hierarchy level from the NetCDF file.
+///
+/// Every variable goes through [`cf::read_unpacked`], which applies the CF
+/// packing conventions the `netcdf` crate does not. See that module for the
+/// rules; the short version is that most GLM variables are `_Unsigned` packed
+/// shorts and reading them raw yields meaningless numbers.
 fn parse_level_records(
     file: &netcdf::File,
     vars: &LevelVars,
     time_origin: &chrono::NaiveDateTime,
     satellite: GlmSatellite,
 ) -> Result<Vec<GlmFlash>, String> {
-    let lats = read_required_f32(file, vars.lat)?;
-    let lons = read_required_f32(file, vars.lon)?;
-    let energies = read_required_f32(file, vars.energy)?;
-    let time_offsets = read_required_f64_or_f32(file, vars.time_offset)?;
+    // Required *columns*. Absence here is a product schema change, and it is
+    // loud: `read_required_unpacked` warns once per variable and fails the
+    // level. That is a different condition from an absent *value*, which
+    // arrives quietly as a `None` inside `UnpackedVar::values` — see the note
+    // on [`read_required_unpacked`].
+    let lats = read_required_unpacked(file, vars.lat)?;
+    let lons = read_required_unpacked(file, vars.lon)?;
+    let energies = read_required_unpacked(file, vars.energy)?;
+    let times = read_required_unpacked(file, vars.time_offset)?;
 
     // Every variable at a level shares one dimension (`number_of_flashes`,
     // `number_of_groups`, `number_of_events`), so a short column is never
     // legitimate — it means a corrupt or restructured file. Reject it instead
     // of padding the tail with zeros.
-    let count = lats.len();
+    let count = lats.values.len();
     for (name, len) in [
-        (vars.lon, lons.len()),
-        (vars.energy, energies.len()),
-        (vars.time_offset, time_offsets.len()),
+        (vars.lon, lons.values.len()),
+        (vars.energy, energies.values.len()),
+        (vars.time_offset, times.values.len()),
     ] {
         if len != count {
             return Err(format!(
@@ -661,31 +810,14 @@ fn parse_level_records(
     // *silently* absorbed by the rasterizer as a uniform minimum bolt size.
     // When a level that should have an area is missing one, degrade to no area
     // instead of failing the file, but say so.
-    //
-    // Note this reasons about *column presence* only. Once CF unpacking lands,
-    // individual values can also be absent even where the column exists:
-    // `flash_area`/`group_area` carry `_FillValue = -1s` and
-    // `valid_range = 0s, -6s`. `Option<f32>` already accommodates per-value
-    // absence — `fix/glm-cf-unpacking` should map fill values to `None` here
-    // rather than letting them through as a number.
-    //
-    // TODO(fix/glm-cf-unpacking): energy needs a decision, and it has nowhere to
-    // put one. `flash_energy` and `event_energy` also carry `_FillValue = -1s`,
-    // but this module treats energy as *required*: length-checked against
-    // `count` above and indexed directly as `energies[i]` below, with no
-    // per-value absence path and no `Option`. A filled energy value therefore
-    // has three plausible handlings — skip the record, substitute a default
-    // (which reintroduces the `0f32.log10()` = -inf bolt-sizing bug this branch
-    // removed), or fail the file — and no obviously right one. Decide it
-    // explicitly when unpacking lands; do not let fill values flow into
-    // `GlmFlash::energy` as if they were measurements.
     let areas = match vars.area {
-        Some(name) => match read_optional_f32(file, name)? {
-            Some(values) if values.len() == count => Some(values),
-            Some(values) => {
+        Some(name) => match read_optional_unpacked(file, name)? {
+            Some(v) if v.values.len() == count => Some(v),
+            Some(v) => {
                 log::warn!(
-                    "GLM: '{name}' has {} values but '{}' has {count}; omitting area",
-                    values.len(),
+                    "GLM {}: '{name}' has {} values but '{}' has {count}; omitting area",
+                    satellite.display_name(),
+                    v.values.len(),
                     vars.lat,
                 );
                 None
@@ -695,20 +827,130 @@ fn parse_level_records(
         None => None,
     };
 
+    // The time axis names its own epoch and unit. Prefer them over the
+    // granule-level `time_coverage_start`: in every granule inspected the two
+    // agree, and reading the variable's own metadata means they cannot
+    // silently drift apart.
+    let time_units = match times.units.as_deref() {
+        Some(u) => cf::parse_time_units(u).ok_or_else(|| {
+            format!(
+                "GLM {} declares time units {u:?} that rustdar cannot interpret; \
+                 refusing to guess an epoch",
+                vars.time_offset
+            )
+        })?,
+        None => cf::TimeUnits { seconds_per_unit: 1.0, epoch: *time_origin },
+    };
+    if time_units.epoch != *time_origin {
+        log::warn!(
+            "GLM {}: {} units epoch {} disagrees with time_coverage_start {}; using the \
+             variable's own epoch",
+            satellite.display_name(),
+            vars.time_offset,
+            time_units.epoch,
+            time_origin,
+        );
+    }
+
+    // Unit resolution is scoped to the field it describes. `None` means "this
+    // product declares a unit we cannot convert", which makes the *descriptive*
+    // field unknown — it must not take position and time down with it, and it
+    // must not take the other two hierarchy levels down either.
+    let energy_to_j = unit_multiplier(satellite, vars.energy, Some(&energies), ENERGY_UNITS, "J");
+    let area_to_km2 = unit_multiplier(
+        satellite,
+        vars.area.unwrap_or("area"),
+        areas.as_ref(),
+        AREA_UNITS,
+        "km2",
+    );
+
     let mut records = Vec::with_capacity(count);
+    let mut missing = 0usize;
+    let mut off_globe = 0usize;
+
     for i in 0..count {
-        let millis = (time_offsets[i] * 1000.0) as i64;
-        let time = *time_origin + TimeDelta::milliseconds(millis);
+        // A `_FillValue` in any of the three fields that place a strike in
+        // space and time makes the detection unusable, so the record is
+        // dropped rather than published with a fabricated number. This
+        // matches how the rest of rustdar treats rows it cannot parse (see
+        // `spc::discussion`, `metar::fetch`).
+        let (Some(lat), Some(lon), Some(offset)) =
+            (lats.values[i], lons.values[i], times.values[i])
+        else {
+            missing += 1;
+            continue;
+        };
+
+        let lon = normalize_longitude(lon);
+
+        // Backstop against a coordinate that unpacked to nonsense. Note this
+        // only really guards latitude now: longitude has a legitimate
+        // wrap-around above, so a mis-unpacked longitude can land back inside
+        // the valid interval. Latitude has no such convention, and it is what
+        // caught the original bug — the unfixed code produced -94°.
+        if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+            off_globe += 1;
+            continue;
+        }
+
+        // Energy and area are descriptive, not locating: a strike whose
+        // brightness the product did not report is still a real strike at a
+        // real place and time, so the record survives and the field reads
+        // `None`.
+        //
+        // Never zero, and never a skipped record. `flash_energy` and
+        // `event_energy` carry `_FillValue = -1s`, so a *value* can be absent
+        // in a column that is present, and the three obvious handlings are all
+        // wrong: substituting a default reintroduces `0f32.log10()` = -inf and
+        // draws unknown as the smallest possible bolt (the tempting one, and
+        // the exact bug `Option` was introduced to remove); failing the file
+        // passes a granule-wide verdict on one record, for a condition the
+        // product defines per record; skipping the record deletes a real,
+        // located strike over a descriptive field, which is the same mistake as
+        // rejecting GOES-West longitudes.
+        //
+        // `Option<f32>` is the fourth option, and the column stays *required*
+        // above — a renamed or absent `*_energy` still fails loudly. Required
+        // column, optional value.
+        let energy = column_value(Some(&energies), i)
+            .zip(energy_to_j)
+            .map(|(v, to_j)| (v * to_j) as f32);
+        let area = column_value(areas.as_ref(), i)
+            .zip(area_to_km2)
+            .map(|(v, to_km2)| (v * to_km2) as f32);
+
+        // Microseconds, not milliseconds. GLM's time `scale_factor` is
+        // 3.814756e-4 s, so consecutive representable instants are 0.38 ms
+        // apart: truncating to whole milliseconds collapses roughly three in
+        // five adjacent pairs onto the same timestamp, with a worst-case error
+        // of a full millisecond against a 0.38 ms quantum. Microseconds leave
+        // 381 µs of separation, which is sufficient rather than merely better.
+        //
+        // It also interacts with the unit multiplier above: on a `milliseconds
+        // since` axis the sub-millisecond offsets — which is where the granule
+        // boundary sits — would all truncate to zero.
+        let micros = (offset * time_units.seconds_per_unit * 1e6) as i64;
+        let time = time_units.epoch + TimeDelta::microseconds(micros);
 
         records.push(GlmFlash {
-            lat: lats[i] as f64,
-            lon: lons[i] as f64,
-            energy: energies[i],
-            area: areas.as_ref().map(|a| a[i]),
+            lat,
+            lon,
+            energy,
+            area,
             time,
             satellite,
             level: vars.level,
         });
+    }
+
+    if missing > 0 || off_globe > 0 {
+        log::warn!(
+            "GLM {} {}: dropped {missing} record(s) with fill values and {off_globe} with \
+             out-of-range coordinates (of {count})",
+            satellite.display_name(),
+            vars.level.display_name(),
+        );
     }
 
     Ok(records)
@@ -720,64 +962,231 @@ fn parse_level_records(
 /// A variable vanishing from the product is a permanent schema change, not a
 /// transient condition, so repeating the message on every 20-second poll would
 /// bury it in exactly the way that let the original bug survive a year.
+///
+/// Not satellite-qualified, unlike the unit warnings: the variable *set* is a
+/// property of the product schema, and naming the bird would imply a
+/// per-satellite condition that this is not.
 fn warn_missing_variable_once(name: &'static str) {
-    static WARNED: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
-        std::sync::Mutex::new(std::collections::BTreeSet::new());
-
-    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
-    if warned.insert(name) {
-        log::warn!(
+    warn_once(
+        missing_variable_key(name),
+        &format!(
             "GLM: variable '{name}' is absent from the L2 LCFA file — the product \
              schema has changed and this field can no longer be read"
-        );
+        ),
+    );
+}
+
+/// Read a variable the level cannot do without, with CF unpacking applied.
+///
+/// This is the *column presence* half of a two-level distinction that both
+/// halves of this module needed and neither could express alone:
+///
+/// * **The variable is absent from the file.** A schema change — permanent,
+///   affects every record, and nothing downstream can compensate. Warned once
+///   and failed here. The previous `Ok(Vec::new())` fallback is the mechanism
+///   that produced "Area: 0.0 km²" for a year: a variable that does not exist
+///   read back as an empty column and callers padded it with zeros. The same
+///   silence would turn a renamed `flash_energy` into every bolt drawing at
+///   minimum size, or a renamed `flash_lat` into "no lightning anywhere".
+///
+/// * **An individual value is `_FillValue`** (or outside `valid_range`). A
+///   per-record condition the product deliberately defines — `flash_area`,
+///   `group_area`, `flash_energy` and `event_energy` all carry
+///   `_FillValue = -1s`. Quiet, and carried as a `None` inside
+///   [`cf::UnpackedVar::values`] for the caller to decide per field.
+///
+/// Conflating the two costs something either way round: treating a fill value
+/// as a schema change fails whole granules over one bad record, and treating
+/// an absent column as "all values missing" is the silence this branch exists
+/// to remove.
+fn read_required_unpacked(
+    file: &netcdf::File,
+    name: &'static str,
+) -> Result<cf::UnpackedVar, String> {
+    match cf::read_unpacked(file, name)? {
+        Some(var) => Ok(var),
+        None => {
+            warn_missing_variable_once(name);
+            Err(format!("GLM file has no '{name}' variable (product schema change?)"))
+        }
     }
 }
 
-/// Read a 1-D f32 variable that the level cannot do without.
-///
-/// Absence is an error, deliberately. The previous `Ok(Vec::new())` fallback is
-/// the mechanism that produced "Area: 0.0 km²" for a year: a variable that does
-/// not exist read back as an empty column, and callers padded it with zeros. The
-/// same silence would turn a renamed `flash_energy` into every bolt drawing at
-/// minimum size, or a renamed `flash_lat` into "no lightning anywhere".
-fn read_required_f32(file: &netcdf::File, name: &'static str) -> Result<Vec<f32>, String> {
-    let Some(var) = file.variable(name) else {
-        warn_missing_variable_once(name);
-        return Err(format!("GLM file has no '{name}' variable (product schema change?)"));
-    };
-    var.get_values::<f32, _>(..)
-        .map_err(|e| format!("Failed to read {name}: {e}"))
-}
-
-/// Read a 1-D f32 variable that a level may legitimately lack.
+/// Read a variable a level may legitimately lack, with CF unpacking applied.
 ///
 /// Returns `Ok(None)` when absent, but still reports it: the *declared*
 /// optionality lives in [`LevelVars::area`], so reaching here with a name in
 /// hand means we asked for something the product used to have.
-fn read_optional_f32(file: &netcdf::File, name: &'static str) -> Result<Option<Vec<f32>>, String> {
-    let Some(var) = file.variable(name) else {
+fn read_optional_unpacked(
+    file: &netcdf::File,
+    name: &'static str,
+) -> Result<Option<cf::UnpackedVar>, String> {
+    let var = cf::read_unpacked(file, name)?;
+    if var.is_none() {
         warn_missing_variable_once(name);
-        return Ok(None);
-    };
-    var.get_values::<f32, _>(..)
-        .map(Some)
-        .map_err(|e| format!("Failed to read {name}: {e}"))
+    }
+    Ok(var)
 }
 
-/// Read a required 1-D variable as f64 (trying f64 first, then f32).
-fn read_required_f64_or_f32(file: &netcdf::File, name: &'static str) -> Result<Vec<f64>, String> {
-    let Some(var) = file.variable(name) else {
-        warn_missing_variable_once(name);
-        return Err(format!("GLM file has no '{name}' variable (product schema change?)"));
-    };
-    // Try f64 first
-    if let Ok(vals) = var.get_values::<f64, _>(..) {
-        return Ok(vals);
+/// Fold a GLM longitude into the conventional [-180, 180] interval.
+///
+/// GLM stores longitude in an *unwrapped* frame anchored on the spacecraft, so
+/// the valid interval depends on `add_offset`, which tracks the satellite
+/// sub-point (verified on live granules):
+///
+/// | slot                  | `event_lon:add_offset` | unpackable range   |
+/// |-----------------------|------------------------|--------------------|
+/// | GOES-East (G16, G19)  | -141.56                | -141.56 …   -8.44  |
+/// | GOES-West (G18)       | -203.56                | -203.56 …  -70.44  |
+///
+/// GOES-West therefore runs past the antimeridian: a real detection at
+/// 172.72°E is stored as -187.28. Rejecting those as out-of-range deleted 60
+/// of 3228 events in the granule this was measured on, and did so *selectively* —
+/// `group_lon`/`flash_lon` are genuine floats already wrapped, reaching
+/// +172.90 in that same file, so the groups and flashes survived while their
+/// own constituent events were thrown away.
+///
+/// One wrap is enough for any offset the product uses; anything further out is
+/// left alone so the range check downstream still sees it.
+pub(super) fn normalize_longitude(lon: f64) -> f64 {
+    if (-180.0..=180.0).contains(&lon) || lon.abs() > 540.0 {
+        lon
+    } else if lon < 0.0 {
+        lon + 360.0
+    } else {
+        lon - 360.0
     }
-    // Fall back to f32 → f64
-    var.get_values::<f32, _>(..)
-        .map(|vals| vals.into_iter().map(|v| v as f64).collect())
-        .map_err(|e| format!("Failed to read {name}: {e}"))
+}
+
+/// Value of a column at `i`, or `None` if the variable is absent from the
+/// product, the column is short, or the element is `_FillValue`.
+///
+/// Collapsing those three into one `None` is deliberate *here* and only here:
+/// by this point the column-level conditions have already been reported by
+/// [`read_required_unpacked`]/[`read_optional_unpacked`], and what the caller
+/// needs per record is simply whether there is a number.
+fn column_value(column: Option<&cf::UnpackedVar>, i: usize) -> Option<f64> {
+    column?.values.get(i).copied().flatten()
+}
+
+/// Resolve the multiplier converting a variable's declared `units` into the
+/// unit rustdar stores and displays, or `None` if that cannot be done.
+///
+/// The contract is deliberately symmetric: **a value is reported only when the
+/// file says what unit it is in and we can convert that unit.** Both an absent
+/// `units` attribute and an unrecognized one yield `None`, i.e. "unknown".
+///
+/// The earlier asymmetry was worse than either branch alone. An absent
+/// attribute assumed the value was already canonical, so a dropped `units` on
+/// `flash_area` — which the product ships as `m2` — would have silently
+/// reported areas a million times too large; a merely *misspelled* one failed
+/// the whole granule. A dropped attribute and a renamed one are the same kind
+/// of upstream change and should not diverge that sharply.
+///
+/// Failure is scoped to the field. `*_area` and `*_energy` are descriptive, so
+/// losing them costs a popup row; it must not cost the strike its position and
+/// time, nor take the other two hierarchy levels with it.
+///
+/// Diagnostics name the satellite. Both birds can be enabled at once and they
+/// are separate product streams that can diverge, so an operator needs to know
+/// which one changed — and keying on it means a problem appearing on one slot
+/// does not suppress the warning for the other.
+fn unit_multiplier(
+    satellite: GlmSatellite,
+    name: &str,
+    column: Option<&cf::UnpackedVar>,
+    table: &[(&str, f64)],
+    canonical: &str,
+) -> Option<f64> {
+    // No column at all is a product property, not an anomaly: the L2 LCFA
+    // product simply has no `event_area`. Nothing to report and nothing to
+    // warn about — a genuinely *missing* variable was already reported by
+    // `read_optional_unpacked`.
+    let column = column?;
+    let sat = satellite.display_name();
+
+    let Some(units) = column.units.as_deref() else {
+        warn_once(units_key(satellite, name, "absent"), &format!(
+            "GLM {sat}: {name} declares no units attribute; reporting the field as \
+             unknown rather than assuming {canonical}"
+        ));
+        return None;
+    };
+
+    let key = units.trim().to_ascii_lowercase();
+    let found = table
+        .iter()
+        .find(|(spelling, _)| *spelling == key)
+        .map(|(_, multiplier)| *multiplier);
+
+    if found.is_none() {
+        warn_once(units_key(satellite, name, &key), &format!(
+            "GLM {sat}: {name} declares units {units:?}, which rustdar cannot convert \
+             to {canonical}; reporting the field as unknown. This is an upstream \
+             product change — the conversion table in `glm::fetch` needs the new \
+             spelling."
+        ));
+    }
+    found
+}
+
+/// Dedup key for "a hierarchy level would not parse".
+///
+/// Keyed on the satellite as well as the level: the two birds are separate
+/// product streams that can diverge, so a change hitting one must not suppress
+/// the report for the other.
+pub(super) fn level_parse_key(satellite: GlmSatellite, lat_var: &str) -> String {
+    format!("{}:level-parse:{lat_var}", satellite.bucket())
+}
+
+/// Dedup key for "a variable the product used to have is gone".
+///
+/// Deliberately *not* satellite-qualified: the variable set is a property of
+/// the product schema, so naming the bird would imply a per-satellite condition
+/// this is not, and would report the same schema fact twice.
+pub(super) fn missing_variable_key(name: &str) -> String {
+    format!("variable-absent:{name}")
+}
+
+/// Dedup key for "this variable declares a unit we cannot convert".
+///
+/// Keyed on the satellite *and* the offending spelling, so a second, different
+/// bad spelling still reports, and so does the same one on the other bird.
+pub(super) fn units_key(satellite: GlmSatellite, name: &str, spelling: &str) -> String {
+    format!("{}:{name}:units:{spelling}", satellite.bucket())
+}
+
+/// Log a warning the first time a given key is seen, then stay quiet.
+///
+/// GLM polls every 20 seconds across up to two satellites, so an upstream
+/// schema change would otherwise produce an unbounded stream of identical
+/// lines and bury itself. The conditions this guards are all permanent once
+/// they appear.
+///
+/// The single registry for the module: absent-variable reports
+/// ([`warn_missing_variable_once`]), unit problems and level-parse failures
+/// all key into it, so one condition can never crowd out another and each is
+/// reported exactly once.
+pub(crate) fn warn_once(key: String, message: &str) {
+    if claim_warning(key) {
+        log::warn!("{message}");
+    }
+}
+
+/// Record `key` as seen and report whether this is the first time.
+///
+/// Split out from [`warn_once`] so the deduplication can be tested without a
+/// log capture — in particular that distinct keys really are distinct, which
+/// is what stops a problem on one satellite from suppressing the warning for
+/// the other.
+pub(crate) fn claim_warning(key: String) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = seen.lock().unwrap_or_else(|e| e.into_inner());
+    guard.insert(key)
 }
 
 /// Minimal URL encoding for continuation tokens.
@@ -851,12 +1260,14 @@ mod tests {
     /// Build a minimal in-memory GLM-shaped NetCDF4 file: flashes carry an
     /// area variable, events deliberately do not (mirroring the real product).
     ///
-    /// NOTE: this fixture writes plain unpacked `f32`. The real product stores
-    /// these as `short` with `_Unsigned`, `scale_factor` and `add_offset`, so
-    /// the assertions below deliberately do not pin absolute *values* —
-    /// see the TODO on `GlmFlash::area`. `fix/glm-cf-unpacking` owns the CF
-    /// unpacking work and should extend this fixture to packed shorts; changing
-    /// it here would collide with that branch.
+    /// NOTE: this fixture writes plain unpacked `f32` in already-canonical
+    /// units, deliberately. Its subject is *column presence* — which variables
+    /// a level requires, and what happens when one is missing or short — not
+    /// the CF packing. The real `_Unsigned`/`scale_factor`/`add_offset` shapes
+    /// are exercised against packed shorts in `glm::tests`, so duplicating them
+    /// here would only couple these tests to constants they do not care about.
+    /// The `units` attributes are still declared, because a value whose unit is
+    /// undeclared is reported as unknown.
     fn synthetic_glm_file(spec: Fixture<'_>) -> Vec<u8> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -888,6 +1299,20 @@ mod tests {
                 let mut var = file
                     .add_variable::<f32>(name, &[dim])
                     .unwrap_or_else(|e| panic!("add {name}: {e}"));
+                // Declare units on the two fields that are unit-converted.
+                // These fixtures are about *column* presence, so the values are
+                // written already in rustdar's canonical units rather than the
+                // product's packed `m2` — but they must still say so, because a
+                // value whose unit is undeclared is reported as unknown. The
+                // real packing is exercised in `glm::tests`.
+                let units = match name {
+                    n if n.ends_with("_area") => Some("km2"),
+                    n if n.ends_with("_energy") => Some("J"),
+                    _ => None,
+                };
+                if let Some(u) = units {
+                    var.put_attribute("units", u).expect("units");
+                }
                 var.put_values(values, ..)
                     .unwrap_or_else(|e| panic!("put {name}: {e}"));
             };
@@ -912,8 +1337,18 @@ mod tests {
         std::fs::read(path).expect("read back netcdf")
     }
 
+    /// Records only, for tests that do not care about level failures.
+    fn parse_records(
+        bytes: &[u8],
+        satellite: GlmSatellite,
+        levels: &[GlmDataLevel],
+    ) -> Result<Vec<GlmFlash>, String> {
+        parse_glm_netcdf(bytes, satellite, levels).map(|p| p.records)
+    }
+
     fn parse_flashes(bytes: &[u8]) -> Result<Vec<GlmFlash>, String> {
         parse_glm_netcdf(bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Flash])
+            .map(|p| p.records)
     }
 
     #[test]
@@ -923,7 +1358,8 @@ mod tests {
         let flashes = parse_flashes(&bytes).expect("parse flash level");
         assert_eq!(flashes.len(), 2);
         // Pin that the *right column* was read, in order, without pinning the
-        // absolute scale (which `fix/glm-cf-unpacking` will change). The fixture
+        // absolute scale, which is the fixture's own and not the product's. The
+        // fixture
         // writes area = [128, 256], a ratio of exactly 2; lat is [35, 36] and
         // lon is [-97, -98], so a ratio test excludes both, and a pure scaling
         // preserves it (`flash_area` has add_offset = 0 in the real product).
@@ -939,7 +1375,7 @@ mod tests {
         );
         assert!(areas.iter().all(|a| *a > 1.0), "got {areas:?}");
 
-        let events = parse_glm_netcdf(
+        let events = parse_records(
             &bytes,
             GlmSatellite::GoesEast,
             &[GlmDataLevel::Event],
@@ -1043,7 +1479,7 @@ mod tests {
     #[test]
     fn batch_partition_keeps_every_error_and_separates_the_kinds() {
         let outcome = BatchOutcome::from_results(vec![
-            Ok(("a.nc".into(), Vec::new())),
+            Ok(("a.nc".into(), GranuleParse { records: Vec::new(), level_failures: Vec::new() })),
             Err(FileError::Parse("b.nc: bad variable".into())),
             Err(FileError::Transport("c.nc: HTTP status error: 503".into())),
             Err(FileError::Parse("d.nc: bad variable".into())),
@@ -1057,6 +1493,91 @@ mod tests {
             outcome.transport_errors,
             vec!["c.nc: HTTP status error: 503"],
             "a 503 is a network problem and must never be counted as a parse failure"
+        );
+    }
+
+    /// A schema change hits every granule in the window identically, so the
+    /// same broken level in twenty files is one report — but two *different*
+    /// broken levels are two, and collapsing them would hide a layer.
+    #[test]
+    fn batch_partition_dedups_level_failures_per_level_not_per_file() {
+        let both_broken = || {
+            vec![
+                level_failure(GlmSatellite::GoesEast, GlmDataLevel::Flash),
+                level_failure(GlmSatellite::GoesEast, GlmDataLevel::Group),
+            ]
+        };
+        let outcome = BatchOutcome::from_results(vec![
+            Ok(("a.nc".into(), GranuleParse { records: Vec::new(), level_failures: both_broken() })),
+            Ok(("b.nc".into(), GranuleParse { records: Vec::new(), level_failures: both_broken() })),
+            Ok(("c.nc".into(), GranuleParse { records: Vec::new(), level_failures: both_broken() })),
+        ]);
+
+        assert_eq!(
+            outcome.level_failures.len(),
+            2,
+            "three files reporting the same two broken levels is two reports, got {:?}",
+            outcome.level_failures,
+        );
+        for level in [GlmDataLevel::Flash, GlmDataLevel::Group] {
+            assert!(
+                outcome.level_failures.iter().any(|f| f.level == level),
+                "{level:?} must survive dedup, got {:?}",
+                outcome.level_failures,
+            );
+        }
+    }
+
+    /// The accumulator is where a batch becomes the poll's totals. Dropping any
+    /// bucket here is invisible from the async fetch that calls it, and dropping
+    /// the level bucket reinstates the round-2 regression whole.
+    #[test]
+    fn the_accumulator_forwards_every_bucket() {
+        let mut acc = PollAccumulator::default();
+        acc.absorb(
+            GlmSatellite::GoesWest,
+            &[GlmDataLevel::Group, GlmDataLevel::Flash],
+            BatchOutcome {
+                entries: vec![("a.nc".into(), Vec::new())],
+                parse_errors: vec!["p".into()],
+                transport_errors: vec!["t".into()],
+                level_failures: vec![level_failure(GlmSatellite::GoesWest, GlmDataLevel::Flash)],
+            },
+        );
+
+        assert_eq!(acc.entries.len(), 1);
+        assert_eq!(acc.parse_errors, vec!["p"]);
+        assert_eq!(acc.transport_errors, vec!["t"]);
+        assert_eq!(acc.level_failures.len(), 1, "the level bucket must not be dropped");
+        assert_eq!(
+            acc.evaluated_levels,
+            vec![
+                (GlmSatellite::GoesWest, GlmDataLevel::Group),
+                (GlmSatellite::GoesWest, GlmDataLevel::Flash),
+            ],
+            "a granule that parsed is evidence about every level it was asked for"
+        );
+    }
+
+    /// ...but only a granule that actually parsed is evidence. A batch where
+    /// every file failed tells us nothing about the levels inside them, and
+    /// treating that as evidence would announce a recovery on an outage.
+    #[test]
+    fn a_batch_that_parsed_nothing_is_not_evidence() {
+        let mut acc = PollAccumulator::default();
+        acc.absorb(
+            GlmSatellite::GoesEast,
+            &[GlmDataLevel::Flash],
+            BatchOutcome {
+                entries: Vec::new(),
+                parse_errors: vec!["every file failed".into()],
+                transport_errors: Vec::new(),
+                level_failures: Vec::new(),
+            },
+        );
+        assert!(
+            acc.evaluated_levels.is_empty(),
+            "a batch with no successful parse cannot vouch for any level"
         );
     }
 
@@ -1103,20 +1624,34 @@ mod tests {
         );
     }
 
-    /// Each error bucket must land in its own field. Swapping them makes every
-    /// 503 read as "product change?" — the round-3 defect, restored by
-    /// transposing two lines of a struct literal.
+    fn level_failure(satellite: GlmSatellite, level: GlmDataLevel) -> LevelFailure {
+        LevelFailure { satellite, level, sample_error: format!("{level:?} broke") }
+    }
+
+    /// Every bucket must land in its own field. Swapping two makes every 503
+    /// read as "product change?"; *dropping* the level bucket restores the
+    /// round-2 regression whole, since an unreported level failure is exactly
+    /// the silence `LevelFailure` was added to break.
     #[test]
-    fn build_outcome_binds_each_error_bucket_to_its_own_field() {
+    fn build_outcome_binds_each_bucket_to_its_own_field() {
         let tally = PollTally { in_window: 12 };
-        let outcome = build_outcome(
-            Vec::new(),
-            Vec::new(),
-            vec![GlmSatellite::GoesEast],
-            &tally,
-            vec!["a.nc: GLM file has no 'flash_lat' variable".into()],
-            vec!["b.nc: HTTP status error: 503".into()],
-        );
+        let acc = PollAccumulator {
+            parse_errors: vec!["a.nc: GLM file has no 'flash_lat' variable".into()],
+            transport_errors: vec!["b.nc: HTTP status error: 503".into()],
+            level_failures: vec![level_failure(GlmSatellite::GoesWest, GlmDataLevel::Flash)],
+            // Deliberately a *superset* of the failures: Group was evaluated
+            // and found healthy. Identical sets would let `evaluated_levels` be
+            // derived from `level_failures` — "evidence from asking, not from
+            // parsing" — which at integration level degenerates into a layer
+            // that can never clear.
+            evaluated_levels: vec![
+                (GlmSatellite::GoesWest, GlmDataLevel::Flash),
+                (GlmSatellite::GoesWest, GlmDataLevel::Group),
+            ],
+            ..Default::default()
+        };
+        let outcome =
+            build_outcome(Vec::new(), Vec::new(), vec![GlmSatellite::GoesEast], &tally, acc);
 
         assert_eq!(
             outcome.parse_failures.expect("parse failures").sample_error,
@@ -1127,6 +1662,39 @@ mod tests {
             "b.nc: HTTP status error: 503",
         );
         assert_eq!(outcome.queried, vec![GlmSatellite::GoesEast]);
+
+        // The level bucket is carried through untouched — not summarised into a
+        // file count, and not dropped.
+        assert_eq!(
+            outcome.level_failures,
+            vec![level_failure(GlmSatellite::GoesWest, GlmDataLevel::Flash)],
+        );
+        assert_eq!(
+            outcome.evaluated_levels,
+            vec![
+                (GlmSatellite::GoesWest, GlmDataLevel::Flash),
+                (GlmSatellite::GoesWest, GlmDataLevel::Group),
+            ],
+            "the evidence set must survive independently of the failures, or \
+             every quiet poll reads as a recovery"
+        );
+    }
+
+    /// A level failure is not a file failure. Routing it through
+    /// `summarize_failures` would announce "N/M files failed to parse" while the
+    /// other layers are still drawing.
+    #[test]
+    fn build_outcome_keeps_level_failures_out_of_the_file_counts() {
+        let tally = PollTally { in_window: 9 };
+        let acc = PollAccumulator {
+            level_failures: vec![level_failure(GlmSatellite::GoesEast, GlmDataLevel::Group)],
+            ..Default::default()
+        };
+        let outcome = build_outcome(Vec::new(), Vec::new(), Vec::new(), &tally, acc);
+
+        assert!(outcome.parse_failures.is_none(), "no *file* failed");
+        assert!(outcome.transport_failures.is_none());
+        assert_eq!(outcome.level_failures.len(), 1);
     }
 
     /// Both kinds share the window as their denominator, and an empty bucket
@@ -1134,14 +1702,11 @@ mod tests {
     #[test]
     fn build_outcome_leaves_an_empty_bucket_unreported() {
         let tally = PollTally { in_window: 14 };
-        let outcome = build_outcome(
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            &tally,
-            vec!["a.nc: boom".into()],
-            Vec::new(),
-        );
+        let acc = PollAccumulator {
+            parse_errors: vec!["a.nc: boom".into()],
+            ..Default::default()
+        };
+        let outcome = build_outcome(Vec::new(), Vec::new(), Vec::new(), &tally, acc);
 
         assert_eq!(outcome.parse_failures.expect("parse failures").in_window, 14);
         assert!(
@@ -1175,7 +1740,8 @@ mod tests {
         let flashes =
             parse_downloaded_file(&bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Flash])
                 .expect("fixture should parse");
-        assert_eq!(flashes.len(), 2);
+        assert_eq!(flashes.records.len(), 2);
+        assert!(flashes.level_failures.is_empty());
     }
 
     /// A download that never lands is a *transport* failure, all the way out
@@ -1299,6 +1865,6 @@ mod tests {
         assert!(flashes.iter().all(|f| f.area.is_none()));
         // Position and energy are untouched.
         assert!((flashes[0].lat - 35.0).abs() < 1e-4);
-        assert!(flashes[0].energy > 0.0);
+        assert!(flashes[0].energy.is_some_and(|e| e > 0.0));
     }
 }

@@ -5,7 +5,10 @@
 //! file covers ~20 seconds of data; we aggregate flashes over a configurable
 //! time window (default 5 minutes).
 
+mod cf;
 pub mod fetch;
+#[cfg(test)]
+mod tests;
 
 /// Which GOES orbital slot to fetch GLM data from.
 ///
@@ -75,22 +78,30 @@ impl GlmDataLevel {
 pub struct GlmFlash {
     pub lat: f64,
     pub lon: f64,
-    /// Radiant energy in joules.
-    pub energy: f32,
-    /// Area, when the product reports one.
+    /// Radiant energy in joules, when the product reports one.
     ///
-    /// TODO(fix/glm-cf-unpacking): the unit here is currently a lie. `flash_area`
-    /// and `group_area` are stored as `short` with `_Unsigned = "true"`,
-    /// `scale_factor = 152601.9` and `units = "m2"`, and nothing applies CF
-    /// unpacking, so this field holds a raw packed count — not km², not even m².
-    /// Any raw value above 32767 additionally wraps negative through int16.
-    /// The `fix/glm-cf-unpacking` branch owns the fix; until it lands, treat the
-    /// number as uncalibrated.
+    /// `None` means *unknown*, and callers must not substitute a number for
+    /// it. Zero is not available as a sentinel: every GLM energy variable
+    /// carries `add_offset = 2.8515e-16`, so the smallest value the product
+    /// can express is 2.85e-16 J and zero is out of band. It is also not
+    /// harmless — `rasterize` sizes bolts by `energy.log10()`, and 0.0 clamps
+    /// to the bottom of that window, drawing "unknown" as "weakest".
     ///
-    /// `None` at [`GlmDataLevel::Event`]: the L2 LCFA product only carries
-    /// `group_area` and `flash_area`. Individual events are single sensor
-    /// pixels and have no area variable, so reporting a number there would be
-    /// a fabrication.
+    /// The *column* is required: a renamed or absent `*_energy` variable is a
+    /// schema change and fails the level loudly. Only a per-record
+    /// `_FillValue` reaches here as `None`. See `fetch::parse_level_records`.
+    pub energy: Option<f32>,
+    /// Area in km², when the product reports one.
+    ///
+    /// The product stores this as an `_Unsigned` packed `short` with
+    /// `scale_factor = 152601.9` and `units = "m2"`; `fetch` applies the CF
+    /// unpacking and converts to km² using the file's own `units` attribute,
+    /// so the unit named here is the unit held here.
+    ///
+    /// `None` at [`GlmDataLevel::Event`]: the L2 LCFA product carries only
+    /// `group_area` and `flash_area`. An event is a single sensor pixel and
+    /// has no area variable, so any number here would be invented. Also
+    /// `None` for a per-record `_FillValue`.
     pub area: Option<f32>,
     /// UTC timestamp.
     pub time: chrono::NaiveDateTime,
@@ -177,6 +188,27 @@ impl FetchFailures {
     }
 }
 
+/// A hierarchy level that would not parse, inside files that otherwise did.
+///
+/// Third failure shape, and it needed its own: [`DeadFeed`] is "the files are
+/// absent", [`FetchFailures`] is "the files are present and unusable", and this
+/// is "the files are present and usable, but one *layer* inside them is not".
+///
+/// It cannot be folded into either. Counting it as a failed file would make
+/// `is_total()` announce "all N files failed to parse" while groups and events
+/// are still drawing on the map. Leaving it out — which is what the first cut
+/// of the level-tolerant parse did — means a `flash_*` schema change empties
+/// the Flashes layer with nothing on screen to say why, which is the exact
+/// failure mode this whole area of the code exists to prevent, just scoped to
+/// one layer instead of the whole overlay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LevelFailure {
+    pub satellite: GlmSatellite,
+    pub level: GlmDataLevel,
+    /// Representative error for this level, for the log.
+    pub sample_error: String,
+}
+
 /// What one GLM fetch produced.
 pub struct GlmFetchOutcome {
     pub flashes: Vec<GlmFlash>,
@@ -202,6 +234,20 @@ pub struct GlmFetchOutcome {
     pub parse_failures: Option<FetchFailures>,
     /// Files that could not be downloaded at all (connection errors, non-2xx).
     pub transport_failures: Option<FetchFailures>,
+    /// Hierarchy levels that failed to parse in files that otherwise parsed.
+    ///
+    /// Deduplicated per (satellite, level): a schema change affects every
+    /// granule in the window identically, so the count of files it appears in
+    /// carries no information the user needs.
+    pub level_failures: Vec<LevelFailure>,
+    /// (satellite, level) pairs this poll actually learned something about.
+    ///
+    /// Required to interpret `level_failures`, exactly as `queried` is required
+    /// to interpret `dead_feeds`: a pair absent from `level_failures` is only
+    /// *healthy* if it was evaluated. A poll that downloaded no new granules
+    /// evaluates nothing, and calling that a recovery would be a false
+    /// statement about the layer the user is most likely investigating.
+    pub evaluated_levels: Vec<(GlmSatellite, GlmDataLevel)>,
 }
 
 /// Type-erased fetch result for GLM lightning data.
