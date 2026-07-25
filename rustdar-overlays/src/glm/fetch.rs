@@ -84,11 +84,7 @@ pub async fn fetch_glm_flashes(
     let mut dead_feeds = Vec::new();
     let mut parse_errors: Vec<String> = Vec::new();
     let mut transport_errors: Vec<String> = Vec::new();
-    // Denominator for the failure ratio: every file the listing puts inside the
-    // window, counted whether or not this poll had to download it. Counting
-    // only the uncached ones biases the ratio upward over time, because
-    // successes get cached and drop out while failures are retried forever.
-    let mut in_window = 0usize;
+    let mut tally = PollTally::default();
 
     for &sat in satellites {
         let listing = list_glm_files(client, sat, start, now).await?;
@@ -107,9 +103,7 @@ pub async fn fetch_glm_flashes(
             });
         }
 
-        let plan = plan_downloads(&listing.keys, cache);
-        in_window += plan.in_window;
-        let new_keys = plan.new_keys;
+        let new_keys = plan_downloads(&listing.keys, cache, &mut tally);
 
         if new_keys.is_empty() {
             continue;
@@ -145,36 +139,41 @@ pub async fn fetch_glm_flashes(
         flashes: filtered,
         dead_feeds,
         queried: satellites.to_vec(),
-        parse_failures: summarize_failures(in_window, parse_errors),
-        transport_failures: summarize_failures(in_window, transport_errors),
+        parse_failures: summarize_failures(tally.in_window, parse_errors),
+        transport_failures: summarize_failures(tally.in_window, transport_errors),
     })
 }
 
-/// What one satellite's listing means for this poll.
-struct PollPlan<'a> {
-    /// Every key the listing placed in the window — the failure-ratio
-    /// denominator.
+/// Running totals for one poll, accumulated across satellites.
+#[derive(Default)]
+struct PollTally {
+    /// Every file the listings placed in the window — the denominator the
+    /// failure ratio is measured against.
     in_window: usize,
-    /// The subset that still has to be downloaded.
-    new_keys: Vec<&'a str>,
 }
 
-/// Decide what to download, and what the window contains.
+/// Decide what to download, and record what the window contains.
 ///
-/// The two numbers are deliberately different and must stay that way: cached
-/// successes drop out of `new_keys` while failures are never cached and are
-/// retried every poll, so using `new_keys.len()` as the denominator makes a
-/// single persistent failure look like a total outage after a few ticks. Pure,
-/// so that distinction is testable without touching the network.
-fn plan_downloads<'a>(keys: &'a [String], cache: &GlmCache) -> PollPlan<'a> {
-    PollPlan {
-        in_window: keys.len(),
-        new_keys: keys
-            .iter()
-            .filter(|k| !cache.contains_key(k.as_str()))
-            .map(|k| k.as_str())
-            .collect(),
-    }
+/// The tally is updated *here* rather than by the caller so that exactly one
+/// expression in the codebase defines the failure denominator. The caller sits
+/// inside a network round trip and cannot be unit-tested, so leaving it to pick
+/// between `keys.len()` and `new_keys.len()` would put the decision somewhere
+/// no test can reach — which is how the biased denominator survived review.
+///
+/// The two counts are deliberately different and must stay that way: cached
+/// successes drop out of the returned keys while failures are never cached and
+/// are retried every poll, so using the download count as the denominator makes
+/// a single persistent failure look like a total outage after a few ticks.
+fn plan_downloads<'a>(
+    keys: &'a [String],
+    cache: &GlmCache,
+    tally: &mut PollTally,
+) -> Vec<&'a str> {
+    tally.in_window += keys.len();
+    keys.iter()
+        .filter(|k| !cache.contains_key(k.as_str()))
+        .map(|k| k.as_str())
+        .collect()
 }
 
 /// Result of listing S3 for one satellite, with enough context to tell an
@@ -1020,12 +1019,18 @@ mod tests {
             cache.insert(key.clone(), Vec::new());
         }
 
-        let plan = plan_downloads(&keys, &cache);
+        let mut tally = PollTally::default();
+        let new_keys = plan_downloads(&keys, &cache, &mut tally);
         assert_eq!(
-            plan.in_window, 12,
+            tally.in_window, 12,
             "the window still contains every listed file, cached or not"
         );
-        assert_eq!(plan.new_keys.len(), 3, "only the uncached ones need downloading");
+        assert_eq!(new_keys.len(), 3, "only the uncached ones need downloading");
+
+        // The tally accumulates across satellites rather than being overwritten.
+        let other: Vec<String> = (0..4).map(|i| format!("w{i}.nc")).collect();
+        plan_downloads(&other, &GlmCache::default(), &mut tally);
+        assert_eq!(tally.in_window, 16);
 
         // The pathological steady state: everything cached but one straggler,
         // which is what a 20 s poll against 20 s granules looks like.
@@ -1033,9 +1038,10 @@ mod tests {
         for key in keys.iter().take(11) {
             cache.insert(key.clone(), Vec::new());
         }
-        let plan = plan_downloads(&keys, &cache);
-        assert_eq!(plan.new_keys.len(), 1);
-        let report = summarize_failures(plan.in_window, vec!["k11.nc: boom".into()])
+        let mut tally = PollTally::default();
+        let new_keys = plan_downloads(&keys, &cache, &mut tally);
+        assert_eq!(new_keys.len(), 1);
+        let report = summarize_failures(tally.in_window, vec!["k11.nc: boom".into()])
             .expect("one failure");
         assert!(
             !report.is_total(),
