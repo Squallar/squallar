@@ -113,11 +113,10 @@ pub type Result<T> = std::result::Result<T, ArchiveError>;
 ///
 /// A faithful port of `nexrad_data::aws::archive::Identifier`: a newtype over
 /// the bare object *name* (not the full key), with the site and collection time
-/// recovered by fixed-offset slicing of that name. The derive list matches
-/// upstream's, including the deliberate absence of `Debug` on the
-/// upstream type -- except that `Debug` *is* derived here, because
-/// [`ArchiveError::UnkeyableIdentifier`] prints a name and the frontend logs
-/// identifiers when a loop frame fails.
+/// recovered by fixed-offset slicing of that name. The derive list is
+/// upstream's plus `Debug`, which upstream omitted: the frontend logs an
+/// identifier when a loop frame fails to download, and every consumer in this
+/// workspace renders errors with `{:?}`.
 ///
 /// Names look like `KTLX20240520_000004_V06`: four characters of site, eight of
 /// `%Y%m%d`, a separator, then six of `%H%M%S`.
