@@ -1047,8 +1047,14 @@ impl super::App {
 /// identifiers in the download queue — where, labelled with this loop's site, they
 /// would be cached as this site's scans and rendered with its geometry.
 ///
-/// Stale listings for the *same* site are harmless by comparison — same files,
-/// possibly a different window — and are still taken, as the last word.
+/// Stale listings for the *same* site name that site's own files, and are still
+/// taken, as the last word. Not quite free, though: one requested before a lookback
+/// *shrink* covers a wider span than the loop now asks for, so taking it leaves a
+/// frame list — and a correspondingly oversized download queue — transiently wider
+/// than the current `lookback_secs`. That self-corrects at the next poll, whose
+/// eviction measures the window from the newest frame against the loop's current
+/// `lookback_secs`. Closing the gap properly needs a generation counter, which is
+/// not worth carrying for a few extra frames that expire on their own.
 ///
 /// The frame list and the returned queue are built from one sampled set on purpose:
 /// they are the two halves of the same plan, and a frame with no queued download
