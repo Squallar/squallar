@@ -20,7 +20,9 @@ rustdar-overlays = { workspace = true }
 # this crate stays free of the `serial` feature. The settings pane that does use
 # it turns on rustdar-egui/gps-serial instead, which is where the gate belongs.
 rustdar-gps = { workspace = true }
-reqwest = { workspace = true, features = ["default", "json"] }
+# `json` only -- see the note in rustdar-overlays: `default` would re-enable
+# `default-tls` (= platform verifier + aws-lc-rs) and undo the aws-lc-sys removal.
+reqwest = { workspace = true, features = ["json"] }
 chrono = { workspace = true }
 egui = { workspace = true }
 egui-wgpu = { workspace = true, features = ["winit"] }

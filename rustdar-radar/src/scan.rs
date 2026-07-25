@@ -1,8 +1,39 @@
 use chrono::{Duration, NaiveDateTime, NaiveTime};
 
-use nexrad_data::aws::archive::{download_file, list_files, Identifier};
+use nexrad_data::aws::archive::Identifier;
 use nexrad_model::data::Scan;
 use nexrad_data::result::Result;
+
+// `nexrad-data`'s two network entry points, wrapped so that every call installs
+// the TLS crypto provider first.
+//
+// These deliberately shadow the upstream names: every call site below reads as a
+// plain `list_files(..)` / `download_file(..)` and is routed through
+// `tls::init()` whether or not whoever wrote it knew about TLS. The alternative
+// -- calling `tls::init()` from each of the seven call sites -- is one `git
+// revert` away from a graph where some paths are covered and some are not.
+//
+// The client these reach is built inside a `once_cell::sync::Lazy` in
+// `nexrad-data`, so it is constructed on the first S3 request rather than at
+// startup. With `rustls-no-provider` and no provider installed, that is a
+// `panic!("No provider set")` on first use. See `crate::tls`.
+//
+// `pub(crate)` rather than private so the `tls` probe can poll one of them.
+
+pub(crate) async fn list_files(
+    site: &str,
+    date: &chrono::NaiveDate,
+) -> Result<Vec<Identifier>> {
+    crate::tls::init();
+    nexrad_data::aws::archive::list_files(site, date).await
+}
+
+pub(crate) async fn download_file(
+    identifier: Identifier,
+) -> Result<nexrad_data::volume::File> {
+    crate::tls::init();
+    nexrad_data::aws::archive::download_file(identifier).await
+}
 
 /// List files for the given date, falling back to the previous day if empty.
 /// Returns `None` if both days are empty, otherwise `(files, effective_date)`.
@@ -344,7 +375,11 @@ pub async fn get_tgftp_product(
     );
 
     log::info!("Fetching TGFTP product: {url}");
-    let client = reqwest::Client::new();
+    let client = crate::tls::client(
+        crate::tls::USER_AGENT,
+        std::time::Duration::from_secs(30),
+    )
+    .build()?;
     let resp = client.get(&url).send().await?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(Level3FetchError::NotFound(format!(

@@ -13,9 +13,22 @@ nexrad-model = { workspace = true }
 nexrad-decode = { workspace = true }
 nexrad-level3 = { workspace = true }
 rayon = "=1.11.0"
-reqwest = { workspace = true, features = ["rustls-tls"] }
+# TLS backend comes from the workspace pin; nothing extra is needed here.
+reqwest = { workspace = true }
 thiserror = { workspace = true }
 
-[target.'cfg(target_os = "android")'.dependencies]
-# Force vendored OpenSSL for Android builds to avoid cross-compilation issues
-openssl-sys = { workspace = true }
+# Used by `tls` to build the process-wide *ring* provider. Direct dependency
+# because this crate is the lowest one in the graph that can reach a TLS
+# handshake (see `tls`), so it is where the provider gets installed.
+#
+# Off on wasm32 on purpose. There, reqwest gates every TLS dependency out and
+# goes through the browser's `fetch()`, so trust decisions and revocation are the
+# browser's and update with it. Pulling rustls in anyway would put `ring` -- the
+# workspace's one C dependency -- into a graph that has no use for it.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rustls = { workspace = true }
+
+[dev-dependencies]
+# Test-only: drives the `#[ignore]`d live TLS check in `tls`. Not linked into any
+# shipped binary.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

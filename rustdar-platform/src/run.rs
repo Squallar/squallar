@@ -8,6 +8,13 @@ fn create_event_loop() -> EventLoop<()> {
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Install the rustls crypto provider before anything can open a socket.
+    // Belt-and-braces: every client constructor in the workspace also calls this
+    // (see `rustdar_radar::tls`), so a missing call here does not break TLS. It
+    // is here so the provider is chosen at a predictable point rather than by
+    // whichever background task happens to fetch first.
+    rustdar_frontend::tls::init();
+
     // Initialize logger for native platforms
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)

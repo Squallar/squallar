@@ -12,6 +12,13 @@
 use std::sync::Arc;
 use winit::window::Window;
 
+/// Process-wide TLS setup, re-exported so entry points can install the crypto
+/// provider without taking their own dependency on `rustdar-radar`.
+///
+/// See [`rustdar_radar::tls`] for why the provider has to be installed at all
+/// and why calling it from an entry point is not the load-bearing guarantee.
+pub use rustdar_radar::tls;
+
 /// Type alias for a reference-counted Window
 pub type WindowRef = Arc<Window>;
 

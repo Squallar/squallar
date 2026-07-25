@@ -55,7 +55,8 @@ pollster = { workspace = true }
 log = { workspace = true }
 jni = { workspace = true }
 ndk-context = { workspace = true }
+# Pinned to the version reqwest 0.13.2 resolves, so `android::init_with_refs`
+# below talks to the same verifier instance reqwest's clients read from. 0.6.2
+# wants jni ^0.21, which is the workspace pin -- 0.7.x would require jni ^0.22.
 rustls-platform-verifier = "=0.6.2"
 rustdar-gps = { workspace = true, features = ["serial"] }
-# Force vendored OpenSSL for Android builds to avoid cross-compilation issues
-openssl-sys = { workspace = true }

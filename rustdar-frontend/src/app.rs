@@ -90,11 +90,15 @@ impl App {
         let tokio_runtime = tokio::runtime::Runtime::new()
             .expect("Failed to create Tokio runtime");
 
-        let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .user_agent("rustdar/1.0 (https://github.com/USA-RedDragon/rustdar)")
-            .build()
-            .expect("Failed to build HTTP client");
+        // Goes through `rustdar_radar::tls` rather than `reqwest::Client::builder`
+        // directly: that is what installs the rustls crypto provider (no provider
+        // is compiled in) and sets `https_only`. See `rustdar_radar::tls`.
+        let http_client = rustdar_radar::tls::client(
+            rustdar_radar::tls::USER_AGENT,
+            std::time::Duration::from_secs(30),
+        )
+        .build()
+        .expect("Failed to build HTTP client");
 
         let mut gui = Gui::new();
         if let Some(store) = platform.config_store() {

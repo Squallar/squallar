@@ -52,7 +52,10 @@ futures = "=0.3.32"
 # `flate2/zlib-ng`, which is C and puts the whole problem back.
 hdf5-pure = "=0.24.0"
 log = { workspace = true }
-reqwest = { workspace = true, features = ["default", "json"] }
+# `json` only. NOT `default`: reqwest's default set includes `default-tls`, which
+# is an alias for `rustls` (platform verifier *plus* aws-lc-rs) and would put
+# `aws-lc-sys` back in the graph. The TLS backend comes from the workspace pin.
+reqwest = { workspace = true, features = ["json"] }
 roxmltree = "=0.21.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -65,8 +68,11 @@ tokio = { workspace = true, features = ["fs"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-# Force vendored OpenSSL for Android builds to avoid cross-compilation issues
-openssl-sys = { workspace = true }
+# NOTE: `openssl-sys` used to be pinned here with `features = ["vendored"]` to get
+# a cross-compilable OpenSSL for the NDK. Nothing links OpenSSL any more -- TLS is
+# rustls + rustls-platform-verifier via the workspace `reqwest` pin -- so the
+# vendored build is gone along with its C toolchain requirement.
+#
 # NOTE: `libsqlite3-sys` used to be pinned here with `features = ["bundled"]`,
 # because proj-sys (via grib -> proj) needed SQLite3 headers the NDK sysroot
 # does not ship. grib no longer pulls proj (see the `grib` pin above), so

@@ -451,6 +451,13 @@ fn android_main(app: AndroidApp) {
 
     log::info!("Starting Rustdar Platform (Android)");
 
+    // Install the rustls crypto provider before anything can open a socket.
+    // Belt-and-braces -- every client constructor calls this too (see
+    // `rustdar_radar::tls`) -- but doing it first here keeps the choice of
+    // provider at a predictable point rather than leaving it to whichever
+    // background thread fetches first.
+    rustdar_frontend::tls::init();
+
     // Initialize rustls-platform-verifier for TLS certificate verification.
     // reqwest 0.13+ uses rustls-platform-verifier which requires JNI access to
     // Android's TrustManager. Without this, all HTTPS connections hang silently.
