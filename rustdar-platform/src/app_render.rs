@@ -1,4 +1,4 @@
-use egui_wgpu::{ScreenDescriptor, wgpu};
+use egui_wgpu::wgpu;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -9,34 +9,90 @@ use crate::constants::{MAX_CONCURRENT_RENDERS, MAX_LOOP_RENDER_BUDGET, MAX_CONCU
 use crate::loop_downloads::PendingDownloads;
 use crate::render_dispatch::CachedPaneRender;
 
+/// What the swapchain had for us this frame.
+pub(crate) enum SurfaceStatus {
+    /// A texture to draw into.
+    Ready(wgpu::SurfaceTexture),
+    /// Nothing available right now; skip presenting but keep the state.
+    Skip,
+    /// The surface is gone and the whole rendering state must be rebuilt.
+    Lost,
+}
+
+/// Finish this frame's egui pass, then ask the swapchain for somewhere to draw.
+///
+/// It has to be this way round because `Context::end_pass` is the call that pops
+/// egui's viewport stack and hands over the frame's texture deltas. Acquiring
+/// first and bailing out on failure — which is what this code used to do —
+/// leaves the pass open for good: `begin_pass` pushes onto that stack every
+/// frame and nothing ever pops it, so egui stops believing it is on the
+/// outermost viewport and silently drops pending zoom/scale changes from then
+/// on.
+///
+/// Uploading before acquiring matters for a second reason. egui emits each
+/// font-atlas region exactly once — a full allocation, then per-glyph partial
+/// updates — so once a delta has been handed over it is gone. Anything that
+/// takes the deltas and then returns without applying them desyncs egui's
+/// renderer permanently.
+///
+/// # Why `acquire` is handed the finished pass
+///
+/// It does not need it. The `&P` is a token: it makes the finished pass an
+/// *input* to acquisition, so the ordering is enforced by data flow rather than
+/// by statement order.
+///
+/// Returning `(P, SurfaceStatus)` is not enough on its own. It forces this
+/// function to call `finish_pass`, but it says nothing about a caller that
+/// acquires a surface on its own before calling this at all — which is exactly
+/// the bug being fixed, and it re-compiles clean under the weaker signature.
+/// [`super::App::get_surface_texture`] therefore takes a `&PreparedFrame` it
+/// never reads, so acquiring without having finished the pass is not a mistake
+/// anyone can make quietly: it fails to compile.
+pub(crate) fn finish_then_acquire<P>(
+    finish_pass: impl FnOnce() -> P,
+    acquire: impl FnOnce(&P) -> SurfaceStatus,
+) -> (P, SurfaceStatus) {
+    let prepared = finish_pass();
+    // `acquire` cannot be hoisted above this line: it needs `prepared`.
+    let status = acquire(&prepared);
+    (prepared, status)
+}
+
 impl super::App {
-    /// Create screen descriptor and setup egui frame.
-    /// Returns the screen descriptor and any GUI actions triggered.
+    /// Set up and run the egui UI pass.
     ///
-    /// This calculates the proper scaling factors accounting for:
-    /// - OS display scaling (window.scale_factor())
+    /// Returns the surface size in pixels and any GUI actions triggered. Only
+    /// the size is returned: the scale the frame is laid out at is handed to
+    /// egui here and read back off the context when the pass ends, so there is
+    /// no second copy of it to drift.
+    ///
+    /// The scale handed to egui accounts for:
     /// - Application scale factor (state.scale_factor)
-    pub(super) fn setup_egui_frame(&mut self) -> (ScreenDescriptor, Vec<GuiAction>) {
-        // Build screen descriptor, apply theme, and run the egui UI pass.
+    /// - Surface-to-window ratio (matters on web, where the canvas backing
+    ///   store can differ from the CSS size)
+    ///
+    /// OS display scaling is *not* included: egui-winit puts it on the raw input
+    /// and egui applies it itself.
+    pub(super) fn setup_egui_frame(&mut self) -> ([u32; 2], Vec<GuiAction>) {
+        // Apply theme and run the egui UI pass.
         // Scoped so `state` is dropped before we call &mut self methods below.
-        let (screen_descriptor, gui_action) = {
+        let (size_in_pixels, gui_action) = {
             let state = self.state.as_mut().unwrap();
             let window = self.window.as_ref().unwrap();
 
-            // Calculate screen descriptor
             let window_size = window.inner_size();
             let css_to_canvas_scale_x =
                 state.surface_config.width as f32 / window_size.width.max(1) as f32;
-            let pixels_per_point =
-                window.scale_factor() as f32 * state.scale_factor * css_to_canvas_scale_x;
+            // The application's own scaling only. `window.scale_factor()` is
+            // deliberately not folded in: egui already has it from the raw input
+            // and multiplies it back on, using the value for the pass being
+            // started rather than the one it happened to hold beforehand.
+            let zoom_factor = state.scale_factor * css_to_canvas_scale_x;
 
-            let screen_descriptor = ScreenDescriptor {
-                size_in_pixels: [state.surface_config.width, state.surface_config.height],
-                pixels_per_point,
-            };
+            let size_in_pixels = [state.surface_config.width, state.surface_config.height];
 
             // Start egui frame
-            state.egui_renderer.begin_frame(window);
+            state.egui_renderer.begin_frame(window, zoom_factor);
 
             // Set theme based on OS preference
             let use_dark_theme = match window.theme() {
@@ -54,7 +110,7 @@ impl super::App {
 
             let gui_action = self.gui.ui(state.egui_renderer.context());
 
-            (screen_descriptor, gui_action)
+            (size_in_pixels, gui_action)
         };
 
         // Clean up old textures from previous frame
@@ -75,7 +131,7 @@ impl super::App {
         self.dispatch_loop_renders();
         self.update_loop_readiness();
 
-        (screen_descriptor, gui_action)
+        (size_in_pixels, gui_action)
     }
 
     /// Poll for completed background render results and upload textures.
@@ -498,68 +554,94 @@ impl super::App {
     }
 
     /// Try to acquire the next surface texture for rendering.
-    /// Returns `None` if the surface is temporarily unavailable (e.g. during
-    /// a display change).  Returns `Err(true)` via the second element when
-    /// the surface is *lost* and the caller must recreate rendering state.
-    fn get_surface_texture(surface: &wgpu::Surface) -> (Option<wgpu::SurfaceTexture>, bool) {
+    ///
+    /// `_finished` is never read. It is required so that acquiring a surface is
+    /// impossible without already holding this frame's finished egui pass —
+    /// see [`finish_then_acquire`], whose ordering this is half of. Dropping the
+    /// parameter would make the pre-fix bug (acquire first, return early, leave
+    /// the pass open) compile cleanly again.
+    fn get_surface_texture(
+        surface: &wgpu::Surface,
+        _finished: &crate::egui_renderer::PreparedFrame,
+    ) -> SurfaceStatus {
         match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => (Some(texture), false),
+            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => SurfaceStatus::Ready(texture),
             wgpu::CurrentSurfaceTexture::Outdated => {
                 log::warn!("wgpu surface outdated, skipping frame");
-                (None, false)
+                SurfaceStatus::Skip
             }
             wgpu::CurrentSurfaceTexture::Lost => {
                 log::warn!("wgpu surface lost (display change?), will recreate state");
-                (None, true)
+                SurfaceStatus::Lost
             }
             _ => {
                 log::error!("Surface error");
-                (None, false)
+                SurfaceStatus::Skip
             }
         }
     }
 
-    pub(super) fn present_frame(&mut self, screen_descriptor: ScreenDescriptor) {
+    pub(super) fn present_frame(&mut self, size_in_pixels: [u32; 2]) {
         let state = self.state.as_mut().unwrap();
         let window = self.window.as_ref().unwrap();
 
-        let (surface_texture, surface_lost) = Self::get_surface_texture(&state.surface);
-        if surface_lost {
-            // Surface is irrecoverably lost (e.g. display changed on a foldable).
-            // Drop the entire rendering state so the next handle_redraw() lazily
-            // recreates it with a fresh surface.  Keep cached_render so the radar
-            // image can be restored instantly.
-            self.old_textures.clear();
-            self.render.clear_last_rendered();
-            self.gui.clear_graphics_state();
-            self.state = None;
-            return;
-        }
-        let Some(surface_texture) = surface_texture else {
-            return;
+        let mut encoder = state
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        // Finish egui's pass and upload its textures, THEN ask for a surface.
+        // The order is enforced by data flow, not by the order of these lines:
+        // acquisition takes the finished pass as an argument. See the helper.
+        let (frame, status) = finish_then_acquire(
+            || {
+                state.egui_renderer.end_pass_and_upload(
+                    &state.device,
+                    &state.queue,
+                    &mut encoder,
+                    window,
+                    size_in_pixels,
+                )
+            },
+            |finished| Self::get_surface_texture(&state.surface, finished),
+        );
+
+        let surface_texture = match status {
+            SurfaceStatus::Ready(texture) => texture,
+            SurfaceStatus::Skip | SurfaceStatus::Lost => {
+                // Nothing to draw into, but the uploads recorded above still have
+                // to land: egui already handed over these deltas and will never
+                // re-send them. Submitting the encoder flushes them, and the
+                // retired textures are safe to free because nothing painted with
+                // them this frame.
+                state.queue.submit(Some(encoder.finish()));
+                state
+                    .egui_renderer
+                    .free_textures(frame.textures_to_free());
+
+                if matches!(status, SurfaceStatus::Lost) {
+                    // Surface is irrecoverably lost (e.g. display changed on a
+                    // foldable). Drop the entire rendering state so the next
+                    // handle_redraw() lazily recreates it with a fresh surface.
+                    // Keep cached_render so the radar image can be restored
+                    // instantly.
+                    self.old_textures.clear();
+                    self.render.clear_last_rendered();
+                    self.gui.clear_graphics_state();
+                    self.state = None;
+                }
+                return;
+            }
         };
 
         let surface_view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = state
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-
-        // Render egui
-        let textures_to_free = state.egui_renderer.end_frame_and_draw(
-            &state.device,
-            &state.queue,
-            &mut encoder,
-            window,
-            &surface_view,
-            screen_descriptor,
-        );
+        state.egui_renderer.draw(&mut encoder, &surface_view, &frame);
 
         state.queue.submit(Some(encoder.finish()));
-        state.egui_renderer.free_textures(&textures_to_free);
+        state.egui_renderer.free_textures(frame.textures_to_free());
         surface_texture.present();
     }
 
@@ -2004,5 +2086,89 @@ mod loop_dispatch_tests {
         assert_eq!(params.product, RadarProduct::Reflectivity);
         assert_eq!(params.lat, 35.0);
         assert_eq!(params.lon, -97.0);
+    }
+}
+
+#[cfg(test)]
+mod frame_order_tests {
+    use super::{SurfaceStatus, finish_then_acquire};
+
+    /// Drive one frame whose surface acquisition fails.
+    ///
+    /// `status` ignores the finished pass it is handed; production uses that
+    /// argument to make acquiring without one a compile error.
+    fn skipped_frame(ctx: &egui::Context, status: fn(&egui::FullOutput) -> SurfaceStatus) {
+        ctx.begin_pass(egui::RawInput::default());
+        let (_finished, _status) = finish_then_acquire(|| ctx.end_pass(), status);
+    }
+
+    /// A frame that cannot acquire a surface must still end egui's pass.
+    ///
+    /// `cumulative_pass_nr` is incremented by `Context::end_pass` and by nothing
+    /// else, so it counts passes that actually completed. That is what tells
+    /// "the pass ended and then the frame was abandoned" apart from "the frame
+    /// was abandoned with the pass still open" — and only the second one leaks.
+    #[test]
+    fn a_lost_surface_still_ends_the_egui_pass() {
+        let ctx = egui::Context::default();
+
+        ctx.begin_pass(egui::RawInput::default());
+        assert_eq!(ctx.cumulative_pass_nr(), 0, "pass is open, not yet ended");
+
+        let (_finished, status) =
+            finish_then_acquire(|| ctx.end_pass(), |_| SurfaceStatus::Lost);
+
+        assert!(matches!(status, SurfaceStatus::Lost));
+        assert_eq!(
+            ctx.cumulative_pass_nr(),
+            1,
+            "the pass must be ended even though the surface was lost"
+        );
+    }
+
+    /// Repeated surface failures must not accumulate open passes.
+    #[test]
+    fn every_skipped_frame_completes_its_pass() {
+        let ctx = egui::Context::default();
+        const FRAMES: u64 = 5;
+
+        for _ in 0..FRAMES {
+            skipped_frame(&ctx, |_| SurfaceStatus::Skip);
+        }
+
+        assert_eq!(
+            ctx.cumulative_pass_nr(),
+            FRAMES,
+            "each skipped frame should have completed exactly one pass"
+        );
+    }
+
+    /// The user-visible half of the leak.
+    ///
+    /// egui only consumes a pending zoom/scale change when it believes it is on
+    /// the outermost viewport, and it stops believing that the moment one pass
+    /// is left open — `begin_pass` pushes onto the viewport stack and only
+    /// `end_pass` pops it. So a window moved to a different-DPI monitor after
+    /// any skipped frame would never rescale again.
+    ///
+    /// This asserts on a value the production path actually reads back:
+    /// `end_pass_and_upload` tessellates at `ctx.pixels_per_point()`.
+    #[test]
+    fn scale_changes_still_apply_after_frames_the_surface_refused() {
+        let ctx = egui::Context::default();
+
+        for _ in 0..3 {
+            skipped_frame(&ctx, |_| SurfaceStatus::Skip);
+        }
+
+        ctx.set_pixels_per_point(2.0);
+        ctx.begin_pass(egui::RawInput::default());
+        let applied = ctx.pixels_per_point();
+        let _ = ctx.end_pass();
+
+        assert_eq!(
+            applied, 2.0,
+            "a scale set after skipped frames must still reach the next pass"
+        );
     }
 }

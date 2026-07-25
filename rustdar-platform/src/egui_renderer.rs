@@ -13,6 +13,26 @@ pub struct EguiRenderer {
     applied_visuals_dark: Option<bool>,
 }
 
+/// An egui pass that has been ended, tessellated and uploaded.
+///
+/// Holding one is proof that [`EguiRenderer::end_pass_and_upload`] already ran,
+/// which is the ordering guarantee the frame path depends on.
+pub struct PreparedFrame {
+    tris: Vec<egui::ClippedPrimitive>,
+    /// The descriptor this geometry was built for. Carried with the geometry so
+    /// the draw cannot be clipped at a different scale than it was laid out at.
+    screen_descriptor: ScreenDescriptor,
+    /// Textures egui retired this frame.
+    textures_to_free: Vec<egui::TextureId>,
+}
+
+impl PreparedFrame {
+    /// Textures egui retired this frame, to be freed once the GPU is done.
+    pub fn textures_to_free(&self) -> &[egui::TextureId] {
+        &self.textures_to_free
+    }
+}
+
 impl EguiRenderer {
     pub fn context(&self) -> &Context {
         self.state.egui_ctx()
@@ -60,38 +80,72 @@ impl EguiRenderer {
         response.repaint
     }
 
-    fn set_pixels_per_point(&mut self, v: f32) {
-        self.context().set_pixels_per_point(v);
-    }
-
-    pub fn begin_frame(&mut self, window: &Window) {
+    /// Start an egui pass.
+    ///
+    /// Applied *before* `begin_pass`, not after. egui consumes a pending zoom
+    /// change at the start of a pass, so setting it afterwards — as this used to
+    /// — would not take effect until the next frame, leaving that frame's
+    /// geometry a scale behind. Setting it here makes
+    /// `Context::pixels_per_point()` authoritative for the pass that follows,
+    /// which is what the tessellation and the screen descriptor are both taken
+    /// from.
+    ///
+    /// `zoom_factor` is the application's own scaling only — it deliberately
+    /// excludes the window's DPI. egui multiplies it by the native
+    /// pixels-per-point carried on the raw input, which egui-winit keeps in step
+    /// with the window. Passing a finished pixels_per_point instead would make
+    /// egui divide it back out by the native scale it *currently* holds, and on
+    /// the one frame a monitor's DPI changes that is still the old value, so the
+    /// result overshoots by the ratio of the two before self-correcting the
+    /// frame after.
+    pub fn begin_frame(&mut self, window: &Window, zoom_factor: f32) {
+        self.context().set_zoom_factor(zoom_factor);
         let raw_input = self.state.take_egui_input(window);
         self.state.egui_ctx().begin_pass(raw_input);
     }
 
-    pub fn end_frame_and_draw(
+    /// End the egui pass, tessellate it, and upload everything the GPU needs.
+    ///
+    /// **This must run before the swapchain is touched, and unconditionally.**
+    /// `Context::end_pass` is what pops egui's viewport stack and hands over the
+    /// frame's texture deltas — including font-atlas growth, which egui emits
+    /// exactly once per region. A frame that returns early because the surface
+    /// could not be acquired leaves the pass open (every later frame then nests
+    /// one level deeper, and egui stops applying zoom changes because it no
+    /// longer believes it is on the outermost viewport) and strands those
+    /// uploads.
+    ///
+    /// Only queue writes happen here, so none of it depends on having a render
+    /// target. See `app::render::finish_then_acquire` for the ordering.
+    pub fn end_pass_and_upload(
         &mut self,
         device: &Device,
         queue: &Queue,
         encoder: &mut CommandEncoder,
         window: &Window,
-        window_surface_view: &TextureView,
-        screen_descriptor: ScreenDescriptor,
-    ) -> Vec<egui::TextureId> {
-        self.set_pixels_per_point(screen_descriptor.pixels_per_point);
-
+        size_in_pixels: [u32; 2],
+    ) -> PreparedFrame {
         let full_output = self.state.egui_ctx().end_pass();
 
         // Handle platform output more carefully to avoid animation loops
-        let platform_output = full_output.platform_output;
+        self.state
+            .handle_platform_output(window, full_output.platform_output);
 
-        self.state.handle_platform_output(window, platform_output);
+        // Taken from the context rather than from a cached scale factor so the
+        // geometry and the descriptor that clips it cannot disagree: this is the
+        // value the pass was actually laid out at.
+        let pixels_per_point = self.state.egui_ctx().pixels_per_point();
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels,
+            pixels_per_point,
+        };
 
         // Always render - the change detection was causing panels to blink
         let tris = self
             .state
             .egui_ctx()
-            .tessellate(full_output.shapes, self.state.egui_ctx().pixels_per_point());
+            .tessellate(full_output.shapes, pixels_per_point);
+
         for (id, image_delta) in &full_output.textures_delta.set {
             self.renderer
                 .update_texture(device, queue, *id, image_delta);
@@ -99,9 +153,20 @@ impl EguiRenderer {
         self.renderer
             .update_buffers(device, queue, encoder, &tris, &screen_descriptor);
 
+        PreparedFrame {
+            tris,
+            screen_descriptor,
+            // Freed by the caller AFTER queue.submit(), to avoid destroying GPU
+            // resources still referenced by the recorded render pass.
+            textures_to_free: full_output.textures_delta.free,
+        }
+    }
+
+    /// Record the render pass for an already-prepared frame.
+    pub fn draw(&mut self, encoder: &mut CommandEncoder, view: &TextureView, frame: &PreparedFrame) {
         let rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: window_surface_view,
+                view,
                 resolve_target: None,
                 ops: egui_wgpu::wgpu::Operations {
                     load: egui_wgpu::wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -116,13 +181,11 @@ impl EguiRenderer {
             multiview_mask: None,
         });
 
-        self.renderer
-            .render(&mut rpass.forget_lifetime(), &tris, &screen_descriptor);
-
-        // Return textures to free — caller must free AFTER queue.submit()
-        // to avoid destroying GPU resources still referenced by the
-        // recorded render pass.
-        full_output.textures_delta.free
+        self.renderer.render(
+            &mut rpass.forget_lifetime(),
+            &frame.tris,
+            &frame.screen_descriptor,
+        );
     }
 
     /// Free textures that are no longer needed.  Call after `queue.submit()`.
