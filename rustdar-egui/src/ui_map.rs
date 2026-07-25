@@ -1,4 +1,5 @@
 use crate::actions::GuiAction;
+use crate::ui_input::MapPointerFrame;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::types::{EARTH_RADIUS_KM, RadarProduct, IMAGE_SIZE};
 use rustdar_units::UserPreferences;
@@ -100,65 +101,32 @@ impl super::Gui {
                     // of the pane fields used in the render closure.
                     let mut map_memory = std::mem::take(&mut pane.map_memory);
 
-                    // On Android, process double-tap-drag zoom only for the active pane
-                    #[cfg(target_os = "android")]
-                    if is_active {
-                        self.mobile.double_tap_detector.update(&ctx, &mut map_memory, pane_rect);
-                    }
-
-                    #[cfg(target_os = "android")]
-                    let is_zoom_dragging = if is_active {
-                        self.mobile.double_tap_detector.is_zooming()
-                    } else {
-                        false
-                    };
-                    #[cfg(not(target_os = "android"))]
-                    let is_zoom_dragging = false;
-
-                    // On Android, detect long-press for radar value tooltip
-                    #[cfg(target_os = "android")]
-                    let long_press_pos = if is_active && !is_zoom_dragging {
-                        self.mobile.long_press_detector.update(&ctx)
-                    } else {
-                        None
-                    };
-
-                    // Compute overlay click position per-platform:
-                    // - Desktop: use egui's built-in click detection (instant)
-                    // - Android: use deferred single-tap from DoubleTapDragDetector
-                    //   (waits for double-tap timeout to avoid false popups)
-                    #[cfg(target_os = "android")]
-                    let overlay_click_pos = if is_active {
-                        self.mobile.double_tap_detector.take_confirmed_tap()
-                    } else {
-                        None
-                    };
-                    #[cfg(not(target_os = "android"))]
-                    let overlay_click_pos = ctx.input(|i| {
-                        if i.pointer.any_click() {
-                            i.pointer.interact_pos()
-                        } else {
-                            None
-                        }
-                    });
-
-                    // Pre-filter: discard clicks that land on a floating dialog or popup
-                    // window. This is the canonical dialog-blocking gate for map
-                    // interactions. All handlers that receive overlay_click_pos from
-                    // PaneRenderCtx automatically inherit this protection.
+                    // Resolve this pane's pointer state for the frame:
+                    // - Desktop: egui's built-in click detection (instant)
+                    // - Android: the touch gesture pipeline for the active pane
+                    //   (deferred single-tap so double-tap-to-zoom doesn't open
+                    //   popups, plus zoom-drag and long-press)
+                    //
+                    // Both paths run the click position through the canonical
+                    // dialog-blocking gate (`ui_input::filter_dialog_blocked`),
+                    // which discards clicks landing on a floating dialog or
+                    // popup window. All handlers that receive overlay_click_pos
+                    // from PaneRenderCtx automatically inherit this protection.
                     //
                     // CONVENTION: New map click handlers MUST use overlay_click_pos from
                     // PaneRenderCtx — never read raw click events via ctx.input() for
                     // map-level interactions, as that bypasses dialog blocking.
-                    let overlay_click_pos = overlay_click_pos.filter(|&pos| {
-                        !ctx.layer_id_at(pos)
-                            .is_some_and(|l| l.order > egui::Order::Background)
-                    });
-
                     #[cfg(target_os = "android")]
-                    let suppress_pan = is_zoom_dragging || long_press_pos.is_some();
+                    let pointer = if is_active {
+                        self.mobile.gestures.update(&ctx, &mut map_memory, pane_rect)
+                    } else {
+                        MapPointerFrame::inactive()
+                    };
                     #[cfg(not(target_os = "android"))]
-                    let suppress_pan = is_zoom_dragging;
+                    let pointer = MapPointerFrame::from_mouse(&ctx);
+
+                    let overlay_click_pos = pointer.overlay_click_pos;
+                    let suppress_pan = pointer.suppress_pan;
 
                     // Create a child UI constrained to this pane's rect
                     let mut child_ui = ui.new_child(
@@ -194,7 +162,7 @@ impl super::Gui {
                                 pointer_available,
                                 excluded_rects: excluded_rects.clone(),
                                 #[cfg(target_os = "android")]
-                                long_press_pos,
+                                long_press_pos: pointer.long_press_pos,
                                 overlay_click_pos,
                                 preferences: &self.preferences,
                             };

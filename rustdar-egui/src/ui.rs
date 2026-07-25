@@ -28,25 +28,16 @@ mod map;
 mod settings;
 
 #[cfg(target_os = "android")]
-use mobile::{DoubleTapDragDetector, LongPressDetector};
+use crate::ui_input::TouchGestures;
 
 /// Android-only UI state: slide-out menu visibility and gesture detection.
 #[cfg(target_os = "android")]
+#[derive(Default)]
 pub(super) struct MobileState {
     pub show_menu: bool,
-    pub double_tap_detector: DoubleTapDragDetector,
-    pub long_press_detector: LongPressDetector,
-}
-
-#[cfg(target_os = "android")]
-impl Default for MobileState {
-    fn default() -> Self {
-        Self {
-            show_menu: false,
-            double_tap_detector: DoubleTapDragDetector::default(),
-            long_press_detector: LongPressDetector::default(),
-        }
-    }
+    /// Touch gesture detectors (double-tap-drag zoom, long press).
+    /// Platform-independent — see [`crate::ui_input`].
+    pub gestures: TouchGestures,
 }
 
 /// Radar fetch lifecycle state.

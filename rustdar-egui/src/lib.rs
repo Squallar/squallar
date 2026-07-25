@@ -4,5 +4,6 @@ pub mod pane;
 pub(crate) mod point_painter;
 pub mod tiles;
 mod ui;
+pub(crate) mod ui_input;
 
 pub use ui::Gui;
