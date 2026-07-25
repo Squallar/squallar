@@ -71,6 +71,23 @@ fn nomads_url_raw(
     )
 }
 
+/// URLs for each component of a composite parameter, in merge order.
+///
+/// Split out from the fetch loop so the forecast hour reaching the wire is
+/// testable without a network round trip — the single-field path had that
+/// covered and this one did not.
+fn composite_urls(
+    param: &ModelParameter,
+    parts: &[(&str, &str)],
+    run_hour: u8,
+    date: NaiveDate,
+) -> Vec<String> {
+    parts
+        .iter()
+        .map(|(var, lev)| nomads_url_raw(var, lev, run_hour, date, param.forecast_hour()))
+        .collect()
+}
+
 /// Determine the most recent HRRR run hour that should be available.
 ///
 /// HRRR data typically appears on NOMADS ~45-90 min after the run time.
@@ -300,9 +317,9 @@ async fn try_fetch_composite(
     hour: u8,
 ) -> Result<HrrrGridData, String> {
     let mut grids: Vec<HrrrGridData> = Vec::with_capacity(parts.len());
+    let urls = composite_urls(param, parts, hour, date);
 
-    for (var, lev) in parts {
-        let url = nomads_url_raw(var, lev, hour, date, param.forecast_hour());
+    for ((var, lev), url) in parts.iter().zip(urls) {
         log::info!("Fetching HRRR composite component {var} {lev} from {url}");
 
         let response = client
@@ -549,17 +566,39 @@ mod tests {
         assert!(url.contains("lev_5000-2000_m_above_ground=on"), "{url}");
     }
 
-    /// Composite components are fetched through a separate URL builder, which
-    /// must apply the same forecast hour rather than defaulting to f00.
+    /// Composite components go through a separate URL builder, which must
+    /// take its forecast hour from the parameter rather than assuming f00.
+    ///
+    /// The only composite today is bulk shear, which *is* f00 — so asserting
+    /// on it alone cannot distinguish "derived from the parameter" from
+    /// "hardcoded to zero". The builder is generic over the parameter, so it
+    /// is exercised here with a windowed one too: the day a windowed
+    /// composite is added, this fails instead of silently fetching f00.
     #[test]
-    fn composite_components_share_the_parameters_forecast_hour() {
-        let param = ModelParameter::BulkShear6km;
+    fn composite_urls_derive_the_forecast_hour_from_the_parameter() {
         let date = NaiveDate::from_ymd_opt(2026, 7, 25).unwrap();
-        for (var, lev) in param.composite_parts().unwrap() {
-            let url = nomads_url_raw(var, lev, 3, date, param.forecast_hour());
+
+        let shear = ModelParameter::BulkShear6km;
+        let parts = shear.composite_parts().unwrap();
+        let urls = composite_urls(&shear, &parts, 3, date);
+        assert_eq!(urls.len(), parts.len());
+        for ((var, _), url) in parts.iter().zip(&urls) {
             assert!(url.contains("wrfsfcf00.grib2"), "{url}");
             assert!(url.contains(&format!("{var}=on")), "{url}");
         }
+
+        let windowed = ModelParameter::MaxUH2to5km;
+        let urls = composite_urls(
+            &windowed,
+            &[("var_MXUPHL", "lev_5000-2000_m_above_ground")],
+            3,
+            date,
+        );
+        assert!(
+            urls[0].contains("wrfsfcf01.grib2"),
+            "composite URLs must follow the parameter's forecast hour: {}",
+            urls[0],
+        );
     }
 
     /// Live end-to-end check against NOMADS. Ignored by default so CI stays
