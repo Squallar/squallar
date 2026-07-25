@@ -8,6 +8,7 @@
   ],
   "packageRules": [
     {
+      "description": "The UI stack moves as a unit. walkers pins an exact egui minor, and egui-wgpu pins a wgpu major, so a PR that carries only one of these five is a PR that cannot be correct. Keep this list in step with the '-- UI stack (bump as a unit) --' block in the workspace Cargo.toml.",
       "groupName": "egui",
       "matchDatasources": [
         "crate"
@@ -15,8 +16,20 @@
       "matchPackageNames": [
         "egui",
         "egui-winit",
-        "egui-wgpu"
+        "egui-wgpu",
+        "walkers",
+        "wgpu"
       ]
+    },
+    {
+      "description": "Hard ceiling on wgpu, because grouping alone does not stop this: when only wgpu has a new major, the group PR still bumps wgpu alone. egui-wgpu 0.35 requires wgpu ^29, so a lone wgpu 30 does not upgrade anything -- cargo resolves a SECOND wgpu beside egui-wgpu's, nothing in the workspace references it (every wgpu path goes through egui_wgpu::wgpu), native stays green, and on wasm32 both copies compile their vendored WebGPU bindings until wasm-bindgen aborts with 'duplicate string enums: GpuFilterMode'. That is exactly what 031bb4b did and CI did not catch it. Raise this ceiling only when egui-wgpu itself accepts the newer wgpu, and raise it in the same PR as the egui group.",
+      "matchDatasources": [
+        "crate"
+      ],
+      "matchPackageNames": [
+        "wgpu"
+      ],
+      "allowedVersions": "<30"
     }
   ]
 }

@@ -55,6 +55,54 @@ fn instance_descriptor() -> wgpu::InstanceDescriptor {
     }
 }
 
+/// Check at compile time that the manifest's backend selection survived.
+///
+/// `Instance::enabled_backend_features` is a `const fn` over wgpu's own cfg
+/// aliases, so this is the real compiled-in set, not a restatement of it.
+/// Deliberately written `::wgpu::` rather than the `egui_wgpu::wgpu` re-export
+/// imported above: this is the one place that names the *direct* dependency.
+///
+/// Two failures it turns into build errors.
+///
+/// **The `wgpu` entry in `Cargo.toml` going away.** It carries this crate's
+/// entire per-target backend selection and nothing imports it — every `wgpu::`
+/// path here comes through `egui_wgpu::wgpu`, which is what keeps a single wgpu
+/// in the graph. That makes the entry look dead to `cargo machete`, to
+/// `cargo udeps`, and to anyone tidying the manifest. Deleting it still
+/// compiles: wgpu falls back to the `std` + `wgsl` egui-wgpu asks for, with no
+/// backend at all, and the app dies at `request_adapter` instead. Naming the
+/// crate here also makes the dependency genuinely used, so those tools stop
+/// reporting it.
+///
+/// **`webgpu` coming back.** Features are additive across the graph, so any
+/// dependency that turns on `wgpu/default` re-enables it regardless of what this
+/// crate asks for — which is how the duplicate-bindings failure got in. A build
+/// that has drifted back onto WebGPU now says so here rather than in a browser.
+const _: () = {
+    let enabled = ::wgpu::Instance::enabled_backend_features();
+
+    assert!(
+        !enabled.contains(::wgpu::Backends::BROWSER_WEBGPU),
+        "wgpu's `webgpu` feature is enabled. This build targets WebGL2 because \
+         Firefox has no stable WebGPU; something re-enabled `wgpu/default`."
+    );
+
+    #[cfg(target_arch = "wasm32")]
+    assert!(
+        enabled.contains(::wgpu::Backends::GL),
+        "no WebGL2 backend compiled in — wgpu's `webgl` feature is off. Note \
+         that `gles` does not cover the browser. See the wasm32 target section \
+         of this crate's Cargo.toml."
+    );
+
+    #[cfg(not(target_arch = "wasm32"))]
+    assert!(
+        !enabled.is_empty(),
+        "no native wgpu backend compiled in. See the per-target wgpu feature \
+         sections of this crate's Cargo.toml."
+    );
+};
+
 /// Request a redraw if a window handle is available.
 /// Used by async tasks and event handlers that hold an `Option<WindowRef>`.
 pub(crate) fn notify_redraw(window: &Option<WindowRef>) {
