@@ -362,3 +362,25 @@ fn unallocated_metadata_datasets_do_not_break_a_granule_parse() {
     .expect("granule must parse despite unreadable metadata containers");
     assert!(parsed.level_failures.is_empty(), "no level should have failed");
 }
+
+/// Generator for the frozen fingerprints in [`super::tests`].
+///
+/// Run with `--ignored --nocapture` while `netcdf` is still in the tree; the
+/// numbers it prints are produced by the **C library**, not by the reader they
+/// will be used to check. That is the whole point of capturing them here.
+#[test]
+#[ignore]
+fn print_golden_fingerprints_from_netcdf() {
+    let bytes = fixture_bytes();
+    let nc = netcdf::open_mem(None, &bytes).expect("netcdf open_mem");
+    for name in OVERLAY_VARS {
+        let v = cf::unpack(&nc_raw_var(&nc, name).unwrap(), name);
+        let missing = v.values.iter().filter(|x| x.is_none()).count();
+        println!(
+            "    (\"{name}\", {}, {missing}, {:#018x}, {:?}),",
+            v.values.len(),
+            super::tests::fingerprint(&v.values),
+            v.units.as_deref().unwrap_or("")
+        );
+    }
+}

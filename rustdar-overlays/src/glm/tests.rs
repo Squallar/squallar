@@ -1105,3 +1105,132 @@ fn all_requested_levels_are_returned_together() {
     assert_eq!(all.iter().filter(|f| f.level == GlmDataLevel::Event).count(), 2);
     assert_eq!(all.iter().filter(|f| f.level == GlmDataLevel::Flash).count(), 2);
 }
+
+// ---------------------------------------------------------------------------
+// Real-granule regression, pinned to values the netCDF-C library produced.
+// ---------------------------------------------------------------------------
+
+/// A real GOES-19 GLM L2 LCFA granule: 148 flashes, 2172 groups, 5941 events,
+/// with the `_Unsigned` packed shorts and the multi-chunk `group_lat` the
+/// synthetic fixtures above cannot reproduce.
+const REAL_GRANULE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../rustdar-hdf5/testdata/",
+    "OR_GLM-L2-LCFA_G19_s20251801200000_e20251801200200_c20251801200212.nc"
+);
+
+/// FNV-1a over the IEEE bits of every unpacked value, with `None` distinct from
+/// any real number. Exact rather than tolerance-based: the data is unfiltered,
+/// so any difference at all is a difference, and a single flipped element in
+/// 5941 must not be able to hide behind an average.
+pub(super) fn fingerprint(values: &[Option<f64>]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for x in values {
+        for b in x.map_or(u64::MAX, f64::to_bits).to_le_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// `(variable, element count, missing count, fingerprint, units)`.
+///
+/// **These numbers were produced by the netCDF-C library**, not by the reader
+/// they check — captured by `difftests::print_golden_fingerprints_from_netcdf`
+/// while `netcdf` was still a dependency, and left behind as the permanent
+/// record of that comparison once the C oracle was removed. Regenerating them
+/// with the pure-Rust reader would make this test assert only that the code
+/// agrees with itself.
+/// Note the zero in every "missing" column: this granule happens to carry no
+/// `_FillValue` or out-of-range elements, so it does **not** exercise the
+/// masking rules. Those are covered against synthetic fixtures in
+/// `cf::tests`; do not read this table as evidence for them.
+const GOLDEN: &[(&str, usize, usize, u64, &str)] = &[
+    ("flash_lat", 148, 0, 0x25a7_2e49_ab40_a2c5, "degrees_north"),
+    ("flash_lon", 148, 0, 0x737b_cf67_3941_900c, "degrees_east"),
+    ("flash_energy", 148, 0, 0x2fa3_3f88_6b0b_4f99, "J"),
+    ("flash_area", 148, 0, 0x29ae_d20c_3e8c_a70c, "m2"),
+    (
+        "flash_time_offset_of_first_event",
+        148,
+        0,
+        0xe3a2_4c35_ca42_fc51,
+        "seconds since 2025-06-29 12:00:00.000",
+    ),
+    ("group_lat", 2172, 0, 0x4700_9afb_e78e_734d, "degrees_north"),
+    ("group_lon", 2172, 0, 0xbe30_5954_4c37_9d7a, "degrees_east"),
+    ("group_energy", 2172, 0, 0xf92c_7b5c_fa74_c186, "J"),
+    ("group_area", 2172, 0, 0xdd2a_2c57_5ebf_0126, "m2"),
+    (
+        "group_time_offset",
+        2172,
+        0,
+        0xdcd6_8a01_211c_8742,
+        "seconds since 2025-06-29 12:00:00.000",
+    ),
+    ("event_lat", 5941, 0, 0xdea7_1db9_6c3a_6b00, "degrees_north"),
+    ("event_lon", 5941, 0, 0xf8c6_994a_9ef8_5382, "degrees_east"),
+    ("event_energy", 5941, 0, 0x5e1d_5d72_11d7_dbac, "J"),
+    (
+        "event_time_offset",
+        5941,
+        0,
+        0x5a7c_cef6_029a_8be2,
+        "seconds since 2025-06-29 12:00:00.000",
+    ),
+];
+
+/// The migration's permanent gate: the pure-Rust reader must still reproduce,
+/// exactly, what the C library produced on a real granule.
+#[test]
+fn real_granule_unpacks_to_the_values_the_c_netcdf_library_produced() {
+    let bytes = std::fs::read(REAL_GRANULE).expect("read the committed GLM granule");
+    let g = super::h5::Granule::open(&bytes).expect("open the granule");
+
+    for (name, len, missing, hash, units) in GOLDEN {
+        let v = g
+            .read_unpacked(name)
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .unwrap_or_else(|| panic!("{name} missing from the granule"));
+        assert_eq!(v.values.len(), *len, "{name}: element count");
+        assert_eq!(
+            v.values.iter().filter(|x| x.is_none()).count(),
+            *missing,
+            "{name}: missing-value count"
+        );
+        assert_eq!(v.units.as_deref().unwrap_or(""), *units, "{name}: units");
+        assert_eq!(
+            fingerprint(&v.values),
+            *hash,
+            "{name}: unpacked values differ from what netCDF-C produced"
+        );
+    }
+}
+
+/// The fingerprints above would still pass if every packed variable had
+/// quietly become a plain float, so pin the storage as well: these must remain
+/// `_Unsigned` 16-bit shorts with a `scale_factor`, or the golden test is
+/// checking a code path the product no longer uses.
+#[test]
+fn the_real_granule_still_exercises_packed_unsigned_shorts() {
+    use super::cf::VarType;
+
+    let bytes = std::fs::read(REAL_GRANULE).expect("read the committed GLM granule");
+    let g = super::h5::Granule::open(&bytes).expect("open the granule");
+
+    for name in ["flash_energy", "flash_area", "event_lat", "event_lon"] {
+        let v = g.raw_var(name).unwrap().unwrap();
+        assert_eq!(v.vartype, VarType::SignedInt(2), "{name} storage");
+        assert!(v.unsigned, "{name} lost _Unsigned");
+        assert!(v.attrs.contains_key("scale_factor"), "{name} lost scale_factor");
+    }
+
+    // And `group_lat` must stay multi-chunk: it is the only variable here whose
+    // chunk *placement* is observable, `flash_lat` being a single chunk at
+    // offset 0.
+    let f = hdf5_pure::File::from_bytes(bytes).unwrap();
+    let ds = f.dataset("group_lat").unwrap();
+    let chunk = ds.chunk_shape().unwrap().expect("group_lat chunk shape");
+    assert!(2172u64.div_ceil(chunk[0]) >= 2, "group_lat is no longer multi-chunk");
+}
