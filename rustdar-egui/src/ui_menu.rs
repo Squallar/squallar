@@ -63,14 +63,11 @@ pub(super) enum MenuEvent {
     Toggled(MenuToggle, bool),
 }
 
-/// One leaf a presentation actually put on screen.
+/// One leaf a presentation actually put on screen: the bool `ui.checkbox` was
+/// really handed, and where the widget landed so a test can click it for real.
 ///
-/// Reported *by the renderer*, not reconstructed by a test from the model, for
-/// the same reason `ChromeOutput::excluded_rects` is an output of the chrome:
-/// a test that rebuilds the value it means to check cannot notice the renderer
-/// being handed a different one. `value` is the bool `ui.checkbox` was really
-/// given, and `rect` is where the widget landed, so a test can click it for
-/// real rather than assert on an intermediate.
+/// Reported by the renderer, not rebuilt by a test from the model — for the
+/// same reason `ChromeOutput::excluded_rects` is an output of the chrome.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct DrawnMenuLeaf {
@@ -172,9 +169,7 @@ fn render_menu_items(ui: &mut egui::Ui, nodes: &[MenuNode], out: &mut MenuFrame,
             } => {
                 let mut current = *value;
                 let response = ui.checkbox(&mut current, *label);
-                // `*value`, not `current`: the state the checkbox was *handed*
-                // is what a test has to see, since a stale one renders
-                // unchecked and then emits `Toggled(.., true)` on every click.
+                // `*value`, not `current`: what the checkbox was *handed*.
                 out.record(label, Some(*value), response.rect);
                 if response.changed() {
                     out.events.push(MenuEvent::Toggled(*toggle, current));
@@ -288,12 +283,9 @@ mod tests {
         }
     }
 
-    /// Everything about `Gui` a menu entry is allowed to move, as one value.
-    ///
-    /// Deliberately coarse: the test below only needs "did dispatching this
-    /// entry change anything at all", and a fingerprint that has to be extended
-    /// for each new kind of effect is the point — a new entry whose effect is
-    /// invisible here is one whose effect is invisible to the user too.
+    /// Everything a menu entry is allowed to move, as one value. Coarse on
+    /// purpose: an entry whose effect is invisible here is one whose effect is
+    /// invisible to the user too.
     fn state_fingerprint(gui: &Gui) -> String {
         let mut overlays: Vec<(String, bool)> = gui
             .active_pane()
@@ -308,16 +300,12 @@ mod tests {
         )
     }
 
-    /// Every command the model offers actually *does* something. An unhandled
-    /// entry is a button that visibly does nothing, which is worse than a
-    /// missing one.
+    /// Every command the model offers actually *does* something.
     ///
-    /// The claim has to be about the effect, not about the arm. `match` on
-    /// [`MenuEvent`] is exhaustive, so an arm necessarily exists for every
-    /// entry and merely calling `apply_menu_event` can only ever catch a panic
-    /// — `MenuAction::Exit => {}` and `RefreshRadar => {}` would both sail
-    /// through. So each entry must either emit a [`GuiAction`] or move
-    /// observable state.
+    /// The claim is about the effect, not the arm: `match` on [`MenuEvent`] is
+    /// exhaustive, so an arm always exists and merely calling
+    /// `apply_menu_event` can only catch a panic — `Exit => {}` sails through.
+    /// Each entry must emit a [`GuiAction`] or move observable state.
     #[test]
     fn every_menu_entry_has_a_dispatcher_arm() {
         let mut gui = Gui::new();

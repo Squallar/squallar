@@ -143,12 +143,9 @@ impl super::Gui {
                     let overlay_click_pos = pointer.overlay_click_pos;
                     let suppress_pan = pointer.suppress_pan;
 
-                    // Recorded from the same locals that feed `PaneRenderCtx`
-                    // and `drag_pan_buttons` below — after the modality gate,
-                    // after `resolve_active`/`resolve_inactive`, after
-                    // `overlay_click_pos` is read out. This is what the tests
-                    // observe; anything they resolved for themselves would be a
-                    // parallel implementation rather than this one.
+                    // From the same locals that feed `PaneRenderCtx` and
+                    // `drag_pan_buttons` below: after the gate, after
+                    // `overlay_click_pos` is read out. See `PanePointerProbe`.
                     #[cfg(test)]
                     self.last_pane_pointers.push(crate::ui_input::PanePointerProbe {
                         pane_idx,
