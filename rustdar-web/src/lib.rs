@@ -48,11 +48,27 @@
 //! | Chromium (headless, SwiftShader) | 23 | 174 ms | 191 ms |
 //! | Firefox (headed on Xvfb, NVIDIA) | 14 | 159 ms | 188 ms |
 //!
-//! Run as 12 interleaved pairs, so each comparison shares a contention window,
-//! the median Firefox/Chromium ratio is **0.88**. Firefox is slightly *faster* —
-//! which is what the isolated harness had already found (233 ms against 261 ms)
-//! and was disbelieved because the assembled app seemed to say otherwise. It
-//! does not. There is no Firefox-specific penalty in this bundle to fix.
+//! Those are two different analyses and should be read as two. The table is
+//! every sample each browser produced, pooled; the *n* differ because Firefox
+//! needs a headed X server and lost runs to a display-allocation race. Pooled
+//! medians across unequal, non-simultaneous samples are only suggestive on a
+//! loaded machine. The controlled comparison is the subset that ran as **12
+//! interleaved pairs**, one browser immediately after the other so both meet the
+//! same contention: there the median Firefox/Chromium ratio is **0.88**.
+//!
+//! Both say the same thing, which is the point of quoting both. Firefox is
+//! slightly *faster* — as the isolated harness had already found (233 ms against
+//! 261 ms) and was disbelieved because the assembled app seemed to contradict
+//! it. It does not. There is no Firefox-specific penalty in this bundle to fix.
+//!
+//! The GPUs are deliberately not matched: Chromium runs headless on SwiftShader,
+//! Firefox headed on the host NVIDIA, because headless Firefox has no WebGL2 at
+//! all here. That asymmetry would wreck a comparison of frame *presentation* and
+//! does not touch this one — `radar-render` is the CPU-side rasterizer, it runs
+//! to a `Vec<u8>` on the main thread with no GPU call in the timed region, and
+//! the GPU only ever sees the finished image. It also cuts the wrong way for the
+//! conclusion: the browser on real hardware would be the flattered one, and it is
+//! the one already winning.
 //!
 //! Two things are needed to get a number that means anything, and the original
 //! measurement had neither.

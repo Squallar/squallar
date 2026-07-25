@@ -112,7 +112,7 @@ egui-winit = { workspace = true, features = ["links"] }
 # threads to be unsound about. Without it the browser build stops compiling.
 wgpu = { workspace = true, features = ["webgl"] }
 egui-wgpu = { workspace = true, features = ["fragile-send-sync-non-atomic-wasm"] }
-# Pinned to what the egui/wgpu stack already resolves (wasm-bindgen 0.2.118).
+# Pinned to what the egui/wgpu stack already resolves (wasm-bindgen 0.2.126).
 # A newer wasm-bindgen-futures wants a newer wasm-bindgen and the resolver
 # rejects the pair outright, so this version moves when that stack moves.
 wasm-bindgen-futures = "=0.4.76"

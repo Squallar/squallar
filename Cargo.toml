@@ -72,9 +72,22 @@ web-time = "=1.1.0"
 # string enum and `wasm-bindgen` aborted with
 # `duplicate string enums: GpuFilterMode`.
 #
+# Turning defaults off on a wgpu *30* entry does clear the duplicate-enum error
+# -- the 30 copy then stops compiling `webgpu_sys` -- so it looks like a fix. It
+# is not one. The graph still carries two wgpus, the bundle still ships the
+# WebGPU surface out of egui-wgpu's copy, and, worst of the three, the backend
+# features on that entry configure **the copy nobody runs**: the app reaches wgpu
+# through `egui_wgpu::wgpu`, which is the 29 copy, so `webgl`/`vulkan`/`dx12` set
+# on a 30 entry are inert. Since egui-wgpu requires `^29`, wgpu 30 can never
+# become the sole copy, and there is no way to control the backend set at all
+# while it is in the graph. Reverting is not the tidier of two fixes; it is the
+# only one that leaves the features reachable.
+#
 # Moving to wgpu 30 means moving egui-wgpu, which means moving egui, which
 # `walkers` pins to an exact minor -- the whole "bump as a unit" note above.
 # Until walkers ships against a newer egui, 29 is the only resolvable choice.
+# `.github/renovate.json` now groups all five and caps wgpu at `<30` so this
+# cannot land as a lone PR again; lift that cap in the same PR that moves egui.
 #
 # Defaults must stay off *at the workspace level* -- the same trap `grib`,
 # `hdf5-pure` and `nexrad-data` carry notes about: cargo silently ignores a
