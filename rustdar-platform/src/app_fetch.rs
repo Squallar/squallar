@@ -688,12 +688,17 @@ impl super::App {
             // One send site for both outcomes, so `snapped` cannot come to differ
             // between them. It describes the render that was dispatched — the sweep
             // `render_params` resolved — and stays true of a response carrying no
-            // image, which is what makes it safe to set outside the match.
+            // image, which is what makes it safe to set outside the match. The same
+            // is true of the coordinates: they are the `lat`/`lon` this render was
+            // just given, so the receiver places the image where it was actually
+            // drawn rather than re-deriving that from its own loop.
             let _ = sender.send(crate::channels::LoopRenderResponse {
                 pane_idx,
                 timestamp,
                 target,
                 snapped,
+                site_lat: lat,
+                site_lon: lon,
                 image,
                 max_range_km,
             });

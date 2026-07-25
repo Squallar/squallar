@@ -666,59 +666,27 @@ impl super::App {
             let Some(pane) = self.gui.pane_mut(origin_pane) else {
                 continue;
             };
-            let ls = &mut pane.loop_state;
 
-            // The coordinates the image was projected around. Read before the frame is
-            // borrowed, and carried to every pane that ends up with this texture — the
-            // target's site is checked on each hand-off, so this describes the image
-            // for all of them rather than being re-guessed per receiver.
-            let lat = ls.site_lat;
-            let lon = ls.site_lon;
-
-            // Drop results the pane is no longer expecting — rendered for a site,
-            // product or elevation it has since retargeted away from, or aimed at a
-            // frame that is not awaiting one. Applying either paints an image the
-            // dispatcher then treats as done, so the frame never corrects itself.
-            //
-            // Resolves the frame in the same pass that vets the result, and hands back
-            // the frame rather than its index so there is nothing here to re-derive.
-            let Some(frame) = ls.frame_awaiting_render_result_mut(rr.timestamp, &rr.target) else {
+            // Vetting the result, retiring a failed render and placing the image are
+            // one step over one resolved frame — see `accept_render_result`. The
+            // texture is uploaded from inside it, so a result this pane has
+            // retargeted away from costs no GPU memory.
+            let counter = &mut self.texture_counter;
+            let Some(texture) =
+                accept_render_result(&mut pane.loop_state, &mut rr, |color_image| {
+                    *counter += 1;
+                    // `color_image` is the only copy of this frame's pixels on this
+                    // thread — the renderer's RGBA buffer was dropped on the worker —
+                    // and it is moved into the texture manager here rather than copied.
+                    ctx.load_texture(
+                        format!("loop_frame_{counter}"),
+                        color_image,
+                        egui::TextureOptions::NEAREST,
+                    )
+                })
+            else {
                 continue;
             };
-            frame.render_in_flight = false;
-
-            // No image means the render failed (no matching sweep). Mark the frame so
-            // the dispatcher stops retrying it and readiness stops waiting on it.
-            //
-            // `take`n rather than moved out of `rr`: the sibling broadcast below hands
-            // the *whole response* to `broadcast_sweep`, and that is deliberate — the
-            // receiver's half of the sweep comparison must be resolved from the
-            // receiver's own scan, never filled in from a loose `f32` at the call site.
-            // Partially moving `rr` here would make `&rr` unavailable there and invite
-            // exactly that inlining.
-            let Some(color_image) = rr.image.take() else {
-                frame.render_failed = true;
-                continue;
-            };
-
-            self.texture_counter += 1;
-            let texture_name = format!("loop_frame_{}", self.texture_counter);
-            // `color_image` is the only copy of this frame's pixels on this thread —
-            // the renderer's RGBA buffer was dropped on the worker — and it is moved
-            // into the texture manager here rather than copied.
-            let texture = ctx.load_texture(
-                texture_name,
-                color_image,
-                egui::TextureOptions::NEAREST,
-            );
-
-            frame.texture = Some(rustdar_egui::pane::RadarImageData {
-                texture: texture.clone(),
-                lat,
-                lon,
-                max_range_km: rr.max_range_km,
-                value_data: Arc::new(Vec::new()),
-            });
 
             // Broadcast to sibling panes with matching product+elevation+timestamp
             if self.gui.is_sync_layers() {
@@ -757,17 +725,11 @@ impl super::App {
                     // redundant: same target and timestamp means the same image, so its
                     // result is simply dropped when it arrives.
                     sframe.render_in_flight = false;
-                    sframe.texture = Some(rustdar_egui::pane::RadarImageData {
-                        texture: texture.clone(),
-                        // The origin's coordinates — the ones this image was actually
-                        // projected around. Equal to the receiver's, since the target
-                        // match above pins both loops to the same site; stating the
-                        // provenance keeps that a consequence rather than a coincidence.
-                        lat,
-                        lon,
-                        max_range_km: rr.max_range_km,
-                        value_data: Arc::new(Vec::new()),
-                    });
+                    // The same response the origin frame was filled from, so every
+                    // pane holding this texture agrees about what it depicts and
+                    // where it sits. The receiver's own `site_lat`/`site_lon` are
+                    // never consulted here — see `LoopRenderResponse::site_lat`.
+                    sframe.texture = Some(rendered_image(&rr, &texture));
                 }
             }
         }
@@ -1130,6 +1092,67 @@ fn accept_scan_listing(
     Some(PendingDownloads { site: site.to_string(), queue: VecDeque::from(scans) })
 }
 
+/// The frame image a finished loop render describes.
+///
+/// Every field comes off the response. The coordinates in particular are the ones
+/// the renderer was handed, so this describes the image for whoever ends up holding
+/// it — the pane that asked for it and every sibling the broadcast hands it to —
+/// rather than being re-derived once per receiver from state that merely happens to
+/// agree. See [`crate::channels::LoopRenderResponse::site_lat`].
+fn rendered_image(
+    rr: &crate::channels::LoopRenderResponse,
+    texture: &egui::TextureHandle,
+) -> rustdar_egui::pane::RadarImageData {
+    rustdar_egui::pane::RadarImageData {
+        texture: texture.clone(),
+        lat: rr.site_lat,
+        lon: rr.site_lon,
+        max_range_km: rr.max_range_km,
+        value_data: Arc::new(Vec::new()),
+    }
+}
+
+/// Place a finished loop render on the frame of `ls` that asked for it, returning
+/// the texture that was uploaded so the caller can offer it to sibling panes.
+///
+/// `None` means nothing was placed, for one of two reasons:
+/// - The result is not one this loop is still expecting — rendered for a site,
+///   product or elevation it has since retargeted away from, or aimed at a frame
+///   that is not awaiting one. Applying either paints an image the dispatcher then
+///   treats as done, so the frame never corrects itself.
+/// - The render failed — no image, meaning the scan carried no matching sweep. The
+///   frame is retired so the dispatcher stops retrying it and readiness stops
+///   waiting on it.
+///
+/// The frame is resolved once, in the same pass that vets the result, and held: the
+/// vet and the placement cannot end up describing different frames. `upload` is
+/// handed the pixels and runs only after both checks have passed, so a refused
+/// result costs no GPU texture.
+///
+/// `rr` is taken by `&mut` so the image can be `take`n rather than moved out of the
+/// response. That is deliberate and load-bearing at the call site: the sibling
+/// broadcast below hands the *whole response* to `broadcast_sweep`, because the
+/// receiver's half of the sweep comparison must be resolved from the receiver's own
+/// scan and never filled in from a loose `f32`. Partially moving `rr` here would
+/// make `&rr` unavailable there and invite exactly that inlining.
+fn accept_render_result(
+    ls: &mut rustdar_egui::pane::LoopPlaybackState,
+    rr: &mut crate::channels::LoopRenderResponse,
+    upload: impl FnOnce(egui::ColorImage) -> egui::TextureHandle,
+) -> Option<egui::TextureHandle> {
+    let frame = ls.frame_awaiting_render_result_mut(rr.timestamp, &rr.target)?;
+    frame.render_in_flight = false;
+
+    let Some(color_image) = rr.image.take() else {
+        frame.render_failed = true;
+        return None;
+    };
+
+    let texture = upload(color_image);
+    frame.texture = Some(rendered_image(rr, &texture));
+    Some(texture)
+}
+
 /// Record a finished download: clear its in-flight mark and cache the scan.
 ///
 /// Takes the whole response so the site can only come from the download itself.
@@ -1422,6 +1445,37 @@ mod loop_dispatch_tests {
         ls
     }
 
+    /// A successful render result for `timestamp` at `target`.
+    ///
+    /// The coordinates are KTLX's real ones, which `loop_on` deliberately does *not*
+    /// use — its loops are built at a round 35.0/-97.0. Anything that placed an
+    /// image from a loop's own geometry rather than from the response would produce
+    /// those round numbers instead.
+    fn response(
+        timestamp: chrono::NaiveDateTime,
+        target: RenderTarget,
+    ) -> crate::channels::LoopRenderResponse {
+        crate::channels::LoopRenderResponse {
+            pane_idx: 0,
+            timestamp,
+            target,
+            snapped: 0.5,
+            site_lat: 35.33,
+            site_lon: -97.27,
+            // `Some`, not `None`: a response carrying no image is retired as
+            // `render_failed`, so `None` is the *failure* fixture and has to be
+            // asked for deliberately. The pixels never matter here — every seam
+            // under test reads the metadata — so a 1x1 image stands in for a frame.
+            image: Some(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
+            max_range_km: 100.0,
+        }
+    }
+
+    fn dummy_texture(ctx: &egui::Context) -> egui::TextureHandle {
+        let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
+        ctx.load_texture("test", image, egui::TextureOptions::NEAREST)
+    }
+
     fn queued(target: RenderTarget, timestamp: chrono::NaiveDateTime, snapped: f32) -> LoopRenderRequest {
         LoopRenderRequest {
             pane_idx: 0,
@@ -1648,6 +1702,90 @@ mod loop_dispatch_tests {
         );
     }
 
+    /// The coordinates an image is placed at come off the response — the ones the
+    /// renderer was actually handed — never off the loop receiving it.
+    ///
+    /// In production the two agree, but only via a coupling that lives in another
+    /// type: `site_lat`/`site_lon` move only in `new_for_loop`, which also clears
+    /// `rendered_for`, so a site change makes the target check reject the result
+    /// before any coordinate is read. That is an argument, not a guarantee, it is
+    /// invisible at the point of use, and it has to be re-made for every sibling
+    /// pane the broadcast hands the same texture to. Carrying the values retires the
+    /// argument; this test retires the way back to it.
+    #[test]
+    fn a_rendered_frame_is_placed_where_the_render_actually_drew_it() {
+        let ctx = egui::Context::default();
+        let mut ls = loop_on(&ctx, "KTLX", &[]);
+        ls.frames[1].render_in_flight = true;
+        let mut rr = response(ts(1), ls.rendered_for.clone().expect("target adopted"));
+
+        assert_ne!(rr.site_lat, ls.site_lat, "precondition: the two sources differ");
+        assert_ne!(rr.site_lon, ls.site_lon);
+
+        let texture = accept_render_result(&mut ls, &mut rr, |_| dummy_texture(&ctx))
+            .expect("the loop is awaiting this result");
+
+        let image = ls.frames[1].texture.as_ref().expect("the frame was filled");
+        assert_eq!(image.lat, rr.site_lat, "the latitude the image was projected around");
+        assert_eq!(image.lon, rr.site_lon);
+        assert_eq!(image.max_range_km, rr.max_range_km);
+        assert!(!ls.frames[1].render_in_flight, "and the frame is no longer in flight");
+
+        // The same image, described identically, is what the broadcast hands on — so
+        // a sibling taking it is told where it was drawn rather than assuming.
+        let broadcast = rendered_image(&rr, &texture);
+        assert_eq!((broadcast.lat, broadcast.lon), (image.lat, image.lon));
+    }
+
+    /// A result the loop has retargeted away from is refused, and refusing it must
+    /// cost nothing: the upload is the expensive half and must not run for an image
+    /// that is about to be dropped.
+    #[test]
+    fn a_refused_result_is_never_uploaded() {
+        let ctx = egui::Context::default();
+        let mut ls = loop_on(&ctx, "KTLX", &[]);
+        // In flight, so only the target can be what refuses this.
+        ls.frames[1].render_in_flight = true;
+        let mut stale = response(ts(1), target("KTLX", 2.4));
+
+        let mut uploads = 0;
+        let placed = accept_render_result(&mut ls, &mut stale, |_| {
+            uploads += 1;
+            dummy_texture(&ctx)
+        });
+
+        assert!(placed.is_none(), "a result for another elevation is not this loop's");
+        assert_eq!(uploads, 0, "and nothing was uploaded for it");
+        assert!(ls.frames[1].texture.is_none());
+        assert!(stale.image.is_some(), "and its pixels were not taken off the response");
+    }
+
+    /// No image means the render found no matching sweep. The frame is retired
+    /// rather than left in flight, or the dispatcher retries it forever and readiness
+    /// never stops waiting on it.
+    #[test]
+    fn a_failed_render_retires_its_frame_without_a_texture() {
+        let ctx = egui::Context::default();
+        let mut ls = loop_on(&ctx, "KTLX", &[]);
+        ls.frames[1].render_in_flight = true;
+        let mut failed = crate::channels::LoopRenderResponse {
+            image: None,
+            ..response(ts(1), ls.rendered_for.clone().expect("target adopted"))
+        };
+
+        let mut uploads = 0;
+        let placed = accept_render_result(&mut ls, &mut failed, |_| {
+            uploads += 1;
+            dummy_texture(&ctx)
+        });
+
+        assert!(placed.is_none());
+        assert_eq!(uploads, 0, "a failed render uploads nothing");
+        assert!(ls.frames[1].render_failed, "the frame is retired");
+        assert!(!ls.frames[1].render_in_flight, "and released");
+        assert!(ls.frames[1].texture.is_none());
+    }
+
     /// A finished download is filed under the site it was fetched from, which the
     /// response carries. The requesting pane is not consulted — its loop may have
     /// been rebuilt for another site while the download ran, and filing under that
@@ -1757,18 +1895,13 @@ mod loop_dispatch_tests {
         // *receiving* loop's site, which is the whole point — so one response can be
         // offered to both loops below.
         //
-        // `image` is `Some`, not `None`: a response carrying no image is retired as
-        // `render_failed` before the broadcast loop is reached, so a `None` fixture
-        // would put `broadcast_sweep` in a state the response path never hands it.
-        // The pixels themselves are irrelevant here — this seam reads only `snapped`,
-        // `timestamp` and `target` — so a 1x1 image stands in for a full frame.
+        // It carries an image (`response`'s default, and see the note there): a
+        // response with none is retired as `render_failed` before the broadcast loop
+        // is reached, so a `None` fixture would put `broadcast_sweep` in a state the
+        // response path never hands it.
         let rr = crate::channels::LoopRenderResponse {
-            pane_idx: 0,
-            timestamp: ts(0),
-            target: target("KOUN", 0.5),
             snapped: 1.4,
-            image: Some(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
-            max_range_km: 100.0,
+            ..response(ts(0), target("KOUN", 0.5))
         };
 
         let sweep = broadcast_sweep(&mgr, &koun, &rr);

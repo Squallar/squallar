@@ -113,6 +113,19 @@ pub struct LoopRenderResponse {
     /// Set unconditionally, on the failure path too: it describes the render that was
     /// *dispatched*, and there is only one send site to set it from.
     pub snapped: f32,
+    /// The site coordinates the image was projected around — the ones the renderer
+    /// was handed, straight off `LoopRenderRequest::render_params`.
+    ///
+    /// Carried rather than looked back up. The receiving loop's own
+    /// `site_lat`/`site_lon` are the obvious substitute and are a reconstruction:
+    /// they are only equal to these because a site change rebuilds the loop and
+    /// clears `rendered_for`, so the target check rejects the result first. That
+    /// coupling lives in another type and is invisible at the point of use, and it
+    /// has to hold for sibling panes taking this image via the broadcast too. The
+    /// image describes one pair of coordinates; it travels with them.
+    pub site_lat: f64,
+    /// See [`Self::site_lat`].
+    pub site_lon: f64,
     /// The finished image, already in egui's pixel layout, or `None` when the scan
     /// carried no matching sweep and there is nothing to show.
     ///
