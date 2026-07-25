@@ -27,9 +27,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           token: ${{ steps.app-token.outputs.token }}
-      # `rustup show` materialises the channel, `clippy`, and every cross-target
-      # in rust-toolchain.toml -- which this job now needs, because it verifies
-      # the wasm and Android arms before letting the bot commit.
+      # `rustup show` materialises the channel, `clippy` and the cross-targets in
+      # rust-toolchain.toml, which the verification steps below need.
       - name: Install Rust
         run: rustup show
       - name: Install system deps
@@ -49,27 +48,17 @@ jobs:
       - name: Apply Clippy autofixes
         run: cargo clippy --all-targets --all-features --fix || true
 
-      # ---------------------------------------------------------------------
       # The gate on the autofix. Nothing below this runs if it fails, and that
       # includes the commit+push.
-      # ---------------------------------------------------------------------
       #
-      # This bot pushes straight to main. Before, it committed unconditionally
-      # and re-ran clippy *after* the push, so the only thing that had ever
-      # inspected the rewritten tree at push time was `--fix` itself. A rewrite
-      # that broke the build was already on main by the time anything noticed.
+      # This bot pushes straight to main, and previously committed
+      # unconditionally, re-running clippy only *after* the push -- so a rewrite
+      # that broke the build was already on main before anything noticed.
       #
-      # Host-only verification is not enough here, and the reason is specific to
-      # this repo: `--fix` runs on the host, so it only ever *sees* the host cfg
-      # arms -- but the edits it makes land in shared source that the Android and
-      # wasm arms also compile. Dropping a "redundant" clone or narrowing a
-      # parameter type is invisible to the host build and can still break a call
-      # site behind `#[cfg(target_os = "android")]`, which is exactly the class of
-      # break the Build matrix exists for. Checking the cross arms costs one
-      # cargo-ndk install and two `check`s; pushing a broken main costs more.
-      #
-      # `check`, not `build`: this is verifying that a source rewrite still
-      # compiles, and linking adds nothing to that.
+      # The cross arms are checked too, not just the host. `--fix` only sees the
+      # host cfg arms but edits shared source that the Android and wasm arms also
+      # compile, so a "redundant" clone it drops can break a call site behind
+      # `#[cfg(target_os = "android")]` invisibly.
       - name: Verify the autofixed tree still builds (host)
         run: cargo build --workspace --all-targets --all-features
       - name: Verify the autofixed tree still builds (wasm32)
@@ -93,25 +82,19 @@ jobs:
           commit_user_name: usa-reddragon-auto-commit[bot]
           commit_user_email: 234130638+github-actions[bot]@users.noreply.github.com
           commit_author: "usa-reddragon-auto-commit[bot] <234130638+github-actions[bot]@users.noreply.github.com>"
-      # The gating run. `-D warnings` goes here and not on the --fix step above,
-      # so the bot still gets to autofix what it can and the build fails only on
-      # what it could not.
+      # The gating run. `-D warnings` goes here and not on the `--fix` step, so
+      # the bot still autofixes what it can and the build fails only on the rest.
       #
-      # This is also what makes the `unexpected_cfgs` lint load-bearing: a
-      # `rustdar-frontend` build script that stopped emitting the `mobile` cfg
-      # previously produced warnings nobody failed on, and Android and iOS
-      # silently took the desktop memory budgets.
+      # This is what makes `unexpected_cfgs` load-bearing: a `rustdar-frontend`
+      # build script that stopped emitting the `mobile` cfg produced warnings
+      # nobody failed on, and Android and iOS silently took desktop memory
+      # budgets.
       #
-      # `--all-features` now enables `rustdar-android`'s `jni-typecheck`, so this
-      # run lints the JNI layer -- `jni` is in the host `--all-features` graph and
-      # absent from the default one. Until that feature existed, every JNI call
-      # site in the repo was invisible to Clippy, and "zero warnings" was a
-      # statement about host code only. It is now a statement about the JNI layer
-      # too, and it passes clean.
+      # `--all-features` enables `rustdar-android/jni-typecheck`, so this lints
+      # the JNI layer -- invisible to Clippy until that feature existed.
       #
-      # The gap that remains: this is the *host* cfg of that code. The Android
-      # target itself still has no lint gate, and a `cargo ndk clippy` today
-      # reports 3 distinct warnings (2 in rustdar-platform, 1 in rustdar-egui)
-      # from arms only Android compiles. Adding that row means fixing those first.
+      # Remaining gap: this is the *host* cfg of that code. The Android target
+      # has no lint gate, and `cargo ndk clippy` reports 3 warnings from arms
+      # only Android compiles. Adding that row means fixing those first.
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings

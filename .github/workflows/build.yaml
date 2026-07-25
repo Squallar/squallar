@@ -1,42 +1,9 @@
 name: Build
 
-# rustdar ships to six platforms out of one workspace, and almost every
-# platform-specific file in it is behind a `#[cfg]`. `cargo build --workspace` on
-# Linux therefore does not compile the Android bridges, the wasm entry point or
-# the iOS arms *at all* -- it passes clean no matter how broken they are. That is
-# not a hypothetical: the rustls-platform-verifier 0.6 -> 0.7 bump (and the jni
-# 0.21 -> 0.22 bump it drags in) went green through Build, Clippy and Test while
-# `./gradlew assembleDebug` was failing outright. The first signal was a human
-# trying to build an APK.
-#
-# So the unit of coverage here is the *target triple*, not the workspace. Each row
-# carries its own command and its own feature set, because one command genuinely
-# does not fit all of them -- see the comments on each.
-#
-# Everything feeds `build-success`, which is the single required status check.
-#
-# =============================================================================
-# LANDING ORDER: DO NOT MERGE THIS BEFORE THE wgpu/WebGL FIX
-# =============================================================================
-#
-# `web-bundle` is red on main right now -- wgpu 30's `webgpu` feature collides
-# with the WebGL2 backend this project requires and wasm-bindgen aborts with
-# `duplicate string enums: GpuFilterMode`. That job is in `build-success.needs`,
-# and `Build success check` is a REQUIRED context in the repository ruleset
-# (id 14994623; required contexts are `Clippy`, `Build success check`, `Test`).
-#
-# So merging this before that fix turns every push and every pull request red,
-# and with `required_approving_review_count: 0` the practical effect is that
-# nothing merges at all -- while bypass actors keep committing to main several
-# times an hour, each producing another red run. The likely reaction is that
-# somebody deletes `Build success check` from the ruleset, which destroys the
-# gate this file exists to build.
-#
-# The fix is NOT to wrap `web-bundle` in `|| true` or `continue-on-error`, and
-# not to lift it out of `needs`: a deliverable that does not build should make
-# the required check red. That is the whole point. The fix is to land the wgpu
-# change first. This ordering is deliberate, not an oversight.
-# =============================================================================
+# Almost every platform-specific file in this workspace is behind a `#[cfg]`, so
+# `cargo build --workspace` on Linux compiles none of the Android bridges, the
+# wasm entry point or the iOS arms. The unit of coverage here is the target
+# triple, not the workspace. Everything feeds `build-success`.
 
 on:
   push:
@@ -47,43 +14,25 @@ permissions:
 
 concurrency:
   group: '${{ github.workflow }} @ ${{ github.ref }}'
-  # Cancel superseded runs on branches, never on main. Bots push to main several
-  # times an hour; cancelling those runs leaves `build-success` red for a reason
-  # that has nothing to do with the code, and a cancelled run never reaches
-  # `deploy-pages`, so the site would rarely publish.
+  # Never cancel on main: bots push several times an hour, and a cancelled run
+  # never reaches `deploy-pages`.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Targets reachable with nothing but a rustup target
-  # ---------------------------------------------------------------------------
+  # Targets reachable with nothing but a rustup target.
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     strategy:
-      # A wide matrix exists to show you *every* broken platform in one run. With
-      # fail-fast the first red row cancels the rest and you learn one fact per
-      # push, which for a cross-platform break is the slowest possible way to find
-      # out.
+      # One red row must not cancel the rest; a cross-platform break needs every
+      # failure in one run.
       fail-fast: false
       matrix:
         include:
-          # --- Desktop: the three hosts that run the real binary. ---
-          #
-          # `--all-targets --all-features` is kept here and *only* here. These are
-          # the rows where tests and benches genuinely build, and where enabling
-          # every optional capability is meaningful rather than fictional. The
-          # feature-masking problem that `--all-features` causes is handled by the
-          # `standalone` job below, not by weakening these.
-          #
-          # As of the `jni-typecheck` feature, `--all-features` also pulls
-          # `rustdar-android`'s JNI layer into these host builds -- `jni` is in the
-          # host `--all-features` graph and absent from the default one. So these
-          # rows, and host Clippy, now compile JNI code that was previously
-          # invisible to every host job. That is a real widening, but it is not
-          # Android coverage: the Android *target* still has no lint gate, and
-          # `android_main`, the winit Android backend and the linked `.so` are
-          # exercised only by the cargo-ndk rows.
+          # `--all-targets --all-features` is kept on the desktop rows and only
+          # there. `--all-features` turns on `rustdar-gps/serial` and
+          # `rustdar-android/jni-typecheck`, both of which are meaningful on a
+          # host and neither of which belongs in a wasm or iOS graph.
           - name: Linux x86_64
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
@@ -97,26 +46,10 @@ jobs:
             target: x86_64-pc-windows-msvc
             cmd: cargo build --workspace --all-targets --all-features --target x86_64-pc-windows-msvc
 
-          # --- Web, library crates only ---
-          #
-          # This row is NOT the web gate. It is a fast, per-crate signal that the
-          # portable library stack stays wasm-clean, which catches breakage close
-          # to its cause -- a tokio feature that wasm rejects, an `Instant::now()`
-          # that only exists on native, an unconditional `arboard`.
-          #
-          # It explicitly does not substitute for building the bundle, and the
-          # `web-bundle` job below is the real gate. On this tree today, this row
-          # PASSES while `wasm-pack` fails at the wasm-bindgen step -- `cargo`
-          # compiles the crate graph fine and the breakage is in binding
-          # generation. A wasm row that stopped at `cargo check` would sit green
-          # while the page did not exist.
-          #
-          # rustdar-platform is absent on purpose (desktop bin, no wasm meaning);
-          # so is rustdar-android. Default features, not `--all-features`:
-          # `--all-features` would turn on `rustdar-egui/gps-serial` and put a
-          # serial-port picker in a wasm graph, a configuration nothing ships. It
-          # happens to compile today (serialport 4.9 builds for wasm32), which is
-          # precisely why it is the wrong thing to assert.
+          # Not the web gate -- `web-bundle` is. This is a fast per-crate signal
+          # that the portable stack stays wasm-clean. Default features on
+          # purpose: `--all-features` would put a serial-port picker in a wasm
+          # graph, a configuration nothing ships.
           - name: wasm32 libraries
             runner: ubuntu-24.04
             target: wasm32-unknown-unknown
@@ -125,19 +58,10 @@ jobs:
               -p nexrad-level3 -p rustdar-units -p rustdar-gps -p rustdar-radar
               -p rustdar-overlays -p rustdar-egui -p rustdar-frontend -p rustdar-web
 
-          # --- iOS ---
-          #
-          # `check`, not `build`, and scoped to rustdar-frontend: there is no iOS
-          # entry-point crate in this workspace (no rustdar-ios), so there is no
-          # artifact to link. What there IS is iOS-conditional code --
-          # `constants.rs` gives `target_os = "ios"` the handheld memory budget via
-          # the `mobile` cfg that `rustdar-frontend/build.rs` derives -- and
-          # rustdar-frontend pulls the whole portable stack (egui, overlays, radar,
-          # units, gps) behind it. So this row compiles every line that an iOS app
-          # would compile, minus an entry point that does not exist yet.
-          #
-          # Runs on macOS rather than a Linux cross-container -- see the note on
-          # the runner choice at the bottom of this file.
+          # `check` and scoped to rustdar-frontend: there is no iOS entry-point
+          # crate, so nothing links. rustdar-frontend still pulls the whole
+          # portable stack and carries the `mobile` cfg iOS takes its memory
+          # budget from. Runs on macOS -- see the note at the bottom of this file.
           - name: iOS aarch64
             runner: macos-15
             target: aarch64-apple-ios
@@ -147,17 +71,13 @@ jobs:
 
       - name: Install Rust
         shell: bash
-        # No `rustup target add` here: rust-toolchain.toml lists every
-        # cross-target this matrix uses, so `rustup show` materialises the whole
-        # set. That file is the single source of truth, which is what keeps a
-        # local build honest against CI.
+        # No `rustup target add`: rust-toolchain.toml lists every cross-target
+        # this matrix uses and `rustup show` materialises the set.
         #
-        # The assertion is against `rustup target list --installed`, NOT
-        # `rustc --print target-list`. The latter enumerates every triple rustc
-        # knows how to name, installed or not, so it passes for
-        # `sparc64-unknown-netbsd` and would have let a row whose target is
-        # missing from rust-toolchain.toml fall through to a confusing "can't
-        # find crate for `std`" later in the job.
+        # Asserted against `rustup target list --installed`, not
+        # `rustc --print target-list` -- the latter names triples that are not
+        # installed, so a row missing from rust-toolchain.toml would fall through
+        # to a confusing "can't find crate for `std`".
         run: |
           set -euo pipefail
           rustup show active-toolchain || rustup toolchain install
@@ -167,21 +87,16 @@ jobs:
             exit 1
           fi
 
-      # serialport links against libudev on Linux only; macOS and Windows need
-      # nothing. Guarded rather than unconditional because `apt-get` does not
-      # exist on the other two runners.
+      # serialport links libudev on Linux only. Guarded because `apt-get` does
+      # not exist on the other two runners.
       - name: Install system deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libudev-dev
 
-      # The target is part of the key. The previous single
-      # `${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}` had every Linux
-      # row racing to save one entry: the registry contents differ per target
-      # (Android pulls jni/ndk-context, wasm pulls wasm-bindgen/web-sys, none of
-      # which the desktop resolve fetches), so whichever row finished first won
-      # and the rest restored an incomplete cache and re-downloaded anyway.
+      # The target is part of the key: registry contents differ per target, so a
+      # single key had every Linux row racing to save one incomplete entry.
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -197,28 +112,14 @@ jobs:
         shell: bash
         run: ${{ matrix.cmd }}
 
-  # ---------------------------------------------------------------------------
-  # The web deliverable: the bundle a browser actually loads
-  # ---------------------------------------------------------------------------
+  # The web deliverable: the bundle a browser actually loads.
   #
-  # `cargo check --target wasm32-unknown-unknown` is not a web gate. Verified on
-  # this tree: the release `cargo build` for wasm32 finishes clean and then
-  # `wasm-pack` fails in wasm-bindgen with
-  #   error: duplicate string enums: GpuFilterMode
-  # because wgpu 30's default features enable the `webgpu` backend alongside the
-  # WebGL2 one this project requires (Firefox has no stable WebGPU, so
-  # `rustdar_frontend::app` pins `Backends::GL`), and both generate the same
-  # web-sys binding. Binding generation is a step cargo never runs, so only
-  # building the bundle can see it.
+  # `cargo check --target wasm32-unknown-unknown` is not a web gate. Binding
+  # generation is a step cargo never runs, and that is where the wgpu
+  # `duplicate string enums: GpuFilterMode` break surfaced -- a clean cargo
+  # build followed by a wasm-bindgen failure. Only building the bundle sees it.
   #
-  # KNOWN FAILING on main as of this commit, for exactly that reason. The fix
-  # (turning wgpu's `webgpu` feature off) is a separate change in flight. This job
-  # is deliberately left able to fail rather than wrapped in `|| true` or
-  # `continue-on-error`: a red row that names a real broken deliverable is the
-  # point, and a green row that skipped the build would be worse than no row.
-  #
-  # This is also where the Pages artifact comes from -- built once, uploaded here,
-  # deployed by `deploy-pages` below. There is no second wasm build.
+  # Also the source of the Pages artifact. There is no second wasm build.
   web-bundle:
     name: Web bundle (wasm-pack)
     runs-on: ubuntu-24.04
@@ -237,28 +138,15 @@ jobs:
       - name: Install wasm-pack
         run: cargo install wasm-pack --locked --version ^0.15
 
-      # The command `rustdar-web/src/lib.rs` documents, plus two flags that only
-      # trim output: `--no-typescript` drops the .d.ts files and `--no-pack` the
-      # npm package.json. Neither is served, and nothing consumes this crate as an
-      # npm package.
+      # `--no-typescript` drops the .d.ts files, `--no-pack` the npm
+      # package.json. Neither is served.
       - name: Build the bundle
         run: wasm-pack build rustdar-web --target web --release --no-typescript --no-pack
 
-      # The servable root is `rustdar-web/` -- that is the directory
-      # `python3 -m http.server` is run from to get a working page.
-      #
       # Copied by ALLOWLIST, not by exclusion. rsync copies the working
-      # directory, not git's index, so an exclusion list publishes to the open
-      # internet anything an earlier step happened to leave lying around: a
-      # `.env`, a signing keystore, `.git/config`, stray notes. The tracked tree
-      # is clean today, which is exactly why this must not depend on it staying
-      # clean. Only extensions a browser actually loads are copied.
-      #
-      # The allowlist is by extension rather than by filename so that static
-      # files added beside index.html later -- a `manifest.webmanifest`, a
-      # service worker, `icons/` -- still ship without this job being edited.
-      # Anything skipped is printed, so a genuinely-needed asset with an
-      # unexpected extension is visible rather than silently missing.
+      # directory, not git's index, so an exclusion list would publish whatever
+      # an earlier step left lying around. By extension rather than filename so
+      # that a manifest or service worker added later still ships.
       - name: Stage the servable directory
         shell: bash
         run: |
@@ -291,58 +179,31 @@ jobs:
           test -f dist/pkg/rustdar_web.js
           test -f dist/pkg/rustdar_web_bg.wasm
 
-      # Scans every staged text asset, not just index.html -- see the script's
-      # docstring. The previous version of this step grepped index.html alone
-      # with a handful of patterns, which missed single quotes, `fetch("/`,
-      # `new URL("/`, CSS `url(/)`, and every file the PWA work is about to add.
+      # A project Pages site is served from a subpath, so a root-absolute
+      # reference works under `python3 -m http.server` and 404s in production.
+      # Scans every staged text asset, not just index.html.
       - name: Reject absolute asset paths
         run: python3 .github/scripts/check-relative-paths.py dist
 
-      # Uploaded on every run, not just on main. It costs nothing, and it means a
-      # pull request proves the artifact actually assembles instead of that being
-      # discovered at deploy time. Deployment is a separate, main-only job.
+      # Uploaded on every run so a pull request proves the artifact assembles.
+      # Deployment is a separate, main-only job.
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: dist
 
-  # ---------------------------------------------------------------------------
-  # Android tier 1: type-check the JNI layer on the host, ~12 seconds
-  # ---------------------------------------------------------------------------
+  # Android tier 1: type-check the JNI layer on the host, ~12 seconds.
   #
-  # (Rationale inherited from the standalone android.yaml this file absorbed.)
+  # `rustdar-android`'s `jni-typecheck` feature widens its crate-level cfg to
+  # `any(target_os = "android", feature = "jni-typecheck")`, so every JNI helper
+  # except `android_main` compiles for the host. Needs no NDK, no C toolchain and
+  # no rustup target -- 46 crates, no serialport, so not even libudev.
   #
-  # Every Android source file in this repo is behind `#[cfg(target_os =
-  # "android")]`, so `cargo check --workspace` on the host compiles *none* of it
-  # and passes clean no matter how broken the JNI bridges are. The
-  # rustls-platform-verifier 0.6 -> 0.7 bump, and the jni 0.21 -> 0.22 bump it
-  # drags in, went green through Build, Clippy and Test while
-  # `./gradlew assembleDebug` was failing at `:app:buildRustLibDebug`.
+  # Verified by mutation: restoring the jni 0.21 call shape
+  # `JObject::from_raw(ptr)` turns this red with E0061, while a plain
+  # `cargo check -p rustdar-android` on the same tree still finishes clean.
   #
-  # `rustdar-android`'s `jni-typecheck` feature widens that cfg to
-  # `any(target_os = "android", feature = "jni-typecheck")` and supplies host
-  # copies of the four dependencies the helpers need, so every JNI helper except
-  # `android_main` compiles for the host. See the feature's comment in
-  # `rustdar-android/Cargo.toml`.
-  #
-  # This needs NOTHING: no NDK, no C toolchain, no `cargo install`, and not even a
-  # rustup target -- the graph is 46 crates with no `serialport`, so not even
-  # libudev. Measured at 11.7s cold on this tree with every ANDROID_* variable
-  # unset and every Android path stripped from PATH.
-  #
-  # It genuinely type-checks rather than compiling something harmless. Verified by
-  # mutation: restoring the jni 0.21 call shape `JObject::from_raw(ptr)` turns this
-  # job red with
-  #   error[E0061]: this function takes 2 arguments but 1 argument was supplied
-  # -- the exact error class that shipped the broken Android build -- while a plain
-  # `cargo check -p rustdar-android` on the same mutated tree still reports
-  # "Finished" clean. That contrast is the whole reason this job exists.
-  #
-  # It earns its place by depending on almost nothing. Tier 2 below needs
-  # `cargo install cargo-ndk` to succeed AND the runner image to ship an NDK; when
-  # either breaks, this job still says whether the JNI code itself compiles.
-  #
-  # It does NOT replace tier 2: `android_main`, the winit Android backend and the
+  # Does NOT replace tier 2. `android_main`, the winit Android backend and the
   # linked `.so` are only exercised there.
   android-jni-check:
     name: Android JNI typecheck (host)
@@ -360,16 +221,13 @@ jobs:
           key: ${{ runner.os }}-cargo-android-jni-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-android-jni-
 
-      # A missing feature already fails loudly -- `cargo check --features` on an
-      # unknown feature errors with "does not contain this feature". What that does
-      # NOT catch is the feature surviving while being emptied to `[]`, which would
-      # leave this job compiling the crate with every JNI helper cfg'd back out and
-      # reporting success. Asserting `jni` is actually in the graph *because of*
-      # the feature is what keeps the job's name true.
+      # An unknown feature already errors. What that misses is the feature
+      # surviving while emptied to `[]`, which would leave this job compiling the
+      # crate with every helper cfg'd out and reporting success.
       #
-      # Verified meaningful: without `--features jni-typecheck`, `jni` is absent
-      # from this crate's host graph, so this assertion is testing the feature
-      # rather than something that would hold either way.
+      # NOTE: `cargo tree` reads manifests, not sources, so this guards the
+      # dependency half only. Narrowing lib.rs's `#![cfg(...)]` back to
+      # `target_os = "android"` alone would still pass here and compile nothing.
       - name: Assert the feature still pulls in the JNI layer
         shell: bash
         run: |
@@ -384,29 +242,17 @@ jobs:
       - name: cargo check -p rustdar-android --features jni-typecheck
         run: cargo check -p rustdar-android --features jni-typecheck
 
-  # ---------------------------------------------------------------------------
-  # Android tier 2: the real cross-compile, both shipped ABIs
-  # ---------------------------------------------------------------------------
+  # Android tier 2: the real cross-compile, both shipped ABIs.
   #
-  # A bare `cargo check --target aarch64-linux-android` does NOT work for
-  # rustdar-android and must not be used here. Verified on this tree: it dies in
-  # `ring`'s build script with
-  #   error occurred in cc-rs: failed to find tool "aarch64-linux-android-clang"
-  # because reqwest -> rustls -> ring compiles C, and cargo needs the NDK's
-  # clang/ar/sysroot exported. cargo-ndk exists to export exactly those variables,
-  # and it is what `rustdar-android/android/app/build.gradle.kts` drives, so using
-  # it here keeps CI and the Gradle build on one code path.
+  # A bare `cargo check --target aarch64-linux-android` does not work here: it
+  # dies in `ring`'s build script for want of a cross clang/sysroot. cargo-ndk
+  # exports those, and it is what `android/app/build.gradle.kts` drives, so CI
+  # and Gradle stay on one code path.
   #
-  # The command is deliberately byte-for-byte the shape Gradle's `cargoNdkTask`
-  # runs -- `-P <minSdk> build -p rustdar-android --lib` -- rather than a cheaper
-  # `check`. `-P 28` matters: cargo-ndk otherwise picks a much older platform
-  # level whose sysroot is missing symbols the graphics/JNI stack links against,
-  # so a check at the default level can pass while Gradle's build fails. Matching
-  # minSdk is what makes a green run here mean ":app:buildRustLibDebug will
-  # succeed".
-  #
-  # ABIs are the two in `allAbis` in build.gradle.kts. One row each, so a break on
-  # one ABI does not hide the other.
+  # The command is deliberately the shape Gradle's `cargoNdkTask` runs rather
+  # than a cheaper `check`. `-P 28` must track minSdk: at the default platform
+  # level the sysroot is missing symbols the graphics/JNI stack links against, so
+  # a check there can pass while Gradle fails.
   android:
     name: Android ${{ matrix.abi }}
     runs-on: ubuntu-24.04
@@ -440,14 +286,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # The runner exports the NDK location into the OS environment, but
-          # GitHub's `env` context does not carry runner OS variables --
-          # `${{ env.ANDROID_NDK_LATEST_HOME }}` expands to the empty string. It
-          # has to be read in the shell.
+          # Read in the shell: GitHub's `env` context does not carry runner OS
+          # variables, so `${{ env.ANDROID_NDK_LATEST_HOME }}` expands to empty.
           export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_ROOT:-}}}"
-          # Hard failure, never a skip. A missing NDK must turn this row red: a
-          # silently-skipped cross-compile reads as coverage on the PR page while
-          # verifying nothing, which is worse than not having the row.
+          # Hard failure, never a skip. A silently-skipped cross-compile reads as
+          # coverage on the PR page while verifying nothing.
           if [ -z "$ANDROID_NDK_HOME" ] || [ ! -d "$ANDROID_NDK_HOME" ]; then
             echo "::error::No Android NDK on this runner (ANDROID_NDK_HOME='${ANDROID_NDK_HOME}'). Refusing to pass without cross-compiling."
             exit 1
@@ -456,25 +299,14 @@ jobs:
           # -P must track minSdk in android/app/build.gradle.kts.
           cargo ndk -t '${{ matrix.abi }}' -P 28 build -p rustdar-android --lib
 
-  # ---------------------------------------------------------------------------
-  # Android: the failure no compiler can see
-  # ---------------------------------------------------------------------------
+  # The Android failure no compiler can see.
   #
-  # Bumping `jni` or `rustls-platform-verifier` alone still compiles -- cargo just
+  # Bumping `jni` or `rustls-platform-verifier` alone still compiles -- cargo
   # resolves two copies of the verifier. `rustdar-android` then initialises one
-  # through `init_with_refs` while every reqwest client reads the other,
-  # uninitialised, and Android TLS setup becomes a no-op. Nothing fails at build
-  # time; the first symptom is an on-device HTTPS failure against api.weather.gov.
-  # Both crates' manifests document this lockstep at length; this asserts it.
+  # while every reqwest client reads the other, uninitialised, and Android TLS
+  # setup becomes a no-op whose first symptom is an on-device HTTPS failure.
   #
-  # This job has NO compile-time substitute -- the broken state builds perfectly --
-  # and it is the cheapest job in this file: no NDK, no cross target, no
-  # `cargo install`, just a lockfile query. If Android coverage ever has to be cut
-  # for cost, this is the last thing that should go, not the first.
-  #
-  # Both shipped ABIs are checked. Resolution is per-target, so a dependency that
-  # unified on arm64 is not thereby unified on x86_64, and the emulator build is
-  # what most contributors run first.
+  # Both ABIs, because resolution is per-target.
   android-dep-unification:
     name: Android dependency unification
     runs-on: ubuntu-24.04
@@ -505,30 +337,16 @@ jobs:
           done
           exit "$fail"
 
-  # ---------------------------------------------------------------------------
-  # Every member on its own, with its own default features
-  # ---------------------------------------------------------------------------
+  # Every member on its own, with its own default features.
   #
-  # This is the job that catches what `--all-features` hides. rustdar-egui could
-  # not build standalone for weeks: it called `rustdar_gps::detect_gps_ports`
-  # while that function sat behind rustdar-gps's `serial` feature, and every
-  # `--all-features` build in CI turned `serial` on for it. A human found it.
+  # This is what catches what `--all-features` hides. rustdar-egui could not
+  # build standalone for weeks: it called `rustdar_gps::detect_gps_ports` while
+  # that sat behind rustdar-gps's `serial` feature, which every `--all-features`
+  # build in CI turned on for it.
   #
-  # A plain loop rather than `cargo hack --each-feature`, for two reasons:
-  #
-  #   * It reproduces the actual failure mode. The break was "this crate does not
-  #     build the way it ships"; `-p <member>` with default features is exactly
-  #     that build, because feature unification only spans the *selected*
-  #     packages. Verified: `-p rustdar-egui` resolves without serialport,
-  #     `--all-features` resolves with it.
-  #   * `--each-feature` is a much larger matrix (every feature of every member,
-  #     one build each) that spends most of its time proving combinations nobody
-  #     ships, and it is another tool to install and pin. The narrow check is the
-  #     one with evidence behind it.
-  #
-  # `--all-targets` is on because these are host builds, where tests do build --
-  # and a crate whose *tests* only compile thanks to a sibling's features is the
-  # same defect.
+  # A plain loop rather than `cargo hack --each-feature`: `-p <member>` with
+  # default features is exactly the build that broke, since feature unification
+  # only spans the selected packages.
   standalone:
     name: Standalone crate builds
     runs-on: ubuntu-24.04
@@ -562,19 +380,11 @@ jobs:
           for m in $members; do
             echo "::group::$m"
 
-            # `rustdar-android` compiles to nothing here: its crate-level cfg is
-            # `any(target_os = "android", feature = "jni-typecheck")` and this
-            # loop deliberately uses default features, so a host check of it
-            # compiles zero lines and would print a bare PASS -- green for a
-            # reason unrelated to what it claims, the exact anti-pattern this file
-            # argues against. (The JNI layer is covered by `android-jni-check`,
-            # which turns that feature on.)
-            #
-            # Detected from two structural signals rather than a hardcoded list,
-            # so the label appears and disappears on its own:
-            #   * a crate root beginning `#![cfg(`, or
-            #   * a package with dependencies, none of them unconditional (every
-            #     one declared under a `[target.'cfg(...)'.dependencies]`).
+            # A crate whose whole body is cfg'd out compiles zero lines here and
+            # would print a bare PASS. Labelled instead of hidden. Detected from
+            # structure, not a hardcoded list, so the label comes and goes on its
+            # own: a crate root beginning `#![cfg(`, or a package whose every
+            # dependency sits under a `[target.'cfg(...)'.dependencies]`.
             root="$(cargo metadata --no-deps --format-version 1 \
               | jq -r --arg m "$m" '.packages[] | select(.name==$m) | .targets[]
                                     | select(.kind | index("lib") or index("cdylib") or index("rlib"))
@@ -600,15 +410,11 @@ jobs:
           done
           exit "$fail"
 
-  # ---------------------------------------------------------------------------
-  # The one required status check
-  # ---------------------------------------------------------------------------
+  # The one required status check from this workflow.
   #
-  # Set this as the sole required check in branch protection. Because it lists
-  # every job above in `needs`, adding a row to this file automatically extends
-  # what "green" means -- as long as the new job is added to `needs`, which is the
-  # one thing to remember. `skipped` and `cancelled` are treated as failures on
-  # purpose: a job that did not run has not verified anything.
+  # `needs` on a matrix job covers all its rows. `skipped` and `cancelled` count
+  # as failures: a job that did not run has verified nothing. Adding a job above
+  # means adding it here.
   build-success:
     name: Build success check
     if: always()
@@ -633,22 +439,18 @@ jobs:
           echo "::error::One or more required jobs did not succeed; see the results printed above."
           exit 1
 
-  # ---------------------------------------------------------------------------
-  # Publish the web build to GitHub Pages
-  # ---------------------------------------------------------------------------
+  # Publish the web build to GitHub Pages.
   #
-  # Deploys the artifact `web-bundle` already uploaded in this same run -- there
-  # is no second wasm build, and nothing is rebuilt here.
+  # Deploys the artifact `web-bundle` already uploaded in this run; nothing is
+  # rebuilt. `needs: build-success` is what makes that safe -- build-success is
+  # `always()` and fails when any row failed, so a failure anywhere skips this.
   #
-  # `needs: build-success` is what makes this safe. build-success is `always()`
-  # and fails when any matrix row failed, so a failure anywhere leaves it red and
-  # this job is skipped rather than publishing. In particular, while the wgpu
-  # `webgpu` collision stands, `web-bundle` is red, so there is nothing to deploy
-  # and no deploy is attempted.
+  # NOTE: Clippy and Test are separate workflows and cannot be named in `needs`,
+  # so a push to main that fails either of those still deploys.
   #
-  # `push` to `main` only. A pull request must never publish: `pull_request` runs
-  # for forks too, and the `pages: write` / `id-token: write` permissions below
-  # are exactly what must not be reachable from an untrusted branch.
+  # `push` to `main` only. A pull request must never publish -- `pull_request`
+  # runs for forks, and `pages: write` / `id-token: write` must not be reachable
+  # from an untrusted branch.
   deploy-pages:
     name: Deploy web build to GitHub Pages
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -656,31 +458,26 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      # `pages: write` publishes; `id-token: write` is what deploy-pages uses to
-      # mint the OIDC token Pages authenticates the deployment with.
+      # `pages: write` publishes; `id-token: write` mints the OIDC token Pages
+      # authenticates the deployment with.
       pages: write
       id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    # Deliberately NOT the workflow-level group, which has
-    # cancel-in-progress: true. Cancelling a deployment mid-flight is how a Pages
-    # site ends up half-published; queue them instead.
+    # Deliberately not the workflow-level group, which cancels in progress.
+    # Cancelling a deployment mid-flight half-publishes the site; queue instead.
     concurrency:
       group: pages
       cancel-in-progress: false
     steps:
-      # REQUIRED, and not optional scaffolding: at the time of writing
-      # `GET /repos/USA-RedDragon/rustdar/pages` returns 404, i.e. no Pages site
-      # exists. `deploy-pages` needs one already present with
-      # `build_type: workflow` and will fail outright without it;
-      # `configure-pages` with `enablement: true` is what creates it, and it is
-      # idempotent once it has.
+      # Required, not scaffolding: no Pages site exists yet, and `deploy-pages`
+      # fails outright without one carrying `build_type: workflow`.
+      # `configure-pages` with `enablement: true` creates it, idempotently.
       #
-      # It lives here rather than in `web-bundle` on purpose. Enablement needs
-      # `pages: write`, and `web-bundle` runs on pull requests including from
-      # forks -- that permission must not be reachable from an untrusted branch.
-      # Its `base_path` output is unused: every asset reference is relative, which
+      # Here rather than in `web-bundle` because enablement needs `pages: write`
+      # and `web-bundle` runs on pull requests including from forks. Its
+      # `base_path` output is unused -- every asset reference is relative, which
       # the previous step enforces.
       - name: Enable and configure Pages
         uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
@@ -690,33 +487,9 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
 
-# ---------------------------------------------------------------------------
-# Why iOS runs on macOS and not in a Linux cross-container
-# ---------------------------------------------------------------------------
-#
-# Both work. `aarch64-apple-ios` std is installable on Linux and `cargo check`
-# never links, so the only hard requirement is a C compiler with the iPhoneOS
-# SDK -- `ring`'s build script needs one. Confirmed on this tree: a Linux
-# `cargo check -p rustdar-frontend --target aarch64-apple-ios` fails with
-#   error occurred in cc-rs: failed to find tool "xcrun"
-# so an SDK-carrying container (the `rust-cross` image approach) is genuinely
-# required if this is to run on ubuntu-24.04.
-#
-# macOS was chosen anyway:
-#
-#   * This workflow already pays for a macos-15 runner for the aarch64-apple-darwin
-#     row, so the marginal cost is one more job on an image that is already in the
-#     plan, not a new platform dependency.
-#   * The Linux route needs a third-party image redistributing Apple's iPhoneOS
-#     SDK. That is a supply-chain dependency for the SDK itself, on terms Apple's
-#     licence does not clearly permit, and it would have to be pinned by digest
-#     and kept current with Xcode. `aarch64-apple-ios-sim` would additionally have
-#     to be added to the image, per the note in the brief.
-#   * macos-15 ships Xcode with both the device and simulator SDKs, so `xcrun`
-#     resolves with no setup step at all.
-#
-# The cost is real -- GitHub bills macOS minutes at 10x Linux -- which is why the
-# row is a `check` of one crate rather than a full workspace build, and why only
-# the device triple is covered. If macOS minutes become the binding constraint,
-# the move is to drop this row to a nightly/merge-queue schedule rather than to
-# swap in an untrusted SDK image.
+# Why iOS runs on macOS and not a Linux cross-container: `ring`'s build script
+# needs a C compiler with the iPhoneOS SDK, so a Linux `cargo check --target
+# aarch64-apple-ios` fails with `failed to find tool "xcrun"`. The Linux route
+# needs a third-party image redistributing Apple's SDK; macos-15 ships Xcode with
+# both SDKs and this workflow already pays for that runner. macOS minutes bill at
+# 10x, which is why the row is a `check` of one crate on the device triple only.
