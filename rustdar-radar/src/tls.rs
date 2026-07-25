@@ -154,28 +154,14 @@ mod tests {
         assert!(super::default_is_ring());
     }
 
-    /// `default_is_ring` is a real comparison, not a constant.
-    ///
-    /// Without this, `fn default_is_ring() -> bool { true }` would satisfy every
-    /// other test in this module.
-    #[test]
-    fn default_is_ring_discriminates_between_backends() {
-        let ring = rustls::crypto::ring::default_provider();
-        let ring_random = ring.secure_random as *const _ as *const ();
-
-        // A provider whose `secure_random` is a *different* static must not be
-        // reported as ring. `aws_lc_rs` is not a direct dependency here, so
-        // stand in for "some other backend" with any other `&'static` address.
-        static OTHER: u8 = 0;
-        let other = &OTHER as *const u8 as *const ();
-        assert!(
-            !std::ptr::eq(ring_random, other),
-            "ring's secure_random collided with an unrelated static"
-        );
-
-        // And the real comparison agrees with itself.
-        assert!(std::ptr::eq(ring_random, ring_random));
-    }
+    // NOTE: there is deliberately no test here that `default_is_ring` "is a real
+    // comparison rather than a constant". The obvious one -- assert that ring's
+    // `secure_random` differs from some unrelated static -- asserts a property of
+    // its own fixture and never calls `default_is_ring` at all, so no change to
+    // the function can make it fail. What actually pins the function down is the
+    // pair of subprocess probes below: each asserts `!default_is_ring()` on entry
+    // and `default_is_ring()` after the production path has run, so both a
+    // constant `true` and a constant `false` fail one of them.
 
     /// Poll a future to completion *only if* it never yields.
     ///
@@ -200,6 +186,12 @@ mod tests {
     /// reaches hyper's connector, which panics without a tokio reactor -- this
     /// crate has no tokio dependency -- so that panic is caught and reported as
     /// "not rejected", which is exactly what it means here.
+    ///
+    /// The `is_builder()` narrowing is defensive and, in this setup, not
+    /// falsifiable: with no reactor, the *only* way a request returns `Ready(Err)`
+    /// is the scheme check, so relaxing it to "any error" changes no outcome. It
+    /// is kept because it documents which rejection is being detected, not
+    /// because a test would catch its removal.
     fn rejected_by_scheme_check(client: &reqwest::Client, url: &str) -> bool {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
