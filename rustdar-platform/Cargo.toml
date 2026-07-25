@@ -21,7 +21,7 @@ rustdar-radar = { workspace = true }
 rustdar-overlays = { workspace = true }
 reqwest = { workspace = true, features = ["default", "json"] }
 rustdar-gps = { workspace = true, features = ["serial"] }
-bytemuck = { version = "=1.25.0", features = ["derive"] }
+bytemuck = { version = "=1.25.2", features = ["derive"] }
 chrono = { workspace = true }
 egui = { workspace = true }
 egui-wgpu = { workspace = true, features = ["winit"] }
