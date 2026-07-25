@@ -249,6 +249,32 @@ mod tests {
         );
     }
 
+    /// Every `<domain>` must carry `includeSubdomains="true"`.
+    ///
+    /// Not a style rule: Android Lint raises `NetworkSecurityConfig` /
+    /// "Missing includeSubdomains attribute" as a **fatal** error, so an entry
+    /// without it fails `lintVitalRelease` and takes `assembleRelease` down
+    /// with it. It is also the safer default here, because a bare host leaves
+    /// its subdomains falling through to a `base-config` that permits
+    /// cleartext on purpose.
+    ///
+    /// This one fails in `cargo test`, in seconds, rather than five minutes
+    /// into a release build.
+    #[test]
+    fn every_domain_entry_sets_include_subdomains() {
+        let narrow: Vec<_> = parse_domains(&config_xml())
+            .into_iter()
+            .filter(|r| !r.include_subdomains)
+            .map(|r| r.host)
+            .collect();
+
+        assert!(
+            narrow.is_empty(),
+            "these <domain> entries omit includeSubdomains=\"true\", which is a \
+             fatal Android Lint error under lintVitalRelease: {narrow:?}"
+        );
+    }
+
     /// The base config must keep permitting cleartext, and every domain block
     /// must keep denying it. Inverting either silently breaks HTTPS to
     /// api.weather.gov or silently allows plaintext to rustdar's own origins.

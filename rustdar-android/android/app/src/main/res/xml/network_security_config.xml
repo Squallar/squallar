@@ -48,8 +48,17 @@
   NB: an XML comment may not contain a double hyphen, and aapt2 parses this file
   for real. Keep prose here free of them or the resource build fails.
 
-  includeSubdomains is set where a host family is used (*.noaa.gov, *.weather.gov)
-  and omitted where the exact host is fixed.
+  includeSubdomains is set on every entry, including the ones whose host is
+  fixed. This file used to say it was "omitted where the exact host is fixed",
+  but no entry had ever actually omitted it, and the first one that did failed
+  the build: Android Lint raises NetworkSecurityConfig / "Missing
+  includeSubdomains attribute" as a fatal error under lintVitalRelease.
+
+  Lint is right, and specifically right about this file. Denying cleartext for
+  a bare host leaves its subdomains falling through to base-config, which here
+  permits cleartext on purpose. So the safe default is the wide one, and the
+  test described below asserts the attribute is present on every entry so a
+  release build cannot be broken by this again.
 
   ===========================================================================
   Keeping this list honest
@@ -100,7 +109,7 @@
          be aviationweather.gov, which was still listed here long after nothing
          fetched from it while this host was not listed at all. -->
     <domain-config cleartextTrafficPermitted="false">
-        <domain>mesonet.agron.iastate.edu</domain>
+        <domain includeSubdomains="true">mesonet.agron.iastate.edu</domain>
     </domain-config>
 
     <!-- Everything served out of S3: the NEXRAD Level II archive and realtime
