@@ -54,12 +54,16 @@ pub const ELEVATION_TOLERANCE: f32 = 0.01;
 ///
 /// It identifies an image only together with the scan, and it cannot check the scan
 /// itself: the key derives from the loop, not from what the loop was handed. That the
-/// scan is the right one is enforced upstream instead — `LoopDownloadManager` keys its
-/// cache on `(site, timestamp)`, and a polled scan is appended only to loops on its own
-/// site — so a frame's scan and its target now name the same radar by construction.
-/// What the target still does not pin is the *sweep*: `elevation` is the selection, and
-/// each scan snaps it to whatever sweep it carries. Anything handing one loop's finished
-/// image to another has to compare that separately; see
+/// scan is the right one is enforced upstream instead, at every point a scan can enter
+/// a loop — `LoopDownloadManager` keys its cache on `(site, timestamp)`; a polled scan
+/// is appended only to loops on its own site; a scan listing is refused unless it names
+/// the site the loop is on, and the site it was listed for travels with the queue so
+/// the downloads it produces are filed under it. Those four together are what make a
+/// frame's scan and its target name the same radar; the key cannot check any of them.
+///
+/// What the target does not pin even then is the *sweep*: `elevation` is the selection,
+/// and each scan snaps it to whatever sweep it carries. Anything handing one loop's
+/// finished image to another has to compare that separately; see
 /// [`LoopPlaybackState::frame_accepting_broadcast`].
 ///
 /// `site` is the site the loop's *geometry* was captured for — the same lookup that

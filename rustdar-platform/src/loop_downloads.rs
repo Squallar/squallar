@@ -20,9 +20,27 @@ pub struct LoopDownloadManager {
     /// duplicate downloads across panes looping the same site).
     in_flight_set: HashMap<String, HashSet<chrono::NaiveDateTime>>,
     /// Pending loop scan downloads per pane, waiting to be dispatched (throttled).
-    pending_downloads: HashMap<usize, VecDeque<(chrono::NaiveDateTime, nexrad_data::aws::archive::Identifier)>>,
+    pending_downloads: HashMap<usize, PendingDownloads>,
     /// Number of loop scan downloads currently in flight (global, not per-pane).
     in_flight_count: usize,
+}
+
+/// A pane's undispatched loop downloads, with the site they belong to.
+///
+/// The site travels *with* the queue rather than being read back off the pane when
+/// a download is dispatched. A scan listing is requested asynchronously and cannot
+/// be cancelled, so a listing for the site a pane's loop used to be on can land
+/// after the loop has been rebuilt for another one. Re-deriving the site at
+/// dispatch time labelled those files with whatever site the pane had reached,
+/// cached one radar's scan under another's key, and — because the download filter
+/// then treats that key as satisfied — discarded the real scans that would have
+/// corrected it. Only a site switch (`clear_all`) recovered from that.
+pub struct PendingDownloads {
+    /// The site the listing was made for. Every identifier in `queue` is one of
+    /// this site's files, and the scan each becomes is cached under it.
+    pub site: String,
+    /// Scans still to download, oldest-first.
+    pub queue: VecDeque<(chrono::NaiveDateTime, nexrad_data::aws::archive::Identifier)>,
 }
 
 impl LoopDownloadManager {
@@ -91,13 +109,9 @@ impl LoopDownloadManager {
         self.in_flight_count += count;
     }
 
-    /// Set the pending download queue for a pane.
-    pub fn insert_pending(
-        &mut self,
-        pane: usize,
-        scans: VecDeque<(chrono::NaiveDateTime, nexrad_data::aws::archive::Identifier)>,
-    ) {
-        self.pending_downloads.insert(pane, scans);
+    /// Set the pending download queue for a pane, with the site it was listed for.
+    pub fn insert_pending(&mut self, pane: usize, pending: PendingDownloads) {
+        self.pending_downloads.insert(pane, pending);
     }
 
     /// Remove a pane's pending download queue.
@@ -105,19 +119,11 @@ impl LoopDownloadManager {
         self.pending_downloads.remove(&pane);
     }
 
-    /// Get mutable access to a pane's pending download queue.
-    pub fn pending_mut(
-        &mut self,
-        pane: usize,
-    ) -> Option<&mut VecDeque<(chrono::NaiveDateTime, nexrad_data::aws::archive::Identifier)>> {
-        self.pending_downloads.get_mut(&pane)
-    }
-
     /// Extract the pending queue completely. Call `insert_pending` to return it later.
-    pub fn extract_pending(
-        &mut self,
-        pane: usize,
-    ) -> Option<VecDeque<(chrono::NaiveDateTime, nexrad_data::aws::archive::Identifier)>> {
+    ///
+    /// Handing back the site with the queue is the point: a caller cannot dispatch
+    /// this pane's downloads without also holding the site they were listed for.
+    pub fn extract_pending(&mut self, pane: usize) -> Option<PendingDownloads> {
         self.pending_downloads.remove(&pane)
     }
 
@@ -128,7 +134,7 @@ impl LoopDownloadManager {
 
     /// Whether all pending downloads for a pane have been dispatched.
     pub fn is_pane_done(&self, pane: usize) -> bool {
-        self.pending_downloads.get(&pane).is_none_or(|p| p.is_empty())
+        self.pending_downloads.get(&pane).is_none_or(|p| p.queue.is_empty())
     }
 
     /// Reset all loop download state. Used on site switch to avoid stale data.

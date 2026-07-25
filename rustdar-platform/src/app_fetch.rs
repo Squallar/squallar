@@ -445,44 +445,29 @@ impl super::App {
 
     /// Enable radar loop for a pane: initializes loop state and spawns
     /// an async task to list available scans in the lookback window.
+    ///
+    /// Everything except the spawn lives in [`begin_loop_for_pane`], so which pane
+    /// the loop is read from is one decision, made and tested in one place.
     fn handle_enable_loop(&mut self, pane_idx: usize, lookback_secs: u64) {
-        // Every parameter of the loop comes from the pane the loop is being built
-        // for. `reinit_active_loops` calls this for each looping pane in turn, so
-        // reading the *active* pane instead pointed every loop at one site's
-        // geometry and one site's scan times, under each pane's own label.
-        let Some(LoopInit { site: radar_site, end }) = loop_init_for_pane(self.gui.panes(), pane_idx)
+        let Some(request) = begin_loop_for_pane(self.gui.panes_mut(), &mut self.loop_mgr, pane_idx, lookback_secs)
         else {
             return;
         };
-        let site = radar_site.name.to_string();
-
-        // Clear pending downloads for this pane (global cache is kept for sharing)
-        self.loop_mgr.remove_pending(pane_idx);
-
-        // Initialize loop state on the pane
-        if let Some(pane) = self.gui.pane_mut(pane_idx) {
-            pane.loop_state =
-                rustdar_egui::pane::LoopPlaybackState::new_for_loop(lookback_secs, &radar_site);
-        }
-
-        let start = end - chrono::Duration::seconds(lookback_secs as i64);
+        let LoopScanRequest { site, start, end } = request;
 
         self.spawn_async_task(self.channels.loop_scan_list_sender.clone(), async move {
             match scan::list_scans_for_range(&site, start, end).await {
                 Ok(scans) => {
-                    log::info!("Loop: found {} scans in range for pane {}", scans.len(), pane_idx);
-                    crate::channels::LoopScanListResponse {
-                        pane_idx,
-                        scans,
-                    }
+                    log::info!(
+                        "Loop: found {} {} scans in range for pane {}",
+                        scans.len(), site, pane_idx
+                    );
+                    crate::channels::LoopScanListResponse { pane_idx, site, scans }
                 }
                 Err(e) => {
-                    log::error!("Loop scan listing failed: {:?}", e);
+                    log::error!("Loop scan listing failed for {}: {:?}", site, e);
                     // Send empty list so UI can show error state
-                    crate::channels::LoopScanListResponse {
-                        pane_idx,
-                        scans: Vec::new(),
-                    }
+                    crate::channels::LoopScanListResponse { pane_idx, site, scans: Vec::new() }
                 }
             }
         });
@@ -654,7 +639,7 @@ impl super::App {
         pane_idx: usize,
         timestamp: NaiveDateTime,
         scan_data: std::sync::Arc<nexrad_model::data::Scan>,
-        params: &crate::render_dispatch::RenderParams,
+        params: crate::render_dispatch::RenderParams,
         target: rustdar_egui::pane::RenderTarget,
     ) -> bool {
         // Check concurrent render limit (the counter is shared with static pane renders)
@@ -665,15 +650,13 @@ impl super::App {
         self.render.renders_in_flight.fetch_add(1, Ordering::Relaxed);
         let guard = RenderGuard(std::sync::Arc::clone(&self.render.renders_in_flight));
 
-        let product = params.product;
-        // The sweep this frame's own scan snapped the selection to. One local for
-        // both uses on purpose: it is what the renderer is handed, so it is what the
-        // response reports the image depicts. Reporting `target.elevation` instead
-        // would describe the image by the selection it was asked for rather than the
-        // tilt it shows, and the receiving side compares it against a real sweep.
-        let snapped = params.elevation;
-        let lat = params.lat;
-        let lon = params.lon;
+        // Both the render call and the response's `snapped` read `params`, and
+        // nothing here re-derives either from `target`. `params.elevation` is the
+        // sweep this frame's own scan carries; `target.elevation` is the selection
+        // that was asked for. `LoopRenderRequest::render_params` makes that choice
+        // once, under test — this only forwards it, so the two cannot disagree
+        // about what the image depicts.
+        let crate::render_dispatch::RenderParams { product, elevation: snapped, lat, lon } = params;
         let sender = self.channels.loop_render_sender.clone();
         let window = self.window.clone();
         std::thread::Builder::new()
@@ -745,33 +728,58 @@ impl super::App {
     }
 }
 
-/// The two things a loop is built from, both read from the pane it belongs to.
+/// The scan listing a freshly-built loop needs, and the site it must be requested
+/// for.
 ///
-/// One struct rather than two return values because they must come from a single
-/// pane's `ScanInfo`: the site fixes the geometry every frame is projected with
-/// *and* the site the frame list is listed from, and `end` is that same site's
-/// current scan time. Mixing panes gives a loop that lists one site's scans and
-/// draws them at another's coordinates.
-struct LoopInit {
-    /// The whole site value, so the loop's render-target code and the coordinates
-    /// it projects with cannot come from different sites.
-    site: rustdar_radar::sites::RadarSite,
-    /// The newest scan time the loop covers — the pane's own current scan, not
-    /// wall clock, so the loop ends where the pane is actually looking.
+/// One struct rather than three loose values because they have to describe a single
+/// pane's single site: `site` is the code the listing is requested with *and* the
+/// code the loop's geometry was captured under, and `start`/`end` are that site's
+/// own scan time walked back by the lookback. Any of them coming from elsewhere
+/// gives a loop that lists one radar's files and draws them at another's coordinates.
+pub(super) struct LoopScanRequest {
+    site: String,
+    start: NaiveDateTime,
     end: NaiveDateTime,
 }
 
-/// Read `pane_idx`'s loop parameters, or `None` if that pane has no scan loaded.
+/// Build `pane_idx`'s loop state and return the scan listing it now needs, or
+/// `None` if that pane has no scan loaded to anchor a loop on.
 ///
-/// Indexes `panes` rather than taking a pane, so "which pane" is decided here and
-/// tested here. The active pane is deliberately not consulted: `reinit_active_loops`
-/// runs this for every looping pane, and a loop that took the active pane's site
-/// would show that site's data under its own pane's label.
-fn loop_init_for_pane(panes: &[rustdar_egui::pane::PaneState], pane_idx: usize) -> Option<LoopInit> {
+/// This is everything enabling a loop does apart from the spawn: it indexes the
+/// panes itself, so "which pane" is decided and tested here rather than at an
+/// untestable call site. The active pane is deliberately never consulted —
+/// `reinit_active_loops` runs this for every looping pane in turn, and a loop that
+/// took the active pane's site would show that radar under its own pane's label.
+///
+/// The pane's `scan_info` can lag its `site` field briefly after a site switch,
+/// while the new site's scan is still loading. The loop built in that window is
+/// stale but not wrong: its code, its coordinates and its listing all come from the
+/// one `RadarSite` in that `scan_info`, and the next scan to land re-runs this.
+fn begin_loop_for_pane(
+    panes: &mut [rustdar_egui::pane::PaneState],
+    loop_mgr: &mut crate::loop_downloads::LoopDownloadManager,
+    pane_idx: usize,
+    lookback_secs: u64,
+) -> Option<LoopScanRequest> {
     let scan_info = panes.get(pane_idx)?.scan_info.as_ref()?;
-    Some(LoopInit {
-        site: scan_info.site.clone(),
-        end: scan_info.timestamp,
+    // The whole site value, so the loop's render-target code and the coordinates
+    // it projects with cannot come from different sites.
+    let radar_site = scan_info.site.clone();
+    // The loop ends at this pane's current scan, not at wall clock, so it covers
+    // where the pane is actually looking.
+    let end = scan_info.timestamp;
+
+    // Drop the previous listing's undispatched downloads; they were queued for the
+    // loop this call is replacing. The scan cache is global and deliberately kept.
+    loop_mgr.remove_pending(pane_idx);
+
+    panes[pane_idx].loop_state =
+        rustdar_egui::pane::LoopPlaybackState::new_for_loop(lookback_secs, &radar_site);
+
+    Some(LoopScanRequest {
+        site: radar_site.name.to_string(),
+        start: end - chrono::Duration::seconds(lookback_secs as i64),
+        end,
     })
 }
 
@@ -855,6 +863,8 @@ fn append_polled_frame(
 #[cfg(test)]
 mod loop_pane_tests {
     use super::*;
+    use crate::loop_downloads::LoopDownloadManager;
+    use nexrad_data::aws::archive::Identifier;
     use rustdar_egui::pane::{LoopPlaybackState, PaneState};
     use rustdar_radar::sites::RadarSite;
     use rustdar_radar::types::{RadarProduct, ScanInfo};
@@ -864,6 +874,10 @@ mod loop_pane_tests {
             .unwrap()
             .and_hms_opt(0, minute, 0)
             .unwrap()
+    }
+
+    fn identifier(name: &str) -> Identifier {
+        Identifier::new(name.to_string())
     }
 
     fn site(name: &'static str, lat: f64, lon: f64) -> RadarSite {
@@ -904,30 +918,42 @@ mod loop_pane_tests {
     #[test]
     fn a_loop_is_built_from_its_own_panes_scan_not_the_active_panes() {
         // Pane 0 is the active one in every real call path that reaches here.
-        let panes = [
+        let mut panes = [
             pane_showing(site("KTLX", 35.33, -97.27), ts(10)),
             pane_showing(site("KOUN", 35.23, -97.46), ts(25)),
         ];
+        let mut mgr = LoopDownloadManager::new();
 
-        let init = loop_init_for_pane(&panes, 1).expect("pane 1 has a scan");
-        assert_eq!(init.site.name, "KOUN", "the loop must be built for pane 1's site");
-        assert_eq!(init.site.lat, 35.23, "and pane 1's geometry");
-        assert_eq!(init.site.lon, -97.46);
+        let req = begin_loop_for_pane(&mut panes, &mut mgr, 1, 600).expect("pane 1 has a scan");
+
+        assert_eq!(req.site, "KOUN", "the listing must be requested for pane 1's site");
         assert_eq!(
-            init.end,
+            req.end,
             ts(25),
-            "the loop ends at pane 1's own scan time, which is also the end of the \
-             range its scan list is requested for"
+            "and end at pane 1's own scan time, not the active pane's"
         );
+        assert_eq!(req.start, ts(15), "walked back by the lookback");
 
-        // Pane 0 still reads as itself, so the two are genuinely distinguishable.
-        let active = loop_init_for_pane(&panes, 0).expect("pane 0 has a scan");
-        assert_eq!(active.site.name, "KTLX");
-        assert_eq!(active.end, ts(10));
+        // The loop state is built from the same site value the listing names, so the
+        // code it is compared on and the coordinates it projects with agree.
+        let ls = &panes[1].loop_state;
+        assert_eq!(ls.site, "KOUN");
+        assert_eq!(ls.site_lat, 35.23);
+        assert_eq!(ls.site_lon, -97.46);
+        assert!(ls.is_fetching(), "and it is waiting for that listing");
+
+        // The pane that was *not* asked for is untouched, so nothing here is
+        // incidentally right because both panes were written.
+        assert!(!panes[0].loop_state.is_active());
+
+        // Pane 0 reads as itself when it is the one asked for.
+        let req = begin_loop_for_pane(&mut panes, &mut mgr, 0, 600).expect("pane 0 has a scan");
+        assert_eq!(req.site, "KTLX");
+        assert_eq!(req.end, ts(10));
     }
 
     /// A pane with nothing loaded yet has no loop parameters, and must not borrow
-    /// another pane's.
+    /// another pane's — nor leave a loop half-built.
     #[test]
     fn a_pane_with_no_scan_yields_no_loop() {
         let mut panes = [
@@ -935,9 +961,32 @@ mod loop_pane_tests {
             pane_showing(site("KOUN", 35.23, -97.46), ts(25)),
         ];
         panes[1].scan_info = None;
+        let mut mgr = LoopDownloadManager::new();
 
-        assert!(loop_init_for_pane(&panes, 1).is_none());
-        assert!(loop_init_for_pane(&panes, 7).is_none(), "and neither does a pane that does not exist");
+        assert!(begin_loop_for_pane(&mut panes, &mut mgr, 1, 600).is_none());
+        assert!(!panes[1].loop_state.is_active(), "no loop was started");
+        assert!(
+            begin_loop_for_pane(&mut panes, &mut mgr, 7, 600).is_none(),
+            "and neither does a pane that does not exist"
+        );
+    }
+
+    /// Enabling a loop drops the previous listing's undispatched downloads: they
+    /// were queued for the loop this call is replacing, and on a site switch they
+    /// are another radar's files.
+    #[test]
+    fn beginning_a_loop_clears_the_panes_pending_downloads() {
+        let mut panes = [pane_showing(site("KTLX", 35.33, -97.27), ts(10))];
+        let mut mgr = LoopDownloadManager::new();
+        mgr.insert_pending(0, crate::loop_downloads::PendingDownloads {
+            site: "KOUN".to_string(),
+            queue: [(ts(5), identifier("KOUN20240101_000500_V06"))].into_iter().collect(),
+        });
+        assert!(!mgr.is_pane_done(0), "precondition: pane 0 has work queued");
+
+        begin_loop_for_pane(&mut panes, &mut mgr, 0, 600).expect("pane 0 has a scan");
+
+        assert!(mgr.is_pane_done(0), "the previous loop's downloads are gone");
     }
 
     /// The defect this half of the site fix exists for. Auto-poll delivers one
@@ -1006,14 +1055,12 @@ mod loop_pane_tests {
         assert_eq!(frame_times(&panes[0]), vec![ts(0), ts(5), ts(10)], "no duplicate frame");
     }
 
-    /// Frames older than the lookback window are dropped as new ones arrive, and
-    /// the playhead is pulled back in when it falls off the end.
+    /// Frames older than the lookback window are dropped as new ones arrive.
     #[test]
     fn appending_evicts_past_the_lookback_window() {
         let ktlx = site("KTLX", 35.33, -97.27);
         // 10 minutes of lookback, frames every 5 minutes.
         let mut panes = [pane_looping_on(ktlx, 600, &[0, 5, 10])];
-        panes[0].loop_state.current_frame = 2;
 
         append_polled_frame_to_loops(&mut panes, "KTLX", ts(15));
 
@@ -1022,9 +1069,33 @@ mod loop_pane_tests {
             vec![ts(5), ts(10), ts(15)],
             "the frame older than the window is evicted"
         );
+    }
+
+    /// The playhead has to come back inside the list when eviction shortens it.
+    ///
+    /// A poll gap wider than the lookback — the site was down, the app was asleep,
+    /// the machine was suspended — evicts the whole window at once. Left alone,
+    /// `current_frame` points past the end, `PaneState::displayed_frame` resolves it
+    /// with `.get()` and finds nothing, and the pane renders blank. A paused loop
+    /// never advances, so it stays blank.
+    #[test]
+    fn eviction_pulls_the_playhead_back_inside_the_list() {
+        let ktlx = site("KTLX", 35.33, -97.27);
+        let mut panes = [pane_looping_on(ktlx, 600, &[0, 5, 10])];
+        panes[0].loop_state.current_frame = 2;
+
+        // 15 minutes on from the newest frame, with a 10 minute window: everything
+        // that was there is now older than the cutoff.
+        append_polled_frame_to_loops(&mut panes, "KTLX", ts(25));
+
+        assert_eq!(frame_times(&panes[0]), vec![ts(25)], "precondition: only the new frame survives");
         assert_eq!(
-            panes[0].loop_state.current_frame, 2,
-            "the playhead still points inside the list"
+            panes[0].loop_state.current_frame, 0,
+            "the playhead must land on a frame that exists"
+        );
+        assert!(
+            panes[0].loop_state.frames.get(panes[0].loop_state.current_frame).is_some(),
+            "and resolve to one, which is what the pane renders through"
         );
     }
 }

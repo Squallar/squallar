@@ -6,6 +6,7 @@ use rustdar_egui::actions::GuiAction;
 use rustdar_egui::pane::{BroadcastSweep, ELEVATION_TOLERANCE, RenderTarget};
 use rustdar_radar::types::IMAGE_SIZE;
 use crate::constants::{MAX_CONCURRENT_RENDERS, MAX_LOOP_RENDER_BUDGET, MAX_CONCURRENT_LOOP_DOWNLOADS, MAX_LOOP_FRAMES};
+use crate::loop_downloads::PendingDownloads;
 use crate::render_dispatch::CachedPaneRender;
 
 impl super::App {
@@ -569,56 +570,21 @@ impl super::App {
             let Some(pane) = self.gui.pane_mut(resp.pane_idx) else {
                 continue;
             };
-            let ls = &mut pane.loop_state;
-            if !ls.is_active() {
+            // Whether this listing is still wanted, and what it makes of the frame
+            // list, is decided in one place — including refusing a listing for a
+            // site the pane's loop has since moved off.
+            let Some(pending) = accept_scan_listing(&mut pane.loop_state, &resp.site, resp.scans)
+            else {
                 continue;
-            }
-            ls.phase = rustdar_egui::pane::LoopPhase::Rendering;
+            };
+            log::info!(
+                "Loop: populated {} {} frames for pane {}",
+                pending.queue.len(), pending.site, resp.pane_idx
+            );
 
-            // Populate frames (oldest-first, matching scan listing order)
-            ls.frames = resp
-                .scans
-                .iter()
-                .map(|(ts, _id)| rustdar_egui::pane::LoopFrame {
-                    timestamp: *ts,
-                    texture: None,
-                    render_in_flight: false,
-                    render_failed: false,
-                })
-                .collect();
-
-            if !ls.frames.is_empty() {
-                ls.current_frame = ls.frames.len() - 1; // start at newest
-            }
-
-            log::info!("Loop: populated {} frames for pane {}", resp.scans.len(), resp.pane_idx);
-
-            // Cap pending downloads to MAX_LOOP_FRAMES by evenly sampling
-            let mut scans = resp.scans;
-            if scans.len() > MAX_LOOP_FRAMES {
-                let total = scans.len();
-                let sampled: Vec<_> = (0..MAX_LOOP_FRAMES)
-                    .map(|i| {
-                        let idx = i * (total - 1) / (MAX_LOOP_FRAMES - 1).max(1);
-                        scans[idx].clone()
-                    })
-                    .collect();
-                // Update the frames list to match the sampled set
-                ls.frames = sampled.iter().map(|(ts, _)| rustdar_egui::pane::LoopFrame {
-                    timestamp: *ts,
-                    texture: None,
-                    render_in_flight: false,
-                    render_failed: false,
-                }).collect();
-                if !ls.frames.is_empty() {
-                    ls.current_frame = ls.frames.len() - 1;
-                }
-                log::info!("Loop: sampled {} → {} frames for pane {}", total, MAX_LOOP_FRAMES, resp.pane_idx);
-                scans = sampled;
-            }
-
-            // Store all scans as pending downloads and dispatch the first batch
-            self.loop_mgr.insert_pending(resp.pane_idx, VecDeque::from(scans));
+            // Store the scans as pending downloads — with the site they were listed
+            // for — and dispatch the first batch.
+            self.loop_mgr.insert_pending(resp.pane_idx, pending);
             self.dispatch_pending_loop_downloads(resp.pane_idx);
         }
     }
@@ -628,16 +594,8 @@ impl super::App {
     fn poll_loop_scan_download_results(&mut self) {
         let mut completed_count = 0usize;
         while let Ok(resp) = self.channels.loop_scan_download_receiver.try_recv() {
-            // Keyed by the site the download was spawned for, which the response
-            // carries — not by the requesting pane's current loop, which may have
-            // been rebuilt for another site meanwhile.
-            self.loop_mgr.complete_download(&resp.site, &resp.timestamp);
+            apply_completed_download(&mut self.loop_mgr, resp);
             completed_count += 1;
-
-            // Cache the downloaded scan globally (skip failures)
-            if let Some(scan) = resp.scan {
-                self.loop_mgr.cache_scan(&resp.site, resp.timestamp, scan);
-            }
         }
         if completed_count > 0 {
             self.loop_mgr.complete_batch(completed_count);
@@ -656,42 +614,31 @@ impl super::App {
             return;
         }
 
-        // Every cache and in-flight question below is asked about this pane's loop
-        // site — the site its frames will be looked up under at render time. Asking
-        // without it makes another site's scan look like this loop's, and the frame
-        // is dropped from the queue having never been downloaded.
-        let Some(site) = self
-            .gui
-            .pane(pane_idx)
-            .map(|p| p.loop_state.site.clone())
-            .filter(|s| !s.is_empty())
+        // We need to look up cached/in_flight state while modifying the pending
+        // queue, and both live in loop_mgr, so the queue is extracted completely,
+        // processed, and put back.
+        //
+        // The site comes out with it. Every cache and in-flight question below is
+        // asked about the site these identifiers were *listed* for — the site their
+        // scans will be cached under and looked up under at render time. Re-reading
+        // it off the pane would label a stale listing's files with whatever site the
+        // pane's loop has since become.
+        let Some(PendingDownloads { site, mut queue }) = self.loop_mgr.extract_pending(pane_idx)
         else {
-            return;
-        };
-
-        // We need to look up cached/in_flight state while modifying pending queue.
-        // pending_downloads is part of loop_mgr, so we can't iterate via loop_mgr.pending_mut
-        // while also calling loop_mgr.is_cached(). We extract the queue completely, Process it, and put it back.
-        let mut pending = if let Some(queue) = self.loop_mgr.extract_pending(pane_idx) {
-            queue
-        } else {
             return;
         };
 
         // Filter out timestamps already cached or in flight for this site
         let mut batch = Vec::new();
-        while !pending.is_empty() && batch.len() < slots {
-            let (ts, _) = pending.front().unwrap();
+        while !queue.is_empty() && batch.len() < slots {
+            let (ts, _) = queue.front().unwrap();
             if self.loop_mgr.is_cached(&site, ts) || self.loop_mgr.is_in_flight(&site, ts) {
                 // Already have or fetching this scan — remove from pending
-                pending.pop_front();
+                queue.pop_front();
             } else {
-                batch.push(pending.pop_front().unwrap());
+                batch.push(queue.pop_front().unwrap());
             }
         }
-
-        // Put the queue back
-        self.loop_mgr.insert_pending(pane_idx, pending);
 
         let spawned = batch.len();
 
@@ -699,6 +646,9 @@ impl super::App {
             self.loop_mgr.mark_in_flight(&site, ts);
             self.spawn_loop_scan_download(pane_idx, site.clone(), ts, id);
         }
+
+        // Put the queue back, still carrying its own site
+        self.loop_mgr.insert_pending(pane_idx, PendingDownloads { site, queue });
 
         if spawned > 0 {
             self.loop_mgr.add_spawned(spawned);
@@ -768,24 +718,18 @@ impl super::App {
                     if sibling_idx == origin_pane {
                         continue;
                     }
-                    // What this sibling's *own* scan for the frame would have snapped
-                    // the selection to. Looked up under the sibling's own loop site,
-                    // so it is an independent answer rather than a restatement of the
-                    // origin's — a sibling on another site is refused on the sweep as
-                    // well as on the target.
-                    let own_snapped = self
-                        .gui
-                        .pane(sibling_idx)
-                        .map(|p| p.loop_state.site.clone())
-                        .and_then(|site| {
-                            let scan = self.loop_mgr.get_cached(&site, &rr.timestamp)?;
-                            rustdar_radar::render::find_closest_elevation(
-                                scan,
-                                rr.target.product,
-                                rr.target.elevation,
-                            )
-                        });
-                    let sweep = BroadcastSweep { rendered: rr.snapped, own: own_snapped };
+                    let Some(sibling_loop) = self.gui.pane(sibling_idx).map(|p| &p.loop_state)
+                    else {
+                        continue;
+                    };
+                    // Cheap refusal first. This is the same predicate
+                    // `frame_accepting_broadcast` applies as the authority below, not a
+                    // second opinion — it just skips resolving a sweep for the many
+                    // siblings that cannot take the image anyway.
+                    if !sibling_loop.is_rendered_for(&rr.target) {
+                        continue;
+                    }
+                    let sweep = broadcast_sweep(&self.loop_mgr, sibling_loop, &rr);
 
                     let Some(sibling) = self.gui.pane_mut(sibling_idx) else { continue };
                     // Hand the image only to panes whose frames are keyed to exactly
@@ -840,16 +784,7 @@ impl super::App {
                 continue;
             }
             let any_rendered = pls.frames.iter().any(|f| f.texture.is_some());
-            // Every frame we intend to render must be settled — not merely "nothing
-            // in flight this instant". The render budget is shared with static pane
-            // renders, so part of the batch can be starved and not yet spawned; that
-            // must keep the loop out of Ready instead of animating blank frames.
-            // Asked about this loop's own site: another site's scan at the same
-            // timestamp is not this frame's data and must not count as downloaded.
-            let site = pls.site.as_str();
-            let batch_settled = pls.render_set_settled(MAX_LOOP_RENDER_BUDGET, |f| {
-                loop_mgr.is_cached(site, &f.timestamp)
-            });
+            let batch_settled = loop_batch_settled(loop_mgr, pls, MAX_LOOP_RENDER_BUDGET);
             if any_rendered && batch_settled && pane_downloads_done {
                 pls.phase = rustdar_egui::pane::LoopPhase::Ready;
             }
@@ -1037,10 +972,7 @@ impl super::App {
                     }
                 }
 
-                // The loop's own site is half the key: `target.site` is where the
-                // geometry came from, so the scan rendered with it has to be that
-                // site's scan and not whatever else shares the timestamp.
-                if let Some(scan) = self.loop_mgr.get_cached(&target.site, &frame.timestamp) {
+                if let Some(scan) = frame_scan(&self.loop_mgr, &target, frame.timestamp) {
                     // Snap elevation to closest available in this particular scan
                     let Some(snapped) = rustdar_radar::render::find_closest_elevation(scan, product, elevation) else {
                         // This scan has no sweep carrying the selected product at all.
@@ -1100,12 +1032,14 @@ impl super::App {
                 break;
             }
 
-            // Same `(site, timestamp)` the plan resolved above, from the same target.
-            let scan_arc = Arc::clone(
-                self.loop_mgr
-                    .get_cached(&req.target.site, &req.timestamp)
-                    .expect("planned frames were resolved from this cache entry"),
-            );
+            // The same cache entry the plan resolved above, named the same way: by
+            // the target this render is for. Nothing between then and here removes
+            // an entry, but a missing scan is a skipped frame the next pass retries,
+            // not something to bring the process down over.
+            let Some(scan_arc) = frame_scan(&self.loop_mgr, &req.target, req.timestamp).cloned()
+            else {
+                continue;
+            };
 
             // Only mark the frame in flight if a thread was actually spawned. If the
             // spawn is refused (budget taken between the check above and the one inside),
@@ -1119,7 +1053,7 @@ impl super::App {
                 req.pane_idx,
                 req.timestamp,
                 scan_arc,
-                &req.render_params(),
+                req.render_params(),
                 req.target,
             );
 
@@ -1128,6 +1062,163 @@ impl super::App {
             }
         }
     }
+}
+
+/// Take a scan listing for `site` into `ls`'s frame list, returning the downloads
+/// it now owes — or `None` if this loop is not the one that asked for it.
+///
+/// A listing is an uncancellable network round-trip, and a pane's loop is rebuilt
+/// out from under it routinely: by a site switch, by `reinit_active_loops` after a
+/// time navigation, by every settle of the lookback slider. So a listing can arrive
+/// for a loop that no longer exists, and "does this pane still have *a* loop" cannot
+/// tell that apart from a live one. Comparing the site can: a listing for the site
+/// the loop was on before a switch names files that are not this loop's, and taking
+/// them would put another radar's timestamps in the frame list and another radar's
+/// identifiers in the download queue — where, labelled with this loop's site, they
+/// would be cached as this site's scans and rendered with its geometry.
+///
+/// Stale listings for the *same* site are harmless by comparison — same files,
+/// possibly a different window — and are still taken, as the last word.
+///
+/// The frame list and the returned queue are built from one sampled set on purpose:
+/// they are the two halves of the same plan, and a frame with no queued download
+/// never settles.
+fn accept_scan_listing(
+    ls: &mut rustdar_egui::pane::LoopPlaybackState,
+    site: &str,
+    scans: Vec<(chrono::NaiveDateTime, nexrad_data::aws::archive::Identifier)>,
+) -> Option<PendingDownloads> {
+    if !ls.is_active() || ls.site != site {
+        return None;
+    }
+
+    // Cap the downloads at MAX_LOOP_FRAMES by evenly sampling the listing.
+    let scans = if scans.len() > MAX_LOOP_FRAMES {
+        let total = scans.len();
+        let sampled: Vec<_> = (0..MAX_LOOP_FRAMES)
+            .map(|i| scans[i * (total - 1) / (MAX_LOOP_FRAMES - 1).max(1)].clone())
+            .collect();
+        log::info!("Loop: sampled {} → {} frames for {}", total, MAX_LOOP_FRAMES, site);
+        sampled
+    } else {
+        scans
+    };
+
+    ls.phase = rustdar_egui::pane::LoopPhase::Rendering;
+    // Oldest-first, matching the scan listing order.
+    ls.frames = scans
+        .iter()
+        .map(|(ts, _id)| rustdar_egui::pane::LoopFrame {
+            timestamp: *ts,
+            texture: None,
+            render_in_flight: false,
+            render_failed: false,
+        })
+        .collect();
+    if !ls.frames.is_empty() {
+        ls.current_frame = ls.frames.len() - 1; // start at newest
+    }
+
+    Some(PendingDownloads { site: site.to_string(), queue: VecDeque::from(scans) })
+}
+
+/// Record a finished download: clear its in-flight mark and cache the scan.
+///
+/// Takes the whole response so the site can only come from the download itself.
+/// The requesting pane is deliberately out of scope here — it is the one thing in
+/// reach that looks like an answer and is not one, since its loop can have been
+/// rebuilt for another site while this download ran.
+fn apply_completed_download(
+    loop_mgr: &mut crate::loop_downloads::LoopDownloadManager,
+    resp: crate::channels::LoopScanDownloadResponse,
+) {
+    loop_mgr.complete_download(&resp.site, &resp.timestamp);
+    // Skip failures — the mark is cleared either way so the frame can be retried.
+    if let Some(scan) = resp.scan {
+        loop_mgr.cache_scan(&resp.site, resp.timestamp, scan);
+    }
+}
+
+/// The scan a loop keyed to `target` renders for `timestamp`.
+///
+/// `target.site` is where the loop's geometry came from, so it is also the only
+/// site whose scan may be projected with it. The pane's live `site` field is not a
+/// substitute — it is re-synced across panes without rebuilding their loops — and
+/// it is not in scope here.
+fn frame_scan<'a>(
+    loop_mgr: &'a crate::loop_downloads::LoopDownloadManager,
+    target: &RenderTarget,
+    timestamp: chrono::NaiveDateTime,
+) -> Option<&'a Arc<nexrad_model::data::Scan>> {
+    loop_mgr.get_cached(&target.site, &timestamp)
+}
+
+/// The sweep `ls`'s own scan for `timestamp` snaps `product`/`elevation` to, or
+/// `None` if it has no such scan or that scan carries no sweep for the product.
+///
+/// This is the receiver's half of a broadcast check, so it must be answerable
+/// *without* the sender's result: the site comes from `ls`, and the selection is
+/// passed loose rather than as a `RenderTarget` so the sender's site is not even in
+/// reach. Handed the sender's own snapped angle instead, the comparison would
+/// compare a value to itself and agree unconditionally.
+///
+/// Returning `None` refuses the broadcast, and never strands a frame — a chain
+/// worth stating because it is not local:
+/// - A sibling on another site is already refused by `is_rendered_for`, so `None`
+///   there changes nothing.
+/// - A same-site sibling shares this exact cache entry with the sender, which the
+///   sender resolved a scan from moments ago, so it is present.
+/// - If a re-download replaced that entry with one carrying no sweep for the
+///   product, the sibling's own dispatch retires the frame (`render_failed`) rather
+///   than waiting on a broadcast.
+/// - The one thing that empties the cache under a live loop is `clear_all`, reached
+///   only from `SwitchRadarSite`, which deactivates every affected loop in the same
+///   pass. **A second caller of `clear_all` would break that**, and would have to
+///   re-check this.
+fn own_sweep(
+    loop_mgr: &crate::loop_downloads::LoopDownloadManager,
+    ls: &rustdar_egui::pane::LoopPlaybackState,
+    timestamp: chrono::NaiveDateTime,
+    product: rustdar_radar::types::RadarProduct,
+    elevation: f32,
+) -> Option<f32> {
+    let scan = loop_mgr.get_cached(&ls.site, &timestamp)?;
+    rustdar_radar::render::find_closest_elevation(scan, product, elevation)
+}
+
+/// The sweep pair for offering `rr`'s finished image to the loop `ls`.
+///
+/// Both halves are assembled here rather than at the call site so the receiver's
+/// half cannot be filled in from the response. `rr.snapped` is the sender's answer
+/// and is already the other half of the comparison; using it for `own` as well
+/// would make [`BroadcastSweep::agrees`] compare a value to itself and accept
+/// unconditionally — the sweep term would still be there, still be read, and mean
+/// nothing.
+fn broadcast_sweep(
+    loop_mgr: &crate::loop_downloads::LoopDownloadManager,
+    ls: &rustdar_egui::pane::LoopPlaybackState,
+    rr: &crate::channels::LoopRenderResponse,
+) -> BroadcastSweep {
+    BroadcastSweep {
+        rendered: rr.snapped,
+        own: own_sweep(loop_mgr, ls, rr.timestamp, rr.target.product, rr.target.elevation),
+    }
+}
+
+/// Whether every frame `ls` intends to render has settled, given what has
+/// downloaded.
+///
+/// The "has it downloaded" question is asked about the loop's own site. Answered
+/// site-blind, another site's scan at the same timestamp counts as this frame's
+/// data, and the loop is promoted to `Ready` over frames that will never render.
+fn loop_batch_settled(
+    loop_mgr: &crate::loop_downloads::LoopDownloadManager,
+    ls: &rustdar_egui::pane::LoopPlaybackState,
+    budget: usize,
+) -> bool {
+    // Not merely "nothing in flight this instant": the render budget is shared with
+    // static pane renders, so part of a batch can be starved and not yet spawned.
+    ls.render_set_settled(budget, |f| loop_mgr.is_cached(&ls.site, &f.timestamp))
 }
 
 /// A loop frame render the dispatcher intends to spawn.
@@ -1228,19 +1319,69 @@ fn render_already_queued(
 #[cfg(test)]
 mod loop_dispatch_tests {
     use super::*;
+    use crate::loop_downloads::LoopDownloadManager;
+    use nexrad_data::aws::archive::Identifier;
+    use nexrad_model::data::{
+        MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
+    };
     use rustdar_egui::pane::{LoopFrame, LoopPhase, LoopPlaybackState};
     use rustdar_radar::sites::RadarSite;
     use rustdar_radar::types::RadarProduct;
 
+    /// `minute` minutes past midnight, and so still ordered past the hour — long
+    /// listings run to hundreds of scans.
     fn ts(minute: u32) -> chrono::NaiveDateTime {
         chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
             .unwrap()
-            .and_hms_opt(0, minute, 0)
+            .and_hms_opt(0, 0, 0)
             .unwrap()
+            + chrono::Duration::minutes(minute as i64)
     }
 
     fn target(site: &str, elevation: f32) -> RenderTarget {
         RenderTarget::new(site, RadarProduct::Reflectivity, elevation)
+    }
+
+    fn identifier(name: &str) -> Identifier {
+        Identifier::new(name.to_string())
+    }
+
+    /// A scan whose only sweeps sit at `elevations`, each carrying reflectivity.
+    ///
+    /// Real data, not a stand-in: `find_closest_elevation` walks the sweeps and asks
+    /// each radial for the product's moment, so a scan without one answers `None` for
+    /// every selection and the sweep tests would pass vacuously.
+    fn scan_with_sweeps(elevations: &[f32]) -> Arc<Scan> {
+        let sweeps = elevations
+            .iter()
+            .enumerate()
+            .map(|(i, &elevation)| {
+                let radial = Radial::new(
+                    0,
+                    0,
+                    0.0,
+                    1.0,
+                    RadialStatus::ElevationStart,
+                    i as u8 + 1,
+                    elevation,
+                    Some(MomentData::from_fixed_point(1, 0, 250, 8, 2.0, 66.0, vec![0])),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                Sweep::new(i as u8 + 1, vec![radial])
+            })
+            .collect();
+        Arc::new(Scan::new(
+            VolumeCoveragePattern::new(
+                212, 0, 0.5, PulseWidth::Short, false, 0, false, 0, false, false, 0, false, false,
+                Vec::new(),
+            ),
+            sweeps,
+        ))
     }
 
     /// A loop on `site` with three frames, retargeted to Reflectivity at 0.5, and
@@ -1378,6 +1519,237 @@ mod loop_dispatch_tests {
             find_donor(loops, 1, ts(1), ktlx.rendered_for.as_ref().unwrap()),
             Some((0, 1)),
             "precondition: only the target argument distinguishes these"
+        );
+    }
+
+    /// The blocking defect. A scan listing cannot be cancelled, so one requested
+    /// before a site switch lands after the loop has been rebuilt for the new site.
+    /// Taking it puts the old radar's timestamps in the frame list and the old
+    /// radar's identifiers in the download queue — which are then labelled with the
+    /// *new* site, cached under it, and rendered with its geometry. Nothing
+    /// downstream can see it, and because the download filter treats that key as
+    /// satisfied, the real scans that would correct it are discarded on arrival.
+    #[test]
+    fn a_listing_for_the_site_the_loop_left_is_refused() {
+        let ctx = egui::Context::default();
+        let mut koun = loop_on(&ctx, "KOUN", &[]);
+        koun.frames.clear();
+        let stale = vec![(ts(0), identifier("KTLX20240101_000000_V06"))];
+
+        assert!(
+            accept_scan_listing(&mut koun, "KTLX", stale).is_none(),
+            "a KTLX listing is not this KOUN loop's frame list"
+        );
+        assert!(koun.frames.is_empty(), "and left no frames behind");
+
+        // The loop's own listing is taken.
+        let live = vec![(ts(0), identifier("KOUN20240101_000000_V06"))];
+        let pending = accept_scan_listing(&mut koun, "KOUN", live).expect("its own listing");
+        assert_eq!(pending.site, "KOUN", "the queue carries the site it was listed for");
+        assert_eq!(pending.queue.len(), 1);
+        assert_eq!(koun.frames.len(), 1);
+    }
+
+    /// A listing that arrives after the loop was switched off has nothing to fill.
+    #[test]
+    fn a_listing_for_an_inactive_loop_is_refused() {
+        let ctx = egui::Context::default();
+        let mut ls = loop_on(&ctx, "KTLX", &[]);
+        ls.phase = LoopPhase::Inactive;
+
+        let scans = vec![(ts(0), identifier("KTLX20240101_000000_V06"))];
+        assert!(accept_scan_listing(&mut ls, "KTLX", scans).is_none());
+    }
+
+    /// The frame list and the download queue are the two halves of one plan: every
+    /// frame must have a download queued, or it never settles and the loop hangs in
+    /// `Rendering`. That has to survive the sampling that caps long listings.
+    #[test]
+    fn the_frame_list_and_the_download_queue_describe_the_same_scans() {
+        let ctx = egui::Context::default();
+        let mut ls = loop_on(&ctx, "KTLX", &[]);
+        let scans: Vec<_> = (0..(MAX_LOOP_FRAMES as u32 + 40))
+            .map(|i| (ts(i), identifier(&format!("KTLX2024010{}_V06", i))))
+            .collect();
+
+        let pending = accept_scan_listing(&mut ls, "KTLX", scans).expect("accepted");
+
+        assert_eq!(pending.queue.len(), MAX_LOOP_FRAMES, "capped");
+        assert_eq!(
+            ls.frames.iter().map(|f| f.timestamp).collect::<Vec<_>>(),
+            pending.queue.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            "the sampled set is the frame list, frame for frame"
+        );
+        assert_eq!(ls.current_frame, ls.frames.len() - 1, "playback starts at the newest");
+        assert_eq!(ls.phase, LoopPhase::Rendering);
+    }
+
+    /// A finished download is filed under the site it was fetched from, which the
+    /// response carries. The requesting pane is not consulted — its loop may have
+    /// been rebuilt for another site while the download ran, and filing under that
+    /// site is exactly the corruption this key exists to prevent.
+    #[test]
+    fn a_download_is_cached_under_the_site_it_came_from() {
+        let mut mgr = LoopDownloadManager::new();
+        let scan = scan_with_sweeps(&[0.5]);
+        mgr.mark_in_flight("KTLX", ts(0));
+
+        apply_completed_download(&mut mgr, crate::channels::LoopScanDownloadResponse {
+            pane_idx: 0,
+            site: "KTLX".to_string(),
+            timestamp: ts(0),
+            scan: Some(Arc::clone(&scan)),
+        });
+
+        assert!(Arc::ptr_eq(mgr.get_cached("KTLX", &ts(0)).expect("cached"), &scan));
+        assert!(mgr.get_cached("KOUN", &ts(0)).is_none());
+        assert!(!mgr.is_in_flight("KTLX", &ts(0)), "and its mark is cleared");
+    }
+
+    /// A failed download still clears the mark, or the timestamp is never retried.
+    #[test]
+    fn a_failed_download_clears_its_mark_and_caches_nothing() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.mark_in_flight("KTLX", ts(0));
+
+        apply_completed_download(&mut mgr, crate::channels::LoopScanDownloadResponse {
+            pane_idx: 0,
+            site: "KTLX".to_string(),
+            timestamp: ts(0),
+            scan: None,
+        });
+
+        assert!(!mgr.is_in_flight("KTLX", &ts(0)));
+        assert!(!mgr.is_cached("KTLX", &ts(0)));
+    }
+
+    /// The scan a frame renders is named by the target it is rendered for, because
+    /// that is where the geometry came from.
+    #[test]
+    fn a_frames_scan_is_looked_up_under_its_targets_site() {
+        let mut mgr = LoopDownloadManager::new();
+        let ktlx = scan_with_sweeps(&[0.5]);
+        mgr.cache_scan("KTLX", ts(0), Arc::clone(&ktlx));
+
+        let found = frame_scan(&mgr, &target("KTLX", 0.5), ts(0)).expect("KTLX's own scan");
+        assert!(Arc::ptr_eq(found, &ktlx));
+        assert!(
+            frame_scan(&mgr, &target("KOUN", 0.5), ts(0)).is_none(),
+            "a KOUN loop must not render KTLX's scan"
+        );
+    }
+
+    /// The sharpest half of the broadcast check: the receiver's sweep has to be
+    /// resolved from the receiver's *own* scan. Answered with the sender's snapped
+    /// angle it would compare a value to itself, agree unconditionally, and the
+    /// sweep term would be decorative.
+    #[test]
+    fn the_receivers_sweep_comes_from_the_receivers_own_scan() {
+        let ctx = egui::Context::default();
+        let mut mgr = LoopDownloadManager::new();
+        // One timestamp, two sites, two different sweep sets — which is the whole
+        // reason two loops can disagree about what a selection resolves to.
+        mgr.cache_scan("KTLX", ts(0), scan_with_sweeps(&[0.5, 1.5]));
+        mgr.cache_scan("KOUN", ts(0), scan_with_sweeps(&[1.4]));
+
+        let ktlx = loop_on(&ctx, "KTLX", &[]);
+        let koun = loop_on(&ctx, "KOUN", &[]);
+
+        assert_eq!(
+            own_sweep(&mgr, &ktlx, ts(0), RadarProduct::Reflectivity, 0.5),
+            Some(0.5),
+            "KTLX's scan carries the selected sweep"
+        );
+        assert_eq!(
+            own_sweep(&mgr, &koun, ts(0), RadarProduct::Reflectivity, 0.5),
+            Some(1.4),
+            "KOUN's own scan snaps the same selection somewhere else"
+        );
+    }
+
+    /// And the pair the response path actually builds. The receiver's half must come
+    /// from the receiver; filled in from the response it would agree with itself, and
+    /// the sweep test would pass for every image regardless of the tilt it depicts.
+    #[test]
+    fn a_broadcast_sweep_pairs_the_senders_image_with_the_receivers_own_scan() {
+        let ctx = egui::Context::default();
+        let mut mgr = LoopDownloadManager::new();
+        mgr.cache_scan("KTLX", ts(0), scan_with_sweeps(&[0.5]));
+        mgr.cache_scan("KOUN", ts(0), scan_with_sweeps(&[1.4]));
+        let koun = loop_on(&ctx, "KOUN", &[]);
+
+        // A KTLX pane finished a render of the 0.5° sweep for this timestamp.
+        let rr = crate::channels::LoopRenderResponse {
+            pane_idx: 0,
+            timestamp: ts(0),
+            target: target("KOUN", 0.5),
+            snapped: 0.5,
+            image_data: vec![0; 4],
+            max_range_km: 100.0,
+            value_data: Vec::new(),
+        };
+
+        let sweep = broadcast_sweep(&mgr, &koun, &rr);
+
+        assert_eq!(sweep.rendered, 0.5, "what the image depicts");
+        assert_eq!(sweep.own, Some(1.4), "what this loop's own scan resolves — not 0.5");
+        assert!(!sweep.agrees(), "so the image must not be handed over");
+
+        // Same call, a receiver whose scan does snap where the image was rendered.
+        let ktlx = loop_on(&ctx, "KTLX", &[]);
+        let sweep = broadcast_sweep(&mgr, &ktlx, &rr);
+        assert_eq!(sweep.own, Some(0.5));
+        assert!(sweep.agrees(), "and this one takes it");
+    }
+
+    /// No scan, or no sweep for the product, means the receiver cannot check the
+    /// image — which refuses the broadcast rather than accepting on faith.
+    #[test]
+    fn a_receiver_with_nothing_to_compare_reports_no_sweep() {
+        let ctx = egui::Context::default();
+        let mut mgr = LoopDownloadManager::new();
+        let ktlx = loop_on(&ctx, "KTLX", &[]);
+
+        assert_eq!(
+            own_sweep(&mgr, &ktlx, ts(0), RadarProduct::Reflectivity, 0.5),
+            None,
+            "nothing downloaded for this frame yet"
+        );
+
+        mgr.cache_scan("KTLX", ts(0), scan_with_sweeps(&[0.5]));
+        assert_eq!(
+            own_sweep(&mgr, &ktlx, ts(0), RadarProduct::Velocity, 0.5),
+            None,
+            "the scan carries no sweep for this product"
+        );
+    }
+
+    /// Readiness asks "has this frame's scan downloaded" about the loop's own site.
+    /// Site-blind, another radar's scan at the same timestamp answers yes, and the
+    /// loop is promoted over frames that will never render.
+    #[test]
+    fn readiness_counts_only_this_loops_own_downloads() {
+        let ctx = egui::Context::default();
+        let mut mgr = LoopDownloadManager::new();
+        let koun = loop_on(&ctx, "KOUN", &[]);
+        // Every frame blank, and only *KTLX* scans downloaded.
+        for i in 0..3 {
+            mgr.cache_scan("KTLX", ts(i), scan_with_sweeps(&[0.5]));
+        }
+
+        assert!(
+            loop_batch_settled(&mgr, &koun, MAX_LOOP_RENDER_BUDGET),
+            "precondition: with no scan of its own, a blank frame is not waiting on a render"
+        );
+
+        // Now KOUN's own scans arrive: the same blank frames become renders that
+        // are owed, and readiness must wait for them.
+        for i in 0..3 {
+            mgr.cache_scan("KOUN", ts(i), scan_with_sweeps(&[0.5]));
+        }
+        assert!(
+            !loop_batch_settled(&mgr, &koun, MAX_LOOP_RENDER_BUDGET),
+            "downloaded but unrendered frames must hold the loop out of Ready"
         );
     }
 

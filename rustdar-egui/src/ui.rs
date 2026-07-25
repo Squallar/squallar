@@ -1038,6 +1038,13 @@ impl Gui {
     /// re-split remembers them, and they are neither drawn nor updated — so the
     /// slice stops at `pane_count`, and code that acts on "all panes" must go
     /// through here rather than iterating `panes` directly.
+    ///
+    /// One caveat, shared with [`Self::pane`] and [`Self::pane_mut`]: while the
+    /// settings panel is drawing, the active pane is held out of the vector by
+    /// `mem::take` and its slot is a default `PaneState`. Nothing that reaches these
+    /// accessors runs in that window — the loop and scan paths run either side of
+    /// the egui pass, never inside it — but a future caller inside the UI pass would
+    /// read a blank pane rather than the live one.
     pub fn panes(&self) -> &[PaneState] {
         &self.panes[..self.visible_pane_count()]
     }

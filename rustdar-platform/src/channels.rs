@@ -63,6 +63,16 @@ pub struct OverlayRenderResponse {
 /// Result from listing available scans for a loop time range.
 pub struct LoopScanListResponse {
     pub pane_idx: usize,
+    /// NEXRAD site the listing was requested for. Every `Identifier` below is one
+    /// of this site's files.
+    ///
+    /// A listing is a network round-trip that cannot be cancelled, and a pane's
+    /// loop can be torn down and rebuilt for another site while it is in the air —
+    /// by a site switch, or by any of the routine rebuilds (`reinit_active_loops`,
+    /// the lookback slider). Without this the receiver could not tell a live
+    /// listing from one belonging to a loop that no longer exists, and would take
+    /// one site's file list as another site's frames.
+    pub site: String,
     /// Timestamps and identifiers for scans in the requested range (oldest-first).
     pub scans: Vec<(NaiveDateTime, Identifier)>,
 }
@@ -70,11 +80,13 @@ pub struct LoopScanListResponse {
 /// Result from downloading a single scan for a loop frame.
 pub struct LoopScanDownloadResponse {
     pub pane_idx: usize,
-    /// NEXRAD site this scan was downloaded for, captured when the download was
-    /// spawned. Half of the cache key, and carried on the response rather than
-    /// re-read from the pane: the pane's loop can be rebuilt for another site
-    /// while the download runs, and the scan still belongs to the site it came
-    /// from.
+    /// NEXRAD site this scan was downloaded from. Half of the cache key.
+    ///
+    /// It is the site of the *listing the identifier came from*, carried through
+    /// `PendingDownloads` and echoed here — not the site the requesting pane's loop
+    /// happened to be on when the download was dispatched, and not re-read from the
+    /// pane on arrival. Both of those can have moved on: the pane's loop is rebuilt
+    /// on a site switch, and identifiers outlive the loop that listed them.
     pub site: String,
     /// UTC timestamp of the downloaded scan.
     pub timestamp: NaiveDateTime,
