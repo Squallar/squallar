@@ -206,18 +206,21 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
     let grib2 = grib::from_reader(std::io::Cursor::new(bytes))
         .map_err(|e| format!("GRIB2 parse error: {e}"))?;
 
-    let mut submessages = grib2.iter();
-    let (_index, submessage) = submessages
-        .next()
-        .ok_or_else(|| "No submessages in GRIB2 data".to_string())?;
-    let extra = submessages.count();
-    if extra > 0 {
+    // Counted in its own pass, before any `SubMessage` is held: grib's
+    // iterator borrows the reader through a `RefCell`, and advancing it while
+    // a submessage is alive panics with "RefCell already borrowed".
+    let count = grib2.iter().count();
+    if count != 1 {
         return Err(format!(
-            "expected exactly one GRIB2 submessage, found {} — the byte range \
-             does not delimit a single record",
-            extra + 1,
+            "expected exactly one GRIB2 submessage, found {count} — the byte \
+             range does not delimit a single record",
         ));
     }
+
+    let (_index, submessage) = grib2
+        .iter()
+        .next()
+        .ok_or_else(|| "No submessages in GRIB2 data".to_string())?;
 
     // Collect lat/lon grid points first (borrows submessage, releases on collect).
     let latlon_pairs = grid_latlons(&submessage)?;
@@ -915,6 +918,48 @@ mod tests {
         // returned one component instead, negatives would appear.
         assert!(lo >= 0.0, "a vector magnitude cannot be negative, got {lo}");
         assert!(hi > 0.0);
+    }
+
+    /// `parse_grib2` refuses bytes carrying more than one record.
+    ///
+    /// This is the guard that makes a byte-range arithmetic bug loud instead
+    /// of silent: two concatenated records decode fine as a *sequence*, and
+    /// the previous `iter().next()` would have taken the first and discarded
+    /// the rest — a correct-looking grid for whichever field happened to come
+    /// first.
+    ///
+    /// Built from a real record fetched here rather than a committed fixture,
+    /// because a single HRRR record is ~1 MB and there is nothing to be gained
+    /// from storing one. The single-record case is asserted first, so a
+    /// `parse_grib2` that rejected *everything* would fail rather than pass.
+    #[tokio::test]
+    #[ignore = "hits the live noaa-hrrr-bdp-pds S3 bucket"]
+    async fn live_parse_grib2_refuses_more_than_one_submessage() {
+        let client = hrrr_client().expect("client");
+        let sources = DataSources::production();
+        let (date, hour) = latest_available_run();
+
+        let one = match fetch_record(&client, &sources, date, hour, 0, "CIN", "surface").await {
+            Ok(b) => b,
+            Err(_) => fetch_record(&client, &sources, date, hour - 1, 0, "CIN", "surface")
+                .await
+                .expect("CIN fetch"),
+        };
+
+        // Control: one record must parse.
+        let single = parse_grib2(&one, ModelParameter::SurfaceBasedCin);
+        assert!(single.is_ok(), "a single record must decode: {single:?}");
+
+        // Two concatenated records must not.
+        let mut two = one.clone();
+        two.extend_from_slice(&one);
+        let err = parse_grib2(&two, ModelParameter::SurfaceBasedCin)
+            .expect_err("two records must be refused, not silently truncated");
+        println!("two-record error: {err}");
+        assert!(
+            err.contains("exactly one GRIB2 submessage"),
+            "expected the one-submessage guard to fire, got: {err}",
+        );
     }
 
     /// The byte range really is a small fraction of the file.

@@ -197,9 +197,29 @@ mod tests {
 
     /// ...and must not fetch states nowhere near it. This is the half that
     /// makes the scoping worth doing.
+    ///
+    /// The assertion is on the **exact set**, and on its being well under
+    /// [`MAX_NETWORKS`], for a specific reason: a version of
+    /// `networks_for_viewport` that skipped the intersection test entirely
+    /// still excludes Maine and American Samoa from an Oklahoma view, because
+    /// the nearest-first cap does that on its own. Naming only the absent
+    /// states therefore asserts what the *cap* guarantees, not what the
+    /// *filter* does. Requiring the result to be exactly `{OK, TX}` — two
+    /// networks against a cap of twelve — cannot be satisfied by the cap.
     #[test]
     fn a_viewport_over_a_state_skips_distant_states() {
-        let states = networks_for_viewport(&view(34.3, 36.3, -98.3, -96.3));
+        let mut states = networks_for_viewport(&view(34.3, 36.3, -98.3, -96.3));
+        states.sort_unstable();
+        assert_eq!(
+            states,
+            ["OK", "TX"],
+            "only Oklahoma and the Texas panhandle reach this box",
+        );
+        assert!(
+            states.len() < MAX_NETWORKS,
+            "the result must be smaller than the cap, or the cap is doing the \
+             filtering and this test proves nothing",
+        );
         for far in ["ME", "FL", "WA", "PR", "AS"] {
             assert!(!states.contains(&far), "{far} is not near Oklahoma: {states:?}");
         }

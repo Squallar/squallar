@@ -112,11 +112,15 @@ impl Rejections {
     }
 
     /// Read a JSON cell that should hold a finite number.
+    ///
+    /// An **absent** cell and an explicitly `null` one arrive here identically:
+    /// serde maps a JSON `null` into `None` for an `Option<Value>` before this
+    /// is called, so there is no `Value::Null` left to test for. Both mean "not
+    /// reported", which is an ordinary state and not a rejection — IEM writes
+    /// `null` for every field a station does not sense. Counting them would
+    /// make the tripwire fire constantly and stop meaning anything.
     fn number(&self, field: &str, cell: &Option<Value>) -> Option<f64> {
         let value = cell.as_ref()?;
-        if value.is_null() {
-            return None;
-        }
         match value.as_f64() {
             Some(n) if n.is_finite() => Some(n),
             _ => {
@@ -698,12 +702,17 @@ mod tests {
         let (obs, rejected) = parse_currents(SAMPLE).unwrap();
         assert_eq!(rejected, 0, "the real IEM fixture parses cleanly");
         assert!(!obs.is_empty());
-        // The fixture does contain nulls, so "0 rejections" is a real result
-        // rather than an absence of nulls to misjudge.
+        // "0 rejections" is only meaningful if the fixture actually contains
+        // nulls *in fields this code reads*. It does: three of the six
+        // stations report no `gust`, and two report no `skyl1`. A version of
+        // `number` that counted an absent cell would return 3+ here.
         assert!(
-            SAMPLE.contains(": null"),
-            "fixture must contain nulls for this test to mean anything",
+            SAMPLE.contains("\"gust\": null"),
+            "fixture must contain a null in a field this code reads, or \
+             `rejected == 0` says nothing about how nulls are treated",
         );
+        let null_gusts = SAMPLE.matches("\"gust\": null").count();
+        assert!(null_gusts >= 3, "expected several null gusts, got {null_gusts}");
 
         let broken = SAMPLE.replace("\"sknt\": 14.0", "\"sknt\": \"14 kt\"");
         assert_ne!(broken, SAMPLE, "the replacement must actually apply");
