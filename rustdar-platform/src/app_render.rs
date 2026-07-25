@@ -1675,18 +1675,31 @@ mod loop_dispatch_tests {
         );
     }
 
-    /// And the pair the response path actually builds. The receiver's half must come
-    /// from the receiver; filled in from the response it would agree with itself, and
-    /// the sweep test would pass for every image regardless of the tilt it depicts.
+    /// And the pair the response path actually builds. Both halves are pinned to
+    /// values nothing else in the call could supply:
+    ///
+    /// - `rendered` is the *snapped* sweep off the response, never the selection the
+    ///   target carries. Here the two are 1.4 and 0.5, so a `rendered` filled in from
+    ///   `target.elevation` reads as the wrong tilt rather than as the same number.
+    /// - `own` is resolved from the receiver's own scan against the *selection*. Fed
+    ///   the sender's snapped angle instead it would agree with itself, and the sweep
+    ///   test would pass for every image regardless of the tilt it depicts. KOUN's
+    ///   scan carries both angles precisely so that substitution changes the answer.
     #[test]
     fn a_broadcast_sweep_pairs_the_senders_image_with_the_receivers_own_scan() {
         let ctx = egui::Context::default();
         let mut mgr = LoopDownloadManager::new();
-        mgr.cache_scan("KTLX", ts(0), scan_with_sweeps(&[0.5]));
-        mgr.cache_scan("KOUN", ts(0), scan_with_sweeps(&[1.4]));
+        // One timestamp, two sites. KOUN's volume carries the selected 0.5° sweep and
+        // a 1.4°; KTLX's is a partial volume whose only reflectivity sweep is the
+        // 1.4°, so the same 0.5° selection snaps to a different tilt on each.
+        mgr.cache_scan("KOUN", ts(0), scan_with_sweeps(&[0.5, 1.4]));
+        mgr.cache_scan("KTLX", ts(0), scan_with_sweeps(&[1.4]));
         let koun = loop_on(&ctx, "KOUN", &[]);
 
-        // A KTLX pane finished a render of the 0.5° sweep for this timestamp.
+        // A finished render of the 1.4° sweep, for a 0.5° selection. The target's
+        // site is not read here on purpose — `own_sweep` looks the scan up under the
+        // *receiving* loop's site, which is the whole point — so one response can be
+        // offered to both loops below.
         //
         // `image` is `Some`, not `None`: a response carrying no image is retired as
         // `render_failed` before the broadcast loop is reached, so a `None` fixture
@@ -1697,21 +1710,21 @@ mod loop_dispatch_tests {
             pane_idx: 0,
             timestamp: ts(0),
             target: target("KOUN", 0.5),
-            snapped: 0.5,
+            snapped: 1.4,
             image: Some(egui::ColorImage::filled([1, 1], egui::Color32::WHITE)),
             max_range_km: 100.0,
         };
 
         let sweep = broadcast_sweep(&mgr, &koun, &rr);
 
-        assert_eq!(sweep.rendered, 0.5, "what the image depicts");
-        assert_eq!(sweep.own, Some(1.4), "what this loop's own scan resolves — not 0.5");
+        assert_eq!(sweep.rendered, 1.4, "the tilt the image depicts — not the 0.5 selection");
+        assert_eq!(sweep.own, Some(0.5), "what this loop's own scan resolves that selection to");
         assert!(!sweep.agrees(), "so the image must not be handed over");
 
         // Same call, a receiver whose scan does snap where the image was rendered.
         let ktlx = loop_on(&ctx, "KTLX", &[]);
         let sweep = broadcast_sweep(&mgr, &ktlx, &rr);
-        assert_eq!(sweep.own, Some(0.5));
+        assert_eq!(sweep.own, Some(1.4));
         assert!(sweep.agrees(), "and this one takes it");
     }
 
