@@ -52,7 +52,7 @@ nexrad-decode = "=1.0.0-rc.3"
 nexrad-model = "=1.0.0-rc.2"
 
 # -- shared third-party --
-chrono = "=0.4.44"
+chrono = "=0.4.45"
 flate2 = "=1.1.9"
 jni = "=0.21.1"
 # egui 0.35 requires ^0.4.33.
