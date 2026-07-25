@@ -1,0 +1,739 @@
+{
+  "schema": {
+    "fields": [
+      {
+        "name": "station",
+        "type": "string",
+        "extDtype": "str"
+      },
+      {
+        "name": "name",
+        "type": "string",
+        "extDtype": "str"
+      },
+      {
+        "name": "county",
+        "type": "string",
+        "extDtype": "str"
+      },
+      {
+        "name": "state",
+        "type": "string",
+        "extDtype": "str"
+      },
+      {
+        "name": "network",
+        "type": "string",
+        "extDtype": "str"
+      },
+      {
+        "name": "local_date",
+        "type": "string",
+        "extDtype": "str"
+      },
+      {
+        "name": "snow",
+        "type": "string"
+      },
+      {
+        "name": "snowd",
+        "type": "string"
+      },
+      {
+        "name": "snoww",
+        "type": "string"
+      },
+      {
+        "name": "utc_valid",
+        "type": "string",
+        "extDtype": "str"
+      },
+      {
+        "name": "local_valid",
+        "type": "string",
+        "extDtype": "str"
+      },
+      {
+        "name": "tmpf",
+        "type": "number"
+      },
+      {
+        "name": "max_tmpf",
+        "type": "number"
+      },
+      {
+        "name": "min_tmpf",
+        "type": "number"
+      },
+      {
+        "name": "dwpf",
+        "type": "number"
+      },
+      {
+        "name": "relh",
+        "type": "number"
+      },
+      {
+        "name": "vsby",
+        "type": "number"
+      },
+      {
+        "name": "sknt",
+        "type": "number"
+      },
+      {
+        "name": "drct",
+        "type": "number"
+      },
+      {
+        "name": "c1smv",
+        "type": "string"
+      },
+      {
+        "name": "c2smv",
+        "type": "string"
+      },
+      {
+        "name": "c3smv",
+        "type": "string"
+      },
+      {
+        "name": "c4smv",
+        "type": "string"
+      },
+      {
+        "name": "c5smv",
+        "type": "string"
+      },
+      {
+        "name": "c1tmpf",
+        "type": "string"
+      },
+      {
+        "name": "c2tmpf",
+        "type": "string"
+      },
+      {
+        "name": "c3tmpf",
+        "type": "string"
+      },
+      {
+        "name": "c4tmpf",
+        "type": "string"
+      },
+      {
+        "name": "c5tmpf",
+        "type": "string"
+      },
+      {
+        "name": "ob_pday",
+        "type": "string"
+      },
+      {
+        "name": "ob_pmonth",
+        "type": "string"
+      },
+      {
+        "name": "s_pmonth",
+        "type": "number"
+      },
+      {
+        "name": "max_sknt",
+        "type": "number"
+      },
+      {
+        "name": "max_gust",
+        "type": "number"
+      },
+      {
+        "name": "gust",
+        "type": "number"
+      },
+      {
+        "name": "mslp",
+        "type": "number"
+      },
+      {
+        "name": "pres",
+        "type": "string"
+      },
+      {
+        "name": "scond0",
+        "type": "string"
+      },
+      {
+        "name": "scond1",
+        "type": "string"
+      },
+      {
+        "name": "scond2",
+        "type": "string"
+      },
+      {
+        "name": "scond3",
+        "type": "string"
+      },
+      {
+        "name": "srad",
+        "type": "string"
+      },
+      {
+        "name": "tsf0",
+        "type": "string"
+      },
+      {
+        "name": "tsf1",
+        "type": "string"
+      },
+      {
+        "name": "tsf2",
+        "type": "string"
+      },
+      {
+        "name": "tsf3",
+        "type": "string"
+      },
+      {
+        "name": "rwis_subf",
+        "type": "string"
+      },
+      {
+        "name": "raw",
+        "type": "string",
+        "extDtype": "str"
+      },
+      {
+        "name": "phour",
+        "type": "number"
+      },
+      {
+        "name": "feel",
+        "type": "number"
+      },
+      {
+        "name": "ice_accretion_1hr",
+        "type": "string"
+      },
+      {
+        "name": "ice_accretion_3hr",
+        "type": "string"
+      },
+      {
+        "name": "ice_accretion_6hr",
+        "type": "string"
+      },
+      {
+        "name": "skyl1",
+        "type": "number"
+      },
+      {
+        "name": "skyc1",
+        "type": "string",
+        "extDtype": "str"
+      },
+      {
+        "name": "skyl2",
+        "type": "string"
+      },
+      {
+        "name": "skyc2",
+        "type": "string"
+      },
+      {
+        "name": "skyl3",
+        "type": "string"
+      },
+      {
+        "name": "skyc3",
+        "type": "string"
+      },
+      {
+        "name": "skyl4",
+        "type": "string"
+      },
+      {
+        "name": "skyc4",
+        "type": "string"
+      },
+      {
+        "name": "alti",
+        "type": "number"
+      },
+      {
+        "name": "wxcodes",
+        "type": "string",
+        "extDtype": "str"
+      },
+      {
+        "name": "utc_max_gust_ts",
+        "type": "string",
+        "extDtype": "str"
+      },
+      {
+        "name": "local_max_gust_ts",
+        "type": "string",
+        "extDtype": "str"
+      },
+      {
+        "name": "utc_max_sknt_ts",
+        "type": "string",
+        "extDtype": "str"
+      },
+      {
+        "name": "local_max_sknt_ts",
+        "type": "string",
+        "extDtype": "str"
+      },
+      {
+        "name": "lon",
+        "type": "number"
+      },
+      {
+        "name": "lat",
+        "type": "number"
+      },
+      {
+        "name": "pday",
+        "type": "number"
+      }
+    ],
+    "primaryKey": [
+      "station"
+    ],
+    "pandas_version": "1.4.0"
+  },
+  "data": [
+    {
+      "station": "END",
+      "name": "VANCE AFB/ENID",
+      "county": "Garfield",
+      "state": "OK",
+      "network": "OK_ASOS",
+      "local_date": "2026-07-25",
+      "snow": null,
+      "snowd": null,
+      "snoww": null,
+      "utc_valid": "2026-07-25T15:55:00Z",
+      "local_valid": "2026-07-25T10:55:00",
+      "tmpf": 91.0,
+      "max_tmpf": 91.0,
+      "min_tmpf": 78.0,
+      "dwpf": 74.5,
+      "relh": 58.708206,
+      "vsby": 10.0,
+      "sknt": 8.0,
+      "drct": 210.0,
+      "c1smv": null,
+      "c2smv": null,
+      "c3smv": null,
+      "c4smv": null,
+      "c5smv": null,
+      "c1tmpf": null,
+      "c2tmpf": null,
+      "c3tmpf": null,
+      "c4tmpf": null,
+      "c5tmpf": null,
+      "ob_pday": null,
+      "ob_pmonth": null,
+      "s_pmonth": null,
+      "max_sknt": 10.0,
+      "max_gust": null,
+      "gust": null,
+      "mslp": 1013.3,
+      "pres": null,
+      "scond0": null,
+      "scond1": null,
+      "scond2": null,
+      "scond3": null,
+      "srad": null,
+      "tsf0": null,
+      "tsf1": null,
+      "tsf2": null,
+      "tsf3": null,
+      "rwis_subf": null,
+      "raw": "KEND 251555Z AUTO 21008KT 10SM OVC080 33/24 A2997 RMK AO2 SLP133 T03270236 $",
+      "phour": 0.0,
+      "feel": 101.327065,
+      "ice_accretion_1hr": null,
+      "ice_accretion_3hr": null,
+      "ice_accretion_6hr": null,
+      "skyl1": 8000.0,
+      "skyc1": "OVC",
+      "skyl2": null,
+      "skyc2": null,
+      "skyl3": null,
+      "skyc3": null,
+      "skyl4": null,
+      "skyc4": null,
+      "alti": 29.97,
+      "wxcodes": null,
+      "utc_max_gust_ts": null,
+      "local_max_gust_ts": null,
+      "utc_max_sknt_ts": "2026-07-25T14:55:00Z",
+      "local_max_sknt_ts": "2026-07-25T09:55:00",
+      "lon": -97.9165,
+      "lat": 36.33917,
+      "pday": null
+    },
+    {
+      "station": "PNC",
+      "name": "PONCA CITY MUNI",
+      "county": "Kay",
+      "state": "OK",
+      "network": "OK_ASOS",
+      "local_date": "2026-07-25",
+      "snow": null,
+      "snowd": null,
+      "snoww": null,
+      "utc_valid": "2026-07-25T16:53:00Z",
+      "local_valid": "2026-07-25T11:53:00",
+      "tmpf": 93.0,
+      "max_tmpf": 93.0,
+      "min_tmpf": 77.0,
+      "dwpf": 75.0,
+      "relh": 56.103065,
+      "vsby": 10.0,
+      "sknt": 8.0,
+      "drct": 170.0,
+      "c1smv": null,
+      "c2smv": null,
+      "c3smv": null,
+      "c4smv": null,
+      "c5smv": null,
+      "c1tmpf": null,
+      "c2tmpf": null,
+      "c3tmpf": null,
+      "c4tmpf": null,
+      "c5tmpf": null,
+      "ob_pday": null,
+      "ob_pmonth": null,
+      "s_pmonth": null,
+      "max_sknt": 12.0,
+      "max_gust": 17.0,
+      "gust": null,
+      "mslp": 1014.3,
+      "pres": null,
+      "scond0": null,
+      "scond1": null,
+      "scond2": null,
+      "scond3": null,
+      "srad": null,
+      "tsf0": null,
+      "tsf1": null,
+      "tsf2": null,
+      "tsf3": null,
+      "rwis_subf": null,
+      "raw": "KPNC 251653Z AUTO 17008KT 10SM FEW080 34/24 A3000 RMK AO2 SLP143 T03390239",
+      "phour": 0.0,
+      "feel": 104.58415,
+      "ice_accretion_1hr": null,
+      "ice_accretion_3hr": null,
+      "ice_accretion_6hr": null,
+      "skyl1": 8000.0,
+      "skyc1": "FEW",
+      "skyl2": null,
+      "skyc2": null,
+      "skyl3": null,
+      "skyc3": null,
+      "skyl4": null,
+      "skyc4": null,
+      "alti": 30.0,
+      "wxcodes": null,
+      "utc_max_gust_ts": "2026-07-25T05:10:00Z",
+      "local_max_gust_ts": "2026-07-25T00:10:00",
+      "utc_max_sknt_ts": "2026-07-25T05:05:00Z",
+      "local_max_sknt_ts": "2026-07-25T00:05:00",
+      "lon": -97.1,
+      "lat": 36.73,
+      "pday": null
+    },
+    {
+      "station": "GAG",
+      "name": "GAGE/SHATTUCK",
+      "county": "Ellis",
+      "state": "OK",
+      "network": "OK_ASOS",
+      "local_date": "2026-07-25",
+      "snow": null,
+      "snowd": null,
+      "snoww": null,
+      "utc_valid": "2026-07-25T16:53:00Z",
+      "local_valid": "2026-07-25T11:53:00",
+      "tmpf": 93.0,
+      "max_tmpf": 93.0,
+      "min_tmpf": 76.0,
+      "dwpf": 71.0,
+      "relh": 49.040173,
+      "vsby": 10.0,
+      "sknt": 6.0,
+      "drct": 230.0,
+      "c1smv": null,
+      "c2smv": null,
+      "c3smv": null,
+      "c4smv": null,
+      "c5smv": null,
+      "c1tmpf": null,
+      "c2tmpf": null,
+      "c3tmpf": null,
+      "c4tmpf": null,
+      "c5tmpf": null,
+      "ob_pday": null,
+      "ob_pmonth": null,
+      "s_pmonth": null,
+      "max_sknt": 16.0,
+      "max_gust": 19.0,
+      "gust": null,
+      "mslp": 1013.3,
+      "pres": null,
+      "scond0": null,
+      "scond1": null,
+      "scond2": null,
+      "scond3": null,
+      "srad": null,
+      "tsf0": null,
+      "tsf1": null,
+      "tsf2": null,
+      "tsf3": null,
+      "rwis_subf": null,
+      "raw": "KGAG 251653Z AUTO 23006KT 10SM CLR 34/22 A3003 RMK AO2 SLP133 T03390217",
+      "phour": 0.0,
+      "feel": 100.10437,
+      "ice_accretion_1hr": null,
+      "ice_accretion_3hr": null,
+      "ice_accretion_6hr": null,
+      "skyl1": null,
+      "skyc1": "CLR",
+      "skyl2": null,
+      "skyc2": null,
+      "skyl3": null,
+      "skyc3": null,
+      "skyl4": null,
+      "skyc4": null,
+      "alti": 30.03,
+      "wxcodes": null,
+      "utc_max_gust_ts": "2026-07-25T11:05:00Z",
+      "local_max_gust_ts": "2026-07-25T06:05:00",
+      "utc_max_sknt_ts": "2026-07-25T08:55:00Z",
+      "local_max_sknt_ts": "2026-07-25T03:55:00",
+      "lon": -99.77642,
+      "lat": 36.29554,
+      "pday": null
+    },
+    {
+      "station": "OKC",
+      "name": "Oklahoma City",
+      "county": "Oklahoma",
+      "state": "OK",
+      "network": "OK_ASOS",
+      "local_date": "2026-07-25",
+      "snow": null,
+      "snowd": null,
+      "snoww": null,
+      "utc_valid": "2026-07-25T16:52:00Z",
+      "local_valid": "2026-07-25T11:52:00",
+      "tmpf": 93.0,
+      "max_tmpf": 93.0,
+      "min_tmpf": 75.0,
+      "dwpf": 71.0,
+      "relh": 49.040173,
+      "vsby": 10.0,
+      "sknt": 14.0,
+      "drct": 200.0,
+      "c1smv": null,
+      "c2smv": null,
+      "c3smv": null,
+      "c4smv": null,
+      "c5smv": null,
+      "c1tmpf": null,
+      "c2tmpf": null,
+      "c3tmpf": null,
+      "c4tmpf": null,
+      "c5tmpf": null,
+      "ob_pday": null,
+      "ob_pmonth": null,
+      "s_pmonth": null,
+      "max_sknt": 18.0,
+      "max_gust": 26.0,
+      "gust": 20.0,
+      "mslp": 1015.3,
+      "pres": null,
+      "scond0": null,
+      "scond1": null,
+      "scond2": null,
+      "scond3": null,
+      "srad": null,
+      "tsf0": null,
+      "tsf1": null,
+      "tsf2": null,
+      "tsf3": null,
+      "rwis_subf": null,
+      "raw": "KOKC 251652Z 20014G20KT 10SM FEW250 34/22 A3004 RMK AO2 PK WND 24026/1555 SLP153 T03390217",
+      "phour": 0.0,
+      "feel": 100.10437,
+      "ice_accretion_1hr": null,
+      "ice_accretion_3hr": null,
+      "ice_accretion_6hr": null,
+      "skyl1": 25000.0,
+      "skyc1": "FEW",
+      "skyl2": null,
+      "skyc2": null,
+      "skyl3": null,
+      "skyc3": null,
+      "skyl4": null,
+      "skyc4": null,
+      "alti": 30.04,
+      "wxcodes": null,
+      "utc_max_gust_ts": "2026-07-25T15:55:00Z",
+      "local_max_gust_ts": "2026-07-25T10:55:00",
+      "utc_max_sknt_ts": "2026-07-25T16:10:00Z",
+      "local_max_sknt_ts": "2026-07-25T11:10:00",
+      "lon": -97.6006,
+      "lat": 35.3889,
+      "pday": null
+    },
+    {
+      "station": "TUL",
+      "name": "TULSA INTL ARPT(AW)",
+      "county": "Tulsa",
+      "state": "OK",
+      "network": "OK_ASOS",
+      "local_date": "2026-07-25",
+      "snow": null,
+      "snowd": null,
+      "snoww": null,
+      "utc_valid": "2026-07-25T16:53:00Z",
+      "local_valid": "2026-07-25T11:53:00",
+      "tmpf": 92.0,
+      "max_tmpf": 92.0,
+      "min_tmpf": 78.0,
+      "dwpf": 75.0,
+      "relh": 57.86813,
+      "vsby": 10.0,
+      "sknt": 9.0,
+      "drct": 200.0,
+      "c1smv": null,
+      "c2smv": null,
+      "c3smv": null,
+      "c4smv": null,
+      "c5smv": null,
+      "c1tmpf": null,
+      "c2tmpf": null,
+      "c3tmpf": null,
+      "c4tmpf": null,
+      "c5tmpf": null,
+      "ob_pday": null,
+      "ob_pmonth": null,
+      "s_pmonth": 4.46,
+      "max_sknt": 13.0,
+      "max_gust": 21.0,
+      "gust": 16.0,
+      "mslp": 1015.3,
+      "pres": null,
+      "scond0": null,
+      "scond1": null,
+      "scond2": null,
+      "scond3": null,
+      "srad": null,
+      "tsf0": null,
+      "tsf1": null,
+      "tsf2": null,
+      "tsf3": null,
+      "rwis_subf": null,
+      "raw": "KTUL 251653Z 20009G16KT 10SM FEW060 33/24 A3001 RMK AO2 SLP153 T03330239",
+      "phour": 0.0,
+      "feel": 103.2619,
+      "ice_accretion_1hr": null,
+      "ice_accretion_3hr": null,
+      "ice_accretion_6hr": null,
+      "skyl1": 6000.0,
+      "skyc1": "FEW",
+      "skyl2": null,
+      "skyc2": null,
+      "skyl3": null,
+      "skyc3": null,
+      "skyl4": null,
+      "skyc4": null,
+      "alti": 30.01,
+      "wxcodes": null,
+      "utc_max_gust_ts": "2026-07-25T14:53:00Z",
+      "local_max_gust_ts": "2026-07-25T09:53:00",
+      "utc_max_sknt_ts": "2026-07-25T13:50:00Z",
+      "local_max_sknt_ts": "2026-07-25T08:50:00",
+      "lon": -95.88811,
+      "lat": 36.19839,
+      "pday": 0.0
+    },
+    {
+      "station": "LAW",
+      "name": "LAWTON MUNICIPAL",
+      "county": "Comanche",
+      "state": "OK",
+      "network": "OK_ASOS",
+      "local_date": "2026-07-25",
+      "snow": null,
+      "snowd": null,
+      "snoww": null,
+      "utc_valid": "2026-07-25T16:53:00Z",
+      "local_valid": "2026-07-25T11:53:00",
+      "tmpf": 94.0,
+      "max_tmpf": 94.0,
+      "min_tmpf": 78.0,
+      "dwpf": 70.0,
+      "relh": 45.960922,
+      "vsby": 10.0,
+      "sknt": 9.0,
+      "drct": 210.0,
+      "c1smv": null,
+      "c2smv": null,
+      "c3smv": null,
+      "c4smv": null,
+      "c5smv": null,
+      "c1tmpf": null,
+      "c2tmpf": null,
+      "c3tmpf": null,
+      "c4tmpf": null,
+      "c5tmpf": null,
+      "ob_pday": null,
+      "ob_pmonth": null,
+      "s_pmonth": null,
+      "max_sknt": 15.0,
+      "max_gust": 25.0,
+      "gust": 18.0,
+      "mslp": 1015.6,
+      "pres": null,
+      "scond0": null,
+      "scond1": null,
+      "scond2": null,
+      "scond3": null,
+      "srad": null,
+      "tsf0": null,
+      "tsf1": null,
+      "tsf2": null,
+      "tsf3": null,
+      "rwis_subf": null,
+      "raw": "KLAW 251653Z 21009G18KT 10SM CLR 34/21 A3004 RMK AO2 SLP156 T03440211",
+      "phour": 0.0,
+      "feel": 100.395195,
+      "ice_accretion_1hr": null,
+      "ice_accretion_3hr": null,
+      "ice_accretion_6hr": null,
+      "skyl1": null,
+      "skyc1": "CLR",
+      "skyl2": null,
+      "skyc2": null,
+      "skyl3": null,
+      "skyc3": null,
+      "skyl4": null,
+      "skyc4": null,
+      "alti": 30.04,
+      "wxcodes": null,
+      "utc_max_gust_ts": "2026-07-25T15:20:00Z",
+      "local_max_gust_ts": "2026-07-25T10:20:00",
+      "utc_max_sknt_ts": "2026-07-25T15:20:00Z",
+      "local_max_sknt_ts": "2026-07-25T10:20:00",
+      "lon": -98.41664,
+      "lat": 34.56771,
+      "pday": null
+    }
+  ]
+}

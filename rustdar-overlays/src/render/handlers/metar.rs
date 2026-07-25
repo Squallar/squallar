@@ -270,12 +270,31 @@ impl OverlayHandler for MetarHandler {
     }
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
-        log::info!("Fetching METAR observations");
-        let client = ctx.client.clone();
+        // NOT `ctx.client`: the shared client sends a `User-Agent`, and IEM
+        // answers a CORS preflight with 405, so any request carrying one never
+        // leaves the browser. See `rustdar_radar::tls::simple_client`.
+        let client = match rustdar_radar::tls::simple_client(
+            std::time::Duration::from_secs(60),
+        )
+        .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("could not build the METAR client: {e}");
+                return Vec::new();
+            }
+        };
+        let sources = ctx.sources.clone();
+        let viewport = ctx
+            .viewport
+            .unwrap_or(crate::metar::networks::DEFAULT_VIEWPORT);
+        log::info!("Fetching METAR observations for {viewport:?}");
         vec![FetchTask {
             kind: OverlayKind::Metar,
             future: Box::pin(async move {
-                let result = crate::metar::fetch::fetch_current_metars(&client).await;
+                let result =
+                    crate::metar::fetch::fetch_current_metars(&client, &sources, &viewport)
+                        .await;
                 Box::new(MetarFetchResult(result)) as FetchPayload
             }),
         }]

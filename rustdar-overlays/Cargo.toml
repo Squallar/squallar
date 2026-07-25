@@ -58,6 +58,13 @@ log = { workspace = true }
 # `aws-lc-sys` back in the graph. The TLS backend comes from the workspace pin.
 reqwest = { workspace = true, features = ["json"] }
 roxmltree = "=0.21.1"
+# Promoted from dev-dependencies. This crate now reads two things from it that
+# belong to the whole application rather than to radar: `sources::DataSources`,
+# which declares every network origin in one place, and `tls`, which owns the
+# client construction (including the no-User-Agent variant the METAR feed
+# needs -- see `metar::fetch`). `rustdar-radar` does not depend on this crate,
+# so there is no cycle.
+rustdar-radar = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tiny-skia = "=0.12.0"
@@ -75,13 +82,8 @@ tokio = { workspace = true, features = ["fs"] }
 # Test-only: drives the `#[ignore]`d live-NOMADS checks. Not linked into any
 # shipped binary.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-# Test-only, and only for `rustdar_radar::tls`. This crate never builds its own
-# `reqwest::Client` in production -- callers hand one in, and the frontend gets
-# it from `tls::client` -- but two tests do, and with `rustls-no-provider` that
-# panics unless the process-wide provider is installed first. Depending on the
-# one module that installs it beats naming a crypto backend in a second place;
-# `rustdar-radar` does not depend on this crate, so there is no cycle.
-rustdar-radar = { workspace = true }
+# NOTE: `rustdar-radar` used to be pinned here, test-only, purely so two tests
+# could reach `tls::client`. It is a real dependency now (see above).
 
 [target.'cfg(target_os = "android")'.dependencies]
 # NOTE: `openssl-sys` used to be pinned here with `features = ["vendored"]` to get

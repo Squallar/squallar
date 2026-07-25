@@ -322,6 +322,8 @@ impl super::App {
         let config = FetchConfig {
             client: self.http_client.clone(),
             zone_cache_dir: self.platform.zone_cache_dir().map(|p| p.to_path_buf()),
+            sources: rustdar_radar::sources::DataSources::production(),
+            viewport: self.last_viewport,
         };
 
         let tasks = self.gui.overlays.create_fetch_tasks(kind, &config);

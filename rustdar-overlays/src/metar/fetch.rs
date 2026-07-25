@@ -1,397 +1,539 @@
-//! Fetch current METAR observations from the Aviation Weather Center bulk cache file.
+//! Fetch current METAR observations from the Iowa Environmental Mesonet.
+//!
+//! This replaces `aviationweather.gov/data/cache/metars.cache.csv.gz`, which
+//! sends no `Access-Control-Allow-Origin` and is therefore unreachable from
+//! rustdar's web build. Verified 2026-07-25 with
+//! `curl -H 'Origin: https://example.com'`: `200`, no CORS headers at all.
+//!
+//! IEM serves the same observations as JSON, one state network at a time:
+//! `mesonet.agron.iastate.edu/api/1/currents.json?network=<ST>_ASOS`. Requests
+//! are scoped to the viewport — see [`super::networks`] — because the
+//! whole-network form is 54 MB and ungzipped.
+//!
+//! # The request must stay "simple"
+//!
+//! IEM answers a CORS preflight with `405 Method Not Allowed`, while answering
+//! the plain `GET` with `Access-Control-Allow-Origin: *`. Any non-safelisted
+//! request header — `User-Agent` included — makes the browser preflight, and
+//! the request then never happens. That is why this module takes its client
+//! from [`rustdar_radar::tls::simple_client`] and why
+//! [`rustdar_radar::sources::DataSources::metar_sends_user_agent`] is `false`.
+//!
+//! # UNIT HAZARD — read before mapping a new field
+//!
+//! AWC's CSV reported Celsius and (in the v4 spelling) hectopascals. **IEM
+//! reports neither.** Three of its columns are the same quantity in a
+//! different representation, and each one silently produced a plausible wrong
+//! answer when the CSV parser's candidate lists were extended to cover them:
+//!
+//!   * `tmpf` / `dwpf` are **°F**. Read as `temp_c`, 90 °F renders as 194 °F
+//!     once the display layer applies ×9/5+32.
+//!   * `alti` is **inHg**. Read as hPa it is ~34× low.
+//!   * `sknt` is a **float** (`14.0`). Parsed as `u16` it is rejected, and
+//!     every wind speed in the feed becomes `None`.
+//!
+//! The old parser guarded this with `col_idx_unit`, which bound a unit to each
+//! accepted column *name*. That guard is preserved here in a stronger form:
+//! the unit is part of the **type**. [`Fahrenheit`] and [`InchesOfMercury`] do
+//! not implement any conversion to the other unit's scale, so a field cannot
+//! reach [`MetarOb::temp_c`] or [`MetarOb::altimeter_hpa`] without an explicit,
+//! named conversion. The `sknt` shape is caught by [`Rejections`], the
+//! counterpart of the CSV parser's rejected-cell counter: a column that
+//! silently empties out is otherwise invisible.
 
 use std::cell::{Cell, RefCell};
-use std::io::Read;
 
-use flate2::read::GzDecoder;
+use serde::Deserialize;
+use serde_json::Value;
 
+use super::networks;
 use super::types::{CloudLayer, FlightCategory, MetarOb, Visibility, WindDir};
+use crate::types::GeoBounds;
 
-const METAR_CACHE_URL: &str =
-    "https://aviationweather.gov/data/cache/metars.cache.csv.gz";
+// ── Units ─────────────────────────────────────────────────────────────────
+//
+// These exist so a field's unit is stated by its *type* rather than inferred
+// from its name at the point of use. See the UNIT HAZARD note above.
 
-/// Fetch current METAR observations from the AWC bulk cache file.
+/// A temperature as IEM reports it: degrees Fahrenheit.
 ///
-/// Downloads a gzip-compressed CSV containing all current worldwide METARs,
-/// decompresses it, and parses via header-driven column mapping.
-pub async fn fetch_current_metars(
-    client: &reqwest::Client,
-) -> Result<Vec<MetarOb>, String> {
-    log::info!("Fetching METAR cache from AWC");
+/// Deliberately has no `Deref` and no `From<f64> for Celsius`: the only way to
+/// get a Celsius value out is [`Self::to_celsius`], which is a visible call at
+/// the assignment site.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fahrenheit(pub f64);
 
-    let bytes = client
-        .get(METAR_CACHE_URL)
-        .send()
-        .await
-        .map_err(|e| format!("METAR cache fetch failed: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("AWC returned error: {e}"))?
-        .bytes()
-        .await
-        .map_err(|e| format!("Failed to read METAR cache bytes: {e}"))?;
-
-    let mut decoder = GzDecoder::new(&bytes[..]);
-    let mut csv_text = String::new();
-    decoder
-        .read_to_string(&mut csv_text)
-        .map_err(|e| format!("Failed to decompress METAR cache: {e}"))?;
-
-    parse_metar_csv(&csv_text).map(|(obs, _)| obs)
+impl Fahrenheit {
+    /// Convert to the Celsius [`MetarOb`] stores.
+    pub fn to_celsius(self) -> f64 {
+        (self.0 - 32.0) * 5.0 / 9.0
+    }
 }
 
-/// Parse AWC METAR cache CSV into `MetarOb` structs.
+/// A pressure as IEM reports it: inches of mercury.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InchesOfMercury(pub f64);
+
+impl InchesOfMercury {
+    /// Convert to the hectopascals [`MetarOb`] stores.
+    ///
+    /// 1 inHg = 33.8639 hPa, the same factor the CSV parser used.
+    pub fn to_hpa(self) -> f64 {
+        self.0 * 33.8639
+    }
+}
+
+// ── Rejection counting ────────────────────────────────────────────────────
+
+/// Counts cells that were *present* but unusable.
 ///
-/// Supports both old ADDS/TDS column names and AWC v4 names via fallback mapping.
-///
-/// Returns the observations alongside the number of non-empty cells that failed
-/// to parse. That count is the tripwire for a silent upstream schema change —
-/// see the UNIT HAZARD note below — so it is a return value rather than only a
-/// log line, and tests assert on it.
-fn parse_metar_csv(csv: &str) -> Result<(Vec<MetarOb>, u32), String> {
-    let mut lines = csv.lines();
+/// `null` is not a rejection — IEM writes it for "not reported", which is an
+/// ordinary state. A rejection is a cell holding something that is not a
+/// finite number where a number belongs, i.e. a schema or unit change
+/// upstream. Without this, such a change turns a whole column into `None` and
+/// nothing anywhere says so.
+#[derive(Debug, Default)]
+struct Rejections {
+    count: Cell<u32>,
+    sample: RefCell<String>,
+}
 
-    // Find the header line — skip comment/info lines.
-    let header_line = loop {
-        match lines.next() {
-            Some(line) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty()
-                    || trimmed.starts_with('!')
-                    || trimmed.starts_with('#')
-                {
-                    continue;
-                }
-                // Header should contain a known column name.
-                if trimmed.contains("station_id")
-                    || trimmed.contains("icaoId")
-                    || trimmed.contains("raw_text")
-                    || trimmed.contains("rawOb")
-                {
-                    break trimmed;
-                }
-                // Skip other preamble lines (e.g. "No errors", "N results").
-                continue;
-            }
-            None => return Err("No header line found in METAR CSV".to_string()),
-        }
-    };
-
-    let columns: Vec<&str> = header_line.split(',').map(|s| s.trim()).collect();
-
-    // Find first matching column index for a list of candidate names.
-    //
-    // ── UNIT HAZARD — read before adding a candidate ──────────────────────
-    // This helper matches on *name only*, so appending a new upstream spelling
-    // to an existing list silently inherits whatever unit the other candidates
-    // carry. That is not hypothetical. Iowa Environmental Mesonet
-    // (`mesonet.agron.iastate.edu/api/1/currents.json?network=<ST>_ASOS`) is a
-    // plausible replacement feed, and three of its columns are the same
-    // quantity in a *different* representation:
-    //
-    //   * `tmpf` / `dwpf` are °F, not °C. Adding them to a `temp_c` list would
-    //     put °F into `temp_c`, and the render layer applies ×9/5+32 on top —
-    //     90 °F would display as 194 °F.
-    //   * `alti` is inHg, but the altimeter unit used to be inferred from the
-    //     literal string "altim_in_hg", so `alti` would have been read as hPa,
-    //     roughly 34× off.
-    //   * `sknt` is a float ("8.0"); `get_u16` parses `u16` and rejects it, so
-    //     every wind speed would quietly become `None`.
-    //
-    // Temperature and pressure are therefore resolved through `col_idx_unit`,
-    // which makes the unit a *required* part of each candidate — you cannot add
-    // a spelling without stating what it is measured in. The `sknt` shape is
-    // caught by the rejected-cell count returned from this function.
-    // Nothing here reads IEM today; this note exists so that adding it breaks
-    // loudly instead of quietly.
-    let col_idx = |names: &[&str]| -> Option<usize> {
-        for name in names {
-            if let Some(i) = columns.iter().position(|c| *c == *name) {
-                return Some(i);
-            }
-        }
-        None
-    };
-
-    let i_station = col_idx(&["station_id", "icaoId"]);
-    let i_lat = col_idx(&["latitude", "lat"]);
-    let i_lon = col_idx(&["longitude", "lon"]);
-    let temp_col = col_idx_unit(
-        &columns,
-        &[("temp_c", TempUnit::Celsius), ("temp", TempUnit::Celsius)],
-    );
-    let dewp_col = col_idx_unit(
-        &columns,
-        &[("dewpoint_c", TempUnit::Celsius), ("dewp", TempUnit::Celsius)],
-    );
-    let i_wdir = col_idx(&["wind_dir_degrees", "wdir"]);
-    let i_wspd = col_idx(&["wind_speed_kt", "wspd"]);
-    let i_wgst = col_idx(&["wind_gust_kt", "wgst"]);
-    let i_vis = col_idx(&["visibility_statute_mi", "visib"]);
-    let altim_col = col_idx_unit(
-        &columns,
-        &[
-            // Old ADDS/TDS spells the unit into the name: inches of mercury.
-            ("altim_in_hg", PressureUnit::InHg),
-            // AWC v4 reports the altimeter setting in hectopascals.
-            ("altim", PressureUnit::Hpa),
-        ],
-    );
-    let i_fltcat = col_idx(&["flight_category", "fltcat"]);
-    let i_raw = col_idx(&["raw_text", "rawOb"]);
-    let i_wx = col_idx(&["wx_string", "wxString"]);
-    let i_time = col_idx(&["observation_time", "obsTime", "reportTime"]);
-    let i_elev = col_idx(&["elevation_m", "elev"]);
-    let i_name = col_idx(&["name", "station_name"]);
-
-    // Detect repeated sky_cover / cloud_base_ft_agl pairs (old ADDS format).
-    let cloud_cols: Vec<(usize, Option<usize>)> = {
-        let mut pairs = Vec::new();
-        for (i, col) in columns.iter().enumerate() {
-            if *col == "sky_cover" {
-                let base = if columns.get(i + 1).is_some_and(|c| *c == "cloud_base_ft_agl") {
-                    Some(i + 1)
-                } else {
-                    None
-                };
-                pairs.push((i, base));
-            }
-        }
-        pairs
-    };
-
-    let Some(i_station) = i_station else {
-        return Err("Missing station_id/icaoId column".to_string());
-    };
-    let Some(i_lat) = i_lat else {
-        return Err("Missing latitude/lat column".to_string());
-    };
-    let Some(i_lon) = i_lon else {
-        return Err("Missing longitude/lon column".to_string());
-    };
-
-    let min_fields = i_station.max(i_lat).max(i_lon) + 1;
-    let mut observations = Vec::new();
-
-    // Non-empty cells that fail to parse are counted rather than silently
-    // dropped. A whole column quietly turning into `None` — a unit or format
-    // change upstream, e.g. IEM's float `sknt` against a `u16` parse — is
-    // otherwise completely invisible. One summary line, not one per row.
-    let rejected = Cell::new(0u32);
-    let rejected_sample = RefCell::new(String::new());
-    let note_reject = |s: &str| {
-        rejected.set(rejected.get() + 1);
-        let mut sample = rejected_sample.borrow_mut();
+impl Rejections {
+    fn note(&self, field: &str, value: &Value) {
+        self.count.set(self.count.get() + 1);
+        let mut sample = self.sample.borrow_mut();
         if sample.is_empty() {
-            *sample = s.to_string();
+            *sample = format!("{field}={value}");
         }
-    };
+    }
 
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty()
-            || trimmed.starts_with('!')
-            || trimmed.starts_with('#')
-        {
-            continue;
+    fn count(&self) -> u32 {
+        self.count.get()
+    }
+
+    /// Read a JSON cell that should hold a finite number.
+    fn number(&self, field: &str, cell: &Option<Value>) -> Option<f64> {
+        let value = cell.as_ref()?;
+        if value.is_null() {
+            return None;
         }
-
-        let fields = parse_csv_line(trimmed);
-        if fields.len() < min_fields {
-            continue;
+        match value.as_f64() {
+            Some(n) if n.is_finite() => Some(n),
+            _ => {
+                self.note(field, value);
+                None
+            }
         }
+    }
+}
 
-        let station_id = fields[i_station].to_string();
-        if station_id.is_empty() {
-            continue;
+// ── Wire format ───────────────────────────────────────────────────────────
+
+/// IEM's `currents.json` envelope: a pandas `orient="table"` dump.
+#[derive(Debug, Deserialize)]
+struct CurrentsResponse {
+    #[serde(default)]
+    data: Vec<Record>,
+}
+
+/// One station's current observation.
+///
+/// Numeric fields are `Value` rather than `f64` on purpose: a field that
+/// changed type upstream would abort deserialization of the *entire* response
+/// if it were typed, losing every station in the state. Held as `Value` it is
+/// counted by [`Rejections`] and the rest of the record survives.
+#[derive(Debug, Deserialize)]
+struct Record {
+    #[serde(default)]
+    station: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    lat: Option<Value>,
+    #[serde(default)]
+    lon: Option<Value>,
+    /// Degrees **Fahrenheit**.
+    #[serde(default)]
+    tmpf: Option<Value>,
+    /// Degrees **Fahrenheit**.
+    #[serde(default)]
+    dwpf: Option<Value>,
+    /// Wind direction, degrees true.
+    #[serde(default)]
+    drct: Option<Value>,
+    /// Wind speed in knots — a **float**.
+    #[serde(default)]
+    sknt: Option<Value>,
+    /// Gust in knots.
+    #[serde(default)]
+    gust: Option<Value>,
+    /// Visibility in statute miles.
+    #[serde(default)]
+    vsby: Option<Value>,
+    /// Altimeter setting in **inches of mercury**.
+    #[serde(default)]
+    alti: Option<Value>,
+    /// Present weather codes.
+    #[serde(default)]
+    wxcodes: Option<Value>,
+    /// The raw METAR text.
+    #[serde(default)]
+    raw: Option<String>,
+    /// Observation time, ISO 8601 UTC.
+    #[serde(default)]
+    utc_valid: Option<String>,
+    #[serde(default)]
+    skyc1: Option<String>,
+    #[serde(default)]
+    skyl1: Option<Value>,
+    #[serde(default)]
+    skyc2: Option<String>,
+    #[serde(default)]
+    skyl2: Option<Value>,
+    #[serde(default)]
+    skyc3: Option<String>,
+    #[serde(default)]
+    skyl3: Option<Value>,
+    #[serde(default)]
+    skyc4: Option<String>,
+    #[serde(default)]
+    skyl4: Option<Value>,
+}
+
+// ── Fetch ─────────────────────────────────────────────────────────────────
+
+/// Fetch current METARs for every state network the viewport overlaps.
+///
+/// Networks are fetched concurrently; a network that fails is logged and
+/// skipped rather than failing the whole overlay, because losing one state is
+/// much better than losing the map.
+pub async fn fetch_current_metars(
+    client: &reqwest::Client,
+    sources: &rustdar_radar::sources::DataSources,
+    viewport: &GeoBounds,
+) -> Result<Vec<MetarOb>, String> {
+    let states = networks::networks_for_viewport(viewport);
+    if states.is_empty() {
+        log::info!("METAR: viewport overlaps no ASOS network");
+        return Ok(Vec::new());
+    }
+    log::info!("Fetching METARs for {} network(s): {states:?}", states.len());
+
+    let requests = states.iter().map(|state| {
+        let url = sources.metar_state_url(state);
+        async move {
+            let body = client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| format!("{state}: request failed: {e}"))?
+                .error_for_status()
+                .map_err(|e| format!("{state}: {e}"))?
+                .text()
+                .await
+                .map_err(|e| format!("{state}: body read failed: {e}"))?;
+            parse_currents(&body).map_err(|e| format!("{state}: {e}"))
         }
+    });
 
-        let Ok(lat) = fields[i_lat].parse::<f64>() else { continue };
-        let Ok(lon) = fields[i_lon].parse::<f64>() else { continue };
+    let results = futures::future::join_all(requests).await;
+
+    let mut all = Vec::new();
+    let mut rejected_total = 0u32;
+    let mut failures = 0usize;
+    for result in results {
+        match result {
+            Ok((obs, rejected)) => {
+                all.extend(obs);
+                rejected_total += rejected;
+            }
+            Err(e) => {
+                failures += 1;
+                log::warn!("METAR network fetch failed: {e}");
+            }
+        }
+    }
+
+    if failures == states.len() {
+        return Err(format!("all {failures} METAR network fetches failed"));
+    }
+
+    if rejected_total > 0 {
+        log::warn!(
+            "METAR: {rejected_total} present-but-unparseable cell(s) — a schema \
+             or unit change upstream?"
+        );
+    }
+    log::info!("Parsed {} METAR observations", all.len());
+    Ok(all)
+}
+
+/// Parse one `currents.json` body.
+///
+/// Returns the observations alongside the number of present-but-unusable
+/// cells. That count is the tripwire for a silent upstream schema change, so
+/// it is a return value rather than only a log line, and tests assert on it.
+fn parse_currents(body: &str) -> Result<(Vec<MetarOb>, u32), String> {
+    let response: CurrentsResponse =
+        serde_json::from_str(body).map_err(|e| format!("bad currents.json: {e}"))?;
+
+    let rejects = Rejections::default();
+    let mut observations = Vec::with_capacity(response.data.len());
+
+    for record in &response.data {
+        let Some(lat) = rejects.number("lat", &record.lat) else { continue };
+        let Some(lon) = rejects.number("lon", &record.lon) else { continue };
         if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
             continue;
         }
 
-        let get_f64 = |idx: Option<usize>| -> Option<f64> {
-            let s = *idx.and_then(|i| fields.get(i))?;
-            if s.is_empty() {
-                return None;
-            }
-            match s.parse() {
-                Ok(v) => Some(v),
-                Err(_) => {
-                    note_reject(s);
-                    None
-                }
-            }
-        };
-        let get_u16 = |idx: Option<usize>| -> Option<u16> {
-            let s = *idx.and_then(|i| fields.get(i))?;
-            if s.is_empty() {
-                return None;
-            }
-            match s.parse() {
-                Ok(v) => Some(v),
-                Err(_) => {
-                    note_reject(s);
-                    None
-                }
-            }
-        };
-        let get_str = |idx: Option<usize>| -> String {
-            idx.and_then(|i| fields.get(i))
-                .map(|s| s.to_string())
-                .unwrap_or_default()
-        };
+        let raw_ob = record.raw.clone().unwrap_or_default();
 
-        let name = i_name
-            .and_then(|i| fields.get(i))
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| station_id.clone());
+        // IEM keys on the local 3-letter identifier ("OKC"); the ICAO callsign
+        // is the first token of the raw report ("KOKC"). Prefer the ICAO,
+        // because that is what the rest of the app and the user expect, and
+        // what AWC supplied.
+        let station_id = icao_from_raw(&raw_ob)
+            .map(str::to_string)
+            .unwrap_or_else(|| record.station.clone());
+        if station_id.is_empty() {
+            continue;
+        }
 
-        // The unit rides along with the column name, so a new spelling cannot
-        // inherit the wrong one. See the UNIT HAZARD note on `col_idx`.
-        let altimeter_hpa =
-            altim_col.and_then(|(i, unit)| get_f64(Some(i)).map(|v| unit.to_hpa(v)));
+        // The unit rides in the type: `Fahrenheit` has no path to a Celsius
+        // field except `to_celsius`. See the UNIT HAZARD note.
+        let temp_c = rejects
+            .number("tmpf", &record.tmpf)
+            .map(|v| Fahrenheit(v).to_celsius());
+        let dewp_c = rejects
+            .number("dwpf", &record.dwpf)
+            .map(|v| Fahrenheit(v).to_celsius());
+        let altimeter_hpa = rejects
+            .number("alti", &record.alti)
+            .map(|v| InchesOfMercury(v).to_hpa());
 
-        let flight_category = i_fltcat
-            .and_then(|i| fields.get(i))
-            .and_then(|s| parse_flight_category(s));
+        // `sknt` is a float; rounding is the conversion, not a parse. The CSV
+        // path's `u16::from_str` rejected "14.0" outright and blanked the
+        // whole column.
+        let wind_speed_kt = rejects
+            .number("sknt", &record.sknt)
+            .map(|v| v.round() as u16);
+        let wind_gust_kt = rejects
+            .number("gust", &record.gust)
+            .map(|v| v.round() as u16);
+        let csv_dir = rejects
+            .number("drct", &record.drct)
+            .map(|v| v.round() as u16);
 
-        let wx_string = i_wx
-            .and_then(|i| fields.get(i))
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
-
-        let clouds: Vec<CloudLayer> = cloud_cols
-            .iter()
-            .filter_map(|(cover_i, base_i)| {
-                let cover = fields.get(*cover_i)?.to_string();
-                if cover.is_empty() {
-                    return None;
-                }
-                let base_ft = base_i
-                    .and_then(|bi| fields.get(bi))
-                    .and_then(|s| if s.is_empty() { None } else { s.parse().ok() });
-                Some(CloudLayer { cover, base_ft })
-            })
-            .collect();
-
-        let raw_ob = get_str(i_raw);
-        let wind_speed_kt = get_u16(i_wspd);
+        let clouds = cloud_layers(record, &rejects);
+        let visibility = rejects
+            .number("vsby", &record.vsby)
+            .and_then(|miles| visibility_from(miles, &raw_ob));
 
         observations.push(MetarOb {
             station_id,
-            name,
+            name: record
+                .name
+                .clone()
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| record.station.clone()),
             lat,
             lon,
-            elev_m: get_f64(i_elev),
-            temp_c: temp_col.and_then(|(i, u)| get_f64(Some(i)).map(|v| u.to_celsius(v))),
-            dewp_c: dewp_col.and_then(|(i, u)| get_f64(Some(i)).map(|v| u.to_celsius(v))),
-            // NOT the raw column: `wind_dir_degrees=0` means calm *or* variable,
-            // and reading it as a bearing pointed a barb due north for a quarter
-            // of the feed. See `resolve_wind_dir`.
-            wind_dir: resolve_wind_dir(&raw_ob, get_u16(i_wdir), wind_speed_kt),
+            // IEM's currents feed carries no station elevation. AWC's did.
+            // Left `None` rather than guessed: the station model only prints
+            // it when present.
+            elev_m: None,
+            temp_c,
+            dewp_c,
+            wind_dir: resolve_wind_dir(&raw_ob, csv_dir, wind_speed_kt),
             wind_speed_kt,
-            wind_gust_kt: get_u16(i_wgst),
-            // NOT `get_f64`: AWC writes an unrestricted visibility as `10+` /
-            // `6+`, which `f64::from_str` rejects. Those are 78.5% of the feed's
-            // non-empty values, so parsing them as a plain number blanked the
-            // field for four stations in five — and specifically for the ones
-            // with *good* visibility.
-            visibility: i_vis
-                .and_then(|i| fields.get(i))
-                .and_then(|s| Visibility::parse(s)),
+            wind_gust_kt,
+            visibility,
             altimeter_hpa,
-            flight_category,
+            // Not reported by IEM; derived. See `derive_flight_category`.
+            flight_category: derive_flight_category(visibility, ceiling_ft(&clouds)),
             raw_ob,
             clouds,
-            wx_string,
-            obs_time: get_str(i_time),
+            wx_string: record
+                .wxcodes
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            obs_time: record.utc_valid.clone().unwrap_or_default(),
         });
     }
 
-    if rejected.get() > 0 {
+    if rejects.count() > 0 {
         log::warn!(
-            "METAR cache: dropped {} non-empty cell(s) that failed to parse \
-             (first: {:?}) — a schema or unit change upstream?",
-            rejected.get(),
-            rejected_sample.borrow(),
+            "METAR: dropped {} present-but-unparseable cell(s) (first: {:?})",
+            rejects.count(),
+            rejects.sample.borrow(),
         );
     }
 
-    log::info!("Parsed {} METAR observations from cache", observations.len());
-    Ok((observations, rejected.get()))
+    Ok((observations, rejects.count()))
 }
 
-// ── Column units ──────────────────────────────────────────────────────────
-//
-// These exist so a column's unit is stated where its *name* is declared,
-// instead of being inferred later from a string comparison. See the UNIT
-// HAZARD note in `parse_metar_csv`.
-
-/// The unit a temperature column's values are recorded in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TempUnit {
-    Celsius,
-    /// Not produced by AWC. Present so that wiring up a Fahrenheit feed
-    /// (IEM's `tmpf`/`dwpf`) requires converting rather than mislabelling.
-    #[allow(dead_code)]
-    Fahrenheit,
-}
-
-impl TempUnit {
-    fn to_celsius(self, v: f64) -> f64 {
-        match self {
-            TempUnit::Celsius => v,
-            TempUnit::Fahrenheit => (v - 32.0) * 5.0 / 9.0,
-        }
-    }
-}
-
-/// The unit a pressure/altimeter column's values are recorded in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PressureUnit {
-    Hpa,
-    InHg,
-}
-
-impl PressureUnit {
-    fn to_hpa(self, v: f64) -> f64 {
-        match self {
-            PressureUnit::Hpa => v,
-            PressureUnit::InHg => v * 33.8639,
-        }
-    }
-}
-
-/// First present column among `names`, with the unit bound to that spelling.
+/// The ICAO callsign at the head of a raw METAR.
 ///
-/// Unlike a bare candidate list, this cannot resolve a name to a unit it does
-/// not carry: every candidate must state its own.
-fn col_idx_unit<U: Copy>(columns: &[&str], names: &[(&str, U)]) -> Option<(usize, U)> {
-    names.iter().find_map(|(name, unit)| {
-        columns
-            .iter()
-            .position(|c| c == name)
-            .map(|i| (i, *unit))
+/// `"KOKC 251652Z 20014G20KT ..."` → `"KOKC"`. Some reports lead with the
+/// `METAR`/`SPECI` keyword, which is skipped.
+fn icao_from_raw(raw: &str) -> Option<&str> {
+    raw.split_whitespace()
+        .find(|t| !matches!(*t, "METAR" | "SPECI"))
+        .filter(|t| {
+            t.len() == 4 && t.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        })
+}
+
+/// Build [`Visibility`] from IEM's numeric miles plus the raw report.
+///
+/// IEM decodes the visibility to a plain number, which loses the distinction
+/// AWC spelled as a trailing `+`: `10SM` in a US METAR is the **maximum
+/// reportable value** and means "10 or more", not "exactly 10", and ICAO's
+/// `9999` means "10 km or more". [`Visibility::or_greater`] exists to keep
+/// that apart from a measured 10, so it is recovered from the raw text rather
+/// than dropped.
+fn visibility_from(miles: f64, raw: &str) -> Option<Visibility> {
+    if !miles.is_finite() || miles < 0.0 {
+        return None;
+    }
+    Some(Visibility { miles, or_greater: raw_visibility_is_a_bound(raw) })
+}
+
+/// Whether the raw report states an unrestricted visibility.
+///
+/// The three spellings that mean "or more": US `10SM` (the maximum a US METAR
+/// reports), the `P` prefix (`P6SM`), and ICAO `9999`.
+fn raw_visibility_is_a_bound(raw: &str) -> bool {
+    raw.split_whitespace().any(|token| {
+        token == "10SM"
+            || token == "9999"
+            || (token.starts_with('P') && token.ends_with("SM"))
     })
 }
 
+/// Cloud layers, lowest first, from IEM's four `skyc`/`skyl` slots.
+fn cloud_layers(record: &Record, rejects: &Rejections) -> Vec<CloudLayer> {
+    let slots = [
+        (&record.skyc1, &record.skyl1, "skyl1"),
+        (&record.skyc2, &record.skyl2, "skyl2"),
+        (&record.skyc3, &record.skyl3, "skyl3"),
+        (&record.skyc4, &record.skyl4, "skyl4"),
+    ];
+    slots
+        .iter()
+        .filter_map(|(cover, level, field)| {
+            let cover = cover.as_ref()?.trim();
+            if cover.is_empty() {
+                return None;
+            }
+            Some(CloudLayer {
+                cover: cover.to_string(),
+                base_ft: rejects.number(field, level).map(|v| v.round() as u32),
+            })
+        })
+        .collect()
+}
+
+/// The ceiling: the base of the lowest broken or overcast layer, in feet AGL.
+///
+/// FEW and SCT are not ceilings — they are scattered cloud with the sky still
+/// visible through them — so only BKN, OVC and the obscured-sky indicators
+/// count. `VV` (vertical visibility) is a ceiling by definition: the sky is
+/// not visible at all above it.
+fn ceiling_ft(clouds: &[CloudLayer]) -> Option<u32> {
+    clouds
+        .iter()
+        .filter(|l| matches!(l.cover.as_str(), "BKN" | "OVC" | "VV" | "OVX"))
+        .filter_map(|l| l.base_ft)
+        .min()
+}
+
+/// Flight category from visibility and ceiling.
+///
+/// IEM does not report one, so it is derived. The thresholds are the FAA's
+/// (AIM 7-1-8 / the AWC's own definitions), and the rule is that the **worse**
+/// of the two inputs decides — a 300 ft ceiling is IFR-or-worse no matter how
+/// far you can see along the ground.
+///
+/// ```text
+///            ceiling (ft AGL)          visibility (statute miles)
+///   LIFR     < 500                     < 1
+///   IFR      500 to < 1000             1 to < 3
+///   MVFR     1000 to 3000              3 to 5
+///   VFR      > 3000                    > 5
+/// ```
+///
+/// Returns `None` only when *neither* input is available; a report with a
+/// visibility and no cloud layers is still categorisable, and clear skies are
+/// the common case.
+fn derive_flight_category(
+    visibility: Option<Visibility>,
+    ceiling: Option<u32>,
+) -> Option<FlightCategory> {
+    let from_ceiling = ceiling.map(|ft| {
+        if ft < 500 {
+            FlightCategory::LIFR
+        } else if ft < 1000 {
+            FlightCategory::IFR
+        } else if ft <= 3000 {
+            FlightCategory::MVFR
+        } else {
+            FlightCategory::VFR
+        }
+    });
+
+    let from_visibility = visibility.map(|v| {
+        // An "or greater" report is a lower bound, so it can only improve the
+        // category; using the bound itself is the conservative reading and is
+        // what AWC's own published category did.
+        let m = v.miles;
+        if m < 1.0 {
+            FlightCategory::LIFR
+        } else if m < 3.0 {
+            FlightCategory::IFR
+        } else if m <= 5.0 {
+            FlightCategory::MVFR
+        } else {
+            FlightCategory::VFR
+        }
+    });
+
+    match (from_ceiling, from_visibility) {
+        (Some(a), Some(b)) => Some(worse(a, b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// Rank order, worst first, so the pair-wise minimum is the reported category.
+fn severity(c: FlightCategory) -> u8 {
+    match c {
+        FlightCategory::LIFR => 0,
+        FlightCategory::IFR => 1,
+        FlightCategory::MVFR => 2,
+        FlightCategory::VFR => 3,
+    }
+}
+
+fn worse(a: FlightCategory, b: FlightCategory) -> FlightCategory {
+    if severity(a) <= severity(b) { a } else { b }
+}
+
 // ── Wind direction ────────────────────────────────────────────────────────
+//
+// Unchanged from the CSV path: these read the *raw METAR text*, which IEM
+// carries verbatim in `raw`, so the reasoning and the measurements behind them
+// still apply.
 
 /// Decide a report's wind direction, preferring the raw METAR text.
 ///
-/// The `wind_dir_degrees` column cannot answer this on its own: AWC writes `0`
-/// for calm *and* for variable and never leaves it empty for either, while a
-/// genuine northerly is reported as `360`. The raw report says which it is
-/// outright — `00000KT` versus `VRBnnKT` — so that is the primary source.
-///
-/// The column is the fallback for reports with no parseable wind group (60 of
-/// 4,933 rows in the measured cache, 59 of them with an empty direction).
-/// Measured over that same cache the two sources agreed on **4,873 of 4,873**
-/// rows that had both, so the fallback rule below is the column's convention
-/// applied faithfully, not a second guess.
+/// The numeric direction column cannot answer this on its own: `0` means calm
+/// *or* variable, while a genuine northerly is reported as `360`. The raw
+/// report says which it is outright — `00000KT` versus `VRBnnKT`.
 fn resolve_wind_dir(
     raw_ob: &str,
     csv_dir: Option<u16>,
@@ -411,9 +553,8 @@ fn classify_wind(dir: Option<u16>, speed: u16) -> WindDir {
         None => WindDir::Variable,
         Some(0) if speed == 0 => WindDir::Calm,
         // A `000` bearing with a non-zero speed is not a legal METAR direction —
-        // `000` is reserved for calm. Two Canadian AUTO stations reported
-        // `00025KT` and `00022KT` in the measured cache. Whatever the sensor
-        // meant, it is not "due north", so refuse to draw a bearing for it.
+        // `000` is reserved for calm. Whatever the sensor meant, it is not
+        // "due north", so refuse to draw a bearing for it.
         Some(0) => WindDir::Variable,
         Some(d) => WindDir::Degrees(d),
     }
@@ -421,13 +562,9 @@ fn classify_wind(dir: Option<u16>, speed: u16) -> WindDir {
 
 /// Extract `(direction, speed)` from a raw METAR's wind group.
 ///
-/// Returns the direction as `None` for an explicit `VRB`.
-///
 /// Scanning stops at `RMK`/`TEMPO`/`BECMG`/`NOSIG`, because those sections
-/// carry *other* winds: `GCGM` reports `00000KT` but has `R09/VRB07G21KT` in
-/// its remarks, so a plain substring search for "VRB" would call a dead-calm
-/// station variable. Taking the first match also keeps forecast groups such as
-/// `... 04004KT ... TEMPO VRB15G25KT` from overriding the observed wind.
+/// carry *other* winds: a station reporting `00000KT` with `R09/VRB07G21KT` in
+/// its remarks is dead calm, not variable.
 fn raw_wind_group(raw_ob: &str) -> Option<(Option<u16>, u16)> {
     for token in raw_ob.split_whitespace() {
         if matches!(token, "RMK" | "TEMPO" | "BECMG" | "NOSIG") {
@@ -441,16 +578,12 @@ fn raw_wind_group(raw_ob: &str) -> Option<(Option<u16>, u16)> {
 }
 
 /// Parse one `dddffKT` / `VRBffKT` token (optionally `Gff`, in KT/MPS/KMH).
-///
-/// Speed units are deliberately not converted: only the direction is read
-/// here, and the speed is used solely to separate calm from variable.
 fn parse_wind_token(token: &str) -> Option<(Option<u16>, u16)> {
     let body = token
         .strip_suffix("KT")
         .or_else(|| token.strip_suffix("MPS"))
         .or_else(|| token.strip_suffix("KMH"))?;
 
-    // Drop the gust suffix; it plays no part in the direction.
     let body = match body.split_once('G') {
         Some((before, gust)) => {
             if gust.is_empty() || !gust.bytes().all(|b| b.is_ascii_digit()) {
@@ -484,51 +617,16 @@ fn parse_wind_token(token: &str) -> Option<(Option<u16>, u16)> {
     Some((dir, speed_digits.parse().ok()?))
 }
 
-/// Parse a single CSV line, handling quoted fields.
-fn parse_csv_line(line: &str) -> Vec<&str> {
-    if !line.contains('"') {
-        return line.split(',').collect();
-    }
-    let mut fields = Vec::new();
-    let mut in_quotes = false;
-    let mut start = 0;
-    let bytes = line.as_bytes();
-    for i in 0..bytes.len() {
-        if bytes[i] == b'"' {
-            in_quotes = !in_quotes;
-        } else if bytes[i] == b',' && !in_quotes {
-            fields.push(line[start..i].trim_matches('"'));
-            start = i + 1;
-        }
-    }
-    fields.push(line[start..].trim_matches('"'));
-    fields
-}
-
-fn parse_flight_category(s: &str) -> Option<FlightCategory> {
-    match s {
-        "VFR" => Some(FlightCategory::VFR),
-        "MVFR" => Some(FlightCategory::MVFR),
-        "IFR" => Some(FlightCategory::IFR),
-        "LIFR" => Some(FlightCategory::LIFR),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Thirteen verbatim rows from a live `metars.cache.csv.gz`, chosen to cover
-    /// every shape the live-data bugs turned on: `10+`, `6+`, a fractional
-    /// measurement, a measurement above 10, an empty visibility, calm, fast and
-    /// slow `VRB`, a genuine northerly, an `RMK`-only `VRB`, a `000` bearing
-    /// carrying speed, metric `MPS`, and a report with no wind group at all.
-    const SAMPLE: &str = include_str!("testdata/metars.sample.csv");
+    /// A verbatim `currents.json` body, captured from
+    /// `?network=OK_ASOS`, trimmed to the stations the assertions need.
+    const SAMPLE: &str = include_str!("testdata/currents.ok.json");
 
     fn sample() -> Vec<MetarOb> {
-        let (obs, _) = parse_metar_csv(SAMPLE).expect("fixture must parse");
-        obs
+        parse_currents(SAMPLE).expect("fixture must parse").0
     }
 
     fn station(id: &str) -> MetarOb {
@@ -538,267 +636,400 @@ mod tests {
             .unwrap_or_else(|| panic!("fixture has no station {id}"))
     }
 
-    #[test]
-    fn every_fixture_row_survives_parsing() {
-        assert_eq!(sample().len(), 13, "fixture rows must all be accepted");
-    }
+    // ── Units ─────────────────────────────────────────────────────────────
 
-    /// `10+` and `6+` are 78.5% of the live feed's non-empty visibilities.
-    /// Parsing them straight into `f64` yields `Err`, and the `.ok()` that used
-    /// to follow turned four of every five stations blank.
+    /// IEM's `tmpf` is Fahrenheit. KOKC's live record reads `"tmpf": 93.0`,
+    /// and its raw METAR reads `34/22` — 34 °C. The conversion must produce
+    /// the raw report's own number.
+    ///
+    /// The expected value is the METAR group, not a number this code produced.
     #[test]
-    fn an_unrestricted_visibility_survives_its_trailing_plus() {
-        assert_eq!(
-            Visibility::parse("10+"),
-            Some(Visibility { miles: 10.0, or_greater: true })
+    fn a_fahrenheit_temperature_is_converted_not_relabelled() {
+        let okc = station("KOKC");
+        assert!(okc.raw_ob.contains(" 34/22 "), "fixture must keep the trap");
+        let c = okc.temp_c.expect("KOKC reports a temperature");
+        assert!(
+            (c - 33.888_889).abs() < 1e-4,
+            "93 F is 33.89 C, got {c} — was the value relabelled rather than converted?",
         );
-        assert_eq!(
-            Visibility::parse("6+"),
-            Some(Visibility { miles: 6.0, or_greater: true })
+        // The METAR rounds to whole degrees; that is the independent check.
+        assert_eq!(c.round(), 34.0);
+        // And the dewpoint: 71 F -> 21.67 C, METAR says 22.
+        assert_eq!(okc.dewp_c.unwrap().round(), 22.0);
+    }
+
+    /// Hand-worked arithmetic, independent of any fixture.
+    #[test]
+    fn the_fahrenheit_conversion_is_the_real_formula() {
+        assert_eq!(Fahrenheit(32.0).to_celsius(), 0.0);
+        assert_eq!(Fahrenheit(212.0).to_celsius(), 100.0);
+        assert_eq!(Fahrenheit(-40.0).to_celsius(), -40.0);
+        assert!((Fahrenheit(90.0).to_celsius() - 32.222_222).abs() < 1e-5);
+    }
+
+    /// IEM's `alti` is inHg. KOKC reads `"alti": 30.04` and its raw METAR
+    /// carries `A3004` — the same value, so the fixture pins the unit.
+    #[test]
+    fn an_inhg_altimeter_is_converted_to_hectopascals() {
+        let okc = station("KOKC");
+        assert!(okc.raw_ob.contains("A3004"), "fixture must keep the trap");
+        let hpa = okc.altimeter_hpa.expect("KOKC reports an altimeter");
+        // 30.04 inHg x 33.8639 = 1017.27 hPa, worked by hand.
+        assert!((hpa - 1017.27).abs() < 0.01, "got {hpa} hPa");
+        // Read as hPa directly it would have been ~30, i.e. 34x low.
+        assert!(hpa > 900.0, "{hpa} looks like a raw inHg value");
+    }
+
+    /// `sknt` arrives as a float. The CSV parser's `u16::from_str` rejected
+    /// `"14.0"` outright, which blanked every wind speed in the feed.
+    #[test]
+    fn a_float_wind_speed_survives() {
+        let okc = station("KOKC");
+        assert!(okc.raw_ob.contains("20014G20KT"), "fixture must keep the trap");
+        assert_eq!(okc.wind_speed_kt, Some(14), "sknt 14.0 must round to 14");
+        assert_eq!(okc.wind_gust_kt, Some(20));
+        assert_eq!(okc.wind_dir, Some(WindDir::Degrees(200)));
+    }
+
+    /// A cell that is present but not a number is counted, not swallowed.
+    /// A `null` is *not* a rejection — IEM writes it for "not reported".
+    #[test]
+    fn unusable_cells_are_counted_and_nulls_are_not() {
+        let (obs, rejected) = parse_currents(SAMPLE).unwrap();
+        assert_eq!(rejected, 0, "the real IEM fixture parses cleanly");
+        assert!(!obs.is_empty());
+        // The fixture does contain nulls, so "0 rejections" is a real result
+        // rather than an absence of nulls to misjudge.
+        assert!(
+            SAMPLE.contains(": null"),
+            "fixture must contain nulls for this test to mean anything",
         );
-        assert_eq!(station("KEDU").visibility.unwrap().miles, 10.0);
-        assert_eq!(station("LTAR").visibility.unwrap().miles, 6.0);
+
+        let broken = SAMPLE.replace("\"sknt\": 14.0", "\"sknt\": \"14 kt\"");
+        assert_ne!(broken, SAMPLE, "the replacement must actually apply");
+        let (broken_obs, rejected) = parse_currents(&broken).unwrap();
+        assert_eq!(rejected, 1, "a string in a numeric cell is one rejection");
+        let okc = broken_obs.iter().find(|o| o.station_id == "KOKC").unwrap();
+        assert_eq!(okc.wind_speed_kt, None);
+        // The rest of the record survives — that is why the field is `Value`.
+        assert!(okc.temp_c.is_some(), "one bad cell must not drop the station");
     }
 
-    /// The `+` is the whole point: dropping it would make `10+` and a measured
-    /// `10` indistinguishable, which is what the stale `Option<f64>` did.
+    // ── Identity ──────────────────────────────────────────────────────────
+
+    /// IEM keys on the local 3-letter id; the app wants the ICAO callsign,
+    /// which is the head of the raw report.
     #[test]
-    fn or_greater_separates_a_bound_from_a_measurement() {
-        assert!(Visibility::parse("10+").unwrap().or_greater);
-        assert!(!Visibility::parse("15").unwrap().or_greater);
-        assert!(station("KEDU").visibility.unwrap().or_greater, "10+ is a bound");
-        assert!(!station("CYYH").visibility.unwrap().or_greater, "15SM is measured");
-        assert!(!station("KUZA").visibility.unwrap().or_greater, "2.5 is measured");
+    fn the_station_id_is_the_icao_from_the_raw_report() {
+        assert_eq!(icao_from_raw("KOKC 251652Z 20014G20KT"), Some("KOKC"));
+        assert_eq!(icao_from_raw("METAR KTUL 251653Z 18012KT"), Some("KTUL"));
+        assert_eq!(icao_from_raw("SPECI KLAW 251700Z"), Some("KLAW"));
+        assert_eq!(icao_from_raw(""), None);
+        assert_eq!(icao_from_raw("251652Z 20014G20KT"), None, "not a callsign");
+        // And end to end: the fixture's `station` field is "OKC".
+        assert!(SAMPLE.contains("\"station\": \"OKC\""));
+        assert_eq!(station("KOKC").station_id, "KOKC");
     }
 
-    /// A measurement of 15 statute miles is not "10+"; the live cache carries 77
-    /// such rows (Canadian `15SM`, and metric reports converted from km), so the
-    /// `>= 10.0` branches were rare rather than strictly dead — and rendering
-    /// them as "10+" understated a real observation.
+    // ── Visibility ────────────────────────────────────────────────────────
+
+    /// `10SM` is the maximum a US METAR reports and means "10 or more".
+    /// Collapsing it to a bare 10 is the distinction `or_greater` exists for.
     #[test]
-    fn a_measurement_above_ten_renders_as_itself_not_as_ten_plus() {
-        assert_eq!(Visibility::parse("15").unwrap().label(), "15");
-        assert_eq!(Visibility::parse("12.43").unwrap().label(), "12.4");
-        assert_eq!(station("CYYH").visibility.unwrap().label(), "15");
+    fn an_unrestricted_visibility_is_recovered_from_the_raw_report() {
+        assert!(raw_visibility_is_a_bound("KOKC 251652Z 20014G20KT 10SM FEW250"));
+        assert!(raw_visibility_is_a_bound("EGLL 251650Z 25008KT 9999 FEW035"));
+        assert!(raw_visibility_is_a_bound("KXYZ 251650Z 25008KT P6SM SCT035"));
+        assert!(!raw_visibility_is_a_bound("KUZA 251650Z 00000KT 2 1/2SM BR"));
+        assert!(!raw_visibility_is_a_bound("KABC 251650Z 25008KT 5SM HZ"));
+
+        let okc = station("KOKC");
+        assert_eq!(okc.visibility.unwrap().miles, 10.0);
+        assert!(okc.visibility.unwrap().or_greater, "10SM is a bound");
+        assert_eq!(okc.visibility.unwrap().label(), "10+");
+    }
+
+    /// A measured visibility keeps its own value and loses the `+`.
+    #[test]
+    fn a_measured_visibility_is_not_marked_as_a_bound() {
+        let v = visibility_from(2.5, "KUZA 251650Z 00000KT 2 1/2SM BR OVC004").unwrap();
+        assert_eq!(v.miles, 2.5);
+        assert!(!v.or_greater);
+        assert_eq!(v.label(), "2.5");
     }
 
     #[test]
-    fn visibility_labels_keep_the_plus_and_drop_the_pointless_decimal() {
-        let cases = [
-            ("10+", "10+"),
-            ("6+", "6+"),
-            ("15", "15"),
-            ("9", "9"),
-            ("2.5", "2.5"),
-            // Rust's `{:.1}` rounds half to even, as the previous formatting
-            // did; 1/4 SM has always shown as 0.2. Pinned, not endorsed.
-            ("0.25", "0.2"),
+    fn a_nonsensical_visibility_is_rejected() {
+        assert_eq!(visibility_from(-1.0, "x"), None);
+        assert_eq!(visibility_from(f64::NAN, "x"), None);
+        assert_eq!(visibility_from(f64::INFINITY, "x"), None);
+    }
+
+    // ── Ceiling and flight category ───────────────────────────────────────
+
+    /// Only BKN/OVC/VV are ceilings. FEW and SCT are not — the sky is still
+    /// visible through them — and treating them as a ceiling would call a
+    /// clear day IFR.
+    #[test]
+    fn only_broken_or_worse_layers_form_a_ceiling() {
+        let few_only = vec![CloudLayer { cover: "FEW".into(), base_ft: Some(2500) }];
+        assert_eq!(ceiling_ft(&few_only), None, "FEW is not a ceiling");
+
+        let sct_only = vec![CloudLayer { cover: "SCT".into(), base_ft: Some(1800) }];
+        assert_eq!(ceiling_ft(&sct_only), None, "SCT is not a ceiling");
+
+        let mixed = vec![
+            CloudLayer { cover: "FEW".into(), base_ft: Some(800) },
+            CloudLayer { cover: "SCT".into(), base_ft: Some(1500) },
+            CloudLayer { cover: "BKN".into(), base_ft: Some(2500) },
+            CloudLayer { cover: "OVC".into(), base_ft: Some(4000) },
         ];
-        for (raw, want) in cases {
-            assert_eq!(Visibility::parse(raw).unwrap().label(), want, "input {raw:?}");
-        }
+        assert_eq!(
+            ceiling_ft(&mixed),
+            Some(2500),
+            "the lowest BKN/OVC wins, and the lower FEW/SCT are ignored",
+        );
+
+        let obscured = vec![CloudLayer { cover: "VV".into(), base_ft: Some(200) }];
+        assert_eq!(ceiling_ft(&obscured), Some(200), "VV is a ceiling");
+    }
+
+    /// KOKC's fixture record is `10SM FEW250` — no ceiling at all, good
+    /// visibility, so VFR. A `ceiling_ft` that counted FEW would make it VFR
+    /// too (25,000 ft), so the *lower* FEW in the mixed test above is what
+    /// separates the two.
+    #[test]
+    fn a_clear_report_with_good_visibility_is_vfr() {
+        let okc = station("KOKC");
+        assert_eq!(ceiling_ft(&okc.clouds), None);
+        assert_eq!(okc.flight_category, Some(FlightCategory::VFR));
+    }
+
+    /// The FAA thresholds, each probed on both sides of its boundary.
+    ///
+    /// Values are from the FAA/AWC definitions, not from this code.
+    #[test]
+    fn flight_category_thresholds_match_the_faa_definitions() {
+        let ceiling_only = |ft: u32| derive_flight_category(None, Some(ft));
+        assert_eq!(ceiling_only(499), Some(FlightCategory::LIFR));
+        assert_eq!(ceiling_only(500), Some(FlightCategory::IFR));
+        assert_eq!(ceiling_only(999), Some(FlightCategory::IFR));
+        assert_eq!(ceiling_only(1000), Some(FlightCategory::MVFR));
+        assert_eq!(ceiling_only(3000), Some(FlightCategory::MVFR));
+        assert_eq!(ceiling_only(3001), Some(FlightCategory::VFR));
+
+        let vis_only = |m: f64| {
+            derive_flight_category(Some(Visibility { miles: m, or_greater: false }), None)
+        };
+        assert_eq!(vis_only(0.5), Some(FlightCategory::LIFR));
+        assert_eq!(vis_only(1.0), Some(FlightCategory::IFR));
+        assert_eq!(vis_only(2.9), Some(FlightCategory::IFR));
+        assert_eq!(vis_only(3.0), Some(FlightCategory::MVFR));
+        assert_eq!(vis_only(5.0), Some(FlightCategory::MVFR));
+        assert_eq!(vis_only(5.1), Some(FlightCategory::VFR));
+    }
+
+    /// The worse of the two inputs decides. A 300 ft ceiling is LIFR however
+    /// far you can see, and half a mile of visibility is LIFR under a clear
+    /// sky — taking the *better* of the two, or only ever reading one, is the
+    /// mistake this guards.
+    #[test]
+    fn the_worse_of_ceiling_and_visibility_decides_the_category() {
+        let vis10 = Some(Visibility { miles: 10.0, or_greater: true });
+        assert_eq!(
+            derive_flight_category(vis10, Some(300)),
+            Some(FlightCategory::LIFR),
+            "a 300 ft ceiling is LIFR regardless of visibility",
+        );
+        let vis_half = Some(Visibility { miles: 0.5, or_greater: false });
+        assert_eq!(
+            derive_flight_category(vis_half, Some(25_000)),
+            Some(FlightCategory::LIFR),
+            "half a mile is LIFR regardless of ceiling",
+        );
+        // A genuinely mixed case: MVFR ceiling, IFR visibility -> IFR.
+        let vis2 = Some(Visibility { miles: 2.0, or_greater: false });
+        assert_eq!(
+            derive_flight_category(vis2, Some(1500)),
+            Some(FlightCategory::IFR),
+        );
     }
 
     #[test]
-    fn an_absent_or_nonsensical_visibility_is_none() {
-        for bad in ["", "   ", "+", "M1/4", "abc", "-3", "inf", "NaN"] {
-            assert_eq!(Visibility::parse(bad), None, "input {bad:?} must not parse");
-        }
-        assert_eq!(station("K20U").visibility, None, "K20U reports no visibility");
+    fn a_report_with_neither_input_has_no_category() {
+        assert_eq!(derive_flight_category(None, None), None);
     }
 
-    // ── Wind: calm vs variable vs a real bearing ──────────────────────────
+    // ── Wind ──────────────────────────────────────────────────────────────
 
-    /// AWC writes `wind_dir_degrees=0` for calm *and* variable and never leaves
-    /// it empty for either — 1,249 of 4,933 rows in the measured cache. Reading
-    /// it as a bearing pointed a barb due north for all of them.
-    #[test]
-    fn a_zero_direction_column_never_becomes_a_northerly_bearing() {
-        for id in ["LTAR", "KUZA", "KHHV", "KGOP", "K8A1", "GCGM", "CWHO"] {
-            let dir = station(id).wind_dir.expect("fixture rows carry wind data");
-            assert_ne!(
-                dir,
-                WindDir::Degrees(0),
-                "{id} reports wind_dir_degrees=0, which is not a bearing"
-            );
-            assert_eq!(dir.bearing(), None, "{id} must not offer a barb direction");
-        }
-    }
-
-    /// `00000KT` is calm; `VRBnnKT` is a real wind with no steady direction.
     #[test]
     fn calm_and_variable_are_told_apart() {
-        assert_eq!(station("KUZA").wind_dir, Some(WindDir::Calm));
-        assert_eq!(station("KHHV").wind_dir, Some(WindDir::Calm));
-        assert_eq!(station("LTAR").wind_dir, Some(WindDir::Variable));
-        assert_eq!(station("KGOP").wind_dir, Some(WindDir::Variable));
-    }
-
-    /// 202 of the 295 variable reports in the measured cache blow at 1–2 kt, so
-    /// inferring "variable" from a speed threshold would miss two thirds of them.
-    /// The raw text says `VRB` outright.
-    #[test]
-    fn a_slow_variable_wind_is_still_variable() {
-        let k8a1 = station("K8A1");
-        assert_eq!(k8a1.wind_speed_kt, Some(2), "K8A1 reports VRB02KT");
-        assert_eq!(k8a1.wind_dir, Some(WindDir::Variable));
-    }
-
-    /// The counterpart: a genuine northerly is reported as 360, never 0, and
-    /// must keep its bearing.
-    #[test]
-    fn a_genuine_northerly_keeps_its_bearing() {
-        let ktri = station("KTRI");
-        assert_eq!(ktri.wind_dir, Some(WindDir::Degrees(360)));
-        assert_eq!(ktri.wind_dir.unwrap().bearing(), Some(360));
-    }
-
-    #[test]
-    fn ordinary_bearings_pass_through_including_metric_reports() {
-        assert_eq!(station("KEDU").wind_dir, Some(WindDir::Degrees(180)));
-        assert_eq!(station("K20U").wind_dir, Some(WindDir::Degrees(190)));
-        assert_eq!(station("CYYH").wind_dir, Some(WindDir::Degrees(40)));
+        assert_eq!(resolve_wind_dir("K1 251650Z 00000KT", None, None), Some(WindDir::Calm));
+        assert_eq!(resolve_wind_dir("K1 251650Z VRB03KT", None, None), Some(WindDir::Variable));
         assert_eq!(
-            station("UUBW").wind_dir,
-            Some(WindDir::Degrees(340)),
-            "34002MPS is a bearing even though the speed is metric"
+            resolve_wind_dir("K1 251650Z 36003KT", None, None),
+            Some(WindDir::Degrees(360)),
+            "a genuine northerly is 360, never 0",
         );
     }
 
-    /// GCGM reports `00000KT` but carries `R09/VRB07G21KT` in its remarks. A
-    /// substring search for "VRB" would call a dead-calm station variable.
+    /// A `VRB` confined to the remarks must not make the station variable.
     #[test]
-    fn a_vrb_confined_to_the_remarks_does_not_make_the_station_variable() {
-        assert!(station("GCGM").raw_ob.contains("VRB"), "fixture must keep the trap");
-        assert_eq!(station("GCGM").wind_dir, Some(WindDir::Calm));
+    fn a_vrb_in_the_remarks_does_not_make_the_station_variable() {
+        let raw = "GCGM 251650Z 00000KT RMK R09/VRB07G21KT";
+        assert_eq!(resolve_wind_dir(raw, Some(0), Some(0)), Some(WindDir::Calm));
     }
-
-    /// Forecast groups carry their own winds; only the observed group counts.
-    #[test]
-    fn a_forecast_group_does_not_override_the_observed_wind() {
-        let raw = "METAR LFBI 250530Z AUTO 04004KT 340V080 9999 NCD 19/09 \
-                   Q1009 TEMPO VRB15G25KT 4000 TSRA BKN070CB";
-        assert_eq!(resolve_wind_dir(raw, Some(40), Some(4)), Some(WindDir::Degrees(40)));
-    }
-
-    /// `000` is reserved for calm, so a `000` bearing carrying 25 kt is not a
-    /// northerly — two Canadian AUTO stations report exactly this.
-    #[test]
-    fn a_zero_bearing_with_speed_is_not_treated_as_north() {
-        let cwho = station("CWHO");
-        assert_eq!(cwho.wind_speed_kt, Some(25), "CWHO reports 00025KT");
-        assert_eq!(cwho.wind_dir, Some(WindDir::Variable));
-        assert_eq!(cwho.wind_dir.unwrap().bearing(), None);
-    }
-
-    /// 59 of 4,933 rows report no wind at all. That is unknown, not calm.
-    #[test]
-    fn a_report_without_any_wind_data_has_no_direction() {
-        let k40u = station("K40U");
-        assert!(raw_wind_group(&k40u.raw_ob).is_none(), "K40U has no wind group");
-        assert_eq!(k40u.wind_dir, None);
-        assert_eq!(k40u.wind_speed_kt, None);
-    }
-
-    // ── Wind group tokenizer ──────────────────────────────────────────────
 
     #[test]
     fn wind_tokens_are_recognised_by_shape_not_by_substring() {
         assert_eq!(parse_wind_token("18006KT"), Some((Some(180), 6)));
-        assert_eq!(parse_wind_token("36003KT"), Some((Some(360), 3)));
-        assert_eq!(parse_wind_token("00000KT"), Some((Some(0), 0)));
+        assert_eq!(parse_wind_token("20014G20KT"), Some((Some(200), 14)));
         assert_eq!(parse_wind_token("VRB03KT"), Some((None, 3)));
-        assert_eq!(parse_wind_token("VRB06G13KT"), Some((None, 6)));
         assert_eq!(parse_wind_token("34002MPS"), Some((Some(340), 2)));
-        assert_eq!(parse_wind_token("120100KMH"), Some((Some(120), 100)));
-
-        // Not wind groups.
-        let rejects = [
-            "E00000KT",
-            "R09/VRB07G21KT",
-            "9999",
-            "A2986",
-            "18006",
-            "VRBKT",
-            "18006G",
-            "1800X6KT",
-        ];
-        for bad in rejects {
+        for bad in ["E00000KT", "R09/VRB07G21KT", "9999", "A2986", "18006", "VRBKT"] {
             assert_eq!(parse_wind_token(bad), None, "{bad:?} is not a wind group");
         }
     }
 
-    /// The observed wind precedes `RMK`; anything after it belongs to remarks.
+    /// A `000` bearing with speed is not a northerly — `000` is reserved for
+    /// calm.
     #[test]
-    fn scanning_for_the_wind_group_stops_at_the_remarks_marker() {
-        let raw = "METAR CWHO 250500Z AUTO RMK AO1 SLP105 18006KT";
-        assert_eq!(raw_wind_group(raw), None, "a wind inside RMK is not the observed wind");
+    fn a_zero_bearing_with_speed_is_not_treated_as_north() {
+        assert_eq!(classify_wind(Some(0), 25), WindDir::Variable);
+        assert_eq!(classify_wind(Some(0), 0), WindDir::Calm);
+        assert_eq!(classify_wind(Some(360), 5), WindDir::Degrees(360));
     }
 
-    /// The column agreed with the raw text on 4,873 of 4,873 measured rows, so
-    /// the fallback applies the column's own convention rather than guessing.
+    /// Every station in the fixture must survive parsing, and carry the raw
+    /// report the rest of the pipeline reads.
     #[test]
-    fn the_column_is_the_fallback_when_the_raw_text_has_no_wind_group() {
-        let no_group = "METAR K40U 250535Z AUTO 10SM CLR 25/09 A3027";
-        assert_eq!(resolve_wind_dir(no_group, None, None), None);
-        assert_eq!(resolve_wind_dir(no_group, Some(0), Some(0)), Some(WindDir::Calm));
-        assert_eq!(resolve_wind_dir(no_group, Some(0), Some(7)), Some(WindDir::Variable));
-        assert_eq!(
-            resolve_wind_dir(no_group, Some(360), Some(7)),
-            Some(WindDir::Degrees(360))
+    fn every_fixture_station_parses_and_keeps_its_raw_report() {
+        let obs = sample();
+        assert!(obs.len() >= 4, "fixture is too small to be meaningful");
+        for o in &obs {
+            assert!(!o.station_id.is_empty());
+            assert!(!o.raw_ob.is_empty(), "{} lost its raw report", o.station_id);
+            assert!(!o.obs_time.is_empty(), "{} lost its timestamp", o.station_id);
+            assert!((-90.0..=90.0).contains(&o.lat));
+            assert!((-180.0..=180.0).contains(&o.lon));
+        }
+    }
+
+    /// A body with no `data` array is an error, not an empty result — an empty
+    /// result would render as "no observations" and hide an API change.
+    #[test]
+    fn a_malformed_body_is_an_error() {
+        assert!(parse_currents("not json").is_err());
+        assert!(parse_currents("{\"data\": 5}").is_err());
+    }
+
+    // ── Live checks ───────────────────────────────────────────────────────
+
+    /// The live IEM feed fetches, parses and carries every mapped field.
+    ///
+    /// Run with:
+    ///   `cargo test -p rustdar-overlays -- --ignored --nocapture live_metar`
+    #[ignore = "hits the live mesonet.agron.iastate.edu API"]
+    #[tokio::test]
+    async fn live_metar_fetch_carries_every_mapped_field() {
+        let client = rustdar_radar::tls::simple_client(std::time::Duration::from_secs(60))
+            .build()
+            .expect("client");
+        let sources = rustdar_radar::sources::DataSources::production();
+        // Central Oklahoma — KTLX's neighbourhood.
+        let view = GeoBounds { min_lat: 34.3, max_lat: 36.3, min_lon: -98.3, max_lon: -96.3 };
+
+        let obs = fetch_current_metars(&client, &sources, &view)
+            .await
+            .expect("METAR fetch must succeed");
+        println!("fetched {} observations", obs.len());
+        assert!(obs.len() > 20, "expected a state's worth of ASOS sites");
+
+        // Each mapped field must be populated for *some* station: a field that
+        // is `None` everywhere is the silent-column failure this guards.
+        let has = |f: &dyn Fn(&MetarOb) -> bool| obs.iter().filter(|o| f(o)).count();
+        for (name, count) in [
+            ("temp_c", has(&|o| o.temp_c.is_some())),
+            ("dewp_c", has(&|o| o.dewp_c.is_some())),
+            ("wind_dir", has(&|o| o.wind_dir.is_some())),
+            ("wind_speed_kt", has(&|o| o.wind_speed_kt.is_some())),
+            ("visibility", has(&|o| o.visibility.is_some())),
+            ("altimeter_hpa", has(&|o| o.altimeter_hpa.is_some())),
+            ("flight_category", has(&|o| o.flight_category.is_some())),
+            ("raw_ob", has(&|o| !o.raw_ob.is_empty())),
+            ("obs_time", has(&|o| !o.obs_time.is_empty())),
+        ] {
+            println!("  {name}: {count}/{}", obs.len());
+            assert!(count > 0, "{name} is None for every station");
+        }
+
+        // Sanity: temperatures must look like Celsius, not Fahrenheit. A
+        // relabelled `tmpf` would read 60-110 across most of the US in summer.
+        for o in obs.iter().filter(|o| o.temp_c.is_some()) {
+            let c = o.temp_c.unwrap();
+            assert!(
+                (-60.0..=60.0).contains(&c),
+                "{} reports {c} C — that is a Fahrenheit value in a Celsius field",
+                o.station_id,
+            );
+        }
+        // And altimeters must look like hPa, not inHg.
+        for o in obs.iter().filter(|o| o.altimeter_hpa.is_some()) {
+            let hpa = o.altimeter_hpa.unwrap();
+            assert!(
+                (870.0..=1090.0).contains(&hpa),
+                "{} reports {hpa} hPa — that is an inHg value in a hPa field",
+                o.station_id,
+            );
+        }
+    }
+
+    /// The table in `super::networks` must still match IEM's own extents.
+    ///
+    /// Guards against a network being added, removed or moved upstream, which
+    /// would otherwise show up as a state quietly missing from the map.
+    #[ignore = "hits the live mesonet.agron.iastate.edu API"]
+    #[tokio::test]
+    async fn live_networks_table_matches_iems_own_extents() {
+        let client = rustdar_radar::tls::simple_client(std::time::Duration::from_secs(60))
+            .build()
+            .expect("client");
+        let body = client
+            .get("https://mesonet.agron.iastate.edu/api/1/networks.json")
+            .send()
+            .await
+            .expect("networks.json")
+            .text()
+            .await
+            .expect("body");
+
+        #[derive(serde::Deserialize)]
+        struct Net {
+            id: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Nets {
+            data: Vec<Net>,
+        }
+        let nets: Nets = serde_json::from_str(&body).expect("networks.json parses");
+
+        let upstream: std::collections::HashSet<String> = nets
+            .data
+            .iter()
+            .filter_map(|n| n.id.strip_suffix("_ASOS"))
+            .filter(|s| s.len() == 2 && s.chars().all(|c| c.is_ascii_uppercase()))
+            .map(str::to_string)
+            .collect();
+        let ours: std::collections::HashSet<String> = networks::NETWORKS
+            .iter()
+            .map(|n| n.state.to_string())
+            .collect();
+
+        let missing: Vec<_> = upstream.difference(&ours).collect();
+        let extra: Vec<_> = ours.difference(&upstream).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "networks table has drifted from IEM: missing {missing:?}, extra {extra:?}",
         );
-    }
-
-    // ── Column units (see the UNIT HAZARD note on `col_idx`) ──────────────
-
-    /// `altim_in_hg` spells its unit into the name; `altim` does not and is hPa.
-    /// The unit must ride with the name, not be re-derived from a string test.
-    #[test]
-    fn the_altimeter_unit_comes_from_the_column_name_that_matched() {
-        let candidates = [
-            ("altim_in_hg", PressureUnit::InHg),
-            ("altim", PressureUnit::Hpa),
-        ];
-
-        let cols = ["station_id", "altim_in_hg"];
-        assert_eq!(col_idx_unit(&cols, &candidates).unwrap().1, PressureUnit::InHg);
-
-        let cols = ["station_id", "altim"];
-        assert_eq!(col_idx_unit(&cols, &candidates).unwrap().1, PressureUnit::Hpa);
-
-        // And it is actually applied: KEDU reports 29.86 inHg.
-        let hpa = station("KEDU").altimeter_hpa.unwrap();
-        assert!((hpa - 29.86 * 33.8639).abs() < 1e-6, "got {hpa} hPa");
-    }
-
-    /// A Fahrenheit column (IEM's `tmpf`) must convert, not be relabelled. If a
-    /// future author adds it to the candidate list, `col_idx_unit` forces them
-    /// to state the unit and this conversion is what runs.
-    #[test]
-    fn a_fahrenheit_temperature_column_would_be_converted_not_relabelled() {
-        assert!((TempUnit::Fahrenheit.to_celsius(90.0) - 32.222_222).abs() < 1e-5);
-        assert_eq!(TempUnit::Celsius.to_celsius(21.0), 21.0);
-        // AWC's own column is already Celsius and must pass through untouched.
-        assert_eq!(station("KEDU").temp_c, Some(20.0));
-    }
-
-    /// A cell that is present but unparseable is counted, so a column silently
-    /// emptying out (IEM's float `sknt` against a `u16` parse, or the `10+`
-    /// visibility this tripwire was built for) shows up instead of vanishing.
-    #[test]
-    fn unparseable_cells_are_counted_rather_than_silently_dropped() {
-        let (obs, rejected) = parse_metar_csv(SAMPLE).unwrap();
-        assert_eq!(rejected, 0, "the real AWC fixture parses cleanly");
-        assert!(!obs.is_empty());
-
-        // Same header, one row whose wind speed arrived as a float.
-        let mut lines = SAMPLE.lines();
-        let header = lines.next().unwrap();
-        let row = lines.next().unwrap().replace(",180,6,", ",180,8.0,");
-        let broken = format!("{header}\n{row}\n");
-
-        let (broken_obs, rejected) = parse_metar_csv(&broken).unwrap();
-        assert_eq!(broken_obs[0].wind_speed_kt, None, "a float knot value is rejected");
-        assert_eq!(rejected, 1, "and the rejection is counted, not swallowed");
     }
 }

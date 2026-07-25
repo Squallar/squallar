@@ -72,6 +72,12 @@ pub struct App {
     latest_cached_scans: HashMap<String, (Arc<nexrad_model::data::Scan>, ScanInfo, chrono::NaiveDateTime)>,
     // Set when a manual time navigation fetch is pending; triggers loop reinit after scan loads.
     manual_nav_pending: bool,
+    /// The map extent most recently asked for on screen.
+    ///
+    /// Fed to `FetchConfig::viewport` so overlays that fetch per-region data
+    /// can scope their requests. `None` until the first frame that draws an
+    /// overlay; `metar::networks::DEFAULT_VIEWPORT` covers that window.
+    last_viewport: Option<rustdar_overlays::types::GeoBounds>,
 }
 
 impl App {
@@ -129,6 +135,7 @@ impl App {
             loop_mgr: LoopDownloadManager::new(),
             latest_cached_scans: HashMap::new(),
             manual_nav_pending: false,
+            last_viewport: None,
         }
     }
 
@@ -229,6 +236,10 @@ impl App {
 
         for action in actions {
             if let GuiAction::RenderOverlay { pane_idx, overlay_kind, geo_bounds, texture, data_generation, zoom } = action {
+                // The unexpanded viewport, which is what a region-scoped fetch
+                // wants — the renderer's overdraw margin is a rasterization
+                // concern and would over-fetch if it leaked into the request.
+                self.last_viewport = Some(geo_bounds);
                 overlay_renders.push((pane_idx, overlay_kind, fetch::OverlayRenderRequest {
                     geo_bounds, texture, data_generation, zoom,
                 }));

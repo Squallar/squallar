@@ -306,6 +306,16 @@ pub trait OverlayHandler: Send {
 pub struct FetchConfig {
     pub client: reqwest::Client,
     pub zone_cache_dir: Option<std::path::PathBuf>,
+    /// Where every origin this fetch may reach is declared.
+    pub sources: rustdar_radar::sources::DataSources,
+    /// The map area currently on screen, when one is known.
+    ///
+    /// Overlays that fetch per-region data scope their requests to this. METAR
+    /// is the one that must: the Iowa Environmental Mesonet serves current
+    /// observations one state network at a time, and the whole-country form is
+    /// 54 MB ungzipped. `None` on the first fetch, before any frame has been
+    /// rendered — see [`crate::metar::networks`] for what happens then.
+    pub viewport: Option<crate::types::GeoBounds>,
 }
 
 /// Context for preparing overlay rasterization closures.
