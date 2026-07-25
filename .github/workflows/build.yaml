@@ -75,6 +75,15 @@ jobs:
           # every optional capability is meaningful rather than fictional. The
           # feature-masking problem that `--all-features` causes is handled by the
           # `standalone` job below, not by weakening these.
+          #
+          # As of the `jni-typecheck` feature, `--all-features` also pulls
+          # `rustdar-android`'s JNI layer into these host builds -- `jni` is in the
+          # host `--all-features` graph and absent from the default one. So these
+          # rows, and host Clippy, now compile JNI code that was previously
+          # invisible to every host job. That is a real widening, but it is not
+          # Android coverage: the Android *target* still has no lint gate, and
+          # `android_main`, the winit Android backend and the linked `.so` are
+          # exercised only by the cargo-ndk rows.
           - name: Linux x86_64
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
@@ -298,12 +307,10 @@ jobs:
           path: dist
 
   # ---------------------------------------------------------------------------
-  # Android tier 1: the cheap gate, no NDK, ~7 seconds
+  # Android tier 1: type-check the JNI layer on the host, ~12 seconds
   # ---------------------------------------------------------------------------
   #
-  # (This rationale is inherited from the standalone android.yaml that this file
-  # absorbed, corrected where it was wrong. Kept here because it is the only
-  # written record of why the cheap tier exists.)
+  # (Rationale inherited from the standalone android.yaml this file absorbed.)
   #
   # Every Android source file in this repo is behind `#[cfg(target_os =
   # "android")]`, so `cargo check --workspace` on the host compiles *none* of it
@@ -312,51 +319,34 @@ jobs:
   # drags in, went green through Build, Clippy and Test while
   # `./gradlew assembleDebug` was failing at `:app:buildRustLibDebug`.
   #
-  # `rustdar-android-theme`'s only Android dependencies are `jni` and
-  # `ndk-context`, both pure Rust, so this compiles with nothing but a rustup
-  # target: no NDK, no C toolchain, no `cargo install`. Measured at 7.1s on this
-  # tree with every ANDROID_* variable unset, and it reproduces both errors of the
-  # jni break (`JavaVM::from_raw(..).unwrap()`, one-argument `JObject::from_raw`).
+  # `rustdar-android`'s `jni-typecheck` feature widens that cfg to
+  # `any(target_os = "android", feature = "jni-typecheck")` and supplies host
+  # copies of the four dependencies the helpers need, so every JNI helper except
+  # `android_main` compiles for the host. See the feature's comment in
+  # `rustdar-android/Cargo.toml`.
+  #
+  # This needs NOTHING: no NDK, no C toolchain, no `cargo install`, and not even a
+  # rustup target -- the graph is 46 crates with no `serialport`, so not even
+  # libudev. Measured at 11.7s cold on this tree with every ANDROID_* variable
+  # unset and every Android path stripped from PATH.
+  #
+  # It genuinely type-checks rather than compiling something harmless. Verified by
+  # mutation: restoring the jni 0.21 call shape `JObject::from_raw(ptr)` turns this
+  # job red with
+  #   error[E0061]: this function takes 2 arguments but 1 argument was supplied
+  # -- the exact error class that shipped the broken Android build -- while a plain
+  # `cargo check -p rustdar-android` on the same mutated tree still reports
+  # "Finished" clean. That contrast is the whole reason this job exists.
   #
   # It earns its place by depending on almost nothing. Tier 2 below needs
   # `cargo install cargo-ndk` to succeed AND the runner image to ship an NDK; when
-  # either breaks, this job still says whether the Android code itself compiles.
+  # either breaks, this job still says whether the JNI code itself compiles.
   #
-  # PINNED to a named crate, which is what makes it safe. The generic phrasing --
-  # "check the workspace members that are free of C" -- would keep passing if this
-  # crate were absorbed into `rustdar-android`, while compiling zero JNI calls.
-  # The pinned form cannot: `cargo check -p` on a missing package fails with
-  # "package ID specification did not match any packages", so deleting the crate
-  # turns this red immediately rather than quietly green.
-  #
-  # TWO CORRECTIONS to claims previously made in this repo about this tier:
-  #
-  #   * "Nothing Android-specific is NDK-free any more" is false, and was false
-  #     when written: `android-dep-unification` below is Android-specific, has no
-  #     compile-time substitute, and needs nothing but `cargo tree`.
-  #   * "The tier cannot be reconstructed once rustdar-android-theme is gone" is
-  #     also false. `jni` 0.22 is `default = []` -- pure Rust, no JDK, no NDK --
-  #     and `ndk-context` is portable, so the JNI helpers type-check on the HOST
-  #     with no Android target at all once the cfg admits a feature:
-  #         #[cfg(any(target_os = "android", feature = "jni-typecheck"))]
-  #     Measured at 5.2s, and it checks every `env.call_method`, `jni_sig!` and
-  #     `JObject::from_raw` against the real jni API. That is strictly more
-  #     surface than this job covers, since it does not stop at one crate.
-  #
-  # That feature gate is the intended successor to this job:
-  #     cargo check -p rustdar-android --features jni-typecheck
-  # It is NOT used yet because the feature does not exist in the tree -- adding
-  # the row now would be a row that cannot pass. It belongs to the branch dropping
-  # `rustdar-android-theme`. When that lands, replace this job with the command
-  # above and delete the CRATE pin; until then this keeps the coverage alive.
-  # (`android_main` stays Android-only: it is the sole user of `AndroidApp`,
-  # winit and `rustls_platform_verifier::android`.)
+  # It does NOT replace tier 2: `android_main`, the winit Android backend and the
+  # linked `.so` are only exercised there.
   android-jni-check:
-    name: Android JNI check (no NDK)
+    name: Android JNI typecheck (host)
     runs-on: ubuntu-24.04
-    env:
-      # The crate that holds the JNI call sites.
-      CRATE: rustdar-android-theme
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
@@ -368,25 +358,31 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-android-jni-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-aarch64-linux-android-
+          restore-keys: ${{ runner.os }}-cargo-android-jni-
 
-      # Without this the job would still pass if $CRATE stopped containing JNI
-      # code -- it would compile something harmless for the Android target and
-      # report success while verifying nothing. Asserting the dependency is what
-      # keeps the job's name true.
-      - name: Assert $CRATE still holds the JNI dependency
+      # A missing feature already fails loudly -- `cargo check --features` on an
+      # unknown feature errors with "does not contain this feature". What that does
+      # NOT catch is the feature surviving while being emptied to `[]`, which would
+      # leave this job compiling the crate with every JNI helper cfg'd back out and
+      # reporting success. Asserting `jni` is actually in the graph *because of*
+      # the feature is what keeps the job's name true.
+      #
+      # Verified meaningful: without `--features jni-typecheck`, `jni` is absent
+      # from this crate's host graph, so this assertion is testing the feature
+      # rather than something that would hold either way.
+      - name: Assert the feature still pulls in the JNI layer
         shell: bash
         run: |
           set -euo pipefail
-          if ! cargo tree -p "$CRATE" --target aarch64-linux-android -e normal --prefix none \
+          if ! cargo tree -p rustdar-android --features jni-typecheck -e normal --prefix none \
                | grep -qE '^jni v'; then
-            echo "::error::$CRATE no longer depends on jni, so this job no longer checks any JNI code. Repoint CRATE at the crate that does, or delete this job."
+            echo "::error::the jni-typecheck feature no longer pulls jni into rustdar-android's host graph, so this job type-checks no JNI code. Fix the feature or delete this job."
             exit 1
           fi
-          echo "ok: $CRATE depends on jni"
+          echo "ok: jni-typecheck pulls jni into the host graph"
 
-      - name: cargo check (aarch64-linux-android, no NDK)
-        run: cargo check -p "$CRATE" --lib --target aarch64-linux-android
+      - name: cargo check -p rustdar-android --features jni-typecheck
+        run: cargo check -p rustdar-android --features jni-typecheck
 
   # ---------------------------------------------------------------------------
   # Android tier 2: the real cross-compile, both shipped ABIs
@@ -566,12 +562,13 @@ jobs:
           for m in $members; do
             echo "::group::$m"
 
-            # `rustdar-android` and `rustdar-android-theme` compile to nothing on
-            # a host: the first opens with a crate-level
-            # `#![cfg(target_os = "android")]`, the second gates every item
-            # individually. Either way a host check of them compiles zero lines
-            # and would print a bare PASS -- green for a reason unrelated to what
-            # it claims, which is the exact anti-pattern this file argues against.
+            # `rustdar-android` compiles to nothing here: its crate-level cfg is
+            # `any(target_os = "android", feature = "jni-typecheck")` and this
+            # loop deliberately uses default features, so a host check of it
+            # compiles zero lines and would print a bare PASS -- green for a
+            # reason unrelated to what it claims, the exact anti-pattern this file
+            # argues against. (The JNI layer is covered by `android-jni-check`,
+            # which turns that feature on.)
             #
             # Detected from two structural signals rather than a hardcoded list,
             # so the label appears and disappears on its own:

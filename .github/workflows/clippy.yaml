@@ -101,5 +101,17 @@ jobs:
       # `rustdar-frontend` build script that stopped emitting the `mobile` cfg
       # previously produced warnings nobody failed on, and Android and iOS
       # silently took the desktop memory budgets.
+      #
+      # `--all-features` now enables `rustdar-android`'s `jni-typecheck`, so this
+      # run lints the JNI layer -- `jni` is in the host `--all-features` graph and
+      # absent from the default one. Until that feature existed, every JNI call
+      # site in the repo was invisible to Clippy, and "zero warnings" was a
+      # statement about host code only. It is now a statement about the JNI layer
+      # too, and it passes clean.
+      #
+      # The gap that remains: this is the *host* cfg of that code. The Android
+      # target itself still has no lint gate, and a `cargo ndk clippy` today
+      # reports 3 distinct warnings (2 in rustdar-platform, 1 in rustdar-egui)
+      # from arms only Android compiles. Adding that row means fixing those first.
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
