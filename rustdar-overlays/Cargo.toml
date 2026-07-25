@@ -29,7 +29,7 @@ flate2 = { workspace = true }
 #
 # `png-unpack-with-png-crate` and `time-calculation` are kept: both are pure
 # Rust, and `time-calculation` backs `temporal_raw_info()` in the fetch path.
-grib = { version = "=0.15.1", default-features = false, features = [
+grib = { version = "=0.16.0", default-features = false, features = [
     "png-unpack-with-png-crate",
     "time-calculation",
 ] }
