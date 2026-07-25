@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use chrono::{NaiveDateTime, TimeDelta, Utc};
 
 use super::{
-    DeadFeed, GlmDataLevel, GlmFetchOutcome, GlmFlash, GlmSatellite, ParseFailures,
+    DeadFeed, FetchFailures, GLM_MIN_TIME_WINDOW_SECS, GlmDataLevel, GlmFetchOutcome, GlmFlash,
+    GlmSatellite,
 };
 
 /// Cached GLM file data keyed by S3 object key.
@@ -64,10 +65,10 @@ pub async fn fetch_glm_flashes(
     // always cover an already-published granule. That assumption is the UI's
     // slider minimum; keep a caller from quietly invalidating it.
     debug_assert!(
-        time_window_secs >= 45.0,
-        "GLM time window {time_window_secs}s is below S3 publish latency; the \
-         zero-object check would report a live feed as dead. See \
-         GLM_MIN_TIME_WINDOW_SECS.",
+        time_window_secs >= GLM_MIN_TIME_WINDOW_SECS,
+        "GLM time window {time_window_secs}s is below GLM_MIN_TIME_WINDOW_SECS \
+         ({GLM_MIN_TIME_WINDOW_SECS}s); a window under S3 publish latency makes \
+         the zero-object check report a live feed as dead.",
     );
 
     let now = Utc::now().naive_utc();
@@ -81,8 +82,13 @@ pub async fn fetch_glm_flashes(
     // List & download new files for each satellite
     let mut new_entries: Vec<(String, Vec<GlmFlash>)> = Vec::new();
     let mut dead_feeds = Vec::new();
-    let mut attempted = 0usize;
     let mut parse_errors: Vec<String> = Vec::new();
+    let mut transport_errors: Vec<String> = Vec::new();
+    // Denominator for the failure ratio: every file the listing puts inside the
+    // window, counted whether or not this poll had to download it. Counting
+    // only the uncached ones biases the ratio upward over time, because
+    // successes get cached and drop out while failures are retried forever.
+    let mut in_window = 0usize;
 
     for &sat in satellites {
         let listing = list_glm_files(client, sat, start, now).await?;
@@ -101,6 +107,8 @@ pub async fn fetch_glm_flashes(
             });
         }
 
+        in_window += listing.keys.len();
+
         let new_keys: Vec<&str> = listing.keys.iter()
             .filter(|k| !cache.contains_key(k.as_str()))
             .map(|k| k.as_str())
@@ -112,9 +120,9 @@ pub async fn fetch_glm_flashes(
         log::info!("Downloading {} new GLM files from {}", new_keys.len(), sat.display_name());
 
         // Download in concurrent batches of 20
-        attempted += new_keys.len();
         let batch = download_and_parse_batch(client, sat, &new_keys, levels).await;
-        parse_errors.extend(batch.errors);
+        parse_errors.extend(batch.parse_errors);
+        transport_errors.extend(batch.transport_errors);
         for (key, flashes) in batch.entries {
             new_entries.push((key, flashes));
         }
@@ -133,16 +141,15 @@ pub async fn fetch_glm_flashes(
 
     log::info!("GLM: {} flashes in {:.0}s window", filtered.len(), time_window_secs);
 
-    // Parse failures are *reported*, not logged here, for the same reason dead
-    // feeds are: only the caller knows what the previous poll looked like, and
-    // only the caller can put it on screen.
-    let parse_failures = summarize_parse_failures(attempted, parse_errors);
-
+    // Failures are *reported*, not logged here, for the same reason dead feeds
+    // are: only the caller knows what the previous poll looked like, and only
+    // the caller can put it on screen.
     Ok(GlmFetchOutcome {
         flashes: filtered,
         dead_feeds,
         queried: satellites.to_vec(),
-        parse_failures,
+        parse_failures: summarize_failures(in_window, parse_errors),
+        transport_failures: summarize_failures(in_window, transport_errors),
     })
 }
 
@@ -331,10 +338,13 @@ fn parse_filename_start_time(key: &str) -> Option<NaiveDateTime> {
 /// Outcome of one download batch: what parsed, and what did not.
 struct BatchOutcome {
     entries: Vec<(String, Vec<GlmFlash>)>,
-    /// One message per file that failed. Returned rather than only logged: a
-    /// batch where *every* file fails renders exactly like a quiet sky, so the
-    /// count has to reach the UI, not just the log.
-    errors: Vec<String>,
+    /// One message per file that downloaded but would not parse. Returned
+    /// rather than only logged: a batch where *every* file fails renders
+    /// exactly like a quiet sky, so the count has to reach the UI.
+    parse_errors: Vec<String>,
+    /// One message per file that never arrived. Tracked separately so a network
+    /// problem is never reported as a product schema change.
+    transport_errors: Vec<String>,
 }
 
 /// Download and parse a batch of GLM NetCDF files concurrently.
@@ -360,14 +370,18 @@ async fn download_and_parse_batch(
                     // Per-file detail stays at debug: with 20 files in flight,
                     // warning on each turns a single schema change into a wall
                     // of identical lines. The aggregate is reported instead.
-                    log::debug!("Failed to fetch GLM file {key_owned}: {e}");
-                    Err(format!("{key_owned}: {e}"))
+                    log::debug!("Failed to fetch GLM file {key_owned}: {}", e.message());
+                    let labelled = format!("{key_owned}: {}", e.message());
+                    Err(match e {
+                        FileError::Parse(_) => FileError::Parse(labelled),
+                        FileError::Transport(_) => FileError::Transport(labelled),
+                    })
                 }
             }
         }
     }).collect();
 
-    let results: Vec<Result<(String, Vec<GlmFlash>), String>> = futures::stream::iter(futs)
+    let results: Vec<Result<(String, Vec<GlmFlash>), FileError>> = futures::stream::iter(futs)
         .buffer_unordered(20)
         .collect()
         .await;
@@ -380,27 +394,56 @@ impl BatchOutcome {
     ///
     /// Separated from the async download so the partition is reachable from a
     /// test: this is the step that used to discard every error into a log line.
-    fn from_results(results: Vec<Result<(String, Vec<GlmFlash>), String>>) -> Self {
-        let mut outcome = BatchOutcome { entries: Vec::new(), errors: Vec::new() };
+    fn from_results(results: Vec<Result<(String, Vec<GlmFlash>), FileError>>) -> Self {
+        let mut outcome = BatchOutcome {
+            entries: Vec::new(),
+            parse_errors: Vec::new(),
+            transport_errors: Vec::new(),
+        };
         for result in results {
             match result {
                 Ok(entry) => outcome.entries.push(entry),
-                Err(e) => outcome.errors.push(e),
+                Err(FileError::Parse(e)) => outcome.parse_errors.push(e),
+                Err(FileError::Transport(e)) => outcome.transport_errors.push(e),
             }
         }
         outcome
     }
 }
 
+/// Why one file did not contribute.
+///
+/// The distinction is the whole point: a file that arrives and will not parse
+/// indicts the product, a file that never arrives indicts the network, and
+/// telling a user their GLM product changed because S3 returned 503 SlowDown to
+/// a 20-way concurrent GET burst is a false alarm of exactly the kind this
+/// branch exists to remove.
+#[derive(Debug)]
+enum FileError {
+    /// Connection failure, non-2xx status, or a truncated body.
+    Transport(String),
+    /// The bytes arrived but were not the product we expect.
+    Parse(String),
+}
+
+impl FileError {
+    fn message(&self) -> &str {
+        match self {
+            FileError::Transport(e) | FileError::Parse(e) => e,
+        }
+    }
+}
+
 /// Reduce a poll's per-file errors to the report the UI consumes.
 ///
-/// `None` means every attempted file parsed. Pure, so the classification that
-/// decides whether the user sees "all N files failed" is testable without a
-/// network round trip.
-fn summarize_parse_failures(attempted: usize, errors: Vec<String>) -> Option<ParseFailures> {
+/// `in_window` is every file the listing placed in the window, not just the
+/// ones downloaded this tick — see [`FetchFailures::in_window`]. `None` means
+/// nothing failed. Pure, so the classification that decides whether the user
+/// sees "everything failed" is testable without a network round trip.
+fn summarize_failures(in_window: usize, errors: Vec<String>) -> Option<FetchFailures> {
     let sample_error = errors.first()?.clone();
-    Some(ParseFailures {
-        attempted,
+    Some(FetchFailures {
+        in_window,
         failed: errors.len(),
         sample_error,
     })
@@ -412,18 +455,18 @@ async fn download_and_parse_one(
     url: &str,
     satellite: GlmSatellite,
     levels: &[GlmDataLevel],
-) -> Result<Vec<GlmFlash>, String> {
+) -> Result<Vec<GlmFlash>, FileError> {
     let bytes = client.get(url)
         .send()
         .await
-        .map_err(|e| format!("HTTP error: {e}"))?
+        .map_err(|e| FileError::Transport(format!("HTTP error: {e}")))?
         .error_for_status()
-        .map_err(|e| format!("HTTP status error: {e}"))?
+        .map_err(|e| FileError::Transport(format!("HTTP status error: {e}")))?
         .bytes()
         .await
-        .map_err(|e| format!("Failed to read body: {e}"))?;
+        .map_err(|e| FileError::Transport(format!("Failed to read body: {e}")))?;
 
-    parse_glm_netcdf(&bytes, satellite, levels)
+    parse_glm_netcdf(&bytes, satellite, levels).map_err(FileError::Parse)
 }
 
 /// Variable name sets for each GLM data level.
@@ -540,6 +583,13 @@ fn parse_level_records(
     // *silently* absorbed by the rasterizer as a uniform minimum bolt size.
     // When a level that should have an area is missing one, degrade to no area
     // instead of failing the file, but say so.
+    //
+    // Note this reasons about *column presence* only. Once CF unpacking lands,
+    // individual values can also be absent even where the column exists:
+    // `flash_area`/`group_area` carry `_FillValue = -1s` and
+    // `valid_range = 0s, -6s`. `Option<f32>` already accommodates per-value
+    // absence — `fix/glm-cf-unpacking` should map fill values to `None` here
+    // rather than letting them through as a number.
     let areas = match vars.area {
         Some(name) => match read_optional_f32(file, name)? {
             Some(values) if values.len() == count => Some(values),
@@ -660,6 +710,7 @@ fn urlencoded(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::glm::MIN_FILES_FOR_TOTAL_VERDICT;
 
     /// Only groups and flashes carry area coverage in the L2 LCFA product.
     #[test]
@@ -693,6 +744,11 @@ mod tests {
     /// The error a missing variable must produce, verbatim.
     fn absent_variable_error(name: &str) -> String {
         format!("GLM file has no '{name}' variable (product schema change?)")
+    }
+
+    /// The error a short column must produce, verbatim.
+    fn length_mismatch_error(name: &str, len: usize, reference: &str, count: usize) -> String {
+        format!("GLM variable length mismatch: '{name}' has {len} values but '{reference}' has {count}")
     }
 
     #[derive(Default)]
@@ -779,15 +835,20 @@ mod tests {
         let flashes = parse_flashes(&bytes).expect("parse flash level");
         assert_eq!(flashes.len(), 2);
         // Pin that the *right column* was read, in order, without pinning the
-        // absolute scale (which `fix/glm-cf-unpacking` will change): the fixture
-        // writes a strictly increasing area, and any positive scaling preserves
-        // that ordering.
+        // absolute scale (which `fix/glm-cf-unpacking` will change). The fixture
+        // writes area = [128, 256], a ratio of exactly 2; lat is [35, 36] and
+        // lon is [-97, -98], so a ratio test excludes both, and a pure scaling
+        // preserves it (`flash_area` has add_offset = 0 in the real product).
+        // The `> 1.0` floor then excludes the energy column, which is ~1e-14.
+        //
+        // Note this is a supporting check: the authoritative protection against
+        // sourcing area from the wrong variable is
+        // `only_group_and_flash_levels_declare_an_area_variable`.
         let areas: Vec<f32> = flashes.iter().map(|f| f.area.expect("flash area")).collect();
         assert!(
-            areas[0] < areas[1],
-            "area column should track the file's increasing values, got {areas:?}"
+            (areas[1] / areas[0] - 2.0).abs() < 1e-3,
+            "area column should track the file's values, got {areas:?}"
         );
-        // ...and that it is not silently the energy or lat column.
         assert!(areas.iter().all(|a| *a > 1.0), "got {areas:?}");
 
         let events = parse_glm_netcdf(
@@ -847,12 +908,13 @@ mod tests {
     }
 
     /// Same case for the f64 reader, which has its own absence path.
+    ///
+    /// Only the time variable is omitted; the other columns stay present and
+    /// equally sized, so no length mismatch exists to mask the gate. The
+    /// verbatim assertion is what proves which gate fired.
     #[test]
     fn a_missing_time_variable_alone_is_an_error() {
         let bytes = synthetic_glm_file(Fixture {
-            // Omit lat/lon/energy too, so no length mismatch can mask the
-            // time_offset gate; lat is read first, so target time directly by
-            // leaving the others present but equally sized.
             omit: &["flash_time_offset_of_first_event"],
             ..Default::default()
         });
@@ -882,47 +944,74 @@ mod tests {
             let bytes = synthetic_glm_file(Fixture { short: Some(short), ..Default::default() });
             let err = parse_flashes(&bytes)
                 .expect_err("a short column must be rejected, not indexed past");
-            assert_eq!(
-                err,
-                format!(
-                    "GLM variable length mismatch: '{short}' has 1 values but 'flash_lat' has 2"
-                ),
-            );
+            assert_eq!(err, length_mismatch_error(short, 1, "flash_lat", 2));
         }
     }
 
-    /// Every per-file error must survive the batch partition. This is the step
-    /// that previously discarded them all into `log::warn!` + `None`, which is
-    /// why a total parse failure reached the user as "Updated 0s ago".
+    /// Every per-file error must survive the batch partition, sorted into the
+    /// right bucket. This is the step that previously discarded them all into
+    /// `log::warn!` + `None`, which is why a total parse failure reached the
+    /// user as "Updated 0s ago".
     #[test]
-    fn batch_partition_keeps_every_error() {
+    fn batch_partition_keeps_every_error_and_separates_the_kinds() {
         let outcome = BatchOutcome::from_results(vec![
             Ok(("a.nc".into(), Vec::new())),
-            Err("b.nc: boom".into()),
-            Err("c.nc: boom".into()),
+            Err(FileError::Parse("b.nc: bad variable".into())),
+            Err(FileError::Transport("c.nc: HTTP status error: 503".into())),
+            Err(FileError::Parse("d.nc: bad variable".into())),
         ]);
         assert_eq!(outcome.entries.len(), 1);
-        assert_eq!(outcome.errors, vec!["b.nc: boom", "c.nc: boom"]);
+        assert_eq!(
+            outcome.parse_errors,
+            vec!["b.nc: bad variable", "d.nc: bad variable"]
+        );
+        assert_eq!(
+            outcome.transport_errors,
+            vec!["c.nc: HTTP status error: 503"],
+            "a 503 is a network problem and must never be counted as a parse failure"
+        );
     }
 
     #[test]
-    fn summarize_parse_failures_reports_none_when_everything_parsed() {
-        assert!(summarize_parse_failures(12, Vec::new()).is_none());
+    fn summarize_failures_reports_none_when_everything_worked() {
+        assert!(summarize_failures(12, Vec::new()).is_none());
     }
 
     /// The total/partial distinction drives both the log severity and the panel
     /// wording, so pin it on the boundary rather than trusting the caller.
     #[test]
-    fn summarize_parse_failures_distinguishes_total_from_partial() {
-        let partial = summarize_parse_failures(3, vec!["a".into(), "b".into()])
+    fn summarize_failures_distinguishes_total_from_partial() {
+        let partial = summarize_failures(12, vec!["a".into(), "b".into()])
             .expect("failures present");
-        assert_eq!((partial.failed, partial.attempted), (2, 3));
+        assert_eq!((partial.failed, partial.in_window), (2, 12));
         assert!(!partial.is_total());
         assert_eq!(partial.sample_error, "a", "should keep the first error as the sample");
 
-        let total = summarize_parse_failures(3, vec!["a".into(), "b".into(), "c".into()])
+        let total = summarize_failures(3, vec!["a".into(), "b".into(), "c".into()])
             .expect("failures present");
-        assert!(total.is_total(), "every attempted file failed");
+        assert!(total.is_total(), "every file in the window failed");
+    }
+
+    /// A single bad granule on a quiet tick must not read as a product-wide
+    /// schema change. Granules land every 20 s and the poll interval is 20 s, so
+    /// "one uncached file, and it failed" is an ordinary steady state.
+    #[test]
+    fn one_bad_granule_is_never_a_total_failure() {
+        for in_window in 1..MIN_FILES_FOR_TOTAL_VERDICT {
+            let errors: Vec<String> = (0..in_window).map(|i| format!("f{i}: boom")).collect();
+            let report = summarize_failures(in_window, errors).expect("failures present");
+            assert!(
+                !report.is_total(),
+                "{in_window} file(s) is too small a sample to declare a systematic failure"
+            );
+        }
+
+        let errors: Vec<String> = (0..MIN_FILES_FOR_TOTAL_VERDICT)
+            .map(|i| format!("f{i}: boom"))
+            .collect();
+        let report =
+            summarize_failures(MIN_FILES_FOR_TOTAL_VERDICT, errors).expect("failures present");
+        assert!(report.is_total(), "at the floor, a full sweep is a real verdict");
     }
 
     /// A short *optional* column degrades instead of failing the file, and must

@@ -113,27 +113,58 @@ pub struct DeadFeed {
     pub prefixes: Vec<String>,
 }
 
-/// Files that downloaded but could not be parsed.
+/// Shortest lightning aggregation window the UI allows, in seconds.
 ///
-/// A granule that fails to parse is as invisible to the user as a granule that
-/// never existed — the map just goes blank — but it arrives through a different
-/// door than [`DeadFeed`]: the S3 listing is perfectly healthy. A product-wide
-/// schema change (a renamed variable) shows up here, not in the listing.
+/// Do not lower this below ~45 s without revisiting the zero-object warning in
+/// [`fetch`]. A window this short makes the S3 query cover a single hour prefix,
+/// and that prefix is empty until the hour's first granule publishes (27–30 s
+/// after the boundary, measured live). The warning treats "no objects at all" as
+/// a dead feed, so a minimum window below the publish latency would fire a
+/// spurious "feed dead" warning at the top of every hour. The 60 s floor leaves
+/// roughly 30 s of headroom.
+///
+/// Lives here rather than in the UI handler so `fetch` can assert on it instead
+/// of restating the number in prose.
+pub const GLM_MIN_TIME_WINDOW_SECS: f64 = 60.0;
+
+/// Longest lightning aggregation window the UI allows, in seconds (30 minutes).
+pub const GLM_MAX_TIME_WINDOW_SECS: f64 = 1800.0;
+
+/// Below this many files in the window, "everything failed" is not a claim
+/// worth making.
+///
+/// Granules land every 20 s and the poll interval is also 20 s, so a typical
+/// poll has very few uncached files — often one. Without a floor, a single
+/// corrupt granule arriving on a quiet tick reads as "100% failure", which is
+/// how a one-off becomes a product-schema alarm.
+const MIN_FILES_FOR_TOTAL_VERDICT: usize = 3;
+
+/// Files that were expected to contribute to the current window but did not.
+///
+/// A granule that fails is as invisible to the user as one that never existed —
+/// the map just goes blank — but it arrives through a different door than
+/// [`DeadFeed`]: the S3 listing is perfectly healthy.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseFailures {
-    /// Files that were downloaded and attempted this poll.
-    pub attempted: usize,
-    /// How many of those failed.
+pub struct FetchFailures {
+    /// Every file the listing placed inside the current time window.
+    ///
+    /// Deliberately *not* "files downloaded this poll". Successful parses are
+    /// cached and drop out of subsequent polls while failures are never cached
+    /// and are retried forever, so a per-poll denominator shrinks toward the
+    /// failures themselves and every persistent failure eventually reads as
+    /// total. Counting the whole window keeps the ratio stable.
+    pub in_window: usize,
+    /// How many of those are currently failing.
     pub failed: usize,
     /// One representative error, so the report can say *why*.
     pub sample_error: String,
 }
 
-impl ParseFailures {
-    /// Every single file failed: nothing rendered, and the cause is systematic
-    /// rather than a corrupt granule here and there.
+impl FetchFailures {
+    /// Nothing in the window is usable, over enough files for that to mean
+    /// something systematic rather than one bad granule.
     pub fn is_total(&self) -> bool {
-        self.attempted > 0 && self.failed == self.attempted
+        self.in_window >= MIN_FILES_FOR_TOTAL_VERDICT && self.failed == self.in_window
     }
 }
 
@@ -152,8 +183,16 @@ pub struct GlmFetchOutcome {
     /// is only alive if it was *queried*. Without this, deselecting a dead
     /// satellite in the dropdown reads as the feed recovering.
     pub queried: Vec<GlmSatellite>,
-    /// Download/parse failures this poll, if any.
-    pub parse_failures: Option<ParseFailures>,
+    /// Files that downloaded but would not parse.
+    ///
+    /// Kept separate from `transport_failures` because the two mean opposite
+    /// things: a file that arrives and will not parse points at the *product*
+    /// (a renamed variable, a restructured schema), while a file that never
+    /// arrives points at the *network*. Reporting a 503 as a schema change is
+    /// its own kind of false alarm.
+    pub parse_failures: Option<FetchFailures>,
+    /// Files that could not be downloaded at all (connection errors, non-2xx).
+    pub transport_failures: Option<FetchFailures>,
 }
 
 /// Type-erased fetch result for GLM lightning data.

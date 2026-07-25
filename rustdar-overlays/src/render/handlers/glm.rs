@@ -6,7 +6,8 @@ use rustdar_units::UserPreferences;
 
 use crate::glm::fetch::GlmCache;
 use crate::glm::{
-    DeadFeed, GlmDataLevel, GlmFetchResult, GlmFlash, GlmSatellite, ParseFailures,
+    DeadFeed, FetchFailures, GLM_MAX_TIME_WINDOW_SECS, GLM_MIN_TIME_WINDOW_SECS, GlmDataLevel,
+    GlmFetchResult, GlmFlash, GlmSatellite,
 };
 use crate::render::controls::{
     ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
@@ -135,20 +136,6 @@ impl SatelliteSelection {
     }
 }
 
-/// Shortest lightning aggregation window the UI allows, in seconds.
-///
-/// Do not lower this below ~45 s without revisiting the zero-object warning in
-/// `glm::fetch`. A window this short makes the S3 query cover a single hour
-/// prefix, and that prefix is empty until the hour's first granule publishes
-/// (27–30 s after the boundary, measured live). The warning treats "no objects
-/// at all" as a dead feed, so a minimum window below the publish latency would
-/// fire a spurious "feed dead" warning at the top of every hour. The 60 s floor
-/// leaves roughly 30 s of headroom.
-const GLM_MIN_TIME_WINDOW_SECS: f64 = 60.0;
-
-/// Longest lightning aggregation window the UI allows, in seconds (30 minutes).
-const GLM_MAX_TIME_WINDOW_SECS: f64 = 1800.0;
-
 const SECS_PER_MIN: f64 = 60.0;
 
 pub(crate) struct GlmHandler {
@@ -171,27 +158,59 @@ pub(crate) struct GlmHandler {
     /// be shown in the control panel — a user who never reads logcat is exactly
     /// the person the original year-long outage went unnoticed by.
     dead_feeds: Vec<DeadFeed>,
-    /// Whether the last poll's downloads parsed, as a category rather than a
-    /// count — see [`GlmHandler::report_parse_failures`].
-    parse_health: ParseHealth,
-    /// Detail behind [`Self::parse_health`], for the control panel.
-    parse_failures: Option<ParseFailures>,
+    /// Per-kind failure state — see [`GlmHandler::report_failures`].
+    parse: FailureState,
+    transport: FailureState,
 }
 
-/// Parse outcome reduced to the states worth *announcing*.
+/// What a batch of failures means, reduced to the states worth *announcing*.
 ///
 /// Deliberately carries no counts: a batch that fails 7 files then 9 files has
 /// not changed in any way a user needs told twice, and edge-triggering on raw
 /// counts would flap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum ParseHealth {
+enum FailureHealth {
     #[default]
     Ok,
     /// Some files failed; the map still shows the rest.
     Partial,
-    /// Every downloaded file failed. The map is blank and the cause is
-    /// systematic — a renamed variable, a restructured product.
+    /// Nothing in the window is usable, over enough files for that to be a
+    /// systematic cause rather than one bad granule.
     Total,
+}
+
+/// Edge-trigger state plus the detail the panel renders, for one failure kind.
+#[derive(Default)]
+struct FailureState {
+    health: FailureHealth,
+    detail: Option<FetchFailures>,
+}
+
+/// Which door a failure came through. The two are never merged, because they
+/// point at opposite causes and suggest opposite actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    /// Files arrived and would not parse — suspect the product.
+    Parse,
+    /// Files never arrived — suspect the network.
+    Transport,
+}
+
+impl FailureKind {
+    fn noun(self) -> &'static str {
+        match self {
+            FailureKind::Parse => "failed to parse",
+            FailureKind::Transport => "could not be downloaded",
+        }
+    }
+
+    /// What a *total* failure of this kind most likely means.
+    fn total_hint(self) -> &'static str {
+        match self {
+            FailureKind::Parse => "product change?",
+            FailureKind::Transport => "network down?",
+        }
+    }
 }
 
 impl GlmHandler {
@@ -206,8 +225,8 @@ impl GlmHandler {
             show_flashes: true,
             cache: Arc::new(std::sync::Mutex::new(GlmCache::default())),
             dead_feeds: Vec::new(),
-            parse_health: ParseHealth::Ok,
-            parse_failures: None,
+            parse: FailureState::default(),
+            transport: FailureState::default(),
         }
     }
 
@@ -261,45 +280,55 @@ impl GlmHandler {
         self.dead_feeds = next;
     }
 
-    /// Announce parse-failure *transitions*, and keep the detail for the panel.
+    /// Announce failure *transitions* for one kind, and keep the detail for the
+    /// panel.
     ///
     /// A granule that downloads but will not parse is exactly as invisible as a
     /// granule that was never published — the map goes blank either way — but it
     /// arrives with a perfectly healthy S3 listing, so `dead_feeds` says nothing
     /// about it. Without this, a renamed variable reads to the user as "Updated
     /// 0s ago" over an empty map: the original bug, one layer up.
-    fn report_parse_failures(&mut self, failures: Option<ParseFailures>) {
+    fn report_failures(&mut self, kind: FailureKind, failures: Option<FetchFailures>) {
         let health = match &failures {
-            None => ParseHealth::Ok,
-            Some(f) if f.is_total() => ParseHealth::Total,
-            Some(_) => ParseHealth::Partial,
+            None => FailureHealth::Ok,
+            Some(f) if f.is_total() => FailureHealth::Total,
+            Some(_) => FailureHealth::Partial,
         };
 
-        if health != self.parse_health {
+        let state = match kind {
+            FailureKind::Parse => &mut self.parse,
+            FailureKind::Transport => &mut self.transport,
+        };
+
+        if health != state.health {
             match (&failures, health) {
-                (Some(f), ParseHealth::Total) => log::warn!(
-                    "GLM: every downloaded file failed to parse ({}/{}) — the map is blank \
-                     despite a healthy S3 listing, which points at a product schema change. \
-                     First error: {}",
-                    f.failed,
-                    f.attempted,
+                (Some(f), FailureHealth::Total) => log::warn!(
+                    "GLM: all {} files in the window {} ({}) — the map is blank despite a \
+                     healthy S3 listing. First error: {}",
+                    f.in_window,
+                    kind.noun(),
+                    kind.total_hint(),
                     f.sample_error,
                 ),
-                (Some(f), ParseHealth::Partial) => log::warn!(
-                    "GLM: {}/{} downloaded files failed to parse. First error: {}",
+                (Some(f), FailureHealth::Partial) => log::warn!(
+                    "GLM: {}/{} files in the window {}. First error: {}",
                     f.failed,
-                    f.attempted,
+                    f.in_window,
+                    kind.noun(),
                     f.sample_error,
                 ),
-                (_, ParseHealth::Ok) => {
-                    log::info!("GLM: files are parsing again");
+                (_, FailureHealth::Ok) => {
+                    log::info!("GLM: files {} again — recovered", match kind {
+                        FailureKind::Parse => "are parsing",
+                        FailureKind::Transport => "are downloading",
+                    });
                 }
                 (None, _) => {}
             }
-            self.parse_health = health;
+            state.health = health;
         }
 
-        self.parse_failures = failures;
+        state.detail = failures;
     }
 
     /// Build the list of active data levels from the checkbox flags.
@@ -381,7 +410,8 @@ impl OverlayHandler for GlmHandler {
             Ok(outcome) => {
                 log::info!("Received {} GLM lightning flashes", outcome.flashes.len());
                 self.report_feed_changes(&outcome.queried, outcome.dead_feeds);
-                self.report_parse_failures(outcome.parse_failures);
+                self.report_failures(FailureKind::Parse, outcome.parse_failures);
+                self.report_failures(FailureKind::Transport, outcome.transport_failures);
                 let items = outcome
                     .flashes
                     .into_iter()
@@ -565,16 +595,28 @@ impl OverlayHandler for GlmHandler {
                 });
             }
 
-            // Cause 2: the files arrived and would not parse. The S3 listing is
-            // healthy in this case, so nothing above catches it.
-            if let Some(f) = &self.parse_failures {
+            // Cause 2: the files were published but never became usable — either
+            // they would not download, or they would not parse. The S3 listing
+            // is healthy in both cases, so nothing above catches them, and the
+            // two are reported separately because they indict different things.
+            for (kind, state) in
+                [(FailureKind::Parse, &self.parse), (FailureKind::Transport, &self.transport)]
+            {
+                let Some(f) = &state.detail else { continue };
                 let text = if f.is_total() {
                     format!(
-                        "\u{26a0} All {} downloaded files failed to parse (product change?)",
-                        f.attempted,
+                        "\u{26a0} All {} files in the window {} ({})",
+                        f.in_window,
+                        kind.noun(),
+                        kind.total_hint(),
                     )
                 } else {
-                    format!("\u{26a0} {}/{} files failed to parse", f.failed, f.attempted)
+                    format!(
+                        "\u{26a0} {}/{} files {}",
+                        f.failed,
+                        f.in_window,
+                        kind.noun(),
+                    )
                 };
                 items.push(ControlItem::InfoText { text });
             }
@@ -888,12 +930,16 @@ mod tests {
         assert!(handler.dead_feeds.is_empty());
     }
 
-    fn total_failure() -> ParseFailures {
-        ParseFailures {
-            attempted: 12,
+    fn total_failure() -> FetchFailures {
+        FetchFailures {
+            in_window: 12,
             failed: 12,
             sample_error: "GLM file has no 'flash_lat' variable (product schema change?)".into(),
         }
+    }
+
+    fn partial_failure(failed: usize) -> FetchFailures {
+        FetchFailures { in_window: 12, failed, sample_error: "boom".into() }
     }
 
     /// The scenario that motivated this: a healthy S3 listing, every granule
@@ -902,7 +948,7 @@ mod tests {
     fn total_parse_failure_is_surfaced_in_the_control_panel() {
         let mut handler = GlmHandler::new();
         handler.enabled = true;
-        handler.report_parse_failures(Some(total_failure()));
+        handler.report_failures(FailureKind::Parse, Some(total_failure()));
 
         let texts = info_texts(&handler);
         assert!(
@@ -919,11 +965,7 @@ mod tests {
     fn partial_parse_failure_is_distinguished_from_total() {
         let mut handler = GlmHandler::new();
         handler.enabled = true;
-        handler.report_parse_failures(Some(ParseFailures {
-            attempted: 12,
-            failed: 3,
-            sample_error: "boom".into(),
-        }));
+        handler.report_failures(FailureKind::Parse, Some(partial_failure(3)));
 
         let texts = info_texts(&handler);
         assert!(
@@ -940,8 +982,8 @@ mod tests {
     fn parse_failure_notice_clears_when_files_parse_again() {
         let mut handler = GlmHandler::new();
         handler.enabled = true;
-        handler.report_parse_failures(Some(total_failure()));
-        handler.report_parse_failures(None);
+        handler.report_failures(FailureKind::Parse, Some(total_failure()));
+        handler.report_failures(FailureKind::Parse, None);
 
         assert!(
             !info_texts(&handler).iter().any(|t| t.contains("failed to parse")),
@@ -957,16 +999,284 @@ mod tests {
         handler.enabled = true;
 
         for failed in [3usize, 7, 4, 9] {
-            handler.report_parse_failures(Some(ParseFailures {
-                attempted: 12,
-                failed,
-                sample_error: "boom".into(),
-            }));
-            assert_eq!(handler.parse_health, ParseHealth::Partial);
+            handler.report_failures(FailureKind::Parse, Some(partial_failure(failed)));
+            assert_eq!(handler.parse.health, FailureHealth::Partial);
         }
 
         // Escalation to total is a real change and does update the category.
-        handler.report_parse_failures(Some(total_failure()));
-        assert_eq!(handler.parse_health, ParseHealth::Total);
+        handler.report_failures(FailureKind::Parse, Some(total_failure()));
+        assert_eq!(handler.parse.health, FailureHealth::Total);
+    }
+
+    /// A network failure must never be dressed up as a product schema change.
+    #[test]
+    fn transport_failure_is_not_reported_as_a_product_change() {
+        let mut handler = GlmHandler::new();
+        handler.enabled = true;
+        handler.report_failures(
+            FailureKind::Transport,
+            Some(FetchFailures {
+                in_window: 12,
+                failed: 12,
+                sample_error: "a.nc: HTTP error: error sending request".into(),
+            }),
+        );
+
+        let texts = info_texts(&handler);
+        assert!(
+            texts.iter().any(|t| t.contains("could not be downloaded")
+                && t.contains("network down?")),
+            "a transport failure should point at the network, got {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("product change?")),
+            "S3 throttling must not be announced as a GLM product change, got {texts:?}"
+        );
+    }
+
+    /// The two kinds track independently: a network blip must not clear or mask
+    /// a live parse problem.
+    #[test]
+    fn parse_and_transport_failures_are_tracked_independently() {
+        let mut handler = GlmHandler::new();
+        handler.enabled = true;
+        handler.report_failures(FailureKind::Parse, Some(total_failure()));
+        handler.report_failures(FailureKind::Transport, Some(partial_failure(2)));
+
+        let texts = info_texts(&handler);
+        assert!(texts.iter().any(|t| t.contains("failed to parse")));
+        assert!(texts.iter().any(|t| t.contains("could not be downloaded")));
+
+        // Transport recovers; the parse problem stays on screen.
+        handler.report_failures(FailureKind::Transport, None);
+        let texts = info_texts(&handler);
+        assert!(texts.iter().any(|t| t.contains("failed to parse")));
+        assert!(!texts.iter().any(|t| t.contains("could not be downloaded")));
+    }
+
+    // ---- Log-output tests -------------------------------------------------
+    //
+    // Edge-triggering is the stated purpose of the dead-feed and failure
+    // reporting, and it is only observable in the log. Without capturing the
+    // log, both edge-trigger guards can be deleted with the suite still green.
+
+    /// Captures records into `LOG_RECORDS` for assertion.
+    struct CaptureLogger;
+
+    static LOG_RECORDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    /// Serializes the log-observing tests, which necessarily share one global
+    /// logger.
+    static LOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Only records from this thread are captured. The test harness runs other
+    /// tests in parallel and several of them log; without this filter their
+    /// output lands in the buffer and the counts below become nondeterministic.
+    static CAPTURE_THREAD: std::sync::Mutex<Option<std::thread::ThreadId>> =
+        std::sync::Mutex::new(None);
+
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            let capturing = *CAPTURE_THREAD.lock().unwrap_or_else(|e| e.into_inner());
+            if capturing != Some(std::thread::current().id()) {
+                return;
+            }
+            LOG_RECORDS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(format!("{} {}", record.level(), record.args()));
+        }
+        fn flush(&self) {}
+    }
+
+    /// Run `f` and return everything it logged on this thread.
+    fn captured_logs(f: impl FnOnce()) -> Vec<String> {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        let _serial = LOG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        INIT.call_once(|| {
+            // If another logger is already installed the capture stays empty and
+            // the assertions below fail loudly, which is the right outcome.
+            let _ = log::set_logger(&CaptureLogger);
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+
+        LOG_RECORDS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *CAPTURE_THREAD.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(std::thread::current().id());
+        f();
+        *CAPTURE_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        LOG_RECORDS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn count_containing(logs: &[String], needle: &str) -> usize {
+        logs.iter().filter(|l| l.contains(needle)).count()
+    }
+
+    /// A dead feed warns once, not once per poll. At a 20 s interval the
+    /// unguarded version emits ~180 lines an hour for as long as the outage
+    /// lasts.
+    #[test]
+    fn dead_feed_warns_once_across_many_polls() {
+        let logs = captured_logs(|| {
+            let mut handler = GlmHandler::new();
+            handler.enabled = true;
+            for _ in 0..10 {
+                handler.report_feed_changes(&BOTH, vec![dead_east()]);
+            }
+        });
+
+        assert_eq!(
+            count_containing(&logs, "feed is dead"),
+            1,
+            "expected exactly one dead-feed warning across 10 polls, got: {logs:?}"
+        );
+        assert!(
+            logs.iter().any(|l| l.starts_with("WARN") && l.contains("noaa-goes16")),
+            "the warning should name the bucket, got: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn feed_recovery_logs_once_and_re_arms() {
+        let logs = captured_logs(|| {
+            let mut handler = GlmHandler::new();
+            handler.enabled = true;
+            handler.report_feed_changes(&BOTH, vec![dead_east()]);
+            for _ in 0..5 {
+                handler.report_feed_changes(&BOTH, Vec::new());
+            }
+            // Going dark again is a fresh edge and must warn again.
+            handler.report_feed_changes(&BOTH, vec![dead_east()]);
+        });
+
+        assert_eq!(count_containing(&logs, "feed recovered"), 1, "{logs:?}");
+        assert_eq!(count_containing(&logs, "feed is dead"), 2, "{logs:?}");
+    }
+
+    /// The reviewer's probe: deselecting a dead satellite must produce no log
+    /// output at all — not a recovery, not a repeat warning.
+    #[test]
+    fn deselecting_a_dead_satellite_logs_nothing() {
+        let logs = captured_logs(|| {
+            let mut handler = GlmHandler::new();
+            handler.enabled = true;
+            handler.report_feed_changes(&BOTH, vec![dead_east()]);
+
+            LOG_RECORDS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            // Both -> West -> Both, with East still dark the whole time.
+            handler.report_feed_changes(&WEST_ONLY, Vec::new());
+            handler.report_feed_changes(&BOTH, vec![dead_east()]);
+        });
+
+        assert!(
+            logs.is_empty(),
+            "selection changes alone must not generate feed chatter, got: {logs:?}"
+        );
+    }
+
+    /// The category guard is what stops a fluctuating count from re-announcing
+    /// itself; without it these ten polls emit ten warnings.
+    #[test]
+    fn fluctuating_failure_counts_warn_once() {
+        let logs = captured_logs(|| {
+            let mut handler = GlmHandler::new();
+            handler.enabled = true;
+            for failed in [1usize, 5, 2, 7, 3, 6, 4, 8, 2, 9] {
+                handler.report_failures(FailureKind::Parse, Some(partial_failure(failed)));
+            }
+        });
+
+        assert_eq!(
+            count_containing(&logs, "files in the window failed to parse"),
+            1,
+            "expected one warning across ten fluctuating polls, got: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn escalation_and_recovery_each_log_once() {
+        let logs = captured_logs(|| {
+            let mut handler = GlmHandler::new();
+            handler.enabled = true;
+            handler.report_failures(FailureKind::Parse, Some(partial_failure(3)));
+            handler.report_failures(FailureKind::Parse, Some(total_failure()));
+            handler.report_failures(FailureKind::Parse, Some(total_failure()));
+            handler.report_failures(FailureKind::Parse, None);
+            handler.report_failures(FailureKind::Parse, None);
+        });
+
+        assert_eq!(count_containing(&logs, "3/12"), 1, "{logs:?}");
+        assert_eq!(count_containing(&logs, "all 12 files"), 1, "{logs:?}");
+        assert_eq!(count_containing(&logs, "recovered"), 1, "{logs:?}");
+    }
+
+    // ---- Seam tests -------------------------------------------------------
+    //
+    // Everything above drives the private reporting methods directly. These
+    // drive apply_fetch_result with a populated outcome, which is the only path
+    // production ever takes.
+
+    fn outcome(
+        queried: Vec<GlmSatellite>,
+        dead_feeds: Vec<DeadFeed>,
+        parse_failures: Option<FetchFailures>,
+        transport_failures: Option<FetchFailures>,
+    ) -> Box<dyn Any + Send> {
+        Box::new(GlmFetchResult(Ok(crate::glm::GlmFetchOutcome {
+            flashes: Vec::new(),
+            dead_feeds,
+            queried,
+            parse_failures,
+            transport_failures,
+        })))
+    }
+
+    /// The Ok arm must actually forward the queried set and both failure
+    /// reports. Passing `&[]` or `None` here silently severs the fixes above.
+    #[test]
+    fn apply_fetch_result_forwards_queried_set_and_failures() {
+        let mut handler = GlmHandler::new();
+        handler.enabled = true;
+
+        // East goes dark through the real seam.
+        handler.apply_fetch_result(outcome(
+            vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
+            vec![dead_east()],
+            None,
+            None,
+        ));
+        assert_eq!(handler.dead_feeds, vec![dead_east()]);
+
+        // Both failure kinds arrive through the seam and reach the panel.
+        handler.apply_fetch_result(outcome(
+            vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
+            vec![dead_east()],
+            Some(total_failure()),
+            Some(partial_failure(2)),
+        ));
+        let texts = info_texts(&handler);
+        assert!(
+            texts.iter().any(|t| t.contains("failed to parse")),
+            "parse failures must survive the seam, got {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("could not be downloaded")),
+            "transport failures must survive the seam, got {texts:?}"
+        );
+
+        // Now East recovers, which is only correct because `queried` said we
+        // asked. A seam that drops `queried` carries the dead verdict forward
+        // instead of clearing it.
+        handler.apply_fetch_result(outcome(
+            vec![GlmSatellite::GoesEast, GlmSatellite::GoesWest],
+            Vec::new(),
+            None,
+            None,
+        ));
+        assert!(
+            handler.dead_feeds.is_empty(),
+            "a queried satellite that stops being dead must clear through the seam"
+        );
     }
 }
