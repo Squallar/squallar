@@ -293,17 +293,28 @@ impl super::App {
             return;
         }
 
-        let message = match l3_resp.result {
-            Ok(msg) => msg,
+        let fetched = match l3_resp.result {
+            Ok(p) => p,
             Err(e) => {
                 log::warn!("Level III {:?} fetch failed: {}", l3_resp.product, e);
                 return;
             }
         };
 
-        let elevation = message.pdb.elevation_angle();
-        log::info!("Level III {:?} {} fetched successfully (elevation={:.1}°)", l3_resp.product, l3_resp.tilt_code, elevation);
-        self.render.level3_data.insert((l3_resp.product, l3_resp.tilt_code.clone(), l3_resp.site.clone()), Arc::new(message));
+        let elevation = fetched.message.pdb.elevation_angle();
+        // The age is logged, not just carried: `latest_key` falls back to the
+        // previous UTC day, so a site down since yesterday delivers a product
+        // up to ~48 h old and this is currently the only place that says so.
+        // Surfacing it in the pane is what remains — see `ProductStamp`.
+        log::info!(
+            "Level III {:?} {} fetched successfully (elevation={:.1}°, key={}, age={:?} min)",
+            l3_resp.product,
+            l3_resp.tilt_code,
+            elevation,
+            fetched.stamp.key,
+            fetched.age(chrono::Utc::now().naive_utc()).map(|a| a.num_minutes()),
+        );
+        self.render.level3_data.insert((l3_resp.product, l3_resp.tilt_code.clone(), l3_resp.site.clone()), Arc::new(fetched));
 
         // Trigger a re-render for panes on the same site viewing this product
         for (idx, prs) in self.render.pane_render.iter_mut().enumerate() {

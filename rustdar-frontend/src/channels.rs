@@ -1,6 +1,6 @@
 use chrono::NaiveDateTime;
 use rustdar_radar::archive::Identifier;
-use nexrad_level3::model::Level3Message;
+use rustdar_radar::level3::Level3Product;
 use nexrad_model::data::Scan;
 use rustdar_egui::pane::RenderTarget;
 use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
@@ -44,7 +44,13 @@ pub struct Level3Response {
     pub product: RadarProduct,
     pub tilt_code: String,
     pub site: String,
-    pub result: Result<Level3Message, String>,
+    /// The decoded product *and* the stamp of the object it came from.
+    ///
+    /// Carrying the stamp is what lets the UI distinguish a product from this
+    /// scan from one `level3::latest_key`'s previous-day fallback found — up to
+    /// ~48 h old — the same way `HrrrGridData::ref_time` distinguishes a 0–1 h
+    /// forecast from an analysis.
+    pub result: Result<Level3Product, String>,
 }
 
 /// Result from a background overlay rasterization thread.

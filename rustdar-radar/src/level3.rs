@@ -122,10 +122,83 @@ fn newest(keys: Vec<String>) -> Option<String> {
     keys.into_iter().max()
 }
 
+/// Which object a Level III product came from, and when it was written.
+///
+/// Separate from the message so it can be reasoned about — and tested —
+/// without decoding one, and because it is the part the UI needs: the message
+/// alone cannot answer "how old is this?", and the answer matters.
+/// [`latest_key`] falls back to the previous UTC day, so a site that has been
+/// down since yesterday paints a field up to ~48 h old over a live basemap.
+/// Without the timestamp that is indistinguishable from a product two minutes
+/// old.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductStamp {
+    /// The bucket key, e.g. `TLX_N0S_2026_07_25_17_30_24`.
+    pub key: String,
+    /// When the product was written, from [`key_time`].
+    ///
+    /// `None` only for a key whose tail does not parse, which no key the bucket
+    /// currently serves produces. It is an `Option` because the key format is
+    /// the bucket's to change, not rustdar's, and a product that arrives under
+    /// an unreadable name is still a product worth drawing — just one whose age
+    /// cannot be shown.
+    pub time: Option<NaiveDateTime>,
+}
+
+impl ProductStamp {
+    /// Read the stamp off a bucket key.
+    pub fn from_key(key: impl Into<String>) -> Self {
+        let key = key.into();
+        let time = key_time(&key);
+        Self { key, time }
+    }
+
+    /// How long ago this product was written, as of `now`.
+    ///
+    /// `None` when the key carried no readable timestamp. A key stamped in the
+    /// future yields a negative duration rather than being clamped, so a caller
+    /// can tell "impossible" from "fresh".
+    pub fn age(&self, now: NaiveDateTime) -> Option<Duration> {
+        self.time.map(|t| now - t)
+    }
+
+    /// Whether this product is older than `max`.
+    ///
+    /// An unreadable timestamp is **not** reported as stale: it is unknown, and
+    /// claiming freshness or staleness on no evidence is the failure this whole
+    /// type exists to avoid. Callers that must distinguish the two should read
+    /// [`Self::age`] directly.
+    pub fn is_stale(&self, now: NaiveDateTime, max: Duration) -> bool {
+        self.age(now).is_some_and(|age| age > max)
+    }
+}
+
+/// A decoded Level III product, with the identity of the object it came from.
+///
+/// Deliberately the same shape as the HRRR path, which carries `ref_time` and
+/// `forecast_hour` on its grid *specifically* so a 0–1 h forecast is not
+/// presented as an analysis. Level III now carries [`ProductStamp`] for the
+/// same reason.
+#[derive(Debug, Clone)]
+pub struct Level3Product {
+    /// The decoded product.
+    pub message: Level3Message,
+    /// Where it came from and when it was written.
+    pub stamp: ProductStamp,
+}
+
+impl Level3Product {
+    /// Shorthand for [`ProductStamp::age`].
+    pub fn age(&self, now: NaiveDateTime) -> Option<Duration> {
+        self.stamp.age(now)
+    }
+}
+
 /// Timestamp encoded in a Level III key, if it parses.
 ///
 /// `TLX_N0S_2026_07_25_17_30_24` → 2026-07-25 17:30:24 UTC. Used for reporting
-/// and for the live tests' freshness assertions, never for choosing a key.
+/// — it is what [`Level3Product::time`] carries — and for the live tests'
+/// freshness assertions, never for choosing a key.
 pub fn key_time(key: &str) -> Option<NaiveDateTime> {
     // The last six underscore-separated fields are Y M D H M S. Counting from
     // the end rather than the start keeps this correct for site or product
@@ -189,12 +262,17 @@ pub async fn latest_key(
 /// `site` may be the four-letter ICAO code the rest of the application uses;
 /// it is reduced to three by [`site_code`]. `product` is an AWIPS ID such as
 /// `"N0S"`.
+///
+/// Returns the key and its timestamp alongside the message. The key used to be
+/// discarded here, which left every caller unable to distinguish a product two
+/// minutes old from one the previous-day fallback dug out of yesterday — see
+/// [`Level3Product`].
 pub async fn fetch_latest_product(
     sources: &DataSources,
     site: &str,
     product: &str,
     now: NaiveDateTime,
-) -> Result<Level3Message> {
+) -> Result<Level3Product> {
     let site3 = site_code(site).to_uppercase();
     let date = now.date();
 
@@ -212,7 +290,12 @@ pub async fn fetch_latest_product(
 
     // The object carries the same WMO/AWIPS envelope `sn.last` did; the
     // decoder strips it, so this is byte-identical handling to the TGFTP path.
-    Ok(nexrad_level3::decode::decode_product(&bytes)?)
+    let message = nexrad_level3::decode::decode_product(&bytes)?;
+    let stamp = ProductStamp::from_key(key);
+    if let Some(age) = stamp.age(now) {
+        log::info!("Level III {} is {} minutes old", stamp.key, age.num_minutes());
+    }
+    Ok(Level3Product { message, stamp })
 }
 
 #[cfg(test)]
@@ -316,6 +399,68 @@ mod tests {
                 "{code} appears twice in the ICD table",
             );
         }
+    }
+
+    fn at(h: u32, m: u32, s: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 7, 25).unwrap().and_hms_opt(h, m, s).unwrap()
+    }
+
+    /// A fetched product must be able to say how old it is.
+    ///
+    /// `fetch_latest_product` used to discard the key, so nothing downstream
+    /// could tell a product two minutes old from one the previous-day fallback
+    /// dug out of yesterday.
+    ///
+    /// The expected ages are subtracted by hand from the two stamps in the
+    /// key, not recomputed with `key_time`, so this cannot pass by agreeing
+    /// with the parser it is checking.
+    #[test]
+    fn a_product_stamp_reports_its_age_from_its_key() {
+        let stamp = ProductStamp::from_key("TLX_N0S_2026_07_25_17_30_24");
+        // 17:45:24 - 17:30:24
+        assert_eq!(stamp.age(at(17, 45, 24)).map(|a| a.num_minutes()), Some(15));
+        // 17:30:24 - 17:30:24
+        assert_eq!(stamp.age(at(17, 30, 24)).map(|a| a.num_seconds()), Some(0));
+        // A key stamped ahead of `now` reads negative rather than clamping to
+        // zero, so "impossible" stays distinguishable from "fresh".
+        assert_eq!(stamp.age(at(17, 29, 24)).map(|a| a.num_minutes()), Some(-1));
+    }
+
+    /// The previous-day fallback is the case this exists for: yesterday's key
+    /// must read as old, not as fresh.
+    #[test]
+    fn a_stamp_from_the_previous_day_is_stale() {
+        let now = at(0, 5, 0);
+        // 00:05:00 today minus 23:58:48 yesterday = 6 minutes 12 seconds.
+        let overnight = ProductStamp::from_key("TLX_N0S_2026_07_24_23_58_48");
+        assert_eq!(overnight.age(now).map(|a| a.num_minutes()), Some(6));
+        assert!(
+            !overnight.is_stale(now, Duration::minutes(30)),
+            "the ordinary 00Z rollover is not staleness",
+        );
+
+        // A site down since the previous morning: the fallback still finds a
+        // key, and it is nearly a day and a half old.
+        let dead = ProductStamp::from_key("TLX_N0S_2026_07_24_11_00_00");
+        assert_eq!(dead.age(now).map(|a| a.num_hours()), Some(13));
+        assert!(dead.is_stale(now, Duration::minutes(30)));
+        assert!(dead.is_stale(now, Duration::hours(12)));
+        assert!(!dead.is_stale(now, Duration::hours(14)));
+    }
+
+    /// An unreadable key has an *unknown* age, which is not the same as stale.
+    ///
+    /// Reporting it as stale would put a warning on a product that may be
+    /// seconds old; reporting it as fresh would hide one that may be days old.
+    /// Neither claim is supported, so `age` is `None` and `is_stale` is false.
+    #[test]
+    fn a_stamp_with_no_readable_time_reports_neither_age_nor_staleness() {
+        let stamp = ProductStamp::from_key("garbage");
+        assert_eq!(stamp.time, None);
+        assert_eq!(stamp.age(at(12, 0, 0)), None);
+        assert!(!stamp.is_stale(at(12, 0, 0), Duration::zero()));
+        // The key itself survives, so the UI can still say *what* it drew.
+        assert_eq!(stamp.key, "garbage");
     }
 
     /// The rule is "drop the leading letter", not "strip a leading K".
@@ -500,15 +645,27 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} names no product code", product.name()));
 
             for &code in codes {
-                let msg = fetch_latest_product(&sources, "KTLX", code, now)
+                let fetched = fetch_latest_product(&sources, "KTLX", code, now)
                     .await
                     .unwrap_or_else(|e| panic!("{} fetch of {code} failed: {e}", product.name()));
+                let msg = &fetched.message;
                 let got = msg.header.message_code;
                 println!(
-                    "{} -> {code}: message_code={got}, product_code={}, symbology={}",
+                    "{} -> {code}: message_code={got}, product_code={}, symbology={}, \
+                     key={}, age={:?} min",
                     product.name(),
                     msg.pdb.product_code,
                     msg.symbology.is_some(),
+                    fetched.stamp.key,
+                    fetched.age(now).map(|a| a.num_minutes()),
+                );
+                // The timestamp must survive the fetch, not just the key
+                // parser: it is what tells the UI a product came from
+                // yesterday's fallback rather than from this scan.
+                assert!(
+                    fetched.stamp.time.is_some(),
+                    "{code} arrived as {} with no readable timestamp",
+                    fetched.stamp.key,
                 );
                 assert_eq!(
                     got, want_message_code,

@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use nexrad_level3::model::Level3Message;
+use rustdar_radar::level3::Level3Product;
 use rustdar_radar::render::{render_level3_message_to_image, render_radar_to_image};
 use rustdar_radar::types::RadarProduct;
 
@@ -170,7 +170,12 @@ pub struct RenderDispatcher {
     /// Per-pane render tracking (indexed by pane index).
     pub pane_render: Vec<PaneRenderState>,
     /// Decoded Level III product data, keyed by (RadarProduct, tilt_code, site).
-    pub level3_data: HashMap<(RadarProduct, String, String), Arc<Level3Message>>,
+    /// The latest Level III product per (product, tilt, site).
+    ///
+    /// Holds the whole [`Level3Product`], not just the message, so the stamp —
+    /// which object it came from and when it was written — reaches the UI
+    /// alongside the pixels. See [`rustdar_radar::level3::ProductStamp`].
+    pub level3_data: HashMap<(RadarProduct, String, String), Arc<Level3Product>>,
     /// Generation counter to discard stale render results after site/scan changes.
     pub render_generation: u64,
     /// Per-site fetch generation counters to discard stale fetch results.
@@ -314,8 +319,8 @@ impl RenderDispatcher {
             .iter()
             .filter(|((p, _tilt, s), _)| *p == params.product && s == site)
             .min_by(|(_, a), (_, b)| {
-                let da = (a.pdb.elevation_angle() - params.elevation).abs();
-                let db = (b.pdb.elevation_angle() - params.elevation).abs();
+                let da = (a.message.pdb.elevation_angle() - params.elevation).abs();
+                let db = (b.message.pdb.elevation_angle() - params.elevation).abs();
                 da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(_, msg)| Arc::clone(msg));
@@ -333,7 +338,7 @@ impl RenderDispatcher {
             product
         );
         self.spawn_render(pane_idx, params.product, params.elevation, sender, window, move || {
-            render_level3_message_to_image(&l3_msg, product, lat, lon)
+            render_level3_message_to_image(&l3_msg.message, product, lat, lon)
         });
         true
     }

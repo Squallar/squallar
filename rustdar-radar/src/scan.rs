@@ -368,7 +368,7 @@ pub async fn get_adjacent_scan(
 pub async fn get_level3_product(
     site: &str,
     product: &str,
-) -> std::result::Result<nexrad_level3::model::Level3Message, crate::level3::Level3Error> {
+) -> std::result::Result<crate::level3::Level3Product, crate::level3::Level3Error> {
     crate::tls::init();
     crate::level3::fetch_latest_product(
         &crate::sources::DataSources::production(),
