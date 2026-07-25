@@ -233,14 +233,38 @@ async fn list_glm_files(
                 .and_then(|n| n.text())
                 .is_some_and(|t| t == "true");
 
-            if is_truncated {
-                continuation_token = doc.descendants()
-                    .find(|n| n.tag_name().name() == "NextContinuationToken")
-                    .and_then(|n| n.text())
-                    .map(|s| s.to_string());
-            } else {
+            if !is_truncated {
                 break;
             }
+
+            // A truncated response with no usable continuation token would
+            // otherwise re-issue the identical first-page request forever,
+            // inside an async fetch task with no timeout. Stop and say why.
+            let next = doc.descendants()
+                .find(|n| n.tag_name().name() == "NextContinuationToken")
+                .and_then(|n| n.text())
+                .filter(|t| !t.is_empty())
+                .map(|s| s.to_string());
+
+            let Some(next) = next else {
+                log::warn!(
+                    "GLM: S3 reported a truncated listing for '{prefix}' in bucket \
+                     '{bucket}' but returned no continuation token; \
+                     results for this prefix may be incomplete"
+                );
+                break;
+            };
+
+            // Defensive: a token that repeats would loop just as tightly.
+            if continuation_token.as_deref() == Some(next.as_str()) {
+                log::warn!(
+                    "GLM: S3 repeated the same continuation token for '{prefix}' in \
+                     bucket '{bucket}'; stopping pagination to avoid a spin"
+                );
+                break;
+            }
+
+            continuation_token = Some(next);
         }
     }
 
