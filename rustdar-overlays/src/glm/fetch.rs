@@ -22,6 +22,18 @@ pub struct GlmCache {
 
 impl GlmCache {
     /// Remove cached entries whose flashes are entirely outside the time window.
+    ///
+    /// Granule granularity, deliberately: an entry is one downloaded file, and
+    /// keeping half of one would mean re-downloading it to get the half back.
+    /// So a file survives as long as *one* flash in it is still in window, stale
+    /// siblings and all, and [`flashes_in_window`] does the per-flash narrowing
+    /// afterwards. Tightening this to `all` would evict a granule that straddles
+    /// the cutoff — the newest-but-one file, every single poll.
+    ///
+    /// `cutoff` is inclusive: a flash landing exactly on it is inside the window
+    /// the user asked for. The same instant is passed to `flashes_in_window`, so
+    /// the two stages agree on the boundary and a flash cannot be kept by one
+    /// and dropped by the other.
     pub fn evict_before(&mut self, cutoff: NaiveDateTime) {
         self.entries.retain(|_key, flashes| {
             flashes.iter().any(|f| f.time >= cutoff)
@@ -120,10 +132,7 @@ pub async fn fetch_glm_flashes(
     }
 
     // Return all cached flashes within the window
-    let filtered: Vec<GlmFlash> = cache.all_flashes()
-        .filter(|f| f.time >= cutoff && f.time <= now)
-        .cloned()
-        .collect();
+    let filtered = flashes_in_window(cache, cutoff, now);
 
     log::info!("GLM: {} flashes in {:.0}s window", filtered.len(), time_window_secs);
 
@@ -131,6 +140,43 @@ pub async fn fetch_glm_flashes(
     // are: only the caller knows what the previous poll looked like, and only
     // the caller can put it on screen.
     Ok(build_outcome(filtered, dead_feeds, satellites.to_vec(), &tally, acc))
+}
+
+/// Select the cached flashes that fall inside this poll's window.
+///
+/// The second half of a two-stage narrowing. [`GlmCache::evict_before`] works at
+/// *granule* granularity and keeps a whole file as long as one of its flashes is
+/// still in window; this is what then discards the individual stale flashes
+/// inside a file that was kept. Neither stage subsumes the other, and dropping
+/// either one is invisible on screen — too many bolts and too few both just look
+/// like weather.
+///
+/// Both bounds are inclusive and both are load-bearing:
+///
+/// * `>= cutoff` is what makes the retained-granule case correct. `cutoff` is
+///   the same instant `evict_before` was handed, so a flash exactly on it is
+///   inside the window the user asked for, not one tick outside it.
+/// * `<= now` bounds the window from *above*, which is not the redundant clause
+///   it looks like. `now` is wall-clock and sampled once at the top of the poll,
+///   so it can sit behind the data in two ways: a granule covers ~20 s and is
+///   listed by its start time, so its last flashes can be stamped after `now`;
+///   and an NTP step backwards can put `now` behind flashes already cached. In
+///   both cases the flash stays cached and simply appears on the next poll —
+///   which is exactly why removing this clause is silent.
+///
+/// Extracted for the same reason [`plan_downloads`] and [`build_outcome`] were:
+/// inline in the async fetch it sat behind a network round trip where no test
+/// could reach either bound.
+fn flashes_in_window(
+    cache: &GlmCache,
+    cutoff: NaiveDateTime,
+    now: NaiveDateTime,
+) -> Vec<GlmFlash> {
+    cache
+        .all_flashes()
+        .filter(|f| f.time >= cutoff && f.time <= now)
+        .cloned()
+        .collect()
 }
 
 /// Assemble the outcome a poll reports.
@@ -1621,6 +1667,257 @@ mod tests {
         assert!(
             !report.is_total(),
             "one straggler failing must never read as a total outage, got {report:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Retention: `GlmCache::evict_before` and `flashes_in_window`.
+    //
+    // These two decide which lightning survives a poll, and every way of
+    // getting them wrong renders identically — a quiet sky. Neither had a
+    // test, so an off-by-one on either boundary, or dropping either stage
+    // outright, left the suite green.
+    // ---------------------------------------------------------------------
+
+    /// An arbitrary but fixed instant to hang the retention tests off, so they
+    /// never consult the wall clock.
+    fn t0() -> NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 24)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+    }
+
+    /// A flash whose only interesting property is when it happened.
+    fn flash_at(time: NaiveDateTime) -> GlmFlash {
+        GlmFlash {
+            lat: 38.967,
+            lon: -82.1,
+            energy: Some(1.0e-14),
+            area: Some(278.65),
+            time,
+            satellite: GlmSatellite::GoesEast,
+            level: GlmDataLevel::Flash,
+        }
+    }
+
+    /// Cache keys sorted, so assertions on "what is left" are order-stable.
+    fn cached_keys(cache: &GlmCache) -> Vec<String> {
+        let mut keys: Vec<String> = cache.entries.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    /// `cutoff` is *inclusive*. A granule whose newest flash lands exactly on
+    /// the window edge is inside the window the user asked for, and evicting it
+    /// throws away a file we would immediately re-download.
+    ///
+    /// The tick either side is deliberately one millisecond: GLM times unpack
+    /// through a `0.0003814756 s` scale factor, so sub-second differences are
+    /// the resolution this boundary is actually exercised at, not a contrived
+    /// epsilon.
+    #[test]
+    fn evict_before_keeps_a_granule_sitting_exactly_on_the_cutoff() {
+        let cutoff = t0();
+        let mut cache = GlmCache::default();
+        cache.insert("exactly_at.nc".into(), vec![flash_at(cutoff)]);
+        cache.insert(
+            "one_tick_before.nc".into(),
+            vec![flash_at(cutoff - TimeDelta::milliseconds(1))],
+        );
+        cache.insert(
+            "one_tick_after.nc".into(),
+            vec![flash_at(cutoff + TimeDelta::milliseconds(1))],
+        );
+
+        cache.evict_before(cutoff);
+
+        assert_eq!(
+            cached_keys(&cache),
+            vec!["exactly_at.nc".to_string(), "one_tick_after.nc".to_string()],
+            "the cutoff is inclusive: only the granule strictly before it goes"
+        );
+    }
+
+    /// Eviction is per *granule*, not per flash. A file straddling the cutoff —
+    /// which the newest-but-one file does on essentially every poll, since a
+    /// granule spans ~20 s — must be kept whole; `flashes_in_window` is what
+    /// then hides the stale half. Tightening this to "all flashes in window"
+    /// would evict a live file every tick and re-download it every tick.
+    #[test]
+    fn evict_before_keeps_a_granule_that_straddles_the_cutoff() {
+        let cutoff = t0();
+        let stale = cutoff - TimeDelta::seconds(10);
+        let fresh = cutoff + TimeDelta::seconds(10);
+
+        let mut cache = GlmCache::default();
+        cache.insert("straddles.nc".into(), vec![flash_at(stale), flash_at(fresh)]);
+
+        cache.evict_before(cutoff);
+
+        assert_eq!(cached_keys(&cache), vec!["straddles.nc".to_string()]);
+        let times: Vec<NaiveDateTime> = cache.all_flashes().map(|f| f.time).collect();
+        assert_eq!(
+            times.len(),
+            2,
+            "the granule is kept intact; trimming individual flashes here would \
+             mean re-downloading the file to get them back, and is not this \
+             stage's job"
+        );
+        assert!(times.contains(&stale) && times.contains(&fresh));
+    }
+
+    /// The two ends of the range, and the degenerate case in between.
+    ///
+    /// "Evict nothing" and "evict everything" are the two shapes that make the
+    /// method look like it works while doing neither: a no-op eviction grows the
+    /// cache without bound and keeps hours-old bolts on screen, and a
+    /// clear-everything eviction re-downloads the whole window every poll.
+    #[test]
+    fn evict_before_handles_an_empty_cache_and_both_extremes() {
+        // Empty cache: must not panic, must stay empty.
+        let mut empty = GlmCache::default();
+        empty.evict_before(t0());
+        assert_eq!(empty.all_flashes().count(), 0);
+        assert!(cached_keys(&empty).is_empty());
+
+        // Everything is stale.
+        let mut cache = GlmCache::default();
+        for i in 1..=3 {
+            cache.insert(
+                format!("old{i}.nc"),
+                vec![flash_at(t0() - TimeDelta::minutes(i))],
+            );
+        }
+        cache.evict_before(t0());
+        assert!(
+            cached_keys(&cache).is_empty(),
+            "an eviction that keeps stale granules is a cache that grows forever"
+        );
+
+        // Nothing is stale.
+        let mut cache = GlmCache::default();
+        for i in 1..=3 {
+            cache.insert(
+                format!("new{i}.nc"),
+                vec![flash_at(t0() + TimeDelta::minutes(i))],
+            );
+        }
+        cache.evict_before(t0());
+        assert_eq!(
+            cached_keys(&cache).len(),
+            3,
+            "an eviction that clears live granules re-downloads the whole window \
+             every poll"
+        );
+    }
+
+    /// A granule that parsed to *zero* records is evicted on the very next
+    /// poll, because "no flash is in window" and "no flash at all" are the same
+    /// predicate here.
+    ///
+    /// Pinned as an observation, not an endorsement: an empty parse is a normal
+    /// condition (see `a_level_with_no_records_is_empty_not_broken`), so the
+    /// consequence is that every quiet granule is re-downloaded on every poll
+    /// for as long as it stays in the listing window. That costs bandwidth, not
+    /// correctness — the flash count is right either way — which is why it is
+    /// recorded here rather than changed under a coverage commit. A fix belongs
+    /// in `plan_downloads`/the cache representation (remembering "downloaded and
+    /// empty" as distinct from "not downloaded"), and it will land by making
+    /// this assertion fail.
+    #[test]
+    fn evict_before_drops_a_granule_that_parsed_to_no_records() {
+        let mut cache = GlmCache::default();
+        cache.insert("quiet.nc".into(), Vec::new());
+        cache.evict_before(t0() - TimeDelta::days(365));
+
+        assert!(
+            !cache.contains_key("quiet.nc"),
+            "known wart: an empty granule cannot prove it is in window, so it is \
+             evicted and re-downloaded next poll"
+        );
+    }
+
+    /// Both window bounds are inclusive, and both are load-bearing.
+    ///
+    /// Losing the lower bound shows hours-old bolts inside a granule that was
+    /// legitimately retained; losing the upper bound publishes flashes stamped
+    /// after the instant the poll claims to describe. Neither is visible on
+    /// screen, which is why they are pinned at the exact tick.
+    #[test]
+    fn the_window_filter_includes_both_bounds() {
+        let cutoff = t0();
+        let now = cutoff + TimeDelta::minutes(5);
+        let tick = TimeDelta::milliseconds(1);
+
+        let mut cache = GlmCache::default();
+        cache.insert(
+            "spread.nc".into(),
+            vec![
+                flash_at(cutoff - tick),
+                flash_at(cutoff),
+                flash_at(cutoff + TimeDelta::minutes(2)),
+                flash_at(now),
+                flash_at(now + tick),
+            ],
+        );
+
+        let mut got: Vec<NaiveDateTime> =
+            flashes_in_window(&cache, cutoff, now).into_iter().map(|f| f.time).collect();
+        got.sort();
+
+        assert_eq!(
+            got,
+            vec![cutoff, cutoff + TimeDelta::minutes(2), now],
+            "both ends are inclusive and nothing outside them survives"
+        );
+    }
+
+    /// Wall-clock time is not monotonic, and this poll samples it once with
+    /// `Utc::now()`. An NTP step backwards — or a laptop resuming from sleep
+    /// with a stale RTC — puts `now` *behind* flashes already in the cache.
+    ///
+    /// The required behaviour is that such flashes are hidden from the poll and
+    /// nothing more: they must stay cached, so the moment the clock recovers
+    /// they reappear without a re-download. The upper bound is what makes the
+    /// first half true; the *inclusive* lower bound in `evict_before` is what
+    /// makes the second half true.
+    #[test]
+    fn a_backwards_clock_hides_flashes_without_losing_them() {
+        let window = TimeDelta::minutes(5);
+        let ahead = t0() + TimeDelta::minutes(3);
+
+        let mut cache = GlmCache::default();
+        cache.insert("granule.nc".into(), vec![flash_at(t0()), flash_at(ahead)]);
+
+        // The clock steps back: `now` lands between the two cached flashes.
+        let now = t0() + TimeDelta::minutes(1);
+        let cutoff = now - window;
+        cache.evict_before(cutoff);
+
+        assert!(
+            cache.contains_key("granule.nc"),
+            "a backwards clock must not evict data it has not caught up to yet"
+        );
+        let during: Vec<NaiveDateTime> =
+            flashes_in_window(&cache, cutoff, now).into_iter().map(|f| f.time).collect();
+        assert_eq!(
+            during,
+            vec![t0()],
+            "the flash stamped after `now` is withheld, not published"
+        );
+
+        // The clock catches up. Nothing had to be fetched again.
+        let now = ahead + TimeDelta::minutes(1);
+        let cutoff = now - window;
+        cache.evict_before(cutoff);
+        let mut after: Vec<NaiveDateTime> =
+            flashes_in_window(&cache, cutoff, now).into_iter().map(|f| f.time).collect();
+        after.sort();
+        assert_eq!(
+            after,
+            vec![t0(), ahead],
+            "both flashes were held in the cache the whole time"
         );
     }
 
