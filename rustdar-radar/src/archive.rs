@@ -464,45 +464,13 @@ pub(crate) async fn get_bytes(client: &reqwest::Client, url: String) -> Result<V
     }
 }
 
-/// GET a byte range of an object.
-///
-/// `start` and `end` are inclusive, matching HTTP's `Range: bytes=start-end`.
-///
-/// **`206 Partial Content` is the success status here, not `200`.** [`classify`]
-/// deliberately treats `206` as a failure for whole-object fetches — a partial
-/// body handed to a volume decoder is a truncated file — so this path cannot
-/// reuse it. A server that ignores the `Range` header answers `200` with the
-/// *whole* object; that is accepted, because the caller slicing what it asked
-/// for still gets the right bytes, but it is logged since it means the transfer
-/// saving did not happen.
-pub(crate) async fn get_range(
-    client: &reqwest::Client,
-    url: String,
-    start: u64,
-    end: u64,
-) -> Result<Vec<u8>> {
-    let response = client
-        .get(&url)
-        .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
-        .send()
-        .await?;
-    let status = response.status();
-    if status == StatusCode::PARTIAL_CONTENT {
-        return Ok(response.bytes().await?.to_vec());
-    }
-    if status == StatusCode::OK {
-        log::warn!("{url} ignored the Range header and returned the whole object");
-        let all = response.bytes().await?;
-        let start = (start as usize).min(all.len());
-        let end = ((end as usize) + 1).min(all.len());
-        return Ok(all[start..end].to_vec());
-    }
-    if status == StatusCode::NOT_FOUND {
-        return Err(ArchiveError::NotFound(url));
-    }
-    let body = response.text().await.ok();
-    Err(ArchiveError::Status { status, url, body })
-}
+// NOTE: there is deliberately no byte-range helper here. The one consumer of
+// HTTP `Range` in this workspace is `rustdar_overlays::hrrr::fetch`, and it
+// needs semantics this module's `classify` cannot express: a `200` there means
+// the server ignored the header and is about to stream a ~130 MB file, which is
+// a hard error rather than something to slice locally. Keeping that logic next
+// to the `.idx` arithmetic that produces the range is what makes the two
+// testable together.
 
 // ---------------------------------------------------------------------------
 // Public surface

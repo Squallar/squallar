@@ -7,14 +7,14 @@ This document details which data sources are needed for this project. Not all ar
 |           Data Source           | Status | Public Access |
 | ------------------------------- | ------ | ------------- |
 | NEXRAD Level 2                  | ✅     | ✅ Free — AWS Open Data (NOAA) |
-| NEXRAD Level 3                  | ✅     | ✅ Free — NOAA TGFTP |
+| NEXRAD Level 3                  | ✅     | ✅ Free — AWS Open Data `unidata-nexrad-level3` (CORS-clean; SRM tilts 1–3 discontinued upstream) |
 | MRMS (Multi-Radar/Multi-Sensor) | ❌     | ✅ Free — NCEP / Iowa State |
 
 ## Numerical Weather Prediction (NWP) Models
 
 |                 Model                  | Status | Public Access |
 | -------------------------------------- | ------ | ------------- |
-| HRRR (High-Resolution Rapid Refresh)   | ❌     | ✅ Free — NOAA NOMADS / AWS Open Data |
+| HRRR (High-Resolution Rapid Refresh)   | ✅     | ✅ Free — AWS Open Data `noaa-hrrr-bdp-pds`, `.idx` byte-ranged (CORS-clean) |
 | RAP (Rapid Refresh)                    | ❌     | ✅ Free — NOAA NOMADS |
 | NAM (North American Mesoscale)         | ❌     | ✅ Free — NOAA NOMADS |
 | GFS (Global Forecast System)           | ❌     | ✅ Free — NOAA NOMADS |
@@ -58,7 +58,7 @@ This document details which data sources are needed for this project. Not all ar
 
 |                Data Source                 | Status | Public Access |
 | ------------------------------------------ | ------ | ------------- |
-| METAR/ASOS (surface obs)                   | ✅     | ✅ Free — aviationweather.gov bulk cache |
+| METAR/ASOS (surface obs)                   | ✅     | ✅ Free — Iowa Environmental Mesonet `currents.json`, per state (CORS-clean) |
 | Upper-air soundings (RAOB)                 | ❌     | ✅ Free — University of Wyoming / UCAR |
 | Mesonets (state/regional surface networks) | ❌     | ⚠️ Mixed — varies by state; some free (e.g. Oklahoma, Iowa), many restricted or paywalled |
 | Buoy / Marine obs                          | ❌     | ✅ Free — NDBC (NOAA) |

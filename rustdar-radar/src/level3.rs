@@ -263,7 +263,7 @@ mod tests {
     /// An hour of `9` rather than `09` would sort after `17`.
     #[test]
     fn zero_padded_hours_keep_binary_order_equal_to_time_order() {
-        let mut keys = vec![
+        let mut keys = [
             "TLX_N0S_2026_07_25_09_13_03".to_string(),
             "TLX_N0S_2026_07_25_17_30_24".to_string(),
         ];

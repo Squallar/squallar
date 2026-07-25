@@ -196,14 +196,16 @@ impl OverlayHandler for ModelDataHandler {
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
         let client = ctx.client.clone();
+        let sources = ctx.sources.clone();
         let param = self.selected_param;
         vec![FetchTask {
             kind: OverlayKind::ModelData,
             future: Box::pin(async move {
                 let result = if param.is_composite() {
-                    crate::hrrr::fetch::fetch_composite_hrrr_data(&client, &param).await
+                    crate::hrrr::fetch::fetch_composite_hrrr_data(&client, &sources, &param)
+                        .await
                 } else {
-                    crate::hrrr::fetch::fetch_hrrr_data(&client, &param).await
+                    crate::hrrr::fetch::fetch_hrrr_data(&client, &sources, &param).await
                 };
                 Box::new(result) as FetchPayload
             }),

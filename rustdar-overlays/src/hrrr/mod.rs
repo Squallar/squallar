@@ -120,82 +120,85 @@ impl ModelParameter {
         )
     }
 
-    /// Whether this parameter requires multiple NOMADS fetches that are
+    /// Whether this parameter requires multiple fetches that are
     /// merged into a single grid (e.g. U+V shear components → magnitude).
     pub fn is_composite(&self) -> bool {
         matches!(self, ModelParameter::BulkShear6km)
     }
 
-    /// For composite parameters, returns the (var, lev) pairs to fetch.
-    /// Each pair results in one NOMADS request; values are merged in
+    /// For composite parameters, returns the (var, level) pairs to fetch.
+    /// Each pair selects one GRIB2 record; values are merged in
     /// `fetch::fetch_composite_hrrr_data()`.
     pub fn composite_parts(&self) -> Option<Vec<(&'static str, &'static str)>> {
         match self {
             ModelParameter::BulkShear6km => Some(vec![
-                ("var_VUCSH", "lev_0-6000_m_above_ground"),
-                ("var_VVCSH", "lev_0-6000_m_above_ground"),
+                ("VUCSH", "0-6000 m above ground"),
+                ("VVCSH", "0-6000 m above ground"),
             ]),
             _ => None,
         }
     }
 
-    /// NOMADS `var_*` query parameter name (e.g. `"var_CIN"`).
-    /// Panics for composite parameters — use `composite_parts()` instead.
-    pub fn nomads_var(&self) -> &'static str {
+    /// The GRIB2 variable abbreviation, exactly as the `.idx` spells it.
+    ///
+    /// These are matched **literally** against the index sidecar — see
+    /// [`crate::hrrr::fetch::byte_range`] — so they are the index's strings,
+    /// not a normalised form of them. Panics for composite parameters; use
+    /// [`Self::composite_parts`] instead.
+    pub fn grib_var(&self) -> &'static str {
         match self {
-            ModelParameter::SurfaceBasedCin | ModelParameter::MixedLayerCin => "var_CIN",
+            ModelParameter::SurfaceBasedCin | ModelParameter::MixedLayerCin => "CIN",
             ModelParameter::SurfaceBasedCape
             | ModelParameter::MixedLayerCape
-            | ModelParameter::MostUnstableCape => "var_CAPE",
-            ModelParameter::LiftedIndex => "var_LFTX",
-            ModelParameter::Srh1km | ModelParameter::Srh3km => "var_HLCY",
-            ModelParameter::MaxUH2to5km | ModelParameter::MaxUH0to2km => "var_MXUPHL",
-            ModelParameter::SurfaceWindGust => "var_GUST",
-            ModelParameter::PrecipitableWater => "var_PWAT",
-            ModelParameter::Temperature2m => "var_TMP",
-            ModelParameter::Dewpoint2m => "var_DPT",
-            ModelParameter::Visibility => "var_VIS",
+            | ModelParameter::MostUnstableCape => "CAPE",
+            ModelParameter::LiftedIndex => "LFTX",
+            ModelParameter::Srh1km | ModelParameter::Srh3km => "HLCY",
+            ModelParameter::MaxUH2to5km | ModelParameter::MaxUH0to2km => "MXUPHL",
+            ModelParameter::SurfaceWindGust => "GUST",
+            ModelParameter::PrecipitableWater => "PWAT",
+            ModelParameter::Temperature2m => "TMP",
+            ModelParameter::Dewpoint2m => "DPT",
+            ModelParameter::Visibility => "VIS",
             ModelParameter::BulkShear6km => {
                 panic!("BulkShear6km is composite — use composite_parts()")
             }
         }
     }
 
-    /// NOMADS `lev_*` query parameter name.
+    /// The GRIB2 level description, exactly as the `.idx` spells it.
+    ///
     /// Panics for composite parameters.
-    pub fn nomads_level(&self) -> &'static str {
+    pub fn grib_level(&self) -> &'static str {
         match self {
             ModelParameter::SurfaceBasedCin
             | ModelParameter::SurfaceBasedCape
             | ModelParameter::SurfaceWindGust
-            | ModelParameter::Visibility => "lev_surface",
+            | ModelParameter::Visibility => "surface",
             ModelParameter::MixedLayerCin | ModelParameter::MixedLayerCape => {
-                "lev_180-0_mb_above_ground"
+                "180-0 mb above ground"
             }
-            ModelParameter::MostUnstableCape => "lev_255-0_mb_above_ground",
-            ModelParameter::LiftedIndex => "lev_500-1000_mb",
-            ModelParameter::Srh1km => "lev_1000-0_m_above_ground",
-            ModelParameter::Srh3km => "lev_3000-0_m_above_ground",
+            ModelParameter::MostUnstableCape => "255-0 mb above ground",
+            ModelParameter::LiftedIndex => "500-1000 mb",
+            ModelParameter::Srh1km => "1000-0 m above ground",
+            ModelParameter::Srh3km => "3000-0 m above ground",
             // HRRR declares the MXUPHL layers top-bound-first — the `.idx`
             // reads `MXUPHL:5000-2000 m above ground` and `MXUPHL:2000-0 m
-            // above ground`. NOMADS matches the level string literally, so the
-            // ascending spellings these once used ("2000-5000", "0-2000")
-            // selected no record and the filter CGI answered HTTP 500
-            // `invalid parameter` on every request.
+            // above ground`. The index is matched literally, so the ascending
+            // spellings these once used ("2000-5000", "0-2000") select no
+            // record at all; against NOMADS that produced an HTTP 500 on every
+            // request, and against the index it produces "record not found".
             //
             // Do not "normalise" these to match the ascending layers elsewhere
             // in this match: HRRR is not self-consistent about bound order
             // (`VUCSH:0-6000` and `CAPE:0-3000 m` are bottom-first, `HLCY:3000-0`
             // and these are top-first), so each spelling is only correct
             // against the index record it selects.
-            ModelParameter::MaxUH2to5km => "lev_5000-2000_m_above_ground",
-            ModelParameter::MaxUH0to2km => "lev_2000-0_m_above_ground",
+            ModelParameter::MaxUH2to5km => "5000-2000 m above ground",
+            ModelParameter::MaxUH0to2km => "2000-0 m above ground",
             ModelParameter::PrecipitableWater => {
-                "lev_entire_atmosphere_(considered_as_a_single_layer)"
+                "entire atmosphere (considered as a single layer)"
             }
-            ModelParameter::Temperature2m | ModelParameter::Dewpoint2m => {
-                "lev_2_m_above_ground"
-            }
+            ModelParameter::Temperature2m | ModelParameter::Dewpoint2m => "2 m above ground",
             ModelParameter::BulkShear6km => {
                 panic!("BulkShear6km is composite — use composite_parts()")
             }
