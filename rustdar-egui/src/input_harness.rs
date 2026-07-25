@@ -195,6 +195,16 @@ impl InputHarness {
         self.warm_up();
     }
 
+    /// Report host safe-area insets, as the Android side channel does.
+    ///
+    /// `egui-winit` fills `RawInput::safe_area_insets` only under
+    /// `cfg(target_os = "ios")`, so Android pushes its `WindowInsets` through
+    /// `Gui::set_safe_area_insets` instead. This is that route.
+    pub(crate) fn set_safe_area_insets(&mut self, top: f32, bottom: f32, left: f32, right: f32) {
+        self.gui.set_safe_area_insets(top, bottom, left, right);
+        self.warm_up();
+    }
+
     /// Whether egui has a real widget registered under `id` from the last
     /// frame.
     ///
@@ -2197,6 +2207,77 @@ mod tests {
             compact.pane_options().len() < expanded.pane_options().len(),
             "precondition: the two ranges must differ, or both assertions above \
              are satisfied by one constant"
+        );
+    }
+
+    /// 23. **Host safe-area insets reach the chrome.**
+    ///
+    ///     The Android host pushes its `WindowInsets` through
+    ///     `Gui::set_safe_area_insets`, `LayoutCtx::resolve` folds them into
+    ///     `content_rect`, and the root `Ui` is built on that rect so every
+    ///     nested `Panel` clears the notch and the system bars for free. That
+    ///     last hop was untested: dropping `.max_rect(..)` from the root `Ui`
+    ///     leaves the chrome drawing under the status bar, and the whole suite
+    ///     passed because nothing ever set an inset.
+    #[test]
+    fn host_safe_area_insets_inset_the_chrome() {
+        const TOP: f32 = 60.0;
+        const BOTTOM: f32 = 40.0;
+        const LEFT: f32 = 30.0;
+        const RIGHT: f32 = 20.0;
+
+        let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
+        let bare = h.map_panel_rect();
+
+        h.set_safe_area_insets(TOP, BOTTOM, LEFT, RIGHT);
+        let inset = h.map_panel_rect();
+
+        // The map is what is left after the panels claim their space, so it
+        // moves by exactly what the insets took off each edge.
+        assert_eq!(inset.left() - bare.left(), LEFT, "left inset ignored");
+        assert_eq!(bare.right() - inset.right(), RIGHT, "right inset ignored");
+        assert_eq!(inset.top() - bare.top(), TOP, "top inset ignored");
+        assert_eq!(bare.bottom() - inset.bottom(), BOTTOM, "bottom inset ignored");
+
+        // The hamburger is positioned from `content_rect` too, so it must have
+        // moved clear of the notch rather than staying in the screen corner.
+        let mut h = InputHarness::with_screen(egui::vec2(420.0, 1000.0));
+        assert_eq!(
+            h.width_class(),
+            crate::ui_layout::WidthClass::Compact,
+            "precondition: only a compact layout draws a hamburger"
+        );
+        let bare = h.excluded_rects()[0];
+        h.set_safe_area_insets(TOP, 0.0, LEFT, 0.0);
+        let inset = h.excluded_rects()[0];
+        assert_eq!(
+            (inset.left() - bare.left(), inset.top() - bare.top()),
+            (LEFT, TOP),
+            "the hamburger ignored the insets and stayed under the system bars"
+        );
+    }
+
+    /// 24. **Insets move the breakpoint, not just the padding.**
+    ///
+    ///     The width class is taken from the *content* width, so a window that
+    ///     is Medium by its raw size is Compact once the host's side insets are
+    ///     accounted for. Pinned end to end here, through `Gui::ui`, rather
+    ///     than only on `shrink_to_content` — that is the half that proves
+    ///     `Gui::safe_area_insets` is actually threaded into the resolve.
+    #[test]
+    fn host_insets_move_the_breakpoint_through_the_real_ui() {
+        let mut h = InputHarness::with_screen(egui::vec2(610.0, 900.0));
+        assert_eq!(
+            h.width_class(),
+            crate::ui_layout::WidthClass::Medium,
+            "precondition: 610pt of raw viewport is Medium"
+        );
+
+        h.set_safe_area_insets(0.0, 0.0, 20.0, 20.0);
+        assert_eq!(
+            h.width_class(),
+            crate::ui_layout::WidthClass::Compact,
+            "570pt of content is Compact: the insets never reached the breakpoint"
         );
     }
 
