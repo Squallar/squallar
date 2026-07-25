@@ -61,7 +61,7 @@ ndk-context = "=0.1.1"
 pollster = "=0.4.0"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
-thiserror = "=2.0.18"
+thiserror = "=2.0.19"
 tokio = "=1.51.1"
 # Members differ on the TLS backend, so defaults are off here and every member
 # spells out what it wants (`default` == reqwest's own default feature set).
