@@ -700,17 +700,27 @@ fn draw_shadowed_text(
     );
 }
 
+/// How much taller than wide a pane must be for its color scales to switch to
+/// the horizontal (bottom) orientation.
+///
+/// A bare `height > width` test flips as a divider is dragged through square,
+/// and a 2-pane split of a 16:9 window lands right there (~960x1000), so the
+/// bars would hop between the bottom and right edges mid-drag. Requiring a
+/// clearly portrait pane keeps the common layouts well clear of the boundary:
+/// a phone pane is ~2.0, and panes of any grid on a landscape window are <= 1.0.
+const PORTRAIT_SCALE_RATIO: f32 = 1.2;
+
 /// Whether a pane's color scale bars should be horizontal (along the bottom)
 /// rather than vertical (along the right edge).
 ///
 /// This is keyed on the pane's aspect ratio, not on the platform: panes are
 /// laid out in a grid, so a desktop window can produce portrait panes and a
 /// tablet/landscape phone can produce landscape ones. A portrait pane gets the
-/// bottom bar (what a phone has always shown), a landscape pane the right-hand
-/// bar (what desktop has always shown), so the common single-pane case on each
+/// bottom bar (what a phone has always shown), anything else the right-hand bar
+/// (what desktop has always shown), so the common single-pane case on each
 /// platform is unchanged.
 fn horizontal_color_scale(pane_rect: egui::Rect) -> bool {
-    pane_rect.height() > pane_rect.width()
+    pane_rect.height() > pane_rect.width() * PORTRAIT_SCALE_RATIO
 }
 
 /// Render the color scale legend bar for the current pane's radar product.
