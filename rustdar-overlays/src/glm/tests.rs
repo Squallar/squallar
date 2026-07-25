@@ -1192,3 +1192,112 @@ fn the_real_granule_still_exercises_packed_unsigned_shorts() {
     let chunk = ds.chunk_shape().unwrap().expect("group_lat chunk shape");
     assert!(2172u64.div_ceil(chunk[0]) >= 2, "group_lat is no longer multi-chunk");
 }
+
+/// The overlay end to end on a real granule: bytes off S3 in, plottable
+/// lightning out.
+///
+/// Every assertion here is a property of the *physical world or the product
+/// spec*, not of the reader — a granule of real GLM data has to land on the
+/// globe, in GOES-East's field of view, inside its own 20-second window, with
+/// energies in the joule range GLM actually reports. A reader that produced
+/// self-consistent nonsense (the failure mode CF unpacking has) would satisfy
+/// the fingerprint test above only because the fingerprints came from netCDF-C;
+/// it could not satisfy this one at all.
+///
+/// This is the test that answers "does the lightning overlay still work",
+/// rather than "does it still return the same bytes".
+#[test]
+fn a_real_granule_parses_into_plottable_lightning() {
+    let bytes = std::fs::read(REAL_GRANULE).expect("read the committed GLM granule");
+    let parsed = parse_glm_netcdf(
+        &bytes,
+        GlmSatellite::GoesEast,
+        &[GlmDataLevel::Flash, GlmDataLevel::Group, GlmDataLevel::Event],
+    )
+    .expect("a real NOAA granule must parse");
+
+    assert!(parsed.level_failures.is_empty(), "no level may fail on a healthy granule");
+
+    // 148 flashes + 2172 groups + 5941 events, and nothing dropped: every
+    // record in this granule is inside the globe check in `parse_level_records`.
+    assert_eq!(parsed.records.len(), 8261, "record count");
+    for (level, want) in [
+        (GlmDataLevel::Flash, 148),
+        (GlmDataLevel::Group, 2172),
+        (GlmDataLevel::Event, 5941),
+    ] {
+        let n = parsed.records.iter().filter(|r| r.level == level).count();
+        assert_eq!(n, want, "{level:?} count");
+    }
+
+    // The granule's `time_coverage_start` is 2025-06-29 12:00:00, and its time
+    // axis spans exactly [-5 s, +20 s] around that: every `*_time_offset` is a
+    // u16 with `scale_factor = 0.0003814756` and `add_offset = -5.0`, so
+    // `0 -> -5.000` and `65535 -> +20.000`.
+    //
+    // The lower bound really is negative, and that is the product, not a bug:
+    // a flash is a temporal cluster whose first event can fall slightly before
+    // the granule boundary, so GLM offsets the axis to keep it representable.
+    // This granule contains such a record at 11:59:58.967, and netCDF-C
+    // produced the same timestamp for it, bit for bit.
+    let start = chrono::NaiveDate::from_ymd_opt(2025, 6, 29)
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap();
+    let first = start - chrono::Duration::milliseconds(5_001);
+    let end = start + chrono::Duration::milliseconds(20_001);
+
+    for r in &parsed.records {
+        assert!(r.lat.is_finite() && r.lon.is_finite(), "non-finite position");
+        assert!((-90.0..=90.0).contains(&r.lat), "latitude off the globe: {}", r.lat);
+        assert!((-180.0..=180.0).contains(&r.lon), "longitude off the globe: {}", r.lon);
+        // GOES-East sits over -75.2°; nothing it sees is in the eastern
+        // hemisphere or off Australia. This is what catches an `add_offset`
+        // that was skipped or applied twice -- the values stay finite and
+        // in-range, they just land in the wrong ocean.
+        assert!(
+            (-160.0..=10.0).contains(&r.lon),
+            "outside GOES-East's field of view: {}",
+            r.lon
+        );
+        assert!(
+            r.time >= first && r.time <= end,
+            "timestamp outside the granule's time axis: {}",
+            r.time
+        );
+
+        if let Some(e) = r.energy {
+            // GLM reports radiant energy around 1e-15 J. A missing
+            // `scale_factor` would put this at ~1e4 (the raw count) and a
+            // doubled one at ~1e-31.
+            assert!(
+                (1e-16..1e-10).contains(&e),
+                "energy outside the range GLM reports: {e}"
+            );
+        }
+        if let Some(a) = r.area {
+            // Groups and flashes span tens to thousands of km²; the packed
+            // count is in `m2` and must have been converted.
+            assert!((1.0..1e6).contains(&a), "area outside the plausible range: {a} km2");
+        }
+    }
+
+    // Events carry no area (the product has no `event_area`), flashes and
+    // groups do.
+    assert!(
+        parsed
+            .records
+            .iter()
+            .filter(|r| r.level == GlmDataLevel::Event)
+            .all(|r| r.area.is_none()),
+        "events must not report an area"
+    );
+    assert!(
+        parsed
+            .records
+            .iter()
+            .filter(|r| r.level == GlmDataLevel::Flash)
+            .all(|r| r.area.is_some()),
+        "flashes must report an area"
+    );
+}
