@@ -4142,6 +4142,8 @@ dependencies = [
  "rustdar-egui",
  "rustdar-frontend",
  "rustdar-gps",
+ "rustdar-radar",
+ "walkers",
  "winit",
 ]
 

@@ -35,6 +35,15 @@ pollster = { workspace = true }
 winit = { workspace = true }
 env_logger = "=0.11.11"
 
+[dev-dependencies]
+# For src/network_security_config.rs, which asserts that the Android Network
+# Security Config covers exactly the origins declared here and nowhere else.
+# A dev-dependency, not a dependency: nothing at runtime reads that file.
+rustdar-radar = { workspace = true }
+# TileSource, to derive the basemap hosts from the tile URLs themselves rather
+# than restating them.
+walkers = { workspace = true }
+
 [target.'cfg(not(target_os = "android"))'.dependencies]
 # Cross-platform theme detection for desktop platforms. Android has no entry
 # here: this crate is `#![forbid(unsafe_code)]`, and reading the Android theme

@@ -50,6 +50,28 @@
 
   includeSubdomains is set where a host family is used (*.noaa.gov, *.weather.gov)
   and omitted where the exact host is fixed.
+
+  ===========================================================================
+  Keeping this list honest
+
+  The claim above only holds while this list matches what the application
+  actually fetches, and a hand-maintained copy of another crate's constants does
+  not stay matched on its own. It had already drifted in both directions:
+  aviationweather.gov was still listed after METAR moved off it, and its
+  replacement (Iowa Environmental Mesonet) was never added, so the one live
+  origin missing from this file was silently falling through to base-config,
+  where cleartext is permitted.
+
+  `rustdar-platform/src/network_security_config.rs` parses this file at test
+  time and asserts, both ways, that it covers exactly the origins
+  `rustdar_radar::sources::DataSources::production()` and the tile sources
+  declare. Adding an origin there and not here now fails `cargo test`.
+
+  Generating the file outright was considered and rejected: the attribute on
+  <application> is a resource reference, so the XML has to exist on disk for
+  aapt2 to compile into resources.arsc, and a generated one could not carry any
+  of the reasoning above. A test gives the same guarantee against divergence
+  and leaves the prose where a reader will find it.
 -->
 <network-security-config>
     <!-- Permits the platform's own cleartext CRL/AIA fetches. Does NOT permit
@@ -64,19 +86,35 @@
         </trust-anchors>
     </base-config>
 
-    <!-- NWS / NOAA: alerts, zones, METAR, SPC, HRRR, Level III over TGFTP. -->
+    <!-- NWS / NOAA: active alerts and zone geometry from api.weather.gov, and
+         SPC outlooks, mesoscale discussions and storm reports from
+         www.spc.noaa.gov. Both DataSources::nws_api_base and
+         DataSources::spc_base land here. -->
     <domain-config cleartextTrafficPermitted="false">
         <domain includeSubdomains="true">weather.gov</domain>
         <domain includeSubdomains="true">noaa.gov</domain>
-        <domain includeSubdomains="true">aviationweather.gov</domain>
     </domain-config>
 
-    <!-- NEXRAD Level II archive and realtime chunks, via nexrad-data. -->
+    <!-- Iowa Environmental Mesonet: current ASOS/METAR observations
+         (DataSources::iem_base). This is where METAR comes from now; it used to
+         be aviationweather.gov, which was still listed here long after nothing
+         fetched from it while this host was not listed at all. -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain>mesonet.agron.iastate.edu</domain>
+    </domain-config>
+
+    <!-- Everything served out of S3: the NEXRAD Level II archive and realtime
+         chunks, Level III products (which used to come over TGFTP and now come
+         from the unidata-nexrad-level3 bucket), HRRR GRIB2, and GOES granules
+         for GLM lightning. All of them are
+         https://BUCKET.s3.amazonaws.com/KEY, so one entry with
+         includeSubdomains covers every bucket. -->
     <domain-config cleartextTrafficPermitted="false">
         <domain includeSubdomains="true">s3.amazonaws.com</domain>
     </domain-config>
 
-    <!-- Basemap and label tiles (walkers -> CartoDB via Fastly). -->
+    <!-- Basemap and label tiles (walkers to CartoDB via Fastly), plus the
+         attribution link the map footer opens. -->
     <domain-config cleartextTrafficPermitted="false">
         <domain includeSubdomains="true">global.ssl.fastly.net</domain>
         <domain includeSubdomains="true">openstreetmap.org</domain>
