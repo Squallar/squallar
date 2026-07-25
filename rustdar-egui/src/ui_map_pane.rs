@@ -592,8 +592,8 @@ fn render_user_location(
     // Hover/tap popup with fix details
     if let Some(fix) = fix {
         let dot_rect = egui::Rect::from_center_size(user_screen, egui::vec2(28.0, 28.0));
-        if let Some(hover_pos) = ui.ctx().pointer_hover_pos() {
-            if dot_rect.contains(hover_pos) {
+        if let Some(hover_pos) = ui.ctx().pointer_hover_pos()
+            && dot_rect.contains(hover_pos) {
                 egui::Tooltip::always_open(
                     ui.ctx().clone(),
                     ui.layer_id(),
@@ -622,7 +622,6 @@ fn render_user_location(
                     },
                 );
             }
-        }
     }
 }
 

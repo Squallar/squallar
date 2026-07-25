@@ -71,7 +71,7 @@ impl super::Gui {
                         egui::ComboBox::from_id_salt("gps_port")
                             .selected_text(current_label)
                             .show_ui(ui, |ui| {
-                                if ui.selectable_value(&mut self.gps_config.port_path, None, "Auto-detect").changed() {}
+                                ui.selectable_value(&mut self.gps_config.port_path, None, "Auto-detect").changed();
                                 for port_info in rustdar_gps::detect_gps_ports() {
                                     let label = format!("{} ({})", port_info.port_name, port_info.description);
                                     let val = Some(port_info.port_name.clone());

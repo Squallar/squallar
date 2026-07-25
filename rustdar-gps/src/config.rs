@@ -50,11 +50,10 @@ impl HeadingSource {
         match self {
             HeadingSource::Auto => {
                 let moving = speed_mps.is_some_and(|s| s > MOVING_SPEED_THRESHOLD_MPS);
-                if moving {
-                    if let Some(bearing) = gps_bearing {
+                if moving
+                    && let Some(bearing) = gps_bearing {
                         return Some(bearing as f32);
                     }
-                }
                 compass_heading
             }
             HeadingSource::CompassOnly => compass_heading,
@@ -66,6 +65,7 @@ impl HeadingSource {
 /// Configuration for GPS serial port connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct GpsConfig {
     /// Serial port path. `None` means auto-detect.
     pub port_path: Option<String>,
@@ -75,15 +75,6 @@ pub struct GpsConfig {
     pub heading_source: HeadingSource,
 }
 
-impl Default for GpsConfig {
-    fn default() -> Self {
-        Self {
-            port_path: None,
-            baud_rate: 0,
-            heading_source: HeadingSource::default(),
-        }
-    }
-}
 
 impl GpsConfig {
     /// Whether baud rate should be auto-detected.

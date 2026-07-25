@@ -45,7 +45,7 @@ pub fn detect_gps_ports() -> Vec<GpsPortInfo> {
         let info = match &port.port_type {
             serialport::SerialPortType::UsbPort(usb) => {
                 let is_gps = GPS_VID_PIDS.iter().any(|(vid, pid)| {
-                    usb.vid == *vid && pid.map_or(true, |p| usb.pid == p)
+                    usb.vid == *vid && pid.is_none_or(|p| usb.pid == p)
                 });
                 let desc = usb
                     .product
@@ -212,12 +212,11 @@ fn gps_read_loop(
                 }
                 Ok(_) => {
                     let trimmed = line.trim();
-                    if let Some(fix) = nmea.feed_sentence(trimmed) {
-                        if fix_sender.send(fix).is_err() {
+                    if let Some(fix) = nmea.feed_sentence(trimmed)
+                        && fix_sender.send(fix).is_err() {
                             log::info!("GPS fix channel closed, stopping reader");
                             return;
                         }
-                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                     // Normal timeout, just continue

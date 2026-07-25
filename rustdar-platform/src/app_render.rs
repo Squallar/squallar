@@ -123,7 +123,7 @@ impl super::App {
                 if other_idx == origin_pane {
                     continue;
                 }
-                let matches_site = self.gui.pane(other_idx).map_or(false, |p| p.site == origin_site);
+                let matches_site = self.gui.pane(other_idx).is_some_and(|p| p.site == origin_site);
                 if !matches_site {
                     continue;
                 }
@@ -405,8 +405,8 @@ impl super::App {
                 // is a Level III product waiting for elevation data — keep the old texture
                 // visible until the new render replaces it.
                 let has_scan = self.gui.pane(pane_idx).is_some_and(|p| p.scan_info.is_some());
-                if !has_scan {
-                    if let Some(pane) = self.gui.pane_mut(pane_idx) {
+                if !has_scan
+                    && let Some(pane) = self.gui.pane_mut(pane_idx) {
                         let cache = pane.overlay_cache_mut(
                             rustdar_overlays::render::overlay_state::OverlayKind::Radar,
                         );
@@ -414,7 +414,6 @@ impl super::App {
                             self.old_textures.push(old.texture);
                         }
                     }
-                }
                 self.render.pane_render[pane_idx].last_rendered = None;
             }
         }

@@ -15,6 +15,12 @@ pub struct LoopDownloadManager {
     in_flight_count: usize,
 }
 
+impl Default for LoopDownloadManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LoopDownloadManager {
     pub fn new() -> Self {
         Self {

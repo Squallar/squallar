@@ -12,7 +12,7 @@ nexrad-data = { workspace = true }
 nexrad-model = { workspace = true }
 nexrad-decode = { workspace = true }
 nexrad-level3 = { workspace = true }
-rayon = "=1.11.0"
+rayon = "=1.12.0"
 reqwest = { workspace = true, features = ["rustls-tls"] }
 thiserror = { workspace = true }
 
