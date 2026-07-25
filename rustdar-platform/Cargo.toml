@@ -16,32 +16,32 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 path = "src/lib.rs"
 
 [dependencies]
-rustdar-egui = { path = "../rustdar-egui" }
-rustdar-radar = { path = "../rustdar-radar" }
-rustdar-overlays = { path = "../rustdar-overlays" }
-reqwest = { version = "=0.12.24", features = ["json"] }
-rustdar-gps = { path = "../rustdar-gps" }
+rustdar-egui = { workspace = true }
+rustdar-radar = { workspace = true }
+rustdar-overlays = { workspace = true }
+reqwest = { workspace = true, features = ["default", "json"] }
+rustdar-gps = { workspace = true, features = ["serial"] }
 bytemuck = { version = "=1.25.0", features = ["derive"] }
-chrono = "=0.4.44"
-egui = "=0.34.1"
-egui-wgpu = { version = "=0.34.1", features = ["winit"] }
-log = "=0.4.29"
-nexrad-data = { version = "=1.0.0-rc.7", features = ["aws"] }
-nexrad-model = "=1.0.0-rc.2"
-nexrad-decode = "=1.0.0-rc.3"
-nexrad-level3 = { path = "../nexrad-level3" }
-pollster = "=0.4.0"
-tokio = { version = "=1.51.1", features = ["rt", "rt-multi-thread"] }
-winit = "=0.30.13"
-egui-winit = { version = "=0.34.1", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
+chrono = { workspace = true }
+egui = { workspace = true }
+egui-wgpu = { workspace = true, features = ["winit"] }
+log = { workspace = true }
+nexrad-data = { workspace = true }
+nexrad-model = { workspace = true }
+nexrad-decode = { workspace = true }
+nexrad-level3 = { workspace = true }
+pollster = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+winit = { workspace = true }
+egui-winit = { workspace = true, features = ["clipboard", "links", "wayland", "x11"] }
 env_logger = "=0.11.10"
-wgpu = "=29.0.1"
+wgpu = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Force vendored OpenSSL for Android builds to avoid cross-compilation issues
-openssl-sys = { version = "=0.9.113", features = ["vendored"] }
+openssl-sys = { workspace = true }
 # Android theme detection
-rustdar-android-theme = { path = "../rustdar-android-theme" }
+rustdar-android-theme = { workspace = true }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 # Cross-platform theme detection for desktop platforms

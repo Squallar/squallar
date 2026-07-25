@@ -4,5 +4,5 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-chrono = "=0.4.44"
-serde = { version = "=1.0.228", features = ["derive"] }
+chrono = { workspace = true }
+serde = { workspace = true }

@@ -16,6 +16,58 @@ members = [
 version = "0.1.0"
 edition = "2024"
 
+# Single source of truth for every version pin shared by more than one member,
+# plus the whole UI stack. egui, egui-wgpu, egui-winit, walkers and wgpu MUST be
+# bumped together: walkers pins an exact egui minor, and egui-wgpu/egui-winit
+# only ever match their own egui. Keeping them here makes that lockstep visible
+# and stops a member from drifting onto a second copy of egui.
+[workspace.dependencies]
+# -- internal crates --
+nexrad-level3 = { path = "nexrad-level3" }
+rustdar-android-theme = { path = "rustdar-android-theme" }
+rustdar-egui = { path = "rustdar-egui" }
+rustdar-overlays = { path = "rustdar-overlays" }
+rustdar-platform = { path = "rustdar-platform" }
+rustdar-radar = { path = "rustdar-radar" }
+rustdar-units = { path = "rustdar-units" }
+# Defaults off here because Cargo silently ignores a member's
+# `default-features = false` when the workspace entry leaves defaults on, and
+# rustdar-egui declares exactly that. rustdar-platform and rustdar-android opt
+# the serial reader back in with `features = ["serial"]` — including on Android,
+# where serialport does build and is in the shipped aarch64 graph.
+rustdar-gps = { path = "rustdar-gps", default-features = false }
+
+# -- UI stack (bump as a unit) --
+egui = "=0.34.1"
+egui-wgpu = "=0.34.1"
+# Defaults off: rustdar-platform picks its own backend/clipboard feature set.
+egui-winit = { version = "=0.34.1", default-features = false }
+walkers = "=0.53.0"
+wgpu = "=29.0.1"
+winit = "=0.30.13"
+
+# -- NEXRAD decoding --
+nexrad-data = { version = "=1.0.0-rc.7", features = ["aws"] }
+nexrad-decode = "=1.0.0-rc.3"
+nexrad-model = "=1.0.0-rc.2"
+
+# -- shared third-party --
+chrono = "=0.4.44"
+flate2 = "=1.1.9"
+jni = "=0.21.1"
+log = "=0.4.29"
+ndk-context = "=0.1.1"
+pollster = "=0.4.0"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.149"
+thiserror = "=2.0.18"
+tokio = "=1.51.1"
+# Members differ on the TLS backend, so defaults are off here and every member
+# spells out what it wants (`default` == reqwest's own default feature set).
+reqwest = { version = "=0.12.24", default-features = false }
+# Android needs a vendored OpenSSL; the NDK sysroot has no usable system copy.
+openssl-sys = { version = "=0.9.113", features = ["vendored"] }
+
 [profile.dev]
 # Only optimize dependencies (not workspace code) to preserve debuggability
 strip = true

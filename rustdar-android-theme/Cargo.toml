@@ -4,5 +4,5 @@ version.workspace = true
 edition.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
-jni = "=0.21.1"
-ndk-context = "=0.1.1"
+jni = { workspace = true }
+ndk-context = { workspace = true }

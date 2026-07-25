@@ -4,29 +4,29 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-chrono = "=0.4.44"
+chrono = { workspace = true }
 earcutr = "=0.5.0"
-flate2 = "=1.1.9"
+flate2 = { workspace = true }
 grib = { version = "=0.15.1", default-features = true }
-rustdar-units = { path = "../rustdar-units" }
+rustdar-units = { workspace = true }
 futures = "=0.3.32"
-log = "=0.4.29"
+log = { workspace = true }
 netcdf = { version = "=0.12.0", features = ["static"] }
-reqwest = { version = "=0.12.24", features = ["json"] }
+reqwest = { workspace = true, features = ["default", "json"] }
 roxmltree = "=0.21.1"
-serde = { version = "=1.0.228", features = ["derive"] }
-serde_json = "=1.0.149"
+serde = { workspace = true }
+serde_json = { workspace = true }
 tiny-skia = "=0.12.0"
-tokio = { version = "=1.51.1", features = ["fs"] }
+tokio = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 # Test-only: drives the `#[ignore]`d live-NOMADS checks. Not linked into any
 # shipped binary.
-tokio = { version = "=1.51.1", features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Force vendored OpenSSL for Android builds to avoid cross-compilation issues
-openssl-sys = { version = "=0.9.113", features = ["vendored"] }
+openssl-sys = { workspace = true }
 # proj-sys (via grib → proj) needs SQLite3 at build time, but the NDK sysroot
 # doesn't include SQLite3 development headers. Bundle it from source.
 libsqlite3-sys = { version = "=0.35.0", features = ["bundled"] }
