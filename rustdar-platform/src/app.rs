@@ -264,7 +264,7 @@ impl App {
                         };
                         if scan_resp.is_auto_poll && !any_pane_live_for_site {
                             log::info!("Auto-poll: caching scan (historic mode) @ {}", timestamp);
-                            self.append_scan_to_active_loops(timestamp, Arc::clone(&scan_arc));
+                            self.append_scan_to_active_loops(&site, timestamp, Arc::clone(&scan_arc));
                             self.latest_cached_scans.insert(site, (scan_arc, scan_info, timestamp));
                         } else {
                             log::info!("Received scan data from background thread");
@@ -274,8 +274,8 @@ impl App {
                             self.render.reset_panes_for_site(&site, &self.gui);
                             self.spawn_level3_fetches(&site);
 
-                            // Append the new scan to any active loops
-                            self.append_scan_to_active_loops(timestamp, Arc::clone(&scan_arc));
+                            // Append the new scan to any active loops on this site
+                            self.append_scan_to_active_loops(&site, timestamp, Arc::clone(&scan_arc));
 
                             // If this was a manual navigation, reinitialize active loops
                             if self.manual_nav_pending {

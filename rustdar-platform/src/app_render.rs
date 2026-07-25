@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use rustdar_egui::actions::GuiAction;
-use rustdar_egui::pane::{ELEVATION_TOLERANCE, RenderTarget};
+use rustdar_egui::pane::{BroadcastSweep, ELEVATION_TOLERANCE, RenderTarget};
 use rustdar_radar::types::IMAGE_SIZE;
 use crate::constants::{MAX_CONCURRENT_RENDERS, MAX_LOOP_RENDER_BUDGET, MAX_CONCURRENT_LOOP_DOWNLOADS, MAX_LOOP_FRAMES};
 use crate::render_dispatch::CachedPaneRender;
@@ -628,12 +628,15 @@ impl super::App {
     fn poll_loop_scan_download_results(&mut self) {
         let mut completed_count = 0usize;
         while let Ok(resp) = self.channels.loop_scan_download_receiver.try_recv() {
-            self.loop_mgr.complete_download(&resp.timestamp);
+            // Keyed by the site the download was spawned for, which the response
+            // carries — not by the requesting pane's current loop, which may have
+            // been rebuilt for another site meanwhile.
+            self.loop_mgr.complete_download(&resp.site, &resp.timestamp);
             completed_count += 1;
 
             // Cache the downloaded scan globally (skip failures)
             if let Some(scan) = resp.scan {
-                self.loop_mgr.cache_scan(resp.timestamp, scan);
+                self.loop_mgr.cache_scan(&resp.site, resp.timestamp, scan);
             }
         }
         if completed_count > 0 {
@@ -653,6 +656,19 @@ impl super::App {
             return;
         }
 
+        // Every cache and in-flight question below is asked about this pane's loop
+        // site — the site its frames will be looked up under at render time. Asking
+        // without it makes another site's scan look like this loop's, and the frame
+        // is dropped from the queue having never been downloaded.
+        let Some(site) = self
+            .gui
+            .pane(pane_idx)
+            .map(|p| p.loop_state.site.clone())
+            .filter(|s| !s.is_empty())
+        else {
+            return;
+        };
+
         // We need to look up cached/in_flight state while modifying pending queue.
         // pending_downloads is part of loop_mgr, so we can't iterate via loop_mgr.pending_mut
         // while also calling loop_mgr.is_cached(). We extract the queue completely, Process it, and put it back.
@@ -662,26 +678,26 @@ impl super::App {
             return;
         };
 
-        // Filter out timestamps already cached or in flight
+        // Filter out timestamps already cached or in flight for this site
         let mut batch = Vec::new();
         while !pending.is_empty() && batch.len() < slots {
             let (ts, _) = pending.front().unwrap();
-            if self.loop_mgr.is_cached(ts) || self.loop_mgr.is_in_flight(ts) {
-                // Already have or fetching this timestamp — remove from pending
+            if self.loop_mgr.is_cached(&site, ts) || self.loop_mgr.is_in_flight(&site, ts) {
+                // Already have or fetching this scan — remove from pending
                 pending.pop_front();
             } else {
                 batch.push(pending.pop_front().unwrap());
             }
         }
-        
+
         // Put the queue back
         self.loop_mgr.insert_pending(pane_idx, pending);
-        
+
         let spawned = batch.len();
 
         for (ts, id) in batch {
-            self.loop_mgr.mark_in_flight(ts);
-            self.spawn_loop_scan_download(pane_idx, ts, id);
+            self.loop_mgr.mark_in_flight(&site, ts);
+            self.spawn_loop_scan_download(pane_idx, site.clone(), ts, id);
         }
 
         if spawned > 0 {
@@ -752,17 +768,36 @@ impl super::App {
                     if sibling_idx == origin_pane {
                         continue;
                     }
+                    // What this sibling's *own* scan for the frame would have snapped
+                    // the selection to. Looked up under the sibling's own loop site,
+                    // so it is an independent answer rather than a restatement of the
+                    // origin's — a sibling on another site is refused on the sweep as
+                    // well as on the target.
+                    let own_snapped = self
+                        .gui
+                        .pane(sibling_idx)
+                        .map(|p| p.loop_state.site.clone())
+                        .and_then(|site| {
+                            let scan = self.loop_mgr.get_cached(&site, &rr.timestamp)?;
+                            rustdar_radar::render::find_closest_elevation(
+                                scan,
+                                rr.target.product,
+                                rr.target.elevation,
+                            )
+                        });
+                    let sweep = BroadcastSweep { rendered: rr.snapped, own: own_snapped };
+
                     let Some(sibling) = self.gui.pane_mut(sibling_idx) else { continue };
                     // Hand the image only to panes whose frames are keyed to exactly
-                    // what it depicts, site included. Matching against the response
-                    // rather than the origin pane's live selection keeps a retarget on
-                    // either side from planting an image the receiving pane will never
-                    // correct. The decision — and the frame it resolves to — lives in
-                    // `LoopPlaybackState` so it stays in step with the donor test the
-                    // dispatcher applies before suppressing a pane's own render.
+                    // what it depicts, site and sweep included. Matching against the
+                    // response rather than the origin pane's live selection keeps a
+                    // retarget on either side from planting an image the receiving pane
+                    // will never correct. The decision — and the frame it resolves to —
+                    // lives in `LoopPlaybackState` so it stays in step with the donor
+                    // test the dispatcher applies before suppressing a pane's own render.
                     let Some(sframe) = sibling
                         .loop_state
-                        .frame_accepting_broadcast_mut(rr.timestamp, &rr.target)
+                        .frame_accepting_broadcast_mut(rr.timestamp, &rr.target, sweep)
                     else {
                         continue;
                     };
@@ -809,8 +844,11 @@ impl super::App {
             // in flight this instant". The render budget is shared with static pane
             // renders, so part of the batch can be starved and not yet spawned; that
             // must keep the loop out of Ready instead of animating blank frames.
+            // Asked about this loop's own site: another site's scan at the same
+            // timestamp is not this frame's data and must not count as downloaded.
+            let site = pls.site.as_str();
             let batch_settled = pls.render_set_settled(MAX_LOOP_RENDER_BUDGET, |f| {
-                loop_mgr.is_cached(&f.timestamp)
+                loop_mgr.is_cached(site, &f.timestamp)
             });
             if any_rendered && batch_settled && pane_downloads_done {
                 pls.phase = rustdar_egui::pane::LoopPhase::Ready;
@@ -999,7 +1037,10 @@ impl super::App {
                     }
                 }
 
-                if let Some(scan) = self.loop_mgr.get_cached(&frame.timestamp) {
+                // The loop's own site is half the key: `target.site` is where the
+                // geometry came from, so the scan rendered with it has to be that
+                // site's scan and not whatever else shares the timestamp.
+                if let Some(scan) = self.loop_mgr.get_cached(&target.site, &frame.timestamp) {
                     // Snap elevation to closest available in this particular scan
                     let Some(snapped) = rustdar_radar::render::find_closest_elevation(scan, product, elevation) else {
                         // This scan has no sweep carrying the selected product at all.
@@ -1059,7 +1100,12 @@ impl super::App {
                 break;
             }
 
-            let scan_arc = Arc::clone(self.loop_mgr.get_cached(&req.timestamp).unwrap());
+            // Same `(site, timestamp)` the plan resolved above, from the same target.
+            let scan_arc = Arc::clone(
+                self.loop_mgr
+                    .get_cached(&req.target.site, &req.timestamp)
+                    .expect("planned frames were resolved from this cache entry"),
+            );
 
             // Only mark the frame in flight if a thread was actually spawned. If the
             // spawn is refused (budget taken between the check above and the one inside),
@@ -1159,16 +1205,13 @@ fn find_donor<'a>(
 /// included. A site-blind check suppresses the render of a pane the broadcast will
 /// then refuse, and the frame is served by neither path.
 ///
-/// `snapped` is compared as well, which is strictly stronger than what
-/// `frame_accepting_broadcast` tests — it does not look at the sweep at all. That
-/// asymmetry is safe only in this direction: suppression implies acceptance, never the
-/// reverse. Two loops on the same target cannot currently resolve the selection to
-/// different sweeps, because the scan cache is keyed on timestamp alone and hands both
-/// of them the same `Arc<Scan>`. If that key ever gains a site — the fix this file's
-/// `RenderTarget` docs point at — the hole is the *broadcast*, not this: it would hand
-/// over a differently-snapped image, drop the receiver's own in-flight render as
-/// redundant, and leave the wrong sweep in place permanently. Whoever re-keys the
-/// cache has to give `frame_accepting_broadcast` a sweep comparison in the same change.
+/// `snapped` is compared as well, and `frame_accepting_broadcast` compares it too — via
+/// [`rustdar_egui::pane::BroadcastSweep`] — so both halves of the promise weigh the same
+/// thing. They must stay that way. The sweep is not implied by the target: the target
+/// carries the *selected* elevation, and each scan snaps that to whatever sweep it
+/// carries. If acceptance stopped checking it, a suppressed pane could be handed a
+/// differently-snapped image, have its own in-flight render dropped as redundant, and
+/// keep the wrong sweep permanently.
 fn render_already_queued(
     queued: &[LoopRenderRequest],
     timestamp: chrono::NaiveDateTime,
@@ -1271,6 +1314,40 @@ mod loop_dispatch_tests {
         // so the images differ.
         assert!(!render_already_queued(&q, ts(0), &target("KTLX", 0.5), 1.5));
         assert!(!render_already_queued(&[], ts(0), &target("KTLX", 0.5), 0.48));
+    }
+
+    /// The coupling this file's `render_already_queued` docs describe, tested where
+    /// both halves are in scope. Suppressing a pane's render is a promise that the
+    /// queued render's result will be handed to it, so the two must agree for every
+    /// sweep — including when the receiver's own scan snaps the selection somewhere
+    /// else. A sweep-blind acceptance breaks it in the dangerous direction: not
+    /// suppressed (so the pane renders its own) yet accepted (so that render is
+    /// dropped as redundant and an image of the wrong tilt stays put).
+    #[test]
+    fn suppression_and_acceptance_weigh_the_same_sweep() {
+        let ctx = egui::Context::default();
+        let receiver = loop_on(&ctx, "KTLX", &[]);
+        let want = receiver.rendered_for.clone().expect("target adopted");
+        // A sibling's render of the 0.48° sweep, queued this pass.
+        let q = vec![queued(target("KTLX", 0.5), ts(0), 0.48)];
+
+        for own in [0.48, 0.485, 1.4] {
+            let suppressed = render_already_queued(&q, ts(0), &want, own);
+            let accepted = receiver
+                .frame_accepting_broadcast(
+                    ts(0),
+                    &want,
+                    BroadcastSweep { rendered: 0.48, own: Some(own) },
+                )
+                .is_some();
+            assert_eq!(
+                suppressed, accepted,
+                "own sweep {own}: suppressed={suppressed} but accepted={accepted}"
+            );
+        }
+
+        // Not the trivial agreement of "both always refuse".
+        assert!(render_already_queued(&q, ts(0), &want, 0.48));
     }
 
     #[test]

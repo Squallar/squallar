@@ -1032,6 +1032,30 @@ impl Gui {
         &mut self.panes[self.active_pane]
     }
 
+    /// Every pane the layout is currently showing, in pane-index order.
+    ///
+    /// Splitting to fewer panes leaves the extra `PaneState`s in the vector so a
+    /// re-split remembers them, and they are neither drawn nor updated — so the
+    /// slice stops at `pane_count`, and code that acts on "all panes" must go
+    /// through here rather than iterating `panes` directly.
+    pub fn panes(&self) -> &[PaneState] {
+        &self.panes[..self.visible_pane_count()]
+    }
+
+    /// [`Self::panes`] for the paths that update pane state (loop frames, scan
+    /// info), with the same bound.
+    pub fn panes_mut(&mut self) -> &mut [PaneState] {
+        let count = self.visible_pane_count();
+        &mut self.panes[..count]
+    }
+
+    /// `pane_count` clamped to what the vector actually holds. The two are kept in
+    /// step by every path that changes the layout, but slicing past the end would
+    /// panic, and no pane update is worth a crash.
+    fn visible_pane_count(&self) -> usize {
+        self.pane_layout.pane_count.min(self.panes.len())
+    }
+
     /// Get a specific pane by index (immutable), or `None` if out of bounds.
     pub fn pane(&self, idx: usize) -> Option<&PaneState> {
         self.panes.get(idx)
@@ -1248,5 +1272,53 @@ impl Gui {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pane_slice_tests {
+    use super::*;
+
+    /// Splitting to fewer panes leaves the extra `PaneState`s in the vector so a
+    /// re-split can restore them. They are not drawn and not updated, so the
+    /// "every pane" slice must stop at the layout's count — otherwise a polled
+    /// scan appends loop frames to panes nobody is looking at.
+    #[test]
+    fn the_pane_slices_stop_at_the_visible_count() {
+        let mut gui = Gui::new();
+        gui.set_pane_count_for_test(4);
+        for (idx, pane) in gui.panes_mut().iter_mut().enumerate() {
+            pane.site = format!("PANE{idx}");
+        }
+
+        // Split back down: panes 2 and 3 are remembered but no longer shown.
+        gui.set_pane_count_for_test(2);
+
+        assert_eq!(gui.panes().len(), 2);
+        assert_eq!(gui.panes_mut().len(), 2);
+        assert_eq!(
+            gui.panes().iter().map(|p| p.site.as_str()).collect::<Vec<_>>(),
+            ["PANE0", "PANE1"],
+        );
+        assert_eq!(
+            gui.pane(3).map(|p| p.site.as_str()),
+            Some("PANE3"),
+            "precondition: the hidden pane is still there to be reached by index"
+        );
+    }
+
+    /// The count and the vector are kept in step by every path that changes the
+    /// layout, but slicing past the end would panic, and no pane update is worth
+    /// a crash.
+    #[test]
+    fn the_pane_slices_never_outrun_the_vector() {
+        let mut gui = Gui::new();
+        assert_eq!(gui.panes().len(), 1, "a fresh Gui has one pane");
+        // A layout claiming more panes than the vector holds, as a config whose
+        // pane_count ran ahead of its pane list would leave it.
+        gui.pane_layout = PaneLayout::for_count(4);
+
+        assert_eq!(gui.panes().len(), 1);
+        assert_eq!(gui.panes_mut().len(), 1);
     }
 }

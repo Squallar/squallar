@@ -52,14 +52,15 @@ pub const ELEVATION_TOLERANCE: f32 = 0.01;
 /// stamped onto every dispatched render, and compared on arrival so a result
 /// produced for one target is never painted onto frames keyed to another.
 ///
-/// It is deliberately *not* a claim that `(timestamp, target)` identifies an image.
-/// The scan a frame renders comes from `LoopDownloadManager`'s cache, which is keyed
-/// on timestamp alone with no site in it, and `append_scan_to_active_loops` appends a
-/// polled scan to every active loop without checking whose site it came from — so a
-/// loop can be handed a scan from another site and will render it with its own
-/// coordinates and stamp its own target on the result. This key cannot detect that;
-/// it derives from the loop, not from the scan. Fixing it means keying the scan cache
-/// on `(site, timestamp)`, which is tracked separately.
+/// It identifies an image only together with the scan, and it cannot check the scan
+/// itself: the key derives from the loop, not from what the loop was handed. That the
+/// scan is the right one is enforced upstream instead — `LoopDownloadManager` keys its
+/// cache on `(site, timestamp)`, and a polled scan is appended only to loops on its own
+/// site — so a frame's scan and its target now name the same radar by construction.
+/// What the target still does not pin is the *sweep*: `elevation` is the selection, and
+/// each scan snaps it to whatever sweep it carries. Anything handing one loop's finished
+/// image to another has to compare that separately; see
+/// [`LoopPlaybackState::frame_accepting_broadcast`].
 ///
 /// `site` is the site the loop's *geometry* was captured for — the same lookup that
 /// produced `LoopPlaybackState::site_lat`/`site_lon`, which is what
@@ -100,6 +101,37 @@ impl RenderTarget {
     /// Whether two targets name the same image.
     pub fn matches(&self, other: &RenderTarget) -> bool {
         self.matches_parts(&other.site, other.product, other.elevation)
+    }
+}
+
+/// The two sweep angles a sibling broadcast has to reconcile.
+///
+/// A [`RenderTarget`] carries the *selected* elevation; the renderer is given that
+/// selection snapped to a sweep the frame's own scan actually carries, and two scans
+/// can snap one selection to different sweeps. So an image arriving from another pane
+/// is described by a sweep the receiver has to compare against its own, which is a
+/// different question from "do we want the same product and elevation".
+///
+/// The two are a struct rather than a pair of `f32` parameters so they cannot be
+/// passed in the wrong order — they are the same type, adjacent, and both plausible.
+#[derive(Clone, Copy, Debug)]
+pub struct BroadcastSweep {
+    /// The sweep angle the incoming image depicts.
+    pub rendered: f32,
+    /// The sweep the receiving loop's *own* scan for this frame resolves the same
+    /// selection to, or `None` if it has no scan for the frame yet (or that scan
+    /// carries no sweep for the product). `None` refuses the image: an unverifiable
+    /// hand-off is not better than the local render that will follow once the scan
+    /// is there.
+    pub own: Option<f32>,
+}
+
+impl BroadcastSweep {
+    /// Whether the incoming image depicts the sweep this loop would have rendered.
+    /// Compared within [`ELEVATION_TOLERANCE`], as every other angle comparison is.
+    pub fn agrees(&self) -> bool {
+        self.own
+            .is_some_and(|own| (own - self.rendered).abs() <= ELEVATION_TOLERANCE)
     }
 }
 
@@ -159,8 +191,9 @@ pub struct LoopPlaybackState {
     /// under a live loop — it exists so that results and sibling textures carrying
     /// another site's geometry are rejected by construction rather than by luck.
     ///
-    /// It does *not* make a frame's image fully determined: the scan is still looked
-    /// up by timestamp alone, with no site in the key. See [`RenderTarget`].
+    /// It does not make a frame's image fully determined on its own — the scan
+    /// supplies the rest, and the sweep it snaps the selection to is not in here.
+    /// See [`RenderTarget`].
     pub rendered_for: Option<RenderTarget>,
 }
 
@@ -296,10 +329,10 @@ impl LoopPlaybackState {
     ///   still matches the current target is safe to apply: the target fixes every
     ///   render input except the scan, and the scan for a given `(site, timestamp)`
     ///   does not change under a live loop, so the pending render would produce the
-    ///   same image. That qualifier is load-bearing rather than pedantic — the cache is
-    ///   keyed on timestamp alone and `cache_scan` inserts unconditionally, so a second
-    ///   site's scan at a colliding timestamp overwrites the first. See
-    ///   [`RenderTarget`] for why this key cannot see that.
+    ///   same image. The `(site, timestamp)` qualifier is load-bearing rather than
+    ///   pedantic: that is the cache's key, and it is what makes "the scan does not
+    ///   change" true. Under a timestamp-only key another site's scan could replace
+    ///   this one at any moment and the sentence above would be false.
     /// - The frame is not expecting a result at all: the frame list was rebuilt, the
     ///   graphics state was cleared, or a sibling pane already supplied the texture.
     ///
@@ -349,14 +382,24 @@ impl LoopPlaybackState {
     /// while their loops still carry different geometry. Handing an image across that
     /// gap positions it at coordinates it was not projected for.
     ///
+    /// `sweep` closes the one input the target does not name. `target.elevation` is the
+    /// user's selection; what got rendered is that selection snapped to a sweep the
+    /// *donor's* scan carries, and the receiver's own scan for this frame may snap it
+    /// somewhere else. Accepting then is doubly wrong: the frame takes an image of the
+    /// wrong tilt, *and* the receiver's own in-flight render is dropped as redundant by
+    /// the caller — so nothing ever corrects it. The dispatcher's suppression test
+    /// (`render_already_queued`) already compares the snapped sweep, and suppression is
+    /// a promise of acceptance, so the two have to weigh the same thing.
+    ///
     /// Only untextured frames qualify — a frame that already has an image is not
     /// improved by an identical one, and overwriting it would churn texture handles.
     pub fn frame_accepting_broadcast(
         &self,
         timestamp: NaiveDateTime,
         target: &RenderTarget,
+        sweep: BroadcastSweep,
     ) -> Option<usize> {
-        if !self.is_active() || !self.is_rendered_for(target) {
+        if !self.is_active() || !self.is_rendered_for(target) || !sweep.agrees() {
             return None;
         }
         self.frames
@@ -370,8 +413,9 @@ impl LoopPlaybackState {
         &mut self,
         timestamp: NaiveDateTime,
         target: &RenderTarget,
+        sweep: BroadcastSweep,
     ) -> Option<&mut LoopFrame> {
-        let idx = self.frame_accepting_broadcast(timestamp, target)?;
+        let idx = self.frame_accepting_broadcast(timestamp, target, sweep)?;
         Some(&mut self.frames[idx])
     }
 
@@ -383,6 +427,15 @@ impl LoopPlaybackState {
     /// it must apply the same test, including the site. If the two disagree the
     /// dispatcher suppresses a pane's own render on the promise of a broadcast the
     /// response path then refuses, and the frame is served by neither.
+    ///
+    /// It takes no sweep argument, unlike acceptance, and that asymmetry is confined to
+    /// this direction: a donation is copied on the spot, so there is no promise for a
+    /// later test to break. The promise pair is the *other* one — `render_already_queued`
+    /// suppressing a render because a sibling's is queued, then that sibling's result
+    /// being offered to this loop — and both halves of it compare the sweep. Two loops
+    /// that pass this test are on one site and so share one `(site, timestamp)` cache
+    /// entry, which is what makes their scans, and therefore their snapped sweeps, the
+    /// same to begin with.
     pub fn frame_donatable_to(
         &self,
         timestamp: NaiveDateTime,
@@ -1001,6 +1054,14 @@ mod tests {
         RenderTarget::new(site, product, elevation)
     }
 
+    /// The sweep pair a broadcast normally arrives with: the receiver's own scan
+    /// snapped the selection to the same angle the image was rendered at. Every test
+    /// that is not *about* the sweep needs this, since a disagreeing pair refuses the
+    /// frame before anything else is looked at.
+    fn same_sweep() -> BroadcastSweep {
+        BroadcastSweep { rendered: 0.48, own: Some(0.48) }
+    }
+
     #[test]
     fn render_set_walks_outward_from_playhead() {
         let state = loop_with_frames(8, 0);
@@ -1302,7 +1363,11 @@ mod tests {
                 .frame_donatable_to(frame_ts, receiver.rendered_for.as_ref().unwrap())
                 .is_some();
             let accepted = receiver
-                .frame_accepting_broadcast(frame_ts, donor.rendered_for.as_ref().unwrap())
+                .frame_accepting_broadcast(
+                    frame_ts,
+                    donor.rendered_for.as_ref().unwrap(),
+                    same_sweep(),
+                )
                 .is_some();
             assert_eq!(
                 offered, accepted,
@@ -1314,7 +1379,11 @@ mod tests {
         // trivial "both always refuse".
         assert!(
             same_site
-                .frame_accepting_broadcast(frame_ts, donor.rendered_for.as_ref().unwrap())
+                .frame_accepting_broadcast(
+                    frame_ts,
+                    donor.rendered_for.as_ref().unwrap(),
+                    same_sweep(),
+                )
                 .is_some()
         );
     }
@@ -1360,9 +1429,102 @@ mod tests {
         let current = target(SITE, RadarProduct::Reflectivity, 0.5);
         let frame_ts = state.frames[0].timestamp;
 
-        assert_eq!(state.frame_accepting_broadcast(frame_ts, &current), Some(0));
+        assert_eq!(state.frame_accepting_broadcast(frame_ts, &current, same_sweep()), Some(0));
         state.frames[0].texture = Some(dummy_texture(&ctx));
-        assert_eq!(state.frame_accepting_broadcast(frame_ts, &current), None);
+        assert_eq!(state.frame_accepting_broadcast(frame_ts, &current, same_sweep()), None);
+    }
+
+    /// The coupled defect. The dispatcher suppresses a duplicate render only when the
+    /// *snapped* sweeps match (`render_already_queued`), so acceptance has to weigh the
+    /// same thing — otherwise a pane that was not suppressed, and has its own render
+    /// running, is handed an image of a different tilt and has that render dropped as
+    /// redundant. Nothing re-renders the frame afterwards: it is textured, so the
+    /// dispatcher skips it and readiness counts it settled. The wrong sweep is final.
+    #[test]
+    fn a_broadcast_of_a_different_sweep_is_refused() {
+        let mut state = loop_with_frames(3, 0);
+        state.retarget_renders(RadarProduct::Reflectivity, 0.5);
+        let current = target(SITE, RadarProduct::Reflectivity, 0.5);
+        let frame_ts = state.frames[0].timestamp;
+
+        // Same site, same product, same *selection* — the target matches exactly.
+        assert!(state.is_rendered_for(&current), "precondition: a target-only test accepts");
+
+        assert_eq!(
+            state.frame_accepting_broadcast(
+                frame_ts,
+                &current,
+                BroadcastSweep { rendered: 1.4, own: Some(0.48) },
+            ),
+            None,
+            "an image of the 1.4° sweep must not fill a frame whose scan snaps to 0.48°"
+        );
+        assert_eq!(
+            state.frame_accepting_broadcast(
+                frame_ts,
+                &current,
+                BroadcastSweep { rendered: 0.48, own: Some(0.48) },
+            ),
+            Some(0),
+            "the same sweep is still handed over — the point of the broadcast"
+        );
+        // Sweep angles round-trip through the scan's own radials, so they are compared
+        // with the same tolerance as every other angle here.
+        assert_eq!(
+            state.frame_accepting_broadcast(
+                frame_ts,
+                &current,
+                BroadcastSweep { rendered: 0.48, own: Some(0.485) },
+            ),
+            Some(0),
+            "jitter below the tolerance is the same sweep"
+        );
+    }
+
+    /// A receiver that cannot say what its own scan snaps to cannot check the image.
+    /// Refusing costs one local render once the scan lands; accepting would paint an
+    /// unverified tilt that nothing revisits.
+    #[test]
+    fn a_broadcast_is_refused_when_the_receiver_has_no_sweep_of_its_own() {
+        let mut state = loop_with_frames(3, 0);
+        state.retarget_renders(RadarProduct::Reflectivity, 0.5);
+        let current = target(SITE, RadarProduct::Reflectivity, 0.5);
+        let frame_ts = state.frames[0].timestamp;
+
+        assert_eq!(
+            state.frame_accepting_broadcast(
+                frame_ts,
+                &current,
+                BroadcastSweep { rendered: 0.48, own: None },
+            ),
+            None
+        );
+    }
+
+    /// The `&mut` form gates on the sweep too — it is the one the response path calls,
+    /// and it is the path that drops the receiver's in-flight render.
+    #[test]
+    fn the_mutable_broadcast_accessor_applies_the_sweep_test() {
+        let mut state = loop_with_frames(3, 0);
+        state.retarget_renders(RadarProduct::Reflectivity, 0.5);
+        let current = target(SITE, RadarProduct::Reflectivity, 0.5);
+        let frame_ts = state.frames[0].timestamp;
+
+        assert!(
+            state
+                .frame_accepting_broadcast_mut(
+                    frame_ts,
+                    &current,
+                    BroadcastSweep { rendered: 1.4, own: Some(0.48) },
+                )
+                .is_none(),
+            "no frame is handed back for an image of the wrong sweep"
+        );
+        assert!(
+            state
+                .frame_accepting_broadcast_mut(frame_ts, &current, same_sweep())
+                .is_some()
+        );
     }
 
     /// Single-frame mode keeps a `LoopPlaybackState` around with stale placeholder
@@ -1385,7 +1547,7 @@ mod tests {
         state.phase = LoopPhase::Inactive;
 
         assert_eq!(state.frame_awaiting_render_result(frame_ts, &current), None);
-        assert_eq!(state.frame_accepting_broadcast(frame_ts, &current), None);
+        assert_eq!(state.frame_accepting_broadcast(frame_ts, &current, same_sweep()), None);
         assert_eq!(state.frame_donatable_to(textured_ts, &current), None);
     }
 
@@ -1434,15 +1596,15 @@ mod tests {
             Some(0),
             "precondition: a timestamp-only lookup lands on the textured frame"
         );
-        assert_eq!(state.frame_accepting_broadcast(shared, &current), Some(2));
+        assert_eq!(state.frame_accepting_broadcast(shared, &current, same_sweep()), Some(2));
 
         let frame = state
-            .frame_accepting_broadcast_mut(shared, &current)
+            .frame_accepting_broadcast_mut(shared, &current, same_sweep())
             .expect("frame handed back");
         frame.texture = Some(dummy_texture(&ctx));
         assert!(state.frames[2].texture.is_some(), "frame 2 received the texture");
         assert_eq!(
-            state.frame_accepting_broadcast(shared, &current),
+            state.frame_accepting_broadcast(shared, &current, same_sweep()),
             None,
             "and nothing at this timestamp wants another"
         );

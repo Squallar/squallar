@@ -604,9 +604,15 @@ impl super::App {
     }
 
     /// Spawn a download task for a single loop frame scan.
+    ///
+    /// `site` is the site the requesting pane's loop is on, and is echoed on the
+    /// response: it is half the key the scan is cached and looked up under, so it
+    /// has to travel with the scan rather than being re-read from the pane, whose
+    /// loop may be rebuilt for another site before this lands.
     pub(super) fn spawn_loop_scan_download(
         &self,
         pane_idx: usize,
+        site: String,
         timestamp: NaiveDateTime,
         identifier: nexrad_data::aws::archive::Identifier,
     ) {
@@ -614,12 +620,16 @@ impl super::App {
             let scan = match scan::download_scan(identifier).await {
                 Ok(scan_data) => Some(std::sync::Arc::new(scan_data)),
                 Err(e) => {
-                    log::error!("Loop scan download failed for pane {} @ {}: {:?}", pane_idx, timestamp, e);
+                    log::error!(
+                        "Loop scan download failed for pane {} ({} @ {}): {:?}",
+                        pane_idx, site, timestamp, e
+                    );
                     None
                 }
             };
             crate::channels::LoopScanDownloadResponse {
                 pane_idx,
+                site,
                 timestamp,
                 scan,
             }
@@ -655,7 +665,12 @@ impl super::App {
         let guard = RenderGuard(std::sync::Arc::clone(&self.render.renders_in_flight));
 
         let product = params.product;
-        let elevation = params.elevation;
+        // The sweep this frame's own scan snapped the selection to. One local for
+        // both uses on purpose: it is what the renderer is handed, so it is what the
+        // response reports the image depicts. Reporting `target.elevation` instead
+        // would describe the image by the selection it was asked for rather than the
+        // tilt it shows, and the receiving side compares it against a real sweep.
+        let snapped = params.elevation;
         let lat = params.lat;
         let lon = params.lon;
         let sender = self.channels.loop_render_sender.clone();
@@ -664,13 +679,14 @@ impl super::App {
             .name("loop-render".into())
             .spawn(move || {
             let _guard = guard;
-            match rustdar_radar::render::render_radar_to_image(&scan_data, elevation, product, lat, lon)
+            match rustdar_radar::render::render_radar_to_image(&scan_data, snapped, product, lat, lon)
             {
                 Some((image, range, values)) => {
                     let _ = sender.send(crate::channels::LoopRenderResponse {
                         pane_idx,
                         timestamp,
                         target,
+                        snapped,
                         image_data: image,
                         max_range_km: range,
                         value_data: values,
@@ -682,6 +698,7 @@ impl super::App {
                         pane_idx,
                         timestamp,
                         target,
+                        snapped,
                         image_data: Vec::new(),
                         max_range_km: 0.0,
                         value_data: Vec::new(),
@@ -695,61 +712,20 @@ impl super::App {
 
     /// Append a freshly-polled scan to any active loops, evicting frames past
     /// the lookback window.
+    ///
+    /// `site` is the site the *scan* came from, not any pane's — it decides both
+    /// which cache entry the scan becomes and which loops may take a frame for it.
     pub(super) fn append_scan_to_active_loops(
         &mut self,
+        site: &str,
         timestamp: chrono::NaiveDateTime,
         scan: std::sync::Arc<nexrad_model::data::Scan>,
     ) {
-        use rustdar_egui::pane::LoopFrame;
+        // Store in the shared cache under this scan's own site, for every loop on
+        // that site to use.
+        self.loop_mgr.cache_scan(site, timestamp, scan);
 
-        // Store in global cache for all panes to use
-        self.loop_mgr.cache_scan(timestamp, std::sync::Arc::clone(&scan));
-
-        for pane_idx in 0..self.gui.pane_count() {
-            let Some(pane) = self.gui.pane_mut(pane_idx) else {
-                continue;
-            };
-            let ls = &mut pane.loop_state;
-            if !ls.is_active() {
-                continue;
-            }
-
-            // Skip if this timestamp already exists
-            if ls.frames.iter().any(|f| f.timestamp == timestamp) {
-                continue;
-            }
-
-            // Insert in sorted order
-            let insert_pos = ls.frames.partition_point(|f| f.timestamp < timestamp);
-            ls.frames.insert(insert_pos, LoopFrame {
-                timestamp,
-                texture: None,
-                render_in_flight: false,
-                render_failed: false,
-            });
-
-            // Evict frames outside the lookback window
-            let lookback = chrono::Duration::seconds(ls.lookback_secs as i64);
-            if let Some(newest) = ls.frames.last().map(|f| f.timestamp) {
-                let cutoff = newest - lookback;
-                let old_len = ls.frames.len();
-                ls.frames.retain(|f| f.timestamp >= cutoff);
-                let removed = old_len - ls.frames.len();
-                if removed > 0 {
-                    // Adjust current_frame if needed
-                    if ls.current_frame >= ls.frames.len() {
-                        ls.current_frame = ls.frames.len().saturating_sub(1);
-                    }
-                }
-            }
-
-            log::info!(
-                "Appended scan {} to loop on pane {} ({} frames)",
-                timestamp,
-                pane_idx,
-                ls.frames.len()
-            );
-        }
+        append_polled_frame_to_loops(self.gui.panes_mut(), site, timestamp);
     }
 
     /// Re-initialize radar loops on all panes that have an active loop.
@@ -765,5 +741,202 @@ impl super::App {
         for (pane_idx, lookback_secs) in to_reinit {
             self.handle_enable_loop(pane_idx, lookback_secs);
         }
+    }
+}
+
+/// Append a frame for a scan polled from `site` at `timestamp` to every active
+/// loop that is on that site.
+///
+/// The site test is the point. A polled scan is cached under `(site, timestamp)`
+/// and looked up that way at render time, so a loop on another site handed this
+/// frame resolves the lookup to *its* site's scan or to nothing at all — and
+/// before the cache carried a site, it resolved to this scan and drew it around
+/// the other site's coordinates, which is data from one radar under another
+/// radar's label. Loops on other sites get their own frames from their own polls.
+fn append_polled_frame_to_loops(
+    panes: &mut [rustdar_egui::pane::PaneState],
+    site: &str,
+    timestamp: chrono::NaiveDateTime,
+) {
+    for (pane_idx, pane) in panes.iter_mut().enumerate() {
+        if append_polled_frame(&mut pane.loop_state, site, timestamp) {
+            log::info!(
+                "Appended {} scan {} to loop on pane {} ({} frames)",
+                site,
+                timestamp,
+                pane_idx,
+                pane.loop_state.frames.len()
+            );
+        }
+    }
+}
+
+/// Add a frame at `timestamp` to `ls` if the loop is active, is on `site`, and does
+/// not already have that frame. Returns whether a frame was added.
+///
+/// Evicting past the lookback window is part of the same step: the window is
+/// measured from the newest frame, so it can only be applied once the new frame is
+/// in place.
+fn append_polled_frame(
+    ls: &mut rustdar_egui::pane::LoopPlaybackState,
+    site: &str,
+    timestamp: chrono::NaiveDateTime,
+) -> bool {
+    use rustdar_egui::pane::LoopFrame;
+
+    if !ls.is_active() {
+        return false;
+    }
+    // `LoopPlaybackState::site` is the loop's *geometry* site, captured when the
+    // loop was built — not the pane's live `site` field, which is re-synced across
+    // panes without rebuilding their loops.
+    if ls.site != site {
+        return false;
+    }
+    // Skip if this timestamp already exists
+    if ls.frames.iter().any(|f| f.timestamp == timestamp) {
+        return false;
+    }
+
+    // Insert in sorted order
+    let insert_pos = ls.frames.partition_point(|f| f.timestamp < timestamp);
+    ls.frames.insert(insert_pos, LoopFrame {
+        timestamp,
+        texture: None,
+        render_in_flight: false,
+        render_failed: false,
+    });
+
+    // Evict frames outside the lookback window
+    let lookback = chrono::Duration::seconds(ls.lookback_secs as i64);
+    if let Some(newest) = ls.frames.last().map(|f| f.timestamp) {
+        let cutoff = newest - lookback;
+        ls.frames.retain(|f| f.timestamp >= cutoff);
+        // Adjust current_frame if the playhead fell off the end
+        if ls.current_frame >= ls.frames.len() {
+            ls.current_frame = ls.frames.len().saturating_sub(1);
+        }
+    }
+
+    true
+}
+
+#[cfg(test)]
+mod loop_pane_tests {
+    use super::*;
+    use rustdar_egui::pane::{LoopPlaybackState, PaneState};
+    use rustdar_radar::sites::RadarSite;
+
+    fn ts(minute: u32) -> NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, minute, 0)
+            .unwrap()
+    }
+
+    fn site(name: &'static str, lat: f64, lon: f64) -> RadarSite {
+        RadarSite { name, lat, lon, elev: None }
+    }
+
+    /// A pane with an active loop on `site`, holding frames at the given minutes.
+    fn pane_looping_on(site: RadarSite, lookback_secs: u64, frames: &[u32]) -> PaneState {
+        let mut pane = PaneState::with_site(site.name.to_string());
+        pane.loop_state = LoopPlaybackState::new_for_loop(lookback_secs, &site);
+        for &minute in frames {
+            append_polled_frame(&mut pane.loop_state, site.name, ts(minute));
+        }
+        pane
+    }
+
+    fn frame_times(pane: &PaneState) -> Vec<NaiveDateTime> {
+        pane.loop_state.frames.iter().map(|f| f.timestamp).collect()
+    }
+
+    /// The defect this half of the site fix exists for. Auto-poll delivers one
+    /// site's scan; a loop on a different site used to take a frame for it, then
+    /// render that scan around its own coordinates.
+    #[test]
+    fn a_polled_scan_only_reaches_loops_on_its_own_site() {
+        let ktlx = site("KTLX", 35.33, -97.27);
+        let koun = site("KOUN", 35.23, -97.46);
+        let mut panes = [
+            pane_looping_on(ktlx, 3600, &[0, 5]),
+            pane_looping_on(koun, 3600, &[0, 5]),
+        ];
+
+        append_polled_frame_to_loops(&mut panes, "KTLX", ts(10));
+
+        assert_eq!(frame_times(&panes[0]), vec![ts(0), ts(5), ts(10)]);
+        assert_eq!(
+            frame_times(&panes[1]),
+            vec![ts(0), ts(5)],
+            "a KOUN loop must not take a frame for a KTLX scan"
+        );
+    }
+
+    /// The loop's own site is the geometry site captured when it was built. A pane
+    /// whose live `site` field has been re-synced without its loop being rebuilt
+    /// must still be judged on the loop's site, or the frame lands in a loop that
+    /// projects it somewhere else.
+    #[test]
+    fn the_loops_site_decides_not_the_panes_live_site() {
+        let koun = site("KOUN", 35.23, -97.46);
+        let mut panes = [pane_looping_on(koun, 3600, &[0])];
+        // `propagate_layer_sync` converges the pane's site without rebuilding loops.
+        panes[0].site = "KTLX".to_string();
+
+        append_polled_frame_to_loops(&mut panes, "KTLX", ts(10));
+        assert_eq!(frame_times(&panes[0]), vec![ts(0)], "the loop is still a KOUN loop");
+
+        append_polled_frame_to_loops(&mut panes, "KOUN", ts(10));
+        assert_eq!(frame_times(&panes[0]), vec![ts(0), ts(10)]);
+    }
+
+    /// Single-frame mode keeps a `LoopPlaybackState` around whose `site` is an
+    /// empty placeholder. A poll must not turn that into a frame list.
+    #[test]
+    fn an_inactive_loop_takes_no_frames() {
+        let mut panes = [PaneState::with_site("KTLX".to_string())];
+        assert_eq!(panes[0].loop_state.site, "", "precondition: placeholder site");
+
+        append_polled_frame_to_loops(&mut panes, "KTLX", ts(10));
+        append_polled_frame_to_loops(&mut panes, "", ts(11));
+
+        assert!(panes[0].loop_state.frames.is_empty());
+    }
+
+    #[test]
+    fn a_polled_frame_is_inserted_in_time_order_and_never_twice() {
+        let ktlx = site("KTLX", 35.33, -97.27);
+        let mut panes = [pane_looping_on(ktlx, 3600, &[0, 10])];
+
+        // Out-of-order arrival still lands between its neighbours.
+        append_polled_frame_to_loops(&mut panes, "KTLX", ts(5));
+        assert_eq!(frame_times(&panes[0]), vec![ts(0), ts(5), ts(10)]);
+
+        append_polled_frame_to_loops(&mut panes, "KTLX", ts(5));
+        assert_eq!(frame_times(&panes[0]), vec![ts(0), ts(5), ts(10)], "no duplicate frame");
+    }
+
+    /// Frames older than the lookback window are dropped as new ones arrive, and
+    /// the playhead is pulled back in when it falls off the end.
+    #[test]
+    fn appending_evicts_past_the_lookback_window() {
+        let ktlx = site("KTLX", 35.33, -97.27);
+        // 10 minutes of lookback, frames every 5 minutes.
+        let mut panes = [pane_looping_on(ktlx, 600, &[0, 5, 10])];
+        panes[0].loop_state.current_frame = 2;
+
+        append_polled_frame_to_loops(&mut panes, "KTLX", ts(15));
+
+        assert_eq!(
+            frame_times(&panes[0]),
+            vec![ts(5), ts(10), ts(15)],
+            "the frame older than the window is evicted"
+        );
+        assert_eq!(
+            panes[0].loop_state.current_frame, 2,
+            "the playhead still points inside the list"
+        );
     }
 }

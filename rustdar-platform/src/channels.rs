@@ -70,6 +70,12 @@ pub struct LoopScanListResponse {
 /// Result from downloading a single scan for a loop frame.
 pub struct LoopScanDownloadResponse {
     pub pane_idx: usize,
+    /// NEXRAD site this scan was downloaded for, captured when the download was
+    /// spawned. Half of the cache key, and carried on the response rather than
+    /// re-read from the pane: the pane's loop can be rebuilt for another site
+    /// while the download runs, and the scan still belongs to the site it came
+    /// from.
+    pub site: String,
     /// UTC timestamp of the downloaded scan.
     pub timestamp: NaiveDateTime,
     /// The decoded scan data, or `None` if the download failed.
@@ -86,6 +92,12 @@ pub struct LoopRenderResponse {
     /// `LoopPlaybackState::rendered_for` on arrival to reject results whose target the
     /// pane has since moved away from.
     pub target: RenderTarget,
+    /// The sweep angle the image actually depicts: `target.elevation` snapped to a
+    /// sweep this frame's own scan carries. Unlike the target, this is a property
+    /// of the scan as well as the selection, so a pane taking this image via the
+    /// sibling broadcast has to check it against what *its* scan resolves the same
+    /// selection to — see `LoopPlaybackState::frame_accepting_broadcast`.
+    pub snapped: f32,
     pub image_data: Vec<u8>,
     pub max_range_km: f64,
     pub value_data: Vec<f32>,
