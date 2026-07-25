@@ -79,20 +79,23 @@ nexrad-model = "=1.0.0-rc.2"
 # -- shared third-party --
 chrono = "=0.4.45"
 flate2 = "=1.1.9"
-# PINNED TO 0.21.x DELIBERATELY -- do not take a 0.22 bump on its own.
+# MUST move in lockstep with `rustls-platform-verifier` in rustdar-android.
 #
 # `rustdar-android` hands JNI references to
 # `rustls_platform_verifier::android::init_with_refs`, so it must use the *same*
-# jni crate version the verifier does. rustls-platform-verifier 0.6.2 requires
-# `jni ^0.21`, and 0.6.2 is what `reqwest 0.13.2` resolves (it requires
-# `rustls-platform-verifier ^0.6`).
+# jni crate the verifier does. rpv 0.6.x wants `jni ^0.21`; rpv 0.7.x wants
+# `^0.22`. Bumping one alone makes cargo resolve *two* verifier copies: reqwest's
+# clients read one, `init_with_refs` initialises the other, and **Android TLS
+# init silently does nothing** -- invisible until an on-device HTTPS request
+# fails. A renovate PR proposed exactly that split and it auto-merged cleanly.
 #
-# A renovate PR bumped this to 0.22.4 together with rpv 0.7.0. That pairing is
-# self-consistent but incompatible with reqwest 0.13: cargo would resolve *two*
-# verifier copies, reqwest's clients would read the 0.6 one, and
-# `init_with_refs` would initialise the 0.7 one -- Android TLS init silently
-# doing nothing until an on-device request failed. Both bumps land together, or
-# neither, and only once reqwest requires ^0.7.
+# STATUS (2026-07-25): the blocker has lifted. `reqwest 0.13.2` required rpv
+# `^0.6`, but **0.13.4 accepts `>=0.6.0, <0.8.0`**, so the 0.7.0 + jni 0.22.4
+# pair is now resolvable. It is deliberately NOT taken yet: the Gradle/NDK work
+# built and verified real APKs against 0.6.2, and moving the verifier deserves
+# its own change with those artifact checks re-run (the compiled Network
+# Security Config reference, the R8-surviving `org.rustls.platformverifier.*`
+# classes). Take both bumps together, or neither.
 jni = "=0.21.1"
 # egui 0.35 requires ^0.4.33.
 log = "=0.4.33"
