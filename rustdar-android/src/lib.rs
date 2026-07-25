@@ -433,8 +433,62 @@ fn start_compass_thread(sender: std::sync::mpsc::Sender<f32>) {
     }).expect("failed to spawn compass-heading thread");
 }
 
+/// Load one of our own Java helper classes through the app's [`ClassLoader`] and
+/// invoke its static `register(Activity)`.
+///
+/// Returns a global ref to the loaded class so the caller can keep calling static
+/// methods on it later (see [`COMPASS_CLASS`]).
+///
+/// The class *must* be resolved through `loader` rather than `JNIEnv::find_class`.
+/// `android_main` runs on a thread that `android-activity` attached to the JVM
+/// with no Java frames on the stack, and in that situation JNI `FindClass`
+/// resolves against the *system* class loader — which knows nothing about classes
+/// packaged in the app. `Context.getClassLoader()` is the app loader and does.
+///
+/// [`ClassLoader`]: <https://developer.android.com/reference/java/lang/ClassLoader>
+#[cfg(target_os = "android")]
+fn register_java_helper(
+    env: &mut jni::AttachGuard<'_>,
+    loader: &jni::objects::JObject<'_>,
+    activity: &jni::objects::JObject<'_>,
+    class_name: &str,
+) -> Option<jni::objects::GlobalRef> {
+    use jni::objects::{JClass, JValue};
+
+    let name = env.new_string(class_name).ok()?;
+    let cls_obj = env
+        .call_method(
+            loader,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[JValue::from(&name)],
+        )
+        .and_then(|v| v.l())
+        .inspect_err(|e| log::warn!("Could not load {}: {:?}", class_name, e))
+        .ok()?;
+
+    // Taken before the value is consumed by the JClass conversion below.
+    let global = env.new_global_ref(&cls_obj).ok();
+
+    match env.call_static_method(
+        JClass::from(cls_obj),
+        "register",
+        "(Landroid/app/Activity;)V",
+        &[JValue::from(activity)],
+    ) {
+        Ok(_) => {
+            log::info!("{} registered", class_name);
+            global
+        }
+        Err(e) => {
+            log::warn!("{}.register() failed: {:?}", class_name, e);
+            None
+        }
+    }
+}
+
 /// Android main entry point
-/// 
+///
 /// This function is called by the Android runtime when the app starts.
 /// It initializes logging and starts the main application loop.
 #[cfg(target_os = "android")]
@@ -459,125 +513,52 @@ fn android_main(app: AndroidApp) {
     rustdar_frontend::tls::init();
 
     // Initialize rustls-platform-verifier for TLS certificate verification.
-    // reqwest 0.13+ uses rustls-platform-verifier which requires JNI access to
-    // Android's TrustManager. Without this, all HTTPS connections hang silently.
+    // reqwest uses it to reach Android's TrustManager over JNI; without this,
+    // every HTTPS connection fails.
     //
-    // cargo-apk builds a purely native APK (NativeActivity), so the default
-    // class loader has no DEX paths — it can't find the Kotlin CertificateVerifier
-    // class we injected. We work around this by creating our own PathClassLoader
-    // pointing at the APK's sourceDir and passing it via init_with_refs().
+    // `init_with_env` derives the class loader itself, from
+    // `Context.getClassLoader()`. Under the old cargo-apk build that loader was
+    // useless: cargo-apk emitted a purely native APK with no classes.dex, so the
+    // app loader had never heard of the verifier's Kotlin classes, and this
+    // function had to hand-roll a `PathClassLoader` over the APK's own sourceDir
+    // and hand it to `init_with_refs`. The Gradle build packages a real DEX
+    // (`android:hasCode="true"`), so the app loader is now the correct one and
+    // that whole workaround is gone.
     {
-        use jni::objects::{JObject, JValue};
         use jni::JavaVM;
+        use jni::objects::JObject;
 
         let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr() as *mut jni::sys::JavaVM) }
             .expect("Failed to get JavaVM");
-        let mut env = vm.attach_current_thread()
+        let mut env = vm
+            .attach_current_thread()
             .expect("Failed to attach JNI thread");
+
+        // Two handles onto the same jobject. `JObject::from_raw` only wraps the
+        // pointer -- it takes no ownership and deletes no local reference when
+        // dropped -- and `init_with_env` consumes the handle it is passed, so the
+        // second is what the helper registrations below use to reach the Activity.
         let context = unsafe { JObject::from_raw(app.activity_as_ptr() as jni::sys::jobject) };
+        let activity = unsafe { JObject::from_raw(app.activity_as_ptr() as jni::sys::jobject) };
 
-        // Get the APK path: context.getApplicationInfo().sourceDir
-        let app_info = env
-            .call_method(&context, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;", &[])
-            .expect("getApplicationInfo failed")
-            .l()
-            .expect("getApplicationInfo not an object");
-        let source_dir = env
-            .get_field(&app_info, "sourceDir", "Ljava/lang/String;")
-            .expect("sourceDir field missing")
-            .l()
-            .expect("sourceDir not an object");
+        rustls_platform_verifier::android::init_with_env(&mut env, context)
+            .expect("Failed to initialize rustls-platform-verifier");
+        log::info!("rustls-platform-verifier initialized");
 
-        // Get the existing (empty) class loader as parent
-        let parent_loader = env
-            .call_method(&context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
-            .expect("getClassLoader failed")
-            .l()
-            .expect("getClassLoader not an object");
+        let loader = env
+            .call_method(&activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+            .and_then(|v| v.l())
+            .expect("Context.getClassLoader() failed");
 
-        // Create a PathClassLoader that reads our injected classes.dex from the APK
-        let dex_loader = env
-            .new_object(
-                "dalvik/system/PathClassLoader",
-                "(Ljava/lang/String;Ljava/lang/ClassLoader;)V",
-                &[JValue::from(&source_dir), JValue::from(&parent_loader)],
-            )
-            .expect("Failed to create PathClassLoader");
+        // Back gesture on API 33+: back bypasses the native input queue and goes
+        // through OnBackInvokedDispatcher. Unhandled, NativeActivity calls
+        // finish() and the process dies; the helper minimises instead.
+        register_java_helper(&mut env, &loader, &activity, "com.rustdar.BackHandler");
 
-        // Build global refs and initialize the platform verifier
-        let java_vm = env.get_java_vm().expect("Failed to get JavaVM from env");
-        let context_ref = env.new_global_ref(&context).expect("Failed to create context global ref");
-        let loader_ref = env.new_global_ref(&dex_loader).expect("Failed to create loader global ref");
-
-        rustls_platform_verifier::android::init_with_refs(java_vm, context_ref, loader_ref);
-        log::info!("rustls-platform-verifier initialized with custom PathClassLoader");
-
-        // Register the BackHandler for Android 13+ gesture navigation.
-        // On API 33+, back gestures bypass the native input queue and go
-        // through OnBackInvokedDispatcher. Our Java helper registers a
-        // callback that calls moveTaskToBack() instead of finish().
+        if let Some(cls) =
+            register_java_helper(&mut env, &loader, &activity, "com.rustdar.CompassHelper")
         {
-            let handler_name = env.new_string("com.rustdar.BackHandler")
-                .expect("Failed to create BackHandler class name");
-            match env.call_method(
-                &dex_loader,
-                "loadClass",
-                "(Ljava/lang/String;)Ljava/lang/Class;",
-                &[jni::objects::JValue::from(&handler_name)],
-            ) {
-                Ok(cls_val) => {
-                    let cls_obj = cls_val.l().expect("loadClass did not return object");
-                    let cls = jni::objects::JClass::from(cls_obj);
-                    match env.call_static_method(
-                        cls,
-                        "register",
-                        "(Landroid/app/Activity;)V",
-                        &[jni::objects::JValue::from(&context)],
-                    ) {
-                        Ok(_) => log::info!("BackHandler registered for gesture navigation"),
-                        Err(e) => log::warn!("BackHandler.register() failed: {:?}", e),
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Could not load BackHandler class: {:?}", e);
-                    log::warn!("Back gesture may not work on Android 13+");
-                }
-            }
-        }
-
-        // Register the CompassHelper for heading data.
-        {
-            let compass_name = env.new_string("com.rustdar.CompassHelper")
-                .expect("Failed to create CompassHelper class name");
-            match env.call_method(
-                &dex_loader,
-                "loadClass",
-                "(Ljava/lang/String;)Ljava/lang/Class;",
-                &[jni::objects::JValue::from(&compass_name)],
-            ) {
-                Ok(cls_val) => {
-                    let cls_obj = cls_val.l().expect("loadClass did not return object");
-                    let cls = jni::objects::JClass::from(cls_obj);
-                    let cls_global = env.new_global_ref(&cls);
-                    match env.call_static_method(
-                        cls,
-                        "register",
-                        "(Landroid/app/Activity;)V",
-                        &[jni::objects::JValue::from(&context)],
-                    ) {
-                        Ok(_) => {
-                            log::info!("CompassHelper registered");
-                            if let Ok(global) = cls_global {
-                                let _ = COMPASS_CLASS.set(global);
-                            }
-                        }
-                        Err(e) => log::warn!("CompassHelper.register() failed: {:?}", e),
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Could not load CompassHelper class: {:?}", e);
-                }
-            }
+            let _ = COMPASS_CLASS.set(cls);
         }
     }
 
