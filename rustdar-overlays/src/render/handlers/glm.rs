@@ -56,6 +56,13 @@ impl OverlayItem for GlmFlashItem {
         ];
         // Events have no area in the L2 LCFA product; omit the row rather than
         // showing a placeholder zero.
+        //
+        // TODO(fix/glm-cf-unpacking): "km²" is wrong. The product stores area as
+        // an unsigned packed `short` with scale_factor 152601.9 and units "m2",
+        // and no CF unpacking is applied, so this prints a raw count under a
+        // km² label (and goes negative past 32767 via int16 wraparound). See the
+        // note on `GlmFlash::area`; that branch fixes both this line and the
+        // struct doc.
         if let Some(area) = f.area {
             grid.push(("Area".into(), format!("{area:.1} km²")));
         }

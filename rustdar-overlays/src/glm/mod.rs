@@ -77,7 +77,15 @@ pub struct GlmFlash {
     pub lon: f64,
     /// Radiant energy in joules.
     pub energy: f32,
-    /// Area in km², when the product reports one.
+    /// Area, when the product reports one.
+    ///
+    /// TODO(fix/glm-cf-unpacking): the unit here is currently a lie. `flash_area`
+    /// and `group_area` are stored as `short` with `_Unsigned = "true"`,
+    /// `scale_factor = 152601.9` and `units = "m2"`, and nothing applies CF
+    /// unpacking, so this field holds a raw packed count — not km², not even m².
+    /// Any raw value above 32767 additionally wraps negative through int16.
+    /// The `fix/glm-cf-unpacking` branch owns the fix; until it lands, treat the
+    /// number as uncalibrated.
     ///
     /// `None` at [`GlmDataLevel::Event`]: the L2 LCFA product only carries
     /// `group_area` and `flash_area`. Individual events are single sensor
