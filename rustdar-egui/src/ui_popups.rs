@@ -24,6 +24,14 @@ fn show_detail_popup(
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
+        // Since egui 0.35 (#7725, "rework `Window` margins") this is the window's
+        // OUTER width — it used to size the content. Content is now narrower by
+        // 2 x (`spacing.window_margin` + `visuals.window_stroke`), 14px at the
+        // stock theme. Deliberately not compensated: on mobile `popup_width` is
+        // `screen - 32`, which reads as "a 16px gutter each side", and only the
+        // new meaning actually delivers that. Adding 14 back would restore the
+        // old content width but hardcode a theme-derived constant that rots the
+        // moment the style changes.
         .default_width(popup_width)
         .pivot(egui::Align2::CENTER_CENTER)
         .default_pos(screen.center())

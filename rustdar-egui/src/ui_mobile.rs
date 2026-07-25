@@ -156,7 +156,7 @@ impl super::Gui {
         egui::Panel::top("mobile_status_bar")
             .min_size(32.0 + top_inset)
             .show_separator_line(true)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 // Add spacing to push content below the status bar cutout
                 if top_inset > 0.0 {
                     ui.add_space(top_inset);
@@ -219,7 +219,7 @@ impl super::Gui {
         egui::Panel::left("mobile_layers_panel")
             .default_size(LAYERS_PANEL_WIDTH)
             .resizable(false)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 // Safe-area top padding
                 if top_inset > 0.0 {
                     ui.add_space(top_inset);

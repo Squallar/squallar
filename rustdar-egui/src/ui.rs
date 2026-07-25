@@ -304,7 +304,9 @@ impl Gui {
 
         self.check_auto_polls(&mut actions);
 
-        // Create a root Ui so panel methods can use show_inside().
+        // Create a root Ui to host the panels. Since egui 0.35 the Context-taking
+        // `Panel::show` is gone and panels are Ui-scoped only, so this root Ui is
+        // the only way in.
         let mut root_ui = egui::Ui::new(
             ctx.clone(),
             egui::Id::new("rustdar_root"),

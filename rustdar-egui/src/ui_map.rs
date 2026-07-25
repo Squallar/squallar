@@ -36,7 +36,7 @@ impl super::Gui {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 let panel_rect = ui.max_rect();
                 #[cfg(test)]
                 {
@@ -150,6 +150,21 @@ impl super::Gui {
                     if let Some(tiles) = tiles_owned.as_mut() {
                         Map::new(None, &mut map_memory, center)
                         .with_layer(tiles, 1.0)
+                        // `zoom_with_ctrl(false)` is what puts us on walkers'
+                        // raw-scroll zoom path, and walkers 0.55 changed that
+                        // path's frame-time multiplier from
+                        // `stable_dt.max(predicted_dt * 1.5)` to
+                        // `stable_dt.clamp(predicted_dt * 0.5, predicted_dt * 2.0)`.
+                        // At a steady frame rate that is a uniform x0.667 on the
+                        // scroll-zoom step (60Hz: 0.025 -> 0.01667, so a wheel
+                        // notch that gave ~1.31x now gives ~1.21x); on a hitched
+                        // frame the old form grew unbounded and the new one is
+                        // capped, which is the bug being fixed.
+                        //
+                        // `Map::zoom_speed` (default 2.0) can compensate the
+                        // magnitude, but it is not an exact undo: it scales the
+                        // combined zoom delta, so pinch and double-click zoom
+                        // move with it. Left at the default deliberately.
                         .zoom_with_ctrl(false)
                         .panning(false)
                         .drag_pan_buttons(if suppress_pan {

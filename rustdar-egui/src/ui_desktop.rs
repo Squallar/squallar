@@ -75,7 +75,7 @@ fn render_error_display(ui: &mut egui::Ui, error_message: &mut Option<String>) {
 
 impl super::Gui {
     pub(super) fn render_menu_bar(&mut self, ui: &mut egui::Ui, action: &mut Option<GuiAction>) {
-        egui::Panel::top("menubar_container").show_inside(ui, |ui| {
+        egui::Panel::top("menubar_container").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Exit").clicked() {
@@ -113,7 +113,7 @@ impl super::Gui {
         
         egui::Panel::bottom("status_bar")
             .show_separator_line(true)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
 
@@ -157,7 +157,7 @@ impl super::Gui {
         egui::Panel::left("layers_panel")
             .default_size(LAYERS_PANEL_WIDTH)
             .resizable(false)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.heading("Layers");
                 ui.separator();
 

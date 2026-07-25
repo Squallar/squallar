@@ -18,7 +18,8 @@
 //! agree with each other, and the disagreements are the whole reason the
 //! tracker is shaped the way it is.
 //!
-//! `egui-winit` 0.34.1 (`src/lib.rs`):
+//! `egui-winit` 0.35.0 (`src/lib.rs`) — `on_touch`'s body is byte-identical to
+//! 0.34.1's, so every row below survived the bump unchanged:
 //!
 //! | winit event                | emitted here                                          |
 //! |----------------------------|-------------------------------------------------------|
@@ -27,9 +28,10 @@
 //! | `TouchPhase::Ended`        | `Touch{End}`, `PointerButton{up}`, `PointerGone`      |
 //! | `TouchPhase::Cancelled`    | `Touch{Cancel}`, `PointerGone` — **no release**       |
 //! | `WindowEvent::CursorLeft`  | `PointerGone` alone — and the position is forgotten,  |
-//! |                            | so a release out there is dropped (`lib.rs:796`)      |
+//! |                            | so a release out there is dropped (`lib.rs:784`)      |
 //!
-//! eframe 0.34.1's web canvas (`src/web/events.rs`):
+//! eframe 0.35.0's web canvas (`src/web/events.rs`) — the four touch handlers
+//! are likewise byte-identical to 0.34.1's:
 //!
 //! | DOM event     | emitted here                                                |
 //! |---------------|-------------------------------------------------------------|

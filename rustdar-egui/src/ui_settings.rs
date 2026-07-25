@@ -36,6 +36,9 @@ impl super::Gui {
             .order(egui::Order::Foreground)
             .collapsible(false)
             .resizable(true)
+            // Outer width since egui 0.35 (#7725) — content is 14px narrower at
+            // the stock theme. See the note in `ui_popups.rs`; same reasoning,
+            // deliberately not compensated.
             .default_width(popup_width)
             .pivot(egui::Align2::CENTER_CENTER)
             .default_pos(screen.center())

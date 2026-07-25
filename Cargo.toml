@@ -38,11 +38,11 @@ rustdar-units = { path = "rustdar-units" }
 rustdar-gps = { path = "rustdar-gps", default-features = false }
 
 # -- UI stack (bump as a unit) --
-egui = "=0.34.1"
-egui-wgpu = "=0.34.1"
+egui = "=0.35.0"
+egui-wgpu = "=0.35.0"
 # Defaults off: rustdar-platform picks its own backend/clipboard feature set.
-egui-winit = { version = "=0.34.1", default-features = false }
-walkers = "=0.53.0"
+egui-winit = { version = "=0.35.0", default-features = false }
+walkers = "=0.56.0"
 wgpu = "=29.0.4"
 winit = "=0.30.13"
 
@@ -55,7 +55,8 @@ nexrad-model = "=1.0.0-rc.2"
 chrono = "=0.4.44"
 flate2 = "=1.1.9"
 jni = "=0.21.1"
-log = "=0.4.29"
+# egui 0.35 requires ^0.4.33.
+log = "=0.4.33"
 ndk-context = "=0.1.1"
 pollster = "=0.4.0"
 serde = { version = "=1.0.228", features = ["derive"] }
