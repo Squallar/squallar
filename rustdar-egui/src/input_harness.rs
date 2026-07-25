@@ -144,6 +144,28 @@ impl InputHarness {
         outcome
     }
 
+    /// Run input-free frames for `seconds` of wall clock, asserting `check` on
+    /// **every** frame.
+    ///
+    /// Watching only the last frame is how a re-arming gesture slips through: a
+    /// stuck long press needs [`LONG_PRESS_DURATION_S`] to come back, so any
+    /// "it stayed released" assertion has to cover well past that, frame by
+    /// frame.
+    pub(crate) fn assert_every_frame_for(
+        &mut self,
+        seconds: f64,
+        step: f64,
+        mut check: impl FnMut(usize, &FrameOutcome),
+    ) -> FrameOutcome {
+        let count = (seconds / step).ceil() as usize;
+        let mut outcome = FrameOutcome::default();
+        for frame in 0..count {
+            outcome = self.frame_after(step);
+            check(frame, &outcome);
+        }
+        outcome
+    }
+
     // --- mouse input (mirrors egui-winit's cursor + button handling) --------
 
     pub(crate) fn mouse_move(&mut self, pos: egui::Pos2) {
@@ -184,6 +206,19 @@ impl InputHarness {
     pub(crate) fn touch_cancel(&mut self, pos: egui::Pos2) {
         self.events.push(touch(egui::TouchPhase::Cancel, pos));
         self.events.push(egui::Event::PointerGone);
+    }
+
+    /// A *secondary* finger's touch being cancelled: a raw `Touch{Cancel}` for
+    /// another `TouchId`, with no `PointerGone`, since the emulated pointer is
+    /// still owned by the primary finger.
+    pub(crate) fn secondary_touch_cancel(&mut self, pos: egui::Pos2) {
+        self.events.push(egui::Event::Touch {
+            device_id: egui::TouchDeviceId(0),
+            id: egui::TouchId(1),
+            phase: egui::TouchPhase::Cancel,
+            pos,
+            force: None,
+        });
     }
 
     // --- composite gestures -------------------------------------------------
@@ -264,6 +299,11 @@ mod tests {
     /// Long enough for a deferred single tap to be confirmed
     /// (`DOUBLE_TAP_TIMEOUT_S` is 0.4s).
     const AFTER_DOUBLE_TAP_TIMEOUT: f64 = 0.5;
+
+    /// How long a "the gesture really ended" assertion must keep watching:
+    /// comfortably past `LONG_PRESS_DURATION_S` (0.8s), which is how long a
+    /// detector that re-arms itself off a stale pointer takes to come back.
+    const WATCH_PAST_LONG_PRESS: f64 = 2.5;
 
     /// 1. A single mouse click reports a click position at the clicked point
     ///    and never suppresses panning.
@@ -432,18 +472,27 @@ mod tests {
         );
         assert_eq!(cancelled.touch.long_press_pos, None);
 
-        // …and it must stay released on subsequent frames, even though egui
-        // still reports the primary button as down.
-        let later = h.frames_for(5, 0.1);
-        assert!(
-            !later.touch.suppress_pan,
-            "the map must remain pannable after a cancelled touch"
-        );
-        assert_eq!(later.touch.overlay_click_pos, None);
+        // …and it must stay released, frame after frame, even though egui still
+        // reports the primary button as down. This has to run well past
+        // LONG_PRESS_DURATION_S (0.8s): the phantom finger is still "down", so a
+        // detector that re-arms on `down` takes exactly that long to claim it
+        // back — as a long press pinned at Pos2::ZERO, because `PointerGone`
+        // cleared egui's pointer position.
+        h.assert_every_frame_for(WATCH_PAST_LONG_PRESS, 0.1, |frame, outcome| {
+            assert!(
+                !outcome.touch.suppress_pan,
+                "frame {frame}: map must remain pannable after a cancelled touch"
+            );
+            assert_eq!(
+                outcome.touch.long_press_pos, None,
+                "frame {frame}: a cancelled touch must not become a long press"
+            );
+            assert_eq!(outcome.touch.overlay_click_pos, None, "frame {frame}");
+        });
     }
 
     /// 6b. The same cancellation, but during a long press: the tooltip position
-    ///     must not stick either.
+    ///     must not stick, and must not come back either.
     #[test]
     fn touch_cancelled_during_long_press_clears_it() {
         let mut h = InputHarness::new();
@@ -459,9 +508,112 @@ mod tests {
         assert_eq!(cancelled.touch.long_press_pos, None);
         assert!(!cancelled.touch.suppress_pan);
 
-        let later = h.frames_for(5, 0.1);
-        assert_eq!(later.touch.long_press_pos, None);
-        assert!(!later.touch.suppress_pan);
+        // Watch past LONG_PRESS_DURATION_S: clearing the state once is not
+        // enough if the detector is allowed to re-arm off egui's latched `down`.
+        h.assert_every_frame_for(WATCH_PAST_LONG_PRESS, 0.1, |frame, outcome| {
+            assert_eq!(
+                outcome.touch.long_press_pos, None,
+                "frame {frame}: the long press must not re-arm itself"
+            );
+            assert!(!outcome.touch.suppress_pan, "frame {frame}");
+        });
+    }
+
+    /// 6c. A *secondary* finger being cancelled must not kill the primary
+    ///     finger's live gesture. `Event::Touch { phase: Cancel }` carries a
+    ///     `TouchId` that cannot be matched against the emulated pointer, so the
+    ///     tracker keys on `PointerGone` alone.
+    #[test]
+    fn secondary_touch_cancel_does_not_end_the_drag() {
+        let mut h = InputHarness::new();
+        let start = h.map_center();
+
+        h.touch_tap(start);
+        h.touch_start(start);
+        assert!(
+            h.frame_after(0.05).touch.suppress_pan,
+            "precondition: zoom drag active"
+        );
+
+        h.secondary_touch_cancel(start + egui::vec2(80.0, 0.0));
+        let after = h.frame_after(FRAME_DT);
+        assert!(
+            after.touch.suppress_pan,
+            "another finger's cancellation must not end the primary gesture"
+        );
+
+        // The drag still zooms.
+        let zoom_before = after.zoom;
+        h.touch_move(start + egui::vec2(0.0, 120.0));
+        let dragged = h.frame_after(FRAME_DT);
+        assert!(dragged.touch.suppress_pan);
+        assert!(dragged.zoom > zoom_before, "the drag must still be live");
+    }
+
+    /// 6d. A zoom drag that keeps moving must never be cut off, however long it
+    ///     runs — a user framing a view can easily hold one for many seconds.
+    ///     (The pointer backstop is keyed on inactivity, not on gesture age.)
+    #[test]
+    fn long_active_zoom_drag_is_never_cut_off() {
+        let mut h = InputHarness::new();
+        let start = h.map_center();
+
+        h.touch_tap(start);
+        h.touch_start(start);
+        assert!(h.frame_after(0.05).touch.suppress_pan);
+
+        // 15 seconds of continuous dragging, well past any plausible backstop.
+        let mut offset = 0.0_f32;
+        for step in 0..30 {
+            offset = if step % 2 == 0 { 40.0 } else { -40.0 };
+            h.touch_move(start + egui::vec2(0.0, offset));
+            let frame = h.frame_after(0.5);
+            assert!(
+                frame.touch.suppress_pan,
+                "step {step}: an actively moving drag must stay in control"
+            );
+            assert_eq!(
+                frame.touch.long_press_pos, None,
+                "step {step}: the drag must not hand the finger to the long press"
+            );
+        }
+
+        // Still responding to movement at the end.
+        let zoom_before = h.zoom();
+        h.touch_move(start + egui::vec2(0.0, offset + 100.0));
+        let dragged = h.frame_after(FRAME_DT);
+        assert_ne!(dragged.zoom, zoom_before, "the drag must still zoom");
+    }
+
+    /// 6e. If pointer input simply stops arriving mid-gesture (the integration
+    ///     went away without ever sending a release or a cancel), the stale
+    ///     "finger is down" belief expires — and does not get handed to the long
+    ///     press on the way out.
+    #[test]
+    fn silent_pointer_expires_and_stays_expired() {
+        let mut h = InputHarness::new();
+        let start = h.map_center();
+
+        h.touch_tap(start);
+        h.touch_start(start);
+        assert!(h.frame_after(0.05).touch.suppress_pan);
+        h.touch_move(start + egui::vec2(0.0, 40.0));
+        assert!(h.frame_after(FRAME_DT).touch.suppress_pan);
+
+        // No events at all from here on.
+        let expired = h.frames_for(24, 0.5);
+        assert!(
+            !expired.touch.suppress_pan,
+            "a pointer that stopped reporting must not hold the map hostage"
+        );
+
+        h.assert_every_frame_for(WATCH_PAST_LONG_PRESS, 0.1, |frame, outcome| {
+            assert!(!outcome.touch.suppress_pan, "frame {frame}");
+            assert_eq!(
+                outcome.touch.long_press_pos, None,
+                "frame {frame}: an expired pointer must not become a long press"
+            );
+        });
     }
 
     /// 7. A tap that lands on a floating dialog is filtered out by the
@@ -489,7 +641,10 @@ mod tests {
         assert!(!clicked.mouse.suppress_pan);
 
         // Touch path: the deferred tap is dropped as well, and nothing is
-        // emitted once the double-tap window closes.
+        // emitted once the double-tap window closes. (Note this half is caught
+        // earlier, by the on-floating-UI check inside DoubleTapDragDetector —
+        // `tap_confirmed_under_a_dialog_is_filtered_out` covers the gate
+        // itself.)
         let tapped = h.touch_tap(pos);
         assert_eq!(tapped.touch.overlay_click_pos, None);
         let settled = h.frames_for(3, 0.3);
@@ -501,5 +656,46 @@ mod tests {
         assert!(!h.is_floating_layer_at(pos));
         let clicked = h.mouse_click(pos);
         assert_eq!(clicked.mouse.overlay_click_pos, Some(pos));
+    }
+
+    /// 7b. A touch tap is deferred by 0.4s, so a dialog can open *during* the
+    ///     deferral. The tap was legitimately on the map when it happened, so
+    ///     the detector's own on-release check passes it through, and only
+    ///     `filter_dialog_blocked` can stop it from punching through the dialog
+    ///     that is now covering it.
+    #[test]
+    fn tap_confirmed_under_a_dialog_is_filtered_out() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+
+        // Tap on the bare map: nothing is floating there yet.
+        assert!(!h.is_floating_layer_at(pos));
+        let tapped = h.touch_tap(pos);
+        assert_eq!(tapped.touch.overlay_click_pos, None, "still deferred");
+
+        // A dialog opens over the tap position before the window closes.
+        h.gui_mut().show_settings = true;
+        h.frame_after(FRAME_DT);
+        assert!(
+            h.is_floating_layer_at(pos),
+            "precondition: the dialog now covers the tapped point"
+        );
+
+        let confirmed = h.frame_after(AFTER_DOUBLE_TAP_TIMEOUT);
+        assert_eq!(
+            confirmed.touch.overlay_click_pos, None,
+            "a tap confirmed under a dialog must not reach the map"
+        );
+        let settled = h.frames_for(3, 0.3);
+        assert_eq!(settled.touch.overlay_click_pos, None);
+
+        // Sanity: the identical sequence without the dialog does deliver the
+        // tap, so the assertion above is about the gate and not about the tap
+        // being swallowed somewhere else.
+        h.gui_mut().show_settings = false;
+        h.warm_up();
+        h.touch_tap(pos);
+        let confirmed = h.frame_after(AFTER_DOUBLE_TAP_TIMEOUT);
+        assert_eq!(confirmed.touch.overlay_click_pos, Some(pos));
     }
 }
