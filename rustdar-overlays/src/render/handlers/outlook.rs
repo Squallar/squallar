@@ -195,16 +195,27 @@ impl OverlayHandler for SpcOutlookHandler {
         let day = self.selected_day;
         let products: Vec<OutlookProduct> = self.enabled_products.iter().copied().collect();
         log::info!("Fetching SPC outlooks for {:?}: {:?}", day, products);
+        // NOT `ctx.client` — SPC answers OPTIONS with 403, so a `User-Agent`
+        // makes every one of these fail in the browser. See `spc::fetch`.
+        let client = match crate::spc::fetch::spc_client(&ctx.sources) {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("{e}");
+                return Vec::new();
+            }
+        };
         products
             .into_iter()
             .map(|product| {
-                let client = ctx.client.clone();
+                let client = client.clone();
+                let sources = ctx.sources.clone();
                 FetchTask {
                     kind: OverlayKind::SpcOutlook,
                     future: Box::pin(async move {
-                        let result = crate::spc::fetch::fetch_outlook(&client, day, product)
-                            .await
-                            .map_err(|e| e.to_string());
+                        let result =
+                            crate::spc::fetch::fetch_outlook(&client, &sources, day, product)
+                                .await
+                                .map_err(|e| e.to_string());
                         Box::new(SpcOutlookFetchResult { day, product, result }) as FetchPayload
                     }),
                 }

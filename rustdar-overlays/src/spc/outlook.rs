@@ -122,7 +122,18 @@ pub struct SpcOutlook {
 }
 
 /// Build the SPC GeoJSON URL for the given day and product.
-pub fn outlook_url(day: OutlookDay, product: OutlookProduct) -> String {
+///
+/// The origin comes from
+/// [`DataSources::spc_base`](rustdar_radar::sources::DataSources::spc_base)
+/// rather than a literal, so SPC is covered by the same origin table as every
+/// other feed — including the check that no production URL points at an origin
+/// the browser cannot reach.
+pub fn outlook_url(
+    sources: &rustdar_radar::sources::DataSources,
+    day: OutlookDay,
+    product: OutlookProduct,
+) -> String {
+    let base = &sources.spc_base;
     // Days 4-8 use a separate extended-range endpoint
     if day.is_extended() {
         let n = match day {
@@ -133,10 +144,7 @@ pub fn outlook_url(day: OutlookDay, product: OutlookProduct) -> String {
             OutlookDay::Day8 => 8,
             _ => unreachable!(),
         };
-        return format!(
-            "https://www.spc.noaa.gov/products/exper/day4-8/day{}prob.lyr.geojson",
-            n
-        );
+        return format!("{base}/products/exper/day4-8/day{n}prob.lyr.geojson");
     }
 
     let day_str = match day {
@@ -158,10 +166,7 @@ pub fn outlook_url(day: OutlookDay, product: OutlookProduct) -> String {
         | (_, OutlookProduct::Probabilistic) => "_prob",
     };
 
-    format!(
-        "https://www.spc.noaa.gov/products/outlook/{}{}.lyr.geojson",
-        day_str, product_str
-    )
+    format!("{base}/products/outlook/{day_str}{product_str}.lyr.geojson")
 }
 
 /// Parse an SPC GeoJSON response into an `SpcOutlook`.

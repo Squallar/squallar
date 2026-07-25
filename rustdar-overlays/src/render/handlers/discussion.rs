@@ -216,11 +216,20 @@ impl OverlayHandler for SpcDiscussionHandler {
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
         log::info!("Fetching SPC Mesoscale Discussions");
-        let client = ctx.client.clone();
+        // NOT `ctx.client` — SPC answers OPTIONS with 403, so a `User-Agent`
+        // makes this fail in the browser. See `spc::fetch`.
+        let client = match crate::spc::fetch::spc_client(&ctx.sources) {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("{e}");
+                return Vec::new();
+            }
+        };
+        let sources = ctx.sources.clone();
         vec![FetchTask {
             kind: OverlayKind::SpcDiscussions,
             future: Box::pin(async move {
-                let result = crate::spc::fetch::fetch_active_discussions(&client)
+                let result = crate::spc::fetch::fetch_active_discussions(&client, &sources)
                     .await
                     .map_err(|e| e.to_string());
                 Box::new(SpcDiscussionFetchResult(result)) as FetchPayload

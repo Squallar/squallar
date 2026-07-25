@@ -58,6 +58,23 @@
 //! `/products/outlook/*.lyr.geojson` and `/climo/reports/today_*.csv` all
 //! answered `200` + `ACAO: *` to `GET` and `403` to `OPTIONS`.
 //!
+//! Confirmed in a real browser, not only inferred from the headers. Headless
+//! Chromium, page served from `http://127.0.0.1`, `fetch()` issued twice per
+//! URL — once plain and once carrying a non-safelisted header to force the
+//! preflight:
+//!
+//! ```text
+//! spc /products/spcmdrss.xml            simple 200 readable   preflighted BLOCKED
+//! spc /products/outlook/…lyr.geojson    simple 200 readable   preflighted BLOCKED
+//! spc /climo/reports/today_torn.csv     simple 200 readable   preflighted BLOCKED
+//! mesonet.agron.iastate.edu  currents   simple 200 readable   preflighted BLOCKED
+//! unidata-nexrad-level3.s3   (control)                        preflighted 200 readable
+//! ```
+//!
+//! The S3 line is the control: a preflighted cross-origin request *can*
+//! succeed from that page, so the four `BLOCKED` results are the origins'
+//! behaviour and not the probe's.
+//!
 //! So METAR *and* SPC requests must stay **simple**: no `User-Agent`, no custom
 //! headers. [`Self::metar_sends_user_agent`] and [`Self::spc_sends_user_agent`]
 //! are that rule, stated where the origins are declared rather than buried in

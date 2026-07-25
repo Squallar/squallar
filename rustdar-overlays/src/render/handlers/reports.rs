@@ -220,11 +220,20 @@ impl OverlayHandler for StormReportsHandler {
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
         log::info!("Fetching SPC storm reports");
-        let client = ctx.client.clone();
+        // NOT `ctx.client` — SPC answers OPTIONS with 403, so a `User-Agent`
+        // makes all three CSVs fail in the browser. See `spc::fetch`.
+        let client = match crate::spc::fetch::spc_client(&ctx.sources) {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("{e}");
+                return Vec::new();
+            }
+        };
+        let sources = ctx.sources.clone();
         vec![FetchTask {
             kind: OverlayKind::StormReports,
             future: Box::pin(async move {
-                let result = crate::spc::reports::fetch_storm_reports(&client).await;
+                let result = crate::spc::reports::fetch_storm_reports(&client, &sources).await;
                 Box::new(StormReportsFetchResult(result)) as FetchPayload
             }),
         }]

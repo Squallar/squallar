@@ -28,20 +28,37 @@ pub struct StormReport {
     pub comments: String,
 }
 
-const TORN_URL: &str = "https://www.spc.noaa.gov/climo/reports/today_torn.csv";
-const HAIL_URL: &str = "https://www.spc.noaa.gov/climo/reports/today_hail.csv";
-const WIND_URL: &str = "https://www.spc.noaa.gov/climo/reports/today_wind.csv";
+/// Today's preliminary report CSV for one kind.
+///
+/// The origin comes from
+/// [`DataSources::spc_base`](rustdar_radar::sources::DataSources::spc_base),
+/// not a literal, so these three are covered by the origin table like every
+/// other feed.
+pub(crate) fn report_url(
+    sources: &rustdar_radar::sources::DataSources,
+    kind: StormReportKind,
+) -> String {
+    let name = match kind {
+        StormReportKind::Tornado => "torn",
+        StormReportKind::Hail => "hail",
+        StormReportKind::Wind => "wind",
+    };
+    format!("{}/climo/reports/today_{name}.csv", sources.spc_base)
+}
 
 /// Fetch today's tornado, hail, and wind reports from SPC in parallel.
+///
+/// `client` must be the preflight-safe client — see [`crate::spc::fetch::spc_client`].
 pub async fn fetch_storm_reports(
     client: &reqwest::Client,
+    sources: &rustdar_radar::sources::DataSources,
 ) -> Result<Vec<StormReport>, String> {
     log::info!("Fetching SPC storm reports");
 
     let (torn, hail, wind) = futures::future::join3(
-        fetch_csv(client, TORN_URL, StormReportKind::Tornado),
-        fetch_csv(client, HAIL_URL, StormReportKind::Hail),
-        fetch_csv(client, WIND_URL, StormReportKind::Wind),
+        fetch_csv(client, &report_url(sources, StormReportKind::Tornado), StormReportKind::Tornado),
+        fetch_csv(client, &report_url(sources, StormReportKind::Hail), StormReportKind::Hail),
+        fetch_csv(client, &report_url(sources, StormReportKind::Wind), StormReportKind::Wind),
     ).await;
 
     let mut reports = Vec::new();
