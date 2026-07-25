@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 
 /// Minimum ground speed (m/s) for GPS bearing to be considered meaningful.
 /// Below this, heading data is too noisy from a near-stationary receiver.
+///
+/// Read only by `nmea_parser`, so it carries the same gate.
+#[cfg(feature = "serial")]
 pub(crate) const MIN_SPEED_FOR_BEARING_MPS: f64 = 0.5;
 
 /// Ground speed (m/s) above which the device is considered "moving" (~5 mph).

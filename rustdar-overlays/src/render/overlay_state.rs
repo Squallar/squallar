@@ -37,7 +37,7 @@ pub struct OverlayLegend {
 /// shared pattern, reducing scattered fields on `Gui`.
 pub struct OverlayState<T> {
     pub data: T,
-    pub fetch_time: Option<std::time::Instant>,
+    pub fetch_time: Option<web_time::Instant>,
     pub fetching: bool,
     pub data_generation: u64,
 }
@@ -63,7 +63,7 @@ impl<T> OverlayState<T> {
     /// Replace the data and bump the generation counter.
     pub fn set_data(&mut self, data: T) {
         self.data = data;
-        self.fetch_time = Some(std::time::Instant::now());
+        self.fetch_time = Some(web_time::Instant::now());
         self.data_generation = self.data_generation.wrapping_add(1);
     }
 
@@ -166,7 +166,7 @@ pub trait OverlayHandler: Send {
     fn set_fetching(&mut self, fetching: bool);
 
     /// Timestamp of the last completed fetch.
-    fn fetch_time(&self) -> Option<std::time::Instant>;
+    fn fetch_time(&self) -> Option<web_time::Instant>;
 
     /// Auto-poll interval in seconds, or `None` if this overlay doesn't auto-poll.
     fn auto_poll_interval(&self) -> Option<u64> { None }
@@ -428,7 +428,7 @@ impl OverlayRegistry {
         }
     }
 
-    pub fn fetch_time(&self, kind: OverlayKind) -> Option<std::time::Instant> {
+    pub fn fetch_time(&self, kind: OverlayKind) -> Option<web_time::Instant> {
         self.handler(kind).and_then(|h| h.fetch_time())
     }
 

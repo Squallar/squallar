@@ -45,6 +45,11 @@ egui-wgpu = "=0.35.0"
 # Defaults off: rustdar-platform picks its own backend/clipboard feature set.
 egui-winit = { version = "=0.35.0", default-features = false }
 walkers = "=0.56.0"
+# Drop-in for `std::time`: re-exports the std types verbatim on native, and
+# backs them with `performance.now()` / `Date.now()` on wasm. `Instant::now()`
+# and `SystemTime::now()` both *panic* on wasm32-unknown-unknown, and they
+# compile fine, so nothing catches this until the page runs.
+web-time = "=1.1.0"
 wgpu = "=29.0.4"
 winit = "=0.30.13"
 

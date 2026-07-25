@@ -12,7 +12,6 @@ nexrad-data = { workspace = true }
 nexrad-model = { workspace = true }
 nexrad-decode = { workspace = true }
 nexrad-level3 = { workspace = true }
-rayon = "=1.11.0"
 # TLS backend comes from the workspace pin; nothing extra is needed here.
 reqwest = { workspace = true }
 thiserror = { workspace = true }
@@ -31,6 +30,11 @@ xml = "=1.2.1"
 # workspace's one C dependency -- into a graph that has no use for it.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rustls = { workspace = true }
+# wasm32-unknown-unknown is single-threaded: rayon compiles there but cannot
+# build a pool. `render.rs` carries a sequential fallback for the web arm.
+# rayon stays native because rasterization is the hot path on desktop -- this
+# is a cfg split, not a removal.
+rayon = "=1.11.0"
 
 [dev-dependencies]
 # Test-only: drives the `#[ignore]`d live TLS check in `tls`. Not linked into any

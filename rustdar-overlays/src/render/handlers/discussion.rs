@@ -130,7 +130,7 @@ impl OverlayHandler for SpcDiscussionHandler {
         self.state.fetching = fetching;
     }
 
-    fn fetch_time(&self) -> Option<std::time::Instant> {
+    fn fetch_time(&self) -> Option<web_time::Instant> {
         self.state.fetch_time
     }
 

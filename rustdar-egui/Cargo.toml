@@ -19,6 +19,7 @@ edition.workspace = true
 gps-serial = ["rustdar-gps/serial"]
 
 [dependencies]
+web-time = { workspace = true }
 rustdar-radar = { workspace = true }
 rustdar-overlays = { workspace = true }
 rustdar-units = { workspace = true }

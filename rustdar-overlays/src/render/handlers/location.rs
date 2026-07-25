@@ -30,7 +30,7 @@ impl OverlayHandler for UserLocationHandler {
     fn has_data(&self) -> bool { true }
     fn is_fetching(&self) -> bool { false }
     fn set_fetching(&mut self, _fetching: bool) {}
-    fn fetch_time(&self) -> Option<std::time::Instant> { None }
+    fn fetch_time(&self) -> Option<web_time::Instant> { None }
 
     fn apply_fetch_result(&mut self, _result: FetchPayload) {}
     fn retain_selections(&self, _selections: &mut Vec<Arc<dyn OverlayItem>>) {}

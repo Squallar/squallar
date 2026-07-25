@@ -169,7 +169,7 @@ impl super::App {
                         }
                         rustdar_egui::pane::LoopPhase::Ready | rustdar_egui::pane::LoopPhase::Paused => {
                             ls.phase = rustdar_egui::pane::LoopPhase::Playing;
-                            ls.last_advance = Some(std::time::Instant::now());
+                            ls.last_advance = Some(web_time::Instant::now());
                         }
                         _ => {}
                     }

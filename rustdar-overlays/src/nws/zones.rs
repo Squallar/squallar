@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::types::{GeoPolygon, HatchPattern, OverlayFeature};
@@ -8,12 +9,15 @@ use super::alert::NwsAlert;
 use super::colors::alert_color;
 
 /// TTL for cached zone geometries (1 year in seconds).
+#[cfg(not(target_arch = "wasm32"))]
 const CACHE_TTL_SECS: u64 = 365 * 24 * 3600;
 
 /// Guards first-per-session WARN log for zone cache write failures.
+#[cfg(not(target_arch = "wasm32"))]
 static CACHE_WRITE_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Log a cache write failure at WARN level the first time, then DEBUG.
+#[cfg(not(target_arch = "wasm32"))]
 fn log_cache_write_failure(msg: &str) {
     if CACHE_WRITE_WARNED
         .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
@@ -26,6 +30,7 @@ fn log_cache_write_failure(msg: &str) {
 }
 
 /// A cached zone geometry entry, serialized to JSON on disk.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedZone {
     /// Unix timestamp (seconds since epoch) when this entry was fetched.
@@ -231,9 +236,10 @@ fn parse_zone_polygons(json: &serde_json::Value, url: &str) -> Option<Vec<GeoPol
 // ── Disk cache helpers ───────────────────────────────────────────────────
 
 /// Current unix timestamp in seconds.
+#[cfg(not(target_arch = "wasm32"))]
 fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
@@ -241,6 +247,7 @@ fn unix_now() -> u64 {
 /// Extract a cache-friendly key from a NWS zone URL.
 ///
 /// E.g. `https://api.weather.gov/zones/county/TXC113` → `"county_TXC113"`.
+#[cfg(not(target_arch = "wasm32"))]
 fn zone_cache_key(url: &str) -> Option<String> {
     let trimmed = url.trim_end_matches('/');
     let mut parts = trimmed.rsplit('/');

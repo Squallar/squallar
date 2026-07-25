@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+web-time = { workspace = true }
 chrono = { workspace = true }
 earcutr = "=0.5.0"
 flate2 = { workspace = true }

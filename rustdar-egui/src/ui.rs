@@ -51,7 +51,7 @@ pub(super) struct RadarState {
 
 /// Auto-polling timer state.
 pub(super) struct AutoPollState {
-    last_fetch_time: Option<std::time::Instant>,
+    last_fetch_time: Option<web_time::Instant>,
     pub enabled: bool,
     initial_fetch_done: bool,
     interval_secs: u64,
@@ -60,7 +60,7 @@ pub(super) struct AutoPollState {
 impl AutoPollState {
     /// Record that a fetch was just dispatched.
     pub fn record_fetch(&mut self) {
-        self.last_fetch_time = Some(std::time::Instant::now());
+        self.last_fetch_time = Some(web_time::Instant::now());
     }
 
     /// Call when a scan loads successfully — resets backoff to the base interval.

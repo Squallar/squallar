@@ -172,7 +172,7 @@ pub struct LoopPlaybackState {
     /// Lookback duration in seconds that was requested.
     pub lookback_secs: u64,
     /// Instant of the last frame advance (for animation timing).
-    pub last_advance: Option<std::time::Instant>,
+    pub last_advance: Option<web_time::Instant>,
     /// NEXRAD site code the loop's geometry belongs to, captured at loop creation
     /// from the same lookup as `site_lat`/`site_lon`. Every frame in this loop is
     /// rendered and positioned with those coordinates, so this — not the pane's

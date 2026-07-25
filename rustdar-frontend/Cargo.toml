@@ -13,6 +13,7 @@ edition.workspace = true
 # crate. Adding a dependency back on rustdar-platform would be a cycle.
 
 [dependencies]
+web-time = { workspace = true }
 rustdar-egui = { workspace = true }
 rustdar-radar = { workspace = true }
 rustdar-overlays = { workspace = true }

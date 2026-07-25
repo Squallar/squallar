@@ -1,5 +1,58 @@
 use nexrad_model::data::{DataMoment, Radial, Scan};
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
+
+#[cfg(target_arch = "wasm32")]
+use seq_fallback::*;
+
+/// Sequential stand-ins for the two rayon entry points this module uses.
+///
+/// wasm32-unknown-unknown is single-threaded: rayon compiles there but cannot
+/// build a thread pool, so the parallel iterators are not an option. This keeps
+/// the *call sites* identical rather than cfg'ing four rasterization loops,
+/// which is what would actually rot — the loops are the hot path and the two
+/// copies would drift.
+///
+/// The closures need no changes: rayon requires `Fn + Send + Sync`, which is
+/// strictly stronger than the `FnMut` these want, so anything that satisfied
+/// rayon satisfies this.
+///
+/// Native keeps rayon. This is a cfg split, not a removal — radar
+/// rasterization is the hot path on desktop and a sequential fallback silently
+/// becoming the native arm would be a large regression that no test notices.
+#[cfg(target_arch = "wasm32")]
+mod seq_fallback {
+    /// Stands in for `rayon::prelude::ParallelSlice::par_iter`.
+    ///
+    /// Implemented on `[T]` only; `Vec<T>` reaches it through deref.
+    pub trait ParIterFallback<T> {
+        fn par_iter<'a>(&'a self) -> impl Iterator<Item = &'a T>
+        where
+            T: 'a;
+    }
+
+    impl<T> ParIterFallback<T> for [T] {
+        fn par_iter<'a>(&'a self) -> impl Iterator<Item = &'a T>
+        where
+            T: 'a,
+        {
+            self.iter()
+        }
+    }
+
+    /// Stands in for `rayon::iter::IntoParallelIterator::into_par_iter`.
+    pub trait IntoParIterFallback {
+        type Item;
+        fn into_par_iter(self) -> impl Iterator<Item = Self::Item>;
+    }
+
+    impl IntoParIterFallback for std::ops::Range<usize> {
+        type Item = usize;
+        fn into_par_iter(self) -> impl Iterator<Item = usize> {
+            self
+        }
+    }
+}
 use std::f64::consts::PI;
 use std::sync::atomic::{AtomicU32, Ordering};
 use crate::palette::get_color_for_value;

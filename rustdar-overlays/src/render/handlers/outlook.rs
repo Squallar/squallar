@@ -113,7 +113,7 @@ impl OverlayHandler for SpcOutlookHandler {
         self.state.fetching = fetching;
     }
 
-    fn fetch_time(&self) -> Option<std::time::Instant> {
+    fn fetch_time(&self) -> Option<web_time::Instant> {
         self.state.fetch_time
     }
 
@@ -146,7 +146,7 @@ impl OverlayHandler for SpcOutlookHandler {
             Ok(outlook) => {
                 log::info!("Received SPC outlook: {:?} {:?}", fetch.day, fetch.product);
                 self.state.data.insert((fetch.day, fetch.product), outlook);
-                self.state.fetch_time = Some(std::time::Instant::now());
+                self.state.fetch_time = Some(web_time::Instant::now());
                 let counter = self.per_product_generation
                     .entry((fetch.day, fetch.product))
                     .or_insert(0);

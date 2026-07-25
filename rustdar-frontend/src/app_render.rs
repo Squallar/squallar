@@ -881,7 +881,7 @@ impl super::App {
         }
 
         // Start all ready panes with the same instant and frame position
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         for idx in ready_panes {
             let pane = self.gui.pane_mut(idx).unwrap();
             let ls = &mut pane.loop_state;
@@ -896,7 +896,7 @@ impl super::App {
 
     /// Advance loop playback for all panes with active playing loops.
     fn advance_loop_playback(&mut self) {
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         let interval = std::time::Duration::from_secs_f32(1.0 / self.gui.loop_speed_fps);
 
         for pane_idx in 0..self.gui.pane_count() {
