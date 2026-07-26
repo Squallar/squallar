@@ -48,12 +48,9 @@
         height: 100%;
         outline: none;
         /*
-         * The app owns every gesture on the canvas, pinch included. winit sets
-         * no `touch-action` of its own and only calls `preventDefault()`, which
-         * for pointer events does not stop the browser claiming a two-finger
-         * gesture as page zoom — `touch-action` is the only mechanism that
-         * does. `user-scalable=no` in the meta viewport is not a substitute
-         * either; browsers vary in whether they honour it.
+         * The app owns every gesture, pinch included. winit sets no
+         * `touch-action` and only calls `preventDefault()`, which for pointer
+         * events does not stop the browser claiming two fingers as page zoom.
          */
         touch-action: none;
       }
