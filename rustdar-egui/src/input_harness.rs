@@ -413,6 +413,16 @@ impl InputHarness {
         self.warm_up();
     }
 
+    /// Say when the Level III object behind pane `idx`'s radar image was
+    /// written, as `apply_render_to_pane` does when a render lands.
+    pub(crate) fn set_level3_time(&mut self, idx: usize, written: Option<chrono::NaiveDateTime>) {
+        self.gui
+            .pane_mut(idx)
+            .unwrap_or_else(|| panic!("no pane {idx}"))
+            .level3_time = written;
+        self.warm_up();
+    }
+
     /// Every rect painted during the last frame, in paint order.
     pub(crate) fn painted_rects(&self) -> &[egui::Rect] {
         &self.last_rects
@@ -469,6 +479,44 @@ impl InputHarness {
     /// The rect the pane grid is laid out in, as `render_map` sees it.
     pub(crate) fn map_panel_rect(&self) -> egui::Rect {
         self.gui.map_panel_rect_for_test()
+    }
+
+    /// Pan pane `idx` until `site`'s icon is drawn at `target`, as dragging the
+    /// map there does.
+    ///
+    /// Solved with walkers' own [`walkers::Projector`], built from the pane's
+    /// live `MapMemory` and the rect the layout gave it — the same two inputs
+    /// `Map::show` builds the projector the icon is placed with from. A
+    /// hand-rolled Mercator here would be a second implementation, and the one
+    /// the test depends on would be the wrong one.
+    ///
+    /// `Projector::unproject` is anchored on the *current* centre, so the
+    /// centring pass below is not redundant: it is what makes the reflection
+    /// `2·centre − target` solve for the position that puts the site at
+    /// `target`.
+    pub(crate) fn place_site_at(&mut self, idx: usize, site: &str, target: egui::Pos2) {
+        let radar = rustdar_radar::sites::get_radar_site(site).expect("unknown radar site");
+        let geo = walkers::lat_lon(radar.lat, radar.lon);
+
+        self.gui
+            .pane_mut(idx)
+            .unwrap_or_else(|| panic!("no pane {idx}"))
+            .map_memory
+            .center_at(geo);
+        self.warm_up();
+
+        let rect = self.pane_rects()[idx];
+        let centre = rect.center();
+        let shifted = {
+            let memory = &self.gui.pane(idx).expect("pane vanished").map_memory;
+            let projector = walkers::Projector::new(rect, memory, geo);
+            projector.unproject(egui::vec2(
+                2.0 * centre.x - target.x,
+                2.0 * centre.y - target.y,
+            ))
+        };
+        self.gui.pane_mut(idx).unwrap().map_memory.center_at(shifted);
+        self.warm_up();
     }
 
     /// The color-scale legend strips painted inside `pane`, classified by the
@@ -923,8 +971,16 @@ mod tests {
     /// and a 600s backstop pass. These are absolute claims about the behaviour
     /// instead: a still hold must survive the first, and a pointer that has
     /// gone silent must not survive the second.
+    ///
+    /// They also have to be *close enough together to say something*. At 90s
+    /// the upper claim admitted any backstop up to a minute and a half, so
+    /// stretching the shipped minute to 75s left the suite green while the map
+    /// stayed hostage to a dead integration a quarter longer. The band below is
+    /// 45–70s around a shipped 60: comfortably clear of the longest hold a user
+    /// plausibly performs while reading a value, and short enough that "the map
+    /// comes back after about a minute" is a claim rather than a gesture.
     const HOLD_MUST_SURVIVE_S: f64 = 45.0;
-    const SILENCE_MUST_EXPIRE_S: f64 = 90.0;
+    const SILENCE_MUST_EXPIRE_S: f64 = 70.0;
 
     /// Long enough for a deferred single tap to be confirmed
     /// (`DOUBLE_TAP_TIMEOUT_S` is 0.4s).
@@ -1193,6 +1249,49 @@ mod tests {
         assert!(
             pressed.touch.suppress_pan,
             "10px between two taps is a double tap, not two singles"
+        );
+    }
+
+    /// 5c-ii. …and it closes. **The other conjunct of the same classifier.**
+    ///
+    ///     `handle_press` enters a zoom drag on `dt < DOUBLE_TAP_TIMEOUT_S &&
+    ///     dist < DOUBLE_TAP_DISTANCE_PX`. 5b fails only the distance conjunct
+    ///     and 5c satisfies both, so nothing failed *only* the timeout: widened
+    ///     to 0.5s the whole suite stayed green while a tap and an unrelated
+    ///     second tap half a second later silently became a zoom drag —
+    ///     the map jumping under a finger that was pointing at something.
+    ///
+    ///     Both taps land on the same pixel here, so the distance conjunct is
+    ///     satisfied throughout and only the timeout can decide. The pair
+    ///     straddles the bound, which is what pins it from both sides: a
+    ///     timeout shortened towards zero fails the first assertion, because
+    ///     two taps a third of a second apart are one ordinary double tap.
+    #[test]
+    fn the_double_tap_window_closes_between_two_unrelated_taps() {
+        /// Tap, sit still for `gap` seconds, then press again and hold.
+        /// Reports whether that second press entered a zoom drag.
+        fn a_second_press_after(gap: f64) -> bool {
+            let mut h = InputHarness::new();
+            let pos = h.map_center();
+
+            h.touch_tap(pos);
+            // One frame `gap` after the release, so the promotion inside
+            // `DoubleTapDragDetector::update` gets a frame to run on, exactly
+            // as an idle app does.
+            h.frame_after(gap);
+            h.touch_start(pos);
+            h.frame_after(FRAME_DT).touch.suppress_pan
+        }
+
+        assert!(
+            a_second_press_after(0.30),
+            "two taps a third of a second apart are one double tap — a user \
+             cannot double-tap faster than the timeout allows"
+        );
+        assert!(
+            !a_second_press_after(0.45),
+            "two taps nearly half a second apart are two taps: the second must \
+             pan the map, not zoom it"
         );
     }
 
@@ -3438,6 +3537,121 @@ mod tests {
         );
     }
 
+    /// A Level III product written `ago` before now.
+    ///
+    /// Offset by half a minute so the whole-minute truncation in
+    /// `format_product_age` cannot land on a boundary and read one lower while
+    /// the test runs.
+    fn written_ago(minutes: i64) -> chrono::NaiveDateTime {
+        chrono::Utc::now().naive_utc() - chrono::Duration::seconds(minutes * 60 + 30)
+    }
+
+    /// 26b. **A Level III product says how old it is.**
+    ///
+    ///      The scan line beside it is the *Level II* volume time and says
+    ///      nothing about a Level III object: the two come from different
+    ///      buckets, and `level3::latest_key` falls back to the previous UTC
+    ///      day, so a site that went down yesterday paints a field up to ~48h
+    ///      old under a scan line that looks perfectly current. Until this was
+    ///      drawn, the only place the age existed at all was a `log::info!`.
+    ///
+    ///      Asserted on the text egui laid out inside the bar's own rect, not
+    ///      just on the probe: a probe records what the renderer was handed,
+    ///      and the thing that matters is what reached the glass.
+    #[test]
+    fn a_level3_products_age_is_drawn_in_the_status_bar() {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.load_scan("KTLX");
+        assert_eq!(
+            h.status_bar().product_age_text,
+            None,
+            "precondition: a Level II pane has no product age to draw, so the \
+             line below is not simply always there"
+        );
+
+        h.set_level3_time(0, Some(written_ago(23)));
+
+        let bar = h.status_bar();
+        let drawn = bar
+            .product_age_text
+            .as_deref()
+            .expect("a pane showing a Level III product must report its age");
+        assert!(
+            drawn.starts_with("Level III:") && drawn.contains("(23 min old)"),
+            "the roomy bar should name the product and its age, got {drawn:?}"
+        );
+        assert!(
+            h.text_painted_in(bar.rect, "23 min old"),
+            "the age never reached the glass: nothing was painted inside the \
+             status bar rect {:?}. Painted: {:?}",
+            bar.rect,
+            h.painted_text_strings()
+        );
+
+        // Loop playback draws one of `loop_state`'s frames instead, chosen by
+        // the animation, so the static render's age would be a caption on
+        // someone else's picture.
+        h.gui_mut().pane_mut(0).unwrap().loop_state =
+            crate::pane::LoopPlaybackState::new_for_loop(
+                600,
+                rustdar_radar::sites::get_radar_site("KTLX").unwrap(),
+            );
+        h.warm_up();
+        assert_eq!(
+            h.status_bar().product_age_text,
+            None,
+            "a looping pane must not caption its animation with the static \
+             render's age"
+        );
+    }
+
+    /// 26c. **…and a day-old one reads as hours, not as 1,560 minutes.**
+    ///
+    ///      This is the case the line exists for. `level3::latest_key` falls
+    ///      back to the previous UTC day when today's prefix is empty, so the
+    ///      product a downed site serves is not a few minutes stale, it is
+    ///      most of a day — and a bar that only ever counted minutes would say
+    ///      so in a unit nobody reads at a glance.
+    #[test]
+    fn a_day_old_level3_product_reads_in_hours() {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.load_scan("KTLX");
+        h.set_level3_time(0, Some(written_ago(26 * 60 + 5)));
+
+        let bar = h.status_bar();
+        assert_eq!(
+            bar.product_age_text.as_deref().map(|t| t.contains("(26h 5m old)")),
+            Some(true),
+            "a 26-hour-old product must read in hours, got {:?}",
+            bar.product_age_text
+        );
+        assert!(
+            h.text_painted_in(bar.rect, "26h 5m old"),
+            "…and be painted: {:?}",
+            h.painted_text_strings()
+        );
+
+        // A narrow bar drops the date, as the scan line beside it does, but
+        // never the age — that is the whole message.
+        let mut phone = InputHarness::with_screen(egui::vec2(420.0, 900.0));
+        phone.load_scan("KTLX");
+        phone.set_level3_time(0, Some(written_ago(26 * 60 + 5)));
+        let compact = phone.status_bar();
+        let drawn = compact
+            .product_age_text
+            .as_deref()
+            .expect("a compact bar must still report the age");
+        assert!(
+            drawn.starts_with("L3 ") && drawn.contains("(26h 5m old)"),
+            "the compact form should be short and still carry the age, got \
+             {drawn:?}"
+        );
+        assert!(
+            !drawn.contains("Level III:"),
+            "the compact bar drew the roomy form: {drawn:?}"
+        );
+    }
+
     /// 16. A wide screen has a persistent sidebar and therefore no hamburger,
     ///     so nothing is excluded — the complement of the test above.
     #[test]
@@ -3666,6 +3880,130 @@ mod tests {
         );
     }
 
+    /// 32b. **The pane rect is what keeps a click off the map off the map.**
+    ///
+    ///      `is_pos_blocked`'s three conditions mask each other everywhere they
+    ///      normally meet, so each has to be reached alone. This is the
+    ///      pane-rect one: a site icon straddling the pane's bottom edge, and
+    ///      two clicks 10pt apart — one on the map, one in the status bar. The
+    ///      icon's own hit-test cannot tell them apart, and neither can the
+    ///      other two conditions (nothing is excluded on a wide screen, and a
+    ///      panel is a background layer), so only the pane rect stands between
+    ///      a click on the chrome and a radar site change.
+    ///
+    ///      `screen_rect.expand(100.0)` in `render_pane_map_content` is what
+    ///      makes this reachable at all: sites just off the pane are still
+    ///      drawn and still hit-tested, so "off the pane" is not implied by
+    ///      "not drawn".
+    #[test]
+    fn a_click_outside_the_pane_does_not_reach_a_site_icon_straddling_its_edge() {
+        let mut h = InputHarness::new();
+        h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+        h.warm_up();
+
+        let pane = h.pane_rects()[0];
+        let edge = egui::pos2(pane.center().x, pane.bottom());
+        h.place_site_at(0, "KTLX", edge);
+
+        // 5pt either side of the edge: both well inside an 18pt icon, so the
+        // icon hit-test says yes to both.
+        let on_map = edge - egui::vec2(0.0, 5.0);
+        let off_pane = edge + egui::vec2(0.0, 5.0);
+        let pane = h.pane_rects()[0];
+        assert!(pane.contains(on_map), "precondition: one click is on the pane");
+        assert!(!pane.contains(off_pane), "precondition: the other is not");
+        assert!(
+            h.screen_rect().contains(off_pane),
+            "precondition: the blocked click must still be on screen — this is \
+             a click on the chrome, not a click on nothing"
+        );
+        assert!(
+            h.map_excluded_rects().is_empty(),
+            "precondition: a wide screen excludes no floating chrome, so the \
+             excluded-rect condition cannot be what blocks this"
+        );
+        assert!(
+            !h.is_floating_layer_at(off_pane),
+            "precondition: the status bar is a background layer, so the layer \
+             condition cannot be what blocks this either"
+        );
+
+        h.mouse_click(on_map);
+        // `contains`, not equality: at this zoom the three Oklahoma City
+        // radars sit inside one icon of each other, and which of them also
+        // answers says nothing about the condition under test.
+        assert!(
+            site_switches(&h).contains(&("KTLX".to_owned(), 0)),
+            "control: the icon really is under both clicks — if this fails the \
+             site was never placed and the assertion below is vacuous. Got {:?}",
+            site_switches(&h)
+        );
+
+        h.mouse_click(off_pane);
+        assert_eq!(
+            site_switches(&h),
+            vec![],
+            "a click in the status bar switched the radar site: the map is \
+             hit-testing chrome"
+        );
+    }
+
+    /// 32c. **A dialog over a site icon takes its hover readout away.**
+    ///
+    ///      The layer condition, reached alone — and reachable only through
+    ///      *hover*: a click is already stripped upstream by
+    ///      `ui_input::filter_dialog_blocked`, so with the layer check deleted
+    ///      from `is_pos_blocked` every click test still passes. Hover has no
+    ///      such pre-filter; `pointer_hover_pos()` is read raw.
+    ///
+    ///      Asserted on the readout that was painted, not on a flag: the site
+    ///      readout is the thing a user sees follow the cursor through a
+    ///      dialog, and it is the same `Area` that once claimed `layer_id_at`
+    ///      and ate the click behind it.
+    #[test]
+    fn a_dialog_over_a_site_icon_suppresses_its_hover_readout() {
+        let mut h = InputHarness::new();
+        h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+        h.warm_up();
+        // Put the icon where a modal dialog lands, so one hover position
+        // serves both halves.
+        let target = h.screen_center();
+        h.place_site_at(0, "KTLX", target);
+        assert!(
+            h.pane_rects()[0].contains(target),
+            "precondition: the icon is on the pane, so the pane-rect condition \
+             cannot be what blocks the hover"
+        );
+        assert!(
+            h.map_excluded_rects().is_empty(),
+            "precondition: nothing is excluded on a wide screen either"
+        );
+
+        h.mouse_move(target);
+        h.frames_for(3, FRAME_DT);
+        assert!(
+            h.painted_text_strings().iter().any(|t| t.contains("KTLX\nLat:")),
+            "control: hovering the icon must draw the site readout, or the \
+             assertion below passes for free. Painted: {:?}",
+            h.painted_text_strings()
+        );
+
+        h.gui_mut().show_settings = true;
+        h.warm_up();
+        assert!(
+            h.is_floating_layer_at(target),
+            "precondition: the settings dialog must cover the icon"
+        );
+
+        h.mouse_move(target);
+        h.frames_for(3, FRAME_DT);
+        assert!(
+            !h.painted_text_strings().iter().any(|t| t.contains("KTLX\nLat:")),
+            "the site readout came up through an open dialog: the map is \
+             hovering what the dialog is covering"
+        );
+    }
+
     /// 33. **A dropdown's collapsed box says what its open list says.**
     ///
     ///     `ControlItem::Dropdown` carries `(value, display_label)` pairs. The
@@ -3815,6 +4153,154 @@ mod tests {
             &[] as &[egui::Rect],
             "egui saw a widget rect come back under a different id when the \
              scan arrived: everything it remembers under those ids is discarded"
+        );
+    }
+
+    /// 34b. **Crossing 600pt re-keys the status bar, and nothing else.**
+    ///
+    ///      The menu bar going away advances the root `Ui`'s auto-id counter
+    ///      one step less, and `Ui::new_child` folds that counter into every
+    ///      child scope's `unique_id` — `id_salt` moves only the *stable* id —
+    ///      so the status-bar panel and the widgets keyed off its counter come
+    ///      back under new ids on the far side. **This is deliberate and
+    ///      costs nothing**; see the "Ids do not depend on the breakpoint"
+    ///      note in `ui_chrome.rs` for why, and why there is no fix that is
+    ///      not worse.
+    ///
+    ///      What this pins is the *extent* of it. egui's own marker says which
+    ///      rects moved, so if the shift ever reaches a widget outside the
+    ///      status bar — where something does store state across frames — this
+    ///      fails rather than being noticed by someone re-deriving the whole
+    ///      mechanism a third time. If it fails because the list came back
+    ///      empty, the shift is gone and the note in `ui_chrome.rs` can go
+    ///      with it.
+    #[test]
+    fn crossing_the_menu_bar_breakpoint_re_keys_only_the_status_bar() {
+        // Above 600pt, and narrow enough to have no sidebar either side of the
+        // crossing, so the layers panel is the drawer both times.
+        let mut h = InputHarness::with_screen(egui::vec2(750.0, 600.0));
+        h.set_drawer_open(true);
+        h.load_scan("KTLX");
+        assert!(
+            h.width_class().has_menu_bar(),
+            "precondition: start above the menu-bar breakpoint"
+        );
+
+        // Real stored state behind a real widget id, so "nothing was lost" is
+        // a claim about something rather than about an empty set.
+        let probes = h.widget_id_probes();
+        let scroll_id = probes
+            .iter()
+            .find(|(name, _)| *name == "layers_scroll")
+            .expect("precondition: the scroll area must report an id")
+            .1;
+        h.scroll_at(egui::pos2(80.0, 400.0), egui::vec2(0.0, -120.0));
+        h.frames_for(3, FRAME_DT);
+        let scrolled = h.scroll_offset(scroll_id);
+        assert!(
+            scrolled.is_some_and(|o| o.y > 0.0),
+            "precondition: the layers panel must have scrolled, got {scrolled:?}"
+        );
+
+        h.clear_id_changes();
+        h.set_screen(egui::vec2(550.0, 600.0));
+        h.set_drawer_open(true);
+        assert_eq!(
+            h.width_class(),
+            crate::ui_layout::WidthClass::Compact,
+            "precondition: the resize crossed the 600pt breakpoint"
+        );
+
+        let moved = h.id_changes().to_vec();
+        assert!(
+            !moved.is_empty(),
+            "no widget id moved across the breakpoint at all — if that is a \
+             fix rather than a probe that stopped reading, delete this test \
+             and the note in `ui_chrome.rs` with it"
+        );
+        let bar = h.status_bar().rect;
+        for rect in &moved {
+            assert!(
+                bar.contains_rect(*rect),
+                "a widget outside the status bar ({rect:?}) changed id across \
+                 the breakpoint; the bar is {bar:?}. Everything egui remembers \
+                 under that id is discarded on every resize past 600pt"
+            );
+        }
+
+        // ...and it cost nothing: the ids that key stored state are the same
+        // ids, and the state stored under them is still there.
+        assert_eq!(
+            probes,
+            h.widget_id_probes(),
+            "a widget id that keys stored state moved with the layout"
+        );
+        assert_eq!(
+            h.scroll_offset(scroll_id),
+            scrolled,
+            "the scroll position did not survive the breakpoint"
+        );
+    }
+
+    /// 34c. **An error on screen keeps its id while the row moves around it.**
+    ///
+    ///      [`a_scan_arriving_moves_no_widget_id`] fixed and pinned the *empty*
+    ///      half of this hazard — a slot allocated with nothing in it. The
+    ///      occupied half survived, and nothing in the suite ever put an error
+    ///      on screen to see it: the slot is right-aligned, so when there
+    ///      really is an error its rect is welded to the row's edge while
+    ///      everything to its left comes and goes, and the slot plus all three
+    ///      widgets inside it come back under new ids. Two things move it — the
+    ///      auto-poll block when a scan lands, and the Level III age line when
+    ///      a render does — so both are driven here.
+    #[test]
+    fn an_error_on_screen_keeps_its_id_while_the_row_changes_around_it() {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.gui_mut().set_error("boom".to_owned());
+        // `set_error` ends the fetch, so put it back: the transition under test
+        // is the auto-poll spinner (three widgets) becoming the checkbox (one).
+        h.gui_mut().set_fetching(true);
+        h.warm_up();
+        assert!(
+            h.status_bar().auto_poll.is_none(),
+            "precondition: a fetch must be in flight, so the bar is showing the \
+             spinner rather than the checkbox"
+        );
+        assert!(
+            h.painted_text_strings().iter().any(|t| t == "boom"),
+            "precondition: the error must be on screen, or the slot under test \
+             is not allocated at all"
+        );
+
+        h.clear_id_changes();
+        h.load_scan("KTLX");
+        assert!(
+            h.status_bar().auto_poll.is_some(),
+            "precondition: the scan must have cleared the fetch, or nothing to \
+             the left of the error changed"
+        );
+        assert!(
+            h.painted_text_strings().iter().any(|t| t == "boom"),
+            "precondition: the error must still be on screen after the scan"
+        );
+        assert_eq!(
+            h.id_changes(),
+            &[] as &[egui::Rect],
+            "a scan arriving re-keyed the error slot: its rect is pinned to the \
+             row's right edge while its id follows the widget count to its left"
+        );
+
+        // …and the same slot, moved by the other neighbour.
+        h.clear_id_changes();
+        h.set_level3_time(0, Some(written_ago(5)));
+        assert!(
+            h.status_bar().product_age_text.is_some(),
+            "precondition: the age line must have appeared, or nothing moved"
+        );
+        assert_eq!(
+            h.id_changes(),
+            &[] as &[egui::Rect],
+            "the Level III age line appearing re-keyed the error slot"
         );
     }
 

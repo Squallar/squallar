@@ -215,3 +215,115 @@ pub(super) fn draw_label_tiles_overlay(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SCREEN: egui::Vec2 = egui::vec2(800.0, 600.0);
+    /// The pane, inset from the viewport on every side, so "outside the pane"
+    /// and "off the screen" are different places.
+    const PANE: egui::Rect =
+        egui::Rect::from_min_max(egui::pos2(200.0, 80.0), egui::pos2(760.0, 520.0));
+
+    /// A real context with a real floating `Area` at `dialog`, run for two
+    /// passes so the area is registered whichever visibility rule egui applies.
+    ///
+    /// A hand-built `LayerId` would not do: `layer_id_at` answers out of
+    /// `Areas`, which only `Area::show` writes to, so a fake would make the
+    /// layer disjunct untestable in exactly the way that lets it be deleted.
+    fn ctx_with_dialog(dialog: Option<egui::Rect>) -> egui::Context {
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN)),
+                ..Default::default()
+            });
+            if let Some(rect) = dialog {
+                egui::Area::new(egui::Id::new("a_dialog"))
+                    .order(egui::Order::Middle)
+                    .fixed_pos(rect.min)
+                    .interactable(true)
+                    .show(&ctx, |ui| {
+                        ui.allocate_exact_size(rect.size(), egui::Sense::click());
+                    });
+            }
+            let _ = ctx.end_pass();
+        }
+        ctx
+    }
+
+    /// Each of the three conditions must block **on its own**.
+    ///
+    /// They mask each other in the app, which is why this is claimed here
+    /// rather than only through the UI: the hamburger is both an excluded rect
+    /// *and* a floating layer, so deleting either check leaves a tap on it
+    /// still caught, and a click on a dialog is already stripped upstream by
+    /// `ui_input::filter_dialog_blocked` before this ever sees it. Each row
+    /// below satisfies exactly one condition, so it fails if and only if that
+    /// one stops doing its job.
+    ///
+    /// The two that *can* be reached end to end are also driven through the
+    /// real UI — see `input_harness`'s
+    /// `a_click_outside_the_pane_does_not_reach_a_site_icon_straddling_its_edge`
+    /// and `a_dialog_over_a_site_icon_suppresses_its_hover_readout`.
+    #[test]
+    fn each_condition_blocks_a_position_on_its_own() {
+        let clear = egui::pos2(400.0, 300.0);
+        assert!(PANE.contains(clear), "fixture: the control point is on the pane");
+
+        let excluded = egui::Rect::from_min_size(egui::pos2(220.0, 100.0), egui::vec2(48.0, 48.0));
+        let on_excluded = excluded.center();
+        let dialog = egui::Rect::from_min_size(egui::pos2(500.0, 350.0), egui::vec2(120.0, 90.0));
+        let on_dialog = dialog.center();
+        // Outside the pane but still on screen: the sidebar / status-bar case.
+        let off_pane = egui::pos2(100.0, 300.0);
+
+        let bare = ctx_with_dialog(None);
+        let with_dialog = ctx_with_dialog(Some(dialog));
+
+        assert!(
+            !is_pos_blocked(&bare, clear, PANE, &[]),
+            "a plain spot on the map must not be blocked, or every row below \
+             passes for free"
+        );
+
+        assert!(
+            is_pos_blocked(&bare, off_pane, PANE, &[]),
+            "a position outside the pane must be blocked by the pane check \
+             alone: nothing is excluded and no layer floats over it"
+        );
+
+        assert!(
+            !bare.layer_id_at(on_excluded).is_some_and(|l| l.order > egui::Order::Background),
+            "fixture: nothing floats over the excluded rect, so only the \
+             excluded-rect check can block it"
+        );
+        assert!(
+            is_pos_blocked(&bare, on_excluded, PANE, &[excluded]),
+            "a position on an excluded rect must be blocked by the excluded-rect \
+             check alone"
+        );
+        assert!(
+            !is_pos_blocked(&bare, on_excluded, PANE, &[]),
+            "…and only because it was excluded: the same point with an empty \
+             list must fall through"
+        );
+
+        assert!(
+            PANE.contains(on_dialog),
+            "fixture: the dialog sits over the pane, so only the layer check \
+             can block it"
+        );
+        assert!(
+            is_pos_blocked(&with_dialog, on_dialog, PANE, &[]),
+            "a position on a floating layer must be blocked by the layer check \
+             alone"
+        );
+        assert!(
+            !is_pos_blocked(&bare, on_dialog, PANE, &[]),
+            "…and only because of the layer: with no dialog open the same point \
+             is ordinary map"
+        );
+    }
+}

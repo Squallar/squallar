@@ -464,6 +464,42 @@ impl RenderDispatcher {
             .map(|(_, msg)| Arc::clone(msg))
     }
 
+    /// Record on `pane` how old the Level III object behind `render` is, so the
+    /// status bar can say. `None` for a Level II product, which has no
+    /// `ProductStamp` and whose age is the scan time the bar already shows.
+    ///
+    /// Three values have to agree for the answer to mean anything — the
+    /// product and elevation of *this* render, and the site of *this* pane —
+    /// and they are read here rather than by the caller, which is what makes a
+    /// pane that took this image from a sibling's broadcast report the image's
+    /// age rather than whatever it was showing before.
+    ///
+    /// Assigned unconditionally, so switching a pane to a Level II product
+    /// clears the last Level III object's age rather than leaving it captioning
+    /// a field it does not describe.
+    ///
+    /// Resolved through [`nearest_tilt`](Self::nearest_tilt) — the same
+    /// selection the render was spawned from — rather than being handed to
+    /// `spawn_render` and carried back up the render thread. A value that is
+    /// only *passed along* cannot be tested at the point it is passed, and
+    /// `try_spawn_level3_render` has no test callers by design; see its note,
+    /// and `storm_motion_for`'s.
+    ///
+    /// The cost is one render's worth of latency in the other direction: if a
+    /// newer object for this tilt lands while the render is in flight, this
+    /// reports the newer stamp for the frame or two before the re-render it
+    /// triggered arrives. `poll_level3_results` clears `last_rendered` for
+    /// every pane on the site, so that re-render is already queued.
+    pub fn stamp_pane_with_product_age(
+        &self,
+        pane: &mut rustdar_egui::pane::PaneState,
+        render: &CachedPaneRender,
+    ) {
+        pane.level3_time = self
+            .nearest_tilt(render.product, &pane.site, render.elevation)
+            .and_then(|tilt| tilt.stamp.time);
+    }
+
     /// The storm motion vector to apply to `velocity`: the user's if they set
     /// one, otherwise the vector belonging to the volume `velocity` itself came
     /// from, and only failing that the newest one seen. Every tilt goes through
@@ -1158,6 +1194,121 @@ mod srm_dispatch_tests {
             .storm_motion_for("KMPX", &velocity_from(9999))
             .expect("an unknown volume falls back");
         assert_eq!(unseen.volume, Some(next), "the fallback is the newest, not an arbitrary one");
+    }
+
+    /// A pane-sized render of `product` at `elevation`. Only the two fields
+    /// the age lookup reads carry anything.
+    fn rendered(product: RadarProduct, elevation: f32) -> CachedPaneRender {
+        CachedPaneRender {
+            image_data: Arc::new(Vec::new()),
+            max_range_km: 230.0,
+            value_data: Arc::new(Vec::new()),
+            product,
+            elevation,
+        }
+    }
+
+    /// A pane on `site`, as `apply_render_to_pane` hands one over.
+    fn pane_on(site: &str) -> rustdar_egui::pane::PaneState {
+        rustdar_egui::pane::PaneState::with_site(site.to_string())
+    }
+
+    /// The age a pane is stamped with belongs to **the tilt it is showing**.
+    ///
+    /// `level3::latest_key` falls back to the previous UTC day, so the object a
+    /// downed site serves can be most of a day old while the Level II scan line
+    /// beside it looks current — that is the whole reason the pane draws an age
+    /// at all. A lookup that answered with the site's *newest* stamp, or with
+    /// the first entry the map happened to iterate, would caption a stale field
+    /// with a fresh time and be worse than drawing nothing.
+    ///
+    /// Every tilt is given a distinct stamp, so a reader tied to any one of
+    /// them fails on the others. `1.9°` is the discriminating request: VCP
+    /// 212's real cuts put it nearer 2.4° than 1.3°, so an implementation that
+    /// resolved the tilt any other way lands on a different stamp.
+    #[test]
+    fn a_render_stamps_its_pane_with_the_age_of_the_tilt_it_chose() {
+        let mut d = RenderDispatcher::new();
+        // Minute `nn` in the key, per tilt — nothing else about the fixtures
+        // differs, so only the tilt selection can decide which comes back.
+        let stamps = [("N0G", 11u32), ("N1G", 22), ("N2U", 33), ("N3U", 44)];
+        for (code, product_code, tenths, elev_num, ps) in SRM_FIXTURE {
+            let mut p = product(product_code, tenths, elev_num, 7108, ps);
+            if let Some((_, minute)) = stamps.iter().find(|(c, _)| *c == code) {
+                p.stamp = ProductStamp::from_key(format!("MPX_{code}_2026_07_26_01_{minute}_00"));
+            }
+            cache(&mut d, RadarProduct::StormRelativeVelocity, code, "KMPX", p);
+        }
+
+        let minute_at = |elevation: f32| {
+            let mut pane = pane_on("KMPX");
+            d.stamp_pane_with_product_age(
+                &mut pane,
+                &rendered(RadarProduct::StormRelativeVelocity, elevation),
+            );
+            pane.level3_time.map(|t| chrono::Timelike::minute(&t))
+        };
+        assert_eq!(minute_at(0.5), Some(11), "0.5° is N0G");
+        assert_eq!(minute_at(1.3), Some(22), "1.3° is N1G");
+        assert_eq!(minute_at(2.4), Some(33), "2.4° is N2U");
+        assert_eq!(minute_at(3.1), Some(44), "3.1° is N3U");
+        assert_eq!(
+            minute_at(1.9),
+            Some(33),
+            "1.9° belongs to the 2.4° cut, so it must carry that cut's stamp",
+        );
+
+        // The pane's *own* site, not any site with a tilt cached: two panes
+        // showing the same product on different radars must not share an age.
+        let mut elsewhere = pane_on("KTLX");
+        d.stamp_pane_with_product_age(
+            &mut elsewhere,
+            &rendered(RadarProduct::StormRelativeVelocity, 0.5),
+        );
+        assert_eq!(
+            elsewhere.level3_time, None,
+            "another site's tilts are not this pane's",
+        );
+
+        // …and a Level II render clears it rather than leaving the Level III
+        // age captioning a volume it has nothing to do with.
+        let mut switched = pane_on("KMPX");
+        d.stamp_pane_with_product_age(
+            &mut switched,
+            &rendered(RadarProduct::StormRelativeVelocity, 0.5),
+        );
+        assert!(switched.level3_time.is_some(), "precondition: it was dated");
+        d.stamp_pane_with_product_age(&mut switched, &rendered(RadarProduct::Reflectivity, 0.5));
+        assert_eq!(
+            switched.level3_time, None,
+            "a Level II product has no ProductStamp at all",
+        );
+    }
+
+    /// A key whose tail does not parse is an **unknown** age, not a fresh one.
+    ///
+    /// `ProductStamp::time` is `None` there, and the pane draws no age line —
+    /// which is the honest answer. Reporting the epoch, or silently falling
+    /// back to now, would both claim something the key does not say.
+    #[test]
+    fn an_unreadable_key_reports_no_age_rather_than_a_wrong_one() {
+        let mut d = RenderDispatcher::new();
+        let mut p = product(154, 5, 1, 7108, VELOCITY_PS);
+        p.stamp = ProductStamp::from_key("not-a-key");
+        cache(&mut d, RadarProduct::StormRelativeVelocity, "N0G", "KMPX", p);
+
+        assert!(
+            d.nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", 0.5)
+                .is_some(),
+            "precondition: the tilt is still drawn — an unreadable key is worth \
+             rendering, just not worth dating",
+        );
+        let mut pane = pane_on("KMPX");
+        d.stamp_pane_with_product_age(
+            &mut pane,
+            &rendered(RadarProduct::StormRelativeVelocity, 0.5),
+        );
+        assert_eq!(pane.level3_time, None);
     }
 
     /// The history is bounded and keyed on the volume, so a long session cannot

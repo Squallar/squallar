@@ -45,14 +45,32 @@ pub(crate) struct PaneOptionProbe {
 
 /// What the status bar drew, rather than the flags that decided it.
 #[cfg(test)]
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StatusBarProbe {
     /// The scan summary text, verbatim — long or short form.
     pub scan_text: String,
+    /// The Level III product age line, when one was drawn.
+    pub product_age_text: Option<String>,
     /// The auto-poll checkbox's rect, when one was drawn.
     pub auto_poll: Option<egui::Rect>,
     /// Whether the hover readout was drawn.
     pub hover: bool,
+    /// The rect the panel actually claimed, straight off its own response —
+    /// not the bottom slice of the screen worked out a second time.
+    pub rect: egui::Rect,
+}
+
+#[cfg(test)]
+impl Default for StatusBarProbe {
+    fn default() -> Self {
+        Self {
+            scan_text: String::new(),
+            product_age_text: None,
+            auto_poll: None,
+            hover: false,
+            rect: egui::Rect::NOTHING,
+        }
+    }
 }
 
 /// Radar fetch lifecycle state.

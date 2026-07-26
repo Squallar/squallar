@@ -25,6 +25,46 @@
 //! crossed a breakpoint. The two old files had exactly that hazard latent in
 //! them: `"d_"`/`"m_"` control prefixes and `layers_panel`/`mobile_layers_panel`
 //! could never collide only because the two files were never compiled together.
+//!
+//! ## …but the status bar's *positional* id does, and that is fine
+//!
+//! Crossing 600pt makes the menu-bar panel appear or vanish, which advances the
+//! root `Ui`'s auto-id counter one step more or less before the status bar is
+//! shown. egui's `Ui::new_child` computes `unique_id = stable_id.with(parent's
+//! next_auto_id_salt)` (`egui-0.35.0/src/ui.rs:255`), so that counter folds into
+//! every child scope's registered id **regardless of salting** — `Panel` builds
+//! its `Ui` with `id_salt`, which moves only `stable_id`. So the status-bar
+//! panel, and the widgets whose auto-ids run off its counter, come back under
+//! new ids on the far side of the breakpoint, and egui's debug check reports two
+//! rects in the bar as `changed id between passes`.
+//!
+//! **Decision: leave it.** It costs no widget state, and there is no fix here
+//! that is not worse:
+//!
+//! * `unique_id` is documented by egui as deliberately non-stable — "it can
+//!   change if new widgets are added or removed prior to this one… should
+//!   therefore only be used for transient interactions (clicks etc), not for
+//!   storing state over time" (`ui.rs:346`). Everything that *does* persist —
+//!   `ScrollArea`, `ComboBox`, panel sizes — keys on `make_persistent_id`, i.e.
+//!   `Ui::id()`, i.e. `stable_id`, which does not move. That is what
+//!   `crossing_a_breakpoint_does_not_move_any_widget_id` checks, and it is green
+//!   for real reasons, not because the check is shadowed.
+//! * Nothing in this bar stores anything under an auto-id anyway: the refresh
+//!   button and the separators are stateless, and the auto-poll checkbox writes
+//!   to `AutoPollState`. The worst observable cost is a tooltip or a half-made
+//!   click on the refresh button being dropped on the single frame of a resize —
+//!   which needs the pointer to be holding that button while the window is
+//!   being resized.
+//! * Making it stable would mean keeping the counter identical either side,
+//!   i.e. allocating a menu-bar scope that draws nothing below 600pt. That is
+//!   precisely the always-allocated empty child `Ui` removed from
+//!   `render_status_bar` below, and the pattern egui's own check flags. `Panel`
+//!   offers no explicit-id form (`UiBuilder::id` exists, `Panel` does not use
+//!   it), so the alternative is patching egui.
+//!
+//! `crossing_the_menu_bar_breakpoint_re_keys_only_the_status_bar` holds the
+//! *extent* of this: the shift must stay inside the status bar, where nothing is
+//! stored, and the ids that key stored state must not move.
 
 use crate::actions::GuiAction;
 use crate::ui_layout::{PointerModality, WidthClass};
@@ -175,7 +215,7 @@ impl super::Gui {
         #[cfg(test)]
         let mut probe = super::StatusBarProbe::default();
 
-        egui::Panel::bottom("status_bar")
+        let panel = egui::Panel::bottom("status_bar")
             .show_separator_line(true)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -221,6 +261,24 @@ impl super::Gui {
                     #[cfg(not(test))]
                     let _ = scan_text;
 
+                    // The Level II scan time above says nothing about a Level
+                    // III product's age — they come from different objects,
+                    // and the Level III one can be a day older. Drawn only
+                    // when there is one, so a Level II pane keeps the bar it
+                    // always had.
+                    let age_text = render_product_age(
+                        ui,
+                        self.panes.get(self.active_pane),
+                        &self.preferences,
+                        roomy,
+                    );
+                    #[cfg(test)]
+                    {
+                        probe.product_age_text = age_text;
+                    }
+                    #[cfg(not(test))]
+                    let _ = age_text;
+
                     if has_hover {
                         ui.separator();
                         render_hover_info(ui, &self.panes);
@@ -242,9 +300,22 @@ impl super::Gui {
                     // the auto-poll block above (three widgets mid-fetch, one
                     // otherwise) re-keyed this slot on the frame a scan landed,
                     // which egui reports as `changed id between passes`.
+                    //
+                    // Skipping the allocation fixes the *empty* case only. When
+                    // there really is an error the same slot is still welded to
+                    // the right edge while everything to its left comes and
+                    // goes — the auto-poll block, and now the Level III age —
+                    // so its rect stays put while its id moves, and its three
+                    // widgets go with it (their auto-ids run off this scope's
+                    // `unique_id`). `UiBuilder::id` is the one form that takes
+                    // `IdSource::Explicit`, which makes `unique_id ==
+                    // stable_id` and takes the parent's counter out of it
+                    // entirely. Salting cannot do this.
                     if self.radar.error_message.is_some() {
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
+                        ui.scope_builder(
+                            egui::UiBuilder::new()
+                                .id(ui.id().with("status_error"))
+                                .layout(egui::Layout::right_to_left(egui::Align::Center)),
                             |ui| {
                                 render_error_display(ui, &mut self.radar.error_message);
                             },
@@ -255,8 +326,11 @@ impl super::Gui {
 
         #[cfg(test)]
         {
+            probe.rect = panel.response.rect;
             self.last_status_bar = probe;
         }
+        #[cfg(not(test))]
+        let _ = panel;
     }
 
     /// The layers panel, in whichever of its two forms this width calls for.
@@ -404,6 +478,61 @@ fn render_scan_info(
     text
 }
 
+/// How old a Level III product is, in words.
+///
+/// Whole minutes below an hour and `Nh Mm` above it — a volume takes four to
+/// six minutes, so minutes are the unit that tells "this volume" from "the one
+/// before", and hours are the unit that tells a live field from the previous
+/// UTC day's that `level3::latest_key` falls back to.
+///
+/// A key stamped in the future is not clamped to zero: `ProductStamp::age`
+/// deliberately keeps the sign so "impossible" stays distinguishable from
+/// "fresh", and a bar that rounded it away would report a clock skew as a
+/// current product.
+pub(super) fn format_product_age(age: chrono::Duration) -> String {
+    if age < chrono::Duration::zero() {
+        return "stamped ahead".to_owned();
+    }
+    let minutes = age.num_minutes();
+    if minutes < 60 {
+        format!("{minutes} min old")
+    } else {
+        format!("{}h {}m old", minutes / 60, minutes % 60)
+    }
+}
+
+/// The Level III product line: when the object behind the pane's radar image
+/// was written, and how long ago that was. Returns the text it drew, or `None`
+/// when there was nothing to draw.
+///
+/// Suppressed during loop playback: the frame on screen then is one of
+/// [`PaneState::loop_state`]'s, chosen by the animation, and `level3_time`
+/// describes the *static* render it replaced.
+fn render_product_age(
+    ui: &mut egui::Ui,
+    pane: Option<&PaneState>,
+    prefs: &UserPreferences,
+    roomy: bool,
+) -> Option<String> {
+    let pane = pane?;
+    if pane.loop_state.is_active() {
+        return None;
+    }
+    let written = pane.level3_time?;
+    let age = format_product_age(chrono::Utc::now().naive_utc() - written);
+    let text = if roomy {
+        format!(
+            "Level III: {} ({age})",
+            prefs.timezone.format_naive_utc(written, "%Y-%m-%d %H:%M:%S")
+        )
+    } else {
+        format!("L3 {} ({age})", prefs.timezone.format_naive_utc(written, "%H:%M"))
+    };
+    ui.separator();
+    ui.label(&text);
+    Some(text)
+}
+
 fn render_hover_info(ui: &mut egui::Ui, panes: &[PaneState]) {
     let hover_info = panes.iter().find_map(|p| p.hover_value.as_ref());
     let overlay_hover = panes.iter().find_map(|p| p.overlay_hover_value.as_ref());
@@ -431,5 +560,27 @@ fn render_error_display(ui: &mut egui::Ui, error_message: &mut Option<String>) {
     }
     if dismiss {
         *error_message = None;
+    }
+}
+
+#[cfg(test)]
+mod age_format {
+    use super::format_product_age;
+    use chrono::Duration;
+
+    // The negative branch is only reachable through a clock skew, so no UI test
+    // arrives at it. Without this, "-5 min old" renders and reads as fresh.
+    #[test]
+    fn a_stamp_from_the_future_is_not_reported_as_an_age() {
+        assert_eq!(format_product_age(Duration::minutes(-5)), "stamped ahead");
+        assert_eq!(format_product_age(Duration::seconds(-1)), "stamped ahead");
+    }
+
+    #[test]
+    fn minutes_below_an_hour_then_hours_above_it() {
+        assert_eq!(format_product_age(Duration::zero()), "0 min old");
+        assert_eq!(format_product_age(Duration::minutes(59)), "59 min old");
+        assert_eq!(format_product_age(Duration::minutes(60)), "1h 0m old");
+        assert_eq!(format_product_age(Duration::minutes(1565)), "26h 5m old");
     }
 }

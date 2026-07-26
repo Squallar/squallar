@@ -260,6 +260,12 @@ impl super::App {
             max_lon: bounds.max_lon,
         };
         let pane = self.gui.pane_mut(pane_idx).unwrap();
+        // The lookup and the assignment are inside the callee, which the
+        // dispatcher's own tests drive; this call is the one hop nothing
+        // covers, along with everything else in this function — `App::new`
+        // wants a `PlatformBridge` and this wants a texture upload, so there
+        // is no harness here to reach it from.
+        self.render.stamp_pane_with_product_age(pane, render);
         let cache = pane.overlay_cache_mut(OverlayKind::Radar);
         cache.current = Some(OverlayTextureData {
             texture,

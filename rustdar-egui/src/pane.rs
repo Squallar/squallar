@@ -208,6 +208,17 @@ pub struct PaneState {
     pub site: String,
     /// Product/elevation metadata for this pane's site.
     pub scan_info: Option<ScanInfo>,
+    /// When the Level III object behind this pane's current radar image was
+    /// written (UTC), from its [`rustdar_radar::level3::ProductStamp`].
+    ///
+    /// `None` for a Level II render and for a key whose tail does not parse.
+    /// Written on every render that reaches the pane, so switching to Level II
+    /// clears it rather than leaving the last Level III product's age on
+    /// screen. It is the age of *what is drawn*, not of the newest object in
+    /// the cache: `level3::latest_key` falls back to the previous UTC day, so
+    /// a site down since yesterday paints a field up to ~48 h old over a live
+    /// basemap and nothing else on screen says so.
+    pub level3_time: Option<NaiveDateTime>,
     pub selected_product: RadarProduct,
     pub selected_elevation: f32,
     /// Whether this pane is viewing the latest (live) data.
@@ -589,6 +600,7 @@ impl PaneState {
         Self {
             site,
             scan_info: None,
+            level3_time: None,
             selected_product: RadarProduct::Reflectivity,
             selected_elevation: 0.0,
             viewing_live: true,
