@@ -47,9 +47,42 @@ mod seq_fallback {
             self
         }
     }
+
+    /// Stands in for `rayon::slice::ParallelSlice::par_chunks`.
+    pub trait ParChunksFallback<T> {
+        fn par_chunks<'a>(&'a self, n: usize) -> impl Iterator<Item = &'a [T]>
+        where
+            T: 'a;
+    }
+
+    impl<T> ParChunksFallback<T> for [T] {
+        fn par_chunks<'a>(&'a self, n: usize) -> impl Iterator<Item = &'a [T]>
+        where
+            T: 'a,
+        {
+            self.chunks(n)
+        }
+    }
+
+    /// Stands in for `rayon::slice::ParallelSliceMut::par_chunks_mut`.
+    pub trait ParChunksMutFallback<T> {
+        fn par_chunks_mut<'a>(&'a mut self, n: usize) -> impl Iterator<Item = &'a mut [T]>
+        where
+            T: 'a;
+    }
+
+    impl<T> ParChunksMutFallback<T> for [T] {
+        fn par_chunks_mut<'a>(&'a mut self, n: usize) -> impl Iterator<Item = &'a mut [T]>
+        where
+            T: 'a,
+        {
+            self.chunks_mut(n)
+        }
+    }
 }
+
 use std::f64::consts::PI;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use crate::palette::get_color_for_value;
 use crate::types;
 
@@ -85,7 +118,7 @@ impl MercatorProjection {
         range_km: f64,
         gate_interval: f64,
         value: f32,
-        color: (u8, u8, u8, u8),
+        from: GateId,
     ) {
         let range_start = range_km - gate_interval / 2.0;
         let range_end = range_km + gate_interval / 2.0;
@@ -99,8 +132,7 @@ impl MercatorProjection {
         let inv_num_range = 1.0 / num_range_samples.max(1) as f64;
         let inv_num_az = 1.0 / num_az_samples.max(1) as f64;
 
-        let packed = u32::from_ne_bytes([color.0, color.1, color.2, color.3]);
-        let value_bits = value.to_bits();
+        let cell = RenderBuffers::cell(write_key(from), value);
 
         for r_step in 0..num_range_samples {
             let r = range_start + (range_end - range_start) * (r_step as f64 * inv_num_range);
@@ -127,8 +159,7 @@ impl MercatorProjection {
                     && py_i < types::IMAGE_SIZE as i32
                 {
                     let pixel_idx = py_i as usize * types::IMAGE_SIZE + px_i as usize;
-                    bufs.image[pixel_idx].store(packed, Ordering::Relaxed);
-                    bufs.values[pixel_idx].store(value_bits, Ordering::Relaxed);
+                    bufs.claim(pixel_idx, cell);
                 }
             }
         }
@@ -163,20 +194,94 @@ impl RadialContext {
     }
 }
 
-/// Paired atomic image and value buffers for parallel rendering.
+/// One atomic cell per output pixel: `(write_key << 32) | value_bits`.
 ///
-/// Load-bearing on native: `render_gate` runs under a `par_iter` over radials
-/// and two radials routinely land on the same pixel. The overlap is *defined*
-/// but not *deterministic* — the last relaxed store wins, and which radial
-/// stores last is scheduling, so a native render differs between runs (five
-/// runs over one KTLX sweep, five hashes; `RAYON_NUM_THREADS=1`, one hash).
-/// Anything byte-comparing a native render must pin the thread count. wasm32 is
-/// single-threaded and so already reproducible.
+/// `render_gate` runs under a `par_iter` over radials, and two radials
+/// routinely claim the same pixel — but *not* because their footprints overlap
+/// in continuous space. They tile: `t` runs over `[0, 1)`, so a gate samples a
+/// strict subset of `[range_start, range_end)`, and the `+2` on the sample
+/// counts raises sample *density*, never extent. They collide because those
+/// footprints are quantized onto a pixel grid nothing aligns them to — inside
+/// ~26 km a 0.5° radial's arc is narrower than one pixel, and at any range the
+/// truncating cast drops neighbouring wedges into the same cell. The L2 path
+/// adds a second source: `compute_azimuth_spacing` hands every radial the
+/// *average* half-width, so radials packed tighter than average overlap for
+/// real. A fixture whose wedges tile exactly still contends over 271 pixels;
+/// see `overlapping_radials_contend_for_pixels`.
+///
+/// Neither claimant is more correct — the rasterizer never computes subpixel
+/// coverage — so the tie is arbitrary, and the only question is whether it gets
+/// resolved *stably*.
+///
+/// It used to be resolved by the race. Two relaxed stores per sample, one to an
+/// image buffer and one to a value buffer, last writer wins. That cost two
+/// things:
+///
+///   * The render was not reproducible. Over 12 runs of a 720 × 1200 L3 sweep
+///     at `IMAGE_SIZE` 2048 on 32 threads: 12 distinct hashes, ~16 k of 3.3 M
+///     painted pixels differing per pair, 53 k in the union. Invisible, in
+///     fairness — 91% of those differed by ≤ 0.5 dBZ (one data level), none by
+///     more than 5 dBZ, and no pixel flipped between opaque and transparent.
+///   * The image and value stores were a *pair*, and nothing kept them
+///     together. One radial could win the colour while another won the value,
+///     leaving a pixel no radial ever wrote: measured, rare, real — 3 such
+///     pixels over 12 runs of that sweep.
+///
+/// Now there is one cell, so there is no pair to tear, and it is claimed with
+/// `fetch_max` rather than a store. `fetch_max` is a set operation: the result
+/// is the greatest claim, whatever order the claims arrive in. With
+/// [`write_key`] ranking claims radial-major, gate-minor, the greatest claim is
+/// the one a single-threaded radial-major render would have written last — so
+/// the parallel result *is* the sequential result, not merely a stable one.
+/// Checked against the pre-change rasterizer compiled in alongside this one:
+/// 0 differing bytes and 0 differing values over all 4,194,304 pixels, on both
+/// a smooth field and an adversarial one. Note the suite cannot re-check that
+/// on its own — `parallel_matches_single_thread` compares this code against
+/// its own single-threaded self, which `fetch_max` makes true by construction.
+///
+/// ## What determinism costs
+///
+/// It is not free. `AtomicU64::fetch_max` has no x86-64 instruction behind it;
+/// it lowers to a `lock cmpxchgq` retry loop, which needs the line exclusively
+/// and cannot coalesce in the store buffer, so the cost climbs with thread
+/// count. Three variants compiled into one binary and interleaved in one
+/// process, 30 samples each, same 720 × 1200 sweep. **Medians** — the minimum
+/// is actively misleading here, because `fetch_max` widens the distribution
+/// instead of shifting it, and min-of-N reports the run that got lucky:
+///
+/// | `IMAGE_SIZE` 2048           |  1 thr | 8 thr | 16 thr | 32 thr |
+/// |-----------------------------|-------:|------:|-------:|-------:|
+/// | 2 × `AtomicU32`, store      |  395.8 |  73.2 |   51.1 |   42.9 |
+/// | 1 × `AtomicU32`, store      |  394.6 |  67.0 |   45.2 |   37.9 |
+/// | 1 × `AtomicU64`, `fetch_max`|  413.4 |  72.3 |   52.9 |   52.1 |
+///
+/// At 32 threads that is +21% against the old layout, and the spread tells the
+/// story better than the median: 41.7 / 42.9 / 44.0 (min/median/max) before,
+/// 37.0 / 52.1 / 64.7 now. At `IMAGE_SIZE` 1024 single-threaded — the web arm's
+/// operating point — it is a wash: 201.7 / 195.5 / 200.3.
+///
+/// The middle row is why the cell was collapsed at all, and it is separable
+/// from the keying: a single `AtomicU32` holding just the value bits ends the
+/// tearing outright, with nothing left to tear against, and is the fastest of
+/// the three everywhere. Determinism is what the third row buys and the third
+/// row's price.
+///
+/// Colour is derived in `into_output` rather than stored per gate. That is
+/// *more* palette work, not less — ~663 k gates reach the 230 km break against
+/// 3.3 M painted pixels at 2048² — but it is parallel and off the fill loop,
+/// and it removes a whole store per sample from the loop that is actually hot.
+/// Leaving that pass serial costs more than everything else here put together.
+///
+/// ## Earlier measurement, still standing
 ///
 /// The atomics are *not* load-bearing on wasm32, so cfg-splitting that arm to a
 /// plain buffer looks like a free win. It was measured per component, not
 /// assumed, against a real KTLX 0.5° reflectivity sweep (720 radials × 1832
-/// gates) at `IMAGE_SIZE` 1024, release, rasterizer isolated from WebGL/winit:
+/// gates) at `IMAGE_SIZE` 1024, release, rasterizer isolated from WebGL/winit.
+/// It predates the collapse to one cell, so the store counts are the old
+/// paired ones and it measured relaxed *stores*, not the RMW the fill loop now
+/// runs. Nothing here re-measures that in a browser; what carries over is only
+/// that atomics-vs-plain was ~1% of the frame when it was measured.
 ///
 /// | what                                    | Firefox | Chromium |
 /// |-----------------------------------------|--------:|---------:|
@@ -203,30 +308,72 @@ impl RadialContext {
 /// 159 ms *minimum* against Chromium's 174 ms, a matched-pair median ratio of
 /// 0.88; see `rustdar-web`'s crate docs for the medians and the method.
 struct RenderBuffers {
-    image: Vec<AtomicU32>,
-    values: Vec<AtomicU32>,
+    cells: Vec<AtomicU64>,
+    /// Only `into_output` needs it, but it has to be the product the gates were
+    /// coloured against, so it is captured at construction rather than passed
+    /// back in.
+    product: types::RadarProduct,
 }
 
 impl RenderBuffers {
-    fn new() -> Self {
+    fn new(product: types::RadarProduct) -> Self {
         let n = types::IMAGE_SIZE * types::IMAGE_SIZE;
         Self {
-            image: (0..n).map(|_| AtomicU32::new(0)).collect(),
-            values: (0..n).map(|_| AtomicU32::new(f32::NAN.to_bits())).collect(),
+            cells: (0..n).map(|_| AtomicU64::new(Self::EMPTY)).collect(),
+            product,
         }
     }
 
+    /// No gate has claimed this pixel. Distinct from every real cell because
+    /// [`write_key`] never yields 0.
+    const EMPTY: u64 = 0;
+
+    /// Pack a gate's claim. The key takes the high bits so `fetch_max` orders
+    /// by it and not by the value riding along in the low ones.
+    #[inline]
+    fn cell(key: u32, value: f32) -> u64 {
+        ((key as u64) << 32) | value.to_bits() as u64
+    }
+
+    /// Give `cell` the pixel if it outranks whatever holds it.
+    #[inline]
+    fn claim(&self, pixel_idx: usize, cell: u64) {
+        self.cells[pixel_idx].fetch_max(cell, Ordering::Relaxed);
+    }
+
+    /// Pixels per colouring task. Big enough that rayon's per-task overhead
+    /// vanishes against the palette lookups.
+    const COLOR_CHUNK: usize = 16 * 1024;
+
+    /// Split the cells into the RGBA texture and the value grid.
+    ///
+    /// Colour is derived here rather than stored per sample: it is a pure
+    /// function of the value at every call site, so keeping it in the cell
+    /// would only give it a second chance to disagree. Deriving it is also
+    /// less work — one lookup per pixel instead of one per gate — but only
+    /// once the pass is parallel. Serial, it dominates the whole render.
     fn into_output(self, actual_max_range: f64) -> (Vec<u8>, f64, Vec<f32>) {
-        let image: Vec<u8> = self
-            .image
-            .iter()
-            .flat_map(|a| a.load(Ordering::Relaxed).to_ne_bytes())
-            .collect();
+        let product = self.product;
         let value_data: Vec<f32> = self
-            .values
+            .cells
             .iter()
-            .map(|a| f32::from_bits(a.load(Ordering::Relaxed)))
+            .map(|a| match a.load(Ordering::Relaxed) {
+                Self::EMPTY => f32::NAN,
+                cell => f32::from_bits(cell as u32),
+            })
             .collect();
+        let mut image = vec![0u8; value_data.len() * 4];
+        image
+            .par_chunks_mut(4 * Self::COLOR_CHUNK)
+            .zip(value_data.par_chunks(Self::COLOR_CHUNK))
+            .for_each(|(px, vals)| {
+                for (px, &v) in px.chunks_exact_mut(4).zip(vals) {
+                    if !v.is_nan() {
+                        let c = get_color_for_value(product, v);
+                        px.copy_from_slice(&[c.0, c.1, c.2, c.3]);
+                    }
+                }
+            });
         let max_range = if actual_max_range > 0.0 {
             actual_max_range
         } else {
@@ -234,6 +381,31 @@ impl RenderBuffers {
         };
         (image, max_range, value_data)
     }
+}
+
+/// Which gate a claim came from. Named fields rather than two `usize`
+/// arguments: three call sites build one of these, and transposing them would
+/// reorder the tie-break silently on whichever path got it wrong.
+#[derive(Clone, Copy)]
+struct GateId {
+    radial: usize,
+    gate: usize,
+}
+
+/// Rank a gate's write the way a single-threaded, radial-major render would:
+/// radial index first, gate index within it second. `fetch_max` over these is
+/// order-independent, so the parallel result is the sequential one.
+///
+/// Never 0, so [`RenderBuffers::EMPTY`] stays unambiguous. Saturates: past
+/// 65535 radials or 65534 gates some writes rank equally, which stays
+/// deterministic (`fetch_max` is a set operation) but stops matching the
+/// sequential order. No NEXRAD product comes close — 720 radials and 1832
+/// gates is the widest sweep.
+#[inline]
+fn write_key(from: GateId) -> u32 {
+    let r = from.radial.min(0xFFFF) as u32;
+    let g = from.gate.min(0xFFFE) as u32;
+    (r << 16) | (g + 1)
 }
 
 // ── Sweep / azimuth helpers ──────────────────────────────────────────────────
@@ -322,12 +494,13 @@ fn render_with_projection(
     radar_lat: f64,
     radar_lon: f64,
     actual_max_range: f64,
+    product: types::RadarProduct,
     label: &str,
     fill: impl FnOnce(&MercatorProjection, &RenderBuffers),
 ) -> (Vec<u8>, f64, Vec<f32>) {
     let bounds = types::ImageBounds::from_radar_site(radar_lat, radar_lon);
     let proj = MercatorProjection::from_bounds(radar_lat, &bounds);
-    let bufs = RenderBuffers::new();
+    let bufs = RenderBuffers::new(product);
 
     fill(&proj, &bufs);
 
@@ -363,9 +536,9 @@ pub fn render_radar_to_image(
     let actual_max_range = compute_max_range(radials, product);
 
     let output = render_with_projection(
-        radar_lat, radar_lon, actual_max_range, "Radar",
+        radar_lat, radar_lon, actual_max_range, product, "Radar",
         |proj, bufs| {
-            radials.par_iter().for_each(|radial| {
+            radials.par_iter().enumerate().for_each(|(radial_idx, radial)| {
                 let azimuth = radial.azimuth_angle_degrees() as f64;
                 let ctx = RadialContext::new(azimuth, avg_azimuth_spacing / 2.0);
 
@@ -387,8 +560,8 @@ pub fn render_radar_to_image(
                             continue;
                         }
 
-                        let color = get_color_for_value(product, scaled_value);
-                        proj.render_gate(bufs, &ctx, range_km, gate_size, scaled_value, color);
+                        let from = GateId { radial: radial_idx, gate: gate_idx };
+                        proj.render_gate(bufs, &ctx, range_km, gate_size, scaled_value, from);
                     }
                 }
             });
@@ -421,7 +594,8 @@ fn render_nrot_to_image(
     let nrot_grid = filter_nrot_grid(&nrot_grid, vg.gate_count);
 
     let output = render_with_projection(
-        radar_lat, radar_lon, actual_max_range, "NROT",
+        radar_lat, radar_lon, actual_max_range,
+        types::RadarProduct::NormalizedRotation, "NROT",
         |proj, bufs| {
             nrot_grid.par_iter().enumerate().for_each(|(i, nrot_row)| {
                 let ctx = RadialContext::new(vg.azimuths_deg[i], avg_spacing_deg / 2.0);
@@ -436,6 +610,10 @@ fn render_nrot_to_image(
                         break;
                     }
 
+                    // Sub-threshold shear must not claim the pixel at all, or
+                    // it would outrank a real return from a lower radial.
+                    // `into_output` would colour it transparent either way, so
+                    // this has to happen here, not there.
                     let scaled_value = nrot_val as f32;
                     let color = get_color_for_value(
                         types::RadarProduct::NormalizedRotation,
@@ -445,7 +623,10 @@ fn render_nrot_to_image(
                         continue;
                     }
 
-                    proj.render_gate(bufs, &ctx, range_km, vg.gate_interval_km, scaled_value, color);
+                    let from = GateId { radial: i, gate: j };
+                    proj.render_gate(
+                        bufs, &ctx, range_km, vg.gate_interval_km, scaled_value, from,
+                    );
                 }
             });
         },
@@ -674,9 +855,9 @@ pub fn render_level3_radial_to_image(
     let radials = &radial_packet.radials;
 
     let output = render_with_projection(
-        radar_lat, radar_lon, actual_max_range, "Level III",
+        radar_lat, radar_lon, actual_max_range, product, "Level III",
         |proj, bufs| {
-            radials.par_iter().for_each(|radial_run| {
+            radials.par_iter().enumerate().for_each(|(radial_idx, radial_run)| {
                 let azimuth =
                     radial_run.start_angle as f64 + radial_run.angle_delta as f64 / 2.0;
                 let ctx = RadialContext::new(azimuth, radial_run.angle_delta as f64 / 2.0);
@@ -700,8 +881,8 @@ pub fn render_level3_radial_to_image(
                         break;
                     }
 
-                    let color = get_color_for_value(product, physical_value);
-                    proj.render_gate(bufs, &ctx, range_km, gate_interval, physical_value, color);
+                    let from = GateId { radial: radial_idx, gate: gate_idx };
+                    proj.render_gate(bufs, &ctx, range_km, gate_interval, physical_value, from);
                 }
             });
         },
@@ -891,5 +1072,452 @@ fn l3_physical_value(
         v * 0.514444
     } else {
         v
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use nexrad_level3::model::{RadialPacket, RadialRun};
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    const LAT: f64 = 35.3333;
+    const LON: f64 = -97.2778;
+    const SCALE: f32 = 2.0;
+    const OFFSET: f32 = 66.0;
+    const PRODUCT: types::RadarProduct = types::RadarProduct::Reflectivity;
+    const N_RADIALS: usize = 360;
+    const N_BINS: usize = 600;
+
+    /// A spatially coherent reflectivity field — storm cores placed in (x, y)
+    /// rather than a per-radial pattern, so neighbouring radials agree about
+    /// as much as real ones do. `silence` drops one radial without renumbering
+    /// the rest, which [`overlapping_radials_contend_for_pixels`] needs.
+    fn packet(silence: Option<usize>) -> RadialPacket {
+        let radials = (0..N_RADIALS)
+            .map(|i| {
+                let az = (i as f64).to_radians();
+                let (s, c) = az.sin_cos();
+                let gate_values = (0..N_BINS)
+                    .map(|j| {
+                        if silence == Some(i) {
+                            return 0; // a gate value <= 1 is skipped
+                        }
+                        let r = j as f64 * 0.25;
+                        let (x, y) = (r * s, r * c);
+                        let core = |cx: f64, cy: f64, w: f64, amp: f64| {
+                            let d2 = (x - cx).powi(2) + (y - cy).powi(2);
+                            amp * (-d2 / (2.0 * w * w)).exp()
+                        };
+                        let dbz = 20.0
+                            + core(40.0, 60.0, 18.0, 55.0)
+                            + core(-70.0, -30.0, 25.0, 45.0)
+                            + core(10.0, -90.0, 12.0, 60.0)
+                            + 6.0 * (x / 30.0).sin() * (y / 30.0).cos();
+                        ((dbz * SCALE as f64 + OFFSET as f64).round() as i64).clamp(2, 250) as u16
+                    })
+                    .collect();
+                RadialRun { start_angle: i as f32, angle_delta: 1.0, gate_values }
+            })
+            .collect();
+        RadialPacket {
+            first_range_bin: 0,
+            num_range_bins: N_BINS as u16,
+            i_center: 0,
+            j_center: 0,
+            scale_factor: 4.0,
+            is_legacy: false,
+            xdr_data_scale: None,
+            xdr_data_offset: None,
+            radials,
+        }
+    }
+
+    fn render(p: &RadialPacket) -> (Vec<u8>, Vec<f32>) {
+        let (image, _, values) =
+            render_level3_radial_to_image(p, PRODUCT, LAT, LON, SCALE, OFFSET, None).unwrap();
+        (image, values)
+    }
+
+    fn digest(image: &[u8], values: &[f32]) -> u64 {
+        let mut h = DefaultHasher::new();
+        image.hash(&mut h);
+        for v in values {
+            v.to_bits().hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// The fixture has to actually paint, or everything below passes vacuously.
+    #[test]
+    fn fixture_covers_a_realistic_share_of_the_image() {
+        let (image, values) = render(&packet(None));
+        let painted = image.chunks_exact(4).filter(|px| px[3] != 0).count();
+        let disc = std::f64::consts::PI
+            * (N_BINS as f64 * 0.25 * types::PIXELS_PER_KM).powi(2);
+        assert!(
+            (painted as f64) > disc * 0.9 && (painted as f64) < disc * 1.1,
+            "painted {painted}, expected about {disc:.0} for a {N_BINS}-gate disc"
+        );
+        assert!(values.iter().any(|v| !v.is_nan()));
+    }
+
+    /// Every value has to survive the trip through the cell exactly. The key
+    /// shares those 64 bits, so anything that lets it reach the low half shows
+    /// up here as a value the packet could not have encoded.
+    #[test]
+    fn values_round_trip_through_the_cell_unaltered() {
+        let (_, values) = render(&packet(None));
+        for &v in values.iter().filter(|v| !v.is_nan()) {
+            let gate = v * SCALE + OFFSET;
+            assert!(
+                gate.fract() == 0.0 && (2.0..=250.0).contains(&gate),
+                "value {v} is not (gate - {OFFSET}) / {SCALE} for any gate the fixture wrote"
+            );
+        }
+    }
+
+    /// Pins the *direction* of the tie-break, not just its stability. Two
+    /// adjacent radials, the earlier one deliberately carrying the **larger**
+    /// value: wherever both reach a pixel the later radial must take it, purely
+    /// because it is later. Ranking by anything else — value, gate index, a
+    /// constant key — hands some of those pixels to radial 0 instead.
+    ///
+    /// `both`, `only_first` and `only_second` are the value grids with both
+    /// radials, with the second silenced, and with the first silenced.
+    fn assert_later_radial_wins(
+        both: &[f32],
+        only_first: &[f32],
+        only_second: &[f32],
+        first_value: f32,
+    ) {
+        let contested = only_first
+            .iter()
+            .zip(only_second)
+            .filter(|(a, b)| !a.is_nan() && !b.is_nan())
+            .count();
+        assert!(
+            contested > 20,
+            "only {contested} pixels are reached by both radials; this fixture cannot \
+             observe the tie-break"
+        );
+
+        let stolen = both
+            .iter()
+            .zip(only_second)
+            .filter(|(got, second)| !second.is_nan() && **got == first_value)
+            .count();
+        assert_eq!(
+            stolen, 0,
+            "{stolen} of {contested} contested pixels kept radial 0's value even though \
+             radial 1 reached them; the later radial is no longer winning"
+        );
+    }
+
+    #[test]
+    fn level3_later_radial_wins_a_contested_pixel() {
+        // Radial 0 carries the larger value on purpose.
+        fn two_radials(first: u16, second: u16) -> RadialPacket {
+            let run = |start: f32, gate: u16| RadialRun {
+                start_angle: start,
+                angle_delta: 1.0,
+                gate_values: vec![gate; N_BINS],
+            };
+            RadialPacket {
+                first_range_bin: 0,
+                num_range_bins: N_BINS as u16,
+                i_center: 0,
+                j_center: 0,
+                scale_factor: 4.0,
+                is_legacy: false,
+                xdr_data_scale: None,
+                xdr_data_offset: None,
+                radials: vec![run(90.0, first), run(91.0, second)],
+            }
+        }
+        let grid = |first, second| render(&two_radials(first, second)).1;
+        assert_later_radial_wins(
+            &grid(200, 100),
+            &grid(200, 0),
+            &grid(0, 100),
+            (200.0 - OFFSET) / SCALE,
+        );
+    }
+
+    /// Guards the premise of the two determinism tests: radials really do land
+    /// on each other's pixels, so a racy rasterizer would have something to
+    /// race over. Silencing radial `k` hands every pixel it owned to whichever
+    /// lower-keyed radial also wrote there, so a pixel painted both times but
+    /// holding different values is one that two radials contended for.
+    #[test]
+    fn overlapping_radials_contend_for_pixels() {
+        let (_, full) = render(&packet(None));
+        let (_, cut) = render(&packet(Some(N_RADIALS / 2)));
+
+        let contested = full
+            .iter()
+            .zip(&cut)
+            .filter(|(a, b)| !a.is_nan() && !b.is_nan() && a.to_bits() != b.to_bits())
+            .count();
+
+        assert!(
+            contested > 100,
+            "only {contested} pixels contended; the fixture has stopped overlapping and \
+             the determinism tests prove nothing"
+        );
+    }
+
+    /// The property this module exists to pin: ten renders of one sweep across
+    /// the whole rayon pool agree byte for byte.
+    #[test]
+    fn parallel_render_is_deterministic() {
+        assert!(
+            rayon::current_num_threads() > 1,
+            "single-threaded pool: this test cannot observe a race"
+        );
+        let p = packet(None);
+        let first = {
+            let (i, v) = render(&p);
+            digest(&i, &v)
+        };
+        for run in 1..10 {
+            let (i, v) = render(&p);
+            assert_eq!(digest(&i, &v), first, "render {run} differs from render 0");
+        }
+    }
+
+    /// Stability alone would let the parallel path settle on an answer of its
+    /// own. It has to settle on the sequential one.
+    #[test]
+    fn parallel_matches_single_thread() {
+        let p = packet(None);
+        let (i, v) = render(&p);
+        let parallel = digest(&i, &v);
+
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let sequential = pool.install(|| {
+            let (i, v) = render(&p);
+            digest(&i, &v)
+        });
+
+        assert_eq!(parallel, sequential);
+    }
+
+    /// Colour and value come out of one cell, so they cannot come from
+    /// different gates. Two separate buffers used to let them.
+    #[test]
+    fn colour_agrees_with_value_at_every_pixel() {
+        let (image, values) = render(&packet(None));
+        for (idx, (px, &v)) in image.chunks_exact(4).zip(&values).enumerate() {
+            let expected = if v.is_nan() {
+                (0, 0, 0, 0)
+            } else {
+                get_color_for_value(PRODUCT, v)
+            };
+            assert_eq!(
+                (px[0], px[1], px[2], px[3]),
+                expected,
+                "pixel {idx} holds a colour its value did not produce (value {v})"
+            );
+        }
+    }
+
+    // ── Level II and NROT ────────────────────────────────────────────────────
+    //
+    // These paths build their own keys and hand their own product to
+    // `RenderBuffers`, and none of the Level III tests above reach them.
+
+    const L2_ELEVATION: f32 = 0.5;
+
+    /// A one-sweep Level II scan, one radial per entry in `gates`, spaced 1°
+    /// from 90°. A radial whose byte is 0 decodes as below-threshold and is
+    /// skipped, which silences it without renumbering the rest.
+    fn l2_scan(gates: &[u8], velocity: bool) -> Scan {
+        use nexrad_model::data::{
+            MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern,
+        };
+        let radials = gates
+            .iter()
+            .enumerate()
+            .map(|(i, &byte)| {
+                let moment =
+                    MomentData::from_fixed_point(600, 0, 250, 8, SCALE, OFFSET, vec![byte; 600]);
+                let (refl, vel) = if velocity {
+                    (None, Some(moment))
+                } else {
+                    (Some(moment), None)
+                };
+                Radial::new(
+                    0,
+                    i as u16,
+                    90.0 + i as f32,
+                    1.0,
+                    RadialStatus::IntermediateRadialData,
+                    1,
+                    L2_ELEVATION,
+                    refl,
+                    vel,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        Scan::new(
+            VolumeCoveragePattern::new(
+                212, 0, 0.5, PulseWidth::Short, false, 0, false, 0, false, false, 0, false,
+                false, Vec::new(),
+            ),
+            vec![Sweep::new(1, radials)],
+        )
+    }
+
+    fn render_l2(gates: &[u8], product: types::RadarProduct) -> (Vec<u8>, Vec<f32>) {
+        let scan = l2_scan(gates, product != types::RadarProduct::Reflectivity);
+        let (image, _, values) =
+            render_radar_to_image(&scan, L2_ELEVATION, product, LAT, LON).unwrap();
+        (image, values)
+    }
+
+    #[test]
+    fn level2_later_radial_wins_a_contested_pixel() {
+        let grid = |g: &[u8]| render_l2(g, PRODUCT).1;
+        assert_later_radial_wins(
+            &grid(&[200, 100]),
+            &grid(&[200, 0]),
+            &grid(&[0, 100]),
+            (200.0 - OFFSET) / SCALE,
+        );
+    }
+
+    #[test]
+    fn level2_colour_agrees_with_value_at_every_pixel() {
+        let (image, values) = render_l2(&[200, 100, 180, 120], PRODUCT);
+        assert!(values.iter().any(|v| !v.is_nan()), "level II fixture painted nothing");
+        for (px, &v) in image.chunks_exact(4).zip(&values) {
+            let want = if v.is_nan() { (0, 0, 0, 0) } else { get_color_for_value(PRODUCT, v) };
+            assert_eq!((px[0], px[1], px[2], px[3]), want);
+        }
+    }
+
+    /// A velocity field with enough azimuthal shear to survive the LLSD fit and
+    /// the coherence filter, so `render_nrot_to_image` actually paints.
+    fn nrot_scan(n_radials: usize) -> Scan {
+        use nexrad_model::data::{
+            MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern,
+        };
+        let radials = (0..n_radials)
+            .map(|i| {
+                let theta = i as f64 / n_radials as f64 * std::f64::consts::TAU;
+                // Byte 129 is 0 m/s at scale 2 / offset 129; ±8 cycles of
+                // ±35 m/s gives shear well past the 0.5 display threshold.
+                let ms = 35.0 * (8.0 * theta).sin();
+                let byte = (129.0 + ms * 2.0).round().clamp(2.0, 254.0) as u8;
+                Radial::new(
+                    0,
+                    i as u16,
+                    i as f32 * (360.0 / n_radials as f32),
+                    360.0 / n_radials as f32,
+                    RadialStatus::IntermediateRadialData,
+                    1,
+                    L2_ELEVATION,
+                    None,
+                    Some(MomentData::from_fixed_point(
+                        400,
+                        0,
+                        250,
+                        8,
+                        2.0,
+                        129.0,
+                        vec![byte; 400],
+                    )),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        Scan::new(
+            VolumeCoveragePattern::new(
+                212, 0, 0.5, PulseWidth::Short, false, 0, false, 0, false, false, 0, false,
+                false, Vec::new(),
+            ),
+            vec![Sweep::new(1, radials)],
+        )
+    }
+
+    /// NROT hands `RenderBuffers` its own product literal, far from where
+    /// `into_output` applies it. Rendering NROT through the reflectivity
+    /// palette would look plausible and fail nothing else.
+    #[test]
+    fn nrot_colour_comes_from_the_nrot_palette() {
+        let scan = nrot_scan(360);
+        let (image, _, values) = render_radar_to_image(
+            &scan,
+            L2_ELEVATION,
+            types::RadarProduct::NormalizedRotation,
+            LAT,
+            LON,
+        )
+        .unwrap();
+
+        let painted = image.chunks_exact(4).filter(|px| px[3] != 0).count();
+        assert!(painted > 10_000, "NROT fixture painted only {painted} pixels");
+
+        for (px, &v) in image.chunks_exact(4).zip(&values) {
+            let want = if v.is_nan() {
+                (0, 0, 0, 0)
+            } else {
+                get_color_for_value(types::RadarProduct::NormalizedRotation, v)
+            };
+            assert_eq!((px[0], px[1], px[2], px[3]), want);
+        }
+    }
+
+    /// The NROT grid is indexed (azimuth, gate) like the others, and its key
+    /// has to agree.
+    ///
+    /// Known gap: transposing this path's [`GateId`] survives the suite. The
+    /// L2 and L3 equivalents die to their `later_radial_wins` tests, which need
+    /// two adjacent radials carrying known, very different values — NROT has no
+    /// such handle, since every value is an LLSD fit over its neighbours and
+    /// the coherence filter deletes anything isolated enough to control. The
+    /// named fields are the mitigation: a transposition there has to be
+    /// written out in full rather than slipped in as argument order.
+    #[test]
+    fn nrot_render_is_deterministic() {
+        let scan = nrot_scan(360);
+        let once = || {
+            let (image, _, values) = render_radar_to_image(
+                &scan,
+                L2_ELEVATION,
+                types::RadarProduct::NormalizedRotation,
+                LAT,
+                LON,
+            )
+            .unwrap();
+            digest(&image, &values)
+        };
+        let first = once();
+        for run in 1..6 {
+            assert_eq!(once(), first, "NROT render {run} differs from render 0");
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        assert_eq!(pool.install(once), first, "NROT parallel differs from sequential");
+    }
+
+    #[test]
+    fn write_key_ranks_radial_major_and_never_reads_as_empty() {
+        let k = |radial, gate| write_key(GateId { radial, gate });
+        assert!(k(0, 0) > 0);
+        assert!(k(0, 1) > k(0, 0));
+        assert!(k(1, 0) > k(0, N_BINS));
+        assert!(k(719, 1831) > k(718, 1831));
     }
 }
