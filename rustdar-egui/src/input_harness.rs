@@ -2743,4 +2743,126 @@ mod tests {
              proves nothing about the limit being read at all"
         );
     }
+
+    // ── Radar site icons: from the click to the action ───────────────────
+
+    /// Off-centre, but well inside a 24pt icon. A click at the exact centre
+    /// still lands inside a zero-sized `Rect`, so a hit-test collapsed to
+    /// nothing would pass there.
+    const INSIDE_THE_ICON: egui::Vec2 = egui::vec2(5.0, 5.0);
+
+    /// The site switches the last frame asked the app for.
+    fn site_switches(h: &InputHarness) -> Vec<(String, usize)> {
+        h.last_actions()
+            .iter()
+            .filter_map(|a| match a {
+                GuiAction::SwitchRadarSite { site, pane_idx } => {
+                    Some((site.clone(), *pane_idx))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A harness showing `site`, with the radar-site overlay on, plus the
+    /// screen position that site's icon is drawn at.
+    ///
+    /// `render_map` centres a pane on its own scan's site, so the icon lands on
+    /// the pane centre. That comes from the layout, not from the hit-testing
+    /// under test, so shrinking or inflating the icon cannot move it.
+    fn harness_showing_site(site: &str) -> (InputHarness, egui::Pos2) {
+        let mut h = InputHarness::new();
+        h.load_scan(site);
+        h.gui_mut().enable_overlay_for_test(OverlayKind::RadarSites);
+        h.warm_up();
+        assert!(
+            h.overlay_enabled(OverlayKind::RadarSites),
+            "precondition: the radar-site overlay must be on, or nothing draws \
+             an icon to click"
+        );
+        let icon = h.pane_rects()[0].center();
+        assert!(
+            !h.is_floating_layer_at(icon),
+            "precondition: the icon must not already be under a floating layer"
+        );
+        (h, icon)
+    }
+
+    /// 30. **Clicking a radar site icon switches to that radar.**
+    ///
+    ///     The click resolves — that is what the whole pointer suite pins — but
+    ///     nothing checked that the action it is supposed to produce ever
+    ///     reached the app. Two things were eating it, and either alone is
+    ///     enough to make every site unselectable on every platform:
+    ///     `handle_radar_site_interactions` was handed the excluded rects with
+    ///     *the site icons already in them*, and the readout it opens on hover
+    ///     was an interactable layer sitting over the pointer, which the dialog
+    ///     gate then read as a click on a floating window.
+    #[test]
+    fn clicking_a_radar_site_icon_switches_to_that_site() {
+        let (mut h, icon) = harness_showing_site("KTLX");
+        let target = icon + INSIDE_THE_ICON;
+
+        // Rest on the icon first, as a mouse user does. That opens the site
+        // readout, and a readout that takes part in layer hit-testing then eats
+        // the click it was opened by — the pointer is inside it.
+        h.mouse_move(target);
+        h.frames_for(3, FRAME_DT);
+        assert!(
+            !h.is_floating_layer_at(target),
+            "the readout claimed the pointer, so the dialog gate will read the \
+             click that follows as landing on a floating window"
+        );
+
+        h.mouse_click(target);
+
+        assert_eq!(
+            site_switches(&h),
+            vec![("KTLX".to_owned(), 0)],
+            "clicking KTLX's icon did not ask the app to switch to KTLX"
+        );
+    }
+
+    /// 31. **Tapping one switches too.**
+    ///
+    ///     The same handler under the other modality, which reaches it by a
+    ///     different route: the touch pipeline confirms the tap only after
+    ///     `DOUBLE_TAP_TIMEOUT_S`, a frame on which nothing is pressed at all.
+    #[test]
+    fn tapping_a_radar_site_icon_switches_to_that_site() {
+        let (mut h, icon) = harness_showing_site("KTLX");
+
+        h.touch_tap(icon + INSIDE_THE_ICON);
+        h.frame_after(AFTER_DOUBLE_TAP_TIMEOUT);
+
+        assert_eq!(
+            site_switches(&h),
+            vec![("KTLX".to_owned(), 0)],
+            "tapping KTLX's icon did not ask the app to switch to KTLX"
+        );
+    }
+
+    /// 32. **...and clicking beside one does not.**
+    ///
+    ///     The complement: without it an icon stretched over the pane satisfies
+    ///     the two above while turning every map click into a site switch.
+    ///     40pt out is comfortably clear of a 24pt icon and still far nearer
+    ///     than the next radar, which at this zoom is hundreds of points away.
+    #[test]
+    fn clicking_beside_a_radar_site_icon_switches_nothing() {
+        let (mut h, icon) = harness_showing_site("KTLX");
+        let beside = icon + egui::vec2(40.0, 0.0);
+        assert!(
+            h.pane_rects()[0].contains(beside),
+            "precondition: the spot must still be on the map"
+        );
+
+        h.mouse_click(beside);
+
+        assert_eq!(
+            site_switches(&h),
+            vec![],
+            "a click 40pt clear of the icon still switched sites"
+        );
+    }
 }

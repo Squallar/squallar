@@ -33,6 +33,9 @@ pub(super) struct PaneRenderCtx<'a> {
     /// panel by `ColorScaleOrientation`, so every pane agrees.
     pub horizontal_color_scale: bool,
     pub pointer_available: bool,
+    /// Floating chrome drawn over the map (the hamburger). Clicks there are
+    /// not map clicks. Map content that is itself clickable does **not**
+    /// belong here — see `site_icon_rects` in `render_pane_map_content`.
     pub excluded_rects: Vec<egui::Rect>,
     /// Screen position of an active long-press (for the radar value tooltip),
     /// or `None`. Only the touch pipeline ever produces one.
@@ -60,8 +63,11 @@ pub(super) fn render_pane_map_content(
         ctx.overlays.load_pane_configs(&ctx.pane.overlay_configs);
     }
 
-    // Pre-compute radar site icon rects so overlay click detection can
-    // skip clicks that land on a site marker (sites take priority).
+    // Sites take priority over the overlays beneath them, so those skip a click
+    // that lands on an icon. Kept out of `ctx.excluded_rects`, which
+    // `handle_radar_site_interactions` reads itself: with the icons in there,
+    // every site click was blocked by its own icon.
+    let mut site_icon_rects: Vec<egui::Rect> = Vec::new();
     if ctx.pane.is_overlay_enabled(OverlayKind::RadarSites) {
         let screen_rect = ui.max_rect();
         let icon_size = (10.0 + zoom as f32 * 2.0).clamp(8.0, 24.0);
@@ -70,13 +76,20 @@ pub(super) fn render_pane_map_content(
                 .project(walkers::lat_lon(site.lat, site.lon))
                 .to_pos2();
             if screen_rect.expand(100.0).contains(pos) {
-                ctx.excluded_rects.push(egui::Rect::from_center_size(
+                site_icon_rects.push(egui::Rect::from_center_size(
                     pos,
                     egui::vec2(icon_size, icon_size),
                 ));
             }
         }
     }
+    // What the overlays *under* the sites must not be clicked through.
+    let overlay_excluded_rects: Vec<egui::Rect> = ctx
+        .excluded_rects
+        .iter()
+        .chain(&site_icon_rects)
+        .copied()
+        .collect();
 
     // --- Phase 1: immutable-ui work (ordered layer dispatch) ---
     // RadarSites requires `allocate_rect` (&mut ui), so it is deferred to Phase 2.
@@ -86,7 +99,7 @@ pub(super) fn render_pane_map_content(
             projector,
             ctx.pointer_available,
             ctx.pane_rect,
-            &ctx.excluded_rects,
+            &overlay_excluded_rects,
             ctx.overlay_click_pos,
         );
 
@@ -194,7 +207,7 @@ pub(super) fn render_pane_map_content(
                                     zoom,
                                     prefs: ctx.preferences,
                                     overlay_click_pos: ctx.overlay_click_pos,
-                                    excluded_rects: &ctx.excluded_rects,
+                                    excluded_rects: &overlay_excluded_rects,
                                     pane_rect: ctx.pane_rect,
                                 },
                             ));
@@ -433,6 +446,32 @@ fn update_pane_hover_value_from_meta(
     }
 }
 
+/// A hover readout pinned to the pointer, on a layer that cannot claim it.
+///
+/// `egui::Tooltip` puts its `Area` up **interactable**, so `layer_id_at`
+/// reports it at the pointer it is anchored to and the dialog gate
+/// (`filter_dialog_blocked`, `is_pos_blocked`) then throws away the click that
+/// follows. Hovering a thing on the map is what made it unclickable.
+fn map_hover_tooltip(
+    ctx: &egui::Context,
+    id: egui::Id,
+    pos: egui::Pos2,
+    width: Option<f32>,
+    content: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Area::new(id)
+        .order(egui::Order::Tooltip)
+        .interactable(false)
+        .constrain(true)
+        .fixed_pos(pos)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_max_width(width.unwrap_or_else(|| ui.spacing().tooltip_width));
+                content(ui);
+            });
+        });
+}
+
 /// Per-frame radar site label rendering and interaction detection.
 ///
 /// The site circles and background pills are in the background-rasterized
@@ -527,13 +566,13 @@ fn handle_radar_site_interactions(
                     "{}\nLat: {:.3}°, Lon: {:.3}°\nElev: {}",
                     radar_site.name, radar_site.lat, radar_site.lon, elev_str
                 );
-                egui::Tooltip::always_open(
-                    ui.ctx().clone(),
-                    ui.layer_id(),
+                map_hover_tooltip(
+                    ui.ctx(),
                     egui::Id::new(("site_tooltip", radar_site.name)),
-                    egui::PopupAnchor::Pointer,
-                )
-                .show(|tooltip_ui| { tooltip_ui.label(tooltip_text); });
+                    pos,
+                    None,
+                    |tooltip_ui| { tooltip_ui.label(tooltip_text); },
+                );
             }
     }
 }
@@ -603,13 +642,12 @@ fn render_user_location(
         let dot_rect = egui::Rect::from_center_size(user_screen, egui::vec2(28.0, 28.0));
         if let Some(hover_pos) = ui.ctx().pointer_hover_pos()
             && dot_rect.contains(hover_pos) {
-                egui::Tooltip::always_open(
-                    ui.ctx().clone(),
-                    ui.layer_id(),
+                map_hover_tooltip(
+                    ui.ctx(),
                     egui::Id::new("gps_fix_tooltip"),
-                    egui::PopupAnchor::Pointer,
-                )
-                .show(|tooltip_ui| {
+                    hover_pos,
+                    None,
+                    |tooltip_ui| {
                         tooltip_ui.label(format!("Lat: {:.5}°  Lon: {:.5}°", fix.latitude, fix.longitude));
                         if let Some(alt) = fix.altitude_m {
                             tooltip_ui.label(format!("Alt: {:.0} m", alt));
@@ -1167,18 +1205,16 @@ fn render_per_frame_overlay(
 
     // Show tooltip for closest hovered point
     if let Some((_, id)) = closest_hover
+        && let Some(hp) = hover_pos
         && let Some(text) = pf.overlays.hover_text(pf.kind, id, &hover_ctx) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            egui::Tooltip::always_open(
-                ui.ctx().clone(),
-                ui.layer_id(),
+            map_hover_tooltip(
+                ui.ctx(),
                 egui::Id::new(("per_frame_overlay_hover", pf.kind as u8)),
-                egui::PopupAnchor::Pointer,
-            )
-            .width(400.0)
-            .show(|tooltip_ui| {
-                tooltip_ui.label(text);
-            });
+                hp,
+                Some(400.0),
+                |tooltip_ui| { tooltip_ui.label(text); },
+            );
         }
 
     selected
