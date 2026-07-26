@@ -614,7 +614,9 @@ pub fn quantize_to_rpg_levels(knots: f32) -> u8 {
 /// `#[cfg(test)]` rather than shipped: none of it is reachable from a render,
 /// and the quarantine table alone is a few kilobytes of prose that would
 /// otherwise land in every binary, wasm included.
-#[cfg(test)]
+///
+/// Gated off wasm32 with both modules that use it, or it would be dead there.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod validation_policy {
     use super::*;
 
@@ -1105,7 +1107,9 @@ mod validation_policy {
     }
 }
 
-#[cfg(test)]
+// Native-only with `live_validation` below, which it cross-checks: the
+// quarantine table is asserted against that module's `SITES`.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::validation_policy::*;
     use super::*;
@@ -1995,7 +1999,10 @@ mod tests {
 /// The tgftp origin is deliberately **not** in [`crate::sources::DataSources`]:
 /// it sends no `Access-Control-Allow-Origin`, nothing shipped may reach for it,
 /// and `no_production_origin_is_one_the_browser_cannot_reach` enforces that.
-#[cfg(test)]
+///
+/// Native-only: every check here is a `#[tokio::test]`, and that
+/// dev-dependency is target-gated off wasm32.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod live_validation {
     use super::validation_policy::*;
     use super::*;

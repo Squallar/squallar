@@ -546,7 +546,9 @@ fn parse_wind_token(token: &str) -> Option<(Option<u16>, u16)> {
     Some((dir, speed_digits.parse().ok()?))
 }
 
-#[cfg(test)]
+// Native-only: the live IEM checks at the tail are `#[tokio::test]`, and that
+// dev-dependency is target-gated off wasm32.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

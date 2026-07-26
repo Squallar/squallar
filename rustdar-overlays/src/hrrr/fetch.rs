@@ -40,7 +40,9 @@ use super::{GridCoords, HrrrFetchResult, HrrrGridData, ModelParameter, lambert};
 use crate::types::GeoBounds;
 
 /// Live tests only. Production fetches with `ctx.client` (30 s).
-#[cfg(test)]
+///
+/// Gated off wasm32 with the module that uses it, or it would be dead there.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 const HRRR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 // ---------------------------------------------------------------------------
@@ -541,14 +543,16 @@ async fn try_fetch_composite(
 /// A `User-Agent` is fine on this origin, unlike IEM and SPC: S3 answers the
 /// preflight `200` with `Access-Control-Allow-Headers: user-agent`. See
 /// `rustdar_radar::sources`.
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 fn hrrr_client() -> Result<reqwest::Client, String> {
     rustdar_radar::tls::client(rustdar_radar::tls::USER_AGENT, HRRR_TIMEOUT)
         .build()
         .map_err(|e| format!("could not build the HRRR client: {e}"))
 }
 
-#[cfg(test)]
+// Native-only: the live fetches at the tail are `#[tokio::test]`, and that
+// dev-dependency is target-gated off wasm32.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

@@ -229,7 +229,9 @@ pub async fn fetch_latest_product(
     Ok(Level3Product { message, stamp })
 }
 
-#[cfg(test)]
+// Native-only: the live checks at the tail are `#[tokio::test]`, and that
+// dev-dependency is target-gated off wasm32.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use crate::types::RadarProduct;

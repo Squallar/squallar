@@ -435,7 +435,10 @@ pub async fn download_file(identifier: Identifier) -> Result<nexrad_data::volume
     }
 }
 
-#[cfg(test)]
+// Native-only: `#[tokio::test]` (the dev-dependency is target-gated) and
+// `ClientBuilder::timeout`, which reqwest's wasm builder does not have. Keeps
+// this crate compiling under the wasm32 CI row.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

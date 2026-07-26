@@ -1157,7 +1157,9 @@ fn urlencoded(s: &str) -> String {
     out
 }
 
-#[cfg(test)]
+// Native-only: builds a loopback client with `ClientBuilder::timeout`, which
+// reqwest's wasm builder does not have.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

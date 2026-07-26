@@ -441,8 +441,9 @@ impl HttpsTiles {
 
     /// Tiles currently held, including pending and failed markers.
     ///
-    /// Exposed for the eviction test; the map has no use for it.
-    #[cfg(test)]
+    /// Exposed for the eviction test; the map has no use for it. Gated off
+    /// wasm32 with `mod tests`, its only caller, or it would be dead there.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     fn cached_entries(&self) -> usize {
         self.cache.len()
     }
@@ -596,5 +597,9 @@ async fn fetch_continuously<S: TileSource>(
     log::debug!("tile fetch loop finished");
 }
 
-#[cfg(test)]
+// Native-only: `#[tokio::test]` (the dev-dependency is target-gated),
+// `ClientBuilder::timeout` and `Error::is_connect`, which reqwest's wasm arm
+// does not have, and `rustdar_radar::tls::default_is_ring`, itself
+// `cfg(not(wasm32))`.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
