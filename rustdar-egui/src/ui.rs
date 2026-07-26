@@ -1631,11 +1631,23 @@ impl Gui {
         }
     }
 
-    /// Set the user's GPS location for the blue dot indicator
     /// Set safe area insets in logical pixels (top, bottom, left, right).
     /// On Android, this compensates for the status bar and navigation bar.
     pub fn set_safe_area_insets(&mut self, top: f32, bottom: f32, left: f32, right: f32) {
         self.safe_area_insets = (top, bottom, left, right);
+    }
+
+    /// The insets currently in force, in the same order they are set in.
+    ///
+    /// This and the three getters below it are the read half of the setters
+    /// they sit beside, and they exist for one reason: all four values are
+    /// pushed in from the host through a platform bridge this crate cannot
+    /// see, and the frontend's tests need somewhere to observe that the
+    /// hand-off happened at all. What the UI then *does* with them is covered
+    /// here, against the drawn chrome (see `input_harness`), never against
+    /// these.
+    pub fn safe_area_insets(&self) -> (f32, f32, f32, f32) {
+        self.safe_area_insets
     }
 
     /// Tell the UI whether this platform can quit. `false` drops Exit from the
@@ -1644,12 +1656,28 @@ impl Gui {
         self.supports_exit = supported;
     }
 
+    /// See [`set_supports_exit`](Self::set_supports_exit).
+    pub fn supports_exit(&self) -> bool {
+        self.supports_exit
+    }
+
+    /// Set the user's GPS location for the blue dot indicator.
     pub fn set_gps_fix(&mut self, fix: rustdar_gps::GpsFix) {
         self.user_fix = Some(fix);
     }
 
+    /// See [`set_gps_fix`](Self::set_gps_fix).
+    pub fn gps_fix(&self) -> Option<&rustdar_gps::GpsFix> {
+        self.user_fix.as_ref()
+    }
+
     pub fn set_user_heading(&mut self, heading: f32) {
         self.user_heading = Some(heading);
+    }
+
+    /// See [`set_user_heading`](Self::set_user_heading).
+    pub fn user_heading(&self) -> Option<f32> {
+        self.user_heading
     }
 
     /// Whether the active pane is showing the most recent (live) scan.

@@ -36,15 +36,12 @@ pub fn start() -> Result<(), JsValue> {
         EventLoop::new().map_err(|e| JsValue::from_str(&format!("event loop: {e}")))?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    // The receiver goes in through the bridge because
-    // `App::set_gps_fix_receiver` is `#[cfg(target_os = "android")]`.
     let (fix_sender, fix_receiver) = std::sync::mpsc::channel();
     crate::geolocation::start_watch(fix_sender);
 
-    let mut platform = crate::bridge::WebPlatform::new(canvas);
-    rustdar_frontend::platform::PlatformBridge::set_gps_fix_receiver(&mut platform, fix_receiver);
-
-    let app = rustdar_frontend::app::App::new(Box::new(platform));
+    let platform = crate::bridge::WebPlatform::new(canvas);
+    let mut app = rustdar_frontend::app::App::new(Box::new(platform));
+    app.set_gps_fix_receiver(fix_receiver);
 
     event_loop.spawn_app(app);
     Ok(())

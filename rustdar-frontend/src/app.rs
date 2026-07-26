@@ -217,7 +217,19 @@ impl App {
     /// one to build. Without that inversion the app layer and the platform
     /// layer would have to depend on each other.
     pub fn new(platform: Box<dyn PlatformBridge>) -> Self {
-        let instance = egui_wgpu::wgpu::Instance::new(instance_descriptor());
+        Self::with_instance(egui_wgpu::wgpu::Instance::new(instance_descriptor()), platform)
+    }
+
+    /// Everything [`new`](Self::new) does once the wgpu instance exists.
+    ///
+    /// Split off so a test can supply an instance with no backends selected.
+    /// `Instance::new(instance_descriptor())` opens the Vulkan and GL loaders
+    /// and enumerates adapters — measured at ~72 ms per call on this machine,
+    /// against ~1 µs for an empty one — and nothing an `App` does without a
+    /// window ever asks it for a surface. The split is here rather than at the
+    /// field so that everything else `new` wires up, `set_supports_exit` and
+    /// the initial config load included, is on the tested side of it.
+    fn with_instance(instance: wgpu::Instance, platform: Box<dyn PlatformBridge>) -> Self {
         let input = InputHandler::new();
         let channels = ChannelHub::new();
         // Owns the single shared render-budget counter used by both the loop and
@@ -285,12 +297,47 @@ impl App {
     }
 
     fn handle_resized(&mut self, width: u32, height: u32) {
+        // A rotation moves the cutout and the navigation bar to other edges,
+        // and it reaches the app as a resize — not as a resume. Queried once in
+        // `resumed` and never again, the insets would describe the orientation
+        // the app happened to start in for the rest of the session, and the map
+        // would keep an exclusion band down the wrong side of the screen.
+        //
+        // A resize is also the only signal available that a *layout* has
+        // happened, which is what `getRootWindowInsets` needs before it has
+        // anything but the previous frame's numbers to return; see
+        // `rustdar_android::get_system_insets`.
+        //
+        // Only on a real size. Android cannot distinguish a failed read from a
+        // genuine zero -- `get_system_insets` collapses every JNI failure,
+        // including a null `getRootWindowInsets()` before the first layout, to
+        // all-zero -- so querying at 0x0 replaces good insets with bad ones.
+        if width > 0 && height > 0 {
+            self.refresh_safe_area_insets();
+        }
         if width > 0
             && height > 0
             && let Some(state) = self.state.as_mut()
         {
             log::info!("Window resized to {}x{}", width, height);
             state.resize_surface(width, height);
+        }
+    }
+
+    /// Ask the platform what the system bars are covering and hand it to the UI.
+    ///
+    /// A bridge with nothing to say answers `None` and the last value stands
+    /// rather than being zeroed: desktop has no system bars, and on iOS
+    /// egui-winit fills `RawInput::safe_area_insets` itself, so writing zeros
+    /// here would be this code overriding the platform's own answer with a
+    /// worse one.
+    ///
+    /// Android is the only platform that answers `Some`, and it answers
+    /// all-zero for a failed read as readily as for a real one, so callers
+    /// must not ask unless a layout has actually happened.
+    fn refresh_safe_area_insets(&mut self) {
+        if let Some((top, bottom, left, right)) = self.platform.query_insets() {
+            self.gui.set_safe_area_insets(top, bottom, left, right);
         }
     }
 
@@ -578,26 +625,32 @@ impl App {
         }
     }
 
-    /// Set a receiver for GPS fix updates (Android only).
-    #[cfg(target_os = "android")]
+    // The three below are forwards to trait methods that are *not* gated: the
+    // bridge declares them for every platform with a no-op default, and only
+    // Android and the web override any of them. Gating the forwards on
+    // `target_os = "android"` therefore bought nothing and cost twice: the web
+    // entry point had to reach past `App` and call the trait method on its own
+    // bridge before boxing it, and a host build — which is every build the
+    // tests run in — compiled none of this, so nothing here could be exercised
+    // anywhere. `set_theme_detector` beside them was never gated at all.
+    //
+    // `set_safe_area_insets` used to sit here too and is gone. It pushed insets
+    // straight at the UI, and no entry point has called it since Android
+    // switched to injecting a querier; the live route is `set_insets_querier`
+    // -> `query_insets` -> `refresh_safe_area_insets`.
+
+    /// Set a receiver for GPS fix updates. Android and the web send fixes this
+    /// way; desktop reads a serial port instead, through `start_gps`.
     pub fn set_gps_fix_receiver(&mut self, receiver: std::sync::mpsc::Receiver<rustdar_gps::GpsFix>) {
         self.platform.set_gps_fix_receiver(receiver);
     }
 
     /// Set a receiver for compass heading updates (Android only).
-    #[cfg(target_os = "android")]
     pub fn set_heading_receiver(&mut self, receiver: std::sync::mpsc::Receiver<f32>) {
         self.platform.set_heading_receiver(receiver);
     }
 
-    /// Set safe area insets in logical pixels (top, bottom, left, right).
-    #[cfg(target_os = "android")]
-    pub fn set_safe_area_insets(&mut self, top: f32, bottom: f32, left: f32, right: f32) {
-        self.gui.set_safe_area_insets(top, bottom, left, right);
-    }
-
-    /// Set a callback that queries system bar insets.
-    #[cfg(target_os = "android")]
+    /// Set a callback that queries system bar insets (Android only).
     pub fn set_insets_querier(&mut self, querier: fn() -> (f32, f32, f32, f32)) {
         self.platform.set_insets_querier(querier);
     }
@@ -728,10 +781,10 @@ impl ApplicationHandler for App {
         log::info!("App resumed");
         self.create_window(event_loop);
 
-        // Query system bar insets now that the window is ready.
-        if let Some((top, bottom, left, right)) = self.platform.query_insets() {
-            self.gui.set_safe_area_insets(top, bottom, left, right);
-        }
+        // Query system bar insets now that the window is ready. Not the only
+        // query — see `handle_resized`, which catches the orientation changes
+        // that never come back through here.
+        self.refresh_safe_area_insets();
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
@@ -809,9 +862,12 @@ impl ApplicationHandler for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform_double::TestBridge;
+    use rustdar_egui::config_store::MemoryConfigStore;
     use rustdar_egui::overlay_cache::OverlayTexturePlan;
     use rustdar_overlays::render::overlay_state::OverlayKind;
     use rustdar_overlays::types::GeoBounds;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn bounds() -> GeoBounds {
         GeoBounds { min_lat: 30.0, max_lat: 40.0, min_lon: -100.0, max_lon: -90.0 }
@@ -917,75 +973,14 @@ mod tests {
 
     /// A bridge that consumes every back press, as Android's does: it installs
     /// a handler at startup and `handle_back` reports `true` from then on.
-    struct MinimisingBridge;
-
-    impl PlatformBridge for MinimisingBridge {
-        fn handle_back(&self) -> bool {
-            true
-        }
-        fn poll_theme(&mut self) -> Option<bool> {
-            None
-        }
-        fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix> {
-            None
-        }
-        fn poll_heading(&mut self) -> Option<f32> {
-            None
-        }
-        fn query_insets(&self) -> Option<(f32, f32, f32, f32)> {
-            None
-        }
-        fn detect_dark_theme(&self) -> bool {
-            false
-        }
-        fn set_back_handler(&mut self, _handler: fn()) {}
-        fn set_zone_cache_dir(&mut self, _dir: std::path::PathBuf) {}
-        fn zone_cache_dir(&self) -> Option<&std::path::Path> {
-            None
-        }
-        fn set_config_dir(&mut self, _dir: std::path::PathBuf) {}
-        fn config_store(&self) -> Option<Box<dyn rustdar_egui::config_store::ConfigStore>> {
-            None
-        }
-        fn needs_process_exit(&self) -> bool {
-            true
-        }
-    }
-
-    /// A bridge with no back handler installed, as desktop and the web have.
-    struct QuittingBridge;
-
-    impl PlatformBridge for QuittingBridge {
-        fn handle_back(&self) -> bool {
-            false
-        }
-        fn poll_theme(&mut self) -> Option<bool> {
-            None
-        }
-        fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix> {
-            None
-        }
-        fn poll_heading(&mut self) -> Option<f32> {
-            None
-        }
-        fn query_insets(&self) -> Option<(f32, f32, f32, f32)> {
-            None
-        }
-        fn detect_dark_theme(&self) -> bool {
-            false
-        }
-        fn set_back_handler(&mut self, _handler: fn()) {}
-        fn set_zone_cache_dir(&mut self, _dir: std::path::PathBuf) {}
-        fn zone_cache_dir(&self) -> Option<&std::path::Path> {
-            None
-        }
-        fn set_config_dir(&mut self, _dir: std::path::PathBuf) {}
-        fn config_store(&self) -> Option<Box<dyn rustdar_egui::config_store::ConfigStore>> {
-            None
-        }
-        fn needs_process_exit(&self) -> bool {
-            false
-        }
+    fn minimising_bridge() -> TestBridge {
+        let mut bridge = TestBridge::android();
+        // Deliberately not `record_back_press`: that one's flag belongs to
+        // `the_injected_callbacks_reach_the_bridge` alone. Tests run in
+        // parallel, and a second writer could set it while that test is
+        // asserting — which would only ever make it pass, which is worse.
+        bridge.set_back_handler(|| {});
+        bridge
     }
 
     /// Back with something open closes it; only a second press, with nothing
@@ -1003,7 +998,7 @@ mod tests {
     #[test]
     fn back_closes_what_is_open_before_it_minimises() {
         let mut gui = Gui::new();
-        let platform = MinimisingBridge;
+        let platform = minimising_bridge();
         gui.show_settings = true;
 
         assert_eq!(
@@ -1086,7 +1081,7 @@ mod tests {
     #[test]
     fn escape_with_nothing_open_still_exits() {
         let mut gui = Gui::new();
-        let platform = QuittingBridge;
+        let platform = TestBridge::desktop();
         gui.show_settings = true;
 
         assert_eq!(
@@ -1095,5 +1090,431 @@ mod tests {
             "escape must close the window rather than quit, same as back"
         );
         assert_eq!(App::resolve_back_press(&mut gui, &platform), BackPress::Exit);
+    }
+
+    // ── Driving a whole `App` ───────────────────────────────────────────
+    //
+    // Everything below builds one. Two things used to make that impossible and
+    // only one of them was real: `App::new` builds a `wgpu::Instance` and a
+    // Tokio runtime, and it needs a `PlatformBridge`. The bridge is now
+    // `platform_double::TestBridge`; the instance is built with no backends,
+    // which is the whole of `with_instance`'s reason to exist. A texture upload
+    // was also blamed and is not an obstacle at all — a bare `egui::Context`
+    // uploads perfectly well with no renderer behind it, which is what
+    // `app_render`'s tests rely on.
+
+    /// An `App` with no GPU behind it, wired the way `App::new` wires one.
+    pub(super) fn headless(platform: TestBridge) -> App {
+        App::with_instance(
+            egui_wgpu::wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::empty(),
+                ..instance_descriptor()
+            }),
+            Box::new(platform),
+        )
+    }
+
+    /// A loop speed no default produces, so finding it can only mean the stored
+    /// config was read.
+    const STORED_FPS: f32 = 9.25;
+
+    /// Write a config the way the app writes one, rather than by hand: a
+    /// literal blob would stop matching the format the moment it changed and
+    /// would then be testing nothing.
+    fn seed_config(store: &MemoryConfigStore, fps: f32) {
+        let mut gui = Gui::new();
+        gui.loop_speed_fps = fps;
+        gui.save_ui_config(store);
+    }
+
+    /// What a bridge's store holds, read back through the same parser the app
+    /// loads with.
+    fn stored_fps(store: &MemoryConfigStore) -> f32 {
+        let mut reloaded = Gui::new();
+        reloaded.load_ui_config(store);
+        reloaded.loop_speed_fps
+    }
+
+    /// Set by the back handler the app installs, so a test can see it *ran*
+    /// rather than merely being held somewhere.
+    static BACK_PRESS_REACHED_THE_HANDLER: AtomicBool = AtomicBool::new(false);
+
+    fn record_back_press() {
+        BACK_PRESS_REACHED_THE_HANDLER.store(true, Ordering::Relaxed);
+    }
+
+    fn always_dark() -> bool {
+        true
+    }
+
+    /// The app opens showing what the last session left, and it can only get
+    /// that from the bridge — this crate has no idea where config lives.
+    #[test]
+    fn the_app_opens_with_the_config_its_platform_kept() {
+        let bridge = TestBridge::desktop();
+        seed_config(&bridge.store(), STORED_FPS);
+
+        let app = headless(bridge);
+
+        assert_eq!(
+            app.gui.loop_speed_fps, STORED_FPS,
+            "the stored config never reached the UI, so every session starts \
+             on defaults",
+        );
+    }
+
+    /// iOS cannot quit, and the menu must not offer to. The flag is pushed in
+    /// from here because `rustdar-egui` cannot see a bridge; what it then does
+    /// with it — dropping the Exit entry — is covered there.
+    #[test]
+    fn the_ui_is_told_whether_this_platform_can_quit() {
+        assert!(
+            !headless(TestBridge::ios()).gui.supports_exit(),
+            "iOS would draw an Exit button that does nothing",
+        );
+        assert!(
+            headless(TestBridge::desktop()).gui.supports_exit(),
+            "the desktop menu lost its Exit entry",
+        );
+    }
+
+    /// Android learns its data directory only after startup, so the load in
+    /// `App::new` had nothing to read and the second one is the only one that
+    /// ever runs there.
+    ///
+    /// Also the strongest available statement that the directory *reached the
+    /// bridge*: the double, like Android's, has no store to hand out until it
+    /// has been told where one lives, so a dropped forward leaves the UI on
+    /// defaults just as a dropped load does.
+    #[test]
+    fn learning_where_config_lives_loads_it() {
+        let bridge = TestBridge::android();
+        seed_config(&bridge.store(), STORED_FPS);
+
+        let mut app = headless(bridge);
+        assert_eq!(
+            app.gui.loop_speed_fps, 5.0,
+            "precondition: nowhere to load from yet",
+        );
+
+        app.set_config_dir(std::path::PathBuf::from("/data/user/0/rustdar"));
+
+        assert_eq!(
+            app.gui.loop_speed_fps, STORED_FPS,
+            "the config directory arrived and nothing was read from it",
+        );
+    }
+
+    /// The save has to happen before the platform gets to refuse the exit.
+    ///
+    /// On iOS the refusal is unconditional, so a `supports_exit` check hoisted
+    /// above the save would mean that platform never persists anything on quit
+    /// at all — and it would look completely fine on every other platform.
+    #[test]
+    fn a_platform_that_cannot_quit_still_saves_on_the_way_out() {
+        let bridge = TestBridge::ios();
+        let store = bridge.store();
+        let mut app = headless(bridge);
+        app.gui.loop_speed_fps = STORED_FPS;
+
+        app.request_exit(None);
+
+        assert_eq!(
+            stored_fps(&store),
+            STORED_FPS,
+            "nothing was persisted; on iOS this is the only exit path there is",
+        );
+        assert!(
+            !app.exit_requested,
+            "iOS has no quit, so nothing may be scheduled on the next event",
+        );
+    }
+
+    /// An exit asked for during a redraw has no event loop to hand, so it is
+    /// deferred rather than dropped.
+    #[test]
+    fn an_exit_with_no_event_loop_is_deferred_to_the_next_event() {
+        let mut app = headless(TestBridge::desktop());
+        assert!(!app.exit_requested, "precondition");
+
+        app.request_exit(None);
+
+        assert!(
+            app.exit_requested,
+            "the request was swallowed and the app never quits",
+        );
+    }
+
+    /// The menu's Exit is one of the four ways out and goes through the same
+    /// gate as the rest: it saves, and it respects a platform that cannot quit.
+    ///
+    /// The other three — `CloseRequested`, Escape and the Android back button —
+    /// all reach `request_exit` holding an `ActiveEventLoop`, which winit will
+    /// not hand out except from inside a running loop. Their routes are pinned
+    /// by the source probes above and below; only this one can be driven.
+    #[test]
+    fn the_menus_exit_goes_through_the_same_gate() {
+        let mut app = headless(TestBridge::desktop());
+        app.handle_gui_action(GuiAction::Exit, None);
+        assert!(
+            app.exit_requested,
+            "Exit from the menu no longer reaches request_exit",
+        );
+
+        let bridge = TestBridge::ios();
+        let store = bridge.store();
+        let mut app = headless(bridge);
+        app.gui.loop_speed_fps = STORED_FPS;
+
+        app.handle_gui_action(GuiAction::Exit, None);
+
+        assert!(!app.exit_requested, "iOS took the exit path anyway");
+        assert_eq!(
+            stored_fps(&store),
+            STORED_FPS,
+            "the menu's Exit skipped the config save",
+        );
+    }
+
+    /// A fix and a heading are separate readings from separate sensors and must
+    /// stay that way: the map draws the dot from one and rotates it by the
+    /// other.
+    ///
+    /// Both arrive over channels the app installs on the bridge, which is how
+    /// Android and the browser deliver them. Nothing here could be reached at
+    /// all until those two setters stopped being `#[cfg(target_os = "android")]`.
+    ///
+    /// Driven through `handle_redraw` rather than `poll_platform_state`
+    /// directly. Nothing else polls the bridge, so calling the poller by hand
+    /// would leave the one line that schedules it — in the frame loop — free to
+    /// be deleted. With no window, `handle_redraw` polls and then returns
+    /// before it needs a renderer.
+    #[test]
+    fn the_platforms_sensors_reach_the_map() {
+        let mut app = headless(TestBridge::android());
+        let (fix_tx, fix_rx) = std::sync::mpsc::channel();
+        let (heading_tx, heading_rx) = std::sync::mpsc::channel();
+        app.set_gps_fix_receiver(fix_rx);
+        app.set_heading_receiver(heading_rx);
+
+        fix_tx
+            .send(rustdar_gps::GpsFix::from_lat_lon(35.3331, -97.2778))
+            .unwrap();
+        heading_tx.send(214.5).unwrap();
+
+        app.handle_redraw();
+
+        let fix = app.gui.gps_fix().expect("no position reached the UI");
+        assert_eq!((fix.latitude, fix.longitude), (35.3331, -97.2778));
+        assert_eq!(
+            app.gui.user_heading(),
+            Some(214.5),
+            "no compass reading reached the UI — note the fix carries no \
+             heading of its own, so this cannot have come from it",
+        );
+    }
+
+    /// A theme change has to invalidate the site labels, and only a *change*
+    /// may.
+    ///
+    /// The labels are raster textures baked in the theme's colours, so they are
+    /// stale the moment it flips. But Android's theme poller re-sends its
+    /// reading every two seconds whether or not it moved — see
+    /// `spawn_state_poller` — so an unguarded bump would re-rasterise every
+    /// label on every pane twice a second, forever.
+    #[test]
+    fn a_theme_change_invalidates_the_site_labels_exactly_once() {
+        let mut bridge = TestBridge::android();
+        let theme = bridge.theme_channel();
+        let mut app = headless(bridge);
+        let before = app.gui.pane(0).unwrap().radar_sites_render_gen;
+
+        theme.send(true).unwrap();
+        app.handle_redraw();
+
+        assert_eq!(app.cached_dark_theme, Some(true), "the change was not taken");
+        let after = app.gui.pane(0).unwrap().radar_sites_render_gen;
+        assert_eq!(
+            after,
+            before.wrapping_add(1),
+            "the site labels still carry the old theme's colours",
+        );
+
+        theme.send(true).unwrap();
+        app.handle_redraw();
+
+        assert_eq!(
+            app.gui.pane(0).unwrap().radar_sites_render_gen,
+            after,
+            "a repeated reading re-rasterised every label; the poller sends \
+             one of these every two seconds",
+        );
+    }
+
+    /// Where the injected querier says the system bars are. A `fn` pointer
+    /// closes over nothing, which is the constraint Android's real querier is
+    /// under too — it reaches the framework through a process-wide `JavaVM`.
+    static ROTATED: AtomicBool = AtomicBool::new(false);
+
+    fn cutout() -> (f32, f32, f32, f32) {
+        if ROTATED.load(Ordering::Relaxed) {
+            (0.0, 0.0, 96.0, 0.0)
+        } else {
+            (96.0, 0.0, 0.0, 0.0)
+        }
+    }
+
+    /// Turning the device sideways moves the cutout to another edge, and the
+    /// app has to ask again.
+    ///
+    /// It arrives as a resize, not as a resume, so insets queried once at
+    /// startup describe the orientation the app happened to open in for the
+    /// rest of the session — reserving a strip along the top while the notch is
+    /// down the left. The resize is also the signal that a layout has happened,
+    /// which is what `getRootWindowInsets` needs before it has anything current
+    /// to return.
+    #[test]
+    fn a_rotation_re_queries_the_insets_rather_than_keeping_the_old_edge() {
+        ROTATED.store(false, Ordering::Relaxed);
+        let mut app = headless(TestBridge::android());
+        app.set_insets_querier(cutout);
+
+        // What `resumed` does once the window exists.
+        app.refresh_safe_area_insets();
+        assert_eq!(
+            app.gui.safe_area_insets(),
+            (96.0, 0.0, 0.0, 0.0),
+            "precondition: portrait puts the cutout along the top",
+        );
+
+        ROTATED.store(true, Ordering::Relaxed);
+        app.handle_resized(2400, 1080);
+
+        assert_eq!(
+            app.gui.safe_area_insets(),
+            (0.0, 0.0, 96.0, 0.0),
+            "the device rotated and the app is still holding a strip clear at \
+             the top while the cutout eats the left edge",
+        );
+    }
+
+    /// Both query sites have to stay wired. The behavioural test above drives
+    /// `handle_resized`; `resumed` takes an `ActiveEventLoop` and cannot be
+    /// called, so its half is read off the source, as `back_out`'s is.
+    #[test]
+    fn both_inset_queries_are_still_wired() {
+        for f in ["fn resumed(", "fn handle_resized("] {
+            assert!(
+                fn_body(f).contains("refresh_safe_area_insets("),
+                "{f} no longer asks the platform for insets",
+            );
+        }
+    }
+
+    /// The window's own close button is the fourth exit trigger and the last
+    /// one with no other handle on it: `window_event` takes an
+    /// `ActiveEventLoop`, so the arm can only be read.
+    ///
+    /// What it must reach is `request_exit` and not `event_loop.exit()` — the
+    /// config save and the `supports_exit` refusal both live inside it, and a
+    /// direct exit here would skip both while looking perfectly correct.
+    #[test]
+    fn closing_the_window_goes_through_request_exit() {
+        let body = fn_body("fn window_event(");
+        let arm = body
+            .find("WindowEvent::CloseRequested")
+            .expect("window_event no longer handles CloseRequested");
+        let arm_end = body[arm..]
+            .find("WindowEvent::RedrawRequested")
+            .map(|i| arm + i)
+            .unwrap_or(body.len());
+        assert!(
+            body[arm..arm_end].contains("self.request_exit("),
+            "the close button bypasses request_exit, so it saves no config and \
+             ignores a platform that cannot quit: {}",
+            &body[arm..arm_end],
+        );
+    }
+
+    /// Two things the app hands the bridge that it can only get back by asking.
+    ///
+    /// The theme read is Android's only source — NativeActivity never emits
+    /// `ThemeChanged` — and the back handler is what makes back minimise there
+    /// instead of quitting. Both are `fn` pointers because the JNI they end in
+    /// lives in a crate the bridge cannot depend on.
+    #[test]
+    fn the_injected_callbacks_reach_the_bridge() {
+        let mut app = headless(TestBridge::android());
+        assert!(
+            !app.platform.detect_dark_theme(),
+            "precondition: nothing injected yet",
+        );
+
+        app.set_theme_detector(always_dark);
+        assert!(
+            app.platform.detect_dark_theme(),
+            "the theme read never arrived, and Android has no other one",
+        );
+
+        BACK_PRESS_REACHED_THE_HANDLER.store(false, Ordering::Relaxed);
+        assert_eq!(
+            App::resolve_back_press(&mut app.gui, app.platform.as_ref()),
+            BackPress::Exit,
+            "precondition: with no handler installed, back quits",
+        );
+
+        app.set_back_handler(record_back_press);
+        assert_eq!(
+            App::resolve_back_press(&mut app.gui, app.platform.as_ref()),
+            BackPress::PlatformHandled,
+        );
+        assert!(
+            BACK_PRESS_REACHED_THE_HANDLER.load(Ordering::Relaxed),
+            "the handler was installed but never run, so back reports the app \
+             minimised and nothing minimises",
+        );
+    }
+
+    /// The reader is started on the port the *action* names.
+    ///
+    /// The settings pane edits a config and emits it with the action; the
+    /// bridge is the only thing that ever sees it, and opening the wrong serial
+    /// port is indistinguishable from a missing one at this level. So the
+    /// double keeps what it was handed — the one place in this suite where a
+    /// recorded argument is the only observable there is.
+    #[test]
+    fn starting_gps_hands_the_bridge_the_config_the_action_carried() {
+        let bridge = TestBridge::desktop();
+        let started = bridge.gps_record();
+        let mut app = headless(bridge);
+
+        app.handle_gui_action(
+            GuiAction::StartGps {
+                config: rustdar_gps::GpsConfig {
+                    port_path: Some("/dev/ttyPROBE".to_string()),
+                    baud_rate: 38400,
+                    ..Default::default()
+                },
+            },
+            None,
+        );
+
+        assert!(app.platform.gps_active(), "the reader was never started");
+        {
+            let record = started.borrow();
+            let config = record.as_ref().expect("start_gps was not reached");
+            assert_eq!(
+                config.port_path.as_deref(),
+                Some("/dev/ttyPROBE"),
+                "the reader opened a different port than the action asked for",
+            );
+            assert_eq!(config.baud_rate, 38400);
+        }
+
+        app.handle_gui_action(GuiAction::StopGps, None);
+        assert!(
+            !app.platform.gps_active(),
+            "the reader kept the serial port open after being told to stop",
+        );
     }
 }

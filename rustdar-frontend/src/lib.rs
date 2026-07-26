@@ -35,4 +35,8 @@ pub mod offload;
 #[cfg(test)]
 mod mobile_cfg;
 pub mod platform;
+/// The [`PlatformBridge`](platform::PlatformBridge) test double. Compiled only
+/// for tests; it is the seam every `App`-level test is driven through.
+#[cfg(test)]
+pub(crate) mod platform_double;
 pub mod render_dispatch;

@@ -260,11 +260,11 @@ impl super::App {
             max_lon: bounds.max_lon,
         };
         let pane = self.gui.pane_mut(pane_idx).unwrap();
-        // The lookup and the assignment are inside the callee, which the
-        // dispatcher's own tests drive; this call is the one hop nothing
-        // covers, along with everything else in this function — `App::new`
-        // wants a `PlatformBridge` and this wants a texture upload, so there
-        // is no harness here to reach it from.
+        // Dropping this call is silent: a pane that should be captioned with a
+        // two-hour-old Level III object looks exactly like a pane showing Level
+        // II, which is captioned with nothing. The lookup and the assignment
+        // inside the callee are the dispatcher's own tests' business; that this
+        // function *makes the call* is `stamping_tests` below.
         self.render.stamp_pane_with_product_age(pane, render);
         let cache = pane.overlay_cache_mut(OverlayKind::Radar);
         cache.current = Some(OverlayTextureData {
@@ -2202,6 +2202,195 @@ mod frame_order_tests {
         assert_eq!(
             applied, 2.0,
             "a scale set after skipped frames must still reach the next pass"
+        );
+    }
+}
+
+/// What `apply_render_to_pane` does with a finished image beyond placing it.
+///
+/// Reached by building an `App` — see `app::tests::headless` — with the
+/// platform double standing in for the OS and a bare `egui::Context` for the
+/// renderer. The upload is genuinely done here: `Context::load_texture` needs no
+/// device, no surface and no window, so the only thing that ever blocked this
+/// was `App::new`'s wgpu instance.
+#[cfg(test)]
+mod stamping_tests {
+    use super::*;
+    use crate::platform_double::TestBridge;
+    use nexrad_level3::model::{Level3Message, MessageHeader, ProductDescriptionBlock};
+    use rustdar_radar::level3::{Level3Product, ProductStamp};
+    use rustdar_radar::types::{RadarProduct, ScanInfo};
+
+    /// A radar whose Level III objects the pane below is showing.
+    const SITE: &str = "KMPX";
+    /// The product carried through: Level III, and not the storm-relative one,
+    /// whose tilt filter would need a symbology block to pass.
+    const PRODUCT: RadarProduct = RadarProduct::EchoTops;
+
+    /// The smallest Level III object `nearest_tilt` will consider: it reads the
+    /// elevation off the PDB and nothing else, and `is_renderable_tilt` waves
+    /// through everything that is not storm-relative velocity.
+    fn tilt(elevation_tenths: i16, key: &str) -> Level3Product {
+        Level3Product {
+            message: Level3Message {
+                header: MessageHeader {
+                    message_code: 135,
+                    date_of_message: 20661,
+                    time_of_message: 7108,
+                    message_length: 0,
+                    source_id: 0,
+                    destination_id: 0,
+                    number_of_blocks: 3,
+                },
+                pdb: ProductDescriptionBlock {
+                    block_divider: -1,
+                    latitude: 44.849,
+                    longitude: -93.565,
+                    height: 1000,
+                    product_code: 135,
+                    operational_mode: 2,
+                    vcp: 212,
+                    sequence_number: 0,
+                    volume_scan_number: 39,
+                    volume_scan_date: 20661,
+                    volume_scan_time: 7108,
+                    generation_date: 20661,
+                    generation_time: 7108,
+                    product_specific_1: 0,
+                    product_specific_2: 0,
+                    elevation_number: 1,
+                    product_specific_3: elevation_tenths,
+                    thresholds: [0u16; 16],
+                    product_specific_47_53: [0i16; 7],
+                    version: 0,
+                    spot_blank: 0,
+                    symbology_offset: 60,
+                    graphic_offset: 0,
+                    tabular_offset: 0,
+                },
+                symbology: None,
+            },
+            stamp: ProductStamp::from_key(key),
+        }
+    }
+
+    /// A finished render, as `poll_render_results` builds one. The pixels are
+    /// blank but full size: `ColorImage::from_rgba_unmultiplied` checks the
+    /// buffer against the dimensions it is given.
+    fn finished(product: RadarProduct, elevation: f32) -> CachedPaneRender {
+        CachedPaneRender {
+            image_data: Arc::new(vec![0u8; IMAGE_SIZE * IMAGE_SIZE * 4]),
+            max_range_km: 230.0,
+            value_data: Arc::new(Vec::new()),
+            product,
+            elevation,
+        }
+    }
+
+    /// An `App` with one pane on [`SITE`], far enough along that
+    /// `apply_render_to_pane` will not bail out of it: the pane needs scan info
+    /// for the site coordinates and the dispatcher needs a slot for the pane.
+    fn app_showing_site() -> crate::app::App {
+        let mut app = crate::app::tests::headless(TestBridge::desktop());
+        let site = rustdar_radar::sites::get_radar_site(SITE)
+            .expect("KMPX is a real radar")
+            .clone();
+        app.gui.pane_mut(0).unwrap().site = SITE.to_string();
+        app.gui.set_scan_info_for_pane(
+            0,
+            ScanInfo {
+                site,
+                timestamp: chrono::NaiveDate::from_ymd_opt(2026, 7, 26)
+                    .unwrap()
+                    .and_hms_opt(1, 55, 52)
+                    .unwrap(),
+                vcp_number: 212,
+                available_products: vec![PRODUCT],
+                product_elevations: std::collections::HashMap::new(),
+                status: String::new(),
+            },
+        );
+        app.render.ensure_pane_count(1);
+        app
+    }
+
+    /// Placing an image also dates it.
+    ///
+    /// `latest_key` falls back to the previous UTC day, so a site that went down
+    /// yesterday serves an object most of a day old while the Level II scan line
+    /// beside it looks current. The age line is the only thing that says so, and
+    /// its absence is invisible: an undated pane is exactly what a Level II pane
+    /// looks like. Nothing between the render arriving and the pane being drawn
+    /// would notice this call going missing.
+    #[test]
+    fn a_placed_render_dates_the_pane_it_lands_on() {
+        let ctx = egui::Context::default();
+        let mut app = app_showing_site();
+        app.render.cache_level3(
+            PRODUCT,
+            "EET".to_string(),
+            SITE.to_string(),
+            tilt(5, "MPX_EET_2026_07_26_01_55_52"),
+        );
+
+        app.apply_render_to_pane(&ctx, 0, &finished(PRODUCT, 0.5));
+
+        let stamped = app.gui.pane(0).unwrap().level3_time;
+        assert_eq!(
+            stamped,
+            Some(
+                chrono::NaiveDate::from_ymd_opt(2026, 7, 26)
+                    .unwrap()
+                    .and_hms_opt(1, 55, 52)
+                    .unwrap()
+            ),
+            "the image was placed undated, so the status bar says nothing about \
+             an object that may be a day old",
+        );
+
+        // …and the image really did land, so the assertion above is about a
+        // frame the user would be looking at rather than an early return.
+        let pane = app.gui.pane_mut(0).unwrap();
+        assert!(
+            pane.overlay_cache_mut(
+                rustdar_overlays::render::overlay_state::OverlayKind::Radar
+            )
+            .current
+            .is_some(),
+            "precondition: no texture was placed at all",
+        );
+    }
+
+    /// Switching a pane to a product with no stamp clears the old one.
+    ///
+    /// The assignment is unconditional for this reason: leaving the last Level
+    /// III object's time in place would caption a Level II volume with the age
+    /// of a field it has nothing to do with — a wrong answer, where saying
+    /// nothing is the right one.
+    #[test]
+    fn a_render_with_no_stamp_behind_it_clears_the_old_date() {
+        let ctx = egui::Context::default();
+        let mut app = app_showing_site();
+        app.render.cache_level3(
+            PRODUCT,
+            "EET".to_string(),
+            SITE.to_string(),
+            tilt(5, "MPX_EET_2026_07_26_01_55_52"),
+        );
+
+        app.apply_render_to_pane(&ctx, 0, &finished(PRODUCT, 0.5));
+        assert!(
+            app.gui.pane(0).unwrap().level3_time.is_some(),
+            "precondition: it was dated",
+        );
+
+        app.apply_render_to_pane(&ctx, 0, &finished(RadarProduct::Reflectivity, 0.5));
+
+        assert_eq!(
+            app.gui.pane(0).unwrap().level3_time,
+            None,
+            "a Level II volume is still captioned with the last Level III \
+             object's age",
         );
     }
 }
