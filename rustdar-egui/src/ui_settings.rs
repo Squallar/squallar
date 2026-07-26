@@ -161,9 +161,44 @@ impl super::Gui {
                 ui.separator();
                 ui.add_space(SETTINGS_SMALL_SPACING);
 
+                // --- Storm motion (storm-relative velocity) ---
+                //
+                // Off by default: the RPG's own SCIT average is in the N0S
+                // Product Description Block and is what the RPG used for the
+                // 0.5° tilt, so overriding it makes the tilts disagree.
+                ui.heading("Storm motion");
+                ui.add_space(SETTINGS_SMALL_SPACING);
+                let motion = &mut self.storm_motion_override;
+                ui.checkbox(&mut motion.enabled, "Override average storm motion");
+                ui.add_enabled_ui(motion.enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Speed:");
+                        ui.add(
+                            egui::DragValue::new(&mut motion.speed_kt)
+                                .speed(0.5)
+                                .range(0.0..=200.0)
+                                .suffix(" kt"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("From:");
+                        ui.add(
+                            egui::DragValue::new(&mut motion.direction_deg)
+                                .speed(1.0)
+                                .range(0.0..=360.0)
+                                .suffix("\u{00b0}"),
+                        );
+                    });
+                });
+
+                ui.add_space(SETTINGS_LARGE_SPACING);
+                ui.separator();
+                ui.add_space(SETTINGS_SMALL_SPACING);
+
                 if ui.button("Reset to defaults").clicked() {
                     self.preferences = UserPreferences::default();
                     self.gps_config = rustdar_gps::GpsConfig::default();
+                    self.storm_motion_override = crate::StormMotionOverride::default();
                 }
             });
 

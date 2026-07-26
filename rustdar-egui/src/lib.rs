@@ -12,5 +12,5 @@ pub(crate) mod ui_layout;
 #[cfg(test)]
 mod input_harness;
 
-pub use ui::Gui;
+pub use ui::{Gui, StormMotionOverride};
 pub use ui_input::{normalize_touch_devices, normalize_wheel_units};
