@@ -230,13 +230,26 @@ impl super::Gui {
                         }
                     }
 
-                    // Flexible space pushes the error to the right.
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            render_error_display(ui, &mut self.radar.error_message);
-                        },
-                    );
+                    // Flexible space pushes the error to the right — but only
+                    // when there is an error to push.
+                    //
+                    // Allocated unconditionally this scope is empty most of the
+                    // time, and an empty child `Ui` is a zero-area widget rect
+                    // pinned to the row's right edge: a rect that never moves,
+                    // under an id that does. `Ui::new_child` folds the parent's
+                    // auto-id counter into every child scope's registered id —
+                    // `id_salt` stabilises only the state id, not that one — so
+                    // the auto-poll block above (three widgets mid-fetch, one
+                    // otherwise) re-keyed this slot on the frame a scan landed,
+                    // which egui reports as `changed id between passes`.
+                    if self.radar.error_message.is_some() {
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                render_error_display(ui, &mut self.radar.error_message);
+                            },
+                        );
+                    }
                 });
             });
 

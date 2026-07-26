@@ -172,6 +172,10 @@ pub struct Gui {
     /// What the last frame's status bar actually drew. Only read by tests.
     #[cfg(test)]
     last_status_bar: StatusBarProbe,
+    /// Every handler dropdown the last frame drew, with the text its collapsed
+    /// box showed. Only read by tests — see [`DrawnDropdown`].
+    #[cfg(test)]
+    last_dropdowns: Vec<DrawnDropdown>,
     viewport_sync: bool,
     sync_layers: bool,
     // --- Radar loop settings ---
@@ -252,6 +256,76 @@ impl Default for Gui {
     }
 }
 
+/// The order the layers panel renders each handler's controls in.
+const OVERLAY_CONTROL_ORDER: &[OverlayKind] = &[
+    OverlayKind::Radar,
+    OverlayKind::ModelData,
+    OverlayKind::SpcOutlook,
+    OverlayKind::SpcDiscussions,
+    OverlayKind::NwsAlerts,
+    OverlayKind::StormReports,
+    OverlayKind::Lightning,
+    OverlayKind::Metar,
+    OverlayKind::CityLabels,
+    OverlayKind::RadarSites,
+    OverlayKind::UserLocation,
+    OverlayKind::ColorScale,
+];
+
+/// The label the open list puts against `value`, or the raw value for one the
+/// handler did not offer.
+///
+/// The single source of the text for a [`ControlItem::Dropdown`]: both the
+/// collapsed box and the list read it, which is the whole point of it existing.
+fn dropdown_option_label<'a>(options: &'a [(String, String)], value: &'a str) -> &'a str {
+    options
+        .iter()
+        .find(|(v, _)| v == value)
+        .map_or(value, |(_, display)| display.as_str())
+}
+
+/// One dropdown a control tree actually drew: the text the *collapsed* box
+/// showed, and where it landed so a test can open it for real.
+///
+/// Reported by the renderer, like [`ui_menu::DrawnMenuLeaf`], rather than
+/// rebuilt by a test from the [`ControlItem`] — a test that reformatted the
+/// model itself would agree with a renderer that had stopped doing so.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DrawnDropdown {
+    pub id: &'static str,
+    pub label: String,
+    pub selected_text: String,
+    pub rect: egui::Rect,
+}
+
+/// What one pass over a control tree drew. A no-op outside tests, like
+/// [`ui_menu::MenuFrame`].
+#[derive(Default)]
+pub(crate) struct ControlProbe {
+    #[cfg(test)]
+    pub drawn: Vec<DrawnDropdown>,
+}
+
+impl ControlProbe {
+    #[inline]
+    fn record_dropdown(
+        &mut self,
+        _id: &'static str,
+        _label: &str,
+        _selected_text: &str,
+        _rect: egui::Rect,
+    ) {
+        #[cfg(test)]
+        self.drawn.push(DrawnDropdown {
+            id: _id,
+            label: _label.to_owned(),
+            selected_text: _selected_text.to_owned(),
+            rect: _rect,
+        });
+    }
+}
+
 /// Render a single declarative [`ControlItem`] into the UI, collecting any
 /// resulting [`ControlUpdate`]s into `updates`.
 fn render_control_item(
@@ -259,6 +333,7 @@ fn render_control_item(
     kind: OverlayKind,
     item: &ControlItem,
     updates: &mut Vec<(OverlayKind, ControlUpdate)>,
+    probe: &mut ControlProbe,
 ) {
     match item {
         ControlItem::Toggle { id, label, enabled } => {
@@ -302,13 +377,19 @@ fn render_control_item(
             let original = sel.clone();
             ui.horizontal(|ui| {
                 ui.label(label.as_str());
-                egui::ComboBox::from_id_salt(format!("{kind:?}_{id}"))
-                    .selected_text(sel.as_str())
+                // One formatter for both halves. `selected_text` used to be the
+                // raw option *value*, so the collapsed box read `sbcin` and
+                // `both` while the list it opened said "Surface-Based CIN" and
+                // "Both".
+                let shown = dropdown_option_label(options, &sel).to_owned();
+                let combo = egui::ComboBox::from_id_salt(format!("{kind:?}_{id}"))
+                    .selected_text(shown.as_str())
                     .show_ui(ui, |ui| {
                         for (value, display) in options {
                             ui.selectable_value(&mut sel, value.clone(), display.as_str());
                         }
                     });
+                probe.record_dropdown(id, label, &shown, combo.response.rect);
             });
             if sel != original {
                 updates.push((kind, ControlUpdate { id, value: ControlValue::String(sel) }));
@@ -335,14 +416,14 @@ fn render_control_item(
                     .default_open(*expanded)
                     .show(ui, |ui| {
                         for child in items {
-                            render_control_item(ui, kind, child, updates);
+                            render_control_item(ui, kind, child, updates, probe);
                         }
                     });
             } else {
                 ui.group(|ui| {
                     ui.label(egui::RichText::new(label.as_str()).strong());
                     for child in items {
-                        render_control_item(ui, kind, child, updates);
+                        render_control_item(ui, kind, child, updates, probe);
                     }
                 });
             }
@@ -398,6 +479,8 @@ impl Gui {
             last_map_excluded_rects: Vec::new(),
             #[cfg(test)]
             last_status_bar: StatusBarProbe::default(),
+            #[cfg(test)]
+            last_dropdowns: Vec::new(),
             viewport_sync: true,
             sync_layers: true,
             loop_lookback_secs: 3600, // default 1 hour
@@ -437,6 +520,9 @@ impl Gui {
             // are not there — a compact layout with the drawer shut offers
             // nothing at all.
             self.last_pane_options.clear();
+            // Same reason: the handler dropdowns only exist while the panel is
+            // on screen.
+            self.last_dropdowns.clear();
         }
 
         // Create a root Ui to host the panels. Since egui 0.35 the Context-taking
@@ -561,6 +647,48 @@ impl Gui {
         if let Some(pane) = self.panes.get_mut(pane_idx) {
             pane.scan_info = Some(info);
         }
+    }
+
+    /// Close the topmost thing the user has open, and say whether there was
+    /// one.
+    ///
+    /// What Escape and Android's back both mean: back out of the thing I am
+    /// in. Only when this returns `false` is the press a request to leave the
+    /// app — which is why the drawer used to cost a whole launch on a phone,
+    /// where the drawer *is* the menu at every width the Fold 7 reaches.
+    ///
+    /// Ordered topmost first — whatever is painted over everything else is
+    /// what a press is aimed at — and exactly one layer closes per press.
+    ///
+    /// Not derived from the order `ui` calls them in, which is time dialog,
+    /// then popup, then settings. The popup and the settings window are both
+    /// `Order::Foreground`, so egui stacks them by area recency rather than by
+    /// call order, and the time dialog sits below both. This order is asserted
+    /// rather than computed; see `a_back_press_closes_one_open_layer_at_a_time`.
+    ///
+    /// Deliberately not reachable from `request_exit`: the window's close
+    /// button and the menu's Exit item are unambiguous, and dismissing a dialog
+    /// instead of honouring them would strand the user — the Exit item lives
+    /// *inside* the drawer.
+    pub fn dismiss_top_layer(&mut self) -> bool {
+        if !self.overlays.selected_overlays.is_empty() {
+            self.overlays.selected_overlays.clear();
+            self.overlays.selected_overlay_page = 0;
+            return true;
+        }
+        if self.show_settings {
+            self.show_settings = false;
+            return true;
+        }
+        if self.time_dialog.show {
+            self.time_dialog.show = false;
+            return true;
+        }
+        if self.drawer_open {
+            self.drawer_open = false;
+            return true;
+        }
+        false
     }
 
     /// Set fetching status
@@ -1058,21 +1186,6 @@ impl Gui {
         pane: &mut PaneState,
         actions: &mut Vec<GuiAction>,
     ) {
-        const ORDER: &[OverlayKind] = &[
-            OverlayKind::Radar,
-            OverlayKind::ModelData,
-            OverlayKind::SpcOutlook,
-            OverlayKind::SpcDiscussions,
-            OverlayKind::NwsAlerts,
-            OverlayKind::StormReports,
-            OverlayKind::Lightning,
-            OverlayKind::Metar,
-            OverlayKind::CityLabels,
-            OverlayKind::RadarSites,
-            OverlayKind::UserLocation,
-            OverlayKind::ColorScale,
-        ];
-
         // Load this pane's config snapshot into the handlers.
         if !pane.overlay_configs.is_empty() {
             self.overlays.load_pane_configs(&pane.overlay_configs);
@@ -1085,8 +1198,9 @@ impl Gui {
 
         // Render controls and collect updates.
         let mut updates: Vec<(OverlayKind, ControlUpdate)> = Vec::new();
+        let mut probe = ControlProbe::default();
 
-        for (i, &kind) in ORDER.iter().enumerate() {
+        for (i, &kind) in OVERLAY_CONTROL_ORDER.iter().enumerate() {
             if i > 0 {
                 ui.add_space(6.0);
                 ui.separator();
@@ -1094,9 +1208,14 @@ impl Gui {
             let controls = self.overlays.controls(kind, &ctx);
 
             for item in &controls {
-                render_control_item(ui, kind, item, &mut updates);
+                render_control_item(ui, kind, item, &mut updates, &mut probe);
             }
         }
+
+        #[cfg(test)]
+        self.last_dropdowns.extend(probe.drawn.iter().cloned());
+        #[cfg(not(test))]
+        let _ = probe;
 
         // Apply updates and handle effects.
         let mut pane_ctx = PaneControlContextMut {
@@ -1379,6 +1498,45 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn set_drawer_open(&mut self, open: bool) {
         self.drawer_open = open;
+    }
+
+    /// Every handler dropdown the last frame drew. See [`DrawnDropdown`].
+    #[cfg(test)]
+    pub(crate) fn dropdowns_for_test(&self) -> &[DrawnDropdown] {
+        &self.last_dropdowns
+    }
+
+    /// The `(options, selected)` a handler is currently offering under `label`
+    /// — the *model* behind a [`DrawnDropdown`], asked of the handler rather
+    /// than of the renderer.
+    #[cfg(test)]
+    pub(crate) fn dropdown_model_for_test(
+        &self,
+        label: &str,
+    ) -> Option<(Vec<(String, String)>, String)> {
+        let ctx = PaneControlContext { pane_idx: self.active_pane, pane_state: None };
+        fn find(
+            items: &[ControlItem],
+            label: &str,
+        ) -> Option<(Vec<(String, String)>, String)> {
+            for item in items {
+                match item {
+                    ControlItem::Dropdown { label: l, options, selected, .. } if l == label => {
+                        return Some((options.clone(), selected.clone()));
+                    }
+                    ControlItem::Section { items, .. } => {
+                        if let Some(found) = find(items, label) {
+                            return Some(found);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        OVERLAY_CONTROL_ORDER
+            .iter()
+            .find_map(|&kind| find(&self.overlays.controls(kind, &ctx), label))
     }
 
     /// This frame's resolved layout, for tests asserting on the breakpoint.

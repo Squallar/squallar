@@ -112,7 +112,7 @@
 //! That is the **worst** case, not the usual one: in the bucket the five keys
 //! normally carry the identical timestamp and rustdar refetches all five
 //! together, so this is a race at a volume boundary rather than the steady
-//! state. [`DerivedSrm::motion_volume_matches`] records when it happens. A
+//! state. [`MotionProvenance::PreviousVolume`] records when it happens. A
 //! per-volume vector history was considered and rejected as solving a transient.
 //!
 //! It bites the *validation* harder than production, because tgftp's `sn.last`
@@ -219,21 +219,47 @@ pub struct DerivedSrm {
     pub elevation_number: u16,
     /// The vector applied.
     pub motion: StormMotion,
-    /// Whether the vector came from the same volume scan as the velocity. The
-    /// RPG re-fits the SCIT average every volume; `false` costs about ten
-    /// points of exact-match agreement and one tenth of a point of
-    /// within-one-level agreement.
-    pub motion_volume_matches: bool,
+    /// Which volume the vector belongs to, relative to this velocity product.
+    pub motion_provenance: MotionProvenance,
+}
+
+/// Where the vector a derived field used stands relative to the velocity
+/// product it was applied to.
+///
+/// Three states, not a bool: "not this volume" and "no volume at all" are
+/// different claims, and a bool made the second read as the first — the
+/// override path used to report a stale RPG vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionProvenance {
+    /// The RPG's vector, fitted for this very volume scan.
+    SameVolume,
+    /// The RPG's vector, but fitted for an earlier volume. The RPG re-fits the
+    /// SCIT average every volume, so this costs about ten points of
+    /// exact-match agreement and one tenth of a point of within-one-level
+    /// agreement.
+    PreviousVolume,
+    /// A vector the user typed in. It belongs to no volume, so the velocity
+    /// product's volume says nothing about it either way.
+    UserOverride,
+}
+
+impl DerivedSrm {
+    /// Whether the vector was fitted for this very volume — the accuracy
+    /// signal, and `false` for an override, which has no volume to agree with.
+    pub fn motion_volume_matches(&self) -> bool {
+        self.motion_provenance == MotionProvenance::SameVolume
+    }
 }
 
 /// Where a storm motion vector came from, and which volume it describes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StormMotionSample {
     pub motion: StormMotion,
-    /// [`ProductDescriptionBlock::volume_key`] of the `N0S` it was read from.
+    /// [`ProductDescriptionBlock::volume_key`] of the `N0S` it was read from,
+    /// or `None` for a vector the user typed in.
     ///
     /// [`ProductDescriptionBlock::volume_key`]: nexrad_level3::model::ProductDescriptionBlock::volume_key
-    pub volume: (u16, u32),
+    pub volume: Option<(u16, u32)>,
 }
 
 impl StormMotionSample {
@@ -241,12 +267,13 @@ impl StormMotionSample {
     pub fn from_message(msg: &Level3Message) -> Option<Self> {
         Some(Self {
             motion: msg.pdb.storm_motion()?,
-            volume: msg.pdb.volume_key(),
+            volume: Some(msg.pdb.volume_key()),
         })
     }
 
-    /// A vector the user typed in. It matches no volume, so a derived field
-    /// built from it never claims the RPG's provenance.
+    /// A vector the user typed in. It belongs to no volume, so a derived field
+    /// built from it never claims the RPG's provenance — and never claims to
+    /// be *stale* either, which a sentinel volume key made it do.
     ///
     /// `None` for a non-finite speed or direction. The guard is here rather
     /// than only at the widget because a NaN is not merely a bad render: it
@@ -263,7 +290,7 @@ impl StormMotionSample {
                 direction_deg,
                 is_scit_average: false,
             },
-            volume: (0, 0),
+            volume: None,
         })
     }
 }
@@ -374,7 +401,11 @@ pub fn derive(velocity: &Level3Message, sample: &StormMotionSample) -> Option<De
         elevation_angle: pdb.elevation_angle(),
         elevation_number: pdb.elevation_number,
         motion,
-        motion_volume_matches: sample.volume == pdb.volume_key(),
+        motion_provenance: match sample.volume {
+            None => MotionProvenance::UserOverride,
+            Some(volume) if volume == pdb.volume_key() => MotionProvenance::SameVolume,
+            Some(_) => MotionProvenance::PreviousVolume,
+        },
     })
 }
 
@@ -525,7 +556,7 @@ mod tests {
     fn sample(speed_kt: f32, direction_deg: f32, volume: u32) -> StormMotionSample {
         StormMotionSample {
             motion: StormMotion { speed_kt, direction_deg, is_scit_average: true },
-            volume: (20661, volume),
+            volume: Some((20661, volume)),
         }
     }
 
@@ -693,8 +724,15 @@ mod tests {
         let msg = uniform(99, &[0.0], 1.0, 10.0);
         let matched = derive(&msg, &sample(20.0, 270.0, 7108)).unwrap();
         let stale = derive(&msg, &sample(20.0, 270.0, 6952)).unwrap();
-        assert!(matched.motion_volume_matches);
-        assert!(!stale.motion_volume_matches);
+        assert_eq!(matched.motion_provenance, MotionProvenance::SameVolume);
+        assert_eq!(stale.motion_provenance, MotionProvenance::PreviousVolume);
+        // The accuracy signal itself, not just the provenance it reads. Its
+        // only other assertion is negative, so a body of `false` — or one
+        // inverted to `PreviousVolume`, which flips the validation harness's
+        // "vector one volume stale" annotation — would otherwise go unnoticed;
+        // that harness is `#[ignore]`d and cannot catch it.
+        assert!(matched.motion_volume_matches());
+        assert!(!stale.motion_volume_matches());
         // Same arithmetic either way: the flag is provenance, not a switch.
         assert_eq!(
             matched.packet.radials[0].gate_values,
@@ -736,13 +774,23 @@ mod tests {
         assert!(StormMotionSample::user_override(0.0, 0.0).is_some(), "zero is legitimate");
     }
 
-    /// A hand-entered vector matches no volume and is never a SCIT average.
+    /// A hand-entered vector belongs to no volume and is never a SCIT average.
+    ///
+    /// Not the same claim as "a different volume": a sentinel key made the two
+    /// indistinguishable, so every override rendered under a `(previous
+    /// volume)` annotation that named provenance it never had. It must also
+    /// not read as *this* volume — that would claim the RPG had fitted it.
     #[test]
     fn a_user_override_claims_no_provenance() {
         let s = StormMotionSample::user_override(45.0, 210.0).expect("finite");
         assert!(!s.motion.is_scit_average);
+        assert_eq!(s.volume, None, "an override must carry no volume key at all");
         let d = derive(&uniform(154, &[0.0], 0.5, 0.0), &s).unwrap();
-        assert!(!d.motion_volume_matches);
+        assert_eq!(d.motion_provenance, MotionProvenance::UserOverride);
+        assert!(
+            !d.motion_volume_matches(),
+            "an override agrees with no volume, so it is not this one either"
+        );
         assert_eq!(d.motion.speed_kt, 45.0);
         assert_eq!(d.motion.direction_deg, 210.0);
     }
@@ -1394,7 +1442,7 @@ mod live_validation {
                     derived.elevation_angle,
                     derived.elevation_number,
                     if is_moving { "moving" } else { "ZERO VECTOR" },
-                    if derived.motion_volume_matches { "" } else { ", vector one volume stale" },
+                    if derived.motion_volume_matches() { "" } else { ", vector one volume stale" },
                     t.n,
                     t.exact_pct(),
                     t.within_one_pct(),

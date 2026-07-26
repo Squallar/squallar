@@ -6,7 +6,6 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
-use winit::keyboard::KeyCode;
 use winit::window::{Window, WindowId};
 
 use crate::WindowRef;
@@ -149,6 +148,17 @@ pub(crate) fn notify_redraw(window: &Option<WindowRef>) {
             w.request_redraw();
         }));
     }
+}
+
+/// What one press of Escape or the back button resolved to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackPress {
+    /// A layer closed. The app stays, and nothing else about it changes.
+    Dismissed,
+    /// Nothing was open and the platform took the press — Android minimises.
+    PlatformHandled,
+    /// Nothing was open and nothing took it: leave.
+    Exit,
 }
 
 pub struct App {
@@ -598,14 +608,45 @@ impl App {
     }
 
     fn handle_input_events(&mut self, event_loop: &ActiveEventLoop) {
-        if self.input.key_pressed(KeyCode::Escape) {
-            self.request_exit(Some(event_loop));
+        // Both keys mean the same thing — back out of the thing I am in — so
+        // both take the same route. They used to differ only in that back gave
+        // the platform first refusal, and on Android a handler is always
+        // installed, so back never reached any of the decisions below it.
+        // Taken, not read: this runs on every keyboard press, not once a frame.
+        if self.input.take_back_out_press() {
+            self.back_out(event_loop);
         }
+    }
 
-        if self.input.back_pressed()
-            && !self.platform.handle_back() {
-                self.request_exit(Some(event_loop));
-            }
+    /// One press of Escape or the back button.
+    fn back_out(&mut self, event_loop: &ActiveEventLoop) {
+        match Self::resolve_back_press(&mut self.gui, self.platform.as_ref()) {
+            // Nothing else consumed the press, so nothing else will schedule
+            // the frame that shows the layer gone.
+            BackPress::Dismissed => notify_redraw(&self.window),
+            BackPress::PlatformHandled => {}
+            BackPress::Exit => self.request_exit(Some(event_loop)),
+        }
+    }
+
+    /// Resolve one press of Escape or back.
+    ///
+    /// The UI gets first refusal and the platform is asked only about a press
+    /// it did not want. That order is the whole fix: on Android a back handler
+    /// is always installed, so [`PlatformBridge::handle_back`] reports every
+    /// press consumed, and asking it first meant nothing after it was ever
+    /// asked at all — one press with the drawer open minimised the app.
+    ///
+    /// Takes the two collaborators rather than `&mut self` so the decision can
+    /// be exercised without an event loop or a GPU.
+    fn resolve_back_press(gui: &mut Gui, platform: &dyn PlatformBridge) -> BackPress {
+        if gui.dismiss_top_layer() {
+            return BackPress::Dismissed;
+        }
+        if platform.handle_back() {
+            return BackPress::PlatformHandled;
+        }
+        BackPress::Exit
     }
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) {
@@ -872,5 +913,187 @@ mod tests {
         assert_eq!(result[0].2.texture.width, 2048);
         assert_eq!(result[0].2.texture.overdraw, 0.28, "the clamped plan's overdraw survived grouping");
         assert_eq!(result[1].2.texture.overdraw, 1.0);
+    }
+
+    /// A bridge that consumes every back press, as Android's does: it installs
+    /// a handler at startup and `handle_back` reports `true` from then on.
+    struct MinimisingBridge;
+
+    impl PlatformBridge for MinimisingBridge {
+        fn handle_back(&self) -> bool {
+            true
+        }
+        fn poll_theme(&mut self) -> Option<bool> {
+            None
+        }
+        fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix> {
+            None
+        }
+        fn poll_heading(&mut self) -> Option<f32> {
+            None
+        }
+        fn query_insets(&self) -> Option<(f32, f32, f32, f32)> {
+            None
+        }
+        fn detect_dark_theme(&self) -> bool {
+            false
+        }
+        fn set_back_handler(&mut self, _handler: fn()) {}
+        fn set_zone_cache_dir(&mut self, _dir: std::path::PathBuf) {}
+        fn zone_cache_dir(&self) -> Option<&std::path::Path> {
+            None
+        }
+        fn set_config_dir(&mut self, _dir: std::path::PathBuf) {}
+        fn config_store(&self) -> Option<Box<dyn rustdar_egui::config_store::ConfigStore>> {
+            None
+        }
+        fn needs_process_exit(&self) -> bool {
+            true
+        }
+    }
+
+    /// A bridge with no back handler installed, as desktop and the web have.
+    struct QuittingBridge;
+
+    impl PlatformBridge for QuittingBridge {
+        fn handle_back(&self) -> bool {
+            false
+        }
+        fn poll_theme(&mut self) -> Option<bool> {
+            None
+        }
+        fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix> {
+            None
+        }
+        fn poll_heading(&mut self) -> Option<f32> {
+            None
+        }
+        fn query_insets(&self) -> Option<(f32, f32, f32, f32)> {
+            None
+        }
+        fn detect_dark_theme(&self) -> bool {
+            false
+        }
+        fn set_back_handler(&mut self, _handler: fn()) {}
+        fn set_zone_cache_dir(&mut self, _dir: std::path::PathBuf) {}
+        fn zone_cache_dir(&self) -> Option<&std::path::Path> {
+            None
+        }
+        fn set_config_dir(&mut self, _dir: std::path::PathBuf) {}
+        fn config_store(&self) -> Option<Box<dyn rustdar_egui::config_store::ConfigStore>> {
+            None
+        }
+        fn needs_process_exit(&self) -> bool {
+            false
+        }
+    }
+
+    /// Back with something open closes it; only a second press, with nothing
+    /// open, minimises.
+    ///
+    /// The bug is an *ordering* one, which is why the platform here consumes
+    /// everything: `handle_back` used to be asked first, and on Android a
+    /// handler is always installed, so it always said yes — the UI was never
+    /// consulted and one press with the drawer open went straight to minimise.
+    ///
+    /// Opens the settings window rather than the drawer only because
+    /// `show_settings` is the dismissible state this crate can reach.
+    /// `dismiss_top_layer`'s own coverage of the drawer, and of the one-layer-
+    /// per-press rule, is in `rustdar-egui`'s `ui_menu` tests.
+    #[test]
+    fn back_closes_what_is_open_before_it_minimises() {
+        let mut gui = Gui::new();
+        let platform = MinimisingBridge;
+        gui.show_settings = true;
+
+        assert_eq!(
+            App::resolve_back_press(&mut gui, &platform),
+            BackPress::Dismissed,
+            "the first press left the app with a window still open"
+        );
+        assert!(!gui.show_settings, "the window is still open");
+
+        assert_eq!(
+            App::resolve_back_press(&mut gui, &platform),
+            BackPress::PlatformHandled,
+            "with nothing open, back must reach the platform and minimise"
+        );
+    }
+
+    /// The two tests above exercise the decision; nothing can exercise the
+    /// call that reaches it, because `handle_input_events` takes an
+    /// `ActiveEventLoop` and winit will not hand one out except from inside a
+    /// running loop. Reading the source is the only handle, as it is for
+    /// `egui_renderer`'s `begin_frame`.
+    fn fn_body(name: &str) -> &'static str {
+        let (_, rest) = include_str!("app.rs")
+            .split_once(name)
+            .unwrap_or_else(|| panic!("{name} is no longer a method here"));
+        rest.split_once("\n    }")
+            .map(|(body, _)| body)
+            .unwrap_or_else(|| panic!("{name} has no recognisable body"))
+    }
+
+    /// A press has to actually reach the funnel.
+    ///
+    /// Both keys go through one call and one route, so this is the whole
+    /// wiring: drop either and Escape and back do nothing at all, with the
+    /// decision tests still green because they call `resolve_back_press`
+    /// directly.
+    ///
+    /// `take_back_out_press` rather than a plain read is part of the claim —
+    /// `handle_input_events` runs on every keyboard press, so a non-consuming
+    /// read spends one press on two layers.
+    #[test]
+    fn every_back_out_press_reaches_the_funnel_exactly_once() {
+        let body = fn_body("fn handle_input_events(");
+        for call in ["take_back_out_press(", "self.back_out("] {
+            assert!(
+                body.contains(call),
+                "handle_input_events no longer calls {call}, so Escape and the \
+                 back button reach nothing: {body}"
+            );
+        }
+    }
+
+    /// A dismissal has to schedule the frame that shows it.
+    ///
+    /// Nothing else consumed the press, so nothing else requests a redraw: drop
+    /// this and the drawer stays on screen until something unrelated repaints.
+    /// `WindowRef` cannot be built without a window, so the source is again the
+    /// only handle.
+    #[test]
+    fn a_dismissal_asks_for_the_frame_that_shows_it() {
+        let body = fn_body("fn back_out(");
+        let dismissed = body
+            .find("BackPress::Dismissed")
+            .expect("back_out no longer handles a dismissal");
+        let arm_end = body[dismissed..]
+            .find('\n')
+            .map(|i| dismissed + i)
+            .unwrap_or(body.len());
+        assert!(
+            body[dismissed..arm_end].contains("notify_redraw("),
+            "the Dismissed arm does not request a redraw: {}",
+            &body[dismissed..arm_end]
+        );
+    }
+
+    /// The same press on a platform with no back handler: Escape on the desktop
+    /// and the browser's back. Nothing open means quit, and quitting must stay
+    /// reachable — a dismissal that reported itself with nothing open would
+    /// make the app unquittable.
+    #[test]
+    fn escape_with_nothing_open_still_exits() {
+        let mut gui = Gui::new();
+        let platform = QuittingBridge;
+        gui.show_settings = true;
+
+        assert_eq!(
+            App::resolve_back_press(&mut gui, &platform),
+            BackPress::Dismissed,
+            "escape must close the window rather than quit, same as back"
+        );
+        assert_eq!(App::resolve_back_press(&mut gui, &platform), BackPress::Exit);
     }
 }

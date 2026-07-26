@@ -80,15 +80,24 @@ impl super::Gui {
                     // Port selection
                     ui.horizontal(|ui| {
                         ui.label("Port:");
-                        let current_label = self.gps_config.port_path.as_deref().unwrap_or("Auto-detect");
+                        // One list, read by both halves. The collapsed box used
+                        // to show the bare device path while the list it opened
+                        // showed "path (description)" — the same divergence the
+                        // handler dropdowns had. Enumerated once per frame
+                        // because `detect_gps_ports` touches the serial
+                        // subsystem, so formatting the two halves separately
+                        // would mean probing it twice.
+                        let ports = gps_port_options(rustdar_gps::detect_gps_ports());
+                        let selected = gps_port_label(&ports, self.gps_config.port_path.as_deref());
                         egui::ComboBox::from_id_salt("gps_port")
-                            .selected_text(current_label)
+                            .selected_text(selected)
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.gps_config.port_path, None, "Auto-detect").changed();
-                                for port_info in rustdar_gps::detect_gps_ports() {
-                                    let label = format!("{} ({})", port_info.port_name, port_info.description);
-                                    let val = Some(port_info.port_name.clone());
-                                    ui.selectable_value(&mut self.gps_config.port_path, val, label);
+                                for (value, label) in &ports {
+                                    ui.selectable_value(
+                                        &mut self.gps_config.port_path,
+                                        value.clone(),
+                                        label.as_str(),
+                                    );
                                 }
                             });
                     });
@@ -212,6 +221,39 @@ impl super::Gui {
     }
 }
 
+/// The GPS port dropdown's options, as `(value, label)` — "Auto-detect" plus
+/// every port given.
+///
+/// Takes the ports rather than calling `detect_gps_ports` itself so the
+/// labelling can be tested; enumeration needs real hardware.
+#[cfg(feature = "gps-serial")]
+fn gps_port_options(
+    ports: impl IntoIterator<Item = rustdar_gps::GpsPortInfo>,
+) -> Vec<(Option<String>, String)> {
+    std::iter::once((None, "Auto-detect".to_owned()))
+        .chain(ports.into_iter().map(|port| {
+            (
+                Some(port.port_name.clone()),
+                format!("{} ({})", port.port_name, port.description),
+            )
+        }))
+        .collect()
+}
+
+/// The label the port list puts against `selected`.
+///
+/// Falls back to the bare device path for a configured port that is no longer
+/// plugged in: it is not in the list, but naming it is better than silently
+/// reading "Auto-detect" while a specific port is still configured.
+#[cfg(feature = "gps-serial")]
+fn gps_port_label(ports: &[(Option<String>, String)], selected: Option<&str>) -> String {
+    ports
+        .iter()
+        .find(|(value, _)| value.as_deref() == selected)
+        .map(|(_, label)| label.clone())
+        .unwrap_or_else(|| selected.unwrap_or("Auto-detect").to_owned())
+}
+
 /// Generic combo box for a unit preference enum.
 fn unit_combo<T: Copy + PartialEq + UnitLabel>(
     ui: &mut egui::Ui,
@@ -229,4 +271,60 @@ fn unit_combo<T: Copy + PartialEq + UnitLabel>(
                 }
             });
     });
+}
+
+#[cfg(all(test, feature = "gps-serial"))]
+mod tests {
+    use super::*;
+
+    /// Built by the shipped `gps_port_options`, so the labels under test are
+    /// the ones the dropdown really offers.
+    fn ports() -> Vec<(Option<String>, String)> {
+        gps_port_options([rustdar_gps::GpsPortInfo {
+            port_name: "/dev/ttyUSB0".to_owned(),
+            description: "FT232R USB UART".to_owned(),
+        }])
+    }
+
+    /// A port is offered under its description, not its bare device path —
+    /// `/dev/ttyUSB0` alone does not tell you which of two dongles it is.
+    #[test]
+    fn the_port_list_describes_each_port() {
+        let ports = ports();
+        assert_eq!(ports[0], (None, "Auto-detect".to_owned()));
+        assert_eq!(
+            ports[1],
+            (
+                Some("/dev/ttyUSB0".to_owned()),
+                "/dev/ttyUSB0 (FT232R USB UART)".to_owned()
+            ),
+        );
+    }
+
+    /// The collapsed box shows what the open list shows.
+    ///
+    /// It used to show the raw `port_path`, so a chosen port read
+    /// `/dev/ttyUSB0` until you opened the list and found it described there
+    /// as `/dev/ttyUSB0 (FT232R USB UART)`. The same defect the handler
+    /// dropdowns had, hidden behind a non-default feature that wasm and
+    /// Android never build.
+    #[test]
+    fn the_gps_port_box_shows_the_label_its_list_shows() {
+        let ports = ports();
+        for (value, label) in &ports {
+            assert_eq!(
+                gps_port_label(&ports, value.as_deref()),
+                *label,
+                "the collapsed box disagrees with the list entry for {value:?}"
+            );
+        }
+    }
+
+    /// A configured port that is no longer plugged in is not in the list.
+    /// Naming it beats reading "Auto-detect" while a specific port is set.
+    #[test]
+    fn an_unplugged_port_is_still_named() {
+        assert_eq!(gps_port_label(&ports(), Some("/dev/ttyS9")), "/dev/ttyS9");
+        assert_eq!(gps_port_label(&[], None), "Auto-detect");
+    }
 }

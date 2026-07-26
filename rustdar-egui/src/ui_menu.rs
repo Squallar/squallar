@@ -406,4 +406,88 @@ mod tests {
             assert!(!gui.drawer_open, "{opened} dialog left the drawer open");
         }
     }
+
+    /// An overlay detail item, so the pager popup can be opened without a map
+    /// click. The concrete items are `pub(crate)` to `rustdar-overlays`; the
+    /// trait is not.
+    #[derive(Debug)]
+    struct StubOverlayItem;
+
+    impl rustdar_overlays::render::overlay_state::OverlayItem for StubOverlayItem {
+        fn kind(&self) -> OverlayKind {
+            OverlayKind::NwsAlerts
+        }
+        fn popup_content(
+            &self,
+            _prefs: &rustdar_units::UserPreferences,
+        ) -> rustdar_overlays::render::overlay_state::PopupContent {
+            rustdar_overlays::render::overlay_state::PopupContent {
+                title: "Stub".to_owned(),
+                accent_rgb: [255, 0, 0],
+                width: 300.0,
+                sections: Vec::new(),
+                actions: Vec::new(),
+            }
+        }
+        fn matches(&self, _other: &dyn rustdar_overlays::render::overlay_state::OverlayItem) -> bool {
+            false
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Escape and back close what is open, one layer per press, and say so.
+    ///
+    /// Only when nothing is open is the press a request to leave: with the
+    /// drawer open, back used to go straight to minimise, which on the phone
+    /// widths this app actually runs at throws away the only route to the
+    /// whole menu on a single misplaced tap.
+    ///
+    /// Driven top down through all four layers, so it also pins the *order*: a
+    /// press must take the topmost, not whichever the function tests for first.
+    /// The overlay pager sits above everything — it is what a map tap opens —
+    /// and each press below it must leave the ones under it alone.
+    #[test]
+    fn a_back_press_closes_one_open_layer_at_a_time() {
+        let mut gui = Gui::new();
+        gui.drawer_open = true;
+        gui.show_settings = true;
+        gui.time_dialog.show = true;
+        gui.overlays.selected_overlays = vec![std::sync::Arc::new(StubOverlayItem)];
+        gui.overlays.selected_overlay_page = 0;
+
+        assert!(gui.dismiss_top_layer(), "the overlay pager was open");
+        assert!(
+            gui.overlays.selected_overlays.is_empty(),
+            "the overlay pager did not close"
+        );
+        assert!(
+            gui.show_settings && gui.time_dialog.show && gui.drawer_open,
+            "closing the pager took a layer under it with it: {}",
+            state_fingerprint(&gui)
+        );
+
+        assert!(gui.dismiss_top_layer(), "the settings window was open");
+        assert!(!gui.show_settings, "settings did not close");
+        assert!(
+            gui.time_dialog.show && gui.drawer_open,
+            "one press closed more than one layer: {}",
+            state_fingerprint(&gui)
+        );
+
+        assert!(gui.dismiss_top_layer(), "the time dialog was open");
+        assert!(!gui.time_dialog.show, "the time dialog did not close");
+        assert!(gui.drawer_open, "the drawer went with it");
+
+        assert!(gui.dismiss_top_layer(), "the drawer was open");
+        assert!(!gui.drawer_open, "the drawer did not close");
+
+        assert!(
+            !gui.dismiss_top_layer(),
+            "reported something dismissed with nothing open, so a press would \
+             never reach the exit path at all: {}",
+            state_fingerprint(&gui)
+        );
+    }
 }

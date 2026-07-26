@@ -183,6 +183,19 @@ fn elevation_key(elevation: f32) -> i32 {
     (elevation * 10.0).round() as i32
 }
 
+/// What to append to the SRM render log to qualify the vector it used.
+///
+/// A user override belongs to no volume, so neither volume claim applies to it
+/// — it used to be annotated `(previous volume)`, which said the RPG had fitted
+/// this vector for some earlier scan.
+fn motion_provenance_suffix(provenance: srm::MotionProvenance) -> &'static str {
+    match provenance {
+        srm::MotionProvenance::SameVolume => "",
+        srm::MotionProvenance::PreviousVolume => " (previous volume)",
+        srm::MotionProvenance::UserOverride => " (user override)",
+    }
+}
+
 /// Manages radar rendering dispatch and Level III data caching.
 ///
 /// Tracks per-pane render state, owns the Level III data cache, and
@@ -452,7 +465,7 @@ impl RenderDispatcher {
                 l3_msg.message.pdb.product_code,
                 derived.motion.speed_kt,
                 derived.motion.direction_deg,
-                if derived.motion_volume_matches { "" } else { " (previous volume)" },
+                motion_provenance_suffix(derived.motion_provenance),
             );
             self.spawn_render(pane_idx, product, params.elevation, sender, window, move || {
                 render_derived_srm_to_image(&derived, lat, lon)
@@ -799,6 +812,59 @@ mod srm_dispatch_tests {
         }
     }
 
+    /// The render log must not tell the user an override came from an earlier
+    /// volume.
+    ///
+    /// `(previous volume)` is a claim about the *RPG's* fit: it says the SCIT
+    /// average applied here was computed for some other scan, which is the one
+    /// case where the derived field is known to drift. A hand-entered vector
+    /// belongs to no volume at all, so the annotation described provenance it
+    /// never had — and it appeared on every override, because the sentinel
+    /// volume key `(0, 0)` matched nothing.
+    ///
+    /// Driven through the real `derive`, so it fails for a provenance the
+    /// derivation stops assigning as well as for a suffix that comes back.
+    #[test]
+    fn an_overridden_vector_is_not_logged_as_a_previous_volume() {
+        let d = loaded();
+        let tilt = d
+            .nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", 0.5)
+            .expect("0.5° has a tilt");
+
+        let rpg = d.storm_motion_for("KMPX", None).expect("N0S is loaded");
+        let own_volume = srm::derive(&tilt.message, &rpg).expect("derives");
+        assert_eq!(
+            motion_provenance_suffix(own_volume.motion_provenance),
+            "",
+            "precondition: this tilt's own volume's vector must be unannotated, \
+             or the assertion below passes whatever the override does",
+        );
+
+        let stale = StormMotionSample {
+            volume: rpg.volume.map(|(date, time)| (date, time - 1)),
+            ..rpg
+        };
+        assert_eq!(
+            motion_provenance_suffix(
+                srm::derive(&tilt.message, &stale).expect("derives").motion_provenance
+            ),
+            " (previous volume)",
+            "precondition: a genuinely stale RPG vector must still say so",
+        );
+
+        let overridden = srm::derive(
+            &tilt.message,
+            &StormMotionSample::user_override(30.0, 240.0).expect("finite"),
+        )
+        .expect("derives");
+        assert_eq!(overridden.motion_provenance, srm::MotionProvenance::UserOverride);
+        assert_eq!(
+            motion_provenance_suffix(overridden.motion_provenance),
+            " (user override)",
+            "an override must not be annotated with any volume claim",
+        );
+    }
+
     /// Every tilt is 0.25 km. `N0S` is 1 km, so while it was rendered the 0.5°
     /// pane was four times coarser than the three above it.
     #[test]
@@ -883,7 +949,7 @@ mod srm_dispatch_tests {
         assert_eq!(s.motion.speed_kt, 25.7);
         assert_eq!(s.motion.direction_deg, 296.1);
         assert!(s.motion.is_scit_average);
-        assert_eq!(s.volume, (20661, 7108));
+        assert_eq!(s.volume, Some((20661, 7108)));
     }
 
     /// Without an `N0S` there is no vector, and rendering the velocity field

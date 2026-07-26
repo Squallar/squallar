@@ -126,6 +126,30 @@ pub(crate) struct InputHarness {
     max_texture_side: Option<usize>,
     /// The [`GuiAction`]s `Gui::ui` returned from the last frame.
     last_actions: Vec<crate::actions::GuiAction>,
+    /// Every text run painted during the last frame, with its layout rect.
+    last_texts: Vec<(egui::Rect, String)>,
+    /// Rects egui itself flagged as having changed widget id between passes,
+    /// accumulated over every frame since the last [`InputHarness::clear_id_changes`].
+    /// See [`InputHarness::id_changes`].
+    id_changes: Vec<egui::Rect>,
+}
+
+/// The debug marker `egui::context::warn_if_rect_changes_id` emits alongside its
+/// `log::warn!`: a 2px red outside stroke, no fill, clipped to everything.
+///
+/// Matching the painted marker rather than capturing the log is what makes this
+/// a read of egui's *output*. Nothing in this app paints an unfilled red 2px
+/// rect at `Rect::EVERYTHING` clip, so the signature is unambiguous.
+fn id_change_marker(clipped: &egui::epaint::ClippedShape) -> Option<egui::Rect> {
+    let egui::Shape::Rect(rect_shape) = &clipped.shape else {
+        return None;
+    };
+    let matches = clipped.clip_rect == egui::Rect::EVERYTHING
+        && rect_shape.fill == egui::Color32::TRANSPARENT
+        && rect_shape.stroke.color == egui::Color32::RED
+        && (rect_shape.stroke.width - 2.0).abs() < f32::EPSILON
+        && rect_shape.stroke_kind == egui::StrokeKind::Outside;
+    matches.then_some(rect_shape.rect)
 }
 
 impl InputHarness {
@@ -156,6 +180,8 @@ impl InputHarness {
             last_rects: Vec::new(),
             max_texture_side: None,
             last_actions: Vec::new(),
+            last_texts: Vec::new(),
+            id_changes: Vec::new(),
         };
         harness.warm_up();
         // The first frame's `check_auto_polls` starts the initial fetch and
@@ -264,6 +290,36 @@ impl InputHarness {
         self.menu_leaves().into_iter().find(|l| l.label == label)
     }
 
+    /// Every handler dropdown the last frame's layers panel drew.
+    pub(crate) fn dropdowns(&self) -> Vec<crate::ui::DrawnDropdown> {
+        self.gui.dropdowns_for_test().to_vec()
+    }
+
+    /// The `(options, selected)` the handler behind `label` is offering — the
+    /// model a [`crate::ui::DrawnDropdown`] is supposed to be a rendering of.
+    pub(crate) fn dropdown_model(
+        &self,
+        label: &str,
+    ) -> Option<(Vec<(String, String)>, String)> {
+        self.gui.dropdown_model_for_test(label)
+    }
+
+    /// Every text run the last frame painted, without its rect.
+    pub(crate) fn painted_text_strings(&self) -> Vec<String> {
+        self.last_texts.iter().map(|(_, text)| text.clone()).collect()
+    }
+
+    /// Whether `needle` was painted anywhere inside `rect`.
+    ///
+    /// The other end of a probe: a `DrawnDropdown` says what the renderer was
+    /// *handed*, this says what egui put on the glass, so a test can require
+    /// the two to agree.
+    pub(crate) fn text_painted_in(&self, rect: egui::Rect, needle: &str) -> bool {
+        self.last_texts
+            .iter()
+            .any(|(r, text)| rect.contains(r.center()) && text.contains(needle))
+    }
+
     /// Whether the **live** active pane has `kind` on — the state the menu
     /// checkbox claims to be showing.
     pub(crate) fn overlay_enabled(&self, kind: OverlayKind) -> bool {
@@ -360,6 +416,22 @@ impl InputHarness {
     /// Every rect painted during the last frame, in paint order.
     pub(crate) fn painted_rects(&self) -> &[egui::Rect] {
         &self.last_rects
+    }
+
+    /// Rects egui flagged as having changed widget id between passes, since the
+    /// last [`InputHarness::clear_id_changes`].
+    ///
+    /// This is egui's own verdict, read out of the frame it painted — the same
+    /// check that logs `Widget rect … changed id between passes` on device. It
+    /// is gated on `debug_assertions`, which `cargo test` always has.
+    pub(crate) fn id_changes(&self) -> &[egui::Rect] {
+        &self.id_changes
+    }
+
+    /// Forget the id changes seen so far, so a test can attribute later ones to
+    /// one specific transition.
+    pub(crate) fn clear_id_changes(&mut self) {
+        self.id_changes.clear();
     }
 
     /// The width class the UI resolved for the last frame.
@@ -777,11 +849,24 @@ impl InputHarness {
         };
 
         let full_output = ctx.end_pass();
+        self.id_changes
+            .extend(full_output.shapes.iter().filter_map(id_change_marker));
         self.last_rects = full_output
             .shapes
             .iter()
             .filter_map(|clipped| match &clipped.shape {
                 egui::Shape::Rect(rect_shape) => Some(rect_shape.rect),
+                _ => None,
+            })
+            .collect();
+        self.last_texts = full_output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some((
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                    text.galley.text().to_owned(),
+                )),
                 _ => None,
             })
             .collect();
@@ -3578,6 +3663,193 @@ mod tests {
             site_switches(&h),
             vec![],
             "a click 40pt clear of the icon still switched sites"
+        );
+    }
+
+    /// 33. **A dropdown's collapsed box says what its open list says.**
+    ///
+    ///     `ControlItem::Dropdown` carries `(value, display_label)` pairs. The
+    ///     open list has always shown the label; `selected_text` showed the raw
+    ///     *value*, so Model Data's Parameter box read `sbcin` and GLM's
+    ///     Satellite box read `both` until you opened them.
+    ///
+    ///     Asserted against the label the handler itself offers for the
+    ///     selected value, not against a string this test spells out: a
+    ///     renderer that started formatting labels its own way would still have
+    ///     to agree with the list beside it. The painted-text check is the
+    ///     other end — it is the text egui actually laid out inside the combo's
+    ///     rect, so a probe reporting a value the widget never received fails.
+    #[test]
+    fn a_dropdown_shows_its_option_label_not_the_raw_value() {
+        let mut h = compact_with_drawer();
+        for kind in [OverlayKind::ModelData, OverlayKind::Lightning] {
+            h.set_overlay_on_pane(0, kind, true);
+        }
+
+        // Every dropdown on screen, whichever handler produced it.
+        let drawn = h.dropdowns();
+        assert!(
+            drawn.len() >= 2,
+            "precondition: Model Data and GLM must both be offering a dropdown, \
+             got {drawn:?}"
+        );
+
+        for dropdown in &drawn {
+            let (options, selected) =
+                h.dropdown_model(&dropdown.label).unwrap_or_else(|| {
+                    panic!("no handler offers a {:?} dropdown", dropdown.label)
+                });
+            let expected = options
+                .iter()
+                .find(|(value, _)| *value == selected)
+                .map(|(_, display)| display.clone())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the {:?} dropdown's selected value {selected:?} is not \
+                         among the options it offers: {options:?}",
+                        dropdown.label
+                    )
+                });
+            assert_eq!(
+                dropdown.selected_text, expected,
+                "the {:?} dropdown's collapsed box disagrees with the label its \
+                 own list puts against {selected:?}",
+                dropdown.label
+            );
+            assert!(
+                h.text_painted_in(dropdown.rect, &dropdown.selected_text),
+                "the {:?} dropdown reported {:?} but egui painted no such text \
+                 inside {:?}",
+                dropdown.label,
+                dropdown.selected_text,
+                dropdown.rect
+            );
+        }
+
+        // …and the list the box opens is the other half of the claim. Assert on
+        // the labels it *paints*, so that "both halves use one formatter" is
+        // checked against two rendered results rather than one rendered result
+        // and one reading of the model.
+        for dropdown in &drawn {
+            let mut h = compact_with_drawer();
+            for kind in [OverlayKind::ModelData, OverlayKind::Lightning] {
+                h.set_overlay_on_pane(0, kind, true);
+            }
+            let (options, _) = h.dropdown_model(&dropdown.label).expect("still offered");
+            assert!(
+                h.screen_rect().contains(dropdown.rect.center()),
+                "the {:?} dropdown was laid out at {:?}, off the {:?} viewport, \
+                 so the click below would open nothing",
+                dropdown.label,
+                dropdown.rect,
+                h.screen_rect()
+            );
+
+            h.mouse_click(dropdown.rect.center());
+            h.warm_up();
+
+            let painted = h.painted_text_strings();
+            // The list scrolls, so only the options that fit are laid out —
+            // hence "the ones on screen are labels", not "all of them are".
+            let labels_shown = options
+                .iter()
+                .filter(|(_, display)| painted.contains(display))
+                .count();
+            assert!(
+                labels_shown >= 2,
+                "the {:?} list opened but painted fewer than two of its own \
+                 option labels, so the check below has nothing to bite on; it \
+                 painted {painted:?}",
+                dropdown.label
+            );
+            for (value, display) in &options {
+                assert!(
+                    value == display || !painted.contains(value),
+                    "the open {:?} list painted the raw option id {value:?} \
+                     where its label is {display:?}",
+                    dropdown.label
+                );
+            }
+        }
+    }
+
+    /// 34. **The scan arriving must not re-key a widget.**
+    ///
+    ///     egui compares each pass's widget rects against the last and warns
+    ///     when the same rect comes back under a different `Id` — the same
+    ///     hazard [`crossing_a_breakpoint_does_not_move_any_widget_id`] guards
+    ///     across a resize, caught by egui itself rather than by a probe list.
+    ///
+    ///     The status bar used to allocate its right-aligned error slot every
+    ///     frame whether or not there was an error. Empty, that scope is a
+    ///     zero-area rect welded to the row's right edge, while its id moves
+    ///     with the widget count before it — and the auto-poll block draws
+    ///     three widgets mid-fetch and one after. So the frame the first scan
+    ///     landed re-keyed a widget, twice per launch.
+    ///
+    ///     This reads egui's verdict out of the frame it painted, so it fires
+    ///     for any widget that acquires the same hazard, not just this one.
+    #[test]
+    fn a_scan_arriving_moves_no_widget_id() {
+        // Roughly a Fold 7 inner screen: wide enough for the long status bar,
+        // too narrow for the sidebar, which is where this was seen.
+        let mut h = InputHarness::with_screen(egui::vec2(750.0, 900.0));
+        h.gui_mut().set_fetching(true);
+        h.warm_up();
+        assert!(
+            h.status_bar().auto_poll.is_none(),
+            "precondition: a fetch must be in flight, so the status bar is \
+             showing the spinner rather than the auto-poll checkbox"
+        );
+
+        h.clear_id_changes();
+        h.load_scan("KTLX");
+
+        assert!(
+            h.status_bar().auto_poll.is_some(),
+            "precondition: the scan must have cleared the fetch, or the widget \
+             count in the status bar never changed and this proves nothing"
+        );
+        assert_eq!(
+            h.id_changes(),
+            &[] as &[egui::Rect],
+            "egui saw a widget rect come back under a different id when the \
+             scan arrived: everything it remembers under those ids is discarded"
+        );
+    }
+
+    /// 35. **...and the probe that says so can see a real one.**
+    ///
+    ///     [`a_scan_arriving_moves_no_widget_id`] asserts on an empty list, so
+    ///     a marker signature that matched nothing would pass it forever. This
+    ///     drives egui with a deliberately unstable id at a fixed rect and
+    ///     requires the same reader to report it.
+    #[test]
+    fn the_id_change_probe_reports_a_real_id_change() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0));
+        let ctx = egui::Context::default();
+        let mut seen = Vec::new();
+        for pass in 0..3u32 {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            });
+            let root = egui::Ui::new(
+                ctx.clone(),
+                egui::Id::new("canary_root"),
+                egui::UiBuilder::new()
+                    .layer_id(egui::LayerId::background())
+                    .max_rect(screen),
+            );
+            let rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(50.0, 20.0));
+            // Same rect, new id, same parent: exactly what egui warns about.
+            root.interact(rect, egui::Id::new(("canary", pass)), egui::Sense::click());
+            seen.extend(ctx.end_pass().shapes.iter().filter_map(id_change_marker));
+        }
+        assert!(
+            !seen.is_empty(),
+            "the id-change reader saw nothing for a widget that changed id \
+             every pass, so the assertion it backs is vacuous"
         );
     }
 }
