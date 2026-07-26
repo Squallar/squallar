@@ -50,12 +50,29 @@ jobs:
             target: x86_64-pc-windows-gnullvm
             cmd: cargo build --workspace --all-targets --all-features --target x86_64-pc-windows-gnullvm
 
-          # `check` and scoped: there is no iOS entry-point crate, so nothing
-          # links. rustdar-frontend carries the `mobile` cfg iOS takes its
-          # memory budget from.
+          # A real link, not a `check`. `rustdar-platform --lib` as a staticlib
+          # codegens the whole graph, and the link is where the failures that
+          # only iOS has actually appear: a missing `-framework`, or a
+          # dependency that reaches for IOKit. `IN_CONTAINER=1` because this job
+          # already runs inside the image ios/Makefile would otherwise start.
+          # `zip` is not in the image and is only needed to package the .ipa.
           - name: ios-aarch64
             target: aarch64-apple-ios
-            cmd: cargo check -p rustdar-frontend --lib --target aarch64-apple-ios
+            workspaces: ". -> target-ios"
+            cmd: |
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends zip
+              make -C ios IN_CONTAINER=1
+              test -f ios/build/linux/iphoneos/rustdar.ipa \
+                || { echo "::error::no .ipa was packaged"; exit 1; }
+          # Same link against the simulator SDK. Not redundant: it is a
+          # different target triple with its own std, its own clang wrapper and
+          # its own Mach-O platform, and it is the only one testable without
+          # signing.
+          - name: ios-aarch64-sim
+            target: aarch64-apple-ios-sim
+            workspaces: ". -> target-ios"
+            cmd: make -C ios IN_CONTAINER=1 SIMULATOR=1
 
           # cargo-ndk, not bare cargo: `ring`'s build script needs the cross
           # clang/sysroot it exports, and it is what android/app/build.gradle.kts
@@ -177,6 +194,9 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ${{ matrix.name }}
+          # The iOS rows build into target-ios/, not target/; without this they
+          # would cache and restore an empty directory on every run.
+          workspaces: ${{ matrix.workspaces || '.' }}
           # CARGO_HOME is the image's /usr/local/cargo; restoring a cached bin/
           # over it would shadow the image's own wasm-pack and cargo-ndk.
           cache-bin: "false"

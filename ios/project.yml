@@ -1,0 +1,61 @@
+# XcodeGen spec for the rustdar iOS app — kept for local Xcode development
+# (`xcodegen generate` opens the app in Xcode). `make -C ios` does NOT use Xcode:
+# it cross-compiles and links inside the rust-cross container (see ios/Makefile)
+# and reads only the bundle metadata below (MARKETING_VERSION,
+# CURRENT_PROJECT_VERSION, PRODUCT_BUNDLE_IDENTIFIER), which is why this file is
+# the single source of that metadata.
+#
+# The app is a thin UIKit shell (Sources/main.m) linking the Rust staticlib
+# (librustdar_platform_lib.a, built by cargo for aarch64-apple-ios) and calling
+# `rustdar_ios_main`; winit's UIKit backend drives everything from there.
+#
+# Keep the framework list here in lockstep with the `-framework` flags in
+# ios/Makefile — they are the same list expressed twice, and only the Makefile's
+# copy is exercised on Linux.
+name: rustdar
+options:
+  bundleIdPrefix: dev.mcswain
+  deploymentTarget:
+    iOS: "14.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: "NO"
+targets:
+  rustdar:
+    type: application
+    platform: iOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.mcswain.rustdar
+        INFOPLIST_FILE: Info.plist
+        ENABLE_BITCODE: "NO"
+        LIBRARY_SEARCH_PATHS: "$(inherited) $(RUST_LIB_DIR)"
+        OTHER_LDFLAGS: "$(inherited) $(RUST_LIB_DIR)/librustdar_platform_lib.a -lobjc"
+    dependencies:
+      - sdk: UIKit.framework
+      # CAMetalLayer lives in QuartzCore; wgpu's Metal backend needs both.
+      - sdk: QuartzCore.framework
+      - sdk: Metal.framework
+      - sdk: CoreGraphics.framework
+      - sdk: Foundation.framework
+      - sdk: CoreFoundation.framework
+      # rustls-platform-verifier's Apple path (SecTrustEvaluateWithError).
+      - sdk: Security.framework
+      # CLLocationManager: position and heading.
+      - sdk: CoreLocation.framework
+schemes:
+  rustdar:
+    build:
+      targets:
+        rustdar: all
+    run:
+      config: Release
+    archive:
+      config: Release

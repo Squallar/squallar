@@ -530,6 +530,11 @@ impl App {
         if let Some(store) = self.platform.config_store() {
             self.gui.save_ui_config(store.as_ref());
         }
+        if !self.platform.supports_exit() {
+            // The config save above still ran, which is the part that matters.
+            log::debug!("exit requested; ignored (this platform has no quit)");
+            return;
+        }
         if let Some(event_loop) = event_loop {
             log::info!("Exiting application");
             event_loop.exit();

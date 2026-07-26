@@ -13,13 +13,19 @@ path = "src/main.rs"
 name = "rustdar_platform_lib"
 # rlib only. Adding `cdylib` makes cargo-ndk emit and copy
 # librustdar_platform_lib.so into jniLibs -- a dead 1.8 MB per ABI.
+#
+# iOS needs a `staticlib` to link the .app against, but adding it here would
+# archive the whole graph on every desktop build and every `--all-targets`
+# clippy run too. `ios/Makefile` asks for it per-build with
+# `cargo rustc --crate-type staticlib` instead.
 crate-type = ["rlib"]
 path = "src/lib.rs"
 
 [dependencies]
 rustdar-frontend = { workspace = true }
 rustdar-egui = { workspace = true }
-rustdar-gps = { workspace = true, features = ["serial"] }
+# Types only here (GpsFix, GpsConfig). `serial` is requested per target below.
+rustdar-gps = { workspace = true }
 log = { workspace = true }
 pollster = { workspace = true }
 winit = { workspace = true }
@@ -30,10 +36,13 @@ env_logger = "=0.11.11"
 rustdar-radar = { workspace = true }
 walkers = { workspace = true }
 
-[target.'cfg(not(target_os = "android"))'.dependencies]
-# No Android entry: reading the Android theme is a JNI call and this crate is
-# `#![forbid(unsafe_code)]`, so `rustdar-android` injects it instead.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+# Android's theme is a JNI call injected by `rustdar-android`. iOS is excluded
+# because `dark-light` 2.0's iOS arm returns `Mode::Light` unconditionally *and*
+# returns `Mode`, not `Result<Mode>`, so it does not even typecheck here.
 dark-light = "=2.0.0"
-# Desktop-only, because cargo features are additive across the graph: enabling
-# `gps-serial` unconditionally would leak the port picker into the Android UI.
+# `serialport` links IOKit, which iOS does not have -- that fails the link, not
+# the compile, so only the .app build would have caught it. Features are
+# additive across the graph, so this also keeps the port picker off mobile.
 rustdar-egui = { workspace = true, features = ["gps-serial"] }
+rustdar-gps = { workspace = true, features = ["serial"] }

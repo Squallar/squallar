@@ -1,7 +1,10 @@
 //! Concrete [`PlatformBridge`] implementations. The trait lives in
 //! `rustdar-frontend`, which must never name a per-OS type.
 
-use rustdar_frontend::platform::{PlatformBridge, drain_latest};
+use rustdar_frontend::platform::PlatformBridge;
+// The iOS bridge has no pollable channels yet; see the note above `IosPlatform`.
+#[cfg(not(target_os = "ios"))]
+use rustdar_frontend::platform::drain_latest;
 
 /// System bar insets as `(top, bottom, left, right)`. Aliased because
 /// `clippy::type_complexity` rejects the bare fn pointer in the field below.
@@ -10,7 +13,7 @@ type InsetsQuerier = fn() -> (f32, f32, f32, f32);
 
 // ── Desktop implementation ──────────────────────────────────────────────
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub struct DesktopPlatform {
     back_handler: Option<fn()>,
     zone_cache_dir: Option<std::path::PathBuf>,
@@ -21,14 +24,14 @@ pub struct DesktopPlatform {
     gps_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_gps::GpsFix>>,
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl Default for DesktopPlatform {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl DesktopPlatform {
     pub fn new() -> Self {
         Self {
@@ -57,7 +60,7 @@ impl DesktopPlatform {
     }
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 impl PlatformBridge for DesktopPlatform {
     fn poll_theme(&mut self) -> Option<bool> {
         // Desktop uses WindowEvent::ThemeChanged; no polling needed.
@@ -292,8 +295,117 @@ impl PlatformBridge for AndroidPlatform {
     }
 }
 
+// ── iOS implementation ──────────────────────────────────────────────────
+//
+// Bare on purpose: GPS, compass and theme are the next unit of work, and they
+// are `None` here so they cannot confound the gate this build exists to prove
+// (that wgpu/Metal and winit's UIKit path work at all).
+//
+// There is no insets querier and must not be one: egui-winit already fills
+// `RawInput::safe_area_insets` on iOS. Android's side channel works around a
+// platform gap iOS does not have.
+//
+// Nothing will be injected here the way Android injects. That split exists
+// because Android's entry point is in another crate; iOS's is in this one.
+
+#[cfg(target_os = "ios")]
+pub struct IosPlatform {
+    back_handler: Option<fn()>,
+    zone_cache_dir: Option<std::path::PathBuf>,
+    config_dir: Option<std::path::PathBuf>,
+}
+
+#[cfg(target_os = "ios")]
+impl Default for IosPlatform {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(target_os = "ios")]
+impl IosPlatform {
+    pub fn new() -> Self {
+        Self {
+            back_handler: None,
+            zone_cache_dir: Self::sandbox_subdir("Library/Caches/rustdar/zones"),
+            config_dir: Self::sandbox_subdir("Library/Application Support/rustdar"),
+        }
+    }
+
+    /// UIKit points `HOME` at the app's sandbox container, so this needs no
+    /// `NSHomeDirectory` call and therefore no ObjC.
+    fn sandbox_subdir(rel: &str) -> Option<std::path::PathBuf> {
+        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(rel))
+    }
+}
+
+#[cfg(target_os = "ios")]
+impl PlatformBridge for IosPlatform {
+    fn poll_theme(&mut self) -> Option<bool> {
+        None
+    }
+
+    fn poll_gps_fix(&mut self) -> Option<rustdar_gps::GpsFix> {
+        None
+    }
+
+    fn poll_heading(&mut self) -> Option<f32> {
+        None
+    }
+
+    fn query_insets(&self) -> Option<(f32, f32, f32, f32)> {
+        // See the module note above: egui-winit already supplies these.
+        None
+    }
+
+    fn handle_back(&self) -> bool {
+        if let Some(handler) = self.back_handler {
+            handler();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `dark-light` 2.0's iOS arm returns `Mode::Light` unconditionally, so the
+    /// replacement is a `UITraitCollection.userInterfaceStyle` read.
+    fn detect_dark_theme(&self) -> bool {
+        false
+    }
+
+    fn set_back_handler(&mut self, handler: fn()) {
+        self.back_handler = Some(handler);
+    }
+
+    fn set_zone_cache_dir(&mut self, dir: std::path::PathBuf) {
+        self.zone_cache_dir = Some(dir);
+    }
+
+    fn zone_cache_dir(&self) -> Option<&std::path::Path> {
+        self.zone_cache_dir.as_deref()
+    }
+
+    fn set_config_dir(&mut self, dir: std::path::PathBuf) {
+        self.config_dir = Some(dir);
+    }
+
+    fn config_store(&self) -> Option<Box<dyn rustdar_egui::config_store::ConfigStore>> {
+        self.config_dir
+            .clone()
+            .map(|dir| Box::new(crate::config_store::FileConfigStore::new(dir)) as Box<_>)
+    }
+
+    fn needs_process_exit(&self) -> bool {
+        false
+    }
+
+    fn supports_exit(&self) -> bool {
+        false
+    }
+}
+
 /// Create the platform-appropriate bridge.
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn create_platform() -> DesktopPlatform {
     DesktopPlatform::new()
 }
@@ -301,4 +413,9 @@ pub fn create_platform() -> DesktopPlatform {
 #[cfg(target_os = "android")]
 pub fn create_platform() -> AndroidPlatform {
     AndroidPlatform::new()
+}
+
+#[cfg(target_os = "ios")]
+pub fn create_platform() -> IosPlatform {
+    IosPlatform::new()
 }

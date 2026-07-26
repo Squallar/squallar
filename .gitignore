@@ -1,4 +1,6 @@
 /target
+# The iOS cross-build's own CARGO_TARGET_DIR; see ios/Makefile.
+/target-ios
 /coverage
 /lcov.info
 *.jks

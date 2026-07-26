@@ -120,6 +120,15 @@ pub trait PlatformBridge {
     /// `std::process::exit` (Android), `false` for normal event-loop exit.
     fn needs_process_exit(&self) -> bool;
 
+    /// Whether quitting is something this platform lets an app do at all.
+    ///
+    /// `false` on iOS: calling `exit()` is an App Store rejection, and UIKit's
+    /// run loop never unwinds back to `run_app`'s caller, so `event_loop.exit()`
+    /// would leave the app running with its exit path already taken.
+    fn supports_exit(&self) -> bool {
+        true
+    }
+
     /// Adjust the attributes the main window is created with.
     ///
     /// Defaulted because only the web bridge has anything to add: winit's web

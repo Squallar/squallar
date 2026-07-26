@@ -62,16 +62,27 @@ wgpu = { workspace = true, features = ["std", "wgsl"] }
 # so the web build spawns onto that instead. See `App::spawn_detached`.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+# `parking_lot` swaps wgpu's internal locks for parking_lot's. It only buys
+# anything where there are threads to contend, so the browser does not take it.
+wgpu = { workspace = true, features = ["parking_lot"] }
+
 # `clipboard` pulls `arboard`, which has no wasm backend at all -- it fails to
 # compile rather than degrading. `wayland`/`x11` are likewise meaningless in a
 # browser. The web build keeps only `links`; the clipboard there is the
 # browser's own, reached through egui-winit's web path.
 # Android is deliberately grouped with native here, preserving exactly the
 # feature set it had before this split.
+#
+# iOS is NOT: arboard has no iOS arm, and its cfg is
+# `unix, not(macos|android|emscripten)`, so iOS silently selects the X11/Wayland
+# backend. That compiles and even links (x11rb is pure Rust), then fails to
+# connect to a display at startup. UIPasteboard would be the real thing;
+# nothing in rustdar copies text, so the feature is simply dropped there.
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "ios")))'.dependencies]
 egui-winit = { workspace = true, features = ["clipboard", "links", "wayland", "x11"] }
-# `parking_lot` swaps wgpu's internal locks for parking_lot's. It only buys
-# anything where there are threads to contend, so the browser does not take it.
-wgpu = { workspace = true, features = ["parking_lot"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+egui-winit = { workspace = true, features = ["links"] }
 
 # The native backend set, split the way wgpu's own build.rs splits it.
 #

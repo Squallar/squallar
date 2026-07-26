@@ -1,5 +1,7 @@
 #![warn(clippy::all)]
-#![forbid(unsafe_code)]
+// See the note in lib.rs. Nothing in this file is unsafe; it matches lib.rs so
+// the two halves of the crate carry the same rule.
+#![deny(unsafe_code)]
 
 use rustdar_platform_lib::run;
 
