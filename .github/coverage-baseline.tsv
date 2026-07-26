@@ -3,7 +3,7 @@ nexrad-level3/src/decode/mod.rs	82	0
 nexrad-level3/src/decode/radial.rs	324	0
 nexrad-level3/src/decode/symbology.rs	56	0
 nexrad-level3/src/model/header.rs	197	196
-nexrad-level3/src/model/radial.rs	8	4
+nexrad-level3/src/model/radial.rs	8	7
 rustdar-egui/src/actions.rs	42	8
 rustdar-egui/src/config_store.rs	11	11
 rustdar-egui/src/input_harness.rs	1787	1770
@@ -86,14 +86,14 @@ rustdar-platform/src/platform.rs	88	0
 rustdar-platform/src/run.rs	31	0
 rustdar-radar/src/archive.rs	510	394
 rustdar-radar/src/level3.rs	332	176
-rustdar-radar/src/palette.rs	122	40
-rustdar-radar/src/render.rs	541	17
+rustdar-radar/src/palette.rs	122	50
+rustdar-radar/src/render.rs	847	728
 rustdar-radar/src/scan.rs	212	6
 rustdar-radar/src/sites.rs	10	10
 rustdar-radar/src/sources.rs	131	128
 rustdar-radar/src/srm.rs	701	413
 rustdar-radar/src/tls.rs	173	153
-rustdar-radar/src/types.rs	233	44
+rustdar-radar/src/types.rs	233	65
 rustdar-units/src/distance.rs	21	7
 rustdar-units/src/hail_size.rs	21	7
 rustdar-units/src/height.rs	32	15
