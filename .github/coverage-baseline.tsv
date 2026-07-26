@@ -6,7 +6,7 @@ nexrad-level3/src/model/header.rs	17	0
 nexrad-level3/src/model/radial.rs	8	0
 rustdar-egui/src/actions.rs	42	8
 rustdar-egui/src/config_store.rs	12	11
-rustdar-egui/src/input_harness.rs	1309	1295
+rustdar-egui/src/input_harness.rs	1499	1484
 rustdar-egui/src/overlay_cache.rs	332	264
 rustdar-egui/src/pane.rs	867	812
 rustdar-egui/src/point_painter.rs	56	0
@@ -15,7 +15,7 @@ rustdar-egui/src/tiles.rs	112	95
 rustdar-egui/src/ui.rs	1015	581
 rustdar-egui/src/ui_chrome.rs	237	219
 rustdar-egui/src/ui_config.rs	213	192
-rustdar-egui/src/ui_input.rs	507	505
+rustdar-egui/src/ui_input.rs	513	513
 rustdar-egui/src/ui_layout.rs	271	271
 rustdar-egui/src/ui_map.rs	226	172
 rustdar-egui/src/ui_map_overlays.rs	142	109
@@ -29,7 +29,7 @@ rustdar-frontend/src/app_render.rs	1229	540
 rustdar-frontend/src/app_state.rs	84	0
 rustdar-frontend/src/channels.rs	31	0
 rustdar-frontend/src/constants.rs	24	19
-rustdar-frontend/src/egui_renderer.rs	114	0
+rustdar-frontend/src/egui_renderer.rs	115	0
 rustdar-frontend/src/input.rs	29	0
 rustdar-frontend/src/loop_downloads.rs	145	136
 rustdar-frontend/src/mobile_cfg.rs	19	19
