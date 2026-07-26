@@ -36,7 +36,7 @@ use chrono::{NaiveDate, NaiveDateTime, Timelike, Utc};
 use grib::{Grib2SubmessageDecoder, GridDefinitionTemplateValues, LatLons, SubMessage};
 use rustdar_radar::sources::DataSources;
 
-use super::{HrrrFetchResult, HrrrGridData, ModelParameter, lambert};
+use super::{GridCoords, HrrrFetchResult, HrrrGridData, ModelParameter, lambert};
 use crate::types::GeoBounds;
 
 /// Live tests only. Production fetches with `ctx.client` (30 s).
@@ -155,39 +155,50 @@ fn previous_run(date: NaiveDate, hour: u8) -> (NaiveDate, u8) {
 // GRIB2 decoding
 // ---------------------------------------------------------------------------
 
-/// Lat/lon of every grid point of a submessage, in scanning-mode order.
+/// How to get the lat/lon of any grid point of a submessage, in scanning-mode
+/// order.
 ///
 /// `grib` is built with `default-features = false` (no C/C++), which drops
 /// `gridpoints-proj` and with it the only `latlons()` for template 3.30 —
 /// grib returns `NotSupported`. HRRR is 3.30 for every field, so without the
-/// [`lambert::latlons`] branch below every HRRR fetch fails here. Other
-/// templates still go through grib, which needs no PROJ for them.
-fn grid_latlons<R>(submessage: &SubMessage<'_, R>) -> Result<Vec<(f64, f64)>, String> {
+/// [`lambert`] branch below every HRRR fetch fails here. Other templates still
+/// go through grib, which needs no PROJ for them, and are materialised because
+/// there is nothing here to recompute them from.
+fn grid_coords<R>(submessage: &SubMessage<'_, R>) -> Result<GridCoords, String> {
     let grid_def = submessage.grid_def();
     let template = GridDefinitionTemplateValues::try_from(grid_def)
         .map_err(|e| format!("Cannot read grid definition: {e}"))?;
 
     match template {
         GridDefinitionTemplateValues::Template30(ref lambert_grid) => {
-            let points = lambert::latlons(lambert_grid)?;
-            // A mismatch against section 3's declared count means the grid we
-            // walked is not the grid the data was packed against.
-            let declared = grid_def.num_points() as usize;
-            if points.len() != declared {
-                return Err(format!(
-                    "Lambert grid point count mismatch: {declared} declared in \
-                     section 3 vs {} computed",
-                    points.len(),
-                ));
-            }
-            Ok(points)
+            let geometry = lambert::LambertGrid::from_template(lambert_grid)?;
+            check_point_count(geometry.len(), grid_def.num_points() as usize)?;
+            Ok(GridCoords::Lambert(geometry))
         }
-        _ => Ok(submessage
-            .latlons()
-            .map_err(|e| format!("Cannot compute grid lat/lons: {e}"))?
-            .map(|(lat, lon)| (f64::from(lat), f64::from(lon)))
-            .collect()),
+        _ => {
+            let (lats, lons) = submessage
+                .latlons()
+                .map_err(|e| format!("Cannot compute grid lat/lons: {e}"))?
+                .map(|(lat, lon)| (f64::from(lat), f64::from(lon)))
+                .unzip();
+            Ok(GridCoords::Explicit { lats, lons })
+        }
     }
+}
+
+/// The grid we walked must hold exactly as many points as section 3 declares.
+///
+/// A mismatch means it is not the grid the data was packed against, and the
+/// values would then be laid out over the wrong coordinates — a plausible field
+/// in the wrong places, which looks like weather.
+fn check_point_count(computed: usize, declared: usize) -> Result<(), String> {
+    if computed != declared {
+        return Err(format!(
+            "Lambert grid point count mismatch: {declared} declared in \
+             section 3 vs {computed} computed",
+        ));
+    }
+    Ok(())
 }
 
 /// `!= 1`, not `< 1`. Zero means the range delimited nothing; **two** means it
@@ -224,8 +235,8 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
         .next()
         .ok_or_else(|| "No submessages in GRIB2 data".to_string())?;
 
-    // Borrows submessage, releases on collect.
-    let latlon_pairs = grid_latlons(&submessage)?;
+    // Borrows submessage, releases here.
+    let coords = grid_coords(&submessage)?;
 
     let (ni, nj) = submessage
         .grid_shape()
@@ -269,17 +280,15 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
         return Err("No grid points decoded from GRIB2".into());
     }
 
-    // Build coordinate arrays and compute bounds.
-    let mut lats = Vec::with_capacity(latlon_pairs.len());
-    let mut lons = Vec::with_capacity(latlon_pairs.len());
+    // One streaming pass for the bounds: nothing is retained, so the 30 MB of
+    // coordinates this used to build never exists.
     let mut min_lat = f64::MAX;
     let mut max_lat = f64::MIN;
     let mut min_lon = f64::MAX;
     let mut max_lon = f64::MIN;
 
-    for &(lat, lon) in &latlon_pairs {
-        lats.push(lat);
-        lons.push(lon);
+    for index in 0..coords.len() {
+        let Some((lat, lon)) = coords.at(index) else { break };
         if lat < min_lat { min_lat = lat; }
         if lat > max_lat { max_lat = lat; }
         if lon < min_lon { min_lon = lon; }
@@ -298,8 +307,7 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
     Ok(HrrrGridData {
         parameter: param,
         values,
-        lats,
-        lons,
+        coords,
         ni,
         nj,
         bounds,
@@ -516,8 +524,7 @@ async fn try_fetch_composite(
     Ok(HrrrGridData {
         parameter: *param,
         values,
-        lats: base.lats.clone(),
-        lons: base.lons.clone(),
+        coords: base.coords.clone(),
         ni: base.ni,
         nj: base.nj,
         bounds: base.bounds,
@@ -813,6 +820,24 @@ mod tests {
         assert!(exactly_one_submessage(3).is_err());
     }
 
+    /// The count guard is only reachable through a real submessage, so it is
+    /// pinned here rather than only by the live S3 tests. HRRR's 1799x1059 is
+    /// the case that must pass; either direction of mismatch must not.
+    #[test]
+    fn a_grid_point_count_must_match_what_section_three_declares() {
+        assert!(check_point_count(1_905_141, 1_905_141).is_ok());
+
+        let short = check_point_count(1_905_140, 1_905_141)
+            .expect_err("a grid one point short must be refused");
+        assert!(short.contains("1905141 declared"), "{short}");
+        assert!(short.contains("1905140 computed"), "{short}");
+
+        assert!(
+            check_point_count(1_905_142, 1_905_141).is_err(),
+            "a grid one point long must be refused too",
+        );
+    }
+
     /// Four verbatim lines from
     /// `hrrr.20260725/conus/hrrr.t14z.wrfsfcf01.grib2.idx` where `(var, level)`
     /// repeats. Neither pair is a field rustdar requests, but taking record 8
@@ -987,7 +1012,12 @@ mod tests {
             assert_eq!(grid.ni, 1799, "{}", param.display_name());
             assert_eq!(grid.nj, 1059, "{}", param.display_name());
             assert_eq!(grid.values.len(), 1_905_141, "{}", param.display_name());
-            assert_eq!(grid.lats.len(), grid.values.len());
+            assert_eq!(grid.coords.len(), grid.values.len());
+            assert!(
+                matches!(grid.coords, GridCoords::Lambert(_)),
+                "{} must take the lazy 3.30 path, not materialise 30 MB",
+                param.display_name(),
+            );
 
             assert!(
                 lo < hi,

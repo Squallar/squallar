@@ -76,7 +76,7 @@ jobs:
       - name: Verify the autofixed tree still builds (host)
         run: cargo build --workspace --all-targets --all-features
       - name: Verify the autofixed tree still builds (wasm32)
-        run: cargo check -p rustdar-web --lib --target wasm32-unknown-unknown
+        run: cargo check -p rustdar-web -p rustdar-frontend --all-targets --target wasm32-unknown-unknown
       - name: Verify the autofixed tree still builds (Android arm64-v8a)
         shell: bash
         run: |

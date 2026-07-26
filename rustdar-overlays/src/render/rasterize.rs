@@ -783,14 +783,15 @@ pub fn rasterize_model_data(
     let total = ni * nj;
 
     // Pre-project once: the cell loop reads each neighbour several times.
+    // `coords.at` is the Lambert inverse for HRRR, so this is the one place
+    // that pays for not storing the coordinates — ~80 ms per raster on a
+    // 1.9 M-point grid, on the background render thread.
     let mut px_coords: Vec<(f32, f32)> = Vec::with_capacity(total);
     for i in 0..total {
-        if i >= grid.lats.len() || i >= grid.lons.len() {
-            px_coords.push((f32::NAN, f32::NAN));
-            continue;
+        match grid.coords.at(i) {
+            Some((lat, lon)) => px_coords.push(mb.project(lat, lon, w, h)),
+            None => px_coords.push((f32::NAN, f32::NAN)),
         }
-        let (px, py) = mb.project(grid.lats[i], grid.lons[i], w, h);
-        px_coords.push((px, py));
     }
 
     for j in 0..nj {
@@ -982,8 +983,10 @@ mod model_nan_tests {
         HrrrGridData {
             parameter,
             values,
-            lats: vec![35.1, 35.1, 35.0, 35.0],
-            lons: vec![-97.1, -97.0, -97.1, -97.0],
+            coords: crate::hrrr::GridCoords::Explicit {
+                lats: vec![35.1, 35.1, 35.0, 35.0],
+                lons: vec![-97.1, -97.0, -97.1, -97.0],
+            },
             ni: 2,
             nj: 2,
             bounds: BOUNDS,
@@ -1079,6 +1082,13 @@ mod model_nan_tests {
 
     /// `px_coords` is NaN-padded when `ni * nj` exceeds the coordinate arrays;
     /// those points must be skipped, not projected somewhere arbitrary.
+    ///
+    /// A padded point is a *neighbour* of a real one, and neighbour spacing is
+    /// what sizes each cell. NaN survives that arithmetic and falls out at the
+    /// 0.5 px floor via `f32::max`; any real coordinate — `(0.0, 0.0)` being
+    /// the obvious wrong choice — stretches the cell across the texture
+    /// instead. Hence the bottom-row assertion: the four real points all sit in
+    /// the upper two thirds.
     #[test]
     fn a_grid_shape_mismatch_does_not_paint_padded_points() {
         let mut g = grid(ModelParameter::SurfaceBasedCin, vec![-400.0; 4]);
@@ -1087,5 +1097,16 @@ mod model_nan_tests {
         g.nj = 4;
         let out = rasterize_model_data(&g, &BOUNDS, 64, 64);
         assert_eq!(out.rgba.len(), 64 * 64 * 4, "must not overrun the buffer");
+
+        let bottom_row = &out.rgba[(63 * 64 * 4)..];
+        assert_eq!(
+            bottom_row.chunks_exact(4).filter(|px| px[3] > 0).count(),
+            0,
+            "a padded neighbour stretched a cell to the bottom of the texture",
+        );
+        assert!(
+            out.rgba.chunks_exact(4).any(|px| px[3] > 0),
+            "control: the four real points must still paint",
+        );
     }
 }

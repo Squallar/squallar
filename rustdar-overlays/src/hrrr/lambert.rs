@@ -263,59 +263,200 @@ fn normalize_longitude_degrees(lon: f64) -> f64 {
     (lon + 540.0).rem_euclid(360.0) - 180.0
 }
 
+/// A template 3.30 grid reduced to the constants any point's lat/lon can be
+/// rebuilt from — 88 bytes standing in for two 15 MB `Vec<f64>`.
+///
+/// HRRR CONUS is 1,905,141 points, so materialising the coordinates costs
+/// 30.5 MB per cached parameter and 61 MB at the peak of a parse (the pair
+/// vector and the split arrays are alive together). Nothing downstream reads
+/// them in bulk: the rasterizer walks the grid in index order and the tooltip
+/// wants one point, both of which this answers arithmetically.
+#[derive(Debug, Clone, Copy)]
+pub struct LambertGrid {
+    projection: LambertConformalConic,
+    /// Projection-plane metres of grid point (0, 0).
+    x0: f64,
+    y0: f64,
+    /// Signed step per index — the encoding is unsigned, the scanning mode
+    /// carries the direction.
+    dx: f64,
+    dy: f64,
+    ni: usize,
+    nj: usize,
+    /// Scanning-mode bits that decide the flat index order.
+    i_consecutive: bool,
+    alternating: bool,
+}
+
+impl LambertGrid {
+    /// Template 3.30 fixes the angular unit at 1e-6 degrees; there is no basic
+    /// angle / subdivision pair in this template to override it.
+    const ANGLE_UNIT: f64 = 1e-6;
+    /// Dx and Dy are in millimetres for this template.
+    const LENGTH_UNIT_M: f64 = 1e-3;
+
+    /// Read the projection and grid walk out of GRIB2 section 3.
+    pub fn from_template(grid: &Template3_30) -> Result<Self, String> {
+        let lad = f64::from(grid.lad) * Self::ANGLE_UNIT;
+        let lov = f64::from(grid.lov) * Self::ANGLE_UNIT;
+        let latin1 = f64::from(grid.latin1) * Self::ANGLE_UNIT;
+        let latin2 = f64::from(grid.latin2) * Self::ANGLE_UNIT;
+
+        let (a, b) = grid.earth_shape.radii().ok_or_else(|| {
+            format!(
+                "Unknown value of GRIB2 Code Table 3.2 (shape of the Earth): {}",
+                grid.earth_shape.shape
+            )
+        })?;
+
+        let projection = LambertConformalConic::new(a, b, lad, lov, latin1, latin2)?;
+
+        // Constructed and dropped for its flag validation: `has_unsupported_flags`
+        // is private to grib, and rejecting exactly what grib's own iterator
+        // rejects is the point.
+        grid.ij()
+            .map_err(|e| format!("Cannot iterate Lambert grid indices: {e}"))?;
+
+        // Grid steps are always positive in the encoding; the scanning mode says
+        // which way they actually run.
+        let mut dx = f64::from(grid.dx) * Self::LENGTH_UNIT_M;
+        let mut dy = f64::from(grid.dy) * Self::LENGTH_UNIT_M;
+        if !grid.scanning_mode.scans_positively_for_i() && dx > 0.0 {
+            dx = -dx;
+        }
+        if !grid.scanning_mode.scans_positively_for_j() && dy > 0.0 {
+            dy = -dy;
+        }
+
+        let (x0, y0) = projection.forward(
+            f64::from(grid.first_point_lat) * Self::ANGLE_UNIT,
+            f64::from(grid.first_point_lon) * Self::ANGLE_UNIT,
+        );
+
+        Ok(Self {
+            projection,
+            x0,
+            y0,
+            dx,
+            dy,
+            ni: grid.ni as usize,
+            nj: grid.nj as usize,
+            i_consecutive: grid.scanning_mode.is_consecutive_for_i(),
+            alternating: grid.scanning_mode.scans_alternating_rows(),
+        })
+    }
+
+    /// Number of grid points.
+    pub fn len(&self) -> usize {
+        self.ni * self.nj
+    }
+
+    /// A grid with no points; only reachable from a malformed section 3.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Lat/lon of grid point `(i, j)`, degrees, longitude wrapped to -180..180.
+    pub fn latlon(&self, i: usize, j: usize) -> (f64, f64) {
+        let (lat, lon) = self.projection.inverse(
+            self.x0 + self.dx * i as f64,
+            self.y0 + self.dy * j as f64,
+        );
+        (lat, normalize_longitude_degrees(lon))
+    }
+
+    /// Lat/lon of the `index`-th decoded value, or `None` past the end.
+    pub fn latlon_at(&self, index: usize) -> Option<(f64, f64)> {
+        let (i, j) = self.ij_at(index)?;
+        Some(self.latlon(i, j))
+    }
+
+    /// Flat index of the grid point nearest `(lat, lon)`, or `None` when the
+    /// point falls outside the grid.
+    ///
+    /// Forward-projecting and dividing by the step is exact for this grid — the
+    /// axes are the projection's own — so this replaces a scan over every point.
+    /// "Nearest" is therefore in the projection plane rather than in degrees;
+    /// on a 3 km grid the two can differ only for a query already sitting on a
+    /// cell boundary.
+    pub fn nearest(&self, lat: f64, lon: f64) -> Option<usize> {
+        let (x, y) = self.projection.forward(lat, lon);
+        let fi = ((x - self.x0) / self.dx).round();
+        let fj = ((y - self.y0) / self.dy).round();
+        if !(fi.is_finite() && fj.is_finite()) || fi < 0.0 || fj < 0.0 {
+            return None;
+        }
+        let (i, j) = (fi as usize, fj as usize);
+        if i >= self.ni || j >= self.nj {
+            return None;
+        }
+        Some(self.index_of(i, j))
+    }
+
+    /// The `(i, j)` grib's [`GridPointIndex::ij`] yields at position `index`.
+    ///
+    /// Reproduces `GridPointIndexIterator` in closed form;
+    /// `the_flat_index_mapping_reproduces_gribs_scan_order` pins it against the
+    /// iterator itself rather than against this reasoning.
+    fn ij_at(&self, index: usize) -> Option<(usize, usize)> {
+        let (major_len, minor_len) = self.scan_lengths();
+        if minor_len == 0 {
+            return None;
+        }
+        let major = index / minor_len;
+        if major >= major_len {
+            return None;
+        }
+        let mut minor = index % minor_len;
+        if self.alternating && major % 2 == 1 {
+            minor = minor_len - minor - 1;
+        }
+        Some(if self.i_consecutive {
+            (minor, major)
+        } else {
+            (major, minor)
+        })
+    }
+
+    /// Inverse of [`Self::ij_at`].
+    fn index_of(&self, i: usize, j: usize) -> usize {
+        let (_, minor_len) = self.scan_lengths();
+        let (major, minor) = if self.i_consecutive { (j, i) } else { (i, j) };
+        let minor = if self.alternating && major % 2 == 1 {
+            minor_len - minor - 1
+        } else {
+            minor
+        };
+        major * minor_len + minor
+    }
+
+    /// `(outer, inner)` loop lengths of the scan, in grib's own terms.
+    fn scan_lengths(&self) -> (usize, usize) {
+        if self.i_consecutive {
+            (self.nj, self.ni)
+        } else {
+            (self.ni, self.nj)
+        }
+    }
+}
+
 /// Drop-in replacement for grib's PROJ-backed
 /// `<Template3_30 as LatLons>::latlons`, mirroring its sequence exactly.
 ///
 /// Points come back in scanning-mode order — the same order as the decoded data
 /// values — because the iteration is driven by grib's own
 /// [`GridPointIndex::ij`], which is not gated behind `gridpoints-proj`.
+///
+/// The fetch path no longer calls this; it keeps a [`LambertGrid`] and computes
+/// points on demand. It survives as the reference the lazy form is checked
+/// against, and as the eager form for any caller that genuinely wants all
+/// 30 MB.
 pub fn latlons(grid: &Template3_30) -> Result<Vec<(f64, f64)>, String> {
-    // Template 3.30 fixes the angular unit at 1e-6 degrees; there is no basic
-    // angle / subdivision pair in this template to override it.
-    const ANGLE_UNIT: f64 = 1e-6;
-    // Dx and Dy are in millimetres for this template.
-    const LENGTH_UNIT_M: f64 = 1e-3;
-
-    let lad = f64::from(grid.lad) * ANGLE_UNIT;
-    let lov = f64::from(grid.lov) * ANGLE_UNIT;
-    let latin1 = f64::from(grid.latin1) * ANGLE_UNIT;
-    let latin2 = f64::from(grid.latin2) * ANGLE_UNIT;
-
-    let (a, b) = grid.earth_shape.radii().ok_or_else(|| {
-        format!(
-            "Unknown value of GRIB2 Code Table 3.2 (shape of the Earth): {}",
-            grid.earth_shape.shape
-        )
-    })?;
-
-    let projection = LambertConformalConic::new(a, b, lad, lov, latin1, latin2)?;
-
-    // Grid steps are always positive in the encoding; the scanning mode says
-    // which way they actually run.
-    let mut dx = f64::from(grid.dx) * LENGTH_UNIT_M;
-    let mut dy = f64::from(grid.dy) * LENGTH_UNIT_M;
-    if !grid.scanning_mode.scans_positively_for_i() && dx > 0.0 {
-        dx = -dx;
-    }
-    if !grid.scanning_mode.scans_positively_for_j() && dy > 0.0 {
-        dy = -dy;
-    }
-
-    let (x0, y0) = projection.forward(
-        f64::from(grid.first_point_lat) * ANGLE_UNIT,
-        f64::from(grid.first_point_lon) * ANGLE_UNIT,
-    );
-
+    let geometry = LambertGrid::from_template(grid)?;
     let indices = grid
         .ij()
         .map_err(|e| format!("Cannot iterate Lambert grid indices: {e}"))?;
-
-    Ok(indices
-        .map(|(i, j)| {
-            let (lat, lon) = projection.inverse(x0 + dx * i as f64, y0 + dy * j as f64);
-            (lat, normalize_longitude_degrees(lon))
-        })
-        .collect())
+    Ok(indices.map(|(i, j)| geometry.latlon(i, j)).collect())
 }
 
 #[cfg(test)]
@@ -550,6 +691,145 @@ mod tests {
             "the two encodings differ by {delta:.3e}° at the NE corner, far more \
              than one microdegree of Lo1 should cause",
         );
+    }
+
+    // ── The lazy geometry ─────────────────────────────────────────────────
+
+    /// [`LambertGrid::ij_at`] reproduces grib's `GridPointIndexIterator` in
+    /// closed form, which is what lets a point be answered without walking the
+    /// grid. Pinned against that iterator across **all sixteen** supported
+    /// scanning modes rather than against the reasoning behind it — HRRR only
+    /// ever sends 0b0100_0000, so the other fifteen have no other guard.
+    #[test]
+    fn the_flat_index_mapping_reproduces_gribs_scan_order() {
+        use grib::def::grib2::template::param_set;
+        let mut grid = hrrr_conus_grid();
+        // Deliberately not square and not even, so a transposed or
+        // off-by-one-row mapping cannot coincide with the right one.
+        grid.ni = 5;
+        grid.nj = 3;
+
+        for high_nibble in 0..16u8 {
+            let bits = high_nibble << 4;
+            grid.scanning_mode = param_set::ScanningMode(bits);
+            let expected: Vec<(usize, usize)> = grid.ij().unwrap().collect();
+            let geometry = LambertGrid::from_template(&grid).unwrap();
+
+            assert_eq!(expected.len(), geometry.len(), "mode {bits:#010b}");
+            for (k, &(i, j)) in expected.iter().enumerate() {
+                assert_eq!(
+                    geometry.ij_at(k),
+                    Some((i, j)),
+                    "mode {bits:#010b}: index {k}",
+                );
+                assert_eq!(
+                    geometry.index_of(i, j),
+                    k,
+                    "mode {bits:#010b}: point ({i}, {j})",
+                );
+            }
+            assert_eq!(
+                geometry.ij_at(expected.len()),
+                None,
+                "mode {bits:#010b}: one past the end must not wrap",
+            );
+        }
+    }
+
+    /// The lazy form must be **bit-identical** to the eager one it replaced, at
+    /// every one of the 1,905,141 points — not close, identical: it is the same
+    /// arithmetic, and every PROJ-anchored assertion above is stated in terms of
+    /// [`latlons`].
+    #[test]
+    fn the_lazy_geometry_reproduces_the_eager_latlons() {
+        let grid = hrrr_conus_grid();
+        let eager = latlons(&grid).unwrap();
+        let lazy = LambertGrid::from_template(&grid).unwrap();
+
+        assert_eq!(lazy.len(), eager.len());
+        for (k, &expected) in eager.iter().enumerate() {
+            assert_eq!(lazy.latlon_at(k), Some(expected), "grid point {k}");
+        }
+        assert_eq!(lazy.latlon_at(eager.len()), None);
+    }
+
+    /// The tooltip's O(1) lookup must land where a scan over all 1.9 M points
+    /// would.
+    ///
+    /// Sampled away from the anchor on purpose: `nearest` divides by the same
+    /// `dx`/`dy` the forward projection was anchored with, so grid point (0, 0)
+    /// resolves correctly even under a wrong step — the same blind-oracle shape
+    /// as the earth-radius corner case above.
+    #[test]
+    fn nearest_recovers_the_index_of_a_grid_point() {
+        let grid = hrrr_conus_grid();
+        let geometry = LambertGrid::from_template(&grid).unwrap();
+
+        for &(i, j, _, _, what) in HRRR_CORNERS_FROM_PROJ {
+            let (lat, lon) = geometry.latlon(i, j);
+            assert_eq!(
+                geometry.nearest(lat, lon),
+                Some(geometry.index_of(i, j)),
+                "{what}",
+            );
+        }
+
+        // A third of a cell off-centre still rounds to the same point.
+        let (lat, lon) = geometry.latlon(900, 530);
+        let (nlat, nlon) = geometry.latlon(901, 531);
+        assert_eq!(
+            geometry.nearest(lat + (nlat - lat) / 3.0, lon + (nlon - lon) / 3.0),
+            Some(geometry.index_of(900, 530)),
+            "a point inside a cell must resolve to that cell",
+        );
+    }
+
+    /// One cell past each edge, not a continent away.
+    ///
+    /// The far-away cases below cannot see this: relaxing the upper bound to
+    /// `i > ni` admits `i == ni`, and under i-consecutive scanning
+    /// `index_of(ni, j)` is the *west* edge of row `j + 1` — an in-range index
+    /// holding a reading from 5,000 km away, which `values.get` will happily
+    /// return.
+    #[test]
+    fn nearest_refuses_the_cell_just_past_each_edge() {
+        let grid = hrrr_conus_grid();
+        let (ni, nj) = (grid.ni as usize, grid.nj as usize);
+        let geometry = LambertGrid::from_template(&grid).unwrap();
+
+        for &(i, j, what) in &[
+            (ni, 0usize, "one column past the east edge"),
+            (0usize, nj, "one row past the north edge"),
+            (ni, nj, "past both edges"),
+        ] {
+            let (lat, lon) = geometry.latlon(i, j);
+            assert_eq!(geometry.nearest(lat, lon), None, "{what}");
+        }
+
+        // Control: the last real point must still resolve, or the guard is
+        // simply off by one the other way.
+        let (lat, lon) = geometry.latlon(ni - 1, nj - 1);
+        assert_eq!(
+            geometry.nearest(lat, lon),
+            Some(geometry.index_of(ni - 1, nj - 1)),
+            "the far corner is inside the grid",
+        );
+    }
+
+    /// Off the grid must be `None`, not a clamped edge point: the tooltip would
+    /// otherwise report a CONUS reading for a cursor over the Atlantic.
+    #[test]
+    fn nearest_refuses_a_point_outside_the_grid() {
+        let geometry = LambertGrid::from_template(&hrrr_conus_grid()).unwrap();
+        for &(lat, lon, what) in &[
+            (51.5, -0.13, "London"),
+            (-33.87, 151.21, "Sydney"),
+            (21.14, -140.0, "west of the SW corner"),
+            (60.0, -97.5, "north of the domain"),
+            (10.0, -97.5, "south of the domain"),
+        ] {
+            assert_eq!(geometry.nearest(lat, lon), None, "{what}");
+        }
     }
 
     /// A projection can agree with PROJ at sampled points and still be indexed

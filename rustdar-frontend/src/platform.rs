@@ -212,112 +212,120 @@ mod tests {
     //
     // The Android theme bridge is the only caller and cannot run under test, so
     // these pin the parts of it that are plain Rust.
+    //
+    // Carries the *same* cfg as the function: wasm32 has no threads, so the
+    // definition is absent there and ungated callers here broke
+    // `--all-targets` on that target while the lib arm stayed green.
+    #[cfg(not(target_arch = "wasm32"))]
+    mod poller {
+        use super::super::spawn_state_poller;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::Duration;
 
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::Duration;
+        /// The consumer has nothing to show until the first sample lands, so it
+        /// must not wait out an interval first.
+        #[test]
+        fn poller_sends_an_initial_sample_without_waiting() {
+            let rx =
+                spawn_state_poller("test-initial", Duration::from_secs(3600), || true).unwrap();
 
-    /// The consumer has nothing to show until the first sample lands, so it must
-    /// not wait out an interval first.
-    #[test]
-    fn poller_sends_an_initial_sample_without_waiting() {
-        let rx = spawn_state_poller("test-initial", Duration::from_secs(3600), || true).unwrap();
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(5)),
+                Ok(true),
+                "first sample must not be delayed by one interval"
+            );
+        }
 
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(5)),
-            Ok(true),
-            "first sample must not be delayed by one interval"
-        );
-    }
-
-    /// A flipped value must reach the consumer.
-    #[test]
-    fn poller_reports_a_change() {
-        let state = Arc::new(AtomicBool::new(false));
-        let probe = Arc::clone(&state);
-        let rx =
-            spawn_state_poller("test-change", Duration::from_millis(5), move || {
+        /// A flipped value must reach the consumer.
+        #[test]
+        fn poller_reports_a_change() {
+            let state = Arc::new(AtomicBool::new(false));
+            let probe = Arc::clone(&state);
+            let rx = spawn_state_poller("test-change", Duration::from_millis(5), move || {
                 probe.load(Ordering::Relaxed)
             })
             .unwrap();
 
-        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(false));
-        state.store(true, Ordering::Relaxed);
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(false));
+            state.store(true, Ordering::Relaxed);
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            match rx.recv_timeout(Duration::from_secs(5)) {
-                Ok(true) => break,
-                Ok(false) => assert!(
-                    std::time::Instant::now() < deadline,
-                    "poller never reported the flipped value"
-                ),
-                Err(e) => panic!("poller stopped early: {e:?}"),
-            }
-        }
-    }
-
-    /// The regression this exists for: a send-on-change loop never retries after
-    /// the value settles, so it never observes the disconnect and runs forever.
-    /// Dropping the receiver must stop the thread even though nothing changed.
-    #[test]
-    fn poller_exits_when_the_receiver_is_dropped_and_the_value_never_changes() {
-        // The closure owns a Sender; the thread dropping the closure on exit is
-        // what disconnects this probe channel. That makes "thread exited"
-        // observable without sleeping on a guess.
-        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
-        let rx = spawn_state_poller("test-exit", Duration::from_millis(5), move || {
-            let _ = probe_tx.send(());
-            true // deliberately constant
-        })
-        .unwrap();
-
-        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
-        drop(rx);
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let mut exited = false;
-        while std::time::Instant::now() < deadline {
-            match probe_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(()) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    exited = true;
-                    break;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(true) => break,
+                    Ok(false) => assert!(
+                        std::time::Instant::now() < deadline,
+                        "poller never reported the flipped value"
+                    ),
+                    Err(e) => panic!("poller stopped early: {e:?}"),
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             }
         }
-        assert!(
-            exited,
-            "poller must stop once its receiver is dropped, even if the sampled \
-             value never changes"
-        );
-    }
 
-    /// The thread must stop calling the detector after it exits — a leaked
-    /// thread would keep a JVM attachment alive on Android.
-    #[test]
-    fn poller_stops_sampling_after_exit() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let probe = Arc::clone(&calls);
-        let rx = spawn_state_poller("test-quiesce", Duration::from_millis(5), move || {
-            probe.fetch_add(1, Ordering::SeqCst);
-            true
-        })
-        .unwrap();
+        /// The regression this exists for: a send-on-change loop never retries
+        /// after the value settles, so it never observes the disconnect and runs
+        /// forever. Dropping the receiver must stop the thread even though
+        /// nothing changed.
+        #[test]
+        fn poller_exits_when_the_receiver_is_dropped_and_the_value_never_changes() {
+            // The closure owns a Sender; the thread dropping the closure on exit
+            // is what disconnects this probe channel. That makes "thread exited"
+            // observable without sleeping on a guess.
+            let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+            let rx = spawn_state_poller("test-exit", Duration::from_millis(5), move || {
+                let _ = probe_tx.send(());
+                true // deliberately constant
+            })
+            .unwrap();
 
-        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
-        drop(rx);
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
+            drop(rx);
 
-        // Let it notice the disconnect, then confirm the count has settled.
-        std::thread::sleep(Duration::from_millis(200));
-        let settled = calls.load(Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(200));
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut exited = false;
+            while std::time::Instant::now() < deadline {
+                match probe_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(()) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        exited = true;
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                }
+            }
+            assert!(
+                exited,
+                "poller must stop once its receiver is dropped, even if the \
+                 sampled value never changes"
+            );
+        }
 
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            settled,
-            "detector was still being called after the receiver was dropped"
-        );
+        /// The thread must stop calling the detector after it exits — a leaked
+        /// thread would keep a JVM attachment alive on Android.
+        #[test]
+        fn poller_stops_sampling_after_exit() {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let probe = Arc::clone(&calls);
+            let rx = spawn_state_poller("test-quiesce", Duration::from_millis(5), move || {
+                probe.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+            .unwrap();
+
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
+            drop(rx);
+
+            // Let it notice the disconnect, then confirm the count has settled.
+            std::thread::sleep(Duration::from_millis(200));
+            let settled = calls.load(Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(200));
+
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                settled,
+                "detector was still being called after the receiver was dropped"
+            );
+        }
     }
 }

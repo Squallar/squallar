@@ -765,6 +765,77 @@ fn lerp_color(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
     ]
 }
 
+/// Where a grid point's coordinates come from.
+///
+/// HRRR is 1,905,141 points, so a materialised `lats`/`lons` pair is 30.5 MB
+/// *per cached parameter* — and [`crate::render::handlers`] caches one grid per
+/// parameter with no eviction, on targets with a 4 GiB address space (wasm32)
+/// or a hard per-app cap (Android). The Lambert case rebuilds any point from
+/// the projection constants instead, which is every point HRRR has ever
+/// returned; see [`lambert::LambertGrid`].
+#[derive(Debug, Clone)]
+pub enum GridCoords {
+    /// GRIB2 template 3.30 — computed on demand from section 3.
+    Lambert(lambert::LambertGrid),
+    /// Any other template, where the coordinates come out of grib itself and
+    /// there is no closed form here to recompute them from.
+    Explicit {
+        /// Latitude of each grid point.
+        lats: Vec<f64>,
+        /// Longitude of each grid point.
+        lons: Vec<f64>,
+    },
+}
+
+impl GridCoords {
+    /// Number of grid points.
+    pub fn len(&self) -> usize {
+        match self {
+            GridCoords::Lambert(g) => g.len(),
+            GridCoords::Explicit { lats, lons } => lats.len().min(lons.len()),
+        }
+    }
+
+    /// Whether the grid carries no points at all.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Lat/lon of the `index`-th decoded value, or `None` past the end.
+    pub fn at(&self, index: usize) -> Option<(f64, f64)> {
+        match self {
+            GridCoords::Lambert(g) => g.latlon_at(index),
+            GridCoords::Explicit { lats, lons } => {
+                Some((*lats.get(index)?, *lons.get(index)?))
+            }
+        }
+    }
+
+    /// Index of the grid point nearest `(lat, lon)`, or `None` when the grid
+    /// does not cover it.
+    ///
+    /// O(1) for a Lambert grid — the flat scan it replaces ran over all
+    /// 1.9 M points on every hover frame.
+    pub fn nearest(&self, lat: f64, lon: f64) -> Option<usize> {
+        match self {
+            GridCoords::Lambert(g) => g.nearest(lat, lon),
+            GridCoords::Explicit { lats, lons } => {
+                let mut best = None;
+                let mut best_d2 = f64::MAX;
+                for (i, (&glat, &glon)) in lats.iter().zip(lons.iter()).enumerate() {
+                    let (dlat, dlon) = (glat - lat, glon - lon);
+                    let d2 = dlat * dlat + dlon * dlon;
+                    if d2 < best_d2 {
+                        best_d2 = d2;
+                        best = Some(i);
+                    }
+                }
+                best
+            }
+        }
+    }
+}
+
 /// Parsed HRRR grid data for a single model parameter.
 #[derive(Debug, Clone)]
 pub struct HrrrGridData {
@@ -773,10 +844,8 @@ pub struct HrrrGridData {
     /// Grid point values in row-major order (nj rows × ni columns).
     /// NaN for missing/undefined points.
     pub values: Vec<f32>,
-    /// Latitude of each grid point (same length as `values`).
-    pub lats: Vec<f64>,
-    /// Longitude of each grid point (same length as `values`).
-    pub lons: Vec<f64>,
+    /// How to get the lat/lon of grid point `i`.
+    pub coords: GridCoords,
     /// Number of columns in the grid.
     pub ni: usize,
     /// Number of rows in the grid.
@@ -870,8 +939,10 @@ mod tests {
         HrrrGridData {
             parameter: param,
             values,
-            lats: vec![35.0; n],
-            lons: vec![-97.0; n],
+            coords: GridCoords::Explicit {
+                lats: vec![35.0; n],
+                lons: vec![-97.0; n],
+            },
             ni: n,
             nj: 1,
             bounds: GeoBounds {
@@ -990,6 +1061,59 @@ mod tests {
         keys.sort_unstable();
         keys.dedup();
         assert_eq!(keys.len(), total, "duplicate config key among {keys:?}");
+    }
+
+    // ── GridCoords ────────────────────────────────────────────────────────
+
+    fn explicit() -> GridCoords {
+        GridCoords::Explicit {
+            lats: vec![35.0, 35.0, 35.1, 35.1],
+            lons: vec![-97.1, -97.0, -97.1, -97.0],
+        }
+    }
+
+    #[test]
+    fn explicit_coords_read_back_by_index_and_stop_at_the_end() {
+        let c = explicit();
+        assert_eq!(c.len(), 4);
+        assert!(!c.is_empty());
+        assert_eq!(c.at(0), Some((35.0, -97.1)));
+        assert_eq!(c.at(3), Some((35.1, -97.0)));
+        assert_eq!(c.at(4), None, "one past the end must not wrap");
+    }
+
+    /// A ragged pair — one array shorter than the other — must report the
+    /// shorter length rather than hand out an index only one side has.
+    #[test]
+    fn explicit_coords_are_bounded_by_the_shorter_array() {
+        let c = GridCoords::Explicit {
+            lats: vec![35.0, 36.0, 37.0],
+            lons: vec![-97.0],
+        };
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.at(1), None);
+    }
+
+    #[test]
+    fn an_empty_grid_reports_itself_empty() {
+        let c = GridCoords::Explicit {
+            lats: Vec::new(),
+            lons: Vec::new(),
+        };
+        assert!(c.is_empty());
+        assert_eq!(c.at(0), None);
+        assert_eq!(c.nearest(35.0, -97.0), None);
+    }
+
+    /// The scan must return the *closest* point, not the first one it sees —
+    /// the probe below sits nearest the last of the four.
+    #[test]
+    fn explicit_nearest_picks_the_closest_point_not_the_first() {
+        let c = explicit();
+        assert_eq!(c.nearest(35.099, -97.001), Some(3));
+        assert_eq!(c.nearest(35.001, -97.099), Some(0));
+        assert_eq!(c.nearest(35.001, -97.001), Some(1));
+        assert_eq!(c.nearest(35.099, -97.099), Some(2));
     }
 
     /// A missing point has no reading to report.

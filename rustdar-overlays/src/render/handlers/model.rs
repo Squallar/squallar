@@ -142,23 +142,14 @@ impl OverlayHandler for ModelDataHandler {
             return None;
         }
         // Nearest neighbour, not interpolation: the HRRR grid is ~3 km, finer
-        // than a tooltip needs. Linear scan over the whole grid.
-        let mut best_dist_sq = f64::MAX;
-        let mut best_val = f32::NAN;
-        for (i, &value) in grid.values.iter().enumerate() {
-            if i >= grid.lats.len() || i >= grid.lons.len() {
-                break;
-            }
-            let dlat = grid.lats[i] - lat;
-            let dlon = grid.lons[i] - lon;
-            let d2 = dlat * dlat + dlon * dlon;
-            if d2 < best_dist_sq {
-                best_dist_sq = d2;
-                best_val = value;
-            }
-        }
+        // than a tooltip needs. Lambert grids answer this by forward-projecting
+        // the cursor; everything else still scans.
+        let index = grid.coords.nearest(lat, lon)?;
+        let (glat, glon) = grid.coords.at(index)?;
+        let best_val = *grid.values.get(index)?;
+        let (dlat, dlon) = (glat - lat, glon - lon);
         // ~0.05° ≈ 5 km at mid-latitudes.
-        if best_dist_sq > 0.05 * 0.05 {
+        if dlat * dlat + dlon * dlon > 0.05 * 0.05 {
             return None;
         }
         let text = grid.parameter.format_value(best_val);
@@ -365,8 +356,10 @@ mod tests {
         HrrrGridData {
             parameter,
             values,
-            lats: vec![35.0; n],
-            lons: vec![-97.0; n],
+            coords: crate::hrrr::GridCoords::Explicit {
+                lats: vec![35.0; n],
+                lons: vec![-97.0; n],
+            },
             ni: n,
             nj: 1,
             bounds: GeoBounds {
@@ -477,6 +470,91 @@ mod tests {
     fn a_populated_overlay_reports_no_problem() {
         let lines = info_lines(&handler(ModelParameter::MaxUH2to5km, vec![120.0, 0.0]));
         assert!(!lines.iter().any(|l| l.contains('\u{26a0}')), "{lines:?}");
+    }
+
+    // ── Hover ─────────────────────────────────────────────────────────────
+
+    /// A 2x2 grid whose four points carry four different values, so a lookup
+    /// that lands on the wrong one is visible in the text.
+    fn hover_handler() -> ModelDataHandler {
+        let parameter = ModelParameter::SurfaceBasedCape;
+        let values = vec![300.0, 1200.0, 2600.0, 4100.0];
+        let (visible_points, value_range) = crate::hrrr::summarize_values(&values, parameter);
+        let g = HrrrGridData {
+            parameter,
+            values,
+            coords: crate::hrrr::GridCoords::Explicit {
+                lats: vec![35.0, 35.0, 35.1, 35.1],
+                lons: vec![-97.1, -97.0, -97.1, -97.0],
+            },
+            ni: 2,
+            nj: 2,
+            bounds: GeoBounds {
+                min_lat: 35.0,
+                max_lat: 35.1,
+                min_lon: -97.1,
+                max_lon: -97.0,
+            },
+            ref_time: chrono::NaiveDate::from_ymd_opt(2026, 7, 25)
+                .unwrap()
+                .and_hms_opt(RUN_HOUR, 0, 0)
+                .unwrap(),
+            forecast_hour: parameter.forecast_hour(),
+            visible_points,
+            value_range,
+        };
+        let mut h = ModelDataHandler::new();
+        h.enabled = true;
+        h.selected_param = parameter;
+        h.apply_fetch_result(Box::new(HrrrFetchResult(Ok(g))));
+        h
+    }
+
+    /// Each corner must report its own point's reading.
+    #[test]
+    fn hover_reports_the_nearest_grid_points_value() {
+        let h = hover_handler();
+        assert_eq!(
+            h.hover_value_at(35.001, -97.099).as_deref(),
+            Some("SBCAPE: 300 J/kg"),
+        );
+        assert_eq!(
+            h.hover_value_at(35.099, -97.001).as_deref(),
+            Some("SBCAPE: 4100 J/kg"),
+        );
+        assert_eq!(
+            h.hover_value_at(35.001, -97.001).as_deref(),
+            Some("SBCAPE: 1200 J/kg"),
+        );
+    }
+
+    /// Outside the grid's bounds there is nothing to report.
+    #[test]
+    fn hover_is_silent_outside_the_grid_bounds() {
+        let h = hover_handler();
+        assert_eq!(h.hover_value_at(40.0, -97.05), None);
+        assert_eq!(h.hover_value_at(35.05, -90.0), None);
+    }
+
+    /// Inside the bounds but ~7.8 km from all four points, which is past the
+    /// 0.05° cutoff — a reading must not be stretched across a gap.
+    #[test]
+    fn hover_is_silent_further_than_the_cutoff_from_every_point() {
+        assert_eq!(hover_handler().hover_value_at(35.05, -97.05), None);
+    }
+
+    /// 0.02° north of the top edge: outside the bounds, but *inside* the 0.05°
+    /// cutoff of a real point. The bounds test is the only thing that can
+    /// reject it, so the cases above would pass without it.
+    #[test]
+    fn hover_is_silent_just_outside_the_bounds_beside_a_real_point() {
+        assert_eq!(hover_handler().hover_value_at(35.12, -97.0), None);
+    }
+
+    /// A parameter with no grid fetched has nothing to hover over.
+    #[test]
+    fn hover_is_silent_before_any_data_arrives() {
+        assert_eq!(ModelDataHandler::new().hover_value_at(35.0, -97.0), None);
     }
 
     /// Fails if a fetch error is only logged. An HTTP 500 once made both UH
