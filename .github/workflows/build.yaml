@@ -85,8 +85,14 @@ jobs:
             target: x86_64-linux-android
             cmd: cargo ndk -t x86_64 -P 28 build -p rustdar-android --lib
 
-          # The only wasm build. `cargo check` is not a web gate: binding
-          # generation is a step cargo never runs, and that is where the wgpu
+          # The only wasm build, and deliberately so. The deleted `wasm32
+          # libraries` row named members as roots, so rustdar-gps took its own
+          # defaults and serialport -- the crate the `serial`/`gps-serial` gates
+          # exist to keep off web and iOS -- got compiled for wasm32. Nothing
+          # ships that combination, so it gated nothing. Do not restore the row.
+          #
+          # `cargo check` is not a web gate either: binding generation is a step
+          # cargo never runs, and that is where the wgpu
           # `duplicate string enums: GpuFilterMode` break surfaced.
           - name: web-wasm32
             target: wasm32-unknown-unknown
@@ -179,7 +185,7 @@ jobs:
               }
               check jni                      rustdar-android:aarch64-linux-android rustdar-android:x86_64-linux-android
               check rustls-platform-verifier rustdar-android:aarch64-linux-android rustdar-android:x86_64-linux-android
-              check wgpu                     rustdar-platform:x86_64-unknown-linux-gnu rustdar-web:wasm32-unknown-unknown rustdar-android:aarch64-linux-android
+              check wgpu                     rustdar-platform:x86_64-unknown-linux-gnu rustdar-platform:aarch64-apple-ios rustdar-web:wasm32-unknown-unknown rustdar-android:aarch64-linux-android
               exit "$fail"
 
     steps:

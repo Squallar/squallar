@@ -39,8 +39,8 @@ jobs:
           sudo apt-get install -y libudev-dev
       # rust-cache does cache `${CARGO_HOME}/bin`, but its key hashes every
       # Cargo.lock, so a dependency bump would rebuild cargo-llvm-cov from
-      # source. This key names only the tool. `cache-bin` is off below so the
-      # two do not store the same directory twice.
+      # source. This key names only the tool and its version. `cache-bin` is off
+      # below so the two do not store the same directory twice.
       - name: Cache cargo-installed binaries
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -48,7 +48,7 @@ jobs:
             ~/.cargo/bin
             ~/.cargo/.crates.toml
             ~/.cargo/.crates2.json
-          key: ${{ runner.os }}-cargobin-test-llvm-cov
+          key: ${{ runner.os }}-cargobin-test-llvm-cov-0.8
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: test
@@ -57,7 +57,7 @@ jobs:
         run: |
           rustup default stable
           rustup component add llvm-tools-preview
-          cargo install cargo-llvm-cov
+          cargo install cargo-llvm-cov --locked --version ^0.8
       - name: Run tests
         run: cargo llvm-cov --no-report
       - name: Generate coverage reports
@@ -74,7 +74,7 @@ jobs:
           retention-days: 14
       - name: Report coverage
         if: always()
-        uses: USA-RedDragon/reusable-actions/coverage@d65722ccb9ea7d4e4b770754a67aecc037033f1b # v2.0.21
+        uses: USA-RedDragon/reusable-actions/coverage@v2
         with:
           file: lcov.info
           # Runs under `if: always()`, so a run whose report generation failed

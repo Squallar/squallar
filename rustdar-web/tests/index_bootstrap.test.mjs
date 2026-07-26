@@ -303,7 +303,7 @@ describe("controllerchange", () => {
     // `controllerchange` fires both when a waiting worker takes over and when
     // the worker's own `clients.claim()` promotes a page that had no
     // controller. Reloading on the second means every first visit downloads the
-    // 11 MB module, throws it away, and downloads it again.
+    // ~10 MB module, throws it away, and downloads it again.
     const page = await runBootstrap();
     await page.settle();
     page.serviceWorker.dispatch("controllerchange");

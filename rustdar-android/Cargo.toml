@@ -54,8 +54,8 @@ jni = { workspace = true }
 #
 # The jni pin travels with it (0.7.x wants jni ^0.22) and is equally not to be
 # taken alone -- see the `jni` entry in the workspace Cargo.toml. Both halves
-# landed together in c213e46 + 634bfad; the `.github/workflows/android.yaml`
-# dependency-unification job now guards the split.
+# landed together in c213e46 + 634bfad; the `dep-unification` row in
+# `.github/workflows/build.yaml` now guards the split.
 #
 # Its Kotlin half ships as an AAR inside the `rustls-platform-verifier-android`
 # crate's registry checkout; `android/app/build.gradle.kts` locates that via
