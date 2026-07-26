@@ -314,7 +314,7 @@ impl super::App {
             fetched.stamp.key,
             fetched.age(chrono::Utc::now().naive_utc()).map(|a| a.num_minutes()),
         );
-        self.render.level3_data.insert((l3_resp.product, l3_resp.tilt_code.clone(), l3_resp.site.clone()), Arc::new(fetched));
+        self.render.cache_level3(l3_resp.product, l3_resp.tilt_code.clone(), l3_resp.site.clone(), fetched);
 
         // Trigger a re-render for panes on the same site viewing this product
         for (idx, prs) in self.render.pane_render.iter_mut().enumerate() {
@@ -345,7 +345,15 @@ impl super::App {
                 );
                 changed = true;
             }
-            // Register the actual elevation angle from the PDB
+            // Register the actual elevation angle from the PDB.
+            //
+            // `render_dispatch::is_renderable_tilt` is *not* applied here, so
+            // `N0S` — fetched for its storm motion vector alone and never drawn
+            // — does register an SRM elevation. That is harmless only by
+            // coincidence: `N0S` and `N0G` are both 0.5°, so the dedupe just
+            // below collapses them and the picker gains no entry it cannot
+            // render. A vector source at an angle no tilt product shares would
+            // put a dead entry in the elevation list, selectable and blank.
             let elevations = info.product_elevations.entry(l3_resp.product).or_default();
             let rounded_elev = (elevation * 10.0).round() / 10.0;
             if !elevations.iter().any(|e| (e - rounded_elev).abs() < 0.05) {
@@ -454,11 +462,14 @@ impl super::App {
                     };
 
                     if product.is_level3() {
+                        // The override reaches the render through
+                        // `set_storm_motion_override` above, not as an argument
+                        // here — one source for both the invalidation and the
+                        // field that gets drawn.
                         self.render.try_spawn_level3_render(
                             pane_idx,
                             &params,
                             &pane_site,
-                            storm_motion,
                             self.channels.render_sender.clone(),
                             self.window.clone(),
                         );
