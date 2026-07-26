@@ -104,6 +104,10 @@ impl EguiRenderer {
         // Before `begin_pass`: egui buckets touches by device as it folds the
         // events in, so a later rewrite would be a frame too late.
         rustdar_egui::normalize_touch_devices(&mut raw_input);
+        // Web only: native reports one line per notch, which egui's native
+        // `line_scroll_speed` already scales correctly.
+        #[cfg(target_arch = "wasm32")]
+        rustdar_egui::normalize_wheel_units(&mut raw_input, zoom_factor);
         self.state.egui_ctx().begin_pass(raw_input);
     }
 
@@ -208,6 +212,42 @@ impl EguiRenderer {
                 egui::Visuals::light()
             };
             self.context().set_visuals(visuals);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Both input rewrites must precede `begin_pass`, and only this file says so.
+    ///
+    /// `begin_frame` needs a real `Window` and a wgpu device, so no unit test
+    /// runs it; the input harness models the ordering but cannot observe this
+    /// function. Moving either call below `begin_pass` therefore broke nothing
+    /// in the suite while breaking pinch and wheel zoom in the browser — egui
+    /// folds the events in during `begin_pass`, so a later rewrite is a frame
+    /// too late and never reaches that frame's gestures.
+    #[test]
+    fn the_input_rewrites_run_before_begin_pass() {
+        let src = include_str!("egui_renderer.rs");
+        let body = src
+            .split_once("pub fn begin_frame(")
+            .and_then(|(_, rest)| rest.split_once("\n    }"))
+            .map(|(body, _)| body)
+            .expect("begin_frame is no longer a method here");
+
+        let begin_pass = body
+            .find("begin_pass(")
+            .expect("begin_frame no longer starts a pass");
+
+        for call in ["normalize_touch_devices(", "normalize_wheel_units("] {
+            let at = body
+                .find(call)
+                .unwrap_or_else(|| panic!("begin_frame no longer calls {call}"));
+            assert!(
+                at < begin_pass,
+                "{call} runs after begin_pass, so egui has already bucketed \
+                 this frame's events and the rewrite lands a frame late"
+            );
         }
     }
 }

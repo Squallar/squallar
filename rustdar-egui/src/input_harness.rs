@@ -229,6 +229,25 @@ impl InputHarness {
         });
     }
 
+    /// One wheel notch over `pos`, in whichever unit the browser chose to
+    /// report it in. `egui-winit` derives the unit straight from winit's
+    /// `MouseScrollDelta`, so this is the only thing that differs between a
+    /// browser that sends `DOM_DELTA_PIXEL` and one that sends `DOM_DELTA_LINE`.
+    pub(crate) fn wheel_notch(
+        &mut self,
+        pos: egui::Pos2,
+        unit: egui::MouseWheelUnit,
+        delta_y: f32,
+    ) {
+        self.events.push(egui::Event::PointerMoved(pos));
+        self.events.push(egui::Event::MouseWheel {
+            unit,
+            delta: egui::vec2(0.0, delta_y),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::default(),
+        });
+    }
+
     /// The floating-chrome rects the last frame excluded from map clicks.
     pub(crate) fn excluded_rects(&self) -> Vec<egui::Rect> {
         self.gui.excluded_rects_for_test().to_vec()
@@ -710,6 +729,9 @@ impl InputHarness {
         // The same call `EguiRenderer::begin_frame` makes, at the same point in
         // the pipeline, so the multi-touch tests exercise the shipped function.
         crate::ui_input::normalize_touch_devices(&mut raw_input);
+        // Likewise, and at the same point: the web build's wheel-unit rewrite.
+        // `zoom_factor` is 1.0 here, matching an unscaled UI.
+        crate::ui_input::normalize_wheel_units(&mut raw_input, 1.0);
 
         // `begin_pass`/`end_pass` rather than `run_ui`, so the body runs exactly
         // once per frame: a repeated pass would feed the same events to the
@@ -1654,6 +1676,135 @@ mod tests {
                 "frame {frame}: a finished pinch must not become a long press"
             );
         });
+    }
+
+    /// 7g. **A wheel notch must zoom the same however the browser spelled it.**
+    ///
+    ///     Measured on Firefox 153: one notch is `deltaY: 132` in
+    ///     `DOM_DELTA_PIXEL` to this app, and `deltaY: 6` in `DOM_DELTA_LINE` to
+    ///     an ordinary page — same wheel, same click of the same detent. Without
+    ///     the rewrite egui scales the line form by `line_scroll_speed`, 8.0 on
+    ///     web, so that notch lands as 48 against the other's 132 and the map
+    ///     zooms 2.75x slower. Nothing errors; the wheel just feels wrong in one
+    ///     browser, which is why this is pinned on the ratio rather than on any
+    ///     absolute step.
+    #[test]
+    fn a_wheel_notch_zooms_the_same_in_either_wheel_unit() {
+        /// Four notches over the pane centre, and the zoom they moved.
+        fn notches(unit: egui::MouseWheelUnit, delta_y: f32) -> f64 {
+            let mut h = InputHarness::new();
+            let centre = h.pane_rects()[0].center();
+            let before = h.frame_after(FRAME_DT).resolved_zoom;
+            let mut last = before;
+            for _ in 0..4 {
+                h.wheel_notch(centre, unit, delta_y);
+                // egui bleeds a wheel impulse out over several frames, so the
+                // step is only whole once the smoothing has drained.
+                last = h.frames_for(12, FRAME_DT).resolved_zoom;
+            }
+            last - before
+        }
+
+        // Negative delta is a scroll *down*, which walkers zooms out on; take
+        // the magnitude so the two are compared on the same axis.
+        let pixel = notches(egui::MouseWheelUnit::Point, 132.0);
+        let line = notches(egui::MouseWheelUnit::Line, 6.0);
+
+        assert!(
+            pixel.abs() > 0.5,
+            "precondition: a pixel-mode notch must zoom at all, got {pixel}"
+        );
+        let ratio = line / pixel;
+        assert!(
+            (0.9..=1.1).contains(&ratio),
+            "the same notch in line units must zoom like the pixel one: \
+             pixel {pixel}, line {line} (ratio {ratio})"
+        );
+    }
+
+    /// 7h. The rewrite in isolation: units converge, everything else survives.
+    #[test]
+    fn normalizing_wheel_units_converts_only_the_line_events() {
+        let wheel = |unit, delta: egui::Vec2| egui::Event::MouseWheel {
+            unit,
+            delta,
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        let mut input = egui::RawInput {
+            events: vec![
+                wheel(egui::MouseWheelUnit::Line, egui::vec2(2.0, 6.0)),
+                wheel(egui::MouseWheelUnit::Point, egui::vec2(0.0, 132.0)),
+            ],
+            ..Default::default()
+        };
+        crate::ui_input::normalize_wheel_units(&mut input, 1.0);
+
+        let seen: Vec<_> = input
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    phase,
+                    modifiers,
+                } => Some((*unit, *delta, *phase, *modifiers)),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            seen.iter().all(|(u, ..)| *u == egui::MouseWheelUnit::Point),
+            "every wheel event must leave in point units, got {seen:?}"
+        );
+        // 6 lines is the notch Firefox reports; 22 px a line makes it the 132 px
+        // the same browser reports for the same notch.
+        assert_eq!(seen[0].1, egui::vec2(44.0, 132.0), "line delta must scale");
+        assert_eq!(
+            seen[1].1,
+            egui::vec2(0.0, 132.0),
+            "a point delta was already normal and must not be touched"
+        );
+        assert_eq!(
+            seen[0].2,
+            egui::TouchPhase::Move,
+            "phase must survive — egui starts and ends wheel gestures on it"
+        );
+        assert_eq!(
+            seen[0].3,
+            egui::Modifiers::CTRL,
+            "modifiers must survive — ctrl is what routes a wheel to zoom"
+        );
+    }
+
+    /// 7i. The app's UI scale must not change the wheel step in one unit only.
+    ///
+    ///     `egui-winit` divides pixel deltas by `pixels_per_point`, which folds
+    ///     in the zoom factor; line deltas never went through it. Left alone,
+    ///     turning up the UI scale would slow the wheel in one browser and not
+    ///     the other.
+    #[test]
+    fn the_wheel_rewrite_divides_by_the_zoom_factor() {
+        let mut input = egui::RawInput {
+            events: vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 6.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        };
+        crate::ui_input::normalize_wheel_units(&mut input, 2.0);
+
+        let egui::Event::MouseWheel { delta, .. } = input.events[0] else {
+            panic!("expected a wheel event");
+        };
+        assert_eq!(
+            delta.y, 66.0,
+            "a 2x UI scale must halve the rewritten delta, as it already does \
+             to the pixel deltas egui-winit produced"
+        );
     }
 
     /// 8. **The panel decides which edge, and that decision reaches the paint.**

@@ -83,6 +83,37 @@ pub fn normalize_touch_devices(input: &mut egui::RawInput) {
     }
 }
 
+/// CSS pixels one `DOM_DELTA_LINE` line is worth.
+///
+/// Firefox's own ratio for one notch, measured on 153: `deltaY: 132` in pixel
+/// mode, `deltaY: 6` in line mode. Matching a browser to itself, not to Chromium.
+const PX_PER_WHEEL_LINE: f32 = 22.0;
+
+/// Rewrite line-mode wheel events as pixel-mode ones, so a notch zooms the same
+/// whichever way the browser spelled it.
+///
+/// Chromium always sends `DOM_DELTA_PIXEL`; Firefox sends `DOM_DELTA_LINE` to an
+/// ordinary page and `DOM_DELTA_PIXEL` to this one. egui scales `Line` by
+/// `line_scroll_speed`, 8.0 on web against 40.0 native, so the notch Firefox
+/// spells as 6 lines arrives as 48 where the same notch as 132 pixels arrives as
+/// 132 — a 2.75x slower zoom, and nothing looks broken enough to notice.
+///
+/// `zoom_factor` divides because `egui-winit` already divided the pixel deltas by
+/// it; without it the UI-scale setting would change one spelling's speed only.
+///
+/// Web only: natively winit reports one line per notch, which egui's 40.0 suits.
+pub fn normalize_wheel_units(input: &mut egui::RawInput, zoom_factor: f32) {
+    let scale = PX_PER_WHEEL_LINE / zoom_factor.max(f32::EPSILON);
+    for event in &mut input.events {
+        if let egui::Event::MouseWheel { unit, delta, .. } = event
+            && *unit == egui::MouseWheelUnit::Line
+        {
+            *unit = egui::MouseWheelUnit::Point;
+            *delta *= scale;
+        }
+    }
+}
+
 /// One frame's pointer facts, with `down` corrected for sequences that egui
 /// never ends. Produced by [`PointerTracker::read`].
 #[derive(Clone, Copy, Debug, PartialEq)]
