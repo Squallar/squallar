@@ -13,3 +13,4 @@ pub(crate) mod ui_layout;
 mod input_harness;
 
 pub use ui::Gui;
+pub use ui_input::normalize_touch_devices;

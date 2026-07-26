@@ -600,6 +600,85 @@ impl InputHarness {
         });
     }
 
+    // --- multi-touch (mirrors winit's web backend) --------------------------
+
+    /// A second finger lands while the first stays down.
+    ///
+    /// `egui-winit` emits pointer emulation only for the finger held in
+    /// `pointer_touch_id` (`lib.rs:882`), so the second finger is a bare
+    /// `Touch` — and winit's web backend gives it **its own device id**, which
+    /// is the whole reason pinch needed fixing. Both fingers keep their web
+    /// device ids here so the tests run against the real event shape.
+    pub(crate) fn web_second_finger_down(&mut self, pos: egui::Pos2) {
+        self.events.push(web_touch(
+            WEB_FINGER_B,
+            egui::TouchPhase::Start,
+            pos,
+        ));
+    }
+
+    /// Both fingers move. Only the first drives the emulated pointer.
+    pub(crate) fn web_pinch_move(&mut self, a: egui::Pos2, b: egui::Pos2) {
+        self.events
+            .push(web_touch(WEB_FINGER_A, egui::TouchPhase::Move, a));
+        self.events.push(egui::Event::PointerMoved(a));
+        self.events
+            .push(web_touch(WEB_FINGER_B, egui::TouchPhase::Move, b));
+    }
+
+    /// The first finger goes down, on the web backend's per-finger device.
+    pub(crate) fn web_first_finger_down(&mut self, pos: egui::Pos2) {
+        self.events
+            .push(web_touch(WEB_FINGER_A, egui::TouchPhase::Start, pos));
+        self.events.push(egui::Event::PointerMoved(pos));
+        self.events.push(pointer_button(pos, true));
+    }
+
+    /// Lift the **second** finger, leaving the first down — pinch ending with
+    /// one finger still on the glass.
+    pub(crate) fn web_second_finger_up(&mut self, pos: egui::Pos2) {
+        self.events
+            .push(web_touch(WEB_FINGER_B, egui::TouchPhase::End, pos));
+    }
+
+    /// Lift the **first** finger — the one backing the emulated pointer —
+    /// while the second stays down. `egui-winit` releases and drops the pointer
+    /// here (`lib.rs:904`), so this is the ordering that can strand the map.
+    pub(crate) fn web_first_finger_up(&mut self, pos: egui::Pos2) {
+        self.events
+            .push(web_touch(WEB_FINGER_A, egui::TouchPhase::End, pos));
+        self.events.push(pointer_button(pos, false));
+        self.events.push(egui::Event::PointerGone);
+    }
+
+    /// Spread two fingers apart from `center` over `steps` frames, from
+    /// `from_gap` to `to_gap` pixels of separation. Returns the last frame.
+    pub(crate) fn web_pinch(
+        &mut self,
+        center: egui::Pos2,
+        from_gap: f32,
+        to_gap: f32,
+        steps: usize,
+    ) -> FrameOutcome {
+        let at = |gap: f32| {
+            (
+                center - egui::vec2(gap / 2.0, 0.0),
+                center + egui::vec2(gap / 2.0, 0.0),
+            )
+        };
+        let (a, b) = at(from_gap);
+        self.web_first_finger_down(a);
+        self.web_second_finger_down(b);
+        let mut outcome = self.frame_after(FRAME_DT);
+        for step in 1..=steps {
+            let gap = from_gap + (to_gap - from_gap) * (step as f32 / steps as f32);
+            let (a, b) = at(gap);
+            self.web_pinch_move(a, b);
+            outcome = self.frame_after(FRAME_DT);
+        }
+        outcome
+    }
+
     // --- composite gestures -------------------------------------------------
 
     /// A quick touch tap (press + release within the tap thresholds), spread
@@ -621,13 +700,16 @@ impl InputHarness {
 
     /// Run one egui pass: `Gui::ui` followed by the pane pointer resolution.
     pub(crate) fn frame(&mut self) -> FrameOutcome {
-        let raw_input = egui::RawInput {
+        let mut raw_input = egui::RawInput {
             screen_rect: Some(self.screen_rect),
             time: Some(self.time),
             events: std::mem::take(&mut self.events),
             max_texture_side: self.max_texture_side,
             ..Default::default()
         };
+        // The same call `EguiRenderer::begin_frame` makes, at the same point in
+        // the pipeline, so the multi-touch tests exercise the shipped function.
+        crate::ui_input::normalize_touch_devices(&mut raw_input);
 
         // `begin_pass`/`end_pass` rather than `run_ui`, so the body runs exactly
         // once per frame: a repeated pass would feed the same events to the
@@ -698,6 +780,24 @@ fn touch(phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
     egui::Event::Touch {
         device_id: egui::TouchDeviceId(0),
         id: egui::TouchId(0),
+        phase,
+        pos,
+        force: None,
+    }
+}
+
+/// The browser `pointerId`s the two fingers arrive under. winit's web backend
+/// uses that one number for **both** the touch id and the device id
+/// (`window_target.rs:410`), so these deliberately do the same.
+const WEB_FINGER_A: u64 = 3;
+const WEB_FINGER_B: u64 = 4;
+
+/// A touch exactly as winit's web backend reports it: a device id fabricated
+/// per finger from the pointer id.
+fn web_touch(pointer_id: u64, phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
+    egui::Event::Touch {
+        device_id: egui::TouchDeviceId(pointer_id),
+        id: egui::TouchId(pointer_id),
         phase,
         pos,
         force: None,
@@ -1332,6 +1432,227 @@ mod tests {
                 "frame {frame}: the tooltip must survive a still finger"
             );
             assert!(outcome.touch.suppress_pan, "frame {frame}");
+        });
+    }
+
+    /// 7. **PROBE I — the root cause, pinned against egui itself.**
+    ///
+    ///    egui buckets touches by `TouchDeviceId` and only builds a gesture from
+    ///    two touches on one device. winit's web backend fabricates a device id
+    ///    per finger, so each finger landed in its own bucket holding one touch
+    ///    and `zoom_delta()` never moved off 1.0. Same fingers, same positions —
+    ///    only the device ids differ.
+    #[test]
+    fn a_pinch_only_forms_when_both_fingers_share_a_touch_device() {
+        /// Spread two fingers from 100px apart to 200px apart, and report what
+        /// egui made of it. `devices` is the device id each finger arrives on.
+        fn spread(devices: [u64; 2]) -> (f32, bool) {
+            let ctx = egui::Context::default();
+            let screen =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 768.0));
+            let centre = egui::pos2(500.0, 400.0);
+            let touch = |dev: u64, id: u64, phase, pos| egui::Event::Touch {
+                device_id: egui::TouchDeviceId(dev),
+                id: egui::TouchId(id),
+                phase,
+                pos,
+                force: None,
+            };
+            let pass = |time: f64, half: f32, phase| {
+                let first = centre - egui::vec2(half, 0.0);
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(time),
+                    events: vec![
+                        touch(devices[0], 1, phase, first),
+                        // egui refuses to *start* a gesture without a pointer
+                        // position (`touch_state.rs:229`). `egui-winit` emulates
+                        // one from the first finger, so a bare two-finger event
+                        // stream would be unrepresentative without it.
+                        egui::Event::PointerMoved(first),
+                        touch(devices[1], 2, phase, centre + egui::vec2(half, 0.0)),
+                    ],
+                    ..Default::default()
+                }
+            };
+
+            // Three frames, not two. egui hands `TouchState` the *previous*
+            // frame's `interact_pos` (`input_state/mod.rs:390`) and refuses to
+            // start a gesture without one, so the gesture only begins on the
+            // second frame — and begins with no `previous`, i.e. a zoom of 1.0.
+            // The third frame is the first that can report a ratio at all.
+            ctx.begin_pass(pass(1.0, 50.0, egui::TouchPhase::Start));
+            let _ = ctx.end_pass();
+            ctx.begin_pass(pass(1.0 + FRAME_DT, 50.0, egui::TouchPhase::Move));
+            let _ = ctx.end_pass();
+            ctx.begin_pass(pass(1.0 + 2.0 * FRAME_DT, 100.0, egui::TouchPhase::Move));
+            let seen = ctx.input(|i| (i.zoom_delta(), i.multi_touch().is_some()));
+            let _ = ctx.end_pass();
+            seen
+        }
+
+        let (web_zoom, web_multi) = spread([WEB_FINGER_A, WEB_FINGER_B]);
+        assert!(
+            !web_multi,
+            "a device id per finger must be what breaks it — if egui now pairs \
+             them across devices, `normalize_touch_devices` is obsolete"
+        );
+        assert_eq!(
+            web_zoom, 1.0,
+            "this is the bug: two fingers on two devices produce no zoom at all"
+        );
+
+        let (shared_zoom, shared_multi) = spread([0, 0]);
+        assert!(shared_multi, "one device, two fingers: a gesture must form");
+        assert!(
+            shared_zoom > 1.9 && shared_zoom < 2.1,
+            "doubling the gap must double the zoom factor, got {shared_zoom}"
+        );
+    }
+
+    /// 7b. The fix in isolation: fingers keep their identities, devices merge.
+    ///
+    ///     Collapsing the `TouchId`s too would leave egui with one finger and no
+    ///     gesture at all, which looks identical from the outside until you
+    ///     notice nothing zooms.
+    #[test]
+    fn normalizing_merges_devices_and_leaves_the_fingers_alone() {
+        let mut input = egui::RawInput {
+            events: vec![
+                web_touch(WEB_FINGER_A, egui::TouchPhase::Start, egui::pos2(10.0, 10.0)),
+                web_touch(WEB_FINGER_B, egui::TouchPhase::Start, egui::pos2(90.0, 10.0)),
+            ],
+            ..Default::default()
+        };
+        crate::ui_input::normalize_touch_devices(&mut input);
+
+        let seen: Vec<(egui::TouchDeviceId, egui::TouchId)> = input
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::Touch { device_id, id, .. } => Some((*device_id, *id)),
+                _ => None,
+            })
+            .collect();
+
+        let devices: std::collections::BTreeSet<_> = seen.iter().map(|(d, _)| *d).collect();
+        assert_eq!(devices.len(), 1, "both fingers must land on one device");
+        let fingers: std::collections::BTreeSet<_> = seen.iter().map(|(_, f)| *f).collect();
+        assert_eq!(
+            fingers.len(),
+            2,
+            "the two fingers must stay distinct, or there is no gesture to form"
+        );
+    }
+
+    /// 7c. **End to end: pinching out zooms the real map in.**
+    ///
+    ///     Driven through `Gui::ui`, so this is walkers' own `zoom_delta()` path
+    ///     acting on the shipped pane — the thing that was dead in the browser.
+    #[test]
+    fn a_web_pinch_out_zooms_the_map_in() {
+        let mut h = InputHarness::new();
+        let centre = h.pane_rects()[0].center();
+        let before = h.frame_after(FRAME_DT).resolved_zoom;
+
+        let pinched = h.web_pinch(centre, 80.0, 320.0, 8);
+
+        assert_eq!(pinched.modality, PointerModality::Touch, "two fingers are touch");
+        assert!(
+            pinched.resolved_zoom > before + 0.2,
+            "pinching out must zoom the map in: {before} -> {}",
+            pinched.resolved_zoom
+        );
+    }
+
+    /// 7d. …and pinching in zooms out. Direction, pinned separately, because a
+    ///     sign error passes 7c whenever the gap happens to grow.
+    #[test]
+    fn a_web_pinch_in_zooms_the_map_out() {
+        let mut h = InputHarness::new();
+        let centre = h.pane_rects()[0].center();
+        let before = h.frame_after(FRAME_DT).resolved_zoom;
+
+        let pinched = h.web_pinch(centre, 320.0, 80.0, 8);
+
+        assert!(
+            pinched.resolved_zoom < before - 0.2,
+            "pinching in must zoom the map out: {before} -> {}",
+            pinched.resolved_zoom
+        );
+    }
+
+    /// 7e. A pinch is not a tap and not a long press. Two fingers resting while
+    ///     the gesture runs must not open an overlay popup or raise a tooltip.
+    #[test]
+    fn a_pinch_is_not_a_tap() {
+        let mut h = InputHarness::new();
+        let centre = h.pane_rects()[0].center();
+
+        let pinched = h.web_pinch(centre, 80.0, 320.0, 8);
+        assert_eq!(
+            pinched.resolved.overlay_click_pos, None,
+            "a pinch must never resolve as an overlay tap"
+        );
+
+        h.web_second_finger_up(centre + egui::vec2(160.0, 0.0));
+        h.web_first_finger_up(centre - egui::vec2(160.0, 0.0));
+        let settled = h.frames_for(5, 0.2);
+        assert_eq!(
+            settled.resolved.overlay_click_pos, None,
+            "lifting out of a pinch must not become a deferred tap either"
+        );
+    }
+
+    /// 7f. **A pinch that ends one finger at a time must not strand the map.**
+    ///
+    ///     The dangerous order is the *first* finger going up while the second
+    ///     stays down: that is the one backing the emulated pointer, so
+    ///     `egui-winit` fires a release and a `PointerGone` while a finger is
+    ///     still on the glass. The second finger's later events must not put the
+    ///     map back into a suppressed state.
+    #[test]
+    fn a_pinch_ending_one_finger_at_a_time_leaves_the_map_pannable() {
+        let mut h = InputHarness::new();
+        let centre = h.pane_rects()[0].center();
+
+        h.web_pinch(centre, 80.0, 320.0, 8);
+
+        // The emulated-pointer finger leaves first; the other is still down.
+        let left = centre - egui::vec2(160.0, 0.0);
+        let right = centre + egui::vec2(160.0, 0.0);
+        h.web_first_finger_up(left);
+        let lifted = h.frame_after(FRAME_DT);
+        assert!(
+            !lifted.resolved.suppress_pan,
+            "the map must be released the moment the primary finger goes"
+        );
+
+        // The survivor keeps moving, then lifts.
+        for step in 1..=4 {
+            h.events.push(web_touch(
+                WEB_FINGER_B,
+                egui::TouchPhase::Move,
+                right + egui::vec2(0.0, 10.0 * step as f32),
+            ));
+            let moving = h.frame_after(FRAME_DT);
+            assert!(
+                !moving.resolved.suppress_pan,
+                "step {step}: a leftover finger must not re-suppress panning"
+            );
+        }
+        h.web_second_finger_up(right + egui::vec2(0.0, 40.0));
+
+        // And it must stay that way well past the long-press threshold.
+        h.assert_every_frame_for(WATCH_PAST_LONG_PRESS, 0.1, |frame, outcome| {
+            assert!(
+                !outcome.resolved.suppress_pan,
+                "frame {frame}: map must remain pannable after a pinch ends"
+            );
+            assert_eq!(
+                outcome.resolved.long_press_pos, None,
+                "frame {frame}: a finished pinch must not become a long press"
+            );
         });
     }
 

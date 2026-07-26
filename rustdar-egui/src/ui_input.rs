@@ -57,6 +57,32 @@ const LONG_PRESS_MAX_MOVE_PX: f32 = 20.0;
 /// comes back on its own, without needing a lift and a fresh press.
 const POINTER_IDLE_TIMEOUT_S: f64 = 60.0;
 
+/// The single touch device every finger is reported on after normalisation.
+const CANONICAL_TOUCH_DEVICE: egui::TouchDeviceId = egui::TouchDeviceId(0);
+
+/// Collapse every touch in a frame onto one device, so egui can see a pinch.
+///
+/// egui buckets touches by `TouchDeviceId` (`InputState::touch_states`) and only
+/// forms a gesture from two touches on the **same** device
+/// (`touch_state.rs:249` returns `None` below two). winit's web backend
+/// fabricates the `DeviceId` from the browser's `pointerId`
+/// (`window_target.rs:410`), so every finger arrives as its own device, each
+/// holding exactly one touch — `multi_touch()` is therefore always `None` in the
+/// browser and `zoom_delta()` never leaves 1.0, which is what stopped walkers
+/// pinch-zooming. Single-touch is unaffected, which is why double-tap-drag
+/// worked and pinch did not.
+///
+/// An identity transform off the web: every other backend already reports one
+/// device id per touchscreen. egui itself only ever reads the first active
+/// device, so nothing downstream distinguishes them anyway.
+pub fn normalize_touch_devices(input: &mut egui::RawInput) {
+    for event in &mut input.events {
+        if let egui::Event::Touch { device_id, .. } = event {
+            *device_id = CANONICAL_TOUCH_DEVICE;
+        }
+    }
+}
+
 /// One frame's pointer facts, with `down` corrected for sequences that egui
 /// never ends. Produced by [`PointerTracker::read`].
 #[derive(Clone, Copy, Debug, PartialEq)]

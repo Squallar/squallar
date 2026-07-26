@@ -260,6 +260,27 @@ fn index_html_carries_an_explicit_offline_state() {
     );
 }
 
+/// The canvas must opt out of the browser's own touch gestures.
+///
+/// winit sets no `touch-action` and only calls `preventDefault()`, which for
+/// pointer events does not stop a two-finger gesture being taken as page zoom.
+/// Nothing in the Rust build reads this stylesheet, so losing the rule would
+/// only ever show up as pinch mysteriously not reaching the app.
+#[test]
+fn the_canvas_opts_out_of_browser_touch_gestures() {
+    let canvas_rule = INDEX_HTML
+        .split_once("#rustdar-canvas {")
+        .and_then(|(_, rest)| rest.split_once('}'))
+        .map(|(body, _)| body)
+        .expect("index.html has no #rustdar-canvas style rule");
+
+    assert!(
+        canvas_rule.contains("touch-action: none"),
+        "#rustdar-canvas does not set `touch-action: none`, so the browser may \
+         claim pinch as page zoom and never deliver the second pointer"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // service worker
 // ---------------------------------------------------------------------------

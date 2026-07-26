@@ -100,7 +100,10 @@ impl EguiRenderer {
     /// frame after.
     pub fn begin_frame(&mut self, window: &Window, zoom_factor: f32) {
         self.context().set_zoom_factor(zoom_factor);
-        let raw_input = self.state.take_egui_input(window);
+        let mut raw_input = self.state.take_egui_input(window);
+        // Before `begin_pass`: egui buckets touches by device as it folds the
+        // events in, so a later rewrite would be a frame too late.
+        rustdar_egui::normalize_touch_devices(&mut raw_input);
         self.state.egui_ctx().begin_pass(raw_input);
     }
 
