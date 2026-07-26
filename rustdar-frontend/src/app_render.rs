@@ -9,6 +9,14 @@ use crate::constants::{MAX_CONCURRENT_RENDERS, MAX_LOOP_RENDER_BUDGET, MAX_CONCU
 use crate::loop_downloads::PendingDownloads;
 use crate::render_dispatch::CachedPaneRender;
 
+/// The user's storm motion vector, or `None` when the RPG's own SCIT average
+/// should be used.
+fn storm_motion_override(gui: &rustdar_egui::Gui) -> Option<rustdar_radar::srm::StormMotionSample> {
+    let o = gui.storm_motion_override;
+    o.enabled
+        .then(|| rustdar_radar::srm::StormMotionSample::user_override(o.speed_kt, o.direction_deg))
+}
+
 /// What the swapchain had for us this frame.
 pub(crate) enum SurfaceStatus {
     /// A texture to draw into.
@@ -410,6 +418,10 @@ impl super::App {
     /// Check all panes for needed background renders and spawn render threads.
     fn dispatch_pane_renders(&mut self) {
         let ctx = self.state.as_ref().unwrap().egui_renderer.context().clone();
+        // Editing the vector changes nothing else about a pane, so the derived
+        // storm-relative tilts have to be invalidated explicitly.
+        let storm_motion = storm_motion_override(&self.gui);
+        self.render.set_storm_motion_override(storm_motion);
         for pane_idx in 0..self.gui.pane_count() {
             if let Some((product, elevation)) = self.gui.get_rendering_params_for_pane(pane_idx) {
                 let prs = &self.render.pane_render[pane_idx];
@@ -454,6 +466,7 @@ impl super::App {
                             pane_idx,
                             &params,
                             &pane_site,
+                            storm_motion,
                             self.channels.render_sender.clone(),
                             self.window.clone(),
                         );
