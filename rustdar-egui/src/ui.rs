@@ -237,13 +237,12 @@ impl StormMotionOverride {
     /// `NaN != NaN`, makes the change detector in `set_storm_motion_override`
     /// fire on every frame, re-rendering every storm-relative pane forever.
     pub fn sample(&self) -> Option<rustdar_radar::srm::StormMotionSample> {
-        if !self.enabled || !self.speed_kt.is_finite() || !self.direction_deg.is_finite() {
+        if !self.enabled {
             return None;
         }
-        Some(rustdar_radar::srm::StormMotionSample::user_override(
-            self.speed_kt,
-            self.direction_deg,
-        ))
+        // The constructor rejects non-finite values too; this is the boundary,
+        // that is the invariant.
+        rustdar_radar::srm::StormMotionSample::user_override(self.speed_kt, self.direction_deg)
     }
 }
 

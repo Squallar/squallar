@@ -712,7 +712,7 @@ mod srm_dispatch_tests {
             .remove(&(RadarProduct::StormRelativeVelocity, "N0S".to_string(), "KMPX".to_string()));
         assert!(d.storm_motion_for("KMPX", None).is_none());
         // A user override fills the gap — that is what it is for.
-        let o = StormMotionSample::user_override(40.0, 200.0);
+        let o = StormMotionSample::user_override(40.0, 200.0).expect("finite");
         assert_eq!(d.storm_motion_for("KMPX", Some(o)).map(|s| s.motion.speed_kt), Some(40.0));
     }
 
@@ -720,7 +720,7 @@ mod srm_dispatch_tests {
     #[test]
     fn a_user_override_displaces_the_rpg_vector() {
         let d = loaded();
-        let o = StormMotionSample::user_override(45.0, 210.0);
+        let o = StormMotionSample::user_override(45.0, 210.0).expect("finite");
         let s = d.storm_motion_for("KMPX", Some(o)).unwrap();
         assert_eq!(s.motion.speed_kt, 45.0);
         assert_eq!(s.motion.direction_deg, 210.0);
@@ -739,7 +739,7 @@ mod srm_dispatch_tests {
         d.cache_render("KMPX", RadarProduct::StormRelativeVelocity, 1.3, output());
         d.cache_render("KMPX", RadarProduct::Reflectivity, 0.5, output());
 
-        assert!(d.set_storm_motion_override(Some(StormMotionSample::user_override(30.0, 240.0))));
+        assert!(d.set_storm_motion_override(Some(StormMotionSample::user_override(30.0, 240.0).expect("finite"))));
         assert_eq!(d.pane_render[0].last_rendered, None);
         assert_eq!(
             d.pane_render[1].last_rendered,
@@ -761,7 +761,7 @@ mod srm_dispatch_tests {
     fn an_unchanged_override_invalidates_nothing() {
         let mut d = loaded();
         d.ensure_pane_count(1);
-        let o = Some(StormMotionSample::user_override(30.0, 240.0));
+        let o = Some(StormMotionSample::user_override(30.0, 240.0).expect("finite"));
         assert!(d.set_storm_motion_override(o));
         d.pane_render[0].last_rendered = Some((RadarProduct::StormRelativeVelocity, 1.3));
         assert!(!d.set_storm_motion_override(o));
