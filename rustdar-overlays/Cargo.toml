@@ -50,7 +50,10 @@ tiny-skia = "=0.12.0"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["fs"] }
 
-[dev-dependencies]
+# Target-gated for the same reason as the entry above: `rt-multi-thread` is not
+# one of the features tokio accepts on wasm, and an ungated dev-dependency still
+# breaks `cargo check --all-targets --target wasm32-unknown-unknown`.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # Drives the `#[ignore]`d live-network checks (IEM and the S3 buckets).
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

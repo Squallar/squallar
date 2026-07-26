@@ -811,6 +811,55 @@ impl GridCoords {
         }
     }
 
+    /// Fractional `(i_min, i_max, j_min, j_max)` bounding every grid point
+    /// inside `bounds`, or `None` when there is no cheaper answer than "all of
+    /// them".
+    ///
+    /// Only the Lambert case answers: [`GridCoords::at`] is a slice index for
+    /// the explicit case, so there is nothing to save, and the closed form
+    /// [`lambert::LambertGrid::index_bounds`] uses does not exist for a grid
+    /// whose coordinates arrived as two arrays.
+    ///
+    /// `ni`/`nj` are the *caller's* grid shape: the result is stated in the
+    /// caller's `j * ni + i` terms, so a scan order or shape that does not
+    /// match that is refused rather than answered wrongly.
+    pub fn index_bounds(
+        &self,
+        bounds: &GeoBounds,
+        ni: usize,
+        nj: usize,
+    ) -> Option<(f64, f64, f64, f64)> {
+        match self {
+            GridCoords::Lambert(g) if g.is_row_major(ni, nj) => g.index_bounds(
+                bounds.min_lat,
+                bounds.max_lat,
+                bounds.min_lon,
+                bounds.max_lon,
+            ),
+            _ => None,
+        }
+    }
+
+    /// Upper bound on how many degrees one grid cell spans near `lat`, or
+    /// `None` when the grid cannot say — see
+    /// [`lambert::LambertGrid::cell_span_degrees`].
+    pub fn cell_span_degrees(&self, lat: f64) -> Option<f64> {
+        match self {
+            GridCoords::Lambert(g) => Some(g.cell_span_degrees(lat)),
+            GridCoords::Explicit { .. } => None,
+        }
+    }
+
+    /// Whether adjacent grid points can jump most of a turn in longitude — see
+    /// [`lambert::LambertGrid::wraps_longitude`]. Always `false` for the
+    /// explicit case, which is never narrowed anyway.
+    pub fn wraps_longitude(&self) -> bool {
+        match self {
+            GridCoords::Lambert(g) => g.wraps_longitude(),
+            GridCoords::Explicit { .. } => false,
+        }
+    }
+
     /// Index of the grid point nearest `(lat, lon)`, or `None` when the grid
     /// does not cover it.
     ///

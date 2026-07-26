@@ -177,16 +177,30 @@ impl LambertConformalConic {
         }
     }
 
+    /// Snyder eq. 15-1: polar radius for a latitude, metres. Monotone in
+    /// latitude — decreasing for `n > 0`, increasing for `n < 0` — so a
+    /// latitude range's radii are bounded by its two endpoints either way.
+    fn rho(&self, lat_deg: f64) -> f64 {
+        self.a * self.big_f * Self::t(lat_deg.to_radians(), self.e).powf(self.n)
+    }
+
+    /// Snyder eq. 14-4: cone angle for a longitude, radians.
+    fn theta(&self, lon_deg: f64) -> f64 {
+        self.n * normalize_radians(lon_deg.to_radians() - self.lon0)
+    }
+
+    /// Snyder eq. 14-1/14-2: polar to plane.
+    fn plane(&self, rho: f64, theta: f64) -> (f64, f64) {
+        (rho * theta.sin(), self.rho0 - rho * theta.cos())
+    }
+
     /// Project geodetic degrees to projection-plane metres.
     ///
     /// Snyder eq. 15-1, 15-2, 14-4. The origin of the returned coordinates is
     /// `(lon_0, lat_0)`; there is no false easting/northing, matching the PROJ
     /// string grib builds.
     pub fn forward(&self, lat_deg: f64, lon_deg: f64) -> (f64, f64) {
-        let phi = lat_deg.to_radians();
-        let rho = self.a * self.big_f * Self::t(phi, self.e).powf(self.n);
-        let theta = self.n * normalize_radians(lon_deg.to_radians() - self.lon0);
-        (rho * theta.sin(), self.rho0 - rho * theta.cos())
+        self.plane(self.rho(lat_deg), self.theta(lon_deg))
     }
 
     /// Inverse: projection-plane metres back to geodetic degrees.
@@ -286,6 +300,9 @@ pub struct LambertGrid {
     /// Scanning-mode bits that decide the flat index order.
     i_consecutive: bool,
     alternating: bool,
+    /// Whether adjacent grid points can jump in longitude — see
+    /// [`Self::wraps_longitude`]. Measured once here, not per use.
+    wraps_longitude: bool,
 }
 
 impl LambertGrid {
@@ -333,7 +350,7 @@ impl LambertGrid {
             f64::from(grid.first_point_lon) * Self::ANGLE_UNIT,
         );
 
-        Ok(Self {
+        let mut geometry = Self {
             projection,
             x0,
             y0,
@@ -343,7 +360,111 @@ impl LambertGrid {
             nj: grid.nj as usize,
             i_consecutive: grid.scanning_mode.is_consecutive_for_i(),
             alternating: grid.scanning_mode.scans_alternating_rows(),
-        })
+            wraps_longitude: false,
+        };
+        geometry.wraps_longitude = geometry.detect_longitude_wrap();
+        Ok(geometry)
+    }
+
+    /// Whether two *adjacent* grid points can differ by more than half a turn
+    /// in longitude.
+    ///
+    /// Two unrelated discontinuities show up as the same jump, and both break
+    /// any caller that treats a cell as covering the ground between itself and
+    /// its neighbour:
+    ///
+    ///  * [`normalize_longitude_degrees`] folds at ±180, so a grid straddling
+    ///    the anti-meridian has neighbours a whole turn apart;
+    ///  * [`LambertConformalConic::inverse`] takes `atan2`, whose own cut at
+    ///    ±pi is the *cone's* seam. Crossing it moves longitude by `360 / n`
+    ///    degrees — 578 for HRRR — which normalises to a 218° jump.
+    ///
+    /// Either way a Mercator rasterizer puts the two neighbours most of a
+    /// texture apart and stretches the cell between them across the image.
+    fn detect_longitude_wrap(&self) -> bool {
+        if self.ni == 0 || self.nj == 0 {
+            return false;
+        }
+        // The boundary alone is enough, for a different reason per cut.
+        //
+        // The band cut is a *crossing* test on a meridian, which this projection
+        // draws as a straight ray from the apex: a ray cannot cross the grid
+        // without crossing an edge between two adjacent boundary points.
+        //
+        // The sector cut is a *membership* test on a wedge (`|theta| > n*pi`,
+        // angular width `2(1-n)pi`), not on its boundary rays. It reduces to the
+        // boundary because the wedge is symmetric about the plane's y-axis with
+        // its apex on it, and a template 3.30 grid is axis-aligned in that same
+        // plane — so the wedge's horizontal slices nest in y, and any column bad
+        // at some row is bad at j = 0 or j = nj-1. Both are walked.
+        for j in [0, self.nj - 1] {
+            for i in 1..self.ni {
+                if self.step_is_discontinuous((i - 1, j), (i, j)) {
+                    return true;
+                }
+            }
+        }
+        for i in [0, self.ni - 1] {
+            for j in 1..self.nj {
+                if self.step_is_discontinuous((i, j - 1), (i, j)) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The longitude [`LambertConformalConic::inverse`] reports for grid point
+    /// `(i, j)`, before [`normalize_longitude_degrees`] folds it.
+    fn raw_lon(&self, i: usize, j: usize) -> f64 {
+        self.projection
+            .inverse(self.x0 + self.dx * i as f64, self.y0 + self.dy * j as f64)
+            .1
+    }
+
+    /// Whether the longitudes of these two grid points are separated by one of
+    /// the two cuts, rather than by ground.
+    ///
+    /// Both are located exactly rather than inferred from the size of the jump.
+    /// Size is not a reliable signal: crossing the cone's seam moves longitude
+    /// by `360 / n` — 578° for HRRR — which lands 218° away but can normalise to
+    /// its 141.7° complement, *under* any half-turn threshold.
+    fn step_is_discontinuous(&self, a: (usize, usize), b: (usize, usize)) -> bool {
+        let (raw_a, raw_b) = (self.raw_lon(a.0, a.1), self.raw_lon(b.0, b.1));
+
+        // Cut 1 — the cone's seam. `inverse` reads the angle with `atan2`, so
+        // the longitudes it can report span `360 / n`: 578° for HRRR, i.e. more
+        // than a turn. Longitude is therefore *not* single-valued over the
+        // plane, and `theta` — which folds into one turn about `lon0` before
+        // scaling — only ever names the principal preimage. A grid outside that
+        // sector is described by the other one, and every longitude-to-index
+        // answer for it is computed on the wrong arc. The sector is exactly
+        // `|raw - lon0| <= 180`.
+        let lon0 = self.projection.lon0.to_degrees();
+        if (raw_a - lon0).abs() > 180.0 || (raw_b - lon0).abs() > 180.0 {
+            return true;
+        }
+
+        // Cut 2 — the anti-meridian. `normalize_longitude_degrees` folds at
+        // every odd multiple of 180, so a step across one lands a turn away in
+        // the coordinates the rasterizer actually projects.
+        let band = |lon: f64| ((lon + 180.0) / 360.0).floor();
+        band(raw_a) != band(raw_b)
+    }
+
+    /// See [`Self::detect_longitude_wrap`]. Free to call; measured at
+    /// construction.
+    ///
+    /// Deliberately not "does the grid's `min_lon..max_lon` contain the seam":
+    /// for a grid that wraps, those two are the extreme *normalised*
+    /// longitudes, so the discontinuity falls in the unpopulated gap between
+    /// `max_lon` and `min_lon + 360` — outside the interval — and the test
+    /// silently answers `false`. That is the same "interval predicate applied
+    /// to something that is not an interval" mistake one level up, and it hides
+    /// exactly the `LoV = 0` case, where the cone seam and the anti-meridian
+    /// coincide.
+    pub fn wraps_longitude(&self) -> bool {
+        self.wraps_longitude
     }
 
     /// Number of grid points.
@@ -391,6 +512,126 @@ impl LambertGrid {
             return None;
         }
         Some(self.index_of(i, j))
+    }
+
+    /// Whether the flat scan index is exactly `j * ni + i` over an `ni` x `nj`
+    /// grid — what a caller stepping to `index ± 1` / `index ± ni` for the four
+    /// neighbours is assuming. False for the other fifteen scanning modes.
+    pub(crate) fn is_row_major(&self, ni: usize, nj: usize) -> bool {
+        self.i_consecutive && !self.alternating && self.ni == ni && self.nj == nj
+    }
+
+    /// Whether `min_lon..max_lon` crosses the cone's **seam** — the meridian
+    /// opposite the central one, `lon0 + 180`.
+    ///
+    /// [`LambertConformalConic::theta`] folds `lon - lon0` into -pi..=pi and
+    /// *then* multiplies by the cone constant, so crossing that meridian moves
+    /// the plane point by `n * 2pi` — for HRRR 224°, not a whole turn. The image
+    /// of a longitude range spanning it is therefore two disjoint arcs, and
+    /// anything that treats it as one interval is describing a different region
+    /// of the plane than the one it was asked about.
+    ///
+    /// Detected by consistency rather than by comparing meridians: stepping from
+    /// one end must land on the other end's own angle.
+    pub fn crosses_seam(&self, min_lon: f64, max_lon: f64) -> bool {
+        let p = &self.projection;
+        let span = p.n * (max_lon - min_lon).to_radians();
+        !span.is_finite()
+            || span.abs() >= std::f64::consts::TAU
+            || (p.theta(min_lon) + span - p.theta(max_lon)).abs() > 1e-9
+    }
+
+    /// Upper bound on how many degrees one grid cell spans near `lat`, along
+    /// either axis.
+    ///
+    /// A step of `s` metres is at most `s / (a cos φ)` radians of longitude and
+    /// exactly `s / a` radians of latitude, and the longitude term is the larger
+    /// away from the equator — so one number bounds both, and (divided by
+    /// `cos φ` once more, i.e. the same number in radians) also bounds the step
+    /// in Mercator `y`. That is what lets a caller state a margin in *cells*
+    /// rather than as a fraction of whatever box it happens to be rendering.
+    ///
+    /// Upper bound only where the scale factor `k >= 1`, which a tangent cone
+    /// guarantees. A secant cone has `k < 1` between its parallels and this
+    /// underestimates by `1/k` — ~3.5% for a 30/60 pair at 45°, inside
+    /// `CELL_REACH`'s 0.75-against-0.55 headroom, but not by an unlimited
+    /// margin. HRRR is tangent; revisit if a secant model is ever added.
+    pub fn cell_span_degrees(&self, lat: f64) -> f64 {
+        // Not the pole: `cos` there is zero and the bound is unbounded, which is
+        // true but useless. 89.9° already gives ~570x the equatorial cell.
+        let cos = lat.abs().min(89.9).to_radians().cos();
+        let step = self.dx.abs().max(self.dy.abs());
+        (step / (self.projection.a * cos)).to_degrees()
+    }
+
+    /// Fractional `(i_min, i_max, j_min, j_max)` bounding every grid point
+    /// inside the lat/lon box, or `None` when no useful bound exists.
+    ///
+    /// **Exact, not sampled.** An LCC lat/lon box is an annular sector in the
+    /// projection plane: `rho` depends only on latitude and `theta` only on
+    /// longitude. So `x = rho·sin θ` and `y = rho0 − rho·cos θ` are extremal
+    /// either at a corner of the sector or where `sin`/`cos` turns — a quadrant
+    /// boundary of `theta` — and that candidate set is finite. Sampling the
+    /// box's edges instead would be an approximation whose error is a function
+    /// of the arc, and this is used to *skip* work, so an underestimate paints
+    /// the wrong picture.
+    ///
+    /// Callers must still widen the result: a grid point just outside the box
+    /// can influence a pixel inside it.
+    pub fn index_bounds(
+        &self,
+        min_lat: f64,
+        max_lat: f64,
+        min_lon: f64,
+        max_lon: f64,
+    ) -> Option<(f64, f64, f64, f64)> {
+        if min_lat > max_lat || min_lon > max_lon || self.dx == 0.0 || self.dy == 0.0 {
+            return None;
+        }
+        let p = &self.projection;
+        let rhos = [p.rho(min_lat), p.rho(max_lat)];
+
+        // The theta interval, unwrapped: `theta` folds `lon - lon0` into
+        // -pi..=pi, so stepping from one end is the only way to get a single
+        // interval rather than two arcs — and it is only a single interval at
+        // all if the box stays off the seam. Rather than bound two arcs,
+        // decline; such a box spans half the planet, so there was little to
+        // exclude anyway.
+        if self.crosses_seam(min_lon, max_lon) {
+            return None;
+        }
+        let span = p.n * (max_lon - min_lon).to_radians();
+        let start = p.theta(min_lon);
+        let (lo, hi) = (start.min(start + span), start.max(start + span));
+
+        let quarter = std::f64::consts::FRAC_PI_2;
+        let mut thetas = vec![lo, hi];
+        let mut k = (lo / quarter).ceil();
+        while k * quarter <= hi {
+            thetas.push(k * quarter);
+            k += 1.0;
+        }
+
+        let (mut x_min, mut x_max) = (f64::INFINITY, f64::NEG_INFINITY);
+        let (mut y_min, mut y_max) = (f64::INFINITY, f64::NEG_INFINITY);
+        for rho in rhos {
+            for &theta in &thetas {
+                let (x, y) = p.plane(rho, theta);
+                x_min = x_min.min(x);
+                x_max = x_max.max(x);
+                y_min = y_min.min(y);
+                y_max = y_max.max(y);
+            }
+        }
+
+        // A negative step reverses the ordering, hence the min/max pairs.
+        let (ia, ib) = ((x_min - self.x0) / self.dx, (x_max - self.x0) / self.dx);
+        let (ja, jb) = ((y_min - self.y0) / self.dy, (y_max - self.y0) / self.dy);
+        let out = (ia.min(ib), ia.max(ib), ja.min(jb), ja.max(jb));
+        if !(out.0.is_finite() && out.1.is_finite() && out.2.is_finite() && out.3.is_finite()) {
+            return None;
+        }
+        Some(out)
     }
 
     /// The `(i, j)` grib's [`GridPointIndex::ij`] yields at position `index`.
@@ -459,6 +700,54 @@ pub fn latlons(grid: &Template3_30) -> Result<Vec<(f64, f64)>, String> {
     Ok(indices.map(|(i, j)| geometry.latlon(i, j)).collect())
 }
 
+/// HRRR CONUS grid definition, transcribed field-for-field from GRIB2 section 3
+/// of a **raw operational** file (`hrrr.t12z.wrfsfcf00.grib2`, 2026-07-24 12Z),
+/// fetched with no `subregion` so NOMADS streams it untouched. Matches
+/// `wgrib2 -grid` and NOAA's published domain: 1799x1059, 3 km, LoV 262.5,
+/// LaD/Latin1/Latin2 38.5.
+///
+/// A NOMADS filter-CGI download gives a different `Lo1` and the corner
+/// assertions fail by a hair — see
+/// [`tests::the_nomads_filter_reencodes_lo1_by_one_microdegree`]. Both are
+/// correct; the projection anchors on whatever `Lo1` the file states.
+///
+/// Lives outside `mod tests` so the rasterizer's tests can raster a grid with
+/// the real HRRR geometry rather than a toy one.
+#[cfg(test)]
+pub(crate) fn hrrr_conus_grid() -> Template3_30 {
+    use grib::def::grib2::template::param_set;
+    Template3_30 {
+        earth_shape: param_set::EarthShape {
+            // Code Table 3.2 value 6 = "spherical, radius 6,371,229.0 m".
+            // The radius is implied by the code; the explicit radius
+            // fields are all zero in the file, as transcribed here.
+            shape: 6,
+            spherical_earth_radius_scale_factor: 0,
+            spherical_earth_radius_scaled_value: 0,
+            major_axis_scale_factor: 0,
+            major_axis_scaled_value: 0,
+            minor_axis_scale_factor: 0,
+            minor_axis_scaled_value: 0,
+        },
+        ni: 1799,
+        nj: 1059,
+        first_point_lat: 21_138_123,
+        first_point_lon: 237_280_472,
+        resolution_and_component_flags: param_set::ResolutionAndComponentFlags(0b0000_1000),
+        lad: 38_500_000,
+        lov: 262_500_000,
+        dx: 3_000_000,
+        dy: 3_000_000,
+        projection_centre: param_set::ProjectionCentreFlag(0b0000_0000),
+        // 0b0100_0000: +i, +j, i-consecutive, no alternating rows.
+        scanning_mode: param_set::ScanningMode(0b0100_0000),
+        latin1: 38_500_000,
+        latin2: 38_500_000,
+        south_pole_lat: 0,
+        south_pole_lon: 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,50 +758,6 @@ mod tests {
     //       to and therefore the behaviour this module must preserve;
     //   (C) the EPSG Guidance Note 7-2 worked example for "Lambert Conic
     //       Conformal (2SP)" (method 9802).
-
-    /// HRRR CONUS grid definition, transcribed field-for-field from GRIB2
-    /// section 3 of a **raw operational** file (`hrrr.t12z.wrfsfcf00.grib2`,
-    /// 2026-07-24 12Z), fetched with no `subregion` so NOMADS streams it
-    /// untouched. Matches `wgrib2 -grid` and NOAA's published domain:
-    /// 1799x1059, 3 km, LoV 262.5, LaD/Latin1/Latin2 38.5.
-    ///
-    /// A NOMADS filter-CGI download gives a different `Lo1` and the corner
-    /// assertions fail by a hair — see
-    /// [`the_nomads_filter_reencodes_lo1_by_one_microdegree`]. Both are correct;
-    /// the projection anchors on whatever `Lo1` the file states.
-    fn hrrr_conus_grid() -> Template3_30 {
-        use grib::def::grib2::template::param_set;
-        Template3_30 {
-            earth_shape: param_set::EarthShape {
-                // Code Table 3.2 value 6 = "spherical, radius 6,371,229.0 m".
-                // The radius is implied by the code; the explicit radius
-                // fields are all zero in the file, as transcribed here.
-                shape: 6,
-                spherical_earth_radius_scale_factor: 0,
-                spherical_earth_radius_scaled_value: 0,
-                major_axis_scale_factor: 0,
-                major_axis_scaled_value: 0,
-                minor_axis_scale_factor: 0,
-                minor_axis_scaled_value: 0,
-            },
-            ni: 1799,
-            nj: 1059,
-            first_point_lat: 21_138_123,
-            first_point_lon: 237_280_472,
-            resolution_and_component_flags: param_set::ResolutionAndComponentFlags(0b0000_1000),
-            lad: 38_500_000,
-            lov: 262_500_000,
-            dx: 3_000_000,
-            dy: 3_000_000,
-            projection_centre: param_set::ProjectionCentreFlag(0b0000_0000),
-            // 0b0100_0000: +i, +j, i-consecutive, no alternating rows.
-            scanning_mode: param_set::ScanningMode(0b0100_0000),
-            latin1: 38_500_000,
-            latin2: 38_500_000,
-            south_pole_lat: 0,
-            south_pole_lon: 0,
-        }
-    }
 
     /// <= 11 cm anywhere on this grid: 1e-6° of latitude is 0.111 m at every
     /// latitude (1° ≈ 111.2 km), while 1e-6° of longitude (1° ≈ 111.32·cos φ km)
@@ -814,6 +1059,85 @@ mod tests {
             Some(geometry.index_of(ni - 1, nj - 1)),
             "the far corner is inside the grid",
         );
+    }
+
+    /// [`LambertGrid::index_bounds`] is a closed form over a candidate set, not
+    /// a scan, so it is checked against the scan it replaces: every grid point
+    /// inside the box must fall inside the bounds it returns.
+    ///
+    /// The second half is what stops it degenerating into `0..ni`, which would
+    /// satisfy the first half for ever: the answer must also be *tight*, within
+    /// a cell of the true extent of the contained points.
+    #[test]
+    fn index_bounds_brackets_exactly_the_points_inside_the_box() {
+        let mut template = hrrr_conus_grid();
+        template.ni = 120;
+        template.nj = 90;
+        let g = LambertGrid::from_template(&template).unwrap();
+
+        // Spread over the grid, including boxes that straddle an edge, cover
+        // everything and miss entirely. Degrees, absolute. `tight` is off for a
+        // box that runs off the grid: it is then legitimately wider than any
+        // point it contains, and only containment is meaningful.
+        let (lat0, lon0) = g.latlon(60, 45);
+        let boxes: &[(f64, f64, f64, f64, bool, &str)] = &[
+            (lat0 - 0.2, lat0 + 0.2, lon0 - 0.2, lon0 + 0.2, true, "small interior"),
+            (lat0 - 0.5, lat0 + 0.5, lon0 - 0.8, lon0 + 0.8, true, "wide interior"),
+            (lat0 - 0.03, lat0 + 0.03, lon0 - 0.9, lon0 + 0.9, true, "a thin strip"),
+            (lat0 - 3.0, lat0 + 0.3, lon0 - 3.0, lon0 + 0.3, false, "over the SW corner"),
+            (0.0, 90.0, -180.0, 0.0, false, "a quarter of the planet"),
+            (lat0 + 8.0, lat0 + 9.0, lon0, lon0 + 1.0, false, "well off the grid"),
+        ];
+
+        for &(min_lat, max_lat, min_lon, max_lon, tight, what) in boxes {
+            let (fi0, fi1, fj0, fj1) = g
+                .index_bounds(min_lat, max_lat, min_lon, max_lon)
+                .unwrap_or_else(|| panic!("{what}: no bounds"));
+
+            let (mut ti0, mut ti1) = (usize::MAX, 0usize);
+            let (mut tj0, mut tj1) = (usize::MAX, 0usize);
+            let mut inside = 0;
+            for j in 0..template.nj as usize {
+                for i in 0..template.ni as usize {
+                    let (lat, lon) = g.latlon(i, j);
+                    if lat < min_lat || lat > max_lat || lon < min_lon || lon > max_lon {
+                        continue;
+                    }
+                    inside += 1;
+                    assert!(
+                        (fi0..=fi1).contains(&(i as f64)) && (fj0..=fj1).contains(&(j as f64)),
+                        "{what}: point ({i}, {j}) is inside the box but outside \
+                         i {fi0:.3}..{fi1:.3}, j {fj0:.3}..{fj1:.3}",
+                    );
+                    ti0 = ti0.min(i);
+                    ti1 = ti1.max(i);
+                    tj0 = tj0.min(j);
+                    tj1 = tj1.max(j);
+                }
+            }
+
+            if !tight {
+                continue;
+            }
+            assert!(inside > 0, "{what}: an empty box proves nothing about tightness");
+            // Two cells of slack: the bounds are over the continuous box, the
+            // true extent over lattice points, and a thin box's corner need not
+            // contain one. Nowhere near enough slack to admit a degenerate
+            // `0..ni`, which is tens of cells out on these boxes.
+            for (got, want, axis) in [
+                (fi0, ti0 as f64, "i lower"),
+                (fi1, ti1 as f64, "i upper"),
+                (fj0, tj0 as f64, "j lower"),
+                (fj1, tj1 as f64, "j upper"),
+            ] {
+                assert!(
+                    (got - want).abs() <= 2.0,
+                    "{what}: {axis} bound {got:.3} is {:.3} cells off the {want} \
+                     the {inside} contained points actually reach",
+                    (got - want).abs(),
+                );
+            }
+        }
     }
 
     /// Off the grid must be `None`, not a clamped edge point: the tooltip would

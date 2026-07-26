@@ -75,6 +75,31 @@ jobs:
       # `#[cfg(target_os = "android")]` invisibly.
       - name: Verify the autofixed tree still builds (host)
         run: cargo build --workspace --all-targets --all-features
+      # Naming both packages is load-bearing: `--all-targets` only expands the
+      # *selected* packages, so `-p rustdar-web` alone would pass over a wasm32
+      # break in the other.
+      #
+      # Not `--workspace`, and the tokio dev-dependency gating in rustdar-radar,
+      # rustdar-overlays and rustdar-egui is not enough to make it one. Those
+      # three crates' `#[cfg(test)]` modules are native-only in substance: they
+      # call reqwest APIs wasm does not have (`ClientBuilder::timeout`,
+      # `Error::is_connect`) and `rustdar_radar::tls::default_is_ring`, which is
+      # itself `cfg(not(wasm32))`. Gating the dev-dependency also leaves their
+      # `#[tokio::test]` attributes unresolvable there. Widening needs the
+      # modules themselves gated on `cfg(all(test, not(target_arch = "wasm32")))`
+      # -- the pattern rustdar-radar/src/tls.rs already uses. The libs are clean.
+      #
+      # That follow-up is 7 files across 3 crates: archive.rs, level3.rs and
+      # srm.rs in rustdar-radar; hrrr/fetch.rs, metar/fetch.rs and glm/fetch.rs
+      # in rustdar-overlays; tile_source/tests.rs in rustdar-egui. Nothing else
+      # is waiting behind them -- with wasm-legal tokio dev-deps substituted so
+      # that all 24 `#[tokio::test]`s resolve, those five errors are the only
+      # ones left -- so gating them turns this row into `--workspace`.
+      #
+      # Note `--all-targets` also compiles rustdar-web/tests/{pwa_assets,
+      # sw_behaviour}.rs and rustdar-frontend/tests/wgpu_guard.rs here, so a
+      # future host-only integration test in either crate would fail this row
+      # spuriously -- gate any such test on `cfg(not(target_arch = "wasm32"))`.
       - name: Verify the autofixed tree still builds (wasm32)
         run: cargo check -p rustdar-web -p rustdar-frontend --all-targets --target wasm32-unknown-unknown
       - name: Verify the autofixed tree still builds (Android arm64-v8a)

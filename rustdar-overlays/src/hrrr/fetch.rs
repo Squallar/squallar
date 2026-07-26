@@ -838,6 +838,219 @@ mod tests {
         );
     }
 
+    // ── A synthetic GRIB2 message ─────────────────────────────────────────
+
+    /// 3 x 2 = 6 points, which keeps the whole message to 188 bytes — a real
+    /// HRRR record is ~1 MB, far too large to commit.
+    const SYNTHETIC_NI: u32 = 3;
+    const SYNTHETIC_NJ: u32 = 2;
+    const SYNTHETIC_POINTS: u32 = SYNTHETIC_NI * SYNTHETIC_NJ;
+
+    /// Byte offset of section 3's `numberOfDataPoints`: section 0 (16) +
+    /// section 1 (21) + section 3's 5-byte header + its 1-byte source-of-grid.
+    /// Checked against the built bytes below rather than trusted.
+    const SECT3_NUM_POINTS_OFFSET: usize = 16 + 21 + 5 + 1;
+
+    /// `length | section number | body`, with the length computed.
+    fn grib_section(number: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = ((body.len() + 5) as u32).to_be_bytes().to_vec();
+        out.push(number);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A whole GRIB2 message: a 3 x 2 Lambert-conformal grid (template 3.30)
+    /// carrying a constant field (DRT 5.0 with `nbits = 0`, so section 7 holds
+    /// no data at all).
+    ///
+    /// `declared_points` is section 3's `numberOfDataPoints`, which grib reads
+    /// verbatim — `GridDefinition::num_points()` is a `read_as!(u32, .., 1)`,
+    /// not `ni * nj` — so any value but [`SYNTHETIC_POINTS`] gives a message
+    /// well-formed everywhere except the count [`check_point_count`] guards.
+    fn synthetic_lambert_grib2(declared_points: u32) -> Vec<u8> {
+        // Section 1 — identification.
+        let mut sect1 = Vec::new();
+        sect1.extend_from_slice(&7u16.to_be_bytes()); // centre: NCEP
+        sect1.extend_from_slice(&0u16.to_be_bytes()); // subcentre
+        sect1.push(2); // master table version
+        sect1.push(1); // local table version
+        sect1.push(0); // significance of reference time: analysis
+        sect1.extend_from_slice(&2026u16.to_be_bytes());
+        sect1.extend_from_slice(&[7, 25, 14, 0, 0]); // month, day, hour, min, sec
+        sect1.push(0); // production status: operational
+        sect1.push(1); // type of data: forecast
+
+        // Section 3 — grid definition.
+        let mut sect3 = Vec::new();
+        sect3.push(0); // source of grid definition: the template below
+        sect3.extend_from_slice(&declared_points.to_be_bytes()); // ← perturbed
+        sect3.push(0); // no optional list of numbers of points
+        sect3.push(0); // ...so nothing to interpret
+        sect3.extend_from_slice(&30u16.to_be_bytes()); // template 3.30
+        // Template 3.30 body, in grib's `Template3_30` field order.
+        sect3.push(6); // Code Table 3.2 value 6: sphere, radius 6371229 m
+        sect3.push(0);
+        sect3.extend_from_slice(&0u32.to_be_bytes()); // spherical radius
+        sect3.push(0);
+        sect3.extend_from_slice(&0u32.to_be_bytes()); // major axis
+        sect3.push(0);
+        sect3.extend_from_slice(&0u32.to_be_bytes()); // minor axis
+        sect3.extend_from_slice(&SYNTHETIC_NI.to_be_bytes());
+        sect3.extend_from_slice(&SYNTHETIC_NJ.to_be_bytes());
+        sect3.extend_from_slice(&38_500_000i32.to_be_bytes()); // La1
+        sect3.extend_from_slice(&262_500_000u32.to_be_bytes()); // Lo1
+        sect3.push(0b0000_1000); // resolution and component flags
+        sect3.extend_from_slice(&38_500_000i32.to_be_bytes()); // LaD
+        sect3.extend_from_slice(&262_500_000u32.to_be_bytes()); // LoV
+        sect3.extend_from_slice(&3_000_000u32.to_be_bytes()); // Dx, mm
+        sect3.extend_from_slice(&3_000_000u32.to_be_bytes()); // Dy, mm
+        sect3.push(0); // projection centre: north pole, one cone
+        sect3.push(0b0100_0000); // +i, +j, i-consecutive, no alternating rows
+        sect3.extend_from_slice(&38_500_000i32.to_be_bytes()); // Latin1
+        sect3.extend_from_slice(&38_500_000i32.to_be_bytes()); // Latin2
+        sect3.extend_from_slice(&0i32.to_be_bytes()); // southern pole lat
+        sect3.extend_from_slice(&0u32.to_be_bytes()); // southern pole lon
+
+        // Section 4 — product definition, template 4.0.
+        let mut sect4 = Vec::new();
+        sect4.extend_from_slice(&0u16.to_be_bytes()); // no coordinate values
+        sect4.extend_from_slice(&0u16.to_be_bytes()); // template 4.0
+        sect4.push(7); // parameter category: thermodynamic stability indices
+        sect4.push(7); // parameter number: CIN
+        sect4.push(2); // type of generating process: forecast
+        sect4.push(0); // background process
+        sect4.push(83); // generating process identifier
+        sect4.extend_from_slice(&0u16.to_be_bytes()); // hours after cutoff
+        sect4.push(0); // minutes after cutoff
+        sect4.push(1); // indicator of unit of time range: hour
+        sect4.extend_from_slice(&0u32.to_be_bytes()); // forecast time
+        sect4.push(1); // first fixed surface: ground or water surface
+        sect4.push(0); // scale factor
+        sect4.extend_from_slice(&0u32.to_be_bytes()); // scaled value
+        sect4.push(255); // no second fixed surface
+        sect4.push(0);
+        sect4.extend_from_slice(&0u32.to_be_bytes());
+
+        // Section 5 — data representation, template 5.0. Its own point count
+        // stays at Ni x Nj in both fixtures, so section 3's is the only
+        // difference between them.
+        let mut sect5 = Vec::new();
+        sect5.extend_from_slice(&SYNTHETIC_POINTS.to_be_bytes());
+        sect5.extend_from_slice(&0u16.to_be_bytes()); // template 5.0
+        sect5.extend_from_slice(&(-75.0f32).to_be_bytes()); // reference value
+        sect5.extend_from_slice(&0i16.to_be_bytes()); // binary scale factor
+        sect5.extend_from_slice(&0i16.to_be_bytes()); // decimal scale factor
+        sect5.push(0); // 0 bits/value: every point is the reference value
+        sect5.push(0); // original field values are floating point
+
+        let mut body = grib_section(1, &sect1);
+        body.extend(grib_section(3, &sect3));
+        body.extend(grib_section(4, &sect4));
+        body.extend(grib_section(5, &sect5));
+        body.extend(grib_section(6, &[255])); // no bitmap
+        body.extend(grib_section(7, &[])); // no data, nbits is 0
+        body.extend_from_slice(b"7777"); // section 8
+
+        // Section 0. The total length is computed; grib walks the message by
+        // decrementing it, so a hand-counted value desynchronises the parse.
+        let mut message = b"GRIB".to_vec();
+        message.extend_from_slice(&[0, 0]); // reserved
+        message.push(0); // discipline: meteorological products
+        message.push(2); // GRIB edition 2
+        let total = (message.len() + 8 + body.len()) as u64;
+        message.extend_from_slice(&total.to_be_bytes());
+        message.extend(body);
+        message
+    }
+
+    /// [`grid_coords`] on the first submessage of `bytes`, i.e. the real call
+    /// site, reached the way `parse_grib2` reaches it.
+    fn grid_coords_of(bytes: &[u8]) -> Result<GridCoords, String> {
+        let grib2 = grib::from_reader(std::io::Cursor::new(bytes))
+            .map_err(|e| format!("GRIB2 parse error: {e}"))?;
+        let (_index, submessage) = grib2
+            .iter()
+            .next()
+            .ok_or_else(|| "no submessages in the synthetic message".to_string())?;
+        grid_coords(&submessage)
+    }
+
+    /// The control the mismatch test rests on: this message is well-formed in
+    /// every other respect, so the `Err` below cannot be blamed on anything
+    /// else. Without it the negative test would pass on a message grib rejects
+    /// for an unrelated reason, and the guard would go untested.
+    #[test]
+    fn a_synthetic_lambert_message_decodes_through_the_real_parse_path() {
+        let bytes = synthetic_lambert_grib2(SYNTHETIC_POINTS);
+        assert_eq!(bytes.len(), 188, "the fixture should be 188 bytes");
+        assert_eq!(&bytes[..4], b"GRIB");
+        assert_eq!(&bytes[bytes.len() - 4..], b"7777");
+        assert_eq!(
+            u32::from_be_bytes(
+                bytes[SECT3_NUM_POINTS_OFFSET..SECT3_NUM_POINTS_OFFSET + 4]
+                    .try_into()
+                    .unwrap(),
+            ),
+            SYNTHETIC_POINTS,
+            "SECT3_NUM_POINTS_OFFSET must land on section 3's declared count",
+        );
+
+        let grid = parse_grib2(&bytes, ModelParameter::SurfaceBasedCin)
+            .expect("the synthetic message must decode end to end");
+        assert_eq!((grid.ni, grid.nj), (3, 2));
+        assert_eq!(grid.values.len(), SYNTHETIC_POINTS as usize);
+        assert_eq!(grid.coords.len(), SYNTHETIC_POINTS as usize);
+        assert!(
+            matches!(grid.coords, GridCoords::Lambert(_)),
+            "template 3.30 must take the lambert branch of grid_coords",
+        );
+        assert!(
+            grid.values.iter().all(|&v| v == -75.0),
+            "nbits = 0 is a constant field at the reference value: {:?}",
+            grid.values,
+        );
+        assert_eq!(grid.ref_time.to_string(), "2026-07-25 14:00:00");
+    }
+
+    /// The `?` on `check_point_count` inside [`grid_coords`]. Dropping it lets
+    /// a grid whose Ni x Nj disagrees with section 3 through, and the values
+    /// are then laid out over the wrong coordinates — weather in the wrong
+    /// place. [`check_point_count`]'s own body is pinned above; this pins the
+    /// propagation at the only call site.
+    ///
+    /// The two fixtures differ in exactly the four bytes of section 3's
+    /// `numberOfDataPoints`, so nothing else can be what rejects the second.
+    #[test]
+    fn a_declared_point_count_that_disagrees_with_the_grid_is_refused() {
+        let good = synthetic_lambert_grib2(SYNTHETIC_POINTS);
+        let bad = synthetic_lambert_grib2(SYNTHETIC_POINTS + 1);
+        assert_eq!(good.len(), bad.len());
+
+        let differing: Vec<usize> = (0..good.len()).filter(|&i| good[i] != bad[i]).collect();
+        let field = SECT3_NUM_POINTS_OFFSET..SECT3_NUM_POINTS_OFFSET + 4;
+        assert!(
+            !differing.is_empty() && differing.iter().all(|i| field.contains(i)),
+            "the fixtures must differ only inside {field:?}, but differ at {differing:?}",
+        );
+
+        // Control: the same call, on the same message, with the count agreeing.
+        assert!(
+            matches!(grid_coords_of(&good), Ok(GridCoords::Lambert(_))),
+            "the control fixture must reach the Lambert branch: {:?}",
+            grid_coords_of(&good).err(),
+        );
+
+        let err = grid_coords_of(&bad).expect_err("the mismatch must be refused");
+        assert!(err.contains("Lambert grid point count mismatch"), "{err}");
+        assert!(err.contains("7 declared"), "{err}");
+        assert!(err.contains("6 computed"), "{err}");
+
+        // ...and it must reach the caller rather than being swallowed there.
+        let err = parse_grib2(&bad, ModelParameter::SurfaceBasedCin)
+            .expect_err("parse_grib2 must refuse it too");
+        assert!(err.contains("Lambert grid point count mismatch"), "{err}");
+    }
+
     /// Four verbatim lines from
     /// `hrrr.20260725/conus/hrrr.t14z.wrfsfcf01.grib2.idx` where `(var, level)`
     /// repeats. Neither pair is a field rustdar requests, but taking record 8

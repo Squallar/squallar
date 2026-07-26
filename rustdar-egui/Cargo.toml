@@ -68,6 +68,11 @@ wasm-bindgen-futures = "=0.4.76"
 # rather than on a checked-in blob. Same version walkers already resolves;
 # `png` only, since that is the one format the fixtures use.
 image = { version = "=0.25.10", default-features = false, features = ["png"] }
+
+# Same split as `[dependencies]` above, for the same reason: `rt-multi-thread` is
+# rejected on wasm, and `--all-targets` compiles dev-deps, so leaving this ungated
+# breaks `cargo check --target wasm32-unknown-unknown`.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # Drives the async tile tests and the `#[ignore]`d live CartoDB fetch. Not linked
 # into any shipped binary.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
