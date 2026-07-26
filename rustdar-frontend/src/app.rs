@@ -229,6 +229,7 @@ impl App {
         .expect("Failed to build HTTP client");
 
         let mut gui = Gui::new();
+        gui.set_supports_exit(platform.supports_exit());
         if let Some(store) = platform.config_store() {
             gui.load_ui_config(store.as_ref());
         }

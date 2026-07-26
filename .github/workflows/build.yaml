@@ -143,35 +143,43 @@ jobs:
           # Android TLS goes silently no-op. A second `wgpu` copy once left
           # rustdar-frontend's backend selection applying to an inert one; its
           # `const _` guard is per-crate, so this is the only graph-wide check.
-          # Per-target, because resolution is.
+          # Per-target, because resolution is, and `-p`-scoped to the crate that
+          # actually ships that target: an unscoped `cargo tree -i` answers for
+          # the union of the workspace graph, which is not what any one artifact
+          # links. On iOS that union already lies -- it reports serialport, which
+          # the linked binary does not contain.
           - name: dep-unification
             cmd: |
               fail=0
+              # Each spec is <shipping crate>:<target>.
               check() {
                 crate=$1; shift
-                for t in "$@"; do
+                for spec in "$@"; do
+                  pkg=${spec%%:*}; t=${spec#*:}
                   # cargo tree exits non-zero with "specification is ambiguous"
                   # when two copies resolve -- itself the failure, so report it
                   # rather than let it surface as a misleading "found 0".
-                  if ! out=$(cargo tree -i "$crate" --target "$t" -e normal --prefix none 2>&1); then
-                    echo "::error::cargo tree -i $crate --target $t failed:"
+                  if ! out=$(cargo tree -i "$crate" -p "$pkg" --target "$t" -e normal --prefix none 2>&1); then
+                    echo "::error::cargo tree -i $crate -p $pkg --target $t failed:"
                     printf '%s\n' "$out" | sed 's/^/    /'
                     fail=1; continue
                   fi
                   found=$(printf '%s\n' "$out" | grep -E "^$crate v" | sort -u) || true
                   n=$(printf '%s\n' "$found" | grep -c .) || true
                   if [ "$n" = 1 ]; then
-                    echo "ok [$t]: $found"
+                    echo "ok [$pkg $t]: $found"
                   else
-                    echo "::error::expected exactly 1 version of $crate in the $t graph, found $n"
+                    # 0 is a failure too: scoped, it means the crate left the
+                    # artifact's graph entirely.
+                    echo "::error::expected exactly 1 version of $crate in the $pkg $t graph, found $n"
                     printf '%s\n' "$found" | sed 's/^/    /'
                     fail=1
                   fi
                 done
               }
-              check jni                      aarch64-linux-android x86_64-linux-android
-              check rustls-platform-verifier aarch64-linux-android x86_64-linux-android
-              check wgpu                     x86_64-unknown-linux-gnu wasm32-unknown-unknown aarch64-linux-android
+              check jni                      rustdar-android:aarch64-linux-android rustdar-android:x86_64-linux-android
+              check rustls-platform-verifier rustdar-android:aarch64-linux-android rustdar-android:x86_64-linux-android
+              check wgpu                     rustdar-platform:x86_64-unknown-linux-gnu rustdar-web:wasm32-unknown-unknown rustdar-android:aarch64-linux-android
               exit "$fail"
 
     steps:

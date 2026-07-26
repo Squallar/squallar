@@ -20,10 +20,28 @@
     <string>$(MARKETING_VERSION)</string>
     <key>CFBundleVersion</key>
     <string>$(CURRENT_PROJECT_VERSION)</string>
+    <!-- Device and simulator bundles differ here, so these three expand
+         per-target (ios/Makefile). `simctl install` rejects a bundle whose
+         CFBundleSupportedPlatforms does not name iPhoneSimulator. -->
+    <key>CFBundleSupportedPlatforms</key>
+    <array>
+        <string>$(SUPPORTED_PLATFORM)</string>
+    </array>
+    <key>DTPlatformName</key>
+    <string>$(PLATFORM_NAME)</string>
+    <key>DTSDKName</key>
+    <string>$(SDK_NAME)</string>
     <key>LSRequiresIPhoneOS</key>
     <true/>
     <key>MinimumOSVersion</key>
     <string>14.0</string>
+    <!-- 1 = iPhone/iPod, 2 = iPad. Absent, this defaults to iPhone-only, which
+         is what left `UISupportedInterfaceOrientations~ipad` below inert. -->
+    <key>UIDeviceFamily</key>
+    <array>
+        <integer>1</integer>
+        <integer>2</integer>
+    </array>
     <!-- Empty launch screen (iOS 13+); winit owns the window, so no storyboard. -->
     <key>UILaunchScreen</key>
     <dict/>

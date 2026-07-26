@@ -34,8 +34,12 @@ TARGET_DIR ?= target-ios
 build:
 	@cd "$(ROOT)"
 	SDK=iphoneos; RUST_TARGET=aarch64-apple-ios; IOS_CC=arm64-apple-ios-clang
+	# CFBundleSupportedPlatforms is capitalised where PLATFORM_NAME is not, and
+	# a bundle claiming the wrong one is what "not compatible" means to simctl.
+	SUPPORTED_PLATFORM=iPhoneOS; SDKROOT_REF='$$IOS_SDKROOT'
 	if [ -n "$(SIMULATOR)" ]; then
 	  SDK=iphonesimulator; RUST_TARGET=aarch64-apple-ios-sim; IOS_CC=arm64-apple-ios-sim-clang
+	  SUPPORTED_PLATFORM=iPhoneSimulator; SDKROOT_REF='$$IOS_SIMULATOR_SDKROOT'
 	fi
 	if [ -n "$(DEBUG)" ]; then PROFILE_DIR=debug; CARGO_PROFILE=; else PROFILE_DIR=release; CARGO_PROFILE=--release; fi
 	LIBDIR="$(TARGET_DIR)/$$RUST_TARGET/$$PROFILE_DIR"
@@ -65,7 +69,9 @@ build:
 	        -framework CoreGraphics \
 	        -framework Foundation -framework CoreFoundation \
 	        -framework Security -framework CoreLocation \
-	        -o $$LIBDIR/rustdar"
+	        -o $$LIBDIR/rustdar
+	    tr -d '\"' < $$SDKROOT_REF/SDKSettings.json | tr ',' '\n' \
+	        | sed -n 's/^CanonicalName://p' | head -1 > $$LIBDIR/sdk-name"
 
 	if [ -n "$(IN_CONTAINER)" ]; then
 	  echo "==> cargo + link ($$RUST_TARGET, $$PROFILE_DIR)"
@@ -97,6 +103,10 @@ build:
 	MARKETING_VERSION="$$(yaml_val MARKETING_VERSION)"
 	CURRENT_PROJECT_VERSION="$$(yaml_val CURRENT_PROJECT_VERSION)"
 	: "$${BUNDLE_ID:?could not read PRODUCT_BUNDLE_IDENTIFIER from ios/project.yml}"
+	# DTSDKName is read off the SDK the link just used rather than written down
+	# here, so it cannot drift from the image.
+	SDK_NAME="$$(cat "$$LIBDIR/sdk-name")"
+	: "$${SDK_NAME:?no CanonicalName in the SDKSettings.json of the linked SDK}"
 
 	OUT="ios/build/linux/$$SDK"; APP="$$OUT/rustdar.app"
 	rm -rf "$$OUT"; mkdir -p "$$APP"
@@ -106,6 +116,9 @@ build:
 	    -e "s|\$$(PRODUCT_BUNDLE_IDENTIFIER)|$$BUNDLE_ID|g" \
 	    -e "s|\$$(MARKETING_VERSION)|$$MARKETING_VERSION|g" \
 	    -e "s|\$$(CURRENT_PROJECT_VERSION)|$$CURRENT_PROJECT_VERSION|g" \
+	    -e "s|\$$(SUPPORTED_PLATFORM)|$$SUPPORTED_PLATFORM|g" \
+	    -e "s|\$$(PLATFORM_NAME)|$$SDK|g" \
+	    -e "s|\$$(SDK_NAME)|$$SDK_NAME|g" \
 	    ios/Info.plist > "$$APP/Info.plist"
 	# An unexpanded $(...) here means a key silently ships as a literal.
 	! grep -q '\$$(' "$$APP/Info.plist" || { echo "ERROR: unexpanded build setting left in Info.plist"; exit 1; }

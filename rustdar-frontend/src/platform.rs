@@ -160,8 +160,9 @@ pub trait PlatformBridge {
     /// `JavaVM`. Both live in `rustdar-android`, the cdylib entry point — which
     /// depends on the bridge's own crate, so the bridge can never call into it
     /// directly. Injecting the reader is the same inversion `set_insets_querier`
-    /// and `set_back_handler` already use, and it is what lets `rustdar-platform`
-    /// keep `#![forbid(unsafe_code)]`.
+    /// and `set_back_handler` already use, and it is what keeps JNI out of
+    /// `rustdar-platform`: that crate is `#![deny(unsafe_code)]`, and its one
+    /// scoped `allow` is the iOS entry symbol, not this.
     ///
     /// Desktop and web answer `detect_dark_theme` themselves and ignore this.
     fn set_theme_detector(&mut self, _detector: fn() -> bool) {}

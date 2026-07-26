@@ -191,20 +191,23 @@ impl super::Gui {
     /// Build this frame's menu, reading the live state the toggles reflect.
     pub(super) fn menu_model(&self) -> Vec<MenuNode> {
         let pane = self.active_pane();
+        let mut file = vec![MenuNode::Item {
+            label: "Refresh Radar",
+            action: MenuAction::RefreshRadar,
+        }];
+        // Omitted where the platform has no quit (iOS): `request_exit` returns
+        // early there, so the entry would be a button that does nothing.
+        if self.supports_exit {
+            file.push(MenuNode::Separator);
+            file.push(MenuNode::Item {
+                label: "Exit",
+                action: MenuAction::Exit,
+            });
+        }
         vec![
             MenuNode::Submenu {
                 label: "File",
-                children: vec![
-                    MenuNode::Item {
-                        label: "Refresh Radar",
-                        action: MenuAction::RefreshRadar,
-                    },
-                    MenuNode::Separator,
-                    MenuNode::Item {
-                        label: "Exit",
-                        action: MenuAction::Exit,
-                    },
-                ],
+                children: file,
             },
             MenuNode::Submenu {
                 label: "View",

@@ -148,7 +148,7 @@ impl PlatformBridge for DesktopPlatform {
 #[cfg(target_os = "android")]
 pub struct AndroidPlatform {
     /// Injected by `rustdar-android`: the read is a JNI call and this crate is
-    /// `#![forbid(unsafe_code)]`.
+    /// `#![deny(unsafe_code)]`.
     theme_detector: Option<fn() -> bool>,
     /// Theme changes from the poll thread `set_theme_detector` starts.
     theme_receiver: Option<std::sync::mpsc::Receiver<bool>>,

@@ -185,6 +185,9 @@ pub struct Gui {
     // Safe area insets in logical pixels (top, bottom, left, right)
     // Used on Android to avoid drawing under system bars.
     safe_area_insets: (f32, f32, f32, f32),
+    /// Whether this platform can quit at all. Pushed in by the frontend from
+    /// the bridge, which this crate cannot see. `false` hides the menu's Exit.
+    supports_exit: bool,
     /// Remembers whether a mouse or a finger is driving, across frames.
     modality: ModalityLatch,
     /// This frame's resolved layout. Written once at the top of [`Gui::ui`] and
@@ -358,6 +361,7 @@ impl Gui {
             loop_speed_fps: 5.0,      // default 5 fps
             drawer_open: false,
             safe_area_insets: (0.0, 0.0, 0.0, 0.0),
+            supports_exit: true,
             modality: ModalityLatch::default(),
             layout: LayoutCtx::default(),
             interaction: InteractionState::default(),
@@ -1412,6 +1416,12 @@ impl Gui {
     /// On Android, this compensates for the status bar and navigation bar.
     pub fn set_safe_area_insets(&mut self, top: f32, bottom: f32, left: f32, right: f32) {
         self.safe_area_insets = (top, bottom, left, right);
+    }
+
+    /// Tell the UI whether this platform can quit. `false` drops Exit from the
+    /// menu; on iOS the action is a no-op, so rendering it is a dead button.
+    pub fn set_supports_exit(&mut self, supported: bool) {
+        self.supports_exit = supported;
     }
 
     pub fn set_gps_fix(&mut self, fix: rustdar_gps::GpsFix) {

@@ -503,10 +503,11 @@ fn get_display_density() -> f32 {
 ///
 /// Handed to the Android `PlatformBridge` by [`android_main`] rather than called
 /// from it. `rustdar-platform`, which owns that bridge, is
-/// `#![forbid(unsafe_code)]` and could not host a JNI call even if it wanted to
-/// — and it cannot depend on this crate to borrow one, because this crate is the
-/// cdylib that depends on *it*. Injecting a `fn()` is the same inversion
-/// `set_insets_querier` and `set_back_handler` already use.
+/// `#![deny(unsafe_code)]` with one scoped `allow` on the iOS entry symbol, so
+/// JNI stays out of it by policy — and it could not borrow one from this crate
+/// anyway, because this crate is the cdylib that depends on *it*. Injecting a
+/// `fn()` is the same inversion `set_insets_querier` and `set_back_handler`
+/// already use.
 ///
 /// `dark-light` answers this on every other platform. It compiles for Android
 /// and returns a wrong answer there, which is why this exists at all.
