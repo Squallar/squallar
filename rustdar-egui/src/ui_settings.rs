@@ -173,10 +173,13 @@ impl super::Gui {
                 ui.add_enabled_ui(motion.enabled, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Speed:");
+                        // Upper bound shared with `DERIVED_OFFSET`, which is
+                        // sized so nothing this widget admits can saturate the
+                        // derived gate encoding.
                         ui.add(
                             egui::DragValue::new(&mut motion.speed_kt)
                                 .speed(0.5)
-                                .range(0.0..=200.0)
+                                .range(0.0..=rustdar_radar::srm::MAX_OVERRIDE_SPEED_KT)
                                 .suffix(" kt"),
                         );
                     });
