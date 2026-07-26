@@ -5,6 +5,7 @@ pub mod render;
 pub mod scan;
 pub mod sites;
 pub mod sources;
+pub mod srm;
 pub mod tls;
 pub mod types;
 

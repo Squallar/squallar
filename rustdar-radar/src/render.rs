@@ -709,6 +709,29 @@ pub fn render_level3_radial_to_image(
     Some(output)
 }
 
+/// Render a storm-relative velocity field derived from dealiased Level III
+/// velocity. See [`crate::srm`].
+///
+/// Separate from [`render_level3_message_to_image`] because the derived packet
+/// is not what any product on the wire looks like: its gate values are knots on
+/// a scale this crate chose, and its gate spacing comes from the source
+/// product's code rather than from the packet.
+pub fn render_derived_srm_to_image(
+    derived: &crate::srm::DerivedSrm,
+    radar_lat: f64,
+    radar_lon: f64,
+) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+    render_level3_radial_to_image(
+        &derived.packet,
+        types::RadarProduct::StormRelativeVelocity,
+        radar_lat,
+        radar_lon,
+        derived.scale,
+        derived.offset,
+        None,
+    )
+}
+
 /// Render a Level III message, taking the radial packet, scale/offset and LUT
 /// out of its symbology and product description blocks. Keeps every
 /// nexrad-level3 internal out of the callers.

@@ -24,14 +24,21 @@
 //!
 //! # The storm-relative velocity gap
 //!
-//! Only the lowest SRM tilt survives. `N1S`/`N2S`/`N3S` exist in the bucket
-//! historically but have had nothing written to them since 2020, because NWS
-//! dropped the higher tilts from the NOAAPort broadcast (SCN 22-96); every
-//! CORS-clean source is NOAAPort-derived. Measured on 2026-07-25 for `TLX`:
-//! `N0S`/`N0K`/`EET`/`DVL`/`HHC`/`DPR` 342 keys each for the UTC day, `N1S`,
-//! `N2S`, `N3S` zero (last objects 2020-03-30, 03-31, 04-01). No substitute is
-//! swapped in: an SRM tilt from a *different* elevation would be wrong in a way
-//! the UI could not show.
+//! Only the lowest SRM tilt survives as a product. `N1S`/`N2S`/`N3S` exist in
+//! the bucket historically but have had nothing written to them since 2020,
+//! because NWS dropped the higher tilts from the NOAAPort broadcast
+//! (SCN 22-96); every CORS-clean source is NOAAPort-derived. Measured on
+//! 2026-07-25 for `TLX`: `N0S`/`N0K`/`EET`/`DVL`/`HHC`/`DPR` 342 keys each for
+//! the UTC day, `N1S`, `N2S`, `N3S` zero (last objects 2020-03-30, 03-31,
+//! 04-01).
+//!
+//! The three upper tilts are **derived** instead, from the dealiased velocity
+//! products the same bucket does carry — `N1G` (code 154), `N2U` and `N3U`
+//! (code 99), 294 objects a day each, the same as `N0S`. See [`crate::srm`].
+//! No substitute is swapped in for a *missing* tilt: an SRM field from a
+//! different elevation would be wrong in a way the UI could not show, so the
+//! elevation always comes from the fetched product's own Product Description
+//! Block.
 
 use chrono::{Duration, NaiveDate, NaiveDateTime};
 use nexrad_level3::model::Level3Message;
@@ -229,26 +236,35 @@ mod tests {
     /// | product | AWIPS | message code | field |
     /// |---|---|---|---|
     /// | Storm Relative Velocity | `N0S` | 56 | Storm Relative Mean Radial Velocity |
+    /// | ″ | `N1G` | 154 | Super-Res Digital Base Velocity (derived to SRM) |
+    /// | ″ | `N2U` | 99 | Digital Base Velocity (derived to SRM) |
+    /// | ″ | `N3U` | 99 | Digital Base Velocity (derived to SRM) |
     /// | Specific Differential Phase | `N0K` | 163 | Specific Differential Phase |
     /// | Echo Tops | `EET` | 135 | Enhanced Echo Tops |
     /// | Vertically Integrated Liquid | `DVL` | 134 | Digital Vertically Integrated Liquid |
     /// | Hydrometeor Classification | `HHC` | 177 | Hybrid Hydrometeor Classification |
     /// | Precipitation Rate | `DPR` | 176 | Digital Instantaneous Precipitation Rate |
-    const ICD: &[(RadarProduct, &str, i16)] = &[
-        (RadarProduct::StormRelativeVelocity, "N0S", 56),
-        (RadarProduct::SpecificDifferentialPhase, "N0K", 163),
-        (RadarProduct::EchoTops, "EET", 135),
-        (RadarProduct::VerticallyIntegratedLiquid, "DVL", 134),
-        (RadarProduct::HydrometeorClassification, "HHC", 177),
-        (RadarProduct::PrecipitationRate, "DPR", 176),
+    ///
+    /// The AWIPS IDs are listed **in request order**, so the table pins which
+    /// tilt each one is, not merely that the set is right.
+    const ICD: &[(RadarProduct, &[(&str, i16)])] = &[
+        (
+            RadarProduct::StormRelativeVelocity,
+            &[("N0S", 56), ("N1G", 154), ("N2U", 99), ("N3U", 99)],
+        ),
+        (RadarProduct::SpecificDifferentialPhase, &[("N0K", 163)]),
+        (RadarProduct::EchoTops, &[("EET", 135)]),
+        (RadarProduct::VerticallyIntegratedLiquid, &[("DVL", 134)]),
+        (RadarProduct::HydrometeorClassification, &[("HHC", 177)]),
+        (RadarProduct::PrecipitationRate, &[("DPR", 176)]),
     ];
 
-    fn icd_row(product: &RadarProduct) -> Option<&'static (RadarProduct, &'static str, i16)> {
-        ICD.iter().find(|(p, ..)| p == product)
+    fn icd_row(product: &RadarProduct) -> Option<&'static [(&'static str, i16)]> {
+        ICD.iter().find(|(p, _)| p == product).map(|(_, ids)| *ids)
     }
 
-    /// Every Level III product must request the AWIPS ID the ICD gives for the
-    /// field rustdar renders it as.
+    /// Every Level III product must request the AWIPS IDs the ICD gives for the
+    /// field rustdar renders it as, in the order it gives them.
     ///
     /// Swapping two IDs neither crashes nor fails to decode: `DVL` under Echo
     /// Tops decodes cleanly in kg/m² and the Echo Tops palette then paints a
@@ -257,7 +273,7 @@ mod tests {
     #[test]
     fn each_level3_product_requests_the_awips_id_the_icd_gives_it() {
         for product in RadarProduct::all() {
-            let Some(&(_, want, _)) = icd_row(product) else {
+            let Some(row) = icd_row(product) else {
                 assert!(
                     !product.is_level3(),
                     "{} is Level III but has no row in the ICD table; add one \
@@ -274,10 +290,10 @@ mod tests {
             let codes = product
                 .level3_products()
                 .unwrap_or_else(|| panic!("{} names no product code", product.name()));
+            let want: Vec<&str> = row.iter().map(|(id, _)| *id).collect();
             assert_eq!(
-                codes,
-                [want],
-                "{} requests {codes:?}; the ICD gives {want} for that field",
+                codes, want,
+                "{} requests {codes:?}; the ICD gives {want:?} for that field",
                 product.name(),
             );
         }
@@ -297,9 +313,10 @@ mod tests {
         );
         // A duplicated ID would let two products agree with the table while
         // pointing at the same field.
-        for (i, (_, code, _)) in ICD.iter().enumerate() {
+        let all: Vec<&str> = ICD.iter().flat_map(|(_, ids)| ids.iter().map(|(id, _)| *id)).collect();
+        for (i, code) in all.iter().enumerate() {
             assert!(
-                !ICD[..i].iter().any(|(_, other, _)| other == code),
+                !all[..i].contains(code),
                 "{code} appears twice in the ICD table",
             );
         }
@@ -479,19 +496,41 @@ mod tests {
 
     /// The three dead SRM tilts must not be requested. Asserted by name, not
     /// count: adding "N1S" back is the obvious thing to try when someone
-    /// notices only one SRM tilt renders, and it can only ever fail.
+    /// notices the upper tilts are computed rather than fetched, and it can
+    /// only ever fail.
     #[test]
     fn the_discontinued_srm_tilts_are_not_requested() {
         let codes = RadarProduct::StormRelativeVelocity
             .level3_products()
             .expect("SRM is Level III");
-        assert_eq!(codes, ["N0S"]);
+        assert_eq!(codes, ["N0S", "N1G", "N2U", "N3U"]);
         for dead in ["N1S", "N2S", "N3S"] {
             assert!(
                 !codes.contains(&dead),
                 "{dead} has had no data written since 2020 (NWS SCN 22-96)",
             );
         }
+    }
+
+    /// The upper SRM tilts must come from products the derivation recognises as
+    /// dealiased velocity, or they would render as base velocity under a
+    /// storm-relative label — the storm motion silently never applied.
+    #[test]
+    fn the_upper_srm_tilts_request_dealiased_velocity_products() {
+        let codes = RadarProduct::StormRelativeVelocity
+            .level3_products()
+            .expect("SRM is Level III");
+        let row = icd_row(&RadarProduct::StormRelativeVelocity).expect("SRM has an ICD row");
+        assert_eq!(codes[0], "N0S", "the lowest tilt is fetched, not derived");
+        for (id, message_code) in &row[1..] {
+            assert!(
+                crate::srm::VELOCITY_PRODUCT_CODES.contains(message_code),
+                "{id} decodes as {message_code}, which srm::derive would refuse",
+            );
+        }
+        // Product 56 must NOT be in that set, or the 0.5° tilt would have the
+        // correction applied to a field that already has it.
+        assert!(!crate::srm::VELOCITY_PRODUCT_CODES.contains(&56));
     }
 
     // ── Live checks ───────────────────────────────────────────────────────
@@ -513,13 +552,10 @@ mod tests {
         let now = chrono::Utc::now().naive_utc();
 
         for product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
-            let &(_, _, want_message_code) = icd_row(product)
+            let row = icd_row(product)
                 .unwrap_or_else(|| panic!("{} has no ICD row", product.name()));
-            let codes = product
-                .level3_products()
-                .unwrap_or_else(|| panic!("{} names no product code", product.name()));
 
-            for &code in codes {
+            for &(code, want_message_code) in row {
                 let fetched = fetch_latest_product(&sources, "KTLX", code, now)
                     .await
                     .unwrap_or_else(|e| panic!("{} fetch of {code} failed: {e}", product.name()));

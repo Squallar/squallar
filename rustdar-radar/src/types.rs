@@ -292,14 +292,16 @@ impl RadarProduct {
     /// the `unidata-nexrad-level3` bucket (`TLX_N0S_2026_07_25_...`). `None`
     /// for Level II products.
     ///
-    /// Storm-relative velocity is one tilt, not four: NWS removed the higher
-    /// SRM tilts from NOAAPort (SCN 22-96), so nothing has been written to
-    /// `N1S`/`N2S`/`N3S` since 2020. Do not fill the gap by pointing a higher
-    /// tilt at `N0S` — SRM is elevation-specific, so a 0.5° field labelled 1.5°
-    /// is a wrong answer rather than a missing one.
+    /// Storm-relative velocity mixes the two: `N0S` is the RPG's own product,
+    /// and the three tilts above it are **derived** from dealiased velocity,
+    /// because NWS removed `N1S`/`N2S`/`N3S` from NOAAPort (SCN 22-96) and
+    /// nothing has been written to those keys since 2020. See
+    /// [`crate::srm`]. Never point a higher tilt at `N0S` — SRM is
+    /// elevation-specific, so a 0.5° field labelled 1.5° is a wrong answer
+    /// rather than a missing one.
     pub fn level3_products(&self) -> Option<&'static [&'static str]> {
         match self {
-            RadarProduct::StormRelativeVelocity => Some(&["N0S"]),
+            RadarProduct::StormRelativeVelocity => Some(&crate::srm::SRM_TILT_PRODUCTS),
             RadarProduct::SpecificDifferentialPhase => Some(&["N0K"]),
             RadarProduct::EchoTops => Some(&["EET"]),
             RadarProduct::VerticallyIntegratedLiquid => Some(&["DVL"]),

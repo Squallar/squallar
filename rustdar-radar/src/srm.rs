@@ -1,0 +1,891 @@
+//! Storm-relative mean velocity, derived from Level III **dealiased** velocity.
+//!
+//! Only the lowest SRM tilt is still published. NWS SCN 22-96 dropped
+//! `N1S`/`N2S`/`N3S` from the NOAAPort broadcast in 2022, and every CORS-clean
+//! source is NOAAPort-derived: `unidata-nexrad-level3` last wrote to those three
+//! keys in 2020, while `N0S` runs 294 objects a day. THREDDS, GCS, IEM, COD and
+//! NCEI were all checked. So the upper tilts are computed here instead:
+//!
+//! ```text
+//! SRM_kt = V_kt + speed · cos(direction − azimuth)
+//! ```
+//!
+//! **From Level III, never Level II.** L2 velocity is aliased and
+//! `nexrad-decode` has no dealiasing; the errors would be 2×Nyquist — 50–70 kt
+//! in exactly the mesocyclone cores the product exists to show — and would
+//! render couplets inverted. The RPG dealiases before publishing `N?G`/`N?U`.
+//!
+//! **The vector is read, not estimated.** It is in the `N0S` Product
+//! Description Block, halfwords 51 and 52; see
+//! [`nexrad_level3::model::ProductDescriptionBlock::storm_motion`]. Bunkers and
+//! every other estimator is refuted by that: the RPG's own SCIT average is
+//! available for free and is what the RPG itself used.
+//!
+//! **Native resolution is kept.** The RPG resamples to 1 km × 1° and 16 levels;
+//! the source products are 0.25 km with 254 levels, so the derived field has
+//! four times the range resolution and sixteen times the value resolution of
+//! the `N1S` it replaces. [`quantize_to_rpg_levels`] exists only so the
+//! validation test can compare like with like.
+//!
+//! # Accuracy
+//!
+//! Measured against the RPG's own product 56 over 597,500 gates from 18 sites
+//! on the upper three tilts: **90.6% of gates identical, 99.9% within one data
+//! level**, when each tilt is paired with its own volume's vector. Taking the
+//! vector from the newest `N0S` regardless of volume — what the application
+//! does — gives 79.7% / 99.8%. The residual is the RPG's undocumented
+//! resampling, which a zero-motion control (`KARX`, `KDLH`, `KGRB`, all
+//! 0.0 kt) shows is not a property of the storm-motion term.
+
+use nexrad_level3::model::{DataPacket, Level3Message, RadialPacket, RadialRun, StormMotion};
+
+/// Knots per metre per second.
+const MS_TO_KT: f64 = 1.0 / 0.514_444;
+
+/// Product codes carrying dealiased velocity that an SRM tilt can be derived
+/// from: 154 super-resolution (`N?G`, 0.5° radials) and 99 (`N?U`, 1°). Both
+/// encode 0.25 km gates and 254 levels of 0.5 m/s.
+pub const VELOCITY_PRODUCT_CODES: [i16; 2] = [154, 99];
+
+/// The AWIPS IDs rustdar fetches for storm-relative velocity, lowest tilt
+/// first: the RPG's own product for 0.5°, then dealiased velocity for the
+/// three tilts above it.
+///
+/// The bucket carries `N0G`/`N1G` but not `N2G`/`N3G`, and `N2U`/`N3U` but not
+/// `N0U`/`N1U` — verified by listing a full UTC day, 294 objects each for
+/// `TLX`, matching `N0S` exactly. **These are request keys, not elevations.**
+/// `N1G` is *not* 1.5°: in VCP 212 it is 1.3°, and the angle always comes from
+/// the fetched product's own Product Description Block.
+pub const SRM_TILT_PRODUCTS: [&str; 4] = ["N0S", "N1G", "N2U", "N3U"];
+
+/// Physical value per gate step in the derived packet, in knots. Finer than the
+/// 0.5 m/s (0.97 kt) the source products carry, so the requantisation adds no
+/// error of its own.
+const DERIVED_SCALE: f32 = 2.0;
+/// Gate value standing for 0 kt. Chosen so the representable range,
+/// `(2 - offset)/scale` upward, reaches -199 kt — far past any dealiased
+/// velocity plus any storm motion.
+const DERIVED_OFFSET: f32 = 400.0;
+
+/// Gate values 0 and 1 are "below threshold" and "range folded" in every
+/// product involved, and the renderer skips both.
+const NO_DATA: u16 = 0;
+const FIRST_DATA_GATE: u16 = 2;
+
+/// A storm-relative velocity field computed from a dealiased velocity product.
+#[derive(Debug, Clone)]
+pub struct DerivedSrm {
+    /// Gate values are storm-relative knots through
+    /// [`scale`](Self::scale)/[`offset`](Self::offset), in the same geometry as
+    /// the source product.
+    pub packet: RadialPacket,
+    /// `knots = (gate - offset) / scale`.
+    pub scale: f32,
+    /// See [`scale`](Self::scale).
+    pub offset: f32,
+    /// From the source product's PDB, never from its AWIPS mnemonic.
+    pub elevation_angle: f32,
+    /// From the source product's PDB. Identifies the cut within the volume;
+    /// split cuts and SAILS/MRLE repeats share an angle but not a number.
+    pub elevation_number: u16,
+    /// The vector applied.
+    pub motion: StormMotion,
+    /// Whether the vector came from the same volume scan as the velocity. The
+    /// RPG re-fits the SCIT average every volume; `false` costs about ten
+    /// points of exact-match agreement and one tenth of a point of
+    /// within-one-level agreement.
+    pub motion_volume_matches: bool,
+}
+
+/// Where a storm motion vector came from, and which volume it describes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StormMotionSample {
+    pub motion: StormMotion,
+    /// [`ProductDescriptionBlock::volume_key`] of the `N0S` it was read from.
+    ///
+    /// [`ProductDescriptionBlock::volume_key`]: nexrad_level3::model::ProductDescriptionBlock::volume_key
+    pub volume: (u16, u32),
+}
+
+impl StormMotionSample {
+    /// The vector an `N0S` product carries, or `None` for anything else.
+    pub fn from_message(msg: &Level3Message) -> Option<Self> {
+        Some(Self {
+            motion: msg.pdb.storm_motion()?,
+            volume: msg.pdb.volume_key(),
+        })
+    }
+
+    /// A vector the user typed in. It matches no volume, so a derived field
+    /// built from it never claims the RPG's provenance.
+    pub fn user_override(speed_kt: f32, direction_deg: f32) -> Self {
+        Self {
+            motion: StormMotion {
+                speed_kt,
+                direction_deg,
+                is_scit_average: false,
+            },
+            volume: (0, 0),
+        }
+    }
+}
+
+/// The first digital radial packet in a message's symbology.
+pub fn radial_packet(msg: &Level3Message) -> Option<&RadialPacket> {
+    msg.symbology.as_ref()?.layers.iter().find_map(|layer| {
+        layer.packets.iter().find_map(|pkt| match pkt {
+            DataPacket::DigitalRadial(rp) => Some(rp),
+            _ => None,
+        })
+    })
+}
+
+/// Whether `msg` is a dealiased velocity product an SRM tilt can be built from.
+pub fn is_velocity_source(msg: &Level3Message) -> bool {
+    VELOCITY_PRODUCT_CODES.contains(&msg.pdb.product_code)
+}
+
+/// Compute storm-relative velocity from a dealiased velocity product.
+///
+/// Returns `None` for anything that is not one of
+/// [`VELOCITY_PRODUCT_CODES`], or that carries no radial data — a caller
+/// holding an `N0S` must render it directly rather than derive from it.
+pub fn derive(velocity: &Level3Message, sample: &StormMotionSample) -> Option<DerivedSrm> {
+    if !is_velocity_source(velocity) {
+        return None;
+    }
+    let source = radial_packet(velocity)?;
+    if source.radials.is_empty() {
+        return None;
+    }
+
+    let pdb = &velocity.pdb;
+    let scale = pdb.data_scale();
+    let offset = pdb.data_offset();
+    let motion = sample.motion;
+
+    let radials = source
+        .radials
+        .iter()
+        .map(|run| {
+            // The packet records the leading edge of the radial; the correction
+            // belongs at its centre, which is also where the renderer places it.
+            let azimuth = run.start_angle as f64 + run.angle_delta as f64 / 2.0;
+            let component = motion.radial_component_kt(azimuth);
+            let gate_values = run
+                .gate_values
+                .iter()
+                .map(|&gate| {
+                    if gate < FIRST_DATA_GATE {
+                        return NO_DATA;
+                    }
+                    let v_kt = (gate as f32 - offset) as f64 / scale as f64 * MS_TO_KT;
+                    let derived = (v_kt + component) * DERIVED_SCALE as f64 + DERIVED_OFFSET as f64;
+                    derived.round().clamp(FIRST_DATA_GATE as f64, u16::MAX as f64) as u16
+                })
+                .collect();
+            RadialRun {
+                start_angle: run.start_angle,
+                angle_delta: run.angle_delta,
+                gate_values,
+            }
+        })
+        .collect();
+
+    // The packet's own scale factor halfword reads 999 for the 1 km product 56
+    // and the 0.25 km velocity products alike, so it is replaced rather than
+    // carried over — see `ProductDescriptionBlock::range_gate_km`.
+    let scale_factor = match pdb.range_gate_km() {
+        Some(km) if km > 0.0 => (1.0 / km) as f32,
+        _ => source.scale_factor,
+    };
+
+    Some(DerivedSrm {
+        packet: RadialPacket {
+            first_range_bin: source.first_range_bin,
+            num_range_bins: source.num_range_bins,
+            i_center: source.i_center,
+            j_center: source.j_center,
+            scale_factor,
+            is_legacy: false,
+            xdr_data_scale: None,
+            xdr_data_offset: None,
+            radials,
+        },
+        scale: DERIVED_SCALE,
+        offset: DERIVED_OFFSET,
+        elevation_angle: pdb.elevation_angle(),
+        elevation_number: pdb.elevation_number,
+        motion,
+        motion_volume_matches: sample.volume == pdb.volume_key(),
+    })
+}
+
+/// The 14 displayable levels of the RPG's legacy velocity products, in knots.
+/// Level `i` covers `[RPG_LEVEL_EDGES[i-2], RPG_LEVEL_EDGES[i-1])`; levels 0
+/// and 15 are "no data" and "range folded".
+///
+/// Transcribed from the data level thresholds of a real `N0S` — halfwords
+/// 31–46 decode to `-64, -50, -36, -26, -20, -10, -1, 0, 10, 20, 26, 36, 50,
+/// 64` — with the `-1`/`0` pair read as the single boundary at zero the AWIPS
+/// colour bar draws.
+pub const RPG_LEVEL_EDGES: [f32; 13] = [
+    -64.0, -50.0, -36.0, -26.0, -20.0, -10.0, 0.0, 10.0, 20.0, 26.0, 36.0, 50.0, 64.0,
+];
+
+/// Quantise storm-relative knots to the RPG's 16-level scale.
+///
+/// **Only for validating against `N1S`/`N2S`/`N3S`.** The shipped product keeps
+/// its 254 levels; chasing the RPG's legacy quantisation would throw away
+/// fifteen sixteenths of the value resolution to gain nothing.
+pub fn quantize_to_rpg_levels(knots: f32) -> u8 {
+    for (level, edge) in (1u8..).zip(RPG_LEVEL_EDGES) {
+        if knots < edge {
+            return level;
+        }
+    }
+    14
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexrad_level3::model::{
+        DataLayer, MessageHeader, ProductDescriptionBlock, SymbologyBlock,
+    };
+
+    fn header(code: i16) -> MessageHeader {
+        MessageHeader {
+            message_code: code,
+            date_of_message: 20661,
+            time_of_message: 7108,
+            message_length: 0,
+            source_id: 0,
+            destination_id: 0,
+            number_of_blocks: 3,
+        }
+    }
+
+    /// Halfwords 31–33 of a real `MPX_N1G`: -63.5 m/s minimum, 0.5 m/s
+    /// increment, 254 levels.
+    fn velocity_pdb(product_code: i16, elevation_tenths: i16, elevation_number: u16, volume: u32)
+        -> ProductDescriptionBlock
+    {
+        let mut thresholds = [0u16; 16];
+        thresholds[0] = -635i16 as u16;
+        thresholds[1] = 5;
+        thresholds[2] = 254;
+        ProductDescriptionBlock {
+            block_divider: -1,
+            latitude: 44.849,
+            longitude: -93.565,
+            height: 1000,
+            product_code,
+            operational_mode: 2,
+            vcp: 212,
+            sequence_number: 0,
+            volume_scan_number: 39,
+            volume_scan_date: 20661,
+            volume_scan_time: volume,
+            generation_date: 20661,
+            generation_time: volume,
+            product_specific_1: 0,
+            product_specific_2: 0,
+            elevation_number,
+            product_specific_3: elevation_tenths,
+            thresholds,
+            // Halfword 51 is the BZ2 compression flag on a digital product.
+            product_specific_47_53: [-93, 74, 0, 8097, 1, 13, 16382],
+            version: 0,
+            spot_blank: 0,
+            symbology_offset: 60,
+            graphic_offset: 0,
+            tabular_offset: 0,
+        }
+    }
+
+    /// Gate 129 is 0 m/s; each step is 0.5 m/s.
+    fn gate_for_ms(ms: f32) -> u16 {
+        (129.0 + ms / 0.5).round() as u16
+    }
+
+    fn message(pdb: ProductDescriptionBlock, radials: Vec<RadialRun>) -> Level3Message {
+        let code = pdb.product_code;
+        let num_range_bins = radials.iter().map(|r| r.gate_values.len()).max().unwrap_or(0) as u16;
+        Level3Message {
+            header: header(code),
+            pdb,
+            symbology: Some(SymbologyBlock {
+                block_id: 1,
+                block_length: 0,
+                num_layers: 1,
+                layers: vec![DataLayer {
+                    layer_length: 0,
+                    packets: vec![DataPacket::DigitalRadial(RadialPacket {
+                        first_range_bin: 0,
+                        num_range_bins,
+                        i_center: 0,
+                        j_center: 0,
+                        // What the RPG really writes: 999/1000, for a product
+                        // whose gates are 0.25 km.
+                        scale_factor: 0.999,
+                        is_legacy: false,
+                        xdr_data_scale: None,
+                        xdr_data_offset: None,
+                        radials,
+                    })],
+                }],
+            }),
+        }
+    }
+
+    /// One radial per listed azimuth, every gate at the same velocity.
+    fn uniform(product_code: i16, azimuths: &[f32], width: f32, ms: f32) -> Level3Message {
+        let radials = azimuths
+            .iter()
+            .map(|&a| RadialRun {
+                start_angle: a,
+                angle_delta: width,
+                gate_values: vec![gate_for_ms(ms); 4],
+            })
+            .collect();
+        message(velocity_pdb(product_code, 13, 9, 7108), radials)
+    }
+
+    fn sample(speed_kt: f32, direction_deg: f32, volume: u32) -> StormMotionSample {
+        StormMotionSample {
+            motion: StormMotion { speed_kt, direction_deg, is_scit_average: true },
+            volume: (20661, volume),
+        }
+    }
+
+    fn knots_at(d: &DerivedSrm, radial: usize, gate: usize) -> f32 {
+        (d.packet.radials[radial].gate_values[gate] as f32 - d.offset) / d.scale
+    }
+
+    /// The correction is `+speed·cos(direction − azimuth)`, in knots, on top of
+    /// a velocity the source stores in metres per second.
+    ///
+    /// The fixture is a *uniform* 10 m/s field, so every number below is the
+    /// storm-motion term plus a constant — a dropped conversion, a dropped
+    /// cosine or a flipped sign each move a different one.
+    #[test]
+    fn the_storm_motion_term_is_added_along_the_radial() {
+        // Radials at 0/90/180/270, each 1° wide, so their centres are at 0.5°,
+        // 90.5°, … — near enough to read the cardinal cosines off.
+        let msg = uniform(154, &[89.5, 179.5, 269.5, 359.5], 1.0, 10.0);
+        let d = derive(&msg, &sample(30.0, 90.0, 7108)).expect("154 is a velocity source");
+        let base: f32 = 10.0 * (1.0 / 0.514_444);
+        assert!((base - 19.438).abs() < 0.01, "10 m/s is 19.4 kt");
+
+        // Azimuth 90 points at the direction the storm comes from: full +30 kt.
+        assert!((knots_at(&d, 0, 0) - (base + 30.0)).abs() < 0.5, "az 090");
+        // Azimuth 270 is the reciprocal: full -30 kt.
+        assert!((knots_at(&d, 2, 0) - (base - 30.0)).abs() < 0.5, "az 270");
+        // Orthogonal radials keep the base velocity.
+        assert!((knots_at(&d, 1, 0) - base).abs() < 0.5, "az 180");
+        assert!((knots_at(&d, 3, 0) - base).abs() < 0.5, "az 000");
+    }
+
+    /// The base field must arrive in knots. A missing conversion leaves 10
+    /// where 19.4 belongs — a 48% error that no sign or index test sees,
+    /// because the storm-motion term is unaffected.
+    #[test]
+    fn the_source_velocity_is_converted_from_metres_per_second() {
+        let msg = uniform(99, &[0.0], 1.0, 25.0);
+        let d = derive(&msg, &sample(0.0, 0.0, 7108)).unwrap();
+        assert!((knots_at(&d, 0, 0) - 48.60).abs() < 0.3, "25 m/s is 48.6 kt");
+        assert!(knots_at(&d, 0, 0) > 30.0, "not left in metres per second");
+    }
+
+    /// A zero vector must leave the field alone: with no storm motion,
+    /// storm-relative velocity *is* base velocity. This is the control that
+    /// separates the conversion from the correction.
+    #[test]
+    fn a_zero_vector_reproduces_the_base_velocity() {
+        for ms in [-40.0f32, -12.5, 0.0, 7.5, 33.0] {
+            let msg = uniform(154, &[0.0, 137.0, 300.0], 0.5, ms);
+            let d = derive(&msg, &sample(0.0, 285.7, 7108)).unwrap();
+            for r in 0..3 {
+                let want = ms as f64 * MS_TO_KT;
+                assert!(
+                    (knots_at(&d, r, 0) as f64 - want).abs() < 0.3,
+                    "{ms} m/s radial {r}: got {}", knots_at(&d, r, 0),
+                );
+            }
+        }
+    }
+
+    /// The correction uses the radial's **centre**, matching where
+    /// `render_level3_radial_to_image` places the gate.
+    ///
+    /// Deliberately exaggerated geometry: at the 0.5° and 1° widths real
+    /// products carry, centre and leading edge differ by under 0.02 kt, so no
+    /// realistic fixture can tell them apart and one that tried would be
+    /// asserting on rounding. A 60°-wide radial makes the *convention*
+    /// observable, which is the thing that has to match the renderer.
+    #[test]
+    fn the_correction_uses_the_centre_of_the_radial_not_its_leading_edge() {
+        // Leading edge 60°, width 60° → centre 90°, which is the peak.
+        let msg = uniform(154, &[60.0], 60.0, 0.0);
+        let d = derive(&msg, &sample(40.0, 90.0, 7108)).unwrap();
+        assert!(
+            (knots_at(&d, 0, 0) - 40.0).abs() < 0.3,
+            "the centre is 090, the peak: got {}", knots_at(&d, 0, 0),
+        );
+        // The leading edge would give cos(30°) = 0.866 → 34.6 kt.
+        assert!(
+            (knots_at(&d, 0, 0) - 34.64).abs() > 1.0,
+            "the correction was taken at the leading edge",
+        );
+
+        // And the reverse pairing: a radial whose centre is the zero crossing
+        // but whose leading edge is not, so neither case passes by symmetry.
+        let msg = uniform(154, &[150.0], 60.0, 0.0);
+        let d2 = derive(&msg, &sample(40.0, 90.0, 7108)).unwrap();
+        assert!(
+            knots_at(&d2, 0, 0).abs() < 0.3,
+            "the centre is 180, the zero crossing: got {}", knots_at(&d2, 0, 0),
+        );
+    }
+
+    /// Below-threshold and range-folded gates stay below-threshold. Mapping
+    /// them through the arithmetic would paint the storm-motion field itself
+    /// across every gate the radar saw nothing in.
+    #[test]
+    fn gates_with_no_data_stay_empty() {
+        let radials = vec![RadialRun {
+            start_angle: 90.0,
+            angle_delta: 1.0,
+            gate_values: vec![0, 1, gate_for_ms(5.0), 0],
+        }];
+        let msg = message(velocity_pdb(99, 24, 5, 7108), radials);
+        let d = derive(&msg, &sample(35.0, 90.0, 7108)).unwrap();
+        let g = &d.packet.radials[0].gate_values;
+        assert_eq!(g[0], 0, "below threshold");
+        assert_eq!(g[1], 0, "range folded");
+        assert_eq!(g[3], 0);
+        assert!(g[2] > 1, "the gate that had data still does");
+    }
+
+    /// The gate spacing must come from the product code. The packet says 999,
+    /// which reads as ~1 km — four times too coarse for a 0.25 km product, and
+    /// the field would be drawn out to 1200 km.
+    #[test]
+    fn the_derived_packet_carries_quarter_kilometre_gates() {
+        for code in VELOCITY_PRODUCT_CODES {
+            let msg = uniform(code, &[0.0], 1.0, 0.0);
+            assert!(
+                (radial_packet(&msg).unwrap().gate_interval_km() - 1.001).abs() < 0.01,
+                "the fixture really does carry the RPG's misleading 999",
+            );
+            let d = derive(&msg, &sample(0.0, 0.0, 7108)).unwrap();
+            assert!(
+                (d.packet.gate_interval_km() - 0.25).abs() < 1e-9,
+                "product {code} gates are 0.25 km",
+            );
+        }
+    }
+
+    /// Elevation comes from the Product Description Block. `N1G` is 1.3° in
+    /// VCP 212, not the 1.5° its mnemonic suggests, and the two adjacent cuts
+    /// at one angle are told apart only by elevation number.
+    #[test]
+    fn elevation_comes_from_the_product_description_block() {
+        let msg = message(velocity_pdb(154, 13, 9, 7108), vec![RadialRun {
+            start_angle: 0.0,
+            angle_delta: 0.5,
+            gate_values: vec![gate_for_ms(0.0)],
+        }]);
+        let d = derive(&msg, &sample(0.0, 0.0, 7108)).unwrap();
+        assert_eq!(d.elevation_angle, 1.3, "not the mnemonic's nominal 1.5");
+        assert_eq!(d.elevation_number, 9, "the MRLE repeat, not cut 3");
+    }
+
+    /// Only dealiased velocity may be derived from. Handed the RPG's own
+    /// product 56 — which is already storm-relative — this must decline rather
+    /// than apply the correction a second time.
+    #[test]
+    fn an_already_storm_relative_product_is_not_a_source() {
+        for code in [56i16, 55, 94, 134, 135, 163, 176, 177] {
+            let msg = uniform(code, &[0.0], 1.0, 10.0);
+            assert!(derive(&msg, &sample(30.0, 90.0, 7108)).is_none(), "product {code}");
+        }
+        for code in VELOCITY_PRODUCT_CODES {
+            assert!(derive(&uniform(code, &[0.0], 1.0, 10.0), &sample(30.0, 90.0, 7108)).is_some());
+        }
+    }
+
+    /// A vector from another volume still produces a field — the alternative is
+    /// no upper tilts at all — but says so.
+    #[test]
+    fn a_vector_from_another_volume_is_used_and_flagged() {
+        let msg = uniform(99, &[0.0], 1.0, 10.0);
+        let matched = derive(&msg, &sample(20.0, 270.0, 7108)).unwrap();
+        let stale = derive(&msg, &sample(20.0, 270.0, 6952)).unwrap();
+        assert!(matched.motion_volume_matches);
+        assert!(!stale.motion_volume_matches);
+        // Same arithmetic either way: the flag is provenance, not a switch.
+        assert_eq!(
+            matched.packet.radials[0].gate_values,
+            stale.packet.radials[0].gate_values,
+        );
+    }
+
+    /// A hand-entered vector matches no volume and is never a SCIT average.
+    #[test]
+    fn a_user_override_claims_no_provenance() {
+        let s = StormMotionSample::user_override(45.0, 210.0);
+        assert!(!s.motion.is_scit_average);
+        let d = derive(&uniform(154, &[0.0], 0.5, 0.0), &s).unwrap();
+        assert!(!d.motion_volume_matches);
+        assert_eq!(d.motion.speed_kt, 45.0);
+        assert_eq!(d.motion.direction_deg, 210.0);
+    }
+
+    /// The four request keys, and the reason they are not `N0S`..`N3S`.
+    #[test]
+    fn the_tilt_products_are_one_srm_product_and_three_velocity_products() {
+        assert_eq!(SRM_TILT_PRODUCTS, ["N0S", "N1G", "N2U", "N3U"]);
+        for dead in ["N1S", "N2S", "N3S"] {
+            assert!(
+                !SRM_TILT_PRODUCTS.contains(&dead),
+                "{dead} has had no data written since 2020 (NWS SCN 22-96)",
+            );
+        }
+        // `N2G`/`N3G` and `N0U`/`N1U` are not in the bucket; asserted by name
+        // because swapping one in is the obvious thing to try.
+        for absent in ["N2G", "N3G", "N0U", "N1U"] {
+            assert!(!SRM_TILT_PRODUCTS.contains(&absent), "{absent} is not published");
+        }
+    }
+
+    /// The quantiser's bins, checked against the boundaries a real `N0S`
+    /// declares. Each edge is exercised from both sides — a `<=` for a `<`
+    /// moves every boundary gate by one level.
+    #[test]
+    fn the_rpg_level_bins_run_from_below_minus_64_to_above_64() {
+        assert_eq!(quantize_to_rpg_levels(-100.0), 1);
+        assert_eq!(quantize_to_rpg_levels(-64.1), 1);
+        assert_eq!(quantize_to_rpg_levels(-64.0), 2, "the edge belongs to the bin above");
+        assert_eq!(quantize_to_rpg_levels(-50.1), 2);
+        assert_eq!(quantize_to_rpg_levels(-50.0), 3);
+        assert_eq!(quantize_to_rpg_levels(-0.1), 7, "just negative");
+        assert_eq!(quantize_to_rpg_levels(0.0), 8, "zero reads positive");
+        assert_eq!(quantize_to_rpg_levels(9.9), 8);
+        assert_eq!(quantize_to_rpg_levels(10.0), 9);
+        assert_eq!(quantize_to_rpg_levels(63.9), 13);
+        assert_eq!(quantize_to_rpg_levels(64.0), 14);
+        assert_eq!(quantize_to_rpg_levels(200.0), 14);
+        // Monotone, and every one of the 14 levels reachable.
+        let mut seen = std::collections::BTreeSet::new();
+        let mut last = 0;
+        for i in -2000..2000 {
+            let l = quantize_to_rpg_levels(i as f32 / 10.0);
+            assert!(l >= last, "not monotone at {}", i as f32 / 10.0);
+            last = l;
+            seen.insert(l);
+        }
+        assert_eq!(seen.len(), 14, "reached {seen:?}");
+    }
+
+    /// The derived scale must not be coarser than the source's, or the
+    /// requantisation adds error of its own. 0.5 kt per step against the
+    /// source's 0.5 m/s (0.97 kt).
+    #[test]
+    fn the_derived_scale_is_finer_than_the_source_step() {
+        let source_step_kt = 0.5 * MS_TO_KT;
+        assert!(1.0 / DERIVED_SCALE as f64 <= source_step_kt);
+        // Round-tripping every source level must be exact to well under a step.
+        let msg = uniform(154, &[0.0], 0.5, 0.0);
+        for gate in 2u16..=255 {
+            let want = (gate as f64 - 129.0) * 0.5 * MS_TO_KT;
+            let radials = vec![RadialRun {
+                start_angle: 0.0,
+                angle_delta: 0.5,
+                gate_values: vec![gate],
+            }];
+            let m = message(msg.pdb.clone(), radials);
+            let d = derive(&m, &sample(0.0, 0.0, 7108)).unwrap();
+            assert!(
+                (knots_at(&d, 0, 0) as f64 - want).abs() <= 0.25,
+                "gate {gate}: {} vs {want}", knots_at(&d, 0, 0),
+            );
+        }
+    }
+}
+
+/// Agreement with the RPG's own `N1S`/`N2S`/`N3S`, measured against live data.
+///
+/// ```text
+/// cargo test -p rustdar-radar --lib -- --ignored --nocapture live_derived_srm
+/// ```
+///
+/// Those three products are unreachable from a browser but are still served to
+/// a dev machine by **tgftp**, which is fed by RPCCDS rather than by the
+/// NOAAPort broadcast that dropped them. That is the only place the answer this
+/// module reproduces still exists, and it disappears when tgftp is retired —
+/// which is why this lives in the repository rather than in a notebook.
+///
+/// The tgftp origin is deliberately **not** in [`crate::sources::DataSources`]:
+/// it sends no `Access-Control-Allow-Origin`, nothing shipped may reach for it,
+/// and `no_production_origin_is_one_the_browser_cannot_reach` enforces that.
+#[cfg(test)]
+mod live_validation {
+    use super::*;
+    use crate::level3::fetch_latest_product;
+    use crate::sources::DataSources;
+    use nexrad_level3::model::RadialPacket;
+
+    const TGFTP_SRM_DIR: &str = "https://tgftp.nws.noaa.gov/SL.us008001/DF.of/DC.radar/DS.56rm";
+
+    /// Sites are tried in order until enough tilts line up. tgftp's `sn.last`
+    /// and the bucket's newest key are frequently one volume apart, and a
+    /// comparison across volumes measures the weather rather than the maths.
+    const SITES: &[&str] = &["KMPX", "KTLX", "KFSD", "KBIS", "KOAX", "KUEX", "KABR", "KMRX"];
+
+    /// Level 0 is "no data" and 15 "range folded" in the RPG's product; neither
+    /// is a value this can be checked against.
+    const RPG_NO_DATA: u16 = 0;
+    const RPG_RANGE_FOLDED: u16 = 15;
+
+    /// Product 56's gates are 1.0 km. Its packet's scale-factor halfword reads
+    /// **999** — the same value the 0.25 km velocity products carry — so
+    /// [`RadialPacket::gate_interval_km`] answers 1.001 and the range binning
+    /// has drifted a whole gate by 230 km. Measured on `KMPX` tilt 2: 87.5%
+    /// exact at 1.001 against 97.3% at 1.0.
+    ///
+    /// Not folded into
+    /// [`ProductDescriptionBlock::range_gate_km`](nexrad_level3::model::ProductDescriptionBlock::range_gate_km):
+    /// the renderer does not consult that, so declaring it there would create a
+    /// value that is authoritative in one place and ignored in another. The
+    /// 0.1% it costs the shipped `N0S` render is 230 m at maximum range.
+    const RPG_SRM_GATE_KM: f64 = 1.0;
+
+    async fn tgftp_tilt(tilt: usize, site: &str) -> Option<Level3Message> {
+        let url = format!("{TGFTP_SRM_DIR}{tilt}/SI.{}/sn.last", site.to_lowercase());
+        let bytes = crate::archive::get_bytes(crate::archive::shared_client(), url)
+            .await
+            .ok()?;
+        nexrad_level3::decode::decode_product(&bytes).ok()
+    }
+
+    /// Which RPG radial each derived radial falls in, by centre azimuth.
+    /// Resolved through a tenth-of-a-degree table so a product whose radials do
+    /// not start on whole degrees still lands correctly.
+    fn azimuth_map(rpg: &RadialPacket) -> [Option<usize>; 3600] {
+        let mut slots = [None; 3600];
+        for (i, run) in rpg.radials.iter().enumerate() {
+            let start = (run.start_angle as f64 * 10.0).round() as i32;
+            let width = (run.angle_delta as f64 * 10.0).round().max(1.0) as i32;
+            for k in 0..width {
+                slots[(start + k).rem_euclid(3600) as usize] = Some(i);
+            }
+        }
+        slots
+    }
+
+    struct Tally {
+        n: usize,
+        exact: usize,
+        within_one: usize,
+    }
+
+    /// Resample the derived 0.25 km field onto the RPG's 1 km × 1° grid and
+    /// compare level for level.
+    ///
+    /// The RPG's recombination, established by measurement rather than from the
+    /// ICD, which does not document it:
+    ///
+    /// - **Along range** it keeps the largest-magnitude of the four sub-gates.
+    ///   Averaging instead costs 17 points of exact agreement. A velocity
+    ///   product that smoothed its couplets away would be useless, so this is
+    ///   also the physically sensible choice.
+    /// - **Across azimuth** it averages the two half-degree radials of a
+    ///   super-resolution product. Taking the larger instead costs 6 points and
+    ///   pushes `N1G` below the acceptance bar; this is what super-resolution
+    ///   *recombination* means. No-op for `N2U`/`N3U`, which are already 1°.
+    ///
+    /// Getting these backwards is the single largest term in the residual, and
+    /// mixing them up looks like an accuracy problem in the derivation itself.
+    fn compare(rpg: &Level3Message, derived: &DerivedSrm) -> Tally {
+        let rpg_packet = radial_packet(rpg).expect("the RPG product carries radials");
+        let derived_gate_km = derived.packet.gate_interval_km();
+        let levels = decode_rpg_levels(rpg);
+        let slots = azimuth_map(rpg_packet);
+
+        // Per RPG cell: the sum of each contributing radial's peak, and how
+        // many radials contributed — the azimuth mean of a range max.
+        let mut sums: Vec<Vec<(f64, u32)>> = rpg_packet
+            .radials
+            .iter()
+            .map(|r| vec![(0.0, 0); r.gate_values.len()])
+            .collect();
+
+        for run in &derived.packet.radials {
+            let centre = run.start_angle as f64 + run.angle_delta as f64 / 2.0;
+            let slot = ((centre * 10.0).round() as i32).rem_euclid(3600) as usize;
+            let Some(ri) = slots[slot] else { continue };
+            let mut peak: Vec<Option<f32>> = vec![None; sums[ri].len()];
+            for (j, &gate) in run.gate_values.iter().enumerate() {
+                if gate < FIRST_DATA_GATE {
+                    continue;
+                }
+                let range_km = (derived.packet.first_range_bin as f64 + j as f64) * derived_gate_km;
+                let bin =
+                    ((range_km / RPG_SRM_GATE_KM).floor() as i64) - rpg_packet.first_range_bin as i64;
+                if bin < 0 || bin as usize >= peak.len() {
+                    continue;
+                }
+                let knots = (gate as f32 - derived.offset) / derived.scale;
+                let cell = &mut peak[bin as usize];
+                if cell.is_none_or(|best: f32| knots.abs() > best.abs()) {
+                    *cell = Some(knots);
+                }
+            }
+            for (bin, value) in peak.iter().enumerate() {
+                if let Some(v) = value {
+                    sums[ri][bin].0 += *v as f64;
+                    sums[ri][bin].1 += 1;
+                }
+            }
+        }
+
+        let mut t = Tally { n: 0, exact: 0, within_one: 0 };
+        for (ri, run) in rpg_packet.radials.iter().enumerate() {
+            for (i, &level) in run.gate_values.iter().enumerate() {
+                if level == RPG_NO_DATA || level == RPG_RANGE_FOLDED {
+                    continue;
+                }
+                let (sum, count) = sums[ri][i];
+                if count == 0 {
+                    continue;
+                }
+                let knots = (sum / count as f64) as f32;
+                let diff = quantize_to_rpg_levels(knots) as i32 - level as i32;
+                t.n += 1;
+                t.exact += usize::from(diff == 0);
+                t.within_one += usize::from(diff.abs() <= 1);
+            }
+        }
+        // Nothing above depends on the fixture's own threshold table, but
+        // reading it proves the product really is the 14-level velocity scale
+        // `quantize_to_rpg_levels` was written against.
+        assert_eq!(levels, RPG_LEVEL_EDGES.len() + 1, "unexpected level count");
+        t
+    }
+
+    /// Count the displayable data levels a legacy product declares. Blank/ND/RF
+    /// levels carry the 0x80 flag in the high byte of their threshold halfword.
+    fn decode_rpg_levels(msg: &Level3Message) -> usize {
+        msg.pdb
+            .thresholds
+            .iter()
+            .filter(|t| (*t >> 8) as u8 & 0x80 == 0)
+            .count()
+    }
+
+    #[ignore = "hits the live S3 bucket and tgftp"]
+    #[tokio::test]
+    async fn live_derived_srm_agrees_with_the_rpgs_upper_tilts() {
+        let sources = DataSources::production();
+        let now = chrono::Utc::now().naive_utc();
+        let mut total = Tally { n: 0, exact: 0, within_one: 0 };
+        let mut compared_tilts = 0;
+
+        for &site in SITES {
+            let Ok(n0s) = fetch_latest_product(&sources, site, SRM_TILT_PRODUCTS[0], now).await
+            else {
+                println!("{site}: no N0S");
+                continue;
+            };
+            let Some(sample) = StormMotionSample::from_message(&n0s.message) else {
+                println!("{site}: N0S carries no vector");
+                continue;
+            };
+            println!(
+                "{site}: vector {:.1} kt from {:.1}° (scit={})",
+                sample.motion.speed_kt, sample.motion.direction_deg, sample.motion.is_scit_average,
+            );
+
+            // Skips the lowest tilt: `N0S` is fetched, not derived, so
+            // comparing it against tgftp would test the bucket, not this code.
+            for (tilt, &code) in SRM_TILT_PRODUCTS.iter().enumerate().skip(1) {
+                let Ok(velocity) = fetch_latest_product(&sources, site, code, now).await else {
+                    println!("  tilt {tilt} ({code}): not in the bucket");
+                    continue;
+                };
+                let Some(rpg) = tgftp_tilt(tilt, site).await else {
+                    println!("  tilt {tilt}: tgftp N{tilt}S unavailable");
+                    continue;
+                };
+                // A comparison across volumes or across cuts measures the
+                // weather moving, not the derivation.
+                if rpg.pdb.volume_key() != velocity.message.pdb.volume_key()
+                    || rpg.pdb.elevation_number != velocity.message.pdb.elevation_number
+                {
+                    println!(
+                        "  tilt {tilt}: skipped — RPG vol {:?} cut {} vs {code} vol {:?} cut {}",
+                        rpg.pdb.volume_key(),
+                        rpg.pdb.elevation_number,
+                        velocity.message.pdb.volume_key(),
+                        velocity.message.pdb.elevation_number,
+                    );
+                    continue;
+                }
+                let derived = srm_derive_or_panic(&velocity.message, &sample, code);
+                let t = compare(&rpg, &derived);
+                if t.n == 0 {
+                    println!("  tilt {tilt}: no overlapping gates");
+                    continue;
+                }
+                println!(
+                    "  tilt {tilt} ({code}, {:.1}°, cut {}): n={} exact={:.1}% within1={:.1}%",
+                    derived.elevation_angle,
+                    derived.elevation_number,
+                    t.n,
+                    100.0 * t.exact as f64 / t.n as f64,
+                    100.0 * t.within_one as f64 / t.n as f64,
+                );
+                total.n += t.n;
+                total.exact += t.exact;
+                total.within_one += t.within_one;
+                compared_tilts += 1;
+            }
+            if compared_tilts >= 3 {
+                break;
+            }
+        }
+
+        assert!(
+            compared_tilts > 0 && total.n > 10_000,
+            "no upper tilt could be aligned to a common volume ({compared_tilts} tilts, \
+             {} gates). This test cannot pass vacuously — re-run; tgftp's sn.last and the \
+             bucket's newest key drift by a volume scan.",
+            total.n,
+        );
+        let exact = 100.0 * total.exact as f64 / total.n as f64;
+        let within_one = 100.0 * total.within_one as f64 / total.n as f64;
+        println!("TOTAL over {compared_tilts} tilts: n={} exact={exact:.1}% within1={within_one:.1}%", total.n);
+        assert!(
+            within_one >= 99.0,
+            "derived SRM agrees within one data level on {within_one:.2}% of {} gates; \
+             the bar is 99%",
+            total.n,
+        );
+    }
+
+    fn srm_derive_or_panic(
+        velocity: &Level3Message,
+        sample: &StormMotionSample,
+        code: &str,
+    ) -> DerivedSrm {
+        derive(velocity, sample).unwrap_or_else(|| {
+            panic!(
+                "{code} decoded as product {} with {} radials and could not be derived from",
+                velocity.pdb.product_code,
+                radial_packet(velocity).map_or(0, |p| p.radials.len()),
+            )
+        })
+    }
+}
