@@ -29,13 +29,53 @@
 //!
 //! # Accuracy
 //!
-//! Measured against the RPG's own product 56 over 597,500 gates from 18 sites
-//! on the upper three tilts: **90.6% of gates identical, 99.9% within one data
-//! level**, when each tilt is paired with its own volume's vector. Taking the
-//! vector from the newest `N0S` regardless of volume — what the application
-//! does — gives 79.7% / 99.8%. The residual is the RPG's undocumented
-//! resampling, which a zero-motion control (`KARX`, `KDLH`, `KGRB`, all
-//! 0.0 kt) shows is not a property of the storm-motion term.
+//! Measured against the RPG's own product 56 over **753,698 gates from 19
+//! sites** on the upper three tilts, each paired with its own volume's vector:
+//! **91.5% of gates identical, 99.95% within one data level**.
+//! [`live_validation`] reproduces this against live data and reported 92.3% /
+//! 99.85% on 154,390 gates the last time it was run.
+//!
+//! ## Where the residual comes from
+//!
+//! Four of the nineteen sites had a 0.0 kt vector, which makes the correction
+//! identically zero and isolates the conversion and the comparison's resampler
+//! from the storm-motion term. Compared **tilt for tilt**, so the split is not
+//! confounded with tilt mix:
+//!
+//! ```text
+//! tilt   zero vector          nonzero vector
+//!   1    98.6% / 100.0%       90.3% / 99.9%
+//!   2    99.1% / 100.0%       90.4% / 99.9%
+//!   3    99.2% / 100.0%       89.6% / 100.0%
+//! ```
+//!
+//! So roughly **one** point of disagreement survives with no vector at all —
+//! that part is the RPG's undocumented resampling — and roughly **eight more
+//! appear only when a vector is applied**. Part of the residual therefore *is*
+//! a property of the storm-motion term, most likely where in the RPG's
+//! resampling chain it applies the vector, or what precision it applies it at.
+//! Do not read the zero-motion control as absolving the correction; it does the
+//! opposite. Within one data level holds at ≥99.9% in every cell either way,
+//! which is the criterion this has to meet.
+//!
+//! The agreement figure is an **upper bound rather than an independent
+//! validation**: one of the comparison's two resampling knobs was chosen
+//! because it scored better against this same oracle. See
+//! [`live_validation::compare`].
+//!
+//! ## Volume pairing
+//!
+//! All four tilts of a volume share one vector, and the RPG re-fits the SCIT
+//! average every volume. Only `N0S` carries one, so a velocity product from the
+//! next volume gets a vector one volume stale, which costs about twelve points
+//! of exact agreement — 79.9% against 92.3% over the same gates in the run
+//! above — while within one data level barely moves, 99.81% against 99.85%.
+//!
+//! That is the **worst** case, not the usual one: in the bucket the four keys
+//! normally carry the identical timestamp and rustdar refetches all four
+//! together, so this is a race at a volume boundary rather than the steady
+//! state. [`DerivedSrm::motion_volume_matches`] records when it happens. A
+//! per-volume vector history was considered and rejected as solving a transient.
 
 use nexrad_level3::model::{DataPacket, Level3Message, RadialPacket, RadialRun, StormMotion};
 
@@ -62,10 +102,24 @@ pub const SRM_TILT_PRODUCTS: [&str; 4] = ["N0S", "N1G", "N2U", "N3U"];
 /// 0.5 m/s (0.97 kt) the source products carry, so the requantisation adds no
 /// error of its own.
 const DERIVED_SCALE: f32 = 2.0;
-/// Gate value standing for 0 kt. Chosen so the representable range,
-/// `(2 - offset)/scale` upward, reaches -199 kt — far past any dealiased
-/// velocity plus any storm motion.
-const DERIVED_OFFSET: f32 = 400.0;
+
+/// Gate value standing for 0 kt, so the representable range is
+/// `(2 - offset)/scale` upward: **-499 kt to +32,267 kt**.
+///
+/// Sized against the worst case that can actually reach here, not against
+/// meteorology: the source products floor at -63.5 m/s (-123.4 kt) and the
+/// settings dialog admits up to [`MAX_OVERRIDE_SPEED_KT`] of storm motion, for
+/// -323.4 kt. Below the floor the gate value would clamp, and a clamped gate
+/// is still ≥ 2, so it paints as data rather than dropping out — which is why
+/// the range has to cover the input rather than merely be "generous".
+const DERIVED_OFFSET: f32 = 1000.0;
+
+/// Largest storm motion the settings dialog admits, in knots. Lives here
+/// because [`DERIVED_OFFSET`] is sized from it; the widget reads it.
+///
+/// Well past anything meteorological — the fastest observed storm motions are
+/// around 70 kt — but the encoding must survive whatever the widget permits.
+pub const MAX_OVERRIDE_SPEED_KT: f32 = 200.0;
 
 /// Gate values 0 and 1 are "below threshold" and "range folded" in every
 /// product involved, and the renderer skips both.
@@ -589,6 +643,41 @@ mod tests {
         assert_eq!(seen.len(), 14, "reached {seen:?}");
     }
 
+    /// The worst case the settings dialog admits must survive the encoding.
+    ///
+    /// A clamped gate is still ≥ 2, so saturation does not drop out — it paints
+    /// at the clamp, which reads as a real -199 kt inbound rather than as
+    /// missing data. The encoding therefore has to cover the input range, and
+    /// the input range is set by the widget, not by meteorology.
+    #[test]
+    fn the_largest_vector_the_ui_permits_cannot_saturate_the_encoding() {
+        // The radial centre is 90.0°, so a vector from 270° subtracts its full
+        // speed and one from 090° adds it. Gate 2 is the source's floor
+        // (-63.5 m/s = -123.4 kt), gate 255 its ceiling (+63.0 m/s = +122.4 kt).
+        for (gate, direction, want) in [
+            (2u16, 270.0f32, -123.4 - MAX_OVERRIDE_SPEED_KT as f64),
+            (255, 90.0, 122.4 + MAX_OVERRIDE_SPEED_KT as f64),
+        ] {
+            let radials = vec![RadialRun {
+                start_angle: 89.5,
+                angle_delta: 1.0,
+                gate_values: vec![gate],
+            }];
+            let msg = message(velocity_pdb(154, 13, 9, 7108), radials);
+            let s = StormMotionSample::user_override(MAX_OVERRIDE_SPEED_KT, direction);
+            let d = derive(&msg, &s).expect("154 is a velocity source");
+            let raw = d.packet.radials[0].gate_values[0];
+            assert!(raw > FIRST_DATA_GATE, "gate {gate} clamped to the floor");
+            assert!(raw < u16::MAX, "gate {gate} clamped to the ceiling");
+            // The value must come back intact, not at the clamp.
+            let got = knots_at(&d, 0, 0) as f64;
+            assert!(
+                (got - want).abs() < 1.0,
+                "gate {gate} from {direction}°: got {got:.1} kt, want {want:.1} kt",
+            );
+        }
+    }
+
     /// The derived scale must not be coarser than the source's, or the
     /// requantisation adds error of its own. 0.5 kt per step against the
     /// source's 0.5 m/s (0.97 kt).
@@ -639,21 +728,33 @@ mod live_validation {
 
     const TGFTP_SRM_DIR: &str = "https://tgftp.nws.noaa.gov/SL.us008001/DF.of/DC.radar/DS.56rm";
 
-    /// Sites are tried in order until enough tilts line up. tgftp's `sn.last`
-    /// and the bucket's newest key are frequently one volume apart, and a
-    /// comparison across volumes measures the weather rather than the maths.
-    const SITES: &[&str] = &["KMPX", "KTLX", "KFSD", "KBIS", "KOAX", "KUEX", "KABR", "KMRX"];
+    /// Sites are tried in order until enough tilts line up **with a nonzero
+    /// vector**. Two things make a site unusable, and both are common:
+    /// tgftp's `sn.last` and the bucket's newest key are frequently one volume
+    /// apart, and a quiet site reports 0.0 kt, which zeroes the very term this
+    /// is validating. Long and geographically spread so a calm night over any
+    /// one region does not starve the sample.
+    const SITES: &[&str] = &[
+        "KMPX", "KFSD", "KBIS", "KOAX", "KUEX", "KABR", "KTLX", "KMRX", "KTLH", "KMOB", "KSGF",
+        "KPAH", "KMLB", "KMTX", "KSFX", "KMVX", "KLZK", "KSHV", "KEAX", "KDDC", "KAMA", "KFWS",
+    ];
 
     /// Level 0 is "no data" and 15 "range folded" in the RPG's product; neither
     /// is a value this can be checked against.
     const RPG_NO_DATA: u16 = 0;
     const RPG_RANGE_FOLDED: u16 = 15;
 
-    /// Product 56's gates are 1.0 km. Its packet's scale-factor halfword reads
-    /// **999** — the same value the 0.25 km velocity products carry — so
+    /// Product 56's gates are 1.0 km — 230 bins over the 230 km the product is
+    /// documented at. Its packet's scale-factor halfword reads **999**, the
+    /// same value the 0.25 km velocity products carry, so
     /// [`RadialPacket::gate_interval_km`] answers 1.001 and the range binning
     /// has drifted a whole gate by 230 km. Measured on `KMPX` tilt 2: 87.5%
     /// exact at 1.001 against 97.3% at 1.0.
+    ///
+    /// That measurement shows the halfword is not a gate spacing; it does
+    /// **not** show which misreading it is. 0.999 and 1/0.999 sit either side
+    /// of 1.0 by the same 0.1%, so agreement cannot tell them apart. The
+    /// distinction is numerically irrelevant here and is not claimed.
     ///
     /// Not folded into
     /// [`ProductDescriptionBlock::range_gate_km`](nexrad_level3::model::ProductDescriptionBlock::range_gate_km):
@@ -694,20 +795,27 @@ mod live_validation {
     /// Resample the derived 0.25 km field onto the RPG's 1 km × 1° grid and
     /// compare level for level.
     ///
-    /// The RPG's recombination, established by measurement rather than from the
-    /// ICD, which does not document it:
+    /// The ICD does not document the RPG's recombination, so both knobs below
+    /// were set by trying variants against this same oracle. **They are not
+    /// equally well founded, and the difference matters for how much the
+    /// agreement figure is worth:**
     ///
-    /// - **Along range** it keeps the largest-magnitude of the four sub-gates.
-    ///   Averaging instead costs 17 points of exact agreement. A velocity
-    ///   product that smoothed its couplets away would be useless, so this is
-    ///   also the physically sensible choice.
-    /// - **Across azimuth** it averages the two half-degree radials of a
+    /// - **Along range**, keep the largest-magnitude of the four sub-gates.
+    ///   Averaging instead costs 17 points of exact agreement — but this one
+    ///   also has an argument independent of the score: a velocity product that
+    ///   smoothed its couplets away would be useless, so preserving the peak is
+    ///   what the RPG must be doing.
+    /// - **Across azimuth**, average the two half-degree radials of a
     ///   super-resolution product. Taking the larger instead costs 6 points and
-    ///   pushes `N1G` below the acceptance bar; this is what super-resolution
-    ///   *recombination* means. No-op for `N2U`/`N3U`, which are already 1°.
+    ///   pushes `N1G` below the acceptance bar. **This one was chosen because it
+    ///   scored better and for no other reason** — "recombination" is a
+    ///   plausible story, not evidence. No-op for `N2U`/`N3U`, already 1°.
     ///
-    /// Getting these backwards is the single largest term in the residual, and
-    /// mixing them up looks like an accuracy problem in the derivation itself.
+    /// One parameter fitted to the oracle makes the resulting agreement an
+    /// **upper bound, not an independent validation**. It is `#[cfg(test)]`-only
+    /// and within-one-level was 99.0% before the azimuth knob was tuned, so the
+    /// acceptance criterion does not rest on the fit — but the exact-match
+    /// percentage partly does.
     fn compare(rpg: &Level3Message, derived: &DerivedSrm) -> Tally {
         let rpg_packet = radial_packet(rpg).expect("the RPG product carries radials");
         let derived_gate_km = derived.packet.gate_interval_km();
@@ -731,9 +839,15 @@ mod live_validation {
                 if gate < FIRST_DATA_GATE {
                     continue;
                 }
-                let range_km = (derived.packet.first_range_bin as f64 + j as f64) * derived_gate_km;
+                // The gate's centre, matching what `first_gate_range_km` and
+                // the renderer mean by a gate's range. Using the near edge
+                // instead happens to bin identically while 0.25 divides 1.0
+                // exactly, but it is the wrong quantity and would drift the
+                // moment either spacing changed.
+                let centre_km =
+                    (derived.packet.first_range_bin as f64 + j as f64 + 0.5) * derived_gate_km;
                 let bin =
-                    ((range_km / RPG_SRM_GATE_KM).floor() as i64) - rpg_packet.first_range_bin as i64;
+                    ((centre_km / RPG_SRM_GATE_KM).floor() as i64) - rpg_packet.first_range_bin as i64;
                 if bin < 0 || bin as usize >= peak.len() {
                     continue;
                 }
@@ -790,8 +904,20 @@ mod live_validation {
     async fn live_derived_srm_agrees_with_the_rpgs_upper_tilts() {
         let sources = DataSources::production();
         let now = chrono::Utc::now().naive_utc();
-        let mut total = Tally { n: 0, exact: 0, within_one: 0 };
-        let mut compared_tilts = 0;
+        // Kept apart because a zero vector makes the correction identically
+        // zero: those gates exercise the m/s→kt conversion and the resampler,
+        // and nothing whatever about the sign, magnitude or azimuth convention
+        // of the storm-motion term. Pooling them lets a run over quiet sites
+        // report a high number while testing none of what this module is for.
+        let mut moving = Tally { n: 0, exact: 0, within_one: 0 };
+        let mut still = Tally { n: 0, exact: 0, within_one: 0 };
+        // The same gates, but with each tilt paired to its own volume's vector
+        // — taken from the RPG product being compared against, which carries
+        // it. Not reachable in production, where only `N0S` has a vector; it
+        // separates the derivation's own error from the cost of pairing across
+        // a volume boundary, and it is the figure the module doc quotes.
+        let mut matched = Tally { n: 0, exact: 0, within_one: 0 };
+        let mut moving_tilts = 0;
 
         for &site in SITES {
             let Ok(n0s) = fetch_latest_product(&sources, site, SRM_TILT_PRODUCTS[0], now).await
@@ -839,39 +965,72 @@ mod live_validation {
                     println!("  tilt {tilt}: no overlapping gates");
                     continue;
                 }
+                let is_moving = sample.motion.speed_kt != 0.0;
                 println!(
-                    "  tilt {tilt} ({code}, {:.1}°, cut {}): n={} exact={:.1}% within1={:.1}%",
+                    "  tilt {tilt} ({code}, {:.1}°, cut {}, {}): n={} exact={:.1}% within1={:.1}%",
                     derived.elevation_angle,
                     derived.elevation_number,
+                    if is_moving { "moving" } else { "ZERO VECTOR" },
                     t.n,
                     100.0 * t.exact as f64 / t.n as f64,
                     100.0 * t.within_one as f64 / t.n as f64,
                 );
-                total.n += t.n;
-                total.exact += t.exact;
-                total.within_one += t.within_one;
-                compared_tilts += 1;
+                let bucket = if is_moving { &mut moving } else { &mut still };
+                bucket.n += t.n;
+                bucket.exact += t.exact;
+                bucket.within_one += t.within_one;
+                if is_moving {
+                    moving_tilts += 1;
+                    // Same gates, this tilt's own volume's vector.
+                    if let Some(own) = StormMotionSample::from_message(&rpg) {
+                        let m = compare(&rpg, &srm_derive_or_panic(&velocity.message, &own, code));
+                        matched.n += m.n;
+                        matched.exact += m.exact;
+                        matched.within_one += m.within_one;
+                    }
+                }
             }
-            if compared_tilts >= 3 {
+            // Counts only tilts that carried a vector, so a run whose first
+            // sites are quiet keeps going instead of stopping satisfied.
+            if moving_tilts >= 3 {
                 break;
             }
         }
 
+        for (label, t) in [
+            ("nonzero vector, from N0S (production path)", &moving),
+            ("nonzero vector, own volume's vector", &matched),
+            ("zero vector (correction is identically zero)", &still),
+        ] {
+            if t.n == 0 {
+                println!("{label}: none");
+                continue;
+            }
+            println!(
+                "{label}: n={} exact={:.1}% within1={:.2}%",
+                t.n,
+                100.0 * t.exact as f64 / t.n as f64,
+                100.0 * t.within_one as f64 / t.n as f64,
+            );
+        }
+
+        // The gates that actually exercise the correction. Without this floor
+        // the test passes on quiet sites alone, where the storm-motion term is
+        // multiplied by zero and could be arbitrarily wrong.
         assert!(
-            compared_tilts > 0 && total.n > 10_000,
-            "no upper tilt could be aligned to a common volume ({compared_tilts} tilts, \
-             {} gates). This test cannot pass vacuously — re-run; tgftp's sn.last and the \
-             bucket's newest key drift by a volume scan.",
-            total.n,
+            moving_tilts > 0 && moving.n > 10_000,
+            "only {} gates over {moving_tilts} tilts carried a nonzero storm motion vector. \
+             A zero vector makes the correction identically zero, so this run tested the \
+             conversion and the resampler and nothing else. Re-run — tgftp's sn.last and \
+             the bucket's newest key drift by a volume scan, and quiet sites have no vector.",
+            moving.n,
         );
-        let exact = 100.0 * total.exact as f64 / total.n as f64;
-        let within_one = 100.0 * total.within_one as f64 / total.n as f64;
-        println!("TOTAL over {compared_tilts} tilts: n={} exact={exact:.1}% within1={within_one:.1}%", total.n);
+        let within_one = 100.0 * moving.within_one as f64 / moving.n as f64;
         assert!(
             within_one >= 99.0,
-            "derived SRM agrees within one data level on {within_one:.2}% of {} gates; \
-             the bar is 99%",
-            total.n,
+            "with a nonzero vector applied, derived SRM agrees within one data level on \
+             {within_one:.2}% of {} gates; the bar is 99%",
+            moving.n,
         );
     }
 
