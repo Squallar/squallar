@@ -1,14 +1,27 @@
 //! Storm-relative mean velocity, derived from Level III **dealiased** velocity.
 //!
-//! Only the lowest SRM tilt is still published. NWS SCN 22-96 dropped
-//! `N1S`/`N2S`/`N3S` from the NOAAPort broadcast in 2022, and every CORS-clean
-//! source is NOAAPort-derived: `unidata-nexrad-level3` last wrote to those three
-//! keys in 2020, while `N0S` runs 294 objects a day. THREDDS, GCS, IEM, COD and
-//! NCEI were all checked. So the upper tilts are computed here instead:
+//! Every tilt is computed here, 0.5° included:
 //!
 //! ```text
 //! SRM_kt = V_kt + speed · cos(direction − azimuth)
 //! ```
+//!
+//! Only the lowest SRM *product* is still published. NWS SCN 22-96 dropped
+//! `N1S`/`N2S`/`N3S` from the NOAAPort broadcast in 2022, and every CORS-clean
+//! source is NOAAPort-derived: `unidata-nexrad-level3` last wrote to those three
+//! keys in 2020, while `N0S` runs 294 objects a day. THREDDS, GCS, IEM, COD and
+//! NCEI were all checked. `N0S` is still fetched — see
+//! [`STORM_MOTION_PRODUCT`] — but for its vector alone; it is no longer drawn.
+//!
+//! **Deriving 0.5° rather than rendering `N0S`** is what makes the four panes
+//! one thing rather than two. `N0S` is 1 km at the RPG's 16 display levels
+//! while the derived tilts are 0.25 km at 254, so a rendered `N0S` was visibly
+//! coarser than the three tilts above it; and its gate values already have the
+//! RPG's own vector baked in, so it was also the one tilt a storm motion
+//! override could not reach. `N0G` is the same product 154 as `N1G` at the same
+//! 0.5° cut — verified at `TLX`: product code 154, 0.5°, 1200 bins of 0.25 km
+//! over 720 half-degree radials, minimum -63.5 m/s in steps of 0.5 over 254
+//! levels, byte for byte the shape `N1G` has.
 //!
 //! **From Level III, never Level II.** L2 velocity is aliased and
 //! `nexrad-decode` has no dealiasing; the errors would be 2×Nyquist — 50–70 kt
@@ -19,73 +32,94 @@
 //! Description Block, halfwords 51 and 52; see
 //! [`nexrad_level3::model::ProductDescriptionBlock::storm_motion`]. Bunkers and
 //! every other estimator is refuted by that: the RPG's own SCIT average is
-//! available for free and is what the RPG itself used.
+//! available for free and is what the RPG itself used. No velocity product can
+//! supply it — halfword 51 is the BZ2 compression flag on every digital
+//! product, and `N0G` carries a 1 there like the rest, which reads as "0.1 kt".
 //!
 //! **Native resolution is kept.** The RPG resamples to 1 km × 1° and 16 levels;
-//! the source products are 0.25 km with 254 levels, so the derived field has
+//! the source products are 0.25 km with 254 levels, so every derived tilt has
 //! four times the range resolution and sixteen times the value resolution of
-//! the `N1S` it replaces. [`quantize_to_rpg_levels`] exists only so the
+//! the `N?S` it replaces. [`quantize_to_rpg_levels`] exists only so the
 //! validation test can compare like with like.
 //!
 //! # Accuracy
 //!
-//! Measured against the RPG's own product 56 over **432,187 gates from 19
-//! sites** on tilts 2 and 3, each paired with its own volume's vector:
-//! **91.1% of gates identical, 99.96% within one data level**.
+//! Measured by [`live_validation`], which fetches exactly what production
+//! fetches and pairs every velocity product with its own volume's vector.
+//! Across two volumes at each of thirteen sites carrying a nonzero vector, on
+//! 2026-07-26 — 23 site-volumes per tilt, `KSFX` and `KBIS` excluded as
+//! quarantined, range over site-volumes rather than a pooled average:
 //!
-//! Tilts 2 and 3 only, because that sweep compared against product 99 and
-//! production fetches product 99 for exactly those two. Tilt 1 ships `N1G`,
-//! which is product **154** at 0.5° radials and needs an azimuth recombination
-//! the others do not; measuring it against product 99 flatters it by several
-//! points. `N1G` is covered by [`live_validation`], which fetches what
-//! production fetches, and reported 92.3% / 99.85% on 154,390 gates across all
-//! three tilts the last time it was run.
+//! ```text
+//! tilt         product   exact         within one level
+//!  0.5°  N0G   154       76.1-91.0%    99.10-99.80%
+//!  1.3°  N1G   154       77.3-90.1%    98.94-99.87%
+//!  2.4°  N2U    99       82.2-98.8%    99.90-99.99%
+//!  3.1°  N3U    99       80.7-98.6%    99.91-100.00%
+//! ```
+//!
+//! Only the 0.5° column and the four-tilt site total are asserted on; a single
+//! upper tilt is allowed to dip, as `N1G` does at `KABR`, provided the site
+//! total holds. The quarantined pair measured 95.2-95.6% (`KSFX`, 0.5°, and it
+//! misses at every tilt) and 98.18-98.40% (`KBIS`, 0.5° only).
+//!
+//! **The 0.5° tilt is the strongest of the four measurements**, not the
+//! weakest, however the percentages read: its oracle is `N0S`, the product
+//! rustdar itself rendered until this derivation replaced it, and it is still
+//! being written. The upper three are checked against `N1S`/`N2S`/`N3S`, which
+//! tgftp still serves but which the NOAAPort feed dropped in 2022. So tilt 0
+//! compares the new answer against the old one directly.
 //!
 //! ## Where the residual comes from
 //!
+//! Almost all of it is the comparison's resampler, not the derivation. The
+//! ranking above is the tell: `N2U`/`N3U` are already 1°, so only the range
+//! step of [`live_validation::compare`] runs on them and they agree to
+//! 99.9%+; `N0G`/`N1G` are half-degree and need the azimuth step as well,
+//! and they are the two that fall short. It gets worse as the tilt gets
+//! lower, where azimuthal gradients are sharpest.
+//!
 //! Some sites report a 0.0 kt vector, which makes the correction identically
-//! zero and isolates the conversion and the comparison's resampler from the
-//! storm-motion term. Compared **tilt for tilt**, so the split is not
-//! confounded with tilt mix, and on the same product-99 sweep:
+//! zero and isolates the conversion and the resampler from the storm-motion
+//! term. Those sites are measured and printed but never asserted on, and on
+//! the run above they scored 89.9% / 99.40% over 977,025 gates — squarely
+//! inside the spread of the sites that do carry a vector. **Do not read that
+//! as absolving the correction**: it says the resampler alone accounts for
+//! most of the disagreement, not that the correction is free.
 //!
-//! ```text
-//! tilt   zero vector          nonzero vector
-//!   2    99.1% / 100.00%      90.4% / 99.94%
-//!   3    99.2% / 100.00%      89.6% / 99.96%
-//! ```
+//! **This does not hold everywhere.** `KSFX` misses the bar at every tilt and
+//! `KBIS` misses it at 0.5° alone; nobody knows why for either. See
+//! [`live_validation::QUARANTINED`], which records the numbers and what has
+//! been ruled out. The claim this module can support is that the bar is met at
+//! every site the shipped test asserts on — not that it is met at every site.
 //!
-//! So roughly **one** point of disagreement survives with no vector at all —
-//! that part is the RPG's undocumented resampling — and roughly **nine more
-//! appear only when a vector is applied**. Part of the residual therefore *is*
-//! a property of the storm-motion term, most likely where in the RPG's
-//! resampling chain it applies the vector, or what precision it applies it at.
-//! Do not read the zero-motion control as absolving the correction; it does the
-//! opposite.
-//!
-//! **This does not hold everywhere.** `KSFX` misses the acceptance bar outright
-//! and nobody knows why; see [`live_validation::QUARANTINED`], which records the
-//! numbers and what has been ruled out. The claim this module can support is
-//! that the bar is met at every site the shipped test asserts on — not that it
-//! is met at every site.
-//!
-//! The agreement figure is an **upper bound rather than an independent
-//! validation**: one of the comparison's two resampling knobs was chosen
-//! because it scored better against this same oracle. See
-//! [`live_validation::compare`].
+//! The agreement figure is still a **reconstruction of an undocumented step**
+//! rather than an independent validation, because the resampler that produces
+//! it was built against this same oracle. Its ordering now has an argument that
+//! does not appeal to the score — see [`live_validation::compare`] — but treat
+//! exact-match as indicative and within-one-level as the criterion.
 //!
 //! ## Volume pairing
 //!
 //! All four tilts of a volume share one vector, and the RPG re-fits the SCIT
 //! average every volume. Only `N0S` carries one, so a velocity product from the
-//! next volume gets a vector one volume stale, which costs about twelve points
-//! of exact agreement — 79.9% against 92.3% over the same gates in the run
-//! above — while within one data level barely moves, 99.81% against 99.85%.
+//! next volume gets a vector one volume stale. On the run above that cost 10 to
+//! 45 points of exact agreement wherever it happened — `KEAX` 70.9% against
+//! 92.1%, `KABR` 80.0% against 91.6% — and usually a tenth of a point or so
+//! within one level, though `KPAH` once measured 77.36% against 99.64%, so it
+//! is not always small.
 //!
-//! That is the **worst** case, not the usual one: in the bucket the four keys
-//! normally carry the identical timestamp and rustdar refetches all four
+//! That is the **worst** case, not the usual one: in the bucket the five keys
+//! normally carry the identical timestamp and rustdar refetches all five
 //! together, so this is a race at a volume boundary rather than the steady
 //! state. [`DerivedSrm::motion_volume_matches`] records when it happens. A
 //! per-volume vector history was considered and rejected as solving a transient.
+//!
+//! It bites the *validation* harder than production, because tgftp's `sn.last`
+//! and the bucket's newest key drift independently, and at 0.5° SAILS
+//! republishes the cut two to four times a volume. So the harness looks up the
+//! bucket object belonging to tgftp's volume and cut rather than taking the
+//! newest — without which the lowest tilt was skipped at two sites in three.
 
 use nexrad_level3::model::{DataPacket, Level3Message, RadialPacket, RadialRun, StormMotion};
 
@@ -97,16 +131,47 @@ const MS_TO_KT: f64 = 1.0 / 0.514_444;
 /// encode 0.25 km gates and 254 levels of 0.5 m/s.
 pub const VELOCITY_PRODUCT_CODES: [i16; 2] = [154, 99];
 
-/// The AWIPS IDs rustdar fetches for storm-relative velocity, lowest tilt
-/// first: the RPG's own product for 0.5°, then dealiased velocity for the
-/// three tilts above it.
+/// The AWIPS ID fetched **for its storm motion vector alone**, never rendered.
+///
+/// Product 56 is the only thing in the bucket carrying halfwords 51/52 as a
+/// vector; on a digital velocity product halfword 51 is the BZ2 compression
+/// flag, so `N0G` read as a vector reports 0.1 kt — plausible enough to ship.
+/// See [`nexrad_level3::model::ProductDescriptionBlock::storm_motion`].
+pub const STORM_MOTION_PRODUCT: &str = "N0S";
+
+/// The AWIPS IDs the four SRM tilts are **derived** from, lowest first: `N0G`
+/// and `N1G` super-resolution (product 154, 0.5° radials), `N2U`/`N3U` at 1°
+/// (product 99). All four are 0.25 km gates over 254 levels.
 ///
 /// The bucket carries `N0G`/`N1G` but not `N2G`/`N3G`, and `N2U`/`N3U` but not
 /// `N0U`/`N1U` — verified by listing a full UTC day, 294 objects each for
 /// `TLX`, matching `N0S` exactly. **These are request keys, not elevations.**
 /// `N1G` is *not* 1.5°: in VCP 212 it is 1.3°, and the angle always comes from
 /// the fetched product's own Product Description Block.
-pub const SRM_TILT_PRODUCTS: [&str; 4] = ["N0S", "N1G", "N2U", "N3U"];
+///
+/// [`STORM_MOTION_PRODUCT`] is deliberately absent. It is the RPG's own
+/// already-storm-relative field at 1 km with the RPG's own vector baked in, so
+/// rendering it as the 0.5° tilt made that one pane both coarser than its
+/// neighbours and deaf to the storm motion override.
+pub const SRM_TILT_PRODUCTS: [&str; 4] = ["N0G", "N1G", "N2U", "N3U"];
+
+/// Everything rustdar fetches for storm-relative velocity: the vector source
+/// followed by the four tilts it is applied to.
+///
+/// One more object per site than rendering `N0S` directly cost, and by far the
+/// largest of the five: the 0.5° cut is super-resolution and sees the most
+/// echo, so `N0G` alone outweighs the other four together. Measured on
+/// 2026-07-26 over every Level III object a site load fetches:
+///
+/// ```text
+/// site   N0S     N0G      without N0G   with N0G
+/// TLX    30 KiB  258 KiB  359 KiB       616 KiB
+/// MPX    27 KiB  237 KiB  412 KiB       649 KiB
+/// ```
+///
+/// It scales with echo coverage, so a site in widespread precipitation costs
+/// more than these and a clear one much less.
+pub const SRM_FETCH_PRODUCTS: [&str; 5] = ["N0S", "N0G", "N1G", "N2U", "N3U"];
 
 /// Physical value per gate step in the derived packet, in knots. Finer than the
 /// 0.5 m/s (0.97 kt) the source products carry, so the requantisation adds no
@@ -239,8 +304,9 @@ pub fn is_velocity_source(msg: &Level3Message) -> bool {
 /// Compute storm-relative velocity from a dealiased velocity product.
 ///
 /// Returns `None` for anything that is not one of
-/// [`VELOCITY_PRODUCT_CODES`], or that carries no radial data — a caller
-/// holding an `N0S` must render it directly rather than derive from it.
+/// [`VELOCITY_PRODUCT_CODES`], or that carries no radial data. An `N0S` is
+/// refused: it is already storm-relative, so the correction would be applied
+/// twice. Nothing renders it — it is fetched for its vector alone.
 pub fn derive(velocity: &Level3Message, sample: &StormMotionSample) -> Option<DerivedSrm> {
     if !is_velocity_source(velocity) {
         return None;
@@ -430,8 +496,21 @@ mod tests {
         }
     }
 
-    /// One radial per listed azimuth, every gate at the same velocity.
+    /// One radial per listed azimuth, every gate at the same velocity, on the
+    /// 1.3° cut.
     fn uniform(product_code: i16, azimuths: &[f32], width: f32, ms: f32) -> Level3Message {
+        uniform_at(product_code, 13, 9, azimuths, width, ms)
+    }
+
+    /// [`uniform`] at a named cut, for the tests that care which tilt it is.
+    fn uniform_at(
+        product_code: i16,
+        elevation_tenths: i16,
+        elevation_number: u16,
+        azimuths: &[f32],
+        width: f32,
+        ms: f32,
+    ) -> Level3Message {
         let radials = azimuths
             .iter()
             .map(|&a| RadialRun {
@@ -440,7 +519,7 @@ mod tests {
                 gate_values: vec![gate_for_ms(ms); 4],
             })
             .collect();
-        message(velocity_pdb(product_code, 13, 9, 7108), radials)
+        message(velocity_pdb(product_code, elevation_tenths, elevation_number, 7108), radials)
     }
 
     fn sample(speed_kt: f32, direction_deg: f32, volume: u32) -> StormMotionSample {
@@ -608,7 +687,7 @@ mod tests {
     }
 
     /// A vector from another volume still produces a field — the alternative is
-    /// no upper tilts at all — but says so.
+    /// no storm-relative velocity at all — but says so.
     #[test]
     fn a_vector_from_another_volume_is_used_and_flagged() {
         let msg = uniform(99, &[0.0], 1.0, 10.0);
@@ -670,8 +749,8 @@ mod tests {
 
     /// The four request keys, and the reason they are not `N0S`..`N3S`.
     #[test]
-    fn the_tilt_products_are_one_srm_product_and_three_velocity_products() {
-        assert_eq!(SRM_TILT_PRODUCTS, ["N0S", "N1G", "N2U", "N3U"]);
+    fn every_tilt_product_is_a_dealiased_velocity_key() {
+        assert_eq!(SRM_TILT_PRODUCTS, ["N0G", "N1G", "N2U", "N3U"]);
         for dead in ["N1S", "N2S", "N3S"] {
             assert!(
                 !SRM_TILT_PRODUCTS.contains(&dead),
@@ -683,6 +762,62 @@ mod tests {
         for absent in ["N2G", "N3G", "N0U", "N1U"] {
             assert!(!SRM_TILT_PRODUCTS.contains(&absent), "{absent} is not published");
         }
+    }
+
+    /// `N0S` is fetched but is not a tilt. Rendering it was the 0.5° pane's
+    /// old behaviour and is the thing this module exists to have stopped
+    /// doing: 1 km against 0.25 km, 16 display levels against 254, and the
+    /// RPG's vector baked in where the user's override belongs.
+    #[test]
+    fn the_vector_source_is_fetched_but_never_rendered() {
+        assert_eq!(STORM_MOTION_PRODUCT, "N0S");
+        assert!(
+            !SRM_TILT_PRODUCTS.contains(&STORM_MOTION_PRODUCT),
+            "{STORM_MOTION_PRODUCT} is back as a tilt: the 0.5° pane would be \
+             1 km where the other three are 0.25 km, and would ignore the \
+             storm motion override",
+        );
+        // The fetch list is exactly the vector source followed by the tilts,
+        // in order — a tilt dropped from the fetch list never arrives, and a
+        // key fetched but absent from the tilt list is never drawn.
+        assert_eq!(SRM_FETCH_PRODUCTS[0], STORM_MOTION_PRODUCT);
+        assert_eq!(SRM_FETCH_PRODUCTS[1..], SRM_TILT_PRODUCTS);
+    }
+
+    /// The lowest tilt derives from the same product 154 as `N1G`, at the same
+    /// 0.25 km, and honours a vector the same way. Built from the real `N0G`
+    /// PDB halfwords, so a 0.5° special case anywhere in `derive` shows up as
+    /// a disagreement with 1.3° rather than as a silently coarser pane.
+    #[test]
+    fn the_lowest_tilt_derives_exactly_as_the_ones_above_it() {
+        // 0.5° cut 1 and 1.3° cut 3, the elevation numbers `TLX` really
+        // publishes, over the identical field and vector.
+        let low = uniform_at(154, 5, 1, &[89.5], 1.0, 10.0);
+        let high = uniform_at(154, 13, 3, &[89.5], 1.0, 10.0);
+        let s = sample(30.0, 90.0, 7108);
+        let d0 = derive(&low, &s).expect("N0G is product 154");
+        let d1 = derive(&high, &s).expect("N1G is product 154");
+
+        assert_eq!(d0.elevation_angle, 0.5);
+        assert_eq!(d1.elevation_angle, 1.3);
+        assert_eq!(d0.packet.radials[0].gate_values, d1.packet.radials[0].gate_values);
+        assert!((d0.packet.gate_interval_km() - 0.25).abs() < 1e-9, "0.5° is 0.25 km");
+        assert_eq!(d0.scale, d1.scale);
+        assert_eq!(d0.offset, d1.offset);
+        // 10 m/s is 19.4 kt, and azimuth 090 takes the full +30 kt.
+        assert!((knots_at(&d0, 0, 0) - (19.438 + 30.0)).abs() < 0.5, "got {}", knots_at(&d0, 0, 0));
+    }
+
+    /// The vector cannot come off `N0G`: halfword 51 is the BZ2 compression
+    /// flag there, exactly as on `N1G`.
+    #[test]
+    fn the_lowest_tilts_source_carries_no_vector_of_its_own() {
+        let low = uniform_at(154, 5, 1, &[0.0], 0.5, 0.0);
+        assert!(
+            StormMotionSample::from_message(&low).is_none(),
+            "N0G reported a vector — halfword 51 is its compression flag, and \
+             reading it yields 0.1 kt from 1.3°",
+        );
     }
 
     /// The quantiser's bins, checked against the boundaries a real `N0S`
@@ -776,17 +911,24 @@ mod tests {
     }
 }
 
-/// Agreement with the RPG's own `N1S`/`N2S`/`N3S`, measured against live data.
+/// Agreement with the RPG's own `N0S`/`N1S`/`N2S`/`N3S`, measured against live
+/// data.
 ///
 /// ```text
 /// cargo test -p rustdar-radar --lib -- --ignored --nocapture live_derived_srm
 /// ```
 ///
-/// Those three products are unreachable from a browser but are still served to
-/// a dev machine by **tgftp**, which is fed by RPCCDS rather than by the
-/// NOAAPort broadcast that dropped them. That is the only place the answer this
-/// module reproduces still exists, and it disappears when tgftp is retired —
-/// which is why this lives in the repository rather than in a notebook.
+/// The upper three are unreachable from a browser but are still served to a dev
+/// machine by **tgftp**, which is fed by RPCCDS rather than by the NOAAPort
+/// broadcast that dropped them. That is the only place the answer this module
+/// reproduces still exists, and it disappears when tgftp is retired — which is
+/// why this lives in the repository rather than in a notebook.
+///
+/// The 0.5° tilt is the exception and the strongest check here: its oracle,
+/// `N0S`, is the product rustdar itself fetched and rendered until this
+/// derivation replaced it, and it is still being written. So tilt 0 compares
+/// the new answer against the old one directly, on a product that is current
+/// rather than five years cold.
 ///
 /// The tgftp origin is deliberately **not** in [`crate::sources::DataSources`]:
 /// it sends no `Access-Control-Allow-Origin`, nothing shipped may reach for it,
@@ -794,7 +936,7 @@ mod tests {
 #[cfg(test)]
 mod live_validation {
     use super::*;
-    use crate::level3::fetch_latest_product;
+    use crate::level3::{Level3Product, fetch_latest_product};
     use crate::sources::DataSources;
     use nexrad_level3::model::RadialPacket;
 
@@ -811,27 +953,70 @@ mod live_validation {
         "KPAH", "KMLB", "KMTX", "KSFX", "KMVX", "KLZK", "KSHV", "KEAX", "KDDC", "KAMA", "KFWS",
     ];
 
-    /// Sites measured to miss the acceptance bar, and why nobody knows why.
+    /// How much of a quarantined site stops being asserted on.
+    #[derive(PartialEq)]
+    enum Scope {
+        /// Nothing at this site is asserted on.
+        Whole,
+        /// The four-tilt total is still asserted on; the 0.5° figure is not.
+        /// A site can be sound on the tilts the RPG publishes at 1° and short
+        /// only where the half-degree recombination bites, and excluding the
+        /// whole of it would stop measuring three tilts that meet the bar.
+        LowestTilt,
+    }
+
+    struct Quarantine {
+        site: &'static str,
+        scope: Scope,
+        why: &'static str,
+    }
+
+    /// Sites measured to miss the acceptance bar, and what has been ruled out.
     ///
     /// Measured, printed and excluded from the assertion — **not** removed from
     /// [`SITES`], because a site that silently stopped being compared is a site
     /// nobody would notice had got worse. Adding to this list is admitting a
     /// gap, so record the numbers and the eliminations, and never widen the bar
     /// instead.
-    const QUARANTINED: &[(&str, &str)] = &[(
-        "KSFX",
-        "96.26% within one level on its own volume's vector — the figure this \
-         test asserts on — against a 99% bar; 95.99% on a later run. Per tilt \
-         and on the production pairing, 21.8-29.9% exact / 91.8-93.8% within \
-         one across tilts 1-3 (n=57,657), against 85-98% exact everywhere \
-         else: a roughly one-level systematic offset rather than noise. \
-         Ruled out: the stale vector (the own-volume figure above is the \
-         corrected one and is still short); the storm-motion term (zeroing \
-         the correction collapses agreement to 36.79%, so the correction is \
-         carrying the field and carrying it correctly); and packet geometry \
-         (230 bins / 0.999 / 360 radials against 1200 / 0.25 km / 720, \
-         identical to sites that agree). Cause unknown.",
-    )];
+    const QUARANTINED: &[Quarantine] = &[
+        Quarantine {
+            site: "KSFX",
+            scope: Scope::Whole,
+            why: "96.93% and 96.99% within one level on its own volume's vector over two \
+                  volumes — the figure this test asserts on — against a 99% bar. Per tilt \
+                  and own-volume: 95.2-95.6% at 0.5°, 96.4% at 1.3°, 99.6% at 2.4° and \
+                  3.1°, on 20.9-25.7% exact against 85-98% exact everywhere else — a \
+                  roughly one-level systematic offset rather than noise, present at every \
+                  tilt. Ruled out: the stale vector (the own-volume figure above is the \
+                  corrected one and is still short); the storm-motion term (zeroing the \
+                  correction collapses agreement to 36.79%, so the correction is carrying \
+                  the field and carrying it correctly); packet geometry (230 bins / 0.999 \
+                  / 360 radials against 1200 / 0.25 km / 720, identical to sites that \
+                  agree); and the resampler (reordering it to recombine azimuth before \
+                  range lifted this site from 94.68% to 96.93%, and lifted every other \
+                  site over the bar, but not this one). Cause unknown.",
+        },
+        Quarantine {
+            site: "KBIS",
+            scope: Scope::LowestTilt,
+            why: "98.18% and 98.40% within one level at 0.5° on its own volume's vector \
+                  over two volumes, against a 99% bar; the four-tilt total clears it at \
+                  99.22% and 99.27%, so only the lowest tilt is excluded. Graded by tilt \
+                  — 98.2-98.4% at 0.5°, 99.3% at 1.3°, 99.9% at 2.4°, 100.0% at 3.1° — \
+                  which is the shape of the half-degree recombination, worst where \
+                  azimuthal gradients are sharpest, rather than of the derivation. Ruled \
+                  out: the stale vector (own-volume and production agree to two decimal \
+                  places at this tilt on both runs); the storm-motion term (the same \
+                  vector gives 99.3-100.0% on the three tilts above); and the resampler \
+                  ordering (reordering it lifted this site from 96.98% to 98.18%, which \
+                  helped and did not close the gap). Every other site measured clears the \
+                  bar at 0.5°, the lowest of them at 99.10%. Cause unknown.",
+        },
+    ];
+
+    fn quarantine(site: &str) -> Option<&'static Quarantine> {
+        QUARANTINED.iter().find(|q| q.site == site)
+    }
 
     /// Level 0 is "no data" and 15 "range folded" in the RPG's product; neither
     /// is a value this can be checked against.
@@ -852,9 +1037,8 @@ mod live_validation {
     ///
     /// Not folded into
     /// [`ProductDescriptionBlock::range_gate_km`](nexrad_level3::model::ProductDescriptionBlock::range_gate_km):
-    /// the renderer does not consult that, so declaring it there would create a
-    /// value that is authoritative in one place and ignored in another. The
-    /// 0.1% it costs the shipped `N0S` render is 230 m at maximum range.
+    /// nothing shipped renders a product 56 any more, so declaring it there
+    /// would add a case no production path reads.
     const RPG_SRM_GATE_KM: f64 = 1.0;
 
     async fn tgftp_tilt(tilt: usize, site: &str) -> Option<Level3Message> {
@@ -863,6 +1047,82 @@ mod live_validation {
             .await
             .ok()?;
         nexrad_level3::decode::decode_product(&bytes).ok()
+    }
+
+    /// How many bucket objects to open looking for the volume and cut tgftp
+    /// served, and how far from its generation time to look.
+    ///
+    /// The bucket's *newest* key will not do, above all at 0.5°: SAILS
+    /// republishes the lowest cut two to four times a volume, so the newest
+    /// `N0G` is usually a mid-volume repeat while tgftp's `sn.last` is some
+    /// other cut. Taking the newest key skipped the lowest tilt at two sites in
+    /// three on the first run — which would have left the tilt this validates
+    /// almost never actually compared.
+    const KEY_LOOKBACK: usize = 10;
+    const KEY_WINDOW_MINUTES: i64 = 20;
+
+    /// The bucket product for `site`/`code` from the same volume **and cut** as
+    /// `rpg`, searched by proximity to the RPG product's own generation time.
+    ///
+    /// The product code is production's — this picks a different *object* of
+    /// the same product, never a different product. Comparing across volumes or
+    /// across cuts measures the weather moving, not the derivation.
+    async fn bucket_product_matching(
+        sources: &DataSources,
+        site: &str,
+        code: &str,
+        rpg: &Level3Message,
+    ) -> Option<Level3Product> {
+        let want = generated_at(rpg)?;
+        let site3 = crate::level3::site_code(site).to_uppercase();
+        let mut keys = Vec::new();
+        for day in [want.date(), want.date() - chrono::Duration::days(1)] {
+            if let Ok(k) = crate::level3::list_day(sources, &site3, code, &day).await {
+                keys.extend(k);
+            }
+        }
+        // Nearest in time first: the matching object is written within seconds
+        // of the RPG's, so the first candidate is almost always the answer.
+        let mut candidates: Vec<(i64, String)> = keys
+            .into_iter()
+            .filter_map(|k| {
+                let t = crate::level3::key_time(&k)?;
+                let delta = (t - want).num_seconds().abs();
+                (delta <= KEY_WINDOW_MINUTES * 60).then_some((delta, k))
+            })
+            .collect();
+        candidates.sort();
+
+        for (_, key) in candidates.into_iter().take(KEY_LOOKBACK) {
+            let url = sources.level3_object_url(&key);
+            let Ok(bytes) = crate::archive::get_bytes(crate::archive::shared_client(), url).await
+            else {
+                continue;
+            };
+            let Ok(message) = nexrad_level3::decode::decode_product(&bytes) else {
+                continue;
+            };
+            if message.pdb.volume_key() == rpg.pdb.volume_key()
+                && message.pdb.elevation_number == rpg.pdb.elevation_number
+            {
+                return Some(Level3Product {
+                    message,
+                    stamp: crate::level3::ProductStamp::from_key(key),
+                });
+            }
+        }
+        None
+    }
+
+    /// A product's generation timestamp. Halfword 24 is a modified Julian date
+    /// whose **day 1 is 1970-01-01**, and halfwords 25–26 are seconds since
+    /// midnight UTC.
+    fn generated_at(msg: &Level3Message) -> Option<chrono::NaiveDateTime> {
+        let days = u64::from(msg.pdb.generation_date).checked_sub(1)?;
+        chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?
+            .checked_add_days(chrono::Days::new(days))?
+            .and_hms_opt(0, 0, 0)?
+            .checked_add_signed(chrono::Duration::seconds(i64::from(msg.pdb.generation_time)))
     }
 
     /// Which RPG radial each derived radial falls in, by centre azimuth.
@@ -880,97 +1140,156 @@ mod live_validation {
         slots
     }
 
+    #[derive(Default)]
     struct Tally {
         n: usize,
         exact: usize,
         within_one: usize,
     }
 
+    impl Tally {
+        fn absorb(&mut self, other: &Tally) {
+            self.n += other.n;
+            self.exact += other.exact;
+            self.within_one += other.within_one;
+        }
+
+        /// Percentages over `max(n, 1)`, so an empty tally reads 0.0% rather
+        /// than NaN. Every assertion checks `n > 0` separately.
+        fn exact_pct(&self) -> f64 {
+            100.0 * self.exact as f64 / self.n.max(1) as f64
+        }
+
+        fn within_one_pct(&self) -> f64 {
+            100.0 * self.within_one as f64 / self.n.max(1) as f64
+        }
+    }
+
+    /// One site's four measurements: the production vector pairing and the
+    /// own-volume one, each over all four tilts and over the lowest alone.
+    struct SiteResult {
+        site: &'static str,
+        /// All four tilts, the vector production would have used.
+        moving: Tally,
+        /// All four tilts, each velocity product's own volume's vector.
+        matched: Tally,
+        /// Tilt 0 only, production pairing.
+        lowest_moving: Tally,
+        /// Tilt 0 only, own-volume pairing. The strongest number here: the
+        /// oracle is `N0S`, the very product the 0.5° tilt used to be.
+        lowest_matched: Tally,
+    }
+
     /// Resample the derived 0.25 km field onto the RPG's 1 km × 1° grid and
     /// compare level for level.
     ///
-    /// The ICD does not document the RPG's recombination, so both knobs below
-    /// were set by trying variants against this same oracle. **They are not
-    /// equally well founded, and the difference matters for how much the
-    /// agreement figure is worth:**
+    /// The ICD does not document the RPG's recombination. Two steps are applied,
+    /// **in this order**, and the order is the load-bearing part:
     ///
-    /// - **Along range**, keep the largest-magnitude of the four sub-gates.
-    ///   Averaging instead costs 17 points of exact agreement — but this one
-    ///   also has an argument independent of the score: a velocity product that
-    ///   smoothed its couplets away would be useless, so preserving the peak is
-    ///   what the RPG must be doing.
-    /// - **Across azimuth**, average the two half-degree radials of a
-    ///   super-resolution product. Taking the larger instead costs 6 points and
-    ///   pushes `N1G` below the acceptance bar. **This one was chosen because it
-    ///   scored better and for no other reason** — "recombination" is a
-    ///   plausible story, not evidence. No-op for `N2U`/`N3U`, already 1°.
+    /// 1. **Across azimuth**, average the two half-degree radials of a
+    ///    super-resolution product into one 1° radial. A no-op for `N2U`/`N3U`,
+    ///    which the RPG already publishes at 1°.
+    /// 2. **Along range**, keep the largest-magnitude of the four 0.25 km
+    ///    sub-gates in each 1 km cell. Averaging instead costs 17 points of
+    ///    exact agreement, and a velocity product that smoothed its couplets
+    ///    away would be useless, so preserving the peak is what the RPG must be
+    ///    doing.
     ///
-    /// One parameter fitted to the oracle makes the resulting agreement an
-    /// **upper bound, not an independent validation**. It is `#[cfg(test)]`-only
-    /// and within-one-level was 99.0% before the azimuth knob was tuned, so the
-    /// acceptance criterion does not rest on the fit — but the exact-match
-    /// percentage partly does.
+    /// Step 1 first because that is the field the RPG itself publishes: `N2U`
+    /// and `N3U` *are* the output of step 1, at 0.25 km × 1°, and on those two
+    /// tilts — where only step 2 runs — agreement is 99.9%+ at every site
+    /// measured. So step 2 is known accurate on its own, and applying step 1
+    /// ahead of it reproduces the intermediate product rather than inventing
+    /// one. Doing them the other way round — the peak of four sub-gates per
+    /// half-degree radial, then averaging the two peaks — takes the maximum of
+    /// two independently-peaked samples and cost roughly a point of
+    /// within-one-level agreement at 0.5°, where azimuthal gradients are
+    /// sharpest: `KBIS` 96.98% against 99.3%, `KMVX` 98.54% against 99.7%.
+    ///
+    /// Choosing "average" over "take the larger" in step 1 was originally
+    /// settled by score alone, which made the figure an upper bound rather than
+    /// an independent validation. It has an argument now — the intermediate
+    /// product exists and can be checked — but the resampler is still a
+    /// reconstruction of an undocumented step, so treat exact-match as
+    /// indicative and within-one-level as the criterion.
     fn compare(rpg: &Level3Message, derived: &DerivedSrm) -> Tally {
         let rpg_packet = radial_packet(rpg).expect("the RPG product carries radials");
         let derived_gate_km = derived.packet.gate_interval_km();
         let levels = decode_rpg_levels(rpg);
         let slots = azimuth_map(rpg_packet);
-
-        // Per RPG cell: the sum of each contributing radial's peak, and how
-        // many radials contributed — the azimuth mean of a range max.
-        let mut sums: Vec<Vec<(f64, u32)>> = rpg_packet
+        let sub_gates = derived
+            .packet
             .radials
             .iter()
-            .map(|r| vec![(0.0, 0); r.gate_values.len()])
+            .map(|r| r.gate_values.len())
+            .max()
+            .unwrap_or(0);
+
+        // Step 1: per RPG radial, the azimuth mean of every 0.25 km sub-gate.
+        let mut sub: Vec<Vec<(f64, u32)>> = rpg_packet
+            .radials
+            .iter()
+            .map(|_| vec![(0.0, 0); sub_gates])
             .collect();
 
         for run in &derived.packet.radials {
             let centre = run.start_angle as f64 + run.angle_delta as f64 / 2.0;
             let slot = ((centre * 10.0).round() as i32).rem_euclid(3600) as usize;
             let Some(ri) = slots[slot] else { continue };
-            let mut peak: Vec<Option<f32>> = vec![None; sums[ri].len()];
             for (j, &gate) in run.gate_values.iter().enumerate() {
                 if gate < FIRST_DATA_GATE {
                     continue;
                 }
-                // The gate's centre, matching what `first_gate_range_km` and
-                // the renderer mean by a gate's range. Using the near edge
-                // instead happens to bin identically while 0.25 divides 1.0
-                // exactly, but it is the wrong quantity and would drift the
-                // moment either spacing changed.
+                let knots = (gate as f32 - derived.offset) / derived.scale;
+                sub[ri][j].0 += knots as f64;
+                sub[ri][j].1 += 1;
+            }
+        }
+
+        // Which 1 km cell each 0.25 km sub-gate falls in, by its **centre** —
+        // what `first_gate_range_km` and the renderer mean by a gate's range.
+        // The near edge happens to bin identically while 0.25 divides 1.0
+        // exactly, but it is the wrong quantity and would drift the moment
+        // either spacing changed.
+        let bin_of: Vec<i64> = (0..sub_gates)
+            .map(|j| {
                 let centre_km =
                     (derived.packet.first_range_bin as f64 + j as f64 + 0.5) * derived_gate_km;
-                let bin =
-                    ((centre_km / RPG_SRM_GATE_KM).floor() as i64) - rpg_packet.first_range_bin as i64;
-                if bin < 0 || bin as usize >= peak.len() {
+                ((centre_km / RPG_SRM_GATE_KM).floor() as i64) - rpg_packet.first_range_bin as i64
+            })
+            .collect();
+
+        // Step 2: per 1 km cell, the largest-magnitude of its sub-gate means.
+        let mut peak: Vec<Vec<Option<f64>>> = rpg_packet
+            .radials
+            .iter()
+            .map(|r| vec![None; r.gate_values.len()])
+            .collect();
+        for (ri, row) in sub.iter().enumerate() {
+            for (j, &(sum, count)) in row.iter().enumerate() {
+                if count == 0 {
                     continue;
                 }
-                let knots = (gate as f32 - derived.offset) / derived.scale;
-                let cell = &mut peak[bin as usize];
-                if cell.is_none_or(|best: f32| knots.abs() > best.abs()) {
-                    *cell = Some(knots);
+                let bin = bin_of[j];
+                if bin < 0 || bin as usize >= peak[ri].len() {
+                    continue;
                 }
-            }
-            for (bin, value) in peak.iter().enumerate() {
-                if let Some(v) = value {
-                    sums[ri][bin].0 += *v as f64;
-                    sums[ri][bin].1 += 1;
+                let value = sum / count as f64;
+                let cell = &mut peak[ri][bin as usize];
+                if cell.is_none_or(|best: f64| value.abs() > best.abs()) {
+                    *cell = Some(value);
                 }
             }
         }
 
-        let mut t = Tally { n: 0, exact: 0, within_one: 0 };
+        let mut t = Tally::default();
         for (ri, run) in rpg_packet.radials.iter().enumerate() {
             for (i, &level) in run.gate_values.iter().enumerate() {
                 if level == RPG_NO_DATA || level == RPG_RANGE_FOLDED {
                     continue;
                 }
-                let (sum, count) = sums[ri][i];
-                if count == 0 {
-                    continue;
-                }
-                let knots = (sum / count as f64) as f32;
-                let diff = quantize_to_rpg_levels(knots) as i32 - level as i32;
+                let Some(knots) = peak[ri][i] else { continue };
+                let diff = quantize_to_rpg_levels(knots as f32) as i32 - level as i32;
                 t.n += 1;
                 t.exact += usize::from(diff == 0);
                 t.within_one += usize::from(diff.abs() <= 1);
@@ -995,7 +1314,7 @@ mod live_validation {
 
     #[ignore = "hits the live S3 bucket and tgftp"]
     #[tokio::test]
-    async fn live_derived_srm_agrees_with_the_rpgs_upper_tilts() {
+    async fn live_derived_srm_agrees_with_the_rpgs_own_tilts() {
         let sources = DataSources::production();
         let now = chrono::Utc::now().naive_utc();
         // Per site, never pooled. Pooling lets one site's shortfall hide inside
@@ -1003,59 +1322,64 @@ mod live_validation {
         // same averaging that once let a single calm site supply most of the
         // sample. `KSFX` fails the bar on its own and passes in any aggregate
         // it is a minority of.
-        let mut asserted: Vec<(&str, Tally, Tally)> = Vec::new();
+        let mut asserted: Vec<SiteResult> = Vec::new();
         // Zero-vector and quarantined sites are measured and printed but never
         // asserted on: a zero vector makes the correction identically zero, so
         // those gates exercise the conversion and the resampler and nothing
         // about the storm-motion term.
-        let mut still = Tally { n: 0, exact: 0, within_one: 0 };
+        let mut still = Tally::default();
 
         for &site in SITES {
-            let Ok(n0s) = fetch_latest_product(&sources, site, SRM_TILT_PRODUCTS[0], now).await
+            let Ok(n0s) = fetch_latest_product(&sources, site, STORM_MOTION_PRODUCT, now).await
             else {
-                println!("{site}: no N0S");
+                println!("{site}: no {STORM_MOTION_PRODUCT}");
                 continue;
             };
             let Some(sample) = StormMotionSample::from_message(&n0s.message) else {
-                println!("{site}: N0S carries no vector");
+                println!("{site}: {STORM_MOTION_PRODUCT} carries no vector");
                 continue;
             };
-            let quarantine = QUARANTINED.iter().find(|(s, _)| *s == site).map(|(_, why)| *why);
+            let quarantine = quarantine(site);
             println!(
                 "{site}: vector {:.1} kt from {:.1}° (scit={}){}",
                 sample.motion.speed_kt,
                 sample.motion.direction_deg,
                 sample.motion.is_scit_average,
-                if quarantine.is_some() { "  [QUARANTINED]" } else { "" },
+                match quarantine.map(|q| &q.scope) {
+                    None => "",
+                    Some(Scope::Whole) => "  [QUARANTINED]",
+                    Some(Scope::LowestTilt) => "  [QUARANTINED at 0.5°]",
+                },
             );
-            let mut moving = Tally { n: 0, exact: 0, within_one: 0 };
-            let mut matched = Tally { n: 0, exact: 0, within_one: 0 };
+            let mut result = SiteResult {
+                site,
+                moving: Tally::default(),
+                matched: Tally::default(),
+                lowest_moving: Tally::default(),
+                lowest_matched: Tally::default(),
+            };
 
-            // Skips the lowest tilt: `N0S` is fetched, not derived, so
-            // comparing it against tgftp would test the bucket, not this code.
-            for (tilt, &code) in SRM_TILT_PRODUCTS.iter().enumerate().skip(1) {
-                let Ok(velocity) = fetch_latest_product(&sources, site, code, now).await else {
-                    println!("  tilt {tilt} ({code}): not in the bucket");
-                    continue;
-                };
+            // Every tilt, 0.5° included. The lowest is compared against the
+            // RPG's own `N0S` — the product it replaced — which makes it the
+            // one tilt whose oracle is still live rather than five years cold.
+            //
+            // tgftp first, then the bucket object belonging to *its* volume and
+            // cut: a comparison across volumes or across cuts measures the
+            // weather moving, not the derivation.
+            for (tilt, &code) in SRM_TILT_PRODUCTS.iter().enumerate() {
                 let Some(rpg) = tgftp_tilt(tilt, site).await else {
                     println!("  tilt {tilt}: tgftp N{tilt}S unavailable");
                     continue;
                 };
-                // A comparison across volumes or across cuts measures the
-                // weather moving, not the derivation.
-                if rpg.pdb.volume_key() != velocity.message.pdb.volume_key()
-                    || rpg.pdb.elevation_number != velocity.message.pdb.elevation_number
-                {
+                let Some(velocity) = bucket_product_matching(&sources, site, code, &rpg).await
+                else {
                     println!(
-                        "  tilt {tilt}: skipped — RPG vol {:?} cut {} vs {code} vol {:?} cut {}",
+                        "  tilt {tilt} ({code}): no bucket object for RPG vol {:?} cut {}",
                         rpg.pdb.volume_key(),
                         rpg.pdb.elevation_number,
-                        velocity.message.pdb.volume_key(),
-                        velocity.message.pdb.elevation_number,
                     );
                     continue;
-                }
+                };
                 let derived = srm_derive_or_panic(&velocity.message, &sample, code);
                 let t = compare(&rpg, &derived);
                 if t.n == 0 {
@@ -1064,51 +1388,78 @@ mod live_validation {
                 }
                 let is_moving = sample.motion.speed_kt != 0.0;
                 println!(
-                    "  tilt {tilt} ({code}, {:.1}°, cut {}, {}): n={} exact={:.1}% within1={:.1}%",
+                    "  tilt {tilt} ({}, {:.1}°, cut {}, {}{}): \
+                     n={} exact={:.1}% within1={:.2}%",
+                    velocity.stamp.key,
                     derived.elevation_angle,
                     derived.elevation_number,
                     if is_moving { "moving" } else { "ZERO VECTOR" },
+                    if derived.motion_volume_matches { "" } else { ", vector one volume stale" },
                     t.n,
-                    100.0 * t.exact as f64 / t.n as f64,
-                    100.0 * t.within_one as f64 / t.n as f64,
+                    t.exact_pct(),
+                    t.within_one_pct(),
                 );
-                let bucket = if is_moving { &mut moving } else { &mut still };
-                bucket.n += t.n;
-                bucket.exact += t.exact;
-                bucket.within_one += t.within_one;
-                if is_moving {
-                    // Same gates, this tilt's own volume's vector.
-                    if let Some(own) = StormMotionSample::from_message(&rpg) {
-                        let m = compare(&rpg, &srm_derive_or_panic(&velocity.message, &own, code));
-                        matched.n += m.n;
-                        matched.exact += m.exact;
-                        matched.within_one += m.within_one;
+                if !is_moving {
+                    still.absorb(&t);
+                    continue;
+                }
+                result.moving.absorb(&t);
+                if tilt == 0 {
+                    result.lowest_moving.absorb(&t);
+                }
+                // Same gates, this tilt's own volume's vector.
+                if let Some(own) = StormMotionSample::from_message(&rpg) {
+                    let m = compare(&rpg, &srm_derive_or_panic(&velocity.message, &own, code));
+                    println!(
+                        "    own-volume vector {:.1} kt from {:.1}°: \
+                         n={} exact={:.2}% within1={:.2}%",
+                        own.motion.speed_kt,
+                        own.motion.direction_deg,
+                        m.n,
+                        m.exact_pct(),
+                        m.within_one_pct(),
+                    );
+                    if tilt == 0 {
+                        result.lowest_matched.absorb(&m);
                     }
+                    result.matched.absorb(&m);
                 }
             }
 
-            if moving.n == 0 {
+            if result.moving.n == 0 {
                 continue;
             }
             println!(
                 "  {site} nonzero-vector total: n={} exact={:.1}% within1={:.2}% \
-                 (own-volume vector: {:.1}% / {:.2}%)",
-                moving.n,
-                100.0 * moving.exact as f64 / moving.n as f64,
-                100.0 * moving.within_one as f64 / moving.n as f64,
-                100.0 * matched.exact as f64 / matched.n.max(1) as f64,
-                100.0 * matched.within_one as f64 / matched.n.max(1) as f64,
+                 (own-volume vector: {:.1}% / {:.2}%); \
+                 0.5° alone n={} exact={:.1}% within1={:.2}% \
+                 (own-volume: {:.1}% / {:.2}%)",
+                result.moving.n,
+                result.moving.exact_pct(),
+                result.moving.within_one_pct(),
+                result.matched.exact_pct(),
+                result.matched.within_one_pct(),
+                result.lowest_moving.n,
+                result.lowest_moving.exact_pct(),
+                result.lowest_moving.within_one_pct(),
+                result.lowest_matched.exact_pct(),
+                result.lowest_matched.within_one_pct(),
             );
-            if let Some(why) = quarantine {
-                println!("  {site} is quarantined and not asserted on: {why}");
-                continue;
+            if let Some(q) = quarantine {
+                println!("  {site} is quarantined and not asserted on: {}", q.why);
+                if q.scope == Scope::Whole {
+                    continue;
+                }
             }
-            asserted.push((site, moving, matched));
+            asserted.push(result);
             // Enough independent sites to be worth a conclusion. Quarantined
             // and quiet sites do not count toward it, so a run cannot stop
-            // early having asserted on nothing.
+            // early having asserted on nothing. The 0.5° tilt has to have been
+            // asserted on somewhere too, or the tilt this change exists for
+            // goes unmeasured while the other three carry the run.
             if asserted.len() >= 2
-                && asserted.iter().map(|(_, m, _)| m.n).sum::<usize>() > MIN_NONZERO_GATES
+                && asserted.iter().map(|r| r.matched.n).sum::<usize>() > MIN_NONZERO_GATES
+                && asserted.iter().any(asserts_at_the_lowest_tilt)
             {
                 break;
             }
@@ -1119,15 +1470,15 @@ mod live_validation {
                 "zero vector (correction is identically zero, not asserted on): \
                  n={} exact={:.1}% within1={:.2}%",
                 still.n,
-                100.0 * still.exact as f64 / still.n as f64,
-                100.0 * still.within_one as f64 / still.n as f64,
+                still.exact_pct(),
+                still.within_one_pct(),
             );
         }
 
         // The gates that actually exercise the correction. Without this floor
         // the test passes on quiet sites alone, where the storm-motion term is
         // multiplied by zero and could be arbitrarily wrong.
-        let nonzero_gates: usize = asserted.iter().map(|(_, m, _)| m.n).sum();
+        let nonzero_gates: usize = asserted.iter().map(|r| r.matched.n).sum();
         assert!(
             sample_is_conclusive(asserted.len(), nonzero_gates),
             "only {nonzero_gates} gates over {} sites carried a nonzero storm motion vector \
@@ -1136,6 +1487,18 @@ mod live_validation {
              nothing else. Re-run — tgftp's sn.last and the bucket's newest key drift by a \
              volume scan, quiet sites have no vector, and quarantined sites do not count.",
             asserted.len(),
+        );
+        // The 0.5° tilt is the one this validates that nothing else can: it is
+        // the only tilt whose oracle is a product still being written, and the
+        // one that used to be rendered rather than derived. A run that never
+        // reached it has measured the change not at all — and a run that
+        // reached it only at a site quarantined there has not measured it
+        // either.
+        assert!(
+            asserted.iter().any(asserts_at_the_lowest_tilt),
+            "no site produced a 0.5° comparison that is asserted on. The upper tilts alone \
+             say nothing about the tilt derived from {}; re-run.",
+            SRM_TILT_PRODUCTS[0],
         );
 
         // Per site. An aggregate would let one site's shortfall be averaged
@@ -1151,21 +1514,43 @@ mod live_validation {
         // fail at healthy sites: `KMPX` was measured at 93.42% production
         // against 99.86% own-volume during one such boundary. The production
         // figure is printed on every site so the transient stays visible.
-        for (site, moving, matched) in &asserted {
-            assert!(matched.n > 0, "{site}: no own-volume comparison was made");
-            let within_one = 100.0 * matched.within_one as f64 / matched.n as f64;
-            assert!(
-                within_one >= 99.0,
-                "{site}: derived SRM agrees within one data level on {within_one:.2}% of {} \
-                 gates with its own volume's nonzero vector applied; the bar is 99%. The \
-                 production pairing gives {:.2}%, so if that is no worse the vector pairing \
-                 is not the cause. If this site is genuinely beyond the derivation, add it to \
-                 QUARANTINED with its numbers and what has been ruled out — do not widen the \
-                 bar.",
-                matched.n,
-                100.0 * moving.within_one as f64 / moving.n.max(1) as f64,
-            );
+        //
+        // The 0.5° tilt is asserted **separately as well as** inside the
+        // four-tilt total, because three agreeing upper tilts outnumber it: a
+        // 0.5° derivation that had gone wrong would still leave the site total
+        // above the bar.
+        for r in &asserted {
+            assert!(r.matched.n > 0, "{}: no own-volume comparison was made", r.site);
+            meets_the_bar(r, "all tilts", &r.matched);
+            if asserts_at_the_lowest_tilt(r) {
+                meets_the_bar(r, "0.5°", &r.lowest_matched);
+            } else {
+                println!("  {}: 0.5° measured but not asserted on", r.site);
+            }
         }
+    }
+
+    /// Whether this site's 0.5° figure is one the run may conclude from: it has
+    /// to have been measured, and the site must not be quarantined there.
+    fn asserts_at_the_lowest_tilt(r: &SiteResult) -> bool {
+        r.lowest_matched.n > 0 && quarantine(r.site).is_none()
+    }
+
+    /// The acceptance bar: 99% of gates within one of the RPG's data levels.
+    fn meets_the_bar(site: &SiteResult, what: &str, tally: &Tally) {
+        let within_one = tally.within_one_pct();
+        assert!(
+            within_one >= 99.0,
+            "{} ({what}): derived SRM agrees within one data level on {within_one:.2}% of \
+             {} gates with its own volume's nonzero vector applied; the bar is 99%. The \
+             production pairing over all tilts gives {:.2}%, so if that is no worse the \
+             vector pairing is not the cause. If this site is genuinely beyond the \
+             derivation, add it to QUARANTINED with its numbers and what has been ruled \
+             out — do not widen the bar.",
+            site.site,
+            tally.n,
+            site.moving.within_one_pct(),
+        );
     }
 
     fn srm_derive_or_panic(

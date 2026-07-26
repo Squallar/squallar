@@ -24,17 +24,22 @@
 //!
 //! # The storm-relative velocity gap
 //!
-//! Only the lowest SRM tilt survives as a product. `N1S`/`N2S`/`N3S` exist in
-//! the bucket historically but have had nothing written to them since 2020,
-//! because NWS dropped the higher tilts from the NOAAPort broadcast
-//! (SCN 22-96); every CORS-clean source is NOAAPort-derived. Measured on
-//! 2026-07-25 for `TLX`: `N0S`/`N0K`/`EET`/`DVL`/`HHC`/`DPR` 342 keys each for
-//! the UTC day, `N1S`, `N2S`, `N3S` zero (last objects 2020-03-30, 03-31,
-//! 04-01).
+//! Only the lowest SRM product survives. `N1S`/`N2S`/`N3S` exist in the bucket
+//! historically but have had nothing written to them since 2020, because NWS
+//! dropped the higher tilts from the NOAAPort broadcast (SCN 22-96); every
+//! CORS-clean source is NOAAPort-derived. Measured on 2026-07-25 for `TLX`:
+//! `N0S`/`N0K`/`EET`/`DVL`/`HHC`/`DPR` 342 keys each for the UTC day, `N1S`,
+//! `N2S`, `N3S` zero (last objects 2020-03-30, 03-31, 04-01).
 //!
-//! The three upper tilts are **derived** instead, from the dealiased velocity
-//! products the same bucket does carry — `N1G` (code 154), `N2U` and `N3U`
-//! (code 99), 294 objects a day each, the same as `N0S`. See [`crate::srm`].
+//! All four tilts are **derived** instead, from the dealiased velocity products
+//! the same bucket does carry — `N0G` and `N1G` (code 154), `N2U` and `N3U`
+//! (code 99), 294 objects a day each, the same as `N0S`. `N0S` is still fetched
+//! but is no longer drawn: it supplies the storm motion vector, which no
+//! velocity product carries. Deriving 0.5° too is what makes all four panes
+//! 0.25 km fields at 254 levels that a storm motion override reaches; rendering
+//! `N0S` left the lowest one coarser than its neighbours and deaf to the
+//! override. See [`crate::srm`].
+//!
 //! No substitute is swapped in for a *missing* tilt: an SRM field from a
 //! different elevation would be wrong in a way the UI could not show, so the
 //! elevation always comes from the fetched product's own Product Description
@@ -148,7 +153,10 @@ pub fn key_time(key: &str) -> Option<NaiveDateTime> {
 }
 
 /// List the keys for one site/product/UTC day.
-async fn list_day(
+///
+/// `pub(crate)` for [`crate::srm`]'s validation harness, which has to find the
+/// key belonging to a *particular* volume rather than the newest one.
+pub(crate) async fn list_day(
     sources: &DataSources,
     site3: &str,
     product: &str,
@@ -235,7 +243,8 @@ mod tests {
     ///
     /// | product | AWIPS | message code | field |
     /// |---|---|---|---|
-    /// | Storm Relative Velocity | `N0S` | 56 | Storm Relative Mean Radial Velocity |
+    /// | Storm Relative Velocity | `N0S` | 56 | Storm Relative Mean Radial Velocity (vector only, not rendered) |
+    /// | ″ | `N0G` | 154 | Super-Res Digital Base Velocity (derived to SRM) |
     /// | ″ | `N1G` | 154 | Super-Res Digital Base Velocity (derived to SRM) |
     /// | ″ | `N2U` | 99 | Digital Base Velocity (derived to SRM) |
     /// | ″ | `N3U` | 99 | Digital Base Velocity (derived to SRM) |
@@ -250,7 +259,7 @@ mod tests {
     const ICD: &[(RadarProduct, &[(&str, i16)])] = &[
         (
             RadarProduct::StormRelativeVelocity,
-            &[("N0S", 56), ("N1G", 154), ("N2U", 99), ("N3U", 99)],
+            &[("N0S", 56), ("N0G", 154), ("N1G", 154), ("N2U", 99), ("N3U", 99)],
         ),
         (RadarProduct::SpecificDifferentialPhase, &[("N0K", 163)]),
         (RadarProduct::EchoTops, &[("EET", 135)]),
@@ -496,14 +505,14 @@ mod tests {
 
     /// The three dead SRM tilts must not be requested. Asserted by name, not
     /// count: adding "N1S" back is the obvious thing to try when someone
-    /// notices the upper tilts are computed rather than fetched, and it can
-    /// only ever fail.
+    /// notices the tilts are computed rather than fetched, and it can only ever
+    /// fail.
     #[test]
     fn the_discontinued_srm_tilts_are_not_requested() {
         let codes = RadarProduct::StormRelativeVelocity
             .level3_products()
             .expect("SRM is Level III");
-        assert_eq!(codes, ["N0S", "N1G", "N2U", "N3U"]);
+        assert_eq!(codes, ["N0S", "N0G", "N1G", "N2U", "N3U"]);
         for dead in ["N1S", "N2S", "N3S"] {
             assert!(
                 !codes.contains(&dead),
@@ -512,25 +521,41 @@ mod tests {
         }
     }
 
-    /// The upper SRM tilts must come from products the derivation recognises as
-    /// dealiased velocity, or they would render as base velocity under a
+    /// Every SRM tilt must come from a product the derivation recognises as
+    /// dealiased velocity, or it would render as base velocity under a
     /// storm-relative label — the storm motion silently never applied.
+    ///
+    /// `N0S` is the one key fetched that is not a tilt. It is product 56,
+    /// already storm-relative, so `srm::derive` refuses it; it is fetched for
+    /// the storm motion vector in its Product Description Block alone.
     #[test]
-    fn the_upper_srm_tilts_request_dealiased_velocity_products() {
+    fn every_srm_tilt_requests_a_dealiased_velocity_product() {
         let codes = RadarProduct::StormRelativeVelocity
             .level3_products()
             .expect("SRM is Level III");
         let row = icd_row(&RadarProduct::StormRelativeVelocity).expect("SRM has an ICD row");
-        assert_eq!(codes[0], "N0S", "the lowest tilt is fetched, not derived");
+        assert_eq!(
+            codes[0],
+            crate::srm::STORM_MOTION_PRODUCT,
+            "the first key is the vector source, and only that",
+        );
+        assert_eq!(codes[1..], crate::srm::SRM_TILT_PRODUCTS, "the rest are the tilts");
         for (id, message_code) in &row[1..] {
             assert!(
                 crate::srm::VELOCITY_PRODUCT_CODES.contains(message_code),
                 "{id} decodes as {message_code}, which srm::derive would refuse",
             );
         }
-        // Product 56 must NOT be in that set, or the 0.5° tilt would have the
+        // Product 56 must NOT be in that set, or a tilt would have the
         // correction applied to a field that already has it.
         assert!(!crate::srm::VELOCITY_PRODUCT_CODES.contains(&56));
+        assert!(
+            !crate::srm::SRM_TILT_PRODUCTS.contains(&crate::srm::STORM_MOTION_PRODUCT),
+            "the vector source is back as a tilt: it is 1 km at the RPG's 16 display \
+             levels where every other tilt is 0.25 km at 254, and its gate values \
+             already carry the RPG's vector, so the storm motion override cannot \
+             reach it",
+        );
     }
 
     // ── Live checks ───────────────────────────────────────────────────────

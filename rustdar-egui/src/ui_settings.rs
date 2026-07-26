@@ -164,8 +164,9 @@ impl super::Gui {
                 // --- Storm motion (storm-relative velocity) ---
                 //
                 // Off by default: the RPG's own SCIT average is in the N0S
-                // Product Description Block and is what the RPG used for the
-                // 0.5° tilt, so overriding it makes the tilts disagree.
+                // Product Description Block and is the vector the RPG itself
+                // fitted for this volume. An override replaces it on all four
+                // tilts at once — every one of them is derived.
                 ui.heading("Storm motion");
                 ui.add_space(SETTINGS_SMALL_SPACING);
                 let motion = &mut self.storm_motion_override;

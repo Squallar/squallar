@@ -201,10 +201,10 @@ pub struct Gui {
     pub show_settings: bool,
     /// GPS configuration (port, baud, heading source).
     pub gps_config: rustdar_gps::GpsConfig,
-    /// Storm motion the user typed in, overriding the RPG's SCIT average for
-    /// the derived storm-relative velocity tilts. `None` means "use the
-    /// vector the `N0S` product carries", which is the default and is what
-    /// AWIPS calls the average storm motion.
+    /// Storm motion the user typed in, overriding the RPG's SCIT average on
+    /// every storm-relative velocity tilt — all four are derived, so all four
+    /// take it. `None` means "use the vector the `N0S` product carries", which
+    /// is the default and is what AWIPS calls the average storm motion.
     pub storm_motion_override: StormMotionOverride,
 }
 

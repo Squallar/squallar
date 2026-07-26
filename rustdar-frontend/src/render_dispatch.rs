@@ -155,6 +155,24 @@ impl RenderCache {
     }
 }
 
+/// Whether a cached Level III product is one a pane can show.
+///
+/// Storm-relative velocity derives every tilt, 0.5° included, and fetches
+/// `N0S` on top of the four for the storm motion vector in its Product
+/// Description Block — no velocity product carries one, because halfword 51 is
+/// the BZ2 compression flag there. `N0S` must never be *drawn*: it is 1 km at
+/// the RPG's 16 display levels where the derived tilts are 0.25 km at 254, and
+/// its gate values already have the RPG's own vector in them, so a storm motion
+/// override cannot reach it.
+///
+/// Filtering here rather than in the elevation comparison because nothing in
+/// that comparison could separate the two: at `TLX` the bucket's `N0S` and
+/// `N0G` both report 0.5° and both report elevation number 1, so an unfiltered
+/// search resolves the 0.5° pane to whichever of them the hash yielded.
+fn is_renderable_tilt(product: RadarProduct, msg: &nexrad_level3::model::Level3Message) -> bool {
+    product != RadarProduct::StormRelativeVelocity || srm::is_velocity_source(msg)
+}
+
 /// Quantize an elevation angle to tenths of a degree for cache key use.
 ///
 /// Coarser than `rustdar_egui::pane::ELEVATION_TOLERANCE`, deliberately: that is a
@@ -233,6 +251,10 @@ impl RenderDispatcher {
     /// the shared render cache have to go: the cache is keyed on
     /// `(site, product, elevation)`, which the vector is not part of, so a
     /// stale entry would be handed straight back to the next pane that asked.
+    ///
+    /// All four tilts, 0.5° included. While that tilt rendered `N0S` directly
+    /// this invalidated it to redraw a byte-identical image, because the RPG's
+    /// vector was already in the gate values.
     pub fn set_storm_motion_override(&mut self, motion: Option<StormMotionSample>) -> bool {
         if self.last_storm_motion_override == motion {
             return false;
@@ -340,6 +362,9 @@ impl RenderDispatcher {
     ///
     /// Ties break on elevation number so a split cut or a SAILS/MRLE repeat,
     /// which share an angle, resolve to the same one every frame.
+    ///
+    /// Products that are cached but not displayable are filtered out first; see
+    /// [`is_renderable_tilt`].
     fn nearest_tilt(
         &self,
         product: RadarProduct,
@@ -348,7 +373,9 @@ impl RenderDispatcher {
     ) -> Option<Arc<Level3Product>> {
         self.level3_data
             .iter()
-            .filter(|((p, _tilt, s), _)| *p == product && s == site)
+            .filter(|((p, _tilt, s), l3)| {
+                *p == product && s == site && is_renderable_tilt(product, &l3.message)
+            })
             .min_by(|(_, a), (_, b)| {
                 let da = (a.message.pdb.elevation_angle() - elevation).abs();
                 let db = (b.message.pdb.elevation_angle() - elevation).abs();
@@ -361,10 +388,12 @@ impl RenderDispatcher {
 
     /// The storm motion vector to apply to a derived SRM tilt: the user's if
     /// they set one, otherwise whatever the newest `N0S` for this site carries.
+    /// Every tilt goes through here, so an override reaches all four.
     ///
     /// Only `N0S` has a vector — halfword 51 is the BZ2 compression flag on
     /// every digital product — so this scans the site's cached products for one
-    /// that reports it rather than assuming a tilt code.
+    /// that reports it rather than assuming a code. It is the one product
+    /// fetched that [`is_renderable_tilt`] then keeps off the screen.
     fn storm_motion_for(
         &self,
         site: &str,
@@ -382,8 +411,9 @@ impl RenderDispatcher {
     /// Spawn a Level III render for a pane if applicable.
     /// Returns `true` if a render was spawned.
     ///
-    /// Storm-relative velocity above 0.5° has no product on the wire and is
-    /// computed here from dealiased velocity; see [`rustdar_radar::srm`].
+    /// No storm-relative velocity tilt is rendered from a product on the wire;
+    /// all four are computed here from dealiased velocity. See
+    /// [`rustdar_radar::srm`].
     pub fn try_spawn_level3_render(
         &mut self,
         pane_idx: usize,
@@ -597,16 +627,25 @@ mod srm_dispatch_tests {
     /// Halfwords 47-53 of a real N1G. Halfword 51 is the BZ2 compression flag.
     const VELOCITY_PS: [i16; 7] = [-93, 74, 0, 8097, 1, 13, 16382];
 
-    /// A dispatcher holding one site's four SRM tilts, at the elevations
-    /// VCP 212 really produces.
+    /// The five keys one site's SRM fetch produces: the four derived tilts at
+    /// the elevations VCP 212 really produces, plus `N0S`, which is fetched for
+    /// its vector and must never be drawn.
+    ///
+    /// `N0S` and `N0G` are given the **same** 0.5° and the same elevation
+    /// number 1, which is what `TLX` really publishes — so nothing in the
+    /// nearest-angle search or its tie-break can separate them, and only
+    /// `is_renderable_tilt` can.
+    const SRM_FIXTURE: [(&str, i16, i16, u16, [i16; 7]); 5] = [
+        ("N0S", 56, 5, 1, N0S_PS),
+        ("N0G", 154, 5, 1, VELOCITY_PS),
+        ("N1G", 154, 13, 3, VELOCITY_PS),
+        ("N2U", 99, 24, 5, VELOCITY_PS),
+        ("N3U", 99, 31, 6, VELOCITY_PS),
+    ];
+
     fn loaded() -> RenderDispatcher {
         let mut d = RenderDispatcher::new();
-        for (code, product_code, tenths, elev_num, ps) in [
-            ("N0S", 56i16, 5i16, 1u16, N0S_PS),
-            ("N1G", 154, 13, 9, VELOCITY_PS),
-            ("N2U", 99, 24, 5, VELOCITY_PS),
-            ("N3U", 99, 31, 6, VELOCITY_PS),
-        ] {
+        for (code, product_code, tenths, elev_num, ps) in SRM_FIXTURE {
             d.level3_data.insert(
                 (RadarProduct::StormRelativeVelocity, code.to_string(), "KMPX".to_string()),
                 product(product_code, tenths, elev_num, 7108, ps),
@@ -626,7 +665,7 @@ mod srm_dispatch_tests {
             d.nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", e)
                 .map(|p| (p.message.pdb.elevation_angle(), p.message.pdb.product_code))
         };
-        assert_eq!(at(0.5), Some((0.5, 56)));
+        assert_eq!(at(0.5), Some((0.5, 154)), "0.5° derives from N0G, not N0S");
         assert_eq!(at(1.3), Some((1.3, 154)), "N1G is 1.3°, not the nominal 1.5°");
         assert_eq!(at(2.4), Some((2.4, 99)));
         assert_eq!(at(3.1), Some((3.1, 99)));
@@ -634,6 +673,150 @@ mod srm_dispatch_tests {
         // and nothing must resolve to a 1.5° that does not exist.
         assert_eq!(at(1.5), Some((1.3, 154)));
         assert_eq!(at(9.9), Some((3.1, 99)), "the highest cut is the nearest");
+        // 1.9° is the one request where reading the angle and assuming it
+        // disagree: VCP 212's real cuts put it 0.6° from 1.3° and 0.5° from
+        // 2.4°, so it belongs to `N2U`; the mnemonics' nominal 1.5°/2.4° put it
+        // 0.4° from `N1G` and would hand back a field a whole cut too low.
+        assert_eq!(at(1.9), Some((2.4, 99)), "ranked by the PDB, not by the mnemonic");
+    }
+
+    /// Only storm-relative velocity filters its candidates. Every other
+    /// Level III product is rendered straight from the message on the wire, and
+    /// none of them is dealiased velocity — so a filter that applied to all of
+    /// them would leave the KDP, echo-tops, VIL, hydrometeor and
+    /// precipitation-rate panes permanently blank, with nothing else about them
+    /// changed.
+    #[test]
+    fn the_other_level3_products_are_not_filtered_at_all() {
+        let mut d = RenderDispatcher::new();
+        for (radar_product, code, product_code) in [
+            (RadarProduct::SpecificDifferentialPhase, "N0K", 163i16),
+            (RadarProduct::EchoTops, "EET", 135),
+            (RadarProduct::VerticallyIntegratedLiquid, "DVL", 134),
+            (RadarProduct::HydrometeorClassification, "HHC", 177),
+            (RadarProduct::PrecipitationRate, "DPR", 176),
+        ] {
+            d.level3_data.insert(
+                (radar_product, code.to_string(), "KMPX".to_string()),
+                product(product_code, 5, 1, 7108, VELOCITY_PS),
+            );
+            let picked = d.nearest_tilt(radar_product, "KMPX", 0.5).unwrap_or_else(|| {
+                panic!("{code} is not dealiased velocity, and must render regardless")
+            });
+            assert_eq!(picked.message.pdb.product_code, product_code);
+        }
+    }
+
+    /// The RPG's own product 56 must never be chosen as a tilt.
+    ///
+    /// It shares both the angle and the elevation number with `N0G`, so the
+    /// tie-break cannot decide between them and hash order would: run over
+    /// **freshly built maps** in both insertion orders, because `std`'s
+    /// `RandomState` re-seeds per `HashMap` and one map iterates identically
+    /// every time.
+    #[test]
+    fn the_rpgs_own_storm_relative_product_is_never_drawn() {
+        for round in 0..60 {
+            let mut d = RenderDispatcher::new();
+            let mut fixture = SRM_FIXTURE;
+            if round % 2 == 1 {
+                fixture.reverse();
+            }
+            for (code, product_code, tenths, elev_num, ps) in fixture {
+                d.level3_data.insert(
+                    (RadarProduct::StormRelativeVelocity, code.to_string(), "KMPX".to_string()),
+                    product(product_code, tenths, elev_num, 7108, ps),
+                );
+            }
+            for elevation in [0.0, 0.5, 0.9, 1.3, 2.4, 3.1] {
+                let picked = d
+                    .nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", elevation)
+                    .expect("every elevation resolves to some tilt");
+                assert_ne!(
+                    picked.message.pdb.product_code, 56,
+                    "round {round}, {elevation}°: the pane would show the RPG's 1 km \
+                     field with its own vector baked in",
+                );
+            }
+        }
+    }
+
+    /// With no `N0G` the 0.5° pane falls back to the next derived tilt, never
+    /// to `N0S`. The fallback is a wrong *elevation*, which the pane can at
+    /// least be honest about; `N0S` would be a wrong *kind of field*.
+    #[test]
+    fn a_missing_lowest_tilt_does_not_fall_back_to_the_rpgs_product() {
+        let mut d = loaded();
+        d.level3_data
+            .remove(&(RadarProduct::StormRelativeVelocity, "N0G".to_string(), "KMPX".to_string()));
+        let picked = d
+            .nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", 0.5)
+            .expect("the upper tilts are still loaded");
+        assert_eq!(picked.message.pdb.product_code, 154);
+        assert_eq!(picked.message.pdb.elevation_angle(), 1.3, "the nearest surviving cut");
+        // With every velocity product gone there is no tilt at all, rather than
+        // `N0S` reappearing as one.
+        for code in ["N1G", "N2U", "N3U"] {
+            d.level3_data
+                .remove(&(RadarProduct::StormRelativeVelocity, code.to_string(), "KMPX".to_string()));
+        }
+        assert!(d.nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", 0.5).is_none());
+        // …and the vector is still there to be read, so the filter removed it
+        // from the screen and not from the cache.
+        assert!(d.storm_motion_for("KMPX", None).is_some());
+    }
+
+    /// Every tilt is derived, so every tilt honours the override — including
+    /// 0.5°, which ignored it entirely while it rendered `N0S`.
+    #[test]
+    fn the_storm_motion_override_reaches_every_tilt_including_the_lowest() {
+        let d = loaded();
+        let o = StormMotionSample::user_override(45.0, 210.0).expect("finite");
+        for elevation in [0.5f32, 1.3, 2.4, 3.1] {
+            let tilt = d
+                .nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", elevation)
+                .unwrap_or_else(|| panic!("{elevation}° has a tilt"));
+            let overridden = srm::derive(
+                &tilt.message,
+                &d.storm_motion_for("KMPX", Some(o)).expect("the override is a vector"),
+            )
+            .unwrap_or_else(|| panic!("{elevation}° derives"));
+            let rpg = srm::derive(
+                &tilt.message,
+                &d.storm_motion_for("KMPX", None).expect("N0S is loaded"),
+            )
+            .unwrap_or_else(|| panic!("{elevation}° derives"));
+
+            assert_eq!(overridden.motion.speed_kt, 45.0, "{elevation}°");
+            assert_eq!(overridden.motion.direction_deg, 210.0, "{elevation}°");
+            assert!(!overridden.motion.is_scit_average, "{elevation}°");
+            // Recording the vector is not applying it: the gates have to move.
+            assert_ne!(
+                overridden.packet.radials[0].gate_values,
+                rpg.packet.radials[0].gate_values,
+                "{elevation}°: the override was recorded but never reached the field",
+            );
+        }
+    }
+
+    /// Every tilt is 0.25 km. `N0S` is 1 km, so while it was rendered the 0.5°
+    /// pane was four times coarser than the three above it.
+    #[test]
+    fn every_tilt_is_a_quarter_kilometre_field() {
+        let d = loaded();
+        let s = d.storm_motion_for("KMPX", None).expect("N0S is loaded");
+        for elevation in [0.5f32, 1.3, 2.4, 3.1] {
+            let tilt = d
+                .nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", elevation)
+                .unwrap_or_else(|| panic!("{elevation}° has a tilt"));
+            let derived = srm::derive(&tilt.message, &s)
+                .unwrap_or_else(|| panic!("{elevation}° derives"));
+            assert!(
+                (derived.packet.gate_interval_km() - 0.25).abs() < 1e-9,
+                "{elevation}°: {} km gates",
+                derived.packet.gate_interval_km(),
+            );
+        }
     }
 
     /// Another site's products must never be borrowed. Both sites carry the
