@@ -539,7 +539,7 @@ impl InputHarness {
     ///
     /// No integration in this workspace actually produces this:
     /// `egui-winit`'s `on_mouse_motion` (`lib.rs:759`) is reachable only from
-    /// `DeviceEvent`, and `rustdar-platform/src/egui_renderer.rs:59` forwards
+    /// `DeviceEvent`, and `rustdar-frontend/src/egui_renderer.rs:79` forwards
     /// `on_window_event` only. It is here to exercise the tracker's defensive
     /// position fallback, and to prove a delta with no coordinates cannot
     /// resurrect a cancelled touch.
@@ -929,6 +929,66 @@ mod tests {
         );
     }
 
+    /// 3b. The long press must not fire **early**.
+    ///
+    ///     Test 3 only pins the late direction — that a 1s hold does raise the
+    ///     tooltip — so shortening `LONG_PRESS_DURATION_S` to a hundredth of a
+    ///     second passes it. Early is the direction that hurts: the tooltip
+    ///     appearing under an ordinary tap, or the moment a pan begins, taking
+    ///     the drag away from the map.
+    #[test]
+    fn a_long_press_does_not_fire_before_its_threshold() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+
+        h.touch_start(pos);
+        // 0.7s of held, motionless finger: still short of LONG_PRESS_DURATION_S.
+        h.assert_every_frame_for(0.7, 0.05, |frame, outcome| {
+            assert_eq!(
+                outcome.touch.long_press_pos, None,
+                "frame {frame}: the hold is not old enough to be a long press"
+            );
+            assert!(
+                !outcome.touch.suppress_pan,
+                "frame {frame}: and nothing may take the pan yet either"
+            );
+        });
+
+        // Past it, it does fire — so the assertion above is about *when*, not
+        // about the detector having been switched off.
+        let held = h.frames_for(4, 0.05);
+        assert_eq!(held.touch.long_press_pos, Some(pos));
+    }
+
+    /// 3c. A finger that keeps moving never becomes a long press, however long
+    ///     it goes on.
+    ///
+    ///     The cancel-on-movement branch is what separates a hold from a pan,
+    ///     and nothing pinned it: widening `LONG_PRESS_MAX_MOVE_PX` to 2000, or
+    ///     dropping the branch entirely, raises a tooltip mid-drag and
+    ///     suppresses the pan under it. The finger zigzags rather than running
+    ///     off in one direction so the distance per frame, not the distance from
+    ///     the start, is what the detector has to be reading.
+    #[test]
+    fn a_moving_finger_never_becomes_a_long_press() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+
+        h.touch_start(pos);
+        h.frame_after(FRAME_DT);
+        // 1.2s — comfortably past LONG_PRESS_DURATION_S — of 30px steps.
+        for step in 0..12 {
+            let jitter = if step % 2 == 0 { 30.0 } else { 0.0 };
+            h.touch_move(pos + egui::vec2(0.0, jitter));
+            let moving = h.frame_after(0.1);
+            assert_eq!(
+                moving.touch.long_press_pos, None,
+                "step {step}: a finger still moving is a pan, not a hold"
+            );
+            assert!(!moving.touch.suppress_pan, "step {step}: pan must stay live");
+        }
+    }
+
     /// 4. A touch tap is deferred until the double-tap window closes, then
     ///    reported once at the tapped position.
     #[test]
@@ -993,6 +1053,113 @@ mod tests {
         assert_eq!(
             settled.touch.overlay_click_pos, None,
             "double-tap-drag must never open an overlay popup"
+        );
+    }
+
+    /// 5b. A second tap somewhere else is a separate tap, not a double tap.
+    ///
+    ///     `DOUBLE_TAP_DISTANCE_PX` is the only thing keeping two unrelated taps
+    ///     in quick succession — which is what walking a finger across the map
+    ///     looks like — out of a zoom drag. Test 5 taps twice at the same point,
+    ///     so it holds neither this bound nor the `&&` joining it to the timeout.
+    #[test]
+    fn a_second_tap_far_away_does_not_enter_a_zoom_drag() {
+        let mut h = InputHarness::new();
+        let near = h.map_center();
+        let far = near + egui::vec2(200.0, 0.0);
+        let zoom_before = h.zoom();
+
+        h.touch_tap(near);
+        // Well inside DOUBLE_TAP_TIMEOUT_S, well outside DOUBLE_TAP_DISTANCE_PX.
+        h.touch_start(far);
+        let pressed = h.frame_after(0.05);
+        assert!(
+            !pressed.touch.suppress_pan,
+            "a tap 200px away is not the second half of a double tap"
+        );
+
+        for step in 1..=3 {
+            h.touch_move(far + egui::vec2(0.0, 50.0 * step as f32));
+            h.frame_after(FRAME_DT);
+        }
+        let dragged = h.frame_after(FRAME_DT);
+        assert!(
+            (dragged.zoom - zoom_before).abs() < 1e-9,
+            "dragging after an unrelated tap must pan, not zoom: {zoom_before} \
+             -> {}",
+            dragged.zoom
+        );
+    }
+
+    /// 5c. …but the second tap does not have to be pixel-exact.
+    ///
+    ///     The other direction of the same bound, and the one that decides
+    ///     whether the gesture is usable at all: a finger never lands twice on
+    ///     the same pixel, so a `DOUBLE_TAP_DISTANCE_PX` tightened towards zero
+    ///     leaves double-tap-zoom looking simply broken.
+    #[test]
+    fn a_double_tap_tolerates_the_jitter_between_two_real_taps() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+
+        h.touch_tap(pos);
+        h.touch_start(pos + egui::vec2(10.0, 0.0));
+        let pressed = h.frame_after(0.05);
+        assert!(
+            pressed.touch.suppress_pan,
+            "10px between two taps is a double tap, not two singles"
+        );
+    }
+
+    /// 5d. A zoom drag held still is still a zoom drag.
+    ///
+    ///     The long press is polled only when no zoom drag is running, and
+    ///     nothing pinned that exclusion. A user who double-taps and then holds
+    ///     before dragging is doing something completely ordinary, and without
+    ///     the gate they get the radar-value tooltip on top of the zoom.
+    #[test]
+    fn a_stationary_zoom_drag_does_not_become_a_long_press() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+
+        h.touch_tap(pos);
+        h.touch_start(pos);
+        let dragging = h.frame_after(0.05);
+        assert!(
+            dragging.touch.suppress_pan,
+            "precondition: the second press must have entered a zoom drag"
+        );
+
+        h.assert_every_frame_for(1.5, 0.1, |frame, outcome| {
+            assert_eq!(
+                outcome.touch.long_press_pos, None,
+                "frame {frame}: a zoom drag owns the finger, tooltip and all"
+            );
+        });
+    }
+
+    /// 5e. The zoom drag moves one level per `ZOOM_DRAG_SENSITIVITY` pixels.
+    ///
+    ///     Test 5 pins only the sign — that dragging down zooms in — so a
+    ///     tenfold sensitivity passes it while slamming the map from one zoom
+    ///     stop to the other on the smallest drag. This pins the rate.
+    #[test]
+    fn the_zoom_drag_moves_one_level_per_sensitivity_of_travel() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+        let zoom_before = h.zoom();
+
+        h.touch_tap(pos);
+        h.touch_start(pos);
+        h.frame_after(0.05);
+        // Exactly ZOOM_DRAG_SENSITIVITY pixels of travel: one zoom level.
+        h.touch_move(pos + egui::vec2(0.0, 150.0));
+        let dragged = h.frame_after(FRAME_DT);
+
+        assert!(
+            (dragged.zoom - (zoom_before + 1.0)).abs() < 0.05,
+            "150px of drag is one zoom level: {zoom_before} -> {}",
+            dragged.zoom
         );
     }
 
@@ -1619,11 +1786,80 @@ mod tests {
 
         h.web_second_finger_up(centre + egui::vec2(160.0, 0.0));
         h.web_first_finger_up(centre - egui::vec2(160.0, 0.0));
-        let settled = h.frames_for(5, 0.2);
+        // Frame by frame, not just the last one: a confirmed tap surfaces
+        // exactly [`DOUBLE_TAP_TIMEOUT_S`] after the release and
+        // `take_confirmed_tap` consumes it on that one frame, so a run that only
+        // reads the final outcome is looking 0.6s after the evidence went away.
+        h.assert_every_frame_for(1.0, 0.2, |frame, outcome| {
+            assert_eq!(
+                outcome.resolved.overlay_click_pos, None,
+                "frame {frame}: lifting out of a pinch must not become a \
+                 deferred tap either"
+            );
+        });
+    }
+
+    /// 7e-i. A quick flick is not a tap — **distance alone**.
+    ///
+    ///     The classifier is `duration < A && distance < B`, and the pinch above
+    ///     breaks both conjuncts at once, so it holds neither one in place: with
+    ///     `TAP_DISTANCE_MAX_PX` widened to 2000 the pinch is still too slow to
+    ///     be a tap and 7e passes regardless. This flick is comfortably inside
+    ///     the duration bound and only outside the distance one, so it fails if
+    ///     and only if the distance bound stops doing its job — which is a drag
+    ///     of the map opening an overlay popup under the finger.
+    #[test]
+    fn a_quick_flick_is_not_a_tap() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+
+        h.touch_start(pos);
+        h.frame_after(FRAME_DT);
+        for step in 1..=4 {
+            h.touch_move(pos + egui::vec2(30.0 * step as f32, 0.0));
+            h.frame_after(FRAME_DT);
+        }
+        // ~0.08s and 120px: well under TAP_DURATION_MAX_S, well over
+        // TAP_DISTANCE_MAX_PX.
+        h.touch_end(pos + egui::vec2(120.0, 0.0));
+
+        h.assert_every_frame_for(1.0, 0.1, |frame, outcome| {
+            assert_eq!(
+                outcome.touch.overlay_click_pos, None,
+                "frame {frame}: a 120px flick is a drag, not a tap"
+            );
+        });
+    }
+
+    /// 7e-ii. A slow stationary press is not a tap — **duration alone**.
+    ///
+    ///     The mirror of 7e-i, and what pins `TAP_DURATION_MAX_S`: the finger
+    ///     never moves, so the distance bound is satisfied throughout and only
+    ///     the duration bound can reject it. Half a second is past
+    ///     `TAP_DURATION_MAX_S` and short of `LONG_PRESS_DURATION_S`, so this is
+    ///     the deliberate-but-not-yet-a-long-press hold, which must resolve to
+    ///     nothing at all.
+    #[test]
+    fn a_slow_stationary_press_is_not_a_tap() {
+        let mut h = InputHarness::new();
+        let pos = h.map_center();
+
+        h.touch_start(pos);
+        h.frame_after(FRAME_DT);
+        let held = h.frames_for(5, 0.1);
         assert_eq!(
-            settled.resolved.overlay_click_pos, None,
-            "lifting out of a pinch must not become a deferred tap either"
+            held.touch.long_press_pos, None,
+            "precondition: 0.5s must still be short of a long press, or this \
+             probe is testing the long-press path instead"
         );
+        h.touch_end(pos);
+
+        h.assert_every_frame_for(1.0, 0.1, |frame, outcome| {
+            assert_eq!(
+                outcome.touch.overlay_click_pos, None,
+                "frame {frame}: a 0.5s hold is not a tap"
+            );
+        });
     }
 
     /// 7f. **A pinch that ends one finger at a time must not strand the map.**
@@ -1680,14 +1916,21 @@ mod tests {
 
     /// 7g. **A wheel notch must zoom the same however the browser spelled it.**
     ///
-    ///     Measured on Firefox 153: one notch is `deltaY: 132` in
-    ///     `DOM_DELTA_PIXEL` to this app, and `deltaY: 6` in `DOM_DELTA_LINE` to
-    ///     an ordinary page — same wheel, same click of the same detent. Without
-    ///     the rewrite egui scales the line form by `line_scroll_speed`, 8.0 on
-    ///     web, so that notch lands as 48 against the other's 132 and the map
-    ///     zooms 2.75x slower. Nothing errors; the wheel just feels wrong in one
-    ///     browser, which is why this is pinned on the ratio rather than on any
-    ///     absolute step.
+    ///     One detent of the same wheel: Chromium reports `deltaY: 120` in
+    ///     `DOM_DELTA_PIXEL`, Firefox `deltaY: 6` in `DOM_DELTA_LINE`. Those two
+    ///     numbers come from two different browsers, which is what makes this
+    ///     test independent of [`PX_PER_WHEEL_LINE`] — anchoring the line side on
+    ///     the pixel number the *same* browser would have sent only restates the
+    ///     constant. Without the rewrite egui scales the line form by
+    ///     `line_scroll_speed`, 8.0 on web, so Firefox's notch lands as 48
+    ///     against Chromium's 120 and the map zooms 2.5x slower. Nothing errors;
+    ///     the wheel just feels wrong in one browser, which is why this is pinned
+    ///     on the ratio rather than on any absolute step.
+    ///
+    ///     The band is 2% because the ratio at the shipped constant is exactly
+    ///     1.0 — `6 × 20` *is* 120, so the two runs see identical events. A 5%
+    ///     error in `PX_PER_WHEEL_LINE` moves it 5%, so anything looser stops
+    ///     being a calibration and starts being a smoke test.
     #[test]
     fn a_wheel_notch_zooms_the_same_in_either_wheel_unit() {
         /// Four notches over the pane centre, and the zoom they moved.
@@ -1707,18 +1950,18 @@ mod tests {
 
         // Negative delta is a scroll *down*, which walkers zooms out on; take
         // the magnitude so the two are compared on the same axis.
-        let pixel = notches(egui::MouseWheelUnit::Point, 132.0);
-        let line = notches(egui::MouseWheelUnit::Line, 6.0);
+        let chromium = notches(egui::MouseWheelUnit::Point, 120.0);
+        let firefox = notches(egui::MouseWheelUnit::Line, 6.0);
 
         assert!(
-            pixel.abs() > 0.5,
-            "precondition: a pixel-mode notch must zoom at all, got {pixel}"
+            chromium.abs() > 0.5,
+            "precondition: a pixel-mode notch must zoom at all, got {chromium}"
         );
-        let ratio = line / pixel;
+        let ratio = firefox / chromium;
         assert!(
-            (0.9..=1.1).contains(&ratio),
-            "the same notch in line units must zoom like the pixel one: \
-             pixel {pixel}, line {line} (ratio {ratio})"
+            (0.98..=1.02).contains(&ratio),
+            "one notch must move the map the same in either browser: \
+             Chromium {chromium}, Firefox {firefox} (ratio {ratio})"
         );
     }
 
@@ -1734,7 +1977,7 @@ mod tests {
         let mut input = egui::RawInput {
             events: vec![
                 wheel(egui::MouseWheelUnit::Line, egui::vec2(2.0, 6.0)),
-                wheel(egui::MouseWheelUnit::Point, egui::vec2(0.0, 132.0)),
+                wheel(egui::MouseWheelUnit::Point, egui::vec2(0.0, 120.0)),
             ],
             ..Default::default()
         };
@@ -1758,12 +2001,12 @@ mod tests {
             seen.iter().all(|(u, ..)| *u == egui::MouseWheelUnit::Point),
             "every wheel event must leave in point units, got {seen:?}"
         );
-        // 6 lines is the notch Firefox reports; 22 px a line makes it the 132 px
-        // the same browser reports for the same notch.
-        assert_eq!(seen[0].1, egui::vec2(44.0, 132.0), "line delta must scale");
+        // 6 lines is the notch Firefox reports; 20 px a line makes it the 120 px
+        // Chromium reports for the same detent.
+        assert_eq!(seen[0].1, egui::vec2(40.0, 120.0), "line delta must scale");
         assert_eq!(
             seen[1].1,
-            egui::vec2(0.0, 132.0),
+            egui::vec2(0.0, 120.0),
             "a point delta was already normal and must not be touched"
         );
         assert_eq!(
@@ -1801,7 +2044,7 @@ mod tests {
             panic!("expected a wheel event");
         };
         assert_eq!(
-            delta.y, 66.0,
+            delta.y, 60.0,
             "a 2x UI scale must halve the rewritten delta, as it already does \
              to the pixel deltas egui-winit produced"
         );

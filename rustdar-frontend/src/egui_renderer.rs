@@ -218,23 +218,29 @@ impl EguiRenderer {
 
 #[cfg(test)]
 mod tests {
-    /// Both input rewrites must precede `begin_pass`, and only this file says so.
+    /// `begin_frame`'s body, read out of this file's own source.
     ///
     /// `begin_frame` needs a real `Window` and a wgpu device, so no unit test
-    /// runs it; the input harness models the ordering but cannot observe this
-    /// function. Moving either call below `begin_pass` therefore broke nothing
-    /// in the suite while breaking pinch and wheel zoom in the browser — egui
-    /// folds the events in during `begin_pass`, so a later rewrite is a frame
-    /// too late and never reaches that frame's gestures.
-    #[test]
-    fn the_input_rewrites_run_before_begin_pass() {
-        let src = include_str!("egui_renderer.rs");
-        let body = src
+    /// can run it; the input harness models what the rewrites do but cannot
+    /// observe that this function calls them. Reading the source is the only
+    /// handle there is.
+    fn begin_frame_body() -> &'static str {
+        include_str!("egui_renderer.rs")
             .split_once("pub fn begin_frame(")
             .and_then(|(_, rest)| rest.split_once("\n    }"))
             .map(|(body, _)| body)
-            .expect("begin_frame is no longer a method here");
+            .expect("begin_frame is no longer a method here")
+    }
 
+    /// Both input rewrites must precede `begin_pass`, and only this file says so.
+    ///
+    /// Moving either call below `begin_pass` broke nothing in the suite while
+    /// breaking pinch and wheel zoom in the browser — egui folds the events in
+    /// during `begin_pass`, so a later rewrite is a frame too late and never
+    /// reaches that frame's gestures.
+    #[test]
+    fn the_input_rewrites_run_before_begin_pass() {
+        let body = begin_frame_body();
         let begin_pass = body
             .find("begin_pass(")
             .expect("begin_frame no longer starts a pass");
@@ -249,5 +255,39 @@ mod tests {
                  this frame's events and the rewrite lands a frame late"
             );
         }
+    }
+
+    /// The wheel rewrite must be *reachable*, and reachable on the web only.
+    ///
+    /// Order is not the only way to switch a call off, and the assertion above
+    /// sees none of the others: pointing the `cfg` at another arch makes the
+    /// rewrite dead on every target — the fix silently reverted, Firefox back to
+    /// a 2.5x slow wheel — while deleting the attribute runs it natively, where
+    /// winit already reports one line per notch and 20px a line against egui's
+    /// native `line_scroll_speed` of 40.0 nearly halves the desktop wheel. Both
+    /// leave the call exactly where it is, before `begin_pass`. So pin the
+    /// guard, not just the position.
+    #[test]
+    fn the_wheel_rewrite_is_gated_on_wasm32_and_nothing_else() {
+        let body = begin_frame_body();
+        let at = body
+            .find("normalize_wheel_units(")
+            .expect("begin_frame no longer calls normalize_wheel_units");
+
+        // Back up to the start of the call's own line, so the search lands on
+        // the attribute above it rather than on the call's indentation.
+        let line_start = body[..at].rfind('\n').map_or(0, |nl| nl + 1);
+        let guard = body[..line_start]
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .expect("nothing at all precedes the wheel rewrite");
+
+        assert_eq!(
+            guard, r#"#[cfg(target_arch = "wasm32")]"#,
+            "the wheel rewrite must sit directly under that cfg and no other \
+             guard; found {guard:?}"
+        );
     }
 }

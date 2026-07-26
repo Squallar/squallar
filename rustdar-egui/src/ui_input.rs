@@ -85,18 +85,23 @@ pub fn normalize_touch_devices(input: &mut egui::RawInput) {
 
 /// CSS pixels one `DOM_DELTA_LINE` line is worth.
 ///
-/// Firefox's own ratio for one notch, measured on 153: `deltaY: 132` in pixel
-/// mode, `deltaY: 6` in line mode. Matching a browser to itself, not to Chromium.
-const PX_PER_WHEEL_LINE: f32 = 22.0;
+/// The cross-browser rate for one notch: Chromium spells it `deltaY: 120` in
+/// pixel mode, Firefox spells the same detent `deltaY: 6` in line mode, so
+/// `120 / 6` is what makes one notch move the map equally in either browser.
+const PX_PER_WHEEL_LINE: f32 = 20.0;
 
 /// Rewrite line-mode wheel events as pixel-mode ones, so a notch zooms the same
 /// whichever way the browser spelled it.
 ///
-/// Chromium always sends `DOM_DELTA_PIXEL`; Firefox sends `DOM_DELTA_LINE` to an
-/// ordinary page and `DOM_DELTA_PIXEL` to this one. egui scales `Line` by
-/// `line_scroll_speed`, 8.0 on web against 40.0 native, so the notch Firefox
-/// spells as 6 lines arrives as 48 where the same notch as 132 pixels arrives as
-/// 132 — a 2.75x slower zoom, and nothing looks broken enough to notice.
+/// Chromium always sends `DOM_DELTA_PIXEL`, Firefox always `DOM_DELTA_LINE` —
+/// measured on 153, which reports `deltaMode 1, deltaY 6` to this app and to an
+/// ordinary page alike, at any `devicePixelRatio` and under any modifier. egui
+/// scales `Line` by `line_scroll_speed`, 8.0 on web against 40.0 native, so that
+/// notch arrives as 48 against Chromium's 120 — a 2.5x slower zoom, and nothing
+/// looks broken enough to notice.
+///
+/// `DOM_DELTA_PAGE` needs no case: winit drops it before egui sees it
+/// (`winit-0.30.13/src/platform_impl/web/web_sys/event.rs:159` returns `None`).
 ///
 /// `zoom_factor` divides because `egui-winit` already divided the pixel deltas by
 /// it; without it the UI-scale setting would change one spelling's speed only.
