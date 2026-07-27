@@ -75,14 +75,30 @@ impl super::App {
     ///
     /// OS display scaling is *not* included: egui-winit puts it on the raw input
     /// and egui applies it itself.
+    ///
+    /// # Why the pollers run before `Gui::ui`
+    ///
+    /// Everything they apply — a finished radar image, an overlay raster, a
+    /// loop frame — is state the UI reads while it lays the frame out. Applied
+    /// after the layout it misses the frame that was being built, and nothing
+    /// asks for another one: the re-arm at the end of `handle_redraw` fires only
+    /// for a render still in flight, for auto-poll, or for an active loop. So
+    /// the *last* result of a batch, with auto-poll off, sat applied but
+    /// unpresented until something unrelated — a mouse move — repainted.
+    ///
+    /// Polling first costs nothing. A poller needs `&mut self` and an
+    /// `egui::Context`, and `Context::load_texture` neither needs a pass to be
+    /// open nor cares that one is. The dispatchers move with them: they read
+    /// the selection the *previous* frame left, which is what they did anyway
+    /// for every frame the UI did not change it.
     pub(super) fn setup_egui_frame(&mut self) -> ([u32; 2], Vec<GuiAction>) {
         // Before the pass, because the cache it writes is read by everything
         // that rasterizes off-frame — see `App::resolve_theme`.
         let use_dark_theme = self.resolve_theme();
 
-        // Apply theme and run the egui UI pass.
+        // Open egui's pass and apply the theme.
         // Scoped so `state` is dropped before we call &mut self methods below.
-        let (size_in_pixels, gui_action) = {
+        let size_in_pixels = {
             let state = self.state.as_mut().unwrap();
             let window = self.window.as_ref().unwrap();
 
@@ -95,16 +111,12 @@ impl super::App {
             // started rather than the one it happened to hold beforehand.
             let zoom_factor = state.scale_factor * css_to_canvas_scale_x;
 
-            let size_in_pixels = [state.surface_config.width, state.surface_config.height];
-
             // Start egui frame
             state.egui_renderer.begin_frame(window, zoom_factor);
 
             state.egui_renderer.apply_theme(use_dark_theme);
 
-            let gui_action = self.gui.ui(state.egui_renderer.context());
-
-            (size_in_pixels, gui_action)
+            [state.surface_config.width, state.surface_config.height]
         };
 
         // Clean up old textures from previous frame
@@ -124,6 +136,10 @@ impl super::App {
         self.dispatch_pane_renders();
         self.dispatch_loop_renders();
         self.update_loop_readiness();
+
+        // Last, so this frame is laid out over everything applied above.
+        let ctx = self.state.as_ref().unwrap().egui_renderer.context().clone();
+        let gui_action = self.gui.ui(&ctx);
 
         (size_in_pixels, gui_action)
     }
@@ -2580,6 +2596,59 @@ mod stamping_tests {
             "a Level II volume is still captioned with the last Level III \
              object's age",
         );
+    }
+}
+
+/// The order one frame is assembled in.
+///
+/// `setup_egui_frame` unwraps an `AppState`, which is a wgpu device, a surface
+/// and a window — none of which exist here — so the sequence can only be read
+/// off the source, the same handle `handle_input_events` and `begin_frame` are
+/// pinned by.
+#[cfg(test)]
+mod frame_build_order_tests {
+    /// The body of `setup_egui_frame`.
+    fn setup_body() -> &'static str {
+        let (_, rest) = include_str!("app_render.rs")
+            .split_once("fn setup_egui_frame(")
+            .expect("setup_egui_frame is no longer a method here");
+        rest.split_once("\n    }")
+            .map(|(body, _)| body)
+            .expect("setup_egui_frame has no recognisable body")
+    }
+
+    /// Nothing a poller applies may land after the frame has been laid out.
+    ///
+    /// A result applied afterwards misses the frame it was applied to, and
+    /// nothing schedules the one that would show it: the re-arm at the end of
+    /// `handle_redraw` covers a render still in flight, auto-poll and an active
+    /// loop, and the last result of a batch is none of those. With auto-poll off
+    /// it sat there, applied and unpresented, until a mouse move repainted.
+    #[test]
+    fn every_poller_runs_before_the_frame_is_laid_out() {
+        let body = setup_body();
+        let laid_out = body
+            .find("self.gui.ui(")
+            .expect("setup_egui_frame no longer lays out a frame");
+
+        for poller in [
+            "self.poll_render_results(",
+            "self.poll_level3_results(",
+            "self.poll_overlay_render_results(",
+            "self.poll_loop_scan_list_results(",
+            "self.poll_loop_scan_download_results(",
+            "self.poll_loop_render_results(",
+        ] {
+            let at = body
+                .find(poller)
+                .unwrap_or_else(|| panic!("{poller} is no longer called from setup_egui_frame"));
+            assert!(
+                at < laid_out,
+                "{poller} applies its results after the frame has been laid \
+                 out, so the last of a batch is not on screen until something \
+                 unrelated repaints",
+            );
+        }
     }
 }
 
