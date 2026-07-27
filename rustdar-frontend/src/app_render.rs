@@ -1,5 +1,6 @@
 use crate::constants::{
-    MAX_CONCURRENT_LOOP_DOWNLOADS, MAX_CONCURRENT_RENDERS, MAX_LOOP_FRAMES, MAX_LOOP_RENDER_BUDGET,
+    DEFAULT_LOOP_SPEED_FPS, MAX_CONCURRENT_LOOP_DOWNLOADS, MAX_CONCURRENT_RENDERS, MAX_LOOP_FRAMES,
+    MAX_LOOP_RENDER_BUDGET, MAX_LOOP_SPEED_FPS, MIN_LOOP_SPEED_FPS,
 };
 use crate::loop_downloads::PendingDownloads;
 use crate::render_dispatch::CachedPaneRender;
@@ -60,6 +61,27 @@ pub(crate) fn finish_then_acquire<P>(
     (prepared, status)
 }
 
+/// How long one loop frame is held on screen, for a stored playback speed.
+///
+/// The clamp is here rather than at the slider because this is the last point
+/// before the value becomes a `Duration`, and `Duration::from_secs_f32` panics
+/// on a negative, an infinity or a NaN — while `1.0 / 0.0` is an infinity, so a
+/// stored zero panics too. The slider that normally writes `loop_speed_fps`
+/// bounds an *edit*; a config load assigns the stored number as it stands. See
+/// [`MIN_LOOP_SPEED_FPS`].
+///
+/// NaN is handled before the clamp, not by it: `f32::clamp` propagates NaN
+/// rather than replacing it, so clamping alone would leave the panic in place
+/// for the one input that reaches it by arithmetic rather than by editing.
+fn loop_interval(fps: f32) -> std::time::Duration {
+    let fps = if fps.is_finite() {
+        fps.clamp(MIN_LOOP_SPEED_FPS, MAX_LOOP_SPEED_FPS)
+    } else {
+        DEFAULT_LOOP_SPEED_FPS
+    };
+    std::time::Duration::from_secs_f32(1.0 / fps)
+}
+
 impl super::App {
     /// Set up and run the egui UI pass.
     ///
@@ -68,51 +90,55 @@ impl super::App {
     /// egui here and read back off the context when the pass ends, so there is
     /// no second copy of it to drift.
     ///
-    /// The scale handed to egui accounts for:
-    /// - Application scale factor (state.scale_factor)
-    /// - Surface-to-window ratio (matters on web, where the canvas backing
-    ///   store can differ from the CSS size)
+    /// The scale handed to egui is the surface-to-window ratio, which matters on
+    /// web, where the canvas backing store can differ from its CSS size. There is
+    /// no second, application-level factor beside it: `AppState` used to carry a
+    /// `scale_factor` that was initialised to 1.0 and never written, so the
+    /// product it took part in was always just this ratio.
     ///
     /// OS display scaling is *not* included: egui-winit puts it on the raw input
     /// and egui applies it itself.
+    ///
+    /// # Why the pollers run before `Gui::ui`
+    ///
+    /// Everything they apply — a finished radar image, an overlay raster, a
+    /// loop frame — is state the UI reads while it lays the frame out. Applied
+    /// after the layout it misses the frame that was being built, and nothing
+    /// asks for another one: the re-arm at the end of `handle_redraw` fires only
+    /// for a render still in flight, for auto-poll, or for an active loop. So
+    /// the *last* result of a batch, with auto-poll off, sat applied but
+    /// unpresented until something unrelated — a mouse move — repainted.
+    ///
+    /// Polling first costs nothing. A poller needs `&mut self` and an
+    /// `egui::Context`, and `Context::load_texture` neither needs a pass to be
+    /// open nor cares that one is. The dispatchers move with them: they read
+    /// the selection the *previous* frame left, which is what they did anyway
+    /// for every frame the UI did not change it.
     pub(super) fn setup_egui_frame(&mut self) -> ([u32; 2], Vec<GuiAction>) {
-        // Apply theme and run the egui UI pass.
+        // Before the pass, because the cache it writes is read by everything
+        // that rasterizes off-frame — see `App::resolve_theme`.
+        let use_dark_theme = self.resolve_theme();
+
+        // Open egui's pass and apply the theme.
         // Scoped so `state` is dropped before we call &mut self methods below.
-        let (size_in_pixels, gui_action) = {
+        let size_in_pixels = {
             let state = self.state.as_mut().unwrap();
             let window = self.window.as_ref().unwrap();
 
             let window_size = window.inner_size();
-            let css_to_canvas_scale_x =
-                state.surface_config.width as f32 / window_size.width.max(1) as f32;
-            // The application's own scaling only. `window.scale_factor()` is
-            // deliberately not folded in: egui already has it from the raw input
-            // and multiplies it back on, using the value for the pass being
-            // started rather than the one it happened to hold beforehand.
-            let zoom_factor = state.scale_factor * css_to_canvas_scale_x;
-
-            let size_in_pixels = [state.surface_config.width, state.surface_config.height];
+            // The CSS-size-to-backing-store ratio, and nothing else.
+            // `window.scale_factor()` is deliberately not folded in: egui
+            // already has it from the raw input and multiplies it back on, using
+            // the value for the pass being started rather than the one it
+            // happened to hold beforehand.
+            let zoom_factor = state.surface_config.width as f32 / window_size.width.max(1) as f32;
 
             // Start egui frame
             state.egui_renderer.begin_frame(window, zoom_factor);
 
-            // Set theme based on OS preference
-            let use_dark_theme = match window.theme() {
-                Some(theme) => matches!(theme, winit::window::Theme::Dark),
-                None => match self.cached_dark_theme {
-                    Some(cached) => cached,
-                    None => {
-                        let detected = self.platform.detect_dark_theme();
-                        self.cached_dark_theme = Some(detected);
-                        detected
-                    }
-                },
-            };
             state.egui_renderer.apply_theme(use_dark_theme);
 
-            let gui_action = self.gui.ui(state.egui_renderer.context());
-
-            (size_in_pixels, gui_action)
+            [state.surface_config.width, state.surface_config.height]
         };
 
         // Clean up old textures from previous frame
@@ -132,6 +158,10 @@ impl super::App {
         self.dispatch_pane_renders();
         self.dispatch_loop_renders();
         self.update_loop_readiness();
+
+        // Last, so this frame is laid out over everything applied above.
+        let ctx = self.state.as_ref().unwrap().egui_renderer.context().clone();
+        let gui_action = self.gui.ui(&ctx);
 
         (size_in_pixels, gui_action)
     }
@@ -314,111 +344,115 @@ impl super::App {
     }
 
     /// Poll for completed Level III fetch results and update scan info.
+    ///
+    /// Drains, like every sibling poller. One Level II scan spawns a fetch per
+    /// Level III product *and tilt code* — a dozen and more, all landing within
+    /// a few hundred milliseconds of each other — so taking one per frame turned
+    /// the product picker into a list that fills in one entry per redraw, and
+    /// stalled outright on the frame where no redraw follows.
     fn poll_level3_results(&mut self) {
-        let Ok(l3_resp) = self.channels.level3_receiver.try_recv() else {
-            return;
-        };
-
-        if self
-            .render
-            .is_fetch_stale(&l3_resp.site, l3_resp.generation)
-        {
-            log::debug!(
-                "Discarding stale Level III result for {} (gen {})",
-                l3_resp.site,
-                l3_resp.generation
-            );
-            return;
-        }
-
-        let fetched = match l3_resp.result {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!("Level III {:?} fetch failed: {}", l3_resp.product, e);
-                return;
-            }
-        };
-
-        let elevation = fetched.message.pdb.elevation_angle();
-        // The age is logged, not just carried: `latest_key` falls back to the
-        // previous UTC day, so a site down since yesterday delivers a product
-        // up to ~48 h old and this is currently the only place that says so.
-        // Surfacing it in the pane is what remains — see `ProductStamp`.
-        log::info!(
-            "Level III {:?} {} fetched successfully (elevation={:.1}°, key={}, age={:?} min)",
-            l3_resp.product,
-            l3_resp.tilt_code,
-            elevation,
-            fetched.stamp.key,
-            fetched
-                .age(chrono::Utc::now().naive_utc())
-                .map(|a| a.num_minutes()),
-        );
-        self.render.cache_level3(
-            l3_resp.product,
-            l3_resp.tilt_code.clone(),
-            l3_resp.site.clone(),
-            fetched,
-        );
-
-        // Trigger a re-render for panes on the same site viewing this product
-        for (idx, prs) in self.render.pane_render.iter_mut().enumerate() {
-            let pane_matches_site = self.gui.pane(idx).is_some_and(|p| p.site == l3_resp.site);
-            if pane_matches_site
-                && self.gui.get_rendering_params_for_pane(idx).map(|(p, _)| p)
-                    == Some(l3_resp.product)
+        while let Ok(l3_resp) = self.channels.level3_receiver.try_recv() {
+            if self
+                .render
+                .is_fetch_stale(&l3_resp.site, l3_resp.generation)
             {
-                prs.last_rendered = None;
-            }
-        }
-
-        // Add Level III products to the scan info for panes on this site
-        for pane_idx in 0..self.gui.pane_count() {
-            let pane_site = self
-                .gui
-                .pane(pane_idx)
-                .map(|p| p.site.clone())
-                .unwrap_or_default();
-            if pane_site != l3_resp.site {
-                continue;
-            }
-            let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
-                continue;
-            };
-            let mut info = scan_info.clone();
-            let mut changed = false;
-            if !info.available_products.contains(&l3_resp.product) {
-                info.available_products.push(l3_resp.product);
-                info.available_products.sort_by_key(|p| p.sort_order());
-                info.status = format!(
-                    "Loaded {} products: {}",
-                    info.available_products.len(),
-                    info.available_products
-                        .iter()
-                        .map(|p| p.name())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                log::debug!(
+                    "Discarding stale Level III result for {} (gen {})",
+                    l3_resp.site,
+                    l3_resp.generation
                 );
-                changed = true;
+                continue;
             }
-            // Register the actual elevation angle from the PDB.
-            //
-            // `render_dispatch::is_renderable_tilt` is *not* applied here, so
-            // `N0S` — fetched for its storm motion vector alone and never drawn
-            // — does register an SRM elevation. That is harmless only by
-            // coincidence: `N0S` and `N0G` are both 0.5°, so the dedupe just
-            // below collapses them and the picker gains no entry it cannot
-            // render. A vector source at an angle no tilt product shares would
-            // put a dead entry in the elevation list, selectable and blank.
-            let elevations = info.product_elevations.entry(l3_resp.product).or_default();
-            let rounded_elev = (elevation * 10.0).round() / 10.0;
-            if !elevations.iter().any(|e| (e - rounded_elev).abs() < 0.05) {
-                elevations.push(rounded_elev);
-                elevations.sort_by(|a, b| a.total_cmp(b));
-                changed = true;
+
+            let fetched = match l3_resp.result {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("Level III {:?} fetch failed: {}", l3_resp.product, e);
+                    continue;
+                }
+            };
+
+            let elevation = fetched.message.pdb.elevation_angle();
+            // The age is logged, not just carried: `latest_key` falls back to the
+            // previous UTC day, so a site down since yesterday delivers a product
+            // up to ~48 h old and this is currently the only place that says so.
+            // Surfacing it in the pane is what remains — see `ProductStamp`.
+            log::info!(
+                "Level III {:?} {} fetched successfully (elevation={:.1}°, key={}, age={:?} min)",
+                l3_resp.product,
+                l3_resp.tilt_code,
+                elevation,
+                fetched.stamp.key,
+                fetched
+                    .age(chrono::Utc::now().naive_utc())
+                    .map(|a| a.num_minutes()),
+            );
+            self.render.cache_level3(
+                l3_resp.product,
+                l3_resp.tilt_code.clone(),
+                l3_resp.site.clone(),
+                fetched,
+            );
+
+            // Trigger a re-render for panes on the same site viewing this product
+            for (idx, prs) in self.render.pane_render.iter_mut().enumerate() {
+                let pane_matches_site = self.gui.pane(idx).is_some_and(|p| p.site == l3_resp.site);
+                if pane_matches_site
+                    && self.gui.get_rendering_params_for_pane(idx).map(|(p, _)| p)
+                        == Some(l3_resp.product)
+                {
+                    prs.last_rendered = None;
+                }
             }
-            if changed {
-                self.gui.set_scan_info_for_pane(pane_idx, info);
+
+            // Add Level III products to the scan info for panes on this site
+            for pane_idx in 0..self.gui.pane_count() {
+                let pane_site = self
+                    .gui
+                    .pane(pane_idx)
+                    .map(|p| p.site.clone())
+                    .unwrap_or_default();
+                if pane_site != l3_resp.site {
+                    continue;
+                }
+                let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
+                    continue;
+                };
+                let mut info = scan_info.clone();
+                let mut changed = false;
+                if !info.available_products.contains(&l3_resp.product) {
+                    info.available_products.push(l3_resp.product);
+                    info.available_products.sort_by_key(|p| p.sort_order());
+                    info.status = format!(
+                        "Loaded {} products: {}",
+                        info.available_products.len(),
+                        info.available_products
+                            .iter()
+                            .map(|p| p.name())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    changed = true;
+                }
+                // Register the actual elevation angle from the PDB.
+                //
+                // `render_dispatch::is_renderable_tilt` is *not* applied here, so
+                // `N0S` — fetched for its storm motion vector alone and never drawn
+                // — does register an SRM elevation. That is harmless only by
+                // coincidence: `N0S` and `N0G` are both 0.5°, so the dedupe just
+                // below collapses them and the picker gains no entry it cannot
+                // render. A vector source at an angle no tilt product shares would
+                // put a dead entry in the elevation list, selectable and blank.
+                let elevations = info.product_elevations.entry(l3_resp.product).or_default();
+                let rounded_elev = (elevation * 10.0).round() / 10.0;
+                if !elevations.iter().any(|e| (e - rounded_elev).abs() < 0.05) {
+                    elevations.push(rounded_elev);
+                    elevations.sort_by(|a, b| a.total_cmp(b));
+                    changed = true;
+                }
+                if changed {
+                    self.gui.set_scan_info_for_pane(pane_idx, info);
+                }
             }
         }
     }
@@ -1013,7 +1047,7 @@ impl super::App {
     /// Advance loop playback for all panes with active playing loops.
     fn advance_loop_playback(&mut self) {
         let now = web_time::Instant::now();
-        let interval = std::time::Duration::from_secs_f32(1.0 / self.gui.loop_speed_fps);
+        let interval = loop_interval(self.gui.loop_speed_fps);
 
         for pane_idx in 0..self.gui.pane_count() {
             let Some(pane) = self.gui.pane_mut(pane_idx) else {
@@ -2583,7 +2617,7 @@ mod stamping_tests {
     use rustdar_radar::types::{RadarProduct, ScanInfo};
 
     /// A radar whose Level III objects the pane below is showing.
-    const SITE: &str = "KMPX";
+    pub(super) const SITE: &str = "KMPX";
     /// The product carried through: Level III, and not the storm-relative one,
     /// whose tilt filter would need a symbology block to pass.
     const PRODUCT: RadarProduct = RadarProduct::EchoTops;
@@ -2591,7 +2625,7 @@ mod stamping_tests {
     /// The smallest Level III object `nearest_tilt` will consider: it reads the
     /// elevation off the PDB and nothing else, and `is_renderable_tilt` waves
     /// through everything that is not storm-relative velocity.
-    fn tilt(elevation_tenths: i16, key: &str) -> Level3Product {
+    pub(super) fn tilt(elevation_tenths: i16, key: &str) -> Level3Product {
         Level3Product {
             message: Level3Message {
                 header: MessageHeader {
@@ -2651,7 +2685,7 @@ mod stamping_tests {
     /// An `App` with one pane on [`SITE`], far enough along that
     /// `apply_render_to_pane` will not bail out of it: the pane needs scan info
     /// for the site coordinates and the dispatcher needs a slot for the pane.
-    fn app_showing_site() -> crate::app::App {
+    pub(super) fn app_showing_site() -> crate::app::App {
         let mut app = crate::app::tests::headless(TestBridge::desktop());
         let site = rustdar_radar::sites::get_radar_site(SITE)
             .expect("KMPX is a real radar")
@@ -2750,6 +2784,175 @@ mod stamping_tests {
             None,
             "a Level II volume is still captioned with the last Level III \
              object's age",
+        );
+    }
+}
+
+/// What the loop timer does with a playback speed no slider could have set.
+#[cfg(test)]
+mod loop_interval_tests {
+    use super::loop_interval;
+    use crate::constants::{DEFAULT_LOOP_SPEED_FPS, MAX_LOOP_SPEED_FPS, MIN_LOOP_SPEED_FPS};
+
+    /// A stored speed the UI cannot produce must not take the app down.
+    ///
+    /// Every one of these panics `Duration::from_secs_f32` — zero and the
+    /// negatives through the reciprocal, the rest directly — and it panics in
+    /// `advance_loop_playback`, which runs on every frame. There is no getting
+    /// out of that: the frame that would let the user fix the slider is the
+    /// frame that dies. The values are all reachable, because the save-side
+    /// guard checks only `is_finite` and the load assigns whatever it finds.
+    #[test]
+    fn a_speed_no_slider_could_have_set_still_yields_a_frame_interval() {
+        for fps in [0.0, -1.0, -0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let interval = loop_interval(fps);
+            assert!(
+                interval.as_secs_f32().is_finite() && !interval.is_zero(),
+                "{fps} produced {interval:?}",
+            );
+        }
+    }
+
+    /// And the speeds the slider *can* set are honoured exactly.
+    ///
+    /// A clamp that quietly rounded every speed to one value would satisfy the
+    /// test above and make the setting inert.
+    #[test]
+    fn a_speed_the_slider_can_set_is_used_as_it_stands() {
+        assert_eq!(loop_interval(5.0).as_secs_f32(), 0.2);
+        assert_eq!(
+            loop_interval(MIN_LOOP_SPEED_FPS).as_secs_f32(),
+            1.0 / MIN_LOOP_SPEED_FPS,
+        );
+        assert_eq!(
+            loop_interval(MAX_LOOP_SPEED_FPS).as_secs_f32(),
+            1.0 / MAX_LOOP_SPEED_FPS,
+        );
+        assert_eq!(
+            loop_interval(f32::NAN),
+            loop_interval(DEFAULT_LOOP_SPEED_FPS),
+            "a value that is not a number falls back to the UI's own default",
+        );
+    }
+}
+
+/// The order one frame is assembled in.
+///
+/// `setup_egui_frame` unwraps an `AppState`, which is a wgpu device, a surface
+/// and a window — none of which exist here — so the sequence can only be read
+/// off the source, the same handle `handle_input_events` and `begin_frame` are
+/// pinned by.
+#[cfg(test)]
+mod frame_build_order_tests {
+    /// The body of `setup_egui_frame`.
+    fn setup_body() -> &'static str {
+        let (_, rest) = include_str!("app_render.rs")
+            .split_once("fn setup_egui_frame(")
+            .expect("setup_egui_frame is no longer a method here");
+        rest.split_once("\n    }")
+            .map(|(body, _)| body)
+            .expect("setup_egui_frame has no recognisable body")
+    }
+
+    /// Nothing a poller applies may land after the frame has been laid out.
+    ///
+    /// A result applied afterwards misses the frame it was applied to, and
+    /// nothing schedules the one that would show it: the re-arm at the end of
+    /// `handle_redraw` covers a render still in flight, auto-poll and an active
+    /// loop, and the last result of a batch is none of those. With auto-poll off
+    /// it sat there, applied and unpresented, until a mouse move repainted.
+    #[test]
+    fn every_poller_runs_before_the_frame_is_laid_out() {
+        let body = setup_body();
+        let laid_out = body
+            .find("self.gui.ui(")
+            .expect("setup_egui_frame no longer lays out a frame");
+
+        for poller in [
+            "self.poll_render_results(",
+            "self.poll_level3_results(",
+            "self.poll_overlay_render_results(",
+            "self.poll_loop_scan_list_results(",
+            "self.poll_loop_scan_download_results(",
+            "self.poll_loop_render_results(",
+        ] {
+            let at = body
+                .find(poller)
+                .unwrap_or_else(|| panic!("{poller} is no longer called from setup_egui_frame"));
+            assert!(
+                at < laid_out,
+                "{poller} applies its results after the frame has been laid \
+                 out, so the last of a batch is not on screen until something \
+                 unrelated repaints",
+            );
+        }
+    }
+}
+
+/// What `poll_level3_results` does with a channel holding more than one answer.
+///
+/// Built on `stamping_tests`' fixtures: an `App` with one pane on a real radar,
+/// and the smallest Level III object the pipeline will accept.
+#[cfg(test)]
+mod level3_poll_tests {
+    use super::stamping_tests::{SITE, app_showing_site, tilt};
+    use rustdar_radar::types::RadarProduct;
+
+    /// A finished fetch of `product`, as `spawn_level3_fetches` produces one.
+    ///
+    /// Generation 0 is what a site nothing has re-fetched carries, so nothing
+    /// here is discarded as stale. The object is the same for both: what a
+    /// response is *of* is decided by the `product` beside it, not by the
+    /// message's own code.
+    fn landed(product: RadarProduct, tilt_code: &str) -> crate::channels::Level3Response {
+        crate::channels::Level3Response {
+            generation: 0,
+            product,
+            tilt_code: tilt_code.to_string(),
+            site: SITE.to_string(),
+            result: Ok(tilt(5, "MPX_EET_2026_07_26_01_55_52")),
+        }
+    }
+
+    /// Every Level III result queued for a frame is taken in it.
+    ///
+    /// One Level II scan spawns a fetch per Level III product *and* tilt code —
+    /// a dozen and more — and they land in a burst. Taking one per frame filled
+    /// the product picker an entry per redraw, and stopped filling it at all on
+    /// the frame after which nothing schedules another: `handle_redraw` re-arms
+    /// only for a render in flight, auto-poll, or an active loop, and a pane
+    /// sitting on a finished scan is none of those.
+    #[test]
+    fn every_queued_level3_result_is_taken_in_the_frame_it_arrives_in() {
+        let mut app = app_showing_site();
+        for resp in [
+            landed(RadarProduct::VerticallyIntegratedLiquid, "DVL"),
+            landed(RadarProduct::PrecipitationRate, "DPR"),
+        ] {
+            app.channels.level3_sender.send(resp).unwrap();
+        }
+
+        app.poll_level3_results();
+
+        let products = app
+            .gui
+            .get_scan_info_for_pane(0)
+            .expect("the pane still has its scan info")
+            .available_products
+            .clone();
+        for product in [
+            RadarProduct::VerticallyIntegratedLiquid,
+            RadarProduct::PrecipitationRate,
+        ] {
+            assert!(
+                products.contains(&product),
+                "{product:?} never reached the picker, so the rest of the burst \
+                 is still sitting in the channel: {products:?}",
+            );
+        }
+        assert!(
+            app.channels.level3_receiver.try_recv().is_err(),
+            "the frame ended with a Level III result still queued",
         );
     }
 }

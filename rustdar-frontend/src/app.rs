@@ -163,6 +163,27 @@ pub struct App {
     state: Option<app_state::AppState>,
     window: Option<WindowRef>,
     gui: Gui,
+    /// The decoded Level II volume each pane's static render draws from, by site.
+    ///
+    /// # Retention
+    ///
+    /// One entry is a whole decoded volume — tens of megabytes — so this is held
+    /// to the sites that are on screen: [`evict_unshown_scans`] runs once a frame
+    /// and drops every site no pane names. Nothing else ever removes an entry, so
+    /// without that pass a session's every visited radar stayed resident for the
+    /// life of the process, which on a handheld is an OOM rather than a leak.
+    ///
+    /// A site counts as named by a pane's live `site` *or* by the site of the
+    /// `scan_info` it is currently drawing, and both are needed: a switch moves
+    /// `pane.site` at once, while `dispatch_pane_renders` goes on looking the
+    /// volume up under `scan_info.site.name` until the new one lands. Evicting on
+    /// the live site alone pulls the scan out from under a pane still rendering
+    /// from it.
+    ///
+    /// Loop frames are not in here. They have their own cache and their own
+    /// bound — see `LoopDownloadManager` and `MAX_LOOP_FRAMES`.
+    ///
+    /// [`evict_unshown_scans`]: Self::evict_unshown_scans
     scan_data: std::collections::HashMap<String, Arc<nexrad_model::data::Scan>>,
     input: InputHandler,
     channels: ChannelHub,
@@ -364,6 +385,7 @@ impl App {
         self.input.clear_frame_state();
         self.poll_platform_state();
         self.poll_data_channels();
+        self.evict_unshown_scans();
 
         // Skip rendering when minimized
         if let Some(window) = self.window.as_ref()
@@ -418,13 +440,59 @@ impl App {
         }
     }
 
+    /// Take a theme reading, and say whether it changed anything.
+    ///
+    /// Every source goes through here: Android's poll thread, winit's
+    /// `ThemeChanged`, and the per-frame read of `window.theme()` that the
+    /// desktops answer — see [`resolve_theme`](Self::resolve_theme). One
+    /// funnel because the cache is not a memo: `cached_dark_theme` is what
+    /// overlay rasterization reads (`RasterizeContext::is_dark`, and the
+    /// `is_dark` handed to `rasterize_radar_sites`), and those run off-frame
+    /// with no window to ask. A source that writes the theme somewhere else,
+    /// or not at all, leaves them rasterizing light under a dark UI.
+    ///
+    /// Only a *change* invalidates. The site labels are raster textures baked
+    /// in the theme's colours, so they are stale the moment it flips — but
+    /// Android's poller re-sends its reading every two seconds whether or not
+    /// it moved (see `spawn_state_poller`), so an unguarded bump would
+    /// re-rasterise every label on every pane twice a second, forever.
+    fn adopt_theme(&mut self, dark: bool) -> bool {
+        if self.cached_dark_theme == Some(dark) {
+            return false;
+        }
+        self.cached_dark_theme = Some(dark);
+        self.gui.bump_all_radar_sites_gen();
+        true
+    }
+
+    /// What this frame draws in, adopted into the cache on the way past.
+    ///
+    /// winit answers `window.theme()` on Windows and macOS and that answer is
+    /// authoritative, so it is taken first — and *recorded*, which is the half
+    /// that used to be missing. Desktop's [`PlatformBridge::poll_theme`] is
+    /// hardwired `None`, so on those platforms nothing else ever writes the
+    /// cache and everything reading it off-frame saw `None` forever.
+    ///
+    /// The bridge is asked only where winit has no answer — X11 and Android —
+    /// and only once: the read is a JNI call there, and the poll thread keeps
+    /// the cache current from then on.
+    fn resolve_theme(&mut self) -> bool {
+        let dark = match self.window.as_ref().and_then(|w| w.theme()) {
+            Some(theme) => matches!(theme, winit::window::Theme::Dark),
+            None => match self.cached_dark_theme {
+                Some(cached) => cached,
+                None => self.platform.detect_dark_theme(),
+            },
+        };
+        self.adopt_theme(dark);
+        dark
+    }
+
     /// Poll for platform-specific theme, GPS fix, and compass heading changes.
     fn poll_platform_state(&mut self) {
         if let Some(new_theme) = self.platform.poll_theme()
-            && self.cached_dark_theme != Some(new_theme)
+            && self.adopt_theme(new_theme)
         {
-            self.cached_dark_theme = Some(new_theme);
-            self.gui.bump_all_radar_sites_gen();
             notify_redraw(&self.window);
         }
         if let Some(fix) = self.platform.poll_gps_fix() {
@@ -569,8 +637,16 @@ impl App {
 
     /// Poll all data channels for completed async results (scan, overlays).
     fn poll_data_channels(&mut self) {
-        // Check for received scan data (with generation check)
-        if let Ok(scan_resp) = self.channels.scan_receiver.try_recv() {
+        // Every queued scan result, not one per frame (with generation check).
+        //
+        // Responses arrive in batches — auto-poll sends one `CheckForNewScans`
+        // per live site, and two quick navigations queue two — while winit
+        // coalesces the redraws they each ask for into a single
+        // `RedrawRequested`. Taking one per frame therefore strands the rest:
+        // the end-of-frame re-arm in `handle_redraw` only fires for a render in
+        // flight, auto-poll, or an active loop, so a queued response can sit
+        // there until some unrelated OS event wakes the loop.
+        while let Ok(scan_resp) = self.channels.scan_receiver.try_recv() {
             if self
                 .render
                 .is_fetch_stale(&scan_resp.site, scan_resp.generation)
@@ -580,6 +656,27 @@ impl App {
                     scan_resp.site,
                     scan_resp.generation
                 );
+                // Throwing the result away still ends the wait it belonged to.
+                // Nothing else does: the fetch that superseded this one is
+                // typically the auto-poll check, and `check_and_fetch_latest`
+                // sends no response at all when there is no newer volume — so a
+                // spinner left up here stays up until some later volume happens
+                // to land, and a `fetching` flag left set blocks the very poll
+                // that would have cleared it (`check_auto_polls` refuses to poll
+                // while it is true). `SwitchRadarSite` raises a `loading_site`
+                // and sets no `fetching` flag at all, so that gate does not
+                // protect this path either — a switch superseded by one auto-poll
+                // check is the case this was found on.
+                //
+                // The cost is the other order: a newer fetch that raised a
+                // spinner of its own before this landed has it taken down early.
+                // That is a frame or two of understatement against a wait
+                // indicator nothing ever takes down, and the newer result still
+                // arrives and repaints the pane. The flag is global rather than
+                // per-site, which is the same coarseness `set_error` has on the
+                // error arm below.
+                self.gui.set_fetching(false);
+                self.gui.clear_loading_site_for_site(&scan_resp.site);
             } else {
                 match scan_resp.result {
                     Ok(scan_data) => {
@@ -651,6 +748,31 @@ impl App {
         }
     }
 
+    /// Drop the decoded volumes no pane is showing.
+    ///
+    /// The retention rule, and why it is the *union* of two site fields rather
+    /// than either one, is written down at [`scan_data`](Self::scan_data).
+    ///
+    /// Once a frame rather than at the inserts: there are two of those and one
+    /// of them (`handle_jump_to_live`) is nowhere near this, so a sweep is the
+    /// only form that cannot be half-wired. It costs a walk of a map that is
+    /// never longer than the pane count plus whatever one frame's switches left
+    /// behind.
+    fn evict_unshown_scans(&mut self) {
+        let mut shown: Vec<&str> = Vec::with_capacity(self.gui.pane_count() * 2);
+        for idx in 0..self.gui.pane_count() {
+            let Some(pane) = self.gui.pane(idx) else {
+                continue;
+            };
+            shown.push(pane.site.as_str());
+            if let Some(info) = pane.scan_info.as_ref() {
+                shown.push(info.site.name);
+            }
+        }
+        self.scan_data
+            .retain(|site, _| shown.iter().any(|shown| *shown == site));
+    }
+
     /// Request application exit - handles both GUI and keyboard exit requests
     fn request_exit(&mut self, event_loop: Option<&ActiveEventLoop>) {
         // Persist UI config before exiting
@@ -663,14 +785,31 @@ impl App {
             return;
         }
         if let Some(event_loop) = event_loop {
-            log::info!("Exiting application");
-            event_loop.exit();
-            if self.platform.needs_process_exit() {
-                std::process::exit(0);
-            }
+            self.exit_now(event_loop);
         } else {
             // Defer exit until the next event where event_loop is available
             self.exit_requested = true;
+        }
+    }
+
+    /// Leave, now: the half of [`request_exit`](Self::request_exit) that needs
+    /// an event loop.
+    ///
+    /// Split out so the deferred replay in `window_event` can take exactly this
+    /// half and no more — the config save happened when the flag was set, and
+    /// running it again on the way out would write the file twice.
+    ///
+    /// `process::exit` is not redundant beside `event_loop.exit()`. On Android
+    /// the loop never unwinds, so nothing after `exit()` ever runs and the
+    /// process stays alive; that is also the platform where the menu's Exit is
+    /// the primary way out, and the menu is processed during a redraw with no
+    /// event loop to hand out. So the deferred route is exactly the one that
+    /// must not lose this.
+    fn exit_now(&self, event_loop: &ActiveEventLoop) {
+        log::info!("Exiting application");
+        event_loop.exit();
+        if self.platform.needs_process_exit() {
+            std::process::exit(0);
         }
     }
 
@@ -739,13 +878,41 @@ impl App {
         self.platform.set_back_press_taker(taker);
     }
 
+    /// Whether egui is going to want this key press for itself.
+    ///
+    /// `egui_wants_keyboard_input` is true whenever *any* widget holds focus,
+    /// not only a text field, and that is the right question: Escape is how egui
+    /// surrenders focus, whatever kind of widget has it. Read off the context
+    /// the last frame left, which is the answer egui will give for this press
+    /// too — focus moves only inside a pass, and no pass has run since.
+    ///
+    /// `false` with no renderer yet. Nothing can be focused before the first
+    /// frame, so a press then is the app's to spend.
+    ///
+    /// Only the raw-key route asks. `about_to_wait` collects a press Android's
+    /// `OnBackInvokedDispatcher` delivered, and nothing in egui is competing for
+    /// that one — it never entered the keyboard queue, and on Android it is the
+    /// route back actually arrives by.
+    fn ui_is_taking_keys(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_some_and(|state| state.egui_renderer.context().egui_wants_keyboard_input())
+    }
+
     fn handle_input_events(&mut self, event_loop: &ActiveEventLoop) {
         // Both keys mean the same thing — back out of the thing I am in — so
         // both take the same route. They used to differ only in that back gave
         // the platform first refusal, and on Android a handler is always
         // installed, so back never reached any of the decisions below it.
         // Taken, not read: this runs on every keyboard press, not once a frame.
-        if self.input.take_back_out_press() {
+        //
+        // Taken *before* the focus test, and deliberately: a press left latched
+        // because the UI wanted it is spent by the next key of any kind, which
+        // is the same double dismissal one keystroke later. `InputHandler` reads
+        // the raw `WindowEvent` and is never told what egui consumed, so this is
+        // the only place the two can be reconciled — without it, Escape in a
+        // text field unfocuses the field *and* closes the layer behind it.
+        if self.input.take_back_out_press() && !self.ui_is_taking_keys() {
             self.back_out(event_loop);
         }
     }
@@ -965,19 +1132,27 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.handle_redraw();
-                // Check for deferred exit (set during redraw when event_loop is unavailable)
-                if self.exit_requested {
-                    event_loop.exit();
+                // Spend a deferred exit (set during redraw, where there was no
+                // event loop to hand out) through the same door an immediate one
+                // uses — `process::exit` included. Taken rather than read: the
+                // config save already ran when the flag was set.
+                if std::mem::take(&mut self.exit_requested) {
+                    self.exit_now(event_loop);
                 }
             }
             WindowEvent::Resized(new_size) => {
                 self.handle_resized(new_size.width, new_size.height);
                 notify_redraw(&self.window);
             }
-            WindowEvent::ThemeChanged(_theme) => {
-                // Theme changed, clear cache so we re-detect on next frame
-                self.cached_dark_theme = None;
-                notify_redraw(&self.window);
+            WindowEvent::ThemeChanged(theme) => {
+                // winit hands the new theme over, so take it rather than
+                // clearing the cache and hoping something re-detects: on the
+                // desktops the bridge's `poll_theme` never answers, so an
+                // emptied cache is one that stays empty for every off-frame
+                // reader — which is what overlay rasterization is.
+                if self.adopt_theme(matches!(theme, winit::window::Theme::Dark)) {
+                    notify_redraw(&self.window);
+                }
             }
             _ => {
                 // For other events, request redraw only if egui needs it
@@ -1230,6 +1405,35 @@ mod tests {
                  back button reach nothing: {body}"
             );
         }
+    }
+
+    /// A press the UI is about to take must not also back the app out.
+    ///
+    /// `InputHandler` reads the raw `WindowEvent`, before egui and independently
+    /// of what egui consumes, so Escape with a text field focused unfocused the
+    /// field *and* dismissed the layer behind it — or, with nothing else open,
+    /// quit — on one press.
+    ///
+    /// Two claims, and the second is the one a bare "contains the gate" missed.
+    /// The press has to be *taken* whether or not it is spent: `&&`
+    /// short-circuits left to right, so `!self.ui_is_taking_keys() &&
+    /// self.input.take_back_out_press()` leaves the flag latched, and
+    /// `handle_input_events` runs on every keyboard press — the next key of any
+    /// kind then spends it, which is the same double dismissal one keystroke
+    /// later.
+    #[test]
+    fn a_press_the_ui_is_taking_does_not_also_back_the_app_out() {
+        let body = fn_body("fn handle_input_events(");
+        assert!(
+            body.contains("if self.input.take_back_out_press() && !self.ui_is_taking_keys() {"),
+            "the funnel no longer takes the press first and then asks whether \
+             egui wanted it: {body}",
+        );
+        assert!(
+            fn_body("fn ui_is_taking_keys(").contains("egui_wants_keyboard_input()"),
+            "ui_is_taking_keys no longer asks egui what it has focused, so it \
+             is answering from something else",
+        );
     }
 
     /// A dismissal has to schedule the frame that shows it.
@@ -1755,6 +1959,275 @@ mod tests {
         );
     }
 
+    /// Every scan response queued for a frame is spent in it.
+    ///
+    /// They arrive in batches — auto-poll sends one `CheckForNewScans` per live
+    /// site, and two quick navigations queue two — while winit coalesces the
+    /// redraws each of them asks for into one `RedrawRequested`. Taking a single
+    /// response per frame left the rest in the channel with nothing scheduled to
+    /// come back for them: `handle_redraw`'s re-arm only fires for a render in
+    /// flight, auto-poll or an active loop.
+    ///
+    /// The first response here is for a site no pane is showing, so only a drain
+    /// that goes past it reaches the one the pane is waiting on.
+    #[test]
+    fn every_queued_scan_response_is_spent_in_the_frame_it_arrives_in() {
+        let mut app = headless(TestBridge::desktop());
+        {
+            let pane = app.gui.pane_mut(0).unwrap();
+            pane.site = "KTLX".to_string();
+            pane.loading_site = Some("KTLX".to_string());
+        }
+
+        for site in ["KOUN", "KTLX"] {
+            app.channels
+                .scan_sender
+                .send(crate::channels::ScanResponse {
+                    generation: 1,
+                    site: site.to_string(),
+                    result: Err("no data".to_string()),
+                    is_auto_poll: false,
+                })
+                .unwrap();
+        }
+
+        app.poll_data_channels();
+
+        assert_eq!(
+            app.gui.pane(0).unwrap().loading_site,
+            None,
+            "the second response was left in the channel, so the pane holds its \
+             spinner until something unrelated wakes the loop",
+        );
+        assert!(
+            app.channels.scan_receiver.try_recv().is_err(),
+            "the frame ended with a scan response still queued",
+        );
+    }
+
+    /// A scan carrying no sweeps.
+    ///
+    /// Nothing below reads a pixel: what is under test is whether a response was
+    /// applied at all, and an empty volume is the cheapest one this crate can
+    /// build. `ScanInfo::from_scan` handles it — it falls back to the requested
+    /// timestamp when there is no radial to date the volume from.
+    fn empty_scan() -> nexrad_model::data::Scan {
+        use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
+        Scan::new(
+            VolumeCoveragePattern::new(
+                212,
+                0,
+                0.5,
+                PulseWidth::Short,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+                0,
+                false,
+                false,
+                Vec::new(),
+            ),
+            Vec::new(),
+        )
+    }
+
+    /// The scan info a pane holds while it is drawing `site`'s volume.
+    fn scan_info_for(site: &str) -> ScanInfo {
+        ScanInfo::from_scan(
+            &empty_scan(),
+            site,
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+        )
+    }
+
+    /// A decoded volume nobody is showing is not kept.
+    ///
+    /// One entry is tens of megabytes and nothing else in this crate ever
+    /// removes one, so every radar a session visits stayed resident until the
+    /// process ended — next to a render cache that is carefully bounded and a
+    /// loop cache with a written-down byte budget.
+    #[test]
+    fn a_volume_no_pane_is_showing_is_dropped() {
+        let mut app = headless(TestBridge::desktop());
+        app.gui.pane_mut(0).unwrap().site = "KTLX".to_string();
+        app.gui.set_scan_info_for_pane(0, scan_info_for("KTLX"));
+        app.scan_data
+            .insert("KTLX".to_string(), Arc::new(empty_scan()));
+        app.scan_data
+            .insert("KOUN".to_string(), Arc::new(empty_scan()));
+
+        app.evict_unshown_scans();
+
+        assert!(
+            app.scan_data.contains_key("KTLX"),
+            "the volume the pane is drawing from was evicted",
+        );
+        assert!(
+            !app.scan_data.contains_key("KOUN"),
+            "a radar no pane is on is still holding its whole decoded volume",
+        );
+    }
+
+    /// The window a site switch opens.
+    ///
+    /// `SwitchRadarSite` moves `pane.site` immediately, but the pane goes on
+    /// drawing the old radar until the new volume lands — and
+    /// `dispatch_pane_renders` looks that volume up under `scan_info.site.name`,
+    /// not under `pane.site`. An eviction keyed on the live site alone therefore
+    /// pulls the scan out from under a pane still rendering from it, and the
+    /// symptom is a product change that silently does nothing until the switch
+    /// completes.
+    #[test]
+    fn the_volume_a_switching_pane_is_still_drawing_survives() {
+        let mut app = headless(TestBridge::desktop());
+        app.gui.set_scan_info_for_pane(0, scan_info_for("KTLX"));
+        app.gui.pane_mut(0).unwrap().site = "KOUN".to_string();
+        app.scan_data
+            .insert("KTLX".to_string(), Arc::new(empty_scan()));
+
+        app.evict_unshown_scans();
+
+        assert!(
+            app.scan_data.contains_key("KTLX"),
+            "the pane's own scan info still names KTLX, which is what the \
+             render path looks the volume up by",
+        );
+    }
+
+    /// A result thrown away still ends the wait it belonged to.
+    ///
+    /// `SwitchRadarSite` raises a `loading_site` and sets no `fetching` flag, so
+    /// the gate that holds auto-poll off does not hold, and the very next frame
+    /// can emit a `CheckForNewScans` for the same site that bumps the generation
+    /// past it. The switch's own result then lands stale and is discarded — and
+    /// nothing else was ever going to take the spinner down, because
+    /// `check_and_fetch_latest` sends no response at all unless there is a newer
+    /// volume.
+    #[test]
+    fn a_discarded_scan_result_still_takes_down_the_wait_it_belonged_to() {
+        let mut app = headless(TestBridge::desktop());
+        {
+            let pane = app.gui.pane_mut(0).unwrap();
+            pane.site = "KTLX".to_string();
+            pane.loading_site = Some("KTLX".to_string());
+        }
+
+        // The fetch this response belongs to, then the one that supersedes it.
+        let superseded = app.render.next_fetch_generation("KTLX");
+        app.render.next_fetch_generation("KTLX");
+
+        app.channels
+            .scan_sender
+            .send(crate::channels::ScanResponse {
+                generation: superseded,
+                site: "KTLX".to_string(),
+                result: Ok(crate::channels::ScanData {
+                    scan: empty_scan(),
+                    site: "KTLX".to_string(),
+                    timestamp: chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap(),
+                }),
+                is_auto_poll: false,
+            })
+            .unwrap();
+
+        app.poll_data_channels();
+
+        assert!(
+            app.gui.pane(0).unwrap().scan_info.is_none() && app.scan_data.is_empty(),
+            "precondition: the superseded result was applied rather than \
+             discarded, so nothing here is about the discard path",
+        );
+        assert_eq!(
+            app.gui.pane(0).unwrap().loading_site,
+            None,
+            "the switch's spinner is still up with nothing left that would ever \
+             take it down",
+        );
+    }
+
+    /// The theme the frame resolves is the theme everything else rasterizes in.
+    ///
+    /// `cached_dark_theme` is not a memo for a slow read: it is the *only*
+    /// answer the overlay rasterizers have, because they run on worker threads
+    /// with no window to ask (`RasterizeContext::is_dark`, and the `is_dark`
+    /// handed to `rasterize_radar_sites`). A frame that resolves a theme
+    /// without recording it leaves them on `unwrap_or(false)`.
+    ///
+    /// Driven with no window, which is the arm Android and X11 take: winit has
+    /// no answer there, so the bridge is asked. The other arm is source-probed
+    /// below — a window cannot be built here.
+    #[test]
+    fn the_theme_the_frame_resolves_is_the_one_the_overlays_get() {
+        let mut app = headless(TestBridge::android());
+        app.set_theme_detector(always_dark);
+        let before = app.gui.pane(0).unwrap().radar_sites_render_gen;
+        assert_eq!(
+            app.cached_dark_theme, None,
+            "precondition: nothing read yet"
+        );
+
+        assert!(app.resolve_theme(), "the frame drew in the wrong theme");
+
+        assert_eq!(
+            app.cached_dark_theme,
+            Some(true),
+            "the frame resolved a theme and left every off-frame rasterizer \
+             with none, so the overlays come back light under a dark UI",
+        );
+        assert_eq!(
+            app.gui.pane(0).unwrap().radar_sites_render_gen,
+            before.wrapping_add(1),
+            "the site labels still carry the old theme's colours",
+        );
+
+        assert!(app.resolve_theme(), "the reading changed on a second look");
+        assert_eq!(
+            app.gui.pane(0).unwrap().radar_sites_render_gen,
+            before.wrapping_add(1),
+            "every frame re-rasterises every label",
+        );
+    }
+
+    /// The two theme routes a desktop actually takes, neither of which can be
+    /// driven here: winit answers `window.theme()` on Windows and macOS, and it
+    /// reports a flip as `ThemeChanged`. Both must reach `adopt_theme`.
+    ///
+    /// This is the shape the bug had. The `window.theme()` arm resolved a value
+    /// and returned it without recording it, and `ThemeChanged` *emptied* the
+    /// cache — which reads as "re-detect next frame" only on a platform whose
+    /// bridge detects anything. Desktop's `poll_theme` is hardwired `None`, so
+    /// there the cache simply stayed empty for good, and both defects were
+    /// invisible on the two platforms whose poll thread writes it anyway.
+    #[test]
+    fn the_desktop_theme_routes_record_what_they_read() {
+        let body = fn_body("fn resolve_theme(");
+        assert!(
+            body.contains("self.adopt_theme(dark)"),
+            "resolve_theme no longer records the theme it resolved: {body}",
+        );
+        assert!(
+            !body.contains("return"),
+            "an arm of resolve_theme answers on its own, so the theme it read \
+             never reaches the cache: {body}",
+        );
+
+        let arm = arm_body(fn_body("fn window_event("), "WindowEvent::ThemeChanged");
+        assert!(
+            arm.contains("self.adopt_theme("),
+            "a theme flip no longer goes through the funnel, so nothing \
+             re-rasterises the site labels in the new theme's colours: {arm}",
+        );
+    }
+
     /// Where the injected querier says the system bars are. A `fn` pointer
     /// closes over nothing, which is the constraint Android's real querier is
     /// under too — it reaches the framework through a process-wide `JavaVM`.
@@ -1829,6 +2302,34 @@ mod tests {
             arm.contains("self.request_exit("),
             "the close button bypasses request_exit, so it saves no config and \
              ignores a platform that cannot quit: {arm}",
+        );
+    }
+
+    /// A deferred exit has to leave by the same door as an immediate one.
+    ///
+    /// The menu's Exit is processed during a redraw, where there is no
+    /// `ActiveEventLoop` to hand out, so it parks a flag and the next
+    /// `RedrawRequested` spends it. That replay used to call `event_loop.exit()`
+    /// on its own, which drops the `process::exit` half — and Android, where the
+    /// loop never unwinds and the menu is the primary way out, is precisely the
+    /// platform that needs it. So the one route that *always* defers was the one
+    /// route that never ended the process.
+    ///
+    /// `window_event` takes an `ActiveEventLoop` and `exit_now` ends the
+    /// process, so both halves are read off the source.
+    #[test]
+    fn a_deferred_exit_leaves_by_the_same_door_as_an_immediate_one() {
+        let arm = arm_body(fn_body("fn window_event("), "WindowEvent::RedrawRequested");
+        assert!(
+            arm.contains("self.exit_now("),
+            "the deferred exit no longer goes through exit_now, so on Android \
+             it asks a loop that never unwinds to leave and the process stays \
+             up: {arm}",
+        );
+        assert!(
+            fn_body("fn exit_now(").contains("self.platform.needs_process_exit()"),
+            "exit_now no longer ends the process on a platform whose event loop \
+             never unwinds",
         );
     }
 

@@ -103,6 +103,29 @@ pub const MAX_RENDER_CACHE_ENTRIES: usize = 6;
 #[cfg(not(mobile))]
 pub const MAX_RENDER_CACHE_ENTRIES: usize = 8;
 
+/// The playback rates the loop timer is willing to divide by.
+///
+/// `loop_speed_fps` is a config value before it is a slider value. The settings
+/// slider clamps to 1..=30 while it is being dragged, but that clamp only
+/// applies to an edit: `load_ui_config` assigns whatever the stored blob holds,
+/// and the save-side guard rejects only non-finite. So an older or hand-edited
+/// config can hand the frame loop a zero, a negative or a NaN — and
+/// `Duration::from_secs_f32` panics on every one of them, on every frame, in a
+/// state the user cannot get out of because the panic is in the frame loop.
+///
+/// The bounds mirror that slider (`rustdar_egui`'s settings pane). Widening
+/// either without widening the slider only admits values the UI cannot produce.
+pub const MIN_LOOP_SPEED_FPS: f32 = 1.0;
+
+/// See [`MIN_LOOP_SPEED_FPS`].
+pub const MAX_LOOP_SPEED_FPS: f32 = 30.0;
+
+/// What a speed that is not a number at all falls back to.
+///
+/// The UI's default, and the same substitute `save_ui_config` writes when it
+/// finds a non-finite value on the way out.
+pub const DEFAULT_LOOP_SPEED_FPS: f32 = 5.0;
+
 /// A handheld target must have been given the `mobile` cfg.
 ///
 /// This is the control on `build.rs` actually running. If it is deleted, or the
@@ -132,6 +155,11 @@ const _: () = const {
     assert!(MAX_RENDER_CACHE_ENTRIES > 0);
     assert!(MAX_CONCURRENT_RENDERS > 0);
     assert!(MAX_CONCURRENT_LOOP_DOWNLOADS > 0);
+    // The loop timer divides by this, so zero is a division by zero and a
+    // reversed pair is a `clamp` that panics.
+    assert!(MIN_LOOP_SPEED_FPS > 0.0);
+    assert!(MIN_LOOP_SPEED_FPS <= DEFAULT_LOOP_SPEED_FPS);
+    assert!(DEFAULT_LOOP_SPEED_FPS <= MAX_LOOP_SPEED_FPS);
     // Eviction is what bounds the textured-frame count, so it must bind first.
     assert!(MAX_LOOP_RENDER_BUDGET <= MAX_LOOP_FRAMES);
     // Every render path indexes a square image; the projection assumes a power of two.
