@@ -454,7 +454,8 @@ mod tests {
              this probe is only meaningful in a fresh process"
         );
         let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
-        poll_once(crate::archive::list_files("KTLX", &date));
+        let sources = crate::sources::DataSources::production();
+        poll_once(crate::archive::list_files(&sources, "KTLX", &date));
         assert!(
             super::default_is_ring(),
             "archive::list_files did not install ring before its first await"

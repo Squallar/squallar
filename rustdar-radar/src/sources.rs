@@ -58,14 +58,22 @@ pub struct DataSources {
     /// NEXRAD Level II archive volumes. Keys are `YYYY/MM/DD/SITE/NAME`.
     pub level2_bucket: Source,
     /// NEXRAD Level II real-time chunks.
+    ///
+    /// Declared ahead of use: no fetch path reads it yet, so the derived
+    /// validations (the Android network-security-config, the web
+    /// service-worker never-cache list) already cover the origin for when one
+    /// does.
     pub level2_chunks_bucket: Source,
     /// NEXRAD Level III products. Keys are **flat**: `SSS_PPP_YYYY_MM_DD_HH_MM_SS`.
     pub level3_bucket: Source,
     /// HRRR GRIB2 output, mirrored from NCEP by the Big Data Program.
     pub hrrr_bucket: Source,
-    /// GOES-East (GOES-19) granules, for GLM lightning.
+    /// GOES-East granules, for GLM lightning. Names the orbital *slot*, whose
+    /// current occupant is GOES-19: `noaa-goes16` has no GLM data after 2025
+    /// day 097, and the fetch rendering nothing for a year afterwards is why
+    /// the bucket lives in this table rather than beside the fetch.
     pub goes_east_bucket: Source,
-    /// GOES-West (GOES-18) granules, for GLM lightning.
+    /// GOES-West (currently GOES-18) granules, for GLM lightning.
     pub goes_west_bucket: Source,
     /// NWS public API: active alerts and zone geometry.
     pub nws_api_base: Source,

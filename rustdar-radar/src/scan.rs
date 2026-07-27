@@ -23,15 +23,23 @@ pub type Result<T> = std::result::Result<T, ScanError>;
 // belt-and-braces: `crate::archive` builds its client through `tls::client`,
 // which installs the provider itself. `pub(crate)` so the `tls` probe can poll
 // one of them.
+//
+// This is also where the production origin table is bound, exactly as
+// `get_level3_product` binds it below: threading `&DataSources` out through
+// this module's public surface would ripple into every frontend call site for
+// no gain — nothing above here overrides an origin.
 
 pub(crate) async fn list_files(site: &str, date: &chrono::NaiveDate) -> Result<Vec<Identifier>> {
     crate::tls::init();
-    Ok(crate::archive::list_files(site, date).await?)
+    Ok(crate::archive::list_files(&crate::sources::DataSources::production(), site, date).await?)
 }
 
 pub(crate) async fn download_file(identifier: Identifier) -> Result<nexrad_data::volume::File> {
     crate::tls::init();
-    Ok(crate::archive::download_file(identifier).await?)
+    Ok(
+        crate::archive::download_file(&crate::sources::DataSources::production(), identifier)
+            .await?,
+    )
 }
 
 /// List files for the given date, falling back to the previous day if empty.

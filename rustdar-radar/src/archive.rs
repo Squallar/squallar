@@ -24,10 +24,7 @@ use chrono::NaiveDate;
 use reqwest::StatusCode;
 use xml::reader::{EventReader, XmlEvent};
 
-/// The public NOAA/Unidata bucket holding Level II archive volumes.
-/// `archive_bucket_matches_the_declared_origin` pins this against
-/// [`crate::sources::DataSources`], which cannot hold it as a `const`.
-pub const ARCHIVE_BUCKET: &str = "unidata-nexrad-level2";
+use crate::sources::DataSources;
 
 /// How long a single archive request may take, end to end. Upstream had *no*
 /// timeout, so a stalled connection hung the fetch task, and the pane's
@@ -385,22 +382,37 @@ pub(crate) async fn get_bytes(client: &reqwest::Client, url: String) -> Result<V
 /// The volumes the archive holds for one site-day, in the bucket's own key
 /// order -- `crate::scan` relies on that order to break the tie between a
 /// volume and its `_MDM` sidecar by taking the first match.
-pub async fn list_files(site: &str, date: &NaiveDate) -> Result<Vec<Identifier>> {
+///
+/// The bucket comes from [`DataSources::level2_bucket`], as
+/// [`crate::level3::list_day`] takes its bucket from the same table: the
+/// derived validations (the Android network-security-config, the web
+/// service-worker never-cache list) read [`DataSources`], so a bucket named
+/// anywhere else is invisible to both.
+pub async fn list_files(
+    sources: &DataSources,
+    site: &str,
+    date: &NaiveDate,
+) -> Result<Vec<Identifier>> {
     // Before the first `.await`, so that merely polling this future installs
     // the crypto provider. `crate::tls` has a probe that depends on it.
     let client = shared_client();
     let prefix = day_prefix(site, date);
 
     log::debug!("Listing archive objects for prefix {prefix:?}");
-    let keys = collect_keys(ARCHIVE_BUCKET, &prefix, None, |url| get_text(client, url)).await?;
+    let keys =
+        collect_keys(&sources.level2_bucket, &prefix, None, |url| get_text(client, url)).await?;
     log::debug!("Listing for {prefix:?} returned {} keys", keys.len());
 
     Ok(keys.iter().map(|key| key_to_identifier(key)).collect())
 }
 
 /// Download the volume an identifier names. [`nexrad_data::volume::File`] still
-/// owns decompression and decoding.
-pub async fn download_file(identifier: Identifier) -> Result<nexrad_data::volume::File> {
+/// owns decompression and decoding. The bucket comes from
+/// [`DataSources::level2_bucket`] — see [`list_files`].
+pub async fn download_file(
+    sources: &DataSources,
+    identifier: Identifier,
+) -> Result<nexrad_data::volume::File> {
     let client = shared_client();
 
     let date = identifier
@@ -410,8 +422,13 @@ pub async fn download_file(identifier: Identifier) -> Result<nexrad_data::volume
         .site()
         .ok_or_else(|| ArchiveError::UnkeyableIdentifier(identifier.name().to_string()))?;
 
-    let key = format!("{}/{}/{}", date.format("%Y/%m/%d"), site, identifier.name());
-    let url = object_url(ARCHIVE_BUCKET, &key);
+    let key = format!(
+        "{}/{}/{}",
+        date.format("%Y/%m/%d"),
+        site,
+        identifier.name()
+    );
+    let url = object_url(&sources.level2_bucket, &key);
 
     log::debug!("Downloading archive object {key:?}");
     let response = client.get(&url).send().await?;
@@ -450,10 +467,7 @@ mod tests {
         assert_eq!(id.name(), "KTLX20240520_000004_V06");
         assert_eq!(id.site(), Some("KTLX"));
         let dt = id.date_time().expect("parses");
-        assert_eq!(
-            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-            "2024-05-20 00:00:04"
-        );
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2024-05-20 00:00:04");
     }
 
     /// A name too short to slice must yield `None`, not panic —
@@ -653,14 +667,13 @@ mod tests {
     /// Drive `collect_keys` over canned pages, recording the URLs requested.
     /// The future is driven by hand (no `pollster` here); it never yields,
     /// because the fetcher is immediate.
-    fn paginate(
-        pages: Vec<std::result::Result<String, ArchiveError>>,
-    ) -> (Result<Vec<String>>, Vec<String>) {
+    fn paginate(pages: Vec<std::result::Result<String, ArchiveError>>) -> (Result<Vec<String>>, Vec<String>) {
         let urls = std::cell::RefCell::new(Vec::new());
         let remaining = std::cell::RefCell::new(std::collections::VecDeque::from(pages));
 
+        let sources = DataSources::production();
         let outcome = {
-            let fut = collect_keys(ARCHIVE_BUCKET, "2024/05/20/KTLX", Some(2), |url| {
+            let fut = collect_keys(&sources.level2_bucket, "2024/05/20/KTLX", Some(2), |url| {
                 urls.borrow_mut().push(url);
                 let next = remaining
                     .borrow_mut()
@@ -725,10 +738,8 @@ mod tests {
     /// while `next_token.is_some()` would request forever here.
     #[test]
     fn pagination_stops_on_the_truncation_flag_not_the_cursor() {
-        let body = listing(&["a/b/c/d/k1"], None).replace(
-            "</ListBucketResult>",
-            "<NextContinuationToken>STALE</NextContinuationToken></ListBucketResult>",
-        );
+        let body = listing(&["a/b/c/d/k1"], None)
+            .replace("</ListBucketResult>", "<NextContinuationToken>STALE</NextContinuationToken></ListBucketResult>");
         let (keys, urls) = paginate(vec![Ok(body)]);
         assert_eq!(keys.expect("completes"), vec!["a/b/c/d/k1"]);
         assert_eq!(urls.len(), 1, "followed a cursor on an untruncated page");
@@ -881,10 +892,9 @@ mod tests {
     #[ignore = "hits the live unidata-nexrad-level2 S3 bucket"]
     #[tokio::test]
     async fn live_archive_lists_downloads_and_decodes_a_volume() {
+        let sources = DataSources::production();
         let day = date(2024, 5, 20);
-        let files = list_files("KTLX", &day)
-            .await
-            .expect("listing KTLX 2024-05-20");
+        let files = list_files(&sources, "KTLX", &day).await.expect("listing KTLX 2024-05-20");
         println!("listed {} objects", files.len());
         assert!(
             files.len() > 100,
@@ -900,7 +910,7 @@ mod tests {
             .expect("at least one V06 volume");
         println!("downloading {}", volume.name());
 
-        let file = download_file(volume.clone())
+        let file = download_file(&sources, volume.clone())
             .await
             .expect("download should succeed");
         println!("downloaded {} bytes", file.data().len());
@@ -924,11 +934,12 @@ mod tests {
     #[ignore = "hits the live unidata-nexrad-level2 S3 bucket"]
     #[tokio::test]
     async fn live_paged_listing_equals_the_single_page_listing() {
+        let sources = DataSources::production();
         let client = shared_client();
         let prefix = day_prefix("KTLX", &date(2024, 5, 20));
 
         let mut single_page_requests = 0;
-        let whole = collect_keys(ARCHIVE_BUCKET, &prefix, None, |url| {
+        let whole = collect_keys(&sources.level2_bucket, &prefix, None, |url| {
             single_page_requests += 1;
             get_text(client, url)
         })
@@ -936,7 +947,7 @@ mod tests {
         .expect("unpaginated listing");
 
         let mut paged_requests = 0;
-        let paged = collect_keys(ARCHIVE_BUCKET, &prefix, Some(20), |url| {
+        let paged = collect_keys(&sources.level2_bucket, &prefix, Some(20), |url| {
             paged_requests += 1;
             get_text(client, url)
         })
@@ -949,10 +960,7 @@ mod tests {
             paged.len()
         );
 
-        assert_eq!(
-            single_page_requests, 1,
-            "the default page should hold a site-day"
-        );
+        assert_eq!(single_page_requests, 1, "the default page should hold a site-day");
         assert!(
             paged_requests > 5,
             "max-keys=20 over ~235 keys should need many pages, took {paged_requests}"
@@ -971,7 +979,7 @@ mod tests {
         // Well-formed name, real site, real date, no such volume: this reaches
         // S3 and comes back 404 rather than failing key derivation locally.
         let missing = Identifier::new("KTLX20240520_010101_V06".to_string());
-        let err = download_file(missing)
+        let err = download_file(&DataSources::production(), missing)
             .await
             .expect_err("a nonexistent volume must not download");
         println!("got: {err:?}");
@@ -987,7 +995,8 @@ mod tests {
     #[ignore = "hits the live unidata-nexrad-level2 S3 bucket"]
     #[tokio::test]
     async fn live_listing_needs_no_credentials() {
-        let url = list_url(ARCHIVE_BUCKET, "2024/05/20/KTLX", Some(1), None).expect("url");
+        let sources = DataSources::production();
+        let url = list_url(&sources.level2_bucket, "2024/05/20/KTLX", Some(1), None).expect("url");
         let response = shared_client()
             .get(&url)
             .send()
