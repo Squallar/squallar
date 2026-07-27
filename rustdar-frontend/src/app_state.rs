@@ -68,7 +68,6 @@ pub struct AppState {
     pub queue: wgpu::Queue,
     pub surface_config: wgpu::SurfaceConfiguration,
     pub surface: wgpu::Surface<'static>,
-    pub scale_factor: f32,
     pub egui_renderer: egui_renderer::EguiRenderer,
     max_surface_dimension: u32,
 }
@@ -134,15 +133,12 @@ impl AppState {
         let egui_renderer =
             egui_renderer::EguiRenderer::new(&device, surface_config.format, None, 1, window);
 
-        let scale_factor = 1.0;
-
         Self {
             device,
             queue,
             surface,
             surface_config,
             egui_renderer,
-            scale_factor,
             max_surface_dimension,
         }
     }

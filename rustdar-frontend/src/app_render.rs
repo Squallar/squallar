@@ -90,10 +90,11 @@ impl super::App {
     /// egui here and read back off the context when the pass ends, so there is
     /// no second copy of it to drift.
     ///
-    /// The scale handed to egui accounts for:
-    /// - Application scale factor (state.scale_factor)
-    /// - Surface-to-window ratio (matters on web, where the canvas backing
-    ///   store can differ from the CSS size)
+    /// The scale handed to egui is the surface-to-window ratio, which matters on
+    /// web, where the canvas backing store can differ from its CSS size. There is
+    /// no second, application-level factor beside it: `AppState` used to carry a
+    /// `scale_factor` that was initialised to 1.0 and never written, so the
+    /// product it took part in was always just this ratio.
     ///
     /// OS display scaling is *not* included: egui-winit puts it on the raw input
     /// and egui applies it itself.
@@ -125,13 +126,12 @@ impl super::App {
             let window = self.window.as_ref().unwrap();
 
             let window_size = window.inner_size();
-            let css_to_canvas_scale_x =
-                state.surface_config.width as f32 / window_size.width.max(1) as f32;
-            // The application's own scaling only. `window.scale_factor()` is
-            // deliberately not folded in: egui already has it from the raw input
-            // and multiplies it back on, using the value for the pass being
-            // started rather than the one it happened to hold beforehand.
-            let zoom_factor = state.scale_factor * css_to_canvas_scale_x;
+            // The CSS-size-to-backing-store ratio, and nothing else.
+            // `window.scale_factor()` is deliberately not folded in: egui
+            // already has it from the raw input and multiplies it back on, using
+            // the value for the pass being started rather than the one it
+            // happened to hold beforehand.
+            let zoom_factor = state.surface_config.width as f32 / window_size.width.max(1) as f32;
 
             // Start egui frame
             state.egui_renderer.begin_frame(window, zoom_factor);
