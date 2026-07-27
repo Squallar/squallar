@@ -831,13 +831,41 @@ impl App {
         self.platform.set_back_press_taker(taker);
     }
 
+    /// Whether egui is going to want this key press for itself.
+    ///
+    /// `egui_wants_keyboard_input` is true whenever *any* widget holds focus,
+    /// not only a text field, and that is the right question: Escape is how egui
+    /// surrenders focus, whatever kind of widget has it. Read off the context
+    /// the last frame left, which is the answer egui will give for this press
+    /// too — focus moves only inside a pass, and no pass has run since.
+    ///
+    /// `false` with no renderer yet. Nothing can be focused before the first
+    /// frame, so a press then is the app's to spend.
+    ///
+    /// Only the raw-key route asks. `about_to_wait` collects a press Android's
+    /// `OnBackInvokedDispatcher` delivered, and nothing in egui is competing for
+    /// that one — it never entered the keyboard queue, and on Android it is the
+    /// route back actually arrives by.
+    fn ui_is_taking_keys(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_some_and(|state| state.egui_renderer.context().egui_wants_keyboard_input())
+    }
+
     fn handle_input_events(&mut self, event_loop: &ActiveEventLoop) {
         // Both keys mean the same thing — back out of the thing I am in — so
         // both take the same route. They used to differ only in that back gave
         // the platform first refusal, and on Android a handler is always
         // installed, so back never reached any of the decisions below it.
         // Taken, not read: this runs on every keyboard press, not once a frame.
-        if self.input.take_back_out_press() {
+        //
+        // Taken *before* the focus test, and deliberately: a press left latched
+        // because the UI wanted it is spent by the next key of any kind, which
+        // is the same double dismissal one keystroke later. `InputHandler` reads
+        // the raw `WindowEvent` and is never told what egui consumed, so this is
+        // the only place the two can be reconciled — without it, Escape in a
+        // text field unfocuses the field *and* closes the layer behind it.
+        if self.input.take_back_out_press() && !self.ui_is_taking_keys() {
             self.back_out(event_loop);
         }
     }
@@ -1330,6 +1358,35 @@ mod tests {
                  back button reach nothing: {body}"
             );
         }
+    }
+
+    /// A press the UI is about to take must not also back the app out.
+    ///
+    /// `InputHandler` reads the raw `WindowEvent`, before egui and independently
+    /// of what egui consumes, so Escape with a text field focused unfocused the
+    /// field *and* dismissed the layer behind it — or, with nothing else open,
+    /// quit — on one press.
+    ///
+    /// Two claims, and the second is the one a bare "contains the gate" missed.
+    /// The press has to be *taken* whether or not it is spent: `&&`
+    /// short-circuits left to right, so `!self.ui_is_taking_keys() &&
+    /// self.input.take_back_out_press()` leaves the flag latched, and
+    /// `handle_input_events` runs on every keyboard press — the next key of any
+    /// kind then spends it, which is the same double dismissal one keystroke
+    /// later.
+    #[test]
+    fn a_press_the_ui_is_taking_does_not_also_back_the_app_out() {
+        let body = fn_body("fn handle_input_events(");
+        assert!(
+            body.contains("if self.input.take_back_out_press() && !self.ui_is_taking_keys() {"),
+            "the funnel no longer takes the press first and then asks whether \
+             egui wanted it: {body}",
+        );
+        assert!(
+            fn_body("fn ui_is_taking_keys(").contains("egui_wants_keyboard_input()"),
+            "ui_is_taking_keys no longer asks egui what it has focused, so it \
+             is answering from something else",
+        );
     }
 
     /// A dismissal has to schedule the frame that shows it.
