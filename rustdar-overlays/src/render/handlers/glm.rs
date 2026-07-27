@@ -744,6 +744,14 @@ impl OverlayHandler for GlmHandler {
                     if new_sat != self.satellite {
                         self.satellite = new_sat;
                         self.state.data_generation = self.state.data_generation.wrapping_add(1);
+                        // Deliberately no `clear_cache()`, unlike the level
+                        // toggles below: cached records carry their satellite
+                        // and `glm::fetch::flashes_in_window` filters by the
+                        // current selection, so a deselected bird stops
+                        // rendering on the very next poll and re-selecting it
+                        // restores instantly from cache. Levels must clear
+                        // because a deselected level was never parsed into the
+                        // cache at all.
                         return ControlEffect::Fetch;
                     }
                 }
