@@ -634,6 +634,27 @@ impl App {
                     scan_resp.site,
                     scan_resp.generation
                 );
+                // Throwing the result away still ends the wait it belonged to.
+                // Nothing else does: the fetch that superseded this one is
+                // typically the auto-poll check, and `check_and_fetch_latest`
+                // sends no response at all when there is no newer volume — so a
+                // spinner left up here stays up until some later volume happens
+                // to land, and a `fetching` flag left set blocks the very poll
+                // that would have cleared it (`check_auto_polls` refuses to poll
+                // while it is true). `SwitchRadarSite` raises a `loading_site`
+                // and sets no `fetching` flag at all, so that gate does not
+                // protect this path either — a switch superseded by one auto-poll
+                // check is the case this was found on.
+                //
+                // The cost is the other order: a newer fetch that raised a
+                // spinner of its own before this landed has it taken down early.
+                // That is a frame or two of understatement against a wait
+                // indicator nothing ever takes down, and the newer result still
+                // arrives and repaints the pane. The flag is global rather than
+                // per-site, which is the same coarseness `set_error` has on the
+                // error arm below.
+                self.gui.set_fetching(false);
+                self.gui.clear_loading_site_for_site(&scan_resp.site);
             } else {
                 match scan_resp.result {
                     Ok(scan_data) => {
@@ -1877,6 +1898,89 @@ mod tests {
         assert!(
             app.channels.scan_receiver.try_recv().is_err(),
             "the frame ended with a scan response still queued",
+        );
+    }
+
+    /// A scan carrying no sweeps.
+    ///
+    /// Nothing below reads a pixel: what is under test is whether a response was
+    /// applied at all, and an empty volume is the cheapest one this crate can
+    /// build. `ScanInfo::from_scan` handles it — it falls back to the requested
+    /// timestamp when there is no radial to date the volume from.
+    fn empty_scan() -> nexrad_model::data::Scan {
+        use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
+        Scan::new(
+            VolumeCoveragePattern::new(
+                212,
+                0,
+                0.5,
+                PulseWidth::Short,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+                0,
+                false,
+                false,
+                Vec::new(),
+            ),
+            Vec::new(),
+        )
+    }
+
+    /// A result thrown away still ends the wait it belonged to.
+    ///
+    /// `SwitchRadarSite` raises a `loading_site` and sets no `fetching` flag, so
+    /// the gate that holds auto-poll off does not hold, and the very next frame
+    /// can emit a `CheckForNewScans` for the same site that bumps the generation
+    /// past it. The switch's own result then lands stale and is discarded — and
+    /// nothing else was ever going to take the spinner down, because
+    /// `check_and_fetch_latest` sends no response at all unless there is a newer
+    /// volume.
+    #[test]
+    fn a_discarded_scan_result_still_takes_down_the_wait_it_belonged_to() {
+        let mut app = headless(TestBridge::desktop());
+        {
+            let pane = app.gui.pane_mut(0).unwrap();
+            pane.site = "KTLX".to_string();
+            pane.loading_site = Some("KTLX".to_string());
+        }
+
+        // The fetch this response belongs to, then the one that supersedes it.
+        let superseded = app.render.next_fetch_generation("KTLX");
+        app.render.next_fetch_generation("KTLX");
+
+        app.channels
+            .scan_sender
+            .send(crate::channels::ScanResponse {
+                generation: superseded,
+                site: "KTLX".to_string(),
+                result: Ok(crate::channels::ScanData {
+                    scan: empty_scan(),
+                    site: "KTLX".to_string(),
+                    timestamp: chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap(),
+                }),
+                is_auto_poll: false,
+            })
+            .unwrap();
+
+        app.poll_data_channels();
+
+        assert!(
+            app.gui.pane(0).unwrap().scan_info.is_none() && app.scan_data.is_empty(),
+            "precondition: the superseded result was applied rather than \
+             discarded, so nothing here is about the discard path",
+        );
+        assert_eq!(
+            app.gui.pane(0).unwrap().loading_site,
+            None,
+            "the switch's spinner is still up with nothing left that would ever \
+             take it down",
         );
     }
 
