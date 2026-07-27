@@ -2,7 +2,9 @@ use crate::nws::alert::AlertCategory;
 use crate::spc::outlook::{OutlookDay, OutlookProduct};
 
 /// Finer-grained than `OverlayKind`: one variant per user-facing toggle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum LayerKind {
     Radar,
     SpcCategorical,
@@ -155,10 +157,7 @@ impl LayerManager {
     }
 
     pub fn is_enabled(&self, kind: LayerKind) -> bool {
-        self.layers
-            .get(&kind)
-            .map(|s| s.enabled)
-            .unwrap_or(false)
+        self.layers.get(&kind).map(|s| s.enabled).unwrap_or(false)
     }
 
     pub fn set_enabled(&mut self, kind: LayerKind, enabled: bool) {
@@ -176,7 +175,11 @@ impl LayerManager {
     /// Inserts a disabled entry if the layer is unknown, so egui always has a
     /// `&mut bool` to bind a checkbox to.
     pub fn enabled_mut(&mut self, kind: LayerKind) -> &mut bool {
-        &mut self.layers.entry(kind).or_insert(LayerState::new(false)).enabled
+        &mut self
+            .layers
+            .entry(kind)
+            .or_insert(LayerState::new(false))
+            .enabled
     }
 
     pub fn any_spc_enabled(&self) -> bool {
@@ -220,10 +223,7 @@ impl LayerManager {
                 LayerKind::SpcWind,
                 LayerKind::SpcHail,
             ],
-            OutlookDay::Day3 => vec![
-                LayerKind::SpcCategorical,
-                LayerKind::SpcProbabilistic,
-            ],
+            OutlookDay::Day3 => vec![LayerKind::SpcCategorical, LayerKind::SpcProbabilistic],
             _ => unreachable!(),
         }
     }

@@ -1,5 +1,5 @@
-use crate::types::{GeoPolygon, GeoPolygonRing, HatchPattern, OverlayFeature};
 use super::colors::{md_fill_color, md_stroke_color};
+use crate::types::{GeoPolygon, GeoPolygonRing, HatchPattern, OverlayFeature};
 
 /// Not an SPC field: derived from keywords in the discussion text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -197,8 +197,7 @@ fn extract_md_number(title: &str) -> Option<u32> {
 /// `spcmdrss.xml` items carry `<title>`, `<link>` and a `<description>` holding
 /// the whole product body, `LAT...LON` block included.
 pub fn parse_md_rss(xml: &str) -> Result<Vec<SpcDiscussion>, String> {
-    let doc = roxmltree::Document::parse(xml)
-        .map_err(|e| format!("RSS parse error: {e}"))?;
+    let doc = roxmltree::Document::parse(xml).map_err(|e| format!("RSS parse error: {e}"))?;
     let mut discussions = Vec::new();
 
     for item in doc.descendants().filter(|n| n.has_tag_name("item")) {
@@ -264,7 +263,10 @@ fn decode_html_entities(s: &str) -> String {
 /// Unwraps CDATA, maps `<br>` to a newline, drops all other tags.
 fn strip_html_tags(s: &str) -> String {
     let s = s.replace("<![CDATA[", "").replace("]]>", "");
-    let s = s.replace("<br />", "\n").replace("<br/>", "\n").replace("<br>", "\n");
+    let s = s
+        .replace("<br />", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br>", "\n");
     let mut result = String::with_capacity(s.len());
     let mut in_tag = false;
     for ch in s.chars() {
@@ -389,14 +391,26 @@ mod tests {
 
     #[test]
     fn test_classify_md_type_convective() {
-        assert_eq!(classify_md_type("SEVERE THUNDERSTORM watch likely"), MdType::Convective);
-        assert_eq!(classify_md_type("isolated tornado possible"), MdType::Convective);
+        assert_eq!(
+            classify_md_type("SEVERE THUNDERSTORM watch likely"),
+            MdType::Convective
+        );
+        assert_eq!(
+            classify_md_type("isolated tornado possible"),
+            MdType::Convective
+        );
     }
 
     #[test]
     fn test_classify_md_type_winter() {
-        assert_eq!(classify_md_type("heavy snow expected"), MdType::WinterWeather);
-        assert_eq!(classify_md_type("freezing rain advisory"), MdType::WinterWeather);
+        assert_eq!(
+            classify_md_type("heavy snow expected"),
+            MdType::WinterWeather
+        );
+        assert_eq!(
+            classify_md_type("freezing rain advisory"),
+            MdType::WinterWeather
+        );
     }
 
     #[test]
@@ -474,7 +488,10 @@ LAT...LON   39282034 38832002 38131950 37361936 37671975
         assert_eq!(discussions.len(), 1);
         let md = &discussions[0];
         assert_eq!(md.number, 1);
-        let ring = md.polygon.first().expect("polygon should be parsed from CDATA body");
+        let ring = md
+            .polygon
+            .first()
+            .expect("polygon should be parsed from CDATA body");
         assert_eq!(ring.len(), 9);
         for &(_, lon) in ring {
             assert!((-121.0..-119.0).contains(&lon), "lon {lon}");

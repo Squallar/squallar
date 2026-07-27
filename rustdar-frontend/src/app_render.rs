@@ -1,13 +1,15 @@
+use crate::constants::{
+    MAX_CONCURRENT_LOOP_DOWNLOADS, MAX_CONCURRENT_RENDERS, MAX_LOOP_FRAMES, MAX_LOOP_RENDER_BUDGET,
+};
+use crate::loop_downloads::PendingDownloads;
+use crate::render_dispatch::CachedPaneRender;
 use egui_wgpu::wgpu;
-use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use rustdar_egui::actions::GuiAction;
 use rustdar_egui::pane::{BroadcastSweep, ELEVATION_TOLERANCE, RenderTarget};
 use rustdar_radar::types::IMAGE_SIZE;
-use crate::constants::{MAX_CONCURRENT_RENDERS, MAX_LOOP_RENDER_BUDGET, MAX_CONCURRENT_LOOP_DOWNLOADS, MAX_LOOP_FRAMES};
-use crate::loop_downloads::PendingDownloads;
-use crate::render_dispatch::CachedPaneRender;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 /// What the swapchain had for us this frame.
 pub(crate) enum SurfaceStatus {
@@ -143,12 +145,19 @@ impl super::App {
             }
 
             if self.render.is_render_stale(rr.generation) {
-                log::debug!("Discarding stale render result (gen {} < current {})", rr.generation, self.render.render_generation);
+                log::debug!(
+                    "Discarding stale render result (gen {} < current {})",
+                    rr.generation,
+                    self.render.render_generation
+                );
                 continue;
             }
 
             if rr.pane_idx >= self.gui.pane_count()
-                || self.gui.get_rendering_params_for_pane(rr.pane_idx).is_none()
+                || self
+                    .gui
+                    .get_rendering_params_for_pane(rr.pane_idx)
+                    .is_none()
             {
                 continue;
             }
@@ -164,12 +173,21 @@ impl super::App {
             };
 
             // Cache the render output for sharing with other panes on the same site
-            let origin_site = self.gui.pane(origin_pane).map(|p| p.site.clone()).unwrap_or_default();
-            self.render.cache_render(&origin_site, render_result.product, render_result.elevation, crate::render_dispatch::CachedRenderOutput {
-                image_data: Arc::clone(&render_result.image_data),
-                max_range_km: render_result.max_range_km,
-                value_data: Arc::clone(&render_result.value_data),
-            });
+            let origin_site = self
+                .gui
+                .pane(origin_pane)
+                .map(|p| p.site.clone())
+                .unwrap_or_default();
+            self.render.cache_render(
+                &origin_site,
+                render_result.product,
+                render_result.elevation,
+                crate::render_dispatch::CachedRenderOutput {
+                    image_data: Arc::clone(&render_result.image_data),
+                    max_range_km: render_result.max_range_km,
+                    value_data: Arc::clone(&render_result.value_data),
+                },
+            );
 
             // Apply to the originating pane
             self.apply_render_to_pane(&ctx, origin_pane, &render_result);
@@ -180,18 +198,28 @@ impl super::App {
                 if other_idx == origin_pane {
                     continue;
                 }
-                let matches_site = self.gui.pane(other_idx).is_some_and(|p| p.site == origin_site);
+                let matches_site = self
+                    .gui
+                    .pane(other_idx)
+                    .is_some_and(|p| p.site == origin_site);
                 if !matches_site {
                     continue;
                 }
-                let Some((other_product, other_elevation)) = self.gui.get_rendering_params_for_pane(other_idx) else {
+                let Some((other_product, other_elevation)) =
+                    self.gui.get_rendering_params_for_pane(other_idx)
+                else {
                     continue;
                 };
-                if other_product == render_result.product && (other_elevation - render_result.elevation).abs() <= ELEVATION_TOLERANCE {
+                if other_product == render_result.product
+                    && (other_elevation - render_result.elevation).abs() <= ELEVATION_TOLERANCE
+                {
                     let needs = other_idx < self.render.pane_render.len()
                         && self.render.pane_render[other_idx]
                             .last_rendered
-                            .map(|(lp, le)| lp != other_product || (le - other_elevation).abs() > ELEVATION_TOLERANCE)
+                            .map(|(lp, le)| {
+                                lp != other_product
+                                    || (le - other_elevation).abs() > ELEVATION_TOLERANCE
+                            })
                             .unwrap_or(true);
                     if needs {
                         self.apply_render_to_pane(&ctx, other_idx, &render_result);
@@ -234,11 +262,7 @@ impl super::App {
         let color_image =
             egui::ColorImage::from_rgba_unmultiplied([IMAGE_SIZE, IMAGE_SIZE], &render.image_data);
         let texture_name = format!("radar_image_{}", self.texture_counter);
-        let texture = ctx.load_texture(
-            texture_name,
-            color_image,
-            egui::TextureOptions::NEAREST,
-        );
+        let texture = ctx.load_texture(texture_name, color_image, egui::TextureOptions::NEAREST);
 
         // Cache the raw image data for fast restore after suspend/resume
         if pane_idx < self.render.pane_render.len() {
@@ -284,7 +308,8 @@ impl super::App {
         });
 
         if pane_idx < self.render.pane_render.len() {
-            self.render.pane_render[pane_idx].last_rendered = Some((render.product, render.elevation));
+            self.render.pane_render[pane_idx].last_rendered =
+                Some((render.product, render.elevation));
         }
     }
 
@@ -294,8 +319,15 @@ impl super::App {
             return;
         };
 
-        if self.render.is_fetch_stale(&l3_resp.site, l3_resp.generation) {
-            log::debug!("Discarding stale Level III result for {} (gen {})", l3_resp.site, l3_resp.generation);
+        if self
+            .render
+            .is_fetch_stale(&l3_resp.site, l3_resp.generation)
+        {
+            log::debug!(
+                "Discarding stale Level III result for {} (gen {})",
+                l3_resp.site,
+                l3_resp.generation
+            );
             return;
         }
 
@@ -318,21 +350,35 @@ impl super::App {
             l3_resp.tilt_code,
             elevation,
             fetched.stamp.key,
-            fetched.age(chrono::Utc::now().naive_utc()).map(|a| a.num_minutes()),
+            fetched
+                .age(chrono::Utc::now().naive_utc())
+                .map(|a| a.num_minutes()),
         );
-        self.render.cache_level3(l3_resp.product, l3_resp.tilt_code.clone(), l3_resp.site.clone(), fetched);
+        self.render.cache_level3(
+            l3_resp.product,
+            l3_resp.tilt_code.clone(),
+            l3_resp.site.clone(),
+            fetched,
+        );
 
         // Trigger a re-render for panes on the same site viewing this product
         for (idx, prs) in self.render.pane_render.iter_mut().enumerate() {
             let pane_matches_site = self.gui.pane(idx).is_some_and(|p| p.site == l3_resp.site);
-            if pane_matches_site && self.gui.get_rendering_params_for_pane(idx).map(|(p, _)| p) == Some(l3_resp.product) {
+            if pane_matches_site
+                && self.gui.get_rendering_params_for_pane(idx).map(|(p, _)| p)
+                    == Some(l3_resp.product)
+            {
                 prs.last_rendered = None;
             }
         }
 
         // Add Level III products to the scan info for panes on this site
         for pane_idx in 0..self.gui.pane_count() {
-            let pane_site = self.gui.pane(pane_idx).map(|p| p.site.clone()).unwrap_or_default();
+            let pane_site = self
+                .gui
+                .pane(pane_idx)
+                .map(|p| p.site.clone())
+                .unwrap_or_default();
             if pane_site != l3_resp.site {
                 continue;
             }
@@ -347,7 +393,11 @@ impl super::App {
                 info.status = format!(
                     "Loaded {} products: {}",
                     info.available_products.len(),
-                    info.available_products.iter().map(|p| p.name()).collect::<Vec<_>>().join(", ")
+                    info.available_products
+                        .iter()
+                        .map(|p| p.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
                 changed = true;
             }
@@ -440,10 +490,17 @@ impl super::App {
 
                 if needs_render && !prs.render_in_flight {
                     // Get the pane's site for cache lookups
-                    let pane_site = self.gui.pane(pane_idx).map(|p| p.site.clone()).unwrap_or_default();
+                    let pane_site = self
+                        .gui
+                        .pane(pane_idx)
+                        .map(|p| p.site.clone())
+                        .unwrap_or_default();
 
                     // Check if another pane already rendered this site+product+elevation
-                    if let Some(cached) = self.render.get_cached_render(&pane_site, product, elevation) {
+                    if let Some(cached) = self
+                        .render
+                        .get_cached_render(&pane_site, product, elevation)
+                    {
                         let render_result = crate::render_dispatch::CachedPaneRender {
                             image_data: Arc::clone(&cached.image_data),
                             max_range_km: cached.max_range_km,
@@ -451,7 +508,12 @@ impl super::App {
                             product,
                             elevation,
                         };
-                        log::info!("Reusing cached render for pane {}: {:?} at {:.1}°", pane_idx, product, elevation);
+                        log::info!(
+                            "Reusing cached render for pane {}: {:?} at {:.1}°",
+                            pane_idx,
+                            product,
+                            elevation
+                        );
                         self.apply_render_to_pane(&ctx, pane_idx, &render_result);
                         continue;
                     }
@@ -494,10 +556,11 @@ impl super::App {
                 // When scan_info exists but get_rendering_params returns None, the pane
                 // is a Level III product waiting for elevation data — keep the old texture
                 // visible until the new render replaces it.
-                let has_scan = self.gui.pane(pane_idx).is_some_and(|p| p.scan_info.is_some());
-                if !has_scan
-                    && let Some(pane) = self.gui.pane_mut(pane_idx)
-                {
+                let has_scan = self
+                    .gui
+                    .pane(pane_idx)
+                    .is_some_and(|p| p.scan_info.is_some());
+                if !has_scan && let Some(pane) = self.gui.pane_mut(pane_idx) {
                     let cache = pane.overlay_cache_mut(
                         rustdar_overlays::render::overlay_state::OverlayKind::Radar,
                     );
@@ -526,9 +589,7 @@ impl super::App {
         };
 
         for pane_idx in 0..self.render.pane_render.len().min(self.gui.pane_count()) {
-            let Some(ref cached) =
-                self.render.pane_render[pane_idx].cached_render
-            else {
+            let Some(ref cached) = self.render.pane_render[pane_idx].cached_render else {
                 continue;
             };
             let max_range_km = cached.max_range_km;
@@ -550,9 +611,13 @@ impl super::App {
 
             self.texture_counter += 1;
             let ctx = state.egui_renderer.context();
-            let color_image = egui::ColorImage::from_rgba_unmultiplied([IMAGE_SIZE, IMAGE_SIZE], &cached.image_data);
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [IMAGE_SIZE, IMAGE_SIZE],
+                &cached.image_data,
+            );
             let texture_name = format!("radar_image_{}", self.texture_counter);
-            let texture = ctx.load_texture(texture_name, color_image, egui::TextureOptions::NEAREST);
+            let texture =
+                ctx.load_texture(texture_name, color_image, egui::TextureOptions::NEAREST);
 
             let bounds = ImageBounds::from_radar_site(lat, lon);
             let geo_bounds = GeoBounds {
@@ -648,9 +713,7 @@ impl super::App {
                 // retired textures are safe to free because nothing painted with
                 // them this frame.
                 state.queue.submit(Some(encoder.finish()));
-                state
-                    .egui_renderer
-                    .free_textures(frame.textures_to_free());
+                state.egui_renderer.free_textures(frame.textures_to_free());
 
                 if matches!(status, SurfaceStatus::Lost) {
                     // Surface is irrecoverably lost (e.g. display changed on a
@@ -671,7 +734,9 @@ impl super::App {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        state.egui_renderer.draw(&mut encoder, &surface_view, &frame);
+        state
+            .egui_renderer
+            .draw(&mut encoder, &surface_view, &frame);
 
         state.queue.submit(Some(encoder.finish()));
         state.egui_renderer.free_textures(frame.textures_to_free());
@@ -694,7 +759,9 @@ impl super::App {
             };
             log::info!(
                 "Loop: populated {} {} frames for pane {}",
-                pending.queue.len(), pending.site, resp.pane_idx
+                pending.queue.len(),
+                pending.site,
+                resp.pane_idx
             );
 
             // Store the scans as pending downloads — with the site they were listed
@@ -763,7 +830,8 @@ impl super::App {
         }
 
         // Put the queue back, still carrying its own site
-        self.loop_mgr.insert_pending(pane_idx, PendingDownloads { site, queue });
+        self.loop_mgr
+            .insert_pending(pane_idx, PendingDownloads { site, queue });
 
         if spawned > 0 {
             self.loop_mgr.add_spawned(spawned);
@@ -822,7 +890,9 @@ impl super::App {
                     }
                     let sweep = broadcast_sweep(&self.loop_mgr, sibling_loop, &rr);
 
-                    let Some(sibling) = self.gui.pane_mut(sibling_idx) else { continue };
+                    let Some(sibling) = self.gui.pane_mut(sibling_idx) else {
+                        continue;
+                    };
                     // Hand the image only to panes whose frames are keyed to exactly
                     // what it depicts, site and sweep included. Matching against the
                     // response rather than the origin pane's live selection keeps a
@@ -830,10 +900,11 @@ impl super::App {
                     // will never correct. The decision — and the frame it resolves to —
                     // lives in `LoopPlaybackState` so it stays in step with the donor
                     // test the dispatcher applies before suppressing a pane's own render.
-                    let Some(sframe) = sibling
-                        .loop_state
-                        .frame_accepting_broadcast_mut(rr.timestamp, &rr.target, sweep)
-                    else {
+                    let Some(sframe) = sibling.loop_state.frame_accepting_broadcast_mut(
+                        rr.timestamp,
+                        &rr.target,
+                        sweep,
+                    ) else {
                         continue;
                     };
                     // If the sibling had its own render running for this frame it is now
@@ -863,7 +934,9 @@ impl super::App {
         for pidx in 0..self.gui.pane_count() {
             let loop_mgr = &self.loop_mgr;
             let pane_downloads_done = loop_mgr.is_pane_done(pidx);
-            let Some(p) = self.gui.pane_mut(pidx) else { continue };
+            let Some(p) = self.gui.pane_mut(pidx) else {
+                continue;
+            };
             let pls = &mut p.loop_state;
             if !pls.is_active() || pls.is_render_ready() || pls.frames.is_empty() {
                 continue;
@@ -889,7 +962,9 @@ impl super::App {
         let mut ready_panes: Vec<usize> = Vec::new();
         let mut not_ready_panes: Vec<usize> = Vec::new();
         for idx in 0..pane_count {
-            let Some(pane) = self.gui.pane(idx) else { continue };
+            let Some(pane) = self.gui.pane(idx) else {
+                continue;
+            };
             let ls = &pane.loop_state;
             if !ls.is_active() {
                 continue;
@@ -941,7 +1016,8 @@ impl super::App {
                 continue;
             }
 
-            let should_advance = ls.last_advance
+            let should_advance = ls
+                .last_advance
                 .map(|last| now.duration_since(last) >= interval)
                 .unwrap_or(true);
 
@@ -981,7 +1057,9 @@ impl super::App {
             if ls.retarget_renders(product, elevation) {
                 log::debug!(
                     "Loop: pane {} retargeted to {:?} at {:.1}°, re-rendering all frames",
-                    pane_idx, product, elevation
+                    pane_idx,
+                    product,
+                    elevation
                 );
                 continue;
             }
@@ -1041,7 +1119,8 @@ impl super::App {
                 // applies, so the two cannot disagree about who may serve this frame.
                 if sync {
                     let donor = find_donor(
-                        (0..pane_count).filter_map(|i| self.gui.pane(i).map(|p| (i, &p.loop_state))),
+                        (0..pane_count)
+                            .filter_map(|i| self.gui.pane(i).map(|p| (i, &p.loop_state))),
                         pane_idx,
                         frame.timestamp,
                         &target,
@@ -1059,7 +1138,9 @@ impl super::App {
 
                 if let Some(scan) = frame_scan(&self.loop_mgr, &target, frame.timestamp) {
                     // Snap elevation to closest available in this particular scan
-                    let Some(snapped) = rustdar_radar::render::find_closest_elevation(scan, product, elevation) else {
+                    let Some(snapped) =
+                        rustdar_radar::render::find_closest_elevation(scan, product, elevation)
+                    else {
                         // This scan has no sweep carrying the selected product at all.
                         // Nothing will ever render it, so retire the frame.
                         to_mark_failed.push((pane_idx, idx));
@@ -1068,7 +1149,8 @@ impl super::App {
                     // Deduplicate: if another pane already queued a render for the same
                     // target and timestamp, skip — the broadcast in
                     // poll_loop_render_results will deliver the texture to this pane.
-                    if sync && render_already_queued(&to_render, frame.timestamp, &target, snapped) {
+                    if sync && render_already_queued(&to_render, frame.timestamp, &target, snapped)
+                    {
                         continue;
                     }
                     to_render.push(LoopRenderRequest {
@@ -1098,12 +1180,20 @@ impl super::App {
         // (`to_mark_failed` only sets a flag), so they are used directly.
         for req in to_clone {
             let cloned = {
-                let Some(src) = self.gui.pane(req.src_pane) else { continue };
-                let Some(sframe) = src.loop_state.frames.get(req.src_frame) else { continue };
-                let Some(tex) = sframe.texture.clone() else { continue };
+                let Some(src) = self.gui.pane(req.src_pane) else {
+                    continue;
+                };
+                let Some(sframe) = src.loop_state.frames.get(req.src_frame) else {
+                    continue;
+                };
+                let Some(tex) = sframe.texture.clone() else {
+                    continue;
+                };
                 tex
             };
-            let Some(dest) = self.gui.pane_mut(req.dest_pane) else { continue };
+            let Some(dest) = self.gui.pane_mut(req.dest_pane) else {
+                continue;
+            };
             if let Some(dframe) = dest.loop_state.frames.get_mut(req.dest_frame) {
                 dframe.texture = Some(cloned);
             }
@@ -1189,7 +1279,12 @@ fn accept_scan_listing(
         let sampled: Vec<_> = (0..MAX_LOOP_FRAMES)
             .map(|i| scans[i * (total - 1) / (MAX_LOOP_FRAMES - 1).max(1)].clone())
             .collect();
-        log::info!("Loop: sampled {} → {} frames for {}", total, MAX_LOOP_FRAMES, site);
+        log::info!(
+            "Loop: sampled {} → {} frames for {}",
+            total,
+            MAX_LOOP_FRAMES,
+            site
+        );
         sampled
     } else {
         scans
@@ -1210,7 +1305,10 @@ fn accept_scan_listing(
         ls.current_frame = ls.frames.len() - 1; // start at newest
     }
 
-    Some(PendingDownloads { site: site.to_string(), queue: VecDeque::from(scans) })
+    Some(PendingDownloads {
+        site: site.to_string(),
+        queue: VecDeque::from(scans),
+    })
 }
 
 /// The frame image a finished loop render describes.
@@ -1353,7 +1451,13 @@ fn broadcast_sweep(
 ) -> BroadcastSweep {
     BroadcastSweep {
         rendered: rr.snapped,
-        own: own_sweep(loop_mgr, ls, rr.timestamp, rr.target.product, rr.target.elevation),
+        own: own_sweep(
+            loop_mgr,
+            ls,
+            rr.timestamp,
+            rr.target.product,
+            rr.target.elevation,
+        ),
     }
 }
 
@@ -1472,11 +1576,11 @@ fn render_already_queued(
 mod loop_dispatch_tests {
     use super::*;
     use crate::loop_downloads::LoopDownloadManager;
-    use rustdar_radar::archive::Identifier;
     use nexrad_model::data::{
         MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
     };
     use rustdar_egui::pane::{LoopFrame, LoopPhase, LoopPlaybackState};
+    use rustdar_radar::archive::Identifier;
     use rustdar_radar::sites::RadarSite;
     use rustdar_radar::types::RadarProduct;
 
@@ -1516,7 +1620,15 @@ mod loop_dispatch_tests {
                     RadialStatus::ElevationStart,
                     i as u8 + 1,
                     elevation,
-                    Some(MomentData::from_fixed_point(1, 0, 250, 8, 2.0, 66.0, vec![0])),
+                    Some(MomentData::from_fixed_point(
+                        1,
+                        0,
+                        250,
+                        8,
+                        2.0,
+                        66.0,
+                        vec![0],
+                    )),
                     None,
                     None,
                     None,
@@ -1529,7 +1641,19 @@ mod loop_dispatch_tests {
             .collect();
         Arc::new(Scan::new(
             VolumeCoveragePattern::new(
-                212, 0, 0.5, PulseWidth::Short, false, 0, false, 0, false, false, 0, false, false,
+                212,
+                0,
+                0.5,
+                PulseWidth::Short,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+                0,
+                false,
+                false,
                 Vec::new(),
             ),
             sweeps,
@@ -1541,7 +1665,12 @@ mod loop_dispatch_tests {
     fn loop_on(ctx: &egui::Context, site: &'static str, textured: &[usize]) -> LoopPlaybackState {
         let mut ls = LoopPlaybackState::new_for_loop(
             3600,
-            &RadarSite { name: site, lat: 35.0, lon: -97.0, elev: None },
+            &RadarSite {
+                name: site,
+                lat: 35.0,
+                lon: -97.0,
+                elev: None,
+            },
         );
         ls.phase = LoopPhase::Rendering;
         ls.frames = (0..3)
@@ -1597,7 +1726,11 @@ mod loop_dispatch_tests {
         ctx.load_texture("test", image, egui::TextureOptions::NEAREST)
     }
 
-    fn queued(target: RenderTarget, timestamp: chrono::NaiveDateTime, snapped: f32) -> LoopRenderRequest {
+    fn queued(
+        target: RenderTarget,
+        timestamp: chrono::NaiveDateTime,
+        snapped: f32,
+    ) -> LoopRenderRequest {
         LoopRenderRequest {
             pane_idx: 0,
             frame_idx: 0,
@@ -1615,7 +1748,12 @@ mod loop_dispatch_tests {
         let q = vec![queued(target("KTLX", 0.5), ts(0), 0.48)];
         assert!(render_already_queued(&q, ts(0), &target("KTLX", 0.5), 0.48));
         // Selection jitter within tolerance is the same target.
-        assert!(render_already_queued(&q, ts(0), &target("KTLX", 0.505), 0.48));
+        assert!(render_already_queued(
+            &q,
+            ts(0),
+            &target("KTLX", 0.505),
+            0.48
+        ));
     }
 
     /// The defect: suppressing here promises a broadcast that
@@ -1633,11 +1771,21 @@ mod loop_dispatch_tests {
     #[test]
     fn a_queued_render_at_another_timestamp_or_sweep_suppresses_nothing() {
         let q = vec![queued(target("KTLX", 0.5), ts(0), 0.48)];
-        assert!(!render_already_queued(&q, ts(1), &target("KTLX", 0.5), 0.48));
+        assert!(!render_already_queued(
+            &q,
+            ts(1),
+            &target("KTLX", 0.5),
+            0.48
+        ));
         // Same target, but the two scans resolved the selection to different sweeps,
         // so the images differ.
         assert!(!render_already_queued(&q, ts(0), &target("KTLX", 0.5), 1.5));
-        assert!(!render_already_queued(&[], ts(0), &target("KTLX", 0.5), 0.48));
+        assert!(!render_already_queued(
+            &[],
+            ts(0),
+            &target("KTLX", 0.5),
+            0.48
+        ));
     }
 
     /// The coupling this file's `render_already_queued` docs describe, tested where
@@ -1661,7 +1809,10 @@ mod loop_dispatch_tests {
                 .frame_accepting_broadcast(
                     ts(0),
                     &want,
-                    BroadcastSweep { rendered: 0.48, own: Some(own) },
+                    BroadcastSweep {
+                        rendered: 0.48,
+                        own: Some(own),
+                    },
                 )
                 .is_some();
             assert_eq!(
@@ -1728,7 +1879,10 @@ mod loop_dispatch_tests {
         // The loop's own listing is taken.
         let live = vec![(ts(0), identifier("KOUN20240101_000000_V06"))];
         let pending = accept_scan_listing(&mut koun, "KOUN", live).expect("its own listing");
-        assert_eq!(pending.site, "KOUN", "the queue carries the site it was listed for");
+        assert_eq!(
+            pending.site, "KOUN",
+            "the queue carries the site it was listed for"
+        );
         assert_eq!(pending.queue.len(), 1);
         assert_eq!(koun.frames.len(), 1);
     }
@@ -1759,7 +1913,10 @@ mod loop_dispatch_tests {
         let ctx = egui::Context::default();
         let mut ls = loop_on(&ctx, "KTLX", &[]);
         ls.phase = LoopPhase::FetchingScanList;
-        assert!(ls.is_fetching(), "precondition: a loop awaiting its listing");
+        assert!(
+            ls.is_fetching(),
+            "precondition: a loop awaiting its listing"
+        );
 
         let scans: Vec<_> = (0..(MAX_LOOP_FRAMES as u32 + 40))
             .map(|i| (ts(i), identifier(&format!("KTLX2024010{}_V06", i))))
@@ -1773,9 +1930,16 @@ mod loop_dispatch_tests {
             pending.queue.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
             "the sampled set is the frame list, frame for frame"
         );
-        assert_eq!(ls.current_frame, ls.frames.len() - 1, "playback starts at the newest");
+        assert_eq!(
+            ls.current_frame,
+            ls.frames.len() - 1,
+            "playback starts at the newest"
+        );
         assert_eq!(ls.phase, LoopPhase::Rendering);
-        assert!(!ls.is_fetching(), "and the loop has stopped reading as fetching");
+        assert!(
+            !ls.is_fetching(),
+            "and the loop has stopped reading as fetching"
+        );
     }
 
     /// The cap has to *sample* the window, not truncate it. Taking the first
@@ -1840,17 +2004,26 @@ mod loop_dispatch_tests {
         ls.frames[1].render_in_flight = true;
         let mut rr = response(ts(1), ls.rendered_for.clone().expect("target adopted"));
 
-        assert_ne!(rr.site_lat, ls.site_lat, "precondition: the two sources differ");
+        assert_ne!(
+            rr.site_lat, ls.site_lat,
+            "precondition: the two sources differ"
+        );
         assert_ne!(rr.site_lon, ls.site_lon);
 
         let texture = accept_render_result(&mut ls, &mut rr, |_| dummy_texture(&ctx))
             .expect("the loop is awaiting this result");
 
         let image = ls.frames[1].texture.as_ref().expect("the frame was filled");
-        assert_eq!(image.lat, rr.site_lat, "the latitude the image was projected around");
+        assert_eq!(
+            image.lat, rr.site_lat,
+            "the latitude the image was projected around"
+        );
         assert_eq!(image.lon, rr.site_lon);
         assert_eq!(image.max_range_km, rr.max_range_km);
-        assert!(!ls.frames[1].render_in_flight, "and the frame is no longer in flight");
+        assert!(
+            !ls.frames[1].render_in_flight,
+            "and the frame is no longer in flight"
+        );
 
         // The same image, described identically, is what the broadcast hands on — so
         // a sibling taking it is told where it was drawn rather than assuming.
@@ -1875,10 +2048,16 @@ mod loop_dispatch_tests {
             dummy_texture(&ctx)
         });
 
-        assert!(placed.is_none(), "a result for another elevation is not this loop's");
+        assert!(
+            placed.is_none(),
+            "a result for another elevation is not this loop's"
+        );
         assert_eq!(uploads, 0, "and nothing was uploaded for it");
         assert!(ls.frames[1].texture.is_none());
-        assert!(stale.image.is_some(), "and its pixels were not taken off the response");
+        assert!(
+            stale.image.is_some(),
+            "and its pixels were not taken off the response"
+        );
     }
 
     /// No image means the render found no matching sweep. The frame is retired
@@ -1917,14 +2096,20 @@ mod loop_dispatch_tests {
         let scan = scan_with_sweeps(&[0.5]);
         mgr.mark_in_flight("KTLX", ts(0));
 
-        apply_completed_download(&mut mgr, crate::channels::LoopScanDownloadResponse {
-            pane_idx: 0,
-            site: "KTLX".to_string(),
-            timestamp: ts(0),
-            scan: Some(Arc::clone(&scan)),
-        });
+        apply_completed_download(
+            &mut mgr,
+            crate::channels::LoopScanDownloadResponse {
+                pane_idx: 0,
+                site: "KTLX".to_string(),
+                timestamp: ts(0),
+                scan: Some(Arc::clone(&scan)),
+            },
+        );
 
-        assert!(Arc::ptr_eq(mgr.get_cached("KTLX", &ts(0)).expect("cached"), &scan));
+        assert!(Arc::ptr_eq(
+            mgr.get_cached("KTLX", &ts(0)).expect("cached"),
+            &scan
+        ));
         assert!(mgr.get_cached("KOUN", &ts(0)).is_none());
         assert!(!mgr.is_in_flight("KTLX", &ts(0)), "and its mark is cleared");
     }
@@ -1935,12 +2120,15 @@ mod loop_dispatch_tests {
         let mut mgr = LoopDownloadManager::new();
         mgr.mark_in_flight("KTLX", ts(0));
 
-        apply_completed_download(&mut mgr, crate::channels::LoopScanDownloadResponse {
-            pane_idx: 0,
-            site: "KTLX".to_string(),
-            timestamp: ts(0),
-            scan: None,
-        });
+        apply_completed_download(
+            &mut mgr,
+            crate::channels::LoopScanDownloadResponse {
+                pane_idx: 0,
+                site: "KTLX".to_string(),
+                timestamp: ts(0),
+                scan: None,
+            },
+        );
 
         assert!(!mgr.is_in_flight("KTLX", &ts(0)));
         assert!(!mgr.is_cached("KTLX", &ts(0)));
@@ -2027,8 +2215,15 @@ mod loop_dispatch_tests {
 
         let sweep = broadcast_sweep(&mgr, &koun, &rr);
 
-        assert_eq!(sweep.rendered, 1.4, "the tilt the image depicts — not the 0.5 selection");
-        assert_eq!(sweep.own, Some(0.5), "what this loop's own scan resolves that selection to");
+        assert_eq!(
+            sweep.rendered, 1.4,
+            "the tilt the image depicts — not the 0.5 selection"
+        );
+        assert_eq!(
+            sweep.own,
+            Some(0.5),
+            "what this loop's own scan resolves that selection to"
+        );
         assert!(!sweep.agrees(), "so the image must not be handed over");
 
         // Same call, a receiver whose scan does snap where the image was rendered.
@@ -2148,8 +2343,7 @@ mod frame_order_tests {
         ctx.begin_pass(egui::RawInput::default());
         assert_eq!(ctx.cumulative_pass_nr(), 0, "pass is open, not yet ended");
 
-        let (_finished, status) =
-            finish_then_acquire(|| ctx.end_pass(), |_| SurfaceStatus::Lost);
+        let (_finished, status) = finish_then_acquire(|| ctx.end_pass(), |_| SurfaceStatus::Lost);
 
         assert!(matches!(status, SurfaceStatus::Lost));
         assert_eq!(
@@ -2352,11 +2546,9 @@ mod stamping_tests {
         // frame the user would be looking at rather than an early return.
         let pane = app.gui.pane_mut(0).unwrap();
         assert!(
-            pane.overlay_cache_mut(
-                rustdar_overlays::render::overlay_state::OverlayKind::Radar
-            )
-            .current
-            .is_some(),
+            pane.overlay_cache_mut(rustdar_overlays::render::overlay_state::OverlayKind::Radar)
+                .current
+                .is_some(),
             "precondition: no texture was placed at all",
         );
     }

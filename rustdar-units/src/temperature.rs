@@ -10,10 +10,7 @@ pub enum TemperatureUnit {
 }
 
 impl TemperatureUnit {
-    pub const ALL: &[TemperatureUnit] = &[
-        TemperatureUnit::Fahrenheit,
-        TemperatureUnit::Celsius,
-    ];
+    pub const ALL: &[TemperatureUnit] = &[TemperatureUnit::Fahrenheit, TemperatureUnit::Celsius];
 
     pub fn convert_from_f(self, value: f64) -> f64 {
         match self {

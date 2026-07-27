@@ -151,18 +151,28 @@ impl DataSources {
     }
 
     /// URL of one HRRR GRIB2 file.
-    pub fn hrrr_grib_url(&self, date: &chrono::NaiveDate, run_hour: u8, forecast_hour: u8) -> String {
-        Self::s3_object_url(&self.hrrr_bucket, &Self::hrrr_key(date, run_hour, forecast_hour))
+    pub fn hrrr_grib_url(
+        &self,
+        date: &chrono::NaiveDate,
+        run_hour: u8,
+        forecast_hour: u8,
+    ) -> String {
+        Self::s3_object_url(
+            &self.hrrr_bucket,
+            &Self::hrrr_key(date, run_hour, forecast_hour),
+        )
     }
 
     /// The `.idx` sidecar listing that GRIB2 file's records and byte offsets.
     /// ~9 KB, then a `Range:` request for the one record wanted — which is what
     /// makes the S3 path cheaper than the NOMADS filter CGI it replaces.
-    pub fn hrrr_idx_url(&self, date: &chrono::NaiveDate, run_hour: u8, forecast_hour: u8) -> String {
-        format!(
-            "{}.idx",
-            self.hrrr_grib_url(date, run_hour, forecast_hour)
-        )
+    pub fn hrrr_idx_url(
+        &self,
+        date: &chrono::NaiveDate,
+        run_hour: u8,
+        forecast_hour: u8,
+    ) -> String {
+        format!("{}.idx", self.hrrr_grib_url(date, run_hour, forecast_hour))
     }
 
     /// Current ASOS observations for one US state, as JSON.
@@ -170,10 +180,7 @@ impl DataSources {
     /// Scoped to a state (~72 KB) rather than the whole network: the
     /// `?networkclass=ASOS` form is one request but **54 MB, ungzipped**.
     pub fn metar_state_url(&self, state: &str) -> String {
-        format!(
-            "{}/api/1/currents.json?network={state}_ASOS",
-            self.iem_base,
-        )
+        format!("{}/api/1/currents.json?network={state}_ASOS", self.iem_base,)
     }
 
     /// Active NWS alerts, as GeoJSON.
@@ -209,7 +216,11 @@ mod tests {
             s.spc_base.to_string(),
         ];
         for url in urls {
-            for blocked in ["tgftp.nws.noaa.gov", "nomads.ncep.noaa.gov", "aviationweather.gov"] {
+            for blocked in [
+                "tgftp.nws.noaa.gov",
+                "nomads.ncep.noaa.gov",
+                "aviationweather.gov",
+            ] {
                 assert!(
                     !url.contains(blocked),
                     "{url} still points at {blocked}, which sends no \
@@ -262,7 +273,10 @@ mod tests {
             s.hrrr_idx_url(&date(), 3, 0),
             format!("{}.idx", s.hrrr_grib_url(&date(), 3, 0)),
         );
-        assert!(s.hrrr_idx_url(&date(), 3, 0).ends_with("wrfsfcf00.grib2.idx"));
+        assert!(
+            s.hrrr_idx_url(&date(), 3, 0)
+                .ends_with("wrfsfcf00.grib2.idx")
+        );
     }
 
     /// `network=<ST>_ASOS`, never `networkclass=ASOS`: 72 KB vs 54 MB measured,
@@ -321,8 +335,14 @@ mod tests {
     #[test]
     fn flipping_the_preflight_rule_changes_the_client() {
         let t = std::time::Duration::from_secs(1);
-        let metar = DataSources { metar_sends_user_agent: true, ..DataSources::production() };
-        let spc = DataSources { spc_sends_user_agent: true, ..DataSources::production() };
+        let metar = DataSources {
+            metar_sends_user_agent: true,
+            ..DataSources::production()
+        };
+        let spc = DataSources {
+            spc_sends_user_agent: true,
+            ..DataSources::production()
+        };
         assert!(
             crate::tls::sends_user_agent(&metar.metar_client(t).build().expect("client")),
             "metar_client does not read metar_sends_user_agent",

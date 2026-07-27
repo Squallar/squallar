@@ -113,11 +113,7 @@ pub fn parse_idx(text: &str) -> Vec<IdxRecord> {
 /// caller wanted the maximum is the same quiet class of error as the
 /// constant-zero f00 `MXUPHL`. [`IdxRecord::forecast`] is carried as the
 /// disambiguator for a parameter whose pair does repeat.
-pub fn byte_range(
-    records: &[IdxRecord],
-    var: &str,
-    level: &str,
-) -> Option<(u64, Option<u64>)> {
+pub fn byte_range(records: &[IdxRecord], var: &str, level: &str) -> Option<(u64, Option<u64>)> {
     let idx = records
         .iter()
         .position(|r| r.var == var && r.level == level)?;
@@ -290,11 +286,21 @@ fn parse_grib2(bytes: &[u8], param: ModelParameter) -> Result<HrrrGridData, Stri
     let mut max_lon = f64::MIN;
 
     for index in 0..coords.len() {
-        let Some((lat, lon)) = coords.at(index) else { break };
-        if lat < min_lat { min_lat = lat; }
-        if lat > max_lat { max_lat = lat; }
-        if lon < min_lon { min_lon = lon; }
-        if lon > max_lon { max_lon = lon; }
+        let Some((lat, lon)) = coords.at(index) else {
+            break;
+        };
+        if lat < min_lat {
+            min_lat = lat;
+        }
+        if lat > max_lat {
+            max_lat = lat;
+        }
+        if lon < min_lon {
+            min_lon = lon;
+        }
+        if lon > max_lon {
+            max_lon = lon;
+        }
     }
 
     let bounds = GeoBounds {
@@ -352,7 +358,10 @@ async fn fetch_record(
     }
 
     let (start, end) = byte_range(&records, var, level).ok_or_else(|| {
-        format!("no `{var}:{level}` record in {idx_url} ({} records)", records.len())
+        format!(
+            "no `{var}:{level}` record in {idx_url} ({} records)",
+            records.len()
+        )
     })?;
 
     let grib_url = sources.hrrr_grib_url(&date, run_hour, forecast_hour);
@@ -383,7 +392,10 @@ async fn fetch_record(
         .bytes()
         .await
         .map_err(|e| format!("Failed to read response body: {e}"))?;
-    log::info!("Received {} bytes of GRIB2 data for {var}:{level}", bytes.len());
+    log::info!(
+        "Received {} bytes of GRIB2 data for {var}:{level}",
+        bytes.len()
+    );
     Ok(bytes.to_vec())
 }
 
@@ -638,7 +650,10 @@ mod tests {
                 end,
                 Some(pair[1].offset - 1),
                 "{}:{} must stop before {}:{}",
-                pair[0].var, pair[0].level, pair[1].var, pair[1].level,
+                pair[0].var,
+                pair[0].level,
+                pair[1].var,
+                pair[1].level,
             );
         }
     }
@@ -700,15 +715,35 @@ mod tests {
     /// with no near-miss handling.
     const IDX_RECORDS: &[(ModelParameter, &str, &str)] = &[
         (ModelParameter::SurfaceBasedCin, "CIN", "surface"),
-        (ModelParameter::MixedLayerCin, "CIN", "180-0 mb above ground"),
+        (
+            ModelParameter::MixedLayerCin,
+            "CIN",
+            "180-0 mb above ground",
+        ),
         (ModelParameter::SurfaceBasedCape, "CAPE", "surface"),
-        (ModelParameter::MixedLayerCape, "CAPE", "180-0 mb above ground"),
-        (ModelParameter::MostUnstableCape, "CAPE", "255-0 mb above ground"),
+        (
+            ModelParameter::MixedLayerCape,
+            "CAPE",
+            "180-0 mb above ground",
+        ),
+        (
+            ModelParameter::MostUnstableCape,
+            "CAPE",
+            "255-0 mb above ground",
+        ),
         (ModelParameter::LiftedIndex, "LFTX", "500-1000 mb"),
         (ModelParameter::Srh1km, "HLCY", "1000-0 m above ground"),
         (ModelParameter::Srh3km, "HLCY", "3000-0 m above ground"),
-        (ModelParameter::MaxUH2to5km, "MXUPHL", "5000-2000 m above ground"),
-        (ModelParameter::MaxUH0to2km, "MXUPHL", "2000-0 m above ground"),
+        (
+            ModelParameter::MaxUH2to5km,
+            "MXUPHL",
+            "5000-2000 m above ground",
+        ),
+        (
+            ModelParameter::MaxUH0to2km,
+            "MXUPHL",
+            "2000-0 m above ground",
+        ),
         (ModelParameter::SurfaceWindGust, "GUST", "surface"),
         (
             ModelParameter::PrecipitableWater,
@@ -811,7 +846,10 @@ mod tests {
     /// for the wrong field. Only an `#[ignore]`d live test used to catch that.
     #[test]
     fn only_a_single_submessage_is_accepted() {
-        assert!(exactly_one_submessage(1).is_ok(), "one record must be accepted");
+        assert!(
+            exactly_one_submessage(1).is_ok(),
+            "one record must be accepted"
+        );
 
         let none = exactly_one_submessage(0).expect_err("zero records must be refused");
         assert!(none.contains("found 0"), "{none}");
@@ -1079,7 +1117,10 @@ mod tests {
         let (start, _) = byte_range(&records, "REFD", "263 K level").unwrap();
         assert_eq!(start, 2_668_643, "the first match must win, i.e. record 8");
         let (start, _) = byte_range(&records, "WEASD", "surface").unwrap();
-        assert_eq!(start, 42_378_051, "the first match must win, i.e. record 68");
+        assert_eq!(
+            start, 42_378_051,
+            "the first match must win, i.e. record 68"
+        );
     }
 
     /// `hour` is a `u8` and `latest_available_run` returns 0 for the whole
@@ -1089,12 +1130,19 @@ mod tests {
     fn the_previous_run_rolls_back_over_midnight() {
         let day = NaiveDate::from_ymd_opt(2026, 7, 25).unwrap();
         let before = NaiveDate::from_ymd_opt(2026, 7, 24).unwrap();
-        assert_eq!(previous_run(day, 0), (before, 23), "00Z must fall back to 23Z yesterday");
+        assert_eq!(
+            previous_run(day, 0),
+            (before, 23),
+            "00Z must fall back to 23Z yesterday"
+        );
         assert_eq!(previous_run(day, 1), (day, 0));
         assert_eq!(previous_run(day, 14), (day, 13));
         // The first day of a month, where the date arithmetic is not just -1.
         let first = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
-        assert_eq!(previous_run(first, 0), (NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(), 23));
+        assert_eq!(
+            previous_run(first, 0),
+            (NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(), 23)
+        );
     }
 
     /// The forecast hour must reach the object key; if it does not, the UH fix
@@ -1127,7 +1175,12 @@ mod tests {
         // live in f01, the rest in f00.
         for forecast_hour in [0u8, 1] {
             let url = sources.hrrr_idx_url(&date, hour, forecast_hour);
-            let text = match client.get(&url).send().await.and_then(|r| r.error_for_status()) {
+            let text = match client
+                .get(&url)
+                .send()
+                .await
+                .and_then(|r| r.error_for_status())
+            {
                 Ok(r) => r.text().await.expect("index body"),
                 Err(_) => {
                     let (prev_date, prev_hour) = previous_run(date, hour);
@@ -1144,7 +1197,11 @@ mod tests {
                 }
             };
             let records = parse_idx(&text);
-            assert!(records.len() > 100, "f{forecast_hour:02} index parsed to {} records", records.len());
+            assert!(
+                records.len() > 100,
+                "f{forecast_hour:02} index parsed to {} records",
+                records.len()
+            );
 
             // Control: the ambiguity this is guarding against is real in this
             // very index, so a "no pair ever repeats" reading of a pass below
@@ -1160,15 +1217,18 @@ mod tests {
                 })
                 .map(|r| format!("{}:{}", r.var, r.level))
                 .collect::<std::collections::BTreeSet<_>>();
-            println!("f{forecast_hour:02}: {} records, repeated pairs: {repeated:?}", records.len());
+            println!(
+                "f{forecast_hour:02}: {} records, repeated pairs: {repeated:?}",
+                records.len()
+            );
 
             for param in ModelParameter::all() {
                 if param.forecast_hour() != forecast_hour {
                     continue;
                 }
-                let pairs = param.composite_parts().unwrap_or_else(|| {
-                    vec![(param.grib_var(), param.grib_level())]
-                });
+                let pairs = param
+                    .composite_parts()
+                    .unwrap_or_else(|| vec![(param.grib_var(), param.grib_level())]);
                 for (var, level) in pairs {
                     let matches = records
                         .iter()
@@ -1182,7 +1242,10 @@ mod tests {
                          match on IdxRecord::forecast as well. Candidates: {:?}",
                         param.display_name(),
                         matches.len(),
-                        matches.iter().map(|r| (r.number, &r.forecast)).collect::<Vec<_>>(),
+                        matches
+                            .iter()
+                            .map(|r| (r.number, &r.forecast))
+                            .collect::<Vec<_>>(),
                     );
                 }
             }
@@ -1354,6 +1417,10 @@ mod tests {
             "{} bytes is not a single GRIB2 record",
             bytes.len(),
         );
-        assert_eq!(&bytes[..4], b"GRIB", "range did not start at a record boundary");
+        assert_eq!(
+            &bytes[..4],
+            b"GRIB",
+            "range did not start at a record boundary"
+        );
     }
 }

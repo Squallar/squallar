@@ -24,17 +24,12 @@ pub type Result<T> = std::result::Result<T, ScanError>;
 // which installs the provider itself. `pub(crate)` so the `tls` probe can poll
 // one of them.
 
-pub(crate) async fn list_files(
-    site: &str,
-    date: &chrono::NaiveDate,
-) -> Result<Vec<Identifier>> {
+pub(crate) async fn list_files(site: &str, date: &chrono::NaiveDate) -> Result<Vec<Identifier>> {
     crate::tls::init();
     Ok(crate::archive::list_files(site, date).await?)
 }
 
-pub(crate) async fn download_file(
-    identifier: Identifier,
-) -> Result<nexrad_data::volume::File> {
+pub(crate) async fn download_file(identifier: Identifier) -> Result<nexrad_data::volume::File> {
     crate::tls::init();
     Ok(crate::archive::download_file(identifier).await?)
 }
@@ -74,9 +69,10 @@ pub async fn check_latest_scan(
             continue;
         };
         if let Ok(time) = NaiveTime::parse_from_str(time_str, "%H%M%S")
-            && latest_time.is_none_or(|lt| time > lt) {
-                latest_time = Some(time);
-            }
+            && latest_time.is_none_or(|lt| time > lt)
+        {
+            latest_time = Some(time);
+        }
     }
 
     Ok(latest_time.map(|t| effective_date.and_time(t)))
@@ -187,10 +183,11 @@ pub async fn check_and_fetch_latest(
             continue;
         };
         if let Ok(time) = NaiveTime::parse_from_str(time_str, "%H%M%S")
-            && latest_time.is_none_or(|lt| time > lt) {
-                latest_time = Some(time);
-                latest_meta = Some(m);
-            }
+            && latest_time.is_none_or(|lt| time > lt)
+        {
+            latest_time = Some(time);
+            latest_meta = Some(m);
+        }
     }
 
     let (latest_time, latest_meta) = match (latest_time, latest_meta) {
@@ -267,18 +264,30 @@ pub async fn get_adjacent_scan(
 
     if let Some((metas, effective_date)) = list_files_with_fallback(site, &date).await? {
         for m in &metas {
-            let Some(time_str) = m.name().split('_').nth(1) else { continue };
-            let Ok(time) = NaiveTime::parse_from_str(time_str, "%H%M%S") else { continue };
+            let Some(time_str) = m.name().split('_').nth(1) else {
+                continue;
+            };
+            let Ok(time) = NaiveTime::parse_from_str(time_str, "%H%M%S") else {
+                continue;
+            };
             all.push((effective_date.and_time(time), m.clone()));
         }
     }
 
     // The neighbouring day, for requests near a midnight boundary.
-    let neighbor = if forward { date + Duration::days(1) } else { date - Duration::days(1) };
+    let neighbor = if forward {
+        date + Duration::days(1)
+    } else {
+        date - Duration::days(1)
+    };
     if let Some((metas, effective_date)) = list_files_with_fallback(site, &neighbor).await? {
         for m in &metas {
-            let Some(time_str) = m.name().split('_').nth(1) else { continue };
-            let Ok(time) = NaiveTime::parse_from_str(time_str, "%H%M%S") else { continue };
+            let Some(time_str) = m.name().split('_').nth(1) else {
+                continue;
+            };
+            let Ok(time) = NaiveTime::parse_from_str(time_str, "%H%M%S") else {
+                continue;
+            };
             all.push((effective_date.and_time(time), m.clone()));
         }
     }

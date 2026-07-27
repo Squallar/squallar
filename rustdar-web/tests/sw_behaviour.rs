@@ -20,15 +20,18 @@ fn web_dir() -> PathBuf {
 }
 
 fn node_major() -> u32 {
-    let output = Command::new("node").arg("--version").output().unwrap_or_else(|e| {
-        panic!(
-            "could not run `node`: {e}\n\n\
+    let output = Command::new("node")
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "could not run `node`: {e}\n\n\
              The service worker's caching policy is JavaScript, and these suites \
              are the only thing that checks it does what it claims. They need \
              Node {MINIMUM_NODE_MAJOR} or newer — no packages, no network, just \
              the built-in `node --test` runner."
-        )
-    });
+            )
+        });
 
     let version = String::from_utf8_lossy(&output.stdout);
     let major = version
@@ -95,7 +98,10 @@ fn every_javascript_suite_is_actually_invoked() {
     }
     found.sort();
 
-    assert!(!found.is_empty(), "no *.test.mjs suites found in rustdar-web/tests/");
+    assert!(
+        !found.is_empty(),
+        "no *.test.mjs suites found in rustdar-web/tests/"
+    );
 
     for suite in &found {
         assert!(

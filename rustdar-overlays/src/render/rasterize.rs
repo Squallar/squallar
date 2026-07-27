@@ -6,9 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::f64::consts::PI;
 
-use tiny_skia::{
-    Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, Transform,
-};
+use tiny_skia::{Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
 use std::sync::Arc;
 
@@ -53,7 +51,10 @@ impl HitMap {
             return;
         }
         let idx = qy * self.width + qx;
-        let ids = self.cells.entry(idx).or_insert_with(|| Vec::with_capacity(1));
+        let ids = self
+            .cells
+            .entry(idx)
+            .or_insert_with(|| Vec::with_capacity(1));
         if !ids.contains(&item_id) {
             ids.push(item_id);
         }
@@ -143,7 +144,11 @@ pub fn rasterize_spc_outlooks(
     hatch_color: [u8; 4],
 ) -> Vec<u8> {
     let Some(mut pixmap) = Pixmap::new(width, height) else {
-        log::error!("Pixmap allocation failed in rasterize_spc_outlooks ({}×{})", width, height);
+        log::error!(
+            "Pixmap allocation failed in rasterize_spc_outlooks ({}×{})",
+            width,
+            height
+        );
         return vec![0u8; (width * height * 4) as usize];
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -168,7 +173,11 @@ pub fn rasterize_spc_discussions(
     height: u32,
 ) -> Vec<u8> {
     let Some(mut pixmap) = Pixmap::new(width, height) else {
-        log::error!("Pixmap allocation failed in rasterize_spc_discussions ({}×{})", width, height);
+        log::error!(
+            "Pixmap allocation failed in rasterize_spc_discussions ({}×{})",
+            width,
+            height
+        );
         return vec![0u8; (width * height * 4) as usize];
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -183,7 +192,10 @@ pub fn rasterize_spc_discussions(
             if ring.len() < 3 {
                 continue;
             }
-            let pts: Vec<(f32, f32)> = ring.iter().map(|&(lat, lon)| mb.project(lat, lon, w, h)).collect();
+            let pts: Vec<(f32, f32)> = ring
+                .iter()
+                .map(|&(lat, lon)| mb.project(lat, lon, w, h))
+                .collect();
             if let Some(path) = build_polygon_path(&pts) {
                 fill_path(&mut pixmap, &path, fill_rgba);
                 let sw = scaled_stroke_width(&path, 2.0);
@@ -206,7 +218,11 @@ pub fn rasterize_nws_alerts(
     height: u32,
 ) -> Vec<u8> {
     let Some(mut pixmap) = Pixmap::new(width, height) else {
-        log::error!("Pixmap allocation failed in rasterize_nws_alerts ({}×{})", width, height);
+        log::error!(
+            "Pixmap allocation failed in rasterize_nws_alerts ({}×{})",
+            width,
+            height
+        );
         return vec![0u8; (width * height * 4) as usize];
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -244,7 +260,11 @@ pub fn rasterize_radar_sites(
     is_dark: bool,
 ) -> Vec<u8> {
     let Some(mut pixmap) = Pixmap::new(width, height) else {
-        log::error!("Pixmap allocation failed in rasterize_radar_sites ({}×{})", width, height);
+        log::error!(
+            "Pixmap allocation failed in rasterize_radar_sites ({}×{})",
+            width,
+            height
+        );
         return vec![0u8; (width * height * 4) as usize];
     };
     let mb = MercatorBounds::from_geo(bounds);
@@ -282,10 +302,19 @@ pub fn rasterize_radar_sites(
             let mut paint = Paint::default();
             paint.set_color(fill);
             paint.anti_alias = true;
-            pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+            pixmap.fill_path(
+                &path,
+                &paint,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
 
             paint.set_color(Color::from_rgba8(255, 255, 255, 255));
-            let stroke = Stroke { width: stroke_w, ..Stroke::default() };
+            let stroke = Stroke {
+                width: stroke_w,
+                ..Stroke::default()
+            };
             pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
         }
 
@@ -304,7 +333,13 @@ pub fn rasterize_radar_sites(
                 let mut paint = Paint::default();
                 paint.set_color(text_bg);
                 paint.anti_alias = true;
-                pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+                pixmap.fill_path(
+                    &path,
+                    &paint,
+                    FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
             }
         }
     }
@@ -327,7 +362,13 @@ fn draw_tornado_symbol(pixmap: &mut Pixmap, px: f32, py: f32, r: f32, color: Col
         let mut paint = Paint::default();
         paint.set_color(color);
         paint.anti_alias = true;
-        pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     }
 }
 
@@ -344,18 +385,33 @@ fn draw_hail_symbol(pixmap: &mut Pixmap, px: f32, py: f32, r: f32, color: Color)
         let mut paint = Paint::default();
         paint.set_color(color);
         paint.anti_alias = true;
-        pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+        pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     }
 
     let mut paint = Paint::default();
     paint.set_color(color);
     paint.anti_alias = true;
-    let stroke = Stroke { width: stroke_w, line_cap: LineCap::Round, ..Stroke::default() };
+    let stroke = Stroke {
+        width: stroke_w,
+        line_cap: LineCap::Round,
+        ..Stroke::default()
+    };
     let diag = std::f32::consts::FRAC_1_SQRT_2;
     let offsets: [(f32, f32); 4] = [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)];
     for (dx, dy) in offsets {
-        let (adx, ady) = if dx.abs() > 0.5 { (dx, diag * dy.signum().max(0.3)) } else { (diag * dx.signum().max(0.3), dy) };
-        let _ = ady; let _ = adx;
+        let (adx, ady) = if dx.abs() > 0.5 {
+            (dx, diag * dy.signum().max(0.3))
+        } else {
+            (diag * dx.signum().max(0.3), dy)
+        };
+        let _ = ady;
+        let _ = adx;
         let mut pb = PathBuilder::new();
         pb.move_to(px + dx * tick_inner, py + dy * tick_inner);
         pb.line_to(px + dx * tick_outer, py + dy * tick_outer);
@@ -378,7 +434,11 @@ fn draw_wind_symbol(pixmap: &mut Pixmap, px: f32, py: f32, r: f32, color: Color)
         let mut paint = Paint::default();
         paint.set_color(color);
         paint.anti_alias = true;
-        let stroke = Stroke { width: stroke_w, line_cap: LineCap::Round, ..Stroke::default() };
+        let stroke = Stroke {
+            width: stroke_w,
+            line_cap: LineCap::Round,
+            ..Stroke::default()
+        };
         pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
     }
 }
@@ -395,7 +455,11 @@ pub fn rasterize_storm_reports(
     is_dark: bool,
 ) -> RasterizeOutput {
     let Some(mut pixmap) = Pixmap::new(width, height) else {
-        log::error!("Pixmap allocation failed in rasterize_storm_reports ({}×{})", width, height);
+        log::error!(
+            "Pixmap allocation failed in rasterize_storm_reports ({}×{})",
+            width,
+            height
+        );
         return RasterizeOutput {
             rgba: vec![0u8; (width * height * 4) as usize],
             hit_map: None,
@@ -436,24 +500,41 @@ pub fn rasterize_storm_reports(
         let mut pb = PathBuilder::new();
         pb.push_circle(px, py, radius);
         if let Some(path) = pb.finish() {
-            let mut paint = Paint { anti_alias: true, ..Paint::default() };
+            let mut paint = Paint {
+                anti_alias: true,
+                ..Paint::default()
+            };
 
             if use_symbol {
                 paint.set_color(fill);
-                let stroke = Stroke { width: stroke_w, ..Stroke::default() };
+                let stroke = Stroke {
+                    width: stroke_w,
+                    ..Stroke::default()
+                };
                 pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
 
                 match report.kind {
-                    StormReportKind::Tornado => draw_tornado_symbol(&mut pixmap, px, py, radius, fill),
+                    StormReportKind::Tornado => {
+                        draw_tornado_symbol(&mut pixmap, px, py, radius, fill)
+                    }
                     StormReportKind::Hail => draw_hail_symbol(&mut pixmap, px, py, radius, fill),
                     StormReportKind::Wind => draw_wind_symbol(&mut pixmap, px, py, radius, fill),
                 }
             } else {
                 paint.set_color(fill);
-                pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+                pixmap.fill_path(
+                    &path,
+                    &paint,
+                    FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
 
                 paint.set_color(outline);
-                let stroke = Stroke { width: stroke_w, ..Stroke::default() };
+                let stroke = Stroke {
+                    width: stroke_w,
+                    ..Stroke::default()
+                };
                 pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
             }
         }
@@ -570,7 +651,11 @@ pub fn rasterize_glm_strikes(
     params: &GlmRenderParams,
 ) -> RasterizeOutput {
     let Some(mut pixmap) = Pixmap::new(width, height) else {
-        log::error!("Pixmap allocation failed in rasterize_glm_strikes ({}×{})", width, height);
+        log::error!(
+            "Pixmap allocation failed in rasterize_glm_strikes ({}×{})",
+            width,
+            height
+        );
         return RasterizeOutput {
             rgba: vec![0u8; (width * height * 4) as usize],
             hit_map: None,
@@ -641,7 +726,13 @@ pub fn rasterize_glm_strikes(
 
 // ── Feature rendering ────────────────────────────────────────────────────
 
-fn draw_feature(pixmap: &mut Pixmap, feature: &OverlayFeature, mb: &MercatorBounds, w: f32, h: f32) {
+fn draw_feature(
+    pixmap: &mut Pixmap,
+    feature: &OverlayFeature,
+    mb: &MercatorBounds,
+    w: f32,
+    h: f32,
+) {
     // Geo-AABB cull before any projection work.
     if let Some(ref fb) = feature.geo_bounds {
         let tb = GeoBounds {
@@ -656,12 +747,17 @@ fn draw_feature(pixmap: &mut Pixmap, feature: &OverlayFeature, mb: &MercatorBoun
     }
 
     for polygon in &feature.polygons {
-        let Some(exterior) = polygon.first() else { continue };
+        let Some(exterior) = polygon.first() else {
+            continue;
+        };
         if exterior.len() < 3 {
             continue;
         }
         let ring = strip_closing_dup(exterior);
-        let pts: Vec<(f32, f32)> = ring.iter().map(|&(lat, lon)| mb.project(lat, lon, w, h)).collect();
+        let pts: Vec<(f32, f32)> = ring
+            .iter()
+            .map(|&(lat, lon)| mb.project(lat, lon, w, h))
+            .collect();
         if let Some(path) = build_polygon_path(&pts) {
             fill_path(pixmap, &path, feature.fill_rgba);
             if feature.stroke_rgba[3] > 0 {
@@ -835,7 +931,12 @@ fn projection_window(
     width: u32,
     height: u32,
 ) -> IndexWindow {
-    let full = IndexWindow { i0: 0, i1: grid.ni, j0: 0, j1: grid.nj };
+    let full = IndexWindow {
+        i0: 0,
+        i1: grid.ni,
+        j0: 0,
+        j1: grid.nj,
+    };
 
     // A grid with a longitude discontinuity in it — across the anti-meridian or
     // across the cone's own seam — has an `i` neighbour most of a turn away, so
@@ -909,7 +1010,10 @@ pub fn rasterize_model_data(
     // can influence a pixel of *this* texture are projected now.
     let win = projection_window(grid, bounds, width, height);
     if win.is_empty() {
-        return RasterizeOutput { rgba, hit_map: None };
+        return RasterizeOutput {
+            rgba,
+            hit_map: None,
+        };
     }
     let win_w = win.i1 - win.i0;
 
@@ -1020,7 +1124,10 @@ mod glm_energy_tests {
         let strongest = energy_size_scale(Some(STRONGEST));
 
         assert_eq!(weakest, 0.0, "the window floor should be the channel floor");
-        assert_eq!(strongest, 1.0, "the window ceiling should be the channel ceiling");
+        assert_eq!(
+            strongest, 1.0,
+            "the window ceiling should be the channel ceiling"
+        );
         assert!(
             unknown > weakest,
             "an unreported energy must not render as the weakest strike (got {unknown})"
@@ -1036,7 +1143,10 @@ mod glm_energy_tests {
     #[test]
     fn zero_energy_would_clamp_to_the_floor() {
         assert_eq!(energy_size_scale(Some(0.0)), 0.0);
-        assert_eq!(energy_size_scale(Some(0.0)), energy_size_scale(Some(WEAKEST)));
+        assert_eq!(
+            energy_size_scale(Some(0.0)),
+            energy_size_scale(Some(WEAKEST))
+        );
     }
 
     #[test]
@@ -1059,7 +1169,12 @@ mod glm_energy_tests {
             satellite: GlmSatellite::GoesEast,
             level: GlmDataLevel::Flash,
         };
-        let bounds = GeoBounds { min_lat: 34.0, max_lat: 36.0, min_lon: -98.0, max_lon: -96.0 };
+        let bounds = GeoBounds {
+            min_lat: 34.0,
+            max_lat: 36.0,
+            min_lon: -98.0,
+            max_lon: -96.0,
+        };
         let out = rasterize_glm_strikes(
             std::slice::from_ref(&flash),
             &[],
@@ -1320,8 +1435,8 @@ mod model_raster_bench {
 #[cfg(test)]
 mod projection_window_tests {
     use super::lambert_fixture::{
-        CELL_OFFSETS, box_of_cells, coverage, grid_anchored_at, lambert_grid,
-        lambert_grid_stepped, materialised,
+        CELL_OFFSETS, box_of_cells, coverage, grid_anchored_at, lambert_grid, lambert_grid_stepped,
+        materialised,
     };
     use super::*;
 
@@ -1417,7 +1532,12 @@ mod projection_window_tests {
     /// signs — so those four modes must still narrow, and are the control here.
     #[test]
     fn a_scan_order_the_neighbour_walk_does_not_match_is_not_narrowed() {
-        let whole = |g: &HrrrGridData| IndexWindow { i0: 0, i1: g.ni, j0: 0, j1: g.nj };
+        let whole = |g: &HrrrGridData| IndexWindow {
+            i0: 0,
+            i1: g.ni,
+            j0: 0,
+            j1: g.nj,
+        };
         for mode in [
             0b0000_0000u8,
             0b0100_0000,
@@ -1478,7 +1598,12 @@ mod projection_window_tests {
         // And the whole domain must still be the whole domain.
         assert_eq!(
             projection_window(&grid, &coverage(37.0, -97.5, 75.0), 1024, 1024),
-            IndexWindow { i0: 0, i1: grid.ni, j0: 0, j1: grid.nj },
+            IndexWindow {
+                i0: 0,
+                i1: grid.ni,
+                j0: 0,
+                j1: grid.nj
+            },
         );
     }
 
@@ -1502,7 +1627,12 @@ mod projection_window_tests {
         };
 
         let mut narrowed = 0;
-        let whole = IndexWindow { i0: 0, i1: lambert.ni, j0: 0, j1: lambert.nj };
+        let whole = IndexWindow {
+            i0: 0,
+            i1: lambert.ni,
+            j0: 0,
+            j1: lambert.nj,
+        };
         for case in 0..400 {
             let (fx, fy) = (next() * 3.0 - 1.0, next() * 3.0 - 1.0);
             // Log-uniform, so small boxes — the ones that narrow — are not
@@ -1522,7 +1652,10 @@ mod projection_window_tests {
         }
         // Without this the sweep could pass on 400 cases that all fell back to
         // the whole grid, which proves nothing about the window.
-        assert!(narrowed > 200, "only {narrowed} of 400 cases narrowed at all");
+        assert!(
+            narrowed > 200,
+            "only {narrowed} of 400 cases narrowed at all"
+        );
     }
 
     /// **Street-level zoom.** `walkers` allows zoom 0-26 and nothing here
@@ -1576,7 +1709,12 @@ mod projection_window_tests {
             (-360.0, 0.0),
             (10.0, 300.0), // and the eastern side
         ] {
-            let bounds = GeoBounds { min_lat: 15.0, max_lat: 55.0, min_lon, max_lon };
+            let bounds = GeoBounds {
+                min_lat: 15.0,
+                max_lat: 55.0,
+                min_lon,
+                max_lon,
+            };
             for &side in &[64u32, 512] {
                 assert_eq!(
                     rasterize_model_data(&lambert, &bounds, side, side).rgba,
@@ -1606,9 +1744,21 @@ mod projection_window_tests {
     #[test]
     fn a_grid_that_wraps_the_globe_is_not_narrowed() {
         for &(ni, nj, step, lov, label) in &[
-            (300usize, 40usize, 200_000_000u32, 262_500_000u32, "200 km, LoV 262.5"),
+            (
+                300usize,
+                40usize,
+                200_000_000u32,
+                262_500_000u32,
+                "200 km, LoV 262.5",
+            ),
             (120, 60, 400_000_000, 262_500_000, "400 km, LoV 262.5"),
-            (120, 60, 400_000_000, 0, "400 km, LoV 0 (seam on the anti-meridian)"),
+            (
+                120,
+                60,
+                400_000_000,
+                0,
+                "400 km, LoV 0 (seam on the anti-meridian)",
+            ),
             (300, 40, 200_000_000, 0, "200 km, LoV 0"),
             (120, 60, 400_000_000, 5_000_000, "400 km, LoV 5"),
             (120, 60, 400_000_000, 355_000_000, "400 km, LoV 355"),
@@ -1727,7 +1877,12 @@ mod projection_window_tests {
                 "well inside one cell, off-lattice",
             ),
             (
-                GeoBounds { min_lat: 15.0, max_lat: 55.0, min_lon: -290.0, max_lon: -110.0 },
+                GeoBounds {
+                    min_lat: 15.0,
+                    max_lat: 55.0,
+                    min_lon: -290.0,
+                    max_lon: -110.0,
+                },
                 "past the anti-meridian",
             ),
         ];

@@ -1,19 +1,20 @@
 use crate::actions::GuiAction;
 use crate::overlay_cache::{
-    viewport_geo_bounds, current_quantized_zoom, draw_overlay_texture,
-    plan_overlay_texture,
+    current_quantized_zoom, draw_overlay_texture, plan_overlay_texture, viewport_geo_bounds,
 };
+use crate::pane::{PaneState, RadarImageData};
 use crate::point_painter::EguiPointPainter;
 use rustdar_overlays::render::draw::{DrawPointContext, HoverContext};
-use std::sync::Arc;
-use rustdar_overlays::render::overlay_state::{OverlayRegistry, OverlayKind, OverlayItem, RenderMode};
-use crate::pane::{PaneState, RadarImageData};
+use rustdar_overlays::render::overlay_state::{
+    OverlayItem, OverlayKind, OverlayRegistry, RenderMode,
+};
 use rustdar_units::UserPreferences;
+use std::sync::Arc;
 
-use rustdar_radar::{get_color_for_value, get_legend_scale};
-use rustdar_radar::sites::RADARS;
-use rustdar_radar::types::{MAX_RANGE_KM, ImageBounds, RadarProduct};
 use crate::tile_source::HttpsTiles;
+use rustdar_radar::sites::RADARS;
+use rustdar_radar::types::{ImageBounds, MAX_RANGE_KM, RadarProduct};
+use rustdar_radar::{get_color_for_value, get_legend_scale};
 
 use super::super::map_overlays::{OverlayDrawContext, draw_label_tiles_overlay, is_pos_blocked};
 
@@ -116,16 +117,36 @@ pub(super) fn render_pane_map_content(
                     // Loop playback: draw the active loop frame instead
                     if ctx.pane.loop_state.is_active() {
                         if let Some(img) = ctx.pane.active_image().cloned() {
-                            render_radar_overlay(ui, projector, &img, ctx.pane, ctx.pane_rect, ctx.preferences);
+                            render_radar_overlay(
+                                ui,
+                                projector,
+                                &img,
+                                ctx.pane,
+                                ctx.pane_rect,
+                                ctx.preferences,
+                            );
                         }
                     } else {
                         // Extract metadata before drawing (avoids borrow conflict)
-                        let meta_snapshot = ctx.pane.overlay_cache(OverlayKind::Radar)
+                        let meta_snapshot = ctx
+                            .pane
+                            .overlay_cache(OverlayKind::Radar)
                             .and_then(|c| c.current.as_ref())
                             .and_then(|tex| tex.radar_meta.as_ref())
-                            .map(|m| (m.lat, m.lon, m.max_range_km, std::sync::Arc::clone(&m.value_data)));
+                            .map(|m| {
+                                (
+                                    m.lat,
+                                    m.lon,
+                                    m.max_range_km,
+                                    std::sync::Arc::clone(&m.value_data),
+                                )
+                            });
 
-                        if let Some(tex) = ctx.pane.overlay_cache(OverlayKind::Radar).and_then(|c| c.current.as_ref()) {
+                        if let Some(tex) = ctx
+                            .pane
+                            .overlay_cache(OverlayKind::Radar)
+                            .and_then(|c| c.current.as_ref())
+                        {
                             let screen_rect = ui.max_rect();
                             draw_overlay_texture(ui.painter(), projector, tex, screen_rect);
                         }
@@ -134,9 +155,16 @@ pub(super) fn render_pane_map_content(
                         if let Some((lat, lon, _max_range_km, value_data)) = meta_snapshot {
                             render_radar_range_ring(ui, projector, lat, lon);
                             update_pane_hover_value_from_meta(
-                                ui, projector,
-                                &RadarHoverData { value_data: &value_data, lat, lon },
-                                ctx.pane, ctx.pane_rect, ctx.preferences,
+                                ui,
+                                projector,
+                                &RadarHoverData {
+                                    value_data: &value_data,
+                                    lat,
+                                    lon,
+                                },
+                                ctx.pane,
+                                ctx.pane_rect,
+                                ctx.preferences,
                             );
                         }
                     }
@@ -149,7 +177,11 @@ pub(super) fn render_pane_map_content(
                 }
                 // Radar sites: texture + per-frame interactions (text labels, clicks)
                 OverlayKind::RadarSites => {
-                    if let Some(tex) = ctx.pane.overlay_cache(kind).and_then(|c| c.current.as_ref()) {
+                    if let Some(tex) = ctx
+                        .pane
+                        .overlay_cache(kind)
+                        .and_then(|c| c.current.as_ref())
+                    {
                         let screen_rect = ui.max_rect();
                         draw_overlay_texture(ui.painter(), projector, tex, screen_rect);
                     }
@@ -158,17 +190,22 @@ pub(super) fn render_pane_map_content(
                 // User location blue dot
                 OverlayKind::UserLocation => {
                     if let Some((user_lat, user_lon)) = ctx.user_location {
-                        render_user_location(ui, projector, user_lat, user_lon, ctx.user_heading, ctx.user_fix.as_ref());
+                        render_user_location(
+                            ui,
+                            projector,
+                            user_lat,
+                            user_lon,
+                            ctx.user_heading,
+                            ctx.user_fix.as_ref(),
+                        );
                     }
                 }
                 // Color scale legend (screen-space HUD).
                 // Draw on a foreground layer so overlay textures can never
                 // paint over the bars regardless of egui shape batching.
                 OverlayKind::ColorScale => {
-                    let fg_layer = egui::LayerId::new(
-                        egui::Order::Background,
-                        ui.id().with("color_scale"),
-                    );
+                    let fg_layer =
+                        egui::LayerId::new(egui::Order::Background, ui.id().with("color_scale"));
                     let mut fg_painter = ui.ctx().layer_painter(fg_layer);
                     fg_painter.set_clip_rect(ctx.pane_rect);
                     let pane_rect = ui.max_rect();
@@ -188,33 +225,29 @@ pub(super) fn render_pane_map_content(
                     );
                 }
                 // All other overlays dispatched by render mode
-                _ => {
-                    match ctx.overlays.render_mode(kind) {
-                        Some(RenderMode::Texture) => {
-                            let items = ctx.overlays.clickable_items(kind);
-                            selected.extend(overlay_ctx.draw_overlay(
-                                ctx.pane.overlay_cache(kind),
-                                &items,
-                            ));
-                        }
-                        Some(RenderMode::PerFramePoint) => {
-                            selected.extend(render_per_frame_overlay(
-                                ui,
-                                projector,
-                                &PerFrameOverlayCtx {
-                                    overlays: ctx.overlays,
-                                    kind,
-                                    zoom,
-                                    prefs: ctx.preferences,
-                                    overlay_click_pos: ctx.overlay_click_pos,
-                                    excluded_rects: &overlay_excluded_rects,
-                                    pane_rect: ctx.pane_rect,
-                                },
-                            ));
-                        }
-                        _ => {}
+                _ => match ctx.overlays.render_mode(kind) {
+                    Some(RenderMode::Texture) => {
+                        let items = ctx.overlays.clickable_items(kind);
+                        selected
+                            .extend(overlay_ctx.draw_overlay(ctx.pane.overlay_cache(kind), &items));
                     }
-                }
+                    Some(RenderMode::PerFramePoint) => {
+                        selected.extend(render_per_frame_overlay(
+                            ui,
+                            projector,
+                            &PerFrameOverlayCtx {
+                                overlays: ctx.overlays,
+                                kind,
+                                zoom,
+                                prefs: ctx.preferences,
+                                overlay_click_pos: ctx.overlay_click_pos,
+                                excluded_rects: &overlay_excluded_rects,
+                                pane_rect: ctx.pane_rect,
+                            },
+                        ));
+                    }
+                    _ => {}
+                },
             }
         }
 
@@ -229,18 +262,23 @@ pub(super) fn render_pane_map_content(
             ctx.pane.overlay_hover_value = None;
             if let Some(pos) = hover_pos
                 && ctx.pane_rect.contains(pos)
-                && !ui.ctx().layer_id_at(pos).is_some_and(|l| l.order > egui::Order::Background) {
-                    let map_pos = projector.unproject(egui::vec2(pos.x, pos.y));
-                    let hover_lat = map_pos.y();
-                    let hover_lon = map_pos.x();
-                    for &kind in &draw_order {
-                        if ctx.pane.is_overlay_enabled(kind)
-                            && let Some(text) = ctx.overlays.hover_value_at(kind, hover_lat, hover_lon) {
-                                ctx.pane.overlay_hover_value = Some(text);
-                                break;
-                            }
+                && !ui
+                    .ctx()
+                    .layer_id_at(pos)
+                    .is_some_and(|l| l.order > egui::Order::Background)
+            {
+                let map_pos = projector.unproject(egui::vec2(pos.x, pos.y));
+                let hover_lat = map_pos.y();
+                let hover_lon = map_pos.x();
+                for &kind in &draw_order {
+                    if ctx.pane.is_overlay_enabled(kind)
+                        && let Some(text) = ctx.overlays.hover_value_at(kind, hover_lat, hover_lon)
+                    {
+                        ctx.pane.overlay_hover_value = Some(text);
+                        break;
                     }
                 }
+            }
         }
 
         // --- Check if any texture overlays need background re-rendering ---
@@ -301,17 +339,32 @@ pub(super) fn render_pane_map_content(
         && ctx.pane_rect.contains(touch_pos)
     {
         // Try overlay cache meta first (non-loop static render), then loop frame
-        let raw_meta = ctx.pane.overlay_cache(OverlayKind::Radar)
+        let raw_meta = ctx
+            .pane
+            .overlay_cache(OverlayKind::Radar)
             .and_then(|c| c.current.as_ref())
             .and_then(|tex| tex.radar_meta.as_ref())
             .map(|m| (m.lat, m.lon, std::sync::Arc::clone(&m.value_data)));
         if let Some((lat, lon, value_data)) = raw_meta {
             draw_long_press_tooltip(
-                ui, projector, &value_data, lat, lon, touch_pos, ctx.pane, ctx.preferences,
+                ui,
+                projector,
+                &value_data,
+                lat,
+                lon,
+                touch_pos,
+                ctx.pane,
+                ctx.preferences,
             );
         } else if let Some(img) = ctx.pane.active_image().cloned() {
             draw_long_press_tooltip(
-                ui, projector, &img.value_data, img.lat, img.lon, touch_pos, ctx.pane,
+                ui,
+                projector,
+                &img.value_data,
+                img.lat,
+                img.lon,
+                touch_pos,
+                ctx.pane,
                 ctx.preferences,
             );
         }
@@ -346,22 +399,22 @@ fn render_radar_overlay(
 
     render_radar_range_ring(ui, projector, img.lat, img.lon);
     update_pane_hover_value_from_meta(
-        ui, projector,
-        &RadarHoverData { value_data: &img.value_data, lat: img.lat, lon: img.lon },
-        pane, pane_rect, prefs,
+        ui,
+        projector,
+        &RadarHoverData {
+            value_data: &img.value_data,
+            lat: img.lat,
+            lon: img.lon,
+        },
+        pane,
+        pane_rect,
+        prefs,
     );
 }
 
 /// Draw only the range ring for a radar site (used with overlay-cache rendering).
-fn render_radar_range_ring(
-    ui: &egui::Ui,
-    projector: &walkers::Projector,
-    lat: f64,
-    lon: f64,
-) {
-    let radar_center = projector
-        .project(walkers::lat_lon(lat, lon))
-        .to_pos2();
+fn render_radar_range_ring(ui: &egui::Ui, projector: &walkers::Projector, lat: f64, lon: f64) {
+    let radar_center = projector.project(walkers::lat_lon(lat, lon)).to_pos2();
     let north_edge = projector
         .project(walkers::lat_lon(lat + MAX_RANGE_KM / 111.32, lon))
         .to_pos2();
@@ -414,7 +467,11 @@ fn update_pane_hover_value_from_meta(
     };
 
     // Suppress hover when cursor is over a floating dialog or popup window.
-    if ui.ctx().layer_id_at(hover_pos).is_some_and(|l| l.order > egui::Order::Background) {
+    if ui
+        .ctx()
+        .layer_id_at(hover_pos)
+        .is_some_and(|l| l.order > egui::Order::Background)
+    {
         pane.last_hover_pos = None;
         pane.hover_value = None;
         return;
@@ -540,40 +597,46 @@ fn handle_radar_site_interactions(
             );
         }
 
-        let icon_rect =
-            egui::Rect::from_center_size(site_screen, egui::vec2(icon_size, icon_size));
+        let icon_rect = egui::Rect::from_center_size(site_screen, egui::vec2(icon_size, icon_size));
 
         if let Some(pos) = click_pos
             && icon_rect.contains(pos)
-            && !is_pos_blocked(ui.ctx(), pos, pane_rect, excluded_rects) {
-                pane.loading_site = Some(radar_site.name.to_string());
-                pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
-                actions.push(GuiAction::SwitchRadarSite { site: radar_site.name.to_string(), pane_idx });
-            }
+            && !is_pos_blocked(ui.ctx(), pos, pane_rect, excluded_rects)
+        {
+            pane.loading_site = Some(radar_site.name.to_string());
+            pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
+            actions.push(GuiAction::SwitchRadarSite {
+                site: radar_site.name.to_string(),
+                pane_idx,
+            });
+        }
 
         if let Some(pos) = hover_pos
             && icon_rect.contains(pos)
-            && !is_pos_blocked(ui.ctx(), pos, pane_rect, excluded_rects) {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                let elev_str = match radar_site.elev {
-                    Some(e) => {
-                        let converted = prefs.height.convert_from_feet(e as f32);
-                        format!("{:.0} {}", converted, prefs.height.suffix())
-                    }
-                    None => "N/A".to_string(),
-                };
-                let tooltip_text = format!(
-                    "{}\nLat: {:.3}°, Lon: {:.3}°\nElev: {}",
-                    radar_site.name, radar_site.lat, radar_site.lon, elev_str
-                );
-                map_hover_tooltip(
-                    ui.ctx(),
-                    egui::Id::new(("site_tooltip", radar_site.name)),
-                    pos,
-                    None,
-                    |tooltip_ui| { tooltip_ui.label(tooltip_text); },
-                );
-            }
+            && !is_pos_blocked(ui.ctx(), pos, pane_rect, excluded_rects)
+        {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            let elev_str = match radar_site.elev {
+                Some(e) => {
+                    let converted = prefs.height.convert_from_feet(e as f32);
+                    format!("{:.0} {}", converted, prefs.height.suffix())
+                }
+                None => "N/A".to_string(),
+            };
+            let tooltip_text = format!(
+                "{}\nLat: {:.3}°, Lon: {:.3}°\nElev: {}",
+                radar_site.name, radar_site.lat, radar_site.lon, elev_str
+            );
+            map_hover_tooltip(
+                ui.ctx(),
+                egui::Id::new(("site_tooltip", radar_site.name)),
+                pos,
+                None,
+                |tooltip_ui| {
+                    tooltip_ui.label(tooltip_text);
+                },
+            );
+        }
     }
 }
 
@@ -641,34 +704,38 @@ fn render_user_location(
     if let Some(fix) = fix {
         let dot_rect = egui::Rect::from_center_size(user_screen, egui::vec2(28.0, 28.0));
         if let Some(hover_pos) = ui.ctx().pointer_hover_pos()
-            && dot_rect.contains(hover_pos) {
-                map_hover_tooltip(
-                    ui.ctx(),
-                    egui::Id::new("gps_fix_tooltip"),
-                    hover_pos,
-                    None,
-                    |tooltip_ui| {
-                        tooltip_ui.label(format!("Lat: {:.5}°  Lon: {:.5}°", fix.latitude, fix.longitude));
-                        if let Some(alt) = fix.altitude_m {
-                            tooltip_ui.label(format!("Alt: {:.0} m", alt));
-                        }
-                        if let Some(speed) = fix.speed_mps {
-                            let speed_kts = speed * 1.94384;
-                            tooltip_ui.label(format!("Speed: {:.1} m/s ({:.1} kts)", speed, speed_kts));
-                        }
-                        if let Some(hdg) = fix.heading_deg {
-                            tooltip_ui.label(format!("Course: {:.0}°", hdg));
-                        }
-                        if let Some(sats) = fix.satellites {
-                            tooltip_ui.label(format!("Sats: {}", sats));
-                        }
-                        tooltip_ui.label(format!("Fix: {}", fix.fix_quality.label()));
-                        if let Some(hdop) = fix.hdop {
-                            tooltip_ui.label(format!("HDOP: {:.1}", hdop));
-                        }
-                    },
-                );
-            }
+            && dot_rect.contains(hover_pos)
+        {
+            map_hover_tooltip(
+                ui.ctx(),
+                egui::Id::new("gps_fix_tooltip"),
+                hover_pos,
+                None,
+                |tooltip_ui| {
+                    tooltip_ui.label(format!(
+                        "Lat: {:.5}°  Lon: {:.5}°",
+                        fix.latitude, fix.longitude
+                    ));
+                    if let Some(alt) = fix.altitude_m {
+                        tooltip_ui.label(format!("Alt: {:.0} m", alt));
+                    }
+                    if let Some(speed) = fix.speed_mps {
+                        let speed_kts = speed * 1.94384;
+                        tooltip_ui.label(format!("Speed: {:.1} m/s ({:.1} kts)", speed, speed_kts));
+                    }
+                    if let Some(hdg) = fix.heading_deg {
+                        tooltip_ui.label(format!("Course: {:.0}°", hdg));
+                    }
+                    if let Some(sats) = fix.satellites {
+                        tooltip_ui.label(format!("Sats: {}", sats));
+                    }
+                    tooltip_ui.label(format!("Fix: {}", fix.fix_quality.label()));
+                    if let Some(hdop) = fix.hdop {
+                        tooltip_ui.label(format!("HDOP: {:.1}", hdop));
+                    }
+                },
+            );
+        }
     }
 }
 
@@ -692,25 +759,23 @@ const MIN_LABEL_SPACING: f32 = 14.0;
 /// Format a legend label value. For HHC uses category names; for others, a short numeric string.
 fn format_legend_value(product: RadarProduct, value: f32, prefs: &UserPreferences) -> String {
     match product {
-        RadarProduct::HydrometeorClassification => {
-            match value as u16 {
-                10 => "Bio".into(),
-                20 => "AP".into(),
-                30 => "IC".into(),
-                40 => "DS".into(),
-                50 => "WS".into(),
-                60 => "RA".into(),
-                70 => "HR".into(),
-                80 => "BD".into(),
-                90 => "GR".into(),
-                100 => "HA".into(),
-                110 => "LH".into(),
-                120 => "GH".into(),
-                140 => "UK".into(),
-                150 => "RF".into(),
-                _ => format!("{value:.0}"),
-            }
-        }
+        RadarProduct::HydrometeorClassification => match value as u16 {
+            10 => "Bio".into(),
+            20 => "AP".into(),
+            30 => "IC".into(),
+            40 => "DS".into(),
+            50 => "WS".into(),
+            60 => "RA".into(),
+            70 => "HR".into(),
+            80 => "BD".into(),
+            90 => "GR".into(),
+            100 => "HA".into(),
+            110 => "LH".into(),
+            120 => "GH".into(),
+            140 => "UK".into(),
+            150 => "RF".into(),
+            _ => format!("{value:.0}"),
+        },
         RadarProduct::Velocity | RadarProduct::StormRelativeVelocity => {
             let converted = prefs.speed.convert_from_ms(value);
             format!("{converted:.0}")
@@ -725,15 +790,22 @@ fn format_legend_value(product: RadarProduct, value: f32, prefs: &UserPreference
         }
         RadarProduct::PrecipitationRate => {
             let converted = prefs.precip_rate.convert_from_in_per_hr(value);
-            if converted < 1.0 { format!("{converted:.2}") }
-            else { format!("{converted:.1}") }
+            if converted < 1.0 {
+                format!("{converted:.2}")
+            } else {
+                format!("{converted:.1}")
+            }
         }
         RadarProduct::CorrelationCoefficient => format!("{value:.2}"),
-        RadarProduct::DifferentialReflectivity
-        | RadarProduct::SpecificDifferentialPhase => format!("{value:.1}"),
+        RadarProduct::DifferentialReflectivity | RadarProduct::SpecificDifferentialPhase => {
+            format!("{value:.1}")
+        }
         _ => {
-            if value.fract().abs() < 0.01 { format!("{value:.0}") }
-            else { format!("{value:.1}") }
+            if value.fract().abs() < 0.01 {
+                format!("{value:.0}")
+            } else {
+                format!("{value:.1}")
+            }
         }
     }
 }
@@ -753,13 +825,7 @@ fn draw_shadowed_text(
         font.clone(),
         egui::Color32::from_black_alpha(200),
     );
-    painter.text(
-        pos,
-        anchor,
-        text,
-        font,
-        egui::Color32::WHITE,
-    );
+    painter.text(pos, anchor, text, font, egui::Color32::WHITE);
 }
 
 /// Render the color scale legend bar for the current pane's radar product.
@@ -802,20 +868,14 @@ fn render_color_scale(
         let left = pane_rect.left() + SCALE_MARGIN;
         let bottom = pane_rect.bottom() - SCALE_MARGIN;
         let top = bottom - SCALE_BAR_WIDTH;
-        egui::Rect::from_min_max(
-            egui::pos2(left, top),
-            egui::pos2(left + bar_length, bottom),
-        )
+        egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(left + bar_length, bottom))
     } else {
         // Vertical bar along the right, origin at bottom-right
         let right = pane_rect.right() - SCALE_MARGIN;
         let left = right - SCALE_BAR_WIDTH;
         let bottom = pane_rect.bottom() - SCALE_MARGIN;
         let top = bottom - bar_length;
-        egui::Rect::from_min_max(
-            egui::pos2(left, top),
-            egui::pos2(right, bottom),
-        )
+        egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom))
     };
 
     let min_val = legend.min_value;
@@ -834,7 +894,9 @@ fn render_color_scale(
             let t = i as f32 / (steps - 1).max(1) as f32;
             let value = min_val + t * range;
             let (r, g, b, a) = get_color_for_value(product, value);
-            if a == 0 { continue; }
+            if a == 0 {
+                continue;
+            }
             let color = egui::Color32::from_rgb(r, g, b);
             // Use 2px wide strips to avoid sub-pixel gaps
             if horizontal {
@@ -911,24 +973,41 @@ fn render_color_scale(
 
     // Filter out labels that are too close to the previous one
     let mut prev_pos: Option<f32> = None;
-    let thinned: Vec<(f32, &str)> = label_positions.iter().filter(|(pos, _)| {
-        if let Some(prev) = prev_pos
-            && (pos - prev).abs() < MIN_LABEL_SPACING {
+    let thinned: Vec<(f32, &str)> = label_positions
+        .iter()
+        .filter(|(pos, _)| {
+            if let Some(prev) = prev_pos
+                && (pos - prev).abs() < MIN_LABEL_SPACING
+            {
                 return false;
             }
-        prev_pos = Some(*pos);
-        true
-    }).map(|(pos, text)| (*pos, text.as_str())).collect();
+            prev_pos = Some(*pos);
+            true
+        })
+        .map(|(pos, text)| (*pos, text.as_str()))
+        .collect();
 
     for (pixel_pos, text) in &thinned {
         if horizontal {
             // Labels above the bar
             let pos = egui::pos2(*pixel_pos, bar_rect.top() - 2.0);
-            draw_shadowed_text(painter, pos, egui::Align2::CENTER_BOTTOM, text, label_font.clone());
+            draw_shadowed_text(
+                painter,
+                pos,
+                egui::Align2::CENTER_BOTTOM,
+                text,
+                label_font.clone(),
+            );
         } else {
             // Labels to the left of the bar
             let pos = egui::pos2(bar_rect.left() - 4.0, *pixel_pos);
-            draw_shadowed_text(painter, pos, egui::Align2::RIGHT_CENTER, text, label_font.clone());
+            draw_shadowed_text(
+                painter,
+                pos,
+                egui::Align2::RIGHT_CENTER,
+                text,
+                label_font.clone(),
+            );
         }
     }
 
@@ -936,10 +1015,22 @@ fn render_color_scale(
     let unit = product.unit_label(prefs);
     if horizontal {
         let title_pos = egui::pos2(bar_rect.left() - 4.0, bar_rect.center().y);
-        draw_shadowed_text(painter, title_pos, egui::Align2::RIGHT_CENTER, unit, title_font);
+        draw_shadowed_text(
+            painter,
+            title_pos,
+            egui::Align2::RIGHT_CENTER,
+            unit,
+            title_font,
+        );
     } else {
         let title_pos = egui::pos2(bar_rect.center().x, bar_rect.top() - 4.0);
-        draw_shadowed_text(painter, title_pos, egui::Align2::CENTER_BOTTOM, unit, title_font);
+        draw_shadowed_text(
+            painter,
+            title_pos,
+            egui::Align2::CENTER_BOTTOM,
+            unit,
+            title_font,
+        );
     }
 }
 
@@ -984,19 +1075,13 @@ fn render_overlay_color_scales(
             let left = pane_rect.left() + SCALE_MARGIN;
             let bottom = pane_rect.bottom() - SCALE_MARGIN - offset_px;
             let top = bottom - SCALE_BAR_WIDTH;
-            egui::Rect::from_min_max(
-                egui::pos2(left, top),
-                egui::pos2(left + bar_length, bottom),
-            )
+            egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(left + bar_length, bottom))
         } else {
             let right = pane_rect.right() - SCALE_MARGIN - offset_px;
             let left = right - SCALE_BAR_WIDTH;
             let bottom = pane_rect.bottom() - SCALE_MARGIN;
             let top = bottom - bar_length;
-            egui::Rect::from_min_max(
-                egui::pos2(left, top),
-                egui::pos2(right, bottom),
-            )
+            egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom))
         };
 
         let min_val = legend.min_value;
@@ -1046,23 +1131,39 @@ fn render_overlay_color_scales(
         }
 
         let mut prev_pos: Option<f32> = None;
-        let thinned: Vec<(f32, &str)> = label_positions.iter().filter(|(pos, _)| {
-            if let Some(prev) = prev_pos
-                && (pos - prev).abs() < MIN_LABEL_SPACING
-            {
-                return false;
-            }
-            prev_pos = Some(*pos);
-            true
-        }).map(|(pos, text)| (*pos, text.as_str())).collect();
+        let thinned: Vec<(f32, &str)> = label_positions
+            .iter()
+            .filter(|(pos, _)| {
+                if let Some(prev) = prev_pos
+                    && (pos - prev).abs() < MIN_LABEL_SPACING
+                {
+                    return false;
+                }
+                prev_pos = Some(*pos);
+                true
+            })
+            .map(|(pos, text)| (*pos, text.as_str()))
+            .collect();
 
         for (pixel_pos, text) in &thinned {
             if horizontal {
                 let pos = egui::pos2(*pixel_pos, bar_rect.top() - 2.0);
-                draw_shadowed_text(painter, pos, egui::Align2::CENTER_BOTTOM, text, label_font.clone());
+                draw_shadowed_text(
+                    painter,
+                    pos,
+                    egui::Align2::CENTER_BOTTOM,
+                    text,
+                    label_font.clone(),
+                );
             } else {
                 let pos = egui::pos2(bar_rect.left() - 4.0, *pixel_pos);
-                draw_shadowed_text(painter, pos, egui::Align2::RIGHT_CENTER, text, label_font.clone());
+                draw_shadowed_text(
+                    painter,
+                    pos,
+                    egui::Align2::RIGHT_CENTER,
+                    text,
+                    label_font.clone(),
+                );
             }
         }
 
@@ -1070,10 +1171,22 @@ fn render_overlay_color_scales(
         let unit = legend.unit_label;
         if horizontal {
             let title_pos = egui::pos2(bar_rect.left() - 4.0, bar_rect.center().y);
-            draw_shadowed_text(painter, title_pos, egui::Align2::RIGHT_CENTER, unit, title_font);
+            draw_shadowed_text(
+                painter,
+                title_pos,
+                egui::Align2::RIGHT_CENTER,
+                unit,
+                title_font,
+            );
         } else {
             let title_pos = egui::pos2(bar_rect.center().x, bar_rect.top() - 4.0);
-            draw_shadowed_text(painter, title_pos, egui::Align2::CENTER_BOTTOM, unit, title_font);
+            draw_shadowed_text(
+                painter,
+                title_pos,
+                egui::Align2::CENTER_BOTTOM,
+                unit,
+                title_font,
+            );
         }
     }
 }
@@ -1138,7 +1251,10 @@ fn render_per_frame_overlay(
 
     let zoom_f32 = pf.zoom as f32;
     let is_dark = ui.ctx().global_style().visuals.dark_mode;
-    let draw_ctx = DrawPointContext { zoom: zoom_f32, is_dark };
+    let draw_ctx = DrawPointContext {
+        zoom: zoom_f32,
+        is_dark,
+    };
     let hit_radius = pf.overlays.point_hit_radius(pf.kind, zoom_f32);
     let hover_ctx = HoverContext { prefs: pf.prefs };
 
@@ -1185,37 +1301,43 @@ fn render_per_frame_overlay(
             let dx = click_pos.x - screen.x;
             let dy = click_pos.y - screen.y;
             if dx * dx + dy * dy <= hit_radius * hit_radius
-                && !is_pos_blocked(ui.ctx(), click_pos, pf.pane_rect, pf.excluded_rects) {
-                    selected.push(pt.selection.clone());
-                }
+                && !is_pos_blocked(ui.ctx(), click_pos, pf.pane_rect, pf.excluded_rects)
+            {
+                selected.push(pt.selection.clone());
+            }
         }
 
         // Hover detection — skip if cursor is over a dialog or outside the pane.
         if let Some(hp) = hover_pos
-            && !is_pos_blocked(ui.ctx(), hp, pf.pane_rect, pf.excluded_rects) {
-                let dx = hp.x - screen.x;
-                let dy = hp.y - screen.y;
-                let d2 = dx * dx + dy * dy;
-                if d2 <= hit_radius * hit_radius
-                    && closest_hover.is_none_or(|(best_d2, _)| d2 < best_d2) {
-                        closest_hover = Some((d2, pt.id));
-                    }
+            && !is_pos_blocked(ui.ctx(), hp, pf.pane_rect, pf.excluded_rects)
+        {
+            let dx = hp.x - screen.x;
+            let dy = hp.y - screen.y;
+            let d2 = dx * dx + dy * dy;
+            if d2 <= hit_radius * hit_radius
+                && closest_hover.is_none_or(|(best_d2, _)| d2 < best_d2)
+            {
+                closest_hover = Some((d2, pt.id));
             }
+        }
     }
 
     // Show tooltip for closest hovered point
     if let Some((_, id)) = closest_hover
         && let Some(hp) = hover_pos
-        && let Some(text) = pf.overlays.hover_text(pf.kind, id, &hover_ctx) {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            map_hover_tooltip(
-                ui.ctx(),
-                egui::Id::new(("per_frame_overlay_hover", pf.kind as u8)),
-                hp,
-                Some(400.0),
-                |tooltip_ui| { tooltip_ui.label(text); },
-            );
-        }
+        && let Some(text) = pf.overlays.hover_text(pf.kind, id, &hover_ctx)
+    {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        map_hover_tooltip(
+            ui.ctx(),
+            egui::Id::new(("per_frame_overlay_hover", pf.kind as u8)),
+            hp,
+            Some(400.0),
+            |tooltip_ui| {
+                tooltip_ui.label(text);
+            },
+        );
+    }
 
     selected
 }
@@ -1242,7 +1364,7 @@ fn draw_long_press_tooltip(
     pane: &PaneState,
     prefs: &UserPreferences,
 ) {
-    use rustdar_radar::types::{ImageBounds, IMAGE_SIZE};
+    use rustdar_radar::types::{IMAGE_SIZE, ImageBounds};
 
     let bounds = ImageBounds::from_radar_site(lat, lon);
 

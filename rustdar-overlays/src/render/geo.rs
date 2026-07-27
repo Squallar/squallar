@@ -16,9 +16,7 @@ pub fn point_in_polygon(point: ScreenPoint, vertices: &[ScreenPoint]) -> bool {
     for i in 0..n {
         let vi = vertices[i];
         let vj = vertices[j];
-        if (vi.y > py) != (vj.y > py)
-            && px < (vj.x - vi.x) * (py - vi.y) / (vj.y - vi.y) + vi.x
-        {
+        if (vi.y > py) != (vj.y > py) && px < (vj.x - vi.x) * (py - vi.y) / (vj.y - vi.y) + vi.x {
             inside = !inside;
         }
         j = i;
@@ -66,11 +64,7 @@ fn rdp_simplify(points: &[(f64, f64)], epsilon: f64) -> Vec<(f64, f64)> {
     }
 }
 
-fn perpendicular_distance(
-    point: (f64, f64),
-    line_start: (f64, f64),
-    line_end: (f64, f64),
-) -> f64 {
+fn perpendicular_distance(point: (f64, f64), line_start: (f64, f64), line_end: (f64, f64)) -> f64 {
     let dx = line_end.0 - line_start.0;
     let dy = line_end.1 - line_start.1;
     let len_sq = dx * dx + dy * dy;
@@ -95,7 +89,6 @@ pub fn simplify_polygons(polygons: &mut Vec<GeoPolygon>, epsilon: f64) {
     }
     polygons.retain(|p| !p.is_empty());
 }
-
 
 /// Drops GeoJSON's closing duplicate vertex (last == first).
 fn strip_closing_dup(ring: &[(f64, f64)]) -> &[(f64, f64)] {

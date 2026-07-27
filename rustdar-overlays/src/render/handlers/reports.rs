@@ -3,10 +3,12 @@ use std::sync::Arc;
 
 use rustdar_units::UserPreferences;
 
-use crate::render::controls::{ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext, PaneControlContextMut};
+use crate::render::controls::{
+    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
+    PaneControlContextMut,
+};
 use crate::render::overlay_state::{
-    FetchPayload,
-    ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
     OverlayState, PopupContent, PopupSection, RasterizeContext, RasterizeFn, RenderMode,
 };
 use crate::render::rasterize;
@@ -42,7 +44,10 @@ impl OverlayItem for StormReportItem {
             match prefs.timezone {
                 rustdar_units::TimezonePreference::Utc => format!("{hhmm} UTC"),
                 rustdar_units::TimezonePreference::Local => {
-                    if let (Ok(h), Ok(m)) = (report.time[..2].parse::<u32>(), report.time[2..].parse::<u32>()) {
+                    if let (Ok(h), Ok(m)) = (
+                        report.time[..2].parse::<u32>(),
+                        report.time[2..].parse::<u32>(),
+                    ) {
                         let today = chrono::Utc::now().date_naive();
                         if let Some(naive) = today.and_hms_opt(h, m, 0) {
                             let utc_dt = chrono::TimeZone::from_utc_datetime(&chrono::Utc, &naive);
@@ -59,9 +64,10 @@ impl OverlayItem for StormReportItem {
         } else {
             format!("{} UTC", report.time)
         };
-        let mut sections = vec![
-            PopupSection::Text(format!("{formatted_time} — {}, {} {}", report.location, report.county, report.state)),
-        ];
+        let mut sections = vec![PopupSection::Text(format!(
+            "{formatted_time} — {}, {} {}",
+            report.location, report.county, report.state
+        ))];
         if let Some(mag) = report.magnitude {
             let mag_text = match report.kind {
                 StormReportKind::Tornado => format!("F/EF Scale: {mag}"),
@@ -202,19 +208,23 @@ impl OverlayHandler for StormReportsHandler {
         });
     }
 
-    fn prepare_rasterize(
-        &self,
-        ctx: &RasterizeContext,
-    ) -> Option<RasterizeFn> {
+    fn prepare_rasterize(&self, ctx: &RasterizeContext) -> Option<RasterizeFn> {
         if self.state.data.is_empty() {
             return None;
         }
         let reports: Vec<StormReport> = self.state.data.iter().map(|i| i.report.clone()).collect();
-        let items: Vec<Arc<dyn OverlayItem>> = self.state.data.iter().map(|i| i.clone() as Arc<dyn OverlayItem>).collect();
+        let items: Vec<Arc<dyn OverlayItem>> = self
+            .state
+            .data
+            .iter()
+            .map(|i| i.clone() as Arc<dyn OverlayItem>)
+            .collect();
         let zoom = ctx.zoom;
         let is_dark = ctx.is_dark;
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            rasterize::rasterize_storm_reports(&reports, &items, bounds, width, height, zoom, is_dark)
+            rasterize::rasterize_storm_reports(
+                &reports, &items, bounds, width, height, zoom, is_dark,
+            )
         }))
     }
 
@@ -247,9 +257,11 @@ impl OverlayHandler for StormReportsHandler {
             format!("\u{26a1}  SPC Storm Reports ({count})")
         };
 
-        let mut items = vec![
-            ControlItem::Toggle { id: "enabled", label, enabled: self.enabled },
-        ];
+        let mut items = vec![ControlItem::Toggle {
+            id: "enabled",
+            label,
+            enabled: self.enabled,
+        }];
 
         if self.enabled {
             items.push(ControlItem::ButtonRow {
@@ -261,7 +273,9 @@ impl OverlayHandler for StormReportsHandler {
                 }],
             });
             if self.state.fetching {
-                items.push(ControlItem::InfoText { text: "Fetching\u{2026}".into() });
+                items.push(ControlItem::InfoText {
+                    text: "Fetching\u{2026}".into(),
+                });
             }
             if let Some(t) = self.state.fetch_time {
                 let secs = t.elapsed().as_secs();
@@ -277,7 +291,11 @@ impl OverlayHandler for StormReportsHandler {
         items
     }
 
-    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneControlContextMut<'_>) -> ControlEffect {
+    fn apply_control(
+        &mut self,
+        update: &ControlUpdate,
+        _ctx: &mut PaneControlContextMut<'_>,
+    ) -> ControlEffect {
         match update.id {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {

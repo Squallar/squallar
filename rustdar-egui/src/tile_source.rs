@@ -349,11 +349,7 @@ impl HttpsTiles {
         let (tile_tx, tile_rx) = channel(MAX_PARALLEL_DOWNLOADS);
 
         let runtime = runtime::spawn(fetch_continuously(
-            source,
-            client,
-            request_rx,
-            tile_tx,
-            egui_ctx,
+            source, client, request_rx, tile_tx, egui_ctx,
         ));
 
         Self {
@@ -399,14 +395,12 @@ impl HttpsTiles {
             cache, request_tx, ..
         } = self;
 
-        let outcome = cache.try_get_or_insert(
-            tile_id,
-            || -> Result<Option<Tile>, TrySendError<TileId>> {
+        let outcome =
+            cache.try_get_or_insert(tile_id, || -> Result<Option<Tile>, TrySendError<TileId>> {
                 request_tx.try_send(tile_id)?;
                 log::trace!("requested tile {tile_id:?}");
                 Ok(None)
-            },
-        );
+            });
 
         match outcome {
             Ok(_) => {}

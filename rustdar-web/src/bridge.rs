@@ -53,10 +53,7 @@ impl PlatformBridge for WebPlatform {
         self.gps_fix_receiver.as_ref().and_then(drain_latest)
     }
 
-    fn set_gps_fix_receiver(
-        &mut self,
-        receiver: std::sync::mpsc::Receiver<rustdar_gps::GpsFix>,
-    ) {
+    fn set_gps_fix_receiver(&mut self, receiver: std::sync::mpsc::Receiver<rustdar_gps::GpsFix>) {
         self.gps_fix_receiver = Some(receiver);
     }
 

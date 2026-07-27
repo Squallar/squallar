@@ -7,8 +7,7 @@ use crate::render::controls::{
     PaneControlContextMut,
 };
 use crate::render::overlay_state::{
-    FetchPayload,
-    FetchConfig, FetchTask, OverlayHandler, OverlayKind, OverlayLegend, OverlayState,
+    FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayKind, OverlayLegend, OverlayState,
     RasterizeContext, RenderMode,
 };
 use crate::render::rasterize::{self, RasterizeOutput};
@@ -90,9 +89,7 @@ impl OverlayHandler for ModelDataHandler {
         Some(3600) // HRRR runs hourly.
     }
 
-    fn clickable_items(
-        &self,
-    ) -> Vec<crate::render::overlay_state::ClickableItem> {
+    fn clickable_items(&self) -> Vec<crate::render::overlay_state::ClickableItem> {
         Vec::new() // Gridded, not feature-based; hover uses `hover_value_at`.
     }
 
@@ -136,8 +133,10 @@ impl OverlayHandler for ModelDataHandler {
 
     fn hover_value_at(&self, lat: f64, lon: f64) -> Option<String> {
         let grid = self.cached_grids.get(&self.selected_param)?;
-        if lat < grid.bounds.min_lat || lat > grid.bounds.max_lat
-            || lon < grid.bounds.min_lon || lon > grid.bounds.max_lon
+        if lat < grid.bounds.min_lat
+            || lat > grid.bounds.max_lat
+            || lon < grid.bounds.min_lon
+            || lon > grid.bounds.max_lon
         {
             return None;
         }
@@ -190,8 +189,7 @@ impl OverlayHandler for ModelDataHandler {
             kind: OverlayKind::ModelData,
             future: Box::pin(async move {
                 let result = if param.is_composite() {
-                    crate::hrrr::fetch::fetch_composite_hrrr_data(&client, &sources, &param)
-                        .await
+                    crate::hrrr::fetch::fetch_composite_hrrr_data(&client, &sources, &param).await
                 } else {
                     crate::hrrr::fetch::fetch_hrrr_data(&client, &sources, &param).await
                 };
@@ -419,8 +417,14 @@ mod tests {
     fn a_forecast_hour_is_visible_in_the_toggle_label() {
         let label = toggle_label(&handler(ModelParameter::MaxUH2to5km, vec![120.0]));
         assert!(label.contains("F01"), "{label}");
-        assert!(label.contains("04:00z"), "forecast valid time expected: {label}");
-        assert!(!label.contains("03:00z"), "run time must not stand in: {label}");
+        assert!(
+            label.contains("04:00z"),
+            "forecast valid time expected: {label}"
+        );
+        assert!(
+            !label.contains("03:00z"),
+            "run time must not stand in: {label}"
+        );
     }
 
     /// The counterpart: analysis fields must not grow an F-hour suffix.

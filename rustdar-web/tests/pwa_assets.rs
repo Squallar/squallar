@@ -107,7 +107,9 @@ fn html_url_attributes(html: &str) -> Vec<(String, String)> {
         let mut rest = html;
         while let Some(i) = rest.find(&needle) {
             rest = &rest[i + needle.len()..];
-            let end = rest.find('"').expect("unterminated attribute in index.html");
+            let end = rest
+                .find('"')
+                .expect("unterminated attribute in index.html");
             out.push((attr.to_string(), rest[..end].to_string()));
             rest = &rest[end..];
         }
@@ -135,7 +137,9 @@ fn host_of(source: &str) -> String {
 fn manifest_start_url_and_scope_are_relative_so_a_subpath_deploy_resolves() {
     let m = manifest();
     for key in ["start_url", "scope"] {
-        let value = m[key].as_str().unwrap_or_else(|| panic!("{key} is missing"));
+        let value = m[key]
+            .as_str()
+            .unwrap_or_else(|| panic!("{key} is missing"));
         assert!(
             !value.starts_with('/') && !value.contains("://"),
             "manifest {key} is {value:?}; an absolute URL resolves to the origin \
@@ -175,16 +179,26 @@ fn manifest_declares_the_icons_installability_requires() {
             let p = icon["purpose"].as_str().unwrap_or("any");
             let s = icon["sizes"].as_str().unwrap_or("");
             p.split_whitespace().any(|w| w == purpose)
-                && s.split_whitespace().any(|dim| dim == format!("{want}x{want}"))
+                && s.split_whitespace()
+                    .any(|dim| dim == format!("{want}x{want}"))
         })
     };
 
-    assert!(sized("any", 192), "no 192x192 `any` icon; Android's install \
-        prompt and the home-screen shortcut both want one");
-    assert!(sized("any", 512), "no 512x512 `any` icon; this is the size the \
-        install dialog and splash screen are generated from");
-    assert!(sized("maskable", 512), "no 512x512 `maskable` icon; without one \
-        Android draws the square icon inside its adaptive mask, letterboxed");
+    assert!(
+        sized("any", 192),
+        "no 192x192 `any` icon; Android's install \
+        prompt and the home-screen shortcut both want one"
+    );
+    assert!(
+        sized("any", 512),
+        "no 512x512 `any` icon; this is the size the \
+        install dialog and splash screen are generated from"
+    );
+    assert!(
+        sized("maskable", 512),
+        "no 512x512 `maskable` icon; without one \
+        Android draws the square icon inside its adaptive mask, letterboxed"
+    );
 }
 
 #[test]
@@ -199,7 +213,11 @@ fn every_manifest_icon_is_relative_and_the_file_matches_its_declared_size() {
         );
 
         let path = web_dir().join(src);
-        assert!(path.is_file(), "icon {src} does not exist at {}", path.display());
+        assert!(
+            path.is_file(),
+            "icon {src} does not exist at {}",
+            path.display()
+        );
 
         let declared = icon["sizes"].as_str().expect("icon has no sizes");
         let (w, h) = png_dimensions(&path);

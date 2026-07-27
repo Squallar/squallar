@@ -449,7 +449,11 @@ mod tests {
         // The hamburger is exactly where the sidebar is not: a layout with
         // neither strands every layer control behind nothing, and one with
         // both wastes a button.
-        for class in [WidthClass::Compact, WidthClass::Medium, WidthClass::Expanded] {
+        for class in [
+            WidthClass::Compact,
+            WidthClass::Medium,
+            WidthClass::Expanded,
+        ] {
             assert_ne!(
                 class.has_hamburger(),
                 class.has_persistent_sidebar(),

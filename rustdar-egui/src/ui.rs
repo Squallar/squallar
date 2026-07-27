@@ -1,26 +1,28 @@
 use crate::actions::{GuiAction, RadarConfig};
-use rustdar_overlays::render::controls::{ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext, PaneControlContextMut};
+use rustdar_overlays::render::controls::{
+    ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
+    PaneControlContextMut,
+};
 
 const DEFAULT_INITIAL_ZOOM: f64 = 7.0;
 
-use rustdar_overlays::render::overlay_state::{OverlayRegistry, OverlayKind};
 use crate::pane::{ColorScaleOrientation, PaneId, PaneLayout, PaneState};
 use crate::tiles::MapTileState;
 use crate::ui_layout::{LayoutCtx, ModalityLatch};
 use chrono::Timelike;
 use egui::Context;
+use rustdar_overlays::render::overlay_state::{OverlayKind, OverlayRegistry};
 use rustdar_radar::types::{RadarProduct, ScanInfo};
 use rustdar_units::UserPreferences;
 
-
-#[path = "ui_popups.rs"]
-mod popups;
+#[path = "ui_chrome.rs"]
+mod chrome;
 #[path = "ui_config.rs"]
 mod config;
 #[path = "ui_map_overlays.rs"]
 mod map_overlays;
-#[path = "ui_chrome.rs"]
-mod chrome;
+#[path = "ui_popups.rs"]
+mod popups;
 #[path = "ui_menu.rs"]
 mod ui_menu;
 /// What the menu presentations actually drew last frame, for the input harness.
@@ -107,15 +109,15 @@ impl AutoPollState {
     /// Whether the poll timer has elapsed and a new check should fire.
     pub fn should_poll(&self) -> bool {
         self.enabled
-            && self.last_fetch_time
+            && self
+                .last_fetch_time
                 .is_some_and(|t| t.elapsed().as_secs() >= self.interval_secs)
     }
 
     /// Seconds remaining until the next poll, if a timer is running.
     pub fn time_until_next(&self) -> Option<u64> {
-        self.last_fetch_time.map(|t| {
-            self.interval_secs.saturating_sub(t.elapsed().as_secs())
-        })
+        self.last_fetch_time
+            .map(|t| self.interval_secs.saturating_sub(t.elapsed().as_secs()))
     }
 
     /// Whether auto-poll has started (initial fetch done) and is enabled.
@@ -246,7 +248,11 @@ pub struct StormMotionOverride {
 
 impl Default for StormMotionOverride {
     fn default() -> Self {
-        Self { enabled: false, speed_kt: 30.0, direction_deg: 240.0 }
+        Self {
+            enabled: false,
+            speed_kt: 30.0,
+            direction_deg: 240.0,
+        }
     }
 }
 
@@ -357,7 +363,13 @@ fn render_control_item(
         ControlItem::Toggle { id, label, enabled } => {
             let mut value = *enabled;
             if ui.checkbox(&mut value, label.as_str()).changed() {
-                updates.push((kind, ControlUpdate { id, value: ControlValue::Bool(value) }));
+                updates.push((
+                    kind,
+                    ControlUpdate {
+                        id,
+                        value: ControlValue::Bool(value),
+                    },
+                ));
             }
         }
         ControlItem::Heading { text } => {
@@ -374,15 +386,20 @@ fn render_control_item(
                         ui.add_enabled(
                             btn.enabled,
                             egui::Button::new(btn.label.as_str()).selected(btn.highlight),
-                        ).clicked()
+                        )
+                        .clicked()
                     } else {
-                        ui.add_enabled(
-                            btn.enabled,
-                            egui::Button::new(btn.label.as_str()),
-                        ).clicked()
+                        ui.add_enabled(btn.enabled, egui::Button::new(btn.label.as_str()))
+                            .clicked()
                     };
                     if clicked {
-                        updates.push((kind, ControlUpdate { id: btn.id, value: ControlValue::Action }));
+                        updates.push((
+                            kind,
+                            ControlUpdate {
+                                id: btn.id,
+                                value: ControlValue::Action,
+                            },
+                        ));
                     }
                 }
             });
@@ -390,7 +407,12 @@ fn render_control_item(
         ControlItem::Separator => {
             ui.separator();
         }
-        ControlItem::Dropdown { id, label, options, selected } => {
+        ControlItem::Dropdown {
+            id,
+            label,
+            options,
+            selected,
+        } => {
             let mut sel = selected.clone();
             let original = sel.clone();
             ui.horizontal(|ui| {
@@ -410,10 +432,24 @@ fn render_control_item(
                 probe.record_dropdown(id, label, &shown, combo.response.rect);
             });
             if sel != original {
-                updates.push((kind, ControlUpdate { id, value: ControlValue::String(sel) }));
+                updates.push((
+                    kind,
+                    ControlUpdate {
+                        id,
+                        value: ControlValue::String(sel),
+                    },
+                ));
             }
         }
-        ControlItem::Slider { id, label, min, max, value, logarithmic, .. } => {
+        ControlItem::Slider {
+            id,
+            label,
+            min,
+            max,
+            value,
+            logarithmic,
+            ..
+        } => {
             let mut val = *value;
             let original = val;
             ui.horizontal(|ui| {
@@ -425,10 +461,21 @@ fn render_control_item(
                 ui.add(slider);
             });
             if (val - original).abs() > f64::EPSILON {
-                updates.push((kind, ControlUpdate { id, value: ControlValue::Float(val) }));
+                updates.push((
+                    kind,
+                    ControlUpdate {
+                        id,
+                        value: ControlValue::Float(val),
+                    },
+                ));
             }
         }
-        ControlItem::Section { label, collapsible, expanded, items } => {
+        ControlItem::Section {
+            label,
+            collapsible,
+            expanded,
+            items,
+        } => {
             if *collapsible {
                 egui::CollapsingHeader::new(label.as_str())
                     .default_open(*expanded)
@@ -632,12 +679,14 @@ impl Gui {
         for &kind in OverlayKind::all() {
             if let Some(interval) = self.overlays.auto_poll_interval(kind)
                 && let Some(pane_idx) = self.first_pane_with_overlay_enabled(kind)
-                    && !self.overlays.is_fetching(kind)
-                    && self.overlays.fetch_time(kind)
-                        .is_none_or(|t| t.elapsed().as_secs() >= interval)
-                {
-                    actions.push(GuiAction::FetchOverlay { kind, pane_idx });
-                }
+                && !self.overlays.is_fetching(kind)
+                && self
+                    .overlays
+                    .fetch_time(kind)
+                    .is_none_or(|t| t.elapsed().as_secs() >= interval)
+            {
+                actions.push(GuiAction::FetchOverlay { kind, pane_idx });
+            }
         }
     }
 
@@ -723,7 +772,7 @@ impl Gui {
 
     fn render_time_dialog(&mut self, ctx: &Context) -> Option<GuiAction> {
         let mut action = None;
-        
+
         if self.time_dialog.show {
             egui::Window::new("Set Time")
                 .collapsible(false)
@@ -737,50 +786,61 @@ impl Gui {
                     ui.vertical_centered(|ui| {
                         ui.heading("Select Time");
                         ui.add_space(10.0);
-                        
+
                         ui.label("Date:");
                         ui.text_edit_singleline(&mut self.time_dialog.date_string);
-                        
+
                         ui.add_space(5.0);
-                        
+
                         ui.label("Time:");
                         ui.text_edit_singleline(&mut self.time_dialog.time_string);
-                        
+
                         ui.add_space(10.0);
-                        
+
                         if ui.button("Use Current Time").clicked() {
                             self.radar.config.timestamp = chrono::Local::now().naive_local();
-                            self.time_dialog.date_string = self.radar.config.timestamp.format("%Y-%m-%d").to_string();
-                            self.time_dialog.time_string = self.radar.config.timestamp.format("%H:%M:%S").to_string();
+                            self.time_dialog.date_string =
+                                self.radar.config.timestamp.format("%Y-%m-%d").to_string();
+                            self.time_dialog.time_string =
+                                self.radar.config.timestamp.format("%H:%M:%S").to_string();
                         }
-                        
+
                         ui.add_space(15.0);
-                        
+
                         ui.horizontal(|ui| {
                             if ui.button("OK").clicked() {
                                 // Try to parse the date and time strings
-                                let datetime_str = format!("{} {}", self.time_dialog.date_string, self.time_dialog.time_string);
-                                if let Ok(timestamp) = chrono::NaiveDateTime::parse_from_str(&datetime_str, "%Y-%m-%d %H:%M:%S") {
+                                let datetime_str = format!(
+                                    "{} {}",
+                                    self.time_dialog.date_string, self.time_dialog.time_string
+                                );
+                                if let Ok(timestamp) = chrono::NaiveDateTime::parse_from_str(
+                                    &datetime_str,
+                                    "%Y-%m-%d %H:%M:%S",
+                                ) {
                                     self.radar.config.timestamp = timestamp;
                                     if let Some(pane) = self.panes.get_mut(self.active_pane) {
                                         pane.viewing_live = false;
                                     }
-                                    action = Some(GuiAction::FetchRadarScan(self.radar.config.clone()));
+                                    action =
+                                        Some(GuiAction::FetchRadarScan(self.radar.config.clone()));
                                 }
                                 self.time_dialog.show = false;
                             }
-                            
+
                             if ui.button("Cancel").clicked() {
                                 // Restore the original strings from the current config
-                                self.time_dialog.date_string = self.radar.config.timestamp.format("%Y-%m-%d").to_string();
-                                self.time_dialog.time_string = self.radar.config.timestamp.format("%H:%M:%S").to_string();
+                                self.time_dialog.date_string =
+                                    self.radar.config.timestamp.format("%Y-%m-%d").to_string();
+                                self.time_dialog.time_string =
+                                    self.radar.config.timestamp.format("%H:%M:%S").to_string();
                                 self.time_dialog.show = false;
                             }
                         });
                     });
                 });
         }
-        
+
         action
     }
 
@@ -789,19 +849,13 @@ impl Gui {
     /// Shared by desktop and mobile layers panels. The caller must pass the
     /// currently-taken `pane` by mutable reference so this method can swap
     /// it back into `self.panes` when the active pane changes.
-    fn render_pane_selector(
-        &mut self,
-        ui: &mut egui::Ui,
-        pane: &mut PaneState,
-    ) {
+    fn render_pane_selector(&mut self, ui: &mut egui::Ui, pane: &mut PaneState) {
         let max_panes = self.layout.width.max_panes();
         ui.horizontal(|ui| {
             ui.label("Panes:");
             for count in 1..=max_panes {
-                let button = ui.selectable_label(
-                    self.pane_layout.pane_count == count,
-                    format!("{count}"),
-                );
+                let button =
+                    ui.selectable_label(self.pane_layout.pane_count == count, format!("{count}"));
                 // The button that was drawn: which count, whether it read as
                 // selected, and where it landed so a test can click it. A probe
                 // built from `max_panes` instead would be a restatement of the
@@ -833,7 +887,9 @@ impl Gui {
             ui.horizontal(|ui| {
                 ui.label("Pane:");
                 for i in 0..self.pane_layout.pane_count {
-                    if ui.selectable_label(self.active_pane == i, format!("{}", i + 1)).clicked()
+                    if ui
+                        .selectable_label(self.active_pane == i, format!("{}", i + 1))
+                        .clicked()
                         && self.active_pane != i
                     {
                         self.panes[self.active_pane] = std::mem::take(pane);
@@ -845,7 +901,6 @@ impl Gui {
         }
         ui.separator();
     }
-
 
     /// Render the layer controls shared by desktop and mobile panels.
     ///
@@ -882,7 +937,6 @@ impl Gui {
             ui.checkbox(&mut self.sync_layers, "\u{1f517}  Sync Layers");
             ui.separator();
         }
-
     }
 
     /// Render radar product/elevation combo boxes (shown when Radar is enabled).
@@ -915,31 +969,30 @@ impl Gui {
 
                     if let Some(elevations) =
                         scan_info.product_elevations.get(&pane.selected_product)
-                        && !elevations.is_empty() {
-                            let selected_angle = elevations
-                                .iter()
-                                .min_by(|a, b| {
-                                    ((**a - pane.selected_elevation).abs())
-                                        .total_cmp(
-                                            &((**b - pane.selected_elevation).abs()),
-                                        )
-                                })
-                                .copied()
-                                .unwrap_or(0.0);
+                        && !elevations.is_empty()
+                    {
+                        let selected_angle = elevations
+                            .iter()
+                            .min_by(|a, b| {
+                                ((**a - pane.selected_elevation).abs())
+                                    .total_cmp(&((**b - pane.selected_elevation).abs()))
+                            })
+                            .copied()
+                            .unwrap_or(0.0);
 
-                            egui::ComboBox::from_id_salt(format!("{id_prefix}elev_sel"))
-                                .selected_text(format!("{:.1}\u{b0}", selected_angle))
-                                .width(combo_width)
-                                .show_ui(ui, |ui| {
-                                    for angle in elevations.iter() {
-                                        ui.selectable_value(
-                                            &mut pane.selected_elevation,
-                                            *angle,
-                                            format!("{:.1}\u{b0}", angle),
-                                        );
-                                    }
-                                });
-                        }
+                        egui::ComboBox::from_id_salt(format!("{id_prefix}elev_sel"))
+                            .selected_text(format!("{:.1}\u{b0}", selected_angle))
+                            .width(combo_width)
+                            .show_ui(ui, |ui| {
+                                for angle in elevations.iter() {
+                                    ui.selectable_value(
+                                        &mut pane.selected_elevation,
+                                        *angle,
+                                        format!("{:.1}\u{b0}", angle),
+                                    );
+                                }
+                            });
+                    }
                 } else {
                     ui.label("No scan loaded");
                 }
@@ -1006,9 +1059,15 @@ impl Gui {
             if ui.button("\u{25c0} Back").clicked() {
                 pane.viewing_live = false;
                 if pane.time_step_secs == 0 {
-                    actions.push(GuiAction::NavigateOneScan { pane_idx: active_pane_idx, forward: false });
+                    actions.push(GuiAction::NavigateOneScan {
+                        pane_idx: active_pane_idx,
+                        forward: false,
+                    });
                 } else {
-                    actions.push(GuiAction::NavigateTime { pane_idx: active_pane_idx, step_secs: -pane.time_step_secs });
+                    actions.push(GuiAction::NavigateTime {
+                        pane_idx: active_pane_idx,
+                        step_secs: -pane.time_step_secs,
+                    });
                 }
             }
 
@@ -1016,20 +1075,30 @@ impl Gui {
             let live_button = if pane.viewing_live {
                 egui::Button::new("\u{23fa} Live")
             } else {
-                egui::Button::new(
-                    egui::RichText::new("\u{23fa} Live").color(egui::Color32::WHITE)
-                ).fill(egui::Color32::from_rgb(200, 50, 50))
+                egui::Button::new(egui::RichText::new("\u{23fa} Live").color(egui::Color32::WHITE))
+                    .fill(egui::Color32::from_rgb(200, 50, 50))
             };
             if ui.add(live_button).clicked() && !pane.viewing_live {
-                actions.push(GuiAction::JumpToLive { pane_idx: active_pane_idx });
+                actions.push(GuiAction::JumpToLive {
+                    pane_idx: active_pane_idx,
+                });
             }
 
             // Forward button — disabled when live
-            if ui.add_enabled(!pane.viewing_live, egui::Button::new("Forward \u{25b6}")).clicked() {
+            if ui
+                .add_enabled(!pane.viewing_live, egui::Button::new("Forward \u{25b6}"))
+                .clicked()
+            {
                 if pane.time_step_secs == 0 {
-                    actions.push(GuiAction::NavigateOneScan { pane_idx: active_pane_idx, forward: true });
+                    actions.push(GuiAction::NavigateOneScan {
+                        pane_idx: active_pane_idx,
+                        forward: true,
+                    });
                 } else {
-                    actions.push(GuiAction::NavigateTime { pane_idx: active_pane_idx, step_secs: pane.time_step_secs });
+                    actions.push(GuiAction::NavigateTime {
+                        pane_idx: active_pane_idx,
+                        step_secs: pane.time_step_secs,
+                    });
                 }
             }
         });
@@ -1069,11 +1138,15 @@ impl Gui {
                 let mut lookback_mins = (self.loop_lookback_secs as f32 / 60.0).round();
                 ui.horizontal(|ui| {
                     ui.label("Lookback:");
-                    if ui.add(egui::Slider::new(&mut lookback_mins, 5.0..=1440.0)
-                        .logarithmic(true)
-                        .suffix(" min")
-                        .clamping(egui::SliderClamping::Always)
-                    ).drag_stopped() {
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut lookback_mins, 5.0..=1440.0)
+                                .logarithmic(true)
+                                .suffix(" min")
+                                .clamping(egui::SliderClamping::Always),
+                        )
+                        .drag_stopped()
+                    {
                         let new_secs = (lookback_mins * 60.0) as u64;
                         if new_secs != self.loop_lookback_secs {
                             self.loop_lookback_secs = new_secs;
@@ -1090,9 +1163,10 @@ impl Gui {
                 // Speed slider
                 ui.horizontal(|ui| {
                     ui.label("Speed:");
-                    ui.add(egui::Slider::new(&mut self.loop_speed_fps, 1.0..=30.0)
-                        .suffix(" fps")
-                        .clamping(egui::SliderClamping::Always)
+                    ui.add(
+                        egui::Slider::new(&mut self.loop_speed_fps, 1.0..=30.0)
+                            .suffix(" fps")
+                            .clamping(egui::SliderClamping::Always),
                     );
                 });
 
@@ -1118,7 +1192,7 @@ impl Gui {
                             });
                             ui.add(
                                 egui::ProgressBar::new(rendered as f32 / total as f32)
-                                    .show_percentage()
+                                    .show_percentage(),
                             );
                         } else {
                             ui.label(format!("{}/{} frames rendered", rendered, total));
@@ -1127,7 +1201,11 @@ impl Gui {
                         // Transport controls
                         ui.horizontal(|ui| {
                             // Step backward
-                            if ui.button("\u{23ee}").on_hover_text("Previous frame").clicked() {
+                            if ui
+                                .button("\u{23ee}")
+                                .on_hover_text("Previous frame")
+                                .clicked()
+                            {
                                 for pane_idx in self.loop_sync_targets() {
                                     actions.push(GuiAction::StepLoopFrame {
                                         pane_idx,
@@ -1137,7 +1215,11 @@ impl Gui {
                             }
 
                             // Play/pause
-                            let play_label = if ls.is_playing() { "\u{23f8}" } else { "\u{25b6}" };
+                            let play_label = if ls.is_playing() {
+                                "\u{23f8}"
+                            } else {
+                                "\u{25b6}"
+                            };
                             let play_hover = if ls.is_playing() {
                                 "Pause".to_string()
                             } else if rendering {
@@ -1146,7 +1228,8 @@ impl Gui {
                                 "Play".to_string()
                             };
                             let play_btn = egui::Button::new(play_label);
-                            let resp = ui.add_enabled(!rendering || ls.is_playing(), play_btn)
+                            let resp = ui
+                                .add_enabled(!rendering || ls.is_playing(), play_btn)
                                 .on_hover_text(play_hover);
                             if resp.clicked() {
                                 for pane_idx in self.loop_sync_targets() {
@@ -1167,9 +1250,13 @@ impl Gui {
 
                         // Frame seek slider
                         let mut frame_idx = ls.current_frame;
-                        if ui.add(egui::Slider::new(&mut frame_idx, 0..=(total - 1))
-                            .show_value(false)
-                        ).changed() {
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut frame_idx, 0..=(total - 1))
+                                    .show_value(false),
+                            )
+                            .changed()
+                        {
                             for pane_idx in self.loop_sync_targets() {
                                 actions.push(GuiAction::SeekLoopFrame {
                                     pane_idx,
@@ -1182,8 +1269,11 @@ impl Gui {
                         if let Some(frame) = ls.frames.get(ls.current_frame) {
                             ui.label(
                                 egui::RichText::new(
-                                    self.preferences.timezone.format_naive_utc(frame.timestamp, "%H:%M:%S")
-                                ).small()
+                                    self.preferences
+                                        .timezone
+                                        .format_naive_utc(frame.timestamp, "%H:%M:%S"),
+                                )
+                                .small(),
                             );
                         }
                     }
@@ -1244,7 +1334,10 @@ impl Gui {
         for (kind, update) in updates {
             let effect = self.overlays.apply_control(kind, &update, &mut pane_ctx);
             if matches!(effect, ControlEffect::Fetch) {
-                actions.push(GuiAction::FetchOverlay { kind, pane_idx: self.active_pane });
+                actions.push(GuiAction::FetchOverlay {
+                    kind,
+                    pane_idx: self.active_pane,
+                });
             }
         }
 
@@ -1342,7 +1435,8 @@ impl Gui {
     /// Used for auto-poll decisions: we should fetch data for an overlay
     /// if at least one pane wants to display it.
     pub fn any_pane_has_overlay_enabled(&self, kind: OverlayKind) -> bool {
-        self.panes.iter()
+        self.panes
+            .iter()
             .take(self.pane_layout.pane_count)
             .any(|p| p.is_overlay_enabled(kind))
     }
@@ -1350,7 +1444,8 @@ impl Gui {
     /// Returns the index of the first pane that has the given overlay kind enabled,
     /// or `None` if no pane has it enabled.
     pub fn first_pane_with_overlay_enabled(&self, kind: OverlayKind) -> Option<usize> {
-        self.panes.iter()
+        self.panes
+            .iter()
             .take(self.pane_layout.pane_count)
             .position(|p| p.is_overlay_enabled(kind))
     }
@@ -1408,7 +1503,8 @@ impl Gui {
 
     /// Get the rendering params for a specific pane.
     pub fn get_rendering_params_for_pane(&self, pane_idx: PaneId) -> Option<(RadarProduct, f32)> {
-        self.panes.get(pane_idx)
+        self.panes
+            .get(pane_idx)
             .and_then(|p| p.get_rendering_params())
     }
 
@@ -1494,12 +1590,7 @@ impl Gui {
     /// map — `render_layer_controls` reloads the handlers from the config every
     /// frame, so a write to `enabled_overlays` alone is undone immediately.
     #[cfg(test)]
-    pub(crate) fn set_overlay_on_pane_for_test(
-        &mut self,
-        idx: usize,
-        kind: OverlayKind,
-        on: bool,
-    ) {
+    pub(crate) fn set_overlay_on_pane_for_test(&mut self, idx: usize, kind: OverlayKind, on: bool) {
         let configs = self.panes[idx].overlay_configs.clone();
         if !configs.is_empty() {
             self.overlays.load_pane_configs(&configs);
@@ -1532,14 +1623,19 @@ impl Gui {
         &self,
         label: &str,
     ) -> Option<(Vec<(String, String)>, String)> {
-        let ctx = PaneControlContext { pane_idx: self.active_pane, pane_state: None };
-        fn find(
-            items: &[ControlItem],
-            label: &str,
-        ) -> Option<(Vec<(String, String)>, String)> {
+        let ctx = PaneControlContext {
+            pane_idx: self.active_pane,
+            pane_state: None,
+        };
+        fn find(items: &[ControlItem], label: &str) -> Option<(Vec<(String, String)>, String)> {
             for item in items {
                 match item {
-                    ControlItem::Dropdown { label: l, options, selected, .. } if l == label => {
+                    ControlItem::Dropdown {
+                        label: l,
+                        options,
+                        selected,
+                        ..
+                    } if l == label => {
                         return Some((options.clone(), selected.clone()));
                     }
                     ControlItem::Section { items, .. } => {
@@ -1682,12 +1778,17 @@ impl Gui {
 
     /// Whether the active pane is showing the most recent (live) scan.
     pub fn is_viewing_live(&self) -> bool {
-        self.panes.get(self.active_pane).is_some_and(|p| p.viewing_live)
+        self.panes
+            .get(self.active_pane)
+            .is_some_and(|p| p.viewing_live)
     }
 
     /// Whether any pane is viewing live (for auto-poll gating).
     pub fn is_any_pane_live(&self) -> bool {
-        self.panes.iter().take(self.pane_layout.pane_count).any(|p| p.viewing_live)
+        self.panes
+            .iter()
+            .take(self.pane_layout.pane_count)
+            .any(|p| p.viewing_live)
     }
 
     /// Set live/historic viewing mode for a specific pane.
@@ -1699,7 +1800,9 @@ impl Gui {
 
     /// Get the scan info for the active pane.
     pub fn get_scan_info(&self) -> Option<&ScanInfo> {
-        self.panes.get(self.active_pane).and_then(|p| p.scan_info.as_ref())
+        self.panes
+            .get(self.active_pane)
+            .and_then(|p| p.scan_info.as_ref())
     }
 
     /// Get the scan info for a specific pane.
@@ -1720,7 +1823,10 @@ impl Gui {
     pub fn any_loop_active(&self) -> bool {
         self.panes.iter().any(|p| {
             let ls = &p.loop_state;
-            ls.is_active() && (ls.is_playing() || ls.is_fetching() || ls.frames.iter().any(|f| f.render_in_flight))
+            ls.is_active()
+                && (ls.is_playing()
+                    || ls.is_fetching()
+                    || ls.frames.iter().any(|f| f.render_in_flight))
         })
     }
 
@@ -1768,8 +1874,7 @@ impl Gui {
                 let curr_pos = self.panes[idx].map_memory.detached();
                 let pos_changed = match (prev_pos, &curr_pos) {
                     (Some(p1), Some(p2)) => {
-                        (p1.x() - p2.x()).abs() > 0.00001
-                            || (p1.y() - p2.y()).abs() > 0.00001
+                        (p1.x() - p2.x()).abs() > 0.00001 || (p1.y() - p2.y()).abs() > 0.00001
                     }
                     (None, Some(_)) | (Some(_), None) => true,
                     _ => false,
@@ -1818,14 +1923,26 @@ mod storm_motion_override_tests {
     #[test]
     fn a_non_finite_override_is_refused_rather_than_propagated() {
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            let speed = StormMotionOverride { enabled: true, speed_kt: bad, direction_deg: 240.0 };
+            let speed = StormMotionOverride {
+                enabled: true,
+                speed_kt: bad,
+                direction_deg: 240.0,
+            };
             assert!(speed.sample().is_none(), "speed {bad}");
-            let dir = StormMotionOverride { enabled: true, speed_kt: 30.0, direction_deg: bad };
+            let dir = StormMotionOverride {
+                enabled: true,
+                speed_kt: 30.0,
+                direction_deg: bad,
+            };
             assert!(dir.sample().is_none(), "direction {bad}");
         }
         // The counterweight: ordinary values still pass, so "reject everything"
         // is not how the test above is satisfied.
-        let ok = StormMotionOverride { enabled: true, speed_kt: 0.0, direction_deg: 0.0 };
+        let ok = StormMotionOverride {
+            enabled: true,
+            speed_kt: 0.0,
+            direction_deg: 0.0,
+        };
         assert!(ok.sample().is_some(), "zero is a legitimate vector");
     }
 
@@ -1833,10 +1950,17 @@ mod storm_motion_override_tests {
     /// change detector re-renders every frame even without a NaN.
     #[test]
     fn equal_overrides_produce_equal_samples() {
-        let a = StormMotionOverride { enabled: true, speed_kt: 31.5, direction_deg: 287.5 };
+        let a = StormMotionOverride {
+            enabled: true,
+            speed_kt: 31.5,
+            direction_deg: 287.5,
+        };
         let b = a;
         assert_eq!(a.sample(), b.sample());
-        let c = StormMotionOverride { speed_kt: 31.6, ..a };
+        let c = StormMotionOverride {
+            speed_kt: 31.6,
+            ..a
+        };
         assert_ne!(a.sample(), c.sample());
     }
 
@@ -1871,7 +1995,10 @@ mod pane_slice_tests {
         assert_eq!(gui.panes().len(), 2);
         assert_eq!(gui.panes_mut().len(), 2);
         assert_eq!(
-            gui.panes().iter().map(|p| p.site.as_str()).collect::<Vec<_>>(),
+            gui.panes()
+                .iter()
+                .map(|p| p.site.as_str())
+                .collect::<Vec<_>>(),
             ["PANE0", "PANE1"],
         );
         assert_eq!(

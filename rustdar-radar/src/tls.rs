@@ -134,10 +134,7 @@ pub fn simple_client(_timeout: std::time::Duration) -> reqwest::ClientBuilder {
 /// property of one `#[cfg]` arm, not of the CORS problem: restore a `User-Agent`
 /// to the wasm client and METAR and SPC go dark in the browser with no error on
 /// native. [`sends_user_agent`] pins it.
-pub fn client_for(
-    sends_user_agent: bool,
-    timeout: std::time::Duration,
-) -> reqwest::ClientBuilder {
+pub fn client_for(sends_user_agent: bool, timeout: std::time::Duration) -> reqwest::ClientBuilder {
     if sends_user_agent {
         client(USER_AGENT, timeout)
     } else {
@@ -373,7 +370,13 @@ mod tests {
     fn run_probe(name: &str) {
         let exe = std::env::current_exe().expect("current_exe");
         let out = std::process::Command::new(&exe)
-            .args(["--exact", name, "--ignored", "--nocapture", "--test-threads=1"])
+            .args([
+                "--exact",
+                name,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
             .env("RUSTDAR_TLS_PROBE", "1")
             .output()
             .expect("failed to re-exec test binary");

@@ -38,7 +38,11 @@ const BARB_STROKE_WIDTH: f32 = 1.5;
 pub fn draw_metar_station(ob: &MetarOb, painter: &mut dyn PointPainter, ctx: &DrawPointContext) {
     let zoom = ctx.zoom;
     let fc_color = flight_category_color(ob.flight_category);
-    let text_color = if ctx.is_dark { [255, 255, 255, 230] } else { [20, 20, 20, 230] };
+    let text_color = if ctx.is_dark {
+        [255, 255, 255, 230]
+    } else {
+        [20, 20, 20, 230]
+    };
     let font_size = font_size_for_zoom(zoom);
     let circle_r = circle_radius_for_zoom(zoom);
 
@@ -52,12 +56,24 @@ pub fn draw_metar_station(ob: &MetarOb, painter: &mut dyn PointPainter, ctx: &Dr
     // ── Tier 2 ────────────────────────────────────────────────────────
     if let Some(tc) = ob.temp_c {
         let tf = tc * 9.0 / 5.0 + 32.0;
-        painter.text(TEMP_OFFSET, &format!("{tf:.0}"), text_color, font_size, TextAnchor::BottomRight);
+        painter.text(
+            TEMP_OFFSET,
+            &format!("{tf:.0}"),
+            text_color,
+            font_size,
+            TextAnchor::BottomRight,
+        );
     }
 
     if let Some(td) = ob.dewp_c {
         let tdf = td * 9.0 / 5.0 + 32.0;
-        painter.text(DEWP_OFFSET, &format!("{tdf:.0}"), text_color, font_size, TextAnchor::TopRight);
+        painter.text(
+            DEWP_OFFSET,
+            &format!("{tdf:.0}"),
+            text_color,
+            font_size,
+            TextAnchor::TopRight,
+        );
     }
 
     draw_wind_barb(painter, ob.wind_dir, ob.wind_speed_kt, circle_r, text_color);
@@ -81,14 +97,26 @@ pub fn draw_metar_station(ob: &MetarOb, painter: &mut dyn PointPainter, ctx: &Dr
     }
 
     if let Some(vis) = ob.visibility {
-        painter.text(VIS_OFFSET, &vis.label(), text_color, font_size * 0.85, TextAnchor::CenterRight);
+        painter.text(
+            VIS_OFFSET,
+            &vis.label(),
+            text_color,
+            font_size * 0.85,
+            TextAnchor::CenterRight,
+        );
     }
 
     if let Some(ref wx) = ob.wx_string {
         draw_wx_symbol(painter, WX_OFFSET, wx, text_color);
     }
 
-    painter.text(ID_OFFSET, &ob.station_id, text_color, font_size * 0.75, TextAnchor::TopLeft);
+    painter.text(
+        ID_OFFSET,
+        &ob.station_id,
+        text_color,
+        font_size * 0.75,
+        TextAnchor::TopLeft,
+    );
 }
 
 pub fn hit_radius_for_zoom(zoom: f32) -> f32 {
@@ -120,9 +148,11 @@ pub fn hover_text_for_metar(ob: &MetarOb, prefs: &rustdar_units::UserPreferences
         let converted = prefs.speed.convert_from_knots(speed as f32);
         match ob.wind_dir {
             Some(WindDir::Calm) => parts.push("CALM".into()),
-            Some(dir) => {
-                parts.push(format!("{} {converted:.0}{}", dir.label(), prefs.speed.suffix()))
-            }
+            Some(dir) => parts.push(format!(
+                "{} {converted:.0}{}",
+                dir.label(),
+                prefs.speed.suffix()
+            )),
             None => parts.push(format!("{converted:.0}{}", prefs.speed.suffix())),
         }
     }
@@ -158,7 +188,11 @@ fn draw_cloud_cover_circle(
     is_dark: bool,
 ) {
     let fill_fraction = cloud_cover_fraction(&ob.clouds);
-    let outline_color = if is_dark { [255, 255, 255, 180] } else { [40, 40, 40, 180] };
+    let outline_color = if is_dark {
+        [255, 255, 255, 180]
+    } else {
+        [40, 40, 40, 180]
+    };
 
     if fill_fraction >= 0.99 {
         // OVC
@@ -169,7 +203,11 @@ fn draw_cloud_cover_circle(
         // BKN: filled, with an open slice on the right faked by overpainting
         // in the background colour — `PointPainter` has no arc primitive.
         painter.circle_filled([0.0, 0.0], radius, fc_color);
-        let bg = if is_dark { [30, 30, 30, 230] } else { [245, 245, 245, 230] };
+        let bg = if is_dark {
+            [30, 30, 30, 230]
+        } else {
+            [245, 245, 245, 230]
+        };
         let open_fraction = 1.0 - fill_fraction;
         let half_w = radius * open_fraction * 2.0;
         let pts: [[f32; 2]; 4] = [
@@ -290,10 +328,7 @@ fn draw_wind_barb(
         let next_x = staff_end_x - cos_d * (pos + PENNANT_WIDTH);
         let next_y = staff_end_y - sin_d * (pos + PENNANT_WIDTH);
 
-        painter.filled_polygon(
-            &[[base_x, base_y], [tip_x, tip_y], [next_x, next_y]],
-            color,
-        );
+        painter.filled_polygon(&[[base_x, base_y], [tip_x, tip_y], [next_x, next_y]], color);
         pos += PENNANT_WIDTH + 1.0;
     }
 
@@ -378,15 +413,12 @@ fn draw_wx_rain_heavy(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8;
 
 /// Drizzle (DZ): a comma — short vertical line with a curve
 fn draw_wx_drizzle(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8; 4]) {
-    painter.line(
-        [off[0], off[1] - 3.0],
-        [off[0], off[1] + 2.0],
-        color, 1.5,
-    );
+    painter.line([off[0], off[1] - 3.0], [off[0], off[1] + 2.0], color, 1.5);
     painter.line(
         [off[0], off[1] + 2.0],
         [off[0] - 1.5, off[1] + 4.0],
-        color, 1.5,
+        color,
+        1.5,
     );
 }
 
@@ -395,9 +427,19 @@ fn draw_wx_snow(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8; 4]) {
     let r = 4.0_f32;
     painter.line([off[0], off[1] - r], [off[0], off[1] + r], color, 1.2);
     let dx = r * 0.866; // cos(30°)
-    let dy = r * 0.5;   // sin(30°)
-    painter.line([off[0] - dx, off[1] - dy], [off[0] + dx, off[1] + dy], color, 1.2);
-    painter.line([off[0] - dx, off[1] + dy], [off[0] + dx, off[1] - dy], color, 1.2);
+    let dy = r * 0.5; // sin(30°)
+    painter.line(
+        [off[0] - dx, off[1] - dy],
+        [off[0] + dx, off[1] + dy],
+        color,
+        1.2,
+    );
+    painter.line(
+        [off[0] - dx, off[1] + dy],
+        [off[0] + dx, off[1] - dy],
+        color,
+        1.2,
+    );
 }
 
 /// Heavy snow (+SN): two asterisks stacked
@@ -412,12 +454,14 @@ fn draw_wx_freezing_rain(painter: &mut dyn PointPainter, off: [f32; 2], color: [
     painter.line(
         [off[0] - 3.0, off[1] - 4.0],
         [off[0], off[1] - 2.0],
-        color, 1.2,
+        color,
+        1.2,
     );
     painter.line(
         [off[0], off[1] - 2.0],
         [off[0] + 3.0, off[1] - 4.0],
-        color, 1.2,
+        color,
+        1.2,
     );
 }
 
@@ -427,12 +471,14 @@ fn draw_wx_freezing_drizzle(painter: &mut dyn PointPainter, off: [f32; 2], color
     painter.line(
         [off[0] - 3.0, off[1] - 4.0],
         [off[0], off[1] - 2.0],
-        color, 1.2,
+        color,
+        1.2,
     );
     painter.line(
         [off[0], off[1] - 2.0],
         [off[0] + 3.0, off[1] - 4.0],
-        color, 1.2,
+        color,
+        1.2,
     );
 }
 
@@ -451,22 +497,26 @@ fn draw_wx_hail(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8; 4]) {
     painter.line(
         [off[0], off[1] - 4.0],
         [off[0] - 3.5, off[1] + 2.0],
-        color, 1.2,
+        color,
+        1.2,
     );
     painter.line(
         [off[0], off[1] - 4.0],
         [off[0] + 3.5, off[1] + 2.0],
-        color, 1.2,
+        color,
+        1.2,
     );
     painter.line(
         [off[0] - 3.5, off[1] + 2.0],
         [off[0] + 3.5, off[1] + 2.0],
-        color, 1.2,
+        color,
+        1.2,
     );
     painter.line(
         [off[0] - 3.5, off[1] + 4.5],
         [off[0] + 3.5, off[1] + 4.5],
-        color, 1.2,
+        color,
+        1.2,
     );
 }
 
@@ -484,12 +534,14 @@ fn draw_wx_thunderstorm(painter: &mut dyn PointPainter, off: [f32; 2], color: [u
     painter.line(
         [off[0] - 2.0, off[1] + 3.0],
         [off[0] - 0.5, off[1] + 2.0],
-        color, 1.5,
+        color,
+        1.5,
     );
     painter.line(
         [off[0] - 2.0, off[1] + 3.0],
         [off[0] - 3.5, off[1] + 2.0],
-        color, 1.5,
+        color,
+        1.5,
     );
 }
 
@@ -506,12 +558,14 @@ fn draw_wx_mist(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8; 4]) {
     painter.line(
         [off[0] - 5.0, off[1] - 2.0],
         [off[0] + 5.0, off[1] - 2.0],
-        color, 1.2,
+        color,
+        1.2,
     );
     painter.line(
         [off[0] - 5.0, off[1] + 2.0],
         [off[0] + 5.0, off[1] + 2.0],
-        color, 1.2,
+        color,
+        1.2,
     );
 }
 
@@ -526,36 +580,37 @@ fn draw_wx_smoke(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8; 4]) 
     painter.line(
         [off[0], off[1] + 4.0],
         [off[0] + 2.0, off[1] + 1.0],
-        color, 1.2,
+        color,
+        1.2,
     );
     painter.line(
         [off[0] + 2.0, off[1] + 1.0],
         [off[0] - 2.0, off[1] - 2.0],
-        color, 1.2,
+        color,
+        1.2,
     );
     painter.line(
         [off[0] - 2.0, off[1] - 2.0],
         [off[0], off[1] - 5.0],
-        color, 1.2,
+        color,
+        1.2,
     );
 }
 
 /// Squall (SQ): arrow-like symbol pointing up-right
 fn draw_wx_squall(painter: &mut dyn PointPainter, off: [f32; 2], color: [u8; 4]) {
-    painter.line(
-        [off[0], off[1] + 4.0],
-        [off[0], off[1] - 4.0],
-        color, 1.5,
-    );
+    painter.line([off[0], off[1] + 4.0], [off[0], off[1] - 4.0], color, 1.5);
     painter.line(
         [off[0], off[1] - 4.0],
         [off[0] - 3.0, off[1] - 1.0],
-        color, 1.5,
+        color,
+        1.5,
     );
     painter.line(
         [off[0], off[1] - 4.0],
         [off[0] + 3.0, off[1] - 1.0],
-        color, 1.5,
+        color,
+        1.5,
     );
 }
 
@@ -592,11 +647,7 @@ mod tests {
         wind_ob(None, None, vis)
     }
 
-    fn wind_ob(
-        dir: Option<WindDir>,
-        speed: Option<u16>,
-        vis: Option<Visibility>,
-    ) -> MetarOb {
+    fn wind_ob(dir: Option<WindDir>, speed: Option<u16>, vis: Option<Visibility>) -> MetarOb {
         MetarOb {
             station_id: "KTST".into(),
             name: "KTST".into(),
@@ -619,12 +670,18 @@ mod tests {
     }
 
     fn knots() -> UserPreferences {
-        UserPreferences { speed: SpeedUnit::Knots, ..Default::default() }
+        UserPreferences {
+            speed: SpeedUnit::Knots,
+            ..Default::default()
+        }
     }
 
     fn plot(vis: Option<Visibility>) -> RecordingPainter {
         let mut p = RecordingPainter::default();
-        let ctx = DrawPointContext { zoom: 12.0, is_dark: true };
+        let ctx = DrawPointContext {
+            zoom: 12.0,
+            is_dark: true,
+        };
         draw_metar_station(&ob(vis), &mut p, &ctx);
         p
     }
@@ -632,29 +689,48 @@ mod tests {
     /// Fails if the plot drops the `+` from an "or greater" visibility.
     #[test]
     fn the_plot_shows_the_or_greater_marker() {
-        let p = plot(Some(Visibility { miles: 10.0, or_greater: true }));
+        let p = plot(Some(Visibility {
+            miles: 10.0,
+            or_greater: true,
+        }));
         assert!(p.texts.contains(&"10+".to_string()), "drew {:?}", p.texts);
     }
 
     #[test]
     fn the_plot_does_not_flatten_a_measurement_into_the_bound() {
-        let p = plot(Some(Visibility { miles: 15.0, or_greater: false }));
+        let p = plot(Some(Visibility {
+            miles: 15.0,
+            or_greater: false,
+        }));
         assert!(p.texts.contains(&"15".to_string()), "drew {:?}", p.texts);
         assert!(!p.texts.contains(&"10+".to_string()));
     }
 
     #[test]
     fn hover_text_reports_unrestricted_visibility() {
-        let text =
-            hover_text_for_metar(&ob(Some(Visibility { miles: 10.0, or_greater: true })), &knots());
+        let text = hover_text_for_metar(
+            &ob(Some(Visibility {
+                miles: 10.0,
+                or_greater: true,
+            })),
+            &knots(),
+        );
         assert!(text.contains("10+SM"), "got {text:?}");
     }
 
     #[test]
     fn hover_text_keeps_a_measurement_distinct_from_the_bound() {
-        let text =
-            hover_text_for_metar(&ob(Some(Visibility { miles: 15.0, or_greater: false })), &knots());
-        assert!(text.contains("15SM") && !text.contains("10+"), "got {text:?}");
+        let text = hover_text_for_metar(
+            &ob(Some(Visibility {
+                miles: 15.0,
+                or_greater: false,
+            })),
+            &knots(),
+        );
+        assert!(
+            text.contains("15SM") && !text.contains("10+"),
+            "got {text:?}"
+        );
     }
 
     // ── Wind barb ─────────────────────────────────────────────────────────
@@ -696,7 +772,10 @@ mod tests {
         let vrb = barb(Some(WindDir::Variable), Some(6));
         assert_eq!(calm.strokes.len(), 1, "calm draws one ring");
         assert_eq!(vrb.strokes.len(), 2, "variable adds a second ring");
-        assert_ne!(vrb.strokes[0].0, vrb.strokes[1].0, "the rings differ in size");
+        assert_ne!(
+            vrb.strokes[0].0, vrb.strokes[1].0,
+            "the rings differ in size"
+        );
     }
 
     /// The counterpart: 360° is a real bearing and must still draw a staff.
@@ -705,17 +784,26 @@ mod tests {
         let p = barb(Some(WindDir::Degrees(360)), Some(10));
         let end = staff_end(&p).expect("360° is a bearing and must draw a staff");
         // Screen space: north is -y.
-        assert!(end[0].abs() < 1e-3, "a northerly staff has no x component: {end:?}");
+        assert!(
+            end[0].abs() < 1e-3,
+            "a northerly staff has no x component: {end:?}"
+        );
         assert!(end[1] < -5.0, "a northerly staff points up-screen: {end:?}");
     }
 
     #[test]
     fn the_staff_follows_the_reported_bearing() {
         let east = staff_end(&barb(Some(WindDir::Degrees(90)), Some(10))).unwrap();
-        assert!(east[0] > 5.0 && east[1].abs() < 1e-3, "090° points right: {east:?}");
+        assert!(
+            east[0] > 5.0 && east[1].abs() < 1e-3,
+            "090° points right: {east:?}"
+        );
 
         let south = staff_end(&barb(Some(WindDir::Degrees(180)), Some(10))).unwrap();
-        assert!(south[1] > 5.0 && south[0].abs() < 1e-3, "180° points down: {south:?}");
+        assert!(
+            south[1] > 5.0 && south[0].abs() < 1e-3,
+            "180° points down: {south:?}"
+        );
     }
 
     // ── Hover text ────────────────────────────────────────────────────────
@@ -723,10 +811,12 @@ mod tests {
     /// Fails if the hover reads "000°" for a variable wind.
     #[test]
     fn hover_text_says_vrb_for_a_variable_wind() {
-        let text =
-            hover_text_for_metar(&wind_ob(Some(WindDir::Variable), Some(6), None), &knots());
+        let text = hover_text_for_metar(&wind_ob(Some(WindDir::Variable), Some(6), None), &knots());
         assert!(text.contains("VRB 6kt"), "got {text:?}");
-        assert!(!text.contains("000"), "a variable wind is not a 000° bearing: {text:?}");
+        assert!(
+            !text.contains("000"),
+            "a variable wind is not a 000° bearing: {text:?}"
+        );
     }
 
     #[test]
@@ -738,8 +828,10 @@ mod tests {
 
     #[test]
     fn hover_text_keeps_a_real_bearing() {
-        let text =
-            hover_text_for_metar(&wind_ob(Some(WindDir::Degrees(360)), Some(3), None), &knots());
+        let text = hover_text_for_metar(
+            &wind_ob(Some(WindDir::Degrees(360)), Some(3), None),
+            &knots(),
+        );
         assert!(text.contains("360° 3kt"), "got {text:?}");
     }
 }

@@ -51,31 +51,31 @@ pub fn start_watch(sender: std::sync::mpsc::Sender<GpsFix>) {
         return;
     };
 
-    let on_success = Closure::<dyn FnMut(web_sys::Position)>::new(move |position: web_sys::Position| {
-        let coords = position.coords();
-        let fix = fix_from_coords(
-            coords.latitude(),
-            coords.longitude(),
-            coords.altitude(),
-            coords.speed(),
-            coords.heading(),
-        );
-        // A closed receiver means the app is gone; the watch dies with the page.
-        if sender.send(fix).is_err() {
-            log::debug!("GPS receiver dropped; geolocation updates have nowhere to go");
-        }
-    });
+    let on_success =
+        Closure::<dyn FnMut(web_sys::Position)>::new(move |position: web_sys::Position| {
+            let coords = position.coords();
+            let fix = fix_from_coords(
+                coords.latitude(),
+                coords.longitude(),
+                coords.altitude(),
+                coords.speed(),
+                coords.heading(),
+            );
+            // A closed receiver means the app is gone; the watch dies with the page.
+            if sender.send(fix).is_err() {
+                log::debug!("GPS receiver dropped; geolocation updates have nowhere to go");
+            }
+        });
 
-    let on_error = Closure::<dyn FnMut(web_sys::PositionError)>::new(
-        move |error: web_sys::PositionError| {
+    let on_error =
+        Closure::<dyn FnMut(web_sys::PositionError)>::new(move |error: web_sys::PositionError| {
             // Denial is the common case and is not an application error.
             log::info!(
                 "geolocation unavailable (code {}): {}",
                 error.code(),
                 error.message()
             );
-        },
-    );
+        });
 
     let options = web_sys::PositionOptions::new();
     options.set_enable_high_accuracy(true);

@@ -66,12 +66,16 @@ impl LoopDownloadManager {
 
     /// Whether this site's scan for the given timestamp is already cached.
     pub fn is_cached(&self, site: &str, ts: &chrono::NaiveDateTime) -> bool {
-        self.scan_cache.get(site).is_some_and(|scans| scans.contains_key(ts))
+        self.scan_cache
+            .get(site)
+            .is_some_and(|scans| scans.contains_key(ts))
     }
 
     /// Whether a download of this site's scan for the given timestamp is in flight.
     pub fn is_in_flight(&self, site: &str, ts: &chrono::NaiveDateTime) -> bool {
-        self.in_flight_set.get(site).is_some_and(|tss| tss.contains(ts))
+        self.in_flight_set
+            .get(site)
+            .is_some_and(|tss| tss.contains(ts))
     }
 
     /// Get a cached scan by site and timestamp.
@@ -90,12 +94,18 @@ impl LoopDownloadManager {
         ts: chrono::NaiveDateTime,
         scan: Arc<nexrad_model::data::Scan>,
     ) {
-        self.scan_cache.entry(site.to_string()).or_default().insert(ts, scan);
+        self.scan_cache
+            .entry(site.to_string())
+            .or_default()
+            .insert(ts, scan);
     }
 
     /// Mark a site's timestamp as currently being downloaded.
     pub fn mark_in_flight(&mut self, site: &str, ts: chrono::NaiveDateTime) {
-        self.in_flight_set.entry(site.to_string()).or_default().insert(ts);
+        self.in_flight_set
+            .entry(site.to_string())
+            .or_default()
+            .insert(ts);
     }
 
     /// Remove a site's timestamp from the in-flight set (download completed or failed).
@@ -140,7 +150,9 @@ impl LoopDownloadManager {
 
     /// Whether all pending downloads for a pane have been dispatched.
     pub fn is_pane_done(&self, pane: usize) -> bool {
-        self.pending_downloads.get(&pane).is_none_or(|p| p.queue.is_empty())
+        self.pending_downloads
+            .get(&pane)
+            .is_none_or(|p| p.queue.is_empty())
     }
 
     /// Reset all loop download state. Used on site switch to avoid stale data.
@@ -162,8 +174,8 @@ impl LoopDownloadManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustdar_radar::archive::Identifier;
     use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
+    use rustdar_radar::archive::Identifier;
 
     fn ts(minute: u32) -> chrono::NaiveDateTime {
         chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
@@ -228,7 +240,10 @@ mod tests {
         mgr.cache_scan("KTLX", ts(0), scan());
 
         assert!(mgr.is_cached("KTLX", &ts(0)));
-        assert!(!mgr.is_cached("KOUN", &ts(0)), "KOUN has not downloaded this scan");
+        assert!(
+            !mgr.is_cached("KOUN", &ts(0)),
+            "KOUN has not downloaded this scan"
+        );
         assert!(!mgr.is_cached("KTLX", &ts(1)), "nor KTLX another timestamp");
         assert!(mgr.get_cached("KOUN", &ts(0)).is_none());
     }
@@ -248,7 +263,10 @@ mod tests {
         mgr.mark_in_flight("KOUN", ts(0));
         mgr.complete_download("KTLX", &ts(0));
         assert!(!mgr.is_in_flight("KTLX", &ts(0)));
-        assert!(mgr.is_in_flight("KOUN", &ts(0)), "KOUN is still downloading");
+        assert!(
+            mgr.is_in_flight("KOUN", &ts(0)),
+            "KOUN is still downloading"
+        );
     }
 
     /// Re-downloading the same site's timestamp replaces the entry, which is what
@@ -261,7 +279,10 @@ mod tests {
         mgr.cache_scan("KTLX", ts(0), Arc::clone(&first));
         mgr.cache_scan("KTLX", ts(0), Arc::clone(&second));
 
-        assert!(Arc::ptr_eq(mgr.get_cached("KTLX", &ts(0)).unwrap(), &second));
+        assert!(Arc::ptr_eq(
+            mgr.get_cached("KTLX", &ts(0)).unwrap(),
+            &second
+        ));
     }
 
     /// A site switch drops every site's cached data, not just the one switched away
@@ -279,14 +300,23 @@ mod tests {
         mgr.cache_scan("KTLX", ts(0), scan());
         mgr.cache_scan("KOUN", ts(0), scan());
         mgr.mark_in_flight("KTLX", ts(1));
-        mgr.insert_pending(0, PendingDownloads {
-            site: "KTLX".to_string(),
-            queue: [(ts(2), Identifier::new("KTLX20240101_000200_V06".to_string()))]
+        mgr.insert_pending(
+            0,
+            PendingDownloads {
+                site: "KTLX".to_string(),
+                queue: [(
+                    ts(2),
+                    Identifier::new("KTLX20240101_000200_V06".to_string()),
+                )]
                 .into_iter()
                 .collect(),
-        });
+            },
+        );
         mgr.add_spawned(2);
-        assert!(!mgr.is_pane_done(0), "precondition: pane 0 has a download queued");
+        assert!(
+            !mgr.is_pane_done(0),
+            "precondition: pane 0 has a download queued"
+        );
 
         mgr.clear_all();
 

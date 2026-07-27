@@ -189,7 +189,10 @@ pub async fn fetch_current_metars(
         log::info!("METAR: viewport overlaps no ASOS network");
         return Ok(Vec::new());
     }
-    log::info!("Fetching METARs for {} network(s): {states:?}", states.len());
+    log::info!(
+        "Fetching METARs for {} network(s): {states:?}",
+        states.len()
+    );
 
     let requests = states.iter().map(|state| {
         let url = sources.metar_state_url(state);
@@ -250,8 +253,12 @@ fn parse_currents(body: &str) -> Result<(Vec<MetarOb>, u32), String> {
     let mut observations = Vec::with_capacity(response.data.len());
 
     for record in &response.data {
-        let Some(lat) = rejects.number("lat", &record.lat) else { continue };
-        let Some(lon) = rejects.number("lon", &record.lon) else { continue };
+        let Some(lat) = rejects.number("lat", &record.lat) else {
+            continue;
+        };
+        let Some(lon) = rejects.number("lon", &record.lon) else {
+            continue;
+        };
         if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
             continue;
         }
@@ -343,7 +350,9 @@ fn icao_from_raw(raw: &str) -> Option<&str> {
     raw.split_whitespace()
         .find(|t| !matches!(*t, "METAR" | "SPECI"))
         .filter(|t| {
-            t.len() == 4 && t.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            t.len() == 4
+                && t.bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
         })
 }
 
@@ -354,15 +363,16 @@ fn visibility_from(miles: f64, raw: &str) -> Option<Visibility> {
     if !miles.is_finite() || miles < 0.0 {
         return None;
     }
-    Some(Visibility { miles, or_greater: raw_visibility_is_a_bound(raw) })
+    Some(Visibility {
+        miles,
+        or_greater: raw_visibility_is_a_bound(raw),
+    })
 }
 
 /// Three spellings mean "or more": US `10SM`, the `P` prefix (`P6SM`), ICAO `9999`.
 fn raw_visibility_is_a_bound(raw: &str) -> bool {
     raw.split_whitespace().any(|token| {
-        token == "10SM"
-            || token == "9999"
-            || (token.starts_with('P') && token.ends_with("SM"))
+        token == "10SM" || token == "9999" || (token.starts_with('P') && token.ends_with("SM"))
     })
 }
 
@@ -469,11 +479,7 @@ fn worse(a: FlightCategory, b: FlightCategory) -> FlightCategory {
 /// Prefers the raw METAR text: the numeric column reports `0` for both calm and
 /// variable, while a genuine northerly is `360`. The raw report distinguishes
 /// them outright — `00000KT` versus `VRBnnKT`.
-fn resolve_wind_dir(
-    raw_ob: &str,
-    csv_dir: Option<u16>,
-    csv_speed: Option<u16>,
-) -> Option<WindDir> {
+fn resolve_wind_dir(raw_ob: &str, csv_dir: Option<u16>, csv_speed: Option<u16>) -> Option<WindDir> {
     if let Some((dir, speed)) = raw_wind_group(raw_ob) {
         return Some(classify_wind(dir, speed));
     }
@@ -537,9 +543,7 @@ fn parse_wind_token(token: &str) -> Option<(Option<u16>, u16)> {
         }
     };
 
-    if !(2..=3).contains(&speed_digits.len())
-        || !speed_digits.bytes().all(|b| b.is_ascii_digit())
-    {
+    if !(2..=3).contains(&speed_digits.len()) || !speed_digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
 
@@ -611,7 +615,10 @@ mod tests {
     #[test]
     fn a_float_wind_speed_survives() {
         let okc = station("KOKC");
-        assert!(okc.raw_ob.contains("20014G20KT"), "fixture must keep the trap");
+        assert!(
+            okc.raw_ob.contains("20014G20KT"),
+            "fixture must keep the trap"
+        );
         assert_eq!(okc.wind_speed_kt, Some(14), "sknt 14.0 must round to 14");
         assert_eq!(okc.wind_gust_kt, Some(20));
         assert_eq!(okc.wind_dir, Some(WindDir::Degrees(200)));
@@ -631,7 +638,10 @@ mod tests {
              `rejected == 0` says nothing about how nulls are treated",
         );
         let null_gusts = SAMPLE.matches("\"gust\": null").count();
-        assert!(null_gusts >= 3, "expected several null gusts, got {null_gusts}");
+        assert!(
+            null_gusts >= 3,
+            "expected several null gusts, got {null_gusts}"
+        );
 
         let broken = SAMPLE.replace("\"sknt\": 14.0", "\"sknt\": \"14 kt\"");
         assert_ne!(broken, SAMPLE, "the replacement must actually apply");
@@ -640,7 +650,10 @@ mod tests {
         let okc = broken_obs.iter().find(|o| o.station_id == "KOKC").unwrap();
         assert_eq!(okc.wind_speed_kt, None);
         // The rest of the record survives — that is why the field is `Value`.
-        assert!(okc.temp_c.is_some(), "one bad cell must not drop the station");
+        assert!(
+            okc.temp_c.is_some(),
+            "one bad cell must not drop the station"
+        );
     }
 
     // ── Identity ──────────────────────────────────────────────────────────
@@ -664,10 +677,18 @@ mod tests {
     /// Fails if `10SM`/`9999`/`P6SM` collapse to a bare measured number.
     #[test]
     fn an_unrestricted_visibility_is_recovered_from_the_raw_report() {
-        assert!(raw_visibility_is_a_bound("KOKC 251652Z 20014G20KT 10SM FEW250"));
-        assert!(raw_visibility_is_a_bound("EGLL 251650Z 25008KT 9999 FEW035"));
-        assert!(raw_visibility_is_a_bound("KXYZ 251650Z 25008KT P6SM SCT035"));
-        assert!(!raw_visibility_is_a_bound("KUZA 251650Z 00000KT 2 1/2SM BR"));
+        assert!(raw_visibility_is_a_bound(
+            "KOKC 251652Z 20014G20KT 10SM FEW250"
+        ));
+        assert!(raw_visibility_is_a_bound(
+            "EGLL 251650Z 25008KT 9999 FEW035"
+        ));
+        assert!(raw_visibility_is_a_bound(
+            "KXYZ 251650Z 25008KT P6SM SCT035"
+        ));
+        assert!(!raw_visibility_is_a_bound(
+            "KUZA 251650Z 00000KT 2 1/2SM BR"
+        ));
         assert!(!raw_visibility_is_a_bound("KABC 251650Z 25008KT 5SM HZ"));
 
         let okc = station("KOKC");
@@ -696,17 +717,35 @@ mod tests {
     /// Fails if FEW/SCT count as a ceiling, which calls a clear day IFR.
     #[test]
     fn only_broken_or_worse_layers_form_a_ceiling() {
-        let few_only = vec![CloudLayer { cover: "FEW".into(), base_ft: Some(2500) }];
+        let few_only = vec![CloudLayer {
+            cover: "FEW".into(),
+            base_ft: Some(2500),
+        }];
         assert_eq!(ceiling_ft(&few_only), None, "FEW is not a ceiling");
 
-        let sct_only = vec![CloudLayer { cover: "SCT".into(), base_ft: Some(1800) }];
+        let sct_only = vec![CloudLayer {
+            cover: "SCT".into(),
+            base_ft: Some(1800),
+        }];
         assert_eq!(ceiling_ft(&sct_only), None, "SCT is not a ceiling");
 
         let mixed = vec![
-            CloudLayer { cover: "FEW".into(), base_ft: Some(800) },
-            CloudLayer { cover: "SCT".into(), base_ft: Some(1500) },
-            CloudLayer { cover: "BKN".into(), base_ft: Some(2500) },
-            CloudLayer { cover: "OVC".into(), base_ft: Some(4000) },
+            CloudLayer {
+                cover: "FEW".into(),
+                base_ft: Some(800),
+            },
+            CloudLayer {
+                cover: "SCT".into(),
+                base_ft: Some(1500),
+            },
+            CloudLayer {
+                cover: "BKN".into(),
+                base_ft: Some(2500),
+            },
+            CloudLayer {
+                cover: "OVC".into(),
+                base_ft: Some(4000),
+            },
         ];
         assert_eq!(
             ceiling_ft(&mixed),
@@ -714,7 +753,10 @@ mod tests {
             "the lowest BKN/OVC wins, and the lower FEW/SCT are ignored",
         );
 
-        let obscured = vec![CloudLayer { cover: "VV".into(), base_ft: Some(200) }];
+        let obscured = vec![CloudLayer {
+            cover: "VV".into(),
+            base_ft: Some(200),
+        }];
         assert_eq!(ceiling_ft(&obscured), Some(200), "VV is a ceiling");
     }
 
@@ -738,7 +780,13 @@ mod tests {
         assert_eq!(ceiling_only(3001), Some(FlightCategory::VFR));
 
         let vis_only = |m: f64| {
-            derive_flight_category(Some(Visibility { miles: m, or_greater: false }), None)
+            derive_flight_category(
+                Some(Visibility {
+                    miles: m,
+                    or_greater: false,
+                }),
+                None,
+            )
         };
         assert_eq!(vis_only(0.5), Some(FlightCategory::LIFR));
         assert_eq!(vis_only(1.0), Some(FlightCategory::IFR));
@@ -751,20 +799,29 @@ mod tests {
     /// Fails if the *better* of ceiling and visibility wins, or only one is read.
     #[test]
     fn the_worse_of_ceiling_and_visibility_decides_the_category() {
-        let vis10 = Some(Visibility { miles: 10.0, or_greater: true });
+        let vis10 = Some(Visibility {
+            miles: 10.0,
+            or_greater: true,
+        });
         assert_eq!(
             derive_flight_category(vis10, Some(300)),
             Some(FlightCategory::LIFR),
             "a 300 ft ceiling is LIFR regardless of visibility",
         );
-        let vis_half = Some(Visibility { miles: 0.5, or_greater: false });
+        let vis_half = Some(Visibility {
+            miles: 0.5,
+            or_greater: false,
+        });
         assert_eq!(
             derive_flight_category(vis_half, Some(25_000)),
             Some(FlightCategory::LIFR),
             "half a mile is LIFR regardless of ceiling",
         );
         // Mixed: MVFR ceiling, IFR visibility -> IFR.
-        let vis2 = Some(Visibility { miles: 2.0, or_greater: false });
+        let vis2 = Some(Visibility {
+            miles: 2.0,
+            or_greater: false,
+        });
         assert_eq!(
             derive_flight_category(vis2, Some(1500)),
             Some(FlightCategory::IFR),
@@ -780,8 +837,14 @@ mod tests {
 
     #[test]
     fn calm_and_variable_are_told_apart() {
-        assert_eq!(resolve_wind_dir("K1 251650Z 00000KT", None, None), Some(WindDir::Calm));
-        assert_eq!(resolve_wind_dir("K1 251650Z VRB03KT", None, None), Some(WindDir::Variable));
+        assert_eq!(
+            resolve_wind_dir("K1 251650Z 00000KT", None, None),
+            Some(WindDir::Calm)
+        );
+        assert_eq!(
+            resolve_wind_dir("K1 251650Z VRB03KT", None, None),
+            Some(WindDir::Variable)
+        );
         assert_eq!(
             resolve_wind_dir("K1 251650Z 36003KT", None, None),
             Some(WindDir::Degrees(360)),
@@ -802,7 +865,14 @@ mod tests {
         assert_eq!(parse_wind_token("20014G20KT"), Some((Some(200), 14)));
         assert_eq!(parse_wind_token("VRB03KT"), Some((None, 3)));
         assert_eq!(parse_wind_token("34002MPS"), Some((Some(340), 2)));
-        for bad in ["E00000KT", "R09/VRB07G21KT", "9999", "A2986", "18006", "VRBKT"] {
+        for bad in [
+            "E00000KT",
+            "R09/VRB07G21KT",
+            "9999",
+            "A2986",
+            "18006",
+            "VRBKT",
+        ] {
             assert_eq!(parse_wind_token(bad), None, "{bad:?} is not a wind group");
         }
     }
@@ -822,7 +892,11 @@ mod tests {
         for o in &obs {
             assert!(!o.station_id.is_empty());
             assert!(!o.raw_ob.is_empty(), "{} lost its raw report", o.station_id);
-            assert!(!o.obs_time.is_empty(), "{} lost its timestamp", o.station_id);
+            assert!(
+                !o.obs_time.is_empty(),
+                "{} lost its timestamp",
+                o.station_id
+            );
             assert!((-90.0..=90.0).contains(&o.lat));
             assert!((-180.0..=180.0).contains(&o.lon));
         }
@@ -847,7 +921,12 @@ mod tests {
             .expect("client");
         let sources = rustdar_radar::sources::DataSources::production();
         // Central Oklahoma — KTLX's neighbourhood.
-        let view = GeoBounds { min_lat: 34.3, max_lat: 36.3, min_lon: -98.3, max_lon: -96.3 };
+        let view = GeoBounds {
+            min_lat: 34.3,
+            max_lat: 36.3,
+            min_lon: -98.3,
+            max_lon: -96.3,
+        };
 
         let obs = fetch_current_metars(&client, &sources, &view)
             .await

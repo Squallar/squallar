@@ -6,11 +6,19 @@ use crate::ui_layout::{LayoutCtx, WidthClass};
 /// narrow window on a desktop wants the tighter type just as much as a phone
 /// does, and a tablet does not.
 fn heading_size(layout: &LayoutCtx) -> f32 {
-    if layout.width == WidthClass::Compact { 13.0 } else { 14.0 }
+    if layout.width == WidthClass::Compact {
+        13.0
+    } else {
+        14.0
+    }
 }
 
 fn monospace_size(layout: &LayoutCtx) -> f32 {
-    if layout.width == WidthClass::Compact { 11.0 } else { 12.0 }
+    if layout.width == WidthClass::Compact {
+        11.0
+    } else {
+        12.0
+    }
 }
 
 /// Show a centered detail popup window sized for the current layout.
@@ -78,15 +86,21 @@ fn render_popup_sections(
                 ui.label(rt);
             }
             PopupSection::KeyValueGrid(rows) => {
-                egui::Grid::new("popup_kv_grid").num_columns(2).show(ui, |ui| {
-                    for (key, value) in rows {
-                        ui.label(egui::RichText::new(format!("{}:", key)).strong());
-                        ui.add(egui::Label::new(value).wrap());
-                        ui.end_row();
-                    }
-                });
+                egui::Grid::new("popup_kv_grid")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        for (key, value) in rows {
+                            ui.label(egui::RichText::new(format!("{}:", key)).strong());
+                            ui.add(egui::Label::new(value).wrap());
+                            ui.end_row();
+                        }
+                    });
             }
-            PopupSection::ScrollableText { text, monospace, max_height } => {
+            PopupSection::ScrollableText {
+                text,
+                monospace,
+                max_height,
+            } => {
                 egui::ScrollArea::vertical()
                     .max_height(*max_height)
                     .show(ui, |ui| {
@@ -176,8 +190,11 @@ impl super::Gui {
                     self.overlays.selected_overlays.remove(page);
                     if self.overlays.selected_overlays.is_empty() {
                         self.overlays.selected_overlay_page = 0;
-                    } else if self.overlays.selected_overlay_page >= self.overlays.selected_overlays.len() {
-                        self.overlays.selected_overlay_page = self.overlays.selected_overlays.len() - 1;
+                    } else if self.overlays.selected_overlay_page
+                        >= self.overlays.selected_overlays.len()
+                    {
+                        self.overlays.selected_overlay_page =
+                            self.overlays.selected_overlays.len() - 1;
                     }
                 }
             }
@@ -193,11 +210,17 @@ impl super::Gui {
 /// Render prev/next pager navigation controls.
 fn render_pager_nav(ui: &mut egui::Ui, page: usize, count: usize, current_page: &mut usize) {
     ui.horizontal(|ui| {
-        if ui.add_enabled(page > 0, egui::Button::new("\u{25c0}")).clicked() {
+        if ui
+            .add_enabled(page > 0, egui::Button::new("\u{25c0}"))
+            .clicked()
+        {
             *current_page = page.saturating_sub(1);
         }
         ui.label(format!("{} / {}", page + 1, count));
-        if ui.add_enabled(page + 1 < count, egui::Button::new("\u{25b6}")).clicked() {
+        if ui
+            .add_enabled(page + 1 < count, egui::Button::new("\u{25b6}"))
+            .clicked()
+        {
             *current_page = page + 1;
         }
     });

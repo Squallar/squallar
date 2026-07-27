@@ -46,10 +46,23 @@ pub async fn fetch_storm_reports(
     log::info!("Fetching SPC storm reports");
 
     let (torn, hail, wind) = futures::future::join3(
-        fetch_csv(client, &report_url(sources, StormReportKind::Tornado), StormReportKind::Tornado),
-        fetch_csv(client, &report_url(sources, StormReportKind::Hail), StormReportKind::Hail),
-        fetch_csv(client, &report_url(sources, StormReportKind::Wind), StormReportKind::Wind),
-    ).await;
+        fetch_csv(
+            client,
+            &report_url(sources, StormReportKind::Tornado),
+            StormReportKind::Tornado,
+        ),
+        fetch_csv(
+            client,
+            &report_url(sources, StormReportKind::Hail),
+            StormReportKind::Hail,
+        ),
+        fetch_csv(
+            client,
+            &report_url(sources, StormReportKind::Wind),
+            StormReportKind::Wind,
+        ),
+    )
+    .await;
 
     let mut reports = Vec::new();
     match torn {

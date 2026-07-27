@@ -148,7 +148,11 @@ impl ProductDescriptionBlock {
         let hw1 = self.thresholds[1];
         let bits = ((hw0 as u32) << 16) | (hw1 as u32);
         let val = f32::from_bits(bits);
-        if val.is_normal() && val > 0.0 { val } else { 1.0 }
+        if val.is_normal() && val > 0.0 {
+            val
+        } else {
+            1.0
+        }
     }
 
     /// Offset from thresholds 2–3. Same IEEE-float caveat as
@@ -164,7 +168,11 @@ impl ProductDescriptionBlock {
         let bits = ((hw2 as u32) << 16) | (hw3 as u32);
         let val = f32::from_bits(bits);
         // Exact zero is a legitimate offset; subnormal/inf/nan are not.
-        if val.is_normal() || val == 0.0 { val } else { 0.0 }
+        if val.is_normal() || val == 0.0 {
+            val
+        } else {
+            0.0
+        }
     }
 
     /// Elevation-based products put the angle in halfword 30
@@ -260,7 +268,22 @@ mod tests {
     /// Halfwords 31–46 of a real `MPX_N1G` (product 154) and `TLX_N2U`
     /// (product 99): min -63.5, increment 0.5, 254 levels, rest zero.
     const VELOCITY_THRESHOLDS: [u16; 16] = [
-        -635i16 as u16, 5, 254, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        -635i16 as u16,
+        5,
+        254,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
     ];
 
     /// Halfwords 47–53 of a real `MPX_N0S`: max neg/pos velocity, the SCIT
@@ -286,7 +309,11 @@ mod tests {
             assert_eq!(offset, 129.0, "product {code} minimum is -63.5 m/s");
             assert_eq!(physical(2), -63.5, "product {code} gate 2 is the minimum");
             assert_eq!(physical(129), 0.0, "product {code} gate 129 is 0 m/s");
-            assert_eq!(physical(255), 63.0, "product {code} gate 255 is the maximum");
+            assert_eq!(
+                physical(255),
+                63.0,
+                "product {code} gate 255 is the maximum"
+            );
             assert_eq!(p.data_levels(), Some(254));
         }
     }
@@ -329,7 +356,11 @@ mod tests {
         // IEEE path give neither 2.0 nor 129.0, so widening the product list to
         // 94 — or narrowing it away from 99 — changes an answer here.
         let misread = pdb(94, VELOCITY_THRESHOLDS, VELOCITY_PS47_53);
-        assert_eq!(misread.data_scale(), 1.0, "0xFD850005 is not a positive normal float");
+        assert_eq!(
+            misread.data_scale(),
+            1.0,
+            "0xFD850005 is not a positive normal float"
+        );
         assert_ne!(misread.data_offset(), 129.0);
     }
 
@@ -382,7 +413,10 @@ mod tests {
     #[test]
     fn only_the_storm_relative_products_report_a_vector() {
         for code in [55, 56] {
-            assert!(pdb(code, [0; 16], SRM_PS47_53).storm_motion().is_some(), "{code}");
+            assert!(
+                pdb(code, [0; 16], SRM_PS47_53).storm_motion().is_some(),
+                "{code}"
+            );
         }
         for code in [94, 99, 134, 135, 153, 154, 163, 176, 177] {
             let p = pdb(code, VELOCITY_THRESHOLDS, VELOCITY_PS47_53);
@@ -398,11 +432,24 @@ mod tests {
     /// points at the direction the storm comes from.
     #[test]
     fn the_radial_component_peaks_along_the_motion_direction() {
-        let m = StormMotion { speed_kt: 30.0, direction_deg: 90.0, is_scit_average: true };
-        assert!((m.radial_component_kt(90.0) - 30.0).abs() < 1e-9, "toward 090");
-        assert!((m.radial_component_kt(270.0) + 30.0).abs() < 1e-9, "away at 270");
+        let m = StormMotion {
+            speed_kt: 30.0,
+            direction_deg: 90.0,
+            is_scit_average: true,
+        };
+        assert!(
+            (m.radial_component_kt(90.0) - 30.0).abs() < 1e-9,
+            "toward 090"
+        );
+        assert!(
+            (m.radial_component_kt(270.0) + 30.0).abs() < 1e-9,
+            "away at 270"
+        );
         assert!(m.radial_component_kt(0.0).abs() < 1e-9, "orthogonal at 000");
-        assert!(m.radial_component_kt(180.0).abs() < 1e-9, "orthogonal at 180");
+        assert!(
+            m.radial_component_kt(180.0).abs() < 1e-9,
+            "orthogonal at 180"
+        );
         // 60° off the motion direction is half the speed, so a sign flip or a
         // swapped subtraction cannot pass by symmetry alone.
         assert!((m.radial_component_kt(30.0) - 15.0).abs() < 1e-9);
@@ -413,7 +460,11 @@ mod tests {
     /// Wrapping past 360° must not change the answer.
     #[test]
     fn the_radial_component_is_periodic_in_azimuth() {
-        let m = StormMotion { speed_kt: 25.7, direction_deg: 296.1, is_scit_average: true };
+        let m = StormMotion {
+            speed_kt: 25.7,
+            direction_deg: 296.1,
+            is_scit_average: true,
+        };
         for az in [0.0, 17.0, 183.5, 359.0] {
             let a = m.radial_component_kt(az);
             let b = m.radial_component_kt(az + 360.0);
@@ -427,7 +478,10 @@ mod tests {
     #[test]
     fn only_the_quarter_kilometre_velocity_products_override_the_gate_spacing() {
         for code in [99, 154] {
-            assert_eq!(pdb(code, VELOCITY_THRESHOLDS, VELOCITY_PS47_53).range_gate_km(), Some(0.25));
+            assert_eq!(
+                pdb(code, VELOCITY_THRESHOLDS, VELOCITY_PS47_53).range_gate_km(),
+                Some(0.25)
+            );
         }
         for code in [56, 94, 134, 135, 163, 176, 177] {
             assert_eq!(

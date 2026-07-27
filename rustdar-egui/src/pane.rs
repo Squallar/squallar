@@ -1,9 +1,9 @@
-use std::collections::HashMap;
-use rustdar_overlays::render::overlay_state::OverlayKind;
 use crate::overlay_cache::OverlayTextureCache;
+use chrono::NaiveDateTime;
+use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::sites::RadarSite;
 use rustdar_radar::types::{RadarProduct, ScanInfo};
-use chrono::NaiveDateTime;
+use std::collections::HashMap;
 use std::sync::Arc;
 use walkers::MapMemory;
 
@@ -85,7 +85,11 @@ pub struct RenderTarget {
 
 impl RenderTarget {
     pub fn new(site: impl Into<String>, product: RadarProduct, elevation: f32) -> Self {
-        Self { site: site.into(), product, elevation }
+        Self {
+            site: site.into(),
+            product,
+            elevation,
+        }
     }
 
     /// Whether this target names the same image as `site`/`product`/`elevation`.
@@ -312,7 +316,10 @@ impl LoopPlaybackState {
 
     /// True if enough frames have rendered for playback to be enabled.
     pub fn is_render_ready(&self) -> bool {
-        matches!(self.phase, LoopPhase::Ready | LoopPhase::Playing | LoopPhase::Paused)
+        matches!(
+            self.phase,
+            LoopPhase::Ready | LoopPhase::Playing | LoopPhase::Paused
+        )
     }
 
     /// True during the initial scan list fetch.
@@ -327,7 +334,9 @@ impl LoopPlaybackState {
 
     /// True if the frames' render state is keyed to exactly this target.
     pub fn is_rendered_for(&self, target: &RenderTarget) -> bool {
-        self.rendered_for.as_ref().is_some_and(|t| t.matches(target))
+        self.rendered_for
+            .as_ref()
+            .is_some_and(|t| t.matches(target))
     }
 
     /// The index of the frame a finished render for `timestamp`, produced for
@@ -624,7 +633,8 @@ impl PaneState {
 
     /// The currently active radar image (from loop frame or static render).
     pub fn active_image(&self) -> Option<&RadarImageData> {
-        self.loop_state.frames
+        self.loop_state
+            .frames
             .get(self.loop_state.current_frame)
             .and_then(|f| f.texture.as_ref())
     }
@@ -668,7 +678,6 @@ impl PaneState {
                 .map(|elev_angle| (self.selected_product, elev_angle))
         })
     }
-
 }
 
 impl Default for PaneState {
@@ -792,7 +801,10 @@ impl PaneLayout {
         };
         let num_rows = grid.len();
         let row_ratios = vec![1.0 / num_rows as f32; num_rows];
-        let col_ratios = grid.iter().map(|&cols| vec![1.0 / cols as f32; cols]).collect();
+        let col_ratios = grid
+            .iter()
+            .map(|&cols| vec![1.0 / cols as f32; cols])
+            .collect();
         Self {
             pane_count: count,
             grid,
@@ -845,7 +857,15 @@ impl PaneLayout {
                 egui::pos2(total_rect.right(), y + DIVIDER_HALF_WIDTH),
             );
             let id = egui::Id::new(("h_div", row_idx));
-            drag_divider(ui, divider_rect, id, &mut self.row_ratios, row_idx, total_rect.height(), true);
+            drag_divider(
+                ui,
+                divider_rect,
+                id,
+                &mut self.row_ratios,
+                row_idx,
+                total_rect.height(),
+                true,
+            );
         }
 
         // Vertical dividers (between columns in each row)
@@ -860,7 +880,15 @@ impl PaneLayout {
                     egui::pos2(col_x + DIVIDER_HALF_WIDTH, row_y + row_height),
                 );
                 let id = egui::Id::new(("v_div", row_idx, col_idx));
-                drag_divider(ui, divider_rect, id, &mut self.col_ratios[row_idx], col_idx, total_rect.width(), false);
+                drag_divider(
+                    ui,
+                    divider_rect,
+                    id,
+                    &mut self.col_ratios[row_idx],
+                    col_idx,
+                    total_rect.width(),
+                    false,
+                );
             }
             row_y += row_height;
         }
@@ -880,7 +908,11 @@ fn drag_divider(
 ) {
     let response = ui.interact(rect, id, egui::Sense::drag());
     if response.dragged() {
-        let delta = if use_y_axis { response.drag_delta().y } else { response.drag_delta().x };
+        let delta = if use_y_axis {
+            response.drag_delta().y
+        } else {
+            response.drag_delta().x
+        };
         let ratio_delta = delta / total_extent;
         let new_a = ratios[idx] + ratio_delta;
         let new_b = ratios[idx + 1] - ratio_delta;
@@ -914,7 +946,12 @@ mod tests {
     #[test]
     fn color_scale_orientation_follows_the_panel_shape() {
         // Every landscape desktop/laptop aspect, and a landscape phone.
-        for (w, h) in [(1920.0, 1080.0), (1920.0, 1200.0), (1280.0, 1024.0), (2340.0, 1080.0)] {
+        for (w, h) in [
+            (1920.0, 1080.0),
+            (1920.0, 1200.0),
+            (1280.0, 1024.0),
+            (2340.0, 1080.0),
+        ] {
             assert!(
                 !ColorScaleOrientation::default().resolve(panel(w, h)),
                 "{w}x{h} is landscape: the bar belongs on the right edge"
@@ -938,9 +975,18 @@ mod tests {
         // the ratio a 16:10 laptop's two-pane split used to sit at).
         let mut from_landscape = ColorScaleOrientation::default();
         assert!(!from_landscape.resolve(panel(1920.0, 1080.0)));
-        assert!(!from_landscape.resolve(panel(960.0, 1200.0)), "1.25 is inside the band");
-        assert!(!from_landscape.resolve(panel(1000.0, 1200.0)), "1.20, exactly the old threshold");
-        assert!(!from_landscape.resolve(panel(1000.0, 1100.0)), "1.10, still inside");
+        assert!(
+            !from_landscape.resolve(panel(960.0, 1200.0)),
+            "1.25 is inside the band"
+        );
+        assert!(
+            !from_landscape.resolve(panel(1000.0, 1200.0)),
+            "1.20, exactly the old threshold"
+        );
+        assert!(
+            !from_landscape.resolve(panel(1000.0, 1100.0)),
+            "1.10, still inside"
+        );
 
         // Seeded portrait, walked through the identical ratios: it keeps the
         // *other* answer. Same input, different history — that is hysteresis.
@@ -951,8 +997,14 @@ mod tests {
         assert!(from_portrait.resolve(panel(1000.0, 1100.0)));
 
         // Only leaving the band flips it, in either direction.
-        assert!(from_landscape.resolve(panel(1000.0, 1400.0)), "1.40 is clearly portrait");
-        assert!(!from_portrait.resolve(panel(1000.0, 1000.0)), "1.00 is clearly not portrait");
+        assert!(
+            from_landscape.resolve(panel(1000.0, 1400.0)),
+            "1.40 is clearly portrait"
+        );
+        assert!(
+            !from_portrait.resolve(panel(1000.0, 1000.0)),
+            "1.00 is clearly not portrait"
+        );
 
         // …and the flip is *recorded*, not just returned. If the memory froze
         // at the seed, the band would be one-sided: the same in-band ratio
@@ -1009,7 +1061,10 @@ mod tests {
                 orientation.resolve(degenerate),
                 "a degenerate panel must report the remembered orientation"
             );
-            assert!(orientation.resolve(panel(960.0, 1200.0)), "and not have disturbed it");
+            assert!(
+                orientation.resolve(panel(960.0, 1200.0)),
+                "and not have disturbed it"
+            );
         }
     }
 
@@ -1038,7 +1093,12 @@ mod tests {
 
     /// A site value with the code and coordinates agreeing, as the real table has it.
     fn site(name: &'static str, lat: f64, lon: f64) -> RadarSite {
-        RadarSite { name, lat, lon, elev: None }
+        RadarSite {
+            name,
+            lat,
+            lon,
+            elev: None,
+        }
     }
 
     fn loop_with_frames(count: usize, current_frame: usize) -> LoopPlaybackState {
@@ -1075,7 +1135,10 @@ mod tests {
     /// that is not *about* the sweep needs this, since a disagreeing pair refuses the
     /// frame before anything else is looked at.
     fn same_sweep() -> BroadcastSweep {
-        BroadcastSweep { rendered: 0.48, own: Some(0.48) }
+        BroadcastSweep {
+            rendered: 0.48,
+            own: Some(0.48),
+        }
     }
 
     #[test]
@@ -1445,9 +1508,15 @@ mod tests {
         let current = target(SITE, RadarProduct::Reflectivity, 0.5);
         let frame_ts = state.frames[0].timestamp;
 
-        assert_eq!(state.frame_accepting_broadcast(frame_ts, &current, same_sweep()), Some(0));
+        assert_eq!(
+            state.frame_accepting_broadcast(frame_ts, &current, same_sweep()),
+            Some(0)
+        );
         state.frames[0].texture = Some(dummy_texture(&ctx));
-        assert_eq!(state.frame_accepting_broadcast(frame_ts, &current, same_sweep()), None);
+        assert_eq!(
+            state.frame_accepting_broadcast(frame_ts, &current, same_sweep()),
+            None
+        );
     }
 
     /// The coupled defect. The dispatcher suppresses a duplicate render only when the
@@ -1464,13 +1533,19 @@ mod tests {
         let frame_ts = state.frames[0].timestamp;
 
         // Same site, same product, same *selection* — the target matches exactly.
-        assert!(state.is_rendered_for(&current), "precondition: a target-only test accepts");
+        assert!(
+            state.is_rendered_for(&current),
+            "precondition: a target-only test accepts"
+        );
 
         assert_eq!(
             state.frame_accepting_broadcast(
                 frame_ts,
                 &current,
-                BroadcastSweep { rendered: 1.4, own: Some(0.48) },
+                BroadcastSweep {
+                    rendered: 1.4,
+                    own: Some(0.48)
+                },
             ),
             None,
             "an image of the 1.4° sweep must not fill a frame whose scan snaps to 0.48°"
@@ -1479,7 +1554,10 @@ mod tests {
             state.frame_accepting_broadcast(
                 frame_ts,
                 &current,
-                BroadcastSweep { rendered: 0.48, own: Some(0.48) },
+                BroadcastSweep {
+                    rendered: 0.48,
+                    own: Some(0.48)
+                },
             ),
             Some(0),
             "the same sweep is still handed over — the point of the broadcast"
@@ -1490,7 +1568,10 @@ mod tests {
             state.frame_accepting_broadcast(
                 frame_ts,
                 &current,
-                BroadcastSweep { rendered: 0.48, own: Some(0.485) },
+                BroadcastSweep {
+                    rendered: 0.48,
+                    own: Some(0.485)
+                },
             ),
             Some(0),
             "jitter below the tolerance is the same sweep"
@@ -1511,7 +1592,10 @@ mod tests {
             state.frame_accepting_broadcast(
                 frame_ts,
                 &current,
-                BroadcastSweep { rendered: 0.48, own: None },
+                BroadcastSweep {
+                    rendered: 0.48,
+                    own: None
+                },
             ),
             None
         );
@@ -1531,7 +1615,10 @@ mod tests {
                 .frame_accepting_broadcast_mut(
                     frame_ts,
                     &current,
-                    BroadcastSweep { rendered: 1.4, own: Some(0.48) },
+                    BroadcastSweep {
+                        rendered: 1.4,
+                        own: Some(0.48)
+                    },
                 )
                 .is_none(),
             "no frame is handed back for an image of the wrong sweep"
@@ -1557,13 +1644,20 @@ mod tests {
         let textured_ts = state.frames[1].timestamp;
 
         // Precondition: everything is accepted while the loop is active.
-        assert!(state.frame_awaiting_render_result(frame_ts, &current).is_some());
+        assert!(
+            state
+                .frame_awaiting_render_result(frame_ts, &current)
+                .is_some()
+        );
         assert!(state.frame_donatable_to(textured_ts, &current).is_some());
 
         state.phase = LoopPhase::Inactive;
 
         assert_eq!(state.frame_awaiting_render_result(frame_ts, &current), None);
-        assert_eq!(state.frame_accepting_broadcast(frame_ts, &current, same_sweep()), None);
+        assert_eq!(
+            state.frame_accepting_broadcast(frame_ts, &current, same_sweep()),
+            None
+        );
         assert_eq!(state.frame_donatable_to(textured_ts, &current), None);
     }
 
@@ -1612,13 +1706,19 @@ mod tests {
             Some(0),
             "precondition: a timestamp-only lookup lands on the textured frame"
         );
-        assert_eq!(state.frame_accepting_broadcast(shared, &current, same_sweep()), Some(2));
+        assert_eq!(
+            state.frame_accepting_broadcast(shared, &current, same_sweep()),
+            Some(2)
+        );
 
         let frame = state
             .frame_accepting_broadcast_mut(shared, &current, same_sweep())
             .expect("frame handed back");
         frame.texture = Some(dummy_texture(&ctx));
-        assert!(state.frames[2].texture.is_some(), "frame 2 received the texture");
+        assert!(
+            state.frames[2].texture.is_some(),
+            "frame 2 received the texture"
+        );
         assert_eq!(
             state.frame_accepting_broadcast(shared, &current, same_sweep()),
             None,
@@ -1688,7 +1788,10 @@ mod tests {
             .collect();
         assert_eq!(
             textured,
-            state.render_set_indices(3).into_iter().collect::<HashSet<_>>()
+            state
+                .render_set_indices(3)
+                .into_iter()
+                .collect::<HashSet<_>>()
         );
         assert!(state.render_set_settled(3, all_scans_available));
     }
@@ -1717,7 +1820,8 @@ mod tests {
             "precondition: an in-flight-only guard would accept the stale result here"
         );
         assert_eq!(
-            state.frame_awaiting_render_result(frame_ts, &target(SITE, RadarProduct::Velocity, 0.5)),
+            state
+                .frame_awaiting_render_result(frame_ts, &target(SITE, RadarProduct::Velocity, 0.5)),
             None,
             "a result for the abandoned target must be rejected"
         );

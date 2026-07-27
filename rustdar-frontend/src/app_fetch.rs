@@ -1,13 +1,13 @@
-use chrono::NaiveDateTime;
-use chrono::TimeZone;
-use std::sync::atomic::Ordering;
-use winit::event_loop::ActiveEventLoop;
-use rustdar_egui::actions::GuiAction;
-use crate::channels::{ScanResponse, ScanData, Level3Response, OverlayRenderResponse};
-use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
+use crate::channels::{Level3Response, OverlayRenderResponse, ScanData, ScanResponse};
 use crate::constants::MAX_CONCURRENT_RENDERS;
 use crate::render_dispatch::RenderGuard;
+use chrono::NaiveDateTime;
+use chrono::TimeZone;
+use rustdar_egui::actions::GuiAction;
+use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
 use rustdar_radar::types::{IMAGE_SIZE, RadarProduct};
+use std::sync::atomic::Ordering;
+use winit::event_loop::ActiveEventLoop;
 
 /// Parameters for a background overlay rasterization request.
 pub(super) struct OverlayRenderRequest {
@@ -51,7 +51,6 @@ pub trait MaybeSend {}
 impl<T: ?Sized> MaybeSend for T {}
 
 impl super::App {
-
     /// Spawn a detached future on whatever executor this target provides.
     ///
     /// Two bodies because the executors genuinely differ — native has a
@@ -91,7 +90,11 @@ impl super::App {
             let msg = match scan::get_scan(&site, timestamp).await {
                 Ok(data) => {
                     log::info!("Fetched scan: {} @ {}", site, timestamp);
-                    Ok(ScanData { scan: data, site: site.clone(), timestamp })
+                    Ok(ScanData {
+                        scan: data,
+                        site: site.clone(),
+                        timestamp,
+                    })
                 }
                 Err(e) => {
                     let err = format!("Failed to fetch radar scan: {:?}", e);
@@ -99,7 +102,12 @@ impl super::App {
                     Err(err)
                 }
             };
-            ScanResponse { generation, site, result: msg, is_auto_poll: false }
+            ScanResponse {
+                generation,
+                site,
+                result: msg,
+                is_auto_poll: false,
+            }
         });
     }
 
@@ -107,9 +115,16 @@ impl super::App {
     /// Called after a Level II scan loads so the products are available
     /// alongside the base moments.
     pub(super) fn spawn_level3_fetches(&self, site: &str) {
-        let generation = self.render.fetch_generations.get(site).copied().unwrap_or(0);
+        let generation = self
+            .render
+            .fetch_generations
+            .get(site)
+            .copied()
+            .unwrap_or(0);
         for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
-            let Some(codes) = l3_product.level3_products() else { continue };
+            let Some(codes) = l3_product.level3_products() else {
+                continue;
+            };
             for &code in codes {
                 let site = site.to_string();
                 let code_str = code.to_string();
@@ -126,7 +141,13 @@ impl super::App {
                             Err(format!("{e}"))
                         }
                     };
-                    Level3Response { generation, product, tilt_code: code_str, site, result }
+                    Level3Response {
+                        generation,
+                        product,
+                        tilt_code: code_str,
+                        site,
+                        result,
+                    }
                 });
             }
         }
@@ -140,7 +161,11 @@ impl super::App {
         local_dt.with_timezone(&chrono::Utc).naive_utc()
     }
 
-    pub(super) fn handle_gui_action(&mut self, action: GuiAction, event_loop: Option<&ActiveEventLoop>) {
+    pub(super) fn handle_gui_action(
+        &mut self,
+        action: GuiAction,
+        event_loop: Option<&ActiveEventLoop>,
+    ) {
         match action {
             GuiAction::FetchRadarScan(_)
             | GuiAction::CheckForNewScans(_)
@@ -148,13 +173,17 @@ impl super::App {
             GuiAction::Exit => {
                 self.request_exit(event_loop);
             }
-            GuiAction::FetchOverlay { .. }
-            | GuiAction::RefreshOverlay { .. } => self.handle_overlay_action(action),
+            GuiAction::FetchOverlay { .. } | GuiAction::RefreshOverlay { .. } => {
+                self.handle_overlay_action(action)
+            }
             GuiAction::RenderOverlay { .. } => {
                 // Handled in process_gui_actions() with deduplication
                 unreachable!("RenderOverlay should be intercepted by process_gui_actions");
             }
-            GuiAction::EnableLoop { pane_idx, lookback_secs } => {
+            GuiAction::EnableLoop {
+                pane_idx,
+                lookback_secs,
+            } => {
                 self.handle_enable_loop(pane_idx, lookback_secs);
             }
             GuiAction::DisableLoop { pane_idx } => {
@@ -167,7 +196,8 @@ impl super::App {
                         rustdar_egui::pane::LoopPhase::Playing => {
                             ls.phase = rustdar_egui::pane::LoopPhase::Paused;
                         }
-                        rustdar_egui::pane::LoopPhase::Ready | rustdar_egui::pane::LoopPhase::Paused => {
+                        rustdar_egui::pane::LoopPhase::Ready
+                        | rustdar_egui::pane::LoopPhase::Paused => {
                             ls.phase = rustdar_egui::pane::LoopPhase::Playing;
                             ls.last_advance = Some(web_time::Instant::now());
                         }
@@ -189,7 +219,10 @@ impl super::App {
                     }
                 }
             }
-            GuiAction::SeekLoopFrame { pane_idx, frame_index } => {
+            GuiAction::SeekLoopFrame {
+                pane_idx,
+                frame_index,
+            } => {
                 if let Some(pane) = self.gui.pane_mut(pane_idx) {
                     let ls = &mut pane.loop_state;
                     if frame_index < ls.frames.len() {
@@ -197,7 +230,10 @@ impl super::App {
                     }
                 }
             }
-            GuiAction::NavigateTime { pane_idx, step_secs } => {
+            GuiAction::NavigateTime {
+                pane_idx,
+                step_secs,
+            } => {
                 self.handle_navigate_time(pane_idx, step_secs);
             }
             GuiAction::NavigateOneScan { pane_idx, forward } => {
@@ -244,12 +280,22 @@ impl super::App {
 
                 // Not using spawn_async_task: conditional send (only on new data)
                 self.spawn_detached(async move {
-                    match scan::check_and_fetch_latest(&site, &utc_timestamp.date(), current_scan_timestamp).await {
+                    match scan::check_and_fetch_latest(
+                        &site,
+                        &utc_timestamp.date(),
+                        current_scan_timestamp,
+                    )
+                    .await
+                    {
                         Ok(Some((data, timestamp))) => {
                             let _ = sender.send(crate::channels::ScanResponse {
                                 generation,
                                 site: site.clone(),
-                                result: Ok(crate::channels::ScanData { scan: data, site, timestamp }),
+                                result: Ok(crate::channels::ScanData {
+                                    scan: data,
+                                    site,
+                                    timestamp,
+                                }),
                                 is_auto_poll: true,
                             });
                         }
@@ -263,7 +309,7 @@ impl super::App {
             }
             GuiAction::SwitchRadarSite { site, pane_idx } => {
                 log::info!("Switch radar site requested: pane {} -> {}", pane_idx, site);
-                
+
                 let mut new_config = self.gui.get_radar_config().clone();
                 new_config.site = site.clone();
                 self.gui.set_radar_config(new_config.clone());
@@ -274,7 +320,8 @@ impl super::App {
                         if let Some(pane) = self.gui.pane_mut(idx) {
                             pane.loading_site = Some(site.clone());
                             pane.site = site.clone();
-                            pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
+                            pane.radar_sites_render_gen =
+                                pane.radar_sites_render_gen.wrapping_add(1);
                             pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new();
                         }
                     }
@@ -288,7 +335,7 @@ impl super::App {
                     }
                 }
                 self.loop_mgr.clear_all();
-                
+
                 let utc_timestamp = Self::local_to_utc(new_config.timestamp);
                 self.spawn_fetch(site, utc_timestamp);
             }
@@ -299,7 +346,8 @@ impl super::App {
     /// Handle overlay fetch/refresh actions for all overlay kinds.
     fn handle_overlay_action(&mut self, action: GuiAction) {
         match action {
-            GuiAction::FetchOverlay { kind, pane_idx } | GuiAction::RefreshOverlay { kind, pane_idx } => {
+            GuiAction::FetchOverlay { kind, pane_idx }
+            | GuiAction::RefreshOverlay { kind, pane_idx } => {
                 self.fetch_overlay(kind, pane_idx);
             }
             _ => unreachable!(),
@@ -312,7 +360,9 @@ impl super::App {
 
         // Load the requesting pane's config so create_fetch_tasks reads the
         // correct per-pane settings (e.g. selected model parameter, SPC day).
-        let pane_configs = self.gui.pane(pane_idx)
+        let pane_configs = self
+            .gui
+            .pane(pane_idx)
             .map(|p| p.overlay_configs.clone())
             .unwrap_or_default();
         if !pane_configs.is_empty() {
@@ -331,14 +381,21 @@ impl super::App {
             return;
         }
 
-        log::info!("Fetching overlay data for {:?} ({} task(s))", kind, tasks.len());
+        log::info!(
+            "Fetching overlay data for {:?} ({} task(s))",
+            kind,
+            tasks.len()
+        );
         self.gui.overlays.set_fetching(kind, true);
 
         for task in tasks {
             let task_kind = task.kind;
             self.spawn_async_task(self.channels.overlay_fetch_sender.clone(), async move {
                 let data = task.future.await;
-                OverlayFetchResult { kind: task_kind, data }
+                OverlayFetchResult {
+                    kind: task_kind,
+                    data,
+                }
             });
         }
     }
@@ -350,18 +407,28 @@ impl super::App {
         kind: OverlayKind,
         req: OverlayRenderRequest,
     ) {
-        use rustdar_overlays::render::rasterize;
         use rustdar_egui::overlay_cache::ZOOM_QUANTIZATION_FACTOR;
+        use rustdar_overlays::render::rasterize;
 
-        let OverlayRenderRequest { geo_bounds, texture, data_generation, zoom } = req;
+        let OverlayRenderRequest {
+            geo_bounds,
+            texture,
+            data_generation,
+            zoom,
+        } = req;
         let (width, height) = (texture.width, texture.height);
 
         if width == 0 || height == 0 {
             return;
         }
 
-        if self.gui.overlays.render_mode(kind) != Some(rustdar_overlays::render::overlay_state::RenderMode::Texture) {
-            log::warn!("spawn_overlay_render called with non-texture kind: {:?}", kind);
+        if self.gui.overlays.render_mode(kind)
+            != Some(rustdar_overlays::render::overlay_state::RenderMode::Texture)
+        {
+            log::warn!(
+                "spawn_overlay_render called with non-texture kind: {:?}",
+                kind
+            );
             return;
         }
 
@@ -381,7 +448,9 @@ impl super::App {
         // Clone the pane's overlay config before mutating the registry.
         let first_pane_idx = pane_indices[0];
         let pane_configs = {
-            let Some(target_pane) = self.gui.pane(first_pane_idx) else { return };
+            let Some(target_pane) = self.gui.pane(first_pane_idx) else {
+                return;
+            };
             target_pane.overlay_configs.clone()
         };
         if !pane_configs.is_empty() {
@@ -430,20 +499,23 @@ impl super::App {
                 });
             }
             OverlayKind::RadarSites => {
-                let Some(target_pane) = self.gui.pane(first_pane_idx) else { return };
+                let Some(target_pane) = self.gui.pane(first_pane_idx) else {
+                    return;
+                };
                 let target_site = target_pane.site.clone();
                 let target_loading = target_pane.loading_site.clone();
                 let is_dark = self.cached_dark_theme.unwrap_or(false);
                 let actual_zoom = zoom as f64 / ZOOM_QUANTIZATION_FACTOR;
-                let sites: Vec<rasterize::RadarSiteInfo> = rustdar_radar::sites::RADARS.iter().map(|s| {
-                    rasterize::RadarSiteInfo {
+                let sites: Vec<rasterize::RadarSiteInfo> = rustdar_radar::sites::RADARS
+                    .iter()
+                    .map(|s| rasterize::RadarSiteInfo {
                         name: s.name.to_string(),
                         lat: s.lat,
                         lon: s.lon,
                         is_current: s.name == target_site,
                         is_loading: target_loading.as_deref() == Some(s.name),
-                    }
-                }).collect();
+                    })
+                    .collect();
                 crate::offload::offload("sites-render", move || {
                     let image_data = rasterize::rasterize_radar_sites(
                         &sites,
@@ -468,10 +540,15 @@ impl super::App {
                 });
             }
             // Non-texture overlay kinds are never dispatched for background rendering.
-            OverlayKind::Radar | OverlayKind::CityLabels
-            | OverlayKind::UserLocation | OverlayKind::Metar
-            | OverlayKind::ColorScale  => {
-                log::warn!("spawn_overlay_render called with non-texture kind: {:?}", kind);
+            OverlayKind::Radar
+            | OverlayKind::CityLabels
+            | OverlayKind::UserLocation
+            | OverlayKind::Metar
+            | OverlayKind::ColorScale => {
+                log::warn!(
+                    "spawn_overlay_render called with non-texture kind: {:?}",
+                    kind
+                );
             }
         }
     }
@@ -482,8 +559,12 @@ impl super::App {
     /// Everything except the spawn lives in [`begin_loop_for_pane`], so which pane
     /// the loop is read from is one decision, made and tested in one place.
     fn handle_enable_loop(&mut self, pane_idx: usize, lookback_secs: u64) {
-        let Some(request) = begin_loop_for_pane(self.gui.panes_mut(), &mut self.loop_mgr, pane_idx, lookback_secs)
-        else {
+        let Some(request) = begin_loop_for_pane(
+            self.gui.panes_mut(),
+            &mut self.loop_mgr,
+            pane_idx,
+            lookback_secs,
+        ) else {
             return;
         };
         let LoopScanRequest { site, start, end } = request;
@@ -493,14 +574,24 @@ impl super::App {
                 Ok(scans) => {
                     log::info!(
                         "Loop: found {} {} scans in range for pane {}",
-                        scans.len(), site, pane_idx
+                        scans.len(),
+                        site,
+                        pane_idx
                     );
-                    crate::channels::LoopScanListResponse { pane_idx, site, scans }
+                    crate::channels::LoopScanListResponse {
+                        pane_idx,
+                        site,
+                        scans,
+                    }
                 }
                 Err(e) => {
                     log::error!("Loop scan listing failed for {}: {:?}", site, e);
                     // Send empty list so UI can show error state
-                    crate::channels::LoopScanListResponse { pane_idx, site, scans: Vec::new() }
+                    crate::channels::LoopScanListResponse {
+                        pane_idx,
+                        site,
+                        scans: Vec::new(),
+                    }
                 }
             }
         });
@@ -523,7 +614,9 @@ impl super::App {
 
     /// Navigate by a relative time step (seconds). Positive = forward, negative = backward.
     fn handle_navigate_time(&mut self, pane_idx: usize, step_secs: i64) {
-        let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else { return };
+        let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
+            return;
+        };
         let site = scan_info.site.name.to_string();
         let current_utc = scan_info.timestamp;
 
@@ -552,7 +645,9 @@ impl super::App {
 
     /// Navigate to the next or previous adjacent scan on AWS.
     fn handle_navigate_one_scan(&mut self, pane_idx: usize, forward: bool) {
-        let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else { return };
+        let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
+            return;
+        };
         let site = scan_info.site.name.to_string();
         let current_utc = scan_info.timestamp;
 
@@ -563,14 +658,16 @@ impl super::App {
 
         self.spawn_async_task(self.channels.scan_sender.clone(), async move {
             match scan::get_adjacent_scan(&site, current_utc, forward).await {
-                Ok((data, timestamp)) => {
-                    crate::channels::ScanResponse {
-                        generation,
-                        site: site.clone(),
-                        result: Ok(crate::channels::ScanData { scan: data, site, timestamp }),
-                        is_auto_poll: false,
-                    }
-                }
+                Ok((data, timestamp)) => crate::channels::ScanResponse {
+                    generation,
+                    site: site.clone(),
+                    result: Ok(crate::channels::ScanData {
+                        scan: data,
+                        site,
+                        timestamp,
+                    }),
+                    is_auto_poll: false,
+                },
                 Err(e) => {
                     let err = format!("Failed to find adjacent scan: {:?}", e);
                     log::error!("{}", err);
@@ -591,13 +688,23 @@ impl super::App {
         self.manual_nav_pending = true;
 
         // Get the pane's site to check for cached scan
-        let pane_site = self.gui.pane(pane_idx).map(|p| p.site.clone()).unwrap_or_default();
+        let pane_site = self
+            .gui
+            .pane(pane_idx)
+            .map(|p| p.site.clone())
+            .unwrap_or_default();
 
-        if let Some((scan_arc, scan_info, timestamp)) = self.latest_cached_scans.remove(&pane_site) {
-            log::info!("JumpToLive: using cached scan for {} @ {}", pane_site, timestamp);
+        if let Some((scan_arc, scan_info, timestamp)) = self.latest_cached_scans.remove(&pane_site)
+        {
+            log::info!(
+                "JumpToLive: using cached scan for {} @ {}",
+                pane_site,
+                timestamp
+            );
             self.scan_data.insert(pane_site.clone(), scan_arc);
 
-            let local_ts = chrono::TimeZone::from_utc_datetime(&chrono::Local, &timestamp).naive_local();
+            let local_ts =
+                chrono::TimeZone::from_utc_datetime(&chrono::Local, &timestamp).naive_local();
             let mut config = self.gui.get_radar_config().clone();
             config.timestamp = local_ts;
             self.gui.set_radar_config(config);
@@ -635,24 +742,30 @@ impl super::App {
         timestamp: NaiveDateTime,
         identifier: rustdar_radar::archive::Identifier,
     ) {
-        self.spawn_async_task(self.channels.loop_scan_download_sender.clone(), async move {
-            let scan = match scan::download_scan(identifier).await {
-                Ok(scan_data) => Some(std::sync::Arc::new(scan_data)),
-                Err(e) => {
-                    log::error!(
-                        "Loop scan download failed for pane {} ({} @ {}): {:?}",
-                        pane_idx, site, timestamp, e
-                    );
-                    None
+        self.spawn_async_task(
+            self.channels.loop_scan_download_sender.clone(),
+            async move {
+                let scan = match scan::download_scan(identifier).await {
+                    Ok(scan_data) => Some(std::sync::Arc::new(scan_data)),
+                    Err(e) => {
+                        log::error!(
+                            "Loop scan download failed for pane {} ({} @ {}): {:?}",
+                            pane_idx,
+                            site,
+                            timestamp,
+                            e
+                        );
+                        None
+                    }
+                };
+                crate::channels::LoopScanDownloadResponse {
+                    pane_idx,
+                    site,
+                    timestamp,
+                    scan,
                 }
-            };
-            crate::channels::LoopScanDownloadResponse {
-                pane_idx,
-                site,
-                timestamp,
-                scan,
-            }
-        });
+            },
+        );
     }
 
     /// Spawn a background render thread for a single loop frame.
@@ -680,7 +793,9 @@ impl super::App {
         if current >= MAX_CONCURRENT_RENDERS {
             return false;
         }
-        self.render.renders_in_flight.fetch_add(1, Ordering::Relaxed);
+        self.render
+            .renders_in_flight
+            .fetch_add(1, Ordering::Relaxed);
         let guard = RenderGuard(std::sync::Arc::clone(&self.render.renders_in_flight));
 
         // Both the render call and the response's `snapped` read `params`, and
@@ -689,14 +804,20 @@ impl super::App {
         // that was asked for. `LoopRenderRequest::render_params` makes that choice
         // once, under test — this only forwards it, so the two cannot disagree
         // about what the image depicts.
-        let crate::render_dispatch::RenderParams { product, elevation: snapped, lat, lon } = params;
+        let crate::render_dispatch::RenderParams {
+            product,
+            elevation: snapped,
+            lat,
+            lon,
+        } = params;
         let sender = self.channels.loop_render_sender.clone();
         let window = self.window.clone();
         crate::offload::offload("loop-render", move || {
             let _guard = guard;
             // A failed render still has to be sent, so render_in_flight gets cleared.
-            let rendered =
-                rustdar_radar::render::render_radar_to_image(&scan_data, snapped, product, lat, lon);
+            let rendered = rustdar_radar::render::render_radar_to_image(
+                &scan_data, snapped, product, lat, lon,
+            );
             let (image, max_range_km) = match rendered {
                 Some((rgba, range, _values)) => {
                     // Convert here rather than on the main thread, and let `rgba` drop
@@ -764,9 +885,10 @@ impl super::App {
         let mut to_reinit = Vec::new();
         for pane_idx in 0..self.gui.pane_count() {
             if let Some(pane) = self.gui.pane_mut(pane_idx)
-                && pane.loop_state.is_active() {
-                    to_reinit.push((pane_idx, pane.loop_state.lookback_secs));
-                }
+                && pane.loop_state.is_active()
+            {
+                to_reinit.push((pane_idx, pane.loop_state.lookback_secs));
+            }
         }
         for (pane_idx, lookback_secs) in to_reinit {
             self.handle_enable_loop(pane_idx, lookback_secs);
@@ -788,7 +910,10 @@ fn loop_frame_image(rgba: &[u8]) -> Option<egui::ColorImage> {
     if rgba.len() != IMAGE_SIZE * IMAGE_SIZE * 4 {
         return None;
     }
-    Some(egui::ColorImage::from_rgba_unmultiplied([IMAGE_SIZE, IMAGE_SIZE], rgba))
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [IMAGE_SIZE, IMAGE_SIZE],
+        rgba,
+    ))
 }
 
 /// The scan listing a freshly-built loop needs, and the site it must be requested
@@ -902,12 +1027,15 @@ fn append_polled_frame(
 
     // Insert in sorted order
     let insert_pos = ls.frames.partition_point(|f| f.timestamp < timestamp);
-    ls.frames.insert(insert_pos, LoopFrame {
-        timestamp,
-        texture: None,
-        render_in_flight: false,
-        render_failed: false,
-    });
+    ls.frames.insert(
+        insert_pos,
+        LoopFrame {
+            timestamp,
+            texture: None,
+            render_in_flight: false,
+            render_failed: false,
+        },
+    );
 
     // Evict frames outside the lookback window
     let lookback = chrono::Duration::seconds(ls.lookback_secs as i64);
@@ -927,8 +1055,8 @@ fn append_polled_frame(
 mod loop_pane_tests {
     use super::*;
     use crate::loop_downloads::LoopDownloadManager;
-    use rustdar_radar::archive::Identifier;
     use rustdar_egui::pane::{LoopPlaybackState, PaneState};
+    use rustdar_radar::archive::Identifier;
     use rustdar_radar::sites::RadarSite;
     use rustdar_radar::types::{RadarProduct, ScanInfo};
 
@@ -944,7 +1072,12 @@ mod loop_pane_tests {
     }
 
     fn site(name: &'static str, lat: f64, lon: f64) -> RadarSite {
-        RadarSite { name, lat, lon, elev: None }
+        RadarSite {
+            name,
+            lat,
+            lon,
+            elev: None,
+        }
     }
 
     /// The site every `pane_showing` pane has already switched *to*, and whose scan
@@ -964,7 +1097,10 @@ mod loop_pane_tests {
     /// interchangeable, and every assertion below would hold just as well for a
     /// `begin_loop_for_pane` that read the wrong one.
     fn pane_showing(site: RadarSite, timestamp: NaiveDateTime) -> PaneState {
-        assert_ne!(site.name, SWITCHED_TO, "the fixture's divergence must be real");
+        assert_ne!(
+            site.name, SWITCHED_TO,
+            "the fixture's divergence must be real"
+        );
         let mut pane = PaneState::with_site(SWITCHED_TO.to_string());
         pane.scan_info = Some(ScanInfo {
             site,
@@ -1003,7 +1139,10 @@ mod loop_pane_tests {
         ];
         let mut mgr = LoopDownloadManager::new();
 
-        assert_eq!(panes[1].site, SWITCHED_TO, "precondition: pane 1's live site has already moved");
+        assert_eq!(
+            panes[1].site, SWITCHED_TO,
+            "precondition: pane 1's live site has already moved"
+        );
 
         let req = begin_loop_for_pane(&mut panes, &mut mgr, 1, 600).expect("pane 1 has a scan");
 
@@ -1011,7 +1150,10 @@ mod loop_pane_tests {
         // own live `site` field. Both are in reach at the listing site and both are
         // wrong: the identifiers this listing returns are cached and projected with
         // the coordinates that came out of the same `scan_info`.
-        assert_eq!(req.site, "KOUN", "the listing must be requested for pane 1's loaded scan's site");
+        assert_eq!(
+            req.site, "KOUN",
+            "the listing must be requested for pane 1's loaded scan's site"
+        );
         assert_eq!(
             req.end,
             ts(25),
@@ -1063,15 +1205,23 @@ mod loop_pane_tests {
     fn beginning_a_loop_clears_the_panes_pending_downloads() {
         let mut panes = [pane_showing(site("KTLX", 35.33, -97.27), ts(10))];
         let mut mgr = LoopDownloadManager::new();
-        mgr.insert_pending(0, crate::loop_downloads::PendingDownloads {
-            site: "KOUN".to_string(),
-            queue: [(ts(5), identifier("KOUN20240101_000500_V06"))].into_iter().collect(),
-        });
+        mgr.insert_pending(
+            0,
+            crate::loop_downloads::PendingDownloads {
+                site: "KOUN".to_string(),
+                queue: [(ts(5), identifier("KOUN20240101_000500_V06"))]
+                    .into_iter()
+                    .collect(),
+            },
+        );
         assert!(!mgr.is_pane_done(0), "precondition: pane 0 has work queued");
 
         begin_loop_for_pane(&mut panes, &mut mgr, 0, 600).expect("pane 0 has a scan");
 
-        assert!(mgr.is_pane_done(0), "the previous loop's downloads are gone");
+        assert!(
+            mgr.is_pane_done(0),
+            "the previous loop's downloads are gone"
+        );
     }
 
     /// The defect this half of the site fix exists for. Auto-poll delivers one
@@ -1108,7 +1258,11 @@ mod loop_pane_tests {
         panes[0].site = "KTLX".to_string();
 
         append_polled_frame_to_loops(&mut panes, "KTLX", ts(10));
-        assert_eq!(frame_times(&panes[0]), vec![ts(0)], "the loop is still a KOUN loop");
+        assert_eq!(
+            frame_times(&panes[0]),
+            vec![ts(0)],
+            "the loop is still a KOUN loop"
+        );
 
         append_polled_frame_to_loops(&mut panes, "KOUN", ts(10));
         assert_eq!(frame_times(&panes[0]), vec![ts(0), ts(10)]);
@@ -1119,7 +1273,10 @@ mod loop_pane_tests {
     #[test]
     fn an_inactive_loop_takes_no_frames() {
         let mut panes = [PaneState::with_site("KTLX".to_string())];
-        assert_eq!(panes[0].loop_state.site, "", "precondition: placeholder site");
+        assert_eq!(
+            panes[0].loop_state.site, "",
+            "precondition: placeholder site"
+        );
 
         append_polled_frame_to_loops(&mut panes, "KTLX", ts(10));
         append_polled_frame_to_loops(&mut panes, "", ts(11));
@@ -1137,7 +1294,11 @@ mod loop_pane_tests {
         assert_eq!(frame_times(&panes[0]), vec![ts(0), ts(5), ts(10)]);
 
         append_polled_frame_to_loops(&mut panes, "KTLX", ts(5));
-        assert_eq!(frame_times(&panes[0]), vec![ts(0), ts(5), ts(10)], "no duplicate frame");
+        assert_eq!(
+            frame_times(&panes[0]),
+            vec![ts(0), ts(5), ts(10)],
+            "no duplicate frame"
+        );
     }
 
     /// Frames older than the lookback window are dropped as new ones arrive.
@@ -1173,13 +1334,21 @@ mod loop_pane_tests {
         // that was there is now older than the cutoff.
         append_polled_frame_to_loops(&mut panes, "KTLX", ts(25));
 
-        assert_eq!(frame_times(&panes[0]), vec![ts(25)], "precondition: only the new frame survives");
+        assert_eq!(
+            frame_times(&panes[0]),
+            vec![ts(25)],
+            "precondition: only the new frame survives"
+        );
         assert_eq!(
             panes[0].loop_state.current_frame, 0,
             "the playhead must land on a frame that exists"
         );
         assert!(
-            panes[0].loop_state.frames.get(panes[0].loop_state.current_frame).is_some(),
+            panes[0]
+                .loop_state
+                .frames
+                .get(panes[0].loop_state.current_frame)
+                .is_some(),
             "and resolve to one, which is what the pane renders through"
         );
     }
@@ -1206,7 +1375,10 @@ mod loop_frame_image_tests {
     fn a_malformed_buffer_is_rejected_rather_than_panicking() {
         let short = IMAGE_SIZE * IMAGE_SIZE * 4 - 4;
         let long = IMAGE_SIZE * IMAGE_SIZE * 4 + 4;
-        assert!(loop_frame_image(&vec![0u8; short]).is_none(), "short buffer");
+        assert!(
+            loop_frame_image(&vec![0u8; short]).is_none(),
+            "short buffer"
+        );
         assert!(loop_frame_image(&vec![0u8; long]).is_none(), "long buffer");
         assert!(loop_frame_image(&[]).is_none(), "empty buffer");
     }
@@ -1218,7 +1390,10 @@ mod loop_frame_image_tests {
         let mut rgba = vec![0u8; IMAGE_SIZE * IMAGE_SIZE * 4];
         rgba[0..4].copy_from_slice(&[10, 20, 30, 255]);
         let image = loop_frame_image(&rgba).unwrap();
-        assert_eq!(image.pixels[0], egui::Color32::from_rgba_unmultiplied(10, 20, 30, 255));
+        assert_eq!(
+            image.pixels[0],
+            egui::Color32::from_rgba_unmultiplied(10, 20, 30, 255)
+        );
         assert_ne!(image.pixels[0], egui::Color32::TRANSPARENT);
     }
 }

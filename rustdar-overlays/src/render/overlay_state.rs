@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use rustdar_units::UserPreferences;
 
-use crate::render::controls::{ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut};
+use crate::render::controls::{
+    ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut,
+};
 use crate::render::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter};
 use crate::render::rasterize::RasterizeOutput;
 use crate::types::{GeoBounds, OverlayFeature, OverlayLabel};
@@ -116,7 +118,9 @@ pub trait OverlayHandler: Send {
     fn render_mode(&self) -> RenderMode;
 
     /// Applies to a *new* pane only.
-    fn default_enabled(&self) -> bool { false }
+    fn default_enabled(&self) -> bool {
+        false
+    }
 
     // ── Data lifecycle ────────────────────────────────────────────────
 
@@ -132,12 +136,18 @@ pub trait OverlayHandler: Send {
     fn fetch_time(&self) -> Option<web_time::Instant>;
 
     /// Seconds. `None` means this overlay never auto-polls.
-    fn auto_poll_interval(&self) -> Option<u64> { None }
+    fn auto_poll_interval(&self) -> Option<u64> {
+        None
+    }
 
-    fn item_count(&self) -> usize { 0 }
+    fn item_count(&self) -> usize {
+        0
+    }
 
     /// Each handler owns its own toggle state; there is no central layer table.
-    fn is_enabled(&self) -> bool { true }
+    fn is_enabled(&self) -> bool {
+        true
+    }
 
     /// Meaningful only for simple toggle handlers.
     fn set_enabled(&mut self, _enabled: bool) {}
@@ -155,58 +165,81 @@ pub trait OverlayHandler: Send {
     // ── Rendering (texture mode) ──────────────────────────────────────
 
     /// `None` when there is nothing to render.
-    fn prepare_rasterize(
-        &self,
-        ctx: &RasterizeContext,
-    ) -> Option<RasterizeFn> {
+    fn prepare_rasterize(&self, ctx: &RasterizeContext) -> Option<RasterizeFn> {
         let _ = ctx;
         None
     }
 
     // ── Click & selection ─────────────────────────────────────────────
 
-    fn clickable_items(&self) -> Vec<ClickableItem> { Vec::new() }
+    fn clickable_items(&self) -> Vec<ClickableItem> {
+        Vec::new()
+    }
 
     /// `true` if this handler owned the action.
-    fn handle_popup_action(&mut self, _action: &PopupAction) -> bool { false }
+    fn handle_popup_action(&mut self, _action: &PopupAction) -> bool {
+        false
+    }
 
     /// Drops selections whose `matches()` finds nothing in the refreshed data.
     fn retain_selections(&self, selections: &mut Vec<Arc<dyn OverlayItem>>);
 
     // ── Per-frame point rendering (opt-in for PerFramePoint mode) ─────
 
-    fn per_frame_points(&self) -> &[MapPoint] { &[] }
+    fn per_frame_points(&self) -> &[MapPoint] {
+        &[]
+    }
 
     fn draw_point(&self, _id: u32, _painter: &mut dyn PointPainter, _ctx: &DrawPointContext) {}
 
     /// Screen pixels.
-    fn point_hit_radius(&self, _zoom: f32) -> f32 { 0.0 }
+    fn point_hit_radius(&self, _zoom: f32) -> f32 {
+        0.0
+    }
 
     /// `None` suppresses the tooltip entirely.
-    fn hover_text(&self, _id: u32, _ctx: &HoverContext<'_>) -> Option<String> { None }
+    fn hover_text(&self, _id: u32, _ctx: &HoverContext<'_>) -> Option<String> {
+        None
+    }
 
     /// For gridded overlays only.
-    fn hover_value_at(&self, _lat: f64, _lon: f64) -> Option<String> { None }
+    fn hover_value_at(&self, _lat: f64, _lon: f64) -> Option<String> {
+        None
+    }
 
-    fn legend(&self) -> Option<OverlayLegend> { None }
+    fn legend(&self) -> Option<OverlayLegend> {
+        None
+    }
 
     // ── Declarative UI controls ───────────────────────────────────────
 
     /// Declarative: the egui crate renders these without overlay-specific code.
-    fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> { Vec::new() }
+    fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
+        Vec::new()
+    }
 
     /// The returned [`ControlEffect`] is how a handler asks the caller for a
     /// side-effect such as a refetch.
-    fn apply_control(&mut self, _update: &ControlUpdate, _ctx: &mut PaneControlContextMut<'_>) -> ControlEffect { ControlEffect::None }
+    fn apply_control(
+        &mut self,
+        _update: &ControlUpdate,
+        _ctx: &mut PaneControlContextMut<'_>,
+    ) -> ControlEffect {
+        ControlEffect::None
+    }
 
     // ── Per-pane state ────────────────────────────────────────────────
 
     /// e.g. selected product, loop state. `None` if there is no per-pane state.
-    fn create_pane_state(&self) -> Option<FetchPayload> { None }
+    fn create_pane_state(&self) -> Option<FetchPayload> {
+        None
+    }
 
     // ── Config persistence ────────────────────────────────────────────
 
-    fn serialize_state(&self) -> serde_json::Value { serde_json::Value::Null }
+    fn serialize_state(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
 
     fn deserialize_state(&mut self, _value: serde_json::Value) {}
 
@@ -220,7 +253,9 @@ pub trait OverlayHandler: Send {
 
     // ── Loop support (opt-in) ─────────────────────────────────────────
 
-    fn supports_loop(&self) -> bool { false }
+    fn supports_loop(&self) -> bool {
+        false
+    }
 
     /// Yields the timestamps of available frames, not the frames themselves.
     fn create_loop_list_task(
@@ -306,7 +341,10 @@ impl Default for OverlayRegistry {
 
 impl OverlayRegistry {
     fn handler(&self, kind: OverlayKind) -> Option<&dyn OverlayHandler> {
-        self.handlers.iter().find(|h| h.kind() == kind).map(|h| &**h)
+        self.handlers
+            .iter()
+            .find(|h| h.kind() == kind)
+            .map(|h| &**h)
     }
 
     fn handler_mut(&mut self, kind: OverlayKind) -> Option<&mut dyn OverlayHandler> {
@@ -371,7 +409,8 @@ impl OverlayRegistry {
     }
 
     pub fn clickable_items(&self, kind: OverlayKind) -> Vec<ClickableItem> {
-        self.handler(kind).map_or_else(Vec::new, |h| h.clickable_items())
+        self.handler(kind)
+            .map_or_else(Vec::new, |h| h.clickable_items())
     }
 
     pub fn hover_value_at(&self, kind: OverlayKind, lat: f64, lon: f64) -> Option<String> {
@@ -382,14 +421,19 @@ impl OverlayRegistry {
         self.handler(kind).and_then(|h| h.legend())
     }
 
-    pub fn popup_content(&self, selected: &dyn OverlayItem, prefs: &UserPreferences) -> PopupContent {
+    pub fn popup_content(
+        &self,
+        selected: &dyn OverlayItem,
+        prefs: &UserPreferences,
+    ) -> PopupContent {
         selected.popup_content(prefs)
     }
 
     /// Routes to the handler that owns `action.target`.
     pub fn handle_popup_action(&mut self, action: &PopupAction) -> bool {
         let kind = action.target.kind();
-        self.handler_mut(kind).is_some_and(|h| h.handle_popup_action(action))
+        self.handler_mut(kind)
+            .is_some_and(|h| h.handle_popup_action(action))
     }
 
     /// Re-runs `retain_selections` afterwards, since the data just changed.
@@ -413,14 +457,21 @@ impl OverlayRegistry {
     }
 
     pub fn create_fetch_tasks(&self, kind: OverlayKind, ctx: &FetchConfig) -> Vec<FetchTask> {
-        self.handler(kind).map_or_else(Vec::new, |h| h.create_fetch_tasks(ctx))
+        self.handler(kind)
+            .map_or_else(Vec::new, |h| h.create_fetch_tasks(ctx))
     }
 
     pub fn controls(&self, kind: OverlayKind, ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
-        self.handler(kind).map_or_else(Vec::new, |h| h.controls(ctx))
+        self.handler(kind)
+            .map_or_else(Vec::new, |h| h.controls(ctx))
     }
 
-    pub fn apply_control(&mut self, kind: OverlayKind, update: &ControlUpdate, ctx: &mut PaneControlContextMut<'_>) -> ControlEffect {
+    pub fn apply_control(
+        &mut self,
+        kind: OverlayKind,
+        update: &ControlUpdate,
+        ctx: &mut PaneControlContextMut<'_>,
+    ) -> ControlEffect {
         if let Some(h) = self.handler_mut(kind) {
             h.apply_control(update, ctx)
         } else {
@@ -442,19 +493,24 @@ impl OverlayRegistry {
 
     /// Seeds a new pane's `enabled_overlays`; call after config deserialization.
     pub fn build_enabled_map(&self) -> std::collections::HashMap<OverlayKind, bool> {
-        self.handlers.iter()
+        self.handlers
+            .iter()
             .map(|h| (h.kind(), h.is_enabled()))
             .collect()
     }
 
     pub fn save_pane_configs(&self) -> std::collections::HashMap<OverlayKind, serde_json::Value> {
-        self.handlers.iter()
+        self.handlers
+            .iter()
             .map(|h| (h.kind(), h.serialize_state()))
             .collect()
     }
 
     /// Handlers absent from `configs` keep their current state.
-    pub fn load_pane_configs(&mut self, configs: &std::collections::HashMap<OverlayKind, serde_json::Value>) {
+    pub fn load_pane_configs(
+        &mut self,
+        configs: &std::collections::HashMap<OverlayKind, serde_json::Value>,
+    ) {
         for h in &mut self.handlers {
             if let Some(val) = configs.get(&h.kind()) {
                 h.deserialize_state(val.clone());
@@ -463,7 +519,8 @@ impl OverlayRegistry {
     }
 
     pub fn save_enabled_map(&self) -> std::collections::HashMap<OverlayKind, bool> {
-        self.handlers.iter()
+        self.handlers
+            .iter()
             .map(|h| (h.kind(), h.is_enabled()))
             .collect()
     }
@@ -474,7 +531,13 @@ impl OverlayRegistry {
         self.handler(kind).map_or(&[], |h| h.per_frame_points())
     }
 
-    pub fn draw_point(&self, kind: OverlayKind, id: u32, painter: &mut dyn PointPainter, ctx: &DrawPointContext) {
+    pub fn draw_point(
+        &self,
+        kind: OverlayKind,
+        id: u32,
+        painter: &mut dyn PointPainter,
+        ctx: &DrawPointContext,
+    ) {
         if let Some(h) = self.handler(kind) {
             h.draw_point(id, painter, ctx);
         }
@@ -503,7 +566,10 @@ impl OverlayRegistry {
         map
     }
 
-    pub fn deserialize_handler_states(&mut self, states: &serde_json::Map<String, serde_json::Value>) {
+    pub fn deserialize_handler_states(
+        &mut self,
+        states: &serde_json::Map<String, serde_json::Value>,
+    ) {
         for h in &mut self.handlers {
             let key = format!("{:?}", h.kind());
             if let Some(val) = states.get(&key) {
@@ -583,11 +649,22 @@ pub struct PopupContent {
 pub enum PopupSection {
     Heading(String),
     Text(String),
-    ColoredText { text: String, rgb: [u8; 3], bold: bool },
+    ColoredText {
+        text: String,
+        rgb: [u8; 3],
+        bold: bool,
+    },
     KeyValueGrid(Vec<(String, String)>),
-    ScrollableText { text: String, monospace: bool, max_height: f32 },
+    ScrollableText {
+        text: String,
+        monospace: bool,
+        max_height: f32,
+    },
     Separator,
-    Link { label: String, url: String },
+    Link {
+        label: String,
+        url: String,
+    },
 }
 
 /// The UI crate renders it; this crate defines what it means.

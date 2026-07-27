@@ -353,7 +353,10 @@ mod tests {
             "the model must re-read the pane, not report a snapshot"
         );
 
-        gui.apply_menu_event(MenuEvent::Toggled(MenuToggle::AutoPoll, false), &mut actions);
+        gui.apply_menu_event(
+            MenuEvent::Toggled(MenuToggle::AutoPoll, false),
+            &mut actions,
+        );
         assert!(!auto_poll_toggle(&gui));
         gui.apply_menu_event(MenuEvent::Toggled(MenuToggle::AutoPoll, true), &mut actions);
         assert!(auto_poll_toggle(&gui));
@@ -429,7 +432,10 @@ mod tests {
                 actions: Vec::new(),
             }
         }
-        fn matches(&self, _other: &dyn rustdar_overlays::render::overlay_state::OverlayItem) -> bool {
+        fn matches(
+            &self,
+            _other: &dyn rustdar_overlays::render::overlay_state::OverlayItem,
+        ) -> bool {
             false
         }
         fn as_any(&self) -> &dyn std::any::Any {

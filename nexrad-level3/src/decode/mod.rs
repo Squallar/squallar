@@ -42,7 +42,10 @@ pub fn decode_product(data: &[u8]) -> Result<Level3Message> {
     let symbology = if pdb.symbology_offset > 0 {
         // Halfwords, counted from the start of the message header.
         let sym_byte_offset = pdb.symbology_offset as usize * 2;
-        Some(symbology::decode_symbology_block(data_ref, sym_byte_offset)?)
+        Some(symbology::decode_symbology_block(
+            data_ref,
+            sym_byte_offset,
+        )?)
     } else {
         // Fallback: try parsing whatever follows the PDB.
         if offset < data_ref.len() {

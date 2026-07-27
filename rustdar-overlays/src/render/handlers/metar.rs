@@ -4,11 +4,13 @@ use std::sync::Arc;
 use rustdar_units::UserPreferences;
 
 use crate::metar::types::{MetarOb, WindDir};
-use crate::render::controls::{ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext, PaneControlContextMut};
+use crate::render::controls::{
+    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
+    PaneControlContextMut,
+};
 use crate::render::draw::{DrawPointContext, HoverContext, MapPoint, PointPainter};
 use crate::render::overlay_state::{
-    FetchPayload,
-    ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
     OverlayState, PopupContent, PopupSection, RasterizeContext, RasterizeFn, RenderMode,
 };
 use crate::render::station_model;
@@ -23,9 +25,7 @@ const METAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// none of this. The rule is read from
 /// [`DataSources::metar_sends_user_agent`](rustdar_radar::sources::DataSources::metar_sends_user_agent),
 /// not restated here.
-fn metar_client(
-    sources: &rustdar_radar::sources::DataSources,
-) -> Result<reqwest::Client, String> {
+fn metar_client(sources: &rustdar_radar::sources::DataSources) -> Result<reqwest::Client, String> {
     sources
         .metar_client(METAR_TIMEOUT)
         .build()
@@ -68,7 +68,10 @@ impl OverlayItem for MetarItem {
             };
             if let Some(gust) = ob.wind_gust_kt {
                 let g_converted = prefs.speed.convert_from_knots(gust as f32);
-                wind_text.push_str(&format!(", gusts {g_converted:.0} {}", prefs.speed.suffix()));
+                wind_text.push_str(&format!(
+                    ", gusts {g_converted:.0} {}",
+                    prefs.speed.suffix()
+                ));
             }
             kv.push(("Wind".into(), wind_text));
         }
@@ -79,7 +82,10 @@ impl OverlayItem for MetarItem {
 
         if let Some(alt) = ob.altimeter_hpa {
             let in_hg = alt * 0.02953;
-            kv.push(("Altimeter".into(), format!("{in_hg:.2} inHg / {alt:.0} hPa")));
+            kv.push((
+                "Altimeter".into(),
+                format!("{in_hg:.2} inHg / {alt:.0} hPa"),
+            ));
         }
 
         if let Some(fc) = ob.flight_category {
@@ -116,7 +122,10 @@ impl OverlayItem for MetarItem {
         }
 
         if !ob.obs_time.is_empty() {
-            kv.push(("Obs Time".into(), prefs.timezone.format_rfc3339(&ob.obs_time)));
+            kv.push((
+                "Obs Time".into(),
+                prefs.timezone.format_rfc3339(&ob.obs_time),
+            ));
         }
 
         let accent_rgb = ob
@@ -273,14 +282,14 @@ impl OverlayHandler for MetarHandler {
             if sel.kind() != OverlayKind::Metar {
                 return true;
             }
-            self.state.data.iter().any(|item| item.matches(sel.as_ref()))
+            self.state
+                .data
+                .iter()
+                .any(|item| item.matches(sel.as_ref()))
         });
     }
 
-    fn prepare_rasterize(
-        &self,
-        _ctx: &RasterizeContext,
-    ) -> Option<RasterizeFn> {
+    fn prepare_rasterize(&self, _ctx: &RasterizeContext) -> Option<RasterizeFn> {
         None // PerFramePoint mode; nothing is rasterized in the background.
     }
 
@@ -302,8 +311,7 @@ impl OverlayHandler for MetarHandler {
             kind: OverlayKind::Metar,
             future: Box::pin(async move {
                 let result =
-                    crate::metar::fetch::fetch_current_metars(&client, &sources, &viewport)
-                        .await;
+                    crate::metar::fetch::fetch_current_metars(&client, &sources, &viewport).await;
                 Box::new(MetarFetchResult(result)) as FetchPayload
             }),
         }]
@@ -326,9 +334,10 @@ impl OverlayHandler for MetarHandler {
     }
 
     fn hover_text(&self, id: u32, ctx: &HoverContext<'_>) -> Option<String> {
-        self.state.data.get(id as usize).map(|item| {
-            station_model::hover_text_for_metar(&item.ob, ctx.prefs)
-        })
+        self.state
+            .data
+            .get(id as usize)
+            .map(|item| station_model::hover_text_for_metar(&item.ob, ctx.prefs))
     }
 
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
@@ -339,9 +348,11 @@ impl OverlayHandler for MetarHandler {
             format!("\u{1f321}  METAR ({count})")
         };
 
-        let mut items = vec![
-            ControlItem::Toggle { id: "enabled", label, enabled: self.enabled },
-        ];
+        let mut items = vec![ControlItem::Toggle {
+            id: "enabled",
+            label,
+            enabled: self.enabled,
+        }];
 
         if self.enabled {
             items.push(ControlItem::ButtonRow {
@@ -353,7 +364,9 @@ impl OverlayHandler for MetarHandler {
                 }],
             });
             if self.state.fetching {
-                items.push(ControlItem::InfoText { text: "Fetching\u{2026}".into() });
+                items.push(ControlItem::InfoText {
+                    text: "Fetching\u{2026}".into(),
+                });
             }
             if let Some(t) = self.state.fetch_time {
                 let secs = t.elapsed().as_secs();
@@ -369,7 +382,11 @@ impl OverlayHandler for MetarHandler {
         items
     }
 
-    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneControlContextMut<'_>) -> ControlEffect {
+    fn apply_control(
+        &mut self,
+        update: &ControlUpdate,
+        _ctx: &mut PaneControlContextMut<'_>,
+    ) -> ControlEffect {
         match update.id {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {
@@ -436,11 +453,7 @@ mod tests {
         wind_ob(None, None, vis)
     }
 
-    fn wind_ob(
-        dir: Option<WindDir>,
-        speed: Option<u16>,
-        vis: Option<Visibility>,
-    ) -> MetarOb {
+    fn wind_ob(dir: Option<WindDir>, speed: Option<u16>, vis: Option<Visibility>) -> MetarOb {
         MetarOb {
             station_id: "KTST".into(),
             name: "KTST".into(),
@@ -463,7 +476,10 @@ mod tests {
     }
 
     fn rows(ob: MetarOb) -> Vec<(String, String)> {
-        let prefs = UserPreferences { speed: SpeedUnit::Knots, ..Default::default() };
+        let prefs = UserPreferences {
+            speed: SpeedUnit::Knots,
+            ..Default::default()
+        };
         MetarItem { ob }
             .popup_content(&prefs)
             .sections
@@ -481,13 +497,19 @@ mod tests {
 
     #[test]
     fn the_popup_reports_unrestricted_visibility() {
-        let vis = Some(Visibility { miles: 10.0, or_greater: true });
+        let vis = Some(Visibility {
+            miles: 10.0,
+            or_greater: true,
+        });
         assert_eq!(field(ob(vis), "Visibility").as_deref(), Some("10+ mi"));
     }
 
     #[test]
     fn the_popup_keeps_a_measurement_distinct_from_the_bound() {
-        let vis = Some(Visibility { miles: 15.0, or_greater: false });
+        let vis = Some(Visibility {
+            miles: 15.0,
+            or_greater: false,
+        });
         assert_eq!(field(ob(vis), "Visibility").as_deref(), Some("15 mi"));
     }
 
@@ -501,7 +523,10 @@ mod tests {
     fn the_popup_says_vrb_for_a_variable_wind() {
         let wind = field(wind_ob(Some(WindDir::Variable), Some(6), None), "Wind").unwrap();
         assert_eq!(wind, "VRB at 6 kt");
-        assert!(!wind.contains("000"), "a variable wind is not a 000° bearing");
+        assert!(
+            !wind.contains("000"),
+            "a variable wind is not a 000° bearing"
+        );
     }
 
     #[test]

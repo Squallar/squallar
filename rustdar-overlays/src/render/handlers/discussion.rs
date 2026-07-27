@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
-use crate::render::controls::{ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext, PaneControlContextMut};
+use crate::render::controls::{
+    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
+    PaneControlContextMut,
+};
 use crate::render::overlay_state::{
-    FetchPayload,
-    ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
     OverlayState, PopupContent, PopupSection, RasterizeContext, RasterizeFn, RenderMode,
 };
 use crate::render::rasterize::{self, RasterizeOutput};
@@ -141,10 +143,15 @@ impl OverlayHandler for SpcDiscussionHandler {
     }
 
     fn clickable_items(&self) -> Vec<ClickableItem> {
-        self.state.data.iter()
+        self.state
+            .data
+            .iter()
             .filter(|item| !item.md.polygon.is_empty())
             .map(|item| {
-                let label = item.md.polygon.first()
+                let label = item
+                    .md
+                    .polygon
+                    .first()
                     .filter(|ring| !ring.is_empty())
                     .map(|ring| {
                         let n = ring.len() as f64;
@@ -192,21 +199,25 @@ impl OverlayHandler for SpcDiscussionHandler {
             if sel.kind() != OverlayKind::SpcDiscussions {
                 return true;
             }
-            self.state.data.iter().any(|item| item.matches(sel.as_ref()))
+            self.state
+                .data
+                .iter()
+                .any(|item| item.matches(sel.as_ref()))
         });
     }
 
-    fn prepare_rasterize(
-        &self,
-        _ctx: &RasterizeContext,
-    ) -> Option<RasterizeFn> {
+    fn prepare_rasterize(&self, _ctx: &RasterizeContext) -> Option<RasterizeFn> {
         if self.state.data.is_empty() {
             return None;
         }
-        let discussions: Vec<SpcDiscussion> = self.state.data.iter().map(|i| i.md.clone()).collect();
+        let discussions: Vec<SpcDiscussion> =
+            self.state.data.iter().map(|i| i.md.clone()).collect();
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
             let rgba = rasterize::rasterize_spc_discussions(&discussions, bounds, width, height);
-            RasterizeOutput { rgba, hit_map: None }
+            RasterizeOutput {
+                rgba,
+                hit_map: None,
+            }
         }))
     }
 
@@ -241,9 +252,11 @@ impl OverlayHandler for SpcDiscussionHandler {
             format!("\u{1f4cb}  Mesoscale Disc. ({count})")
         };
 
-        let mut items = vec![
-            ControlItem::Toggle { id: "enabled", label, enabled: self.enabled },
-        ];
+        let mut items = vec![ControlItem::Toggle {
+            id: "enabled",
+            label,
+            enabled: self.enabled,
+        }];
 
         if self.enabled {
             items.push(ControlItem::ButtonRow {
@@ -255,7 +268,9 @@ impl OverlayHandler for SpcDiscussionHandler {
                 }],
             });
             if self.state.fetching {
-                items.push(ControlItem::InfoText { text: "Fetching\u{2026}".into() });
+                items.push(ControlItem::InfoText {
+                    text: "Fetching\u{2026}".into(),
+                });
             }
             if let Some(t) = self.state.fetch_time {
                 let secs = t.elapsed().as_secs();
@@ -271,7 +286,11 @@ impl OverlayHandler for SpcDiscussionHandler {
         items
     }
 
-    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneControlContextMut<'_>) -> ControlEffect {
+    fn apply_control(
+        &mut self,
+        update: &ControlUpdate,
+        _ctx: &mut PaneControlContextMut<'_>,
+    ) -> ControlEffect {
         match update.id {
             "enabled" => {
                 if let ControlValue::Bool(val) = update.value {

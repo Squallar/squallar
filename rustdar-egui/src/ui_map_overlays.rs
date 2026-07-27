@@ -1,11 +1,9 @@
-use std::sync::Arc;
+use crate::overlay_cache::{OverlayTextureCache, draw_overlay_texture, geo_point_in_feature};
 use crate::tile_source::HttpsTiles;
-use walkers::{Tile, TileId, Tiles};
-use crate::overlay_cache::{
-    OverlayTextureCache, draw_overlay_texture, geo_point_in_feature,
-};
+use crate::tiles::{lat_to_tile_y, lon_to_tile_x, tile_to_lat, tile_to_lon};
 use rustdar_overlays::render::overlay_state::{ClickableItem, OverlayItem};
-use crate::tiles::{lon_to_tile_x, lat_to_tile_y, tile_to_lon, tile_to_lat};
+use std::sync::Arc;
+use walkers::{Tile, TileId, Tiles};
 
 // ---------------------------------------------------------------------------
 /// Shared context for overlay drawing operations.
@@ -123,14 +121,15 @@ impl<'a> OverlayDrawContext<'a> {
 
         // If a hit buffer is available, use it for pixel-perfect detection.
         if let Some(tex) = texture.and_then(|c| c.current.as_ref())
-            && let Some(ref hit_map) = tex.hit_map {
-                let rect = crate::overlay_cache::overlay_texture_rect(self.projector, tex);
-                if rect.width() > 0.0 && rect.height() > 0.0 {
-                    let u = (click_pos.x - rect.left()) / rect.width();
-                    let v = (click_pos.y - rect.top()) / rect.height();
-                    return hit_map.hit_test(u, v);
-                }
+            && let Some(ref hit_map) = tex.hit_map
+        {
+            let rect = crate::overlay_cache::overlay_texture_rect(self.projector, tex);
+            if rect.width() > 0.0 && rect.height() > 0.0 {
+                let u = (click_pos.x - rect.left()) / rect.width();
+                let v = (click_pos.y - rect.top()) / rect.height();
+                return hit_map.hit_test(u, v);
             }
+        }
 
         // Fall back to geographic polygon containment.
         let geo = self
@@ -141,9 +140,10 @@ impl<'a> OverlayDrawContext<'a> {
 
         let mut hits = Vec::new();
         for item in items {
-            let hit = item.features.iter().any(|f| {
-                geo_point_in_feature(lat, lon, f)
-            });
+            let hit = item
+                .features
+                .iter()
+                .any(|f| geo_point_in_feature(lat, lon, f));
             if hit {
                 hits.push(item.item.clone());
             }
@@ -210,7 +210,8 @@ pub(super) fn draw_label_tiles_overlay(
                 let rect = egui::Rect::from_two_pos(nw_screen, se_screen);
 
                 let Tile::Raster(ref tex) = twuv.tile;
-                ui.painter().image(tex.id(), rect, twuv.uv, egui::Color32::WHITE);
+                ui.painter()
+                    .image(tex.id(), rect, twuv.uv, egui::Color32::WHITE);
             }
         }
     }
@@ -270,7 +271,10 @@ mod tests {
     #[test]
     fn each_condition_blocks_a_position_on_its_own() {
         let clear = egui::pos2(400.0, 300.0);
-        assert!(PANE.contains(clear), "fixture: the control point is on the pane");
+        assert!(
+            PANE.contains(clear),
+            "fixture: the control point is on the pane"
+        );
 
         let excluded = egui::Rect::from_min_size(egui::pos2(220.0, 100.0), egui::vec2(48.0, 48.0));
         let on_excluded = excluded.center();
@@ -295,7 +299,9 @@ mod tests {
         );
 
         assert!(
-            !bare.layer_id_at(on_excluded).is_some_and(|l| l.order > egui::Order::Background),
+            !bare
+                .layer_id_at(on_excluded)
+                .is_some_and(|l| l.order > egui::Order::Background),
             "fixture: nothing floats over the excluded rect, so only the \
              excluded-rect check can block it"
         );

@@ -66,9 +66,9 @@
 //! *extent* of this: the shift must stay inside the status bar, where nothing is
 //! stored, and the ids that key stored state must not move.
 
+use super::ui_menu;
 use crate::actions::GuiAction;
 use crate::ui_layout::{PointerModality, WidthClass};
-use super::ui_menu;
 use rustdar_radar::types::ScanInfo;
 use rustdar_units::UserPreferences;
 
@@ -361,14 +361,11 @@ impl super::Gui {
                 ui.horizontal(|ui| {
                     ui.heading("Layers");
                     if is_drawer {
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui.button("\u{2715}").clicked() {
-                                    self.drawer_open = false;
-                                }
-                            },
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("\u{2715}").clicked() {
+                                self.drawer_open = false;
+                            }
+                        });
                     }
                 });
                 ui.separator();
@@ -387,24 +384,24 @@ impl super::Gui {
                 let scroll = egui::ScrollArea::vertical()
                     .id_salt("layers_scroll")
                     .show(ui, |ui| {
-                    self.render_pane_selector(ui, &mut pane);
-                    self.render_layer_controls(
-                        ui,
-                        &mut pane,
-                        COMBO_BOX_WIDTH,
-                        LAYER_CONTROL_ID_PREFIX,
-                        actions,
-                    );
+                        self.render_pane_selector(ui, &mut pane);
+                        self.render_layer_controls(
+                            ui,
+                            &mut pane,
+                            COMBO_BOX_WIDTH,
+                            LAYER_CONTROL_ID_PREFIX,
+                            actions,
+                        );
 
-                    // With no menu bar on screen, the menu lives here — the
-                    // same model, rendered as a list. This is what used to be
-                    // `ui_mobile.rs`'s hand-rolled "Controls" block.
-                    if let Some(model) = menu_model.as_ref() {
-                        ui.add_space(10.0);
-                        ui.separator();
-                        menu_frame = ui_menu::render_menu_drawer(ui, model);
-                    }
-                });
+                        // With no menu bar on screen, the menu lives here — the
+                        // same model, rendered as a list. This is what used to be
+                        // `ui_mobile.rs`'s hand-rolled "Controls" block.
+                        if let Some(model) = menu_model.as_ref() {
+                            ui.add_space(10.0);
+                            ui.separator();
+                            menu_frame = ui_menu::render_menu_drawer(ui, model);
+                        }
+                    });
 
                 // Report the id egui really used, rather than reconstructing
                 // it: the test that pins id stability across a breakpoint has
@@ -420,7 +417,8 @@ impl super::Gui {
         self.propagate_layer_sync();
 
         #[cfg(test)]
-        self.last_menu_leaves.extend(menu_frame.drawn.iter().copied());
+        self.last_menu_leaves
+            .extend(menu_frame.drawn.iter().copied());
 
         for event in menu_frame.events {
             self.apply_menu_event(event, actions);
@@ -523,10 +521,15 @@ fn render_product_age(
     let text = if roomy {
         format!(
             "Level III: {} ({age})",
-            prefs.timezone.format_naive_utc(written, "%Y-%m-%d %H:%M:%S")
+            prefs
+                .timezone
+                .format_naive_utc(written, "%Y-%m-%d %H:%M:%S")
         )
     } else {
-        format!("L3 {} ({age})", prefs.timezone.format_naive_utc(written, "%H:%M"))
+        format!(
+            "L3 {} ({age})",
+            prefs.timezone.format_naive_utc(written, "%H:%M")
+        )
     };
     ui.separator();
     ui.label(&text);

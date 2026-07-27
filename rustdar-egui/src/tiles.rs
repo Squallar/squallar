@@ -1,7 +1,7 @@
 use crate::tile_source::HttpsTiles;
 use walkers::{
-    sources::{Attribution, TileSource},
     TileId,
+    sources::{Attribution, TileSource},
 };
 
 /// CartoDB tile source variants.
@@ -22,19 +22,27 @@ pub struct CartoDb {
 
 impl CartoDb {
     pub fn light() -> Self {
-        Self { style: CartoDbStyle::LightNoLabels }
+        Self {
+            style: CartoDbStyle::LightNoLabels,
+        }
     }
 
     pub fn dark() -> Self {
-        Self { style: CartoDbStyle::DarkNoLabels }
+        Self {
+            style: CartoDbStyle::DarkNoLabels,
+        }
     }
 
     pub fn light_labels() -> Self {
-        Self { style: CartoDbStyle::LightLabelsOnly }
+        Self {
+            style: CartoDbStyle::LightLabelsOnly,
+        }
     }
 
     pub fn dark_labels() -> Self {
-        Self { style: CartoDbStyle::DarkLabelsOnly }
+        Self {
+            style: CartoDbStyle::DarkLabelsOnly,
+        }
     }
 }
 

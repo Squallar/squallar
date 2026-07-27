@@ -49,6 +49,9 @@ pub fn offload(name: &'static str, job: impl FnOnce() + Send + 'static) {
         // it is logged rather than estimated.
         let started = web_time::Instant::now();
         job();
-        log::info!("{name} took {} ms on the main thread", started.elapsed().as_millis());
+        log::info!(
+            "{name} took {} ms on the main thread",
+            started.elapsed().as_millis()
+        );
     }
 }

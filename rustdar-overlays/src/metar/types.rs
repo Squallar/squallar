@@ -12,10 +12,10 @@ impl FlightCategory {
     /// Standard aviation category colours.
     pub fn color_rgba(self) -> [u8; 4] {
         match self {
-            FlightCategory::VFR => [0, 180, 0, 220],       // green
-            FlightCategory::MVFR => [0, 100, 255, 220],    // blue
-            FlightCategory::IFR => [220, 40, 40, 220],     // red
-            FlightCategory::LIFR => [180, 0, 180, 220],    // magenta
+            FlightCategory::VFR => [0, 180, 0, 220],    // green
+            FlightCategory::MVFR => [0, 100, 255, 220], // blue
+            FlightCategory::IFR => [220, 40, 40, 220],  // red
+            FlightCategory::LIFR => [180, 0, 180, 220], // magenta
         }
     }
 

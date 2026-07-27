@@ -530,7 +530,9 @@ pub fn derive(velocity: &Level3Message, sample: &StormMotionSample) -> Option<De
                     }
                     let v_kt = (gate as f32 - offset) as f64 / scale as f64 * MS_TO_KT;
                     let derived = (v_kt + component) * DERIVED_SCALE as f64 + DERIVED_OFFSET as f64;
-                    derived.round().clamp(FIRST_DATA_GATE as f64, u16::MAX as f64) as u16
+                    derived
+                        .round()
+                        .clamp(FIRST_DATA_GATE as f64, u16::MAX as f64) as u16
                 })
                 .collect();
             RadialRun {
@@ -1004,8 +1006,11 @@ mod validation_policy {
             .unwrap_or(0);
 
         // Step 1: per RPG radial, the azimuth mean of every 0.25 km sub-gate.
-        let mut sub: Vec<Vec<(f64, u32)>> =
-            rpg.radials.iter().map(|_| vec![(0.0, 0); sub_gates]).collect();
+        let mut sub: Vec<Vec<(f64, u32)>> = rpg
+            .radials
+            .iter()
+            .map(|_| vec![(0.0, 0); sub_gates])
+            .collect();
 
         for run in &derived.packet.radials {
             let centre = run.start_angle as f64 + run.angle_delta as f64 / 2.0;
@@ -1035,8 +1040,11 @@ mod validation_policy {
             .collect();
 
         // Step 2: per 1 km cell, the largest-magnitude of its sub-gate means.
-        let mut peak: Vec<Vec<Option<f64>>> =
-            rpg.radials.iter().map(|r| vec![None; r.gate_values.len()]).collect();
+        let mut peak: Vec<Vec<Option<f64>>> = rpg
+            .radials
+            .iter()
+            .map(|r| vec![None; r.gate_values.len()])
+            .collect();
         for (ri, row) in sub.iter().enumerate() {
             for (j, &(sum, count)) in row.iter().enumerate() {
                 if count == 0 {
@@ -1138,7 +1146,10 @@ mod validation_policy {
     /// leaves the correction term as the single difference between them.
     pub fn without_motion(sample: &StormMotionSample) -> StormMotionSample {
         StormMotionSample {
-            motion: StormMotion { speed_kt: 0.0, ..sample.motion },
+            motion: StormMotion {
+                speed_kt: 0.0,
+                ..sample.motion
+            },
             volume: sample.volume,
         }
     }
@@ -1162,9 +1173,7 @@ mod validation_policy {
 mod tests {
     use super::validation_policy::*;
     use super::*;
-    use nexrad_level3::model::{
-        DataLayer, MessageHeader, ProductDescriptionBlock, SymbologyBlock,
-    };
+    use nexrad_level3::model::{DataLayer, MessageHeader, ProductDescriptionBlock, SymbologyBlock};
 
     fn header(code: i16) -> MessageHeader {
         MessageHeader {
@@ -1180,9 +1189,12 @@ mod tests {
 
     /// Halfwords 31–33 of a real `MPX_N1G`: -63.5 m/s minimum, 0.5 m/s
     /// increment, 254 levels.
-    fn velocity_pdb(product_code: i16, elevation_tenths: i16, elevation_number: u16, volume: u32)
-        -> ProductDescriptionBlock
-    {
+    fn velocity_pdb(
+        product_code: i16,
+        elevation_tenths: i16,
+        elevation_number: u16,
+        volume: u32,
+    ) -> ProductDescriptionBlock {
         let mut thresholds = [0u16; 16];
         thresholds[0] = -635i16 as u16;
         thresholds[1] = 5;
@@ -1223,7 +1235,11 @@ mod tests {
 
     fn message(pdb: ProductDescriptionBlock, radials: Vec<RadialRun>) -> Level3Message {
         let code = pdb.product_code;
-        let num_range_bins = radials.iter().map(|r| r.gate_values.len()).max().unwrap_or(0) as u16;
+        let num_range_bins = radials
+            .iter()
+            .map(|r| r.gate_values.len())
+            .max()
+            .unwrap_or(0) as u16;
         Level3Message {
             header: header(code),
             pdb,
@@ -1274,12 +1290,19 @@ mod tests {
                 gate_values: vec![gate_for_ms(ms); 4],
             })
             .collect();
-        message(velocity_pdb(product_code, elevation_tenths, elevation_number, 7108), radials)
+        message(
+            velocity_pdb(product_code, elevation_tenths, elevation_number, 7108),
+            radials,
+        )
     }
 
     fn sample(speed_kt: f32, direction_deg: f32, volume: u32) -> StormMotionSample {
         StormMotionSample {
-            motion: StormMotion { speed_kt, direction_deg, is_scit_average: true },
+            motion: StormMotion {
+                speed_kt,
+                direction_deg,
+                is_scit_average: true,
+            },
             volume: Some((20661, volume)),
         }
     }
@@ -1319,7 +1342,10 @@ mod tests {
     fn the_source_velocity_is_converted_from_metres_per_second() {
         let msg = uniform(99, &[0.0], 1.0, 25.0);
         let d = derive(&msg, &sample(0.0, 0.0, 7108)).unwrap();
-        assert!((knots_at(&d, 0, 0) - 48.60).abs() < 0.3, "25 m/s is 48.6 kt");
+        assert!(
+            (knots_at(&d, 0, 0) - 48.60).abs() < 0.3,
+            "25 m/s is 48.6 kt"
+        );
         assert!(knots_at(&d, 0, 0) > 30.0, "not left in metres per second");
     }
 
@@ -1335,7 +1361,8 @@ mod tests {
                 let want = ms as f64 * MS_TO_KT;
                 assert!(
                     (knots_at(&d, r, 0) as f64 - want).abs() < 0.3,
-                    "{ms} m/s radial {r}: got {}", knots_at(&d, r, 0),
+                    "{ms} m/s radial {r}: got {}",
+                    knots_at(&d, r, 0),
                 );
             }
         }
@@ -1356,7 +1383,8 @@ mod tests {
         let d = derive(&msg, &sample(40.0, 90.0, 7108)).unwrap();
         assert!(
             (knots_at(&d, 0, 0) - 40.0).abs() < 0.3,
-            "the centre is 090, the peak: got {}", knots_at(&d, 0, 0),
+            "the centre is 090, the peak: got {}",
+            knots_at(&d, 0, 0),
         );
         // The leading edge would give cos(30°) = 0.866 → 34.6 kt.
         assert!(
@@ -1370,7 +1398,8 @@ mod tests {
         let d2 = derive(&msg, &sample(40.0, 90.0, 7108)).unwrap();
         assert!(
             knots_at(&d2, 0, 0).abs() < 0.3,
-            "the centre is 180, the zero crossing: got {}", knots_at(&d2, 0, 0),
+            "the centre is 180, the zero crossing: got {}",
+            knots_at(&d2, 0, 0),
         );
     }
 
@@ -1417,11 +1446,14 @@ mod tests {
     /// at one angle are told apart only by elevation number.
     #[test]
     fn elevation_comes_from_the_product_description_block() {
-        let msg = message(velocity_pdb(154, 13, 9, 7108), vec![RadialRun {
-            start_angle: 0.0,
-            angle_delta: 0.5,
-            gate_values: vec![gate_for_ms(0.0)],
-        }]);
+        let msg = message(
+            velocity_pdb(154, 13, 9, 7108),
+            vec![RadialRun {
+                start_angle: 0.0,
+                angle_delta: 0.5,
+                gate_values: vec![gate_for_ms(0.0)],
+            }],
+        );
         let d = derive(&msg, &sample(0.0, 0.0, 7108)).unwrap();
         assert_eq!(d.elevation_angle, 1.3, "not the mnemonic's nominal 1.5");
         assert_eq!(d.elevation_number, 9, "the MRLE repeat, not cut 3");
@@ -1434,7 +1466,10 @@ mod tests {
     fn an_already_storm_relative_product_is_not_a_source() {
         for code in [56i16, 55, 94, 134, 135, 163, 176, 177] {
             let msg = uniform(code, &[0.0], 1.0, 10.0);
-            assert!(derive(&msg, &sample(30.0, 90.0, 7108)).is_none(), "product {code}");
+            assert!(
+                derive(&msg, &sample(30.0, 90.0, 7108)).is_none(),
+                "product {code}"
+            );
         }
         for code in VELOCITY_PRODUCT_CODES {
             assert!(derive(&uniform(code, &[0.0], 1.0, 10.0), &sample(30.0, 90.0, 7108)).is_some());
@@ -1481,7 +1516,10 @@ mod tests {
         // Absolute, not relative to the constant: a floor expressed only in
         // terms of `MIN_NONZERO_GATES` moves with it, so lowering the constant
         // to 1 would leave every assertion above still passing.
-        assert!(!sample_is_conclusive(3, 5_000), "5,000 gates is not a sample");
+        assert!(
+            !sample_is_conclusive(3, 5_000),
+            "5,000 gates is not a sample"
+        );
         assert!(!sample_is_conclusive(3, 9_999));
         assert!(sample_is_conclusive(3, 200_000));
     }
@@ -1492,10 +1530,19 @@ mod tests {
     #[test]
     fn a_non_finite_override_is_not_constructible() {
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            assert!(StormMotionSample::user_override(bad, 240.0).is_none(), "speed {bad}");
-            assert!(StormMotionSample::user_override(30.0, bad).is_none(), "direction {bad}");
+            assert!(
+                StormMotionSample::user_override(bad, 240.0).is_none(),
+                "speed {bad}"
+            );
+            assert!(
+                StormMotionSample::user_override(30.0, bad).is_none(),
+                "direction {bad}"
+            );
         }
-        assert!(StormMotionSample::user_override(0.0, 0.0).is_some(), "zero is legitimate");
+        assert!(
+            StormMotionSample::user_override(0.0, 0.0).is_some(),
+            "zero is legitimate"
+        );
     }
 
     /// A hand-entered vector belongs to no volume and is never a SCIT average.
@@ -1508,7 +1555,10 @@ mod tests {
     fn a_user_override_claims_no_provenance() {
         let s = StormMotionSample::user_override(45.0, 210.0).expect("finite");
         assert!(!s.motion.is_scit_average);
-        assert_eq!(s.volume, None, "an override must carry no volume key at all");
+        assert_eq!(
+            s.volume, None,
+            "an override must carry no volume key at all"
+        );
         let d = derive(&uniform(154, &[0.0], 0.5, 0.0), &s).unwrap();
         assert_eq!(d.motion_provenance, MotionProvenance::UserOverride);
         assert!(
@@ -1532,7 +1582,10 @@ mod tests {
         // `N2G`/`N3G` and `N0U`/`N1U` are not in the bucket; asserted by name
         // because swapping one in is the obvious thing to try.
         for absent in ["N2G", "N3G", "N0U", "N1U"] {
-            assert!(!SRM_TILT_PRODUCTS.contains(&absent), "{absent} is not published");
+            assert!(
+                !SRM_TILT_PRODUCTS.contains(&absent),
+                "{absent} is not published"
+            );
         }
     }
 
@@ -1572,12 +1625,22 @@ mod tests {
 
         assert_eq!(d0.elevation_angle, 0.5);
         assert_eq!(d1.elevation_angle, 1.3);
-        assert_eq!(d0.packet.radials[0].gate_values, d1.packet.radials[0].gate_values);
-        assert!((d0.packet.gate_interval_km() - 0.25).abs() < 1e-9, "0.5° is 0.25 km");
+        assert_eq!(
+            d0.packet.radials[0].gate_values,
+            d1.packet.radials[0].gate_values
+        );
+        assert!(
+            (d0.packet.gate_interval_km() - 0.25).abs() < 1e-9,
+            "0.5° is 0.25 km"
+        );
         assert_eq!(d0.scale, d1.scale);
         assert_eq!(d0.offset, d1.offset);
         // 10 m/s is 19.4 kt, and azimuth 090 takes the full +30 kt.
-        assert!((knots_at(&d0, 0, 0) - (19.438 + 30.0)).abs() < 0.5, "got {}", knots_at(&d0, 0, 0));
+        assert!(
+            (knots_at(&d0, 0, 0) - (19.438 + 30.0)).abs() < 0.5,
+            "got {}",
+            knots_at(&d0, 0, 0)
+        );
     }
 
     /// The vector cannot come off `N0G`: halfword 51 is the BZ2 compression
@@ -1599,7 +1662,11 @@ mod tests {
     fn the_rpg_level_bins_run_from_below_minus_64_to_above_64() {
         assert_eq!(quantize_to_rpg_levels(-100.0), 1);
         assert_eq!(quantize_to_rpg_levels(-64.1), 1);
-        assert_eq!(quantize_to_rpg_levels(-64.0), 2, "the edge belongs to the bin above");
+        assert_eq!(
+            quantize_to_rpg_levels(-64.0),
+            2,
+            "the edge belongs to the bin above"
+        );
         assert_eq!(quantize_to_rpg_levels(-50.1), 2);
         assert_eq!(quantize_to_rpg_levels(-50.0), 3);
         assert_eq!(quantize_to_rpg_levels(-0.1), 7, "just negative");
@@ -1677,7 +1744,8 @@ mod tests {
             let d = derive(&m, &sample(0.0, 0.0, 7108)).unwrap();
             assert!(
                 (knots_at(&d, 0, 0) as f64 - want).abs() <= 0.25,
-                "gate {gate}: {} vs {want}", knots_at(&d, 0, 0),
+                "gate {gate}: {} vs {want}",
+                knots_at(&d, 0, 0),
             );
         }
     }
@@ -1718,8 +1786,14 @@ mod tests {
     #[test]
     fn a_whole_site_quarantine_suppresses_the_site_total() {
         assert!(!site_total_is_asserted("KSFX"), "KSFX is quarantined whole");
-        assert!(site_total_is_asserted("KBIS"), "KBIS is quarantined only at 0.5°");
-        assert!(site_total_is_asserted("KMPX"), "an unquarantined site is asserted on");
+        assert!(
+            site_total_is_asserted("KBIS"),
+            "KBIS is quarantined only at 0.5°"
+        );
+        assert!(
+            site_total_is_asserted("KMPX"),
+            "an unquarantined site is asserted on"
+        );
         assert_eq!(quarantine("KSFX").map(|q| q.scope), Some(Scope::Whole));
         assert_eq!(quarantine("KMPX").map(|q| q.scope), None);
         // Every site the forty-volume survey found short at 0.5°. Named
@@ -1733,14 +1807,18 @@ mod tests {
                 Some(Scope::LowestTilt),
                 "{site} was measured under the bar at 0.5° over many volumes",
             );
-            assert!(site_total_is_asserted(site), "{site} still contributes a total");
+            assert!(
+                site_total_is_asserted(site),
+                "{site} still contributes a total"
+            );
         }
         // Quarantined means "not asserted on", never "not measured": a site
         // dropped from SITES is a site nobody would notice had got worse.
         for q in QUARANTINED {
             assert!(
                 super::live_validation::SITES.contains(&q.site),
-                "{} is quarantined but no longer measured", q.site,
+                "{} is quarantined but no longer measured",
+                q.site,
             );
             assert!(!q.why.is_empty(), "{} records no numbers", q.site);
         }
@@ -1752,14 +1830,27 @@ mod tests {
     /// inside a 99% assertion.
     #[test]
     fn no_quarantined_site_is_asserted_on_at_the_lowest_tilt() {
-        assert!(!lowest_tilt_is_asserted("KBIS", 500_000), "KBIS at 0.5° is the quarantine");
+        assert!(
+            !lowest_tilt_is_asserted("KBIS", 500_000),
+            "KBIS at 0.5° is the quarantine"
+        );
         assert!(!lowest_tilt_is_asserted("KSFX", 500_000));
-        assert!(lowest_tilt_is_asserted("KMPX", 1), "an unquarantined site with gates");
+        assert!(
+            lowest_tilt_is_asserted("KMPX", 1),
+            "an unquarantined site with gates"
+        );
         // Unmeasured is not the same as passing: a run that never reached the
         // lowest tilt must not count as having asserted on it.
-        assert!(!lowest_tilt_is_asserted("KMPX", 0), "no gates is not an assertion");
+        assert!(
+            !lowest_tilt_is_asserted("KMPX", 0),
+            "no gates is not an assertion"
+        );
         for q in QUARANTINED {
-            assert!(!lowest_tilt_is_asserted(q.site, 500_000), "{} at 0.5°", q.site);
+            assert!(
+                !lowest_tilt_is_asserted(q.site, 500_000),
+                "{} at 0.5°",
+                q.site
+            );
         }
     }
 
@@ -1780,7 +1871,10 @@ mod tests {
         // whole point of the narrower scope.
         assert!(!tilt_is_asserted("KBIS", 0), "KBIS 0.5° is the quarantine");
         for tilt in 1..4 {
-            assert!(tilt_is_asserted("KBIS", tilt), "KBIS tilt {tilt} still counts");
+            assert!(
+                tilt_is_asserted("KBIS", tilt),
+                "KBIS tilt {tilt} still counts"
+            );
         }
         // Whole-site: nothing counts, so the site contributes no gates at all.
         for tilt in 0..4 {
@@ -1802,7 +1896,14 @@ mod tests {
                 // unique n; the lowest tilt is deliberately the worst.
                 let n = 10_usize.pow(3 - tilt as u32);
                 let within_one = if tilt == 0 { n * 90 / 100 } else { n };
-                (tilt, Tally { n, exact: within_one, within_one })
+                (
+                    tilt,
+                    Tally {
+                        n,
+                        exact: within_one,
+                        within_one,
+                    },
+                )
             })
             .collect()
     }
@@ -1830,7 +1931,10 @@ mod tests {
         let f = figures_to_assert("KBIS", &per_tilt);
         assert_eq!(f.len(), 1, "the 0.5° figure is not asserted on");
         assert_eq!(f[0].0, Figure::AssertedTilts);
-        assert_eq!(f[0].1.n, 111, "the quarantined tilt's gates are gone, not discounted");
+        assert_eq!(
+            f[0].1.n, 111,
+            "the quarantined tilt's gates are gone, not discounted"
+        );
         assert!(
             (f[0].1.within_one_pct() - 100.0).abs() < 1e-9,
             "the upper three agree perfectly here; got {:.2}% — the excluded tilt leaked in",
@@ -1841,7 +1945,10 @@ mod tests {
         // no tilt is admitted, so the pool is empty and there is nothing to
         // apply a bar to — the same route as a site that measured nothing.
         assert!(figures_to_assert("KSFX", &per_tilt).is_empty());
-        assert!(!site_total_is_asserted("KSFX"), "and the scope says so directly");
+        assert!(
+            !site_total_is_asserted("KSFX"),
+            "and the scope says so directly"
+        );
 
         // A site whose 0.5° was never compared gets no 0.5° figure, and the
         // total still holds.
@@ -1867,8 +1974,14 @@ mod tests {
     /// module's "the residual is the resampler" argument rests on it.
     #[test]
     fn only_a_still_oracle_makes_a_zero_vector_control() {
-        assert_eq!(classify_sample(0.0, Some(0.0)), SampleKind::ZeroVectorControl);
-        assert_eq!(classify_sample(0.0, Some(11.8)), SampleKind::MismatchedStill);
+        assert_eq!(
+            classify_sample(0.0, Some(0.0)),
+            SampleKind::ZeroVectorControl
+        );
+        assert_eq!(
+            classify_sample(0.0, Some(11.8)),
+            SampleKind::MismatchedStill
+        );
         assert_eq!(classify_sample(0.0, None), SampleKind::MismatchedStill);
         // A real vector is a real vector whatever the oracle says; the oracle
         // check must not start suppressing the gates the bar is applied to.
@@ -1956,29 +2069,62 @@ mod tests {
 
         // RPG radial 0, gate 0: azimuth means [3, -4, 5, 2] m/s, peak +5.
         let got = cell(&grid, 0, 0);
-        assert!((got - kt(5.0)).abs() < 0.3, "want {:.2} kt, got {got:.2}", kt(5.0));
-        assert!((got - kt(10.0)).abs() > 1.0, "azimuth summed instead of averaged");
-        assert!((got - kt(1.5)).abs() > 1.0, "range averaged instead of peaking");
+        assert!(
+            (got - kt(5.0)).abs() < 0.3,
+            "want {:.2} kt, got {got:.2}",
+            kt(5.0)
+        );
+        assert!(
+            (got - kt(10.0)).abs() > 1.0,
+            "azimuth summed instead of averaged"
+        );
+        assert!(
+            (got - kt(1.5)).abs() > 1.0,
+            "range averaged instead of peaking"
+        );
         // Either half-degree radial on its own peaks at ±6 m/s, so both "took
         // the larger" and "read only one radial" land there.
-        assert!((got - kt(6.0)).abs() > 1.0, "azimuth kept one radial rather than the mean");
-        assert!((got - kt(-6.0)).abs() > 1.0, "azimuth kept one radial rather than the mean");
+        assert!(
+            (got - kt(6.0)).abs() > 1.0,
+            "azimuth kept one radial rather than the mean"
+        );
+        assert!(
+            (got - kt(-6.0)).abs() > 1.0,
+            "azimuth kept one radial rather than the mean"
+        );
         // Reversing the two steps — peak per half-degree radial, then average
         // the peaks — gives mean(-6, +6) = 0 here.
-        assert!(got.abs() > 1.0, "range was peaked before azimuth was averaged");
+        assert!(
+            got.abs() > 1.0,
+            "range was peaked before azimuth was averaged"
+        );
 
         // RPG radial 0, gate 1: means [-9, 3, 0, 4] m/s. The peak is negative,
         // so "largest magnitude" and "largest value" part company.
         let got = cell(&grid, 0, 1);
-        assert!((got - kt(-9.0)).abs() < 0.3, "want {:.2} kt, got {got:.2}", kt(-9.0));
-        assert!(got < 0.0, "range kept the largest value, not the largest magnitude");
+        assert!(
+            (got - kt(-9.0)).abs() < 0.3,
+            "want {:.2} kt, got {got:.2}",
+            kt(-9.0)
+        );
+        assert!(
+            got < 0.0,
+            "range kept the largest value, not the largest magnitude"
+        );
 
         // RPG radial 1 draws on the other two derived radials entirely.
-        assert!((cell(&grid, 1, 0) - kt(21.0)).abs() < 0.3, "azimuth mapping crossed radials");
+        assert!(
+            (cell(&grid, 1, 0) - kt(21.0)).abs() < 0.3,
+            "azimuth mapping crossed radials"
+        );
         assert!((cell(&grid, 1, 1) - kt(1.0)).abs() < 0.3);
 
         // RPG radial 2 has no derived radial pointing at it.
-        assert_eq!(grid[2], vec![None, None], "a cell with no sub-gate stays empty");
+        assert_eq!(
+            grid[2],
+            vec![None, None],
+            "a cell with no sub-gate stays empty"
+        );
     }
 
     /// Both packets' `first_range_bin` shift the range binning, and a sub-gate
@@ -1998,11 +2144,13 @@ mod tests {
         // Azimuth means are [3, -4, 5, 2, -9, 3, 0, 4] m/s.
         assert!(
             (cell(&grid, 0, 0) - kt(-9.0)).abs() < 0.3,
-            "want the peak of j=2..5, got {:.2}", cell(&grid, 0, 0),
+            "want the peak of j=2..5, got {:.2}",
+            cell(&grid, 0, 0),
         );
         assert!(
             (cell(&grid, 0, 1) - kt(4.0)).abs() < 0.3,
-            "want the peak of j=6,7, got {:.2}", cell(&grid, 0, 1),
+            "want the peak of j=6,7, got {:.2}",
+            cell(&grid, 0, 1),
         );
     }
 
@@ -2074,16 +2222,40 @@ mod tests {
             "the RPG's levels are 10 kt wide either side of zero; a floor under that \
              cannot tell the corrected field from the uncorrected one",
         );
-        assert!(!vector_is_decisive(0.0), "a zero vector is the case being excluded");
+        assert!(
+            !vector_is_decisive(0.0),
+            "a zero vector is the case being excluded"
+        );
         assert!(!vector_is_decisive(DECISIVE_VECTOR_KT - 0.1));
         assert!(vector_is_decisive(DECISIVE_VECTOR_KT));
 
-        let better = Tally { n: 1000, exact: 0, within_one: 995 };
-        let worse = Tally { n: 1000, exact: 0, within_one: 400 };
-        assert!(correction_is_earned(&better, &worse), "the corrected field agrees more");
-        assert!(!correction_is_earned(&worse, &better), "and a sign error agrees less");
+        let better = Tally {
+            n: 1000,
+            exact: 0,
+            within_one: 995,
+        };
+        let worse = Tally {
+            n: 1000,
+            exact: 0,
+            within_one: 400,
+        };
         assert!(
-            !correction_is_earned(&better, &Tally { n: 1000, exact: 0, within_one: 995 }),
+            correction_is_earned(&better, &worse),
+            "the corrected field agrees more"
+        );
+        assert!(
+            !correction_is_earned(&worse, &better),
+            "and a sign error agrees less"
+        );
+        assert!(
+            !correction_is_earned(
+                &better,
+                &Tally {
+                    n: 1000,
+                    exact: 0,
+                    within_one: 995
+                }
+            ),
             "a tie is not earned — with a decisive vector the two fields differ",
         );
     }
@@ -2184,7 +2356,11 @@ mod live_validation {
             })
             .collect();
         candidates.sort();
-        candidates.into_iter().take(KEY_LOOKBACK).map(|(_, k)| k).collect()
+        candidates
+            .into_iter()
+            .take(KEY_LOOKBACK)
+            .map(|(_, k)| k)
+            .collect()
     }
 
     /// The bucket product for `site`/`code` from the same volume **and cut** as
@@ -2229,7 +2405,9 @@ mod live_validation {
         chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?
             .checked_add_days(chrono::Days::new(days))?
             .and_hms_opt(0, 0, 0)?
-            .checked_add_signed(chrono::Duration::seconds(i64::from(msg.pdb.generation_time)))
+            .checked_add_signed(chrono::Duration::seconds(i64::from(
+                msg.pdb.generation_time,
+            )))
     }
 
     /// One site's four measurements: the newest-vector pairing and the
@@ -2381,7 +2559,11 @@ mod live_validation {
                     derived.elevation_angle,
                     derived.elevation_number,
                     if is_moving { "moving" } else { "ZERO VECTOR" },
-                    if derived.motion_volume_matches() { "" } else { ", vector from another volume" },
+                    if derived.motion_volume_matches() {
+                        ""
+                    } else {
+                        ", vector from another volume"
+                    },
                     t.n,
                     t.exact_pct(),
                     t.within_one_pct(),
@@ -2552,7 +2734,11 @@ mod live_validation {
         // default suite reads.
         for r in &asserted {
             let figures = figures_to_assert(r.site, &r.per_tilt);
-            assert!(!figures.is_empty(), "{}: no own-volume comparison was made", r.site);
+            assert!(
+                !figures.is_empty(),
+                "{}: no own-volume comparison was made",
+                r.site
+            );
             for (figure, tally) in &figures {
                 meets_the_bar(r, *figure, tally);
             }
@@ -2700,9 +2886,7 @@ mod live_validation {
             }
             println!(
                 "{site}: vector {:.1} kt from {:.1}° (scit={})",
-                sample.motion.speed_kt,
-                sample.motion.direction_deg,
-                sample.motion.is_scit_average,
+                sample.motion.speed_kt, sample.motion.direction_deg, sample.motion.is_scit_average,
             );
 
             for (tilt, &code) in SRM_TILT_PRODUCTS.iter().enumerate() {
@@ -2864,7 +3048,11 @@ mod live_validation {
                     t.n,
                     t.exact_pct(),
                     t.within_one_pct(),
-                    if meets_acceptance_bar(t.within_one_pct()) { "" } else { "  UNDER BAR" },
+                    if meets_acceptance_bar(t.within_one_pct()) {
+                        ""
+                    } else {
+                        "  UNDER BAR"
+                    },
                 );
                 pcts.push(t.within_one_pct());
                 pooled.absorb(&t);

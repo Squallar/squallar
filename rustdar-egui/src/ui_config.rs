@@ -126,9 +126,15 @@ impl super::Gui {
     /// Save UI layout configuration to `store`.
     pub fn save_ui_config(&self, store: &dyn ConfigStore) {
         // Guard against NaN/Infinity in f32 fields which cause serde_json to fail.
-        let fps = if self.loop_speed_fps.is_finite() { self.loop_speed_fps } else { 5.0 };
-        let pane_configs: Vec<PaneConfig> = self.panes.iter().map(|pane| {
-            PaneConfig {
+        let fps = if self.loop_speed_fps.is_finite() {
+            self.loop_speed_fps
+        } else {
+            5.0
+        };
+        let pane_configs: Vec<PaneConfig> = self
+            .panes
+            .iter()
+            .map(|pane| PaneConfig {
                 selected_product: pane.selected_product,
                 selected_elevation: if pane.selected_elevation.is_finite() {
                     pane.selected_elevation
@@ -142,8 +148,8 @@ impl super::Gui {
                 draw_order: pane.draw_order.clone(),
                 enabled_overlays: pane.enabled_overlays.clone(),
                 overlay_configs: pane.overlay_configs.clone(),
-            }
-        }).collect();
+            })
+            .collect();
         let config = UiConfig {
             pane_count: self.pane_layout.pane_count,
             active_pane: self.active_pane,
@@ -195,11 +201,19 @@ impl super::Gui {
         // per-device narrowing at the point of *editing*.
         let count = config.pane_count.clamp(1, WidthClass::max_panes_absolute());
         while self.panes.len() < count {
-            let site = config.panes.get(self.panes.len()).map(|pc| pc.site.clone()).unwrap_or_else(|| config.site.clone());
+            let site = config
+                .panes
+                .get(self.panes.len())
+                .map(|pc| pc.site.clone())
+                .unwrap_or_else(|| config.site.clone());
             self.panes.push(PaneState::with_site(site));
         }
         self.pane_layout = PaneLayout::for_count(count);
-        self.active_pane = if config.active_pane < count { config.active_pane } else { 0 };
+        self.active_pane = if config.active_pane < count {
+            config.active_pane
+        } else {
+            0
+        };
 
         self.viewport_sync = config.viewport_sync;
         self.sync_layers = config.sync_layers;
@@ -236,9 +250,10 @@ impl super::Gui {
             pane.time_step_secs = pc.time_step_secs;
             // Capture the first pane's legacy Radar toggle for migration.
             if legacy_radar_enabled.is_none()
-                && let Some(&enabled) = pc.layers.get(&LayerKind::Radar) {
-                    legacy_radar_enabled = Some(enabled);
-                }
+                && let Some(&enabled) = pc.layers.get(&LayerKind::Radar)
+            {
+                legacy_radar_enabled = Some(enabled);
+            }
             pane.draw_order = reconcile_draw_order(&pc.draw_order);
             // Restore per-pane overlay enabled state.
             if !pc.enabled_overlays.is_empty() {
@@ -252,7 +267,8 @@ impl super::Gui {
 
         // Restore handler-owned overlay states (backward-compatible: old configs have empty map)
         if !config.overlay_states.is_empty() {
-            self.overlays.deserialize_handler_states(&config.overlay_states);
+            self.overlays
+                .deserialize_handler_states(&config.overlay_states);
         } else if let Some(enabled) = legacy_radar_enabled {
             // Migrating from legacy config: no overlay_states saved yet.
             // Apply the old per-pane Radar toggle to the global handler.
@@ -276,7 +292,11 @@ fn reconcile_draw_order(saved: &[OverlayKind]) -> Vec<OverlayKind> {
         OverlayKind::all().iter().copied().collect();
 
     // Keep only recognized kinds, in saved order.
-    let mut result: Vec<OverlayKind> = saved.iter().copied().filter(|k| all_set.contains(k)).collect();
+    let mut result: Vec<OverlayKind> = saved
+        .iter()
+        .copied()
+        .filter(|k| all_set.contains(k))
+        .collect();
 
     // Append any missing kinds (new variants added since save).
     for &kind in OverlayKind::all() {

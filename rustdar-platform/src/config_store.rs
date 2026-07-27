@@ -81,7 +81,9 @@ mod tests {
         let store = FileConfigStore::new(dir.0.clone());
 
         assert_eq!(store.load("ui"), None, "nothing stored yet");
-        store.store("ui", "{\"a\":1}").expect("store should succeed");
+        store
+            .store("ui", "{\"a\":1}")
+            .expect("store should succeed");
         assert_eq!(store.load("ui"), Some("{\"a\":1}".to_string()));
     }
 

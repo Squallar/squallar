@@ -138,18 +138,12 @@ pub async fn resolve_zone_geometries(
     }
 }
 
-async fn fetch_zone_geometry(
-    client: &reqwest::Client,
-    url: &str,
-) -> Option<Vec<GeoPolygon>> {
+async fn fetch_zone_geometry(client: &reqwest::Client, url: &str) -> Option<Vec<GeoPolygon>> {
     let json = fetch_zone_json(client, url).await?;
     parse_zone_polygons(&json, url)
 }
 
-async fn fetch_zone_json(
-    client: &reqwest::Client,
-    url: &str,
-) -> Option<serde_json::Value> {
+async fn fetch_zone_json(client: &reqwest::Client, url: &str) -> Option<serde_json::Value> {
     let response = client
         .get(url)
         .header("Accept", "application/geo+json")
@@ -198,7 +192,9 @@ fn parse_zone_polygons(json: &serde_json::Value, url: &str) -> Option<Vec<GeoPol
         .map(|polygon| {
             polygon
                 .into_iter()
-                .map(|ring| crate::render::geo::simplify_ring(&ring, crate::types::SIMPLIFY_EPSILON))
+                .map(|ring| {
+                    crate::render::geo::simplify_ring(&ring, crate::types::SIMPLIFY_EPSILON)
+                })
                 .filter(|r| r.len() >= 3)
                 .collect()
         })

@@ -302,7 +302,9 @@ impl PlatformBridge for AndroidPlatform {
             Ok(receiver) => self.theme_receiver = Some(receiver),
             // Not fatal: `detect_dark_theme` still answers synchronously, so
             // the app opens in the right theme, it just stops tracking changes.
-            Err(e) => log::error!("could not start theme polling, theme will not track changes: {e}"),
+            Err(e) => {
+                log::error!("could not start theme polling, theme will not track changes: {e}")
+            }
         }
     }
 }

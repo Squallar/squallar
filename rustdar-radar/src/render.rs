@@ -81,10 +81,10 @@ mod seq_fallback {
     }
 }
 
-use std::f64::consts::PI;
-use std::sync::atomic::{AtomicU64, Ordering};
 use crate::palette::get_color_for_value;
 use crate::types;
+use std::f64::consts::PI;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ── Shared rendering infrastructure ──────────────────────────────────────────
 
@@ -147,8 +147,7 @@ impl MercatorProjection {
 
                 let dx_km = r * sin_az;
                 let dy_km = r * cos_az;
-                let px_i =
-                    (self.center_px + dx_km * cos_correction * types::PIXELS_PER_KM) as i32;
+                let px_i = (self.center_px + dx_km * cos_correction * types::PIXELS_PER_KM) as i32;
                 let dest_lat_rad = self.radar_lat_rad + dy_km / types::EARTH_RADIUS_KM;
                 let dest_merc_y = types::lat_rad_to_mercator_y(dest_lat_rad);
                 let py_i = ((self.merc_y_top - dest_merc_y) * self.merc_y_scale) as i32;
@@ -425,10 +424,7 @@ pub fn find_closest_elevation(
             let rounded = (r.elevation_angle_degrees() * 10.0).round() / 10.0;
             product.get_moment(r).is_some().then_some(rounded)
         })
-        .min_by(|a, b| {
-            ((*a - target_elevation).abs())
-                .total_cmp(&((*b - target_elevation).abs()))
-        })
+        .min_by(|a, b| ((*a - target_elevation).abs()).total_cmp(&((*b - target_elevation).abs())))
 }
 
 /// Find the sweep whose first radial matches `elevation_angle` and carries the
@@ -536,35 +532,45 @@ pub fn render_radar_to_image(
     let actual_max_range = compute_max_range(radials, product);
 
     let output = render_with_projection(
-        radar_lat, radar_lon, actual_max_range, product, "Radar",
+        radar_lat,
+        radar_lon,
+        actual_max_range,
+        product,
+        "Radar",
         |proj, bufs| {
-            radials.par_iter().enumerate().for_each(|(radial_idx, radial)| {
-                let azimuth = radial.azimuth_angle_degrees() as f64;
-                let ctx = RadialContext::new(azimuth, avg_azimuth_spacing / 2.0);
+            radials
+                .par_iter()
+                .enumerate()
+                .for_each(|(radial_idx, radial)| {
+                    let azimuth = radial.azimuth_angle_degrees() as f64;
+                    let ctx = RadialContext::new(azimuth, avg_azimuth_spacing / 2.0);
 
-                if let Some(moment) = product.get_moment(radial) {
-                    let first_gate_range = moment.first_gate_range_km();
-                    let gate_size = moment.gate_interval_km();
+                    if let Some(moment) = product.get_moment(radial) {
+                        let first_gate_range = moment.first_gate_range_km();
+                        let gate_size = moment.gate_interval_km();
 
-                    for (gate_idx, moment_value) in moment.values().iter().enumerate() {
-                        let range_km = first_gate_range + (gate_idx as f64 * gate_size);
-                        if range_km > types::MAX_RANGE_KM {
-                            break;
+                        for (gate_idx, moment_value) in moment.values().iter().enumerate() {
+                            let range_km = first_gate_range + (gate_idx as f64 * gate_size);
+                            if range_km > types::MAX_RANGE_KM {
+                                break;
+                            }
+
+                            let scaled_value = match moment_value {
+                                nexrad_model::data::MomentValue::Value(v) => *v,
+                                _ => continue,
+                            };
+                            if scaled_value >= 999.0 || scaled_value.is_nan() {
+                                continue;
+                            }
+
+                            let from = GateId {
+                                radial: radial_idx,
+                                gate: gate_idx,
+                            };
+                            proj.render_gate(bufs, &ctx, range_km, gate_size, scaled_value, from);
                         }
-
-                        let scaled_value = match moment_value {
-                            nexrad_model::data::MomentValue::Value(v) => *v,
-                            _ => continue,
-                        };
-                        if scaled_value >= 999.0 || scaled_value.is_nan() {
-                            continue;
-                        }
-
-                        let from = GateId { radial: radial_idx, gate: gate_idx };
-                        proj.render_gate(bufs, &ctx, range_km, gate_size, scaled_value, from);
                     }
-                }
-            });
+                });
         },
     );
     Some(output)
@@ -589,13 +595,22 @@ fn render_nrot_to_image(
     let azimuths_rad: Vec<f64> = vg.azimuths_deg.iter().map(|d| d.to_radians()).collect();
     let avg_spacing_deg = 360.0 / num_radials as f64;
 
-    let nrot_grid = compute_nrot_grid(&vg.vel_grid, vg.gate_count, vg.first_gate_range_km, vg.gate_interval_km, &azimuths_rad);
+    let nrot_grid = compute_nrot_grid(
+        &vg.vel_grid,
+        vg.gate_count,
+        vg.first_gate_range_km,
+        vg.gate_interval_km,
+        &azimuths_rad,
+    );
 
     let nrot_grid = filter_nrot_grid(&nrot_grid, vg.gate_count);
 
     let output = render_with_projection(
-        radar_lat, radar_lon, actual_max_range,
-        types::RadarProduct::NormalizedRotation, "NROT",
+        radar_lat,
+        radar_lon,
+        actual_max_range,
+        types::RadarProduct::NormalizedRotation,
+        "NROT",
         |proj, bufs| {
             nrot_grid.par_iter().enumerate().for_each(|(i, nrot_row)| {
                 let ctx = RadialContext::new(vg.azimuths_deg[i], avg_spacing_deg / 2.0);
@@ -615,17 +630,20 @@ fn render_nrot_to_image(
                     // `into_output` would colour it transparent either way, so
                     // this has to happen here, not there.
                     let scaled_value = nrot_val as f32;
-                    let color = get_color_for_value(
-                        types::RadarProduct::NormalizedRotation,
-                        scaled_value,
-                    );
+                    let color =
+                        get_color_for_value(types::RadarProduct::NormalizedRotation, scaled_value);
                     if color.3 == 0 {
                         continue;
                     }
 
                     let from = GateId { radial: i, gate: j };
                     proj.render_gate(
-                        bufs, &ctx, range_km, vg.gate_interval_km, scaled_value, from,
+                        bufs,
+                        &ctx,
+                        range_km,
+                        vg.gate_interval_km,
+                        scaled_value,
+                        from,
                     );
                 }
             });
@@ -658,15 +676,23 @@ fn build_velocity_grid(radials: &[Radial]) -> Option<VelocityGrid> {
         if let Some(moment) = radial.velocity() {
             for (j, val) in moment.values().iter().enumerate().take(gate_count) {
                 if let nexrad_model::data::MomentValue::Value(v) = val
-                    && !v.is_nan() && *v < 999.0 {
-                        gates[j] = *v as f64;
-                    }
+                    && !v.is_nan()
+                    && *v < 999.0
+                {
+                    gates[j] = *v as f64;
+                }
             }
         }
         vel_grid.push(gates);
     }
 
-    Some(VelocityGrid { vel_grid, azimuths_deg, gate_count, first_gate_range_km, gate_interval_km })
+    Some(VelocityGrid {
+        vel_grid,
+        azimuths_deg,
+        gate_count,
+        first_gate_range_km,
+        gate_interval_km,
+    })
 }
 
 /// Drop isolated noise: a gate survives only if at least `MIN_COHERENT` of its
@@ -764,8 +790,7 @@ fn compute_nrot_grid(
                     let mut n = 0usize;
 
                     for da in -az_reach..=az_reach {
-                        let ai =
-                            ((i as i32 + da).rem_euclid(num_radials as i32)) as usize;
+                        let ai = ((i as i32 + da).rem_euclid(num_radials as i32)) as usize;
                         let mut dtheta = azimuths_rad[ai] - center_az;
                         if dtheta > PI {
                             dtheta -= 2.0 * PI;
@@ -783,8 +808,7 @@ fn compute_nrot_grid(
                             }
 
                             let rng_dist_km = (dr as f64 * gate_interval).abs();
-                            let dist_sq =
-                                az_dist_km * az_dist_km + rng_dist_km * rng_dist_km;
+                            let dist_sq = az_dist_km * az_dist_km + rng_dist_km * rng_dist_km;
                             if dist_sq > NEIGHBORHOOD_KM * NEIGHBORHOOD_KM {
                                 continue;
                             }
@@ -855,36 +879,46 @@ pub fn render_level3_radial_to_image(
     let radials = &radial_packet.radials;
 
     let output = render_with_projection(
-        radar_lat, radar_lon, actual_max_range, product, "Level III",
+        radar_lat,
+        radar_lon,
+        actual_max_range,
+        product,
+        "Level III",
         |proj, bufs| {
-            radials.par_iter().enumerate().for_each(|(radial_idx, radial_run)| {
-                let azimuth =
-                    radial_run.start_angle as f64 + radial_run.angle_delta as f64 / 2.0;
-                let ctx = RadialContext::new(azimuth, radial_run.angle_delta as f64 / 2.0);
+            radials
+                .par_iter()
+                .enumerate()
+                .for_each(|(radial_idx, radial_run)| {
+                    let azimuth =
+                        radial_run.start_angle as f64 + radial_run.angle_delta as f64 / 2.0;
+                    let ctx = RadialContext::new(azimuth, radial_run.angle_delta as f64 / 2.0);
 
-                let bins_to_render = radial_run.gate_values.len().min(num_bins);
-                for (gate_idx, &gate_value) in
-                    radial_run.gate_values[..bins_to_render].iter().enumerate()
-                {
-                    if gate_value <= 1 {
-                        continue;
+                    let bins_to_render = radial_run.gate_values.len().min(num_bins);
+                    for (gate_idx, &gate_value) in
+                        radial_run.gate_values[..bins_to_render].iter().enumerate()
+                    {
+                        if gate_value <= 1 {
+                            continue;
+                        }
+
+                        let physical_value =
+                            l3_physical_value(gate_value, product, scale, offset, lut);
+                        if physical_value.is_nan() || physical_value >= 999.0 {
+                            continue;
+                        }
+
+                        let range_km = first_gate_range + gate_idx as f64 * gate_interval;
+                        if range_km > types::MAX_RANGE_KM {
+                            break;
+                        }
+
+                        let from = GateId {
+                            radial: radial_idx,
+                            gate: gate_idx,
+                        };
+                        proj.render_gate(bufs, &ctx, range_km, gate_interval, physical_value, from);
                     }
-
-                    let physical_value =
-                        l3_physical_value(gate_value, product, scale, offset, lut);
-                    if physical_value.is_nan() || physical_value >= 999.0 {
-                        continue;
-                    }
-
-                    let range_km = first_gate_range + gate_idx as f64 * gate_interval;
-                    if range_km > types::MAX_RANGE_KM {
-                        break;
-                    }
-
-                    let from = GateId { radial: radial_idx, gate: gate_idx };
-                    proj.render_gate(bufs, &ctx, range_km, gate_interval, physical_value, from);
-                }
-            });
+                });
         },
     );
     Some(output)
@@ -940,7 +974,11 @@ pub fn render_level3_message_to_image(
         Some(rp) => {
             log::debug!(
                 "L3 {:?}: radials={}, bins={}, legacy={}, scale_factor={}",
-                product, rp.radials.len(), rp.num_range_bins, rp.is_legacy, rp.scale_factor
+                product,
+                rp.radials.len(),
+                rp.num_range_bins,
+                rp.is_legacy,
+                rp.scale_factor
             );
             rp
         }
@@ -953,7 +991,9 @@ pub fn render_level3_message_to_image(
     // Prefer the XDR scale/offset from packet 28 attributes: PDB thresholds do
     // not encode IEEE floats for some products (134 DVL, 135 EET).
     let scale = rp.xdr_data_scale.unwrap_or_else(|| l3_msg.pdb.data_scale());
-    let offset = rp.xdr_data_offset.unwrap_or_else(|| l3_msg.pdb.data_offset());
+    let offset = rp
+        .xdr_data_offset
+        .unwrap_or_else(|| l3_msg.pdb.data_offset());
     let vil_lut = build_vil_lut(&l3_msg.pdb);
     let legacy_lut;
     let lut: Option<&[f32]> = if vil_lut.is_some() {
@@ -967,7 +1007,13 @@ pub fn render_level3_message_to_image(
 
     log::debug!(
         "L3 {:?}: rendering with scale={}, offset={}, legacy={}, lut_len={:?}, xdr_scale={:?}, xdr_offset={:?}",
-        product, scale, offset, rp.is_legacy, lut.map(|l| l.len()), rp.xdr_data_scale, rp.xdr_data_offset
+        product,
+        scale,
+        offset,
+        rp.is_legacy,
+        lut.map(|l| l.len()),
+        rp.xdr_data_scale,
+        rp.xdr_data_offset
     );
 
     render_level3_radial_to_image(rp, product, radar_lat, radar_lon, scale, offset, lut)
@@ -995,7 +1041,12 @@ fn build_vil_lut(pdb: &nexrad_level3::model::ProductDescriptionBlock) -> Option<
     for (i, slot) in lut.iter_mut().enumerate().take(log_start.min(255)).skip(2) {
         *slot = (i as f32 - lin_offset) / lin_scale;
     }
-    for (i, slot) in lut.iter_mut().enumerate().take(255).skip(log_start.min(255)) {
+    for (i, slot) in lut
+        .iter_mut()
+        .enumerate()
+        .take(255)
+        .skip(log_start.min(255))
+    {
         *slot = ((i as f32 - log_offset) / log_scale).exp();
     }
     // Gate 255 is reserved
@@ -1118,7 +1169,11 @@ mod tests {
                         ((dbz * SCALE as f64 + OFFSET as f64).round() as i64).clamp(2, 250) as u16
                     })
                     .collect();
-                RadialRun { start_angle: i as f32, angle_delta: 1.0, gate_values }
+                RadialRun {
+                    start_angle: i as f32,
+                    angle_delta: 1.0,
+                    gate_values,
+                }
             })
             .collect();
         RadialPacket {
@@ -1154,8 +1209,7 @@ mod tests {
     fn fixture_covers_a_realistic_share_of_the_image() {
         let (image, values) = render(&packet(None));
         let painted = image.chunks_exact(4).filter(|px| px[3] != 0).count();
-        let disc = std::f64::consts::PI
-            * (N_BINS as f64 * 0.25 * types::PIXELS_PER_KM).powi(2);
+        let disc = std::f64::consts::PI * (N_BINS as f64 * 0.25 * types::PIXELS_PER_KM).powi(2);
         assert!(
             (painted as f64) > disc * 0.9 && (painted as f64) < disc * 1.1,
             "painted {painted}, expected about {disc:.0} for a {N_BINS}-gate disc"
@@ -1295,7 +1349,10 @@ mod tests {
         let (i, v) = render(&p);
         let parallel = digest(&i, &v);
 
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
         let sequential = pool.install(|| {
             let (i, v) = render(&p);
             digest(&i, &v)
@@ -1368,8 +1425,20 @@ mod tests {
             .collect();
         Scan::new(
             VolumeCoveragePattern::new(
-                212, 0, 0.5, PulseWidth::Short, false, 0, false, 0, false, false, 0, false,
-                false, Vec::new(),
+                212,
+                0,
+                0.5,
+                PulseWidth::Short,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+                0,
+                false,
+                false,
+                Vec::new(),
             ),
             vec![Sweep::new(1, radials)],
         )
@@ -1396,9 +1465,16 @@ mod tests {
     #[test]
     fn level2_colour_agrees_with_value_at_every_pixel() {
         let (image, values) = render_l2(&[200, 100, 180, 120], PRODUCT);
-        assert!(values.iter().any(|v| !v.is_nan()), "level II fixture painted nothing");
+        assert!(
+            values.iter().any(|v| !v.is_nan()),
+            "level II fixture painted nothing"
+        );
         for (px, &v) in image.chunks_exact(4).zip(&values) {
-            let want = if v.is_nan() { (0, 0, 0, 0) } else { get_color_for_value(PRODUCT, v) };
+            let want = if v.is_nan() {
+                (0, 0, 0, 0)
+            } else {
+                get_color_for_value(PRODUCT, v)
+            };
             assert_eq!((px[0], px[1], px[2], px[3]), want);
         }
     }
@@ -1444,8 +1520,20 @@ mod tests {
             .collect();
         Scan::new(
             VolumeCoveragePattern::new(
-                212, 0, 0.5, PulseWidth::Short, false, 0, false, 0, false, false, 0, false,
-                false, Vec::new(),
+                212,
+                0,
+                0.5,
+                PulseWidth::Short,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+                0,
+                false,
+                false,
+                Vec::new(),
             ),
             vec![Sweep::new(1, radials)],
         )
@@ -1467,7 +1555,10 @@ mod tests {
         .unwrap();
 
         let painted = image.chunks_exact(4).filter(|px| px[3] != 0).count();
-        assert!(painted > 10_000, "NROT fixture painted only {painted} pixels");
+        assert!(
+            painted > 10_000,
+            "NROT fixture painted only {painted} pixels"
+        );
 
         for (px, &v) in image.chunks_exact(4).zip(&values) {
             let want = if v.is_nan() {
@@ -1508,8 +1599,15 @@ mod tests {
             assert_eq!(once(), first, "NROT render {run} differs from render 0");
         }
 
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
-        assert_eq!(pool.install(once), first, "NROT parallel differs from sequential");
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        assert_eq!(
+            pool.install(once),
+            first,
+            "NROT parallel differs from sequential"
+        );
     }
 
     #[test]

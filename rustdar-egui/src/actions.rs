@@ -1,6 +1,6 @@
+use chrono::NaiveDateTime;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_overlays::types::GeoBounds;
-use chrono::NaiveDateTime;
 
 /// Configuration for radar site and time selection
 #[derive(Debug, Clone)]
@@ -29,11 +29,20 @@ pub enum GuiAction {
     Exit,
     FetchRadarScan(RadarConfig),
     CheckForNewScans(RadarConfig),
-    SwitchRadarSite { site: String, pane_idx: usize }, // Switch to a different radar site
+    SwitchRadarSite {
+        site: String,
+        pane_idx: usize,
+    }, // Switch to a different radar site
     /// Fetch overlay data for the given kind (initial load when layer enabled).
-    FetchOverlay { kind: OverlayKind, pane_idx: usize },
+    FetchOverlay {
+        kind: OverlayKind,
+        pane_idx: usize,
+    },
     /// Re-fetch overlay data for the given kind (manual refresh).
-    RefreshOverlay { kind: OverlayKind, pane_idx: usize },
+    RefreshOverlay {
+        kind: OverlayKind,
+        pane_idx: usize,
+    },
     /// Request a background overlay rasterization for a pane.
     RenderOverlay {
         pane_idx: usize,
@@ -116,11 +125,22 @@ impl std::fmt::Display for GuiAction {
             GuiAction::RefreshOverlay { kind, pane_idx } => {
                 write!(f, "Refresh overlay {:?} for pane {}", kind, pane_idx)
             }
-            GuiAction::RenderOverlay { pane_idx, overlay_kind, .. } => {
+            GuiAction::RenderOverlay {
+                pane_idx,
+                overlay_kind,
+                ..
+            } => {
                 write!(f, "Render overlay {:?} for pane {}", overlay_kind, pane_idx)
             }
-            GuiAction::EnableLoop { pane_idx, lookback_secs } => {
-                write!(f, "Enable loop for pane {} ({}s lookback)", pane_idx, lookback_secs)
+            GuiAction::EnableLoop {
+                pane_idx,
+                lookback_secs,
+            } => {
+                write!(
+                    f,
+                    "Enable loop for pane {} ({}s lookback)",
+                    pane_idx, lookback_secs
+                )
             }
             GuiAction::DisableLoop { pane_idx } => {
                 write!(f, "Disable loop for pane {}", pane_idx)
@@ -129,16 +149,38 @@ impl std::fmt::Display for GuiAction {
                 write!(f, "Toggle loop playback for pane {}", pane_idx)
             }
             GuiAction::StepLoopFrame { pane_idx, forward } => {
-                write!(f, "Step loop frame for pane {} (forward={})", pane_idx, forward)
+                write!(
+                    f,
+                    "Step loop frame for pane {} (forward={})",
+                    pane_idx, forward
+                )
             }
-            GuiAction::SeekLoopFrame { pane_idx, frame_index } => {
-                write!(f, "Seek loop to frame {} for pane {}", frame_index, pane_idx)
+            GuiAction::SeekLoopFrame {
+                pane_idx,
+                frame_index,
+            } => {
+                write!(
+                    f,
+                    "Seek loop to frame {} for pane {}",
+                    frame_index, pane_idx
+                )
             }
-            GuiAction::NavigateTime { pane_idx, step_secs } => {
-                write!(f, "Navigate time by {} seconds for pane {}", step_secs, pane_idx)
+            GuiAction::NavigateTime {
+                pane_idx,
+                step_secs,
+            } => {
+                write!(
+                    f,
+                    "Navigate time by {} seconds for pane {}",
+                    step_secs, pane_idx
+                )
             }
             GuiAction::NavigateOneScan { pane_idx, forward } => {
-                write!(f, "Navigate one scan (forward={}) for pane {}", forward, pane_idx)
+                write!(
+                    f,
+                    "Navigate one scan (forward={}) for pane {}",
+                    forward, pane_idx
+                )
             }
             GuiAction::JumpToLive { pane_idx } => {
                 write!(f, "Jump to live for pane {}", pane_idx)

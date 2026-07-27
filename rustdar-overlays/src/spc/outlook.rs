@@ -1,5 +1,5 @@
+use crate::types::{CIG_FILL_ALPHA, GeoPolygon, HatchPattern, OverlayFeature, REGULAR_FILL_ALPHA};
 use chrono::NaiveDateTime;
-use crate::types::{GeoPolygon, HatchPattern, OverlayFeature, CIG_FILL_ALPHA, REGULAR_FILL_ALPHA};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum OutlookDay {
@@ -48,10 +48,7 @@ impl OutlookDay {
                 OutlookProduct::Wind,
                 OutlookProduct::Hail,
             ],
-            OutlookDay::Day3 => &[
-                OutlookProduct::Categorical,
-                OutlookProduct::Probabilistic,
-            ],
+            OutlookDay::Day3 => &[OutlookProduct::Categorical, OutlookProduct::Probabilistic],
             _ => &[OutlookProduct::Probabilistic],
         }
     }
@@ -185,7 +182,11 @@ pub fn parse_geojson(
     let mut expire: Option<NaiveDateTime> = None;
 
     for feature_val in features_array {
-        let ParsedOutlookFeature { feature, valid: feat_valid, expire: feat_expire } = match parse_outlook_feature(feature_val)? {
+        let ParsedOutlookFeature {
+            feature,
+            valid: feat_valid,
+            expire: feat_expire,
+        } = match parse_outlook_feature(feature_val)? {
             Some(result) => result,
             None => continue,
         };
@@ -251,7 +252,11 @@ fn parse_outlook_feature(
         _ => HatchPattern::None,
     };
 
-    let fill_alpha = if hatch != HatchPattern::None { CIG_FILL_ALPHA } else { REGULAR_FILL_ALPHA };
+    let fill_alpha = if hatch != HatchPattern::None {
+        CIG_FILL_ALPHA
+    } else {
+        REGULAR_FILL_ALPHA
+    };
     let fill_rgba = super::colors::parse_hex_color(fill_hex, fill_alpha);
     let stroke_rgba = super::colors::parse_hex_color(stroke_hex, 255);
 
@@ -268,10 +273,7 @@ fn parse_outlook_feature(
         .get("geometry")
         .ok_or_else(|| "Feature missing 'geometry'".to_string())?;
 
-    let geo_type = geometry
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let geo_type = geometry.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     let mut polygons = match geo_type {
         "MultiPolygon" => parse_multi_polygon(geometry)?,
@@ -300,7 +302,11 @@ fn parse_outlook_feature(
     }
 
     let feature = OverlayFeature::new(polygons, fill_rgba, stroke_rgba, label, label2, hatch);
-    Ok(Some(ParsedOutlookFeature { feature, valid, expire }))
+    Ok(Some(ParsedOutlookFeature {
+        feature,
+        valid,
+        expire,
+    }))
 }
 
 /// GeoJSON is `[lon, lat]`; output is `(lat, lon)`.

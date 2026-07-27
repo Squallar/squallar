@@ -11,11 +11,11 @@ use crate::types::GpsFix;
 /// USB VID/PIDs of common GPS chipsets and the USB-serial adapters GPS modules
 /// are usually wired through. `None` PID matches every product from that vendor.
 const GPS_VID_PIDS: &[(u16, Option<u16>)] = &[
-    (0x1546, None),        // u-blox
-    (0x067B, None),        // Prolific (PL2303)
-    (0x0403, None),        // FTDI
-    (0x10C4, None),        // Silicon Labs CP210x
-    (0x1A86, None),        // QinHeng CH340
+    (0x1546, None),         // u-blox
+    (0x067B, None),         // Prolific (PL2303)
+    (0x0403, None),         // FTDI
+    (0x10C4, None),         // Silicon Labs CP210x
+    (0x1A86, None),         // QinHeng CH340
     (0x4292, Some(0x0603)), // SiRF (USB-attached receivers)
 ];
 
@@ -40,9 +40,9 @@ pub fn detect_gps_ports() -> Vec<GpsPortInfo> {
     for port in ports {
         let info = match &port.port_type {
             serialport::SerialPortType::UsbPort(usb) => {
-                let is_gps = GPS_VID_PIDS.iter().any(|(vid, pid)| {
-                    usb.vid == *vid && pid.is_none_or(|p| usb.pid == p)
-                });
+                let is_gps = GPS_VID_PIDS
+                    .iter()
+                    .any(|(vid, pid)| usb.vid == *vid && pid.is_none_or(|p| usb.pid == p));
                 let desc = usb
                     .product
                     .clone()
@@ -165,7 +165,11 @@ fn gps_read_loop(
                 p
             }
             Err(e) => {
-                log::warn!("Failed to open GPS port {}: {}. Retrying in 5s", port_name, e);
+                log::warn!(
+                    "Failed to open GPS port {}: {}. Retrying in 5s",
+                    port_name,
+                    e
+                );
                 // 5s retry, sliced so the stop signal is still seen promptly.
                 for _ in 0..50 {
                     if stop_rx.try_recv().is_ok() {
@@ -196,10 +200,11 @@ fn gps_read_loop(
                 Ok(_) => {
                     let trimmed = line.trim();
                     if let Some(fix) = nmea.feed_sentence(trimmed)
-                        && fix_sender.send(fix).is_err() {
-                            log::info!("GPS fix channel closed, stopping reader");
-                            return;
-                        }
+                        && fix_sender.send(fix).is_err()
+                    {
+                        log::info!("GPS fix channel closed, stopping reader");
+                        return;
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                     // A quiet receiver, not a disconnect: do not reconnect.

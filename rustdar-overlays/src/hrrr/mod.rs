@@ -177,9 +177,7 @@ impl ModelParameter {
             // ascending spelling selects no record at all.
             ModelParameter::MaxUH2to5km => "5000-2000 m above ground",
             ModelParameter::MaxUH0to2km => "2000-0 m above ground",
-            ModelParameter::PrecipitableWater => {
-                "entire atmosphere (considered as a single layer)"
-            }
+            ModelParameter::PrecipitableWater => "entire atmosphere (considered as a single layer)",
             ModelParameter::Temperature2m | ModelParameter::Dewpoint2m => "2 m above ground",
             ModelParameter::BulkShear6km => {
                 panic!("BulkShear6km is composite — use composite_parts()")
@@ -357,18 +355,10 @@ impl ModelParameter {
             ModelParameter::BulkShear6km | ModelParameter::SurfaceWindGust => {
                 wind_color(self.convert_for_display(value))
             }
-            ModelParameter::PrecipitableWater => {
-                pwat_color(self.convert_for_display(value))
-            }
-            ModelParameter::Temperature2m => {
-                temperature_color(self.convert_for_display(value))
-            }
-            ModelParameter::Dewpoint2m => {
-                dewpoint_color(self.convert_for_display(value))
-            }
-            ModelParameter::Visibility => {
-                visibility_color(self.convert_for_display(value))
-            }
+            ModelParameter::PrecipitableWater => pwat_color(self.convert_for_display(value)),
+            ModelParameter::Temperature2m => temperature_color(self.convert_for_display(value)),
+            ModelParameter::Dewpoint2m => dewpoint_color(self.convert_for_display(value)),
+            ModelParameter::Visibility => visibility_color(self.convert_for_display(value)),
         }
     }
 
@@ -592,15 +582,35 @@ fn cape_color(value: f32) -> [u8; 4] {
     if value < 250.0 {
         [0, 0, 0, 0]
     } else if value < 500.0 {
-        lerp_color([200, 230, 255, ALPHA], [100, 200, 100, ALPHA], (value - 250.0) / 250.0)
+        lerp_color(
+            [200, 230, 255, ALPHA],
+            [100, 200, 100, ALPHA],
+            (value - 250.0) / 250.0,
+        )
     } else if value < 1000.0 {
-        lerp_color([100, 200, 100, ALPHA], [255, 255, 0, ALPHA], (value - 500.0) / 500.0)
+        lerp_color(
+            [100, 200, 100, ALPHA],
+            [255, 255, 0, ALPHA],
+            (value - 500.0) / 500.0,
+        )
     } else if value < 2000.0 {
-        lerp_color([255, 255, 0, ALPHA], [255, 165, 0, ALPHA], (value - 1000.0) / 1000.0)
+        lerp_color(
+            [255, 255, 0, ALPHA],
+            [255, 165, 0, ALPHA],
+            (value - 1000.0) / 1000.0,
+        )
     } else if value < 3000.0 {
-        lerp_color([255, 165, 0, ALPHA], [220, 50, 50, ALPHA], (value - 2000.0) / 1000.0)
+        lerp_color(
+            [255, 165, 0, ALPHA],
+            [220, 50, 50, ALPHA],
+            (value - 2000.0) / 1000.0,
+        )
     } else {
-        lerp_color([220, 50, 50, ALPHA], [180, 0, 200, ALPHA], ((value - 3000.0) / 2000.0).min(1.0))
+        lerp_color(
+            [220, 50, 50, ALPHA],
+            [180, 0, 200, ALPHA],
+            ((value - 3000.0) / 2000.0).min(1.0),
+        )
     }
 }
 
@@ -612,11 +622,23 @@ fn li_color(value: f32) -> [u8; 4] {
     } else if value > -2.0 {
         lerp_color([144, 238, 144, ALPHA], [255, 255, 0, ALPHA], -value / 2.0)
     } else if value > -4.0 {
-        lerp_color([255, 255, 0, ALPHA], [255, 165, 0, ALPHA], (-value - 2.0) / 2.0)
+        lerp_color(
+            [255, 255, 0, ALPHA],
+            [255, 165, 0, ALPHA],
+            (-value - 2.0) / 2.0,
+        )
     } else if value > -6.0 {
-        lerp_color([255, 165, 0, ALPHA], [220, 50, 50, ALPHA], (-value - 4.0) / 2.0)
+        lerp_color(
+            [255, 165, 0, ALPHA],
+            [220, 50, 50, ALPHA],
+            (-value - 4.0) / 2.0,
+        )
     } else {
-        lerp_color([220, 50, 50, ALPHA], [180, 0, 200, ALPHA], ((-value - 6.0) / 4.0).min(1.0))
+        lerp_color(
+            [220, 50, 50, ALPHA],
+            [180, 0, 200, ALPHA],
+            ((-value - 6.0) / 4.0).min(1.0),
+        )
     }
 }
 
@@ -626,13 +648,29 @@ fn srh_color(value: f32) -> [u8; 4] {
     if value < 50.0 {
         [0, 0, 0, 0]
     } else if value < 100.0 {
-        lerp_color([144, 238, 144, ALPHA], [255, 255, 0, ALPHA], (value - 50.0) / 50.0)
+        lerp_color(
+            [144, 238, 144, ALPHA],
+            [255, 255, 0, ALPHA],
+            (value - 50.0) / 50.0,
+        )
     } else if value < 200.0 {
-        lerp_color([255, 255, 0, ALPHA], [255, 165, 0, ALPHA], (value - 100.0) / 100.0)
+        lerp_color(
+            [255, 255, 0, ALPHA],
+            [255, 165, 0, ALPHA],
+            (value - 100.0) / 100.0,
+        )
     } else if value < 300.0 {
-        lerp_color([255, 165, 0, ALPHA], [220, 50, 50, ALPHA], (value - 200.0) / 100.0)
+        lerp_color(
+            [255, 165, 0, ALPHA],
+            [220, 50, 50, ALPHA],
+            (value - 200.0) / 100.0,
+        )
     } else {
-        lerp_color([220, 50, 50, ALPHA], [180, 0, 200, ALPHA], ((value - 300.0) / 200.0).min(1.0))
+        lerp_color(
+            [220, 50, 50, ALPHA],
+            [180, 0, 200, ALPHA],
+            ((value - 300.0) / 200.0).min(1.0),
+        )
     }
 }
 
@@ -642,13 +680,29 @@ fn uh_color(value: f32) -> [u8; 4] {
     if value < 25.0 {
         [0, 0, 0, 0]
     } else if value < 75.0 {
-        lerp_color([144, 238, 144, ALPHA], [255, 255, 0, ALPHA], (value - 25.0) / 50.0)
+        lerp_color(
+            [144, 238, 144, ALPHA],
+            [255, 255, 0, ALPHA],
+            (value - 25.0) / 50.0,
+        )
     } else if value < 150.0 {
-        lerp_color([255, 255, 0, ALPHA], [255, 165, 0, ALPHA], (value - 75.0) / 75.0)
+        lerp_color(
+            [255, 255, 0, ALPHA],
+            [255, 165, 0, ALPHA],
+            (value - 75.0) / 75.0,
+        )
     } else if value < 300.0 {
-        lerp_color([255, 165, 0, ALPHA], [220, 50, 50, ALPHA], (value - 150.0) / 150.0)
+        lerp_color(
+            [255, 165, 0, ALPHA],
+            [220, 50, 50, ALPHA],
+            (value - 150.0) / 150.0,
+        )
     } else {
-        lerp_color([220, 50, 50, ALPHA], [180, 0, 200, ALPHA], ((value - 300.0) / 200.0).min(1.0))
+        lerp_color(
+            [220, 50, 50, ALPHA],
+            [180, 0, 200, ALPHA],
+            ((value - 300.0) / 200.0).min(1.0),
+        )
     }
 }
 
@@ -658,13 +712,29 @@ fn uh_low_color(value: f32) -> [u8; 4] {
     if value < 10.0 {
         [0, 0, 0, 0]
     } else if value < 30.0 {
-        lerp_color([144, 238, 144, ALPHA], [255, 255, 0, ALPHA], (value - 10.0) / 20.0)
+        lerp_color(
+            [144, 238, 144, ALPHA],
+            [255, 255, 0, ALPHA],
+            (value - 10.0) / 20.0,
+        )
     } else if value < 75.0 {
-        lerp_color([255, 255, 0, ALPHA], [255, 165, 0, ALPHA], (value - 30.0) / 45.0)
+        lerp_color(
+            [255, 255, 0, ALPHA],
+            [255, 165, 0, ALPHA],
+            (value - 30.0) / 45.0,
+        )
     } else if value < 150.0 {
-        lerp_color([255, 165, 0, ALPHA], [220, 50, 50, ALPHA], (value - 75.0) / 75.0)
+        lerp_color(
+            [255, 165, 0, ALPHA],
+            [220, 50, 50, ALPHA],
+            (value - 75.0) / 75.0,
+        )
     } else {
-        lerp_color([220, 50, 50, ALPHA], [180, 0, 200, ALPHA], ((value - 150.0) / 150.0).min(1.0))
+        lerp_color(
+            [220, 50, 50, ALPHA],
+            [180, 0, 200, ALPHA],
+            ((value - 150.0) / 150.0).min(1.0),
+        )
     }
 }
 
@@ -674,13 +744,29 @@ fn wind_color(kt: f32) -> [u8; 4] {
     if kt < 10.0 {
         [0, 0, 0, 0]
     } else if kt < 20.0 {
-        lerp_color([144, 238, 144, ALPHA], [255, 255, 0, ALPHA], (kt - 10.0) / 10.0)
+        lerp_color(
+            [144, 238, 144, ALPHA],
+            [255, 255, 0, ALPHA],
+            (kt - 10.0) / 10.0,
+        )
     } else if kt < 30.0 {
-        lerp_color([255, 255, 0, ALPHA], [255, 165, 0, ALPHA], (kt - 20.0) / 10.0)
+        lerp_color(
+            [255, 255, 0, ALPHA],
+            [255, 165, 0, ALPHA],
+            (kt - 20.0) / 10.0,
+        )
     } else if kt < 45.0 {
-        lerp_color([255, 165, 0, ALPHA], [220, 50, 50, ALPHA], (kt - 30.0) / 15.0)
+        lerp_color(
+            [255, 165, 0, ALPHA],
+            [220, 50, 50, ALPHA],
+            (kt - 30.0) / 15.0,
+        )
     } else {
-        lerp_color([220, 50, 50, ALPHA], [180, 0, 200, ALPHA], ((kt - 45.0) / 20.0).min(1.0))
+        lerp_color(
+            [220, 50, 50, ALPHA],
+            [180, 0, 200, ALPHA],
+            ((kt - 45.0) / 20.0).min(1.0),
+        )
     }
 }
 
@@ -690,13 +776,29 @@ fn pwat_color(inches: f32) -> [u8; 4] {
     if inches < 0.75 {
         [0, 0, 0, 0]
     } else if inches < 1.0 {
-        lerp_color([200, 230, 255, ALPHA], [100, 200, 100, ALPHA], (inches - 0.75) / 0.25)
+        lerp_color(
+            [200, 230, 255, ALPHA],
+            [100, 200, 100, ALPHA],
+            (inches - 0.75) / 0.25,
+        )
     } else if inches < 1.5 {
-        lerp_color([100, 200, 100, ALPHA], [255, 255, 0, ALPHA], (inches - 1.0) / 0.5)
+        lerp_color(
+            [100, 200, 100, ALPHA],
+            [255, 255, 0, ALPHA],
+            (inches - 1.0) / 0.5,
+        )
     } else if inches < 2.0 {
-        lerp_color([255, 255, 0, ALPHA], [255, 165, 0, ALPHA], (inches - 1.5) / 0.5)
+        lerp_color(
+            [255, 255, 0, ALPHA],
+            [255, 165, 0, ALPHA],
+            (inches - 1.5) / 0.5,
+        )
     } else {
-        lerp_color([255, 165, 0, ALPHA], [220, 50, 50, ALPHA], ((inches - 2.0) / 0.5).min(1.0))
+        lerp_color(
+            [255, 165, 0, ALPHA],
+            [220, 50, 50, ALPHA],
+            ((inches - 2.0) / 0.5).min(1.0),
+        )
     }
 }
 
@@ -708,13 +810,29 @@ fn temperature_color(f: f32) -> [u8; 4] {
     } else if f < 32.0 {
         lerp_color([180, 0, 200, ALPHA], [100, 150, 255, ALPHA], f / 32.0)
     } else if f < 50.0 {
-        lerp_color([100, 150, 255, ALPHA], [100, 200, 100, ALPHA], (f - 32.0) / 18.0)
+        lerp_color(
+            [100, 150, 255, ALPHA],
+            [100, 200, 100, ALPHA],
+            (f - 32.0) / 18.0,
+        )
     } else if f < 70.0 {
-        lerp_color([100, 200, 100, ALPHA], [255, 255, 0, ALPHA], (f - 50.0) / 20.0)
+        lerp_color(
+            [100, 200, 100, ALPHA],
+            [255, 255, 0, ALPHA],
+            (f - 50.0) / 20.0,
+        )
     } else if f < 90.0 {
-        lerp_color([255, 255, 0, ALPHA], [255, 165, 0, ALPHA], (f - 70.0) / 20.0)
+        lerp_color(
+            [255, 255, 0, ALPHA],
+            [255, 165, 0, ALPHA],
+            (f - 70.0) / 20.0,
+        )
     } else if f < 110.0 {
-        lerp_color([255, 165, 0, ALPHA], [220, 50, 50, ALPHA], (f - 90.0) / 20.0)
+        lerp_color(
+            [255, 165, 0, ALPHA],
+            [220, 50, 50, ALPHA],
+            (f - 90.0) / 20.0,
+        )
     } else {
         [220, 50, 50, ALPHA]
     }
@@ -726,15 +844,31 @@ fn dewpoint_color(f: f32) -> [u8; 4] {
     if f < 30.0 {
         [0, 0, 0, 0]
     } else if f < 45.0 {
-        lerp_color([180, 150, 100, ALPHA], [144, 238, 144, ALPHA], (f - 30.0) / 15.0)
+        lerp_color(
+            [180, 150, 100, ALPHA],
+            [144, 238, 144, ALPHA],
+            (f - 30.0) / 15.0,
+        )
     } else if f < 55.0 {
-        lerp_color([144, 238, 144, ALPHA], [100, 200, 100, ALPHA], (f - 45.0) / 10.0)
+        lerp_color(
+            [144, 238, 144, ALPHA],
+            [100, 200, 100, ALPHA],
+            (f - 45.0) / 10.0,
+        )
     } else if f < 65.0 {
-        lerp_color([100, 200, 100, ALPHA], [255, 255, 0, ALPHA], (f - 55.0) / 10.0)
+        lerp_color(
+            [100, 200, 100, ALPHA],
+            [255, 255, 0, ALPHA],
+            (f - 55.0) / 10.0,
+        )
     } else if f < 70.0 {
         lerp_color([255, 255, 0, ALPHA], [255, 165, 0, ALPHA], (f - 65.0) / 5.0)
     } else {
-        lerp_color([255, 165, 0, ALPHA], [220, 50, 50, ALPHA], ((f - 70.0) / 5.0).min(1.0))
+        lerp_color(
+            [255, 165, 0, ALPHA],
+            [220, 50, 50, ALPHA],
+            ((f - 70.0) / 5.0).min(1.0),
+        )
     }
 }
 
@@ -744,13 +878,21 @@ fn visibility_color(mi: f32) -> [u8; 4] {
     if mi > 10.0 {
         [0, 0, 0, 0]
     } else if mi > 5.0 {
-        lerp_color([144, 238, 144, ALPHA], [255, 255, 0, ALPHA], (10.0 - mi) / 5.0)
+        lerp_color(
+            [144, 238, 144, ALPHA],
+            [255, 255, 0, ALPHA],
+            (10.0 - mi) / 5.0,
+        )
     } else if mi > 3.0 {
         lerp_color([255, 255, 0, ALPHA], [255, 165, 0, ALPHA], (5.0 - mi) / 2.0)
     } else if mi > 1.0 {
         lerp_color([255, 165, 0, ALPHA], [220, 50, 50, ALPHA], (3.0 - mi) / 2.0)
     } else {
-        lerp_color([220, 50, 50, ALPHA], [180, 0, 200, ALPHA], ((1.0 - mi) / 0.5).min(1.0))
+        lerp_color(
+            [220, 50, 50, ALPHA],
+            [180, 0, 200, ALPHA],
+            ((1.0 - mi) / 0.5).min(1.0),
+        )
     }
 }
 
@@ -805,9 +947,7 @@ impl GridCoords {
     pub fn at(&self, index: usize) -> Option<(f64, f64)> {
         match self {
             GridCoords::Lambert(g) => g.latlon_at(index),
-            GridCoords::Explicit { lats, lons } => {
-                Some((*lats.get(index)?, *lons.get(index)?))
-            }
+            GridCoords::Explicit { lats, lons } => Some((*lats.get(index)?, *lons.get(index)?)),
         }
     }
 
@@ -952,10 +1092,7 @@ impl HrrrGridData {
 /// One pass for the render-coverage summary on [`HrrrGridData`]: how many
 /// points will be painted, and the range of the finite values. Non-finite points
 /// are missing data, not readings — excluded from both.
-pub fn summarize_values(
-    values: &[f32],
-    param: ModelParameter,
-) -> (usize, Option<(f32, f32)>) {
+pub fn summarize_values(values: &[f32], param: ModelParameter) -> (usize, Option<(f32, f32)>) {
     let mut visible = 0usize;
     let mut range: Option<(f32, f32)> = None;
     for &v in values {
@@ -1073,7 +1210,11 @@ mod tests {
         assert_eq!(uh.valid_time().format("%H:%Mz").to_string(), "04:00z");
 
         let cin = grid(ModelParameter::SurfaceBasedCin, vec![-100.0]);
-        assert_eq!(cin.valid_time(), cin.ref_time, "f00 is valid at its run time");
+        assert_eq!(
+            cin.valid_time(),
+            cin.ref_time,
+            "f00 is valid at its run time"
+        );
     }
 
     /// `format_value` keeps its tooltip prefix; `format_magnitude` is the bare
@@ -1098,7 +1239,12 @@ mod tests {
     fn every_parameter_round_trips_through_its_config_key() {
         for param in ModelParameter::all() {
             let parsed: ModelParameter = param.as_str().parse().unwrap();
-            assert_eq!(parsed, *param, "key {:?} did not round-trip", param.as_str());
+            assert_eq!(
+                parsed,
+                *param,
+                "key {:?} did not round-trip",
+                param.as_str()
+            );
         }
     }
 

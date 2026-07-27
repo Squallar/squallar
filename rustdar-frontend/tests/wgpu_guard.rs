@@ -24,7 +24,12 @@ struct CratePath {
 
 impl std::fmt::Display for CratePath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}{}", if self.rooted { "::" } else { "" }, self.segments.join("::"))
+        write!(
+            f,
+            "{}{}",
+            if self.rooted { "::" } else { "" },
+            self.segments.join("::")
+        )
     }
 }
 
@@ -63,10 +68,17 @@ fn resolve<'a>(mut ty: &'a Type, aliases: &HashMap<String, &'a Type>) -> &'a Typ
 }
 
 fn crate_path(ty: &Type) -> CratePath {
-    let Type::Path(p) = ty else { panic!("the wgpu guard compares a non-path type") };
+    let Type::Path(p) = ty else {
+        panic!("the wgpu guard compares a non-path type")
+    };
     CratePath {
         rooted: p.path.leading_colon.is_some(),
-        segments: p.path.segments.iter().map(|s| s.ident.to_string()).collect(),
+        segments: p
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect(),
     }
 }
 
@@ -81,7 +93,10 @@ fn guard_sides() -> (CratePath, CratePath) {
     let mut blocks = file.items.iter().filter_map(|item| match item {
         Item::Const(c) if c.ident == "_" => match &*c.expr {
             Expr::Block(b)
-                if b.block.stmts.iter().any(|s| matches!(s, Stmt::Item(Item::Trait(_)))) =>
+                if b.block
+                    .stmts
+                    .iter()
+                    .any(|s| matches!(s, Stmt::Item(Item::Trait(_)))) =>
             {
                 Some(&b.block)
             }
@@ -97,7 +112,10 @@ fn guard_sides() -> (CratePath, CratePath) {
              nothing renders through."
         )
     });
-    assert!(blocks.next().is_none(), "more than one candidate guard block in app.rs");
+    assert!(
+        blocks.next().is_none(),
+        "more than one candidate guard block in app.rs"
+    );
 
     let mut aliases: HashMap<String, &Type> = HashMap::new();
     let mut impls: Vec<&Type> = Vec::new();
@@ -113,11 +131,24 @@ fn guard_sides() -> (CratePath, CratePath) {
         turbofish.visit_stmt(stmt);
     }
 
-    assert_eq!(impls.len(), 1, "expected one trait impl in the wgpu guard, found {}", impls.len());
+    assert_eq!(
+        impls.len(),
+        1,
+        "expected one trait impl in the wgpu guard, found {}",
+        impls.len()
+    );
     let args = turbofish.0;
-    assert_eq!(args.len(), 1, "expected one turbofish arg in the wgpu guard, found {}", args.len());
+    assert_eq!(
+        args.len(),
+        1,
+        "expected one turbofish arg in the wgpu guard, found {}",
+        args.len()
+    );
 
-    (crate_path(resolve(impls[0], &aliases)), crate_path(resolve(args[0], &aliases)))
+    (
+        crate_path(resolve(impls[0], &aliases)),
+        crate_path(resolve(args[0], &aliases)),
+    )
 }
 
 #[test]
@@ -134,8 +165,11 @@ fn guard_compares_two_different_crates() {
     );
 
     // Which side carries the `impl` is arbitrary; only the pair matters.
-    let (ours, theirs) =
-        if impl_side.rooted { (&impl_side, &assert_side) } else { (&assert_side, &impl_side) };
+    let (ours, theirs) = if impl_side.rooted {
+        (&impl_side, &assert_side)
+    } else {
+        (&assert_side, &impl_side)
+    };
 
     assert_eq!(
         ours.segments.first().map(String::as_str),
@@ -143,9 +177,14 @@ fn guard_compares_two_different_crates() {
         "the `::`-rooted side of the wgpu guard is `{ours}`, not the `wgpu` crate"
     );
     assert!(
-        theirs.segments.starts_with(&["egui_wgpu".to_owned(), "wgpu".to_owned()]),
+        theirs
+            .segments
+            .starts_with(&["egui_wgpu".to_owned(), "wgpu".to_owned()]),
         "the other side of the wgpu guard is `{theirs}`, which does not reach wgpu through \
          `egui_wgpu`, so it is not the copy that renders"
     );
-    assert_ne!(ours, theirs, "both sides of the wgpu guard resolve to the same path");
+    assert_ne!(
+        ours, theirs,
+        "both sides of the wgpu guard resolve to the same path"
+    );
 }

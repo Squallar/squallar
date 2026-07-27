@@ -154,7 +154,11 @@ mod tests {
     /// every dispatch with `MAX_LOOP_RENDER_BUDGET`, so a loop of `MAX_LOOP_FRAMES`
     /// keeps only the render set textured.
     const fn textured_frames() -> usize {
-        if MAX_LOOP_RENDER_BUDGET < MAX_LOOP_FRAMES { MAX_LOOP_RENDER_BUDGET } else { MAX_LOOP_FRAMES }
+        if MAX_LOOP_RENDER_BUDGET < MAX_LOOP_FRAMES {
+            MAX_LOOP_RENDER_BUDGET
+        } else {
+            MAX_LOOP_FRAMES
+        }
     }
 
     /// The ceiling the per-target constants were chosen to fit. Whichever arm this
@@ -195,5 +199,4 @@ mod tests {
     fn the_render_budget_is_what_bounds_the_textured_frames() {
         assert_eq!(textured_frames(), MAX_LOOP_RENDER_BUDGET);
     }
-
 }

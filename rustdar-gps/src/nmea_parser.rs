@@ -37,7 +37,10 @@ impl NmeaState {
         };
 
         let altitude_m = self.parser.altitude.map(|a| a as f64);
-        let speed_mps = self.parser.speed_over_ground.map(|knots| knots as f64 * 0.514444);
+        let speed_mps = self
+            .parser
+            .speed_over_ground
+            .map(|knots| knots as f64 * 0.514444);
         let heading_deg = self
             .parser
             .true_course

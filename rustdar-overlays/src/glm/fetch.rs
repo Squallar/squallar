@@ -34,7 +34,11 @@ impl CachedGranule {
     /// A granule spans ~20 s from the start time it is keyed by, so its records
     /// all land at or after `granule_start`.
     fn new(granule_start: NaiveDateTime, flashes: Vec<GlmFlash>) -> Self {
-        let newest = flashes.iter().map(|f| f.time).max().unwrap_or(granule_start);
+        let newest = flashes
+            .iter()
+            .map(|f| f.time)
+            .max()
+            .unwrap_or(granule_start);
         CachedGranule { flashes, newest }
     }
 }
@@ -55,7 +59,8 @@ impl GlmCache {
     ///
     /// `cutoff` is inclusive, and the same instant goes to `flashes_in_window`.
     pub fn evict_before(&mut self, cutoff: NaiveDateTime) {
-        self.entries.retain(|_key, granule| granule.newest >= cutoff);
+        self.entries
+            .retain(|_key, granule| granule.newest >= cutoff);
     }
 
     /// Iterate over all cached flashes.
@@ -76,7 +81,8 @@ impl GlmCache {
     /// `granule_start` is passed rather than inferred because a granule with no
     /// records has nothing to infer it from. See [`granule_start_of`].
     pub fn insert(&mut self, key: String, granule_start: NaiveDateTime, flashes: Vec<GlmFlash>) {
-        self.entries.insert(key, CachedGranule::new(granule_start, flashes));
+        self.entries
+            .insert(key, CachedGranule::new(granule_start, flashes));
     }
 }
 
@@ -84,11 +90,7 @@ impl GlmCache {
 ///
 /// Empty granules are cached like any other. Filtering them out here would make
 /// [`plan_downloads`] re-queue every one of them on the next poll.
-fn cache_granules(
-    cache: &mut GlmCache,
-    entries: Vec<(String, Vec<GlmFlash>)>,
-    now: NaiveDateTime,
-) {
+fn cache_granules(cache: &mut GlmCache, entries: Vec<(String, Vec<GlmFlash>)>, now: NaiveDateTime) {
     for (key, flashes) in entries {
         let granule_start = granule_start_of(&key, now);
         cache.insert(key, granule_start, flashes);
@@ -159,7 +161,11 @@ pub async fn fetch_glm_flashes(
         if new_keys.is_empty() {
             continue;
         }
-        log::info!("Downloading {} new GLM files from {}", new_keys.len(), sat.display_name());
+        log::info!(
+            "Downloading {} new GLM files from {}",
+            new_keys.len(),
+            sat.display_name()
+        );
 
         // Download in concurrent batches of 20
         let batch = download_and_parse_batch(client, sat, &new_keys, levels).await;
@@ -172,10 +178,20 @@ pub async fn fetch_glm_flashes(
     // Return all cached flashes within the window
     let filtered = flashes_in_window(cache, cutoff, now);
 
-    log::info!("GLM: {} flashes in {:.0}s window", filtered.len(), time_window_secs);
+    log::info!(
+        "GLM: {} flashes in {:.0}s window",
+        filtered.len(),
+        time_window_secs
+    );
 
     // Reported, not logged, for the same reason dead feeds are.
-    Ok(build_outcome(filtered, dead_feeds, satellites.to_vec(), &tally, acc))
+    Ok(build_outcome(
+        filtered,
+        dead_feeds,
+        satellites.to_vec(),
+        &tally,
+        acc,
+    ))
 }
 
 /// Select the cached flashes that fall inside this poll's window.
@@ -189,11 +205,7 @@ pub async fn fetch_glm_flashes(
 /// flashes can be stamped after `now`, and an NTP step backwards does the same.
 /// Such flashes stay cached and appear next poll, which is why dropping this
 /// clause is silent.
-fn flashes_in_window(
-    cache: &GlmCache,
-    cutoff: NaiveDateTime,
-    now: NaiveDateTime,
-) -> Vec<GlmFlash> {
+fn flashes_in_window(cache: &GlmCache, cutoff: NaiveDateTime, now: NaiveDateTime) -> Vec<GlmFlash> {
     cache
         .all_flashes()
         .filter(|f| f.time >= cutoff && f.time <= now)
@@ -275,11 +287,7 @@ struct PollTally {
 /// stay different: cached successes drop out of the returned keys while failures
 /// are never cached and are retried every poll, so a download-count denominator
 /// makes one persistent failure look like a total outage after a few ticks.
-fn plan_downloads<'a>(
-    keys: &'a [String],
-    cache: &GlmCache,
-    tally: &mut PollTally,
-) -> Vec<&'a str> {
+fn plan_downloads<'a>(keys: &'a [String], cache: &GlmCache, tally: &mut PollTally) -> Vec<&'a str> {
     tally.in_window += keys.len();
     keys.iter()
         .filter(|k| !cache.contains_key(k.as_str()))
@@ -347,9 +355,7 @@ async fn list_glm_files(
     for prefix in &prefixes {
         let mut continuation_token: Option<String> = None;
         loop {
-            let mut url = format!(
-                "https://{bucket}.s3.amazonaws.com/?list-type=2&prefix={prefix}"
-            );
+            let mut url = format!("https://{bucket}.s3.amazonaws.com/?list-type=2&prefix={prefix}");
             if let Some(ref token) = continuation_token {
                 url.push_str("&continuation-token=");
                 url.push_str(&urlencoded(token));
@@ -365,7 +371,9 @@ async fn list_glm_files(
                 return Err(format!("S3 returned HTTP {}", resp.status()));
             }
 
-            let body = resp.text().await
+            let body = resp
+                .text()
+                .await
                 .map_err(|e| format!("Failed to read S3 list response: {e}"))?;
 
             let doc = roxmltree::Document::parse(&body)
@@ -373,20 +381,24 @@ async fn list_glm_files(
 
             for node in doc.descendants() {
                 if node.tag_name().name() == "Key"
-                    && let Some(key) = node.text() {
-                        objects_seen += 1;
-                        if key.ends_with(".nc") {
-                            // Filter by start time encoded in filename
-                            if let Some(file_start) = parse_filename_start_time(key)
-                                && file_start >= start && file_start <= end {
-                                    all_keys.push(key.to_string());
-                                }
+                    && let Some(key) = node.text()
+                {
+                    objects_seen += 1;
+                    if key.ends_with(".nc") {
+                        // Filter by start time encoded in filename
+                        if let Some(file_start) = parse_filename_start_time(key)
+                            && file_start >= start
+                            && file_start <= end
+                        {
+                            all_keys.push(key.to_string());
                         }
                     }
+                }
             }
 
             // Check for truncation (pagination)
-            let is_truncated = doc.descendants()
+            let is_truncated = doc
+                .descendants()
                 .find(|n| n.tag_name().name() == "IsTruncated")
                 .and_then(|n| n.text())
                 .is_some_and(|t| t == "true");
@@ -398,7 +410,8 @@ async fn list_glm_files(
             // A truncated response with no usable continuation token would
             // re-issue the identical first-page request forever, inside an
             // async task with no timeout.
-            let next = doc.descendants()
+            let next = doc
+                .descendants()
                 .find(|n| n.tag_name().name() == "NextContinuationToken")
                 .and_then(|n| n.text())
                 .filter(|t| !t.is_empty())
@@ -483,28 +496,31 @@ async fn download_and_parse_batch(
 
     let bucket = satellite.bucket();
     let levels_owned: Vec<GlmDataLevel> = levels.to_vec();
-    let futs: Vec<_> = keys.iter().map(|&key| {
-        let client = client.clone();
-        let url = format!("https://{bucket}.s3.amazonaws.com/{key}");
-        let key_owned = key.to_string();
-        let lvls = levels_owned.clone();
-        async move {
-            match download_and_parse_one(&client, &url, satellite, &lvls).await {
-                Ok(parsed) => Ok((key_owned, parsed)),
-                Err(e) => {
-                    // Debug, not warn: with 20 files in flight a single schema
-                    // change would produce a wall of identical lines. The
-                    // aggregate is reported instead.
-                    log::debug!("Failed to fetch GLM file {key_owned}: {}", e.message());
-                    let labelled = format!("{key_owned}: {}", e.message());
-                    Err(match e {
-                        FileError::Parse(_) => FileError::Parse(labelled),
-                        FileError::Transport(_) => FileError::Transport(labelled),
-                    })
+    let futs: Vec<_> = keys
+        .iter()
+        .map(|&key| {
+            let client = client.clone();
+            let url = format!("https://{bucket}.s3.amazonaws.com/{key}");
+            let key_owned = key.to_string();
+            let lvls = levels_owned.clone();
+            async move {
+                match download_and_parse_one(&client, &url, satellite, &lvls).await {
+                    Ok(parsed) => Ok((key_owned, parsed)),
+                    Err(e) => {
+                        // Debug, not warn: with 20 files in flight a single schema
+                        // change would produce a wall of identical lines. The
+                        // aggregate is reported instead.
+                        log::debug!("Failed to fetch GLM file {key_owned}: {}", e.message());
+                        let labelled = format!("{key_owned}: {}", e.message());
+                        Err(match e {
+                            FileError::Parse(_) => FileError::Parse(labelled),
+                            FileError::Transport(_) => FileError::Transport(labelled),
+                        })
+                    }
                 }
             }
-        }
-    }).collect();
+        })
+        .collect();
 
     let results: Vec<Result<(String, GranuleParse), FileError>> = futures::stream::iter(futs)
         .buffer_unordered(20)
@@ -588,7 +604,8 @@ fn summarize_failures(in_window: usize, errors: Vec<String>) -> Option<FetchFail
 /// Fetch the raw bytes of one object. Every failure here is a transport failure
 /// by construction.
 async fn download_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
-    client.get(url)
+    client
+        .get(url)
         .send()
         .await
         .map_err(|e| format!("HTTP error: {e}"))?
@@ -610,7 +627,9 @@ async fn download_and_parse_one(
     satellite: GlmSatellite,
     levels: &[GlmDataLevel],
 ) -> Result<GranuleParse, FileError> {
-    let bytes = download_bytes(client, url).await.map_err(FileError::Transport)?;
+    let bytes = download_bytes(client, url)
+        .await
+        .map_err(FileError::Transport)?;
     parse_downloaded_file(&bytes, satellite, levels)
 }
 
@@ -754,7 +773,10 @@ fn parse_with_source<S: VarSource>(
     // through `level_failures`. `Err` would discard good group records over a
     // flash-only schema change; a bare `Ok` means `parse_failures: None`, which
     // the panel reads as "everything is fine" while the layer sits empty.
-    Ok(GranuleParse { records: all_records, level_failures: failures })
+    Ok(GranuleParse {
+        records: all_records,
+        level_failures: failures,
+    })
 }
 
 /// One granule's worth of parsed records, plus any level that did not parse.
@@ -856,7 +878,10 @@ fn parse_level_records<S: VarSource>(
                 vars.time_offset
             )
         })?,
-        None => cf::TimeUnits { seconds_per_unit: 1.0, epoch: *time_origin },
+        None => cf::TimeUnits {
+            seconds_per_unit: 1.0,
+            epoch: *time_origin,
+        },
     };
     if time_units.epoch != *time_origin {
         log::warn!(
@@ -983,7 +1008,9 @@ fn read_required_unpacked<S: VarSource>(
         Some(var) => Ok(var),
         None => {
             warn_missing_variable_once(name);
-            Err(format!("GLM file has no '{name}' variable (product schema change?)"))
+            Err(format!(
+                "GLM file has no '{name}' variable (product schema change?)"
+            ))
         }
     }
 }
@@ -1071,10 +1098,13 @@ fn unit_multiplier(
     let sat = satellite.display_name();
 
     let Some(units) = column.units.as_deref() else {
-        warn_once(units_key(satellite, name, "absent"), &format!(
-            "GLM {sat}: {name} declares no units attribute; reporting the field as \
+        warn_once(
+            units_key(satellite, name, "absent"),
+            &format!(
+                "GLM {sat}: {name} declares no units attribute; reporting the field as \
              unknown rather than assuming {canonical}"
-        ));
+            ),
+        );
         return None;
     };
 
@@ -1085,12 +1115,15 @@ fn unit_multiplier(
         .map(|(_, multiplier)| *multiplier);
 
     if found.is_none() {
-        warn_once(units_key(satellite, name, &key), &format!(
-            "GLM {sat}: {name} declares units {units:?}, which rustdar cannot convert \
+        warn_once(
+            units_key(satellite, name, &key),
+            &format!(
+                "GLM {sat}: {name} declares units {units:?}, which rustdar cannot convert \
              to {canonical}; reporting the field as unknown. This is an upstream \
              product change — the conversion table in `glm::fetch` needs the new \
              spelling."
-        ));
+            ),
+        );
     }
     found
 }
@@ -1190,7 +1223,9 @@ mod tests {
 
     /// The error a short column must produce, verbatim.
     fn length_mismatch_error(name: &str, len: usize, reference: &str, count: usize) -> String {
-        format!("GLM variable length mismatch: '{name}' has {len} values but '{reference}' has {count}")
+        format!(
+            "GLM variable length mismatch: '{name}' has {len} values but '{reference}' has {count}"
+        )
     }
 
     #[derive(Default)]
@@ -1223,7 +1258,11 @@ mod tests {
                 }
                 // A "short" column is one element instead of two: the length
                 // *is* the data here, so there are no dimensions to mismatch.
-                let values = if spec.short == Some(name) { &values[..1] } else { values };
+                let values = if spec.short == Some(name) {
+                    &values[..1]
+                } else {
+                    values
+                };
                 let var = file.create_dataset(name);
                 var.with_f32_data(values);
                 // Only the two unit-converted fields need a `units` attribute.
@@ -1241,10 +1280,7 @@ mod tests {
             put("flash_lon", &[-97.0, -98.0]);
             put("flash_energy", &[1.0e-14, 2.0e-14]);
             put("flash_area", &[128.0, 256.0]);
-            put(
-                "flash_time_offset_of_first_event",
-                &[1.0, 2.0],
-            );
+            put("flash_time_offset_of_first_event", &[1.0, 2.0]);
 
             put("event_lat", &[35.5, 36.5]);
             put("event_lon", &[-97.5, -98.5]);
@@ -1266,8 +1302,7 @@ mod tests {
     }
 
     fn parse_flashes(bytes: &[u8]) -> Result<Vec<GlmFlash>, String> {
-        parse_glm_netcdf(bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Flash])
-            .map(|p| p.records)
+        parse_glm_netcdf(bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Flash]).map(|p| p.records)
     }
 
     #[test]
@@ -1281,19 +1316,18 @@ mod tests {
         // which lat [35, 36] and lon [-97, -98] do not, and which a pure
         // scaling preserves (`flash_area` has add_offset = 0 in the product).
         // The `> 1.0` floor excludes the ~1e-14 energy column.
-        let areas: Vec<f32> = flashes.iter().map(|f| f.area.expect("flash area")).collect();
+        let areas: Vec<f32> = flashes
+            .iter()
+            .map(|f| f.area.expect("flash area"))
+            .collect();
         assert!(
             (areas[1] / areas[0] - 2.0).abs() < 1e-3,
             "area column should track the file's values, got {areas:?}"
         );
         assert!(areas.iter().all(|a| *a > 1.0), "got {areas:?}");
 
-        let events = parse_records(
-            &bytes,
-            GlmSatellite::GoesEast,
-            &[GlmDataLevel::Event],
-        )
-        .expect("parse event level");
+        let events = parse_records(&bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Event])
+            .expect("parse event level");
         assert_eq!(events.len(), 2);
         // Fails if events fall back to Some(0.0), rendered as "Area: 0.0 km²".
         assert!(
@@ -1319,7 +1353,10 @@ mod tests {
             "flash_energy",
             "flash_time_offset_of_first_event",
         ] {
-            let bytes = synthetic_glm_file(Fixture { omit: &[missing], ..Default::default() });
+            let bytes = synthetic_glm_file(Fixture {
+                omit: &[missing],
+                ..Default::default()
+            });
             let err = parse_flashes(&bytes).expect_err(
                 "a missing required variable must surface, not read back as an empty column",
             );
@@ -1333,7 +1370,10 @@ mod tests {
     /// cleanly into zero records — a blank map reported as success.
     #[test]
     fn a_whole_level_vanishing_is_an_error_not_zero_records() {
-        let bytes = synthetic_glm_file(Fixture { omit: &FLASH_LEVEL_VARS, ..Default::default() });
+        let bytes = synthetic_glm_file(Fixture {
+            omit: &FLASH_LEVEL_VARS,
+            ..Default::default()
+        });
         let err = parse_flashes(&bytes)
             .expect_err("an entirely absent level must not read as 'no lightning'");
         assert_eq!(err, absent_variable_error("flash_lat"));
@@ -1349,7 +1389,10 @@ mod tests {
             ..Default::default()
         });
         let err = parse_flashes(&bytes).expect_err("absent time variable must surface");
-        assert_eq!(err, absent_variable_error("flash_time_offset_of_first_event"));
+        assert_eq!(
+            err,
+            absent_variable_error("flash_time_offset_of_first_event")
+        );
     }
 
     /// Fails if energy falls back to 0.0, which the rasterizer turns into
@@ -1369,8 +1412,15 @@ mod tests {
     /// variable is corruption, and indexing past it would panic.
     #[test]
     fn a_short_required_column_is_rejected() {
-        for short in ["flash_lon", "flash_energy", "flash_time_offset_of_first_event"] {
-            let bytes = synthetic_glm_file(Fixture { short: Some(short), ..Default::default() });
+        for short in [
+            "flash_lon",
+            "flash_energy",
+            "flash_time_offset_of_first_event",
+        ] {
+            let bytes = synthetic_glm_file(Fixture {
+                short: Some(short),
+                ..Default::default()
+            });
             let err = parse_flashes(&bytes)
                 .expect_err("a short column must be rejected, not indexed past");
             assert_eq!(err, length_mismatch_error(short, 1, "flash_lat", 2));
@@ -1383,7 +1433,13 @@ mod tests {
     #[test]
     fn batch_partition_keeps_every_error_and_separates_the_kinds() {
         let outcome = BatchOutcome::from_results(vec![
-            Ok(("a.nc".into(), GranuleParse { records: Vec::new(), level_failures: Vec::new() })),
+            Ok((
+                "a.nc".into(),
+                GranuleParse {
+                    records: Vec::new(),
+                    level_failures: Vec::new(),
+                },
+            )),
             Err(FileError::Parse("b.nc: bad variable".into())),
             Err(FileError::Transport("c.nc: HTTP status error: 503".into())),
             Err(FileError::Parse("d.nc: bad variable".into())),
@@ -1412,9 +1468,27 @@ mod tests {
             ]
         };
         let outcome = BatchOutcome::from_results(vec![
-            Ok(("a.nc".into(), GranuleParse { records: Vec::new(), level_failures: both_broken() })),
-            Ok(("b.nc".into(), GranuleParse { records: Vec::new(), level_failures: both_broken() })),
-            Ok(("c.nc".into(), GranuleParse { records: Vec::new(), level_failures: both_broken() })),
+            Ok((
+                "a.nc".into(),
+                GranuleParse {
+                    records: Vec::new(),
+                    level_failures: both_broken(),
+                },
+            )),
+            Ok((
+                "b.nc".into(),
+                GranuleParse {
+                    records: Vec::new(),
+                    level_failures: both_broken(),
+                },
+            )),
+            Ok((
+                "c.nc".into(),
+                GranuleParse {
+                    records: Vec::new(),
+                    level_failures: both_broken(),
+                },
+            )),
         ]);
 
         assert_eq!(
@@ -1451,7 +1525,11 @@ mod tests {
         assert_eq!(acc.entries.len(), 1);
         assert_eq!(acc.parse_errors, vec!["p"]);
         assert_eq!(acc.transport_errors, vec!["t"]);
-        assert_eq!(acc.level_failures.len(), 1, "the level bucket must not be dropped");
+        assert_eq!(
+            acc.level_failures.len(),
+            1,
+            "the level bucket must not be dropped"
+        );
         assert_eq!(
             acc.evaluated_levels,
             vec![
@@ -1519,8 +1597,8 @@ mod tests {
         let mut tally = PollTally::default();
         let new_keys = plan_downloads(&keys, &cache, &mut tally);
         assert_eq!(new_keys.len(), 1);
-        let report = summarize_failures(tally.in_window, vec!["k11.nc: boom".into()])
-            .expect("one failure");
+        let report =
+            summarize_failures(tally.in_window, vec!["k11.nc: boom".into()]).expect("one failure");
         assert!(
             !report.is_total(),
             "one straggler failing must never read as a total outage, got {report:?}"
@@ -1628,7 +1706,11 @@ mod tests {
         let fresh = cutoff + TimeDelta::seconds(10);
 
         let mut cache = GlmCache::default();
-        cache_granule(&mut cache, "straddles.nc", vec![flash_at(stale), flash_at(fresh)]);
+        cache_granule(
+            &mut cache,
+            "straddles.nc",
+            vec![flash_at(stale), flash_at(fresh)],
+        );
 
         cache.evict_before(cutoff);
 
@@ -1766,7 +1848,11 @@ mod tests {
         );
         // `now` is nowhere near the key's own time — see
         // `wall_clock_unlike_keys`.
-        cache.insert(key.to_string(), granule_start_of(key, wall_clock_unlike_keys()), Vec::new());
+        cache.insert(
+            key.to_string(),
+            granule_start_of(key, wall_clock_unlike_keys()),
+            Vec::new(),
+        );
 
         // Polls 2..n, still inside the window: the listing keeps offering it and
         // the cache must keep answering "already have it" (~250 KB per miss).
@@ -1779,7 +1865,10 @@ mod tests {
                 "poll {poll}: a granule already downloaded and found empty was \
                  re-queued — this is the every-poll re-fetch, back"
             );
-            assert_eq!(tally.in_window, 1, "it is still in the window, just not new work");
+            assert_eq!(
+                tally.in_window, 1,
+                "it is still in the window, just not new work"
+            );
         }
 
         // Past the cutoff it leaves, like any other granule. It is out of the
@@ -1822,7 +1911,10 @@ mod tests {
         cache.evict_before(
             parse_filename_start_time(quiet).expect("fixture key") + TimeDelta::milliseconds(1),
         );
-        assert!(!cache.contains_key(quiet), "the empty granule ages by its own start time");
+        assert!(
+            !cache.contains_key(quiet),
+            "the empty granule ages by its own start time"
+        );
     }
 
     /// The fallback in [`granule_start_of`] is unreachable for anything a poll
@@ -1872,8 +1964,10 @@ mod tests {
             ],
         );
 
-        let mut got: Vec<NaiveDateTime> =
-            flashes_in_window(&cache, cutoff, now).into_iter().map(|f| f.time).collect();
+        let mut got: Vec<NaiveDateTime> = flashes_in_window(&cache, cutoff, now)
+            .into_iter()
+            .map(|f| f.time)
+            .collect();
         got.sort();
 
         assert_eq!(
@@ -1893,7 +1987,11 @@ mod tests {
         let ahead = t0() + TimeDelta::minutes(3);
 
         let mut cache = GlmCache::default();
-        cache_granule(&mut cache, "granule.nc", vec![flash_at(t0()), flash_at(ahead)]);
+        cache_granule(
+            &mut cache,
+            "granule.nc",
+            vec![flash_at(t0()), flash_at(ahead)],
+        );
 
         // The clock steps back: `now` lands between the two cached flashes.
         let now = t0() + TimeDelta::minutes(1);
@@ -1904,8 +2002,10 @@ mod tests {
             cache.contains_key("granule.nc"),
             "a backwards clock must not evict data it has not caught up to yet"
         );
-        let during: Vec<NaiveDateTime> =
-            flashes_in_window(&cache, cutoff, now).into_iter().map(|f| f.time).collect();
+        let during: Vec<NaiveDateTime> = flashes_in_window(&cache, cutoff, now)
+            .into_iter()
+            .map(|f| f.time)
+            .collect();
         assert_eq!(
             during,
             vec![t0()],
@@ -1916,8 +2016,10 @@ mod tests {
         let now = ahead + TimeDelta::minutes(1);
         let cutoff = now - window;
         cache.evict_before(cutoff);
-        let mut after: Vec<NaiveDateTime> =
-            flashes_in_window(&cache, cutoff, now).into_iter().map(|f| f.time).collect();
+        let mut after: Vec<NaiveDateTime> = flashes_in_window(&cache, cutoff, now)
+            .into_iter()
+            .map(|f| f.time)
+            .collect();
         after.sort();
         assert_eq!(
             after,
@@ -1927,7 +2029,11 @@ mod tests {
     }
 
     fn level_failure(satellite: GlmSatellite, level: GlmDataLevel) -> LevelFailure {
-        LevelFailure { satellite, level, sample_error: format!("{level:?} broke") }
+        LevelFailure {
+            satellite,
+            level,
+            sample_error: format!("{level:?} broke"),
+        }
     }
 
     /// Every bucket must land in its own field: swapping two makes every 503
@@ -1949,15 +2055,23 @@ mod tests {
             ],
             ..Default::default()
         };
-        let outcome =
-            build_outcome(Vec::new(), Vec::new(), vec![GlmSatellite::GoesEast], &tally, acc);
+        let outcome = build_outcome(
+            Vec::new(),
+            Vec::new(),
+            vec![GlmSatellite::GoesEast],
+            &tally,
+            acc,
+        );
 
         assert_eq!(
             outcome.parse_failures.expect("parse failures").sample_error,
             "a.nc: GLM file has no 'flash_lat' variable",
         );
         assert_eq!(
-            outcome.transport_failures.expect("transport failures").sample_error,
+            outcome
+                .transport_failures
+                .expect("transport failures")
+                .sample_error,
             "b.nc: HTTP status error: 503",
         );
         assert_eq!(outcome.queried, vec![GlmSatellite::GoesEast]);
@@ -2006,7 +2120,10 @@ mod tests {
         };
         let outcome = build_outcome(Vec::new(), Vec::new(), Vec::new(), &tally, acc);
 
-        assert_eq!(outcome.parse_failures.expect("parse failures").in_window, 14);
+        assert_eq!(
+            outcome.parse_failures.expect("parse failures").in_window,
+            14
+        );
         assert!(
             outcome.transport_failures.is_none(),
             "nothing failed to download, so there is nothing to report"
@@ -2035,9 +2152,8 @@ mod tests {
     #[test]
     fn a_good_granule_parses_through_the_classified_stage() {
         let bytes = synthetic_glm_file(Fixture::default());
-        let flashes =
-            parse_downloaded_file(&bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Flash])
-                .expect("fixture should parse");
+        let flashes = parse_downloaded_file(&bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Flash])
+            .expect("fixture should parse");
         assert_eq!(flashes.records.len(), 2);
         assert!(flashes.level_failures.is_empty());
     }
@@ -2087,11 +2203,14 @@ mod tests {
     /// wording.
     #[test]
     fn summarize_failures_distinguishes_total_from_partial() {
-        let partial = summarize_failures(12, vec!["a".into(), "b".into()])
-            .expect("failures present");
+        let partial =
+            summarize_failures(12, vec!["a".into(), "b".into()]).expect("failures present");
         assert_eq!((partial.failed, partial.in_window), (2, 12));
         assert!(!partial.is_total());
-        assert_eq!(partial.sample_error, "a", "should keep the first error as the sample");
+        assert_eq!(
+            partial.sample_error, "a",
+            "should keep the first error as the sample"
+        );
 
         let total = summarize_failures(3, vec!["a".into(), "b".into(), "c".into()])
             .expect("failures present");
@@ -2125,8 +2244,8 @@ mod tests {
     #[test]
     fn one_bad_granule_is_never_a_total_failure() {
         for in_window in [2usize, 5, 14, 89] {
-            let report = summarize_failures(in_window, vec!["f0: boom".into()])
-                .expect("failures present");
+            let report =
+                summarize_failures(in_window, vec!["f0: boom".into()]).expect("failures present");
             assert!(
                 !report.is_total(),
                 "1 of {in_window} failing is a bad granule, not a product change"
@@ -2154,8 +2273,8 @@ mod tests {
             omit: &["flash_area"],
             ..Default::default()
         });
-        let flashes = parse_flashes(&bytes)
-            .expect("a missing area must not blank the whole overlay");
+        let flashes =
+            parse_flashes(&bytes).expect("a missing area must not blank the whole overlay");
         assert_eq!(flashes.len(), 2);
         assert!(flashes.iter().all(|f| f.area.is_none()));
         // Position and energy are untouched.

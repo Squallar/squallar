@@ -295,7 +295,12 @@ impl PointerTracker {
             // in the ordered walk below. See `PointerTracker`.
             let mut touch_started = None;
             for event in &i.events {
-                if let egui::Event::Touch { id, phase: egui::TouchPhase::Start, .. } = event {
+                if let egui::Event::Touch {
+                    id,
+                    phase: egui::TouchPhase::Start,
+                    ..
+                } = event
+                {
                     // First wins: eframe picks the primary as
                     // `all_touches.first()` and pushes changed touches in the
                     // same order (`web/input.rs:30`, `:85`).
@@ -313,7 +318,9 @@ impl PointerTracker {
             // within one frame ends up armed, not lost.
             for event in &i.events {
                 match event {
-                    egui::Event::PointerButton { pressed, button, .. } => {
+                    egui::Event::PointerButton {
+                        pressed, button, ..
+                    } => {
                         activity = true;
                         // Only the primary button drives the sequence. `down`
                         // is `primary_down()`, so a right- or middle-click says
@@ -506,7 +513,14 @@ impl DoubleTapDragDetector {
         map_memory: &mut walkers::MapMemory,
         map_rect: egui::Rect,
     ) {
-        let PointerFrame { pressed, released, down, pos, time, .. } = input;
+        let PointerFrame {
+            pressed,
+            released,
+            down,
+            pos,
+            time,
+            ..
+        } = input;
 
         // Clear last frame's confirmed tap
         self.confirmed_tap_pos = None;
@@ -554,7 +568,11 @@ impl DoubleTapDragDetector {
             self.state = GestureState::Idle;
             return;
         }
-        if let GestureState::ZoomDragging { drag_start_y, initial_zoom } = self.state {
+        if let GestureState::ZoomDragging {
+            drag_start_y,
+            initial_zoom,
+        } = self.state
+        {
             let dy = pos.y - drag_start_y;
             let zoom_delta = dy as f64 / ZOOM_DRAG_SENSITIVITY as f64;
             let new_zoom = (initial_zoom + zoom_delta).clamp(1.0, 19.0);
@@ -563,12 +581,7 @@ impl DoubleTapDragDetector {
     }
 
     /// On press, check if this is the second tap of a double-tap sequence.
-    fn handle_press(
-        &mut self,
-        pos: egui::Pos2,
-        time: f64,
-        map_memory: &mut walkers::MapMemory,
-    ) {
+    fn handle_press(&mut self, pos: egui::Pos2, time: f64, map_memory: &mut walkers::MapMemory) {
         if let GestureState::WaitingForSecondTap { tap_time, tap_pos } = self.state {
             let dt = time - tap_time;
             let dist = (pos - tap_pos).length();
@@ -639,7 +652,9 @@ impl LongPressDetector {
     /// egui's raw `pointer.down`, a cancelled touch would re-arm the hold every
     /// [`LONG_PRESS_DURATION_S`] forever.
     pub(crate) fn update(&mut self, input: PointerFrame) -> Option<egui::Pos2> {
-        let PointerFrame { down, pos, time, .. } = input;
+        let PointerFrame {
+            down, pos, time, ..
+        } = input;
 
         if !down {
             self.press_start = None;
@@ -767,8 +782,7 @@ impl TouchGestures {
             self.long_press.update(input)
         };
 
-        let overlay_click_pos =
-            filter_dialog_blocked(ctx, self.double_tap.take_confirmed_tap());
+        let overlay_click_pos = filter_dialog_blocked(ctx, self.double_tap.take_confirmed_tap());
 
         MapPointerFrame {
             overlay_click_pos,
@@ -949,18 +963,25 @@ mod tests {
         let mut d = TrackerDriver::new();
         let pos = egui::pos2(100.0, 100.0);
 
-        assert!(d.frame(vec![button(egui::PointerButton::Primary, true, pos)]).down);
+        assert!(
+            d.frame(vec![button(egui::PointerButton::Primary, true, pos)])
+                .down
+        );
         assert!(!d.frame(vec![egui::Event::PointerGone]).down);
 
         for step in 1..=4 {
             let moved = d.frame(vec![egui::Event::PointerMoved(
                 pos + egui::vec2(4.0 * step as f32, 0.0),
             )]);
-            assert!(!moved.down, "step {step}: motion is not evidence of a held button");
+            assert!(
+                !moved.down,
+                "step {step}: motion is not evidence of a held button"
+            );
         }
 
         assert!(
-            d.frame(vec![button(egui::PointerButton::Primary, true, pos)]).down,
+            d.frame(vec![button(egui::PointerButton::Primary, true, pos)])
+                .down,
             "a real press is what brings it back"
         );
     }
@@ -1049,7 +1070,8 @@ mod tests {
             "the finger this frame adopted is the finger this frame cancelled"
         );
         assert!(
-            !d.frame(vec![egui::Event::PointerMoved(pos + egui::vec2(40.0, 0.0))]).down,
+            !d.frame(vec![egui::Event::PointerMoved(pos + egui::vec2(40.0, 0.0))])
+                .down,
             "and it is terminal like any other cancellation"
         );
     }
@@ -1090,7 +1112,8 @@ mod tests {
 
         assert!(d.frame(touch_down(0, pos)).down);
         assert!(
-            d.frame(vec![button(egui::PointerButton::Secondary, false, pos)]).down,
+            d.frame(vec![button(egui::PointerButton::Secondary, false, pos)])
+                .down,
             "a right-button release is not this sequence ending"
         );
 
@@ -1102,7 +1125,8 @@ mod tests {
         ]);
 
         assert!(
-            d.frame(vec![touch(1, egui::TouchPhase::Cancel, second)]).down,
+            d.frame(vec![touch(1, egui::TouchPhase::Cancel, second)])
+                .down,
             "the second finger must not have taken the identity"
         );
         assert!(
@@ -1176,8 +1200,12 @@ mod tests {
         );
 
         assert!(
-            d.frame(vec![touch(6, egui::TouchPhase::Cancel, pos + egui::vec2(60.0, 0.0))])
-                .down,
+            d.frame(vec![touch(
+                6,
+                egui::TouchPhase::Cancel,
+                pos + egui::vec2(60.0, 0.0)
+            )])
+            .down,
             "the second finger is not the primary"
         );
         assert!(
@@ -1197,7 +1225,11 @@ mod tests {
 
         assert!(d.frame(touch_down(0, pos)).down);
 
-        let after = d.frame(vec![touch(1, egui::TouchPhase::Cancel, pos + egui::vec2(80.0, 0.0))]);
+        let after = d.frame(vec![touch(
+            1,
+            egui::TouchPhase::Cancel,
+            pos + egui::vec2(80.0, 0.0),
+        )]);
         assert!(after.down, "another finger's cancellation is not ours");
     }
 
@@ -1251,11 +1283,18 @@ mod tests {
         ]);
 
         // A mouse press: no touch involved at all.
-        assert!(d.frame(vec![button(egui::PointerButton::Primary, true, pos)]).down);
+        assert!(
+            d.frame(vec![button(egui::PointerButton::Primary, true, pos)])
+                .down
+        );
 
         assert!(
-            d.frame(vec![touch(0, egui::TouchPhase::Cancel, pos + egui::vec2(200.0, 0.0))])
-                .down,
+            d.frame(vec![touch(
+                0,
+                egui::TouchPhase::Cancel,
+                pos + egui::vec2(200.0, 0.0)
+            )])
+            .down,
             "a recycled touch id must not cancel a mouse sequence"
         );
     }
@@ -1281,8 +1320,12 @@ mod tests {
         ]);
 
         assert!(
-            d.frame(vec![touch(1, egui::TouchPhase::Cancel, pos + egui::vec2(80.0, 0.0))])
-                .down,
+            d.frame(vec![touch(
+                1,
+                egui::TouchPhase::Cancel,
+                pos + egui::vec2(80.0, 0.0)
+            )])
+            .down,
             "the second finger never became the primary"
         );
         assert!(

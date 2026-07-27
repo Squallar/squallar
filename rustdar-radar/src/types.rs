@@ -1,11 +1,11 @@
+use crate::sites::RadarSite;
+use crate::sites::get_radar_site;
 use chrono::NaiveDateTime;
 use nexrad_model::data::Radial;
 use nexrad_model::data::Scan;
 use rustdar_units::UserPreferences;
 use std::collections::HashMap;
 use std::f64::consts::PI;
-use crate::sites::RadarSite;
-use crate::sites::get_radar_site;
 
 /// Side length, in pixels, of the square radar image every render produces.
 /// An RGBA texture is `IMAGE_SIZE² × 4` bytes; a static pane render keeps an
@@ -155,7 +155,10 @@ fn discover_product_elevations(scan: &Scan) -> HashMap<RadarProduct, Vec<f32>> {
             }
             log::info!(
                 "  Sweep {:2}: raw={:.2}° rounded={:.1}° radials={} products=[{}]",
-                i, raw_angle, elev_angle, sweep.radials().len(),
+                i,
+                raw_angle,
+                elev_angle,
+                sweep.radials().len(),
                 products_found.join(", ")
             );
         } else {
@@ -177,9 +180,7 @@ fn discover_product_elevations(scan: &Scan) -> HashMap<RadarProduct, Vec<f32>> {
     }
 
     for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
-        product_elevations
-            .entry(*l3_product)
-            .or_default();
+        product_elevations.entry(*l3_product).or_default();
     }
 
     product_elevations
@@ -280,11 +281,11 @@ impl RadarProduct {
         matches!(
             self,
             RadarProduct::StormRelativeVelocity
-            | RadarProduct::SpecificDifferentialPhase
-            | RadarProduct::EchoTops
-            | RadarProduct::VerticallyIntegratedLiquid
-            | RadarProduct::HydrometeorClassification
-            | RadarProduct::PrecipitationRate
+                | RadarProduct::SpecificDifferentialPhase
+                | RadarProduct::EchoTops
+                | RadarProduct::VerticallyIntegratedLiquid
+                | RadarProduct::HydrometeorClassification
+                | RadarProduct::PrecipitationRate
         )
     }
 
@@ -346,7 +347,9 @@ impl RadarProduct {
                 let converted = prefs.speed.convert_from_ms(value);
                 format!("Spectrum Width: {:.1} {}", converted, prefs.speed.suffix())
             }
-            RadarProduct::DifferentialReflectivity => format!("Diff. Reflectivity: {:.2} dB", value),
+            RadarProduct::DifferentialReflectivity => {
+                format!("Diff. Reflectivity: {:.2} dB", value)
+            }
             RadarProduct::CorrelationCoefficient => format!("Corr. Coefficient: {:.4}", value),
             RadarProduct::DifferentialPhase => format!("Diff. Phase: {:.1}°", value),
             RadarProduct::SpecificDifferentialPhase => format!("KDP: {:.2} °/km", value),
@@ -377,7 +380,11 @@ impl RadarProduct {
             }
             RadarProduct::PrecipitationRate => {
                 let converted = prefs.precip_rate.convert_from_in_per_hr(value);
-                format!("Precip Rate: {:.2} {}", converted, prefs.precip_rate.suffix())
+                format!(
+                    "Precip Rate: {:.2} {}",
+                    converted,
+                    prefs.precip_rate.suffix()
+                )
             }
             RadarProduct::NormalizedRotation => format!("NROT: {:.2}", value),
         }

@@ -240,7 +240,8 @@ impl LambertConformalConic {
             for _ in 0..MAX_LATITUDE_ITERATIONS {
                 let s = phi.sin();
                 let next = std::f64::consts::FRAC_PI_2
-                    - 2.0 * (t * ((1.0 - self.e * s) / (1.0 + self.e * s)).powf(self.e / 2.0)).atan();
+                    - 2.0
+                        * (t * ((1.0 - self.e * s) / (1.0 + self.e * s)).powf(self.e / 2.0)).atan();
                 let converged = (next - phi).abs() < LATITUDE_ITERATION_TOLERANCE_RAD;
                 phi = next;
                 if converged {
@@ -479,10 +480,9 @@ impl LambertGrid {
 
     /// Lat/lon of grid point `(i, j)`, degrees, longitude wrapped to -180..180.
     pub fn latlon(&self, i: usize, j: usize) -> (f64, f64) {
-        let (lat, lon) = self.projection.inverse(
-            self.x0 + self.dx * i as f64,
-            self.y0 + self.dy * j as f64,
-        );
+        let (lat, lon) = self
+            .projection
+            .inverse(self.x0 + self.dx * i as f64, self.y0 + self.dy * j as f64);
         (lat, normalize_longitude_degrees(lon))
     }
 
@@ -773,10 +773,7 @@ mod tests {
 
     #[track_caller]
     fn assert_latlon_close(actual: (f64, f64), expected: (f64, f64), tol: f64, what: &str) {
-        let (dlat, dlon) = (
-            (actual.0 - expected.0).abs(),
-            (actual.1 - expected.1).abs(),
-        );
+        let (dlat, dlon) = ((actual.0 - expected.0).abs(), (actual.1 - expected.1).abs());
         assert!(
             dlat <= tol && dlon <= tol,
             "{what}: got ({:.8}, {:.8}), expected ({:.8}, {:.8}); \
@@ -844,7 +841,13 @@ mod tests {
         (0, 0, 21.138123_00, -122.719528_00, "SW corner (0,0)"),
         (1798, 0, 21.140546_63, -72.289718_49, "SE corner (ni-1,0)"),
         (0, 1058, 47.838623_50, -134.095479_73, "NW corner (0,nj-1)"),
-        (1798, 1058, 47.842195_02, -60.917192_77, "NE corner (ni-1,nj-1)"),
+        (
+            1798,
+            1058,
+            47.842195_02,
+            -60.917192_77,
+            "NE corner (ni-1,nj-1)",
+        ),
         (899, 529, 38.497246_65, -97.505976_69, "interior midpoint"),
     ];
 
@@ -1081,12 +1084,47 @@ mod tests {
         // point it contains, and only containment is meaningful.
         let (lat0, lon0) = g.latlon(60, 45);
         let boxes: &[(f64, f64, f64, f64, bool, &str)] = &[
-            (lat0 - 0.2, lat0 + 0.2, lon0 - 0.2, lon0 + 0.2, true, "small interior"),
-            (lat0 - 0.5, lat0 + 0.5, lon0 - 0.8, lon0 + 0.8, true, "wide interior"),
-            (lat0 - 0.03, lat0 + 0.03, lon0 - 0.9, lon0 + 0.9, true, "a thin strip"),
-            (lat0 - 3.0, lat0 + 0.3, lon0 - 3.0, lon0 + 0.3, false, "over the SW corner"),
+            (
+                lat0 - 0.2,
+                lat0 + 0.2,
+                lon0 - 0.2,
+                lon0 + 0.2,
+                true,
+                "small interior",
+            ),
+            (
+                lat0 - 0.5,
+                lat0 + 0.5,
+                lon0 - 0.8,
+                lon0 + 0.8,
+                true,
+                "wide interior",
+            ),
+            (
+                lat0 - 0.03,
+                lat0 + 0.03,
+                lon0 - 0.9,
+                lon0 + 0.9,
+                true,
+                "a thin strip",
+            ),
+            (
+                lat0 - 3.0,
+                lat0 + 0.3,
+                lon0 - 3.0,
+                lon0 + 0.3,
+                false,
+                "over the SW corner",
+            ),
             (0.0, 90.0, -180.0, 0.0, false, "a quarter of the planet"),
-            (lat0 + 8.0, lat0 + 9.0, lon0, lon0 + 1.0, false, "well off the grid"),
+            (
+                lat0 + 8.0,
+                lat0 + 9.0,
+                lon0,
+                lon0 + 1.0,
+                false,
+                "well off the grid",
+            ),
         ];
 
         for &(min_lat, max_lat, min_lon, max_lon, tight, what) in boxes {
@@ -1119,7 +1157,10 @@ mod tests {
             if !tight {
                 continue;
             }
-            assert!(inside > 0, "{what}: an empty box proves nothing about tightness");
+            assert!(
+                inside > 0,
+                "{what}: an empty box proves nothing about tightness"
+            );
             // Two cells of slack: the bounds are over the continuous box, the
             // true extent over lattice points, and a thin box's corner need not
             // contain one. Nowhere near enough slack to admit a degenerate
@@ -1195,8 +1236,8 @@ mod tests {
     #[test]
     fn forward_of_inverse_returns_the_original_grid_index() {
         let grid = hrrr_conus_grid();
-        let projection = LambertConformalConic::new(6_371_229.0, 6_371_229.0, 38.5, 262.5, 38.5, 38.5)
-            .unwrap();
+        let projection =
+            LambertConformalConic::new(6_371_229.0, 6_371_229.0, 38.5, 262.5, 38.5, 38.5).unwrap();
         let (x0, y0) = projection.forward(21.138123, 237.280472);
         let points = latlons(&grid).unwrap();
 
@@ -1221,10 +1262,42 @@ mod tests {
     fn projection_origin_inverts_to_lat0_lon0() {
         let cases: &[(f64, f64, f64, f64, f64, f64, &str)] = &[
             // (a, b, lat_0, lon_0, lat_1, lat_2, label)
-            (6_371_229.0, 6_371_229.0, 38.5, 262.5, 38.5, 38.5, "HRRR (tangent, sphere)"),
-            (6_371_229.0, 6_371_229.0, 38.5, -97.5, 30.0, 60.0, "secant, sphere"),
-            (6_378_206.4, 6_356_583.8, 27.833333, -99.0, 28.383333, 30.283333, "secant, ellipsoid"),
-            (6_371_229.0, 6_371_229.0, -38.5, 145.0, -30.0, -60.0, "southern cone"),
+            (
+                6_371_229.0,
+                6_371_229.0,
+                38.5,
+                262.5,
+                38.5,
+                38.5,
+                "HRRR (tangent, sphere)",
+            ),
+            (
+                6_371_229.0,
+                6_371_229.0,
+                38.5,
+                -97.5,
+                30.0,
+                60.0,
+                "secant, sphere",
+            ),
+            (
+                6_378_206.4,
+                6_356_583.8,
+                27.833333,
+                -99.0,
+                28.383333,
+                30.283333,
+                "secant, ellipsoid",
+            ),
+            (
+                6_371_229.0,
+                6_371_229.0,
+                -38.5,
+                145.0,
+                -30.0,
+                -60.0,
+                "southern cone",
+            ),
         ];
         for &(a, b, lat0, lon0, lat1, lat2, label) in cases {
             let p = LambertConformalConic::new(a, b, lat0, lon0, lat1, lat2).unwrap();
@@ -1250,7 +1323,11 @@ mod tests {
             "tangent cone constant {} != sin(38.5°) = {expected}",
             tangent.n,
         );
-        assert!(tangent.n.is_finite(), "tangent branch produced {}", tangent.n);
+        assert!(
+            tangent.n.is_finite(),
+            "tangent branch produced {}",
+            tangent.n
+        );
     }
 
     /// The tangent cone constant must come from **Latin1, not LaD**.
@@ -1280,8 +1357,8 @@ mod tests {
     /// (rho0 is built from the same `n`), hence the other three rows.
     #[test]
     fn tangent_cone_constant_follows_latin1_not_lad() {
-        let p = LambertConformalConic::new(6_371_229.0, 6_371_229.0, 45.0, -97.5, 30.0, 30.0)
-            .unwrap();
+        let p =
+            LambertConformalConic::new(6_371_229.0, 6_371_229.0, 45.0, -97.5, 30.0, 30.0).unwrap();
 
         let expected_n = 30.0_f64.to_radians().sin();
         assert!(
@@ -1357,7 +1434,10 @@ mod tests {
         let normal = LambertConformalConic::new(a, b, lat0, lon0, lat1, lat2).unwrap();
         let swapped = LambertConformalConic::new(a, b, lat0, lon0, lat2, lat1).unwrap();
 
-        assert!((normal.n - swapped.n).abs() < 1e-15, "cone constant differs");
+        assert!(
+            (normal.n - swapped.n).abs() < 1e-15,
+            "cone constant differs"
+        );
         assert!(
             (normal.big_f - swapped.big_f).abs() / normal.big_f < 1e-12,
             "scale factor differs: {} vs {}",
@@ -1463,13 +1543,20 @@ mod tests {
         const US_SURVEY_FOOT_M: f64 = 1200.0 / 3937.0;
         let a = 6_378_206.400;
         let b = a * (1.0 - 1.0 / 294.97870);
-        let (lat0, lon0, lat1, lat2) =
-            (27.0 + 50.0 / 60.0, -99.0, 28.0 + 23.0 / 60.0, 30.0 + 17.0 / 60.0);
+        let (lat0, lon0, lat1, lat2) = (
+            27.0 + 50.0 / 60.0,
+            -99.0,
+            28.0 + 23.0 / 60.0,
+            30.0 + 17.0 / 60.0,
+        );
 
         let ellipsoid = LambertConformalConic::new(a, b, lat0, lon0, lat1, lat2).unwrap();
         let sphere = LambertConformalConic::new(a, a, lat0, lon0, lat1, lat2).unwrap();
 
-        assert!(ellipsoid.e > 0.0, "Clarke 1866 must have non-zero eccentricity");
+        assert!(
+            ellipsoid.e > 0.0,
+            "Clarke 1866 must have non-zero eccentricity"
+        );
         assert_eq!(sphere.e, 0.0, "a == b must give exactly zero eccentricity");
 
         // Distance between the two answers at the EPSG test point.
@@ -1519,9 +1606,12 @@ mod tests {
     /// Tolerance is 1 mm, which is the printed precision of the reference.
     #[test]
     fn southern_cone_matches_proj_and_round_trips() {
-        let p =
-            LambertConformalConic::new(6_371_229.0, 6_371_229.0, -38.5, 145.0, -30.0, -60.0).unwrap();
-        assert!(p.n < 0.0, "southern parallels must give a negative cone constant");
+        let p = LambertConformalConic::new(6_371_229.0, 6_371_229.0, -38.5, 145.0, -30.0, -60.0)
+            .unwrap();
+        assert!(
+            p.n < 0.0,
+            "southern parallels must give a negative cone constant"
+        );
 
         let from_proj: &[(f64, f64, f64, f64)] = &[
             (-35.0, 150.0, 446_832.877539, 366_322.927131),
@@ -1567,7 +1657,10 @@ mod tests {
         // not a panic.
         let mut grid = hrrr_conus_grid();
         grid.earth_shape.shape = 200;
-        assert!(latlons(&grid).is_err(), "unknown Code Table 3.2 value must error");
+        assert!(
+            latlons(&grid).is_err(),
+            "unknown Code Table 3.2 value must error"
+        );
     }
 
     /// Deliberately not a bit-for-bit clone of grib's `normalize_latlon`: grib's

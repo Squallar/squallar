@@ -127,10 +127,7 @@ enum Behaviour {
     ///
     /// Lets a test put exactly one tile in the cache and leave a chosen
     /// descendant permanently unavailable.
-    ServeOnly {
-        path: String,
-        body: Arc<Vec<u8>>,
-    },
+    ServeOnly { path: String, body: Arc<Vec<u8>> },
 }
 
 /// A real HTTP/1.1 server on loopback, recording every path it is asked for.
@@ -1022,7 +1019,10 @@ fn an_arriving_tile_requests_a_repaint() {
         },
     );
     assert!(
-        pump_until(DEFAULT_TIMEOUT, || ctx.has_requested_repaint().then_some(())).is_some(),
+        pump_until(DEFAULT_TIMEOUT, || ctx
+            .has_requested_repaint()
+            .then_some(()))
+        .is_some(),
         "a tile arrived but no repaint was requested"
     );
 }

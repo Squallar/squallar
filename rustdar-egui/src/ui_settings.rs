@@ -1,9 +1,9 @@
+use crate::actions::GuiAction;
+use rustdar_gps::HeadingSource;
 use rustdar_units::{
     DistanceUnit, HailSizeUnit, HeightUnit, PrecipRateUnit, SpeedUnit, TemperatureUnit,
-    TimezonePreference, UserPreferences, UnitLabel,
+    TimezonePreference, UnitLabel, UserPreferences,
 };
-use rustdar_gps::HeadingSource;
-use crate::actions::GuiAction;
 
 /// Width of the settings window when there is room for a fixed-width one.
 /// Narrower screens get a full-bleed window instead — see
@@ -54,13 +54,38 @@ impl super::Gui {
                 ui.heading("Units");
                 ui.add_space(SETTINGS_SMALL_SPACING);
 
-                unit_combo(ui, "Timezone", &mut self.preferences.timezone, TimezonePreference::ALL);
-                unit_combo(ui, "Temperature", &mut self.preferences.temperature, TemperatureUnit::ALL);
+                unit_combo(
+                    ui,
+                    "Timezone",
+                    &mut self.preferences.timezone,
+                    TimezonePreference::ALL,
+                );
+                unit_combo(
+                    ui,
+                    "Temperature",
+                    &mut self.preferences.temperature,
+                    TemperatureUnit::ALL,
+                );
                 unit_combo(ui, "Speed", &mut self.preferences.speed, SpeedUnit::ALL);
-                unit_combo(ui, "Distance", &mut self.preferences.distance, DistanceUnit::ALL);
+                unit_combo(
+                    ui,
+                    "Distance",
+                    &mut self.preferences.distance,
+                    DistanceUnit::ALL,
+                );
                 unit_combo(ui, "Height", &mut self.preferences.height, HeightUnit::ALL);
-                unit_combo(ui, "Precip rate", &mut self.preferences.precip_rate, PrecipRateUnit::ALL);
-                unit_combo(ui, "Hail size", &mut self.preferences.hail_size, HailSizeUnit::ALL);
+                unit_combo(
+                    ui,
+                    "Precip rate",
+                    &mut self.preferences.precip_rate,
+                    PrecipRateUnit::ALL,
+                );
+                unit_combo(
+                    ui,
+                    "Hail size",
+                    &mut self.preferences.hail_size,
+                    HailSizeUnit::ALL,
+                );
 
                 ui.add_space(SETTINGS_LARGE_SPACING);
                 ui.separator();
@@ -113,9 +138,17 @@ impl super::Gui {
                         egui::ComboBox::from_id_salt("gps_baud")
                             .selected_text(baud_label)
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.gps_config.baud_rate, 0, "Auto-detect");
+                                ui.selectable_value(
+                                    &mut self.gps_config.baud_rate,
+                                    0,
+                                    "Auto-detect",
+                                );
                                 for &rate in GPS_BAUD_RATES {
-                                    ui.selectable_value(&mut self.gps_config.baud_rate, rate, rate.to_string());
+                                    ui.selectable_value(
+                                        &mut self.gps_config.baud_rate,
+                                        rate,
+                                        rate.to_string(),
+                                    );
                                 }
                             });
                     });

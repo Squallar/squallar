@@ -100,7 +100,10 @@ impl RenderCache {
     /// Move `key` to the most-recently-used end. No-op if absent.
     fn touch(&mut self, key: &RenderCacheKey) {
         if let Some(pos) = self.recency.iter().position(|k| k == key) {
-            let k = self.recency.remove(pos).expect("position() just yielded it");
+            let k = self
+                .recency
+                .remove(pos)
+                .expect("position() just yielded it");
             self.recency.push_back(k);
         }
     }
@@ -126,7 +129,9 @@ impl RenderCache {
             self.recency.push_back(key);
         }
         while self.entries.len() > self.capacity {
-            let Some(oldest) = self.recency.pop_front() else { break };
+            let Some(oldest) = self.recency.pop_front() else {
+                break;
+            };
             self.entries.remove(&oldest);
         }
     }
@@ -144,7 +149,11 @@ impl RenderCache {
 
     #[cfg(test)]
     pub fn entry_count(&self) -> usize {
-        debug_assert_eq!(self.entries.len(), self.recency.len(), "recency queue out of step");
+        debug_assert_eq!(
+            self.entries.len(),
+            self.recency.len(),
+            "recency queue out of step"
+        );
         self.entries.len()
     }
 
@@ -304,11 +313,14 @@ impl RenderDispatcher {
                 // Sorted rather than assumed: objects do not always arrive in
                 // volume order, and both the fallback (the front) and the
                 // eviction (the back) depend on newest-first holding.
-                history.make_contiguous().sort_by_key(|s| std::cmp::Reverse(s.volume));
+                history
+                    .make_contiguous()
+                    .sort_by_key(|s| std::cmp::Reverse(s.volume));
                 history.truncate(STORM_MOTION_HISTORY);
             }
         }
-        self.level3_data.insert((product, tilt_code, site), Arc::new(fetched));
+        self.level3_data
+            .insert((product, tilt_code, site), Arc::new(fetched));
     }
 
     /// Record the storm motion override in force and, if it moved, drop every
@@ -328,7 +340,10 @@ impl RenderDispatcher {
         }
         self.last_storm_motion_override = motion;
         for prs in &mut self.pane_render {
-            if matches!(prs.last_rendered, Some((RadarProduct::StormRelativeVelocity, _))) {
+            if matches!(
+                prs.last_rendered,
+                Some((RadarProduct::StormRelativeVelocity, _))
+            ) {
                 prs.last_rendered = None;
             }
         }
@@ -415,13 +430,28 @@ impl RenderDispatcher {
     ///
     /// `&mut self` because a hit counts as a use for the LRU: a pane that keeps
     /// reusing its cached render must not age out behind one nobody is looking at.
-    pub fn get_cached_render(&mut self, site: &str, product: RadarProduct, elevation: f32) -> Option<&CachedRenderOutput> {
-        self.render_cache.get(&(site.to_string(), product, elevation_key(elevation)))
+    pub fn get_cached_render(
+        &mut self,
+        site: &str,
+        product: RadarProduct,
+        elevation: f32,
+    ) -> Option<&CachedRenderOutput> {
+        self.render_cache
+            .get(&(site.to_string(), product, elevation_key(elevation)))
     }
 
     /// Store a render result in the cache for sharing across panes.
-    pub fn cache_render(&mut self, site: &str, product: RadarProduct, elevation: f32, output: CachedRenderOutput) {
-        self.render_cache.insert((site.to_string(), product, elevation_key(elevation)), output);
+    pub fn cache_render(
+        &mut self,
+        site: &str,
+        product: RadarProduct,
+        elevation: f32,
+        output: CachedRenderOutput,
+    ) {
+        self.render_cache.insert(
+            (site.to_string(), product, elevation_key(elevation)),
+            output,
+        );
     }
 }
 
@@ -459,7 +489,12 @@ impl RenderDispatcher {
                 let db = (b.message.pdb.elevation_angle() - elevation).abs();
                 da.partial_cmp(&db)
                     .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(a.message.pdb.elevation_number.cmp(&b.message.pdb.elevation_number))
+                    .then(
+                        a.message
+                            .pdb
+                            .elevation_number
+                            .cmp(&b.message.pdb.elevation_number),
+                    )
             })
             .map(|(_, msg)| Arc::clone(msg))
     }
@@ -605,9 +640,14 @@ impl RenderDispatcher {
                 derived.motion.direction_deg,
                 motion_provenance_suffix(derived.motion_provenance),
             );
-            self.spawn_render(pane_idx, product, params.elevation, sender, window, move || {
-                render_derived_srm_to_image(&derived, lat, lon)
-            });
+            self.spawn_render(
+                pane_idx,
+                product,
+                params.elevation,
+                sender,
+                window,
+                move || render_derived_srm_to_image(&derived, lat, lon),
+            );
             return true;
         }
 
@@ -616,9 +656,14 @@ impl RenderDispatcher {
             pane_idx,
             product
         );
-        self.spawn_render(pane_idx, params.product, params.elevation, sender, window, move || {
-            render_level3_message_to_image(&l3_msg.message, product, lat, lon)
-        });
+        self.spawn_render(
+            pane_idx,
+            params.product,
+            params.elevation,
+            sender,
+            window,
+            move || render_level3_message_to_image(&l3_msg.message, product, lat, lon),
+        );
         true
     }
 
@@ -834,7 +879,11 @@ mod srm_dispatch_tests {
                 .map(|p| (p.message.pdb.elevation_angle(), p.message.pdb.product_code))
         };
         assert_eq!(at(0.5), Some((0.5, 154)), "0.5° derives from N0G, not N0S");
-        assert_eq!(at(1.3), Some((1.3, 154)), "N1G is 1.3°, not the nominal 1.5°");
+        assert_eq!(
+            at(1.3),
+            Some((1.3, 154)),
+            "N1G is 1.3°, not the nominal 1.5°"
+        );
         assert_eq!(at(2.4), Some((2.4, 99)));
         assert_eq!(at(3.1), Some((3.1, 99)));
         // 1.5° — what the mnemonic claims — must still resolve to the 1.3° cut,
@@ -845,7 +894,11 @@ mod srm_dispatch_tests {
         // disagree: VCP 212's real cuts put it 0.6° from 1.3° and 0.5° from
         // 2.4°, so it belongs to `N2U`; the mnemonics' nominal 1.5°/2.4° put it
         // 0.4° from `N1G` and would hand back a field a whole cut too low.
-        assert_eq!(at(1.9), Some((2.4, 99)), "ranked by the PDB, not by the mnemonic");
+        assert_eq!(
+            at(1.9),
+            Some((2.4, 99)),
+            "ranked by the PDB, not by the mnemonic"
+        );
     }
 
     /// Only storm-relative velocity filters its candidates. Every other
@@ -866,9 +919,11 @@ mod srm_dispatch_tests {
         ] {
             let p = product(product_code, 5, 1, 7108, VELOCITY_PS);
             cache(&mut d, radar_product, code, "KMPX", p);
-            let picked = d.nearest_tilt(radar_product, "KMPX", 0.5).unwrap_or_else(|| {
-                panic!("{code} is not dealiased velocity, and must render regardless")
-            });
+            let picked = d
+                .nearest_tilt(radar_product, "KMPX", 0.5)
+                .unwrap_or_else(|| {
+                    panic!("{code} is not dealiased velocity, and must render regardless")
+                });
             assert_eq!(picked.message.pdb.product_code, product_code);
         }
     }
@@ -911,23 +966,39 @@ mod srm_dispatch_tests {
     #[test]
     fn a_missing_lowest_tilt_does_not_fall_back_to_the_rpgs_product() {
         let mut d = loaded();
-        d.level3_data
-            .remove(&(RadarProduct::StormRelativeVelocity, "N0G".to_string(), "KMPX".to_string()));
+        d.level3_data.remove(&(
+            RadarProduct::StormRelativeVelocity,
+            "N0G".to_string(),
+            "KMPX".to_string(),
+        ));
         let picked = d
             .nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", 0.5)
             .expect("the upper tilts are still loaded");
         assert_eq!(picked.message.pdb.product_code, 154);
-        assert_eq!(picked.message.pdb.elevation_angle(), 1.3, "the nearest surviving cut");
+        assert_eq!(
+            picked.message.pdb.elevation_angle(),
+            1.3,
+            "the nearest surviving cut"
+        );
         // With every velocity product gone there is no tilt at all, rather than
         // `N0S` reappearing as one.
         for code in ["N1G", "N2U", "N3U"] {
-            d.level3_data
-                .remove(&(RadarProduct::StormRelativeVelocity, code.to_string(), "KMPX".to_string()));
+            d.level3_data.remove(&(
+                RadarProduct::StormRelativeVelocity,
+                code.to_string(),
+                "KMPX".to_string(),
+            ));
         }
-        assert!(d.nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", 0.5).is_none());
+        assert!(
+            d.nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", 0.5)
+                .is_none()
+        );
         // …and the vector is still there to be read, so the filter removed it
         // from the screen and not from the cache.
-        assert!(d.storm_motion_for("KMPX", &velocity_from(VOLUME.1)).is_some());
+        assert!(
+            d.storm_motion_for("KMPX", &velocity_from(VOLUME.1))
+                .is_some()
+        );
     }
 
     /// Every tilt is derived, so every tilt honours the override — including
@@ -945,7 +1016,8 @@ mod srm_dispatch_tests {
             // the invalidation reads cannot come apart.
             let rpg = srm::derive(
                 &tilt.message,
-                &d.storm_motion_for("KMPX", &tilt.message).expect("N0S is loaded"),
+                &d.storm_motion_for("KMPX", &tilt.message)
+                    .expect("N0S is loaded"),
             )
             .unwrap_or_else(|| panic!("{elevation}° derives"));
             d.set_storm_motion_override(Some(
@@ -953,7 +1025,8 @@ mod srm_dispatch_tests {
             ));
             let overridden = srm::derive(
                 &tilt.message,
-                &d.storm_motion_for("KMPX", &tilt.message).expect("the override is a vector"),
+                &d.storm_motion_for("KMPX", &tilt.message)
+                    .expect("the override is a vector"),
             )
             .unwrap_or_else(|| panic!("{elevation}° derives"));
             d.set_storm_motion_override(None);
@@ -963,8 +1036,7 @@ mod srm_dispatch_tests {
             assert!(!overridden.motion.is_scit_average, "{elevation}°");
             // Recording the vector is not applying it: the gates have to move.
             assert_ne!(
-                overridden.packet.radials[0].gate_values,
-                rpg.packet.radials[0].gate_values,
+                overridden.packet.radials[0].gate_values, rpg.packet.radials[0].gate_values,
                 "{elevation}°: the override was recorded but never reached the field",
             );
         }
@@ -989,7 +1061,9 @@ mod srm_dispatch_tests {
             .nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", 0.5)
             .expect("0.5° has a tilt");
 
-        let rpg = d.storm_motion_for("KMPX", &tilt.message).expect("N0S is loaded");
+        let rpg = d
+            .storm_motion_for("KMPX", &tilt.message)
+            .expect("N0S is loaded");
         let own_volume = srm::derive(&tilt.message, &rpg).expect("derives");
         assert_eq!(
             motion_provenance_suffix(own_volume.motion_provenance),
@@ -1004,7 +1078,9 @@ mod srm_dispatch_tests {
         };
         assert_eq!(
             motion_provenance_suffix(
-                srm::derive(&tilt.message, &stale).expect("derives").motion_provenance
+                srm::derive(&tilt.message, &stale)
+                    .expect("derives")
+                    .motion_provenance
             ),
             " (previous volume)",
             "precondition: a genuinely stale RPG vector must still say so",
@@ -1015,7 +1091,10 @@ mod srm_dispatch_tests {
             &StormMotionSample::user_override(30.0, 240.0).expect("finite"),
         )
         .expect("derives");
-        assert_eq!(overridden.motion_provenance, srm::MotionProvenance::UserOverride);
+        assert_eq!(
+            overridden.motion_provenance,
+            srm::MotionProvenance::UserOverride
+        );
         assert_eq!(
             motion_provenance_suffix(overridden.motion_provenance),
             " (user override)",
@@ -1028,13 +1107,15 @@ mod srm_dispatch_tests {
     #[test]
     fn every_tilt_is_a_quarter_kilometre_field() {
         let d = loaded();
-        let s = d.storm_motion_for("KMPX", &velocity_from(VOLUME.1)).expect("N0S is loaded");
+        let s = d
+            .storm_motion_for("KMPX", &velocity_from(VOLUME.1))
+            .expect("N0S is loaded");
         for elevation in [0.5f32, 1.3, 2.4, 3.1] {
             let tilt = d
                 .nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", elevation)
                 .unwrap_or_else(|| panic!("{elevation}° has a tilt"));
-            let derived = srm::derive(&tilt.message, &s)
-                .unwrap_or_else(|| panic!("{elevation}° derives"));
+            let derived =
+                srm::derive(&tilt.message, &s).unwrap_or_else(|| panic!("{elevation}° derives"));
             assert!(
                 (derived.packet.gate_interval_km() - 0.25).abs() < 1e-9,
                 "{elevation}°: {} km gates",
@@ -1050,13 +1131,28 @@ mod srm_dispatch_tests {
     fn a_tilt_is_never_taken_from_another_site() {
         let mut d = loaded();
         let p = product(154, 13, 9, 9999, VELOCITY_PS);
-        cache(&mut d, RadarProduct::StormRelativeVelocity, "N1G", "KFSD", p);
+        cache(
+            &mut d,
+            RadarProduct::StormRelativeVelocity,
+            "N1G",
+            "KFSD",
+            p,
+        );
         let picked = d
             .nearest_tilt(RadarProduct::StormRelativeVelocity, "KFSD", 1.3)
             .expect("KFSD has one tilt");
-        assert_eq!(picked.message.pdb.volume_scan_time, 9999, "took KMPX's product");
-        assert!(d.nearest_tilt(RadarProduct::StormRelativeVelocity, "KABR", 1.3).is_none());
-        assert!(d.nearest_tilt(RadarProduct::EchoTops, "KMPX", 1.3).is_none());
+        assert_eq!(
+            picked.message.pdb.volume_scan_time, 9999,
+            "took KMPX's product"
+        );
+        assert!(
+            d.nearest_tilt(RadarProduct::StormRelativeVelocity, "KABR", 1.3)
+                .is_none()
+        );
+        assert!(
+            d.nearest_tilt(RadarProduct::EchoTops, "KMPX", 1.3)
+                .is_none()
+        );
     }
 
     /// Split cuts and SAILS/MRLE repeats share an elevation angle, so the angle
@@ -1099,7 +1195,9 @@ mod srm_dispatch_tests {
     #[test]
     fn the_vector_is_taken_from_the_product_that_carries_one() {
         let d = loaded();
-        let s = d.storm_motion_for("KMPX", &velocity_from(VOLUME.1)).expect("N0S is loaded");
+        let s = d
+            .storm_motion_for("KMPX", &velocity_from(VOLUME.1))
+            .expect("N0S is loaded");
         assert_eq!(s.motion.speed_kt, 25.7);
         assert_eq!(s.motion.direction_deg, 296.1);
         assert!(s.motion.is_scit_average);
@@ -1118,13 +1216,17 @@ mod srm_dispatch_tests {
             let p = product(product_code, tenths, elev_num, 7108, ps);
             cache(&mut d, RadarProduct::StormRelativeVelocity, code, "KMPX", p);
         }
-        assert!(d.storm_motion_for("KMPX", &velocity_from(VOLUME.1)).is_none());
+        assert!(
+            d.storm_motion_for("KMPX", &velocity_from(VOLUME.1))
+                .is_none()
+        );
         // A user override fills the gap — that is what it is for.
         d.set_storm_motion_override(Some(
             StormMotionSample::user_override(40.0, 200.0).expect("finite"),
         ));
         assert_eq!(
-            d.storm_motion_for("KMPX", &velocity_from(VOLUME.1)).map(|s| s.motion.speed_kt),
+            d.storm_motion_for("KMPX", &velocity_from(VOLUME.1))
+                .map(|s| s.motion.speed_kt),
             Some(40.0),
         );
     }
@@ -1193,7 +1295,11 @@ mod srm_dispatch_tests {
         let unseen = d
             .storm_motion_for("KMPX", &velocity_from(9999))
             .expect("an unknown volume falls back");
-        assert_eq!(unseen.volume, Some(next), "the fallback is the newest, not an arbitrary one");
+        assert_eq!(
+            unseen.volume,
+            Some(next),
+            "the fallback is the newest, not an arbitrary one"
+        );
     }
 
     /// A pane-sized render of `product` at `elevation`. Only the two fields
@@ -1295,7 +1401,13 @@ mod srm_dispatch_tests {
         let mut d = RenderDispatcher::new();
         let mut p = product(154, 5, 1, 7108, VELOCITY_PS);
         p.stamp = ProductStamp::from_key("not-a-key");
-        cache(&mut d, RadarProduct::StormRelativeVelocity, "N0G", "KMPX", p);
+        cache(
+            &mut d,
+            RadarProduct::StormRelativeVelocity,
+            "N0G",
+            "KMPX",
+            p,
+        );
 
         assert!(
             d.nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", 0.5)
@@ -1343,7 +1455,10 @@ mod srm_dispatch_tests {
         }
         assert_eq!(d.storm_motion_history["KMPX"].len(), STORM_MOTION_HISTORY);
         // The oldest went, not the newest.
-        assert!(d.storm_motion_for("KMPX", &velocity_from(7011)).is_some_and(|s| s.volume.map(|v| v.1) == Some(7011)));
+        assert!(
+            d.storm_motion_for("KMPX", &velocity_from(7011))
+                .is_some_and(|s| s.volume.map(|v| v.1) == Some(7011))
+        );
         assert!(
             d.storm_motion_for("KMPX", &velocity_from(7000))
                 .is_some_and(|s| s.volume.map(|v| v.1) == Some(7011)),
@@ -1360,11 +1475,13 @@ mod srm_dispatch_tests {
             product(56, 5, 1, 6500, N0S_PS),
         );
         assert!(
-            d.storm_motion_for("KMPX", &velocity_from(1)).is_some_and(|s| s.volume.map(|v| v.1) == Some(7011)),
+            d.storm_motion_for("KMPX", &velocity_from(1))
+                .is_some_and(|s| s.volume.map(|v| v.1) == Some(7011)),
             "an old object arriving late became the newest",
         );
         assert!(
-            d.storm_motion_for("KMPX", &velocity_from(7011)).is_some_and(|s| s.volume.map(|v| v.1) == Some(7011)),
+            d.storm_motion_for("KMPX", &velocity_from(7011))
+                .is_some_and(|s| s.volume.map(|v| v.1) == Some(7011)),
             "an old object arriving late evicted a newer volume",
         );
     }
@@ -1403,7 +1520,10 @@ mod srm_dispatch_tests {
 
         // A full reset does forget, and takes every site with it.
         d.reset_panes();
-        assert!(d.storm_motion_for("KMPX", &velocity_from(VOLUME.1)).is_none());
+        assert!(
+            d.storm_motion_for("KMPX", &velocity_from(VOLUME.1))
+                .is_none()
+        );
     }
 
     /// The override wins over the RPG's own vector, or the setting does nothing.
@@ -1414,7 +1534,9 @@ mod srm_dispatch_tests {
         d.set_storm_motion_override(Some(
             StormMotionSample::user_override(45.0, 210.0).expect("finite"),
         ));
-        let s = d.storm_motion_for("KMPX", &velocity_from(VOLUME.1)).unwrap();
+        let s = d
+            .storm_motion_for("KMPX", &velocity_from(VOLUME.1))
+            .unwrap();
         assert_eq!(s.motion.speed_kt, 45.0);
         assert_eq!(s.motion.direction_deg, 210.0);
         assert!(!s.motion.is_scit_average);
@@ -1432,7 +1554,9 @@ mod srm_dispatch_tests {
         d.cache_render("KMPX", RadarProduct::StormRelativeVelocity, 1.3, output());
         d.cache_render("KMPX", RadarProduct::Reflectivity, 0.5, output());
 
-        assert!(d.set_storm_motion_override(Some(StormMotionSample::user_override(30.0, 240.0).expect("finite"))));
+        assert!(d.set_storm_motion_override(Some(
+            StormMotionSample::user_override(30.0, 240.0).expect("finite")
+        )));
         assert_eq!(d.pane_render[0].last_rendered, None);
         assert_eq!(
             d.pane_render[1].last_rendered,
@@ -1441,11 +1565,15 @@ mod srm_dispatch_tests {
         );
         assert_eq!(d.pane_render[2].last_rendered, None);
         assert!(
-            d.get_cached_render("KMPX", RadarProduct::StormRelativeVelocity, 1.3).is_none(),
+            d.get_cached_render("KMPX", RadarProduct::StormRelativeVelocity, 1.3)
+                .is_none(),
             "the shared cache is keyed on (site, product, elevation), which the vector is \
              not part of, so a stale entry would be handed straight back",
         );
-        assert!(d.get_cached_render("KMPX", RadarProduct::Reflectivity, 0.5).is_some());
+        assert!(
+            d.get_cached_render("KMPX", RadarProduct::Reflectivity, 0.5)
+                .is_some()
+        );
     }
 
     /// Re-applying the same override must not invalidate anything, or every
@@ -1458,7 +1586,10 @@ mod srm_dispatch_tests {
         assert!(d.set_storm_motion_override(o));
         d.pane_render[0].last_rendered = Some((RadarProduct::StormRelativeVelocity, 1.3));
         assert!(!d.set_storm_motion_override(o));
-        assert_eq!(d.pane_render[0].last_rendered, Some((RadarProduct::StormRelativeVelocity, 1.3)));
+        assert_eq!(
+            d.pane_render[0].last_rendered,
+            Some((RadarProduct::StormRelativeVelocity, 1.3))
+        );
         // Turning it back off is a change again.
         assert!(d.set_storm_motion_override(None));
         assert_eq!(d.pane_render[0].last_rendered, None);
@@ -1478,7 +1609,11 @@ mod render_cache_tests {
     use super::*;
 
     fn key(site: &str, elevation_tenths: i32) -> RenderCacheKey {
-        (site.to_string(), RadarProduct::Reflectivity, elevation_tenths)
+        (
+            site.to_string(),
+            RadarProduct::Reflectivity,
+            elevation_tenths,
+        )
     }
 
     /// A distinguishable entry — `max_range_km` doubles as the identity so a test
@@ -1522,8 +1657,14 @@ mod render_cache_tests {
         assert!(cache.get(&key("KTLX", 0)).is_some());
         cache.insert(key("KTLX", 3), output(3.0));
 
-        assert!(cache.get(&key("KTLX", 0)).is_some(), "the read should have saved it");
-        assert!(cache.get(&key("KTLX", 1)).is_none(), "untouched since insert, so it goes");
+        assert!(
+            cache.get(&key("KTLX", 0)).is_some(),
+            "the read should have saved it"
+        );
+        assert!(
+            cache.get(&key("KTLX", 1)).is_none(),
+            "untouched since insert, so it goes"
+        );
         assert_eq!(cache.entry_count(), 3);
     }
 
@@ -1623,9 +1764,15 @@ mod render_cache_tests {
         for (i, site) in sites.iter().enumerate() {
             let hit = dispatcher.get_cached_render(site, RadarProduct::Reflectivity, 0.5);
             let Some(hit) = hit else {
-                panic!("{site} was evicted with only {} panes' worth cached", sites.len());
+                panic!(
+                    "{site} was evicted with only {} panes' worth cached",
+                    sites.len()
+                );
             };
-            assert_eq!(hit.max_range_km, i as f64, "{site} came back as another pane's render");
+            assert_eq!(
+                hit.max_range_km, i as f64,
+                "{site} came back as another pane's render"
+            );
         }
     }
 }

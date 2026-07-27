@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
-use crate::render::controls::{ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut};
+use crate::render::controls::{
+    ControlEffect, ControlItem, ControlUpdate, PaneControlContext, PaneControlContextMut,
+};
 use crate::render::overlay_state::{
-    FetchPayload,OverlayHandler, OverlayItem, OverlayKind, RenderMode};
+    FetchPayload, OverlayHandler, OverlayItem, OverlayKind, RenderMode,
+};
 
 /// Toggle state only: the draw loop renders the marker per frame.
 pub(crate) struct UserLocationHandler {
@@ -16,37 +19,60 @@ impl UserLocationHandler {
 }
 
 impl OverlayHandler for UserLocationHandler {
-    fn kind(&self) -> OverlayKind { OverlayKind::UserLocation }
-    fn display_name(&self) -> &str { "My Location" }
-    fn render_mode(&self) -> RenderMode { RenderMode::PerFrameDirect }
-    fn default_enabled(&self) -> bool { true }
-    fn is_enabled(&self) -> bool { self.enabled }
-    fn set_enabled(&mut self, enabled: bool) { self.enabled = enabled; }
+    fn kind(&self) -> OverlayKind {
+        OverlayKind::UserLocation
+    }
+    fn display_name(&self) -> &str {
+        "My Location"
+    }
+    fn render_mode(&self) -> RenderMode {
+        RenderMode::PerFrameDirect
+    }
+    fn default_enabled(&self) -> bool {
+        true
+    }
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
 
-    fn data_generation(&self) -> u64 { 0 }
-    fn has_data(&self) -> bool { true }
-    fn is_fetching(&self) -> bool { false }
+    fn data_generation(&self) -> u64 {
+        0
+    }
+    fn has_data(&self) -> bool {
+        true
+    }
+    fn is_fetching(&self) -> bool {
+        false
+    }
     fn set_fetching(&mut self, _fetching: bool) {}
-    fn fetch_time(&self) -> Option<web_time::Instant> { None }
+    fn fetch_time(&self) -> Option<web_time::Instant> {
+        None
+    }
 
     fn apply_fetch_result(&mut self, _result: FetchPayload) {}
     fn retain_selections(&self, _selections: &mut Vec<Arc<dyn OverlayItem>>) {}
 
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
-        vec![
-            ControlItem::Toggle {
-                id: "enabled",
-                label: "\u{1f4cd}  My Location".to_string(),
-                enabled: self.enabled,
-            },
-        ]
+        vec![ControlItem::Toggle {
+            id: "enabled",
+            label: "\u{1f4cd}  My Location".to_string(),
+            enabled: self.enabled,
+        }]
     }
 
-    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneControlContextMut<'_>) -> ControlEffect {
+    fn apply_control(
+        &mut self,
+        update: &ControlUpdate,
+        _ctx: &mut PaneControlContextMut<'_>,
+    ) -> ControlEffect {
         if update.id == "enabled"
-            && let crate::render::controls::ControlValue::Bool(val) = update.value {
-                self.enabled = val;
-            }
+            && let crate::render::controls::ControlValue::Bool(val) = update.value
+        {
+            self.enabled = val;
+        }
         ControlEffect::None
     }
 

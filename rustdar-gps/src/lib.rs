@@ -12,4 +12,4 @@ pub use config::{GpsConfig, HeadingSource};
 pub use types::{FixQuality, GpsFix};
 
 #[cfg(feature = "serial")]
-pub use serial::{detect_gps_ports, GpsPortInfo, SerialGpsReader};
+pub use serial::{GpsPortInfo, SerialGpsReader, detect_gps_ports};

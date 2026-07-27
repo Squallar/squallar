@@ -46,10 +46,9 @@ impl HeadingSource {
         match self {
             HeadingSource::Auto => {
                 let moving = speed_mps.is_some_and(|s| s > MOVING_SPEED_THRESHOLD_MPS);
-                if moving
-                    && let Some(bearing) = gps_bearing {
-                        return Some(bearing as f32);
-                    }
+                if moving && let Some(bearing) = gps_bearing {
+                    return Some(bearing as f32);
+                }
                 compass_heading
             }
             HeadingSource::CompassOnly => compass_heading,
@@ -69,7 +68,6 @@ pub struct GpsConfig {
     /// How the directional heading is determined.
     pub heading_source: HeadingSource,
 }
-
 
 impl GpsConfig {
     /// Whether baud rate should be auto-detected.

@@ -20,46 +20,224 @@ impl AlertColorEntry {
 /// in `event_types.txt` — see `every_live_entry_matches_a_real_event`.
 static ALERT_COLORS: &[AlertColorEntry] = &[
     // ── Warnings (most severe first) ──
-    AlertColorEntry { keywords: &["tornado", "warning"],           r: 255, g: 0,   b: 0   }, // Red (reserved)
-    AlertColorEntry { keywords: &["severe thunderstorm", "warning"], r: 255, g: 165, b: 0   }, // Orange
-    AlertColorEntry { keywords: &["flash flood", "warning"],       r: 139, g: 0,   b: 0   }, // Dark red
-    AlertColorEntry { keywords: &["flood", "warning"],             r: 0,   g: 255, b: 0   }, // Green
-    AlertColorEntry { keywords: &["blizzard", "warning"],          r: 255, g: 69,  b: 0   }, // OrangeRed
-    AlertColorEntry { keywords: &["winter storm", "warning"],      r: 255, g: 105, b: 180 }, // Hot pink
-    AlertColorEntry { keywords: &["ice storm", "warning"],         r: 139, g: 0,   b: 139 }, // Dark magenta
-    AlertColorEntry { keywords: &["extreme cold", "warning"],      r: 176, g: 196, b: 222 }, // Light steel blue
-    AlertColorEntry { keywords: &["high wind", "warning"],         r: 218, g: 165, b: 32  }, // Goldenrod
-    AlertColorEntry { keywords: &["extreme heat", "warning"],      r: 199, g: 21,  b: 133 }, // MediumVioletRed
-    AlertColorEntry { keywords: &["freeze", "warning"],            r: 72,  g: 61,  b: 139 }, // Dark slate blue
-    AlertColorEntry { keywords: &["red flag", "warning"],          r: 210, g: 105, b: 30  }, // Chocolate
-    AlertColorEntry { keywords: &["fire", "warning"],              r: 205, g: 92,  b: 92  }, // IndianRed
-    AlertColorEntry { keywords: &["dust storm", "warning"],        r: 255, g: 228, b: 196 }, // Bisque
-    AlertColorEntry { keywords: &["gale", "warning"],              r: 218, g: 112, b: 214 }, // Orchid
-
+    AlertColorEntry {
+        keywords: &["tornado", "warning"],
+        r: 255,
+        g: 0,
+        b: 0,
+    }, // Red (reserved)
+    AlertColorEntry {
+        keywords: &["severe thunderstorm", "warning"],
+        r: 255,
+        g: 165,
+        b: 0,
+    }, // Orange
+    AlertColorEntry {
+        keywords: &["flash flood", "warning"],
+        r: 139,
+        g: 0,
+        b: 0,
+    }, // Dark red
+    AlertColorEntry {
+        keywords: &["flood", "warning"],
+        r: 0,
+        g: 255,
+        b: 0,
+    }, // Green
+    AlertColorEntry {
+        keywords: &["blizzard", "warning"],
+        r: 255,
+        g: 69,
+        b: 0,
+    }, // OrangeRed
+    AlertColorEntry {
+        keywords: &["winter storm", "warning"],
+        r: 255,
+        g: 105,
+        b: 180,
+    }, // Hot pink
+    AlertColorEntry {
+        keywords: &["ice storm", "warning"],
+        r: 139,
+        g: 0,
+        b: 139,
+    }, // Dark magenta
+    AlertColorEntry {
+        keywords: &["extreme cold", "warning"],
+        r: 176,
+        g: 196,
+        b: 222,
+    }, // Light steel blue
+    AlertColorEntry {
+        keywords: &["high wind", "warning"],
+        r: 218,
+        g: 165,
+        b: 32,
+    }, // Goldenrod
+    AlertColorEntry {
+        keywords: &["extreme heat", "warning"],
+        r: 199,
+        g: 21,
+        b: 133,
+    }, // MediumVioletRed
+    AlertColorEntry {
+        keywords: &["freeze", "warning"],
+        r: 72,
+        g: 61,
+        b: 139,
+    }, // Dark slate blue
+    AlertColorEntry {
+        keywords: &["red flag", "warning"],
+        r: 210,
+        g: 105,
+        b: 30,
+    }, // Chocolate
+    AlertColorEntry {
+        keywords: &["fire", "warning"],
+        r: 205,
+        g: 92,
+        b: 92,
+    }, // IndianRed
+    AlertColorEntry {
+        keywords: &["dust storm", "warning"],
+        r: 255,
+        g: 228,
+        b: 196,
+    }, // Bisque
+    AlertColorEntry {
+        keywords: &["gale", "warning"],
+        r: 218,
+        g: 112,
+        b: 214,
+    }, // Orchid
     // ── Watches ──
-    AlertColorEntry { keywords: &["tornado", "watch"],             r: 255, g: 255, b: 0   }, // Yellow (reserved)
-    AlertColorEntry { keywords: &["severe thunderstorm", "watch"], r: 219, g: 112, b: 147 }, // PaleVioletRed
-    AlertColorEntry { keywords: &["flash flood", "watch"],         r: 60,  g: 179, b: 113 }, // MediumSeaGreen
-    AlertColorEntry { keywords: &["flood", "watch"],               r: 46,  g: 139, b: 87  }, // Sea green
-    AlertColorEntry { keywords: &["winter storm", "watch"],        r: 70,  g: 130, b: 180 }, // Steel blue
-    AlertColorEntry { keywords: &["extreme cold", "watch"],        r: 95,  g: 158, b: 160 }, // CadetBlue
-    AlertColorEntry { keywords: &["extreme heat", "watch"],        r: 128, g: 0,   b: 0   }, // Maroon
-    AlertColorEntry { keywords: &["fire", "watch"],                r: 255, g: 222, b: 173 }, // NavajoWhite
-
+    AlertColorEntry {
+        keywords: &["tornado", "watch"],
+        r: 255,
+        g: 255,
+        b: 0,
+    }, // Yellow (reserved)
+    AlertColorEntry {
+        keywords: &["severe thunderstorm", "watch"],
+        r: 219,
+        g: 112,
+        b: 147,
+    }, // PaleVioletRed
+    AlertColorEntry {
+        keywords: &["flash flood", "watch"],
+        r: 60,
+        g: 179,
+        b: 113,
+    }, // MediumSeaGreen
+    AlertColorEntry {
+        keywords: &["flood", "watch"],
+        r: 46,
+        g: 139,
+        b: 87,
+    }, // Sea green
+    AlertColorEntry {
+        keywords: &["winter storm", "watch"],
+        r: 70,
+        g: 130,
+        b: 180,
+    }, // Steel blue
+    AlertColorEntry {
+        keywords: &["extreme cold", "watch"],
+        r: 95,
+        g: 158,
+        b: 160,
+    }, // CadetBlue
+    AlertColorEntry {
+        keywords: &["extreme heat", "watch"],
+        r: 128,
+        g: 0,
+        b: 0,
+    }, // Maroon
+    AlertColorEntry {
+        keywords: &["fire", "watch"],
+        r: 255,
+        g: 222,
+        b: 173,
+    }, // NavajoWhite
     // ── Advisories / Statements ──
-    AlertColorEntry { keywords: &["wind advisory"],                r: 210, g: 180, b: 140 }, // Tan
-    AlertColorEntry { keywords: &["winter weather advisory"],      r: 123, g: 104, b: 238 }, // MediumSlateBlue
-    AlertColorEntry { keywords: &["frost advisory"],               r: 100, g: 149, b: 237 }, // CornflowerBlue
-    AlertColorEntry { keywords: &["heat advisory"],                r: 255, g: 127, b: 80  }, // Coral
-    AlertColorEntry { keywords: &["cold weather advisory"],        r: 175, g: 238, b: 238 }, // PaleTurquoise
-    AlertColorEntry { keywords: &["dense fog advisory"],           r: 112, g: 128, b: 144 }, // SlateGray
-    AlertColorEntry { keywords: &["flood advisory"],               r: 0,   g: 255, b: 127 }, // SpringGreen
-    AlertColorEntry { keywords: &["small craft advisory"],         r: 127, g: 255, b: 212 }, // Aquamarine
-    AlertColorEntry { keywords: &["high surf advisory"],           r: 32,  g: 178, b: 170 }, // LightSeaGreen
-    AlertColorEntry { keywords: &["air quality"],                  r: 143, g: 188, b: 143 }, // DarkSeaGreen
-    AlertColorEntry { keywords: &["rip current"],                  r: 0,   g: 206, b: 209 }, // DarkTurquoise
-    AlertColorEntry { keywords: &["beach hazards"],                r: 72,  g: 209, b: 204 }, // MediumTurquoise
-    AlertColorEntry { keywords: &["special weather statement"],    r: 255, g: 228, b: 181 }, // Moccasin
+    AlertColorEntry {
+        keywords: &["wind advisory"],
+        r: 210,
+        g: 180,
+        b: 140,
+    }, // Tan
+    AlertColorEntry {
+        keywords: &["winter weather advisory"],
+        r: 123,
+        g: 104,
+        b: 238,
+    }, // MediumSlateBlue
+    AlertColorEntry {
+        keywords: &["frost advisory"],
+        r: 100,
+        g: 149,
+        b: 237,
+    }, // CornflowerBlue
+    AlertColorEntry {
+        keywords: &["heat advisory"],
+        r: 255,
+        g: 127,
+        b: 80,
+    }, // Coral
+    AlertColorEntry {
+        keywords: &["cold weather advisory"],
+        r: 175,
+        g: 238,
+        b: 238,
+    }, // PaleTurquoise
+    AlertColorEntry {
+        keywords: &["dense fog advisory"],
+        r: 112,
+        g: 128,
+        b: 144,
+    }, // SlateGray
+    AlertColorEntry {
+        keywords: &["flood advisory"],
+        r: 0,
+        g: 255,
+        b: 127,
+    }, // SpringGreen
+    AlertColorEntry {
+        keywords: &["small craft advisory"],
+        r: 127,
+        g: 255,
+        b: 212,
+    }, // Aquamarine
+    AlertColorEntry {
+        keywords: &["high surf advisory"],
+        r: 32,
+        g: 178,
+        b: 170,
+    }, // LightSeaGreen
+    AlertColorEntry {
+        keywords: &["air quality"],
+        r: 143,
+        g: 188,
+        b: 143,
+    }, // DarkSeaGreen
+    AlertColorEntry {
+        keywords: &["rip current"],
+        r: 0,
+        g: 206,
+        b: 209,
+    }, // DarkTurquoise
+    AlertColorEntry {
+        keywords: &["beach hazards"],
+        r: 72,
+        g: 209,
+        b: 204,
+    }, // MediumTurquoise
+    AlertColorEntry {
+        keywords: &["special weather statement"],
+        r: 255,
+        g: 228,
+        b: 181,
+    }, // Moccasin
 ];
 
 /// Names NWS hazard simplification retired: "Excessive Heat Warning/Watch" →
@@ -71,21 +249,66 @@ static ALERT_COLORS: &[AlertColorEntry] = &[
 /// can never shadow a live product. Each must match *no* current event name;
 /// see `retired_entries_are_actually_retired`.
 static RETIRED_ALERT_COLORS: &[AlertColorEntry] = &[
-    AlertColorEntry { keywords: &["excessive heat", "warning"],    r: 199, g: 21,  b: 133 }, // = Extreme Heat Warning
-    AlertColorEntry { keywords: &["excessive heat", "watch"],      r: 128, g: 0,   b: 0   }, // = Extreme Heat Watch
-    AlertColorEntry { keywords: &["wind chill", "warning"],        r: 176, g: 196, b: 222 }, // = Extreme Cold Warning
-    AlertColorEntry { keywords: &["wind chill", "watch"],          r: 95,  g: 158, b: 160 }, // = Extreme Cold Watch
-    AlertColorEntry { keywords: &["wind chill advisory"],          r: 175, g: 238, b: 238 }, // = Cold Weather Advisory
+    AlertColorEntry {
+        keywords: &["excessive heat", "warning"],
+        r: 199,
+        g: 21,
+        b: 133,
+    }, // = Extreme Heat Warning
+    AlertColorEntry {
+        keywords: &["excessive heat", "watch"],
+        r: 128,
+        g: 0,
+        b: 0,
+    }, // = Extreme Heat Watch
+    AlertColorEntry {
+        keywords: &["wind chill", "warning"],
+        r: 176,
+        g: 196,
+        b: 222,
+    }, // = Extreme Cold Warning
+    AlertColorEntry {
+        keywords: &["wind chill", "watch"],
+        r: 95,
+        g: 158,
+        b: 160,
+    }, // = Extreme Cold Watch
+    AlertColorEntry {
+        keywords: &["wind chill advisory"],
+        r: 175,
+        g: 238,
+        b: 238,
+    }, // = Cold Weather Advisory
 ];
 
 /// Keyed off the product suffix. Must avoid the reserved tornado colours: an
 /// unrecognised warning still reads as severe, but must never be mistakable
 /// for a tornado warning. A silent upstream rename lands here.
 static FALLBACK_COLORS: &[AlertColorEntry] = &[
-    AlertColorEntry { keywords: &["warning"],                      r: 178, g: 34,  b: 34  }, // Firebrick
-    AlertColorEntry { keywords: &["watch"],                        r: 240, g: 230, b: 140 }, // Khaki
-    AlertColorEntry { keywords: &["advisory"],                     r: 255, g: 215, b: 0   }, // Gold
-    AlertColorEntry { keywords: &["statement"],                    r: 245, g: 222, b: 179 }, // Wheat
+    AlertColorEntry {
+        keywords: &["warning"],
+        r: 178,
+        g: 34,
+        b: 34,
+    }, // Firebrick
+    AlertColorEntry {
+        keywords: &["watch"],
+        r: 240,
+        g: 230,
+        b: 140,
+    }, // Khaki
+    AlertColorEntry {
+        keywords: &["advisory"],
+        r: 255,
+        g: 215,
+        b: 0,
+    }, // Gold
+    AlertColorEntry {
+        keywords: &["statement"],
+        r: 245,
+        g: 222,
+        b: 179,
+    }, // Wheat
 ];
 
 /// Reserved for "no styling at all"; no table entry may use it.
@@ -204,11 +427,17 @@ mod tests {
 
     #[test]
     fn retired_names_still_render_like_their_replacements() {
-        assert_eq!(rgb_of("Excessive Heat Warning"), rgb_of("Extreme Heat Warning"));
+        assert_eq!(
+            rgb_of("Excessive Heat Warning"),
+            rgb_of("Extreme Heat Warning")
+        );
         assert_eq!(rgb_of("Excessive Heat Watch"), rgb_of("Extreme Heat Watch"));
         assert_eq!(rgb_of("Wind Chill Warning"), rgb_of("Extreme Cold Warning"));
         assert_eq!(rgb_of("Wind Chill Watch"), rgb_of("Extreme Cold Watch"));
-        assert_eq!(rgb_of("Wind Chill Advisory"), rgb_of("Cold Weather Advisory"));
+        assert_eq!(
+            rgb_of("Wind Chill Advisory"),
+            rgb_of("Cold Weather Advisory")
+        );
     }
 
     // ── Collision guards ───────────────────────────────────────────────────
@@ -299,7 +528,11 @@ mod tests {
 
     #[test]
     fn nothing_shares_the_unknown_colour() {
-        for entry in ALERT_COLORS.iter().chain(RETIRED_ALERT_COLORS).chain(FALLBACK_COLORS) {
+        for entry in ALERT_COLORS
+            .iter()
+            .chain(RETIRED_ALERT_COLORS)
+            .chain(FALLBACK_COLORS)
+        {
             assert_ne!(
                 (entry.r, entry.g, entry.b),
                 UNKNOWN_EVENT,
@@ -318,9 +551,7 @@ mod tests {
         // nothing panics, and the map quietly starts lying.
         let events = sample_events();
         for entry in ALERT_COLORS.iter().chain(FALLBACK_COLORS) {
-            let matched = events
-                .iter()
-                .any(|e| entry.matches(&e.to_lowercase()));
+            let matched = events.iter().any(|e| entry.matches(&e.to_lowercase()));
             assert!(
                 matched,
                 "ALERT_COLORS entry {:?} matches no current NWS event name. \

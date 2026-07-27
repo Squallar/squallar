@@ -32,8 +32,7 @@ impl DomainRule {
     /// Android's rule: exact match always, subdomains only with
     /// `includeSubdomains`.
     fn covers(&self, host: &str) -> bool {
-        host == self.host
-            || (self.include_subdomains && host.ends_with(&format!(".{}", self.host)))
+        host == self.host || (self.include_subdomains && host.ends_with(&format!(".{}", self.host)))
     }
 }
 
@@ -69,7 +68,9 @@ fn parse_domains(xml: &str) -> Vec<DomainRule> {
         let Some(gt) = after.find('>') else { break };
         let attrs = &after[..gt];
         let body = &after[gt + 1..];
-        let Some(close) = body.find("</domain>") else { break };
+        let Some(close) = body.find("</domain>") else {
+            break;
+        };
 
         out.push(DomainRule {
             host: body[..close].trim().to_string(),
@@ -156,8 +157,14 @@ mod tests {
         assert_eq!(
             rules,
             vec![
-                DomainRule { host: "weather.gov".into(), include_subdomains: true },
-                DomainRule { host: "exact.example.com".into(), include_subdomains: false },
+                DomainRule {
+                    host: "weather.gov".into(),
+                    include_subdomains: true
+                },
+                DomainRule {
+                    host: "exact.example.com".into(),
+                    include_subdomains: false
+                },
             ],
             "a <domain-config> wrapper and a host named only in a comment must \
              not be read as rules"
@@ -166,7 +173,10 @@ mod tests {
 
     #[test]
     fn include_subdomains_matches_subdomains_but_not_a_suffix_of_the_label() {
-        let wide = DomainRule { host: "weather.gov".into(), include_subdomains: true };
+        let wide = DomainRule {
+            host: "weather.gov".into(),
+            include_subdomains: true,
+        };
         assert!(wide.covers("weather.gov"));
         assert!(wide.covers("api.weather.gov"));
         assert!(
@@ -246,7 +256,8 @@ mod tests {
         );
         assert_eq!(
             xml.matches("<domain-config").count(),
-            xml.matches(r#"<domain-config cleartextTrafficPermitted="false">"#).count(),
+            xml.matches(r#"<domain-config cleartextTrafficPermitted="false">"#)
+                .count(),
             "every <domain-config> must set cleartextTrafficPermitted=\"false\""
         );
     }

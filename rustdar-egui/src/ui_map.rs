@@ -1,6 +1,6 @@
 use crate::actions::GuiAction;
 use rustdar_overlays::render::overlay_state::OverlayKind;
-use rustdar_radar::types::{EARTH_RADIUS_KM, RadarProduct, IMAGE_SIZE};
+use rustdar_radar::types::{EARTH_RADIUS_KM, IMAGE_SIZE, RadarProduct};
 use rustdar_units::UserPreferences;
 
 #[path = "ui_map_pane.rs"]
@@ -30,7 +30,10 @@ impl super::Gui {
 
         // Initialize tiles via MapTileState
         self.map_tiles.ensure_base_tiles(is_dark_theme, &ctx);
-        let any_city_labels = self.panes.iter().any(|p| p.is_overlay_enabled(OverlayKind::CityLabels));
+        let any_city_labels = self
+            .panes
+            .iter()
+            .any(|p| p.is_overlay_enabled(OverlayKind::CityLabels));
         if any_city_labels {
             self.map_tiles.ensure_label_tiles(is_dark_theme, &ctx);
         }
@@ -61,15 +64,16 @@ impl super::Gui {
                 // the panel (not from each pane's rect) so every pane on screen
                 // agrees and dragging a divider cannot flip the bars. See
                 // `ColorScaleOrientation`.
-                let horizontal_color_scale =
-                    self.color_scale_orientation.resolve(panel_rect);
+                let horizontal_color_scale = self.color_scale_orientation.resolve(panel_rect);
 
                 self.detect_active_pane_click(ui.ctx(), panel_rect);
 
                 // Snapshot viewport state before rendering for sync detection
                 let (pre_zooms, pre_positions): (Vec<f64>, Vec<Option<Position>>) =
                     if self.viewport_sync && pane_count > 1 {
-                        self.panes.iter().take(pane_count)
+                        self.panes
+                            .iter()
+                            .take(pane_count)
                             .map(|p| (p.map_memory.zoom(), p.map_memory.detached()))
                             .unzip()
                     } else {
@@ -130,12 +134,8 @@ impl super::Gui {
                     // PaneRenderCtx — never read raw click events via ctx.input() for
                     // map-level interactions, as that bypasses dialog blocking.
                     let pointer = if is_active {
-                        self.interaction.resolve_active(
-                            &ctx,
-                            modality,
-                            &mut map_memory,
-                            pane_rect,
-                        )
+                        self.interaction
+                            .resolve_active(&ctx, modality, &mut map_memory, pane_rect)
                     } else {
                         self.interaction.resolve_inactive(&ctx, modality)
                     };
@@ -147,16 +147,17 @@ impl super::Gui {
                     // `drag_pan_buttons` below: after the gate, after
                     // `overlay_click_pos` is read out. See `PanePointerProbe`.
                     #[cfg(test)]
-                    self.last_pane_pointers.push(crate::ui_input::PanePointerProbe {
-                        pane_idx,
-                        is_active,
-                        modality,
-                        frame: crate::ui_input::MapPointerFrame {
-                            overlay_click_pos,
-                            long_press_pos: pointer.long_press_pos,
-                            suppress_pan,
-                        },
-                    });
+                    self.last_pane_pointers
+                        .push(crate::ui_input::PanePointerProbe {
+                            pane_idx,
+                            is_active,
+                            modality,
+                            frame: crate::ui_input::MapPointerFrame {
+                                overlay_click_pos,
+                                long_press_pos: pointer.long_press_pos,
+                                suppress_pan,
+                            },
+                        });
 
                     // Create a child UI constrained to this pane's rect
                     let mut child_ui = ui.new_child(
@@ -168,52 +169,57 @@ impl super::Gui {
 
                     if let Some(tiles) = tiles_owned.as_mut() {
                         Map::new(None, &mut map_memory, center)
-                        .with_layer(tiles, 1.0)
-                        // `zoom_with_ctrl(false)` is what puts us on walkers'
-                        // raw-scroll zoom path, and walkers 0.55 changed that
-                        // path's frame-time multiplier from
-                        // `stable_dt.max(predicted_dt * 1.5)` to
-                        // `stable_dt.clamp(predicted_dt * 0.5, predicted_dt * 2.0)`.
-                        // At a steady frame rate that is a uniform x0.667 on the
-                        // scroll-zoom step (60Hz: 0.025 -> 0.01667, so a wheel
-                        // notch that gave ~1.31x now gives ~1.21x); on a hitched
-                        // frame the old form grew unbounded and the new one is
-                        // capped, which is the bug being fixed.
-                        //
-                        // `Map::zoom_speed` (default 2.0) can compensate the
-                        // magnitude, but it is not an exact undo: it scales the
-                        // combined zoom delta, so pinch and double-click zoom
-                        // move with it. Left at the default deliberately.
-                        .zoom_with_ctrl(false)
-                        .panning(false)
-                        .drag_pan_buttons(if suppress_pan {
-                            egui::DragPanButtons::empty()
-                        } else {
-                            egui::DragPanButtons::PRIMARY
-                        })
-                        .show(&mut child_ui, |ui, _response, projector, memory| {
-                            let zoom = memory.zoom();
+                            .with_layer(tiles, 1.0)
+                            // `zoom_with_ctrl(false)` is what puts us on walkers'
+                            // raw-scroll zoom path, and walkers 0.55 changed that
+                            // path's frame-time multiplier from
+                            // `stable_dt.max(predicted_dt * 1.5)` to
+                            // `stable_dt.clamp(predicted_dt * 0.5, predicted_dt * 2.0)`.
+                            // At a steady frame rate that is a uniform x0.667 on the
+                            // scroll-zoom step (60Hz: 0.025 -> 0.01667, so a wheel
+                            // notch that gave ~1.31x now gives ~1.21x); on a hitched
+                            // frame the old form grew unbounded and the new one is
+                            // capped, which is the bug being fixed.
+                            //
+                            // `Map::zoom_speed` (default 2.0) can compensate the
+                            // magnitude, but it is not an exact undo: it scales the
+                            // combined zoom delta, so pinch and double-click zoom
+                            // move with it. Left at the default deliberately.
+                            .zoom_with_ctrl(false)
+                            .panning(false)
+                            .drag_pan_buttons(if suppress_pan {
+                                egui::DragPanButtons::empty()
+                            } else {
+                                egui::DragPanButtons::PRIMARY
+                            })
+                            .show(&mut child_ui, |ui, _response, projector, memory| {
+                                let zoom = memory.zoom();
 
-                            let mut render_ctx = pane_render::PaneRenderCtx {
-                                pane_idx,
-                                pane: &mut pane,
-                                overlays: &mut self.overlays,
-                                user_location,
-                                user_heading,
-                                user_fix: user_fix.clone(),
-                                label_tiles: &mut label_tiles,
-                                actions: &mut actions,
-                                pane_rect,
-                                horizontal_color_scale,
-                                pointer_available,
-                                excluded_rects: excluded_rects.to_vec(),
-                                long_press_pos: pointer.long_press_pos,
-                                overlay_click_pos,
-                                preferences: &self.preferences,
-                            };
+                                let mut render_ctx = pane_render::PaneRenderCtx {
+                                    pane_idx,
+                                    pane: &mut pane,
+                                    overlays: &mut self.overlays,
+                                    user_location,
+                                    user_heading,
+                                    user_fix: user_fix.clone(),
+                                    label_tiles: &mut label_tiles,
+                                    actions: &mut actions,
+                                    pane_rect,
+                                    horizontal_color_scale,
+                                    pointer_available,
+                                    excluded_rects: excluded_rects.to_vec(),
+                                    long_press_pos: pointer.long_press_pos,
+                                    overlay_click_pos,
+                                    preferences: &self.preferences,
+                                };
 
-                            pane_render::render_pane_map_content(ui, projector, zoom, &mut render_ctx);
-                        });
+                                pane_render::render_pane_map_content(
+                                    ui,
+                                    projector,
+                                    zoom,
+                                    &mut render_ctx,
+                                );
+                            });
                     }
 
                     // Restore map_memory and pane
@@ -228,16 +234,15 @@ impl super::Gui {
                 // Handle divider dragging on a foreground layer so they
                 // take priority over map panning in the overlap zone.
                 if pane_count > 1 {
-                    let divider_layer = egui::LayerId::new(
-                        egui::Order::Foreground,
-                        egui::Id::new("pane_dividers"),
-                    );
+                    let divider_layer =
+                        egui::LayerId::new(egui::Order::Foreground, egui::Id::new("pane_dividers"));
                     let mut divider_ui = ui.new_child(
                         egui::UiBuilder::new()
                             .max_rect(panel_rect)
                             .layer_id(divider_layer),
                     );
-                    self.pane_layout.handle_dividers(&mut divider_ui, panel_rect);
+                    self.pane_layout
+                        .handle_dividers(&mut divider_ui, panel_rect);
                 }
 
                 // Sync viewports: propagate the interacted pane's viewport to all others
@@ -266,7 +271,10 @@ impl super::Gui {
             }
         }) {
             // Don't switch panes when the click lands on a floating dialog or popup.
-            if ctx.layer_id_at(pos).is_some_and(|l| l.order > egui::Order::Background) {
+            if ctx
+                .layer_id_at(pos)
+                .is_some_and(|l| l.order > egui::Order::Background)
+            {
                 return;
             }
             for idx in 0..self.pane_layout.pane_count {
@@ -292,7 +300,8 @@ impl super::Gui {
                 }
             });
             if let Some(pos) = click_pos {
-                let on_popup = ctx.layer_id_at(pos)
+                let on_popup = ctx
+                    .layer_id_at(pos)
                     .is_some_and(|l| l.order > egui::Order::Background);
                 if !on_popup {
                     self.overlays.selected_overlays.clear();
@@ -371,6 +380,11 @@ pub(super) fn compute_hover_info_raw(
 
     format!(
         "Lat: {:.4}\u{b0}, Lon: {:.4}\u{b0} | Range: {:.1}{}, Az: {:.1}\u{b0} {}",
-        input.hover_lat, input.hover_lon, distance, prefs.distance.suffix(), azimuth, value_str
+        input.hover_lat,
+        input.hover_lon,
+        distance,
+        prefs.distance.suffix(),
+        azimuth,
+        value_str
     )
 }

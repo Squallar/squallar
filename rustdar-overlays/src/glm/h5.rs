@@ -95,7 +95,12 @@ impl Granule {
         // legitimately empty. Short-circuit on the *declared* count only: a
         // variable claiming 148 elements it cannot produce is still an error.
         if count == 0 {
-            return Ok(Some(RawVar { raw: Vec::new(), vartype, unsigned, attrs }));
+            return Ok(Some(RawVar {
+                raw: Vec::new(),
+                vartype,
+                unsigned,
+                attrs,
+            }));
         }
 
         let raw = read_raw(&ds, name, &dtype, unsigned)?;
@@ -105,7 +110,12 @@ impl Granule {
                 raw.len()
             ));
         }
-        Ok(Some(RawVar { raw, vartype, unsigned, attrs }))
+        Ok(Some(RawVar {
+            raw,
+            vartype,
+            unsigned,
+            attrs,
+        }))
     }
 }
 
@@ -124,26 +134,49 @@ fn read_raw(
 ) -> Result<Vec<f64>, String> {
     let err = |e: hdf5_pure::Error| format!("Failed to read {name}: {e}");
     Ok(match dtype {
-        DType::F32 => ds.read_f32().map_err(err)?.into_iter().map(f64::from).collect(),
+        DType::F32 => ds
+            .read_f32()
+            .map_err(err)?
+            .into_iter()
+            .map(f64::from)
+            .collect(),
         DType::F64 => ds.read_f64().map_err(err)?,
         // Signed storage: `_Unsigned` reinterprets the bits, and only here.
         DType::I8 => ds
             .read_i8()
             .map_err(err)?
             .into_iter()
-            .map(|v| if unsigned { f64::from(v as u8) } else { f64::from(v) })
+            .map(|v| {
+                if unsigned {
+                    f64::from(v as u8)
+                } else {
+                    f64::from(v)
+                }
+            })
             .collect(),
         DType::I16 => ds
             .read_i16()
             .map_err(err)?
             .into_iter()
-            .map(|v| if unsigned { f64::from(v as u16) } else { f64::from(v) })
+            .map(|v| {
+                if unsigned {
+                    f64::from(v as u16)
+                } else {
+                    f64::from(v)
+                }
+            })
             .collect(),
         DType::I32 => ds
             .read_i32()
             .map_err(err)?
             .into_iter()
-            .map(|v| if unsigned { f64::from(v as u32) } else { f64::from(v) })
+            .map(|v| {
+                if unsigned {
+                    f64::from(v as u32)
+                } else {
+                    f64::from(v)
+                }
+            })
             .collect(),
         DType::I64 => ds
             .read_i64()
@@ -152,11 +185,35 @@ fn read_raw(
             .map(|v| if unsigned { v as u64 as f64 } else { v as f64 })
             .collect(),
         // Already unsigned on disk: nothing to reinterpret.
-        DType::U8 => ds.read_u8().map_err(err)?.into_iter().map(f64::from).collect(),
-        DType::U16 => ds.read_u16().map_err(err)?.into_iter().map(f64::from).collect(),
-        DType::U32 => ds.read_u32().map_err(err)?.into_iter().map(f64::from).collect(),
-        DType::U64 => ds.read_u64().map_err(err)?.into_iter().map(|v| v as f64).collect(),
-        other => return Err(format!("GLM variable {name} has unsupported type {other:?}")),
+        DType::U8 => ds
+            .read_u8()
+            .map_err(err)?
+            .into_iter()
+            .map(f64::from)
+            .collect(),
+        DType::U16 => ds
+            .read_u16()
+            .map_err(err)?
+            .into_iter()
+            .map(f64::from)
+            .collect(),
+        DType::U32 => ds
+            .read_u32()
+            .map_err(err)?
+            .into_iter()
+            .map(f64::from)
+            .collect(),
+        DType::U64 => ds
+            .read_u64()
+            .map_err(err)?
+            .into_iter()
+            .map(|v| v as f64)
+            .collect(),
+        other => {
+            return Err(format!(
+                "GLM variable {name} has unsupported type {other:?}"
+            ));
+        }
     })
 }
 

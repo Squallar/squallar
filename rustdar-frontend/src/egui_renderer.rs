@@ -170,7 +170,12 @@ impl EguiRenderer {
     }
 
     /// Record the render pass for an already-prepared frame.
-    pub fn draw(&mut self, encoder: &mut CommandEncoder, view: &TextureView, frame: &PreparedFrame) {
+    pub fn draw(
+        &mut self,
+        encoder: &mut CommandEncoder,
+        view: &TextureView,
+        frame: &PreparedFrame,
+    ) {
         let rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,

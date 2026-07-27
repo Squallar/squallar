@@ -2,10 +2,12 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::render::controls::{ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext, PaneControlContextMut};
+use crate::render::controls::{
+    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
+    PaneControlContextMut,
+};
 use crate::render::overlay_state::{
-    FetchPayload,
-    ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
     OverlayState, PopupContent, PopupSection, RasterizeContext, RasterizeFn, RenderMode,
 };
 use crate::render::rasterize::{self, RasterizeOutput};
@@ -74,7 +76,10 @@ impl SpcOutlookHandler {
     }
 
     fn combined_generation(&self) -> u64 {
-        self.per_product_generation.values().sum::<u64>().wrapping_add(self.config_generation)
+        self.per_product_generation
+            .values()
+            .sum::<u64>()
+            .wrapping_add(self.config_generation)
     }
 }
 
@@ -123,12 +128,16 @@ impl OverlayHandler for SpcOutlookHandler {
         let day = self.selected_day;
         let mut items = Vec::new();
         for &product in &self.enabled_products {
-            let Some(outlook) = self.state.data.get(&(day, product)) else { continue };
+            let Some(outlook) = self.state.data.get(&(day, product)) else {
+                continue;
+            };
             for feature in &outlook.features {
                 items.push(ClickableItem {
                     features: vec![feature.clone()],
                     label: None,
-                    item: Arc::new(OutlookItem { label: feature.label.clone() }) as Arc<dyn OverlayItem>,
+                    item: Arc::new(OutlookItem {
+                        label: feature.label.clone(),
+                    }) as Arc<dyn OverlayItem>,
                 });
             }
         }
@@ -145,13 +154,19 @@ impl OverlayHandler for SpcOutlookHandler {
                 log::info!("Received SPC outlook: {:?} {:?}", fetch.day, fetch.product);
                 self.state.data.insert((fetch.day, fetch.product), outlook);
                 self.state.fetch_time = Some(web_time::Instant::now());
-                let counter = self.per_product_generation
+                let counter = self
+                    .per_product_generation
                     .entry((fetch.day, fetch.product))
                     .or_insert(0);
                 *counter = counter.wrapping_add(1);
             }
             Err(e) => {
-                log::error!("SPC outlook fetch failed ({:?} {:?}): {}", fetch.day, fetch.product, e);
+                log::error!(
+                    "SPC outlook fetch failed ({:?} {:?}): {}",
+                    fetch.day,
+                    fetch.product,
+                    e
+                );
             }
         }
         self.state.fetching = false;
@@ -161,10 +176,7 @@ impl OverlayHandler for SpcOutlookHandler {
         // Nothing to prune: outlook items match on label, not on a data ID.
     }
 
-    fn prepare_rasterize(
-        &self,
-        ctx: &RasterizeContext,
-    ) -> Option<RasterizeFn> {
+    fn prepare_rasterize(&self, ctx: &RasterizeContext) -> Option<RasterizeFn> {
         let day = self.selected_day;
         let mut features = Vec::new();
         for &product in &self.enabled_products {
@@ -181,8 +193,12 @@ impl OverlayHandler for SpcOutlookHandler {
             [60, 60, 60, 180]
         };
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
-            let rgba = rasterize::rasterize_spc_outlooks(&features, bounds, width, height, hatch_color);
-            RasterizeOutput { rgba, hit_map: None }
+            let rgba =
+                rasterize::rasterize_spc_outlooks(&features, bounds, width, height, hatch_color);
+            RasterizeOutput {
+                rgba,
+                hit_map: None,
+            }
         }))
     }
 
@@ -214,7 +230,11 @@ impl OverlayHandler for SpcOutlookHandler {
                             crate::spc::fetch::fetch_outlook(&client, &sources, day, product)
                                 .await
                                 .map_err(|e| e.to_string());
-                        Box::new(SpcOutlookFetchResult { day, product, result }) as FetchPayload
+                        Box::new(SpcOutlookFetchResult {
+                            day,
+                            product,
+                            result,
+                        }) as FetchPayload
                     }),
                 }
             })
@@ -222,28 +242,31 @@ impl OverlayHandler for SpcOutlookHandler {
     }
 
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
-        let mut items = vec![
-            ControlItem::Heading { text: "\u{26c8}  SPC Outlooks".into() },
-        ];
+        let mut items = vec![ControlItem::Heading {
+            text: "\u{26c8}  SPC Outlooks".into(),
+        }];
 
-        let buttons: Vec<ControlButton> = OutlookDay::all().iter().map(|&d| {
-            let id: &'static str = match d {
-                OutlookDay::Day1 => "day1",
-                OutlookDay::Day2 => "day2",
-                OutlookDay::Day3 => "day3",
-                OutlookDay::Day4 => "day4",
-                OutlookDay::Day5 => "day5",
-                OutlookDay::Day6 => "day6",
-                OutlookDay::Day7 => "day7",
-                OutlookDay::Day8 => "day8",
-            };
-            ControlButton {
-                id,
-                label: d.label().to_string(),
-                enabled: true,
-                highlight: d == self.selected_day,
-            }
-        }).collect();
+        let buttons: Vec<ControlButton> = OutlookDay::all()
+            .iter()
+            .map(|&d| {
+                let id: &'static str = match d {
+                    OutlookDay::Day1 => "day1",
+                    OutlookDay::Day2 => "day2",
+                    OutlookDay::Day3 => "day3",
+                    OutlookDay::Day4 => "day4",
+                    OutlookDay::Day5 => "day5",
+                    OutlookDay::Day6 => "day6",
+                    OutlookDay::Day7 => "day7",
+                    OutlookDay::Day8 => "day8",
+                };
+                ControlButton {
+                    id,
+                    label: d.label().to_string(),
+                    enabled: true,
+                    highlight: d == self.selected_day,
+                }
+            })
+            .collect();
         items.push(ControlItem::ButtonRow { buttons });
 
         // Only the products the selected day actually publishes.
@@ -272,14 +295,20 @@ impl OverlayHandler for SpcOutlookHandler {
                 }],
             });
             if self.state.fetching {
-                items.push(ControlItem::InfoText { text: "Fetching\u{2026}".into() });
+                items.push(ControlItem::InfoText {
+                    text: "Fetching\u{2026}".into(),
+                });
             }
         }
 
         items
     }
 
-    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneControlContextMut<'_>) -> ControlEffect {
+    fn apply_control(
+        &mut self,
+        update: &ControlUpdate,
+        _ctx: &mut PaneControlContextMut<'_>,
+    ) -> ControlEffect {
         match update.id {
             "day1" | "day2" | "day3" | "day4" | "day5" | "day6" | "day7" | "day8" => {
                 let new_day = match update.id {
@@ -297,7 +326,8 @@ impl OverlayHandler for SpcOutlookHandler {
                     self.selected_day = new_day;
                     // Days publish different product sets; drop the ones the
                     // new day has no endpoint for.
-                    let valid: HashSet<OutlookProduct> = new_day.products().iter().copied().collect();
+                    let valid: HashSet<OutlookProduct> =
+                        new_day.products().iter().copied().collect();
                     self.enabled_products.retain(|p| valid.contains(p));
                     self.config_generation = self.config_generation.wrapping_add(1);
                     if !self.enabled_products.is_empty() {
@@ -341,10 +371,16 @@ impl OverlayHandler for SpcOutlookHandler {
     }
 
     fn deserialize_state(&mut self, value: serde_json::Value) {
-        if let Some(day) = value.get("selected_day").and_then(|v| serde_json::from_value(v.clone()).ok()) {
+        if let Some(day) = value
+            .get("selected_day")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+        {
             self.selected_day = day;
         }
-        if let Some(products) = value.get("enabled_products").and_then(|v| serde_json::from_value(v.clone()).ok()) {
+        if let Some(products) = value
+            .get("enabled_products")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+        {
             self.enabled_products = products;
         }
     }

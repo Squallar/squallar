@@ -66,7 +66,6 @@ pub async fn fetch_outlook(
     parse_geojson(&json, day, product)
 }
 
-
 pub async fn fetch_active_discussions(
     client: &reqwest::Client,
     sources: &DataSources,
@@ -107,10 +106,7 @@ pub fn available_products(day: OutlookDay) -> Vec<OutlookProduct> {
             OutlookProduct::Wind,
             OutlookProduct::Hail,
         ],
-        OutlookDay::Day3 => vec![
-            OutlookProduct::Categorical,
-            OutlookProduct::Probabilistic,
-        ],
+        OutlookDay::Day3 => vec![OutlookProduct::Categorical, OutlookProduct::Probabilistic],
         _ => unreachable!(),
     }
 }
@@ -136,7 +132,10 @@ mod tests {
     /// Fails if the rule is a constant rather than the origin's recorded one.
     #[test]
     fn the_spc_client_follows_the_origins_recorded_rule() {
-        let sources = DataSources { spc_sends_user_agent: true, ..DataSources::production() };
+        let sources = DataSources {
+            spc_sends_user_agent: true,
+            ..DataSources::production()
+        };
         let client = spc_client(&sources).expect("the SPC client must build");
         assert!(
             rustdar_radar::tls::sends_user_agent(&client),
@@ -165,7 +164,10 @@ mod tests {
                 url.starts_with("http://127.0.0.1:8080/"),
                 "{url} does not come from spc_base",
             );
-            assert!(!url.contains("spc.noaa.gov"), "{url} still hardcodes the origin");
+            assert!(
+                !url.contains("spc.noaa.gov"),
+                "{url} still hardcodes the origin"
+            );
         }
     }
 
@@ -174,7 +176,10 @@ mod tests {
     #[test]
     fn the_production_spc_paths_are_the_ones_that_were_probed() {
         let s = DataSources::production();
-        assert_eq!(md_rss_url(&s), "https://www.spc.noaa.gov/products/spcmdrss.xml");
+        assert_eq!(
+            md_rss_url(&s),
+            "https://www.spc.noaa.gov/products/spcmdrss.xml"
+        );
         assert_eq!(
             outlook_url(&s, OutlookDay::Day1, OutlookProduct::Categorical),
             "https://www.spc.noaa.gov/products/outlook/day1otlk_cat.lyr.geojson",

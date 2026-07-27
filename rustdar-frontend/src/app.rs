@@ -20,10 +20,7 @@ use crate::input::InputHandler;
 use crate::loop_downloads::LoopDownloadManager;
 use crate::platform::PlatformBridge;
 use crate::render_dispatch::RenderDispatcher;
-use rustdar_egui::{
-    Gui,
-    actions::GuiAction,
-};
+use rustdar_egui::{Gui, actions::GuiAction};
 use rustdar_radar::types::ScanInfo;
 
 #[path = "app_fetch.rs"]
@@ -197,7 +194,14 @@ pub struct App {
     // Grouped loop download state: scan cache, in-flight tracking, and pending queues.
     loop_mgr: LoopDownloadManager,
     // Cached latest scan per site from auto-poll while panes on that site view historic data.
-    latest_cached_scans: HashMap<String, (Arc<nexrad_model::data::Scan>, ScanInfo, chrono::NaiveDateTime)>,
+    latest_cached_scans: HashMap<
+        String,
+        (
+            Arc<nexrad_model::data::Scan>,
+            ScanInfo,
+            chrono::NaiveDateTime,
+        ),
+    >,
     // Set when a manual time navigation fetch is pending; triggers loop reinit after scan loads.
     manual_nav_pending: bool,
     /// The map extent most recently asked for on screen.
@@ -217,7 +221,10 @@ impl App {
     /// one to build. Without that inversion the app layer and the platform
     /// layer would have to depend on each other.
     pub fn new(platform: Box<dyn PlatformBridge>) -> Self {
-        Self::with_instance(egui_wgpu::wgpu::Instance::new(instance_descriptor()), platform)
+        Self::with_instance(
+            egui_wgpu::wgpu::Instance::new(instance_descriptor()),
+            platform,
+        )
     }
 
     /// Everything [`new`](Self::new) does once the wgpu instance exists.
@@ -237,8 +244,7 @@ impl App {
         let render = RenderDispatcher::new();
 
         #[cfg(not(target_arch = "wasm32"))]
-        let tokio_runtime = tokio::runtime::Runtime::new()
-            .expect("Failed to create Tokio runtime");
+        let tokio_runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
         // Goes through `rustdar_radar::tls` rather than `reqwest::Client::builder`
         // directly: that is what installs the rustls crypto provider (no provider
@@ -385,7 +391,11 @@ impl App {
         if let Some(window) = self.window.as_ref() {
             let size = window.inner_size();
             if size.width == 0 || size.height == 0 {
-                log::debug!("Window has zero area ({}x{}); skipping frame", size.width, size.height);
+                log::debug!(
+                    "Window has zero area ({}x{}); skipping frame",
+                    size.width,
+                    size.height
+                );
                 return;
             }
         }
@@ -400,7 +410,10 @@ impl App {
         self.process_gui_actions(gui_actions);
 
         // Request redraw only when there is pending background work or auto-poll is active
-        if self.render.any_render_in_flight() || self.gui.is_auto_poll_active() || self.gui.any_loop_active() {
+        if self.render.any_render_in_flight()
+            || self.gui.is_auto_poll_active()
+            || self.gui.any_loop_active()
+        {
             notify_redraw(&self.window);
         }
     }
@@ -408,11 +421,12 @@ impl App {
     /// Poll for platform-specific theme, GPS fix, and compass heading changes.
     fn poll_platform_state(&mut self) {
         if let Some(new_theme) = self.platform.poll_theme()
-            && self.cached_dark_theme != Some(new_theme) {
-                self.cached_dark_theme = Some(new_theme);
-                self.gui.bump_all_radar_sites_gen();
-                notify_redraw(&self.window);
-            }
+            && self.cached_dark_theme != Some(new_theme)
+        {
+            self.cached_dark_theme = Some(new_theme);
+            self.gui.bump_all_radar_sites_gen();
+            notify_redraw(&self.window);
+        }
         if let Some(fix) = self.platform.poll_gps_fix() {
             self.gui.set_gps_fix(fix);
         }
@@ -504,17 +518,33 @@ impl App {
         use rustdar_overlays::render::overlay_state::OverlayKind;
 
         // Separate overlay render actions for deduplication
-        let mut overlay_renders: Vec<(usize, OverlayKind, fetch::OverlayRenderRequest)> = Vec::new();
+        let mut overlay_renders: Vec<(usize, OverlayKind, fetch::OverlayRenderRequest)> =
+            Vec::new();
 
         for action in actions {
-            if let GuiAction::RenderOverlay { pane_idx, overlay_kind, geo_bounds, texture, data_generation, zoom } = action {
+            if let GuiAction::RenderOverlay {
+                pane_idx,
+                overlay_kind,
+                geo_bounds,
+                texture,
+                data_generation,
+                zoom,
+            } = action
+            {
                 // The unexpanded viewport, which is what a region-scoped fetch
                 // wants — the renderer's overdraw margin is a rasterization
                 // concern and would over-fetch if it leaked into the request.
                 self.last_viewport = Some(geo_bounds);
-                overlay_renders.push((pane_idx, overlay_kind, fetch::OverlayRenderRequest {
-                    geo_bounds, texture, data_generation, zoom,
-                }));
+                overlay_renders.push((
+                    pane_idx,
+                    overlay_kind,
+                    fetch::OverlayRenderRequest {
+                        geo_bounds,
+                        texture,
+                        data_generation,
+                        zoom,
+                    },
+                ));
             } else {
                 log::debug!("GUI action received: {}", action);
                 self.handle_gui_action(action, None);
@@ -526,7 +556,11 @@ impl App {
             let grouped = deduplicate_overlay_renders(overlay_renders, should_group);
             for (pane_indices, kind, req) in grouped {
                 if should_group {
-                    log::debug!("Spawning overlay render for {:?} targeting {} panes", kind, pane_indices.len());
+                    log::debug!(
+                        "Spawning overlay render for {:?} targeting {} panes",
+                        kind,
+                        pane_indices.len()
+                    );
                 }
                 self.spawn_overlay_render(pane_indices, kind, req);
             }
@@ -537,12 +571,23 @@ impl App {
     fn poll_data_channels(&mut self) {
         // Check for received scan data (with generation check)
         if let Ok(scan_resp) = self.channels.scan_receiver.try_recv() {
-            if self.render.is_fetch_stale(&scan_resp.site, scan_resp.generation) {
-                log::debug!("Discarding stale scan result for {} (gen {})", scan_resp.site, scan_resp.generation);
+            if self
+                .render
+                .is_fetch_stale(&scan_resp.site, scan_resp.generation)
+            {
+                log::debug!(
+                    "Discarding stale scan result for {} (gen {})",
+                    scan_resp.site,
+                    scan_resp.generation
+                );
             } else {
                 match scan_resp.result {
                     Ok(scan_data) => {
-                        let scan_info = ScanInfo::from_scan(&scan_data.scan, &scan_data.site, scan_data.timestamp);
+                        let scan_info = ScanInfo::from_scan(
+                            &scan_data.scan,
+                            &scan_data.site,
+                            scan_data.timestamp,
+                        );
                         let site = scan_data.site;
                         let timestamp = scan_data.timestamp;
                         let scan_arc = Arc::new(scan_data.scan);
@@ -553,13 +598,20 @@ impl App {
                         let any_pane_live_for_site = scan_resp.is_auto_poll && {
                             let count = self.gui.pane_count();
                             (0..count).any(|i| {
-                                self.gui.pane(i).is_some_and(|p| p.site == site && p.viewing_live)
+                                self.gui
+                                    .pane(i)
+                                    .is_some_and(|p| p.site == site && p.viewing_live)
                             })
                         };
                         if scan_resp.is_auto_poll && !any_pane_live_for_site {
                             log::info!("Auto-poll: caching scan (historic mode) @ {}", timestamp);
-                            self.append_scan_to_active_loops(&site, timestamp, Arc::clone(&scan_arc));
-                            self.latest_cached_scans.insert(site, (scan_arc, scan_info, timestamp));
+                            self.append_scan_to_active_loops(
+                                &site,
+                                timestamp,
+                                Arc::clone(&scan_arc),
+                            );
+                            self.latest_cached_scans
+                                .insert(site, (scan_arc, scan_info, timestamp));
                         } else {
                             log::info!("Received scan data from background thread");
                             self.scan_data.insert(site.clone(), Arc::clone(&scan_arc));
@@ -569,7 +621,11 @@ impl App {
                             self.spawn_level3_fetches(&site);
 
                             // Append the new scan to any active loops on this site
-                            self.append_scan_to_active_loops(&site, timestamp, Arc::clone(&scan_arc));
+                            self.append_scan_to_active_loops(
+                                &site,
+                                timestamp,
+                                Arc::clone(&scan_arc),
+                            );
 
                             // If this was a manual navigation, reinitialize active loops
                             if self.manual_nav_pending {
@@ -654,7 +710,10 @@ impl App {
 
     /// Set a receiver for GPS fix updates. Android and the web send fixes this
     /// way; desktop reads a serial port instead, through `start_gps`.
-    pub fn set_gps_fix_receiver(&mut self, receiver: std::sync::mpsc::Receiver<rustdar_gps::GpsFix>) {
+    pub fn set_gps_fix_receiver(
+        &mut self,
+        receiver: std::sync::mpsc::Receiver<rustdar_gps::GpsFix>,
+    ) {
         self.platform.set_gps_fix_receiver(receiver);
     }
 
@@ -770,9 +829,17 @@ impl App {
 /// and height cannot disagree about it — keying on it would only add a field that is
 /// always equal when the rest are.
 fn deduplicate_overlay_renders(
-    overlay_renders: Vec<(usize, rustdar_overlays::render::overlay_state::OverlayKind, fetch::OverlayRenderRequest)>,
+    overlay_renders: Vec<(
+        usize,
+        rustdar_overlays::render::overlay_state::OverlayKind,
+        fetch::OverlayRenderRequest,
+    )>,
     should_group: bool,
-) -> Vec<(Vec<usize>, rustdar_overlays::render::overlay_state::OverlayKind, fetch::OverlayRenderRequest)> {
+) -> Vec<(
+    Vec<usize>,
+    rustdar_overlays::render::overlay_state::OverlayKind,
+    fetch::OverlayRenderRequest,
+)> {
     use rustdar_overlays::render::overlay_state::OverlayKind;
 
     if !should_group {
@@ -791,8 +858,15 @@ fn deduplicate_overlay_renders(
     let mut grouped: HashMap<(OverlayKind, i32, u64, u32, u32), GroupedRender> = HashMap::new();
 
     for (pane_idx, kind, req) in overlay_renders {
-        let key = (kind, req.zoom, req.data_generation, req.texture.width, req.texture.height);
-        grouped.entry(key)
+        let key = (
+            kind,
+            req.zoom,
+            req.data_generation,
+            req.texture.width,
+            req.texture.height,
+        );
+        grouped
+            .entry(key)
             .and_modify(|g| {
                 if !g.pane_indices.contains(&pane_idx) {
                     g.pane_indices.push(pane_idx);
@@ -805,7 +879,10 @@ fn deduplicate_overlay_renders(
             });
     }
 
-    grouped.into_values().map(|g| (g.pane_indices, g.kind, g.req)).collect()
+    grouped
+        .into_values()
+        .map(|g| (g.pane_indices, g.kind, g.req))
+        .collect()
 }
 
 impl ApplicationHandler for App {
@@ -850,7 +927,7 @@ impl ApplicationHandler for App {
         self.old_textures.clear();
         self.render.clear_last_rendered();
         self.texture_counter = 0;
-        self.gui.clear_graphics_state();        // Keep cached_render intact so we can re-upload the texture
+        self.gui.clear_graphics_state(); // Keep cached_render intact so we can re-upload the texture
         // immediately on resume without re-rendering.        // Clear both window and state so resumed() creates fresh ones.
         // Leaving state alive would keep a wgpu surface referencing the destroyed window.
         self.window = None;
@@ -923,7 +1000,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn bounds() -> GeoBounds {
-        GeoBounds { min_lat: 30.0, max_lat: 40.0, min_lon: -100.0, max_lon: -90.0 }
+        GeoBounds {
+            min_lat: 30.0,
+            max_lat: 40.0,
+            min_lon: -100.0,
+            max_lon: -90.0,
+        }
     }
 
     /// A request as `process_gui_actions` builds one: unexpanded viewport bounds
@@ -931,7 +1013,11 @@ mod tests {
     fn req(w: u32, h: u32, overdraw: f32, data_gen: u64, zoom: i32) -> fetch::OverlayRenderRequest {
         fetch::OverlayRenderRequest {
             geo_bounds: bounds(),
-            texture: OverlayTexturePlan { width: w, height: h, overdraw },
+            texture: OverlayTexturePlan {
+                width: w,
+                height: h,
+                overdraw,
+            },
             data_generation: data_gen,
             zoom,
         }
@@ -991,7 +1077,10 @@ mod tests {
 
     #[test]
     fn test_dedup_different_keys() {
-        let input = vec![entry(0, OverlayKind::Radar), entry(1, OverlayKind::NwsAlerts)];
+        let input = vec![
+            entry(0, OverlayKind::Radar),
+            entry(1, OverlayKind::NwsAlerts),
+        ];
 
         let result = deduplicate_overlay_renders(input, true);
         assert_eq!(result.len(), 2);
@@ -1017,10 +1106,17 @@ mod tests {
         ];
 
         let mut result = deduplicate_overlay_renders(input, true);
-        assert_eq!(result.len(), 2, "different texture widths are different renders");
+        assert_eq!(
+            result.len(),
+            2,
+            "different texture widths are different renders"
+        );
         result.sort_by_key(|e| e.2.texture.width);
         assert_eq!(result[0].2.texture.width, 2048);
-        assert_eq!(result[0].2.texture.overdraw, 0.28, "the clamped plan's overdraw survived grouping");
+        assert_eq!(
+            result[0].2.texture.overdraw, 0.28,
+            "the clamped plan's overdraw survived grouping"
+        );
         assert_eq!(result[1].2.texture.overdraw, 1.0);
     }
 
@@ -1359,7 +1455,10 @@ mod tests {
         for (name, mut bridge) in [
             ("desktop", TestBridge::desktop()),
             ("ios", TestBridge::ios()),
-            ("android, before android_main injects the taker", TestBridge::android()),
+            (
+                "android, before android_main injects the taker",
+                TestBridge::android(),
+            ),
         ] {
             assert!(
                 !bridge.poll_back_press(),
@@ -1383,7 +1482,10 @@ mod tests {
             BackPress::Dismissed,
             "escape must close the window rather than quit, same as back"
         );
-        assert_eq!(App::resolve_back_press(&mut gui, &platform), BackPress::Exit);
+        assert_eq!(
+            App::resolve_back_press(&mut gui, &platform),
+            BackPress::Exit
+        );
     }
 
     // ── Driving a whole `App` ───────────────────────────────────────────
@@ -1630,7 +1732,11 @@ mod tests {
         theme.send(true).unwrap();
         app.handle_redraw();
 
-        assert_eq!(app.cached_dark_theme, Some(true), "the change was not taken");
+        assert_eq!(
+            app.cached_dark_theme,
+            Some(true),
+            "the change was not taken"
+        );
         let after = app.gui.pane(0).unwrap().radar_sites_render_gen;
         assert_eq!(
             after,

@@ -268,8 +268,16 @@ fn event_level_coordinates_unpack_to_real_positions() {
     // unplottable, so it must not appear at all.
     assert_eq!(events.len(), 2, "the fill-latitude event must be dropped");
 
-    assert!((events[0].lat - 38.9670).abs() < 1e-3, "lat was {}", events[0].lat);
-    assert!((events[0].lon - (-66.4981)).abs() < 1e-3, "lon was {}", events[0].lon);
+    assert!(
+        (events[0].lat - 38.9670).abs() < 1e-3,
+        "lat was {}",
+        events[0].lat
+    );
+    assert!(
+        (events[0].lon - (-66.4981)).abs() < 1e-3,
+        "lon was {}",
+        events[0].lon
+    );
     assert!(events.iter().all(|e| (-90.0..=90.0).contains(&e.lat)));
     assert!(events.iter().all(|e| (-180.0..=180.0).contains(&e.lon)));
 }
@@ -320,7 +328,10 @@ fn per_variable_epoch_wins_over_time_coverage_start() {
 /// `time_coverage_start` rather than failing.
 #[test]
 fn absent_time_units_fall_back_to_time_coverage_start() {
-    let bytes = granule(&GranuleSpec { time_units: None, ..Default::default() });
+    let bytes = granule(&GranuleSpec {
+        time_units: None,
+        ..Default::default()
+    });
     let events = events_of(&bytes);
     assert_eq!((events[0].time - epoch()).num_milliseconds(), -785);
 }
@@ -351,11 +362,15 @@ fn a_millisecond_time_axis_is_scaled_not_misread() {
 
     // Raw 11048 unpacks to -0.785458 *milliseconds*, so the strike sits well
     // under a millisecond before the epoch — not 785 ms before it.
-    let us = (events[0].time - epoch()).num_microseconds().expect("in range");
+    let us = (events[0].time - epoch())
+        .num_microseconds()
+        .expect("in range");
     assert_eq!(us, -785, "expected -0.785 ms, got {us} µs");
 
     // And the second event, at 10.0088 ms rather than 10.0088 s.
-    let us2 = (events[1].time - epoch()).num_microseconds().expect("in range");
+    let us2 = (events[1].time - epoch())
+        .num_microseconds()
+        .expect("in range");
     assert_eq!(us2, 10_008, "expected +10.008 ms, got {us2} µs");
 }
 
@@ -396,9 +411,21 @@ fn longitudes_past_the_antimeridian_wrap_rather_than_vanish() {
     // The window is generous: `add_offset` is `sub_point - 66.56` and a
     // sub-point is within ±180, so any geostationary slot's interval lies
     // inside ±246.56 and one wrap always suffices.
-    assert_eq!(normalize_longitude(-450.0), -90.0, "inside the window: wraps");
-    assert_eq!(normalize_longitude(-540.0), -180.0, "the boundary itself wraps");
-    assert_eq!(normalize_longitude(-540.001), -540.001, "just outside: left alone");
+    assert_eq!(
+        normalize_longitude(-450.0),
+        -90.0,
+        "inside the window: wraps"
+    );
+    assert_eq!(
+        normalize_longitude(-540.0),
+        -180.0,
+        "the boundary itself wraps"
+    );
+    assert_eq!(
+        normalize_longitude(-540.001),
+        -540.001,
+        "just outside: left alone"
+    );
     assert_eq!(normalize_longitude(540.0), 180.0);
     assert_eq!(normalize_longitude(540.001), 540.001);
     assert_eq!(normalize_longitude(-1000.0), -1000.0);
@@ -412,7 +439,10 @@ fn latitude_is_never_wrapped() {
     // ~305°, so a ±360 wrap would land at -54.5°, inside the valid interval.
     // Anything below ±270 makes this vacuous: it would be dropped whether or
     // not latitude were normalized.
-    let bytes = granule(&GranuleSpec { lat_offset: 200.0, ..Default::default() });
+    let bytes = granule(&GranuleSpec {
+        lat_offset: 200.0,
+        ..Default::default()
+    });
     assert!(
         events_of(&bytes).is_empty(),
         "an out-of-range latitude must be dropped, not folded into a plausible one"
@@ -436,7 +466,11 @@ fn goes_west_events_past_the_antimeridian_are_kept() {
     });
     let events = events_of(&bytes);
 
-    assert_eq!(events.len(), 2, "no GOES-West event may be dropped for being west of -180");
+    assert_eq!(
+        events.len(),
+        2,
+        "no GOES-West event may be dropped for being west of -180"
+    );
     assert!(
         (events[0].lon - 172.7207).abs() < 1e-3,
         "expected the wrapped eastern-hemisphere longitude, got {}",
@@ -481,8 +515,14 @@ fn fill_valued_energy_becomes_unknown_without_dropping_the_record() {
 
     // raw 79 → 79 * 1.9024e-17 + 2.8515e-16 = 1.788e-15 J
     let first = events[0].energy.expect("first event has a real energy");
-    assert!((f64::from(first) - 1.788e-15).abs() < 1e-17, "energy was {first:e}");
-    assert_eq!(events[1].energy, None, "a fill energy must not become a number");
+    assert!(
+        (f64::from(first) - 1.788e-15).abs() < 1e-17,
+        "energy was {first:e}"
+    );
+    assert_eq!(
+        events[1].energy, None,
+        "a fill energy must not become a number"
+    );
 }
 
 /// The L2 LCFA product has no `event_area` variable at all — a property of the
@@ -527,7 +567,11 @@ fn unconvertible_area_units_make_the_field_unknown() {
     });
     let flashes = flashes_of(&bytes);
 
-    assert_eq!(flashes.len(), 2, "unit trouble must not cost us the records");
+    assert_eq!(
+        flashes.len(),
+        2,
+        "unit trouble must not cost us the records"
+    );
     assert!(
         flashes.iter().all(|f| f.area.is_none()),
         "an unconvertible unit must not be reported as km²"
@@ -539,7 +583,10 @@ fn unconvertible_area_units_make_the_field_unknown() {
 /// times too large, silently.
 #[test]
 fn absent_area_units_are_treated_the_same_as_unconvertible_ones() {
-    let bytes = granule(&GranuleSpec { area_units: None, ..Default::default() });
+    let bytes = granule(&GranuleSpec {
+        area_units: None,
+        ..Default::default()
+    });
     let flashes = flashes_of(&bytes);
 
     assert_eq!(flashes.len(), 2);
@@ -561,7 +608,11 @@ fn unconvertible_energy_units_make_the_field_unknown() {
     });
     let flashes = flashes_of(&bytes);
 
-    assert_eq!(flashes.len(), 2, "unit trouble must not cost us the records");
+    assert_eq!(
+        flashes.len(),
+        2,
+        "unit trouble must not cost us the records"
+    );
     assert!(
         flashes.iter().all(|f| f.energy.is_none()),
         "an unconvertible unit must not be reported as joules"
@@ -573,7 +624,10 @@ fn unconvertible_energy_units_make_the_field_unknown() {
 /// Absent energy units are treated the same as unconvertible ones.
 #[test]
 fn absent_energy_units_are_treated_the_same_as_unconvertible_ones() {
-    let bytes = granule(&GranuleSpec { energy_units: None, ..Default::default() });
+    let bytes = granule(&GranuleSpec {
+        energy_units: None,
+        ..Default::default()
+    });
     let flashes = flashes_of(&bytes);
     assert_eq!(flashes.len(), 2);
     assert!(flashes.iter().all(|f| f.energy.is_none()));
@@ -593,7 +647,10 @@ fn unit_trouble_is_scoped_to_the_field_it_describes() {
     assert_eq!(flashes[0].lat, f64::from(39.033424_f32));
     assert_eq!((flashes[0].time - epoch()).num_milliseconds(), -785);
     // Energy still declares "J" and still converts.
-    assert!(flashes[0].energy.is_some(), "energy must survive an area unit problem");
+    assert!(
+        flashes[0].energy.is_some(),
+        "energy must survive an area unit problem"
+    );
 
     // ...and the other levels parse normally from the same granule.
     let events = events_of(&bytes);
@@ -826,7 +883,6 @@ fn mismatched_column_lengths_are_rejected() {
 fn one_broken_level_does_not_black_out_the_others() {
     let mut file = new_granule(COVERAGE_START);
     {
-
         add_short(
             &mut file,
             "event_lat",
@@ -910,15 +966,26 @@ fn one_broken_level_does_not_black_out_the_others() {
 
     // Half one: the good level survives.
     assert_eq!(parsed.records.len(), 2);
-    assert!(parsed.records.iter().all(|r| r.level == GlmDataLevel::Event));
+    assert!(
+        parsed
+            .records
+            .iter()
+            .all(|r| r.level == GlmDataLevel::Event)
+    );
 
     // Half two: the broken level is *reported*. A bare `Ok` means
     // `parse_failures: None`, which the panel reads as "everything is fine".
-    assert_eq!(parsed.level_failures.len(), 1, "the broken level must be reported");
+    assert_eq!(
+        parsed.level_failures.len(),
+        1,
+        "the broken level must be reported"
+    );
     assert_eq!(parsed.level_failures[0].level, GlmDataLevel::Flash);
     assert_eq!(parsed.level_failures[0].satellite, GlmSatellite::GoesEast);
     assert!(
-        parsed.level_failures[0].sample_error.contains("length mismatch"),
+        parsed.level_failures[0]
+            .sample_error
+            .contains("length mismatch"),
         "the report must carry why: {}",
         parsed.level_failures[0].sample_error
     );
@@ -935,7 +1002,10 @@ fn every_level_failing_is_a_file_failure_not_a_level_failure() {
     });
     let err = parse_glm_netcdf(&bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Event])
         .expect_err("the only requested level failed, so the granule is unusable");
-    assert!(err.contains("time units"), "the verbatim cause must survive: {err}");
+    assert!(
+        err.contains("time units"),
+        "the verbatim cause must survive: {err}"
+    );
 }
 
 /// A level with zero records is normal, not a failure: the product uses
@@ -945,37 +1015,60 @@ fn every_level_failing_is_a_file_failure_not_a_level_failure() {
 fn a_level_with_no_records_is_empty_not_broken() {
     let mut file = new_granule(COVERAGE_START);
     {
-        add_short(&mut file, "event_lat", &[], Packed {
-            scale: Some(COORD_SCALE),
-            offset: Some(LAT_OFFSET),
-            fill: None,
-            units: Some("degrees_north"),
-        });
-        add_short(&mut file, "event_lon", &[], Packed {
-            scale: Some(COORD_SCALE),
-            offset: Some(LON_OFFSET_EAST),
-            fill: None,
-            units: Some("degrees_east"),
-        });
-        add_short(&mut file, "event_time_offset", &[], Packed {
-            scale: Some(TIME_SCALE),
-            offset: Some(TIME_OFFSET),
-            fill: None,
-            units: Some(TIME_UNITS),
-        });
-        add_short(&mut file, "event_energy", &[], Packed {
-            scale: Some(EVENT_ENERGY_SCALE),
-            offset: Some(ENERGY_OFFSET),
-            fill: Some(-1),
-            units: Some("J"),
-        });
+        add_short(
+            &mut file,
+            "event_lat",
+            &[],
+            Packed {
+                scale: Some(COORD_SCALE),
+                offset: Some(LAT_OFFSET),
+                fill: None,
+                units: Some("degrees_north"),
+            },
+        );
+        add_short(
+            &mut file,
+            "event_lon",
+            &[],
+            Packed {
+                scale: Some(COORD_SCALE),
+                offset: Some(LON_OFFSET_EAST),
+                fill: None,
+                units: Some("degrees_east"),
+            },
+        );
+        add_short(
+            &mut file,
+            "event_time_offset",
+            &[],
+            Packed {
+                scale: Some(TIME_SCALE),
+                offset: Some(TIME_OFFSET),
+                fill: None,
+                units: Some(TIME_UNITS),
+            },
+        );
+        add_short(
+            &mut file,
+            "event_energy",
+            &[],
+            Packed {
+                scale: Some(EVENT_ENERGY_SCALE),
+                offset: Some(ENERGY_OFFSET),
+                fill: Some(-1),
+                units: Some("J"),
+            },
+        );
     }
     let bytes = file.finish().expect("write");
 
     let parsed = parse_glm_netcdf(&bytes, GlmSatellite::GoesEast, &[GlmDataLevel::Event])
         .expect("an empty level is a quiet sky, not a broken product");
     assert!(parsed.records.is_empty());
-    assert!(parsed.level_failures.is_empty(), "a quiet sky must not report a failure");
+    assert!(
+        parsed.level_failures.is_empty(),
+        "a quiet sky must not report a failure"
+    );
 }
 
 /// A healthy granule reports no level failures at all.
@@ -1002,8 +1095,18 @@ fn all_requested_levels_are_returned_together() {
     .expect("parse both levels")
     .records;
     assert_eq!(all.len(), 4); // 2 surviving events + 2 flashes
-    assert_eq!(all.iter().filter(|f| f.level == GlmDataLevel::Event).count(), 2);
-    assert_eq!(all.iter().filter(|f| f.level == GlmDataLevel::Flash).count(), 2);
+    assert_eq!(
+        all.iter()
+            .filter(|f| f.level == GlmDataLevel::Event)
+            .count(),
+        2
+    );
+    assert_eq!(
+        all.iter()
+            .filter(|f| f.level == GlmDataLevel::Flash)
+            .count(),
+        2
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,7 +1221,10 @@ fn the_real_granule_still_exercises_packed_unsigned_shorts() {
         let v = g.raw_var(name).unwrap().unwrap();
         assert_eq!(v.vartype, VarType::SignedInt(2), "{name} storage");
         assert!(v.unsigned, "{name} lost _Unsigned");
-        assert!(v.attrs.contains_key("scale_factor"), "{name} lost scale_factor");
+        assert!(
+            v.attrs.contains_key("scale_factor"),
+            "{name} lost scale_factor"
+        );
     }
 
     // And `group_lat` must stay multi-chunk: it is the only variable here whose
@@ -1127,7 +1233,10 @@ fn the_real_granule_still_exercises_packed_unsigned_shorts() {
     let f = hdf5_pure::File::from_bytes(bytes).unwrap();
     let ds = f.dataset("group_lat").unwrap();
     let chunk = ds.chunk_shape().unwrap().expect("group_lat chunk shape");
-    assert!(2172u64.div_ceil(chunk[0]) >= 2, "group_lat is no longer multi-chunk");
+    assert!(
+        2172u64.div_ceil(chunk[0]) >= 2,
+        "group_lat is no longer multi-chunk"
+    );
 }
 
 /// The overlay end to end on a real granule: bytes off S3 in, plottable
@@ -1142,11 +1251,18 @@ fn a_real_granule_parses_into_plottable_lightning() {
     let parsed = parse_glm_netcdf(
         &bytes,
         GlmSatellite::GoesEast,
-        &[GlmDataLevel::Flash, GlmDataLevel::Group, GlmDataLevel::Event],
+        &[
+            GlmDataLevel::Flash,
+            GlmDataLevel::Group,
+            GlmDataLevel::Event,
+        ],
     )
     .expect("a real NOAA granule must parse");
 
-    assert!(parsed.level_failures.is_empty(), "no level may fail on a healthy granule");
+    assert!(
+        parsed.level_failures.is_empty(),
+        "no level may fail on a healthy granule"
+    );
 
     // 148 flashes + 2172 groups + 5941 events, and nothing dropped: every
     // record in this granule is inside the globe check in `parse_level_records`.
@@ -1176,9 +1292,20 @@ fn a_real_granule_parses_into_plottable_lightning() {
     let end = start + chrono::Duration::milliseconds(20_001);
 
     for r in &parsed.records {
-        assert!(r.lat.is_finite() && r.lon.is_finite(), "non-finite position");
-        assert!((-90.0..=90.0).contains(&r.lat), "latitude off the globe: {}", r.lat);
-        assert!((-180.0..=180.0).contains(&r.lon), "longitude off the globe: {}", r.lon);
+        assert!(
+            r.lat.is_finite() && r.lon.is_finite(),
+            "non-finite position"
+        );
+        assert!(
+            (-90.0..=90.0).contains(&r.lat),
+            "latitude off the globe: {}",
+            r.lat
+        );
+        assert!(
+            (-180.0..=180.0).contains(&r.lon),
+            "longitude off the globe: {}",
+            r.lon
+        );
         // GOES-East sits over -75.2°. Catches an `add_offset` skipped or
         // applied twice: the values stay finite and in-range, they just land in
         // the wrong ocean.
@@ -1205,7 +1332,10 @@ fn a_real_granule_parses_into_plottable_lightning() {
         if let Some(a) = r.area {
             // Groups and flashes span tens to thousands of km²; the packed
             // count is in `m2` and must have been converted.
-            assert!((1.0..1e6).contains(&a), "area outside the plausible range: {a} km2");
+            assert!(
+                (1.0..1e6).contains(&a),
+                "area outside the plausible range: {a} km2"
+            );
         }
     }
 

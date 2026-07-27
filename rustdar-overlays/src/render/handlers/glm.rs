@@ -14,8 +14,7 @@ use crate::render::controls::{
     PaneControlContextMut,
 };
 use crate::render::overlay_state::{
-    FetchPayload,
-    ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
+    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
     OverlayState, PopupContent, PopupSection, RasterizeContext, RasterizeFn, RenderMode,
 };
 use crate::render::rasterize;
@@ -36,9 +35,7 @@ impl OverlayItem for GlmFlashItem {
     fn popup_content(&self, prefs: &UserPreferences) -> PopupContent {
         let f = &self.flash;
         let time_str = match prefs.timezone {
-            rustdar_units::TimezonePreference::Utc => {
-                f.time.format("%H:%M:%S UTC").to_string()
-            }
+            rustdar_units::TimezonePreference::Utc => f.time.format("%H:%M:%S UTC").to_string(),
             rustdar_units::TimezonePreference::Local => {
                 let utc_dt = chrono::TimeZone::from_utc_datetime(&chrono::Utc, &f.time);
                 let local_dt = utc_dt.with_timezone(&chrono::Local);
@@ -292,7 +289,11 @@ impl GlmHandler {
     /// means "alive" only for a satellite that was actually asked.
     fn report_feed_changes(&mut self, queried: &[GlmSatellite], current: Vec<DeadFeed>) {
         for feed in &current {
-            if !self.dead_feeds.iter().any(|d| d.satellite == feed.satellite) {
+            if !self
+                .dead_feeds
+                .iter()
+                .any(|d| d.satellite == feed.satellite)
+            {
                 log::warn!(
                     "GLM: {} feed is dead — bucket '{}' returned no objects at all under \
                      prefixes [{}]. Not a quiet sky: the files themselves are absent \
@@ -364,10 +365,13 @@ impl GlmHandler {
                     f.sample_error,
                 ),
                 (_, FailureHealth::Ok) => {
-                    log::info!("GLM: files {} again — recovered", match kind {
-                        FailureKind::Parse => "are parsing",
-                        FailureKind::Transport => "are downloading",
-                    });
+                    log::info!(
+                        "GLM: files {} again — recovered",
+                        match kind {
+                            FailureKind::Parse => "are parsing",
+                            FailureKind::Transport => "are downloading",
+                        }
+                    );
                 }
                 (None, _) => {}
             }
@@ -380,9 +384,15 @@ impl GlmHandler {
     /// Build the list of active data levels from the checkbox flags.
     fn active_levels(&self) -> Vec<GlmDataLevel> {
         let mut levels = Vec::new();
-        if self.show_events { levels.push(GlmDataLevel::Event); }
-        if self.show_groups { levels.push(GlmDataLevel::Group); }
-        if self.show_flashes { levels.push(GlmDataLevel::Flash); }
+        if self.show_events {
+            levels.push(GlmDataLevel::Event);
+        }
+        if self.show_groups {
+            levels.push(GlmDataLevel::Group);
+        }
+        if self.show_flashes {
+            levels.push(GlmDataLevel::Flash);
+        }
         levels
     }
 
@@ -488,24 +498,34 @@ impl OverlayHandler for GlmHandler {
         });
     }
 
-    fn prepare_rasterize(
-        &self,
-        ctx: &RasterizeContext,
-    ) -> Option<RasterizeFn> {
+    fn prepare_rasterize(&self, ctx: &RasterizeContext) -> Option<RasterizeFn> {
         if self.state.data.is_empty() {
             return None;
         }
         let flashes: Vec<GlmFlash> = self.state.data.iter().map(|i| i.flash.clone()).collect();
-        let items: Vec<Arc<dyn OverlayItem>> =
-            self.state.data.iter().map(|i| i.clone() as Arc<dyn OverlayItem>).collect();
+        let items: Vec<Arc<dyn OverlayItem>> = self
+            .state
+            .data
+            .iter()
+            .map(|i| i.clone() as Arc<dyn OverlayItem>)
+            .collect();
         let zoom = ctx.zoom;
         let is_dark = ctx.is_dark;
         let time_window_secs = self.time_window_secs;
         let now = Utc::now().naive_utc();
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
             rasterize::rasterize_glm_strikes(
-                &flashes, &items, bounds, width, height,
-                &rasterize::GlmRenderParams { zoom, is_dark, time_window_secs, now },
+                &flashes,
+                &items,
+                bounds,
+                width,
+                height,
+                &rasterize::GlmRenderParams {
+                    zoom,
+                    is_dark,
+                    time_window_secs,
+                    now,
+                },
             )
         }))
     }
@@ -631,7 +651,11 @@ impl OverlayHandler for GlmHandler {
             // ones so they do not read as recovered, but showing those is
             // stale.
             let selected = self.satellite.to_satellites();
-            for feed in self.dead_feeds.iter().filter(|f| selected.contains(&f.satellite)) {
+            for feed in self
+                .dead_feeds
+                .iter()
+                .filter(|f| selected.contains(&f.satellite))
+            {
                 items.push(ControlItem::InfoText {
                     text: format!(
                         "\u{26a0} No data from {}: bucket '{}' is empty",
@@ -648,9 +672,10 @@ impl OverlayHandler for GlmHandler {
             // Both can show at once, but two *totals* cannot: each file yields
             // exactly one FileError, so the counts partition the failures and
             // at most one can equal `in_window`.
-            for (kind, state) in
-                [(FailureKind::Parse, &self.parse), (FailureKind::Transport, &self.transport)]
-            {
+            for (kind, state) in [
+                (FailureKind::Parse, &self.parse),
+                (FailureKind::Transport, &self.transport),
+            ] {
                 let Some(f) = &state.detail else { continue };
                 let text = if f.is_total() {
                     format!(
@@ -784,8 +809,7 @@ impl OverlayHandler for GlmHandler {
             self.satellite = SatelliteSelection::from_str(sat);
         }
         if let Some(tw) = value.get("time_window_secs").and_then(|v| v.as_f64()) {
-            self.time_window_secs =
-                tw.clamp(GLM_MIN_TIME_WINDOW_SECS, GLM_MAX_TIME_WINDOW_SECS);
+            self.time_window_secs = tw.clamp(GLM_MIN_TIME_WINDOW_SECS, GLM_MAX_TIME_WINDOW_SECS);
         }
         if let Some(v) = value.get("show_events").and_then(|v| v.as_bool()) {
             self.show_events = v;
@@ -891,7 +915,10 @@ mod tests {
     fn popup_renders_reported_values_in_the_documented_units() {
         let r = rows(&item(GlmDataLevel::Flash, Some(7.5e-14), Some(300.0)));
         let get = |k: &str| {
-            r.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone()).unwrap_or_default()
+            r.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
         };
         assert_eq!(get("Energy"), "7.50e-14 J");
         assert_eq!(get("Area"), "300.0 km²");
@@ -932,7 +959,9 @@ mod tests {
 
         let texts = info_texts(&handler);
         assert!(
-            texts.iter().any(|t| t.contains("noaa-goes16") && t.contains("GOES-19 (East)")),
+            texts
+                .iter()
+                .any(|t| t.contains("noaa-goes16") && t.contains("GOES-19 (East)")),
             "control panel should name the empty bucket, got {texts:?}"
         );
     }
@@ -962,7 +991,13 @@ mod tests {
             handler.report_feed_changes(&BOTH, vec![dead_east()]);
         }
         assert_eq!(handler.dead_feeds.len(), 1);
-        assert_eq!(info_texts(&handler).iter().filter(|t| t.contains("noaa-goes16")).count(), 1);
+        assert_eq!(
+            info_texts(&handler)
+                .iter()
+                .filter(|t| t.contains("noaa-goes16"))
+                .count(),
+            1
+        );
 
         handler.report_feed_changes(&BOTH, Vec::new());
         assert!(handler.dead_feeds.is_empty());
@@ -1004,7 +1039,9 @@ mod tests {
         );
         // ...and the stale notice is not shown while East is deselected.
         assert!(
-            !info_texts(&handler).iter().any(|t| t.contains("noaa-goes16")),
+            !info_texts(&handler)
+                .iter()
+                .any(|t| t.contains("noaa-goes16")),
             "a deselected satellite should not occupy the panel"
         );
     }
@@ -1021,7 +1058,10 @@ mod tests {
 
         assert_eq!(handler.dead_feeds, vec![dead_east()]);
         assert_eq!(
-            info_texts(&handler).iter().filter(|t| t.contains("noaa-goes16")).count(),
+            info_texts(&handler)
+                .iter()
+                .filter(|t| t.contains("noaa-goes16"))
+                .count(),
             1,
             "the notice should appear once, not duplicate per selection change"
         );
@@ -1047,7 +1087,11 @@ mod tests {
     }
 
     fn partial_failure(failed: usize) -> FetchFailures {
-        FetchFailures { in_window: 12, failed, sample_error: "boom".into() }
+        FetchFailures {
+            in_window: 12,
+            failed,
+            sample_error: "boom".into(),
+        }
     }
 
     /// A healthy S3 listing with every granule failing to parse must not read
@@ -1094,7 +1138,9 @@ mod tests {
         handler.report_failures(FailureKind::Parse, None);
 
         assert!(
-            !info_texts(&handler).iter().any(|t| t.contains("failed to parse")),
+            !info_texts(&handler)
+                .iter()
+                .any(|t| t.contains("failed to parse")),
             "notice should clear once parsing recovers"
         );
     }
@@ -1132,8 +1178,9 @@ mod tests {
 
         let texts = info_texts(&handler);
         assert!(
-            texts.iter().any(|t| t.contains("could not be downloaded")
-                && t.contains("network down?")),
+            texts
+                .iter()
+                .any(|t| t.contains("could not be downloaded") && t.contains("network down?")),
             "a transport failure should point at the network, got {texts:?}"
         );
         assert!(
@@ -1206,12 +1253,18 @@ mod tests {
             log::set_max_level(log::LevelFilter::Trace);
         });
 
-        LOG_RECORDS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        LOG_RECORDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         *CAPTURE_THREAD.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(std::thread::current().id());
         f();
         *CAPTURE_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        LOG_RECORDS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        LOG_RECORDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn count_containing(logs: &[String], needle: &str) -> usize {
@@ -1263,7 +1316,9 @@ mod tests {
 
         let texts = info_texts(&handler);
         assert!(
-            texts.iter().any(|t| t.contains("Flashes") && t.contains("GOES-19 (East)")),
+            texts
+                .iter()
+                .any(|t| t.contains("Flashes") && t.contains("GOES-19 (East)")),
             "the panel must name the missing layer, got {texts:?}"
         );
     }
@@ -1455,10 +1510,13 @@ mod tests {
 
             handler.report_level_failures(&east_both, vec![east_flash.clone()]);
             // Group breaks too, while Flash is still broken.
-            handler
-                .report_level_failures(&east_both, vec![east_flash.clone(), east_group.clone()]);
+            handler.report_level_failures(&east_both, vec![east_flash.clone(), east_group.clone()]);
 
-            assert_eq!(handler.level_failures.len(), 2, "both layers must be tracked");
+            assert_eq!(
+                handler.level_failures.len(),
+                2,
+                "both layers must be tracked"
+            );
             let texts = info_texts(&handler);
             assert!(texts.iter().any(|t| t.contains("Flashes")), "{texts:?}");
             assert!(texts.iter().any(|t| t.contains("Groups")), "{texts:?}");
@@ -1489,7 +1547,11 @@ mod tests {
 
             handler.report_level_failures(&FLASH_EVALUATED, vec![east.clone()]);
             handler.report_level_failures(&FLASH_EVALUATED, vec![east.clone(), west.clone()]);
-            assert_eq!(handler.level_failures.len(), 2, "both birds must be tracked");
+            assert_eq!(
+                handler.level_failures.len(),
+                2,
+                "both birds must be tracked"
+            );
 
             // Only West is evaluated and only West fails, so East's verdict
             // must be carried rather than dropped.
@@ -1502,8 +1564,16 @@ mod tests {
             assert_eq!(handler.level_failures.len(), 2);
         });
 
-        assert_eq!(count_containing(&logs, "from GOES-19 (East)"), 1, "{logs:?}");
-        assert_eq!(count_containing(&logs, "from GOES-18 (West)"), 1, "{logs:?}");
+        assert_eq!(
+            count_containing(&logs, "from GOES-19 (East)"),
+            1,
+            "{logs:?}"
+        );
+        assert_eq!(
+            count_containing(&logs, "from GOES-18 (West)"),
+            1,
+            "{logs:?}"
+        );
         assert_eq!(count_containing(&logs, "parsing again"), 0, "{logs:?}");
     }
 
@@ -1550,7 +1620,10 @@ mod tests {
             let mut handler = GlmHandler::new();
             handler.report_level_failures(&FLASH_EVALUATED, vec![flash_level_gone()]);
             handler.report_level_failures(&FLASH_EVALUATED, Vec::new());
-            assert!(handler.level_failures.is_empty(), "a looked-at healthy layer must clear");
+            assert!(
+                handler.level_failures.is_empty(),
+                "a looked-at healthy layer must clear"
+            );
         });
         assert_eq!(count_containing(&logs, "parsing again"), 1, "{logs:?}");
     }
@@ -1587,7 +1660,8 @@ mod tests {
             "expected exactly one dead-feed warning across 10 polls, got: {logs:?}"
         );
         assert!(
-            logs.iter().any(|l| l.starts_with("WARN") && l.contains("noaa-goes16")),
+            logs.iter()
+                .any(|l| l.starts_with("WARN") && l.contains("noaa-goes16")),
             "the warning should name the bucket, got: {logs:?}"
         );
     }
@@ -1618,7 +1692,10 @@ mod tests {
             handler.enabled = true;
             handler.report_feed_changes(&BOTH, vec![dead_east()]);
 
-            LOG_RECORDS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            LOG_RECORDS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
             // Both -> West -> Both, with East still dark the whole time.
             handler.report_feed_changes(&WEST_ONLY, Vec::new());
             handler.report_feed_changes(&BOTH, vec![dead_east()]);

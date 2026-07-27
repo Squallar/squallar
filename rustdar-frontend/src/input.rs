@@ -54,9 +54,10 @@ impl InputHandler {
         }
         // Escape by *physical* key, so it survives a layout that remaps it.
         if let PhysicalKey::Code(keycode) = physical
-            && keycode == KeyCode::Escape {
-                self.escape_pressed = true;
-            }
+            && keycode == KeyCode::Escape
+        {
+            self.escape_pressed = true;
+        }
         // Back by *logical* key: Android's button and the browser's are named
         // keys with no physical keycode at all.
         if let Key::Named(NamedKey::GoBack | NamedKey::BrowserBack) = logical {
@@ -95,7 +96,10 @@ mod tests {
     }
 
     fn escape() -> (PhysicalKey, Key) {
-        (PhysicalKey::Code(KeyCode::Escape), Key::Named(NamedKey::Escape))
+        (
+            PhysicalKey::Code(KeyCode::Escape),
+            Key::Named(NamedKey::Escape),
+        )
     }
 
     /// Android's back button and the browser's, which arrive as different
@@ -127,7 +131,10 @@ mod tests {
     }
 
     fn letter_a() -> (PhysicalKey, Key) {
-        (PhysicalKey::Code(KeyCode::KeyA), Key::Character(SmolStr::new("a")))
+        (
+            PhysicalKey::Code(KeyCode::KeyA),
+            Key::Character(SmolStr::new("a")),
+        )
     }
 
     /// Escape and back must both mean "back out". Only Escape did, which is why
@@ -137,7 +144,10 @@ mod tests {
         for (name, (physical, logical)) in back_out_keys() {
             let mut input = InputHandler::new();
             press(&mut input, physical, logical, false);
-            assert!(input.take_back_out_press(), "{name} did not count as a back-out");
+            assert!(
+                input.take_back_out_press(),
+                "{name} did not count as a back-out"
+            );
         }
 
         let mut neither = InputHandler::new();
@@ -162,7 +172,10 @@ mod tests {
         for (name, (physical, logical)) in back_out_keys() {
             let mut input = InputHandler::new();
             press(&mut input, physical, logical.clone(), false);
-            assert!(input.take_back_out_press(), "{name}: the first press was lost");
+            assert!(
+                input.take_back_out_press(),
+                "{name}: the first press was lost"
+            );
 
             for repeat in 0..5 {
                 press(&mut input, physical, logical.clone(), true);
@@ -244,7 +257,11 @@ mod tests {
             .map(|(body, _)| body)
             .expect("process_event has no recognisable body");
 
-        for field in ["key_event.physical_key", "key_event.logical_key", "key_event.repeat"] {
+        for field in [
+            "key_event.physical_key",
+            "key_event.logical_key",
+            "key_event.repeat",
+        ] {
             assert!(
                 body.contains(field),
                 "process_event no longer forwards {field}, so note_key decides \
@@ -253,4 +270,3 @@ mod tests {
         }
     }
 }
-

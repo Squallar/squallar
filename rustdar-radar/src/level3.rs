@@ -190,9 +190,7 @@ pub async fn latest_key(
         return Ok(Some(key));
     }
     let yesterday = *today - Duration::days(1);
-    log::info!(
-        "No {product} for {site3} on {today}, falling back to {yesterday}"
-    );
+    log::info!("No {product} for {site3} on {today}, falling back to {yesterday}");
     Ok(newest(list_day(sources, site3, product, &yesterday).await?))
 }
 
@@ -224,7 +222,11 @@ pub async fn fetch_latest_product(
     let message = nexrad_level3::decode::decode_product(&bytes)?;
     let stamp = ProductStamp::from_key(key);
     if let Some(age) = stamp.age(now) {
-        log::info!("Level III {} is {} minutes old", stamp.key, age.num_minutes());
+        log::info!(
+            "Level III {} is {} minutes old",
+            stamp.key,
+            age.num_minutes()
+        );
     }
     Ok(Level3Product { message, stamp })
 }
@@ -261,7 +263,13 @@ mod tests {
     const ICD: &[(RadarProduct, &[(&str, i16)])] = &[
         (
             RadarProduct::StormRelativeVelocity,
-            &[("N0S", 56), ("N0G", 154), ("N1G", 154), ("N2U", 99), ("N3U", 99)],
+            &[
+                ("N0S", 56),
+                ("N0G", 154),
+                ("N1G", 154),
+                ("N2U", 99),
+                ("N3U", 99),
+            ],
         ),
         (RadarProduct::SpecificDifferentialPhase, &[("N0K", 163)]),
         (RadarProduct::EchoTops, &[("EET", 135)]),
@@ -303,7 +311,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} names no product code", product.name()));
             let want: Vec<&str> = row.iter().map(|(id, _)| *id).collect();
             assert_eq!(
-                codes, want,
+                codes,
+                want,
                 "{} requests {codes:?}; the ICD gives {want:?} for that field",
                 product.name(),
             );
@@ -314,7 +323,10 @@ mod tests {
     /// test above passes by skipping a product the table forgot.
     #[test]
     fn the_icd_table_covers_exactly_the_level3_products() {
-        let level3: Vec<_> = RadarProduct::all().iter().filter(|p| p.is_level3()).collect();
+        let level3: Vec<_> = RadarProduct::all()
+            .iter()
+            .filter(|p| p.is_level3())
+            .collect();
         assert_eq!(
             ICD.len(),
             level3.len(),
@@ -324,7 +336,10 @@ mod tests {
         );
         // A duplicated ID would let two products agree with the table while
         // pointing at the same field.
-        let all: Vec<&str> = ICD.iter().flat_map(|(_, ids)| ids.iter().map(|(id, _)| *id)).collect();
+        let all: Vec<&str> = ICD
+            .iter()
+            .flat_map(|(_, ids)| ids.iter().map(|(id, _)| *id))
+            .collect();
         for (i, code) in all.iter().enumerate() {
             assert!(
                 !all[..i].contains(code),
@@ -334,7 +349,10 @@ mod tests {
     }
 
     fn at(h: u32, m: u32, s: u32) -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(2026, 7, 25).unwrap().and_hms_opt(h, m, s).unwrap()
+        NaiveDate::from_ymd_opt(2026, 7, 25)
+            .unwrap()
+            .and_hms_opt(h, m, s)
+            .unwrap()
     }
 
     /// A fetched product must say how old it is: nothing downstream could
@@ -415,10 +433,7 @@ mod tests {
             "TLX_N0S_2026_07_25_00_02_19".to_string(),
             "TLX_N0S_2026_07_25_09_13_03".to_string(),
         ];
-        assert_eq!(
-            newest(keys).as_deref(),
-            Some("TLX_N0S_2026_07_25_17_30_24"),
-        );
+        assert_eq!(newest(keys).as_deref(), Some("TLX_N0S_2026_07_25_17_30_24"),);
     }
 
     /// Zero padding is what makes binary order equal chronological order.
@@ -487,11 +502,16 @@ mod tests {
                 let codes = codes.unwrap_or_else(|| {
                     panic!("{} is Level III but names no product code", product.name())
                 });
-                assert!(!codes.is_empty(), "{} names an empty code list", product.name());
+                assert!(
+                    !codes.is_empty(),
+                    "{} names an empty code list",
+                    product.name()
+                );
                 for code in codes {
                     assert_eq!(code.len(), 3, "{code} is not a 3-character AWIPS ID");
                     assert!(
-                        code.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
+                        code.chars()
+                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
                         "{code} is not an AWIPS ID",
                     );
                 }
@@ -541,7 +561,11 @@ mod tests {
             crate::srm::STORM_MOTION_PRODUCT,
             "the first key is the vector source, and only that",
         );
-        assert_eq!(codes[1..], crate::srm::SRM_TILT_PRODUCTS, "the rest are the tilts");
+        assert_eq!(
+            codes[1..],
+            crate::srm::SRM_TILT_PRODUCTS,
+            "the rest are the tilts"
+        );
         for (id, message_code) in &row[1..] {
             assert!(
                 crate::srm::VELOCITY_PRODUCT_CODES.contains(message_code),
@@ -579,8 +603,8 @@ mod tests {
         let now = chrono::Utc::now().naive_utc();
 
         for product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
-            let row = icd_row(product)
-                .unwrap_or_else(|| panic!("{} has no ICD row", product.name()));
+            let row =
+                icd_row(product).unwrap_or_else(|| panic!("{} has no ICD row", product.name()));
 
             for &(code, want_message_code) in row {
                 let fetched = fetch_latest_product(&sources, "KTLX", code, now)
@@ -605,7 +629,8 @@ mod tests {
                     fetched.stamp.key,
                 );
                 assert_eq!(
-                    got, want_message_code,
+                    got,
+                    want_message_code,
                     "{} fetches {code}, which decoded as message code {got}; \
                      the ICD gives {want_message_code} for {}",
                     product.name(),

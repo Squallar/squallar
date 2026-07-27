@@ -1,14 +1,14 @@
 use chrono::NaiveDateTime;
-use rustdar_radar::archive::Identifier;
-use rustdar_radar::level3::Level3Product;
 use nexrad_model::data::Scan;
 use rustdar_egui::pane::RenderTarget;
 use rustdar_overlays::render::overlay_state::{OverlayFetchResult, OverlayKind};
 use rustdar_overlays::render::rasterize::HitMap;
 use rustdar_overlays::types::GeoBounds;
+use rustdar_radar::archive::Identifier;
+use rustdar_radar::level3::Level3Product;
 use rustdar_radar::types::RadarProduct;
-use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender};
 
 /// Successful scan data returned from a background fetch.
 pub struct ScanData {

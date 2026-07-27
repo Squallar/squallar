@@ -104,7 +104,12 @@ pub(crate) struct UnpackedVar {
 /// Steps 3 to 5 of the rules at the top of this module; the backend has
 /// already done steps 1 and 2 and handed over a [`RawVar`].
 pub(crate) fn unpack(var: &RawVar, name: &str) -> UnpackedVar {
-    let RawVar { raw, vartype, unsigned, attrs } = var;
+    let RawVar {
+        raw,
+        vartype,
+        unsigned,
+        attrs,
+    } = var;
     let (vartype, unsigned) = (*vartype, *unsigned);
     let attr = |n: &str| attrs.get(n).cloned();
 
@@ -262,7 +267,11 @@ pub(crate) fn parse_time_units(units: &str) -> Option<TimeUnits> {
 pub(crate) fn parse_cf_epoch(s: &str) -> Option<chrono::NaiveDateTime> {
     // Trim a trailing UTC designator; CF times without an offset are UTC and
     // GLM writes both `...12:00:00.000` and `...12:00:00.0Z`.
-    let s = s.trim().trim_end_matches('Z').trim_end_matches(" UTC").trim();
+    let s = s
+        .trim()
+        .trim_end_matches('Z')
+        .trim_end_matches(" UTC")
+        .trim();
 
     for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"] {
         if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
@@ -296,7 +305,10 @@ mod tests {
         let lat: f64 = 51951.0 * 0.00203128 + -66.56;
         assert!((lat - 38.967).abs() < 1e-3, "got {lat}");
         let wrong: f64 = -13585.0 * 0.00203128 + -66.56;
-        assert!(wrong < -90.0, "the unfixed path is not even a valid latitude");
+        assert!(
+            wrong < -90.0,
+            "the unfixed path is not even a valid latitude"
+        );
     }
 
     /// `_FillValue = -1s` under `_Unsigned` means 65535, and `valid_range =
@@ -312,7 +324,10 @@ mod tests {
 
     #[test]
     fn unsigned_reinterpretation_covers_the_other_int_widths() {
-        assert_eq!(reinterpret_unsigned(-1.0, VarType::SignedInt(1), true), 255.0);
+        assert_eq!(
+            reinterpret_unsigned(-1.0, VarType::SignedInt(1), true),
+            255.0
+        );
         assert_eq!(
             reinterpret_unsigned(-1.0, VarType::SignedInt(4), true),
             4_294_967_295.0
@@ -327,7 +342,10 @@ mod tests {
             65535.0
         );
         // Floats are never reinterpreted.
-        assert_eq!(reinterpret_unsigned(-13585.0, VarType::Float, true), -13585.0);
+        assert_eq!(
+            reinterpret_unsigned(-13585.0, VarType::Float, true),
+            -13585.0
+        );
     }
 
     #[test]
@@ -590,8 +608,7 @@ mod tests {
     /// `group_lat`/`flash_lat` — must come through bit-for-bit.
     #[test]
     fn float_variable_passes_through_unchanged() {
-        let bytes =
-            float_var_file(&[39.033424_f32, -22.65055, 55.2922], Some("degrees_north"));
+        let bytes = float_var_file(&[39.033424_f32, -22.65055, 55.2922], Some("degrees_north"));
 
         let v = read_v(&bytes);
         assert_eq!(v.values[0], Some(f64::from(39.033424_f32)));

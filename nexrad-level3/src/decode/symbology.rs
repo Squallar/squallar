@@ -18,10 +18,7 @@ use super::header::{read_i16, read_u16, read_u32};
 /// HW 2-3  Layer length (u32, bytes of data packets)
 /// ... data packets ...
 /// ```
-pub(crate) fn decode_symbology_block(
-    data: &[u8],
-    offset: usize,
-) -> Result<SymbologyBlock> {
+pub(crate) fn decode_symbology_block(data: &[u8], offset: usize) -> Result<SymbologyBlock> {
     let mut o = offset;
 
     let _block_divider = read_i16(data, o)?; // should be -1
@@ -61,22 +58,21 @@ pub(crate) fn decode_symbology_block(
                     o = new_offset;
                 }
                 // Generic Data Component: self-describing XDR.
-                28 => {
-                    match super::radial::decode_generic_radial_packet(data, o) {
-                        Ok((radial_packet, new_offset)) => {
-                            packets.push(DataPacket::DigitalRadial(radial_packet));
-                            o = new_offset;
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "Failed to decode Generic Data Component at offset {}: {}",
-                                o, e
-                            );
-                            o = layer_end;
-                            break;
-                        }
+                28 => match super::radial::decode_generic_radial_packet(data, o) {
+                    Ok((radial_packet, new_offset)) => {
+                        packets.push(DataPacket::DigitalRadial(radial_packet));
+                        o = new_offset;
                     }
-                }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to decode Generic Data Component at offset {}: {}",
+                            o,
+                            e
+                        );
+                        o = layer_end;
+                        break;
+                    }
+                },
                 _ => {
                     // No length field to skip by, so abandon the layer.
                     log::warn!(

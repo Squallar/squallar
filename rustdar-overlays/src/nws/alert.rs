@@ -1,5 +1,5 @@
-use crate::types::{GeoPolygon, HatchPattern, OverlayFeature};
 use super::colors::alert_color;
+use crate::types::{GeoPolygon, HatchPattern, OverlayFeature};
 
 /// Not an NWS field: derived from the `event` string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -63,9 +63,24 @@ macro_rules! str_enum {
     };
 }
 
-str_enum!(AlertSeverity { Extreme, Severe, Moderate, Minor });
-str_enum!(AlertUrgency { Immediate, Expected, Future, Past });
-str_enum!(AlertCertainty { Observed, Likely, Possible, Unlikely });
+str_enum!(AlertSeverity {
+    Extreme,
+    Severe,
+    Moderate,
+    Minor
+});
+str_enum!(AlertUrgency {
+    Immediate,
+    Expected,
+    Future,
+    Past
+});
+str_enum!(AlertCertainty {
+    Observed,
+    Likely,
+    Possible,
+    Unlikely
+});
 
 #[derive(Debug, Clone)]
 pub struct NwsAlert {
@@ -142,12 +157,24 @@ pub fn parse_alerts(json: &serde_json::Value) -> Vec<NwsAlert> {
             id: str_field(props, "id"),
             event,
             category,
-            severity: props.get("severity").and_then(|v| v.as_str()).unwrap_or("Unknown")
-                .parse().unwrap(),
-            urgency: props.get("urgency").and_then(|v| v.as_str()).unwrap_or("Unknown")
-                .parse().unwrap(),
-            certainty: props.get("certainty").and_then(|v| v.as_str()).unwrap_or("Unknown")
-                .parse().unwrap(),
+            severity: props
+                .get("severity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown")
+                .parse()
+                .unwrap(),
+            urgency: props
+                .get("urgency")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown")
+                .parse()
+                .unwrap(),
+            certainty: props
+                .get("certainty")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown")
+                .parse()
+                .unwrap(),
             headline: opt_str_field(props, "headline"),
             description: str_field(props, "description"),
             instruction: opt_str_field(props, "instruction"),
@@ -208,9 +235,7 @@ fn str_field(obj: &serde_json::Value, key: &str) -> String {
 }
 
 fn opt_str_field(obj: &serde_json::Value, key: &str) -> Option<String> {
-    obj.get(key)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    obj.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
 fn parse_affected_zones(props: &serde_json::Value) -> Vec<String> {

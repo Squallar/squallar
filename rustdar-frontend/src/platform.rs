@@ -206,7 +206,9 @@ pub trait PlatformBridge {
     fn stop_gps(&mut self) {}
 
     /// Whether the desktop serial GPS reader is currently running.
-    fn gps_active(&self) -> bool { false }
+    fn gps_active(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

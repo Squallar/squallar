@@ -170,10 +170,7 @@ impl InputHarness {
             map_memory: walkers::MapMemory::default(),
             // The map occupies the middle of the window: inset generously so
             // the harness never depends on exact panel widths.
-            pane_rect: egui::Rect::from_min_max(
-                egui::pos2(220.0, 80.0),
-                egui::pos2(1004.0, 690.0),
-            ),
+            pane_rect: egui::Rect::from_min_max(egui::pos2(220.0, 80.0), egui::pos2(1004.0, 690.0)),
             time: 100.0,
             events: Vec::new(),
             screen_rect,
@@ -297,16 +294,16 @@ impl InputHarness {
 
     /// The `(options, selected)` the handler behind `label` is offering — the
     /// model a [`crate::ui::DrawnDropdown`] is supposed to be a rendering of.
-    pub(crate) fn dropdown_model(
-        &self,
-        label: &str,
-    ) -> Option<(Vec<(String, String)>, String)> {
+    pub(crate) fn dropdown_model(&self, label: &str) -> Option<(Vec<(String, String)>, String)> {
         self.gui.dropdown_model_for_test(label)
     }
 
     /// Every text run the last frame painted, without its rect.
     pub(crate) fn painted_text_strings(&self) -> Vec<String> {
-        self.last_texts.iter().map(|(_, text)| text.clone()).collect()
+        self.last_texts
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect()
     }
 
     /// Whether `needle` was painted anywhere inside `rect`.
@@ -515,7 +512,11 @@ impl InputHarness {
                 2.0 * centre.y - target.y,
             ))
         };
-        self.gui.pane_mut(idx).unwrap().map_memory.center_at(shifted);
+        self.gui
+            .pane_mut(idx)
+            .unwrap()
+            .map_memory
+            .center_at(shifted);
         self.warm_up();
     }
 
@@ -749,11 +750,8 @@ impl InputHarness {
     /// is the whole reason pinch needed fixing. Both fingers keep their web
     /// device ids here so the tests run against the real event shape.
     pub(crate) fn web_second_finger_down(&mut self, pos: egui::Pos2) {
-        self.events.push(web_touch(
-            WEB_FINGER_B,
-            egui::TouchPhase::Start,
-            pos,
-        ));
+        self.events
+            .push(web_touch(WEB_FINGER_B, egui::TouchPhase::Start, pos));
     }
 
     /// Both fingers move. Only the first drives the emulated pointer.
@@ -1045,7 +1043,10 @@ mod tests {
 
         h.mouse_press(pos);
         let pressed = h.frame_after(FRAME_DT);
-        assert_eq!(pressed.touch.long_press_pos, None, "not held long enough yet");
+        assert_eq!(
+            pressed.touch.long_press_pos, None,
+            "not held long enough yet"
+        );
         assert!(!pressed.touch.suppress_pan);
 
         // Hold for ~1s (LONG_PRESS_DURATION_S is 0.8s) without moving.
@@ -1126,7 +1127,10 @@ mod tests {
                 moving.touch.long_press_pos, None,
                 "step {step}: a finger still moving is a pan, not a hold"
             );
-            assert!(!moving.touch.suppress_pan, "step {step}: pan must stay live");
+            assert!(
+                !moving.touch.suppress_pan,
+                "step {step}: pan must stay live"
+            );
         }
     }
 
@@ -1167,7 +1171,10 @@ mod tests {
         // Second press within the double-tap window enters the zoom drag.
         h.touch_start(start);
         let dragging = h.frame_after(0.05);
-        assert!(dragging.touch.suppress_pan, "zoom drag must block map panning");
+        assert!(
+            dragging.touch.suppress_pan,
+            "zoom drag must block map panning"
+        );
         assert_eq!(dragging.touch.overlay_click_pos, None);
         assert_eq!(dragging.touch.long_press_pos, None);
 
@@ -1359,7 +1366,10 @@ mod tests {
         h.touch_tap(start);
         h.touch_start(start);
         let dragging = h.frame_after(0.05);
-        assert!(dragging.touch.suppress_pan, "precondition: zoom drag active");
+        assert!(
+            dragging.touch.suppress_pan,
+            "precondition: zoom drag active"
+        );
 
         h.touch_move(start + egui::vec2(0.0, 60.0));
         assert!(h.frame_after(FRAME_DT).touch.suppress_pan);
@@ -1401,7 +1411,11 @@ mod tests {
 
         h.touch_start(pos);
         let held = h.frames_for(10, 0.1);
-        assert_eq!(held.touch.long_press_pos, Some(pos), "precondition: long press");
+        assert_eq!(
+            held.touch.long_press_pos,
+            Some(pos),
+            "precondition: long press"
+        );
         assert!(held.touch.suppress_pan);
 
         h.touch_cancel(pos);
@@ -1545,7 +1559,10 @@ mod tests {
         // so the pointer must be distrusted for as long as it stays silent.
         h.cursor_left();
         let gone = h.frame_after(FRAME_DT);
-        assert_eq!(gone.touch.long_press_pos, None, "the held position must not stick");
+        assert_eq!(
+            gone.touch.long_press_pos, None,
+            "the held position must not stick"
+        );
         assert!(!gone.touch.suppress_pan);
 
         // It comes back, still dragging: five move events, no press among them.
@@ -1650,7 +1667,10 @@ mod tests {
 
         h.touch_tap(start);
         h.touch_start(start);
-        assert!(h.frame_after(0.05).touch.suppress_pan, "precondition: zoom drag");
+        assert!(
+            h.frame_after(0.05).touch.suppress_pan,
+            "precondition: zoom drag"
+        );
 
         h.touch_cancel(start);
         assert!(!h.frame_after(FRAME_DT).touch.suppress_pan);
@@ -1795,7 +1815,11 @@ mod tests {
 
         h.touch_start(pos);
         let held = h.frames_for(10, 0.1);
-        assert_eq!(held.touch.long_press_pos, Some(pos), "precondition: long press");
+        assert_eq!(
+            held.touch.long_press_pos,
+            Some(pos),
+            "precondition: long press"
+        );
 
         // Not one event for thirty seconds; the finger has not moved a pixel.
         h.assert_every_frame_for(HOLD_MUST_SURVIVE_S, 0.25, |frame, outcome| {
@@ -1821,8 +1845,7 @@ mod tests {
         /// egui made of it. `devices` is the device id each finger arrives on.
         fn spread(devices: [u64; 2]) -> (f32, bool) {
             let ctx = egui::Context::default();
-            let screen =
-                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 768.0));
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 768.0));
             let centre = egui::pos2(500.0, 400.0);
             let touch = |dev: u64, id: u64, phase, pos| egui::Event::Touch {
                 device_id: egui::TouchDeviceId(dev),
@@ -1892,8 +1915,16 @@ mod tests {
     fn normalizing_merges_devices_and_leaves_the_fingers_alone() {
         let mut input = egui::RawInput {
             events: vec![
-                web_touch(WEB_FINGER_A, egui::TouchPhase::Start, egui::pos2(10.0, 10.0)),
-                web_touch(WEB_FINGER_B, egui::TouchPhase::Start, egui::pos2(90.0, 10.0)),
+                web_touch(
+                    WEB_FINGER_A,
+                    egui::TouchPhase::Start,
+                    egui::pos2(10.0, 10.0),
+                ),
+                web_touch(
+                    WEB_FINGER_B,
+                    egui::TouchPhase::Start,
+                    egui::pos2(90.0, 10.0),
+                ),
             ],
             ..Default::default()
         };
@@ -1930,7 +1961,11 @@ mod tests {
 
         let pinched = h.web_pinch(centre, 80.0, 320.0, 8);
 
-        assert_eq!(pinched.modality, PointerModality::Touch, "two fingers are touch");
+        assert_eq!(
+            pinched.modality,
+            PointerModality::Touch,
+            "two fingers are touch"
+        );
         assert!(
             pinched.resolved_zoom > before + 0.2,
             "pinching out must zoom the map in: {before} -> {}",
@@ -2562,7 +2597,10 @@ mod tests {
             dragged.resolved_zoom, before,
             "the touch gesture must reach the map through the gate"
         );
-        assert!(dragged.resolved.suppress_pan, "the zoom drag owns the pointer");
+        assert!(
+            dragged.resolved.suppress_pan,
+            "the zoom drag owns the pointer"
+        );
     }
 
     /// 12. **A gesture interrupted by a modality change is abandoned, and stays
@@ -2864,9 +2902,18 @@ mod tests {
     #[test]
     fn the_map_keeps_usable_space_at_every_breakpoint() {
         for (size, expected) in [
-            (egui::vec2(420.0, 800.0), crate::ui_layout::WidthClass::Compact),
-            (egui::vec2(800.0, 800.0), crate::ui_layout::WidthClass::Medium),
-            (egui::vec2(1400.0, 900.0), crate::ui_layout::WidthClass::Expanded),
+            (
+                egui::vec2(420.0, 800.0),
+                crate::ui_layout::WidthClass::Compact,
+            ),
+            (
+                egui::vec2(800.0, 800.0),
+                crate::ui_layout::WidthClass::Medium,
+            ),
+            (
+                egui::vec2(1400.0, 900.0),
+                crate::ui_layout::WidthClass::Expanded,
+            ),
         ] {
             let mut h = InputHarness::with_screen(size);
             assert_eq!(
@@ -3424,7 +3471,11 @@ mod tests {
         assert_eq!(inset.left() - bare.left(), LEFT, "left inset ignored");
         assert_eq!(bare.right() - inset.right(), RIGHT, "right inset ignored");
         assert_eq!(inset.top() - bare.top(), TOP, "top inset ignored");
-        assert_eq!(bare.bottom() - inset.bottom(), BOTTOM, "bottom inset ignored");
+        assert_eq!(
+            bare.bottom() - inset.bottom(),
+            BOTTOM,
+            "bottom inset ignored"
+        );
 
         // The hamburger is positioned from `content_rect` too, so it must have
         // moved clear of the notch rather than staying in the screen corner.
@@ -3525,7 +3576,8 @@ mod tests {
             roomy_bar.scan_text
         );
         assert!(
-            roomy_bar.scan_text.contains("2 products") && roomy_bar.scan_text.contains("2026-07-24"),
+            roomy_bar.scan_text.contains("2 products")
+                && roomy_bar.scan_text.contains("2026-07-24"),
             "the roomy bar dropped the long scan summary: {:?}",
             roomy_bar.scan_text
         );
@@ -3591,11 +3643,10 @@ mod tests {
         // Loop playback draws one of `loop_state`'s frames instead, chosen by
         // the animation, so the static render's age would be a caption on
         // someone else's picture.
-        h.gui_mut().pane_mut(0).unwrap().loop_state =
-            crate::pane::LoopPlaybackState::new_for_loop(
-                600,
-                rustdar_radar::sites::get_radar_site("KTLX").unwrap(),
-            );
+        h.gui_mut().pane_mut(0).unwrap().loop_state = crate::pane::LoopPlaybackState::new_for_loop(
+            600,
+            rustdar_radar::sites::get_radar_site("KTLX").unwrap(),
+        );
         h.warm_up();
         assert_eq!(
             h.status_bar().product_age_text,
@@ -3620,7 +3671,9 @@ mod tests {
 
         let bar = h.status_bar();
         assert_eq!(
-            bar.product_age_text.as_deref().map(|t| t.contains("(26h 5m old)")),
+            bar.product_age_text
+                .as_deref()
+                .map(|t| t.contains("(26h 5m old)")),
             Some(true),
             "a 26-hour-old product must read in hours, got {:?}",
             bar.product_age_text
@@ -3709,14 +3762,19 @@ mod tests {
             "fixture must actually reach the render path — no RenderOverlay was emitted"
         );
         assert!(
-            unclamped.iter().any(|p| p.width > LIMIT || p.height > LIMIT),
+            unclamped
+                .iter()
+                .any(|p| p.width > LIMIT || p.height > LIMIT),
             "fixture must cross the limit before it is imposed, else the clamp is never \
              exercised; got {unclamped:?}"
         );
 
         h.set_max_texture_side(LIMIT as usize);
         let clamped = requested_plans(&h);
-        assert!(!clamped.is_empty(), "still expected a render request after clamping");
+        assert!(
+            !clamped.is_empty(),
+            "still expected a render request after clamping"
+        );
         for plan in &clamped {
             assert!(
                 plan.width <= LIMIT && plan.height <= LIMIT,
@@ -3770,9 +3828,7 @@ mod tests {
         h.last_actions()
             .iter()
             .filter_map(|a| match a {
-                GuiAction::SwitchRadarSite { site, pane_idx } => {
-                    Some((site.clone(), *pane_idx))
-                }
+                GuiAction::SwitchRadarSite { site, pane_idx } => Some((site.clone(), *pane_idx)),
                 _ => None,
             })
             .collect()
@@ -3910,7 +3966,10 @@ mod tests {
         let on_map = edge - egui::vec2(0.0, 5.0);
         let off_pane = edge + egui::vec2(0.0, 5.0);
         let pane = h.pane_rects()[0];
-        assert!(pane.contains(on_map), "precondition: one click is on the pane");
+        assert!(
+            pane.contains(on_map),
+            "precondition: one click is on the pane"
+        );
         assert!(!pane.contains(off_pane), "precondition: the other is not");
         assert!(
             h.screen_rect().contains(off_pane),
@@ -3982,7 +4041,9 @@ mod tests {
         h.mouse_move(target);
         h.frames_for(3, FRAME_DT);
         assert!(
-            h.painted_text_strings().iter().any(|t| t.contains("KTLX\nLat:")),
+            h.painted_text_strings()
+                .iter()
+                .any(|t| t.contains("KTLX\nLat:")),
             "control: hovering the icon must draw the site readout, or the \
              assertion below passes for free. Painted: {:?}",
             h.painted_text_strings()
@@ -3998,7 +4059,9 @@ mod tests {
         h.mouse_move(target);
         h.frames_for(3, FRAME_DT);
         assert!(
-            !h.painted_text_strings().iter().any(|t| t.contains("KTLX\nLat:")),
+            !h.painted_text_strings()
+                .iter()
+                .any(|t| t.contains("KTLX\nLat:")),
             "the site readout came up through an open dialog: the map is \
              hovering what the dialog is covering"
         );
@@ -4033,10 +4096,9 @@ mod tests {
         );
 
         for dropdown in &drawn {
-            let (options, selected) =
-                h.dropdown_model(&dropdown.label).unwrap_or_else(|| {
-                    panic!("no handler offers a {:?} dropdown", dropdown.label)
-                });
+            let (options, selected) = h
+                .dropdown_model(&dropdown.label)
+                .unwrap_or_else(|| panic!("no handler offers a {:?} dropdown", dropdown.label));
             let expected = options
                 .iter()
                 .find(|(value, _)| *value == selected)
