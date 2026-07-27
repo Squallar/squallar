@@ -4400,6 +4400,45 @@ mod tests {
              every pass, so the assertion it backs is vacuous"
         );
     }
+    /// 36. **A pane born from the pane-count picker inherits the layer state.**
+    ///
+    ///     `PaneState::with_site` starts with empty overlay maps, and
+    ///     `is_overlay_enabled` reads a missing entry as *off* — so a pane the
+    ///     picker adds would draw no overlays at all, Radar included. Layer
+    ///     sync masks this by copying the active pane over the newcomer every
+    ///     frame the layers panel is up, so it runs with sync off.
+    #[test]
+    fn a_pane_added_by_the_picker_still_shows_radar_with_layer_sync_off() {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        assert_eq!(
+            h.width_class(),
+            crate::ui_layout::WidthClass::Expanded,
+            "precondition: the picker only draws where the layers panel is up"
+        );
+        h.set_sync_layers(false);
+        assert!(
+            h.overlay_enabled(OverlayKind::Radar),
+            "precondition: the active pane must have Radar on, or there is no \
+             state for the newcomer to inherit"
+        );
+
+        let two = h
+            .pane_options()
+            .into_iter()
+            .find(|o| o.count == 2)
+            .expect("the picker must offer a 2-pane split on a desktop width");
+        h.mouse_click(two.rect.center());
+        h.frames_for(3, FRAME_DT);
+        assert_eq!(h.pane_count(), 2, "precondition: the click must have split the map");
+        assert!(!h.sync_layers(), "precondition: sync must still be off, or it did the seeding");
+
+        assert!(
+            h.overlay_enabled_on(1, OverlayKind::Radar),
+            "the picker's new pane came up with every overlay off — its empty \
+             `enabled_overlays` was never seeded from the handler state"
+        );
+    }
+
     /// 38. **A hover readout dies with the radar that produced it.**
     ///
     ///     `pane.hover_value` is written only by the radar arm of

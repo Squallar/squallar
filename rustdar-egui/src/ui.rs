@@ -875,6 +875,13 @@ impl Gui {
                         new_pane.scan_info = active_scan_info.clone();
                         self.panes.push(new_pane);
                     }
+                    // A pane born here has empty overlay maps, and
+                    // `is_overlay_enabled` reads a missing entry as *off* — so
+                    // with layer sync disabled it would draw no overlays at
+                    // all, Radar included. Seed it from the handlers, which
+                    // hold the active pane's state (reloaded at the end of
+                    // every frame in `Gui::ui`), the same way startup does.
+                    self.initialize_pane_enabled();
                     self.pane_layout = PaneLayout::for_count(count);
                     if self.active_pane >= count {
                         self.active_pane = 0;
@@ -1414,8 +1421,10 @@ impl Gui {
 
     /// Initialize per-pane `enabled_overlays` from the current handler states.
     ///
-    /// Called after `new()` and after `load_ui_config()` to populate any panes
-    /// whose `enabled_overlays` maps are empty (backward compatibility).
+    /// Called after `new()`, after `load_ui_config()` (backward compatibility
+    /// for configs without per-pane maps), and when the pane-count picker
+    /// grows the vector — anywhere a pane could otherwise be left with an
+    /// empty map that `is_overlay_enabled` reads as everything-off.
     pub fn initialize_pane_enabled(&mut self) {
         let defaults = self.overlays.build_enabled_map();
         let default_configs = self.overlays.save_pane_configs();
