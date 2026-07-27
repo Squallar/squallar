@@ -3,7 +3,7 @@
 use crate::model::{DataLayer, DataPacket, SymbologyBlock};
 use crate::result::Result;
 
-use super::header::{read_i16, read_u16, read_u32};
+use super::header::{checked_end, read_i16, read_u16, read_u32};
 
 /// Decode the Product Symbology Block starting at `offset` in `data`.
 ///
@@ -37,7 +37,7 @@ pub(crate) fn decode_symbology_block(data: &[u8], offset: usize) -> Result<Symbo
         let layer_length = read_u32(data, o)?;
         o += 4;
 
-        let layer_end = o + layer_length as usize;
+        let layer_end = checked_end(data, o, layer_length as usize)?;
         let mut packets = Vec::new();
 
         while o + 2 <= layer_end && o + 2 <= data.len() {
@@ -101,4 +101,27 @@ pub(crate) fn decode_symbology_block(data: &[u8], offset: usize) -> Result<Symbo
         num_layers,
         layers,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-layer block whose declared layer length is `u32::MAX`. Adding
+    /// it to the running offset overflows a 32-bit `usize` (wasm32); on
+    /// 64-bit the truncated packet inside errors first. Either way: an
+    /// error, never a panic.
+    #[test]
+    fn a_layer_length_that_overflows_the_offset_is_an_error() {
+        let mut d = Vec::new();
+        d.extend_from_slice(&(-1i16).to_be_bytes()); // block divider
+        d.extend_from_slice(&1u16.to_be_bytes()); // block id
+        d.extend_from_slice(&16u32.to_be_bytes()); // block length
+        d.extend_from_slice(&1u16.to_be_bytes()); // one layer
+        d.extend_from_slice(&(-1i16).to_be_bytes()); // layer divider
+        d.extend_from_slice(&u32::MAX.to_be_bytes()); // layer length
+        d.extend_from_slice(&16u16.to_be_bytes()); // digital radial packet…
+        // …with nothing after it, so the 64-bit path errors on truncation.
+        assert!(decode_symbology_block(&d, 0).is_err());
+    }
 }

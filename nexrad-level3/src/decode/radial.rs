@@ -3,7 +3,7 @@
 use crate::model::{RadialPacket, RadialRun};
 use crate::result::{Error, Result};
 
-use super::header::{read_i16, read_i32, read_u16, read_u32};
+use super::header::{checked_end, read_i16, read_i32, read_u16, read_u32};
 
 /// Decode a Digital Radial Data Array packet (packet code 16).
 ///
@@ -223,7 +223,7 @@ pub(crate) fn decode_generic_radial_packet(
     let block_length = read_u32(data, o)? as usize;
     o += 4;
 
-    let block_end = o + block_length;
+    let block_end = checked_end(data, o, block_length)?;
 
     // --- XDR Product Description ---
     // Skip: name, description (variable-length strings)
@@ -390,8 +390,18 @@ fn decode_xdr_radial_component(
     // Radial-level parameters
     o = skip_xdr_param_list(data, o)?;
 
-    let num_radials = read_i32(data, o)? as usize;
+    // Real products carry 360–720 radials per sweep; 3600 allows 0.1°
+    // spacing with room to spare. A negative count would sign-extend through
+    // `as usize` into a capacity-overflow panic in `Vec::with_capacity`.
+    const MAX_RADIALS: i32 = 3600;
+    let num_radials_raw = read_i32(data, o)?;
     o += 4;
+    if !(0..=MAX_RADIALS).contains(&num_radials_raw) {
+        return Err(Error::InvalidSymbologyBlock(format!(
+            "XDR radial count {num_radials_raw} outside 0..={MAX_RADIALS}"
+        )));
+    }
+    let num_radials = num_radials_raw as usize;
 
     let mut radials = Vec::with_capacity(num_radials);
     let mut max_bins: u16 = 0;
@@ -420,18 +430,23 @@ fn decode_xdr_radial_component(
             o = skip_xdr_string(data, o)?;
         }
 
-        // Data array: length prefix (i32) + N × i32 values
-        let arr_len = read_i32(data, o)? as usize;
+        // Data array: length prefix (i32) + N × i32 values. A negative
+        // length would wrap `data_end` right past the bounds check below.
+        let arr_len_raw = read_i32(data, o)?;
         o += 4;
+        let arr_len = usize::try_from(arr_len_raw).map_err(|_| {
+            Error::InvalidSymbologyBlock(format!("negative XDR data array length {arr_len_raw}"))
+        })?;
 
-        let data_end = o + arr_len * 4;
-        if data_end > data.len() {
-            return Err(Error::UnexpectedEof {
+        let data_end = arr_len
+            .checked_mul(4)
+            .and_then(|bytes| o.checked_add(bytes))
+            .filter(|&end| end <= data.len())
+            .ok_or(Error::UnexpectedEof {
                 offset: o,
-                expected: arr_len * 4,
+                expected: arr_len.saturating_mul(4),
                 available: data.len().saturating_sub(o),
-            });
-        }
+            })?;
 
         // i32 on the wire, but the values are unsigned shorts.
         let gate_values: Vec<u16> = data[o..data_end]
@@ -480,4 +495,134 @@ fn decode_xdr_radial_component(
         },
         block_end.max(o),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// XDR scalars are all 4-byte big-endian.
+    fn push_i32(d: &mut Vec<u8>, v: i32) {
+        d.extend_from_slice(&v.to_be_bytes());
+    }
+
+    fn push_f32(d: &mut Vec<u8>, v: f32) {
+        d.extend_from_slice(&v.to_bits().to_be_bytes());
+    }
+
+    /// An empty XDR string is just its zero length prefix.
+    fn push_empty_string(d: &mut Vec<u8>) {
+        push_i32(d, 0);
+    }
+
+    /// The packet-28 header and XDR product description leading up to the
+    /// radial component body: empty strings, zeroed scalars, one component
+    /// of code 1 (radial). Bytes appended afterwards land exactly where
+    /// `decode_xdr_radial_component` starts reading.
+    fn xdr_radial_component_prelude() -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&28u16.to_be_bytes()); // packet code
+        d.extend_from_slice(&0u16.to_be_bytes()); // reserved
+        push_i32(&mut d, 0); // block length, patched by `finish`
+        push_empty_string(&mut d); // name
+        push_empty_string(&mut d); // description
+        push_i32(&mut d, 0); // code
+        push_i32(&mut d, 0); // type
+        push_i32(&mut d, 0); // prod_time
+        push_empty_string(&mut d); // radar_name
+        d.extend_from_slice(&[0u8; 48]); // lat .. uncompressed_size
+        push_i32(&mut d, 0); // product parameter count
+        push_i32(&mut d, 0); // parameter list pointer
+        push_i32(&mut d, 1); // number of components
+        push_i32(&mut d, 0); // component pointer
+        push_i32(&mut d, 1); // component code: radial
+        push_empty_string(&mut d); // component description
+        push_f32(&mut d, 1000.0); // gate_width
+        push_f32(&mut d, 0.0); // first_gate
+        push_i32(&mut d, 0); // radial parameter count
+        push_i32(&mut d, 0); // parameter list pointer
+        d
+    }
+
+    /// Patches the block length the packet header declares to match the body.
+    fn finish(mut d: Vec<u8>) -> Vec<u8> {
+        let len = (d.len() - 8) as u32;
+        d[4..8].copy_from_slice(&len.to_be_bytes());
+        d
+    }
+
+    /// -1 read as `i32` and cast straight to `usize` sign-extends to ~2^64,
+    /// and `Vec::with_capacity` on that panics "capacity overflow".
+    #[test]
+    fn a_negative_xdr_radial_count_is_an_error_not_a_capacity_panic() {
+        let mut d = xdr_radial_component_prelude();
+        push_i32(&mut d, -1); // number of radials
+        let r = decode_generic_radial_packet(&finish(d), 0);
+        assert!(matches!(r, Err(Error::InvalidSymbologyBlock(_))), "{r:?}");
+    }
+
+    /// A count that passes the sign check must still be bounded: nothing
+    /// real produces more than a few hundred radials per sweep.
+    #[test]
+    fn an_absurd_xdr_radial_count_is_rejected_before_allocation() {
+        let mut d = xdr_radial_component_prelude();
+        push_i32(&mut d, i32::MAX); // number of radials
+        let r = decode_generic_radial_packet(&finish(d), 0);
+        assert!(matches!(r, Err(Error::InvalidSymbologyBlock(_))), "{r:?}");
+    }
+
+    /// For `arr_len = -1`, the old `arr_len * 4` wrapped in release so
+    /// `data_end` landed 4 bytes *before* the slice start and
+    /// `data[o..data_end]` panicked in both build modes.
+    #[test]
+    fn a_negative_xdr_data_array_length_is_an_error_not_a_slice_panic() {
+        let mut d = xdr_radial_component_prelude();
+        push_i32(&mut d, 1); // one radial
+        push_f32(&mut d, 0.0); // azimuth
+        push_f32(&mut d, 0.0); // elevation
+        push_f32(&mut d, 1.0); // width
+        push_i32(&mut d, 0); // number of bins
+        push_empty_string(&mut d); // attributes
+        push_i32(&mut d, -1); // data array length
+        let r = decode_generic_radial_packet(&finish(d), 0);
+        assert!(matches!(r, Err(Error::InvalidSymbologyBlock(_))), "{r:?}");
+    }
+
+    /// The declared block length feeds `block_end`; `u32::MAX` overflows the
+    /// add on 32-bit targets and merely runs past the buffer on 64-bit —
+    /// either way the decoder must error, not panic.
+    #[test]
+    fn a_block_length_past_the_buffer_is_an_error() {
+        let mut d = xdr_radial_component_prelude();
+        push_i32(&mut d, 1); // one radial, but no radial bytes follow
+        let mut d = finish(d);
+        d[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(decode_generic_radial_packet(&d, 0).is_err());
+    }
+
+    /// The guardrails must not reject a well-formed packet: one radial,
+    /// two gates, decoded end to end.
+    #[test]
+    fn a_well_formed_generic_radial_packet_still_decodes() {
+        let mut d = xdr_radial_component_prelude();
+        push_i32(&mut d, 1); // one radial
+        push_f32(&mut d, 90.0); // azimuth
+        push_f32(&mut d, 0.5); // elevation
+        push_f32(&mut d, 1.0); // width
+        push_i32(&mut d, 2); // number of bins
+        push_empty_string(&mut d); // attributes
+        push_i32(&mut d, 2); // data array length
+        push_i32(&mut d, 7);
+        push_i32(&mut d, 11);
+        let d = finish(d);
+        let (packet, end) = match decode_generic_radial_packet(&d, 0) {
+            Ok(v) => v,
+            Err(e) => panic!("well-formed packet failed to decode: {e}"),
+        };
+        assert_eq!(end, d.len());
+        assert_eq!(packet.radials.len(), 1);
+        assert_eq!(packet.radials[0].gate_values, vec![7, 11]);
+        assert_eq!(packet.radials[0].start_angle, 90.0);
+        assert_eq!(packet.num_range_bins, 2);
+    }
 }

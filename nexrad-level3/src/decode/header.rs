@@ -29,6 +29,18 @@ pub(crate) fn read_i32(data: &[u8], offset: usize) -> Result<i32> {
     Ok(i32::from_be_bytes(read_bytes(data, offset)?))
 }
 
+/// `offset + len`, erroring when the sum overflows `usize` — a declared
+/// length too large to address certainly runs past the end of `data`.
+/// Overflow is reachable on 32-bit targets (wasm32), where a hostile u32
+/// length can exceed the address space.
+pub(crate) fn checked_end(data: &[u8], offset: usize, len: usize) -> Result<usize> {
+    offset.checked_add(len).ok_or(Error::UnexpectedEof {
+        offset,
+        expected: len,
+        available: data.len().saturating_sub(offset),
+    })
+}
+
 /// Decode the 18-byte Message Header; returns it and the offset after it.
 ///
 /// ICD 2620001 Figure 3-3:

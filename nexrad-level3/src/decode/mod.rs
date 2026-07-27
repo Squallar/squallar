@@ -5,7 +5,7 @@ mod radial;
 mod symbology;
 
 use crate::model::{Level3Message, ProductDescriptionBlock};
-use crate::result::Result;
+use crate::result::{Error, Result};
 
 /// Decode a raw Level III product byte stream into a [`Level3Message`].
 ///
@@ -40,8 +40,16 @@ pub fn decode_product(data: &[u8]) -> Result<Level3Message> {
     let data_ref: &[u8] = &data_vec;
 
     let symbology = if pdb.symbology_offset > 0 {
-        // Halfwords, counted from the start of the message header.
-        let sym_byte_offset = pdb.symbology_offset as usize * 2;
+        // Halfwords, counted from the start of the message header. The
+        // doubling can overflow a 32-bit `usize` (wasm32), so it is checked.
+        let sym_byte_offset = (pdb.symbology_offset as usize)
+            .checked_mul(2)
+            .ok_or_else(|| {
+                Error::InvalidProductDescription(format!(
+                    "symbology offset {} halfwords overflows the address space",
+                    pdb.symbology_offset
+                ))
+            })?;
         Some(symbology::decode_symbology_block(
             data_ref,
             sym_byte_offset,
@@ -159,5 +167,23 @@ fn decompress_after_pdb(
             log::debug!("BZ2 decompression failed ({}), using raw data", e);
             Ok(data.to_vec())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal message header + PDB, all zeroes except the symbology
+    /// offset, which is `u32::MAX` halfwords. Doubling it overflows a
+    /// 32-bit `usize` (wasm32); on 64-bit it points far past the buffer.
+    /// Either way: an error, never a panic.
+    #[test]
+    fn a_symbology_offset_that_overflows_when_doubled_is_an_error() {
+        // 18-byte message header + 102-byte PDB.
+        let mut d = vec![0u8; 120];
+        // Symbology offset lives at PDB byte 90, absolute byte 108.
+        d[108..112].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(decode_product(&d).is_err());
     }
 }
