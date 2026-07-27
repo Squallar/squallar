@@ -17,7 +17,9 @@ fn scale_color(scale: ColorScale, value: f32) -> (u8, u8, u8) {
             color = c;
             last_threshold = threshold;
         } else {
-            if gradient && i > 0 && threshold > last_threshold {
+            // A non-finite left stop (e.g. ZDR's NEG_INFINITY floor) would make
+            // `t` NaN; fall through to the flat color instead.
+            if gradient && i > 0 && threshold > last_threshold && last_threshold.is_finite() {
                 let t = (value - last_threshold) / (threshold - last_threshold);
                 return (
                     (color.0 as f32 + (c.0 as f32 - color.0 as f32) * t) as u8,
@@ -32,7 +34,11 @@ fn scale_color(scale: ColorScale, value: f32) -> (u8, u8, u8) {
 }
 
 /// RGBA color for a radar value, in the product's own units.
+/// Non-finite values render transparent for every product.
 pub fn get_color_for_value(product: RadarProduct, value: f32) -> (u8, u8, u8, u8) {
+    if !value.is_finite() {
+        return (0, 0, 0, 0);
+    }
     match product {
         RadarProduct::Reflectivity => {
             if value.is_nan() || value.is_infinite() || value < 0.0 {
@@ -460,6 +466,46 @@ pub fn get_legend_scale(product: RadarProduct) -> LegendScale {
         RadarProduct::NormalizedRotation => {
             // NROT is unitless, so no conversion.
             merge_bidirectional(NROT_ANTICYCLONIC, NROT_CYCLONIC, 1.0)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ZDR's first stop is a NEG_INFINITY floor; interpolating from it would
+    /// make `t = inf/inf = NaN` and every channel would cast to 0. Values
+    /// below the second stop must get the flat first-stop dark gray, not black.
+    #[test]
+    fn zdr_below_the_finite_stops_is_dark_gray_not_black() {
+        let color = get_color_for_value(RadarProduct::DifferentialReflectivity, -5.0);
+        assert_eq!(color, (66, 66, 66, TRANSPARENCY));
+    }
+
+    /// Every product renders non-finite input transparent, including velocity,
+    /// whose inbound branch used to catch NaN and paint it dark green.
+    #[test]
+    fn non_finite_input_is_transparent_for_every_product() {
+        let products = [
+            RadarProduct::Reflectivity,
+            RadarProduct::Velocity,
+            RadarProduct::StormRelativeVelocity,
+            RadarProduct::SpectrumWidth,
+            RadarProduct::DifferentialReflectivity,
+            RadarProduct::CorrelationCoefficient,
+            RadarProduct::DifferentialPhase,
+            RadarProduct::SpecificDifferentialPhase,
+            RadarProduct::NormalizedRotation,
+        ];
+        for product in products {
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                assert_eq!(
+                    get_color_for_value(product, bad),
+                    (0, 0, 0, 0),
+                    "{product:?} should render {bad} transparent"
+                );
+            }
         }
     }
 }
