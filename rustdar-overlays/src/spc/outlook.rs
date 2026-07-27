@@ -1,5 +1,5 @@
-use crate::types::{CIG_FILL_ALPHA, GeoPolygon, HatchPattern, OverlayFeature, REGULAR_FILL_ALPHA};
 use chrono::NaiveDateTime;
+use crate::types::{GeoPolygon, HatchPattern, OverlayFeature, CIG_FILL_ALPHA, REGULAR_FILL_ALPHA};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum OutlookDay {
@@ -48,7 +48,10 @@ impl OutlookDay {
                 OutlookProduct::Wind,
                 OutlookProduct::Hail,
             ],
-            OutlookDay::Day3 => &[OutlookProduct::Categorical, OutlookProduct::Probabilistic],
+            OutlookDay::Day3 => &[
+                OutlookProduct::Categorical,
+                OutlookProduct::Probabilistic,
+            ],
             _ => &[OutlookProduct::Probabilistic],
         }
     }
@@ -182,14 +185,20 @@ pub fn parse_geojson(
     let mut expire: Option<NaiveDateTime> = None;
 
     for feature_val in features_array {
-        let ParsedOutlookFeature {
-            feature,
-            valid: feat_valid,
-            expire: feat_expire,
-        } = match parse_outlook_feature(feature_val)? {
-            Some(result) => result,
-            None => continue,
-        };
+        // One malformed feature must not blank the whole product: SPC has
+        // shipped single degenerate polygons (every ring under 3 points), and
+        // propagating the error here turned one of them into an empty outlook.
+        // Skip-and-warn, mirroring `nws::alert::parse_alerts`; `Err` is
+        // reserved for an unusable envelope (bad JSON, no `features` array).
+        let ParsedOutlookFeature { feature, valid: feat_valid, expire: feat_expire } =
+            match parse_outlook_feature(feature_val) {
+                Ok(Some(result)) => result,
+                Ok(None) => continue,
+                Err(e) => {
+                    log::warn!("SPC {day} {product}: skipping malformed feature: {e}");
+                    continue;
+                }
+            };
         if valid.is_none() {
             valid = feat_valid;
         }
@@ -252,11 +261,7 @@ fn parse_outlook_feature(
         _ => HatchPattern::None,
     };
 
-    let fill_alpha = if hatch != HatchPattern::None {
-        CIG_FILL_ALPHA
-    } else {
-        REGULAR_FILL_ALPHA
-    };
+    let fill_alpha = if hatch != HatchPattern::None { CIG_FILL_ALPHA } else { REGULAR_FILL_ALPHA };
     let fill_rgba = super::colors::parse_hex_color(fill_hex, fill_alpha);
     let stroke_rgba = super::colors::parse_hex_color(stroke_hex, 255);
 
@@ -273,7 +278,10 @@ fn parse_outlook_feature(
         .get("geometry")
         .ok_or_else(|| "Feature missing 'geometry'".to_string())?;
 
-    let geo_type = geometry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let geo_type = geometry
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     let mut polygons = match geo_type {
         "MultiPolygon" => parse_multi_polygon(geometry)?,
@@ -302,11 +310,7 @@ fn parse_outlook_feature(
     }
 
     let feature = OverlayFeature::new(polygons, fill_rgba, stroke_rgba, label, label2, hatch);
-    Ok(Some(ParsedOutlookFeature {
-        feature,
-        valid,
-        expire,
-    }))
+    Ok(Some(ParsedOutlookFeature { feature, valid, expire }))
 }
 
 /// GeoJSON is `[lon, lat]`; output is `(lat, lon)`.
@@ -331,4 +335,65 @@ fn parse_polygon(geometry: &serde_json::Value) -> Result<GeoPolygon, String> {
         .ok_or_else(|| "Polygon missing 'coordinates'".to_string())?;
     crate::types::parse_polygon_coords(coords)
         .ok_or_else(|| "Invalid polygon coordinates".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A feature in the feed's own shape (see [`parse_geojson`]), with the
+    /// given label and MultiPolygon rings.
+    fn feature(label: &str, rings: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "properties": {
+                "LABEL": label,
+                "LABEL2": "Slight Risk",
+                "fill": "#FFE066",
+                "stroke": "#DDAA00",
+                "VALID": "202603062000",
+                "EXPIRE": "202603071200"
+            },
+            "geometry": { "type": "MultiPolygon", "coordinates": rings }
+        })
+    }
+
+    /// One degenerate polygon in SPC's feed must not blank the whole product.
+    /// The degenerate feature comes *first*, so a propagating `?` would abort
+    /// before ever reaching the good one.
+    #[test]
+    fn a_degenerate_feature_is_skipped_and_the_good_ones_survive() {
+        // Every ring under 3 points: `parse_polygon_coords` rejects it and
+        // `parse_multi_polygon` turns that into an error.
+        let degenerate = feature(
+            "MRGL",
+            serde_json::json!([[[[-100.0, 30.0], [-99.0, 30.0]]]]),
+        );
+        let good = feature(
+            "SLGT",
+            serde_json::json!([[[
+                [-100.0, 30.0], [-95.0, 30.0], [-95.0, 35.0],
+                [-100.0, 35.0], [-100.0, 30.0]
+            ]]]),
+        );
+        let json = serde_json::json!({ "features": [degenerate, good] });
+
+        let outlook = parse_geojson(&json, OutlookDay::Day1, OutlookProduct::Categorical)
+            .expect("one bad feature must not abort the whole outlook");
+
+        assert_eq!(outlook.features.len(), 1, "the good feature survives, the bad one is dropped");
+        assert_eq!(outlook.features[0].label, "SLGT");
+        // VALID/EXPIRE still come from the surviving feature.
+        assert!(outlook.valid.is_some() && outlook.expire.is_some());
+    }
+
+    /// The counterpart: `Err` stays reserved for an unusable envelope. A feed
+    /// with no `features` array has nothing salvageable to skip past.
+    #[test]
+    fn a_missing_features_array_is_still_a_hard_error() {
+        let json = serde_json::json!({ "type": "FeatureCollection" });
+        assert!(
+            parse_geojson(&json, OutlookDay::Day1, OutlookProduct::Categorical).is_err(),
+            "an envelope without features is a broken product, not an empty one"
+        );
+    }
 }
