@@ -23,7 +23,7 @@ rustdar-egui/src/ui_map_pane.rs	880	463
 rustdar-egui/src/ui_menu.rs	266	235
 rustdar-egui/src/ui_popups.rs	146	4
 rustdar-egui/src/ui_settings.rs	195	157
-rustdar-frontend/src/app.rs	657	468
+rustdar-frontend/src/app.rs	764	562
 rustdar-frontend/src/app_fetch.rs	701	233
 rustdar-frontend/src/app_render.rs	1314	699
 rustdar-frontend/src/app_state.rs	82	0
@@ -34,8 +34,8 @@ rustdar-frontend/src/input.rs	125	114
 rustdar-frontend/src/loop_downloads.rs	142	133
 rustdar-frontend/src/mobile_cfg.rs	19	19
 rustdar-frontend/src/offload.rs	6	0
-rustdar-frontend/src/platform.rs	120	99
-rustdar-frontend/src/platform_double.rs	122	113
+rustdar-frontend/src/platform.rs	124	99
+rustdar-frontend/src/platform_double.rs	135	123
 rustdar-frontend/src/render_dispatch.rs	848	729
 rustdar-gps/src/config.rs	28	19
 rustdar-gps/src/nmea_parser.rs	49	0
@@ -92,7 +92,7 @@ rustdar-radar/src/render.rs	847	728
 rustdar-radar/src/scan.rs	212	6
 rustdar-radar/src/sites.rs	10	10
 rustdar-radar/src/sources.rs	131	128
-rustdar-radar/src/srm.rs	1123	699
+rustdar-radar/src/srm.rs	1267	735
 rustdar-radar/src/tls.rs	173	153
 rustdar-radar/src/types.rs	233	65
 rustdar-units/src/distance.rs	21	7
