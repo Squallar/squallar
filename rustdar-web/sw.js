@@ -411,6 +411,11 @@ async function shellCacheForClient(clientId) {
  * be published.
  */
 async function installShell(token, name = shellCacheName(token)) {
+  // A rollback re-issues a token this worker has installed before, so `name`
+  // can already exist — and can be the very generation a live client is pinned
+  // to, retained through every purge because of that pin. Note which case this
+  // is before `caches.open` creates the cache and erases the distinction.
+  const preExisting = await caches.has(name);
   const cache = await caches.open(name);
   /*
    * `no-cache`, not `reload`. Both bypass a stale `max-age` (Pages serves
@@ -431,11 +436,15 @@ async function installShell(token, name = shellCacheName(token)) {
   try {
     await cache.addAll(SHELL_URLS.map((u) => new Request(u, { cache: "no-cache" })));
   } catch (e) {
-    // `addAll` writes nothing when it rejects, but `caches.open` above already
-    // created the cache. Left behind, `openShellCache` would treat it as a real
-    // generation and a later install under the same token would find it
-    // pre-existing.
-    await caches.delete(name);
+    // `addAll` writes nothing when it rejects, so `name` now holds exactly what
+    // it held before the call. For a cache this install created, that is the
+    // empty husk `caches.open` above manufactured: left behind, `openShellCache`
+    // would treat it as a real generation and a later install under the same
+    // token would find it pre-existing. For a cache that predated this install
+    // — a rollback — it is a complete shell, possibly the one a pinned page is
+    // mid-load in, and deleting it would be this installer causing the exact
+    // mixed shell the pinning exists to prevent. Delete only what was created.
+    if (!preExisting) await caches.delete(name);
     throw e;
   }
   await writeMeta({ token, cacheName: name, installedAt: Date.now() });

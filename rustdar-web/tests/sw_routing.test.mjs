@@ -620,6 +620,36 @@ describe("install: a shell is published whole or not at all", () => {
     );
   });
 
+  it("keeps a pinned generation intact when a rollback's install fails", async () => {
+    // A rollback re-issues a token seen before, so the install opens the very
+    // cache a live client is pinned to — the one every purge spared because of
+    // that pin. If the download then fails, deleting "the" cache by name would
+    // destroy the in-use generation: the installer manufacturing the mixed
+    // shell the pinning exists to prevent.
+    const worker = await bootWorker({ tag: "A" });
+    const client = worker.addClient();
+    await worker.fetch(worker.navigation(ORIGIN), { resultingClientId: client.id });
+
+    // Deploy B lands and installs; the client stays pinned to generation A.
+    publishDeploy(worker.network, ORIGIN, "B");
+    await worker.message({ type: "rustdar:check-update" });
+
+    // The deploy is rolled back to A, but the re-download fails halfway.
+    publishDeploy(worker.network, ORIGIN, "A");
+    worker.network.serve(shellUrl("icons/icon-512.png"), new Response("gone", { status: 500 }));
+    await worker.message({ type: "rustdar:check-update" });
+
+    // The pinned page's wasm request must still be answerable from A.
+    const wasm = await worker.fetch(new Request(shellUrl("pkg/rustdar_web_bg.wasm")), {
+      clientId: client.id,
+    });
+    assert.equal(
+      await (await wasm.response).text(),
+      "pkg/rustdar_web_bg.wasm::A",
+      "the failed rollback install deleted the generation this page was loading from",
+    );
+  });
+
   it("does not announce the first install as an update", async () => {
     const network = new Network();
     publishDeploy(network, ORIGIN, "A");
