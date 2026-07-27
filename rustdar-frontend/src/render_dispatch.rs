@@ -1856,7 +1856,10 @@ mod render_invalidation_tests {
     /// render is *running*, and a render of nothing would routinely finish before
     /// the reset landed, so the test would pass on timing rather than on the
     /// abandonment.
-    fn gated_render() -> (mpsc::Sender<()>, impl FnOnce() -> RenderOutput + Send + 'static) {
+    fn gated_render() -> (
+        mpsc::Sender<()>,
+        impl FnOnce() -> RenderOutput + Send + 'static,
+    ) {
         let (release, held) = mpsc::channel::<()>();
         (release, move || {
             held.recv().expect("every gated render is released");
@@ -1890,7 +1893,10 @@ mod render_invalidation_tests {
 
     /// How many renders were not abandoned. Ends when the last worker drops its
     /// sender, so nothing here waits on a timeout.
-    fn arrivals(results: mpsc::Sender<RenderResponse>, rx: mpsc::Receiver<RenderResponse>) -> usize {
+    fn arrivals(
+        results: mpsc::Sender<RenderResponse>,
+        rx: mpsc::Receiver<RenderResponse>,
+    ) -> usize {
         drop(results);
         rx.iter().count()
     }

@@ -590,7 +590,10 @@ impl super::App {
                 }
                 Err(e) => {
                     log::error!("Loop scan listing failed for {}: {:?}", site, e);
-                    // Send empty list so UI can show error state
+                    // An empty list is how a failed listing reaches the pane:
+                    // `accept_scan_listing` switches the loop back off, so the pane
+                    // returns to its static image rather than sitting in `Rendering`
+                    // with nothing to render and nothing outstanding to change that.
                     crate::channels::LoopScanListResponse {
                         pane_idx,
                         site,
