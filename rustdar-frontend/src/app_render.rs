@@ -306,111 +306,115 @@ impl super::App {
     }
 
     /// Poll for completed Level III fetch results and update scan info.
+    ///
+    /// Drains, like every sibling poller. One Level II scan spawns a fetch per
+    /// Level III product *and tilt code* — a dozen and more, all landing within
+    /// a few hundred milliseconds of each other — so taking one per frame turned
+    /// the product picker into a list that fills in one entry per redraw, and
+    /// stalled outright on the frame where no redraw follows.
     fn poll_level3_results(&mut self) {
-        let Ok(l3_resp) = self.channels.level3_receiver.try_recv() else {
-            return;
-        };
-
-        if self
-            .render
-            .is_fetch_stale(&l3_resp.site, l3_resp.generation)
-        {
-            log::debug!(
-                "Discarding stale Level III result for {} (gen {})",
-                l3_resp.site,
-                l3_resp.generation
-            );
-            return;
-        }
-
-        let fetched = match l3_resp.result {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!("Level III {:?} fetch failed: {}", l3_resp.product, e);
-                return;
-            }
-        };
-
-        let elevation = fetched.message.pdb.elevation_angle();
-        // The age is logged, not just carried: `latest_key` falls back to the
-        // previous UTC day, so a site down since yesterday delivers a product
-        // up to ~48 h old and this is currently the only place that says so.
-        // Surfacing it in the pane is what remains — see `ProductStamp`.
-        log::info!(
-            "Level III {:?} {} fetched successfully (elevation={:.1}°, key={}, age={:?} min)",
-            l3_resp.product,
-            l3_resp.tilt_code,
-            elevation,
-            fetched.stamp.key,
-            fetched
-                .age(chrono::Utc::now().naive_utc())
-                .map(|a| a.num_minutes()),
-        );
-        self.render.cache_level3(
-            l3_resp.product,
-            l3_resp.tilt_code.clone(),
-            l3_resp.site.clone(),
-            fetched,
-        );
-
-        // Trigger a re-render for panes on the same site viewing this product
-        for (idx, prs) in self.render.pane_render.iter_mut().enumerate() {
-            let pane_matches_site = self.gui.pane(idx).is_some_and(|p| p.site == l3_resp.site);
-            if pane_matches_site
-                && self.gui.get_rendering_params_for_pane(idx).map(|(p, _)| p)
-                    == Some(l3_resp.product)
+        while let Ok(l3_resp) = self.channels.level3_receiver.try_recv() {
+            if self
+                .render
+                .is_fetch_stale(&l3_resp.site, l3_resp.generation)
             {
-                prs.last_rendered = None;
-            }
-        }
-
-        // Add Level III products to the scan info for panes on this site
-        for pane_idx in 0..self.gui.pane_count() {
-            let pane_site = self
-                .gui
-                .pane(pane_idx)
-                .map(|p| p.site.clone())
-                .unwrap_or_default();
-            if pane_site != l3_resp.site {
-                continue;
-            }
-            let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
-                continue;
-            };
-            let mut info = scan_info.clone();
-            let mut changed = false;
-            if !info.available_products.contains(&l3_resp.product) {
-                info.available_products.push(l3_resp.product);
-                info.available_products.sort_by_key(|p| p.sort_order());
-                info.status = format!(
-                    "Loaded {} products: {}",
-                    info.available_products.len(),
-                    info.available_products
-                        .iter()
-                        .map(|p| p.name())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                log::debug!(
+                    "Discarding stale Level III result for {} (gen {})",
+                    l3_resp.site,
+                    l3_resp.generation
                 );
-                changed = true;
+                continue;
             }
-            // Register the actual elevation angle from the PDB.
-            //
-            // `render_dispatch::is_renderable_tilt` is *not* applied here, so
-            // `N0S` — fetched for its storm motion vector alone and never drawn
-            // — does register an SRM elevation. That is harmless only by
-            // coincidence: `N0S` and `N0G` are both 0.5°, so the dedupe just
-            // below collapses them and the picker gains no entry it cannot
-            // render. A vector source at an angle no tilt product shares would
-            // put a dead entry in the elevation list, selectable and blank.
-            let elevations = info.product_elevations.entry(l3_resp.product).or_default();
-            let rounded_elev = (elevation * 10.0).round() / 10.0;
-            if !elevations.iter().any(|e| (e - rounded_elev).abs() < 0.05) {
-                elevations.push(rounded_elev);
-                elevations.sort_by(|a, b| a.total_cmp(b));
-                changed = true;
+
+            let fetched = match l3_resp.result {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("Level III {:?} fetch failed: {}", l3_resp.product, e);
+                    continue;
+                }
+            };
+
+            let elevation = fetched.message.pdb.elevation_angle();
+            // The age is logged, not just carried: `latest_key` falls back to the
+            // previous UTC day, so a site down since yesterday delivers a product
+            // up to ~48 h old and this is currently the only place that says so.
+            // Surfacing it in the pane is what remains — see `ProductStamp`.
+            log::info!(
+                "Level III {:?} {} fetched successfully (elevation={:.1}°, key={}, age={:?} min)",
+                l3_resp.product,
+                l3_resp.tilt_code,
+                elevation,
+                fetched.stamp.key,
+                fetched
+                    .age(chrono::Utc::now().naive_utc())
+                    .map(|a| a.num_minutes()),
+            );
+            self.render.cache_level3(
+                l3_resp.product,
+                l3_resp.tilt_code.clone(),
+                l3_resp.site.clone(),
+                fetched,
+            );
+
+            // Trigger a re-render for panes on the same site viewing this product
+            for (idx, prs) in self.render.pane_render.iter_mut().enumerate() {
+                let pane_matches_site = self.gui.pane(idx).is_some_and(|p| p.site == l3_resp.site);
+                if pane_matches_site
+                    && self.gui.get_rendering_params_for_pane(idx).map(|(p, _)| p)
+                        == Some(l3_resp.product)
+                {
+                    prs.last_rendered = None;
+                }
             }
-            if changed {
-                self.gui.set_scan_info_for_pane(pane_idx, info);
+
+            // Add Level III products to the scan info for panes on this site
+            for pane_idx in 0..self.gui.pane_count() {
+                let pane_site = self
+                    .gui
+                    .pane(pane_idx)
+                    .map(|p| p.site.clone())
+                    .unwrap_or_default();
+                if pane_site != l3_resp.site {
+                    continue;
+                }
+                let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
+                    continue;
+                };
+                let mut info = scan_info.clone();
+                let mut changed = false;
+                if !info.available_products.contains(&l3_resp.product) {
+                    info.available_products.push(l3_resp.product);
+                    info.available_products.sort_by_key(|p| p.sort_order());
+                    info.status = format!(
+                        "Loaded {} products: {}",
+                        info.available_products.len(),
+                        info.available_products
+                            .iter()
+                            .map(|p| p.name())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    changed = true;
+                }
+                // Register the actual elevation angle from the PDB.
+                //
+                // `render_dispatch::is_renderable_tilt` is *not* applied here, so
+                // `N0S` — fetched for its storm motion vector alone and never drawn
+                // — does register an SRM elevation. That is harmless only by
+                // coincidence: `N0S` and `N0G` are both 0.5°, so the dedupe just
+                // below collapses them and the picker gains no entry it cannot
+                // render. A vector source at an angle no tilt product shares would
+                // put a dead entry in the elevation list, selectable and blank.
+                let elevations = info.product_elevations.entry(l3_resp.product).or_default();
+                let rounded_elev = (elevation * 10.0).round() / 10.0;
+                if !elevations.iter().any(|e| (e - rounded_elev).abs() < 0.05) {
+                    elevations.push(rounded_elev);
+                    elevations.sort_by(|a, b| a.total_cmp(b));
+                    changed = true;
+                }
+                if changed {
+                    self.gui.set_scan_info_for_pane(pane_idx, info);
+                }
             }
         }
     }
@@ -2408,7 +2412,7 @@ mod stamping_tests {
     use rustdar_radar::types::{RadarProduct, ScanInfo};
 
     /// A radar whose Level III objects the pane below is showing.
-    const SITE: &str = "KMPX";
+    pub(super) const SITE: &str = "KMPX";
     /// The product carried through: Level III, and not the storm-relative one,
     /// whose tilt filter would need a symbology block to pass.
     const PRODUCT: RadarProduct = RadarProduct::EchoTops;
@@ -2416,7 +2420,7 @@ mod stamping_tests {
     /// The smallest Level III object `nearest_tilt` will consider: it reads the
     /// elevation off the PDB and nothing else, and `is_renderable_tilt` waves
     /// through everything that is not storm-relative velocity.
-    fn tilt(elevation_tenths: i16, key: &str) -> Level3Product {
+    pub(super) fn tilt(elevation_tenths: i16, key: &str) -> Level3Product {
         Level3Product {
             message: Level3Message {
                 header: MessageHeader {
@@ -2476,7 +2480,7 @@ mod stamping_tests {
     /// An `App` with one pane on [`SITE`], far enough along that
     /// `apply_render_to_pane` will not bail out of it: the pane needs scan info
     /// for the site coordinates and the dispatcher needs a slot for the pane.
-    fn app_showing_site() -> crate::app::App {
+    pub(super) fn app_showing_site() -> crate::app::App {
         let mut app = crate::app::tests::headless(TestBridge::desktop());
         let site = rustdar_radar::sites::get_radar_site(SITE)
             .expect("KMPX is a real radar")
@@ -2575,6 +2579,74 @@ mod stamping_tests {
             None,
             "a Level II volume is still captioned with the last Level III \
              object's age",
+        );
+    }
+}
+
+/// What `poll_level3_results` does with a channel holding more than one answer.
+///
+/// Built on `stamping_tests`' fixtures: an `App` with one pane on a real radar,
+/// and the smallest Level III object the pipeline will accept.
+#[cfg(test)]
+mod level3_poll_tests {
+    use super::stamping_tests::{SITE, app_showing_site, tilt};
+    use rustdar_radar::types::RadarProduct;
+
+    /// A finished fetch of `product`, as `spawn_level3_fetches` produces one.
+    ///
+    /// Generation 0 is what a site nothing has re-fetched carries, so nothing
+    /// here is discarded as stale. The object is the same for both: what a
+    /// response is *of* is decided by the `product` beside it, not by the
+    /// message's own code.
+    fn landed(product: RadarProduct, tilt_code: &str) -> crate::channels::Level3Response {
+        crate::channels::Level3Response {
+            generation: 0,
+            product,
+            tilt_code: tilt_code.to_string(),
+            site: SITE.to_string(),
+            result: Ok(tilt(5, "MPX_EET_2026_07_26_01_55_52")),
+        }
+    }
+
+    /// Every Level III result queued for a frame is taken in it.
+    ///
+    /// One Level II scan spawns a fetch per Level III product *and* tilt code —
+    /// a dozen and more — and they land in a burst. Taking one per frame filled
+    /// the product picker an entry per redraw, and stopped filling it at all on
+    /// the frame after which nothing schedules another: `handle_redraw` re-arms
+    /// only for a render in flight, auto-poll, or an active loop, and a pane
+    /// sitting on a finished scan is none of those.
+    #[test]
+    fn every_queued_level3_result_is_taken_in_the_frame_it_arrives_in() {
+        let mut app = app_showing_site();
+        for resp in [
+            landed(RadarProduct::VerticallyIntegratedLiquid, "DVL"),
+            landed(RadarProduct::PrecipitationRate, "DPR"),
+        ] {
+            app.channels.level3_sender.send(resp).unwrap();
+        }
+
+        app.poll_level3_results();
+
+        let products = app
+            .gui
+            .get_scan_info_for_pane(0)
+            .expect("the pane still has its scan info")
+            .available_products
+            .clone();
+        for product in [
+            RadarProduct::VerticallyIntegratedLiquid,
+            RadarProduct::PrecipitationRate,
+        ] {
+            assert!(
+                products.contains(&product),
+                "{product:?} never reached the picker, so the rest of the burst \
+                 is still sitting in the channel: {products:?}",
+            );
+        }
+        assert!(
+            app.channels.level3_receiver.try_recv().is_err(),
+            "the frame ended with a Level III result still queued",
         );
     }
 }
