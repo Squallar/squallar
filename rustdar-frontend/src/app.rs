@@ -615,8 +615,16 @@ impl App {
 
     /// Poll all data channels for completed async results (scan, overlays).
     fn poll_data_channels(&mut self) {
-        // Check for received scan data (with generation check)
-        if let Ok(scan_resp) = self.channels.scan_receiver.try_recv() {
+        // Every queued scan result, not one per frame (with generation check).
+        //
+        // Responses arrive in batches — auto-poll sends one `CheckForNewScans`
+        // per live site, and two quick navigations queue two — while winit
+        // coalesces the redraws they each ask for into a single
+        // `RedrawRequested`. Taking one per frame therefore strands the rest:
+        // the end-of-frame re-arm in `handle_redraw` only fires for a render in
+        // flight, auto-poll, or an active loop, so a queued response can sit
+        // there until some unrelated OS event wakes the loop.
+        while let Ok(scan_resp) = self.channels.scan_receiver.try_recv() {
             if self
                 .render
                 .is_fetch_stale(&scan_resp.site, scan_resp.generation)
@@ -1823,6 +1831,52 @@ mod tests {
             after,
             "a repeated reading re-rasterised every label; the poller sends \
              one of these every two seconds",
+        );
+    }
+
+    /// Every scan response queued for a frame is spent in it.
+    ///
+    /// They arrive in batches — auto-poll sends one `CheckForNewScans` per live
+    /// site, and two quick navigations queue two — while winit coalesces the
+    /// redraws each of them asks for into one `RedrawRequested`. Taking a single
+    /// response per frame left the rest in the channel with nothing scheduled to
+    /// come back for them: `handle_redraw`'s re-arm only fires for a render in
+    /// flight, auto-poll or an active loop.
+    ///
+    /// The first response here is for a site no pane is showing, so only a drain
+    /// that goes past it reaches the one the pane is waiting on.
+    #[test]
+    fn every_queued_scan_response_is_spent_in_the_frame_it_arrives_in() {
+        let mut app = headless(TestBridge::desktop());
+        {
+            let pane = app.gui.pane_mut(0).unwrap();
+            pane.site = "KTLX".to_string();
+            pane.loading_site = Some("KTLX".to_string());
+        }
+
+        for site in ["KOUN", "KTLX"] {
+            app.channels
+                .scan_sender
+                .send(crate::channels::ScanResponse {
+                    generation: 1,
+                    site: site.to_string(),
+                    result: Err("no data".to_string()),
+                    is_auto_poll: false,
+                })
+                .unwrap();
+        }
+
+        app.poll_data_channels();
+
+        assert_eq!(
+            app.gui.pane(0).unwrap().loading_site,
+            None,
+            "the second response was left in the channel, so the pane holds its \
+             spinner until something unrelated wakes the loop",
+        );
+        assert!(
+            app.channels.scan_receiver.try_recv().is_err(),
+            "the frame ended with a scan response still queued",
         );
     }
 
