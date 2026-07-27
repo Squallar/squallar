@@ -82,8 +82,11 @@ pub fn detect_gps_ports() -> Vec<GpsPortInfo> {
     gps_ports
 }
 
-/// Probe each rate in [`COMMON_BAUDS`] for a line starting with `$`.
-fn detect_baud(port_name: &str) -> Option<u32> {
+/// Probe each rate in [`COMMON_BAUDS`] for a line starting with `$`. Worst
+/// case is tens of seconds of blocking reads, so it runs on the reader thread
+/// and checks the stop signal between reads; `None` on stop is fine — the
+/// caller falls back to a default and [`gps_read_loop`] re-checks immediately.
+fn detect_baud(port_name: &str, stop_rx: &mpsc::Receiver<()>) -> Option<u32> {
     for &baud in COMMON_BAUDS {
         let port = serialport::new(port_name, baud)
             .timeout(Duration::from_millis(1500))
@@ -94,6 +97,9 @@ fn detect_baud(port_name: &str) -> Option<u32> {
         let mut buf = String::new();
 
         for _ in 0..5 {
+            if should_stop(stop_rx) {
+                return None;
+            }
             buf.clear();
             if reader.read_line(&mut buf).is_ok() && buf.starts_with('$') {
                 return Some(baud);
@@ -110,29 +116,31 @@ pub struct SerialGpsReader {
 }
 
 impl SerialGpsReader {
-    /// Auto-detects port and baud where `config` leaves them unset. `None` when
-    /// no port was found — detection failure, not an error.
+    /// Spawns the reader thread and returns it immediately — always `Some`
+    /// today. Port and baud auto-detection (where `config` leaves them unset)
+    /// happens on that thread, not here — probing can block for tens of
+    /// seconds and the caller is the GUI thread — so the reader is returned
+    /// before any port is confirmed; if none ever turns up, the thread keeps
+    /// retrying detection until the reader is dropped.
     pub fn start(config: &GpsConfig, fix_sender: mpsc::Sender<GpsFix>) -> Option<Self> {
-        let port_name = if let Some(ref path) = config.port_path {
-            path.clone()
-        } else {
-            let ports = detect_gps_ports();
-            ports.first()?.port_name.clone()
-        };
-
-        let baud = if config.auto_baud() {
-            detect_baud(&port_name).unwrap_or(9600)
-        } else {
-            config.baud_rate
-        };
+        let configured_port = config.port_path.clone();
+        let auto_baud = config.auto_baud();
+        let configured_baud = config.baud_rate;
 
         let (stop_tx, stop_rx) = mpsc::channel();
-
-        log::info!("Starting GPS reader on {} @ {} baud", port_name, baud);
 
         std::thread::Builder::new()
             .name("gps-serial".into())
             .spawn(move || {
+                let Some(port_name) = resolve_port(configured_port, &stop_rx) else {
+                    return;
+                };
+                let baud = if auto_baud {
+                    detect_baud(&port_name, &stop_rx).unwrap_or(9600)
+                } else {
+                    configured_baud
+                };
+                log::info!("Starting GPS reader on {} @ {} baud", port_name, baud);
                 gps_read_loop(&port_name, baud, &fix_sender, &stop_rx);
             })
             .expect("failed to spawn gps-serial thread");
@@ -143,6 +151,37 @@ impl SerialGpsReader {
     }
 }
 
+/// The configured port when set, otherwise the first detected port — retrying
+/// every 5s so a receiver plugged in after enabling GPS is still picked up.
+/// `None` only when stopped while waiting.
+fn resolve_port(configured: Option<String>, stop_rx: &mpsc::Receiver<()>) -> Option<String> {
+    if let Some(path) = configured {
+        return Some(path);
+    }
+    loop {
+        if let Some(port) = detect_gps_ports().first() {
+            return Some(port.port_name.clone());
+        }
+        log::warn!("No GPS port found. Retrying detection in 5s");
+        // 5s retry, sliced so the stop signal is still seen promptly.
+        for _ in 0..50 {
+            if should_stop(stop_rx) {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// Whether the reader thread must exit: an explicit stop `()` arrived, or the
+/// [`SerialGpsReader`] holding the sender was dropped (`Disconnected`). Only
+/// an empty-but-connected channel means keep running — a bare
+/// `try_recv().is_ok()` would read the drop as "keep going" and leak the
+/// thread, which holds the port open exclusively.
+fn should_stop(stop_rx: &mpsc::Receiver<()>) -> bool {
+    !matches!(stop_rx.try_recv(), Err(mpsc::TryRecvError::Empty))
+}
+
 fn gps_read_loop(
     port_name: &str,
     baud: u32,
@@ -150,7 +189,7 @@ fn gps_read_loop(
     stop_rx: &mpsc::Receiver<()>,
 ) {
     loop {
-        if stop_rx.try_recv().is_ok() {
+        if should_stop(stop_rx) {
             log::info!("GPS reader stopping (signal received)");
             return;
         }
@@ -172,7 +211,7 @@ fn gps_read_loop(
                 );
                 // 5s retry, sliced so the stop signal is still seen promptly.
                 for _ in 0..50 {
-                    if stop_rx.try_recv().is_ok() {
+                    if should_stop(stop_rx) {
                         return;
                     }
                     std::thread::sleep(Duration::from_millis(100));
@@ -186,7 +225,7 @@ fn gps_read_loop(
         let mut line = String::new();
 
         loop {
-            if stop_rx.try_recv().is_ok() {
+            if should_stop(stop_rx) {
                 log::info!("GPS reader stopping (signal received)");
                 return;
             }
@@ -219,10 +258,38 @@ fn gps_read_loop(
 
         // 5s reconnect delay, sliced the same way.
         for _ in 0..50 {
-            if stop_rx.try_recv().is_ok() {
+            if should_stop(stop_rx) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_stop_stays_false_while_the_sender_is_alive_and_silent() {
+        let (_stop_tx, stop_rx) = mpsc::channel::<()>();
+        assert!(!should_stop(&stop_rx));
+    }
+
+    #[test]
+    fn should_stop_fires_on_an_explicit_stop_message() {
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        stop_tx.send(()).unwrap();
+        assert!(should_stop(&stop_rx));
+    }
+
+    /// Dropping [`SerialGpsReader`] drops the sender without ever sending, so
+    /// the thread must read `Disconnected` as stop — a bare `is_ok()` check
+    /// here leaked the thread and kept the port open exclusively forever.
+    #[test]
+    fn should_stop_fires_when_the_sender_is_dropped_without_sending() {
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        drop(stop_tx);
+        assert!(should_stop(&stop_rx));
     }
 }
