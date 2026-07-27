@@ -703,15 +703,17 @@ impl super::App {
 
     /// Jump back to live mode: apply any cached auto-poll scan, or fetch latest.
     fn handle_jump_to_live(&mut self, pane_idx: usize) {
+        // The pane's site decides everything below — which cached scan is applied,
+        // which site the fallback fetch names. A pane that is not there has no
+        // site, and `unwrap_or_default` turned that into `spawn_fetch("")`: a
+        // request for a radar with no code, whose failure the user sees as an
+        // error banner. Nothing to do is the answer.
+        let Some(pane_site) = self.gui.pane(pane_idx).map(|p| p.site.clone()) else {
+            return;
+        };
+
         self.gui.set_viewing_live_for_pane(pane_idx, true);
         self.manual_nav_pending = true;
-
-        // Get the pane's site to check for cached scan
-        let pane_site = self
-            .gui
-            .pane(pane_idx)
-            .map(|p| p.site.clone())
-            .unwrap_or_default();
 
         if let Some((scan_arc, scan_info, timestamp)) = self.latest_cached_scans.remove(&pane_site)
         {
