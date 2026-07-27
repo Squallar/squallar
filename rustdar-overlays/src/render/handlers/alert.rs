@@ -3,12 +3,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::nws::alert::{AlertCategory, NwsAlert};
-use crate::render::controls::{
-    ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext,
-    PaneControlContextMut,
-};
+use crate::render::controls::{ControlButton, ControlEffect, ControlItem, ControlUpdate, ControlValue, PaneControlContext, PaneControlContextMut};
 use crate::render::overlay_state::{
-    ClickableItem, FetchConfig, FetchPayload, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
+    FetchPayload,
+    ClickableItem, FetchConfig, FetchTask, OverlayHandler, OverlayItem, OverlayKind,
     OverlayState, PopupAction, PopupActionKind, PopupContent, PopupSection, RasterizeContext,
     RasterizeFn, RenderMode,
 };
@@ -29,9 +27,7 @@ impl OverlayItem for AlertItem {
 
     fn popup_content(&self, prefs: &rustdar_units::UserPreferences) -> PopupContent {
         let alert = &self.alert;
-        let [r, g, b, _] = alert
-            .features
-            .first()
+        let [r, g, b, _] = alert.features.first()
             .map(|f| f.stroke_rgba)
             .unwrap_or([200, 200, 200, 255]);
 
@@ -44,14 +40,8 @@ impl OverlayItem for AlertItem {
         sections.push(PopupSection::KeyValueGrid(vec![
             ("Areas".into(), alert.area_desc.clone()),
             ("Issued by".into(), alert.sender_name.clone()),
-            (
-                "Effective".into(),
-                prefs.timezone.format_rfc3339(&alert.effective),
-            ),
-            (
-                "Expires".into(),
-                prefs.timezone.format_rfc3339(&alert.expires),
-            ),
+            ("Effective".into(), prefs.timezone.format_rfc3339(&alert.effective)),
+            ("Expires".into(), prefs.timezone.format_rfc3339(&alert.expires)),
         ]));
 
         sections.push(PopupSection::Separator);
@@ -171,9 +161,7 @@ impl OverlayHandler for NwsAlertHandler {
     }
 
     fn clickable_items(&self) -> Vec<ClickableItem> {
-        self.state
-            .data
-            .iter()
+        self.state.data.iter()
             .filter(|item| {
                 self.enabled_categories.contains(&item.alert.category)
                     && !self.hidden_alerts.contains(&item.alert.id)
@@ -227,20 +215,19 @@ impl OverlayHandler for NwsAlertHandler {
             if sel.kind() != OverlayKind::NwsAlerts {
                 return true;
             }
-            self.state
-                .data
-                .iter()
-                .any(|item| item.matches(sel.as_ref()))
+            self.state.data.iter().any(|item| item.matches(sel.as_ref()))
         });
     }
 
-    fn prepare_rasterize(&self, _ctx: &RasterizeContext) -> Option<RasterizeFn> {
+    fn prepare_rasterize(
+        &self,
+        _ctx: &RasterizeContext,
+    ) -> Option<RasterizeFn> {
         if self.state.data.is_empty() {
             return None;
         }
         let alerts: Vec<NwsAlert> = self.state.data.iter().map(|i| i.alert.clone()).collect();
-        let enabled_categories: Vec<AlertCategory> =
-            self.enabled_categories.iter().copied().collect();
+        let enabled_categories: Vec<AlertCategory> = self.enabled_categories.iter().copied().collect();
         let hidden_alerts = self.hidden_alerts.clone();
         Some(Box::new(move |bounds: &GeoBounds, width, height| {
             let rgba = rasterize::rasterize_nws_alerts(
@@ -251,21 +238,23 @@ impl OverlayHandler for NwsAlertHandler {
                 width,
                 height,
             );
-            RasterizeOutput {
-                rgba,
-                hit_map: None,
-            }
+            RasterizeOutput { rgba, hit_map: None }
         }))
     }
 
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
         log::info!("Fetching NWS active alerts");
         let client = ctx.client.clone();
+        let sources = ctx.sources.clone();
         let zone_cache = ctx.zone_cache_dir.clone();
         vec![FetchTask {
             kind: OverlayKind::NwsAlerts,
             future: Box::pin(async move {
-                let result = crate::nws::fetch::fetch_active_alerts(&client, zone_cache.as_deref())
+                let result = crate::nws::fetch::fetch_active_alerts(
+                    &client,
+                    &sources,
+                    zone_cache.as_deref(),
+                )
                     .await
                     .map_err(|e| e.to_string());
                 Box::new(NwsAlertFetchResult(result)) as FetchPayload
@@ -275,9 +264,7 @@ impl OverlayHandler for NwsAlertHandler {
 
     fn controls(&self, _ctx: &PaneControlContext<'_>) -> Vec<ControlItem> {
         let mut items = vec![
-            ControlItem::Heading {
-                text: "\u{26a0}  NWS Alerts".into(),
-            },
+            ControlItem::Heading { text: "\u{26a0}  NWS Alerts".into() },
             ControlItem::Toggle {
                 id: "warnings",
                 label: "\u{26a0}  Warnings".into(),
@@ -305,15 +292,11 @@ impl OverlayHandler for NwsAlertHandler {
                 }],
             });
             if self.state.fetching {
-                items.push(ControlItem::InfoText {
-                    text: "Fetching\u{2026}".into(),
-                });
+                items.push(ControlItem::InfoText { text: "Fetching\u{2026}".into() });
             }
             if self.has_data() {
                 let visible = self.clickable_items().len();
-                items.push(ControlItem::InfoText {
-                    text: format!("{visible} alerts shown"),
-                });
+                items.push(ControlItem::InfoText { text: format!("{visible} alerts shown") });
             }
             if let Some(t) = self.state.fetch_time {
                 let secs = t.elapsed().as_secs();
@@ -329,11 +312,7 @@ impl OverlayHandler for NwsAlertHandler {
         items
     }
 
-    fn apply_control(
-        &mut self,
-        update: &ControlUpdate,
-        _ctx: &mut PaneControlContextMut<'_>,
-    ) -> ControlEffect {
+    fn apply_control(&mut self, update: &ControlUpdate, _ctx: &mut PaneControlContextMut<'_>) -> ControlEffect {
         match update.id {
             "warnings" | "watches" | "advisories" => {
                 let category = match update.id {
@@ -350,8 +329,7 @@ impl OverlayHandler for NwsAlertHandler {
                         self.enabled_categories.remove(&category);
                     }
                     self.state.data_generation = self.state.data_generation.wrapping_add(1);
-                    if !was_enabled && self.is_enabled() && !self.has_data() && !self.state.fetching
-                    {
+                    if !was_enabled && self.is_enabled() && !self.has_data() && !self.state.fetching {
                         return ControlEffect::Fetch;
                     }
                 }
@@ -369,10 +347,7 @@ impl OverlayHandler for NwsAlertHandler {
     }
 
     fn deserialize_state(&mut self, value: serde_json::Value) {
-        if let Some(cats) = value
-            .get("enabled_categories")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-        {
+        if let Some(cats) = value.get("enabled_categories").and_then(|v| serde_json::from_value(v.clone()).ok()) {
             self.enabled_categories = cats;
         }
     }
