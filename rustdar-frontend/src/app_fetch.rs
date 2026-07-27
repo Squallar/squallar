@@ -154,11 +154,7 @@ impl super::App {
     }
 
     fn local_to_utc(timestamp: NaiveDateTime) -> NaiveDateTime {
-        let local_dt = chrono::Local
-            .from_local_datetime(&timestamp)
-            .latest()
-            .unwrap_or_else(chrono::Local::now);
-        local_dt.with_timezone(&chrono::Utc).naive_utc()
+        local_to_utc_in(&chrono::Local, timestamp)
     }
 
     pub(super) fn handle_gui_action(
@@ -271,7 +267,11 @@ impl super::App {
                 );
 
                 let utc_timestamp = Self::local_to_utc(radar_config.timestamp);
-                let current_scan_timestamp = self.gui.get_scan_info().map(|info| info.timestamp);
+                // This site's own current scan. The GUI emits one check per unique
+                // live site, so the active pane's scan time is the wrong "current"
+                // for every other one — see [`latest_scan_time_for_site`].
+                let current_scan_timestamp =
+                    latest_scan_time_for_site(self.gui.panes(), &radar_config.site);
 
                 let generation = self.render.next_fetch_generation(&radar_config.site);
                 let site = radar_config.site.clone();
@@ -314,20 +314,16 @@ impl super::App {
                 new_config.site = site.clone();
                 self.gui.set_radar_config(new_config.clone());
 
-                if self.gui.is_sync_layers() {
-                    // Sync ON: update all panes to the new site
-                    for idx in 0..self.gui.pane_count() {
-                        if let Some(pane) = self.gui.pane_mut(idx) {
-                            pane.loading_site = Some(site.clone());
-                            pane.site = site.clone();
-                            pane.radar_sites_render_gen =
-                                pane.radar_sites_render_gen.wrapping_add(1);
-                            pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new();
-                        }
-                    }
+                // Sync ON moves every pane to the new site; sync OFF only the pane
+                // that asked. That is the whole difference — writing the move out
+                // once per branch invites the two copies to drift.
+                let moving = if self.gui.is_sync_layers() {
+                    0..self.gui.pane_count()
                 } else {
-                    // Sync OFF: only update the target pane
-                    if let Some(pane) = self.gui.pane_mut(pane_idx) {
+                    pane_idx..pane_idx + 1
+                };
+                for idx in moving {
+                    if let Some(pane) = self.gui.pane_mut(idx) {
                         pane.loading_site = Some(site.clone());
                         pane.site = site.clone();
                         pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
@@ -432,7 +428,9 @@ impl super::App {
             return;
         }
 
-        // Mark in-flight on the appropriate texture cache for all target panes
+        // Mark in-flight on the appropriate texture cache for all target panes.
+        // Every path out of here that does not reach an `offload` has to undo this
+        // with `clear_overlay_render_marks` — see it.
         for &pidx in &pane_indices {
             if let Some(pane) = self.gui.pane_mut(pidx) {
                 pane.overlay_cache_mut(kind).render_in_flight = true;
@@ -449,6 +447,7 @@ impl super::App {
         let first_pane_idx = pane_indices[0];
         let pane_configs = {
             let Some(target_pane) = self.gui.pane(first_pane_idx) else {
+                self.clear_overlay_render_marks(&pane_indices, kind);
                 return;
             };
             target_pane.overlay_configs.clone()
@@ -475,11 +474,7 @@ impl super::App {
                 };
                 let Some(rasterize_fn) = self.gui.overlays.prepare_rasterize(kind, &rctx) else {
                     // Nothing to render — clear in-flight
-                    for &pidx in &pane_indices {
-                        if let Some(pane) = self.gui.pane_mut(pidx) {
-                            pane.overlay_cache_mut(kind).render_in_flight = false;
-                        }
-                    }
+                    self.clear_overlay_render_marks(&pane_indices, kind);
                     return;
                 };
                 crate::offload::offload("overlay-render", move || {
@@ -500,6 +495,7 @@ impl super::App {
             }
             OverlayKind::RadarSites => {
                 let Some(target_pane) = self.gui.pane(first_pane_idx) else {
+                    self.clear_overlay_render_marks(&pane_indices, kind);
                     return;
                 };
                 let target_site = target_pane.site.clone();
@@ -549,6 +545,26 @@ impl super::App {
                     "spawn_overlay_render called with non-texture kind: {:?}",
                     kind
                 );
+                self.clear_overlay_render_marks(&pane_indices, kind);
+            }
+        }
+    }
+
+    /// Undo the in-flight marks [`spawn_overlay_render`](Self::spawn_overlay_render)
+    /// set on its target panes.
+    ///
+    /// Nothing else clears them. The mark is cleared on arrival of the render
+    /// response, so a dispatch that returns without offloading anything leaves
+    /// every target pane believing a rasterization it will never hear about is
+    /// still running — and a pane in that state never asks for that overlay
+    /// again, so the layer stays blank until something else resets the cache.
+    /// The marks are set for *all* `pane_indices`, so they must be cleared for
+    /// all of them: the early exits below are reached by asking about one pane,
+    /// which used to leave its siblings' marks behind.
+    fn clear_overlay_render_marks(&mut self, pane_indices: &[usize], kind: OverlayKind) {
+        for &pidx in pane_indices {
+            if let Some(pane) = self.gui.pane_mut(pidx) {
+                pane.overlay_cache_mut(kind).render_in_flight = false;
             }
         }
     }
@@ -586,7 +602,10 @@ impl super::App {
                 }
                 Err(e) => {
                     log::error!("Loop scan listing failed for {}: {:?}", site, e);
-                    // Send empty list so UI can show error state
+                    // An empty list is how a failed listing reaches the pane:
+                    // `accept_scan_listing` switches the loop back off, so the pane
+                    // returns to its static image rather than sitting in `Rendering`
+                    // with nothing to render and nothing outstanding to change that.
                     crate::channels::LoopScanListResponse {
                         pane_idx,
                         site,
@@ -684,15 +703,17 @@ impl super::App {
 
     /// Jump back to live mode: apply any cached auto-poll scan, or fetch latest.
     fn handle_jump_to_live(&mut self, pane_idx: usize) {
+        // The pane's site decides everything below — which cached scan is applied,
+        // which site the fallback fetch names. A pane that is not there has no
+        // site, and `unwrap_or_default` turned that into `spawn_fetch("")`: a
+        // request for a radar with no code, whose failure the user sees as an
+        // error banner. Nothing to do is the answer.
+        let Some(pane_site) = self.gui.pane(pane_idx).map(|p| p.site.clone()) else {
+            return;
+        };
+
         self.gui.set_viewing_live_for_pane(pane_idx, true);
         self.manual_nav_pending = true;
-
-        // Get the pane's site to check for cached scan
-        let pane_site = self
-            .gui
-            .pane(pane_idx)
-            .map(|p| p.site.clone())
-            .unwrap_or_default();
 
         if let Some((scan_arc, scan_info, timestamp)) = self.latest_cached_scans.remove(&pane_site)
         {
@@ -894,6 +915,74 @@ impl super::App {
             self.handle_enable_loop(pane_idx, lookback_secs);
         }
     }
+}
+
+/// The UTC instant `timestamp` names as a wall-clock time in `tz`.
+///
+/// Two of the three answers a local time can have are decided here.
+///
+/// An **ambiguous** time — the hour a fall-back transition names twice — resolves
+/// to the later of the two instants. Either is defensible; the later one is the
+/// one nearer to now, which is the one a user stepping backwards through scans
+/// has just come from.
+///
+/// A **nonexistent** time is the hour a spring-forward skips: 02:30 does not
+/// happen on a US transition day, and the time picker and every relative
+/// navigation step can land on it. This used to fall back to `Local::now()`,
+/// which answers a question nobody asked — a request for a scan from the small
+/// hours fetched the current one instead, and the pane silently jumped to live.
+/// Shifting past the gap and re-resolving lands on the instant the clock jumped
+/// to, which is both the nearest time that exists and, since the shift and the
+/// offset change cancel, exactly the instant the requested wall clock would have
+/// named had the transition not happened.
+///
+/// Generic over the zone because `Local` is whatever the machine running the
+/// tests is set to, and a zone with no DST — or one mid-transition — would make
+/// any assertion about the gap either vacuous or flaky.
+fn local_to_utc_in<Tz: TimeZone>(tz: &Tz, timestamp: NaiveDateTime) -> NaiveDateTime {
+    if let Some(resolved) = tz.from_local_datetime(&timestamp).latest() {
+        return resolved.with_timezone(&chrono::Utc).naive_utc();
+    }
+    let past_the_gap = timestamp + chrono::Duration::hours(1);
+    if let Some(resolved) = tz.from_local_datetime(&past_the_gap).latest() {
+        return resolved.with_timezone(&chrono::Utc).naive_utc();
+    }
+    // No zone in the tz database skips more than an hour, so this is unreachable
+    // in practice. Applying the offset in force around then keeps the answer
+    // within an hour of what was asked for, where `now()` was unbounded.
+    use chrono::Offset;
+    let offset = tz.offset_from_utc_datetime(&timestamp).fix();
+    timestamp - chrono::Duration::seconds(offset.local_minus_utc() as i64)
+}
+
+/// The newest scan of `site` any pane is currently showing, or `None` if none is.
+///
+/// This is the "current" an auto-poll compares that site's latest object against:
+/// `scan::check_and_fetch_latest` downloads only when the site's newest scan is
+/// strictly newer. The GUI emits one `CheckForNewScans` per unique **live site**,
+/// so the active pane's scan time answers the question for at most one of them.
+/// Handed to the others it fails both ways round: an active pane newer than a
+/// second site's scan suppresses that site's updates for as long as both stay
+/// live, and an active pane parked on historic data re-downloads the other site's
+/// whole Level II volume — plus five Level III refetches and a re-render — every
+/// poll interval, for a scan that has not changed.
+///
+/// Resolved through each pane's `scan_info`, whose `site` is the site the scan in
+/// hand really came from, rather than through the pane's live `site` field: the
+/// two diverge for as long as a freshly switched pane's new scan takes to land,
+/// and a timestamp read under the wrong site's name is exactly the mismatch this
+/// exists to prevent. During that window this reports `None` for the new site,
+/// which fetches unconditionally — which is what a site with nothing loaded wants.
+fn latest_scan_time_for_site(
+    panes: &[rustdar_egui::pane::PaneState],
+    site: &str,
+) -> Option<NaiveDateTime> {
+    panes
+        .iter()
+        .filter_map(|p| p.scan_info.as_ref())
+        .filter(|info| info.site.name == site)
+        .map(|info| info.timestamp)
+        .max()
 }
 
 /// Convert a renderer RGBA buffer into egui's pixel layout, or `None` if it is not
@@ -1198,6 +1287,64 @@ mod loop_pane_tests {
         );
     }
 
+    /// The defect: auto-poll asked one question per live site but answered every
+    /// one of them with the *active* pane's scan time. With two sites on screen the
+    /// site that was not active either never updated (its latest was older than the
+    /// active pane's, so `check_and_fetch_latest` declined) or was re-downloaded and
+    /// re-rendered in full every poll interval (the active pane was parked on
+    /// historic data, so everything looked new).
+    #[test]
+    fn each_site_is_polled_against_its_own_current_scan() {
+        // Pane 0 is the active one in every path that reaches here, and is the
+        // newer of the two.
+        let panes = [
+            pane_showing(site("KTLX", 35.33, -97.27), ts(25)),
+            pane_showing(site("KOUN", 35.23, -97.46), ts(10)),
+        ];
+
+        assert_eq!(
+            latest_scan_time_for_site(&panes, "KOUN"),
+            Some(ts(10)),
+            "KOUN is polled against KOUN's scan, not the active pane's",
+        );
+        assert_eq!(latest_scan_time_for_site(&panes, "KTLX"), Some(ts(25)));
+        assert_eq!(
+            latest_scan_time_for_site(&panes, "KFWS"),
+            None,
+            "a site nothing is showing has no current scan, so its latest is fetched",
+        );
+    }
+
+    /// The scan's own site decides, not the pane's live `site` field: the two
+    /// diverge for as long as a switched pane's new scan takes to land, and reading
+    /// the pane's field would offer the old site's timestamp as the new site's
+    /// current — suppressing the very fetch the switch is waiting on.
+    #[test]
+    fn a_scans_own_site_decides_which_poll_it_answers() {
+        let panes = [pane_showing(site("KTLX", 35.33, -97.27), ts(10))];
+        assert_eq!(
+            panes[0].site, SWITCHED_TO,
+            "precondition: the pane's live site has already moved"
+        );
+
+        assert_eq!(latest_scan_time_for_site(&panes, "KTLX"), Some(ts(10)));
+        assert_eq!(
+            latest_scan_time_for_site(&panes, SWITCHED_TO),
+            None,
+            "the pane holds no scan of the site it has switched to"
+        );
+    }
+
+    /// Two panes on one site, one stepped back in time: the poll must compare
+    /// against the newest of them, or every interval re-downloads a scan the other
+    /// pane already has.
+    #[test]
+    fn one_sites_current_scan_is_the_newest_pane_showing_it() {
+        let ktlx = || site("KTLX", 35.33, -97.27);
+        let panes = [pane_showing(ktlx(), ts(10)), pane_showing(ktlx(), ts(25))];
+        assert_eq!(latest_scan_time_for_site(&panes, "KTLX"), Some(ts(25)));
+    }
+
     /// Enabling a loop drops the previous listing's undispatched downloads: they
     /// were queued for the loop this call is replacing, and on a site switch they
     /// are another radar's files.
@@ -1350,6 +1497,149 @@ mod loop_pane_tests {
                 .get(panes[0].loop_state.current_frame)
                 .is_some(),
             "and resolve to one, which is what the pane renders through"
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_time_tests {
+    use super::*;
+    use chrono::{FixedOffset, LocalResult, NaiveDate};
+
+    /// US Central in 2024: -6 in winter, -5 in summer, springing forward at
+    /// 2024-03-10 02:00 local and back at 2024-11-03 02:00 local.
+    ///
+    /// Hand-rolled because `Local` is whatever the machine running the tests is
+    /// set to: on a zone without DST every assertion below passes vacuously, and
+    /// on one with it the dates would have to track that zone's rules.
+    #[derive(Clone, Copy, Debug)]
+    struct UsCentral2024;
+
+    const CST: i32 = -6 * 3600;
+    const CDT: i32 = -5 * 3600;
+
+    fn at(month: u32, day: u32, hour: u32, minute: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2024, month, day)
+            .unwrap()
+            .and_hms_opt(hour, minute, 0)
+            .unwrap()
+    }
+
+    fn fixed(seconds: i32) -> FixedOffset {
+        FixedOffset::east_opt(seconds).unwrap()
+    }
+
+    impl chrono::TimeZone for UsCentral2024 {
+        type Offset = FixedOffset;
+
+        fn from_offset(_: &FixedOffset) -> Self {
+            UsCentral2024
+        }
+
+        fn offset_from_local_date(&self, local: &NaiveDate) -> LocalResult<FixedOffset> {
+            self.offset_from_local_datetime(&local.and_hms_opt(0, 0, 0).unwrap())
+        }
+
+        fn offset_from_local_datetime(&self, local: &NaiveDateTime) -> LocalResult<FixedOffset> {
+            if *local < at(3, 10, 2, 0) {
+                LocalResult::Single(fixed(CST))
+            } else if *local < at(3, 10, 3, 0) {
+                // The skipped hour: no instant carries this wall-clock time.
+                LocalResult::None
+            } else if *local < at(11, 3, 1, 0) {
+                LocalResult::Single(fixed(CDT))
+            } else if *local < at(11, 3, 2, 0) {
+                // Named twice, an hour apart.
+                LocalResult::Ambiguous(fixed(CDT), fixed(CST))
+            } else {
+                LocalResult::Single(fixed(CST))
+            }
+        }
+
+        fn offset_from_utc_date(&self, utc: &NaiveDate) -> FixedOffset {
+            self.offset_from_utc_datetime(&utc.and_hms_opt(0, 0, 0).unwrap())
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &NaiveDateTime) -> FixedOffset {
+            if *utc >= at(3, 10, 8, 0) && *utc < at(11, 3, 7, 0) {
+                fixed(CDT)
+            } else {
+                fixed(CST)
+            }
+        }
+    }
+
+    #[test]
+    fn an_ordinary_local_time_converts_by_the_offset_in_force() {
+        assert_eq!(
+            local_to_utc_in(&UsCentral2024, at(1, 15, 9, 30)),
+            at(1, 15, 15, 30),
+            "winter is UTC-6"
+        );
+        assert_eq!(
+            local_to_utc_in(&UsCentral2024, at(7, 15, 9, 30)),
+            at(7, 15, 14, 30),
+            "summer is UTC-5"
+        );
+    }
+
+    /// The defect. 02:30 does not exist on the spring-forward day, and the time
+    /// picker and every relative navigation step can land there. Falling back to
+    /// `now()` answered a question nobody asked: a request for a scan from the
+    /// small hours fetched the current one and the pane jumped to live.
+    #[test]
+    fn a_time_the_clocks_skipped_lands_next_to_itself_not_at_now() {
+        let asked = at(3, 10, 2, 30);
+        assert!(
+            matches!(
+                chrono::TimeZone::offset_from_local_datetime(&UsCentral2024, &asked),
+                LocalResult::None
+            ),
+            "precondition: the fixture really skips this hour"
+        );
+
+        assert_eq!(
+            local_to_utc_in(&UsCentral2024, asked),
+            at(3, 10, 8, 30),
+            "the instant the clock jumped to — which is also where 02:30 would \
+             have fallen had it happened",
+        );
+    }
+
+    /// The whole skipped hour, not just its middle, and the edges either side of
+    /// it are untouched.
+    #[test]
+    fn the_whole_skipped_hour_resolves_within_an_hour_of_itself() {
+        for minute in [0, 1, 30, 59] {
+            let asked = at(3, 10, 2, minute);
+            let resolved = local_to_utc_in(&UsCentral2024, asked);
+            assert_eq!(
+                resolved,
+                at(3, 10, 8, minute),
+                "02:{minute:02} resolved somewhere else entirely"
+            );
+        }
+        assert_eq!(
+            local_to_utc_in(&UsCentral2024, at(3, 10, 1, 59)),
+            at(3, 10, 7, 59),
+            "the minute before the gap is still CST"
+        );
+        assert_eq!(
+            local_to_utc_in(&UsCentral2024, at(3, 10, 3, 0)),
+            at(3, 10, 8, 0),
+            "and the first minute after it is CDT"
+        );
+    }
+
+    /// An hour named twice resolves to the later of the two instants — the one
+    /// nearer to now, which is where a user stepping back through scans has just
+    /// come from.
+    #[test]
+    fn an_hour_the_clocks_repeated_resolves_to_the_second_pass() {
+        assert_eq!(
+            local_to_utc_in(&UsCentral2024, at(11, 3, 1, 30)),
+            at(11, 3, 7, 30),
+            "the first 01:30 is 06:30 UTC, the second 07:30"
         );
     }
 }

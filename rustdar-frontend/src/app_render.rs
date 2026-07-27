@@ -922,7 +922,8 @@ impl super::App {
     }
 
     /// Promote loops from `Rendering` to `Ready` once every frame they intend to
-    /// render has settled, then start playback for the panes that are ready.
+    /// render has settled — or off entirely when none of them can be rendered at
+    /// all — then start playback for the panes that are ready.
     ///
     /// Runs once per frame after dispatch rather than inside the render-response
     /// drain. Several things that settle a batch never produce a render response —
@@ -930,21 +931,28 @@ impl super::App {
     /// render set shifting as the playhead moves — so a loop can be complete with
     /// nothing left to receive. A second pane whose frames are all satisfied by
     /// sibling clones spawns no renders at all, and would never be promoted.
+    ///
+    /// The phase decision itself is [`settle_loop_phase`]; what is left here is the
+    /// state that lives outside the pane, which a loop being switched off has to
+    /// release.
     pub(super) fn update_loop_readiness(&mut self) {
+        let mut abandoned = Vec::new();
         for pidx in 0..self.gui.pane_count() {
             let loop_mgr = &self.loop_mgr;
-            let pane_downloads_done = loop_mgr.is_pane_done(pidx);
             let Some(p) = self.gui.pane_mut(pidx) else {
                 continue;
             };
-            let pls = &mut p.loop_state;
-            if !pls.is_active() || pls.is_render_ready() || pls.frames.is_empty() {
-                continue;
+            if settle_loop_phase(loop_mgr, pidx, &mut p.loop_state, MAX_LOOP_RENDER_BUDGET) {
+                abandoned.push(pidx);
             }
-            let any_rendered = pls.frames.iter().any(|f| f.texture.is_some());
-            let batch_settled = loop_batch_settled(loop_mgr, pls, MAX_LOOP_RENDER_BUDGET);
-            if any_rendered && batch_settled && pane_downloads_done {
-                pls.phase = rustdar_egui::pane::LoopPhase::Ready;
+        }
+        for pidx in abandoned {
+            // The same release `handle_disable_loop` does: the pane is back to
+            // single-frame mode, and clearing `last_rendered` is what makes
+            // `dispatch_pane_renders` put its static image back.
+            self.loop_mgr.remove_pending(pidx);
+            if pidx < self.render.pane_render.len() {
+                self.render.pane_render[pidx].last_rendered = None;
             }
         }
 
@@ -1240,7 +1248,18 @@ impl super::App {
 }
 
 /// Take a scan listing for `site` into `ls`'s frame list, returning the downloads
-/// it now owes — or `None` if this loop is not the one that asked for it.
+/// it now owes.
+///
+/// `None` means there is nothing to download, for one of two reasons:
+/// - This loop is not the one that asked for the listing (see below), and is left
+///   exactly as it was.
+/// - The listing is empty — the site served nothing for the window, or the request
+///   failed and `handle_enable_loop` sent an empty list in its place. There is no
+///   loop to be had, so the loop is switched off and the pane returns to its static
+///   image. The alternative is what this used to do: advance to `Rendering` with
+///   zero frames, where `update_loop_readiness` skips it (no frames),
+///   `any_loop_active` reads false (nothing in flight) and nothing retries — a
+///   pane stuck reading "rendering" for the rest of the session.
 ///
 /// A listing is an uncancellable network round-trip, and a pane's loop is rebuilt
 /// out from under it routinely: by a site switch, by `reinit_active_loops` after a
@@ -1270,6 +1289,12 @@ fn accept_scan_listing(
     scans: Vec<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)>,
 ) -> Option<PendingDownloads> {
     if !ls.is_active() || ls.site != site {
+        return None;
+    }
+
+    if scans.is_empty() {
+        log::warn!("Loop: no {site} scans in the requested window; leaving loop mode");
+        *ls = rustdar_egui::pane::LoopPlaybackState::new();
         return None;
     }
 
@@ -1309,6 +1334,63 @@ fn accept_scan_listing(
         site: site.to_string(),
         queue: VecDeque::from(scans),
     })
+}
+
+/// Move a loop that is still `Rendering` on to whatever its frames have settled
+/// into, returning `true` if the loop was switched off.
+///
+/// Three outcomes, and the third is the one that used to be missing:
+/// - Nothing has settled yet: left alone.
+/// - Something rendered: promoted to `Ready`, and playback starts.
+/// - Nothing rendered and nothing ever will: switched off. Every frame has been
+///   ruled out — retired as `render_failed` because its scan carries no sweep for
+///   the selected product, or left with no scan at all because its download
+///   failed — and no listing, download or render is outstanding to change that.
+///   Left in `Rendering` such a loop is a dead end: readiness needs a rendered
+///   frame to promote it, `any_loop_active` reads false so nothing even repaints,
+///   and the pane draws its loop frames instead of its static image — which means
+///   it draws nothing at all.
+///
+/// Switching off rather than promoting to `Ready` is deliberate: a `Ready` loop
+/// with no textures starts "playing", asks for a repaint every frame, and shows an
+/// empty pane. Off, the pane goes back to its static radar image, which is what
+/// the user had before enabling the loop.
+///
+/// The caller's half of switching off is in `update_loop_readiness`; both
+/// download bookkeeping and the settled/finished distinction are resolved here so
+/// the decision is one testable unit rather than three booleans assembled at an
+/// untestable call site.
+fn settle_loop_phase(
+    loop_mgr: &crate::loop_downloads::LoopDownloadManager,
+    pane_idx: usize,
+    ls: &mut rustdar_egui::pane::LoopPlaybackState,
+    budget: usize,
+) -> bool {
+    if !ls.is_active() || ls.is_render_ready() || ls.frames.is_empty() {
+        return false;
+    }
+    // `is_pane_done` means "dispatched", not "arrived" — see below.
+    if !loop_batch_settled(loop_mgr, ls, budget) || !loop_mgr.is_pane_done(pane_idx) {
+        return false;
+    }
+    if ls.frames.iter().any(|f| f.texture.is_some()) {
+        ls.phase = rustdar_egui::pane::LoopPhase::Ready;
+        return false;
+    }
+    // A frame whose scan is still downloading is "settled" as far as rendering
+    // goes — nothing is in flight for it *yet* — so the download half has to be
+    // asked separately before concluding that nothing will ever render. Otherwise
+    // every loop is abandoned on the pass right after its last batch is dispatched.
+    if ls
+        .frames
+        .iter()
+        .any(|f| loop_mgr.is_in_flight(&ls.site, &f.timestamp))
+    {
+        return false;
+    }
+    log::warn!("Loop: no frame on pane {pane_idx} could be rendered; leaving loop mode");
+    *ls = rustdar_egui::pane::LoopPlaybackState::new();
+    true
 }
 
 /// The frame image a finished loop render describes.
@@ -1896,6 +1978,91 @@ mod loop_dispatch_tests {
 
         let scans = vec![(ts(0), identifier("KTLX20240101_000000_V06"))];
         assert!(accept_scan_listing(&mut ls, "KTLX", scans).is_none());
+    }
+
+    /// The wedge. A failed listing is delivered as an empty list, and so is a
+    /// window the site served nothing for. Advancing to `Rendering` with no frames
+    /// is a state nothing leaves: readiness skips loops with no frames,
+    /// `any_loop_active` reads false so the app stops repainting, nothing retries,
+    /// and the pane draws its (nonexistent) loop frames instead of its static
+    /// image for the rest of the session.
+    #[test]
+    fn an_empty_listing_switches_the_loop_off() {
+        let ctx = egui::Context::default();
+        let mut ls = loop_on(&ctx, "KTLX", &[]);
+        ls.phase = LoopPhase::FetchingScanList;
+
+        assert!(
+            accept_scan_listing(&mut ls, "KTLX", Vec::new()).is_none(),
+            "there is nothing to download"
+        );
+        assert!(
+            !ls.is_active(),
+            "the pane must fall back to its static image, not sit in Rendering"
+        );
+        assert!(ls.frames.is_empty());
+    }
+
+    /// A loop in `Rendering` whose frames have all been ruled out — every scan
+    /// carries no sweep for the selected product — is the same dead end reached
+    /// from the other side: readiness needs a rendered frame to promote it, and
+    /// there will never be one.
+    #[test]
+    fn a_loop_no_frame_of_which_can_render_is_switched_off() {
+        let ctx = egui::Context::default();
+        let mut ls = loop_on(&ctx, "KTLX", &[]);
+        for frame in &mut ls.frames {
+            frame.render_failed = true;
+        }
+        let mgr = LoopDownloadManager::new();
+
+        assert!(
+            settle_loop_phase(&mgr, 0, &mut ls, MAX_LOOP_RENDER_BUDGET),
+            "the caller has to release this pane's loop state"
+        );
+        assert!(!ls.is_active());
+    }
+
+    /// …but not while its scans are still arriving. A frame with no scan yet is
+    /// "settled" as far as rendering goes — nothing is in flight for it *yet* — so
+    /// a check that only asked the render side would abandon every loop on the
+    /// pass right after its last download batch was dispatched.
+    #[test]
+    fn a_loop_still_waiting_on_its_scans_is_left_alone() {
+        let ctx = egui::Context::default();
+        let mut ls = loop_on(&ctx, "KTLX", &[]);
+        let mut mgr = LoopDownloadManager::new();
+        mgr.mark_in_flight("KTLX", ts(0));
+
+        assert!(!settle_loop_phase(&mgr, 0, &mut ls, MAX_LOOP_RENDER_BUDGET));
+        assert_eq!(ls.phase, LoopPhase::Rendering, "still working");
+
+        // Undispatched downloads hold it open too.
+        let mut mgr = LoopDownloadManager::new();
+        mgr.insert_pending(
+            0,
+            PendingDownloads {
+                site: "KTLX".to_string(),
+                queue: [(ts(1), identifier("KTLX20240101_000100_V06"))]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        assert!(!settle_loop_phase(&mgr, 0, &mut ls, MAX_LOOP_RENDER_BUDGET));
+        assert_eq!(ls.phase, LoopPhase::Rendering);
+    }
+
+    /// One rendered frame is still enough to play, whatever became of the rest.
+    #[test]
+    fn a_loop_with_something_to_show_is_promoted_rather_than_abandoned() {
+        let ctx = egui::Context::default();
+        let mut ls = loop_on(&ctx, "KTLX", &[1]);
+        ls.frames[0].render_failed = true;
+        ls.frames[2].render_failed = true;
+        let mgr = LoopDownloadManager::new();
+
+        assert!(!settle_loop_phase(&mgr, 0, &mut ls, MAX_LOOP_RENDER_BUDGET));
+        assert_eq!(ls.phase, LoopPhase::Ready);
     }
 
     /// The frame list and the download queue are the two halves of one plan: every

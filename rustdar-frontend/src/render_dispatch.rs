@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rustdar_radar::level3::Level3Product;
 use rustdar_radar::render::{
@@ -42,6 +42,24 @@ pub struct PaneRenderState {
     pub last_rendered: Option<(RadarProduct, f32)>,
     /// Cached render for instant texture restore after suspend/resume.
     pub cached_render: Option<CachedPaneRender>,
+    /// One flag per render dispatched for this pane and not yet finished, held
+    /// alongside the copy the render thread carries.
+    ///
+    /// Clearing one abandons that render: the worker drops its result instead of
+    /// sending it. This is per **pane**, which is the finest granularity the
+    /// dispatch path can name — `spawn_level2_render` is handed a pane index and
+    /// no site — and it is what keeps a new scan for one site from discarding the
+    /// in-flight renders of panes on every *other* site, each of which then costs
+    /// a fresh 2048² image and value grid to redo.
+    ///
+    /// **Only [`reset_panes_for_site`](RenderDispatcher::reset_panes_for_site) and
+    /// [`reset_panes`](RenderDispatcher::reset_panes) clear these, and both clear
+    /// `render_in_flight` on the same pane in the same pass.** That pairing is
+    /// what makes a suppressed send safe: the receiver clears `render_in_flight`
+    /// when a result arrives, so abandoning a render without clearing the flag
+    /// would leave the pane believing a render it will never hear about is still
+    /// running, and it would never dispatch another.
+    results_wanted: Vec<Arc<AtomicBool>>,
 }
 
 impl Default for PaneRenderState {
@@ -56,6 +74,31 @@ impl PaneRenderState {
             render_in_flight: false,
             last_rendered: None,
             cached_render: None,
+            results_wanted: Vec::new(),
+        }
+    }
+
+    /// The flag a newly dispatched render reports through, live until this pane's
+    /// renders are abandoned.
+    ///
+    /// Finished renders are dropped from the list first: the worker holds the only
+    /// other reference to its own flag, so one strong reference means it is gone.
+    fn want_result(&mut self) -> Arc<AtomicBool> {
+        self.results_wanted.retain(|f| Arc::strong_count(f) > 1);
+        let flag = Arc::new(AtomicBool::new(true));
+        self.results_wanted.push(Arc::clone(&flag));
+        flag
+    }
+
+    /// Stop wanting every render currently running for this pane.
+    ///
+    /// A pane can have more than one: `reset_panes*` clears `render_in_flight`
+    /// while a render is still going, so the next dispatch spawns a second one
+    /// before the first has landed. Abandoning only the newest would leave the
+    /// older free to arrive last and paint the previous scan over the new one.
+    fn abandon_results(&mut self) {
+        for flag in self.results_wanted.drain(..) {
+            flag.store(false, Ordering::Relaxed);
         }
     }
 }
@@ -223,7 +266,14 @@ pub struct RenderDispatcher {
     /// in: an insert that bypassed it would drop the storm motion vector on the
     /// floor, and the pane would render with another volume's.
     level3_data: HashMap<(RadarProduct, String, String), Arc<Level3Product>>,
-    /// Generation counter to discard stale render results after site/scan changes.
+    /// Generation counter to discard stale render results after a **full** reset.
+    ///
+    /// Bumped by [`reset_panes`](Self::reset_panes) only. Per-site resets abandon
+    /// the affected panes' renders individually — see
+    /// [`PaneRenderState::results_wanted`] — because this counter is global and a
+    /// bump of it discards the in-flight renders of every pane on every other
+    /// site, which then respawn: a wasted 2048² image and value grid per pane per
+    /// cross-site poll, recurring every poll interval in a multi-site layout.
     pub render_generation: u64,
     /// Per-site fetch generation counters to discard stale fetch results.
     pub fetch_generations: HashMap<String, u64>,
@@ -360,15 +410,22 @@ impl RenderDispatcher {
     }
 
     /// Reset render state for panes on a specific site (e.g. after a new scan loads for that site).
+    ///
+    /// Only those panes' in-flight renders are abandoned. The global
+    /// [`render_generation`](Self::render_generation) is deliberately *not* bumped:
+    /// it is a single comparison for every pane, so bumping it here would throw
+    /// away the renders of panes on other sites — whose data has not changed —
+    /// and have them redone on every poll of every site.
     pub fn reset_panes_for_site(&mut self, site: &str, gui: &rustdar_egui::Gui) {
         for (idx, prs) in self.pane_render.iter_mut().enumerate() {
             if gui.pane(idx).is_some_and(|p| p.site == site) {
                 prs.last_rendered = None;
                 prs.cached_render = None;
                 prs.render_in_flight = false;
+                // Paired with the line above: see `results_wanted`.
+                prs.abandon_results();
             }
         }
-        self.render_generation += 1;
         self.level3_data.retain(|(_prod, _tilt, s), _| s != site);
         // `storm_motion_history` deliberately survives. This runs on **every**
         // auto-poll for a live pane, immediately before the five products are
@@ -389,6 +446,7 @@ impl RenderDispatcher {
             prs.last_rendered = None;
             prs.cached_render = None;
             prs.render_in_flight = false;
+            prs.abandon_results();
         }
         self.render_generation += 1;
         self.level3_data.clear();
@@ -710,9 +768,15 @@ impl RenderDispatcher {
         let guard = RenderGuard(Arc::clone(&self.renders_in_flight));
 
         let generation = self.render_generation;
+        // Cleared if this pane's data changes while the render runs, which is
+        // where a per-site reset stops a result — the global `generation` above
+        // cannot, since it says nothing about which site a result belongs to.
+        let wanted = self.pane_render[pane_idx].want_result();
         crate::offload::offload("radar-render", move || {
             let _guard = guard;
-            if let Some((image, range, values)) = render_fn() {
+            if let Some((image, range, values)) = render_fn()
+                && wanted.load(Ordering::Relaxed)
+            {
                 let _ = sender.send(RenderResponse {
                     image_data: Arc::new(image),
                     max_range_km: range,
@@ -1774,5 +1838,175 @@ mod render_cache_tests {
                 "{site} came back as another pane's render"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod render_invalidation_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// What a render closure hands back: the RGBA image, its range and the value
+    /// grid, or `None` when the scan carries no matching sweep.
+    type RenderOutput = Option<(Vec<u8>, f64, Vec<f32>)>;
+
+    /// A render that does not finish until the test releases it.
+    ///
+    /// The gate is the whole point: a reset only has something to act on while a
+    /// render is *running*, and a render of nothing would routinely finish before
+    /// the reset landed, so the test would pass on timing rather than on the
+    /// abandonment.
+    fn gated_render() -> (
+        mpsc::Sender<()>,
+        impl FnOnce() -> RenderOutput + Send + 'static,
+    ) {
+        let (release, held) = mpsc::channel::<()>();
+        (release, move || {
+            held.recv().expect("every gated render is released");
+            Some((Vec::new(), 230.0, Vec::new()))
+        })
+    }
+
+    /// One pane, on `site`, which is how `reset_panes_for_site` reads the layout.
+    fn gui_showing(site: &str) -> rustdar_egui::Gui {
+        let mut gui = rustdar_egui::Gui::new();
+        gui.pane_mut(0).expect("a fresh Gui has one pane").site = site.to_string();
+        gui
+    }
+
+    fn dispatch(
+        d: &mut RenderDispatcher,
+        pane_idx: usize,
+        results: &mpsc::Sender<RenderResponse>,
+    ) -> mpsc::Sender<()> {
+        let (release, render) = gated_render();
+        d.spawn_render(
+            pane_idx,
+            RadarProduct::Reflectivity,
+            0.5,
+            results.clone(),
+            None,
+            render,
+        );
+        release
+    }
+
+    /// How many renders were not abandoned. Ends when the last worker drops its
+    /// sender, so nothing here waits on a timeout.
+    fn arrivals(
+        results: mpsc::Sender<RenderResponse>,
+        rx: mpsc::Receiver<RenderResponse>,
+    ) -> usize {
+        drop(results);
+        rx.iter().count()
+    }
+
+    /// The defect: a scan arriving for one site bumped a single global generation,
+    /// so every pane on every *other* site had its in-flight render discarded at
+    /// the receiver and respawned — a 2048² image and value grid redone per pane
+    /// per poll, recurring every interval in any multi-site layout.
+    #[test]
+    fn a_scan_for_one_site_leaves_another_sites_render_alone() {
+        let gui = gui_showing("KOUN");
+        let mut d = RenderDispatcher::new();
+        let (results, rx) = mpsc::channel();
+        let release = dispatch(&mut d, 0, &results);
+
+        // A scan for the other site lands while the KOUN pane is still rendering.
+        let generation = d.render_generation;
+        d.reset_panes_for_site("KTLX", &gui);
+        assert!(
+            !d.is_render_stale(generation),
+            "a per-site reset must not move the global generation — the receiver \
+             compares every pane against it"
+        );
+
+        release.send(()).expect("the render is still running");
+        assert_eq!(
+            arrivals(results, rx),
+            1,
+            "the KOUN pane's render was thrown away for a KTLX scan"
+        );
+    }
+
+    /// The other half: a scan for the pane's own site does invalidate it, or the
+    /// pane paints the previous volume over the new one and then stops, since
+    /// `last_rendered` records that render as the one it is showing.
+    #[test]
+    fn a_scan_for_the_panes_own_site_abandons_its_render() {
+        let gui = gui_showing("KOUN");
+        let mut d = RenderDispatcher::new();
+        let (results, rx) = mpsc::channel();
+        let release = dispatch(&mut d, 0, &results);
+
+        d.reset_panes_for_site("KOUN", &gui);
+        assert!(
+            !d.pane_render[0].render_in_flight,
+            "the pairing an abandoned send depends on: the pane must not be left \
+             waiting for a result that will never come"
+        );
+
+        release.send(()).expect("the render is still running");
+        assert_eq!(arrivals(results, rx), 0);
+    }
+
+    /// A pane can have more than one render running: the reset above clears
+    /// `render_in_flight` while the first is still going, so the next dispatch
+    /// starts a second. Abandoning only the newest would leave the older free to
+    /// arrive last and paint the scan the reset was meant to replace.
+    #[test]
+    fn every_render_a_pane_has_running_is_abandoned_at_once() {
+        let gui = gui_showing("KOUN");
+        let mut d = RenderDispatcher::new();
+        let (results, rx) = mpsc::channel();
+        let first = dispatch(&mut d, 0, &results);
+        let second = dispatch(&mut d, 0, &results);
+
+        d.reset_panes_for_site("KOUN", &gui);
+
+        second.send(()).expect("both renders are still running");
+        first.send(()).expect("both renders are still running");
+        assert_eq!(arrivals(results, rx), 0);
+    }
+
+    /// A full reset is site-blind by design — surface loss, a layout change — and
+    /// keeps discarding everything.
+    #[test]
+    fn a_full_reset_abandons_every_panes_render() {
+        let mut d = RenderDispatcher::new();
+        let (results, rx) = mpsc::channel();
+        let release = dispatch(&mut d, 0, &results);
+
+        let generation = d.render_generation;
+        d.reset_panes();
+        assert!(
+            d.is_render_stale(generation),
+            "and the global generation still moves, so a result already in the \
+             channel is discarded on arrival"
+        );
+
+        release.send(()).expect("the render is still running");
+        assert_eq!(arrivals(results, rx), 0);
+    }
+
+    /// The flag list is bounded by what is actually running, not by how many
+    /// renders a session has dispatched.
+    #[test]
+    fn finished_renders_stop_being_tracked() {
+        let mut d = RenderDispatcher::new();
+        let (results, rx) = mpsc::channel();
+        for _ in 0..5 {
+            let release = dispatch(&mut d, 0, &results);
+            release.send(()).expect("the render is still running");
+            // The worker has to drop its flag before the next dispatch prunes.
+            rx.recv().expect("an unabandoned render arrives");
+        }
+        // Each dispatch prunes before pushing, so only the render just added — and
+        // at most one whose worker had not quite dropped its flag — can be held.
+        assert!(
+            d.pane_render[0].results_wanted.len() <= 2,
+            "flags accumulated: {}",
+            d.pane_render[0].results_wanted.len()
+        );
     }
 }
