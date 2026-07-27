@@ -1105,6 +1105,55 @@ mod validation_policy {
         }
         t
     }
+
+    /// Smallest vector, in knots, from which
+    /// [`live_a_nonzero_vector_moves_the_field_off_base_velocity`] may conclude
+    /// anything.
+    ///
+    /// The correction spans `±speed` around the compass, and the RPG's data
+    /// levels are 10 knots wide either side of zero — so below about this the
+    /// corrected field and the uncorrected one quantise onto the same levels
+    /// almost everywhere, and "with the vector beat without it" becomes a
+    /// coin-flip on a handful of gates rather than a measurement. It is a floor
+    /// on the *evidence*, not on the derivation: production applies whatever
+    /// vector it is given, however small.
+    ///
+    /// [`live_a_nonzero_vector_moves_the_field_off_base_velocity`]:
+    ///     super::live_validation::live_a_nonzero_vector_moves_the_field_off_base_velocity
+    pub const DECISIVE_VECTOR_KT: f32 = 15.0;
+
+    /// Whether a vector is large enough to tell the two fields apart. See
+    /// [`DECISIVE_VECTOR_KT`].
+    pub fn vector_is_decisive(speed_kt: f32) -> bool {
+        speed_kt >= DECISIVE_VECTOR_KT
+    }
+
+    /// The same sample with the speed zeroed and **the volume left alone**.
+    ///
+    /// [`derive`] with a zero speed reproduces the source velocity exactly —
+    /// pinned offline by `a_zero_vector_reproduces_the_base_velocity` — so this
+    /// is how the harness gets hold of "the base velocity field" without a
+    /// second decode path that could drift from the one under test. Keeping the
+    /// volume means both derivations claim the same [`MotionProvenance`], which
+    /// leaves the correction term as the single difference between them.
+    pub fn without_motion(sample: &StormMotionSample) -> StormMotionSample {
+        StormMotionSample {
+            motion: StormMotion { speed_kt: 0.0, ..sample.motion },
+            volume: sample.volume,
+        }
+    }
+
+    /// Whether applying the vector agreed with the RPG better than not applying
+    /// it, over the same gates of the same velocity product.
+    ///
+    /// Deliberately a direction and not a margin. The size of the gap depends
+    /// on how much echo lies along the vector that minute and is worth
+    /// printing, not asserting; what must never happen is the corrected field
+    /// agreeing *worse*, which is what a sign error, a swapped halfword or a
+    /// degrees/knots transposition would each produce.
+    pub fn correction_is_earned(with_vector: &Tally, base_velocity: &Tally) -> bool {
+        with_vector.within_one_pct() > base_velocity.within_one_pct()
+    }
 }
 
 // Native-only with `live_validation` below, which it cross-checks: the
@@ -1975,6 +2024,69 @@ mod tests {
         assert_eq!(t.exact, 0, "a reversed vector must move every gate");
         assert_eq!(t.within_one, 0, "and by more than one level");
     }
+
+    /// `without_motion` has to reach the base velocity field *and* keep the
+    /// provenance, or the comparison it feeds would differ in two things at
+    /// once rather than in the correction alone.
+    #[test]
+    fn stripping_the_motion_leaves_the_base_velocity_and_the_volume() {
+        let msg = uniform(154, &[89.5], 1.0, 10.0);
+        let moving = sample(30.0, 90.0, 7108);
+        let still = without_motion(&moving);
+
+        assert_eq!(still.motion.speed_kt, 0.0, "the speed is what is stripped");
+        assert_eq!(
+            still.volume, moving.volume,
+            "the volume must survive, or the two derivations claim different provenance",
+        );
+
+        let base = derive(&msg, &still).expect("154 is a source");
+        assert_eq!(
+            base.motion_provenance,
+            MotionProvenance::SameVolume,
+            "a stripped sample still belongs to its volume",
+        );
+        // 10 m/s outbound is 19.44 kt, and with the speed zeroed that is all
+        // that is left — the direction is irrelevant once the speed is zero.
+        // Within half a step of DERIVED_SCALE, which stores 0.5 kt: 19.44 kt
+        // encodes as 19.5, and that requantisation is the derived packet's own
+        // and not something stripping the motion introduced.
+        assert!(
+            (knots_at(&base, 0, 0) - 10.0 * MS_TO_KT as f32).abs() <= 0.5 / DERIVED_SCALE,
+            "want the source velocity back, got {}",
+            knots_at(&base, 0, 0),
+        );
+    }
+
+    /// The floor and the verdict the live base-velocity comparison rests on.
+    /// Both are trivial and both are load-bearing: a `DECISIVE_VECTOR_KT` of
+    /// zero would admit the very quiet-night sample that test exists to reject,
+    /// and a `correction_is_earned` that answered `true` unconditionally would
+    /// pass on a field derived with the sign reversed.
+    #[test]
+    fn only_a_vector_big_enough_to_see_counts_and_only_if_it_helps() {
+        // Phrased through the function rather than on the constant directly,
+        // because the constant alone is a `clippy::assertions_on_constants`.
+        // 9.9 kt is the widest vector that could still leave the corrected and
+        // uncorrected fields on the same RPG level everywhere.
+        assert!(
+            !vector_is_decisive(9.9),
+            "the RPG's levels are 10 kt wide either side of zero; a floor under that \
+             cannot tell the corrected field from the uncorrected one",
+        );
+        assert!(!vector_is_decisive(0.0), "a zero vector is the case being excluded");
+        assert!(!vector_is_decisive(DECISIVE_VECTOR_KT - 0.1));
+        assert!(vector_is_decisive(DECISIVE_VECTOR_KT));
+
+        let better = Tally { n: 1000, exact: 0, within_one: 995 };
+        let worse = Tally { n: 1000, exact: 0, within_one: 400 };
+        assert!(correction_is_earned(&better, &worse), "the corrected field agrees more");
+        assert!(!correction_is_earned(&worse, &better), "and a sign error agrees less");
+        assert!(
+            !correction_is_earned(&better, &Tally { n: 1000, exact: 0, within_one: 995 }),
+            "a tie is not earned — with a decisive vector the two fields differ",
+        );
+    }
 }
 
 /// Agreement with the RPG's own `N0S`/`N1S`/`N2S`/`N3S`, measured against live
@@ -2519,6 +2631,156 @@ mod live_validation {
             }
         }
         None
+    }
+
+    /// That a derived tilt is a **different field from base velocity, and a
+    /// better one** — the one claim a quiet night cannot settle.
+    ///
+    /// ```text
+    /// cargo test -p rustdar-radar --lib -- --ignored --nocapture live_a_nonzero_vector
+    /// ```
+    ///
+    /// Run on a real device at ~01:30 CDT on a quiet night, the RPG vector at
+    /// `KSRX` read 0.0 kt from 0.0°. A zero vector makes [`derive`] reproduce
+    /// the source velocity exactly — `a_zero_vector_reproduces_the_base_velocity`
+    /// pins that offline — so the storm-relative pane and the base-velocity pane
+    /// were the same picture, and nothing measured against that night could tell
+    /// a correct zero from halfwords 51/52 decoding to zero. Every other test
+    /// here is an *accuracy* check that a zero vector passes trivially: with the
+    /// correction multiplied by zero they exercise the m/s→kt conversion and the
+    /// resampler and say nothing about the storm-motion term at all.
+    ///
+    /// So this one needs weather. For each site whose vector clears
+    /// [`DECISIVE_VECTOR_KT`] it derives every tilt **twice from the same
+    /// velocity product and the same volume's vector** — once as production
+    /// does, once with the speed stripped by [`without_motion`] — and reports
+    /// two things:
+    ///
+    /// * [`level_shift`] between the two derivations, which consults no oracle
+    ///   and resamples nothing. Both sides share a geometry, so this is the
+    ///   correction term and nothing else: it answers "is the field actually
+    ///   different?" in RPG data levels.
+    /// * each derivation's agreement with the RPG's own `N?S`, which answers
+    ///   the follow-up "and is it the *right* difference?". Only the direction
+    ///   of that comparison is asserted, by [`correction_is_earned`] — a sign
+    ///   error, a swapped halfword or a knots/degrees transposition all make the
+    ///   corrected field agree *worse* than doing nothing, which is the failure
+    ///   this exists to catch.
+    ///
+    /// Unlike [`live_derived_srm_agrees_with_the_rpgs_own_tilts`] this walks
+    /// every site instead of stopping once two have been asserted on: the site
+    /// with the weather is rarely near the front of [`SITES`], and that harness
+    /// breaking early at `KMPX` is exactly why the convective sites below it had
+    /// never been reached.
+    #[ignore = "hits the live S3 bucket and tgftp"]
+    #[tokio::test]
+    async fn live_a_nonzero_vector_moves_the_field_off_base_velocity() {
+        let sources = DataSources::production();
+        let now = chrono::Utc::now().naive_utc();
+        let mut decisive = 0usize;
+        let mut quiet = 0usize;
+
+        for &site in SITES {
+            let Ok(n0s) = fetch_latest_product(&sources, site, STORM_MOTION_PRODUCT, now).await
+            else {
+                println!("{site}: no {STORM_MOTION_PRODUCT}");
+                continue;
+            };
+            let Some(sample) = StormMotionSample::from_message(&n0s.message) else {
+                continue;
+            };
+            if !vector_is_decisive(sample.motion.speed_kt) {
+                quiet += 1;
+                println!(
+                    "{site}: {:.1} kt from {:.1}° — under {DECISIVE_VECTOR_KT} kt, \
+                     too small to tell the two fields apart",
+                    sample.motion.speed_kt, sample.motion.direction_deg,
+                );
+                continue;
+            }
+            println!(
+                "{site}: vector {:.1} kt from {:.1}° (scit={})",
+                sample.motion.speed_kt,
+                sample.motion.direction_deg,
+                sample.motion.is_scit_average,
+            );
+
+            for (tilt, &code) in SRM_TILT_PRODUCTS.iter().enumerate() {
+                let Some(rpg) = tgftp_tilt(tilt, site).await else {
+                    println!("  tilt {tilt}: tgftp N{tilt}S unavailable");
+                    continue;
+                };
+                let Some(velocity) = bucket_product_matching(&sources, site, code, &rpg).await
+                else {
+                    println!("  tilt {tilt} ({code}): no bucket object for the RPG's volume");
+                    continue;
+                };
+                // The oracle's own volume's vector, so the pairing is the one
+                // production makes and the correction is the only variable.
+                let Some(own) = StormMotionSample::from_message(&rpg) else {
+                    continue;
+                };
+                if !vector_is_decisive(own.motion.speed_kt) {
+                    println!(
+                        "  tilt {tilt}: the oracle's own volume carried {:.1} kt — too small",
+                        own.motion.speed_kt,
+                    );
+                    continue;
+                }
+
+                let with = srm_derive_or_panic(&velocity.message, &own, code);
+                let base = srm_derive_or_panic(&velocity.message, &without_motion(&own), code);
+                let moved = level_shift(&with, &base);
+                let agreed = compare(&rpg, &with);
+                let uncorrected = compare(&rpg, &base);
+                if moved.n == 0 || agreed.n == 0 {
+                    println!("  tilt {tilt}: no overlapping gates");
+                    continue;
+                }
+
+                println!(
+                    "  tilt {tilt} ({code}, {:.1}°, cut {}): {:.1} kt from {:.1}° moves \
+                     {:.1}% of {} gates off their base-velocity level ({:.1}% by more than \
+                     one); against N{tilt}S within one level, {:.2}% with the vector \
+                     against {:.2}% without it, over {} gates",
+                    with.elevation_angle,
+                    with.elevation_number,
+                    own.motion.speed_kt,
+                    own.motion.direction_deg,
+                    100.0 - moved.exact_pct(),
+                    moved.n,
+                    100.0 - moved.within_one_pct(),
+                    agreed.within_one_pct(),
+                    uncorrected.within_one_pct(),
+                    agreed.n,
+                );
+                assert!(
+                    correction_is_earned(&agreed, &uncorrected),
+                    "{site} tilt {tilt} ({code}): applying {:.1} kt from {:.1}° agreed with \
+                     the RPG's own N{tilt}S on {:.2}% of {} gates within one level, against \
+                     {:.2}% for the same product with the correction stripped. A vector this \
+                     size must improve the field, not worsen it — suspect the sign of \
+                     StormMotion::radial_component_kt, or halfwords 51/52 being read the \
+                     wrong way round.",
+                    own.motion.speed_kt,
+                    own.motion.direction_deg,
+                    agreed.within_one_pct(),
+                    agreed.n,
+                    uncorrected.within_one_pct(),
+                );
+                decisive += 1;
+            }
+        }
+
+        assert!(
+            decisive > 0,
+            "no site in SITES carried a vector of at least {DECISIVE_VECTOR_KT} kt paired with \
+             a tilt that could be compared ({quiet} of {} were under it). This test needs \
+             weather somewhere in the network; on a night when the whole list is quiet there \
+             is nothing here to measure, and a run that asserted anyway would be asserting on \
+             the zero-vector case it exists to rule out. Re-run when something is moving.",
+            SITES.len(),
+        );
     }
 
     /// How many volumes of one site's lowest tilt
