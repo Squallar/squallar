@@ -541,6 +541,27 @@ export function publishDeploy(network, origin, tag, { headStatus = 200 } = {}) {
   return network;
 }
 
+/**
+ * Publish a deploy that changed only the directory index, leaving the wasm
+ * module — and every other asset — exactly as `baseTag` served them. This is
+ * the shape of a shell-side deploy: index.html edited, the `wasm-pack` output
+ * untouched, so the module's validator does not move. A probe watching only
+ * the wasm sees nothing here; detecting this deploy is what the second probe
+ * asset exists for.
+ */
+export function publishIndexOnlyDeploy(network, origin, baseTag, indexTag) {
+  publishDeploy(network, origin, baseTag);
+  network.serve(new URL("", origin).href, (request, init, method) =>
+    method === "HEAD"
+      ? new Response(null, { status: 200, headers: { etag: `"${indexTag}"` } })
+      : new Response(`::${indexTag}`, {
+          status: 200,
+          headers: { etag: `"${indexTag}"`, "content-type": "text/plain" },
+        }),
+  );
+  return network;
+}
+
 /** A deploy that publishes no HTTP validators at all. */
 export function publishUnversionedDeploy(network, origin, tag) {
   for (const asset of SHELL_ASSETS) {

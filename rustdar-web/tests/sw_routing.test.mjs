@@ -39,6 +39,7 @@ import {
   Network,
   opaqueResponse,
   publishDeploy,
+  publishIndexOnlyDeploy,
   publishUnversionedDeploy,
   restartWorker,
   startWorker,
@@ -655,8 +656,51 @@ describe("install: a shell is published whole or not at all", () => {
     const after = worker.network.log.slice(before);
     assert.deepEqual(
       after.map((e) => e.method),
-      ["HEAD"],
-      `an unchanged deploy cost more than one HEAD: ${JSON.stringify(after)}`,
+      ["HEAD", "HEAD"],
+      `an unchanged deploy cost more than the two probe HEADs: ${JSON.stringify(after)}`,
+    );
+  });
+});
+
+// ===========================================================================
+describe("updates: the version probe watches both halves of a deploy", () => {
+  // =========================================================================
+
+  it("detects a deploy that changed only the index, not the wasm", async () => {
+    // The regression this pins. A shell-side deploy edits index.html and ships
+    // the same wasm bytes, so a probe that watched only the wasm produced an
+    // identical token and never installed it — and navigations are cache-first,
+    // so the stale index was served indefinitely, with only rustdarForceUpdate()
+    // or a later wasm-changing deploy as the way out.
+    const worker = await bootWorker({ tag: "A" });
+    publishIndexOnlyDeploy(worker.network, ORIGIN, "A", "A2");
+    await worker.message({ type: "rustdar:check-update" });
+
+    const page = await loadPage(worker);
+    assert.equal(
+      page.document,
+      "::A2",
+      "an index-only deploy was not detected; the old shell is still being served",
+    );
+    assert.equal(
+      page.wasm,
+      "pkg/rustdar_web_bg.wasm::A",
+      "the wasm module did not change in this deploy and must be served as-is",
+    );
+  });
+
+  it("announces an index-only deploy to open windows", async () => {
+    // The reload prompt is how a mid-session tab hears about a deploy at all;
+    // an update the probe can now see must reach it like any other.
+    const worker = await bootWorker({ tag: "A" });
+    const client = worker.addClient();
+    publishIndexOnlyDeploy(worker.network, ORIGIN, "A", "A2");
+    await worker.message({ type: "rustdar:check-update" });
+
+    assert.equal(
+      client.messages.some((m) => m.type === "rustdar:shell-updated"),
+      true,
+      "an open window was not told the index-only deploy is ready",
     );
   });
 });
@@ -776,7 +820,7 @@ describe("updates: a degraded version probe is visible and escapable", () => {
     const after = worker.network.log.slice(before);
     assert.deepEqual(
       after.map((e) => e.method),
-      ["HEAD"],
+      ["HEAD", "HEAD"],
       `the ordinary check reinstalled after a force: ${JSON.stringify(after)}`,
     );
   });

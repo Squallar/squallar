@@ -18,10 +18,11 @@
  * changed, and these do not change when the wasm module does. Hashing the bundle
  * in would need a build step that rewrites this file, and the Pages deployment
  * is not ours to change — so the version is discovered at runtime instead:
- * `probeValidator()` HEADs the wasm module and tokenises the validators the
- * server already sends. A changed token refetches the whole shell into a *new*
- * cache and moves the meta pointer only once that completes. `SW_VERSION`
- * versions this file's logic and is bumped by hand.
+ * `probeValidator()` HEADs the wasm module and the directory index and joins
+ * the validators the server already sends for each into one token. A changed
+ * token refetches the whole shell into a *new* cache and moves the meta pointer
+ * only once that completes. `SW_VERSION` versions this file's logic and is
+ * bumped by hand.
  *
  * MIXED SHELLS are what per-client pinning exists to prevent. A page load is
  * three fetches seconds apart (navigation, glue, wasm) and a deploy can land
@@ -97,8 +98,20 @@ const SHELL_PATHS = [
 const SHELL_URLS = SHELL_PATHS.map((p) => new URL(p, ROOT).href);
 const SHELL_URL_SET = new Set(SHELL_URLS);
 
-/* The asset whose HTTP validators stand in for "which deploy is this". */
-const SHELL_VERSION_PROBE = new URL("pkg/rustdar_web_bg.wasm", ROOT).href;
+/*
+ * The assets whose HTTP validators stand in for "which deploy is this". Two,
+ * because a deploy has two independent halves: the wasm bundle, and the shell
+ * around it. A probe that watched only the wasm never saw a deploy that changed
+ * index.html without rebuilding the module — and navigations are cache-first,
+ * so the old shell was served indefinitely. The directory index is the asset a
+ * shell-side deploy is most certain to touch (it inlines the CSS and the
+ * bootstrap); an icon-only deploy still slips through, which is what
+ * `rustdarForceUpdate()` is for — closing it would cost nine HEADs per check.
+ */
+const SHELL_VERSION_PROBES = [
+  new URL("pkg/rustdar_web_bg.wasm", ROOT).href,
+  new URL("", ROOT).href,
+];
 
 /*
  * Every origin `rustdar_radar::sources::DataSources::production()` reads from.
@@ -236,9 +249,10 @@ function routeFor({ url, method = "GET", mode = "no-cors" }) {
  * the header differences between the two (notably `Content-Length` under content
  * negotiation).
  *
- * `null` means the server publishes no validators, in which case updates cannot
- * be detected and the shell is left alone rather than re-downloaded on every
- * load. Pages sends `ETag`; `http.server` sends `Last-Modified` + `Content-Length`.
+ * `null` means the server publishes no validators for that asset. When every
+ * probe says so, updates cannot be detected and the shell is left alone rather
+ * than re-downloaded on every load. Pages sends `ETag`; `http.server` sends
+ * `Last-Modified` + `Content-Length`.
  */
 function validatorToken(response) {
   const etag = response.headers.get("etag");
@@ -250,14 +264,22 @@ function validatorToken(response) {
 }
 
 async function probeValidator() {
-  // `no-store` so the browser's own HTTP cache cannot answer this and hide a new
-  // deploy behind an unexpired `max-age`.
-  const response = await fetch(SHELL_VERSION_PROBE, {
-    method: "HEAD",
-    cache: "no-store",
-  });
-  if (!response.ok) throw new Error(`shell probe: HTTP ${response.status}`);
-  return validatorToken(response);
+  // `no-store` so the browser's own HTTP cache cannot answer these and hide a
+  // new deploy behind an unexpired `max-age`. Any probe failing fails them all:
+  // a token built from the assets that did answer would change again when the
+  // outage ended, and a phantom token change is a pointless reinstall. Throwing
+  // instead lands in `checkForUpdate`'s keep-serving path, same as one probe.
+  const tokens = await Promise.all(
+    SHELL_VERSION_PROBES.map(async (url) => {
+      const response = await fetch(url, { method: "HEAD", cache: "no-store" });
+      if (!response.ok) throw new Error(`shell probe: HTTP ${response.status} for ${url}`);
+      return validatorToken(response);
+    }),
+  );
+  // All-null keeps its meaning: nothing here can detect a deploy. One null
+  // degrades only that asset — a change in the other is still a changed token.
+  if (tokens.every((t) => t === null)) return null;
+  return tokens.map((t) => t ?? "none").join("+");
 }
 
 function shellCacheName(token) {
@@ -518,8 +540,9 @@ function checkForUpdate({ force = false } = {}) {
         warnOnce(
           "unversioned",
           'rustdar sw: the server sends neither ETag nor Last-Modified for the ' +
-            "wasm module, so a new deploy cannot be detected and the cached " +
-            'shell is pinned. Post {type:"rustdar:force-update"} to reinstall it.',
+            "wasm module or the directory index, so a new deploy cannot be " +
+            "detected and the cached shell is pinned. Post " +
+            '{type:"rustdar:force-update"} to reinstall it.',
         );
         return;
       }
