@@ -43,25 +43,44 @@ public final class CompassHelper {
     // is not reliable — which would let a pause/resume double-register the
     // listener, or unregister nothing.
     //
-    // Volatile is sufficient here and a lock is not: every field is written
-    // once by `register` before the callbacks are registered, or flipped by
-    // start/stopListening, which the framework only calls from the UI thread.
-    // The one genuinely concurrent pair is `sHeading` (UI writer, poll-thread
-    // reader), and that is a single 32-bit value with no invariant tying it to
-    // anything else.
+    // Volatile alone used to be argued sufficient on the grounds that every
+    // field was "written once by `register` before the callbacks are
+    // registered". That premise died when register() stopped being
+    // once-per-process: android_main runs once per Activity *instance*, so a
+    // second register() rewrites these fields from its own thread while the
+    // process-wide lifecycle callbacks may be flipping the listener on the UI
+    // thread. The register/startListening/stopListening transitions are
+    // therefore serialised on the class lock (`static synchronized`); volatile
+    // stays for the lock-free readers -- `getHeading` on the poll thread, and
+    // the sensor callback's `sHeading` write.
     private static volatile float sHeading = -1f;
     private static volatile SensorEventListener sListener;
     private static volatile SensorManager sSensorManager;
     private static volatile Sensor sRotationSensor;
-    /**
-     * Whether the listener is currently registered. Only ever touched from the
-     * UI thread after `register` returns, but volatile so the initial write is
-     * visible there.
-     */
+    /** Whether the listener is currently registered. Guarded by the class lock. */
     private static volatile boolean sListening;
+    /**
+     * Whether the lifecycle callbacks are installed. They are registered once
+     * per *process* -- they hold no per-Activity state -- against register()'s
+     * once-per-Activity call cadence; without the guard, each new Activity
+     * stacked another never-unregistered callback.
+     */
+    private static volatile boolean sCallbacksRegistered;
 
-    /** Register for rotation vector sensor updates. Call once from android_main. */
-    public static void register(Activity activity) {
+    /**
+     * Register for rotation vector sensor updates. Called once per
+     * android_main — which is once per Activity <em>instance</em>, not once
+     * per process, so this must be idempotent: see the guards below.
+     */
+    public static synchronized void register(Activity activity) {
+        // A second Activity means a second android_main and a second call
+        // here. If the previous listener is still registered — the new
+        // Activity can resume before this runs, and that onActivityResumed
+        // re-registers whatever sListener holds — unregister it now, before
+        // the overwrites below orphan it into exactly the everlasting sensor
+        // drain the class comment says was fixed.
+        stopListening();
+
         sSensorManager = (SensorManager) activity.getSystemService(Context.SENSOR_SERVICE);
         if (sSensorManager == null) return;
 
@@ -101,8 +120,12 @@ public final class CompassHelper {
         // The app declares a single Activity (android.app.NativeActivity, in a
         // singleTask task), so there is no need to match on identity here —
         // and not holding an Activity reference is what keeps this leak-free.
+        // It is also what lets one registration serve every later Activity
+        // instance, which is why sCallbacksRegistered gates it rather than
+        // this stacking a fresh callback per register() call.
         Application app = activity.getApplication();
-        if (app != null) {
+        if (app != null && !sCallbacksRegistered) {
+            sCallbacksRegistered = true;
             app.registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {
                 @Override
                 public void onActivityResumed(Activity a) {
@@ -123,7 +146,7 @@ public final class CompassHelper {
         }
     }
 
-    private static void startListening() {
+    private static synchronized void startListening() {
         if (sListening || sSensorManager == null || sListener == null || sRotationSensor == null) {
             return;
         }
@@ -131,7 +154,7 @@ public final class CompassHelper {
         sListening = true;
     }
 
-    private static void stopListening() {
+    private static synchronized void stopListening() {
         if (!sListening || sSensorManager == null || sListener == null) return;
         sSensorManager.unregisterListener(sListener);
         sListening = false;
