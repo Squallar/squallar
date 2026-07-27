@@ -1883,11 +1883,7 @@ impl Gui {
     /// Bounded by [`Self::visible_pane_count`], not the layout's raw count:
     /// hidden panes are neither read as a sync source nor written to, and a
     /// count that ran ahead of the vector cannot index past its end.
-    fn sync_viewports(
-        &mut self,
-        pre_zooms: &[f64],
-        pre_positions: &[Option<walkers::Position>],
-    ) {
+    fn sync_viewports(&mut self, pre_zooms: &[f64], pre_positions: &[Option<walkers::Position>]) {
         let pane_count = self.visible_pane_count();
         if !self.viewport_sync || pane_count <= 1 {
             return;

@@ -4430,8 +4430,15 @@ mod tests {
             .expect("the picker must offer a 2-pane split on a desktop width");
         h.mouse_click(two.rect.center());
         h.frames_for(3, FRAME_DT);
-        assert_eq!(h.pane_count(), 2, "precondition: the click must have split the map");
-        assert!(!h.sync_layers(), "precondition: sync must still be off, or it did the seeding");
+        assert_eq!(
+            h.pane_count(),
+            2,
+            "precondition: the click must have split the map"
+        );
+        assert!(
+            !h.sync_layers(),
+            "precondition: sync must still be off, or it did the seeding"
+        );
 
         assert!(
             h.overlay_enabled_on(1, OverlayKind::Radar),
@@ -4472,7 +4479,8 @@ mod tests {
         h.gui_mut().set_radar_config(config);
         h.warm_up();
         assert_eq!(
-            h.gui_mut().active_pane().site, "KTLX",
+            h.gui_mut().active_pane().site,
+            "KTLX",
             "precondition: the active pane and the global config must disagree"
         );
 
@@ -4535,7 +4543,9 @@ mod tests {
         h.set_pane_count(2);
         h.frame();
         assert!(
-            !h.painted_text_strings().iter().any(|t| t == "HIDDEN PANE READOUT"),
+            !h.painted_text_strings()
+                .iter()
+                .any(|t| t == "HIDDEN PANE READOUT"),
             "a hidden pane's stale readout surfaced in the status bar"
         );
     }

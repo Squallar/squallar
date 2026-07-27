@@ -2,8 +2,8 @@ use tiny_skia::{
     Color, FillRule, LineCap, Mask, Paint, PathBuilder, Pixmap, Stroke, StrokeDash, Transform,
 };
 
-use crate::types::{HatchPattern, OverlayFeature};
 use crate::render::rasterize::{MercatorBounds, build_polygon_path, strip_closing_dup};
+use crate::types::{HatchPattern, OverlayFeature};
 
 /// Pixels.
 const HATCH_SPACING: f32 = 10.0;
@@ -53,8 +53,10 @@ fn draw_directional_hatch(
     let norm_y = dir_x;
 
     let corners = [
-        (min_x, min_y), (max_x, min_y),
-        (min_x, max_y), (max_x, max_y),
+        (min_x, min_y),
+        (max_x, min_y),
+        (min_x, max_y),
+        (max_x, max_y),
     ];
 
     let (mut min_proj, mut max_proj) = (f32::MAX, f32::MIN);
@@ -96,7 +98,13 @@ fn draw_directional_hatch(
         pb.move_to(x1, y1);
         pb.line_to(x2, y2);
         if let Some(line_path) = pb.finish() {
-            pixmap.stroke_path(&line_path, &paint, &stroke, Transform::identity(), Some(clip));
+            pixmap.stroke_path(
+                &line_path,
+                &paint,
+                &stroke,
+                Transform::identity(),
+                Some(clip),
+            );
         }
 
         t += HATCH_SPACING;
@@ -113,10 +121,10 @@ pub(crate) fn draw_hatch_pass(
     h: f32,
     hatch_color: [u8; 4],
 ) {
-struct HatchedPolygon {
-    feature_idx: usize,
-    path: tiny_skia::Path,
-}
+    struct HatchedPolygon {
+        feature_idx: usize,
+        path: tiny_skia::Path,
+    }
 
     let mut cig2_pts: Vec<Vec<(f32, f32)>> = Vec::new();
     let mut cig3_pts: Vec<Vec<(f32, f32)>> = Vec::new();
@@ -127,16 +135,24 @@ struct HatchedPolygon {
             continue;
         }
         for polygon in &feature.polygons {
-            let Some(exterior) = polygon.first() else { continue };
+            let Some(exterior) = polygon.first() else {
+                continue;
+            };
             let ring = strip_closing_dup(exterior);
-            let pts: Vec<(f32, f32)> = ring.iter().map(|&(lat, lon)| mb.project(lat, lon, w, h)).collect();
+            let pts: Vec<(f32, f32)> = ring
+                .iter()
+                .map(|&(lat, lon)| mb.project(lat, lon, w, h))
+                .collect();
             if let Some(path) = build_polygon_path(&pts) {
                 match feature.hatch {
                     HatchPattern::Cig2 => cig2_pts.push(pts),
                     HatchPattern::Cig3 => cig3_pts.push(pts),
                     _ => {}
                 }
-                all_hatched.push(HatchedPolygon { feature_idx: idx, path });
+                all_hatched.push(HatchedPolygon {
+                    feature_idx: idx,
+                    path,
+                });
             }
         }
     }
@@ -148,7 +164,11 @@ struct HatchedPolygon {
         let hatch = features[hp.feature_idx].hatch;
 
         let exclusion_pts: Vec<&[(f32, f32)]> = match hatch {
-            HatchPattern::Cig1 => cig2_pts.iter().chain(cig3_pts.iter()).map(|v| v.as_slice()).collect(),
+            HatchPattern::Cig1 => cig2_pts
+                .iter()
+                .chain(cig3_pts.iter())
+                .map(|v| v.as_slice())
+                .collect(),
             HatchPattern::Cig2 => cig3_pts.iter().map(|v| v.as_slice()).collect(),
             _ => Vec::new(),
         };
@@ -250,7 +270,11 @@ mod tests {
             "inside CIG1 ∧ CIG2 ∧ CIG3: three crossings made even-odd parity \
              re-fill this point"
         );
-        assert_eq!(coverage(&mask, 50, 32), 0, "inside CIG2 only: still excluded");
+        assert_eq!(
+            coverage(&mask, 50, 32),
+            0,
+            "inside CIG2 only: still excluded"
+        );
         // Controls: the exclusion must not eat the ring it is cut from.
         assert_eq!(coverage(&mask, 50, 15), 255, "inside CIG1 only: hatched");
         assert_eq!(coverage(&mask, 50, 5), 0, "outside CIG1: never hatched");
@@ -271,7 +295,11 @@ mod tests {
             "inside the disjoint exclusion ring, outside the hatched polygon: \
              one crossing made even-odd parity fill it"
         );
-        assert_eq!(coverage(&mask, 30, 50), 255, "the hatched polygon itself still hatches");
+        assert_eq!(
+            coverage(&mask, 30, 50),
+            255,
+            "the hatched polygon itself still hatches"
+        );
     }
 
     /// SPC does not promise consistent ring orientation, so two overlapping
@@ -291,6 +319,10 @@ mod tests {
             0,
             "a reversed inner ring must not cancel the outer ring's exclusion"
         );
-        assert_eq!(coverage(&mask, 50, 15), 255, "control: CIG1-only area still hatches");
+        assert_eq!(
+            coverage(&mask, 50, 15),
+            255,
+            "control: CIG1-only area still hatches"
+        );
     }
 }

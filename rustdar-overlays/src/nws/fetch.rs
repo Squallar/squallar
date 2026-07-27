@@ -66,7 +66,10 @@ mod tests {
             url.starts_with("http://127.0.0.1:8080/"),
             "{url} does not come from nws_api_base",
         );
-        assert!(!url.contains("api.weather.gov"), "{url} still hardcodes the origin");
+        assert!(
+            !url.contains("api.weather.gov"),
+            "{url} still hardcodes the origin"
+        );
     }
 
     /// The exact URL the hardcoded constant used to name, probed live

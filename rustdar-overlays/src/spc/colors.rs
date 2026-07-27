@@ -9,9 +9,18 @@ pub fn parse_hex_color(hex: &str, alpha: u8) -> [u8; 4] {
     // `get`, not `[..]`: the ranges are byte offsets, and indexing panics when
     // one lands inside a multi-byte character ("€€" is six bytes, so it passes
     // the length gate above).
-    let r = hex.get(0..2).and_then(|s| u8::from_str_radix(s, 16).ok()).unwrap_or(128);
-    let g = hex.get(2..4).and_then(|s| u8::from_str_radix(s, 16).ok()).unwrap_or(128);
-    let b = hex.get(4..6).and_then(|s| u8::from_str_radix(s, 16).ok()).unwrap_or(128);
+    let r = hex
+        .get(0..2)
+        .and_then(|s| u8::from_str_radix(s, 16).ok())
+        .unwrap_or(128);
+    let g = hex
+        .get(2..4)
+        .and_then(|s| u8::from_str_radix(s, 16).ok())
+        .unwrap_or(128);
+    let b = hex
+        .get(4..6)
+        .and_then(|s| u8::from_str_radix(s, 16).ok())
+        .unwrap_or(128);
     [r, g, b, alpha]
 }
 

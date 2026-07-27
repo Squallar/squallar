@@ -754,12 +754,18 @@ mod tests {
     #[test]
     fn the_bkn_open_slice_overpaint_stays_inside_the_circle() {
         let mut bkn = ob(None);
-        bkn.clouds = vec![CloudLayer { cover: "BKN".into(), base_ft: Some(3000) }];
+        bkn.clouds = vec![CloudLayer {
+            cover: "BKN".into(),
+            base_ft: Some(3000),
+        }];
         let radius = 6.0_f32;
         let mut p = RecordingPainter::default();
         draw_cloud_cover_circle(&mut p, &bkn, [0, 255, 0, 255], radius, true);
 
-        assert!(!p.polygons.is_empty(), "BKN draws its open slice as a filled polygon");
+        assert!(
+            !p.polygons.is_empty(),
+            "BKN draws its open slice as a filled polygon"
+        );
         for poly in &p.polygons {
             for pt in poly {
                 let d = (pt[0] * pt[0] + pt[1] * pt[1]).sqrt();
@@ -776,7 +782,10 @@ mod tests {
             .iter()
             .flatten()
             .any(|pt| pt[0] > radius * 0.95 && pt[1].abs() < 1.0);
-        assert!(reaches_right, "the open slice must still touch the circle's right edge");
+        assert!(
+            reaches_right,
+            "the open slice must still touch the circle's right edge"
+        );
     }
 
     // ── Wind barb ─────────────────────────────────────────────────────────

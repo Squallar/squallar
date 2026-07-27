@@ -399,8 +399,10 @@ pub async fn list_files(
     let prefix = day_prefix(site, date);
 
     log::debug!("Listing archive objects for prefix {prefix:?}");
-    let keys =
-        collect_keys(&sources.level2_bucket, &prefix, None, |url| get_text(client, url)).await?;
+    let keys = collect_keys(&sources.level2_bucket, &prefix, None, |url| {
+        get_text(client, url)
+    })
+    .await?;
     log::debug!("Listing for {prefix:?} returned {} keys", keys.len());
 
     Ok(keys.iter().map(|key| key_to_identifier(key)).collect())
@@ -422,12 +424,7 @@ pub async fn download_file(
         .site()
         .ok_or_else(|| ArchiveError::UnkeyableIdentifier(identifier.name().to_string()))?;
 
-    let key = format!(
-        "{}/{}/{}",
-        date.format("%Y/%m/%d"),
-        site,
-        identifier.name()
-    );
+    let key = format!("{}/{}/{}", date.format("%Y/%m/%d"), site, identifier.name());
     let url = object_url(&sources.level2_bucket, &key);
 
     log::debug!("Downloading archive object {key:?}");
@@ -467,7 +464,10 @@ mod tests {
         assert_eq!(id.name(), "KTLX20240520_000004_V06");
         assert_eq!(id.site(), Some("KTLX"));
         let dt = id.date_time().expect("parses");
-        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2024-05-20 00:00:04");
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2024-05-20 00:00:04"
+        );
     }
 
     /// A name too short to slice must yield `None`, not panic —
@@ -667,7 +667,9 @@ mod tests {
     /// Drive `collect_keys` over canned pages, recording the URLs requested.
     /// The future is driven by hand (no `pollster` here); it never yields,
     /// because the fetcher is immediate.
-    fn paginate(pages: Vec<std::result::Result<String, ArchiveError>>) -> (Result<Vec<String>>, Vec<String>) {
+    fn paginate(
+        pages: Vec<std::result::Result<String, ArchiveError>>,
+    ) -> (Result<Vec<String>>, Vec<String>) {
         let urls = std::cell::RefCell::new(Vec::new());
         let remaining = std::cell::RefCell::new(std::collections::VecDeque::from(pages));
 
@@ -738,8 +740,10 @@ mod tests {
     /// while `next_token.is_some()` would request forever here.
     #[test]
     fn pagination_stops_on_the_truncation_flag_not_the_cursor() {
-        let body = listing(&["a/b/c/d/k1"], None)
-            .replace("</ListBucketResult>", "<NextContinuationToken>STALE</NextContinuationToken></ListBucketResult>");
+        let body = listing(&["a/b/c/d/k1"], None).replace(
+            "</ListBucketResult>",
+            "<NextContinuationToken>STALE</NextContinuationToken></ListBucketResult>",
+        );
         let (keys, urls) = paginate(vec![Ok(body)]);
         assert_eq!(keys.expect("completes"), vec!["a/b/c/d/k1"]);
         assert_eq!(urls.len(), 1, "followed a cursor on an untruncated page");
@@ -894,7 +898,9 @@ mod tests {
     async fn live_archive_lists_downloads_and_decodes_a_volume() {
         let sources = DataSources::production();
         let day = date(2024, 5, 20);
-        let files = list_files(&sources, "KTLX", &day).await.expect("listing KTLX 2024-05-20");
+        let files = list_files(&sources, "KTLX", &day)
+            .await
+            .expect("listing KTLX 2024-05-20");
         println!("listed {} objects", files.len());
         assert!(
             files.len() > 100,
@@ -960,7 +966,10 @@ mod tests {
             paged.len()
         );
 
-        assert_eq!(single_page_requests, 1, "the default page should hold a site-day");
+        assert_eq!(
+            single_page_requests, 1,
+            "the default page should hold a site-day"
+        );
         assert!(
             paged_requests > 5,
             "max-keys=20 over ~235 keys should need many pages, took {paged_requests}"

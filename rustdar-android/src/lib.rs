@@ -111,8 +111,9 @@ fn java_context() -> Option<std::sync::Arc<JavaContext>> {
 /// previous Activity -- deferred past any helper still holding its `Arc`, so
 /// the ref is never deleted under a live JNI call.
 fn set_java_context(context: Option<JavaContext>) {
-    *JAVA.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-        context.map(std::sync::Arc::new);
+    *JAVA
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = context.map(std::sync::Arc::new);
 }
 
 /// Attach the calling thread to the JVM and run `f`.
@@ -422,58 +423,61 @@ fn start_location_thread(sender: std::sync::mpsc::Sender<rustdar_gps::GpsFix>) {
     std::thread::Builder::new()
         .name("gps-location".into())
         .spawn(move || {
-        // Let the app fully initialise before doing JNI work
-        std::thread::sleep(std::time::Duration::from_secs(3));
+            // Let the app fully initialise before doing JNI work
+            std::thread::sleep(std::time::Duration::from_secs(3));
 
-        // Counts requests that *actually reached* Activity.requestPermissions,
-        // not attempts. The old code set a `permission_requested` flag after the
-        // first call whether or not anything happened, and because that call was
-        // reaching the Application rather than the Activity (see [`JAVA`]) the
-        // dialog was never shown and never retried: GPS was off for the life of
-        // the process unless the permission was granted from Settings.
-        //
-        // Bounded, because Android stops showing the dialog after the user has
-        // declined twice and silently auto-denies from then on. Retrying past
-        // that is pure noise.
-        //
-        // Retrying *up to* it is not belt-and-braces, and this is the part not
-        // to collapse back into a single call: `request_location_permission`
-        // reaches `Activity.requestPermissions` from this thread, which is not
-        // the UI thread and not a context the framework supports (see that
-        // function). The first attempt fires three seconds in and can land
-        // before the Activity is resumed. The counter only advances when the
-        // call actually got through, so a dropped attempt costs one more pass
-        // of this loop rather than the whole feature.
-        const MAX_PERMISSION_REQUESTS: u32 = 2;
-        let mut requests_made = 0u32;
+            // Counts requests that *actually reached* Activity.requestPermissions,
+            // not attempts. The old code set a `permission_requested` flag after the
+            // first call whether or not anything happened, and because that call was
+            // reaching the Application rather than the Activity (see [`JAVA`]) the
+            // dialog was never shown and never retried: GPS was off for the life of
+            // the process unless the permission was granted from Settings.
+            //
+            // Bounded, because Android stops showing the dialog after the user has
+            // declined twice and silently auto-denies from then on. Retrying past
+            // that is pure noise.
+            //
+            // Retrying *up to* it is not belt-and-braces, and this is the part not
+            // to collapse back into a single call: `request_location_permission`
+            // reaches `Activity.requestPermissions` from this thread, which is not
+            // the UI thread and not a context the framework supports (see that
+            // function). The first attempt fires three seconds in and can land
+            // before the Activity is resumed. The counter only advances when the
+            // call actually got through, so a dropped attempt costs one more pass
+            // of this loop rather than the whole feature.
+            const MAX_PERMISSION_REQUESTS: u32 = 2;
+            let mut requests_made = 0u32;
 
-        // Whether `LocationHelper.start()` has been delivered. Tracked so the
-        // call is made once per grant rather than every 10 s; retried while
-        // `false` because a miss (helper class not registered, JNI attach
-        // failure) must not cost the process live updates -- the call is
-        // idempotent on the Java side.
-        let mut updates_started = false;
+            // Whether `LocationHelper.start()` has been delivered. Tracked so the
+            // call is made once per grant rather than every 10 s; retried while
+            // `false` because a miss (helper class not registered, JNI attach
+            // failure) must not cost the process live updates -- the call is
+            // idempotent on the Java side.
+            let mut updates_started = false;
 
-        loop {
-            if has_location_permission() {
-                if !updates_started {
-                    updates_started = start_location_updates();
+            loop {
+                if has_location_permission() {
+                    if !updates_started {
+                        updates_started = start_location_updates();
+                    }
+                    if let Some(fix) = get_last_known_location()
+                        && sender.send(fix).is_err()
+                    {
+                        break; // channel closed
+                    }
+                } else if requests_made < MAX_PERMISSION_REQUESTS {
+                    log::info!(
+                        "Requesting ACCESS_FINE_LOCATION + ACCESS_COARSE_LOCATION permissions"
+                    );
+                    if request_location_permission() {
+                        requests_made += 1;
+                    }
                 }
-                if let Some(fix) = get_last_known_location()
-                    && sender.send(fix).is_err()
-                {
-                    break; // channel closed
-                }
-            } else if requests_made < MAX_PERMISSION_REQUESTS {
-                log::info!("Requesting ACCESS_FINE_LOCATION + ACCESS_COARSE_LOCATION permissions");
-                if request_location_permission() {
-                    requests_made += 1;
-                }
+
+                std::thread::sleep(std::time::Duration::from_secs(10));
             }
-
-            std::thread::sleep(std::time::Duration::from_secs(10));
-        }
-    }).expect("failed to spawn gps-location thread");
+        })
+        .expect("failed to spawn gps-location thread");
 }
 
 /// Query the system window insets (status bar, navigation bar) in physical pixels.
@@ -513,16 +517,35 @@ fn system_insets_with(
     // full-bleed rect that ignored cutouts and the navigation bar.
     //
     // Activity.getWindow().getDecorView().getRootWindowInsets()
-    let window = match env.call_method(activity, jni_str!("getWindow"), jni_sig!("()Landroid/view/Window;"), &[]) {
-        Ok(w) => match w.l() { Ok(w) => w, Err(_) => return (0.0, 0.0, 0.0, 0.0) },
+    let window = match env.call_method(
+        activity,
+        jni_str!("getWindow"),
+        jni_sig!("()Landroid/view/Window;"),
+        &[],
+    ) {
+        Ok(w) => match w.l() {
+            Ok(w) => w,
+            Err(_) => return (0.0, 0.0, 0.0, 0.0),
+        },
         Err(_) => return (0.0, 0.0, 0.0, 0.0),
     };
-    let decor = match env.call_method(&window, jni_str!("getDecorView"), jni_sig!("()Landroid/view/View;"), &[]) {
-        Ok(v) => match v.l() { Ok(v) => v, Err(_) => return (0.0, 0.0, 0.0, 0.0) },
+    let decor = match env.call_method(
+        &window,
+        jni_str!("getDecorView"),
+        jni_sig!("()Landroid/view/View;"),
+        &[],
+    ) {
+        Ok(v) => match v.l() {
+            Ok(v) => v,
+            Err(_) => return (0.0, 0.0, 0.0, 0.0),
+        },
         Err(_) => return (0.0, 0.0, 0.0, 0.0),
     };
     let insets_obj = match env.call_method(
-        &decor, jni_str!("getRootWindowInsets"), jni_sig!("()Landroid/view/WindowInsets;"), &[]
+        &decor,
+        jni_str!("getRootWindowInsets"),
+        jni_sig!("()Landroid/view/WindowInsets;"),
+        &[],
     ) {
         Ok(i) => match i.l() {
             Ok(i) if !i.is_null() => i,
@@ -539,12 +562,19 @@ fn system_insets_with(
             Ok(c) => c,
             Err(_) => return get_legacy_insets(env, &insets_obj),
         };
-        let type_mask = match env.call_static_method(&type_class, jni_str!("systemBars"), jni_sig!("()I"), &[]) {
-            Ok(v) => match v.i() { Ok(v) => v, Err(_) => return get_legacy_insets(env, &insets_obj) },
-            Err(_) => return get_legacy_insets(env, &insets_obj),
-        };
+        let type_mask =
+            match env.call_static_method(&type_class, jni_str!("systemBars"), jni_sig!("()I"), &[])
+            {
+                Ok(v) => match v.i() {
+                    Ok(v) => v,
+                    Err(_) => return get_legacy_insets(env, &insets_obj),
+                },
+                Err(_) => return get_legacy_insets(env, &insets_obj),
+            };
         let insets_result = env.call_method(
-            &insets_obj, jni_str!("getInsets"), jni_sig!("(I)Landroid/graphics/Insets;"),
+            &insets_obj,
+            jni_str!("getInsets"),
+            jni_sig!("(I)Landroid/graphics/Insets;"),
             &[JValue::Int(type_mask)],
         );
         match insets_result {
@@ -553,10 +583,22 @@ fn system_insets_with(
                     Ok(i) if !i.is_null() => i,
                     _ => return get_legacy_insets(env, &insets_obj),
                 };
-                let t = env.get_field(&insets, jni_str!("top"), jni_sig!("I")).map(|v| v.i().unwrap_or(0)).unwrap_or(0);
-                let b = env.get_field(&insets, jni_str!("bottom"), jni_sig!("I")).map(|v| v.i().unwrap_or(0)).unwrap_or(0);
-                let l = env.get_field(&insets, jni_str!("left"), jni_sig!("I")).map(|v| v.i().unwrap_or(0)).unwrap_or(0);
-                let r = env.get_field(&insets, jni_str!("right"), jni_sig!("I")).map(|v| v.i().unwrap_or(0)).unwrap_or(0);
+                let t = env
+                    .get_field(&insets, jni_str!("top"), jni_sig!("I"))
+                    .map(|v| v.i().unwrap_or(0))
+                    .unwrap_or(0);
+                let b = env
+                    .get_field(&insets, jni_str!("bottom"), jni_sig!("I"))
+                    .map(|v| v.i().unwrap_or(0))
+                    .unwrap_or(0);
+                let l = env
+                    .get_field(&insets, jni_str!("left"), jni_sig!("I"))
+                    .map(|v| v.i().unwrap_or(0))
+                    .unwrap_or(0);
+                let r = env
+                    .get_field(&insets, jni_str!("right"), jni_sig!("I"))
+                    .map(|v| v.i().unwrap_or(0))
+                    .unwrap_or(0);
                 (t as f32, b as f32, l as f32, r as f32)
             }
             Err(_) => get_legacy_insets(env, &insets_obj),
@@ -569,17 +611,48 @@ fn system_insets_with(
 }
 
 /// Fallback for Android < API 30: use deprecated getSystemWindowInset*() methods.
-fn get_legacy_insets(env: &mut jni::Env<'_>, insets_obj: &jni::objects::JObject<'_>) -> (f32, f32, f32, f32) {
+fn get_legacy_insets(
+    env: &mut jni::Env<'_>,
+    insets_obj: &jni::objects::JObject<'_>,
+) -> (f32, f32, f32, f32) {
     use jni::{jni_sig, jni_str};
 
-    let top = env.call_method(insets_obj, jni_str!("getSystemWindowInsetTop"), jni_sig!("()I"), &[])
-        .map(|v| v.i().unwrap_or(0)).unwrap_or(0);
-    let bottom = env.call_method(insets_obj, jni_str!("getSystemWindowInsetBottom"), jni_sig!("()I"), &[])
-        .map(|v| v.i().unwrap_or(0)).unwrap_or(0);
-    let left = env.call_method(insets_obj, jni_str!("getSystemWindowInsetLeft"), jni_sig!("()I"), &[])
-        .map(|v| v.i().unwrap_or(0)).unwrap_or(0);
-    let right = env.call_method(insets_obj, jni_str!("getSystemWindowInsetRight"), jni_sig!("()I"), &[])
-        .map(|v| v.i().unwrap_or(0)).unwrap_or(0);
+    let top = env
+        .call_method(
+            insets_obj,
+            jni_str!("getSystemWindowInsetTop"),
+            jni_sig!("()I"),
+            &[],
+        )
+        .map(|v| v.i().unwrap_or(0))
+        .unwrap_or(0);
+    let bottom = env
+        .call_method(
+            insets_obj,
+            jni_str!("getSystemWindowInsetBottom"),
+            jni_sig!("()I"),
+            &[],
+        )
+        .map(|v| v.i().unwrap_or(0))
+        .unwrap_or(0);
+    let left = env
+        .call_method(
+            insets_obj,
+            jni_str!("getSystemWindowInsetLeft"),
+            jni_sig!("()I"),
+            &[],
+        )
+        .map(|v| v.i().unwrap_or(0))
+        .unwrap_or(0);
+    let right = env
+        .call_method(
+            insets_obj,
+            jni_str!("getSystemWindowInsetRight"),
+            jni_sig!("()I"),
+            &[],
+        )
+        .map(|v| v.i().unwrap_or(0))
+        .unwrap_or(0);
     (top as f32, bottom as f32, left as f32, right as f32)
 }
 
@@ -591,7 +664,9 @@ fn get_legacy_insets(env: &mut jni::Env<'_>, insets_obj: &jni::objects::JObject<
 fn android_api_level(env: &mut jni::Env<'_>) -> i32 {
     use jni::{jni_sig, jni_str};
 
-    let Ok(build_class) = env.find_class(jni_str!("android/os/Build$VERSION")) else { return 0 };
+    let Ok(build_class) = env.find_class(jni_str!("android/os/Build$VERSION")) else {
+        return 0;
+    };
     env.get_static_field(&build_class, jni_str!("SDK_INT"), jni_sig!("I"))
         .map(|v| v.i().unwrap_or(0))
         .unwrap_or(0)
@@ -683,7 +758,9 @@ pub fn detect_dark_theme() -> bool {
 
     // `Option<Result<_>>`: the outer `None` is "no Activity yet, or the thread
     // would not attach", the inner `Err` is a JNI failure. Both mean light.
-    let Some(Ok(ui_mode)) = ui_mode else { return false };
+    let Some(Ok(ui_mode)) = ui_mode else {
+        return false;
+    };
 
     // Configuration.UI_MODE_NIGHT_MASK / UI_MODE_NIGHT_YES.
     const UI_MODE_NIGHT_MASK: i32 = 0x30;
@@ -918,18 +995,19 @@ fn start_compass_thread(sender: std::sync::mpsc::Sender<f32>) {
     std::thread::Builder::new()
         .name("compass-heading".into())
         .spawn(move || {
-        // Wait for CompassHelper to be initialized
-        std::thread::sleep(std::time::Duration::from_secs(4));
+            // Wait for CompassHelper to be initialized
+            std::thread::sleep(std::time::Duration::from_secs(4));
 
-        loop {
-            if let Some(heading) = get_compass_heading()
-                && sender.send(heading).is_err()
-            {
-                break; // channel closed
+            loop {
+                if let Some(heading) = get_compass_heading()
+                    && sender.send(heading).is_err()
+                {
+                    break; // channel closed
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
             }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
-    }).expect("failed to spawn compass-heading thread");
+        })
+        .expect("failed to spawn compass-heading thread");
 }
 
 /// Load one of our own Java helper classes through the app's [`ClassLoader`] and
@@ -997,7 +1075,7 @@ fn register_java_helper(
 #[unsafe(no_mangle)]
 fn android_main(app: AndroidApp) {
     use winit::platform::android::EventLoopBuilderExtAndroid;
-    
+
     // Initialize Android logging
     android_logger::init_once(
         android_logger::Config::default()
@@ -1130,9 +1208,7 @@ fn android_main(app: AndroidApp) {
         .and_then(|p| p.parent().map(|root| root.join("cache").join("zones")));
 
     // Derive the config directory before `app` is moved into the event loop.
-    let android_config_dir = app
-        .internal_data_path()
-        .map(|p| p.join("config"));
+    let android_config_dir = app.internal_data_path().map(|p| p.join("config"));
 
     // Create event loop with Android app
     let event_loop = winit::event_loop::EventLoop::builder()
@@ -1180,8 +1256,19 @@ fn android_main(app: AndroidApp) {
         let (top, bottom, left, right) = get_system_insets();
         let density = get_display_density();
         let density = if density > 0.0 { density } else { 1.0 };
-        let result = (top / density, bottom / density, left / density, right / density);
-        log::info!("Safe area insets (logical): top={}, bottom={}, left={}, right={}", result.0, result.1, result.2, result.3);
+        let result = (
+            top / density,
+            bottom / density,
+            left / density,
+            right / density,
+        );
+        log::info!(
+            "Safe area insets (logical): top={}, bottom={}, left={}, right={}",
+            result.0,
+            result.1,
+            result.2,
+            result.3
+        );
         result
     });
 
@@ -1199,7 +1286,7 @@ fn android_main(app: AndroidApp) {
     let (heading_sender, heading_receiver) = std::sync::mpsc::channel();
     start_compass_thread(heading_sender);
     platform_app.set_heading_receiver(heading_receiver);
-    
+
     if let Err(e) = event_loop.run_app(&mut platform_app) {
         log::error!("Application error: {}", e);
     }

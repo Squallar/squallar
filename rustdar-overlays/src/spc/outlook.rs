@@ -1,5 +1,5 @@
+use crate::types::{CIG_FILL_ALPHA, GeoPolygon, HatchPattern, OverlayFeature, REGULAR_FILL_ALPHA};
 use chrono::NaiveDateTime;
-use crate::types::{GeoPolygon, HatchPattern, OverlayFeature, CIG_FILL_ALPHA, REGULAR_FILL_ALPHA};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum OutlookDay {
@@ -48,10 +48,7 @@ impl OutlookDay {
                 OutlookProduct::Wind,
                 OutlookProduct::Hail,
             ],
-            OutlookDay::Day3 => &[
-                OutlookProduct::Categorical,
-                OutlookProduct::Probabilistic,
-            ],
+            OutlookDay::Day3 => &[OutlookProduct::Categorical, OutlookProduct::Probabilistic],
             _ => &[OutlookProduct::Probabilistic],
         }
     }
@@ -190,15 +187,18 @@ pub fn parse_geojson(
         // propagating the error here turned one of them into an empty outlook.
         // Skip-and-warn, mirroring `nws::alert::parse_alerts`; `Err` is
         // reserved for an unusable envelope (bad JSON, no `features` array).
-        let ParsedOutlookFeature { feature, valid: feat_valid, expire: feat_expire } =
-            match parse_outlook_feature(feature_val) {
-                Ok(Some(result)) => result,
-                Ok(None) => continue,
-                Err(e) => {
-                    log::warn!("SPC {day} {product}: skipping malformed feature: {e}");
-                    continue;
-                }
-            };
+        let ParsedOutlookFeature {
+            feature,
+            valid: feat_valid,
+            expire: feat_expire,
+        } = match parse_outlook_feature(feature_val) {
+            Ok(Some(result)) => result,
+            Ok(None) => continue,
+            Err(e) => {
+                log::warn!("SPC {day} {product}: skipping malformed feature: {e}");
+                continue;
+            }
+        };
         if valid.is_none() {
             valid = feat_valid;
         }
@@ -261,7 +261,11 @@ fn parse_outlook_feature(
         _ => HatchPattern::None,
     };
 
-    let fill_alpha = if hatch != HatchPattern::None { CIG_FILL_ALPHA } else { REGULAR_FILL_ALPHA };
+    let fill_alpha = if hatch != HatchPattern::None {
+        CIG_FILL_ALPHA
+    } else {
+        REGULAR_FILL_ALPHA
+    };
     let fill_rgba = super::colors::parse_hex_color(fill_hex, fill_alpha);
     let stroke_rgba = super::colors::parse_hex_color(stroke_hex, 255);
 
@@ -278,10 +282,7 @@ fn parse_outlook_feature(
         .get("geometry")
         .ok_or_else(|| "Feature missing 'geometry'".to_string())?;
 
-    let geo_type = geometry
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let geo_type = geometry.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     let mut polygons = match geo_type {
         "MultiPolygon" => parse_multi_polygon(geometry)?,
@@ -310,7 +311,11 @@ fn parse_outlook_feature(
     }
 
     let feature = OverlayFeature::new(polygons, fill_rgba, stroke_rgba, label, label2, hatch);
-    Ok(Some(ParsedOutlookFeature { feature, valid, expire }))
+    Ok(Some(ParsedOutlookFeature {
+        feature,
+        valid,
+        expire,
+    }))
 }
 
 /// GeoJSON is `[lon, lat]`; output is `(lat, lon)`.
@@ -371,8 +376,11 @@ mod tests {
         let good = feature(
             "SLGT",
             serde_json::json!([[[
-                [-100.0, 30.0], [-95.0, 30.0], [-95.0, 35.0],
-                [-100.0, 35.0], [-100.0, 30.0]
+                [-100.0, 30.0],
+                [-95.0, 30.0],
+                [-95.0, 35.0],
+                [-100.0, 35.0],
+                [-100.0, 30.0]
             ]]]),
         );
         let json = serde_json::json!({ "features": [degenerate, good] });
@@ -380,7 +388,11 @@ mod tests {
         let outlook = parse_geojson(&json, OutlookDay::Day1, OutlookProduct::Categorical)
             .expect("one bad feature must not abort the whole outlook");
 
-        assert_eq!(outlook.features.len(), 1, "the good feature survives, the bad one is dropped");
+        assert_eq!(
+            outlook.features.len(),
+            1,
+            "the good feature survives, the bad one is dropped"
+        );
         assert_eq!(outlook.features[0].label, "SLGT");
         // VALID/EXPIRE still come from the surviving feature.
         assert!(outlook.valid.is_some() && outlook.expire.is_some());
