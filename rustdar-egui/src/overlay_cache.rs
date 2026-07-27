@@ -307,16 +307,10 @@ pub fn overlay_texture_rect(
     tex: &OverlayTextureData,
 ) -> egui::Rect {
     let nw = projector
-        .project(walkers::lat_lon(
-            tex.geo_bounds.max_lat,
-            tex.geo_bounds.min_lon,
-        ))
+        .project(walkers::lat_lon(tex.geo_bounds.max_lat, tex.geo_bounds.min_lon))
         .to_pos2();
     let se = projector
-        .project(walkers::lat_lon(
-            tex.geo_bounds.min_lat,
-            tex.geo_bounds.max_lon,
-        ))
+        .project(walkers::lat_lon(tex.geo_bounds.min_lat, tex.geo_bounds.max_lon))
         .to_pos2();
     egui::Rect::from_two_pos(nw, se)
 }
@@ -357,25 +351,41 @@ fn lat_rad_to_mercator_y(lat_rad: f64) -> f64 {
 /// Test whether a geographic point (lat, lon) falls inside any polygon of an
 /// overlay feature, using the even-odd rule on geo-coordinate rings.
 ///
+/// Each polygon's first ring is its exterior; the rest are holes (see
+/// `GeoPolygonRing`). Under the even-odd rule a point inside a hole is
+/// *outside* that polygon, so an exterior hit only counts when no hole of the
+/// same polygon contains the point — otherwise a click in the cut-out of an
+/// SPC/NWS donut opens the surrounding feature's popup.
+///
 /// Uses Web Mercator Y for the vertical axis so that comparisons are
 /// consistent with the rendered projection.
 pub fn geo_point_in_feature(lat: f64, lon: f64, feature: &OverlayFeature) -> bool {
     let merc_y = lat_rad_to_mercator_y(lat.to_radians());
-    for polygon in &feature.polygons {
-        let Some(exterior) = polygon.first() else {
-            continue;
-        };
-        if exterior.len() < 3 {
-            continue;
+    let point = ScreenPoint::new(lon as f32, merc_y as f32);
+    let ring_contains = |ring: &[(f64, f64)]| {
+        if ring.len() < 3 {
+            return false;
         }
-        let ring: Vec<ScreenPoint> = exterior
+        let projected: Vec<ScreenPoint> = ring
             .iter()
             .map(|&(rlat, rlon)| {
-                ScreenPoint::new(rlon as f32, lat_rad_to_mercator_y(rlat.to_radians()) as f32)
+                ScreenPoint::new(
+                    rlon as f32,
+                    lat_rad_to_mercator_y(rlat.to_radians()) as f32,
+                )
             })
             .collect();
-        let point = ScreenPoint::new(lon as f32, merc_y as f32);
-        if overlay_geo::point_in_polygon(point, &ring) {
+        overlay_geo::point_in_polygon(point, &projected)
+    };
+    for polygon in &feature.polygons {
+        let Some(exterior) = polygon.first() else { continue };
+        if !ring_contains(exterior) {
+            continue;
+        }
+        // Inside the exterior — but inside any interior ring means this
+        // polygon has a hole here, and the point is outside it. Another
+        // polygon of the same feature may still contain the point.
+        if !polygon[1..].iter().any(|hole| ring_contains(hole)) {
             return true;
         }
     }
@@ -402,6 +412,73 @@ pub fn current_quantized_zoom(zoom: f64) -> i32 {
 }
 
 #[cfg(test)]
+mod geo_click_tests {
+    use super::*;
+    use rustdar_overlays::types::HatchPattern;
+
+    /// A feature holding the given polygons, with fields that play no part in
+    /// hit-testing left at throwaway values.
+    fn feature(polygons: Vec<Vec<Vec<(f64, f64)>>>) -> OverlayFeature {
+        OverlayFeature::new(
+            polygons,
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            String::new(),
+            String::new(),
+            HatchPattern::None,
+        )
+    }
+
+    /// A square ring in (lat, lon) order, closed like GeoJSON rings arrive.
+    fn square(min_lat: f64, max_lat: f64, min_lon: f64, max_lon: f64) -> Vec<(f64, f64)> {
+        vec![
+            (min_lat, min_lon),
+            (min_lat, max_lon),
+            (max_lat, max_lon),
+            (max_lat, min_lon),
+            (min_lat, min_lon),
+        ]
+    }
+
+    /// A donut: `polygon[0]` is the exterior, `polygon[1]` the hole — the ring
+    /// layout `GeoPolygonRing` documents and GeoJSON delivers.
+    fn donut() -> Vec<Vec<(f64, f64)>> {
+        vec![square(30.0, 40.0, -100.0, -90.0), square(33.0, 37.0, -97.0, -93.0)]
+    }
+
+    /// The live consequence of testing only `polygon.first()`: a click inside
+    /// an SPC/NWS polygon's hole reported "inside" and opened the surrounding
+    /// feature's popup. Even-odd says a hole hit is an exit, not an entry.
+    #[test]
+    fn a_point_in_a_polygons_hole_is_outside_the_feature() {
+        let f = feature(vec![donut()]);
+        assert!(
+            !geo_point_in_feature(35.0, -95.0, &f),
+            "the hole's centre was reported inside — interior rings are being ignored"
+        );
+        // The counterweight, either side of the hole boundary: the ring
+        // between exterior and hole is still inside, so this cannot pass by
+        // rejecting the exterior wholesale.
+        assert!(geo_point_in_feature(31.0, -95.0, &f), "the solid ring south of the hole");
+        assert!(geo_point_in_feature(35.0, -98.5, &f), "the solid ring west of the hole");
+        assert!(!geo_point_in_feature(45.0, -95.0, &f), "north of the exterior entirely");
+    }
+
+    /// A hole belongs to *its* polygon only. A second polygon of the same
+    /// MultiPolygon sitting inside the first one's hole (an island) must still
+    /// take the hit — rejecting on any hole in the feature would lose it.
+    #[test]
+    fn a_hole_in_one_polygon_does_not_mask_another_polygon_of_the_feature() {
+        let island = vec![square(34.0, 36.0, -96.0, -94.0)];
+        let f = feature(vec![donut(), island]);
+        assert!(
+            geo_point_in_feature(35.0, -95.0, &f),
+            "the island inside the donut's hole was masked by the hole"
+        );
+    }
+}
+
+#[cfg(test)]
 mod texture_budget_tests {
     use super::*;
 
@@ -419,11 +496,7 @@ mod texture_budget_tests {
     /// A plan with the given overdraw. Dimensions are irrelevant to `coverage`, so
     /// they stand in at 1x1 rather than pretending to a size.
     fn plan_with_overdraw(overdraw: f32) -> OverlayTexturePlan {
-        OverlayTexturePlan {
-            width: 1,
-            height: 1,
-            overdraw,
-        }
+        OverlayTexturePlan { width: 1, height: 1, overdraw }
     }
 
     /// Right after a render: the texture covers `viewport ± overdraw` on all four
@@ -444,12 +517,7 @@ mod texture_budget_tests {
     /// obviously computing one axis's band from the other's ranges — produces
     /// identical answers and survives every assertion here.
     fn viewport() -> GeoBounds {
-        GeoBounds {
-            min_lat: 30.0,
-            max_lat: 40.0,
-            min_lon: -100.0,
-            max_lon: -84.0,
-        }
+        GeoBounds { min_lat: 30.0, max_lat: 40.0, min_lon: -100.0, max_lon: -84.0 }
     }
 
     /// The viewport's own extent per axis, which is also the overdraw band at
@@ -461,19 +529,11 @@ mod texture_budget_tests {
 
     /// Slide a viewport south (negative) or north (positive) by `d` degrees.
     fn panned_lat(viewport: &GeoBounds, d: f64) -> GeoBounds {
-        GeoBounds {
-            min_lat: viewport.min_lat + d,
-            max_lat: viewport.max_lat + d,
-            ..*viewport
-        }
+        GeoBounds { min_lat: viewport.min_lat + d, max_lat: viewport.max_lat + d, ..*viewport }
     }
 
     fn panned_lon(viewport: &GeoBounds, d: f64) -> GeoBounds {
-        GeoBounds {
-            min_lon: viewport.min_lon + d,
-            max_lon: viewport.max_lon + d,
-            ..*viewport
-        }
+        GeoBounds { min_lon: viewport.min_lon + d, max_lon: viewport.max_lon + d, ..*viewport }
     }
 
     // ── plan_overlay_texture ─────────────────────────────────────────────
@@ -491,16 +551,8 @@ mod texture_budget_tests {
         );
 
         let plan = plan_overlay_texture(pane(683.0, 400.0), WEBGL2_LIMIT);
-        assert!(
-            plan.width <= WEBGL2_LIMIT,
-            "width {} exceeds the limit",
-            plan.width
-        );
-        assert!(
-            plan.height <= WEBGL2_LIMIT,
-            "height {} exceeds the limit",
-            plan.height
-        );
+        assert!(plan.width <= WEBGL2_LIMIT, "width {} exceeds the limit", plan.width);
+        assert!(plan.height <= WEBGL2_LIMIT, "height {} exceeds the limit", plan.height);
         assert!(
             plan.overdraw < OVERDRAW_FRACTION,
             "overdraw {} should have been cut back from {OVERDRAW_FRACTION}",
@@ -537,12 +589,7 @@ mod texture_budget_tests {
     /// window can demand, so the plan is bit-for-bit what the old constant produced.
     #[test]
     fn a_desktop_adapter_limit_changes_nothing() {
-        for (w, h) in [
-            (683.0, 400.0),
-            (1920.0, 1080.0),
-            (2560.0, 1440.0),
-            (100.0, 100.0),
-        ] {
+        for (w, h) in [(683.0, 400.0), (1920.0, 1080.0), (2560.0, 1440.0), (100.0, 100.0)] {
             let plan = plan_overlay_texture(pane(w, h), DESKTOP_LIMIT);
             assert_eq!(
                 plan.overdraw, OVERDRAW_FRACTION,
@@ -575,10 +622,7 @@ mod texture_budget_tests {
     fn only_the_overflowing_axis_is_truncated() {
         let plan = plan_overlay_texture(pane(3000.0, 900.0), WEBGL2_LIMIT);
         assert_eq!(plan.overdraw, 0.0);
-        assert_eq!(
-            plan.width, WEBGL2_LIMIT,
-            "the overflowing axis is cut to the limit"
-        );
+        assert_eq!(plan.width, WEBGL2_LIMIT, "the overflowing axis is cut to the limit");
         assert_eq!(plan.height, 900, "the axis that fits keeps its own size");
     }
 
@@ -590,10 +634,7 @@ mod texture_budget_tests {
     fn a_degenerate_pane_produces_a_finite_plan() {
         let plan = plan_overlay_texture(pane(0.0, 0.0), WEBGL2_LIMIT);
         assert!(plan.overdraw.is_finite(), "got {}", plan.overdraw);
-        assert_eq!(
-            plan.overdraw, OVERDRAW_FRACTION,
-            "a zero side constrains nothing"
-        );
+        assert_eq!(plan.overdraw, OVERDRAW_FRACTION, "a zero side constrains nothing");
         assert_eq!((plan.width, plan.height), (0, 0));
     }
 
@@ -603,10 +644,7 @@ mod texture_budget_tests {
     fn a_pane_with_one_zero_axis_still_sizes_the_other() {
         let plan = plan_overlay_texture(pane(0.0, 3000.0), WEBGL2_LIMIT);
         assert!(plan.overdraw.is_finite());
-        assert_eq!(
-            plan.overdraw, 0.0,
-            "the 3000pt axis alone exhausts the limit"
-        );
+        assert_eq!(plan.overdraw, 0.0, "the 3000pt axis alone exhausts the limit");
         assert_eq!(plan.width, 0);
         assert_eq!(plan.height, WEBGL2_LIMIT);
     }
@@ -642,28 +680,16 @@ mod texture_budget_tests {
         let short = |band: f64| band * (PAN_REBUILD_THRESHOLD as f64 - 0.05);
 
         for d in [past(band_lat), -past(band_lat)] {
-            assert!(
-                pan_exceeds_coverage(&tex, &panned_lat(&vp, d)),
-                "lat pan {d} must rebuild"
-            );
+            assert!(pan_exceeds_coverage(&tex, &panned_lat(&vp, d)), "lat pan {d} must rebuild");
         }
         for d in [past(band_lon), -past(band_lon)] {
-            assert!(
-                pan_exceeds_coverage(&tex, &panned_lon(&vp, d)),
-                "lon pan {d} must rebuild"
-            );
+            assert!(pan_exceeds_coverage(&tex, &panned_lon(&vp, d)), "lon pan {d} must rebuild");
         }
         for d in [short(band_lat), -short(band_lat)] {
-            assert!(
-                !pan_exceeds_coverage(&tex, &panned_lat(&vp, d)),
-                "lat pan {d} is still covered"
-            );
+            assert!(!pan_exceeds_coverage(&tex, &panned_lat(&vp, d)), "lat pan {d} is still covered");
         }
         for d in [short(band_lon), -short(band_lon)] {
-            assert!(
-                !pan_exceeds_coverage(&tex, &panned_lon(&vp, d)),
-                "lon pan {d} is still covered"
-            );
+            assert!(!pan_exceeds_coverage(&tex, &panned_lon(&vp, d)), "lon pan {d} is still covered");
         }
     }
 
@@ -675,10 +701,7 @@ mod texture_budget_tests {
     fn each_axis_is_judged_against_its_own_band() {
         let vp = viewport();
         let (band_lat, band_lon) = viewport_ranges();
-        assert!(
-            band_lon > band_lat * 1.5,
-            "fixture must be decisively non-square"
-        );
+        assert!(band_lon > band_lat * 1.5, "fixture must be decisively non-square");
 
         let tex = freshly_rendered(&vp, OVERDRAW_FRACTION);
         // Headroom is 30% of the band: 3° of latitude, 4.8° of longitude. A 6.5°
@@ -748,12 +771,7 @@ mod texture_budget_tests {
     fn a_pane_that_outgrew_its_texture_rebuilds() {
         let vp = viewport();
         let tex = freshly_rendered(&vp, 0.1);
-        let grown = GeoBounds {
-            min_lat: 20.0,
-            max_lat: 50.0,
-            min_lon: -110.0,
-            max_lon: -80.0,
-        };
+        let grown = GeoBounds { min_lat: 20.0, max_lat: 50.0, min_lon: -110.0, max_lon: -80.0 };
         assert!(
             grown.max_lat - grown.min_lat > tex.max_lat - tex.min_lat,
             "fixture must actually outgrow the texture"
@@ -772,10 +790,7 @@ mod texture_budget_tests {
         let vp = viewport();
         let (band_lat_at_full, _) = viewport_ranges();
         let plan = plan_overlay_texture(pane(1440.0, 900.0), WEBGL2_LIMIT);
-        assert!(
-            plan.overdraw < OVERDRAW_FRACTION,
-            "fixture must be a clamped one"
-        );
+        assert!(plan.overdraw < OVERDRAW_FRACTION, "fixture must be a clamped one");
 
         // The production path: the plan is asked for its own coverage.
         let honest = plan.coverage(&vp);
@@ -828,12 +843,7 @@ mod texture_budget_tests {
         let vp = viewport();
         let bounds = plan_with_overdraw(0.0).coverage(&vp);
         assert_eq!(
-            (
-                bounds.min_lat,
-                bounds.max_lat,
-                bounds.min_lon,
-                bounds.max_lon
-            ),
+            (bounds.min_lat, bounds.max_lat, bounds.min_lon, bounds.max_lon),
             (vp.min_lat, vp.max_lat, vp.min_lon, vp.max_lon)
         );
     }
@@ -842,12 +852,7 @@ mod texture_budget_tests {
     /// the map wraps.
     #[test]
     fn latitude_is_clamped_to_the_mercator_range() {
-        let polar = GeoBounds {
-            min_lat: -80.0,
-            max_lat: 80.0,
-            min_lon: -10.0,
-            max_lon: 10.0,
-        };
+        let polar = GeoBounds { min_lat: -80.0, max_lat: 80.0, min_lon: -10.0, max_lon: 10.0 };
         assert!(
             80.0 + 160.0 * OVERDRAW_FRACTION as f64 > MERCATOR_LAT_LIMIT,
             "fixture must actually overrun the clamp"
