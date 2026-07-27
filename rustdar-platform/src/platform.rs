@@ -156,6 +156,9 @@ pub struct AndroidPlatform {
     heading_receiver: Option<std::sync::mpsc::Receiver<f32>>,
     insets_querier: Option<InsetsQuerier>,
     back_handler: Option<fn()>,
+    /// Injected by `rustdar-android`: the flag it reads is set by the JNI
+    /// callback `BackHandler.java` invokes on the UI thread.
+    back_press_taker: Option<fn() -> bool>,
     zone_cache_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
 }
@@ -177,6 +180,7 @@ impl AndroidPlatform {
             heading_receiver: None,
             insets_querier: None,
             back_handler: None,
+            back_press_taker: None,
             zone_cache_dir: None,
             config_dir: None,
         }
@@ -208,6 +212,14 @@ impl PlatformBridge for AndroidPlatform {
         } else {
             false
         }
+    }
+
+    fn poll_back_press(&mut self) -> bool {
+        self.back_press_taker.is_some_and(|take| take())
+    }
+
+    fn set_back_press_taker(&mut self, taker: fn() -> bool) {
+        self.back_press_taker = Some(taker);
     }
 
     fn detect_dark_theme(&self) -> bool {

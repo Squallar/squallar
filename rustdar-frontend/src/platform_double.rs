@@ -72,6 +72,11 @@ pub(crate) struct TestBridge {
     /// others never do, which is the whole of why back minimises there and
     /// quits everywhere else.
     back_handler: Option<fn()>,
+    /// Injected, as Android injects it. Only that platform has a second way to
+    /// deliver back — `OnBackInvokedDispatcher`, which bypasses the input
+    /// queue — so on the other two this stays `None` and `poll_back_press`
+    /// answers `false` forever.
+    back_press_taker: Option<fn() -> bool>,
     /// Injected, as Android injects it: the read is a JNI call.
     insets_querier: Option<fn() -> Insets>,
     /// Injected, as Android injects it.
@@ -94,6 +99,7 @@ impl TestBridge {
             zone_cache_dir: None,
             store: Rc::new(MemoryConfigStore::default()),
             back_handler: None,
+            back_press_taker: None,
             insets_querier: None,
             theme_detector: None,
             fallback_dark: false,
@@ -179,6 +185,14 @@ impl PlatformBridge for TestBridge {
         } else {
             false
         }
+    }
+
+    fn poll_back_press(&mut self) -> bool {
+        self.back_press_taker.is_some_and(|take| take())
+    }
+
+    fn set_back_press_taker(&mut self, taker: fn() -> bool) {
+        self.back_press_taker = Some(taker);
     }
 
     fn detect_dark_theme(&self) -> bool {

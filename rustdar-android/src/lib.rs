@@ -42,7 +42,7 @@ use winit::platform::android::activity::AndroidApp;
 /// | method              | used by                     | symptom when called on Application |
 /// |---------------------|-----------------------------|------------------------------------|
 /// | `getWindow`         | [`get_system_insets`]       | insets always `(0,0,0,0)`, so the map's `excluded_rects` ignore cutouts and nav bars |
-/// | `moveTaskToBack`    | [`move_task_to_back`]       | back-to-minimise dead on API 28–32 (33+ goes through `BackHandler`) |
+/// | `moveTaskToBack`    | [`move_task_to_back`]       | back-to-minimise dead, on every API level and by either dispatch route |
 /// | `requestPermissions`| [`request_location_permission`] | the location dialog is never shown, so GPS stays off |
 ///
 /// `getResources`, `getSystemService` and `checkSelfPermission` are `Context`
@@ -567,13 +567,16 @@ pub fn detect_dark_theme() -> bool {
 /// This keeps the app alive in recents with a proper thumbnail instead of
 /// killing the process (which leaves a white box in recents).
 ///
-/// This is the **only** path to minimise on API 28–32. `BackHandler.java`
-/// covers 33+, where back arrives through `OnBackInvokedDispatcher`; below that
-/// `KEYCODE_BACK` comes in over the native input queue and the frontend calls
-/// this. `PlatformBridge::handle_back` reports `true` as soon as a handler is
-/// installed, so a no-op here reads to the frontend as a handled press and the
-/// button does nothing at all — which is what happened while this was reaching
-/// the Application instead of the Activity. See [`JAVA`].
+/// This is where *every* back press that the UI did not want ends up, whichever
+/// route it came in by: `KEYCODE_BACK` off the native input queue, or
+/// `OnBackInvokedDispatcher` through [`Java_com_rustdar_BackHandler_nativeBackPressed`].
+/// Both reach `App::resolve_back_press`, which asks the UI first and only then
+/// calls `PlatformBridge::handle_back` — which is this.
+///
+/// `handle_back` reports `true` as soon as a handler is installed, so a no-op
+/// here reads to the frontend as a handled press and the button does nothing at
+/// all — which is what happened while this was reaching the Application instead
+/// of the Activity. See [`JAVA`].
 pub fn move_task_to_back() {
     use jni::objects::JValue;
     use jni::{jni_sig, jni_str};
@@ -591,6 +594,157 @@ pub fn move_task_to_back() {
     });
     if called.is_none() {
         log::warn!("moveTaskToBack: no Activity yet, or JNI attach failed");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Predictive back (BackHandler.java)
+// ---------------------------------------------------------------------------
+
+/// A back press from `OnBackInvokedDispatcher`, waiting to be spent.
+///
+/// Written on the Java UI thread by [`Java_com_rustdar_BackHandler_nativeBackPressed`]
+/// and taken on the `android_main` thread by [`take_back_press`]. A flag rather
+/// than a count: two presses the loop never got between are one press as far as
+/// the user is concerned, and collapsing them here is cheaper than dismissing
+/// two layers for one gesture.
+///
+/// Process-global, and `android_main` is not: see [`set_event_loop_proxy`],
+/// which clears this so a press parked against a dead loop is not spent by the
+/// next one.
+static BACK_PRESS_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Wakes the winit loop for [`BACK_PRESS_PENDING`], or `None` when there is no
+/// loop to wake.
+///
+/// **Replaceable, not write-once.** `android_main` is tied to the lifetime of
+/// the *Activity*, not the process: android-activity's own docs say it "may be
+/// called multiple times, for each `Activity` instance". `run_app` consumes the
+/// `EventLoop` and drops the receiver behind the proxy, so a second
+/// `android_main` must install a live one over the dead one. A `OnceLock` here
+/// would keep the corpse, `send_event` would fail forever, and every back press
+/// for the rest of the process would fall through to the Java minimise — the
+/// exact bug this route exists to remove, silently reinstated.
+///
+/// The `Mutex` is for that replacement and nothing else. `EventLoopProxy<()>`
+/// is both `Send` and `Sync` here (`mpsc::Sender<T: Send>` has been `Sync`
+/// since Rust 1.72, and `AndroidAppWaker` declares both), so a static needs no
+/// lock to *hold* one — only to swap one.
+///
+/// Empty until [`android_main`] builds the loop, which is after
+/// [`register_java_helper`] has already registered `BackHandler`; presses in
+/// that window are what the Java side's fallback covers.
+#[cfg(target_os = "android")]
+static EVENT_LOOP_PROXY: std::sync::Mutex<Option<winit::event_loop::EventLoopProxy<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Pins the "not there to make the proxy shareable" half of the note above.
+///
+/// An earlier draft of it said `mpsc::Sender` was `Send` but not `Sync`, which
+/// stopped being true in Rust 1.72 and was simply wrong about the lock's reason
+/// to exist. If this ever fails the lock has acquired a second reason, and the
+/// note needs rewriting rather than the assertion deleting.
+#[cfg(target_os = "android")]
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<winit::event_loop::EventLoopProxy<()>>();
+};
+
+/// Take the proxy slot, recovering from poisoning rather than reporting "no
+/// loop".
+///
+/// Nothing under this lock can panic today, so poisoning means some future
+/// caller does. Treating that as "no event loop" would silently downgrade every
+/// later back press to a bare minimise, which is precisely the failure this
+/// module is about; the proxy itself is unaffected by an unwind elsewhere, so
+/// the guard is worth taking.
+#[cfg(target_os = "android")]
+fn event_loop_proxy()
+-> std::sync::MutexGuard<'static, Option<winit::event_loop::EventLoopProxy<()>>> {
+    EVENT_LOOP_PROXY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Install (or clear) the proxy back presses are handed to.
+///
+/// Clears [`BACK_PRESS_PENDING`] with it: on a second `android_main` a press
+/// may be parked against the loop that just died, and the new loop's first
+/// `about_to_wait` would otherwise spend it on a layer the user never asked to
+/// close.
+#[cfg(target_os = "android")]
+fn set_event_loop_proxy(proxy: Option<winit::event_loop::EventLoopProxy<()>>) {
+    *event_loop_proxy() = proxy;
+    BACK_PRESS_PENDING.store(false, std::sync::atomic::Ordering::Release);
+}
+
+/// Park a back press and wake the event loop for it.
+///
+/// `false` means there is no live loop to hand it to, and the Java caller
+/// minimises for itself — which is what it used to do unconditionally.
+fn post_back_press() -> bool {
+    #[cfg(target_os = "android")]
+    {
+        use std::sync::atomic::Ordering;
+
+        let slot = event_loop_proxy();
+        let Some(proxy) = slot.as_ref() else {
+            log::warn!("back press with no event loop installed yet; minimising in Java");
+            return false;
+        };
+
+        // Parked before the wake, because the wake is what comes back for it.
+        BACK_PRESS_PENDING.store(true, Ordering::Release);
+        // `send_event` queues *and* wakes. Waking alone would not do: winit's
+        // Android backend discards a `PollEvent::Wake` unless the loop is
+        // running *and* a redraw or a user event is already outstanding
+        // (`!self.running || (!pending_redraw && !has_incoming())`), so a bare
+        // wake is dropped outright while paused and dropped when idle.
+        if proxy.send_event(()).is_ok() {
+            return true;
+        }
+
+        // The loop closed between the check and the send. The flag stays set on
+        // purpose: clearing it here would also erase a *previous* press that
+        // parked successfully and has not been drained. Nothing will drain it
+        // now, and `set_event_loop_proxy` clears it when a loop next appears.
+        log::warn!("the event loop is gone; minimising in Java");
+    }
+    false
+}
+
+/// Take the parked back press, if there is one.
+///
+/// Injected into `AndroidPlatform` as its `poll_back_press`, and read from
+/// `App::about_to_wait` on the loop the wake above interrupted.
+fn take_back_press() -> bool {
+    BACK_PRESS_PENDING.swap(false, std::sync::atomic::Ordering::Acquire)
+}
+
+/// `BackHandler.nativeBackPressed()` — the predictive-back gesture, arriving on
+/// the Java UI thread.
+///
+/// Returns whether the press reached the Rust funnel. `false` is the Java
+/// side's cue to minimise for itself; [`post_back_press`] logs which of the two
+/// reasons it was.
+///
+/// Deliberately does nothing but park and wake. This is not the `android_main`
+/// thread, so it cannot touch `App`, and the framework is waiting on it, so it
+/// must not block. The decision — dismiss a layer, or minimise — belongs to
+/// `App::resolve_back_press`, exactly as it does for `KEYCODE_BACK`.
+///
+/// Raw pointers rather than `jni::Env`/`JClass`: neither is used, and the raw
+/// signature is the JNI ABI with nothing in between to get wrong.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_rustdar_BackHandler_nativeBackPressed(
+    _env: *mut jni::sys::JNIEnv,
+    _class: jni::sys::jclass,
+) -> jni::sys::jboolean {
+    if post_back_press() {
+        jni::sys::JNI_TRUE
+    } else {
+        jni::sys::JNI_FALSE
     }
 }
 
@@ -801,9 +955,14 @@ fn android_main(app: AndroidApp) {
                 .and_then(|v| v.l())
                 .expect("Context.getClassLoader() failed");
 
-            // Back gesture on API 33+: back bypasses the native input queue and
-            // goes through OnBackInvokedDispatcher. Unhandled, NativeActivity
-            // calls finish() and the process dies; the helper minimises instead.
+            // Predictive back. Once the app opts in, back bypasses the native
+            // input queue and goes through OnBackInvokedDispatcher; unhandled,
+            // NativeActivity calls finish() and the process dies. The helper
+            // registers a callback that hands the press to
+            // `Java_com_rustdar_BackHandler_nativeBackPressed` instead of
+            // deciding anything itself. Registered here, before the event loop
+            // exists, so presses in that window take the callback's own
+            // minimise — see `post_back_press`.
             register_java_helper(env, &loader, &activity, "com.rustdar.BackHandler");
 
             if let Some(cls) =
@@ -835,6 +994,17 @@ fn android_main(app: AndroidApp) {
         .build()
         .expect("Failed to create event loop");
 
+    // The predictive-back callback runs on the UI thread and cannot touch the
+    // App; this is how it reaches the loop that can. Installed before
+    // `run_app` — until it is, `post_back_press` reports `false` and the Java
+    // side minimises for itself.
+    //
+    // An *overwrite*, not a first write: this function runs once per Activity
+    // instance, not once per process, and the proxy left behind by a previous
+    // instance is attached to an `EventLoop` that `run_app` has already
+    // consumed. See [`EVENT_LOOP_PROXY`].
+    set_event_loop_proxy(Some(event_loop.create_proxy()));
+
     // Create and run the platform app
     let mut platform_app = rustdar_frontend::app::App::new(Box::new(
         rustdar_platform_lib::platform::create_platform(),
@@ -842,6 +1012,10 @@ fn android_main(app: AndroidApp) {
 
     // Wire up Android back button to minimize instead of exit
     platform_app.set_back_handler(move_task_to_back);
+
+    // ...and the other half of it: where a press that came in through
+    // OnBackInvokedDispatcher rather than the input queue is collected.
+    platform_app.set_back_press_taker(take_back_press);
 
     // Set zone geometry cache directory for persistent caching
     if let Some(cache_path) = android_zone_cache {
@@ -883,4 +1057,12 @@ fn android_main(app: AndroidApp) {
     if let Err(e) = event_loop.run_app(&mut platform_app) {
         log::error!("Application error: {}", e);
     }
+
+    // `run_app` consumed the loop, so the proxy above is now a corpse whose
+    // `send_event` can only fail. Dropping it means a back press between here
+    // and the next `android_main` reports "no loop installed" and minimises,
+    // rather than looking like a delivery failure. Usually unreachable —
+    // `needs_process_exit` takes Android out through `process::exit` — but this
+    // is where a plain Activity teardown arrives.
+    set_event_loop_proxy(None);
 }

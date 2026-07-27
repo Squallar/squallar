@@ -21,7 +21,20 @@
 # invoked through call_static_method by literal method name and signature.
 -keep class com.rustdar.BackHandler {
     public static void register(android.app.Activity);
+    private static native boolean nativeBackPressed();
 }
+# `nativeBackPressed` is kept by *name* and not merely retained: the name is the
+# JNI symbol (Java_com_rustdar_BackHandler_nativeBackPressed in
+# rustdar-android/src/lib.rs), so a rename makes it unresolvable. R8 has a real
+# caller for it -- the OnBackInvokedCallback lambda inside `register` -- so this
+# is the rename it stops, and the failure it stops is release-only: back would
+# throw UnsatisfiedLinkError and fall through to the plain minimise, which looks
+# exactly like the bug this class was rewritten to remove.
+#
+# proguard-android-optimize.txt's own `-keepclasseswithmembernames class * {
+# native <methods>; }` covers this too, and this rule is here anyway because the
+# member list above is explicit: adding a member to a `-keep` block and leaving
+# the native one to a default in another file is how it gets dropped later.
 -keep class com.rustdar.CompassHelper {
     public static void register(android.app.Activity);
     public static float getHeading();

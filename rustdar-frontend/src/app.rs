@@ -660,6 +660,13 @@ impl App {
         self.platform.set_theme_detector(detector);
     }
 
+    /// Set a callback that takes a back press delivered outside the input
+    /// queue (Android's `OnBackInvokedDispatcher`; see
+    /// [`PlatformBridge::poll_back_press`]).
+    pub fn set_back_press_taker(&mut self, taker: fn() -> bool) {
+        self.platform.set_back_press_taker(taker);
+    }
+
     fn handle_input_events(&mut self, event_loop: &ActiveEventLoop) {
         // Both keys mean the same thing — back out of the thing I am in — so
         // both take the same route. They used to differ only in that back gave
@@ -672,6 +679,13 @@ impl App {
     }
 
     /// One press of Escape or the back button.
+    ///
+    /// Three callers, one body: `handle_input_events` for Escape and for
+    /// `KEYCODE_BACK` off the input queue, and `about_to_wait` for a press
+    /// Android's `OnBackInvokedDispatcher` delivered instead. Anything that
+    /// makes a route to `resolve_back_press` its own is the bug this shape
+    /// exists to prevent — the predictive-back callback used to be exactly
+    /// that, minimising on its own with no route into Rust at all.
     fn back_out(&mut self, event_loop: &ActiveEventLoop) {
         match Self::resolve_back_press(&mut self.gui, self.platform.as_ref()) {
             // Nothing else consumed the press, so nothing else will schedule
@@ -683,6 +697,11 @@ impl App {
     }
 
     /// Resolve one press of Escape or back.
+    ///
+    /// The single decision for every route in: Escape, `KEYCODE_BACK` off the
+    /// input queue, and Android's `OnBackInvokedDispatcher`. The last of those
+    /// is a Java callback that could perfectly well minimise for itself, and
+    /// deliberately does not — see `BackHandler.java`.
     ///
     /// The UI gets first refusal and the platform is asked only about a press
     /// it did not want. That order is the whole fix: on Android a back handler
@@ -785,6 +804,27 @@ impl ApplicationHandler for App {
         // query — see `handle_resized`, which catches the orientation changes
         // that never come back through here.
         self.refresh_safe_area_insets();
+    }
+
+    /// Pick up a back press the platform delivered outside the input queue.
+    ///
+    /// Android's predictive-back dispatcher hands the press to a Java callback
+    /// on the UI thread, which parks it and wakes this loop with
+    /// `EventLoopProxy::send_event` — the flag alone would not do, because
+    /// winit's Android backend drops a bare wake unless the loop is running
+    /// *and* a redraw or user event is already outstanding. (Which also means a
+    /// press that arrives while the app is paused waits for the resume; the
+    /// dispatcher does not deliver one there anyway.) Everywhere else
+    /// `poll_back_press` is the trait's `false` default and this costs one load
+    /// per iteration.
+    ///
+    /// Here rather than in `user_event` so the press is spent on the iteration
+    /// it arrived in even if the wake coalesced with a real event, and so the
+    /// funnel does not depend on *which* winit callback the wake surfaces as.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.platform.poll_back_press() {
+            self.back_out(event_loop);
+        }
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
@@ -1072,6 +1112,215 @@ mod tests {
             "the Dismissed arm does not request a redraw: {}",
             &body[dismissed..arm_end]
         );
+    }
+
+    // ── The second delivery route: Android's predictive back ────────────
+    //
+    // `OnBackInvokedDispatcher` does not go through the input queue, so none of
+    // the pins above see it. It also does not go through this process's main
+    // thread: the press lands on a Java callback, which parks it and wakes the
+    // loop, and `about_to_wait` collects it. What has to hold is that it ends
+    // in the *same* `resolve_back_press` — which the decision tests above
+    // already cover once a press gets there.
+
+    /// The Java half of the route, so a rename on either side is a build
+    /// failure rather than an `UnsatisfiedLinkError` on a device.
+    const BACK_HANDLER_JAVA: &str = include_str!(
+        "../../rustdar-android/android/app/src/main/java/com/rustdar/BackHandler.java"
+    );
+
+    /// The Rust half. `rustdar-android` is `#![cfg(target_os = "android")]`, so
+    /// it compiles to nothing on a host and can hold no test of its own; this
+    /// crate owns the funnel both halves are about, so the pins live here.
+    const ANDROID_ENTRY: &str = include_str!("../../rustdar-android/src/lib.rs");
+
+    /// `src` with its Java comments removed.
+    ///
+    /// The pins below are about the order two calls happen in, and the prose
+    /// around them necessarily names both — the first draft failed on its own
+    /// javadoc. Deliberately naive: it would mangle a `//` inside a string
+    /// literal, and there is none in this file.
+    fn java_code(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut rest = src;
+        while let Some(slash) = rest.find('/') {
+            let (kept, tail) = rest.split_at(slash);
+            out.push_str(kept);
+            if let Some(body) = tail.strip_prefix("/*") {
+                rest = body.split_once("*/").map_or("", |(_, after)| after);
+            } else if let Some(body) = tail.strip_prefix("//") {
+                rest = body.split_once('\n').map_or("", |(_, after)| after);
+            } else {
+                // A lone '/' opens nothing. Keep it and move past it.
+                out.push('/');
+                rest = &tail[1..];
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// A press delivered outside the input queue has to reach the same funnel,
+    /// and only when there *is* one.
+    ///
+    /// `about_to_wait` takes an `ActiveEventLoop`, so this is a source probe for
+    /// the same reason `handle_input_events` is. Three claims, and the third is
+    /// the one a substring pair missed: without `poll_back_press` the press is
+    /// never collected; without `self.back_out` it is collected and thrown
+    /// away; and with the poll demoted out of the condition — `let _ =
+    /// self.platform.poll_back_press(); self.back_out(event_loop);` — this runs
+    /// on *every* iteration of the loop and the UI dismantles itself. So the
+    /// call is pinned as the `if`, not merely as present.
+    #[test]
+    fn a_back_press_from_the_platform_reaches_the_funnel_too() {
+        let body = fn_body("fn about_to_wait(");
+        assert!(
+            body.contains("if self.platform.poll_back_press() {"),
+            "the platform back press is no longer what gates the funnel, so \
+             about_to_wait either drops it or backs out on every iteration: \
+             {body}"
+        );
+        assert!(
+            body.contains("self.back_out("),
+            "about_to_wait collects the press and does nothing with it: {body}"
+        );
+    }
+
+    /// The two ends of the JNI hop must agree on one name.
+    ///
+    /// It is resolved by string at runtime and by nothing at build time, so a
+    /// rename on either side compiles, links, ships, and then throws
+    /// `UnsatisfiedLinkError` on the first back press — where the Java
+    /// fallback catches it and minimises, which is indistinguishable from the
+    /// bug this route exists to remove.
+    #[test]
+    fn the_java_callback_calls_the_symbol_rust_exports() {
+        let java = java_code(BACK_HANDLER_JAVA);
+        assert!(
+            java.contains("package com.rustdar;")
+                && java.contains("class BackHandler")
+                && java.contains("native boolean nativeBackPressed()"),
+            "the Java side no longer declares com.rustdar.BackHandler.nativeBackPressed",
+        );
+        assert!(
+            ANDROID_ENTRY.contains("fn Java_com_rustdar_BackHandler_nativeBackPressed("),
+            "nothing exports the symbol BackHandler.nativeBackPressed() binds to",
+        );
+    }
+
+    /// Offsets of every *call* to `name`, skipping the line that declares it.
+    ///
+    /// The declaration and the call are spelled the same, and an earlier draft
+    /// of the pin below matched the first of either. A review moved
+    /// `private static native boolean nativeBackPressed();` above the method and
+    /// rewrote the body to minimise first and ask second — the regression the
+    /// pin is named for — and it passed, because the declaration was now the
+    /// first match. A `native` keyword on the line is what tells them apart.
+    fn call_sites(java: &str, name: &str) -> Vec<usize> {
+        java.match_indices(name)
+            .map(|(at, _)| at)
+            .filter(|at| {
+                let line = java[..*at].rfind('\n').map_or(0, |nl| nl + 1);
+                !java[line..*at].contains("native ")
+            })
+            .collect()
+    }
+
+    /// The bomb this route was built to defuse.
+    ///
+    /// The callback used to be `() -> activity.moveTaskToBack(true)`: no route
+    /// into Rust at all, inert only because the manifest has not opted in and
+    /// targetSdk is 34. Raising targetSdk opts the app in, and back would have
+    /// gone straight back to minimising on the first press with the drawer
+    /// open — no test failing, nothing logged.
+    ///
+    /// So: every minimise in this class must come after the class has asked
+    /// Rust. The one `moveTaskToBack` left is the fallback for a press with no
+    /// event loop to route to, and it sits after the call that asks.
+    ///
+    /// Deliberately ordered across the whole class rather than within one
+    /// method: a minimise hoisted into a helper *defined earlier in the file*
+    /// would fail this even if it still ran after the call. That is the safe
+    /// direction to be wrong in, and the class is sixty lines of code.
+    #[test]
+    fn the_predictive_back_callback_asks_rust_before_it_minimises() {
+        let java = java_code(BACK_HANDLER_JAVA);
+        assert!(
+            java.contains("registerOnBackInvokedCallback"),
+            "BackHandler no longer registers a callback",
+        );
+
+        let asks = *call_sites(&java, "nativeBackPressed(")
+            .first()
+            .expect("BackHandler declares the native funnel but never calls it");
+
+        for minimises in call_sites(&java, "moveTaskToBack(") {
+            assert!(
+                minimises > asks,
+                "BackHandler minimises before it asks Rust, so one press with \
+                 the drawer open minimises the app",
+            );
+        }
+        assert!(
+            java.matches("moveTaskToBack(").count() <= 1,
+            "a second minimise appeared in BackHandler; the one this class is \
+             allowed is the fallback for a press with no event loop to route to",
+        );
+    }
+
+    /// Set by `one_press` below. A `fn` pointer closes over nothing, which is
+    /// the constraint the real taker is under too — it reads a `static` a JNI
+    /// entry point on the UI thread wrote.
+    static PARKED_BACK_PRESS: AtomicBool = AtomicBool::new(false);
+
+    fn one_press() -> bool {
+        PARKED_BACK_PRESS.swap(false, Ordering::Relaxed)
+    }
+
+    /// The taker has to reach the bridge, and it has to *consume*.
+    ///
+    /// `about_to_wait` runs every loop iteration, so a non-consuming read would
+    /// spend one gesture on every layer the UI has open — the drawer, the
+    /// settings window and the time dialog would all vanish together, and then
+    /// the app would minimise.
+    #[test]
+    fn a_parked_back_press_is_collected_once() {
+        let mut app = headless(TestBridge::android());
+        PARKED_BACK_PRESS.store(true, Ordering::Relaxed);
+        assert!(
+            !app.platform.poll_back_press(),
+            "precondition: nothing injected yet, so there is nothing to collect",
+        );
+
+        app.set_back_press_taker(one_press);
+
+        assert!(
+            app.platform.poll_back_press(),
+            "the parked press never reached the bridge",
+        );
+        assert!(
+            !app.platform.poll_back_press(),
+            "the press was not consumed, so it fires again on the next iteration",
+        );
+    }
+
+    /// No bridge may invent a press. `about_to_wait` runs on every iteration of
+    /// every platform's loop, so a bridge answering `true` on its own would
+    /// close a layer per iteration and then minimise, for a gesture nobody
+    /// made. Desktop and iOS never get a taker at all; Android has none until
+    /// `android_main` injects one.
+    #[test]
+    fn no_bridge_invents_a_back_press() {
+        for (name, mut bridge) in [
+            ("desktop", TestBridge::desktop()),
+            ("ios", TestBridge::ios()),
+            ("android, before android_main injects the taker", TestBridge::android()),
+        ] {
+            assert!(
+                !bridge.poll_back_press(),
+                "{name} reported a back press nobody delivered",
+            );
+        }
     }
 
     /// The same press on a platform with no back handler: Escape on the desktop

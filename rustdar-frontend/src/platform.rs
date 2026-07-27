@@ -93,6 +93,38 @@ pub trait PlatformBridge {
     /// the event (e.g. Android moveTaskToBack), `false` if the app should exit.
     fn handle_back(&self) -> bool;
 
+    /// Take a back press the platform delivered *outside* the window's input
+    /// queue, if one is waiting.
+    ///
+    /// Android's `OnBackInvokedDispatcher` is the only source. Once the app
+    /// opts in to predictive back — explicitly, or by targeting an SDK that
+    /// opts in for it — back stops arriving as `KEYCODE_BACK` and is handed to
+    /// a Java callback on the UI thread instead, which is not the thread `App`
+    /// lives on. The callback therefore parks the press and wakes the loop, and
+    /// this is where the loop picks it up; from there it takes the same route
+    /// as Escape and as legacy back. See `BackHandler.java`.
+    ///
+    /// Consuming, like [`InputHandler::take_back_out_press`]: this is polled
+    /// every loop iteration, and a non-consuming read would spend one press on
+    /// every layer the UI has.
+    ///
+    /// Defaulted because no other platform has a second delivery route: the
+    /// desktop, iOS and the browser all deliver back (or Escape) as an input
+    /// event and nothing else.
+    ///
+    /// [`InputHandler::take_back_out_press`]: crate::input::InputHandler::take_back_out_press
+    fn poll_back_press(&mut self) -> bool {
+        false
+    }
+
+    /// Set the reader for [`poll_back_press`](Self::poll_back_press) (Android
+    /// only, no-op elsewhere).
+    ///
+    /// Injected for the same reason [`set_theme_detector`](Self::set_theme_detector)
+    /// is: the flag it reads is written by a JNI entry point, and that lives in
+    /// `rustdar-android`, a crate this one cannot depend on.
+    fn set_back_press_taker(&mut self, _taker: fn() -> bool) {}
+
     /// Detect the current system dark theme preference.
     fn detect_dark_theme(&self) -> bool;
 
