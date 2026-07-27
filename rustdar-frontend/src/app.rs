@@ -2000,7 +2000,10 @@ mod tests {
         let mut app = headless(TestBridge::android());
         app.set_theme_detector(always_dark);
         let before = app.gui.pane(0).unwrap().radar_sites_render_gen;
-        assert_eq!(app.cached_dark_theme, None, "precondition: nothing read yet");
+        assert_eq!(
+            app.cached_dark_theme, None,
+            "precondition: nothing read yet"
+        );
 
         assert!(app.resolve_theme(), "the frame drew in the wrong theme");
 

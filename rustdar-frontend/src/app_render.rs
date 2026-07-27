@@ -1,5 +1,6 @@
 use crate::constants::{
-    MAX_CONCURRENT_LOOP_DOWNLOADS, MAX_CONCURRENT_RENDERS, MAX_LOOP_FRAMES, MAX_LOOP_RENDER_BUDGET,
+    DEFAULT_LOOP_SPEED_FPS, MAX_CONCURRENT_LOOP_DOWNLOADS, MAX_CONCURRENT_RENDERS, MAX_LOOP_FRAMES,
+    MAX_LOOP_RENDER_BUDGET, MAX_LOOP_SPEED_FPS, MIN_LOOP_SPEED_FPS,
 };
 use crate::loop_downloads::PendingDownloads;
 use crate::render_dispatch::CachedPaneRender;
@@ -58,6 +59,27 @@ pub(crate) fn finish_then_acquire<P>(
     // `acquire` cannot be hoisted above this line: it needs `prepared`.
     let status = acquire(&prepared);
     (prepared, status)
+}
+
+/// How long one loop frame is held on screen, for a stored playback speed.
+///
+/// The clamp is here rather than at the slider because this is the last point
+/// before the value becomes a `Duration`, and `Duration::from_secs_f32` panics
+/// on a negative, an infinity or a NaN — while `1.0 / 0.0` is an infinity, so a
+/// stored zero panics too. The slider that normally writes `loop_speed_fps`
+/// bounds an *edit*; a config load assigns the stored number as it stands. See
+/// [`MIN_LOOP_SPEED_FPS`].
+///
+/// NaN is handled before the clamp, not by it: `f32::clamp` propagates NaN
+/// rather than replacing it, so clamping alone would leave the panic in place
+/// for the one input that reaches it by arithmetic rather than by editing.
+fn loop_interval(fps: f32) -> std::time::Duration {
+    let fps = if fps.is_finite() {
+        fps.clamp(MIN_LOOP_SPEED_FPS, MAX_LOOP_SPEED_FPS)
+    } else {
+        DEFAULT_LOOP_SPEED_FPS
+    };
+    std::time::Duration::from_secs_f32(1.0 / fps)
 }
 
 impl super::App {
@@ -1017,7 +1039,7 @@ impl super::App {
     /// Advance loop playback for all panes with active playing loops.
     fn advance_loop_playback(&mut self) {
         let now = web_time::Instant::now();
-        let interval = std::time::Duration::from_secs_f32(1.0 / self.gui.loop_speed_fps);
+        let interval = loop_interval(self.gui.loop_speed_fps);
 
         for pane_idx in 0..self.gui.pane_count() {
             let Some(pane) = self.gui.pane_mut(pane_idx) else {
@@ -2595,6 +2617,54 @@ mod stamping_tests {
             None,
             "a Level II volume is still captioned with the last Level III \
              object's age",
+        );
+    }
+}
+
+/// What the loop timer does with a playback speed no slider could have set.
+#[cfg(test)]
+mod loop_interval_tests {
+    use super::loop_interval;
+    use crate::constants::{DEFAULT_LOOP_SPEED_FPS, MAX_LOOP_SPEED_FPS, MIN_LOOP_SPEED_FPS};
+
+    /// A stored speed the UI cannot produce must not take the app down.
+    ///
+    /// Every one of these panics `Duration::from_secs_f32` — zero and the
+    /// negatives through the reciprocal, the rest directly — and it panics in
+    /// `advance_loop_playback`, which runs on every frame. There is no getting
+    /// out of that: the frame that would let the user fix the slider is the
+    /// frame that dies. The values are all reachable, because the save-side
+    /// guard checks only `is_finite` and the load assigns whatever it finds.
+    #[test]
+    fn a_speed_no_slider_could_have_set_still_yields_a_frame_interval() {
+        for fps in [0.0, -1.0, -0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let interval = loop_interval(fps);
+            assert!(
+                interval.as_secs_f32().is_finite() && !interval.is_zero(),
+                "{fps} produced {interval:?}",
+            );
+        }
+    }
+
+    /// And the speeds the slider *can* set are honoured exactly.
+    ///
+    /// A clamp that quietly rounded every speed to one value would satisfy the
+    /// test above and make the setting inert.
+    #[test]
+    fn a_speed_the_slider_can_set_is_used_as_it_stands() {
+        assert_eq!(loop_interval(5.0).as_secs_f32(), 0.2);
+        assert_eq!(
+            loop_interval(MIN_LOOP_SPEED_FPS).as_secs_f32(),
+            1.0 / MIN_LOOP_SPEED_FPS,
+        );
+        assert_eq!(
+            loop_interval(MAX_LOOP_SPEED_FPS).as_secs_f32(),
+            1.0 / MAX_LOOP_SPEED_FPS,
+        );
+        assert_eq!(
+            loop_interval(f32::NAN),
+            loop_interval(DEFAULT_LOOP_SPEED_FPS),
+            "a value that is not a number falls back to the UI's own default",
         );
     }
 }
