@@ -4400,4 +4400,50 @@ mod tests {
              every pass, so the assertion it backs is vacuous"
         );
     }
+    /// 38. **A hover readout dies with the radar that produced it.**
+    ///
+    ///     `pane.hover_value` is written only by the radar arm of
+    ///     `render_pane_map_content` and read by the status bar. Two ways the
+    ///     writer stops running while the reader keeps going: the pane stops
+    ///     drawing radar under the pointer, or the pane is hidden by splitting
+    ///     back down and is not rendered at all. Neither may freeze the last
+    ///     readout on the glass.
+    #[test]
+    fn a_hover_readout_does_not_outlive_its_pane_or_its_radar() {
+        let mut h = InputHarness::with_screen(egui::vec2(800.0, 900.0));
+        h.mouse_move(h.map_center());
+        h.warm_up();
+        assert!(
+            h.status_bar().hover,
+            "precondition: mouse modality, or there is no readout to go stale"
+        );
+
+        // A readout on a visible pane reaches the glass — the channel every
+        // staleness assertion below depends on.
+        h.gui_mut().pane_mut(0).unwrap().hover_value = Some("LIVE READOUT".to_owned());
+        h.frame();
+        assert!(
+            h.painted_text_strings().iter().any(|t| t == "LIVE READOUT"),
+            "precondition: a visible pane's readout must reach the status bar"
+        );
+
+        // ...for exactly as long as the radar arm re-sets it: with no radar
+        // image under the pointer, the pane's next render clears it.
+        h.frame();
+        assert!(
+            !h.painted_text_strings().iter().any(|t| t == "LIVE READOUT"),
+            "a readout with no radar left behind it froze in the status bar"
+        );
+
+        // A pane hidden by splitting back down is never rendered, so nothing
+        // can clear it — the status bar must not be reading it at all.
+        h.set_pane_count(4);
+        h.gui_mut().pane_mut(3).unwrap().hover_value = Some("HIDDEN PANE READOUT".to_owned());
+        h.set_pane_count(2);
+        h.frame();
+        assert!(
+            !h.painted_text_strings().iter().any(|t| t == "HIDDEN PANE READOUT"),
+            "a hidden pane's stale readout surfaced in the status bar"
+        );
+    }
 }

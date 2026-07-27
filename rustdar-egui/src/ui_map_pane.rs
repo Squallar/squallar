@@ -64,6 +64,13 @@ pub(super) fn render_pane_map_content(
         ctx.overlays.load_pane_configs(&ctx.pane.overlay_configs);
     }
 
+    // Cleared every frame and re-set by the radar arm below, exactly as
+    // `overlay_hover_value` is. The radar arm is the only writer, and it only
+    // runs while Radar is enabled, in `draw_order`, and has an image — clearing
+    // only inside that arm left the last readout frozen in the status bar
+    // whenever any of those stopped being true.
+    ctx.pane.hover_value = None;
+
     // Sites take priority over the overlays beneath them, so those skip a click
     // that lands on an icon. Kept out of `ctx.excluded_rects`, which
     // `handle_radar_site_interactions` reads itself: with the icons in there,
@@ -477,30 +484,28 @@ fn update_pane_hover_value_from_meta(
         return;
     }
 
-    let pos_changed = pane
-        .last_hover_pos
-        .map(|last| (last - hover_pos).length() > 0.5)
-        .unwrap_or(true);
+    // Recomputed every frame the pointer is over the pane, stationary or not:
+    // `render_pane_map_content` clears `hover_value` at its top, so a value
+    // cached behind a did-the-pointer-move gate would blank the readout the
+    // moment the mouse rested.
     pane.last_hover_pos = Some(hover_pos);
 
-    if pos_changed {
-        let screen_vec = egui::vec2(hover_pos.x, hover_pos.y);
-        let map_pos = projector.unproject(screen_vec);
+    let screen_vec = egui::vec2(hover_pos.x, hover_pos.y);
+    let map_pos = projector.unproject(screen_vec);
 
-        pane.hover_value = Some(super::compute_hover_info_raw(
-            radar.value_data,
-            &super::HoverInput {
-                site_lat: radar.lat,
-                site_lon: radar.lon,
-                hover_lat: map_pos.y(),
-                hover_lon: map_pos.x(),
-                hover_pos,
-                rect: image_rect,
-            },
-            pane.selected_product,
-            prefs,
-        ));
-    }
+    pane.hover_value = Some(super::compute_hover_info_raw(
+        radar.value_data,
+        &super::HoverInput {
+            site_lat: radar.lat,
+            site_lon: radar.lon,
+            hover_lat: map_pos.y(),
+            hover_lon: map_pos.x(),
+            hover_pos,
+            rect: image_rect,
+        },
+        pane.selected_product,
+        prefs,
+    ));
 }
 
 /// A hover readout pinned to the pointer, on a layer that cannot claim it.
