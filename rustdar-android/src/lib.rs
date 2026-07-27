@@ -18,8 +18,8 @@ use winit::platform::android::activity::AndroidApp;
 // JNI location helper functions (Android only)
 // ---------------------------------------------------------------------------
 
-/// The process `JavaVM` and a global reference to the real `Activity`, captured
-/// once at the top of [`android_main`].
+/// The process `JavaVM` and a global reference to the real `Activity`,
+/// recaptured at the top of every [`android_main`].
 ///
 /// **Deliberately not `ndk_context`.** `ndk_context::android_context().context()`
 /// is not the Activity on the `android-activity` version this build pins:
@@ -54,9 +54,23 @@ use winit::platform::android::activity::AndroidApp;
 /// helpers document *achievable*. `ndk_context::android_context()` is
 /// `ANDROID_CONTEXT.expect("android context was not initialized")`: a helper
 /// built on it cannot fall back when the context is missing, because it has
-/// already panicked. A `OnceLock` returns `None` instead, which matters because
-/// these run on the GPS and compass threads where an unwind takes the feature
-/// out silently.
+/// already panicked. An empty slot here yields `None` instead, which matters
+/// because these run on the GPS and compass threads where an unwind takes the
+/// feature out silently.
+///
+/// # Replaceable, not write-once
+///
+/// `android_main` is tied to the lifetime of the *Activity*, not the process
+/// -- [`EVENT_LOOP_PROXY`] pins the android-activity contract and became
+/// replaceable for exactly this reason. This slot was a `OnceLock`, whose
+/// `set` no-ops on the second Activity: every helper in the table above kept
+/// calling the *destroyed* Activity, and the stale global ref pinned that
+/// Activity for the rest of the process. So: a `Mutex<Option<Arc<_>>>`,
+/// overwritten at the top of every `android_main` and cleared when one
+/// returns. The `Arc` is for the readers -- a helper mid-call on the GPS or
+/// compass thread keeps the context it started with until it returns, and the
+/// old Activity's global ref drops with the last such clone rather than out
+/// from under a live JNI call.
 ///
 /// # These calls do not run on the Android main thread
 ///
@@ -68,7 +82,7 @@ use winit::platform::android::activity::AndroidApp;
 /// part is that "it compiled and the object is right" is not the same as "the
 /// framework expects this call here", and neither of those is testable without
 /// a device.
-static JAVA: std::sync::OnceLock<JavaContext> = std::sync::OnceLock::new();
+static JAVA: std::sync::Mutex<Option<std::sync::Arc<JavaContext>>> = std::sync::Mutex::new(None);
 
 /// See [`JAVA`].
 struct JavaContext {
@@ -78,13 +92,37 @@ struct JavaContext {
     activity: jni::objects::Global<jni::objects::JObject<'static>>,
 }
 
+/// Clone the current [`JAVA`] context out of the lock, recovering from
+/// poisoning rather than reporting "no Activity". Same reasoning as
+/// [`event_loop_proxy`]: nothing under this lock can panic today, and treating
+/// a poisoned lock as an absent context would silently take insets,
+/// back-to-minimise and the GPS permission prompt out for the rest of the
+/// process.
+fn java_context() -> Option<std::sync::Arc<JavaContext>> {
+    JAVA.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Install (or clear) the [`JAVA`] context.
+///
+/// An overwrite on every `android_main`, exactly like [`set_event_loop_proxy`]:
+/// dropping the previous entry is what releases the global ref pinning the
+/// previous Activity -- deferred past any helper still holding its `Arc`, so
+/// the ref is never deleted under a live JNI call.
+fn set_java_context(context: Option<JavaContext>) {
+    *JAVA.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+        context.map(std::sync::Arc::new);
+}
+
 /// Attach the calling thread to the JVM and run `f`.
 ///
-/// `None` if [`android_main`] has not reached its JNI setup block yet, or if the
-/// thread could not be attached. Every caller degrades to a default rather than
-/// propagating a failure.
+/// `None` if [`android_main`] has not reached its JNI setup block yet (or the
+/// last Activity has been torn down and the next has not stashed its context),
+/// or if the thread could not be attached. Every caller degrades to a default
+/// rather than propagating a failure.
 fn with_env<T>(f: impl FnOnce(&mut jni::Env<'_>) -> T) -> Option<T> {
-    let java = JAVA.get()?;
+    let java = java_context()?;
     java.vm
         .attach_current_thread(|env| -> jni::errors::Result<T> { Ok(f(env)) })
         .ok()
@@ -94,8 +132,10 @@ fn with_env<T>(f: impl FnOnce(&mut jni::Env<'_>) -> T) -> Option<T> {
 fn with_activity<T>(
     f: impl FnOnce(&mut jni::Env<'_>, &jni::objects::JObject<'static>) -> T,
 ) -> Option<T> {
-    let activity = &JAVA.get()?.activity;
-    with_env(|env| f(env, activity))
+    let java = java_context()?;
+    java.vm
+        .attach_current_thread(|env| -> jni::errors::Result<T> { Ok(f(env, &java.activity)) })
+        .ok()
 }
 
 /// Check whether the app holds either location runtime permission.
@@ -944,8 +984,8 @@ fn android_main(app: AndroidApp) {
             let activity = unsafe { JObject::from_raw(env, activity_ptr) };
 
             // Stash the Activity for the JNI helpers above, *before* anything
-            // that can fail: this is the only point in the process where the
-            // real Activity is available. `ndk_context` cannot substitute for
+            // that can fail: this is the only point in this `android_main`
+            // where the real Activity is available. `ndk_context` cannot substitute for
             // it -- android-activity 0.6 registers `Activity.getApplication()`
             // there, and `getWindow` / `moveTaskToBack` / `requestPermissions`
             // do not exist on `Application`. See [`JAVA`].
@@ -953,10 +993,16 @@ fn android_main(app: AndroidApp) {
                 Ok(global) => {
                     // `JavaVM` is a handle onto a process-wide singleton, so the
                     // clone is the same VM this closure is attached through.
-                    let _ = JAVA.set(JavaContext {
+                    //
+                    // An *overwrite*, not a first write, for the same reason as
+                    // `set_event_loop_proxy` below: one `android_main` per
+                    // Activity instance, and the context a previous instance
+                    // left behind both points every helper at a destroyed
+                    // Activity and pins that Activity in memory. See [`JAVA`].
+                    set_java_context(Some(JavaContext {
                         vm: vm.clone(),
                         activity: global,
-                    });
+                    }));
                 }
                 // Not fatal on its own -- TLS and the event loop still work --
                 // but insets, back-to-minimise and the location permission
@@ -1092,4 +1138,10 @@ fn android_main(app: AndroidApp) {
     // `needs_process_exit` takes Android out through `process::exit` — but this
     // is where a plain Activity teardown arrives.
     set_event_loop_proxy(None);
+
+    // Same for the Activity context: from here until the next `android_main`
+    // the object behind [`JAVA`] is a destroyed Activity, so let the global
+    // ref go and let the helpers degrade to their documented defaults instead
+    // of calling into the corpse.
+    set_java_context(None);
 }
