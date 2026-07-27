@@ -436,7 +436,9 @@ impl super::App {
             return;
         }
 
-        // Mark in-flight on the appropriate texture cache for all target panes
+        // Mark in-flight on the appropriate texture cache for all target panes.
+        // Every path out of here that does not reach an `offload` has to undo this
+        // with `clear_overlay_render_marks` — see it.
         for &pidx in &pane_indices {
             if let Some(pane) = self.gui.pane_mut(pidx) {
                 pane.overlay_cache_mut(kind).render_in_flight = true;
@@ -453,6 +455,7 @@ impl super::App {
         let first_pane_idx = pane_indices[0];
         let pane_configs = {
             let Some(target_pane) = self.gui.pane(first_pane_idx) else {
+                self.clear_overlay_render_marks(&pane_indices, kind);
                 return;
             };
             target_pane.overlay_configs.clone()
@@ -479,11 +482,7 @@ impl super::App {
                 };
                 let Some(rasterize_fn) = self.gui.overlays.prepare_rasterize(kind, &rctx) else {
                     // Nothing to render — clear in-flight
-                    for &pidx in &pane_indices {
-                        if let Some(pane) = self.gui.pane_mut(pidx) {
-                            pane.overlay_cache_mut(kind).render_in_flight = false;
-                        }
-                    }
+                    self.clear_overlay_render_marks(&pane_indices, kind);
                     return;
                 };
                 crate::offload::offload("overlay-render", move || {
@@ -504,6 +503,7 @@ impl super::App {
             }
             OverlayKind::RadarSites => {
                 let Some(target_pane) = self.gui.pane(first_pane_idx) else {
+                    self.clear_overlay_render_marks(&pane_indices, kind);
                     return;
                 };
                 let target_site = target_pane.site.clone();
@@ -553,6 +553,26 @@ impl super::App {
                     "spawn_overlay_render called with non-texture kind: {:?}",
                     kind
                 );
+                self.clear_overlay_render_marks(&pane_indices, kind);
+            }
+        }
+    }
+
+    /// Undo the in-flight marks [`spawn_overlay_render`](Self::spawn_overlay_render)
+    /// set on its target panes.
+    ///
+    /// Nothing else clears them. The mark is cleared on arrival of the render
+    /// response, so a dispatch that returns without offloading anything leaves
+    /// every target pane believing a rasterization it will never hear about is
+    /// still running — and a pane in that state never asks for that overlay
+    /// again, so the layer stays blank until something else resets the cache.
+    /// The marks are set for *all* `pane_indices`, so they must be cleared for
+    /// all of them: the early exits below are reached by asking about one pane,
+    /// which used to leave its siblings' marks behind.
+    fn clear_overlay_render_marks(&mut self, pane_indices: &[usize], kind: OverlayKind) {
+        for &pidx in pane_indices {
+            if let Some(pane) = self.gui.pane_mut(pidx) {
+                pane.overlay_cache_mut(kind).render_in_flight = false;
             }
         }
     }
