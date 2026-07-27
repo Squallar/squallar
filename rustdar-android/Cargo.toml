@@ -61,7 +61,13 @@ jni = { workspace = true }
 # crate's registry checkout; `android/app/build.gradle.kts` locates that via
 # `cargo metadata` and adds it as a Maven repo.
 rustls-platform-verifier = "=0.7.0"
-rustdar-gps = { workspace = true, features = ["serial"] }
+# No `serial`: this crate consumes only GpsFix/FixQuality, which are not behind
+# any feature. Features are additive across the whole graph, so switching it on
+# here re-enables the serialport stack for everything Android links -- exactly
+# the mobile exclusion rustdar-platform's cfg-gated dependencies exist to keep
+# (see the comment there). The host-only copy below already documents that the
+# JNI helpers build "without serial".
+rustdar-gps = { workspace = true }
 
 # Host-only, opt-in copies of the three dependencies the JNI helpers actually
 # need. See the `jni-typecheck` feature below for why they exist.
