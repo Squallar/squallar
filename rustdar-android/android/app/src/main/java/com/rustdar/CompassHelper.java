@@ -7,11 +7,16 @@ import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
+import android.hardware.display.DisplayManager;
+import android.os.Build;
 import android.os.Bundle;
+import android.view.Display;
+import android.view.Surface;
 
 /**
  * Static helper that registers for rotation vector sensor updates and
- * provides the current compass heading (azimuth in degrees, 0–360).
+ * provides the current compass heading (azimuth in degrees, 0–360, relative
+ * to whatever is currently "up" on screen — see the remap in the listener).
  *
  * Loaded by name through the app ClassLoader from android_main; see
  * register_java_helper in rustdar-android/src/lib.rs.
@@ -52,7 +57,7 @@ public final class CompassHelper {
     // thread. The register/startListening/stopListening transitions are
     // therefore serialised on the class lock (`static synchronized`); volatile
     // stays for the lock-free readers -- `getHeading` on the poll thread, and
-    // the sensor callback's `sHeading` write.
+    // the sensor callback's `sHeading` write and `sDisplay` read.
     private static volatile float sHeading = -1f;
     private static volatile SensorEventListener sListener;
     private static volatile SensorManager sSensorManager;
@@ -66,6 +71,12 @@ public final class CompassHelper {
      * stacked another never-unregistered callback.
      */
     private static volatile boolean sCallbacksRegistered;
+    /**
+     * The display the Activity is on; its rotation feeds the coordinate remap
+     * in the sensor callback. Held via DisplayManager off the application
+     * context, never via the Activity -- see the comment in register().
+     */
+    private static volatile Display sDisplay;
 
     /**
      * Register for rotation vector sensor updates. Called once per
@@ -87,17 +98,71 @@ public final class CompassHelper {
         sRotationSensor = sSensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
         if (sRotationSensor == null) return;
 
+        // Resolve the display whose rotation the sensor callback's remap
+        // needs, without retaining the Activity (nothing in this class may --
+        // see the listener comment below). The *id* comes from the Activity,
+        // the handle from DisplayManager on the application context:
+        // Activity.getDisplay() only exists from API 30, and
+        // WindowManager.getDefaultDisplay() is only deprecated *at* 30, so
+        // each side of the minSdk 28 / targetSdk 34 range uses the call that
+        // is correct for it.
+        int displayId = Display.DEFAULT_DISPLAY;
+        if (Build.VERSION.SDK_INT >= 30) {
+            Display d = activity.getDisplay();
+            if (d != null) displayId = d.getDisplayId();
+        } else {
+            displayId = activity.getWindowManager().getDefaultDisplay().getDisplayId();
+        }
+        DisplayManager dm = (DisplayManager)
+                activity.getApplicationContext().getSystemService(Context.DISPLAY_SERVICE);
+        sDisplay = dm != null ? dm.getDisplay(displayId) : null;
+
         // Anonymous class of a *static* method, so it holds no reference to the
         // Activity. Neither does SensorManager, which is a process-scoped system
         // service. Nothing here keeps the Activity alive.
         sListener = new SensorEventListener() {
             private final float[] rotationMatrix = new float[9];
+            private final float[] remappedMatrix = new float[9];
             private final float[] orientation = new float[3];
 
             @Override
             public void onSensorChanged(SensorEvent event) {
                 SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values);
-                SensorManager.getOrientation(rotationMatrix, orientation);
+
+                // getOrientation() answers azimuth for the device's *natural*
+                // orientation; the UI wants heading relative to what is
+                // currently up on screen. Remap the frame by the display
+                // rotation first — unremapped, landscape reads ±90° off and
+                // reverse portrait 180°. Read per event, not latched in
+                // register(): the manifest's configChanges keeps the Activity
+                // alive across rotation, so no lifecycle callback marks the
+                // change. The axis pairs are the standard
+                // remapCoordinateSystem permutations for each
+                // Surface.ROTATION_* (which requires out != in, hence the
+                // second matrix).
+                float[] m = rotationMatrix;
+                Display display = sDisplay;
+                switch (display != null ? display.getRotation() : Surface.ROTATION_0) {
+                    case Surface.ROTATION_90:
+                        SensorManager.remapCoordinateSystem(rotationMatrix,
+                                SensorManager.AXIS_Y, SensorManager.AXIS_MINUS_X, remappedMatrix);
+                        m = remappedMatrix;
+                        break;
+                    case Surface.ROTATION_180:
+                        SensorManager.remapCoordinateSystem(rotationMatrix,
+                                SensorManager.AXIS_MINUS_X, SensorManager.AXIS_MINUS_Y, remappedMatrix);
+                        m = remappedMatrix;
+                        break;
+                    case Surface.ROTATION_270:
+                        SensorManager.remapCoordinateSystem(rotationMatrix,
+                                SensorManager.AXIS_MINUS_Y, SensorManager.AXIS_X, remappedMatrix);
+                        m = remappedMatrix;
+                        break;
+                    default:
+                        break; // ROTATION_0: already the natural frame
+                }
+
+                SensorManager.getOrientation(m, orientation);
                 // orientation[0] is azimuth in radians (-π to π) → convert to degrees (0–360)
                 float azimuthDeg = (float) Math.toDegrees(orientation[0]);
                 if (azimuthDeg < 0) azimuthDeg += 360f;
