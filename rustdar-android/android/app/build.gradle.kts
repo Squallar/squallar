@@ -249,7 +249,15 @@ android {
             create("release") {
                 val storePath = keystoreProps.getProperty("storeFile")
                     ?: error("keystore.properties: missing storeFile")
-                storeFile = file(storePath).let {
+                // Plain `File`, not Project.file(): the latter resolves a
+                // relative path against *this* project (app/) and always
+                // returns an absolute File, which made the isAbsolute test
+                // below a tautology and the rootProject fallback dead code.
+                // A relative storeFile must resolve against android/ (the
+                // root project) -- that is what keystore.properties.example
+                // documents, and where its keytool command writes the
+                // keystore.
+                storeFile = File(storePath).let {
                     if (it.isAbsolute) it else rootProject.file(storePath)
                 }
                 storePassword = keystoreProps.getProperty("storePassword")
