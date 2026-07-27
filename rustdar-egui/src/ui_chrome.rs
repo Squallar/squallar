@@ -281,7 +281,7 @@ impl super::Gui {
 
                     if has_hover {
                         ui.separator();
-                        render_hover_info(ui, &self.panes);
+                        render_hover_info(ui, self.panes());
                         #[cfg(test)]
                         {
                             probe.hover = true;
@@ -536,6 +536,11 @@ fn render_product_age(
     Some(text)
 }
 
+/// The pointer readout: the first pane with a hover value.
+///
+/// Handed `Gui::panes()` — the visible slice — never the raw vector. A hidden
+/// pane is not rendered, so nothing ever clears its `hover_value` again, and
+/// scanning the full vector would surface that stale readout forever.
 fn render_hover_info(ui: &mut egui::Ui, panes: &[PaneState]) {
     let hover_info = panes.iter().find_map(|p| p.hover_value.as_ref());
     let overlay_hover = panes.iter().find_map(|p| p.overlay_hover_value.as_ref());

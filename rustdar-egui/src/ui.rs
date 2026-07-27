@@ -1853,12 +1853,16 @@ impl Gui {
     }
 
     /// Propagate the interacted pane's viewport (zoom + position) to all other panes.
+    ///
+    /// Bounded by [`Self::visible_pane_count`], not the layout's raw count:
+    /// hidden panes are neither read as a sync source nor written to, and a
+    /// count that ran ahead of the vector cannot index past its end.
     fn sync_viewports(
         &mut self,
-        pane_count: usize,
         pre_zooms: &[f64],
         pre_positions: &[Option<walkers::Position>],
     ) {
+        let pane_count = self.visible_pane_count();
         if !self.viewport_sync || pane_count <= 1 {
             return;
         }
@@ -2021,5 +2025,28 @@ mod pane_slice_tests {
 
         assert_eq!(gui.panes().len(), 1);
         assert_eq!(gui.panes_mut().len(), 1);
+    }
+
+    /// `sync_viewports` reads and writes panes by raw index, so it takes its
+    /// bound from the visible slice rather than the layout's claim — with the
+    /// raw count, the same ran-ahead layout as above panicked mid-frame.
+    #[test]
+    fn viewport_sync_never_outruns_the_pane_vector() {
+        let mut gui = Gui::new();
+        gui.set_pane_count_for_test(2);
+        gui.viewport_sync = true;
+        gui.pane_layout = PaneLayout::for_count(4);
+
+        // Snapshots sized to the layout's claim, exactly as `render_map` would
+        // have taken them had it trusted the raw count too. All-zero zooms
+        // make every pane look interacted, so the source scan runs as deep as
+        // its bound allows.
+        gui.sync_viewports(&[0.0; 4], &[None; 4]);
+
+        // The panes that are really there still synced to a common zoom.
+        assert_eq!(
+            gui.pane(0).unwrap().map_memory.zoom(),
+            gui.pane(1).unwrap().map_memory.zoom(),
+        );
     }
 }
