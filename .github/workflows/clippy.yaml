@@ -21,6 +21,12 @@ jobs:
       contents: write
     steps:
       - name: Generate GitHub App Token
+        # Fork PRs run without secrets, so minting would fail here before
+        # clippy ever ran. Skip the mint for them; checkout below falls back to
+        # the default GITHUB_TOKEN. The auto-commit step is skipped on every
+        # pull_request event anyway (see below), so nothing on a fork PR needs
+        # push credentials.
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
         with:
@@ -28,7 +34,9 @@ jobs:
           private-key: ${{ secrets.AUTO_COMMIT_APP_KEY }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          token: ${{ steps.app-token.outputs.token }}
+          # A skipped mint step yields an empty string, so `||` selects the
+          # default token on fork PRs.
+          token: ${{ steps.app-token.outputs.token || github.token }}
       # The cross-targets are named here rather than in rust-toolchain.toml,
       # which no longer carries a `targets` list -- see the note in that file.
       # This job verifies the autofixed tree on both arms below, so it needs
@@ -116,7 +124,13 @@ jobs:
           fi
           cargo ndk -t arm64-v8a -P 28 check -p rustdar-android --lib
 
+      # Not on pull_request: that event checks out the detached PR merge ref,
+      # so there is no branch here to commit to — the push either fails or
+      # lands somewhere it should not. `on: push` fires for every same-repo
+      # branch, so autofixes still land there through that event; fork branches
+      # are out of reach by design.
       - uses: stefanzweifel/git-auto-commit-action@4a55954c782fc1ea30b9056cd3e7a2b40ca8887d # v7.2.0
+        if: github.event_name != 'pull_request'
         with:
           commit_message: "chore: Apply clippy fixes"
           commit_user_name: usa-reddragon-auto-commit[bot]
