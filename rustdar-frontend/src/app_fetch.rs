@@ -314,20 +314,16 @@ impl super::App {
                 new_config.site = site.clone();
                 self.gui.set_radar_config(new_config.clone());
 
-                if self.gui.is_sync_layers() {
-                    // Sync ON: update all panes to the new site
-                    for idx in 0..self.gui.pane_count() {
-                        if let Some(pane) = self.gui.pane_mut(idx) {
-                            pane.loading_site = Some(site.clone());
-                            pane.site = site.clone();
-                            pane.radar_sites_render_gen =
-                                pane.radar_sites_render_gen.wrapping_add(1);
-                            pane.loop_state = rustdar_egui::pane::LoopPlaybackState::new();
-                        }
-                    }
+                // Sync ON moves every pane to the new site; sync OFF only the pane
+                // that asked. That is the whole difference — writing the move out
+                // once per branch invites the two copies to drift.
+                let moving = if self.gui.is_sync_layers() {
+                    0..self.gui.pane_count()
                 } else {
-                    // Sync OFF: only update the target pane
-                    if let Some(pane) = self.gui.pane_mut(pane_idx) {
+                    pane_idx..pane_idx + 1
+                };
+                for idx in moving {
+                    if let Some(pane) = self.gui.pane_mut(idx) {
                         pane.loading_site = Some(site.clone());
                         pane.site = site.clone();
                         pane.radar_sites_render_gen = pane.radar_sites_render_gen.wrapping_add(1);
