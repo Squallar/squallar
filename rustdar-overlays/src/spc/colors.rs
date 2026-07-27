@@ -1,12 +1,17 @@
-/// `"#RRGGBB"` or `"RRGGBB"`. Falls back to grey rather than failing.
+/// `"#RRGGBB"` or `"RRGGBB"`. Falls back to grey rather than failing: this
+/// runs on network data inside the outlook fetch task, where a panic is
+/// swallowed and the overlay wedges in "fetching".
 pub fn parse_hex_color(hex: &str, alpha: u8) -> [u8; 4] {
     let hex = hex.trim_start_matches('#');
     if hex.len() < 6 {
         return [128, 128, 128, alpha];
     }
-    let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(128);
-    let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(128);
-    let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(128);
+    // `get`, not `[..]`: the ranges are byte offsets, and indexing panics when
+    // one lands inside a multi-byte character ("€€" is six bytes, so it passes
+    // the length gate above).
+    let r = hex.get(0..2).and_then(|s| u8::from_str_radix(s, 16).ok()).unwrap_or(128);
+    let g = hex.get(2..4).and_then(|s| u8::from_str_radix(s, 16).ok()).unwrap_or(128);
+    let b = hex.get(4..6).and_then(|s| u8::from_str_radix(s, 16).ok()).unwrap_or(128);
     [r, g, b, alpha]
 }
 
@@ -42,5 +47,19 @@ mod tests {
     #[test]
     fn test_parse_hex_color_invalid() {
         assert_eq!(parse_hex_color("bad", 128), [128, 128, 128, 128]);
+    }
+
+    /// The fill property is network data and can hold multi-byte text. "€€" is
+    /// six *bytes*, so it passes the length gate and reaches the channel
+    /// slices, which used to panic on the char boundary — inside the fetch
+    /// task, where the panic is swallowed and the overlay wedges in "fetching".
+    #[test]
+    fn a_multi_byte_fill_string_falls_back_to_grey_instead_of_panicking() {
+        assert_eq!(parse_hex_color("€€", 128), [128, 128, 128, 128]);
+        assert_eq!(parse_hex_color("#€€", 64), [128, 128, 128, 64]);
+        // Mixed: a valid ASCII red pair still parses; the channels landing
+        // inside the multi-byte character fall back per channel, matching the
+        // existing per-channel `unwrap_or` behaviour.
+        assert_eq!(parse_hex_color("ff€€", 255), [255, 128, 128, 255]);
     }
 }
