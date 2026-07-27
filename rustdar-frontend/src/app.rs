@@ -663,14 +663,31 @@ impl App {
             return;
         }
         if let Some(event_loop) = event_loop {
-            log::info!("Exiting application");
-            event_loop.exit();
-            if self.platform.needs_process_exit() {
-                std::process::exit(0);
-            }
+            self.exit_now(event_loop);
         } else {
             // Defer exit until the next event where event_loop is available
             self.exit_requested = true;
+        }
+    }
+
+    /// Leave, now: the half of [`request_exit`](Self::request_exit) that needs
+    /// an event loop.
+    ///
+    /// Split out so the deferred replay in `window_event` can take exactly this
+    /// half and no more — the config save happened when the flag was set, and
+    /// running it again on the way out would write the file twice.
+    ///
+    /// `process::exit` is not redundant beside `event_loop.exit()`. On Android
+    /// the loop never unwinds, so nothing after `exit()` ever runs and the
+    /// process stays alive; that is also the platform where the menu's Exit is
+    /// the primary way out, and the menu is processed during a redraw with no
+    /// event loop to hand out. So the deferred route is exactly the one that
+    /// must not lose this.
+    fn exit_now(&self, event_loop: &ActiveEventLoop) {
+        log::info!("Exiting application");
+        event_loop.exit();
+        if self.platform.needs_process_exit() {
+            std::process::exit(0);
         }
     }
 
@@ -965,9 +982,12 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.handle_redraw();
-                // Check for deferred exit (set during redraw when event_loop is unavailable)
-                if self.exit_requested {
-                    event_loop.exit();
+                // Spend a deferred exit (set during redraw, where there was no
+                // event loop to hand out) through the same door an immediate one
+                // uses — `process::exit` included. Taken rather than read: the
+                // config save already ran when the flag was set.
+                if std::mem::take(&mut self.exit_requested) {
+                    self.exit_now(event_loop);
                 }
             }
             WindowEvent::Resized(new_size) => {
@@ -1829,6 +1849,34 @@ mod tests {
             arm.contains("self.request_exit("),
             "the close button bypasses request_exit, so it saves no config and \
              ignores a platform that cannot quit: {arm}",
+        );
+    }
+
+    /// A deferred exit has to leave by the same door as an immediate one.
+    ///
+    /// The menu's Exit is processed during a redraw, where there is no
+    /// `ActiveEventLoop` to hand out, so it parks a flag and the next
+    /// `RedrawRequested` spends it. That replay used to call `event_loop.exit()`
+    /// on its own, which drops the `process::exit` half — and Android, where the
+    /// loop never unwinds and the menu is the primary way out, is precisely the
+    /// platform that needs it. So the one route that *always* defers was the one
+    /// route that never ended the process.
+    ///
+    /// `window_event` takes an `ActiveEventLoop` and `exit_now` ends the
+    /// process, so both halves are read off the source.
+    #[test]
+    fn a_deferred_exit_leaves_by_the_same_door_as_an_immediate_one() {
+        let arm = arm_body(fn_body("fn window_event("), "WindowEvent::RedrawRequested");
+        assert!(
+            arm.contains("self.exit_now("),
+            "the deferred exit no longer goes through exit_now, so on Android \
+             it asks a loop that never unwinds to leave and the process stays \
+             up: {arm}",
+        );
+        assert!(
+            fn_body("fn exit_now(").contains("self.platform.needs_process_exit()"),
+            "exit_now no longer ends the process on a platform whose event loop \
+             never unwinds",
         );
     }
 
