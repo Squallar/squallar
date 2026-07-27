@@ -163,6 +163,27 @@ pub struct App {
     state: Option<app_state::AppState>,
     window: Option<WindowRef>,
     gui: Gui,
+    /// The decoded Level II volume each pane's static render draws from, by site.
+    ///
+    /// # Retention
+    ///
+    /// One entry is a whole decoded volume — tens of megabytes — so this is held
+    /// to the sites that are on screen: [`evict_unshown_scans`] runs once a frame
+    /// and drops every site no pane names. Nothing else ever removes an entry, so
+    /// without that pass a session's every visited radar stayed resident for the
+    /// life of the process, which on a handheld is an OOM rather than a leak.
+    ///
+    /// A site counts as named by a pane's live `site` *or* by the site of the
+    /// `scan_info` it is currently drawing, and both are needed: a switch moves
+    /// `pane.site` at once, while `dispatch_pane_renders` goes on looking the
+    /// volume up under `scan_info.site.name` until the new one lands. Evicting on
+    /// the live site alone pulls the scan out from under a pane still rendering
+    /// from it.
+    ///
+    /// Loop frames are not in here. They have their own cache and their own
+    /// bound — see `LoopDownloadManager` and `MAX_LOOP_FRAMES`.
+    ///
+    /// [`evict_unshown_scans`]: Self::evict_unshown_scans
     scan_data: std::collections::HashMap<String, Arc<nexrad_model::data::Scan>>,
     input: InputHandler,
     channels: ChannelHub,
@@ -364,6 +385,7 @@ impl App {
         self.input.clear_frame_state();
         self.poll_platform_state();
         self.poll_data_channels();
+        self.evict_unshown_scans();
 
         // Skip rendering when minimized
         if let Some(window) = self.window.as_ref()
@@ -724,6 +746,31 @@ impl App {
         while let Ok(result) = self.channels.overlay_fetch_receiver.try_recv() {
             self.gui.overlays.apply_fetch_result(result);
         }
+    }
+
+    /// Drop the decoded volumes no pane is showing.
+    ///
+    /// The retention rule, and why it is the *union* of two site fields rather
+    /// than either one, is written down at [`scan_data`](Self::scan_data).
+    ///
+    /// Once a frame rather than at the inserts: there are two of those and one
+    /// of them (`handle_jump_to_live`) is nowhere near this, so a sweep is the
+    /// only form that cannot be half-wired. It costs a walk of a map that is
+    /// never longer than the pane count plus whatever one frame's switches left
+    /// behind.
+    fn evict_unshown_scans(&mut self) {
+        let mut shown: Vec<&str> = Vec::with_capacity(self.gui.pane_count() * 2);
+        for idx in 0..self.gui.pane_count() {
+            let Some(pane) = self.gui.pane(idx) else {
+                continue;
+            };
+            shown.push(pane.site.as_str());
+            if let Some(info) = pane.scan_info.as_ref() {
+                shown.push(info.site.name);
+            }
+        }
+        self.scan_data
+            .retain(|site, _| shown.iter().any(|shown| *shown == site));
     }
 
     /// Request application exit - handles both GUI and keyboard exit requests
@@ -1985,6 +2032,72 @@ mod tests {
             ),
             Vec::new(),
         )
+    }
+
+    /// The scan info a pane holds while it is drawing `site`'s volume.
+    fn scan_info_for(site: &str) -> ScanInfo {
+        ScanInfo::from_scan(
+            &empty_scan(),
+            site,
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+        )
+    }
+
+    /// A decoded volume nobody is showing is not kept.
+    ///
+    /// One entry is tens of megabytes and nothing else in this crate ever
+    /// removes one, so every radar a session visits stayed resident until the
+    /// process ended — next to a render cache that is carefully bounded and a
+    /// loop cache with a written-down byte budget.
+    #[test]
+    fn a_volume_no_pane_is_showing_is_dropped() {
+        let mut app = headless(TestBridge::desktop());
+        app.gui.pane_mut(0).unwrap().site = "KTLX".to_string();
+        app.gui.set_scan_info_for_pane(0, scan_info_for("KTLX"));
+        app.scan_data
+            .insert("KTLX".to_string(), Arc::new(empty_scan()));
+        app.scan_data
+            .insert("KOUN".to_string(), Arc::new(empty_scan()));
+
+        app.evict_unshown_scans();
+
+        assert!(
+            app.scan_data.contains_key("KTLX"),
+            "the volume the pane is drawing from was evicted",
+        );
+        assert!(
+            !app.scan_data.contains_key("KOUN"),
+            "a radar no pane is on is still holding its whole decoded volume",
+        );
+    }
+
+    /// The window a site switch opens.
+    ///
+    /// `SwitchRadarSite` moves `pane.site` immediately, but the pane goes on
+    /// drawing the old radar until the new volume lands — and
+    /// `dispatch_pane_renders` looks that volume up under `scan_info.site.name`,
+    /// not under `pane.site`. An eviction keyed on the live site alone therefore
+    /// pulls the scan out from under a pane still rendering from it, and the
+    /// symptom is a product change that silently does nothing until the switch
+    /// completes.
+    #[test]
+    fn the_volume_a_switching_pane_is_still_drawing_survives() {
+        let mut app = headless(TestBridge::desktop());
+        app.gui.set_scan_info_for_pane(0, scan_info_for("KTLX"));
+        app.gui.pane_mut(0).unwrap().site = "KOUN".to_string();
+        app.scan_data
+            .insert("KTLX".to_string(), Arc::new(empty_scan()));
+
+        app.evict_unshown_scans();
+
+        assert!(
+            app.scan_data.contains_key("KTLX"),
+            "the pane's own scan info still names KTLX, which is what the \
+             render path looks the volume up by",
+        );
     }
 
     /// A result thrown away still ends the wait it belonged to.
