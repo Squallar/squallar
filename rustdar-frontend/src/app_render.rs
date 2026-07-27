@@ -76,6 +76,10 @@ impl super::App {
     /// OS display scaling is *not* included: egui-winit puts it on the raw input
     /// and egui applies it itself.
     pub(super) fn setup_egui_frame(&mut self) -> ([u32; 2], Vec<GuiAction>) {
+        // Before the pass, because the cache it writes is read by everything
+        // that rasterizes off-frame — see `App::resolve_theme`.
+        let use_dark_theme = self.resolve_theme();
+
         // Apply theme and run the egui UI pass.
         // Scoped so `state` is dropped before we call &mut self methods below.
         let (size_in_pixels, gui_action) = {
@@ -96,18 +100,6 @@ impl super::App {
             // Start egui frame
             state.egui_renderer.begin_frame(window, zoom_factor);
 
-            // Set theme based on OS preference
-            let use_dark_theme = match window.theme() {
-                Some(theme) => matches!(theme, winit::window::Theme::Dark),
-                None => match self.cached_dark_theme {
-                    Some(cached) => cached,
-                    None => {
-                        let detected = self.platform.detect_dark_theme();
-                        self.cached_dark_theme = Some(detected);
-                        detected
-                    }
-                },
-            };
             state.egui_renderer.apply_theme(use_dark_theme);
 
             let gui_action = self.gui.ui(state.egui_renderer.context());

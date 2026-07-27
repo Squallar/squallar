@@ -418,13 +418,59 @@ impl App {
         }
     }
 
+    /// Take a theme reading, and say whether it changed anything.
+    ///
+    /// Every source goes through here: Android's poll thread, winit's
+    /// `ThemeChanged`, and the per-frame read of `window.theme()` that the
+    /// desktops answer — see [`resolve_theme`](Self::resolve_theme). One
+    /// funnel because the cache is not a memo: `cached_dark_theme` is what
+    /// overlay rasterization reads (`RasterizeContext::is_dark`, and the
+    /// `is_dark` handed to `rasterize_radar_sites`), and those run off-frame
+    /// with no window to ask. A source that writes the theme somewhere else,
+    /// or not at all, leaves them rasterizing light under a dark UI.
+    ///
+    /// Only a *change* invalidates. The site labels are raster textures baked
+    /// in the theme's colours, so they are stale the moment it flips — but
+    /// Android's poller re-sends its reading every two seconds whether or not
+    /// it moved (see `spawn_state_poller`), so an unguarded bump would
+    /// re-rasterise every label on every pane twice a second, forever.
+    fn adopt_theme(&mut self, dark: bool) -> bool {
+        if self.cached_dark_theme == Some(dark) {
+            return false;
+        }
+        self.cached_dark_theme = Some(dark);
+        self.gui.bump_all_radar_sites_gen();
+        true
+    }
+
+    /// What this frame draws in, adopted into the cache on the way past.
+    ///
+    /// winit answers `window.theme()` on Windows and macOS and that answer is
+    /// authoritative, so it is taken first — and *recorded*, which is the half
+    /// that used to be missing. Desktop's [`PlatformBridge::poll_theme`] is
+    /// hardwired `None`, so on those platforms nothing else ever writes the
+    /// cache and everything reading it off-frame saw `None` forever.
+    ///
+    /// The bridge is asked only where winit has no answer — X11 and Android —
+    /// and only once: the read is a JNI call there, and the poll thread keeps
+    /// the cache current from then on.
+    fn resolve_theme(&mut self) -> bool {
+        let dark = match self.window.as_ref().and_then(|w| w.theme()) {
+            Some(theme) => matches!(theme, winit::window::Theme::Dark),
+            None => match self.cached_dark_theme {
+                Some(cached) => cached,
+                None => self.platform.detect_dark_theme(),
+            },
+        };
+        self.adopt_theme(dark);
+        dark
+    }
+
     /// Poll for platform-specific theme, GPS fix, and compass heading changes.
     fn poll_platform_state(&mut self) {
         if let Some(new_theme) = self.platform.poll_theme()
-            && self.cached_dark_theme != Some(new_theme)
+            && self.adopt_theme(new_theme)
         {
-            self.cached_dark_theme = Some(new_theme);
-            self.gui.bump_all_radar_sites_gen();
             notify_redraw(&self.window);
         }
         if let Some(fix) = self.platform.poll_gps_fix() {
@@ -994,10 +1040,15 @@ impl ApplicationHandler for App {
                 self.handle_resized(new_size.width, new_size.height);
                 notify_redraw(&self.window);
             }
-            WindowEvent::ThemeChanged(_theme) => {
-                // Theme changed, clear cache so we re-detect on next frame
-                self.cached_dark_theme = None;
-                notify_redraw(&self.window);
+            WindowEvent::ThemeChanged(theme) => {
+                // winit hands the new theme over, so take it rather than
+                // clearing the cache and hoping something re-detects: on the
+                // desktops the bridge's `poll_theme` never answers, so an
+                // emptied cache is one that stays empty for every off-frame
+                // reader — which is what overlay rasterization is.
+                if self.adopt_theme(matches!(theme, winit::window::Theme::Dark)) {
+                    notify_redraw(&self.window);
+                }
             }
             _ => {
                 // For other events, request redraw only if egui needs it
@@ -1772,6 +1823,77 @@ mod tests {
             after,
             "a repeated reading re-rasterised every label; the poller sends \
              one of these every two seconds",
+        );
+    }
+
+    /// The theme the frame resolves is the theme everything else rasterizes in.
+    ///
+    /// `cached_dark_theme` is not a memo for a slow read: it is the *only*
+    /// answer the overlay rasterizers have, because they run on worker threads
+    /// with no window to ask (`RasterizeContext::is_dark`, and the `is_dark`
+    /// handed to `rasterize_radar_sites`). A frame that resolves a theme
+    /// without recording it leaves them on `unwrap_or(false)`.
+    ///
+    /// Driven with no window, which is the arm Android and X11 take: winit has
+    /// no answer there, so the bridge is asked. The other arm is source-probed
+    /// below — a window cannot be built here.
+    #[test]
+    fn the_theme_the_frame_resolves_is_the_one_the_overlays_get() {
+        let mut app = headless(TestBridge::android());
+        app.set_theme_detector(always_dark);
+        let before = app.gui.pane(0).unwrap().radar_sites_render_gen;
+        assert_eq!(app.cached_dark_theme, None, "precondition: nothing read yet");
+
+        assert!(app.resolve_theme(), "the frame drew in the wrong theme");
+
+        assert_eq!(
+            app.cached_dark_theme,
+            Some(true),
+            "the frame resolved a theme and left every off-frame rasterizer \
+             with none, so the overlays come back light under a dark UI",
+        );
+        assert_eq!(
+            app.gui.pane(0).unwrap().radar_sites_render_gen,
+            before.wrapping_add(1),
+            "the site labels still carry the old theme's colours",
+        );
+
+        assert!(app.resolve_theme(), "the reading changed on a second look");
+        assert_eq!(
+            app.gui.pane(0).unwrap().radar_sites_render_gen,
+            before.wrapping_add(1),
+            "every frame re-rasterises every label",
+        );
+    }
+
+    /// The two theme routes a desktop actually takes, neither of which can be
+    /// driven here: winit answers `window.theme()` on Windows and macOS, and it
+    /// reports a flip as `ThemeChanged`. Both must reach `adopt_theme`.
+    ///
+    /// This is the shape the bug had. The `window.theme()` arm resolved a value
+    /// and returned it without recording it, and `ThemeChanged` *emptied* the
+    /// cache — which reads as "re-detect next frame" only on a platform whose
+    /// bridge detects anything. Desktop's `poll_theme` is hardwired `None`, so
+    /// there the cache simply stayed empty for good, and both defects were
+    /// invisible on the two platforms whose poll thread writes it anyway.
+    #[test]
+    fn the_desktop_theme_routes_record_what_they_read() {
+        let body = fn_body("fn resolve_theme(");
+        assert!(
+            body.contains("self.adopt_theme(dark)"),
+            "resolve_theme no longer records the theme it resolved: {body}",
+        );
+        assert!(
+            !body.contains("return"),
+            "an arm of resolve_theme answers on its own, so the theme it read \
+             never reaches the cache: {body}",
+        );
+
+        let arm = arm_body(fn_body("fn window_event("), "WindowEvent::ThemeChanged");
+        assert!(
+            arm.contains("self.adopt_theme("),
+            "a theme flip no longer goes through the funnel, so nothing \
+             re-rasterises the site labels in the new theme's colours: {arm}",
         );
     }
 
