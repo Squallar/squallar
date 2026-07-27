@@ -245,6 +245,11 @@ fn request_location_permission() -> bool {
 
 /// Try to retrieve the device's last known GPS location via `LocationManager`.
 /// Returns a [`GpsFix`] on success or `None` if unavailable.
+///
+/// "Last known" is whatever the providers last produced for *any* client;
+/// LocationHelper's subscription (see [`start_location_updates`]) is what
+/// keeps them producing once permission is granted, and this poll doubles as
+/// the fallback when that subscription could not be established.
 fn get_last_known_location() -> Option<rustdar_gps::GpsFix> {
     with_activity(last_known_location_with).flatten()
 }
@@ -363,8 +368,56 @@ fn last_known_location_with(
     None
 }
 
+/// JClass for com.rustdar.LocationHelper, loaded once via the app class loader.
+///
+/// A `OnceLock`, unlike [`JAVA`]: this is a *class* resolved through the
+/// process-wide app ClassLoader, so the same object serves every Activity
+/// instance and there is nothing to replace. Same shape as [`COMPASS_CLASS`].
+static LOCATION_CLASS: std::sync::OnceLock<jni::objects::Global<jni::objects::JClass<'static>>> =
+    std::sync::OnceLock::new();
+
+/// Ask LocationHelper to begin real location updates (`LocationHelper.start()`).
+///
+/// `getLastKnownLocation` is passive: it reports the fix some location client
+/// caused a provider to produce, and on a device where no other app happens to
+/// be requesting location it stays null forever -- permission or not.
+/// `start()` makes this app that client: LocationHelper subscribes a
+/// do-nothing listener on the main looper, which is what switches the
+/// providers on, and the existing [`get_last_known_location`] poll reads the
+/// fixes they then produce. That split -- Java holds the subscription, Rust
+/// keeps all the fix extraction -- is the simplest mechanism that covers
+/// minSdk 28 through targetSdk 34: `requestLocationUpdates(String, long,
+/// float, LocationListener, Looper)` exists and is undeprecated across the
+/// whole range (`getCurrentLocation` is API 30+), and a `LocationListener` is
+/// a Java interface Rust cannot implement without a DEX class anyway, so the
+/// listener lives in LocationHelper.java beside the CompassHelper it mirrors.
+///
+/// Returns whether the call reached Java, so the caller retries a miss --
+/// helper class not registered, JNI attach failure -- on its next pass instead
+/// of giving live updates up for the process. Safe to deliver more than once:
+/// `start()` is idempotent.
+fn start_location_updates() -> bool {
+    use jni::objects::JClass;
+    use jni::{jni_sig, jni_str};
+
+    let Some(global_ref) = LOCATION_CLASS.get() else {
+        return false;
+    };
+
+    with_env(|env| {
+        let cls: &JClass<'static> = global_ref;
+        env.call_static_method(cls, jni_str!("start"), jni_sig!("()V"), &[])
+            .inspect_err(|e| log::warn!("LocationHelper.start() failed: {e:?}"))
+            .is_ok()
+    })
+    .unwrap_or(false)
+}
+
 /// Start a background thread that polls GPS location and sends updates
-/// through the provided channel. Also handles permission requests.
+/// through the provided channel. Also handles permission requests, and -- once
+/// a permission is granted -- switches real location updates on via
+/// [`start_location_updates`], without which the poll below can read null
+/// forever on a device where no other app is requesting location.
 fn start_location_thread(sender: std::sync::mpsc::Sender<rustdar_gps::GpsFix>) {
     std::thread::Builder::new()
         .name("gps-location".into())
@@ -394,8 +447,18 @@ fn start_location_thread(sender: std::sync::mpsc::Sender<rustdar_gps::GpsFix>) {
         const MAX_PERMISSION_REQUESTS: u32 = 2;
         let mut requests_made = 0u32;
 
+        // Whether `LocationHelper.start()` has been delivered. Tracked so the
+        // call is made once per grant rather than every 10 s; retried while
+        // `false` because a miss (helper class not registered, JNI attach
+        // failure) must not cost the process live updates -- the call is
+        // idempotent on the Java side.
+        let mut updates_started = false;
+
         loop {
             if has_location_permission() {
+                if !updates_started {
+                    updates_started = start_location_updates();
+                }
                 if let Some(fix) = get_last_known_location()
                     && sender.send(fix).is_err()
                 {
@@ -1042,6 +1105,16 @@ fn android_main(app: AndroidApp) {
                 register_java_helper(env, &loader, &activity, "com.rustdar.CompassHelper")
             {
                 let _ = COMPASS_CLASS.set(cls);
+            }
+
+            // Holds the location-update subscription that keeps the providers
+            // producing fixes for the gps-location thread's poll. Registered
+            // here; actually *started* lazily from that thread, once it sees
+            // the runtime permission granted. See `start_location_updates`.
+            if let Some(cls) =
+                register_java_helper(env, &loader, &activity, "com.rustdar.LocationHelper")
+            {
+                let _ = LOCATION_CLASS.set(cls);
             }
             Ok(())
         })

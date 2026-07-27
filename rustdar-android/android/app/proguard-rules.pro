@@ -44,6 +44,13 @@
 # SENSOR_DELAY_UI for the life of the process, including after the app was
 # minimised. CompassHelper now drives it from ActivityLifecycleCallbacks, so
 # there is a real caller inside the class and R8 keeps it on its own.
+-keep class com.rustdar.LocationHelper {
+    public static void register(android.app.Activity);
+    public static void start();
+}
+# `start` is called from the Rust gps-location thread only after the runtime
+# location permission is granted -- which can be minutes after launch, or
+# never -- so R8 sees no caller for it any more than it does for `register`.
 
 # ---------------------------------------------------------------------------
 # Rules that used to be here, and why they are not

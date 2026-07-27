@@ -4,7 +4,10 @@
     <!-- HTTPS to api.weather.gov, the NEXRAD archive, and basemap tiles. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <!-- LocationManager.getLastKnownLocation() in rustdar-android's GPS thread. -->
+    <!-- LocationHelper's requestLocationUpdates() subscription, and the
+         getLastKnownLocation() poll on rustdar-android's GPS thread that it
+         feeds. Both are requested at runtime together; COARSE alone (the
+         "approximate only" dialog answer) still serves the network provider. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
