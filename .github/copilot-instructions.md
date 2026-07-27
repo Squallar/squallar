@@ -2,23 +2,26 @@
 
 ## Project Overview
 
-Rustdar is a cross-platform NEXRAD weather radar viewer built in Rust. It fetches real-time radar data from AWS, renders it onto a map, and runs on both desktop (Linux/macOS/Windows) and Android. The GUI uses **egui** with a **wgpu** rendering backend and **winit** for windowing.
+Rustdar is a cross-platform NEXRAD weather radar viewer built in Rust. It fetches real-time radar data from public S3 buckets, renders it onto a map, and runs on desktop (Linux/macOS/Windows), Android, and in the browser as a PWA (wasm32 + WebGL2). The GUI uses **egui** with a **wgpu** rendering backend and **winit** for windowing.
 
 Keep this document, `features.md`, and `data.md` updated when architecture or features change.
 
 ## Workspace Architecture
 
-Cargo workspace (`resolver = "2"`, edition 2024) with seven crates:
+Cargo workspace (`resolver = "2"`, edition 2024) with ten crates:
 
 | Crate | Role |
 |---|---|
-| `rustdar-platform` | Binary + lib. Owns winit event loop, wgpu surface, egui renderer, Tokio runtime. `app.rs` orchestrates lifecycle with `#[path]` submodules `app_fetch.rs` and `app_render.rs`. `PlatformBridge` trait abstracts desktop/Android differences. |
-| `rustdar-egui` | Pure egui UI layer — no wgpu dependency. Defines `Gui` + `GuiAction` enum. Uses `walkers` crate for CartoDB map tiles. Split via `#[path]` submodules (`ui_popups.rs`, `ui_config.rs`, `ui_mobile.rs`, `ui_map_overlays.rs`, `ui_desktop.rs`, `ui_map.rs`, `ui_settings.rs`). |
-| `rustdar-units` | Leaf crate for unit conversion and timezone formatting. `UserPreferences` persisted in `ui.json`. Conversions happen at display boundaries only — internal data stays in original units. |
-| `rustdar-radar` | Radar data: AWS Level II fetching, TGFTP Level III fetching, 2048×2048 RGBA rendering via Web Mercator, `ColorScale` palettes, 207 NEXRAD sites, `RadarProduct` enum (13 variants). |
-| `rustdar-overlays` | Weather overlay data + render-agnostic logic. SPC outlooks, Mesoscale Discussions, NWS alerts, HRRR model data, METAR observations, storm reports. `OverlayHandler` trait + `OverlayRegistry` for type-erased overlay management. Rasterized to textures via tiny-skia. |
-| `nexrad-level3` | Level III product decoder (WMO headers, zlib/BZ2, radial packets). Product-specific LUT/threshold decoding lives in `rustdar-radar`. |
+| `rustdar-frontend` | The portable half of the application: winit application handler, wgpu/egui renderer, fetch and render dispatch, app state. `app.rs` orchestrates lifecycle with `#[path]` submodules `app_fetch.rs` and `app_render.rs`. Defines the `PlatformBridge` trait that per-OS crates implement. |
+| `rustdar-platform` | Binary + lib. Desktop, Android and iOS entry points: the event loop bootstrap (`run.rs`) and the concrete `PlatformBridge` implementations. No portable code — that lives in `rustdar-frontend`, which this crate depends on (never the other way round). |
+| `rustdar-web` | Browser target (wasm32 + WebGL2): the entry point, the browser `PlatformBridge`, and the PWA shell (`index.html`, `sw.js`, `manifest.webmanifest`, icons). Deployed to GitHub Pages by `build.yaml` on every push to `main`. |
 | `rustdar-android` | Android entry point (`cdylib`, `android_main`). Owns every JNI bridge — insets, compass, location, back handling, theme detection — and injects the callback-shaped ones into the `PlatformBridge` that `rustdar-platform` constructs. |
+| `rustdar-egui` | Pure egui UI layer — no wgpu dependency. Defines `Gui` + `GuiAction` enum. Uses `walkers` crate for CartoDB map tiles. Split via `#[path]` submodules off `ui.rs` (`ui_popups.rs`, `ui_config.rs`, `ui_map_overlays.rs`, `ui_chrome.rs`, `ui_menu.rs`, `ui_map.rs`, `ui_settings.rs`; `ui_map_pane.rs` hangs off `ui_map.rs`) plus plain modules `ui_input.rs` and `ui_layout.rs`. |
+| `rustdar-units` | Leaf crate for unit conversion and timezone formatting. `UserPreferences` persisted in `ui.json`. Conversions happen at display boundaries only — internal data stays in original units. |
+| `rustdar-radar` | Radar data: Level II from the `unidata-nexrad-level2` S3 bucket, Level III from the `unidata-nexrad-level3` S3 bucket, storm-relative velocity derivation (`srm.rs`), RGBA rendering via Web Mercator, palettes, NEXRAD site list, `RadarProduct` enum. |
+| `rustdar-overlays` | Weather overlay data + render-agnostic logic. SPC outlooks, Mesoscale Discussions, NWS alerts, HRRR model data, GLM lightning, METAR observations, storm reports. `OverlayHandler` trait + `OverlayRegistry` for type-erased overlay management. Rasterized to textures via tiny-skia. |
+| `rustdar-gps` | GPS fix and config types; NMEA parser and serial-port reader behind the `serial` feature (off on wasm and iOS). |
+| `nexrad-level3` | Level III product decoder (WMO headers, zlib/BZ2, radial packets). Byte slices in, model types out — no network, no filesystem. Product-specific LUT/threshold decoding lives in `rustdar-radar`. |
 
 ## Data Flow
 
@@ -28,19 +31,19 @@ Overlay fetching uses `OverlayRegistry::create_fetch_tasks()` → handler-specif
 
 ## Key Conventions
 
-- **`#![warn(clippy::all)]` and `#![forbid(unsafe_code)]`** on `rustdar-platform`, `rustdar-frontend`, `rustdar-web` and `nexrad-level3`. `rustdar-android` is the only crate that uses `unsafe` (JNI) — which is *why* Android capabilities reach `rustdar-platform` as injected `fn` pointers rather than direct calls.
+- **Lints:** `rustdar-frontend` and `rustdar-web` are `#![warn(clippy::all)]` + `#![forbid(unsafe_code)]`. `rustdar-platform` is `#![deny(unsafe_code)]`, not `forbid` — the iOS entry symbol carries a scoped `allow`, which a `forbid` could not be overridden by. `nexrad-level3` is `#![forbid(unsafe_code)]` + `#![deny(clippy::unwrap_used)]` + `#![deny(clippy::expect_used)]`. `rustdar-android` is the only crate that uses `unsafe` freely (JNI) — which is *why* Android capabilities reach the shared code as injected `fn` pointers rather than direct calls.
 - **CI:** `cargo clippy --fix` auto-applied, then strict clippy re-run. Always pass `cargo clippy --all-targets --all-features`.
 - **Generation counters** (`fetch_generation`, `render_generation`) guard against stale results. Increment before spawning; discard results with generation < current.
 - **`#[path]` submodule pattern:** Large files split via `#[path = "ui_xxx.rs"] mod xxx;`. Extracted methods use `impl super::Gui {}` with `pub(super)` visibility.
-- **Pinned crate versions:** `nexrad-data =1.0.0-rc.5`, `nexrad-model =1.0.0-rc.2`, `nexrad-decode =1.0.0-rc.3`. Don't upgrade without testing.
+- **Pinned crate versions:** every external dependency is pinned exactly (`=x.y.z`) in `[workspace.dependencies]` in the root `Cargo.toml` — that section is the source of truth for versions; don't restate them elsewhere, and don't upgrade without testing.
 - **Config:** `ui.json` saved/loaded from `XDG_CONFIG_HOME/rustdar` or `~/.config/rustdar`. Uses `#[serde(default)]` for backward compatibility.
-- **No web target.** Native adapter limits only.
+- **Web target is WebGL2, never WebGPU.** `rustdar_frontend::app` pins `Backends::GL` on wasm32, and the `webgpu` wgpu feature is deliberately absent on every target — Firefox has no stable WebGPU, so compiling it would only add an untested second rendering path. See the wgpu feature comments in `rustdar-frontend/Cargo.toml` before touching wgpu features anywhere.
 - **Android:** `#[cfg(target_os = "android")]` gates in `rustdar-platform` and Cargo.toml deps. TLS is `rustls` + `rustls-platform-verifier` over the OS trust store; there is no OpenSSL and no bundled root store.
 
 ## Build & Run
 
 ```bash
-cargo build --workspace                      # Desktop (needs libasound2-dev on Ubuntu)
+cargo build --workspace                      # Desktop (needs libudev-dev on Ubuntu)
 cargo run -p rustdar-platform
 cargo clippy --all-targets --all-features    # Lint (matches CI)
 
@@ -59,7 +62,7 @@ the resource table so the manifest can reference it.
 - **Async work:** Network I/O on Tokio. CPU-heavy rendering on `std::thread::spawn` + rayon, not Tokio. Background tasks send results via mpsc channels and call `notify_redraw()`.
 - **Overlay rendering:** All overlays (including radar) are rasterized to RGBA textures and drawn as geo-positioned images. Per-frame cost is one `painter.image()` per overlay type. `OverlayHandler` trait encapsulates fetch, render, and interaction per overlay type.
 - **Map tiles:** CartoDB no-labels base + labels-only overlay on top of radar/overlays, so text isn't obscured.
-- **Geometry helpers:** Framework-agnostic algorithms in `rustdar-overlays/src/render/geo.rs`, egui-specific bridges in `rustdar-egui/src/geo.rs`. Don't duplicate.
+- **Geometry helpers:** Framework-agnostic algorithms in `rustdar-overlays/src/render/geo.rs`; `rustdar-egui` imports them (e.g. `overlay_cache.rs` uses `render::geo`) rather than keeping its own copies. Don't duplicate.
 - **Radar rendering:** Level II and III share `render_with_projection()`. Produces dual output: RGBA image + `Vec<f32>` value data for hover tooltips. Gate parameters vary per radial.
 - **Auto-polling:** Radar every 60s (only when `viewing_live`; historic results cached for instant live return). Overlays on their own intervals regardless of live/historic mode.
 
@@ -81,7 +84,7 @@ the resource table so the manifest can reference it.
 
 1. Add variant to `RadarProduct` in `rustdar-radar/src/types.rs`
 2. Implement `code()`, `name()`, `sort_order()`, `is_level3()`, `format_value()`, `get_moment()` arms; add to `all()`
-3. If Level III: add `tgftp_dirs()` mapping
+3. If Level III: add a `level3_products()` arm — the AWIPS product IDs that key the `unidata-nexrad-level3` bucket
 4. Add `ColorScale` in `palette.rs`; wire in `get_color_for_value()`
 5. UI auto-discovers new products via `ScanInfo::available_products`
 

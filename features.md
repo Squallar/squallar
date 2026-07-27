@@ -25,7 +25,7 @@ Feature comparison across weather platforms. ✅ = implemented, ❌ = not implem
 
 |              Feature               | Pivotal | WeatherBell | Windy | Rustdar |
 | ---------------------------------- | ------- | ----------- | ----- | ------- |
-| HRRR                               | ✅      | ✅          | ✅    | ❌      |
+| HRRR                               | ✅      | ✅          | ✅    | ✅      |
 | NAM / NAM Nest                     | ✅      | ✅          | ❌    | ❌      |
 | GFS                                | ✅      | ✅          | ✅    | ❌      |
 | GEFS (ensemble)                    | ✅      | ✅          | ❌    | ❌      |
@@ -72,7 +72,7 @@ Feature comparison across weather platforms. ✅ = implemented, ❌ = not implem
 | ------------------------- | ----- | --- | ------- |
 | GOES-16/18 visible        | ✅    | ✅  | ❌      |
 | GOES IR / Water vapor     | ✅    | ✅  | ❌      |
-| GOES GLM (lightning)      | ❌    | ❌  | ❌      |
+| GOES GLM (lightning)      | ❌    | ❌  | ✅      |
 | Mesoscale sectors         | ❌    | ✅  | ❌      |
 | Sandwich product (Vis+IR) | ❌    | ❌  | ❌      |
 | Day/Night band            | ❌    | ❌  | ❌      |
@@ -84,7 +84,7 @@ Feature comparison across weather platforms. ✅ = implemented, ❌ = not implem
 |           Feature           | RadarScope | Baron | Rustdar |
 | --------------------------- | ---------- | ----- | ------- |
 | Real-time strikes           | ✅ (paid)  | ✅    | ❌      |
-| GLM (satellite-based)       | ❌         | ✅    | ❌      |
+| GLM (satellite-based)       | ❌         | ✅    | ✅      |
 | Blitzortung (community)     | ❌         | ❌    | ❌      |
 | Lightning density / history | ❌         | ✅    | ❌      |
 
@@ -114,7 +114,7 @@ Feature comparison across weather platforms. ✅ = implemented, ❌ = not implem
 |           Feature           |    GR2A    | RadarScope | Windy |       Rustdar      |
 | --------------------------- | ---------- | ---------- | ----- | ------------------ |
 | Desktop app                 | ✅ (Win)   | ✅         | ❌    | ✅ (Linux/Mac/Win) |
-| Web app                     | ❌         | ❌         | ✅    | ❌                 |
+| Web app                     | ❌         | ❌         | ✅    | ✅                 |
 | Mobile (iOS/Android)        | ❌         | ✅         | ✅    | Android only       |
 | Offline capability          | ✅         | ❌         | ❌    | ❌                 |
 | Dark mode / themes          | ❌         | ❌         | ✅    | ✅                 |
