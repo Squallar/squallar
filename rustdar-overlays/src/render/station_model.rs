@@ -210,12 +210,19 @@ fn draw_cloud_cover_circle(
         };
         let open_fraction = 1.0 - fill_fraction;
         let half_w = radius * open_fraction * 2.0;
-        let pts: [[f32; 2]; 4] = [
-            [radius - half_w, -radius],
-            [radius, -radius],
-            [radius, radius],
-            [radius - half_w, radius],
-        ];
+        // The overpaint is a circular *segment* — a chord at x = radius-half_w
+        // closed by arc samples through the circle's rightmost point — drawn
+        // as a polygon inscribed in the circle, so it cannot leave it. The
+        // full-height rect this replaces put its corners at r·√2 from the
+        // centre, blotting out map and radar pixels beneath the station.
+        let x0 = radius - half_w;
+        let theta = (x0 / radius).clamp(-1.0, 1.0).acos();
+        const ARC_STEPS: usize = 8;
+        let mut pts = [[0.0_f32; 2]; ARC_STEPS + 1];
+        for (i, pt) in pts.iter_mut().enumerate() {
+            let a = -theta + 2.0 * theta * i as f32 / ARC_STEPS as f32;
+            *pt = [radius * a.cos(), radius * a.sin()];
+        }
         painter.filled_polygon(&pts, bg);
     } else {
         // FEW/SCT: partially filled from the left.
@@ -627,6 +634,8 @@ mod tests {
         strokes: Vec<(f32, f32)>,
         /// `(from, to)` per line segment.
         lines: Vec<([f32; 2], [f32; 2])>,
+        /// Vertices per filled polygon.
+        polygons: Vec<Vec<[f32; 2]>>,
     }
 
     impl PointPainter for RecordingPainter {
@@ -640,7 +649,9 @@ mod tests {
         fn line(&mut self, from: [f32; 2], to: [f32; 2], _c: [u8; 4], _w: f32) {
             self.lines.push((from, to));
         }
-        fn filled_polygon(&mut self, _p: &[[f32; 2]], _c: [u8; 4]) {}
+        fn filled_polygon(&mut self, p: &[[f32; 2]], _c: [u8; 4]) {
+            self.polygons.push(p.to_vec());
+        }
     }
 
     fn ob(vis: Option<Visibility>) -> MetarOb {
@@ -731,6 +742,41 @@ mod tests {
             text.contains("15SM") && !text.contains("10+"),
             "got {text:?}"
         );
+    }
+
+    // ── Sky-cover circle ──────────────────────────────────────────────────
+
+    /// The BKN "open slice" is faked by overpainting in the background colour,
+    /// and that overpaint must stay inside the sky-cover circle: the full-height
+    /// rect it used to be put its corners at r·√2 from the centre, blotting out
+    /// map and radar pixels beneath the station. Vertex containment is
+    /// sufficient — the vertices lie on the circle, and their hull is inside it.
+    #[test]
+    fn the_bkn_open_slice_overpaint_stays_inside_the_circle() {
+        let mut bkn = ob(None);
+        bkn.clouds = vec![CloudLayer { cover: "BKN".into(), base_ft: Some(3000) }];
+        let radius = 6.0_f32;
+        let mut p = RecordingPainter::default();
+        draw_cloud_cover_circle(&mut p, &bkn, [0, 255, 0, 255], radius, true);
+
+        assert!(!p.polygons.is_empty(), "BKN draws its open slice as a filled polygon");
+        for poly in &p.polygons {
+            for pt in poly {
+                let d = (pt[0] * pt[0] + pt[1] * pt[1]).sqrt();
+                assert!(
+                    d <= radius + 0.01,
+                    "overpaint vertex {pt:?} sits {d:.2} px out on an r={radius} circle"
+                );
+            }
+        }
+        // Negative control against "fixed" by shrinking the glyph: the slice
+        // still reaches the right edge of the circle, where WMO puts it.
+        let reaches_right = p
+            .polygons
+            .iter()
+            .flatten()
+            .any(|pt| pt[0] > radius * 0.95 && pt[1].abs() < 1.0);
+        assert!(reaches_right, "the open slice must still touch the circle's right edge");
     }
 
     // ── Wind barb ─────────────────────────────────────────────────────────
