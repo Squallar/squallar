@@ -271,7 +271,11 @@ impl super::App {
                 );
 
                 let utc_timestamp = Self::local_to_utc(radar_config.timestamp);
-                let current_scan_timestamp = self.gui.get_scan_info().map(|info| info.timestamp);
+                // This site's own current scan. The GUI emits one check per unique
+                // live site, so the active pane's scan time is the wrong "current"
+                // for every other one — see [`latest_scan_time_for_site`].
+                let current_scan_timestamp =
+                    latest_scan_time_for_site(self.gui.panes(), &radar_config.site);
 
                 let generation = self.render.next_fetch_generation(&radar_config.site);
                 let site = radar_config.site.clone();
@@ -896,6 +900,36 @@ impl super::App {
     }
 }
 
+/// The newest scan of `site` any pane is currently showing, or `None` if none is.
+///
+/// This is the "current" an auto-poll compares that site's latest object against:
+/// `scan::check_and_fetch_latest` downloads only when the site's newest scan is
+/// strictly newer. The GUI emits one `CheckForNewScans` per unique **live site**,
+/// so the active pane's scan time answers the question for at most one of them.
+/// Handed to the others it fails both ways round: an active pane newer than a
+/// second site's scan suppresses that site's updates for as long as both stay
+/// live, and an active pane parked on historic data re-downloads the other site's
+/// whole Level II volume — plus five Level III refetches and a re-render — every
+/// poll interval, for a scan that has not changed.
+///
+/// Resolved through each pane's `scan_info`, whose `site` is the site the scan in
+/// hand really came from, rather than through the pane's live `site` field: the
+/// two diverge for as long as a freshly switched pane's new scan takes to land,
+/// and a timestamp read under the wrong site's name is exactly the mismatch this
+/// exists to prevent. During that window this reports `None` for the new site,
+/// which fetches unconditionally — which is what a site with nothing loaded wants.
+fn latest_scan_time_for_site(
+    panes: &[rustdar_egui::pane::PaneState],
+    site: &str,
+) -> Option<NaiveDateTime> {
+    panes
+        .iter()
+        .filter_map(|p| p.scan_info.as_ref())
+        .filter(|info| info.site.name == site)
+        .map(|info| info.timestamp)
+        .max()
+}
+
 /// Convert a renderer RGBA buffer into egui's pixel layout, or `None` if it is not
 /// the `IMAGE_SIZE²` image the renderer is supposed to produce.
 ///
@@ -1196,6 +1230,64 @@ mod loop_pane_tests {
             begin_loop_for_pane(&mut panes, &mut mgr, 7, 600).is_none(),
             "and neither does a pane that does not exist"
         );
+    }
+
+    /// The defect: auto-poll asked one question per live site but answered every
+    /// one of them with the *active* pane's scan time. With two sites on screen the
+    /// site that was not active either never updated (its latest was older than the
+    /// active pane's, so `check_and_fetch_latest` declined) or was re-downloaded and
+    /// re-rendered in full every poll interval (the active pane was parked on
+    /// historic data, so everything looked new).
+    #[test]
+    fn each_site_is_polled_against_its_own_current_scan() {
+        // Pane 0 is the active one in every path that reaches here, and is the
+        // newer of the two.
+        let panes = [
+            pane_showing(site("KTLX", 35.33, -97.27), ts(25)),
+            pane_showing(site("KOUN", 35.23, -97.46), ts(10)),
+        ];
+
+        assert_eq!(
+            latest_scan_time_for_site(&panes, "KOUN"),
+            Some(ts(10)),
+            "KOUN is polled against KOUN's scan, not the active pane's",
+        );
+        assert_eq!(latest_scan_time_for_site(&panes, "KTLX"), Some(ts(25)));
+        assert_eq!(
+            latest_scan_time_for_site(&panes, "KFWS"),
+            None,
+            "a site nothing is showing has no current scan, so its latest is fetched",
+        );
+    }
+
+    /// The scan's own site decides, not the pane's live `site` field: the two
+    /// diverge for as long as a switched pane's new scan takes to land, and reading
+    /// the pane's field would offer the old site's timestamp as the new site's
+    /// current — suppressing the very fetch the switch is waiting on.
+    #[test]
+    fn a_scans_own_site_decides_which_poll_it_answers() {
+        let panes = [pane_showing(site("KTLX", 35.33, -97.27), ts(10))];
+        assert_eq!(
+            panes[0].site, SWITCHED_TO,
+            "precondition: the pane's live site has already moved"
+        );
+
+        assert_eq!(latest_scan_time_for_site(&panes, "KTLX"), Some(ts(10)));
+        assert_eq!(
+            latest_scan_time_for_site(&panes, SWITCHED_TO),
+            None,
+            "the pane holds no scan of the site it has switched to"
+        );
+    }
+
+    /// Two panes on one site, one stepped back in time: the poll must compare
+    /// against the newest of them, or every interval re-downloads a scan the other
+    /// pane already has.
+    #[test]
+    fn one_sites_current_scan_is_the_newest_pane_showing_it() {
+        let ktlx = || site("KTLX", 35.33, -97.27);
+        let panes = [pane_showing(ktlx(), ts(10)), pane_showing(ktlx(), ts(25))];
+        assert_eq!(latest_scan_time_for_site(&panes, "KTLX"), Some(ts(25)));
     }
 
     /// Enabling a loop drops the previous listing's undispatched downloads: they
