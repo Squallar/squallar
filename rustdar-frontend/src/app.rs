@@ -335,6 +335,19 @@ impl App {
     /// Android is the only platform that answers `Some`, and it answers
     /// all-zero for a failed read as readily as for a real one, so callers
     /// must not ask unless a layout has actually happened.
+    ///
+    /// # Known gap: insets can change without a resize
+    ///
+    /// Switching between gesture and 3-button navigation, and the system bars
+    /// showing or hiding under `Theme.DeviceDefault.NoActionBar.Fullscreen`,
+    /// move the insets without changing the window size. Android reports both
+    /// as `MainEvent::InsetsChanged` and winit discards it outright —
+    /// `winit-0.30.13/src/platform_impl/android/mod.rs:294` logs
+    /// `"TODO: handle Android InsetsChanged notification"` and forwards no
+    /// event — so this function's two call sites, `resumed` and
+    /// `handle_resized`, are the only signal the app has, and stale insets
+    /// stand until the next resize. Re-check that line when winit is bumped; an
+    /// `InsetsChanged` forwarded upstream is the fix.
     fn refresh_safe_area_insets(&mut self) {
         if let Some((top, bottom, left, right)) = self.platform.query_insets() {
             self.gui.set_safe_area_insets(top, bottom, left, right);
@@ -1069,6 +1082,38 @@ mod tests {
             .unwrap_or_else(|| panic!("{name} has no recognisable body"))
     }
 
+    /// The block of the `match` arm `pattern` opens, brace-matched.
+    ///
+    /// Ending the slice at the *next* arm's pattern instead would tie the probe
+    /// to the order the arms happen to be written in: reorder them and the end
+    /// marker lands behind the start, the slice falls back to the whole
+    /// function, and the assertion stops saying anything about the arm it
+    /// names. Braces are the arm's own structure and move with it.
+    fn arm_body<'a>(body: &'a str, pattern: &str) -> &'a str {
+        let at = body
+            .find(pattern)
+            .unwrap_or_else(|| panic!("there is no {pattern} arm here"));
+        let open = at
+            + body[at..]
+                .find("=> {")
+                .unwrap_or_else(|| panic!("the {pattern} arm is no longer a block"))
+            + "=> ".len();
+        let mut depth = 0usize;
+        for (i, c) in body[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &body[open..=open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("the {pattern} arm's block is unterminated");
+    }
+
     /// A press has to actually reach the funnel.
     ///
     /// Both keys go through one call and one route, so this is the whole
@@ -1396,6 +1441,10 @@ mod tests {
         true
     }
 
+    fn always_light() -> bool {
+        false
+    }
+
     /// The app opens showing what the last session left, and it can only get
     /// that from the bridge — this crate has no idea where config lives.
     #[test]
@@ -1669,19 +1718,11 @@ mod tests {
     /// direct exit here would skip both while looking perfectly correct.
     #[test]
     fn closing_the_window_goes_through_request_exit() {
-        let body = fn_body("fn window_event(");
-        let arm = body
-            .find("WindowEvent::CloseRequested")
-            .expect("window_event no longer handles CloseRequested");
-        let arm_end = body[arm..]
-            .find("WindowEvent::RedrawRequested")
-            .map(|i| arm + i)
-            .unwrap_or(body.len());
+        let arm = arm_body(fn_body("fn window_event("), "WindowEvent::CloseRequested");
         assert!(
-            body[arm..arm_end].contains("self.request_exit("),
+            arm.contains("self.request_exit("),
             "the close button bypasses request_exit, so it saves no config and \
-             ignores a platform that cannot quit: {}",
-            &body[arm..arm_end],
+             ignores a platform that cannot quit: {arm}",
         );
     }
 
@@ -1691,18 +1732,33 @@ mod tests {
     /// `ThemeChanged` — and the back handler is what makes back minimise there
     /// instead of quitting. Both are `fn` pointers because the JNI they end in
     /// lives in a crate the bridge cannot depend on.
+    ///
+    /// The theme half takes two apps rather than reading the uninjected state
+    /// first: with no detector, Android has no answer at all and both the real
+    /// bridge and the double `debug_assert!` there. Opposite detectors say more
+    /// anyway — that the read *follows* the injected function, not merely that
+    /// it changed.
     #[test]
     fn the_injected_callbacks_reach_the_bridge() {
         let mut app = headless(TestBridge::android());
-        assert!(
-            !app.platform.detect_dark_theme(),
-            "precondition: nothing injected yet",
-        );
-
         app.set_theme_detector(always_dark);
         assert!(
             app.platform.detect_dark_theme(),
             "the theme read never arrived, and Android has no other one",
+        );
+
+        let mut light = headless(TestBridge::android());
+        light.set_theme_detector(always_light);
+        assert!(
+            !light.platform.detect_dark_theme(),
+            "the read does not follow the detector it was handed",
+        );
+
+        light.set_theme_detector(always_dark);
+        assert!(
+            !light.platform.detect_dark_theme(),
+            "a second detector was accepted; Android refuses one rather than \
+             leave its poll thread calling the detector it has replaced",
         );
 
         BACK_PRESS_REACHED_THE_HANDLER.store(false, Ordering::Relaxed);

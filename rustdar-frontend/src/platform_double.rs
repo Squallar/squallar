@@ -21,6 +21,15 @@
 //! observable — `start_gps` is the only one — the argument is kept behind a
 //! handle the test shares, and that is stated at the field.
 //!
+//! # Where it stops short of the real bridges
+//!
+//! Nothing here starts a thread. `AndroidPlatform::set_theme_detector` spawns a
+//! two-second poller alongside the assignment, because NativeActivity emits no
+//! `ThemeChanged`; this refuses a second detector the way that one does but
+//! spawns nothing, and `theme_channel` is the test's stand-in for the poller.
+//! That is why the refusal is keyed on the detector rather than on the receiver
+//! the real one would have created.
+//!
 //! Nothing here is `Send`: `App` never requires it of a bridge, and `Rc` keeps
 //! the shared handles cheap.
 
@@ -81,9 +90,11 @@ pub(crate) struct TestBridge {
     insets_querier: Option<fn() -> Insets>,
     /// Injected, as Android injects it.
     theme_detector: Option<fn() -> bool>,
-    /// What `detect_dark_theme` answers with no detector installed — the
-    /// synchronous OS read desktop does for itself and iOS hard-codes.
-    fallback_dark: bool,
+    /// Whether the platform has a synchronous theme read of its own: desktop
+    /// (`dark_light::detect`) and iOS (hard-coded light) do, Android does not.
+    /// Both of those answer light here — a host-dependent desktop answer is
+    /// exactly the kind of invention this double avoids, and nothing reads it.
+    reads_theme_itself: bool,
     theme_receiver: Option<Receiver<bool>>,
     gps_fix_receiver: Option<Receiver<rustdar_gps::GpsFix>>,
     heading_receiver: Option<Receiver<f32>>,
@@ -102,7 +113,7 @@ impl TestBridge {
             back_press_taker: None,
             insets_querier: None,
             theme_detector: None,
-            fallback_dark: false,
+            reads_theme_itself: true,
             theme_receiver: None,
             gps_fix_receiver: None,
             heading_receiver: None,
@@ -126,6 +137,7 @@ impl TestBridge {
     pub(crate) fn android() -> Self {
         Self {
             needs_process_exit: true,
+            reads_theme_itself: false,
             ..Self::bare()
         }
     }
@@ -198,7 +210,16 @@ impl PlatformBridge for TestBridge {
     fn detect_dark_theme(&self) -> bool {
         match self.theme_detector {
             Some(detect) => detect(),
-            None => self.fallback_dark,
+            None => {
+                // Android's only theme source is the injected detector, so a
+                // missing one is a wiring bug rather than an answer;
+                // `AndroidPlatform::detect_dark_theme` fails the same way.
+                debug_assert!(
+                    self.reads_theme_itself,
+                    "TestBridge::android detect_dark_theme with no detector injected",
+                );
+                false
+            }
         }
     }
 
@@ -247,7 +268,13 @@ impl PlatformBridge for TestBridge {
         self.insets_querier = Some(querier);
     }
 
+    /// A second detector is refused, as `AndroidPlatform` refuses one: there,
+    /// accepting would leave the running poll thread on the old detector while
+    /// the synchronous path used the new one.
     fn set_theme_detector(&mut self, detector: fn() -> bool) {
+        if self.theme_detector.is_some() {
+            return;
+        }
         self.theme_detector = Some(detector);
     }
 
