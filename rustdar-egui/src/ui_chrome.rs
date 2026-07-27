@@ -225,8 +225,14 @@ impl super::Gui {
                         !self.radar.fetching,
                         egui::Button::new("\u{1f504}").frame(false),
                     );
+                    #[cfg(test)]
+                    {
+                        probe.refresh = refresh_button.rect;
+                    }
                     if refresh_button.clicked() {
-                        actions.push(GuiAction::FetchRadarScan(self.radar.config.clone()));
+                        // The active pane's site, not `radar.config`'s global
+                        // one — see `active_pane_fetch_config`.
+                        actions.push(GuiAction::FetchRadarScan(self.active_pane_fetch_config()));
                     }
                     refresh_button.on_hover_text("Refresh radar data");
 

@@ -55,6 +55,9 @@ pub(crate) struct StatusBarProbe {
     pub product_age_text: Option<String>,
     /// The auto-poll checkbox's rect, when one was drawn.
     pub auto_poll: Option<egui::Rect>,
+    /// The refresh button's rect — always drawn, so a test can click the real
+    /// button rather than restating its position.
+    pub refresh: egui::Rect,
     /// Whether the hover readout was drawn.
     pub hover: bool,
     /// The rect the panel actually claimed, straight off its own response —
@@ -69,6 +72,7 @@ impl Default for StatusBarProbe {
             scan_text: String::new(),
             product_age_text: None,
             auto_poll: None,
+            refresh: egui::Rect::NOTHING,
             hover: false,
             rect: egui::Rect::NOTHING,
         }
@@ -637,6 +641,21 @@ impl Gui {
         actions
     }
 
+    /// The config a radar fetch on the active pane's behalf must use: the
+    /// shared `radar.config` with the active pane's site substituted in.
+    ///
+    /// `config.site` is a *global* last-switched site — the frontend's
+    /// `SwitchRadarSite` writes it even when layer sync is off — so with
+    /// per-pane sites it can name a site the active pane is not viewing.
+    /// Both Refresh entry points (status bar and menu) and the initial
+    /// auto-fetch route through here rather than cloning the config verbatim,
+    /// so they cannot drift apart.
+    pub(super) fn active_pane_fetch_config(&self) -> RadarConfig {
+        let mut config = self.radar.config.clone();
+        config.site = self.active_pane().site.clone();
+        config
+    }
+
     /// Check timers and emit fetch actions for auto-polling radar scans,
     /// NWS alerts, and SPC discussions.
     fn check_auto_polls(&mut self, actions: &mut Vec<GuiAction>) {
@@ -645,9 +664,7 @@ impl Gui {
             self.radar.fetching = true;
             self.auto_poll.initial_fetch_done = true;
             self.auto_poll.record_fetch();
-            let mut config = self.radar.config.clone();
-            config.site = self.active_pane().site.clone();
-            actions.push(GuiAction::FetchRadarScan(config));
+            actions.push(GuiAction::FetchRadarScan(self.active_pane_fetch_config()));
         }
 
         // Poll for new scans at the current poll interval (only when any pane is viewing live)

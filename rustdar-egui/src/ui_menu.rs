@@ -247,7 +247,9 @@ impl super::Gui {
         match event {
             MenuEvent::Invoked(MenuAction::Exit) => actions.push(GuiAction::Exit),
             MenuEvent::Invoked(MenuAction::RefreshRadar) => {
-                actions.push(GuiAction::FetchRadarScan(self.radar.config.clone()));
+                // The active pane's site, not `radar.config`'s global one —
+                // see `active_pane_fetch_config`.
+                actions.push(GuiAction::FetchRadarScan(self.active_pane_fetch_config()));
             }
             MenuEvent::Invoked(MenuAction::OpenTimeDialog) => {
                 self.time_dialog.show = true;

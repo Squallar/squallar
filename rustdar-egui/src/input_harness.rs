@@ -4400,6 +4400,7 @@ mod tests {
              every pass, so the assertion it backs is vacuous"
         );
     }
+
     /// 36. **A pane born from the pane-count picker inherits the layer state.**
     ///
     ///     `PaneState::with_site` starts with empty overlay maps, and
@@ -4436,6 +4437,59 @@ mod tests {
             h.overlay_enabled_on(1, OverlayKind::Radar),
             "the picker's new pane came up with every overlay off — its empty \
              `enabled_overlays` was never seeded from the handler state"
+        );
+    }
+
+    /// The site of the first `FetchRadarScan` among `actions`, if any.
+    fn fetched_site(actions: &[crate::actions::GuiAction]) -> Option<String> {
+        actions.iter().find_map(|a| match a {
+            crate::actions::GuiAction::FetchRadarScan(config) => Some(config.site.clone()),
+            _ => None,
+        })
+    }
+
+    /// 37. **Refresh fetches the site the active pane is viewing.**
+    ///
+    ///     `radar.config.site` is a *global* last-switched site — the
+    ///     frontend's `SwitchRadarSite` writes it whichever pane switched,
+    ///     sync on or off — so with per-pane sites a Refresh that clones the
+    ///     config verbatim can fetch a site the active pane never showed.
+    ///     Both entry points, driven the way a user reaches them: the status
+    ///     bar's button and the File menu's item.
+    #[test]
+    fn refresh_fetches_the_active_panes_site_not_the_global_one() {
+        let mut h = InputHarness::with_screen(egui::vec2(800.0, 900.0));
+        assert_eq!(
+            h.width_class(),
+            crate::ui_layout::WidthClass::Medium,
+            "precondition: the menu-bar presentation of Refresh must be on screen"
+        );
+
+        // Some other pane switched sites last: the global config points away
+        // from what the active pane is viewing.
+        let mut config = h.gui_mut().get_radar_config().clone();
+        config.site = "KDMX".to_owned();
+        h.gui_mut().set_radar_config(config);
+        h.warm_up();
+        assert_eq!(
+            h.gui_mut().active_pane().site, "KTLX",
+            "precondition: the active pane and the global config must disagree"
+        );
+
+        h.mouse_click(h.status_bar().refresh.center());
+        assert_eq!(
+            fetched_site(h.last_actions()).as_deref(),
+            Some("KTLX"),
+            "the status-bar Refresh fetched the global site, not the active pane's"
+        );
+
+        h.mouse_click(clickable_leaf(&h, "File").center());
+        h.frames_for(2, FRAME_DT);
+        h.mouse_click(clickable_leaf(&h, "Refresh Radar").center());
+        assert_eq!(
+            fetched_site(h.last_actions()).as_deref(),
+            Some("KTLX"),
+            "the menu's Refresh fetched the global site, not the active pane's"
         );
     }
 
