@@ -1358,3 +1358,30 @@ fn a_real_granule_parses_into_plottable_lightning() {
         "flashes must report an area"
     );
 }
+
+/// Fails if a GLM bucket bypasses the origin table. The Android
+/// network-security-config test and the web service-worker never-cache test
+/// are both derived from `DataSources`, so a bucket resolved anywhere else is
+/// invisible to both — the enum's own hardcode is how `noaa-goes16` outlived
+/// GOES-16's rotation out of the East slot.
+#[test]
+fn the_glm_buckets_come_from_the_declared_origins() {
+    use rustdar_radar::sources::DataSources;
+
+    let s = DataSources::production();
+    assert_eq!(GlmSatellite::GoesEast.bucket(&s), "noaa-goes19");
+    assert_eq!(GlmSatellite::GoesWest.bucket(&s), "noaa-goes18");
+
+    // Overriding one slot must move that slot's bucket and only that slot's:
+    // this is what lets a test point one satellite at a mock server.
+    let overridden = DataSources {
+        goes_east_bucket: std::borrow::Cow::Borrowed("mock-east"),
+        ..DataSources::production()
+    };
+    assert_eq!(
+        GlmSatellite::GoesEast.bucket(&overridden),
+        "mock-east",
+        "the East bucket must track the origin table, not a hardcode",
+    );
+    assert_eq!(GlmSatellite::GoesWest.bucket(&overridden), "noaa-goes18");
+}

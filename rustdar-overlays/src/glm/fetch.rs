@@ -1,11 +1,12 @@
 //! Fetch GLM lightning flash data from AWS S3.
 //!
-//! Lists and downloads L2 LCFA NetCDF4 files from the `noaa-goes19`/
-//! `noaa-goes18` public buckets. Each granule covers ~20 seconds.
+//! Lists and downloads L2 LCFA NetCDF4 files from the public GOES buckets
+//! declared in [`DataSources`]. Each granule covers ~20 seconds.
 
 use std::collections::HashMap;
 
 use chrono::{NaiveDateTime, TimeDelta, Utc};
+use rustdar_radar::sources::DataSources;
 
 use super::cf;
 use super::{
@@ -112,6 +113,7 @@ fn granule_start_of(key: &str, now: NaiveDateTime) -> NaiveDateTime {
 /// poll's state and can edge-trigger the message.
 pub async fn fetch_glm_flashes(
     client: &reqwest::Client,
+    sources: &DataSources,
     satellites: &[GlmSatellite],
     time_window_secs: f64,
     levels: &[GlmDataLevel],
@@ -140,7 +142,8 @@ pub async fn fetch_glm_flashes(
     let mut tally = PollTally::default();
 
     for &sat in satellites {
-        let listing = list_glm_files(client, sat, start, now).await?;
+        let bucket = sat.bucket(sources);
+        let listing = list_glm_files(client, bucket, start, now).await?;
 
         // Zero objects means the feed is gone (dead bucket, renamed path,
         // satellite rotated out of the slot), not a quiet sky: GOES-East
@@ -149,7 +152,7 @@ pub async fn fetch_glm_flashes(
         if listing.objects_seen == 0 {
             dead_feeds.push(DeadFeed {
                 satellite: sat,
-                bucket: sat.bucket(),
+                bucket: bucket.to_string(),
                 prefixes: listing.prefixes.clone(),
             });
         }
@@ -162,7 +165,7 @@ pub async fn fetch_glm_flashes(
         log::info!("Downloading {} new GLM files from {}", new_keys.len(), sat.display_name());
 
         // Download in concurrent batches of 20
-        let batch = download_and_parse_batch(client, sat, &new_keys, levels).await;
+        let batch = download_and_parse_batch(client, sat, bucket, &new_keys, levels).await;
         acc.absorb(sat, levels, batch);
     }
 
@@ -307,17 +310,17 @@ struct GlmListing {
     prefixes: Vec<String>,
 }
 
-/// List GLM LCFA file keys on S3 for the given time range.
+/// List GLM LCFA file keys on S3 for the given time range. `bucket` is the
+/// slot's declared origin — see [`GlmSatellite::bucket`].
 ///
 /// S3 path: `GLM-L2-LCFA/{year}/{day_of_year}/{hour}/`
 /// Files: `OR_GLM-L2-LCFA_G{sat}_s{start}_e{end}_c{creation}.nc`
 async fn list_glm_files(
     client: &reqwest::Client,
-    satellite: GlmSatellite,
+    bucket: &str,
     start: NaiveDateTime,
     end: NaiveDateTime,
 ) -> Result<GlmListing, String> {
-    let bucket = satellite.bucket();
     let mut all_keys = Vec::new();
     let mut objects_seen = 0usize;
 
@@ -481,20 +484,21 @@ struct BatchOutcome {
     level_failures: Vec<LevelFailure>,
 }
 
-/// Download and parse a batch of GLM NetCDF files concurrently.
+/// Download and parse a batch of GLM NetCDF files concurrently. `bucket` is
+/// the slot's declared origin — see [`GlmSatellite::bucket`].
 async fn download_and_parse_batch(
     client: &reqwest::Client,
     satellite: GlmSatellite,
+    bucket: &str,
     keys: &[&str],
     levels: &[GlmDataLevel],
 ) -> BatchOutcome {
     use futures::stream::StreamExt;
 
-    let bucket = satellite.bucket();
     let levels_owned: Vec<GlmDataLevel> = levels.to_vec();
     let futs: Vec<_> = keys.iter().map(|&key| {
         let client = client.clone();
-        let url = format!("https://{bucket}.s3.amazonaws.com/{key}");
+        let url = DataSources::s3_object_url(bucket, key);
         let key_owned = key.to_string();
         let lvls = levels_owned.clone();
         async move {
@@ -1104,10 +1108,20 @@ fn unit_multiplier(
     found
 }
 
+/// Stable per-slot token for the dedup keys below. Deliberately not the S3
+/// bucket: that is resolved from [`DataSources`] at fetch time and a test can
+/// point it elsewhere, while a warning's identity must not move when it does.
+fn slot_key(satellite: GlmSatellite) -> &'static str {
+    match satellite {
+        GlmSatellite::GoesEast => "goes-east",
+        GlmSatellite::GoesWest => "goes-west",
+    }
+}
+
 /// Dedup key for "a hierarchy level would not parse". Satellite-qualified: a
 /// change hitting one bird must not suppress the report for the other.
 pub(super) fn level_parse_key(satellite: GlmSatellite, lat_var: &str) -> String {
-    format!("{}:level-parse:{lat_var}", satellite.bucket())
+    format!("{}:level-parse:{lat_var}", slot_key(satellite))
 }
 
 /// Dedup key for "a variable the product used to have is gone". Deliberately
@@ -1121,7 +1135,7 @@ pub(super) fn missing_variable_key(name: &str) -> String {
 /// the satellite *and* the offending spelling, so a second bad spelling still
 /// reports, and so does the same one on the other bird.
 pub(super) fn units_key(satellite: GlmSatellite, name: &str, spelling: &str) -> String {
-    format!("{}:{name}:units:{spelling}", satellite.bucket())
+    format!("{}:{name}:units:{spelling}", slot_key(satellite))
 }
 
 /// Log a warning the first time a given key is seen, then stay quiet.

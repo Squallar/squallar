@@ -533,6 +533,7 @@ impl OverlayHandler for GlmHandler {
     fn create_fetch_tasks(&self, ctx: &FetchConfig) -> Vec<FetchTask> {
         log::info!("Fetching GLM lightning data");
         let client = ctx.client.clone();
+        let sources = ctx.sources.clone();
         let satellites = self.satellite.to_satellites();
         let time_window_secs = self.time_window_secs;
         let levels = self.active_levels();
@@ -547,6 +548,7 @@ impl OverlayHandler for GlmHandler {
                 };
                 let result = crate::glm::fetch::fetch_glm_flashes(
                     &client,
+                    &sources,
                     &satellites,
                     time_window_secs,
                     &levels,
@@ -935,7 +937,7 @@ mod tests {
     fn dead_east() -> DeadFeed {
         DeadFeed {
             satellite: GlmSatellite::GoesEast,
-            bucket: "noaa-goes16",
+            bucket: "noaa-goes16".into(),
             prefixes: vec!["GLM-L2-LCFA/2026/206/02/".into()],
         }
     }

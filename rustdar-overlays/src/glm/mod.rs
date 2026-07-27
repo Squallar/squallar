@@ -1,8 +1,11 @@
 //! GOES GLM (Geostationary Lightning Mapper) data types and fetch logic.
 //!
-//! Level 2 LCFA (Lightning Cluster-Filter Algorithm) data from the public
-//! `noaa-goes19`/`noaa-goes18` S3 buckets. Each NetCDF4 granule covers ~20 s;
-//! flashes are aggregated over a configurable window (default 5 minutes).
+//! Level 2 LCFA (Lightning Cluster-Filter Algorithm) data from the public GOES
+//! S3 buckets declared in [`rustdar_radar::sources::DataSources`]. Each NetCDF4
+//! granule covers ~20 s; flashes are aggregated over a configurable window
+//! (default 5 minutes).
+
+use rustdar_radar::sources::DataSources;
 
 mod cf;
 pub mod fetch;
@@ -27,12 +30,16 @@ pub enum GlmSatellite {
 }
 
 impl GlmSatellite {
-    /// S3 bucket name for the satellite currently operating this slot.
-    pub fn bucket(self) -> &'static str {
+    /// S3 bucket for the satellite currently operating this slot, resolved
+    /// from the origin table rather than hardcoded here: the two derived
+    /// validations (the Android network-security-config test, the web
+    /// service-worker never-cache test) read [`DataSources`], so a bucket
+    /// named anywhere else is invisible to both — which is how `noaa-goes16`
+    /// outlived GOES-16's rotation out of the East slot.
+    pub fn bucket(self, sources: &DataSources) -> &str {
         match self {
-            // `noaa-goes16` has no GLM data after 2025 day 097.
-            GlmSatellite::GoesEast => "noaa-goes19",
-            GlmSatellite::GoesWest => "noaa-goes18",
+            GlmSatellite::GoesEast => &sources.goes_east_bucket,
+            GlmSatellite::GoesWest => &sources.goes_west_bucket,
         }
     }
 
@@ -105,7 +112,9 @@ pub struct GlmFlash {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeadFeed {
     pub satellite: GlmSatellite,
-    pub bucket: &'static str,
+    /// Owned, not `&'static`: the bucket is resolved from [`DataSources`],
+    /// which a test can point at a mock.
+    pub bucket: String,
     /// The S3 prefixes that were queried and returned nothing.
     pub prefixes: Vec<String>,
 }
