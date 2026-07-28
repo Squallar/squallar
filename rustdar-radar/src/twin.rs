@@ -30,12 +30,15 @@ pub mod compare {
     impl ValueCodec {
         /// The codec a message's own PDB and packet declare — the same
         /// selection [`crate::render`] makes to draw the product: Digital
-        /// VIL's hybrid LUT for product 134, the legacy threshold table for
-        /// RLE packets, otherwise packet-28 XDR scale/offset falling back to
-        /// the PDB's pair. `None` when the message carries no radial packet.
+        /// VIL's hybrid LUT for product 134, EET's mask/scale/offset LUT for
+        /// product 135, the legacy threshold table for RLE packets, otherwise
+        /// packet-28 XDR scale/offset falling back to the PDB's pair. `None`
+        /// when the message carries no radial packet.
         pub fn for_message(msg: &Level3Message) -> Option<Self> {
             let packet = crate::srm::radial_packet(msg)?;
-            if let Some(lut) = l3_values::build_vil_lut(&msg.pdb) {
+            if let Some(lut) =
+                l3_values::build_vil_lut(&msg.pdb).or_else(|| l3_values::build_eet_lut(&msg.pdb))
+            {
                 return Some(Self::Lut(lut));
             }
             if packet.is_legacy {
@@ -463,6 +466,67 @@ pub mod live {
         );
         assert_eq!(twin.message.pdb.product_code, 135, "EET decodes as 135");
     }
+
+    /// The EET decode fix, live: a real product-135 object selects the
+    /// mask/scale/offset LUT, and every defined gate decodes to a height in
+    /// the ICD's 0–69 kft band — never the raw 130–199 topped levels the
+    /// scaled fallback used to report.
+    ///
+    /// ```text
+    /// cargo test -p rustdar-radar --release -- --ignored --nocapture live_eet_codec
+    /// ```
+    #[ignore = "hits the live S3 bucket"]
+    #[tokio::test]
+    async fn live_eet_codec_decodes_heights_within_the_icd_band() {
+        crate::tls::init();
+        let sources = DataSources::production();
+        let now = chrono::Utc::now().naive_utc();
+
+        // Any real EET object will do — checking the decode's range needs no
+        // volume pairing — so take the first candidate that decodes.
+        let mut found = None;
+        'sites: for &site in SITES {
+            for key in candidate_keys(&sources, site, "EET", now).await {
+                let url = sources.level3_object_url(&key);
+                let Ok(bytes) = archive::get_bytes(archive::shared_client(), url).await else {
+                    continue;
+                };
+                if let Ok(message) = nexrad_level3::decode::decode_product(&bytes) {
+                    found = Some((site, key, message));
+                    break 'sites;
+                }
+            }
+        }
+        let (site, key, message) = found.expect("some site has a recent EET object");
+        assert_eq!(message.pdb.product_code, 135);
+        println!(
+            "{site} {key}: thresholds {:?}",
+            &message.pdb.thresholds[..4]
+        );
+
+        let codec = super::compare::ValueCodec::for_message(&message)
+            .expect("the EET object carries a radial packet");
+        assert!(
+            matches!(codec, super::compare::ValueCodec::Lut(_)),
+            "product 135 must select the EET LUT, not scale/offset",
+        );
+
+        let packet = crate::srm::radial_packet(&message).expect("present per the codec");
+        let (mut defined, mut topped) = (0usize, 0usize);
+        for &gate in packet.radials.iter().flat_map(|r| r.gate_values.iter()) {
+            let v = codec.decode(gate);
+            if v.is_nan() {
+                continue;
+            }
+            assert!(
+                (0.0..=69.0).contains(&v),
+                "{site} {key}: gate level {gate} decoded to {v} kft",
+            );
+            defined += 1;
+            topped += usize::from(gate & 0x80 != 0);
+        }
+        println!("{site} {key}: {defined} defined bins decoded into 0–69 kft ({topped} topped)");
+    }
 }
 
 #[cfg(test)]
@@ -682,6 +746,53 @@ mod tests {
         assert_eq!(lut.decode(3), 10.0);
         assert!(lut.decode(4).is_nan(), "past the table is undefined");
         assert_eq!(lut.encode(9.0), 3);
+    }
+
+    /// Product 135 selects the EET mask/scale/offset LUT — its thresholds
+    /// are `[127, 1, 2, 128]`, not floats, and decoding them as the scaled
+    /// fallback painted every bin 2 kft high and topped bins as 130–199 kft.
+    #[test]
+    fn for_message_selects_the_eet_lut_for_product_135() {
+        use nexrad_level3::model::{
+            DataLayer, DataPacket, Level3Message, MessageHeader, SymbologyBlock,
+        };
+        let mut pdb = pdb_with_volume(20661, 7108);
+        pdb.thresholds[..4].copy_from_slice(&[0x7F, 1, 2, 0x80]);
+        let msg = Level3Message {
+            header: MessageHeader {
+                message_code: 135,
+                date_of_message: 20661,
+                time_of_message: 7200,
+                message_length: 0,
+                source_id: 0,
+                destination_id: 0,
+                number_of_blocks: 3,
+            },
+            pdb,
+            symbology: Some(SymbologyBlock {
+                block_id: 1,
+                block_length: 0,
+                num_layers: 1,
+                layers: vec![DataLayer {
+                    layer_length: 0,
+                    packets: vec![DataPacket::DigitalRadial(packet(
+                        360,
+                        4,
+                        0,
+                        0.001, // what a live EET packet carries
+                        |_, j| [0, 2, 71, 130][j],
+                    ))],
+                }],
+            }),
+        };
+        let codec = ValueCodec::for_message(&msg).expect("a radial packet is present");
+        assert!(matches!(codec, ValueCodec::Lut(_)), "135 decodes via LUT");
+        assert!(codec.decode(0).is_nan());
+        assert_eq!(codec.decode(2), 0.0);
+        assert_eq!(codec.decode(71), 69.0);
+        assert_eq!(codec.decode(130), 0.0, "bit 7 flags topped, not height");
+        assert_eq!(codec.decode(199), 69.0);
+        assert!(codec.decode(100).is_nan(), "outside the encodable band");
     }
 
     /// The volume stamp conversion: day 1 is 1970-01-01, so MJD 20661 at

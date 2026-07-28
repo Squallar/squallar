@@ -81,7 +81,7 @@ mod seq_fallback {
     }
 }
 
-use crate::l3_values::{build_vil_lut, decode_legacy_thresholds, l3_physical_value};
+use crate::l3_values::{build_eet_lut, build_vil_lut, decode_legacy_thresholds, l3_physical_value};
 use crate::palette::get_color_for_value;
 use crate::types;
 use std::f64::consts::PI;
@@ -986,10 +986,10 @@ pub fn render_level3_message_to_image(
     let offset = rp
         .xdr_data_offset
         .unwrap_or_else(|| l3_msg.pdb.data_offset());
-    let vil_lut = build_vil_lut(&l3_msg.pdb);
+    let product_lut = build_vil_lut(&l3_msg.pdb).or_else(|| build_eet_lut(&l3_msg.pdb));
     let legacy_lut;
-    let lut: Option<&[f32]> = if vil_lut.is_some() {
-        vil_lut.as_deref()
+    let lut: Option<&[f32]> = if product_lut.is_some() {
+        product_lut.as_deref()
     } else if rp.is_legacy {
         legacy_lut = decode_legacy_thresholds(&l3_msg.pdb);
         Some(legacy_lut.as_slice())

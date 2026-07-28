@@ -49,10 +49,11 @@
 //! a live `TLX_EET` object (packet 16, 360 × 1° radials, 1 km gates, 346
 //! bins, thresholds `[127, 1, 2, 128]`).
 //!
-//! The crate's Level III render path decodes EET through the PDB fallback
-//! scale 1 / offset 0 (135's thresholds are not IEEE floats), so it painted
-//! every bin 2 kft high and topped bins as 130–199 kft; this derivation
-//! replaces that path with correct values.
+//! The crate's Level III render path and twin codec decode 135 through
+//! `l3_values::build_eet_lut`, which reads exactly these four threshold
+//! halfwords. (They once fell back to the PDB's scale 1 / offset 0 — 135's
+//! thresholds are not IEEE floats — which painted every bin 2 kft high and
+//! topped bins as absurd 130–199 kft heights.)
 //!
 //! # Documented gaps against the RPG
 //!

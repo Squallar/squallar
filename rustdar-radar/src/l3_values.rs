@@ -45,6 +45,42 @@ pub(crate) fn build_vil_lut(pdb: &ProductDescriptionBlock) -> Option<Vec<f32>> {
     Some(lut)
 }
 
+/// Build a 256-entry look-up table for Enhanced Echo Tops (product 135),
+/// `None` for anything else.
+///
+/// 135's thresholds are neither IEEE floats nor NEXRAD float16s: per the ICD
+/// amendment (see `crate::eet`'s module doc), halfwords 0–3 carry
+/// DATA_MASK / SCALE / OFFSET / TOPPED_MASK — `[127, 1, 2, 128]` on a live
+/// `TLX_EET` — and the decode is
+/// `height_kft = (level & DATA_MASK) / SCALE − OFFSET`, where bit 7
+/// (TOPPED_MASK) only flags a storm top above the volume's highest cut.
+/// Levels 0 and 1 (below threshold / bad data) and any level whose masked
+/// value falls outside the encodable band (heights `0 ≤ EET < 70` kft, i.e.
+/// the unused 72–127) are `NaN`.
+pub(crate) fn build_eet_lut(pdb: &ProductDescriptionBlock) -> Option<Vec<f32>> {
+    if pdb.product_code != 135 {
+        return None;
+    }
+    let data_mask = pdb.thresholds[0];
+    let scale = f32::from(pdb.thresholds[1]);
+    let offset = f32::from(pdb.thresholds[2]);
+    let topped_mask = pdb.thresholds[3];
+
+    let mut lut = vec![f32::NAN; 256];
+    // Levels 0 and 1 are below threshold and bad data → NaN.
+    for (i, slot) in lut.iter_mut().enumerate().skip(2) {
+        let level = i as u16;
+        if level & !(data_mask | topped_mask) != 0 {
+            continue;
+        }
+        let height = f32::from(level & data_mask) / scale - offset;
+        if (0.0..crate::eet::MAX_EET_KFT).contains(&height) {
+            *slot = height;
+        }
+    }
+    Some(lut)
+}
+
 /// Decode the 16 legacy data level thresholds into physical values.
 ///
 /// For legacy products (e.g. code 56 SRM) each threshold `u16` carries flag
@@ -233,6 +269,51 @@ mod tests {
         }
         // Any other product code has no VIL table.
         assert!(build_vil_lut(&pdb(135, dvl_thresholds())).is_none());
+    }
+
+    /// The ICD amendment's EET thresholds, as a live `TLX_EET` declares them:
+    /// DATA_MASK / SCALE / OFFSET / TOPPED_MASK.
+    fn eet_thresholds() -> [u16; 16] {
+        let mut t = [0u16; 16];
+        t[0] = 0x7F; // DATA_MASK
+        t[1] = 1; // SCALE
+        t[2] = 2; // OFFSET
+        t[3] = 0x80; // TOPPED_MASK
+        t
+    }
+
+    #[test]
+    fn the_eet_lut_masks_bit_7_and_offsets_by_two() {
+        let lut = build_eet_lut(&pdb(135, eet_thresholds())).expect("135 is EET");
+        assert_eq!(lut.len(), 256);
+        assert!(lut[0].is_nan(), "level 0 is below threshold");
+        assert!(lut[1].is_nan(), "level 1 is bad data");
+        assert_eq!(lut[2], 0.0, "the 0-kft bin");
+        assert_eq!(lut[71], 69.0, "the last height level");
+        assert_eq!(lut[130], 0.0, "topped 0 kft: bit 7 is a flag, not height");
+        assert_eq!(lut[199], 69.0, "the last topped level");
+        for (i, v) in lut.iter().enumerate().take(130).skip(72) {
+            assert!(v.is_nan(), "lut[{i}] is outside the encodable band");
+        }
+        for (i, v) in lut.iter().enumerate().skip(200) {
+            assert!(v.is_nan(), "lut[{i}] is outside the encodable band");
+        }
+        // Any other product code has no EET table, and the VIL builder in
+        // turn refuses 135 (pinned in the VIL test above).
+        assert!(build_eet_lut(&pdb(134, eet_thresholds())).is_none());
+    }
+
+    /// The builder reads the PDB's own halfwords, it does not assume the
+    /// fleet values: shift the offset and the heights shift with it.
+    #[test]
+    fn the_eet_lut_reads_its_thresholds_from_the_pdb() {
+        let mut t = eet_thresholds();
+        t[2] = 3;
+        let lut = build_eet_lut(&pdb(135, t)).expect("still EET");
+        assert!(lut[2].is_nan(), "masked 2 − 3 is below the 0-kft bin");
+        assert_eq!(lut[3], 0.0);
+        assert_eq!(lut[131], 0.0, "the topped band shifts identically");
+        assert_eq!(lut[72], 69.0, "the band's top follows the offset");
     }
 
     /// The inverse the DVL harness will lean on: every displayable level
