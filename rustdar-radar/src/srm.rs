@@ -2295,16 +2295,12 @@ mod live_validation {
 
     const TGFTP_SRM_DIR: &str = "https://tgftp.nws.noaa.gov/SL.us008001/DF.of/DC.radar/DS.56rm";
 
-    /// Sites are tried in order until enough tilts line up **with a nonzero
-    /// vector**. Two things make a site unusable, and both are common:
-    /// tgftp's `sn.last` and the bucket's newest key are frequently one volume
-    /// apart, and a quiet site reports 0.0 kt, which zeroes the very term this
-    /// is validating. Long and geographically spread so a calm night over any
-    /// one region does not starve the sample.
-    pub const SITES: &[&str] = &[
-        "KMPX", "KFSD", "KBIS", "KOAX", "KUEX", "KABR", "KTLX", "KMRX", "KTLH", "KMOB", "KSGF",
-        "KPAH", "KMLB", "KMTX", "KSFX", "KMVX", "KLZK", "KSHV", "KEAX", "KDDC", "KAMA", "KFWS",
-    ];
+    // The site roster and the volume-pairing key search live in
+    // `crate::twin::live` now, shared with the product-twin harnesses; the
+    // rationale for both — why the list is long and spread, and why the
+    // newest key is never taken — moved with them.
+    pub use crate::twin::live::SITES;
+    use crate::twin::live::candidate_keys;
 
     /// Level 0 is "no data" and 15 "range folded" in the RPG's product; neither
     /// is a value this can be checked against.
@@ -2317,50 +2313,6 @@ mod live_validation {
             .await
             .ok()?;
         nexrad_level3::decode::decode_product(&bytes).ok()
-    }
-
-    /// How many bucket objects to open looking for the volume and cut tgftp
-    /// served, and how far from its generation time to look.
-    ///
-    /// The bucket's *newest* key will not do, above all at 0.5°: SAILS
-    /// republishes the lowest cut two to four times a volume, so the newest
-    /// `N0G` is usually a mid-volume repeat while tgftp's `sn.last` is some
-    /// other cut. Taking the newest key skipped the lowest tilt at two sites in
-    /// three on the first run — which would have left the tilt this validates
-    /// almost never actually compared.
-    const KEY_LOOKBACK: usize = 10;
-    const KEY_WINDOW_MINUTES: i64 = 20;
-
-    /// The bucket keys for `site`/`code` within [`KEY_WINDOW_MINUTES`] of
-    /// `want`, nearest first: the matching object is written within seconds of
-    /// its sibling, so the first candidate is almost always the answer.
-    async fn candidate_keys(
-        sources: &DataSources,
-        site: &str,
-        code: &str,
-        want: chrono::NaiveDateTime,
-    ) -> Vec<String> {
-        let site3 = crate::level3::site_code(site).to_uppercase();
-        let mut keys = Vec::new();
-        for day in [want.date(), want.date() - chrono::Duration::days(1)] {
-            if let Ok(k) = crate::level3::list_day(sources, &site3, code, &day).await {
-                keys.extend(k);
-            }
-        }
-        let mut candidates: Vec<(i64, String)> = keys
-            .into_iter()
-            .filter_map(|k| {
-                let t = crate::level3::key_time(&k)?;
-                let delta = (t - want).num_seconds().abs();
-                (delta <= KEY_WINDOW_MINUTES * 60).then_some((delta, k))
-            })
-            .collect();
-        candidates.sort();
-        candidates
-            .into_iter()
-            .take(KEY_LOOKBACK)
-            .map(|(_, k)| k)
-            .collect()
     }
 
     /// The bucket product for `site`/`code` from the same volume **and cut** as
