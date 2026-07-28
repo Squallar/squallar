@@ -24,10 +24,10 @@ rustdar-egui/src/ui_menu.rs	273	240
 rustdar-egui/src/ui_popups.rs	163	4
 rustdar-egui/src/ui_settings.rs	220	177
 rustdar-frontend/src/app.rs	1007	771
-rustdar-frontend/src/app_fetch.rs	927	363
-rustdar-frontend/src/app_render.rs	1576	962
+rustdar-frontend/src/app_fetch.rs	936	363
+rustdar-frontend/src/app_render.rs	1587	963
 rustdar-frontend/src/app_state.rs	80	0
-rustdar-frontend/src/channels.rs	31	28
+rustdar-frontend/src/channels.rs	34	31
 rustdar-frontend/src/constants.rs	26	20
 rustdar-frontend/src/egui_renderer.rs	153	33
 rustdar-frontend/src/input.rs	138	127
@@ -36,7 +36,7 @@ rustdar-frontend/src/mobile_cfg.rs	19	19
 rustdar-frontend/src/offload.rs	6	6
 rustdar-frontend/src/platform.rs	126	99
 rustdar-frontend/src/platform_double.rs	135	123
-rustdar-frontend/src/render_dispatch.rs	1062	981
+rustdar-frontend/src/render_dispatch.rs	1070	982
 rustdar-gps/src/config.rs	27	19
 rustdar-gps/src/nmea_parser.rs	52	0
 rustdar-gps/src/serial.rs	168	37
@@ -86,10 +86,11 @@ rustdar-platform/src/network_security_config.rs	150	147
 rustdar-platform/src/platform.rs	88	0
 rustdar-platform/src/run.rs	31	0
 rustdar-radar/src/archive.rs	529	407
-rustdar-radar/src/level3.rs	346	187
+rustdar-radar/src/level3.rs	364	187
+rustdar-radar/src/nrot.rs	1045	981
 rustdar-radar/src/palette.rs	156	83
-rustdar-radar/src/render.rs	902	776
-rustdar-radar/src/scan.rs	216	3
+rustdar-radar/src/render.rs	838	713
+rustdar-radar/src/scan.rs	229	3
 rustdar-radar/src/sites.rs	10	10
 rustdar-radar/src/sources.rs	154	151
 rustdar-radar/src/srm.rs	1370	822
