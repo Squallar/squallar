@@ -1265,3 +1265,226 @@ pub fn get_radar_site(site: &str) -> Option<&'static RadarSite> {
 
     SITE_MAP.get(site).copied()
 }
+
+/// Great-circle distance between two coordinates, in kilometres.
+///
+/// Haversine rather than the cheaper equirectangular approximation: the caller
+/// compares sites up to a continent apart (a fix in Hawaii against a table that
+/// is mostly CONUS), and the flat approximation's error grows with both
+/// separation and latitude — exactly the regime the comparison runs in.
+pub fn distance_km(lat_a: f64, lon_a: f64, lat_b: f64, lon_b: f64) -> f64 {
+    /// Mean radius, the value the WGS-84 sphere approximation uses.
+    const EARTH_RADIUS_KM: f64 = 6371.0088;
+
+    let (lat_a_rad, lat_b_rad) = (lat_a.to_radians(), lat_b.to_radians());
+    let d_lat = (lat_b - lat_a).to_radians();
+    let d_lon = (lon_b - lon_a).to_radians();
+
+    let h = (d_lat / 2.0).sin().powi(2)
+        + lat_a_rad.cos() * lat_b_rad.cos() * (d_lon / 2.0).sin().powi(2);
+    // `asin(sqrt(h))` rather than `atan2`: h is clamped below, so the numerically
+    // delicate case `atan2` exists to handle cannot arise here.
+    2.0 * EARTH_RADIUS_KM * h.clamp(0.0, 1.0).sqrt().asin()
+}
+
+impl RadarSite {
+    /// Whether this is a Terminal Doppler Weather Radar rather than a WSR-88D.
+    ///
+    /// The distinction is load-bearing rather than trivia: the Level II archive
+    /// this app reads carries WSR-88D volume scans only, so a TDWR site has no
+    /// reflectivity to show through that path. [`RADARS`] lists both because the
+    /// map draws a marker for every site.
+    ///
+    /// The `T` prefix identifies the 45 TDWRs, with one exception that a naive
+    /// `starts_with('T')` gets wrong: `TJUA` is San Juan's WSR-88D.
+    pub fn is_tdwr(&self) -> bool {
+        self.name.starts_with('T') && self.name != "TJUA"
+    }
+
+    /// Whether this site is a WSR-88D, the network the Level II archive covers.
+    pub fn is_wsr88d(&self) -> bool {
+        !self.is_tdwr()
+    }
+
+    /// Whether this site runs an operational scan an ordinary viewer can rely on.
+    ///
+    /// `KCRI` is the Radar Operations Center's test bed in Norman. It is a real
+    /// WSR-88D and it does reach the archive, but it scans to whatever schedule
+    /// the ROC is testing that day rather than continuously. It also sits 0.4 km
+    /// closer to downtown Oklahoma City than `KTLX` does, so *every* automatic
+    /// pick for the Oklahoma City metro would land on it and intermittently show
+    /// an empty map.
+    ///
+    /// Only automatic selection consults this. The site stays in [`RADARS`], the
+    /// map still draws it, and a user who picks it by hand still gets it.
+    pub fn is_operational(&self) -> bool {
+        self.name != "KCRI"
+    }
+}
+
+/// The radar site closest to `lat`/`lon`, with its distance in kilometres.
+///
+/// Considers every site including TDWRs. Callers picking a site to *display*
+/// almost certainly want [`nearest_wsr88d_site`] instead.
+///
+/// Returns `None` only for a non-finite input. A NaN coordinate would otherwise
+/// compare `false` against every candidate and silently yield whichever site
+/// happens to sit first in [`RADARS`], which reads as a deliberate choice.
+///
+/// No distance cap: a caller in Europe gets the nearest NEXRAD and a very large
+/// number, and it is the caller's business whether that is useful. Callers that
+/// care should test the returned distance rather than expect `None`.
+pub fn nearest_radar_site(lat: f64, lon: f64) -> Option<(&'static RadarSite, f64)> {
+    nearest_site_where(lat, lon, |_| true)
+}
+
+/// The closest site an automatic pick should open on, with its distance in km.
+///
+/// This is the one startup site selection wants: the nearest operational
+/// WSR-88D. Downtown Oklahoma City illustrates both filters at once — the
+/// literal nearest site is the TDWR `TOKC`, and the nearest WSR-88D is the ROC
+/// test bed `KCRI`. Neither reliably shows a viewer reflectivity, and the site
+/// a person there actually wants is the third one out, `KTLX`.
+pub fn nearest_wsr88d_site(lat: f64, lon: f64) -> Option<(&'static RadarSite, f64)> {
+    nearest_site_where(lat, lon, |site| site.is_wsr88d() && site.is_operational())
+}
+
+fn nearest_site_where(
+    lat: f64,
+    lon: f64,
+    accept: impl Fn(&RadarSite) -> bool,
+) -> Option<(&'static RadarSite, f64)> {
+    if !lat.is_finite() || !lon.is_finite() {
+        return None;
+    }
+    RADARS
+        .iter()
+        .filter(|site| accept(site))
+        .map(|site| (site, distance_km(lat, lon, site.lat, site.lon)))
+        // `total_cmp`, not `partial_cmp().unwrap()`: the distances are finite
+        // given a finite input, but the unwrap would be a panic path in a
+        // startup routine to save nothing.
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+}
+
+#[cfg(test)]
+mod nearest_tests {
+    use super::*;
+
+    /// Two points ~111 km apart along a meridian, where the expected answer is
+    /// a definition rather than a measurement.
+    #[test]
+    fn one_degree_of_latitude_is_about_111_km() {
+        let d = distance_km(35.0, -97.0, 36.0, -97.0);
+        assert!((d - 111.19).abs() < 0.5, "{d}");
+    }
+
+    #[test]
+    fn a_point_is_zero_km_from_itself() {
+        assert_eq!(distance_km(35.3331, -97.2778, 35.3331, -97.2778), 0.0);
+    }
+
+    /// Longitude wrapping is the case an unsigned subtraction gets wrong: these
+    /// are 2° apart across the antimeridian, not 358°.
+    #[test]
+    fn distance_wraps_across_the_antimeridian() {
+        let d = distance_km(51.0, 179.0, 51.0, -179.0);
+        assert!(d < 200.0, "{d} km — the meridian wrap was not handled");
+    }
+
+    /// Downtown Oklahoma City resolves to KTLX, which is the site the old
+    /// hardcoded default happened to name. The point is that it is now *derived*.
+    ///
+    /// This is also the case that motivates the TDWR filter: the literal nearest
+    /// site to this coordinate is `TOKC`, which has no Level II data.
+    #[test]
+    fn oklahoma_city_resolves_to_ktlx() {
+        let (site, dist) = nearest_wsr88d_site(35.4676, -97.5164).expect("a finite coordinate");
+        assert_eq!(site.name, "KTLX");
+        assert!(dist < 50.0, "{dist}");
+
+        // Both filters are doing work here, and a change to either would
+        // otherwise silently stop mattering while the assertion above still
+        // passed for the wrong reason.
+        let (unfiltered, _) = nearest_radar_site(35.4676, -97.5164).expect("a finite coordinate");
+        assert_eq!(unfiltered.name, "TOKC", "the literal nearest site is a TDWR");
+
+        let (nearest_88d, _) = nearest_site_where(35.4676, -97.5164, RadarSite::is_wsr88d)
+            .expect("a finite coordinate");
+        assert_eq!(
+            nearest_88d.name, "KCRI",
+            "the nearest WSR-88D is the ROC test bed"
+        );
+    }
+
+    /// The regression the whole feature exists for: somewhere far from Oklahoma
+    /// must not resolve to Oklahoma's radar.
+    #[test]
+    fn seattle_does_not_resolve_to_an_oklahoma_radar() {
+        let (site, _) = nearest_wsr88d_site(47.6062, -122.3321).expect("a finite coordinate");
+        assert_eq!(site.name, "KATX");
+    }
+
+    /// Miami sits beside `TMIA`, so this is a second independent check that the
+    /// TDWR filter holds in a different part of the table.
+    #[test]
+    fn miami_resolves_to_the_south_florida_wsr88d() {
+        let (site, _) = nearest_wsr88d_site(25.7617, -80.1918).expect("a finite coordinate");
+        assert_eq!(site.name, "KAMX");
+    }
+
+    /// Non-CONUS coverage: the table holds Alaska, Hawaii, Puerto Rico and Guam,
+    /// and a naive CONUS-only assumption would strand these users.
+    #[test]
+    fn outlying_coverage_resolves_locally_rather_than_to_the_mainland() {
+        for (lat, lon, expected) in [
+            (21.3069, -157.8583, "PHMO"),
+            (61.2181, -149.9003, "PAHG"),
+            (18.4655, -66.1057, "TJUA"),
+            (13.4443, 144.7937, "PGUA"),
+        ] {
+            let (site, dist) = nearest_wsr88d_site(lat, lon).expect("a finite coordinate");
+            assert_eq!(site.name, expected, "at {lat},{lon} (got {dist} km)");
+        }
+    }
+
+    /// `TJUA` is San Juan's WSR-88D, not a TDWR, and a `starts_with('T')` test
+    /// would wrongly exclude the only Level II site serving Puerto Rico.
+    #[test]
+    fn tjua_is_not_treated_as_a_tdwr() {
+        let tjua = get_radar_site("TJUA").expect("TJUA is in the table");
+        assert!(tjua.is_wsr88d());
+        assert!(!tjua.is_tdwr());
+    }
+
+    /// Pins the split so a table edit that adds or drops a site is visible here
+    /// rather than silently changing what startup selection can choose from.
+    #[test]
+    fn the_table_splits_into_45_tdwrs_and_the_wsr88d_network() {
+        let tdwrs = RADARS.iter().filter(|s| s.is_tdwr()).count();
+        assert_eq!(tdwrs, 45);
+        assert_eq!(RADARS.len() - tdwrs, 162);
+    }
+
+    /// A NaN must not silently degrade to "the first entry in the table".
+    #[test]
+    fn a_non_finite_coordinate_has_no_nearest_site() {
+        assert!(nearest_wsr88d_site(f64::NAN, -97.0).is_none());
+        assert!(nearest_wsr88d_site(35.0, f64::INFINITY).is_none());
+    }
+
+    /// Every site must be reachable as its own nearest neighbour, which catches
+    /// a transposed lat/lon in any single table row.
+    #[test]
+    fn every_site_is_its_own_nearest_neighbour() {
+        for site in RADARS.iter() {
+            let (found, dist) =
+                nearest_radar_site(site.lat, site.lon).expect("table coordinates are finite");
+            assert_eq!(
+                found.name, site.name,
+                "{} resolved to {} at {} km",
+                site.name, found.name, dist
+            );
+        }
+    }
+}
