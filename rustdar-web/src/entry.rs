@@ -36,6 +36,11 @@ pub fn start() -> Result<(), JsValue> {
         EventLoop::new().map_err(|e| JsValue::from_str(&format!("event loop: {e}")))?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
+    // Started before the app so the handshake is in flight while the event loop
+    // and WebGL context come up. It never blocks: rasterization runs on this
+    // thread until the worker answers, and forever if it does not.
+    crate::worker_port::attach();
+
     let (fix_sender, fix_receiver) = std::sync::mpsc::channel();
     crate::geolocation::start_watch(fix_sender);
 

@@ -135,12 +135,18 @@ pub struct LoopRenderResponse {
     /// The finished image, already in egui's pixel layout, or `None` when the scan
     /// carried no matching sweep and there is nothing to show.
     ///
-    /// Deliberately not the renderer's `Vec<u8>`. Converting on the render thread
-    /// means the RGBA buffer and its `Color32` copy — `IMAGE_SIZE² × 4` bytes each,
-    /// 16 MiB apiece at 2048² — never coexist on the main thread, which then holds
+    /// Deliberately not the renderer's `Vec<u8>`. Converting before the send means
+    /// the RGBA buffer and its `Color32` copy — `IMAGE_SIZE² × 4` bytes each,
+    /// 16 MiB apiece at 2048² — never coexist in the channel; the receiver holds
     /// exactly one buffer and moves it straight into `Context::load_texture`. The
-    /// worker's own transient pair is bounded by `MAX_CONCURRENT_RENDERS` and is off
-    /// the frame-pacing path.
+    /// transient pair is bounded by `MAX_CONCURRENT_RENDERS`.
+    ///
+    /// Natively that conversion is on the render thread, off the frame-pacing
+    /// path entirely. In the browser, where the rasterization runs in a Web
+    /// Worker that cannot build an `egui::ColorImage` and could not post one if
+    /// it did, it happens in `spawn_loop_frame_render`'s `deliver` — on the main
+    /// thread, but as a reinterpretation of 4 MiB rather than a rasterization,
+    /// and against a 1024² frame rather than 2048².
     ///
     /// `None` replaces the previous empty-`Vec` sentinel; the meaning is unchanged.
     /// The receiver `take`s it rather than moving it out, so the rest of the response

@@ -717,7 +717,9 @@ impl RenderDispatcher {
                 params.elevation,
                 sender,
                 window,
-                move || render_derived_srm_to_image(&derived, lat, lon),
+                crate::offload::Job::Opaque(Box::new(move || {
+                    render_derived_srm_to_image(&derived, lat, lon).map(Into::into)
+                })),
             );
             return true;
         }
@@ -733,7 +735,9 @@ impl RenderDispatcher {
             params.elevation,
             sender,
             window,
-            move || render_level3_message_to_image(&l3_msg.message, product, lat, lon),
+            crate::offload::Job::Opaque(Box::new(move || {
+                render_level3_message_to_image(&l3_msg.message, product, lat, lon).map(Into::into)
+            })),
         );
         true
     }
@@ -758,19 +762,42 @@ impl RenderDispatcher {
             product,
             elevation
         );
-        self.spawn_render(pane_idx, product, elevation, sender, window, move || {
-            rustdar_radar::render::render_radar_to_image_with_winds(
-                &data,
-                elevation,
-                product,
-                lat,
-                lon,
-                winds.as_deref(),
-            )
-        });
+        // Extracted here, against the volume, because the volume is the thing
+        // that must not travel: a decoded `Scan` is tens of megabytes and a
+        // `RenderInput` is the one sweep the renderer actually reads.
+        //
+        // `None` means no sweep carries this product, which is exactly what the
+        // renderer would have answered — so the job is dispatched anyway and
+        // answers nothing, leaving the in-flight bookkeeping to unwind the way
+        // a failed render always has.
+        let job = match rustdar_radar::render_input::RenderInput::extract(
+            &data,
+            elevation,
+            product,
+            lat,
+            lon,
+            winds.as_deref(),
+        ) {
+            Some(input) => {
+                crate::offload::Job::Described(crate::offload::JobRequest::Radar {
+                    input: Box::new(input),
+                    // A static pane keeps the grid: it is what a hover reads.
+                    values_wanted: true,
+                })
+            }
+            None => crate::offload::Job::renders_nothing(),
+        };
+        self.spawn_render(pane_idx, product, elevation, sender, window, job);
     }
 
-    /// Shared thread dispatch for both Level II and Level III renders.
+    /// Shared dispatch for both Level II and Level III renders.
+    ///
+    /// The tail below — the guard, the cancellation check, the send and the
+    /// redraw — is handed to the funnel as `deliver` rather than written into
+    /// the job. That is what lets the Level II arm run in a browser worker
+    /// without a second copy of it: `deliver` runs on this thread wherever the
+    /// rasterization happened, and holds the two things that must not outlive
+    /// the render either way.
     fn spawn_render(
         &mut self,
         pane_idx: usize,
@@ -778,7 +805,7 @@ impl RenderDispatcher {
         elevation: f32,
         sender: std::sync::mpsc::Sender<RenderResponse>,
         window: Option<WindowRef>,
-        render_fn: impl FnOnce() -> Option<(Vec<u8>, f64, Vec<f32>)> + Send + 'static,
+        job: crate::offload::Job,
     ) {
         // Check concurrent render limit
         let current = self.renders_in_flight.load(Ordering::Relaxed);
@@ -792,16 +819,19 @@ impl RenderDispatcher {
         // Cleared if this pane's data changes while the render runs, which is
         // where a per-site reset stops a result — the global `generation` above
         // cannot, since it says nothing about which site a result belongs to.
+        //
+        // `deliver` carries the only other reference to it, which is also what
+        // `want_result`'s `Arc::strong_count` pruning reads as "still running".
         let wanted = self.pane_render[pane_idx].want_result();
-        crate::offload::offload("radar-render", move || {
+        crate::offload::offload_job("radar-render", job, move |frame| {
             let _guard = guard;
-            if let Some((image, range, values)) = render_fn()
+            if let Some(frame) = frame
                 && wanted.load(Ordering::Relaxed)
             {
                 let _ = sender.send(RenderResponse {
-                    image_data: Arc::new(image),
-                    max_range_km: range,
-                    value_data: Arc::new(values),
+                    image_data: Arc::new(frame.image),
+                    max_range_km: frame.max_range_km,
+                    value_data: Arc::new(frame.values),
                     product,
                     elevation,
                     generation,
@@ -1867,25 +1897,26 @@ mod render_invalidation_tests {
     use super::*;
     use std::sync::mpsc;
 
-    /// What a render closure hands back: the RGBA image, its range and the value
-    /// grid, or `None` when the scan carries no matching sweep.
-    type RenderOutput = Option<(Vec<u8>, f64, Vec<f32>)>;
-
     /// A render that does not finish until the test releases it.
     ///
     /// The gate is the whole point: a reset only has something to act on while a
     /// render is *running*, and a render of nothing would routinely finish before
     /// the reset landed, so the test would pass on timing rather than on the
     /// abandonment.
-    fn gated_render() -> (
-        mpsc::Sender<()>,
-        impl FnOnce() -> RenderOutput + Send + 'static,
-    ) {
+    ///
+    /// Deliberately a `Job::Opaque`: it has to *block*, and a described job is
+    /// executed by the funnel with no handle to hold it open. What is under
+    /// test is the abandonment protocol around a running render, which is the
+    /// same for both job shapes — `deliver` carries the flag either way.
+    fn gated_render() -> (mpsc::Sender<()>, crate::offload::Job) {
         let (release, held) = mpsc::channel::<()>();
-        (release, move || {
-            held.recv().expect("every gated render is released");
-            Some((Vec::new(), 230.0, Vec::new()))
-        })
+        (
+            release,
+            crate::offload::Job::Opaque(Box::new(move || {
+                held.recv().expect("every gated render is released");
+                Some((Vec::new(), 230.0, Vec::new()).into())
+            })),
+        )
     }
 
     /// One pane, on `site`, which is how `reset_panes_for_site` reads the layout.

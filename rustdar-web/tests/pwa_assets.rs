@@ -18,6 +18,12 @@ use rustdar_radar::sources::DataSources;
 const MANIFEST: &str = include_str!("../manifest.webmanifest");
 const SERVICE_WORKER: &str = include_str!("../sw.js");
 const INDEX_HTML: &str = include_str!("../index.html");
+const RASTER_WORKER: &str = include_str!("../worker.js");
+
+/// The one module specifier both the page and the rasterization worker load.
+/// Written out rather than derived so a change to either has to change this
+/// line too — see [`the_rasterization_worker_loads_the_same_module_as_the_page`].
+const GLUE_SPECIFIER: &str = "./pkg/rustdar_web.js";
 
 fn web_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -443,4 +449,61 @@ fn the_worker_precaches_the_manifest_and_both_halves_of_the_wasm_bundle() {
         "sw.js does not precache the directory index (\"\"), which is the entry \
          every navigation is answered from"
     );
+}
+
+/// The rasterization worker is what keeps a ~160-190 ms Level II frame off the
+/// main thread. Left out of the precache it still *works* — the funnel falls
+/// back to rendering inline — which is exactly why nothing else would notice.
+#[test]
+fn the_worker_precaches_the_rasterization_worker() {
+    let paths = js_string_list(SERVICE_WORKER, "const SHELL_PATHS = [");
+    assert!(
+        paths.iter().any(|p| p == "worker.js"),
+        "sw.js does not precache worker.js. Offline, and on any load the shell \
+         answers, rasterization would silently move back onto the main thread."
+    );
+}
+
+/// One wasm module, instantiated twice.
+///
+/// `sw.js` pins each client to a single shell generation because a mismatched
+/// glue/module pair is a `LinkError`, and that machinery is written for exactly
+/// one `(glue, wasm)` pair. A worker built from a *second* artifact would need
+/// its own pair kept atomic with the first — so if this assertion ever has to
+/// change, `SHELL_PATHS`, the version probes and the per-client pinning all
+/// need revisiting together.
+#[test]
+fn the_rasterization_worker_loads_the_same_module_as_the_page() {
+    assert!(
+        RASTER_WORKER.contains(&format!("from \"{GLUE_SPECIFIER}\"")),
+        "worker.js does not import {GLUE_SPECIFIER}; a second wasm artifact \
+         needs its own precache entries and its own place in sw.js's per-client \
+         shell pinning"
+    );
+    assert!(
+        INDEX_HTML.contains(&format!("from \"{GLUE_SPECIFIER}\"")),
+        "index.html no longer imports {GLUE_SPECIFIER}; the page and the worker \
+         must load the same module"
+    );
+    assert!(
+        RASTER_WORKER.contains("rustdar_worker_main"),
+        "worker.js does not call the worker entry point"
+    );
+}
+
+/// The same subpath rule the rest of the deploy lives under, applied to the one
+/// file that is fetched by a Worker rather than by the page.
+#[test]
+fn the_rasterization_worker_uses_only_relative_paths() {
+    for (line_no, line) in RASTER_WORKER.lines().enumerate() {
+        for needle in ["from \"/", "import(\"/", "new URL(\"/", "importScripts(\"/"] {
+            assert!(
+                !line.contains(needle),
+                "worker.js:{} uses a root-absolute path ({needle}...). It resolves \
+                 under `python3 -m http.server` and 404s under the project-Pages \
+                 subpath.",
+                line_no + 1
+            );
+        }
+    }
 }

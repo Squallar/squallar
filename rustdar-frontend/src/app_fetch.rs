@@ -875,25 +875,40 @@ impl super::App {
         } = params;
         let sender = self.channels.loop_render_sender.clone();
         let window = self.window.clone();
-        crate::offload::offload("loop-render", move || {
+
+        // The scan is reduced to the one sweep this frame draws before the job
+        // is dispatched, so a browser worker can be handed the request without
+        // the volume behind it. `None` — no sweep carries the product — is the
+        // same answer the renderer gives, and takes the same failure path.
+        let job = match rustdar_radar::render_input::RenderInput::extract(
+            &scan_data, snapped, product, lat, lon, None,
+        ) {
+            Some(input) => crate::offload::Job::Described(crate::offload::JobRequest::Radar {
+                input: Box::new(input),
+                // Loop frames store an empty value grid, so asking for one
+                // would produce `IMAGE_SIZE² × 4` bytes per frame to be dropped
+                // on arrival — and copied across a worker boundary first.
+                values_wanted: false,
+            }),
+            None => crate::offload::Job::renders_nothing(),
+        };
+        crate::offload::offload_job("loop-render", job, move |frame| {
             let _guard = guard;
             // A failed render still has to be sent, so render_in_flight gets cleared.
-            let rendered = rustdar_radar::render::render_radar_to_image(
-                &scan_data, snapped, product, lat, lon,
-            );
-            let (image, max_range_km) = match rendered {
-                Some((rgba, range, _values)) => {
-                    // Convert here rather than on the main thread, and let `rgba` drop
-                    // at the end of this scope so only one of the two buffers is ever
-                    // in the channel. `values` is dropped outright: loop frames store
-                    // an empty value grid, so shipping 16 MiB of hover data per frame
-                    // only to discard it on arrival is pure waste.
-                    match loop_frame_image(&rgba) {
-                        Some(image) => (Some(image), range),
+            let (image, max_range_km) = match frame {
+                Some(frame) => {
+                    // Converted here, in `deliver`, so `rgba` drops at the end
+                    // of this scope and only one of the two buffers is ever in
+                    // the channel. On a thread that is off the frame entirely;
+                    // in a browser with a worker it is the one part of the
+                    // render that lands on the main thread, and it is a
+                    // reinterpretation of 4 MiB rather than a rasterization.
+                    match loop_frame_image(&frame.image) {
+                        Some(image) => (Some(image), frame.max_range_km),
                         None => {
                             log::error!(
                                 "Loop render for pane {pane_idx} produced {} bytes, expected {}",
-                                rgba.len(),
+                                frame.image.len(),
                                 IMAGE_SIZE * IMAGE_SIZE * 4
                             );
                             (None, 0.0)

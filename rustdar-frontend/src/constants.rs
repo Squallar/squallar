@@ -4,11 +4,19 @@ pub const RENDER_WIDTH: u32 = 1920;
 /// Default height for the application window in pixels
 pub const RENDER_HEIGHT: u32 = 1080;
 
-/// Maximum number of concurrent background radar render threads (loop + static).
+/// Maximum number of concurrent background radar renders (loop + static).
 /// Handhelds have much less RAM, so we cap aggressively to avoid OOM.
-#[cfg(mobile)]
+///
+/// The web arm is not a memory cap but a *worker* cap: the browser has one
+/// rasterization worker, so anything past the first only queues behind it. It
+/// used to take the desktop 6 while `offload` ran jobs inline, which meant six
+/// renders could run back to back inside a single frame — six times the stall
+/// this cap exists to bound. Raise it in step with the worker pool, not alone.
+#[cfg(target_arch = "wasm32")]
+pub const MAX_CONCURRENT_RENDERS: usize = 1;
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
 pub const MAX_CONCURRENT_RENDERS: usize = 3;
-#[cfg(not(mobile))]
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
 pub const MAX_CONCURRENT_RENDERS: usize = 6;
 
 /// Maximum number of loop frames to consider for rendering per dispatch cycle.

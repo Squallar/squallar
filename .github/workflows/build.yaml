@@ -105,7 +105,7 @@ jobs:
               # Opt-in list. The old extension allowlist shipped `tests/*.mjs`
               # and carried `*.json` -- what a leaked service-account key wears.
               rm -rf dist && mkdir -p dist/pkg
-              cp rustdar-web/index.html rustdar-web/manifest.webmanifest rustdar-web/sw.js dist/
+              cp rustdar-web/index.html rustdar-web/manifest.webmanifest rustdar-web/sw.js rustdar-web/worker.js dist/
               cp -R rustdar-web/icons dist/icons
               cp rustdar-web/pkg/rustdar_web.js rustdar-web/pkg/rustdar_web_bg.wasm dist/pkg/
               # wasm-bindgen emits this only for crates using JS snippets.

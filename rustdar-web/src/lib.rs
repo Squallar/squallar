@@ -72,5 +72,18 @@ pub mod bridge;
 #[cfg(target_arch = "wasm32")]
 mod entry;
 
+/// The rasterization worker. `worker` is the module `worker.js` boots inside a
+/// dedicated Worker; `worker_port` is the page's half, which installs it into
+/// `rustdar_frontend::offload`. Both are the same wasm module, instantiated
+/// twice — see [`worker`] for why.
+#[cfg(target_arch = "wasm32")]
+mod worker;
+#[cfg(target_arch = "wasm32")]
+mod worker_port;
+#[cfg(target_arch = "wasm32")]
+mod worker_protocol;
+
 #[cfg(target_arch = "wasm32")]
 pub use entry::start;
+#[cfg(target_arch = "wasm32")]
+pub use worker::rustdar_worker_main;

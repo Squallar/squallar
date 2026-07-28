@@ -4,6 +4,7 @@ pub mod level3;
 pub mod nrot;
 mod palette;
 pub mod render;
+pub mod render_input;
 pub mod scan;
 pub mod sites;
 pub mod sounding;

@@ -73,7 +73,7 @@ const META_KEY = new URL("__rustdar_sw_meta__", ROOT).href;
 const PINS_KEY = new URL("__rustdar_sw_pins__", ROOT).href;
 
 /*
- * The app shell, relative to ROOT. Nine entries, but the wasm module
+ * The app shell, relative to ROOT. Ten entries, but the wasm module
  * (10,161,914 B) and its glue (117,911 B) are essentially all of it — index.html
  * and the icons together are under 260 KB.
  *
@@ -82,10 +82,17 @@ const PINS_KEY = new URL("__rustdar_sw_pins__", ROOT).href;
  * listed too: caching the same bytes under two keys is how the two copies end up
  * from different deploys. `pkg/` is what `wasm-pack build --target web` emits;
  * its `.d.ts` and `package.json` are build-time artefacts.
+ *
+ * `worker.js` boots the rasterization worker. It is a shell asset and not an
+ * afterthought: without it in the precache, the first offline load renders
+ * radar frames on the main thread — correct, but a fifth of a second of frozen
+ * UI per frame. It loads no bytes of its own beyond the `pkg/` pair already
+ * here, which is what keeps this list one deploy generation wide.
  */
 const SHELL_PATHS = [
   "",
   "manifest.webmanifest",
+  "worker.js",
   "pkg/rustdar_web.js",
   "pkg/rustdar_web_bg.wasm",
   "icons/icon-192.png",

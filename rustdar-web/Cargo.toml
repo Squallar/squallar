@@ -74,12 +74,26 @@ features = [
     "PositionError",
     "PositionOptions",
     "Coordinates",
+    # The rasterization worker (`src/worker.rs`, `src/worker_port.rs`).
+    # `WorkerType` is what makes it a *module* worker, which it has to be: it
+    # `import`s the ES module `wasm-pack --target web` emits.
+    "Worker",
+    "WorkerOptions",
+    "WorkerType",
+    "DedicatedWorkerGlobalScope",
+    "MessageEvent",
 ]
 
-# For `tests/pwa_assets.rs`. Target-gated because rustdar-radar pulls reqwest and
-# a TLS stack and has no wasm32 build, and a plain `[dev-dependencies]` entry is
-# built for every target under `--all-targets` -- which would break
-# `cargo clippy --target wasm32-unknown-unknown -p rustdar-web --all-targets`.
+# For `tests/pwa_assets.rs`. Target-gated because a plain `[dev-dependencies]`
+# entry is built for every target under `--all-targets`, and this test is
+# `#![cfg(not(target_arch = "wasm32"))]` -- so an ungated entry would add a
+# dependency tree to `cargo clippy --target wasm32-unknown-unknown -p rustdar-web
+# --all-targets` that nothing in that build uses.
+#
+# Not because rustdar-radar has no wasm32 build: it does, and the shipped module
+# links it through rustdar-frontend. `rustls` and `rayon` are the only pieces
+# target-gated off wasm (see rustdar-radar/Cargo.toml); reqwest compiles there
+# and routes through the browser's `fetch()`.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # The single declaration of every network origin rustdar reads from; the test
 # derives the service worker's never-cache hostnames from it.

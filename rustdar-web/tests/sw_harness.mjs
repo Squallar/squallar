@@ -507,6 +507,7 @@ export async function startWorker({
 export const SHELL_ASSETS = [
   "",
   "manifest.webmanifest",
+  "worker.js",
   "pkg/rustdar_web.js",
   "pkg/rustdar_web_bg.wasm",
   "icons/icon-192.png",

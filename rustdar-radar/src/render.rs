@@ -450,7 +450,10 @@ pub fn find_closest_elevation(
 /// area ratio 0.98, against 0.69 / 0.89 for the newer 0.53° Doppler cut).
 /// Upper tilts are single merged cuts carrying everything, so the preference
 /// falls back to any sweep with the product's moment.
-fn find_sweep(
+/// `pub(crate)` for [`crate::render_input`], which has to make this exact
+/// choice against the whole volume so the one sweep it carries is the one
+/// `find_sweep` reaches again on the reconstructed scan.
+pub(crate) fn find_sweep(
     scan: &Scan,
     product: types::RadarProduct,
     elevation_angle: f32,
@@ -553,6 +556,28 @@ pub fn render_radar_to_image(
     radar_lon: f64,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     render_radar_to_image_with_winds(data, elevation_angle, product, radar_lat, radar_lon, None)
+}
+
+/// [`render_radar_to_image`] from a [`RenderInput`] instead of a `Scan`.
+///
+/// This is the entry point for a caller that does not hold the volume — the
+/// browser's rasterization worker, which is handed
+/// [`RenderInput::to_bytes`](crate::render_input::RenderInput::to_bytes) over a
+/// message port because a decoded `Scan` is tens of megabytes and a `RenderInput`
+/// is one sweep.
+///
+/// It reconstructs a `Scan` and runs the ordinary renderer, so there is one
+/// rasterizer rather than two that could disagree about a pixel; see
+/// [`crate::render_input`] for why the reconstruction is exact.
+pub fn render_from(input: &crate::render_input::RenderInput) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+    render_radar_to_image_with_winds(
+        &input.to_scan(),
+        input.elevation(),
+        input.product(),
+        input.radar_lat(),
+        input.radar_lon(),
+        input.wind_levels(),
+    )
 }
 
 /// [`render_radar_to_image`] with an optional environmental wind profile —
