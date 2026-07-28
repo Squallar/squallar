@@ -1481,6 +1481,11 @@ impl Gui {
         &self.panes[self.active_pane]
     }
 
+    /// Index of the active pane, for the `GuiAction`s that address one by index.
+    pub fn active_pane_idx(&self) -> usize {
+        self.active_pane
+    }
+
     /// Get the active pane (mutable).
     pub fn active_pane_mut(&mut self) -> &mut PaneState {
         &mut self.panes[self.active_pane]

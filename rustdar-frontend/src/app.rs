@@ -951,7 +951,24 @@ impl App {
             "location fix refines the opening site to {} ({dist:.0} km)",
             site.name
         );
-        self.gui.set_initial_site(site.name);
+        // Through the same action a click on the site picker raises, not through
+        // `set_initial_site`. Assigning `pane.site` is only the visible third of
+        // a site change: `SwitchRadarSite` also raises `loading_site`, resets the
+        // loop, clears the download manager and — the part that actually matters
+        // here — spawns the fetch. Setting the field alone left the pane naming a
+        // site whose volume nobody had asked for, so `scan_info` stayed `None`
+        // and the map fell back to its no-data centre, which is in Kansas.
+        //
+        // `set_initial_site` is still right for the startup guess, where this
+        // runs before the event loop and the app's own first fetch reads the
+        // site it leaves behind.
+        self.handle_gui_action(
+            GuiAction::SwitchRadarSite {
+                site: site.name.to_string(),
+                pane_idx: self.gui.active_pane_idx(),
+            },
+            None,
+        );
     }
 
     /// Arrange for one more frame if a change might still be unsaved.
@@ -2038,6 +2055,38 @@ mod tests {
         app.poll_platform_state();
 
         assert_eq!(opening_site(&app), "KDLH");
+    }
+
+    /// Naming the new site is only the visible part of moving to it. The first
+    /// version of this feature assigned `pane.site` and nothing else, so no
+    /// volume was ever requested: the pane sat on a site with no `scan_info`,
+    /// which is the state the map draws at the geographic centre of the
+    /// contiguous US — leaving the user looking at Kansas with the right radar
+    /// named in the picker.
+    ///
+    /// `loading_site` is the observable, because it is raised by the same
+    /// `SwitchRadarSite` handling that spawns the fetch and cleared only when a
+    /// scan for that site arrives. Asserting on the site name alone passes on
+    /// the broken version, which is how this shipped.
+    #[test]
+    fn a_refined_site_actually_requests_its_radar_data() {
+        let mut bridge = TestBridge::desktop().with_timezone("America/Chicago");
+        let fixes = bridge.gps_channel();
+        let mut app = headless(bridge);
+
+        fixes
+            .send(rustdar_gps::GpsFix::from_lat_lon(46.7867, -92.1005))
+            .unwrap();
+        app.poll_platform_state();
+
+        let pane = app.gui.pane(0).expect("a pane exists");
+        assert_eq!(pane.site, "KDLH");
+        assert_eq!(
+            pane.loading_site.as_deref(),
+            Some("KDLH"),
+            "the site changed without anything fetching for it, so the pane has \
+             no scan_info and the map stays at its no-data centre"
+        );
     }
 
     /// A fix must not move a site the user chose. Someone in Dallas watching a

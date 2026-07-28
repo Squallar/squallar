@@ -101,9 +101,25 @@ impl super::Gui {
 
                     let mut pane = std::mem::take(&mut self.panes[pane_idx]);
 
-                    // Determine the map center
+                    // Determine the map center.
+                    //
+                    // The loaded scan is the best answer, but it is not available
+                    // for the whole window between asking for a site and its
+                    // volume arriving — and on a slow link, or a site whose fetch
+                    // fails, that window is the entire experience. Falling
+                    // straight to the geographic centre of the contiguous US
+                    // there means the user watches the map sit in Kansas while
+                    // the picker names the radar they asked for.
+                    //
+                    // The site's own coordinates are known from the moment it is
+                    // named, so they bridge the gap: the map goes where it is
+                    // going immediately and the scan simply confirms it. The US
+                    // centre stays for the genuinely unplaceable case — a pane
+                    // naming a site the table does not have.
                     let center = if let Some(scan_info) = &pane.scan_info {
                         Position::new(scan_info.site.lon, scan_info.site.lat)
+                    } else if let Some(site) = rustdar_radar::sites::get_radar_site(&pane.site) {
+                        Position::new(site.lon, site.lat)
                     } else {
                         Position::new(-98.5795, 39.8283) // Geographic center of contiguous USA
                     };
