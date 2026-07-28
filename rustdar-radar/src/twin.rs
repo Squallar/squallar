@@ -418,6 +418,7 @@ pub mod live {
             return Some(Level3Product {
                 message,
                 stamp: ProductStamp::from_key(key),
+                bytes: std::sync::Arc::new(bytes),
             });
         }
         None

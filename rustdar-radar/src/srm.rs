@@ -2343,6 +2343,7 @@ mod live_validation {
                 return Some(Level3Product {
                     message,
                     stamp: crate::level3::ProductStamp::from_key(key),
+                    bytes: std::sync::Arc::new(bytes),
                 });
             }
         }

@@ -88,9 +88,10 @@ pub fn offload(name: &'static str, job: impl FnOnce() + Send + 'static) {
 /// A CPU-bound job described as data, so it can be executed somewhere that does
 /// not share this thread's memory.
 ///
-/// One variant today. The enum rather than a bare `RenderInput` is what lets
-/// the Level III and derived-SRM renders join later without changing the
-/// funnel, the wire format's framing, or the worker.
+/// Every variant is an *input* to a render, never its output: what travels is
+/// the smallest thing the renderer can be re-run from, because re-running it is
+/// how the worker and this thread stay byte-identical without a second
+/// implementation to keep in step.
 #[derive(Debug, Clone, PartialEq)]
 pub enum JobRequest {
     /// Rasterize a Level II frame.
@@ -107,6 +108,32 @@ pub enum JobRequest {
         ///
         /// The texture is unaffected either way; only the grid is cleared.
         values_wanted: bool,
+    },
+    /// Rasterize a Level III radial product.
+    ///
+    /// The product's *bytes*, not its decoded form: a `Level3Message` holds
+    /// run-length radial packets with no serde derives anywhere in the graph,
+    /// and re-decoding is both cheap against the render and a use of the one
+    /// decoder rather than a second description of the format. The decode moves
+    /// off the main thread with the render as a result.
+    Level3 {
+        bytes: std::sync::Arc<Vec<u8>>,
+        product: rustdar_radar::types::RadarProduct,
+        radar_lat: f64,
+        radar_lon: f64,
+    },
+    /// Rasterize a storm-relative velocity field derived from a Level III
+    /// dealiased velocity product.
+    ///
+    /// The derivation travels as its two inputs — the source product's bytes
+    /// and the storm motion vector — rather than as its output, for the same
+    /// reason: `DerivedSrm` has no wire form, and `srm::derive` is pure, so
+    /// re-running it in the worker produces the same field.
+    Srm {
+        bytes: std::sync::Arc<Vec<u8>>,
+        motion: rustdar_radar::srm::StormMotionSample,
+        radar_lat: f64,
+        radar_lon: f64,
     },
 }
 
@@ -178,6 +205,45 @@ impl JobRequest {
                 out.extend_from_slice(&input.to_bytes());
                 out
             }
+            Self::Level3 {
+                bytes,
+                product,
+                radar_lat,
+                radar_lon,
+            } => {
+                let mut out = vec![TAG_LEVEL3];
+                out.extend_from_slice(&product.wire_code().to_le_bytes());
+                out.extend_from_slice(&radar_lat.to_le_bytes());
+                out.extend_from_slice(&radar_lon.to_le_bytes());
+                out.extend_from_slice(bytes);
+                out
+            }
+            Self::Srm {
+                bytes,
+                motion,
+                radar_lat,
+                radar_lon,
+            } => {
+                let mut out = vec![TAG_SRM];
+                out.extend_from_slice(&motion.motion.speed_kt.to_le_bytes());
+                out.extend_from_slice(&motion.motion.direction_deg.to_le_bytes());
+                out.push(u8::from(motion.motion.is_scit_average));
+                match motion.volume {
+                    // `None` is a vector the user typed in, and a derived field
+                    // built from one must not claim the RPG's provenance — so
+                    // the distinction has to survive the wire.
+                    None => out.push(0),
+                    Some((a, b)) => {
+                        out.push(1);
+                        out.extend_from_slice(&a.to_le_bytes());
+                        out.extend_from_slice(&b.to_le_bytes());
+                    }
+                }
+                out.extend_from_slice(&radar_lat.to_le_bytes());
+                out.extend_from_slice(&radar_lon.to_le_bytes());
+                out.extend_from_slice(bytes);
+                out
+            }
         }
     }
 
@@ -198,6 +264,38 @@ impl JobRequest {
                     input: Box::new(RenderInput::from_bytes(rest)?),
                 })
             }
+            TAG_LEVEL3 => {
+                let mut r = Reader::new(rest);
+                Some(Self::Level3 {
+                    product: rustdar_radar::types::RadarProduct::from_wire_code(r.u16()?)?,
+                    radar_lat: r.f64()?,
+                    radar_lon: r.f64()?,
+                    bytes: std::sync::Arc::new(r.rest().to_vec()),
+                })
+            }
+            TAG_SRM => {
+                let mut r = Reader::new(rest);
+                let motion = nexrad_level3::model::StormMotion {
+                    speed_kt: r.f32()?,
+                    direction_deg: r.f32()?,
+                    is_scit_average: match r.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return None,
+                    },
+                };
+                let volume = match r.u8()? {
+                    0 => None,
+                    1 => Some((r.u16()?, r.u32()?)),
+                    _ => return None,
+                };
+                Some(Self::Srm {
+                    motion: rustdar_radar::srm::StormMotionSample { motion, volume },
+                    radar_lat: r.f64()?,
+                    radar_lon: r.f64()?,
+                    bytes: std::sync::Arc::new(r.rest().to_vec()),
+                })
+            }
             _ => None,
         }
     }
@@ -209,11 +307,62 @@ impl JobRequest {
                 rustdar_radar::types::RadarProduct::NormalizedRotation => "radar/nrot",
                 _ => "radar",
             },
+            Self::Level3 { .. } => "level3",
+            Self::Srm { .. } => "srm",
         }
     }
 }
 
 const TAG_RADAR: u8 = 1;
+const TAG_LEVEL3: u8 = 2;
+const TAG_SRM: u8 = 3;
+
+/// A bounds-checked cursor over a job's fixed-width header.
+///
+/// Every accessor answers `None` rather than panicking: these bytes arrive on a
+/// message port and are not trusted. The variable-length tail is whatever
+/// [`rest`](Reader::rest) is left holding, so no length prefix can lie about it.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, at: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.at.checked_add(n)?;
+        let slice = self.bytes.get(self.at..end)?;
+        self.at = end;
+        Some(slice)
+    }
+
+    fn rest(&self) -> &'a [u8] {
+        &self.bytes[self.at..]
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        self.take(1).map(|b| b[0])
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn f32(&mut self) -> Option<f32> {
+        Some(f32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn f64(&mut self) -> Option<f64> {
+        Some(f64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+}
 
 /// Do the work.
 ///
@@ -237,6 +386,40 @@ pub fn execute(request: &JobRequest) -> JobResult {
                 values: if *values_wanted { values } else { Vec::new() },
             }
         }),
+        JobRequest::Level3 {
+            bytes,
+            product,
+            radar_lat,
+            radar_lon,
+        } => decode_level3(bytes).and_then(|message| {
+            rustdar_radar::render::render_level3_message_to_image(
+                &message, *product, *radar_lat, *radar_lon,
+            )
+            .map(Into::into)
+        }),
+        JobRequest::Srm {
+            bytes,
+            motion,
+            radar_lat,
+            radar_lon,
+        } => decode_level3(bytes)
+            .and_then(|message| rustdar_radar::srm::derive(&message, motion))
+            .and_then(|derived| {
+                rustdar_radar::render::render_derived_srm_to_image(&derived, *radar_lat, *radar_lon)
+                    .map(Into::into)
+            }),
+    }
+}
+
+/// The product these bytes decode to, or `None` — which the caller reports as a
+/// render that drew nothing, the same answer a scan with no matching sweep gets.
+fn decode_level3(bytes: &[u8]) -> Option<nexrad_level3::model::Level3Message> {
+    match nexrad_level3::decode::decode_product(bytes) {
+        Ok(message) => Some(message),
+        Err(e) => {
+            log::error!("could not decode a Level III product for rendering: {e}");
+            None
+        }
     }
 }
 
@@ -522,10 +705,54 @@ mod tests {
         .to_bytes()
     }
 
+    /// A Level III job. The bytes are opaque here on purpose: the framing must
+    /// carry an arbitrary tail without a length prefix that could lie about it.
+    fn a_level3_job() -> JobRequest {
+        JobRequest::Level3 {
+            bytes: std::sync::Arc::new(vec![7, 8, 9, 0xFF, 0]),
+            product: rustdar_radar::types::RadarProduct::EchoTops,
+            radar_lat: 35.0,
+            radar_lon: -97.0,
+        }
+    }
+
+    fn an_srm_job(volume: Option<(u16, u32)>) -> JobRequest {
+        JobRequest::Srm {
+            bytes: std::sync::Arc::new(vec![1, 2, 3]),
+            motion: rustdar_radar::srm::StormMotionSample {
+                motion: nexrad_level3::model::StormMotion {
+                    speed_kt: 42.5,
+                    direction_deg: 231.25,
+                    is_scit_average: true,
+                },
+                volume,
+            },
+            radar_lat: 35.0,
+            radar_lon: -97.0,
+        }
+    }
+
     #[test]
-    fn a_job_survives_the_wire_format() {
-        let job = a_job();
-        assert_eq!(JobRequest::from_bytes(&job.to_bytes()), Some(job));
+    fn every_job_kind_survives_the_wire_format() {
+        for job in [
+            a_job(),
+            a_level3_job(),
+            // Both arms: `None` is a storm motion the user typed in, and a
+            // derived field built from one must not claim the RPG's provenance.
+            an_srm_job(Some((12, 34567))),
+            an_srm_job(None),
+        ] {
+            assert_eq!(
+                JobRequest::from_bytes(&job.to_bytes()),
+                Some(job.clone()),
+                "{:?} did not survive its round trip",
+                job.kind()
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_job_is_refused_rather_than_misread() {
         assert_eq!(JobRequest::from_bytes(&[]), None, "empty");
         assert_eq!(JobRequest::from_bytes(&[0xFF, 1, 2]), None, "unknown tag");
         assert_eq!(JobRequest::from_bytes(&[TAG_RADAR]), None, "no flag");
@@ -535,6 +762,37 @@ mod tests {
             None,
             "the flag is a bool, not a byte"
         );
+
+        // A truncated header must not be read as a short one. The variable tail
+        // is whatever is left, so only the fixed part can be checked this way.
+        for job in [a_job(), a_level3_job(), an_srm_job(Some((1, 2)))] {
+            let bytes = job.to_bytes();
+            for cut in 1..bytes.len().min(20) {
+                let _ = JobRequest::from_bytes(&bytes[..cut]);
+            }
+            assert_eq!(
+                JobRequest::from_bytes(&bytes[..1]),
+                None,
+                "a tag with no header must be refused"
+            );
+        }
+
+        let mut bad_product = a_level3_job().to_bytes();
+        bad_product[1] = 0xFE;
+        bad_product[2] = 0xFF;
+        assert_eq!(
+            JobRequest::from_bytes(&bad_product),
+            None,
+            "a product code this build does not have"
+        );
+    }
+
+    /// A Level III payload that does not decode is a render that drew nothing,
+    /// not a panic — the bytes come off a message port.
+    #[test]
+    fn an_undecodable_level3_payload_renders_nothing() {
+        assert_eq!(execute(&a_level3_job()), None);
+        assert_eq!(execute(&an_srm_job(None)), None);
     }
 
     /// With no worker installed, `offload_job` is the old behaviour: the job

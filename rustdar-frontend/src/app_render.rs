@@ -2704,6 +2704,8 @@ mod stamping_tests {
                 symbology: None,
             },
             stamp: ProductStamp::from_key(key),
+            // No render in these tests, so nothing decodes them.
+            bytes: std::sync::Arc::new(Vec::new()),
         }
     }
 

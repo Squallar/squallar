@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rustdar_radar::level3::Level3Product;
-use rustdar_radar::render::{render_derived_srm_to_image, render_level3_message_to_image};
 use rustdar_radar::srm::{self, StormMotionSample};
 use rustdar_radar::types::RadarProduct;
 
@@ -717,9 +716,18 @@ impl RenderDispatcher {
                 params.elevation,
                 sender,
                 window,
-                crate::offload::Job::Opaque(Box::new(move || {
-                    render_derived_srm_to_image(&derived, lat, lon).map(Into::into)
-                })),
+                // The *inputs* to the derivation, not its output: `DerivedSrm`
+                // has no wire form and `srm::derive` is pure, so re-running it
+                // where the render runs produces the same field. `derived` above
+                // is still built here because the log line reports it and
+                // because a source that cannot be derived from must not take a
+                // render slot.
+                crate::offload::Job::Described(crate::offload::JobRequest::Srm {
+                    bytes: std::sync::Arc::clone(&l3_msg.bytes),
+                    motion: sample,
+                    radar_lat: lat,
+                    radar_lon: lon,
+                }),
             );
             return true;
         }
@@ -735,9 +743,16 @@ impl RenderDispatcher {
             params.elevation,
             sender,
             window,
-            crate::offload::Job::Opaque(Box::new(move || {
-                render_level3_message_to_image(&l3_msg.message, product, lat, lon).map(Into::into)
-            })),
+            // The product's bytes rather than its decoded form: a
+            // `Level3Message` has no wire form, and re-decoding is cheap against
+            // the render it precedes — so on the web the decode moves off the
+            // main thread with it.
+            crate::offload::Job::Described(crate::offload::JobRequest::Level3 {
+                bytes: std::sync::Arc::clone(&l3_msg.bytes),
+                product,
+                radar_lat: lat,
+                radar_lon: lon,
+            }),
         );
         true
     }
@@ -930,6 +945,8 @@ mod srm_dispatch_tests {
                 }),
             },
             stamp: ProductStamp::from_key("MPX_N1G_2026_07_26_01_55_52"),
+            // No render in these tests, so nothing decodes them.
+            bytes: std::sync::Arc::new(Vec::new()),
         }
     }
 

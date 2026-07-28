@@ -131,6 +131,20 @@ impl ProductStamp {
 pub struct Level3Product {
     pub message: Level3Message,
     pub stamp: ProductStamp,
+    /// The object's bytes, WMO/AWIPS envelope included — exactly what
+    /// [`nexrad_level3::decode::decode_product`] was handed to produce
+    /// [`message`](Self::message).
+    ///
+    /// Kept because a `Level3Message` has no wire form: its radial packets are
+    /// run-length structures with no serde derives anywhere in the graph. The
+    /// browser's rasterization worker is given these bytes and decodes them
+    /// itself, which reuses that exact decoder rather than adding a second
+    /// description of the product — and moves the decode off the main thread
+    /// alongside the render.
+    ///
+    /// A product is a few hundred kilobytes against the ~10 MB volume beside
+    /// it, and `Arc` so a render can borrow them without a copy.
+    pub bytes: std::sync::Arc<Vec<u8>>,
 }
 
 impl Level3Product {
@@ -228,7 +242,11 @@ pub async fn fetch_latest_product(
             age.num_minutes()
         );
     }
-    Ok(Level3Product { message, stamp })
+    Ok(Level3Product {
+        message,
+        stamp,
+        bytes: std::sync::Arc::new(bytes),
+    })
 }
 
 /// Fetch the latest Level III product for a site as raw bytes, WMO/AWIPS

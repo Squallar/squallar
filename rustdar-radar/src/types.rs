@@ -354,6 +354,60 @@ impl RadarProduct {
         }
     }
 
+    /// A stable identifier for this product on a wire.
+    ///
+    /// Deliberately not the enum's declaration order and not the serde
+    /// representation: reordering or renaming the variants must not silently
+    /// change what an already-encoded message means. Both message formats that
+    /// cross the browser's worker boundary — [`crate::render_input`]'s payload
+    /// and `rustdar_frontend::offload`'s job framing — read this one table.
+    ///
+    /// The match is exhaustive, so a new variant fails to compile until it is
+    /// given a code.
+    pub fn wire_code(&self) -> u16 {
+        match self {
+            RadarProduct::Reflectivity => 1,
+            RadarProduct::Velocity => 2,
+            RadarProduct::SpectrumWidth => 3,
+            RadarProduct::DifferentialPhase => 4,
+            RadarProduct::CorrelationCoefficient => 5,
+            RadarProduct::DifferentialReflectivity => 6,
+            RadarProduct::StormRelativeVelocity => 7,
+            RadarProduct::SpecificDifferentialPhase => 8,
+            RadarProduct::EchoTops => 9,
+            RadarProduct::EchoTopsInterpolated => 10,
+            RadarProduct::VerticallyIntegratedLiquid => 11,
+            RadarProduct::HydrometeorClassification => 12,
+            RadarProduct::PrecipitationRate => 13,
+            RadarProduct::NormalizedRotation => 14,
+        }
+    }
+
+    /// The inverse of [`wire_code`](Self::wire_code). `None` for a code this
+    /// build does not know, which is a message from another build rather than a
+    /// bug to panic on.
+    pub fn from_wire_code(code: u16) -> Option<Self> {
+        let product = match code {
+            1 => RadarProduct::Reflectivity,
+            2 => RadarProduct::Velocity,
+            3 => RadarProduct::SpectrumWidth,
+            4 => RadarProduct::DifferentialPhase,
+            5 => RadarProduct::CorrelationCoefficient,
+            6 => RadarProduct::DifferentialReflectivity,
+            7 => RadarProduct::StormRelativeVelocity,
+            8 => RadarProduct::SpecificDifferentialPhase,
+            9 => RadarProduct::EchoTops,
+            10 => RadarProduct::EchoTopsInterpolated,
+            11 => RadarProduct::VerticallyIntegratedLiquid,
+            12 => RadarProduct::HydrometeorClassification,
+            13 => RadarProduct::PrecipitationRate,
+            14 => RadarProduct::NormalizedRotation,
+            _ => return None,
+        };
+        debug_assert_eq!(product.wire_code(), code);
+        Some(product)
+    }
+
     /// Which of a radial's moment fields this product reads.
     ///
     /// The single product → moment table. [`get_moment`](Self::get_moment)

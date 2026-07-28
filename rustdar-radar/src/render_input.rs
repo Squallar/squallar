@@ -191,6 +191,11 @@ impl RenderInput {
     /// elevation number. The moments are rebuilt from their fixed-point fields
     /// and raw gate bytes, so they decode to the identical values.
     pub fn to_scan(&self) -> Scan {
+        // Always `Some`: both constructors refuse a product with no Level II
+        // field. Degrading to "no moments" rather than panicking keeps a
+        // hand-crafted payload off a message port from taking the tab down; it
+        // renders nothing, which is what such a request means anyway.
+        let slot = self.product.moment_slot();
         let sweeps = self
             .sweeps
             .iter()
@@ -282,8 +287,12 @@ type MomentSlots = (
 ///
 /// The inverse of [`MomentSlot::read`], and the reason `MomentSlot` exists:
 /// `get_moment` can only fetch, and rebuilding a radial needs the field named.
-fn place_moment(slot: MomentSlot, moment: Option<MomentData>) -> MomentSlots {
+///
+/// `slot` is `None` only for a product with no Level II field, which neither
+/// constructor produces; the moment is then dropped rather than guessed at.
+fn place_moment(slot: Option<MomentSlot>, moment: Option<MomentData>) -> MomentSlots {
     let mut slots: MomentSlots = (None, None, None, None, None, None);
+    let Some(slot) = slot else { return slots };
     match slot {
         MomentSlot::Reflectivity => slots.0 = moment,
         MomentSlot::Velocity => slots.1 = moment,
@@ -371,7 +380,7 @@ impl RenderInput {
         let mut out = Vec::with_capacity(self.encoded_len());
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        out.extend_from_slice(&product_code(self.product).to_le_bytes());
+        out.extend_from_slice(&self.product.wire_code().to_le_bytes());
         out.extend_from_slice(&self.elevation.to_le_bytes());
         out.extend_from_slice(&self.radar_lat.to_le_bytes());
         out.extend_from_slice(&self.radar_lon.to_le_bytes());
@@ -431,7 +440,12 @@ impl RenderInput {
         if r.u16()? != FORMAT_VERSION {
             return None;
         }
-        let product = product_from_code(r.u16()?)?;
+        let product = RadarProduct::from_wire_code(r.u16()?)?;
+        // The same refusal `extract` makes. A payload naming a Level III
+        // product has no moment any field could hold, so it could only ever
+        // render nothing; refusing it here keeps that from looking like a
+        // renderer that found no sweep.
+        product.moment_slot()?;
         let elevation = r.f32()?;
         let radar_lat = r.f64()?;
         let radar_lon = r.f64()?;
@@ -574,52 +588,6 @@ impl<'a> Reader<'a> {
     fn at_end(&self) -> bool {
         self.at == self.bytes.len()
     }
-}
-
-/// Stable wire codes for [`RadarProduct`].
-///
-/// Deliberately not the enum's declaration order: reordering the variants must
-/// not silently change what a payload means. The match is exhaustive, so a new
-/// variant fails to compile until it is given a code.
-fn product_code(product: RadarProduct) -> u16 {
-    match product {
-        RadarProduct::Reflectivity => 1,
-        RadarProduct::Velocity => 2,
-        RadarProduct::SpectrumWidth => 3,
-        RadarProduct::DifferentialPhase => 4,
-        RadarProduct::CorrelationCoefficient => 5,
-        RadarProduct::DifferentialReflectivity => 6,
-        RadarProduct::StormRelativeVelocity => 7,
-        RadarProduct::SpecificDifferentialPhase => 8,
-        RadarProduct::EchoTops => 9,
-        RadarProduct::EchoTopsInterpolated => 10,
-        RadarProduct::VerticallyIntegratedLiquid => 11,
-        RadarProduct::HydrometeorClassification => 12,
-        RadarProduct::PrecipitationRate => 13,
-        RadarProduct::NormalizedRotation => 14,
-    }
-}
-
-fn product_from_code(code: u16) -> Option<RadarProduct> {
-    let product = match code {
-        1 => RadarProduct::Reflectivity,
-        2 => RadarProduct::Velocity,
-        3 => RadarProduct::SpectrumWidth,
-        4 => RadarProduct::DifferentialPhase,
-        5 => RadarProduct::CorrelationCoefficient,
-        6 => RadarProduct::DifferentialReflectivity,
-        7 => RadarProduct::StormRelativeVelocity,
-        8 => RadarProduct::SpecificDifferentialPhase,
-        9 => RadarProduct::EchoTops,
-        10 => RadarProduct::EchoTopsInterpolated,
-        11 => RadarProduct::VerticallyIntegratedLiquid,
-        12 => RadarProduct::HydrometeorClassification,
-        13 => RadarProduct::PrecipitationRate,
-        14 => RadarProduct::NormalizedRotation,
-        _ => return None,
-    };
-    debug_assert_eq!(product_code(product), code);
-    Some(product)
 }
 
 #[cfg(test)]
@@ -1050,11 +1018,11 @@ mod tests {
         ];
         let mut seen = std::collections::HashSet::new();
         for product in products {
-            let code = product_code(product);
+            let code = product.wire_code();
             assert!(seen.insert(code), "{product:?} reuses wire code {code}");
-            assert_eq!(product_from_code(code), Some(product));
+            assert_eq!(RadarProduct::from_wire_code(code), Some(product));
         }
-        assert_eq!(product_from_code(0), None);
-        assert_eq!(product_from_code(u16::MAX), None);
+        assert_eq!(RadarProduct::from_wire_code(0), None);
+        assert_eq!(RadarProduct::from_wire_code(u16::MAX), None);
     }
 }
