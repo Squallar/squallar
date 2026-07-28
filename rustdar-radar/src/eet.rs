@@ -72,10 +72,48 @@
 //! * **SAILS/MRLE revisits**: HREET consumes each elevation's DQA buffer once
 //!   as the volume completes, so the cube is deduplicated
 //!   [`DedupPolicy::FirstOfVolume`] — the coherent first pass the RPG's
-//!   volume products are computed from, not the freshest look.
+//!   volume products are computed from, not the freshest look. (Measured
+//!   against a live KMRX 212 twin, newest-wins changes the score by under a
+//!   tenth of a point either way, so the choice is by the doc, uncontradicted.)
+//! * **Cell statistic** — twin-arbitrated, not documented: each 1° × 1 km
+//!   cell takes the **maximum** dBZ of its sub-gates ([`CellStat::Max`]).
+//!   The documented recombination average (linear-Z mean) reads 1.5 data
+//!   levels *lower* against a live KMRX EET twin (mean level bias −2.75
+//!   against −1.23, within-±1 43% against 58%), and leaves thousands of bins
+//!   undefined that the twin defines whose column maximum sits at 14–18 dBZ —
+//!   just under threshold. The same finding as the SRM campaign's range
+//!   recombination: the RPG keeps peaks.
+//!
+//! # Validation status — read before trusting the twin harness to pass
+//!
+//! The live harness below holds this derivation to the campaign bar (99%
+//! within one level, per site) against the RPG's own EET for the same
+//! volume. As of the 2026-07-28 survey it does **not** meet that bar on
+//! convective volumes: clear-air/weak sites read 99–100% within-±1, but
+//! sites with real storms plateau at 60–80% with a storm-depth-dependent
+//! low bias, and the twin defines 15–30% more bins than any per-column
+//! recomputation of the same Level II data can (its extra bins sit at
+//! column maxima of 14–18 dBZ). The twin's field is also visibly smoother
+//! than a raw column scan — flat 2–3-level plateaus across cores.
+//!
+//! Ruled out by measurement (single-volume A/B against the KMRX/KSGF/KMLB
+//! twins, each change isolated): dedup policy (first against newest —
+//! indistinguishable); datum (MSL confirmed: near-radar twin bins encode
+//! site-elevation heights, low-top bins agree to a quarter level); beam top
+//! against beam centre (+0.475–0.5° overshoots, range-proportionally);
+//! linear-Z interpolation (centres the mean but widens the spread); azimuth
+//! registration (cells cover [k, k+1)°, the centred alternative is worse);
+//! range sub-column lanes, azimuth pooling across the half-degree radials,
+//! ground-projected (flat-polar) sampling, interpolating toward a floor when
+//! censored above, and 3×3 median/max input and output filters — each moves
+//! the score by single points, none closes it. The remaining candidate is
+//! HREET's own pre/post-processing (its input is the DQA buffer and its
+//! source, `cpc014/tsk012`, is not in any public CODE distribution), so the
+//! residual is recorded here rather than papered over: do not lower the bar,
+//! and do not calibrate further heuristics against a single twin volume.
 
 use crate::types::RadarProduct;
-use crate::volumetric::{DedupPolicy, RANGE_BINS, VolumeCube};
+use crate::volumetric::{CellStat, DedupPolicy, RANGE_BINS, VolumeCube};
 use nexrad_model::data::Scan;
 
 /// Echo-top reflectivity threshold, dBZ: the `alg.vil_echo_tops min_refl`
@@ -146,16 +184,17 @@ struct TiltView<'a> {
 /// module doc. `radar_height_ft` is the radar height above MSL in feet — the
 /// value the twin's PDB carries, or [`radar_height_ft_near`] for a render.
 pub fn compute_eet(scan: &Scan, radar_height_ft: f64) -> EetGrid {
-    let cube = VolumeCube::build(
+    let cube = VolumeCube::build_with_stats(
         scan,
-        &[RadarProduct::Reflectivity],
+        &[(RadarProduct::Reflectivity, CellStat::Max)],
         DedupPolicy::FirstOfVolume,
     );
     let radar_height_kft = radar_height_ft * FT_TO_KFT;
 
     // The tilts carrying reflectivity, ascending, each with altitudes at its
-    // *actual* elevation angle (the cube's key is rounded to 0.1°, which is
-    // 0.2 km of beam height at 230 km — enough to matter against the twin).
+    // *actual* elevation angle — the sweep's median radial elevation. The
+    // cube's key is rounded to 0.1°, which is 0.2 km of beam height at
+    // 230 km — enough to matter against the twin.
     let tilts: Vec<TiltView> = cube
         .tilts
         .iter()
@@ -165,10 +204,8 @@ pub fn compute_eet(scan: &Scan, radar_height_ft: f64) -> EetGrid {
             let elev = scan
                 .sweeps()
                 .get(grid.sweep_index)
-                .and_then(|s| s.radials().first())
-                .map_or(tilt.elevation_deg, |r| {
-                    f64::from(r.elevation_angle_degrees())
-                });
+                .and_then(|s| crate::volumetric::sweep_elevation_deg(s.radials()))
+                .unwrap_or(tilt.elevation_deg);
             Some(TiltView {
                 heights_kft: (0..RANGE_BINS)
                     .map(|r| beam_centre_kft_msl(r as f64 + 0.5, elev, radar_height_kft))
@@ -442,10 +479,8 @@ mod tests {
             .map(|i| {
                 let byte = match dbz_at(i) {
                     None => 0u8,
-                    Some(dbz) => {
-                        ((dbz * f64::from(SCALE) + f64::from(OFFSET)).round() as i64).clamp(2, 255)
-                            as u8
-                    }
+                    Some(dbz) => ((dbz * f64::from(SCALE) + f64::from(OFFSET)).round() as i64)
+                        .clamp(2, 255) as u8,
                 };
                 Radial::new(
                     0,
@@ -828,7 +863,10 @@ mod live_validation {
                 continue;
             };
             let Some(packet) = crate::srm::radial_packet(&twin.message) else {
-                println!("{site}: SKIP — twin {} has no radial packet", twin.stamp.key);
+                println!(
+                    "{site}: SKIP — twin {} has no radial packet",
+                    twin.stamp.key
+                );
                 continue;
             };
 
