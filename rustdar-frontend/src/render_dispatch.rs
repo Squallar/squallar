@@ -228,6 +228,23 @@ fn is_renderable_tilt(product: RadarProduct, msg: &nexrad_level3::model::Level3M
 /// pairwise comparison, this has to be a hashable bucket, and no exact bucketing
 /// agrees with a tolerance at the edges. Tenths is finer than any real sweep spacing,
 /// so two selections that compare equal never land in different buckets in practice.
+/// Whether a Level II product reads the whole volume rather than one sweep.
+///
+/// Mirrors the `whole_volume` branch in `RenderInput::extract`, which is what
+/// actually decides how much of the `Scan` travels: `EchoTopsInterpolated`
+/// integrates every reflectivity tilt, and `NormalizedRotation` collects every
+/// velocity tilt *unless* the caller's wind levels already yield a profile. Both
+/// would read a volume still being assembled as a complete short one —
+/// `compute_echo_tops` clamps every column to the topmost tilt present, with no
+/// error and no NaN to notice.
+fn whole_volume_product(product: RadarProduct, have_wind_profile: bool) -> bool {
+    match product {
+        RadarProduct::EchoTopsInterpolated => true,
+        RadarProduct::NormalizedRotation => !have_wind_profile,
+        _ => false,
+    }
+}
+
 fn elevation_key(elevation: f32) -> i32 {
     (elevation * 10.0).round() as i32
 }
@@ -450,6 +467,86 @@ impl RenderDispatcher {
         // that visited every radar in the country. A vector that no longer
         // matches any volume is never selected, so keeping them is inert.
         self.render_cache.retain(|(s, _prod, _elev)| s != site);
+    }
+
+    /// The narrow counterpart to [`reset_panes_for_site`], for the real-time
+    /// chunk feed: one elevation cut completed, not a whole volume.
+    ///
+    /// A pane showing another tilt is showing an image that is still correct,
+    /// and resetting it costs more than a wasted render. `RenderInput::extract`
+    /// answers `None` for a tilt the volume does not yet carry, which dispatches
+    /// `Job::renders_nothing`; that unwinds the pane's in-flight mark but
+    /// consumes a slot in the render budget, and it would happen for every
+    /// unarrived tilt on every cut of every volume.
+    ///
+    /// `angles` are matched against each pane's **snapped** render elevation —
+    /// what `get_rendering_params` resolves and what `last_rendered` records —
+    /// not against `selected_elevation`, which may name a tilt no sweep carries.
+    ///
+    /// Volume-wide Level II products are skipped here and taken by
+    /// [`reset_panes_for_volume`]: `EchoTopsInterpolated` integrates every
+    /// reflectivity tilt, and NROT without an external wind profile fits its
+    /// profile from every velocity tilt, so both would read a partial volume as
+    /// a complete short one. Level III panes are skipped outright — their pixels
+    /// come from `level3_data`, which a Level II cut says nothing about.
+    ///
+    /// Returns how many panes were invalidated, for the log and the tests.
+    pub fn reset_panes_for_tilts(
+        &mut self,
+        site: &str,
+        gui: &rustdar_egui::Gui,
+        angles: &[f32],
+        have_wind_profile: bool,
+    ) -> usize {
+        let hit = self.invalidate_panes_where(site, gui, |product, elevation| {
+            if product.is_level3() || whole_volume_product(product, have_wind_profile) {
+                return false;
+            }
+            angles
+                .iter()
+                .any(|a| (a - elevation).abs() <= rustdar_egui::pane::ELEVATION_TOLERANCE)
+        });
+        // Only the tilts that changed. A whole-site `retain` would throw away the
+        // images the untouched panes are still sharing.
+        self.render_cache.retain(|(s, _prod, elev)| {
+            s != site || !angles.iter().any(|a| elevation_key(*a) == *elev)
+        });
+        hit
+    }
+
+    /// The tilt-independent half: the Level II products that integrate a whole
+    /// volume. Called only when a volume closes complete.
+    pub fn reset_panes_for_volume(&mut self, site: &str, gui: &rustdar_egui::Gui) -> usize {
+        self.invalidate_panes_where(site, gui, |product, _| {
+            !product.is_level3() && whole_volume_product(product, false)
+        })
+    }
+
+    /// The one place the `abandon_results` + `render_in_flight` pairing is
+    /// written for the narrow resets. Both public methods above go through it,
+    /// so there is one new home for the invariant rather than two.
+    fn invalidate_panes_where(
+        &mut self,
+        site: &str,
+        gui: &rustdar_egui::Gui,
+        mut want: impl FnMut(RadarProduct, f32) -> bool,
+    ) -> usize {
+        let mut hit = 0;
+        for (idx, prs) in self.pane_render.iter_mut().enumerate() {
+            let matches = gui.pane(idx).is_some_and(|p| p.site == site)
+                && gui
+                    .get_rendering_params_for_pane(idx)
+                    .is_some_and(|(product, elevation)| want(product, elevation));
+            if matches {
+                prs.last_rendered = None;
+                prs.cached_render = None;
+                prs.render_in_flight = false;
+                // Paired with the line above: see `results_wanted`.
+                prs.abandon_results();
+                hit += 1;
+            }
+        }
+        hit
     }
 
     /// Reset all pane render state (e.g. after a new scan loads).
@@ -2137,6 +2234,176 @@ mod render_invalidation_tests {
 
         release.send(()).expect("the render is still running");
         assert_eq!(arrivals(results, rx), 0);
+    }
+
+    /// One pane on `site` showing `product`, with `available` as the tilt list
+    /// its selection snaps within.
+    ///
+    /// One pane rather than several because `Gui::set_pane_count_for_test` is
+    /// `#[cfg(test)]` inside `rustdar-egui` and so does not exist for this
+    /// crate's tests. The property under test — that a reset picks panes by
+    /// their snapped tilt — is the same either way, and the pair of tests below
+    /// covers both answers.
+    fn gui_on_tilt(
+        site: &str,
+        product: RadarProduct,
+        selected: f32,
+        available: &[f32],
+    ) -> rustdar_egui::Gui {
+        use rustdar_radar::sites::RadarSite;
+        use rustdar_radar::types::ScanInfo;
+        let mut gui = rustdar_egui::Gui::new();
+        let pane = gui.pane_mut(0).expect("a fresh Gui has one pane");
+        pane.site = site.to_string();
+        pane.selected_product = product;
+        pane.selected_elevation = selected;
+        let mut product_elevations = std::collections::HashMap::new();
+        product_elevations.insert(product, available.to_vec());
+        pane.scan_info = Some(ScanInfo {
+            site: RadarSite {
+                name: "KOUN",
+                lat: 35.2,
+                lon: -97.4,
+                elev: None,
+            },
+            timestamp: chrono::NaiveDate::from_ymd_opt(2026, 7, 28)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            vcp_number: 212,
+            available_products: vec![product],
+            product_elevations,
+            status: String::new(),
+        });
+        gui
+    }
+
+    fn cached(range: f64) -> CachedRenderOutput {
+        CachedRenderOutput {
+            image_data: Arc::new(Vec::new()),
+            max_range_km: range,
+            value_data: Arc::new(Vec::new()),
+        }
+    }
+
+    /// The defect this avoids: a cut completing in the real-time feed changes one
+    /// sweep, not the volume, so a pane on another tilt is still showing a
+    /// correct image. Resetting it dispatches a render whose `extract` answers
+    /// `None` — a wasted slot in the render budget, on every cut of every volume.
+    #[test]
+    fn a_finished_tilt_leaves_a_pane_on_another_tilt_alone() {
+        let gui = gui_on_tilt("KOUN", RadarProduct::Reflectivity, 4.0, &[0.5, 4.0]);
+        let mut d = RenderDispatcher::new();
+        d.ensure_pane_count(1);
+        let (results, rx) = mpsc::channel();
+        let release = dispatch(&mut d, 0, &results);
+
+        assert_eq!(
+            d.reset_panes_for_tilts("KOUN", &gui, &[0.5], false),
+            0,
+            "the 4.0° pane was invalidated by a 0.5° cut completing"
+        );
+        assert!(d.pane_render[0].render_in_flight);
+
+        release.send(()).expect("still running");
+        assert_eq!(
+            arrivals(results, rx),
+            1,
+            "its render should survive: the image it is showing is still correct"
+        );
+    }
+
+    /// The counterweight: the pane whose tilt it was must be invalidated, or the
+    /// new sweep never reaches the screen.
+    #[test]
+    fn a_finished_tilt_invalidates_the_pane_showing_it() {
+        let gui = gui_on_tilt("KOUN", RadarProduct::Reflectivity, 0.5, &[0.5, 4.0]);
+        let mut d = RenderDispatcher::new();
+        d.ensure_pane_count(1);
+        let (results, rx) = mpsc::channel();
+        let release = dispatch(&mut d, 0, &results);
+
+        assert_eq!(d.reset_panes_for_tilts("KOUN", &gui, &[0.5], false), 1);
+        assert!(
+            !d.pane_render[0].render_in_flight,
+            "the pairing an abandoned send depends on"
+        );
+        release.send(()).expect("still running");
+        assert_eq!(arrivals(results, rx), 0);
+    }
+
+    /// Echo tops integrates every reflectivity tilt and clamps each column to the
+    /// topmost one present, so a partial volume gives a plausible, low, wrong
+    /// number with no error and no NaN. It must wait for the volume to close.
+    #[test]
+    fn a_finished_tilt_leaves_the_volumetric_pane_for_the_closing_volume() {
+        let gui = gui_on_tilt("KOUN", RadarProduct::EchoTopsInterpolated, 0.5, &[0.5]);
+        let mut d = RenderDispatcher::new();
+        d.ensure_pane_count(1);
+
+        assert_eq!(
+            d.reset_panes_for_tilts("KOUN", &gui, &[0.5], false),
+            0,
+            "echo tops was invalidated by a single cut completing"
+        );
+        assert_eq!(
+            d.reset_panes_for_volume("KOUN", &gui),
+            1,
+            "and the closing volume did not pick it up"
+        );
+    }
+
+    /// NROT without an external wind profile collects every velocity tilt, so it
+    /// is volume-wide too — but with VWP levels in hand `extract` carries only
+    /// the one sweep, and it can refresh per cut like any other product.
+    #[test]
+    fn nrot_waits_for_the_volume_only_while_it_has_no_wind_profile() {
+        let gui = gui_on_tilt("KOUN", RadarProduct::NormalizedRotation, 0.5, &[0.5]);
+        let mut d = RenderDispatcher::new();
+        d.ensure_pane_count(1);
+
+        assert_eq!(
+            d.reset_panes_for_tilts("KOUN", &gui, &[0.5], false),
+            0,
+            "NROT with no wind profile fits it from every velocity tilt, so a \
+             partial volume would halve its shear"
+        );
+        assert_eq!(d.reset_panes_for_tilts("KOUN", &gui, &[0.5], true), 1);
+    }
+
+    /// A Level III pane's pixels come from `level3_data`; a Level II cut
+    /// completing says nothing about them, and its tilts are refetched only when
+    /// the volume closes.
+    #[test]
+    fn a_finished_tilt_does_not_touch_a_level3_pane() {
+        let gui = gui_on_tilt("KOUN", RadarProduct::StormRelativeVelocity, 0.5, &[0.5]);
+        let mut d = RenderDispatcher::new();
+        d.ensure_pane_count(1);
+        assert_eq!(d.reset_panes_for_tilts("KOUN", &gui, &[0.5], false), 0);
+        assert_eq!(d.reset_panes_for_volume("KOUN", &gui), 0);
+    }
+
+    /// A whole-site `render_cache.retain` would throw away the images the panes
+    /// this reset deliberately left alone are still sharing.
+    #[test]
+    fn a_tilt_reset_keeps_the_other_tilts_cached_renders() {
+        let gui = gui_on_tilt("KOUN", RadarProduct::Reflectivity, 0.5, &[0.5, 4.0]);
+        let mut d = RenderDispatcher::new();
+        d.ensure_pane_count(1);
+        d.cache_render("KOUN", RadarProduct::Reflectivity, 0.5, cached(1.0));
+        d.cache_render("KOUN", RadarProduct::Reflectivity, 4.0, cached(2.0));
+
+        d.reset_panes_for_tilts("KOUN", &gui, &[0.5], false);
+        assert!(
+            d.get_cached_render("KOUN", RadarProduct::Reflectivity, 0.5)
+                .is_none(),
+            "the completed tilt's stale image survived"
+        );
+        assert!(
+            d.get_cached_render("KOUN", RadarProduct::Reflectivity, 4.0)
+                .is_some(),
+            "an untouched tilt's image was evicted with it"
+        );
     }
 
     /// The flag list is bounded by what is actually running, not by how many

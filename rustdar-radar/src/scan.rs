@@ -361,3 +361,43 @@ pub async fn get_level3_product(
     )
     .await
 }
+
+// ---------------------------------------------------------------------------
+// Real-time chunks
+// ---------------------------------------------------------------------------
+
+/// A poller for one site's real-time chunk feed, with the crypto provider
+/// installed.
+///
+/// The production origin table is bound in [`poll_chunks`] for the same reason
+/// it is bound in `list_files`: threading `&DataSources` out through this
+/// module's public surface would ripple into every frontend call site for no
+/// gain, since nothing above here overrides an origin.
+pub fn chunk_poller(site: &str) -> crate::chunks::ChunkPoller {
+    crate::tls::init();
+    crate::chunks::ChunkPoller::new(site)
+}
+
+/// [`chunk_poller`] resuming from a volume index a caller already knows, which
+/// skips the ~10-request discovery search.
+pub fn resume_chunk_poller(
+    site: &str,
+    volume: crate::chunks::VolumeIndex,
+) -> crate::chunks::ChunkPoller {
+    crate::tls::init();
+    crate::chunks::ChunkPoller::resume(site, volume)
+}
+
+/// One poll round against the production chunk bucket.
+///
+/// No sleeping and no looping: the caller owns the timer. That is a wasm
+/// requirement rather than a preference — see [`crate::chunks::ChunkPoller`] —
+/// and [`crate::chunks::ChunkPoller::suggested_interval`] advises the delay.
+pub async fn poll_chunks(
+    poller: &mut crate::chunks::ChunkPoller,
+) -> std::result::Result<crate::chunks::PollOutcome, crate::chunks::ChunkError> {
+    crate::tls::init();
+    poller
+        .poll(&crate::sources::DataSources::production())
+        .await
+}

@@ -895,6 +895,326 @@ impl VolumeAssembler {
 }
 
 // ---------------------------------------------------------------------------
+// Polling
+// ---------------------------------------------------------------------------
+
+/// Base delay between rounds.
+///
+/// Measured against KTLX: the *latency* of this feed is bound by this number,
+/// not by the bucket — cuts became renderable a median 4 s after their last
+/// radial was collected, with a 5 s interval. The only cadence-dependent cost is
+/// the listing, ~5 kB a round (~3.5 MB/hour), because the chunk downloads
+/// themselves happen once regardless of how often the directory is checked.
+pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Delay after a round that found nothing new.
+///
+/// Backing off on *quiet* rather than on error, because no new chunk is the
+/// ordinary state between cuts and across the gap between volumes; an empty
+/// round is not a failure and must not be counted as one.
+pub const QUIET_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ceiling on the failure backoff.
+pub const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How stale the current volume may get before discovery is re-run rather than
+/// the next index probed. Three volume periods; past that the app was probably
+/// backgrounded and stepping one index per round would take many rounds to catch
+/// up.
+const VOLUME_STALE: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
+
+/// What a round should do, decided from state alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PollPlan {
+    /// Nothing known, or what is known is too old to walk forward from.
+    Discover,
+    /// List the current volume and fetch what is new.
+    Fill { volume: VolumeIndex },
+    /// The current volume ended; see whether the next has started.
+    ProbeNext {
+        current: VolumeIndex,
+        next: VolumeIndex,
+    },
+}
+
+/// Whether a per-chunk fetch failure ends the round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FetchDisposition {
+    Skip,
+    Abort,
+}
+
+/// A listed-then-missing key is ordinary: S3 is eventually consistent, and the
+/// rotation can retire a key between the listing and the GET. Anything else ends
+/// the round — the chunks already ingested stay ingested, so the next round
+/// resumes rather than restarts.
+pub(crate) fn fetch_disposition(e: &ArchiveError) -> FetchDisposition {
+    match e {
+        ArchiveError::NotFound(_) => FetchDisposition::Skip,
+        _ => FetchDisposition::Abort,
+    }
+}
+
+/// What one round changed.
+#[derive(Debug, Clone, Default)]
+pub struct PollOutcome {
+    pub ingested: usize,
+    /// Elevation numbers whose cut completed this round, ascending. **The render
+    /// trigger**, and the test for whether a snapshot is worth building.
+    pub sealed_elevations: Vec<u8>,
+    /// Their angles, parallel to `sealed_elevations`.
+    pub sealed_angles: Vec<f32>,
+    /// The volume rolled this round; `snapshot` now describes a new volume.
+    pub rolled_to: Option<VolumeIndex>,
+    /// The volume that just closed, with its final progress. Where
+    /// `volume_complete` for a finished volume is reported.
+    pub closed: Option<VolumeProgress>,
+    pub progress: Option<VolumeProgress>,
+    /// Keys that would not parse or bytes that would not decode. Skipped, not
+    /// fatal.
+    pub skipped: usize,
+}
+
+/// One site's real-time feed.
+///
+/// **Pull-driven: nothing here sleeps, loops or schedules.** [`Self::poll`] does
+/// one round and returns; the caller decides when to call again. That is a wasm
+/// requirement, not a preference — this crate builds for `wasm32`, where reqwest
+/// is the browser's `fetch()`, there is no `tokio::time`, and a self-scheduling
+/// task could not be cancelled by the UI. The frontend already drives every
+/// other fetch this way.
+pub struct ChunkPoller {
+    site: String,
+    current: Option<VolumeAssembler>,
+    consecutive_failures: u32,
+    last_round_was_quiet: bool,
+}
+
+impl ChunkPoller {
+    pub fn new(site: impl Into<String>) -> Self {
+        Self {
+            site: site.into(),
+            current: None,
+            consecutive_failures: 0,
+            last_round_was_quiet: false,
+        }
+    }
+
+    /// Resume from a known index, skipping discovery.
+    pub fn resume(site: impl Into<String>, volume: VolumeIndex) -> Self {
+        let site = site.into();
+        Self {
+            current: Some(VolumeAssembler::new(site.clone(), volume)),
+            site,
+            consecutive_failures: 0,
+            last_round_was_quiet: false,
+        }
+    }
+
+    pub fn site(&self) -> &str {
+        &self.site
+    }
+
+    pub fn volume(&self) -> Option<VolumeIndex> {
+        self.current.as_ref().map(VolumeAssembler::volume)
+    }
+
+    pub fn progress(&self) -> Option<VolumeProgress> {
+        self.current.as_ref().map(VolumeAssembler::progress)
+    }
+
+    /// The volume so far, complete sweeps only. `None` before the first chunk.
+    pub fn snapshot(&mut self) -> Option<std::sync::Arc<nexrad_model::data::Scan>> {
+        self.current.as_mut().map(VolumeAssembler::snapshot)
+    }
+
+    /// Advisory delay before the next [`Self::poll`]. Advisory because this crate
+    /// has no timer on wasm — the caller owns the clock.
+    pub fn suggested_interval(&self) -> std::time::Duration {
+        if self.consecutive_failures > 0 {
+            let shift = self.consecutive_failures.min(6);
+            return (POLL_INTERVAL * (1 << shift)).min(MAX_BACKOFF);
+        }
+        if self.last_round_was_quiet {
+            QUIET_INTERVAL
+        } else {
+            POLL_INTERVAL
+        }
+    }
+
+    /// What the next round should do. `now` is a parameter so the staleness rule
+    /// is testable.
+    pub(crate) fn plan(&self, now: chrono::NaiveDateTime) -> PollPlan {
+        let Some(current) = &self.current else {
+            return PollPlan::Discover;
+        };
+        // A volume this old means the walk-forward would take many rounds to
+        // catch up; one discovery is cheaper.
+        if current
+            .volume_time()
+            .is_some_and(|t| now.signed_duration_since(t) > VOLUME_STALE)
+        {
+            return PollPlan::Discover;
+        }
+        if current.progress().saw_scan_end {
+            return PollPlan::ProbeNext {
+                current: current.volume(),
+                next: current.volume().next(),
+            };
+        }
+        PollPlan::Fill {
+            volume: current.volume(),
+        }
+    }
+
+    /// The chunks in `listed` this volume still wants, ascending.
+    pub(crate) fn select(&self, listed: &[ChunkId]) -> Vec<ChunkId> {
+        let Some(current) = &self.current else {
+            return Vec::new();
+        };
+        let volume_time = current.volume_time();
+        listed
+            .iter()
+            .filter(|id| {
+                id.volume() == current.volume()
+                    && !current.has_ingested(id.sequence())
+                    // A directory the rotation has not yet cleared can still
+                    // hold the previous pass's chunks alongside the new ones.
+                    && volume_time.is_none_or(|known| id.volume_time() == known)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Close the current volume and begin the next.
+    pub(crate) fn roll(&mut self, to: VolumeIndex) -> Option<VolumeProgress> {
+        let closed = self.current.as_mut().map(VolumeAssembler::close);
+        self.current = Some(VolumeAssembler::new(self.site.clone(), to));
+        closed
+    }
+
+    /// One round: no sleeping, no looping, no self-scheduling.
+    pub async fn poll(&mut self, sources: &crate::sources::DataSources) -> Result<PollOutcome> {
+        // Before the first `.await`, so merely polling this future installs the
+        // crypto provider — `crate::tls` has a probe that depends on it.
+        let _ = crate::archive::shared_client();
+
+        let now = chrono::Utc::now().naive_utc();
+        let mut outcome = PollOutcome::default();
+
+        let volume = match self.plan(now) {
+            PollPlan::Discover => {
+                let volume = match latest_volume(sources, &self.site).await {
+                    Ok(volume) => volume,
+                    Err(e) => {
+                        self.consecutive_failures += 1;
+                        return Err(e);
+                    }
+                };
+                self.current = Some(VolumeAssembler::new(self.site.clone(), volume));
+                outcome.rolled_to = Some(volume);
+                volume
+            }
+            PollPlan::Fill { volume } => volume,
+            PollPlan::ProbeNext { current, next } => {
+                // Roll only when the next directory holds a volume that started
+                // *later* than this one. An index the rotation has not yet
+                // reused still holds the previous pass, whose start time is
+                // older — that is not a new volume.
+                let listed = match list_chunks(sources, &self.site, next).await {
+                    Ok(listed) => listed,
+                    Err(e) => {
+                        self.consecutive_failures += 1;
+                        return Err(e);
+                    }
+                };
+                let current_time = self.current.as_ref().and_then(VolumeAssembler::volume_time);
+                let started = listed
+                    .first()
+                    .is_some_and(|c| current_time.is_none_or(|t| c.volume_time() > t));
+                if started {
+                    outcome.closed = self.roll(next);
+                    outcome.rolled_to = Some(next);
+                    next
+                } else {
+                    self.consecutive_failures = 0;
+                    self.last_round_was_quiet = true;
+                    outcome.progress = self.progress();
+                    let _ = current;
+                    return Ok(outcome);
+                }
+            }
+        };
+
+        let listed = match list_chunks(sources, &self.site, volume).await {
+            Ok(listed) => listed,
+            Err(e) => {
+                self.consecutive_failures += 1;
+                return Err(e);
+            }
+        };
+
+        for id in self.select(&listed) {
+            let bytes = match download_chunk(sources, &id).await {
+                Ok(bytes) => bytes,
+                Err(ChunkError::Bucket(e)) => match fetch_disposition(&e) {
+                    FetchDisposition::Skip => {
+                        outcome.skipped += 1;
+                        continue;
+                    }
+                    FetchDisposition::Abort => {
+                        self.consecutive_failures += 1;
+                        return Err(ChunkError::Bucket(e));
+                    }
+                },
+                Err(e) => {
+                    self.consecutive_failures += 1;
+                    return Err(e);
+                }
+            };
+            let Some(current) = self.current.as_mut() else {
+                break;
+            };
+            match current.ingest(&id, &bytes) {
+                Ok(o) if o.accepted => {
+                    outcome.ingested += 1;
+                    outcome.sealed_elevations.extend(o.sealed);
+                }
+                Ok(_) => {}
+                // A chunk that will not decode is skipped, not fatal: the volume
+                // is still worth what already arrived, and the next round will
+                // not retry it.
+                Err(e) => {
+                    log::warn!("{}: chunk {} did not decode: {e:?}", self.site, id.name());
+                    outcome.skipped += 1;
+                }
+            }
+        }
+
+        self.consecutive_failures = 0;
+        self.last_round_was_quiet = outcome.ingested == 0;
+
+        let progress = self.progress();
+        if let Some(progress) = &progress {
+            outcome.sealed_angles = outcome
+                .sealed_elevations
+                .iter()
+                .map(|e| {
+                    progress
+                        .sealed_elevations
+                        .iter()
+                        .position(|s| s == e)
+                        .map(|i| progress.sealed_angles[i])
+                        .unwrap_or(f32::NAN)
+                })
+                .collect();
+        }
+        outcome.progress = progress;
+        Ok(outcome)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bucket access
 // ---------------------------------------------------------------------------
 
@@ -1841,6 +2161,171 @@ mod tests {
         assert_eq!(a.progress().chunks_ingested, 1);
     }
 
+    // -- poller -------------------------------------------------------------
+
+    /// Seed a poller's assembler with one chunk so it has a volume time.
+    fn primed(volume: VolumeIndex) -> ChunkPoller {
+        let mut p = ChunkPoller::resume("KTLX", volume);
+        let (sequence, kind, contents) = golden_chunks()[1].clone();
+        p.current
+            .as_mut()
+            .expect("resume seeds an assembler")
+            .ingest_contents(sequence, kind, volume_time(), contents);
+        p
+    }
+
+    #[test]
+    fn a_cold_poller_plans_discovery() {
+        let p = ChunkPoller::new("KTLX");
+        assert_eq!(p.plan(volume_time()), PollPlan::Discover);
+    }
+
+    /// While a volume is still filling, keep listing it; once it has ended, look
+    /// at the next index instead.
+    #[test]
+    fn a_filling_volume_is_listed_and_a_finished_one_probes_the_next() {
+        let mut p = primed(vol(42));
+        assert_eq!(p.plan(volume_time()), PollPlan::Fill { volume: vol(42) });
+
+        for (sequence, kind, contents) in golden_chunks().into_iter().skip(2) {
+            p.current
+                .as_mut()
+                .unwrap()
+                .ingest_contents(sequence, kind, volume_time(), contents);
+        }
+        assert_eq!(
+            p.plan(volume_time()),
+            PollPlan::ProbeNext {
+                current: vol(42),
+                next: vol(43)
+            }
+        );
+    }
+
+    /// Rollover reaches the plan, not just `VolumeIndex::next`.
+    #[test]
+    fn the_volume_probed_after_999_is_1() {
+        let mut p = primed(vol(999));
+        for (sequence, kind, contents) in golden_chunks().into_iter().skip(2) {
+            p.current
+                .as_mut()
+                .unwrap()
+                .ingest_contents(sequence, kind, volume_time(), contents);
+        }
+        assert_eq!(
+            p.plan(volume_time()),
+            PollPlan::ProbeNext {
+                current: vol(999),
+                next: vol(1)
+            }
+        );
+    }
+
+    /// A backgrounded app comes back to a volume long gone. Stepping one index
+    /// per round would take many rounds to catch up, so discovery is re-run.
+    #[test]
+    fn a_stale_volume_replans_discovery() {
+        let p = primed(vol(42));
+        let much_later = volume_time() + chrono::Duration::minutes(30);
+        assert_eq!(p.plan(much_later), PollPlan::Discover);
+        assert_eq!(
+            p.plan(volume_time() + chrono::Duration::minutes(2)),
+            PollPlan::Fill { volume: vol(42) },
+            "a volume two minutes old is simply the current one"
+        );
+    }
+
+    /// A re-listed directory returns everything every round; only what is new
+    /// gets fetched.
+    #[test]
+    fn an_already_ingested_chunk_is_not_selected_again() {
+        let p = primed(vol(42));
+        let listed: Vec<ChunkId> = (1..=3)
+            .map(|seq| {
+                ChunkId::parse("KTLX", vol(42), &format!("{VOLUME_TIME}-{seq:03}-I"))
+                    .expect("parses")
+            })
+            .collect();
+
+        let selected = p.select(&listed);
+        assert_eq!(
+            selected.iter().map(ChunkId::sequence).collect::<Vec<_>>(),
+            vec![1, 3],
+            "sequence 2 was already ingested by `primed`"
+        );
+    }
+
+    /// A directory the rotation has not yet cleared holds the previous pass's
+    /// chunks beside the new ones. Merging them would collide elevation numbers.
+    #[test]
+    fn a_leftover_from_the_previous_pass_is_not_selected() {
+        let p = primed(vol(42));
+        let stale = (volume_time() - chrono::Duration::days(3))
+            .format("%Y%m%d-%H%M%S")
+            .to_string();
+        let listed = vec![
+            ChunkId::parse("KTLX", vol(42), &format!("{VOLUME_TIME}-005-I")).expect("parses"),
+            ChunkId::parse("KTLX", vol(42), &format!("{stale}-006-I")).expect("parses"),
+        ];
+        assert_eq!(
+            p.select(&listed)
+                .iter()
+                .map(ChunkId::sequence)
+                .collect::<Vec<_>>(),
+            vec![5],
+        );
+    }
+
+    /// A listed-then-missing key is ordinary — S3 is eventually consistent and
+    /// the rotation retires keys — so it skips. Anything else ends the round,
+    /// which is what stops a 503 being read as an empty volume.
+    #[test]
+    fn a_missing_chunk_is_skipped_and_a_server_error_is_not() {
+        assert_eq!(
+            fetch_disposition(&ArchiveError::NotFound("k".into())),
+            FetchDisposition::Skip
+        );
+        assert_eq!(
+            fetch_disposition(&ArchiveError::Status {
+                status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                url: "u".into(),
+                body: None,
+            }),
+            FetchDisposition::Abort
+        );
+        assert_eq!(
+            fetch_disposition(&ArchiveError::MalformedListing("x".into())),
+            FetchDisposition::Abort
+        );
+    }
+
+    /// Backing off on quiet, not on error: an empty round is the ordinary state
+    /// between cuts and across the gap between volumes, and treating it as a
+    /// failure would retreat from a feed that is working perfectly.
+    #[test]
+    fn the_interval_backs_off_on_failure_and_on_quiet_but_not_on_progress() {
+        let mut p = ChunkPoller::new("KTLX");
+        assert_eq!(p.suggested_interval(), POLL_INTERVAL);
+
+        p.last_round_was_quiet = true;
+        assert_eq!(p.suggested_interval(), QUIET_INTERVAL);
+
+        p.last_round_was_quiet = false;
+        p.consecutive_failures = 1;
+        assert_eq!(p.suggested_interval(), POLL_INTERVAL * 2);
+        p.consecutive_failures = 3;
+        assert_eq!(p.suggested_interval(), POLL_INTERVAL * 8);
+        p.consecutive_failures = 99;
+        assert_eq!(
+            p.suggested_interval(),
+            MAX_BACKOFF,
+            "the backoff has to stop somewhere"
+        );
+
+        p.consecutive_failures = 0;
+        assert_eq!(p.suggested_interval(), POLL_INTERVAL);
+    }
+
     // -- live ---------------------------------------------------------------
     //
     // Run with:
@@ -1949,6 +2434,94 @@ mod tests {
             "sequence 1 must be the start chunk — it is the only carrier of the \
              coverage pattern"
         );
+    }
+
+    /// The poller end to end: discover, fill, seal.
+    ///
+    /// Two rounds a few seconds apart, which is the cadence the frontend will
+    /// drive. Prints the age of each cut's freshest radial at the moment it
+    /// became renderable — **the measurement the whole feature is for**, against
+    /// the archive path's five to seven minutes.
+    #[ignore = "hits the live unidata-nexrad-level2-chunks S3 bucket"]
+    #[tokio::test]
+    async fn live_a_few_poll_rounds_assemble_and_seal() {
+        let sources = crate::sources::DataSources::production();
+        crate::tls::init();
+        let mut poller = ChunkPoller::new("KTLX");
+
+        // Polled to a deadline rather than a fixed round count: a cut is 3 or 6
+        // chunks and the radar takes ~30-40 s over one, so a handful of rounds
+        // can legitimately seal nothing.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
+        let mut total_sealed = 0usize;
+        let mut round = 0;
+        while std::time::Instant::now() < deadline && total_sealed == 0 {
+            round += 1;
+            let outcome = poller.poll(&sources).await.expect("a poll round");
+            let progress = outcome.progress.clone().expect("a volume is being tracked");
+            println!(
+                "round {round}: volume {} | ingested {} | sealed {:?} | {} cuts so far | complete={} | next in {:?}",
+                poller.volume().expect("a volume").get(),
+                outcome.ingested,
+                outcome.sealed_elevations,
+                progress.sealed_elevations.len(),
+                progress.volume_complete,
+                poller.suggested_interval(),
+            );
+            for (elevation, angle) in outcome
+                .sealed_elevations
+                .iter()
+                .zip(outcome.sealed_angles.iter())
+            {
+                let scan = poller.snapshot().expect("a snapshot after a seal");
+                let age = scan
+                    .sweeps()
+                    .iter()
+                    .find(|s| s.elevation_number() == *elevation)
+                    .and_then(|s| s.radials().iter().map(|r| r.collection_timestamp()).max())
+                    .and_then(chrono::DateTime::from_timestamp_millis)
+                    .map(|t| (chrono::Utc::now() - t).num_seconds());
+                println!(
+                    "   elev {elevation} ({angle:.2}°) renderable, data age {}s",
+                    age.unwrap_or(-1)
+                );
+            }
+            total_sealed += outcome.sealed_elevations.len();
+            if total_sealed == 0 {
+                tokio::time::sleep(poller.suggested_interval()).await;
+            }
+        }
+
+        let progress = poller.progress().expect("a volume");
+        assert!(
+            total_sealed > 0,
+            "{round} rounds over 150s produced no complete cut; the feed is \
+             ingesting {} chunks but nothing ever seals",
+            progress.chunks_ingested
+        );
+        assert_eq!(
+            progress.late_radials_dropped, 0,
+            "radials arrived for a cut that had already sealed, which means \
+             elevation numbers repeat within a volume"
+        );
+        // Every sweep handed out is a full rotation.
+        if let Some(scan) = poller.snapshot() {
+            for sweep in scan.sweeps() {
+                let spacing = sweep
+                    .radials()
+                    .first()
+                    .map(|r| r.azimuth_spacing_degrees())
+                    .unwrap_or(1.0);
+                let expected = (360.0 / spacing).round() as usize;
+                assert!(
+                    sweep.radials().len() * 100 >= expected * MIN_SEALED_RADIAL_PERCENT,
+                    "elevation {} reached the snapshot with {}/{} radials",
+                    sweep.elevation_number(),
+                    sweep.radials().len(),
+                    expected
+                );
+            }
+        }
     }
 
     /// End to end: the start chunk decodes, and it is where the VCP comes from.

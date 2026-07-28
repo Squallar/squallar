@@ -403,6 +403,11 @@ mod tests {
         run_probe("tls::tests::probe_archive_list_files_installs_ring");
     }
 
+    #[test]
+    fn chunk_polling_installs_provider_in_a_fresh_process() {
+        run_probe("tls::tests::probe_chunk_poll_installs_ring");
+    }
+
     /// Fails if the `init()` call is removed from [`super::client`].
     #[test]
     #[ignore = "spawned by client_installs_provider_in_a_fresh_process"]
@@ -459,6 +464,28 @@ mod tests {
         assert!(
             super::default_is_ring(),
             "archive::list_files did not install ring before its first await"
+        );
+    }
+
+    /// The same pin for the real-time chunk feed. `ChunkPoller::poll` reaches
+    /// `archive::shared_client()` in its synchronous prologue for exactly this
+    /// reason; move that call after the first `.await` and merely polling the
+    /// future stops installing a provider, which is a panic for anyone who
+    /// reaches the poller without going through `scan::poll_chunks`.
+    #[test]
+    #[ignore = "spawned by chunk_polling_installs_provider_in_a_fresh_process"]
+    fn probe_chunk_poll_installs_ring() {
+        assert!(
+            !super::default_is_ring(),
+            "a provider was already installed before the probe ran; \
+             this probe is only meaningful in a fresh process"
+        );
+        let sources = crate::sources::DataSources::production();
+        let mut poller = crate::chunks::ChunkPoller::new("KTLX");
+        poll_once(poller.poll(&sources));
+        assert!(
+            super::default_is_ring(),
+            "ChunkPoller::poll did not install ring before its first await"
         );
     }
 }
