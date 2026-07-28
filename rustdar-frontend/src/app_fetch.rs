@@ -121,6 +121,18 @@ impl super::App {
             .get(site)
             .copied()
             .unwrap_or(0);
+        {
+            // VAD Wind Profile for NROT's wind-aided dealiasing.
+            let site = site.to_string();
+            self.spawn_async_task(self.channels.vwp_sender.clone(), async move {
+                let levels = scan::get_vwp_wind_levels(&site).await.unwrap_or_default();
+                crate::channels::VwpResponse {
+                    generation,
+                    site,
+                    levels,
+                }
+            });
+        }
         for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
             let Some(codes) = l3_product.level3_products() else {
                 continue;

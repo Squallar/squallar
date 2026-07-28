@@ -1,5 +1,6 @@
 pub mod archive;
 pub mod level3;
+pub mod nrot;
 mod palette;
 pub mod render;
 pub mod scan;

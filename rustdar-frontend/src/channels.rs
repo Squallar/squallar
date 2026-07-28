@@ -151,6 +151,15 @@ pub struct LoopRenderResponse {
 
 /// Centralized channel hub for all async communication between the App and
 /// background tasks (network fetches, radar rendering, etc.).
+/// The latest VAD Wind Profile levels for a site — (height km, u, v) —
+/// fetched alongside the Level III products; NROT renders pass them to
+/// `render_radar_to_image_with_winds`.
+pub struct VwpResponse {
+    pub generation: u64,
+    pub site: String,
+    pub levels: Vec<(f64, f64, f64)>,
+}
+
 pub struct ChannelHub {
     pub scan_sender: Sender<ScanResponse>,
     pub scan_receiver: Receiver<ScanResponse>,
@@ -168,6 +177,8 @@ pub struct ChannelHub {
     pub loop_scan_download_receiver: Receiver<LoopScanDownloadResponse>,
     pub loop_render_sender: Sender<LoopRenderResponse>,
     pub loop_render_receiver: Receiver<LoopRenderResponse>,
+    pub vwp_sender: Sender<VwpResponse>,
+    pub vwp_receiver: Receiver<VwpResponse>,
 }
 
 impl Default for ChannelHub {
@@ -186,6 +197,7 @@ impl ChannelHub {
         let (loop_scan_list_sender, loop_scan_list_receiver) = std::sync::mpsc::channel();
         let (loop_scan_download_sender, loop_scan_download_receiver) = std::sync::mpsc::channel();
         let (loop_render_sender, loop_render_receiver) = std::sync::mpsc::channel();
+        let (vwp_sender, vwp_receiver) = std::sync::mpsc::channel();
 
         Self {
             scan_sender,
@@ -204,6 +216,8 @@ impl ChannelHub {
             loop_scan_download_receiver,
             loop_render_sender,
             loop_render_receiver,
+            vwp_sender,
+            vwp_receiver,
         }
     }
 }

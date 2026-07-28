@@ -328,6 +328,24 @@ pub async fn get_adjacent_scan(
 // Level III product fetching
 // ---------------------------------------------------------------------------
 
+/// Fetch and parse the latest VAD Wind Profile (NVW) for a site into
+/// (height km, u, v) levels — the environmental wind reference NROT's
+/// dealiaser uses via [`crate::render::render_radar_to_image_with_winds`].
+/// `None` when the product is missing or carries no levels.
+pub async fn get_vwp_wind_levels(site: &str) -> Option<Vec<(f64, f64, f64)>> {
+    crate::tls::init();
+    let raw = crate::level3::fetch_latest_raw(
+        &crate::sources::DataSources::production(),
+        site,
+        "NVW",
+        chrono::Utc::now().naive_utc(),
+    )
+    .await
+    .ok()?;
+    let levels = crate::nrot::parse_nvw_wind_levels(&raw);
+    (!levels.is_empty()).then_some(levels)
+}
+
 /// Fetch the latest Level III product for a site. `product` is an AWIPS ID
 /// such as `"N0S"`; see [`crate::types::RadarProduct::level3_products`].
 pub async fn get_level3_product(

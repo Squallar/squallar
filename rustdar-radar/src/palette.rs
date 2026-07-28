@@ -119,7 +119,7 @@ fn velocity_lookup(velocity_ms: f32) -> (u8, u8, u8, u8) {
 
 /// Positive NROT is cyclonic, negative anticyclonic.
 fn nrot_lookup(nrot: f32) -> (u8, u8, u8, u8) {
-    if nrot.is_nan() || nrot.is_infinite() || nrot.abs() < 0.5 {
+    if nrot.is_nan() || nrot.is_infinite() || nrot.abs() < 0.25 {
         return (0, 0, 0, 0);
     }
     let (r, g, b) = if nrot > 0.0 {
@@ -369,24 +369,31 @@ static PRECIP_RATE: ColorScale = &(
     true,
 );
 
-/// NROT cyclonic / positive rotation (unitless).
+/// NROT cyclonic / positive rotation (unitless)
 static NROT_CYCLONIC: ColorScale = &(
     &[
-        (0.25, (0, 0, 255)),     // weak
-        (1.0, (0, 255, 0)),      // significant
-        (1.5, (255, 150, 0)),    // strong
-        (2.0, (255, 0, 0)),      // very strong
-        (2.5, (255, 141, 161)),  // extreme
-        (2.75, (255, 255, 255)), // oh fuck
+        (0.25, (64, 64, 128)), // weak: slate...
+        (0.999, (0, 0, 255)),  // ...to blue
+        (1.0, (0, 192, 0)),    // significant: green...
+        (1.499, (64, 255, 64)),
+        (1.5, (192, 192, 64)), // strong: olive to yellow
+        (1.999, (255, 255, 0)),
+        (2.0, (192, 64, 64)), // very strong: brick to red
+        (2.499, (255, 0, 0)),
+        (2.5, (255, 0, 255)), // extreme: solid magenta
+        (2.999, (255, 0, 255)),
+        (3.0, (255, 255, 255)), // off the chart: white
     ],
     true,
 );
 
-/// NROT anticyclonic / negative rotation (thresholds = abs values).
+/// NROT anticyclonic / negative rotation (thresholds = abs values)
 static NROT_ANTICYCLONIC: ColorScale = &(
     &[
-        (0.25, (0, 255, 128)), // weak
-        (1.0, (0, 255, 0)),    // significant
+        (0.25, (48, 96, 64)), // weak: dim green...
+        (0.999, (96, 192, 128)),
+        (1.0, (0, 160, 0)), // significant: green,
+        (2.0, (0, 255, 0)), // brightening and then solid
     ],
     true,
 );

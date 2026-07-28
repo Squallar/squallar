@@ -429,12 +429,17 @@ pub fn find_closest_elevation(
 
 /// Find the sweep whose first radial matches `elevation_angle` and carries the
 /// requested product's moment data.
+///
+/// Searched newest-first: SAILS volumes carry several cuts of the low tilts,
+/// minutes apart, and the last one in the scan is the most recent. GR2Analyst
+/// displays the newest cut too — cursor samples of its NROT correlate at 0.95
+/// with the matching cut and near zero with the stale ones.
 fn find_sweep(
     scan: &Scan,
     product: types::RadarProduct,
     elevation_angle: f32,
 ) -> Option<&[Radial]> {
-    scan.sweeps().iter().find_map(|sweep| {
+    scan.sweeps().iter().rev().find_map(|sweep| {
         let matches = sweep
             .radials()
             .first()
@@ -522,10 +527,26 @@ pub fn render_radar_to_image(
     radar_lat: f64,
     radar_lon: f64,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+    render_radar_to_image_with_winds(data, elevation_angle, product, radar_lat, radar_lon, None)
+}
+
+/// [`render_radar_to_image`] with an optional environmental wind profile —
+/// (height km, u, v) levels, e.g. from the RPG's NVW product via
+/// [`crate::nrot::parse_nvw_wind_levels`]. NROT's dealiaser uses it to settle
+/// fold branches the volume alone cannot (GR2Analyst's "Use Wind Profile");
+/// other products ignore it.
+pub fn render_radar_to_image_with_winds(
+    data: &Scan,
+    elevation_angle: f32,
+    product: types::RadarProduct,
+    radar_lat: f64,
+    radar_lon: f64,
+    wind_levels: Option<&[(f64, f64, f64)]>,
+) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     let radials = find_sweep(data, product, elevation_angle)?;
 
     if product == types::RadarProduct::NormalizedRotation {
-        return render_nrot_to_image(radials, radar_lat, radar_lon);
+        return render_nrot_to_image(data, radials, radar_lat, radar_lon, wind_levels);
     }
 
     let avg_azimuth_spacing = compute_azimuth_spacing(radials);
@@ -580,9 +601,11 @@ pub fn render_radar_to_image(
 /// velocity, normalized by range to remove beam broadening and scaled to a
 /// unitless field where >1.0 is significant and >2.5 extreme.
 fn render_nrot_to_image(
+    scan: &Scan,
     radials: &[Radial],
     radar_lat: f64,
     radar_lon: f64,
+    wind_levels: Option<&[(f64, f64, f64)]>,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     let num_radials = radials.len();
     if num_radials < 3 {
@@ -592,18 +615,26 @@ fn render_nrot_to_image(
     let vg = build_velocity_grid(radials)?;
 
     let actual_max_range = vg.first_gate_range_km + vg.gate_count as f64 * vg.gate_interval_km;
-    let azimuths_rad: Vec<f64> = vg.azimuths_deg.iter().map(|d| d.to_radians()).collect();
     let avg_spacing_deg = 360.0 / num_radials as f64;
 
-    let nrot_grid = compute_nrot_grid(
-        &vg.vel_grid,
-        vg.gate_count,
-        vg.first_gate_range_km,
-        vg.gate_interval_km,
-        &azimuths_rad,
+    let elevation_deg = radials
+        .first()
+        .map(|r| r.elevation_angle_degrees() as f64)
+        .unwrap_or(0.5);
+    let profile = wind_levels
+        .and_then(crate::nrot::WindProfile::from_levels)
+        .or_else(|| build_wind_profile(scan));
+    let nrot_grid = crate::nrot::compute_nrot_grid_with_profile(
+        &crate::nrot::VelocitySweep {
+            vel_grid: &vg.vel_grid,
+            azimuths_deg: &vg.azimuths_deg,
+            gate_count: vg.gate_count,
+            first_gate_range_km: vg.first_gate_range_km,
+            gate_interval_km: vg.gate_interval_km,
+        },
+        elevation_deg,
+        profile.as_ref(),
     );
-
-    let nrot_grid = filter_nrot_grid(&nrot_grid, vg.gate_count);
 
     let output = render_with_projection(
         radar_lat,
@@ -661,6 +692,34 @@ struct VelocityGrid {
     gate_interval_km: f64,
 }
 
+/// Fit the volume wind profile from every velocity tilt in the scan
+fn build_wind_profile(scan: &Scan) -> Option<crate::nrot::WindProfile> {
+    let mut builder = crate::nrot::WindProfileBuilder::new();
+    for sweep in scan.sweeps() {
+        let radials = sweep.radials();
+        let Some(first) = radials.first() else {
+            continue;
+        };
+        if first.velocity().is_none() || radials.len() < 3 {
+            continue;
+        }
+        let Some(vg) = build_velocity_grid(radials) else {
+            continue;
+        };
+        builder.add_sweep(
+            &crate::nrot::VelocitySweep {
+                vel_grid: &vg.vel_grid,
+                azimuths_deg: &vg.azimuths_deg,
+                gate_count: vg.gate_count,
+                first_gate_range_km: vg.first_gate_range_km,
+                gate_interval_km: vg.gate_interval_km,
+            },
+            first.elevation_angle_degrees() as f64,
+        );
+    }
+    builder.finish()
+}
+
 fn build_velocity_grid(radials: &[Radial]) -> Option<VelocityGrid> {
     let first_vel = radials.iter().find_map(|r| r.velocity())?;
     let gate_count = first_vel.gate_count() as usize;
@@ -693,163 +752,6 @@ fn build_velocity_grid(radials: &[Radial]) -> Option<VelocityGrid> {
         first_gate_range_km,
         gate_interval_km,
     })
-}
-
-/// Drop isolated noise: a gate survives only if at least `MIN_COHERENT` of its
-/// 24 neighbours (±2 azimuth × ±2 range, centre excluded) are non-NaN and share
-/// its sign. Noise has alternating signs; real rotation couplets are spatially
-/// coherent.
-fn filter_nrot_grid(nrot_grid: &[Vec<f64>], gate_count: usize) -> Vec<Vec<f64>> {
-    const HALF: i32 = 2;
-    const MIN_COHERENT: usize = 8;
-
-    let num_radials = nrot_grid.len() as i32;
-
-    (0..num_radials as usize)
-        .map(|i| {
-            (0..gate_count)
-                .map(|j| {
-                    let center = nrot_grid[i][j];
-                    if center.is_nan() {
-                        return f64::NAN;
-                    }
-                    let center_positive = center > 0.0;
-                    let mut count = 0usize;
-
-                    for da in -HALF..=HALF {
-                        let ai = ((i as i32 + da).rem_euclid(num_radials)) as usize;
-                        for dr in -HALF..=HALF {
-                            if da == 0 && dr == 0 {
-                                continue;
-                            }
-                            let rj = j as i32 + dr;
-                            if rj < 0 || rj >= gate_count as i32 {
-                                continue;
-                            }
-                            let v = nrot_grid[ai][rj as usize];
-                            if !v.is_nan() && (v > 0.0) == center_positive {
-                                count += 1;
-                            }
-                        }
-                    }
-
-                    if count >= MIN_COHERENT {
-                        center
-                    } else {
-                        f64::NAN
-                    }
-                })
-                .collect()
-        })
-        .collect()
-}
-
-/// Compute NROT via LLSD (Linear Least Squares Derivative): per gate, fit
-/// `V = a + b*θ` over the velocities within `NEIGHBORHOOD_KM`, where θ is the
-/// azimuthal offset in radians; `b / range` is azimuthal shear (1/s), scaled by
-/// `NROT_SCALE`.
-///
-/// Averaging over the ~50-100 gate pairs this reaches at typical ranges is why
-/// no separate pre- or post-smoothing is needed.
-fn compute_nrot_grid(
-    vel_grid: &[Vec<f64>],
-    gate_count: usize,
-    first_gate_range: f64,
-    gate_interval: f64,
-    azimuths_rad: &[f64],
-) -> Vec<Vec<f64>> {
-    const NROT_SCALE: f64 = 250.0;
-    const MIN_RANGE_KM: f64 = 10.0;
-    const NEIGHBORHOOD_KM: f64 = 2.0;
-    const MIN_POINTS: usize = 10;
-
-    let num_radials = vel_grid.len();
-    let rng_reach = (NEIGHBORHOOD_KM / gate_interval).ceil() as i32;
-
-    (0..num_radials)
-        .into_par_iter()
-        .map(|i| {
-            let center_az = azimuths_rad[i];
-
-            (0..gate_count)
-                .map(|j| {
-                    let range_km = first_gate_range + j as f64 * gate_interval;
-                    if range_km < MIN_RANGE_KM {
-                        return f64::NAN;
-                    }
-
-                    // Azimuths that fit in the neighborhood at this range.
-                    let az_spacing_rad = 2.0 * PI / num_radials as f64;
-                    let arc_per_az_km = range_km * az_spacing_rad;
-                    let az_reach = (NEIGHBORHOOD_KM / arc_per_az_km).ceil() as i32;
-
-                    let mut sum_t = 0.0_f64;
-                    let mut sum_v = 0.0_f64;
-                    let mut sum_t2 = 0.0_f64;
-                    let mut sum_tv = 0.0_f64;
-                    let mut n = 0usize;
-
-                    for da in -az_reach..=az_reach {
-                        let ai = ((i as i32 + da).rem_euclid(num_radials as i32)) as usize;
-                        let mut dtheta = azimuths_rad[ai] - center_az;
-                        if dtheta > PI {
-                            dtheta -= 2.0 * PI;
-                        }
-                        if dtheta < -PI {
-                            dtheta += 2.0 * PI;
-                        }
-
-                        let az_dist_km = (range_km * dtheta).abs();
-
-                        for dr in -rng_reach..=rng_reach {
-                            let rj = j as i32 + dr;
-                            if rj < 0 || rj >= gate_count as i32 {
-                                continue;
-                            }
-
-                            let rng_dist_km = (dr as f64 * gate_interval).abs();
-                            let dist_sq = az_dist_km * az_dist_km + rng_dist_km * rng_dist_km;
-                            if dist_sq > NEIGHBORHOOD_KM * NEIGHBORHOOD_KM {
-                                continue;
-                            }
-
-                            let v = vel_grid[ai][rj as usize];
-                            if v.is_nan() {
-                                continue;
-                            }
-
-                            sum_t += dtheta;
-                            sum_v += v;
-                            sum_t2 += dtheta * dtheta;
-                            sum_tv += dtheta * v;
-                            n += 1;
-                        }
-                    }
-
-                    if n < MIN_POINTS {
-                        return f64::NAN;
-                    }
-
-                    let nf = n as f64;
-                    let denom = nf * sum_t2 - sum_t * sum_t;
-                    // Well above f64 epsilon (~2.2e-16): rejects near-singular
-                    // systems before catastrophic cancellation.
-                    if denom.abs() < 1e-10 {
-                        return f64::NAN;
-                    }
-
-                    // slope = dV/dθ (m/s per radian)
-                    let slope = (nf * sum_tv - sum_t * sum_v) / denom;
-
-                    // azimuthal shear = slope / range (1/s)
-                    let range_m = range_km * 1000.0;
-                    let az_shear = slope / range_m;
-
-                    az_shear * NROT_SCALE
-                })
-                .collect()
-        })
-        .collect()
 }
 
 /// Render a Level III radial product, as [`render_radar_to_image`] does for a
@@ -1479,8 +1381,9 @@ mod tests {
         }
     }
 
-    /// A velocity field with enough azimuthal shear to survive the LLSD fit and
-    /// the coherence filter, so `render_nrot_to_image` actually paints.
+    /// A velocity field with enough azimuthal shear to survive the LLSD fit,
+    /// the range normalization, and the ±0.25 display threshold, so
+    /// `render_nrot_to_image` actually paints.
     fn nrot_scan(n_radials: usize) -> Scan {
         use nexrad_model::data::{
             MomentData, PulseWidth, RadialStatus, Sweep, VolumeCoveragePattern,
@@ -1577,7 +1480,7 @@ mod tests {
     /// L2 and L3 equivalents die to their `later_radial_wins` tests, which need
     /// two adjacent radials carrying known, very different values — NROT has no
     /// such handle, since every value is an LLSD fit over its neighbours and
-    /// the coherence filter deletes anything isolated enough to control. The
+    /// the median filter deletes anything isolated enough to control. The
     /// named fields are the mitigation: a transposition there has to be
     /// written out in full rather than slipped in as argument order.
     #[test]

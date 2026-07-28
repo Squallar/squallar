@@ -4,9 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rustdar_radar::level3::Level3Product;
-use rustdar_radar::render::{
-    render_derived_srm_to_image, render_level3_message_to_image, render_radar_to_image,
-};
+use rustdar_radar::render::{render_derived_srm_to_image, render_level3_message_to_image};
 use rustdar_radar::srm::{self, StormMotionSample};
 use rustdar_radar::types::RadarProduct;
 
@@ -266,6 +264,10 @@ pub struct RenderDispatcher {
     /// in: an insert that bypassed it would drop the storm motion vector on the
     /// floor, and the pane would render with another volume's.
     level3_data: HashMap<(RadarProduct, String, String), Arc<Level3Product>>,
+    /// Latest VAD Wind Profile levels per site — (height km, u, v). NROT
+    /// renders pass these to the winds-aware render entry so its dealiaser
+    /// settles fold branches the volume alone cannot.
+    pub vwp_levels: HashMap<String, Vec<(f64, f64, f64)>>,
     /// Generation counter to discard stale render results after a **full** reset.
     ///
     /// Bumped by [`reset_panes`](Self::reset_panes) only. Per-site resets abandon
@@ -332,6 +334,7 @@ impl RenderDispatcher {
         Self {
             pane_render: vec![PaneRenderState::new()],
             level3_data: HashMap::new(),
+            vwp_levels: HashMap::new(),
             render_generation: 0,
             fetch_generations: HashMap::new(),
             // Owned here so there is exactly one render budget counter in the process.
@@ -733,6 +736,7 @@ impl RenderDispatcher {
         data: Arc<nexrad_model::data::Scan>,
         sender: std::sync::mpsc::Sender<RenderResponse>,
         window: Option<WindowRef>,
+        winds: Option<Vec<(f64, f64, f64)>>,
     ) {
         let product = params.product;
         let elevation = params.elevation;
@@ -745,7 +749,14 @@ impl RenderDispatcher {
             elevation
         );
         self.spawn_render(pane_idx, product, elevation, sender, window, move || {
-            render_radar_to_image(&data, elevation, product, lat, lon)
+            rustdar_radar::render::render_radar_to_image_with_winds(
+                &data,
+                elevation,
+                product,
+                lat,
+                lon,
+                winds.as_deref(),
+            )
         });
     }
 
