@@ -34,11 +34,10 @@ pub fn rustdar_worker_main() -> Result<(), JsValue> {
 
     let scope = worker_scope()?;
     let handler_scope = scope.clone();
-    let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
-        move |event: web_sys::MessageEvent| {
+    let on_message =
+        Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
             handle_message(&handler_scope, &event.data());
-        },
-    );
+        });
     scope.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
     // Leaked deliberately, as `geolocation::start_watch` does: the handler must
     // outlive this call and lives exactly as long as the worker does.
@@ -129,11 +128,7 @@ fn post_result(
             transfer.push(&values.buffer());
             proto::set_field(&message, proto::IMAGE, &image);
             proto::set_field(&message, proto::VALUES, &values);
-            proto::set_field(
-                &message,
-                proto::MAX_RANGE,
-                &JsValue::from_f64(max_range_km),
-            );
+            proto::set_field(&message, proto::MAX_RANGE, &JsValue::from_f64(max_range_km));
         }
     }
     scope.post_message_with_transfer(&message, &transfer)

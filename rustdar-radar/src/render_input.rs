@@ -638,15 +638,7 @@ mod tests {
     const RADIALS: usize = 360;
 
     fn moment(scale: f32, offset: f32, byte: u8, gates: usize) -> MomentData {
-        MomentData::from_fixed_point(
-            gates as u16,
-            0,
-            250,
-            8,
-            scale,
-            offset,
-            vec![byte; gates],
-        )
+        MomentData::from_fixed_point(gates as u16, 0, 250, 8, scale, offset, vec![byte; gates])
     }
 
     /// One sweep at `elevation`, `RADIALS` radials spaced evenly from 0°.
@@ -815,8 +807,8 @@ mod tests {
             placeholder_coverage_pattern(),
             vec![sweep(0.5, Some(&strong_refl), Some(&shear))],
         );
-        let input = RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None)
-            .unwrap();
+        let input =
+            RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None).unwrap();
         let moment = input.sweeps[0].radials[0].moment.as_ref().unwrap();
         assert_eq!(moment.scale, REFL_SCALE);
         assert_eq!(moment.offset, REFL_OFFSET);
@@ -845,15 +837,9 @@ mod tests {
     #[test]
     fn nrot_carries_every_velocity_tilt_only_when_it_needs_them() {
         let scan = volume();
-        let without = RenderInput::extract(
-            &scan,
-            0.5,
-            RadarProduct::NormalizedRotation,
-            LAT,
-            LON,
-            None,
-        )
-        .unwrap();
+        let without =
+            RenderInput::extract(&scan, 0.5, RadarProduct::NormalizedRotation, LAT, LON, None)
+                .unwrap();
         assert_eq!(
             without.sweeps.len(),
             2,
@@ -863,8 +849,7 @@ mod tests {
         // A profile `WindProfile::from_levels` accepts: the extra tilts are
         // then dead weight, because `render_nrot_to_image` never fits from the
         // volume.
-        let levels: Vec<(f64, f64, f64)> =
-            (0..12).map(|i| (i as f64 * 0.3, 10.0, -5.0)).collect();
+        let levels: Vec<(f64, f64, f64)> = (0..12).map(|i| (i as f64 * 0.3, 10.0, -5.0)).collect();
         assert!(
             crate::nrot::WindProfile::from_levels(&levels).is_some(),
             "fixture profile must be one the renderer would accept"
@@ -878,7 +863,11 @@ mod tests {
             Some(&levels),
         )
         .unwrap();
-        assert_eq!(with.sweeps.len(), 1, "a usable profile makes the tilts dead weight");
+        assert_eq!(
+            with.sweeps.len(),
+            1,
+            "a usable profile makes the tilts dead weight"
+        );
 
         assert_same_frame(
             &render_radar_to_image_with_winds(
@@ -1019,9 +1008,10 @@ mod tests {
     #[test]
     fn an_absurd_length_does_not_reach_an_allocation() {
         let scan = volume();
-        let mut bytes = RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None)
-            .unwrap()
-            .to_bytes();
+        let mut bytes =
+            RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None)
+                .unwrap()
+                .to_bytes();
         // The sweep count sits directly after the header and the `u32::MAX`
         // wind marker.
         let at = 4 + 2 + 2 + 4 + 8 + 8 + 4;

@@ -45,11 +45,10 @@ pub fn attach() {
     };
 
     let on_message_worker = worker.clone();
-    let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
-        move |event: web_sys::MessageEvent| {
+    let on_message =
+        Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
             handle_message(&on_message_worker, &event.data());
-        },
-    );
+        });
     worker.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
     on_message.forget();
 
@@ -88,7 +87,9 @@ fn handle_message(worker: &web_sys::Worker, data: &JsValue) {
         }
         Some(proto::FATAL) => {
             let error = proto::string_field(data, proto::ERROR).unwrap_or_default();
-            log::warn!("rasterization worker failed to start ({error}); rendering on the main thread");
+            log::warn!(
+                "rasterization worker failed to start ({error}); rendering on the main thread"
+            );
             worker.terminate();
             offload::abandon_worker("the worker failed to start");
         }

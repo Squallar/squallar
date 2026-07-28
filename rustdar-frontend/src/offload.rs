@@ -334,11 +334,7 @@ pub fn worker_attached() -> bool {
 /// reference used to be the one the offloaded closure held. It is now the one
 /// `deliver` holds, kept alive by the pending map for exactly as long as the
 /// job is outstanding.
-pub fn offload_job(
-    name: &'static str,
-    job: Job,
-    deliver: impl FnOnce(JobResult) + Send + 'static,
-) {
+pub fn offload_job(name: &'static str, job: Job, deliver: impl FnOnce(JobResult) + Send + 'static) {
     let request = match job {
         Job::Described(request) => request,
         // Nothing to post. This is the same `offload` the opaque callers use
@@ -565,11 +561,16 @@ mod tests {
         let posted = attach(true);
         let ran = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&ran);
-        offload_job("test", Job::Described(a_job()), move |_| flag.store(true, Ordering::Relaxed));
+        offload_job("test", Job::Described(a_job()), move |_| {
+            flag.store(true, Ordering::Relaxed)
+        });
 
         assert_eq!(posted.lock().unwrap().len(), 1, "the job should be posted");
         assert_eq!(jobs_in_worker(), 1);
-        assert!(!ran.load(Ordering::Relaxed), "deliver must wait for a reply");
+        assert!(
+            !ran.load(Ordering::Relaxed),
+            "deliver must wait for a reply"
+        );
 
         let id = posted.lock().unwrap()[0].0;
         deliver_worker_reply(id, None);
@@ -599,11 +600,14 @@ mod tests {
 
         wanted.store(false, Ordering::Relaxed);
         let id = posted.lock().unwrap()[0].0;
-        deliver_worker_reply(id, Some(RenderedFrame {
-            image: vec![0; 4],
-            max_range_km: 230.0,
-            values: vec![f32::NAN],
-        }));
+        deliver_worker_reply(
+            id,
+            Some(RenderedFrame {
+                image: vec![0; 4],
+                max_range_km: 230.0,
+                values: vec![f32::NAN],
+            }),
+        );
 
         assert!(rx.try_recv().is_err(), "an abandoned render must not send");
         assert_eq!(
