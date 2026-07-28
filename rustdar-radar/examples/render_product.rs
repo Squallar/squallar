@@ -22,6 +22,7 @@ fn main() {
         "phi" => RadarProduct::DifferentialPhase,
         "nrot" => RadarProduct::NormalizedRotation,
         "eti" => RadarProduct::EchoTopsInterpolated,
+        "vild" => RadarProduct::VilDensity,
         other => panic!("unknown product {other}"),
     };
     let out = args.next().expect(usage);

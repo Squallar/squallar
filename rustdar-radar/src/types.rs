@@ -233,6 +233,7 @@ pub enum RadarProduct {
     EchoTops,
     EchoTopsInterpolated,
     VerticallyIntegratedLiquid,
+    VilDensity,
     HydrometeorClassification,
     PrecipitationRate,
     NormalizedRotation,
@@ -252,6 +253,7 @@ impl RadarProduct {
             RadarProduct::EchoTops => "eet",
             RadarProduct::EchoTopsInterpolated => "eti",
             RadarProduct::VerticallyIntegratedLiquid => "vil",
+            RadarProduct::VilDensity => "vild",
             RadarProduct::HydrometeorClassification => "hhc",
             RadarProduct::PrecipitationRate => "dpr",
             RadarProduct::NormalizedRotation => "nrot",
@@ -271,6 +273,7 @@ impl RadarProduct {
             RadarProduct::EchoTops => "Echo Tops",
             RadarProduct::EchoTopsInterpolated => "Echo Tops (Interp)",
             RadarProduct::VerticallyIntegratedLiquid => "Vertically Integrated Liquid",
+            RadarProduct::VilDensity => "VIL Density",
             RadarProduct::HydrometeorClassification => "Hydrometeor Classification",
             RadarProduct::PrecipitationRate => "Precipitation Rate",
             RadarProduct::NormalizedRotation => "Normalized Rotation",
@@ -290,6 +293,7 @@ impl RadarProduct {
             RadarProduct::EchoTops,
             RadarProduct::EchoTopsInterpolated,
             RadarProduct::VerticallyIntegratedLiquid,
+            RadarProduct::VilDensity,
             RadarProduct::HydrometeorClassification,
             RadarProduct::PrecipitationRate,
             RadarProduct::NormalizedRotation,
@@ -311,8 +315,9 @@ impl RadarProduct {
             RadarProduct::EchoTops => 9,
             RadarProduct::EchoTopsInterpolated => 10,
             RadarProduct::VerticallyIntegratedLiquid => 11,
-            RadarProduct::HydrometeorClassification => 12,
-            RadarProduct::PrecipitationRate => 13,
+            RadarProduct::VilDensity => 12,
+            RadarProduct::HydrometeorClassification => 13,
+            RadarProduct::PrecipitationRate => 14,
         }
     }
 
@@ -380,6 +385,7 @@ impl RadarProduct {
             RadarProduct::HydrometeorClassification => 12,
             RadarProduct::PrecipitationRate => 13,
             RadarProduct::NormalizedRotation => 14,
+            RadarProduct::VilDensity => 15,
         }
     }
 
@@ -402,6 +408,7 @@ impl RadarProduct {
             12 => RadarProduct::HydrometeorClassification,
             13 => RadarProduct::PrecipitationRate,
             14 => RadarProduct::NormalizedRotation,
+            15 => RadarProduct::VilDensity,
             _ => return None,
         };
         debug_assert_eq!(product.wire_code(), code);
@@ -429,6 +436,9 @@ impl RadarProduct {
             // tying availability to the reflectivity moment lists it alongside
             // the reflectivity tilts (the rendered field is tilt-independent).
             RadarProduct::EchoTopsInterpolated => Some(MomentSlot::Reflectivity),
+            // VIL density integrates the whole reflectivity volume twice over
+            // (local VIL divided by local echo tops), so it lists the same way.
+            RadarProduct::VilDensity => Some(MomentSlot::Reflectivity),
             // Level III products. No Level II moment stands behind them.
             RadarProduct::StormRelativeVelocity
             | RadarProduct::SpecificDifferentialPhase
@@ -472,6 +482,7 @@ impl RadarProduct {
                 )
             }
             RadarProduct::VerticallyIntegratedLiquid => format!("VIL: {:.1} kg/m²", value),
+            RadarProduct::VilDensity => format!("VIL Density: {:.2} g/m³", value),
             RadarProduct::HydrometeorClassification => {
                 let class = match value as u16 {
                     0..=9 => "No Data",
@@ -518,6 +529,7 @@ impl RadarProduct {
                 prefs.height.kilo_suffix()
             }
             RadarProduct::VerticallyIntegratedLiquid => "kg/m\u{00b2}",
+            RadarProduct::VilDensity => "g/m\u{00b3}",
             RadarProduct::HydrometeorClassification => "HHC",
             RadarProduct::PrecipitationRate => prefs.precip_rate.suffix(),
             RadarProduct::NormalizedRotation => "NROT",

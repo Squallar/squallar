@@ -597,6 +597,10 @@ pub fn render_radar_to_image_with_winds(
         return render_echo_tops_interp_to_image(data, radar_lat, radar_lon);
     }
 
+    if product == types::RadarProduct::VilDensity {
+        return render_vil_density_to_image(data, radar_lat, radar_lon);
+    }
+
     let radials = find_sweep(data, product, elevation_angle)?;
 
     if product == types::RadarProduct::NormalizedRotation {
@@ -824,6 +828,45 @@ pub fn render_echo_tops_interp_to_image(
         radar_lon,
         max_range,
         types::RadarProduct::EchoTopsInterpolated,
+        "Radar",
+        |proj, bufs| {
+            grid.values.par_iter().enumerate().for_each(|(az, row)| {
+                let ctx = RadialContext::new(az as f64 + 0.5, 0.5);
+                for (r, v) in row.iter().enumerate() {
+                    if v.is_nan() {
+                        continue;
+                    }
+                    let from = GateId {
+                        radial: az,
+                        gate: r,
+                    };
+                    proj.render_gate(bufs, &ctx, r as f64 + 0.5, 1.0, *v, from);
+                }
+            });
+        },
+    );
+    Some(output)
+}
+
+/// Render VIL density: local Digital VIL over local echo tops
+/// ([`crate::vil::compute_vil_density`]), a 1° × 1 km polar grid in g/m³
+/// painted with the VIL-density palette. Tilt-independent — every elevation
+/// request renders the same volume product. The site height the echo top's
+/// MSL datum needs comes from the nearest-site table, as the EET render
+/// path's does.
+pub fn render_vil_density_to_image(
+    scan: &Scan,
+    radar_lat: f64,
+    radar_lon: f64,
+) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+    let radar_height_ft = crate::eet::radar_height_ft_near(radar_lat, radar_lon);
+    let grid = crate::vil::compute_vil_density(scan, radar_height_ft);
+    let max_range = grid.range_bins as f64;
+    let output = render_with_projection(
+        radar_lat,
+        radar_lon,
+        max_range,
+        types::RadarProduct::VilDensity,
         "Radar",
         |proj, bufs| {
             grid.values.par_iter().enumerate().for_each(|(az, row)| {

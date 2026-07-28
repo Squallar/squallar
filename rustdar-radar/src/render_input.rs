@@ -123,6 +123,9 @@ impl RenderInput {
             // reflectivity volume. `VolumeCube::build` dedups same-elevation
             // cuts in encounter order, which is why the original order is kept.
             RadarProduct::EchoTopsInterpolated => true,
+            // Same shape: VIL density is local VIL over local echo tops,
+            // both integrals of the whole reflectivity volume.
+            RadarProduct::VilDensity => true,
             // The selected sweep rasterizes, but `build_wind_profile` fits the
             // volume profile from every velocity tilt — and only when the
             // caller's levels do not already yield a profile. Asking
@@ -718,6 +721,7 @@ mod tests {
             RadarProduct::Velocity,
             RadarProduct::NormalizedRotation,
             RadarProduct::EchoTopsInterpolated,
+            RadarProduct::VilDensity,
         ] {
             let direct =
                 render_radar_to_image_with_winds(&scan, 0.5, product, LAT, LON, None).unwrap();
@@ -742,6 +746,7 @@ mod tests {
             RadarProduct::Velocity,
             RadarProduct::NormalizedRotation,
             RadarProduct::EchoTopsInterpolated,
+            RadarProduct::VilDensity,
         ] {
             let input = RenderInput::extract(&scan, 0.5, product, LAT, LON, None).unwrap();
             let decoded = RenderInput::from_bytes(&input.to_bytes())
@@ -1015,6 +1020,7 @@ mod tests {
             RadarProduct::HydrometeorClassification,
             RadarProduct::PrecipitationRate,
             RadarProduct::NormalizedRotation,
+            RadarProduct::VilDensity,
         ];
         let mut seen = std::collections::HashSet::new();
         for product in products {

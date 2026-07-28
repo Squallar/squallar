@@ -88,6 +88,13 @@ pub fn get_color_for_value(product: RadarProduct, value: f32) -> (u8, u8, u8, u8
             let (r, g, b) = scale_color(VIL, value);
             (r, g, b, TRANSPARENCY)
         }
+        RadarProduct::VilDensity => {
+            if value < 0.5 {
+                return (0, 0, 0, 0);
+            }
+            let (r, g, b) = scale_color(VIL_DENSITY, value);
+            (r, g, b, TRANSPARENCY)
+        }
         RadarProduct::HydrometeorClassification => {
             if value < 10.0 {
                 return (0, 0, 0, 0);
@@ -329,6 +336,29 @@ static VIL: ColorScale = &(
     true,
 );
 
+/// VIL Density (g/m³). Authored NWS-style around the operational hail
+/// scale: Amburn & Wolf (1997, *Wea. Forecasting* 12, 473–478) found severe
+/// hail rare below 3.5 g/m³ and near-universal at 4.0 and above, and the
+/// NWS WDTD training scale runs interest from ~0.5 to 4.5+. Cool colors
+/// below the significance break, the warm ramp igniting at 3.0 and hitting
+/// red exactly at Amburn & Wolf's 4.0.
+static VIL_DENSITY: ColorScale = &(
+    &[
+        (0.5, (100, 100, 100)), // dispatcher renders < 0.5 transparent
+        (1.0, (0, 100, 255)),
+        (1.5, (0, 200, 255)),
+        (2.0, (0, 200, 0)),
+        (2.5, (0, 150, 0)),
+        (3.0, (255, 255, 0)),
+        (3.5, (255, 130, 0)), // below here severe hail is rare
+        (4.0, (255, 0, 0)),   // at and above, nearly every storm severe
+        (4.5, (200, 0, 0)),
+        (5.0, (255, 0, 255)),
+        (6.0, (255, 255, 255)),
+    ],
+    true,
+);
+
 /// Hydrometeor Classification. Categorical: thresholds are the ICD class
 /// codes, 0 = ND.
 static HHC: ColorScale = &(
@@ -468,6 +498,7 @@ pub fn get_legend_scale(product: RadarProduct) -> LegendScale {
         RadarProduct::SpecificDifferentialPhase => extract_scale(KDP),
         RadarProduct::EchoTops | RadarProduct::EchoTopsInterpolated => extract_scale(ECHO_TOPS),
         RadarProduct::VerticallyIntegratedLiquid => extract_scale(VIL),
+        RadarProduct::VilDensity => extract_scale(VIL_DENSITY),
         RadarProduct::HydrometeorClassification => extract_scale(HHC),
         RadarProduct::PrecipitationRate => extract_scale(PRECIP_RATE),
         RadarProduct::NormalizedRotation => {
@@ -504,6 +535,7 @@ mod tests {
             RadarProduct::DifferentialPhase,
             RadarProduct::SpecificDifferentialPhase,
             RadarProduct::NormalizedRotation,
+            RadarProduct::VilDensity,
         ];
         for product in products {
             for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {

@@ -138,8 +138,8 @@
 //!   early-stop rule nothing undocumented was chased.
 //!
 //! Product 134 therefore **stays a Level III fetch**; this module ships as
-//! the local input to VIL density (which has no Level III twin anywhere)
-//! with that provenance documented.
+//! the local input to [`compute_vil_density`] (VIL density has no Level III
+//! twin anywhere) with that provenance documented.
 
 use crate::types::RadarProduct;
 use crate::volumetric::{
@@ -353,6 +353,65 @@ fn compute_vil_impl(scan: &Scan, opts: VilOptions) -> VolumetricGrid {
             }
         }
     }
+    VolumetricGrid {
+        values,
+        range_bins: RANGE_BINS,
+    }
+}
+
+/// One kilofoot in metres, exactly: 1000 ft · 0.3048 m/ft.
+const KFT_TO_M: f32 = 304.8;
+
+/// VIL density for one cell, g/m³, per Amburn & Wolf (1997, *Weather and
+/// Forecasting* 12, 473–478): `VILD = 1000 · VIL / ET` with VIL in kg/m²
+/// and the echo top in **metres** — the paper divides the WSR-88D VIL
+/// product by the WSR-88D echo-top product's height as published, so the
+/// height here is the ET product's own kft-above-MSL convention, converted
+/// to metres. `NaN` when either input is undefined (or a non-positive top,
+/// which MSL heights at real sites never produce).
+pub fn vil_density_g_m3(vil_kg_m2: f32, echo_top_kft_msl: f32) -> f32 {
+    if !vil_kg_m2.is_finite() || !echo_top_kft_msl.is_finite() || echo_top_kft_msl <= 0.0 {
+        return f32::NAN;
+    }
+    1000.0 * vil_kg_m2 / (echo_top_kft_msl * KFT_TO_M)
+}
+
+/// VIL density over the volume: [`compute_vil`]'s field divided by
+/// [`crate::eet::compute_eet`]'s, cell for cell, per [`vil_density_g_m3`].
+///
+/// Both inputs are the local Level II derivations — there is no Level III
+/// VIL-density product anywhere to fetch or to validate against, so this
+/// product is **validated by construction** from its two inputs: VIL's twin
+/// survey verdict (misses the campaign bar, DQA residual — see the module
+/// doc) and EET's (the same, recorded in [`crate::eet`]) are the product's
+/// provenance. Amburn & Wolf's thresholds still apply to it operationally:
+/// below 3.5 g/m³ severe hail is rare, at 4.0 and above nearly universal.
+///
+/// `radar_height_ft` is the site height above MSL in feet
+/// ([`crate::eet::radar_height_ft_near`] for a render); it enters only
+/// through the echo top's MSL datum, exactly as the paper's use of the ET
+/// product implies. At high-elevation sites the MSL top overstates the
+/// column's physical depth by the site elevation and VILD reads
+/// correspondingly low — the paper's own convention, kept rather than
+/// corrected, so the numbers stay comparable to the operational literature.
+///
+/// A cell is defined only where **both** inputs are: a weak-echo column
+/// carries VIL 0.0 but no 18.3 dBZ echo top, so it is `NaN` here, not 0.
+pub fn compute_vil_density(scan: &Scan, radar_height_ft: f64) -> VolumetricGrid {
+    let vil = compute_vil(scan);
+    let eet = crate::eet::compute_eet(scan, radar_height_ft);
+    let values = vil
+        .values
+        .iter()
+        .zip(&eet.values)
+        .map(|(vil_row, et_row)| {
+            vil_row
+                .iter()
+                .zip(et_row)
+                .map(|(&v, &et)| vil_density_g_m3(v, et))
+                .collect()
+        })
+        .collect();
     VolumetricGrid {
         values,
         range_bins: RANGE_BINS,
@@ -788,6 +847,50 @@ mod tests {
             "got {} — the repeat's reflectivity leaked into the sum",
             grid.values[61][30],
         );
+    }
+
+    /// Amburn & Wolf's formula against hand-computed pairs: 20 kg/m² over a
+    /// 10 km top (32.8084 kft = 10,000 m) is exactly 2.0 g/m³, and 35 kg/m²
+    /// over the same top is their 3.5 g/m³ severe-hail break. `NaN` in
+    /// either slot, or a non-positive top, is `NaN` out.
+    #[test]
+    fn vil_density_reproduces_the_amburn_wolf_pairs() {
+        assert!((vil_density_g_m3(20.0, 32.8084) - 2.0).abs() < 1e-5);
+        assert!((vil_density_g_m3(35.0, 32.8084) - 3.5).abs() < 1e-5);
+        // One kilofoot of top: 1000·VIL/304.8.
+        assert!((vil_density_g_m3(1.0, 1.0) - 3.280_84).abs() < 1e-4);
+
+        assert!(vil_density_g_m3(f32::NAN, 32.8).is_nan(), "undefined VIL");
+        assert!(vil_density_g_m3(20.0, f32::NAN).is_nan(), "undefined top");
+        assert!(vil_density_g_m3(f32::NAN, f32::NAN).is_nan());
+        assert!(vil_density_g_m3(20.0, 0.0).is_nan(), "a zero top divides");
+        assert!(vil_density_g_m3(20.0, -1.0).is_nan());
+        assert!(vil_density_g_m3(f32::INFINITY, 32.8).is_nan());
+    }
+
+    /// The volume product wires the two derivations together: on the golden
+    /// scan's topped 50 dBZ column (az 10, r 30) VIL is 5.157956 kg/m² and
+    /// the echo top (radar at 0 ft MSL) is the 3.5° beam centre at 30.5 km,
+    /// 6.306813 kft — VILD = 1000·5.157956/(6.306813·304.8) =
+    /// **2.683198 g/m³**. Columns where either input is undefined are `NaN`:
+    /// az 45 carries VIL (a defined 0.0-ish weak column) but no echo top,
+    /// az 50 carries neither.
+    #[test]
+    fn vil_density_composes_the_two_derivations() {
+        let grid = compute_vil_density(&golden_scan(), 0.0);
+        assert_eq!(grid.range_bins, RANGE_BINS);
+        let r = 30;
+        assert!(
+            (grid.values[10][r] - 2.683_198).abs() < 1e-4,
+            "topped core column: got {}",
+            grid.values[10][r],
+        );
+        assert!(
+            grid.values[45][r].is_nan(),
+            "VIL defined but no echo top: VILD must be NaN, not 0",
+        );
+        assert!(grid.values[50][r].is_nan(), "a censored column");
+        assert!(grid.values[10][GATES].is_nan(), "beyond the data extent");
     }
 
     /// The A/B knobs really vary the conventions they name: on a uniform
