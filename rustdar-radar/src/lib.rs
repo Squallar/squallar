@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod eet;
 pub(crate) mod l3_values;
 pub mod level3;
 pub mod nrot;
