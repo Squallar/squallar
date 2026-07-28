@@ -133,6 +133,36 @@ impl super::App {
                 }
             });
         }
+        {
+            // Environmental 0 °C / −20 °C heights for the hail products.
+            // TTL-gated, unlike the VWP fetch above: Open-Meteo serves hourly
+            // model rows, so refetching on every poll would re-download the
+            // same numbers. Stale-or-missing is the only trigger, and a failed
+            // fetch stores nothing, so the gate retries it next poll.
+            let now = chrono::Utc::now();
+            let fresh = self
+                .render
+                .env_heights
+                .get(site)
+                .is_some_and(|h| !h.is_stale(now));
+            if !fresh && let Some(radar) = rustdar_radar::sites::get_radar_site(site) {
+                let (lat, lon) = (radar.lat, radar.lon);
+                let site = site.to_string();
+                self.spawn_async_task(self.channels.sounding_sender.clone(), async move {
+                    let heights = rustdar_radar::sounding::fetch_env_heights(
+                        &rustdar_radar::sources::DataSources::production(),
+                        lat,
+                        lon,
+                    )
+                    .await;
+                    crate::channels::SoundingResponse {
+                        generation,
+                        site,
+                        heights,
+                    }
+                });
+            }
+        }
         for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
             let Some(codes) = l3_product.level3_products() else {
                 continue;

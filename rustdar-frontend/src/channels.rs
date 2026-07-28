@@ -160,6 +160,20 @@ pub struct VwpResponse {
     pub levels: Vec<(f64, f64, f64)>,
 }
 
+/// The environmental 0 °C / −20 °C heights over a site, from Open-Meteo —
+/// fetched beside the VWP when a scan loads, but TTL-gated (see
+/// [`rustdar_radar::sounding::ENV_HEIGHTS_TTL`]) rather than refetched every
+/// poll. Staged for the hail products, which will read them off
+/// `RenderDispatcher::env_heights`.
+pub struct SoundingResponse {
+    pub generation: u64,
+    pub site: String,
+    /// `None` when the fetch or parse failed. The receiver keeps whatever it
+    /// already holds for the site — a stale environment beats none, and the
+    /// TTL gate retries on the next poll.
+    pub heights: Option<rustdar_radar::sounding::EnvHeights>,
+}
+
 pub struct ChannelHub {
     pub scan_sender: Sender<ScanResponse>,
     pub scan_receiver: Receiver<ScanResponse>,
@@ -179,6 +193,8 @@ pub struct ChannelHub {
     pub loop_render_receiver: Receiver<LoopRenderResponse>,
     pub vwp_sender: Sender<VwpResponse>,
     pub vwp_receiver: Receiver<VwpResponse>,
+    pub sounding_sender: Sender<SoundingResponse>,
+    pub sounding_receiver: Receiver<SoundingResponse>,
 }
 
 impl Default for ChannelHub {
@@ -198,6 +214,7 @@ impl ChannelHub {
         let (loop_scan_download_sender, loop_scan_download_receiver) = std::sync::mpsc::channel();
         let (loop_render_sender, loop_render_receiver) = std::sync::mpsc::channel();
         let (vwp_sender, vwp_receiver) = std::sync::mpsc::channel();
+        let (sounding_sender, sounding_receiver) = std::sync::mpsc::channel();
 
         Self {
             scan_sender,
@@ -218,6 +235,8 @@ impl ChannelHub {
             loop_render_receiver,
             vwp_sender,
             vwp_receiver,
+            sounding_sender,
+            sounding_receiver,
         }
     }
 }

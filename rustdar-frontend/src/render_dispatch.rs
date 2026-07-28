@@ -268,6 +268,15 @@ pub struct RenderDispatcher {
     /// renders pass these to the winds-aware render entry so its dealiaser
     /// settles fold branches the volume alone cannot.
     pub vwp_levels: HashMap<String, Vec<(f64, f64, f64)>>,
+    /// Environmental 0 °C / −20 °C heights per site, from Open-Meteo — staged
+    /// for the hail products, which will read them at render time. Written by
+    /// the sounding drain in `app_render`; read back by
+    /// `spawn_level3_fetches`'s TTL gate, which refetches on poll only once
+    /// [`rustdar_radar::sounding::EnvHeights::is_stale`] says the entry has
+    /// aged out. Like [`vwp_levels`](Self::vwp_levels), survives both reset
+    /// paths: the environment does not change because a pane was reset, and
+    /// the TTL is the eviction policy.
+    pub env_heights: HashMap<String, rustdar_radar::sounding::EnvHeights>,
     /// Generation counter to discard stale render results after a **full** reset.
     ///
     /// Bumped by [`reset_panes`](Self::reset_panes) only. Per-site resets abandon
@@ -335,6 +344,7 @@ impl RenderDispatcher {
             pane_render: vec![PaneRenderState::new()],
             level3_data: HashMap::new(),
             vwp_levels: HashMap::new(),
+            env_heights: HashMap::new(),
             render_generation: 0,
             fetch_generations: HashMap::new(),
             // Owned here so there is exactly one render budget counter in the process.
