@@ -427,29 +427,53 @@ pub fn find_closest_elevation(
         .min_by(|a, b| ((*a - target_elevation).abs()).total_cmp(&((*b - target_elevation).abs())))
 }
 
-/// Find the sweep whose first radial matches `elevation_angle` and carries the
-/// requested product's moment data.
+/// Find the newest sweep in `elevation_angle`'s tilt *family* that carries
+/// the requested product's moment data.
 ///
 /// Searched newest-first: SAILS volumes carry several cuts of the low tilts,
-/// minutes apart, and the last one in the scan is the most recent. GR2Analyst
-/// displays the newest cut too — cursor samples of its NROT correlate at 0.95
-/// with the matching cut and near zero with the stale ones.
+/// minutes apart, and the last one in the scan is the most recent. The
+/// reference display shows the newest cut too — cursor samples of its NROT
+/// correlate at 0.95 with the matching cut and near zero with the stale ones.
+///
+/// The window is a wide 0.3° rather than an exact match because split-cut
+/// surveillance sweeps drift well off the nominal tilt (0.32°/0.63° cuts for
+/// a requested 0.5°), and they carry the full-range reflectivity and dual-pol
+/// fields. Doppler cuts sit within 0.05° of nominal, so velocity-family
+/// products keep picking the same sweep they always did.
+///
+/// Within the family, non-Doppler products prefer the newest sweep *without*
+/// a velocity moment: a split cut's Doppler half repeats a short-range copy
+/// of the surveillance moments, and the reference display draws reflectivity
+/// from the surveillance half (measured on a KLOT SAILS volume: the 0.63°
+/// surveillance cut's painted mask matches the reference at IoU 0.73 /
+/// area ratio 0.98, against 0.69 / 0.89 for the newer 0.53° Doppler cut).
+/// Upper tilts are single merged cuts carrying everything, so the preference
+/// falls back to any sweep with the product's moment.
 fn find_sweep(
     scan: &Scan,
     product: types::RadarProduct,
     elevation_angle: f32,
 ) -> Option<&[Radial]> {
-    scan.sweeps().iter().rev().find_map(|sweep| {
-        let matches = sweep
-            .radials()
-            .first()
-            .map(|r| {
-                let rounded = (r.elevation_angle_degrees() * 10.0).round() / 10.0;
-                (rounded - elevation_angle).abs() < 0.05 && product.get_moment(r).is_some()
-            })
-            .unwrap_or(false);
-        matches.then(|| sweep.radials())
-    })
+    let newest = |surveillance_only: bool| {
+        scan.sweeps().iter().rev().find_map(|sweep| {
+            let matches = sweep
+                .radials()
+                .first()
+                .map(|r| {
+                    (r.elevation_angle_degrees() - elevation_angle).abs() < 0.3
+                        && product.get_moment(r).is_some()
+                        && !(surveillance_only && r.velocity().is_some())
+                })
+                .unwrap_or(false);
+            matches.then(|| sweep.radials())
+        })
+    };
+    match product {
+        types::RadarProduct::Velocity
+        | types::RadarProduct::SpectrumWidth
+        | types::RadarProduct::NormalizedRotation => newest(false),
+        _ => newest(true).or_else(|| newest(false)),
+    }
 }
 
 /// Average azimuth spacing (degrees) between consecutive Level II radials.
