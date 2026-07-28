@@ -148,6 +148,19 @@ pub trait PlatformBridge {
     /// which has no path to return.
     fn config_store(&self) -> Option<Box<dyn rustdar_egui::config_store::ConfigStore>>;
 
+    /// This device's IANA timezone name, e.g. `"America/Denver"`.
+    ///
+    /// Used to pick a starting radar site on a first run, before any
+    /// configuration exists and without asking for a location permission. See
+    /// [`crate::location_hint`] for what that buys and what it does not.
+    ///
+    /// The default is `None`, which leaves the caller on its compiled-in
+    /// default. A platform that cannot answer is not an error — it is a platform
+    /// where the old behaviour stands.
+    fn iana_timezone(&self) -> Option<String> {
+        None
+    }
+
     /// Request application exit. Returns `true` if the platform requires
     /// `std::process::exit` (Android), `false` for normal event-loop exit.
     fn needs_process_exit(&self) -> bool;

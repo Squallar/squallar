@@ -94,6 +94,10 @@ impl PlatformBridge for WebPlatform {
             .map(|store| Box::new(store) as Box<dyn rustdar_egui::config_store::ConfigStore>)
     }
 
+    fn iana_timezone(&self) -> Option<String> {
+        crate::geolocation::browser_timezone()
+    }
+
     /// There is no process to exit; the event loop stopping is all there is.
     fn needs_process_exit(&self) -> bool {
         false

@@ -4138,6 +4138,7 @@ version = "0.1.0"
 dependencies = [
  "dark-light",
  "env_logger",
+ "iana-time-zone",
  "log",
  "pollster",
  "rustdar-egui",

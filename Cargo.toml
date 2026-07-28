@@ -43,6 +43,7 @@ nexrad-decode = "=1.0.0-rc.3"
 nexrad-model = "=1.0.0-rc.2"
 
 chrono = "=0.4.45"
+iana-time-zone = "=0.1.65"
 flate2 = "=1.1.9"
 
 jni = "=0.22.4"

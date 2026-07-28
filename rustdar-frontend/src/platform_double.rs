@@ -99,6 +99,10 @@ pub(crate) struct TestBridge {
     gps_fix_receiver: Option<Receiver<rustdar_gps::GpsFix>>,
     heading_receiver: Option<Receiver<f32>>,
     gps: GpsRecord,
+    /// What `iana_timezone` answers. `None` stands for the platforms and
+    /// environments that cannot say — a container with no zone configured, or a
+    /// browser too old for `Intl` — where the app must keep its own default.
+    timezone: Option<String>,
 }
 
 impl TestBridge {
@@ -118,6 +122,7 @@ impl TestBridge {
             gps_fix_receiver: None,
             heading_receiver: None,
             gps: Rc::new(RefCell::new(None)),
+            timezone: None,
         }
     }
 
@@ -163,6 +168,20 @@ impl TestBridge {
     /// See [`GpsRecord`].
     pub(crate) fn gps_record(&self) -> GpsRecord {
         Rc::clone(&self.gps)
+    }
+
+    /// Report `zone` as the device's IANA timezone.
+    pub(crate) fn with_timezone(mut self, zone: &str) -> Self {
+        self.timezone = Some(zone.to_string());
+        self
+    }
+
+    /// Feed `poll_gps_fix`, standing in for the browser's geolocation watch and
+    /// Android's location callbacks.
+    pub(crate) fn gps_channel(&mut self) -> std::sync::mpsc::Sender<rustdar_gps::GpsFix> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.gps_fix_receiver = Some(rx);
+        tx
     }
 
     /// Feed `poll_theme`, standing in for Android's polling thread.
@@ -246,6 +265,10 @@ impl PlatformBridge for TestBridge {
         self.config_dir
             .as_ref()
             .map(|_| Box::new(SharedStore(Rc::clone(&self.store))) as Box<_>)
+    }
+
+    fn iana_timezone(&self) -> Option<String> {
+        self.timezone.clone()
     }
 
     fn needs_process_exit(&self) -> bool {

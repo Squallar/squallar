@@ -231,6 +231,35 @@ pub struct App {
     /// can scope their requests. `None` until the first frame that draws an
     /// overlay; `metar::networks::DEFAULT_VIEWPORT` covers that window.
     last_viewport: Option<rustdar_overlays::types::GeoBounds>,
+    /// Whether the current site was guessed from the timezone rather than chosen.
+    ///
+    /// A guessed site is the one thing a location fix is allowed to overwrite.
+    /// It is cleared the moment the guess is replaced — by a fix or by the user —
+    /// so a site the user has actually settled on is never moved out from under
+    /// them, however far they later travel.
+    site_is_provisional: bool,
+}
+
+/// Point a fresh `Gui` at the radar nearest this device's timezone.
+///
+/// Returns whether a site was actually chosen. `false` means the platform had no
+/// timezone or the timezone is not one we map, and the compiled-in default
+/// stands — see [`crate::location_hint`].
+///
+/// Called only when nothing was restored from storage. That is the whole
+/// precedence rule: a stored site is the user's, and this never touches it.
+fn apply_location_hint(gui: &mut Gui, platform: &dyn PlatformBridge) -> bool {
+    let Some(zone) = platform.iana_timezone() else {
+        log::debug!("no timezone available; keeping the default site");
+        return false;
+    };
+    let Some(site) = crate::location_hint::site_for_timezone(&zone) else {
+        log::debug!("timezone {zone} maps to no radar; keeping the default site");
+        return false;
+    };
+    log::info!("first run: opening on {site}, nearest to timezone {zone}");
+    gui.set_initial_site(site);
+    true
 }
 
 impl App {
@@ -282,6 +311,7 @@ impl App {
         if let Some(store) = platform.config_store() {
             gui.load_ui_config(store.as_ref());
         }
+        let site_is_provisional = apply_location_hint(&mut gui, platform.as_ref());
 
         Self {
             instance,
@@ -297,6 +327,7 @@ impl App {
             old_textures: Vec::new(),
             cached_dark_theme: None,
             exit_requested: false,
+            site_is_provisional,
             http_client,
             #[cfg(not(target_arch = "wasm32"))]
             tokio_runtime,
@@ -496,6 +527,7 @@ impl App {
             notify_redraw(&self.window);
         }
         if let Some(fix) = self.platform.poll_gps_fix() {
+            self.upgrade_provisional_site(&fix);
             self.gui.set_gps_fix(fix);
         }
         if let Some(heading) = self.platform.poll_heading() {
@@ -773,6 +805,45 @@ impl App {
             .retain(|site, _| shown.iter().any(|shown| *shown == site));
     }
 
+    /// Replace a timezone-guessed site with the one nearest an actual fix.
+    ///
+    /// This is the silent upgrade the timezone guess exists to be replaced by:
+    /// the guess resolves a *region* in time for the first paint, and a real fix
+    /// — which arrives only where the user has already granted location, so no
+    /// prompt is involved — resolves the actual radar a moment later.
+    ///
+    /// Does nothing once the site is no longer provisional, which is the
+    /// precedence rule the whole feature turns on. A user who has chosen a site,
+    /// or whose site came back from storage, keeps it: someone in Dallas
+    /// watching a storm over Kansas must not be yanked home by a fix arriving
+    /// late.
+    fn upgrade_provisional_site(&mut self, fix: &rustdar_gps::GpsFix) {
+        if !self.site_is_provisional {
+            return;
+        }
+        // An `Invalid` quality is the "no fix yet" state the map already treats
+        // as no location, and its coordinates are meaningless.
+        if !matches!(fix.fix_quality, rustdar_gps::FixQuality::Gps) {
+            return;
+        }
+        let Some((site, dist)) =
+            rustdar_radar::sites::nearest_wsr88d_site(fix.latitude, fix.longitude)
+        else {
+            return;
+        };
+        // Spent either way. A fix that confirms the guess must still stop the
+        // site being provisional, or every later fix re-runs this.
+        self.site_is_provisional = false;
+        if self.gui.pane(0).is_some_and(|p| p.site == site.name) {
+            return;
+        }
+        log::info!(
+            "location fix refines the opening site to {} ({dist:.0} km)",
+            site.name
+        );
+        self.gui.set_initial_site(site.name);
+    }
+
     /// Request application exit - handles both GUI and keyboard exit requests
     fn request_exit(&mut self, event_loop: Option<&ActiveEventLoop>) {
         // Persist UI config before exiting
@@ -829,7 +900,17 @@ impl App {
         // Load config now — on Android this is called after App::new(),
         // so the initial load in new() had no config dir yet.
         if let Some(store) = self.platform.config_store() {
-            self.gui.load_ui_config(store.as_ref());
+            if self.gui.load_ui_config(store.as_ref()) {
+                // A returning user on Android reaches the timezone guess before
+                // their stored site is readable, so the guess has to be undone
+                // here rather than merely not applied.
+                self.site_is_provisional = false;
+            } else if !self.site_is_provisional {
+                // Still a first run, and `App::new` had no bridge answer to work
+                // with. This is the first chance to place them.
+                self.site_is_provisional =
+                    apply_location_hint(&mut self.gui, self.platform.as_ref());
+            }
         }
     }
 
@@ -1733,6 +1814,131 @@ mod tests {
         let mut reloaded = Gui::new();
         reloaded.load_ui_config(store);
         reloaded.loop_speed_fps
+    }
+
+    /// The site every pane opens on, which is what a user actually sees.
+    fn opening_site(app: &App) -> String {
+        app.gui.pane(0).expect("a pane exists").site.clone()
+    }
+
+    // ── First-run site selection ────────────────────────────────────────
+
+    /// The complaint this feature answers: a first run in Minnesota opened on
+    /// Oklahoma's radar because the default was compiled in.
+    #[test]
+    fn a_first_run_opens_on_the_radar_nearest_the_devices_timezone() {
+        let app = headless(TestBridge::desktop().with_timezone("America/Chicago"));
+        assert_eq!(opening_site(&app), "KLOT");
+    }
+
+    /// Two devices in different timezones must not open on the same site, which
+    /// is the failure mode a hardcoded default has by construction.
+    #[test]
+    fn different_timezones_open_on_different_sites() {
+        let west = headless(TestBridge::desktop().with_timezone("America/Los_Angeles"));
+        let east = headless(TestBridge::desktop().with_timezone("America/New_York"));
+        assert_ne!(opening_site(&west), opening_site(&east));
+    }
+
+    /// A platform that cannot report a timezone keeps the compiled-in default
+    /// rather than ending up on an empty or invented site.
+    #[test]
+    fn a_platform_with_no_timezone_keeps_the_built_in_default() {
+        let app = headless(TestBridge::desktop());
+        assert_eq!(opening_site(&app), Gui::new().pane(0).unwrap().site);
+    }
+
+    /// The precedence rule, and the one that matters most: a returning user's
+    /// stored site is never second-guessed, however far the timezone disagrees.
+    #[test]
+    fn a_stored_site_outranks_the_timezone_guess() {
+        let bridge = TestBridge::desktop().with_timezone("America/Los_Angeles");
+        let store = bridge.store();
+        {
+            let mut gui = Gui::new();
+            gui.set_initial_site("KMPX");
+            gui.save_ui_config(store.as_ref());
+        }
+
+        let app = headless(bridge);
+        assert_eq!(
+            opening_site(&app),
+            "KMPX",
+            "a stored choice was overwritten by the timezone guess"
+        );
+    }
+
+    // ── Refining a guess with a real fix ────────────────────────────────
+
+    /// The silent upgrade: the timezone puts the user in the right region for
+    /// the first paint, and a fix — which only arrives where location was
+    /// already granted — resolves the actual nearest radar.
+    #[test]
+    fn a_location_fix_refines_a_guessed_site() {
+        let mut bridge = TestBridge::desktop().with_timezone("America/Chicago");
+        let fixes = bridge.gps_channel();
+        let mut app = headless(bridge);
+        assert_eq!(opening_site(&app), "KLOT", "the guess is the starting point");
+
+        // Duluth, Minnesota: same timezone, a different radar.
+        fixes
+            .send(rustdar_gps::GpsFix::from_lat_lon(46.7867, -92.1005))
+            .unwrap();
+        app.poll_platform_state();
+
+        assert_eq!(opening_site(&app), "KDLH");
+    }
+
+    /// A fix must not move a site the user chose. Someone in Dallas watching a
+    /// storm over Kansas keeps the Kansas radar.
+    #[test]
+    fn a_location_fix_does_not_move_a_stored_site() {
+        let mut bridge = TestBridge::desktop().with_timezone("America/Chicago");
+        let fixes = bridge.gps_channel();
+        let store = bridge.store();
+        {
+            let mut gui = Gui::new();
+            gui.set_initial_site("KICT");
+            gui.save_ui_config(store.as_ref());
+        }
+
+        let mut app = headless(bridge);
+        fixes
+            .send(rustdar_gps::GpsFix::from_lat_lon(32.7767, -96.7970))
+            .unwrap();
+        app.poll_platform_state();
+
+        assert_eq!(
+            opening_site(&app),
+            "KICT",
+            "a late fix yanked the user away from the site they chose"
+        );
+    }
+
+    /// Once a guess has been refined it stops being a guess. A later fix — from
+    /// someone travelling with the app open — must not keep re-homing the map.
+    #[test]
+    fn only_the_first_fix_refines_the_site() {
+        let mut bridge = TestBridge::desktop().with_timezone("America/Chicago");
+        let fixes = bridge.gps_channel();
+        let mut app = headless(bridge);
+
+        fixes
+            .send(rustdar_gps::GpsFix::from_lat_lon(46.7867, -92.1005))
+            .unwrap();
+        app.poll_platform_state();
+        assert_eq!(opening_site(&app), "KDLH");
+
+        // The same user, now in Denver.
+        fixes
+            .send(rustdar_gps::GpsFix::from_lat_lon(39.7392, -104.9903))
+            .unwrap();
+        app.poll_platform_state();
+        assert_eq!(
+            opening_site(&app),
+            "KDLH",
+            "a second fix moved a site that was already settled"
+        );
     }
 
     /// Set by the back handler the app installs, so a test can see it *ran*

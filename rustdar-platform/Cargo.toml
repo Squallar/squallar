@@ -26,6 +26,7 @@ rustdar-frontend = { workspace = true }
 rustdar-egui = { workspace = true }
 # Types only here (GpsFix, GpsConfig). `serial` is requested per target below.
 rustdar-gps = { workspace = true }
+iana-time-zone = { workspace = true }
 log = { workspace = true }
 pollster = { workspace = true }
 winit = { workspace = true }

@@ -34,6 +34,33 @@ pub fn fix_from_coords(
     }
 }
 
+/// The browser's IANA timezone, e.g. `"America/Denver"`.
+///
+/// `Intl.DateTimeFormat().resolvedOptions().timeZone` is the whole mechanism:
+/// no permission, no prompt, no network, and an answer before the first frame.
+/// It is the only "where is this user" signal a page gets for free, which is why
+/// it is worth the coarse resolution — see [`location_hint`] for what that
+/// resolution is and is not good for.
+///
+/// Reached through `js_sys::Reflect` rather than a typed `web_sys` binding
+/// because `ResolvedDateTimeFormatOptions` is an anonymous object in the spec
+/// and `web_sys` exposes it as a bare `Object`.
+///
+/// [`location_hint`]: rustdar_frontend::location_hint
+#[cfg(target_arch = "wasm32")]
+pub fn browser_timezone() -> Option<String> {
+    use wasm_bindgen::JsValue;
+
+    let resolved = js_sys::Intl::DateTimeFormat::default().resolved_options();
+    let zone = js_sys::Reflect::get(&resolved, &JsValue::from_str("timeZone")).ok()?;
+    // A browser too old for the `timeZone` key returns `undefined`, whose
+    // `as_string` is `None` — the same miss as any other absent value.
+    let zone = zone.as_string()?;
+    // An empty string is not a zone, and would otherwise reach the anchor table
+    // as a lookup that misses in a way that looks deliberate.
+    (!zone.is_empty()).then_some(zone)
+}
+
 /// Start watching the browser's position, pushing every reading into `sender`.
 ///
 /// `watchPosition`, not `getCurrentPosition`: the fix channel is state —

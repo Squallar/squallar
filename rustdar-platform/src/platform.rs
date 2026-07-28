@@ -11,6 +11,25 @@ use rustdar_frontend::platform::drain_latest;
 #[cfg(target_os = "android")]
 type InsetsQuerier = fn() -> (f32, f32, f32, f32);
 
+/// This machine's IANA timezone name, or `None` if it cannot be determined.
+///
+/// Shared by all three native bridges, which answer this identically —
+/// `iana-time-zone` already covers Linux, macOS, Windows, Android and iOS, so
+/// there is nothing per-OS left for the bridges to decide.
+///
+/// A failure here is ordinary: a container with no `/etc/localtime`, or a `TZ`
+/// naming a POSIX offset rather than a zone. The caller falls back to its
+/// compiled-in default site, which is what it did before this existed.
+fn system_timezone() -> Option<String> {
+    match iana_time_zone::get_timezone() {
+        Ok(zone) => Some(zone),
+        Err(e) => {
+            log::debug!("no system timezone available: {e}");
+            None
+        }
+    }
+}
+
 // ── Desktop implementation ──────────────────────────────────────────────
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -112,6 +131,10 @@ impl PlatformBridge for DesktopPlatform {
         self.config_dir
             .clone()
             .map(|dir| Box::new(crate::config_store::FileConfigStore::new(dir)) as Box<_>)
+    }
+
+    fn iana_timezone(&self) -> Option<String> {
+        system_timezone()
     }
 
     fn needs_process_exit(&self) -> bool {
@@ -266,6 +289,10 @@ impl PlatformBridge for AndroidPlatform {
             .map(|dir| Box::new(crate::config_store::FileConfigStore::new(dir)) as Box<_>)
     }
 
+    fn iana_timezone(&self) -> Option<String> {
+        system_timezone()
+    }
+
     fn needs_process_exit(&self) -> bool {
         true
     }
@@ -407,6 +434,10 @@ impl PlatformBridge for IosPlatform {
         self.config_dir
             .clone()
             .map(|dir| Box::new(crate::config_store::FileConfigStore::new(dir)) as Box<_>)
+    }
+
+    fn iana_timezone(&self) -> Option<String> {
+        system_timezone()
     }
 
     fn needs_process_exit(&self) -> bool {
