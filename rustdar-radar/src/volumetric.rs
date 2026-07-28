@@ -1,15 +1,31 @@
-//! Volume-derived products computed from Level II reflectivity: interpolated echo tops. The RPG's EET/DVL products use coarser
-//! grids and beam-top conventions; these implementations interpolate between
-//! tilt centers, calibrated against a reference implementation's readouts.
+//! Volume-derived products computed from the Level II volume.
+//!
+//! The heart is [`VolumeCube`]: the whole volume collapsed once per scan onto
+//! a 360° × 230 km polar grid per tilt, for whatever moments a product needs,
+//! with beam geometry and sweep provenance alongside. Products
+//! ([`compute_echo_tops`], and the EET/DVL/KDP/HCA family to come) are then
+//! column scans over the cube rather than owners of their own gridding.
+//!
+//! The RPG's EET/DVL products use coarser grids and beam-top conventions; the
+//! interpolated echo tops here interpolate between tilt centers, calibrated
+//! against a reference implementation's readouts.
 
 use crate::types::RadarProduct;
-use nexrad_model::data::{DataMoment, MomentValue, Scan};
+use nexrad_model::data::{DataMoment, MomentValue, Radial, Scan};
 
 /// Effective earth radius (4/3 model), km.
 const RE_EFF_KM: f64 = 6371.0 * 4.0 / 3.0;
 
+/// Half-power beamwidth of the WSR-88D antenna, degrees. Beam bottom and top
+/// heights sit half of this below and above the tilt centre.
+pub const HALF_POWER_BEAMWIDTH_DEG: f64 = 0.95;
+
 /// Reflectivity threshold for echo tops, dBZ.
 const ET_THRESHOLD_DBZ: f32 = 18.3;
+
+/// Range cells of the cube and of every volumetric product: 1 km each, 230 km
+/// total — the domain the RPG specifies its derived products over.
+pub const RANGE_BINS: usize = 230;
 
 /// Polar grid of a volume-derived product: 360 azimuth degrees × 1-km range
 /// bins, value `NaN` where undefined.
@@ -18,17 +34,217 @@ pub struct VolumetricGrid {
     pub range_bins: usize,
 }
 
-const RANGE_BINS: usize = 230;
-
 /// Beam-center height above the radar, km, for a slant range and elevation.
 fn beam_height_km(range_km: f64, elev_deg: f64) -> f64 {
     let el = elev_deg.to_radians();
     range_km * el.sin() + range_km * range_km / (2.0 * RE_EFF_KM)
 }
 
-/// Reflectivity per (az°, range-km) cell for one sweep: linear-Z mean of the
-/// gates falling in the cell on the radial nearest the cell centre.
-fn sweep_to_grid(radials: &[nexrad_model::data::Radial]) -> Vec<Vec<f32>> {
+/// The statistic collapsing a radial's gates into a 1-km cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellStat {
+    /// Mean in linear Z (`10^(dBZ/10)`), read back in dBZ. Averaging
+    /// reflectivity in dB space would understate every mixed cell.
+    LinearZMean,
+    /// Arithmetic mean of the physical values.
+    Mean,
+    /// Largest value in the cell.
+    Max,
+}
+
+impl CellStat {
+    /// The statistic a moment's physics wants: linear-Z mean for reflectivity
+    /// (and the products that read it), arithmetic mean for everything else.
+    pub fn for_moment(moment: RadarProduct) -> Self {
+        match moment {
+            RadarProduct::Reflectivity | RadarProduct::EchoTopsInterpolated => Self::LinearZMean,
+            _ => Self::Mean,
+        }
+    }
+}
+
+/// How a repeated elevation (a SAILS/MRLE revisit of the lowest cuts) is
+/// resolved to one sweep per tilt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupPolicy {
+    /// The latest sweep at an elevation wins — the freshest look, what the
+    /// shipped interpolated echo tops have always done.
+    NewestWins,
+    /// The first sweep of the volume wins — the coherent snapshot the RPG's
+    /// own volume products are computed from, which the validation harnesses
+    /// need when comparing against an EET/DVL twin.
+    FirstOfVolume,
+}
+
+/// One moment's 360×230 grid on one tilt, with the sweep it came from.
+pub struct MomentGrid {
+    /// `[az_deg][range_km]`, `NaN` where no gate carried data.
+    pub values: Vec<Vec<f32>>,
+    /// Index into [`Scan::sweeps`] of the sweep this grid was computed from.
+    pub sweep_index: usize,
+    /// Whether this sweep displaced an earlier sweep at the same elevation — a
+    /// SAILS/MRLE repeat resolved by [`DedupPolicy::NewestWins`]. Always
+    /// `false` under [`DedupPolicy::FirstOfVolume`], which keeps the sweep a
+    /// repeat would have displaced.
+    pub displaced_repeat: bool,
+}
+
+/// Beam bottom/centre/top heights above the radar, km, at every range cell
+/// centre (`r + 0.5` km) of one tilt.
+pub struct BeamHeights {
+    pub bottom_km: Vec<f64>,
+    pub centre_km: Vec<f64>,
+    pub top_km: Vec<f64>,
+}
+
+impl BeamHeights {
+    /// Heights for a tilt centred on `elev_deg`, the bottom and top at half
+    /// the half-power beamwidth below and above it.
+    fn at_elevation(elev_deg: f64) -> Self {
+        let half = HALF_POWER_BEAMWIDTH_DEG / 2.0;
+        let at = |e: f64| -> Vec<f64> {
+            (0..RANGE_BINS)
+                .map(|r| beam_height_km(r as f64 + 0.5, e))
+                .collect()
+        };
+        Self {
+            bottom_km: at(elev_deg - half),
+            centre_km: at(elev_deg),
+            top_km: at(elev_deg + half),
+        }
+    }
+}
+
+/// One distinct elevation of the volume.
+pub struct Tilt {
+    /// The elevation key, degrees, rounded to 0.1° — the resolution sweeps are
+    /// deduplicated at.
+    pub elevation_deg: f64,
+    /// Beam geometry at every range cell centre.
+    pub heights: BeamHeights,
+    /// One entry per requested moment, in the cube's moment order. `None` when
+    /// no sweep at this elevation carries the moment.
+    grids: Vec<Option<MomentGrid>>,
+}
+
+/// The volume as a stack of polar grids: one 360° × 230 km grid per tilt per
+/// requested moment, computed **once** per scan and shared by every product
+/// derived from it.
+///
+/// Sweeps are chosen **per moment**: a split cut publishes reflectivity and
+/// velocity at the same elevation on different sweeps, so a tilt's
+/// reflectivity grid and its velocity grid may legitimately come from
+/// different sweep indices. The tilt list is the union of every requested
+/// moment's elevations, ascending.
+pub struct VolumeCube {
+    moments: Vec<RadarProduct>,
+    pub tilts: Vec<Tilt>,
+}
+
+impl VolumeCube {
+    /// Build the cube with each moment's default statistic
+    /// ([`CellStat::for_moment`]).
+    pub fn build(scan: &Scan, moments: &[RadarProduct], policy: DedupPolicy) -> Self {
+        let with_stats: Vec<(RadarProduct, CellStat)> = moments
+            .iter()
+            .map(|&m| (m, CellStat::for_moment(m)))
+            .collect();
+        Self::build_with_stats(scan, &with_stats, policy)
+    }
+
+    /// Build the cube with an explicit statistic per moment.
+    pub fn build_with_stats(
+        scan: &Scan,
+        moments: &[(RadarProduct, CellStat)],
+        policy: DedupPolicy,
+    ) -> Self {
+        // Per moment: (elevation key, sweep index, displaced an earlier
+        // same-elevation sweep), in encounter order.
+        let mut chosen: Vec<Vec<(f64, usize, bool)>> = vec![Vec::new(); moments.len()];
+        for (si, sweep) in scan.sweeps().iter().enumerate() {
+            let Some(first) = sweep.radials().first() else {
+                continue;
+            };
+            let key = (first.elevation_angle_degrees() as f64 * 10.0).round() / 10.0;
+            for (mi, (moment, _)) in moments.iter().enumerate() {
+                if moment.get_moment(first).is_none() {
+                    continue;
+                }
+                match chosen[mi]
+                    .iter_mut()
+                    .find(|(k, ..)| (*k - key).abs() < 0.05)
+                {
+                    Some(entry) => {
+                        if policy == DedupPolicy::NewestWins {
+                            *entry = (entry.0, si, true);
+                        }
+                    }
+                    None => chosen[mi].push((key, si, false)),
+                }
+            }
+        }
+
+        // The union of every moment's elevations, ascending.
+        let mut keys: Vec<f64> = Vec::new();
+        for per_moment in &chosen {
+            for &(k, ..) in per_moment {
+                if !keys.iter().any(|e| (e - k).abs() < 0.05) {
+                    keys.push(k);
+                }
+            }
+        }
+        keys.sort_by(f64::total_cmp);
+
+        let tilts = keys
+            .into_iter()
+            .map(|key| {
+                let grids = moments
+                    .iter()
+                    .enumerate()
+                    .map(|(mi, &(moment, stat))| {
+                        chosen[mi]
+                            .iter()
+                            .find(|(k, ..)| (k - key).abs() < 0.05)
+                            .map(|&(_, si, displaced)| MomentGrid {
+                                values: sweep_to_grid(scan.sweeps()[si].radials(), moment, stat),
+                                sweep_index: si,
+                                displaced_repeat: displaced,
+                            })
+                    })
+                    .collect();
+                Tilt {
+                    elevation_deg: key,
+                    heights: BeamHeights::at_elevation(key),
+                    grids,
+                }
+            })
+            .collect();
+
+        Self {
+            moments: moments.iter().map(|&(m, _)| m).collect(),
+            tilts,
+        }
+    }
+
+    /// The moments this cube was built for, in grid order.
+    pub fn moments(&self) -> &[RadarProduct] {
+        &self.moments
+    }
+
+    /// The grid for one moment on one tilt. `None` when the tilt index is out
+    /// of range, the moment was not requested, or no sweep at that elevation
+    /// carries the moment.
+    pub fn grid(&self, tilt: usize, moment: RadarProduct) -> Option<&MomentGrid> {
+        let mi = self.moments.iter().position(|m| *m == moment)?;
+        self.tilts.get(tilt)?.grids[mi].as_ref()
+    }
+}
+
+/// One sweep collapsed onto the cube's grid for one moment: per whole-degree
+/// azimuth cell the radial nearest the cell centre, per 1-km range cell `stat`
+/// over the gates falling in it. `NaN` where no gate carried data; gate values
+/// ≥ 999 are the decoder's sentinels and are dropped.
+fn sweep_to_grid(radials: &[Radial], moment: RadarProduct, stat: CellStat) -> Vec<Vec<f32>> {
     let mut grid = vec![vec![f32::NAN; RANGE_BINS]; 360];
     // nearest radial per whole-degree centre
     let mut nearest: Vec<Option<usize>> = vec![None; 360];
@@ -51,73 +267,76 @@ fn sweep_to_grid(radials: &[nexrad_model::data::Radial]) -> Vec<Vec<f32>> {
     for (cell, slot) in nearest.iter().enumerate() {
         let Some(ri) = slot else { continue };
         let radial = &radials[*ri];
-        if let Some(moment) = RadarProduct::Reflectivity.get_moment(radial) {
-            let fg = moment.first_gate_range_km();
-            let gi = moment.gate_interval_km();
-            // linear-Z mean of the gates falling in each 1-km cell
-            let mut acc = vec![(0.0f64, 0u32); RANGE_BINS];
-            for (j, v) in moment.values().iter().enumerate() {
-                let MomentValue::Value(z) = v else { continue };
-                if *z >= 999.0 || z.is_nan() {
-                    continue;
-                }
-                let r = (fg + j as f64 * gi) as usize;
-                if r < RANGE_BINS {
-                    acc[r].0 += 10f64.powf(*z as f64 / 10.0);
-                    acc[r].1 += 1;
+        let Some(md) = moment.get_moment(radial) else {
+            continue;
+        };
+        let fg = md.first_gate_range_km();
+        let gi = md.gate_interval_km();
+        // (accumulator, gate count) per cell; what the accumulator holds
+        // depends on `stat`.
+        let mut acc = vec![(0.0f64, 0u32); RANGE_BINS];
+        for (j, v) in md.values().iter().enumerate() {
+            let MomentValue::Value(z) = v else { continue };
+            if *z >= 999.0 || z.is_nan() {
+                continue;
+            }
+            let r = (fg + j as f64 * gi) as usize;
+            if r >= RANGE_BINS {
+                continue;
+            }
+            match stat {
+                CellStat::LinearZMean => acc[r].0 += 10f64.powf(*z as f64 / 10.0),
+                CellStat::Mean => acc[r].0 += *z as f64,
+                CellStat::Max => {
+                    acc[r].0 = if acc[r].1 == 0 {
+                        *z as f64
+                    } else {
+                        acc[r].0.max(*z as f64)
+                    }
                 }
             }
-            for (r, (zsum, n)) in acc.into_iter().enumerate() {
-                if n > 0 {
-                    grid[cell][r] = (10.0 * (zsum / n as f64).log10()) as f32;
-                }
+            acc[r].1 += 1;
+        }
+        for (r, (sum, n)) in acc.into_iter().enumerate() {
+            if n > 0 {
+                grid[cell][r] = match stat {
+                    CellStat::LinearZMean => (10.0 * (sum / n as f64).log10()) as f32,
+                    CellStat::Mean => (sum / n as f64) as f32,
+                    CellStat::Max => sum as f32,
+                };
             }
         }
     }
     grid
 }
 
-/// Distinct reflectivity tilts of a volume, ascending elevation, newest sweep
-/// per 0.1°-rounded elevation. Returns (elevation°, per-cell max dBZ grid).
-fn tilt_grids(scan: &Scan) -> Vec<(f64, Vec<Vec<f32>>)> {
-    let mut by_elev: Vec<(f64, &nexrad_model::data::Sweep)> = Vec::new();
-    for sweep in scan.sweeps() {
-        let Some(first) = sweep.radials().first() else {
-            continue;
-        };
-        if RadarProduct::Reflectivity.get_moment(first).is_none() {
-            continue;
-        }
-        let elev = first.elevation_angle_degrees() as f64;
-        let key = (elev * 10.0).round() / 10.0;
-        match by_elev.iter_mut().find(|(k, _)| (*k - key).abs() < 0.05) {
-            Some(entry) => entry.1 = sweep, // newest wins (sweeps in scan order)
-            None => by_elev.push((key, sweep)),
-        }
-    }
-    by_elev.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    by_elev
-        .into_iter()
-        .map(|(e, s)| (e, sweep_to_grid(s.radials())))
-        .collect()
-}
 /// Echo tops: height (kft above radar) of the interpolated crossing of
-/// [`ET_THRESHOLD_DBZ`], scanning tilts top-down per column.
+/// [`ET_THRESHOLD_DBZ`], scanning tilts top-down per column of a
+/// newest-wins reflectivity [`VolumeCube`].
 pub fn compute_echo_tops(scan: &Scan) -> VolumetricGrid {
-    let tilts = tilt_grids(scan);
+    let cube = VolumeCube::build(scan, &[RadarProduct::Reflectivity], DedupPolicy::NewestWins);
+    // The tilts actually carrying reflectivity, bottom-up.
+    let tilts: Vec<(&BeamHeights, &Vec<Vec<f32>>)> = cube
+        .tilts
+        .iter()
+        .enumerate()
+        .filter_map(|(ti, t)| {
+            cube.grid(ti, RadarProduct::Reflectivity)
+                .map(|g| (&t.heights, &g.values))
+        })
+        .collect();
+
     let mut out = vec![vec![f32::NAN; RANGE_BINS]; 360];
     for (az, row) in out.iter_mut().enumerate() {
         for (r, cell) in row.iter_mut().enumerate() {
-            let rr = r as f64 + 0.5;
             // topmost tilt meeting the threshold
-            let mut top: Option<f32> = None;
             for ti in (0..tilts.len()).rev() {
                 let z = tilts[ti].1[az][r];
                 if !z.is_nan() && z >= ET_THRESHOLD_DBZ {
-                    let h = beam_height_km(rr, tilts[ti].0);
+                    let h = tilts[ti].0.centre_km[r];
                     let ht = if ti + 1 < tilts.len() {
                         let z_up = tilts[ti + 1].1[az][r];
-                        let h_up = beam_height_km(rr, tilts[ti + 1].0);
+                        let h_up = tilts[ti + 1].0.centre_km[r];
                         if z_up.is_nan() {
                             // echo absent above: the tilt centre itself
                             h
@@ -128,12 +347,9 @@ pub fn compute_echo_tops(scan: &Scan) -> VolumetricGrid {
                     } else {
                         h
                     };
-                    top = Some((ht * 3.28084) as f32); // km -> kft
+                    *cell = (ht * 3.28084) as f32; // km -> kft
                     break;
                 }
-            }
-            if let Some(t) = top {
-                *cell = t;
             }
         }
     }
@@ -397,5 +613,291 @@ mod tests {
             "the no-data sector filled in"
         );
         assert!(grid.values[10][200].is_nan(), "15 dBZ background topped");
+    }
+
+    // ── VolumeCube ──────────────────────────────────────────────────────────
+
+    /// A one-radial sweep whose moment is handed in directly, for tests that
+    /// need full control of the encoding.
+    fn one_radial_sweep(
+        elevation_number: u8,
+        elevation_deg: f32,
+        azimuth: f32,
+        refl: Option<MomentData>,
+        vel: Option<MomentData>,
+        zdr: Option<MomentData>,
+    ) -> Sweep {
+        let radial = Radial::new(
+            0,
+            0,
+            azimuth,
+            1.0,
+            RadialStatus::IntermediateRadialData,
+            elevation_number,
+            elevation_deg,
+            refl,
+            vel,
+            None,
+            zdr,
+            None,
+            None,
+            None,
+        );
+        Sweep::new(elevation_number, radials_vec(radial))
+    }
+
+    fn radials_vec(r: Radial) -> Vec<Radial> {
+        vec![r]
+    }
+
+    /// 1-km gates encoding the given bytes at scale/offset.
+    fn moment(bytes: &[u8], scale: f32, offset: f32) -> MomentData {
+        MomentData::from_fixed_point(
+            bytes.len() as u16,
+            0,
+            1000,
+            8,
+            scale,
+            offset,
+            bytes.to_vec(),
+        )
+    }
+
+    #[test]
+    fn beam_heights_match_the_hand_computed_four_thirds_model() {
+        // Range cell 100 (centre 100.5 km) on a 0.5° tilt, half-power
+        // beamwidth 0.95°, effective radius 6371·4/3 km:
+        //   centre = 100.5·sin 0.500° + 100.5²/(2·8494.667) = 1.4715221935 km
+        //   bottom = 100.5·sin 0.025° + …                   = 0.6383567720 km
+        //   top    = 100.5·sin 0.975° + …                   = 2.3046273386 km
+        let h = BeamHeights::at_elevation(0.5);
+        assert!((h.centre_km[100] - 1.4715221935087277).abs() < 1e-9);
+        assert!((h.bottom_km[100] - 0.638356771987057).abs() < 1e-9);
+        assert!((h.top_km[100] - 2.3046273386189857).abs() < 1e-9);
+        // Cell 0 (centre 0.5 km) on a 19.5° tilt: 0.5·sin 19.5° + 0.5²/(2·Re′).
+        let steep = BeamHeights::at_elevation(19.5);
+        assert!((steep.centre_km[0] - 0.16691814473225194).abs() < 1e-9);
+        assert_eq!(h.centre_km.len(), RANGE_BINS);
+        assert_eq!(h.bottom_km.len(), RANGE_BINS);
+        assert_eq!(h.top_km.len(), RANGE_BINS);
+    }
+
+    /// Both dedup policies, on the same volume, disagree exactly where they
+    /// must: sweep identity, the displaced flag, and the values themselves —
+    /// the SAILS repeat's cores are shifted, so cell (308°, 120 km) is hotter
+    /// on the repeat than on the first look.
+    #[test]
+    fn dedup_policies_pick_opposite_ends_of_a_sails_pair() {
+        let scan = Scan::new(
+            vcp(),
+            vec![
+                refl_sweep(1, 0.5, 360, 0.5, false),
+                refl_sweep(2, 1.5, 360, 0.5, false),
+                refl_sweep(3, 0.5, 360, 0.5, true), // SAILS repeat, shifted
+            ],
+        );
+        let newest = VolumeCube::build(
+            &scan,
+            &[RadarProduct::Reflectivity],
+            DedupPolicy::NewestWins,
+        );
+        let first = VolumeCube::build(
+            &scan,
+            &[RadarProduct::Reflectivity],
+            DedupPolicy::FirstOfVolume,
+        );
+        assert_eq!(newest.tilts.len(), 2);
+        assert_eq!(first.tilts.len(), 2);
+        assert!((newest.tilts[0].elevation_deg - 0.5).abs() < 1e-12);
+        assert!((newest.tilts[1].elevation_deg - 1.5).abs() < 1e-12);
+
+        let n = newest.grid(0, RadarProduct::Reflectivity).unwrap();
+        assert_eq!(n.sweep_index, 2);
+        assert!(n.displaced_repeat, "the repeat displaced the first look");
+
+        let f = first.grid(0, RadarProduct::Reflectivity).unwrap();
+        assert_eq!(f.sweep_index, 0);
+        assert!(!f.displaced_repeat);
+
+        // The two policies must yield *different fields*, not just different
+        // indices: the repeat's core C sits at 308°, the first look's at 300°.
+        assert!(n.values[308][120] > f.values[308][120]);
+        assert!(n.values[300][120] < f.values[300][120]);
+
+        // The unrepeated tilt is identical under both policies.
+        let nu = newest.grid(1, RadarProduct::Reflectivity).unwrap();
+        let fu = first.grid(1, RadarProduct::Reflectivity).unwrap();
+        assert_eq!(nu.sweep_index, 1);
+        assert_eq!(fu.sweep_index, 1);
+        assert!(!nu.displaced_repeat);
+    }
+
+    /// Two radials contend for one azimuth cell; the one nearer the cell
+    /// centre must supply it.
+    #[test]
+    fn the_radial_nearest_the_cell_centre_wins() {
+        // Cell 10's centre is 10.5°. 10.2° is 0.3 away, 10.4° is 0.1 away.
+        let far = Radial::new(
+            0,
+            0,
+            10.2,
+            0.5,
+            RadialStatus::IntermediateRadialData,
+            1,
+            0.5,
+            Some(moment(&[126; 5], SCALE, OFFSET)), // 30 dBZ
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let near = Radial::new(
+            0,
+            1,
+            10.4,
+            0.5,
+            RadialStatus::IntermediateRadialData,
+            1,
+            0.5,
+            Some(moment(&[166; 5], SCALE, OFFSET)), // 50 dBZ
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let scan = Scan::new(vcp(), vec![Sweep::new(1, vec![far, near])]);
+        let cube = VolumeCube::build(
+            &scan,
+            &[RadarProduct::Reflectivity],
+            DedupPolicy::NewestWins,
+        );
+        let g = cube.grid(0, RadarProduct::Reflectivity).unwrap();
+        assert!(
+            (g.values[10][2] - 50.0).abs() < 1e-4,
+            "cell 10 read {} — the farther radial won",
+            g.values[10][2],
+        );
+        assert!(g.values[11][2].is_nan(), "no radial points at cell 11");
+    }
+
+    /// Below-threshold gates, ≥999 sentinels and empty cells all come out NaN;
+    /// a legitimate value in the same radial survives.
+    #[test]
+    fn nan_propagation_keeps_holes_and_drops_sentinels() {
+        // ZDR at scale 0.1, offset 0: byte 0 below threshold, byte 100 →
+        // 1000 (a ≥999 sentinel, dropped), byte 50 → 500 (kept).
+        let mut bytes = vec![0u8; 3];
+        bytes.extend_from_slice(&[100, 100, 100]); // cell 3..6 → sentinel
+        bytes.extend_from_slice(&[50, 50]); // cells 6, 7 → 500
+        let zdr = MomentData::from_fixed_point(8, 0, 1000, 8, 0.1, 0.0, bytes);
+        let scan = Scan::new(
+            vcp(),
+            vec![one_radial_sweep(1, 0.5, 42.5, None, None, Some(zdr))],
+        );
+        let cube = VolumeCube::build(
+            &scan,
+            &[RadarProduct::DifferentialReflectivity],
+            DedupPolicy::NewestWins,
+        );
+        let g = cube
+            .grid(0, RadarProduct::DifferentialReflectivity)
+            .unwrap();
+        assert!(g.values[42][0].is_nan(), "below-threshold gates filled in");
+        assert!(g.values[42][3].is_nan(), "a ≥999 sentinel was kept");
+        assert!((g.values[42][6] - 500.0).abs() < 1e-3);
+        assert!(g.values[42][7 + 1..].iter().all(|v| v.is_nan()));
+        assert!(g.values[43][0].is_nan(), "another azimuth cell filled in");
+    }
+
+    /// The statistic really is per moment: identical gate bytes read through
+    /// reflectivity average in linear Z, through ZDR arithmetically, and a
+    /// [`CellStat::Max`] override keeps the peak.
+    #[test]
+    fn cell_statistics_dispatch_per_moment() {
+        // Two 0.5-km gates per 1-km cell: 20 dBZ and 40 dBZ.
+        let bytes = vec![106u8, 146]; // (b-66)/2 → 20, 40
+        let make = || MomentData::from_fixed_point(2, 0, 500, 8, SCALE, OFFSET, bytes.clone());
+        let scan = Scan::new(
+            vcp(),
+            vec![one_radial_sweep(
+                1,
+                0.5,
+                7.5,
+                Some(make()),
+                None,
+                Some(make()),
+            )],
+        );
+        let cube = VolumeCube::build(
+            &scan,
+            &[
+                RadarProduct::Reflectivity,
+                RadarProduct::DifferentialReflectivity,
+            ],
+            DedupPolicy::NewestWins,
+        );
+        let z = cube.grid(0, RadarProduct::Reflectivity).unwrap().values[7][0];
+        let zdr = cube
+            .grid(0, RadarProduct::DifferentialReflectivity)
+            .unwrap()
+            .values[7][0];
+        // 10·log₁₀((10² + 10⁴)/2) = 37.0329…, not the 30.0 a dB-space mean
+        // would give.
+        assert!((z - 37.032_913).abs() < 1e-4, "got {z}");
+        assert_eq!(zdr, 30.0, "ZDR must average arithmetically");
+
+        let peaked = VolumeCube::build_with_stats(
+            &scan,
+            &[(RadarProduct::Reflectivity, CellStat::Max)],
+            DedupPolicy::NewestWins,
+        );
+        let m = peaked.grid(0, RadarProduct::Reflectivity).unwrap().values[7][0];
+        assert_eq!(m, 40.0, "Max must keep the peak");
+    }
+
+    /// A split cut: reflectivity and velocity at the same elevation on
+    /// different sweeps. Each moment must come from its own sweep, on one
+    /// shared tilt.
+    #[test]
+    fn a_split_cut_supplies_each_moment_from_its_own_sweep() {
+        let scan = Scan::new(
+            vcp(),
+            vec![
+                refl_sweep(1, 0.5, 360, 0.5, false),
+                velocity_only_sweep(2, 0.5),
+                refl_sweep(3, 1.5, 360, 0.5, false),
+            ],
+        );
+        let cube = VolumeCube::build(
+            &scan,
+            &[RadarProduct::Reflectivity, RadarProduct::Velocity],
+            DedupPolicy::NewestWins,
+        );
+        assert_eq!(cube.tilts.len(), 2);
+
+        let z = cube.grid(0, RadarProduct::Reflectivity).unwrap();
+        let v = cube.grid(0, RadarProduct::Velocity).unwrap();
+        assert_eq!(z.sweep_index, 0, "reflectivity from the surveillance cut");
+        assert_eq!(v.sweep_index, 1, "velocity from the Doppler cut");
+        assert!(
+            !z.displaced_repeat && !v.displaced_repeat,
+            "a split cut is not a SAILS repeat: neither moment displaced anything",
+        );
+        assert_eq!(v.values[42][50], 0.0, "byte 129 at scale 2/offset 129");
+
+        // The upper tilt has reflectivity but no velocity.
+        assert!(cube.grid(1, RadarProduct::Reflectivity).is_some());
+        assert!(cube.grid(1, RadarProduct::Velocity).is_none());
+
+        // A moment the cube was not built for is None everywhere.
+        assert!(cube.grid(0, RadarProduct::SpectrumWidth).is_none());
+        assert_eq!(
+            cube.moments(),
+            &[RadarProduct::Reflectivity, RadarProduct::Velocity],
+        );
     }
 }
