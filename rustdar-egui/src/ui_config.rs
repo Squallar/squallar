@@ -37,6 +37,24 @@ struct PaneConfig {
     /// Per-pane overlay handler config snapshots.
     #[serde(default)]
     overlay_configs: HashMap<OverlayKind, serde_json::Value>,
+    /// Map zoom level, as `walkers::MapMemory` reports it.
+    ///
+    /// `Option` rather than a defaulted `f64` so a config written before the
+    /// viewport was persisted is distinguishable from one that genuinely saved
+    /// the default zoom. The former must leave `PaneState::with_site`'s choice
+    /// alone; the latter must override it.
+    #[serde(default)]
+    zoom: Option<f64>,
+    /// Where the map is centred, as `(lat, lon)`, when the user has panned away
+    /// from the site.
+    ///
+    /// `None` means the map is following the radar site rather than sitting at a
+    /// detached centre — the state `MapMemory::detached` reports as `None` — and
+    /// restoring it has to re-establish *following*, not centre on the site's
+    /// coordinates and call it the same thing. The two look identical until the
+    /// pane changes site.
+    #[serde(default)]
+    center: Option<(f64, f64)>,
 }
 
 fn default_site() -> String {
@@ -74,6 +92,8 @@ impl Default for PaneConfig {
             draw_order: OverlayKind::default_draw_order(),
             enabled_overlays: HashMap::new(),
             overlay_configs: HashMap::new(),
+            zoom: None,
+            center: None,
         }
     }
 }
@@ -125,6 +145,23 @@ impl Default for UiConfig {
 impl super::Gui {
     /// Save UI layout configuration to `store`.
     pub fn save_ui_config(&self, store: &dyn ConfigStore) {
+        let Some(json) = self.ui_config_json() else {
+            return;
+        };
+        if let Err(e) = store.store(UI_CONFIG_KEY, &json) {
+            log::error!("Failed to write config: {}", e);
+        }
+    }
+
+    /// The configuration this `Gui` would persist, as JSON.
+    ///
+    /// Exposed separately from [`save_ui_config`](Self::save_ui_config) so the
+    /// periodic autosave can ask "has anything changed?" without a storage
+    /// write. Comparing this against the last written string is what keeps a
+    /// three-second timer from becoming a three-second write loop.
+    ///
+    /// `None` only if serialization fails, which is already logged.
+    pub fn ui_config_json(&self) -> Option<String> {
         // Guard against NaN/Infinity in f32 fields which cause serde_json to fail.
         let fps = if self.loop_speed_fps.is_finite() {
             self.loop_speed_fps
@@ -148,6 +185,20 @@ impl super::Gui {
                 draw_order: pane.draw_order.clone(),
                 enabled_overlays: pane.enabled_overlays.clone(),
                 overlay_configs: pane.overlay_configs.clone(),
+                // Same NaN guard as `loop_speed_fps` above, and for the same
+                // reason: `serde_json` refuses to serialize a non-finite float,
+                // and it fails the *whole* config, so one bad zoom would silently
+                // stop persisting everything else too.
+                zoom: pane
+                    .map_memory
+                    .zoom()
+                    .is_finite()
+                    .then(|| pane.map_memory.zoom()),
+                center: pane
+                    .map_memory
+                    .detached()
+                    .map(|p| (p.y(), p.x()))
+                    .filter(|(lat, lon)| lat.is_finite() && lon.is_finite()),
             })
             .collect();
         let config = UiConfig {
@@ -166,13 +217,10 @@ impl super::Gui {
             gps_config: self.gps_config.clone(),
         };
         match serde_json::to_string_pretty(&config) {
-            Ok(json) => {
-                if let Err(e) = store.store(UI_CONFIG_KEY, &json) {
-                    log::error!("Failed to write config: {}", e);
-                }
-            }
+            Ok(json) => Some(json),
             Err(e) => {
                 log::error!("Failed to serialize config: {}", e);
+                None
             }
         }
     }
@@ -181,15 +229,24 @@ impl super::Gui {
     ///
     /// A missing or unparseable config leaves `self` untouched, so the caller
     /// keeps whatever defaults it was constructed with.
-    pub fn load_ui_config(&mut self, store: &dyn ConfigStore) {
+    ///
+    /// Returns whether a config was actually applied. The caller uses that to
+    /// tell a returning user from a first run: only a first run may have its
+    /// radar site chosen for it, because on any later run the stored site is the
+    /// user's own choice and overriding it would be the bug, not the feature.
+    ///
+    /// An unparseable config counts as *not* loaded. That is the honest answer —
+    /// nothing was applied — and it means a corrupted store still gets a sensibly
+    /// located default rather than the compiled-in one.
+    pub fn load_ui_config(&mut self, store: &dyn ConfigStore) -> bool {
         let Some(content) = store.load(UI_CONFIG_KEY) else {
-            return;
+            return false;
         };
         let config = match serde_json::from_str::<UiConfig>(&content) {
             Ok(c) => c,
             Err(e) => {
                 log::warn!("Failed to parse config: {}", e);
-                return;
+                return false;
             }
         };
 
@@ -263,6 +320,7 @@ impl super::Gui {
             if !pc.overlay_configs.is_empty() {
                 pane.overlay_configs = pc.overlay_configs.clone();
             }
+            restore_viewport(pane, pc);
         }
 
         // Restore handler-owned overlay states (backward-compatible: old configs have empty map)
@@ -278,6 +336,44 @@ impl super::Gui {
         // Fill in any overlay kinds not yet in per-pane enabled maps
         // (e.g. newly added overlays or first load after migration).
         self.initialize_pane_enabled();
+        true
+    }
+
+    /// Point every pane at `site`, for a first run with no stored config.
+    ///
+    /// Only legitimate before the user has seen anything: it overwrites the site
+    /// on each pane and on the fetch config unconditionally. Guarding that is
+    /// the caller's job — see [`load_ui_config`](Self::load_ui_config).
+    pub fn set_initial_site(&mut self, site: &str) {
+        self.radar.config.site = site.to_string();
+        for pane in &mut self.panes {
+            pane.site = site.to_string();
+        }
+    }
+}
+
+/// Put a pane's map back where it was left: same zoom, same centre.
+///
+/// Both fields are restored only when present, so a config written before the
+/// viewport was persisted leaves `PaneState::with_site`'s defaults intact rather
+/// than snapping every pane to zoom 0 over the Atlantic.
+///
+/// A rejected zoom is not an error worth propagating. `walkers` clamps to a
+/// valid range and refuses anything outside it; the saved value came from
+/// `walkers` in the first place, so the only way to land here is a hand-edited
+/// or version-skewed config, where keeping the default is the right answer.
+fn restore_viewport(pane: &mut PaneState, pc: &PaneConfig) {
+    if let Some(zoom) = pc.zoom
+        && pane.map_memory.set_zoom(zoom).is_err()
+    {
+        log::warn!("saved zoom {zoom} is out of range; keeping the default");
+    }
+    // No `else`: a saved `None` means the map was following its site, which is
+    // already the state a fresh `MapMemory` is in. Calling `follow_my_position`
+    // here would be a no-op on a fresh pane and would fight the pane-reuse path
+    // on a reload, so leaving it alone is both simpler and more correct.
+    if let Some((lat, lon)) = pc.center {
+        pane.map_memory.center_at(walkers::lat_lon(lat, lon));
     }
 }
 
@@ -338,6 +434,94 @@ mod tests {
         assert_eq!(restored.loop_lookback_secs, 7200);
         assert_eq!(restored.loop_speed_fps, 12.5);
         assert!(!restored.viewport_sync);
+    }
+
+    /// Zoom and pan are what "come back to where I left off" actually means, and
+    /// neither was persisted before.
+    #[test]
+    fn a_panned_and_zoomed_map_comes_back_where_it_was_left() {
+        let store = MemoryConfigStore::default();
+
+        let baseline = crate::Gui::new();
+        let default_zoom = baseline.pane(0).unwrap().map_memory.zoom();
+        assert_ne!(
+            default_zoom, 9.0,
+            "the test zoom must differ from the default"
+        );
+        assert!(
+            baseline.pane(0).unwrap().map_memory.detached().is_none(),
+            "a fresh pane follows its site; the test then pans it away"
+        );
+
+        let mut gui = crate::Gui::new();
+        {
+            let pane = gui.pane_mut(0).unwrap();
+            pane.map_memory.set_zoom(9.0).unwrap();
+            pane.map_memory
+                .center_at(walkers::lat_lon(44.9778, -93.2650));
+        }
+        gui.save_ui_config(&store);
+
+        let mut restored = crate::Gui::new();
+        restored.load_ui_config(&store);
+
+        let pane = restored.pane(0).unwrap();
+        assert_eq!(pane.map_memory.zoom(), 9.0);
+        let center = pane.map_memory.detached().expect("the pan was persisted");
+        // `Position` is (x, y) = (lon, lat). A transposition here is silently a
+        // valid coordinate, just the wrong hemisphere.
+        assert!((center.y() - 44.9778).abs() < 1e-9, "lat {}", center.y());
+        assert!((center.x() + 93.2650).abs() < 1e-9, "lon {}", center.x());
+    }
+
+    /// Following the site and being centred on the site's coordinates look the
+    /// same until the pane changes site, at which point one moves and the other
+    /// does not. A round trip must not silently convert the first into the second.
+    #[test]
+    fn a_map_following_its_site_does_not_come_back_pinned() {
+        let store = MemoryConfigStore::default();
+
+        let mut gui = crate::Gui::new();
+        gui.pane_mut(0).unwrap().map_memory.set_zoom(7.0).unwrap();
+        assert!(gui.pane(0).unwrap().map_memory.detached().is_none());
+        gui.save_ui_config(&store);
+
+        let mut restored = crate::Gui::new();
+        restored.load_ui_config(&store);
+
+        assert_eq!(restored.pane(0).unwrap().map_memory.zoom(), 7.0);
+        assert!(
+            restored.pane(0).unwrap().map_memory.detached().is_none(),
+            "an un-panned map was restored as pinned to a fixed centre"
+        );
+    }
+
+    /// Configs written before the viewport was persisted must keep the built-in
+    /// default zoom rather than being read as "saved zoom 0".
+    #[test]
+    fn a_config_predating_viewport_persistence_keeps_the_default_zoom() {
+        let store = MemoryConfigStore::default();
+        let default_zoom = crate::Gui::new().pane(0).unwrap().map_memory.zoom();
+
+        // A config with panes but no `zoom`/`center` keys at all — exactly the
+        // shape every already-installed copy of the app has on disk right now.
+        store
+            .store(
+                UI_CONFIG_KEY,
+                r#"{"pane_count":1,"site":"KMPX","panes":[{"site":"KMPX"}]}"#,
+            )
+            .unwrap();
+
+        let mut restored = crate::Gui::new();
+        restored.load_ui_config(&store);
+
+        assert_eq!(restored.pane(0).unwrap().site, "KMPX");
+        assert_eq!(
+            restored.pane(0).unwrap().map_memory.zoom(),
+            default_zoom,
+            "an absent zoom was treated as a saved value"
+        );
+        assert!(restored.pane(0).unwrap().map_memory.detached().is_none());
     }
 
     /// A pane layout wider than a phone offers survives the round trip.

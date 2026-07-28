@@ -47,15 +47,22 @@ pub(crate) type Insets = (f32, f32, f32, f32);
 ///
 /// `config_store` hands out a fresh `Box` per call, so the backing store has to
 /// outlive the box for a test to read back what the app persisted through it.
-pub(crate) struct SharedStore(Rc<MemoryConfigStore>);
+pub(crate) struct SharedStore {
+    inner: Rc<MemoryConfigStore>,
+    writes: Rc<std::cell::Cell<usize>>,
+}
 
 impl ConfigStore for SharedStore {
     fn load(&self, key: &str) -> Option<String> {
-        self.0.load(key)
+        self.inner.load(key)
     }
 
     fn store(&self, key: &str, value: &str) -> Result<(), String> {
-        self.0.store(key, value)
+        // Counted, not just recorded. The autosave runs on a timer for the life
+        // of the process, so "does an unchanged config still write?" is a
+        // question about cost that reading the stored value cannot answer.
+        self.writes.set(self.writes.get() + 1);
+        self.inner.store(key, value)
     }
 }
 
@@ -99,6 +106,7 @@ pub(crate) struct TestBridge {
     gps_fix_receiver: Option<Receiver<rustdar_gps::GpsFix>>,
     heading_receiver: Option<Receiver<f32>>,
     gps: GpsRecord,
+    writes: Rc<std::cell::Cell<usize>>,
     /// What `iana_timezone` answers. `None` stands for the platforms and
     /// environments that cannot say — a container with no zone configured, or a
     /// browser too old for `Intl` — where the app must keep its own default.
@@ -122,6 +130,7 @@ impl TestBridge {
             gps_fix_receiver: None,
             heading_receiver: None,
             gps: Rc::new(RefCell::new(None)),
+            writes: Rc::new(std::cell::Cell::new(0)),
             timezone: None,
         }
     }
@@ -163,6 +172,11 @@ impl TestBridge {
     /// before the app loads it and for reading back what the app saved.
     pub(crate) fn store(&self) -> Rc<MemoryConfigStore> {
         Rc::clone(&self.store)
+    }
+
+    /// How many times the app has written config through this bridge.
+    pub(crate) fn write_count(&self) -> Rc<std::cell::Cell<usize>> {
+        Rc::clone(&self.writes)
     }
 
     /// See [`GpsRecord`].
@@ -262,9 +276,12 @@ impl PlatformBridge for TestBridge {
     /// what makes `App::set_config_dir` observable: before it, there is no
     /// store to load from.
     fn config_store(&self) -> Option<Box<dyn ConfigStore>> {
-        self.config_dir
-            .as_ref()
-            .map(|_| Box::new(SharedStore(Rc::clone(&self.store))) as Box<_>)
+        self.config_dir.as_ref().map(|_| {
+            Box::new(SharedStore {
+                inner: Rc::clone(&self.store),
+                writes: Rc::clone(&self.writes),
+            }) as Box<_>
+        })
     }
 
     fn iana_timezone(&self) -> Option<String> {

@@ -48,57 +48,233 @@ struct ZoneAnchor {
 /// cover. `anchors_sit_within_plausible_radar_range` holds the line.
 static ZONE_ANCHORS: &[ZoneAnchor] = &[
     // Eastern
-    ZoneAnchor { zone: "America/New_York", lat: 40.7128, lon: -74.0060 },
-    ZoneAnchor { zone: "America/Detroit", lat: 42.3314, lon: -83.0458 },
-    ZoneAnchor { zone: "America/Kentucky/Louisville", lat: 38.2527, lon: -85.7585 },
-    ZoneAnchor { zone: "America/Kentucky/Monticello", lat: 36.8298, lon: -84.8491 },
-    ZoneAnchor { zone: "America/Indiana/Indianapolis", lat: 39.7684, lon: -86.1581 },
-    ZoneAnchor { zone: "America/Indiana/Vincennes", lat: 38.6773, lon: -87.5286 },
-    ZoneAnchor { zone: "America/Indiana/Winamac", lat: 41.0514, lon: -86.6033 },
-    ZoneAnchor { zone: "America/Indiana/Marengo", lat: 38.3695, lon: -86.3439 },
-    ZoneAnchor { zone: "America/Indiana/Petersburg", lat: 38.4917, lon: -87.2786 },
-    ZoneAnchor { zone: "America/Indiana/Vevay", lat: 38.7478, lon: -85.0672 },
-    ZoneAnchor { zone: "America/Indiana/Tell_City", lat: 37.9515, lon: -86.7678 },
-    ZoneAnchor { zone: "America/Indiana/Knox", lat: 41.2959, lon: -86.6250 },
-    ZoneAnchor { zone: "America/Toronto", lat: 43.6532, lon: -79.3832 },
-    ZoneAnchor { zone: "America/Montreal", lat: 45.5019, lon: -73.5674 },
-    ZoneAnchor { zone: "America/Nassau", lat: 25.0443, lon: -77.3504 },
+    ZoneAnchor {
+        zone: "America/New_York",
+        lat: 40.7128,
+        lon: -74.0060,
+    },
+    ZoneAnchor {
+        zone: "America/Detroit",
+        lat: 42.3314,
+        lon: -83.0458,
+    },
+    ZoneAnchor {
+        zone: "America/Kentucky/Louisville",
+        lat: 38.2527,
+        lon: -85.7585,
+    },
+    ZoneAnchor {
+        zone: "America/Kentucky/Monticello",
+        lat: 36.8298,
+        lon: -84.8491,
+    },
+    ZoneAnchor {
+        zone: "America/Indiana/Indianapolis",
+        lat: 39.7684,
+        lon: -86.1581,
+    },
+    ZoneAnchor {
+        zone: "America/Indiana/Vincennes",
+        lat: 38.6773,
+        lon: -87.5286,
+    },
+    ZoneAnchor {
+        zone: "America/Indiana/Winamac",
+        lat: 41.0514,
+        lon: -86.6033,
+    },
+    ZoneAnchor {
+        zone: "America/Indiana/Marengo",
+        lat: 38.3695,
+        lon: -86.3439,
+    },
+    ZoneAnchor {
+        zone: "America/Indiana/Petersburg",
+        lat: 38.4917,
+        lon: -87.2786,
+    },
+    ZoneAnchor {
+        zone: "America/Indiana/Vevay",
+        lat: 38.7478,
+        lon: -85.0672,
+    },
+    ZoneAnchor {
+        zone: "America/Indiana/Tell_City",
+        lat: 37.9515,
+        lon: -86.7678,
+    },
+    ZoneAnchor {
+        zone: "America/Indiana/Knox",
+        lat: 41.2959,
+        lon: -86.6250,
+    },
+    ZoneAnchor {
+        zone: "America/Toronto",
+        lat: 43.6532,
+        lon: -79.3832,
+    },
+    ZoneAnchor {
+        zone: "America/Montreal",
+        lat: 45.5019,
+        lon: -73.5674,
+    },
+    ZoneAnchor {
+        zone: "America/Nassau",
+        lat: 25.0443,
+        lon: -77.3504,
+    },
     // Central
-    ZoneAnchor { zone: "America/Chicago", lat: 41.8781, lon: -87.6298 },
-    ZoneAnchor { zone: "America/Menominee", lat: 45.1078, lon: -87.6142 },
-    ZoneAnchor { zone: "America/North_Dakota/Center", lat: 47.1164, lon: -101.2996 },
-    ZoneAnchor { zone: "America/North_Dakota/New_Salem", lat: 46.8450, lon: -101.4118 },
-    ZoneAnchor { zone: "America/North_Dakota/Beulah", lat: 47.2636, lon: -101.7779 },
-    ZoneAnchor { zone: "America/Winnipeg", lat: 49.8951, lon: -97.1384 },
-    ZoneAnchor { zone: "America/Regina", lat: 50.4452, lon: -104.6189 },
-    ZoneAnchor { zone: "America/Monterrey", lat: 25.6866, lon: -100.3161 },
+    ZoneAnchor {
+        zone: "America/Chicago",
+        lat: 41.8781,
+        lon: -87.6298,
+    },
+    ZoneAnchor {
+        zone: "America/Menominee",
+        lat: 45.1078,
+        lon: -87.6142,
+    },
+    ZoneAnchor {
+        zone: "America/North_Dakota/Center",
+        lat: 47.1164,
+        lon: -101.2996,
+    },
+    ZoneAnchor {
+        zone: "America/North_Dakota/New_Salem",
+        lat: 46.8450,
+        lon: -101.4118,
+    },
+    ZoneAnchor {
+        zone: "America/North_Dakota/Beulah",
+        lat: 47.2636,
+        lon: -101.7779,
+    },
+    ZoneAnchor {
+        zone: "America/Winnipeg",
+        lat: 49.8951,
+        lon: -97.1384,
+    },
+    ZoneAnchor {
+        zone: "America/Regina",
+        lat: 50.4452,
+        lon: -104.6189,
+    },
+    ZoneAnchor {
+        zone: "America/Monterrey",
+        lat: 25.6866,
+        lon: -100.3161,
+    },
     // Mountain
-    ZoneAnchor { zone: "America/Denver", lat: 39.7392, lon: -104.9903 },
-    ZoneAnchor { zone: "America/Boise", lat: 43.6150, lon: -116.2023 },
-    ZoneAnchor { zone: "America/Phoenix", lat: 33.4484, lon: -112.0740 },
-    ZoneAnchor { zone: "America/Chihuahua", lat: 28.6330, lon: -106.0691 },
+    ZoneAnchor {
+        zone: "America/Denver",
+        lat: 39.7392,
+        lon: -104.9903,
+    },
+    ZoneAnchor {
+        zone: "America/Boise",
+        lat: 43.6150,
+        lon: -116.2023,
+    },
+    ZoneAnchor {
+        zone: "America/Phoenix",
+        lat: 33.4484,
+        lon: -112.0740,
+    },
+    ZoneAnchor {
+        zone: "America/Chihuahua",
+        lat: 28.6330,
+        lon: -106.0691,
+    },
     // Pacific
-    ZoneAnchor { zone: "America/Los_Angeles", lat: 34.0522, lon: -118.2437 },
-    ZoneAnchor { zone: "America/Vancouver", lat: 49.2827, lon: -123.1207 },
-    ZoneAnchor { zone: "America/Tijuana", lat: 32.5149, lon: -117.0382 },
+    ZoneAnchor {
+        zone: "America/Los_Angeles",
+        lat: 34.0522,
+        lon: -118.2437,
+    },
+    ZoneAnchor {
+        zone: "America/Vancouver",
+        lat: 49.2827,
+        lon: -123.1207,
+    },
+    ZoneAnchor {
+        zone: "America/Tijuana",
+        lat: 32.5149,
+        lon: -117.0382,
+    },
     // Alaska, Hawaii and the territories, each of which has its own radars and
     // would otherwise be sent thousands of miles to the mainland.
-    ZoneAnchor { zone: "America/Anchorage", lat: 61.2181, lon: -149.9003 },
-    ZoneAnchor { zone: "America/Juneau", lat: 58.3019, lon: -134.4197 },
-    ZoneAnchor { zone: "America/Sitka", lat: 57.0531, lon: -135.3300 },
-    ZoneAnchor { zone: "America/Yakutat", lat: 59.5469, lon: -139.7272 },
-    ZoneAnchor { zone: "America/Nome", lat: 64.5011, lon: -165.4064 },
-    ZoneAnchor { zone: "America/Metlakatla", lat: 55.1292, lon: -131.5758 },
-    ZoneAnchor { zone: "Pacific/Honolulu", lat: 21.3069, lon: -157.8583 },
-    ZoneAnchor { zone: "Pacific/Guam", lat: 13.4443, lon: 144.7937 },
-    ZoneAnchor { zone: "Pacific/Saipan", lat: 15.1770, lon: 145.7500 },
-    ZoneAnchor { zone: "America/Puerto_Rico", lat: 18.4655, lon: -66.1057 },
-    ZoneAnchor { zone: "America/St_Thomas", lat: 18.3419, lon: -64.9307 },
-    ZoneAnchor { zone: "America/Virgin", lat: 18.3419, lon: -64.9307 },
+    ZoneAnchor {
+        zone: "America/Anchorage",
+        lat: 61.2181,
+        lon: -149.9003,
+    },
+    ZoneAnchor {
+        zone: "America/Juneau",
+        lat: 58.3019,
+        lon: -134.4197,
+    },
+    ZoneAnchor {
+        zone: "America/Sitka",
+        lat: 57.0531,
+        lon: -135.3300,
+    },
+    ZoneAnchor {
+        zone: "America/Yakutat",
+        lat: 59.5469,
+        lon: -139.7272,
+    },
+    ZoneAnchor {
+        zone: "America/Nome",
+        lat: 64.5011,
+        lon: -165.4064,
+    },
+    ZoneAnchor {
+        zone: "America/Metlakatla",
+        lat: 55.1292,
+        lon: -131.5758,
+    },
+    ZoneAnchor {
+        zone: "Pacific/Honolulu",
+        lat: 21.3069,
+        lon: -157.8583,
+    },
+    ZoneAnchor {
+        zone: "Pacific/Guam",
+        lat: 13.4443,
+        lon: 144.7937,
+    },
+    ZoneAnchor {
+        zone: "Pacific/Saipan",
+        lat: 15.1770,
+        lon: 145.7500,
+    },
+    ZoneAnchor {
+        zone: "America/Puerto_Rico",
+        lat: 18.4655,
+        lon: -66.1057,
+    },
+    ZoneAnchor {
+        zone: "America/St_Thomas",
+        lat: 18.3419,
+        lon: -64.9307,
+    },
+    ZoneAnchor {
+        zone: "America/Virgin",
+        lat: 18.3419,
+        lon: -64.9307,
+    },
     // Overseas WSR-88D sites. Small populations, but the alternative for them is
     // a radar on the other side of the planet.
-    ZoneAnchor { zone: "Atlantic/Azores", lat: 38.7333, lon: -27.0833 },
-    ZoneAnchor { zone: "Asia/Seoul", lat: 37.5665, lon: 126.9780 },
+    ZoneAnchor {
+        zone: "Atlantic/Azores",
+        lat: 38.7333,
+        lon: -27.0833,
+    },
+    ZoneAnchor {
+        zone: "Asia/Seoul",
+        lat: 37.5665,
+        lon: 126.9780,
+    },
 ];
 
 /// A representative coordinate for `zone`, or `None` if it is not one we map.

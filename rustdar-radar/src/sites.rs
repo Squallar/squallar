@@ -1407,7 +1407,10 @@ mod nearest_tests {
         // otherwise silently stop mattering while the assertion above still
         // passed for the wrong reason.
         let (unfiltered, _) = nearest_radar_site(35.4676, -97.5164).expect("a finite coordinate");
-        assert_eq!(unfiltered.name, "TOKC", "the literal nearest site is a TDWR");
+        assert_eq!(
+            unfiltered.name, "TOKC",
+            "the literal nearest site is a TDWR"
+        );
 
         let (nearest_88d, _) = nearest_site_where(35.4676, -97.5164, RadarSite::is_wsr88d)
             .expect("a finite coordinate");

@@ -5,7 +5,7 @@ use winit::application::ApplicationHandler;
 #[cfg(not(target_arch = "wasm32"))]
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
-use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::{Window, WindowId};
 
 use crate::WindowRef;
@@ -231,6 +231,7 @@ pub struct App {
     /// can scope their requests. `None` until the first frame that draws an
     /// overlay; `metar::networks::DEFAULT_VIEWPORT` covers that window.
     last_viewport: Option<rustdar_overlays::types::GeoBounds>,
+    autosave: AutosaveState,
     /// Whether the current site was guessed from the timezone rather than chosen.
     ///
     /// A guessed site is the one thing a location fix is allowed to overwrite.
@@ -239,6 +240,60 @@ pub struct App {
     /// them, however far they later travel.
     site_is_provisional: bool,
 }
+
+/// Bookkeeping for the periodic config write.
+///
+/// # Why this exists
+///
+/// Configuration used to be written from exactly two places: [`request_exit`]
+/// and [`suspended`]. Both are real save points on a desktop or a phone, and
+/// neither one happens in a browser. Closing a tab, navigating away, or having
+/// the tab discarded under memory pressure runs no Rust at all — so the web
+/// build persisted nothing unless the user went out of their way to pick Exit
+/// from the menu, and a session's site, layout and viewport died with the tab.
+///
+/// A `beforeunload` handler would be the obvious browser-shaped fix, and it is
+/// the wrong one: it is not delivered for a discarded tab or a killed process,
+/// it needs a path from a JS callback back into `App`'s state, and it is a
+/// mechanism only one of the three platforms has. Writing periodically instead
+/// costs one serialization every few seconds and is correct under every way a
+/// session can end, including the ones that run no shutdown code — a killed
+/// process, an OOM, a crash. The existing exit and suspend saves stay: they make
+/// the *last* few seconds durable on the platforms that do get notice.
+///
+/// [`request_exit`]: App::request_exit
+/// [`suspended`]: App::suspended
+struct AutosaveState {
+    /// When the config was last examined for changes.
+    last_check: Option<web_time::Instant>,
+    /// The JSON most recently written, so an unchanged config costs a
+    /// serialization and a string compare rather than a storage write.
+    ///
+    /// Comparing serialized output is what lets this work without a dirty flag
+    /// threaded through every mutation in the UI. A flag would be cheaper and
+    /// would be wrong the first time someone adds a setting and forgets to set
+    /// it; this cannot drift out of sync with what is actually persisted.
+    last_written: Option<String>,
+    /// Whether any event has arrived that could have changed the config.
+    ///
+    /// Deliberately coarse — it is set by *any* window event, most of which
+    /// change nothing. Its only job is to distinguish "this session has seen
+    /// activity" from "this tab has been sitting untouched", so that
+    /// [`schedule_autosave_wakeup`] does not keep an idle app awake. A false
+    /// positive costs one serialization; the string compare then finds nothing
+    /// to write.
+    ///
+    /// [`schedule_autosave_wakeup`]: App::schedule_autosave_wakeup
+    touched: bool,
+}
+
+/// How often the config is examined for changes.
+///
+/// The cost of a check is one `serde_json` serialization of a small struct. The
+/// cost of setting this too high is losing that many seconds of work when a tab
+/// is closed. Three seconds keeps a pan-and-zoom durable at human timescales
+/// while staying far below the rate at which anything here is edited.
+const AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Point a fresh `Gui` at the radar nearest this device's timezone.
 ///
@@ -308,10 +363,13 @@ impl App {
 
         let mut gui = Gui::new();
         gui.set_supports_exit(platform.supports_exit());
-        if let Some(store) = platform.config_store() {
-            gui.load_ui_config(store.as_ref());
-        }
-        let site_is_provisional = apply_location_hint(&mut gui, platform.as_ref());
+        let restored = platform
+            .config_store()
+            .is_some_and(|store| gui.load_ui_config(store.as_ref()));
+        // Android has no config dir yet at this point and loads later in
+        // `set_config_dir`, so `restored` is false there even for a returning
+        // user. That is handled where the real load happens, not here.
+        let site_is_provisional = !restored && apply_location_hint(&mut gui, platform.as_ref());
 
         Self {
             instance,
@@ -327,6 +385,14 @@ impl App {
             old_textures: Vec::new(),
             cached_dark_theme: None,
             exit_requested: false,
+            // `last_written` starts empty rather than seeded from the config
+            // just loaded. The two differ whenever this build added a field, and
+            // that first corrective write is exactly what should happen.
+            autosave: AutosaveState {
+                last_check: None,
+                last_written: None,
+                touched: false,
+            },
             site_is_provisional,
             http_client,
             #[cfg(not(target_arch = "wasm32"))]
@@ -417,6 +483,11 @@ impl App {
         self.poll_platform_state();
         self.poll_data_channels();
         self.evict_unshown_scans();
+        // Ahead of the minimized and zero-area early returns below: a window
+        // that is minimized or still sizing is exactly one whose session might
+        // be about to end, and skipping the save there is how the last change
+        // gets lost.
+        self.autosave_config(false);
 
         // Skip rendering when minimized
         if let Some(window) = self.window.as_ref()
@@ -805,6 +876,45 @@ impl App {
             .retain(|site, _| shown.iter().any(|shown| *shown == site));
     }
 
+    /// Persist the config if it has changed and the interval has elapsed.
+    ///
+    /// Cheap enough to call every frame: until [`AUTOSAVE_INTERVAL`] is up this
+    /// is a subtraction, and after it a serialization and a string compare. Only
+    /// a genuine change reaches the store.
+    ///
+    /// See [`AutosaveState`] for why the config is written on a timer rather
+    /// than at shutdown.
+    fn autosave_config(&mut self, force: bool) {
+        let now = web_time::Instant::now();
+        if !force
+            && let Some(last) = self.autosave.last_check
+            && now.duration_since(last) < AUTOSAVE_INTERVAL
+        {
+            return;
+        }
+        self.autosave.last_check = Some(now);
+        // The check is happening now, so activity up to this point is accounted
+        // for. Anything arriving after re-arms it and earns another wake-up.
+        self.autosave.touched = false;
+
+        let Some(json) = self.gui.ui_config_json() else {
+            return;
+        };
+        if self.autosave.last_written.as_deref() == Some(json.as_str()) {
+            return;
+        }
+        let Some(store) = self.platform.config_store() else {
+            return;
+        };
+        match store.store(rustdar_egui::config_store::UI_CONFIG_KEY, &json) {
+            Ok(()) => self.autosave.last_written = Some(json),
+            // Not fatal and not retried on a shorter timer: the next tick tries
+            // again anyway, and a full `localStorage` would otherwise log once
+            // per frame forever.
+            Err(e) => log::warn!("config autosave failed: {e}"),
+        }
+    }
+
     /// Replace a timezone-guessed site with the one nearest an actual fix.
     ///
     /// This is the silent upgrade the timezone guess exists to be replaced by:
@@ -842,6 +952,35 @@ impl App {
             site.name
         );
         self.gui.set_initial_site(site.name);
+    }
+
+    /// Arrange for one more frame if a change might still be unsaved.
+    ///
+    /// The app runs on `ControlFlow::Wait` and redraws only when something
+    /// happens, which leaves a gap the timer alone cannot close: the user pans
+    /// the map, the pan's final frame lands less than [`AUTOSAVE_INTERVAL`]
+    /// after the previous check, nothing else happens, and the app sleeps
+    /// forever holding an unwritten change. Asking for a wake-up once the
+    /// interval is up gives that change a frame to be saved on.
+    ///
+    /// Only when something has actually happened. Scheduling unconditionally
+    /// would turn an idle tab into a 0.33 Hz poll for no benefit, which is the
+    /// cost `ControlFlow::Wait` was chosen to avoid in the first place.
+    fn schedule_autosave_wakeup(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.autosave.touched {
+            return;
+        }
+        let deadline = self
+            .autosave
+            .last_check
+            .map(|last| last + AUTOSAVE_INTERVAL)
+            .unwrap_or_else(web_time::Instant::now);
+        // `wait_duration` rather than `WaitUntil`: winit's `Instant` is
+        // `std::time`'s natively and `web_time`'s on wasm, so no single instant
+        // value typechecks for both targets. A duration does, and the helper
+        // also degrades an overflowing deadline to a plain `Wait`.
+        let delay = deadline.saturating_duration_since(web_time::Instant::now());
+        event_loop.set_control_flow(ControlFlow::wait_duration(delay));
     }
 
     /// Request application exit - handles both GUI and keyboard exit requests
@@ -1163,6 +1302,7 @@ impl ApplicationHandler for App {
         if self.platform.poll_back_press() {
             self.back_out(event_loop);
         }
+        self.schedule_autosave_wakeup(event_loop);
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
@@ -1236,6 +1376,13 @@ impl ApplicationHandler for App {
                 }
             }
             _ => {
+                // Everything the user does to change the config — clicking,
+                // dragging, typing, panning — arrives here, so this is where the
+                // autosave learns it has something to look at. Deliberately not
+                // set for the named arms above: a redraw is the frame the
+                // autosave wake-up itself asks for, and re-arming from it would
+                // never let an idle app sleep.
+                self.autosave.touched = true;
                 // For other events, request redraw only if egui needs it
                 if needs_repaint {
                     notify_redraw(&self.window);
@@ -1878,7 +2025,11 @@ mod tests {
         let mut bridge = TestBridge::desktop().with_timezone("America/Chicago");
         let fixes = bridge.gps_channel();
         let mut app = headless(bridge);
-        assert_eq!(opening_site(&app), "KLOT", "the guess is the starting point");
+        assert_eq!(
+            opening_site(&app),
+            "KLOT",
+            "the guess is the starting point"
+        );
 
         // Duluth, Minnesota: same timezone, a different radar.
         fixes
@@ -1939,6 +2090,105 @@ mod tests {
             "KDLH",
             "a second fix moved a site that was already settled"
         );
+    }
+
+    // ── Autosave ────────────────────────────────────────────────────────
+
+    /// The bug this exists for. Config used to be written only from
+    /// `request_exit` and `suspended`; a browser tab close runs neither, so the
+    /// web build persisted nothing at all.
+    #[test]
+    fn config_is_persisted_without_an_exit_or_a_suspend() {
+        let bridge = TestBridge::desktop();
+        let store = bridge.store();
+        let mut app = headless(bridge);
+
+        app.gui.loop_speed_fps = STORED_FPS;
+        app.autosave_config(true);
+
+        assert_eq!(
+            stored_fps(&store),
+            STORED_FPS,
+            "a change was lost because nothing but exit and suspend ever saved"
+        );
+    }
+
+    /// An idle app must not rewrite an unchanged config every three seconds for
+    /// the life of the process.
+    #[test]
+    fn an_unchanged_config_is_not_rewritten() {
+        let bridge = TestBridge::desktop();
+        let writes = bridge.write_count();
+        let mut app = headless(bridge);
+
+        app.gui.loop_speed_fps = STORED_FPS;
+        app.autosave_config(true);
+        let after_change = writes.get();
+        assert!(after_change > 0, "the change was never written at all");
+
+        for _ in 0..10 {
+            app.autosave_config(true);
+        }
+        assert_eq!(
+            writes.get(),
+            after_change,
+            "an unchanged config is being rewritten on every tick"
+        );
+    }
+
+    /// Having saved once must not stop the next change being saved.
+    #[test]
+    fn a_later_change_is_written_after_an_idle_period() {
+        let bridge = TestBridge::desktop();
+        let store = bridge.store();
+        let mut app = headless(bridge);
+
+        app.gui.loop_speed_fps = STORED_FPS;
+        app.autosave_config(true);
+        app.autosave_config(true);
+
+        app.gui.loop_speed_fps = 3.5;
+        app.autosave_config(true);
+
+        assert_eq!(stored_fps(&store), 3.5);
+    }
+
+    /// The interval is what keeps this cheap, so it has to actually gate. A
+    /// forced call is the only one allowed through immediately.
+    #[test]
+    fn autosave_respects_its_interval() {
+        let bridge = TestBridge::desktop();
+        let writes = bridge.write_count();
+        let mut app = headless(bridge);
+
+        // The first unforced call has no previous check to compare against and
+        // establishes the baseline.
+        app.autosave_config(false);
+        let baseline = writes.get();
+
+        app.gui.loop_speed_fps = STORED_FPS;
+        app.autosave_config(false);
+        assert_eq!(
+            writes.get(),
+            baseline,
+            "a change was written before the interval elapsed, so the timer is \
+             not gating and this runs every frame"
+        );
+    }
+
+    /// A timezone-guessed site has to reach storage like any other, or a first
+    /// run guesses again every launch and a returning user is never recognised.
+    #[test]
+    fn a_guessed_site_is_persisted() {
+        let bridge = TestBridge::desktop().with_timezone("America/Denver");
+        let store = bridge.store();
+        let mut app = headless(bridge);
+
+        app.autosave_config(true);
+
+        let mut reloaded = Gui::new();
+        assert!(reloaded.load_ui_config(store.as_ref()));
+        assert_eq!(reloaded.pane(0).unwrap().site, "KFTG");
     }
 
     /// Set by the back handler the app installs, so a test can see it *ran*
