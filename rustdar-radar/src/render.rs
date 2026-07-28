@@ -567,6 +567,10 @@ pub fn render_radar_to_image_with_winds(
     radar_lon: f64,
     wind_levels: Option<&[(f64, f64, f64)]>,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+    if product == types::RadarProduct::EchoTopsInterpolated {
+        return render_echo_tops_interp_to_image(data, radar_lat, radar_lon);
+    }
+
     let radials = find_sweep(data, product, elevation_angle)?;
 
     if product == types::RadarProduct::NormalizedRotation {
@@ -776,6 +780,42 @@ fn build_velocity_grid(radials: &[Radial]) -> Option<VelocityGrid> {
         first_gate_range_km,
         gate_interval_km,
     })
+}
+
+/// Render interpolated echo tops: the whole reflectivity volume reduced to a
+/// 1° × 1 km polar grid of threshold-crossing heights, painted with the echo
+/// tops palette. Tilt-independent — every elevation request renders the same
+/// volume product.
+pub fn render_echo_tops_interp_to_image(
+    scan: &Scan,
+    radar_lat: f64,
+    radar_lon: f64,
+) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+    let grid = crate::volumetric::compute_echo_tops(scan);
+    let max_range = grid.range_bins as f64;
+    let output = render_with_projection(
+        radar_lat,
+        radar_lon,
+        max_range,
+        types::RadarProduct::EchoTopsInterpolated,
+        "Radar",
+        |proj, bufs| {
+            grid.values.par_iter().enumerate().for_each(|(az, row)| {
+                let ctx = RadialContext::new(az as f64 + 0.5, 0.5);
+                for (r, v) in row.iter().enumerate() {
+                    if v.is_nan() {
+                        continue;
+                    }
+                    let from = GateId {
+                        radial: az,
+                        gate: r,
+                    };
+                    proj.render_gate(bufs, &ctx, r as f64 + 0.5, 1.0, *v, from);
+                }
+            });
+        },
+    );
+    Some(output)
 }
 
 /// Render a Level III radial product, as [`render_radar_to_image`] does for a

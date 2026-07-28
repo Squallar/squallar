@@ -74,7 +74,7 @@ pub fn get_color_for_value(product: RadarProduct, value: f32) -> (u8, u8, u8, u8
             let (r, g, b) = scale_color(KDP, value);
             (r, g, b, TRANSPARENCY)
         }
-        RadarProduct::EchoTops => {
+        RadarProduct::EchoTops | RadarProduct::EchoTopsInterpolated => {
             if value < 5.0 {
                 return (0, 0, 0, 0);
             }
@@ -466,7 +466,7 @@ pub fn get_legend_scale(product: RadarProduct) -> LegendScale {
         RadarProduct::CorrelationCoefficient => extract_scale(RHO),
         RadarProduct::DifferentialPhase => extract_scale(PHI),
         RadarProduct::SpecificDifferentialPhase => extract_scale(KDP),
-        RadarProduct::EchoTops => extract_scale(ECHO_TOPS),
+        RadarProduct::EchoTops | RadarProduct::EchoTopsInterpolated => extract_scale(ECHO_TOPS),
         RadarProduct::VerticallyIntegratedLiquid => extract_scale(VIL),
         RadarProduct::HydrometeorClassification => extract_scale(HHC),
         RadarProduct::PrecipitationRate => extract_scale(PRECIP_RATE),

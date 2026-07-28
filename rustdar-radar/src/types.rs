@@ -197,6 +197,7 @@ pub enum RadarProduct {
     StormRelativeVelocity,
     SpecificDifferentialPhase,
     EchoTops,
+    EchoTopsInterpolated,
     VerticallyIntegratedLiquid,
     HydrometeorClassification,
     PrecipitationRate,
@@ -215,6 +216,7 @@ impl RadarProduct {
             RadarProduct::StormRelativeVelocity => "srv",
             RadarProduct::SpecificDifferentialPhase => "kdp",
             RadarProduct::EchoTops => "eet",
+            RadarProduct::EchoTopsInterpolated => "eti",
             RadarProduct::VerticallyIntegratedLiquid => "vil",
             RadarProduct::HydrometeorClassification => "hhc",
             RadarProduct::PrecipitationRate => "dpr",
@@ -233,6 +235,7 @@ impl RadarProduct {
             RadarProduct::StormRelativeVelocity => "Storm-Relative Velocity",
             RadarProduct::SpecificDifferentialPhase => "Specific Differential Phase",
             RadarProduct::EchoTops => "Echo Tops",
+            RadarProduct::EchoTopsInterpolated => "Echo Tops (Interp)",
             RadarProduct::VerticallyIntegratedLiquid => "Vertically Integrated Liquid",
             RadarProduct::HydrometeorClassification => "Hydrometeor Classification",
             RadarProduct::PrecipitationRate => "Precipitation Rate",
@@ -251,6 +254,7 @@ impl RadarProduct {
             RadarProduct::StormRelativeVelocity,
             RadarProduct::SpecificDifferentialPhase,
             RadarProduct::EchoTops,
+            RadarProduct::EchoTopsInterpolated,
             RadarProduct::VerticallyIntegratedLiquid,
             RadarProduct::HydrometeorClassification,
             RadarProduct::PrecipitationRate,
@@ -271,9 +275,10 @@ impl RadarProduct {
             RadarProduct::StormRelativeVelocity => 7,
             RadarProduct::SpecificDifferentialPhase => 8,
             RadarProduct::EchoTops => 9,
-            RadarProduct::VerticallyIntegratedLiquid => 10,
-            RadarProduct::HydrometeorClassification => 11,
-            RadarProduct::PrecipitationRate => 12,
+            RadarProduct::EchoTopsInterpolated => 10,
+            RadarProduct::VerticallyIntegratedLiquid => 11,
+            RadarProduct::HydrometeorClassification => 12,
+            RadarProduct::PrecipitationRate => 13,
         }
     }
 
@@ -326,6 +331,10 @@ impl RadarProduct {
             RadarProduct::DifferentialPhase => radial.differential_phase(),
             // NROT is derived from velocity
             RadarProduct::NormalizedRotation => radial.velocity(),
+            // Interpolated echo tops integrate the whole reflectivity volume;
+            // tying availability to the reflectivity moment lists it alongside
+            // the reflectivity tilts (the rendered field is tilt-independent).
+            RadarProduct::EchoTopsInterpolated => radial.reflectivity(),
             RadarProduct::StormRelativeVelocity
             | RadarProduct::SpecificDifferentialPhase
             | RadarProduct::EchoTops
@@ -353,9 +362,14 @@ impl RadarProduct {
             RadarProduct::CorrelationCoefficient => format!("Corr. Coefficient: {:.4}", value),
             RadarProduct::DifferentialPhase => format!("Diff. Phase: {:.1}°", value),
             RadarProduct::SpecificDifferentialPhase => format!("KDP: {:.2} °/km", value),
-            RadarProduct::EchoTops => {
+            RadarProduct::EchoTops | RadarProduct::EchoTopsInterpolated => {
                 let converted = prefs.height.convert_kft_to_kilo(value);
-                format!("Echo Tops: {:.1} {}", converted, prefs.height.kilo_suffix())
+                format!(
+                    "{}: {:.1} {}",
+                    self.name(),
+                    converted,
+                    prefs.height.kilo_suffix()
+                )
             }
             RadarProduct::VerticallyIntegratedLiquid => format!("VIL: {:.1} kg/m²", value),
             RadarProduct::HydrometeorClassification => {
@@ -400,7 +414,9 @@ impl RadarProduct {
             RadarProduct::CorrelationCoefficient => "CC",
             RadarProduct::DifferentialPhase => "\u{00b0}",
             RadarProduct::SpecificDifferentialPhase => "\u{00b0}/km",
-            RadarProduct::EchoTops => prefs.height.kilo_suffix(),
+            RadarProduct::EchoTops | RadarProduct::EchoTopsInterpolated => {
+                prefs.height.kilo_suffix()
+            }
             RadarProduct::VerticallyIntegratedLiquid => "kg/m\u{00b2}",
             RadarProduct::HydrometeorClassification => "HHC",
             RadarProduct::PrecipitationRate => prefs.precip_rate.suffix(),

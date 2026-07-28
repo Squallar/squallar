@@ -21,6 +21,7 @@ fn main() {
         "cc" => RadarProduct::CorrelationCoefficient,
         "phi" => RadarProduct::DifferentialPhase,
         "nrot" => RadarProduct::NormalizedRotation,
+        "eti" => RadarProduct::EchoTopsInterpolated,
         other => panic!("unknown product {other}"),
     };
     let out = args.next().expect(usage);
@@ -47,17 +48,6 @@ fn main() {
             .collect()
     });
 
-    if std::env::var("SWEEP_DEBUG").is_ok() {
-        for (si, sw) in scan.sweeps().iter().enumerate() {
-            if let Some(r) = sw.radials().first() {
-                eprintln!(
-                    "sweep {si}: elev {:.2} moment {:?}",
-                    r.elevation_angle_degrees(),
-                    product.get_moment(r).is_some()
-                );
-            }
-        }
-    }
     let (rgba, max_range_km, _values) = rustdar_radar::render::render_radar_to_image_with_winds(
         &scan,
         elevation,
@@ -82,5 +72,3 @@ fn main() {
     std::fs::write(&out, ppm).expect("write ppm");
     eprintln!("wrote {out}");
 }
-
-// (debug helper appended during product audit; remove before commit)
