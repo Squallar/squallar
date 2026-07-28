@@ -19,11 +19,7 @@ const MANIFEST: &str = include_str!("../manifest.webmanifest");
 const SERVICE_WORKER: &str = include_str!("../sw.js");
 const INDEX_HTML: &str = include_str!("../index.html");
 const RASTER_WORKER: &str = include_str!("../worker.js");
-
-/// The one module specifier both the page and the rasterization worker load.
-/// Written out rather than derived so a change to either has to change this
-/// line too — see [`the_rasterization_worker_loads_the_same_module_as_the_page`].
-const GLUE_SPECIFIER: &str = "./pkg/rustdar_web.js";
+const WORKER_PORT: &str = include_str!("../src/worker_port.rs");
 
 fn web_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -80,6 +76,32 @@ fn js_string_list(src: &str, marker: &str) -> Vec<String> {
         rest = &rest[close + 1..];
     }
     out
+}
+
+/// The single-quoted or double-quoted literal that follows `marker`.
+///
+/// Used to read a path out of source rather than restate it here: a test that
+/// hardcodes the same string it is checking passes whether or not the two
+/// files still agree.
+fn literal_after(src: &str, what: &str, marker: &str) -> String {
+    let start = src
+        .find(marker)
+        .unwrap_or_else(|| panic!("{what} no longer contains {marker:?}"))
+        + marker.len();
+    let len = src[start..]
+        .find('"')
+        .unwrap_or_else(|| panic!("unterminated string after {marker:?} in {what}"));
+    src[start..start + len].to_string()
+}
+
+/// The worker script `worker_port.rs` asks the browser for.
+fn requested_worker_url() -> String {
+    literal_after(WORKER_PORT, "worker_port.rs", "const WORKER_URL: &str = \"")
+}
+
+/// The wasm-bindgen glue `index.html`'s module script imports.
+fn page_module_specifier() -> String {
+    literal_after(INDEX_HTML, "index.html", "import init, { start } from \"")
 }
 
 /// Width and height from a PNG's IHDR.
@@ -452,15 +474,26 @@ fn the_worker_precaches_the_manifest_and_both_halves_of_the_wasm_bundle() {
 }
 
 /// The rasterization worker is what keeps a ~160-190 ms Level II frame off the
-/// main thread. Left out of the precache it still *works* — the funnel falls
-/// back to rendering inline — which is exactly why nothing else would notice.
+/// main thread. Every way of losing it is silent — the funnel just falls back
+/// to rendering inline — so the script `worker_port.rs` asks for has to be a
+/// file that exists and an entry the shell precaches, and both are read from
+/// the source that names it rather than restated here.
 #[test]
-fn the_worker_precaches_the_rasterization_worker() {
+fn the_script_the_page_asks_for_is_shipped_and_precached() {
+    let requested = requested_worker_url();
+    let relative = requested.trim_start_matches("./");
+
+    assert!(
+        web_dir().join(relative).is_file(),
+        "worker_port.rs starts {requested:?}, which is not a file in this crate. \
+         The browser would 404 and rasterization would stay on the main thread."
+    );
     let paths = js_string_list(SERVICE_WORKER, "const SHELL_PATHS = [");
     assert!(
-        paths.iter().any(|p| p == "worker.js"),
-        "sw.js does not precache worker.js. Offline, and on any load the shell \
-         answers, rasterization would silently move back onto the main thread."
+        paths.iter().any(|p| p == relative),
+        "sw.js does not precache {relative:?}, which worker_port.rs starts. \
+         Offline, and on any load the shell answers, rasterization would \
+         silently move back onto the main thread."
     );
 }
 
@@ -474,16 +507,12 @@ fn the_worker_precaches_the_rasterization_worker() {
 /// need revisiting together.
 #[test]
 fn the_rasterization_worker_loads_the_same_module_as_the_page() {
+    let glue = page_module_specifier();
     assert!(
-        RASTER_WORKER.contains(&format!("from \"{GLUE_SPECIFIER}\"")),
-        "worker.js does not import {GLUE_SPECIFIER}; a second wasm artifact \
-         needs its own precache entries and its own place in sw.js's per-client \
-         shell pinning"
-    );
-    assert!(
-        INDEX_HTML.contains(&format!("from \"{GLUE_SPECIFIER}\"")),
-        "index.html no longer imports {GLUE_SPECIFIER}; the page and the worker \
-         must load the same module"
+        RASTER_WORKER.contains(&format!("from \"{glue}\"")),
+        "index.html imports {glue:?} but worker.js does not. A second wasm \
+         artifact needs its own precache entries and its own place in sw.js's \
+         per-client shell pinning."
     );
     assert!(
         RASTER_WORKER.contains("rustdar_worker_main"),

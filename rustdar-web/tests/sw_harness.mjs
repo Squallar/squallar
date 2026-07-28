@@ -59,6 +59,7 @@
  * the object on to `cache.match` and `fetch`, both of which are this file's.
  */
 
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
@@ -503,19 +504,37 @@ export async function startWorker({
 // A deployment to serve
 // ---------------------------------------------------------------------------
 
-/** The shell `sw.js` precaches, relative to the deploy directory. */
-export const SHELL_ASSETS = [
-  "",
-  "manifest.webmanifest",
-  "worker.js",
-  "pkg/rustdar_web.js",
-  "pkg/rustdar_web_bg.wasm",
-  "icons/icon-192.png",
-  "icons/icon-512.png",
-  "icons/icon-maskable-512.png",
-  "icons/apple-touch-icon.png",
-  "icons/favicon-32.png",
-];
+/**
+ * The shell `sw.js` precaches, relative to the deploy directory — read out of
+ * `sw.js` itself.
+ *
+ * This list used to be written out here as well. That is a deploy the tests
+ * cannot see: `installShell` calls `cache.addAll`, which is all-or-nothing, so
+ * a shell entry the harness does not publish makes every install fail — 18
+ * suites at once, all of them pointing at caching rather than at the list. And
+ * the inverse is worse and silent: an entry dropped from `sw.js` but left here
+ * still gets served, so the suite keeps passing for an asset that is no longer
+ * precached.
+ *
+ * The extraction is the same shape as the one `build.yaml` uses to check the
+ * staged tree, and `pwa_assets.rs`'s: a flat list of double-quoted strings.
+ * Anything else throws here rather than yielding a plausible short list.
+ */
+export const SHELL_ASSETS = readShellPaths(readFileSync(SW_SOURCE_URL, "utf8"));
+
+function readShellPaths(src) {
+  const list = /const SHELL_PATHS = \[([^\]]*)\]/.exec(src);
+  if (list === null) {
+    throw new Error("sw.js no longer declares `const SHELL_PATHS = [...]`");
+  }
+  const paths = [...list[1].matchAll(/"([^"]*)"/g)].map((m) => m[1]);
+  if (paths.length < 2) {
+    throw new Error(
+      `SHELL_PATHS in sw.js parsed as ${paths.length} entries; the extraction is wrong`,
+    );
+  }
+  return paths;
+}
 
 /**
  * Publish a deploy tagged `tag` at `origin`.
