@@ -81,6 +81,7 @@ mod seq_fallback {
     }
 }
 
+use crate::l3_values::{build_vil_lut, decode_legacy_thresholds, l3_physical_value};
 use crate::palette::get_color_for_value;
 use crate::types;
 use std::f64::consts::PI;
@@ -983,113 +984,6 @@ pub fn render_level3_message_to_image(
     );
 
     render_level3_radial_to_image(rp, product, radar_lat, radar_lon, scale, offset, lut)
-}
-
-/// Build a 256-entry look-up table for Digital VIL (product 134), `None` for
-/// anything else.
-///
-/// VIL is a hybrid linear + logarithmic mapping encoded in NEXRAD 16-bit floats
-/// (not IEEE-754). Thresholds 0..5 carry lin_scale, lin_offset, log_start,
-/// log_scale, log_offset; gates 2..log_start are linear, log_start..254
-/// exponential.
-fn build_vil_lut(pdb: &nexrad_level3::model::ProductDescriptionBlock) -> Option<Vec<f32>> {
-    if pdb.product_code != 134 {
-        return None;
-    }
-    let lin_scale = nexrad_float16(pdb.thresholds[0]);
-    let lin_offset = nexrad_float16(pdb.thresholds[1]);
-    let log_start = pdb.thresholds[2] as usize;
-    let log_scale = nexrad_float16(pdb.thresholds[3]);
-    let log_offset = nexrad_float16(pdb.thresholds[4]);
-
-    let mut lut = vec![f32::NAN; 256];
-    // Gate 0 = below threshold, gate 1 = range folded → NaN
-    for (i, slot) in lut.iter_mut().enumerate().take(log_start.min(255)).skip(2) {
-        *slot = (i as f32 - lin_offset) / lin_scale;
-    }
-    for (i, slot) in lut
-        .iter_mut()
-        .enumerate()
-        .take(255)
-        .skip(log_start.min(255))
-    {
-        *slot = ((i as f32 - log_offset) / log_scale).exp();
-    }
-    // Gate 255 is reserved
-    Some(lut)
-}
-
-/// Decode the 16 legacy data level thresholds into physical values.
-///
-/// For legacy products (e.g. code 56 SRM) each threshold `u16` carries flag
-/// bits in the high byte and the value in the low byte. `NaN` marks a level
-/// that is not displayable.
-fn decode_legacy_thresholds(pdb: &nexrad_level3::model::ProductDescriptionBlock) -> [f32; 16] {
-    let mut lut = [f32::NAN; 16];
-    for (i, &t) in pdb.thresholds.iter().enumerate() {
-        let codes = (t >> 8) as u8;
-        let mut val = (t & 0xFF) as f32;
-
-        if codes & 0x80 != 0 {
-            // Blank, TH (below threshold), ND (no data) or RF (range folded).
-            continue;
-        } else if codes & 0x40 != 0 {
-            val *= 0.01;
-        } else if codes & 0x20 != 0 {
-            val *= 0.05;
-        } else if codes & 0x10 != 0 {
-            val *= 0.1;
-        }
-
-        if codes & 0x01 != 0 {
-            val = -val;
-        }
-
-        lut[i] = val;
-    }
-    lut
-}
-
-/// Decode a NEXRAD-specific 16-bit float: sign (bit 15), exponent (14–10),
-/// fraction (9–0).
-/// `value = (-1)^sign × 2^(exp − 16) × (1 + frac/1024)` when exp ≠ 0,
-/// `value = (-1)^sign × frac / 512` when exp = 0.
-fn nexrad_float16(raw: u16) -> f32 {
-    let frac = (raw & 0x03FF) as f32;
-    let exp = ((raw >> 10) & 0x1F) as i32;
-    let sign = raw >> 15;
-    let value = if exp != 0 {
-        2f32.powi(exp - 16) * (1.0 + frac / 1024.0)
-    } else {
-        frac / 512.0
-    };
-    if sign != 0 { -value } else { value }
-}
-
-/// Level III gate byte to physical value, via LUT or scale/offset. SRV is
-/// converted knots → m/s.
-fn l3_physical_value(
-    gate_value: u16,
-    product: types::RadarProduct,
-    scale: f32,
-    offset: f32,
-    lut: Option<&[f32]>,
-) -> f32 {
-    let v = if let Some(table) = lut {
-        let idx = gate_value as usize;
-        if idx < table.len() {
-            table[idx]
-        } else {
-            f32::NAN
-        }
-    } else {
-        (gate_value as f32 - offset) / scale
-    };
-    if matches!(product, types::RadarProduct::StormRelativeVelocity) {
-        v * 0.514444
-    } else {
-        v
-    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
