@@ -170,11 +170,16 @@ impl From<(Vec<u8>, f64, Vec<f32>)> for RenderedFrame {
 /// decides where work runs, and adding a job kind does not add a dispatch site.
 pub enum Job {
     /// Portable. Goes to the worker when one is attached, and runs through
-    /// [`execute`] when none is.
+    /// [`execute`] when none is. Every rasterizing dispatch is one of these.
     Described(JobRequest),
-    /// Not describable. Level III and derived SRM renders hold decoded product
-    /// structures with no wire form yet, so they run where [`offload`] runs
-    /// things — a thread natively, this frame in the browser.
+    /// Not describable, so it runs where [`offload`] runs things — a thread
+    /// natively, this frame in the browser.
+    ///
+    /// Nothing in production is one today; it is what [`Job::renders_nothing`]
+    /// is built from, and the shape a future job kind takes before it has a
+    /// wire form. Reaching for it for a *rasterizing* job would put that job
+    /// back on the browser's main thread, which is the thing this module
+    /// exists to stop.
     Opaque(Box<dyn FnOnce() -> JobResult + Send>),
 }
 
