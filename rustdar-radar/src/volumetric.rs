@@ -40,6 +40,27 @@ fn beam_height_km(range_km: f64, elev_deg: f64) -> f64 {
     range_km * el.sin() + range_km * range_km / (2.0 * RE_EFF_KM)
 }
 
+/// A sweep's elevation angle: the **median** of its radials' instantaneous
+/// angles. `None` for an empty sweep.
+///
+/// Not the first radial's: the antenna can still be settling onto the cut
+/// when the sweep starts, and the error is not small — a live KMRX volume's
+/// 0.5° cut opened at 0.283° and its 19.5° cut at 19.297°. Keying tilts on
+/// the first radial split SAILS revisits into phantom tilts (and collided
+/// them with neighbouring cuts), and any height ladder built from it sat a
+/// fifth of a degree low.
+pub fn sweep_elevation_deg(radials: &[Radial]) -> Option<f64> {
+    if radials.is_empty() {
+        return None;
+    }
+    let mut els: Vec<f32> = radials
+        .iter()
+        .map(|r| r.elevation_angle_degrees())
+        .collect();
+    els.sort_by(f32::total_cmp);
+    Some(f64::from(els[els.len() / 2]))
+}
+
 /// The statistic collapsing a radial's gates into a 1-km cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CellStat {
@@ -165,7 +186,10 @@ impl VolumeCube {
             let Some(first) = sweep.radials().first() else {
                 continue;
             };
-            let key = (first.elevation_angle_degrees() as f64 * 10.0).round() / 10.0;
+            // Keyed on the sweep's median elevation, not the first radial's —
+            // see [`sweep_elevation_deg`] for what settling does to the first.
+            let key =
+                (sweep_elevation_deg(sweep.radials()).unwrap_or_default() * 10.0).round() / 10.0;
             for (mi, (moment, _)) in moments.iter().enumerate() {
                 if moment.get_moment(first).is_none() {
                     continue;
