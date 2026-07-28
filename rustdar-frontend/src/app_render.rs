@@ -192,12 +192,20 @@ impl super::App {
                 continue;
             }
 
+            // A render that found no sweep has already done its one job above by
+            // clearing `render_in_flight`; there is nothing to cache or draw.
+            // The pane keeps whatever it was showing, which is what a missing
+            // tilt should look like.
+            let Some(rendered) = rr.rendered else {
+                continue;
+            };
+
             // Extract fields to avoid borrow issues
             let origin_pane = rr.pane_idx;
             let render_result = crate::render_dispatch::CachedPaneRender {
-                image_data: rr.image_data,
-                max_range_km: rr.max_range_km,
-                value_data: rr.value_data,
+                image_data: rendered.image_data,
+                max_range_km: rendered.max_range_km,
+                value_data: rendered.value_data,
                 product: rr.product,
                 elevation: rr.elevation,
             };

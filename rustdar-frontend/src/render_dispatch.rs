@@ -840,13 +840,17 @@ impl RenderDispatcher {
         let wanted = self.pane_render[pane_idx].want_result();
         crate::offload::offload_job("radar-render", job, move |frame| {
             let _guard = guard;
-            if let Some(frame) = frame
-                && wanted.load(Ordering::Relaxed)
-            {
+            // Sent whether or not there is a frame, because the receiver is what
+            // clears `render_in_flight` and a pane that never hears back stops
+            // dispatching. Still gated on `wanted`: an abandoned render must not
+            // clear the flag belonging to the render that superseded it.
+            if wanted.load(Ordering::Relaxed) {
                 let _ = sender.send(RenderResponse {
-                    image_data: Arc::new(frame.image),
-                    max_range_km: frame.max_range_km,
-                    value_data: Arc::new(frame.values),
+                    rendered: frame.map(|frame| crate::channels::RenderedImage {
+                        image_data: Arc::new(frame.image),
+                        max_range_km: frame.max_range_km,
+                        value_data: Arc::new(frame.values),
+                    }),
                     product,
                     elevation,
                     generation,
@@ -1936,6 +1940,20 @@ mod render_invalidation_tests {
         )
     }
 
+    /// [`gated_render`] for a render that answers nothing — what
+    /// `Job::renders_nothing` produces when no sweep carries the product, held
+    /// open so the abandonment protocol can be exercised around it.
+    fn gated_nothing() -> (mpsc::Sender<()>, crate::offload::Job) {
+        let (release, held) = mpsc::channel::<()>();
+        (
+            release,
+            crate::offload::Job::Opaque(Box::new(move || {
+                held.recv().expect("every gated render is released");
+                None
+            })),
+        )
+    }
+
     /// One pane, on `site`, which is how `reset_panes_for_site` reads the layout.
     fn gui_showing(site: &str) -> rustdar_egui::Gui {
         let mut gui = rustdar_egui::Gui::new();
@@ -2053,6 +2071,55 @@ mod render_invalidation_tests {
             "and the global generation still moves, so a result already in the \
              channel is discarded on arrival"
         );
+
+        release.send(()).expect("the render is still running");
+        assert_eq!(arrivals(results, rx), 0);
+    }
+
+    /// The lock-out this closes: a render that finds no sweep used to send
+    /// nothing at all. `render_in_flight` is cleared by the receiver or by a
+    /// reset and nowhere else, and `dispatch_pane_renders` refuses to dispatch
+    /// while it is set — so the pane went quiet until something unrelated reset
+    /// it, and a user changing product saw nothing happen.
+    ///
+    /// Rare against an archive volume, which carries every cut it will ever
+    /// have. Routine against a volume still being assembled from the real-time
+    /// chunk feed, where an upper tilt has simply not been scanned yet.
+    #[test]
+    fn a_render_that_finds_nothing_still_reports_back() {
+        let mut d = RenderDispatcher::new();
+        let (results, rx) = mpsc::channel();
+        let (release, nothing) = gated_nothing();
+        d.spawn_render(0, RadarProduct::Reflectivity, 0.5, results.clone(), None, nothing);
+
+        release.send(()).expect("the render is still running");
+        drop(results);
+        let replies: Vec<_> = rx.iter().collect();
+        assert_eq!(
+            replies.len(),
+            1,
+            "a render with nothing to draw stayed silent, so its pane is still \
+             marked in flight and will never dispatch again"
+        );
+        assert!(
+            replies[0].rendered.is_none(),
+            "there was no sweep to draw, but a frame arrived anyway"
+        );
+    }
+
+    /// The counterweight, and the reason the report is gated on `results_wanted`
+    /// rather than sent unconditionally: an abandoned render must stay silent.
+    /// Reporting would clear `render_in_flight` for the render that *superseded*
+    /// it, and the pane would dispatch a third while the second was still going.
+    #[test]
+    fn an_abandoned_render_that_finds_nothing_reports_nothing() {
+        let gui = gui_showing("KOUN");
+        let mut d = RenderDispatcher::new();
+        let (results, rx) = mpsc::channel();
+        let (release, nothing) = gated_nothing();
+        d.spawn_render(0, RadarProduct::Reflectivity, 0.5, results.clone(), None, nothing);
+
+        d.reset_panes_for_site("KOUN", &gui);
 
         release.send(()).expect("the render is still running");
         assert_eq!(arrivals(results, rx), 0);

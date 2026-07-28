@@ -27,11 +27,35 @@ pub struct ScanResponse {
     pub is_auto_poll: bool,
 }
 
-/// Result from a background radar render thread.
-pub struct RenderResponse {
+/// What a render produced: the RGBA texture, the range it was projected at, and
+/// the per-pixel value grid a hover reads.
+pub struct RenderedImage {
     pub image_data: Arc<Vec<u8>>,
     pub max_range_km: f64,
     pub value_data: Arc<Vec<f32>>,
+}
+
+/// Result from a background radar render thread.
+pub struct RenderResponse {
+    /// `None` where the renderer found nothing to draw.
+    ///
+    /// A render that answers nothing still has to report back. `pane_render`'s
+    /// `render_in_flight` is cleared on receipt of this message and nowhere else
+    /// outside `reset_panes*`, and `dispatch_pane_renders` refuses to dispatch
+    /// while it is set — so a render that stayed silent would leave its pane
+    /// unable to ask for another one until something reset it.
+    ///
+    /// The ordinary source of a `None` is `Job::renders_nothing`: a pane parked
+    /// on a tilt the volume does not carry. Rare against an archive volume,
+    /// which holds every cut it will ever have; routine against a volume still
+    /// being assembled from the real-time chunk feed, where an upper tilt has
+    /// simply not been scanned yet. That change in frequency is what makes the
+    /// report mandatory rather than tidy.
+    ///
+    /// An *abandoned* render still sends nothing at all — the send is gated on
+    /// `results_wanted`, so a superseded render cannot clear the flag belonging
+    /// to the render that replaced it.
+    pub rendered: Option<RenderedImage>,
     pub product: RadarProduct,
     pub elevation: f32,
     pub generation: u64,

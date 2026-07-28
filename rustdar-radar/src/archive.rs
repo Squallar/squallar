@@ -126,12 +126,41 @@ pub(crate) fn list_url(
     max_keys: Option<u32>,
     continuation_token: Option<&str>,
 ) -> Result<String> {
+    list_url_inner(bucket, prefix, None, max_keys, continuation_token)
+}
+
+/// [`list_url`] plus a `delimiter`, which makes S3 collapse everything below it
+/// into `CommonPrefixes` instead of returning the keys.
+///
+/// A separate entry point rather than a fifth parameter on [`list_url`], so its
+/// four existing call sites keep reading as plain prefix queries. Both share
+/// [`list_url_inner`] so the `query_pairs_mut` encoding discipline applies to
+/// the delimiter too.
+pub(crate) fn list_url_delimited(
+    bucket: &str,
+    prefix: &str,
+    delimiter: &str,
+    continuation_token: Option<&str>,
+) -> Result<String> {
+    list_url_inner(bucket, prefix, Some(delimiter), None, continuation_token)
+}
+
+fn list_url_inner(
+    bucket: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    max_keys: Option<u32>,
+    continuation_token: Option<&str>,
+) -> Result<String> {
     let mut url = reqwest::Url::parse(&format!("https://{bucket}.s3.amazonaws.com/"))
         .map_err(|e| ArchiveError::MalformedListing(format!("bad bucket {bucket:?}: {e}")))?;
     {
         let mut query = url.query_pairs_mut();
         query.append_pair("list-type", "2");
         query.append_pair("prefix", prefix);
+        if let Some(delimiter) = delimiter {
+            query.append_pair("delimiter", delimiter);
+        }
         if let Some(max_keys) = max_keys {
             query.append_pair("max-keys", &max_keys.to_string());
         }
@@ -171,6 +200,9 @@ fn key_to_identifier(key: &str) -> Identifier {
 struct ListPage {
     /// In the order S3 returned them, which is UTF-8 binary order.
     keys: Vec<String>,
+    /// The `CommonPrefixes` a delimited listing collapsed everything below into.
+    /// Always empty for the undelimited queries the archive path issues.
+    common_prefixes: Vec<String>,
     truncated: bool,
     /// Present exactly when `truncated`.
     next_token: Option<String>,
@@ -180,15 +212,20 @@ struct ListPage {
 #[derive(PartialEq, Eq)]
 enum Field {
     Key,
+    CommonPrefix,
     IsTruncated,
     NextToken,
 }
 
-/// Parse one `ListBucketResult` document. Only `Contents/Key`, `IsTruncated`
-/// and `NextContinuationToken` are read.
+/// Parse one `ListBucketResult` document. Only `Contents/Key`,
+/// `CommonPrefixes/Prefix`, `IsTruncated` and `NextContinuationToken` are read.
 ///
 /// `Key` is captured only inside `Contents`, so the document's own
 /// `<Prefix>`/`<Name>` and any `CommonPrefixes` are not mistaken for objects.
+/// `Prefix` is captured only inside `CommonPrefixes` for the mirror-image
+/// reason: every `ListBucketResult` echoes the requested prefix at top level,
+/// and that is not a directory the caller asked about.
+///
 /// Character data is accumulated rather than assigned: an XML parser may split
 /// text across several events, and continuation tokens are long enough to hit
 /// that.
@@ -196,6 +233,7 @@ fn parse_list_page(body: &str) -> Result<ListPage> {
     let mut page = ListPage::default();
     let mut field: Option<Field> = None;
     let mut in_contents = false;
+    let mut in_common_prefixes = false;
     let mut buffer = String::new();
 
     for event in EventReader::new(body.as_bytes()) {
@@ -208,7 +246,12 @@ fn parse_list_page(body: &str) -> Result<ListPage> {
                         in_contents = true;
                         None
                     }
+                    "CommonPrefixes" => {
+                        in_common_prefixes = true;
+                        None
+                    }
                     "Key" if in_contents => Some(Field::Key),
+                    "Prefix" if in_common_prefixes => Some(Field::CommonPrefix),
                     "IsTruncated" => Some(Field::IsTruncated),
                     "NextContinuationToken" => Some(Field::NextToken),
                     _ => None,
@@ -222,8 +265,12 @@ fn parse_list_page(body: &str) -> Result<ListPage> {
             XmlEvent::EndElement { name } => {
                 match name.local_name.as_str() {
                     "Contents" => in_contents = false,
+                    "CommonPrefixes" => in_common_prefixes = false,
                     "Key" if field == Some(Field::Key) => {
                         page.keys.push(std::mem::take(&mut buffer));
+                    }
+                    "Prefix" if field == Some(Field::CommonPrefix) => {
+                        page.common_prefixes.push(std::mem::take(&mut buffer));
                     }
                     "IsTruncated" if field == Some(Field::IsTruncated) => {
                         page.truncated = buffer.trim() == "true";
@@ -287,6 +334,53 @@ where
 
     Err(ArchiveError::MalformedListing(format!(
         "listing for prefix {prefix:?} did not terminate within {MAX_LIST_PAGES} pages"
+    )))
+}
+
+/// The directory-style listing: one entry per `CommonPrefixes/Prefix`, no keys.
+///
+/// The real-time chunk bucket holds a site's ~55 chunks under each of 999
+/// rotating volume directories, so "which volumes exist" is ~55 000 keys as a
+/// flat query and one page as a delimited one.
+///
+/// Shares [`collect_keys`]'s paging discipline for the same reasons — keyed off
+/// `IsTruncated` rather than the token, truncated-without-a-token is an error
+/// rather than silent loss, and the page cap stops a server that never stops
+/// saying `IsTruncated`.
+pub(crate) async fn collect_common_prefixes<F, Fut>(
+    bucket: &str,
+    prefix: &str,
+    delimiter: &str,
+    mut fetch_page: F,
+) -> Result<Vec<String>>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<String>>,
+{
+    let mut prefixes = Vec::new();
+    let mut token: Option<String> = None;
+
+    for _ in 0..MAX_LIST_PAGES {
+        let url = list_url_delimited(bucket, prefix, delimiter, token.as_deref())?;
+        let page = parse_list_page(&fetch_page(url).await?)?;
+        prefixes.extend(page.common_prefixes);
+
+        if !page.truncated {
+            return Ok(prefixes);
+        }
+        let Some(next) = page.next_token else {
+            return Err(ArchiveError::MalformedListing(format!(
+                "delimited listing for prefix {prefix:?} is truncated but carries \
+                 no NextContinuationToken; {} prefixes would be silently lost",
+                prefixes.len()
+            )));
+        };
+        token = Some(next);
+    }
+
+    Err(ArchiveError::MalformedListing(format!(
+        "delimited listing for prefix {prefix:?} did not terminate within \
+         {MAX_LIST_PAGES} pages"
     )))
 }
 
@@ -650,6 +744,67 @@ mod tests {
             page.keys,
             vec!["a/b/c/d/real"],
             "captured a Key from outside Contents"
+        );
+        assert_eq!(
+            page.common_prefixes,
+            vec!["2024/05/20/KTLX/"],
+            "the CommonPrefixes entry belongs in its own bucket, not discarded \
+             and not among the keys"
+        );
+    }
+
+    /// The mirror image of the guard above. Every `ListBucketResult` echoes the
+    /// requested prefix at top level; without `if in_common_prefixes` that echo
+    /// is returned as a directory, so a volume-discovery listing gains a phantom
+    /// entry naming the site itself.
+    #[test]
+    fn parse_list_page_only_takes_prefixes_inside_common_prefixes() {
+        let doc = listing(&[], None);
+        assert!(
+            doc.contains("<Prefix>2024/05/20/KTLX</Prefix>"),
+            "the fixture must carry a top-level Prefix or this proves nothing"
+        );
+        let page = parse_list_page(&doc).expect("parses");
+        assert!(
+            page.common_prefixes.is_empty(),
+            "the document's own echoed Prefix was mistaken for a directory: {:?}",
+            page.common_prefixes
+        );
+    }
+
+    /// A delimited listing carries no `Contents` at all, and its directories are
+    /// what the caller asked for.
+    #[test]
+    fn parse_list_page_reads_a_delimited_listing() {
+        let doc = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<Name>unidata-nexrad-level2-chunks</Name><Prefix>KTLX/</Prefix>
+<Delimiter>/</Delimiter><IsTruncated>false</IsTruncated>
+<CommonPrefixes><Prefix>KTLX/1/</Prefix></CommonPrefixes>
+<CommonPrefixes><Prefix>KTLX/10/</Prefix></CommonPrefixes>
+<CommonPrefixes><Prefix>KTLX/2/</Prefix></CommonPrefixes>
+</ListBucketResult>"#;
+        let page = parse_list_page(doc).expect("parses");
+        assert!(page.keys.is_empty());
+        assert_eq!(
+            page.common_prefixes,
+            vec!["KTLX/1/", "KTLX/10/", "KTLX/2/"],
+            "and in S3's UTF-8 order, which is not numeric — the caller has to \
+             parse and sort"
+        );
+    }
+
+    /// The delimiter reaches the wire, and a plain listing still carries none.
+    #[test]
+    fn list_url_delimited_asks_for_directories() {
+        let url = list_url_delimited("bucket", "KTLX/", "/", None).expect("url");
+        assert!(url.contains("delimiter=%2F"), "{url}");
+        assert!(url.contains("prefix=KTLX%2F"), "{url}");
+
+        let plain = list_url("bucket", "KTLX/", None, None).expect("url");
+        assert!(
+            !plain.contains("delimiter"),
+            "an undelimited listing must stay undelimited: {plain}"
         );
     }
 
@@ -1017,5 +1172,94 @@ mod tests {
             StatusCode::OK,
             "anonymous listing was refused; this module would need SigV4"
         );
+    }
+
+    /// The two data-model assumptions the real-time chunk assembler is built on,
+    /// probed against a real volume before anything depends on them.
+    ///
+    /// 1. **`elevation_number` is contiguous `1..=n` with no repeats**, SAILS and
+    ///    MRLE inserts included. The assembler accumulates into a
+    ///    `BTreeMap<u8, Cut>` keyed on it, so a repeat would silently merge two
+    ///    distinct cuts into one oversized sweep. The archive path only
+    ///    *tolerates* a repeat — `Sweep::from_radials` groups by consecutive runs
+    ///    and would emit two sweeps — so nothing today would notice.
+    ///
+    /// 2. **The last radial of a cut carries `ElevationEnd`, and the last radial
+    ///    of the volume carries `ScanEnd` rather than `ElevationEnd`.** The
+    ///    assembler seals a cut on that terminator; reading only `ElevationEnd`
+    ///    would leave the topmost cut open forever and `volume_complete` would
+    ///    never fire.
+    ///
+    /// Uses the archive path deliberately: a chunk volume is assembled from the
+    /// same radials, so this answers the question without any chunk code
+    /// existing, and it keeps answering it as a regression test afterwards.
+    #[ignore = "hits the live unidata-nexrad-level2 S3 bucket"]
+    #[tokio::test]
+    async fn live_volume_elevation_numbers_are_contiguous_and_terminated() {
+        use nexrad_model::data::RadialStatus;
+
+        let sources = DataSources::production();
+        let day = date(2024, 5, 20);
+        let files = list_files(&sources, "KTLX", &day).await.expect("listing");
+        let volume = files
+            .iter()
+            .find(|f| f.name().ends_with("_V06"))
+            .expect("at least one V06 volume");
+        let scan = download_file(&sources, volume.clone())
+            .await
+            .expect("download")
+            .scan()
+            .expect("decode");
+
+        println!(
+            "{} -> VCP {}, {} sweeps",
+            volume.name(),
+            scan.coverage_pattern_number().number(),
+            scan.sweeps().len()
+        );
+
+        let mut numbers = Vec::new();
+        for sweep in scan.sweeps() {
+            let radials = sweep.radials();
+            let first = radials.first().expect("sweep with no radials");
+            let last = radials.last().expect("sweep with no radials");
+            println!(
+                "  elev {:>2}  {:>5.2}°  {:>4} radials  spacing {:.1}°  last status {:?}",
+                sweep.elevation_number(),
+                first.elevation_angle_degrees(),
+                radials.len(),
+                first.azimuth_spacing_degrees(),
+                last.radial_status(),
+            );
+            numbers.push(sweep.elevation_number());
+        }
+
+        let expected: Vec<u8> = (1..=scan.sweeps().len() as u8).collect();
+        assert_eq!(
+            numbers, expected,
+            "elevation numbers are not contiguous 1..=n; a BTreeMap keyed on \
+             them would merge distinct cuts"
+        );
+
+        let terminators: Vec<RadialStatus> = scan
+            .sweeps()
+            .iter()
+            .map(|s| s.radials().last().expect("radials").radial_status())
+            .collect();
+        let (last, rest) = terminators.split_last().expect("at least one sweep");
+        for (i, status) in rest.iter().enumerate() {
+            assert!(
+                matches!(status, RadialStatus::ElevationEnd),
+                "sweep {} ends on {:?}, not ElevationEnd — the seal rule would \
+                 leave it open",
+                i + 1,
+                status
+            );
+        }
+        assert!(
+            matches!(last, RadialStatus::ScanEnd | RadialStatus::ElevationEnd),
+            "the final sweep ends on {last:?}; the seal rule must accept it"
+        );
+        println!("final sweep terminator: {last:?}");
     }
 }
