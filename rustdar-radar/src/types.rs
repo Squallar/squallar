@@ -186,6 +186,40 @@ fn discover_product_elevations(scan: &Scan) -> HashMap<RadarProduct, Vec<f32>> {
     product_elevations
 }
 
+/// A Level II moment field on a [`Radial`], named rather than read.
+///
+/// Several products share one: NROT is derived from velocity, and interpolated
+/// echo tops from reflectivity. Naming the field — instead of only being able
+/// to fetch it — is what lets a moment be put *back* onto a radial, which
+/// [`crate::render_input`] does when it rebuilds a scan from a payload.
+///
+/// Deliberately a smaller set than [`RadarProduct`]: the Level III products
+/// have no Level II field at all, which is what
+/// [`RadarProduct::moment_slot`]'s `None` means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MomentSlot {
+    Reflectivity,
+    Velocity,
+    SpectrumWidth,
+    DifferentialReflectivity,
+    DifferentialPhase,
+    CorrelationCoefficient,
+}
+
+impl MomentSlot {
+    /// This field's value on `radial`.
+    pub fn read<'a>(&self, radial: &'a Radial) -> Option<&'a nexrad_model::data::MomentData> {
+        match self {
+            MomentSlot::Reflectivity => radial.reflectivity(),
+            MomentSlot::Velocity => radial.velocity(),
+            MomentSlot::SpectrumWidth => radial.spectrum_width(),
+            MomentSlot::DifferentialReflectivity => radial.differential_reflectivity(),
+            MomentSlot::DifferentialPhase => radial.differential_phase(),
+            MomentSlot::CorrelationCoefficient => radial.correlation_coefficient(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum RadarProduct {
     Reflectivity,
@@ -320,21 +354,28 @@ impl RadarProduct {
         }
     }
 
-    /// The moment data for this product on a radial.
-    pub fn get_moment<'a>(&self, radial: &'a Radial) -> Option<&'a nexrad_model::data::MomentData> {
+    /// Which of a radial's moment fields this product reads.
+    ///
+    /// The single product → moment table. [`get_moment`](Self::get_moment)
+    /// reads a radial *through* it rather than repeating it, so a consumer that
+    /// needs to name the field — [`crate::render_input`], which has to place a
+    /// moment back on a reconstructed radial — cannot come to disagree with the
+    /// consumer that reads it.
+    pub fn moment_slot(&self) -> Option<MomentSlot> {
         match self {
-            RadarProduct::Reflectivity => radial.reflectivity(),
-            RadarProduct::Velocity => radial.velocity(),
-            RadarProduct::SpectrumWidth => radial.spectrum_width(),
-            RadarProduct::DifferentialReflectivity => radial.differential_reflectivity(),
-            RadarProduct::CorrelationCoefficient => radial.correlation_coefficient(),
-            RadarProduct::DifferentialPhase => radial.differential_phase(),
+            RadarProduct::Reflectivity => Some(MomentSlot::Reflectivity),
+            RadarProduct::Velocity => Some(MomentSlot::Velocity),
+            RadarProduct::SpectrumWidth => Some(MomentSlot::SpectrumWidth),
+            RadarProduct::DifferentialReflectivity => Some(MomentSlot::DifferentialReflectivity),
+            RadarProduct::CorrelationCoefficient => Some(MomentSlot::CorrelationCoefficient),
+            RadarProduct::DifferentialPhase => Some(MomentSlot::DifferentialPhase),
             // NROT is derived from velocity
-            RadarProduct::NormalizedRotation => radial.velocity(),
+            RadarProduct::NormalizedRotation => Some(MomentSlot::Velocity),
             // Interpolated echo tops integrate the whole reflectivity volume;
             // tying availability to the reflectivity moment lists it alongside
             // the reflectivity tilts (the rendered field is tilt-independent).
-            RadarProduct::EchoTopsInterpolated => radial.reflectivity(),
+            RadarProduct::EchoTopsInterpolated => Some(MomentSlot::Reflectivity),
+            // Level III products. No Level II moment stands behind them.
             RadarProduct::StormRelativeVelocity
             | RadarProduct::SpecificDifferentialPhase
             | RadarProduct::EchoTops
@@ -342,6 +383,11 @@ impl RadarProduct {
             | RadarProduct::HydrometeorClassification
             | RadarProduct::PrecipitationRate => None,
         }
+    }
+
+    /// The moment data for this product on a radial.
+    pub fn get_moment<'a>(&self, radial: &'a Radial) -> Option<&'a nexrad_model::data::MomentData> {
+        self.moment_slot()?.read(radial)
     }
 
     /// Format a radar product value for display (e.g. in a hover tooltip).

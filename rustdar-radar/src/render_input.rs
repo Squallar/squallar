@@ -40,7 +40,7 @@
 //! placeholders in [`to_scan`](RenderInput::to_scan); if a renderer ever starts
 //! reading one, the byte-identity test is what fails.
 
-use crate::types::RadarProduct;
+use crate::types::{MomentSlot, RadarProduct};
 use nexrad_model::data::{
     DataMoment, MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
 };
@@ -112,10 +112,12 @@ impl RenderInput {
         radar_lon: f64,
         wind_levels: Option<&[(f64, f64, f64)]>,
     ) -> Option<Self> {
-        let slot = moment_slot(product);
-        // Both wide products need every tilt carrying their moment, and both
-        // read that moment off a slot `get_moment` already names. Anything
-        // else needs one sweep.
+        let slot = product.moment_slot()?;
+        // `None` for a Level III product: no Level II moment stands behind it,
+        // so there is nothing to extract and nothing the renderer would draw.
+        //
+        // Two products then need every tilt carrying that moment; anything else
+        // needs one sweep.
         let whole_volume = match product {
             // Tilt-independent: `compute_echo_tops` integrates the whole
             // reflectivity volume. `VolumeCube::build` dedups same-elevation
@@ -199,12 +201,12 @@ impl RenderInput {
                     .iter()
                     .map(|radial| {
                         let moment = radial.moment.as_ref().map(MomentPayload::to_moment_data);
-                        // Placed in the slot `RadarProduct::get_moment` reads
-                        // for this product. NROT and interpolated echo tops
-                        // read velocity and reflectivity respectively, so the
-                        // slot is a property of the product, not of the name.
+                        // Put back on the field it was read from — the same
+                        // `MomentSlot` `get_moment` resolves this product to,
+                        // so the reconstructed radial answers `get_moment` with
+                        // the moment that was extracted.
                         let (reflectivity, velocity, spectrum_width, zdr, phi, rho) =
-                            place_moment(self.product, moment);
+                            place_moment(slot, moment);
                         Radial::new(
                             0,
                             0,
@@ -232,12 +234,12 @@ impl RenderInput {
 }
 
 /// Every sweep whose first radial carries `slot`'s moment, in scan order.
-fn collect_sweeps(scan: &Scan, slot: RadarProduct) -> Vec<SweepData> {
+fn collect_sweeps(scan: &Scan, slot: MomentSlot) -> Vec<SweepData> {
     scan.sweeps()
         .iter()
         .filter_map(|sweep| {
             let radials = sweep.radials();
-            slot.get_moment(radials.first()?)
+            slot.read(radials.first()?)
                 .is_some()
                 .then(|| sweep_data(radials, slot))
         })
@@ -249,7 +251,7 @@ fn collect_sweeps(scan: &Scan, slot: RadarProduct) -> Vec<SweepData> {
 /// `slot` comes from the caller rather than being probed off the radial: a
 /// merged upper tilt carries reflectivity *and* velocity, so "the first moment
 /// this radial has" would hand a reflectivity render the velocity gates.
-fn sweep_data(radials: &[Radial], slot: RadarProduct) -> SweepData {
+fn sweep_data(radials: &[Radial], slot: MomentSlot) -> SweepData {
     SweepData {
         elevation_angle: radials
             .first()
@@ -260,26 +262,13 @@ fn sweep_data(radials: &[Radial], slot: RadarProduct) -> SweepData {
             .map(|radial| RadialData {
                 azimuth: radial.azimuth_angle_degrees(),
                 azimuth_spacing: radial.azimuth_spacing_degrees(),
-                moment: slot.get_moment(radial).map(MomentPayload::from_moment_data),
+                moment: slot.read(radial).map(MomentPayload::from_moment_data),
             })
             .collect(),
     }
 }
 
-/// Which of `Radial`'s moment fields `product` reads, named as the product that
-/// owns that field. The two products that derive from another's moment — NROT
-/// from velocity, interpolated echo tops from reflectivity — are exactly the
-/// cases `RadarProduct::get_moment` already redirects, and this agrees with it
-/// by construction.
-fn moment_slot(product: RadarProduct) -> RadarProduct {
-    match product {
-        RadarProduct::NormalizedRotation => RadarProduct::Velocity,
-        RadarProduct::EchoTopsInterpolated => RadarProduct::Reflectivity,
-        other => other,
-    }
-}
-
-/// Spread `moment` into the `Radial::new` slot `product`'s `get_moment` reads.
+/// The six `Option<MomentData>` arguments `Radial::new` takes, in its order.
 type MomentSlots = (
     Option<MomentData>,
     Option<MomentData>,
@@ -289,18 +278,19 @@ type MomentSlots = (
     Option<MomentData>,
 );
 
-fn place_moment(product: RadarProduct, moment: Option<MomentData>) -> MomentSlots {
+/// Put `moment` back on the field it was read from.
+///
+/// The inverse of [`MomentSlot::read`], and the reason `MomentSlot` exists:
+/// `get_moment` can only fetch, and rebuilding a radial needs the field named.
+fn place_moment(slot: MomentSlot, moment: Option<MomentData>) -> MomentSlots {
     let mut slots: MomentSlots = (None, None, None, None, None, None);
-    match moment_slot(product) {
-        RadarProduct::Reflectivity => slots.0 = moment,
-        RadarProduct::Velocity => slots.1 = moment,
-        RadarProduct::SpectrumWidth => slots.2 = moment,
-        RadarProduct::DifferentialReflectivity => slots.3 = moment,
-        RadarProduct::DifferentialPhase => slots.4 = moment,
-        RadarProduct::CorrelationCoefficient => slots.5 = moment,
-        // Products with no Level II moment never reach here: `extract` returns
-        // `None` for them, because `find_sweep` does.
-        _ => {}
+    match slot {
+        MomentSlot::Reflectivity => slots.0 = moment,
+        MomentSlot::Velocity => slots.1 = moment,
+        MomentSlot::SpectrumWidth => slots.2 = moment,
+        MomentSlot::DifferentialReflectivity => slots.3 = moment,
+        MomentSlot::DifferentialPhase => slots.4 = moment,
+        MomentSlot::CorrelationCoefficient => slots.5 = moment,
     }
     slots
 }
