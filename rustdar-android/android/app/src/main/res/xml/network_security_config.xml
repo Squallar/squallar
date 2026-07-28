@@ -112,6 +112,13 @@
         <domain includeSubdomains="true">mesonet.agron.iastate.edu</domain>
     </domain-config>
 
+    <!-- Open-Meteo forecast API: environmental sounding heights (0C and -20C
+         levels) per radar site, for the hail products
+         (DataSources::sounding_base). -->
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">api.open-meteo.com</domain>
+    </domain-config>
+
     <!-- Everything served out of S3: the NEXRAD Level II archive and realtime
          chunks, Level III products (which used to come over TGFTP and now come
          from the unidata-nexrad-level3 bucket), HRRR GRIB2, and GOES granules

@@ -129,6 +129,7 @@ const NEVER_CACHE_HOSTS = new Set([
   "api.weather.gov",
   "www.spc.noaa.gov",
   "mesonet.agron.iastate.edu",
+  "api.open-meteo.com",
 ]);
 
 /* CartoDB's four tile subdomains, as `rustdar_egui::tiles::CartoDb` builds them. */

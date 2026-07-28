@@ -325,6 +325,7 @@ fn data_sources_has_the_fields_the_worker_was_written_against() {
         "nws_api_base",
         "spc_base",
         "iem_base",
+        "sounding_base",
         // Not origins: flags selecting which TLS client the SPC and METAR
         // fetches use. Listed so this set stays an exact match on the struct,
         // which is what makes a *new origin* impossible to add unnoticed.
@@ -367,6 +368,7 @@ fn the_worker_states_every_production_data_origin_in_its_deny_list() {
         &s.nws_api_base,
         &s.spc_base,
         &s.iem_base,
+        &s.sounding_base,
     ];
 
     for origin in origins {

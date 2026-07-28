@@ -5,6 +5,7 @@ mod palette;
 pub mod render;
 pub mod scan;
 pub mod sites;
+pub mod sounding;
 pub mod sources;
 pub mod srm;
 pub mod tls;

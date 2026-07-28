@@ -8,6 +8,8 @@ chrono = { workspace = true }
 log = { workspace = true }
 rustdar-units = { workspace = true }
 serde = { workspace = true }
+# Open-Meteo sounding responses in `sounding`.
+serde_json = { workspace = true }
 nexrad-data = { workspace = true }
 nexrad-model = { workspace = true }
 nexrad-decode = { workspace = true }

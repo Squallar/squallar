@@ -121,7 +121,7 @@ mod tests {
             hosts.insert(host_of(&DataSources::s3_object_url(bucket, "k")));
         }
 
-        for base in [&s.nws_api_base, &s.spc_base, &s.iem_base] {
+        for base in [&s.nws_api_base, &s.spc_base, &s.iem_base, &s.sounding_base] {
             hosts.insert(host_of(base));
         }
 

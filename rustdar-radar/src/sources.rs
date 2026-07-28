@@ -23,7 +23,18 @@
 //! unidata-nexrad-level3  OPTIONS -> 200, Allow-Methods: GET, HEAD, Allow-Headers: user-agent
 //! noaa-hrrr-bdp-pds      OPTIONS -> 200, Allow-Methods: GET,       Allow-Headers: user-agent
 //! api.weather.gov        OPTIONS -> 200, Allow-Methods: GET,       Allow-Headers: API-Key, User-Agent
+//! api.open-meteo.com     OPTIONS -> 200, Allow-Methods: GET, POST, OPTIONS, Allow-Headers: …, user-agent, …
 //! ```
+//!
+//! Open-Meteo verified 2026-07-28 against the exact `/v1/forecast` query
+//! [`Self::sounding_url`] builds: plain `GET` 200, `GET` with an `Origin:`
+//! header 200 with `access-control-allow-origin: *` and
+//! `access-control-max-age: 600`, `OPTIONS` preflight 200 with the same. So a
+//! `User-Agent` *would* survive — but nothing there requires one (unlike
+//! `api.weather.gov`), and staying simple skips the preflight round-trip, so
+//! the sounding fetch uses `tls::simple_client` and carries no
+//! `sends_user_agent` flag: the flags exist to keep preflight-hostile origins
+//! reachable, not to record every origin's choice.
 //!
 //! Preflight-**hostile** — plain `GET` carries `ACAO: *`, so curl and every
 //! native build are happy while no browser ever issues the real request:
@@ -81,6 +92,10 @@ pub struct DataSources {
     pub spc_base: Source,
     /// Iowa Environmental Mesonet: current ASOS/METAR observations.
     pub iem_base: Source,
+    /// Open-Meteo forecast API: environmental sounding heights (0 °C and
+    /// −20 °C levels) per radar site, for the hail products. See
+    /// [`crate::sounding`].
+    pub sounding_base: Source,
     /// `false` in production: IEM answers `OPTIONS` with `405`, so a
     /// `User-Agent` makes the request preflighted and it never happens.
     pub metar_sends_user_agent: bool,
@@ -109,6 +124,7 @@ impl DataSources {
             nws_api_base: Cow::Borrowed("https://api.weather.gov"),
             spc_base: Cow::Borrowed("https://www.spc.noaa.gov"),
             iem_base: Cow::Borrowed("https://mesonet.agron.iastate.edu"),
+            sounding_base: Cow::Borrowed("https://api.open-meteo.com"),
             metar_sends_user_agent: false,
             spc_sends_user_agent: false,
         }
@@ -195,6 +211,39 @@ impl DataSources {
     pub fn nws_alerts_url(&self) -> String {
         format!("{}/alerts/active?status=actual", self.nws_api_base)
     }
+
+    /// Environmental sounding heights near one radar site, as JSON (~900 B).
+    ///
+    /// `freezing_level_height` is the 0 °C height directly; the four
+    /// temperature/geopotential-height pressure-level pairs (600–300 hPa) are
+    /// what [`crate::sounding::parse_env_heights`] interpolates the −20 °C
+    /// height from — that span brackets the −20 °C surface in every ordinary
+    /// atmosphere (~−13 °C climatological mean at 600 hPa, ~−45 °C at 300).
+    ///
+    /// `forecast_hours=2` keeps the response at two hourly rows: the current
+    /// hour plus one spare in case the model has a null at the first.
+    ///
+    /// Coordinates are truncated to three decimals (~110 m) — far inside the
+    /// forecast model's grid spacing, and it keeps the URL stable per site.
+    pub fn sounding_url(&self, lat: f64, lon: f64) -> String {
+        format!(
+            "{}/v1/forecast?latitude={lat:.3}&longitude={lon:.3}\
+             &hourly=freezing_level_height,\
+             temperature_600hPa,geopotential_height_600hPa,\
+             temperature_500hPa,geopotential_height_500hPa,\
+             temperature_400hPa,geopotential_height_400hPa,\
+             temperature_300hPa,geopotential_height_300hPa\
+             &forecast_hours=2",
+            self.sounding_base,
+        )
+    }
+
+    /// For Open-Meteo soundings: preflight-tolerant origin, but no `User-Agent`
+    /// is required there, so the request stays simple and skips the preflight
+    /// round-trip. See the module header's Open-Meteo entry.
+    pub fn sounding_client(&self, timeout: std::time::Duration) -> reqwest::ClientBuilder {
+        crate::tls::simple_client(timeout)
+    }
 }
 
 #[cfg(test)]
@@ -218,6 +267,7 @@ mod tests {
             s.hrrr_idx_url(&date(), 3, 0),
             s.metar_state_url("OK"),
             s.nws_alerts_url(),
+            s.sounding_url(41.320, -96.367),
             DataSources::s3_object_url(&s.level2_bucket, "k"),
             DataSources::s3_object_url(&s.goes_east_bucket, "k"),
             DataSources::s3_object_url(&s.goes_west_bucket, "k"),
@@ -299,6 +349,39 @@ mod tests {
         assert!(
             !url.contains("networkclass"),
             "networkclass=ASOS is a 54 MB ungzipped response",
+        );
+    }
+
+    /// The sounding query, pinned verbatim: this exact URL is what the CORS
+    /// probes in the module header were run against (2026-07-28), so a drifted
+    /// query is one the probe evidence no longer covers. KOAX's coordinates,
+    /// matching the `testdata/openmeteo_koax.json` fixture.
+    #[test]
+    fn the_sounding_url_is_the_probed_query_shape() {
+        let url = DataSources::production().sounding_url(41.320, -96.367);
+        assert_eq!(
+            url,
+            "https://api.open-meteo.com/v1/forecast?latitude=41.320&longitude=-96.367\
+             &hourly=freezing_level_height,\
+             temperature_600hPa,geopotential_height_600hPa,\
+             temperature_500hPa,geopotential_height_500hPa,\
+             temperature_400hPa,geopotential_height_400hPa,\
+             temperature_300hPa,geopotential_height_300hPa\
+             &forecast_hours=2",
+        );
+    }
+
+    /// Simple request, no `User-Agent`: Open-Meteo tolerates a preflight (see
+    /// the module header) but requires no UA, so staying simple saves the
+    /// `OPTIONS` round-trip rather than avoiding a breakage.
+    #[test]
+    fn the_sounding_client_sends_no_user_agent() {
+        let s = DataSources::production();
+        let t = std::time::Duration::from_secs(1);
+        assert!(
+            !crate::tls::sends_user_agent(&s.sounding_client(t).build().expect("client")),
+            "the sounding client carries a User-Agent; the fetch was probed \
+             and shipped as a simple request",
         );
     }
 
