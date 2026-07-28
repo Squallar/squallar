@@ -188,9 +188,18 @@ impl ProductDescriptionBlock {
     /// products 99 and 154 alike, so `RadialPacket::gate_interval_km` returns
     /// ~1 km for all three and is 4× wrong for the velocity products. `None`
     /// means the packet's own value is usable.
+    ///
+    /// Product 163 (Digital Specific Differential Phase) lies the same way:
+    /// its generator (`dualpol8bit.c` in the ORPG source) writes the scan
+    /// projection constant `cos(elev)·1000` into that halfword, and a live
+    /// `TLX_N0K` packet of 360 × 1200 gates decodes to ~1.0 km per gate —
+    /// 1200 km of range for a 300 km product. The ICD's 0.25 km wins. (Its
+    /// siblings 159/161 share the generator but are not consumed anywhere in
+    /// this workspace; they can join the table when a live packet of each
+    /// has been checked the same way.)
     pub fn range_gate_km(&self) -> Option<f64> {
         match self.product_code {
-            99 | 154 => Some(0.25),
+            99 | 154 | 163 => Some(0.25),
             _ => None,
         }
     }
@@ -473,17 +482,20 @@ mod tests {
     }
 
     /// The packet-16 scale factor halfword reads 999 for the 1 km product 56
-    /// and the 0.25 km products 99 and 154 alike, so only the product code can
-    /// answer this. A wrong answer here draws the field 4× too far out.
+    /// and the 0.25 km products 99, 154 and 163 alike, so only the product
+    /// code can answer this. A wrong answer here draws the field 4× too far
+    /// out — a live `TLX_N0K` (360 × 1200 gates) decoded to ~1.0 km per gate,
+    /// 1200 km of range for a 300 km product.
     #[test]
-    fn only_the_quarter_kilometre_velocity_products_override_the_gate_spacing() {
+    fn only_the_quarter_kilometre_products_override_the_gate_spacing() {
         for code in [99, 154] {
             assert_eq!(
                 pdb(code, VELOCITY_THRESHOLDS, VELOCITY_PS47_53).range_gate_km(),
                 Some(0.25)
             );
         }
-        for code in [56, 94, 134, 135, 163, 176, 177] {
+        assert_eq!(pdb(163, [0; 16], [0; 7]).range_gate_km(), Some(0.25));
+        for code in [56, 94, 134, 135, 176, 177] {
             assert_eq!(
                 pdb(code, [0; 16], [0; 7]).range_gate_km(),
                 None,
