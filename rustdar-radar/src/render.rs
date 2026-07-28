@@ -887,6 +887,64 @@ pub fn render_vil_density_to_image(
     Some(output)
 }
 
+/// Render the locally derived Specific Differential Phase
+/// ([`crate::kdp::compute_kdp`]) for the tilt family nearest
+/// `elevation_angle`: the sweep is picked with the same tilt-family rule as
+/// the differential phase moment it derives from (surveillance cut
+/// preferred), and the recombined 1° × 0.25 km field paints with the KDP
+/// palette.
+///
+/// `params` carries the radial-header quantities a decoded `Scan` lacks —
+/// [`crate::kdp::KdpParams::from_archive`] when the caller holds the raw
+/// file, `KdpParams::default()` (the documented estimator fallback)
+/// otherwise.
+pub fn render_derived_kdp_to_image(
+    scan: &Scan,
+    elevation_angle: f32,
+    radar_lat: f64,
+    radar_lon: f64,
+    params: &crate::kdp::KdpParams,
+) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+    let radials = find_sweep(
+        scan,
+        types::RadarProduct::DifferentialPhase,
+        elevation_angle,
+    )?;
+    let derived = crate::kdp::compute_kdp(radials, params)?;
+    let n_radials = derived.values.len();
+    if n_radials == 0 {
+        return None;
+    }
+    let max_gates = derived.values.iter().map(Vec::len).max().unwrap_or(0);
+    let actual_max_range = derived.first_gate_km + max_gates as f64 * derived.gate_interval_km;
+    let avg_spacing_deg = 360.0 / n_radials as f64;
+
+    let output = render_with_projection(
+        radar_lat,
+        radar_lon,
+        actual_max_range,
+        types::RadarProduct::SpecificDifferentialPhase,
+        "KDP",
+        |proj, bufs| {
+            derived.values.par_iter().enumerate().for_each(|(i, row)| {
+                let ctx = RadialContext::new(derived.azimuths_deg[i], avg_spacing_deg / 2.0);
+                for (j, &v) in row.iter().enumerate() {
+                    if v.is_nan() {
+                        continue;
+                    }
+                    let range_km = derived.first_gate_km + j as f64 * derived.gate_interval_km;
+                    if range_km > types::MAX_RANGE_KM {
+                        break;
+                    }
+                    let from = GateId { radial: i, gate: j };
+                    proj.render_gate(bufs, &ctx, range_km, derived.gate_interval_km, v, from);
+                }
+            });
+        },
+    );
+    Some(output)
+}
+
 /// Render a Level III radial product, as [`render_radar_to_image`] does for a
 /// Level II `Scan`.
 ///

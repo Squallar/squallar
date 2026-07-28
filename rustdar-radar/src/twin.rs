@@ -350,11 +350,20 @@ pub mod live {
             .collect()
     }
 
-    /// The archived Level II volume nearest `when`: the decoded scan and the
-    /// volume start its identifier names — the timestamp Level III products
-    /// of the same volume carry in their PDB. Looks at the previous UTC day
-    /// too, and skips the `_MDM` sidecars the listing interleaves.
-    pub async fn l2_volume_near(site: &str, when: NaiveDateTime) -> Option<(Scan, NaiveDateTime)> {
+    /// The archived Level II volume nearest `when`, as the **raw file**: the
+    /// undecoded archive plus the volume start its identifier names — the
+    /// timestamp Level III products of the same volume carry in their PDB.
+    /// Looks at the previous UTC day too, and skips the `_MDM` sidecars the
+    /// listing interleaves.
+    ///
+    /// The file form exists for the harnesses that need radial-header
+    /// parameters a decoded `Scan` does not carry (the KDP twin reads the
+    /// initial system differential phase through
+    /// [`crate::kdp::KdpParams::from_archive`]).
+    pub async fn l2_archive_near(
+        site: &str,
+        when: NaiveDateTime,
+    ) -> Option<(nexrad_data::volume::File, NaiveDateTime)> {
         crate::tls::init();
         let sources = DataSources::production();
         let mut nearest: Option<(i64, NaiveDateTime, archive::Identifier)> = None;
@@ -377,12 +386,14 @@ pub mod live {
             }
         }
         let (_, start, id) = nearest?;
-        let scan = archive::download_file(&sources, id)
-            .await
-            .ok()?
-            .scan()
-            .ok()?;
-        Some((scan, start))
+        let file = archive::download_file(&sources, id).await.ok()?;
+        Some((file, start))
+    }
+
+    /// [`l2_archive_near`], decoded: the scan and its volume start.
+    pub async fn l2_volume_near(site: &str, when: NaiveDateTime) -> Option<(Scan, NaiveDateTime)> {
+        let (file, start) = l2_archive_near(site, when).await?;
+        Some((file.scan().ok()?, start))
     }
 
     /// The Level III object generated **from** a given Level II volume: list
