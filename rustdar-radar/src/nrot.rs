@@ -176,7 +176,13 @@ fn preprocess_velocity_with(
     profile: Option<&WindProfile>,
 ) -> Vec<Vec<f64>> {
     let mut vel: Vec<Vec<f64>> = sweep.vel_grid.to_vec();
-    dealias(&mut vel, sweep, elevation_deg, profile);
+    dealias(
+        &mut vel,
+        sweep,
+        elevation_deg,
+        profile,
+        DealiasProfile::NoFalseShear,
+    );
     median_filter(
         &vel,
         sweep.vel_grid,
@@ -1414,11 +1420,96 @@ const DA_RAWMIN_BINS: usize = 16;
 /// so the threshold sits between; 1.2 censored real couplet cores.
 const CENSOR_VNY_FRAC: f64 = 1.24;
 
+/// The censoring posture [`dealias`] takes once the unfolding passes are done.
+///
+/// The passes themselves — seeds, bridges, flood fills, head-and-shoulders —
+/// are identical under every profile; what differs is only what happens to
+/// data the passes could not settle. NROT differentiates the field, so a
+/// residual fold wall becomes clamp-level fake shear and is worth censoring
+/// aggressively. A velocity *display* consumer (storm-relative velocity) shows
+/// the field itself, where a censored gate is a hole in a couplet and the
+/// harm runs the other way — so it keeps everything the passes did not prove
+/// wrong.
+///
+/// The profile reaches ONLY the two post-pass censoring/ND knobs below.
+/// [`DealiasProfile::NoFalseShear`] resolves to the tuned NROT constants
+/// unchanged, so NROT's output is bit-identical to what it was before the
+/// parameter existed — its calibration suite is what pins that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DealiasProfile {
+    /// NROT's tuned posture: unreached-data regions under [`DA_RAWMIN_BINS`]
+    /// bins go ND, and any bin more than [`CENSOR_VNY_FRAC`]·Vny from a
+    /// 4-neighbour is censored as a residual fold wall.
+    NoFalseShear,
+    /// Maximum retained coverage for velocity display consumers: every
+    /// unreached data gate keeps its raw value regardless of region size
+    /// ([`COVERAGE_RAWMIN_BINS`]), and the fold-wall censor runs at the same
+    /// measured [`CENSOR_VNY_FRAC`] threshold — dropping the censor entirely
+    /// was measured worse against the RPG's own dealiased velocity (see
+    /// `crate::srv`'s A/B notes; a kept fold wall is a 2·Vny error on every
+    /// gate it touches, which costs more level agreement than the censored
+    /// hole costs coverage).
+    Coverage,
+}
+
+/// [`DealiasProfile::Coverage`]'s kept-raw region floor: keep every unreached
+/// data gate, however small the region. The RPG's dealiaser resolves all
+/// present data, so for a field that is *displayed* rather than
+/// differentiated, matching its coverage matters more than suppressing
+/// isolated pockets — the A/B against live N0G/N1G twins is recorded in
+/// `crate::srv`.
+const COVERAGE_RAWMIN_BINS: usize = 1;
+
+/// The two post-pass knobs a [`DealiasProfile`] resolves to. `pub(crate)` so
+/// the srv harness can measure candidate postures without shipping a variant
+/// per experiment.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DealiasKnobs {
+    /// Minimum connected-component size (bins, 4-adjacency) for a
+    /// never-reached data region to keep raw rather than go ND.
+    pub rawmin_bins: usize,
+    /// Post-dealias fold-wall censor threshold, in units of Vny;
+    /// `f64::INFINITY` disables the censor.
+    pub censor_vny_frac: f64,
+}
+
+impl DealiasProfile {
+    pub(crate) fn knobs(self) -> DealiasKnobs {
+        match self {
+            DealiasProfile::NoFalseShear => DealiasKnobs {
+                rawmin_bins: DA_RAWMIN_BINS,
+                censor_vny_frac: CENSOR_VNY_FRAC,
+            },
+            DealiasProfile::Coverage => DealiasKnobs {
+                rawmin_bins: COVERAGE_RAWMIN_BINS,
+                censor_vny_frac: CENSOR_VNY_FRAC,
+            },
+        }
+    }
+}
+
 pub(crate) fn dealias(
     vel_grid: &mut [Vec<f64>],
     sweep: &VelocitySweep,
     elevation_deg: f64,
     profile: Option<&WindProfile>,
+    dealias_profile: DealiasProfile,
+) {
+    dealias_with_knobs(
+        vel_grid,
+        sweep,
+        elevation_deg,
+        profile,
+        dealias_profile.knobs(),
+    )
+}
+
+pub(crate) fn dealias_with_knobs(
+    vel_grid: &mut [Vec<f64>],
+    sweep: &VelocitySweep,
+    elevation_deg: f64,
+    profile: Option<&WindProfile>,
+    knobs: DealiasKnobs,
 ) {
     let nyquist = estimate_nyquist(vel_grid);
     if nyquist < 8.0 {
@@ -1859,7 +1950,7 @@ pub(crate) fn dealias(
                     }
                 }
             }
-            if comp.len() >= DA_RAWMIN_BINS {
+            if comp.len() >= knobs.rawmin_bins {
                 for (ci, cj) in comp {
                     keep_raw[idx(ci, cj)] = true;
                 }
@@ -1881,8 +1972,11 @@ pub(crate) fn dealias(
     // 4-neighbor marks a fold wall no pass could place — kept-raw folded
     // regions meet correctly unfolded ones exactly there. The measured
     // transfer censors 1.9·Vny soup and keeps 1.25·Vny.
+    if knobs.censor_vny_frac.is_infinite() {
+        return;
+    }
     let snapshot: Vec<Vec<f64>> = vel_grid.to_vec();
-    let censor_at = CENSOR_VNY_FRAC * nyquist;
+    let censor_at = knobs.censor_vny_frac * nyquist;
     for i in 0..n {
         for j in 0..gc {
             let v = snapshot[i][j];
@@ -1972,10 +2066,55 @@ mod tests {
 
         let vg = grid.clone();
         let sw = sweep_for(&vg, &azs, gates);
-        dealias(&mut grid, &sw, 0.5, Some(&wp));
+        dealias(&mut grid, &sw, 0.5, Some(&wp), DealiasProfile::NoFalseShear);
 
         assert_eq!(grid[0][10], 30.0, "folded arc should unfold to +30");
         assert_eq!(grid[12][10], true_v[12], "unfolded flow must not move");
+
+        // The Coverage profile shares every unfolding pass, so a field the
+        // passes settle comes back identical under both postures.
+        let mut coverage = vg.clone();
+        dealias(&mut coverage, &sw, 0.5, Some(&wp), DealiasProfile::Coverage);
+        assert_eq!(coverage[0][10], 30.0);
+        assert_eq!(coverage[12][10], true_v[12]);
+    }
+
+    /// The profile parameter reaches only the post-pass censoring: an
+    /// unreached data region smaller than `DA_RAWMIN_BINS` goes ND under
+    /// `NoFalseShear` — today's tuned NROT behaviour, unchanged — and keeps
+    /// its raw values under `Coverage`.
+    #[test]
+    fn a_small_unreached_region_is_nd_for_nrot_and_raw_for_coverage() {
+        let n = 72;
+        let gates = 40;
+        // Nothing seeds: no wind profile, and no data near zero inside 40 km
+        // (the zero-isodop band). A lone 2×3 patch of 20 m/s at long range is
+        // unreachable by every propagation pass.
+        let mut grid: Vec<Vec<f64>> = vec![vec![f64::NAN; gates]; n];
+        for row in grid.iter_mut().take(32).skip(30) {
+            for g in row.iter_mut().take(39).skip(36) {
+                *g = 20.0;
+            }
+        }
+        // One far bin pins the Nyquist estimate above the 8 m/s floor.
+        grid[0][39] = 26.0;
+        let azs = ring_azimuths(n);
+        let vg = grid.clone();
+        let sw = sweep_for(&vg, &azs, gates);
+
+        let mut strict = grid.clone();
+        dealias(&mut strict, &sw, 0.5, None, DealiasProfile::NoFalseShear);
+        assert!(
+            strict[30][37].is_nan(),
+            "a 6-bin unreached region is under DA_RAWMIN_BINS and goes ND"
+        );
+
+        let mut coverage = grid.clone();
+        dealias(&mut coverage, &sw, 0.5, None, DealiasProfile::Coverage);
+        assert_eq!(
+            coverage[30][37], 20.0,
+            "Coverage keeps every unreached data gate at raw"
+        );
     }
 
     /// A continuous field, even a sheared one, must pass through untouched:
@@ -1995,7 +2134,7 @@ mod tests {
         let azs: Vec<f64> = (0..n).map(|i| i as f64 * 360.0 / n as f64).collect();
         let vg = grid.clone();
         let sw = sweep_for(&vg, &azs, gates);
-        dealias(&mut grid, &sw, 0.5, None);
+        dealias(&mut grid, &sw, 0.5, None, DealiasProfile::NoFalseShear);
         assert_eq!(grid, grid_orig);
     }
 
