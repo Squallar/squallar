@@ -87,6 +87,7 @@ rustdar-platform/src/network_security_config.rs	150	147
 rustdar-platform/src/platform.rs	98	0
 rustdar-platform/src/run.rs	31	0
 rustdar-radar/src/archive.rs	529	408
+rustdar-radar/src/eet.rs	440	346
 rustdar-radar/src/l3_values.rs	230	230
 rustdar-radar/src/level3.rs	368	187
 rustdar-radar/src/nrot.rs	1308	1100
@@ -101,7 +102,7 @@ rustdar-radar/src/srm.rs	1344	822
 rustdar-radar/src/tls.rs	177	157
 rustdar-radar/src/twin.rs	430	283
 rustdar-radar/src/types.rs	288	169
-rustdar-radar/src/volumetric.rs	501	496
+rustdar-radar/src/volumetric.rs	513	507
 rustdar-units/src/distance.rs	21	7
 rustdar-units/src/hail_size.rs	21	7
 rustdar-units/src/height.rs	32	15
