@@ -475,7 +475,8 @@ pub(crate) fn find_sweep(
     match product {
         types::RadarProduct::Velocity
         | types::RadarProduct::SpectrumWidth
-        | types::RadarProduct::NormalizedRotation => newest(false),
+        | types::RadarProduct::NormalizedRotation
+        | types::RadarProduct::StormRelativeVelocity => newest(false),
         _ => newest(true).or_else(|| newest(false)),
     }
 }
@@ -570,21 +571,23 @@ pub fn render_radar_to_image(
 /// rasterizer rather than two that could disagree about a pixel; see
 /// [`crate::render_input`] for why the reconstruction is exact.
 pub fn render_from(input: &crate::render_input::RenderInput) -> Option<(Vec<u8>, f64, Vec<f32>)> {
-    render_radar_to_image_with_winds(
+    render_radar_to_image_full(
         &input.to_scan(),
         input.elevation(),
         input.product(),
         input.radar_lat(),
         input.radar_lon(),
         input.wind_levels(),
+        input.storm_motion_override(),
     )
 }
 
 /// [`render_radar_to_image`] with an optional environmental wind profile —
 /// (height km, u, v) levels, e.g. from the RPG's NVW product via
 /// [`crate::nrot::parse_nvw_wind_levels`]. NROT's dealiaser uses it to settle
-/// fold branches the volume alone cannot (GR2Analyst's "Use Wind Profile");
-/// other products ignore it.
+/// fold branches the volume alone cannot (GR2Analyst's "Use Wind Profile"),
+/// and storm-relative velocity both dealiases with it and fits its default
+/// Bunkers vector from it; other products ignore it.
 pub fn render_radar_to_image_with_winds(
     data: &Scan,
     elevation_angle: f32,
@@ -592,6 +595,31 @@ pub fn render_radar_to_image_with_winds(
     radar_lat: f64,
     radar_lon: f64,
     wind_levels: Option<&[(f64, f64, f64)]>,
+) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+    render_radar_to_image_full(
+        data,
+        elevation_angle,
+        product,
+        radar_lat,
+        radar_lon,
+        wind_levels,
+        None,
+    )
+}
+
+/// [`render_radar_to_image_with_winds`] plus the storm motion override, in
+/// knots and degrees-from — the one render parameter only storm-relative
+/// velocity reads. `None` is "no override": SRV then applies the Bunkers
+/// right-mover from the volume's own wind profile ([`crate::srv`]).
+#[allow(clippy::too_many_arguments)]
+pub fn render_radar_to_image_full(
+    data: &Scan,
+    elevation_angle: f32,
+    product: types::RadarProduct,
+    radar_lat: f64,
+    radar_lon: f64,
+    wind_levels: Option<&[(f64, f64, f64)]>,
+    storm_motion_override: Option<(f32, f32)>,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     if product == types::RadarProduct::EchoTopsInterpolated {
         return render_echo_tops_interp_to_image(data, radar_lat, radar_lon);
@@ -605,6 +633,17 @@ pub fn render_radar_to_image_with_winds(
 
     if product == types::RadarProduct::NormalizedRotation {
         return render_nrot_to_image(data, radials, radar_lat, radar_lon, wind_levels);
+    }
+
+    if product == types::RadarProduct::StormRelativeVelocity {
+        return render_srv_to_image(
+            data,
+            radials,
+            radar_lat,
+            radar_lon,
+            wind_levels,
+            storm_motion_override,
+        );
     }
 
     let avg_azimuth_spacing = compute_azimuth_spacing(radials);
@@ -732,6 +771,83 @@ fn render_nrot_to_image(
                         range_km,
                         vg.gate_interval_km,
                         scaled_value,
+                        from,
+                    );
+                }
+            });
+        },
+    );
+    Some(output)
+}
+
+/// Render storm-relative velocity derived locally from Level II: the sweep's
+/// velocity dealiased under the Coverage profile, plus the storm-motion
+/// correction — a user override when one is set, otherwise the Bunkers
+/// right-mover from the volume's wind profile. Values are m/s, like every
+/// Level II velocity field, so the palette and `format_value` read them
+/// unchanged. See [`crate::srv`].
+///
+/// `None` when no vector exists at all — no override and a wind profile too
+/// hollow for even the mean-wind fallback — because painting base velocity
+/// under a storm-relative label is the failure the old Level III path
+/// refused too (it waited for an `N0S`).
+fn render_srv_to_image(
+    scan: &Scan,
+    radials: &[Radial],
+    radar_lat: f64,
+    radar_lon: f64,
+    wind_levels: Option<&[(f64, f64, f64)]>,
+    storm_motion_override: Option<(f32, f32)>,
+) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+    if radials.len() < 3 {
+        return None;
+    }
+    let elevation_deg = radials
+        .first()
+        .map(|r| r.elevation_angle_degrees() as f64)
+        .unwrap_or(0.5);
+    let profile = wind_levels
+        .and_then(crate::nrot::WindProfile::from_levels)
+        .or_else(|| build_wind_profile(scan));
+    let user = storm_motion_override.and_then(|(speed_kt, direction_deg)| {
+        crate::srv::SrvMotion::user_override(speed_kt, direction_deg)
+    });
+    let motion = crate::srv::storm_motion(profile.as_ref(), user)?;
+    log::info!(
+        "SRV {elevation_deg:.1}°: {:.1} kt from {:.1}° ({:?})",
+        motion.speed_kt,
+        motion.direction_deg,
+        motion.source,
+    );
+    let grid = crate::srv::compute_srv_grid(radials, elevation_deg, profile.as_ref(), &motion)?;
+
+    let actual_max_range =
+        grid.first_gate_range_km + grid.gate_count as f64 * grid.gate_interval_km;
+    let avg_spacing_deg = 360.0 / grid.values.len().max(1) as f64;
+    let output = render_with_projection(
+        radar_lat,
+        radar_lon,
+        actual_max_range,
+        types::RadarProduct::StormRelativeVelocity,
+        "SRV",
+        |proj, bufs| {
+            grid.values.par_iter().enumerate().for_each(|(i, row)| {
+                let ctx = RadialContext::new(grid.azimuths_deg[i], avg_spacing_deg / 2.0);
+                for (j, &value) in row.iter().enumerate() {
+                    if value.is_nan() {
+                        continue;
+                    }
+                    let range_km = grid.first_gate_range_km + j as f64 * grid.gate_interval_km;
+                    if range_km > types::MAX_RANGE_KM {
+                        break;
+                    }
+                    let from = GateId { radial: i, gate: j };
+                    proj.render_gate(
+                        bufs,
+                        &ctx,
+                        range_km,
+                        grid.gate_interval_km,
+                        value as f32,
                         from,
                     );
                 }

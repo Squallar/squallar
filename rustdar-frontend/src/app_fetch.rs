@@ -887,8 +887,20 @@ impl super::App {
         // is dispatched, so a browser worker can be handed the request without
         // the volume behind it. `None` — no sweep carries the product — is the
         // same answer the renderer gives, and takes the same failure path.
+        // The storm motion override is read from the dispatcher for the same
+        // reason `spawn_level2_render` reads it there: one field for both the
+        // invalidation and the vector drawn.
+        let storm_motion = (product == rustdar_radar::types::RadarProduct::StormRelativeVelocity)
+            .then(|| self.render.storm_motion_override_kt())
+            .flatten();
         let job = match rustdar_radar::render_input::RenderInput::extract(
-            &scan_data, snapped, product, lat, lon, None,
+            &scan_data,
+            snapped,
+            product,
+            lat,
+            lon,
+            None,
+            storm_motion,
         ) {
             Some(input) => crate::offload::Job::Described(crate::offload::JobRequest::Radar {
                 input: Box::new(input),

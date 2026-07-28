@@ -122,19 +122,6 @@ pub enum JobRequest {
         radar_lat: f64,
         radar_lon: f64,
     },
-    /// Rasterize a storm-relative velocity field derived from a Level III
-    /// dealiased velocity product.
-    ///
-    /// The derivation travels as its two inputs — the source product's bytes
-    /// and the storm motion vector — rather than as its output, for the same
-    /// reason: `DerivedSrm` has no wire form, and `srm::derive` is pure, so
-    /// re-running it in the worker produces the same field.
-    Srm {
-        bytes: std::sync::Arc<Vec<u8>>,
-        motion: rustdar_radar::srm::StormMotionSample,
-        radar_lat: f64,
-        radar_lon: f64,
-    },
 }
 
 /// What a rasterizing job produces: the RGBA texture, the range it was
@@ -223,32 +210,6 @@ impl JobRequest {
                 out.extend_from_slice(bytes);
                 out
             }
-            Self::Srm {
-                bytes,
-                motion,
-                radar_lat,
-                radar_lon,
-            } => {
-                let mut out = vec![TAG_SRM];
-                out.extend_from_slice(&motion.motion.speed_kt.to_le_bytes());
-                out.extend_from_slice(&motion.motion.direction_deg.to_le_bytes());
-                out.push(u8::from(motion.motion.is_scit_average));
-                match motion.volume {
-                    // `None` is a vector the user typed in, and a derived field
-                    // built from one must not claim the RPG's provenance — so
-                    // the distinction has to survive the wire.
-                    None => out.push(0),
-                    Some((a, b)) => {
-                        out.push(1);
-                        out.extend_from_slice(&a.to_le_bytes());
-                        out.extend_from_slice(&b.to_le_bytes());
-                    }
-                }
-                out.extend_from_slice(&radar_lat.to_le_bytes());
-                out.extend_from_slice(&radar_lon.to_le_bytes());
-                out.extend_from_slice(bytes);
-                out
-            }
         }
     }
 
@@ -278,29 +239,6 @@ impl JobRequest {
                     bytes: std::sync::Arc::new(r.rest().to_vec()),
                 })
             }
-            TAG_SRM => {
-                let mut r = Reader::new(rest);
-                let motion = nexrad_level3::model::StormMotion {
-                    speed_kt: r.f32()?,
-                    direction_deg: r.f32()?,
-                    is_scit_average: match r.u8()? {
-                        0 => false,
-                        1 => true,
-                        _ => return None,
-                    },
-                };
-                let volume = match r.u8()? {
-                    0 => None,
-                    1 => Some((r.u16()?, r.u32()?)),
-                    _ => return None,
-                };
-                Some(Self::Srm {
-                    motion: rustdar_radar::srm::StormMotionSample { motion, volume },
-                    radar_lat: r.f64()?,
-                    radar_lon: r.f64()?,
-                    bytes: std::sync::Arc::new(r.rest().to_vec()),
-                })
-            }
             _ => None,
         }
     }
@@ -310,17 +248,21 @@ impl JobRequest {
         match self {
             Self::Radar { input, .. } => match input.product() {
                 rustdar_radar::types::RadarProduct::NormalizedRotation => "radar/nrot",
+                rustdar_radar::types::RadarProduct::StormRelativeVelocity => "radar/srv",
                 _ => "radar",
             },
             Self::Level3 { .. } => "level3",
-            Self::Srm { .. } => "srm",
         }
     }
 }
 
 const TAG_RADAR: u8 = 1;
 const TAG_LEVEL3: u8 = 2;
-const TAG_SRM: u8 = 3;
+/// Tag 3 was the Level III SRM derivation job, retired when storm-relative
+/// velocity became a Level II product; the number stays reserved so a stale
+/// worker's job cannot be misread as a future kind.
+#[allow(dead_code)]
+const TAG_SRM_RETIRED: u8 = 3;
 
 /// A bounds-checked cursor over a job's fixed-width header.
 ///
@@ -348,20 +290,8 @@ impl<'a> Reader<'a> {
         &self.bytes[self.at..]
     }
 
-    fn u8(&mut self) -> Option<u8> {
-        self.take(1).map(|b| b[0])
-    }
-
     fn u16(&mut self) -> Option<u16> {
         Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
-    }
-
-    fn f32(&mut self) -> Option<f32> {
-        Some(f32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
 
     fn f64(&mut self) -> Option<f64> {
@@ -402,17 +332,6 @@ pub fn execute(request: &JobRequest) -> JobResult {
             )
             .map(Into::into)
         }),
-        JobRequest::Srm {
-            bytes,
-            motion,
-            radar_lat,
-            radar_lon,
-        } => decode_level3(bytes)
-            .and_then(|message| rustdar_radar::srm::derive(&message, motion))
-            .and_then(|derived| {
-                rustdar_radar::render::render_derived_srm_to_image(&derived, *radar_lat, *radar_lon)
-                    .map(Into::into)
-            }),
     }
 }
 
@@ -705,6 +624,7 @@ mod tests {
             35.0,
             -97.0,
             None,
+            None,
         )
         .expect("fixture extracts")
         .to_bytes()
@@ -721,32 +641,9 @@ mod tests {
         }
     }
 
-    fn an_srm_job(volume: Option<(u16, u32)>) -> JobRequest {
-        JobRequest::Srm {
-            bytes: std::sync::Arc::new(vec![1, 2, 3]),
-            motion: rustdar_radar::srm::StormMotionSample {
-                motion: nexrad_level3::model::StormMotion {
-                    speed_kt: 42.5,
-                    direction_deg: 231.25,
-                    is_scit_average: true,
-                },
-                volume,
-            },
-            radar_lat: 35.0,
-            radar_lon: -97.0,
-        }
-    }
-
     #[test]
     fn every_job_kind_survives_the_wire_format() {
-        for job in [
-            a_job(),
-            a_level3_job(),
-            // Both arms: `None` is a storm motion the user typed in, and a
-            // derived field built from one must not claim the RPG's provenance.
-            an_srm_job(Some((12, 34567))),
-            an_srm_job(None),
-        ] {
+        for job in [a_job(), a_level3_job()] {
             assert_eq!(
                 JobRequest::from_bytes(&job.to_bytes()),
                 Some(job.clone()),
@@ -754,6 +651,14 @@ mod tests {
                 job.kind()
             );
         }
+    }
+
+    /// The retired SRM job tag must be refused, not resurrected: a worker
+    /// from a build that still posts it gets a failed job, never a render of
+    /// something this build would compute differently.
+    #[test]
+    fn the_retired_srm_tag_is_refused() {
+        assert_eq!(JobRequest::from_bytes(&[TAG_SRM_RETIRED, 1, 2, 3]), None);
     }
 
     #[test]
@@ -770,7 +675,7 @@ mod tests {
 
         // A truncated header must not be read as a short one. The variable tail
         // is whatever is left, so only the fixed part can be checked this way.
-        for job in [a_job(), a_level3_job(), an_srm_job(Some((1, 2)))] {
+        for job in [a_job(), a_level3_job()] {
             let bytes = job.to_bytes();
             for cut in 1..bytes.len().min(20) {
                 let _ = JobRequest::from_bytes(&bytes[..cut]);
@@ -797,7 +702,6 @@ mod tests {
     #[test]
     fn an_undecodable_level3_payload_renders_nothing() {
         assert_eq!(execute(&a_level3_job()), None);
-        assert_eq!(execute(&an_srm_job(None)), None);
     }
 
     /// With no worker installed, `offload_job` is the old behaviour: the job

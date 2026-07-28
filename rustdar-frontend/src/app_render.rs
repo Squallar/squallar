@@ -476,14 +476,6 @@ impl super::App {
                     changed = true;
                 }
                 // Register the actual elevation angle from the PDB.
-                //
-                // `render_dispatch::is_renderable_tilt` is *not* applied here, so
-                // `N0S` — fetched for its storm motion vector alone and never drawn
-                // — does register an SRM elevation. That is harmless only by
-                // coincidence: `N0S` and `N0G` are both 0.5°, so the dedupe just
-                // below collapses them and the picker gains no entry it cannot
-                // render. A vector source at an angle no tilt product shares would
-                // put a dead entry in the elevation list, selectable and blank.
                 let elevations = info.product_elevations.entry(l3_resp.product).or_default();
                 let rounded_elev = (elevation * 10.0).round() / 10.0;
                 if !elevations.iter().any(|e| (e - rounded_elev).abs() < 0.05) {
@@ -617,10 +609,16 @@ impl super::App {
                             self.window.clone(),
                         );
                     } else if let Some(data) = self.scan_data.get(scan_info.site.name) {
-                        let winds = (product
-                            == rustdar_radar::types::RadarProduct::NormalizedRotation)
-                            .then(|| self.render.vwp_levels.get(&pane_site).cloned())
-                            .flatten();
+                        // The two velocity-derived products whose dealiaser a
+                        // VAD wind profile seeds — and, for storm-relative
+                        // velocity, whose default Bunkers vector it feeds.
+                        let winds = matches!(
+                            product,
+                            rustdar_radar::types::RadarProduct::NormalizedRotation
+                                | rustdar_radar::types::RadarProduct::StormRelativeVelocity
+                        )
+                        .then(|| self.render.vwp_levels.get(&pane_site).cloned())
+                        .flatten();
                         self.render.spawn_level2_render(
                             pane_idx,
                             &params,
@@ -2664,13 +2662,12 @@ mod stamping_tests {
 
     /// A radar whose Level III objects the pane below is showing.
     pub(super) const SITE: &str = "KMPX";
-    /// The product carried through: Level III, and not the storm-relative one,
-    /// whose tilt filter would need a symbology block to pass.
+    /// The product carried through — any Level III product will do, and
+    /// storm-relative velocity no longer is one.
     const PRODUCT: RadarProduct = RadarProduct::EchoTops;
 
-    /// The smallest Level III object `nearest_tilt` will consider: it reads the
-    /// elevation off the PDB and nothing else, and `is_renderable_tilt` waves
-    /// through everything that is not storm-relative velocity.
+    /// The smallest Level III object `nearest_tilt` will consider: it reads
+    /// the elevation off the PDB and nothing else.
     pub(super) fn tilt(elevation_tenths: i16, key: &str) -> Level3Product {
         Level3Product {
             message: Level3Message {

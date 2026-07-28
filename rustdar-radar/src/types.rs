@@ -324,8 +324,7 @@ impl RadarProduct {
     pub fn is_level3(&self) -> bool {
         matches!(
             self,
-            RadarProduct::StormRelativeVelocity
-                | RadarProduct::SpecificDifferentialPhase
+            RadarProduct::SpecificDifferentialPhase
                 | RadarProduct::EchoTops
                 | RadarProduct::VerticallyIntegratedLiquid
                 | RadarProduct::HydrometeorClassification
@@ -337,19 +336,13 @@ impl RadarProduct {
     /// the `unidata-nexrad-level3` bucket (`TLX_N0S_2026_07_25_...`). `None`
     /// for Level II products.
     ///
-    /// Storm-relative velocity asks for five: all four tilts are **derived**
-    /// from dealiased velocity, and `N0S` is fetched on top of them for the
-    /// storm motion vector in its Product Description Block, which no velocity
-    /// product carries. NWS removed `N1S`/`N2S`/`N3S` from NOAAPort
-    /// (SCN 22-96) and nothing has been written to those keys since 2020; the
-    /// 0.5° tilt is derived too, so that all four are the same field at the
-    /// same resolution and all four honour a storm motion override. See
-    /// [`crate::srm`]. Never point a tilt at `N0S` — it is 1 km where the
-    /// derived tilts are 0.25 km, and its gate values already have the RPG's
-    /// own vector in them.
+    /// Storm-relative velocity is deliberately absent: it once fetched five
+    /// objects here — `N0S` for the vector in its PDB and `N0G`/`N1G`/
+    /// `N2U`/`N3U` as dealiased tilts — and is now derived entirely from the
+    /// Level II volume already in hand, dealiased locally with a Bunkers
+    /// right-mover default vector. See [`crate::srv`].
     pub fn level3_products(&self) -> Option<&'static [&'static str]> {
         match self {
-            RadarProduct::StormRelativeVelocity => Some(&crate::srm::SRM_FETCH_PRODUCTS),
             RadarProduct::SpecificDifferentialPhase => Some(&["N0K"]),
             RadarProduct::EchoTops => Some(&["EET"]),
             RadarProduct::VerticallyIntegratedLiquid => Some(&["DVL"]),
@@ -432,6 +425,10 @@ impl RadarProduct {
             RadarProduct::DifferentialPhase => Some(MomentSlot::DifferentialPhase),
             // NROT is derived from velocity
             RadarProduct::NormalizedRotation => Some(MomentSlot::Velocity),
+            // Storm-relative velocity is derived from velocity too — every
+            // velocity tilt lists, an upgrade over the four fixed Level III
+            // tilts the product used to fetch. See `crate::srv`.
+            RadarProduct::StormRelativeVelocity => Some(MomentSlot::Velocity),
             // Interpolated echo tops integrate the whole reflectivity volume;
             // tying availability to the reflectivity moment lists it alongside
             // the reflectivity tilts (the rendered field is tilt-independent).
@@ -440,8 +437,7 @@ impl RadarProduct {
             // (local VIL divided by local echo tops), so it lists the same way.
             RadarProduct::VilDensity => Some(MomentSlot::Reflectivity),
             // Level III products. No Level II moment stands behind them.
-            RadarProduct::StormRelativeVelocity
-            | RadarProduct::SpecificDifferentialPhase
+            RadarProduct::SpecificDifferentialPhase
             | RadarProduct::EchoTops
             | RadarProduct::VerticallyIntegratedLiquid
             | RadarProduct::HydrometeorClassification

@@ -31,15 +31,43 @@
 //! NROT's median filter entirely: the RPG's own dealiased products are not
 //! median-filtered, and the filter's ND rules cost coverage.
 //!
-//! Both knob choices were A/B'd live against the RPG's own dealiased
-//! velocity (products 154/99, the `N0G`/`N1G`/`N2U`/`N3U` twins of the same
-//! Level II volume) across climatologically diverse sites — plains, gulf
-//! coast, mountain west, southeast — per the campaign's site-diversity rule,
-//! decision sites disjoint from the holdout confirmation; the numbers are in
-//! the module's validation history (see `live_validation` and the WP4
-//! report). The fold-wall censor stays because dropping it keeps gates that
-//! are wrong by 2·Vny — worse for level agreement than the hole is for
-//! coverage.
+//! Both knob choices were A/B'd live (2026-07-28) against the RPG's own
+//! dealiased velocity — products 154/99, the `N0G`/`N1G`/`N2U`/`N3U` twins
+//! of the same Level II volume and cut — on five climatologically spread
+//! decision sites (KMPX upper midwest, KTLX southern plains, KMOB gulf
+//! coast, KMTX mountain west, KMRX Appalachian southeast; 4 tilts × 4
+//! postures × 5 sites), the other seventeen roster sites the holdout:
+//!
+//! * kept-raw floor 16 → 1: coverage 90.3–99.4% → 99.2–100% (the floor-16
+//!   posture would *fail* the 95% coverage bar at KMTX's upper tilts, 90.3%
+//!   and 91.8%), for at most 0.05 points of within-±1 given up — every
+//!   decision site, same verdict;
+//! * censor off: coverage gains at most 0.8 points anywhere, and within-±1
+//!   *drops* wherever real folding exists — KMRX 99.54 → 99.10 (`N0G`),
+//!   99.82 → 99.64, 99.97 → 99.76, 99.88 → 99.55 — because a kept fold wall
+//!   is a 2·Vny error on every gate it touches. The censor stays.
+//!
+//! The holdout confirmed the choice: the full 22-site Protocol A survey
+//! below ran on the shipped knobs and passed everywhere.
+//!
+//! # Validation status (2026-07-28 survey)
+//!
+//! **Protocol A** — the dealiased grid (Coverage profile, no median filter,
+//! pre-SRM) against the RPG's own dealiased velocity, per site per tilt,
+//! all 22 roster sites, 1.37 M gates compared: within one 0.5 m/s level
+//! 99.54–100.00% on all 88 site-tilts (bar 99%; worst KMRX `N0G` 99.54%),
+//! coverage 99.2–100% of the twin's defined gates (bar 95%). Every site
+//! conclusive, none quarantined. Unlike EET/DVL, whose oracle is the
+//! DQA-edited reflectivity chain this campaign cannot reach, the velocity
+//! twins are reproducible from raw Level II: unfolded gates carry identical
+//! 0.5 m/s codes on both sides, so the residual is confined to fold regions
+//! and edited gates.
+//!
+//! **Protocol B** — the same `N0G` and the same `N0S` vector through this
+//! module's m/s arithmetic and through [`crate::srm::derive`]'s knots
+//! arithmetic: 18 sites with nonzero vectors, 100.000% within ±1 derived
+//! level (0.5 kt) at every one, 3.1 M gates. The port is exact to float
+//! rounding.
 //!
 //! # Storm motion
 //!
@@ -68,7 +96,17 @@
 //! printed** by the live harness per site, never asserted: the two are
 //! different estimators of different things (cell-track average against
 //! hodograph prediction), and which to ship is a product decision the
-//! numbers inform.
+//! numbers inform. The 2026-07-28 survey, a quiet-to-moderate day: where
+//! the RPG carried a real vector the deltas ranged from +0.4 kt/+9°
+//! (KUEX) and +0.5 kt/+141° (KPAH) to −37.6 kt/+91° (KEAX, where SCIT was
+//! tracking a single 53 kt cell) — direction deltas are large exactly
+//! where speeds are small and SCIT is fitting few cells. Four sites'
+//! profiles refused Bunkers outright (quiet, shear under the floor at the
+//! time; the mean-wind fallback now covers that case), and three RPG
+//! vectors were 0.0 kt where Bunkers offered 11–14 kt. Read it as: on
+//! organised-convection days the two broadly agree; on quiet days they
+//! are both guessing, and the derived product at least guesses from the
+//! whole volume's hodograph rather than from one cell track.
 //!
 //! # Units and the display seam
 //!

@@ -44,6 +44,7 @@ fn main() {
         "cc" => RadarProduct::CorrelationCoefficient,
         "phi" => RadarProduct::DifferentialPhase,
         "nrot" => RadarProduct::NormalizedRotation,
+        "srv" => RadarProduct::StormRelativeVelocity,
         "eti" => RadarProduct::EchoTopsInterpolated,
         "vild" => RadarProduct::VilDensity,
         other => panic!("unknown product {other}"),
@@ -66,13 +67,21 @@ fn main() {
             .collect()
     });
 
-    let (rgba, max_range_km, _values) = rustdar_radar::render::render_radar_to_image_with_winds(
+    // SRV_MOTION ("speed_kt direction_deg") overrides the Bunkers default,
+    // exactly as the settings dialog's storm motion override does.
+    let storm_motion: Option<(f32, f32)> = std::env::var("SRV_MOTION").ok().and_then(|s| {
+        let mut it = s.split_whitespace();
+        Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+    });
+
+    let (rgba, max_range_km, _values) = rustdar_radar::render::render_radar_to_image_full(
         &scan,
         elevation,
         product,
         lat,
         lon,
         wind_levels.as_deref(),
+        storm_motion,
     )
     .expect("no sweep at that elevation");
     write_ppm(&out, &rgba, max_range_km);

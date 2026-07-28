@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rustdar_radar::level3::Level3Product;
-use rustdar_radar::srm::{self, StormMotionSample};
+use rustdar_radar::srm::StormMotionSample;
 use rustdar_radar::types::RadarProduct;
 
 use crate::WindowRef;
@@ -204,24 +204,6 @@ impl RenderCache {
     }
 }
 
-/// Whether a cached Level III product is one a pane can show.
-///
-/// Storm-relative velocity derives every tilt, 0.5° included, and fetches
-/// `N0S` on top of the four for the storm motion vector in its Product
-/// Description Block — no velocity product carries one, because halfword 51 is
-/// the BZ2 compression flag there. `N0S` must never be *drawn*: it is 1 km at
-/// the RPG's 16 display levels where the derived tilts are 0.25 km at 254, and
-/// its gate values already have the RPG's own vector in them, so a storm motion
-/// override cannot reach it.
-///
-/// Filtering here rather than in the elevation comparison because nothing in
-/// that comparison could separate the two: at `TLX` the bucket's `N0S` and
-/// `N0G` both report 0.5° and both report elevation number 1, so an unfiltered
-/// search resolves the 0.5° pane to whichever of them the hash yielded.
-fn is_renderable_tilt(product: RadarProduct, msg: &nexrad_level3::model::Level3Message) -> bool {
-    product != RadarProduct::StormRelativeVelocity || srm::is_velocity_source(msg)
-}
-
 /// Quantize an elevation angle to tenths of a degree for cache key use.
 ///
 /// Coarser than `rustdar_egui::pane::ELEVATION_TOLERANCE`, deliberately: that is a
@@ -247,19 +229,6 @@ fn whole_volume_product(product: RadarProduct, have_wind_profile: bool) -> bool 
 
 fn elevation_key(elevation: f32) -> i32 {
     (elevation * 10.0).round() as i32
-}
-
-/// What to append to the SRM render log to qualify the vector it used.
-///
-/// A user override belongs to no volume, so neither volume claim applies to it
-/// — it used to be annotated `(previous volume)`, which said the RPG had fitted
-/// this vector for some earlier scan.
-fn motion_provenance_suffix(provenance: srm::MotionProvenance) -> &'static str {
-    match provenance {
-        srm::MotionProvenance::SameVolume => "",
-        srm::MotionProvenance::PreviousVolume => " (previous volume)",
-        srm::MotionProvenance::UserOverride => " (user override)",
-    }
 }
 
 /// Manages radar rendering dispatch and Level III data caching.
@@ -321,32 +290,16 @@ pub struct RenderDispatcher {
     /// for the panes on screen, not a history, and each entry costs `IMAGE_SIZE² × 8`
     /// bytes.
     pub render_cache: RenderCache,
-    /// The storm motion override the derived SRM tilts on screen were built
-    /// with. Nothing else about a pane changes when the user edits the vector,
-    /// so without this the field would keep the old motion until the next fetch.
+    /// The storm motion override the storm-relative renders on screen were
+    /// built with. Nothing else about a pane changes when the user edits the
+    /// vector, so without this the field would keep the old motion until the
+    /// next scan. Routed into the Level II render parameters by
+    /// [`spawn_level2_render`](Self::spawn_level2_render); with no override
+    /// the renderer applies the Bunkers right-mover from the volume's own
+    /// wind profile (`rustdar_radar::srv`). The RPG-vector history that used
+    /// to live beside this left with the five Level III SRM fetches.
     last_storm_motion_override: Option<StormMotionSample>,
-    /// The last few volumes' storm motion vectors per site, newest first.
-    ///
-    /// Only `N0S` carries a vector and only one object of it is ever cached, so
-    /// without a history the four tilts get whichever volume's vector arrived
-    /// last. That is not a boundary transient: `N0S` and `N0G` are published
-    /// when the 0.5° cut finishes, `N1G`/`N2U`/`N3U` when their own cuts do, so
-    /// for most of a volume the newest vector is a volume **ahead** of the
-    /// upper tilts. Measured over 22 sites — see
-    /// `rustdar_radar::srm`'s volume-pairing section — the newest vector
-    /// belonged to another volume on 306 of 792 renders, and on the upper three
-    /// tilts specifically 38-54%.
-    ///
-    /// Survives [`reset_panes_for_site`](Self::reset_panes_for_site), which
-    /// runs on every poll; only a full [`reset_panes`](Self::reset_panes)
-    /// clears it. Bounded to [`STORM_MOTION_HISTORY`] volumes per site.
-    storm_motion_history: HashMap<String, VecDeque<StormMotionSample>>,
 }
-
-/// Volumes of storm motion kept per site. Four covers roughly twenty minutes of
-/// VCP 212 — far more than the one-volume lag that produces almost every
-/// mismatch — and the lookup is a linear scan of this many entries.
-const STORM_MOTION_HISTORY: usize = 4;
 
 impl Default for RenderDispatcher {
     fn default() -> Self {
@@ -367,17 +320,13 @@ impl RenderDispatcher {
             renders_in_flight: Arc::new(AtomicUsize::new(0)),
             render_cache: RenderCache::new(MAX_RENDER_CACHE_ENTRIES),
             last_storm_motion_override: None,
-            storm_motion_history: HashMap::new(),
         }
     }
 
-    /// Cache a fetched Level III product, recording its storm motion vector
-    /// against its volume if it carries one.
+    /// Cache a fetched Level III product.
     ///
     /// The only way into [`level3_data`](Self::level3_data). The map keeps one
-    /// object per `(product, tilt, site)`, so an `N0S` that is not captured here
-    /// is gone the moment the next volume's arrives — and the next volume's is
-    /// the wrong one for three of the four tilts most of the time.
+    /// object per `(product, tilt, site)`.
     pub fn cache_level3(
         &mut self,
         product: RadarProduct,
@@ -385,19 +334,6 @@ impl RenderDispatcher {
         site: String,
         fetched: Level3Product,
     ) {
-        if let Some(sample) = StormMotionSample::from_message(&fetched.message) {
-            let history = self.storm_motion_history.entry(site.clone()).or_default();
-            if !history.iter().any(|s| s.volume == sample.volume) {
-                history.push_back(sample);
-                // Sorted rather than assumed: objects do not always arrive in
-                // volume order, and both the fallback (the front) and the
-                // eviction (the back) depend on newest-first holding.
-                history
-                    .make_contiguous()
-                    .sort_by_key(|s| std::cmp::Reverse(s.volume));
-                history.truncate(STORM_MOTION_HISTORY);
-            }
-        }
         self.level3_data
             .insert((product, tilt_code, site), Arc::new(fetched));
     }
@@ -410,9 +346,10 @@ impl RenderDispatcher {
     /// `(site, product, elevation)`, which the vector is not part of, so a
     /// stale entry would be handed straight back to the next pane that asked.
     ///
-    /// All four tilts, 0.5° included. While that tilt rendered `N0S` directly
-    /// this invalidated it to redraw a byte-identical image, because the RPG's
-    /// vector was already in the gate values.
+    /// Every tilt: the field this records is the same one
+    /// [`spawn_level2_render`](Self::spawn_level2_render) reads into the
+    /// render parameters, so the vector a pane is invalidated for cannot
+    /// differ from the one it is redrawn with.
     pub fn set_storm_motion_override(&mut self, motion: Option<StormMotionSample>) -> bool {
         if self.last_storm_motion_override == motion {
             return false;
@@ -456,16 +393,6 @@ impl RenderDispatcher {
             }
         }
         self.level3_data.retain(|(_prod, _tilt, s), _| s != site);
-        // `storm_motion_history` deliberately survives. This runs on **every**
-        // auto-poll for a live pane, immediately before the five products are
-        // refetched, so clearing it here would leave the history holding only
-        // the volume the newest `N0S` came from — which is the volume the upper
-        // tilts have *not* reached, and the pairing the history exists to fix.
-        // Nothing evicts a site, so the map grows with sites visited: four
-        // samples of ~40 bytes plus the key, call it 150 bytes **per site**,
-        // and ~160 NEXRAD sites exist, so ~24 KB is the ceiling for a session
-        // that visited every radar in the country. A vector that no longer
-        // matches any volume is never selected, so keeping them is inert.
         self.render_cache.retain(|(s, _prod, _elev)| s != site);
     }
 
@@ -559,7 +486,6 @@ impl RenderDispatcher {
         }
         self.render_generation += 1;
         self.level3_data.clear();
-        self.storm_motion_history.clear();
         self.render_cache.clear();
     }
 
@@ -641,13 +567,10 @@ pub struct RenderParams {
 impl RenderDispatcher {
     /// The Level III product for `site` closest to `elevation`, matched on the
     /// **Product Description Block's** elevation angle rather than on the AWIPS
-    /// mnemonic — `N1G` is 1.3° in VCP 212, not the 1.5° its name suggests.
+    /// mnemonic.
     ///
     /// Ties break on elevation number so a split cut or a SAILS/MRLE repeat,
     /// which share an angle, resolve to the same one every frame.
-    ///
-    /// Products that are cached but not displayable are filtered out first; see
-    /// [`is_renderable_tilt`].
     fn nearest_tilt(
         &self,
         product: RadarProduct,
@@ -656,9 +579,7 @@ impl RenderDispatcher {
     ) -> Option<Arc<Level3Product>> {
         self.level3_data
             .iter()
-            .filter(|((p, _tilt, s), l3)| {
-                *p == product && s == site && is_renderable_tilt(product, &l3.message)
-            })
+            .filter(|((p, _tilt, s), _l3)| *p == product && s == site)
             .min_by(|(_, a), (_, b)| {
                 let da = (a.message.pdb.elevation_angle() - elevation).abs();
                 let db = (b.message.pdb.elevation_angle() - elevation).abs();
@@ -692,8 +613,9 @@ impl RenderDispatcher {
     /// selection the render was spawned from — rather than being handed to
     /// `spawn_render` and carried back up the render thread. A value that is
     /// only *passed along* cannot be tested at the point it is passed, and
-    /// `try_spawn_level3_render` has no test callers by design; see its note,
-    /// and `storm_motion_for`'s.
+    /// `try_spawn_level3_render` has no test callers by design — the same
+    /// reasoning that keeps the storm motion override a field read here
+    /// rather than an argument (see `storm_motion_override_kt`).
     ///
     /// The cost is one render's worth of latency in the other direction: if a
     /// newer object for this tilt lands while the render is in flight, this
@@ -710,72 +632,25 @@ impl RenderDispatcher {
             .and_then(|tilt| tilt.stamp.time);
     }
 
-    /// The storm motion vector to apply to `velocity`: the user's if they set
-    /// one, otherwise the vector belonging to the volume `velocity` itself came
-    /// from, and only failing that the newest one seen. Every tilt goes through
-    /// here, so an override reaches all four.
+    /// The storm motion override as the `(speed_kt, direction_deg)` pair the
+    /// Level II render parameters carry, or `None` — Bunkers applies.
     ///
-    /// The RPG re-fits the SCIT average every volume, and all four tilts of a
-    /// volume share the fit — so pairing a velocity product with another
-    /// volume's vector is simply wrong, not merely stale. It is also the normal
-    /// case rather than a boundary race: `N0S` is published with the 0.5° cut
-    /// and the upper tilts a cut or more later, so for most of a volume the
-    /// newest vector belongs to a volume the upper tilts have not reached. See
-    /// [`storm_motion_history`](Self::storm_motion_history).
-    ///
-    /// The fallback stays because the alternative is a blank pane: at 0.5° the
-    /// SAILS repeat can arrive before the volume's `N0S` exists at all, and a
-    /// vector one volume out beats no storm-relative velocity.
-    ///
-    /// Takes the whole message and reads the volume off it, and reads the
-    /// override from `self`. Both were once values the caller worked out and
-    /// passed in, and the caller is `try_spawn_level3_render` — one production
-    /// call site, no test call sites. A mutant that replaced the volume key
-    /// with a constant, or dropped the override argument, therefore compiled
-    /// and passed the entire suite while disabling the feature in production;
-    /// both were confirmed to survive. Argument passing can only be tested from
-    /// the outermost caller, so the fix is to have no argument to pass: both
-    /// reads now sit inside a unit the tests reach.
-    ///
-    /// Reading [`last_storm_motion_override`](Self::last_storm_motion_override)
-    /// also makes it structurally impossible for the vector a pane is
-    /// *invalidated* for to differ from the one it is *drawn* with: both now
-    /// come from the same field.
-    fn storm_motion_for(
-        &self,
-        site: &str,
-        velocity: &nexrad_level3::model::Level3Message,
-    ) -> Option<StormMotionSample> {
-        if self.last_storm_motion_override.is_some() {
-            return self.last_storm_motion_override;
-        }
-        // `Some(..)`, not a bare key: `StormMotionSample::volume` is `None` for
-        // a user override, and an override must never be selected here as if it
-        // were some volume's RPG fit. Only `from_message` samples are recorded,
-        // so in practice every entry carries a key — but the comparison says
-        // which of the two it means.
-        let volume = Some(velocity.pdb.volume_key());
-        let history = self.storm_motion_history.get(site)?;
-        history
-            .iter()
-            .find(|s| s.volume == volume)
-            .or_else(|| history.front())
-            .copied()
+    /// Read from [`last_storm_motion_override`](Self::last_storm_motion_override),
+    /// the same field [`set_storm_motion_override`](Self::set_storm_motion_override)
+    /// invalidates on, so the vector a pane is invalidated for cannot differ
+    /// from the one it is drawn with.
+    pub(crate) fn storm_motion_override_kt(&self) -> Option<(f32, f32)> {
+        self.last_storm_motion_override
+            .map(|s| (s.motion.speed_kt, s.motion.direction_deg))
     }
 
     /// Spawn a Level III render for a pane if applicable.
     /// Returns `true` if a render was spawned.
     ///
-    /// No storm-relative velocity tilt is rendered from a product on the wire;
-    /// all four are computed here from dealiased velocity. See
-    /// [`rustdar_radar::srm`].
-    ///
-    /// The storm motion override is **not** a parameter: it is read from the
-    /// dispatcher by [`storm_motion_for`](Self::storm_motion_for), which is
-    /// where the volume key is read too. This function has no test callers, so
-    /// anything it merely forwards is untested by construction — see
-    /// `storm_motion_for`'s note. Keep it that way: give this function values
-    /// to act on, not values to pass along.
+    /// Storm-relative velocity never comes through here any more: it is a
+    /// Level II product, derived where the Level II render runs — see
+    /// [`spawn_level2_render`](Self::spawn_level2_render) and
+    /// [`rustdar_radar::srv`].
     pub fn try_spawn_level3_render(
         &mut self,
         pane_idx: usize,
@@ -791,51 +666,6 @@ impl RenderDispatcher {
         let lat = params.lat;
         let lon = params.lon;
         let product = params.product;
-
-        if srm::is_velocity_source(&l3_msg.message) {
-            let Some(sample) = self.storm_motion_for(site, &l3_msg.message) else {
-                // No `N0S` yet. Rendering the velocity field raw would paint a
-                // base-velocity couplet under a storm-relative label.
-                log::debug!(
-                    "Pane {pane_idx}: {:.1}° SRM waiting on a storm motion vector",
-                    params.elevation,
-                );
-                return false;
-            };
-            let Some(derived) = srm::derive(&l3_msg.message, &sample) else {
-                return false;
-            };
-            log::info!(
-                "Spawning derived SRM render for pane {pane_idx}: {:.1}° (elevation {}) from \
-                 product {}, {:.1} kt from {:.1}°{}",
-                derived.elevation_angle,
-                derived.elevation_number,
-                l3_msg.message.pdb.product_code,
-                derived.motion.speed_kt,
-                derived.motion.direction_deg,
-                motion_provenance_suffix(derived.motion_provenance),
-            );
-            self.spawn_render(
-                pane_idx,
-                product,
-                params.elevation,
-                sender,
-                window,
-                // The *inputs* to the derivation, not its output: `DerivedSrm`
-                // has no wire form and `srm::derive` is pure, so re-running it
-                // where the render runs produces the same field. `derived` above
-                // is still built here because the log line reports it and
-                // because a source that cannot be derived from must not take a
-                // render slot.
-                crate::offload::Job::Described(crate::offload::JobRequest::Srm {
-                    bytes: std::sync::Arc::clone(&l3_msg.bytes),
-                    motion: sample,
-                    radar_lat: lat,
-                    radar_lon: lon,
-                }),
-            );
-            return true;
-        }
 
         log::info!(
             "Spawning Level III render for pane {}: {:?}",
@@ -876,6 +706,15 @@ impl RenderDispatcher {
         let elevation = params.elevation;
         let lat = params.lat;
         let lon = params.lon;
+        // The storm motion override rides the render parameters for the one
+        // product that reads it. Read here, from the field the invalidation
+        // reads, not passed by the caller — `dispatch_pane_renders` has no
+        // test callers, so an argument it merely forwarded would be untested
+        // by construction (the lesson the old Level III path's
+        // `storm_motion_for` note recorded).
+        let storm_motion = (product == RadarProduct::StormRelativeVelocity)
+            .then(|| self.storm_motion_override_kt())
+            .flatten();
         log::info!(
             "Spawning background render for pane {}: {:?} at {:.1}°",
             pane_idx,
@@ -897,6 +736,7 @@ impl RenderDispatcher {
             lat,
             lon,
             winds.as_deref(),
+            storm_motion,
         ) {
             Some(input) => {
                 crate::offload::Job::Described(crate::offload::JobRequest::Radar {
@@ -969,7 +809,7 @@ impl RenderDispatcher {
 }
 
 #[cfg(test)]
-mod srm_dispatch_tests {
+mod level3_dispatch_tests {
     use super::*;
     use nexrad_level3::model::{
         DataLayer, DataPacket, Level3Message, MessageHeader, ProductDescriptionBlock, RadialPacket,
@@ -977,20 +817,9 @@ mod srm_dispatch_tests {
     };
     use rustdar_radar::level3::ProductStamp;
 
-    /// A minimal Level III product: enough PDB for tilt selection, storm motion
-    /// and derivation, plus one radial so `derive` has something to work on.
-    fn product(
-        product_code: i16,
-        elevation_tenths: i16,
-        elevation_number: u16,
-        volume_time: u32,
-        ps47_53: [i16; 7],
-    ) -> Level3Product {
-        let mut thresholds = [0u16; 16];
-        // Halfwords 31-33 of a real N1G: -63.5 m/s, 0.5 m/s, 254 levels.
-        thresholds[0] = -635i16 as u16;
-        thresholds[1] = 5;
-        thresholds[2] = 254;
+    /// A minimal Level III product: enough PDB for tilt selection plus one
+    /// radial so a render would have something to work on.
+    fn product(product_code: i16, elevation_tenths: i16, elevation_number: u16) -> Level3Product {
         let pdb = ProductDescriptionBlock {
             block_divider: -1,
             latitude: 44.849,
@@ -1002,15 +831,15 @@ mod srm_dispatch_tests {
             sequence_number: 0,
             volume_scan_number: 39,
             volume_scan_date: 20661,
-            volume_scan_time: volume_time,
+            volume_scan_time: 7108,
             generation_date: 20661,
-            generation_time: volume_time,
+            generation_time: 7108,
             product_specific_1: 0,
             product_specific_2: 0,
             elevation_number,
             product_specific_3: elevation_tenths,
-            thresholds,
-            product_specific_47_53: ps47_53,
+            thresholds: [0u16; 16],
+            product_specific_47_53: [0; 7],
             version: 0,
             spot_blank: 0,
             symbology_offset: 60,
@@ -1022,7 +851,7 @@ mod srm_dispatch_tests {
                 header: MessageHeader {
                     message_code: product_code,
                     date_of_message: 20661,
-                    time_of_message: volume_time,
+                    time_of_message: 7108,
                     message_length: 0,
                     source_id: 0,
                     destination_id: 0,
@@ -1053,103 +882,21 @@ mod srm_dispatch_tests {
                     }],
                 }),
             },
-            stamp: ProductStamp::from_key("MPX_N1G_2026_07_26_01_55_52"),
+            stamp: ProductStamp::from_key("MPX_EET_2026_07_26_01_55_52"),
             // No render in these tests, so nothing decodes them.
             bytes: std::sync::Arc::new(Vec::new()),
         }
     }
 
-    /// Cache a fixture the way production does. Going through
-    /// [`RenderDispatcher::cache_level3`] rather than touching `level3_data`
-    /// directly is what populates the storm motion history, so a test that
-    /// inserted straight into the map would find no vector at all.
     fn cache(d: &mut RenderDispatcher, p: RadarProduct, code: &str, site: &str, l3: Level3Product) {
         d.cache_level3(p, code.to_string(), site.to_string(), l3);
     }
 
-    /// The volume every fixture product belongs to.
-    const VOLUME: (u16, u32) = (20661, 7108);
-
-    /// A velocity message from `volume_time`, for asking which vector applies
-    /// to it. `storm_motion_for` reads the volume off the message rather than
-    /// taking one from the caller, so a test that passed a bare key would leave
-    /// the extraction — the wiring into production — unexercised.
-    fn velocity_from(volume_time: u32) -> Level3Message {
-        product(154, 13, 3, volume_time, VELOCITY_PS).message
-    }
-
-    /// Halfwords 47-53 of a real N0S: 25.7 kt from 296.1°, SCIT average.
-    const N0S_PS: [i16; 7] = [-109, 76, -1, 7663, 257, 2961, 0];
-    /// Halfwords 47-53 of a real N1G. Halfword 51 is the BZ2 compression flag.
-    const VELOCITY_PS: [i16; 7] = [-93, 74, 0, 8097, 1, 13, 16382];
-
-    /// The five keys one site's SRM fetch produces: the four derived tilts at
-    /// the elevations VCP 212 really produces, plus `N0S`, which is fetched for
-    /// its vector and must never be drawn.
-    ///
-    /// `N0S` and `N0G` are given the **same** 0.5° and the same elevation
-    /// number 1, which is what `TLX` really publishes — so nothing in the
-    /// nearest-angle search or its tie-break can separate them, and only
-    /// `is_renderable_tilt` can.
-    const SRM_FIXTURE: [(&str, i16, i16, u16, [i16; 7]); 5] = [
-        ("N0S", 56, 5, 1, N0S_PS),
-        ("N0G", 154, 5, 1, VELOCITY_PS),
-        ("N1G", 154, 13, 3, VELOCITY_PS),
-        ("N2U", 99, 24, 5, VELOCITY_PS),
-        ("N3U", 99, 31, 6, VELOCITY_PS),
-    ];
-
-    fn loaded() -> RenderDispatcher {
-        let mut d = RenderDispatcher::new();
-        for (code, product_code, tenths, elev_num, ps) in SRM_FIXTURE {
-            let p = product(product_code, tenths, elev_num, 7108, ps);
-            cache(&mut d, RadarProduct::StormRelativeVelocity, code, "KMPX", p);
-        }
-        d
-    }
-
-    /// Tilt selection reads the Product Description Block. VCP 212's cuts are
-    /// 0.5/1.3/2.4/3.1, so a selector keyed on the mnemonics' nominal
-    /// 0.5/1.5/2.4/3.4 would hand back the wrong product for two of the four —
-    /// silently, since every one of them decodes.
+    /// Every remaining Level III product resolves from its cache — none is
+    /// filtered. Storm-relative velocity is deliberately absent: it is a
+    /// Level II product now and never reaches this cache at all.
     #[test]
-    fn a_tilt_is_chosen_by_its_pdb_elevation_not_its_mnemonic() {
-        let d = loaded();
-        let at = |e: f32| {
-            d.nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", e)
-                .map(|p| (p.message.pdb.elevation_angle(), p.message.pdb.product_code))
-        };
-        assert_eq!(at(0.5), Some((0.5, 154)), "0.5° derives from N0G, not N0S");
-        assert_eq!(
-            at(1.3),
-            Some((1.3, 154)),
-            "N1G is 1.3°, not the nominal 1.5°"
-        );
-        assert_eq!(at(2.4), Some((2.4, 99)));
-        assert_eq!(at(3.1), Some((3.1, 99)));
-        // 1.5° — what the mnemonic claims — must still resolve to the 1.3° cut,
-        // and nothing must resolve to a 1.5° that does not exist.
-        assert_eq!(at(1.5), Some((1.3, 154)));
-        assert_eq!(at(9.9), Some((3.1, 99)), "the highest cut is the nearest");
-        // 1.9° is the one request where reading the angle and assuming it
-        // disagree: VCP 212's real cuts put it 0.6° from 1.3° and 0.5° from
-        // 2.4°, so it belongs to `N2U`; the mnemonics' nominal 1.5°/2.4° put it
-        // 0.4° from `N1G` and would hand back a field a whole cut too low.
-        assert_eq!(
-            at(1.9),
-            Some((2.4, 99)),
-            "ranked by the PDB, not by the mnemonic"
-        );
-    }
-
-    /// Only storm-relative velocity filters its candidates. Every other
-    /// Level III product is rendered straight from the message on the wire, and
-    /// none of them is dealiased velocity — so a filter that applied to all of
-    /// them would leave the KDP, echo-tops, VIL, hydrometeor and
-    /// precipitation-rate panes permanently blank, with nothing else about them
-    /// changed.
-    #[test]
-    fn the_other_level3_products_are_not_filtered_at_all() {
+    fn every_level3_product_resolves_from_its_cache() {
         let mut d = RenderDispatcher::new();
         for (radar_product, code, product_code) in [
             (RadarProduct::SpecificDifferentialPhase, "N0K", 163i16),
@@ -1158,211 +905,18 @@ mod srm_dispatch_tests {
             (RadarProduct::HydrometeorClassification, "HHC", 177),
             (RadarProduct::PrecipitationRate, "DPR", 176),
         ] {
-            let p = product(product_code, 5, 1, 7108, VELOCITY_PS);
+            let p = product(product_code, 5, 1);
             cache(&mut d, radar_product, code, "KMPX", p);
             let picked = d
                 .nearest_tilt(radar_product, "KMPX", 0.5)
-                .unwrap_or_else(|| {
-                    panic!("{code} is not dealiased velocity, and must render regardless")
-                });
+                .unwrap_or_else(|| panic!("{code} must render"));
             assert_eq!(picked.message.pdb.product_code, product_code);
-        }
-    }
-
-    /// The RPG's own product 56 must never be chosen as a tilt.
-    ///
-    /// It shares both the angle and the elevation number with `N0G`, so the
-    /// tie-break cannot decide between them and hash order would: run over
-    /// **freshly built maps** in both insertion orders, because `std`'s
-    /// `RandomState` re-seeds per `HashMap` and one map iterates identically
-    /// every time.
-    #[test]
-    fn the_rpgs_own_storm_relative_product_is_never_drawn() {
-        for round in 0..60 {
-            let mut d = RenderDispatcher::new();
-            let mut fixture = SRM_FIXTURE;
-            if round % 2 == 1 {
-                fixture.reverse();
-            }
-            for (code, product_code, tenths, elev_num, ps) in fixture {
-                let p = product(product_code, tenths, elev_num, 7108, ps);
-                cache(&mut d, RadarProduct::StormRelativeVelocity, code, "KMPX", p);
-            }
-            for elevation in [0.0, 0.5, 0.9, 1.3, 2.4, 3.1] {
-                let picked = d
-                    .nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", elevation)
-                    .expect("every elevation resolves to some tilt");
-                assert_ne!(
-                    picked.message.pdb.product_code, 56,
-                    "round {round}, {elevation}°: the pane would show the RPG's 1 km \
-                     field with its own vector baked in",
-                );
-            }
-        }
-    }
-
-    /// With no `N0G` the 0.5° pane falls back to the next derived tilt, never
-    /// to `N0S`. The fallback is a wrong *elevation*, which the pane can at
-    /// least be honest about; `N0S` would be a wrong *kind of field*.
-    #[test]
-    fn a_missing_lowest_tilt_does_not_fall_back_to_the_rpgs_product() {
-        let mut d = loaded();
-        d.level3_data.remove(&(
-            RadarProduct::StormRelativeVelocity,
-            "N0G".to_string(),
-            "KMPX".to_string(),
-        ));
-        let picked = d
-            .nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", 0.5)
-            .expect("the upper tilts are still loaded");
-        assert_eq!(picked.message.pdb.product_code, 154);
-        assert_eq!(
-            picked.message.pdb.elevation_angle(),
-            1.3,
-            "the nearest surviving cut"
-        );
-        // With every velocity product gone there is no tilt at all, rather than
-        // `N0S` reappearing as one.
-        for code in ["N1G", "N2U", "N3U"] {
-            d.level3_data.remove(&(
-                RadarProduct::StormRelativeVelocity,
-                code.to_string(),
-                "KMPX".to_string(),
-            ));
         }
         assert!(
             d.nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", 0.5)
-                .is_none()
+                .is_none(),
+            "nothing was cached for SRV, and nothing ever is: it derives from Level II",
         );
-        // …and the vector is still there to be read, so the filter removed it
-        // from the screen and not from the cache.
-        assert!(
-            d.storm_motion_for("KMPX", &velocity_from(VOLUME.1))
-                .is_some()
-        );
-    }
-
-    /// Every tilt is derived, so every tilt honours the override — including
-    /// 0.5°, which ignored it entirely while it rendered `N0S`.
-    #[test]
-    fn the_storm_motion_override_reaches_every_tilt_including_the_lowest() {
-        let mut d = loaded();
-        for elevation in [0.5f32, 1.3, 2.4, 3.1] {
-            let tilt = d
-                .nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", elevation)
-                .unwrap_or_else(|| panic!("{elevation}° has a tilt"));
-            // The RPG's own vector first, then the same tilt once an override
-            // is in force. Set through the public setter, which is the only way
-            // production sets it, so the field the renderer reads and the field
-            // the invalidation reads cannot come apart.
-            let rpg = srm::derive(
-                &tilt.message,
-                &d.storm_motion_for("KMPX", &tilt.message)
-                    .expect("N0S is loaded"),
-            )
-            .unwrap_or_else(|| panic!("{elevation}° derives"));
-            d.set_storm_motion_override(Some(
-                StormMotionSample::user_override(45.0, 210.0).expect("finite"),
-            ));
-            let overridden = srm::derive(
-                &tilt.message,
-                &d.storm_motion_for("KMPX", &tilt.message)
-                    .expect("the override is a vector"),
-            )
-            .unwrap_or_else(|| panic!("{elevation}° derives"));
-            d.set_storm_motion_override(None);
-
-            assert_eq!(overridden.motion.speed_kt, 45.0, "{elevation}°");
-            assert_eq!(overridden.motion.direction_deg, 210.0, "{elevation}°");
-            assert!(!overridden.motion.is_scit_average, "{elevation}°");
-            // Recording the vector is not applying it: the gates have to move.
-            assert_ne!(
-                overridden.packet.radials[0].gate_values, rpg.packet.radials[0].gate_values,
-                "{elevation}°: the override was recorded but never reached the field",
-            );
-        }
-    }
-
-    /// The render log must not tell the user an override came from an earlier
-    /// volume.
-    ///
-    /// `(previous volume)` is a claim about the *RPG's* fit: it says the SCIT
-    /// average applied here was computed for some other scan, which is the one
-    /// case where the derived field is known to drift. A hand-entered vector
-    /// belongs to no volume at all, so the annotation described provenance it
-    /// never had — and it appeared on every override, because the sentinel
-    /// volume key `(0, 0)` matched nothing.
-    ///
-    /// Driven through the real `derive`, so it fails for a provenance the
-    /// derivation stops assigning as well as for a suffix that comes back.
-    #[test]
-    fn an_overridden_vector_is_not_logged_as_a_previous_volume() {
-        let d = loaded();
-        let tilt = d
-            .nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", 0.5)
-            .expect("0.5° has a tilt");
-
-        let rpg = d
-            .storm_motion_for("KMPX", &tilt.message)
-            .expect("N0S is loaded");
-        let own_volume = srm::derive(&tilt.message, &rpg).expect("derives");
-        assert_eq!(
-            motion_provenance_suffix(own_volume.motion_provenance),
-            "",
-            "precondition: this tilt's own volume's vector must be unannotated, \
-             or the assertion below passes whatever the override does",
-        );
-
-        let stale = StormMotionSample {
-            volume: rpg.volume.map(|(date, time)| (date, time - 1)),
-            ..rpg
-        };
-        assert_eq!(
-            motion_provenance_suffix(
-                srm::derive(&tilt.message, &stale)
-                    .expect("derives")
-                    .motion_provenance
-            ),
-            " (previous volume)",
-            "precondition: a genuinely stale RPG vector must still say so",
-        );
-
-        let overridden = srm::derive(
-            &tilt.message,
-            &StormMotionSample::user_override(30.0, 240.0).expect("finite"),
-        )
-        .expect("derives");
-        assert_eq!(
-            overridden.motion_provenance,
-            srm::MotionProvenance::UserOverride
-        );
-        assert_eq!(
-            motion_provenance_suffix(overridden.motion_provenance),
-            " (user override)",
-            "an override must not be annotated with any volume claim",
-        );
-    }
-
-    /// Every tilt is 0.25 km. `N0S` is 1 km, so while it was rendered the 0.5°
-    /// pane was four times coarser than the three above it.
-    #[test]
-    fn every_tilt_is_a_quarter_kilometre_field() {
-        let d = loaded();
-        let s = d
-            .storm_motion_for("KMPX", &velocity_from(VOLUME.1))
-            .expect("N0S is loaded");
-        for elevation in [0.5f32, 1.3, 2.4, 3.1] {
-            let tilt = d
-                .nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", elevation)
-                .unwrap_or_else(|| panic!("{elevation}° has a tilt"));
-            let derived =
-                srm::derive(&tilt.message, &s).unwrap_or_else(|| panic!("{elevation}° derives"));
-            assert!(
-                (derived.packet.gate_interval_km() - 0.25).abs() < 1e-9,
-                "{elevation}°: {} km gates",
-                derived.packet.gate_interval_km(),
-            );
-        }
     }
 
     /// Another site's products must never be borrowed. Both sites carry the
@@ -1370,54 +924,57 @@ mod srm_dispatch_tests {
     /// something plausible.
     #[test]
     fn a_tilt_is_never_taken_from_another_site() {
-        let mut d = loaded();
-        let p = product(154, 13, 9, 9999, VELOCITY_PS);
+        let mut d = RenderDispatcher::new();
         cache(
             &mut d,
-            RadarProduct::StormRelativeVelocity,
-            "N1G",
-            "KFSD",
-            p,
+            RadarProduct::EchoTops,
+            "EET",
+            "KMPX",
+            product(135, 5, 1),
         );
+        let mut other = product(135, 5, 1);
+        other.message.pdb.volume_scan_time = 9999;
+        cache(&mut d, RadarProduct::EchoTops, "EET", "KFSD", other);
+
         let picked = d
-            .nearest_tilt(RadarProduct::StormRelativeVelocity, "KFSD", 1.3)
-            .expect("KFSD has one tilt");
+            .nearest_tilt(RadarProduct::EchoTops, "KFSD", 0.5)
+            .expect("KFSD has an EET");
         assert_eq!(
             picked.message.pdb.volume_scan_time, 9999,
             "took KMPX's product"
         );
         assert!(
-            d.nearest_tilt(RadarProduct::StormRelativeVelocity, "KABR", 1.3)
+            d.nearest_tilt(RadarProduct::EchoTops, "KABR", 0.5)
                 .is_none()
         );
         assert!(
-            d.nearest_tilt(RadarProduct::EchoTops, "KMPX", 1.3)
+            d.nearest_tilt(RadarProduct::PrecipitationRate, "KMPX", 0.5)
                 .is_none()
         );
     }
 
-    /// Split cuts and SAILS/MRLE repeats share an elevation angle, so the angle
-    /// alone leaves the choice to hash order.
+    /// Two cached objects at one angle resolve deterministically: the angle
+    /// alone leaves the choice to hash order, so the tie breaks on elevation
+    /// number.
     ///
     /// Asserted across **freshly built maps**, not repeated calls on one map:
     /// `std`'s `RandomState` re-seeds per `HashMap` instance, so one map
     /// iterates in the same order every time and a stability loop over it
-    /// cannot see the tie-break at all. Sixty maps, and both insertion orders,
-    /// make an unbroken tie land on 9 with overwhelming probability.
+    /// cannot see the tie-break at all.
     #[test]
     fn two_cuts_at_one_angle_resolve_the_same_way_every_time() {
         for round in 0..60 {
             let mut d = RenderDispatcher::new();
-            let mut cuts = [("N1G", 9u16), ("NBG", 3)];
+            let mut cuts = [("EE1", 9u16), ("EE2", 3)];
             if round % 2 == 1 {
                 cuts.reverse();
             }
             for (code, elev_num) in cuts {
-                let p = product(154, 13, elev_num, 7108, VELOCITY_PS);
-                cache(&mut d, RadarProduct::StormRelativeVelocity, code, "KMPX", p);
+                let p = product(135, 13, elev_num);
+                cache(&mut d, RadarProduct::EchoTops, code, "KMPX", p);
             }
             let picked = d
-                .nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", 1.3)
+                .nearest_tilt(RadarProduct::EchoTops, "KMPX", 1.3)
                 .expect("both cuts are at 1.3°")
                 .message
                 .pdb
@@ -1428,119 +985,6 @@ mod srm_dispatch_tests {
                  shows whichever cut the hash happened to yield",
             );
         }
-    }
-
-    /// The vector comes from the one product that has one. Halfword 51 is the
-    /// BZ2 compression flag on `N1G`/`N2U`/`N3U`, so a search that took the
-    /// first cached product would report 0.1 kt from 1.3°.
-    #[test]
-    fn the_vector_is_taken_from_the_product_that_carries_one() {
-        let d = loaded();
-        let s = d
-            .storm_motion_for("KMPX", &velocity_from(VOLUME.1))
-            .expect("N0S is loaded");
-        assert_eq!(s.motion.speed_kt, 25.7);
-        assert_eq!(s.motion.direction_deg, 296.1);
-        assert!(s.motion.is_scit_average);
-        assert_eq!(s.volume, Some((20661, 7108)));
-    }
-
-    /// Without an `N0S` there is no vector, and rendering the velocity field
-    /// raw would put a base-velocity couplet under a storm-relative label.
-    #[test]
-    fn no_n0s_means_no_vector_rather_than_a_zero_one() {
-        let mut d = RenderDispatcher::new();
-        for (code, product_code, tenths, elev_num, ps) in SRM_FIXTURE {
-            if code == "N0S" {
-                continue;
-            }
-            let p = product(product_code, tenths, elev_num, 7108, ps);
-            cache(&mut d, RadarProduct::StormRelativeVelocity, code, "KMPX", p);
-        }
-        assert!(
-            d.storm_motion_for("KMPX", &velocity_from(VOLUME.1))
-                .is_none()
-        );
-        // A user override fills the gap — that is what it is for.
-        d.set_storm_motion_override(Some(
-            StormMotionSample::user_override(40.0, 200.0).expect("finite"),
-        ));
-        assert_eq!(
-            d.storm_motion_for("KMPX", &velocity_from(VOLUME.1))
-                .map(|s| s.motion.speed_kt),
-            Some(40.0),
-        );
-    }
-
-    /// An `N0S` from a later volume must not be applied to a velocity product
-    /// from an earlier one.
-    ///
-    /// This is the normal case, not a boundary race: `N0S` and `N0G` are
-    /// published when the 0.5° cut completes and `N1G`/`N2U`/`N3U` when theirs
-    /// do, so for most of a volume the newest vector is a volume ahead of the
-    /// upper three tilts. Measured over 22 sites, the newest vector belonged to
-    /// another volume on 306 of 792 renders, and where the fit had really moved
-    /// taking the newest cost up to 82 points of within-one-level agreement —
-    /// `KFSD` was caught applying 66.5 kt where 19.4 kt belonged, for 17.1%
-    /// against 99.87% on the same gates.
-    #[test]
-    fn each_tilt_gets_its_own_volumes_vector() {
-        let mut d = loaded();
-        // The next volume's N0S arrives, carrying a different fit. The upper
-        // tilts are still the previous volume's.
-        let next = (20661u16, 7392u32);
-        let mut later = N0S_PS;
-        later[4] = 402; // 40.2 kt
-        later[5] = 1500; // from 150.0°
-        cache(
-            &mut d,
-            RadarProduct::StormRelativeVelocity,
-            "N0S",
-            "KMPX",
-            product(56, 5, 1, next.1, later),
-        );
-
-        // Through the products the dispatcher would really hand to `derive`,
-        // resolved the way `try_spawn_level3_render` resolves them. Asking with
-        // a volume key the test made up would leave the one line that reads the
-        // volume off the message — the whole wiring into production — free to
-        // return a constant with every assertion here still passing.
-        for elevation in [0.5f32, 1.3, 2.4, 3.1] {
-            let tilt = d
-                .nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", elevation)
-                .unwrap_or_else(|| panic!("{elevation}° has a tilt"));
-            let s = d
-                .storm_motion_for("KMPX", &tilt.message)
-                .unwrap_or_else(|| panic!("{elevation}° has a vector"));
-            assert_eq!(
-                s.volume,
-                Some(tilt.message.pdb.volume_key()),
-                "{elevation}° was paired with another volume's vector",
-            );
-            assert_eq!(
-                s.motion.speed_kt, 25.7,
-                "{elevation}° got the newest vector rather than its own volume's",
-            );
-        }
-
-        // And the new volume's own tilt resolves to the new fit, so the match
-        // above is a match and not the lookup failing the same way twice.
-        let new = d
-            .storm_motion_for("KMPX", &velocity_from(next.1))
-            .expect("the new volume is recorded");
-        assert_eq!(new.motion.speed_kt, 40.2);
-
-        // A volume nobody has a vector for still renders, on the newest —
-        // better a vector one volume out than a blank storm-relative pane. The
-        // 0.5° SAILS repeat can genuinely arrive before its volume's `N0S`.
-        let unseen = d
-            .storm_motion_for("KMPX", &velocity_from(9999))
-            .expect("an unknown volume falls back");
-        assert_eq!(
-            unseen.volume,
-            Some(next),
-            "the fallback is the newest, not an arbitrary one"
-        );
     }
 
     /// A pane-sized render of `product` at `elevation`. Only the two fields
@@ -1560,234 +1004,91 @@ mod srm_dispatch_tests {
         rustdar_egui::pane::PaneState::with_site(site.to_string())
     }
 
-    /// The age a pane is stamped with belongs to **the tilt it is showing**.
-    ///
-    /// `level3::latest_key` falls back to the previous UTC day, so the object a
-    /// downed site serves can be most of a day old while the Level II scan line
-    /// beside it looks current — that is the whole reason the pane draws an age
-    /// at all. A lookup that answered with the site's *newest* stamp, or with
-    /// the first entry the map happened to iterate, would caption a stale field
-    /// with a fresh time and be worse than drawing nothing.
-    ///
-    /// Every tilt is given a distinct stamp, so a reader tied to any one of
-    /// them fails on the others. `1.9°` is the discriminating request: VCP
-    /// 212's real cuts put it nearer 2.4° than 1.3°, so an implementation that
-    /// resolved the tilt any other way lands on a different stamp.
+    /// The age a pane is stamped with belongs to the object it is showing:
+    /// its own site's, cleared for a Level II product — and storm-relative
+    /// velocity **is** a Level II product now, so a pane switching to it
+    /// must lose the Level III age rather than caption a derived field with
+    /// some other product's stamp.
     #[test]
-    fn a_render_stamps_its_pane_with_the_age_of_the_tilt_it_chose() {
+    fn a_render_stamps_its_pane_with_its_own_sites_product_age() {
         let mut d = RenderDispatcher::new();
-        // Minute `nn` in the key, per tilt — nothing else about the fixtures
-        // differs, so only the tilt selection can decide which comes back.
-        let stamps = [("N0G", 11u32), ("N1G", 22), ("N2U", 33), ("N3U", 44)];
-        for (code, product_code, tenths, elev_num, ps) in SRM_FIXTURE {
-            let mut p = product(product_code, tenths, elev_num, 7108, ps);
-            if let Some((_, minute)) = stamps.iter().find(|(c, _)| *c == code) {
-                p.stamp = ProductStamp::from_key(format!("MPX_{code}_2026_07_26_01_{minute}_00"));
-            }
-            cache(&mut d, RadarProduct::StormRelativeVelocity, code, "KMPX", p);
-        }
-
-        let minute_at = |elevation: f32| {
-            let mut pane = pane_on("KMPX");
-            d.stamp_pane_with_product_age(
-                &mut pane,
-                &rendered(RadarProduct::StormRelativeVelocity, elevation),
-            );
-            pane.level3_time.map(|t| chrono::Timelike::minute(&t))
-        };
-        assert_eq!(minute_at(0.5), Some(11), "0.5° is N0G");
-        assert_eq!(minute_at(1.3), Some(22), "1.3° is N1G");
-        assert_eq!(minute_at(2.4), Some(33), "2.4° is N2U");
-        assert_eq!(minute_at(3.1), Some(44), "3.1° is N3U");
-        assert_eq!(
-            minute_at(1.9),
-            Some(33),
-            "1.9° belongs to the 2.4° cut, so it must carry that cut's stamp",
+        cache(
+            &mut d,
+            RadarProduct::EchoTops,
+            "EET",
+            "KMPX",
+            product(135, 5, 1),
         );
 
-        // The pane's *own* site, not any site with a tilt cached: two panes
-        // showing the same product on different radars must not share an age.
+        let mut pane = pane_on("KMPX");
+        d.stamp_pane_with_product_age(&mut pane, &rendered(RadarProduct::EchoTops, 0.5));
+        assert!(pane.level3_time.is_some(), "the EET stamp is readable");
+
         let mut elsewhere = pane_on("KTLX");
-        d.stamp_pane_with_product_age(
-            &mut elsewhere,
-            &rendered(RadarProduct::StormRelativeVelocity, 0.5),
-        );
+        d.stamp_pane_with_product_age(&mut elsewhere, &rendered(RadarProduct::EchoTops, 0.5));
         assert_eq!(
             elsewhere.level3_time, None,
-            "another site's tilts are not this pane's",
+            "another site's products are not this pane's",
         );
 
-        // …and a Level II render clears it rather than leaving the Level III
-        // age captioning a volume it has nothing to do with.
-        let mut switched = pane_on("KMPX");
+        let mut srv = pane_on("KMPX");
+        d.stamp_pane_with_product_age(&mut srv, &rendered(RadarProduct::EchoTops, 0.5));
+        assert!(srv.level3_time.is_some(), "precondition: it was dated");
         d.stamp_pane_with_product_age(
-            &mut switched,
+            &mut srv,
             &rendered(RadarProduct::StormRelativeVelocity, 0.5),
         );
-        assert!(switched.level3_time.is_some(), "precondition: it was dated");
-        d.stamp_pane_with_product_age(&mut switched, &rendered(RadarProduct::Reflectivity, 0.5));
         assert_eq!(
-            switched.level3_time, None,
-            "a Level II product has no ProductStamp at all",
+            srv.level3_time, None,
+            "SRV derives from the Level II volume; no bucket object stands behind it",
         );
     }
 
     /// A key whose tail does not parse is an **unknown** age, not a fresh one.
-    ///
-    /// `ProductStamp::time` is `None` there, and the pane draws no age line —
-    /// which is the honest answer. Reporting the epoch, or silently falling
-    /// back to now, would both claim something the key does not say.
     #[test]
     fn an_unreadable_key_reports_no_age_rather_than_a_wrong_one() {
         let mut d = RenderDispatcher::new();
-        let mut p = product(154, 5, 1, 7108, VELOCITY_PS);
+        let mut p = product(135, 5, 1);
         p.stamp = ProductStamp::from_key("not-a-key");
-        cache(
-            &mut d,
-            RadarProduct::StormRelativeVelocity,
-            "N0G",
-            "KMPX",
-            p,
-        );
+        cache(&mut d, RadarProduct::EchoTops, "EET", "KMPX", p);
 
         assert!(
-            d.nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", 0.5)
+            d.nearest_tilt(RadarProduct::EchoTops, "KMPX", 0.5)
                 .is_some(),
-            "precondition: the tilt is still drawn — an unreadable key is worth \
+            "precondition: the product is still drawn — an unreadable key is worth \
              rendering, just not worth dating",
         );
         let mut pane = pane_on("KMPX");
-        d.stamp_pane_with_product_age(
-            &mut pane,
-            &rendered(RadarProduct::StormRelativeVelocity, 0.5),
-        );
+        d.stamp_pane_with_product_age(&mut pane, &rendered(RadarProduct::EchoTops, 0.5));
         assert_eq!(pane.level3_time, None);
     }
 
-    /// The history is bounded and keyed on the volume, so a long session cannot
-    /// grow it and a re-fetched `N0S` cannot fill it with one volume.
-    #[test]
-    fn the_storm_motion_history_is_bounded_and_deduplicated() {
-        let mut d = RenderDispatcher::new();
-        for i in 0..3 {
-            for _repeat in 0..4 {
-                cache(
-                    &mut d,
-                    RadarProduct::StormRelativeVelocity,
-                    "N0S",
-                    "KMPX",
-                    product(56, 5, 1, 7000 + i, N0S_PS),
-                );
-            }
-        }
-        assert_eq!(
-            d.storm_motion_history["KMPX"].len(),
-            3,
-            "a repeated volume must not take a slot from a different one",
-        );
-        for i in 3..12 {
-            cache(
-                &mut d,
-                RadarProduct::StormRelativeVelocity,
-                "N0S",
-                "KMPX",
-                product(56, 5, 1, 7000 + i, N0S_PS),
-            );
-        }
-        assert_eq!(d.storm_motion_history["KMPX"].len(), STORM_MOTION_HISTORY);
-        // The oldest went, not the newest.
-        assert!(
-            d.storm_motion_for("KMPX", &velocity_from(7011))
-                .is_some_and(|s| s.volume.map(|v| v.1) == Some(7011))
-        );
-        assert!(
-            d.storm_motion_for("KMPX", &velocity_from(7000))
-                .is_some_and(|s| s.volume.map(|v| v.1) == Some(7011)),
-            "volume 7000 aged out and must fall back to the newest",
-        );
-
-        // An out-of-order arrival must not become the fallback or evict a newer
-        // volume. Fetches complete in whatever order the bucket answers in.
-        cache(
-            &mut d,
-            RadarProduct::StormRelativeVelocity,
-            "N0S",
-            "KMPX",
-            product(56, 5, 1, 6500, N0S_PS),
-        );
-        assert!(
-            d.storm_motion_for("KMPX", &velocity_from(1))
-                .is_some_and(|s| s.volume.map(|v| v.1) == Some(7011)),
-            "an old object arriving late became the newest",
-        );
-        assert!(
-            d.storm_motion_for("KMPX", &velocity_from(7011))
-                .is_some_and(|s| s.volume.map(|v| v.1) == Some(7011)),
-            "an old object arriving late evicted a newer volume",
-        );
-    }
-
-    /// The history outlives a per-site reset, and this is the whole fix.
+    /// The override wins, routes into the Level II render parameters, and
+    /// only for the product that reads it.
     ///
-    /// `reset_panes_for_site` runs on every auto-poll for a live pane, right
-    /// before the five products are refetched. A history cleared there would
-    /// hold nothing but the volume the newest `N0S` came from — which is
-    /// exactly the volume the upper tilts have not reached — so every tilt
-    /// would fall back to the newest vector and the per-volume pairing would
-    /// never once fire in production. Only a full reset forgets.
+    /// `storm_motion_override_kt` is the exact value `spawn_level2_render`
+    /// hands `RenderInput::extract`, read from the same field
+    /// `set_storm_motion_override` invalidates on — so the vector a pane is
+    /// invalidated for cannot differ from the one it is redrawn with.
     #[test]
-    fn a_poll_reset_keeps_the_history_that_the_next_poll_needs() {
-        let mut d = loaded();
-        // A poll arrives: panes reset, products refetched, the next volume's
-        // N0S lands while the upper tilts are still the previous volume's.
-        d.reset_panes_for_site("KMPX", &rustdar_egui::Gui::new());
-        let next = (20661u16, 7392u32);
-        cache(
-            &mut d,
-            RadarProduct::StormRelativeVelocity,
-            "N0S",
-            "KMPX",
-            product(56, 5, 1, next.1, N0S_PS),
-        );
-        let paired = d
-            .storm_motion_for("KMPX", &velocity_from(VOLUME.1))
-            .expect("the previous volume's vector is still known");
-        assert_eq!(
-            paired.volume,
-            Some(VOLUME),
-            "the poll reset dropped the history, so an upper tilt fell back to the newest \
-             vector — the pairing this exists to fix",
-        );
+    fn the_override_routes_into_the_level2_render_params() {
+        let mut d = RenderDispatcher::new();
+        assert_eq!(d.storm_motion_override_kt(), None, "no override, Bunkers");
 
-        // A full reset does forget, and takes every site with it.
-        d.reset_panes();
-        assert!(
-            d.storm_motion_for("KMPX", &velocity_from(VOLUME.1))
-                .is_none()
-        );
-    }
-
-    /// The override wins over the RPG's own vector, or the setting does nothing.
-    #[test]
-    fn a_user_override_displaces_the_rpg_vector() {
-        let mut d = loaded();
-        // The site's own vector is 25.7 kt, so this must not be it.
         d.set_storm_motion_override(Some(
             StormMotionSample::user_override(45.0, 210.0).expect("finite"),
         ));
-        let s = d
-            .storm_motion_for("KMPX", &velocity_from(VOLUME.1))
-            .unwrap();
-        assert_eq!(s.motion.speed_kt, 45.0);
-        assert_eq!(s.motion.direction_deg, 210.0);
-        assert!(!s.motion.is_scit_average);
+        assert_eq!(d.storm_motion_override_kt(), Some((45.0, 210.0)));
+
+        d.set_storm_motion_override(None);
+        assert_eq!(d.storm_motion_override_kt(), None);
     }
 
     /// Editing the vector changes nothing else about a pane, so both the
     /// per-pane state and the shared render cache have to be dropped by hand.
     #[test]
     fn changing_the_override_invalidates_the_storm_relative_renders() {
-        let mut d = loaded();
+        let mut d = RenderDispatcher::new();
         d.ensure_pane_count(3);
         d.pane_render[0].last_rendered = Some((RadarProduct::StormRelativeVelocity, 1.3));
         d.pane_render[1].last_rendered = Some((RadarProduct::Reflectivity, 0.5));
@@ -1821,7 +1122,7 @@ mod srm_dispatch_tests {
     /// frame re-renders every storm-relative pane.
     #[test]
     fn an_unchanged_override_invalidates_nothing() {
-        let mut d = loaded();
+        let mut d = RenderDispatcher::new();
         d.ensure_pane_count(1);
         let o = Some(StormMotionSample::user_override(30.0, 240.0).expect("finite"));
         assert!(d.set_storm_motion_override(o));
@@ -2384,7 +1685,12 @@ mod render_invalidation_tests {
     /// the volume closes.
     #[test]
     fn a_finished_tilt_does_not_touch_a_level3_pane() {
-        let gui = gui_on_tilt("KOUN", RadarProduct::StormRelativeVelocity, 0.5, &[0.5]);
+        let gui = gui_on_tilt(
+            "KOUN",
+            RadarProduct::VerticallyIntegratedLiquid,
+            0.5,
+            &[0.5],
+        );
         let mut d = RenderDispatcher::new();
         d.ensure_pane_count(1);
         assert_eq!(d.reset_panes_for_tilts("KOUN", &gui, &[0.5], false), 0);
