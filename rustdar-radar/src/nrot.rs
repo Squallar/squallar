@@ -285,6 +285,23 @@ impl WindProfile {
         Some(WindProfile { layers })
     }
 
+    /// Layer thickness the profile is discretised at, km. Public so a
+    /// consumer integrating over height bands (Bunkers storm motion in
+    /// [`crate::srv`]) can sample every layer exactly once via
+    /// [`wind_at_km`](Self::wind_at_km) at the layer centres.
+    pub const LAYER_KM: f64 = VWP_LAYER_KM;
+
+    /// The fitted horizontal wind `(u, v)` in m/s at `height_km` AGL, or
+    /// `None` below zero, above the profile, or in a layer nothing fit.
+    /// Resolved at layer granularity ([`Self::LAYER_KM`]), no interpolation.
+    pub fn wind_at_km(&self, height_km: f64) -> Option<(f64, f64)> {
+        if !height_km.is_finite() || height_km < 0.0 {
+            return None;
+        }
+        let l = (height_km / VWP_LAYER_KM) as usize;
+        self.layers.get(l)?.map(|(u, v, _)| (u, v))
+    }
+
     /// Predicted radial velocity at the given azimuth (radians), range (km)
     /// and elevation (degrees), or None where no layer was fit.
     fn predict(&self, az_rad: f64, range_km: f64, elevation_deg: f64) -> Option<f64> {
