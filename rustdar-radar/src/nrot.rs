@@ -27,6 +27,10 @@
 //! 4. Divide ROT by the divisor curve — knot ranges in KILOMETRES, linearly
 //!    interpolated (25 at ≤20 km → 20 → 12 → 8 at 80 km, flat beyond) — and
 //!    clamp to ±5. Measured from the step-response ladder.
+//!    Inside 80 km a matched-filter footprint pass ([`apply_kernel_bank`])
+//!    then caps each detected rotation couplet with the kernel fitted to
+//!    its measured pole width, reproducing the reference's width-dependent
+//!    edge compression while monopolar notches keep the full value.
 //! 5. Blank painted clusters under 4 bins and one-gate-deep slivers; the
 //!    result matches the reference painted density and correlates 0.996
 //!    with reference cursor readouts over a real-volume ground-truth set.
@@ -566,6 +570,165 @@ const COMPOSITE_TAPS: [f64; 5] = [0.1039, 0.1595, 0.1187, -0.0037, -0.0630];
 const SPLIT_CLEAN: [(i32, f64); 3] = [(2, 0.580), (3, 0.238), (4, -0.151)];
 const SPLIT_AWAY: [(i32, f64); 4] = [(1, 0.238), (2, 0.342), (3, 0.238), (4, -0.151)];
 
+/// Matched-filter kernel bank: one per-radial tap operator per couplet pole
+/// width (2/3/4 radials), with the same (offset, tap) clean/away semantics
+/// as [`SPLIT_CLEAN`]/[`SPLIT_AWAY`]. Each kernel was empirically fitted
+/// (ridge least squares, profile-only — no step constraints) so that its
+/// response to the ideal 3-median-filtered width-w couplet matches the
+/// measured width-w couplet response profile, scaled by the primary
+/// operator's own core response on the same pattern. The kernels never see
+/// steps or notches: [`apply_kernel_bank`] only engages them — and only as
+/// magnitude caps — where the local velocity profile carries a bipolar
+/// couplet signature, so the primary chain keeps full ownership of sign,
+/// ND, coherence and every non-couplet pattern.
+const BANK_K2_CLEAN: [(i32, f64); 6] = [
+    (1, 0.1916),
+    (2, 0.3660),
+    (3, 0.3660),
+    (4, 0.1854),
+    (5, 0.1854),
+    (6, 0.0168),
+];
+const BANK_K2_AWAY: [(i32, f64); 6] = [
+    (1, 0.1706),
+    (2, 0.1706),
+    (3, 0.2867),
+    (4, 0.2867),
+    (5, 0.0142),
+    (6, 0.0142),
+];
+const BANK_K3_CLEAN: [(i32, f64); 7] = [
+    (1, -0.0812),
+    (2, 0.4297),
+    (3, 0.0225),
+    (4, 0.6003),
+    (5, 0.1732),
+    (6, 0.0613),
+    (7, -0.2276),
+];
+const BANK_K3_AWAY: [(i32, f64); 7] = [
+    (1, 0.2541),
+    (2, -0.0761),
+    (3, 0.8530),
+    (4, 0.2776),
+    (5, 0.4269),
+    (6, -0.0377),
+    (7, 0.1870),
+];
+const BANK_K4_CLEAN: [(i32, f64); 11] = [
+    (1, 0.3727),
+    (2, 0.1368),
+    (3, 0.1368),
+    (4, 0.5549),
+    (5, 0.5549),
+    (6, 0.4834),
+    (7, 0.4834),
+    (8, 0.1101),
+    (9, 0.1101),
+    (10, 0.5916),
+    (11, 0.5916),
+];
+const BANK_K4_AWAY: [(i32, f64); 11] = [
+    (1, 0.2494),
+    (2, 0.2494),
+    (3, 0.1336),
+    (4, 0.1336),
+    (5, 0.6856),
+    (6, 0.6856),
+    (7, 0.0728),
+    (8, 0.0728),
+    (9, 0.2768),
+    (10, 0.2768),
+    (11, 0.9262),
+];
+
+/// Asymmetric-couplet kernels: span-7 operators with the same clean/away
+/// semantics, empirically fitted to the measured graded-asymmetry couplet
+/// profiles — a +6/−4 pole pair (ratio 0.67) and a +6/−2 pair (ratio
+/// 0.33). The reference compresses asymmetric-couplet edges harder as the
+/// weak pole shrinks (edge/core 0.26 and 0.13 vs 0.34 balanced); symmetric
+/// templates cannot match these patterns, so they get their own kernels
+/// and templates. Footprint-only: their tap energy is too high for the
+/// per-bin base cap, and their template gate is the sole notch guard (the
+/// measured monopolar notch scores r² ≈ 0.2–0.3 against them, far under
+/// the 0.8 floor — the balance gate, which such couplets themselves fail,
+/// is deliberately not applied).
+const BANK_A067_CLEAN: [(i32, f64); 7] = [
+    (1, -0.1595),
+    (2, 0.8119),
+    (3, -0.29),
+    (4, 0.1871),
+    (5, 0.3338),
+    (6, -0.7268),
+    (7, 0.3928),
+];
+const BANK_A067_AWAY: [(i32, f64); 7] = [
+    (1, 0.4798),
+    (2, -0.5459),
+    (3, 0.7539),
+    (4, 0.3544),
+    (5, -0.8263),
+    (6, 0.3977),
+    (7, -0.0731),
+];
+const BANK_A033_CLEAN: [(i32, f64); 7] = [
+    (1, -0.0712),
+    (2, 0.6955),
+    (3, -0.4007),
+    (4, 0.3542),
+    (5, 0.2212),
+    (6, -0.7511),
+    (7, 0.5327),
+];
+const BANK_A033_AWAY: [(i32, f64); 7] = [
+    (1, 0.5561),
+    (2, -0.6041),
+    (3, 0.6831),
+    (4, 0.5249),
+    (5, -1.0944),
+    (6, 0.541),
+    (7, -0.0264),
+];
+
+/// Candidate cores for the footprint pass: local azimuthal maxima of the
+/// primary chain's |NROT| at or above the palette floor.
+const BANK_DETECT_MIN: f64 = 0.25;
+
+/// Template-match floor: squared Pearson correlation between the detrended
+/// local velocity profile and the ideal width-w couplet template (best of
+/// alignments −1/0/+1) must reach this before a width's kernel takes the
+/// couplet's footprint; the best-scoring width wins. High on purpose: the
+/// footprint layer repaints only clean template matches, while the per-bin
+/// base cap handles everything merely couplet-like.
+const BANK_R2_MIN: f64 = 0.8;
+
+/// Compression floor for the footprint cap, as a fraction of the primary
+/// chain's magnitude. On-template the kernels' fitted edge/core responses
+/// stay above this fraction of the primary response, so any deeper
+/// compression is off-template kernel texture, not measured couplet law —
+/// bounding it keeps capped bins within the profile family the bank was
+/// fitted to.
+const BANK_CAP_FLOOR: f64 = 0.7;
+
+/// Gain on the cap operators' output. The kernel fits are anchored to the
+/// primary operator's core response on ideal patterns; hover readouts on
+/// real weak couplet shoulders show the reference's compressed values run
+/// below that anchor, so the cap output is recalibrated by this factor,
+/// measured against a real-volume readout set.
+const BANK_CAP_GAIN: f64 = 0.90;
+
+/// Deviation-balance floor for the per-bin base cap, measured on real
+/// volumes: the KMKX monopolar notch balances at 0.29, rotation couplets
+/// at 0.42 and above.
+const BANK_BASE_BALANCE_MIN: f64 = 0.42;
+
+/// Deviation-balance floor for footprint candidates: opposite deviations
+/// about the window median must reach this ratio. Measured on real
+/// volumes: a monopolar notch the reference paints at full value balances
+/// at 0.29, rotation couplets at 0.42 and above; the floor sits between,
+/// nearer the notch to keep weak lopsided couplets eligible.
+const BANK_BALANCE_MIN: f64 = 0.35;
+
 /// Range limit in km for the split-tap operator; beyond it the composite
 /// 11-tap stencil takes over. The split operator is measured ground truth
 /// near the radar (synthetic steps at 36–41 km, a real couplet at 12.6 km);
@@ -605,10 +768,10 @@ fn split_stencil_rot(
 ) -> Option<f64> {
     let num_radials = vel_grid.len() as i32;
     // Range-averaged velocity at offsets −(4+margin)..=4+margin; prof[6 + o].
-    let mut prof = [f64::NAN; 13];
+    let mut prof = [f64::NAN; 15];
     for (idx, slot) in prof.iter_mut().enumerate() {
-        let da = idx as i32 - 6;
-        if da.abs() > 4 + GK_DATA_MARGIN {
+        let da = idx as i32 - 7;
+        if da.abs() > 7 {
             continue;
         }
         let ai = ((i as i32 + da).rem_euclid(num_radials)) as usize;
@@ -632,13 +795,13 @@ fn split_stencil_rot(
     // populated too, so bins do not appear at echo edges it would reject.
     for m in 0..GK_DATA_MARGIN {
         let o = (5 + m) as usize;
-        if prof[6 + o].is_nan() || prof[6 - o].is_nan() {
+        if prof[7 + o].is_nan() || prof[7 - o].is_nan() {
             return None;
         }
     }
     // Signed weight per profile cell: toward-partner side clean, away side
     // split. The partner sits at +1 for a pair-first radial.
-    let mut w = [0.0f64; 13];
+    let mut w = [0.0f64; 15];
     let clean: &[(i32, f64)] = &SPLIT_CLEAN;
     let away: &[(i32, f64)] = &SPLIT_AWAY;
     let (plus, minus) = if pair_first {
@@ -647,13 +810,13 @@ fn split_stencil_rot(
         (away, clean)
     };
     for &(o, t) in plus {
-        w[(6 + o) as usize] += t;
+        w[(7 + o) as usize] += t;
     }
     for &(o, t) in minus {
-        w[(6 - o) as usize] -= t;
+        w[(7 - o) as usize] -= t;
     }
     let (mut acc, mut mean, mut nv) = (0.0, 0.0, 0);
-    for k in 0..13 {
+    for k in 0..15 {
         if w[k] == 0.0 {
             continue;
         }
@@ -669,7 +832,7 @@ fn split_stencil_rot(
     // correlation between the profile and the stencil weights.
     mean /= nv as f64;
     let (mut svv, mut scc) = (0.0, 0.0);
-    for k in 0..13 {
+    for k in 0..15 {
         if w[k] == 0.0 {
             continue;
         }
@@ -708,6 +871,373 @@ fn pair_phase(azimuths_deg: &[f64]) -> usize {
             .count()
     };
     if cohabit(1) > cohabit(0) { 1 } else { 0 }
+}
+
+/// Range-averaged azimuthal velocity profile around (i, j): the 3-gate range
+/// mean per radial offset −half..=half — the same per-radial samples the tap
+/// stencils consume. NaN where a radial has no data in the range window.
+fn az_profile(vel_grid: &[Vec<f64>], i: usize, j: usize, gate_count: usize, half: i32) -> Vec<f64> {
+    let num_radials = vel_grid.len() as i32;
+    (-half..=half)
+        .map(|da| {
+            let ai = ((i as i32 + da).rem_euclid(num_radials)) as usize;
+            let (mut sum, mut n) = (0.0, 0);
+            for dr in -STENCIL_RNG_HALF..=STENCIL_RNG_HALF {
+                let rj = j as i32 + dr;
+                if rj < 0 || rj >= gate_count as i32 {
+                    continue;
+                }
+                let v = vel_grid[ai][rj as usize];
+                if !v.is_nan() {
+                    sum += v;
+                    n += 1;
+                }
+            }
+            if n > 0 { sum / n as f64 } else { f64::NAN }
+        })
+        .collect()
+}
+
+/// Best squared Pearson correlation between a fully-valid profile (centred
+/// on a candidate core radial) and the ideal width-`w` couplet template —
+/// +1 across w radials meeting −`neg_amp` across w radials at the window
+/// centre — over alignments −1/0/+1. r² is invariant under template
+/// negation, so one template serves both rotation senses and both
+/// orientations of an asymmetric pair (the sign-mirrored pattern scores
+/// identically by construction, and the kernels are linear). Steps and ramps never pass: their profiles do not
+/// return to the background on both sides of the window.
+fn bank_template_r2(prof: &[f64], w: i32, neg_amp: f64) -> Option<f64> {
+    let half = (prof.len() as i32 - 1) / 2;
+    let n = prof.len() as f64;
+    // Detrend: remove the profile's mean and linear component. The second
+    // chain is flow-invariant (measured), so ambient azimuthal shear under a
+    // couplet must not spoil the template match; a monopolar notch stays
+    // monopolar after detrending and still matches nothing.
+    let pm = prof.iter().sum::<f64>() / n;
+    let sxx: f64 = (0..prof.len())
+        .map(|k| (k as f64 - (n - 1.0) / 2.0).powi(2))
+        .sum();
+    let sxy: f64 = prof
+        .iter()
+        .enumerate()
+        .map(|(k, p)| (k as f64 - (n - 1.0) / 2.0) * (p - pm))
+        .sum();
+    let slope = sxy / sxx;
+    let prof: Vec<f64> = prof
+        .iter()
+        .enumerate()
+        .map(|(k, p)| p - pm - slope * (k as f64 - (n - 1.0) / 2.0))
+        .collect();
+    let pm = 0.0;
+    let pv: f64 = prof.iter().map(|p| (p - pm).powi(2)).sum();
+    if pv <= 0.0 {
+        return None;
+    }
+    let mut best: Option<f64> = None;
+    for s in -1..=1 {
+        let t: Vec<f64> = (-half..=half)
+            .map(|d| {
+                let x = d - s;
+                if (-w..0).contains(&x) {
+                    1.0
+                } else if (0..w).contains(&x) {
+                    -neg_amp
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let tm = t.iter().sum::<f64>() / n;
+        let tv: f64 = t.iter().map(|x| (x - tm).powi(2)).sum();
+        let cov: f64 = prof.iter().zip(&t).map(|(p, x)| (p - pm) * (x - tm)).sum();
+        let r2 = cov * cov / (pv * tv);
+        if best.is_none_or(|b| r2 > b) {
+            best = Some(r2);
+        }
+    }
+    best
+}
+
+/// A kernel's clean-side and away-side tap lists.
+type TapPair<'a> = (&'a [(i32, f64)], &'a [(i32, f64)]);
+
+/// One bank kernel at one bin: the same clean/away weight assembly as
+/// [`split_stencil_rot`], normalized by the legacy 1.0° arc. Requires every
+/// tap cell — a missing cell means the footprint bin keeps the primary
+/// chain's value.
+fn bank_kernel_rot(
+    vel_grid: &[Vec<f64>],
+    i: usize,
+    j: usize,
+    arc_per_radial: f64,
+    gate_count: usize,
+    pair_first: bool,
+    taps: TapPair,
+) -> Option<f64> {
+    let (clean, away) = taps;
+    let span = clean.len() as i32;
+    let prof = az_profile(vel_grid, i, j, gate_count, span);
+    let (plus, minus) = if pair_first {
+        (clean, away)
+    } else {
+        (away, clean)
+    };
+    let mut acc = 0.0;
+    for &(o, t) in plus {
+        let v = prof[(span + o) as usize];
+        if v.is_nan() {
+            return None;
+        }
+        acc += t * v;
+    }
+    for &(o, t) in minus {
+        let v = prof[(span - o) as usize];
+        if v.is_nan() {
+            return None;
+        }
+        acc -= t * v;
+    }
+    Some(acc / (2.0 * arc_per_radial))
+}
+
+/// Matched-filter bank pass over the primary NROT grid, inside the
+/// split-tap domain. Two layers, both magnitude caps that keep the
+/// primary's sign and leave everything their gates exclude untouched:
+///
+/// 1. Per-bin base cap: every bin whose velocity profile returns to its
+///    background at both window ends (steps and pure azimuthal ramps never
+///    do) and shows balanced opposite deviations about its median
+///    (monopolar notches never do) is bounded by the smallest kernel
+///    magnitude in the bank. This suppresses the broad sign-fragile
+///    fringes the primary chain paints around weak structure.
+/// 2. Footprint refinement: at each candidate core (a local azimuthal max
+///    of |NROT| at or above [`BANK_DETECT_MIN`]) whose profile passes the
+///    same gates and correlates with a couplet template at
+///    [`BANK_R2_MIN`], the best-matching kernel — symmetric widths 2/3/4,
+///    or an asymmetric width-3 pair (weak-pole ratio 0.67/0.33, exempt
+///    from the balance gate their pattern class inherently fails) — caps
+///    the couplet's whole footprint (core ± (w+2) radials), floored at
+///    [`BANK_CAP_FLOOR`] of the primary value.
+///
+/// Measured on couplet-width ladders: the reference's width-dependent edge
+/// compression (0.47/0.34/0.55 of core for pole widths 2/3/4) with
+/// full-value pass-through on monopolar notches follows from this
+/// selection rule, and the cap form bounds the wide kernels' noise gain by
+/// the primary response on real velocity texture.
+fn apply_kernel_bank(
+    sweep: &VelocitySweep,
+    vel_grid: &[Vec<f64>],
+    grid: &mut [Vec<f64>],
+    phase: usize,
+) {
+    let num_radials = grid.len();
+    if num_radials == 0 {
+        return;
+    }
+    let spacing_rad = (360.0 / num_radials as f64).to_radians();
+    type Bank = [(i32, &'static [(i32, f64)], &'static [(i32, f64)]); 3];
+    const BANK: Bank = [
+        (2, &BANK_K2_CLEAN, &BANK_K2_AWAY),
+        (3, &BANK_K3_CLEAN, &BANK_K3_AWAY),
+        (4, &BANK_K4_CLEAN, &BANK_K4_AWAY),
+    ];
+    // Asymmetric entries: (weak-pole template amplitude, taps). Width-3
+    // poles; footprint-only — see the tap constants' doc.
+    type BankAsym = [(f64, &'static [(i32, f64)], &'static [(i32, f64)]); 2];
+    const BANK_ASYM: BankAsym = [
+        (2.0 / 3.0, &BANK_A067_CLEAN, &BANK_A067_AWAY),
+        (1.0 / 3.0, &BANK_A033_CLEAN, &BANK_A033_AWAY),
+    ];
+    let primary: &[Vec<f64>] = grid;
+    let overrides: Vec<Vec<(usize, f64)>> = (0..sweep.gate_count)
+        .into_par_iter()
+        .map(|j| {
+            let mut ov: Vec<(usize, f64)> = Vec::new();
+            let range_km = sweep.first_gate_range_km + j as f64 * sweep.gate_interval_km;
+            if range_km >= SPLIT_MAX_RANGE_KM || range_km <= MIN_RANGE_NM * KM_PER_NM {
+                return ov;
+            }
+            let arc_per_radial = range_km * spacing_rad;
+            let divisor = rot_divisor(range_km / KM_PER_NM);
+            let mut col: Vec<f64> = (0..num_radials).map(|i| primary[i][j]).collect();
+            // Base layer: per-bin bank cap, the direct successor of the
+            // second-chain magnitude cap this bank replaces. Every bin
+            // whose profile returns to its background at the window ends
+            // (steps and pure azimuthal ramps do not — they keep the full
+            // primary value) and shows balanced opposite deviations about
+            // its median (monopolar notches do not) is bounded by the
+            // smallest kernel magnitude in the bank. This is what
+            // suppresses the broad sign-fragile fringes around weak
+            // structure; the width-matched footprints below then refine
+            // actual couplets.
+            for (i, ci) in col.iter_mut().enumerate() {
+                if ci.is_nan() {
+                    continue;
+                }
+                let prof = az_profile(vel_grid, i, j, sweep.gate_count, 7);
+                let mut vals: Vec<f64> = prof.iter().copied().filter(|p| !p.is_nan()).collect();
+                if vals.is_empty() {
+                    continue;
+                }
+                let (first, last) = (vals[0], vals[vals.len() - 1]);
+                vals.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                let (lo, hi) = (vals[0], vals[vals.len() - 1]);
+                if hi <= lo || (last - first).abs() > 0.7 * (hi - lo) {
+                    continue;
+                }
+                let med = vals[vals.len() / 2];
+                let dpos = hi - med;
+                let dneg = med - lo;
+                let balance = dpos.min(dneg) / dpos.max(dneg).max(1e-9);
+                if balance < BANK_BASE_BALANCE_MIN {
+                    continue;
+                }
+                let mut cap: Option<f64> = None;
+                for &(_, kc, ka) in BANK.iter() {
+                    if let Some(rot) = bank_kernel_rot(
+                        vel_grid,
+                        i,
+                        j,
+                        arc_per_radial,
+                        sweep.gate_count,
+                        i % 2 == phase,
+                        (kc, ka),
+                    ) {
+                        let kv = (BANK_CAP_GAIN * rot / divisor)
+                            .clamp(-NROT_LIMIT, NROT_LIMIT)
+                            .abs();
+                        if cap.is_none_or(|c| kv < c) {
+                            cap = Some(kv);
+                        }
+                    }
+                }
+                if let Some(kv) = cap
+                    && kv < ci.abs()
+                {
+                    let capped = ci.signum() * kv;
+                    *ci = capped;
+                    ov.push((i, capped));
+                }
+            }
+            for i in 0..num_radials {
+                let v = col[i];
+                if v.is_nan() || v.abs() < BANK_DETECT_MIN {
+                    continue;
+                }
+                let prev = col[(i + num_radials - 1) % num_radials];
+                let next = col[(i + 1) % num_radials];
+                if (!prev.is_nan() && prev.abs() > v.abs())
+                    || (!next.is_nan() && next.abs() > v.abs())
+                {
+                    continue;
+                }
+                // A candidate window that passes the ends-return gate (a
+                // couplet's profile comes back to the background on both
+                // sides; a step's does not), or None with the profile's
+                // bipolar balance about its median otherwise.
+                let gated_prof = |w: i32| -> Option<(Vec<f64>, f64)> {
+                    let prof = az_profile(vel_grid, i, j, sweep.gate_count, w + 3);
+                    if prof.iter().any(|p| p.is_nan()) {
+                        return None;
+                    }
+                    let (lo, hi) = prof
+                        .iter()
+                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), &p| {
+                            (l.min(p), h.max(p))
+                        });
+                    if hi <= lo || (prof[prof.len() - 1] - prof[0]).abs() > 0.5 * (hi - lo) {
+                        return None;
+                    }
+                    let mut vals: Vec<f64> = prof.clone();
+                    vals.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                    let med = vals[vals.len() / 2];
+                    let dpos = vals[vals.len() - 1] - med;
+                    let dneg = med - vals[0];
+                    let balance = dpos.min(dneg) / dpos.max(dneg).max(1e-9);
+                    Some((prof, balance))
+                };
+                let mut best: Option<(f64, i32, TapPair)> = None;
+                for &(w, clean, away) in BANK.iter() {
+                    // Bipolar balance about the window median: a monopolar
+                    // notch (one deep pole, weak counter-deviation) never
+                    // balances; a symmetric rotation couplet does.
+                    let Some((prof, balance)) = gated_prof(w) else {
+                        continue;
+                    };
+                    if balance < BANK_BALANCE_MIN {
+                        continue;
+                    }
+                    if let Some(r2) = bank_template_r2(&prof, w, 1.0)
+                        && r2 >= BANK_R2_MIN
+                        && best.is_none_or(|(b, _, _)| r2 > b)
+                    {
+                        best = Some((r2, w, (clean, away)));
+                    }
+                }
+                for &(neg_amp, clean, away) in BANK_ASYM.iter() {
+                    // Asymmetric couplets fail the balance test by nature;
+                    // their template gate alone carries the notch guard
+                    // (the measured notch scores r² ≈ 0.2–0.3 here).
+                    let w = 3;
+                    let Some((prof, _)) = gated_prof(w) else {
+                        continue;
+                    };
+                    if let Some(r2) = bank_template_r2(&prof, w, neg_amp)
+                        && r2 >= BANK_R2_MIN
+                        && best.is_none_or(|(b, _, _)| r2 > b)
+                    {
+                        best = Some((r2, w, (clean, away)));
+                    }
+                }
+                let Some((_, w, (clean, away))) = best else {
+                    continue;
+                };
+                // The kernel must be computable at the core itself — a core
+                // whose own span is incomplete sits on a data edge, where
+                // the primary chain's completeness rules are the authority.
+                if bank_kernel_rot(
+                    vel_grid,
+                    i,
+                    j,
+                    arc_per_radial,
+                    sweep.gate_count,
+                    i % 2 == phase,
+                    (clean, away),
+                )
+                .is_none()
+                {
+                    continue;
+                }
+                for d in -(w + 2)..=(w + 2) {
+                    let ii = ((i as i32 + d).rem_euclid(num_radials as i32)) as usize;
+                    if col[ii].is_nan() {
+                        continue;
+                    }
+                    if let Some(rot) = bank_kernel_rot(
+                        vel_grid,
+                        ii,
+                        j,
+                        arc_per_radial,
+                        sweep.gate_count,
+                        ii % 2 == phase,
+                        (clean, away),
+                    ) {
+                        let kv = (rot / divisor).clamp(-NROT_LIMIT, NROT_LIMIT);
+                        let mag = kv.abs().max(BANK_CAP_FLOOR * col[ii].abs());
+                        if mag < col[ii].abs() {
+                            ov.push((ii, col[ii].signum() * mag));
+                        }
+                    }
+                }
+            }
+            ov
+        })
+        .collect();
+    for (j, ov) in overrides.into_iter().enumerate() {
+        for (i, val) in ov {
+            grid[i][j] = val;
+        }
+    }
 }
 
 /// The measured composite estimator: tap correlation across 11 radials at
@@ -784,7 +1314,7 @@ fn llsd_nrot(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let spacing_rad = avg_spacing_deg.to_radians();
     let phase = pair_phase(sweep.azimuths_deg);
 
-    (0..num_radials)
+    let mut grid: Vec<Vec<f64>> = (0..num_radials)
         .into_par_iter()
         .map(|i| {
             (0..sweep.gate_count)
@@ -820,7 +1350,9 @@ fn llsd_nrot(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Vec<Vec<f64>> {
                 })
                 .collect()
         })
-        .collect()
+        .collect();
+    apply_kernel_bank(sweep, vel_grid, &mut grid, phase);
+    grid
 }
 
 // ————————————————————————————————————————————————————————————————————
