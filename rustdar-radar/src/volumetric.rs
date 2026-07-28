@@ -384,7 +384,7 @@ pub fn compute_echo_tops(scan: &Scan) -> VolumetricGrid {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use nexrad_model::data::{
         MomentData, PulseWidth, Radial, RadialStatus, Sweep, VolumeCoveragePattern,
@@ -397,7 +397,7 @@ mod tests {
     const GATES: usize = 1000;
     const GATE_INTERVAL_M: u16 = 250;
 
-    fn vcp() -> VolumeCoveragePattern {
+    pub(crate) fn vcp() -> VolumeCoveragePattern {
         VolumeCoveragePattern::new(
             212,
             0,
@@ -549,7 +549,7 @@ mod tests {
     /// * a SAILS repeat of 0.5° **late in the scan** whose cores are shifted 8°
     ///   in azimuth — under newest-wins it must displace the first 0.5° sweep,
     ///   which the pinned digest can tell because the two sweeps disagree.
-    fn golden_scan() -> Scan {
+    pub(crate) fn golden_scan() -> Scan {
         Scan::new(
             vcp(),
             vec![
@@ -567,7 +567,7 @@ mod tests {
     /// FNV-1a over every cell's bit pattern, azimuth-major. Implemented here
     /// rather than through `DefaultHasher` so the pinned literal does not
     /// depend on the standard library's unspecified hash algorithm.
-    fn fnv1a64(grid: &VolumetricGrid) -> u64 {
+    pub(crate) fn fnv1a64(grid: &VolumetricGrid) -> u64 {
         let mut h: u64 = 0xcbf29ce484222325;
         for row in &grid.values {
             for v in row {

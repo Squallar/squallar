@@ -265,7 +265,7 @@ impl PartialOrd for ChunkId {
 // ---------------------------------------------------------------------------
 
 /// What one chunk carried.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ChunkContents {
     /// In the order the messages appeared, which is the order the radar
     /// collected them.
@@ -461,6 +461,440 @@ pub(crate) fn placeholder_coverage_pattern(pattern_number: u16) -> VolumeCoverag
 }
 
 // ---------------------------------------------------------------------------
+// Assembly
+// ---------------------------------------------------------------------------
+
+/// How complete a cut must be before it is rendered, as a percentage of the
+/// radials its azimuth spacing implies.
+///
+/// The `ElevationEnd` status says the RDA finished the cut, not that every chunk
+/// carrying it arrived, so the count is checked too. 95% is the gap between "a
+/// few radials dropped" and "a whole chunk missing": chunks hold 120 radials, so
+/// one lost chunk leaves 600 of 720 (83%) or 240 of 360 (67%), both well under,
+/// while a stray drop or two still seals.
+const MIN_SEALED_RADIAL_PERCENT: usize = 95;
+
+/// One elevation cut being accumulated.
+enum Cut {
+    /// Still receiving.
+    ///
+    /// Keyed by `azimuth_number` — the RDA's 1..720 index within the sweep — so
+    /// re-ingesting a chunk is idempotent by construction rather than by a rule
+    /// every insertion point has to remember, and iteration is already in
+    /// collection order, which is what `Sweep::merge` sorts to and what the
+    /// rasterizer's wedge painter expects.
+    Open {
+        radials: std::collections::BTreeMap<u16, Radial>,
+        /// An `ElevationEnd` or `ScanEnd` radial has arrived.
+        terminated: bool,
+        /// Radials a full rotation implies, from the first radial's azimuth
+        /// spacing: 720 at 0.5°, 360 at 1.0°.
+        expected: Option<usize>,
+    },
+    /// A full rotation, frozen. Radials are *moved* out of the map rather than
+    /// copied — a sweep is megabytes of gate bytes.
+    Sealed(nexrad_model::data::Sweep),
+    /// Terminated, or closed with the volume, short of its radial count.
+    ///
+    /// Kept as a diagnostic and **never** placed in a snapshot.
+    /// `render_nrot_to_image` computes `avg_spacing_deg = 360.0 / num_radials`
+    /// and wraps its azimuthal neighbour lookups with `.rem_euclid(num_radials)`,
+    /// so a half-received cut both halves the computed shear and stitches the
+    /// last received radial to the first — manufacturing a rotation signature
+    /// out of a gap. It bails only at zero radials, so nothing downstream would
+    /// catch this.
+    Abandoned { have: usize, expected: usize },
+}
+
+impl Cut {
+    fn is_sealed(&self) -> bool {
+        matches!(self, Self::Sealed(_))
+    }
+}
+
+/// What one `ingest` call changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IngestOutcome {
+    /// `false` when this sequence had already been ingested and nothing changed.
+    pub accepted: bool,
+    /// Elevation numbers whose cut completed on this chunk, ascending.
+    ///
+    /// **The render trigger.** Also the test the caller uses to decide whether a
+    /// snapshot is worth building at all — see [`VolumeAssembler::snapshot`].
+    pub sealed: Vec<u8>,
+    /// This chunk carried the coverage pattern.
+    pub learned_coverage_pattern: bool,
+    /// Every cut the volume plans is sealed and the volume has ended.
+    pub volume_complete: bool,
+}
+
+/// A cut that ended short of a full rotation, and by how much.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AbandonedCut {
+    pub elevation: u8,
+    pub have: usize,
+    /// What the cut's azimuth spacing implied. `0` when no radial ever arrived
+    /// for it, so the spacing was never learned.
+    pub expected: usize,
+}
+
+/// A volume's assembly state, for the caller's gating and logging.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VolumeProgress {
+    pub volume: VolumeIndex,
+    pub volume_time: Option<chrono::NaiveDateTime>,
+    /// Elevation numbers with a complete sweep in the snapshot, ascending.
+    pub sealed_elevations: Vec<u8>,
+    /// Their angles, parallel to `sealed_elevations`. From
+    /// `Sweep::elevation_angle_degrees`, which is the median over the sweep's
+    /// radials and so is not thrown by a transitional first or last one.
+    pub sealed_angles: Vec<f32>,
+    /// Cuts that ended short. A volume holding one never completes, so this is
+    /// the first thing to look at when one does not.
+    pub abandoned: Vec<AbandonedCut>,
+    pub saw_scan_end: bool,
+    /// Gate for every product that integrates the whole volume.
+    ///
+    /// `volumetric::compute_echo_tops` walks only the tilts present and clamps
+    /// each column to the topmost *available* tilt's centre height, so a partial
+    /// volume yields a plausible, low, wrong number in kft — no error, no NaN.
+    /// It is the one product whose failure mode on partial data is invisible.
+    pub volume_complete: bool,
+    pub chunks_ingested: usize,
+    /// Radials that arrived for an already-sealed cut. Expected to stay zero;
+    /// a nonzero count means elevation numbers repeat within a volume, which the
+    /// `BTreeMap<u8, _>` accumulator cannot represent.
+    pub late_radials_dropped: usize,
+}
+
+/// Accumulates one volume's chunks into complete sweeps.
+///
+/// Keyed by elevation number rather than fed to `Sweep::from_radials`, which
+/// groups by *consecutive runs* of equal elevation number: out-of-order or
+/// backfilled chunks make it emit several sweeps all claiming one elevation.
+/// That breaks `render::find_sweep`, which searches `.rev()` assuming a later
+/// sweep is the newer cut, and `volumetric::VolumeCube`'s newest-wins dedup,
+/// where a fragment would displace a complete earlier sweep. `Sweep::merge` is
+/// no better — it requires equal elevation numbers, re-sorts by azimuth, and
+/// does not dedup, so merging a chunk twice doubles the sweep.
+///
+/// The scheme is safe because elevation numbers are sequential and unique within
+/// a volume, SAILS and MRLE inserts included — each repeat of a low tilt takes
+/// its own number. `archive::tests::live_volume_elevation_numbers_are_contiguous_and_terminated`
+/// pins that against a real VCP-212 volume.
+pub struct VolumeAssembler {
+    site: String,
+    volume: VolumeIndex,
+    /// Learned from the first accepted chunk; every later one must match.
+    volume_time: Option<chrono::NaiveDateTime>,
+    ingested: std::collections::BTreeSet<u16>,
+    cuts: std::collections::BTreeMap<u8, Cut>,
+    coverage_pattern: Option<VolumeCoveragePattern>,
+    saw_start_chunk: bool,
+    saw_scan_end: bool,
+    late_radials_dropped: usize,
+    closed: bool,
+    /// Invalidated whenever a cut seals. See [`Self::snapshot`].
+    cached: Option<std::sync::Arc<nexrad_model::data::Scan>>,
+}
+
+impl VolumeAssembler {
+    pub fn new(site: impl Into<String>, volume: VolumeIndex) -> Self {
+        Self {
+            site: site.into(),
+            volume,
+            volume_time: None,
+            ingested: Default::default(),
+            cuts: Default::default(),
+            coverage_pattern: None,
+            saw_start_chunk: false,
+            saw_scan_end: false,
+            late_radials_dropped: 0,
+            closed: false,
+            cached: None,
+        }
+    }
+
+    pub fn site(&self) -> &str {
+        &self.site
+    }
+    pub fn volume(&self) -> VolumeIndex {
+        self.volume
+    }
+    pub fn volume_time(&self) -> Option<chrono::NaiveDateTime> {
+        self.volume_time
+    }
+
+    /// Feed one chunk's bytes.
+    pub fn ingest(&mut self, id: &ChunkId, bytes: &[u8]) -> Result<IngestOutcome> {
+        if id.volume() != self.volume || self.ingested.contains(&id.sequence()) {
+            return Ok(IngestOutcome::default());
+        }
+        let contents = decode_chunk(id.name(), bytes)?;
+        Ok(self.ingest_contents(id.sequence(), id.kind(), id.volume_time(), contents))
+    }
+
+    /// The decode-free half, and the seam the equivalence test drives: a golden
+    /// `Scan` re-sliced into chunks needs no encoder to reach this.
+    pub(crate) fn ingest_contents(
+        &mut self,
+        sequence: u16,
+        kind: ChunkKind,
+        volume_time: chrono::NaiveDateTime,
+        contents: ChunkContents,
+    ) -> IngestOutcome {
+        // A leftover from the previous pass through this rotating index carries
+        // elevation numbers that would collide with the volume being assembled,
+        // so it is refused rather than merged. Checked here rather than in
+        // `ingest` so it is reachable without encoding a chunk.
+        if self.volume_time.is_some_and(|known| known != volume_time) {
+            return IngestOutcome::default();
+        }
+        if self.closed || !self.ingested.insert(sequence) {
+            return IngestOutcome::default();
+        }
+        self.volume_time = Some(volume_time);
+        if kind == ChunkKind::Start {
+            self.saw_start_chunk = true;
+        }
+
+        let mut outcome = IngestOutcome {
+            accepted: true,
+            ..Default::default()
+        };
+        if let Some(vcp) = contents.coverage_pattern {
+            self.coverage_pattern.get_or_insert(vcp);
+            outcome.learned_coverage_pattern = true;
+        }
+
+        let mut touched: Vec<u8> = Vec::new();
+        for radial in contents.radials {
+            let elevation = radial.elevation_number();
+            let status = radial.radial_status();
+            let terminates = matches!(
+                status,
+                nexrad_model::data::RadialStatus::ElevationEnd
+                    | nexrad_model::data::RadialStatus::ScanEnd
+            );
+            if matches!(status, nexrad_model::data::RadialStatus::ScanEnd) {
+                self.saw_scan_end = true;
+            }
+
+            let cut = self.cuts.entry(elevation).or_insert_with(|| Cut::Open {
+                radials: Default::default(),
+                terminated: false,
+                expected: None,
+            });
+            match cut {
+                Cut::Open {
+                    radials,
+                    terminated,
+                    expected,
+                } => {
+                    if expected.is_none() {
+                        let spacing = radial.azimuth_spacing_degrees();
+                        if spacing > 0.0 {
+                            *expected = Some((360.0 / spacing).round() as usize);
+                        }
+                    }
+                    *terminated |= terminates;
+                    // First write wins, so re-ingesting a chunk is byte-stable.
+                    radials.entry(radial.azimuth_number()).or_insert(radial);
+                    if !touched.contains(&elevation) {
+                        touched.push(elevation);
+                    }
+                }
+                // Never reopened: a sealed cut may already be inside a `Scan`
+                // some render is holding, and mutating it would change an image
+                // mid-flight.
+                Cut::Sealed(_) | Cut::Abandoned { .. } => self.late_radials_dropped += 1,
+            }
+        }
+
+        touched.sort_unstable();
+        for elevation in touched {
+            if self.try_seal(elevation) {
+                outcome.sealed.push(elevation);
+            }
+        }
+        if !outcome.sealed.is_empty() {
+            self.cached = None;
+        }
+        outcome.volume_complete = self.is_volume_complete();
+        outcome
+    }
+
+    /// Seal a cut if it is terminated and complete enough. Returns whether it
+    /// sealed on this call.
+    fn try_seal(&mut self, elevation: u8) -> bool {
+        let Some(Cut::Open {
+            radials,
+            terminated,
+            expected,
+        }) = self.cuts.get_mut(&elevation)
+        else {
+            return false;
+        };
+        let Some(expected) = *expected else {
+            return false;
+        };
+        if !*terminated || radials.len() * 100 < expected * MIN_SEALED_RADIAL_PERCENT {
+            return false;
+        }
+        let radials = std::mem::take(radials);
+        self.cuts.insert(
+            elevation,
+            Cut::Sealed(nexrad_model::data::Sweep::new(
+                elevation,
+                radials.into_values().collect(),
+            )),
+        );
+        true
+    }
+
+    /// Whether every cut the volume carries is sealed and the volume has ended.
+    ///
+    /// The contiguity clause is not decoration. A volume *joined mid-flight* has
+    /// no entry at all for the cuts that finished before the first chunk
+    /// arrived, so without it the assembler would report a volume complete whose
+    /// lowest tilts are simply absent — and `compute_echo_tops` would integrate
+    /// tilts 8..23 and report every column's top far too low.
+    pub fn is_volume_complete(&self) -> bool {
+        self.saw_start_chunk
+            && self.saw_scan_end
+            && !self.cuts.is_empty()
+            && self.cuts.values().all(Cut::is_sealed)
+            && self
+                .cuts
+                .keys()
+                .copied()
+                .eq(1..=self.cuts.keys().copied().max().unwrap_or(0))
+    }
+
+    /// Whether this sequence has already been taken.
+    ///
+    /// A poller re-lists the whole volume directory each tick, so this is what
+    /// stops it re-downloading every chunk it already has.
+    pub fn has_ingested(&self, sequence: u16) -> bool {
+        self.ingested.contains(&sequence)
+    }
+
+    pub fn is_elevation_sealed(&self, elevation: u8) -> bool {
+        self.cuts.get(&elevation).is_some_and(Cut::is_sealed)
+    }
+
+    /// Resolve every still-open cut and stop accepting chunks.
+    ///
+    /// Open cuts are resolved *here* rather than when a higher elevation number
+    /// appears: out-of-order arrival is the premise of this module, so "a later
+    /// cut has started" is not evidence an earlier one finished.
+    pub fn close(&mut self) -> VolumeProgress {
+        let short: Vec<(u8, usize, usize)> = self
+            .cuts
+            .iter()
+            .filter_map(|(elevation, cut)| match cut {
+                Cut::Open {
+                    radials, expected, ..
+                } => Some((*elevation, radials.len(), expected.unwrap_or(0))),
+                _ => None,
+            })
+            .collect();
+        for (elevation, have, expected) in &short {
+            log::debug!(
+                "{} volume {}: elevation {elevation} closed with {have}/{expected} radials",
+                self.site,
+                self.volume.get()
+            );
+            self.cuts.insert(
+                *elevation,
+                Cut::Abandoned {
+                    have: *have,
+                    expected: *expected,
+                },
+            );
+        }
+        if !short.is_empty() {
+            self.cached = None;
+        }
+        self.closed = true;
+        self.progress()
+    }
+
+    pub fn progress(&self) -> VolumeProgress {
+        let mut sealed_elevations = Vec::new();
+        let mut sealed_angles = Vec::new();
+        let mut abandoned = Vec::new();
+        for (elevation, cut) in &self.cuts {
+            match cut {
+                Cut::Sealed(sweep) => {
+                    sealed_elevations.push(*elevation);
+                    sealed_angles.push(sweep.elevation_angle_degrees().unwrap_or(f32::NAN));
+                }
+                Cut::Abandoned { have, expected } => abandoned.push(AbandonedCut {
+                    elevation: *elevation,
+                    have: *have,
+                    expected: *expected,
+                }),
+                Cut::Open { .. } => {}
+            }
+        }
+        VolumeProgress {
+            volume: self.volume,
+            volume_time: self.volume_time,
+            sealed_elevations,
+            sealed_angles,
+            abandoned,
+            saw_scan_end: self.saw_scan_end,
+            volume_complete: self.is_volume_complete(),
+            chunks_ingested: self.ingested.len(),
+            late_radials_dropped: self.late_radials_dropped,
+        }
+    }
+
+    /// The volume so far, as a `Scan` carrying **only complete sweeps**, in
+    /// ascending elevation-number order.
+    ///
+    /// *Only complete sweeps*: a partial cut is never in the `Scan`, so
+    /// `render::find_sweep` — and `render_input::RenderInput::extract`, which
+    /// calls it — cannot reach one, and NROT cannot be rendered from one. That
+    /// is a property of the data handed over rather than a rule every caller has
+    /// to remember.
+    ///
+    /// *Ascending elevation number* is what preserves the "a later sweep is the
+    /// newer cut" invariant `find_sweep`'s `.rev()` and `VolumeCube`'s
+    /// newest-wins dedup both stand on: a SAILS revisit of a low tilt takes a
+    /// higher elevation number than the original, so it sorts after it.
+    ///
+    /// **Cached, and the cache matters.** `Sweep: Clone` is a deep copy of every
+    /// gate byte — `nexrad_model::BinaryData` wraps a `Vec<u8>`, not an
+    /// `Arc<[u8]>` — and `Scan::new` takes owned sweeps, so each call copies
+    /// every sealed sweep so far. The same `Arc` comes back until a cut seals;
+    /// build one per *rendered* completion, not one per poll, and use
+    /// [`IngestOutcome::sealed`] to tell whether the seal was even for a tilt
+    /// anything is showing.
+    pub fn snapshot(&mut self) -> std::sync::Arc<nexrad_model::data::Scan> {
+        if let Some(cached) = &self.cached {
+            return std::sync::Arc::clone(cached);
+        }
+        let sweeps: Vec<nexrad_model::data::Sweep> = self
+            .cuts
+            .values()
+            .filter_map(|cut| match cut {
+                Cut::Sealed(sweep) => Some(sweep.clone()),
+                _ => None,
+            })
+            .collect();
+        let vcp = self
+            .coverage_pattern
+            .clone()
+            .unwrap_or_else(|| placeholder_coverage_pattern(0));
+        let scan = std::sync::Arc::new(nexrad_model::data::Scan::new(vcp, sweeps));
+        self.cached = Some(std::sync::Arc::clone(&scan));
+        scan
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bucket access
 // ---------------------------------------------------------------------------
 
@@ -496,7 +930,10 @@ pub async fn list_chunks(
 }
 
 /// Fetch one chunk's bytes.
-pub async fn download_chunk(sources: &crate::sources::DataSources, id: &ChunkId) -> Result<Vec<u8>> {
+pub async fn download_chunk(
+    sources: &crate::sources::DataSources,
+    id: &ChunkId,
+) -> Result<Vec<u8>> {
     let client = crate::archive::shared_client();
     let url = crate::sources::DataSources::s3_object_url(&sources.level2_chunks_bucket, &id.key());
     Ok(crate::archive::get_bytes(client, url).await?)
@@ -515,11 +952,10 @@ pub async fn list_volume_indices(
     let bucket = sources.level2_chunks_bucket.clone();
     let prefix = format!("{site}/");
 
-    let prefixes =
-        crate::archive::collect_common_prefixes(&bucket, &prefix, DELIMITER, |url| {
-            get_text(client, url)
-        })
-        .await?;
+    let prefixes = crate::archive::collect_common_prefixes(&bucket, &prefix, DELIMITER, |url| {
+        get_text(client, url)
+    })
+    .await?;
 
     Ok(parse_volume_indices(&prefixes))
 }
@@ -848,7 +1284,9 @@ mod tests {
             async move {
                 // A negative minute stands for a directory holding nothing
                 // readable.
-                Ok(at.filter(|m| *m >= 0).map(|m| base + chrono::Duration::minutes(m)))
+                Ok(at
+                    .filter(|m| *m >= 0)
+                    .map(|m| base + chrono::Duration::minutes(m)))
             }
         });
         let mut fut = Box::pin(fut);
@@ -992,6 +1430,417 @@ mod tests {
         );
     }
 
+    // -- assembly -----------------------------------------------------------
+
+    use nexrad_model::data::{Radial, RadialStatus};
+
+    const VOLUME_TIME: &str = "20260728-181234";
+
+    fn volume_time() -> chrono::NaiveDateTime {
+        chrono::NaiveDateTime::parse_from_str(VOLUME_TIME, "%Y%m%d-%H%M%S").expect("fixture time")
+    }
+
+    /// Copy a radial with a different status. `Radial` has no setters, so every
+    /// field is read back off the original; if one is ever added and missed
+    /// here, the digest test below is what notices.
+    fn with_status(r: &Radial, status: RadialStatus) -> Radial {
+        Radial::new(
+            r.collection_timestamp(),
+            r.azimuth_number(),
+            r.azimuth_angle_degrees(),
+            r.azimuth_spacing_degrees(),
+            status,
+            r.elevation_number(),
+            r.elevation_angle_degrees(),
+            r.reflectivity().cloned(),
+            r.velocity().cloned(),
+            r.spectrum_width().cloned(),
+            r.differential_reflectivity().cloned(),
+            r.differential_phase().cloned(),
+            r.correlation_coefficient().cloned(),
+            r.clutter_filter_power().cloned(),
+        )
+    }
+
+    /// `volumetric::tests::golden_scan` re-sliced into the chunks the bucket
+    /// actually publishes.
+    ///
+    /// 120 radials per chunk is the real size — confirmed against the live
+    /// bucket by `live_a_start_chunk_decodes_and_carries_the_coverage_pattern`,
+    /// which decodes an intermediate chunk to exactly 120 — so a super-resolution
+    /// cut is 6 chunks and a standard one 3. The slicing is the bucket's, not an
+    /// arbitrary split.
+    ///
+    /// Two edits the fixture needs. Sequence 1 is a synthetic start chunk
+    /// carrying the VCP and no radials, which is what a real one looks like. And
+    /// each sweep's last radial is rebuilt with `ElevationEnd` — `ScanEnd` on the
+    /// final sweep — because the generator marks every radial
+    /// `IntermediateRadialData`, so without this nothing would ever seal.
+    fn golden_chunks() -> Vec<(u16, ChunkKind, ChunkContents)> {
+        let scan = crate::volumetric::tests::golden_scan();
+        let sweeps = scan.sweeps();
+        let mut out: Vec<(u16, ChunkKind, ChunkContents)> = vec![(
+            1,
+            ChunkKind::Start,
+            ChunkContents {
+                radials: Vec::new(),
+                coverage_pattern: Some(crate::volumetric::tests::vcp()),
+            },
+        )];
+
+        let mut sequence = 2u16;
+        for (si, sweep) in sweeps.iter().enumerate() {
+            let last_sweep = si + 1 == sweeps.len();
+            let radials = sweep.radials();
+            let terminator = if last_sweep {
+                RadialStatus::ScanEnd
+            } else {
+                RadialStatus::ElevationEnd
+            };
+            let rebuilt: Vec<Radial> = radials
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    if i + 1 == radials.len() {
+                        with_status(r, terminator)
+                    } else {
+                        r.clone()
+                    }
+                })
+                .collect();
+            for group in rebuilt.chunks(120) {
+                out.push((
+                    sequence,
+                    ChunkKind::Intermediate,
+                    ChunkContents {
+                        radials: group.to_vec(),
+                        coverage_pattern: None,
+                    },
+                ));
+                sequence += 1;
+            }
+        }
+        if let Some(last) = out.last_mut() {
+            last.1 = ChunkKind::End;
+        }
+        out
+    }
+
+    /// Feed chunks to a fresh assembler in the order given.
+    fn assemble(chunks: Vec<(u16, ChunkKind, ChunkContents)>) -> VolumeAssembler {
+        let mut a = VolumeAssembler::new("KTLX", vol(42));
+        for (sequence, kind, contents) in chunks {
+            a.ingest_contents(sequence, kind, volume_time(), contents);
+        }
+        a
+    }
+
+    fn digest(a: &mut VolumeAssembler) -> u64 {
+        let scan = a.snapshot();
+        crate::volumetric::tests::fnv1a64(&crate::volumetric::compute_echo_tops(&scan))
+    }
+
+    /// **The claim this module rests on**: assembling a volume from chunks
+    /// produces the same `Scan` that decoding the whole volume does.
+    ///
+    /// Driven through `compute_echo_tops` and pinned on
+    /// `volumetric::tests::golden_echo_tops_grid_is_pinned`'s own digest, so it
+    /// exercises gridding, newest-wins dedup, beam heights and interpolation and
+    /// demands bit-identity — not merely "some sweeps arrived". The NaN
+    /// assertion additionally pins that ascending elevation-number order
+    /// reproduces newest-wins, which is the invariant `find_sweep`'s `.rev()`
+    /// and `VolumeCube` both stand on.
+    #[test]
+    fn the_assembled_golden_volume_reproduces_the_pinned_digest() {
+        let mut a = assemble(golden_chunks());
+        let progress = a.progress();
+        assert!(
+            progress.volume_complete,
+            "the volume did not complete: {progress:?}"
+        );
+        assert_eq!(progress.late_radials_dropped, 0);
+
+        let scan = a.snapshot();
+        assert_eq!(
+            scan.sweeps().len(),
+            crate::volumetric::tests::golden_scan().sweeps().len()
+        );
+        let grid = crate::volumetric::compute_echo_tops(&scan);
+        assert_eq!(
+            crate::volumetric::tests::fnv1a64(&grid),
+            0x4559ce366731e030,
+            "assembling from chunks does not reproduce the volume the archive \
+             path decodes"
+        );
+        let defined: usize = grid.values.iter().flatten().filter(|v| !v.is_nan()).count();
+        assert_eq!(defined, 4680);
+        assert!(
+            grid.values[300][120].is_nan(),
+            "the SAILS repeat no longer displaces the first 0.5° sweep, so the \
+             emitted sweep order is not newest-last"
+        );
+    }
+
+    /// Out-of-order delivery is the premise of the whole module. Fails for
+    /// `Sweep::from_radials`, which groups by consecutive runs and would emit a
+    /// sweep per fragment.
+    #[test]
+    fn a_shuffled_chunk_order_assembles_the_same_volume() {
+        let mut chunks = golden_chunks();
+        // A fixed permutation rather than a random one: no `rand` dependency,
+        // and a failure reproduces.
+        let mid = chunks.len() / 2;
+        let mut shuffled: Vec<_> = Vec::with_capacity(chunks.len());
+        let back = chunks.split_off(mid);
+        let mut front = chunks.into_iter();
+        let mut back = back.into_iter();
+        loop {
+            match (back.next(), front.next()) {
+                (None, None) => break,
+                (b, f) => shuffled.extend(b.into_iter().chain(f)),
+            }
+        }
+        assert_eq!(shuffled.len(), golden_chunks().len());
+
+        let mut a = assemble(shuffled);
+        assert!(a.progress().volume_complete);
+        assert_eq!(digest(&mut a), 0x4559ce366731e030);
+    }
+
+    /// The extreme case of the same property.
+    #[test]
+    fn a_reversed_chunk_order_assembles_the_same_volume() {
+        let mut chunks = golden_chunks();
+        chunks.reverse();
+        let mut a = assemble(chunks);
+        assert!(a.progress().volume_complete);
+        assert_eq!(digest(&mut a), 0x4559ce366731e030);
+    }
+
+    /// A re-listed volume re-delivers chunks already seen. Fails for
+    /// `Sweep::merge`, which extends without deduping and would double every
+    /// sweep.
+    #[test]
+    fn ingesting_every_chunk_twice_changes_nothing() {
+        let mut doubled = golden_chunks();
+        doubled.extend(golden_chunks());
+        let mut a = assemble(doubled);
+        assert_eq!(
+            a.progress().chunks_ingested,
+            golden_chunks().len(),
+            "a repeat was counted as new work"
+        );
+        assert_eq!(digest(&mut a), 0x4559ce366731e030);
+    }
+
+    /// The safety property, stated directly: a cut short of its radial count is
+    /// never in the emitted `Scan`, so `find_sweep` and `RenderInput::extract`
+    /// cannot reach one and NROT cannot be rendered from one.
+    #[test]
+    fn a_partial_cut_never_reaches_the_snapshot() {
+        // Drop the chunk carrying the 0.5° cut's terminator.
+        let mut chunks = golden_chunks();
+        let dropped = chunks
+            .iter()
+            .position(|(_, _, c)| {
+                c.radials.iter().any(|r| {
+                    r.elevation_number() == 1 && r.radial_status() == RadialStatus::ElevationEnd
+                })
+            })
+            .expect("the 0.5° cut has a terminator chunk");
+        chunks.remove(dropped);
+
+        let mut a = assemble(chunks);
+        let progress = a.progress();
+        assert!(
+            !progress.sealed_elevations.contains(&1),
+            "an unterminated cut sealed anyway: {progress:?}"
+        );
+        assert!(!progress.volume_complete);
+
+        let scan = a.snapshot();
+        assert!(
+            scan.sweeps().iter().all(|s| s.elevation_number() != 1),
+            "the partial 0.5° cut reached the Scan"
+        );
+    }
+
+    /// The terminator alone is not enough: it says the RDA finished the cut, not
+    /// that every chunk of it arrived. Fails for a seal rule that trusts the
+    /// status by itself.
+    #[test]
+    fn a_terminator_without_the_radial_count_does_not_seal() {
+        let mut chunks = golden_chunks();
+        // Keep the 0.5° cut's terminator chunk, drop an interior one.
+        let interior = chunks
+            .iter()
+            .position(|(_, _, c)| {
+                c.radials.first().is_some_and(|r| r.elevation_number() == 1)
+                    && c.radials
+                        .iter()
+                        .all(|r| r.radial_status() != RadialStatus::ElevationEnd)
+            })
+            .expect("the 0.5° cut spans several chunks");
+        chunks.remove(interior);
+
+        let a = assemble(chunks);
+        let progress = a.progress();
+        assert!(
+            !progress.sealed_elevations.contains(&1),
+            "a cut missing 120 of its 720 radials sealed on the terminator alone"
+        );
+    }
+
+    /// The final cut of a volume carries `ScanEnd`, not `ElevationEnd`. Reading
+    /// only `ElevationEnd` leaves the topmost cut open forever, so
+    /// `volume_complete` never fires and everything gated on it — echo tops, the
+    /// Level III refetch, the loop append — is dead.
+    #[test]
+    fn the_final_cut_seals_on_scan_end() {
+        let mut a = assemble(golden_chunks());
+        let top = crate::volumetric::tests::golden_scan().sweeps().len() as u8;
+        assert!(
+            a.is_elevation_sealed(top),
+            "the last cut never sealed, so the volume can never complete"
+        );
+        assert!(a.progress().saw_scan_end);
+        assert!(a.progress().volume_complete);
+        let _ = a.snapshot();
+    }
+
+    /// Reported per chunk, and only for the cut that finished on it — the
+    /// frontend uses this to decide which panes to invalidate and whether a
+    /// snapshot is worth building at all.
+    #[test]
+    fn a_cut_is_reported_sealed_on_the_chunk_that_finishes_it() {
+        let mut a = VolumeAssembler::new("KTLX", vol(42));
+        let mut seals: Vec<(u16, Vec<u8>)> = Vec::new();
+        for (sequence, kind, contents) in golden_chunks() {
+            let outcome = a.ingest_contents(sequence, kind, volume_time(), contents);
+            if !outcome.sealed.is_empty() {
+                seals.push((sequence, outcome.sealed));
+            }
+        }
+        let sealed_order: Vec<u8> = seals.iter().flat_map(|(_, e)| e.clone()).collect();
+        assert_eq!(
+            sealed_order,
+            (1..=crate::volumetric::tests::golden_scan().sweeps().len() as u8).collect::<Vec<_>>(),
+            "cuts must seal once each, in acquisition order: {seals:?}"
+        );
+    }
+
+    /// A volume joined mid-flight has no entry for the cuts that finished before
+    /// the first chunk arrived. Without the contiguity clause it would report
+    /// complete, and `compute_echo_tops` would integrate only the upper tilts
+    /// and report every column's top far too low.
+    #[test]
+    fn a_volume_joined_mid_flight_never_reports_complete() {
+        let chunks: Vec<_> = golden_chunks()
+            .into_iter()
+            .filter(|(_, _, c)| c.radials.first().is_none_or(|r| r.elevation_number() >= 3))
+            .collect();
+        let a = assemble(chunks);
+        let progress = a.progress();
+        assert!(
+            progress.saw_scan_end,
+            "the fixture must still reach the end of the volume"
+        );
+        assert!(
+            !progress.volume_complete,
+            "a volume missing its lowest cuts reported complete: {progress:?}"
+        );
+    }
+
+    /// Radials for a cut that already sealed are dropped, not merged: the sealed
+    /// sweep may already be inside a `Scan` a render is holding.
+    #[test]
+    fn late_radials_for_a_sealed_cut_are_dropped() {
+        let mut a = assemble(golden_chunks());
+        let before = a.snapshot();
+        let replay = golden_chunks();
+        // Re-deliver one cut's chunks under fresh sequence numbers so the
+        // idempotence check does not short-circuit them.
+        let mut next_sequence = 900u16;
+        for (_, kind, contents) in replay {
+            if contents
+                .radials
+                .first()
+                .is_some_and(|r| r.elevation_number() == 1)
+            {
+                a.ingest_contents(next_sequence, kind, volume_time(), contents);
+                next_sequence += 1;
+            }
+        }
+        let after = a.snapshot();
+        assert!(
+            std::sync::Arc::ptr_eq(&before, &after),
+            "a sealed cut was reopened, so a Scan already handed out changed"
+        );
+        assert!(a.progress().late_radials_dropped > 0);
+    }
+
+    /// The cache is what keeps a poll cheap: `Sweep: Clone` deep-copies every
+    /// gate byte, so rebuilding per poll would be hundreds of megabytes of
+    /// memcpy across a volume.
+    #[test]
+    fn the_snapshot_is_shared_until_a_cut_seals() {
+        let mut a = VolumeAssembler::new("KTLX", vol(42));
+        let chunks = golden_chunks();
+        // Up to but not including the chunk that seals the first cut.
+        let seal_at = chunks
+            .iter()
+            .position(|(_, _, c)| {
+                c.radials
+                    .iter()
+                    .any(|r| r.radial_status() == RadialStatus::ElevationEnd)
+            })
+            .expect("some chunk seals a cut");
+        for (sequence, kind, contents) in chunks.iter().take(seal_at).cloned() {
+            a.ingest_contents(sequence, kind, volume_time(), contents);
+        }
+        let first = a.snapshot();
+        let second = a.snapshot();
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "two snapshots with no seal between them rebuilt the volume"
+        );
+
+        let (sequence, kind, contents) = chunks[seal_at].clone();
+        a.ingest_contents(sequence, kind, volume_time(), contents);
+        let third = a.snapshot();
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &third),
+            "a seal did not invalidate the cached snapshot"
+        );
+    }
+
+    /// A leftover from the previous pass through this rotating index carries
+    /// elevation numbers that would collide with the volume being assembled, so
+    /// it must be refused outright rather than merged.
+    #[test]
+    fn a_chunk_from_another_volume_is_refused() {
+        let mut a = VolumeAssembler::new("KTLX", vol(42));
+        let chunks = golden_chunks();
+        let (sequence, kind, contents) = chunks[1].clone();
+        assert!(
+            a.ingest_contents(sequence, kind, volume_time(), contents)
+                .accepted
+        );
+        let sealed_before = a.progress().sealed_elevations;
+
+        let stale = volume_time() - chrono::Duration::days(3);
+        for (sequence, kind, contents) in chunks.into_iter().skip(2) {
+            let outcome = a.ingest_contents(sequence, kind, stale, contents);
+            assert!(
+                !outcome.accepted,
+                "a chunk from volume {stale} was merged into volume {}",
+                volume_time()
+            );
+        }
+        assert_eq!(a.progress().sealed_elevations, sealed_before);
+        assert_eq!(a.progress().chunks_ingested, 1);
+    }
+
     // -- live ---------------------------------------------------------------
     //
     // Run with:
@@ -1006,13 +1855,9 @@ mod tests {
     async fn live_chunk_bucket_allows_anonymous_listing() {
         let sources = crate::sources::DataSources::production();
         crate::tls::init();
-        let url = crate::archive::list_url_delimited(
-            &sources.level2_chunks_bucket,
-            "KTLX/",
-            "/",
-            None,
-        )
-        .expect("url");
+        let url =
+            crate::archive::list_url_delimited(&sources.level2_chunks_bucket, "KTLX/", "/", None)
+                .expect("url");
         let response = crate::archive::shared_client()
             .get(&url)
             .send()
@@ -1075,7 +1920,9 @@ mod tests {
         let sources = crate::sources::DataSources::production();
         crate::tls::init();
         let volume = latest_volume(&sources, "KTLX").await.expect("discovery");
-        let chunks = list_chunks(&sources, "KTLX", volume).await.expect("listing");
+        let chunks = list_chunks(&sources, "KTLX", volume)
+            .await
+            .expect("listing");
 
         assert!(!chunks.is_empty(), "the current volume listed no chunks");
         assert!(
@@ -1111,7 +1958,9 @@ mod tests {
         let sources = crate::sources::DataSources::production();
         crate::tls::init();
         let volume = latest_volume(&sources, "KTLX").await.expect("discovery");
-        let chunks = list_chunks(&sources, "KTLX", volume).await.expect("listing");
+        let chunks = list_chunks(&sources, "KTLX", volume)
+            .await
+            .expect("listing");
 
         let start = chunks
             .iter()

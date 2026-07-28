@@ -2090,7 +2090,14 @@ mod render_invalidation_tests {
         let mut d = RenderDispatcher::new();
         let (results, rx) = mpsc::channel();
         let (release, nothing) = gated_nothing();
-        d.spawn_render(0, RadarProduct::Reflectivity, 0.5, results.clone(), None, nothing);
+        d.spawn_render(
+            0,
+            RadarProduct::Reflectivity,
+            0.5,
+            results.clone(),
+            None,
+            nothing,
+        );
 
         release.send(()).expect("the render is still running");
         drop(results);
@@ -2117,7 +2124,14 @@ mod render_invalidation_tests {
         let mut d = RenderDispatcher::new();
         let (results, rx) = mpsc::channel();
         let (release, nothing) = gated_nothing();
-        d.spawn_render(0, RadarProduct::Reflectivity, 0.5, results.clone(), None, nothing);
+        d.spawn_render(
+            0,
+            RadarProduct::Reflectivity,
+            0.5,
+            results.clone(),
+            None,
+            nothing,
+        );
 
         d.reset_panes_for_site("KOUN", &gui);
 
