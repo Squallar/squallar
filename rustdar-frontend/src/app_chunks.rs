@@ -149,11 +149,12 @@ impl super::App {
         let feeds: &[Feed] = if chunks { &Feed::ALL } else { &[Feed::Archive] };
         let endpoint = self.gui.notifier_endpoint().to_string();
         let window = self.window.clone();
-        self.chunk_notify.sync_sites(live, feeds, &endpoint, move || {
-            // From the socket's own thread: without this the frame loop can sleep
-            // through the very notification that was supposed to wake it.
-            crate::app::notify_redraw(&window);
-        });
+        self.chunk_notify
+            .sync_sites(live, feeds, &endpoint, move || {
+                // From the socket's own thread: without this the frame loop can sleep
+                // through the very notification that was supposed to wake it.
+                crate::app::notify_redraw(&window);
+            });
 
         for notified in self.chunk_notify.drain() {
             // Nothing should arrive on a feed that was not subscribed, but a
@@ -476,7 +477,10 @@ mod tests {
             .expect("handle_redraw is gone from app.rs");
         assert!(
             arm.find("self.chunk_notify.reconnect_pending()")
-                .is_some_and(|at| at < arm.find("notify_redraw(&self.window)").unwrap_or(usize::MAX)),
+                .is_some_and(|at| at
+                    < arm
+                        .find("notify_redraw(&self.window)")
+                        .unwrap_or(usize::MAX)),
             "the re-arm dropped its reconnect term, so a socket that goes down \
              with auto-poll off is never retried"
         );

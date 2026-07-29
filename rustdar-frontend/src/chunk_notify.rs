@@ -293,11 +293,7 @@ impl ChunkNotifier {
     /// whatever unrelated work happened to be keeping frames coming: turn
     /// auto-poll off with the socket down and it would never be retried.
     pub fn reconnect_pending(&self) -> bool {
-        !self.backoff.is_empty()
-            || self
-                .subs
-                .values()
-                .any(|s| s.state == LinkState::Connecting)
+        !self.backoff.is_empty() || self.subs.values().any(|s| s.state == LinkState::Connecting)
     }
 
     fn connect(
