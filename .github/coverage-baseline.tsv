@@ -10,7 +10,7 @@ rustdar-egui/src/input_harness.rs	2130	2108
 rustdar-egui/src/overlay_cache.rs	421	372
 rustdar-egui/src/pane.rs	921	888
 rustdar-egui/src/point_painter.rs	55	0
-rustdar-egui/src/tile_source.rs	188	182
+rustdar-egui/src/tile_source.rs	188	183
 rustdar-egui/src/tiles.rs	120	103
 rustdar-egui/src/ui.rs	1426	1047
 rustdar-egui/src/ui_chrome.rs	333	310
@@ -92,11 +92,10 @@ rustdar-platform/src/run.rs	31	0
 rustdar-radar/src/archive.rs	669	485
 rustdar-radar/src/chunks.rs	1786	1269
 rustdar-radar/src/dpprep.rs	1019	950
-rustdar-radar/src/dpr.rs	1546	1067
 rustdar-radar/src/eet.rs	440	346
 rustdar-radar/src/hail.rs	787	671
-rustdar-radar/src/hca.rs	2645	1966
-rustdar-radar/src/hhc.rs	599	318
+rustdar-radar/src/hca.rs	2629	1949
+rustdar-radar/src/hhc.rs	595	314
 rustdar-radar/src/kdp.rs	918	600
 rustdar-radar/src/l3_values.rs	282	281
 rustdar-radar/src/level3.rs	333	170
