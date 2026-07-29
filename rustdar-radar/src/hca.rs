@@ -812,7 +812,7 @@ impl MeltingLayer {
 pub(crate) struct MlBins {
     /// `BEAM_EDGE_BOTTOM`: the beam's *upper* edge crossing the layer
     /// bottom — the nearest of the four, the absolute bottom of the layer.
-    pub(crate) bb: i64,
+    bb: i64,
     b: i64,
     t: i64,
     /// `BEAM_EDGE_TOP`: the beam's *lower* edge crossing the layer top —
@@ -1047,15 +1047,6 @@ pub(crate) struct Fields {
     /// The cleaned met signal per gate (`DMET`), NaN when the legacy flag
     /// ran instead — the hybrid-scan compositor's usability check reads it.
     pub(crate) met: Vec<f64>,
-    /// `raw_smZ` (`qperate_read_Moments.c`'s `get_raw_REF_and_smooth`): the
-    /// 5-gate mean of the **raw** reflectivity — no attenuation correction,
-    /// unlike [`smz`](Self::smz) — sampled at the DP gates. Read only by
-    /// the specific-attenuation rate ([`crate::dpr`]).
-    pub(crate) raw_smz: Vec<f64>,
-    /// `PhiRA` (`dpp_process.c`'s `phi_ra_gate`): the unfolded φ smoothed
-    /// over [`RA_GATE`] gates and interpolated across the meteorological
-    /// groups — the phase field the specific-attenuation rate integrates.
-    pub(crate) phi_ra: Vec<f64>,
     /// The six quality indices per gate, in fuzzy-logic input order.
     pub(crate) q: Vec<[f64; 6]>,
 }
@@ -1199,16 +1190,6 @@ pub(crate) fn radial_fields(
     let kdp9 = kdp_from_phi(&phi_short, SHORT_GATE, r.dg);
     let kdp25 = kdp_from_phi(&phi_long, LONG_GATE, r.dg);
 
-    // PhiRA: the same interpolation over the same groups, but of the plain
-    // 7-gate mean of the *unfolded* φ — `dpp_process.c` smooths `phi`, not
-    // `phi_med`, for this one.
-    let phi_ra = interpolate(
-        &average_filter(&phi, crate::dpprep::RA_GATE),
-        crate::dpprep::RA_GATE,
-        &groups,
-        init_fdp,
-    );
-
     // z_prcd / zdr_prcd with the ΦDP-driven attenuation corrections
     // (Create_corrected_fields_and_adjust_kdp; the syscals are 0).
     let z_prcd: Vec<f64> = (0..nz)
@@ -1292,8 +1273,6 @@ pub(crate) fn radial_fields(
                 .collect(),
             None => vec![f64::NAN; n],
         },
-        raw_smz: Vec::with_capacity(n),
-        phi_ra: Vec::with_capacity(n),
         q: Vec::with_capacity(n),
     };
     for i in 0..n {
@@ -1315,15 +1294,6 @@ pub(crate) fn radial_fields(
         });
         fields.sdz.push(if z_present {
             sentinel(q8(pick_z(&sd_zh), SDZ_SCALE))
-        } else {
-            NO_DATA
-        });
-        // `raw_smZ` never travels as a moment: `qperate_read_Moments.c`
-        // smooths the base data header's own reflectivity inside the rate
-        // task, so it is a float, not an 8-bit level. R(A) is ~15% per dB
-        // sensitive to it, so re-quantizing here would be a real error.
-        fields.raw_smz.push(if z_present {
-            sentinel(pick_z(&ref_smd5))
         } else {
             NO_DATA
         });
@@ -1353,11 +1323,6 @@ pub(crate) fn radial_fields(
         });
         fields.sdp.push(if phi_present {
             sentinel(q8(sd_phi[i], SDP_SCALE))
-        } else {
-            NO_DATA
-        });
-        fields.phi_ra.push(if phi_present {
-            sentinel(phi_ra[i])
         } else {
             NO_DATA
         });
@@ -3206,8 +3171,6 @@ mod tests {
             sdp: vec![sdp],
             smv: vec![smv],
             met: vec![f64::NAN],
-            raw_smz: vec![smz],
-            phi_ra: vec![phi],
             q: vec![quality_indices(phi, rho, smz, snr, true)],
         }
     }
@@ -3757,8 +3720,6 @@ mod tests {
             sdp: vec![5.0; n],
             smv: vec![NO_DATA; n],
             met: vec![f64::NAN; n],
-            raw_smz: vec![smz; n],
-            phi_ra: vec![60.0; n],
             q: vec![q; n],
         }
     }

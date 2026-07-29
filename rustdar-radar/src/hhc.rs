@@ -46,15 +46,15 @@
 //! usable that R(Z, ZDR) could not, at a gate whose class is rain but whose
 //! ZDR is absent — that combination is vanishingly rare (the fuzzy
 //! classification needs ZDR to reach RA in the first place) and the
-//! surveyed agreement below is measured with it absent. [`crate::dpr`],
+//! surveyed agreement below is measured with it absent. A rate product,
 //! which must have R(A) for the rate itself, runs the full test and so
 //! fills a handful more bins than this module does.
 //!
-//! The ladder itself lives in [`composite_hybrid_scan`] and is **shared**
-//! with [`crate::dpr`]: the RPG fills `HybridHCA` (this product) and
-//! `RateComb` (product 176) from one pass of `Add_bin_to_RR_Polar_Grid`, so
-//! the tiering, the SAILS lists and the `Grid_is_full` stop are written
-//! once and each module supplies only its own per-bin answer.
+//! The ladder itself lives in [`composite_hybrid_scan`], written over
+//! whatever the per-bin answer is: the RPG fills `HybridHCA` (this product)
+//! and `RateComb` (product 176) from one pass of `Add_bin_to_RR_Polar_Grid`,
+//! so the tiering, the SAILS lists and the `Grid_is_full` stop are written
+//! once and the caller supplies only its own per-bin answer.
 //!
 //! **SAILS/MRLE** (`Sails_opt = YES`, CCR NA17-00126): bins that computed
 //! a good rate on base cut *k* (k ≤ 4) are recorded, and each supplemental
@@ -181,18 +181,11 @@ pub(crate) struct TiltRow {
     pub(crate) smz: Vec<f64>,
     pub(crate) zdr: Vec<f64>,
     pub(crate) kdp: Vec<f64>,
-    pub(crate) rho: Vec<f64>,
     pub(crate) met: Vec<f64>,
-    /// The specific-attenuation rate's two extra preprocessor fields.
-    pub(crate) raw_smz: Vec<f64>,
-    pub(crate) phi_ra: Vec<f64>,
     pub(crate) hatt: bool,
     /// `beam_edge_top`: where the beam's lower edge crosses the melting
     /// layer's top, in DP bins.
     pub(crate) bin_tt: i64,
-    /// `beam_edge_bottom`: where the beam's upper edge crosses the melting
-    /// layer's bottom, in DP bins — the R(A) subsystem's search limit.
-    pub(crate) bin_bb: i64,
 }
 
 /// The derived hybrid classification, at the product's own geometry.
@@ -299,13 +292,9 @@ pub(crate) fn prepare_tilt(
             smz: f.smz,
             zdr: f.zdr,
             kdp: f.kdp,
-            rho: f.rho,
             met: f.met,
-            raw_smz: f.raw_smz,
-            phi_ra: f.phi_ra,
             hatt: f.hatt,
             bin_tt: ml_bins.tt,
-            bin_bb: ml_bins.bb,
         });
     }
     Some(rows)
@@ -325,12 +314,12 @@ pub(crate) struct Composite<T> {
 }
 
 /// **The hybrid-scan ladder** of `qperate_build_RainfallRate.c`
-/// (`build_RR_Polar_Grid` / `Add_bin_to_RR_Polar_Grid`), shared by the two
-/// products the task emits from one pass — `HybridHCA` (product 177, this
-/// module) and `RateComb` (product 176, [`crate::dpr`]). The RPG fills both
-/// grids from the same `compute_IRRate` outcome at the same bins, so the
-/// ladder, the SAILS/MRLE replacement lists and the `Grid_is_full` stop live
-/// here once.
+/// (`build_RR_Polar_Grid` / `Add_bin_to_RR_Polar_Grid`), generic over the
+/// per-bin answer because the task emits two products from one pass —
+/// `HybridHCA` (product 177, this module) and `RateComb` (product 176). The
+/// RPG fills both grids from the same `compute_IRRate` outcome at the same
+/// bins, so the ladder, the SAILS/MRLE replacement lists and the
+/// `Grid_is_full` stop live here once.
 ///
 /// `prepare` turns a tilt's radials into whatever state the per-bin answer
 /// needs (`None` skips the tilt entirely); `answer` is `Add_bin`'s

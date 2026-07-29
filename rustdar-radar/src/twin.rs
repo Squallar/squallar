@@ -183,7 +183,12 @@ pub mod compare {
         ))
     }
 
-    /// The lower-level entry point: explicit packet, gate spacing and codec.
+    /// The packet's own gate levels on the 360° × 230 km comparison grid,
+    /// `None` where the packet has no gate for a cell.
+    ///
+    /// Levels, not values: what [`tally_packet`] compares is the level, so
+    /// the resampling has to stop short of the codec — a rate product's
+    /// tolerance-based harness decodes them itself.
     ///
     /// Resampling, cell for cell of the derived grid:
     ///
@@ -197,12 +202,6 @@ pub mod compare {
     ///   products represented by their centre gate.
     ///
     /// The domain is always ≤ 230 km: packet gates beyond it are ignored.
-    /// The packet's own gate levels on the 360° × 230 km comparison grid,
-    /// `None` where the packet has no gate for a cell.
-    ///
-    /// Levels, not values: what [`tally_packet`] compares is the level, so
-    /// the resampling has to stop short of the codec. [`crate::dpr`]'s
-    /// tolerance-based harness decodes them itself.
     pub fn resample_packet_levels(packet: &RadialPacket, l3_gate_km: f64) -> Vec<Vec<Option<u16>>> {
         // Which packet radial covers each tenth of a degree; later radials
         // overwrite earlier ones, as in the SRM resampler.
@@ -253,6 +252,8 @@ pub mod compare {
             .collect()
     }
 
+    /// The lower-level entry point: explicit packet, gate spacing and codec,
+    /// scoring the derived grid against [`resample_packet_levels`].
     pub fn tally_packet(
         derived: &[Vec<f32>],
         packet: &RadialPacket,
