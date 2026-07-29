@@ -21,10 +21,15 @@ impl super::App {
     /// interval check is the gate, and every site is normally in the middle of
     /// one.
     pub(super) fn drive_chunk_feeds(&mut self) {
-        if !self.gui.live_chunks_enabled() {
+        let enabled = self.gui.live_chunks_enabled();
+        let live = self.gui.live_sites();
+        // Published every frame, including when the feed is off or retired, so
+        // the status bar never shows a stale claim about the transport.
+        let status = self.chunk_feeds.status(&live, enabled);
+        self.gui.set_chunk_status(status);
+        if !enabled {
             return;
         }
-        let live = self.gui.live_sites();
         // Narrower than `evict_unshown_scans`: a feed has no reader once no pane
         // is live on its site. See `ChunkFeedManager::retain_live`.
         self.chunk_feeds.retain_live(&live);

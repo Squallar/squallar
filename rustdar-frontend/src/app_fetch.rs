@@ -1049,7 +1049,7 @@ fn local_to_utc_in<Tz: TimeZone>(tz: &Tz, timestamp: NaiveDateTime) -> NaiveDate
 /// and a timestamp read under the wrong site's name is exactly the mismatch this
 /// exists to prevent. During that window this reports `None` for the new site,
 /// which fetches unconditionally — which is what a site with nothing loaded wants.
-fn latest_scan_time_for_site(
+pub(super) fn latest_scan_time_for_site(
     panes: &[rustdar_egui::pane::PaneState],
     site: &str,
 ) -> Option<NaiveDateTime> {

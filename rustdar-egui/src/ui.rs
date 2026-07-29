@@ -130,6 +130,25 @@ impl AutoPollState {
     }
 }
 
+/// What the real-time chunk feed is doing for the sites on screen.
+///
+/// A summary rather than the feeds themselves: the status bar wants one line,
+/// and every field here is something a user can act on — whether the low-latency
+/// path is running, how often it checks, and when the archive will be consulted
+/// next if it is not.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChunkFeedStatus {
+    /// Some live site is being fed from the real-time bucket.
+    pub feeding: bool,
+    /// A live site had its feed retired and fell back to the archive. Worth
+    /// saying out loud: it is a silent drop from seconds of latency to minutes.
+    pub retired: bool,
+    /// The feed's own poll cadence, in seconds.
+    pub interval_secs: u64,
+    /// Elevation cuts this feed has completed for the volume in progress.
+    pub cuts_this_volume: usize,
+}
+
 /// Time editing dialog state.
 pub(super) struct TimeDialogState {
     pub date_string: String,
@@ -142,6 +161,8 @@ pub struct Gui {
     auto_poll: AutoPollState,
     /// See [`Gui::live_chunks_enabled`].
     live_chunks: bool,
+    /// What the real-time feed is doing, refreshed each frame by the App.
+    chunk_status: ChunkFeedStatus,
     time_dialog: TimeDialogState,
     initial_zoom_set: bool,
     // --- Map tiles (shared across panes) ---
@@ -515,6 +536,7 @@ impl Gui {
                 error_message: None,
             },
             live_chunks: true,
+            chunk_status: ChunkFeedStatus::default(),
             auto_poll: AutoPollState {
                 last_fetch_time: None,
                 enabled: true,
@@ -812,6 +834,18 @@ impl Gui {
         self.live_chunks = enabled;
     }
 
+    /// Publish what the real-time feed is doing, so the status bar can say so.
+    ///
+    /// Pushed in by the App each frame rather than pulled: the feeds live there,
+    /// and this crate has no business reaching into them.
+    pub fn set_chunk_status(&mut self, status: ChunkFeedStatus) {
+        self.chunk_status = status;
+    }
+
+    pub fn chunk_status(&self) -> &ChunkFeedStatus {
+        &self.chunk_status
+    }
+
     /// The distinct sites some pane is watching live — the unit the chunk feed
     /// and the archive auto-poll both work in.
     pub fn live_sites(&self) -> Vec<String> {
@@ -871,6 +905,14 @@ impl Gui {
             return true;
         }
         false
+    }
+
+    /// Whether a fetch someone is waiting on is in flight.
+    ///
+    /// Global rather than per-site, and it gates `check_auto_polls` — so any
+    /// path that raises it has to lower it on every exit.
+    pub fn fetching(&self) -> bool {
+        self.radar.fetching
     }
 
     /// Set fetching status

@@ -810,6 +810,25 @@ impl App {
                                     .is_some_and(|p| p.site == site && p.viewing_live)
                             })
                         };
+                        // An archive volume for a site the chunk feed has already
+                        // moved past.
+                        //
+                        // The archive publishes a volume only once every cut is
+                        // finished, so what it returns while a feed is running is
+                        // by construction the volume *before* the one being
+                        // assembled. Applying it walks the display backwards by a
+                        // whole volume — which is what a user pressing Refresh
+                        // least expects, and how this was found.
+                        //
+                        // The volume is still real and still complete, so it goes
+                        // to the loops and the cache; only the live display is
+                        // left alone. Once the feed retires `chunks_are_feeding`
+                        // goes false and the archive is applied unconditionally,
+                        // which is the whole point of the fallback.
+                        let feed_is_ahead = self.chunks_are_feeding(&site)
+                            && fetch::latest_scan_time_for_site(self.gui.panes(), &site)
+                                .is_some_and(|shown| timestamp <= shown);
+
                         if scan_resp.is_auto_poll && !any_pane_live_for_site {
                             log::info!("Auto-poll: caching scan (historic mode) @ {}", timestamp);
                             self.append_scan_to_active_loops(
@@ -819,6 +838,19 @@ impl App {
                             );
                             self.latest_cached_scans
                                 .insert(site, (scan_arc, scan_info, timestamp));
+                        } else if feed_is_ahead {
+                            log::info!(
+                                "Keeping the real-time volume for {site}: the archive's \
+                                 latest is {timestamp}, which is not newer"
+                            );
+                            self.append_scan_to_active_loops(&site, timestamp, scan_arc);
+                            // The wait this fetch belonged to still has to end.
+                            // A Refresh raises `fetching`, and `check_auto_polls`
+                            // refuses to poll while it is set — so skipping
+                            // `set_scan_info_for_site` without this leaves the
+                            // spinner up and the archive poll wedged behind it.
+                            self.gui.set_fetching(false);
+                            self.gui.clear_loading_site_for_site(&site);
                         } else {
                             log::info!("Received scan data from background thread");
                             self.scan_data.insert(site.clone(), Arc::clone(&scan_arc));
@@ -2530,7 +2562,7 @@ mod tests {
     /// applied at all, and an empty volume is the cheapest one this crate can
     /// build. `ScanInfo::from_scan` handles it — it falls back to the requested
     /// timestamp when there is no radial to date the volume from.
-    fn empty_scan() -> nexrad_model::data::Scan {
+    pub(super) fn empty_scan() -> nexrad_model::data::Scan {
         use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
         Scan::new(
             VolumeCoveragePattern::new(
@@ -2946,6 +2978,148 @@ mod tests {
         assert!(
             !app.platform.gps_active(),
             "the reader kept the serial port open after being told to stop",
+        );
+    }
+}
+
+#[cfg(test)]
+mod chunk_feed_precedence_tests {
+    use super::tests::{empty_scan, headless};
+    use super::*;
+    use crate::platform_double::TestBridge;
+
+    fn at(minute: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 28)
+            .unwrap()
+            .and_hms_opt(18, minute, 0)
+            .unwrap()
+    }
+
+    /// A live pane on KTLX already showing a volume assembled at `shown`.
+    fn app_showing(shown: chrono::NaiveDateTime) -> App {
+        let mut app = headless(TestBridge::desktop());
+        {
+            let pane = app.gui.pane_mut(0).unwrap();
+            pane.site = "KTLX".to_string();
+            pane.viewing_live = true;
+            pane.scan_info = Some(rustdar_radar::types::ScanInfo {
+                site: rustdar_radar::sites::RadarSite {
+                    name: "KTLX",
+                    lat: 35.3,
+                    lon: -97.3,
+                    elev: None,
+                },
+                timestamp: shown,
+                vcp_number: 212,
+                available_products: Vec::new(),
+                product_elevations: Default::default(),
+                status: String::new(),
+            });
+        }
+        app
+    }
+
+    fn send_archive(app: &App, timestamp: chrono::NaiveDateTime) {
+        let generation = app.render.fetch_generation_for("KTLX");
+        app.channels
+            .scan_sender
+            .send(crate::channels::ScanResponse {
+                generation,
+                site: "KTLX".to_string(),
+                result: Ok(crate::channels::ScanData {
+                    scan: empty_scan(),
+                    site: "KTLX".to_string(),
+                    timestamp,
+                }),
+                is_auto_poll: false,
+            })
+            .unwrap();
+    }
+
+    /// The bug this closes: pressing Refresh while the real-time feed was ahead
+    /// reverted the display to the previous archive volume.
+    ///
+    /// The archive publishes a volume only once every cut is finished, so what a
+    /// Refresh returns while a feed is running is by construction the volume
+    /// *before* the one being assembled — several minutes older than what is on
+    /// screen.
+    #[test]
+    fn an_archive_volume_older_than_the_feed_does_not_replace_it() {
+        let mut app = app_showing(at(10));
+        app.chunk_feeds.ensure("KTLX");
+        assert!(app.chunks_are_feeding("KTLX"), "precondition: feed running");
+
+        send_archive(&app, at(5));
+        app.poll_data_channels();
+
+        assert_eq!(
+            app.gui
+                .pane(0)
+                .unwrap()
+                .scan_info
+                .as_ref()
+                .unwrap()
+                .timestamp,
+            at(10),
+            "Refresh walked the display back to the previous archive volume"
+        );
+        assert!(
+            !app.scan_data.contains_key("KTLX"),
+            "and it replaced the volume the panes render from"
+        );
+    }
+
+    /// The wait still has to end. A Refresh raises `fetching`, and
+    /// `check_auto_polls` refuses to poll while it is set, so a skipped apply
+    /// that left it up would wedge the archive poll behind a spinner that
+    /// nothing takes down.
+    #[test]
+    fn a_skipped_archive_volume_still_ends_the_wait_it_belonged_to() {
+        let mut app = app_showing(at(10));
+        app.chunk_feeds.ensure("KTLX");
+        app.gui.set_fetching(true);
+        app.gui.pane_mut(0).unwrap().loading_site = Some("KTLX".to_string());
+
+        send_archive(&app, at(5));
+        app.poll_data_channels();
+
+        assert!(!app.gui.fetching(), "the spinner was left up");
+        assert!(
+            app.gui.pane(0).unwrap().loading_site.is_none(),
+            "and the pane's loading marker with it"
+        );
+    }
+
+    /// The counterweight: a genuinely newer archive volume is still applied, or
+    /// the guard would freeze the display whenever a feed existed.
+    #[test]
+    fn an_archive_volume_newer_than_the_feed_is_applied() {
+        let mut app = app_showing(at(10));
+        app.chunk_feeds.ensure("KTLX");
+
+        send_archive(&app, at(15));
+        app.poll_data_channels();
+
+        assert!(
+            app.scan_data.contains_key("KTLX"),
+            "a newer archive volume was refused"
+        );
+    }
+
+    /// And with no feed running the archive is authoritative, which is what the
+    /// fallback depends on — a retired feed leaves the site here.
+    #[test]
+    fn without_a_feed_the_archive_is_applied_unconditionally() {
+        let mut app = app_showing(at(10));
+        assert!(!app.chunks_are_feeding("KTLX"));
+
+        send_archive(&app, at(5));
+        app.poll_data_channels();
+
+        assert!(
+            app.scan_data.contains_key("KTLX"),
+            "the fallback cannot restore a site if an older archive volume is \
+             refused when no feed is running"
         );
     }
 }

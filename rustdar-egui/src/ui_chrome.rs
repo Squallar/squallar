@@ -239,8 +239,12 @@ impl super::Gui {
                     ui.separator();
 
                     if roomy {
-                        let drawn =
-                            render_auto_poll_status(ui, self.radar.fetching, &mut self.auto_poll);
+                        let drawn = render_auto_poll_status(
+                            ui,
+                            self.radar.fetching,
+                            &mut self.auto_poll,
+                            &self.chunk_status,
+                        );
                         #[cfg(test)]
                         {
                             probe.auto_poll = drawn;
@@ -434,10 +438,17 @@ impl super::Gui {
 
 /// Returns the checkbox's rect when one was drawn — while a fetch is running
 /// there is a spinner instead.
+///
+/// The label is three-valued because the two transports differ by two orders of
+/// magnitude in latency and the user cannot otherwise tell which one they are
+/// on. A feed that has silently retired takes a site from seconds behind the
+/// radar to minutes behind it, which is exactly the kind of downgrade a severe
+/// weather display should say out loud rather than absorb.
 fn render_auto_poll_status(
     ui: &mut egui::Ui,
     fetching: bool,
     auto_poll: &mut super::AutoPollState,
+    chunks: &super::ChunkFeedStatus,
 ) -> Option<egui::Rect> {
     if fetching {
         ui.label("\u{1f504}");
@@ -445,11 +456,46 @@ fn render_auto_poll_status(
         ui.spinner();
         return None;
     }
-    let label = match auto_poll.time_until_next() {
-        Some(remaining) if auto_poll.enabled => format!("Auto-poll (next in {}s)", remaining),
-        _ => "Auto-poll".to_owned(),
+
+    let archive = match auto_poll.time_until_next() {
+        Some(remaining) if auto_poll.enabled => format!("archive {remaining}s"),
+        _ => "archive off".to_owned(),
     };
-    Some(ui.checkbox(&mut auto_poll.enabled, label).rect)
+
+    let label = if chunks.feeding {
+        // The archive poll is suppressed while a feed is running, so its
+        // countdown would be misleading here; what matters is the live cadence
+        // and that cuts are actually landing.
+        let cuts = match chunks.cuts_this_volume {
+            0 => "waiting for a cut".to_owned(),
+            1 => "1 cut".to_owned(),
+            n => format!("{n} cuts"),
+        };
+        format!(
+            "\u{26a1} Live \u{2014} real-time {}s, {cuts}",
+            chunks.interval_secs
+        )
+    } else if chunks.retired {
+        format!("\u{26a0} Live \u{2014} real-time unavailable, {archive}")
+    } else {
+        format!("Auto-poll ({archive})")
+    };
+
+    let response = ui.checkbox(&mut auto_poll.enabled, label);
+    let response = if chunks.feeding {
+        response.on_hover_text(
+            "Assembling this volume from the real-time chunk feed, seconds \
+             behind the radar. The archive is polled only if the feed stops.",
+        )
+    } else if chunks.retired {
+        response.on_hover_text(
+            "The real-time feed stopped responding for this site; falling back \
+             to completed archive volumes, which are several minutes old.",
+        )
+    } else {
+        response
+    };
+    Some(response.rect)
 }
 
 /// The scan summary. `roomy` picks the long form; a compact bar has room for
