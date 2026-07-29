@@ -25,7 +25,15 @@ impl super::App {
         let live = self.gui.live_sites();
         // Published every frame, including when the feed is off or retired, so
         // the status bar never shows a stale claim about the transport.
-        let status = self.chunk_feeds.status(&live, enabled);
+        let showing = self
+            .gui
+            .get_rendering_params_for_pane(self.gui.active_pane_idx())
+            .map(|(_, elevation)| (self.gui.active_pane().site.clone(), elevation));
+        let status = self.chunk_feeds.status(
+            &live,
+            enabled,
+            showing.as_ref().map(|(s, e)| (s.as_str(), *e)),
+        );
         self.gui.set_chunk_status(status);
         if !enabled {
             return;
@@ -130,6 +138,7 @@ impl super::App {
             self.gui.clear_loading_site_for_site(site);
             self.render.reset_panes_for_site(site, &self.gui);
             self.spawn_level3_fetches(site);
+            self.record_tilt_freshness(site, &scan, &outcome.sealed_elevations);
             // Only now: `append_polled_frame` dedupes by timestamp and a
             // `LoopFrame` has no "the scan got better" transition, so a frame
             // appended mid-volume would freeze on a one-cut volume forever.
@@ -137,6 +146,7 @@ impl super::App {
         } else {
             self.gui.apply_chunk_scan_info(site, info);
             self.gui.clear_loading_site_for_site(site);
+            self.record_tilt_freshness(site, &scan, &outcome.sealed_elevations);
             let have_winds = self.render.vwp_levels.contains_key(site);
             let hit = self.render.reset_panes_for_tilts(
                 site,
@@ -153,6 +163,42 @@ impl super::App {
         // to user navigation and would drag the time picker along every few
         // seconds, and `manual_nav_pending`, which would trigger
         // `reinit_active_loops` and re-list the whole lookback window per round.
+    }
+
+    /// Stamp each freshly delivered cut with the age of its newest radial.
+    ///
+    /// Taken from the sweep rather than from the wall clock at arrival: what a
+    /// user wants to know is how long ago the *radar* looked, and a chunk can
+    /// sit in the bucket or in a retry before it gets here.
+    fn record_tilt_freshness(
+        &mut self,
+        site: &str,
+        scan: &nexrad_model::data::Scan,
+        sealed: &[u8],
+    ) {
+        let now = chrono::Utc::now();
+        for elevation_number in sealed {
+            let Some(sweep) = scan
+                .sweeps()
+                .iter()
+                .find(|s| s.elevation_number() == *elevation_number)
+            else {
+                continue;
+            };
+            let Some(angle) = sweep.elevation_angle_degrees() else {
+                continue;
+            };
+            let newest = sweep
+                .radials()
+                .iter()
+                .map(|r| r.collection_timestamp())
+                .max()
+                .and_then(chrono::DateTime::from_timestamp_millis);
+            let age = newest
+                .map(|t| (now - t).to_std().unwrap_or_default())
+                .unwrap_or_default();
+            self.chunk_feeds.record_delivery(site, angle, age);
+        }
     }
 
     /// Hand a site back to the archive path.

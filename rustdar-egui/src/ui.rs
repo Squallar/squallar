@@ -130,13 +130,28 @@ impl AutoPollState {
     }
 }
 
-/// What the real-time chunk feed is doing for the sites on screen.
+/// How fresh the tilt on screen is.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TiltFreshness {
+    /// The elevation the active pane is actually rendering — the snapped angle,
+    /// not the one the user selected.
+    pub elevation: f32,
+    /// Seconds since the radar collected the newest radial in that sweep.
+    ///
+    /// Counts up between cuts and drops back when the beam returns, so it reads
+    /// as the real cadence of the tilt rather than as a countdown to a poll.
+    /// This is the number the feature exists to make small.
+    pub data_age_secs: u64,
+}
+
+/// What the real-time chunk feed is doing for the pane on screen.
 ///
-/// A summary rather than the feeds themselves: the status bar wants one line,
-/// and every field here is something a user can act on — whether the low-latency
-/// path is running, how often it checks, and when the archive will be consulted
-/// next if it is not.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Deliberately about *the tilt being shown* rather than about the feed's
+/// progress through the volume. A count of completed cuts is operator jargon and
+/// answers the wrong question: what a user needs to know is whether the image in
+/// front of them is current, and a volume can be most of the way assembled while
+/// their own tilt is still minutes old.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ChunkFeedStatus {
     /// Some live site is being fed from the real-time bucket.
     pub feeding: bool,
@@ -145,8 +160,8 @@ pub struct ChunkFeedStatus {
     pub retired: bool,
     /// The feed's own poll cadence, in seconds.
     pub interval_secs: u64,
-    /// Elevation cuts this feed has completed for the volume in progress.
-    pub cuts_this_volume: usize,
+    /// The active pane's tilt, once the feed has delivered it at least once.
+    pub tilt: Option<TiltFreshness>,
 }
 
 /// Time editing dialog state.

@@ -90,10 +90,31 @@ impl SiteFeed {
     }
 }
 
+/// Elevation in tenths of a degree, so two angles that round to the same tilt
+/// share a key — the same rounding `render_dispatch` and `ScanInfo` use.
+fn elevation_tenths(elevation: f32) -> i32 {
+    (elevation * 10.0).round() as i32
+}
+
+/// When a tilt was last delivered, and how old its data was at that moment.
+///
+/// Recorded on apply rather than recomputed each frame: the age now is that
+/// number plus the wall clock since, which is exact and O(1). Rescanning the
+/// sweep's radials for their newest timestamp every frame would be hundreds of
+/// iterations per frame for a value that only changes when a cut lands.
+#[derive(Debug, Clone, Copy)]
+struct Delivered {
+    age_at_apply: std::time::Duration,
+    at: web_time::Instant,
+}
+
 /// Every site being fed from the real-time bucket.
 #[derive(Default)]
 pub struct ChunkFeedManager {
     feeds: HashMap<String, SiteFeed>,
+    /// Keyed by site and elevation in tenths of a degree, matching
+    /// `render_dispatch`'s cache key.
+    delivered: HashMap<(String, i32), Delivered>,
 }
 
 impl ChunkFeedManager {
@@ -200,13 +221,21 @@ impl ChunkFeedManager {
     /// `retired` is reported only for a site that *was* being fed and is not
     /// any more, so a site that never had a feed reads as plain auto-poll rather
     /// than as a failure.
-    pub fn status(&self, live_sites: &[String], enabled: bool) -> rustdar_egui::ChunkFeedStatus {
+    pub fn status(
+        &self,
+        live_sites: &[String],
+        enabled: bool,
+        showing: Option<(&str, f32)>,
+    ) -> rustdar_egui::ChunkFeedStatus {
         let mut status = rustdar_egui::ChunkFeedStatus {
             interval_secs: rustdar_radar::chunks::POLL_INTERVAL.as_secs(),
             ..Default::default()
         };
         if !enabled {
             return status;
+        }
+        if let Some((site, elevation)) = showing {
+            status.tilt = self.freshness(site, elevation);
         }
         for site in live_sites {
             let Some(feed) = self.feeds.get(site) else {
@@ -219,13 +248,31 @@ impl ChunkFeedManager {
             status.feeding = true;
             if let Some(poller) = &feed.poller {
                 status.interval_secs = poller.suggested_interval().as_secs();
-                status.cuts_this_volume = poller
-                    .progress()
-                    .map(|p| p.sealed_elevations.len())
-                    .unwrap_or(0);
             }
         }
         status
+    }
+
+    /// Note that a tilt was just delivered, with the age of its newest radial.
+    pub fn record_delivery(&mut self, site: &str, elevation: f32, age: std::time::Duration) {
+        self.delivered.insert(
+            (site.to_string(), elevation_tenths(elevation)),
+            Delivered {
+                age_at_apply: age,
+                at: web_time::Instant::now(),
+            },
+        );
+    }
+
+    /// How stale the tilt on screen is now, if the feed has ever delivered it.
+    pub fn freshness(&self, site: &str, elevation: f32) -> Option<rustdar_egui::TiltFreshness> {
+        let d = self
+            .delivered
+            .get(&(site.to_string(), elevation_tenths(elevation)))?;
+        Some(rustdar_egui::TiltFreshness {
+            elevation,
+            data_age_secs: (d.age_at_apply + d.at.elapsed()).as_secs(),
+        })
     }
 
     /// The volume so far for a site, complete sweeps only.
@@ -254,6 +301,8 @@ impl ChunkFeedManager {
     pub fn retain_live(&mut self, live_sites: &[String]) {
         self.feeds
             .retain(|site, _| live_sites.iter().any(|s| s == site));
+        self.delivered
+            .retain(|(site, _), _| live_sites.iter().any(|s| s == site));
     }
 
     #[cfg(test)]
@@ -455,7 +504,7 @@ mod status_tests {
     fn the_status_says_nothing_when_the_feed_is_disabled() {
         let mut mgr = ChunkFeedManager::new();
         mgr.ensure("KTLX");
-        let status = mgr.status(&live(&["KTLX"]), false);
+        let status = mgr.status(&live(&["KTLX"]), false, None);
         assert!(!status.feeding);
         assert!(!status.retired);
     }
@@ -464,7 +513,7 @@ mod status_tests {
     #[test]
     fn a_site_that_never_had_a_feed_is_not_reported_as_retired() {
         let mgr = ChunkFeedManager::new();
-        let status = mgr.status(&live(&["KTLX"]), true);
+        let status = mgr.status(&live(&["KTLX"]), true, None);
         assert!(!status.feeding);
         assert!(
             !status.retired,
@@ -479,7 +528,7 @@ mod status_tests {
     fn a_running_feed_reports_its_own_interval() {
         let mut mgr = ChunkFeedManager::new();
         mgr.ensure("KTLX");
-        let status = mgr.status(&live(&["KTLX"]), true);
+        let status = mgr.status(&live(&["KTLX"]), true, None);
         assert!(status.feeding);
         assert_eq!(
             status.interval_secs,
@@ -494,7 +543,7 @@ mod status_tests {
         let mut mgr = ChunkFeedManager::new();
         mgr.ensure("KTLX");
         mgr.force_retire_at("KTLX", std::time::Duration::from_secs(1));
-        let status = mgr.status(&live(&["KTLX"]), true);
+        let status = mgr.status(&live(&["KTLX"]), true, None);
         assert!(status.retired);
         assert!(!status.feeding);
     }
@@ -507,8 +556,80 @@ mod status_tests {
         mgr.ensure("KTLX");
         mgr.ensure("KOUN");
         mgr.force_retire_at("KOUN", std::time::Duration::from_secs(1));
-        let status = mgr.status(&live(&["KTLX", "KOUN"]), true);
+        let status = mgr.status(&live(&["KTLX", "KOUN"]), true, None);
         assert!(status.feeding);
         assert!(status.retired);
+    }
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+
+    fn live(sites: &[&str]) -> Vec<String> {
+        sites.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// The label is about the tilt on screen, so a tilt the feed has never
+    /// delivered reports nothing rather than borrowing another tilt's age —
+    /// which would claim the upper tilt was seconds old when it is a volume
+    /// behind.
+    #[test]
+    fn a_tilt_the_feed_has_not_delivered_has_no_age() {
+        let mut mgr = ChunkFeedManager::new();
+        mgr.ensure("KTLX");
+        mgr.record_delivery("KTLX", 0.5, std::time::Duration::from_secs(4));
+
+        assert!(
+            mgr.status(&live(&["KTLX"]), true, Some(("KTLX", 4.0)))
+                .tilt
+                .is_none(),
+            "the 4.0° pane borrowed the 0.5° cut's freshness"
+        );
+        let shown = mgr
+            .status(&live(&["KTLX"]), true, Some(("KTLX", 0.5)))
+            .tilt
+            .expect("the delivered tilt reports an age");
+        assert_eq!(shown.elevation, 0.5);
+        assert!(
+            shown.data_age_secs >= 4,
+            "the age must include how old the data already was when it arrived, \
+             not just the wall clock since"
+        );
+    }
+
+    /// Angles that round to the same tenth are the same tilt — the rounding
+    /// `ScanInfo` and the render cache already use — so a sweep whose radials
+    /// report 0.54° answers for a pane snapped to 0.5°.
+    #[test]
+    fn a_tilt_is_matched_on_the_rounded_angle() {
+        let mut mgr = ChunkFeedManager::new();
+        mgr.ensure("KTLX");
+        mgr.record_delivery("KTLX", 0.54, std::time::Duration::from_secs(1));
+        assert!(
+            mgr.status(&live(&["KTLX"]), true, Some(("KTLX", 0.5)))
+                .tilt
+                .is_some(),
+            "a tilt reported at its achieved angle did not match the snapped one"
+        );
+    }
+
+    /// One site's freshness never answers for another's.
+    #[test]
+    fn freshness_is_per_site() {
+        let mut mgr = ChunkFeedManager::new();
+        mgr.ensure("KTLX");
+        mgr.record_delivery("KTLX", 0.5, std::time::Duration::from_secs(1));
+        assert!(mgr.freshness("KOUN", 0.5).is_none());
+    }
+
+    /// Freshness for a site nothing watches goes with the feed.
+    #[test]
+    fn dropping_a_feed_drops_its_recorded_freshness() {
+        let mut mgr = ChunkFeedManager::new();
+        mgr.ensure("KTLX");
+        mgr.record_delivery("KTLX", 0.5, std::time::Duration::from_secs(1));
+        mgr.retain_live(&[]);
+        assert!(mgr.freshness("KTLX", 0.5).is_none());
     }
 }

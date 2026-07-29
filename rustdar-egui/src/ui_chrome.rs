@@ -436,6 +436,19 @@ impl super::Gui {
     }
 }
 
+/// How stale a tilt is, in words a status bar has room for.
+///
+/// Seconds while the number is small enough to mean "just now", then minutes —
+/// which is also where the archive path permanently lives, so the two transports
+/// read on the same scale.
+fn describe_age(secs: u64) -> String {
+    match secs {
+        0..=9 => "just now".to_owned(),
+        s if s < 90 => format!("{s}s old"),
+        s => format!("{}m old", (s + 30) / 60),
+    }
+}
+
 /// Returns the checkbox's rect when one was drawn — while a fetch is running
 /// there is a spinner instead.
 ///
@@ -463,18 +476,20 @@ fn render_auto_poll_status(
     };
 
     let label = if chunks.feeding {
-        // The archive poll is suppressed while a feed is running, so its
-        // countdown would be misleading here; what matters is the live cadence
-        // and that cuts are actually landing.
-        let cuts = match chunks.cuts_this_volume {
-            0 => "waiting for a cut".to_owned(),
-            1 => "1 cut".to_owned(),
-            n => format!("{n} cuts"),
-        };
-        format!(
-            "\u{26a1} Live \u{2014} real-time {}s, {cuts}",
-            chunks.interval_secs
-        )
+        // About the tilt on screen, not the feed's progress through the volume.
+        // A cut count answers the wrong question — a volume can be nearly
+        // assembled while the user's own tilt is still minutes old — and it is
+        // operator jargon besides. The archive countdown is left out because
+        // that poll is suppressed while a feed runs, so showing it would be a
+        // countdown to something that will not fire.
+        match chunks.tilt {
+            Some(tilt) => format!(
+                "\u{26a1} Live \u{2014} {:.1}\u{b0} {}",
+                tilt.elevation,
+                describe_age(tilt.data_age_secs)
+            ),
+            None => "\u{26a1} Live \u{2014} waiting for this tilt".to_owned(),
+        }
     } else if chunks.retired {
         format!("\u{26a0} Live \u{2014} real-time unavailable, {archive}")
     } else {
@@ -483,10 +498,12 @@ fn render_auto_poll_status(
 
     let response = ui.checkbox(&mut auto_poll.enabled, label);
     let response = if chunks.feeding {
-        response.on_hover_text(
-            "Assembling this volume from the real-time chunk feed, seconds \
-             behind the radar. The archive is polled only if the feed stops.",
-        )
+        response.on_hover_text(format!(
+            "Assembled from the real-time chunk feed, checked every {}s. The age \
+             is how long ago the radar collected this tilt; it climbs until the \
+             beam comes back round. The archive is polled only if the feed stops.",
+            chunks.interval_secs
+        ))
     } else if chunks.retired {
         response.on_hover_text(
             "The real-time feed stopped responding for this site; falling back \
@@ -642,5 +659,38 @@ mod age_format {
         assert_eq!(format_product_age(Duration::minutes(59)), "59 min old");
         assert_eq!(format_product_age(Duration::minutes(60)), "1h 0m old");
         assert_eq!(format_product_age(Duration::minutes(1565)), "26h 5m old");
+    }
+}
+
+#[cfg(test)]
+mod age_wording_tests {
+    use super::describe_age;
+
+    /// Very fresh data reads as "just now" rather than as a jittering
+    /// single-digit counter — the poll is every 5s, so the number would never
+    /// settle.
+    #[test]
+    fn seconds_old_data_reads_as_just_now() {
+        assert_eq!(describe_age(0), "just now");
+        assert_eq!(describe_age(4), "just now");
+        assert_eq!(describe_age(9), "just now");
+    }
+
+    /// Through the middle range the exact second is useful: it is how a user
+    /// sees the beam coming back round.
+    #[test]
+    fn the_middle_range_reads_in_seconds() {
+        assert_eq!(describe_age(10), "10s old");
+        assert_eq!(describe_age(89), "89s old");
+    }
+
+    /// Past ninety seconds it switches to minutes, which is the scale the
+    /// archive path permanently lives on — so the two transports read on one
+    /// scale and the difference between them is obvious.
+    #[test]
+    fn older_data_reads_in_rounded_minutes() {
+        assert_eq!(describe_age(90), "2m old");
+        assert_eq!(describe_age(120), "2m old");
+        assert_eq!(describe_age(330), "6m old");
     }
 }
