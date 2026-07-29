@@ -2,14 +2,51 @@
 //! [`crate::kdp`] for shared consumers (KDP, HCA).
 //!
 //! Everything here is a function-for-function transcription of the released
-//! ORPG source (github likev/CodeOrpgPub): the azimuth recombination task
-//! `cpc004/tsk009` (`recomb`), the dual-pol preprocessor `cpc004/tsk011`
-//! (`dpprep`) and its `calc_system_PhiDP.c` estimator, with the fleet-default
-//! adaptation values from `cpc104/lib006/dpprep.alg`. The full provenance,
-//! validation history and documented gaps live in [`crate::kdp`]'s module
-//! documentation — this module only holds the shared machinery, moved here
-//! verbatim so the hydrometeor classification chain can consume the same
-//! preprocessor without duplicating it.
+//! ORPG source: the azimuth recombination task `cpc004/tsk009` (`recomb`),
+//! the dual-pol preprocessor `cpc004/tsk011` (`dpprep`) and its
+//! `calc_system_PhiDP.c` estimator, with the fleet-default adaptation values
+//! from `cpc104/lib006/dpprep.alg`. Originally transcribed from the Build 16
+//! mirror (github likev/CodeOrpgPub) and cross-checked against the CODE
+//! **Build 21.0r1.7** public source; the full provenance, validation history
+//! and documented gaps live in [`crate::kdp`]'s module documentation — this
+//! module only holds the shared machinery, moved here verbatim so the
+//! hydrometeor classification chain can consume the same preprocessor
+//! without duplicating it.
+//!
+//! # Build 21 delta: Met Signal processing (CCR NA14-00100, fleet ON)
+//!
+//! Build 17 added, and B21's `dpprep.alg` defaults to,
+//! `metsignal_processing = ON`: the meteorological gate flag no longer comes
+//! from `rho_smd ≥ corr_thresh` (or SNR on high-attenuation radials) but from
+//! a fuzzy **met-signal** per gate (`findMetSignal.cpp`): six trapezoidal
+//! votes — Z (weight 2, trap 10..30), ρ (1, trap 0.75..0.9), an inverted |V|
+//! trap (1, −1.5..1.5), and the 9-gate textures of raw φ (2, 0/0/10/20), raw
+//! ZDR (2, 0/0/1/2) and raw ρ (1, 0/0/0.02/0.04) — averaged over the weights
+//! of the present inputs (≥ 4 required), scaled to 0–100, zeroed when
+//! SNR < 0 dB or when ≥ threshold but ρ < 0.65 / ZDR outside ±4.5
+//! ([`find_met_signal`]). `cleanMetSignal.cpp` then dilates the ≥ 80 signal
+//! by one gate, trims it back at run edges, and despeckles runs spanning
+//! < 2 bins to 78.5 ([`clean_met_signal`]). The flag is `met > 80`
+//! (`dpp_process.c`'s strict `<=` → 0), and `Unfold_PhiDP` filters on
+//! `met ≥ 80` instead of ρ ≥ 0.85 — [`unfold_phidp`] is parameterized
+//! accordingly, with the legacy ρ/0.85 pair for `metsignal_processing = OFF`.
+//!
+//! The companion **reflectivity CAPPI** (`ReflCAPPI.cpp`): a persistent
+//! 360° × 1 km grid of raw Z near 3 km ARL, updated from every radial with
+//! elevation ≥ 1° outside 30 km, that rescues weak met-signal gates
+//! (0 < met < 80 → 99.5) below 3 km where the stored CAPPI exceeds 11 dBZ.
+//! Both `update_CAPPI` and `apply_CAPPI` return early for elevations under
+//! 1.0°, so the CAPPI **never touches the lowest split cuts** — it matters
+//! to the melting-layer tilts' inner ranges and to the hybrid-scan tiers.
+//! Operationally the CAPPI persists across volumes (15-minute freshness);
+//! [`ReflCappi`] rebuilds it from the current volume's own ≥ 1° sweeps —
+//! the nearest state a single archived volume can reproduce, one volume
+//! fresher than the operational grid, with the cold-start (no CAPPI) as the
+//! bounded A/B alternative.
+//!
+//! `findBragg` (ZDR-calibration monitoring) and the B21-new `DPRA`/`DPIN`
+//! output phases (DP QPE / CDA consumers) alter no field this chain reads
+//! and are not transcribed.
 
 use nexrad_model::data::{DataMoment, MomentValue, Radial};
 
@@ -418,8 +455,11 @@ pub(crate) fn combine_pair(a: &DpInput, b: &DpInput, coherent: bool) -> Combined
 
 /// `Unfold_PhiDP`, transcribed: the historical median of the previous 30
 /// qualifying gates decides whether φ folded, past gate 240 with enough
-/// valid data accumulated.
-pub(crate) fn unfold_phidp(phi: &mut [f64], rho: &[f64], init_fdp: f64) {
+/// valid data accumulated. B21 parameterizes the qualifying test
+/// (`filtering_data`/`filtering_data_threshold`): the legacy pair is
+/// (ρ, [`UNFOLD_MIN_RHO`]), the `metsignal_processing = ON` pair is the
+/// cleaned met signal with [`MET_SIG_THRESHOLD`].
+pub(crate) fn unfold_phidp(phi: &mut [f64], filter: &[f64], thresh: f64, init_fdp: f64) {
     let n = phi.len();
     let mut unfolded = vec![f64::NAN; n];
     let mut valid_data = 0usize;
@@ -429,15 +469,15 @@ pub(crate) fn unfold_phidp(phi: &mut [f64], rho: &[f64], init_fdp: f64) {
         if phi[i].is_nan() {
             continue;
         }
-        let rho_i = rho.get(i).copied().unwrap_or(f64::NAN);
-        if rho_i >= UNFOLD_MIN_RHO {
+        let f_i = filter.get(i).copied().unwrap_or(f64::NAN);
+        if f_i >= thresh {
             valid_data += 1;
         }
         if i >= HIST_WINDOW {
             hist.clear();
             for j in 1..=HIST_WINDOW {
-                let r = rho.get(i - j).copied().unwrap_or(f64::NAN);
-                if r >= UNFOLD_MIN_RHO && !unfolded[i - j].is_nan() {
+                let f = filter.get(i - j).copied().unwrap_or(f64::NAN);
+                if f >= thresh && !unfolded[i - j].is_nan() {
                     hist.push(unfolded[i - j]);
                 }
             }
@@ -903,6 +943,346 @@ pub(crate) fn std_filter(input: &[f64], smoothed: &[f64], w: usize, max_diff: f6
         .collect()
 }
 
+// ── Met Signal processing (findMetSignal.cpp / cleanMetSignal.cpp, B21) ─────
+
+/// `dpprep.alg`'s `metsignal_threshold` fleet default.
+pub(crate) const MET_SIG_THRESHOLD: f64 = 80.0;
+/// `cleanMetSignal`'s despeckle span (`despeckle_seg_size` at the call site).
+const MET_SIG_DESPECKLE_SPAN: f64 = 2.0;
+/// `cleanMetSignal`'s dilate radius.
+const MET_SIG_DILATE: usize = 1;
+
+/// `trap4point`: the plateau-inclusive trapezoid with the degenerate guard.
+/// Shared with the HCA chain's HSDA (`HailSize.cpp` links the same
+/// `trapazoid.cpp`).
+pub(crate) fn trap4(input: f64, x1: f64, x2: f64, x3: f64, x4: f64) -> f64 {
+    if x2 - x1 < 0.0 || x3 - x2 < 0.0 || x4 - x3 < 0.0 {
+        return 0.0;
+    }
+    if input >= x2 && input <= x3 {
+        1.0
+    } else if input <= x1 || input >= x4 {
+        0.0
+    } else if input > x1 && input < x2 {
+        (input - x1) / (x2 - x1)
+    } else if input > x3 && input < x4 {
+        (x4 - input) / (x4 - x3)
+    } else {
+        0.0 // NaN input matches no branch in the C either
+    }
+}
+
+/// `nint`: round half away from zero, the source's own helper.
+fn nint(v: f64) -> i64 {
+    if v >= 0.0 {
+        (v + 0.5) as i64
+    } else {
+        (v - 0.5) as i64
+    }
+}
+
+/// `findMetSignal`: the fuzzy met-signal per gate, 0–100. All inputs are at
+/// the DP gates in the NaN domain — `z` and `snr` sampled there by the
+/// caller (the C indexes its Z-gate arrays directly, the geometries being
+/// identical) — with `phi` the **raw** phase (pre-unfold) and `zdr`/`rho`
+/// raw, exactly as `Dpp_process_radial` calls it. `snr` is from the 3-gate
+/// smoothed Z.
+pub(crate) fn find_met_signal(
+    z: &[f64],
+    vel: &[f64],
+    zdr: &[f64],
+    rho: &[f64],
+    phi: &[f64],
+    snr: &[f64],
+) -> Vec<f64> {
+    let n = phi.len();
+    let std_phi = std_filter(phi, &average_filter(phi, SHORT_GATE), SHORT_GATE, 100.0);
+    let std_zdr = std_filter(zdr, &average_filter(zdr, SHORT_GATE), SHORT_GATE, 100.0);
+    let std_rho = std_filter(rho, &average_filter(rho, SHORT_GATE), SHORT_GATE, 100.0);
+
+    const Z_WEIGHT: f64 = 2.0;
+    const RHV_WEIGHT: f64 = 1.0;
+    const V_WEIGHT: f64 = 1.0;
+    const STD_ZDR_WEIGHT: f64 = 2.0;
+    const STD_PHI_WEIGHT: f64 = 2.0;
+    const STD_RHO_WEIGHT: f64 = 1.0;
+
+    let mut met = vec![0.0f64; n];
+    for i in 0..n {
+        let snr_i = snr.get(i).copied().unwrap_or(f64::NAN);
+        // SNR below 0 dB (or missing — the sentinel is negative) is not met.
+        if snr_i.is_nan() || snr_i < 0.0 {
+            continue;
+        }
+        let mut sv = 0.0f64;
+        let mut weight = 0.0f64;
+        let mut num_s = 0usize;
+        let z_i = z.get(i).copied().unwrap_or(f64::NAN);
+        if z_i.is_finite() {
+            sv += Z_WEIGHT * trap4(z_i, 10.0, 30.0, f64::INFINITY, f64::INFINITY);
+            num_s += 1;
+            weight += Z_WEIGHT;
+        }
+        let rho_i = rho.get(i).copied().unwrap_or(f64::NAN);
+        if rho_i.is_finite() {
+            sv += RHV_WEIGHT * trap4(rho_i, 0.75, 0.9, f64::INFINITY, f64::INFINITY);
+            num_s += 1;
+            weight += RHV_WEIGHT;
+        }
+        let v_i = vel.get(i).copied().unwrap_or(f64::NAN);
+        if v_i.is_finite() {
+            // The source spells the inverted trapezoid exactly this way.
+            sv += 1.0 - V_WEIGHT * trap4(v_i, -1.5, -1.0, 1.0, 1.5);
+            num_s += 1;
+            weight += V_WEIGHT;
+        }
+        if std_phi[i].is_finite() {
+            sv += STD_PHI_WEIGHT * trap4(std_phi[i], 0.0, 0.0, 10.0, 20.0);
+            num_s += 1;
+            weight += STD_PHI_WEIGHT;
+        }
+        if std_zdr[i].is_finite() {
+            sv += STD_ZDR_WEIGHT * trap4(std_zdr[i], 0.0, 0.0, 1.0, 2.0);
+            num_s += 1;
+            weight += STD_ZDR_WEIGHT;
+        }
+        if std_rho[i].is_finite() {
+            sv += STD_RHO_WEIGHT * trap4(std_rho[i], 0.0, 0.0, 0.02, 0.04);
+            num_s += 1;
+            weight += STD_RHO_WEIGHT;
+        }
+        if num_s < 4 {
+            continue; // met stays 0
+        }
+        met[i] = nint(sv / weight * 100.0) as f64;
+        // Hard limits: a qualifying signal with depressed ρ or extreme ZDR
+        // (either missing — the C sentinel fails these tests too) is not met.
+        let zdr_i = zdr.get(i).copied().unwrap_or(f64::NAN);
+        let rho_fails = rho_i.is_nan() || rho_i < 0.65;
+        let zdr_fails = zdr_i.is_nan() || !(-4.5..=4.5).contains(&zdr_i);
+        if met[i] >= MET_SIG_THRESHOLD && (rho_fails || zdr_fails) {
+            met[i] = 0.0;
+        }
+    }
+    met
+}
+
+/// `cleanMetSignal`: dilate the ≥ threshold signal by one gate, trim it back
+/// at run edges, then despeckle runs spanning fewer than 2 bins down to
+/// `threshold − 1.5`.
+pub(crate) fn clean_met_signal(met: &mut [f64], threshold: f64) {
+    let n = met.len();
+    if n <= 2 * MET_SIG_DILATE {
+        return;
+    }
+    let mut temp = met.to_vec();
+
+    // Dilate.
+    for (b, &m) in met
+        .iter()
+        .enumerate()
+        .take(n - MET_SIG_DILATE)
+        .skip(MET_SIG_DILATE)
+    {
+        if m.is_finite() && m >= threshold {
+            for cell in temp
+                .iter_mut()
+                .take(b + MET_SIG_DILATE + 1)
+                .skip(b - MET_SIG_DILATE)
+            {
+                if *cell < threshold {
+                    *cell = threshold;
+                }
+            }
+        }
+    }
+
+    // Trim back to the original values at run transitions.
+    let mut signal = temp[0] >= threshold;
+    for b in MET_SIG_DILATE..(n - MET_SIG_DILATE) {
+        if temp[b] >= threshold {
+            if !signal {
+                // New data found: trim [b, b + dilate) to the original.
+                temp[b..b + MET_SIG_DILATE].copy_from_slice(&met[b..b + MET_SIG_DILATE]);
+            }
+            signal = true;
+        } else {
+            if signal {
+                // Data stopped: trim [b − dilate, b) to the original.
+                temp[b - MET_SIG_DILATE..b].copy_from_slice(&met[b - MET_SIG_DILATE..b]);
+            }
+            signal = false;
+        }
+    }
+    met.copy_from_slice(&temp);
+
+    // Despeckle isolated runs; the trailing run is never flushed, per the C.
+    let (mut beg, mut end): (Option<usize>, Option<usize>) = (None, None);
+    for b in 0..n {
+        if met[b].is_finite() && met[b] >= threshold {
+            if beg.is_none() {
+                beg = Some(b);
+            }
+            end = Some(b);
+        } else {
+            if let (Some(bi), Some(ei)) = (beg, end)
+                && ((ei as f64) - (bi as f64)).abs() < MET_SIG_DESPECKLE_SPAN
+            {
+                for cell in met.iter_mut().take(ei + 1).skip(bi) {
+                    *cell = threshold - 1.5;
+                }
+            }
+            beg = None;
+            end = None;
+        }
+    }
+}
+
+// ── Reflectivity CAPPI (ReflCAPPI.cpp, B21) ──────────────────────────────────
+
+/// `CAPPI_height` / `CAPPI_threshold` fleet defaults (`dpprep.alg`).
+pub(crate) const CAPPI_HEIGHT_KM: f64 = 3.0;
+pub(crate) const CAPPI_REFL_THRESH_DBZ: f64 = 11.0;
+/// `MIN_CAPPI_RANGE`: no update inside this range.
+const CAPPI_MIN_RANGE_KM: f64 = 30.0;
+/// `METSIG_CAPPI_OVERRIDE`.
+const CAPPI_OVERRIDE: f64 = 99.5;
+/// `checkCAPPIHeight`'s height tolerance.
+const CAPPI_TOLERANCE_KM: f64 = 0.2;
+const CAPPI_NUM_GATES: usize = 300;
+const CAPPI_AZ_OFFSET: f64 = 0.25;
+const CAPPI_UNSET_HEIGHT: f64 = 9999.0;
+
+/// `computeHeight_b5`: beam height above the radar, km, on the B5 spec's
+/// `1.21·6371 km` effective Earth — the same model `RPGCS_height` and the
+/// MLDA use.
+pub(crate) fn height_b5_km(elev_deg: f64, range_km: f64) -> f64 {
+    let s = elev_deg.to_radians().sin();
+    range_km * s + range_km * range_km / (2.0 * 1.21 * 6371.0)
+}
+
+/// The persistent reflectivity CAPPI the met-signal chain consults
+/// (`ReflCAPPI.cpp`): raw Z near 3 km ARL on a 360° × 1 km grid.
+///
+/// Operationally this survives across volumes with a 15-minute freshness
+/// window; here it is rebuilt from one volume's own ≥ 1° sweeps (every
+/// radial inside a volume is within that window), which stands one volume
+/// fresher than the grid the RPG consulted for the same cut.
+pub struct ReflCappi {
+    /// `[az][1-km range]`, raw dBZ, `NaN` empty.
+    z: Vec<[f64; CAPPI_NUM_GATES]>,
+    /// The actual beam height stored per range column (`CAPPI_Heights`).
+    heights: [f64; CAPPI_NUM_GATES],
+}
+
+impl Default for ReflCappi {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReflCappi {
+    pub(crate) fn new() -> Self {
+        Self {
+            z: vec![[f64::NAN; CAPPI_NUM_GATES]; 360],
+            heights: [CAPPI_UNSET_HEIGHT; CAPPI_NUM_GATES],
+        }
+    }
+
+    /// `check_Az` + the double-`nint` azimuth indexing of the source.
+    fn az_index(az_deg: f64) -> usize {
+        let check = |a: f64| a.rem_euclid(360.0);
+        let inner = nint(check(az_deg - CAPPI_AZ_OFFSET)) as f64;
+        (nint(check(inner)) as usize) % 360
+    }
+
+    /// `update_CAPPI`: store this radial's raw Z into the columns whose beam
+    /// height sits nearest the CAPPI height. Radials under 1.0° never update.
+    pub(crate) fn update_radial(
+        &mut self,
+        elev_deg: f64,
+        az_deg: f64,
+        zr0: f64,
+        zg: f64,
+        z: &[f64],
+    ) {
+        if elev_deg < 1.0 {
+            return;
+        }
+        let az = Self::az_index(az_deg);
+        let cos_e = elev_deg.to_radians().cos();
+
+        // checkCAPPIHeight: the UseFLAG pass, mutating the height store.
+        let mut use_flag = vec![false; z.len()];
+        for (b, flag) in use_flag.iter_mut().enumerate() {
+            let range = zr0 + b as f64 * zg;
+            let h = height_b5_km(elev_deg, range);
+            let ri = nint((range - zr0) * cos_e);
+            if ri >= CAPPI_NUM_GATES as i64 {
+                break;
+            }
+            let ri = ri.max(0) as usize;
+            let stored = self.heights[ri];
+            if (h - CAPPI_HEIGHT_KM).abs() <= (stored - CAPPI_HEIGHT_KM).abs() + CAPPI_TOLERANCE_KM
+                || stored == CAPPI_UNSET_HEIGHT
+            {
+                self.heights[ri] = h;
+                *flag = true;
+            }
+            if range < CAPPI_MIN_RANGE_KM {
+                *flag = false;
+            }
+        }
+
+        for (b, &v) in z.iter().enumerate() {
+            let range = zr0 + b as f64 * zg;
+            let ri = nint((range - zr0) * cos_e);
+            if ri >= CAPPI_NUM_GATES as i64 {
+                break;
+            }
+            if use_flag[b] {
+                self.z[az][ri.max(0) as usize] = v;
+            }
+        }
+    }
+
+    /// `apply_CAPPI`: rescue weak met-signal gates (0 < met < threshold)
+    /// below the CAPPI height where the stored Z exceeds 11 dBZ. Radials
+    /// under 1.0° are never touched — the lowest split cuts see no CAPPI.
+    pub(crate) fn apply_radial(
+        &self,
+        elev_deg: f64,
+        az_deg: f64,
+        dr0: f64,
+        dg: f64,
+        met: &mut [f64],
+    ) {
+        if elev_deg < 1.0 {
+            return;
+        }
+        let az = Self::az_index(az_deg);
+        let cos_e = elev_deg.to_radians().cos();
+        for (b, m) in met.iter_mut().enumerate() {
+            let range = dr0 + b as f64 * dg;
+            if height_b5_km(elev_deg, range) >= CAPPI_HEIGHT_KM {
+                break;
+            }
+            let ri = nint((range - dr0) * cos_e);
+            if ri >= CAPPI_NUM_GATES as i64 {
+                break;
+            }
+            let stored = self.z[az][ri.max(0) as usize];
+            if stored.is_finite()
+                && stored > CAPPI_REFL_THRESH_DBZ
+                && *m < MET_SIG_THRESHOLD
+                && *m > 0.0
+            {
+                *m = CAPPI_OVERRIDE;
+            }
+        }
+    }
+}
+
 /// Resample a derived field onto the 360° × 230 km comparison grid, cell for
 /// cell the way [`crate::twin::compare::tally_packet`] resamples the Level
 /// III twin: the radial nearest the cell centre `az + 0.5°` (bounded by the
@@ -967,4 +1347,225 @@ pub(crate) fn resample_to_polar_grid(
         }
     }
     grid
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── trap4point ───────────────────────────────────────────────────────────
+
+    /// The trapezoid the met signal and the HSDA share: plateau inclusive,
+    /// linear shoulders, zero at and beyond the outer points, degenerate
+    /// rows and NaN inputs read 0.
+    #[test]
+    fn trap4_matches_trapazoid_cpp() {
+        assert_eq!(trap4(2.0, 0.0, 1.0, 3.0, 5.0), 1.0);
+        assert_eq!(trap4(1.0, 0.0, 1.0, 3.0, 5.0), 1.0, "x2 is plateau");
+        assert_eq!(trap4(3.0, 0.0, 1.0, 3.0, 5.0), 1.0, "x3 is plateau");
+        assert_eq!(trap4(0.5, 0.0, 1.0, 3.0, 5.0), 0.5);
+        assert_eq!(trap4(4.0, 0.0, 1.0, 3.0, 5.0), 0.5);
+        assert_eq!(trap4(0.0, 0.0, 1.0, 3.0, 5.0), 0.0);
+        assert_eq!(trap4(5.0, 0.0, 1.0, 3.0, 5.0), 0.0);
+        // The half-open trapezoids the met signal uses: x1 == x2 reads 1
+        // at the shared point, and an infinite top never falls off.
+        assert_eq!(trap4(0.0, 0.0, 0.0, 10.0, 20.0), 1.0);
+        assert_eq!(trap4(1e12, 10.0, 30.0, f64::INFINITY, f64::INFINITY), 1.0);
+        assert_eq!(trap4(1.0, 3.0, 1.0, 4.0, 5.0), 0.0, "degenerate row");
+        assert_eq!(
+            trap4(f64::NAN, 0.0, 1.0, 3.0, 5.0),
+            0.0,
+            "NaN matches no branch",
+        );
+    }
+
+    // ── findMetSignal ────────────────────────────────────────────────────────
+
+    fn uniform(n: usize, v: f64) -> Vec<f64> {
+        vec![v; n]
+    }
+
+    /// A clean rain radial (strong Z, high ρ, smooth φ/ZDR/ρ, no velocity)
+    /// scores 100; SNR under 0 dB scores 0 outright.
+    #[test]
+    fn find_met_signal_scores_clean_rain_at_100() {
+        let n = 40;
+        let met = find_met_signal(
+            &uniform(n, 40.0),
+            &[],
+            &uniform(n, 0.5),
+            &uniform(n, 0.99),
+            &uniform(n, 60.0),
+            &uniform(n, 30.0),
+        );
+        assert!(met.iter().all(|&m| m == 100.0), "got {:?}", &met[..5]);
+
+        let met = find_met_signal(
+            &uniform(n, 40.0),
+            &[],
+            &uniform(n, 0.5),
+            &uniform(n, 0.99),
+            &uniform(n, 60.0),
+            &uniform(n, -3.0),
+        );
+        assert!(met.iter().all(|&m| m == 0.0), "SNR < 0 is never met");
+    }
+
+    /// The hard limits: a gate whose vote clears the threshold but whose ρ
+    /// sits under 0.65 (or ZDR outside ±4.5) zeroes — biology cannot ride
+    /// smooth textures in.
+    #[test]
+    fn find_met_signal_hard_limits_zero_qualifying_gates() {
+        let n = 40;
+        // ρ = 0.5: the ρ trapezoid contributes 0 but the five other votes
+        // give 7/8 = 88 ≥ 80 — the hard limit must kill it.
+        let met = find_met_signal(
+            &uniform(n, 40.0),
+            &[],
+            &uniform(n, 0.5),
+            &uniform(n, 0.50),
+            &uniform(n, 60.0),
+            &uniform(n, 30.0),
+        );
+        assert!(met.iter().all(|&m| m == 0.0), "got {:?}", &met[..5]);
+        // Same construction with ρ = 0.70: above the hard floor, below the
+        // trapezoid's 0.75 foot — the vote stands at 88.
+        let met = find_met_signal(
+            &uniform(n, 40.0),
+            &[],
+            &uniform(n, 0.5),
+            &uniform(n, 0.70),
+            &uniform(n, 60.0),
+            &uniform(n, 30.0),
+        );
+        assert!(met.iter().all(|&m| m == 88.0), "got {:?}", &met[..5]);
+        // Extreme ZDR trips the other limb.
+        let met = find_met_signal(
+            &uniform(n, 40.0),
+            &[],
+            &uniform(n, 5.0),
+            &uniform(n, 0.99),
+            &uniform(n, 60.0),
+            &uniform(n, 30.0),
+        );
+        assert!(met.iter().all(|&m| m == 0.0), "ZDR 5 dB is out of bounds");
+    }
+
+    /// Fewer than four present inputs scores 0 (the divide-by-zero guard).
+    #[test]
+    fn find_met_signal_needs_four_inputs() {
+        let n = 40;
+        // Only Z and SNR present: the textures of missing fields are
+        // missing, ρ/ZDR missing → 1 vote < 4.
+        let met = find_met_signal(
+            &uniform(n, 40.0),
+            &[],
+            &uniform(n, f64::NAN),
+            &uniform(n, f64::NAN),
+            &uniform(n, f64::NAN),
+            &uniform(n, 30.0),
+        );
+        assert!(met.iter().all(|&m| m == 0.0));
+    }
+
+    // ── cleanMetSignal ───────────────────────────────────────────────────────
+
+    /// Runs spanning fewer than 2 bins despeckle to threshold − 1.5; a
+    /// trailing run survives (the C never flushes it).
+    #[test]
+    fn clean_met_signal_despeckles_isolated_runs() {
+        let t = MET_SIG_THRESHOLD;
+        // An isolated single-gate signal: dilate spreads it to the two
+        // neighbours, trim pulls both back, despeckle removes the residue.
+        let mut met = vec![0.0, 0.0, 0.0, 95.0, 0.0, 0.0, 0.0];
+        clean_met_signal(&mut met, t);
+        assert!(met.iter().all(|&m| m < t), "got {met:?}");
+
+        // A broad run survives intact in its interior.
+        let mut met = vec![0.0, 0.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 0.0, 0.0];
+        clean_met_signal(&mut met, t);
+        assert!(met[3..8].iter().all(|&m| m >= t), "got {met:?}");
+
+        // A trailing run at the array end is never despeckled.
+        let mut met = vec![0.0; 8];
+        met[7] = 95.0;
+        clean_met_signal(&mut met, t);
+        assert_eq!(met[7], 95.0, "the C never flushes the trailing run");
+    }
+
+    // ── ReflCAPPI ────────────────────────────────────────────────────────────
+
+    /// `height_b5`: the B5 spec's 1.21·6371 km model, hand-computed at
+    /// 3.0° / 50 km: 50·sin(3°) + 2500/15417.82 = 2.778948 km.
+    #[test]
+    fn height_b5_matches_the_hand_computation() {
+        assert!((height_b5_km(3.0, 50.0) - 2.778_948).abs() < 1e-4);
+        assert_eq!(height_b5_km(0.0, 0.0), 0.0);
+    }
+
+    /// update/apply honour the guards: nothing under 1.0° elevation,
+    /// no update inside 30 km, apply stops at the CAPPI height, and the
+    /// rescue only lifts weak-but-nonzero signals over stored Z > 11 dBZ.
+    #[test]
+    fn refl_cappi_updates_and_rescues_per_the_source() {
+        let mut cappi = ReflCappi::new();
+        let n = 1200usize; // 0.25 km gates to 300 km
+        let z: Vec<f64> = vec![20.0; n];
+
+        // A 0.5° radial never updates.
+        cappi.update_radial(0.5, 100.25, 0.125, 0.25, &z);
+        assert!(cappi.z[100].iter().all(|v| v.is_nan()));
+
+        // A 3.0° radial fills its azimuth's columns past 30 km.
+        cappi.update_radial(3.0, 100.25, 0.125, 0.25, &z);
+        let az = ReflCappi::az_index(100.25);
+        assert_eq!(az, 100);
+        assert!(cappi.z[100][29].is_nan(), "no update inside 30 km");
+        assert_eq!(cappi.z[100][50], 20.0);
+
+        // Apply on a 1.5° radial: weak-but-nonzero gates over stored
+        // Z > 11 dBZ lift to 99.5, zero-signal gates stay zero, gates
+        // inside 30 km see empty columns, and the loop stops at 3 km.
+        let mut met = vec![50.0; n];
+        met[200] = 0.0;
+        cappi.apply_radial(1.5, 100.25, 0.125, 0.25, &mut met);
+        assert_eq!(met[100], 50.0, "range 25 km: column never filled");
+        assert_eq!(met[240], 99.5, "range 60 km: rescued");
+        assert_eq!(met[200], 0.0, "a zero signal is never rescued");
+        // Beyond the height cut (h ≥ 3 km at 1.5° is ~103 km) nothing moves.
+        assert_eq!(met[500], 50.0, "range 125 km: beam above the CAPPI");
+
+        // A 0.5° radial is never rescued at all.
+        let mut met_low = vec![50.0; n];
+        cappi.apply_radial(0.5, 100.25, 0.125, 0.25, &mut met_low);
+        assert!(met_low.iter().all(|&m| m == 50.0));
+
+        // A strong signal is never overridden.
+        let mut met_hi = vec![90.0; n];
+        cappi.apply_radial(1.5, 100.25, 0.125, 0.25, &mut met_hi);
+        assert!(met_hi.iter().all(|&m| m == 90.0));
+
+        // The tolerance rule: a later radial whose beam sits farther from
+        // 3 km than the stored height (plus 0.2 km) does not overwrite —
+        // at 50 km the 3.0° beam (2.78 km) beats the 8.0° one (7.28 km).
+        let z25: Vec<f64> = vec![25.0; n];
+        cappi.update_radial(8.0, 100.25, 0.125, 0.25, &z25);
+        assert_eq!(
+            cappi.z[100][50], 20.0,
+            "the closer-to-CAPPI height keeps the column",
+        );
+    }
+
+    /// The double-nint azimuth indexing with the 0.25° offset.
+    #[test]
+    fn refl_cappi_azimuth_indexing_wraps_the_offset() {
+        assert_eq!(
+            ReflCappi::az_index(0.1),
+            0,
+            "0.1 − 0.25 wraps to 359.85 → 360 → 0",
+        );
+        assert_eq!(ReflCappi::az_index(0.75), 1);
+        assert_eq!(ReflCappi::az_index(359.75), 0);
+        assert_eq!(ReflCappi::az_index(180.0), 180);
+    }
 }

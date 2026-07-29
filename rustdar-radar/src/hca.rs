@@ -5,19 +5,62 @@
 //!
 //! The WSR-88D **Hydrometeor Classification Algorithm** is fully public:
 //! task `cpc023/tsk001` (`hca`) ships complete C source in the CODE
-//! distribution (mirrored at github `likev/CodeOrpgPub`), together with its
-//! two feeder tasks — the dual-pol preprocessor `cpc004/tsk011` (`dpprep`,
-//! already transcribed for [`crate::kdp`] and shared through
-//! [`crate::dpprep`]) and the **Quality Index Algorithm** `cpc023/tsk002`
-//! (`qia`) — and the **Melting Layer Detection Algorithm** `cpc023/tsk003`
-//! (`mlda`). Everything below is transcribed from that source, function for
-//! function, with the fleet-default adaptation values from
-//! `cpc104/lib006/{hca,qia,mlda,dpprep}.alg`. The algorithm lineage is Park,
-//! Ryzhkov, Zrnić, Kim 2009, "The Hydrometeor Classification Algorithm for
-//! the Polarimetric WSR-88D" (Weather and Forecasting 24, 730–748) for HCA
-//! and Giangrande, Krause, Ryzhkov 2008 (JAMC 47, 1354–1364) for the MLDA;
-//! **where the released source and the paper differ, the source wins** (the
-//! divergence list below).
+//! distribution, together with its two feeder tasks — the dual-pol
+//! preprocessor `cpc004/tsk011` (`dpprep`, already transcribed for
+//! [`crate::kdp`] and shared through [`crate::dpprep`]) and the **Quality
+//! Index Algorithm** `cpc023/tsk002` (`qia`) — and the **Melting Layer
+//! Detection Algorithm** `cpc023/tsk003` (`mlda`). Everything below was
+//! first transcribed from the Build 16 mirror (github `likev/CodeOrpgPub`),
+//! then cross-checked against and **updated to the CODE Build 21.0r1.7
+//! public source** (the fleet runs ≥ B21 semantics; the delta list is
+//! below), with the fleet-default adaptation values from
+//! `cpc104/lib006/{hca,qia,mlda,dpprep,hail}.alg`. The algorithm lineage is
+//! Park, Ryzhkov, Zrnić, Kim 2009, "The Hydrometeor Classification
+//! Algorithm for the Polarimetric WSR-88D" (Weather and Forecasting 24,
+//! 730–748) for HCA and Giangrande, Krause, Ryzhkov 2008 (JAMC 47,
+//! 1354–1364) for the MLDA; **where the released source and the paper
+//! differ, the source wins** (the divergence list below).
+//!
+//! # Build 21 deltas applied over the Build 16 transcription
+//!
+//! Diffed file-for-file against `rpg_b21_0r1_7_pub_src` (all fleet
+//! defaults; each item names its CCR where the source records one):
+//!
+//! * **memDS** (`hca.alg`): ZDR row (−0.3, 0, **0.9, 1.1**) — B16 had
+//!   (−0.3, 0, 1.3, 1.6) — and ρ row (**0.98, 0.99**, 1.0, 1.01) — B16
+//!   (0.95, 0.98, 1.0, 1.01).
+//! * **memWS** (`hca.alg`): Z row (**15, 25**, 40, 50) — B16 (25, 30, 40,
+//!   50); the ZDR row became **two-dimensional**, (0.5, 1.0, f2, f2+0.3)
+//!   via `memFlagWS` = (none, none, f2, f2); ρ row (**0.84, 0.88, 0.97**,
+//!   0.985) — B16 (0.88, 0.92, 0.95, 0.985).
+//! * **WS hard threshold** (CCR NA15-00181): the `Z < min_Z_WS` leg is
+//!   commented out of `hca_allowedHydroClass.c`; only `ZDR < 0` kills WS.
+//! * **Melting-layer zones** (`hca_allowedHydroClass.c`): the upper
+//!   transition regained **BI** and the above-layer zone regained **GC and
+//!   BI** (B16: `GC DS WS IC GR BD RH` / `DS IC GR RH`).
+//! * **Tie-break** (CCR NA14-00181): an aggregation margin under
+//!   `min_Dif_Agg` no longer reads UK — `Break_tie` picks between winner
+//!   and runner-up by the AEL Table 4 priority of the gate's zone, with the
+//!   source's "tuned" upper lists (BI/GC prepended).
+//! * **Hail Size Discrimination** (CCR NA14-00275, `enable_size = Yes`):
+//!   `HailSize_v3` subclasses RH gates into small/large/giant against six
+//!   height regimes around the wet-bulb 0 °C/−25 °C heights (`hail.alg`
+//!   operator values; here [`HsdaHeights`], sounding-fed), with
+//!   `min_data_size = 2` despeckling and a ZDR ≥ 2 hard stop; product 165
+//!   emits **LH 110 / GH 120** for the large/giant subclasses
+//!   (`dualpol8bit.c`'s `EXT_LH`/`EXT_GH`). `hca_setMembershipPoints.c`
+//!   additionally re-derives RH's F1-flagged ZDR points from the gate
+//!   height in the two regimes below the wet-bulb zero (hardcoded
+//!   polynomials — the `.alg`'s unused `h1` coefficients are *not* what
+//!   the code evaluates).
+//! * **Met-signal preprocessing** (CCR NA14-00100, `metsignal_processing =
+//!   ON`): the dpprep meteorological flag, unfold filter and the CAPPI
+//!   rescue — see [`crate::dpprep`]'s module doc; the QIA is unchanged
+//!   except for a blockage term (`Nc`) that is zero without the blockage
+//!   store, and `melting_layer.c`'s constants are unchanged (its B21
+//!   model-merge refactor is operational state, same gap as before).
+//! * `dpprep`'s new `DPRA`/`DPIN` output phases and `findBragg` feed DP QPE
+//!   / CDA / monitoring, not this chain.
 //!
 //! **Chain** (`cpc104/lib003/task_attr_table`): super-res base data →
 //! `recomb` → `dpprep` → `qia` → `hca` → `dualpol8bit` (product 165). Per
@@ -67,26 +110,32 @@
 //!   invalidate classes: |V| > 1 kills GC; Z > 50 kills RA (plus ρ < 0.94
 //!   with φ < 100°); Z < 30 kills RH and HR (HR also ZDR < 1); Z > 40 kills
 //!   IC; Z outside [10, 60] or ZDR > 2 kills GR; Z < 15 or ZDR < 0.5 kills
-//!   BD; Z < 20 or ZDR < 0 kills WS; ZDR > 2 kills DS; ρ > 0.97 or Z > 35
-//!   kills BI (`atten_control = Off` applies both everywhere);
+//!   BD; ZDR < 0 kills WS (the Z leg is gone in B21); ZDR > 2 kills DS;
+//!   ρ > 0.97 or Z > 35 kills BI (`atten_control = Off` applies both
+//!   everywhere);
 //! * the melting layer gates the allowed set by the gate's position against
 //!   the four beam/ML intersection ranges (`hca_beamMLIntersection.c`,
 //!   effective radius 7708.91 km, 1° beam): below — GC BI BD RA HR RH;
-//!   entering — + WS GR; within — GC BI DS WS GR BD RH; upper — GC DS WS
-//!   IC GR BD RH; above — DS IC GR RH;
+//!   entering — + WS GR; within — GC BI DS WS GR BD RH; upper — GC BI DS
+//!   WS IC GR BD RH; above — GC BI DS IC GR RH;
 //! * for each surviving class, six trapezoidal memberships
 //!   (`hca_setMembershipPoints.c` + `hca_degreeMembership.c`; the ZDR and
 //!   LKDP breakpoints of the rain family shift with Z through
-//!   `f1/f2/f3/g1/g2`), each weighted by the class×variable weight **and**
-//!   the gate's quality index, aggregate `Σ WQF/(Σ WQ + 0.01)`;
-//! * the largest aggregation wins; a maximum under 0.4 (`min_Agg`) or a
-//!   margin under 0.001 (`min_Dif_Agg`) yields UK. LKdp is `10·log10(KDP)`,
-//!   floored at −40 for KDP < 0.001 (`MINI_LKTP`).
+//!   `f1/f2/f3/g1/g2`, and RH's ZDR points additionally with gate height
+//!   below the wet-bulb zero — the HSDA modification), each weighted by
+//!   the class×variable weight **and** the gate's quality index, aggregate
+//!   `Σ WQF/(Σ WQ + 0.01)`;
+//! * the largest aggregation wins; a maximum under 0.4 (`min_Agg`) yields
+//!   UK, and a margin under 0.001 (`min_Dif_Agg`) goes to the zone's AEL
+//!   Table 4 priority (`Break_tie`). LKdp is `10·log10(KDP)`, floored at
+//!   −40 for KDP < 0.001 (`MINI_LKTP`);
+//! * RH gates then pass through `HailSize_v3` (see the B21 delta list).
 //!
 //! The output uses the product's external codes (`dualpol8bit.c`'s
-//! `Class_external`, class × 10): RA 60, HR 70, RH 100, BD 80, BI 10, GC 20,
-//! DS 40, WS 50, IC 30, GR 90, UK 140; NE encodes level 0 and decodes as
-//! undefined, exactly as the Level III twin's codec treats it.
+//! `Class_external`, class × 10): RA 60, HR 70, RH 100 (LH 110 and GH 120
+//! for the large/giant-hail subclasses), BD 80, BI 10, GC 20, DS 40, WS 50,
+//! IC 30, GR 90, UK 140; NE encodes level 0 and decodes as undefined,
+//! exactly as the Level III twin's codec treats it.
 //!
 //! # Melting layer and environmental data
 //!
@@ -133,7 +182,8 @@
 //!   `ZDR < f2(Z) − 0.3` to fixed `Z < 15 || ZDR < 0.5`;
 //! * BI's ZDR x2 is 0 (paper 2) and its ρ row is (0.30, 0.50, 0.85, 0.90)
 //!   (paper x3/x4 0.80/0.83); the source adds the `max_Z_BI = 35` kill;
-//! * DS's ZDR row is (−0.3, 0, 1.3, 1.6) (paper (−0.3, 0, 0.3, 0.6));
+//! * DS's ZDR row is (−0.3, 0, 0.9, 1.1) in B21 (paper (−0.3, 0, 0.3,
+//!   0.6); B16 shipped (−0.3, 0, 1.3, 1.6));
 //! * RH's minimum-Z hard threshold is 30 dBZ (paper 40);
 //! * LKdp floors at −40 for KDP < 0.001 (paper −30 for ≤ 0.001);
 //! * the aggregation denominator carries `+ 0.01`;
@@ -141,9 +191,8 @@
 //!   paper's confidence vector (Eqs. 14–19: no NBF gradients, no ΔZDR, no
 //!   blockage estimate);
 //! * the paper's convective/stratiform separation and despeckling do not
-//!   exist in the released HCA task;
-//! * the source drops BI from the paper's upper-transition allowed set
-//!   (Eq. 24's Rt–Rtt zone lists BS; `hca_allowedHydroClass.c` does not);
+//!   exist in the released HCA task (the only despeckle is the HSDA's
+//!   hail-size one);
 //! * MLDA's ZDR-maximum profile ceiling is 2.2 dB (`mlda.alg`; the paper
 //!   text says 2.5).
 //!
@@ -208,13 +257,16 @@
 //! volume; nothing undocumented was chased.
 
 use crate::dpprep::{
-    CORR_THRESH, DBZ_THRESH, DBZ_WINDOW, DpCombined, DpInput, LONG_GATE, SHORT_GATE, WINDOW,
-    average_filter, combine_sweep_dp, index_into, interpolate, is_high_attenuation_radial,
-    isdp_from_queue, kdp_from_phi, median_filter, meteo_groups, radial_system_phi,
-    resample_to_polar_grid, std_filter, unfold_phidp,
+    CORR_THRESH, DBZ_THRESH, DBZ_WINDOW, DpCombined, DpInput, LONG_GATE, MET_SIG_THRESHOLD,
+    SHORT_GATE, UNFOLD_MIN_RHO, WINDOW, average_filter, clean_met_signal, combine_sweep_dp,
+    find_met_signal, index_into, interpolate, is_high_attenuation_radial, isdp_from_queue,
+    kdp_from_phi, median_filter, meteo_groups, radial_system_phi, resample_to_polar_grid,
+    std_filter, unfold_phidp,
 };
 use crate::kdp::KdpParams;
 use nexrad_model::data::Radial;
+
+pub use crate::dpprep::ReflCappi;
 
 // ── Class indices (hca.h) and the product's external codes ──────────────────
 
@@ -264,7 +316,8 @@ const MAX_Z_GR: f64 = 60.0;
 const MAX_ZDR_GR: f64 = 2.0;
 const MIN_Z_BD: f64 = 15.0;
 const MIN_ZDR_BD: f64 = 0.5;
-const MIN_Z_WS: f64 = 20.0;
+// B21: `min_Z_WS` is "no longer used per CCR NA15-00181" — the Z leg of the
+// WS kill is commented out of `hca_allowedHydroClass.c`; only ZDR remains.
 const MIN_ZDR_WS: f64 = 0.0;
 const MAX_RHOHV_BI: f64 = 0.97;
 const MAX_Z_BI: f64 = 35.0;
@@ -429,31 +482,44 @@ pub(crate) const MEM_GC: MemTable = MemTable {
     flags: [[MF; 4]; 6],
 };
 
-/// `hca.alg`'s `memDS`/`memFlagDS` (dry snow). The ZDR row is the source's
-/// (−0.3, 0, 1.3, 1.6) — the paper prints (−0.3, 0, 0.3, 0.6).
+/// `hca.alg`'s `memDS`/`memFlagDS` (dry snow). B21 tightened the row pair
+/// B16 shipped: ZDR (−0.3, 0, **0.9, 1.1**) — B16 (−0.3, 0, 1.3, 1.6), the
+/// paper (−0.3, 0, 0.3, 0.6) — and ρ (**0.98, 0.99**, 1.00, 1.01) — B16
+/// (0.95, 0.98, 1.00, 1.01).
 pub(crate) const MEM_DS: MemTable = MemTable {
     points: [
         [5.00, 10.00, 35.00, 40.00],
-        [-0.30, 0.00, 1.30, 1.60],
+        [-0.30, 0.00, 0.90, 1.10],
         [-30.00, -25.00, 10.00, 20.00],
-        [0.95, 0.98, 1.00, 1.01],
+        [0.98, 0.99, 1.00, 1.01],
         [0.00, 0.50, 3.00, 6.00],
         [0.00, 1.00, 15.00, 30.00],
     ],
     flags: [[MF; 4]; 6],
 };
 
-/// `hca.alg`'s `memWS`/`memFlagWS` (wet snow).
+/// `hca.alg`'s `memWS`/`memFlagWS` (wet snow), reworked wholesale in B21:
+/// Z (**15, 25**, 40, 50) — B16 (25, 30, 40, 50); the ZDR row became
+/// two-dimensional, (0.5, 1.0, f2+0, f2+0.3) via `memFlagWS`'s new
+/// (none, none, f2, f2); ρ widened to (**0.84, 0.88, 0.97**, 0.985) — B16
+/// (0.88, 0.92, 0.95, 0.985).
 pub(crate) const MEM_WS: MemTable = MemTable {
     points: [
-        [25.00, 30.00, 40.00, 50.00],
-        [0.50, 1.00, 2.00, 3.00],
+        [15.00, 25.00, 40.00, 50.00],
+        [0.50, 1.00, 0.00, 0.30],
         [-30.00, -25.00, 10.00, 20.00],
-        [0.88, 0.92, 0.95, 0.985],
+        [0.84, 0.88, 0.97, 0.985],
         [0.00, 0.50, 3.00, 6.00],
         [0.00, 1.00, 15.00, 30.00],
     ],
-    flags: [[MF; 4]; 6],
+    flags: [
+        [MF, MF, MF, MF],
+        [MF, MF, F2, F2],
+        [MF, MF, MF, MF],
+        [MF, MF, MF, MF],
+        [MF, MF, MF, MF],
+        [MF, MF, MF, MF],
+    ],
 };
 
 /// `hca.alg`'s `memIC`/`memFlagIC` (ice crystals).
@@ -562,6 +628,72 @@ const BEAM_WIDTH_DEG: f64 = 1.0;
 /// is unreadable: 10.5 kft, in km MSL.
 pub const DEFAULT_HEIGHT_0_KM_MSL: f64 = 10.5 * 0.3048;
 
+// ── HSDA (Hail Size Discrimination, CCR NA14-00275; HailSize.cpp v3) ────────
+
+/// `hca.alg`'s `enable_size` fleet default (Yes): product 165 subclasses RH
+/// into small/large/giant hail, large and giant carrying their own codes.
+const ENABLE_SIZE: bool = true;
+/// `hca.alg`'s `min_data_size`: hail-size runs shorter than this despeckle
+/// down one size.
+const MIN_DATA_SIZE: usize = 2;
+/// `dualpol8bit.c`'s `EXT_LH`/`EXT_GH`: the product codes of the RH
+/// subclasses (small hail stays at RH's 100).
+const EXT_LH: f32 = 110.0;
+const EXT_GH: f32 = 120.0;
+/// `hail.alg`'s operator-maintained wet-bulb heights, kft MSL → km: the
+/// fleet defaults stand in when no environmental value is available.
+pub const DEFAULT_HEIGHT_TW0_KM_MSL: f64 = 10.0 * 0.3048;
+pub const DEFAULT_HEIGHT_TW_M25_KM_MSL: f64 = 22.0 * 0.3048;
+/// `HailSize.cpp`'s hard bounds.
+const HSDA_MAX_ZDR: f64 = 2.0;
+const HSDA_MIN_ZDR: f64 = -7.75;
+const HSDA_MIN_RHO: f64 = 0.0;
+const HSDA_MAX_Z: f64 = 100.0;
+const HSDA_DELTA_ZDR: f64 = -0.50;
+const HSDA_MIN_PV: f64 = 0.2;
+const HSDA_MIN_AGG: f64 = 0.6;
+
+/// The wet-bulb heights the HSDA regimes and the RH ZDR-membership
+/// modification read, km **above radar level** — `Hca_process_radial`'s
+/// `Hca_0_Tw_height`/`Hca_minus_25_Tw_height` after its MSL → ARL
+/// conversion. Operationally these are the `hail.alg` operator values;
+/// [`from_env_heights`](Self::from_env_heights) stands the WP-S sounding's
+/// dry-bulb heights in for them (wet-bulb sits within a few hundred metres
+/// below dry-bulb in moist columns — inside the operator values' own
+/// update cadence), extrapolating −25 °C from the 0/−20 °C lapse.
+#[derive(Debug, Clone, Copy)]
+pub struct HsdaHeights {
+    pub tw0_km_arl: f64,
+    pub twm25_km_arl: f64,
+}
+
+impl HsdaHeights {
+    /// From MSL heights, as `Hca_process_radial` converts them. The source
+    /// does not floor these at ground.
+    pub fn from_msl(tw0_km_msl: f64, twm25_km_msl: f64, radar_km_msl: f64) -> Self {
+        Self {
+            tw0_km_arl: tw0_km_msl - radar_km_msl,
+            twm25_km_arl: twm25_km_msl - radar_km_msl,
+        }
+    }
+
+    /// The `hail.alg` fleet defaults (10.0 / 22.0 kft MSL).
+    pub fn operational_defaults(radar_km_msl: f64) -> Self {
+        Self::from_msl(
+            DEFAULT_HEIGHT_TW0_KM_MSL,
+            DEFAULT_HEIGHT_TW_M25_KM_MSL,
+            radar_km_msl,
+        )
+    }
+
+    /// From the sounding's dry-bulb 0 °C / −20 °C heights (km MSL):
+    /// −25 °C extrapolated by a quarter of the 0 → −20 °C depth.
+    pub fn from_env_heights(h0c_km_msl: f64, hm20c_km_msl: f64, radar_km_msl: f64) -> Self {
+        let hm25 = hm20c_km_msl + 0.25 * (hm20c_km_msl - h0c_km_msl);
+        Self::from_msl(h0c_km_msl, hm25, radar_km_msl)
+    }
+}
+
 // ── dpprep transport scales (dpp_format.c / qia_process.c Add_moment) ───────
 
 const SMZ_SCALE: (f64, f64) = (2.0, 66.0);
@@ -639,11 +771,22 @@ fn beam_ml_intersection(elev_deg: f64, az: usize, bin_size_km: f64, ml: &Melting
 
 /// `Hca_setMembershipPoints`: the class×input row's four points, the 2-D
 /// rows adjusted by `f1/f2/f3/g1/g2` of the (FShield-adjusted) reflectivity.
-fn set_membership_points(class: usize, fl_input: usize, z_fshield: f64) -> [f64; 4] {
+/// With HSDA enabled (B21, CCR NA14-00275), the RH class's F1-flagged ZDR
+/// points are re-derived from the gate height against the wet-bulb 0 °C
+/// height in the two regimes below it — the hardcoded polynomials of
+/// `hca_setMembershipPoints.c`, not the `.alg`'s `h1` coefficients.
+fn set_membership_points(
+    class: usize,
+    fl_input: usize,
+    z_fshield: f64,
+    height_km: f64,
+    tw0_km_arl: f64,
+) -> [f64; 4] {
     let table = MEM[class - RA];
     let mut points = [0.0; 4];
     for (x, point) in points.iter_mut().enumerate() {
-        let eqn = match table.flags[fl_input][x] {
+        let flag = table.flags[fl_input][x];
+        let mut eqn = match flag {
             MemFlag::None => 0.0,
             MemFlag::F1 => F1_COEF.0 * z_fshield * z_fshield + F1_COEF.1 * z_fshield + F1_COEF.2,
             MemFlag::F2 => F2_COEF.0 * z_fshield * z_fshield + F2_COEF.1 * z_fshield + F2_COEF.2,
@@ -651,6 +794,13 @@ fn set_membership_points(class: usize, fl_input: usize, z_fshield: f64) -> [f64;
             MemFlag::G1 => G1_COEF.0 * z_fshield + G1_COEF.1,
             MemFlag::G2 => G2_COEF.0 * z_fshield + G2_COEF.1,
         };
+        if ENABLE_SIZE && class == RH && fl_input == ZDR && flag == MemFlag::F1 {
+            if tw0_km_arl - 2.0 < height_km && height_km <= tw0_km_arl - 1.0 {
+                eqn = 5e-4 * z_fshield * z_fshield + 1.5e-2 * z_fshield - 0.9;
+            } else if tw0_km_arl - 1.0 < height_km && height_km < tw0_km_arl {
+                eqn = 0.02 * z_fshield - 0.6;
+            }
+        }
         *point = eqn + table.points[fl_input][x];
     }
     points
@@ -729,7 +879,8 @@ fn allowed_hydro_class(
     if z < MIN_Z_BD || zdr < MIN_ZDR_BD {
         agg[BD] = INVALID;
     }
-    if z < MIN_Z_WS || zdr < MIN_ZDR_WS {
+    // B21 (CCR NA15-00181): the WS kill lost its Z leg.
+    if zdr < MIN_ZDR_WS {
         agg[WS] = INVALID;
     }
     if zdr > MAX_ZDR_DS {
@@ -746,6 +897,9 @@ fn allowed_hydro_class(
         agg[RA] = INVALID;
     }
 
+    // B21 widened the two upper zones: the upper transition regained BI and
+    // the above-layer zone regained GC and BI (B16: GC DS WS IC GR BD RH and
+    // DS IC GR RH respectively).
     let allowed: &[usize] = if bin < ml.bb {
         &[GC, BI, BD, RA, HR, RH]
     } else if bin < ml.b {
@@ -753,15 +907,43 @@ fn allowed_hydro_class(
     } else if bin < ml.t {
         &[GC, BI, DS, WS, GR, BD, RH]
     } else if bin < ml.tt {
-        &[GC, DS, WS, IC, GR, BD, RH]
+        &[GC, BI, DS, WS, IC, GR, BD, RH]
     } else {
-        &[DS, IC, GR, RH]
+        &[GC, BI, DS, IC, GR, RH]
     };
     for (i, a) in agg.iter_mut().enumerate() {
         if !allowed.contains(&i) {
             *a = INVALID;
         }
     }
+}
+
+/// `Break_tie` (CCR NA14-00181, B21's `hca_process_radial.c`): when the top
+/// two aggregations sit within `min_Dif_Agg`, the class is chosen by the
+/// AEL Table 4 priority order of the gate's melting-layer zone — B16 read
+/// UK here. The upper-transition and above-layer lists carry the source's
+/// "tuned" orders (BI/GC prepended to the original AEL lists).
+fn break_tie(bin: i64, ml: MlBins, h_class: usize, runner_up: usize) -> usize {
+    let priority: &[usize] = if bin < ml.bb {
+        &[GC, BI, BD, RA, HR, RH]
+    } else if bin < ml.b {
+        &[GC, BI, WS, GR, BD, RA, HR, RH]
+    } else if bin < ml.t {
+        &[GC, BI, DS, WS, GR, BD, RH]
+    } else if bin < ml.tt {
+        &[BI, GC, DS, WS, IC, GR, BD, RH] // "tuned"
+    } else {
+        &[GC, BI, DS, IC, GR, RH]
+    };
+    for &c in priority {
+        if c == h_class {
+            return h_class;
+        }
+        if c == runner_up {
+            return runner_up;
+        }
+    }
+    h_class
 }
 
 // ── The preprocessed per-radial fields HCA and the MLDA consume ─────────────
@@ -811,21 +993,62 @@ fn sentinel(v: f64) -> f64 {
     if v.is_finite() { v } else { NO_DATA }
 }
 
-/// The full dpprep + QIA chain for one recombined radial — the same
-/// pipeline [`crate::kdp`] validated, plus the fields KDP never reads.
+/// The full dpprep + QIA chain for one recombined radial. With
+/// `metsignal` (the B21 fleet default) the meteorological flag and the
+/// unfold filter come from the cleaned met signal — plus the CAPPI rescue
+/// on ≥ 1° radials when a volume CAPPI is supplied; without it, the legacy
+/// (metsignal-OFF) construction [`crate::kdp`] validated.
 fn radial_fields(
     c: &DpCombined,
     init_fdp: f64,
     dbz0: Option<f64>,
     atmos: Option<f64>,
     quantize: bool,
+    metsignal: bool,
+    cappi: Option<&ReflCappi>,
 ) -> Fields {
     let r = &c.base;
     let n = r.phi.len();
     let nz = r.z.len();
 
+    // SNR precedes the met signal (Compute_snr's first call, from the
+    // 3-gate smoothed Z).
+    let ref_smd3 = average_filter(&r.z, DBZ_WINDOW);
+    let snr_z: Vec<f64> = (0..nz)
+        .map(|iz| match dbz0 {
+            Some(dbz0) if !ref_smd3[iz].is_nan() => {
+                let rr = (r.zr0 + iz as f64 * r.zg).max(1e-9);
+                ref_smd3[iz] - 20.0 * rr.log10() + atmos.unwrap_or(0.0) * rr - dbz0
+            }
+            _ => f64::NAN,
+        })
+        .collect();
+
+    // The met signal reads the raw fields — φ before unfolding.
+    let met = if metsignal {
+        let pick_z = |field: &[f64], i: usize| -> f64 {
+            let d = r.dr0 + i as f64 * r.dg;
+            index_into(d, r.zr0, r.zg, field.len())
+                .map(|iz| field[iz])
+                .unwrap_or(f64::NAN)
+        };
+        let z_dp: Vec<f64> = (0..n).map(|i| pick_z(&r.z, i)).collect();
+        let snr_dp: Vec<f64> = (0..n).map(|i| pick_z(&snr_z, i)).collect();
+        let mut met = find_met_signal(&z_dp, &r.vel, &c.zdr, &r.rho, &r.phi, &snr_dp);
+        clean_met_signal(&mut met, MET_SIG_THRESHOLD);
+        if let Some(cappi) = cappi {
+            cappi.apply_radial(c.elev, r.az, r.dr0, r.dg, &mut met);
+        }
+        Some(met)
+    } else {
+        None
+    };
+
     let mut phi = r.phi.clone();
-    unfold_phidp(&mut phi, &r.rho, init_fdp);
+    match &met {
+        Some(met) => unfold_phidp(&mut phi, met, MET_SIG_THRESHOLD, init_fdp),
+        None => unfold_phidp(&mut phi, &r.rho, UNFOLD_MIN_RHO, init_fdp),
+    }
 
     // Textures about their own smoothing windows (dpp_process.c order:
     // SD(Z) about the 5-gate mean, before ref_smd is overwritten by the
@@ -838,32 +1061,29 @@ fn radial_fields(
     let rho_smd = average_filter(&r.rho, WINDOW);
     let zdr_smd = average_filter(&c.zdr, WINDOW);
     let vel_smd = average_filter(&r.vel, WINDOW);
-    let ref_smd3 = average_filter(&r.z, DBZ_WINDOW);
 
     let hatt = is_high_attenuation_radial(&r.z, &r.vel, &r.spw, &r.rho);
 
-    // SNR from the 3-gate smoothed Z (Compute_snr's second call).
-    let snr_z: Vec<f64> = (0..nz)
-        .map(|iz| match dbz0 {
-            Some(dbz0) if !ref_smd3[iz].is_nan() => {
-                let rr = (r.zr0 + iz as f64 * r.zg).max(1e-9);
-                ref_smd3[iz] - 20.0 * rr.log10() + atmos.unwrap_or(0.0) * rr - dbz0
-            }
-            _ => f64::NAN,
-        })
-        .collect();
-
-    // Meteorological flag and the two smoothed/interpolated φ chains — the
-    // same construction kdp::process_radial pins.
+    // Meteorological flag: the cleaned met signal above threshold (strictly
+    // — dpp_process.c zeroes `<=`), or the legacy construction the KDP
+    // chain pins.
     let mut flag = vec![false; n];
-    if hatt && dbz0.is_some() {
-        let ngs = n.min(snr_z.len());
-        for (i, f) in flag.iter_mut().enumerate().take(ngs) {
-            *f = snr_z[i] >= crate::dpprep::MD_SNR_THRESH && !phi[i].is_nan();
+    match &met {
+        Some(met) => {
+            for (i, f) in flag.iter_mut().enumerate() {
+                *f = met[i] > MET_SIG_THRESHOLD;
+            }
         }
-    } else {
-        for (i, f) in flag.iter_mut().enumerate() {
-            *f = rho_smd[i] >= CORR_THRESH && !phi[i].is_nan();
+        None if hatt && dbz0.is_some() => {
+            let ngs = n.min(snr_z.len());
+            for (i, f) in flag.iter_mut().enumerate().take(ngs) {
+                *f = snr_z[i] >= crate::dpprep::MD_SNR_THRESH && !phi[i].is_nan();
+            }
+        }
+        None => {
+            for (i, f) in flag.iter_mut().enumerate() {
+                *f = rho_smd[i] >= CORR_THRESH && !phi[i].is_nan();
+            }
         }
     }
     let groups = meteo_groups(&flag);
@@ -1066,14 +1286,18 @@ fn quality_indices(phi: f64, rho: f64, smz: f64, snr: f64, quantize: bool) -> [f
 }
 
 /// One gate through `Hca_process_radial`'s classification: returns the
-/// internal class index.
-fn classify_gate(f: &Fields, bin: usize, ml: MlBins) -> usize {
+/// internal class index. `tw0_km_arl` feeds the HSDA modification of RH's
+/// ZDR membership.
+fn classify_gate(f: &Fields, bin: usize, ml: MlBins, tw0_km_arl: f64) -> usize {
     if f.snr[bin] < MIN_SNR {
         return NE;
     }
     // (The RF → UK branch is unreachable here; see the module doc.)
 
     let z_fshield = f.smz[bin]; // no blockage: FShield adjustment is 0
+    // `RPGCS_height(bin·dg, elev)` — the bin height the HSDA membership
+    // modification reads (the C measures range from bin 0, not `dr0`).
+    let height_km = ml_height_from_range(f.elev, bin as f64 * f.dg);
 
     let mut agg = [0.0f64; NUM_CLASSES];
     allowed_hydro_class(
@@ -1107,14 +1331,15 @@ fn classify_gate(f: &Fields, bin: usize, ml: MlBins) -> usize {
         }
         let mut fd_mem = [0.0f64; 6];
         for (fl_input, fd) in fd_mem.iter_mut().enumerate() {
-            let points = set_membership_points(h_class, fl_input, z_fshield);
+            let points = set_membership_points(h_class, fl_input, z_fshield, height_km, tw0_km_arl);
             *fd = degree_membership(d[fl_input], points);
         }
         *a = weighted_aggregation(&WEIGHT[h_class - RA], &quality, &fd_mem);
     }
 
     // The largest aggregation wins (first index on ties, as the C's strict
-    // `<` keeps the earlier class), then the min_Agg / min_Dif_Agg gates.
+    // `<` keeps the earlier class), then the min_Agg gate; a margin under
+    // min_Dif_Agg goes to the AEL Table 4 tie-break (B21; B16 read UK).
     let mut agg_max = -2.0;
     let mut max_cal = NE;
     for (h_class, &a) in agg.iter().enumerate() {
@@ -1124,25 +1349,314 @@ fn classify_gate(f: &Fields, bin: usize, ml: MlBins) -> usize {
         }
     }
     let mut top_diff = 100.0;
+    let mut runner_up = UK;
     for (h_class, &a) in agg.iter().enumerate() {
         if h_class != max_cal {
             let diff = agg_max - a;
             if diff < top_diff {
                 top_diff = diff;
+                runner_up = h_class;
             }
         }
     }
-    if agg_max < MIN_AGG || top_diff < MIN_DIF_AGG {
+    if agg_max < MIN_AGG {
         return UK;
+    }
+    if top_diff < MIN_DIF_AGG {
+        return break_tie(bin as i64, ml, max_cal, runner_up);
     }
     max_cal
 }
 
 /// One radial's classes.
-fn classify_radial(f: &Fields, ml: &MeltingLayer) -> Vec<usize> {
+fn classify_radial(f: &Fields, ml: &MeltingLayer, tw0_km_arl: f64) -> Vec<usize> {
     let az = (f.az.rem_euclid(360.0)) as usize % 360;
     let bins = beam_ml_intersection(f.elev, az, f.dg, ml);
-    (0..f.n).map(|bin| classify_gate(f, bin, bins)).collect()
+    (0..f.n)
+        .map(|bin| classify_gate(f, bin, bins, tw0_km_arl))
+        .collect()
+}
+
+// ── Hail size discrimination (HailSize.cpp v3) ───────────────────────────────
+
+/// The RH subclassification (`data.sub`): `Current` is an RH gate the HSDA
+/// left at rain-and-hail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HailSize {
+    NotHail,
+    Current,
+    Small,
+    Large,
+    Giant,
+}
+
+/// One height regime's three (Z, ZDR, ρ) trapezoids, small/large/giant.
+type HsdaTraps = [[[f64; 4]; 3]; 3];
+
+/// `HailSize_v3`'s inline trapezoids for one gate: the six height regimes
+/// against the wet-bulb heights, the ZDR rows of the lower regimes built
+/// from the hail-size `f`/`g` polynomials at the gate's Z (all carrying
+/// `DeltaZdr = −0.5`). Returns the regime's (weights, trapezoids).
+fn hsda_regime(height_km: f64, hs: &HsdaHeights, z: f64) -> ([f64; 3], HsdaTraps) {
+    let dz = HSDA_DELTA_ZDR;
+    let f1 = -0.5 + 2.5e-3 * z + 7.5e-4 * z * z + dz;
+    let f2 = 0.1 * (z - 50.0) + dz;
+    let f3 = 0.1 * (z - 60.0) + dz;
+    let g1 = -0.9 + 1.5e-2 * z + 5.0e-4 * z * z + dz;
+    let g2 = 0.075 * (z - 50.0) + dz;
+    let g3 = 0.075 * (z - 60.0) + dz;
+    let (zmin, rmin, zmax) = (HSDA_MIN_ZDR, HSDA_MIN_RHO, HSDA_MAX_Z);
+    let (tw0, twm25) = (hs.tw0_km_arl, hs.twm25_km_arl);
+
+    if height_km > twm25 {
+        (
+            [1.0, 0.3, 0.6],
+            [
+                [
+                    [45.0, 50.0, 60.0, 65.0],
+                    [-0.5, -0.3, 0.3, 0.5],
+                    [0.92, 0.96, 0.99, 1.0],
+                ],
+                [
+                    [48.0, 58.0, 63.0, 68.0],
+                    [-0.5, -0.3, 0.3, 0.5],
+                    [0.92, 0.96, 0.99, 1.0],
+                ],
+                [
+                    [50.0, 60.0, zmax, zmax + 1.0],
+                    [zmin - 1.0, zmin, 0.3, 0.5],
+                    [rmin - 1.0, rmin, 0.99, 1.0],
+                ],
+            ],
+        )
+    } else if height_km > tw0 {
+        (
+            [1.0, 0.3, 0.6],
+            [
+                [
+                    [45.0, 50.0, 60.0, 65.0],
+                    [-0.5, -0.3, 0.3, 0.5],
+                    [0.92, 0.96, 0.99, 1.0],
+                ],
+                [
+                    [48.0, 58.0, 63.0, 68.0],
+                    [-0.5, -0.3, 0.3, 0.5],
+                    [0.86, 0.90, 0.96, 0.98],
+                ],
+                [
+                    [50.0, 60.0, zmax, zmax + 1.0],
+                    [zmin - 1.0, zmin, 0.2, 0.5],
+                    [rmin - 1.0, rmin, 0.93, 0.98],
+                ],
+            ],
+        )
+    } else if height_km > tw0 - 1.0 {
+        (
+            [0.8, 0.5, 0.6],
+            [
+                [
+                    [45.0, 50.0, 60.0, 65.0],
+                    [-0.1, 0.3, 0.7, 1.2],
+                    [0.93, 0.96, 0.99, 1.0],
+                ],
+                [
+                    [48.0, 58.0, 63.0, 68.0],
+                    [-0.3, 0.1, 0.5, 1.0],
+                    [0.80, 0.91, 0.97, 0.98],
+                ],
+                [
+                    [50.0, 60.0, zmax, zmax + 1.0],
+                    [zmin - 1.0, zmin, 0.2, 0.7],
+                    [rmin - 1.0, rmin, 0.94, 0.98],
+                ],
+            ],
+        )
+    } else if height_km > tw0 - 2.0 {
+        (
+            [0.7, 0.8, 0.6],
+            [
+                [
+                    [45.0, 52.0, 62.0, 67.0],
+                    [g2 - 0.3, g2, g1, g1 + 0.3],
+                    [0.94, 0.96, 0.98, 1.0],
+                ],
+                [
+                    [50.0, 60.0, 65.0, 70.0],
+                    [g3 - 0.3, g3, g2, g2 + 0.3],
+                    [0.80, 0.91, 0.97, 0.98],
+                ],
+                [
+                    [52.0, 62.0, zmax, zmax + 1.0],
+                    [zmin - 1.0, zmin, g3, g3 + 0.3],
+                    [rmin - 1.0, rmin, 0.96, 0.98],
+                ],
+            ],
+        )
+    } else if height_km > tw0 - 3.0 {
+        (
+            [0.7, 1.0, 0.6],
+            [
+                [
+                    [45.0, 49.0, 59.0, 64.0],
+                    [f2 - 0.3, f2, f1, f1 + 0.3],
+                    [0.91, 0.94, 0.96, 0.99],
+                ],
+                [
+                    [50.0, 57.0, 62.0, 67.0],
+                    [f3 - 0.3, f3, f2, f2 + 0.3],
+                    [0.80, 0.93, 0.96, 0.99],
+                ],
+                [
+                    [50.0, 59.0, zmax, zmax + 1.0],
+                    [zmin - 1.0, zmin, f3, f3 + 0.3],
+                    [rmin - 1.0, rmin, 0.93, 0.98],
+                ],
+            ],
+        )
+    } else {
+        (
+            [0.7, 1.0, 0.6],
+            [
+                [
+                    [45.0, 47.0, 57.0, 62.0],
+                    [f2 - 0.3, f2, f1, f1 + 0.3],
+                    [0.91, 0.94, 0.96, 0.99],
+                ],
+                [
+                    [50.0, 55.0, 60.0, 65.0],
+                    [f3 - 0.3, f3, f2, f2 + 0.3],
+                    [0.80, 0.93, 0.96, 0.99],
+                ],
+                [
+                    [50.0, 57.0, zmax, zmax + 1.0],
+                    [zmin - 1.0, zmin, f3, f3 + 0.3],
+                    [rmin - 1.0, rmin, 0.93, 0.98],
+                ],
+            ],
+        )
+    }
+}
+
+/// `HailSize_v3` over one radial: subclassify the RH gates by hail size.
+/// Inputs are the classified radial's fields (sentinel domain — a missing
+/// ZDR at −10⁵ falls off every trapezoid, exactly as the C's `no_data`
+/// does) and the QIA indices for Z, ZDR and ρ. The despeckle demotes
+/// giant→large then large→small runs shorter than `min_data_size`.
+fn hail_size_radial(f: &Fields, classes: &[usize], hs: &HsdaHeights) -> Vec<HailSize> {
+    use crate::dpprep::trap4;
+    let mut sub: Vec<HailSize> = classes
+        .iter()
+        .map(|&c| {
+            if c == RH {
+                HailSize::Current
+            } else {
+                HailSize::NotHail
+            }
+        })
+        .collect();
+
+    for (i, cell) in sub.iter_mut().enumerate().take(f.n) {
+        if *cell != HailSize::Current {
+            continue;
+        }
+        let z = f.smz[i];
+        let zdr = f.zdr[i];
+        let rho = f.rho[i];
+        let height_km = ml_height_from_range(f.elev, i as f64 * f.dg);
+        let (w, traps) = hsda_regime(height_km, hs, z);
+        let q = [f.q[i][SMZ], f.q[i][ZDR], f.q[i][RHO]];
+
+        let mut agg = [0.0f64; 3];
+        for (s, a) in agg.iter_mut().enumerate() {
+            let t = &traps[s];
+            let pv = [
+                trap4(z, t[0][0], t[0][1], t[0][2], t[0][3]),
+                trap4(zdr, t[1][0], t[1][1], t[1][2], t[1][3]),
+                trap4(rho, t[2][0], t[2][1], t[2][2], t[2][3]),
+            ];
+            let sum_weights = w[0] * q[0] + w[1] * q[1] + w[2] * q[2];
+            *a = (w[0] * pv[0] * q[0] + w[1] * pv[1] * q[1] + w[2] * pv[2] * q[2]) / sum_weights;
+            // The "handcuffs": large and giant need every input to carry
+            // at least some membership.
+            if s != 0 && (pv[0] < HSDA_MIN_PV || pv[1] < HSDA_MIN_PV || pv[2] < HSDA_MIN_PV) {
+                *a = 0.0;
+            }
+        }
+
+        // Strict `>` keeps the earlier (smaller) size on ties; a NaN
+        // aggregation (all-zero qualities) selects nothing, as in the C.
+        let mut max_value = -1.0f64;
+        let mut max_index = 0usize;
+        for (s, &a) in agg.iter().enumerate() {
+            if a > max_value {
+                max_value = a;
+                max_index = s;
+            }
+        }
+        if max_value >= HSDA_MIN_AGG {
+            // max_hail_cat is pinned at giant in the released source, so
+            // the category caps never bind.
+            *cell = match max_index {
+                0 => HailSize::Small,
+                1 => HailSize::Large,
+                _ => HailSize::Giant,
+            };
+        }
+        // Hard limit: high ZDR is never large/giant hail.
+        if zdr >= HSDA_MAX_ZDR {
+            *cell = HailSize::Small;
+        }
+    }
+
+    despeckle_hail(&mut sub, HailSize::Giant, HailSize::Large);
+    despeckle_hail(&mut sub, HailSize::Large, HailSize::Small);
+    sub
+}
+
+/// One gate's product code: `dualpol8bit.c`'s `Class_external` with the RH
+/// subclass split (`EXT_LH`/`EXT_GH`; small hail and unsized RH keep RH's
+/// 100). Codes of 0 (U0/U1/NE) are undefined.
+fn external_code(class: usize, size: HailSize) -> f32 {
+    let code = if class == RH {
+        match size {
+            HailSize::Large => EXT_LH,
+            HailSize::Giant => EXT_GH,
+            _ => CLASS_EXTERNAL[RH],
+        }
+    } else {
+        CLASS_EXTERNAL[class]
+    };
+    if code == 0.0 { f32::NAN } else { code }
+}
+
+/// One despeckle pass: runs of `from` shorter than `min_data_size` become
+/// `to`. The trailing run is flushed by the loop's else-arm never firing —
+/// the C leaves it standing, and so does this.
+fn despeckle_hail(sub: &mut [HailSize], from: HailSize, to: HailSize) {
+    let mut short_runs: Vec<(usize, usize)> = Vec::new();
+    let mut beg: Option<usize> = None;
+    let mut count = 0usize;
+    for (i, &cur) in sub.iter().enumerate() {
+        if cur == from {
+            if beg.is_none() {
+                beg = Some(i);
+            }
+            count += 1;
+        } else {
+            if let Some(b) = beg
+                && count < MIN_DATA_SIZE
+            {
+                short_runs.push((b, i));
+            }
+            beg = None;
+            count = 0;
+        }
+    }
+    for (b, e) in short_runs {
+        for cell in sub[b..e].iter_mut() {
+            *cell = to;
+        }
+    }
 }
 
 // ── Public entry points ──────────────────────────────────────────────────────
@@ -1157,6 +1671,10 @@ pub(crate) struct HcaOptions {
     /// Reproduce the 8-bit moment transport between tasks (the primary).
     /// Off is the naive physical-units reading.
     pub(crate) quantize_transport: bool,
+    /// The B21 met-signal meteorological flag (`metsignal_processing = ON`,
+    /// the fleet default and the primary). Off is the legacy (pre-B17)
+    /// ρ/SNR flag the KDP chain's survey record was measured with.
+    pub(crate) metsignal: bool,
 }
 
 impl HcaOptions {
@@ -1164,6 +1682,7 @@ impl HcaOptions {
         Self {
             isdp_estimated: false,
             quantize_transport: true,
+            metsignal: true,
         }
     }
 }
@@ -1232,26 +1751,52 @@ fn resolve_init_fdp(params: &KdpParams, combined: &[DpCombined], estimated: bool
 }
 
 /// Compute the tilt's hydrometeor classification per the rules in the
-/// module doc: recombine the sweep to 1°, run the dpprep and QIA chains,
-/// classify every gate against the melting layer, and emit the product's
-/// external class codes. `None` when no radial carries the differential
-/// phase moment.
+/// module doc: recombine the sweep to 1°, run the dpprep (met-signal) and
+/// QIA chains, classify every gate against the melting layer, subclass RH
+/// by hail size, and emit the product's external class codes. `None` when
+/// no radial carries the differential phase moment.
 ///
 /// `params` carries the radial-header values ([`KdpParams::from_archive`]);
 /// without `dbz0` the SNR gate cannot run and every gate reads no-echo,
 /// exactly as the operational chain would with no calibration constant.
+/// `hsda` carries the wet-bulb heights; `cappi` the volume's reflectivity
+/// CAPPI ([`build_refl_cappi`]) — `None` is the cold-start state, which
+/// only differs on ≥ 1° tilts.
 pub fn compute_hca(
     radials: &[Radial],
     params: &KdpParams,
     ml: &MeltingLayer,
+    hsda: &HsdaHeights,
+    cappi: Option<&ReflCappi>,
 ) -> Option<DerivedHca> {
-    compute_hca_impl(radials, params, ml, HcaOptions::primary())
+    compute_hca_impl(radials, params, ml, hsda, cappi, HcaOptions::primary())
+}
+
+/// Build the volume's reflectivity CAPPI from its ≥ 1° dual-pol sweeps —
+/// the state [`compute_hca`]'s met-signal chain consults (see the
+/// [`crate::dpprep`] module doc's CAPPI notes). Sweeps must be given in
+/// scan order, as the RPG fills the grid.
+pub fn build_refl_cappi(sweeps: &[&[Radial]]) -> ReflCappi {
+    let mut cappi = ReflCappi::new();
+    for &radials in sweeps {
+        let inputs: Vec<DpInput> = radials.iter().filter_map(DpInput::from_radial).collect();
+        if inputs.is_empty() {
+            continue;
+        }
+        let combined = combine_sweep_dp(&inputs, true);
+        for c in &combined {
+            cappi.update_radial(c.elev, c.base.az, c.base.zr0, c.base.zg, &c.base.z);
+        }
+    }
+    cappi
 }
 
 fn compute_hca_impl(
     radials: &[Radial],
     params: &KdpParams,
     ml: &MeltingLayer,
+    hsda: &HsdaHeights,
+    cappi: Option<&ReflCappi>,
     opts: HcaOptions,
 ) -> Option<DerivedHca> {
     let inputs: Vec<DpInput> = radials.iter().filter_map(DpInput::from_radial).collect();
@@ -1276,15 +1821,26 @@ fn compute_hca_impl(
     let mut values = Vec::with_capacity(combined.len());
     let mut azimuths = Vec::with_capacity(combined.len());
     for c in &combined {
-        let fields = radial_fields(c, init_fdp, dbz0, atmos, opts.quantize_transport);
-        let classes = classify_radial(&fields, ml);
+        let fields = radial_fields(
+            c,
+            init_fdp,
+            dbz0,
+            atmos,
+            opts.quantize_transport,
+            opts.metsignal,
+            cappi,
+        );
+        let classes = classify_radial(&fields, ml, hsda.tw0_km_arl);
+        let sub = if ENABLE_SIZE {
+            hail_size_radial(&fields, &classes, hsda)
+        } else {
+            vec![HailSize::NotHail; classes.len()]
+        };
         values.push(
             classes
                 .iter()
-                .map(|&cl| {
-                    let code = CLASS_EXTERNAL[cl];
-                    if code == 0.0 { f32::NAN } else { code }
-                })
+                .zip(sub.iter())
+                .map(|(&cl, &s)| external_code(cl, s))
                 .collect(),
         );
         azimuths.push(c.base.az);
@@ -1393,6 +1949,26 @@ pub fn detect_melting_layer(
     sweeps: &[&[Radial]],
     params: &KdpParams,
     default_top_km_arl: f64,
+    hsda: &HsdaHeights,
+    cappi: Option<&ReflCappi>,
+) -> MeltingLayer {
+    detect_melting_layer_impl(
+        sweeps,
+        params,
+        default_top_km_arl,
+        hsda,
+        cappi,
+        HcaOptions::primary(),
+    )
+}
+
+fn detect_melting_layer_impl(
+    sweeps: &[&[Radial]],
+    params: &KdpParams,
+    default_top_km_arl: f64,
+    hsda: &HsdaHeights,
+    cappi: Option<&ReflCappi>,
+    opts: HcaOptions,
 ) -> MeltingLayer {
     let default = MeltingLayer::flat(default_top_km_arl);
     let dbz0 = params.dbz0.map(f64::from);
@@ -1409,12 +1985,20 @@ pub fn detect_melting_layer(
             continue;
         }
         let combined = combine_sweep_dp(&inputs, true);
-        let init_fdp = resolve_init_fdp(params, &combined, false);
+        let init_fdp = resolve_init_fdp(params, &combined, opts.isdp_estimated);
         let elev_weight = ml_elev_weight(sweep_elev);
 
         for c in &combined {
-            let f = radial_fields(c, init_fdp, dbz0, atmos, true);
-            let classes = classify_radial(&f, &default);
+            let f = radial_fields(
+                c,
+                init_fdp,
+                dbz0,
+                atmos,
+                opts.quantize_transport,
+                opts.metsignal,
+                cappi,
+            );
+            let classes = classify_radial(&f, &default, hsda.tw0_km_arl);
             let stop = (ml_range_from_height(c.elev, ML_MAX_TOP_KM) / f.dg + 0.5) as usize;
             let az_index = (f.az.rem_euclid(360.0)) as usize % 360;
             for (i, &class) in classes.iter().enumerate().take(f.n.min(stop)) {
@@ -1792,6 +2376,15 @@ mod tests {
         }
     }
 
+    /// Wet-bulb heights far above every fixture beam: the HSDA regimes and
+    /// the RH ZDR modification stay inert unless a test moves them.
+    fn hsda_far() -> HsdaHeights {
+        HsdaHeights {
+            tw0_km_arl: 100.0,
+            twm25_km_arl: 105.0,
+        }
+    }
+
     // ── Transcription pins: one test per class's membership table ─────────
     //
     // Each row is asserted separately so a wrong transcription localizes to
@@ -1921,8 +2514,8 @@ mod tests {
         );
     }
 
-    /// DS's ZDR row is the source's (−0.3, 0, 1.3, 1.6) — the paper prints
-    /// (−0.3, 0, 0.3, 0.6); the source wins.
+    /// DS's B21 rows: ZDR (−0.3, 0, 0.9, 1.1) and ρ (0.98, 0.99, 1, 1.01)
+    /// — read off B21's `hca.alg`, tighter than both the paper and B16.
     #[test]
     fn mem_table_ds_matches_hca_alg() {
         assert_table(
@@ -1930,9 +2523,9 @@ mod tests {
             &MEM_DS,
             [
                 [5.0, 10.0, 35.0, 40.0],
-                [-0.3, 0.0, 1.3, 1.6],
+                [-0.3, 0.0, 0.9, 1.1],
                 [-30.0, -25.0, 10.0, 20.0],
-                [0.95, 0.98, 1.0, 1.01],
+                [0.98, 0.99, 1.0, 1.01],
                 [0.0, 0.5, 3.0, 6.0],
                 [0.0, 1.0, 15.0, 30.0],
             ],
@@ -1940,20 +2533,22 @@ mod tests {
         );
     }
 
+    /// WS's B21 rows: Z starts at 15, the ZDR row is two-dimensional
+    /// ((0.5, 1.0) + f2-based upper points), ρ widened down to 0.84.
     #[test]
     fn mem_table_ws_matches_hca_alg() {
         assert_table(
             "WS",
             &MEM_WS,
             [
-                [25.0, 30.0, 40.0, 50.0],
-                [0.5, 1.0, 2.0, 3.0],
+                [15.0, 25.0, 40.0, 50.0],
+                [0.5, 1.0, 0.0, 0.3],
                 [-30.0, -25.0, 10.0, 20.0],
-                [0.88, 0.92, 0.95, 0.985],
+                [0.84, 0.88, 0.97, 0.985],
                 [0.0, 0.5, 3.0, 6.0],
                 [0.0, 1.0, 15.0, 30.0],
             ],
-            [NF; 6],
+            [NF, [MF, MF, F2, F2], NF, NF, NF, NF],
         );
     }
 
@@ -2035,7 +2630,8 @@ mod tests {
         assert_eq!(MAX_ZDR_GR, 2.0);
         assert_eq!(MIN_Z_BD, 15.0);
         assert_eq!(MIN_ZDR_BD, 0.5);
-        assert_eq!(MIN_Z_WS, 20.0);
+        // B21 (CCR NA15-00181): no min_Z_WS constant — the Z leg of the WS
+        // kill is commented out of the source.
         assert_eq!(MIN_ZDR_WS, 0.0);
         assert_eq!(MAX_RHOHV_BI, 0.97);
         assert_eq!(MAX_Z_BI, 35.0);
@@ -2045,6 +2641,16 @@ mod tests {
         assert_eq!(MIN_SNR, 5.0);
         assert!(!ATTEN_CONTROL, "atten_control = Off in hca.alg");
         assert_eq!(MINI_LKTP, -40.0, "the source's −40, not the paper's −30");
+        // The B21 HSDA adaptation values (hca.alg / hail.alg).
+        assert!(ENABLE_SIZE, "enable_size = Yes in hca.alg");
+        assert_eq!(MIN_DATA_SIZE, 2);
+        assert_eq!(EXT_LH, 110.0);
+        assert_eq!(EXT_GH, 120.0);
+        assert!((DEFAULT_HEIGHT_TW0_KM_MSL - 3.048).abs() < 1e-9, "10.0 kft");
+        assert!(
+            (DEFAULT_HEIGHT_TW_M25_KM_MSL - 6.7056).abs() < 1e-9,
+            "22.0 kft",
+        );
     }
 
     /// The output codes against `dualpol8bit.c`'s `Class_external`, and
@@ -2103,32 +2709,77 @@ mod tests {
     }
 
     /// The 2-D rows at Z = 45 dBZ, hand-computed: f1 = 1.13125,
-    /// f2 = 4.4285, f3 = 5.403625, g1 = −8, g2 = 0.5.
+    /// f2 = 4.4285, f3 = 5.403625, g1 = −8, g2 = 0.5. Heights far below
+    /// the wet-bulb zero regimes keep the HSDA modification inert.
     #[test]
     fn two_dimensional_membership_points_follow_the_equations() {
-        let ra_zdr = set_membership_points(RA, ZDR, 45.0);
+        let mp = |class, input, z| set_membership_points(class, input, z, 0.0, 100.0);
+        let ra_zdr = mp(RA, ZDR, 45.0);
         for (got, want) in ra_zdr.iter().zip([0.83125, 1.13125, 4.4285, 4.9285]) {
             assert!(
                 (got - want).abs() < 1e-9,
                 "RA/ZDR at 45 dBZ: {got} vs {want}"
             );
         }
-        let ra_lkdp = set_membership_points(RA, LKDP, 45.0);
+        let ra_lkdp = mp(RA, LKDP, 45.0);
         for (got, want) in ra_lkdp.iter().zip([-9.0, -8.0, 0.5, 1.5]) {
             assert!(
                 (got - want).abs() < 1e-9,
                 "RA/LKDP at 45 dBZ: {got} vs {want}"
             );
         }
-        let bd_zdr = set_membership_points(BD, ZDR, 45.0);
+        let bd_zdr = mp(BD, ZDR, 45.0);
         for (got, want) in bd_zdr.iter().zip([4.1285, 4.4285, 5.403625, 6.403625]) {
             assert!(
                 (got - want).abs() < 1e-9,
                 "BD/ZDR at 45 dBZ: {got} vs {want}"
             );
         }
+        // The B21 WS ZDR row: x3/x4 ride f2 (4.4285 + 0 / + 0.3 at 45 dBZ).
+        let ws_zdr = mp(WS, ZDR, 45.0);
+        for (got, want) in ws_zdr.iter().zip([0.5, 1.0, 4.4285, 4.7285]) {
+            assert!(
+                (got - want).abs() < 1e-9,
+                "WS/ZDR at 45 dBZ: {got} vs {want}"
+            );
+        }
         // 1-D rows pass through untouched.
-        assert_eq!(set_membership_points(GC, RHO, 45.0), [0.5, 0.6, 0.9, 0.95]);
+        assert_eq!(mp(GC, RHO, 45.0), [0.5, 0.6, 0.9, 0.95]);
+    }
+
+    /// The HSDA modification of RH's ZDR row (hca_setMembershipPoints.c):
+    /// only the F1-flagged points move, only in the two regimes below the
+    /// wet-bulb zero, by the hardcoded polynomials. At Z = 55:
+    /// g-regime (tw0−2 < h ≤ tw0−1): 5e-4·55² + 1.5e-2·55 − 0.9 = 1.4375;
+    /// linear regime (tw0−1 < h < tw0): 0.02·55 − 0.6 = 0.5.
+    #[test]
+    fn hsda_reshapes_rh_zdr_membership_below_the_wet_bulb_zero() {
+        let tw0 = 3.0;
+        // Far below both regimes: the normal F1 applies
+        // (f1(55) = −0.5 + 2.5e-3·55 + 7.5e-4·55² = 1.90625; the RH ZDR
+        // base points are x3 = 0, x4 = 0.5).
+        let normal = set_membership_points(RH, ZDR, 55.0, 0.5, tw0);
+        assert!((normal[2] - 1.906_25).abs() < 1e-9, "got {}", normal[2]);
+        assert!((normal[3] - 2.406_25).abs() < 1e-9);
+        // (tw0−2, tw0−1]: the g-shaped polynomial replaces F1.
+        let g = set_membership_points(RH, ZDR, 55.0, 1.5, tw0);
+        assert!((g[2] - 1.4375).abs() < 1e-9, "got {}", g[2]);
+        assert!((g[3] - 1.9375).abs() < 1e-9);
+        // (tw0−1, tw0): the linear polynomial.
+        let lin = set_membership_points(RH, ZDR, 55.0, 2.5, tw0);
+        assert!((lin[2] - 0.5).abs() < 1e-9, "got {}", lin[2]);
+        assert!((lin[3] - 1.0).abs() < 1e-9);
+        // At/above the wet-bulb zero: normal F1 again.
+        let above = set_membership_points(RH, ZDR, 55.0, 3.0, tw0);
+        assert_eq!(above, normal);
+        // The unflagged x1/x2 never move.
+        assert_eq!(g[0], -0.3);
+        assert_eq!(g[1], 0.0);
+        // Other classes are untouched in the same regime.
+        assert_eq!(
+            set_membership_points(RA, ZDR, 55.0, 1.5, tw0),
+            set_membership_points(RA, ZDR, 55.0, 0.5, tw0),
+        );
     }
 
     /// The aggregation: `Σ WQF / (Σ WQ + 0.01)`, hand-computed.
@@ -2241,8 +2892,54 @@ mod tests {
         assert_eq!(allowed(50), vec![RA, HR, RH, BD, BI, GC]);
         assert_eq!(allowed(150), vec![RA, HR, RH, BD, BI, GC, WS, GR]);
         assert_eq!(allowed(250), vec![RH, BD, BI, GC, DS, WS, GR]);
-        assert_eq!(allowed(350), vec![RH, BD, GC, DS, WS, IC, GR]);
-        assert_eq!(allowed(450), vec![RH, DS, IC, GR]);
+        // B21 widened the upper zones: BI back in the upper transition,
+        // GC and BI back above the layer.
+        assert_eq!(allowed(350), vec![RH, BD, BI, GC, DS, WS, IC, GR]);
+        assert_eq!(allowed(450), vec![RH, BI, GC, DS, IC, GR]);
+    }
+
+    /// B21 (CCR NA15-00181): weak Z no longer kills WS — only negative ZDR
+    /// does.
+    #[test]
+    fn the_ws_kill_lost_its_z_leg_in_b21() {
+        let ml = MlBins {
+            bb: 0,
+            b: 0,
+            t: 100,
+            tt: 100,
+        };
+        let ws_alive = |z: f64, zdr: f64| -> bool {
+            let mut agg = [0.0f64; NUM_CLASSES];
+            allowed_hydro_class(50, z, zdr, 0.93, 120.0, NO_DATA, false, &mut agg, ml);
+            agg[WS] == 0.0
+        };
+        assert!(ws_alive(18.0, 0.5), "Z 18 killed WS in B16, not in B21");
+        assert!(!ws_alive(18.0, -0.5), "negative ZDR still kills WS");
+    }
+
+    /// `Break_tie` (CCR NA14-00181): the AEL Table 4 priority per zone,
+    /// including the source's "tuned" upper lists.
+    #[test]
+    fn break_tie_follows_the_zone_priority_lists() {
+        let ml = MlBins {
+            bb: 100,
+            b: 200,
+            t: 300,
+            tt: 400,
+        };
+        // Below the layer BD outranks RA.
+        assert_eq!(break_tie(50, ml, RA, BD), BD);
+        assert_eq!(break_tie(50, ml, BD, RA), BD);
+        // Entering: WS outranks BD.
+        assert_eq!(break_tie(150, ml, BD, WS), WS);
+        // Within: DS outranks WS.
+        assert_eq!(break_tie(250, ml, WS, DS), DS);
+        // Upper transition (tuned list): BI outranks GC.
+        assert_eq!(break_tie(350, ml, GC, BI), BI);
+        // Above: GC outranks DS.
+        assert_eq!(break_tie(450, ml, DS, GC), GC);
+        // A runner-up absent from the list leaves the winner standing.
+        assert_eq!(break_tie(450, ml, DS, RA), DS);
     }
 
     /// Each hard threshold kills exactly its class.
@@ -2432,7 +3129,7 @@ mod tests {
         for (name, class, [smz, zdr, rho, kdp, phi, sdz, sdp, smv], zone) in cases {
             let f = fields_one_gate(smz, zdr, rho, kdp, phi, sdz, sdp, smv, 30.0);
             assert_eq!(
-                classify_gate(&f, 0, zone),
+                classify_gate(&f, 0, zone, 100.0),
                 class,
                 "{name} plateau inputs must classify {name}",
             );
@@ -2448,7 +3145,7 @@ mod tests {
         let z_ref = 35.0;
         for class in RA..=GR {
             for input in 0..NUM_FL_INPUTS {
-                let p = set_membership_points(class, input, z_ref);
+                let p = set_membership_points(class, input, z_ref, 0.0, 100.0);
                 let name = format!("class {class} input {input}");
                 if p[0] > p[1] || p[1] > p[2] || p[2] > p[3] {
                     continue; // degenerate at this Z; the guard returns 0
@@ -2467,13 +3164,13 @@ mod tests {
     #[test]
     fn low_snr_is_ne_and_hopeless_gates_are_unknown() {
         let f = fields_one_gate(30.0, 1.0, 0.99, NO_DATA, 60.0, 1.0, 5.0, NO_DATA, 3.0);
-        assert_eq!(classify_gate(&f, 0, BELOW), NE, "SNR 3 dB < 5");
+        assert_eq!(classify_gate(&f, 0, BELOW, 100.0), NE, "SNR 3 dB < 5");
         let f = fields_one_gate(30.0, 1.0, 0.99, NO_DATA, 60.0, 1.0, 5.0, NO_DATA, NO_DATA);
-        assert_eq!(classify_gate(&f, 0, BELOW), NE, "missing SNR");
+        assert_eq!(classify_gate(&f, 0, BELOW, 100.0), NE, "missing SNR");
         // φ missing zeroes the φ-driven qualities; textures far outside
         // every plateau zero the rest: nothing reaches min_Agg → UK.
         let f = fields_one_gate(30.0, 3.0, 0.5, NO_DATA, NO_DATA, 20.0, 80.0, NO_DATA, 30.0);
-        assert_eq!(classify_gate(&f, 0, BELOW), UK);
+        assert_eq!(classify_gate(&f, 0, BELOW, 100.0), UK);
     }
 
     // ── End-to-end synthetics through compute_hca ──────────────────────────
@@ -2503,7 +3200,7 @@ mod tests {
             })
             .collect();
         let ml = MeltingLayer::flat(4.0);
-        let derived = compute_hca(&radials, &params(), &ml).expect("computes");
+        let derived = compute_hca(&radials, &params(), &ml, &hsda_far(), None).expect("computes");
         assert_eq!(derived.values.len(), 360, "720 half-degree radials pair");
         assert!((derived.azimuths_deg[0] - 0.5).abs() < 1e-6);
         assert!((derived.gate_interval_km - 0.25).abs() < 1e-9);
@@ -2536,8 +3233,22 @@ mod tests {
                 )
             })
             .collect();
-        let below = compute_hca(&radials, &params(), &MeltingLayer::flat(6.0)).expect("computes");
-        let above = compute_hca(&radials, &params(), &MeltingLayer::flat(0.0)).expect("computes");
+        let below = compute_hca(
+            &radials,
+            &params(),
+            &MeltingLayer::flat(6.0),
+            &hsda_far(),
+            None,
+        )
+        .expect("computes");
+        let above = compute_hca(
+            &radials,
+            &params(),
+            &MeltingLayer::flat(0.0),
+            &hsda_far(),
+            None,
+        )
+        .expect("computes");
         let i = 200;
         assert_eq!(below.values[0][i], 60.0, "below the layer this is rain");
         assert_eq!(
@@ -2569,7 +3280,14 @@ mod tests {
                 )
             })
             .collect();
-        let derived = compute_hca(&radials, &params(), &MeltingLayer::flat(4.0)).expect("computes");
+        let derived = compute_hca(
+            &radials,
+            &params(),
+            &MeltingLayer::flat(4.0),
+            &hsda_far(),
+            None,
+        )
+        .expect("computes");
         assert!(derived.values[0][50].is_finite());
         assert!(
             derived.values[0][150].is_nan(),
@@ -2595,7 +3313,8 @@ mod tests {
             init_fdp_deg: Some(60.0),
             ..KdpParams::default()
         };
-        let derived = compute_hca(&radials, &p, &MeltingLayer::flat(4.0)).expect("computes");
+        let derived = compute_hca(&radials, &p, &MeltingLayer::flat(4.0), &hsda_far(), None)
+            .expect("computes");
         assert!(derived.values[0].iter().all(|v| v.is_nan()));
     }
 
@@ -2816,7 +3535,7 @@ mod tests {
         };
         let sweeps: Vec<Vec<Radial>> = [4.5, 5.5, 6.5].iter().map(|&e| make_sweep(e)).collect();
         let sweep_refs: Vec<&[Radial]> = sweeps.iter().map(|s| s.as_slice()).collect();
-        let ml = detect_melting_layer(&sweep_refs, &params(), 2.75);
+        let ml = detect_melting_layer(&sweep_refs, &params(), 2.75, &hsda_far(), None);
         for az in [0usize, 90, 180, 270] {
             assert!(
                 (2.6..=3.3).contains(&ml.top_km_arl[az]),
@@ -2831,9 +3550,126 @@ mod tests {
             assert!(ml.top_km_arl[az] > ml.bottom_km_arl[az]);
         }
         // A quiet volume detects nothing and returns the default.
-        let quiet = detect_melting_layer(&[], &params(), 2.75);
+        let quiet = detect_melting_layer(&[], &params(), 2.75, &hsda_far(), None);
         assert_eq!(quiet.top_km_arl[0], 2.75);
         assert_eq!(quiet.bottom_km_arl[0], 2.25);
+    }
+
+    // ── Hail size discrimination (HailSize.cpp v3) ─────────────────────────
+
+    /// A `Fields` fixture of `n` identical gates for the HSDA.
+    fn fields_n(n: usize, smz: f64, zdr: f64, rho: f64) -> Fields {
+        let q = quality_indices(60.0, rho, smz, 30.0, true);
+        Fields {
+            az: 0.5,
+            elev: 0.5,
+            hatt: false,
+            n,
+            dg: 0.25,
+            smz: vec![smz; n],
+            snr: vec![30.0; n],
+            sdz: vec![1.0; n],
+            zdr: vec![zdr; n],
+            rho: vec![rho; n],
+            kdp: vec![NO_DATA; n],
+            phi: vec![60.0; n],
+            sdp: vec![5.0; n],
+            smv: vec![NO_DATA; n],
+            q: vec![q; n],
+        }
+    }
+
+    /// Deep below the wet-bulb zero (regime 5), a 65 dBZ / −1 dB / ρ 0.90
+    /// core is giant hail on every trapezoid: PV = 1 across Z/ZDR/ρ, so
+    /// the aggregation clears 0.6 and a run of 4 survives the despeckle.
+    #[test]
+    fn hsda_subclasses_a_giant_hail_core() {
+        let f = fields_n(4, 65.0, -1.0, 0.90);
+        let classes = vec![RH; 4];
+        let sub = hail_size_radial(&f, &classes, &hsda_far());
+        assert_eq!(sub, vec![HailSize::Giant; 4]);
+        assert_eq!(external_code(RH, HailSize::Giant), 120.0, "GH code");
+        assert_eq!(external_code(RH, HailSize::Large), 110.0, "LH code");
+        assert_eq!(
+            external_code(RH, HailSize::Small),
+            100.0,
+            "small hail keeps RH's code",
+        );
+        assert_eq!(external_code(RH, HailSize::Current), 100.0);
+        assert_eq!(external_code(RA, HailSize::NotHail), 60.0);
+    }
+
+    /// ZDR at or above 2 dB is never large or giant hail — the hard limit
+    /// forces small regardless of the aggregation.
+    #[test]
+    fn hsda_zdr_hard_limit_forces_small() {
+        let f = fields_n(4, 65.0, 2.5, 0.90);
+        let classes = vec![RH; 4];
+        let sub = hail_size_radial(&f, &classes, &hsda_far());
+        assert_eq!(sub, vec![HailSize::Small; 4]);
+    }
+
+    /// A weak aggregation (nothing reaches 0.6) leaves the gate at RH, and
+    /// non-RH gates are never touched.
+    #[test]
+    fn hsda_leaves_weak_gates_and_other_classes_alone() {
+        // 46 dBZ with ZDR 1.9: the small-hail ZDR trapezoid tops out below
+        // 1.9 in regime 5, Z sits on the shoulder — no size concludes.
+        let f = fields_n(3, 46.0, 1.9, 0.97);
+        let classes = vec![RH, RA, RH];
+        let sub = hail_size_radial(&f, &classes, &hsda_far());
+        assert_eq!(
+            sub,
+            vec![HailSize::Current, HailSize::NotHail, HailSize::Current],
+        );
+    }
+
+    /// A single giant gate inside a large-hail run despeckles down to
+    /// large (`min_data_size = 2`).
+    #[test]
+    fn hsda_despeckles_single_gate_giant_runs() {
+        // Large-hail pattern in regime 5: Z 57, ZDR 0, ρ 0.94 — the giant
+        // trapezoids score lower than large there.
+        let mut f = fields_n(3, 57.0, 0.0, 0.94);
+        // The middle gate is unambiguous giant.
+        f.smz[1] = 65.0;
+        f.zdr[1] = -1.0;
+        f.rho[1] = 0.90;
+        f.q[1] = quality_indices(60.0, 0.90, 65.0, 30.0, true);
+        let classes = vec![RH; 3];
+        let sub = hail_size_radial(&f, &classes, &hsda_far());
+        assert_eq!(sub[1], HailSize::Large, "giant run of 1 demotes to large");
+        assert_eq!(
+            sub,
+            vec![HailSize::Large; 3],
+            "then a large run of 3 stands"
+        );
+    }
+
+    /// The height regimes move the verdict: the same moments that read
+    /// giant near the surface read differently above the wet-bulb zero,
+    /// where the dry-hail trapezoids apply.
+    #[test]
+    fn hsda_regimes_follow_the_wet_bulb_heights() {
+        // ZDR 0.4 / ρ 0.97 at 60 dBZ: below tw0−3 the giant ZDR plateau
+        // tops at f3 + 0.3 = 0.5 − 0.5 + 0.3... regime 5 f3(60) = −0.5, so
+        // giant ZDR range is (−8.75, −7.75, −0.5, −0.2): 0.4 reads 0. The
+        // large plateau [f3, f2] = [−0.5, 0.5] holds 0.4 → large wins low.
+        let f = fields_n(2, 60.0, 0.4, 0.97);
+        let classes = vec![RH; 2];
+        let low = hail_size_radial(&f, &classes, &hsda_far());
+        assert_eq!(low, vec![HailSize::Large; 2]);
+        // Push the whole column above the wet-bulb −25 °C level (regime
+        // 0): ZDR 0.4 sits on the small/large plateau edge (−0.5..0.5 with
+        // x3 = 0.3, shoulder to 0.5) but ρ 0.97 → small/large ρ plateau
+        // (0.96..0.99) → both score; small ties large through Z (60 on
+        // both plateaus) and the strict `>` keeps small.
+        let cold = HsdaHeights {
+            tw0_km_arl: -2.0,
+            twm25_km_arl: -1.0,
+        };
+        let high = hail_size_radial(&f, &classes, &cold);
+        assert_eq!(high, vec![HailSize::Small; 2]);
     }
 }
 
@@ -3047,7 +3883,7 @@ mod live_validation {
         let mut azs = Vec::new();
         let (mut first_gate, mut gate_int) = (0.125, 0.25);
         for c in &combined {
-            let f = super::radial_fields(c, init_fdp, dbz0, atmos, true);
+            let f = super::radial_fields(c, init_fdp, dbz0, atmos, true, true, None);
             cause.push(
                 (0..f.n)
                     .map(|i| {
@@ -3158,20 +3994,65 @@ mod live_validation {
         )
     }
 
+    /// Per-class producer accuracy (P(ours = c | twin = c)) and user
+    /// accuracy (P(twin = c | ours = c)), from the confusion matrix.
+    fn per_class_accuracy(tally: &compare::Tally) -> String {
+        use std::collections::BTreeMap;
+        let mut twin_totals: BTreeMap<u8, usize> = BTreeMap::new();
+        let mut ours_totals: BTreeMap<u8, usize> = BTreeMap::new();
+        for (&(a, b), &c) in &tally.confusion {
+            *ours_totals.entry(a).or_insert(0) += c;
+            *twin_totals.entry(b).or_insert(0) += c;
+        }
+        let mut parts = Vec::new();
+        for (&code, &twin_n) in &twin_totals {
+            let diag = tally.confusion.get(&(code, code)).copied().unwrap_or(0);
+            let ours_n = ours_totals.get(&code).copied().unwrap_or(0);
+            parts.push(format!(
+                "{} n={} prod {:.0}% user {:.0}%",
+                class_name(code),
+                twin_n,
+                100.0 * diag as f64 / twin_n.max(1) as f64,
+                100.0 * diag as f64 / ours_n.max(1) as f64,
+            ));
+        }
+        parts.join(" | ")
+    }
+
+    /// The survey's site-hours: `HCA_SITE_HOURS` as comma/semicolon
+    /// separated `SITE=YYYY-MM-DDTHH:MM` pairs targets precipitating
+    /// archive hours (a site may appear more than once); unset, the full
+    /// roster at now — the clear-air fallback.
+    fn site_hours() -> Vec<(String, chrono::NaiveDateTime)> {
+        let now = chrono::Utc::now().naive_utc();
+        match std::env::var("HCA_SITE_HOURS") {
+            Ok(spec) if !spec.trim().is_empty() => spec
+                .split([',', ';'])
+                .filter_map(|pair| {
+                    let (site, when) = pair.trim().split_once('=')?;
+                    let when = chrono::NaiveDateTime::parse_from_str(when.trim(), "%Y-%m-%dT%H:%M")
+                        .unwrap_or_else(|e| panic!("bad HCA_SITE_HOURS entry {pair}: {e}"));
+                    Some((site.trim().to_uppercase(), when))
+                })
+                .collect(),
+            _ => live::SITES.iter().map(|s| (s.to_string(), now)).collect(),
+        }
+    }
+
     #[ignore = "hits the live S3 bucket"]
     #[tokio::test]
     async fn live_derived_hca_matches_the_rpgs_own_product() {
         crate::tls::init();
         let sources = DataSources::production();
-        let now = chrono::Utc::now().naive_utc();
 
         let mut asserted_sites = 0usize;
         let mut pooled_compared = 0usize;
         let mut failures: Vec<String> = Vec::new();
 
-        for &site in live::SITES {
-            let Some((file, l2_start)) = live::l2_archive_near(site, now).await else {
-                println!("{site}: SKIP — no archived Level II volume found");
+        for (site, when) in site_hours() {
+            let site = site.as_str();
+            let Some((file, l2_start)) = live::l2_archive_near(site, when).await else {
+                println!("{site}: SKIP — no archived Level II volume found near {when}");
                 continue;
             };
             let mut params = KdpParams::from_archive(&file);
@@ -3181,22 +4062,44 @@ mod live_validation {
             };
             params.isdp_est_deg = crate::kdp::estimate_volume_isdp(&scan);
 
-            // The environmental 0 °C height (the operational chain's
-            // `height_0`) from the WP-S sounding, with the source's own
-            // 10.5 kft fallback; radar height from the site table.
+            // The environmental heights (the operational chain's `height_0`
+            // and the HSDA's wet-bulb pair) from the WP-S sounding, with
+            // the sources' own fallbacks; radar height from the site table.
             let radar_km_msl = crate::sites::get_radar_site(site)
                 .and_then(|s| s.elev)
                 .map(|ft| f64::from(ft) * 0.0003048)
                 .unwrap_or(0.0);
-            let h0c_km_msl = match crate::sites::get_radar_site(site) {
-                Some(s) => crate::sounding::fetch_env_heights(&sources, s.lat, s.lon)
-                    .await
-                    .map(|e| e.h0c_km_msl),
+            let env = match crate::sites::get_radar_site(site) {
+                Some(s) => crate::sounding::fetch_env_heights(&sources, s.lat, s.lon).await,
                 None => None,
             };
-            let h0c = h0c_km_msl.unwrap_or(super::DEFAULT_HEIGHT_0_KM_MSL);
+            let h0c = env
+                .as_ref()
+                .map(|e| e.h0c_km_msl)
+                .unwrap_or(super::DEFAULT_HEIGHT_0_KM_MSL);
+            let hsda = match &env {
+                Some(e) => {
+                    super::HsdaHeights::from_env_heights(e.h0c_km_msl, e.hm20c_km_msl, radar_km_msl)
+                }
+                None => super::HsdaHeights::operational_defaults(radar_km_msl),
+            };
             let default_top_arl = (h0c - radar_km_msl).max(0.0);
             let ml_flat = MeltingLayer::from_zero_c_height(h0c, radar_km_msl);
+
+            // The volume's reflectivity CAPPI (the met-signal rescue state;
+            // built from the ≥ 1° dual-pol sweeps in scan order).
+            let all_dp_sweeps: Vec<&[Radial]> = scan
+                .sweeps()
+                .iter()
+                .map(|s| s.radials())
+                .filter(|radials| {
+                    radials
+                        .first()
+                        .map(|r| r.differential_phase().is_some())
+                        .unwrap_or(false)
+                })
+                .collect();
+            let cappi = super::build_refl_cappi(&all_dp_sweeps);
 
             // The volume's 4°–10° tilts feed the radar MLDA (the
             // operational accumulation spans 3 volumes and merges the
@@ -3215,27 +4118,40 @@ mod live_validation {
                         .unwrap_or(false)
                 })
                 .collect();
-            let ml_radar = super::detect_melting_layer(&ml_sweeps, &params, default_top_arl);
-            let radar_detected = ml_radar
+            let ml_radar = super::detect_melting_layer(
+                &ml_sweeps,
+                &params,
+                default_top_arl,
+                &hsda,
+                Some(&cappi),
+            );
+            let detected_azs = ml_radar
                 .top_km_arl
                 .iter()
                 .zip(ml_flat.top_km_arl.iter())
-                .any(|(a, b)| (a - b).abs() > 1e-9);
+                .filter(|(a, b)| (*a - *b).abs() > 1e-9)
+                .count();
+            let mean = |v: &[f64; 360]| v.iter().sum::<f64>() / 360.0;
             println!(
                 "{site}: h0c {h0c:.2} km MSL ({}), radar {radar_km_msl:.2} km, default ML top \
-                 {default_top_arl:.2} km ARL | radar MLDA {} ({} ML sweeps) top az0 {:.2}",
-                if h0c_km_msl.is_some() {
+                 {default_top_arl:.2} km ARL | Tw0 {:.2} Tw-25 {:.2} km ARL | radar MLDA {} \
+                 ({} ML sweeps, {detected_azs}/360 az differ from flat) mean top {:.2} \
+                 bottom {:.2}",
+                if env.is_some() {
                     "sounding"
                 } else {
                     "fallback"
                 },
-                if radar_detected {
+                hsda.tw0_km_arl,
+                hsda.twm25_km_arl,
+                if detected_azs > 0 {
                     "detected"
                 } else {
                     "default"
                 },
                 ml_sweeps.len(),
-                ml_radar.top_km_arl[0],
+                mean(&ml_radar.top_km_arl),
+                mean(&ml_radar.bottom_km_arl),
             );
 
             // The tilts that could have generated N0H: the lowest sweeps
@@ -3391,30 +4307,59 @@ mod live_validation {
                 continue;
             }
 
+            // How much precipitation this tilt actually carries, for the
+            // site-hour selection table (raw Z ≥ 35 dBZ gate count).
+            let hot_gates: usize = radials
+                .iter()
+                .filter_map(|r| r.reflectivity())
+                .flat_map(|m| m.values())
+                .filter(|v| matches!(v, nexrad_model::data::MomentValue::Value(x) if *x >= 35.0))
+                .count();
+            println!("{site}: precip check — {hot_gates} gates ≥ 35 dBZ on the paired tilt");
+
             // The bounded A/B matrix: documented conventions only, primary
             // first. Nothing outside this list is ever tried.
-            let ab: [(&str, &MeltingLayer, HcaOptions); 4] = [
+            let ab: [(&str, &MeltingLayer, Option<&super::ReflCappi>, HcaOptions); 6] = [
                 (
-                    "radar-mlda/rda-isdp/quantized",
+                    "radar-mlda/metsig+cappi/rda-isdp/quant",
                     &ml_radar,
+                    Some(&cappi),
                     HcaOptions::primary(),
                 ),
                 (
-                    "flat-0c-ml /rda-isdp/quantized",
+                    "flat-0c-ml /metsig+cappi/rda-isdp/quant",
                     &ml_flat,
+                    Some(&cappi),
                     HcaOptions::primary(),
                 ),
                 (
-                    "radar-mlda/isdp-applied/quantized",
+                    "radar-mlda/metsig cold-cappi/rda-isdp",
                     &ml_radar,
+                    None,
+                    HcaOptions::primary(),
+                ),
+                (
+                    "radar-mlda/legacy-rho-flag/rda-isdp",
+                    &ml_radar,
+                    None,
+                    HcaOptions {
+                        metsignal: false,
+                        ..HcaOptions::primary()
+                    },
+                ),
+                (
+                    "radar-mlda/metsig+cappi/isdp-applied",
+                    &ml_radar,
+                    Some(&cappi),
                     HcaOptions {
                         isdp_estimated: true,
                         ..HcaOptions::primary()
                     },
                 ),
                 (
-                    "radar-mlda/rda-isdp/physical",
+                    "radar-mlda/metsig+cappi/rda-isdp/phys",
                     &ml_radar,
+                    Some(&cappi),
                     HcaOptions {
                         quantize_transport: false,
                         ..HcaOptions::primary()
@@ -3423,8 +4368,10 @@ mod live_validation {
             ];
 
             let mut primary_tally = None;
-            for (label, ml, opts) in ab {
-                let Some(derived) = super::compute_hca_impl(radials, &params, ml, opts) else {
+            for (label, ml, ab_cappi, opts) in ab {
+                let Some(derived) =
+                    super::compute_hca_impl(radials, &params, ml, &hsda, ab_cappi, opts)
+                else {
                     continue;
                 };
                 let grid = derived.to_polar_grid();
@@ -3439,7 +4386,7 @@ mod live_validation {
                     "     ab"
                 };
                 println!(
-                    "{site}: {tag} {label:34} | compared {} exact {:.2}% compatible {:.2}% \
+                    "{site}: {tag} {label:40} | compared {} exact {:.2}% compatible {:.2}% \
                      presence {:.2}% (derived {} / twin {})",
                     t.compared,
                     t.exact_pct(),
@@ -3450,6 +4397,7 @@ mod live_validation {
                 );
                 if primary_tally.is_none() {
                     println!("{site}: confusion {}", top_confusions(&t, 8));
+                    println!("{site}: per-class {}", per_class_accuracy(&t));
                     println!(
                         "{site}: presence {}",
                         presence_diagnostic(

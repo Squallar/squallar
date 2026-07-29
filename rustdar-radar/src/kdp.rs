@@ -174,14 +174,27 @@
 //! the documented local derivation with the render path wired
 //! ([`crate::render::render_derived_kdp_to_image`], the `kdp` arm of
 //! `examples/render_product.rs`) and that provenance recorded.
+//!
+//! # Build 21 note (2026-07 cross-check)
+//!
+//! The CODE Build 21.0r1.7 source confirms every constant above unchanged,
+//! but B21's `dpprep.alg` defaults `metsignal_processing = ON` (CCR
+//! NA14-00100): the fleet's meteorological flag and unfold filter come from
+//! the fuzzy met signal, not `rho_smd ≥ 0.9` — see [`crate::dpprep`]'s
+//! module doc. That machinery is implemented and is the HCA chain's
+//! primary; **this module's pipeline keeps the legacy flag its survey
+//! record above was measured with** (three full-roster surveys; the product
+//! ships as a fetch either way), so the figures and the code stay one
+//! thing. The B21-new `ra_gate` φ chain (`DPRA`, window 7) and `DPIN` feed
+//! DP QPE/CDA, not KDP.
 
 #[cfg(test)]
 use crate::dpprep::coherent_phi_rho;
 use crate::dpprep::{
     CORR_THRESH, CombinedRadial, DBZ_THRESH, DBZ_WINDOW, DpInput, ISDP_MAX_QUEUE, LONG_GATE,
-    MD_SNR_THRESH, SHORT_GATE, WINDOW, average_filter, combine_sweep, estimate_isdp, index_into,
-    interpolate, is_high_attenuation_radial, isdp_from_queue, kdp_from_phi, median_filter,
-    meteo_groups, radial_system_phi, unfold_phidp,
+    MD_SNR_THRESH, SHORT_GATE, UNFOLD_MIN_RHO, WINDOW, average_filter, combine_sweep,
+    estimate_isdp, index_into, interpolate, is_high_attenuation_radial, isdp_from_queue,
+    kdp_from_phi, median_filter, meteo_groups, radial_system_phi, unfold_phidp,
 };
 use crate::volumetric::RANGE_BINS;
 use nexrad_model::data::Radial;
@@ -488,7 +501,10 @@ fn process_radial(
     }
 
     let mut phi = radial.phi.clone();
-    unfold_phidp(&mut phi, &radial.rho, init_fdp);
+    // The legacy (metsignal-OFF) filter pair — the configuration this
+    // module's survey record was measured with; see the module doc's B21
+    // note.
+    unfold_phidp(&mut phi, &radial.rho, UNFOLD_MIN_RHO, init_fdp);
 
     let rho_smd = average_filter(&radial.rho, WINDOW);
     let ref_smd = average_filter(&radial.z, DBZ_WINDOW);
