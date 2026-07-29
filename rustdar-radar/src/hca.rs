@@ -255,6 +255,74 @@
 //! RUC/RAP freezing grid plus 3-volume accumulation — state the archive
 //! does not carry). None of these is reachable from a single archived
 //! volume; nothing undocumented was chased.
+//!
+//! # Precipitation re-survey — 2026-07-29, after the B21 upgrade
+//!
+//! The clear-air survey never exercised the rain/hail classes, the
+//! melting-layer ring or the compatible band, so the campaign re-surveyed
+//! on **precipitating site-hours** picked by protocol: the roster scanned
+//! at candidate hours over the previous day (`live_hca_precip_site_scan`,
+//! lowest-cut gates ≥ 35 dBZ as the cheap check), twelve site-hours
+//! selected for climatology — the 2026-07-29 06–08 UTC plains nocturnal
+//! MCS (KUEX 15.8k hot gates, KDDC 7.0k, KAMA 5.3k, KOAX 5.2k, KEAX 2.2k,
+//! KFSD 0.8k, KSGF 0.8k), the 2026-07-28 20–22 UTC afternoon convection
+//! southeast and gulf (KMRX 15.9k, KMLB 9.1k Florida, KMOB 2.3k) and
+//! mountain west (KSFX 3.9k, KMTX 3.4k). No cold-sector stratiform exists
+//! anywhere in late July; that regime remains unexercised.
+//!
+//! **Verdict: pass.** Sixteen measurements (twelve site-hours plus
+//! second/third volumes at the leads): every one cleared the 85% exact
+//! bar (90.9–98.8%); eight of twelve sites cleared the 95% compatible bar
+//! too — KUEX 96.36/96.43, KOAX 95.45/95.56, KDDC 97.76/97.82, KEAX
+//! 95.74/95.75, KSGF 97.80/97.80, KAMA 97.53/97.53, KMLB 96.02/96.22,
+//! KMOB 98.77/98.84 (exact/compatible) — 330k compared gates pooled over
+//! the asserted eight, conclusive under [`validation_policy`]. The
+//! confusion matrix finally carries the precipitation classes, with
+//! per-site producer accuracies at the asserted sites: RA 74–99% over
+//! ~27k twin gates, HR 97–100% (KUEX n=448, KMLB n=143), BD 82–95%
+//! (~5.9k), GR 72–93% (~1.6k), DS 56–98%, WS 39–75% (user 56–93% — the
+//! shortfall lands in GR/DS, the paper's own overlap), RH 40–100% on
+//! small populations. **HSDA validated live**: the twins do emit LH
+//! 110/GH 120, and the single-gate LH/GH cells matched exactly at
+//! KDDC/KAMA/KSGF (7 of 8 across the survey) — wrong before this upgrade,
+//! when those cells could only read RH.
+//!
+//! Four sites are **quarantined** with two-run, multi-volume evidence
+//! (see [`validation_policy::QUARANTINED`]): KFSD (biology-dominated
+//! field, compatible adds nothing, residual = the documented BI↔GC/UK
+//! state fingerprints), KMRX and KSFX (terrain blockage-store residual),
+//! and KMTX (the 07-28 episode's twin ran a model-enhanced melting layer
+//! below our sounding flat — RA→DS 0.8–1.3% — while the same site
+//! **passed both bars** on 2026-07-29 07:57, 96.04/96.16, pinning the
+//! miss on ML state, not transcription). Every quarantined site still
+//! clears the exact bar on every volume.
+//!
+//! **Melting-layer ring**: [`detect_melting_layer`] concluded from wet
+//! snow at none of the sixteen measurements (0/360 azimuths everywhere) —
+//! a single volume's 4°–10° histogram never reaches `min_wet_snow_sum`
+//! = 1500 in July convection, where the operational MLDA accumulates
+//! three volumes and merges the model grid. Every survey ran on the
+//! sounding flat layer, and the radar-vs-flat A/B rows were identical at
+//! all sixteen; the only place the twin's transition band disagreed with
+//! the sounding was the quarantined KMTX episode above. WS populations at
+//! the asserted plains sites (n=36–325 per site, producer 39–75%,
+//! compatible with GR) sat inside the sounding band.
+//!
+//! **A/B in precipitation** (decided on the precipitating tuning set
+//! KUEX/KMLB/KMTX/KMRX/KDDC, confirmed on the holdout
+//! KOAX/KAMA/KMOB/KSFX/KEAX/KSGF/KFSD, which played no part):
+//!
+//! * **B21 met-signal flag vs the legacy ρ/SNR flag**: met signal won 4
+//!   of 5 tuning sites (+0.07…+0.24 exact, one KMTX tie at −0.01) and 7
+//!   of 7 holdouts (+0.06…+0.89, KFSD tie) — the fleet-default
+//!   `metsignal_processing = ON` stays primary, now with survey evidence.
+//! * **Volume-built CAPPI vs cold start**: identical on every measurement
+//!   — every paired N0H tilt sits under 1.0°, where `apply_CAPPI` never
+//!   fires. The warm build stays primary as the closer operational
+//!   approximation for the ≥ 1° consumers.
+//! * **radar-MLDA vs flat**: tied everywhere (no detection).
+//! * **isdp-applied** and **physical-units**: ties to small losses; the
+//!   documented defaults stay.
 
 use crate::dpprep::{
     CORR_THRESH, DBZ_THRESH, DBZ_WINDOW, DpCombined, DpInput, LONG_GATE, MET_SIG_THRESHOLD,
@@ -2237,13 +2305,57 @@ pub(crate) mod validation_policy {
 
     /// Sites measured to miss the bar, with what has been ruled out.
     ///
-    /// Empty until the survey earns an entry: quarantining requires
-    /// recorded evidence from **at least two volumes across at least two
-    /// runs** — one run's miss is a lead, not a verdict. A quarantined
-    /// site stays in [`crate::twin::live::SITES`] and stays measured and
-    /// printed; only the assertion is withheld. Never widen the bar
-    /// instead.
-    pub const QUARANTINED: &[Quarantine] = &[];
+    /// Quarantining requires recorded evidence from **at least two volumes
+    /// across at least two runs** — one run's miss is a lead, not a
+    /// verdict. A quarantined site stays in [`crate::twin::live::SITES`]
+    /// and stays measured and printed; only the assertion is withheld.
+    /// Never widen the bar instead.
+    ///
+    /// Every entry below missed only the **95% compatible** leg — each
+    /// cleared the 85% exact bar on every volume measured (the
+    /// 2026-07-29 precipitation survey; figures in the module doc).
+    pub const QUARANTINED: &[Quarantine] = &[
+        Quarantine {
+            site: "KFSD",
+            scope: Scope::Whole,
+            why: "compatible 91.24/91.66 on volumes 2026-07-29 08:01 and 06:29 \
+                  across two runs (exact 91.23/91.66). The compared field is \
+                  >80% biology, where the compatible pairs add nothing; the \
+                  whole residual is BI↔GC (blockage store + split-cut Doppler \
+                  graft) and BI↔UK (min_Dif_Agg margins) — the clear-air \
+                  survey's documented operational-state fingerprints.",
+        },
+        Quarantine {
+            site: "KMRX",
+            scope: Scope::Whole,
+            why: "compatible 94.34/94.60 on volumes 2026-07-28 20:58 and 19:58 \
+                  across two runs (exact 90.94/91.19, heavy convection). \
+                  Residual: BI↔GC/UK in the ridge-and-valley terrain (blockage \
+                  store) plus UK↔RA ~1% on aggregation margins; the rain-family \
+                  cells themselves are compatible (BD→RA 2%).",
+        },
+        Quarantine {
+            site: "KSFX",
+            scope: Scope::Whole,
+            why: "compatible 93.74/92.49 on volumes 2026-07-28 20:59 and 21:59 \
+                  across two runs (exact 93.42/91.86). Mountain site: BI↔GC/UK \
+                  (blockage store) plus DS→IC in the cold band — the documented \
+                  DS↔IC state fingerprint.",
+        },
+        Quarantine {
+            site: "KMTX",
+            scope: Scope::Whole,
+            why: "compatible 93.69/93.55/93.85 on volumes 2026-07-28 20:57, \
+                  20:27 and 21:29 across two runs (exact 93.51/93.06/93.34), \
+                  driven by RA→DS 0.8-1.3% — the twin's model-enhanced melting \
+                  layer sat below our sounding flat layer through that episode \
+                  (RUC/RAP grid state the archive does not carry) — plus the \
+                  mountain BI↔GC band. The site PASSED both bars on \
+                  2026-07-29 07:57 (96.04/96.16): the derivation is sound when \
+                  the ML state aligns, so the quarantine records state, not \
+                  transcription, error.",
+        },
+    ];
 
     pub fn quarantine(site: &str) -> Option<&'static Quarantine> {
         QUARANTINED.iter().find(|q| q.site == site)
@@ -3733,12 +3845,18 @@ mod policy_tests {
         assert!(policy::volume_is_scoreable(500));
     }
 
+    /// The quarantine table carries exactly the 2026-07-29 precipitation
+    /// survey's four evidence-backed entries, each still measured, each
+    /// `why` naming at least two volumes (the ≥2-volumes/≥2-runs rule
+    /// leaves its trace as multiple slash-separated figures).
     #[test]
-    fn the_quarantine_table_is_empty_and_would_stay_measured() {
-        assert!(
-            policy::QUARANTINED.is_empty(),
-            "an entry appeared: it needs evidence from ≥2 volumes across ≥2 \
-             runs recorded in its `why`, per the table's doc",
+    fn the_quarantine_table_matches_the_precipitation_survey_evidence() {
+        let sites: Vec<&str> = policy::QUARANTINED.iter().map(|q| q.site).collect();
+        assert_eq!(
+            sites,
+            ["KFSD", "KMRX", "KSFX", "KMTX"],
+            "quarantine entries changed: they need evidence from ≥2 volumes \
+             across ≥2 runs recorded in the `why`, per the table's doc",
         );
         for q in policy::QUARANTINED {
             assert!(
@@ -3748,8 +3866,15 @@ mod policy_tests {
                 q.scope,
                 q.why,
             );
+            assert!(
+                q.why.contains("compatible") && q.why.contains('/'),
+                "{}'s why must record the multi-volume compatible evidence",
+                q.site,
+            );
+            assert!(!policy::site_is_asserted(q.site));
         }
         assert!(policy::site_is_asserted("KTLX"));
+        assert!(policy::site_is_asserted("KUEX"));
         assert_eq!(format!("{:?}", policy::Scope::Whole), "Whole");
     }
 
@@ -4036,6 +4161,66 @@ mod live_validation {
                 })
                 .collect(),
             _ => live::SITES.iter().map(|s| (s.to_string(), now)).collect(),
+        }
+    }
+
+    /// The site-hour **selection protocol**'s cheap precipitation check:
+    /// for every roster site × candidate hour (`HCA_SCAN_HOURS`, comma
+    /// separated ISO minutes), fetch the nearest archived volume and count
+    /// the lowest cut's gates at or above 35 dBZ. Pure reconnaissance — it
+    /// asserts nothing; its table picks the survey's `HCA_SITE_HOURS`.
+    ///
+    /// ```text
+    /// HCA_SCAN_HOURS=2026-07-29T08:00,2026-07-28T21:00 \
+    ///   cargo test -p rustdar-radar --release --lib -- --ignored \
+    ///   --nocapture live_hca_precip_site_scan
+    /// ```
+    #[ignore = "hits the live S3 bucket"]
+    #[tokio::test]
+    async fn live_hca_precip_site_scan() {
+        crate::tls::init();
+        let hours: Vec<chrono::NaiveDateTime> = std::env::var("HCA_SCAN_HOURS")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| {
+                chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%dT%H:%M")
+                    .unwrap_or_else(|e| panic!("bad HCA_SCAN_HOURS entry {s}: {e}"))
+            })
+            .collect();
+        let hours = if hours.is_empty() {
+            vec![chrono::Utc::now().naive_utc()]
+        } else {
+            hours
+        };
+        for &when in &hours {
+            for &site in live::SITES {
+                let Some((file, l2_start)) = live::l2_archive_near(site, when).await else {
+                    println!("{when} {site}: no volume");
+                    continue;
+                };
+                let Ok(scan) = file.scan() else {
+                    println!("{when} {site}: volume failed to decode");
+                    continue;
+                };
+                let lowest = scan.sweeps().first();
+                let hot: usize = lowest
+                    .map(|s| {
+                        s.radials()
+                            .iter()
+                            .filter_map(|r| r.reflectivity())
+                            .flat_map(|m| m.values())
+                            .filter(
+                                |v| matches!(v, nexrad_model::data::MomentValue::Value(x) if *x >= 35.0),
+                            )
+                            .count()
+                    })
+                    .unwrap_or(0);
+                println!(
+                    "{when} {site}: vol {l2_start} VCP {:?} — {hot} gates ≥ 35 dBZ in the lowest cut",
+                    scan.coverage_pattern_number(),
+                );
+            }
         }
     }
 
