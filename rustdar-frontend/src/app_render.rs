@@ -885,9 +885,26 @@ impl super::App {
             // The same counter the Level II downloads decrement: one network
             // concurrency budget for the loop, whichever datasource it reads.
             self.loop_mgr.complete_batch(completed_count);
-            for pane_idx in self.loop_mgr.pending_l3_pane_indices() {
-                self.dispatch_pending_loop_l3_pairings(pane_idx);
-            }
+            self.dispatch_freed_loop_slots();
+        }
+    }
+
+    /// Offer the slots a finished batch released to every pane that still owes
+    /// downloads, on **both** datasources.
+    ///
+    /// The budget is one counter, so a pane looping a Level II product and a pane
+    /// looping a Level III one compete for it — and each datasource's completion
+    /// drain is the only thing that ever frees a slot. A drain that re-dispatched
+    /// only its own kind starves the other: once the budget is full of volume
+    /// downloads, nothing re-triggers the pairing queue until a pairing completes,
+    /// and no pairing was ever spawned. The pane sits in `Rendering` with its
+    /// queue intact and nothing running.
+    fn dispatch_freed_loop_slots(&mut self) {
+        for pane_idx in self.loop_mgr.pending_pane_indices() {
+            self.dispatch_pending_loop_downloads(pane_idx);
+        }
+        for pane_idx in self.loop_mgr.pending_l3_pane_indices() {
+            self.dispatch_pending_loop_l3_pairings(pane_idx);
         }
     }
 
@@ -918,10 +935,21 @@ impl super::App {
         // volume's last object while the once-per-volume products take the
         // nearest one. Read from the queue's own product, which cannot have
         // retargeted under it the way the pane can.
+        //
+        // `plan_downloads_for` only ever builds this queue for a product that
+        // names codes, so the `None` arm is unreachable. It puts the queue back
+        // rather than dropping it: an early return that quietly emptied a queue
+        // would make `is_pane_done` report a pane as finished with work still
+        // owed, which is how a loop gets abandoned mid-fetch.
         let Some(pick) = product.level3_volume_pick() else {
-            // Not a Level III product — nothing to pair, and the queue was
-            // derived for one, so it is stale. Dropping it is correct: the
-            // retarget that produced this state already rebuilt the other queue.
+            self.loop_mgr.insert_pending_l3(
+                pane_idx,
+                PendingL3Pairings {
+                    site,
+                    product,
+                    queue,
+                },
+            );
             return;
         };
 
@@ -992,11 +1020,10 @@ impl super::App {
         }
         if completed_count > 0 {
             self.loop_mgr.complete_batch(completed_count);
-            // Dispatch next pending downloads for all panes that have pending work
-            let pane_indices = self.loop_mgr.pending_pane_indices();
-            for pane_idx in pane_indices {
-                self.dispatch_pending_loop_downloads(pane_idx);
-            }
+            // Both datasources: the concurrency budget is shared, so the slots this
+            // batch released belong to whoever is owed work. See
+            // `dispatch_freed_loop_slots`.
+            self.dispatch_freed_loop_slots();
         }
     }
 
@@ -3787,6 +3814,34 @@ mod loop_level3_tests {
         // And the plan is gone, so nothing can re-derive a queue from the site the
         // pane has just left.
         assert!(!mgr.plan_downloads_for(0, L3));
+    }
+
+    /// The two queues are reported by two separate index lists, which is why a
+    /// completion drain has to iterate both.
+    ///
+    /// One concurrency budget serves them, and each drain is the only thing that
+    /// frees a slot. A drain that re-dispatched only its own kind starves the other:
+    /// with the budget full of volume downloads nothing re-triggers the pairing
+    /// queue, because no pairing was ever spawned to complete. That is what
+    /// `dispatch_freed_loop_slots` exists to prevent, and this pins the shape it
+    /// depends on — neither list can stand in for the other.
+    #[test]
+    fn the_two_queues_are_reported_separately_so_both_must_be_dispatched() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_plan(0, plan(2));
+        mgr.plan_downloads_for(0, L2);
+        mgr.set_plan(1, plan(2));
+        mgr.plan_downloads_for(1, L3);
+
+        assert_eq!(mgr.pending_pane_indices(), vec![0], "pane 0 owes volumes");
+        assert_eq!(
+            mgr.pending_l3_pane_indices(),
+            vec![1],
+            "pane 1 owes pairings, and iterating the volume list alone never \
+             reaches it",
+        );
+        assert!(!mgr.is_pane_done(0));
+        assert!(!mgr.is_pane_done(1));
     }
 
     /// Switching the loop off releases both queues and the plan behind them.
