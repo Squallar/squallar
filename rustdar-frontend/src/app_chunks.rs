@@ -12,7 +12,7 @@ use rustdar_radar::types::ScanInfo;
 
 use crate::channels::ChunkResponse;
 use crate::chunk_feed::Retirement;
-use crate::chunk_notify::{ChunkAvailable, Notified};
+use crate::chunk_notify::{ChunkAvailable, Feed, Notified};
 
 impl super::App {
     /// Start or stop feeds so the set matches the sites panes are watching
@@ -40,14 +40,19 @@ impl super::App {
                 .as_ref()
                 .is_some_and(|(site, _)| self.chunk_notify.chunk_link_open(site));
         self.gui.set_chunk_status(status);
+        // Ahead of the `enabled` gate on purpose, for two reasons. Archive
+        // pushes are worth having precisely when the chunk feed is off — they
+        // are what takes the path that is then carrying the site from "up to a
+        // minute late" to "as soon as it is published". And reconnection runs
+        // from here, so returning early would mean a socket that dropped while
+        // the setting was briefly off is never retried after it comes back.
+        self.drive_chunk_notifications(&live);
         if !enabled {
             return;
         }
         // Narrower than `evict_unshown_scans`: a feed has no reader once no pane
         // is live on its site. See `ChunkFeedManager::retain_live`.
         self.chunk_feeds.retain_live(&live);
-
-        self.drive_chunk_notifications(&live);
 
         for site in live {
             self.chunk_feeds.ensure(&site);
@@ -134,18 +139,29 @@ impl super::App {
         if !self.gui.chunk_notifications_enabled() {
             // Drop every socket rather than merely ignoring them, so turning the
             // setting off actually stops the connections.
-            self.chunk_notify.sync_sites(&[], "", || {});
+            self.chunk_notify.sync_sites(&[], &[], "", || {});
             return;
         }
+        // Chunk pushes only mean anything while the live feed is running, since
+        // all they do is bring its next round forward. Archive pushes stand on
+        // their own and are kept either way.
+        let chunks = self.gui.live_chunks_enabled();
+        let feeds: &[Feed] = if chunks { &Feed::ALL } else { &[Feed::Archive] };
         let endpoint = self.gui.notifier_endpoint().to_string();
         let window = self.window.clone();
-        self.chunk_notify.sync_sites(live, &endpoint, move || {
+        self.chunk_notify.sync_sites(live, feeds, &endpoint, move || {
             // From the socket's own thread: without this the frame loop can sleep
             // through the very notification that was supposed to wake it.
             crate::app::notify_redraw(&window);
         });
 
         for notified in self.chunk_notify.drain() {
+            // Nothing should arrive on a feed that was not subscribed, but a
+            // chunk notification acted on with the feed off would build an
+            // assembler nothing will ever drain.
+            if !chunks && matches!(notified, Notified::Chunk(_)) {
+                continue;
+            }
             match notified {
                 // The message named the object, so fetch it outright — no
                 // listing, no discovery, no rollover probe.
@@ -440,6 +456,46 @@ mod tests {
         assert!(
             at("self.poll_data_channels(") < at("self.setup_egui_frame("),
             "the frame is laid out before the chunk drain has applied anything"
+        );
+    }
+
+    /// Reconnection must not be conditional on anything else being busy.
+    ///
+    /// Two source probes, because both halves are positional and neither has a
+    /// type that could carry the requirement. `sync_sites` is the only thing that
+    /// reopens a dropped socket and it only runs on a frame, so the frame has to
+    /// keep coming while a reconnect is owed — and the notification driver has to
+    /// sit ahead of the `enabled` gate, or turning the chunk feed off would
+    /// strand the socket rather than narrowing it to the archive feed.
+    #[test]
+    fn a_down_socket_is_retried_regardless_of_other_activity() {
+        let redraw = include_str!("app.rs");
+        let arm = redraw
+            .find("fn handle_redraw(")
+            .map(|i| &redraw[i..])
+            .expect("handle_redraw is gone from app.rs");
+        assert!(
+            arm.find("self.chunk_notify.reconnect_pending()")
+                .is_some_and(|at| at < arm.find("notify_redraw(&self.window)").unwrap_or(usize::MAX)),
+            "the re-arm dropped its reconnect term, so a socket that goes down \
+             with auto-poll off is never retried"
+        );
+
+        let chunks = include_str!("app_chunks.rs");
+        let drive = chunks
+            .find("fn drive_chunk_feeds(")
+            .map(|i| &chunks[i..])
+            .expect("drive_chunk_feeds is gone");
+        let notify = drive
+            .find("self.drive_chunk_notifications(")
+            .expect("the notification driver left drive_chunk_feeds");
+        let gate = drive
+            .find("if !enabled {")
+            .expect("the enabled gate left drive_chunk_feeds");
+        assert!(
+            notify < gate,
+            "notifications are driven behind the live-chunk gate, so turning the \
+             feed off drops the archive socket and stops reconnecting"
         );
     }
 }

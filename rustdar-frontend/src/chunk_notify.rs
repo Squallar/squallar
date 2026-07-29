@@ -46,8 +46,23 @@ use ewebsock::{WsEvent, WsMessage, WsReceiver, WsSender};
 use rustdar_radar::chunks::{ChunkId, VolumeIndex};
 
 /// Backoff after a failed or dropped connection, doubling to a ceiling.
+///
+/// A ceiling, never a limit: retries continue for as long as the setting is on
+/// and the site is live. A service that is down for an hour is exactly the case
+/// this has to survive, and giving up would leave the site silently on the
+/// slower path with nothing to say so.
 const RECONNECT_BASE: std::time::Duration = std::time::Duration::from_secs(5);
 const RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long a socket may sit in [`LinkState::Connecting`] before it is torn down
+/// and retried.
+///
+/// `ewebsock` reports failures by event, so an ordinary refusal already lands as
+/// `Error` or `Closed`. This covers the case with no event at all: a handshake
+/// black-holed by a proxy, or a browser that neither opens nor rejects. Without
+/// it such a socket sits in `subs` forever and the reconnect loop skips it,
+/// because "already subscribed" and "still trying" are the same state there.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A chunk the service says now exists.
 ///
@@ -129,7 +144,7 @@ pub enum Feed {
 }
 
 impl Feed {
-    const ALL: [Feed; 2] = [Feed::Chunk, Feed::Archive];
+    pub(crate) const ALL: [Feed; 2] = [Feed::Chunk, Feed::Archive];
 
     fn route(self) -> &'static str {
         match self {
@@ -187,6 +202,9 @@ struct Subscription {
     receiver: WsReceiver,
     state: LinkState,
     failures: u32,
+    /// When this socket was opened, so [`CONNECT_TIMEOUT`] can tell a handshake
+    /// still in progress from one that will never finish.
+    since: web_time::Instant,
 }
 
 /// Per-site, per-feed subscriptions to the notifier service.
@@ -203,24 +221,55 @@ impl ChunkNotifier {
         Self::default()
     }
 
-    /// Open a subscription for every site in `sites`, drop the rest.
+    /// Open a subscription to every `feed` for every site in `sites`, drop the
+    /// rest, and retry anything that is due.
+    ///
+    /// Called every frame, which is what makes reconnection unconditional: there
+    /// is no separate retry task to stall, and a socket that dropped is simply a
+    /// key that is missing again on the next pass.
+    ///
+    /// `feeds` is narrowed rather than the whole call being skipped when the live
+    /// chunk feed is off — see [`Feed::Archive`], which is worth pushing exactly
+    /// when chunks are not.
     ///
     /// `wake` is called from the socket's own thread on every event, so the frame
     /// loop does not sleep through a notification.
     pub fn sync_sites(
         &mut self,
         sites: &[String],
+        feeds: &[Feed],
         endpoint: &str,
         wake: impl Fn() + Send + Sync + Clone + 'static,
     ) {
-        self.subs
-            .retain(|(site, _), _| sites.iter().any(|s| s == site));
-        self.backoff
-            .retain(|(site, _), _| sites.iter().any(|s| s == site));
+        let wanted =
+            |site: &String, feed: &Feed| sites.iter().any(|s| s == site) && feeds.contains(feed);
+        self.subs.retain(|(site, feed), _| wanted(site, feed));
+        self.backoff.retain(|(site, feed), _| wanted(site, feed));
+
+        // A handshake that never resolves would otherwise be indistinguishable
+        // from a healthy subscription: the loop below skips every key already in
+        // `subs`, so without this "connecting" is a state a socket can never
+        // leave and the site never reconnects.
+        let stuck: Vec<(String, Feed)> = self
+            .subs
+            .iter()
+            .filter(|(_, sub)| {
+                sub.state == LinkState::Connecting && sub.since.elapsed() >= CONNECT_TIMEOUT
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (site, feed) in stuck {
+            log::warn!("{site}: {feed:?} notification socket never finished connecting; retrying");
+            let failures = self
+                .subs
+                .remove(&(site.clone(), feed))
+                .map_or(1, |s| s.failures + 1);
+            self.schedule_retry(&site, feed, failures);
+        }
 
         let now = web_time::Instant::now();
         for site in sites {
-            for feed in Feed::ALL {
+            for feed in feeds.iter().copied() {
                 let key = (site.clone(), feed);
                 if self.subs.contains_key(&key) {
                     continue;
@@ -234,6 +283,21 @@ impl ChunkNotifier {
                 self.connect(site, feed, endpoint, failures, wake.clone());
             }
         }
+    }
+
+    /// Whether some subscription still owes an attempt — waiting out a backoff,
+    /// or mid-handshake.
+    ///
+    /// The frame loop reads this to decide whether to re-arm. Reconnection runs
+    /// from [`Self::sync_sites`], so without a term of its own it would inherit
+    /// whatever unrelated work happened to be keeping frames coming: turn
+    /// auto-poll off with the socket down and it would never be retried.
+    pub fn reconnect_pending(&self) -> bool {
+        !self.backoff.is_empty()
+            || self
+                .subs
+                .values()
+                .any(|s| s.state == LinkState::Connecting)
     }
 
     fn connect(
@@ -265,6 +329,7 @@ impl ChunkNotifier {
                         receiver,
                         state: LinkState::Connecting,
                         failures,
+                        since: web_time::Instant::now(),
                     },
                 );
             }
@@ -359,6 +424,15 @@ impl ChunkNotifier {
     #[cfg(test)]
     pub(crate) fn is_backing_off(&self, site: &str, feed: Feed) -> bool {
         self.backoff.contains_key(&(site.to_string(), feed))
+    }
+
+    /// Age a socket's handshake, so [`CONNECT_TIMEOUT`] can be exercised without
+    /// the test sleeping for it.
+    #[cfg(test)]
+    pub(crate) fn backdate_handshake(&mut self, site: &str, feed: Feed, by: std::time::Duration) {
+        if let Some(sub) = self.subs.get_mut(&(site.to_string(), feed)) {
+            sub.since = sub.since.checked_sub(by).unwrap_or(sub.since);
+        }
     }
 }
 
@@ -506,7 +580,7 @@ mod tests {
     fn subscriptions_follow_the_live_sites() {
         let mut n = ChunkNotifier::new();
         let sites = ["KTLX".to_string(), "KOUN".to_string()];
-        n.sync_sites(&sites, "wss://127.0.0.1:1", || {});
+        n.sync_sites(&sites, &Feed::ALL, "wss://127.0.0.1:1", || {});
         for site in &sites {
             for feed in [Feed::Chunk, Feed::Archive] {
                 assert!(
@@ -516,7 +590,7 @@ mod tests {
             }
         }
 
-        n.sync_sites(&[], "wss://127.0.0.1:1", || {});
+        n.sync_sites(&[], &Feed::ALL, "wss://127.0.0.1:1", || {});
         assert_eq!(n.subscription_count(), 0, "a socket outlived its site");
         assert!(
             !n.is_backing_off("KTLX", Feed::Chunk) && !n.is_backing_off("KTLX", Feed::Archive),
@@ -530,12 +604,100 @@ mod tests {
     fn re_syncing_the_same_sites_keeps_their_sockets() {
         let mut n = ChunkNotifier::new();
         let sites = ["KTLX".to_string()];
-        n.sync_sites(&sites, "wss://127.0.0.1:1", || {});
+        n.sync_sites(&sites, &Feed::ALL, "wss://127.0.0.1:1", || {});
         let before = n.subscription_count();
         for _ in 0..5 {
-            n.sync_sites(&sites, "wss://127.0.0.1:1", || {});
+            n.sync_sites(&sites, &Feed::ALL, "wss://127.0.0.1:1", || {});
         }
         assert_eq!(n.subscription_count(), before);
+    }
+
+    /// A handshake that never resolves must not become a permanent state.
+    ///
+    /// `sync_sites` skips every key already in `subs`, so a socket that neither
+    /// opens nor fails — a black-holed handshake, a gateway that accepts the
+    /// connection and says nothing — would otherwise occupy its slot forever and
+    /// the site would never reconnect. Kills a mutation that drops the
+    /// `CONNECT_TIMEOUT` sweep.
+    #[test]
+    fn a_handshake_that_never_resolves_is_torn_down_and_retried() {
+        let mut n = ChunkNotifier::new();
+        let sites = ["KTLX".to_string()];
+        n.sync_sites(&sites, &Feed::ALL, "wss://127.0.0.1:1", || {});
+        // Counterweight: a handshake still within its window is left alone,
+        // otherwise this would "pass" by reconnecting on every frame.
+        n.sync_sites(&sites, &Feed::ALL, "wss://127.0.0.1:1", || {});
+        assert!(
+            !n.is_backing_off("KTLX", Feed::Chunk),
+            "a fresh handshake was torn down early"
+        );
+
+        n.backdate_handshake("KTLX", Feed::Chunk, CONNECT_TIMEOUT + RECONNECT_BASE);
+        n.sync_sites(&sites, &Feed::ALL, "wss://127.0.0.1:1", || {});
+        assert!(
+            n.is_backing_off("KTLX", Feed::Chunk),
+            "a socket stuck connecting was never retried"
+        );
+    }
+
+    /// The frame loop's re-arm term. Reconnection only runs on a frame, so if
+    /// this ever reported "nothing pending" while a socket was down, the retry
+    /// would depend on unrelated work happening to keep the loop awake.
+    #[test]
+    fn a_pending_reconnect_is_visible_to_the_frame_loop() {
+        let mut n = ChunkNotifier::new();
+        assert!(
+            !n.reconnect_pending(),
+            "an idle notifier must let the loop sleep"
+        );
+
+        let sites = ["KTLX".to_string()];
+        n.sync_sites(&sites, &Feed::ALL, "wss://127.0.0.1:1", || {});
+        assert!(
+            n.reconnect_pending(),
+            "a handshake in progress must keep the loop awake so it can time out"
+        );
+
+        n.backdate_handshake("KTLX", Feed::Chunk, CONNECT_TIMEOUT + RECONNECT_BASE);
+        n.backdate_handshake("KTLX", Feed::Archive, CONNECT_TIMEOUT + RECONNECT_BASE);
+        n.sync_sites(&sites, &Feed::ALL, "wss://127.0.0.1:1", || {});
+        assert!(
+            n.reconnect_pending(),
+            "a socket waiting out a backoff must keep the loop awake"
+        );
+
+        n.sync_sites(&[], &Feed::ALL, "wss://127.0.0.1:1", || {});
+        assert!(
+            !n.reconnect_pending(),
+            "a retired site must not keep the loop awake forever"
+        );
+    }
+
+    /// Turning the live chunk feed off narrows the subscriptions rather than
+    /// dropping them: archive pushes are worth most exactly when chunks are not
+    /// running, because the archive path is then the one carrying the site.
+    #[test]
+    fn archive_notifications_survive_the_chunk_feed_being_off() {
+        let mut n = ChunkNotifier::new();
+        let sites = ["KTLX".to_string()];
+        n.sync_sites(&sites, &Feed::ALL, "wss://127.0.0.1:1", || {});
+        assert_eq!(n.subscription_count(), 2);
+
+        n.sync_sites(&sites, &[Feed::Archive], "wss://127.0.0.1:1", || {});
+        assert_eq!(
+            n.subscription_count(),
+            1,
+            "narrowing the feeds should leave exactly the archive socket"
+        );
+        assert!(
+            !n.is_backing_off("KTLX", Feed::Chunk),
+            "a de-subscribed feed should not keep retrying"
+        );
+        assert_ne!(
+            n.state_for("KTLX", Feed::Archive),
+            LinkState::Down,
+            "the archive socket was dropped with the chunk feed"
+        );
     }
 
     /// A site with no subscription reports `Down`, which is what makes the

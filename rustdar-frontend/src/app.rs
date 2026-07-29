@@ -548,6 +548,11 @@ impl App {
             || self.gui.is_auto_poll_active()
             || self.gui.any_loop_active()
             || self.chunk_feeds.any_in_flight()
+            // A down socket reconnects from `sync_sites`, which only runs on a
+            // frame. Without this term the retry would depend on something else
+            // happening to keep the loop awake, so turning auto-poll off with the
+            // notifier unreachable would strand it permanently.
+            || self.chunk_notify.reconnect_pending()
         {
             notify_redraw(&self.window);
         }
