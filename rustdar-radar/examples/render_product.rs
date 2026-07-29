@@ -18,6 +18,35 @@ fn main() {
     let out = args.next().expect(usage);
     let elevation: f32 = args.next().map_or(0.5, |e| e.parse().unwrap());
 
+    // VIL density is a Level III product derived from **two** objects of the
+    // same volume — Digital VIL over Enhanced Echo Tops — so it reads two
+    // Level III files instead of a Level II archive: the `DVL` object in the
+    // first positional slot and the `EET` object in `VILD_EET`. A mismatched
+    // volume is refused, exactly as in the app.
+    if product_code == "vild" {
+        let eet_path = std::env::var("VILD_EET").expect(
+            "vild needs VILD_EET=<EET object path>; the archive2 slot takes the DVL object",
+        );
+        let decode = |p: &str| {
+            let bytes = std::fs::read(p).unwrap_or_else(|e| panic!("read {p}: {e}"));
+            nexrad_level3::decode::decode_product(&bytes)
+                .unwrap_or_else(|e| panic!("decode {p}: {e}"))
+        };
+        let (dvl, eet) = (decode(&path), decode(&eet_path));
+        eprintln!(
+            "vild: DVL product {} vol {:?} / EET product {} vol {:?}",
+            dvl.pdb.product_code,
+            rustdar_radar::vild::volume_scan_started(&dvl.pdb),
+            eet.pdb.product_code,
+            rustdar_radar::vild::volume_scan_started(&eet.pdb),
+        );
+        let (rgba, max_range_km, _values) =
+            rustdar_radar::render::render_derived_vild_to_image(&dvl, &eet, lat, lon)
+                .expect("the two objects are not a 134/135 pair of one volume");
+        write_ppm(&out, &rgba, max_range_km);
+        return;
+    }
+
     let data = std::fs::read(&path).expect("read archive file");
     let file = nexrad_data::volume::File::new(data);
     let scan = file.scan().expect("decode archive file");
@@ -46,7 +75,6 @@ fn main() {
         "nrot" => RadarProduct::NormalizedRotation,
         "srv" => RadarProduct::StormRelativeVelocity,
         "eti" => RadarProduct::EchoTopsInterpolated,
-        "vild" => RadarProduct::VilDensity,
         "posh" => RadarProduct::ProbabilityOfSevereHail,
         "mehs" => RadarProduct::MaxExpectedHailSize,
         // The hybrid classification composites the whole volume; the render

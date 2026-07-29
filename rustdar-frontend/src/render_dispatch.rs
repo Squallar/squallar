@@ -215,17 +215,21 @@ impl RenderCache {
 /// Mirrors the `whole_volume` branch in `RenderInput::extract`, which is what
 /// actually decides how much of the `Scan` travels: `EchoTopsInterpolated`
 /// integrates every reflectivity tilt, and `NormalizedRotation` collects every
-/// velocity tilt for its wind-profile fit. `VilDensity` and the hail pair
-/// integrate every reflectivity tilt the way echo tops does — the hail SHI
-/// column reads the same local VIL machinery. All would read a volume still
-/// being assembled as a complete short one — `compute_echo_tops` clamps every
-/// column to the topmost tilt present, with no error and no NaN to notice.
+/// velocity tilt for its wind-profile fit. The hail pair integrates every
+/// reflectivity tilt the way echo tops does — the hail SHI column reads the
+/// same local VIL machinery. All would read a volume still being assembled as a
+/// complete short one — `compute_echo_tops` clamps every column to the topmost
+/// tilt present, with no error and no NaN to notice.
+///
+/// `VilDensity` used to be here, when it was a local quotient of two
+/// whole-volume integrals. It is a Level III product now — the RPG's own `DVL`
+/// over its own `EET` (`rustdar_radar::vild`) — so it reads no Level II tilts
+/// at all and `is_level3()` covers it instead.
 pub fn needs_whole_volume(product: RadarProduct) -> bool {
     matches!(
         product,
         RadarProduct::EchoTopsInterpolated
             | RadarProduct::NormalizedRotation
-            | RadarProduct::VilDensity
             | RadarProduct::ProbabilityOfSevereHail
             | RadarProduct::MaxExpectedHailSize
             | RadarProduct::HydrometeorClassification
@@ -730,6 +734,25 @@ impl RenderDispatcher {
         .flatten()
     }
 
+    /// The object cached for one `(product, AWIPS code, site)`.
+    ///
+    /// The by-code counterpart of [`nearest_tilt`](Self::nearest_tilt), for the
+    /// one product whose cached objects are not tilts of itself but the two
+    /// **inputs** of a derivation: VIL density's `DVL` and `EET`
+    /// (`rustdar_radar::vild`). Selecting those by nearest PDB elevation would
+    /// be meaningless — both are whole-volume products at elevation 0 — and
+    /// would resolve by hash order.
+    fn cached_by_code(
+        &self,
+        product: RadarProduct,
+        site: &str,
+        code: &str,
+    ) -> Option<Arc<Level3Product>> {
+        self.level3_data
+            .get(&(product, code.to_string(), site.to_string()))
+            .map(Arc::clone)
+    }
+
     /// Spawn a Level III render for a pane if applicable.
     /// Returns `true` if a render was spawned.
     ///
@@ -737,6 +760,15 @@ impl RenderDispatcher {
     /// Level II product, derived where the Level II render runs — see
     /// [`spawn_level2_render`](Self::spawn_level2_render) and
     /// [`rustdar_radar::srv`].
+    ///
+    /// VIL density takes the two-object path: it is derived from `DVL` over
+    /// `EET`, so both have to be in hand before anything can be drawn, and the
+    /// radar crate refuses the pair outright if they are not from the same
+    /// volume scan (`rustdar_radar::vild::Refusal`). `false` here — no render
+    /// spawned — is the same answer a product with no cached object gets, so
+    /// the pane keeps whatever it was showing and tries again next frame, which
+    /// is what happens for the volume or two while only one of the pair has
+    /// landed.
     pub fn try_spawn_level3_render(
         &mut self,
         pane_idx: usize,
@@ -745,6 +777,30 @@ impl RenderDispatcher {
         sender: std::sync::mpsc::Sender<RenderResponse>,
         window: Option<WindowRef>,
     ) -> bool {
+        if params.product == RadarProduct::VilDensity {
+            let (Some(dvl), Some(eet)) = (
+                self.cached_by_code(params.product, site, "DVL"),
+                self.cached_by_code(params.product, site, "EET"),
+            ) else {
+                return false;
+            };
+            log::info!("Spawning VIL density render for pane {pane_idx} from DVL over EET");
+            self.spawn_render(
+                pane_idx,
+                params.product,
+                params.elevation,
+                sender,
+                window,
+                crate::offload::Job::Described(crate::offload::JobRequest::Level3Pair {
+                    dvl: std::sync::Arc::clone(&dvl.bytes),
+                    eet: std::sync::Arc::clone(&eet.bytes),
+                    radar_lat: params.lat,
+                    radar_lon: params.lon,
+                }),
+            );
+            return true;
+        }
+
         let Some(l3_msg) = self.nearest_tilt(params.product, site, params.elevation) else {
             return false;
         };
@@ -986,11 +1042,15 @@ mod level3_dispatch_tests {
         d.cache_level3(p, code.to_string(), site.to_string(), l3);
     }
 
-    /// Every remaining Level III product resolves from its cache — none is
+    /// Every single-object Level III product resolves from its cache — none is
     /// filtered. Storm-relative velocity is deliberately absent: it is a
     /// Level II product now and never reaches this cache at all — and the
     /// hydrometeor classification joined it (the hybrid composite derives
     /// from Level II; see `rustdar_radar::hhc`).
+    ///
+    /// VIL density is absent for the opposite reason: it resolves **two**
+    /// objects by AWIPS code rather than one by nearest tilt, and
+    /// `vil_density_needs_both_of_its_objects` covers it.
     #[test]
     fn every_level3_product_resolves_from_its_cache() {
         let mut d = RenderDispatcher::new();
@@ -1012,6 +1072,109 @@ mod level3_dispatch_tests {
                 .is_none(),
             "nothing was cached for SRV, and nothing ever is: it derives from Level II",
         );
+
+        // The whole Level III roster is accounted for by exactly one of the
+        // two shapes, so a product added to `is_level3` cannot land here
+        // unresolvable.
+        for p in RadarProduct::all().iter().filter(|p| p.is_level3()) {
+            let codes = p
+                .level3_products()
+                .unwrap_or_else(|| panic!("{} is Level III but names no codes", p.name()));
+            if codes.len() == 1 {
+                assert!(
+                    d.nearest_tilt(*p, "KMPX", 0.5).is_some(),
+                    "{} names one object but did not resolve by nearest tilt",
+                    p.name(),
+                );
+            } else {
+                assert_eq!(
+                    *p,
+                    RadarProduct::VilDensity,
+                    "{} names {codes:?} — a new multi-object product needs a \
+                     resolution path in `try_spawn_level3_render`",
+                    p.name(),
+                );
+            }
+        }
+    }
+
+    /// VIL density resolves its two inputs **by AWIPS code**, and needs both:
+    /// it is `DVL` over `EET` (`rustdar_radar::vild`), so one object alone
+    /// draws nothing rather than half a field.
+    ///
+    /// By code, not by nearest tilt, because both objects are whole-volume
+    /// products whose PDB elevation is the same — a nearest-tilt selection
+    /// would resolve by hash order and hand the numerator's object over as the
+    /// denominator's half the time.
+    #[test]
+    fn vil_density_needs_both_of_its_objects() {
+        let mut d = RenderDispatcher::new();
+        assert!(
+            d.cached_by_code(RadarProduct::VilDensity, "KMPX", "DVL")
+                .is_none(),
+            "nothing cached yet",
+        );
+
+        cache(
+            &mut d,
+            RadarProduct::VilDensity,
+            "DVL",
+            "KMPX",
+            product(134, 0, 0),
+        );
+        assert_eq!(
+            d.cached_by_code(RadarProduct::VilDensity, "KMPX", "DVL")
+                .map(|p| p.message.pdb.product_code),
+            Some(134),
+        );
+        assert!(
+            d.cached_by_code(RadarProduct::VilDensity, "KMPX", "EET")
+                .is_none(),
+            "the denominator has not landed — nothing to divide by",
+        );
+
+        cache(
+            &mut d,
+            RadarProduct::VilDensity,
+            "EET",
+            "KMPX",
+            product(135, 0, 0),
+        );
+        assert_eq!(
+            d.cached_by_code(RadarProduct::VilDensity, "KMPX", "EET")
+                .map(|p| p.message.pdb.product_code),
+            Some(135),
+        );
+        // The numerator is still its own object: caching the second must not
+        // displace the first.
+        assert_eq!(
+            d.cached_by_code(RadarProduct::VilDensity, "KMPX", "DVL")
+                .map(|p| p.message.pdb.product_code),
+            Some(134),
+        );
+
+        // Another site's objects are never borrowed, and neither are the
+        // identically-coded objects the single-field products cache.
+        assert!(
+            d.cached_by_code(RadarProduct::VilDensity, "KTLX", "DVL")
+                .is_none(),
+        );
+        cache(
+            &mut d,
+            RadarProduct::VerticallyIntegratedLiquid,
+            "DVL",
+            "KTLX",
+            product(134, 0, 0),
+        );
+        assert!(
+            d.cached_by_code(RadarProduct::VilDensity, "KTLX", "DVL")
+                .is_none(),
+            "VIL's own DVL is not VIL density's — each product fetches its own",
+        );
+
+        // And it is not a whole-volume Level II product any more.
+        assert!(!needs_whole_volume(RadarProduct::VilDensity));
+        assert!(RadarProduct::VilDensity.is_level3());
     }
 
     /// Another site's products must never be borrowed. Both sites carry the

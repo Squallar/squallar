@@ -137,23 +137,43 @@
 //!   No documented convention closes the residual, and per the campaign's
 //!   early-stop rule nothing undocumented was chased.
 //!
-//! Product 134 therefore **stays a Level III fetch**; this module ships as
-//! the local input to [`compute_vil_density`] (VIL density has no Level III
-//! twin anywhere) with that provenance documented.
+//! Product 134 therefore **stays a Level III fetch**, and this module ships
+//! with that provenance documented: as the twin harness's derived side, as
+//! the hail SHI column's liquid-water machinery, and as the retired VIL
+//! density input recorded below.
 //!
-//! # VIL density — validated 2026-07-29 against the RPG's own two inputs
+//! # VIL density — measured 2026-07-29, and the local derivation retired
 //!
-//! [`compute_vil_density`] shipped "by construction": no gridded L3
-//! VIL-density product exists, so it was never measured. It now has been.
-//! There is no twin, but the RPG publishes **both of its inputs** for the
-//! same volume, so the reference is their quotient on the shared 1° × 1 km
-//! grid — `1000 · DVL / ((EET_published + 0.5) · 304.8)`, product 134 over
-//! product 135, the same arithmetic [`vil_density_g_m3`] applies to the local
-//! derivations. [`vild_validation_policy`] documents the construction, the
-//! bin-centre datum and the reference's own quantization noise floor
-//! (±0.5 kft of echo top = ±0.057 g/m³ at a 30 kft top and VILD 3.5, ~±0.1
-//! g/m³ once product 134's log-region step is included — which is why no
-//! value-agreement bar is pinned, only a decision bar).
+//! **Outcome first**: VIL density is no longer computed here. It is now
+//! [`crate::vild`] — the RPG's own two published products divided,
+//! `1000 · DVL / ((EET_published + 0.5) · 304.8)` — because the survey below
+//! measured the local `compute_vil / compute_eet` quotient against exactly
+//! that expression and found it **effectively mute at the thresholds the
+//! product is read for**. The residual is [`compute_vil`]'s, and it is the
+//! DQA gap recorded above, which is not reachable from raw Level II. Rather
+//! than ship a hail discriminator that does not discriminate, the product was
+//! rebuilt as the reference itself: both inputs are already fetched and drawn
+//! by the app, so the change costs no new datasource and the shipped field is
+//! now as accurate as the RPG's own products allow.
+//!
+//! Its remaining error is the reference's own **quantization noise floor**,
+//! which is therefore now the product's stated accuracy limit: product 135
+//! publishes whole kilofeet, so ±0.5 kft of echo top is ±0.057 g/m³ at a
+//! 30 kft top and VILD 3.5 (±0.113 at 15 kft, ±0.035 at 50), and ~±0.1 g/m³
+//! once product 134's log-region step is included. See
+//! [`crate::vild::quantization_halfwidth_g_m3`]. That floor is why the bars
+//! below are decision bars rather than value-agreement bars, and why nothing
+//! anywhere claims this field to better than about a tenth of a g/m³.
+//!
+//! **The survey's construction is the shipped product.** The harness does not
+//! rebuild the quotient: [`vild_validation_policy`] re-exports
+//! [`crate::vild`]'s own constructors, and
+//! `vild::tests::the_shipped_path_is_the_surveys_reference_construction` pins
+//! that [`crate::vild::compute_vild`] composes them in exactly the order the
+//! harness does. So the survey below now scores the field the app draws by
+//! construction, and its PRIMARY row is expected to be perfect; what the run
+//! still measures is the two **attribution** rows, which are the record of how
+//! far the retired local inputs sat from the RPG's.
 //!
 //! **Survey**: 41 precipitating site-hours over 2026-07-28 21 UTC →
 //! 2026-07-29 18 UTC, every site-hour the shared reconnaissance scan
@@ -164,9 +184,8 @@
 //! mid-south (KLZK, KSHV, KSGF, KTLX) and mountain west (KSFX 3,915, KMTX
 //! 3,435). 310,215 domain cells.
 //!
-//! **Verdict: the survey does not conclude, and every direction it does
-//! resolve is a miss. Do not read this product at Amburn & Wolf's
-//! thresholds.**
+//! **Verdict on the local derivation: the survey does not conclude, and every
+//! direction it does resolve is a miss.** This is what retired it.
 //!
 //! * **The pinned per-site legs all pass, and passing them means nothing
 //!   here.** Threshold agreement runs 99.45–100% at both breaks (bar 95%) and
@@ -229,15 +248,54 @@
 //! reference-flagged conclusiveness gate. The 28 later site-hours played no
 //! part in either and reproduced every figure.
 //!
-//! What this does **not** say: the product's arithmetic is right (the offline
-//! pins hand-compute it), its wiring is right, and away from the decision
-//! region it tracks the RPG's own quotient to a few hundredths of a g/m³.
-//! What it says is that the one thing VIL density is *read* for — Amburn &
-//! Wolf's severe-hail break — is where it fails, that it fails by
-//! under-warning rather than the suspected over-warning, and that the cause
-//! is [`compute_vil`]'s residual, not [`crate::eet::compute_eet`]'s. Whether
-//! that means retiring the product, relabelling it, or fixing VIL is a
-//! decision for the campaign, not for this module.
+//! What this did **not** say: that the local quotient's arithmetic was wrong
+//! (the offline pins hand-computed it), or its wiring. What it said is that the
+//! one thing VIL density is *read* for — Amburn & Wolf's severe-hail break —
+//! was where it failed, that it failed by under-warning rather than the
+//! suspected over-warning, and that the cause was [`compute_vil`]'s residual,
+//! not [`crate::eet::compute_eet`]'s: **fixing the echo top would not have
+//! moved the product**. The campaign's decision was the third option the
+//! attribution left open — take the reference as the product. See
+//! [`crate::vild`].
+//!
+//! ## Re-run against the shipped Level III product, 2026-07-29
+//!
+//! Eight precipitating site-hours (KUEX, KOAX, KEAX, KSGF, KLZK, KDDC at 12
+//! UTC, KTLH and KMLB at 18 UTC — 1,700 to 55,800 lowest-cut gates ≥ 35 dBZ
+//! each), 83,098 domain cells pooled. The result is what the construction
+//! forces, and confirming it is the point of the run:
+//!
+//! * **PRIMARY (the shipped [`crate::vild::compute_vild`], entry point and
+//!   all)**: threshold agreement **100.00%** at both breaks at every
+//!   site-hour, false-high 0, MAE **0.0000** g/m³, within ±0.5 and within ±15%
+//!   both 100.00%, pooled **POD 100.00% / FAR 0.00% / CSI 100.00%** over the
+//!   33 cells the reference flags at 3.5 and the 25 it flags at 4.0. Not
+//!   "close": bit-identical, which is the anti-drift pin passing on live data.
+//! * **The retired local quotient**, scored on the same volumes: POD **3.03%**
+//!   at 3.5, **0.00%** at 4.0, FAR 66.67%, and −5.55 … −7.92 g/m³ of signed
+//!   bias at the site-hours with decision-region mass. Attribution reproduces
+//!   too — our-VIL/RPG-top POD 3.03%, RPG-DVL/our-top POD 96.97%.
+//! * **The datum A/B** still costs a decision: dividing by the published floor
+//!   instead of the bin centre moves POD 100% → 97.06% at 3.5 (one cell of 34).
+//! * The pooled **conclusiveness gate still reads INCONCLUSIVE** — 33
+//!   reference-flagged cells against
+//!   [`vild_validation_policy::MIN_FLAGGED_CELLS`]'s 200 — for exactly the
+//!   reason it did over 41 site-hours (154 cells): real volumes carry tens of
+//!   cells above 3.5 g/m³, not hundreds. That gate is now a statement about
+//!   the *weather sample*, and it has deliberately **not** been relaxed: the
+//!   failure mode it guards against (a mute derivation shrinking its own
+//!   sample out of judgement) is impossible for a product that is its own
+//!   reference, but it will still catch the next derivation that is not.
+//!
+//! Rendered fields for the record. KUEX 12:00:54, a stratiform-dominant MCS:
+//! 39,004 defined cells, mostly 0.3–1.5 g/m³ with discrete 2–3.5 g/m³ cores
+//! sitting on the same NNE-through-SE arc the 0.5° reflectivity carries its
+//! 50+ dBZ cells on, and nothing crossing 3.5 — correctly, for that storm
+//! mode. KDDC 12:01:01, a hail day: 65 cells ≥ 1 g/m³, 21 ≥ 3.5, 19 ≥ 4.0,
+//! maximum **12.06** g/m³ in one compact cluster. That maximum is well past
+//! Amburn & Wolf's scale and it is the **RPG's own** — a large `DVL` over a low
+//! published `EET`, reproduced cell for cell on both sides of the comparison —
+//! so it is the reference's behaviour to read, not a defect here.
 
 use crate::types::RadarProduct;
 use crate::volumetric::{
@@ -451,69 +509,6 @@ fn compute_vil_impl(scan: &Scan, opts: VilOptions) -> VolumetricGrid {
             }
         }
     }
-    VolumetricGrid {
-        values,
-        range_bins: RANGE_BINS,
-    }
-}
-
-/// One kilofoot in metres, exactly: 1000 ft · 0.3048 m/ft.
-const KFT_TO_M: f32 = 304.8;
-
-/// VIL density for one cell, g/m³, per Amburn & Wolf (1997, *Weather and
-/// Forecasting* 12, 473–478): `VILD = 1000 · VIL / ET` with VIL in kg/m²
-/// and the echo top in **metres** — the paper divides the WSR-88D VIL
-/// product by the WSR-88D echo-top product's height as published, so the
-/// height here is the ET product's own kft-above-MSL convention, converted
-/// to metres. `NaN` when either input is undefined (or a non-positive top,
-/// which MSL heights at real sites never produce).
-pub fn vil_density_g_m3(vil_kg_m2: f32, echo_top_kft_msl: f32) -> f32 {
-    if !vil_kg_m2.is_finite() || !echo_top_kft_msl.is_finite() || echo_top_kft_msl <= 0.0 {
-        return f32::NAN;
-    }
-    1000.0 * vil_kg_m2 / (echo_top_kft_msl * KFT_TO_M)
-}
-
-/// VIL density over the volume: [`compute_vil`]'s field divided by
-/// [`crate::eet::compute_eet`]'s, cell for cell, per [`vil_density_g_m3`].
-///
-/// Both inputs are the local Level II derivations, and there is no Level III
-/// VIL-density product anywhere to fetch. It is nonetheless **measured**, not
-/// validated by construction: the RPG publishes both inputs for the same
-/// volume, so `1000 · DVL / ((EET + 0.5) · 304.8)` is a reference for the
-/// quotient itself. See the module doc's 2026-07-29 survey — it does **not**
-/// support reading this field at Amburn & Wolf's thresholds (below 3.5 g/m³
-/// severe hail is rare, at 4.0 and above nearly universal): over 41
-/// precipitating site-hours the derivation reproduced 13.6% of the
-/// reference's 3.5 g/m³ cells and 1.9% of its 4.0 g/m³ cells, reading
-/// systematically **low** in storm cores, and the input attribution puts the
-/// whole residual on [`compute_vil`] rather than [`crate::eet::compute_eet`].
-///
-/// `radar_height_ft` is the site height above MSL in feet
-/// ([`crate::eet::radar_height_ft_near`] for a render); it enters only
-/// through the echo top's MSL datum, exactly as the paper's use of the ET
-/// product implies. At high-elevation sites the MSL top overstates the
-/// column's physical depth by the site elevation and VILD reads
-/// correspondingly low — the paper's own convention, kept rather than
-/// corrected, so the numbers stay comparable to the operational literature.
-///
-/// A cell is defined only where **both** inputs are: a weak-echo column
-/// carries VIL 0.0 but no 18.3 dBZ echo top, so it is `NaN` here, not 0.
-pub fn compute_vil_density(scan: &Scan, radar_height_ft: f64) -> VolumetricGrid {
-    let vil = compute_vil(scan);
-    let eet = crate::eet::compute_eet(scan, radar_height_ft);
-    let values = vil
-        .values
-        .iter()
-        .zip(&eet.values)
-        .map(|(vil_row, et_row)| {
-            vil_row
-                .iter()
-                .zip(et_row)
-                .map(|(&v, &et)| vil_density_g_m3(v, et))
-                .collect()
-        })
-        .collect();
     VolumetricGrid {
         values,
         range_bins: RANGE_BINS,
@@ -949,50 +944,6 @@ mod tests {
             "got {} — the repeat's reflectivity leaked into the sum",
             grid.values[61][30],
         );
-    }
-
-    /// Amburn & Wolf's formula against hand-computed pairs: 20 kg/m² over a
-    /// 10 km top (32.8084 kft = 10,000 m) is exactly 2.0 g/m³, and 35 kg/m²
-    /// over the same top is their 3.5 g/m³ severe-hail break. `NaN` in
-    /// either slot, or a non-positive top, is `NaN` out.
-    #[test]
-    fn vil_density_reproduces_the_amburn_wolf_pairs() {
-        assert!((vil_density_g_m3(20.0, 32.8084) - 2.0).abs() < 1e-5);
-        assert!((vil_density_g_m3(35.0, 32.8084) - 3.5).abs() < 1e-5);
-        // One kilofoot of top: 1000·VIL/304.8.
-        assert!((vil_density_g_m3(1.0, 1.0) - 3.280_84).abs() < 1e-4);
-
-        assert!(vil_density_g_m3(f32::NAN, 32.8).is_nan(), "undefined VIL");
-        assert!(vil_density_g_m3(20.0, f32::NAN).is_nan(), "undefined top");
-        assert!(vil_density_g_m3(f32::NAN, f32::NAN).is_nan());
-        assert!(vil_density_g_m3(20.0, 0.0).is_nan(), "a zero top divides");
-        assert!(vil_density_g_m3(20.0, -1.0).is_nan());
-        assert!(vil_density_g_m3(f32::INFINITY, 32.8).is_nan());
-    }
-
-    /// The volume product wires the two derivations together: on the golden
-    /// scan's topped 50 dBZ column (az 10, r 30) VIL is 5.157956 kg/m² and
-    /// the echo top (radar at 0 ft MSL) is the 3.5° beam centre at 30.5 km,
-    /// 6.306813 kft — VILD = 1000·5.157956/(6.306813·304.8) =
-    /// **2.683198 g/m³**. Columns where either input is undefined are `NaN`:
-    /// az 45 carries VIL (a defined 0.0-ish weak column) but no echo top,
-    /// az 50 carries neither.
-    #[test]
-    fn vil_density_composes_the_two_derivations() {
-        let grid = compute_vil_density(&golden_scan(), 0.0);
-        assert_eq!(grid.range_bins, RANGE_BINS);
-        let r = 30;
-        assert!(
-            (grid.values[10][r] - 2.683_198).abs() < 1e-4,
-            "topped core column: got {}",
-            grid.values[10][r],
-        );
-        assert!(
-            grid.values[45][r].is_nan(),
-            "VIL defined but no echo top: VILD must be NaN, not 0",
-        );
-        assert!(grid.values[50][r].is_nan(), "a censored column");
-        assert!(grid.values[10][GATES].is_nan(), "beyond the data extent");
     }
 
     /// The A/B knobs really vary the conventions they name: on a uniform
@@ -2087,28 +2038,50 @@ mod vild_policy_tests {
         assert_eq!(none.within_abs_pct(), 0.0);
     }
 
-    /// The harness scores the **shipped** product: `density_field` over the
-    /// two local derivations must reproduce [`super::compute_vil_density`]
-    /// cell for cell, `NaN`s included. If this ever drifts, the survey is
-    /// measuring something the app does not draw.
+    /// The harness scores the **shipped** product because its constructors
+    /// *are* the shipped product's: this is the pin that they have not been
+    /// forked back apart into a private copy, which is how a survey comes to
+    /// bless a field the app does not draw.
+    ///
+    /// The composition — that [`crate::vild::compute_vild`] applies these in
+    /// this order, at each product's own gate spacing — is pinned by
+    /// `vild::tests::the_shipped_path_is_the_surveys_reference_construction`,
+    /// which has the synthetic message pairs to do it with.
     #[test]
     fn the_harness_scores_the_shipped_vil_density_product() {
-        let scan = super::tests::golden_scan();
-        let shipped = super::compute_vil_density(&scan, 0.0);
-        let composed = policy::density_field(
-            &super::compute_vil(&scan).values,
-            &crate::eet::compute_eet(&scan, 0.0).values,
-        );
-        assert_eq!(composed.len(), shipped.values.len());
-        for (az, (a, b)) in composed.iter().zip(&shipped.values).enumerate() {
-            assert_eq!(a.len(), b.len());
+        for &dvl in &[0.0f32, 0.011, 3.7, 34.4, 35.0, 62.0, 200.0, f32::NAN] {
+            for &kft in &[0.0f32, -1.0, 1.0, 15.0, 32.0, 69.0, f32::NAN] {
+                let harness = policy::reference_vild(dvl, kft);
+                let shipped = crate::vild::vild_from_published(dvl, kft);
+                assert!(
+                    (harness.is_nan() && shipped.is_nan())
+                        || harness.to_bits() == shipped.to_bits(),
+                    "DVL {dvl} over {kft} kft: harness {harness}, shipped {shipped} — the \
+                     harness's reference has been forked from the shipped product",
+                );
+            }
+        }
+
+        // And the two field constructors, on a field carrying every category:
+        // values either side of both breaks, a defined zero, one-sided cells,
+        // a zero top and an undefined top.
+        let dvl = vec![vec![35.0f32, 34.0, 0.0, 20.0, f32::NAN, 35.0, 35.0]];
+        let tops = vec![vec![32.0f32, 32.0, 32.0, f32::NAN, 40.0, 0.0, -1.0]];
+        let harness = policy::density_field(&dvl, &policy::published_top_field(&tops));
+        let shipped = crate::vild::density_field(&dvl, &crate::vild::published_top_field(&tops));
+        assert_eq!(harness.len(), shipped.len());
+        for (az, (a, b)) in harness.iter().zip(&shipped).enumerate() {
             for (r, (&x, &y)) in a.iter().zip(b).enumerate() {
                 assert!(
-                    (x.is_nan() && y.is_nan()) || (x - y).abs() < 1e-9,
+                    (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits(),
                     "az {az} r {r}: harness {x}, shipped {y}",
                 );
             }
         }
+        assert!(
+            harness[0][..3].iter().all(|v| v.is_finite()),
+            "the comparison must cover defined cells, not only NaNs",
+        );
     }
 
     /// The resampler feeds the reference physical values through the
@@ -2219,13 +2192,21 @@ mod vild_policy_tests {
 }
 
 /// The live VIL-density harness: score the shipped
-/// [`compute_vil_density`] against a reference built from the RPG's **own two
-/// inputs** for the same volume — product 134 (`DVL`) over product 135
-/// (`EET`) — at Amburn & Wolf's decision thresholds.
+/// [`crate::vild::compute_vild`] against a reference built from the RPG's
+/// **own two inputs** for the same volume — product 134 (`DVL`) over product
+/// 135 (`EET`) — at Amburn & Wolf's decision thresholds.
 ///
 /// VIL density has no Level III twin, so this is the only oracle there is.
 /// See [`vild_validation_policy`] for the reference's construction and its
 /// quantization noise floor.
+///
+/// Since the product **is** that reference, the PRIMARY row is perfect by
+/// construction and its job is to prove it (a miss means the shipped path and
+/// the reference have drifted — start at
+/// `vild::tests::the_shipped_path_is_the_surveys_reference_construction`). The
+/// rows that still measure something are the two attribution mixes and the
+/// retired local quotient, which record how far the local derivations sat from
+/// the RPG's own products.
 ///
 /// Site-hours come from `VILD_SITE_HOURS` (`SITE=YYYY-MM-DDTHH:MM`, comma or
 /// semicolon separated, a site may appear more than once); unset, the roster
@@ -2264,10 +2245,18 @@ mod live_vild_validation {
         }
     }
 
-    /// The rows every site-hour is scored on: the shipped product, then the
-    /// two attribution mixes (one input swapped at a time), then the
-    /// reference-datum A/B. Pooled in this order.
-    const ROWS: usize = 4;
+    /// The rows every site-hour is scored on, pooled in this order: the
+    /// shipped product, the two attribution mixes (one input swapped for the
+    /// retired local derivation at a time), the fully local quotient the
+    /// product used to be, and the reference-datum A/B.
+    const ROW_LABELS: [&str; 5] = [
+        "PRIMARY shipped L3",
+        "attr our-VIL/RPG-top",
+        "attr RPG-DVL/our-top",
+        "retired local/local",
+        "ab  ref-on-floor-top",
+    ];
+    const ROWS: usize = ROW_LABELS.len();
 
     /// One scored row of the survey: a candidate VIL-density field against
     /// the reference, at both breaks. Returns the two confusions so the run
@@ -2412,14 +2401,29 @@ mod live_vild_validation {
                 })
                 .collect();
 
-            // Ours, and the two attribution mixes — one input swapped at a
-            // time, so a residual can be pinned on VIL or on the echo top.
+            // The shipped product, straight through its own entry point —
+            // *not* rebuilt from the fields above, so this row measures what
+            // the app draws, product-code checks and volume pairing included.
+            // It is the reference by construction, and the run's job is to
+            // prove that it still is.
+            let ours = match crate::vild::compute_vild(&dvl.message, &eet.message) {
+                Ok(grid) => grid.values,
+                Err(refusal) => {
+                    println!("{site}: SKIP — the shipped path refused: {refusal:?}");
+                    continue;
+                }
+            };
+
+            // The two attribution mixes — one input swapped for the retired
+            // local derivation at a time — and the retired quotient itself, so
+            // the residual it had can still be pinned on VIL or on the echo
+            // top.
             let radar_height_ft = f64::from(eet.message.pdb.height);
             let our_vil = super::compute_vil(&scan);
             let our_eet = crate::eet::compute_eet(&scan, radar_height_ft);
-            let ours = policy::density_field(&our_vil.values, &our_eet.values);
             let our_vil_rpg_top = policy::density_field(&our_vil.values, &rpg_tops);
             let rpg_vil_our_top = policy::density_field(&dvl_field, &our_eet.values);
+            let local_only = policy::density_field(&our_vil.values, &our_eet.values);
 
             let hot = scan
                 .sweeps()
@@ -2465,10 +2469,11 @@ mod live_vild_validation {
             );
 
             for (i, row) in [
-                print_row("PRIMARY ours", &ours, &reference),
-                print_row("attr our-VIL/RPG-top", &our_vil_rpg_top, &reference),
-                print_row("attr RPG-DVL/our-top", &rpg_vil_our_top, &reference),
-                print_row("ab  ref-on-floor-top", &ours, &reference_floor),
+                print_row(ROW_LABELS[0], &ours, &reference),
+                print_row(ROW_LABELS[1], &our_vil_rpg_top, &reference),
+                print_row(ROW_LABELS[2], &rpg_vil_our_top, &reference),
+                print_row(ROW_LABELS[3], &local_only, &reference),
+                print_row(ROW_LABELS[4], &ours, &reference_floor),
             ]
             .into_iter()
             .enumerate()
@@ -2570,19 +2575,12 @@ mod live_vild_validation {
                 c.csi_pct(),
             );
         }
-        // The input attribution, pooled: which of the two inputs the residual
-        // belongs to. Row 1 swaps our echo top out for the RPG's (so what is
-        // left is VIL's), row 2 swaps our VIL out for the RPG's (so what is
-        // left is the echo top's).
-        for (label, row) in [
-            "PRIMARY ours",
-            "attr our-VIL/RPG-top",
-            "attr RPG-DVL/our-top",
-            "ab  ref-on-floor-top",
-        ]
-        .into_iter()
-        .zip(pooled_rows)
-        {
+        // The input attribution, pooled: which of the two retired local inputs
+        // the old product's residual belonged to. Row 1 swaps our echo top out
+        // for the RPG's (so what is left is VIL's), row 2 swaps our VIL out for
+        // the RPG's (so what is left is the echo top's), row 3 is the retired
+        // product itself.
+        for (label, row) in ROW_LABELS.into_iter().zip(pooled_rows) {
             for (i, threshold) in [
                 policy::HAIL_RARE_BELOW_G_M3,
                 policy::HAIL_NEAR_CERTAIN_AT_G_M3,

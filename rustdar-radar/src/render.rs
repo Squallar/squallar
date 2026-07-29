@@ -616,10 +616,6 @@ pub fn render_radar_to_image_full(
         return render_echo_tops_interp_to_image(data, radar_lat, radar_lon);
     }
 
-    if product == types::RadarProduct::VilDensity {
-        return render_vil_density_to_image(data, radar_lat, radar_lon);
-    }
-
     if matches!(
         product,
         types::RadarProduct::ProbabilityOfSevereHail | types::RadarProduct::MaxExpectedHailSize
@@ -953,19 +949,33 @@ pub fn render_echo_tops_interp_to_image(
     Some(output)
 }
 
-/// Render VIL density: local Digital VIL over local echo tops
-/// ([`crate::vil::compute_vil_density`]), a 1° × 1 km polar grid in g/m³
-/// painted with the VIL-density palette. Tilt-independent — every elevation
-/// request renders the same volume product. The site height the echo top's
-/// MSL datum needs comes from the nearest-site table, as the EET render
-/// path's does.
-pub fn render_vil_density_to_image(
-    scan: &Scan,
+/// Render VIL density from the RPG's own two published products for one
+/// volume — Digital VIL (134) over Enhanced Echo Tops (135), see
+/// [`crate::vild`] — as a 1° × 1 km polar grid in g/m³ painted with the
+/// VIL-density palette.
+///
+/// The Level III counterpart of [`render_level3_message_to_image`], separate
+/// only because it takes **two** messages: the palette, the value grid the
+/// hover reads and the legend downstream are the ordinary Level III display
+/// pipeline's.
+///
+/// `None` where the pair cannot make a field — a mismatched volume above all,
+/// which is refused rather than painted ([`crate::vild::Refusal`]). Drawing
+/// nothing is the same answer the hail products give without a sounding, and
+/// the reason is logged.
+pub fn render_derived_vild_to_image(
+    dvl: &nexrad_level3::model::Level3Message,
+    eet: &nexrad_level3::model::Level3Message,
     radar_lat: f64,
     radar_lon: f64,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
-    let radar_height_ft = crate::eet::radar_height_ft_near(radar_lat, radar_lon);
-    let grid = crate::vil::compute_vil_density(scan, radar_height_ft);
+    let grid = match crate::vild::compute_vild(dvl, eet) {
+        Ok(grid) => grid,
+        Err(refusal) => {
+            log::info!("VIL density: nothing to render — {refusal:?}");
+            return None;
+        }
+    };
     let max_range = grid.range_bins as f64;
     let output = render_with_projection(
         radar_lat,

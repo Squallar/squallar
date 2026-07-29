@@ -158,9 +158,6 @@ impl RenderInput {
             // reflectivity volume. `VolumeCube::build` dedups same-elevation
             // cuts in encounter order, which is why the original order is kept.
             RadarProduct::EchoTopsInterpolated => true,
-            // Same shape: VIL density is local VIL over local echo tops,
-            // both integrals of the whole reflectivity volume.
-            RadarProduct::VilDensity => true,
             // And the hail pair: the SHI column integral reads every
             // reflectivity tilt (`crate::hail`).
             RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize => true,
@@ -901,7 +898,6 @@ mod tests {
             RadarProduct::NormalizedRotation,
             RadarProduct::StormRelativeVelocity,
             RadarProduct::EchoTopsInterpolated,
-            RadarProduct::VilDensity,
             RadarProduct::ProbabilityOfSevereHail,
             RadarProduct::MaxExpectedHailSize,
         ] {
@@ -932,7 +928,6 @@ mod tests {
             RadarProduct::NormalizedRotation,
             RadarProduct::StormRelativeVelocity,
             RadarProduct::EchoTopsInterpolated,
-            RadarProduct::VilDensity,
             RadarProduct::ProbabilityOfSevereHail,
             RadarProduct::MaxExpectedHailSize,
         ] {

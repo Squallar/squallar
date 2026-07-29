@@ -486,6 +486,7 @@ mod tests {
     /// | Specific Differential Phase | `N0K` | 163 | Specific Differential Phase |
     /// | Echo Tops | `EET` | 135 | Enhanced Echo Tops |
     /// | Vertically Integrated Liquid | `DVL` | 134 | Digital Vertically Integrated Liquid |
+    /// | VIL Density | `DVL`, `EET` | 134, 135 | the two above, divided |
     /// | Precipitation Rate | `DPR` | 176 | Digital Instantaneous Precipitation Rate |
     ///
     /// Hydrometeor Classification's row (`HHC` 177) left with the fetch —
@@ -496,15 +497,47 @@ mod tests {
     /// velocity's five-entry row (`N0S` 56 vector-only, `N0G`/`N1G` 154,
     /// `N2U`/`N3U` 99) left with the fetch — the product derives from
     /// Level II now ([`crate::srv`]).
+    ///
+    /// VIL density is the one **derived** row: its two IDs are not two tilts of
+    /// one field but the numerator and the denominator of
+    /// `1000 · DVL / ((EET + 0.5) · 304.8)` ([`crate::vild`]), in that order —
+    /// so the order pins which is which, and swapping them would divide
+    /// kilofeet by kilograms. It is therefore also the one row whose IDs
+    /// legitimately appear elsewhere in the table; see
+    /// [`DERIVED_FROM_OTHER_ROWS`].
     const ICD: &[(RadarProduct, &[(&str, i16)])] = &[
         (RadarProduct::SpecificDifferentialPhase, &[("N0K", 163)]),
         (RadarProduct::EchoTops, &[("EET", 135)]),
         (RadarProduct::VerticallyIntegratedLiquid, &[("DVL", 134)]),
+        (RadarProduct::VilDensity, &[("DVL", 134), ("EET", 135)]),
         (RadarProduct::PrecipitationRate, &[("DPR", 176)]),
     ];
 
+    /// The products whose row is a **computation over other products' objects**
+    /// rather than the tilts of a field of their own.
+    ///
+    /// This exists so the duplicate-ID check below stays as strict as it was
+    /// for everything else. Its point was never "no ID may appear twice" for
+    /// its own sake — it was that two products must not each claim to *be* the
+    /// same field, because `DVL` under Echo Tops decodes cleanly and paints a
+    /// 62 kg/m² VIL core labelled "Echo Tops: 62.0 kft". A derived product
+    /// reusing its inputs' objects is a different thing, and admitting it by
+    /// name — rather than by relaxing the check for everyone — keeps the
+    /// original bug catchable.
+    ///
+    /// The obligation an entry takes on: its row must name **more than one** ID
+    /// (a single-ID row that reuses another product's ID is exactly the
+    /// copy-paste bug), and every ID it names must belong to some
+    /// non-derived row, so a derived product cannot invent an input nothing
+    /// fetches.
+    const DERIVED_FROM_OTHER_ROWS: &[RadarProduct] = &[RadarProduct::VilDensity];
+
     fn icd_row(product: &RadarProduct) -> Option<&'static [(&'static str, i16)]> {
         ICD.iter().find(|(p, _)| p == product).map(|(_, ids)| *ids)
+    }
+
+    fn is_derived(product: &RadarProduct) -> bool {
+        DERIVED_FROM_OTHER_ROWS.contains(product)
     }
 
     /// Every Level III product must request the AWIPS IDs the ICD gives for the
@@ -560,16 +593,51 @@ mod tests {
             level3.len(),
         );
         // A duplicated ID would let two products agree with the table while
-        // pointing at the same field.
-        let all: Vec<&str> = ICD
+        // pointing at the same field — so among the rows that *are* a field,
+        // every ID is still unique. The derived rows are checked separately,
+        // and more strictly, below.
+        let primary: Vec<&str> = ICD
             .iter()
+            .filter(|(p, _)| !is_derived(p))
             .flat_map(|(_, ids)| ids.iter().map(|(id, _)| *id))
             .collect();
-        for (i, code) in all.iter().enumerate() {
+        for (i, code) in primary.iter().enumerate() {
             assert!(
-                !all[..i].contains(code),
-                "{code} appears twice in the ICD table",
+                !primary[..i].contains(code),
+                "{code} appears twice among the ICD table's own fields",
             );
+        }
+
+        // A derived row reuses its inputs' objects rather than naming a field
+        // of its own. It owes two things: more than one input (a single-ID row
+        // reusing another product's ID is the copy-paste bug the check above
+        // exists for), and every input has to be an object some non-derived row
+        // fetches, so nothing can invent an input.
+        for product in DERIVED_FROM_OTHER_ROWS {
+            let row = icd_row(product)
+                .unwrap_or_else(|| panic!("{} is derived but has no row", product.name()));
+            assert!(
+                row.len() > 1,
+                "{} is listed as derived from other rows but names only {row:?}",
+                product.name(),
+            );
+            let mut seen: Vec<&str> = Vec::new();
+            for (id, code) in row {
+                assert!(
+                    !seen.contains(id),
+                    "{} names {id} twice — one object cannot be two inputs",
+                    product.name(),
+                );
+                seen.push(id);
+                assert!(
+                    ICD.iter()
+                        .any(|(p, ids)| !is_derived(p)
+                            && ids.iter().any(|(i, c)| i == id && c == code)),
+                    "{} takes {id} ({code}) as an input, but no product fetches that \
+                     object as a field of its own",
+                    product.name(),
+                );
+            }
         }
     }
 
@@ -1001,6 +1069,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// VIL density is a Level III product with **two** inputs, in numerator
+    /// then denominator order, and no Level II moment behind it.
+    ///
+    /// Asserted directly because every part of it is a plausible regression:
+    /// the product used to be `compute_vil / compute_eet` off the Level II
+    /// volume and listed on the reflectivity moment, and it was retired for
+    /// measured muteness at the thresholds it is read for (see
+    /// [`crate::vil`]'s validation section). A `moment_slot` here again would
+    /// put the local quotient back on screen; a one-ID row would render a
+    /// kg/m² field through the g/m³ palette.
+    #[test]
+    fn vil_density_requests_the_two_products_it_divides() {
+        assert!(RadarProduct::VilDensity.is_level3());
+        assert_eq!(
+            RadarProduct::VilDensity.level3_products(),
+            Some(&["DVL", "EET"][..]),
+            "DVL is the numerator and EET the denominator — the order is the ratio",
+        );
+        assert_eq!(
+            RadarProduct::VilDensity.moment_slot(),
+            None,
+            "no Level II moment stands behind it any more",
+        );
+        assert_eq!(
+            icd_row(&RadarProduct::VilDensity),
+            Some(&[("DVL", 134i16), ("EET", 135)][..]),
+        );
+        assert!(is_derived(&RadarProduct::VilDensity));
+
+        // Its inputs are the objects the two single-field products fetch, so
+        // nothing new is downloaded on its account.
+        assert_eq!(
+            RadarProduct::VerticallyIntegratedLiquid.level3_products(),
+            Some(&["DVL"][..]),
+        );
+        assert_eq!(RadarProduct::EchoTops.level3_products(), Some(&["EET"][..]));
     }
 
     // ── Live checks ───────────────────────────────────────────────────────

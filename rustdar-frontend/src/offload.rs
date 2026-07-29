@@ -122,6 +122,21 @@ pub enum JobRequest {
         radar_lat: f64,
         radar_lon: f64,
     },
+    /// Rasterize a Level III product **derived from two objects of the same
+    /// volume**: VIL density, Digital VIL over Enhanced Echo Tops
+    /// (`rustdar_radar::vild`).
+    ///
+    /// A second variant rather than a `Vec<Arc<Vec<u8>>>` on the one above: the
+    /// two objects are not interchangeable — the first is the numerator and the
+    /// second the denominator — and a positional pair says so where a list
+    /// would leave it to a comment. The bytes travel for the same reason
+    /// [`JobRequest::Level3`]'s do.
+    Level3Pair {
+        dvl: std::sync::Arc<Vec<u8>>,
+        eet: std::sync::Arc<Vec<u8>>,
+        radar_lat: f64,
+        radar_lon: f64,
+    },
 }
 
 /// What a rasterizing job produces: the RGBA texture, the range it was
@@ -210,6 +225,22 @@ impl JobRequest {
                 out.extend_from_slice(bytes);
                 out
             }
+            Self::Level3Pair {
+                dvl,
+                eet,
+                radar_lat,
+                radar_lon,
+            } => {
+                // The first object is length-prefixed and the second takes the
+                // rest, so neither length can lie about the other.
+                let mut out = vec![TAG_LEVEL3_PAIR];
+                out.extend_from_slice(&radar_lat.to_le_bytes());
+                out.extend_from_slice(&radar_lon.to_le_bytes());
+                out.extend_from_slice(&(dvl.len() as u32).to_le_bytes());
+                out.extend_from_slice(dvl);
+                out.extend_from_slice(eet);
+                out
+            }
         }
     }
 
@@ -239,6 +270,18 @@ impl JobRequest {
                     bytes: std::sync::Arc::new(r.rest().to_vec()),
                 })
             }
+            TAG_LEVEL3_PAIR => {
+                let mut r = Reader::new(rest);
+                let radar_lat = r.f64()?;
+                let radar_lon = r.f64()?;
+                let dvl_len = r.u32()? as usize;
+                Some(Self::Level3Pair {
+                    radar_lat,
+                    radar_lon,
+                    dvl: std::sync::Arc::new(r.take(dvl_len)?.to_vec()),
+                    eet: std::sync::Arc::new(r.rest().to_vec()),
+                })
+            }
             _ => None,
         }
     }
@@ -252,6 +295,7 @@ impl JobRequest {
                 _ => "radar",
             },
             Self::Level3 { .. } => "level3",
+            Self::Level3Pair { .. } => "level3/vild",
         }
     }
 }
@@ -263,6 +307,10 @@ const TAG_LEVEL3: u8 = 2;
 /// worker's job cannot be misread as a future kind.
 #[allow(dead_code)]
 const TAG_SRM_RETIRED: u8 = 3;
+/// The two-object Level III derivation: VIL density. Its product is not on the
+/// wire — the tag names it, because there is exactly one such product and a
+/// wire code would let a mismatched pair claim to be another one.
+const TAG_LEVEL3_PAIR: u8 = 4;
 
 /// A bounds-checked cursor over a job's fixed-width header.
 ///
@@ -292,6 +340,10 @@ impl<'a> Reader<'a> {
 
     fn u16(&mut self) -> Option<u16> {
         Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
 
     fn f64(&mut self) -> Option<f64> {
@@ -332,6 +384,20 @@ pub fn execute(request: &JobRequest) -> JobResult {
             )
             .map(Into::into)
         }),
+        JobRequest::Level3Pair {
+            dvl,
+            eet,
+            radar_lat,
+            radar_lon,
+        } => match (decode_level3(dvl), decode_level3(eet)) {
+            (Some(dvl), Some(eet)) => rustdar_radar::render::render_derived_vild_to_image(
+                &dvl, &eet, *radar_lat, *radar_lon,
+            )
+            .map(Into::into),
+            // One of the two did not decode, which `decode_level3` has already
+            // logged: nothing to draw, the same answer a missing sweep gets.
+            _ => None,
+        },
     }
 }
 
@@ -641,9 +707,21 @@ mod tests {
         }
     }
 
+    /// The two-object VIL density job. The two payloads differ in length *and*
+    /// in content, so a framing that swapped them, or one that split them at
+    /// the wrong offset, cannot round-trip.
+    fn a_level3_pair_job() -> JobRequest {
+        JobRequest::Level3Pair {
+            dvl: std::sync::Arc::new(vec![1, 2, 3]),
+            eet: std::sync::Arc::new(vec![4, 5, 6, 7, 0xFF, 0]),
+            radar_lat: 35.0,
+            radar_lon: -97.0,
+        }
+    }
+
     #[test]
     fn every_job_kind_survives_the_wire_format() {
-        for job in [a_job(), a_level3_job()] {
+        for job in [a_job(), a_level3_job(), a_level3_pair_job()] {
             assert_eq!(
                 JobRequest::from_bytes(&job.to_bytes()),
                 Some(job.clone()),
@@ -673,9 +751,20 @@ mod tests {
             "the flag is a bool, not a byte"
         );
 
+        // A length prefix that claims more than the payload holds must be
+        // refused, not read as a short object: the pair's first length is the
+        // one number on the wire that could lie.
+        let mut overlong = a_level3_pair_job().to_bytes();
+        overlong[17] = 0xFF;
+        assert_eq!(
+            JobRequest::from_bytes(&overlong),
+            None,
+            "a DVL length past the end of the payload",
+        );
+
         // A truncated header must not be read as a short one. The variable tail
         // is whatever is left, so only the fixed part can be checked this way.
-        for job in [a_job(), a_level3_job()] {
+        for job in [a_job(), a_level3_job(), a_level3_pair_job()] {
             let bytes = job.to_bytes();
             for cut in 1..bytes.len().min(20) {
                 let _ = JobRequest::from_bytes(&bytes[..cut]);
@@ -702,6 +791,11 @@ mod tests {
     #[test]
     fn an_undecodable_level3_payload_renders_nothing() {
         assert_eq!(execute(&a_level3_job()), None);
+        assert_eq!(
+            execute(&a_level3_pair_job()),
+            None,
+            "neither object of the pair decodes",
+        );
     }
 
     /// With no worker installed, `offload_job` is the old behaviour: the job

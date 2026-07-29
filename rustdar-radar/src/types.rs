@@ -337,13 +337,20 @@ impl RadarProduct {
             RadarProduct::SpecificDifferentialPhase
                 | RadarProduct::EchoTops
                 | RadarProduct::VerticallyIntegratedLiquid
+                | RadarProduct::VilDensity
                 | RadarProduct::PrecipitationRate
         )
     }
 
-    /// The AWIPS product IDs to fetch for this product, one per tilt. These key
-    /// the `unidata-nexrad-level3` bucket (`TLX_N0S_2026_07_25_...`). `None`
-    /// for Level II products.
+    /// The AWIPS product IDs to fetch for this product. These key the
+    /// `unidata-nexrad-level3` bucket (`TLX_N0S_2026_07_25_...`). `None` for
+    /// Level II products.
+    ///
+    /// Usually one per tilt, and usually one entry. VIL density is the
+    /// exception: it is **derived from two objects**, `DVL` over `EET` for the
+    /// same volume ([`crate::vild`]), so it names both — the only product here
+    /// whose codes are inputs to a computation rather than tilts of itself, and
+    /// the only one that reuses codes another product also fetches.
     ///
     /// Storm-relative velocity is deliberately absent: it once fetched five
     /// objects here — `N0S` for the vector in its PDB and `N0G`/`N1G`/
@@ -355,6 +362,7 @@ impl RadarProduct {
             RadarProduct::SpecificDifferentialPhase => Some(&["N0K"]),
             RadarProduct::EchoTops => Some(&["EET"]),
             RadarProduct::VerticallyIntegratedLiquid => Some(&["DVL"]),
+            RadarProduct::VilDensity => Some(&["DVL", "EET"]),
             RadarProduct::PrecipitationRate => Some(&["DPR"]),
             _ => None,
         }
@@ -468,9 +476,6 @@ impl RadarProduct {
             // tying availability to the reflectivity moment lists it alongside
             // the reflectivity tilts (the rendered field is tilt-independent).
             RadarProduct::EchoTopsInterpolated => Some(MomentSlot::Reflectivity),
-            // VIL density integrates the whole reflectivity volume twice over
-            // (local VIL divided by local echo tops), so it lists the same way.
-            RadarProduct::VilDensity => Some(MomentSlot::Reflectivity),
             // The hail pair integrates the whole reflectivity volume too
             // (`crate::hail`); the environmental heights it also needs ride
             // the render parameters, not a moment.
@@ -485,9 +490,16 @@ impl RadarProduct {
             // extras).
             RadarProduct::HydrometeorClassification => Some(MomentSlot::Reflectivity),
             // Level III products. No Level II moment stands behind them.
+            //
+            // VIL density is here rather than on reflectivity: it used to be a
+            // local quotient of two whole-volume integrals, and is now the
+            // RPG's own `DVL` over its own `EET` ([`crate::vild`]) because the
+            // local version was measured mute at the thresholds it is read for
+            // (see [`crate::vil`]'s validation section).
             RadarProduct::SpecificDifferentialPhase
             | RadarProduct::EchoTops
             | RadarProduct::VerticallyIntegratedLiquid
+            | RadarProduct::VilDensity
             | RadarProduct::PrecipitationRate => None,
         }
     }
