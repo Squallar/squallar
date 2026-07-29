@@ -147,13 +147,9 @@ impl super::App {
             self.gui.apply_chunk_scan_info(site, info);
             self.gui.clear_loading_site_for_site(site);
             self.record_tilt_freshness(site, &scan, &outcome.sealed_elevations);
-            let have_winds = self.render.vwp_levels.contains_key(site);
-            let hit = self.render.reset_panes_for_tilts(
-                site,
-                &self.gui,
-                &outcome.sealed_angles,
-                have_winds,
-            );
+            let hit = self
+                .render
+                .reset_panes_for_tilts(site, &self.gui, &outcome.sealed_angles);
             log::debug!(
                 "{site}: cuts {:?} complete, {hit} pane(s) re-rendering",
                 outcome.sealed_elevations

@@ -122,23 +122,11 @@ impl super::App {
             .copied()
             .unwrap_or(0);
         {
-            // VAD Wind Profile for NROT's wind-aided dealiasing.
-            let site = site.to_string();
-            self.spawn_async_task(self.channels.vwp_sender.clone(), async move {
-                let levels = scan::get_vwp_wind_levels(&site).await.unwrap_or_default();
-                crate::channels::VwpResponse {
-                    generation,
-                    site,
-                    levels,
-                }
-            });
-        }
-        {
             // Environmental 0 °C / −20 °C heights for the hail products.
-            // TTL-gated, unlike the VWP fetch above: Open-Meteo serves hourly
-            // model rows, so refetching on every poll would re-download the
-            // same numbers. Stale-or-missing is the only trigger, and a failed
-            // fetch stores nothing, so the gate retries it next poll.
+            // TTL-gated: Open-Meteo serves hourly model rows, so refetching
+            // on every poll would re-download the same numbers.
+            // Stale-or-missing is the only trigger, and a failed fetch
+            // stores nothing, so the gate retries it next poll.
             let now = chrono::Utc::now();
             let fresh = self
                 .render
@@ -899,7 +887,6 @@ impl super::App {
             product,
             lat,
             lon,
-            None,
             storm_motion,
         ) {
             Some(input) => crate::offload::Job::Described(crate::offload::JobRequest::Radar {

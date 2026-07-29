@@ -99,10 +99,9 @@ pub fn compute_nrot_grid(sweep: &VelocitySweep) -> Vec<Vec<f64>> {
 }
 
 /// Run the full pipeline with a volume wind profile guiding fold-branch
-/// decisions. The profile comes from the RPG's NVW product or from every
-/// velocity tilt in the volume via [`WindProfileBuilder`], so its
-/// predictions stay well-conditioned at long range where the sweep's own
-/// echo fills only a narrow azimuth sector.
+/// decisions. The profile is fitted from every velocity tilt in the volume
+/// via [`WindProfileBuilder`], so its predictions stay well-conditioned at
+/// long range where the sweep's own echo fills only a narrow azimuth sector.
 pub fn compute_nrot_grid_with_profile(
     sweep: &VelocitySweep,
     elevation_deg: f64,
@@ -195,11 +194,11 @@ fn preprocess_velocity_with(
 /// Effective earth radius for beam-height, km (4/3 model).
 const RE_EFF_KM: f64 = 4.0 / 3.0 * 6371.0;
 /// Wind-profile layer thickness, km.
-const VWP_LAYER_KM: f64 = 0.3;
+const PROFILE_LAYER_KM: f64 = 0.3;
 /// Layers span 0..12 km AGL.
-const VWP_LAYERS: usize = 40;
+const PROFILE_LAYERS: usize = 40;
 /// Sample cap per layer keeps memory bounded on wasm.
-const VWP_MAX_SAMPLES: usize = 16384;
+const PROFILE_MAX_SAMPLES: usize = 16384;
 
 /// Horizontal wind fitted per height layer from every velocity tilt of a
 /// volume: vr ≈ u·sin(az)·cos(el) + v·cos(az)·cos(el) + c.
@@ -208,69 +207,28 @@ pub struct WindProfile {
     layers: Vec<Option<(f64, f64, f64)>>,
 }
 
-/// Extract (height km, u m/s, v m/s) wind levels from a Level III VAD Wind
-/// Profile (NVW) product payload. The product's tabular alphanumeric block
-/// carries plain-text rows — `ALT(100s of ft)  U  V  W  DIR  SPD …` — so this
-/// scans ASCII runs rather than decoding the binary product structure. Rows
-/// repeat per tilt; the last row per altitude wins. Feed the result to
-/// [`WindProfile::from_levels`] and the winds-aware render entry points.
-pub fn parse_nvw_wind_levels(payload: &[u8]) -> Vec<(f64, f64, f64)> {
-    let mut by_alt: Vec<(u32, f64, f64)> = Vec::new();
-    for run in payload.split(|b| !(0x20..0x7f).contains(b)) {
-        let Ok(text) = std::str::from_utf8(run) else {
-            continue;
-        };
-        let mut it = text.split_whitespace().peekable();
-        // Optional leading page marker.
-        if it.peek() == Some(&"P") {
-            it.next();
-        }
-        let (Some(alt), Some(u), Some(v)) = (it.next(), it.next(), it.next()) else {
-            continue;
-        };
-        if alt.len() != 3 || !alt.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let (Ok(alt), Ok(u), Ok(v)) = (alt.parse::<u32>(), u.parse::<f64>(), v.parse::<f64>())
-        else {
-            continue;
-        };
-        if !(u.abs() <= 150.0 && v.abs() <= 150.0) {
-            continue;
-        }
-        if let Some(e) = by_alt.iter_mut().find(|(a, _, _)| *a == alt) {
-            (e.1, e.2) = (u, v);
-        } else {
-            by_alt.push((alt, u, v));
-        }
-    }
-    by_alt.sort_unstable_by_key(|e| e.0);
-    by_alt
-        .into_iter()
-        .map(|(a, u, v)| (a as f64 * 100.0 * 0.3048 / 1000.0, u, v))
-        .collect()
-}
-
 impl WindProfile {
-    /// Build from explicit (height km, u, v) levels — e.g. the RPG's own VAD
-    /// Wind Profile (Level 3 NVW product), an externally quality-controlled
-    /// wind source well suited to seeding the dealiaser. Levels map to the
-    /// internal layers; gaps between adjacent levels are filled by the
-    /// nearer level.
+    /// Build from explicit (height km, u, v) levels. The render path fits
+    /// its profile from the volume ([`WindProfileBuilder`]); this constructor
+    /// exists for callers that already hold levels — tests, mostly. Levels
+    /// map to the internal layers; gaps between adjacent levels are filled
+    /// by the nearer level.
     pub fn from_levels(levels: &[(f64, f64, f64)]) -> Option<Self> {
         if levels.is_empty() {
             return None;
         }
-        let mut layers: Vec<Option<(f64, f64, f64)>> = vec![None; VWP_LAYERS];
+        let mut layers: Vec<Option<(f64, f64, f64)>> = vec![None; PROFILE_LAYERS];
         for &(h, u, v) in levels {
-            let l = (h / VWP_LAYER_KM) as usize;
-            if l < VWP_LAYERS {
+            let l = (h / PROFILE_LAYER_KM) as usize;
+            if l < PROFILE_LAYERS {
                 layers[l] = Some((u, v, 0.0));
             }
         }
         // Fill interior gaps from the nearest filled layer below/above.
-        let filled: Vec<usize> = (0..VWP_LAYERS).filter(|&l| layers[l].is_some()).collect();
-        for l in 0..VWP_LAYERS {
+        let filled: Vec<usize> = (0..PROFILE_LAYERS)
+            .filter(|&l| layers[l].is_some())
+            .collect();
+        for l in 0..PROFILE_LAYERS {
             if layers[l].is_none() {
                 let nearest = filled
                     .iter()
@@ -289,7 +247,7 @@ impl WindProfile {
     /// consumer integrating over height bands (Bunkers storm motion in
     /// [`crate::srv`]) can sample every layer exactly once via
     /// [`wind_at_km`](Self::wind_at_km) at the layer centres.
-    pub const LAYER_KM: f64 = VWP_LAYER_KM;
+    pub const LAYER_KM: f64 = PROFILE_LAYER_KM;
 
     /// The fitted horizontal wind `(u, v)` in m/s at `height_km` AGL, or
     /// `None` below zero, above the profile, or in a layer nothing fit.
@@ -298,7 +256,7 @@ impl WindProfile {
         if !height_km.is_finite() || height_km < 0.0 {
             return None;
         }
-        let l = (height_km / VWP_LAYER_KM) as usize;
+        let l = (height_km / PROFILE_LAYER_KM) as usize;
         self.layers.get(l)?.map(|(u, v, _)| (u, v))
     }
 
@@ -307,7 +265,7 @@ impl WindProfile {
     fn predict(&self, az_rad: f64, range_km: f64, elevation_deg: f64) -> Option<f64> {
         let el = elevation_deg.to_radians();
         let h = range_km * el.sin() + range_km * range_km / (2.0 * RE_EFF_KM);
-        let l = (h / VWP_LAYER_KM) as usize;
+        let l = (h / PROFILE_LAYER_KM) as usize;
         let layer = *self
             .layers
             .get(l)?
@@ -330,7 +288,7 @@ pub struct WindProfileBuilder {
 impl WindProfileBuilder {
     pub fn new() -> Self {
         Self {
-            samples: (0..VWP_LAYERS).map(|_| Vec::new()).collect(),
+            samples: (0..PROFILE_LAYERS).map(|_| Vec::new()).collect(),
         }
     }
 
@@ -348,8 +306,8 @@ impl WindProfileBuilder {
                 }
                 let r = sweep.first_gate_range_km + j as f64 * sweep.gate_interval_km;
                 let h = r * sin_el + r * r / (2.0 * RE_EFF_KM);
-                let l = (h / VWP_LAYER_KM) as usize;
-                if l < VWP_LAYERS && self.samples[l].len() < VWP_MAX_SAMPLES {
+                let l = (h / PROFILE_LAYER_KM) as usize;
+                if l < PROFILE_LAYERS && self.samples[l].len() < PROFILE_MAX_SAMPLES {
                     self.samples[l].push((s, c, *v));
                 }
             }
@@ -2326,23 +2284,5 @@ mod tests {
                 "radial {radial}: got {got:.3}, expected ~0"
             );
         }
-    }
-
-    /// The NVW parser on a real KLOT VAD Wind Profile product captured from
-    /// tgftp: plausible level count, heights, and winds.
-    #[test]
-    fn nvw_parser_reads_a_real_product() {
-        let payload = include_bytes!("../testdata/klot_nvw.bin");
-        let levels = parse_nvw_wind_levels(payload);
-        assert!(levels.len() >= 10, "few levels: {}", levels.len());
-        assert!(levels.first().unwrap().0 < 1.0, "first level should be low");
-        assert!(
-            levels.last().unwrap().0 > 3.0,
-            "levels should reach altitude"
-        );
-        for (h, u, v) in &levels {
-            assert!((0.0..20.0).contains(h) && u.abs() < 150.0 && v.abs() < 150.0);
-        }
-        assert!(WindProfile::from_levels(&levels).is_some());
     }
 }

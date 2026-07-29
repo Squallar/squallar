@@ -50,23 +50,6 @@ fn main() {
         other => panic!("unknown product {other}"),
     };
 
-    // WIND_FILE ("height_km u v" per line, e.g. a parsed NVW product) feeds
-    // NROT's wind-aided dealiaser, matching probe_nrot and the app path.
-    let wind_levels: Option<Vec<(f64, f64, f64)>> = std::env::var("WIND_FILE").ok().map(|p| {
-        std::fs::read_to_string(&p)
-            .expect("read WIND_FILE")
-            .lines()
-            .filter_map(|l| {
-                let mut it = l.split_whitespace();
-                Some((
-                    it.next()?.parse().ok()?,
-                    it.next()?.parse().ok()?,
-                    it.next()?.parse().ok()?,
-                ))
-            })
-            .collect()
-    });
-
     // SRV_MOTION ("speed_kt direction_deg") overrides the Bunkers default,
     // exactly as the settings dialog's storm motion override does.
     let storm_motion: Option<(f32, f32)> = std::env::var("SRV_MOTION").ok().and_then(|s| {
@@ -80,7 +63,6 @@ fn main() {
         product,
         lat,
         lon,
-        wind_levels.as_deref(),
         storm_motion,
     )
     .expect("no sweep at that elevation");

@@ -556,7 +556,7 @@ pub fn render_radar_to_image(
     radar_lat: f64,
     radar_lon: f64,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
-    render_radar_to_image_with_winds(data, elevation_angle, product, radar_lat, radar_lon, None)
+    render_radar_to_image_full(data, elevation_angle, product, radar_lat, radar_lon, None)
 }
 
 /// [`render_radar_to_image`] from a [`RenderInput`] instead of a `Scan`.
@@ -577,48 +577,26 @@ pub fn render_from(input: &crate::render_input::RenderInput) -> Option<(Vec<u8>,
         input.product(),
         input.radar_lat(),
         input.radar_lon(),
-        input.wind_levels(),
         input.storm_motion_override(),
     )
 }
 
-/// [`render_radar_to_image`] with an optional environmental wind profile —
-/// (height km, u, v) levels, e.g. from the RPG's NVW product via
-/// [`crate::nrot::parse_nvw_wind_levels`]. NROT's dealiaser uses it to settle
-/// fold branches the volume alone cannot (GR2Analyst's "Use Wind Profile"),
-/// and storm-relative velocity both dealiases with it and fits its default
-/// Bunkers vector from it; other products ignore it.
-pub fn render_radar_to_image_with_winds(
-    data: &Scan,
-    elevation_angle: f32,
-    product: types::RadarProduct,
-    radar_lat: f64,
-    radar_lon: f64,
-    wind_levels: Option<&[(f64, f64, f64)]>,
-) -> Option<(Vec<u8>, f64, Vec<f32>)> {
-    render_radar_to_image_full(
-        data,
-        elevation_angle,
-        product,
-        radar_lat,
-        radar_lon,
-        wind_levels,
-        None,
-    )
-}
-
-/// [`render_radar_to_image_with_winds`] plus the storm motion override, in
-/// knots and degrees-from — the one render parameter only storm-relative
-/// velocity reads. `None` is "no override": SRV then applies the Bunkers
-/// right-mover from the volume's own wind profile ([`crate::srv`]).
-#[allow(clippy::too_many_arguments)]
+/// [`render_radar_to_image`] plus the storm motion override, in knots and
+/// degrees-from — the one render parameter only storm-relative velocity
+/// reads. `None` is "no override": SRV then applies the Bunkers right-mover
+/// from the volume's own wind profile ([`crate::srv`]).
+///
+/// The environmental wind profile NROT's and SRV's dealiasers seed from is
+/// not a parameter: it is fit from the volume's own velocity tilts
+/// ([`build_wind_profile`]). The RPG's NVW product used to be an alternate
+/// source, until the local VAD fit was validated against the RPG's own
+/// dealiased velocity and the fetch dropped.
 pub fn render_radar_to_image_full(
     data: &Scan,
     elevation_angle: f32,
     product: types::RadarProduct,
     radar_lat: f64,
     radar_lon: f64,
-    wind_levels: Option<&[(f64, f64, f64)]>,
     storm_motion_override: Option<(f32, f32)>,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     if product == types::RadarProduct::EchoTopsInterpolated {
@@ -632,18 +610,11 @@ pub fn render_radar_to_image_full(
     let radials = find_sweep(data, product, elevation_angle)?;
 
     if product == types::RadarProduct::NormalizedRotation {
-        return render_nrot_to_image(data, radials, radar_lat, radar_lon, wind_levels);
+        return render_nrot_to_image(data, radials, radar_lat, radar_lon);
     }
 
     if product == types::RadarProduct::StormRelativeVelocity {
-        return render_srv_to_image(
-            data,
-            radials,
-            radar_lat,
-            radar_lon,
-            wind_levels,
-            storm_motion_override,
-        );
+        return render_srv_to_image(data, radials, radar_lat, radar_lon, storm_motion_override);
     }
 
     let avg_azimuth_spacing = compute_azimuth_spacing(radials);
@@ -702,7 +673,6 @@ fn render_nrot_to_image(
     radials: &[Radial],
     radar_lat: f64,
     radar_lon: f64,
-    wind_levels: Option<&[(f64, f64, f64)]>,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     let num_radials = radials.len();
     if num_radials < 3 {
@@ -718,9 +688,7 @@ fn render_nrot_to_image(
         .first()
         .map(|r| r.elevation_angle_degrees() as f64)
         .unwrap_or(0.5);
-    let profile = wind_levels
-        .and_then(crate::nrot::WindProfile::from_levels)
-        .or_else(|| build_wind_profile(scan));
+    let profile = build_wind_profile(scan);
     let nrot_grid = crate::nrot::compute_nrot_grid_with_profile(
         &crate::nrot::VelocitySweep {
             vel_grid: &vg.vel_grid,
@@ -796,7 +764,6 @@ fn render_srv_to_image(
     radials: &[Radial],
     radar_lat: f64,
     radar_lon: f64,
-    wind_levels: Option<&[(f64, f64, f64)]>,
     storm_motion_override: Option<(f32, f32)>,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     if radials.len() < 3 {
@@ -806,9 +773,7 @@ fn render_srv_to_image(
         .first()
         .map(|r| r.elevation_angle_degrees() as f64)
         .unwrap_or(0.5);
-    let profile = wind_levels
-        .and_then(crate::nrot::WindProfile::from_levels)
-        .or_else(|| build_wind_profile(scan));
+    let profile = build_wind_profile(scan);
     let user = storm_motion_override.and_then(|(speed_kt, direction_deg)| {
         crate::srv::SrvMotion::user_override(speed_kt, direction_deg)
     });

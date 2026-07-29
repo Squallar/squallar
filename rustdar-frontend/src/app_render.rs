@@ -359,17 +359,6 @@ impl super::App {
     /// the product picker into a list that fills in one entry per redraw, and
     /// stalled outright on the frame where no redraw follows.
     fn poll_level3_results(&mut self) {
-        while let Ok(vwp) = self.channels.vwp_receiver.try_recv() {
-            if self.render.is_fetch_stale(&vwp.site, vwp.generation) {
-                continue;
-            }
-            log::info!(
-                "VWP winds cached for {} ({} levels)",
-                vwp.site,
-                vwp.levels.len()
-            );
-            self.render.vwp_levels.insert(vwp.site, vwp.levels);
-        }
         while let Ok(sounding) = self.channels.sounding_receiver.try_recv() {
             if self
                 .render
@@ -609,23 +598,12 @@ impl super::App {
                             self.window.clone(),
                         );
                     } else if let Some(data) = self.scan_data.get(scan_info.site.name) {
-                        // The two velocity-derived products whose dealiaser a
-                        // VAD wind profile seeds — and, for storm-relative
-                        // velocity, whose default Bunkers vector it feeds.
-                        let winds = matches!(
-                            product,
-                            rustdar_radar::types::RadarProduct::NormalizedRotation
-                                | rustdar_radar::types::RadarProduct::StormRelativeVelocity
-                        )
-                        .then(|| self.render.vwp_levels.get(&pane_site).cloned())
-                        .flatten();
                         self.render.spawn_level2_render(
                             pane_idx,
                             &params,
                             Arc::clone(data),
                             self.channels.render_sender.clone(),
                             self.window.clone(),
-                            winds,
                         );
                     }
                 }

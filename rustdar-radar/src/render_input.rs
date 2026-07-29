@@ -4,16 +4,17 @@
 //! [`crate::render`] takes a whole `&Scan`: a decoded volume of tens of
 //! megabytes, holding every moment of every radial of every sweep. It *reads*
 //! almost none of that. `find_sweep` picks one sweep and the rasterizer then
-//! touches only `product.get_moment(radial)` on it; two products reach wider —
-//! `NormalizedRotation` fits its wind profile from every velocity tilt, and
-//! `EchoTopsInterpolated` integrates every reflectivity tilt — and nothing
-//! reads the coverage pattern, the site, the collection timestamps, the radial
-//! statuses, or any moment other than the product's own.
+//! touches only `product.get_moment(radial)` on it; the velocity-derived
+//! products (`NormalizedRotation`, `StormRelativeVelocity`) fit their wind
+//! profile from every velocity tilt, `EchoTopsInterpolated` integrates every
+//! reflectivity tilt — and nothing reads the coverage pattern, the site, the
+//! collection timestamps, the radial statuses, or any moment other than the
+//! product's own.
 //!
 //! [`RenderInput`] is that reachable subset, flattened. For a normal product it
 //! is one sweep: ~1.3 MB for a 720 × 1832 8-bit moment, ~2.6 MB for 16-bit
-//! dual-pol. NROT without an external wind profile carries every velocity tilt
-//! (~10-14 MB) and interpolated echo tops every reflectivity tilt (~20 MB).
+//! dual-pol. NROT and SRV carry every velocity tilt (~10-14 MB) and
+//! interpolated echo tops every reflectivity tilt (~20 MB).
 //! Against a `Scan` that is a large reduction, and it is the difference between
 //! a payload a browser can post per render and one it cannot.
 //!
@@ -56,12 +57,9 @@ pub struct RenderInput {
     elevation: f32,
     radar_lat: f64,
     radar_lon: f64,
-    wind_levels: Option<Vec<(f64, f64, f64)>>,
     /// The user's storm motion vector, knots and degrees-from. Read by
     /// storm-relative velocity alone; `None` means "no override", which SRV
-    /// answers with the Bunkers right-mover from the volume's own profile —
-    /// so, unlike `wind_levels`, there is no "present but empty" state to
-    /// keep distinct.
+    /// answers with the Bunkers right-mover from the volume's own profile.
     storm_motion_override: Option<(f32, f32)>,
     sweeps: Vec<SweepData>,
 }
@@ -116,14 +114,13 @@ impl RenderInput {
         product: RadarProduct,
         radar_lat: f64,
         radar_lon: f64,
-        wind_levels: Option<&[(f64, f64, f64)]>,
         storm_motion_override: Option<(f32, f32)>,
     ) -> Option<Self> {
         let slot = product.moment_slot()?;
         // `None` for a Level III product: no Level II moment stands behind it,
         // so there is nothing to extract and nothing the renderer would draw.
         //
-        // Three products then need every tilt carrying that moment; anything
+        // Four products then need every tilt carrying that moment; anything
         // else needs one sweep.
         let whole_volume = match product {
             // Tilt-independent: `compute_echo_tops` integrates the whole
@@ -134,20 +131,14 @@ impl RenderInput {
             // both integrals of the whole reflectivity volume.
             RadarProduct::VilDensity => true,
             // The selected sweep rasterizes, but `build_wind_profile` fits the
-            // volume profile from every velocity tilt — and only when the
-            // caller's levels do not already yield a profile. Asking
-            // `WindProfile::from_levels` here is the same question
-            // `render_nrot_to_image` asks, so the two agree on whether the
-            // extra tilts are needed.
+            // dealias-seeding profile from every velocity tilt of the volume.
             //
             // Storm-relative velocity has the same shape and one more reason:
             // the profile is also where its default Bunkers vector comes
             // from. An override does not shrink the payload — dealias seeding
             // still wants the profile, or render quality would silently vary
             // with whether the user typed a vector in.
-            RadarProduct::NormalizedRotation | RadarProduct::StormRelativeVelocity => wind_levels
-                .and_then(crate::nrot::WindProfile::from_levels)
-                .is_none(),
+            RadarProduct::NormalizedRotation | RadarProduct::StormRelativeVelocity => true,
             _ => false,
         };
 
@@ -175,7 +166,6 @@ impl RenderInput {
             elevation,
             radar_lat,
             radar_lon,
-            wind_levels: wind_levels.map(<[(f64, f64, f64)]>::to_vec),
             storm_motion_override,
             sweeps,
         })
@@ -195,10 +185,6 @@ impl RenderInput {
 
     pub fn radar_lon(&self) -> f64 {
         self.radar_lon
-    }
-
-    pub fn wind_levels(&self) -> Option<&[(f64, f64, f64)]> {
-        self.wind_levels.as_deref()
     }
 
     /// The user's storm motion vector, knots and degrees-from, or `None`
@@ -397,7 +383,10 @@ const MAGIC: [u8; 4] = *b"RDRI";
 ///
 /// Version 2 added the storm motion override between the wind levels and the
 /// sweep count, when storm-relative velocity became a Level II product.
-const FORMAT_VERSION: u16 = 2;
+/// Version 3 removed the wind levels: the dealias-seeding profile is fit from
+/// the payload's own velocity tilts, and the NVW fetch that used to supply
+/// external levels is gone.
+const FORMAT_VERSION: u16 = 3;
 
 impl RenderInput {
     /// Encode for transport. Little-endian throughout; gate blobs are copied
@@ -410,21 +399,6 @@ impl RenderInput {
         out.extend_from_slice(&self.elevation.to_le_bytes());
         out.extend_from_slice(&self.radar_lat.to_le_bytes());
         out.extend_from_slice(&self.radar_lon.to_le_bytes());
-
-        match &self.wind_levels {
-            // `u32::MAX` distinguishes "no profile was offered" from "an empty
-            // one was". `render_nrot_to_image` treats them differently: `None`
-            // falls through to the volume fit, `Some(&[])` does not.
-            None => out.extend_from_slice(&u32::MAX.to_le_bytes()),
-            Some(levels) => {
-                out.extend_from_slice(&(levels.len() as u32).to_le_bytes());
-                for (h, u, v) in levels {
-                    out.extend_from_slice(&h.to_le_bytes());
-                    out.extend_from_slice(&u.to_le_bytes());
-                    out.extend_from_slice(&v.to_le_bytes());
-                }
-            }
-        }
 
         match self.storm_motion_override {
             None => out.push(0),
@@ -484,17 +458,6 @@ impl RenderInput {
         let elevation = r.f32()?;
         let radar_lat = r.f64()?;
         let radar_lon = r.f64()?;
-
-        let wind_count = r.u32()?;
-        let wind_levels = if wind_count == u32::MAX {
-            None
-        } else {
-            let mut levels = Vec::with_capacity(r.bounded(wind_count, 24)?);
-            for _ in 0..wind_count {
-                levels.push((r.f64()?, r.f64()?, r.f64()?));
-            }
-            Some(levels)
-        };
 
         let storm_motion_override = match r.u8()? {
             0 => None,
@@ -556,20 +519,18 @@ impl RenderInput {
             elevation,
             radar_lat,
             radar_lon,
-            wind_levels,
             storm_motion_override,
             sweeps,
         })
     }
 
     fn encoded_len(&self) -> usize {
-        let header = 4 + 2 + 2 + 4 + 8 + 8 + 4;
+        let header = 4 + 2 + 2 + 4 + 8 + 8;
         let motion = 1 + if self.storm_motion_override.is_some() {
             8
         } else {
             0
         };
-        let winds = self.wind_levels.as_ref().map_or(0, |l| l.len() * 24);
         let sweeps: usize = self
             .sweeps
             .iter()
@@ -581,7 +542,7 @@ impl RenderInput {
                     .sum::<usize>()
             })
             .sum();
-        header + winds + motion + 4 + sweeps
+        header + motion + 4 + sweeps
     }
 }
 
@@ -640,7 +601,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render::{render_from, render_radar_to_image_with_winds};
+    use crate::render::{render_from, render_radar_to_image_full};
 
     const LAT: f64 = 35.3333;
     const LON: f64 = -97.2778;
@@ -777,11 +738,10 @@ mod tests {
             RadarProduct::VilDensity,
         ] {
             let over = override_for(product);
-            let direct = crate::render::render_radar_to_image_full(
-                &scan, 0.5, product, LAT, LON, None, over,
-            )
-            .unwrap();
-            let input = RenderInput::extract(&scan, 0.5, product, LAT, LON, None, over).unwrap();
+            let direct =
+                crate::render::render_radar_to_image_full(&scan, 0.5, product, LAT, LON, over)
+                    .unwrap();
+            let input = RenderInput::extract(&scan, 0.5, product, LAT, LON, over).unwrap();
             let viaformat = render_from(&input).unwrap();
 
             assert!(
@@ -806,8 +766,7 @@ mod tests {
             RadarProduct::VilDensity,
         ] {
             let input =
-                RenderInput::extract(&scan, 0.5, product, LAT, LON, None, override_for(product))
-                    .unwrap();
+                RenderInput::extract(&scan, 0.5, product, LAT, LON, override_for(product)).unwrap();
             let decoded = RenderInput::from_bytes(&input.to_bytes())
                 .unwrap_or_else(|| panic!("{product:?} payload did not decode"));
             assert_eq!(input, decoded, "{product:?} payload changed in transit");
@@ -836,7 +795,6 @@ mod tests {
             RadarProduct::StormRelativeVelocity,
             LAT,
             LON,
-            None,
             Some((30.0, 240.0)),
         )
         .unwrap();
@@ -851,7 +809,6 @@ mod tests {
             RadarProduct::StormRelativeVelocity,
             LAT,
             LON,
-            None,
             Some((30.0, 60.0)),
         )
         .unwrap();
@@ -867,7 +824,7 @@ mod tests {
     fn the_encoded_length_estimate_is_exact() {
         let scan = volume();
         for product in [RadarProduct::Reflectivity, RadarProduct::NormalizedRotation] {
-            let input = RenderInput::extract(&scan, 0.5, product, LAT, LON, None, None).unwrap();
+            let input = RenderInput::extract(&scan, 0.5, product, LAT, LON, None).unwrap();
             assert_eq!(input.encoded_len(), input.to_bytes().len(), "{product:?}");
         }
     }
@@ -882,8 +839,7 @@ mod tests {
             vec![sweep(0.5, Some(&strong_refl), Some(&shear))],
         );
         let input =
-            RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None, None)
-                .unwrap();
+            RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None).unwrap();
         let moment = input.sweeps[0].radials[0].moment.as_ref().unwrap();
         assert_eq!(moment.scale, REFL_SCALE);
         assert_eq!(moment.offset, REFL_OFFSET);
@@ -900,72 +856,21 @@ mod tests {
     fn a_plain_product_carries_one_sweep() {
         let scan = volume();
         let input =
-            RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None, None)
-                .unwrap();
+            RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None).unwrap();
         assert_eq!(input.sweeps.len(), 1);
         assert_eq!(input.sweeps[0].radials.len(), RADIALS);
     }
 
-    /// NROT fits its wind profile from every velocity tilt, so those have to
-    /// travel with it — but only when the caller has not supplied a profile
-    /// that already works. Both branches must render identically to the
-    /// whole-volume path, which is what makes the smaller payload safe.
+    /// NROT fits its wind profile from every velocity tilt — that fit is the
+    /// only wind source since the NVW fetch left — so every velocity tilt has
+    /// to travel with the payload.
     #[test]
-    fn nrot_carries_every_velocity_tilt_only_when_it_needs_them() {
+    fn nrot_carries_every_velocity_tilt() {
         let scan = volume();
-        let without = RenderInput::extract(
-            &scan,
-            0.5,
-            RadarProduct::NormalizedRotation,
-            LAT,
-            LON,
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            without.sweeps.len(),
-            2,
-            "both velocity tilts should travel when no profile was supplied"
-        );
-
-        // A profile `WindProfile::from_levels` accepts: the extra tilts are
-        // then dead weight, because `render_nrot_to_image` never fits from the
-        // volume.
-        let levels: Vec<(f64, f64, f64)> = (0..12).map(|i| (i as f64 * 0.3, 10.0, -5.0)).collect();
-        assert!(
-            crate::nrot::WindProfile::from_levels(&levels).is_some(),
-            "fixture profile must be one the renderer would accept"
-        );
-        let with = RenderInput::extract(
-            &scan,
-            0.5,
-            RadarProduct::NormalizedRotation,
-            LAT,
-            LON,
-            Some(&levels),
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            with.sweeps.len(),
-            1,
-            "a usable profile makes the tilts dead weight"
-        );
-
-        assert_same_frame(
-            &render_radar_to_image_with_winds(
-                &scan,
-                0.5,
-                RadarProduct::NormalizedRotation,
-                LAT,
-                LON,
-                Some(&levels),
-            )
-            .unwrap(),
-            &render_from(&with).unwrap(),
-            "NROT with a supplied profile",
-        );
+        let input =
+            RenderInput::extract(&scan, 0.5, RadarProduct::NormalizedRotation, LAT, LON, None)
+                .unwrap();
+        assert_eq!(input.sweeps.len(), 2, "both velocity tilts travel");
     }
 
     /// Interpolated echo tops integrate the volume; every reflectivity tilt has
@@ -980,7 +885,6 @@ mod tests {
             RadarProduct::EchoTopsInterpolated,
             LAT,
             LON,
-            None,
             None,
         )
         .unwrap();
@@ -1008,13 +912,12 @@ mod tests {
                 RadarProduct::HydrometeorClassification,
                 LAT,
                 LON,
-                None,
                 None
             )
             .is_none()
         );
         assert!(
-            render_radar_to_image_with_winds(
+            render_radar_to_image_full(
                 &scan,
                 0.5,
                 RadarProduct::HydrometeorClassification,
@@ -1027,49 +930,14 @@ mod tests {
         );
     }
 
-    /// "No profile offered" and "an empty profile offered" are different
-    /// questions to `render_nrot_to_image`: the first falls through to the
-    /// volume fit, the second does not.
-    #[test]
-    fn an_absent_wind_profile_is_not_an_empty_one() {
-        let scan = volume();
-        let absent =
-            RenderInput::extract(&scan, 0.5, RadarProduct::Velocity, LAT, LON, None, None).unwrap();
-        let empty = RenderInput::extract(
-            &scan,
-            0.5,
-            RadarProduct::Velocity,
-            LAT,
-            LON,
-            Some(&[]),
-            None,
-        )
-        .unwrap();
-        assert_eq!(absent.wind_levels(), None);
-        assert_eq!(empty.wind_levels(), Some(&[][..]));
-        assert_eq!(
-            RenderInput::from_bytes(&absent.to_bytes())
-                .unwrap()
-                .wind_levels(),
-            None
-        );
-        assert_eq!(
-            RenderInput::from_bytes(&empty.to_bytes())
-                .unwrap()
-                .wind_levels(),
-            Some(&[][..])
-        );
-    }
-
     /// The bytes arrive off a message port. Every malformed shape has to be a
     /// clean `None` — the two ends of that port can be different builds.
     #[test]
     fn a_malformed_payload_is_refused_rather_than_misread() {
         let scan = volume();
-        let good =
-            RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None, None)
-                .unwrap()
-                .to_bytes();
+        let good = RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None)
+            .unwrap()
+            .to_bytes();
 
         assert!(RenderInput::from_bytes(&[]).is_none(), "empty");
         assert!(RenderInput::from_bytes(b"nope").is_none(), "wrong magic");
@@ -1104,12 +972,12 @@ mod tests {
     fn an_absurd_length_does_not_reach_an_allocation() {
         let scan = volume();
         let mut bytes =
-            RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None, None)
+            RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None)
                 .unwrap()
                 .to_bytes();
-        // The sweep count sits directly after the header, the `u32::MAX`
-        // wind marker and the absent-override flag byte.
-        let at = 4 + 2 + 2 + 4 + 8 + 8 + 4 + 1;
+        // The sweep count sits directly after the header and the
+        // absent-override flag byte.
+        let at = 4 + 2 + 2 + 4 + 8 + 8 + 1;
         bytes[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(RenderInput::from_bytes(&bytes).is_none());
     }

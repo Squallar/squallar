@@ -235,30 +235,6 @@ pub async fn fetch_latest_product(
     })
 }
 
-/// Fetch the latest Level III product for a site as raw bytes, WMO/AWIPS
-/// envelope included. For products whose payload rustdar reads as text — the
-/// NVW VAD Wind Profile's tabular block via
-/// [`crate::nrot::parse_nvw_wind_levels`] — rather than decoding.
-pub async fn fetch_latest_raw(
-    sources: &DataSources,
-    site: &str,
-    product: &str,
-    now: NaiveDateTime,
-) -> Result<Vec<u8>> {
-    let site3 = site_code(site).to_uppercase();
-    let date = now.date();
-    let Some(key) = latest_key(sources, &site3, product, &date).await? else {
-        return Err(Level3Error::NoProduct {
-            site: site3,
-            product: product.to_string(),
-        });
-    };
-    let url = sources.level3_object_url(&key);
-    log::info!("Fetching Level III (raw) {key}");
-    let client = archive::shared_client();
-    Ok(archive::get_bytes(client, url).await?.to_vec())
-}
-
 // Native-only: the live checks at the tail are `#[tokio::test]`, and that
 // dev-dependency is target-gated off wasm32.
 #[cfg(all(test, not(target_arch = "wasm32")))]

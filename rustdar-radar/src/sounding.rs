@@ -30,9 +30,8 @@ use crate::sources::DataSources;
 /// How long a fetched [`EnvHeights`] stays fresh.
 ///
 /// Open-Meteo serves hourly model rows, so refetching faster than this mostly
-/// re-downloads the same numbers. Holders (the app keeps one per site, beside
-/// its VWP levels) should refetch on their poll cycle only once
-/// [`EnvHeights::is_stale`] says so.
+/// re-downloads the same numbers. Holders (the app keeps one per site) should
+/// refetch on their poll cycle only once [`EnvHeights::is_stale`] says so.
 pub const ENV_HEIGHTS_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// The response is under a kilobyte; this is connection-setup allowance for a

@@ -205,19 +205,8 @@ pub struct ChunkResponse {
     pub result: Result<rustdar_radar::chunks::PollOutcome, String>,
 }
 
-/// Centralized channel hub for all async communication between the App and
-/// background tasks (network fetches, radar rendering, etc.).
-/// The latest VAD Wind Profile levels for a site — (height km, u, v) —
-/// fetched alongside the Level III products; NROT renders pass them to
-/// `render_radar_to_image_with_winds`.
-pub struct VwpResponse {
-    pub generation: u64,
-    pub site: String,
-    pub levels: Vec<(f64, f64, f64)>,
-}
-
 /// The environmental 0 °C / −20 °C heights over a site, from Open-Meteo —
-/// fetched beside the VWP when a scan loads, but TTL-gated (see
+/// fetched when a scan loads, but TTL-gated (see
 /// [`rustdar_radar::sounding::ENV_HEIGHTS_TTL`]) rather than refetched every
 /// poll. Staged for the hail products, which will read them off
 /// `RenderDispatcher::env_heights`.
@@ -230,6 +219,8 @@ pub struct SoundingResponse {
     pub heights: Option<rustdar_radar::sounding::EnvHeights>,
 }
 
+/// Centralized channel hub for all async communication between the App and
+/// background tasks (network fetches, radar rendering, etc.).
 pub struct ChannelHub {
     pub scan_sender: Sender<ScanResponse>,
     pub scan_receiver: Receiver<ScanResponse>,
@@ -247,8 +238,6 @@ pub struct ChannelHub {
     pub loop_scan_download_receiver: Receiver<LoopScanDownloadResponse>,
     pub loop_render_sender: Sender<LoopRenderResponse>,
     pub loop_render_receiver: Receiver<LoopRenderResponse>,
-    pub vwp_sender: Sender<VwpResponse>,
-    pub vwp_receiver: Receiver<VwpResponse>,
     pub chunk_sender: Sender<ChunkResponse>,
     pub chunk_receiver: Receiver<ChunkResponse>,
     pub sounding_sender: Sender<SoundingResponse>,
@@ -271,7 +260,6 @@ impl ChannelHub {
         let (loop_scan_list_sender, loop_scan_list_receiver) = std::sync::mpsc::channel();
         let (loop_scan_download_sender, loop_scan_download_receiver) = std::sync::mpsc::channel();
         let (loop_render_sender, loop_render_receiver) = std::sync::mpsc::channel();
-        let (vwp_sender, vwp_receiver) = std::sync::mpsc::channel();
         let (sounding_sender, sounding_receiver) = std::sync::mpsc::channel();
         let (chunk_sender, chunk_receiver) = std::sync::mpsc::channel();
 
@@ -294,8 +282,6 @@ impl ChannelHub {
             loop_render_receiver,
             chunk_sender,
             chunk_receiver,
-            vwp_sender,
-            vwp_receiver,
             sounding_sender,
             sounding_receiver,
         }

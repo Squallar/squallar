@@ -215,16 +215,14 @@ impl RenderCache {
 /// Mirrors the `whole_volume` branch in `RenderInput::extract`, which is what
 /// actually decides how much of the `Scan` travels: `EchoTopsInterpolated`
 /// integrates every reflectivity tilt, and `NormalizedRotation` collects every
-/// velocity tilt *unless* the caller's wind levels already yield a profile. Both
-/// would read a volume still being assembled as a complete short one —
-/// `compute_echo_tops` clamps every column to the topmost tilt present, with no
-/// error and no NaN to notice.
-fn whole_volume_product(product: RadarProduct, have_wind_profile: bool) -> bool {
-    match product {
-        RadarProduct::EchoTopsInterpolated => true,
-        RadarProduct::NormalizedRotation => !have_wind_profile,
-        _ => false,
-    }
+/// velocity tilt for its wind-profile fit. Both would read a volume still
+/// being assembled as a complete short one — `compute_echo_tops` clamps every
+/// column to the topmost tilt present, with no error and no NaN to notice.
+fn whole_volume_product(product: RadarProduct) -> bool {
+    matches!(
+        product,
+        RadarProduct::EchoTopsInterpolated | RadarProduct::NormalizedRotation
+    )
 }
 
 fn elevation_key(elevation: f32) -> i32 {
@@ -249,18 +247,13 @@ pub struct RenderDispatcher {
     /// in: an insert that bypassed it would drop the storm motion vector on the
     /// floor, and the pane would render with another volume's.
     level3_data: HashMap<(RadarProduct, String, String), Arc<Level3Product>>,
-    /// Latest VAD Wind Profile levels per site — (height km, u, v). NROT
-    /// renders pass these to the winds-aware render entry so its dealiaser
-    /// settles fold branches the volume alone cannot.
-    pub vwp_levels: HashMap<String, Vec<(f64, f64, f64)>>,
     /// Environmental 0 °C / −20 °C heights per site, from Open-Meteo — staged
     /// for the hail products, which will read them at render time. Written by
     /// the sounding drain in `app_render`; read back by
     /// `spawn_level3_fetches`'s TTL gate, which refetches on poll only once
     /// [`rustdar_radar::sounding::EnvHeights::is_stale`] says the entry has
-    /// aged out. Like [`vwp_levels`](Self::vwp_levels), survives both reset
-    /// paths: the environment does not change because a pane was reset, and
-    /// the TTL is the eviction policy.
+    /// aged out. Survives both reset paths: the environment does not change
+    /// because a pane was reset, and the TTL is the eviction policy.
     pub env_heights: HashMap<String, rustdar_radar::sounding::EnvHeights>,
     /// Generation counter to discard stale render results after a **full** reset.
     ///
@@ -312,7 +305,6 @@ impl RenderDispatcher {
         Self {
             pane_render: vec![PaneRenderState::new()],
             level3_data: HashMap::new(),
-            vwp_levels: HashMap::new(),
             env_heights: HashMap::new(),
             render_generation: 0,
             fetch_generations: HashMap::new(),
@@ -412,10 +404,10 @@ impl RenderDispatcher {
     ///
     /// Volume-wide Level II products are skipped here and taken by
     /// [`reset_panes_for_volume`]: `EchoTopsInterpolated` integrates every
-    /// reflectivity tilt, and NROT without an external wind profile fits its
-    /// profile from every velocity tilt, so both would read a partial volume as
-    /// a complete short one. Level III panes are skipped outright — their pixels
-    /// come from `level3_data`, which a Level II cut says nothing about.
+    /// reflectivity tilt, and NROT fits its wind profile from every velocity
+    /// tilt, so both would read a partial volume as a complete short one.
+    /// Level III panes are skipped outright — their pixels come from
+    /// `level3_data`, which a Level II cut says nothing about.
     ///
     /// Returns how many panes were invalidated, for the log and the tests.
     pub fn reset_panes_for_tilts(
@@ -423,10 +415,9 @@ impl RenderDispatcher {
         site: &str,
         gui: &rustdar_egui::Gui,
         angles: &[f32],
-        have_wind_profile: bool,
     ) -> usize {
         let hit = self.invalidate_panes_where(site, gui, |product, elevation| {
-            if product.is_level3() || whole_volume_product(product, have_wind_profile) {
+            if product.is_level3() || whole_volume_product(product) {
                 return false;
             }
             angles
@@ -445,7 +436,7 @@ impl RenderDispatcher {
     /// volume. Called only when a volume closes complete.
     pub fn reset_panes_for_volume(&mut self, site: &str, gui: &rustdar_egui::Gui) -> usize {
         self.invalidate_panes_where(site, gui, |product, _| {
-            !product.is_level3() && whole_volume_product(product, false)
+            !product.is_level3() && whole_volume_product(product)
         })
     }
 
@@ -700,7 +691,6 @@ impl RenderDispatcher {
         data: Arc<nexrad_model::data::Scan>,
         sender: std::sync::mpsc::Sender<RenderResponse>,
         window: Option<WindowRef>,
-        winds: Option<Vec<(f64, f64, f64)>>,
     ) {
         let product = params.product;
         let elevation = params.elevation;
@@ -735,7 +725,6 @@ impl RenderDispatcher {
             product,
             lat,
             lon,
-            winds.as_deref(),
             storm_motion,
         ) {
             Some(input) => {
@@ -1608,7 +1597,7 @@ mod render_invalidation_tests {
         let release = dispatch(&mut d, 0, &results);
 
         assert_eq!(
-            d.reset_panes_for_tilts("KOUN", &gui, &[0.5], false),
+            d.reset_panes_for_tilts("KOUN", &gui, &[0.5]),
             0,
             "the 4.0° pane was invalidated by a 0.5° cut completing"
         );
@@ -1632,7 +1621,7 @@ mod render_invalidation_tests {
         let (results, rx) = mpsc::channel();
         let release = dispatch(&mut d, 0, &results);
 
-        assert_eq!(d.reset_panes_for_tilts("KOUN", &gui, &[0.5], false), 1);
+        assert_eq!(d.reset_panes_for_tilts("KOUN", &gui, &[0.5]), 1);
         assert!(
             !d.pane_render[0].render_in_flight,
             "the pairing an abandoned send depends on"
@@ -1651,7 +1640,7 @@ mod render_invalidation_tests {
         d.ensure_pane_count(1);
 
         assert_eq!(
-            d.reset_panes_for_tilts("KOUN", &gui, &[0.5], false),
+            d.reset_panes_for_tilts("KOUN", &gui, &[0.5]),
             0,
             "echo tops was invalidated by a single cut completing"
         );
@@ -1662,22 +1651,22 @@ mod render_invalidation_tests {
         );
     }
 
-    /// NROT without an external wind profile collects every velocity tilt, so it
-    /// is volume-wide too — but with VWP levels in hand `extract` carries only
-    /// the one sweep, and it can refresh per cut like any other product.
+    /// NROT fits its wind profile from every velocity tilt — the only wind
+    /// source since the NVW fetch left — so it is volume-wide too, and only
+    /// the closing volume refreshes it.
     #[test]
-    fn nrot_waits_for_the_volume_only_while_it_has_no_wind_profile() {
+    fn nrot_waits_for_the_volume() {
         let gui = gui_on_tilt("KOUN", RadarProduct::NormalizedRotation, 0.5, &[0.5]);
         let mut d = RenderDispatcher::new();
         d.ensure_pane_count(1);
 
         assert_eq!(
-            d.reset_panes_for_tilts("KOUN", &gui, &[0.5], false),
+            d.reset_panes_for_tilts("KOUN", &gui, &[0.5]),
             0,
-            "NROT with no wind profile fits it from every velocity tilt, so a \
-             partial volume would halve its shear"
+            "NROT fits its profile from every velocity tilt, so a partial \
+             volume would halve its shear"
         );
-        assert_eq!(d.reset_panes_for_tilts("KOUN", &gui, &[0.5], true), 1);
+        assert_eq!(d.reset_panes_for_volume("KOUN", &gui), 1);
     }
 
     /// A Level III pane's pixels come from `level3_data`; a Level II cut
@@ -1693,7 +1682,7 @@ mod render_invalidation_tests {
         );
         let mut d = RenderDispatcher::new();
         d.ensure_pane_count(1);
-        assert_eq!(d.reset_panes_for_tilts("KOUN", &gui, &[0.5], false), 0);
+        assert_eq!(d.reset_panes_for_tilts("KOUN", &gui, &[0.5]), 0);
         assert_eq!(d.reset_panes_for_volume("KOUN", &gui), 0);
     }
 
@@ -1707,7 +1696,7 @@ mod render_invalidation_tests {
         d.cache_render("KOUN", RadarProduct::Reflectivity, 0.5, cached(1.0));
         d.cache_render("KOUN", RadarProduct::Reflectivity, 4.0, cached(2.0));
 
-        d.reset_panes_for_tilts("KOUN", &gui, &[0.5], false);
+        d.reset_panes_for_tilts("KOUN", &gui, &[0.5]);
         assert!(
             d.get_cached_render("KOUN", RadarProduct::Reflectivity, 0.5)
                 .is_none(),
