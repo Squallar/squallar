@@ -639,19 +639,24 @@ impl RenderDispatcher {
             .map(|(_, msg)| Arc::clone(msg))
     }
 
-    /// Record on `pane` how old the Level III object behind `render` is, so the
-    /// status bar can say. `None` for a Level II product, which has no
-    /// `ProductStamp` and whose age is the scan time the bar already shows.
+    /// Record on `pane` when the data behind `render` was collected, so the status
+    /// bar can say how old the image is.
     ///
-    /// Three values have to agree for the answer to mean anything — the
-    /// product and elevation of *this* render, and the site of *this* pane —
-    /// and they are read here rather than by the caller, which is what makes a
+    /// **Every product gets one**, from whichever datasource it came from: the
+    /// `ProductStamp` time of the Level III object behind it, or the pane's own
+    /// Level II volume time. That uniformity is the point — an age drawn only for
+    /// the bucket-fetched products let the user read the datasource off the status
+    /// bar, and let its absence mean something too.
+    ///
+    /// Three values have to agree for the Level III answer to mean anything — the
+    /// product and elevation of *this* render, and the site of *this* pane — and
+    /// they are read here rather than by the caller, which is what makes a
     /// pane that took this image from a sibling's broadcast report the image's
     /// age rather than whatever it was showing before.
     ///
-    /// Assigned unconditionally, so switching a pane to a Level II product
-    /// clears the last Level III object's age rather than leaving it captioning
-    /// a field it does not describe.
+    /// Assigned unconditionally, so switching a pane between datasources replaces
+    /// the time rather than leaving the previous one captioning a field it does not
+    /// describe.
     ///
     /// Resolved through [`nearest_tilt`](Self::nearest_tilt) — the same
     /// selection the render was spawned from — rather than being handed to
@@ -666,14 +671,22 @@ impl RenderDispatcher {
     /// reports the newer stamp for the frame or two before the re-render it
     /// triggered arrives. `poll_level3_results` clears `last_rendered` for
     /// every pane on the site, so that re-render is already queued.
-    pub fn stamp_pane_with_product_age(
+    pub fn stamp_pane_with_data_time(
         &self,
         pane: &mut rustdar_egui::pane::PaneState,
         render: &CachedPaneRender,
     ) {
-        pane.level3_time = self
-            .nearest_tilt(render.product, &pane.site, render.elevation)
-            .and_then(|tilt| tilt.stamp.time);
+        // A Level III product's own object, or — for anything read off the volume,
+        // derived products included — the volume this pane has loaded. Falling back
+        // to the scan time for a Level III product whose stamp is unreadable would
+        // report a bucket object as being as fresh as the volume, so the branch is
+        // on the product rather than on whether a stamp was found.
+        pane.data_time = if render.product.is_level3() {
+            self.nearest_tilt(render.product, &pane.site, render.elevation)
+                .and_then(|tilt| tilt.stamp.time)
+        } else {
+            pane.scan_info.as_ref().map(|info| info.timestamp)
+        };
     }
 
     /// The storm motion override as the `(speed_kt, direction_deg)` pair the
@@ -1086,13 +1099,49 @@ mod level3_dispatch_tests {
         rustdar_egui::pane::PaneState::with_site(site.to_string())
     }
 
-    /// The age a pane is stamped with belongs to the object it is showing:
-    /// its own site's, cleared for a Level II product — and storm-relative
-    /// velocity **is** a Level II product now, so a pane switching to it
-    /// must lose the Level III age rather than caption a derived field with
-    /// some other product's stamp.
+    /// The volume time a pane with no Level III object reports. Distinct from every
+    /// Level III stamp in these tests (`MPX_EET_2026_07_26_01_55_52`, seven minutes
+    /// later), so a branch that read the wrong one is a wrong *value*, not a
+    /// coincidence.
+    fn volume_time() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 26)
+            .unwrap()
+            .and_hms_opt(1, 48, 0)
+            .unwrap()
+    }
+
+    /// A pane on `site` with a volume loaded, so the volume arm of the data-time
+    /// stamp has something to report.
+    fn pane_with_volume(site: &str) -> rustdar_egui::pane::PaneState {
+        let mut pane = pane_on(site);
+        pane.scan_info = Some(rustdar_radar::types::ScanInfo {
+            site: rustdar_radar::sites::get_radar_site(site)
+                .cloned()
+                .unwrap_or(rustdar_radar::sites::RadarSite {
+                    name: "KMPX",
+                    lat: 44.849,
+                    lon: -93.565,
+                    elev: None,
+                }),
+            timestamp: volume_time(),
+            vcp_number: 212,
+            available_products: vec![RadarProduct::Reflectivity],
+            product_elevations: HashMap::new(),
+            status: String::new(),
+        });
+        pane
+    }
+
+    /// The time a pane is stamped with belongs to the data it is showing: its own
+    /// site's Level III object where the product is fetched, its own volume where
+    /// the product is derived.
+    ///
+    /// Both arms, because the point of the field is that **every** product has one.
+    /// It used to be `None` for anything read off the volume, which let the status
+    /// bar's age line double as a datasource indicator — drawn for the bucket
+    /// products, absent for the rest.
     #[test]
-    fn a_render_stamps_its_pane_with_its_own_sites_product_age() {
+    fn a_render_stamps_its_pane_with_its_own_datas_time() {
         let mut d = RenderDispatcher::new();
         cache(
             &mut d,
@@ -1102,33 +1151,45 @@ mod level3_dispatch_tests {
             product(135, 5, 1),
         );
 
-        let mut pane = pane_on("KMPX");
-        d.stamp_pane_with_product_age(&mut pane, &rendered(RadarProduct::EchoTops, 0.5));
-        assert!(pane.level3_time.is_some(), "the EET stamp is readable");
-
-        let mut elsewhere = pane_on("KTLX");
-        d.stamp_pane_with_product_age(&mut elsewhere, &rendered(RadarProduct::EchoTops, 0.5));
-        assert_eq!(
-            elsewhere.level3_time, None,
-            "another site's products are not this pane's",
+        let mut pane = pane_with_volume("KMPX");
+        d.stamp_pane_with_data_time(&mut pane, &rendered(RadarProduct::EchoTops, 0.5));
+        let l3_time = pane.data_time.expect("the EET stamp is readable");
+        assert_ne!(
+            l3_time,
+            volume_time(),
+            "the object's own time, not the volume it sits beside",
         );
 
-        let mut srv = pane_on("KMPX");
-        d.stamp_pane_with_product_age(&mut srv, &rendered(RadarProduct::EchoTops, 0.5));
-        assert!(srv.level3_time.is_some(), "precondition: it was dated");
-        d.stamp_pane_with_product_age(
+        let mut elsewhere = pane_with_volume("KTLX");
+        d.stamp_pane_with_data_time(&mut elsewhere, &rendered(RadarProduct::EchoTops, 0.5));
+        assert_eq!(
+            elsewhere.data_time, None,
+            "another site's products are not this pane's, and its volume is not a \
+             substitute for the object it has not got",
+        );
+
+        // Storm-relative velocity derives from the volume, so its data time is the
+        // volume's — not the last Level III object's, and not nothing.
+        let mut srv = pane_with_volume("KMPX");
+        d.stamp_pane_with_data_time(&mut srv, &rendered(RadarProduct::EchoTops, 0.5));
+        assert_eq!(srv.data_time, Some(l3_time), "precondition: it was dated");
+        d.stamp_pane_with_data_time(
             &mut srv,
             &rendered(RadarProduct::StormRelativeVelocity, 0.5),
         );
         assert_eq!(
-            srv.level3_time, None,
-            "SRV derives from the Level II volume; no bucket object stands behind it",
+            srv.data_time,
+            Some(volume_time()),
+            "SRV derives from the Level II volume, so that is the age of what is drawn",
         );
     }
 
-    /// A key whose tail does not parse is an **unknown** age, not a fresh one.
+    /// A key whose tail does not parse is an **unknown** time, not a fresh one —
+    /// and not the volume's either. Falling back to the scan time for a Level III
+    /// product would report a bucket object, possibly from the previous UTC day, as
+    /// being exactly as current as the volume beside it.
     #[test]
-    fn an_unreadable_key_reports_no_age_rather_than_a_wrong_one() {
+    fn an_unreadable_key_reports_no_time_rather_than_the_volumes() {
         let mut d = RenderDispatcher::new();
         let mut p = product(135, 5, 1);
         p.stamp = ProductStamp::from_key("not-a-key");
@@ -1140,9 +1201,13 @@ mod level3_dispatch_tests {
             "precondition: the product is still drawn — an unreadable key is worth \
              rendering, just not worth dating",
         );
-        let mut pane = pane_on("KMPX");
-        d.stamp_pane_with_product_age(&mut pane, &rendered(RadarProduct::EchoTops, 0.5));
-        assert_eq!(pane.level3_time, None);
+        let mut pane = pane_with_volume("KMPX");
+        assert!(
+            pane.scan_info.is_some(),
+            "precondition: a volume time is in reach and must not be borrowed",
+        );
+        d.stamp_pane_with_data_time(&mut pane, &rendered(RadarProduct::EchoTops, 0.5));
+        assert_eq!(pane.data_time, None);
     }
 
     /// The override wins, routes into the Level II render parameters, and

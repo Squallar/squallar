@@ -271,11 +271,10 @@ impl super::Gui {
                     #[cfg(not(test))]
                     let _ = scan_text;
 
-                    // The Level II scan time above says nothing about a Level
-                    // III product's age — they come from different objects,
-                    // and the Level III one can be a day older. Drawn only
-                    // when there is one, so a Level II pane keeps the bar it
-                    // always had.
+                    // How old what is on screen is, for every product alike.
+                    // The scan summary above answers a different question —
+                    // which volume is loaded — and for a product fetched from
+                    // the Level III bucket it can be a day out.
                     let age_text = render_product_age(
                         ui,
                         self.panes.get(self.active_pane),
@@ -549,17 +548,16 @@ fn render_scan_info(
     text
 }
 
-/// How old a Level III product is, in words.
+/// How old the data behind a pane's image is, in words.
 ///
 /// Whole minutes below an hour and `Nh Mm` above it — a volume takes four to
 /// six minutes, so minutes are the unit that tells "this volume" from "the one
 /// before", and hours are the unit that tells a live field from the previous
 /// UTC day's that `level3::latest_key` falls back to.
 ///
-/// A key stamped in the future is not clamped to zero: `ProductStamp::age`
-/// deliberately keeps the sign so "impossible" stays distinguishable from
-/// "fresh", and a bar that rounded it away would report a clock skew as a
-/// current product.
+/// A time in the future is not clamped to zero: `ProductStamp::age` deliberately
+/// keeps the sign so "impossible" stays distinguishable from "fresh", and a bar
+/// that rounded it away would report a clock skew as current data.
 pub(super) fn format_product_age(age: chrono::Duration) -> String {
     if age < chrono::Duration::zero() {
         return "stamped ahead".to_owned();
@@ -572,36 +570,43 @@ pub(super) fn format_product_age(age: chrono::Duration) -> String {
     }
 }
 
-/// The Level III product line: when the object behind the pane's radar image
-/// was written, and how long ago that was. Returns the text it drew, or `None`
-/// when there was nothing to draw.
+/// The data line: when the data behind the pane's radar image was collected, and
+/// how long ago that was. Returns the text it drew, or `None` when there was
+/// nothing to draw.
 ///
-/// Suppressed during loop playback: the frame on screen then is one of
-/// [`PaneState::loop_state`]'s, chosen by the animation, and `level3_time`
-/// describes the *static* render it replaced.
+/// **One line for every product.** It used to say `Level III:` and appear only for
+/// a product fetched from the bucket, which made the datasource a thing the user
+/// could read off the bar — and made its *absence* informative too, since a
+/// Level II pane silently had no age at all. The age itself is worth keeping: a
+/// site down since yesterday paints a field up to ~48 h old, and the scan summary
+/// beside this describes the Level II volume, so it looks perfectly current.
+///
+/// Under an active loop this reports the playing frame's own time rather than
+/// being suppressed — see [`PaneState::data_time_on_screen`].
+///
+/// The scan summary's time and this one coincide for a product read off the
+/// volume, and that redundancy is deliberate: the two answer different questions
+/// (which volume is loaded, versus how old what you are looking at is), and making
+/// the second conditional on the first disagreeing is what produced the tell.
 fn render_product_age(
     ui: &mut egui::Ui,
     pane: Option<&PaneState>,
     prefs: &UserPreferences,
     roomy: bool,
 ) -> Option<String> {
-    let pane = pane?;
-    if pane.loop_state.is_active() {
-        return None;
-    }
-    let written = pane.level3_time?;
-    let age = format_product_age(chrono::Utc::now().naive_utc() - written);
+    let collected = pane?.data_time_on_screen()?;
+    let age = format_product_age(chrono::Utc::now().naive_utc() - collected);
     let text = if roomy {
         format!(
-            "Level III: {} ({age})",
+            "Data: {} ({age})",
             prefs
                 .timezone
-                .format_naive_utc(written, "%Y-%m-%d %H:%M:%S")
+                .format_naive_utc(collected, "%Y-%m-%d %H:%M:%S")
         )
     } else {
         format!(
-            "L3 {} ({age})",
-            prefs.timezone.format_naive_utc(written, "%H:%M")
+            "Data {} ({age})",
+            prefs.timezone.format_naive_utc(collected, "%H:%M")
         )
     };
     ui.separator();

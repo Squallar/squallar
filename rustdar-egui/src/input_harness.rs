@@ -477,13 +477,14 @@ impl InputHarness {
         self.warm_up();
     }
 
-    /// Say when the Level III object behind pane `idx`'s radar image was
-    /// written, as `apply_render_to_pane` does when a render lands.
-    pub(crate) fn set_level3_time(&mut self, idx: usize, written: Option<chrono::NaiveDateTime>) {
+    /// Say when the data behind pane `idx`'s radar image was collected, as
+    /// `apply_render_to_pane` does when a render lands — whichever datasource the
+    /// product came from.
+    pub(crate) fn set_data_time(&mut self, idx: usize, collected: Option<chrono::NaiveDateTime>) {
         self.gui
             .pane_mut(idx)
             .unwrap_or_else(|| panic!("no pane {idx}"))
-            .level3_time = written;
+            .data_time = collected;
         self.warm_up();
     }
 
@@ -3661,7 +3662,7 @@ mod tests {
         );
     }
 
-    /// A Level III product written `ago` before now.
+    /// Data collected `ago` before now.
     ///
     /// Offset by half a minute so the whole-minute truncation in
     /// `format_product_age` cannot land on a boundary and read one lower while
@@ -3670,39 +3671,48 @@ mod tests {
         chrono::Utc::now().naive_utc() - chrono::Duration::seconds(minutes * 60 + 30)
     }
 
-    /// 26b. **A Level III product says how old it is.**
+    /// 26b. **Every product says how old the data behind it is, the same way.**
     ///
-    ///      The scan line beside it is the *Level II* volume time and says
-    ///      nothing about a Level III object: the two come from different
-    ///      buckets, and `level3::latest_key` falls back to the previous UTC
-    ///      day, so a site that went down yesterday paints a field up to ~48h
-    ///      old under a scan line that looks perfectly current. Until this was
-    ///      drawn, the only place the age existed at all was a `log::info!`.
+    ///      The scan line beside this is the *volume* time and answers a
+    ///      different question. For a product fetched from the Level III bucket
+    ///      the two can be days apart — `level3::latest_key` falls back to the
+    ///      previous UTC day, so a site that went down yesterday paints a field
+    ///      up to ~48h old under a scan line that looks perfectly current.
+    ///
+    ///      The line used to read `Level III:` and be drawn *only* for the
+    ///      bucket-fetched products, which made the datasource readable off the
+    ///      status bar and made its absence informative too. It is now one
+    ///      uniform line: same label, same format, drawn whenever the pane knows
+    ///      when its data was collected, whatever produced it.
     ///
     ///      Asserted on the text egui laid out inside the bar's own rect, not
     ///      just on the probe: a probe records what the renderer was handed,
     ///      and the thing that matters is what reached the glass.
     #[test]
-    fn a_level3_products_age_is_drawn_in_the_status_bar() {
+    fn every_products_data_age_is_drawn_the_same_way_in_the_status_bar() {
         let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
         h.load_scan("KTLX");
         assert_eq!(
             h.status_bar().product_age_text,
             None,
-            "precondition: a Level II pane has no product age to draw, so the \
-             line below is not simply always there"
+            "precondition: a pane with no render yet has no data time to report, \
+             so the line below is not simply always there"
         );
 
-        h.set_level3_time(0, Some(written_ago(23)));
+        h.set_data_time(0, Some(written_ago(23)));
 
         let bar = h.status_bar();
         let drawn = bar
             .product_age_text
             .as_deref()
-            .expect("a pane showing a Level III product must report its age");
+            .expect("a pane showing an image must report when its data was collected");
         assert!(
-            drawn.starts_with("Level III:") && drawn.contains("(23 min old)"),
-            "the roomy bar should name the product and its age, got {drawn:?}"
+            drawn.starts_with("Data:") && drawn.contains("(23 min old)"),
+            "the roomy bar should give the data time and its age, got {drawn:?}"
+        );
+        assert!(
+            !drawn.contains("Level III") && !drawn.contains("L3"),
+            "the line must not name a datasource: {drawn:?}"
         );
         assert!(
             h.text_painted_in(bar.rect, "23 min old"),
@@ -3711,24 +3721,111 @@ mod tests {
             bar.rect,
             h.painted_text_strings()
         );
+    }
 
-        // Loop playback draws one of `loop_state`'s frames instead, chosen by
-        // the animation, so the static render's age would be a caption on
-        // someone else's picture.
-        h.gui_mut().pane_mut(0).unwrap().loop_state = crate::pane::LoopPlaybackState::new_for_loop(
-            600,
-            rustdar_radar::sites::get_radar_site("KTLX").unwrap(),
-        );
+    /// 26d. **A looping pane dates the frame it is playing, not the still it
+    ///      replaced.**
+    ///
+    ///      The bar used to draw nothing at all while a loop ran, because
+    ///      `data_time` describes the static render the animation stands in
+    ///      for — captioning someone else's picture. The frame's own volume time
+    ///      is the right answer, and it is the same answer whichever datasource
+    ///      the loop reads, since a loop frame *is* a volume.
+    #[test]
+    fn a_looping_pane_reports_its_current_frames_time() {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.load_scan("KTLX");
+        // A time the static render would never report, so the two are telling.
+        h.set_data_time(0, Some(written_ago(90)));
+
+        let frame_time = written_ago(7);
+        {
+            let pane = h.gui_mut().pane_mut(0).unwrap();
+            pane.loop_state = crate::pane::LoopPlaybackState::new_for_loop(
+                600,
+                rustdar_radar::sites::get_radar_site("KTLX").unwrap(),
+            );
+            pane.loop_state.frames = vec![crate::pane::LoopFrame {
+                timestamp: frame_time,
+                texture: None,
+                render_in_flight: false,
+                render_failed: false,
+            }];
+            pane.loop_state.current_frame = 0;
+        }
         h.warm_up();
-        assert_eq!(
-            h.status_bar().product_age_text,
-            None,
-            "a looping pane must not caption its animation with the static \
-             render's age"
+
+        let drawn = h
+            .status_bar()
+            .product_age_text
+            .expect("a looping pane still reports a data time");
+        assert!(
+            drawn.contains("(7 min old)"),
+            "the playing frame's own time must be reported, got {drawn:?}"
+        );
+        assert!(
+            !drawn.contains("90 min old"),
+            "the static render's time captioned the animation: {drawn:?}"
         );
     }
 
-    /// 26c. **…and a day-old one reads as hours, not as 1,560 minutes.**
+    /// 26e. **A product whose tilts have not arrived keeps its tilt picker.**
+    ///
+    ///      Only Level III products can be in this state: `ScanInfo::from_scan`
+    ///      lists them the moment a volume loads and fills their angle in when the
+    ///      fetch lands, and every archive poll rebuilds `ScanInfo` from the volume
+    ///      alone, so the window reopens on every poll. Skipping the combo box
+    ///      while the list was empty made the control *vanish* and the layers panel
+    ///      reflow around it — visible on first selection and then flickering once
+    ///      a minute, which is exactly the kind of thing that tells a user this
+    ///      product is not like the others.
+    #[test]
+    fn a_product_whose_tilts_have_not_arrived_keeps_its_tilt_picker() {
+        use rustdar_radar::types::RadarProduct;
+
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.load_scan("KTLX");
+        {
+            let pane = h.gui_mut().pane_mut(0).unwrap();
+            pane.set_overlay_enabled(OverlayKind::Radar, true);
+            let info = pane.scan_info.as_mut().expect("a scan was loaded");
+            info.product_elevations
+                .insert(RadarProduct::Reflectivity, vec![0.5, 1.5]);
+            // As `from_scan` lists a Level III product: available, no angles yet.
+            info.available_products.push(RadarProduct::EchoTops);
+            info.product_elevations
+                .insert(RadarProduct::EchoTops, Vec::new());
+            pane.selected_product = RadarProduct::EchoTops;
+            pane.selected_elevation = 0.0;
+        }
+        h.warm_up();
+
+        assert!(
+            h.painted_text_strings().iter().any(|t| t == "0.0\u{b0}"),
+            "the tilt picker vanished for a product whose angles have not landed; \
+             painted: {:?}",
+            h.painted_text_strings(),
+        );
+        // And the render path agrees: the selection stands, so a render is
+        // dispatched rather than the previous product's image being held.
+        assert_eq!(
+            h.gui_mut().pane(0).unwrap().get_rendering_params(),
+            Some((RadarProduct::EchoTops, 0.0)),
+        );
+
+        // The populated case still lists its angles, so the assertion above is
+        // about a *present but empty* picker rather than about a combo box that
+        // never shows anything.
+        h.gui_mut().pane_mut(0).unwrap().selected_product = RadarProduct::Reflectivity;
+        h.warm_up();
+        assert!(
+            h.painted_text_strings().iter().any(|t| t == "0.5\u{b0}"),
+            "painted: {:?}",
+            h.painted_text_strings(),
+        );
+    }
+
+    /// 26c. **…and day-old data reads as hours, not as 1,560 minutes.**
     ///
     ///      This is the case the line exists for. `level3::latest_key` falls
     ///      back to the previous UTC day when today's prefix is empty, so the
@@ -3736,10 +3833,10 @@ mod tests {
     ///      most of a day — and a bar that only ever counted minutes would say
     ///      so in a unit nobody reads at a glance.
     #[test]
-    fn a_day_old_level3_product_reads_in_hours() {
+    fn day_old_data_reads_in_hours() {
         let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
         h.load_scan("KTLX");
-        h.set_level3_time(0, Some(written_ago(26 * 60 + 5)));
+        h.set_data_time(0, Some(written_ago(26 * 60 + 5)));
 
         let bar = h.status_bar();
         assert_eq!(
@@ -3747,7 +3844,7 @@ mod tests {
                 .as_deref()
                 .map(|t| t.contains("(26h 5m old)")),
             Some(true),
-            "a 26-hour-old product must read in hours, got {:?}",
+            "26-hour-old data must read in hours, got {:?}",
             bar.product_age_text
         );
         assert!(
@@ -3760,20 +3857,24 @@ mod tests {
         // never the age — that is the whole message.
         let mut phone = InputHarness::with_screen(egui::vec2(420.0, 900.0));
         phone.load_scan("KTLX");
-        phone.set_level3_time(0, Some(written_ago(26 * 60 + 5)));
+        phone.set_data_time(0, Some(written_ago(26 * 60 + 5)));
         let compact = phone.status_bar();
         let drawn = compact
             .product_age_text
             .as_deref()
             .expect("a compact bar must still report the age");
         assert!(
-            drawn.starts_with("L3 ") && drawn.contains("(26h 5m old)"),
+            drawn.starts_with("Data ") && drawn.contains("(26h 5m old)"),
             "the compact form should be short and still carry the age, got \
              {drawn:?}"
         );
         assert!(
-            !drawn.contains("Level III:"),
+            !drawn.contains("Data:"),
             "the compact bar drew the roomy form: {drawn:?}"
+        );
+        assert!(
+            !drawn.contains("L3") && !drawn.contains("Level III"),
+            "nor may the compact form name a datasource: {drawn:?}"
         );
     }
 
@@ -4387,8 +4488,8 @@ mod tests {
     ///      really is an error its rect is welded to the row's edge while
     ///      everything to its left comes and goes, and the slot plus all three
     ///      widgets inside it come back under new ids. Two things move it — the
-    ///      auto-poll block when a scan lands, and the Level III age line when
-    ///      a render does — so both are driven here.
+    ///      auto-poll block when a scan lands, and the data age line when a
+    ///      render does — so both are driven here.
     #[test]
     fn an_error_on_screen_keeps_its_id_while_the_row_changes_around_it() {
         let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
@@ -4428,7 +4529,7 @@ mod tests {
 
         // …and the same slot, moved by the other neighbour.
         h.clear_id_changes();
-        h.set_level3_time(0, Some(written_ago(5)));
+        h.set_data_time(0, Some(written_ago(5)));
         assert!(
             h.status_bar().product_age_text.is_some(),
             "precondition: the age line must have appeared, or nothing moved"
@@ -4436,7 +4537,7 @@ mod tests {
         assert_eq!(
             h.id_changes(),
             &[] as &[egui::Rect],
-            "the Level III age line appearing re-keyed the error slot"
+            "the data age line appearing re-keyed the error slot"
         );
     }
 

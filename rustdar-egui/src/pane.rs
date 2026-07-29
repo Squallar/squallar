@@ -212,17 +212,25 @@ pub struct PaneState {
     pub site: String,
     /// Product/elevation metadata for this pane's site.
     pub scan_info: Option<ScanInfo>,
-    /// When the Level III object behind this pane's current radar image was
-    /// written (UTC), from its [`rustdar_radar::level3::ProductStamp`].
+    /// When the data behind this pane's current radar image was collected (UTC).
     ///
-    /// `None` for a Level II render and for a key whose tail does not parse.
-    /// Written on every render that reaches the pane, so switching to Level II
-    /// clears it rather than leaving the last Level III product's age on
-    /// screen. It is the age of *what is drawn*, not of the newest object in
-    /// the cache: `level3::latest_key` falls back to the previous UTC day, so
-    /// a site down since yesterday paints a field up to ~48 h old over a live
-    /// basemap and nothing else on screen says so.
-    pub level3_time: Option<NaiveDateTime>,
+    /// One field for every product, whatever it is derived from: the volume time
+    /// for a product read off the Level II scan, the
+    /// [`rustdar_radar::level3::ProductStamp`] time for one fetched from the
+    /// Level III bucket. The status bar draws it the same way either way — a
+    /// product whose age is reported under a different label, or only sometimes, is
+    /// a product the user can identify as coming from somewhere else.
+    ///
+    /// It is the time of *what is drawn*, not of the freshest data in hand, and
+    /// that is the point. `level3::latest_key` falls back to the previous UTC day,
+    /// so a site down since yesterday paints a field up to ~48 h old over a live
+    /// basemap; nothing else on screen says so, because the scan line beside it
+    /// describes the Level II volume.
+    ///
+    /// `None` before any render has reached the pane, and for a bucket key whose
+    /// tail does not parse — an *unknown* time, which the bar reports by drawing
+    /// nothing rather than by guessing.
+    pub data_time: Option<NaiveDateTime>,
     pub selected_product: RadarProduct,
     pub selected_elevation: f32,
     /// Whether this pane is viewing the latest (live) data.
@@ -609,7 +617,7 @@ impl PaneState {
         Self {
             site,
             scan_info: None,
-            level3_time: None,
+            data_time: None,
             selected_product: RadarProduct::Reflectivity,
             selected_elevation: 0.0,
             viewing_live: true,
@@ -639,6 +647,28 @@ impl PaneState {
             .and_then(|f| f.texture.as_ref())
     }
 
+    /// When the data behind the image *currently on screen* was collected.
+    ///
+    /// Under an active loop that is the playing frame's own volume time, not
+    /// [`data_time`](Self::data_time), which describes the static render the
+    /// animation replaced — captioning someone else's picture. The status bar used
+    /// to draw nothing at all while a loop ran for exactly that reason; answering
+    /// the question properly is better, and it is the same answer whichever
+    /// datasource the loop reads, since a frame *is* a volume.
+    ///
+    /// `None` when there is nothing to say: no render has landed, or the loop's
+    /// playhead is on a frame that no longer exists.
+    pub fn data_time_on_screen(&self) -> Option<NaiveDateTime> {
+        if self.loop_state.is_active() {
+            return self
+                .loop_state
+                .frames
+                .get(self.loop_state.current_frame)
+                .map(|f| f.timestamp);
+        }
+        self.data_time
+    }
+
     /// Whether this overlay is enabled for this pane.
     ///
     /// Falls back to `false` if the kind has no entry (uninitialised pane).
@@ -662,21 +692,40 @@ impl PaneState {
     }
 
     /// Get rendering params for this pane (product + closest elevation).
+    ///
+    /// Three cases, and the middle one is what keeps a Level III pane behaving like
+    /// a Level II one:
+    ///
+    /// * The product has tilts — the selection snaps to the nearest.
+    /// * The product is **listed with no tilts yet.** The selection stands as it is.
+    ///   Only Level III products reach this: `ScanInfo::from_scan` lists them the
+    ///   moment a volume loads and fills their angle in from the object's PDB when
+    ///   the fetch lands, so there is a window — reopened by every archive poll,
+    ///   which rebuilds `ScanInfo` from the volume alone — in which the product is
+    ///   selectable and has no angle. Answering `None` there made that window
+    ///   visible: `dispatch_pane_renders` took its no-params branch, no render was
+    ///   ever dispatched, and the pane went on showing the *previous* product's
+    ///   image, captioned as the new one, until the fetch happened to land. A
+    ///   Level II product switch holds the old image too — for as long as its render
+    ///   takes — so standing the selection up immediately makes the two paths
+    ///   indistinguishable rather than merely faster.
+    /// * The product is not listed at all — this pane's scan does not offer it, and
+    ///   there is nothing to render.
     pub fn get_rendering_params(&self) -> Option<(RadarProduct, f32)> {
-        self.scan_info.as_ref().and_then(|si| {
-            si.product_elevations
-                .get(&self.selected_product)
-                .and_then(|elevations| {
-                    elevations
-                        .iter()
-                        .min_by(|a, b| {
-                            ((**a - self.selected_elevation).abs())
-                                .total_cmp(&((**b - self.selected_elevation).abs()))
-                        })
-                        .copied()
-                })
-                .map(|elev_angle| (self.selected_product, elev_angle))
-        })
+        let elevations = self
+            .scan_info
+            .as_ref()?
+            .product_elevations
+            .get(&self.selected_product)?;
+        let snapped = elevations
+            .iter()
+            .min_by(|a, b| {
+                ((**a - self.selected_elevation).abs())
+                    .total_cmp(&((**b - self.selected_elevation).abs()))
+            })
+            .copied()
+            .unwrap_or(self.selected_elevation);
+        Some((self.selected_product, snapped))
     }
 }
 
@@ -928,6 +977,137 @@ fn drag_divider(
             egui::CursorIcon::ResizeHorizontal
         };
         ui.ctx().set_cursor_icon(cursor);
+    }
+}
+
+#[cfg(test)]
+mod render_params_tests {
+    use super::*;
+    use rustdar_radar::sites::RadarSite;
+    use rustdar_radar::types::ScanInfo;
+
+    /// A pane whose scan lists `products` with the angles given.
+    fn pane_listing(products: &[(RadarProduct, &[f32])]) -> PaneState {
+        let mut pane = PaneState::with_site("KTLX".to_string());
+        pane.scan_info = Some(ScanInfo {
+            site: RadarSite {
+                name: "KTLX",
+                lat: 35.33,
+                lon: -97.27,
+                elev: None,
+            },
+            timestamp: chrono::NaiveDate::from_ymd_opt(2026, 7, 26)
+                .unwrap()
+                .and_hms_opt(1, 48, 0)
+                .unwrap(),
+            vcp_number: 212,
+            available_products: products.iter().map(|(p, _)| *p).collect(),
+            product_elevations: products
+                .iter()
+                .map(|(p, angles)| (*p, angles.to_vec()))
+                .collect(),
+            status: String::new(),
+        });
+        pane
+    }
+
+    /// The ordinary case: the selection snaps to the nearest listed tilt.
+    #[test]
+    fn a_selection_snaps_to_the_nearest_listed_tilt() {
+        let mut pane = pane_listing(&[(RadarProduct::Reflectivity, &[0.5, 1.5, 2.4])]);
+        pane.selected_elevation = 1.3;
+        assert_eq!(
+            pane.get_rendering_params(),
+            Some((RadarProduct::Reflectivity, 1.5)),
+        );
+    }
+
+    /// The parity case. `ScanInfo::from_scan` lists every Level III product the
+    /// moment a volume loads and fills its angle in only when the fetch lands — and
+    /// every archive poll rebuilds `ScanInfo` from the volume alone, reopening that
+    /// window. Answering `None` there made it visible: no render was dispatched at
+    /// all, so the pane went on showing the *previous* product's image, captioned as
+    /// the new one, until the fetch happened to land. Standing the selection up
+    /// immediately makes the switch behave like a Level II one, which also holds the
+    /// old image for as long as its render takes.
+    #[test]
+    fn a_listed_product_with_no_tilts_yet_still_renders_at_its_selection() {
+        let mut pane = pane_listing(&[
+            (RadarProduct::Reflectivity, &[0.5, 1.5]),
+            (RadarProduct::EchoTops, &[]),
+        ]);
+        pane.selected_product = RadarProduct::EchoTops;
+        pane.selected_elevation = 0.0;
+
+        assert_eq!(
+            pane.get_rendering_params(),
+            Some((RadarProduct::EchoTops, 0.0)),
+            "a product listed without angles must still resolve, or nothing is \
+             ever dispatched for it",
+        );
+
+        // And the selection is the pane's own, not some other product's tilt.
+        pane.selected_elevation = 2.4;
+        assert_eq!(
+            pane.get_rendering_params(),
+            Some((RadarProduct::EchoTops, 2.4)),
+        );
+    }
+
+    /// A product the scan does not offer at all is still `None`: there is nothing
+    /// to render, which is a different answer from "not yet".
+    #[test]
+    fn a_product_the_scan_does_not_list_resolves_to_nothing() {
+        let pane = pane_listing(&[(RadarProduct::Reflectivity, &[0.5])]);
+        let mut absent = pane;
+        absent.selected_product = RadarProduct::Velocity;
+        assert_eq!(absent.get_rendering_params(), None);
+
+        // As is a pane with no scan at all.
+        let empty = PaneState::with_site("KTLX".to_string());
+        assert_eq!(empty.get_rendering_params(), None);
+    }
+
+    /// Under a loop the data line reports the playing frame, not the static
+    /// render's time — and off a loop it reports the static render's.
+    #[test]
+    fn the_data_time_on_screen_follows_the_loop_when_one_is_running() {
+        let volume = chrono::NaiveDate::from_ymd_opt(2026, 7, 26)
+            .unwrap()
+            .and_hms_opt(1, 48, 0)
+            .unwrap();
+        let frame = volume - chrono::Duration::minutes(20);
+
+        let mut pane = PaneState::with_site("KTLX".to_string());
+        pane.data_time = Some(volume);
+        assert_eq!(pane.data_time_on_screen(), Some(volume), "no loop running");
+
+        pane.loop_state = LoopPlaybackState::new_for_loop(
+            600,
+            &RadarSite {
+                name: "KTLX",
+                lat: 35.33,
+                lon: -97.27,
+                elev: None,
+            },
+        );
+        assert_eq!(
+            pane.data_time_on_screen(),
+            None,
+            "a loop with no frames yet has nothing on screen to date",
+        );
+
+        pane.loop_state.frames = vec![LoopFrame {
+            timestamp: frame,
+            texture: None,
+            render_in_flight: false,
+            render_failed: false,
+        }];
+        assert_eq!(
+            pane.data_time_on_screen(),
+            Some(frame),
+            "the animation's own frame, not the still it replaced",
+        );
     }
 }
 

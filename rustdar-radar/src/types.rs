@@ -586,3 +586,79 @@ impl RadarProduct {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
+
+    /// A volume with no sweeps — enough to build a `ScanInfo`, and the strongest
+    /// form of the case below: no product can be *discovered* from it.
+    fn empty_scan() -> Scan {
+        Scan::new(
+            VolumeCoveragePattern::new(
+                212,
+                0,
+                0.5,
+                PulseWidth::Short,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+                0,
+                false,
+                false,
+                Vec::new(),
+            ),
+            Vec::new(),
+        )
+    }
+
+    /// Every Level III product is in the selector from the moment a volume loads,
+    /// with an empty tilt list — not from the moment its fetch lands.
+    ///
+    /// This is the availability half of "a user cannot tell which datasource a
+    /// product comes from". A product that materialises in the picker a second or
+    /// two after the scan, and again after every archive poll (which rebuilds
+    /// `ScanInfo` from the volume alone), is a product visibly unlike its
+    /// neighbours. Listed from the start, the entry is stable and the angle fills
+    /// in behind it; `PaneState::get_rendering_params` reads the empty list as
+    /// "the selection stands" so a render is dispatched immediately.
+    #[test]
+    fn every_level3_product_is_listed_from_the_moment_a_volume_loads() {
+        let info = ScanInfo::from_scan(
+            &empty_scan(),
+            "KTLX",
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 26)
+                .unwrap()
+                .and_hms_opt(1, 48, 0)
+                .unwrap(),
+        );
+
+        for product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
+            assert!(
+                info.available_products.contains(product),
+                "{} is not selectable until its fetch lands",
+                product.name(),
+            );
+            assert_eq!(
+                info.product_elevations.get(product).map(Vec::as_slice),
+                Some(&[][..]),
+                "{} must be listed with an empty tilt list, not absent",
+                product.name(),
+            );
+        }
+
+        // The volume itself carries nothing, so nothing else is listed: the
+        // products above are there because they were added, not because an empty
+        // scan happens to yield every product.
+        assert_eq!(
+            info.available_products.len(),
+            RadarProduct::all().iter().filter(|p| p.is_level3()).count(),
+            "a sweepless volume listed a Level II product: {:?}",
+            info.available_products,
+        );
+    }
+}

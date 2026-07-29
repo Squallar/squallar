@@ -326,12 +326,12 @@ impl super::App {
             max_lon: bounds.max_lon,
         };
         let pane = self.gui.pane_mut(pane_idx).unwrap();
-        // Dropping this call is silent: a pane that should be captioned with a
-        // two-hour-old Level III object looks exactly like a pane showing Level
-        // II, which is captioned with nothing. The lookup and the assignment
-        // inside the callee are the dispatcher's own tests' business; that this
-        // function *makes the call* is `stamping_tests` below.
-        self.render.stamp_pane_with_product_age(pane, render);
+        // Dropping this call is silent: the pane simply keeps whatever time it
+        // was last stamped with, which reads as a current image of another
+        // volume. The lookup and the assignment inside the callee are the
+        // dispatcher's own tests' business; that this function *makes the call*
+        // is `stamping_tests` below.
+        self.render.stamp_pane_with_data_time(pane, render);
         let cache = pane.overlay_cache_mut(OverlayKind::Radar);
         cache.current = Some(OverlayTextureData {
             texture,
@@ -3019,6 +3019,25 @@ mod stamping_tests {
         }
     }
 
+    /// The volume the fixture pane has loaded, deliberately **not** the time in
+    /// the Level III key below: a pane stamped with the wrong one of the two is
+    /// then a wrong value rather than a coincidence.
+    fn volume_time() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 26)
+            .unwrap()
+            .and_hms_opt(1, 48, 0)
+            .unwrap()
+    }
+
+    /// The time `MPX_EET_2026_07_26_01_55_52` carries — seven minutes after the
+    /// volume, which is what a bucket object that lagged a volume looks like.
+    fn object_time() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 26)
+            .unwrap()
+            .and_hms_opt(1, 55, 52)
+            .unwrap()
+    }
+
     /// An `App` with one pane on [`SITE`], far enough along that
     /// `apply_render_to_pane` will not bail out of it: the pane needs scan info
     /// for the site coordinates and the dispatcher needs a slot for the pane.
@@ -3032,10 +3051,7 @@ mod stamping_tests {
             0,
             ScanInfo {
                 site,
-                timestamp: chrono::NaiveDate::from_ymd_opt(2026, 7, 26)
-                    .unwrap()
-                    .and_hms_opt(1, 55, 52)
-                    .unwrap(),
+                timestamp: volume_time(),
                 vcp_number: 212,
                 available_products: vec![PRODUCT],
                 product_elevations: std::collections::HashMap::new(),
@@ -3046,14 +3062,14 @@ mod stamping_tests {
         app
     }
 
-    /// Placing an image also dates it.
+    /// Placing an image also dates it, with the time of the data *behind that
+    /// image*.
     ///
     /// `latest_key` falls back to the previous UTC day, so a site that went down
     /// yesterday serves an object most of a day old while the Level II scan line
-    /// beside it looks current. The age line is the only thing that says so, and
-    /// its absence is invisible: an undated pane is exactly what a Level II pane
-    /// looks like. Nothing between the render arriving and the pane being drawn
-    /// would notice this call going missing.
+    /// beside it looks current. The data line is the only thing that says so, and
+    /// nothing between the render arriving and the pane being drawn would notice
+    /// this call going missing — the pane would simply keep the time it last had.
     #[test]
     fn a_placed_render_dates_the_pane_it_lands_on() {
         let ctx = egui::Context::default();
@@ -3067,17 +3083,10 @@ mod stamping_tests {
 
         app.apply_render_to_pane(&ctx, 0, &finished(PRODUCT, 0.5));
 
-        let stamped = app.gui.pane(0).unwrap().level3_time;
         assert_eq!(
-            stamped,
-            Some(
-                chrono::NaiveDate::from_ymd_opt(2026, 7, 26)
-                    .unwrap()
-                    .and_hms_opt(1, 55, 52)
-                    .unwrap()
-            ),
-            "the image was placed undated, so the status bar says nothing about \
-             an object that may be a day old",
+            app.gui.pane(0).unwrap().data_time,
+            Some(object_time()),
+            "a Level III pane must report its own object's time, not the volume's",
         );
 
         // …and the image really did land, so the assertion above is about a
@@ -3091,14 +3100,16 @@ mod stamping_tests {
         );
     }
 
-    /// Switching a pane to a product with no stamp clears the old one.
+    /// Switching datasource replaces the time rather than leaving the old one.
     ///
-    /// The assignment is unconditional for this reason: leaving the last Level
-    /// III object's time in place would caption a Level II volume with the age
-    /// of a field it has nothing to do with — a wrong answer, where saying
-    /// nothing is the right one.
+    /// The assignment is unconditional for this reason: leaving the Level III
+    /// object's time in place would caption a field derived from the volume with
+    /// the age of one it has nothing to do with. And the replacement is the
+    /// volume's own time, not nothing — a product whose age line disappears is a
+    /// product the user can identify as coming from somewhere else, which is the
+    /// asymmetry this line no longer has.
     #[test]
-    fn a_render_with_no_stamp_behind_it_clears_the_old_date() {
+    fn switching_datasource_redates_the_pane_rather_than_undating_it() {
         let ctx = egui::Context::default();
         let mut app = app_showing_site();
         app.render.cache_level3(
@@ -3109,18 +3120,19 @@ mod stamping_tests {
         );
 
         app.apply_render_to_pane(&ctx, 0, &finished(PRODUCT, 0.5));
-        assert!(
-            app.gui.pane(0).unwrap().level3_time.is_some(),
-            "precondition: it was dated",
+        assert_eq!(
+            app.gui.pane(0).unwrap().data_time,
+            Some(object_time()),
+            "precondition: dated from the bucket object",
         );
 
         app.apply_render_to_pane(&ctx, 0, &finished(RadarProduct::Reflectivity, 0.5));
 
         assert_eq!(
-            app.gui.pane(0).unwrap().level3_time,
-            None,
-            "a Level II volume is still captioned with the last Level III \
-             object's age",
+            app.gui.pane(0).unwrap().data_time,
+            Some(volume_time()),
+            "a volume-derived product reports the volume's time — the same line, \
+             filled in the same way",
         );
     }
 }

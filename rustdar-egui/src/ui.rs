@@ -1189,9 +1189,19 @@ impl Gui {
                         pane.selected_elevation = 0.0;
                     }
 
+                    // The tilt picker is drawn for every listed product, including
+                    // one whose angles have not arrived yet.
+                    //
+                    // Skipping it while the list was empty made the control vanish
+                    // and the panel reflow around it — for a Level III product on
+                    // first selection, and again on every archive poll, which
+                    // rebuilds `ScanInfo` from the volume alone and so drops the
+                    // angles `poll_level3_results` had filled in. Present but
+                    // unpopulated is the honest state: the product is selected, the
+                    // selection stands (`get_rendering_params` leaves it unsnapped),
+                    // and there is nothing to choose between yet.
                     if let Some(elevations) =
                         scan_info.product_elevations.get(&pane.selected_product)
-                        && !elevations.is_empty()
                     {
                         let selected_angle = elevations
                             .iter()
@@ -1200,12 +1210,21 @@ impl Gui {
                                     .total_cmp(&((**b - pane.selected_elevation).abs()))
                             })
                             .copied()
-                            .unwrap_or(0.0);
+                            .unwrap_or(pane.selected_elevation);
 
-                        egui::ComboBox::from_id_salt(format!("{id_prefix}elev_sel"))
+                        let combo = egui::ComboBox::from_id_salt(format!("{id_prefix}elev_sel"))
                             .selected_text(format!("{:.1}\u{b0}", selected_angle))
-                            .width(combo_width)
-                            .show_ui(ui, |ui| {
+                            .width(combo_width);
+                        if elevations.is_empty() {
+                            // Nothing to pick from, so the control is inert rather
+                            // than an empty menu that opens onto nothing.
+                            ui.add_enabled_ui(false, |ui| {
+                                combo.show_ui(ui, |_| {});
+                            })
+                            .response
+                            .on_hover_text("Waiting for this product's data");
+                        } else {
+                            combo.show_ui(ui, |ui| {
                                 for angle in elevations.iter() {
                                     ui.selectable_value(
                                         &mut pane.selected_elevation,
@@ -1214,6 +1233,7 @@ impl Gui {
                                     );
                                 }
                             });
+                        }
                     }
                 } else {
                     ui.label("No scan loaded");
