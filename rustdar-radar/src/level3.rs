@@ -32,7 +32,7 @@
 //! pipeline it replaced and the live harness that still measures it.
 
 use chrono::{Duration, NaiveDate, NaiveDateTime};
-use nexrad_level3::model::Level3Message;
+use nexrad_level3::model::{Level3Message, ProductDescriptionBlock};
 
 use crate::archive::{self, ArchiveError};
 use crate::sources::DataSources;
@@ -233,6 +233,238 @@ pub async fn fetch_latest_product(
         stamp,
         bytes: std::sync::Arc::new(bytes),
     })
+}
+
+// ── Pairing an object to a Level II volume ────────────────────────────────
+//
+// Everything below pairs by **volume identity**, never by key recency. It is
+// the one implementation: the validation twins ([`crate::twin::live`]), the
+// SRM harness and the frontend's Level III loop all route through it, so the
+// rule that makes it correct cannot hold in one copy and not another.
+
+/// How many bucket objects to open looking for a particular volume, and how
+/// far from the volume start to look.
+///
+/// The bucket's *newest* key will not do. SAILS republishes the lowest cut two
+/// to four times a volume and the QPE family emits an intermediate per
+/// SAILS/MRLE scan, so the newest key for a code is usually a mid-volume
+/// repeat of some *other* volume than the one being paired. Taking it skipped
+/// the wanted cut at two sites in three on the SRM harness's first run.
+pub const PAIRING_CANDIDATES: usize = 10;
+/// How far from the volume start a candidate key may be stamped. A product is
+/// generated within seconds to a couple of minutes of the volume it describes;
+/// twenty minutes is wide enough for a slow RPG and narrow enough that the
+/// neighbouring volumes' objects are still ordered behind the right one.
+pub const PAIRING_WINDOW_MINUTES: i64 = 20;
+/// How far a decoded PDB's volume start may sit from the Level II volume start
+/// and still be the same volume. The two are written by different subsystems
+/// from the same clock, so this is slack, not a search radius.
+pub const VOLUME_MATCH_TOLERANCE_SECS: i64 = 60;
+
+/// The PDB's volume scan start as a timestamp. The modified Julian date's
+/// **day 1 is 1970-01-01** — the same convention as the generation stamp.
+///
+/// This is the field that makes pairing possible at all: it is the Level II
+/// volume start, so an object and the volume it was generated from name the
+/// same instant however long the RPG took to publish it.
+pub fn volume_scan_started(pdb: &ProductDescriptionBlock) -> Option<NaiveDateTime> {
+    let days = u64::from(pdb.volume_scan_date).checked_sub(1)?;
+    NaiveDate::from_ymd_opt(1970, 1, 1)?
+        .checked_add_days(chrono::Days::new(days))?
+        .and_hms_opt(0, 0, 0)?
+        .checked_add_signed(Duration::seconds(i64::from(pdb.volume_scan_time)))
+}
+
+/// Whether a decoded product was generated from the volume that started at
+/// `l2_volume_start`, within [`VOLUME_MATCH_TOLERANCE_SECS`].
+///
+/// A PDB with no readable volume stamp names no volume: `false`, never
+/// "close enough".
+pub fn names_volume(pdb: &ProductDescriptionBlock, l2_volume_start: NaiveDateTime) -> bool {
+    volume_scan_started(pdb).is_some_and(|started| {
+        (started - l2_volume_start).num_seconds().abs() <= VOLUME_MATCH_TOLERANCE_SECS
+    })
+}
+
+/// Which object of a paired volume a product wants.
+///
+/// The distinction is real and per-product: most products emit once per
+/// volume, but the QPE family emits an end-of-volume composite *plus* one
+/// partial intermediate per SAILS/MRLE scan, all stamped with the same volume
+/// start. Taking the nearest-to-start one there is taking a partial answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumePick {
+    /// The candidate nearest the volume start that names the volume, and —
+    /// when `cut` is given — that elevation number. What a once-per-volume
+    /// product wants.
+    Nearest {
+        /// PDB `elevation_number` to require, for the per-tilt products.
+        cut: Option<u8>,
+    },
+    /// The highest-keyed object naming the volume: the end-of-volume
+    /// composite for the QPE family.
+    Latest,
+}
+
+impl VolumePick {
+    /// The whole-volume, no-cut-filter case — what every product rustdar
+    /// fetches for display uses unless it is a QPE composite.
+    pub const NEAREST: Self = Self::Nearest { cut: None };
+}
+
+/// The keys of `keys` stamped within [`PAIRING_WINDOW_MINUTES`] of `want`,
+/// **nearest first**.
+///
+/// Pure, and the ordering is the whole point: the matching object is written
+/// within seconds of its siblings, so the first candidate is almost always the
+/// answer and [`product_from_candidates`] opens no more objects than it must.
+/// Keys whose tail does not parse carry no time and are dropped — a key that
+/// cannot be placed in the window cannot be ranked in it either.
+pub fn candidates_near(keys: impl IntoIterator<Item = String>, want: NaiveDateTime) -> Vec<String> {
+    let mut candidates: Vec<(i64, String)> = keys
+        .into_iter()
+        .filter_map(|k| {
+            let t = key_time(&k)?;
+            let delta = (t - want).num_seconds().abs();
+            (delta <= PAIRING_WINDOW_MINUTES * 60).then_some((delta, k))
+        })
+        .collect();
+    // Sorted by `(delta, key)`, so equidistant keys — a product published
+    // before and after the volume start by the same margin — resolve the same
+    // way every call rather than by listing order.
+    candidates.sort();
+    candidates
+        .into_iter()
+        .take(PAIRING_CANDIDATES)
+        .map(|(_, k)| k)
+        .collect()
+}
+
+/// Every key for one site/product across `days`, in one flat list.
+///
+/// Listing a day is a network round-trip per day, and a caller pairing many
+/// volumes against one product — a loop — must not repeat it per volume. So
+/// the listing and the pairing are separate: list once with this, then rank
+/// per volume with [`candidates_near`].
+///
+/// A day that fails to list contributes nothing rather than failing the whole
+/// call: with a two-day span the other day usually still answers, and a
+/// product that genuinely cannot be found is reported as "no object for this
+/// volume" — which is also what a real gap looks like.
+pub async fn list_days(
+    sources: &DataSources,
+    site: &str,
+    product: &str,
+    days: &[NaiveDate],
+) -> Vec<String> {
+    let site3 = site_code(site).to_uppercase();
+    let mut keys = Vec::new();
+    for day in days {
+        match list_day(sources, &site3, product, day).await {
+            Ok(k) => keys.extend(k),
+            Err(e) => log::warn!("Listing {product} for {site3} on {day} failed: {e}"),
+        }
+    }
+    keys
+}
+
+/// The UTC days a pairing window around `want` can touch: the day itself and
+/// the one before, for windows spanning midnight.
+///
+/// A day *after* `want` is deliberately absent. The window is symmetric, so an
+/// object generated just after a volume that started at 23:59 lands on the next
+/// day — but a Level III key names its **generation** time and the pairing only
+/// ever looks backwards for a volume that has already been published, so the
+/// object of the last volume of a day is on that day or, at worst, seconds into
+/// the next. Adding a third listing to cover those seconds would cost a
+/// round-trip per pairing for every volume of every day.
+pub fn pairing_days(want: NaiveDateTime) -> [NaiveDate; 2] {
+    [want.date(), want.date() - Duration::days(1)]
+}
+
+/// The keys for `site`/`product` within the pairing window of `want`, nearest
+/// first — [`list_days`] over [`pairing_days`] then [`candidates_near`].
+pub async fn candidate_keys(
+    sources: &DataSources,
+    site: &str,
+    product: &str,
+    want: NaiveDateTime,
+) -> Vec<String> {
+    let days = pairing_days(want);
+    candidates_near(list_days(sources, site, product, &days).await, want)
+}
+
+/// Open `candidates` in order and return the object generated from the volume
+/// that started at `l2_volume_start`, or `None` if none of them was.
+///
+/// `None` is ordinary: a site can simply not have generated the product for a
+/// volume, which is what a gap in a loop looks like. It is deliberately not an
+/// error — there is nothing to retry and nothing to report.
+///
+/// Never falls back to "the newest key" or "the nearest key regardless": every
+/// returned object has had its PDB checked against the volume. See
+/// [`PAIRING_CANDIDATES`].
+pub async fn product_from_candidates(
+    sources: &DataSources,
+    candidates: Vec<String>,
+    l2_volume_start: NaiveDateTime,
+    pick: VolumePick,
+) -> Option<Level3Product> {
+    let mut best: Option<Level3Product> = None;
+    for key in candidates {
+        let url = sources.level3_object_url(&key);
+        let Ok(bytes) = archive::get_bytes(archive::shared_client(), url).await else {
+            continue;
+        };
+        let Ok(message) = nexrad_level3::decode::decode_product(&bytes) else {
+            continue;
+        };
+        if !names_volume(&message.pdb, l2_volume_start) {
+            continue;
+        }
+        if let VolumePick::Nearest { cut: Some(cut) } = pick
+            && message.pdb.elevation_number != u16::from(cut)
+        {
+            continue;
+        }
+        let product = Level3Product {
+            message,
+            stamp: ProductStamp::from_key(key),
+            bytes: std::sync::Arc::new(bytes),
+        };
+        match pick {
+            // The candidates are already nearest-first, so the first match is
+            // the answer and the remaining objects need not be downloaded.
+            VolumePick::Nearest { .. } => return Some(product),
+            VolumePick::Latest => {
+                if best
+                    .as_ref()
+                    .is_none_or(|b| product.stamp.key > b.stamp.key)
+                {
+                    best = Some(product);
+                }
+            }
+        }
+    }
+    best
+}
+
+/// The Level III object generated **from** a given Level II volume: list the
+/// pairing window's days, rank the candidates nearest the volume start, and
+/// take the first (or highest-keyed, per `pick`) whose PDB names that volume.
+///
+/// One volume, one product code, one listing. A caller pairing many volumes
+/// against one code should list once with [`list_days`] and then call
+/// [`product_from_candidates`] per volume instead.
+pub async fn fetch_product_for_volume(
+    sources: &DataSources,
+    site: &str,
+    product: &str,
+    l2_volume_start: NaiveDateTime,
+    pick: VolumePick,
+) -> Option<Level3Product> {
+    let candidates = candidate_keys(sources, site, product, l2_volume_start).await;
+    product_from_candidates(sources, candidates, l2_volume_start, pick).await
 }
 
 // Native-only: the live checks at the tail are `#[tokio::test]`, and that
@@ -536,6 +768,239 @@ mod tests {
             icd_row(&RadarProduct::StormRelativeVelocity).is_none(),
             "no ICD row either — the table covers exactly what is fetched",
         );
+    }
+
+    // ── Pairing ───────────────────────────────────────────────────────────
+
+    /// A PDB carrying only the fields the pairing reads.
+    fn pdb_for_volume(date: u16, time: u32, elevation_number: u16) -> ProductDescriptionBlock {
+        ProductDescriptionBlock {
+            block_divider: -1,
+            latitude: 41.320,
+            longitude: -96.367,
+            height: 1148,
+            product_code: 135,
+            operational_mode: 2,
+            vcp: 212,
+            sequence_number: 0,
+            volume_scan_number: 1,
+            volume_scan_date: date,
+            volume_scan_time: time,
+            generation_date: date,
+            generation_time: time + 90,
+            product_specific_1: 0,
+            product_specific_2: 0,
+            elevation_number,
+            product_specific_3: 0,
+            thresholds: [0; 16],
+            product_specific_47_53: [0; 7],
+            version: 0,
+            spot_blank: 0,
+            symbology_offset: 60,
+            graphic_offset: 0,
+            tabular_offset: 0,
+        }
+    }
+
+    /// The volume stamp conversion: day 1 is 1970-01-01, so MJD 20661 at 7108 s
+    /// is 2026-07-26 01:58:28 — checked against a calendar, not against the
+    /// function.
+    #[test]
+    fn the_volume_stamp_reads_day_one_as_the_epoch() {
+        let t = volume_scan_started(&pdb_for_volume(20661, 7108, 0)).expect("a valid stamp");
+        assert_eq!(t.to_string(), "2026-07-26 01:58:28");
+        assert_eq!(
+            volume_scan_started(&pdb_for_volume(1, 0, 0)).map(|t| t.to_string()),
+            Some("1970-01-01 00:00:00".to_string()),
+            "day 1 is the epoch itself",
+        );
+        // Day 0 cannot precede the epoch: it is None, not 1969-12-31.
+        assert!(volume_scan_started(&pdb_for_volume(0, 0, 0)).is_none());
+    }
+
+    /// The volume test is a tolerance, not a search: a minute either way is the
+    /// same volume, more is not — and a PDB with no readable stamp names no
+    /// volume at all rather than passing on a plausible default.
+    #[test]
+    fn a_pdb_names_the_volume_it_started_within_a_minute_of() {
+        // MJD 20661 @ 7108 s = 2026-07-26 01:58:28.
+        let started = volume_scan_started(&pdb_for_volume(20661, 7108, 0)).expect("valid");
+        let pdb = pdb_for_volume(20661, 7108, 0);
+
+        assert!(names_volume(&pdb, started));
+        assert!(names_volume(&pdb, started + Duration::seconds(60)));
+        assert!(names_volume(&pdb, started - Duration::seconds(60)));
+        assert!(
+            !names_volume(&pdb, started + Duration::seconds(61)),
+            "past the tolerance is another volume",
+        );
+        assert!(!names_volume(&pdb, started - Duration::seconds(61)));
+        // A four-minute volume spacing is comfortably outside it, which is what
+        // makes the tolerance safe against pairing the neighbour.
+        assert!(!names_volume(&pdb, started + Duration::minutes(4)));
+
+        assert!(
+            !names_volume(&pdb_for_volume(0, 0, 0), started),
+            "an unreadable volume stamp names nothing",
+        );
+    }
+
+    fn key_at(product: &str, hms: (u32, u32, u32)) -> String {
+        format!(
+            "TLX_{product}_2026_07_25_{:02}_{:02}_{:02}",
+            hms.0, hms.1, hms.2
+        )
+    }
+
+    fn want_at(h: u32, m: u32, s: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 7, 25)
+            .unwrap()
+            .and_hms_opt(h, m, s)
+            .unwrap()
+    }
+
+    /// The rule the whole pairing rests on: candidates are ranked by distance
+    /// from the *volume start*, never by recency. The fixture puts the newest
+    /// key furthest away, so a selection that took `keys.max()` — which is what
+    /// the display path's `latest_key` does — would rank it first.
+    #[test]
+    fn candidates_are_ranked_by_distance_from_the_volume_not_by_recency() {
+        let keys = vec![
+            key_at("EET", (17, 45, 10)), // newest, 15 min out
+            key_at("EET", (17, 31, 30)), // 90 s out
+            key_at("EET", (17, 28, 40)), // 80 s out — nearest
+            key_at("EET", (17, 36, 0)),  // 6 min out
+        ];
+        let ranked = candidates_near(keys, want_at(17, 30, 0));
+        assert_eq!(
+            ranked,
+            vec![
+                key_at("EET", (17, 28, 40)),
+                key_at("EET", (17, 31, 30)),
+                key_at("EET", (17, 36, 0)),
+                key_at("EET", (17, 45, 10)),
+            ],
+            "the nearest object is the one written just after the volume; the \
+             newest key is a later volume's",
+        );
+    }
+
+    /// Keys outside the window are not candidates at all, and an unparseable
+    /// key cannot be ranked so it is dropped rather than sorted to the front.
+    #[test]
+    fn the_pairing_window_and_unreadable_keys_bound_the_candidate_set() {
+        let inside = key_at("EET", (17, 49, 0)); // 19 min out
+        let outside = key_at("EET", (17, 51, 0)); // 21 min out
+        let ranked = candidates_near(
+            vec![
+                "garbage".to_string(),
+                outside.clone(),
+                inside.clone(),
+                "TLX_EET_2026_07_25".to_string(),
+            ],
+            want_at(17, 30, 0),
+        );
+        assert_eq!(ranked, vec![inside], "only the in-window readable key");
+        assert!(!ranked.contains(&outside));
+    }
+
+    /// A busy product-day serves hundreds of objects; the candidate list is
+    /// capped so a pairing opens a bounded number of objects, and the cap keeps
+    /// the *nearest* ones.
+    #[test]
+    fn the_candidate_list_is_capped_at_the_nearest_objects() {
+        // One key every 10 s for 5 minutes either side of the volume: 60 keys,
+        // all inside the window.
+        let mut keys = Vec::new();
+        for offset in -30i64..=30 {
+            let t = want_at(17, 30, 0) + Duration::seconds(offset * 10);
+            keys.push(format!("TLX_EET_{}", t.format("%Y_%m_%d_%H_%M_%S")));
+        }
+        let ranked = candidates_near(keys, want_at(17, 30, 0));
+        assert_eq!(ranked.len(), PAIRING_CANDIDATES);
+        // The nearest is the exact hit; nothing further than 50 s survives the
+        // cap (the exact hit plus five pairs either side).
+        assert_eq!(ranked[0], key_at("EET", (17, 30, 0)));
+        for key in &ranked {
+            let delta = (key_time(key).expect("built from a timestamp") - want_at(17, 30, 0))
+                .num_seconds()
+                .abs();
+            assert!(delta <= 50, "{key} is {delta} s out but survived the cap");
+        }
+    }
+
+    /// Equidistant candidates resolve the same way every call: the tie breaks on
+    /// the key, so a listing assembled in another order pairs identically.
+    #[test]
+    fn equidistant_candidates_break_their_tie_deterministically() {
+        let before = key_at("EET", (17, 29, 0));
+        let after = key_at("EET", (17, 31, 0));
+        let want = want_at(17, 30, 0);
+        assert_eq!(
+            candidates_near(vec![after.clone(), before.clone()], want),
+            candidates_near(vec![before.clone(), after.clone()], want),
+        );
+        assert_eq!(
+            candidates_near(vec![after, before.clone()], want)[0],
+            before,
+            "the earlier key wins, since the tie breaks on the key itself",
+        );
+    }
+
+    /// Midnight: a volume just after 00Z is paired against objects that can
+    /// still be under yesterday's prefix, so both days are listed.
+    #[test]
+    fn the_pairing_days_cover_the_previous_utc_day() {
+        let just_after_midnight = NaiveDate::from_ymd_opt(2026, 7, 25)
+            .unwrap()
+            .and_hms_opt(0, 3, 0)
+            .unwrap();
+        assert_eq!(
+            pairing_days(just_after_midnight),
+            [
+                NaiveDate::from_ymd_opt(2026, 7, 25).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 7, 24).unwrap(),
+            ],
+        );
+        // And an in-window key from yesterday really does rank.
+        let overnight = "TLX_EET_2026_07_24_23_59_10".to_string();
+        assert_eq!(
+            candidates_near(vec![overnight.clone()], just_after_midnight),
+            vec![overnight],
+        );
+    }
+
+    /// The per-product pick, which is what keeps a QPE loop from animating
+    /// partial accumulations. Asserted for every product so a new Level III
+    /// product cannot arrive without a decision.
+    #[test]
+    fn only_the_qpe_product_takes_the_volumes_last_object() {
+        use crate::types::RadarProduct;
+        assert_eq!(
+            RadarProduct::PrecipitationRate.level3_volume_pick(),
+            Some(VolumePick::Latest),
+            "DPR emits a partial intermediate per SAILS cut; the composite is last",
+        );
+        for product in RadarProduct::all() {
+            match product.level3_volume_pick() {
+                None => assert!(
+                    !product.is_level3(),
+                    "{} is Level III but names no volume pick",
+                    product.name(),
+                ),
+                Some(pick) => {
+                    assert!(product.is_level3());
+                    if *product != RadarProduct::PrecipitationRate {
+                        assert_eq!(
+                            pick,
+                            VolumePick::NEAREST,
+                            "{} publishes once per volume",
+                            product.name(),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // ── Live checks ───────────────────────────────────────────────────────

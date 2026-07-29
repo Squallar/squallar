@@ -360,6 +360,29 @@ impl RadarProduct {
         }
     }
 
+    /// Which object of a paired volume this product's Level III rendition is —
+    /// what [`crate::level3::product_from_candidates`] is given when a
+    /// particular volume's object is wanted (a loop frame, a validation twin).
+    ///
+    /// [`crate::level3::VolumePick::Latest`] for the QPE family, which emits an
+    /// end-of-volume composite *plus* a partial intermediate per SAILS/MRLE
+    /// scan under the same volume start: the nearest-to-start candidate there is
+    /// an intermediate, and a loop paired that way would animate partial
+    /// accumulations. Nearest for everything else, which publishes once per
+    /// volume.
+    ///
+    /// Meaningless for a Level II product, and it says so — `None` rather than a
+    /// default nobody should read.
+    pub fn level3_volume_pick(&self) -> Option<crate::level3::VolumePick> {
+        if !self.is_level3() {
+            return None;
+        }
+        Some(match self {
+            RadarProduct::PrecipitationRate => crate::level3::VolumePick::Latest,
+            _ => crate::level3::VolumePick::NEAREST,
+        })
+    }
+
     /// A stable identifier for this product on a wire.
     ///
     /// Deliberately not the enum's declaration order and not the serde

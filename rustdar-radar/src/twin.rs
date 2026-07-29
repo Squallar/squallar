@@ -103,16 +103,16 @@ pub mod compare {
             .unwrap_or_else(|| packet.gate_interval_km())
     }
 
-    /// The PDB's volume scan start as a timestamp. The modified Julian date's
-    /// **day 1 is 1970-01-01** — the same convention as the generation stamp
-    /// the SRM harness reads.
-    pub fn volume_scan_started(pdb: &ProductDescriptionBlock) -> Option<chrono::NaiveDateTime> {
-        let days = u64::from(pdb.volume_scan_date).checked_sub(1)?;
-        chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?
-            .checked_add_days(chrono::Days::new(days))?
-            .and_hms_opt(0, 0, 0)?
-            .checked_add_signed(chrono::Duration::seconds(i64::from(pdb.volume_scan_time)))
-    }
+    /// The PDB's volume scan start as a timestamp — re-exported from
+    /// [`crate::level3`], where the pairing that reads it lives.
+    ///
+    /// Kept in this namespace because the `compare_l3` example and the product
+    /// harnesses reach it here, and because it belongs to the same idea as the
+    /// rest of `compare`: a twin is the object of *this* volume, not the newest
+    /// one. There is one implementation, in production code, so the frontend's
+    /// Level III loop and the harnesses cannot disagree about which volume an
+    /// object names.
+    pub use crate::level3::volume_scan_started;
 
     /// Whether level distance means anything. A numeric product's levels are
     /// ordered, so within-±1 is "one shade off"; a class product's levels are
@@ -308,7 +308,7 @@ pub mod compare {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod live {
     use crate::archive;
-    use crate::level3::{Level3Product, ProductStamp};
+    use crate::level3::Level3Product;
     use crate::sources::DataSources;
     use chrono::NaiveDateTime;
     use nexrad_model::data::Scan;
@@ -328,7 +328,8 @@ pub mod live {
     ];
 
     /// How many bucket objects to open looking for a particular volume and
-    /// cut, and how far from the wanted time to look.
+    /// cut, and how far from the wanted time to look — re-exported from
+    /// [`crate::level3`], which owns the pairing.
     ///
     /// The bucket's *newest* key will not do, above all at 0.5°: SAILS
     /// republishes the lowest cut two to four times a volume, so the newest
@@ -336,41 +337,14 @@ pub mod live {
     /// other cut. Taking the newest key skipped the lowest tilt at two sites
     /// in three on the SRM harness's first run — which would have left the
     /// tilt it validates almost never actually compared.
-    pub const KEY_LOOKBACK: usize = 10;
-    pub const KEY_WINDOW_MINUTES: i64 = 20;
+    pub use crate::level3::{
+        PAIRING_CANDIDATES as KEY_LOOKBACK, PAIRING_WINDOW_MINUTES as KEY_WINDOW_MINUTES,
+    };
 
     /// The bucket keys for `site`/`code` within [`KEY_WINDOW_MINUTES`] of
-    /// `want`, nearest first: the matching object is written within seconds
-    /// of its sibling, so the first candidate is almost always the answer.
-    /// Lists the previous UTC day too, for windows spanning midnight.
-    pub async fn candidate_keys(
-        sources: &DataSources,
-        site: &str,
-        code: &str,
-        want: NaiveDateTime,
-    ) -> Vec<String> {
-        let site3 = crate::level3::site_code(site).to_uppercase();
-        let mut keys = Vec::new();
-        for day in [want.date(), want.date() - chrono::Duration::days(1)] {
-            if let Ok(k) = crate::level3::list_day(sources, &site3, code, &day).await {
-                keys.extend(k);
-            }
-        }
-        let mut candidates: Vec<(i64, String)> = keys
-            .into_iter()
-            .filter_map(|k| {
-                let t = crate::level3::key_time(&k)?;
-                let delta = (t - want).num_seconds().abs();
-                (delta <= KEY_WINDOW_MINUTES * 60).then_some((delta, k))
-            })
-            .collect();
-        candidates.sort();
-        candidates
-            .into_iter()
-            .take(KEY_LOOKBACK)
-            .map(|(_, k)| k)
-            .collect()
-    }
+    /// `want`, nearest first — [`crate::level3::candidate_keys`] under the name
+    /// the harnesses reach it by.
+    pub use crate::level3::candidate_keys;
 
     /// The archived Level II volume nearest `when`, as the **raw file**: the
     /// undecoded archive plus the volume start its identifier names — the
@@ -421,8 +395,14 @@ pub mod live {
     /// The Level III object generated **from** a given Level II volume: list
     /// the day prefix (and the previous day near midnight), walk the
     /// candidates nearest the volume start first, and accept the first whose
-    /// PDB names that volume — start times equal within ±60 s — and, when
+    /// PDB names that volume — start times equal within
+    /// [`crate::level3::VOLUME_MATCH_TOLERANCE_SECS`] — and, when
     /// `elevation_number` is given, that cut.
+    ///
+    /// A thin naming of [`crate::level3::fetch_product_for_volume`]: the
+    /// pairing itself is production code, shared with the frontend's Level III
+    /// loop, so a harness and the app can never disagree about which object
+    /// belongs to a volume.
     ///
     /// Never the newest key: see [`KEY_LOOKBACK`].
     pub async fn l3_twin(
@@ -432,32 +412,16 @@ pub mod live {
         l2_volume_start: NaiveDateTime,
         elevation_number: Option<u8>,
     ) -> Option<Level3Product> {
-        for key in candidate_keys(sources, site, awips_code, l2_volume_start).await {
-            let url = sources.level3_object_url(&key);
-            let Ok(bytes) = archive::get_bytes(archive::shared_client(), url).await else {
-                continue;
-            };
-            let Ok(message) = nexrad_level3::decode::decode_product(&bytes) else {
-                continue;
-            };
-            let Some(started) = super::compare::volume_scan_started(&message.pdb) else {
-                continue;
-            };
-            if (started - l2_volume_start).num_seconds().abs() > 60 {
-                continue;
-            }
-            if let Some(cut) = elevation_number
-                && message.pdb.elevation_number != u16::from(cut)
-            {
-                continue;
-            }
-            return Some(Level3Product {
-                message,
-                stamp: ProductStamp::from_key(key),
-                bytes: std::sync::Arc::new(bytes),
-            });
-        }
-        None
+        crate::level3::fetch_product_for_volume(
+            sources,
+            site,
+            awips_code,
+            l2_volume_start,
+            crate::level3::VolumePick::Nearest {
+                cut: elevation_number,
+            },
+        )
+        .await
     }
 
     /// The volume's **latest** object for a product, rather than
@@ -476,34 +440,14 @@ pub mod live {
         awips_code: &str,
         l2_volume_start: NaiveDateTime,
     ) -> Option<Level3Product> {
-        let mut best: Option<Level3Product> = None;
-        for key in candidate_keys(sources, site, awips_code, l2_volume_start).await {
-            let url = sources.level3_object_url(&key);
-            let Ok(bytes) = archive::get_bytes(archive::shared_client(), url).await else {
-                continue;
-            };
-            let Ok(message) = nexrad_level3::decode::decode_product(&bytes) else {
-                continue;
-            };
-            let Some(started) = super::compare::volume_scan_started(&message.pdb) else {
-                continue;
-            };
-            if (started - l2_volume_start).num_seconds().abs() > 60 {
-                continue;
-            }
-            let product = Level3Product {
-                message,
-                stamp: ProductStamp::from_key(key),
-                bytes: std::sync::Arc::new(bytes),
-            };
-            if best
-                .as_ref()
-                .is_none_or(|b| product.stamp.key > b.stamp.key)
-            {
-                best = Some(product);
-            }
-        }
-        best
+        crate::level3::fetch_product_for_volume(
+            sources,
+            site,
+            awips_code,
+            l2_volume_start,
+            crate::level3::VolumePick::Latest,
+        )
+        .await
     }
 
     /// The pairing invariant, live: a recent KOAX volume and its EET twin
@@ -874,23 +818,10 @@ mod tests {
         assert!(codec.decode(100).is_nan(), "outside the encodable band");
     }
 
-    /// The volume stamp conversion: day 1 is 1970-01-01, so MJD 20661 at
-    /// 7108 s is 2026-07-26 01:58:28 — checked against a calendar, not
-    /// against the function.
-    #[test]
-    fn the_volume_stamp_reads_day_one_as_the_epoch() {
-        let mut pdb = pdb_with_volume(20661, 7108);
-        let t = volume_scan_started(&pdb).expect("a valid stamp");
-        assert_eq!(t.to_string(), "2026-07-26 01:58:28");
-        assert_eq!(
-            volume_scan_started(&pdb_with_volume(1, 0)).map(|t| t.to_string()),
-            Some("1970-01-01 00:00:00".to_string()),
-            "day 1 is the epoch itself",
-        );
-        // Day 0 cannot precede the epoch: it is None, not 1969-12-31.
-        pdb.volume_scan_date = 0;
-        assert!(volume_scan_started(&pdb).is_none());
-    }
+    // The volume stamp conversion is asserted where it now lives, beside the
+    // pairing that reads it: `level3::the_volume_stamp_reads_day_one_as_the_epoch`
+    // makes the same three claims (MJD 20661 → 2026-07-26 01:58:28, day 1 is the
+    // epoch, day 0 is `None`) against the one implementation.
 
     /// A PDB carrying only the fields the twin pairing reads.
     fn pdb_with_volume(date: u16, time: u32) -> nexrad_level3::model::ProductDescriptionBlock {
