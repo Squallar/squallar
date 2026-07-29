@@ -1093,6 +1093,133 @@ impl ChunkPoller {
         closed
     }
 
+    /// Fetch one chunk the caller already knows the key of, and ingest it.
+    ///
+    /// The push-notification path. A notification names the object outright, so
+    /// none of [`Self::poll`]'s reconnaissance is needed: no listing to find what
+    /// is new, no discovery search to find the volume, and no probe to notice a
+    /// rollover — the chunk's own name carries the volume's start time, which is
+    /// what makes one directory distinguishable from the same index one rotation
+    /// ago.
+    ///
+    /// Rolls the volume when the named chunk belongs to a *newer* one, and
+    /// ignores it when it belongs to an older one: an index the rotation has not
+    /// yet reused still holds the previous pass, and a late or replayed message
+    /// must not drag the assembler backwards.
+    ///
+    /// Deliberately additive rather than a replacement. [`Self::poll`] keeps
+    /// running underneath as the gap-filler for anything a dropped socket or a
+    /// missed message left behind, and it is the whole path when no notifier is
+    /// reachable.
+    pub async fn fetch_notified(
+        &mut self,
+        sources: &crate::sources::DataSources,
+        id: &ChunkId,
+    ) -> Result<PollOutcome> {
+        // Before the first `.await`, for the same reason as in `poll`.
+        let _ = crate::archive::shared_client();
+
+        let mut outcome = PollOutcome::default();
+        if id.site() != self.site {
+            return Ok(outcome);
+        }
+
+        if self.is_stale_notification(id) {
+            return Ok(outcome);
+        }
+        if self.should_roll_to(id) {
+            outcome.closed = self.roll(id.volume());
+            outcome.rolled_to = Some(id.volume());
+        } else if self.current.is_none() {
+            self.current = Some(VolumeAssembler::new(self.site.clone(), id.volume()));
+            outcome.rolled_to = Some(id.volume());
+        }
+
+        let Some(current) = self.current.as_mut() else {
+            return Ok(outcome);
+        };
+        if current.has_ingested(id.sequence()) {
+            return Ok(outcome);
+        }
+
+        let bytes = match download_chunk(sources, id).await {
+            Ok(bytes) => bytes,
+            // A notification can beat the object into the bucket, and S3 is
+            // eventually consistent besides. The periodic poll picks it up.
+            Err(ChunkError::Bucket(e)) if fetch_disposition(&e) == FetchDisposition::Skip => {
+                outcome.skipped += 1;
+                return Ok(outcome);
+            }
+            Err(e) => {
+                self.consecutive_failures += 1;
+                return Err(e);
+            }
+        };
+
+        let Some(current) = self.current.as_mut() else {
+            return Ok(outcome);
+        };
+        match current.ingest(id, &bytes) {
+            Ok(o) if o.accepted => {
+                outcome.ingested += 1;
+                outcome.sealed_elevations.extend(o.sealed);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                log::warn!("{}: chunk {} did not decode: {e:?}", self.site, id.name());
+                outcome.skipped += 1;
+            }
+        }
+
+        self.consecutive_failures = 0;
+        self.fill_sealed_angles(&mut outcome);
+        Ok(outcome)
+    }
+
+    /// Whether a notified chunk belongs to a volume newer than the one being
+    /// assembled, and so should close it and start there.
+    ///
+    /// Compared on the volume's *start time*, taken from the chunk's own name,
+    /// not on the index: the index rotates, so 999 precedes 1 in time and follows
+    /// it in number. This is what replaces `PollPlan::ProbeNext` on the
+    /// notification path.
+    pub(crate) fn should_roll_to(&self, id: &ChunkId) -> bool {
+        self.current
+            .as_ref()
+            .and_then(VolumeAssembler::volume_time)
+            .is_some_and(|known| id.volume_time() > known)
+    }
+
+    /// Whether a notified chunk belongs to a volume *older* than the one being
+    /// assembled — a replayed message, or a directory the rotation has not yet
+    /// cleared.
+    pub(crate) fn is_stale_notification(&self, id: &ChunkId) -> bool {
+        self.current
+            .as_ref()
+            .and_then(VolumeAssembler::volume_time)
+            .is_some_and(|known| id.volume_time() < known)
+    }
+
+    /// Resolve each sealed elevation number to the angle a pane selects on.
+    fn fill_sealed_angles(&self, outcome: &mut PollOutcome) {
+        let progress = self.progress();
+        if let Some(progress) = &progress {
+            outcome.sealed_angles = outcome
+                .sealed_elevations
+                .iter()
+                .map(|e| {
+                    progress
+                        .sealed_elevations
+                        .iter()
+                        .position(|s| s == e)
+                        .map(|i| progress.sealed_angles[i])
+                        .unwrap_or(f32::NAN)
+                })
+                .collect();
+        }
+        outcome.progress = progress;
+    }
+
     /// One round: no sleeping, no looping, no self-scheduling.
     pub async fn poll(&mut self, sources: &crate::sources::DataSources) -> Result<PollOutcome> {
         // Before the first `.await`, so merely polling this future installs the
@@ -1193,23 +1320,7 @@ impl ChunkPoller {
 
         self.consecutive_failures = 0;
         self.last_round_was_quiet = outcome.ingested == 0;
-
-        let progress = self.progress();
-        if let Some(progress) = &progress {
-            outcome.sealed_angles = outcome
-                .sealed_elevations
-                .iter()
-                .map(|e| {
-                    progress
-                        .sealed_elevations
-                        .iter()
-                        .position(|s| s == e)
-                        .map(|i| progress.sealed_angles[i])
-                        .unwrap_or(f32::NAN)
-                })
-                .collect();
-        }
-        outcome.progress = progress;
+        self.fill_sealed_angles(&mut outcome);
         Ok(outcome)
     }
 }
@@ -2324,6 +2435,51 @@ mod tests {
 
         p.consecutive_failures = 0;
         assert_eq!(p.suggested_interval(), POLL_INTERVAL);
+    }
+
+    /// A notification for a newer volume rolls the assembler without any probe —
+    /// the chunk's own name carries the volume start time, which is what
+    /// distinguishes a new volume from the previous pass through the same
+    /// rotating index.
+    #[test]
+    fn a_notified_chunk_from_a_newer_volume_rolls_the_assembler() {
+        let p = primed(vol(42));
+        let later = (volume_time() + chrono::Duration::minutes(6))
+            .format("%Y%m%d-%H%M%S")
+            .to_string();
+        let next = ChunkId::parse("KTLX", vol(43), &format!("{later}-001-S")).expect("parses");
+
+        // `plan` would have said `Fill` — the current volume has not ended — so
+        // this roll comes from the notification alone.
+        assert_eq!(p.plan(volume_time()), PollPlan::Fill { volume: vol(42) });
+        assert!(
+            p.should_roll_to(&next),
+            "a chunk from a later-started volume must roll the assembler"
+        );
+    }
+
+    /// And one from an older volume is refused: an index the rotation has not
+    /// reused still holds the previous pass, and a replayed message must not drag
+    /// the assembler backwards.
+    #[test]
+    fn a_notified_chunk_from_an_older_volume_is_ignored() {
+        let p = primed(vol(42));
+        let earlier = (volume_time() - chrono::Duration::days(3))
+            .format("%Y%m%d-%H%M%S")
+            .to_string();
+        let stale = ChunkId::parse("KTLX", vol(41), &format!("{earlier}-001-S")).expect("parses");
+        assert!(!p.should_roll_to(&stale));
+        assert!(p.is_stale_notification(&stale));
+    }
+
+    /// A chunk of the volume already being assembled is neither a roll nor stale.
+    #[test]
+    fn a_notified_chunk_of_the_current_volume_is_just_ingested() {
+        let p = primed(vol(42));
+        let same =
+            ChunkId::parse("KTLX", vol(42), &format!("{VOLUME_TIME}-009-I")).expect("parses");
+        assert!(!p.should_roll_to(&same));
+        assert!(!p.is_stale_notification(&same));
     }
 
     // -- live ---------------------------------------------------------------

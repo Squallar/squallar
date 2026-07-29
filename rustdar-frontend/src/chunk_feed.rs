@@ -171,6 +171,23 @@ impl ChunkFeedManager {
         }
     }
 
+    /// Take the poller regardless of the interval, for a notification-driven
+    /// fetch.
+    ///
+    /// Still refuses while a round is in flight — that is the part that matters,
+    /// since a burst of notifications for one volume would otherwise start a
+    /// fetch per message. The interval is skipped because a notification means
+    /// the object exists *now*, which is the whole point.
+    pub fn take_now(&mut self, site: &str) -> Option<Box<ChunkPoller>> {
+        let feed = self.feeds.get_mut(site)?;
+        if feed.in_flight || feed.retired.is_some() {
+            return None;
+        }
+        feed.last_poll = Some(web_time::Instant::now());
+        feed.in_flight = true;
+        feed.poller.take()
+    }
+
     /// Take the poller for a round, if this site wants one now.
     ///
     /// Hands ownership out; [`Self::finish_round`] must put it back or the site

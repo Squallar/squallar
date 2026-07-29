@@ -5,24 +5,33 @@
 //! the NEXRAD SNS topic to a per-station WebSocket, so a chunk can be fetched the
 //! moment it exists instead of on the next tick.
 //!
-//! # This nudges the poller; it does not replace it
+//! # A notification names the object, so it drives the fetch outright
 //!
-//! A notification marks a site **due for a round now**, and the ordinary
-//! [`rustdar_radar::chunks::ChunkPoller`] does the rest — listing, selecting,
-//! downloading, assembling. Nothing about the polling path changes.
+//! The message carries `path` — the complete bucket key. That is the whole
+//! difference between an early wake-up and a shortcut: the volume's
+//! `YYYYMMDD-HHMMSS` start time is part of the object name and cannot be derived
+//! from the numeric fields, so without it a listing would still be needed to
+//! learn the key. With it, [`rustdar_radar::chunks::ChunkPoller::fetch_notified`]
+//! goes straight to a `GET`.
 //!
-//! That is what makes degradation free rather than a feature. If the service is
-//! unreachable, the socket drops, the endpoint is wrong, or the user is on a
-//! network that blocks it, no notifications arrive and the five-second timer
-//! fires exactly as it does today. There is no fallback path to get right
-//! because there is no second path — only an early wake-up that may or may not
-//! come.
+//! What that retires, per site: the ~11-request cold-start discovery search, the
+//! directory listing every round, and the rollover probe — the notification's own
+//! volume start time says which volume a chunk belongs to.
 //!
-//! It also leaves the traffic win on the table: each round still lists the
-//! volume directory. Skipping that needs the volume's `YYYYMMDD-HHMMSS` prefix,
-//! which the notification does not carry (it has the station, the rotating volume
-//! index, the sequence and the type), so a listing is still needed once per
-//! volume to learn it. That is a later increment.
+//! # Degradation is the absence of a feature, not a second path
+//!
+//! The periodic poll never stops. It simply finds nothing new while
+//! notifications are doing the work, so it backs off to its quiet interval and
+//! sits there as a gap-filler for a dropped socket or a missed message.
+//!
+//! So there is no fallback to get right: if the service is unreachable, the
+//! endpoint is wrong, the socket drops, or the network blocks it, no
+//! notifications arrive and the timer carries the site exactly as it does with
+//! the feature switched off.
+//!
+//! A message this build cannot fully read degrades one step rather than to
+//! nothing: an unparseable `path` still yields the station, which brings that
+//! site's next round forward.
 //!
 //! # No async
 //!
@@ -34,7 +43,7 @@
 use std::collections::HashMap;
 
 use ewebsock::{WsEvent, WsMessage, WsReceiver, WsSender};
-use rustdar_radar::chunks::{ChunkKind, VolumeIndex};
+use rustdar_radar::chunks::{ChunkId, VolumeIndex};
 
 /// Backoff after a failed or dropped connection, doubling to a ceiling.
 const RECONNECT_BASE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -42,43 +51,123 @@ const RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// A chunk the service says now exists.
 ///
-/// Not enough to build the object key on its own — that also needs the volume's
-/// start time, which is in the name and not in the message — so this is a
-/// *nudge*, not a fetch instruction.
+/// Carries the full [`ChunkId`] when the message named the object, which is what
+/// lets a notification drive a direct `GET` — no listing, no discovery, no
+/// rollover probe. Falls back to the loose fields when it did not, so an older
+/// or changed service still buys the early wake-up.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChunkAvailable {
-    pub site: String,
-    pub volume: VolumeIndex,
-    pub sequence: u16,
-    pub kind: ChunkKind,
+pub enum ChunkAvailable {
+    /// The message named the object, so the key is known exactly.
+    Identified(ChunkId),
+    /// The message said only that *something* landed for this site.
+    Site(String),
 }
 
-/// One notification message, exactly as the service sends it.
+impl ChunkAvailable {
+    pub fn site(&self) -> &str {
+        match self {
+            Self::Identified(id) => id.site(),
+            Self::Site(site) => site,
+        }
+    }
+}
+
+/// One notification message, as the service sends it.
 ///
-/// `volume` and `chunk` arrive as strings rather than numbers, so they are taken
-/// as such and parsed here.
+/// `volume` and `chunk` arrive as strings rather than numbers. `path` is the
+/// complete bucket key — `{site}/{volume}/{name}` — which is the whole reason
+/// this can skip listing: the volume's `YYYYMMDD-HHMMSS` start time is part of
+/// the object name and is not derivable from the numeric fields.
+///
+/// Everything except `station` is optional so a service that changes shape
+/// degrades to a wake-up rather than going silent.
 #[derive(serde::Deserialize)]
 struct Notification {
     station: String,
-    volume: String,
-    chunk: String,
-    #[serde(rename = "chunkType")]
-    chunk_type: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    volume: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 impl Notification {
     fn into_available(self) -> Option<ChunkAvailable> {
-        Some(ChunkAvailable {
-            volume: VolumeIndex::new(self.volume.parse().ok()?)?,
-            sequence: self.chunk.parse().ok()?,
-            kind: match self.chunk_type.as_str() {
-                "S" => ChunkKind::Start,
-                "I" => ChunkKind::Intermediate,
-                "E" => ChunkKind::End,
-                _ => return None,
-            },
-            site: self.station,
-        })
+        if self.station.is_empty() {
+            return None;
+        }
+        // The key straight off the wire, which `ChunkId::from_key` already
+        // parses — the same path a listing would have produced.
+        if let Some(id) = self.path.as_deref().and_then(ChunkId::from_key) {
+            return Some(ChunkAvailable::Identified(id));
+        }
+        // `path` absent but the pieces present: rebuild it. Kept because the two
+        // fields are redundant in the protocol and either could be the one that
+        // survives a future change.
+        if let (Some(volume), Some(name)) = (self.volume.as_deref(), self.name.as_deref())
+            && let Some(volume) = volume.parse().ok().and_then(VolumeIndex::new)
+            && let Some(id) = ChunkId::parse(&self.station, volume, name)
+        {
+            return Some(ChunkAvailable::Identified(id));
+        }
+        Some(ChunkAvailable::Site(self.station))
+    }
+}
+
+/// Which of the service's two streams a subscription is on.
+///
+/// Both matter, for different reasons. Chunks are the low-latency live path.
+/// Archive volumes are what the 60-second auto-poll is looking for — the
+/// fallback when chunks are off or retired, the source for panes parked on
+/// historic data, and what feeds loop frames — so pushing those too takes the
+/// fallback from "up to a minute late" to "as soon as it is published".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Feed {
+    Chunk,
+    Archive,
+}
+
+impl Feed {
+    const ALL: [Feed; 2] = [Feed::Chunk, Feed::Archive];
+
+    fn route(self) -> &'static str {
+        match self {
+            Self::Chunk => "nexrad-chunk",
+            Self::Archive => "nexrad-archive",
+        }
+    }
+}
+
+/// Something the service said landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Notified {
+    /// A real-time chunk, identified well enough to fetch directly or at least
+    /// to wake its site.
+    Chunk(ChunkAvailable),
+    /// A completed archive volume exists for this site.
+    ///
+    /// Carries only the site on purpose. The archive path already knows how to
+    /// find the newest volume, including the previous-day fallback and the
+    /// `_MDM` sidecars, and reusing that is worth far more than saving one
+    /// listing on an event that fires about once every five minutes.
+    Archive { site: String },
+}
+
+/// Parse one message according to which stream it arrived on.
+///
+/// The two share a `station` field and nothing else that matters, so the stream
+/// decides the shape rather than the payload being sniffed.
+fn parse_message(feed: Feed, text: &str) -> Option<Notified> {
+    match feed {
+        Feed::Chunk => serde_json::from_str::<Notification>(text)
+            .ok()
+            .and_then(Notification::into_available)
+            .map(Notified::Chunk),
+        Feed::Archive => {
+            let n: Notification = serde_json::from_str(text).ok()?;
+            (!n.station.is_empty()).then_some(Notified::Archive { site: n.station })
+        }
     }
 }
 
@@ -100,13 +189,13 @@ struct Subscription {
     failures: u32,
 }
 
-/// Per-site subscriptions to the notifier service.
+/// Per-site, per-feed subscriptions to the notifier service.
 #[derive(Default)]
 pub struct ChunkNotifier {
-    subs: HashMap<String, Subscription>,
-    /// Sites whose subscription is waiting out a backoff, kept out of `subs` so
-    /// a dead socket is not held open.
-    backoff: HashMap<String, (u32, web_time::Instant)>,
+    subs: HashMap<(String, Feed), Subscription>,
+    /// Subscriptions waiting out a backoff, kept out of `subs` so a dead socket
+    /// is not held open.
+    backoff: HashMap<(String, Feed), (u32, web_time::Instant)>,
 }
 
 impl ChunkNotifier {
@@ -124,28 +213,33 @@ impl ChunkNotifier {
         endpoint: &str,
         wake: impl Fn() + Send + Sync + Clone + 'static,
     ) {
-        self.subs.retain(|site, _| sites.iter().any(|s| s == site));
+        self.subs
+            .retain(|(site, _), _| sites.iter().any(|s| s == site));
         self.backoff
-            .retain(|site, _| sites.iter().any(|s| s == site));
+            .retain(|(site, _), _| sites.iter().any(|s| s == site));
 
         let now = web_time::Instant::now();
         for site in sites {
-            if self.subs.contains_key(site) {
-                continue;
+            for feed in Feed::ALL {
+                let key = (site.clone(), feed);
+                if self.subs.contains_key(&key) {
+                    continue;
+                }
+                if let Some((_, retry_at)) = self.backoff.get(&key)
+                    && now < *retry_at
+                {
+                    continue;
+                }
+                let failures = self.backoff.remove(&key).map(|(n, _)| n).unwrap_or(0);
+                self.connect(site, feed, endpoint, failures, wake.clone());
             }
-            if let Some((_, retry_at)) = self.backoff.get(site)
-                && now < *retry_at
-            {
-                continue;
-            }
-            let failures = self.backoff.remove(site).map(|(n, _)| n).unwrap_or(0);
-            self.connect(site, endpoint, failures, wake.clone());
         }
     }
 
     fn connect(
         &mut self,
         site: &str,
+        feed: Feed,
         endpoint: &str,
         failures: u32,
         wake: impl Fn() + Send + Sync + 'static,
@@ -157,14 +251,15 @@ impl ChunkNotifier {
         rustdar_radar::tls::init();
 
         let url = format!(
-            "{}/ws/events/nexrad-chunk/{site}",
-            endpoint.trim_end_matches('/')
+            "{}/ws/events/{}/{site}",
+            endpoint.trim_end_matches('/'),
+            feed.route()
         );
         match ewebsock::connect_with_wakeup(url.clone(), ewebsock::Options::default(), wake) {
             Ok((sender, receiver)) => {
-                log::info!("{site}: subscribing to chunk notifications at {url}");
+                log::info!("{site}: subscribing to {:?} notifications at {url}", feed);
                 self.subs.insert(
-                    site.to_string(),
+                    (site.to_string(), feed),
                     Subscription {
                         _sender: sender,
                         receiver,
@@ -174,17 +269,17 @@ impl ChunkNotifier {
                 );
             }
             Err(e) => {
-                log::warn!("{site}: could not open a notification socket: {e}");
-                self.schedule_retry(site, failures + 1);
+                log::warn!("{site}: could not open a {feed:?} notification socket: {e}");
+                self.schedule_retry(site, feed, failures + 1);
             }
         }
     }
 
-    fn schedule_retry(&mut self, site: &str, failures: u32) {
+    fn schedule_retry(&mut self, site: &str, feed: Feed, failures: u32) {
         let shift = failures.saturating_sub(1).min(6);
         let delay = (RECONNECT_BASE * (1 << shift)).min(RECONNECT_MAX);
         self.backoff.insert(
-            site.to_string(),
+            (site.to_string(), feed),
             (failures, web_time::Instant::now() + delay),
         );
     }
@@ -194,60 +289,63 @@ impl ChunkNotifier {
     /// Unparseable messages are dropped rather than treated as failures: the
     /// service may grow fields or event kinds this build has never heard of, and
     /// the worst case for ignoring one is the five-second timer firing instead.
-    pub fn drain(&mut self) -> Vec<ChunkAvailable> {
+    pub fn drain(&mut self) -> Vec<Notified> {
         let mut out = Vec::new();
-        let mut dropped: Vec<(String, u32)> = Vec::new();
+        let mut dropped: Vec<((String, Feed), u32)> = Vec::new();
 
-        for (site, sub) in &mut self.subs {
+        for ((site, feed), sub) in &mut self.subs {
             while let Some(event) = sub.receiver.try_recv() {
                 match event {
                     WsEvent::Opened => {
-                        log::info!("{site}: chunk notifications connected");
+                        log::info!("{site}: {feed:?} notifications connected");
                         sub.state = LinkState::Open;
                         sub.failures = 0;
                     }
-                    WsEvent::Message(WsMessage::Text(text)) => {
-                        match serde_json::from_str::<Notification>(&text)
-                            .ok()
-                            .and_then(Notification::into_available)
-                        {
-                            Some(available) => out.push(available),
-                            None => log::debug!("{site}: ignoring notification {text}"),
-                        }
-                    }
+                    WsEvent::Message(WsMessage::Text(text)) => match parse_message(*feed, &text) {
+                        Some(notified) => out.push(notified),
+                        None => log::debug!("{site}: ignoring {feed:?} notification {text}"),
+                    },
                     // Pings, pongs and binary frames are not part of this
                     // protocol; the transport handles keepalive itself.
                     WsEvent::Message(_) => {}
                     WsEvent::Error(e) => {
-                        log::warn!("{site}: notification socket error: {e}");
+                        log::warn!("{site}: {feed:?} notification socket error: {e}");
                         sub.state = LinkState::Down;
-                        dropped.push((site.clone(), sub.failures + 1));
+                        dropped.push(((site.clone(), *feed), sub.failures + 1));
                         break;
                     }
                     WsEvent::Closed => {
-                        log::info!("{site}: notification socket closed");
+                        log::info!("{site}: {feed:?} notification socket closed");
                         sub.state = LinkState::Down;
-                        dropped.push((site.clone(), sub.failures + 1));
+                        dropped.push(((site.clone(), *feed), sub.failures + 1));
                         break;
                     }
                 }
             }
         }
 
-        for (site, failures) in dropped {
-            self.subs.remove(&site);
-            self.schedule_retry(&site, failures);
+        for ((site, feed), failures) in dropped {
+            self.subs.remove(&(site.clone(), feed));
+            self.schedule_retry(&site, feed, failures);
         }
         out
     }
 
-    /// Whether any site's socket is currently open, for the status bar.
+    /// Whether any socket is currently open, for the status bar.
     pub fn any_open(&self) -> bool {
         self.subs.values().any(|s| s.state == LinkState::Open)
     }
 
-    pub fn state_for(&self, site: &str) -> LinkState {
-        match self.subs.get(site) {
+    /// Whether this site's *chunk* socket is open — the one that decides whether
+    /// the live path is being pushed.
+    pub fn chunk_link_open(&self, site: &str) -> bool {
+        self.subs
+            .get(&(site.to_string(), Feed::Chunk))
+            .is_some_and(|s| s.state == LinkState::Open)
+    }
+
+    pub fn state_for(&self, site: &str, feed: Feed) -> LinkState {
+        match self.subs.get(&(site.to_string(), feed)) {
             Some(sub) => sub.state,
             None => LinkState::Down,
         }
@@ -259,8 +357,8 @@ impl ChunkNotifier {
     }
 
     #[cfg(test)]
-    pub(crate) fn is_backing_off(&self, site: &str) -> bool {
-        self.backoff.contains_key(site)
+    pub(crate) fn is_backing_off(&self, site: &str, feed: Feed) -> bool {
+        self.backoff.contains_key(&(site.to_string(), feed))
     }
 }
 
@@ -269,55 +367,77 @@ mod tests {
     use super::*;
 
     fn parse(json: &str) -> Option<ChunkAvailable> {
-        serde_json::from_str::<Notification>(json)
-            .ok()
-            .and_then(Notification::into_available)
-    }
-
-    /// The service's own documented shape, with `volume` and `chunk` as strings.
-    #[test]
-    fn a_notification_parses_into_a_chunk_identity() {
-        let got = parse(
-            r#"{"station":"KJAX","volume":"415","chunk":"25","chunkType":"I","l2Version":"V06"}"#,
-        )
-        .expect("parses");
-        assert_eq!(
-            got,
-            ChunkAvailable {
-                site: "KJAX".to_string(),
-                volume: VolumeIndex::new(415).unwrap(),
-                sequence: 25,
-                kind: ChunkKind::Intermediate,
-            }
-        );
-    }
-
-    #[test]
-    fn every_chunk_type_letter_is_understood() {
-        for (letter, want) in [
-            ("S", ChunkKind::Start),
-            ("I", ChunkKind::Intermediate),
-            ("E", ChunkKind::End),
-        ] {
-            let json =
-                format!(r#"{{"station":"KTLX","volume":"1","chunk":"1","chunkType":"{letter}"}}"#);
-            assert_eq!(parse(&json).expect("parses").kind, want);
+        match parse_message(Feed::Chunk, json)? {
+            Notified::Chunk(available) => Some(available),
+            Notified::Archive { .. } => None,
         }
     }
 
-    /// A message this build cannot read is dropped, not fatal. The service may
-    /// grow fields or event kinds, and the cost of ignoring one is the ordinary
-    /// five-second timer firing instead.
+    /// The service's real message, and the property that matters: `path` is the
+    /// complete bucket key, so the fetch needs no listing to find it.
+    #[test]
+    fn a_notification_names_the_object_outright() {
+        let got = parse(
+            r#"{"station":"KJAX","volume":"415","chunk":"25","chunkType":"I",
+                "l2Version":"V06","name":"20240418-033635-025-I",
+                "path":"KJAX/415/20240418-033635-025-I"}"#,
+        )
+        .expect("parses");
+        let ChunkAvailable::Identified(id) = got else {
+            panic!("a message carrying `path` must identify the object, not just the site");
+        };
+        assert_eq!(id.key(), "KJAX/415/20240418-033635-025-I");
+        assert_eq!(id.site(), "KJAX");
+        assert_eq!(id.volume(), VolumeIndex::new(415).unwrap());
+        assert_eq!(id.sequence(), 25);
+        assert_eq!(id.kind(), rustdar_radar::chunks::ChunkKind::Intermediate);
+        // The part no numeric field carries, and the reason `path` is what makes
+        // listing unnecessary.
+        assert_eq!(
+            id.volume_time(),
+            chrono::NaiveDate::from_ymd_opt(2024, 4, 18)
+                .unwrap()
+                .and_hms_opt(3, 36, 35)
+                .unwrap()
+        );
+    }
+
+    /// `path` and `volume`+`name` are redundant in the protocol, so either alone
+    /// is enough and a future change that drops one is survivable.
+    #[test]
+    fn the_object_can_be_rebuilt_without_the_path_field() {
+        let got = parse(r#"{"station":"KJAX","volume":"415","name":"20240418-033635-025-I"}"#)
+            .expect("parses");
+        let ChunkAvailable::Identified(id) = got else {
+            panic!("volume + name is enough to name the object");
+        };
+        assert_eq!(id.key(), "KJAX/415/20240418-033635-025-I");
+    }
+
+    /// A message with nothing usable but the station degrades one step — to an
+    /// early round for that site — rather than to nothing.
+    #[test]
+    fn a_message_without_a_usable_key_still_names_its_site() {
+        for json in [
+            r#"{"station":"KTLX"}"#,
+            r#"{"station":"KTLX","path":"nonsense"}"#,
+            r#"{"station":"KTLX","volume":"0","name":"20240418-033635-025-I"}"#,
+            r#"{"station":"KTLX","volume":"415","name":"garbage"}"#,
+        ] {
+            assert_eq!(
+                parse(json).expect("still parses"),
+                ChunkAvailable::Site("KTLX".to_string()),
+                "{json} should still wake its site"
+            );
+        }
+    }
+
+    /// Nothing usable at all is dropped rather than treated as a failure: the
+    /// service may emit event kinds this build has never heard of, and the cost
+    /// of ignoring one is the ordinary timer firing instead.
     #[test]
     fn an_unreadable_notification_is_dropped_rather_than_fatal() {
-        for bad in [
-            "",
-            "not json",
-            r#"{"station":"KTLX"}"#,
-            r#"{"station":"KTLX","volume":"0","chunk":"1","chunkType":"I"}"#, // outside 1..=999
-            r#"{"station":"KTLX","volume":"abc","chunk":"1","chunkType":"I"}"#,
-            r#"{"station":"KTLX","volume":"1","chunk":"1","chunkType":"X"}"#,
-        ] {
+        for bad in ["", "not json", "{}", r#"{"station":""}"#, "[]"] {
             assert!(parse(bad).is_none(), "{bad:?} should not parse");
         }
     }
@@ -327,11 +447,54 @@ mod tests {
     #[test]
     fn unknown_fields_do_not_break_a_notification() {
         assert!(
-            parse(
-                r#"{"station":"KTLX","volume":"1","chunk":"1","chunkType":"I","somethingNew":42}"#
-            )
-            .is_some()
+            parse(r#"{"station":"KTLX","path":"KTLX/1/20240418-033635-025-I","somethingNew":42}"#)
+                .is_some()
         );
+    }
+
+    /// The archive stream's own shape. Only the station is taken: the archive
+    /// path already knows how to find the newest volume, including the
+    /// previous-day fallback and the `_MDM` sidecars, and reusing that is worth
+    /// more than saving one listing on an event that fires every few minutes.
+    #[test]
+    fn an_archive_notification_names_its_site() {
+        let got = parse_message(
+            Feed::Archive,
+            r#"{"station":"TBOS","path":"2024/04/18/TBOS/TBOS20240418_033635_V08"}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            got,
+            Notified::Archive {
+                site: "TBOS".to_string()
+            }
+        );
+    }
+
+    /// The two streams are told apart by which socket they arrived on, not by
+    /// sniffing the payload — an archive message has no `volume` or `chunkType`
+    /// and would otherwise fall through to the chunk parser's site-only arm.
+    #[test]
+    fn the_stream_decides_the_shape_not_the_payload() {
+        let archive = r#"{"station":"TBOS","path":"2024/04/18/TBOS/TBOS20240418_033635_V08"}"#;
+        assert!(matches!(
+            parse_message(Feed::Archive, archive),
+            Some(Notified::Archive { .. })
+        ));
+
+        let chunk = r#"{"station":"KJAX","path":"KJAX/415/20240418-033635-025-I"}"#;
+        assert!(matches!(
+            parse_message(Feed::Chunk, chunk),
+            Some(Notified::Chunk(ChunkAvailable::Identified(_)))
+        ));
+    }
+
+    /// An archive message with no station is dropped rather than waking a site
+    /// named by the empty string.
+    #[test]
+    fn an_archive_notification_without_a_station_is_dropped() {
+        assert!(parse_message(Feed::Archive, r#"{"path":"a/b/c/d/e"}"#).is_none());
+        assert!(parse_message(Feed::Archive, r#"{"station":""}"#).is_none());
     }
 
     /// Sites nothing watches lose their socket, and their backoff with it.
@@ -345,15 +508,20 @@ mod tests {
         let sites = ["KTLX".to_string(), "KOUN".to_string()];
         n.sync_sites(&sites, "wss://127.0.0.1:1", || {});
         for site in &sites {
-            assert!(
-                n.state_for(site) != LinkState::Down || n.is_backing_off(site),
-                "{site} is neither subscribed nor scheduled to retry"
-            );
+            for feed in [Feed::Chunk, Feed::Archive] {
+                assert!(
+                    n.state_for(site, feed) != LinkState::Down || n.is_backing_off(site, feed),
+                    "{site}/{feed:?} is neither subscribed nor scheduled to retry"
+                );
+            }
         }
 
         n.sync_sites(&[], "wss://127.0.0.1:1", || {});
         assert_eq!(n.subscription_count(), 0, "a socket outlived its site");
-        assert!(!n.is_backing_off("KTLX"), "backoff outlived the site");
+        assert!(
+            !n.is_backing_off("KTLX", Feed::Chunk) && !n.is_backing_off("KTLX", Feed::Archive),
+            "backoff outlived the site"
+        );
     }
 
     /// Re-syncing the same sites does not churn their sockets — otherwise every
@@ -375,7 +543,8 @@ mod tests {
     #[test]
     fn an_unsubscribed_site_reports_down() {
         let n = ChunkNotifier::new();
-        assert_eq!(n.state_for("KTLX"), LinkState::Down);
+        assert_eq!(n.state_for("KTLX", Feed::Chunk), LinkState::Down);
         assert!(!n.any_open());
+        assert!(!n.chunk_link_open("KTLX"));
     }
 }

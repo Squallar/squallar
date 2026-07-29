@@ -12,6 +12,7 @@ use rustdar_radar::types::ScanInfo;
 
 use crate::channels::ChunkResponse;
 use crate::chunk_feed::Retirement;
+use crate::chunk_notify::{ChunkAvailable, Notified};
 
 impl super::App {
     /// Start or stop feeds so the set matches the sites panes are watching
@@ -34,7 +35,10 @@ impl super::App {
             enabled,
             showing.as_ref().map(|(s, e)| (s.as_str(), *e)),
         );
-        status.pushed = status.feeding && self.chunk_notify.any_open();
+        status.pushed = status.feeding
+            && showing
+                .as_ref()
+                .is_some_and(|(site, _)| self.chunk_notify.chunk_link_open(site));
         self.gui.set_chunk_status(status);
         if !enabled {
             return;
@@ -93,16 +97,74 @@ impl super::App {
             crate::app::notify_redraw(&window);
         });
 
-        for available in self.chunk_notify.drain() {
-            log::debug!(
-                "{}: notified of volume {} chunk {} ({:?})",
-                available.site,
-                available.volume.get(),
-                available.sequence,
-                available.kind,
-            );
-            self.chunk_feeds.mark_due(&available.site);
+        for notified in self.chunk_notify.drain() {
+            match notified {
+                // The message named the object, so fetch it outright — no
+                // listing, no discovery, no rollover probe.
+                Notified::Chunk(ChunkAvailable::Identified(id)) => self.fetch_notified_chunk(id),
+                // It only said something landed. Bring the site's next round
+                // forward and let the poller work out what is new.
+                Notified::Chunk(ChunkAvailable::Site(site)) => self.chunk_feeds.mark_due(&site),
+                // A completed volume was published. Routed through the ordinary
+                // auto-poll action rather than fetched here, which is what keeps
+                // one description of "is this volume worth taking": it skips
+                // sites the chunk feed is already serving, inherits the
+                // generation bookkeeping, and lands in the scan drain behind the
+                // guard that refuses an archive volume older than the live feed.
+                //
+                // This is what takes the fallback path — and every historic pane
+                // and loop — from up to a minute late to as soon as it is
+                // published.
+                Notified::Archive { site } => self.check_archive_for(&site),
+            }
         }
+    }
+
+    /// Ask the archive for this site's newest volume, exactly as the 60-second
+    /// timer would have.
+    fn check_archive_for(&mut self, site: &str) {
+        if !self.gui.live_sites().iter().any(|s| s == site) {
+            return;
+        }
+        let now = chrono::Local::now().naive_local();
+        self.handle_gui_action(
+            rustdar_egui::actions::GuiAction::CheckForNewScans(
+                rustdar_egui::actions::RadarConfig {
+                    site: site.to_string(),
+                    timestamp: now,
+                },
+            ),
+            None,
+        );
+    }
+
+    /// Fetch one notified chunk, borrowing the site's poller for the round.
+    ///
+    /// Goes through the same take/finish bookkeeping as a polled round, so a
+    /// burst of notifications for one volume cannot start several concurrent
+    /// fetches and the retirement rules still see every failure.
+    fn fetch_notified_chunk(&mut self, id: rustdar_radar::chunks::ChunkId) {
+        let site = id.site().to_string();
+        self.chunk_feeds.ensure(&site);
+        let Some(mut poller) = self.chunk_feeds.take_now(&site) else {
+            // A round is already in flight; its listing will pick this chunk up.
+            return;
+        };
+        let generation = self.render.fetch_generation_for(&site);
+        let sender = self.channels.chunk_sender.clone();
+        let window = self.window.clone();
+        self.spawn_detached(async move {
+            let result = rustdar_radar::scan::fetch_notified_chunk(&mut poller, &id)
+                .await
+                .map_err(|e| format!("{e:?}"));
+            let _ = sender.send(ChunkResponse {
+                generation,
+                site,
+                poller,
+                result,
+            });
+            crate::app::notify_redraw(&window);
+        });
     }
 
     /// Drain finished rounds and apply them.

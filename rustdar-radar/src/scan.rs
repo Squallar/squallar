@@ -383,3 +383,19 @@ pub async fn poll_chunks(
         .poll(&crate::sources::DataSources::production())
         .await
 }
+
+/// Fetch and ingest one chunk a push notification named.
+///
+/// The counterpart to [`poll_chunks`] for the notification path: the caller
+/// already knows the object key, so this is a single `GET` with no listing,
+/// discovery or rollover probe. See
+/// [`crate::chunks::ChunkPoller::fetch_notified`].
+pub async fn fetch_notified_chunk(
+    poller: &mut crate::chunks::ChunkPoller,
+    id: &crate::chunks::ChunkId,
+) -> std::result::Result<crate::chunks::PollOutcome, crate::chunks::ChunkError> {
+    crate::tls::init();
+    poller
+        .fetch_notified(&crate::sources::DataSources::production(), id)
+        .await
+}
