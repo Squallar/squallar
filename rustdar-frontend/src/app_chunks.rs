@@ -29,11 +29,12 @@ impl super::App {
             .gui
             .get_rendering_params_for_pane(self.gui.active_pane_idx())
             .map(|(_, elevation)| (self.gui.active_pane().site.clone(), elevation));
-        let status = self.chunk_feeds.status(
+        let mut status = self.chunk_feeds.status(
             &live,
             enabled,
             showing.as_ref().map(|(s, e)| (s.as_str(), *e)),
         );
+        status.pushed = status.feeding && self.chunk_notify.any_open();
         self.gui.set_chunk_status(status);
         if !enabled {
             return;
@@ -41,6 +42,8 @@ impl super::App {
         // Narrower than `evict_unshown_scans`: a feed has no reader once no pane
         // is live on its site. See `ChunkFeedManager::retain_live`.
         self.chunk_feeds.retain_live(&live);
+
+        self.drive_chunk_notifications(&live);
 
         for site in live {
             self.chunk_feeds.ensure(&site);
@@ -65,6 +68,40 @@ impl super::App {
                 });
                 crate::app::notify_redraw(&window);
             });
+        }
+    }
+
+    /// Keep the notification subscriptions matched to the live sites, and turn
+    /// anything they said into an early round.
+    ///
+    /// A notification never carries data — only "a chunk exists". It marks the
+    /// site due and the ordinary poller does the rest, which is what makes the
+    /// service optional: with it, latency is bounded by the fetch; without it,
+    /// by the five-second timer that is still running underneath.
+    fn drive_chunk_notifications(&mut self, live: &[String]) {
+        if !self.gui.chunk_notifications_enabled() {
+            // Drop every socket rather than merely ignoring them, so turning the
+            // setting off actually stops the connections.
+            self.chunk_notify.sync_sites(&[], "", || {});
+            return;
+        }
+        let endpoint = self.gui.notifier_endpoint().to_string();
+        let window = self.window.clone();
+        self.chunk_notify.sync_sites(live, &endpoint, move || {
+            // From the socket's own thread: without this the frame loop can sleep
+            // through the very notification that was supposed to wake it.
+            crate::app::notify_redraw(&window);
+        });
+
+        for available in self.chunk_notify.drain() {
+            log::debug!(
+                "{}: notified of volume {} chunk {} ({:?})",
+                available.site,
+                available.volume.get(),
+                available.sequence,
+                available.kind,
+            );
+            self.chunk_feeds.mark_due(&available.site);
         }
     }
 

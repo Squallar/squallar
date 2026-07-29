@@ -55,6 +55,9 @@ winit = { workspace = true }
 # rendering path -- and, until the workspace pin was fixed, a duplicate set of
 # WebGPU bindings that broke `wasm-bindgen` outright.
 wgpu = { workspace = true, features = ["std", "wgsl"] }
+ewebsock = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 # tokio's multi-threaded runtime is native-only -- wasm rejects
 # `rt-multi-thread` outright ("Only features sync,macros,io-util,rt,time are

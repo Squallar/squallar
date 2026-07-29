@@ -499,10 +499,14 @@ fn render_auto_poll_status(
     let response = ui.checkbox(&mut auto_poll.enabled, label);
     let response = if chunks.feeding {
         response.on_hover_text(format!(
-            "Assembled from the real-time chunk feed, checked every {}s. The age \
-             is how long ago the radar collected this tilt; it climbs until the \
-             beam comes back round. The archive is polled only if the feed stops.",
-            chunks.interval_secs
+            "Assembled from the real-time chunk feed{}. The age is how long ago \
+             the radar collected this tilt; it climbs until the beam comes back \
+             round. The archive is polled only if the feed stops.",
+            if chunks.pushed {
+                ", fetched as each chunk is published".to_owned()
+            } else {
+                format!(", checked every {}s", chunks.interval_secs)
+            }
         ))
     } else if chunks.retired {
         response.on_hover_text(

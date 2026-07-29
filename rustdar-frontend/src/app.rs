@@ -219,6 +219,9 @@ pub struct App {
     loop_mgr: LoopDownloadManager,
     /// Per-site real-time chunk feeds. Empty until a live site starts one.
     chunk_feeds: crate::chunk_feed::ChunkFeedManager,
+    /// Push notification of new chunks. Purely an early wake-up for the feeds
+    /// above; see `chunk_notify`.
+    chunk_notify: crate::chunk_notify::ChunkNotifier,
     // Cached latest scan per site from auto-poll while panes on that site view historic data.
     latest_cached_scans: HashMap<
         String,
@@ -406,6 +409,7 @@ impl App {
             pending_state: None,
             loop_mgr: LoopDownloadManager::new(),
             chunk_feeds: crate::chunk_feed::ChunkFeedManager::new(),
+            chunk_notify: crate::chunk_notify::ChunkNotifier::new(),
             latest_cached_scans: HashMap::new(),
             manual_nav_pending: false,
             last_viewport: None,

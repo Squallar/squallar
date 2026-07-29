@@ -32,6 +32,8 @@ egui = "=0.35.0"
 egui-wgpu = { version = "=0.35.0", default-features = false }
 egui-winit = { version = "=0.35.0", default-features = false }
 walkers = "=0.56.0"
+
+ewebsock = { version = "=0.8.0", default-features = false, features = ["tls"] }
 web-time = "=1.1.0"
 wgpu = { version = "=29.0.4", default-features = false }
 winit = "=0.30.13"

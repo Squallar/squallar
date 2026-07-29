@@ -156,6 +156,21 @@ impl ChunkFeedManager {
         }
     }
 
+    /// Make a site due for a round immediately, skipping the interval.
+    ///
+    /// What a push notification does: the chunk exists *now*, so waiting out the
+    /// remainder of the poll interval is latency for nothing. Everything else
+    /// about the round is unchanged, which is why a notifier that goes away costs
+    /// nothing — the timer is still there underneath.
+    ///
+    /// Does not disturb a round already in flight; `should_poll` still refuses
+    /// while the poller is out.
+    pub fn mark_due(&mut self, site: &str) {
+        if let Some(feed) = self.feeds.get_mut(site) {
+            feed.last_poll = None;
+        }
+    }
+
     /// Take the poller for a round, if this site wants one now.
     ///
     /// Hands ownership out; [`Self::finish_round`] must put it back or the site
@@ -631,5 +646,68 @@ mod freshness_tests {
         mgr.record_delivery("KTLX", 0.5, std::time::Duration::from_secs(1));
         mgr.retain_live(&[]);
         assert!(mgr.freshness("KTLX", 0.5).is_none());
+    }
+}
+
+#[cfg(test)]
+mod due_tests {
+    use super::*;
+
+    /// What a push notification does: the chunk exists now, so the remainder of
+    /// the poll interval is latency for nothing.
+    #[test]
+    fn marking_a_site_due_lets_it_poll_before_the_interval() {
+        let mut mgr = ChunkFeedManager::new();
+        mgr.ensure("KTLX");
+        let poller = mgr.take_for_round("KTLX").expect("the first round is due");
+        mgr.finish_round("KTLX", poller, &Ok(PollOutcome::default()));
+
+        assert!(
+            mgr.take_for_round("KTLX").is_none(),
+            "precondition: the interval has not elapsed"
+        );
+        mgr.mark_due("KTLX");
+        assert!(
+            mgr.take_for_round("KTLX").is_some(),
+            "a notification did not bring the next round forward"
+        );
+    }
+
+    /// It must not start a second concurrent round — a burst of notifications
+    /// for one volume would otherwise dispatch one round per message.
+    #[test]
+    fn marking_a_site_due_does_not_interrupt_a_round_in_flight() {
+        let mut mgr = ChunkFeedManager::new();
+        mgr.ensure("KTLX");
+        let poller = mgr.take_for_round("KTLX").expect("the first round is due");
+
+        for _ in 0..5 {
+            mgr.mark_due("KTLX");
+            assert!(
+                mgr.take_for_round("KTLX").is_none(),
+                "a notification dispatched a round while one was still in flight"
+            );
+        }
+        mgr.finish_round("KTLX", poller, &Ok(PollOutcome::default()));
+    }
+
+    /// A notification for a site with no feed is inert rather than a panic —
+    /// the socket can outlive the feed by a frame.
+    #[test]
+    fn marking_an_unknown_site_due_is_inert() {
+        let mut mgr = ChunkFeedManager::new();
+        mgr.mark_due("KTLX");
+        assert!(!mgr.is_feeding("KTLX"));
+    }
+
+    /// A retired site stays retired: notifications are an accelerator for the
+    /// polling feed, not a way around its failure handling.
+    #[test]
+    fn a_notification_does_not_revive_a_retired_feed() {
+        let mut mgr = ChunkFeedManager::new();
+        mgr.ensure("KTLX");
+        mgr.force_retire_at("KTLX", std::time::Duration::from_secs(1));
+        mgr.mark_due("KTLX");
+        assert!(mgr.take_for_round("KTLX").is_none());
     }
 }

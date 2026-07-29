@@ -113,6 +113,11 @@ struct UiConfig {
     /// this field existed takes `UiConfig::default()`'s value — the same
     /// mechanism `auto_poll` relies on.
     live_chunks: bool,
+    /// Subscribe to the push-notification service for new chunks.
+    chunk_notifications: bool,
+    /// Where that service lives. Empty means the built-in default.
+    #[serde(default)]
+    notifier_endpoint: String,
     site: String,
     loop_lookback_secs: u64,
     loop_speed_fps: f32,
@@ -138,6 +143,8 @@ impl Default for UiConfig {
             sync_layers: true,
             auto_poll: true,
             live_chunks: true,
+            chunk_notifications: true,
+            notifier_endpoint: String::new(),
             site: "KTLX".to_string(),
             loop_lookback_secs: 3600,
             loop_speed_fps: 5.0,
@@ -216,6 +223,8 @@ impl super::Gui {
             sync_layers: self.sync_layers,
             auto_poll: self.auto_poll.enabled,
             live_chunks: self.live_chunks,
+            chunk_notifications: self.chunk_notifications,
+            notifier_endpoint: self.notifier_endpoint.clone(),
             site: self.radar.config.site.clone(),
             loop_lookback_secs: self.loop_lookback_secs,
             loop_speed_fps: fps,
@@ -285,6 +294,8 @@ impl super::Gui {
         self.sync_layers = config.sync_layers;
         self.auto_poll.enabled = config.auto_poll;
         self.live_chunks = config.live_chunks;
+        self.chunk_notifications = config.chunk_notifications;
+        self.notifier_endpoint = config.notifier_endpoint;
 
         if !config.site.is_empty() {
             self.radar.config.site = config.site.clone();
@@ -654,5 +665,45 @@ mod live_chunks_config_tests {
             parsed.live_chunks,
             "an existing install would silently lose the low-latency feed"
         );
+    }
+}
+
+#[cfg(test)]
+mod notifier_config_tests {
+    use super::*;
+    use crate::Gui;
+
+    /// Both notification settings survive a save/load cycle.
+    #[test]
+    fn the_notifier_settings_round_trip() {
+        let mut gui = Gui::new();
+        gui.set_chunk_notifications(false);
+        gui.set_notifier_endpoint("wss://example.test");
+        let json = gui.ui_config_json().expect("serialises");
+        let parsed: UiConfig = serde_json::from_str(&json).expect("parses");
+        assert!(!parsed.chunk_notifications);
+        assert_eq!(parsed.notifier_endpoint, "wss://example.test");
+    }
+
+    /// A config written before these fields existed keeps the low-latency
+    /// defaults rather than failing to parse or silently opting out.
+    #[test]
+    fn an_older_config_defaults_to_notifications_on() {
+        let old = r#"{"pane_count":1,"auto_poll":true,"site":"KTLX"}"#;
+        let parsed: UiConfig = serde_json::from_str(old).expect("an older config still parses");
+        assert!(parsed.chunk_notifications);
+        assert!(parsed.live_chunks);
+    }
+
+    /// A cleared endpoint box falls back to the built-in default rather than
+    /// acting as a silent off switch — turning the feature off is what the
+    /// toggle is for.
+    #[test]
+    fn an_empty_endpoint_falls_back_to_the_default() {
+        let mut gui = Gui::new();
+        gui.set_notifier_endpoint("   ");
+        assert_eq!(gui.notifier_endpoint(), crate::DEFAULT_NOTIFIER_ENDPOINT);
+        gui.set_notifier_endpoint("wss://example.test/");
+        assert_eq!(gui.notifier_endpoint(), "wss://example.test/");
     }
 }

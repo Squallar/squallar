@@ -160,6 +160,9 @@ pub struct ChunkFeedStatus {
     pub retired: bool,
     /// The feed's own poll cadence, in seconds.
     pub interval_secs: u64,
+    /// A push-notification socket is open, so chunks are fetched on arrival
+    /// rather than on the next tick.
+    pub pushed: bool,
     /// The active pane's tilt, once the feed has delivered it at least once.
     pub tilt: Option<TiltFreshness>,
 }
@@ -176,6 +179,10 @@ pub struct Gui {
     auto_poll: AutoPollState,
     /// See [`Gui::live_chunks_enabled`].
     live_chunks: bool,
+    /// See [`Gui::chunk_notifications_enabled`].
+    chunk_notifications: bool,
+    /// See [`Gui::notifier_endpoint`].
+    notifier_endpoint: String,
     /// What the real-time feed is doing, refreshed each frame by the App.
     chunk_status: ChunkFeedStatus,
     time_dialog: TimeDialogState,
@@ -551,6 +558,8 @@ impl Gui {
                 error_message: None,
             },
             live_chunks: true,
+            chunk_notifications: true,
+            notifier_endpoint: crate::DEFAULT_NOTIFIER_ENDPOINT.to_string(),
             chunk_status: ChunkFeedStatus::default(),
             auto_poll: AutoPollState {
                 last_fetch_time: None,
@@ -847,6 +856,40 @@ impl Gui {
     /// Set by the settings UI and by the config load.
     pub fn set_live_chunks(&mut self, enabled: bool) {
         self.live_chunks = enabled;
+    }
+
+    /// Whether to subscribe to the push-notification service.
+    ///
+    /// Purely an accelerator: it makes a chunk fetch start the moment the chunk
+    /// exists rather than on the next five-second tick. Turning it off, or
+    /// failing to reach the service, leaves the polling feed running exactly as
+    /// it is — which is why it can default on without making a third-party
+    /// deployment load-bearing.
+    pub fn chunk_notifications_enabled(&self) -> bool {
+        self.chunk_notifications
+    }
+
+    pub fn set_chunk_notifications(&mut self, enabled: bool) {
+        self.chunk_notifications = enabled;
+    }
+
+    /// Where the notifier service lives.
+    ///
+    /// Settable because it is one person's deployment rather than a NOAA
+    /// endpoint: a user behind a network that cannot reach it, or one running
+    /// their own, needs to be able to point elsewhere. An empty value falls back
+    /// to the default rather than disabling the feature, so a cleared box is not
+    /// a silent off switch.
+    pub fn notifier_endpoint(&self) -> &str {
+        if self.notifier_endpoint.trim().is_empty() {
+            crate::DEFAULT_NOTIFIER_ENDPOINT
+        } else {
+            self.notifier_endpoint.trim()
+        }
+    }
+
+    pub fn set_notifier_endpoint(&mut self, endpoint: impl Into<String>) {
+        self.notifier_endpoint = endpoint.into();
     }
 
     /// Publish what the real-time feed is doing, so the status bar can say so.
