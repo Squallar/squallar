@@ -218,7 +218,7 @@ impl RenderCache {
 /// velocity tilt for its wind-profile fit. Both would read a volume still
 /// being assembled as a complete short one — `compute_echo_tops` clamps every
 /// column to the topmost tilt present, with no error and no NaN to notice.
-fn whole_volume_product(product: RadarProduct) -> bool {
+pub fn needs_whole_volume(product: RadarProduct) -> bool {
     matches!(
         product,
         RadarProduct::EchoTopsInterpolated | RadarProduct::NormalizedRotation
@@ -417,7 +417,7 @@ impl RenderDispatcher {
         angles: &[f32],
     ) -> usize {
         let hit = self.invalidate_panes_where(site, gui, |product, elevation| {
-            if product.is_level3() || whole_volume_product(product) {
+            if product.is_level3() || needs_whole_volume(product) {
                 return false;
             }
             angles
@@ -436,7 +436,7 @@ impl RenderDispatcher {
     /// volume. Called only when a volume closes complete.
     pub fn reset_panes_for_volume(&mut self, site: &str, gui: &rustdar_egui::Gui) -> usize {
         self.invalidate_panes_where(site, gui, |product, _| {
-            !product.is_level3() && whole_volume_product(product)
+            !product.is_level3() && needs_whole_volume(product)
         })
     }
 

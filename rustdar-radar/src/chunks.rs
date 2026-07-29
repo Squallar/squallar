@@ -474,6 +474,145 @@ pub(crate) fn placeholder_coverage_pattern(pattern_number: u16) -> VolumeCoverag
 /// while a stray drop or two still seals.
 const MIN_SEALED_RADIAL_PERCENT: usize = 95;
 
+/// Radials one chunk carries, which is what makes a chunk sequence map onto an
+/// elevation cut without decoding anything.
+///
+/// Measured against the live bucket: an intermediate chunk of a KTLX volume
+/// decodes to exactly 120 radials, and the cuts of a VCP-35 volume sealed on
+/// sequences 7, 13, 19, 25, 31, 37, then 40, 43, 46, 49, 52, 55 — six chunks for
+/// each super-resolution cut and three for each standard one, against a start
+/// chunk at sequence 1 that carries no radials at all.
+const RADIALS_PER_CHUNK: usize = 120;
+
+/// Which cuts a caller wants assembled.
+///
+/// Downloading every chunk to render one tilt is most of the traffic wasted: a
+/// 0.5° pane needs 13 of a 55-chunk volume. But two products integrate the whole
+/// volume — `EchoTopsInterpolated` always, and `NormalizedRotation` when no
+/// external wind profile resolves — and `compute_echo_tops` clamps every column
+/// to the topmost tilt *present*, so feeding it a selective volume would produce
+/// a plausible, low, wrong answer with no error to notice.
+///
+/// So the selection is the caller's to make, and [`All`](Self::All) is the
+/// answer whenever anything on screen needs the volume.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum CutSelection {
+    /// Every cut. What a volume-wide product requires, and the default: nothing
+    /// may be skipped until a caller has said what it can do without.
+    #[default]
+    All,
+    /// Only cuts within [`ELEVATION_MATCH`] of one of these angles.
+    ///
+    /// The start chunk is always taken regardless: it carries the coverage
+    /// pattern, without which nothing can be mapped at all.
+    Tilts(Vec<f32>),
+}
+
+/// How near a cut's planned angle must be to a wanted one to count as it.
+///
+/// Wide enough for the drift between a VCP's commanded angle and what a split
+/// cut actually achieves — 0.32°/0.63° against a nominal 0.5° — which is the same
+/// slack `render::find_sweep` allows when picking a sweep.
+const ELEVATION_MATCH: f32 = 0.3;
+
+impl CutSelection {
+    fn wants_angle(&self, angle: f32) -> bool {
+        match self {
+            Self::All => true,
+            Self::Tilts(wanted) => wanted.iter().any(|w| (w - angle).abs() <= ELEVATION_MATCH),
+        }
+    }
+
+    fn is_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
+/// Which elevation cut each chunk sequence belongs to, derived from the volume
+/// coverage pattern.
+///
+/// This is what lets a chunk be skipped *before* it is downloaded. The radials
+/// inside it say which cut it belongs to, but only once it has been fetched and
+/// decompressed — which is the cost being avoided.
+///
+/// Reimplements upstream's `ElevationChunkMapper`, which is behind the `aws`
+/// feature. Purely arithmetic over a decoded message 5.
+#[derive(Debug, Clone)]
+pub struct ElevationChunkMap {
+    /// One entry per cut, in VCP order: its 1-based elevation number, its
+    /// planned angle, and the sequence range it occupies.
+    cuts: Vec<(u8, f32, std::ops::RangeInclusive<u16>)>,
+}
+
+impl ElevationChunkMap {
+    /// Build from the coverage pattern the start chunk carried.
+    ///
+    /// `None` when the pattern lists no cuts — a placeholder, or a message 5
+    /// this build could not read — in which case nothing can be skipped safely
+    /// and the caller must take everything.
+    pub fn from_coverage_pattern(vcp: &VolumeCoveragePattern) -> Option<Self> {
+        let planned = vcp.elevation_cuts();
+        if planned.is_empty() {
+            return None;
+        }
+        // Sequence 1 is the start chunk: metadata only, no radials.
+        let mut next = 2u16;
+        let cuts = planned
+            .iter()
+            .enumerate()
+            .map(|(i, cut)| {
+                let radials = if cut.super_resolution_half_degree_azimuth() {
+                    720
+                } else {
+                    360
+                };
+                let chunks = (radials / RADIALS_PER_CHUNK) as u16;
+                let range = next..=(next + chunks - 1);
+                next += chunks;
+                ((i + 1) as u8, cut.elevation_angle_degrees() as f32, range)
+            })
+            .collect();
+        Some(Self { cuts })
+    }
+
+    /// The cut a sequence belongs to: its elevation number and planned angle.
+    /// `None` for the start chunk, or a sequence past the end of the pattern.
+    pub fn cut_for(&self, sequence: u16) -> Option<(u8, f32)> {
+        self.cuts
+            .iter()
+            .find(|(_, _, range)| range.contains(&sequence))
+            .map(|(elevation, angle, _)| (*elevation, *angle))
+    }
+
+    /// Whether this sequence is worth downloading under `selection`.
+    ///
+    /// The start chunk and anything the map cannot place are always wanted: the
+    /// first carries the coverage pattern, and skipping the second would be
+    /// guessing. Being wrong here costs a download; being wrong the other way
+    /// costs a cut that never completes.
+    pub fn wants(&self, sequence: u16, selection: &CutSelection) -> bool {
+        match self.cut_for(sequence) {
+            None => true,
+            Some((_, angle)) => selection.wants_angle(angle),
+        }
+    }
+
+    /// Elevation numbers a selection asks for, which is what "complete" means
+    /// once cuts are being skipped.
+    pub fn wanted_elevations(&self, selection: &CutSelection) -> Vec<u8> {
+        self.cuts
+            .iter()
+            .filter(|(_, angle, _)| selection.wants_angle(*angle))
+            .map(|(elevation, _, _)| *elevation)
+            .collect()
+    }
+
+    /// How many cuts the pattern plans.
+    pub fn cut_count(&self) -> usize {
+        self.cuts.len()
+    }
+}
+
 /// One elevation cut being accumulated.
 enum Cut {
     /// Still receiving.
@@ -592,6 +731,12 @@ pub struct VolumeAssembler {
     coverage_pattern: Option<VolumeCoveragePattern>,
     saw_start_chunk: bool,
     saw_scan_end: bool,
+    /// Built from the coverage pattern the moment it arrives; `None` until the
+    /// start chunk lands, which is why nothing can be skipped before then.
+    chunk_map: Option<ElevationChunkMap>,
+    /// What the caller asked for. Only ever narrows what is *fetched*; anything
+    /// that arrives anyway is still assembled.
+    selection: CutSelection,
     late_radials_dropped: usize,
     closed: bool,
     /// Invalidated whenever a cut seals. See [`Self::snapshot`].
@@ -609,6 +754,8 @@ impl VolumeAssembler {
             coverage_pattern: None,
             saw_start_chunk: false,
             saw_scan_end: false,
+            chunk_map: None,
+            selection: CutSelection::All,
             late_radials_dropped: 0,
             closed: false,
             cached: None,
@@ -663,7 +810,8 @@ impl VolumeAssembler {
             ..Default::default()
         };
         if let Some(vcp) = contents.coverage_pattern {
-            self.coverage_pattern.get_or_insert(vcp);
+            let vcp = self.coverage_pattern.insert(vcp);
+            self.chunk_map = ElevationChunkMap::from_coverage_pattern(vcp);
             outcome.learned_coverage_pattern = true;
         }
 
@@ -752,6 +900,33 @@ impl VolumeAssembler {
         true
     }
 
+    /// Narrow what this volume will fetch.
+    ///
+    /// Applied to *downloads*, never to assembly: a chunk that arrives anyway —
+    /// because it was already in flight, or because the selection just widened —
+    /// is still ingested.
+    pub fn set_selection(&mut self, selection: CutSelection) {
+        self.selection = selection;
+    }
+
+    pub fn selection(&self) -> &CutSelection {
+        &self.selection
+    }
+
+    /// Whether this chunk is worth downloading.
+    ///
+    /// Always true until the start chunk has been seen: without the coverage
+    /// pattern there is no map, and guessing would drop cuts the caller wanted.
+    pub fn wants_chunk(&self, sequence: u16) -> bool {
+        if self.selection.is_all() {
+            return true;
+        }
+        match &self.chunk_map {
+            None => true,
+            Some(map) => map.wants(sequence, &self.selection),
+        }
+    }
+
     /// Whether every cut the volume carries is sealed and the volume has ended.
     ///
     /// The contiguity clause is not decoration. A volume *joined mid-flight* has
@@ -760,15 +935,38 @@ impl VolumeAssembler {
     /// lowest tilts are simply absent — and `compute_echo_tops` would integrate
     /// tilts 8..23 and report every column's top far too low.
     pub fn is_volume_complete(&self) -> bool {
-        self.saw_start_chunk
-            && self.saw_scan_end
-            && !self.cuts.is_empty()
-            && self.cuts.values().all(Cut::is_sealed)
-            && self
-                .cuts
-                .keys()
-                .copied()
-                .eq(1..=self.cuts.keys().copied().max().unwrap_or(0))
+        if !self.saw_start_chunk || !self.saw_scan_end || self.cuts.is_empty() {
+            return false;
+        }
+        match (&self.selection, &self.chunk_map) {
+            // Everything was asked for, so "complete" is the whole pattern: every
+            // cut sealed, and their numbers contiguous from 1. The contiguity
+            // clause is what stops a volume *joined mid-flight* — which has no
+            // entry at all for the cuts that finished before the first chunk
+            // arrived — from reporting complete and letting `compute_echo_tops`
+            // integrate only the upper tilts.
+            (CutSelection::All, _) | (_, None) => {
+                self.cuts.values().all(Cut::is_sealed)
+                    && self.cuts.keys().copied().eq(1..=self
+                        .cuts
+                        .keys()
+                        .copied()
+                        .max()
+                        .unwrap_or(0))
+            }
+            // Cuts were deliberately skipped, so contiguity is meaningless and
+            // "complete" means every cut that was *asked for*. Note what this
+            // does not license: a volume completed this way must never reach a
+            // product that integrates the volume, which is exactly why choosing
+            // a narrow selection is the caller's decision and not this type's.
+            (selection, Some(map)) => {
+                let wanted = map.wanted_elevations(selection);
+                !wanted.is_empty()
+                    && wanted
+                        .iter()
+                        .all(|elevation| self.is_elevation_sealed(*elevation))
+            }
+        }
     }
 
     /// Whether this sequence has already been taken.
@@ -988,6 +1186,10 @@ pub struct ChunkPoller {
     current: Option<VolumeAssembler>,
     consecutive_failures: u32,
     last_round_was_quiet: bool,
+    /// Carried on the poller rather than the assembler so it survives a volume
+    /// roll — the caller sets it from what is on screen, which does not change
+    /// just because the radar started a new volume.
+    selection: CutSelection,
 }
 
 impl ChunkPoller {
@@ -997,6 +1199,7 @@ impl ChunkPoller {
             current: None,
             consecutive_failures: 0,
             last_round_was_quiet: false,
+            selection: CutSelection::All,
         }
     }
 
@@ -1008,7 +1211,38 @@ impl ChunkPoller {
             site,
             consecutive_failures: 0,
             last_round_was_quiet: false,
+            selection: CutSelection::All,
         }
+    }
+
+    /// Narrow what this feed downloads to the cuts a caller actually renders.
+    ///
+    /// The traffic this saves is the bulk of the feed: a 0.5° pane needs 13 of a
+    /// 55-chunk volume, so ~76% of the bytes — and ~76% of the bzip2 work, which
+    /// on wasm happens on the main thread.
+    ///
+    /// **The caller owns the safety of this.** `compute_echo_tops` clamps every
+    /// column to the topmost tilt present and `render_nrot_to_image` fits its
+    /// wind profile from every velocity tilt, so either would read a selective
+    /// volume as a complete short one — silently. Pass [`CutSelection::All`]
+    /// whenever anything on screen integrates the volume.
+    pub fn set_selection(&mut self, selection: CutSelection) {
+        if self.selection == selection {
+            return;
+        }
+        log::debug!("{}: cut selection -> {selection:?}", self.site);
+        self.selection = selection.clone();
+        if let Some(current) = self.current.as_mut() {
+            // Applied to the volume in flight too, so widening the selection
+            // backfills within this volume rather than waiting for the next one:
+            // the skipped chunks are still in the bucket, and the next listing
+            // will select them.
+            current.set_selection(selection);
+        }
+    }
+
+    pub fn selection(&self) -> &CutSelection {
+        &self.selection
     }
 
     pub fn site(&self) -> &str {
@@ -1078,6 +1312,7 @@ impl ChunkPoller {
             .filter(|id| {
                 id.volume() == current.volume()
                     && !current.has_ingested(id.sequence())
+                    && current.wants_chunk(id.sequence())
                     // A directory the rotation has not yet cleared can still
                     // hold the previous pass's chunks alongside the new ones.
                     && volume_time.is_none_or(|known| id.volume_time() == known)
@@ -1089,7 +1324,9 @@ impl ChunkPoller {
     /// Close the current volume and begin the next.
     pub(crate) fn roll(&mut self, to: VolumeIndex) -> Option<VolumeProgress> {
         let closed = self.current.as_mut().map(VolumeAssembler::close);
-        self.current = Some(VolumeAssembler::new(self.site.clone(), to));
+        let mut next = VolumeAssembler::new(self.site.clone(), to);
+        next.set_selection(self.selection.clone());
+        self.current = Some(next);
         closed
     }
 
@@ -1131,14 +1368,16 @@ impl ChunkPoller {
             outcome.closed = self.roll(id.volume());
             outcome.rolled_to = Some(id.volume());
         } else if self.current.is_none() {
-            self.current = Some(VolumeAssembler::new(self.site.clone(), id.volume()));
+            let mut next = VolumeAssembler::new(self.site.clone(), id.volume());
+            next.set_selection(self.selection.clone());
+            self.current = Some(next);
             outcome.rolled_to = Some(id.volume());
         }
 
         let Some(current) = self.current.as_mut() else {
             return Ok(outcome);
         };
-        if current.has_ingested(id.sequence()) {
+        if current.has_ingested(id.sequence()) || !current.wants_chunk(id.sequence()) {
             return Ok(outcome);
         }
 
@@ -1238,7 +1477,9 @@ impl ChunkPoller {
                         return Err(e);
                     }
                 };
-                self.current = Some(VolumeAssembler::new(self.site.clone(), volume));
+                let mut started = VolumeAssembler::new(self.site.clone(), volume);
+                started.set_selection(self.selection.clone());
+                self.current = Some(started);
                 outcome.rolled_to = Some(volume);
                 volume
             }
@@ -2480,6 +2721,327 @@ mod tests {
             ChunkId::parse("KTLX", vol(42), &format!("{VOLUME_TIME}-009-I")).expect("parses");
         assert!(!p.should_roll_to(&same));
         assert!(!p.is_stale_notification(&same));
+    }
+
+    // -- selective download --------------------------------------------------
+
+    /// A VCP whose first `super_res` cuts are half-degree and the rest standard,
+    /// which is the shape every real pattern has.
+    fn vcp_with(cuts: &[(f32, bool)]) -> VolumeCoveragePattern {
+        let elevation_cuts = cuts
+            .iter()
+            .map(|(angle, super_res)| {
+                ElevationCut::new(
+                    *angle as f64,
+                    ChannelConfiguration::ConstantPhase,
+                    WaveformType::CS,
+                    0.0,
+                    *super_res,
+                    false,
+                    false,
+                    false,
+                    0,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    false,
+                    0,
+                    false,
+                    0,
+                    false,
+                    false,
+                )
+            })
+            .collect();
+        VolumeCoveragePattern::new(
+            35,
+            0,
+            0.5,
+            PulseWidth::Short,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            elevation_cuts,
+        )
+    }
+
+    /// The mapping this rests on, against the volume shape measured on the live
+    /// bucket: KTLX VCP 35, twelve cuts, six chunks each for the six
+    /// super-resolution ones and three for the six standard ones, sealing on
+    /// sequences 7, 13, 19, 25, 31, 37, 40, 43, 46, 49, 52, 55.
+    #[test]
+    fn the_chunk_map_reproduces_a_measured_volume() {
+        let mut cuts: Vec<(f32, bool)> = (0..6).map(|i| (0.5 + i as f32 * 0.4, true)).collect();
+        cuts.extend((0..6).map(|i| (1.8 + i as f32 * 0.9, false)));
+        let vcp = vcp_with(&cuts);
+        let map = ElevationChunkMap::from_coverage_pattern(&vcp).expect("a pattern with cuts");
+        assert_eq!(map.cut_count(), 12);
+
+        // The start chunk belongs to no cut.
+        assert_eq!(map.cut_for(1), None);
+        // Each cut ends on the sequence the live volume sealed it on.
+        for (elevation, last) in [
+            (1u8, 7u16),
+            (2, 13),
+            (3, 19),
+            (4, 25),
+            (5, 31),
+            (6, 37),
+            (7, 40),
+            (8, 43),
+            (9, 46),
+            (10, 49),
+            (11, 52),
+            (12, 55),
+        ] {
+            assert_eq!(
+                map.cut_for(last).map(|(e, _)| e),
+                Some(elevation),
+                "sequence {last} should be the end of cut {elevation}"
+            );
+            assert_ne!(
+                map.cut_for(last + 1).map(|(e, _)| e),
+                Some(elevation),
+                "cut {elevation} ran past sequence {last}"
+            );
+        }
+    }
+
+    /// The traffic claim, stated as a number: a pane on the lowest tilt needs
+    /// thirteen chunks of fifty-five.
+    #[test]
+    fn one_tilt_wants_a_fraction_of_the_volume() {
+        let mut cuts: Vec<(f32, bool)> = (0..2).map(|_| (0.5, true)).collect();
+        cuts.extend((0..4).map(|i| (1.3 + i as f32 * 0.4, true)));
+        cuts.extend((0..6).map(|i| (1.8 + i as f32 * 0.9, false)));
+        let vcp = vcp_with(&cuts);
+        let map = ElevationChunkMap::from_coverage_pattern(&vcp).expect("cuts");
+
+        let low = CutSelection::Tilts(vec![0.5]);
+        let wanted = (1..=55).filter(|s| map.wants(*s, &low)).count();
+        assert_eq!(
+            wanted, 13,
+            "a 0.5° pane should want the start chunk and both halves of the \
+             split cut, and nothing else"
+        );
+        assert_eq!(
+            (1..=55)
+                .filter(|s| map.wants(*s, &CutSelection::All))
+                .count(),
+            55,
+            "asking for everything must still take everything"
+        );
+    }
+
+    /// The start chunk is never skipped: it carries the coverage pattern, and
+    /// without it there is no map to skip anything by.
+    #[test]
+    fn the_start_chunk_is_always_wanted() {
+        let vcp = vcp_with(&[(0.5, true), (4.0, false)]);
+        let map = ElevationChunkMap::from_coverage_pattern(&vcp).expect("cuts");
+        assert!(map.wants(1, &CutSelection::Tilts(vec![90.0])));
+        // And so is a sequence past the end of the pattern — skipping something
+        // unplaceable would be guessing.
+        assert!(map.wants(999, &CutSelection::Tilts(vec![90.0])));
+    }
+
+    /// A placeholder pattern lists no cuts, so nothing can be mapped and nothing
+    /// may be skipped.
+    #[test]
+    fn a_pattern_with_no_cuts_yields_no_map() {
+        assert!(
+            ElevationChunkMap::from_coverage_pattern(&placeholder_coverage_pattern(212)).is_none()
+        );
+    }
+
+    /// Before the start chunk lands there is no map, so every chunk is wanted
+    /// whatever the selection says.
+    #[test]
+    fn nothing_is_skipped_until_the_coverage_pattern_arrives() {
+        let mut a = VolumeAssembler::new("KTLX", vol(42));
+        a.set_selection(CutSelection::Tilts(vec![0.5]));
+        for sequence in 1..=55 {
+            assert!(
+                a.wants_chunk(sequence),
+                "chunk {sequence} was skipped with no coverage pattern to judge by"
+            );
+        }
+    }
+
+    /// The split cut's other half is wanted too: both halves sit at the same
+    /// angle, and a pane switching from reflectivity to velocity must not have
+    /// to wait for the next volume.
+    #[test]
+    fn both_halves_of_a_split_cut_are_wanted_together() {
+        let vcp = vcp_with(&[(0.5, true), (0.5, true), (4.0, false)]);
+        let map = ElevationChunkMap::from_coverage_pattern(&vcp).expect("cuts");
+        let low = CutSelection::Tilts(vec![0.5]);
+        assert_eq!(map.wanted_elevations(&low), vec![1, 2]);
+    }
+
+    /// With cuts deliberately skipped, "complete" means every cut that was asked
+    /// for — contiguity is meaningless once there are holes by design.
+    #[test]
+    fn a_selective_volume_completes_on_the_cuts_it_asked_for() {
+        let vcp = vcp_with(&[(0.5, true), (4.0, false), (6.0, false)]);
+        let mut a = VolumeAssembler::new("KTLX", vol(42));
+        a.set_selection(CutSelection::Tilts(vec![0.5]));
+
+        // Start chunk carrying the pattern, then the 0.5° cut, then the volume
+        // ends — cuts 2 and 3 never arrive because they were never fetched.
+        a.ingest_contents(
+            1,
+            ChunkKind::Start,
+            volume_time(),
+            ChunkContents {
+                radials: Vec::new(),
+                coverage_pattern: Some(vcp),
+            },
+        );
+        assert!(!a.is_volume_complete(), "nothing has been assembled yet");
+
+        let scan = crate::volumetric::tests::golden_scan();
+        let sweep = &scan.sweeps()[0];
+        let radials: Vec<Radial> = sweep
+            .radials()
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                if i + 1 == sweep.radials().len() {
+                    with_status(r, RadialStatus::ScanEnd)
+                } else {
+                    r.clone()
+                }
+            })
+            .collect();
+        for (n, group) in radials.chunks(120).enumerate() {
+            a.ingest_contents(
+                2 + n as u16,
+                ChunkKind::Intermediate,
+                volume_time(),
+                ChunkContents {
+                    radials: group.to_vec(),
+                    coverage_pattern: None,
+                },
+            );
+        }
+
+        assert!(
+            a.is_volume_complete(),
+            "the only cut asked for is sealed and the volume ended, but it did \
+             not report complete: {:?}",
+            a.progress()
+        );
+    }
+
+    /// The pairing that keeps a selective volume away from `compute_echo_tops`:
+    /// under `All`, a volume with a hole is not complete.
+    ///
+    /// Contiguity is what carries this rather than the planned cut list, and
+    /// deliberately so — SAILS and MRLE cuts are inserted at runtime, so the
+    /// number of sweeps a volume produces need not match the number its message 5
+    /// lists, and requiring the planned set could leave a volume that will never
+    /// complete. `ScanEnd` marks the true final cut, so seeing it with 1..=n
+    /// sealed and no gaps genuinely is the whole volume.
+    #[test]
+    fn a_volume_with_a_hole_is_incomplete_when_everything_was_asked_for() {
+        let scan = crate::volumetric::tests::golden_scan();
+        let mut a = VolumeAssembler::new("KTLX", vol(42));
+        a.set_selection(CutSelection::All);
+        a.ingest_contents(
+            1,
+            ChunkKind::Start,
+            volume_time(),
+            ChunkContents {
+                radials: Vec::new(),
+                coverage_pattern: Some(crate::volumetric::tests::vcp()),
+            },
+        );
+
+        // Every cut but the second, with the last radial of the last one marking
+        // the end of the volume — the shape a lost chunk leaves behind.
+        let sweeps = scan.sweeps();
+        let mut sequence = 2u16;
+        for (si, sweep) in sweeps.iter().enumerate() {
+            if si == 1 {
+                continue;
+            }
+            let last_sweep = si + 1 == sweeps.len();
+            let radials: Vec<Radial> = sweep
+                .radials()
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    if i + 1 == sweep.radials().len() {
+                        with_status(
+                            r,
+                            if last_sweep {
+                                RadialStatus::ScanEnd
+                            } else {
+                                RadialStatus::ElevationEnd
+                            },
+                        )
+                    } else {
+                        r.clone()
+                    }
+                })
+                .collect();
+            for group in radials.chunks(120) {
+                a.ingest_contents(
+                    sequence,
+                    ChunkKind::Intermediate,
+                    volume_time(),
+                    ChunkContents {
+                        radials: group.to_vec(),
+                        coverage_pattern: None,
+                    },
+                );
+                sequence += 1;
+            }
+        }
+
+        assert!(a.progress().saw_scan_end, "the fixture must reach the end");
+        assert!(
+            !a.is_volume_complete(),
+            "a volume missing cut 2 reported complete, so `compute_echo_tops` \
+             would integrate a volume with a hole in it: {:?}",
+            a.progress()
+        );
+    }
+
+    /// Widening the selection mid-volume backfills within it rather than waiting
+    /// for the next one — the skipped chunks are still in the bucket.
+    #[test]
+    fn widening_the_selection_makes_the_skipped_chunks_wanted_again() {
+        let vcp = vcp_with(&[(0.5, true), (4.0, false)]);
+        let mut a = VolumeAssembler::new("KTLX", vol(42));
+        a.ingest_contents(
+            1,
+            ChunkKind::Start,
+            volume_time(),
+            ChunkContents {
+                radials: Vec::new(),
+                coverage_pattern: Some(vcp),
+            },
+        );
+
+        a.set_selection(CutSelection::Tilts(vec![0.5]));
+        assert!(!a.wants_chunk(8), "the 4.0° cut should be skipped");
+        a.set_selection(CutSelection::Tilts(vec![0.5, 4.0]));
+        assert!(
+            a.wants_chunk(8),
+            "a pane switching to 4.0° must not wait for the next volume"
+        );
     }
 
     // -- live ---------------------------------------------------------------

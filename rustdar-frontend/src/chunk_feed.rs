@@ -171,6 +171,19 @@ impl ChunkFeedManager {
         }
     }
 
+    /// Tell a site's feed which cuts to download.
+    ///
+    /// Applied to the poller, so it survives a volume roll. Ignored while a
+    /// round is in flight — the poller is out — and picked up on the next one,
+    /// which is a frame's delay at worst.
+    pub fn set_selection(&mut self, site: &str, selection: rustdar_radar::chunks::CutSelection) {
+        if let Some(feed) = self.feeds.get_mut(site)
+            && let Some(poller) = feed.poller.as_mut()
+        {
+            poller.set_selection(selection);
+        }
+    }
+
     /// Take the poller regardless of the interval, for a notification-driven
     /// fetch.
     ///

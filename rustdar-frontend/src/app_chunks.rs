@@ -51,6 +51,8 @@ impl super::App {
 
         for site in live {
             self.chunk_feeds.ensure(&site);
+            let selection = self.cut_selection_for(&site);
+            self.chunk_feeds.set_selection(&site, selection);
             let Some(mut poller) = self.chunk_feeds.take_for_round(&site) else {
                 continue;
             };
@@ -73,6 +75,52 @@ impl super::App {
                 crate::app::notify_redraw(&window);
             });
         }
+    }
+
+    /// What this site's feed needs to download.
+    ///
+    /// The tilts its panes actually render — **unless** anything on the site
+    /// shows a product that integrates the whole volume, in which case every cut
+    /// is needed and the answer is `All`.
+    ///
+    /// That exception is the whole safety of selective download, and it is not
+    /// optional: `compute_echo_tops` walks only the tilts present and clamps each
+    /// column to the topmost one, and `render_nrot_to_image` fits its wind
+    /// profile from every velocity tilt when no external profile resolves. Both
+    /// would read a volume that skipped cuts as a complete short one and produce
+    /// a plausible, low, wrong answer with no error and no NaN to notice.
+    ///
+    /// A pane with no resolvable render params contributes nothing rather than
+    /// forcing `All`: it is showing nothing, so it needs nothing.
+    fn cut_selection_for(&self, site: &str) -> rustdar_radar::chunks::CutSelection {
+        use rustdar_radar::chunks::CutSelection;
+
+        let mut tilts: Vec<f32> = Vec::new();
+        for idx in 0..self.gui.pane_count() {
+            if self.gui.pane(idx).is_none_or(|p| p.site != site) {
+                continue;
+            }
+            let Some((product, elevation)) = self.gui.get_rendering_params_for_pane(idx) else {
+                continue;
+            };
+            if crate::render_dispatch::needs_whole_volume(product) {
+                return CutSelection::All;
+            }
+            // Level III panes draw from `level3_data` and say nothing about which
+            // Level II cuts are needed.
+            if product.is_level3() {
+                continue;
+            }
+            if !tilts.iter().any(|t| (t - elevation).abs() < 0.05) {
+                tilts.push(elevation);
+            }
+        }
+        // Nothing renderable on this site yet — take everything until something
+        // says otherwise, so a site that has only just loaded is never starved.
+        if tilts.is_empty() {
+            return CutSelection::All;
+        }
+        CutSelection::Tilts(tilts)
     }
 
     /// Keep the notification subscriptions matched to the live sites, and turn
@@ -393,5 +441,90 @@ mod tests {
             at("self.poll_data_channels(") < at("self.setup_egui_frame("),
             "the frame is laid out before the chunk drain has applied anything"
         );
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::super::App;
+    use super::super::tests::headless;
+    use crate::platform_double::TestBridge;
+    use rustdar_radar::chunks::CutSelection;
+    use rustdar_radar::types::{RadarProduct, ScanInfo};
+
+    /// One live pane on KTLX showing `product`, snapping within `available`.
+    fn app_showing(product: RadarProduct, selected: f32, available: &[f32]) -> App {
+        let mut app = headless(TestBridge::desktop());
+        let pane = app.gui.pane_mut(0).unwrap();
+        pane.site = "KTLX".to_string();
+        pane.viewing_live = true;
+        pane.selected_product = product;
+        pane.selected_elevation = selected;
+        let mut product_elevations = std::collections::HashMap::new();
+        product_elevations.insert(product, available.to_vec());
+        pane.scan_info = Some(ScanInfo {
+            site: rustdar_radar::sites::RadarSite {
+                name: "KTLX",
+                lat: 35.3,
+                lon: -97.3,
+                elev: None,
+            },
+            timestamp: chrono::NaiveDate::from_ymd_opt(2026, 7, 28)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            vcp_number: 212,
+            available_products: vec![product],
+            product_elevations,
+            status: String::new(),
+        });
+        app
+    }
+
+    /// The ordinary case, and where the traffic saving comes from.
+    #[test]
+    fn a_single_tilt_pane_asks_for_only_its_tilt() {
+        let app = app_showing(RadarProduct::Reflectivity, 0.5, &[0.5, 1.5, 4.0]);
+        assert_eq!(
+            app.cut_selection_for("KTLX"),
+            CutSelection::Tilts(vec![0.5])
+        );
+    }
+
+    /// The guard the whole feature's safety rests on. `compute_echo_tops` clamps
+    /// every column to the topmost tilt present, so a volume that skipped cuts
+    /// would give it a plausible, low, wrong answer with nothing to notice.
+    #[test]
+    fn a_volumetric_pane_forces_the_whole_volume() {
+        let app = app_showing(RadarProduct::EchoTopsInterpolated, 0.5, &[0.5]);
+        assert_eq!(app.cut_selection_for("KTLX"), CutSelection::All);
+    }
+
+    /// NROT fits its wind profile from every velocity tilt when no external
+    /// profile resolves, so it is volume-wide for the same reason.
+    #[test]
+    fn an_nrot_pane_forces_the_whole_volume() {
+        let app = app_showing(RadarProduct::NormalizedRotation, 0.5, &[0.5]);
+        assert_eq!(app.cut_selection_for("KTLX"), CutSelection::All);
+    }
+
+    // Not tested here: that one volumetric pane among several outweighs the
+    // rest. It needs a multi-pane `Gui`, and `set_pane_count_for_test` is
+    // `#[cfg(test)]` inside `rustdar-egui` so it does not exist for this crate.
+    // The two single-pane tests above cover both branches of the decision, and
+    // the loop returns `All` on the first volumetric pane it meets.
+
+    /// A site with nothing renderable takes everything rather than starving.
+    #[test]
+    fn a_site_with_nothing_to_render_asks_for_everything() {
+        let app = headless(TestBridge::desktop());
+        assert_eq!(app.cut_selection_for("KTLX"), CutSelection::All);
+    }
+
+    /// Another site's panes never narrow this one's feed.
+    #[test]
+    fn the_selection_is_per_site() {
+        let app = app_showing(RadarProduct::Reflectivity, 0.5, &[0.5, 4.0]);
+        assert_eq!(app.cut_selection_for("KOUN"), CutSelection::All);
     }
 }
