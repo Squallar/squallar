@@ -341,18 +341,18 @@ pub use crate::dpprep::ReflCappi;
 pub(crate) const NUM_CLASSES: usize = 14;
 const U0: usize = 0;
 const U1: usize = 1;
-const RA: usize = 2;
-const HR: usize = 3;
-const RH: usize = 4;
-const BD: usize = 5;
-const BI: usize = 6;
-const GC: usize = 7;
-const DS: usize = 8;
-const WS: usize = 9;
-const IC: usize = 10;
-const GR: usize = 11;
-const UK: usize = 12;
-const NE: usize = 13;
+pub(crate) const RA: usize = 2;
+pub(crate) const HR: usize = 3;
+pub(crate) const RH: usize = 4;
+pub(crate) const BD: usize = 5;
+pub(crate) const BI: usize = 6;
+pub(crate) const GC: usize = 7;
+pub(crate) const DS: usize = 8;
+pub(crate) const WS: usize = 9;
+pub(crate) const IC: usize = 10;
+pub(crate) const GR: usize = 11;
+pub(crate) const UK: usize = 12;
+pub(crate) const NE: usize = 13;
 
 /// `dualpol8bit.c`'s `Class_external`: internal class index → the product's
 /// data level (class codes scaled by 10). U0/U1/NE map to 0, which the
@@ -364,7 +364,7 @@ pub const CLASS_EXTERNAL: [f32; NUM_CLASSES] = [
 /// The C sentinel for a missing value (`HCA_NO_DATA`). The classification
 /// arithmetic runs in this sentinel domain, exactly as the source does —
 /// a missing ZDR *is* −10⁵ dB against every threshold and membership edge.
-const NO_DATA: f64 = -1.0e5;
+pub(crate) const NO_DATA: f64 = -1.0e5;
 
 /// `MINI_LKTP`: LKdp for KDP below 0.001 °/km.
 const MINI_LKTP: f64 = -40.0;
@@ -809,16 +809,21 @@ impl MeltingLayer {
 /// The four beam/melting-layer intersection ranges of one radial, as DP bin
 /// numbers (`Hca_beamMLintersection`).
 #[derive(Debug, Clone, Copy)]
-struct MlBins {
+pub(crate) struct MlBins {
     bb: i64,
     b: i64,
     t: i64,
-    tt: i64,
+    pub(crate) tt: i64,
 }
 
 /// `Hca_beamMLintersection`: where the 1° beam's bottom edge, centre and
 /// top edge cross the layer, on the 7708.91-km effective Earth.
-fn beam_ml_intersection(elev_deg: f64, az: usize, bin_size_km: f64, ml: &MeltingLayer) -> MlBins {
+pub(crate) fn beam_ml_intersection(
+    elev_deg: f64,
+    az: usize,
+    bin_size_km: f64,
+    ml: &MeltingLayer,
+) -> MlBins {
     let half_bw = (BEAM_WIDTH_DEG / 2.0).to_radians();
     let e = elev_deg.to_radians();
     let ae = BEAM_ML_AE_KM;
@@ -1018,25 +1023,28 @@ fn break_tie(bin: i64, ml: MlBins, h_class: usize, runner_up: usize) -> usize {
 
 /// One recombined radial's HCA inputs, in the C sentinel domain
 /// ([`NO_DATA`] for missing) after the documented moment transport.
-struct Fields {
-    az: f64,
-    elev: f64,
-    hatt: bool,
-    n: usize,
-    dg: f64,
+pub(crate) struct Fields {
+    pub(crate) az: f64,
+    pub(crate) elev: f64,
+    pub(crate) hatt: bool,
+    pub(crate) n: usize,
+    pub(crate) dg: f64,
     /// `DSMZ` (z_prcd), `DSNR`, `DSDZ` — the z-gate fields sampled at each
     /// DP gate.
-    smz: Vec<f64>,
-    snr: Vec<f64>,
-    sdz: Vec<f64>,
-    zdr: Vec<f64>,
-    rho: Vec<f64>,
-    kdp: Vec<f64>,
-    phi: Vec<f64>,
-    sdp: Vec<f64>,
-    smv: Vec<f64>,
+    pub(crate) smz: Vec<f64>,
+    pub(crate) snr: Vec<f64>,
+    pub(crate) sdz: Vec<f64>,
+    pub(crate) zdr: Vec<f64>,
+    pub(crate) rho: Vec<f64>,
+    pub(crate) kdp: Vec<f64>,
+    pub(crate) phi: Vec<f64>,
+    pub(crate) sdp: Vec<f64>,
+    pub(crate) smv: Vec<f64>,
+    /// The cleaned met signal per gate (`DMET`), NaN when the legacy flag
+    /// ran instead — the hybrid-scan compositor's usability check reads it.
+    pub(crate) met: Vec<f64>,
     /// The six quality indices per gate, in fuzzy-logic input order.
-    q: Vec<[f64; 6]>,
+    pub(crate) q: Vec<[f64; 6]>,
 }
 
 /// One value through an 8-bit moment (`Add_moment` then
@@ -1066,7 +1074,7 @@ fn sentinel(v: f64) -> f64 {
 /// unfold filter come from the cleaned met signal — plus the CAPPI rescue
 /// on ≥ 1° radials when a volume CAPPI is supplied; without it, the legacy
 /// (metsignal-OFF) construction [`crate::kdp`] validated.
-fn radial_fields(
+pub(crate) fn radial_fields(
     c: &DpCombined,
     init_fdp: f64,
     dbz0: Option<f64>,
@@ -1246,6 +1254,21 @@ fn radial_fields(
         phi: Vec::with_capacity(n),
         sdp: Vec::with_capacity(n),
         smv: Vec::with_capacity(n),
+        // The DMET moment (8-bit, scale 2 / offset 50) — what qperate's
+        // usability check reads downstream; NaN when the legacy flag ran.
+        met: match &met {
+            Some(m) => m
+                .iter()
+                .map(|&v| {
+                    if quantize {
+                        transport8(v, (2.0, 50.0))
+                    } else {
+                        v
+                    }
+                })
+                .collect(),
+            None => vec![f64::NAN; n],
+        },
         q: Vec::with_capacity(n),
     };
     for i in 0..n {
@@ -1437,7 +1460,7 @@ fn classify_gate(f: &Fields, bin: usize, ml: MlBins, tw0_km_arl: f64) -> usize {
 }
 
 /// One radial's classes.
-fn classify_radial(f: &Fields, ml: &MeltingLayer, tw0_km_arl: f64) -> Vec<usize> {
+pub(crate) fn classify_radial(f: &Fields, ml: &MeltingLayer, tw0_km_arl: f64) -> Vec<usize> {
     let az = (f.az.rem_euclid(360.0)) as usize % 360;
     let bins = beam_ml_intersection(f.elev, az, f.dg, ml);
     (0..f.n)
@@ -1789,7 +1812,11 @@ impl DerivedHca {
 /// The `init_fdp` the pipeline seeds with — the same resolution the KDP
 /// chain validated: the RDA header value, else the volume estimate; the
 /// `isdp_apply = YES` variant prefers the estimate.
-fn resolve_init_fdp(params: &KdpParams, combined: &[DpCombined], estimated: bool) -> f64 {
+pub(crate) fn resolve_init_fdp(
+    params: &KdpParams,
+    combined: &[DpCombined],
+    estimated: bool,
+) -> f64 {
     let estimate = || {
         let mut queue: Vec<f64> = Vec::new();
         for c in combined {
@@ -3139,6 +3166,7 @@ mod tests {
             phi: vec![phi],
             sdp: vec![sdp],
             smv: vec![smv],
+            met: vec![f64::NAN],
             q: vec![quality_indices(phi, rho, smz, snr, true)],
         }
     }
@@ -3687,6 +3715,7 @@ mod tests {
             phi: vec![60.0; n],
             sdp: vec![5.0; n],
             smv: vec![NO_DATA; n],
+            met: vec![f64::NAN; n],
             q: vec![q; n],
         }
     }

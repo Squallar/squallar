@@ -199,9 +199,14 @@ impl ProductDescriptionBlock {
     /// decode 360 × 1200 gates to ~1.0 km per gate. (The remaining siblings
     /// 159/161 are not consumed anywhere in this workspace; they can join
     /// the table when a live packet of each has been checked the same way.)
+    /// Product 177 (Hybrid Hydrometeor Classification) writes a literal
+    /// `1000.` into that halfword (`hhc8bit.c`'s
+    /// `RPGC_digital_radial_data_hdr` call in the CODE B21 source), so its
+    /// 920 × 0.25 km packet also decodes to ~1.0 km per gate; confirmed on
+    /// live `HHC` objects by the HHC twin harness.
     pub fn range_gate_km(&self) -> Option<f64> {
         match self.product_code {
-            99 | 154 | 163 | 165 => Some(0.25),
+            99 | 154 | 163 | 165 | 177 => Some(0.25),
             _ => None,
         }
     }
@@ -498,7 +503,8 @@ mod tests {
         }
         assert_eq!(pdb(163, [0; 16], [0; 7]).range_gate_km(), Some(0.25));
         assert_eq!(pdb(165, [0; 16], [0; 7]).range_gate_km(), Some(0.25));
-        for code in [56, 94, 134, 135, 176, 177] {
+        assert_eq!(pdb(177, [0; 16], [0; 7]).range_gate_km(), Some(0.25));
+        for code in [56, 94, 134, 135, 176] {
             assert_eq!(
                 pdb(code, [0; 16], [0; 7]).range_gate_km(),
                 None,
