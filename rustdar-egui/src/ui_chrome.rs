@@ -484,14 +484,14 @@ fn render_auto_poll_status(
         // countdown to something that will not fire.
         match chunks.tilt {
             Some(tilt) => format!(
-                "\u{26a1} Live \u{2014} {:.1}\u{b0} {}",
+                "\u{26a1} Live - {:.1}\u{b0} {}",
                 tilt.elevation,
                 describe_age(tilt.data_age_secs)
             ),
-            None => "\u{26a1} Live \u{2014} waiting for this tilt".to_owned(),
+            None => "\u{26a1} Live - waiting for this tilt".to_owned(),
         }
     } else if chunks.retired {
-        format!("\u{26a0} Live \u{2014} real-time unavailable, {archive}")
+        format!("\u{26a0} Live - real-time unavailable, {archive}")
     } else {
         format!("Auto-poll ({archive})")
     };

@@ -1076,12 +1076,12 @@ impl HrrrGridData {
         Some(match self.value_range {
             None => format!("\u{26a0} {name}: no usable values in the grid"),
             Some((lo, hi)) if lo == hi => format!(
-                "\u{26a0} {name} is uniformly {} across all {} points \u{2014} nothing to draw",
+                "\u{26a0} {name} is uniformly {} across all {} points - nothing to draw",
                 self.parameter.format_magnitude(lo),
                 self.values.len(),
             ),
             Some((lo, hi)) => format!(
-                "\u{26a0} {name} never reaches the lowest colour threshold (range {} to {}) \u{2014} nothing to draw",
+                "\u{26a0} {name} never reaches the lowest colour threshold (range {} to {}) - nothing to draw",
                 self.parameter.format_magnitude(lo),
                 self.parameter.format_magnitude(hi),
             ),
