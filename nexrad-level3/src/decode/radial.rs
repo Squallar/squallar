@@ -474,9 +474,15 @@ fn decode_xdr_radial_component(
         1.0
     };
 
-    // Metres to range bins.
+    // Metres to range bins. `first_gate` is the range of the **centre** of
+    // the first bin (the generic radial component's own definition — the
+    // RPG's `buildDPR_Packet28.c` writes `first_range = 125.0` for a
+    // 250 m bin, half a bin), while `first_range_bin` is a bin *index*
+    // whose centre sits at `(index + 0.5) · gate_width`. Converting one to
+    // the other therefore drops the half bin; rounding the raw ratio
+    // instead put every gate of a half-bin product one bin too far out.
     let first_range_bin = if gate_width > 0.0 {
-        (first_gate / gate_width).round() as i16
+        (((first_gate / gate_width) - 0.5).max(0.0)).round() as i16
     } else {
         0
     };
@@ -549,6 +555,50 @@ mod tests {
         let len = (d.len() - 8) as u32;
         d[4..8].copy_from_slice(&len.to_be_bytes());
         d
+    }
+
+    /// The generic radial component declares `first_gate` as the range of
+    /// the **centre** of bin 0, while `first_range_bin` is a bin index whose
+    /// centre sits at `(index + 0.5) · gate_width`. The RPG's DPR
+    /// (`buildDPR_Packet28.c`) writes 125 m for a 250 m bin — half a bin —
+    /// which has to decode as index 0, not the 1 a raw `round` gives.
+    #[test]
+    fn a_half_bin_first_gate_decodes_as_bin_zero() {
+        for (gate_width, first_gate, want) in [
+            (250.0f32, 125.0f32, 0i16), // DPR: half a bin
+            (1000.0, 500.0, 0),         // 1 km bins, half a bin
+            (250.0, 375.0, 1),          // one whole bin out
+            (250.0, 625.0, 2),
+            (1000.0, 0.0, 0), // degenerate: clamps at the first bin
+        ] {
+            let mut d = xdr_radial_component_prelude();
+            // Patch the gate_width / first_gate the prelude wrote.
+            let n = d.len();
+            d[n - 16..n - 12].copy_from_slice(&gate_width.to_bits().to_be_bytes());
+            d[n - 12..n - 8].copy_from_slice(&first_gate.to_bits().to_be_bytes());
+            push_i32(&mut d, 1); // one radial
+            push_f32(&mut d, 0.0); // azimuth
+            push_f32(&mut d, 0.0); // elevation
+            push_f32(&mut d, 1.0); // width
+            push_i32(&mut d, 1); // n_bins
+            push_empty_string(&mut d); // attrs
+            push_i32(&mut d, 1); // array length
+            push_i32(&mut d, 7); // one gate
+            let Ok((packet, _)) = decode_generic_radial_packet(&finish(d), 0) else {
+                panic!("gate_width {gate_width} first_gate {first_gate} must decode");
+            };
+            assert_eq!(
+                packet.first_range_bin, want,
+                "gate_width {gate_width} first_gate {first_gate}",
+            );
+            // And the bin the model reports covers the declared centre.
+            let centre = (f64::from(packet.first_range_bin) + 0.5) * packet.gate_interval_km();
+            assert!(
+                (centre - f64::from(first_gate) / 1000.0).abs() <= packet.gate_interval_km() * 0.5,
+                "bin {} centre {centre} km does not cover the declared {first_gate} m",
+                packet.first_range_bin,
+            );
+        }
     }
 
     /// -1 read as `i32` and cast straight to `usize` sign-extends to ~2^64,
