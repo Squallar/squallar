@@ -881,6 +881,9 @@ impl super::App {
         let storm_motion = (product == rustdar_radar::types::RadarProduct::StormRelativeVelocity)
             .then(|| self.render.storm_motion_override_kt())
             .flatten();
+        // The environmental heights ride the same way for the hail pair,
+        // keyed by the loop's own site.
+        let env_heights = self.render.env_heights_km_msl_for(product, &target.site);
         let job = match rustdar_radar::render_input::RenderInput::extract(
             &scan_data,
             snapped,
@@ -888,6 +891,7 @@ impl super::App {
             lat,
             lon,
             storm_motion,
+            env_heights,
         ) {
             Some(input) => crate::offload::Job::Described(crate::offload::JobRequest::Radar {
                 input: Box::new(input),

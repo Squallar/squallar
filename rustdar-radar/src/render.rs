@@ -556,7 +556,15 @@ pub fn render_radar_to_image(
     radar_lat: f64,
     radar_lon: f64,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
-    render_radar_to_image_full(data, elevation_angle, product, radar_lat, radar_lon, None)
+    render_radar_to_image_full(
+        data,
+        elevation_angle,
+        product,
+        radar_lat,
+        radar_lon,
+        None,
+        None,
+    )
 }
 
 /// [`render_radar_to_image`] from a [`RenderInput`] instead of a `Scan`.
@@ -578,13 +586,17 @@ pub fn render_from(input: &crate::render_input::RenderInput) -> Option<(Vec<u8>,
         input.radar_lat(),
         input.radar_lon(),
         input.storm_motion_override(),
+        input.env_heights_km_msl(),
     )
 }
 
-/// [`render_radar_to_image`] plus the storm motion override, in knots and
-/// degrees-from — the one render parameter only storm-relative velocity
-/// reads. `None` is "no override": SRV then applies the Bunkers right-mover
-/// from the volume's own wind profile ([`crate::srv`]).
+/// [`render_radar_to_image`] plus the two render parameters: the storm
+/// motion override, in knots and degrees-from — read by storm-relative
+/// velocity alone; `None` is "no override" and SRV applies the Bunkers
+/// right-mover from the volume's own wind profile ([`crate::srv`]) — and
+/// the environmental 0 °C / −20 °C heights in km MSL, read by the hail pair
+/// alone; `None` there means the hail field is undefined and renders
+/// nothing ([`crate::hail`]).
 ///
 /// The environmental wind profile NROT's and SRV's dealiasers seed from is
 /// not a parameter: it is fit from the volume's own velocity tilts
@@ -598,6 +610,7 @@ pub fn render_radar_to_image_full(
     radar_lat: f64,
     radar_lon: f64,
     storm_motion_override: Option<(f32, f32)>,
+    env_heights_km_msl: Option<(f64, f64)>,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     if product == types::RadarProduct::EchoTopsInterpolated {
         return render_echo_tops_interp_to_image(data, radar_lat, radar_lon);
@@ -605,6 +618,13 @@ pub fn render_radar_to_image_full(
 
     if product == types::RadarProduct::VilDensity {
         return render_vil_density_to_image(data, radar_lat, radar_lon);
+    }
+
+    if matches!(
+        product,
+        types::RadarProduct::ProbabilityOfSevereHail | types::RadarProduct::MaxExpectedHailSize
+    ) {
+        return render_hail_to_image(data, product, radar_lat, radar_lon, env_heights_km_msl);
     }
 
     let radials = find_sweep(data, product, elevation_angle)?;
@@ -961,6 +981,67 @@ pub fn render_vil_density_to_image(
                         gate: r,
                     };
                     proj.render_gate(bufs, &ctx, r as f64 + 0.5, 1.0, *v, from);
+                }
+            });
+        },
+    );
+    Some(output)
+}
+
+/// Render one of the derived hail products ([`crate::hail`]): POSH in %,
+/// or MEHS converted from the field's mm into **inches** — the palette's,
+/// legend's and hover's unit — on a 1° × 1 km polar grid. Tilt-independent:
+/// every elevation request renders the same volume product.
+///
+/// `env_heights_km_msl` is the per-site 0 °C / −20 °C pair
+/// ([`crate::sounding::EnvHeights`], km MSL). **`None` renders nothing** —
+/// `compute_hail` has no field without an environment, and this seam turns
+/// that into the ordinary "no data" answer rather than a zero-filled grid
+/// pretending to be one. The site height that resolves the MSL heights to
+/// the beam's ARL datum comes from the nearest-site table, as the VIL
+/// density render path's does.
+pub fn render_hail_to_image(
+    scan: &Scan,
+    product: types::RadarProduct,
+    radar_lat: f64,
+    radar_lon: f64,
+    env_heights_km_msl: Option<(f64, f64)>,
+) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+    let Some((h0c_km_msl, hm20c_km_msl)) = env_heights_km_msl else {
+        log::info!("{product:?}: no environmental heights — nothing to render");
+        return None;
+    };
+    let env = crate::sounding::EnvHeights {
+        h0c_km_msl,
+        hm20c_km_msl,
+        fetched_at: chrono::Utc::now(),
+    };
+    let radar_height_ft = crate::eet::radar_height_ft_near(radar_lat, radar_lon);
+    let grids = crate::hail::compute_hail(scan, Some(&env), radar_height_ft)?;
+    const MM_PER_IN: f32 = 25.4;
+    let (grid, unit_scale) = match product {
+        types::RadarProduct::MaxExpectedHailSize => (grids.mehs_mm, 1.0 / MM_PER_IN),
+        _ => (grids.posh, 1.0),
+    };
+    let max_range = grid.range_bins as f64;
+    let output = render_with_projection(
+        radar_lat,
+        radar_lon,
+        max_range,
+        product,
+        "Radar",
+        |proj, bufs| {
+            grid.values.par_iter().enumerate().for_each(|(az, row)| {
+                let ctx = RadialContext::new(az as f64 + 0.5, 0.5);
+                for (r, v) in row.iter().enumerate() {
+                    if v.is_nan() {
+                        continue;
+                    }
+                    let from = GateId {
+                        radial: az,
+                        gate: r,
+                    };
+                    proj.render_gate(bufs, &ctx, r as f64 + 0.5, 1.0, *v * unit_scale, from);
                 }
             });
         },

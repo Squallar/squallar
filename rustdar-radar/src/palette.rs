@@ -95,6 +95,20 @@ pub fn get_color_for_value(product: RadarProduct, value: f32) -> (u8, u8, u8, u8
             let (r, g, b) = scale_color(VIL_DENSITY, value);
             (r, g, b, TRANSPARENCY)
         }
+        RadarProduct::ProbabilityOfSevereHail => {
+            if value < 10.0 {
+                return (0, 0, 0, 0);
+            }
+            let (r, g, b) = scale_color(POSH, value);
+            (r, g, b, TRANSPARENCY)
+        }
+        RadarProduct::MaxExpectedHailSize => {
+            if value < 0.25 {
+                return (0, 0, 0, 0);
+            }
+            let (r, g, b) = scale_color(MEHS, value);
+            (r, g, b, TRANSPARENCY)
+        }
         RadarProduct::HydrometeorClassification => {
             if value < 10.0 {
                 return (0, 0, 0, 0);
@@ -359,6 +373,58 @@ static VIL_DENSITY: ColorScale = &(
     true,
 );
 
+/// Probability of Severe Hail (%). Authored NWS/AWIPS-style: **discrete
+/// 10 % steps**, the operational display resolution — the RPG itself rounds
+/// POSH to the nearest 10 % (`a31559.ftn`) and the NWS WDTD "Probability of
+/// Severe Hail" training page describes the product in those steps. 50 % is
+/// where the warm ramp ignites: it is the curve's fixed point (POSH = 50 %
+/// exactly at SHI = WT, Witt et al. 1998 Eq. 9), the paper's nominal
+/// warning-decision level, and the RCM "positive hail" threshold
+/// (`hail_algorithm.h`, `rcm_positive_hail` default 50). Cool colors below,
+/// yellow-through-red above, magenta at the certain-severe top.
+static POSH: ColorScale = &(
+    &[
+        (10.0, (100, 100, 100)), // dispatcher renders < 10 transparent
+        (20.0, (0, 100, 255)),
+        (30.0, (0, 200, 255)),
+        (40.0, (0, 200, 0)),
+        (50.0, (255, 255, 0)), // POSH = 50 at SHI = WT: the decision level
+        (60.0, (255, 200, 0)),
+        (70.0, (255, 150, 0)),
+        (80.0, (255, 0, 0)),
+        (90.0, (200, 0, 0)),
+        (100.0, (255, 0, 255)),
+    ],
+    false,
+);
+
+/// Maximum Expected Hail Size (**inches** — the render seam converts the
+/// derived field's mm, `crate::hail`). Authored as the standard hail-size
+/// ramp in the NWS quarter-inch reporting steps (the RPG rounds MEHS to the
+/// nearest ¼ in, `a31559.ftn`), with the two operational breaks: **1.00 in**
+/// goes green→yellow — the NWS severe-thunderstorm hail criterion (raised
+/// from ¾ in fleet-wide in 2010, NWS Instruction 10-511) — and **2.00 in**
+/// goes red — SPC's "significant severe" hail threshold (Hales 1988's
+/// sig-severe convention). The cell product's own display caps at
+/// "> 4.00 in" (`a31644.ftn`), so the table tops out white at 4.
+static MEHS: ColorScale = &(
+    &[
+        (0.25, (100, 100, 100)), // dispatcher renders < 0.25 transparent
+        (0.5, (0, 100, 255)),
+        (0.75, (0, 200, 255)),
+        (1.0, (0, 200, 0)), // NWS severe criterion (1.00 in, 10-511 / 2010)
+        (1.25, (255, 255, 0)),
+        (1.5, (255, 200, 0)),
+        (1.75, (255, 150, 0)),
+        (2.0, (255, 0, 0)), // SPC significant-severe (2.00 in)
+        (2.5, (200, 0, 0)),
+        (3.0, (255, 0, 255)),
+        (3.5, (200, 0, 200)),
+        (4.0, (255, 255, 255)), // the cell product's "> 4.00" cap
+    ],
+    false,
+);
+
 /// Hydrometeor Classification. Categorical: thresholds are the ICD class
 /// codes, 0 = ND.
 static HHC: ColorScale = &(
@@ -499,6 +565,8 @@ pub fn get_legend_scale(product: RadarProduct) -> LegendScale {
         RadarProduct::EchoTops | RadarProduct::EchoTopsInterpolated => extract_scale(ECHO_TOPS),
         RadarProduct::VerticallyIntegratedLiquid => extract_scale(VIL),
         RadarProduct::VilDensity => extract_scale(VIL_DENSITY),
+        RadarProduct::ProbabilityOfSevereHail => extract_scale(POSH),
+        RadarProduct::MaxExpectedHailSize => extract_scale(MEHS),
         RadarProduct::HydrometeorClassification => extract_scale(HHC),
         RadarProduct::PrecipitationRate => extract_scale(PRECIP_RATE),
         RadarProduct::NormalizedRotation => {
@@ -536,6 +604,8 @@ mod tests {
             RadarProduct::SpecificDifferentialPhase,
             RadarProduct::NormalizedRotation,
             RadarProduct::VilDensity,
+            RadarProduct::ProbabilityOfSevereHail,
+            RadarProduct::MaxExpectedHailSize,
         ];
         for product in products {
             for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {

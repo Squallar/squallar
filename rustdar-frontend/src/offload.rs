@@ -624,6 +624,7 @@ mod tests {
             35.0,
             -97.0,
             None,
+            None,
         )
         .expect("fixture extracts")
         .to_bytes()

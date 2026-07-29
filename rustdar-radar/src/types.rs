@@ -234,6 +234,8 @@ pub enum RadarProduct {
     EchoTopsInterpolated,
     VerticallyIntegratedLiquid,
     VilDensity,
+    ProbabilityOfSevereHail,
+    MaxExpectedHailSize,
     HydrometeorClassification,
     PrecipitationRate,
     NormalizedRotation,
@@ -254,6 +256,8 @@ impl RadarProduct {
             RadarProduct::EchoTopsInterpolated => "eti",
             RadarProduct::VerticallyIntegratedLiquid => "vil",
             RadarProduct::VilDensity => "vild",
+            RadarProduct::ProbabilityOfSevereHail => "posh",
+            RadarProduct::MaxExpectedHailSize => "mehs",
             RadarProduct::HydrometeorClassification => "hhc",
             RadarProduct::PrecipitationRate => "dpr",
             RadarProduct::NormalizedRotation => "nrot",
@@ -274,6 +278,8 @@ impl RadarProduct {
             RadarProduct::EchoTopsInterpolated => "Echo Tops (Interp)",
             RadarProduct::VerticallyIntegratedLiquid => "Vertically Integrated Liquid",
             RadarProduct::VilDensity => "VIL Density",
+            RadarProduct::ProbabilityOfSevereHail => "Prob. of Severe Hail",
+            RadarProduct::MaxExpectedHailSize => "Max Expected Hail Size",
             RadarProduct::HydrometeorClassification => "Hydrometeor Classification",
             RadarProduct::PrecipitationRate => "Precipitation Rate",
             RadarProduct::NormalizedRotation => "Normalized Rotation",
@@ -294,6 +300,8 @@ impl RadarProduct {
             RadarProduct::EchoTopsInterpolated,
             RadarProduct::VerticallyIntegratedLiquid,
             RadarProduct::VilDensity,
+            RadarProduct::ProbabilityOfSevereHail,
+            RadarProduct::MaxExpectedHailSize,
             RadarProduct::HydrometeorClassification,
             RadarProduct::PrecipitationRate,
             RadarProduct::NormalizedRotation,
@@ -316,8 +324,10 @@ impl RadarProduct {
             RadarProduct::EchoTopsInterpolated => 10,
             RadarProduct::VerticallyIntegratedLiquid => 11,
             RadarProduct::VilDensity => 12,
-            RadarProduct::HydrometeorClassification => 13,
-            RadarProduct::PrecipitationRate => 14,
+            RadarProduct::ProbabilityOfSevereHail => 13,
+            RadarProduct::MaxExpectedHailSize => 14,
+            RadarProduct::HydrometeorClassification => 15,
+            RadarProduct::PrecipitationRate => 16,
         }
     }
 
@@ -379,6 +389,8 @@ impl RadarProduct {
             RadarProduct::PrecipitationRate => 13,
             RadarProduct::NormalizedRotation => 14,
             RadarProduct::VilDensity => 15,
+            RadarProduct::ProbabilityOfSevereHail => 16,
+            RadarProduct::MaxExpectedHailSize => 17,
         }
     }
 
@@ -402,6 +414,8 @@ impl RadarProduct {
             13 => RadarProduct::PrecipitationRate,
             14 => RadarProduct::NormalizedRotation,
             15 => RadarProduct::VilDensity,
+            16 => RadarProduct::ProbabilityOfSevereHail,
+            17 => RadarProduct::MaxExpectedHailSize,
             _ => return None,
         };
         debug_assert_eq!(product.wire_code(), code);
@@ -436,6 +450,12 @@ impl RadarProduct {
             // VIL density integrates the whole reflectivity volume twice over
             // (local VIL divided by local echo tops), so it lists the same way.
             RadarProduct::VilDensity => Some(MomentSlot::Reflectivity),
+            // The hail pair integrates the whole reflectivity volume too
+            // (`crate::hail`); the environmental heights it also needs ride
+            // the render parameters, not a moment.
+            RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize => {
+                Some(MomentSlot::Reflectivity)
+            }
             // Level III products. No Level II moment stands behind them.
             RadarProduct::SpecificDifferentialPhase
             | RadarProduct::EchoTops
@@ -479,6 +499,11 @@ impl RadarProduct {
             }
             RadarProduct::VerticallyIntegratedLiquid => format!("VIL: {:.1} kg/m²", value),
             RadarProduct::VilDensity => format!("VIL Density: {:.2} g/m³", value),
+            RadarProduct::ProbabilityOfSevereHail => format!("POSH: {:.0}%", value),
+            // The field computes in mm (`crate::hail`); the render seam
+            // converts to inches, so the value arrives here in inches — the
+            // unit US hail sizes are reported in.
+            RadarProduct::MaxExpectedHailSize => format!("MEHS: {:.2} in", value),
             RadarProduct::HydrometeorClassification => {
                 let class = match value as u16 {
                     0..=9 => "No Data",
@@ -526,6 +551,8 @@ impl RadarProduct {
             }
             RadarProduct::VerticallyIntegratedLiquid => "kg/m\u{00b2}",
             RadarProduct::VilDensity => "g/m\u{00b3}",
+            RadarProduct::ProbabilityOfSevereHail => "%",
+            RadarProduct::MaxExpectedHailSize => "in",
             RadarProduct::HydrometeorClassification => "HHC",
             RadarProduct::PrecipitationRate => prefs.precip_rate.suffix(),
             RadarProduct::NormalizedRotation => "NROT",

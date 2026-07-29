@@ -379,7 +379,19 @@ impl super::App {
                 heights.h0c_km_msl,
                 heights.hm20c_km_msl
             );
-            self.render.env_heights.insert(sounding.site, heights);
+            // Through the setter so hail panes drawn against the old pair —
+            // including the "no pair yet, drew nothing" state a pane sits in
+            // when it was selected before the first sounding landed — are
+            // redrawn against the new one.
+            if self
+                .render
+                .set_env_heights(&sounding.site, heights, &self.gui)
+            {
+                log::info!(
+                    "Env heights moved for {}: hail renders dropped",
+                    sounding.site
+                );
+            }
         }
         while let Ok(l3_resp) = self.channels.level3_receiver.try_recv() {
             if self
@@ -601,6 +613,7 @@ impl super::App {
                         self.render.spawn_level2_render(
                             pane_idx,
                             &params,
+                            &pane_site,
                             Arc::clone(data),
                             self.channels.render_sender.clone(),
                             self.window.clone(),

@@ -61,6 +61,12 @@ pub struct RenderInput {
     /// storm-relative velocity alone; `None` means "no override", which SRV
     /// answers with the Bunkers right-mover from the volume's own profile.
     storm_motion_override: Option<(f32, f32)>,
+    /// The site's environmental 0 °C / −20 °C heights, km MSL
+    /// ([`crate::sounding::EnvHeights`]). Read by the hail pair alone;
+    /// `None` means the hail field is undefined and the render answers
+    /// nothing ([`crate::hail`]) — like the override, there is no "present
+    /// but empty" state to keep distinct.
+    env_heights_km_msl: Option<(f64, f64)>,
     sweeps: Vec<SweepData>,
 }
 
@@ -108,6 +114,7 @@ impl RenderInput {
     /// `None` is returned exactly where [`crate::render`] would have returned
     /// it: a product with no Level II moment behind it, or no sweep in the
     /// requested tilt family carrying one.
+    #[allow(clippy::too_many_arguments)]
     pub fn extract(
         scan: &Scan,
         elevation: f32,
@@ -115,6 +122,7 @@ impl RenderInput {
         radar_lat: f64,
         radar_lon: f64,
         storm_motion_override: Option<(f32, f32)>,
+        env_heights_km_msl: Option<(f64, f64)>,
     ) -> Option<Self> {
         let slot = product.moment_slot()?;
         // `None` for a Level III product: no Level II moment stands behind it,
@@ -130,6 +138,9 @@ impl RenderInput {
             // Same shape: VIL density is local VIL over local echo tops,
             // both integrals of the whole reflectivity volume.
             RadarProduct::VilDensity => true,
+            // And the hail pair: the SHI column integral reads every
+            // reflectivity tilt (`crate::hail`).
+            RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize => true,
             // The selected sweep rasterizes, but `build_wind_profile` fits the
             // dealias-seeding profile from every velocity tilt of the volume.
             //
@@ -167,6 +178,7 @@ impl RenderInput {
             radar_lat,
             radar_lon,
             storm_motion_override,
+            env_heights_km_msl,
             sweeps,
         })
     }
@@ -191,6 +203,12 @@ impl RenderInput {
     /// for "no override" — Bunkers applies.
     pub fn storm_motion_override(&self) -> Option<(f32, f32)> {
         self.storm_motion_override
+    }
+
+    /// The site's environmental 0 °C / −20 °C heights, km MSL, or `None` —
+    /// the hail products then render nothing.
+    pub fn env_heights_km_msl(&self) -> Option<(f64, f64)> {
+        self.env_heights_km_msl
     }
 
     /// A `Scan` holding exactly the extracted sweeps.
@@ -386,7 +404,9 @@ const MAGIC: [u8; 4] = *b"RDRI";
 /// Version 3 removed the wind levels: the dealias-seeding profile is fit from
 /// the payload's own velocity tilts, and the NVW fetch that used to supply
 /// external levels is gone.
-const FORMAT_VERSION: u16 = 3;
+/// Version 4 added the environmental heights between the override and the
+/// sweep count, for the hail products.
+const FORMAT_VERSION: u16 = 4;
 
 impl RenderInput {
     /// Encode for transport. Little-endian throughout; gate blobs are copied
@@ -406,6 +426,15 @@ impl RenderInput {
                 out.push(1);
                 out.extend_from_slice(&speed_kt.to_le_bytes());
                 out.extend_from_slice(&direction_deg.to_le_bytes());
+            }
+        }
+
+        match self.env_heights_km_msl {
+            None => out.push(0),
+            Some((h0c, hm20c)) => {
+                out.push(1);
+                out.extend_from_slice(&h0c.to_le_bytes());
+                out.extend_from_slice(&hm20c.to_le_bytes());
             }
         }
 
@@ -465,6 +494,12 @@ impl RenderInput {
             _ => return None,
         };
 
+        let env_heights_km_msl = match r.u8()? {
+            0 => None,
+            1 => Some((r.f64()?, r.f64()?)),
+            _ => return None,
+        };
+
         let sweep_count = r.u32()?;
         // A sweep costs at least its own header, so this bounds the count
         // against what is actually left rather than trusting it.
@@ -520,6 +555,7 @@ impl RenderInput {
             radar_lat,
             radar_lon,
             storm_motion_override,
+            env_heights_km_msl,
             sweeps,
         })
     }
@@ -528,6 +564,11 @@ impl RenderInput {
         let header = 4 + 2 + 2 + 4 + 8 + 8;
         let motion = 1 + if self.storm_motion_override.is_some() {
             8
+        } else {
+            0
+        };
+        let env = 1 + if self.env_heights_km_msl.is_some() {
+            16
         } else {
             0
         };
@@ -542,7 +583,7 @@ impl RenderInput {
                     .sum::<usize>()
             })
             .sum();
-        header + motion + 4 + sweeps
+        header + motion + env + 4 + sweeps
     }
 }
 
@@ -723,6 +764,17 @@ mod tests {
         (product == RadarProduct::StormRelativeVelocity).then_some((30.0, 240.0))
     }
 
+    /// The environmental heights a hail render carries — only the hail pair
+    /// reads them, and without a pair those products render nothing at all.
+    /// 2 / 4 km MSL sits the fixture's strong low tilt across the ramp.
+    fn env_for(product: RadarProduct) -> Option<(f64, f64)> {
+        matches!(
+            product,
+            RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize
+        )
+        .then_some((2.0, 4.0))
+    }
+
     /// The acceptance criterion for moving rasterization into a worker: the
     /// payload path and the whole-volume path produce the same frame, for every
     /// product shape — one sweep, velocity-derived, and whole-volume.
@@ -736,12 +788,15 @@ mod tests {
             RadarProduct::StormRelativeVelocity,
             RadarProduct::EchoTopsInterpolated,
             RadarProduct::VilDensity,
+            RadarProduct::ProbabilityOfSevereHail,
+            RadarProduct::MaxExpectedHailSize,
         ] {
             let over = override_for(product);
+            let env = env_for(product);
             let direct =
-                crate::render::render_radar_to_image_full(&scan, 0.5, product, LAT, LON, over)
+                crate::render::render_radar_to_image_full(&scan, 0.5, product, LAT, LON, over, env)
                     .unwrap();
-            let input = RenderInput::extract(&scan, 0.5, product, LAT, LON, over).unwrap();
+            let input = RenderInput::extract(&scan, 0.5, product, LAT, LON, over, env).unwrap();
             let viaformat = render_from(&input).unwrap();
 
             assert!(
@@ -764,9 +819,19 @@ mod tests {
             RadarProduct::StormRelativeVelocity,
             RadarProduct::EchoTopsInterpolated,
             RadarProduct::VilDensity,
+            RadarProduct::ProbabilityOfSevereHail,
+            RadarProduct::MaxExpectedHailSize,
         ] {
-            let input =
-                RenderInput::extract(&scan, 0.5, product, LAT, LON, override_for(product)).unwrap();
+            let input = RenderInput::extract(
+                &scan,
+                0.5,
+                product,
+                LAT,
+                LON,
+                override_for(product),
+                env_for(product),
+            )
+            .unwrap();
             let decoded = RenderInput::from_bytes(&input.to_bytes())
                 .unwrap_or_else(|| panic!("{product:?} payload did not decode"));
             assert_eq!(input, decoded, "{product:?} payload changed in transit");
@@ -774,6 +839,11 @@ mod tests {
                 decoded.storm_motion_override(),
                 override_for(product),
                 "{product:?}: the override must survive the wire",
+            );
+            assert_eq!(
+                decoded.env_heights_km_msl(),
+                env_for(product),
+                "{product:?}: the environment must survive the wire",
             );
             assert_same_frame(
                 &render_from(&input).unwrap(),
@@ -796,6 +866,7 @@ mod tests {
             LAT,
             LON,
             Some((30.0, 240.0)),
+            None,
         )
         .unwrap();
         assert_eq!(input.sweeps.len(), 2, "both velocity tilts travel");
@@ -810,6 +881,7 @@ mod tests {
             LAT,
             LON,
             Some((30.0, 60.0)),
+            None,
         )
         .unwrap();
         let a = render_from(&input).unwrap();
@@ -824,7 +896,7 @@ mod tests {
     fn the_encoded_length_estimate_is_exact() {
         let scan = volume();
         for product in [RadarProduct::Reflectivity, RadarProduct::NormalizedRotation] {
-            let input = RenderInput::extract(&scan, 0.5, product, LAT, LON, None).unwrap();
+            let input = RenderInput::extract(&scan, 0.5, product, LAT, LON, None, None).unwrap();
             assert_eq!(input.encoded_len(), input.to_bytes().len(), "{product:?}");
         }
     }
@@ -839,7 +911,8 @@ mod tests {
             vec![sweep(0.5, Some(&strong_refl), Some(&shear))],
         );
         let input =
-            RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None).unwrap();
+            RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None, None)
+                .unwrap();
         let moment = input.sweeps[0].radials[0].moment.as_ref().unwrap();
         assert_eq!(moment.scale, REFL_SCALE);
         assert_eq!(moment.offset, REFL_OFFSET);
@@ -856,7 +929,8 @@ mod tests {
     fn a_plain_product_carries_one_sweep() {
         let scan = volume();
         let input =
-            RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None).unwrap();
+            RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None, None)
+                .unwrap();
         assert_eq!(input.sweeps.len(), 1);
         assert_eq!(input.sweeps[0].radials.len(), RADIALS);
     }
@@ -867,9 +941,16 @@ mod tests {
     #[test]
     fn nrot_carries_every_velocity_tilt() {
         let scan = volume();
-        let input =
-            RenderInput::extract(&scan, 0.5, RadarProduct::NormalizedRotation, LAT, LON, None)
-                .unwrap();
+        let input = RenderInput::extract(
+            &scan,
+            0.5,
+            RadarProduct::NormalizedRotation,
+            LAT,
+            LON,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(input.sweeps.len(), 2, "both velocity tilts travel");
     }
 
@@ -885,6 +966,7 @@ mod tests {
             RadarProduct::EchoTopsInterpolated,
             LAT,
             LON,
+            None,
             None,
         )
         .unwrap();
@@ -912,7 +994,8 @@ mod tests {
                 RadarProduct::HydrometeorClassification,
                 LAT,
                 LON,
-                None
+                None,
+                None,
             )
             .is_none()
         );
@@ -923,11 +1006,47 @@ mod tests {
                 RadarProduct::HydrometeorClassification,
                 LAT,
                 LON,
-                None
+                None,
+                None,
             )
             .is_none(),
             "the payload and the renderer must refuse the same requests"
         );
+    }
+
+    /// The hail pair without an environment: the payload still extracts —
+    /// the sweeps and the request are valid — but both render paths answer
+    /// nothing, the explicit "undefined field" seam (`crate::hail`), never a
+    /// zero-filled grid. The same payload with an environment paints.
+    #[test]
+    fn hail_without_an_environment_renders_nothing_on_both_paths() {
+        let scan = volume();
+        for product in [
+            RadarProduct::ProbabilityOfSevereHail,
+            RadarProduct::MaxExpectedHailSize,
+        ] {
+            let input = RenderInput::extract(&scan, 0.5, product, LAT, LON, None, None).unwrap();
+            assert_eq!(input.env_heights_km_msl(), None);
+            assert!(
+                render_from(&input).is_none(),
+                "{product:?} rendered without an environment"
+            );
+            assert!(
+                crate::render::render_radar_to_image_full(
+                    &scan, 0.5, product, LAT, LON, None, None,
+                )
+                .is_none(),
+                "{product:?}: the payload and the renderer must refuse alike"
+            );
+
+            let with = RenderInput::extract(&scan, 0.5, product, LAT, LON, None, Some((2.0, 4.0)))
+                .unwrap();
+            let frame = render_from(&with).unwrap();
+            assert!(
+                painted(&frame) > 1_000,
+                "{product:?} with an environment must paint"
+            );
+        }
     }
 
     /// The bytes arrive off a message port. Every malformed shape has to be a
@@ -935,9 +1054,10 @@ mod tests {
     #[test]
     fn a_malformed_payload_is_refused_rather_than_misread() {
         let scan = volume();
-        let good = RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None)
-            .unwrap()
-            .to_bytes();
+        let good =
+            RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None, None)
+                .unwrap()
+                .to_bytes();
 
         assert!(RenderInput::from_bytes(&[]).is_none(), "empty");
         assert!(RenderInput::from_bytes(b"nope").is_none(), "wrong magic");
@@ -972,12 +1092,12 @@ mod tests {
     fn an_absurd_length_does_not_reach_an_allocation() {
         let scan = volume();
         let mut bytes =
-            RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None)
+            RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None, None)
                 .unwrap()
                 .to_bytes();
         // The sweep count sits directly after the header and the
-        // absent-override flag byte.
-        let at = 4 + 2 + 2 + 4 + 8 + 8 + 1;
+        // absent-override and absent-environment flag bytes.
+        let at = 4 + 2 + 2 + 4 + 8 + 8 + 1 + 1;
         bytes[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(RenderInput::from_bytes(&bytes).is_none());
     }
@@ -1011,6 +1131,8 @@ mod tests {
             RadarProduct::PrecipitationRate,
             RadarProduct::NormalizedRotation,
             RadarProduct::VilDensity,
+            RadarProduct::ProbabilityOfSevereHail,
+            RadarProduct::MaxExpectedHailSize,
         ];
         let mut seen = std::collections::HashSet::new();
         for product in products {

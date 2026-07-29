@@ -215,13 +215,19 @@ impl RenderCache {
 /// Mirrors the `whole_volume` branch in `RenderInput::extract`, which is what
 /// actually decides how much of the `Scan` travels: `EchoTopsInterpolated`
 /// integrates every reflectivity tilt, and `NormalizedRotation` collects every
-/// velocity tilt for its wind-profile fit. Both would read a volume still
+/// velocity tilt for its wind-profile fit. `VilDensity` and the hail pair
+/// integrate every reflectivity tilt the way echo tops does — the hail SHI
+/// column reads the same local VIL machinery. All would read a volume still
 /// being assembled as a complete short one — `compute_echo_tops` clamps every
 /// column to the topmost tilt present, with no error and no NaN to notice.
 pub fn needs_whole_volume(product: RadarProduct) -> bool {
     matches!(
         product,
-        RadarProduct::EchoTopsInterpolated | RadarProduct::NormalizedRotation
+        RadarProduct::EchoTopsInterpolated
+            | RadarProduct::NormalizedRotation
+            | RadarProduct::VilDensity
+            | RadarProduct::ProbabilityOfSevereHail
+            | RadarProduct::MaxExpectedHailSize
     )
 }
 
@@ -357,6 +363,52 @@ impl RenderDispatcher {
         }
         self.render_cache
             .retain(|(_site, product, _elev)| *product != RadarProduct::StormRelativeVelocity);
+        true
+    }
+
+    /// Record a site's environmental heights and, if the pair actually moved,
+    /// drop that site's hail renders — the per-site counterpart of
+    /// [`set_storm_motion_override`](Self::set_storm_motion_override), for the
+    /// other render parameter that is not part of the cache key. Written by
+    /// the sounding drain in `app_render`; the field it writes is the same one
+    /// [`env_heights_km_msl_for`](Self::env_heights_km_msl_for) reads into the
+    /// render parameters, so the environment a pane is invalidated for cannot
+    /// differ from the one it is redrawn with.
+    ///
+    /// An unchanged pair still refreshes the entry — that restarts the TTL the
+    /// poll's refetch gate reads — but invalidates nothing: soundings refetch
+    /// on a timer and normally land identical, and redrawing every hail pane
+    /// each time would repeat hourly for no visible change.
+    ///
+    /// Returns whether anything was invalidated.
+    pub fn set_env_heights(
+        &mut self,
+        site: &str,
+        heights: rustdar_radar::sounding::EnvHeights,
+        gui: &rustdar_egui::Gui,
+    ) -> bool {
+        let hail = |p: RadarProduct| {
+            matches!(
+                p,
+                RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize
+            )
+        };
+        let unchanged = self.env_heights.get(site).is_some_and(|old| {
+            old.h0c_km_msl == heights.h0c_km_msl && old.hm20c_km_msl == heights.hm20c_km_msl
+        });
+        self.env_heights.insert(site.to_string(), heights);
+        if unchanged {
+            return false;
+        }
+        for (idx, prs) in self.pane_render.iter_mut().enumerate() {
+            if gui.pane(idx).is_some_and(|p| p.site == site)
+                && prs.last_rendered.is_some_and(|(p, _)| hail(p))
+            {
+                prs.last_rendered = None;
+            }
+        }
+        self.render_cache
+            .retain(|(s, product, _elev)| s != site || !hail(*product));
         true
     }
 
@@ -635,6 +687,33 @@ impl RenderDispatcher {
             .map(|s| (s.motion.speed_kt, s.motion.direction_deg))
     }
 
+    /// The environmental heights a Level II render's parameters carry: the
+    /// site's `(0 °C, −20 °C)` pair in km MSL for the hail products, `None`
+    /// for every other product — and `None` when no sounding has landed,
+    /// which the hail render answers by drawing nothing
+    /// ([`rustdar_radar::hail`]).
+    ///
+    /// Read from [`env_heights`](Self::env_heights), the same map
+    /// [`set_env_heights`](Self::set_env_heights) invalidates on, so the
+    /// environment a pane is invalidated for cannot differ from the one it is
+    /// drawn with.
+    pub(crate) fn env_heights_km_msl_for(
+        &self,
+        product: RadarProduct,
+        site: &str,
+    ) -> Option<(f64, f64)> {
+        matches!(
+            product,
+            RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize
+        )
+        .then(|| {
+            self.env_heights
+                .get(site)
+                .map(|h| (h.h0c_km_msl, h.hm20c_km_msl))
+        })
+        .flatten()
+    }
+
     /// Spawn a Level III render for a pane if applicable.
     /// Returns `true` if a render was spawned.
     ///
@@ -683,11 +762,14 @@ impl RenderDispatcher {
         true
     }
 
-    /// Spawn a Level II render for a pane.
+    /// Spawn a Level II render for a pane. `site` names the pane's radar for
+    /// the per-site render parameters; the projection geometry still comes
+    /// from `params`.
     pub fn spawn_level2_render(
         &mut self,
         pane_idx: usize,
         params: &RenderParams,
+        site: &str,
         data: Arc<nexrad_model::data::Scan>,
         sender: std::sync::mpsc::Sender<RenderResponse>,
         window: Option<WindowRef>,
@@ -705,6 +787,9 @@ impl RenderDispatcher {
         let storm_motion = (product == RadarProduct::StormRelativeVelocity)
             .then(|| self.storm_motion_override_kt())
             .flatten();
+        // The environmental heights ride the same way for the hail pair,
+        // read from the field `set_env_heights` invalidates on.
+        let env_heights = self.env_heights_km_msl_for(product, site);
         log::info!(
             "Spawning background render for pane {}: {:?} at {:.1}°",
             pane_idx,
@@ -726,6 +811,7 @@ impl RenderDispatcher {
             lat,
             lon,
             storm_motion,
+            env_heights,
         ) {
             Some(input) => {
                 crate::offload::Job::Described(crate::offload::JobRequest::Radar {
@@ -1354,6 +1440,86 @@ mod render_invalidation_tests {
         let mut gui = rustdar_egui::Gui::new();
         gui.pane_mut(0).expect("a fresh Gui has one pane").site = site.to_string();
         gui
+    }
+
+    /// The environmental heights route into the hail render parameters from
+    /// the same map the sounding drain writes, and a moved pair drops exactly
+    /// that site's hail renders — the per-site sibling of
+    /// `changing_the_override_invalidates_the_storm_relative_renders`.
+    #[test]
+    fn a_landed_sounding_routes_into_hail_renders_and_a_moved_pair_drops_them() {
+        let heights = |h0: f64, hm20: f64| rustdar_radar::sounding::EnvHeights {
+            h0c_km_msl: h0,
+            hm20c_km_msl: hm20,
+            fetched_at: chrono::Utc::now(),
+        };
+        let mut d = RenderDispatcher::new();
+        let gui = gui_showing("KTLX");
+        d.ensure_pane_count(1);
+
+        assert_eq!(
+            d.env_heights_km_msl_for(RadarProduct::ProbabilityOfSevereHail, "KTLX"),
+            None,
+            "before any sounding lands the render must draw nothing, not zeros",
+        );
+        assert!(
+            d.set_env_heights("KTLX", heights(4.2, 7.1), &gui),
+            "the first pair is a change from nothing",
+        );
+        assert_eq!(
+            d.env_heights_km_msl_for(RadarProduct::MaxExpectedHailSize, "KTLX"),
+            Some((4.2, 7.1)),
+        );
+        assert_eq!(
+            d.env_heights_km_msl_for(RadarProduct::Reflectivity, "KTLX"),
+            None,
+            "only the hail pair reads the environment",
+        );
+        assert_eq!(
+            d.env_heights_km_msl_for(RadarProduct::ProbabilityOfSevereHail, "KOUN"),
+            None,
+            "the environment is per-site",
+        );
+
+        d.pane_render[0].last_rendered = Some((RadarProduct::ProbabilityOfSevereHail, 0.5));
+        d.cache_render("KTLX", RadarProduct::MaxExpectedHailSize, 0.5, cached(1.0));
+        d.cache_render("KTLX", RadarProduct::Reflectivity, 0.5, cached(2.0));
+
+        assert!(
+            !d.set_env_heights("KTLX", heights(4.2, 7.1), &gui),
+            "an identical refetch restarts the TTL and drops nothing",
+        );
+        assert_eq!(
+            d.pane_render[0].last_rendered,
+            Some((RadarProduct::ProbabilityOfSevereHail, 0.5)),
+        );
+
+        assert!(
+            d.set_env_heights("KOUN", heights(1.0, 2.5), &gui),
+            "another site's first sounding is a change there",
+        );
+        assert_eq!(
+            d.pane_render[0].last_rendered,
+            Some((RadarProduct::ProbabilityOfSevereHail, 0.5)),
+            "another site's sounding must not touch this pane",
+        );
+
+        assert!(d.set_env_heights("KTLX", heights(4.4, 7.3), &gui));
+        assert_eq!(
+            d.pane_render[0].last_rendered, None,
+            "a hail pane drawn against the old pair has to be redrawn",
+        );
+        assert!(
+            d.get_cached_render("KTLX", RadarProduct::MaxExpectedHailSize, 0.5)
+                .is_none(),
+            "the shared cache is keyed on (site, product, elevation), which \
+             the environment is not part of",
+        );
+        assert!(
+            d.get_cached_render("KTLX", RadarProduct::Reflectivity, 0.5)
+                .is_some(),
+            "an unrelated product keeps its frame",
+        );
     }
 
     fn dispatch(

@@ -47,12 +47,22 @@ fn main() {
         "srv" => RadarProduct::StormRelativeVelocity,
         "eti" => RadarProduct::EchoTopsInterpolated,
         "vild" => RadarProduct::VilDensity,
+        "posh" => RadarProduct::ProbabilityOfSevereHail,
+        "mehs" => RadarProduct::MaxExpectedHailSize,
         other => panic!("unknown product {other}"),
     };
 
     // SRV_MOTION ("speed_kt direction_deg") overrides the Bunkers default,
     // exactly as the settings dialog's storm motion override does.
     let storm_motion: Option<(f32, f32)> = std::env::var("SRV_MOTION").ok().and_then(|s| {
+        let mut it = s.split_whitespace();
+        Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+    });
+
+    // HAIL_ENV ("h0c_km_msl hm20c_km_msl", e.g. "4.2 7.1") supplies the
+    // environmental freezing heights posh/mehs need, matching the app's
+    // model-sounding fetch. Without it those products render nothing.
+    let env_heights: Option<(f64, f64)> = std::env::var("HAIL_ENV").ok().and_then(|s| {
         let mut it = s.split_whitespace();
         Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
     });
@@ -64,8 +74,9 @@ fn main() {
         lat,
         lon,
         storm_motion,
+        env_heights,
     )
-    .expect("no sweep at that elevation");
+    .expect("no sweep at that elevation (or a hail product without HAIL_ENV)");
     write_ppm(&out, &rgba, max_range_km);
 }
 
