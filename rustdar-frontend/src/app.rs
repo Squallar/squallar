@@ -29,6 +29,9 @@ mod fetch;
 #[path = "app_render.rs"]
 mod render;
 
+#[path = "app_chunks.rs"]
+mod chunks;
+
 /// Which wgpu backends this build will consider.
 ///
 /// Native keeps reading `WGPU_BACKEND` from the environment. The browser has no
@@ -214,6 +217,8 @@ pub struct App {
     http_client: reqwest::Client,
     // Grouped loop download state: scan cache, in-flight tracking, and pending queues.
     loop_mgr: LoopDownloadManager,
+    /// Per-site real-time chunk feeds. Empty until a live site starts one.
+    chunk_feeds: crate::chunk_feed::ChunkFeedManager,
     // Cached latest scan per site from auto-poll while panes on that site view historic data.
     latest_cached_scans: HashMap<
         String,
@@ -400,6 +405,7 @@ impl App {
             #[cfg(target_arch = "wasm32")]
             pending_state: None,
             loop_mgr: LoopDownloadManager::new(),
+            chunk_feeds: crate::chunk_feed::ChunkFeedManager::new(),
             latest_cached_scans: HashMap::new(),
             manual_nav_pending: false,
             last_viewport: None,
@@ -537,6 +543,7 @@ impl App {
         if self.render.any_render_in_flight()
             || self.gui.is_auto_poll_active()
             || self.gui.any_loop_active()
+            || self.chunk_feeds.any_in_flight()
         {
             notify_redraw(&self.window);
         }
@@ -844,6 +851,13 @@ impl App {
                 }
             }
         }
+
+        // Real-time chunks, drained beside the scan results and for the same
+        // reason: this is where a new volume becomes the one the panes draw
+        // from, and it has to happen before `evict_unshown_scans` and before the
+        // frame is laid out.
+        self.poll_chunk_results();
+        self.drive_chunk_feeds();
 
         // Check for received overlay fetch results (unified channel)
         while let Ok(result) = self.channels.overlay_fetch_receiver.try_recv() {

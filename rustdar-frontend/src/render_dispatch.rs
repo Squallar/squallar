@@ -584,6 +584,14 @@ impl RenderDispatcher {
     }
 
     /// Check if a fetch generation is stale for a site.
+    /// This site's current fetch generation, without bumping it.
+    ///
+    /// What a chunk round inherits: bumping would let a five-second tick
+    /// supersede a manual navigation whose fetch is still in the air.
+    pub fn fetch_generation_for(&self, site: &str) -> u64 {
+        self.fetch_generations.get(site).copied().unwrap_or(0)
+    }
+
     pub fn is_fetch_stale(&self, site: &str, generation: u64) -> bool {
         self.fetch_generations.get(site).copied().unwrap_or(0) > generation
     }

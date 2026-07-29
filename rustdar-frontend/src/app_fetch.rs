@@ -58,13 +58,13 @@ impl super::App {
     /// threads. The `Send` bound rides on [`MaybeSend`] rather than being
     /// written here, so the *callers* stay single-bodied.
     #[cfg(not(target_arch = "wasm32"))]
-    fn spawn_detached(&self, future: impl Future<Output = ()> + MaybeSend + 'static) {
+    pub(super) fn spawn_detached(&self, future: impl Future<Output = ()> + MaybeSend + 'static) {
         self.tokio_runtime.spawn(future);
     }
 
     /// See the native variant above.
     #[cfg(target_arch = "wasm32")]
-    fn spawn_detached(&self, future: impl Future<Output = ()> + MaybeSend + 'static) {
+    pub(super) fn spawn_detached(&self, future: impl Future<Output = ()> + MaybeSend + 'static) {
         wasm_bindgen_futures::spawn_local(future);
     }
 
@@ -195,7 +195,7 @@ impl super::App {
         }
     }
 
-    fn local_to_utc(timestamp: NaiveDateTime) -> NaiveDateTime {
+    pub(super) fn local_to_utc(timestamp: NaiveDateTime) -> NaiveDateTime {
         local_to_utc_in(&chrono::Local, timestamp)
     }
 
@@ -302,6 +302,13 @@ impl super::App {
                 self.spawn_fetch(radar_config.site, utc_timestamp);
             }
             GuiAction::CheckForNewScans(radar_config) => {
+                // The chunk feed delivers this site's volume cut by cut, minutes
+                // earlier, so the 60 s archive check for it is redundant. Skipped
+                // here rather than suppressed in `check_auto_polls` so the GUI
+                // stays unaware of which transport a site is on.
+                if self.chunks_are_feeding(&radar_config.site) {
+                    return;
+                }
                 log::info!(
                     "Check for new scans: {} @ {} (local)",
                     radar_config.site,

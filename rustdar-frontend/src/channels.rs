@@ -179,6 +179,32 @@ pub struct LoopRenderResponse {
     pub max_range_km: f64,
 }
 
+/// One round of a site's real-time chunk feed.
+///
+/// Deliberately **not** a variant of [`ScanResponse`]. That type's drain bakes in
+/// five behaviours that all belong to a fetch someone is waiting on and are all
+/// wrong every few seconds: it takes the global `fetching` spinner down, clears
+/// the pane's `loading_site`, routes an error through `set_error` (which doubles
+/// the *archive* poll's backoff), stashes into `latest_cached_scans` on the
+/// historic branch, and compensates for a stale discard. A `is_chunk: bool`
+/// beside `is_auto_poll` would put four states in one drain, three of them
+/// unreachable.
+///
+/// The poller travels *back* on this channel rather than being borrowed across
+/// the await: it owns the assembled volume, and the fetch happens on a detached
+/// task that cannot hold a reference into `App`.
+pub struct ChunkResponse {
+    /// The site's fetch generation at dispatch — inherited from the Level II
+    /// fetch, never bumped. Bumping would let a five-second tick supersede a
+    /// manual navigation, and the scan drain's stale arm would then take that
+    /// navigation's spinner down early.
+    pub generation: u64,
+    pub site: String,
+    /// The poller, handed back so the next round resumes from it.
+    pub poller: Box<rustdar_radar::chunks::ChunkPoller>,
+    pub result: Result<rustdar_radar::chunks::PollOutcome, String>,
+}
+
 /// Centralized channel hub for all async communication between the App and
 /// background tasks (network fetches, radar rendering, etc.).
 /// The latest VAD Wind Profile levels for a site — (height km, u, v) —
@@ -223,6 +249,8 @@ pub struct ChannelHub {
     pub loop_render_receiver: Receiver<LoopRenderResponse>,
     pub vwp_sender: Sender<VwpResponse>,
     pub vwp_receiver: Receiver<VwpResponse>,
+    pub chunk_sender: Sender<ChunkResponse>,
+    pub chunk_receiver: Receiver<ChunkResponse>,
     pub sounding_sender: Sender<SoundingResponse>,
     pub sounding_receiver: Receiver<SoundingResponse>,
 }
@@ -245,6 +273,7 @@ impl ChannelHub {
         let (loop_render_sender, loop_render_receiver) = std::sync::mpsc::channel();
         let (vwp_sender, vwp_receiver) = std::sync::mpsc::channel();
         let (sounding_sender, sounding_receiver) = std::sync::mpsc::channel();
+        let (chunk_sender, chunk_receiver) = std::sync::mpsc::channel();
 
         Self {
             scan_sender,
@@ -263,6 +292,8 @@ impl ChannelHub {
             loop_scan_download_receiver,
             loop_render_sender,
             loop_render_receiver,
+            chunk_sender,
+            chunk_receiver,
             vwp_sender,
             vwp_receiver,
             sounding_sender,

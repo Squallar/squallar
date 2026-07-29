@@ -106,6 +106,13 @@ struct UiConfig {
     viewport_sync: bool,
     sync_layers: bool,
     auto_poll: bool,
+    /// Feed live panes from the real-time chunk bucket rather than polling the
+    /// archive for completed volumes.
+    ///
+    /// The container carries `#[serde(default)]`, so a config written before
+    /// this field existed takes `UiConfig::default()`'s value — the same
+    /// mechanism `auto_poll` relies on.
+    live_chunks: bool,
     site: String,
     loop_lookback_secs: u64,
     loop_speed_fps: f32,
@@ -130,6 +137,7 @@ impl Default for UiConfig {
             viewport_sync: true,
             sync_layers: true,
             auto_poll: true,
+            live_chunks: true,
             site: "KTLX".to_string(),
             loop_lookback_secs: 3600,
             loop_speed_fps: 5.0,
@@ -207,6 +215,7 @@ impl super::Gui {
             viewport_sync: self.viewport_sync,
             sync_layers: self.sync_layers,
             auto_poll: self.auto_poll.enabled,
+            live_chunks: self.live_chunks,
             site: self.radar.config.site.clone(),
             loop_lookback_secs: self.loop_lookback_secs,
             loop_speed_fps: fps,
@@ -275,6 +284,7 @@ impl super::Gui {
         self.viewport_sync = config.viewport_sync;
         self.sync_layers = config.sync_layers;
         self.auto_poll.enabled = config.auto_poll;
+        self.live_chunks = config.live_chunks;
 
         if !config.site.is_empty() {
             self.radar.config.site = config.site.clone();
@@ -612,6 +622,37 @@ mod tests {
         assert!(
             serde_json::from_str::<super::UiConfig>(&written).is_ok(),
             "stored blob should parse back as a UiConfig"
+        );
+    }
+}
+
+#[cfg(test)]
+mod live_chunks_config_tests {
+    use super::*;
+    use crate::Gui;
+
+    /// The setting survives a save/load cycle in both positions.
+    #[test]
+    fn the_live_chunks_setting_round_trips() {
+        for enabled in [true, false] {
+            let mut gui = Gui::new();
+            gui.set_live_chunks(enabled);
+            let json = gui.ui_config_json().expect("serialises");
+            let parsed: UiConfig = serde_json::from_str(&json).expect("parses");
+            assert_eq!(parsed.live_chunks, enabled);
+        }
+    }
+
+    /// A config written before the field existed takes the default rather than
+    /// failing to parse — the mechanism `#[serde(default)]` on the container
+    /// provides, and the one `auto_poll` already relies on.
+    #[test]
+    fn a_config_written_before_this_field_defaults_to_chunks() {
+        let old = r#"{"pane_count":1,"active_pane":0,"auto_poll":true,"site":"KTLX"}"#;
+        let parsed: UiConfig = serde_json::from_str(old).expect("an older config still parses");
+        assert!(
+            parsed.live_chunks,
+            "an existing install would silently lose the low-latency feed"
         );
     }
 }

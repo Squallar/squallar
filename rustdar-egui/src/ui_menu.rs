@@ -33,6 +33,9 @@ pub(super) enum MenuToggle {
     Overlay(OverlayKind),
     /// Automatic polling for new scans.
     AutoPoll,
+    /// Feed live panes from the real-time chunk bucket rather than polling the
+    /// archive for completed volumes.
+    LiveChunks,
 }
 
 /// One entry in the menu.
@@ -228,6 +231,11 @@ impl super::Gui {
                         toggle: MenuToggle::AutoPoll,
                         value: self.auto_poll.enabled,
                     },
+                    MenuNode::Toggle {
+                        label: "Live: real-time chunks",
+                        toggle: MenuToggle::LiveChunks,
+                        value: self.live_chunks,
+                    },
                     MenuNode::Separator,
                     MenuNode::Item {
                         label: "Time...",
@@ -266,6 +274,7 @@ impl super::Gui {
                 self.propagate_layer_sync();
             }
             MenuEvent::Toggled(MenuToggle::AutoPoll, on) => self.auto_poll.enabled = on,
+            MenuEvent::Toggled(MenuToggle::LiveChunks, on) => self.live_chunks = on,
         }
     }
 }
@@ -300,8 +309,12 @@ mod tests {
             .collect();
         overlays.sort();
         format!(
-            "settings={} time={} drawer={} auto_poll={} overlays={overlays:?}",
-            gui.show_settings, gui.time_dialog.show, gui.drawer_open, gui.auto_poll.enabled,
+            "settings={} time={} drawer={} auto_poll={} live_chunks={} overlays={overlays:?}",
+            gui.show_settings,
+            gui.time_dialog.show,
+            gui.drawer_open,
+            gui.auto_poll.enabled,
+            gui.live_chunks,
         )
     }
 
