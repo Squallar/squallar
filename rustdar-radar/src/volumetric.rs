@@ -35,7 +35,9 @@ pub struct VolumetricGrid {
 }
 
 /// Beam-center height above the radar, km, for a slant range and elevation.
-fn beam_height_km(range_km: f64, elev_deg: f64) -> f64 {
+/// `pub(crate)` for [`crate::hail`], whose column geometry has to sit in the
+/// same 4/3-model vertical coordinate the cube's [`BeamHeights`] use.
+pub(crate) fn beam_height_km(range_km: f64, elev_deg: f64) -> f64 {
     let el = elev_deg.to_radians();
     range_km * el.sin() + range_km * range_km / (2.0 * RE_EFF_KM)
 }

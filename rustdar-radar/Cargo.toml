@@ -35,3 +35,6 @@ rayon = "=1.12.0"
 # ungated entry breaks `cargo check --target wasm32-unknown-unknown`.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# The hail sanity harness re-runs `nexrad-level3`'s whole-file zlib strip on
+# raw NHI objects to reach their Tabular Alphanumeric Block.
+flate2 = { workspace = true }
