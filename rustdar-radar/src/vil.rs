@@ -1363,15 +1363,14 @@ mod live_validation {
 }
 
 /// The parts of [`live_vild_validation`] that decide **what counts as
-/// passing** for VIL density, plus the construction of the reference field
-/// that decision is made against.
+/// passing** for VIL density.
 ///
 /// Outside the ignored module for the reason [`validation_policy`] is: the
 /// live harness never runs under `cargo test --workspace`, so a bar defined
 /// inside it could be quietly weakened without a default-suite test noticing.
 /// Out here `vild_policy_tests` reaches all of it offline, and does.
 ///
-/// # The reference
+/// # The reference is [`crate::vild`]
 ///
 /// VIL density has no Level III twin — but the RPG publishes **both of its
 /// inputs** for the same volume: product 134 (`DVL`, kg/m²) and product 135
@@ -1383,48 +1382,35 @@ mod live_validation {
 /// VILD_ref = 1000 · DVL / ((EET_published + 0.5) · 304.8)     g/m³
 /// ```
 ///
-/// It is the *same arithmetic* [`vil_density_g_m3`] applies to the local
-/// derivations, so a residual is entirely the two inputs' — which is the
-/// point: both failed their own twin surveys in convective cores, and nobody
-/// had measured whether the quotient's errors cancel or compound.
+/// That expression is [`crate::vild`], and the constructors below are
+/// **re-exports of it** rather than a second implementation. Nothing here
+/// rebuilds the quotient, the bin-centre datum
+/// ([`crate::vild::EET_BIN_CENTRE_KFT`] — see that module for why `+ 0.5` is
+/// the unbiased estimator, and what the residual ±0.5 kft costs) or the
+/// resampling; a private copy of the arithmetic in here is exactly how a
+/// survey comes to bless a field the app does not draw.
 ///
-/// # Why `+ 0.5` — and the reference's own noise floor
+/// [`reference_vild_on_published_floor`] is the one thing that stays local: it
+/// is the datum A/B row, a deliberately *wrong* denominator kept so the choice
+/// stays measured rather than assumed.
 ///
-/// Product 135 encodes `level = ⌊kft⌋ + 2`, so a decoded height is the
-/// **lower edge** of a 1 kft bin, not the top: a published 32 kft means the
-/// real top lies anywhere in [32, 33). Dividing by the lower edge would bias
-/// the reference *high* by half a bin — 1.7% at a 30 kft top, 3.3% at 15 —
-/// exactly the direction this survey is looking for, so the reference takes
-/// the **bin centre** ([`vild_validation_policy::EET_BIN_CENTRE_KFT`]), the
-/// unbiased estimator under a uniform sub-bin top.
-/// [`vild_validation_policy::reference_vild_on_published_floor`] keeps the
-/// literal decode as an A/B row so the choice stays measured, not assumed.
-///
-/// What is left is a genuine ±0.5 kft of top uncertainty per cell, i.e. a
-/// relative VILD uncertainty of `0.5/(published + 0.5)`
-/// ([`vild_validation_policy::reference_quantization_halfwidth_g_m3`]):
-///
-/// | published top | halfwidth | at VILD 3.5 g/m³ |
-/// |---|---|---|
-/// | 15 kft | 3.23% | ±0.113 g/m³ |
-/// | 20 kft | 2.44% | ±0.085 g/m³ |
-/// | 30 kft | 1.64% | ±0.057 g/m³ |
-/// | 40 kft | 1.23% | ±0.043 g/m³ |
-/// | 50 kft | 0.99% | ±0.035 g/m³ |
-///
-/// Product 134's own hybrid encoding adds ~1.3% (half of the log region's
-/// ~2.6% relative step) on top of that. **The reference therefore cannot
-/// resolve VIL density finer than roughly ±0.1 g/m³ at the decision
-/// threshold**, which is why no value-agreement bar is pinned here: a "within
-/// ±0.05 g/m³" bar would be measuring the reference, not the derivation. The
-/// ±0.5 g/m³ and ±15% figures are *reported* (both comfortably above the
-/// floor), and the bar is pinned on the decision the product is actually read
-/// for.
+/// No value-agreement bar is pinned, only decision bars: the reference cannot
+/// resolve VIL density finer than roughly ±0.1 g/m³ at the threshold
+/// ([`crate::vild::quantization_halfwidth_g_m3`]), so a "within ±0.05 g/m³"
+/// bar would be measuring product 135's quantization rather than the
+/// derivation. The ±0.5 g/m³ and ±15% figures are *reported* (both comfortably
+/// above the floor).
 #[cfg(all(test, not(target_arch = "wasm32")))]
-mod vild_validation_policy {
-    use crate::twin::compare::{self, ValueCodec};
+pub(crate) mod vild_validation_policy {
     use crate::volumetric::RANGE_BINS;
-    use nexrad_level3::model::RadialPacket;
+
+    /// The reference's construction, re-exported from the module that owns it.
+    /// See this module's doc.
+    pub use crate::vild::{
+        EET_BIN_CENTRE_KFT, EET_QUANTUM_KFT, density_field, published_top_field,
+        quantization_halfwidth_g_m3 as reference_quantization_halfwidth_g_m3, resampled_field,
+        vild_from_published as reference_vild,
+    };
 
     /// Amburn & Wolf (1997)'s two operational breaks, g/m³: below 3.5 severe
     /// hail is rare, at 4.0 and above it is near-universal. Both are scored;
@@ -1432,107 +1418,14 @@ mod vild_validation_policy {
     pub const HAIL_RARE_BELOW_G_M3: f32 = 3.5;
     pub const HAIL_NEAR_CERTAIN_AT_G_M3: f32 = 4.0;
 
-    /// Product 135's height quantum, kft (`level = ⌊kft⌋ + 2`).
-    pub const EET_QUANTUM_KFT: f32 = 1.0;
-
-    /// Half of it — the bin-centre estimate of a published echo top. See the
-    /// module doc: dividing by the published *lower edge* would bias the
-    /// reference high by this much.
-    pub const EET_BIN_CENTRE_KFT: f32 = EET_QUANTUM_KFT / 2.0;
-
-    /// Reference VIL density for one cell, g/m³, from the RPG's own two
-    /// published products. Undefined when either input is, and — per the
-    /// echo-top datum — when the published top is **zero** (level 2 or the
-    /// topped 130: a top in the lowest kilofoot, where the quotient's
-    /// denominator is not resolvable at all).
-    pub fn reference_vild(dvl_kg_m2: f32, eet_published_kft: f32) -> f32 {
-        if !eet_published_kft.is_finite() || eet_published_kft <= 0.0 {
-            return f32::NAN;
-        }
-        super::vil_density_g_m3(dvl_kg_m2, eet_published_kft + EET_BIN_CENTRE_KFT)
-    }
-
-    /// The A/B row: the same reference on the **literal** decode, dividing by
-    /// the published bin's lower edge. Always the larger of the two.
+    /// The datum A/B row: the same reference on the **literal** decode,
+    /// dividing by the published bin's lower edge. Always the larger of the
+    /// two, and deliberately not what [`crate::vild`] uses.
     pub fn reference_vild_on_published_floor(dvl_kg_m2: f32, eet_published_kft: f32) -> f32 {
         if !eet_published_kft.is_finite() || eet_published_kft <= 0.0 {
             return f32::NAN;
         }
-        super::vil_density_g_m3(dvl_kg_m2, eet_published_kft)
-    }
-
-    /// The reference's own precision at a cell, g/m³: the true top lies
-    /// anywhere in `[published, published + 1)` kft, so the bin-centre
-    /// reference carries a ±0.5 kft top error — a relative VILD uncertainty
-    /// of `0.5/(published + 0.5)`. Nothing tighter than this is measurable.
-    pub fn reference_quantization_halfwidth_g_m3(
-        reference_vild: f32,
-        eet_published_kft: f32,
-    ) -> f32 {
-        reference_vild * EET_BIN_CENTRE_KFT / (eet_published_kft + EET_BIN_CENTRE_KFT)
-    }
-
-    /// A Level III radial packet resampled onto the derived 360° × 230 km
-    /// grid and decoded through the product's own codec — the same
-    /// [`compare::resample_packet_levels`] machinery every other harness
-    /// scores through, stopped one step later (at physical values rather than
-    /// at levels, because the reference is a *quotient* of two products whose
-    /// levels are not commensurable).
-    ///
-    /// The 230 km cap and each product's own range extent are the
-    /// resampler's: cells its packet has no gate for come back `NaN`.
-    pub fn resampled_field(
-        packet: &RadialPacket,
-        gate_km: f64,
-        codec: &ValueCodec,
-    ) -> Vec<Vec<f32>> {
-        compare::resample_packet_levels(packet, gate_km)
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|&g| g.map_or(f32::NAN, |level| codec.decode(level)))
-                    .collect()
-            })
-            .collect()
-    }
-
-    /// `1000 · VIL / (top · 304.8)` cell for cell — the field constructor the
-    /// survey's four rows share, so that "ours", the reference and the two
-    /// attribution mixes differ only in which VIL and which top they are fed.
-    pub fn density_field(vil_kg_m2: &[Vec<f32>], top_kft: &[Vec<f32>]) -> Vec<Vec<f32>> {
-        (0..360)
-            .map(|az| {
-                (0..RANGE_BINS)
-                    .map(|r| {
-                        let v = vil_kg_m2.get(az).and_then(|row| row.get(r)).copied();
-                        let t = top_kft.get(az).and_then(|row| row.get(r)).copied();
-                        match (v, t) {
-                            (Some(v), Some(t)) => super::vil_density_g_m3(v, t),
-                            _ => f32::NAN,
-                        }
-                    })
-                    .collect()
-            })
-            .collect()
-    }
-
-    /// The RPG's published echo tops turned into the reference's denominator:
-    /// bin centres, `NaN` where the published top is undefined or zero.
-    pub fn published_top_field(eet_published_kft: &[Vec<f32>]) -> Vec<Vec<f32>> {
-        eet_published_kft
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|&kft| {
-                        if kft.is_finite() && kft > 0.0 {
-                            kft + EET_BIN_CENTRE_KFT
-                        } else {
-                            f32::NAN
-                        }
-                    })
-                    .collect()
-            })
-            .collect()
+        crate::vild::vild_g_m3(dvl_kg_m2, eet_published_kft)
     }
 
     /// The decision the product is read for, at one threshold: which side of
