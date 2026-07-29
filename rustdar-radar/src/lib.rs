@@ -1,5 +1,6 @@
 pub mod archive;
 pub mod chunks;
+pub(crate) mod dpprep;
 pub mod eet;
 pub mod kdp;
 pub(crate) mod l3_values;
