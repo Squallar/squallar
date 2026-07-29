@@ -49,8 +49,26 @@ fn main() {
         "vild" => RadarProduct::VilDensity,
         "posh" => RadarProduct::ProbabilityOfSevereHail,
         "mehs" => RadarProduct::MaxExpectedHailSize,
+        // The hybrid classification composites the whole volume; the render
+        // path's decoded Scan carries no radial-header parameters, so it
+        // runs on the volume ISDP estimator and — without HHC_ENV
+        // ("h0c_km_msl hm20c_km_msl") — the operational adaptation-default
+        // heights, exactly like the app with no sounding cached.
+        "hhc" => RadarProduct::HydrometeorClassification,
         other => panic!("unknown product {other}"),
     };
+
+    if product == RadarProduct::HydrometeorClassification {
+        let env: Option<(f64, f64)> = std::env::var("HHC_ENV").ok().and_then(|s| {
+            let mut it = s.split_whitespace();
+            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+        });
+        let (rgba, max_range_km, _values) =
+            rustdar_radar::render::render_hhc_to_image(&scan, lat, lon, env)
+                .expect("no dual-pol sweeps in the volume");
+        write_ppm(&out, &rgba, max_range_km);
+        return;
+    }
 
     // SRV_MOTION ("speed_kt direction_deg") overrides the Bunkers default,
     // exactly as the settings dialog's storm motion override does.

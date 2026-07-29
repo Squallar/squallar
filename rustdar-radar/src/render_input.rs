@@ -62,10 +62,12 @@ pub struct RenderInput {
     /// answers with the Bunkers right-mover from the volume's own profile.
     storm_motion_override: Option<(f32, f32)>,
     /// The site's environmental 0 °C / −20 °C heights, km MSL
-    /// ([`crate::sounding::EnvHeights`]). Read by the hail pair alone;
-    /// `None` means the hail field is undefined and the render answers
-    /// nothing ([`crate::hail`]) — like the override, there is no "present
-    /// but empty" state to keep distinct.
+    /// ([`crate::sounding::EnvHeights`]). Read by the hail pair and the
+    /// hybrid hydrometeor classification. `None` means different things to
+    /// each: the hail field is undefined and its render answers nothing
+    /// ([`crate::hail`]), while the HHC falls back to the operational
+    /// adaptation defaults, exactly as the RPG does without environmental
+    /// data.
     env_heights_km_msl: Option<(f64, f64)>,
     sweeps: Vec<SweepData>,
 }
@@ -87,6 +89,11 @@ struct RadialData {
     /// have them, and both `sweep_to_grid` and the rasterizer skip them, so the
     /// distinction has to survive the round trip.
     moment: Option<MomentPayload>,
+    /// The radial's *other* moments, tagged by their index into `ALL_SLOTS` —
+    /// carried only for the hybrid hydrometeor classification, whose
+    /// derivation reads every dual-pol field plus velocity, and empty for
+    /// every other product.
+    extras: Vec<(u8, MomentPayload)>,
 }
 
 /// A moment block in the fixed-point form the decoder produced it in, so
@@ -105,6 +112,22 @@ struct MomentPayload {
     /// Raw gate codes, exactly as `DataMoment::raw_values` returns them: one
     /// byte per gate at 8-bit, a big-endian pair at 16-bit.
     gates: Vec<u8>,
+}
+
+/// Whether a product reads the environmental 0 °C / −20 °C heights.
+///
+/// The hail pair has no field at all without them ([`crate::hail`]); the
+/// hybrid hydrometeor classification uses them for its melting layer and
+/// hail-size heights, falling back to the operational adaptation defaults
+/// when they are absent. Every other product must never carry them, so its
+/// payload bytes cannot depend on an unrelated cache.
+fn reads_env_heights(product: RadarProduct) -> bool {
+    matches!(
+        product,
+        RadarProduct::ProbabilityOfSevereHail
+            | RadarProduct::MaxExpectedHailSize
+            | RadarProduct::HydrometeorClassification
+    )
 }
 
 impl RenderInput {
@@ -150,11 +173,18 @@ impl RenderInput {
             // still wants the profile, or render quality would silently vary
             // with whether the user typed a vector in.
             RadarProduct::NormalizedRotation | RadarProduct::StormRelativeVelocity => true,
+            // The hybrid classification composites every dual-pol tilt down
+            // the hybrid scan — and, unlike the others, reads every moment,
+            // so its radials carry the extras too.
+            RadarProduct::HydrometeorClassification => true,
             _ => false,
         };
 
+        // Only the HHC reads moments beyond its slot; everything else ships
+        // the slot moment alone.
+        let all_moments = product == RadarProduct::HydrometeorClassification;
         let sweeps = if whole_volume {
-            collect_sweeps(scan, slot)
+            collect_sweeps(scan, slot, all_moments)
         } else {
             // One sweep: whichever `find_sweep` would have chosen. Selecting
             // here, against the whole volume, is the point — the reconstructed
@@ -163,6 +193,7 @@ impl RenderInput {
             vec![sweep_data(
                 crate::render::find_sweep(scan, product, elevation)?,
                 slot,
+                false,
             )]
         };
         // `collect_sweeps` can come back empty on a volume that carries the
@@ -178,7 +209,14 @@ impl RenderInput {
             radar_lat,
             radar_lon,
             storm_motion_override,
-            env_heights_km_msl,
+            env_heights_km_msl: if reads_env_heights(product) {
+                env_heights_km_msl
+            } else {
+                // Nothing else reads them; carrying them anyway would make
+                // byte-identity of other products' payloads depend on an
+                // unrelated cache.
+                None
+            },
             sweeps,
         })
     }
@@ -206,7 +244,8 @@ impl RenderInput {
     }
 
     /// The site's environmental 0 °C / −20 °C heights, km MSL, or `None` —
-    /// the hail products then render nothing.
+    /// the hail products then render nothing, and the HHC applies its
+    /// adaptation defaults.
     pub fn env_heights_km_msl(&self) -> Option<(f64, f64)> {
         self.env_heights_km_msl
     }
@@ -237,8 +276,15 @@ impl RenderInput {
                         // `MomentSlot` `get_moment` resolves this product to,
                         // so the reconstructed radial answers `get_moment` with
                         // the moment that was extracted.
-                        let (reflectivity, velocity, spectrum_width, zdr, phi, rho) =
-                            place_moment(slot, moment);
+                        let mut slots = place_moment(slot, moment);
+                        // The extras go back on the fields their tags name —
+                        // the HHC's full-radial reconstruction.
+                        for (code, payload) in &radial.extras {
+                            if let Some(extra_slot) = ALL_SLOTS.get(*code as usize) {
+                                place_into(&mut slots, *extra_slot, payload.to_moment_data());
+                            }
+                        }
+                        let (reflectivity, velocity, spectrum_width, zdr, phi, rho) = slots;
                         Radial::new(
                             0,
                             0,
@@ -266,24 +312,42 @@ impl RenderInput {
 }
 
 /// Every sweep whose first radial carries `slot`'s moment, in scan order.
-fn collect_sweeps(scan: &Scan, slot: MomentSlot) -> Vec<SweepData> {
+/// With `all_moments` (the HHC), a sweep carrying *any* moment qualifies —
+/// the split-cut Doppler halves carry no differential phase but donate the
+/// velocity the classification grafts in.
+fn collect_sweeps(scan: &Scan, slot: MomentSlot, all_moments: bool) -> Vec<SweepData> {
     scan.sweeps()
         .iter()
         .filter_map(|sweep| {
             let radials = sweep.radials();
-            slot.read(radials.first()?)
-                .is_some()
-                .then(|| sweep_data(radials, slot))
+            let first = radials.first()?;
+            let wanted = if all_moments {
+                ALL_SLOTS.iter().any(|s| s.read(first).is_some())
+            } else {
+                slot.read(first).is_some()
+            };
+            wanted.then(|| sweep_data(radials, slot, all_moments))
         })
         .collect()
 }
+
+/// Every moment field a radial has, in `Radial::new` order — the extras'
+/// tag bytes are indices into this table.
+const ALL_SLOTS: [MomentSlot; 6] = [
+    MomentSlot::Reflectivity,
+    MomentSlot::Velocity,
+    MomentSlot::SpectrumWidth,
+    MomentSlot::DifferentialReflectivity,
+    MomentSlot::DifferentialPhase,
+    MomentSlot::CorrelationCoefficient,
+];
 
 /// Flatten one sweep, carrying `slot`'s moment and nothing else.
 ///
 /// `slot` comes from the caller rather than being probed off the radial: a
 /// merged upper tilt carries reflectivity *and* velocity, so "the first moment
 /// this radial has" would hand a reflectivity render the velocity gates.
-fn sweep_data(radials: &[Radial], slot: MomentSlot) -> SweepData {
+fn sweep_data(radials: &[Radial], slot: MomentSlot, all_moments: bool) -> SweepData {
     SweepData {
         elevation_angle: radials
             .first()
@@ -295,6 +359,19 @@ fn sweep_data(radials: &[Radial], slot: MomentSlot) -> SweepData {
                 azimuth: radial.azimuth_angle_degrees(),
                 azimuth_spacing: radial.azimuth_spacing_degrees(),
                 moment: slot.read(radial).map(MomentPayload::from_moment_data),
+                extras: if all_moments {
+                    ALL_SLOTS
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| **s != slot)
+                        .filter_map(|(code, s)| {
+                            s.read(radial)
+                                .map(|m| (code as u8, MomentPayload::from_moment_data(m)))
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
             })
             .collect(),
     }
@@ -320,15 +397,21 @@ type MomentSlots = (
 fn place_moment(slot: Option<MomentSlot>, moment: Option<MomentData>) -> MomentSlots {
     let mut slots: MomentSlots = (None, None, None, None, None, None);
     let Some(slot) = slot else { return slots };
-    match slot {
-        MomentSlot::Reflectivity => slots.0 = moment,
-        MomentSlot::Velocity => slots.1 = moment,
-        MomentSlot::SpectrumWidth => slots.2 = moment,
-        MomentSlot::DifferentialReflectivity => slots.3 = moment,
-        MomentSlot::DifferentialPhase => slots.4 = moment,
-        MomentSlot::CorrelationCoefficient => slots.5 = moment,
-    }
+    let Some(moment) = moment else { return slots };
+    place_into(&mut slots, slot, moment);
     slots
+}
+
+/// Set one field of the six-slot tuple.
+fn place_into(slots: &mut MomentSlots, slot: MomentSlot, moment: MomentData) {
+    match slot {
+        MomentSlot::Reflectivity => slots.0 = Some(moment),
+        MomentSlot::Velocity => slots.1 = Some(moment),
+        MomentSlot::SpectrumWidth => slots.2 = Some(moment),
+        MomentSlot::DifferentialReflectivity => slots.3 = Some(moment),
+        MomentSlot::DifferentialPhase => slots.4 = Some(moment),
+        MomentSlot::CorrelationCoefficient => slots.5 = Some(moment),
+    }
 }
 
 /// Nothing on a render path reads the coverage pattern, but `Scan::new`
@@ -406,7 +489,12 @@ const MAGIC: [u8; 4] = *b"RDRI";
 /// external levels is gone.
 /// Version 4 added the environmental heights between the override and the
 /// sweep count, for the hail products.
-const FORMAT_VERSION: u16 = 4;
+/// Version 5 added the per-radial extra moments, when the hybrid hydrometeor
+/// classification became a Level II product: it composites every dual-pol
+/// moment of every tilt, so its payload carries them alongside the sweep's
+/// own moment, and it reads the same environmental heights the hail pair
+/// does.
+const FORMAT_VERSION: u16 = 5;
 
 impl RenderInput {
     /// Encode for transport. Little-endian throughout; gate blobs are copied
@@ -449,15 +537,13 @@ impl RenderInput {
                     None => out.push(0),
                     Some(moment) => {
                         out.push(1);
-                        out.extend_from_slice(&moment.gate_count.to_le_bytes());
-                        out.extend_from_slice(&moment.first_gate_range_m.to_le_bytes());
-                        out.extend_from_slice(&moment.gate_interval_m.to_le_bytes());
-                        out.push(moment.word_size);
-                        out.extend_from_slice(&moment.scale.to_le_bytes());
-                        out.extend_from_slice(&moment.offset.to_le_bytes());
-                        out.extend_from_slice(&(moment.gates.len() as u32).to_le_bytes());
-                        out.extend_from_slice(&moment.gates);
+                        encode_moment(&mut out, moment);
                     }
+                }
+                out.push(radial.extras.len() as u8);
+                for (code, payload) in &radial.extras {
+                    out.push(*code);
+                    encode_moment(&mut out, payload);
                 }
             }
         }
@@ -513,31 +599,25 @@ impl RenderInput {
                 let azimuth_spacing = r.f32()?;
                 let moment = match r.u8()? {
                     0 => None,
-                    1 => {
-                        let gate_count = r.u16()?;
-                        let first_gate_range_m = r.u16()?;
-                        let gate_interval_m = r.u16()?;
-                        let word_size = r.u8()?;
-                        let scale = r.f32()?;
-                        let offset = r.f32()?;
-                        let gate_len = r.u32()?;
-                        let gates = r.take(gate_len as usize)?.to_vec();
-                        Some(MomentPayload {
-                            gate_count,
-                            first_gate_range_m,
-                            gate_interval_m,
-                            word_size,
-                            scale,
-                            offset,
-                            gates,
-                        })
-                    }
+                    1 => Some(decode_moment(&mut r)?),
                     _ => return None,
                 };
+                let extra_count = r.u8()?;
+                let mut extras = Vec::with_capacity(r.bounded(extra_count as u32, 16)?);
+                for _ in 0..extra_count {
+                    let code = r.u8()?;
+                    // A tag outside the slot table means the two ends
+                    // disagree about the layout; refuse the frame.
+                    if code as usize >= ALL_SLOTS.len() {
+                        return None;
+                    }
+                    extras.push((code, decode_moment(&mut r)?));
+                }
                 radials.push(RadialData {
                     azimuth,
                     azimuth_spacing,
                     moment,
+                    extras,
                 });
             }
             sweeps.push(SweepData {
@@ -579,12 +659,50 @@ impl RenderInput {
                 8 + s
                     .radials
                     .iter()
-                    .map(|r| 9 + r.moment.as_ref().map_or(0, |m| 19 + m.gates.len()))
+                    .map(|r| {
+                        10 + r.moment.as_ref().map_or(0, |m| 19 + m.gates.len())
+                            + r.extras
+                                .iter()
+                                .map(|(_, m)| 20 + m.gates.len())
+                                .sum::<usize>()
+                    })
                     .sum::<usize>()
             })
             .sum();
         header + motion + env + 4 + sweeps
     }
+}
+
+/// One moment payload's wire form, shared by the slot moment and the extras.
+fn encode_moment(out: &mut Vec<u8>, moment: &MomentPayload) {
+    out.extend_from_slice(&moment.gate_count.to_le_bytes());
+    out.extend_from_slice(&moment.first_gate_range_m.to_le_bytes());
+    out.extend_from_slice(&moment.gate_interval_m.to_le_bytes());
+    out.push(moment.word_size);
+    out.extend_from_slice(&moment.scale.to_le_bytes());
+    out.extend_from_slice(&moment.offset.to_le_bytes());
+    out.extend_from_slice(&(moment.gates.len() as u32).to_le_bytes());
+    out.extend_from_slice(&moment.gates);
+}
+
+fn decode_moment(r: &mut Reader) -> Option<MomentPayload> {
+    let gate_count = r.u16()?;
+    let first_gate_range_m = r.u16()?;
+    let gate_interval_m = r.u16()?;
+    let word_size = r.u8()?;
+    let scale = r.f32()?;
+    let offset = r.f32()?;
+    let gate_len = r.u32()?;
+    let gates = r.take(gate_len as usize)?.to_vec();
+    Some(MomentPayload {
+        gate_count,
+        first_gate_range_m,
+        gate_interval_m,
+        word_size,
+        scale,
+        offset,
+        gates,
+    })
 }
 
 /// A bounds-checked cursor. Every accessor returns `None` rather than panicking,
@@ -768,11 +886,7 @@ mod tests {
     /// reads them, and without a pair those products render nothing at all.
     /// 2 / 4 km MSL sits the fixture's strong low tilt across the ramp.
     fn env_for(product: RadarProduct) -> Option<(f64, f64)> {
-        matches!(
-            product,
-            RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize
-        )
-        .then_some((2.0, 4.0))
+        reads_env_heights(product).then_some((2.0, 4.0))
     }
 
     /// The acceptance criterion for moving rasterization into a worker: the
@@ -988,28 +1102,12 @@ mod tests {
     fn a_product_with_no_level_two_moment_extracts_nothing() {
         let scan = volume();
         assert!(
-            RenderInput::extract(
-                &scan,
-                0.5,
-                RadarProduct::HydrometeorClassification,
-                LAT,
-                LON,
-                None,
-                None,
-            )
-            .is_none()
+            RenderInput::extract(&scan, 0.5, RadarProduct::EchoTops, LAT, LON, None, None)
+                .is_none()
         );
         assert!(
-            render_radar_to_image_full(
-                &scan,
-                0.5,
-                RadarProduct::HydrometeorClassification,
-                LAT,
-                LON,
-                None,
-                None,
-            )
-            .is_none(),
+            render_radar_to_image_full(&scan, 0.5, RadarProduct::EchoTops, LAT, LON, None, None)
+                .is_none(),
             "the payload and the renderer must refuse the same requests"
         );
     }
@@ -1047,6 +1145,58 @@ mod tests {
                 "{product:?} with an environment must paint"
             );
         }
+    }
+
+    /// The hybrid classification's payload carries every sweep with every
+    /// moment (the extras), plus the environmental heights — and the whole
+    /// bundle survives the byte round trip. The fixture volume carries only
+    /// reflectivity and velocity, which is not enough to classify, so the
+    /// pin here is structural: the extras and heights are the parts version
+    /// 5 added.
+    #[test]
+    fn hhc_payloads_carry_extras_and_env_heights() {
+        let scan = volume();
+        let input = RenderInput::extract(
+            &scan,
+            0.5,
+            RadarProduct::HydrometeorClassification,
+            LAT,
+            LON,
+            None,
+            Some((5.0, 8.6)),
+        )
+        .unwrap();
+        assert_eq!(input.sweeps.len(), 3, "every sweep travels");
+        assert_eq!(input.env_heights_km_msl(), Some((5.0, 8.6)));
+        // The slot moment is reflectivity; velocity rides in the extras.
+        let with_velocity = input.sweeps[1]
+            .radials
+            .iter()
+            .filter(|r| r.extras.iter().any(|(code, _)| *code == 1))
+            .count();
+        assert!(with_velocity > 0, "the Doppler moment travels as an extra");
+        let back = RenderInput::from_bytes(&input.to_bytes()).expect("round trips");
+        assert_eq!(back, input);
+        // And the reconstruction puts the extras back on their fields.
+        let rebuilt = back.to_scan();
+        let radial = &rebuilt.sweeps()[1].radials()[0];
+        assert!(radial.reflectivity().is_some(), "slot moment placed");
+        assert!(radial.velocity().is_some(), "extra placed on its field");
+        // A non-HHC product never carries either, whatever the caller
+        // passed — other products' payload bytes must not depend on an
+        // unrelated cache.
+        let refl = RenderInput::extract(
+            &scan,
+            0.5,
+            RadarProduct::Reflectivity,
+            LAT,
+            LON,
+            None,
+            Some((5.0, 8.6)),
+        )
+        .unwrap();
+        assert_eq!(refl.env_heights_km_msl(), None);
+        assert!(refl.sweeps[0].radials.iter().all(|r| r.extras.is_empty()));
     }
 
     /// The bytes arrive off a message port. Every malformed shape has to be a

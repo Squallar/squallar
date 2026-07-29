@@ -121,6 +121,18 @@
 //! (+0.03…+0.26, one −0.02 tie) now that ≥ 1° tilts feed the composite;
 //! radar-MLDA vs flat tied everywhere (no wet-snow detection, as
 //! per-tilt).
+//!
+//! On that verdict the product **converted to local derivation**:
+//! `HydrometeorClassification` left `is_level3()` and the ICD fetch table,
+//! lists on the reflectivity tilts as a tilt-independent volume product
+//! (the ETI convention), renders through
+//! [`crate::render::render_hhc_to_image`], and travels the worker boundary
+//! as a version-4 [`crate::render_input`] payload — every sweep with every
+//! moment (the extras) plus the sounding heights. The render path's
+//! decoded `Scan` carries no radial-header calibration, so it runs on
+//! [`crate::kdp::KdpParams::render_fallback`] (a missing `dbz0` would read
+//! every gate as no-echo and blank the product); the twin-validated
+//! harness always reads the real values from the raw archive.
 
 use crate::dpprep::{DpInput, ReflCappi, combine_sweep_dp, resample_to_polar_grid};
 use crate::hca::{

@@ -881,8 +881,10 @@ impl super::App {
         let storm_motion = (product == rustdar_radar::types::RadarProduct::StormRelativeVelocity)
             .then(|| self.render.storm_motion_override_kt())
             .flatten();
-        // The environmental heights ride the same way for the hail pair,
-        // keyed by the loop's own site.
+        // The environmental heights ride the same way for the hail pair and
+        // the classification, keyed by the loop's own site and read from the
+        // same cache the static pane render uses — so a loop frame and the
+        // still frame agree about the melting layer.
         let env_heights = self.render.env_heights_km_msl_for(product, &target.site);
         let job = match rustdar_radar::render_input::RenderInput::extract(
             &scan_data,

@@ -270,7 +270,7 @@
 //! mountain west (KSFX 3.9k, KMTX 3.4k). No cold-sector stratiform exists
 //! anywhere in late July; that regime remains unexercised.
 //!
-//! **Verdict: pass.** Sixteen measurements (twelve site-hours plus
+//! **Verdict: pass.** Eighteen measurements (twelve site-hours plus
 //! second/third volumes at the leads): every one cleared the 85% exact
 //! bar (90.9–98.8%); eight of twelve sites cleared the 95% compatible bar
 //! too — KUEX 96.36/96.43, KOAX 95.45/95.56, KDDC 97.76/97.82, KEAX
@@ -298,12 +298,12 @@
 //! clears the exact bar on every volume.
 //!
 //! **Melting-layer ring**: [`detect_melting_layer`] concluded from wet
-//! snow at none of the sixteen measurements (0/360 azimuths everywhere) —
+//! snow at none of the eighteen measurements (0/360 azimuths everywhere) —
 //! a single volume's 4°–10° histogram never reaches `min_wet_snow_sum`
 //! = 1500 in July convection, where the operational MLDA accumulates
 //! three volumes and merges the model grid. Every survey ran on the
 //! sounding flat layer, and the radar-vs-flat A/B rows were identical at
-//! all sixteen; the only place the twin's transition band disagreed with
+//! all eighteen; the only place the twin's transition band disagreed with
 //! the sounding was the quarantined KMTX episode above. WS populations at
 //! the asserted plains sites (n=36–325 per site, producer 39–75%,
 //! compatible with GR) sat inside the sounding band.

@@ -228,6 +228,7 @@ pub fn needs_whole_volume(product: RadarProduct) -> bool {
             | RadarProduct::VilDensity
             | RadarProduct::ProbabilityOfSevereHail
             | RadarProduct::MaxExpectedHailSize
+            | RadarProduct::HydrometeorClassification
     )
 }
 
@@ -704,7 +705,9 @@ impl RenderDispatcher {
     ) -> Option<(f64, f64)> {
         matches!(
             product,
-            RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize
+            RadarProduct::ProbabilityOfSevereHail
+                | RadarProduct::MaxExpectedHailSize
+                | RadarProduct::HydrometeorClassification
         )
         .then(|| {
             self.env_heights
@@ -787,8 +790,11 @@ impl RenderDispatcher {
         let storm_motion = (product == RadarProduct::StormRelativeVelocity)
             .then(|| self.storm_motion_override_kt())
             .flatten();
-        // The environmental heights ride the same way for the hail pair,
-        // read from the field `set_env_heights` invalidates on.
+        // The environmental heights ride the same way for the hail pair and
+        // the classification, read from the field `set_env_heights`
+        // invalidates on. A missing or stale-kept entry means the product
+        // runs on its adaptation defaults, which is the documented
+        // no-sounding behavior, not an error.
         let env_heights = self.env_heights_km_msl_for(product, site);
         log::info!(
             "Spawning background render for pane {}: {:?} at {:.1}°",
@@ -969,7 +975,9 @@ mod level3_dispatch_tests {
 
     /// Every remaining Level III product resolves from its cache — none is
     /// filtered. Storm-relative velocity is deliberately absent: it is a
-    /// Level II product now and never reaches this cache at all.
+    /// Level II product now and never reaches this cache at all — and the
+    /// hydrometeor classification joined it (the hybrid composite derives
+    /// from Level II; see `rustdar_radar::hhc`).
     #[test]
     fn every_level3_product_resolves_from_its_cache() {
         let mut d = RenderDispatcher::new();
@@ -977,7 +985,6 @@ mod level3_dispatch_tests {
             (RadarProduct::SpecificDifferentialPhase, "N0K", 163i16),
             (RadarProduct::EchoTops, "EET", 135),
             (RadarProduct::VerticallyIntegratedLiquid, "DVL", 134),
-            (RadarProduct::HydrometeorClassification, "HHC", 177),
             (RadarProduct::PrecipitationRate, "DPR", 176),
         ] {
             let p = product(product_code, 5, 1);

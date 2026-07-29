@@ -236,6 +236,25 @@ pub struct KdpParams {
 }
 
 impl KdpParams {
+    /// The render path's stand-in when only a decoded `Scan` is in hand
+    /// (the model drops the radial-header blocks): fleet-typical values
+    /// for the two parameters the classification cannot run without.
+    /// `dbz0` −43.5 dB sits mid-range of the RDA calibration constants the
+    /// 2026-07 precipitation survey read from archives (−41.0…−45.9);
+    /// `atmos` −0.012 dB/km was the value at every site surveyed. The
+    /// initial phase stays `None` — the documented estimator resolves it
+    /// from the data. A ±2 dB `dbz0` error moves only the no-echo boundary
+    /// at the SNR-5 dB fringe; the twin-validated paths always read the
+    /// real values via [`from_archive`](Self::from_archive).
+    pub fn render_fallback() -> Self {
+        Self {
+            init_fdp_deg: None,
+            dbz0: Some(-43.5),
+            atmos_db_per_km: Some(-0.012),
+            isdp_est_deg: None,
+        }
+    }
+
     /// Read the RDA parameters from a raw Level II archive file: the first
     /// digital-radar-data message's volume block (initial system PhiDP,
     /// calibration constant) and elevation block (atmos).

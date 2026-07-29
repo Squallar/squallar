@@ -337,7 +337,6 @@ impl RadarProduct {
             RadarProduct::SpecificDifferentialPhase
                 | RadarProduct::EchoTops
                 | RadarProduct::VerticallyIntegratedLiquid
-                | RadarProduct::HydrometeorClassification
                 | RadarProduct::PrecipitationRate
         )
     }
@@ -356,7 +355,6 @@ impl RadarProduct {
             RadarProduct::SpecificDifferentialPhase => Some(&["N0K"]),
             RadarProduct::EchoTops => Some(&["EET"]),
             RadarProduct::VerticallyIntegratedLiquid => Some(&["DVL"]),
-            RadarProduct::HydrometeorClassification => Some(&["HHC"]),
             RadarProduct::PrecipitationRate => Some(&["DPR"]),
             _ => None,
         }
@@ -456,11 +454,17 @@ impl RadarProduct {
             RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize => {
                 Some(MomentSlot::Reflectivity)
             }
+            // The hybrid hydrometeor classification composites every dual-pol
+            // tilt of the volume (crate::hhc); listing on reflectivity puts
+            // the tilt-independent volume product alongside the reflectivity
+            // tilts, the same convention as ETI and VIL density. The render
+            // payload carries the rest of the moments (crate::render_input's
+            // extras).
+            RadarProduct::HydrometeorClassification => Some(MomentSlot::Reflectivity),
             // Level III products. No Level II moment stands behind them.
             RadarProduct::SpecificDifferentialPhase
             | RadarProduct::EchoTops
             | RadarProduct::VerticallyIntegratedLiquid
-            | RadarProduct::HydrometeorClassification
             | RadarProduct::PrecipitationRate => None,
         }
     }

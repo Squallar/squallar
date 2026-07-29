@@ -627,6 +627,10 @@ pub fn render_radar_to_image_full(
         return render_hail_to_image(data, product, radar_lat, radar_lon, env_heights_km_msl);
     }
 
+    if product == types::RadarProduct::HydrometeorClassification {
+        return render_hhc_to_image(data, radar_lat, radar_lon, env_heights_km_msl);
+    }
+
     let radials = find_sweep(data, product, elevation_angle)?;
 
     if product == types::RadarProduct::NormalizedRotation {
@@ -1042,6 +1046,98 @@ pub fn render_hail_to_image(
                         gate: r,
                     };
                     proj.render_gate(bufs, &ctx, r as f64 + 0.5, 1.0, *v * unit_scale, from);
+                }
+            });
+        },
+    );
+    Some(output)
+}
+
+/// Render the locally derived Hybrid Hydrometeor Classification
+/// ([`crate::hhc::compute_hhc`]): the whole volume's per-tilt
+/// classification composited down the hybrid scan, a 1° × 0.25 km polar
+/// grid of class codes painted with the HHC palette. Tilt-independent —
+/// every elevation request renders the same volume product.
+///
+/// `env_heights_km_msl` is the sounding's (0 °C, −20 °C) pair; `None`
+/// falls back to the operational adaptation defaults, exactly as the RPG
+/// runs without environmental data. The radar height comes from the
+/// nearest-site table, as the EET render path's does; the radial-header
+/// parameters a decoded `Scan` cannot carry come from
+/// [`crate::kdp::KdpParams::render_fallback`] (fleet-typical `dbz0`/atmos —
+/// without a `dbz0` the SNR gate reads every gate as no-echo and the
+/// product would be blank) with the initial phase from the volume's own
+/// estimator, the same fallback family the KDP render arm documents.
+pub fn render_hhc_to_image(
+    scan: &Scan,
+    radar_lat: f64,
+    radar_lon: f64,
+    env_heights_km_msl: Option<(f64, f64)>,
+) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+    let radar_km_msl = crate::eet::radar_height_ft_near(radar_lat, radar_lon) * 0.0003048;
+    let params = crate::kdp::KdpParams {
+        isdp_est_deg: crate::kdp::estimate_volume_isdp(scan),
+        ..crate::kdp::KdpParams::render_fallback()
+    };
+    let (h0c, hsda) = match env_heights_km_msl {
+        Some((h0c, hm20c)) => (
+            h0c,
+            crate::hca::HsdaHeights::from_env_heights(h0c, hm20c, radar_km_msl),
+        ),
+        None => (
+            crate::hca::DEFAULT_HEIGHT_0_KM_MSL,
+            crate::hca::HsdaHeights::operational_defaults(radar_km_msl),
+        ),
+    };
+    let default_top_arl = (h0c - radar_km_msl).max(0.0);
+
+    let all: Vec<&[nexrad_model::data::Radial]> =
+        scan.sweeps().iter().map(|s| s.radials()).collect();
+    let dp: Vec<&[nexrad_model::data::Radial]> = all
+        .iter()
+        .copied()
+        .filter(|r| {
+            r.first()
+                .map(|x| x.differential_phase().is_some())
+                .unwrap_or(false)
+        })
+        .collect();
+    let cappi = crate::hca::build_refl_cappi(&dp);
+    let ml_sweeps: Vec<&[nexrad_model::data::Radial]> = dp
+        .iter()
+        .copied()
+        .filter(|r| {
+            r.first()
+                .map(|x| (4.0..=10.0).contains(&f64::from(x.elevation_angle_degrees())))
+                .unwrap_or(false)
+        })
+        .collect();
+    let ml =
+        crate::hca::detect_melting_layer(&ml_sweeps, &params, default_top_arl, &hsda, Some(&cappi));
+    let tilts = crate::hhc::volume_tilts(&all);
+    let grid = crate::hhc::compute_hhc(&tilts, &params, &ml, &hsda, Some(&cappi))?;
+
+    let max_gates = grid.values.iter().map(Vec::len).max().unwrap_or(0);
+    let max_range = grid.first_gate_km + max_gates as f64 * grid.gate_interval_km;
+    let output = render_with_projection(
+        radar_lat,
+        radar_lon,
+        max_range,
+        types::RadarProduct::HydrometeorClassification,
+        "Radar",
+        |proj, bufs| {
+            grid.values.par_iter().enumerate().for_each(|(az, row)| {
+                let ctx = RadialContext::new(az as f64 + 0.5, 0.5);
+                for (r, &v) in row.iter().enumerate() {
+                    if v.is_nan() {
+                        continue;
+                    }
+                    let range_km = grid.first_gate_km + r as f64 * grid.gate_interval_km;
+                    let from = GateId {
+                        radial: az,
+                        gate: r,
+                    };
+                    proj.render_gate(bufs, &ctx, range_km, grid.gate_interval_km, v, from);
                 }
             });
         },

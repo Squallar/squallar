@@ -254,8 +254,10 @@ mod tests {
     /// | Specific Differential Phase | `N0K` | 163 | Specific Differential Phase |
     /// | Echo Tops | `EET` | 135 | Enhanced Echo Tops |
     /// | Vertically Integrated Liquid | `DVL` | 134 | Digital Vertically Integrated Liquid |
-    /// | Hydrometeor Classification | `HHC` | 177 | Hybrid Hydrometeor Classification |
     /// | Precipitation Rate | `DPR` | 176 | Digital Instantaneous Precipitation Rate |
+    ///
+    /// Hydrometeor Classification's row (`HHC` 177) left with the fetch —
+    /// the product composites locally from Level II now ([`crate::hhc`]).
     ///
     /// The AWIPS IDs are listed **in request order**, so the table pins which
     /// tilt each one is, not merely that the set is right. Storm-relative
@@ -266,7 +268,6 @@ mod tests {
         (RadarProduct::SpecificDifferentialPhase, &[("N0K", 163)]),
         (RadarProduct::EchoTops, &[("EET", 135)]),
         (RadarProduct::VerticallyIntegratedLiquid, &[("DVL", 134)]),
-        (RadarProduct::HydrometeorClassification, &[("HHC", 177)]),
         (RadarProduct::PrecipitationRate, &[("DPR", 176)]),
     ];
 
