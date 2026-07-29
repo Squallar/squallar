@@ -1,6 +1,7 @@
 pub mod archive;
 pub mod chunks;
 pub(crate) mod dpprep;
+pub mod dpr;
 pub mod eet;
 pub mod hail;
 pub mod hca;

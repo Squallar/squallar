@@ -197,13 +197,13 @@ pub mod compare {
     ///   products represented by their centre gate.
     ///
     /// The domain is always ≤ 230 km: packet gates beyond it are ignored.
-    pub fn tally_packet(
-        derived: &[Vec<f32>],
-        packet: &RadialPacket,
-        l3_gate_km: f64,
-        codec: &ValueCodec,
-        kind: ProductKind,
-    ) -> Tally {
+    /// The packet's own gate levels on the 360° × 230 km comparison grid,
+    /// `None` where the packet has no gate for a cell.
+    ///
+    /// Levels, not values: what [`tally_packet`] compares is the level, so
+    /// the resampling has to stop short of the codec. [`crate::dpr`]'s
+    /// tolerance-based harness decodes them itself.
+    pub fn resample_packet_levels(packet: &RadialPacket, l3_gate_km: f64) -> Vec<Vec<Option<u16>>> {
         // Which packet radial covers each tenth of a degree; later radials
         // overwrite earlier ones, as in the SRM resampler.
         let mut slots: Vec<Option<usize>> = vec![None; 3600];
@@ -239,12 +239,33 @@ pub mod compare {
             }
         }
 
+        (0..360)
+            .map(|az| {
+                let radial = slots[az * 10 + 5].map(|ri| &packet.radials[ri]);
+                (0..RANGE_BINS)
+                    .map(|r| {
+                        radial.and_then(|run| {
+                            gate_for_bin[r].and_then(|j| run.gate_values.get(j).copied())
+                        })
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    pub fn tally_packet(
+        derived: &[Vec<f32>],
+        packet: &RadialPacket,
+        l3_gate_km: f64,
+        codec: &ValueCodec,
+        kind: ProductKind,
+    ) -> Tally {
+        let levels = resample_packet_levels(packet, l3_gate_km);
+
         let mut t = Tally::default();
         for (az, row) in derived.iter().take(360).enumerate() {
-            let radial = slots[az * 10 + 5].map(|ri| &packet.radials[ri]);
             for (r, &v) in row.iter().take(RANGE_BINS).enumerate() {
-                let l3_level: Option<u16> = radial
-                    .and_then(|run| gate_for_bin[r].and_then(|j| run.gate_values.get(j).copied()));
+                let l3_level: Option<u16> = levels[az][r];
                 let l3_defined = l3_level.is_some_and(|g| codec.decode(g).is_finite());
                 match (v.is_finite(), l3_defined) {
                     (true, true) => {
@@ -436,6 +457,52 @@ pub mod live {
             });
         }
         None
+    }
+
+    /// The volume's **latest** object for a product, rather than
+    /// [`l3_twin`]'s nearest-to-start one.
+    ///
+    /// The QPE products (`HHC`, `DPR`) are emitted once per volume *plus*
+    /// one intermediate per SAILS/MRLE scan, all naming the same volume
+    /// start. The end-of-volume object is the full composite; the
+    /// intermediates are partial. `l3_twin` takes the candidate nearest the
+    /// volume start, which under SAILS is an intermediate — so these
+    /// harnesses take the maximum key among the candidates that name the
+    /// volume instead.
+    pub async fn latest_l3_twin(
+        sources: &DataSources,
+        site: &str,
+        awips_code: &str,
+        l2_volume_start: NaiveDateTime,
+    ) -> Option<Level3Product> {
+        let mut best: Option<Level3Product> = None;
+        for key in candidate_keys(sources, site, awips_code, l2_volume_start).await {
+            let url = sources.level3_object_url(&key);
+            let Ok(bytes) = archive::get_bytes(archive::shared_client(), url).await else {
+                continue;
+            };
+            let Ok(message) = nexrad_level3::decode::decode_product(&bytes) else {
+                continue;
+            };
+            let Some(started) = super::compare::volume_scan_started(&message.pdb) else {
+                continue;
+            };
+            if (started - l2_volume_start).num_seconds().abs() > 60 {
+                continue;
+            }
+            let product = Level3Product {
+                message,
+                stamp: ProductStamp::from_key(key),
+                bytes: std::sync::Arc::new(bytes),
+            };
+            if best
+                .as_ref()
+                .is_none_or(|b| product.stamp.key > b.stamp.key)
+            {
+                best = Some(product);
+            }
+        }
+        best
     }
 
     /// The pairing invariant, live: a recent KOAX volume and its EET twin

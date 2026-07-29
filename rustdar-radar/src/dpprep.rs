@@ -65,6 +65,11 @@ pub(crate) const WINDOW: usize = 5;
 /// `short_gate` / `long_gate`: the two KDP estimation windows.
 pub(crate) const SHORT_GATE: usize = 9;
 pub(crate) const LONG_GATE: usize = 25;
+/// `ra_gate` (B19, CCR NA17-00156): the window of the **PhiRA** field the
+/// specific-attenuation rate reads — a plain 7-gate mean of the *unfolded*
+/// φ (not the median-filtered, met-masked φ the two KDP windows smooth),
+/// interpolated across the same meteorological groups.
+pub(crate) const RA_GATE: usize = 7;
 /// High-attenuation-radial test (`art_*`).
 pub(crate) const ART_START_BIN: usize = 180;
 pub(crate) const ART_COUNT: usize = 10;

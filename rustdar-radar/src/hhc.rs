@@ -38,10 +38,23 @@
 //!   KDP), R(Z, ZDR) for HR at ≤ 45 dBZ, R(Z)·0.8 for RH above `bin_tt`;
 //!   on a high-attenuation radial a failed rate re-tries R(Z, ZDR), R(Z),
 //!   R(KDP) in order (`AEL 3.1.2.4`). Only **validity** decides the HHC —
-//!   the rate magnitudes feed the rate products, not this one, and the
-//!   R(A) specific-attenuation path (`RofA_switch = ON`) selects *between
-//!   valid* rate forms for RA/BD/HR, never between valid and invalid, so
-//!   it cannot change a class outcome and is not transcribed.
+//!   the rate magnitudes feed the rate products, not this one.
+//!
+//! The R(A) specific-attenuation path (`RofA_switch = ON`) is *not*
+//! transcribed here: it selects between rate forms for RA/BD/HR, and while
+//! `compute_RateRA` does always answer — so it can in principle make a bin
+//! usable that R(Z, ZDR) could not, at a gate whose class is rain but whose
+//! ZDR is absent — that combination is vanishingly rare (the fuzzy
+//! classification needs ZDR to reach RA in the first place) and the
+//! surveyed agreement below is measured with it absent. [`crate::dpr`],
+//! which must have R(A) for the rate itself, runs the full test and so
+//! fills a handful more bins than this module does.
+//!
+//! The ladder itself lives in [`composite_hybrid_scan`] and is **shared**
+//! with [`crate::dpr`]: the RPG fills `HybridHCA` (this product) and
+//! `RateComb` (product 176) from one pass of `Add_bin_to_RR_Polar_Grid`, so
+//! the tiering, the SAILS lists and the `Grid_is_full` stop are written
+//! once and each module supplies only its own per-bin answer.
 //!
 //! **SAILS/MRLE** (`Sails_opt = YES`, CCR NA17-00126): bins that computed
 //! a good rate on base cut *k* (k ≤ 4) are recorded, and each supplemental
@@ -145,7 +158,7 @@ use nexrad_model::data::Radial;
 
 /// The QPEHHC grid: 360 × 920 gates of 0.25 km (`dp_Consts.h`).
 pub const HHC_BINS: usize = 920;
-const HHC_AZ: usize = 360;
+pub(crate) const HHC_AZ: usize = 360;
 
 // ── dp_precip.alg fleet defaults the compositor reads ───────────────────────
 
@@ -158,23 +171,28 @@ const MAX_SUPP_LISTS: usize = 4;
 /// Supplemental cuts repeat an earlier target angle within this.
 const SUPP_ANGLE_TOL: f32 = 0.3;
 
-/// One prepared tilt: the per-azimuth classification and the fields the
-/// usability check reads, plus the melting-layer `bin_tt` per azimuth.
-struct Tilt {
-    elev_deg: f64,
-    /// `Some(k)`: a supplemental cut repeating base cut `k` (1-based).
-    supplements: Option<usize>,
-    rows: Vec<Option<TiltRow>>,
-}
+/// One prepared tilt's per-azimuth rows: the classification and the fields
+/// the usability check reads, plus the melting-layer bins per azimuth.
+/// `None` where the tilt carried no radial for that whole degree.
+pub(crate) type Tilt = Vec<Option<TiltRow>>;
 
-struct TiltRow {
-    class: Vec<usize>,
-    smz: Vec<f64>,
-    zdr: Vec<f64>,
-    kdp: Vec<f64>,
-    met: Vec<f64>,
-    hatt: bool,
-    bin_tt: i64,
+pub(crate) struct TiltRow {
+    pub(crate) class: Vec<usize>,
+    pub(crate) smz: Vec<f64>,
+    pub(crate) zdr: Vec<f64>,
+    pub(crate) kdp: Vec<f64>,
+    pub(crate) rho: Vec<f64>,
+    pub(crate) met: Vec<f64>,
+    /// The specific-attenuation rate's two extra preprocessor fields.
+    pub(crate) raw_smz: Vec<f64>,
+    pub(crate) phi_ra: Vec<f64>,
+    pub(crate) hatt: bool,
+    /// `beam_edge_top`: where the beam's lower edge crosses the melting
+    /// layer's top, in DP bins.
+    pub(crate) bin_tt: i64,
+    /// `beam_edge_bottom`: where the beam's upper edge crosses the melting
+    /// layer's bottom, in DP bins — the R(A) subsystem's search limit.
+    pub(crate) bin_bb: i64,
 }
 
 /// The derived hybrid classification, at the product's own geometry.
@@ -245,11 +263,8 @@ pub fn volume_tilts(sweeps: &[&[Radial]]) -> Vec<(f32, Vec<Radial>)> {
 
 /// Prepare one tilt: recombine, run the dpprep/QIA chain and the per-tilt
 /// classification, and index the radials by whole degree.
-#[allow(clippy::too_many_arguments)]
-fn prepare_tilt(
-    elev_deg: f32,
+pub(crate) fn prepare_tilt(
     radials: &[Radial],
-    supplements: Option<usize>,
     params: &KdpParams,
     ml: &MeltingLayer,
     hsda: &HsdaHeights,
@@ -265,7 +280,7 @@ fn prepare_tilt(
     let dbz0 = params.dbz0.map(f64::from);
     let atmos = params.atmos_db_per_km.map(f64::from);
 
-    let mut rows: Vec<Option<TiltRow>> = (0..HHC_AZ).map(|_| None).collect();
+    let mut rows: Tilt = (0..HHC_AZ).map(|_| None).collect();
     for c in &combined {
         let f = radial_fields(
             c,
@@ -278,21 +293,163 @@ fn prepare_tilt(
         );
         let class = classify_radial(&f, ml, hsda.tw0_km_arl);
         let az = (f.az.rem_euclid(360.0)) as usize % HHC_AZ;
-        let bin_tt = beam_ml_intersection(f.elev, az, f.dg, ml).tt;
+        let ml_bins = beam_ml_intersection(f.elev, az, f.dg, ml);
         rows[az] = Some(TiltRow {
             class,
             smz: f.smz,
             zdr: f.zdr,
             kdp: f.kdp,
+            rho: f.rho,
             met: f.met,
+            raw_smz: f.raw_smz,
+            phi_ra: f.phi_ra,
             hatt: f.hatt,
-            bin_tt,
+            bin_tt: ml_bins.tt,
+            bin_bb: ml_bins.bb,
         });
     }
-    Some(Tilt {
-        elev_deg: f64::from(elev_deg),
-        supplements,
-        rows,
+    Some(rows)
+}
+
+/// One volume's hybrid-scan composite, whatever the per-bin answer is.
+pub(crate) struct Composite<T> {
+    /// `[azimuth 0..360][bin 0..920]`, `None` where the ladder never filled.
+    pub(crate) cells: Vec<Vec<Option<T>>>,
+    /// Range to the centre of bin 0, km, and the bin size.
+    pub(crate) first_gate_km: f64,
+    pub(crate) gate_interval_km: f64,
+    /// `pct_hybrate_filled`: percent of the grid that concluded an answer.
+    pub(crate) pct_filled: f64,
+    /// `highest_elang`: the highest base elevation processed, degrees.
+    pub(crate) highest_elev_deg: f64,
+}
+
+/// **The hybrid-scan ladder** of `qperate_build_RainfallRate.c`
+/// (`build_RR_Polar_Grid` / `Add_bin_to_RR_Polar_Grid`), shared by the two
+/// products the task emits from one pass — `HybridHCA` (product 177, this
+/// module) and `RateComb` (product 176, [`crate::dpr`]). The RPG fills both
+/// grids from the same `compute_IRRate` outcome at the same bins, so the
+/// ladder, the SAILS/MRLE replacement lists and the `Grid_is_full` stop live
+/// here once.
+///
+/// `prepare` turns a tilt's radials into whatever state the per-bin answer
+/// needs (`None` skips the tilt entirely); `answer` is `Add_bin`'s
+/// question — `Some(value)` fills the bin, `None` sends it up the ladder.
+/// Supplemental (SAILS/MRLE) cuts recompute exactly the bins their base cut
+/// filled and a failure keeps the original value, which is why `answer`
+/// takes `&mut` access to nothing and the caller keeps no state between
+/// bins.
+pub(crate) fn composite_hybrid_scan<S, T, P, A>(
+    tilts: &[(f32, Vec<Radial>)],
+    mut prepare: P,
+    mut answer: A,
+) -> Option<Composite<T>>
+where
+    T: Clone,
+    P: FnMut(&[Radial]) -> Option<S>,
+    A: FnMut(&S, usize, usize) -> Option<T>,
+{
+    // Mark supplemental cuts: a repeat of an earlier tilt's target angle.
+    let mut base_angles: Vec<f32> = Vec::new();
+    let mut marked: Vec<(f32, &Vec<Radial>, Option<usize>)> = Vec::new();
+    for (angle, radials) in tilts {
+        let supplements = base_angles
+            .iter()
+            .position(|a| (a - angle).abs() < SUPP_ANGLE_TOL)
+            .map(|k| k + 1);
+        if supplements.is_none() {
+            base_angles.push(*angle);
+        }
+        marked.push((*angle, radials, supplements));
+    }
+    let has_supp = marked.iter().any(|(_, _, s)| s.is_some());
+
+    let mut geometry: Option<(f64, f64)> = None;
+    let mut cells: Vec<Vec<Option<T>>> = vec![vec![None; HHC_BINS]; HHC_AZ];
+    let mut pending: Vec<(u16, u16)> = Vec::new();
+    let mut lists: [Vec<(u16, u16)>; MAX_SUPP_LISTS] = Default::default();
+    let mut filled: usize = 0;
+    let min_bins = ((HHC_AZ * HHC_BINS) as f64 * GRID_IS_FULL_PCT * 0.01).ceil() as usize;
+
+    let mut base_ind = 0usize;
+    let mut highest_elev = 0.0f64;
+    let mut done = false;
+    for (angle, radials, supplements) in marked {
+        if done {
+            break;
+        }
+        let Some(tilt) = prepare(radials) else {
+            continue;
+        };
+        if geometry.is_none()
+            && let Some(input) = radials.iter().filter_map(DpInput::from_radial).next()
+        {
+            geometry = Some((input.dr0, input.dg));
+        }
+
+        if let Some(k) = supplements {
+            // A supplemental cut recomputes exactly the bins its base cut
+            // filled; failures keep the original value, nothing is added
+            // to the hybrid list, and the filled count stands.
+            if k <= MAX_SUPP_LISTS {
+                for &(az, rng) in &lists[k - 1] {
+                    if let Some(v) = answer(&tilt, az as usize, rng as usize) {
+                        cells[az as usize][rng as usize] = Some(v);
+                    }
+                }
+            }
+            continue;
+        }
+
+        base_ind += 1;
+        highest_elev = f64::from(angle);
+        if base_ind == 1 {
+            // The lowest cut tries the whole grid (AEL 3.1.2).
+            for (az, row) in cells.iter_mut().enumerate() {
+                for (rng, cell) in row.iter_mut().enumerate() {
+                    match answer(&tilt, az, rng) {
+                        Some(v) => {
+                            *cell = Some(v);
+                            filled += 1;
+                            if has_supp {
+                                lists[0].push((az as u16, rng as u16));
+                            }
+                        }
+                        None => pending.push((az as u16, rng as u16)),
+                    }
+                }
+            }
+        } else {
+            // Higher cuts retry only the hybrid list.
+            let mut next_pending = Vec::with_capacity(pending.len());
+            for &(az, rng) in &pending {
+                match answer(&tilt, az as usize, rng as usize) {
+                    Some(v) => {
+                        cells[az as usize][rng as usize] = Some(v);
+                        filled += 1;
+                        if has_supp && base_ind <= MAX_SUPP_LISTS {
+                            lists[base_ind - 1].push((az, rng));
+                        }
+                    }
+                    None => next_pending.push((az, rng)),
+                }
+            }
+            pending = next_pending;
+        }
+
+        // Termination: SAILS/MRLE VCPs process the whole volume; otherwise
+        // the ladder stops once the grid is effectively full.
+        if !has_supp && filled >= min_bins {
+            done = true;
+        }
+    }
+    let (first_gate_km, gate_interval_km) = geometry?;
+    Some(Composite {
+        cells,
+        first_gate_km,
+        gate_interval_km,
+        pct_filled: 100.0 * filled as f64 / (HHC_AZ * HHC_BINS) as f64,
+        highest_elev_deg: highest_elev,
     })
 }
 
@@ -369,120 +526,25 @@ pub(crate) fn compute_hhc_impl(
     cappi: Option<&ReflCappi>,
     opts: HcaOptions,
 ) -> Option<DerivedHhc> {
-    // Mark supplemental cuts: a repeat of an earlier tilt's target angle.
-    let mut base_angles: Vec<f32> = Vec::new();
-    let mut marked: Vec<(f32, &Vec<Radial>, Option<usize>)> = Vec::new();
-    for (angle, radials) in tilts {
-        let supplements = base_angles
-            .iter()
-            .position(|a| (a - angle).abs() < SUPP_ANGLE_TOL)
-            .map(|k| k + 1);
-        if supplements.is_none() {
-            base_angles.push(*angle);
-        }
-        marked.push((*angle, radials, supplements));
-    }
-    let has_supp = marked.iter().any(|(_, _, s)| s.is_some());
+    let composite = composite_hybrid_scan(
+        tilts,
+        |radials| prepare_tilt(radials, params, ml, hsda, cappi, opts),
+        |tilt: &Tilt, az, rng| {
+            tilt[az]
+                .as_ref()
+                .and_then(|row| bin_outcome(row, rng, opts.metsignal))
+        },
+    )?;
 
-    let mut geometry: Option<(f64, f64)> = None;
-    let mut hhc: Vec<[u8; HHC_BINS]> = vec![[u8::MAX; HHC_BINS]; HHC_AZ];
-    let mut pending: Vec<(u16, u16)> = Vec::new();
-    let mut lists: [Vec<(u16, u16)>; MAX_SUPP_LISTS] = Default::default();
-    let mut filled: usize = 0;
-    let min_bins = ((HHC_AZ * HHC_BINS) as f64 * GRID_IS_FULL_PCT * 0.01).ceil() as usize;
-
-    let mut base_ind = 0usize;
-    let mut highest_elev = 0.0f64;
-    let mut done = false;
-    for (angle, radials, supplements) in marked {
-        if done {
-            break;
-        }
-        let Some(tilt) = prepare_tilt(angle, radials, supplements, params, ml, hsda, cappi, opts)
-        else {
-            continue;
-        };
-        if geometry.is_none()
-            && let Some(input) = radials.iter().filter_map(DpInput::from_radial).next()
-        {
-            geometry = Some((input.dr0, input.dg));
-        }
-
-        if let Some(k) = tilt.supplements {
-            // A supplemental cut recomputes exactly the bins its base cut
-            // filled; failures keep the original value, nothing is added
-            // to the hybrid list, and the filled count stands.
-            if k <= MAX_SUPP_LISTS {
-                for &(az, rng) in &lists[k - 1] {
-                    if let Some(row) = &tilt.rows[az as usize]
-                        && let Some(class) = bin_outcome(row, rng as usize, opts.metsignal)
-                    {
-                        hhc[az as usize][rng as usize] = class as u8;
-                    }
-                }
-            }
-            continue;
-        }
-
-        base_ind += 1;
-        highest_elev = tilt.elev_deg;
-        if base_ind == 1 {
-            // The lowest cut tries the whole grid (AEL 3.1.2).
-            for (az, hhc_row) in hhc.iter_mut().enumerate() {
-                for (rng, cell) in hhc_row.iter_mut().enumerate() {
-                    match tilt.rows[az]
-                        .as_ref()
-                        .and_then(|row| bin_outcome(row, rng, opts.metsignal))
-                    {
-                        Some(class) => {
-                            *cell = class as u8;
-                            filled += 1;
-                            if has_supp {
-                                lists[0].push((az as u16, rng as u16));
-                            }
-                        }
-                        None => pending.push((az as u16, rng as u16)),
-                    }
-                }
-            }
-        } else {
-            // Higher cuts retry only the hybrid list.
-            let mut next_pending = Vec::with_capacity(pending.len());
-            for &(az, rng) in &pending {
-                match tilt.rows[az as usize]
-                    .as_ref()
-                    .and_then(|row| bin_outcome(row, rng as usize, opts.metsignal))
-                {
-                    Some(class) => {
-                        hhc[az as usize][rng as usize] = class as u8;
-                        filled += 1;
-                        if has_supp && base_ind <= MAX_SUPP_LISTS {
-                            lists[base_ind - 1].push((az, rng));
-                        }
-                    }
-                    None => next_pending.push((az, rng)),
-                }
-            }
-            pending = next_pending;
-        }
-
-        // Termination: SAILS/MRLE VCPs process the whole volume; otherwise
-        // the ladder stops once the grid is effectively full.
-        if !has_supp && filled >= min_bins {
-            done = true;
-        }
-    }
-    let (first_gate_km, gate_interval_km) = geometry?;
-
-    let values: Vec<Vec<f32>> = hhc
+    let values: Vec<Vec<f32>> = composite
+        .cells
         .iter()
         .map(|row| {
             row.iter()
-                .map(|&c| {
-                    if c == u8::MAX {
-                        f32::NAN
-                    } else {
-                        let code = CLASS_EXTERNAL[c as usize];
+                .map(|c| match c {
+                    None => f32::NAN,
+                    Some(class) => {
+                        let code = CLASS_EXTERNAL[*class];
                         if code == 0.0 { f32::NAN } else { code }
                     }
                 })
@@ -492,10 +554,10 @@ pub(crate) fn compute_hhc_impl(
 
     Some(DerivedHhc {
         values,
-        first_gate_km,
-        gate_interval_km,
-        pct_filled: 100.0 * filled as f64 / (HHC_AZ * HHC_BINS) as f64,
-        highest_elev_deg: highest_elev,
+        first_gate_km: composite.first_gate_km,
+        gate_interval_km: composite.gate_interval_km,
+        pct_filled: composite.pct_filled,
+        highest_elev_deg: composite.highest_elev_deg,
     })
 }
 
@@ -784,45 +846,6 @@ mod live_validation {
         }
     }
 
-    /// The volume's **latest** HHC object: every candidate naming the
-    /// volume start, maximum key. `l3_twin` takes the nearest-to-start
-    /// candidate, which under SAILS is an intermediate composite.
-    async fn latest_hhc_twin(
-        sources: &DataSources,
-        site: &str,
-        l2_start: chrono::NaiveDateTime,
-    ) -> Option<crate::level3::Level3Product> {
-        let mut best: Option<crate::level3::Level3Product> = None;
-        for key in live::candidate_keys(sources, site, "HHC", l2_start).await {
-            let url = sources.level3_object_url(&key);
-            let Ok(bytes) = crate::archive::get_bytes(crate::archive::shared_client(), url).await
-            else {
-                continue;
-            };
-            let Ok(message) = nexrad_level3::decode::decode_product(&bytes) else {
-                continue;
-            };
-            let Some(started) = compare::volume_scan_started(&message.pdb) else {
-                continue;
-            };
-            if (started - l2_start).num_seconds().abs() > 60 {
-                continue;
-            }
-            let product = crate::level3::Level3Product {
-                message,
-                stamp: crate::level3::ProductStamp::from_key(key),
-                bytes: std::sync::Arc::new(bytes),
-            };
-            if best
-                .as_ref()
-                .is_none_or(|b| product.stamp.key > b.stamp.key)
-            {
-                best = Some(product);
-            }
-        }
-        best
-    }
-
     #[ignore = "hits the live S3 bucket"]
     #[tokio::test]
     async fn live_derived_hhc_matches_the_rpgs_own_product() {
@@ -911,7 +934,7 @@ mod live_validation {
                 tilts.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
             );
 
-            let Some(twin) = latest_hhc_twin(&sources, site, l2_start).await else {
+            let Some(twin) = live::latest_l3_twin(&sources, site, "HHC", l2_start).await else {
                 println!("{site}: SKIP — no HHC twin names volume {l2_start}");
                 continue;
             };
