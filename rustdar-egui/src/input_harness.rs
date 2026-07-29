@@ -128,28 +128,94 @@ pub(crate) struct InputHarness {
     last_actions: Vec<crate::actions::GuiAction>,
     /// Every text run painted during the last frame, with its layout rect.
     last_texts: Vec<(egui::Rect, String)>,
-    /// Rects egui itself flagged as having changed widget id between passes,
+    /// Rects that came back under a different widget id between passes,
     /// accumulated over every frame since the last [`InputHarness::clear_id_changes`].
     /// See [`InputHarness::id_changes`].
     id_changes: Vec<egui::Rect>,
+    /// The previous pass's widget bookkeeping, diffed against each new pass by
+    /// [`id_changes_between`] to feed [`InputHarness::id_changes`].
+    prev_widgets: egui::WidgetRects,
 }
 
-/// The debug marker `egui::context::warn_if_rect_changes_id` emits alongside its
-/// `log::warn!`: a 2px red outside stroke, no fill, clipped to everything.
+/// The finished pass's widget bookkeeping, read back out of the context.
 ///
-/// Matching the painted marker rather than capturing the log is what makes this
-/// a read of egui's *output*. Nothing in this app paints an unfilled red 2px
-/// rect at `Rect::EVERYTHING` clip, so the signature is unambiguous.
-fn id_change_marker(clipped: &egui::epaint::ClippedShape) -> Option<egui::Rect> {
-    let egui::Shape::Rect(rect_shape) = &clipped.shape else {
-        return None;
-    };
-    let matches = clipped.clip_rect == egui::Rect::EVERYTHING
-        && rect_shape.fill == egui::Color32::TRANSPARENT
-        && rect_shape.stroke.color == egui::Color32::RED
-        && (rect_shape.stroke.width - 2.0).abs() < f32::EPSILON
-        && rect_shape.stroke_kind == egui::StrokeKind::Outside;
-    matches.then_some(rect_shape.rect)
+/// [`egui::Context::end_pass`] swaps the pass it just closed into `prev_pass`,
+/// so immediately after it returns this is the pass that just painted.
+fn pass_widgets(ctx: &egui::Context) -> egui::WidgetRects {
+    ctx.viewport(|viewport| viewport.prev_pass.widgets.clone())
+}
+
+/// Rects that came back under a different widget id while staying put: the
+/// verdict of `egui::context::warn_if_rect_changes_id` — the check that logs
+/// `Widget rect … changed id between passes` on device — mirrored condition
+/// for condition (`egui-0.35.0/src/context.rs:4177`) over the same
+/// [`egui::WidgetRects`] bookkeeping it runs on.
+///
+/// Mirrored rather than read, because egui's own check is `#[cfg(debug_assertions)]`
+/// — the function *and* its call site — so in a release build it is compiled
+/// out entirely, no runtime option can enable it, and the red marker rect it
+/// paints in debug never exists to be matched. The bookkeeping is maintained
+/// in every profile, so this reader answers identically under `cargo test`
+/// and `cargo test --release`, and
+/// `the_id_change_probe_reports_a_real_id_change` holds it against a real id
+/// change in whichever profile is running.
+fn id_changes_between(prev: &egui::WidgetRects, new: &egui::WidgetRects) -> Vec<egui::Rect> {
+    use std::collections::BTreeMap;
+
+    /// Bitwise key so exact float equality groups rects, as egui's
+    /// `OrderedRect` does.
+    fn rect_key(rect: &egui::Rect) -> [u32; 4] {
+        [
+            rect.min.x.to_bits(),
+            rect.min.y.to_bits(),
+            rect.max.x.to_bits(),
+            rect.max.y.to_bits(),
+        ]
+    }
+
+    fn by_rect<'a>(
+        widgets: impl Iterator<Item = &'a egui::WidgetRect>,
+    ) -> BTreeMap<[u32; 4], Vec<&'a egui::WidgetRect>> {
+        let mut lookup: BTreeMap<[u32; 4], Vec<&egui::WidgetRect>> = BTreeMap::new();
+        for widget in widgets {
+            lookup
+                .entry(rect_key(&widget.rect))
+                .or_default()
+                .push(widget);
+        }
+        lookup
+    }
+
+    let mut changed = Vec::new();
+    for (layer_id, new_layer_widgets) in new.layers() {
+        let prev_by_rect = by_rect(prev.get_layer(*layer_id));
+        for (key, new_at_rect) in by_rect(new_layer_widgets.iter()) {
+            let Some(prev_at_rect) = prev_by_rect.get(&key) else {
+                continue; // this rect did not exist in the previous pass
+            };
+            if prev_at_rect
+                .iter()
+                .any(|pw| new_at_rect.iter().any(|nw| nw.id == pw.id))
+            {
+                continue; // at least one id stayed the same: not an id change
+            }
+            // If every previous id still exists somewhere this pass, widgets
+            // merely shifted and the rect match is a coincidence.
+            if prev_at_rect.iter().all(|pw| new.contains(pw.id)) {
+                continue;
+            }
+            // If every parent id changed too, this is a cascading id shift,
+            // not a widget bug.
+            if !prev_at_rect
+                .iter()
+                .any(|pw| new_at_rect.iter().any(|nw| nw.parent_id == pw.parent_id))
+            {
+                continue;
+            }
+            changed.push(new_at_rect[0].rect);
+        }
+    }
+    changed
 }
 
 impl InputHarness {
@@ -179,6 +245,7 @@ impl InputHarness {
             last_actions: Vec::new(),
             last_texts: Vec::new(),
             id_changes: Vec::new(),
+            prev_widgets: egui::WidgetRects::default(),
         };
         harness.warm_up();
         // The first frame's `check_auto_polls` starts the initial fetch and
@@ -425,12 +492,15 @@ impl InputHarness {
         &self.last_rects
     }
 
-    /// Rects egui flagged as having changed widget id between passes, since the
-    /// last [`InputHarness::clear_id_changes`].
+    /// Rects that came back under a different widget id between passes, since
+    /// the last [`InputHarness::clear_id_changes`].
     ///
-    /// This is egui's own verdict, read out of the frame it painted — the same
-    /// check that logs `Widget rect … changed id between passes` on device. It
-    /// is gated on `debug_assertions`, which `cargo test` always has.
+    /// The same verdict egui logs as `Widget rect … changed id between passes`
+    /// on device, computed by [`id_changes_between`] from the per-pass widget
+    /// bookkeeping egui maintains in every build profile. egui's own check is
+    /// compiled out of release builds, so reading its painted debug marker
+    /// instead would leave `cargo test --release` asserting on a probe that
+    /// cannot fire.
     pub(crate) fn id_changes(&self) -> &[egui::Rect] {
         &self.id_changes
     }
@@ -895,8 +965,10 @@ impl InputHarness {
         };
 
         let full_output = ctx.end_pass();
+        let widgets = pass_widgets(&ctx);
         self.id_changes
-            .extend(full_output.shapes.iter().filter_map(id_change_marker));
+            .extend(id_changes_between(&self.prev_widgets, &widgets));
+        self.prev_widgets = widgets;
         self.last_rects = full_output
             .shapes
             .iter()
@@ -4187,8 +4259,9 @@ mod tests {
     ///     three widgets mid-fetch and one after. So the frame the first scan
     ///     landed re-keyed a widget, twice per launch.
     ///
-    ///     This reads egui's verdict out of the frame it painted, so it fires
-    ///     for any widget that acquires the same hazard, not just this one.
+    ///     This reads the verdict off egui's per-pass widget bookkeeping, so
+    ///     it fires for any widget that acquires the same hazard, not just
+    ///     this one.
     #[test]
     fn a_scan_arriving_moves_no_widget_id() {
         // Roughly a Fold 7 inner screen: wide enough for the long status bar,
@@ -4229,9 +4302,10 @@ mod tests {
     ///      note in `ui_chrome.rs` for why, and why there is no fix that is
     ///      not worse.
     ///
-    ///      What this pins is the *extent* of it. egui's own marker says which
-    ///      rects moved, so if the shift ever reaches a widget outside the
-    ///      status bar — where something does store state across frames — this
+    ///      What this pins is the *extent* of it. egui's own widget
+    ///      bookkeeping says which rects moved, so if the shift ever reaches a
+    ///      widget outside the status bar — where something does store state
+    ///      across frames — this
     ///      fails rather than being noticed by someone re-deriving the whole
     ///      mechanism a third time. If it fails because the list came back
     ///      empty, the shift is gone and the note in `ui_chrome.rs` can go
@@ -4369,13 +4443,17 @@ mod tests {
     /// 35. **...and the probe that says so can see a real one.**
     ///
     ///     [`a_scan_arriving_moves_no_widget_id`] asserts on an empty list, so
-    ///     a marker signature that matched nothing would pass it forever. This
-    ///     drives egui with a deliberately unstable id at a fixed rect and
-    ///     requires the same reader to report it.
+    ///     a reader that matched nothing would pass it forever — which is
+    ///     exactly what happened when the reader was egui's painted debug
+    ///     marker: that marker is compiled out of release builds, and only
+    ///     this test noticed. This drives egui with a deliberately unstable id
+    ///     at a fixed rect and requires the same reader the harness uses to
+    ///     report it, in whichever profile is running.
     #[test]
     fn the_id_change_probe_reports_a_real_id_change() {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0));
         let ctx = egui::Context::default();
+        let mut prev_widgets = egui::WidgetRects::default();
         let mut seen = Vec::new();
         for pass in 0..3u32 {
             ctx.begin_pass(egui::RawInput {
@@ -4392,7 +4470,10 @@ mod tests {
             let rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(50.0, 20.0));
             // Same rect, new id, same parent: exactly what egui warns about.
             root.interact(rect, egui::Id::new(("canary", pass)), egui::Sense::click());
-            seen.extend(ctx.end_pass().shapes.iter().filter_map(id_change_marker));
+            let _ = ctx.end_pass();
+            let widgets = pass_widgets(&ctx);
+            seen.extend(id_changes_between(&prev_widgets, &widgets));
+            prev_widgets = widgets;
         }
         assert!(
             !seen.is_empty(),
