@@ -960,12 +960,40 @@ pub fn render_level3_radial_to_image(
     offset: f32,
     lut: Option<&[f32]>,
 ) -> Option<(Vec<u8>, f64, Vec<f32>)> {
+    render_level3_radial_with_gate_km(
+        radial_packet,
+        radial_packet.gate_interval_km(),
+        product,
+        radar_lat,
+        radar_lon,
+        scale,
+        offset,
+        lut,
+    )
+}
+
+/// [`render_level3_radial_to_image`] with the gate spacing chosen by the
+/// caller. The message path passes the PDB's product-code override — some
+/// products' packet-16 scale-factor halfword does not carry the gate size
+/// (see `ProductDescriptionBlock::range_gate_km`) — so the first gate's range
+/// is also re-derived from `first_range_bin` at the chosen spacing rather
+/// than taken from the packet.
+#[allow(clippy::too_many_arguments)]
+fn render_level3_radial_with_gate_km(
+    radial_packet: &nexrad_level3::model::RadialPacket,
+    gate_interval: f64,
+    product: types::RadarProduct,
+    radar_lat: f64,
+    radar_lon: f64,
+    scale: f32,
+    offset: f32,
+    lut: Option<&[f32]>,
+) -> Option<(Vec<u8>, f64, Vec<f32>)> {
     if radial_packet.radials.is_empty() {
         return None;
     }
 
-    let gate_interval = radial_packet.gate_interval_km();
-    let first_gate_range = radial_packet.first_gate_range_km();
+    let first_gate_range = radial_packet.first_range_bin as f64 * gate_interval;
     let num_bins = radial_packet.num_range_bins as usize;
     let actual_max_range = first_gate_range + num_bins as f64 * gate_interval;
 
@@ -1109,13 +1137,26 @@ pub fn render_level3_message_to_image(
         rp.xdr_data_offset
     );
 
-    render_level3_radial_to_image(rp, product, radar_lat, radar_lon, scale, offset, lut)
+    // The packet's own gate spacing with the PDB's product-code override —
+    // 99/154/163's scale-factor halfword lies about the gate size, and the
+    // twin-comparison path already prefers the PDB the same way.
+    let gate_interval = crate::twin::compare::gate_km(&l3_msg.pdb, rp);
+    render_level3_radial_with_gate_km(
+        rp,
+        gate_interval,
+        product,
+        radar_lat,
+        radar_lon,
+        scale,
+        offset,
+        lut,
+    )
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-    use nexrad_level3::model::{RadialPacket, RadialRun};
+    use nexrad_level3::model::{Level3Message, ProductDescriptionBlock, RadialPacket, RadialRun};
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -1604,5 +1645,114 @@ mod tests {
         assert!(k(0, 1) > k(0, 0));
         assert!(k(1, 0) > k(0, N_BINS));
         assert!(k(719, 1831) > k(718, 1831));
+    }
+
+    /// A minimal Level III message around one digital radial packet whose
+    /// scale-factor halfword claims ~1 km gates — what product 163 really
+    /// carries on the wire, where that halfword is the scan projection
+    /// constant and not a gate size.
+    fn message_with_lying_scale_factor(product_code: i16, bins: usize) -> Level3Message {
+        use nexrad_level3::model::{DataLayer, MessageHeader, SymbologyBlock};
+
+        let packet = RadialPacket {
+            first_range_bin: 0,
+            num_range_bins: bins as u16,
+            i_center: 0,
+            j_center: 0,
+            // ~1 km per gate if believed.
+            scale_factor: 0.999,
+            is_legacy: false,
+            xdr_data_scale: Some(SCALE),
+            xdr_data_offset: Some(OFFSET),
+            radials: (0..N_RADIALS)
+                .map(|i| RadialRun {
+                    start_angle: i as f32,
+                    angle_delta: 1.0,
+                    gate_values: vec![100; bins],
+                })
+                .collect(),
+        };
+        Level3Message {
+            header: MessageHeader {
+                message_code: product_code,
+                date_of_message: 20661,
+                time_of_message: 0,
+                message_length: 0,
+                source_id: 0,
+                destination_id: 0,
+                number_of_blocks: 3,
+            },
+            pdb: ProductDescriptionBlock {
+                block_divider: -1,
+                latitude: LAT,
+                longitude: LON,
+                height: 1000,
+                product_code,
+                operational_mode: 2,
+                vcp: 212,
+                sequence_number: 0,
+                volume_scan_number: 1,
+                volume_scan_date: 20661,
+                volume_scan_time: 0,
+                generation_date: 20661,
+                generation_time: 0,
+                product_specific_1: 0,
+                product_specific_2: 0,
+                elevation_number: 1,
+                product_specific_3: 5,
+                thresholds: [0; 16],
+                product_specific_47_53: [0; 7],
+                version: 0,
+                spot_blank: 0,
+                symbology_offset: 60,
+                graphic_offset: 0,
+                tabular_offset: 0,
+            },
+            symbology: Some(SymbologyBlock {
+                block_id: 1,
+                block_length: 0,
+                num_layers: 1,
+                layers: vec![DataLayer {
+                    layer_length: 0,
+                    packets: vec![nexrad_level3::model::DataPacket::DigitalRadial(packet)],
+                }],
+            }),
+        }
+    }
+
+    /// Product 163's packet says ~1 km per gate; the ICD says 0.25 km. The
+    /// display path has to prefer the PDB's override the way the
+    /// twin-comparison path does, or the on-screen KDP field draws 4× too
+    /// far out. A product without an override keeps the packet's own value.
+    #[test]
+    fn message_path_prefers_the_pdb_gate_spacing_over_the_packets() {
+        const BINS: usize = 40;
+
+        let (_, max_range, _) = render_level3_message_to_image(
+            &message_with_lying_scale_factor(163, BINS),
+            types::RadarProduct::SpecificDifferentialPhase,
+            LAT,
+            LON,
+        )
+        .unwrap();
+        assert!(
+            (max_range - BINS as f64 * 0.25).abs() < 1e-9,
+            "163 must render at the ICD's 0.25 km spacing, got a max range of {max_range} km \
+             from {BINS} gates"
+        );
+
+        let (_, max_range, _) = render_level3_message_to_image(
+            &message_with_lying_scale_factor(94, BINS),
+            PRODUCT,
+            LAT,
+            LON,
+        )
+        .unwrap();
+        let packet_km = 1.0 / 0.999_f32 as f64;
+        assert!(
+            (max_range - BINS as f64 * packet_km).abs() < 1e-9,
+            "a product with no PDB override must keep the packet's spacing, got a max range \
+             of {max_range} km from {BINS} gates"
+        );
     }
 }
