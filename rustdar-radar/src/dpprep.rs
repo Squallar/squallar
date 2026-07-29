@@ -90,6 +90,10 @@ pub(crate) struct DpInput {
     pub(crate) spacing: f64,
     /// Half-degree radial (super-res), the recombination precondition.
     pub(crate) half_degree: bool,
+    /// The radial's elevation angle, degrees (`bh->elevation`) — the HCA
+    /// chain's melting-layer beam intersection reads it; the KDP chain does
+    /// not.
+    pub(crate) elev: f64,
 }
 
 pub(crate) fn decode_moment(moment: &nexrad_model::data::MomentData) -> Vec<f64> {
@@ -139,6 +143,7 @@ impl DpInput {
             zg,
             spacing: f64::from(radial.azimuth_spacing_degrees()),
             half_degree: radial.azimuth_spacing_degrees() < 0.75,
+            elev: f64::from(radial.elevation_angle_degrees()),
         })
     }
 }
@@ -752,4 +757,214 @@ pub(crate) fn estimate_isdp(radials: &[CombinedRadial]) -> Option<f64> {
         }
     }
     isdp_from_queue(queue)
+}
+
+// ── Extensions for the HCA chain ─────────────────────────────────────────────
+//
+// Everything below is consumed by [`crate::hca`] only. The KDP chain above is
+// untouched: `combine_sweep` keeps returning the lean [`CombinedRadial`] the
+// KDP pipeline was validated with, and the HCA chain gets the same
+// recombination plus the pieces dpprep computes that KDP never reads — the
+// recombined ZDR (`Recomb_dp_data`'s `Zdrc = 10·log10(phc/pvc)`), the radial
+// elevation, and the texture filter (`DPPT_std_filter`).
+
+/// One recombined radial with the fields the HCA chain needs on top of the
+/// KDP chain's [`CombinedRadial`].
+pub(crate) struct DpCombined {
+    pub(crate) base: CombinedRadial,
+    /// Recombined differential reflectivity at the DP gates, dB.
+    pub(crate) zdr: Vec<f64>,
+    /// Elevation angle, degrees (the first pair member's, as the RPG keeps
+    /// the saved radial's header).
+    pub(crate) elev: f64,
+}
+
+/// The ZDR of one recombined pair per `Recomb_dp_data`: the power ratio of
+/// the (fallback-aware) averaged horizontal and vertical powers,
+/// `10·log10(phc/pvc)` — `ZDR_CAL` is 0 ("already applied at the RDA").
+/// The plain-mean A/B variant averages the two ZDRs directly.
+fn combine_pair_zdr(a: &DpInput, b: &DpInput, coherent: bool) -> Vec<f64> {
+    let n = a.phi.len().min(b.phi.len());
+    (0..n)
+        .map(|i| {
+            let zdra = a.zdr.get(i).copied().unwrap_or(f64::NAN);
+            let zdrb = b.zdr.get(i).copied().unwrap_or(f64::NAN);
+            if !coherent {
+                return nan_mean(zdra, zdrb);
+            }
+            let pha = dp_gate_power(a, i);
+            let phb = dp_gate_power(b, i);
+            let pva = if pha.is_nan() || zdra.is_nan() {
+                f64::NAN
+            } else {
+                pha / 10f64.powf(0.1 * zdra)
+            };
+            let pvb = if phb.is_nan() || zdrb.is_nan() {
+                f64::NAN
+            } else {
+                phb / 10f64.powf(0.1 * zdrb)
+            };
+            let phc = nan_mean(pha, phb);
+            let pvc = nan_mean(pva, pvb);
+            if phc.is_nan() || pvc.is_nan() {
+                f64::NAN
+            } else {
+                10.0 * (phc / pvc).log10()
+            }
+        })
+        .collect()
+}
+
+/// [`combine_sweep`] with the HCA extras: the same pairing decisions
+/// (`combine_radials.c`), the same recombination, plus the recombined ZDR
+/// and the radial elevation.
+pub(crate) fn combine_sweep_dp(inputs: &[DpInput], coherent: bool) -> Vec<DpCombined> {
+    let single = |input: &DpInput| DpCombined {
+        base: CombinedRadial::single(input),
+        zdr: input.zdr.clone(),
+        elev: input.elev,
+    };
+    let mut out = Vec::with_capacity(inputs.len() / 2 + 1);
+    let mut saved: Option<&DpInput> = None;
+    for input in inputs {
+        if !input.half_degree {
+            out.push(DpCombined {
+                base: CombinedRadial::passthrough(input),
+                zdr: input.zdr.clone(),
+                elev: input.elev,
+            });
+            continue;
+        }
+        match saved.take() {
+            None => saved = Some(input),
+            Some(first) => {
+                // The pairing conditions mirror `combine_sweep` exactly.
+                let mut diff = input.az - first.az;
+                if diff < -180.0 {
+                    diff += 360.0;
+                }
+                let fazi = first.az - first.az.trunc();
+                let pairable = (0.0..=0.75).contains(&diff)
+                    && fazi <= 0.5
+                    && first.phi.len() == input.phi.len()
+                    && (first.dr0 - input.dr0).abs() < 1e-6;
+                if pairable {
+                    out.push(DpCombined {
+                        base: combine_pair(first, input, coherent),
+                        zdr: combine_pair_zdr(first, input, coherent),
+                        elev: first.elev,
+                    });
+                } else {
+                    out.push(single(first));
+                    saved = Some(input);
+                }
+            }
+        }
+    }
+    if let Some(first) = saved {
+        out.push(single(first));
+    }
+    out
+}
+
+/// `DPPT_std_filter`: the windowed non-biased standard deviation of
+/// `input − smoothed` — the texture fields SD(Z) (window 5, differences
+/// beyond ±50 dB excluded) and SD(ΦDP) (window 9, ±100°). Gates whose
+/// window collects fewer than `w/2` (or 2) qualifying pairs are undefined.
+pub(crate) fn std_filter(input: &[f64], smoothed: &[f64], w: usize, max_diff: f64) -> Vec<f64> {
+    let n = input.len();
+    let hw = (w / 2) as isize;
+    (0..n as isize)
+        .map(|i| {
+            let mut sum = 0.0;
+            let mut sq = 0.0;
+            let mut cnt = 0usize;
+            for j in (i - hw).max(0)..=(i + hw).min(n as isize - 1) {
+                let v1 = input[j as usize];
+                let v2 = smoothed.get(j as usize).copied().unwrap_or(f64::NAN);
+                if v1.is_nan() || v2.is_nan() {
+                    continue;
+                }
+                let d = v1 - v2;
+                if d <= max_diff && d >= -max_diff {
+                    sum += d;
+                    sq += d * d;
+                    cnt += 1;
+                }
+            }
+            if cnt < hw as usize || cnt < 2 {
+                f64::NAN
+            } else {
+                let mean = sum / cnt as f64;
+                let var = (sq - mean * mean * cnt as f64) / (cnt as f64 - 1.0);
+                var.max(0.0).sqrt()
+            }
+        })
+        .collect()
+}
+
+/// Resample a derived field onto the 360° × 230 km comparison grid, cell for
+/// cell the way [`crate::twin::compare::tally_packet`] resamples the Level
+/// III twin: the radial nearest the cell centre `az + 0.5°` (bounded by the
+/// radial's own angular claim), and per 1-km cell the gate whose centre falls
+/// nearest the cell centre, earlier gate winning ties. Shared by the derived
+/// products' `to_polar_grid` implementations.
+pub(crate) fn resample_to_polar_grid(
+    values: &[Vec<f32>],
+    azimuths_deg: &[f64],
+    first_gate_km: f64,
+    gate_interval_km: f64,
+    radial_width_deg: f64,
+) -> Vec<Vec<f32>> {
+    use crate::volumetric::RANGE_BINS;
+    let mut grid = vec![vec![f32::NAN; RANGE_BINS]; 360];
+    if values.is_empty() {
+        return grid;
+    }
+
+    let n_gates = values.iter().map(Vec::len).max().unwrap_or(0);
+    let mut gate_for_bin: Vec<Option<usize>> = vec![None; RANGE_BINS];
+    let mut best = vec![f64::INFINITY; RANGE_BINS];
+    for j in 0..n_gates {
+        let centre = first_gate_km + j as f64 * gate_interval_km;
+        let bin = centre.floor() as i64;
+        if !(0..RANGE_BINS as i64).contains(&bin) {
+            continue;
+        }
+        let d = (centre - (bin as f64 + 0.5)).abs();
+        if d < best[bin as usize] {
+            best[bin as usize] = d;
+            gate_for_bin[bin as usize] = Some(j);
+        }
+    }
+
+    let circular_distance = |a: f64, b: f64| -> f64 {
+        let mut d = (a - b).rem_euclid(360.0);
+        if d > 180.0 {
+            d = 360.0 - d;
+        }
+        d
+    };
+    let cover = 0.5 * radial_width_deg + 0.05;
+    for (az, row) in grid.iter_mut().enumerate() {
+        let centre = az as f64 + 0.5;
+        let ri = azimuths_deg
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                circular_distance(**a, centre).total_cmp(&circular_distance(**b, centre))
+            })
+            .filter(|(_, a)| circular_distance(**a, centre) <= cover)
+            .map(|(i, _)| i);
+        let Some(ri) = ri else { continue };
+        let radial = &values[ri];
+        for (r, cell) in row.iter_mut().enumerate() {
+            if let Some(j) = gate_for_bin[r]
+                && let Some(&v) = radial.get(j)
+            {
+                *cell = v;
+            }
+        }
+    }
+    grid
 }
