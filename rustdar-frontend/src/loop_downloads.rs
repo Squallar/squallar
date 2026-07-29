@@ -1,5 +1,51 @@
+use rustdar_radar::level3::Level3Product;
+use rustdar_radar::types::RadarProduct;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+
+/// Which Level III object a loop frame wants: the site whose bucket keys it comes
+/// from, the AWIPS code, and the **volume start** the frame names.
+///
+/// The volume start, not the key's own timestamp. A key names when the RPG
+/// *published* an object; a frame names the volume it draws, and the two differ by
+/// however long generation took — plus, under SAILS, by however many intermediate
+/// republications of the same volume there were. Keying the cache on the volume is
+/// what makes "this frame's object" a question with one answer.
+pub type L3FrameKey = (String, String, chrono::NaiveDateTime);
+
+/// What a loop frame has to render, once its data has arrived.
+///
+/// The two arms are the two datasources, and they are the *only* place the
+/// distinction is drawn in the loop: everything downstream — the render budget, the
+/// target key, the sibling broadcast, the readiness rules — treats a frame the same
+/// either way.
+pub enum LoopFrameData {
+    /// A decoded Level II volume; the renderer picks its sweep out of it.
+    Volume(Arc<nexrad_model::data::Scan>),
+    /// The Level III objects of this frame's volume, one per AWIPS code in
+    /// [`RadarProduct::level3_products`] order.
+    ///
+    /// A `Vec` rather than one object because a product may be derived from
+    /// several: VIL density is `DVL ÷ EET`, two codes paired to one volume. The
+    /// pairing, the caching and the "is this frame ready" rule are all already
+    /// per-code, so such a product needs no new plumbing here — only a render job
+    /// that reads more than the first entry.
+    Products(Vec<Arc<Level3Product>>),
+}
+
+/// Whether a frame's Level III objects have arrived.
+#[derive(Debug, PartialEq, Eq)]
+pub enum L3FrameState {
+    /// Every code the product needs is paired to this frame's volume.
+    Ready,
+    /// At least one code was paired and the site generated no object for this
+    /// volume. A gap — normal, terminal, and not an error: nothing will ever
+    /// render this frame, so it is retired the way an unrenderable Level II frame
+    /// is.
+    Absent,
+    /// At least one code has not been paired yet.
+    Pending,
+}
 
 /// Manages loop radar download state: scan cache, in-flight tracking,
 /// and per-pane pending download queues. Grouping these together prevents
@@ -12,6 +58,9 @@ use std::sync::Arc;
 /// radar's data around its own coordinates. Nothing downstream can catch that: the
 /// render target key is derived from the loop, so the result looks entirely
 /// consistent. The site has to be in the key.
+///
+/// The Level III half follows the same rule for the same reason, with the AWIPS
+/// code alongside: see [`L3FrameKey`].
 pub struct LoopDownloadManager {
     /// Downloaded scan data cache for loop frames, keyed by site then timestamp
     /// (shared across every pane looping that site).
@@ -21,7 +70,38 @@ pub struct LoopDownloadManager {
     in_flight_set: HashMap<String, HashSet<chrono::NaiveDateTime>>,
     /// Pending loop scan downloads per pane, waiting to be dispatched (throttled).
     pending_downloads: HashMap<usize, PendingDownloads>,
-    /// Number of loop scan downloads currently in flight (global, not per-pane).
+    /// Pending Level III pairings per pane, the counterpart of
+    /// [`pending_downloads`](Self::pending_downloads).
+    pending_l3: HashMap<usize, PendingL3Pairings>,
+    /// Every frame's volume for each pane's loop, so the download queues can be
+    /// re-derived when the pane retargets across the Level II / Level III line
+    /// without re-listing the archive. See [`FramePlan`].
+    plans: HashMap<usize, FramePlan>,
+    /// The bucket keys serving one `(site, AWIPS code)` over the days a loop's
+    /// window touches, listed **once** and then ranked per frame.
+    ///
+    /// Listing is a round-trip per UTC day, and a loop pairs tens of volumes
+    /// against the same code; re-listing per frame would spend tens of requests
+    /// to answer one question. An empty list is a real answer — the site served
+    /// nothing — and is cached as such, which is what lets every frame resolve to
+    /// a gap and the loop retire cleanly instead of waiting forever.
+    l3_keys: HashMap<(String, String), Arc<Vec<String>>>,
+    /// `(site, code)` listings under way, so two panes looping one site do not
+    /// both list it.
+    l3_keys_in_flight: HashSet<(String, String)>,
+    /// The object paired to each frame's volume, or `None` where the site
+    /// generated none.
+    ///
+    /// `None` is cached deliberately: a gap that was not remembered would be
+    /// re-paired — up to `PAIRING_CANDIDATES` object fetches — on every dispatch
+    /// pass for the life of the loop.
+    l3_cache: HashMap<L3FrameKey, Option<Arc<Level3Product>>>,
+    /// Pairings under way, the Level III counterpart of
+    /// [`in_flight_set`](Self::in_flight_set).
+    l3_in_flight: HashSet<L3FrameKey>,
+    /// Number of loop downloads currently in flight (global, not per-pane, and
+    /// shared by the Level II and Level III paths so the network concurrency cap
+    /// means one thing).
     in_flight_count: usize,
 }
 
@@ -43,6 +123,69 @@ pub struct PendingDownloads {
     pub queue: VecDeque<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)>,
 }
 
+/// A pane's undispatched Level III pairings, with the site they belong to.
+///
+/// The site travels with the queue for exactly the reason it does on
+/// [`PendingDownloads`]: a pairing is an uncancellable network round-trip, and the
+/// pane's loop can be rebuilt for another site while it runs. The object it
+/// produces is cached under the site named here, never under whatever site the
+/// pane has reached by the time it lands.
+pub struct PendingL3Pairings {
+    /// The site whose bucket keys every entry below is paired against.
+    pub site: String,
+    /// The product these pairings are for.
+    ///
+    /// The product rather than a bare list of codes, because it answers both
+    /// halves of a pairing — which AWIPS codes to list, and which object of a
+    /// matched volume to take ([`RadarProduct::level3_volume_pick`]) — so the two
+    /// cannot come from different places and disagree.
+    pub product: RadarProduct,
+    /// `(volume start, AWIPS code)` still to pair, oldest volume first.
+    pub queue: VecDeque<(chrono::NaiveDateTime, String)>,
+}
+
+/// Every volume a pane's loop frames name, kept so the download queues can be
+/// re-derived without re-listing the archive.
+///
+/// A loop's frame list is built from one Level II archive listing and does not
+/// change as the user switches product. What *does* change is which bytes each
+/// frame needs: a Level II product wants the ~10 MB volume, a Level III product
+/// wants a few hundred kilobytes of bucket object and no volume at all. Keeping
+/// the plan means switching between them costs no listing — and means a Level III
+/// loop never downloads the volumes it would not read.
+pub struct FramePlan {
+    /// The site the listing was made for; every identifier below is one of its
+    /// files, and every pairing derived from this plan is against its keys.
+    pub site: String,
+    /// Volume start and archive file per frame, oldest-first.
+    pub frames: Vec<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)>,
+    /// The product the queues were last derived for. Compared, not assumed:
+    /// re-deriving on every dispatch pass would rebuild both queues every frame
+    /// of the UI, and re-deriving never would leave a retargeted pane waiting on
+    /// data nothing was fetching.
+    planned_for: Option<RadarProduct>,
+}
+
+impl FramePlan {
+    /// A plan for a fresh listing, with nothing derived from it yet.
+    ///
+    /// The site and the frames are taken together for the reason they travel
+    /// together everywhere else in the loop: every identifier is one of that
+    /// site's files, and everything derived from the plan — a volume download, a
+    /// bucket pairing — is filed under it. Built by whoever accepted the listing,
+    /// so the site cannot be re-read from a pane whose loop has moved on.
+    pub fn new(
+        site: String,
+        frames: Vec<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)>,
+    ) -> Self {
+        Self {
+            site,
+            frames,
+            planned_for: None,
+        }
+    }
+}
+
 impl Default for LoopDownloadManager {
     fn default() -> Self {
         Self::new()
@@ -55,6 +198,12 @@ impl LoopDownloadManager {
             scan_cache: HashMap::new(),
             in_flight_set: HashMap::new(),
             pending_downloads: HashMap::new(),
+            pending_l3: HashMap::new(),
+            plans: HashMap::new(),
+            l3_keys: HashMap::new(),
+            l3_keys_in_flight: HashSet::new(),
+            l3_cache: HashMap::new(),
+            l3_in_flight: HashSet::new(),
             in_flight_count: 0,
         }
     }
@@ -130,9 +279,262 @@ impl LoopDownloadManager {
         self.pending_downloads.insert(pane, pending);
     }
 
-    /// Remove a pane's pending download queue.
+    /// Remove a pane's pending download queue — both halves, and the plan they
+    /// were derived from.
+    ///
+    /// "Remove pending" has to mean *all* of it. A pane switching its loop off, or
+    /// having it rebuilt, owes nothing on either datasource; leaving the Level III
+    /// queue behind would keep pairing objects for a loop that no longer exists,
+    /// and leaving the plan behind would let the next `plan_downloads_for` refill
+    /// from a listing the new loop never asked for.
     pub fn remove_pending(&mut self, pane: usize) {
         self.pending_downloads.remove(&pane);
+        self.pending_l3.remove(&pane);
+        self.plans.remove(&pane);
+    }
+
+    // ── Level III frames ──────────────────────────────────────────────────
+
+    /// Record what volumes a pane's loop frames name, replacing any previous
+    /// plan and the queues derived from it.
+    ///
+    /// Nothing is queued yet: what the frames need depends on the pane's product,
+    /// which [`plan_downloads_for`](Self::plan_downloads_for) answers.
+    pub fn set_plan(&mut self, pane: usize, plan: FramePlan) {
+        self.pending_downloads.remove(&pane);
+        self.pending_l3.remove(&pane);
+        self.plans.insert(pane, plan);
+    }
+
+    /// Derive this pane's download queues for `product`, returning whether
+    /// anything changed.
+    ///
+    /// This is the one place the two datasources part company in the download
+    /// path, and it is a *data-path* branch: a Level II frame needs its archive
+    /// volume, a Level III frame needs the bucket objects of the same volume and
+    /// not the volume itself. Both produce a queue, both drain through the same
+    /// concurrency budget, and both settle a frame the same way.
+    ///
+    /// Only the queue for the datasource in use is populated. A Level III loop
+    /// that also downloaded its volumes would spend ~10 MB a frame on bytes no
+    /// render reads.
+    pub fn plan_downloads_for(&mut self, pane: usize, product: RadarProduct) -> bool {
+        let Some(plan) = self.plans.get_mut(&pane) else {
+            return false;
+        };
+        if plan.planned_for == Some(product) {
+            return false;
+        }
+        plan.planned_for = Some(product);
+        let site = plan.site.clone();
+        match product.level3_products() {
+            Some(codes) => {
+                self.pending_downloads.remove(&pane);
+                let queue = plan
+                    .frames
+                    .iter()
+                    .flat_map(|(ts, _)| codes.iter().map(move |code| (*ts, (*code).to_string())))
+                    .collect();
+                self.pending_l3.insert(
+                    pane,
+                    PendingL3Pairings {
+                        site,
+                        product,
+                        queue,
+                    },
+                );
+            }
+            None => {
+                self.pending_l3.remove(&pane);
+                let queue = plan.frames.iter().cloned().collect();
+                self.pending_downloads
+                    .insert(pane, PendingDownloads { site, queue });
+            }
+        }
+        true
+    }
+
+    /// Extract a pane's pending pairings completely, mirroring
+    /// [`extract_pending`](Self::extract_pending) — the site and the codes come
+    /// out with the queue, so a caller cannot dispatch one pane's pairings while
+    /// naming another's site.
+    pub fn extract_pending_l3(&mut self, pane: usize) -> Option<PendingL3Pairings> {
+        self.pending_l3.remove(&pane)
+    }
+
+    /// Return a queue taken by [`extract_pending_l3`](Self::extract_pending_l3).
+    pub fn insert_pending_l3(&mut self, pane: usize, pending: PendingL3Pairings) {
+        self.pending_l3.insert(pane, pending);
+    }
+
+    /// Claim the key listing for `(site, code)`, returning whether the caller now
+    /// owes one.
+    ///
+    /// `false` means it is already listed or already being listed. Two panes
+    /// looping the same site want the same keys, and a listing is the expensive
+    /// half of a pairing.
+    pub fn claim_l3_listing(&mut self, site: &str, code: &str) -> bool {
+        let key = (site.to_string(), code.to_string());
+        if self.l3_keys.contains_key(&key) || self.l3_keys_in_flight.contains(&key) {
+            return false;
+        }
+        self.l3_keys_in_flight.insert(key);
+        true
+    }
+
+    /// Record a finished key listing. An empty list is stored, not discarded: it
+    /// is the answer "this site served no objects", which every frame then
+    /// resolves to a gap.
+    pub fn cache_l3_keys(&mut self, site: &str, code: &str, keys: Vec<String>) {
+        let key = (site.to_string(), code.to_string());
+        self.l3_keys_in_flight.remove(&key);
+        self.l3_keys.insert(key, Arc::new(keys));
+    }
+
+    /// The cached key listing for `(site, code)`, or `None` if it has not landed.
+    pub fn l3_keys(&self, site: &str, code: &str) -> Option<&Arc<Vec<String>>> {
+        self.l3_keys.get(&(site.to_string(), code.to_string()))
+    }
+
+    fn l3_key(site: &str, code: &str, ts: &chrono::NaiveDateTime) -> L3FrameKey {
+        (site.to_string(), code.to_string(), *ts)
+    }
+
+    /// Whether this frame's object for `code` has been paired — including having
+    /// been paired to nothing.
+    pub fn l3_is_resolved(&self, site: &str, code: &str, ts: &chrono::NaiveDateTime) -> bool {
+        self.l3_cache.contains_key(&Self::l3_key(site, code, ts))
+    }
+
+    /// Whether a pairing for this frame's object is under way.
+    pub fn l3_is_in_flight(&self, site: &str, code: &str, ts: &chrono::NaiveDateTime) -> bool {
+        self.l3_in_flight.contains(&Self::l3_key(site, code, ts))
+    }
+
+    /// Mark a pairing as under way.
+    pub fn mark_l3_in_flight(&mut self, site: &str, code: &str, ts: chrono::NaiveDateTime) {
+        self.l3_in_flight.insert(Self::l3_key(site, code, &ts));
+    }
+
+    /// Record a finished pairing: clear the in-flight mark and store the result,
+    /// `None` included.
+    pub fn cache_l3_product(
+        &mut self,
+        site: &str,
+        code: &str,
+        ts: chrono::NaiveDateTime,
+        product: Option<Arc<Level3Product>>,
+    ) {
+        let key = Self::l3_key(site, code, &ts);
+        self.l3_in_flight.remove(&key);
+        self.l3_cache.insert(key, product);
+    }
+
+    /// Whether frame `ts` of `product`'s loop on `site` has every object it
+    /// needs, is missing one for good, or is still waiting.
+    ///
+    /// Asked per AWIPS code, so a product derived from several — VIL density's
+    /// `DVL ÷ EET` — is ready only when all of them are and is a gap as soon as
+    /// any one of them is.
+    pub fn l3_frame_state(
+        &self,
+        site: &str,
+        product: RadarProduct,
+        ts: &chrono::NaiveDateTime,
+    ) -> L3FrameState {
+        let Some(codes) = product.level3_products() else {
+            return L3FrameState::Absent;
+        };
+        let mut pending = false;
+        for code in codes {
+            match self.l3_cache.get(&Self::l3_key(site, code, ts)) {
+                Some(Some(_)) => {}
+                // Paired to nothing: terminal, and it decides the frame outright
+                // — no later code can supply the missing input.
+                Some(None) => return L3FrameState::Absent,
+                None => pending = true,
+            }
+        }
+        if pending {
+            L3FrameState::Pending
+        } else {
+            L3FrameState::Ready
+        }
+    }
+
+    /// The objects frame `ts` renders, in [`RadarProduct::level3_products`] order,
+    /// or `None` unless every one of them is present.
+    ///
+    /// All-or-nothing on purpose: a two-input product handed one input would
+    /// render a ratio against a missing denominator.
+    pub fn l3_frame_products(
+        &self,
+        site: &str,
+        product: RadarProduct,
+        ts: &chrono::NaiveDateTime,
+    ) -> Option<Vec<Arc<Level3Product>>> {
+        let codes = product.level3_products()?;
+        codes
+            .iter()
+            .map(|code| {
+                self.l3_cache
+                    .get(&Self::l3_key(site, code, ts))?
+                    .as_ref()
+                    .map(Arc::clone)
+            })
+            .collect()
+    }
+
+    /// Everything frame `ts` of `product`'s loop on `site` needs to render, or
+    /// `None` if it has not all arrived.
+    ///
+    /// The one lookup both render paths go through, so "which datasource does
+    /// this frame draw from" is answered in one place from the product alone.
+    pub fn frame_data(
+        &self,
+        site: &str,
+        product: RadarProduct,
+        ts: &chrono::NaiveDateTime,
+    ) -> Option<LoopFrameData> {
+        if product.is_level3() {
+            return self
+                .l3_frame_products(site, product, ts)
+                .map(LoopFrameData::Products);
+        }
+        self.get_cached(site, ts)
+            .map(|scan| LoopFrameData::Volume(Arc::clone(scan)))
+    }
+
+    /// Whether frame `ts`'s data question has been *answered* — the volume is
+    /// cached, or every Level III object has been paired, gaps included.
+    ///
+    /// This is what loop readiness asks. A gap counts as settled: the frame will
+    /// never render, which is a decision, not a wait.
+    pub fn frame_data_settled(
+        &self,
+        site: &str,
+        product: RadarProduct,
+        ts: &chrono::NaiveDateTime,
+    ) -> bool {
+        if product.is_level3() {
+            return self.l3_frame_state(site, product, ts) != L3FrameState::Pending;
+        }
+        self.is_cached(site, ts)
+    }
+
+    /// Whether a download or pairing for frame `ts` is under way.
+    pub fn frame_data_in_flight(
+        &self,
+        site: &str,
+        product: RadarProduct,
+        ts: &chrono::NaiveDateTime,
+    ) -> bool {
+        match product.level3_products() {
+            Some(codes) => codes
+                .iter()
+                .any(|code| self.l3_is_in_flight(site, code, ts)),
+            None => self.is_in_flight(site, ts),
+        }
     }
 
     /// Extract the pending queue completely. Call `insert_pending` to return it later.
@@ -148,11 +550,26 @@ impl LoopDownloadManager {
         self.pending_downloads.keys().copied().collect()
     }
 
-    /// Whether all pending downloads for a pane have been dispatched.
+    /// Collect all pane indices that have pending Level III pairings.
+    pub fn pending_l3_pane_indices(&self) -> Vec<usize> {
+        self.pending_l3.keys().copied().collect()
+    }
+
+    /// Whether every download a pane owes — volume or object — has been
+    /// dispatched.
+    ///
+    /// Both queues, because a Level III loop's frames are owed through the other
+    /// one. Asking only about volumes would report a loop whose pairings have not
+    /// started as "done", and `settle_loop_phase` would abandon it on the pass
+    /// right after its frame list was built.
     pub fn is_pane_done(&self, pane: usize) -> bool {
         self.pending_downloads
             .get(&pane)
             .is_none_or(|p| p.queue.is_empty())
+            && self
+                .pending_l3
+                .get(&pane)
+                .is_none_or(|p| p.queue.is_empty())
     }
 
     /// Reset all loop download state. Used on site switch to avoid stale data.
@@ -167,6 +584,12 @@ impl LoopDownloadManager {
         self.scan_cache.clear();
         self.in_flight_set.clear();
         self.pending_downloads.clear();
+        self.pending_l3.clear();
+        self.plans.clear();
+        self.l3_keys.clear();
+        self.l3_keys_in_flight.clear();
+        self.l3_cache.clear();
+        self.l3_in_flight.clear();
         self.in_flight_count = 0;
     }
 }

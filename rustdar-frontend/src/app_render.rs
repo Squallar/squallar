@@ -2,7 +2,9 @@ use crate::constants::{
     DEFAULT_LOOP_SPEED_FPS, MAX_CONCURRENT_LOOP_DOWNLOADS, MAX_CONCURRENT_RENDERS, MAX_LOOP_FRAMES,
     MAX_LOOP_RENDER_BUDGET, MAX_LOOP_SPEED_FPS, MIN_LOOP_SPEED_FPS,
 };
-use crate::loop_downloads::PendingDownloads;
+use crate::loop_downloads::{
+    FramePlan, L3FrameState, LoopFrameData, PendingDownloads, PendingL3Pairings,
+};
 use crate::render_dispatch::CachedPaneRender;
 use egui_wgpu::wgpu;
 use rustdar_egui::actions::GuiAction;
@@ -153,6 +155,8 @@ impl super::App {
         self.poll_overlay_render_results();
         self.poll_loop_scan_list_results();
         self.poll_loop_scan_download_results();
+        self.poll_loop_l3_list_results();
+        self.poll_loop_l3_fetch_results();
         self.poll_loop_render_results();
         self.advance_loop_playback();
         self.dispatch_pane_renders();
@@ -822,21 +826,159 @@ impl super::App {
             // Whether this listing is still wanted, and what it makes of the frame
             // list, is decided in one place — including refusing a listing for a
             // site the pane's loop has since moved off.
-            let Some(pending) = accept_scan_listing(&mut pane.loop_state, &resp.site, resp.scans)
+            let product = pane.selected_product;
+            let Some(plan) = accept_scan_listing(&mut pane.loop_state, &resp.site, resp.scans)
             else {
                 continue;
             };
             log::info!(
                 "Loop: populated {} {} frames for pane {}",
-                pending.queue.len(),
-                pending.site,
+                plan.frames.len(),
+                plan.site,
                 resp.pane_idx
             );
 
-            // Store the scans as pending downloads — with the site they were listed
-            // for — and dispatch the first batch.
-            self.loop_mgr.insert_pending(resp.pane_idx, pending);
+            // Store the frame plan — with the site it was listed for — then derive
+            // the queue for whichever datasource this pane's product reads and
+            // dispatch the first batch.
+            self.loop_mgr.set_plan(resp.pane_idx, plan);
+            self.loop_mgr.plan_downloads_for(resp.pane_idx, product);
             self.dispatch_pending_loop_downloads(resp.pane_idx);
+            self.dispatch_pending_loop_l3_pairings(resp.pane_idx);
+        }
+    }
+
+    /// Poll for finished Level III key listings. Each one unblocks every frame
+    /// pairing that was waiting on it.
+    fn poll_loop_l3_list_results(&mut self) {
+        let mut listed = false;
+        while let Ok(resp) = self.channels.loop_l3_list_receiver.try_recv() {
+            // Cached under the site and code it was *listed* for, never under
+            // whatever the requesting pane has since become — the keys belong to
+            // the listing, and every pane looping that site shares them.
+            self.loop_mgr
+                .cache_l3_keys(&resp.site, &resp.code, resp.keys);
+            listed = true;
+        }
+        if !listed {
+            return;
+        }
+        // Every pane, not just the requester: two panes looping one site wait on
+        // one listing, and the second would otherwise sit until something else
+        // happened to re-dispatch it.
+        for pane_idx in self.loop_mgr.pending_l3_pane_indices() {
+            self.dispatch_pending_loop_l3_pairings(pane_idx);
+        }
+    }
+
+    /// Poll for finished Level III frame pairings. A `None` result is cached as
+    /// the answer — the site generated no object for that volume — so the frame is
+    /// retired once instead of being re-paired every pass.
+    fn poll_loop_l3_fetch_results(&mut self) {
+        let mut completed_count = 0usize;
+        while let Ok(resp) = self.channels.loop_l3_fetch_receiver.try_recv() {
+            self.loop_mgr
+                .cache_l3_product(&resp.site, &resp.code, resp.timestamp, resp.product);
+            completed_count += 1;
+        }
+        if completed_count > 0 {
+            // The same counter the Level II downloads decrement: one network
+            // concurrency budget for the loop, whichever datasource it reads.
+            self.loop_mgr.complete_batch(completed_count);
+            for pane_idx in self.loop_mgr.pending_l3_pane_indices() {
+                self.dispatch_pending_loop_l3_pairings(pane_idx);
+            }
+        }
+    }
+
+    /// Dispatch pending Level III frame pairings up to the concurrency limit,
+    /// listing the keys they will be ranked against first.
+    ///
+    /// The shape mirrors [`dispatch_pending_loop_downloads`](Self::dispatch_pending_loop_downloads)
+    /// deliberately: the queue is extracted whole so the site travels with it,
+    /// entries already resolved or in flight are dropped, a batch up to the
+    /// remaining slots is spawned, and the rest goes back.
+    ///
+    /// Entries whose key listing has not landed are **kept**, not dropped: the
+    /// listing is what they need, and `poll_loop_l3_list_results` re-dispatches
+    /// them when it arrives. That is also why the queue's emptiness is a safe
+    /// answer to "has this pane dispatched everything it owes" — see
+    /// `is_pane_done`.
+    fn dispatch_pending_loop_l3_pairings(&mut self, pane_idx: usize) {
+        let Some(PendingL3Pairings {
+            site,
+            product,
+            queue,
+        }) = self.loop_mgr.extract_pending_l3(pane_idx)
+        else {
+            return;
+        };
+        // The pick is the product's, not the frame's or the pane's: DPR's
+        // intermediates are partial accumulations, so its loop takes each
+        // volume's last object while the once-per-volume products take the
+        // nearest one. Read from the queue's own product, which cannot have
+        // retargeted under it the way the pane can.
+        let Some(pick) = product.level3_volume_pick() else {
+            // Not a Level III product — nothing to pair, and the queue was
+            // derived for one, so it is stale. Dropping it is correct: the
+            // retarget that produced this state already rebuilt the other queue.
+            return;
+        };
+
+        // One listing per (site, code), shared by every pane looping that site.
+        // The days come from the loop's own frames rather than from wall clock:
+        // a loop parked on yesterday's data must list yesterday's prefix.
+        let days = pairing_days_for_frames(&queue);
+        for code in product.level3_products().into_iter().flatten() {
+            if self.loop_mgr.claim_l3_listing(&site, code) {
+                self.spawn_loop_l3_listing(
+                    pane_idx,
+                    site.clone(),
+                    (*code).to_string(),
+                    days.clone(),
+                );
+            }
+        }
+
+        let slots = self.loop_mgr.available_slots(MAX_CONCURRENT_LOOP_DOWNLOADS);
+        let mut batch = Vec::new();
+        let mut retained = VecDeque::with_capacity(queue.len());
+        for (ts, code) in queue {
+            if self.loop_mgr.l3_is_resolved(&site, &code, &ts)
+                || self.loop_mgr.l3_is_in_flight(&site, &code, &ts)
+            {
+                // Answered, or being answered — nothing owed either way.
+                continue;
+            }
+            let Some(keys) = self.loop_mgr.l3_keys(&site, &code) else {
+                // Waiting on the listing above.
+                retained.push_back((ts, code));
+                continue;
+            };
+            if batch.len() >= slots {
+                retained.push_back((ts, code));
+                continue;
+            }
+            batch.push((ts, code, Arc::clone(keys)));
+        }
+
+        let spawned = batch.len();
+        for (ts, code, keys) in batch {
+            self.loop_mgr.mark_l3_in_flight(&site, &code, ts);
+            self.spawn_loop_l3_pairing(pane_idx, site.clone(), code, ts, keys, pick);
+        }
+
+        self.loop_mgr.insert_pending_l3(
+            pane_idx,
+            PendingL3Pairings {
+                site,
+                product,
+                queue: retained,
+            },
+        );
+
+        if spawned > 0 {
+            self.loop_mgr.add_spawned(spawned);
         }
     }
 
@@ -1116,6 +1258,10 @@ impl super::App {
     /// Dispatch renders for loop frames around the playhead that have
     /// downloaded scan data but no rendered texture yet.
     fn dispatch_loop_renders(&mut self) {
+        // Panes whose product moved to another datasource, so the frames now need
+        // bytes nothing is fetching. Collected here and acted on below, because
+        // re-deriving a queue needs `loop_mgr` while the pane is borrowed.
+        let mut replan: Vec<(usize, rustdar_radar::types::RadarProduct)> = Vec::new();
         for pane_idx in 0..self.gui.pane_count() {
             let Some(pane) = self.gui.pane_mut(pane_idx) else {
                 continue;
@@ -1138,11 +1284,30 @@ impl super::App {
                     product,
                     elevation
                 );
+                // The retarget may have crossed the Level II / Level III line, in
+                // which case every frame now needs bytes the old queue was not
+                // fetching. `plan_downloads_for` is a no-op when the product has
+                // not actually moved, so this is safe to ask unconditionally.
+                replan.push((pane_idx, product));
                 continue;
             }
 
             // Evict textures from frames far from the playhead to cap memory usage.
             ls.evict_textures_outside_render_set(MAX_LOOP_RENDER_BUDGET);
+        }
+        for (pane_idx, product) in replan {
+            if self.loop_mgr.plan_downloads_for(pane_idx, product) {
+                log::info!(
+                    "Loop: pane {pane_idx} now reads {} for its frames",
+                    if product.is_level3() {
+                        "Level III objects"
+                    } else {
+                        "Level II volumes"
+                    },
+                );
+                self.dispatch_pending_loop_downloads(pane_idx);
+                self.dispatch_pending_loop_l3_pairings(pane_idx);
+            }
         }
 
         // Renders to spawn. `target` is the pane's render target (site + selected
@@ -1171,8 +1336,6 @@ impl super::App {
 
             let site_lat = ls.site_lat;
             let site_lon = ls.site_lon;
-            let product = pane.selected_product;
-            let elevation = pane.selected_elevation;
 
             // Set by `retarget_renders` in the loop above for every active, non-empty
             // loop. Carried through the plan so the dedup, the donor search and the
@@ -1213,32 +1376,38 @@ impl super::App {
                     }
                 }
 
-                if let Some(scan) = frame_scan(&self.loop_mgr, &target, frame.timestamp) {
-                    // Snap elevation to closest available in this particular scan
-                    let Some(snapped) =
-                        rustdar_radar::render::find_closest_elevation(scan, product, elevation)
-                    else {
-                        // This scan has no sweep carrying the selected product at all.
-                        // Nothing will ever render it, so retire the frame.
-                        to_mark_failed.push((pane_idx, idx));
-                        continue;
-                    };
-                    // Deduplicate: if another pane already queued a render for the same
-                    // target and timestamp, skip — the broadcast in
-                    // poll_loop_render_results will deliver the texture to this pane.
-                    if sync && render_already_queued(&to_render, frame.timestamp, &target, snapped)
-                    {
-                        continue;
+                // The sweep this frame's own data resolves the selection to, or
+                // why it cannot be rendered. One question for both datasources —
+                // see `frame_sweep`.
+                match frame_sweep(&self.loop_mgr, &target, frame.timestamp) {
+                    FrameSweep::At(snapped) => {
+                        // Deduplicate: if another pane already queued a render for the
+                        // same target and timestamp, skip — the broadcast in
+                        // poll_loop_render_results will deliver the texture to this pane.
+                        if sync
+                            && render_already_queued(&to_render, frame.timestamp, &target, snapped)
+                        {
+                            continue;
+                        }
+                        to_render.push(LoopRenderRequest {
+                            pane_idx,
+                            frame_idx: idx,
+                            timestamp: frame.timestamp,
+                            target: target.clone(),
+                            snapped,
+                            site_lat,
+                            site_lon,
+                        });
                     }
-                    to_render.push(LoopRenderRequest {
-                        pane_idx,
-                        frame_idx: idx,
-                        timestamp: frame.timestamp,
-                        target: target.clone(),
-                        snapped,
-                        site_lat,
-                        site_lon,
-                    });
+                    // Nothing will ever render this frame — the volume carries no
+                    // sweep for the product, or the site generated no object for
+                    // this volume. Retire it so the dispatcher stops retrying and
+                    // readiness stops waiting; playback then steps over it, which
+                    // is what a gap has always looked like.
+                    FrameSweep::Unrenderable => to_mark_failed.push((pane_idx, idx)),
+                    // Its data has not arrived yet. Left alone; the next pass asks
+                    // again.
+                    FrameSweep::Pending => {}
                 }
             }
         }
@@ -1286,10 +1455,9 @@ impl super::App {
 
             // The same cache entry the plan resolved above, named the same way: by
             // the target this render is for. Nothing between then and here removes
-            // an entry, but a missing scan is a skipped frame the next pass retries,
+            // an entry, but missing data is a skipped frame the next pass retries,
             // not something to bring the process down over.
-            let Some(scan_arc) = frame_scan(&self.loop_mgr, &req.target, req.timestamp).cloned()
-            else {
+            let Some(data) = frame_data(&self.loop_mgr, &req.target, req.timestamp) else {
                 continue;
             };
 
@@ -1304,7 +1472,7 @@ impl super::App {
             let spawned = self.spawn_loop_frame_render(
                 req.pane_idx,
                 req.timestamp,
-                scan_arc,
+                data,
                 req.render_params(),
                 req.target,
             );
@@ -1349,14 +1517,22 @@ impl super::App {
 /// `lookback_secs`. Closing the gap properly needs a generation counter, which is
 /// not worth carrying for a few extra frames that expire on their own.
 ///
-/// The frame list and the returned queue are built from one sampled set on purpose:
-/// they are the two halves of the same plan, and a frame with no queued download
-/// never settles.
+/// The frame list and the returned plan are built from one sampled set on purpose:
+/// they are the two halves of the same decision, and a frame with no planned
+/// download never settles.
+///
+/// The plan is returned rather than a download queue because *what* each frame
+/// needs depends on the pane's product, which can change without re-listing: a
+/// Level II product wants each frame's archive volume, a Level III product wants
+/// the bucket objects of the same volumes and not the volumes at all. The frame
+/// list — the loop's timeline — is the same either way, which is what keeps a
+/// mixed set of panes animating in step. See
+/// [`crate::loop_downloads::LoopDownloadManager::plan_downloads_for`].
 fn accept_scan_listing(
     ls: &mut rustdar_egui::pane::LoopPlaybackState,
     site: &str,
     scans: Vec<(chrono::NaiveDateTime, rustdar_radar::archive::Identifier)>,
-) -> Option<PendingDownloads> {
+) -> Option<FramePlan> {
     if !ls.is_active() || ls.site != site {
         return None;
     }
@@ -1399,10 +1575,7 @@ fn accept_scan_listing(
         ls.current_frame = ls.frames.len() - 1; // start at newest
     }
 
-    Some(PendingDownloads {
-        site: site.to_string(),
-        queue: VecDeque::from(scans),
-    })
+    Some(FramePlan::new(site.to_string(), scans))
 }
 
 /// Move a loop that is still `Rendering` on to whatever its frames have settled
@@ -1446,14 +1619,18 @@ fn settle_loop_phase(
         ls.phase = rustdar_egui::pane::LoopPhase::Ready;
         return false;
     }
-    // A frame whose scan is still downloading is "settled" as far as rendering
-    // goes — nothing is in flight for it *yet* — so the download half has to be
-    // asked separately before concluding that nothing will ever render. Otherwise
-    // every loop is abandoned on the pass right after its last batch is dispatched.
-    if ls
-        .frames
-        .iter()
-        .any(|f| loop_mgr.is_in_flight(&ls.site, &f.timestamp))
+    // A frame whose data is still arriving is "settled" as far as rendering goes —
+    // nothing is in flight for it *yet* — so the download half has to be asked
+    // separately before concluding that nothing will ever render. Otherwise every
+    // loop is abandoned on the pass right after its last batch is dispatched.
+    //
+    // Asked about the loop's own product, so a Level III loop's pairings hold it
+    // open the way a Level II loop's volume downloads do.
+    if let Some(product) = loop_product(ls)
+        && ls
+            .frames
+            .iter()
+            .any(|f| loop_mgr.frame_data_in_flight(&ls.site, product, &f.timestamp))
     {
         return false;
     }
@@ -1540,22 +1717,106 @@ fn apply_completed_download(
     }
 }
 
-/// The scan a loop keyed to `target` renders for `timestamp`.
+/// Every UTC day the pairing windows of `queue`'s volumes touch, deduplicated.
 ///
-/// `target.site` is where the loop's geometry came from, so it is also the only
-/// site whose scan may be projected with it. The pane's live `site` field is not a
-/// substitute — it is re-synced across panes without rebuilding their loops — and
-/// it is not in scope here.
-fn frame_scan<'a>(
-    loop_mgr: &'a crate::loop_downloads::LoopDownloadManager,
-    target: &RenderTarget,
-    timestamp: chrono::NaiveDateTime,
-) -> Option<&'a Arc<nexrad_model::data::Scan>> {
-    loop_mgr.get_cached(&target.site, &timestamp)
+/// Derived from the frames rather than from wall clock. A loop can be parked on
+/// historic data — `handle_navigate_time` then `reinit_active_loops` rebuilds it
+/// around whatever scan the pane is showing — and listing today's prefix for a
+/// loop over yesterday's volumes finds nothing, which is indistinguishable from
+/// "the site served no objects" and would retire every frame as a gap.
+///
+/// One listing per day is a round-trip, so the set is kept minimal: a loop inside
+/// one UTC day yields two days (the day and the one before, per
+/// [`rustdar_radar::level3::pairing_days`]), a loop spanning midnight three.
+fn pairing_days_for_frames(
+    queue: &VecDeque<(chrono::NaiveDateTime, String)>,
+) -> Vec<chrono::NaiveDate> {
+    let mut days: Vec<chrono::NaiveDate> = Vec::new();
+    for (ts, _) in queue {
+        for day in rustdar_radar::level3::pairing_days(*ts) {
+            if !days.contains(&day) {
+                days.push(day);
+            }
+        }
+    }
+    days
 }
 
-/// The sweep `ls`'s own scan for `timestamp` snaps `product`/`elevation` to, or
-/// `None` if it has no such scan or that scan carries no sweep for the product.
+/// The data a loop keyed to `target` renders for `timestamp`: the Level II volume,
+/// or every Level III object of that volume, whichever `target.product` reads.
+///
+/// `target.site` is where the loop's geometry came from, so it is also the only
+/// site whose data may be projected with it. The pane's live `site` field is not a
+/// substitute — it is re-synced across panes without rebuilding their loops — and
+/// it is not in scope here.
+fn frame_data(
+    loop_mgr: &crate::loop_downloads::LoopDownloadManager,
+    target: &RenderTarget,
+    timestamp: chrono::NaiveDateTime,
+) -> Option<LoopFrameData> {
+    loop_mgr.frame_data(&target.site, target.product, &timestamp)
+}
+
+/// What one frame's own data makes of the pane's elevation selection.
+enum FrameSweep {
+    /// The sweep the frame will be rendered at.
+    At(f32),
+    /// The data is here and carries nothing for this product: the volume has no
+    /// such sweep, or the site generated no object for this volume. Terminal.
+    Unrenderable,
+    /// The data has not arrived yet.
+    Pending,
+}
+
+/// The sweep frame `timestamp` of a loop keyed to `target` would be rendered at.
+///
+/// One function for both datasources, because the *distinction* the loop draws is
+/// not "which datasource" but "renderable, gap, or waiting" — and every caller
+/// downstream needs exactly those three.
+///
+/// * A Level II frame snaps the selection to the nearest sweep its own volume
+///   carries. Two volumes can snap one selection differently, which is why this is
+///   per frame rather than per loop.
+/// * A Level III frame is one object per code, already chosen: the sweep it depicts
+///   is the object's own PDB elevation angle. That is the honest answer — it is
+///   what the image shows — and it makes the sibling broadcast's sweep comparison
+///   mean something, since two panes resolving the same `(site, code, volume)`
+///   share one cache entry and therefore one angle.
+fn frame_sweep(
+    loop_mgr: &crate::loop_downloads::LoopDownloadManager,
+    target: &RenderTarget,
+    timestamp: chrono::NaiveDateTime,
+) -> FrameSweep {
+    if target.product.is_level3() {
+        return match loop_mgr.l3_frame_state(&target.site, target.product, &timestamp) {
+            L3FrameState::Pending => FrameSweep::Pending,
+            L3FrameState::Absent => FrameSweep::Unrenderable,
+            L3FrameState::Ready => {
+                match loop_mgr
+                    .l3_frame_products(&target.site, target.product, &timestamp)
+                    .as_deref()
+                    .and_then(<[_]>::first)
+                {
+                    Some(first) => FrameSweep::At(first.message.pdb.elevation_angle()),
+                    // `Ready` promised every code, so this is unreachable; a
+                    // retired frame is still the right answer for a product that
+                    // names no codes at all.
+                    None => FrameSweep::Unrenderable,
+                }
+            }
+        };
+    }
+    let Some(scan) = loop_mgr.get_cached(&target.site, &timestamp) else {
+        return FrameSweep::Pending;
+    };
+    match rustdar_radar::render::find_closest_elevation(scan, target.product, target.elevation) {
+        Some(snapped) => FrameSweep::At(snapped),
+        None => FrameSweep::Unrenderable,
+    }
+}
+
+/// The sweep `ls`'s own data for `timestamp` resolves `product`/`elevation` to, or
+/// `None` if it has none or that data carries nothing for the product.
 ///
 /// This is the receiver's half of a broadcast check, so it must be answerable
 /// *without* the sender's result: the site comes from `ls`, and the selection is
@@ -1568,7 +1829,7 @@ fn frame_scan<'a>(
 /// - A sibling on another site is already refused by `is_rendered_for`, so `None`
 ///   there changes nothing.
 /// - A same-site sibling shares this exact cache entry with the sender, which the
-///   sender resolved a scan from moments ago, so it is present.
+///   sender resolved its data from moments ago, so it is present.
 /// - If a re-download replaced that entry with one carrying no sweep for the
 ///   product, the sibling's own dispatch retires the frame (`render_failed`) rather
 ///   than waiting on a broadcast.
@@ -1583,8 +1844,17 @@ fn own_sweep(
     product: rustdar_radar::types::RadarProduct,
     elevation: f32,
 ) -> Option<f32> {
-    let scan = loop_mgr.get_cached(&ls.site, &timestamp)?;
-    rustdar_radar::render::find_closest_elevation(scan, product, elevation)
+    // Resolved through the same function the dispatcher plans with, against the
+    // receiver's own site: a second rule for "which sweep does this frame show"
+    // would be free to disagree with the one that produced `rr.snapped`.
+    match frame_sweep(
+        loop_mgr,
+        &RenderTarget::new(ls.site.clone(), product, elevation),
+        timestamp,
+    ) {
+        FrameSweep::At(sweep) => Some(sweep),
+        FrameSweep::Unrenderable | FrameSweep::Pending => None,
+    }
 }
 
 /// The sweep pair for offering `rr`'s finished image to the loop `ls`.
@@ -1612,20 +1882,39 @@ fn broadcast_sweep(
     }
 }
 
-/// Whether every frame `ls` intends to render has settled, given what has
-/// downloaded.
+/// The product a loop's frames are keyed to, or `None` before the first dispatch.
 ///
-/// The "has it downloaded" question is asked about the loop's own site. Answered
-/// site-blind, another site's scan at the same timestamp counts as this frame's
-/// data, and the loop is promoted to `Ready` over frames that will never render.
+/// Read off `rendered_for` rather than off the pane. The two diverge for exactly
+/// one dispatch pass after a retarget, and every question below — has this frame's
+/// data arrived, is something fetching it — is about the frames as they stand, not
+/// about the selection they are on their way to.
+fn loop_product(
+    ls: &rustdar_egui::pane::LoopPlaybackState,
+) -> Option<rustdar_radar::types::RadarProduct> {
+    ls.rendered_for.as_ref().map(|t| t.product)
+}
+
+/// Whether every frame `ls` intends to render has settled, given what has arrived.
+///
+/// The "has it arrived" question is asked about the loop's own site *and its own
+/// product*. Site-blind, another site's scan at the same timestamp counts as this
+/// frame's data. Product-blind, a Level III loop's frames would be judged against
+/// a Level II volume cache nothing is filling, so no batch would ever settle and
+/// the loop would sit in `Rendering` for the session.
 fn loop_batch_settled(
     loop_mgr: &crate::loop_downloads::LoopDownloadManager,
     ls: &rustdar_egui::pane::LoopPlaybackState,
     budget: usize,
 ) -> bool {
+    let Some(product) = loop_product(ls) else {
+        // Nothing dispatched yet, so nothing has settled.
+        return false;
+    };
     // Not merely "nothing in flight this instant": the render budget is shared with
     // static pane renders, so part of a batch can be starved and not yet spawned.
-    ls.render_set_settled(budget, |f| loop_mgr.is_cached(&ls.site, &f.timestamp))
+    ls.render_set_settled(budget, |f| {
+        loop_mgr.frame_data_settled(&ls.site, product, &f.timestamp)
+    })
 }
 
 /// A loop frame render the dispatcher intends to spawn.
@@ -2029,12 +2318,12 @@ mod loop_dispatch_tests {
 
         // The loop's own listing is taken.
         let live = vec![(ts(0), identifier("KOUN20240101_000000_V06"))];
-        let pending = accept_scan_listing(&mut koun, "KOUN", live).expect("its own listing");
+        let plan = accept_scan_listing(&mut koun, "KOUN", live).expect("its own listing");
         assert_eq!(
-            pending.site, "KOUN",
-            "the queue carries the site it was listed for"
+            plan.site, "KOUN",
+            "the plan carries the site it was listed for"
         );
-        assert_eq!(pending.queue.len(), 1);
+        assert_eq!(plan.frames.len(), 1);
         assert_eq!(koun.frames.len(), 1);
     }
 
@@ -2134,9 +2423,18 @@ mod loop_dispatch_tests {
         assert_eq!(ls.phase, LoopPhase::Ready);
     }
 
-    /// The frame list and the download queue are the two halves of one plan: every
-    /// frame must have a download queued, or it never settles and the loop hangs in
-    /// `Rendering`. That has to survive the sampling that caps long listings.
+    /// The frame list and the frame *plan* are the two halves of one decision:
+    /// every frame must be in the plan, or nothing ever fetches its data, it never
+    /// settles and the loop hangs in `Rendering`. That has to survive the sampling
+    /// that caps long listings.
+    ///
+    /// The plan, not a download queue: which bytes a frame needs depends on the
+    /// pane's product, and switching between a Level II and a Level III product
+    /// re-derives the queue from this same plan rather than re-listing. So the
+    /// agreement being pinned is frames-to-plan; `plan_downloads_for` is what turns
+    /// the plan into one queue or the other, and
+    /// `a_level3_loop_queues_a_pairing_per_frame_and_no_volume_downloads` pins that
+    /// half.
     ///
     /// Taking the listing also has to *advance* the phase. This is the one fixture
     /// that starts where a real loop starts — `FetchingScanList`, set by
@@ -2145,7 +2443,7 @@ mod loop_dispatch_tests {
     /// Left in `FetchingScanList`, `is_fetching()` never goes false: the pane keeps
     /// its "fetching" label and keeps asking for continuous repaints forever.
     #[test]
-    fn the_frame_list_and_the_download_queue_describe_the_same_scans() {
+    fn the_frame_list_and_the_frame_plan_describe_the_same_scans() {
         let ctx = egui::Context::default();
         let mut ls = loop_on(&ctx, "KTLX", &[]);
         ls.phase = LoopPhase::FetchingScanList;
@@ -2158,12 +2456,12 @@ mod loop_dispatch_tests {
             .map(|i| (ts(i), identifier(&format!("KTLX2024010{}_V06", i))))
             .collect();
 
-        let pending = accept_scan_listing(&mut ls, "KTLX", scans).expect("accepted");
+        let plan = accept_scan_listing(&mut ls, "KTLX", scans).expect("accepted");
 
-        assert_eq!(pending.queue.len(), MAX_LOOP_FRAMES, "capped");
+        assert_eq!(plan.frames.len(), MAX_LOOP_FRAMES, "capped");
         assert_eq!(
             ls.frames.iter().map(|f| f.timestamp).collect::<Vec<_>>(),
-            pending.queue.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            plan.frames.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
             "the sampled set is the frame list, frame for frame"
         );
         assert_eq!(
@@ -2370,18 +2668,21 @@ mod loop_dispatch_tests {
         assert!(!mgr.is_cached("KTLX", &ts(0)));
     }
 
-    /// The scan a frame renders is named by the target it is rendered for, because
+    /// The data a frame renders is named by the target it is rendered for, because
     /// that is where the geometry came from.
     #[test]
-    fn a_frames_scan_is_looked_up_under_its_targets_site() {
+    fn a_frames_data_is_looked_up_under_its_targets_site() {
         let mut mgr = LoopDownloadManager::new();
         let ktlx = scan_with_sweeps(&[0.5]);
         mgr.cache_scan("KTLX", ts(0), Arc::clone(&ktlx));
 
-        let found = frame_scan(&mgr, &target("KTLX", 0.5), ts(0)).expect("KTLX's own scan");
-        assert!(Arc::ptr_eq(found, &ktlx));
+        let found = frame_data(&mgr, &target("KTLX", 0.5), ts(0)).expect("KTLX's own scan");
+        match found {
+            LoopFrameData::Volume(scan) => assert!(Arc::ptr_eq(&scan, &ktlx)),
+            LoopFrameData::Products(_) => panic!("reflectivity is a Level II product"),
+        }
         assert!(
-            frame_scan(&mgr, &target("KOUN", 0.5), ts(0)).is_none(),
+            frame_data(&mgr, &target("KOUN", 0.5), ts(0)).is_none(),
             "a KOUN loop must not render KTLX's scan"
         );
     }
@@ -2872,6 +3173,709 @@ mod loop_interval_tests {
     }
 }
 
+/// The Level III half of the loop: pairing a bucket object to each frame's volume,
+/// what a gap does, and what happens when a pane retargets across the datasource
+/// line mid-loop.
+///
+/// Nothing here touches the network. The pairing itself is
+/// `rustdar_radar::level3`'s, tested against synthetic keys and PDBs there; what
+/// these tests pin is the frontend's half — which frames get queued, what a
+/// resolved-to-nothing frame does to playback, and that a Level III frame reaches
+/// the render dispatcher through exactly the path a Level II one does.
+#[cfg(test)]
+mod loop_level3_tests {
+    use super::*;
+    use crate::loop_downloads::{L3FrameState, LoopDownloadManager};
+    use nexrad_level3::model::{Level3Message, MessageHeader, ProductDescriptionBlock};
+    use rustdar_egui::pane::{LoopFrame, LoopPhase, LoopPlaybackState};
+    use rustdar_radar::archive::Identifier;
+    use rustdar_radar::level3::{Level3Product, ProductStamp};
+    use rustdar_radar::sites::RadarSite;
+    use rustdar_radar::types::RadarProduct;
+
+    const SITE: &str = "KTLX";
+    /// Echo tops: one AWIPS code (`EET`), and the product whose loop this
+    /// exercises. Its `level3_products()` is read rather than the literal, so a
+    /// change to the mapping cannot leave these tests pairing a code the app no
+    /// longer fetches.
+    const L3: RadarProduct = RadarProduct::EchoTops;
+    const L2: RadarProduct = RadarProduct::Reflectivity;
+
+    fn ts(minute: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            + chrono::Duration::minutes(minute as i64)
+    }
+
+    fn codes(product: RadarProduct) -> &'static [&'static str] {
+        product
+            .level3_products()
+            .expect("a Level III product names its codes")
+    }
+
+    /// A frame plan for `n` volumes one minute apart, as `accept_scan_listing`
+    /// builds one.
+    fn plan(n: u32) -> crate::loop_downloads::FramePlan {
+        crate::loop_downloads::FramePlan::new(
+            SITE.to_string(),
+            (0..n)
+                .map(|i| {
+                    (
+                        ts(i),
+                        Identifier::new(format!("KTLX20240101_00{i:02}00_V06")),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// A decoded object whose PDB reports `elevation_tenths / 10` degrees. Only
+    /// the fields the loop reads carry anything — no symbology, since nothing here
+    /// renders.
+    fn object(elevation_tenths: i16) -> Arc<Level3Product> {
+        let pdb = ProductDescriptionBlock {
+            block_divider: -1,
+            latitude: 35.33,
+            longitude: -97.27,
+            height: 1200,
+            product_code: 135,
+            operational_mode: 2,
+            vcp: 212,
+            sequence_number: 0,
+            volume_scan_number: 1,
+            volume_scan_date: 19723,
+            volume_scan_time: 0,
+            generation_date: 19723,
+            generation_time: 90,
+            product_specific_1: 0,
+            product_specific_2: 0,
+            elevation_number: 1,
+            product_specific_3: elevation_tenths,
+            thresholds: [0; 16],
+            product_specific_47_53: [0; 7],
+            version: 0,
+            spot_blank: 0,
+            symbology_offset: 60,
+            graphic_offset: 0,
+            tabular_offset: 0,
+        };
+        Arc::new(Level3Product {
+            message: Level3Message {
+                header: MessageHeader {
+                    message_code: 135,
+                    date_of_message: 19723,
+                    time_of_message: 90,
+                    message_length: 0,
+                    source_id: 0,
+                    destination_id: 0,
+                    number_of_blocks: 3,
+                },
+                pdb,
+                symbology: None,
+            },
+            stamp: ProductStamp::from_key("TLX_EET_2024_01_01_00_01_30"),
+            bytes: Arc::new(Vec::new()),
+        })
+    }
+
+    /// A loop on [`SITE`] with `n` frames, retargeted to `product`.
+    fn loop_for(product: RadarProduct, n: u32) -> LoopPlaybackState {
+        let mut ls = LoopPlaybackState::new_for_loop(
+            3600,
+            &RadarSite {
+                name: SITE,
+                lat: 35.33,
+                lon: -97.27,
+                elev: None,
+            },
+        );
+        ls.phase = LoopPhase::Rendering;
+        ls.frames = (0..n)
+            .map(|i| LoopFrame {
+                timestamp: ts(i),
+                texture: None,
+                render_in_flight: false,
+                render_failed: false,
+            })
+            .collect();
+        ls.retarget_renders(product, 0.5);
+        ls
+    }
+
+    /// The core of the feature. A Level III loop's frames are the *same* volume
+    /// timeline a Level II loop's are — which is what keeps a mixed set of panes
+    /// animating in step, since they share one clock — but what each frame needs
+    /// downloaded is a bucket object per AWIPS code, not the ~10 MB archive volume.
+    ///
+    /// Both halves are asserted. Queuing the pairings without dropping the volume
+    /// queue would work, animate correctly, and quietly spend a volume download per
+    /// frame on bytes no render reads.
+    #[test]
+    fn a_level3_loop_queues_a_pairing_per_frame_and_no_volume_downloads() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_plan(0, plan(4));
+
+        assert!(mgr.plan_downloads_for(0, L3), "the first plan is a change");
+
+        let pending = mgr
+            .extract_pending_l3(0)
+            .expect("a Level III product owes pairings");
+        assert_eq!(pending.site, SITE, "the site travels with the queue");
+        assert_eq!(pending.product, L3);
+        assert_eq!(
+            pending.queue.len(),
+            4 * codes(L3).len(),
+            "one pairing per frame per AWIPS code",
+        );
+        assert_eq!(
+            pending.queue.front().map(|(t, c)| (*t, c.clone())),
+            Some((ts(0), codes(L3)[0].to_string())),
+            "oldest volume first, as the frame list is ordered",
+        );
+        assert!(
+            mgr.extract_pending(0).is_none(),
+            "a Level III loop must not download the volumes it never reads",
+        );
+    }
+
+    /// A Level II loop is the mirror image: volumes queued, no pairings.
+    #[test]
+    fn a_level2_loop_queues_its_volumes_and_no_pairings() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_plan(0, plan(3));
+        assert!(mgr.plan_downloads_for(0, L2));
+
+        let pending = mgr.extract_pending(0).expect("volumes are owed");
+        assert_eq!(pending.site, SITE);
+        assert_eq!(pending.queue.len(), 3);
+        assert!(mgr.extract_pending_l3(0).is_none());
+    }
+
+    /// Switching product mid-loop must re-derive the queues, in both directions.
+    /// The frame list does not change — the loop's timeline is the volumes either
+    /// way — so without this the frames would sit waiting on data nothing is
+    /// fetching, and `settle_loop_phase` would abandon the loop.
+    #[test]
+    fn retargeting_across_the_datasource_line_requeues_the_frames() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_plan(0, plan(2));
+
+        assert!(mgr.plan_downloads_for(0, L2));
+        assert!(
+            mgr.plan_downloads_for(0, L3),
+            "moving to Level III is a change",
+        );
+        assert!(
+            mgr.extract_pending(0).is_none(),
+            "the volume queue went with the old product",
+        );
+        let l3 = mgr.extract_pending_l3(0).expect("pairings queued");
+        assert_eq!(l3.queue.len(), 2 * codes(L3).len());
+        mgr.insert_pending_l3(0, l3);
+
+        assert!(mgr.plan_downloads_for(0, L2), "and back again");
+        assert_eq!(
+            mgr.extract_pending(0).map(|p| p.queue.len()),
+            Some(2),
+            "the volumes are queued from the same plan, with no re-listing",
+        );
+        assert!(mgr.extract_pending_l3(0).is_none());
+    }
+
+    /// An unchanged product must not re-derive anything. `dispatch_loop_renders`
+    /// asks on every retarget, and an elevation change is a retarget — rebuilding
+    /// both queues every time the user nudges a tilt would re-queue every frame
+    /// that had already been fetched.
+    #[test]
+    fn an_unchanged_product_requeues_nothing() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_plan(0, plan(2));
+        assert!(mgr.plan_downloads_for(0, L3));
+        assert!(
+            !mgr.plan_downloads_for(0, L3),
+            "the same product is not a change",
+        );
+        // And a pane with no plan has nothing to derive from.
+        assert!(!mgr.plan_downloads_for(7, L3));
+    }
+
+    /// The three answers a frame's Level III data can have, and the one that only
+    /// exists because gaps are normal: a volume the site generated no object for is
+    /// **Absent**, cached as such, and never asked about again.
+    ///
+    /// The `Absent` case is what a re-pairing loop would otherwise cost: up to
+    /// `PAIRING_CANDIDATES` object fetches per dispatch pass, forever.
+    #[test]
+    fn a_frames_level3_state_distinguishes_ready_absent_and_pending() {
+        let mut mgr = LoopDownloadManager::new();
+        let code = codes(L3)[0];
+
+        assert_eq!(
+            mgr.l3_frame_state(SITE, L3, &ts(0)),
+            L3FrameState::Pending,
+            "nothing paired yet",
+        );
+        assert!(!mgr.l3_is_resolved(SITE, code, &ts(0)));
+
+        mgr.cache_l3_product(SITE, code, ts(0), Some(object(0)));
+        assert_eq!(mgr.l3_frame_state(SITE, L3, &ts(0)), L3FrameState::Ready);
+        assert!(mgr.l3_is_resolved(SITE, code, &ts(0)));
+
+        mgr.cache_l3_product(SITE, code, ts(1), None);
+        assert_eq!(
+            mgr.l3_frame_state(SITE, L3, &ts(1)),
+            L3FrameState::Absent,
+            "the site generated no object for that volume",
+        );
+        assert!(
+            mgr.l3_is_resolved(SITE, code, &ts(1)),
+            "a gap is an answer, so nothing re-pairs it",
+        );
+    }
+
+    /// Another site's objects are never this frame's, even at the same volume time
+    /// — the same rule the volume cache follows, and for the same reason: two
+    /// sites' volume starts land on the same second often enough, and an image
+    /// drawn from one radar's object at another's coordinates looks entirely
+    /// consistent.
+    #[test]
+    fn a_paired_object_is_never_taken_from_another_site() {
+        let mut mgr = LoopDownloadManager::new();
+        let code = codes(L3)[0];
+        mgr.cache_l3_product(SITE, code, ts(0), Some(object(0)));
+
+        assert_eq!(mgr.l3_frame_state(SITE, L3, &ts(0)), L3FrameState::Ready);
+        assert_eq!(
+            mgr.l3_frame_state("KOUN", L3, &ts(0)),
+            L3FrameState::Pending,
+            "KOUN has paired nothing",
+        );
+        assert!(mgr.l3_frame_products("KOUN", L3, &ts(0)).is_none());
+    }
+
+    /// A product needs *every* one of its AWIPS codes before a frame is ready, and
+    /// is a gap as soon as any one of them is missing.
+    ///
+    /// Every Level III product rustdar draws today names one code, so for them this
+    /// reduces to the single-code case above. It is written over
+    /// `level3_products()` rather than over a literal because that is about to stop
+    /// being true: VIL density is being rebuilt as `DVL ÷ EET`, two codes paired to
+    /// one volume, and the moment it lands this test carries the all-or-nothing
+    /// rule without being touched.
+    #[test]
+    fn a_frame_needs_every_one_of_its_products_codes() {
+        for product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
+            let all = codes(*product);
+            let mut mgr = LoopDownloadManager::new();
+            // All but the last code paired.
+            for code in &all[..all.len() - 1] {
+                mgr.cache_l3_product(SITE, code, ts(0), Some(object(0)));
+            }
+            assert_eq!(
+                mgr.l3_frame_state(SITE, *product, &ts(0)),
+                L3FrameState::Pending,
+                "{} was ready without {}",
+                product.name(),
+                all[all.len() - 1],
+            );
+            assert!(
+                mgr.l3_frame_products(SITE, *product, &ts(0)).is_none(),
+                "{} must not render against a missing input",
+                product.name(),
+            );
+
+            mgr.cache_l3_product(SITE, all[all.len() - 1], ts(0), Some(object(0)));
+            assert_eq!(
+                mgr.l3_frame_state(SITE, *product, &ts(0)),
+                L3FrameState::Ready,
+            );
+            assert_eq!(
+                mgr.l3_frame_products(SITE, *product, &ts(0))
+                    .map(|p| p.len()),
+                Some(all.len()),
+                "{} renders from all of its codes, in order",
+                product.name(),
+            );
+        }
+    }
+
+    /// The sweep a Level III frame is rendered at is its **object's own** PDB
+    /// elevation, not the pane's selection.
+    ///
+    /// That is what the image actually depicts, and it is what makes the sibling
+    /// broadcast's sweep comparison mean anything: two panes resolving the same
+    /// `(site, code, volume)` share one cache entry and so one angle, while a
+    /// comparison against the selection would agree for every object regardless of
+    /// which cut it is. The fixture's object sits at 1.4° against a 0.5° selection
+    /// so the two cannot be confused.
+    #[test]
+    fn a_level3_frames_sweep_is_its_objects_own_elevation() {
+        let mut mgr = LoopDownloadManager::new();
+        let code = codes(L3)[0];
+        let tgt = RenderTarget::new(SITE, L3, 0.5);
+
+        assert!(
+            matches!(frame_sweep(&mgr, &tgt, ts(0)), FrameSweep::Pending),
+            "nothing paired yet, so the frame waits rather than being retired",
+        );
+
+        mgr.cache_l3_product(SITE, code, ts(0), Some(object(14)));
+        match frame_sweep(&mgr, &tgt, ts(0)) {
+            FrameSweep::At(sweep) => assert_eq!(sweep, 1.4),
+            other => panic!("expected a renderable frame, got {:?}", DebugSweep(other)),
+        }
+    }
+
+    /// A gap retires its frame, exactly as a Level II volume carrying no sweep for
+    /// the product does — and by the same route, so playback steps over it instead
+    /// of flashing an empty pane or raising an error.
+    #[test]
+    fn a_gap_makes_its_frame_unrenderable_rather_than_pending() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.cache_l3_product(SITE, codes(L3)[0], ts(0), None);
+        assert!(matches!(
+            frame_sweep(&mgr, &RenderTarget::new(SITE, L3, 0.5), ts(0)),
+            FrameSweep::Unrenderable
+        ));
+    }
+
+    /// A frame's render data is resolved from the product on its own target, so a
+    /// Level III frame gets objects and a Level II frame gets a volume with no
+    /// caller deciding which.
+    #[test]
+    fn frame_data_follows_the_targets_own_product() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.cache_l3_product(SITE, codes(L3)[0], ts(0), Some(object(0)));
+
+        match frame_data(&mgr, &RenderTarget::new(SITE, L3, 0.5), ts(0)) {
+            Some(LoopFrameData::Products(objects)) => assert_eq!(objects.len(), codes(L3).len()),
+            _ => panic!("a Level III target must resolve to its objects"),
+        }
+        assert!(
+            frame_data(&mgr, &RenderTarget::new(SITE, L2, 0.5), ts(0)).is_none(),
+            "a Level II target reads the volume cache, which holds nothing here",
+        );
+    }
+
+    /// Readiness has to be asked about the loop's own *product*, not only its site,
+    /// and this is the failure it prevents.
+    ///
+    /// `render_set_settled` reads "this frame has no data yet" as settled — nothing
+    /// is owed to a frame with nothing to render — and leaves the arriving half to
+    /// the download check. So a Level III loop judged against the **volume** cache,
+    /// which nothing fills for it, reads as fully settled the moment its pairings
+    /// are dispatched: no frame has a texture, nothing is in flight, and
+    /// `settle_loop_phase` concludes nothing will ever render and switches the loop
+    /// off. The pane silently falls back to its static image, which is precisely
+    /// "an L3 product that does not loop".
+    ///
+    /// Asked about the product, a paired frame *is* data-available, so the batch
+    /// stays unsettled until its render lands.
+    #[test]
+    fn a_level3_loops_batch_settles_on_its_pairings_not_on_volumes() {
+        let mut ls = loop_for(L3, 3);
+        let mut mgr = LoopDownloadManager::new();
+        let code = codes(L3)[0];
+
+        // Every frame's object is paired; none has rendered.
+        for i in 0..3 {
+            mgr.cache_l3_product(SITE, code, ts(i), Some(object(0)));
+        }
+        assert!(
+            !loop_batch_settled(&mgr, &ls, MAX_LOOP_RENDER_BUDGET),
+            "three renderable frames and no textures: renders are owed",
+        );
+        // The contrast, spelled out: the same batch judged the old way — against
+        // the volume cache — reads as settled, which is the abandonment above.
+        assert!(
+            ls.render_set_settled(MAX_LOOP_RENDER_BUDGET, |f| mgr
+                .is_cached(SITE, &f.timestamp)),
+            "precondition: a volume-cache check settles this batch, and the loop \
+             would then be switched off with everything it needs in hand",
+        );
+        assert!(
+            !settle_loop_phase(&mgr, 0, &mut ls, MAX_LOOP_RENDER_BUDGET),
+            "so the loop must be left in Rendering, waiting on its renders",
+        );
+        assert_eq!(ls.phase, LoopPhase::Rendering);
+
+        // Caching the volumes changes nothing either way: this loop never reads them.
+        for i in 0..3 {
+            mgr.cache_scan(SITE, ts(i), volume());
+        }
+        assert!(!loop_batch_settled(&mgr, &ls, MAX_LOOP_RENDER_BUDGET));
+
+        // One rendered, one gap, one rendered: the batch settles and the loop is
+        // promoted rather than abandoned — the gap is not held against it.
+        ls.frames[0].texture = Some(image());
+        ls.frames[2].texture = Some(image());
+        mgr.cache_l3_product(SITE, code, ts(1), None);
+        ls.frames[1].render_failed = true;
+        assert!(loop_batch_settled(&mgr, &ls, MAX_LOOP_RENDER_BUDGET));
+        assert!(!settle_loop_phase(&mgr, 0, &mut ls, MAX_LOOP_RENDER_BUDGET));
+        assert_eq!(ls.phase, LoopPhase::Ready);
+    }
+
+    /// A pairing in flight holds the loop open, the way a volume download does.
+    /// Without it, a Level III loop is abandoned on the pass right after its first
+    /// batch is dispatched: no frame has a texture yet, nothing is *rendering*, and
+    /// the only thing outstanding is on the other datasource's in-flight set.
+    #[test]
+    fn a_pairing_in_flight_keeps_the_loop_from_being_abandoned() {
+        let mut ls = loop_for(L3, 3);
+        let mut mgr = LoopDownloadManager::new();
+        mgr.mark_l3_in_flight(SITE, codes(L3)[0], ts(0));
+
+        assert!(!settle_loop_phase(&mgr, 0, &mut ls, MAX_LOOP_RENDER_BUDGET));
+        assert_eq!(ls.phase, LoopPhase::Rendering, "still working");
+
+        // Undispatched pairings hold it open too — the queue, not just the marks.
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_plan(0, plan(3));
+        mgr.plan_downloads_for(0, L3);
+        assert!(!mgr.is_pane_done(0), "pairings are still owed");
+        assert!(!settle_loop_phase(&mgr, 0, &mut ls, MAX_LOOP_RENDER_BUDGET));
+        assert_eq!(ls.phase, LoopPhase::Rendering);
+    }
+
+    /// A loop every one of whose frames is a gap is switched off, so the pane falls
+    /// back to its static image rather than animating nothing. The same dead end a
+    /// Level II loop with no renderable frame reaches, by the same route.
+    #[test]
+    fn a_level3_loop_that_is_all_gaps_is_switched_off() {
+        let mut ls = loop_for(L3, 3);
+        let mut mgr = LoopDownloadManager::new();
+        for i in 0..3 {
+            mgr.cache_l3_product(SITE, codes(L3)[0], ts(i), None);
+            ls.frames[i as usize].render_failed = true;
+        }
+
+        assert!(
+            settle_loop_phase(&mgr, 0, &mut ls, MAX_LOOP_RENDER_BUDGET),
+            "the caller has to release this pane's loop state",
+        );
+        assert!(!ls.is_active());
+    }
+
+    /// A pane whose loop has never dispatched has no product to judge its frames
+    /// by, so nothing is settled — rather than everything being, which would
+    /// promote a loop with no frames rendered.
+    #[test]
+    fn a_loop_before_its_first_dispatch_has_settled_nothing() {
+        let mut ls = loop_for(L3, 2);
+        ls.rendered_for = None;
+        let mgr = LoopDownloadManager::new();
+        assert!(!loop_batch_settled(&mgr, &ls, MAX_LOOP_RENDER_BUDGET));
+    }
+
+    /// The days a Level III listing covers come from the loop's own frames, not
+    /// from wall clock: a loop rebuilt around a historic scan pairs against
+    /// yesterday's prefix, and listing today's would find nothing — which is
+    /// indistinguishable from "the site served no objects" and would retire every
+    /// frame as a gap.
+    #[test]
+    fn the_listed_days_come_from_the_frames_and_span_midnight() {
+        let code = codes(L3)[0].to_string();
+        let jan2 = chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+        let jan1 = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let dec31 = chrono::NaiveDate::from_ymd_opt(2023, 12, 31).unwrap();
+
+        // Frames inside one UTC day: that day plus the one before, since an
+        // object for an early volume can sit under the previous prefix.
+        let same_day: VecDeque<_> = [(ts(10), code.clone()), (ts(20), code.clone())]
+            .into_iter()
+            .collect();
+        assert_eq!(pairing_days_for_frames(&same_day), vec![jan1, dec31]);
+
+        // A window that crosses 00Z lists all three, each once.
+        let across: VecDeque<_> = [
+            (ts(23 * 60 + 50), code.clone()),
+            (ts(24 * 60 + 5), code.clone()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(pairing_days_for_frames(&across), vec![jan1, dec31, jan2]);
+
+        assert!(
+            pairing_days_for_frames(&VecDeque::new()).is_empty(),
+            "nothing left to pair, nothing to list",
+        );
+    }
+
+    /// A key listing is claimed once. Two panes looping one site want the same
+    /// keys, and the listing is the expensive half of a pairing — a round-trip per
+    /// UTC day, against a few hundred kilobytes of object per pairing.
+    #[test]
+    fn a_key_listing_is_claimed_once_and_shared() {
+        let mut mgr = LoopDownloadManager::new();
+        let code = codes(L3)[0];
+
+        assert!(mgr.claim_l3_listing(SITE, code), "the first caller owes it");
+        assert!(
+            !mgr.claim_l3_listing(SITE, code),
+            "the second waits on the first",
+        );
+        assert!(
+            mgr.claim_l3_listing("KOUN", code),
+            "another site is another listing",
+        );
+        assert!(mgr.l3_keys(SITE, code).is_none(), "not landed yet");
+
+        mgr.cache_l3_keys(SITE, code, vec!["TLX_EET_2024_01_01_00_01_30".to_string()]);
+        assert_eq!(mgr.l3_keys(SITE, code).map(|k| k.len()), Some(1));
+        assert!(
+            !mgr.claim_l3_listing(SITE, code),
+            "and is not listed a second time once cached",
+        );
+    }
+
+    /// An empty listing is an answer, not a failure to record. Discarded, the
+    /// pairings would wait on a listing that already happened and the loop would
+    /// hang in `Rendering`; cached, every frame pairs to a gap and the loop retires
+    /// to the pane's static image.
+    #[test]
+    fn an_empty_key_listing_is_cached_as_the_answer() {
+        let mut mgr = LoopDownloadManager::new();
+        let code = codes(L3)[0];
+        assert!(mgr.claim_l3_listing(SITE, code));
+        mgr.cache_l3_keys(SITE, code, Vec::new());
+
+        assert_eq!(
+            mgr.l3_keys(SITE, code).map(|k| k.len()),
+            Some(0),
+            "an empty list is stored, so the pairings can proceed and find nothing",
+        );
+        assert!(!mgr.claim_l3_listing(SITE, code));
+    }
+
+    /// Switching site drops every trace of the Level III half too. A pairing left
+    /// behind would land against a loop that no longer exists, and a key listing
+    /// left behind would be re-used for a site it was never made for — which
+    /// `clear_all`'s whole job is to prevent.
+    #[test]
+    fn clear_all_empties_the_level3_state_as_well() {
+        let mut mgr = LoopDownloadManager::new();
+        let code = codes(L3)[0];
+        mgr.set_plan(0, plan(2));
+        mgr.plan_downloads_for(0, L3);
+        mgr.cache_l3_keys(SITE, code, vec!["TLX_EET_2024_01_01_00_01_30".to_string()]);
+        mgr.cache_l3_product(SITE, code, ts(0), Some(object(0)));
+        mgr.mark_l3_in_flight(SITE, code, ts(1));
+        assert!(!mgr.is_pane_done(0), "precondition: pairings are owed");
+
+        mgr.clear_all();
+
+        assert!(mgr.is_pane_done(0));
+        assert!(mgr.pending_l3_pane_indices().is_empty());
+        assert!(mgr.l3_keys(SITE, code).is_none());
+        assert!(!mgr.l3_is_resolved(SITE, code, &ts(0)));
+        assert!(!mgr.l3_is_in_flight(SITE, code, &ts(1)));
+        // And the plan is gone, so nothing can re-derive a queue from the site the
+        // pane has just left.
+        assert!(!mgr.plan_downloads_for(0, L3));
+    }
+
+    /// Switching the loop off releases both queues and the plan behind them.
+    #[test]
+    fn removing_a_panes_pending_work_takes_both_queues_and_the_plan() {
+        let mut mgr = LoopDownloadManager::new();
+        mgr.set_plan(0, plan(2));
+        mgr.plan_downloads_for(0, L3);
+        assert!(!mgr.is_pane_done(0));
+
+        mgr.remove_pending(0);
+
+        assert!(mgr.is_pane_done(0));
+        assert!(
+            !mgr.plan_downloads_for(0, L2),
+            "the plan went with the queues, so nothing refills from it",
+        );
+    }
+
+    /// `FrameSweep` is not `Debug` in production — nothing logs it — so the
+    /// panic message above wraps it.
+    struct DebugSweep(FrameSweep);
+
+    impl std::fmt::Debug for DebugSweep {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self.0 {
+                FrameSweep::At(a) => write!(f, "At({a})"),
+                FrameSweep::Unrenderable => write!(f, "Unrenderable"),
+                FrameSweep::Pending => write!(f, "Pending"),
+            }
+        }
+    }
+
+    /// A Level II volume with one reflectivity sweep, so the volume cache holds
+    /// something real when a test needs to prove it is *not* being read.
+    fn volume() -> Arc<nexrad_model::data::Scan> {
+        use nexrad_model::data::{
+            MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
+        };
+        let radial = Radial::new(
+            0,
+            0,
+            0.0,
+            1.0,
+            RadialStatus::ElevationStart,
+            1,
+            0.5,
+            Some(MomentData::from_fixed_point(
+                1,
+                0,
+                250,
+                8,
+                2.0,
+                66.0,
+                vec![0],
+            )),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Arc::new(Scan::new(
+            VolumeCoveragePattern::new(
+                212,
+                0,
+                0.5,
+                PulseWidth::Short,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+                0,
+                false,
+                false,
+                Vec::new(),
+            ),
+            vec![Sweep::new(1, vec![radial])],
+        ))
+    }
+
+    /// A 1x1 texture standing in for a rendered frame. Nothing here reads pixels.
+    fn image() -> rustdar_egui::pane::RadarImageData {
+        let ctx = egui::Context::default();
+        rustdar_egui::pane::RadarImageData {
+            texture: ctx.load_texture(
+                "test",
+                egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                egui::TextureOptions::NEAREST,
+            ),
+            lat: 35.33,
+            lon: -97.27,
+            max_range_km: 100.0,
+            value_data: Arc::new(Vec::new()),
+        }
+    }
+}
+
 /// The order one frame is assembled in.
 ///
 /// `setup_egui_frame` unwraps an `AppState`, which is a wgpu device, a surface
@@ -2910,6 +3914,11 @@ mod frame_build_order_tests {
             "self.poll_overlay_render_results(",
             "self.poll_loop_scan_list_results(",
             "self.poll_loop_scan_download_results(",
+            // The Level III loop's two stages, listed here for the same reason
+            // as the Level II pair: a pairing that lands after layout is a frame
+            // that stays blank until something unrelated repaints.
+            "self.poll_loop_l3_list_results(",
+            "self.poll_loop_l3_fetch_results(",
             "self.poll_loop_render_results(",
         ] {
             let at = body

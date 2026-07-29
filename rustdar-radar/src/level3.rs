@@ -1117,6 +1117,146 @@ mod tests {
         }
     }
 
+    /// A real Level III loop, end to end: take the last hour of a site's Level II
+    /// volumes — which is exactly the frame timeline the frontend's loop builds —
+    /// list the bucket once, and pair every frame.
+    ///
+    /// What it proves that the unit tests cannot: N frames yield N *decoded* objects
+    /// from N *distinct* volumes, each naming its own frame's volume start. A
+    /// pairing that fell back to the newest key would return the same object for
+    /// every frame and still "succeed" — the distinctness assertions are what catch
+    /// that, and they are the reason SAILS republication makes recency the wrong
+    /// rule.
+    ///
+    /// The listing is done once for the whole loop, as the frontend does it, so this
+    /// also measures the real request cost: one listing plus one object per frame.
+    ///
+    /// Tries several sites: any one of them can be down or between volumes.
+    ///
+    /// ```text
+    /// cargo test -p rustdar-radar --release -- --ignored --nocapture live_a_loops_frames
+    /// ```
+    #[ignore = "hits the live unidata-nexrad-level3 S3 bucket and the Level II archive"]
+    #[tokio::test]
+    async fn live_a_loops_frames_each_pair_with_their_own_volume() {
+        crate::tls::init();
+        let sources = DataSources::production();
+        let now = chrono::Utc::now().naive_utc();
+        // Long enough for several volumes at any VCP, short enough to stay inside
+        // one product-day listing most of the time.
+        let start = now - Duration::hours(1);
+
+        // Echo tops: one AWIPS code, published once per volume.
+        let product = RadarProduct::EchoTops;
+        let code = product.level3_products().expect("EET")[0];
+        let pick = product
+            .level3_volume_pick()
+            .expect("a Level III product names a pick");
+
+        for site in ["KTLX", "KOUN", "KFWS", "KMPX", "KOAX", "KLZK"] {
+            let Ok(volumes) = crate::scan::list_scans_for_range(site, start, now).await else {
+                continue;
+            };
+            // The frontend caps a loop's frames; five is enough to make
+            // distinctness mean something without a long test.
+            let frames: Vec<NaiveDateTime> = volumes
+                .iter()
+                .rev()
+                .take(5)
+                .map(|(t, _)| *t)
+                .rev()
+                .collect();
+            if frames.len() < 3 {
+                println!("{site}: only {} volumes in the window", frames.len());
+                continue;
+            }
+
+            // One listing for the whole loop, exactly as the loop does it.
+            let days: Vec<NaiveDate> = {
+                let mut days = Vec::new();
+                for f in &frames {
+                    for d in pairing_days(*f) {
+                        if !days.contains(&d) {
+                            days.push(d);
+                        }
+                    }
+                }
+                days
+            };
+            let keys = list_days(&sources, site, code, &days).await;
+            println!(
+                "{site}: {} frames, {} {code} keys across {} day(s)",
+                frames.len(),
+                keys.len(),
+                days.len(),
+            );
+            if keys.is_empty() {
+                continue;
+            }
+
+            let mut paired = Vec::new();
+            for frame in &frames {
+                let candidates = candidates_near(keys.iter().cloned(), *frame);
+                let Some(object) =
+                    product_from_candidates(&sources, candidates, *frame, pick).await
+                else {
+                    println!("  {frame}: gap — no {code} for that volume");
+                    continue;
+                };
+                let pdb_start =
+                    volume_scan_started(&object.message.pdb).expect("a decoded PDB is stamped");
+                println!(
+                    "  {frame}: {} (volume {pdb_start}, elevation {:.1}\u{b0})",
+                    object.stamp.key,
+                    object.message.pdb.elevation_angle(),
+                );
+                assert!(
+                    names_volume(&object.message.pdb, *frame),
+                    "{site}: {} was paired to frame {frame} but its PDB names {pdb_start}",
+                    object.stamp.key,
+                );
+                assert!(
+                    object.message.symbology.is_some(),
+                    "{site}: {} decoded with no symbology, so the frame would draw nothing",
+                    object.stamp.key,
+                );
+                paired.push((*frame, object));
+            }
+
+            // A gap or two is ordinary; every frame resolving to nothing is not.
+            assert!(
+                paired.len() >= 3,
+                "{site}: only {} of {} frames paired — the loop would be mostly gaps",
+                paired.len(),
+                frames.len(),
+            );
+            // The assertion the pairing exists for. Taking the newest key would
+            // give one object repeated, which every check above still passes for
+            // the one frame nearest it.
+            for (i, (_, a)) in paired.iter().enumerate() {
+                for (_, b) in &paired[..i] {
+                    assert_ne!(
+                        a.stamp.key, b.stamp.key,
+                        "{site}: two frames paired to the same object, so the loop \
+                         would animate one image",
+                    );
+                    assert_ne!(
+                        volume_scan_started(&a.message.pdb),
+                        volume_scan_started(&b.message.pdb),
+                        "{site}: two frames paired to objects of the same volume",
+                    );
+                }
+            }
+            println!(
+                "{site}: {} frames -> {} distinct volumes",
+                frames.len(),
+                paired.len()
+            );
+            return;
+        }
+        panic!("no site served an hour of volumes with EET objects");
+    }
+
     /// Pins "last key wins" against the live bucket: keys returned in another
     /// order, or a selection taking the first key, would yield something hours
     /// old rather than minutes.

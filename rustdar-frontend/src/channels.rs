@@ -124,6 +124,49 @@ pub struct LoopScanDownloadResponse {
     pub scan: Option<Arc<Scan>>,
 }
 
+/// The Level III bucket keys a loop's pairings will be ranked against: one
+/// listing per `(site, AWIPS code)` covering the UTC days its window touches.
+///
+/// The Level III counterpart of [`LoopScanListResponse`], and it carries the site
+/// and the code for the same reason that one carries the site: a listing is an
+/// uncancellable round-trip, the pane's loop can be rebuilt for another site or
+/// retargeted to another product while it is in the air, and the keys are useless
+/// — worse, misleading — filed under anything but what they were listed for.
+pub struct LoopL3ListResponse {
+    pub pane_idx: usize,
+    /// Site the listing was made for. Every key below is one of its objects.
+    pub site: String,
+    /// AWIPS product ID the listing was made for, e.g. `"EET"`.
+    pub code: String,
+    /// Every key across the listed days, unordered. Ranking per frame is
+    /// [`rustdar_radar::level3::candidates_near`]'s job.
+    ///
+    /// An empty list is a real answer — the site served no objects for this
+    /// product — and is cached as one, so every frame resolves to a gap and the
+    /// loop retires rather than waiting on a listing that already happened.
+    pub keys: Vec<String>,
+}
+
+/// The Level III object paired to one loop frame's volume.
+///
+/// `product` is `None` when the site generated no object for that volume: an
+/// ordinary gap, not a failure. It is cached as the answer, so the frame is
+/// retired once rather than re-paired on every dispatch pass.
+pub struct LoopL3FetchResponse {
+    pub pane_idx: usize,
+    /// Site the object was paired against — half of the cache key, carried from
+    /// the pairing rather than re-read from the pane on arrival, exactly as
+    /// [`LoopScanDownloadResponse::site`] is.
+    pub site: String,
+    /// AWIPS product ID this object is, the second part of the cache key.
+    pub code: String,
+    /// The frame's **volume start** — what the pairing matched the object's PDB
+    /// against, and the third part of the cache key. Not the object's own key
+    /// timestamp, which is when the RPG published it.
+    pub timestamp: chrono::NaiveDateTime,
+    pub product: Option<Arc<Level3Product>>,
+}
+
 /// Result from rendering a single loop frame.
 pub struct LoopRenderResponse {
     pub pane_idx: usize,
@@ -236,6 +279,10 @@ pub struct ChannelHub {
     pub loop_scan_list_receiver: Receiver<LoopScanListResponse>,
     pub loop_scan_download_sender: Sender<LoopScanDownloadResponse>,
     pub loop_scan_download_receiver: Receiver<LoopScanDownloadResponse>,
+    pub loop_l3_list_sender: Sender<LoopL3ListResponse>,
+    pub loop_l3_list_receiver: Receiver<LoopL3ListResponse>,
+    pub loop_l3_fetch_sender: Sender<LoopL3FetchResponse>,
+    pub loop_l3_fetch_receiver: Receiver<LoopL3FetchResponse>,
     pub loop_render_sender: Sender<LoopRenderResponse>,
     pub loop_render_receiver: Receiver<LoopRenderResponse>,
     pub chunk_sender: Sender<ChunkResponse>,
@@ -259,6 +306,8 @@ impl ChannelHub {
         let (overlay_render_sender, overlay_render_receiver) = std::sync::mpsc::channel();
         let (loop_scan_list_sender, loop_scan_list_receiver) = std::sync::mpsc::channel();
         let (loop_scan_download_sender, loop_scan_download_receiver) = std::sync::mpsc::channel();
+        let (loop_l3_list_sender, loop_l3_list_receiver) = std::sync::mpsc::channel();
+        let (loop_l3_fetch_sender, loop_l3_fetch_receiver) = std::sync::mpsc::channel();
         let (loop_render_sender, loop_render_receiver) = std::sync::mpsc::channel();
         let (sounding_sender, sounding_receiver) = std::sync::mpsc::channel();
         let (chunk_sender, chunk_receiver) = std::sync::mpsc::channel();
@@ -278,6 +327,10 @@ impl ChannelHub {
             loop_scan_list_receiver,
             loop_scan_download_sender,
             loop_scan_download_receiver,
+            loop_l3_list_sender,
+            loop_l3_list_receiver,
+            loop_l3_fetch_sender,
+            loop_l3_fetch_receiver,
             loop_render_sender,
             loop_render_receiver,
             chunk_sender,

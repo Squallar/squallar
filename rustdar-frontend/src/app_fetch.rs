@@ -826,6 +826,91 @@ impl super::App {
         );
     }
 
+    /// Spawn the key listing a pane's Level III loop pairings will be ranked
+    /// against: one request per UTC day the loop's window touches, for one AWIPS
+    /// code.
+    ///
+    /// The listing is separated from the pairing on purpose. A loop pairs tens of
+    /// volumes against the same code, and each pairing has to know which keys
+    /// exist; listing per frame would spend two round-trips a frame answering the
+    /// same question. Listed once here and cached in `loop_mgr`, every frame then
+    /// ranks the same key set locally.
+    ///
+    /// `site` and `code` are echoed on the response: together they are the cache
+    /// key, and a listing outlives the loop that asked for it.
+    pub(super) fn spawn_loop_l3_listing(
+        &self,
+        pane_idx: usize,
+        site: String,
+        code: String,
+        days: Vec<chrono::NaiveDate>,
+    ) {
+        self.spawn_async_task(self.channels.loop_l3_list_sender.clone(), async move {
+            let sources = rustdar_radar::sources::DataSources::production();
+            let keys = rustdar_radar::level3::list_days(&sources, &site, &code, &days).await;
+            log::info!(
+                "Loop: listed {} Level III {code} keys for {site} across {} day(s)",
+                keys.len(),
+                days.len(),
+            );
+            crate::channels::LoopL3ListResponse {
+                pane_idx,
+                site,
+                code,
+                keys,
+            }
+        });
+    }
+
+    /// Spawn the pairing for one loop frame's Level III object: rank `keys` around
+    /// the frame's volume start and open candidates until one names that volume.
+    ///
+    /// `timestamp` is the **volume start** the frame draws, which is exactly what
+    /// a Level III PDB reports for the volume it was generated from — so the
+    /// pairing is an equality, not a nearest-in-time guess. The newest key is
+    /// never taken: SAILS republishes cuts mid-volume and the QPE family emits
+    /// partial intermediates, so recency and volume identity routinely disagree.
+    /// See [`rustdar_radar::level3::product_from_candidates`].
+    ///
+    /// `None` on the response is an ordinary gap — a volume the site generated no
+    /// object for — and is cached as the answer so the frame is retired once
+    /// rather than re-paired every pass.
+    pub(super) fn spawn_loop_l3_pairing(
+        &self,
+        pane_idx: usize,
+        site: String,
+        code: String,
+        timestamp: NaiveDateTime,
+        keys: std::sync::Arc<Vec<String>>,
+        pick: rustdar_radar::level3::VolumePick,
+    ) {
+        self.spawn_async_task(self.channels.loop_l3_fetch_sender.clone(), async move {
+            let sources = rustdar_radar::sources::DataSources::production();
+            let candidates =
+                rustdar_radar::level3::candidates_near(keys.iter().cloned(), timestamp);
+            let product = rustdar_radar::level3::product_from_candidates(
+                &sources, candidates, timestamp, pick,
+            )
+            .await;
+            match &product {
+                Some(p) => log::debug!(
+                    "Loop: {site} {code} for volume {timestamp} is {}",
+                    p.stamp.key
+                ),
+                None => log::info!(
+                    "Loop: {site} generated no {code} for volume {timestamp}; frame is a gap"
+                ),
+            }
+            crate::channels::LoopL3FetchResponse {
+                pane_idx,
+                site,
+                code,
+                timestamp,
+                product: product.map(std::sync::Arc::new),
+            }
+        });
+    }
+
     /// Spawn a background render thread for a single loop frame.
     ///
     /// Returns `true` if a render thread was spawned. `false` means the shared
@@ -838,11 +923,16 @@ impl super::App {
     /// `params.lat`/`params.lon`, which are that same site's coordinates. It is stamped
     /// on the response so a result can be rejected if the pane retargets — or the loop
     /// is rebuilt for another site — while the render runs.
+    ///
+    /// `data` is the frame's bytes from whichever datasource its product comes
+    /// from. That is the *only* thing the two differ in from here on: one guard,
+    /// one budget slot, one send site, one response type, so a Level III frame
+    /// cannot acquire a different lifecycle from a Level II one by accident.
     pub(super) fn spawn_loop_frame_render(
         &self,
         pane_idx: usize,
         timestamp: NaiveDateTime,
-        scan_data: std::sync::Arc<nexrad_model::data::Scan>,
+        data: crate::loop_downloads::LoopFrameData,
         params: crate::render_dispatch::RenderParams,
         target: rustdar_egui::pane::RenderTarget,
     ) -> bool {
@@ -871,38 +961,66 @@ impl super::App {
         let sender = self.channels.loop_render_sender.clone();
         let window = self.window.clone();
 
-        // The scan is reduced to the one sweep this frame draws before the job
-        // is dispatched, so a browser worker can be handed the request without
-        // the volume behind it. `None` — no sweep carries the product — is the
-        // same answer the renderer gives, and takes the same failure path.
-        // The storm motion override is read from the dispatcher for the same
-        // reason `spawn_level2_render` reads it there: one field for both the
-        // invalidation and the vector drawn.
-        let storm_motion = (product == rustdar_radar::types::RadarProduct::StormRelativeVelocity)
-            .then(|| self.render.storm_motion_override_kt())
-            .flatten();
-        // The environmental heights ride the same way for the hail pair and
-        // the classification, keyed by the loop's own site and read from the
-        // same cache the static pane render uses — so a loop frame and the
-        // still frame agree about the melting layer.
-        let env_heights = self.render.env_heights_km_msl_for(product, &target.site);
-        let job = match rustdar_radar::render_input::RenderInput::extract(
-            &scan_data,
-            snapped,
-            product,
-            lat,
-            lon,
-            storm_motion,
-            env_heights,
-        ) {
-            Some(input) => crate::offload::Job::Described(crate::offload::JobRequest::Radar {
-                input: Box::new(input),
-                // Loop frames store an empty value grid, so asking for one
-                // would produce `IMAGE_SIZE² × 4` bytes per frame to be dropped
-                // on arrival — and copied across a worker boundary first.
-                values_wanted: false,
-            }),
-            None => crate::offload::Job::renders_nothing(),
+        let job = match data {
+            // The scan is reduced to the one sweep this frame draws before the
+            // job is dispatched, so a browser worker can be handed the request
+            // without the volume behind it. `None` — no sweep carries the
+            // product — is the same answer the renderer gives, and takes the
+            // same failure path.
+            crate::loop_downloads::LoopFrameData::Volume(scan_data) => {
+                // The storm motion override is read from the dispatcher for the
+                // same reason `spawn_level2_render` reads it there: one field
+                // for both the invalidation and the vector drawn.
+                let storm_motion = (product
+                    == rustdar_radar::types::RadarProduct::StormRelativeVelocity)
+                    .then(|| self.render.storm_motion_override_kt())
+                    .flatten();
+                // The environmental heights ride the same way for the hail pair
+                // and the classification, keyed by the loop's own site and read
+                // from the same cache the static pane render uses — so a loop
+                // frame and the still frame agree about the melting layer.
+                let env_heights = self.render.env_heights_km_msl_for(product, &target.site);
+                match rustdar_radar::render_input::RenderInput::extract(
+                    &scan_data,
+                    snapped,
+                    product,
+                    lat,
+                    lon,
+                    storm_motion,
+                    env_heights,
+                ) {
+                    Some(input) => {
+                        crate::offload::Job::Described(crate::offload::JobRequest::Radar {
+                            input: Box::new(input),
+                            // Loop frames store an empty value grid, so asking
+                            // for one would produce `IMAGE_SIZE² × 4` bytes per
+                            // frame to be dropped on arrival — and copied across
+                            // a worker boundary first.
+                            values_wanted: false,
+                        })
+                    }
+                    None => crate::offload::Job::renders_nothing(),
+                }
+            }
+            // The object's *bytes*, exactly as the static Level III pane render
+            // dispatches them (`try_spawn_level3_render`): a `Level3Message` has
+            // no wire form, and re-decoding on the worker is cheap against the
+            // rasterization it precedes.
+            //
+            // `first` today, because every Level III product rustdar draws is one
+            // AWIPS code. A product derived from several — VIL density's
+            // `DVL ÷ EET` — arrives here with all of them, paired to this frame's
+            // volume and ordered by `level3_products`; what it needs is a job
+            // kind that reads more than one, not a different loop path.
+            crate::loop_downloads::LoopFrameData::Products(products) => match products.first() {
+                Some(first) => crate::offload::Job::Described(crate::offload::JobRequest::Level3 {
+                    bytes: std::sync::Arc::clone(&first.bytes),
+                    product,
+                    radar_lat: lat,
+                    radar_lon: lon,
+                }),
+                None => crate::offload::Job::renders_nothing(),
+            },
         };
         crate::offload::offload_job("loop-render", job, move |frame| {
             let _guard = guard;
