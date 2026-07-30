@@ -50,22 +50,37 @@
 //! pane costing what it costs today however much state the other two kinds
 //! accumulate.
 //!
-//! # `Default` means `Map`, and that is forced
+//! # `Default` means `Map`, and it is a choice with consequences
 //!
-//! `PaneState` owns `egui::TextureHandle`s and `egui::TextureHandle` is not
-//! `Default`, so `PaneState`'s hand-written `Default` is the only one there can
-//! be; `PaneContent: Default` is therefore the single bound this module has to
-//! satisfy, and the only variant that can supply it is the one holding no
-//! textures. So `PaneContent::default() == Map`.
+//! `PaneContent: Default` is the one bound this module is obliged to satisfy,
+//! because `PaneState`'s own `Default` is hand-written and has to fill every
+//! field. Nothing about the *types* then dictates which variant that default is:
+//! both non-map variants derive `Default` themselves, so a hand-written
+//! `impl Default for PaneContent` yielding a section pane compiles perfectly
+//! well. Only `derive(Default)`'s `#[default]` attribute narrows it, and that is
+//! a property of the macro rather than of anything in the data.
 //!
-//! **That is also the sharpest hazard in the feature.** Those six `mem::take`
-//! sites mean that during the UI pass `self.panes[idx]` is a *default* pane —
-//! i.e. reads as a map pane — whatever the real pane is. Nothing may branch on
-//! kind through `self.panes[..]` or `active_pane()` while the pane is out;
-//! branch on the taken value. The compiler cannot help with this, which is why
-//! the mitigation is the `last_pane_content` probe: it records what each render
-//! arm actually drew, so a branch reading the wrong thing shows up as an arm
-//! that ran for the wrong kind rather than as a subtly wrong picture.
+//! It is `Map` because of what a default is *used for* here. Six sites
+//! `std::mem::take` a `PaneState`, and a take leaves
+//! `PaneContent::default()` sitting in `Gui::panes[idx]` for the rest of the UI
+//! pass — where the all-panes filters that key off [`PaneState::is_map`] read it.
+//! With a section pane as the default, every one of those filters would silently
+//! *exclude* whichever pane is currently being drawn: no render dispatched for
+//! it, no sibling texture offered to it, no error to say why. `Map` is the value
+//! that makes the placeholder indistinguishable from the pane it stands in for,
+//! for every consumer that has not been taught about kinds — which is all of them
+//! today and most of them afterwards.
+//!
+//! [`PaneState::is_map`]: crate::pane::PaneState::is_map
+//!
+//! **The same choice is the sharpest hazard in the feature**, in the opposite
+//! direction: during the UI pass `self.panes[idx]` genuinely reads as a map pane
+//! whatever the real pane is. Nothing may branch on kind through
+//! `self.panes[..]` or `active_pane()` while a pane is out; branch on the taken
+//! value. The compiler cannot help with this, which is why the mitigation is the
+//! `last_pane_content` probe: it records what each render arm actually drew, so a
+//! branch reading the wrong thing shows up as an arm that ran for the wrong kind
+//! rather than as a subtly wrong picture.
 
 use chrono::NaiveDateTime;
 use rustdar_radar::types::RadarProduct;
@@ -95,12 +110,31 @@ impl PaneKind {
     /// A plan view needs one sweep; a section and a volume render need every
     /// cut in the ladder, and handing either of them a scan whose cuts were
     /// deliberately skipped does not fail — it fabricates layers that are not
-    /// there, quietly. This is the UI-side half of that safety property; the
-    /// data-side half is `render_dispatch::needs_whole_volume`, which asks the
-    /// same question of a *product*. One predicate, two names, because they are
-    /// two different questions with one answer.
+    /// there, quietly.
+    ///
+    /// This is the *view*-side half of that safety property. The data-side half
+    /// is [`RadarProduct::reads_whole_volume`], which asks the same question of a
+    /// product. Two questions, one answer: how much of the volume has to arrive.
+    ///
+    /// Exhaustive, matching `reads_whole_volume` and `RadarProduct::wire_code`: a
+    /// fourth pane kind fails to compile until it has been classified here.
+    /// `!matches!(self, Self::Map)` would be shorter and would classify a new
+    /// kind as whole-volume on its own. That is the *safe* direction — a
+    /// too-wide download wastes bandwidth where a too-narrow one fabricates
+    /// structure — but a kind that really did read one tilt would then quietly
+    /// widen every download its pane triggers, with nothing to say so, and the
+    /// convention in this codebase is that a new variant stops the build until
+    /// someone has decided.
     pub fn consumes_whole_volume(self) -> bool {
-        !matches!(self, Self::Map)
+        match self {
+            // One sweep, chosen by `render::find_sweep` out of the product's own
+            // moment. Everything else in the volume is irrelevant to it.
+            Self::Map => false,
+            // A section interpolates between the tilts bracketing each sample by
+            // beam height, and a raymarch reads a grid resampled from every cut.
+            // Both are vertical structure, which one sweep does not have.
+            Self::CrossSection | Self::Volume => true,
+        }
     }
 }
 
@@ -138,6 +172,33 @@ impl PaneContent {
             PaneKind::Volume => Self::Volume(Box::default()),
         }
     }
+
+    /// Drop every `egui::TextureHandle` this content holds, because the context
+    /// that owns them is going away.
+    ///
+    /// Every arm is empty today — no per-kind state holds a texture yet — and
+    /// this exists anyway, already called from `Gui::clear_graphics_state`. That
+    /// is the only place a pane-held handle is released when the egui context
+    /// dies (`app.rs`'s suspend path and `app_render.rs`'s surface-loss path both
+    /// route through it), and a handle outliving its context is a leak that
+    /// nothing reports: it is not a panic, not a blank pane, just memory that
+    /// never comes back across a suspend/resume cycle.
+    ///
+    /// So the wiring is done first and the fields come later, rather than the
+    /// other way round. The `match` is exhaustive and by value, so a fourth kind
+    /// stops the build here — the same reasoning as `PaneLayout::for_count`'s
+    /// clamp, which is that a trap someone has to *remember* at the moment they
+    /// add a field is a trap that eventually catches someone. A doc comment on
+    /// the field only fires if it is read; this fires either way.
+    pub fn release_textures(&mut self) {
+        match self {
+            Self::Map => {}
+            // `CrossSectionPane` will hold the rendered section raster.
+            Self::CrossSection(_section) => {}
+            // `VolumePane` will hold whatever the volume painter hands back.
+            Self::Volume(_volume) => {}
+        }
+    }
 }
 
 /// A point on the ground, in degrees.
@@ -148,10 +209,22 @@ pub struct GeoPoint {
 }
 
 impl GeoPoint {
-    /// Whether both coordinates are finite. Non-finite coordinates are refused
-    /// at the boundary rather than clamped; see [`SectionLine::new`].
-    pub fn is_finite(self) -> bool {
-        self.lat.is_finite() && self.lon.is_finite()
+    /// Whether this names a point that exists: latitude in `[-90, 90]`,
+    /// longitude in `[-180, 180]`.
+    ///
+    /// Range rather than `is_finite`, and it subsumes it — NaN compares false
+    /// against everything and the infinities fall outside the bounds — so one
+    /// pair of comparisons rules out both a non-finite coordinate and a finite
+    /// one that is nonsense. `lat: 1e9` is finite, walks a perfectly
+    /// well-defined great circle, and describes nowhere.
+    ///
+    /// Not a restriction on where a line may be drawn: a section crossing the
+    /// antimeridian is two in-range endpoints, and the great-circle walk between
+    /// them handles the wrap. `walkers::Projector::unproject` already answers in
+    /// this range, so an out-of-range point means something upstream is wrong
+    /// rather than that the user drew somewhere unusual.
+    pub fn is_on_earth(self) -> bool {
+        (-90.0..=90.0).contains(&self.lat) && (-180.0..=180.0).contains(&self.lon)
     }
 }
 
@@ -186,21 +259,25 @@ impl SectionLine {
     ///
     /// Two refusals, and each one closes a distinct silent failure:
     ///
-    /// * **Non-finite endpoints.** They arrive from a projector fed a degenerate
-    ///   viewport, or from a config file. Rejecting rather than clamping is the
-    ///   rule throughout this crate for the same reason it is on
-    ///   `StormMotionOverride::sample`: `f32::clamp` and `f64::clamp` *propagate*
-    ///   NaN, so a clamp launders a bad value into a bad value that looks
-    ///   checked. Worse, a NaN endpoint reaches [`SectionTarget`], where
-    ///   `NaN != NaN` makes the staleness key never match itself — so the pane
-    ///   re-renders its section on every frame, forever, with no error anywhere.
+    /// * **Endpoints that are not points on Earth** ([`GeoPoint::is_on_earth`]).
+    ///   They arrive from a projector fed a degenerate viewport, or from a
+    ///   config file. Rejecting rather than clamping is the rule throughout this
+    ///   crate for the same reason it is on `StormMotionOverride::sample`:
+    ///   `f32::clamp` and `f64::clamp` *propagate* NaN, so a clamp launders a bad
+    ///   value into a bad value that looks checked. Worse, a NaN endpoint reaches
+    ///   [`SectionTarget`], where `NaN != NaN` makes the staleness key never
+    ///   match itself — so the pane re-renders its section on every frame,
+    ///   forever, with no error anywhere. A finite-but-absurd endpoint is quieter
+    ///   still: `lat: 1e9` walks a well-defined great circle over nowhere and the
+    ///   section renders as empty coverage, which is indistinguishable from a
+    ///   line drawn past the radar's range.
     /// * **Coincident endpoints.** A zero-length line has no bearing, so the
     ///   great-circle walk along it is `0/0` and every column of the raster
     ///   samples the same point. This is the arithmetic bar; the usability bar
     ///   (a drag shorter than a couple of dozen points is a mis-click, not a
     ///   line) belongs to the interaction that produces the drag.
     pub fn new(a: GeoPoint, b: GeoPoint) -> Option<Self> {
-        if !a.is_finite() || !b.is_finite() {
+        if !a.is_on_earth() || !b.is_on_earth() {
             return None;
         }
         if a == b {
@@ -459,11 +536,16 @@ mod tests {
         }
     }
 
-    /// `Default` has to be `Map`: `PaneState` owns `egui::TextureHandle`s, which
-    /// are not `Default`, so a default pane can only be the kind that holds
-    /// none. Pinned because six `mem::take` sites depend on it and because the
-    /// hazard it creates — a pane reading as `Map` mid-frame — is only
-    /// understandable if this is known to be deliberate.
+    /// `Default` is `Map` — a choice, not something the types force: both other
+    /// variants derive `Default` too, so only `derive(Default)`'s `#[default]`
+    /// attribute picks this one, and a hand-written impl yielding a section pane
+    /// would compile.
+    ///
+    /// Pinned because of what the value is *for*. Six `mem::take` sites leave it
+    /// in `Gui::panes[idx]` for the rest of the UI pass, and the all-panes
+    /// filters that key off `PaneState::is_map` read that slot — so a default
+    /// section pane would make every one of them silently skip whichever pane is
+    /// being drawn, with no error to say why.
     #[test]
     fn the_default_content_is_a_map() {
         assert_eq!(PaneContent::default().kind(), PaneKind::Map);
@@ -480,29 +562,57 @@ mod tests {
         assert!(PaneKind::Volume.consumes_whole_volume());
     }
 
-    /// A line that cannot be cut is not representable. Both refusals matter:
+    /// A line that cannot be cut is not representable. Every refusal matters:
     /// a NaN endpoint would make [`SectionTarget`] never equal itself and
-    /// re-render the pane on every frame forever, and a zero-length line has no
-    /// bearing to walk along.
+    /// re-render the pane on every frame forever, a finite-but-absurd one would
+    /// render as empty coverage that looks like an out-of-range line, and a
+    /// zero-length line has no bearing to walk along.
     #[test]
     fn a_section_line_refuses_endpoints_it_cannot_be_cut_along() {
         assert!(SectionLine::new(point(35.3, -97.3), point(35.6, -97.0)).is_some());
 
-        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        // Non-finite, and finite-but-nowhere. The second group is the one a
+        // bare `is_finite` guard let through.
+        for bad_lat in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e9, 90.001] {
             assert!(
-                SectionLine::new(point(bad, -97.3), point(35.6, -97.0)).is_none(),
-                "{bad} latitude accepted"
-            );
-            assert!(
-                SectionLine::new(point(35.3, -97.3), point(35.6, bad)).is_none(),
-                "{bad} longitude accepted"
+                SectionLine::new(point(bad_lat, -97.3), point(35.6, -97.0)).is_none(),
+                "{bad_lat} latitude accepted"
             );
         }
+        for bad_lon in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1e9, 180.001] {
+            assert!(
+                SectionLine::new(point(35.3, -97.3), point(35.6, bad_lon)).is_none(),
+                "{bad_lon} longitude accepted"
+            );
+        }
+
+        // The bounds are inclusive: a pole and the antimeridian are places.
+        assert!(SectionLine::new(point(90.0, 180.0), point(-90.0, -180.0)).is_some());
 
         assert!(
             SectionLine::new(point(35.3, -97.3), point(35.3, -97.3)).is_none(),
             "a zero-length line has no bearing: every column would sample one point"
         );
+    }
+
+    /// `release_textures` is total over the kinds, and callable on each.
+    ///
+    /// Every arm is empty today; the point is that the call site in
+    /// `Gui::clear_graphics_state` is already wired, so the field that needs
+    /// releasing lands inside a function that is already called on every
+    /// suspend and every surface loss. A `match` with no wildcard is what makes
+    /// a fourth kind stop the build rather than leak quietly.
+    #[test]
+    fn releasing_textures_is_total_over_the_kinds() {
+        for kind in [PaneKind::Map, PaneKind::CrossSection, PaneKind::Volume] {
+            let mut content = PaneContent::for_kind(kind);
+            content.release_textures();
+            assert_eq!(
+                content.kind(),
+                kind,
+                "releasing a pane's textures must not change what kind it is"
+            );
+        }
     }
 
     /// The staleness key notices a new volume with no help from any reset path,

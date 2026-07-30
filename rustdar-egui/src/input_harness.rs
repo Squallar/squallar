@@ -5450,14 +5450,27 @@ mod tests {
     ///     later work packages add inside each arm as much as for a renamed
     ///     salt.
     ///
-    ///     The pane converted is the **middle** of three, which is what gives
-    ///     the assertion something to bite on today: `Ui::new_child` folds the
-    ///     parent's auto-id counter into every child's unique id — an `id_salt`
-    ///     moves only the *stable* id, as `ui_chrome.rs`'s note on the 600pt
-    ///     breakpoint records — so an arm that stopped building the shared child
-    ///     `Ui`, or built an extra one, would re-key every pane *after* it while
-    ///     leaving their rects exactly where they were. That is the shape this
-    ///     is a net for.
+    ///     The mechanism it is a net for: `Ui::new_child` folds the parent's
+    ///     auto-id counter into every child's unique id — an `id_salt` moves only
+    ///     the *stable* id, as `ui_chrome.rs`'s note on the 600pt breakpoint
+    ///     records — so an arm that stopped building the shared child `Ui`, or
+    ///     built an extra one, re-keys every pane the loop reaches **after** it
+    ///     while leaving their rects exactly where they were.
+    ///
+    ///     Hence the **middle** of three, which is what makes the assertion bite
+    ///     today, verified by mutation both ways round: with an arm building a
+    ///     spare child `Ui`, converting the middle pane fails this test and
+    ///     converting the *last* one does not. The reason is that the only
+    ///     auto-id'd widget inside a pane right now is the map's own, so a
+    ///     later map pane is the only thing whose id can be seen to move. It is
+    ///     specifically *not* the divider layer downstream of the loop: that
+    ///     child `Ui`'s own id does shift, but `PaneLayout::handle_dividers`
+    ///     gives every divider an explicit `Id::new(("h_div", …))`, and an
+    ///     explicit id does not read the parent's counter.
+    ///
+    ///     A one- or two-pane version of this assertion is still worth writing
+    ///     once an arm registers widgets of its own — from then on a converted
+    ///     pane re-keys *itself* and needs no later pane to reveal it.
     #[test]
     fn converting_a_pane_moves_no_widget_id() {
         let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));

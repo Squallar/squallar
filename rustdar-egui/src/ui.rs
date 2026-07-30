@@ -2162,6 +2162,12 @@ impl Gui {
                 cache.current = None;
                 cache.render_in_flight = false;
             }
+            // And whatever the pane's *kind* holds. Nothing yet — every arm of
+            // `release_textures` is empty — but this is the only place a
+            // pane-held handle is released when the egui context dies, so the
+            // call is wired before there is anything to release rather than
+            // remembered afterwards. See `PaneContent::release_textures`.
+            pane.content.release_textures();
         }
         self.map_tiles.clear();
     }
@@ -2358,6 +2364,62 @@ mod pane_slice_tests {
             gui.pane(0).unwrap().map_memory.zoom(),
             gui.pane(1).unwrap().map_memory.zoom(),
         );
+    }
+
+    /// The graphics-state reset reaches panes of every kind, including the ones
+    /// the layout is not currently showing.
+    ///
+    /// [`Gui::clear_graphics_state`] is the only place a pane-held
+    /// `egui::TextureHandle` is released when the egui context dies, and
+    /// `PaneContent::release_textures` is called from inside this same loop —
+    /// so if the loop skipped non-map panes, or stopped at the visible count,
+    /// that guard would read as covered while never running. Asserted through
+    /// `radar_sites_render_gen`, which the loop bumps on its way past: it is a
+    /// side effect of *this* loop body, so it cannot agree with a loop that
+    /// stopped short.
+    ///
+    /// Hidden panes are included deliberately. A handle belonging to a pane the
+    /// user split away from is just as invalid once the context is gone, and a
+    /// re-split would hand it straight back to the renderer.
+    #[test]
+    fn clearing_graphics_state_reaches_panes_of_every_kind() {
+        use crate::pane::PaneKind;
+
+        let mut gui = Gui::new();
+        gui.set_pane_count_for_test(4);
+        gui.pane_mut(1).unwrap().set_kind(PaneKind::CrossSection);
+        gui.pane_mut(2).unwrap().set_kind(PaneKind::Volume);
+        // Split back down, so panes 2 and 3 are remembered but not shown.
+        gui.set_pane_count_for_test(2);
+
+        let before: Vec<u64> = gui
+            .panes
+            .iter()
+            .map(|pane| pane.radar_sites_render_gen)
+            .collect();
+        assert_eq!(before.len(), 4, "precondition: four panes to reach");
+        assert_eq!(
+            gui.panes.iter().map(|pane| pane.kind()).collect::<Vec<_>>(),
+            [
+                PaneKind::Map,
+                PaneKind::CrossSection,
+                PaneKind::Volume,
+                PaneKind::Map
+            ],
+            "precondition: one pane of each kind, two of them hidden"
+        );
+
+        gui.clear_graphics_state();
+
+        for (idx, was) in before.iter().enumerate() {
+            assert_eq!(
+                gui.panes[idx].radar_sites_render_gen,
+                was + 1,
+                "pane {idx} ({:?}) was not reached by the graphics-state reset, \
+                 so nothing released whatever its kind is holding",
+                gui.panes[idx].kind(),
+            );
+        }
     }
 }
 
