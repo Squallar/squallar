@@ -556,13 +556,17 @@ impl Column {
                 last.sample
             };
         }
-        debug_assert!(above >= 1, "partition_point returned 0 after the guard");
         let lo = &self.rungs[above - 1];
         let hi = &self.rungs[above];
         let span = hi.height_km - lo.height_km;
-        // Two rungs at the same height is only reachable at zero ground range,
-        // where every beam centre is at zero. Weighting the lower one fully is
-        // the only defined choice and matches the `above == len` arm above.
+        // **This branch is unreachable, and is kept anyway.** `partition_point`
+        // over the ascending sort guarantees `lo.height ≤ h < hi.height`, so the
+        // span here is strictly positive; two rungs *can* share a height (every
+        // beam centre is at zero over the site, and two cuts can share a
+        // median), but then they are both at or below `h` or both above it and
+        // neither becomes a bracket. So this is not pinned by a test and cannot
+        // be — it is the arm that keeps a future edit to the sort or to
+        // `partition_point` from turning a zero span into a `NaN` weight.
         let t = if span > 0.0 {
             ((height_km - lo.height_km) / span).clamp(0.0, 1.0)
         } else {
@@ -933,12 +937,12 @@ fn azimuth_bracket(rung: &Rung<'_>, azimuth: f64) -> Option<(usize, usize, f64)>
 /// half gate matters to "which gate contains this range", which is a different
 /// question this function is not asking.
 fn gate_bracket(moment: &MomentData, slant_km: f64) -> (Sample, Sample, f64) {
-    let interval = moment.gate_interval_km();
-    if !interval.is_finite() || interval <= 0.0 {
-        let s = Sample::missing(SampleStatus::NoCoverage);
-        return (s, s, 0.0);
-    }
-    let x = (slant_km - moment.first_gate_range_km()) / interval;
+    // A zero gate interval is not guarded separately: `gate_interval_km` is a
+    // `u16` of metres so it cannot be negative, and dividing by zero lands on
+    // an infinity or a `NaN` that the finiteness test below already refuses.
+    // A second guard would be an unreachable branch, and an unreachable branch
+    // is one nothing can pin.
+    let x = (slant_km - moment.first_gate_range_km()) / moment.gate_interval_km();
     if !x.is_finite() || x < 0.0 {
         // Inside the first gate's centre: the radar has no gate there at all.
         // `BeyondRange` would be the wrong word — nothing has been exceeded.
@@ -1211,6 +1215,59 @@ mod tests {
         )
     }
 
+    /// A reflectivity sweep with **explicit azimuths in collection order**.
+    ///
+    /// Collection order is not azimuth order: a real sweep starts wherever the
+    /// antenna was and wraps through 0°, which is what makes the by-azimuth
+    /// index a real index rather than a copy of the radial list. Azimuths that
+    /// are evenly spaced and start at 0 hide every ordering bug there is.
+    fn refl_sweep_at(
+        elevation_number: u8,
+        elevation_deg: f32,
+        azimuths: &[f32],
+        n_gates: usize,
+        dbz: impl Fn(f64) -> f64,
+    ) -> Sweep {
+        let spacing = 360.0 / azimuths.len() as f32;
+        let radials = azimuths
+            .iter()
+            .enumerate()
+            .map(|(i, &az)| {
+                let bytes = vec![encode_refl(dbz(f64::from(az))); n_gates];
+                Radial::new(
+                    0,
+                    i as u16,
+                    az,
+                    spacing,
+                    RadialStatus::IntermediateRadialData,
+                    elevation_number,
+                    elevation_deg,
+                    Some(moment_from(bytes, REFL_SCALE, REFL_OFFSET)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        Sweep::new(elevation_number, radials)
+    }
+
+    /// A velocity-only sweep of a constant field — the Doppler half of a split
+    /// cut, and the shape a SAILS repeat of a Doppler cut takes.
+    fn flat_velocity_sweep(elevation_number: u8, elevation_deg: f32, ms: f64) -> Sweep {
+        make_sweep(
+            elevation_number,
+            elevation_deg,
+            360,
+            200,
+            None,
+            Some(&move |_, _| Some(ms)),
+        )
+    }
+
     fn cut(angle_deg: f64) -> ElevationCut {
         ElevationCut::new(
             angle_deg,
@@ -1402,6 +1459,45 @@ mod tests {
             round_trip_refl(20.0),
         );
 
+        // The preference is a *preference*: an upper cut is a single merged
+        // sweep carrying everything, so there is no velocity-free half to
+        // prefer and reflectivity falls back to the newest sweep that has it.
+        // Two merged cuts at one angle is what MRLE produces.
+        let merged = Scan::new(
+            vcp(&[4.0, 4.0]),
+            vec![
+                make_sweep(
+                    1,
+                    4.0,
+                    360,
+                    1200,
+                    Some(&|_, _| Some(20.0)),
+                    Some(&|_, _| Some(3.0)),
+                ),
+                make_sweep(
+                    2,
+                    4.0,
+                    360,
+                    1200,
+                    Some(&|_, _| Some(45.0)),
+                    Some(&|_, _| Some(7.0)),
+                ),
+            ],
+        );
+        let merged_refl = VolumeSampler::new(&merged, RadarProduct::Reflectivity).unwrap();
+        assert_eq!(merged_refl.tilt_count(), 1);
+        assert_eq!(
+            f64::from(
+                merged_refl.column(45.0, 100.0).rungs()[0]
+                    .sample
+                    .value()
+                    .unwrap()
+            ),
+            round_trip_refl(45.0),
+            "with no velocity-free half to prefer, reflectivity did not fall \
+             back to the newest sweep",
+        );
+
         // Velocity has one candidate and takes it.
         let vel = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
         assert_eq!(
@@ -1436,6 +1532,94 @@ mod tests {
             round_trip_refl(55.0),
             "the rung kept the first 0.5° cut rather than the SAILS repeat",
         );
+
+        // The Doppler arm takes the same preference and is reached by a
+        // different branch, so it needs its own volume: SAILS repeats the
+        // Doppler cuts too.
+        let scan = Scan::new(
+            vcp(&[0.5, 0.9, 0.5]),
+            vec![
+                flat_velocity_sweep(1, 0.5, 5.0),
+                flat_refl_sweep(2, 0.9, 360, 200, 30.0),
+                flat_velocity_sweep(3, 0.5, 25.0), // the SAILS repeat
+            ],
+        );
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
+        assert_eq!(
+            sampler.tilt_count(),
+            1,
+            "only the 0.5° cut carries velocity"
+        );
+        assert_eq!(
+            f64::from(sampler.column(45.0, 8.0).rungs()[0].sample.value().unwrap()),
+            round_trip_vel(25.0),
+            "the Doppler rung kept the first 0.5° cut rather than the SAILS \
+             repeat",
+        );
+    }
+
+    /// A volume joined mid-flight starts partway up the ladder and wraps into
+    /// the next one, so its sweeps do not arrive in cut order. The ladder has
+    /// to be ascending anyway — a section reads its rows off it, and a
+    /// descending pair inverts every bracket in the column.
+    ///
+    /// One of the 19 mid-flight-join variants the ladder rule was scored on.
+    #[test]
+    fn a_volume_joined_mid_flight_still_yields_an_ascending_ladder() {
+        let scan = Scan::new(
+            vcp(&[0.5, 0.9, 1.3]),
+            vec![
+                // Joined at the 0.9° cut, then 1.3°, then the next volume's
+                // 0.5°.
+                flat_refl_sweep(2, 0.9, 360, 200, 30.0),
+                flat_refl_sweep(3, 1.3, 360, 200, 40.0),
+                flat_refl_sweep(1, 0.5, 360, 200, 20.0),
+            ],
+        );
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
+        let nominal: Vec<f64> = sampler.nominal_elevations_deg().collect();
+        assert_eq!(
+            nominal,
+            vec![0.5, 0.9, 1.3],
+            "the ladder came out in volume order rather than ascending",
+        );
+        let column = sampler.column(45.0, 20.0);
+        let values: Vec<f64> = column
+            .rungs()
+            .iter()
+            .map(|r| f64::from(r.sample.value().unwrap()))
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                round_trip_refl(20.0),
+                round_trip_refl(30.0),
+                round_trip_refl(40.0)
+            ],
+            "a rung is carrying another cut's data",
+        );
+    }
+
+    /// A cut angle that is not a number would fail every grouping comparison
+    /// and scatter one cut across as many rungs as it has sweeps, with a
+    /// ladder that still looks the right length.
+    #[test]
+    fn a_non_finite_cut_angle_is_refused() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let scan = Scan::new(
+                vcp(&[bad, 0.9]),
+                vec![
+                    flat_refl_sweep(1, 0.5, 360, 40, 20.0),
+                    flat_refl_sweep(2, 0.9, 360, 40, 30.0),
+                ],
+            );
+            let err = VolumeSampler::new(&scan, RadarProduct::Reflectivity)
+                .expect_err("a non-finite cut angle built a ladder");
+            assert!(
+                matches!(err, SamplerError::NonFiniteCutAngle { cut_index: 0, .. }),
+                "expected the non-finite refusal for {bad}, got {err:?}",
+            );
+        }
     }
 
     /// The cut table stores a below-horizon angle as a two's-complement value
@@ -1689,7 +1873,24 @@ mod tests {
                 "rung {k} at {}° missed the wall at {WALL_KM} km ground",
                 rung.elevation_deg,
             );
+            // The rung's height is measured over the **ground** range too, not
+            // along the slant range that shares the number.
+            assert_eq!(
+                rung.height_km,
+                beam::height_at_ground_km(WALL_KM, rung.elevation_deg),
+                "rung {k} at {}° took its height along the slant range",
+                rung.elevation_deg,
+            );
         }
+        // precondition: the two height forms really do differ at the steep
+        // tilt, so the assertion above discriminates. 286 m at 10° / 100 km.
+        let height_gap =
+            (beam::height_at_ground_km(WALL_KM, 10.0) - beam::height_km(WALL_KM, 10.0)).abs();
+        assert!(
+            (height_gap - 0.2862).abs() < 1e-3,
+            "the 10° ground/slant height gap moved: {height_gap:.4} km, \
+             documented as 0.2862",
+        );
 
         // The discriminating half. A sampler that fed the ground range to the
         // gate index as if it were a slant range reads the 10° tilt's wall at
@@ -1869,6 +2070,63 @@ mod tests {
             "precondition: the fixture no longer drops to 360 radials on the \
              upper tilt, so this test's super-resolution claim covers more \
              than it should",
+        );
+    }
+
+    /// The range axis interpolates between gate **centres**, so a point half a
+    /// gate along reads the mean of the two gates around it rather than the
+    /// nearer one repeated.
+    ///
+    /// The azimuth test above cannot catch this — its field is constant along
+    /// range — and `round` in place of `floor` produces a *negative* far-corner
+    /// weight, which in linear Z is the logarithm of a negative number.
+    #[test]
+    fn gates_interpolate_between_their_centres_rather_than_snapping() {
+        let alternating = |_az: f64, slant: f64| {
+            let gate = ((slant - f64::from(FIRST_GATE_M) / 1000.0) / (f64::from(GATE_M) / 1000.0))
+                .round() as i64;
+            Some(if gate % 2 == 0 { 10.0 } else { 50.0 })
+        };
+        let scan = Scan::new(
+            vcp(&[0.5]),
+            vec![make_sweep(1, 0.5, 360, 200, Some(&alternating), None)],
+        );
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
+        // Sampling on a radial centre so azimuth contributes no blend of its
+        // own; the ground range is the gate's slant range through `cos e`.
+        let at = |slant: f64| {
+            let ground = beam::ground_range_km(slant, 0.5);
+            f64::from(
+                sampler.column(30.0, ground).rungs()[0]
+                    .sample
+                    .value()
+                    .unwrap(),
+            )
+        };
+
+        for gate in 40..50usize {
+            let want = round_trip_refl(if gate % 2 == 0 { 10.0 } else { 50.0 });
+            let got = at(gate_slant_km(gate));
+            assert!(
+                (got - want).abs() < 1e-4,
+                "gate {gate}'s centre read {got} dBZ, planted {want}",
+            );
+        }
+
+        // Half a gate along: the linear-Z mean of 10 and 50, the same 46.99 the
+        // azimuth axis produces.
+        let half = at(gate_slant_km(40) + f64::from(GATE_M) / 2000.0);
+        assert!(
+            (half - 46.9897).abs() < 0.01,
+            "half a gate past gate 40 read {half:.4} dBZ, expected 46.9897",
+        );
+        // A quarter along leans towards the nearer gate but is still a blend,
+        // which "snap to nearest" is not: 10log10(0.75·10 + 0.25·10⁵) = 43.98.
+        let quarter = at(gate_slant_km(40) + f64::from(GATE_M) / 4000.0);
+        assert!(
+            (quarter - 43.9800).abs() < 0.01,
+            "a quarter gate past gate 40 read {quarter:.4} dBZ, expected \
+             43.9800",
         );
     }
 
@@ -2373,6 +2631,226 @@ mod tests {
         }
     }
 
+    /// A sweep arrives in **collection** order, starting wherever the antenna
+    /// was and wrapping through 0°, and its lowest azimuth is not 0.
+    ///
+    /// Three things fail on such a sweep and on no other: an index that trusts
+    /// the radial order, a bracket that handles only the top of the wrap, and
+    /// a query below the sweep's lowest azimuth (which is the *lower* wrap
+    /// case, and reaches the last radial through 360°).
+    #[test]
+    fn a_sweep_that_starts_off_north_is_indexed_and_wraps_at_both_ends() {
+        // 250.5°, 251.5° … 359.5°, 0.5° … 249.5°, in that order.
+        let azimuths: Vec<f32> = (0..360).map(|i| ((250 + i) % 360) as f32 + 0.5).collect();
+        // precondition: this really is out of order and really does miss 0°.
+        assert!(
+            azimuths.windows(2).any(|w| w[1] < w[0]),
+            "precondition: the fixture's azimuths are already ascending",
+        );
+        assert!(azimuths.iter().all(|&a| a > 0.4));
+
+        // Two hot radials: one in the middle of the sweep, one at the seam.
+        let hot = |az: f64| {
+            if (az - 100.5).abs() < 0.01 || (az - 359.5).abs() < 0.01 {
+                55.0
+            } else {
+                10.0
+            }
+        };
+        let scan = Scan::new(
+            vcp(&[0.5]),
+            vec![refl_sweep_at(1, 0.5, &azimuths, 200, hot)],
+        );
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
+        let at = |az: f64| {
+            f64::from(
+                sampler.column(az, 20.0).rungs()[0]
+                    .sample
+                    .value()
+                    .expect("a complete sweep covers every azimuth"),
+            )
+        };
+
+        assert_eq!(at(100.5), round_trip_refl(55.0), "the hot radial");
+        assert_eq!(at(103.5), round_trip_refl(10.0), "three radials away");
+        assert_eq!(
+            at(250.5),
+            round_trip_refl(10.0),
+            "the first radial collected"
+        );
+
+        // Below the sweep's lowest azimuth: the bracket is the *last* radial
+        // (359.5°, hot) and the first (0.5°, cold), reached across 360°.
+        // 0.2° sits 0.7 of the way from 359.5 to 0.5, so linear Z gives
+        // 10log10(0.3·10^5.5 + 0.7·10) = 49.77 dBZ.
+        let below = at(0.2);
+        assert!(
+            (below - 49.7715).abs() < 0.01,
+            "0.2° read {below:.4} dBZ; expected 49.7715, the linear-Z blend of \
+             the 359.5° and 0.5° radials across the seam",
+        );
+        // And just the other side of the seam, 0.4 of the way instead of 0.7.
+        let above = at(359.9);
+        assert!(
+            (above - 52.7816).abs() < 0.01,
+            "359.9° read {above:.4} dBZ; expected 52.7816",
+        );
+    }
+
+    /// A real sweep's azimuths jitter a few hundredths of a degree, so the
+    /// adjacency threshold cannot be one step exactly.
+    ///
+    /// This is the lower bracket on [`MAX_ADJACENT_GAP_STEPS`]; the dropped
+    /// radial in `an_azimuth_hole_is_reported_rather_than_painted_across` is
+    /// the upper one, because that gap is two steps and must *not* be bridged.
+    #[test]
+    fn azimuth_jitter_does_not_open_a_hole() {
+        // ±0.04°, deterministic, well inside half a step so the order holds.
+        let jitter = |i: usize| ((i * 7) % 17) as f32 * 0.005 - 0.04;
+        let azimuths: Vec<f32> = (0..720).map(|i| i as f32 * 0.5 + jitter(i)).collect();
+
+        // precondition: the jitter really does push a gap past one step, so a
+        // 1.0-step threshold would open a hole here.
+        let gap = |i: usize| {
+            let a = f64::from(azimuths[i]);
+            let b = f64::from(azimuths[(i + 1) % 720]);
+            (b - a).rem_euclid(360.0)
+        };
+        let widest_at = (0..720).max_by(|&a, &b| gap(a).total_cmp(&gap(b))).unwrap();
+        let widest = gap(widest_at);
+        assert!(
+            (0.5..0.75).contains(&widest),
+            "precondition: the widest jittered gap is {widest:.4}°, which does \
+             not sit between one and 1.5 median steps",
+        );
+
+        let scan = Scan::new(
+            vcp(&[0.5]),
+            vec![refl_sweep_at(1, 0.5, &azimuths, 200, |_| 35.0)],
+        );
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
+
+        // The middle of the widest gap, named rather than swept for: a
+        // 1.0-step threshold refuses only the sliver of that one gap outside
+        // the two radials' footprints, which a coarse sweep steps over.
+        let mid = (f64::from(azimuths[widest_at]) + widest / 2.0).rem_euclid(360.0);
+        assert_eq!(
+            sampler.column(mid, 20.0).rungs()[0].sample.status(),
+            SampleStatus::Value,
+            "the middle of the widest jittered gap ({widest:.4}° at {mid}°) \
+             read as a hole",
+        );
+
+        for step in 0..3600 {
+            let az = f64::from(step) / 10.0;
+            assert_eq!(
+                sampler.column(az, 20.0).rungs()[0].sample.status(),
+                SampleStatus::Value,
+                "a jittered but complete sweep reported no coverage at {az}°",
+            );
+        }
+    }
+
+    /// A badly truncated sweep must not widen its own radials' footprints.
+    ///
+    /// The azimuth step is the **median** gap and not the mean for exactly
+    /// this volume: 100 radials covering 50° have a mean gap of 3.6° and a
+    /// median of 0.5°. On the mean, each surviving radial would claim 1.8° of
+    /// ground either side and paint 3.6° of fabricated data around the edge of
+    /// the hole.
+    #[test]
+    fn a_badly_truncated_sweep_keeps_its_radials_half_step_footprint() {
+        let azimuths: Vec<f32> = (0..100).map(|i| i as f32 * 0.5).collect();
+        let scan = Scan::new(
+            vcp(&[0.5]),
+            vec![refl_sweep_at(1, 0.5, &azimuths, 200, |_| 35.0)],
+        );
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
+        let status_at = |az: f64| sampler.column(az, 20.0).rungs()[0].sample.status();
+
+        assert_eq!(status_at(25.0), SampleStatus::Value, "inside the sweep");
+        assert_eq!(
+            status_at(49.7),
+            SampleStatus::Value,
+            "0.2° past the last radial, inside its quarter-degree footprint",
+        );
+        assert_eq!(
+            status_at(49.8),
+            SampleStatus::NoCoverage,
+            "0.3° past the last radial: past a half-step footprint, and the \
+             sweep's *mean* step would have claimed it",
+        );
+        assert_eq!(status_at(51.0), SampleStatus::NoCoverage);
+        assert_eq!(status_at(180.0), SampleStatus::NoCoverage);
+        assert_eq!(
+            status_at(359.7),
+            SampleStatus::NoCoverage,
+            "0.3° short of the first radial, on the other side of the hole",
+        );
+        assert_eq!(
+            status_at(359.9),
+            SampleStatus::Value,
+            "0.1° short of the first radial, inside the footprint it reaches \
+             back across 0° with",
+        );
+    }
+
+    /// A ladder whose chosen sweeps' medians invert its cut order still
+    /// brackets by height.
+    ///
+    /// Measured never to happen — medians did not invert the VCP's cut order
+    /// in 4 756 ordered pairs — which is why the column sorts rather than
+    /// assumes. Without the sort `partition_point` is asking an unsorted
+    /// sequence a sorted question, and the answer is `BelowLowestBeam`
+    /// everywhere: silent, total, and shaped exactly like a volume with no
+    /// data in it.
+    #[test]
+    fn a_ladder_whose_medians_invert_still_brackets_by_height() {
+        let scan = Scan::new(
+            vcp(&[0.5, 0.9]),
+            vec![
+                // The 0.5° cut ran high and the 0.9° cut ran low.
+                flat_refl_sweep(1, 1.05, 360, 200, 20.0),
+                flat_refl_sweep(2, 0.55, 360, 200, 40.0),
+            ],
+        );
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
+        // The ladder is in cut order, which is what the rule says.
+        assert_eq!(
+            sampler.elevations_deg().collect::<Vec<_>>(),
+            vec![f64::from(1.05f32), f64::from(0.55f32)],
+        );
+
+        // 30 km: inside these sweeps' 51.9 km of gates on both rungs.
+        let column = sampler.column(45.0, 30.0);
+        let heights: Vec<f64> = column.rungs().iter().map(|r| r.height_km).collect();
+        assert!(
+            heights.windows(2).all(|w| w[0] < w[1]),
+            "the column is not ascending by height: {heights:?}",
+        );
+        // The low rung is the 0.55° one, so it carries the 40 dBZ.
+        assert_eq!(
+            f64::from(column.rungs()[0].sample.value().unwrap()),
+            round_trip_refl(40.0),
+        );
+        let (low, high) = column.height_span_km().unwrap();
+        assert!(low < high);
+        let mid = 0.5 * (low + high);
+        assert_eq!(
+            column.at_height_km(mid).status(),
+            SampleStatus::Value,
+            "a height between the two rungs was not bracketed",
+        );
+        assert_eq!(
+            column.at_height_km(low - 0.01).status(),
+            SampleStatus::BelowLowestBeam,
+        );
+        assert_eq!(
+            column.at_height_km(high + 0.01).status(),
+            SampleStatus::AboveVolume,
+        );
+    }
+
     // ── The product gate and the wire ───────────────────────────────────────
 
     /// Only the six native moments. The hybrid classification is not a moment
@@ -2548,15 +3026,32 @@ mod tests {
             assert_eq!(column.at_height_km(1.0).status(), SampleStatus::NoCoverage);
         }
         // An azimuth outside 0..360 is wrapped rather than refused, because a
-        // bearing arrives from arithmetic that can overshoot either way.
-        assert_eq!(
-            sampler.column(365.0, 8.0).rungs()[0].sample,
-            sampler.column(5.0, 8.0).rungs()[0].sample,
+        // bearing arrives from arithmetic that can overshoot either way. The
+        // field has to *vary* with azimuth for this to say anything — on the
+        // flat fixture above, every wrong answer is also the right one.
+        let hot = |az: f64| {
+            if (az - 5.0).abs() < 0.01 || (az - 355.0).abs() < 0.01 {
+                55.0
+            } else {
+                10.0
+            }
+        };
+        let azimuths: Vec<f32> = (0..360).map(|i| i as f32).collect();
+        let scan = Scan::new(
+            vcp(&[0.5]),
+            vec![refl_sweep_at(1, 0.5, &azimuths, 200, hot)],
         );
-        assert_eq!(
-            sampler.column(-5.0, 8.0).rungs()[0].sample,
-            sampler.column(355.0, 8.0).rungs()[0].sample,
-        );
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
+        let at = |az: f64| sampler.column(az, 20.0).rungs()[0].sample;
+        // precondition: the two azimuths under test are the hot ones, so a
+        // wrap that landed anywhere else reads 10 rather than 55.
+        assert_eq!(f64::from(at(5.0).value().unwrap()), round_trip_refl(55.0));
+        assert_eq!(f64::from(at(355.0).value().unwrap()), round_trip_refl(55.0));
+        assert_eq!(f64::from(at(9.0).value().unwrap()), round_trip_refl(10.0));
+
+        assert_eq!(at(365.0), at(5.0), "an azimuth past 360° did not wrap");
+        assert_eq!(at(-5.0), at(355.0), "a negative azimuth did not wrap");
+        assert_eq!(at(725.0), at(5.0), "two turns past 360° did not wrap");
     }
 
     /// The ladder's shape accessors, which the section's axes are built from.
