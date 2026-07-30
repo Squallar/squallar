@@ -26,11 +26,43 @@ pub const IMAGE: &str = "image";
 pub const VALUES: &str = "values";
 pub const MAX_RANGE: &str = "range";
 
+/// Worker → page: an output that is not a plan-view frame — a cross-section
+/// raster or a voxel grid — as **one** transferred `Uint8Array` in the payload
+/// type's own wire form.
+///
+/// One field rather than a field per kind, and one array rather than one per
+/// plane, because the codec that produced it
+/// (`rustdar_radar::xsect::CrossSection::to_bytes`,
+/// `rustdar_radar::voxel::VoxelGrid::to_bytes`) already carries its own magic,
+/// version and length prefixes. Splitting a section into three typed arrays
+/// here would put a second description of those planes' lengths on the wire,
+/// and the two could disagree in a way the receiving side would have to
+/// invent an answer for.
+///
+/// On a `Frame` reply this is null and [`IMAGE`]/[`VALUES`]/[`MAX_RANGE`] are
+/// written exactly as they always were; on a `Section` or `Voxels` reply those
+/// three are null and this is set. A `None` result writes all four null-ish,
+/// because the page holds a slot per id and silence would strand it.
+pub const OUT: &str = "out";
+/// Worker → page: which kind of output [`OUT`] carries, as
+/// `rustdar_radar::types::RenderView::wire_code`.
+///
+/// The payload wire forms are self-describing enough to *refuse* the wrong one
+/// — each has its own magic — but "try to decode it as a section, and if that
+/// fails try a grid" turns a corrupt payload into a silently different kind.
+/// The tag says which decoder to run, and the magic says whether it was right.
+pub const OUT_KIND: &str = "outkind";
+
 /// Bumped whenever the shapes above change.
 ///
 /// Part of [`build_token`] rather than checked on its own: a page and a worker
 /// running different protocol versions are, by definition, different builds.
-const PROTOCOL_VERSION: u32 = 1;
+///
+/// Version 2 added [`OUT`] and [`OUT_KIND`], when a job could answer with
+/// something other than a plan-view frame. It is folded into the token, so a
+/// page and a worker on opposite sides of a deploy boundary terminate cleanly
+/// rather than exchanging a reply one of them cannot read.
+const PROTOCOL_VERSION: u32 = 2;
 
 /// What the page and the worker compare before the page trusts the worker.
 ///

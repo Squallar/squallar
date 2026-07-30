@@ -17,7 +17,7 @@
 //! so nothing runs until the page or `worker.js` asks for it.
 
 use crate::worker_protocol as proto;
-use rustdar_frontend::offload::{JobResult, RenderedFrame};
+use rustdar_frontend::offload::{JobOutput, JobResult, RenderedFrame};
 use wasm_bindgen::prelude::*;
 
 /// Boot the worker: install the message handler and announce readiness.
@@ -96,11 +96,24 @@ fn handle_message(scope: &web_sys::DedicatedWorkerGlobalScope, data: &JsValue) {
 
 /// Post the answer, moving the buffers rather than copying them.
 ///
-/// The two buffers are `IMAGE_SIZE² × 4` bytes each — 4 MiB apiece at the
-/// browser's 1024². They are built as typed arrays (one copy out of this
+/// The frame's two buffers are `IMAGE_SIZE² × 4` bytes each — 4 MiB apiece at
+/// the browser's 1024². They are built as typed arrays (one copy out of this
 /// instance's linear memory, which is unavoidable without a `SharedArrayBuffer`
 /// this deployment cannot have) and then *transferred*, so the page adopts them
 /// instead of receiving a second copy.
+///
+/// # Three arms, and every one of them writes every field
+///
+/// The `Frame` arm writes `IMAGE`, `VALUES` and `MAX_RANGE` **byte for byte as
+/// it always did** — that is the point of the shape below, and it is what makes
+/// "the working path is unchanged" a property of the code rather than a claim.
+/// The other two write those three null and put the whole output in `OUT` as a
+/// single transferred `Uint8Array` in the payload type's own wire form.
+///
+/// `None` writes explicit nulls rather than posting nothing, because the page
+/// holds a render slot, a pane's in-flight mark and a pending-map entry against
+/// every id it posted, and only a reply releases them. Silence wedges the pane
+/// forever; a null reply is "nothing to draw", which every path already handles.
 fn post_result(
     scope: &web_sys::DedicatedWorkerGlobalScope,
     id: u64,
@@ -111,17 +124,22 @@ fn post_result(
     proto::set_field(&message, proto::ID, &JsValue::from_f64(id as f64));
 
     let transfer = js_sys::Array::new();
+    // Written first and overwritten by the arm that has one, so no path out of
+    // this function can leave a field absent — an absent field and a null one
+    // read the same on the page, but only one of them is true by construction.
+    proto::set_field(&message, proto::IMAGE, &JsValue::NULL);
+    proto::set_field(&message, proto::VALUES, &JsValue::NULL);
+    proto::set_field(&message, proto::MAX_RANGE, &JsValue::from_f64(0.0));
+    proto::set_field(&message, proto::OUT, &JsValue::NULL);
+    proto::set_field(&message, proto::OUT_KIND, &JsValue::NULL);
+
     match result {
-        None => {
-            proto::set_field(&message, proto::IMAGE, &JsValue::NULL);
-            proto::set_field(&message, proto::VALUES, &JsValue::NULL);
-            proto::set_field(&message, proto::MAX_RANGE, &JsValue::from_f64(0.0));
-        }
-        Some(RenderedFrame {
+        None => {}
+        Some(JobOutput::Frame(RenderedFrame {
             image,
             max_range_km,
             values,
-        }) => {
+        })) => {
             let image = js_sys::Uint8Array::from(image.as_slice());
             let values = js_sys::Float32Array::from(values.as_slice());
             transfer.push(&image.buffer());
@@ -129,6 +147,25 @@ fn post_result(
             proto::set_field(&message, proto::IMAGE, &image);
             proto::set_field(&message, proto::VALUES, &values);
             proto::set_field(&message, proto::MAX_RANGE, &JsValue::from_f64(max_range_km));
+        }
+        Some(output) => {
+            let kind = output.view().wire_code();
+            let bytes = match output {
+                JobOutput::Section(section) => section.to_bytes(),
+                JobOutput::Voxels(grid) => grid.to_bytes(),
+                // Answered above; naming it keeps the match exhaustive by value
+                // so a fourth output kind stops the build here rather than
+                // falling into a catch-all that posts an empty payload.
+                JobOutput::Frame(_) => unreachable!("the frame arm is above"),
+            };
+            let out = js_sys::Uint8Array::from(bytes.as_slice());
+            transfer.push(&out.buffer());
+            proto::set_field(&message, proto::OUT, &out);
+            proto::set_field(
+                &message,
+                proto::OUT_KIND,
+                &JsValue::from_f64(f64::from(kind)),
+            );
         }
     }
     scope.post_message_with_transfer(&message, &transfer)

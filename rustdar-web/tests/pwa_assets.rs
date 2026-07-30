@@ -20,6 +20,8 @@ const SERVICE_WORKER: &str = include_str!("../sw.js");
 const INDEX_HTML: &str = include_str!("../index.html");
 const RASTER_WORKER: &str = include_str!("../worker.js");
 const WORKER_PORT: &str = include_str!("../src/worker_port.rs");
+const WORKER_PROTOCOL: &str = include_str!("../src/worker_protocol.rs");
+const RASTER_WORKER_RS: &str = include_str!("../src/worker.rs");
 
 fn web_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -535,4 +537,71 @@ fn the_rasterization_worker_uses_only_relative_paths() {
             );
         }
     }
+}
+
+/// The protocol version is a **number**, and this is the only instrument that
+/// can check it.
+///
+/// `worker_protocol` is `#[cfg(target_arch = "wasm32")]`, so nothing a host
+/// `cargo test` compiles can name `PROTOCOL_VERSION` at all — and the wasm rows
+/// are `cargo check`, which runs no tests. A source scrape is therefore the
+/// only place the value can be pinned, and it has to be pinned somewhere: every
+/// other version-adjacent test in this workspace flips bytes and asserts a
+/// refusal, which shows that *a* check exists, not what it says. A version that
+/// silently failed to bump when the message shapes changed would leave a page
+/// and a worker from opposite sides of a deploy exchanging replies one of them
+/// cannot read — the failure `build_token` exists to convert into a clean
+/// termination.
+#[test]
+fn the_worker_protocol_version_is_the_one_these_shapes_ship() {
+    assert!(
+        WORKER_PROTOCOL.contains("const PROTOCOL_VERSION: u32 = 2;"),
+        "worker_protocol.rs does not declare PROTOCOL_VERSION 2. Version 2 is \
+         the one that added the `out` field; changing the message shapes \
+         without changing this number is the whole failure it prevents."
+    );
+    assert!(
+        WORKER_PROTOCOL.contains("PROTOCOL_VERSION,"),
+        "PROTOCOL_VERSION is declared but not folded into build_token, so a \
+         page and a worker on different protocol versions would shake hands"
+    );
+}
+
+/// Every arm of the worker's reply writes every field.
+///
+/// The page holds a render slot, a pane's in-flight mark and a pending-map
+/// entry against each id it posted, and only a reply releases them — so a path
+/// through `post_result` that left a field absent, or posted nothing at all,
+/// wedges that pane forever with no error anywhere. The defaults are written
+/// once before the match, which is what makes "every arm" a property of the
+/// shape rather than of three arms agreeing; this pins that shape, because the
+/// function is `wasm32`-only and no host test can run it.
+#[test]
+fn the_worker_reply_writes_every_field_on_every_arm() {
+    let body = RASTER_WORKER_RS
+        .split_once("fn post_result(")
+        .expect("worker.rs no longer has a post_result")
+        .1;
+    let defaults = body
+        .split_once("match result {")
+        .expect("post_result no longer matches on the result")
+        .0;
+    for field in [
+        "proto::IMAGE",
+        "proto::VALUES",
+        "proto::MAX_RANGE",
+        "proto::OUT",
+    ] {
+        assert!(
+            defaults.contains(field),
+            "{field} is not written before the match in post_result, so an arm \
+             that does not set it leaves it absent and the page cannot tell a \
+             null answer from a lost one"
+        );
+    }
+    assert!(
+        defaults.contains("proto::OUT_KIND"),
+        "the out-kind tag is not defaulted, so a reply could carry a payload \
+         with no decoder named"
+    );
 }

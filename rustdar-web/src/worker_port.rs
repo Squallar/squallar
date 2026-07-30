@@ -13,7 +13,7 @@
 //! ends in "leave it inline" rather than in an error the user sees.
 
 use crate::worker_protocol as proto;
-use rustdar_frontend::offload::{self, RenderedFrame, WorkerPort};
+use rustdar_frontend::offload::{self, JobOutput, RenderedFrame, WorkerPort};
 use wasm_bindgen::prelude::*;
 
 /// Where the worker's bootstrap lives, relative to the page.
@@ -112,18 +112,43 @@ fn deliver(data: &JsValue) {
     };
 
     let image = proto::field(data, proto::IMAGE).filter(|v| !v.is_null());
-    let frame = image.map(|image| RenderedFrame {
-        image: js_sys::Uint8Array::new(&image).to_vec(),
-        max_range_km: proto::field(data, proto::MAX_RANGE)
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0),
-        values: proto::field(data, proto::VALUES)
-            .filter(|v| !v.is_null())
-            .map(|v| js_sys::Float32Array::new(&v).to_vec())
-            .unwrap_or_default(),
+    let frame = image.map(|image| {
+        JobOutput::Frame(RenderedFrame {
+            image: js_sys::Uint8Array::new(&image).to_vec(),
+            max_range_km: proto::field(data, proto::MAX_RANGE)
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            values: proto::field(data, proto::VALUES)
+                .filter(|v| !v.is_null())
+                .map(|v| js_sys::Float32Array::new(&v).to_vec())
+                .unwrap_or_default(),
+        })
     });
 
-    offload::deliver_worker_reply(id as u64, frame);
+    // A frame and an `OUT` payload are mutually exclusive on the wire; `or_else`
+    // rather than a branch so a message carrying both — which only a build
+    // mismatch the token check already refuses could produce — still resolves to
+    // exactly one output rather than to a pair somebody has to arbitrate.
+    offload::deliver_worker_reply(id as u64, frame.or_else(|| decode_out(data)));
+}
+
+/// The non-frame half of a reply: one transferred `Uint8Array` plus the tag
+/// saying which decoder owns it.
+///
+/// `None` for anything this build cannot read — a missing payload, a kind byte
+/// it does not have, or bytes the payload type's own codec refuses. All three
+/// are "nothing to draw", which is what a failed render has always been, and
+/// all three still deliver: the caller's slot is released either way.
+/// The decoding itself is [`offload::decode_output`], in the frontend beside
+/// [`offload::execute_bytes`] — so this crate stays the browser adapter and the
+/// payload codecs are reachable from a host test rather than only from a
+/// browser.
+fn decode_out(data: &JsValue) -> Option<offload::JobOutput> {
+    let out = proto::field(data, proto::OUT).filter(|v| !v.is_null())?;
+    let kind = proto::field(data, proto::OUT_KIND)
+        .and_then(|v| v.as_f64())
+        .map(|v| v as u8)?;
+    offload::decode_output(kind, &js_sys::Uint8Array::new(&out).to_vec())
 }
 
 /// The installed port. Owns the `Worker` handle, so the worker lives exactly as
