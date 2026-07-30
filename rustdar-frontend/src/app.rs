@@ -32,6 +32,11 @@ mod render;
 #[path = "app_chunks.rs"]
 mod chunks;
 
+/// Whether this build is the browser build. See `app_state::WEB`, which is the
+/// same value for the same reason: a `cfg!` forks a function both of whose arms
+/// still compile, so a host `cargo test` can call either one.
+const WEB: bool = cfg!(target_arch = "wasm32");
+
 /// Which wgpu backends this build will consider.
 ///
 /// Native keeps reading `WGPU_BACKEND` from the environment. The browser has no
@@ -40,17 +45,28 @@ mod chunks;
 /// Left in, wgpu would select it wherever it exists — which is Chrome but not
 /// Firefox — and the two browsers would then run different, separately-broken
 /// rendering paths off the same binary.
-#[cfg(not(target_arch = "wasm32"))]
 fn instance_descriptor() -> wgpu::InstanceDescriptor {
-    wgpu::InstanceDescriptor::new_without_display_handle_from_env()
+    backends_for(WEB)
 }
 
-/// See the native variant above.
-#[cfg(target_arch = "wasm32")]
-fn instance_descriptor() -> wgpu::InstanceDescriptor {
-    wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::GL,
-        ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
+/// The backend choice itself, parameterised so both arms run from one binary.
+///
+/// The `const _` below asserts the GL *feature* is compiled in. It does not
+/// assert that this function asks for it, and the difference is not academic:
+/// delete the `backends` line and that assertion still passes, the wasm
+/// `cargo check` still exits 0, and every browser silently reverts to
+/// `Backends::all()` — which is the Chrome-on-WebGPU / Firefox-on-WebGL2 split
+/// the doc above says this exists to prevent.
+/// `the_browser_build_asks_for_webgl2_and_refuses_webgpu` asserts the ask.
+fn backends_for(web: bool) -> wgpu::InstanceDescriptor {
+    let from_env = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+    if web {
+        wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::GL,
+            ..from_env
+        }
+    } else {
+        from_env
     }
 }
 
@@ -1492,6 +1508,79 @@ mod tests {
             min_lon: -100.0,
             max_lon: -90.0,
         }
+    }
+
+    /// The browser build asks for WebGL2, and for nothing else.
+    ///
+    /// The `const _` further up this file asserts wgpu's `webgl` feature is
+    /// *compiled in*. It does not assert that this build asks for it, and the
+    /// gap is not academic: delete the `backends: wgpu::Backends::GL` line and
+    /// the const assert still passes, `cargo check --target
+    /// wasm32-unknown-unknown` still exits 0, and every browser silently falls
+    /// back to `Backends::all()`. Chrome then picks WebGPU while Firefox stays
+    /// on WebGL2, and one binary runs two different, separately-broken
+    /// rendering paths — exactly what `instance_descriptor`'s own doc says it
+    /// exists to prevent.
+    #[test]
+    fn the_browser_build_asks_for_webgl2_and_refuses_webgpu() {
+        let web = backends_for(true).backends;
+        assert_eq!(
+            web,
+            wgpu::Backends::GL,
+            "the browser build asks for {web:?}, not WebGL2 alone"
+        );
+        assert!(!web.contains(wgpu::Backends::BROWSER_WEBGPU));
+
+        // Native is deliberately unrestricted and still honours `WGPU_BACKEND`,
+        // which is the other half of the fork and the reason the browser arm
+        // cannot simply be the default.
+        let native = backends_for(false).backends;
+        assert_eq!(native, wgpu::Backends::all().with_env());
+
+        // With no override in the environment the two arms must differ, which
+        // is what makes the browser arm a restriction rather than a restatement
+        // of the default. Skipped when `WGPU_BACKEND` is set, because a
+        // developer who exported `WGPU_BACKEND=gl` has legitimately made them
+        // agree.
+        if std::env::var_os("WGPU_BACKEND").is_none() {
+            assert_eq!(native, wgpu::Backends::all());
+            assert_ne!(
+                native, web,
+                "the browser arm restricts nothing that the default did not \
+                 already restrict"
+            );
+        }
+    }
+
+    /// And that this build asks on its own behalf.
+    ///
+    /// Both arms above run from one host binary, so the remaining unchecked
+    /// claim is which one `instance_descriptor` selects. That is one `cfg!` on
+    /// one line, and every way of getting it wrong — another arch,
+    /// `target_family = "wasm"` (also true for WASI), a hardcoded `false` —
+    /// evaluates identically on this host and differently in a browser. So the
+    /// line is scraped, from the shipped half of the file only: the assertion
+    /// quotes the string it searches for.
+    #[test]
+    fn the_backend_choice_is_made_on_the_wasm32_arch_and_nothing_else() {
+        assert_eq!(instance_descriptor().backends, backends_for(WEB).backends);
+
+        let source = include_str!("app.rs");
+        let (code, _) = source
+            .split_once("#[cfg(test)]")
+            .expect("app.rs no longer has a test module");
+
+        let definition = code
+            .split_once("const WEB: bool =")
+            .and_then(|(_, rest)| rest.split_once(';'))
+            .map(|(value, _)| value.trim())
+            .expect("`WEB` is no longer defined in app.rs");
+        assert_eq!(definition, r#"cfg!(target_arch = "wasm32")"#);
+        assert!(
+            code.contains("backends_for(WEB)"),
+            "instance_descriptor no longer forks on `WEB`, so the browser \
+             backend restriction is not reached on the arm it is for"
+        );
     }
 
     /// A request as `process_gui_actions` builds one: unexpanded viewport bounds
