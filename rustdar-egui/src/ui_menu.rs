@@ -33,6 +33,13 @@ pub(crate) const VOLUME_PANE_LABEL: &str = "3D volume view";
 /// exists to fix.
 pub(crate) const REGION_ARM_LABEL: &str = "Pick 3D region (drag on a map)";
 
+/// The label on the cross-section arming toggle.
+///
+/// Phrased as the gesture it arms rather than as the pane it produces, because
+/// the pane is not what the user does next: they draw a line. A constant for the
+/// reason [`VOLUME_PANE_LABEL`] is one.
+pub(crate) const DRAW_CROSS_SECTION_LABEL: &str = "Draw cross-section";
+
 /// A command the user can invoke from the menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MenuAction {
@@ -64,12 +71,10 @@ pub(super) enum MenuToggle {
     /// which is also the only route out of a section pane restored from a config
     /// — two clicks rather than one, but never a trap.
     ///
-    /// There is deliberately no companion entry for a cross-section. Aiming one
-    /// is an armed modal drag on a *map* pane, and none of that interaction
-    /// exists yet; a checkbox arming a mode nothing implements is exactly the
-    /// button-that-does-nothing `every_menu_entry_has_a_dispatcher_arm` exists to
-    /// forbid, and satisfying that test would mean inventing a flag whose only
-    /// reader was the test's own fingerprint.
+    /// The companion entry, [`MenuToggle::DrawCrossSection`], is deliberately
+    /// *not* the same shape: it arms a gesture rather than converting the pane
+    /// under the cursor, because which pane a section lands in is decided by
+    /// where the line is drawn.
     VolumePane,
     /// Arm the region drag: while it is on, a drag on a **map** pane draws the
     /// patch of ground a 3D pane resamples instead of panning the map.
@@ -77,8 +82,34 @@ pub(super) enum MenuToggle {
     /// A checkbox rather than a command for the same reason `VolumePane` is one:
     /// it is a mode, it changes what dragging does, and a mode a user cannot see
     /// is a mouse that has stopped working. It stays armed through a commit — see
-    /// `Gui::region_arm` — so this is also the only way out of it.
+    /// `Gui::region_arm` — so this and a back press are the two ways out of it.
+    ///
+    /// Ticking it un-ticks [`DrawCrossSection`](Self::DrawCrossSection), which is
+    /// the other armed drag on a map pane: one drag cannot be two gestures. See
+    /// `Gui::set_region_arm`.
     RegionArm,
+    /// Arm the cross-section draw: the next drag on a map pane becomes a
+    /// vertical slice instead of a pan.
+    ///
+    /// A checkbox rather than a command, and for a reason the volume toggle does
+    /// not have. This one arms a **mode**, and the classic failure of a mode is
+    /// that the user forgets they are in it and then cannot work out why the map
+    /// will not pan. A checkbox makes the state visible and puts the way out in
+    /// the place the way in was, which is the only affordance that helps someone
+    /// who does not know what happened.
+    ///
+    /// Not a modifier-drag. A shift-drag is the obvious desktop spelling and has
+    /// no touch equivalent whatsoever, and one wasm binary serves phones and
+    /// desktop browsers alike.
+    ///
+    /// Global rather than per-pane, unlike [`VolumePane`](Self::VolumePane),
+    /// because the pane it applies to is not knowable when it is ticked: the
+    /// user arms the mode and *then* chooses a map to draw on, and choosing it is
+    /// the same press that starts the line.
+    ///
+    /// Ticking it un-ticks [`RegionArm`](Self::RegionArm), for the reason that
+    /// entry gives.
+    DrawCrossSection,
 }
 
 /// One entry in the menu.
@@ -289,6 +320,19 @@ impl super::Gui {
                         toggle: MenuToggle::RegionArm,
                         value: self.region_arm,
                     },
+                    // Beside it, and read off the *global* flag rather than off
+                    // `pane`: it arms a gesture, and which pane the gesture ends
+                    // up aiming is decided by where the line is drawn.
+                    //
+                    // The two armed drags are adjacent on purpose. They are
+                    // mutually exclusive — ticking either un-ticks the other, see
+                    // `Gui::set_region_arm` — and a user only reads that off the
+                    // menu if the box that un-ticked itself is the one next door.
+                    MenuNode::Toggle {
+                        label: DRAW_CROSS_SECTION_LABEL,
+                        toggle: MenuToggle::DrawCrossSection,
+                        value: self.section_draw_armed(),
+                    },
                     MenuNode::Separator,
                     MenuNode::Toggle {
                         label: "Show radar sites",
@@ -354,14 +398,19 @@ impl super::Gui {
                 self.propagate_layer_sync();
             }
             MenuEvent::Toggled(MenuToggle::RegionArm, on) => {
-                self.region_arm = on;
-                // Disarming mid-drag throws the drag away rather than committing
-                // it. A user who reaches for the menu with the button still down
-                // is cancelling, and a box that appeared because of it would be
-                // one nobody asked for.
-                if !on {
-                    self.region_drag = None;
-                }
+                // Through the setter, not a bare assignment. Disarming mid-drag
+                // has to throw the drag away rather than commit it — a user who
+                // reaches for the menu with the button still down is cancelling,
+                // and a box that appeared because of it would be one nobody asked
+                // for — and *arming* has to un-arm the cross-section draw, which
+                // is the other modal drag on a map pane.
+                self.set_region_arm(on);
+                // Deliberately *not* closing the drawer, unlike the cross-section
+                // arm below. That asymmetry is this entry's as it shipped on
+                // `main` and is left alone here: a rebase is the wrong place to
+                // change a reviewed feature's behaviour, and the two entries being
+                // inconsistent about the drawer is a note for the follow-up queue
+                // rather than something the interaction between them forces.
             }
             MenuEvent::Toggled(MenuToggle::AutoPoll, on) => self.auto_poll.enabled = on,
             MenuEvent::Toggled(MenuToggle::LiveChunks, on) => self.live_chunks = on,
@@ -387,6 +436,20 @@ impl super::Gui {
                         crate::pane::PaneKind::Map
                     },
                 );
+            }
+            MenuEvent::Toggled(MenuToggle::DrawCrossSection, on) => {
+                // A direct write, and it may be one: the flag is on `Gui` rather
+                // than on a pane, so no `mem::take` window can swallow it. The
+                // setter exists because *disarming* has to drop a half-drawn
+                // anchor, which a bare assignment would leave behind.
+                self.set_section_draw_armed(on);
+                // Closing the drawer is the point of the entry, not a courtesy:
+                // on every width where the drawer is the menu it covers the map
+                // the line has to be drawn on, so arming the mode and leaving it
+                // open would arm a gesture the user cannot make.
+                if on {
+                    self.drawer_open = false;
+                }
             }
         }
     }
@@ -423,7 +486,7 @@ mod tests {
         overlays.sort();
         format!(
             "settings={} time={} drawer={} auto_poll={} live_chunks={} notify={} \
-             kind={:?} pending_kind={:?} region_arm={} overlays={overlays:?}",
+             kind={:?} pending_kind={:?} region_arm={} armed={} overlays={overlays:?}",
             gui.show_settings,
             gui.time_dialog.show,
             gui.drawer_open,
@@ -442,6 +505,14 @@ mod tests {
             // `ui.rs`.
             gui.pending_pane_kind_for_test(),
             gui.region_arm,
+            // Both armed drags, and separately. Each is a mode with no other
+            // observable — neither converts a pane until a gesture completes — so
+            // without them their toggles' arms would read as no-ops and
+            // `every_menu_entry_has_a_dispatcher_arm` would fail for two entries
+            // that work. Separately rather than as one "is anything armed" flag
+            // because they are mutually exclusive: arming one turns the other off,
+            // and a single flag would report that swap as no change at all.
+            gui.section_draw_armed(),
         )
     }
 

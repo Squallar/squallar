@@ -84,7 +84,9 @@
 
 use chrono::NaiveDateTime;
 use rustdar_radar::types::{RadarProduct, RenderView};
+use rustdar_radar::xsect::CrossSection;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Which of the three things a pane is.
 ///
@@ -213,8 +215,12 @@ impl PaneContent {
     pub fn release_textures(&mut self) {
         match self {
             Self::Map => {}
-            // `CrossSectionPane` will hold the rendered section raster.
-            Self::CrossSection(_section) => {}
+            // The section raster. The `CrossSection` behind it stays: it is
+            // plain memory rather than a GPU handle, it is what a hover reads,
+            // and keeping it means a resume re-uploads a texture instead of
+            // re-cutting the section — which needs the volume, and the volume
+            // may well have been evicted by then.
+            Self::CrossSection(section) => section.texture = None,
             // `VolumePane` will hold whatever the volume painter hands back.
             Self::Volume(_volume) => {}
         }
@@ -359,17 +365,83 @@ pub struct SectionTarget {
     pub line: SectionLine,
 }
 
+/// Why a section pane has no picture, when it has none.
+///
+/// Every variant is a state a user can reach without doing anything wrong, and
+/// each one has a *different* thing to say. A single "no data" would collapse
+/// them, and the collapse is the failure: the two that matter most —
+/// [`AwaitingCoveragePattern`](Self::AwaitingCoveragePattern) and
+/// [`ProductHasNoVerticalStructure`](Self::ProductHasNoVerticalStructure) — are
+/// permanent-looking blanks whose causes are entirely unlike each other and
+/// entirely unlike "the volume has not arrived".
+///
+/// `Ord` is not derived and not wanted: nothing ranks these. The pane holds at
+/// most one, written by whoever refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SectionUnavailable {
+    /// No decoded volume for the pane's site yet — the ordinary startup and
+    /// site-switch state.
+    AwaitingVolume,
+    /// The volume was joined **mid-flight** and its coverage pattern has not
+    /// arrived, so it carries no elevation cut table.
+    ///
+    /// This is the live chunk feed's real behaviour, not a hypothetical:
+    /// `chunks.rs` stands in `placeholder_coverage_pattern(0)` until the VCP
+    /// message lands, and `VolumeSampler::new` correctly refuses a scan like
+    /// that rather than inventing a tilt ladder out of the sweeps' own
+    /// elevation numbers. Without a name of its own it reads as a section that
+    /// silently does not work on live data.
+    AwaitingCoveragePattern,
+    /// The pane's product has no vertical structure to slice — the column
+    /// integrals, the hybrid-scan composite, the derived velocity fields. See
+    /// `rustdar_radar::sampler::samplable`.
+    ProductHasNoVerticalStructure(RadarProduct),
+    /// The cut was dispatched and answered nothing. Rare, and deliberately
+    /// distinct from "not yet": a section that will never appear must not look
+    /// like one that is on its way.
+    RenderFailed,
+}
+
+impl SectionUnavailable {
+    /// One line, addressed to whoever is looking at the empty pane.
+    ///
+    /// Says what is missing and, where the user can do something, what. The
+    /// mid-flight case is the one that most needs saying out loud — it is not
+    /// an error, it resolves on its own, and it is invisible from anywhere else
+    /// in the UI.
+    pub fn message(self) -> String {
+        match self {
+            Self::AwaitingVolume => "Waiting for this site's volume".to_owned(),
+            Self::AwaitingCoveragePattern => {
+                "This volume was joined mid-scan and its coverage pattern has not arrived yet, \
+                 so there is no tilt ladder to cut along. It will appear on the next volume."
+                    .to_owned()
+            }
+            Self::ProductHasNoVerticalStructure(product) => format!(
+                "{} has no vertical structure to slice — pick a moment the radar measures \
+                 tilt by tilt",
+                product.name()
+            ),
+            Self::RenderFailed => "The cross-section could not be cut from this volume".to_owned(),
+        }
+    }
+}
+
 /// A pane showing a vertical cross-section.
 ///
-/// Minimal on purpose: nothing populates it yet. The two fields are the ones
-/// whose *shape* is load-bearing — see [`SectionLine`] for why the endpoints are
-/// geographic and [`SectionTarget`] for why the staleness key carries the volume
-/// time. The rendered raster itself lands with the render path that produces it,
-/// along with its release in `Gui::clear_graphics_state` — the only place a
-/// pane-held `egui::TextureHandle` is dropped when the egui context dies, and
-/// therefore the place a new texture-owning field has to be added in the same
-/// commit that adds the field.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// The first three fields are the ones whose *shape* is load-bearing — see
+/// [`SectionLine`] for why the endpoints are geographic and [`SectionTarget`]
+/// for why the staleness key carries the volume time. The last three are what
+/// the render path produces, and `texture` is released in
+/// [`PaneContent::release_textures`] — the only place a pane-held
+/// `egui::TextureHandle` is dropped when the egui context dies.
+///
+/// # Why `Debug` is hand-written
+///
+/// `egui::TextureHandle` has no `Debug`, and `CrossSection` has one that would
+/// print megabytes. Both are summarised instead, which is also what makes this
+/// type printable in an assertion message at all.
+#[derive(Clone, Default, PartialEq)]
 pub struct CrossSectionPane {
     /// The line to cut along, or `None` until the user has drawn one. A section
     /// pane with no line is an ordinary, expected state: it is what a pane looks
@@ -393,6 +465,41 @@ pub struct CrossSectionPane {
     /// the first render. Compared against the current volume and line to decide
     /// whether to render again.
     pub rendered_for: Option<SectionTarget>,
+    /// The cut itself: the picture, the values a hover reads, and the status
+    /// plane that says *why* a pixel is blank.
+    ///
+    /// `Arc` because the three planes are ~18 MB natively and this is read from
+    /// a hover on every frame the pointer is over the pane; a clone per frame
+    /// would be the most expensive thing in the UI pass.
+    ///
+    /// Kept when the texture is released, so a suspend/resume re-uploads rather
+    /// than re-cutting — the volume behind the cut may have been evicted by
+    /// then, which would make the re-cut impossible rather than slow.
+    pub section: Option<Arc<CrossSection>>,
+    /// The section's raster, uploaded. Dropped by
+    /// [`PaneContent::release_textures`].
+    pub texture: Option<egui::TextureHandle>,
+    /// Why there is no section, when there is none *and* a line has been drawn.
+    ///
+    /// `None` with no [`line`](Self::line) is the ordinary "not aimed yet"
+    /// state, which is not a failure and has its own message. `None` with a
+    /// line and no [`section`](Self::section) means a cut is in flight.
+    pub unavailable: Option<SectionUnavailable>,
+}
+
+impl std::fmt::Debug for CrossSectionPane {
+    /// Summarised rather than dumped: `section` would print three
+    /// multi-megabyte planes, and `texture` has no `Debug` at all.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CrossSectionPane")
+            .field("line", &self.line)
+            .field("source_pane", &self.source_pane)
+            .field("rendered_for", &self.rendered_for)
+            .field("section", &self.section.is_some())
+            .field("texture", &self.texture.as_ref().map(|t| t.id()))
+            .field("unavailable", &self.unavailable)
+            .finish()
+    }
 }
 
 /// Everything a built voxel grid depends on.

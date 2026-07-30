@@ -199,11 +199,39 @@ impl super::Gui {
                     // CONVENTION: New map click handlers MUST use overlay_click_pos from
                     // PaneRenderCtx — never read raw click events via ctx.input() for
                     // map-level interactions, as that bypasses dialog blocking.
-                    let pointer = if is_active {
-                        self.interaction
-                            .resolve_active(&ctx, modality, &mut map_memory, pane_rect)
+                    //
+                    // While the cross-section draw is armed, the active *map*
+                    // pane resolves through the line detector instead — a third
+                    // resolver, not a filter over the other two. The two touch
+                    // gestures are spelled with exactly the press-and-move a
+                    // section line is spelled with, so running them alongside it
+                    // would make every line drawn on a phone also a zoom or a
+                    // value tooltip.
+                    //
+                    // Only a map pane: the line is aimed with a projector, and a
+                    // section or volume pane has none. Arming the mode with one
+                    // of those active therefore leaves it exactly as it was,
+                    // and the press that picks a map pane out of the layout is
+                    // the same press that starts the line — `detect_active_pane_click`
+                    // runs at the top of this frame.
+                    let armed_draw = self.section_draw_armed()
+                        && is_active
+                        && matches!(pane.kind(), PaneKind::Map);
+                    let (pointer, gesture) = if armed_draw {
+                        let armed = self.interaction.resolve_armed(&ctx, modality);
+                        (armed.pointer(), Some(armed.gesture()))
+                    } else if is_active {
+                        (
+                            self.interaction.resolve_active(
+                                &ctx,
+                                modality,
+                                &mut map_memory,
+                                pane_rect,
+                            ),
+                            None,
+                        )
                     } else {
-                        self.interaction.resolve_inactive(&ctx, modality)
+                        (self.interaction.resolve_inactive(&ctx, modality), None)
                     };
 
                     // Both gated on the armed mode, and both **unconditionally**
@@ -215,6 +243,25 @@ impl super::Gui {
                     // slid under the anchor. The same holds for the click: a
                     // press-and-release inside a radar site's icon while armed is
                     // a discarded too-small region, not a request to switch site.
+                    //
+                    // # The two armed modes never overlap here
+                    //
+                    // `region_arm` and `armed_draw` gate the same two fields, and
+                    // this composes with the block above rather than fighting it:
+                    // `ArmedSectionFrame` has already set `suppress_pan` and
+                    // cleared `overlay_click_pos`, so an armed *section* frame
+                    // passes through unchanged, and the `||` cannot un-suppress
+                    // anything. It is not merely that the two agree, though — they
+                    // are mutually exclusive at the source. Arming either mode
+                    // disarms the other (`Gui::set_region_arm`), because one drag
+                    // on one map pane cannot be both a line and a box: the section
+                    // pipeline would anchor a line while `handle_region_drag`,
+                    // which reads the pointer raw inside `Map::show`, started a
+                    // box from the same press, and the release would commit both.
+                    // The two gates below are therefore never *both* the reason a
+                    // field is cleared, and only one of `pending_section_line` and
+                    // `pending_region` can be recorded in a frame — which is what
+                    // `Gui::ui`'s two appliers rely on.
                     let overlay_click_pos = if region_arm {
                         None
                     } else {
@@ -307,6 +354,18 @@ impl super::Gui {
                                     .show(&mut child_ui, |ui, _response, projector, memory| {
                                         let zoom = memory.zoom();
 
+                                        // Inside `Map::show`, because this is
+                                        // the only place a projector exists —
+                                        // and on the frame the gesture happens,
+                                        // because a pixel names different ground
+                                        // one wheel notch later. See
+                                        // `SectionAnchor`.
+                                        if let Some(gesture) = gesture {
+                                            self.track_section_draw(
+                                                pane_idx, gesture, projector,
+                                            );
+                                        }
+
                                         let mut render_ctx = pane_render::PaneRenderCtx {
                                             pane_idx,
                                             pane: &mut pane,
@@ -336,6 +395,15 @@ impl super::Gui {
                                             projector,
                                             zoom,
                                             &mut render_ctx,
+                                        );
+
+                                        // Last, over the radar image and every
+                                        // overlay: a section line the user is
+                                        // dragging that disappeared under a
+                                        // storm would be undrawable exactly
+                                        // where it matters.
+                                        self.draw_section_tracks(
+                                            ui, projector, pane_idx, pane_rect,
                                         );
                                     });
                             }
@@ -416,6 +484,154 @@ impl super::Gui {
         }
 
         actions
+    }
+
+    /// Advance the armed cross-section draw by one frame's gesture.
+    ///
+    /// Called from inside `Map::show`, which is the only place a
+    /// `walkers::Projector` exists — and therefore the only place a pointer
+    /// position can be turned into ground. Both conversions happen on the frame
+    /// their gesture happened, for the reason [`SectionAnchor`] gives at length:
+    /// the draw suppresses panning but not zooming, so a pixel held across a
+    /// wheel notch names somewhere else.
+    ///
+    /// [`SectionAnchor`]: super::SectionAnchor
+    fn track_section_draw(
+        &mut self,
+        pane_idx: usize,
+        gesture: crate::ui_input::SectionGesture,
+        projector: &walkers::Projector,
+    ) {
+        use crate::ui_input::{MIN_SECTION_DRAG_PT, SectionGesture};
+
+        let ground = |pos: egui::Pos2| {
+            // `walkers::Position` is a `geo_types::Point`, so latitude is `y`
+            // and longitude is `x` — the same reading `render_pane_map_content`
+            // takes off `unproject`.
+            let position = projector.unproject(egui::vec2(pos.x, pos.y));
+            crate::pane::GeoPoint {
+                lat: position.y(),
+                lon: position.x(),
+            }
+        };
+
+        match gesture {
+            SectionGesture::Idle => {}
+            SectionGesture::Anchored(pos) => {
+                self.section_anchor = Some(super::SectionAnchor {
+                    pane_idx,
+                    ground: ground(pos),
+                    screen: pos,
+                    current: pos,
+                });
+            }
+            SectionGesture::Dragging(pos) => {
+                if let Some(anchor) = self.section_anchor.as_mut()
+                    && anchor.pane_idx == pane_idx
+                {
+                    anchor.current = pos;
+                }
+            }
+            SectionGesture::Released(pos) => {
+                let Some(anchor) = self.section_anchor.take() else {
+                    return;
+                };
+                if anchor.pane_idx != pane_idx {
+                    return;
+                }
+                // The length test is on the *gesture*, in points, so it means
+                // the same thing at every zoom and on every display density.
+                if (pos - anchor.screen).length() < MIN_SECTION_DRAG_PT {
+                    // Discarded, and **the mode stays armed**. A stray tap is
+                    // the likeliest thing to happen right after arming — it is
+                    // how a user checks which pane they are on — and disarming
+                    // there would silently throw away an intent they had just
+                    // expressed, leaving them to work out from nothing that the
+                    // checkbox had un-ticked itself.
+                    return;
+                }
+                let Some(line) = crate::pane::SectionLine::new(anchor.ground, ground(pos)) else {
+                    // Only reachable from a projector answering outside the
+                    // world, which `walkers` does not do — but the constructor
+                    // is the one gate on a line that cannot be cut, so the
+                    // refusal is honoured rather than unwrapped. The mode stays
+                    // armed, as for any other discarded drag.
+                    log::warn!("a drawn section line was not a line; discarding it");
+                    return;
+                };
+                self.pending_section_line = Some((pane_idx, line));
+                // Disarmed by drawing: the mode's job is done, and leaving it on
+                // would turn the user's next pan into a second section.
+                self.set_section_draw_armed(false);
+            }
+            SectionGesture::Cancelled => {
+                if self
+                    .section_anchor
+                    .as_ref()
+                    .is_some_and(|a| a.pane_idx == pane_idx)
+                {
+                    self.section_anchor = None;
+                }
+            }
+        }
+    }
+
+    /// Draw the rubber band of an in-flight draw and the ground track of every
+    /// section cut from this map.
+    ///
+    /// # The track is ~258 m inside the range ring, deliberately
+    ///
+    /// `render_radar_range_ring` places its circle with `MAX_RANGE_KM / 111.32`
+    /// degrees of latitude, and 111.32 km per degree is a sphere of 6378.1 km —
+    /// the WGS84 equatorial radius. The section's geometry, and this track with
+    /// it, walks [`rustdar_radar::types::EARTH_RADIUS_KM`], which is 6371. So a
+    /// track drawn all the way to the edge of coverage lands
+    /// 230 × (1 − 6371/6378.1) ≈ 0.26 km inside the ring, which is 1.15 px at
+    /// the zoom where the whole ring fits a 2048-pixel pane.
+    ///
+    /// Measured rather than assumed, and left alone rather than reconciled:
+    /// changing either constant to match the other moves a number that is
+    /// correct for what it describes. The ring is a rendering convenience; the
+    /// track is where the beam went.
+    ///
+    /// # Reading `self.panes` from inside the pane loop is safe *here*
+    ///
+    /// The loop has `mem::take`n the pane being drawn, so its slot reads as a
+    /// default map pane — the module's standing hazard. It costs nothing here
+    /// because only [`PaneState::cross_section`] is read and the taken pane is a
+    /// map pane by construction: this runs inside `Map::show`, which only the map
+    /// arm reaches. A section pane can never be the one held out.
+    fn draw_section_tracks(
+        &self,
+        ui: &egui::Ui,
+        projector: &walkers::Projector,
+        pane_idx: usize,
+        pane_rect: egui::Rect,
+    ) {
+        let painter = ui.painter();
+        let project = |p: crate::pane::GeoPoint| {
+            projector
+                .project(walkers::lat_lon(p.lat, p.lon))
+                .to_pos2()
+        };
+
+        // Committed sections first, so a band being dragged over one is on top.
+        for other in self.panes() {
+            let Some(section) = other.cross_section() else {
+                continue;
+            };
+            if section.source_pane != Some(pane_idx) {
+                continue;
+            }
+            let Some(line) = section.line else {
+                continue;
+            };
+            paint_section_track(painter, project(line.a()), project(line.b()), pane_rect);
+        }
+
+        if let Some((from, to)) = self.section_rubber_band(pane_idx) {
+            paint_section_track(painter, from, to, pane_rect);
+        }
     }
 
     /// Detect which pane was clicked and make it the active pane.
@@ -1036,6 +1252,49 @@ fn paint_pane_empty_state(ui: &mut egui::Ui, pane_rect: egui::Rect, text: &str) 
     let top_left = pane_rect.center() - 0.5 * size;
     ui.painter()
         .galley(top_left, galley, ui.visuals().weak_text_color());
+}
+
+/// The colour a section's ground track and its end caps are drawn in.
+///
+/// Warm, and nothing else on the map is: every overlay in the registry is a
+/// hazard colour or a muted grey, and the radar image underneath spans the whole
+/// spectrum. A track has to stay findable over a 70 dBZ core.
+const SECTION_TRACK_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 214, 10);
+
+/// Paint one section ground track: a line with a cap at each end.
+///
+/// Clipped to the pane rather than to the whole panel, so a track belonging to a
+/// map in one pane cannot be drawn across the pane beside it — the projector is
+/// per-pane and happily projects to coordinates outside its own map.
+///
+/// The end caps are what make the track readable as a *section* rather than as
+/// one more line on a busy map: they mark which end is the left-hand column of
+/// the picture, which is otherwise unguessable.
+fn paint_section_track(
+    painter: &egui::Painter,
+    from: egui::Pos2,
+    to: egui::Pos2,
+    pane_rect: egui::Rect,
+) {
+    let painter = painter.with_clip_rect(pane_rect);
+    // A dark halo under the line, so it reads over both a light basemap and a
+    // dark radar core without the line itself having to be thick.
+    painter.line_segment(
+        [from, to],
+        egui::Stroke::new(4.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140)),
+    );
+    painter.line_segment([from, to], egui::Stroke::new(2.0, SECTION_TRACK_COLOR));
+    for (pos, label) in [(from, "A"), (to, "B")] {
+        painter.circle_filled(pos, 4.0, SECTION_TRACK_COLOR);
+        painter.circle_stroke(pos, 4.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
+        painter.text(
+            pos + egui::vec2(0.0, -12.0),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(11.0),
+            SECTION_TRACK_COLOR,
+        );
+    }
 }
 
 /// Draw a border around a pane rect, highlighted when active.

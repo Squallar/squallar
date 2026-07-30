@@ -729,7 +729,12 @@ fn restore_content(pane_idx: usize, pc: &PaneConfig, pane_count: usize) -> PaneC
             PaneContent::CrossSection(Box::new(CrossSectionPane {
                 line,
                 source_pane,
-                rendered_for: None,
+                // A restored pane holds nothing rendered, so it holds no reason
+                // for that either: `rendered_for: None` is what makes the
+                // dispatcher cut the section again against whatever volume the
+                // pane's site loads, and `unavailable: None` is what stops a
+                // reason from a previous session outliving its cause.
+                ..Default::default()
             }))
         }
         PaneKind::Volume => {

@@ -209,6 +209,39 @@ pub(super) struct TimeDialogState {
     pub show: bool,
 }
 
+/// Where an in-flight cross-section draw started.
+///
+/// # `ground` is the endpoint; `screen` is only the gesture
+///
+/// The two are not redundant and they answer different questions.
+///
+/// `ground` is what the finished line is built from, and it is converted from
+/// the pointer **inside `Map::show` on the press frame**, where the projector
+/// is in hand. A pixel denotes different ground after any viewport change, and
+/// an armed draw suppresses panning but *not* zooming — walkers reads the wheel
+/// itself — so a pixel anchor held across a mid-drag zoom would silently re-aim
+/// the line's near end while the far end tracked the finger. The user would get
+/// a section of somewhere they never pointed at, with a perfectly convincing
+/// picture of it.
+///
+/// `screen` is the anchor's position *as a gesture*, and it is the right
+/// coordinate for exactly one question: did the finger travel far enough to mean
+/// a line rather than a tap ([`MIN_SECTION_DRAG_PT`]). That is a question about
+/// the hand, not about the ground, and re-deriving it from `ground` each frame
+/// would make the threshold depend on the zoom level.
+///
+/// [`MIN_SECTION_DRAG_PT`]: crate::ui_input::MIN_SECTION_DRAG_PT
+struct SectionAnchor {
+    /// The map pane the draw started on.
+    pane_idx: PaneId,
+    /// Where it started, on the ground.
+    ground: crate::pane::GeoPoint,
+    /// Where it started, on screen.
+    screen: egui::Pos2,
+    /// Where the pointer is now, on screen. The far end of the rubber band.
+    current: egui::Pos2,
+}
+
 pub struct Gui {
     radar: RadarState,
     auto_poll: AutoPollState,
@@ -345,6 +378,13 @@ pub struct Gui {
     /// commit *and* through a discarded mis-drag, and is turned off from the menu
     /// it was turned on from: a mode that disarmed itself would make aiming two
     /// panes, or re-aiming one that came out wrong, four clicks instead of two.
+    /// [`Self::dismiss_top_layer`] also cancels it, so Escape and Android's back
+    /// button mean here what they mean everywhere else — the same layer the
+    /// cross-section draw sits on, and for the same reason.
+    ///
+    /// **Never on at the same time as [`section_draw_armed`](Self::section_draw_armed).**
+    /// Both are armed modal drags on a map pane, and one drag cannot be two
+    /// gestures — see [`Self::set_region_arm`].
     region_arm: bool,
     /// The region drag in flight, if any.
     ///
@@ -359,6 +399,41 @@ pub struct Gui {
     /// [`pending_pane_kind`](Self::pending_pane_kind): applying it can grow the
     /// pane count, which changes `pane_rect` for every pane not yet drawn.
     pending_region: Option<crate::ui_region::PendingRegion>,
+    /// Whether the cross-section draw is **armed**: the next drag on a map pane
+    /// is a section line rather than a pan.
+    ///
+    /// # Why armed-modal and not a modifier-drag
+    ///
+    /// A shift-drag is the obvious desktop spelling and it has no touch
+    /// equivalent at all. This binary ships to phones, from one wasm build that
+    /// also serves desktop browsers, so a gesture only a keyboard can express is
+    /// a feature only half the users have.
+    ///
+    /// A mode has its own failure — the user forgets they are in it — and the
+    /// answers to that are both here: the arming control is a **checkbox**, so
+    /// the state is visible and turning it off is discoverable in the place it
+    /// was turned on; and [`Self::dismiss_top_layer`] cancels it, so Escape and
+    /// Android's back button both mean what they mean everywhere else.
+    ///
+    /// **Never on at the same time as [`region_arm`](Self::region_arm).** Both
+    /// are armed modal drags on a map pane, and one drag cannot be two gestures —
+    /// see [`Self::set_section_draw_armed`].
+    section_draw_armed: bool,
+    /// The in-flight draw: where it started, on which pane, and where the
+    /// pointer is now.
+    section_anchor: Option<SectionAnchor>,
+    /// A finished line and the map pane it was drawn on, applied **after** the
+    /// pane loop.
+    ///
+    /// Deferred for the reason [`pending_pane_kind`](Self::pending_pane_kind) is,
+    /// and one reason more that is specific to this writer. Applying a line can
+    /// *grow the pane count*, and `PaneLayout::pane_rect` is a function of it —
+    /// so a mid-loop growth silently moves the rects of every pane the loop has
+    /// not reached yet, away from the ones `detect_active_pane_click`
+    /// hit-tested at the top of this same frame. The panes drawn after the growth
+    /// would be drawn in the right place and clicked in the wrong one, for one
+    /// frame, with nothing to say so.
+    pending_section_line: Option<(PaneId, crate::pane::SectionLine)>,
     viewport_sync: bool,
     sync_layers: bool,
     // --- Radar loop settings ---
@@ -734,6 +809,9 @@ impl Gui {
             region_arm: false,
             region_drag: None,
             pending_region: None,
+            section_draw_armed: false,
+            section_anchor: None,
+            pending_section_line: None,
             viewport_sync: true,
             sync_layers: true,
             loop_lookback_secs: 3600, // default 1 hour
@@ -822,8 +900,30 @@ impl Gui {
         // converting a pane cannot be a direct write from the dispatcher that
         // asked for it.
         self.apply_pending_pane_kind(&mut actions);
+        // Same window, and one thing more: this can grow `pane_count`, which
+        // moves `pane_rect` for every pane. Inside the loop that would leave the
+        // panes drawn after it hit-tested against rects they are no longer in.
+        self.apply_pending_section_line();
         // After the kind conversion, so a region that lands on a pane the same
         // frame converted it finds a 3D pane rather than the map it used to be.
+        //
+        // # Two appliers, and why their order is not a design decision
+        //
+        // Both of these can grow the layout, and running two growths in one frame
+        // would be a case neither was written for: the second one's target rule
+        // would run against a layout the first had already changed, and in a full
+        // layout each rule's last resort is *the same pane* — so the second would
+        // convert the pane the first had just filled, and the user would see one
+        // of two completed gestures produce nothing.
+        //
+        // It cannot happen, and the reason is upstream of here: the two modes are
+        // mutually exclusive (see [`Self::set_section_draw_armed`]), only an armed
+        // mode can record a pending, and each pending is recorded and consumed
+        // inside a single frame. So at most one of these two lines does anything
+        // on any frame. Pinned by
+        // `two_appliers_never_both_have_something_to_apply`, which drives the two
+        // toggles rather than writing the flags, because the invariant belongs to
+        // the arming rule rather than to this call order.
         self.apply_pending_region();
 
         // Floating windows last, so they layer above the chrome and the map.
@@ -1133,6 +1233,29 @@ impl Gui {
             self.drawer_open = false;
             return true;
         }
+        // Last, below every painted layer, because an armed drag is a *mode*
+        // rather than something on screen: whatever is drawn over the map is what
+        // a press is aimed at, and the drawer in particular is where the mode was
+        // armed.
+        //
+        // Being here at all is what makes an armed drag cancellable by the two
+        // gestures that mean "back out" everywhere else — and on Android it is
+        // what stops the back button from exiting the app while a mode is on,
+        // which is the reading of a back press least likely to be what was meant.
+        //
+        // **One layer for both modes, not two.** They are mutually exclusive (see
+        // `Gui::set_region_arm`), so at most one of these ever fires and giving
+        // them separate layers would only invite a reader to wonder which order
+        // they are in. A back press cancels whichever armed drag is on, and there
+        // is never more than one.
+        if self.section_draw_armed {
+            self.set_section_draw_armed(false);
+            return true;
+        }
+        if self.region_arm {
+            self.set_region_arm(false);
+            return true;
+        }
         false
     }
 
@@ -1253,8 +1376,14 @@ impl Gui {
                     rect: button.rect,
                 });
                 if button.clicked() && self.pane_layout.pane_count != count {
+                    // The pane goes back into the vector first: `set_pane_count`
+                    // seeds the new panes from the *active* one, and a
+                    // `mem::take`n slot would seed them from a default.
                     self.panes[self.active_pane] = std::mem::take(pane);
-                    self.set_pane_count(count);
+                    // The answer is ignored here and only here: the picker's
+                    // counts come from the width class's own list, so the clamp
+                    // in `PaneLayout::for_count` can never bite.
+                    let _ = self.set_pane_count(count);
                     *pane = std::mem::take(&mut self.panes[self.active_pane]);
                 }
             }
@@ -2105,19 +2234,30 @@ impl Gui {
         self.pending_pane_kind = Some((pane_idx, kind));
     }
 
-    /// Grow or shrink the layout to `count` panes, seeding any new ones.
+    /// Grow or shrink the layout to `count` panes, seeding any new ones, and
+    /// report whether the layout actually reached that count.
     ///
-    /// Factored out of the pane picker rather than left inline because it is no
-    /// longer the only writer of the pane count: a region drag on a layout with
-    /// room in it opens a 3D pane beside the map. Two copies of this would be two
-    /// places to remember [`Self::initialize_pane_enabled`], and forgetting it in
-    /// one of them produces a pane that draws no overlays at all — Radar included
-    /// — which reads as a broken pane rather than as a missing seed.
+    /// **The one writer of the pane count.** Factored out of the pane picker
+    /// rather than left inline because the picker is no longer the only thing
+    /// that changes it: a region drag on a layout with room in it opens a 3D pane
+    /// beside the map, and a section line does the same for a cross-section.
+    /// Three copies of this would be three places to remember
+    /// [`Self::initialize_pane_enabled`], and forgetting it in one of them
+    /// produces a pane that draws no overlays at all — Radar included — which
+    /// reads as a broken pane rather than as a missing seed. It is not a compile
+    /// error and not a panic; it is a blank pane, from one missing call.
     ///
     /// **The caller must have put any `mem::take`n pane back first.** This indexes
     /// `self.panes` directly, and a taken pane's slot holds a default map pane
     /// whose site a new pane would then be seeded from.
-    fn set_pane_count(&mut self, count: usize) {
+    ///
+    /// Returns `false` when the layout could not reach `count` —
+    /// `PaneLayout::for_count` clamps, so asking for more than it allows leaves
+    /// the count where it was rather than producing panes no rect is drawn for.
+    /// The active-pane bound is checked against the **clamped** count for the same
+    /// reason: comparing against the requested one would leave `active_pane`
+    /// pointing past the end of a layout that refused to grow.
+    fn set_pane_count(&mut self, count: usize) -> bool {
         let active_site = self.panes[self.active_pane].site.clone();
         let active_scan_info = self.panes[self.active_pane].scan_info.clone();
         while self.panes.len() < count {
@@ -2132,9 +2272,10 @@ impl Gui {
         // `Gui::ui`), the same way startup does.
         self.initialize_pane_enabled();
         self.pane_layout = PaneLayout::for_count(count);
-        if self.active_pane >= count {
+        if self.active_pane >= self.pane_layout.pane_count {
             self.active_pane = 0;
         }
+        self.pane_layout.pane_count == count
     }
 
     /// Aim a 3D pane at the region the frame committed, if any.
@@ -2158,7 +2299,10 @@ impl Gui {
         let pane_idx = match destination {
             crate::ui_region::RegionDestination::Existing(idx) => idx,
             crate::ui_region::RegionDestination::Grow(count) => {
-                self.set_pane_count(count);
+                if !self.set_pane_count(count) {
+                    log::warn!("the layout refused to grow to {count}; dropping a 3D region");
+                    return;
+                }
                 count - 1
             }
             crate::ui_region::RegionDestination::Convert(idx) => idx,
@@ -2185,13 +2329,45 @@ impl Gui {
         // working on.
     }
 
-    /// Arm or disarm the region drag, as the menu toggle does.
-    #[cfg(test)]
-    pub(crate) fn set_region_arm_for_test(&mut self, on: bool) {
+    /// Arm or disarm the region drag.
+    ///
+    /// Disarming throws away any drag in flight rather than committing it: a user
+    /// who reaches for the menu with the button still down is cancelling, and a
+    /// box that appeared because of it would be one nobody asked for.
+    ///
+    /// # Arming this disarms the cross-section draw
+    ///
+    /// The two are the only armed modal drags on a map pane, and they are spelled
+    /// identically — press, move, release, on the same pane, with the same button
+    /// or the same finger. With both on, one drag would have to mean two things:
+    /// the section pipeline would anchor a line while `handle_region_drag` read
+    /// the same press raw and started a box, and the release would commit both. A
+    /// single gesture would then grow the layout twice, and in a full layout the
+    /// second applier's last resort is the pane the first one just filled — so one
+    /// of the two completed gestures would visibly produce nothing.
+    ///
+    /// Turning the other off is the only rule that keeps the menu honest, because
+    /// both entries are checkboxes: whichever the user ticked last is the one
+    /// showing ticked, and it is the one a drag will do. Silently ignoring the
+    /// second arm, or refusing it, would leave a ticked box that does nothing.
+    ///
+    /// Written as a direct field write rather than as a call to
+    /// [`Self::set_section_draw_armed`], so the two setters cannot recurse into
+    /// each other.
+    pub(crate) fn set_region_arm(&mut self, on: bool) {
         self.region_arm = on;
-        if !on {
+        if on {
+            self.section_draw_armed = false;
+            self.section_anchor = None;
+        } else {
             self.region_drag = None;
         }
+    }
+
+    /// [`Self::set_region_arm`] under the name the region tests already use.
+    #[cfg(test)]
+    pub(crate) fn set_region_arm_for_test(&mut self, on: bool) {
+        self.set_region_arm(on);
     }
 
     /// Whether the region drag is armed.
@@ -2231,6 +2407,157 @@ impl Gui {
             // converting none.
             None => log::warn!("pane {pane_idx} is gone; not converting it to {kind:?}"),
         }
+    }
+
+    /// Whether the cross-section draw is armed.
+    pub fn section_draw_armed(&self) -> bool {
+        self.section_draw_armed
+    }
+
+    /// Arm or disarm the cross-section draw.
+    ///
+    /// Disarming drops any half-drawn line: the anchor means nothing once the
+    /// mode it belongs to is off, and leaving it would make re-arming resume a
+    /// drag the user abandoned minutes ago.
+    ///
+    /// Arming it disarms the 3D region drag, and drops any box in flight, for the
+    /// reason [`Self::set_region_arm`] gives at length: one drag on one map pane
+    /// cannot be both a section line and a region box. Direct field writes rather
+    /// than a call to that setter, so the two cannot recurse into each other.
+    pub fn set_section_draw_armed(&mut self, armed: bool) {
+        self.section_draw_armed = armed;
+        if armed {
+            self.region_arm = false;
+            self.region_drag = None;
+        } else {
+            self.section_anchor = None;
+        }
+    }
+
+    /// The rubber band to draw on pane `pane_idx`, in screen points, or `None`.
+    ///
+    /// Both endpoints are pixels rather than ground, deliberately: this is a
+    /// preview of a gesture in progress, and it should track the finger exactly
+    /// even on the frame a wheel-zoom has moved the map under it. The *stored*
+    /// anchor is geographic — see [`SectionAnchor`] — and it is that one the
+    /// committed line is built from.
+    pub(crate) fn section_rubber_band(&self, pane_idx: PaneId) -> Option<(egui::Pos2, egui::Pos2)> {
+        let anchor = self.section_anchor.as_ref()?;
+        (anchor.pane_idx == pane_idx).then_some((anchor.screen, anchor.current))
+    }
+
+    /// Give the line this frame drew to a pane, converting or creating one if
+    /// need be.
+    ///
+    /// Called from [`Self::ui`] after the pane loop, where every pane is back in
+    /// the vector and growing the count can no longer desynchronise a rect from
+    /// the click that was hit-tested against it.
+    ///
+    /// # The target rule is total
+    ///
+    /// A drawn line always lands somewhere. Four steps, in order, and the order
+    /// is the whole design:
+    ///
+    /// 1. **A section pane already sourced from this map.** Drawing a second
+    ///    line on a map the user has already sectioned means "cut *there*
+    ///    instead", not "give me another section pane" — otherwise three lines
+    ///    fill the screen with panes nobody asked for.
+    /// 2. **Grow the layout.** A section beside the map it was cut from is the
+    ///    picture the feature is for, and it costs the user nothing they had.
+    /// 3. **The lowest-indexed section pane.** The layout is full; re-aiming an
+    ///    existing section is the cheapest thing that can still answer.
+    /// 4. **The highest-indexed pane that is not the one drawn on.** Converting
+    ///    a map is a real loss, so it is last — but it is *there*, because the
+    ///    alternative is a drag that silently does nothing. The pane drawn on is
+    ///    excluded because taking away the map under the line, while other panes
+    ///    exist to take instead, is the one conversion that is certainly wrong.
+    /// 5. **The pane drawn on.** Reachable only in a one-pane layout that cannot
+    ///    grow — a phone in portrait — and right there: on a screen with room
+    ///    for one thing, asking for a section is asking to look at a section.
+    ///    The pane's site, product and viewport all survive the conversion, so
+    ///    turning the checkbox back off restores the map it was.
+    fn apply_pending_section_line(&mut self) {
+        let Some((source, line)) = self.pending_section_line.take() else {
+            return;
+        };
+
+        // Whatever the source map is looking at, so a line drawn on a
+        // reflectivity map cuts reflectivity. A product with no vertical
+        // structure is carried across too, rather than quietly swapped: the
+        // pane says which product it cannot slice and offers the picker to
+        // change it, where a silent substitution would leave the user reading a
+        // moment they did not ask for.
+        let (source_product, source_site, source_scan) = match self.panes.get(source) {
+            Some(pane) => (
+                pane.selected_product,
+                pane.site.clone(),
+                pane.scan_info.clone(),
+            ),
+            None => {
+                log::warn!("pane {source} drew a section line and is already gone");
+                return;
+            }
+        };
+
+        let target = self
+            .section_pane_sourced_from(source)
+            .or_else(|| self.grown_section_pane())
+            .or_else(|| self.lowest_section_pane())
+            .or_else(|| self.highest_pane_other_than(source))
+            // Total by construction: `highest_pane_other_than` only answers
+            // `None` in a one-pane layout, and in one the source *is* the only
+            // pane there is. A drawn line is never silently dropped.
+            .unwrap_or(source);
+
+        let Some(pane) = self.panes.get_mut(target) else {
+            log::warn!("no pane could hold the section drawn on pane {source}");
+            return;
+        };
+        pane.set_kind(crate::pane::PaneKind::CrossSection);
+        pane.selected_product = source_product;
+        pane.site = source_site;
+        pane.scan_info = source_scan;
+        if let Some(section) = pane.cross_section_mut() {
+            section.line = Some(line);
+            section.source_pane = Some(source);
+            // The picture on screen is of the old line. Cleared rather than
+            // left to the staleness comparison, because a section pane whose
+            // texture outlives its line shows a cut through ground the user is
+            // no longer pointing at, for as long as the re-cut takes.
+            section.section = None;
+            section.texture = None;
+            section.unavailable = None;
+            section.rendered_for = None;
+        }
+        self.active_pane = target;
+    }
+
+    /// The first section pane whose line was drawn on `source`.
+    fn section_pane_sourced_from(&self, source: PaneId) -> Option<PaneId> {
+        (0..self.visible_pane_count()).find(|&idx| {
+            self.panes[idx]
+                .cross_section()
+                .is_some_and(|s| s.source_pane == Some(source))
+        })
+    }
+
+    /// A new pane at the end of the layout, or `None` if the layout is full.
+    fn grown_section_pane(&mut self) -> Option<PaneId> {
+        let wanted = self.pane_layout.pane_count + 1;
+        if wanted > self.layout.width.max_panes() {
+            return None;
+        }
+        self.set_pane_count(wanted).then(|| wanted - 1)
+    }
+
+    /// The lowest-indexed section pane, whatever it was aimed at.
+    fn lowest_section_pane(&self) -> Option<PaneId> {
+        (0..self.visible_pane_count()).find(|&idx| self.panes[idx].cross_section().is_some())
+    }
+
+    /// The highest-indexed visible pane that is not `source`.
+    fn highest_pane_other_than(&self, source: PaneId) -> Option<PaneId> {
+        (0..self.visible_pane_count()).rev().find(|&idx| idx != source)
     }
 
     /// The pane conversion this frame recorded and has not applied yet.
