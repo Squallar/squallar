@@ -58,6 +58,15 @@
 //! [`NO_DATA_INDEX`], and its value is `NaN`. The cone of silence and the
 //! volume's outer shell are both just that.
 //!
+//! **The boundary is hard at cell resolution, and that is the sampler's
+//! doing.** Its `blend` falls back to the nearest corner as soon as any corner
+//! of an interpolation has no value, rather than averaging a measurement with
+//! an absence — so a cell either carries a number or does not, and no
+//! partial-alpha transition is baked into the grid. Every softening a viewer
+//! sees at an echo edge comes from the GPU's `Linear` fetch across those hard
+//! cells, which is exactly why the section below is about what that fetch
+//! returns.
+//!
 //! # The encoding, and why index 0 is the bottom of the ramp
 //!
 //! The grid is `R8Unorm` **palette indices** with a 256-entry RGBA table
