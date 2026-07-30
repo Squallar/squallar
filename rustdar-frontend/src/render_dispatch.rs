@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rustdar_radar::level3::Level3Product;
 use rustdar_radar::srm::StormMotionSample;
-use rustdar_radar::types::RadarProduct;
+use rustdar_radar::types::{RadarProduct, RenderView};
 
 use crate::WindowRef;
 use crate::channels::RenderResponse;
@@ -107,8 +107,23 @@ pub struct CachedRenderOutput {
     pub value_data: Arc<Vec<f32>>,
 }
 
-/// `(site, product, elevation_tenths)` — see [`elevation_key`].
-pub type RenderCacheKey = (String, RadarProduct, i32);
+/// `(site, product, view, elevation_tenths)` — see [`elevation_key`] and
+/// [`render_cache_key`].
+///
+/// # Why the view is in the key
+///
+/// The cache is shared between panes, and what it shares is a *buffer*. A plan
+/// view of reflectivity and a cross-section of reflectivity at the same site
+/// are the same `(site, product, elevation)` and completely different shapes —
+/// `IMAGE_SIZE²` of ground against `SECTION_WIDTH × SECTION_HEIGHT` of a
+/// vertical plane. Without this axis they collide in the LRU and one pane is
+/// handed the other's buffers, which is not a wrong picture: it is
+/// `ColorImage::from_rgba_unmultiplied`'s `assert_eq!` on the **main thread**,
+/// live in release, and under wasm a main-thread panic aborts the whole app.
+///
+/// It is added now, while the cache still holds only plan-view rasters, because
+/// this is the last moment at which the change is mechanical.
+pub type RenderCacheKey = (String, RadarProduct, RenderView, i32);
 
 /// Bounded least-recently-used cache of render outputs shared between panes.
 ///
@@ -212,6 +227,68 @@ impl RenderCache {
 /// so two selections that compare equal never land in different buckets in practice.
 fn elevation_key(elevation: f32) -> i32 {
     (elevation * 10.0).round() as i32
+}
+
+/// The elevation slot for a view that has no elevation.
+///
+/// A section cuts across every tilt and a voxel grid resamples all of them, so
+/// the pane's nominal elevation says nothing about the buffer — two sections of
+/// one product at one site are the same render whatever tilt each pane's
+/// selector happens to be parked on, and keying them apart would store the same
+/// picture several times and evict the plan views to do it.
+///
+/// **A sentinel would have been wrong here and the view axis is what makes this
+/// safe.** Any `i32` chosen for "no elevation" collides with a real
+/// [`elevation_key`] — `0` is a genuine 0.0° plan render — so before the key
+/// carried the view there was no value this could be. With the view in the key
+/// the slot is only ever compared against other entries of the same view, so
+/// `0` is not a sentinel at all: it is the one bucket a viewless render has.
+const NO_ELEVATION_SLOT: i32 = 0;
+
+/// The cache key for one render, and the only place one is built.
+///
+/// Written once rather than at each call site because the two rules above —
+/// which axis discriminates, and which slot a viewless view uses — are the kind
+/// that a second copy gets half right.
+fn render_cache_key(
+    site: &str,
+    product: RadarProduct,
+    view: RenderView,
+    elevation: f32,
+) -> RenderCacheKey {
+    let elevation = match view {
+        RenderView::PlanView => elevation_key(elevation),
+        RenderView::CrossSection | RenderView::Volume => NO_ELEVATION_SLOT,
+    };
+    (site.to_string(), product, view, elevation)
+}
+
+/// Whether a render of `view` showing `product` has to be given the whole
+/// volume rather than the one sweep `render::find_sweep` picks.
+///
+/// **One predicate, two halves, and neither can answer for the other.** The
+/// product half is [`RadarProduct::reads_whole_volume`] — "does this field
+/// integrate the column?" — and the view half is
+/// [`RenderView::reads_whole_volume`] — "does this picture slice vertically?".
+/// A reflectivity cross-section answers *no* to the first and *yes* to the
+/// second, so a dispatch that asked only the product question would extract one
+/// sweep and the section would be interpolated across the tilts that were not
+/// there: no error, no `NaN`, a smooth plausible layer that looks *better* than
+/// the truth.
+///
+/// It reads both rather than restating either. That is the lesson the campaign
+/// already paid for once: a hand-maintained second copy of the product half
+/// omitted storm-relative velocity, and live SRV panes fitted their dealias
+/// seed from volumes the feed had deliberately skipped cuts of.
+///
+/// `App::cut_selection_for` still asks the two halves at two different points
+/// rather than calling this, and deliberately: the view is known for a pane
+/// before its render parameters resolve, and the whole window between
+/// converting a pane and its volume arriving — which is exactly when the first
+/// section is cut — is time in which the product half cannot be asked at all.
+/// The safety property is the same; only the order differs.
+pub fn needs_whole_volume(view: RenderView, product: RadarProduct) -> bool {
+    view.reads_whole_volume() || product.reads_whole_volume()
 }
 
 /// Manages radar rendering dispatch and Level III data caching.
@@ -348,8 +425,9 @@ impl RenderDispatcher {
                 prs.last_rendered = None;
             }
         }
-        self.render_cache
-            .retain(|(_site, product, _elev)| *product != RadarProduct::StormRelativeVelocity);
+        self.render_cache.retain(|(_site, product, _view, _elev)| {
+            *product != RadarProduct::StormRelativeVelocity
+        });
         true
     }
 
@@ -395,7 +473,7 @@ impl RenderDispatcher {
             }
         }
         self.render_cache
-            .retain(|(s, product, _elev)| s != site || !hail(*product));
+            .retain(|(s, product, _view, _elev)| s != site || !hail(*product));
         true
     }
 
@@ -424,7 +502,8 @@ impl RenderDispatcher {
             }
         }
         self.level3_data.retain(|(_code, s), _| s != site);
-        self.render_cache.retain(|(s, _prod, _elev)| s != site);
+        self.render_cache
+            .retain(|(s, _prod, _view, _elev)| s != site);
     }
 
     /// The narrow counterpart to [`reset_panes_for_site`], for the real-time
@@ -467,8 +546,15 @@ impl RenderDispatcher {
         });
         // Only the tilts that changed. A whole-site `retain` would throw away the
         // images the untouched panes are still sharing.
-        self.render_cache.retain(|(s, _prod, elev)| {
-            s != site || !angles.iter().any(|a| elevation_key(*a) == *elev)
+        self.render_cache.retain(|(s, _prod, view, elev)| {
+            // Elevation-blind for the vertical views, whose slot is
+            // `NO_ELEVATION_SLOT` rather than a tilt: a completed cut changes
+            // what a section is cut from whatever tilt the pane names.
+            s != site
+                || !(match view {
+                    RenderView::PlanView => angles.iter().any(|a| elevation_key(*a) == *elev),
+                    RenderView::CrossSection | RenderView::Volume => true,
+                })
         });
         hit
     }
@@ -597,10 +683,11 @@ impl RenderDispatcher {
         &mut self,
         site: &str,
         product: RadarProduct,
+        view: RenderView,
         elevation: f32,
     ) -> Option<&CachedRenderOutput> {
         self.render_cache
-            .get(&(site.to_string(), product, elevation_key(elevation)))
+            .get(&render_cache_key(site, product, view, elevation))
     }
 
     /// Store a render result in the cache for sharing across panes.
@@ -608,13 +695,12 @@ impl RenderDispatcher {
         &mut self,
         site: &str,
         product: RadarProduct,
+        view: RenderView,
         elevation: f32,
         output: CachedRenderOutput,
     ) {
-        self.render_cache.insert(
-            (site.to_string(), product, elevation_key(elevation)),
-            output,
-        );
+        self.render_cache
+            .insert(render_cache_key(site, product, view, elevation), output);
     }
 }
 
@@ -970,8 +1056,14 @@ impl RenderDispatcher {
         // `deliver` carries the only other reference to it, which is also what
         // `want_result`'s `Arc::strong_count` pruning reads as "still running".
         let wanted = self.pane_render[pane_idx].want_result();
-        crate::offload::offload_job("radar-render", job, move |frame| {
+        crate::offload::offload_job("radar-render", job, move |output| {
             let _guard = guard;
+            // An output of another kind is `None` here — "nothing to draw",
+            // which every path below already handles. `RenderResponse` carries
+            // a square `IMAGE_SIZE` plan-view raster and `apply_render_to_pane`
+            // asserts that shape on the **main thread**, live in release: under
+            // wasm that panic aborts the whole app. See `JobOutput::frame`.
+            let frame = output.and_then(crate::offload::JobOutput::frame);
             // Sent whether or not there is a frame, because the receiver is what
             // clears `render_in_flight` and a pane that never hears back stops
             // dispatching. Still gated on `wanted`: an abandoned render must not
@@ -1513,8 +1605,20 @@ mod level3_dispatch_tests {
         d.pane_render[0].last_rendered = Some((RadarProduct::StormRelativeVelocity, 1.3));
         d.pane_render[1].last_rendered = Some((RadarProduct::Reflectivity, 0.5));
         d.pane_render[2].last_rendered = Some((RadarProduct::StormRelativeVelocity, 2.4));
-        d.cache_render("KMPX", RadarProduct::StormRelativeVelocity, 1.3, output());
-        d.cache_render("KMPX", RadarProduct::Reflectivity, 0.5, output());
+        d.cache_render(
+            "KMPX",
+            RadarProduct::StormRelativeVelocity,
+            rustdar_radar::types::RenderView::PlanView,
+            1.3,
+            output(),
+        );
+        d.cache_render(
+            "KMPX",
+            RadarProduct::Reflectivity,
+            rustdar_radar::types::RenderView::PlanView,
+            0.5,
+            output(),
+        );
 
         assert!(d.set_storm_motion_override(Some(
             StormMotionSample::user_override(30.0, 240.0).expect("finite")
@@ -1527,14 +1631,24 @@ mod level3_dispatch_tests {
         );
         assert_eq!(d.pane_render[2].last_rendered, None);
         assert!(
-            d.get_cached_render("KMPX", RadarProduct::StormRelativeVelocity, 1.3)
-                .is_none(),
+            d.get_cached_render(
+                "KMPX",
+                RadarProduct::StormRelativeVelocity,
+                rustdar_radar::types::RenderView::PlanView,
+                1.3
+            )
+            .is_none(),
             "the shared cache is keyed on (site, product, elevation), which the vector is \
              not part of, so a stale entry would be handed straight back",
         );
         assert!(
-            d.get_cached_render("KMPX", RadarProduct::Reflectivity, 0.5)
-                .is_some()
+            d.get_cached_render(
+                "KMPX",
+                RadarProduct::Reflectivity,
+                rustdar_radar::types::RenderView::PlanView,
+                0.5
+            )
+            .is_some()
         );
     }
 
@@ -1574,6 +1688,7 @@ mod render_cache_tests {
         (
             site.to_string(),
             RadarProduct::Reflectivity,
+            RenderView::PlanView,
             elevation_tenths,
         )
     }
@@ -1659,7 +1774,7 @@ mod render_cache_tests {
         cache.insert(key("KOUN", 1), output(1.0));
         cache.insert(key("KTLX", 2), output(2.0));
 
-        cache.retain(|(site, _, _)| site != "KTLX");
+        cache.retain(|(site, _, _, _)| site != "KTLX");
 
         assert_eq!(cache.entry_count(), 1);
         assert_eq!(cache.recency_order(), vec![key("KOUN", 1)]);
@@ -1717,14 +1832,31 @@ mod render_cache_tests {
             sites.len()
         );
 
+        // A full screen of panes, each on its own site *and each a different
+        // view*, cycling so a mixed screen is what is measured. The view axis
+        // was the open question when it was added: a pane still wants exactly
+        // one entry whatever it shows, so `capacity >= pane_count` is still the
+        // whole invariant — what the axis removed is the *wrong* sharing
+        // between a plan view and a section of the same product, not headroom.
+        // Asserting it over mixed views is what says so.
+        let views = RenderView::all();
+        let view_of = |i: usize| views[i % views.len()];
+
         let mut dispatcher = RenderDispatcher::new();
         for (i, site) in sites.iter().enumerate() {
-            dispatcher.cache_render(site, RadarProduct::Reflectivity, 0.5, output(i as f64));
+            dispatcher.cache_render(
+                site,
+                RadarProduct::Reflectivity,
+                view_of(i),
+                0.5,
+                output(i as f64),
+            );
         }
 
         // A full screen of panes, each on its own site: none may have evicted another.
         for (i, site) in sites.iter().enumerate() {
-            let hit = dispatcher.get_cached_render(site, RadarProduct::Reflectivity, 0.5);
+            let hit =
+                dispatcher.get_cached_render(site, RadarProduct::Reflectivity, view_of(i), 0.5);
             let Some(hit) = hit else {
                 panic!(
                     "{site} was evicted with only {} panes' worth cached",
@@ -1736,6 +1868,119 @@ mod render_cache_tests {
                 "{site} came back as another pane's render"
             );
         }
+    }
+
+    /// The collision the view axis exists to stop: one site, one product, one
+    /// elevation, two views.
+    ///
+    /// Without the axis the second `cache_render` overwrites the first and the
+    /// plan-view pane is handed the section's buffers — which is not a wrong
+    /// picture but `ColorImage::from_rgba_unmultiplied`'s `assert_eq!` on the
+    /// main thread, live in release, aborting the whole app under wasm.
+    #[test]
+    fn two_views_of_one_product_do_not_share_an_entry() {
+        let mut d = RenderDispatcher::new();
+        d.cache_render(
+            "KTLX",
+            RadarProduct::Reflectivity,
+            RenderView::PlanView,
+            0.5,
+            output(1.0),
+        );
+        d.cache_render(
+            "KTLX",
+            RadarProduct::Reflectivity,
+            RenderView::CrossSection,
+            0.5,
+            output(2.0),
+        );
+        assert_eq!(
+            d.get_cached_render(
+                "KTLX",
+                RadarProduct::Reflectivity,
+                RenderView::PlanView,
+                0.5
+            )
+            .map(|c| c.max_range_km),
+            Some(1.0),
+            "the section overwrote the plan view",
+        );
+        assert_eq!(
+            d.get_cached_render(
+                "KTLX",
+                RadarProduct::Reflectivity,
+                RenderView::CrossSection,
+                0.5,
+            )
+            .map(|c| c.max_range_km),
+            Some(2.0),
+        );
+    }
+
+    /// A vertical view has no elevation, so every tilt selection maps to one
+    /// entry — and that is only safe because the *view* is what keeps it apart
+    /// from a real 0.0° plan render, which no `i32` sentinel could have done.
+    #[test]
+    fn a_vertical_view_ignores_the_elevation_and_still_misses_the_plan_view() {
+        let mut d = RenderDispatcher::new();
+        d.cache_render(
+            "KTLX",
+            RadarProduct::Reflectivity,
+            RenderView::CrossSection,
+            3.4,
+            output(7.0),
+        );
+        assert_eq!(
+            d.get_cached_render(
+                "KTLX",
+                RadarProduct::Reflectivity,
+                RenderView::CrossSection,
+                19.5,
+            )
+            .map(|c| c.max_range_km),
+            Some(7.0),
+            "a section was keyed by a tilt it does not have",
+        );
+        assert!(
+            d.get_cached_render(
+                "KTLX",
+                RadarProduct::Reflectivity,
+                RenderView::PlanView,
+                0.0,
+            )
+            .is_none(),
+            "the section's viewless elevation slot collided with a real 0.0 plan render",
+        );
+    }
+
+    /// The whole-volume predicate is the `||` of its two named halves, for
+    /// every (view, product) pair there is — so neither half can be dropped and
+    /// no third copy can grow.
+    #[test]
+    fn the_whole_volume_predicate_is_both_halves() {
+        let mut saw_view_only = false;
+        for &view in RenderView::all() {
+            for &product in RadarProduct::all() {
+                assert_eq!(
+                    needs_whole_volume(view, product),
+                    view.reads_whole_volume() || product.reads_whole_volume(),
+                );
+                // The pair the product half alone gets wrong: a section of a
+                // one-sweep product.
+                if view.reads_whole_volume() && !product.reads_whole_volume() {
+                    assert!(needs_whole_volume(view, product));
+                    saw_view_only = true;
+                }
+            }
+        }
+        assert!(
+            saw_view_only,
+            "no (view, product) pair needs the volume for the view's sake alone,              so this says nothing about why both halves are asked",
+        );
+        assert!(
+            !needs_whole_volume(RenderView::PlanView, RadarProduct::Reflectivity),
+            "the predicate answers true for everything, which is safe and vacuous",
+        );
     }
 }
 
@@ -1761,7 +2006,9 @@ mod render_invalidation_tests {
             release,
             crate::offload::Job::Opaque(Box::new(move || {
                 held.recv().expect("every gated render is released");
-                Some((Vec::new(), 230.0, Vec::new()).into())
+                Some(crate::offload::JobOutput::Frame(
+                    (Vec::new(), 230.0, Vec::new()).into(),
+                ))
             })),
         )
     }
@@ -1827,8 +2074,20 @@ mod render_invalidation_tests {
         );
 
         d.pane_render[0].last_rendered = Some((RadarProduct::ProbabilityOfSevereHail, 0.5));
-        d.cache_render("KTLX", RadarProduct::MaxExpectedHailSize, 0.5, cached(1.0));
-        d.cache_render("KTLX", RadarProduct::Reflectivity, 0.5, cached(2.0));
+        d.cache_render(
+            "KTLX",
+            RadarProduct::MaxExpectedHailSize,
+            rustdar_radar::types::RenderView::PlanView,
+            0.5,
+            cached(1.0),
+        );
+        d.cache_render(
+            "KTLX",
+            RadarProduct::Reflectivity,
+            rustdar_radar::types::RenderView::PlanView,
+            0.5,
+            cached(2.0),
+        );
 
         assert!(
             !d.set_env_heights("KTLX", heights(4.2, 7.1), &gui),
@@ -1855,14 +2114,24 @@ mod render_invalidation_tests {
             "a hail pane drawn against the old pair has to be redrawn",
         );
         assert!(
-            d.get_cached_render("KTLX", RadarProduct::MaxExpectedHailSize, 0.5)
-                .is_none(),
+            d.get_cached_render(
+                "KTLX",
+                RadarProduct::MaxExpectedHailSize,
+                rustdar_radar::types::RenderView::PlanView,
+                0.5
+            )
+            .is_none(),
             "the shared cache is keyed on (site, product, elevation), which \
              the environment is not part of",
         );
         assert!(
-            d.get_cached_render("KTLX", RadarProduct::Reflectivity, 0.5)
-                .is_some(),
+            d.get_cached_render(
+                "KTLX",
+                RadarProduct::Reflectivity,
+                rustdar_radar::types::RenderView::PlanView,
+                0.5
+            )
+            .is_some(),
             "an unrelated product keeps its frame",
         );
     }
@@ -2242,7 +2511,13 @@ mod render_invalidation_tests {
             // the site at the angles it was given, whatever the pane is showing —
             // so an entry seeded earlier would already be gone and the assertion
             // below would pass without the site reset doing anything.
-            d.cache_render("KOUN", product, 0.5, cached(1.0));
+            d.cache_render(
+                "KOUN",
+                product,
+                rustdar_radar::types::RenderView::PlanView,
+                0.5,
+                cached(1.0),
+            );
 
             d.reset_panes_for_site("KOUN", &gui);
 
@@ -2252,7 +2527,13 @@ mod render_invalidation_tests {
                  site reset either, so nothing refreshes it while the site is live",
             );
             assert!(
-                d.get_cached_render("KOUN", product, 0.5).is_none(),
+                d.get_cached_render(
+                    "KOUN",
+                    product,
+                    rustdar_radar::types::RenderView::PlanView,
+                    0.5
+                )
+                .is_none(),
                 "{product:?}'s stale image survived the site reset, so the pane \
                  re-renders straight back into it",
             );
@@ -2275,18 +2556,40 @@ mod render_invalidation_tests {
         let gui = gui_on_tilt("KOUN", RadarProduct::Reflectivity, 0.5, &[0.5, 4.0]);
         let mut d = RenderDispatcher::new();
         d.ensure_pane_count(1);
-        d.cache_render("KOUN", RadarProduct::Reflectivity, 0.5, cached(1.0));
-        d.cache_render("KOUN", RadarProduct::Reflectivity, 4.0, cached(2.0));
+        d.cache_render(
+            "KOUN",
+            RadarProduct::Reflectivity,
+            rustdar_radar::types::RenderView::PlanView,
+            0.5,
+            cached(1.0),
+        );
+        d.cache_render(
+            "KOUN",
+            RadarProduct::Reflectivity,
+            rustdar_radar::types::RenderView::PlanView,
+            4.0,
+            cached(2.0),
+        );
 
         d.reset_panes_for_tilts("KOUN", &gui, &[0.5]);
         assert!(
-            d.get_cached_render("KOUN", RadarProduct::Reflectivity, 0.5)
-                .is_none(),
+            d.get_cached_render(
+                "KOUN",
+                RadarProduct::Reflectivity,
+                rustdar_radar::types::RenderView::PlanView,
+                0.5
+            )
+            .is_none(),
             "the completed tilt's stale image survived"
         );
         assert!(
-            d.get_cached_render("KOUN", RadarProduct::Reflectivity, 4.0)
-                .is_some(),
+            d.get_cached_render(
+                "KOUN",
+                RadarProduct::Reflectivity,
+                rustdar_radar::types::RenderView::PlanView,
+                4.0
+            )
+            .is_some(),
             "an untouched tilt's image was evicted with it"
         );
     }

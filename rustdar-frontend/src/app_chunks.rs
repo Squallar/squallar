@@ -1230,6 +1230,7 @@ mod volume_close_tests {
         app.render.cache_render(
             "KTLX",
             product,
+            rustdar_radar::types::RenderView::PlanView,
             0.5,
             CachedRenderOutput {
                 image_data: Arc::new(Vec::new()),
@@ -1267,7 +1268,14 @@ mod volume_close_tests {
                  dies"
             );
             assert!(
-                app.render.get_cached_render("KTLX", product, 0.5).is_none(),
+                app.render
+                    .get_cached_render(
+                        "KTLX",
+                        product,
+                        rustdar_radar::types::RenderView::PlanView,
+                        0.5
+                    )
+                    .is_none(),
                 "{product:?}: the previous volume's image survived the reset, so \
                  the pane re-renders straight back into it"
             );

@@ -226,9 +226,16 @@ impl super::App {
                 .pane(origin_pane)
                 .map(|p| p.site.clone())
                 .unwrap_or_default();
+            // `RenderView::PlanView` because this is the plan-view path and
+            // only the plan-view path: `dispatch_pane_renders` starts no render
+            // for a non-map pane, and `CachedRenderOutput` is an `IMAGE_SIZE`
+            // square raster by construction. The axis exists so a section
+            // cached later cannot be handed to this consumer — see
+            // `RenderCacheKey`.
             self.render.cache_render(
                 &origin_site,
                 render_result.product,
+                rustdar_radar::types::RenderView::PlanView,
                 render_result.elevation,
                 crate::render_dispatch::CachedRenderOutput {
                     image_data: Arc::clone(&render_result.image_data),
@@ -621,10 +628,15 @@ impl super::App {
                         .unwrap_or_default();
 
                     // Check if another pane already rendered this site+product+elevation
-                    if let Some(cached) = self
-                        .render
-                        .get_cached_render(&pane_site, product, elevation)
-                    {
+                    // Plan view, and only plan view — see the matching
+                    // `cache_render` above. A pane of another kind never
+                    // reaches here.
+                    if let Some(cached) = self.render.get_cached_render(
+                        &pane_site,
+                        product,
+                        rustdar_radar::types::RenderView::PlanView,
+                        elevation,
+                    ) {
                         let render_result = crate::render_dispatch::CachedPaneRender {
                             image_data: Arc::clone(&cached.image_data),
                             max_range_km: cached.max_range_km,
@@ -4625,8 +4637,13 @@ mod pane_kind_render_filter_tests {
     fn the_dispatcher_skips_a_pane_with_no_plan_view() {
         for kind in [PaneKind::CrossSection, PaneKind::Volume] {
             let mut app = app_on_site();
-            app.render
-                .cache_render(SITE, PRODUCT, TILT, cached_output());
+            app.render.cache_render(
+                SITE,
+                PRODUCT,
+                rustdar_radar::types::RenderView::PlanView,
+                TILT,
+                cached_output(),
+            );
 
             app.dispatch_pane_renders(&egui::Context::default());
             assert!(
@@ -4641,8 +4658,13 @@ mod pane_kind_render_filter_tests {
             );
 
             let mut app = app_on_site();
-            app.render
-                .cache_render(SITE, PRODUCT, TILT, cached_output());
+            app.render.cache_render(
+                SITE,
+                PRODUCT,
+                rustdar_radar::types::RenderView::PlanView,
+                TILT,
+                cached_output(),
+            );
             app.gui.pane_mut(0).unwrap().set_kind(kind);
 
             app.dispatch_pane_renders(&egui::Context::default());
@@ -5022,8 +5044,13 @@ mod pane_kind_render_filter_tests {
     fn the_cached_render_restore_skips_a_pane_with_no_plan_view() {
         for kind in [PaneKind::CrossSection, PaneKind::Volume] {
             let mut app = app_on_site();
-            app.render
-                .cache_render(SITE, PRODUCT, TILT, cached_output());
+            app.render.cache_render(
+                SITE,
+                PRODUCT,
+                rustdar_radar::types::RenderView::PlanView,
+                TILT,
+                cached_output(),
+            );
             app.dispatch_pane_renders(&egui::Context::default());
             assert!(
                 app.render.pane_render[0].cached_render.is_some(),
