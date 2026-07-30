@@ -1629,9 +1629,30 @@ impl Gui {
     /// Return the pane indices that loop actions should target.
     /// When `sync_layers` is on and there are multiple panes, returns all pane indices;
     /// otherwise returns only the active pane.
+    ///
+    /// Panes with no plan view are left out. A loop is a sequence of rendered
+    /// plan-view tilts, and `dispatch_loop_renders` no longer feeds a non-map
+    /// pane — so enabling the loop with sync on would otherwise put every
+    /// section and volume pane into `is_active()` with a frame list nothing ever
+    /// fills, which is a spinner in the loop transport that never finishes and a
+    /// download queue serving nobody.
+    ///
+    /// The active pane is a target unconditionally and is deliberately **never
+    /// tested**. This runs from inside `render_loop_controls`, which the layers
+    /// panel calls while the active pane is held out by `mem::take` — so
+    /// `self.panes[self.active_pane]` is a default `PaneState`, a *map* pane
+    /// whatever the real one is. Reading `is_map()` off that slot would be
+    /// reading the placeholder, and it would agree with reality only by
+    /// coincidence (the loop control is drawn for map panes only). Including the
+    /// index without asking is correct either way: it is the pane whose own
+    /// checkbox was clicked.
     fn loop_sync_targets(&self) -> Vec<usize> {
         if self.sync_layers && self.pane_layout.pane_count > 1 {
-            (0..self.pane_layout.pane_count).collect()
+            (0..self.pane_layout.pane_count)
+                .filter(|&idx| {
+                    idx == self.active_pane || self.panes.get(idx).is_none_or(PaneState::is_map)
+                })
+                .collect()
         } else {
             vec![self.active_pane]
         }
@@ -1660,6 +1681,31 @@ impl Gui {
 
     /// Propagate layer settings from the active pane to all others (when sync is enabled).
     /// Also converges site and scan_info so all panes display the same radar site.
+    ///
+    /// # `content` is deliberately not one of the fields
+    ///
+    /// `PaneContent` derives `Clone`, so copying it costs nothing and the
+    /// omission is a decision rather than a limitation. What sync means here is
+    /// *what every pane is looking at* — the same radar, the same volume, the
+    /// same moment, the same time — and a pane's **kind** is not that. It is how
+    /// this pane presents it.
+    ///
+    /// Copying it would defeat the feature outright: a user splits the screen and
+    /// converts pane 2 to a 3D view precisely in order to see the volume
+    /// *alongside* the plan view on pane 1. Propagating the kind would convert
+    /// pane 1 as well, leaving two identical 3D panes and no map — from a
+    /// setting called "Sync Layers", with nothing to say what happened.
+    ///
+    /// The consequence, accepted: synced panes disagree about kind, and
+    /// per-kind state (a section's line, a volume's camera) is per pane. That is
+    /// the intended reading. Each still converges on site, scan, product,
+    /// elevation, live-or-parked, step and overlays, so the *subject* is shared
+    /// and only the presentation differs.
+    ///
+    /// `selected_elevation` is propagated to non-map panes too, even though a
+    /// whole-volume pane has no tilt. It is inert there rather than wrong, and
+    /// keeping it means a pane converted back to a map lands on the tilt its
+    /// siblings are showing instead of on whatever it held before.
     fn propagate_layer_sync(&mut self) {
         if !self.sync_layers || self.pane_layout.pane_count <= 1 {
             return;
@@ -1675,7 +1721,9 @@ impl Gui {
         let active_selected_product = src.selected_product;
         let active_selected_elevation = src.selected_elevation;
 
-        // Sync per-pane fields including enabled overlays, configs, and radar product/elevation.
+        // Sync per-pane fields including enabled overlays, configs, and radar
+        // product/elevation. Not `content`: see the note on this function for
+        // why the pane's kind is the one field sync deliberately leaves alone.
         for (idx, p) in self.panes.iter_mut().enumerate() {
             if idx == self.active_pane {
                 continue;
@@ -1786,6 +1834,43 @@ impl Gui {
     /// Get a specific pane by index (mutable), or `None` if out of bounds.
     pub fn pane_mut(&mut self, idx: usize) -> Option<&mut PaneState> {
         self.panes.get_mut(idx)
+    }
+
+    /// Whether pane `idx` is a pane the **plan-view** pipeline must skip: it
+    /// exists, and it is not a map.
+    ///
+    /// One predicate for the four frontend loops that dispatch, cache or
+    /// broadcast a plan-view raster (`dispatch_pane_renders`, the sibling
+    /// broadcast in `poll_render_results`, and both halves of
+    /// `dispatch_loop_renders`). Named once because those four have to agree:
+    /// a pane that is dispatched but not broadcast to, or broadcast to but never
+    /// dispatched, is a pane wedged with `render_in_flight` set forever.
+    ///
+    /// Written in the negative on purpose. An index past the end answers
+    /// `false` — "not a pane to skip" — which leaves out-of-range handling
+    /// exactly where each caller already had it, rather than folding a second,
+    /// different question into this one. `dispatch_pane_renders` in particular
+    /// iterates the layout's raw `pane_count`, which can outrun the vector, and
+    /// its own `else` branch is what deals with that.
+    ///
+    /// The `mem::take` caveat on [`Self::pane`] applies in full: during the UI
+    /// pass a taken pane reads as a map. Every caller of this runs from the
+    /// frontend's frame loop, outside the egui pass, which is what makes it
+    /// safe — see [`PaneContent`](crate::pane::PaneContent)'s module docs.
+    pub fn pane_has_no_plan_view(&self, idx: PaneId) -> bool {
+        self.pane(idx).is_some_and(|pane| !pane.is_map())
+    }
+
+    /// Whether pane `idx` needs every cut of its site's volume rather than the
+    /// one tilt it has selected, because of *what kind of pane it is*.
+    ///
+    /// The view-side half of the whole-volume safety property;
+    /// [`RadarProduct::reads_whole_volume`] is the data-side half, and
+    /// `App::cut_selection_for` has to honour both. An index past the end needs
+    /// nothing.
+    pub fn pane_consumes_whole_volume(&self, idx: PaneId) -> bool {
+        self.pane(idx)
+            .is_some_and(|pane| pane.kind().consumes_whole_volume())
     }
 
     /// Get the rendering params for a specific pane.
@@ -2177,6 +2262,25 @@ impl Gui {
     /// Bounded by [`Self::visible_pane_count`], not the layout's raw count:
     /// hidden panes are neither read as a sync source nor written to, and a
     /// count that ran ahead of the vector cannot index past its end.
+    ///
+    /// # Why panes with no map are excluded from both ends
+    ///
+    /// This is the all-panes site a non-map pane breaks the moment one can
+    /// exist, and it breaks it in the direction that looks like a bug in the
+    /// *other* panes. Every pane carries a `map_memory` whatever its kind —
+    /// they are flat fields, deliberately — and `render_panes` resolves the
+    /// active pane's pointer through `InteractionState::resolve_active`, which
+    /// on the touch path hands that `map_memory` to `TouchGestures::update` and
+    /// lets it write a zoom. So a double-tap-drag on a section pane moves a
+    /// viewport nothing is drawing, this function then picks that pane as the
+    /// **source** because it is the first whose zoom changed, and every map pane
+    /// on screen is re-centred and re-zoomed to it. `viewport_sync` defaults
+    /// **on**, so that is the shipped default behaviour, not an opt-in.
+    ///
+    /// Excluded as a *target* as well, for a quieter reason: a converted pane's
+    /// viewport is what it comes back to when it is converted back to a map, and
+    /// it is persisted per pane. Overwriting it would silently move a map the
+    /// user is not looking at yet.
     fn sync_viewports(&mut self, pre_zooms: &[f64], pre_positions: &[Option<walkers::Position>]) {
         let pane_count = self.visible_pane_count();
         if !self.viewport_sync || pane_count <= 1 {
@@ -2184,6 +2288,9 @@ impl Gui {
         }
         let mut source_idx = None;
         for idx in 0..pane_count {
+            if !self.panes[idx].is_map() {
+                continue;
+            }
             if idx < pre_zooms.len() {
                 let zoom_diff = (self.panes[idx].map_memory.zoom() - pre_zooms[idx]).abs();
                 if zoom_diff > 0.0001 {
@@ -2205,11 +2312,23 @@ impl Gui {
                 }
             }
         }
-        let src = source_idx.unwrap_or(self.active_pane);
+        // Nothing moved, so the active pane holds the others where they are —
+        // unless it has no map, in which case its `map_memory` is not a viewport
+        // anyone is looking at and there is nothing to propagate. Returning is
+        // the whole point: `unwrap_or(self.active_pane)` on its own would make a
+        // non-map active pane the source on every frame, which is the same
+        // failure as the source scan above with no interaction needed at all.
+        let Some(src) = source_idx.or_else(|| {
+            self.panes[self.active_pane]
+                .is_map()
+                .then_some(self.active_pane)
+        }) else {
+            return;
+        };
         let zoom = self.panes[src].map_memory.zoom();
         let pos = self.panes[src].map_memory.detached();
         for idx in 0..pane_count {
-            if idx != src {
+            if idx != src && self.panes[idx].is_map() {
                 let _ = self.panes[idx].map_memory.set_zoom(zoom);
                 if let Some(p) = pos {
                     self.panes[idx].map_memory.center_at(p);
@@ -2364,6 +2483,159 @@ mod pane_slice_tests {
             gui.pane(0).unwrap().map_memory.zoom(),
             gui.pane(1).unwrap().map_memory.zoom(),
         );
+    }
+
+    /// A pane with no map neither drives the shared viewport nor follows it.
+    ///
+    /// This is the all-panes site that goes live the instant a non-map pane can
+    /// exist, and it fails in the direction that looks like a bug in the *other*
+    /// panes. `render_panes` hands the active pane's `map_memory` to
+    /// `InteractionState::resolve_active` whatever kind the pane is, and on the
+    /// touch path `TouchGestures::update` writes a zoom into it — so a
+    /// double-tap-drag on a section pane moves a viewport nothing draws.
+    /// Unfiltered, `sync_viewports` then reads that pane as the **source**,
+    /// because it is the first whose zoom moved, and re-centres and re-zooms
+    /// every map pane on screen. `viewport_sync` defaults *on*, so this is the
+    /// shipped default rather than something a user opts into.
+    ///
+    /// Both directions are asserted, and each one fails on its own: the source
+    /// scan skipping non-map panes, and the write loop skipping them. The second
+    /// matters because a converted pane's viewport is what it comes back to —
+    /// `a_converted_pane_keeps_its_site_and_viewport` is the promise — and it is
+    /// persisted per pane.
+    #[test]
+    fn a_pane_with_no_map_neither_drives_nor_follows_the_shared_viewport() {
+        use crate::pane::PaneKind;
+
+        // Zoom 4.0 is `DEFAULT_PANE_ZOOM`; 4.0 +/- 2.0 is well inside walkers'
+        // accepted range, so `set_zoom` below cannot silently clamp and turn a
+        // real move into no move at all.
+        let moved_to = 6.0;
+        let untouched = 4.0;
+
+        let mut gui = Gui::new();
+        gui.set_pane_count_for_test(3);
+        gui.viewport_sync = true;
+        gui.pane_mut(1).unwrap().set_kind(PaneKind::CrossSection);
+        for idx in 0..3 {
+            assert_eq!(
+                gui.pane(idx).unwrap().map_memory.zoom(),
+                untouched,
+                "precondition: every pane starts at the same zoom"
+            );
+        }
+
+        // The gesture: the *section* pane's viewport moved and nobody else's,
+        // exactly as a double-tap-drag on it leaves things.
+        gui.pane_mut(1)
+            .unwrap()
+            .map_memory
+            .set_zoom(moved_to)
+            .expect("precondition: the test zoom must be in range");
+        assert_eq!(
+            gui.pane(1).unwrap().map_memory.zoom(),
+            moved_to,
+            "precondition: walkers clamped the test zoom, so nothing moved"
+        );
+
+        gui.sync_viewports(&[untouched; 3], &[None; 3]);
+
+        assert_eq!(
+            (0..3)
+                .map(|idx| gui.pane(idx).unwrap().map_memory.zoom())
+                .collect::<Vec<_>>(),
+            vec![untouched, moved_to, untouched],
+            "a gesture on a pane with no map re-zoomed the map panes to it"
+        );
+
+        // The same pane as the *target*: now a map pane moves, and the section
+        // pane must not be dragged along with the other map.
+        gui.pane_mut(0)
+            .unwrap()
+            .map_memory
+            .set_zoom(7.0)
+            .expect("in range");
+        gui.sync_viewports(&[untouched, moved_to, untouched], &[None; 3]);
+        assert_eq!(
+            (0..3)
+                .map(|idx| gui.pane(idx).unwrap().map_memory.zoom())
+                .collect::<Vec<_>>(),
+            vec![7.0, moved_to, 7.0],
+            "the section pane's own viewport was overwritten by the sync"
+        );
+    }
+
+    /// With nothing moved and a non-map pane active, there is no source at all.
+    ///
+    /// The fallback used to be `source_idx.unwrap_or(self.active_pane)`, which
+    /// made a non-map active pane the source on *every* frame — the same failure
+    /// as the source scan, reached with no interaction whatsoever, and therefore
+    /// the more likely of the two to be seen.
+    #[test]
+    fn a_non_map_active_pane_is_not_the_fallback_sync_source() {
+        use crate::pane::PaneKind;
+
+        let mut gui = Gui::new();
+        gui.set_pane_count_for_test(2);
+        gui.viewport_sync = true;
+        gui.pane_mut(1).unwrap().set_kind(PaneKind::Volume);
+        gui.active_pane = 1;
+
+        // Deliberately out of step with pane 0, and deliberately *not* reported
+        // as moved: `pre_zooms` says nothing changed this frame, so the only way
+        // this value can escape is through the no-source fallback.
+        gui.pane_mut(1)
+            .unwrap()
+            .map_memory
+            .set_zoom(9.0)
+            .expect("in range");
+
+        gui.sync_viewports(&[4.0, 9.0], &[None; 2]);
+
+        assert_eq!(
+            gui.pane(0).unwrap().map_memory.zoom(),
+            4.0,
+            "the active pane has no map, so its viewport propagated to a map \
+             pane that nothing had interacted with"
+        );
+    }
+
+    /// Loop actions never target a pane that draws no plan-view frames.
+    ///
+    /// A loop frame *is* a rendered plan-view tilt, and
+    /// `App::dispatch_loop_renders` skips panes with no plan view — so a
+    /// non-map pane in this list would be put into `is_active()` with a frame
+    /// list nothing ever fills: a loop transport stuck at "waiting", and a
+    /// download queue fetching volumes for a pane nobody is looking at.
+    ///
+    /// The active pane is included without being asked, which the second half
+    /// below pins. This runs from `render_loop_controls`, inside the layers
+    /// panel's `mem::take` window, where `self.panes[self.active_pane]` is a
+    /// default `PaneState` and therefore reads as a *map* whatever the real pane
+    /// is — so testing it would be testing the placeholder.
+    #[test]
+    fn loop_actions_skip_panes_that_draw_no_frames() {
+        use crate::pane::PaneKind;
+
+        let mut gui = Gui::new();
+        gui.set_pane_count_for_test(4);
+        gui.sync_layers = true;
+        gui.pane_mut(1).unwrap().set_kind(PaneKind::CrossSection);
+        gui.pane_mut(2).unwrap().set_kind(PaneKind::Volume);
+
+        assert_eq!(gui.loop_sync_targets(), vec![0, 3]);
+
+        // Sync off narrows to the active pane, whatever kind it is: it is the
+        // pane whose own checkbox was clicked.
+        gui.sync_layers = false;
+        gui.active_pane = 2;
+        assert_eq!(gui.loop_sync_targets(), vec![2]);
+
+        // And with sync back on, the active pane is still in the list even
+        // though its slot says it is not a map — because the index is included
+        // rather than tested.
+        gui.sync_layers = true;
+        assert_eq!(gui.loop_sync_targets(), vec![0, 2, 3]);
     }
 
     /// The graphics-state reset reaches panes of every kind, including the ones

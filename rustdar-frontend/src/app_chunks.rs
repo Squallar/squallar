@@ -86,23 +86,48 @@ impl super::App {
     ///
     /// The tilts its panes actually render — **unless** anything on the site
     /// shows a product [`rustdar_radar::types::RadarProduct::reads_whole_volume`]
-    /// names, in which case every cut is needed and the answer is `All`.
+    /// names, or *is* a pane whose kind
+    /// ([`PaneKind::consumes_whole_volume`](rustdar_egui::pane::PaneKind::consumes_whole_volume))
+    /// reads the whole ladder, in which case every cut is needed and the answer
+    /// is `All`.
     ///
-    /// That exception is the whole safety of selective download, and it is not
-    /// optional: every such product walks only the tilts *present* —
+    /// Those exceptions are the whole safety of selective download, and neither
+    /// is optional: every such product walks only the tilts *present* —
     /// `compute_echo_tops` clamps each column to the topmost one, a wind profile
     /// fits whatever velocity tilts it is handed — so all of them would read a
     /// volume that skipped cuts as a complete short one and produce a plausible,
     /// wrong answer with no error and no NaN to notice.
     ///
-    /// The predicate is deliberately not restated here. It was, once, and the
+    /// Neither predicate is restated here. The product one was, once, and the
     /// restatement omitted storm-relative velocity: SRV panes narrowed their
     /// site's feed to one tilt while SRV went on fitting its dealias seed and
     /// its default Bunkers vector from the volume's velocity tilts, whichever
     /// of them had happened to be downloaded.
     ///
-    /// A pane with no resolvable render params contributes nothing rather than
-    /// forcing `All`: it is showing nothing, so it needs nothing.
+    /// # Two questions, and both have to be asked
+    ///
+    /// The product question is "does this field integrate the column?"; the
+    /// pane-kind question is "does this view slice vertically?". A reflectivity
+    /// cross-section answers *no* to the first — it is one moment, the same
+    /// moment the plan view rasterizes — and *yes* to the second. So a copy of
+    /// this loop that asked only about the product would narrow the site's feed
+    /// to the section pane's nominal tilt and then let the section be
+    /// interpolated between whichever cuts happened to arrive. That is the worst
+    /// failure mode in the feature: a partial volume does not fail and does not
+    /// produce a NaN, it produces a smooth, plausible, wrong slice, and it looks
+    /// *better* than the truth because the gaps are bridged.
+    ///
+    /// The kind check is deliberately **above** the rendering-params guard below.
+    /// A whole-volume pane with no resolvable params — no scan info yet, or a
+    /// product whose elevations have not landed — contributes nothing under that
+    /// guard, so a sibling map pane on the same site would be left to narrow the
+    /// feed on its own and the section would be cut from what the *map* asked
+    /// for. That window is the whole time between converting a pane and its
+    /// volume arriving, which is exactly when the first section is cut.
+    ///
+    /// A pane with no resolvable render params and an ordinary map kind still
+    /// contributes nothing rather than forcing `All`: it is showing nothing, so
+    /// it needs nothing.
     fn cut_selection_for(&self, site: &str) -> rustdar_radar::chunks::CutSelection {
         use rustdar_radar::chunks::CutSelection;
 
@@ -110,6 +135,13 @@ impl super::App {
         for idx in 0..self.gui.pane_count() {
             if self.gui.pane(idx).is_none_or(|p| p.site != site) {
                 continue;
+            }
+            // The pane-kind half of the whole-volume question. See this
+            // function's own documentation for why it is asked here rather than
+            // after the params guard, and why answering only the product half
+            // silently mis-cuts a section.
+            if self.gui.pane_consumes_whole_volume(idx) {
+                return CutSelection::All;
             }
             let Some((product, elevation)) = self.gui.get_rendering_params_for_pane(idx) else {
                 continue;
@@ -518,7 +550,7 @@ mod tests {
 #[cfg(test)]
 mod selection_tests {
     use super::super::App;
-    use super::super::tests::headless;
+    use super::super::tests::{headless, two_pane_app};
     use crate::platform_double::TestBridge;
     use rustdar_radar::chunks::CutSelection;
     use rustdar_radar::types::{RadarProduct, ScanInfo};
@@ -626,6 +658,122 @@ mod selection_tests {
     // `#[cfg(test)]` inside `rustdar-egui` so it does not exist for this crate.
     // The single-pane tests above cover both branches of the decision, and the
     // loop returns `All` on the first volumetric pane it meets.
+
+    /// The other half of the whole-volume question: the pane's **kind**.
+    ///
+    /// This is the single place a live cross-section can go quietly wrong. The
+    /// product half above asks "does this field integrate the column?" and a
+    /// reflectivity section answers *no* — it is one moment, the same moment the
+    /// plan view rasterizes. The pane-kind half asks "does this view slice
+    /// vertically?", and there the answer is yes. Ask only the product and the
+    /// site's feed narrows to the section pane's nominal tilt, after which the
+    /// section is interpolated between whichever cuts happened to arrive: no
+    /// error, no NaN, and a smooth plausible layer where there is no data at all.
+    /// It looks *better* than the truth, which is what makes it the worst failure
+    /// mode in the feature.
+    ///
+    /// Driven with a product that is deliberately `Tilts`-worthy on its own —
+    /// asserted as a precondition — so the `All` below can only have come from
+    /// the kind.
+    #[test]
+    fn a_whole_volume_pane_kind_forces_the_whole_volume() {
+        use rustdar_egui::pane::PaneKind;
+
+        for kind in [PaneKind::CrossSection, PaneKind::Volume] {
+            let mut app = app_showing(RadarProduct::Reflectivity, 0.5, &[0.5, 1.5, 4.0]);
+            assert_eq!(
+                app.cut_selection_for("KTLX"),
+                CutSelection::Tilts(vec![0.5]),
+                "precondition: as a map pane this selection narrows the feed, so \
+                 the kind is the only thing that can widen it below"
+            );
+
+            app.gui.pane_mut(0).unwrap().set_kind(kind);
+
+            assert_eq!(
+                app.cut_selection_for("KTLX"),
+                CutSelection::All,
+                "{kind:?}: the feed was narrowed under a pane that reads every cut"
+            );
+        }
+    }
+
+    /// The kind is asked **before** the rendering-params guard, not after it.
+    ///
+    /// A whole-volume pane whose params do not resolve — no scan info yet, or a
+    /// product whose elevations have not landed — falls straight through that
+    /// guard contributing nothing. Behind the guard, a sibling map pane on the
+    /// same site is then left to narrow the feed on its own and the section gets
+    /// cut from whatever the *map* asked for. The window is the whole time
+    /// between converting a pane and its volume arriving, which is exactly when
+    /// the first section is cut.
+    ///
+    /// It needs **two** panes to bite, and that is why. With the section pane
+    /// alone, the tilt list ends up empty and the nothing-renderable fallback at
+    /// the bottom returns `All` anyway — so a single-pane version of this test
+    /// passes with the check on either side of the guard and proves nothing. It
+    /// takes a sibling supplying a real tilt for the ordering to be observable,
+    /// which is also precisely the arrangement a user is in.
+    #[test]
+    fn a_whole_volume_pane_with_no_scan_yet_still_forces_the_whole_volume() {
+        use rustdar_egui::pane::PaneKind;
+
+        let mut app = two_pane_app("KTLX", "KTLX");
+        // Pane 0: an ordinary map pane on KTLX with a resolvable tilt.
+        show(&mut app, RadarProduct::Reflectivity, 0.5, &[0.5, 1.5]);
+        // Pane 1: a section on the same site, still waiting for its scan.
+        app.gui
+            .pane_mut(1)
+            .unwrap()
+            .set_kind(PaneKind::CrossSection);
+        assert!(
+            app.gui.get_rendering_params_for_pane(1).is_none(),
+            "precondition: with no scan info the params guard is what this pane \
+             would otherwise hit"
+        );
+        assert!(
+            app.gui.get_rendering_params_for_pane(0).is_some(),
+            "precondition: the sibling must supply a tilt, or the empty-list \
+             fallback returns All whichever side of the guard the check is on"
+        );
+
+        assert_eq!(app.cut_selection_for("KTLX"), CutSelection::All);
+    }
+
+    /// A section pane on one site does not widen another site's feed.
+    ///
+    /// The kind check sits inside the per-site loop, *after* the site test.
+    /// Hoisted out of it — or written as "any pane anywhere is a section" — every
+    /// site in a multi-site layout would start downloading every cut the moment
+    /// one pane anywhere became a section, and the traffic saving the whole
+    /// selective feed exists for would be gone.
+    ///
+    /// Two panes, built through `Gui::load_ui_config`. That is the only public
+    /// route to a multi-pane `Gui` from this crate —
+    /// `Gui::set_pane_count_for_test` is `#[cfg(test)]` inside `rustdar-egui`, so
+    /// it does not exist here — and it is why the older tests in this module
+    /// could only cover the single-pane branches.
+    #[test]
+    fn a_whole_volume_pane_widens_only_its_own_site() {
+        use rustdar_egui::pane::PaneKind;
+
+        let mut app = two_pane_app("KTLX", "KOUN");
+        show(&mut app, RadarProduct::Reflectivity, 0.5, &[0.5, 1.5]);
+        app.gui
+            .pane_mut(1)
+            .unwrap()
+            .set_kind(PaneKind::CrossSection);
+        assert_eq!(
+            app.cut_selection_for("KTLX"),
+            CutSelection::Tilts(vec![0.5]),
+            "the section pane on KOUN widened KTLX's feed"
+        );
+
+        // The counterweight: the section pane's *own* site does widen, so the
+        // assertion above is about the site term rather than about a check that
+        // never fires.
+        assert_eq!(app.cut_selection_for("KOUN"), CutSelection::All);
+    }
 
     /// A site with nothing renderable takes everything rather than starving.
     #[test]

@@ -2565,6 +2565,42 @@ mod tests {
         );
     }
 
+    /// An app split into two panes, one on each named site.
+    ///
+    /// `Gui::load_ui_config` is the only route to a multi-pane `Gui` that is
+    /// public to this crate: `Gui::set_pane_count_for_test` is `#[cfg(test)]`
+    /// inside `rustdar-egui`, so it exists for that crate's own tests and nowhere
+    /// else — which is why the pane loops here could previously only be covered
+    /// on their single-pane branches. Going through the config loader is not a
+    /// workaround either: it is the path a returning user's saved layout takes.
+    pub(super) fn two_pane_app(first: &str, second: &str) -> App {
+        use rustdar_egui::config_store::{ConfigStore, UI_CONFIG_KEY};
+
+        let mut app = headless(TestBridge::desktop());
+        let store = MemoryConfigStore::default();
+        store
+            .store(
+                UI_CONFIG_KEY,
+                &format!(
+                    r#"{{"pane_count":2,"site":"{first}",
+                        "panes":[{{"site":"{first}"}},{{"site":"{second}"}}]}}"#
+                ),
+            )
+            .expect("the memory store always accepts a write");
+        assert!(
+            app.gui.load_ui_config(&store),
+            "the two-pane fixture config did not parse"
+        );
+        assert_eq!(
+            app.gui.pane_count(),
+            2,
+            "precondition: the fixture must really have two panes"
+        );
+        assert_eq!(app.gui.pane(1).map(|p| p.site.as_str()), Some(second));
+        app.render.ensure_pane_count(2);
+        app
+    }
+
     /// A scan carrying no sweeps.
     ///
     /// Nothing below reads a pixel: what is under test is whether a response was

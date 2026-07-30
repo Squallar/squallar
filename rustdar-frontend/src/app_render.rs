@@ -150,7 +150,15 @@ impl super::App {
         // Ensure pane_render vec matches gui pane count
         self.render.ensure_pane_count(self.gui.pane_count());
 
-        self.poll_render_results();
+        // The frame's egui context, resolved once. The two passes below that
+        // upload a plan-view texture are handed it rather than each reaching
+        // through `self.state` for a copy of their own: one `unwrap` on the
+        // renderer per frame instead of three, and it is what lets both of them
+        // be driven by a test against a bare `egui::Context`, which is all
+        // `Context::load_texture` has ever needed.
+        let ctx = self.state.as_ref().unwrap().egui_renderer.context().clone();
+
+        self.poll_render_results(&ctx);
         self.poll_level3_results();
         self.poll_overlay_render_results();
         self.poll_loop_scan_list_results();
@@ -159,20 +167,18 @@ impl super::App {
         self.poll_loop_l3_fetch_results();
         self.poll_loop_render_results();
         self.advance_loop_playback();
-        self.dispatch_pane_renders();
+        self.dispatch_pane_renders(&ctx);
         self.dispatch_loop_renders();
         self.update_loop_readiness();
 
         // Last, so this frame is laid out over everything applied above.
-        let ctx = self.state.as_ref().unwrap().egui_renderer.context().clone();
         let gui_action = self.gui.ui(&ctx);
 
         (size_in_pixels, gui_action)
     }
 
     /// Poll for completed background render results and upload textures.
-    fn poll_render_results(&mut self) {
-        let ctx = self.state.as_ref().unwrap().egui_renderer.context().clone();
+    fn poll_render_results(&mut self, ctx: &egui::Context) {
         while let Ok(rr) = self.channels.render_receiver.try_recv() {
             if rr.pane_idx < self.render.pane_render.len() {
                 self.render.pane_render[rr.pane_idx].render_in_flight = false;
@@ -231,13 +237,34 @@ impl super::App {
                 },
             );
 
-            // Apply to the originating pane
-            self.apply_render_to_pane(&ctx, origin_pane, &render_result);
+            // Apply to the originating pane — unless it stopped being a map
+            // while this render was in flight. `dispatch_pane_renders` no longer
+            // starts one for a non-map pane, but a conversion after dispatch is
+            // a live race, and the result would land as a plan-view texture on
+            // a pane that draws none. `render_in_flight` was already cleared
+            // above, and `last_rendered` stays unset, so converting back
+            // re-dispatches.
+            if !self.gui.pane_has_no_plan_view(origin_pane) {
+                self.apply_render_to_pane(ctx, origin_pane, &render_result);
+            }
 
-            // Broadcast to sibling panes that need the same site+product+elevation
+            // Broadcast to sibling panes that need the same site+product+elevation.
+            //
+            // The test is on site, product and elevation with **no view term**,
+            // because nothing renders anything but a plan view yet: every
+            // `RenderResponse` in the channel is a plan-view raster, so the
+            // receiving pane's kind is the whole of the question. When a section
+            // render exists it will also have to be keyed on the *result's* view
+            // — a pane and a result can both be sections and still disagree
+            // about which — and that arrives with `RenderCacheKey`'s view axis in
+            // WP-G. Until then a view term here would compare a constant against
+            // a constant.
             let pane_count = self.gui.pane_count();
             for other_idx in 0..pane_count {
                 if other_idx == origin_pane {
+                    continue;
+                }
+                if self.gui.pane_has_no_plan_view(other_idx) {
                     continue;
                 }
                 let matches_site = self
@@ -264,7 +291,7 @@ impl super::App {
                             })
                             .unwrap_or(true);
                     if needs {
-                        self.apply_render_to_pane(&ctx, other_idx, &render_result);
+                        self.apply_render_to_pane(ctx, other_idx, &render_result);
                     }
                 }
             }
@@ -558,13 +585,24 @@ impl super::App {
     }
 
     /// Check all panes for needed background renders and spawn render threads.
-    fn dispatch_pane_renders(&mut self) {
-        let ctx = self.state.as_ref().unwrap().egui_renderer.context().clone();
+    fn dispatch_pane_renders(&mut self, ctx: &egui::Context) {
         // Editing the vector changes nothing else about a pane, so the derived
         // storm-relative tilts have to be invalidated explicitly.
         let storm_motion = self.gui.storm_motion_override.sample();
         self.render.set_storm_motion_override(storm_motion);
         for pane_idx in 0..self.gui.pane_count() {
+            // Ahead of the rendering-params branch, not inside it. A pane with
+            // no plan view still has a product and an elevation selected —
+            // they are flat fields — so it would take the `if` arm and buy a
+            // full `IMAGE_SIZE` x `IMAGE_SIZE` RGBA image plus an equally large
+            // `f32` value grid, per pane per selection change, that nothing
+            // draws. Under the `else` arm it would instead have its radar
+            // texture torn down, which is a wasted upload on the way back.
+            // Skipping outright leaves whatever it had as a map pane in place,
+            // so converting back to a map is instant and needs no re-render.
+            if self.gui.pane_has_no_plan_view(pane_idx) {
+                continue;
+            }
             if let Some((product, elevation)) = self.gui.get_rendering_params_for_pane(pane_idx) {
                 let prs = &self.render.pane_render[pane_idx];
                 let needs_render = prs
@@ -600,7 +638,7 @@ impl super::App {
                             product,
                             elevation
                         );
-                        self.apply_render_to_pane(&ctx, pane_idx, &render_result);
+                        self.apply_render_to_pane(ctx, pane_idx, &render_result);
                         continue;
                     }
 
@@ -1310,12 +1348,29 @@ impl super::App {
 
     /// Dispatch renders for loop frames around the playhead that have
     /// downloaded scan data but no rendered texture yet.
+    ///
+    /// Both loops below skip panes with no plan view
+    /// ([`Gui::pane_has_no_plan_view`](rustdar_egui::Gui::pane_has_no_plan_view)).
+    /// A loop frame *is* a rendered plan-view tilt, so there is nothing to
+    /// dispatch for a section or a volume pane and nothing to clone into one —
+    /// and the first loop's replan would otherwise start a download queue for a
+    /// pane nobody is drawing. `loop_sync_targets` keeps such a pane out of the
+    /// enable action in the first place; this is the other half, for the pane
+    /// that was converted while its loop was already running.
+    ///
+    /// Such a pane keeps its frame list and its textures rather than having them
+    /// dropped, which is the same choice `dispatch_pane_renders` makes about the
+    /// static image: converting back to a map resumes instantly. They are
+    /// released with everything else by `Gui::clear_graphics_state`.
     fn dispatch_loop_renders(&mut self) {
         // Panes whose product moved to another datasource, so the frames now need
         // bytes nothing is fetching. Collected here and acted on below, because
         // re-deriving a queue needs `loop_mgr` while the pane is borrowed.
         let mut replan: Vec<(usize, rustdar_radar::types::RadarProduct)> = Vec::new();
         for pane_idx in 0..self.gui.pane_count() {
+            if self.gui.pane_has_no_plan_view(pane_idx) {
+                continue;
+            }
             let Some(pane) = self.gui.pane_mut(pane_idx) else {
                 continue;
             };
@@ -1379,6 +1434,9 @@ impl super::App {
         let pane_count = self.gui.pane_count();
 
         for pane_idx in 0..pane_count {
+            if self.gui.pane_has_no_plan_view(pane_idx) {
+                continue;
+            }
             let Some(pane) = self.gui.pane(pane_idx) else {
                 continue;
             };
@@ -4357,5 +4415,401 @@ mod sounding_poll_tests {
             !app.render.env_heights.contains_key(SITE),
             "a sounding from a superseded fetch generation was stored",
         );
+    }
+}
+
+/// The plan-view render pipeline against a pane that has no plan view.
+///
+/// Four production loops dispatch, cache or broadcast a full-size plan-view
+/// raster, and every one of them reads a pane's `selected_product` and
+/// `selected_elevation` — flat fields a section or a volume pane carries exactly
+/// as a map pane does. So none of them *fails* on a non-map pane. Each one
+/// quietly buys an `IMAGE_SIZE` x `IMAGE_SIZE` RGBA image plus an equally large
+/// `f32` value grid, uploads a texture, and hands it to a pane that draws none.
+///
+/// The four have to agree with each other as well as with reality, which is why
+/// they share one predicate ([`Gui::pane_has_no_plan_view`]): a pane that is
+/// dispatched to but never broadcast to, or broadcast to but never dispatched,
+/// is a pane wedged with `render_in_flight` set for the life of the session.
+///
+/// [`Gui::pane_has_no_plan_view`]: rustdar_egui::Gui::pane_has_no_plan_view
+#[cfg(test)]
+mod pane_kind_render_filter_tests {
+    use super::*;
+    use crate::app::tests::{empty_scan, headless, two_pane_app};
+    use crate::loop_downloads::LoopDownloadManager;
+    use crate::platform_double::TestBridge;
+    use rustdar_egui::pane::{LoopFrame, LoopPhase, LoopPlaybackState, PaneKind};
+    use rustdar_overlays::render::overlay_state::OverlayKind;
+    use rustdar_radar::sites::RadarSite;
+    use rustdar_radar::types::RadarProduct;
+
+    const SITE: &str = "KTLX";
+    const PRODUCT: RadarProduct = RadarProduct::Reflectivity;
+    const TILT: f32 = 0.5;
+
+    fn volume_time() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 29)
+            .unwrap()
+            .and_hms_opt(18, 30, 0)
+            .unwrap()
+    }
+
+    /// A one-pane app on [`SITE`] with scan info, which is what
+    /// `apply_render_to_pane` reads the site coordinates out of before it will
+    /// place anything at all.
+    fn app_on_site() -> crate::app::App {
+        let mut app = headless(TestBridge::desktop());
+        point_at_site(&mut app, 0);
+        app.render.ensure_pane_count(1);
+        app
+    }
+
+    fn point_at_site(app: &mut crate::app::App, pane_idx: usize) {
+        let site = rustdar_radar::sites::get_radar_site(SITE)
+            .expect("KTLX is a real radar")
+            .clone();
+        let mut product_elevations = std::collections::HashMap::new();
+        product_elevations.insert(PRODUCT, vec![TILT]);
+        let pane = app.gui.pane_mut(pane_idx).expect("pane exists");
+        pane.site = SITE.to_string();
+        pane.selected_product = PRODUCT;
+        pane.selected_elevation = TILT;
+        app.gui.set_scan_info_for_pane(
+            pane_idx,
+            rustdar_radar::types::ScanInfo {
+                site,
+                timestamp: volume_time(),
+                vcp_number: 212,
+                available_products: vec![PRODUCT],
+                product_elevations,
+                status: String::new(),
+            },
+        );
+    }
+
+    /// Finished pixels, full size: `ColorImage::from_rgba_unmultiplied` checks
+    /// the buffer against the dimensions it is handed, in a bare `assert_eq!`
+    /// that is live in release and on the main thread.
+    fn finished_pixels() -> Arc<Vec<u8>> {
+        Arc::new(vec![0u8; IMAGE_SIZE * IMAGE_SIZE * 4])
+    }
+
+    fn cached_output() -> crate::render_dispatch::CachedRenderOutput {
+        crate::render_dispatch::CachedRenderOutput {
+            image_data: finished_pixels(),
+            max_range_km: 230.0,
+            value_data: Arc::new(Vec::new()),
+        }
+    }
+
+    /// Whether pane `pane_idx` is holding a radar texture.
+    ///
+    /// The observable throughout this module: it is what `apply_render_to_pane`
+    /// exists to produce, and the only thing that tells a pane which was served
+    /// from one which was skipped.
+    fn holds_radar_texture(app: &mut crate::app::App, pane_idx: usize) -> bool {
+        app.gui
+            .pane_mut(pane_idx)
+            .expect("pane exists")
+            .overlay_cache_mut(OverlayKind::Radar)
+            .current
+            .is_some()
+    }
+
+    /// A finished render landing on the channel, as a render thread posts one,
+    /// and then drained by the poller.
+    ///
+    /// The bare `egui::Context` is the whole renderer these paths need —
+    /// `Context::load_texture` wants no device, no surface and no window — which
+    /// is what `stamping_tests` already relies on and why the frame's context is
+    /// a parameter of the poller rather than something it reaches through
+    /// `self.state` for.
+    fn deliver(app: &mut crate::app::App, pane_idx: usize) {
+        app.channels
+            .render_sender
+            .send(crate::channels::RenderResponse {
+                rendered: Some(crate::channels::RenderedImage {
+                    image_data: finished_pixels(),
+                    max_range_km: 230.0,
+                    value_data: Arc::new(Vec::new()),
+                }),
+                product: PRODUCT,
+                elevation: TILT,
+                generation: app.render.render_generation,
+                pane_idx,
+            })
+            .expect("the receiver lives on the App");
+        app.poll_render_results(&egui::Context::default());
+    }
+
+    /// `dispatch_pane_renders` skips a pane with no plan view, and skips it
+    /// *before* the rendering-params branch.
+    ///
+    /// Driven through the render cache rather than through a spawned render, so
+    /// neither a thread nor a decoded volume is needed: a cache hit is one of the
+    /// two ways the `if` arm places an image, and reaching it at all proves the
+    /// pane got past the guard. The map case is asserted in the same run, so this
+    /// cannot be satisfied by a dispatcher that skips every pane.
+    #[test]
+    fn the_dispatcher_skips_a_pane_with_no_plan_view() {
+        for kind in [PaneKind::CrossSection, PaneKind::Volume] {
+            let mut app = app_on_site();
+            app.render
+                .cache_render(SITE, PRODUCT, TILT, cached_output());
+
+            app.dispatch_pane_renders(&egui::Context::default());
+            assert!(
+                holds_radar_texture(&mut app, 0),
+                "precondition: a map pane must take the cached render, or the \
+                 assertion below is about a path nothing reaches"
+            );
+            assert_eq!(
+                app.render.pane_render[0].last_rendered,
+                Some((PRODUCT, TILT)),
+                "precondition: the map pane's dispatch must have been recorded"
+            );
+
+            let mut app = app_on_site();
+            app.render
+                .cache_render(SITE, PRODUCT, TILT, cached_output());
+            app.gui.pane_mut(0).unwrap().set_kind(kind);
+
+            app.dispatch_pane_renders(&egui::Context::default());
+
+            assert!(
+                !holds_radar_texture(&mut app, 0),
+                "{kind:?}: a full-size plan-view image was uploaded to a pane \
+                 that draws none"
+            );
+            assert_eq!(
+                app.render.pane_render[0].last_rendered, None,
+                "{kind:?}: the dispatcher recorded a render for a pane it must \
+                 not have served"
+            );
+        }
+    }
+
+    /// The sibling broadcast skips a pane with no plan view.
+    ///
+    /// It accepts on site + product + elevation with **no view term**, and all
+    /// three match for a section pane sitting beside the map it was cut from —
+    /// which is the ordinary arrangement rather than a corner case. Unfiltered,
+    /// the section pane is handed the map's raster on the first render either of
+    /// them triggers.
+    ///
+    /// Pane 1 is asserted to take the broadcast while it is still a map, so what
+    /// is observed below is the filter and not a sibling that never qualified.
+    #[test]
+    fn the_sibling_broadcast_skips_a_pane_with_no_plan_view() {
+        for kind in [PaneKind::CrossSection, PaneKind::Volume] {
+            let mut app = two_pane_app(SITE, SITE);
+            point_at_site(&mut app, 0);
+            point_at_site(&mut app, 1);
+
+            deliver(&mut app, 0);
+            assert!(
+                holds_radar_texture(&mut app, 1),
+                "precondition: a map sibling on the same site, product and tilt \
+                 must take the broadcast, or nothing below is being filtered"
+            );
+
+            let mut app = two_pane_app(SITE, SITE);
+            point_at_site(&mut app, 0);
+            point_at_site(&mut app, 1);
+            app.gui.pane_mut(1).unwrap().set_kind(kind);
+
+            deliver(&mut app, 0);
+
+            assert!(
+                holds_radar_texture(&mut app, 0),
+                "{kind:?}: precondition: the origin pane is still a map and must \
+                 have been served"
+            );
+            assert!(
+                !holds_radar_texture(&mut app, 1),
+                "{kind:?}: the broadcast handed a plan-view raster to a pane that \
+                 draws none"
+            );
+        }
+    }
+
+    /// A render already in flight when its pane is converted is not placed on it.
+    ///
+    /// `dispatch_pane_renders` no longer starts one, but conversion happens on a
+    /// frame and a render takes many, so the window is real rather than
+    /// theoretical. The result still clears `render_in_flight` — that is its
+    /// other job, and dropping it would wedge the pane forever — and
+    /// `last_rendered` stays unset, so converting back to a map re-dispatches
+    /// rather than showing nothing.
+    #[test]
+    fn a_render_in_flight_across_a_conversion_is_not_placed() {
+        let mut app = app_on_site();
+        app.render.pane_render[0].render_in_flight = true;
+        app.gui.pane_mut(0).unwrap().set_kind(PaneKind::Volume);
+
+        deliver(&mut app, 0);
+
+        assert!(!holds_radar_texture(&mut app, 0));
+        assert!(
+            !app.render.pane_render[0].render_in_flight,
+            "the in-flight flag was not cleared, so this pane could never ask \
+             for another render as long as it lived"
+        );
+        assert_eq!(app.render.pane_render[0].last_rendered, None);
+    }
+
+    /// A loop on [`SITE`] with one frame per timestamp, keyed to
+    /// [`PRODUCT`] at [`TILT`].
+    fn active_loop(timestamps: &[chrono::NaiveDateTime]) -> LoopPlaybackState {
+        let mut ls = LoopPlaybackState::new_for_loop(
+            3600,
+            &RadarSite {
+                name: SITE,
+                lat: 35.33,
+                lon: -97.27,
+                elev: None,
+            },
+        );
+        ls.phase = LoopPhase::Rendering;
+        ls.frames = timestamps
+            .iter()
+            .map(|&timestamp| LoopFrame {
+                timestamp,
+                texture: None,
+                render_in_flight: false,
+                render_failed: false,
+            })
+            .collect();
+        // Takes the target and reports `false`: there was nothing to discard, so
+        // there is nothing for the caller to react to. What matters here is that
+        // `rendered_for` is now set, which is what the dispatcher reads.
+        ls.retarget_renders(PRODUCT, TILT);
+        assert!(
+            ls.rendered_for.is_some(),
+            "precondition: a fresh loop must take its first target"
+        );
+        ls
+    }
+
+    /// `dispatch_loop_renders`' **first** pass skips a pane with no plan view.
+    ///
+    /// That pass's job is to notice the pane's product moving and re-key the whole
+    /// frame list to it, which also queues a fresh download plan — for a pane
+    /// nobody draws, a download queue serving nobody. So the observable is
+    /// `rendered_for`: it must move for a map pane and must not move for a
+    /// non-map one.
+    #[test]
+    fn the_first_loop_dispatch_pass_skips_a_pane_with_no_plan_view() {
+        let moved_to = RadarProduct::Velocity;
+        assert!(
+            !moved_to.is_level3() && !PRODUCT.is_level3(),
+            "precondition: both products must be Level II, or the replan the \
+             retarget triggers starts a download this test does not serve"
+        );
+
+        for (kind, expected) in [
+            (PaneKind::Map, Some((moved_to, 0.0))),
+            (PaneKind::CrossSection, Some((PRODUCT, TILT))),
+            (PaneKind::Volume, Some((PRODUCT, TILT))),
+        ] {
+            let mut app = app_on_site();
+            {
+                let pane = app.gui.pane_mut(0).unwrap();
+                pane.loop_state = active_loop(&[volume_time()]);
+                pane.selected_product = moved_to;
+                pane.selected_elevation = 0.0;
+                pane.set_kind(kind);
+            }
+
+            app.dispatch_loop_renders();
+
+            let keyed = app
+                .gui
+                .pane(0)
+                .unwrap()
+                .loop_state
+                .rendered_for
+                .as_ref()
+                .map(|target| (target.product, target.elevation));
+            assert_eq!(
+                keyed, expected,
+                "{kind:?}: the loop's render target moved for a pane whose frames \
+                 nobody draws — or failed to move for one whose frames are drawn"
+            );
+        }
+    }
+
+    /// `dispatch_loop_renders`' **second** pass skips a pane with no plan view.
+    ///
+    /// That pass is the one which plans renders and clones siblings' textures.
+    /// The observable is `render_failed`, which it sets on a frame whose own
+    /// volume carries no sweep for the selected product: a scan with no sweeps at
+    /// all makes `find_closest_elevation` answer `None`, so a map pane's frame is
+    /// retired and a non-map pane's frame is never examined. No render thread and
+    /// no real volume are involved.
+    #[test]
+    fn the_second_loop_dispatch_pass_skips_a_pane_with_no_plan_view() {
+        for (kind, expected_failed) in [
+            (PaneKind::Map, true),
+            (PaneKind::CrossSection, false),
+            (PaneKind::Volume, false),
+        ] {
+            let mut app = app_on_site();
+            app.loop_mgr = LoopDownloadManager::new();
+            // A volume that is present, so the frame is not `Pending`, and
+            // carries nothing for the product, so it is `Unrenderable`.
+            app.loop_mgr
+                .cache_scan(SITE, volume_time(), Arc::new(empty_scan()));
+            {
+                let pane = app.gui.pane_mut(0).unwrap();
+                pane.loop_state = active_loop(&[volume_time()]);
+                pane.set_kind(kind);
+            }
+
+            app.dispatch_loop_renders();
+
+            assert_eq!(
+                app.gui.pane(0).unwrap().loop_state.frames[0].render_failed,
+                expected_failed,
+                "{kind:?}: the second dispatch pass judged a frame belonging to a \
+                 pane it must not have looked at — or skipped one it must have"
+            );
+        }
+    }
+
+    /// `App::evict_unshown_scans` needs **no** kind filter, and this is the pin
+    /// on that.
+    ///
+    /// It is the one all-panes loop where excluding a non-map pane would be the
+    /// bug. It retains a decoded volume if any pane names its site, through
+    /// `pane.site` and `pane.scan_info.site` — both flat fields on every pane
+    /// whatever its kind. A section pane samples the whole volume, so it needs it
+    /// alive *more* than a map pane does, and dropping it under one is a
+    /// use-after-evict-shaped fault in the pass whose entire job is knowing what
+    /// is on screen. This is why `PaneContent` is one field on a flat
+    /// `PaneState` rather than an `enum PaneState`.
+    #[test]
+    fn a_whole_volume_pane_keeps_the_volume_it_is_sampling() {
+        for kind in [PaneKind::CrossSection, PaneKind::Volume] {
+            let mut app = app_on_site();
+            app.gui.pane_mut(0).unwrap().set_kind(kind);
+            app.scan_data
+                .insert(SITE.to_string(), Arc::new(empty_scan()));
+            app.scan_data
+                .insert("KOUN".to_string(), Arc::new(empty_scan()));
+
+            app.evict_unshown_scans();
+
+            assert!(
+                app.scan_data.contains_key(SITE),
+                "{kind:?}: the volume this pane is cutting from was evicted"
+            );
+            assert!(
+                !app.scan_data.contains_key("KOUN"),
+                "precondition: eviction must still be happening at all, or the \
+                 assertion above holds for a pass that dropped nothing"
+            );
+        }
     }
 }
