@@ -1977,6 +1977,89 @@ mod tests {
         );
     }
 
+    /// **The `Debug` line can tell two ladders apart when only the chosen
+    /// sweep differs.** Everything else here compares one ladder's string
+    /// against another's, and a comparison of two strings cannot pin what is
+    /// *in* them: drop a term from `describe` and both sides lose it together,
+    /// so every identity assertion in this module goes on passing while
+    /// becoming blind. That is precisely how the split-cut regression reached
+    /// review — the line printed only angles, and on a real split cut the
+    /// angles are identical whichever half won.
+    ///
+    /// So this asserts the discriminating power directly: two volumes whose
+    /// ladders agree in every angle and differ only in which sweep took the
+    /// 0.48° rung must not describe themselves the same way.
+    #[test]
+    fn the_ladder_description_distinguishes_two_sweeps_of_one_cut() {
+        let full = sails_volume();
+        // The same volume with the surveillance half of the split cut removed,
+        // so its Doppler half wins that rung instead. Nothing else moves.
+        let without_surveillance = Scan::new(
+            full.coverage_pattern().clone(),
+            full.sweeps()
+                .iter()
+                .filter(|s| s.elevation_number() != 3)
+                .cloned()
+                .collect(),
+        );
+
+        let a = VolumeSampler::new(&full, RadarProduct::Reflectivity).expect("builds");
+        let b =
+            VolumeSampler::new(&without_surveillance, RadarProduct::Reflectivity).expect("builds");
+
+        // precondition: the two ladders really are indistinguishable by angle,
+        // which is what makes this test about the description rather than about
+        // the ladders.
+        assert_eq!(
+            a.nominal_elevations_deg().collect::<Vec<_>>(),
+            b.nominal_elevations_deg().collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            a.elevations_deg().collect::<Vec<_>>(),
+            b.elevations_deg().collect::<Vec<_>>(),
+            "the two ladders differ in a median, so the angles alone would \
+             separate them and this says nothing about `describe`",
+        );
+
+        assert_ne!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "the ladder describes a 460 km surveillance rung and a 300 km \
+             Doppler rung identically, so every `assert_eq!` on this string in \
+             this module is blind to the difference that matters most",
+        );
+
+        // The other half of the same claim: a sweep with an **abandoned tail**
+        // covers less azimuth at the same range, and that is equally invisible
+        // in the angles. Same cut, same median, same gate count, fewer radials.
+        let truncated = Scan::new(
+            full.coverage_pattern().clone(),
+            full.sweeps()
+                .iter()
+                .map(|s| {
+                    if s.elevation_number() == 3 {
+                        Sweep::new(3, s.radials()[..300].to_vec())
+                    } else {
+                        s.clone()
+                    }
+                })
+                .collect(),
+        );
+        let c = VolumeSampler::new(&truncated, RadarProduct::Reflectivity).expect("builds");
+        assert_eq!(
+            a.elevations_deg().collect::<Vec<_>>(),
+            c.elevations_deg().collect::<Vec<_>>(),
+            "truncating the tail moved a median, so this pair is separable by \
+             angle and says nothing about the description",
+        );
+        assert_ne!(
+            format!("{a:?}"),
+            format!("{c:?}"),
+            "the ladder describes a whole sweep and one missing a sixth of its \
+             azimuths identically",
+        );
+    }
+
     /// **The surveillance half of a split cut still wins its rung after the
     /// port** — which is a fact about *range*, and the one the angles cannot
     /// express.
