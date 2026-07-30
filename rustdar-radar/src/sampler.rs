@@ -1803,6 +1803,10 @@ mod tests {
     ///
     /// Walks sites until one yields a volume, so a quiet or missing site does
     /// not fail the run; the assertion is about the port, not about the weather.
+    /// Host-only: `twin::live` and the `tokio` dev-dependency are both
+    /// `cfg(not(target_arch = "wasm32"))`, so an ungated harness here fails the
+    /// wasm `--all-targets` row — which builds dev-dependencies too.
+    #[cfg(not(target_arch = "wasm32"))]
     #[ignore = "hits the live S3 bucket"]
     #[tokio::test]
     async fn live_the_ported_ladder_is_the_originals() {
