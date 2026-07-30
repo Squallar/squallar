@@ -83,7 +83,7 @@
 //! rather than as a subtly wrong picture.
 
 use chrono::NaiveDateTime;
-use rustdar_radar::types::RadarProduct;
+use rustdar_radar::types::{RadarProduct, RenderView};
 use serde::{Deserialize, Serialize};
 
 /// Which of the three things a pane is.
@@ -116,24 +116,44 @@ impl PaneKind {
     /// is [`RadarProduct::reads_whole_volume`], which asks the same question of a
     /// product. Two questions, one answer: how much of the volume has to arrive.
     ///
-    /// Exhaustive, matching `reads_whole_volume` and `RadarProduct::wire_code`: a
-    /// fourth pane kind fails to compile until it has been classified here.
-    /// `!matches!(self, Self::Map)` would be shorter and would classify a new
-    /// kind as whole-volume on its own. That is the *safe* direction — a
-    /// too-wide download wastes bandwidth where a too-narrow one fabricates
-    /// structure — but a kind that really did read one tilt would then quietly
-    /// widen every download its pane triggers, with nothing to say so, and the
-    /// convention in this codebase is that a new variant stops the build until
-    /// someone has decided.
+    /// **Derived, not decided here.** The classification lives on
+    /// [`RenderView::reads_whole_volume`] and this reads it through
+    /// [`render_view`](Self::render_view), because a pane kind and the view its
+    /// renders produce are the same fact under two names, and two exhaustive
+    /// matches saying the same thing is two places for a fourth variant to be
+    /// classified differently. The compile-time obligation is not lost: it
+    /// simply moved to [`render_view`](Self::render_view), which is also
+    /// exhaustive.
     pub fn consumes_whole_volume(self) -> bool {
+        self.render_view().reads_whole_volume()
+    }
+
+    /// What a render dispatched for a pane of this kind produces.
+    ///
+    /// The single pane-kind → view table, and the only place the mapping lives.
+    /// `rustdar_frontend` keys its render cache and its sibling-texture
+    /// broadcast on the *view*, not on the pane kind: a cached raster outlives
+    /// the pane that asked for it, and the thing that must not be handed to the
+    /// wrong consumer is the buffer's shape.
+    ///
+    /// Exhaustive, matching `RadarProduct::wire_code`'s discipline: a fourth
+    /// pane kind fails to compile until it has been classified here.
+    /// `!matches!(self, Self::Map)` in the predicate above would have been
+    /// shorter and would have classified a new kind as whole-volume on its own
+    /// — the *safe* direction, since a too-wide download wastes bandwidth where
+    /// a too-narrow one fabricates structure — but a kind that really did read
+    /// one tilt would then quietly widen every download its pane triggers, with
+    /// nothing to say so.
+    pub fn render_view(self) -> RenderView {
         match self {
             // One sweep, chosen by `render::find_sweep` out of the product's own
             // moment. Everything else in the volume is irrelevant to it.
-            Self::Map => false,
+            Self::Map => RenderView::PlanView,
             // A section interpolates between the tilts bracketing each sample by
             // beam height, and a raymarch reads a grid resampled from every cut.
             // Both are vertical structure, which one sweep does not have.
-            Self::CrossSection | Self::Volume => true,
+            Self::CrossSection => RenderView::CrossSection,
+            Self::Volume => RenderView::Volume,
         }
     }
 }
@@ -604,6 +624,16 @@ mod tests {
         assert!(!PaneKind::Map.consumes_whole_volume());
         assert!(PaneKind::CrossSection.consumes_whole_volume());
         assert!(PaneKind::Volume.consumes_whole_volume());
+        // And the predicate is the view's, not a second copy of it: every kind
+        // agrees with the view it maps to, so the two names cannot come to
+        // give different answers.
+        for kind in [PaneKind::Map, PaneKind::CrossSection, PaneKind::Volume] {
+            assert_eq!(
+                kind.consumes_whole_volume(),
+                kind.render_view().reads_whole_volume(),
+                "{kind:?} answers the whole-volume question twice, differently",
+            );
+        }
     }
 
     /// A line that cannot be cut is not representable. Every refusal matters:

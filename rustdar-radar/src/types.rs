@@ -261,6 +261,97 @@ impl MomentSlot {
     }
 }
 
+/// What a render *draws*, as opposed to what it draws it of.
+///
+/// Three products of one moment can share a renderer; three views of one
+/// product cannot share a raster. A plan view is `IMAGE_SIZE²` of ground, a
+/// section is [`crate::xsect::SECTION_WIDTH`] × [`crate::xsect::SECTION_HEIGHT`]
+/// of a vertical plane, and a volume is a 3D index grid — different shapes,
+/// different buffers, and nothing in a buffer says which it is.
+///
+/// It lives here, in the crate both the frontend and the UI depend on, so
+/// `rustdar_egui`'s `PaneKind` can map *into* it without either of those crates
+/// having to name the other. `PaneKind` is what a pane is; this is what a
+/// render produced. They are one-to-one today, and separate anyway: a pane is a
+/// place on screen with state and a lifetime, and a `RenderView` is a fact
+/// about a buffer that outlives the pane that asked for it — it is what a
+/// cached render is keyed by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RenderView {
+    /// The plan-view raster every render produced before cross-sections
+    /// existed.
+    PlanView,
+    /// A vertical slice along a line.
+    CrossSection,
+    /// A resampled Cartesian grid, for a raymarch.
+    Volume,
+}
+
+impl RenderView {
+    /// Whether a render of this view reads every tilt carrying the moment,
+    /// rather than the one sweep `crate::render::find_sweep` picks.
+    ///
+    /// The *view*-side half of the whole-volume question;
+    /// [`RadarProduct::reads_whole_volume`] is the product-side half. Both have
+    /// to be asked, and neither can answer for the other: a reflectivity
+    /// cross-section answers **no** to the product question — it is the same
+    /// moment the plan view rasterizes — and **yes** to this one. A dispatch
+    /// that asked only the product question would hand a section a scan whose
+    /// cuts had been deliberately skipped, and a section of a partial volume
+    /// does not fail and does not produce a `NaN`: it interpolates across the
+    /// gap and draws a smooth layer that is not there, which looks *better*
+    /// than the truth.
+    ///
+    /// Exhaustive, like [`RadarProduct::reads_whole_volume`]: a fourth view
+    /// fails to compile until it has been classified. `!matches!(self,
+    /// PlanView)` would classify a new view as whole-volume on its own, which
+    /// is the safe direction, but a view that really did read one tilt would
+    /// then silently widen every download its pane triggers.
+    pub fn reads_whole_volume(self) -> bool {
+        match self {
+            Self::PlanView => false,
+            // A section interpolates between the tilts bracketing each sample
+            // by beam height; a raymarch reads a grid resampled from every cut.
+            // Both are vertical structure, which one sweep does not have.
+            Self::CrossSection | Self::Volume => true,
+        }
+    }
+
+    /// A stable byte for the wire and for a cache key, **not** the declaration
+    /// order.
+    ///
+    /// Same discipline as [`RadarProduct::wire_code`]: reordering the variants
+    /// must not silently change what a stored key or a posted job means.
+    pub fn wire_code(self) -> u8 {
+        match self {
+            Self::PlanView => 1,
+            Self::CrossSection => 2,
+            Self::Volume => 3,
+        }
+    }
+
+    /// The view a [`wire_code`](Self::wire_code) names, or `None` for a byte
+    /// this build does not have — the two ends of a worker port can be
+    /// different builds.
+    pub fn from_wire_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::PlanView),
+            2 => Some(Self::CrossSection),
+            3 => Some(Self::Volume),
+            _ => None,
+        }
+    }
+
+    /// Every view there is, for the sweeps that have to cover all of them.
+    pub fn all() -> &'static [RenderView] {
+        &[
+            RenderView::PlanView,
+            RenderView::CrossSection,
+            RenderView::Volume,
+        ]
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum RadarProduct {
     Reflectivity,
@@ -1180,5 +1271,44 @@ mod tests {
             );
         }
         assert_eq!(RadarProduct::MaxExpectedHailSize.unit_label(&prefs), "in");
+    }
+
+    /// Every view is classified, its code is stable and distinct, and the two
+    /// directions agree — the same three claims
+    /// `every_product_has_a_stable_distinct_wire_code` makes for products, for
+    /// the axis a render cache key gained.
+    #[test]
+    fn every_render_view_has_a_stable_distinct_wire_code() {
+        let mut seen = std::collections::HashSet::new();
+        for &view in RenderView::all() {
+            let code = view.wire_code();
+            assert!(seen.insert(code), "{view:?} reuses wire code {code}");
+            assert_eq!(RenderView::from_wire_code(code), Some(view));
+        }
+        assert_eq!(
+            seen.len(),
+            3,
+            "a view left `all()` without leaving the enum"
+        );
+        assert_eq!(RenderView::from_wire_code(0), None);
+        assert_eq!(RenderView::from_wire_code(u8::MAX), None);
+    }
+
+    /// The view half of the whole-volume question, with the plan view on the
+    /// *false* side.
+    ///
+    /// Both sides are asserted deliberately. A predicate that answered `true`
+    /// for everything would be safe in the download direction and would also
+    /// make the whole distinction vacuous — every plan view would drag the
+    /// whole volume down every live feed — so the `false` arm is the one that
+    /// says the predicate still discriminates.
+    #[test]
+    fn only_the_vertical_views_read_the_whole_volume() {
+        assert!(!RenderView::PlanView.reads_whole_volume());
+        assert!(RenderView::CrossSection.reads_whole_volume());
+        assert!(RenderView::Volume.reads_whole_volume());
+        // And the product half genuinely cannot answer for it: reflectivity is
+        // a one-sweep product, and a reflectivity section is not.
+        assert!(!RadarProduct::Reflectivity.reads_whole_volume());
     }
 }
