@@ -368,6 +368,55 @@ impl RadarProduct {
         }
     }
 
+    /// Every product whose [`level3_products`](Self::level3_products) names
+    /// `code` — the inverse of that table, derived from it rather than written
+    /// out a second time.
+    ///
+    /// One object can serve several products, and since VIL density arrived
+    /// [it does](Self::level3_products): `DVL` is both
+    /// `VerticallyIntegratedLiquid`'s whole field and VIL density's numerator,
+    /// and `EET` is both `EchoTops`' field and its denominator. A fetched object
+    /// therefore belongs to a *code*, not to one product, and everything that
+    /// used to key on the product it was fetched "for" — which pane to redraw,
+    /// which entries to add to the product picker — has to ask this instead.
+    ///
+    /// In [`sort_order`](Self::sort_order) order, so a caller that renders the
+    /// answer produces the same list every time.
+    pub fn level3_readers(code: &str) -> Vec<RadarProduct> {
+        let mut readers: Vec<RadarProduct> = Self::all()
+            .iter()
+            .copied()
+            .filter(|p| {
+                p.level3_products()
+                    .is_some_and(|codes| codes.contains(&code))
+            })
+            .collect();
+        readers.sort_by_key(|p| p.sort_order());
+        readers
+    }
+
+    /// The distinct AWIPS objects `products` need between them, each named once.
+    ///
+    /// What one site poll fetches. [`level3_products`](Self::level3_products) is
+    /// a per-product table and two products may name the same object, so walking
+    /// it product by product asks the bucket for the same ~100 KB twice per poll
+    /// — `DVL` for VIL and again for VIL density, `EET` for echo tops and again
+    /// for VIL density. De-duplicated here, in one place, so the fetch loop and
+    /// the object cache agree on what "one object" is.
+    ///
+    /// Sorted, so a poll dispatches in the same order every run.
+    pub fn level3_codes_for(products: &[RadarProduct]) -> Vec<&'static str> {
+        let mut codes: Vec<&'static str> = products
+            .iter()
+            .filter_map(|p| p.level3_products())
+            .flatten()
+            .copied()
+            .collect();
+        codes.sort_unstable();
+        codes.dedup();
+        codes
+    }
+
     /// Which object of a paired volume this product's Level III rendition is —
     /// what [`crate::level3::product_from_candidates`] is given when a
     /// particular volume's object is wanted (a loop frame, a validation twin).
@@ -381,6 +430,15 @@ impl RadarProduct {
     ///
     /// Meaningless for a Level II product, and it says so — `None` rather than a
     /// default nobody should read.
+    ///
+    /// **Every product naming a given code must answer the same pick.** Objects
+    /// are cached per code and shared by every product that reads them (see
+    /// [`level3_readers`](Self::level3_readers)), so two products that shared a
+    /// code and disagreed here would take turns overwriting one cache entry with
+    /// the other's choice of object. Today the only shared codes are `DVL` and
+    /// `EET`, all of whose readers are `Nearest`, and
+    /// `every_shared_level3_code_agrees_on_its_volume_pick` in
+    /// [`crate::level3`] holds that.
     pub fn level3_volume_pick(&self) -> Option<crate::level3::VolumePick> {
         if !self.is_level3() {
             return None;

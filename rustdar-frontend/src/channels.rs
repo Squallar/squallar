@@ -62,11 +62,18 @@ pub struct RenderResponse {
     pub pane_idx: usize,
 }
 
-/// Result from a Level III product fetch.
+/// Result from a Level III object fetch.
+///
+/// Names the AWIPS **code** and no product. One poll fetches each code once and
+/// every product that reads it is served from the same object, so a `product`
+/// field here would be one of several right answers — and whichever it named
+/// would be the only pane redrawn and the only picker entry filled in. The
+/// readers are derived on arrival instead: [`RadarProduct::level3_readers`].
 pub struct Level3Response {
     pub generation: u64,
-    pub product: RadarProduct,
-    pub tilt_code: String,
+    /// AWIPS product ID this object is, e.g. `"EET"` — the cache key alongside
+    /// the site, and what the readers are looked up by.
+    pub code: String,
     pub site: String,
     /// The decoded product *and* the stamp of the object it came from.
     ///

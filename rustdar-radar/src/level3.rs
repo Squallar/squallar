@@ -1109,6 +1109,124 @@ mod tests {
         assert_eq!(RadarProduct::EchoTops.level3_products(), Some(&["EET"][..]));
     }
 
+    /// One poll fetches one object per **code**, not one per (product, code).
+    ///
+    /// The three products that read `DVL` and `EET` between them name those two
+    /// codes four times over, and before this the fetch loop walked the table
+    /// product by product and asked the bucket for each of the four — two extra
+    /// ~100 KB GETs per site per poll, for bytes already in hand.
+    #[test]
+    fn one_poll_asks_for_each_object_once() {
+        assert_eq!(
+            RadarProduct::level3_codes_for(&[
+                RadarProduct::VerticallyIntegratedLiquid,
+                RadarProduct::EchoTops,
+                RadarProduct::VilDensity,
+            ]),
+            ["DVL", "EET"],
+            "VIL, echo tops and VIL density need two objects between them, not four",
+        );
+
+        // The whole roster, which is what a real poll asks for: one entry per
+        // distinct code, and every code some product names is in it.
+        let codes = RadarProduct::level3_codes_for(RadarProduct::all());
+        assert_eq!(codes, ["DPR", "DVL", "EET", "N0K"]);
+        for product in RadarProduct::all() {
+            for code in product.level3_products().unwrap_or(&[]) {
+                assert!(
+                    codes.contains(code),
+                    "{} names {code}, which no poll would fetch",
+                    product.name(),
+                );
+            }
+        }
+        assert!(
+            RadarProduct::level3_codes_for(&[RadarProduct::Reflectivity]).is_empty(),
+            "a Level II product needs no bucket object",
+        );
+    }
+
+    /// `level3_readers` is the exact inverse of `level3_products`.
+    ///
+    /// It is what a landed object is dispatched by — which panes to redraw, which
+    /// entries the product picker gains — so a code whose readers it under-reports
+    /// is a product that silently never notices its data arriving.
+    #[test]
+    fn every_code_reports_exactly_the_products_that_read_it() {
+        assert_eq!(
+            RadarProduct::level3_readers("DVL"),
+            [
+                RadarProduct::VerticallyIntegratedLiquid,
+                RadarProduct::VilDensity
+            ],
+            "DVL is VIL's whole field and VIL density's numerator",
+        );
+        assert_eq!(
+            RadarProduct::level3_readers("EET"),
+            [RadarProduct::EchoTops, RadarProduct::VilDensity],
+            "EET is echo tops' field and VIL density's denominator",
+        );
+        assert_eq!(
+            RadarProduct::level3_readers("DPR"),
+            [RadarProduct::PrecipitationRate],
+        );
+        assert!(
+            RadarProduct::level3_readers("N0G").is_empty(),
+            "a code nothing names has no readers — SRM's old tilts are gone",
+        );
+
+        // Round-trip: every product is a reader of every code it names, and of
+        // nothing else.
+        for product in RadarProduct::all() {
+            for code in RadarProduct::level3_codes_for(RadarProduct::all()) {
+                let names_it = product
+                    .level3_products()
+                    .is_some_and(|codes| codes.contains(&code));
+                assert_eq!(
+                    RadarProduct::level3_readers(code).contains(product),
+                    names_it,
+                    "{} and {code} disagree about whether it is a reader",
+                    product.name(),
+                );
+            }
+        }
+    }
+
+    /// Products sharing an AWIPS code must agree on which object of a volume to
+    /// take.
+    ///
+    /// One object is cached per `(code, site)` and handed to every product that
+    /// reads it, so a `Latest` reader and a `Nearest` reader of one code would
+    /// take turns replacing the entry with the other's choice — and each would
+    /// draw the other's object roughly half the time, with nothing in the image
+    /// to say so. Today `DPR` (the only `Latest`) is named by one product and the
+    /// shared codes `DVL`/`EET` are `Nearest` throughout; this fails the moment
+    /// that stops being true, which is the point at which the loop's per-code
+    /// cache needs a pick in its key.
+    #[test]
+    fn every_shared_level3_code_agrees_on_its_volume_pick() {
+        for code in RadarProduct::level3_codes_for(RadarProduct::all()) {
+            let readers = RadarProduct::level3_readers(code);
+            let picks: Vec<_> = readers
+                .iter()
+                .map(|p| {
+                    (
+                        p.name(),
+                        p.level3_volume_pick().unwrap_or_else(|| {
+                            panic!("{} reads {code} but is not Level III", p.name())
+                        }),
+                    )
+                })
+                .collect();
+            let (_, first) = picks[0];
+            assert!(
+                picks.iter().all(|(_, pick)| *pick == first),
+                "{code} is read with conflicting volume picks: {picks:?}; the \
+                 per-code object cache can only hold one of them",
+            );
+        }
+    }
+
     // ── Live checks ───────────────────────────────────────────────────────
     //
     // Run with:

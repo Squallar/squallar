@@ -151,35 +151,34 @@ impl super::App {
                 });
             }
         }
-        for l3_product in RadarProduct::all().iter().filter(|p| p.is_level3()) {
-            let Some(codes) = l3_product.level3_products() else {
-                continue;
-            };
-            for &code in codes {
-                let site = site.to_string();
-                let code_str = code.to_string();
-                let product = *l3_product;
-                self.spawn_async_task(self.channels.level3_sender.clone(), async move {
-                    log::info!("Fetching Level III {} for {}", code_str, site);
-                    let result = match scan::get_level3_product(&site, &code_str).await {
-                        Ok(msg) => {
-                            log::info!("Fetched Level III {} for {}", code_str, site);
-                            Ok(msg)
-                        }
-                        Err(e) => {
-                            log::warn!("Level III {} fetch failed: {}", code_str, e);
-                            Err(format!("{e}"))
-                        }
-                    };
-                    Level3Response {
-                        generation,
-                        product,
-                        tilt_code: code_str,
-                        site,
-                        result,
+        // One request per distinct object, not per (product, object). Three
+        // products read `DVL` and `EET` between them — VIL, echo tops, and the
+        // VIL density derived from both — so walking the per-product table
+        // instead asked the bucket for the same two objects twice on every poll
+        // of every site. See [`RadarProduct::level3_codes_for`]; the object cache
+        // is keyed the same way, so one fetch serves every reader.
+        for code in RadarProduct::level3_codes_for(RadarProduct::all()) {
+            let site = site.to_string();
+            let code = code.to_string();
+            self.spawn_async_task(self.channels.level3_sender.clone(), async move {
+                log::info!("Fetching Level III {} for {}", code, site);
+                let result = match scan::get_level3_product(&site, &code).await {
+                    Ok(msg) => {
+                        log::info!("Fetched Level III {} for {}", code, site);
+                        Ok(msg)
                     }
-                });
-            }
+                    Err(e) => {
+                        log::warn!("Level III {} fetch failed: {}", code, e);
+                        Err(format!("{e}"))
+                    }
+                };
+                Level3Response {
+                    generation,
+                    code,
+                    site,
+                    result,
+                }
+            });
         }
     }
 

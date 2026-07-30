@@ -753,4 +753,127 @@ mod tests {
         );
         assert_eq!(mgr.available_slots(4), 4);
     }
+
+    /// An object, or the answer that there is none.
+    fn l3() -> Arc<Level3Product> {
+        Arc::new(Level3Product {
+            message: nexrad_level3::model::Level3Message {
+                header: nexrad_level3::model::MessageHeader {
+                    message_code: 134,
+                    date_of_message: 20661,
+                    time_of_message: 7108,
+                    message_length: 0,
+                    source_id: 0,
+                    destination_id: 0,
+                    number_of_blocks: 3,
+                },
+                pdb: nexrad_level3::model::ProductDescriptionBlock {
+                    block_divider: -1,
+                    latitude: 35.333,
+                    longitude: -97.278,
+                    height: 1200,
+                    product_code: 134,
+                    operational_mode: 2,
+                    vcp: 212,
+                    sequence_number: 0,
+                    volume_scan_number: 39,
+                    volume_scan_date: 20661,
+                    volume_scan_time: 7108,
+                    generation_date: 20661,
+                    generation_time: 7108,
+                    product_specific_1: 0,
+                    product_specific_2: 0,
+                    elevation_number: 0,
+                    product_specific_3: 0,
+                    thresholds: [0u16; 16],
+                    product_specific_47_53: [0i16; 7],
+                    version: 0,
+                    spot_blank: 0,
+                    symbology_offset: 60,
+                    graphic_offset: 0,
+                    tabular_offset: 0,
+                },
+                symbology: None,
+            },
+            stamp: rustdar_radar::level3::ProductStamp::from_key("TLX_DVL_2024_01_01_00_00_30"),
+            bytes: Arc::new(Vec::new()),
+        })
+    }
+
+    /// **The loop pairs each object once, however many products read it.**
+    ///
+    /// The counterpart of the static poll's de-duplication, and it comes free:
+    /// every key here is `(site, code[, volume])` and never mentions a product, so
+    /// one pane looping VIL and another looping VIL density over the same volumes
+    /// pair that volume's `DVL` between them exactly once — a pairing being up to
+    /// `PAIRING_CANDIDATES` object fetches, which is the expensive thing to do
+    /// twice.
+    ///
+    /// Asserted through the three predicates `dispatch_pending_loop_l3_pairings`
+    /// actually gates on — the listing claim, the resolved check and the in-flight
+    /// check — because a product creeping into any one of those keys is what would
+    /// reintroduce the duplicate.
+    #[test]
+    fn one_pairing_serves_every_product_that_reads_the_code() {
+        let mut mgr = LoopDownloadManager::new();
+
+        // The listing is claimed once for the site and code, so the pane that
+        // asks second inherits it rather than listing the days again.
+        assert!(mgr.claim_l3_listing("KTLX", "DVL"));
+        assert!(
+            !mgr.claim_l3_listing("KTLX", "DVL"),
+            "a second reader of DVL must not list the same days again",
+        );
+        assert!(
+            mgr.claim_l3_listing("KTLX", "EET"),
+            "a different code is a different listing",
+        );
+
+        // A pairing in flight for DVL suppresses every other reader's.
+        mgr.mark_l3_in_flight("KTLX", "DVL", ts(0));
+        assert!(mgr.l3_is_in_flight("KTLX", "DVL", &ts(0)));
+        assert!(!mgr.l3_is_resolved("KTLX", "DVL", &ts(0)));
+
+        // And once it lands, both readers see it settled from the one entry.
+        mgr.cache_l3_product("KTLX", "DVL", ts(0), Some(l3()));
+        assert!(!mgr.l3_is_in_flight("KTLX", "DVL", &ts(0)));
+        assert!(mgr.l3_is_resolved("KTLX", "DVL", &ts(0)));
+
+        // VIL's frame is ready off that object alone; VIL density's still waits
+        // for its denominator, and is ready only once EET lands too. Both read the
+        // same DVL entry — `l3_frame_products` hands the very same `Arc` to each.
+        assert_eq!(
+            mgr.l3_frame_state("KTLX", RadarProduct::VerticallyIntegratedLiquid, &ts(0)),
+            L3FrameState::Ready,
+        );
+        assert_eq!(
+            mgr.l3_frame_state("KTLX", RadarProduct::VilDensity, &ts(0)),
+            L3FrameState::Pending,
+            "the denominator has not been paired",
+        );
+        mgr.cache_l3_product("KTLX", "EET", ts(0), Some(l3()));
+        assert_eq!(
+            mgr.l3_frame_state("KTLX", RadarProduct::VilDensity, &ts(0)),
+            L3FrameState::Ready,
+        );
+
+        let vil = mgr
+            .l3_frame_products("KTLX", RadarProduct::VerticallyIntegratedLiquid, &ts(0))
+            .expect("VIL's frame is ready");
+        let vild = mgr
+            .l3_frame_products("KTLX", RadarProduct::VilDensity, &ts(0))
+            .expect("VIL density's frame is ready");
+        assert_eq!(vil.len(), 1);
+        assert_eq!(vild.len(), 2, "numerator then denominator");
+        assert!(
+            Arc::ptr_eq(&vil[0], &vild[0]),
+            "the two loops rendered different DVL objects, so the volume was \
+             paired twice",
+        );
+
+        // Nothing here was ever keyed by product: another volume is still
+        // unanswered for both.
+        assert!(!mgr.l3_is_resolved("KTLX", "DVL", &ts(1)));
+        assert!(!mgr.l3_is_resolved("KOUN", "DVL", &ts(0)));
+    }
 }

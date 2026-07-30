@@ -358,10 +358,10 @@ impl super::App {
     /// Poll for completed Level III fetch results and update scan info.
     ///
     /// Drains, like every sibling poller. One Level II scan spawns a fetch per
-    /// Level III product *and tilt code* — a dozen and more, all landing within
-    /// a few hundred milliseconds of each other — so taking one per frame turned
-    /// the product picker into a list that fills in one entry per redraw, and
-    /// stalled outright on the frame where no redraw follows.
+    /// distinct AWIPS code, all landing within a few hundred milliseconds of each
+    /// other, so taking one per frame turned the product picker into a list that
+    /// fills in one entry per redraw, and stalled outright on the frame where no
+    /// redraw follows.
     fn poll_level3_results(&mut self) {
         while let Ok(sounding) = self.channels.sounding_receiver.try_recv() {
             if self
@@ -413,39 +413,44 @@ impl super::App {
             let fetched = match l3_resp.result {
                 Ok(p) => p,
                 Err(e) => {
-                    log::warn!("Level III {:?} fetch failed: {}", l3_resp.product, e);
+                    log::warn!("Level III {} fetch failed: {}", l3_resp.code, e);
                     continue;
                 }
             };
 
+            // Every product this object feeds. One object serves several — `DVL`
+            // is VIL's field and VIL density's numerator — and the fetch names
+            // only the code, so the products are derived here rather than
+            // travelling with the response. Each of them gets the redraw and the
+            // picker entry it would have got from its own fetch.
+            let readers = rustdar_radar::types::RadarProduct::level3_readers(&l3_resp.code);
             let elevation = fetched.message.pdb.elevation_angle();
             // The age is logged, not just carried: `latest_key` falls back to the
             // previous UTC day, so a site down since yesterday delivers a product
             // up to ~48 h old and this is currently the only place that says so.
             // Surfacing it in the pane is what remains — see `ProductStamp`.
             log::info!(
-                "Level III {:?} {} fetched successfully (elevation={:.1}°, key={}, age={:?} min)",
-                l3_resp.product,
-                l3_resp.tilt_code,
+                "Level III {} fetched successfully for {:?} (elevation={:.1}°, key={}, age={:?} min)",
+                l3_resp.code,
+                readers.iter().map(|p| p.name()).collect::<Vec<_>>(),
                 elevation,
                 fetched.stamp.key,
                 fetched
                     .age(chrono::Utc::now().naive_utc())
                     .map(|a| a.num_minutes()),
             );
-            self.render.cache_level3(
-                l3_resp.product,
-                l3_resp.tilt_code.clone(),
-                l3_resp.site.clone(),
-                fetched,
-            );
+            self.render
+                .cache_level3(l3_resp.code.clone(), l3_resp.site.clone(), fetched);
 
-            // Trigger a re-render for panes on the same site viewing this product
+            // Trigger a re-render for panes on the same site showing anything this
+            // object feeds.
             for (idx, prs) in self.render.pane_render.iter_mut().enumerate() {
                 let pane_matches_site = self.gui.pane(idx).is_some_and(|p| p.site == l3_resp.site);
                 if pane_matches_site
-                    && self.gui.get_rendering_params_for_pane(idx).map(|(p, _)| p)
-                        == Some(l3_resp.product)
+                    && self
+                        .gui
+                        .get_rendering_params_for_pane(idx)
+                        .is_some_and(|(p, _)| readers.contains(&p))
                 {
                     prs.last_rendered = None;
                 }
@@ -466,27 +471,29 @@ impl super::App {
                 };
                 let mut info = scan_info.clone();
                 let mut changed = false;
-                if !info.available_products.contains(&l3_resp.product) {
-                    info.available_products.push(l3_resp.product);
-                    info.available_products.sort_by_key(|p| p.sort_order());
-                    info.status = format!(
-                        "Loaded {} products: {}",
-                        info.available_products.len(),
-                        info.available_products
-                            .iter()
-                            .map(|p| p.name())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                    changed = true;
-                }
-                // Register the actual elevation angle from the PDB.
-                let elevations = info.product_elevations.entry(l3_resp.product).or_default();
-                let rounded_elev = (elevation * 10.0).round() / 10.0;
-                if !elevations.iter().any(|e| (e - rounded_elev).abs() < 0.05) {
-                    elevations.push(rounded_elev);
-                    elevations.sort_by(|a, b| a.total_cmp(b));
-                    changed = true;
+                for &product in &readers {
+                    if !info.available_products.contains(&product) {
+                        info.available_products.push(product);
+                        info.available_products.sort_by_key(|p| p.sort_order());
+                        info.status = format!(
+                            "Loaded {} products: {}",
+                            info.available_products.len(),
+                            info.available_products
+                                .iter()
+                                .map(|p| p.name())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        changed = true;
+                    }
+                    // Register the actual elevation angle from the PDB.
+                    let elevations = info.product_elevations.entry(product).or_default();
+                    let rounded_elev = (elevation * 10.0).round() / 10.0;
+                    if !elevations.iter().any(|e| (e - rounded_elev).abs() < 0.05) {
+                        elevations.push(rounded_elev);
+                        elevations.sort_by(|a, b| a.total_cmp(b));
+                        changed = true;
+                    }
                 }
                 if changed {
                     self.gui.set_scan_info_for_pane(pane_idx, info);
@@ -935,6 +942,11 @@ impl super::App {
         // volume's last object while the once-per-volume products take the
         // nearest one. Read from the queue's own product, which cannot have
         // retargeted under it the way the pane can.
+        //
+        // The pairing cache below is keyed per `(site, code, volume)` and shared
+        // by every product that reads the code, so two readers of one code have
+        // to agree on this — `every_shared_level3_code_agrees_on_its_volume_pick`
+        // in `rustdar_radar::level3` is what holds them to it.
         //
         // `plan_downloads_for` only ever builds this queue for a product that
         // names codes, so the `None` arm is unreachable. It puts the queue back
@@ -3102,7 +3114,6 @@ mod stamping_tests {
         let ctx = egui::Context::default();
         let mut app = app_showing_site();
         app.render.cache_level3(
-            PRODUCT,
             "EET".to_string(),
             SITE.to_string(),
             tilt(5, "MPX_EET_2026_07_26_01_55_52"),
@@ -3140,7 +3151,6 @@ mod stamping_tests {
         let ctx = egui::Context::default();
         let mut app = app_showing_site();
         app.render.cache_level3(
-            PRODUCT,
             "EET".to_string(),
             SITE.to_string(),
             tilt(5, "MPX_EET_2026_07_26_01_55_52"),
@@ -4010,17 +4020,17 @@ mod level3_poll_tests {
     use super::stamping_tests::{SITE, app_showing_site, tilt};
     use rustdar_radar::types::RadarProduct;
 
-    /// A finished fetch of `product`, as `spawn_level3_fetches` produces one.
+    /// A finished fetch of one AWIPS object, as `spawn_level3_fetches` produces
+    /// one.
     ///
     /// Generation 0 is what a site nothing has re-fetched carries, so nothing
-    /// here is discarded as stale. The object is the same for both: what a
-    /// response is *of* is decided by the `product` beside it, not by the
-    /// message's own code.
-    fn landed(product: RadarProduct, tilt_code: &str) -> crate::channels::Level3Response {
+    /// here is discarded as stale. The object's contents are the same whichever
+    /// code is named: what a response is *of* is decided by the code beside it,
+    /// and which products that feeds is derived on arrival.
+    fn landed(code: &str) -> crate::channels::Level3Response {
         crate::channels::Level3Response {
             generation: 0,
-            product,
-            tilt_code: tilt_code.to_string(),
+            code: code.to_string(),
             site: SITE.to_string(),
             result: Ok(tilt(5, "MPX_EET_2026_07_26_01_55_52")),
         }
@@ -4028,19 +4038,16 @@ mod level3_poll_tests {
 
     /// Every Level III result queued for a frame is taken in it.
     ///
-    /// One Level II scan spawns a fetch per Level III product *and* tilt code —
-    /// a dozen and more — and they land in a burst. Taking one per frame filled
-    /// the product picker an entry per redraw, and stopped filling it at all on
-    /// the frame after which nothing schedules another: `handle_redraw` re-arms
-    /// only for a render in flight, auto-poll, or an active loop, and a pane
-    /// sitting on a finished scan is none of those.
+    /// One Level II scan spawns a fetch per distinct AWIPS code and they land in
+    /// a burst. Taking one per frame filled the product picker an entry per
+    /// redraw, and stopped filling it at all on the frame after which nothing
+    /// schedules another: `handle_redraw` re-arms only for a render in flight,
+    /// auto-poll, or an active loop, and a pane sitting on a finished scan is
+    /// none of those.
     #[test]
     fn every_queued_level3_result_is_taken_in_the_frame_it_arrives_in() {
         let mut app = app_showing_site();
-        for resp in [
-            landed(RadarProduct::VerticallyIntegratedLiquid, "DVL"),
-            landed(RadarProduct::PrecipitationRate, "DPR"),
-        ] {
+        for resp in [landed("DVL"), landed("DPR")] {
             app.channels.level3_sender.send(resp).unwrap();
         }
 
@@ -4065,6 +4072,97 @@ mod level3_poll_tests {
         assert!(
             app.channels.level3_receiver.try_recv().is_err(),
             "the frame ended with a Level III result still queued",
+        );
+    }
+
+    /// **One landed object offers every product it feeds.**
+    ///
+    /// The picker is filled from the object's readers, not from the product a
+    /// fetch was spawned "for", because there is no longer one such product: the
+    /// single `DVL` fetch a poll issues is VIL's whole field *and* VIL density's
+    /// numerator. Keying this off one product would leave the other permanently
+    /// absent from the picker — selectable never, whatever landed.
+    #[test]
+    fn a_landed_object_offers_every_product_it_feeds() {
+        let mut app = app_showing_site();
+        app.channels.level3_sender.send(landed("DVL")).unwrap();
+        app.poll_level3_results();
+
+        let info = app
+            .gui
+            .get_scan_info_for_pane(0)
+            .expect("the pane still has its scan info")
+            .clone();
+        for product in [
+            RadarProduct::VerticallyIntegratedLiquid,
+            RadarProduct::VilDensity,
+        ] {
+            assert!(
+                info.available_products.contains(&product),
+                "{product:?} reads DVL but never reached the picker: {:?}",
+                info.available_products,
+            );
+            assert_eq!(
+                info.product_elevations.get(&product).map(|e| e.as_slice()),
+                Some(&[0.5f32][..]),
+                "{product:?} must get the angle off the object's own PDB",
+            );
+        }
+        // Echo tops is listed by the fixture's scan info, as `from_scan` lists
+        // every Level III product the moment a volume loads — but it does not read
+        // `DVL`, so this landing must not fill its angle in. That is the half of
+        // the dispatch a code-keyed fetch could get wrong in the other direction:
+        // an object credited to every Level III product rather than to its readers.
+        assert_eq!(
+            info.product_elevations.get(&RadarProduct::EchoTops),
+            None,
+            "a DVL object dated echo tops, which reads EET",
+        );
+    }
+
+    /// The de-duplication against the live bucket: one poll, one request per
+    /// object.
+    ///
+    /// `spawn_level3_fetches` sends exactly one `Level3Response` per fetch it
+    /// spawns — success *and* failure, so a site that served nothing still
+    /// answers — which makes the responses a count of the requests that were
+    /// really issued. Before this, `DVL` and `EET` each arrived twice: once for
+    /// the single-field product and once for VIL density.
+    ///
+    /// Run with:
+    ///   cargo test -p rustdar-frontend --lib -- --ignored --nocapture live_a_poll
+    #[ignore = "hits the live unidata-nexrad-level3 S3 bucket"]
+    #[test]
+    fn live_a_poll_fetches_each_object_once() {
+        let want = RadarProduct::level3_codes_for(RadarProduct::all());
+        let app = app_showing_site();
+        app.spawn_level3_fetches(SITE);
+
+        let mut codes: Vec<String> = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while codes.len() < want.len() && std::time::Instant::now() < deadline {
+            while let Ok(resp) = app.channels.level3_receiver.try_recv() {
+                println!("fetched {} for {}", resp.code, resp.site);
+                codes.push(resp.code);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // A duplicate would land alongside its twin, not minutes later, but give
+        // the slower of a pair time to arrive before declaring there was none.
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        while let Ok(resp) = app.channels.level3_receiver.try_recv() {
+            println!("fetched {} for {} (late)", resp.code, resp.site);
+            codes.push(resp.code);
+        }
+
+        codes.sort();
+        assert_eq!(
+            codes,
+            want,
+            "one request per distinct object, once each — {} requests for {} \
+             objects means the poll is still walking the per-product table",
+            codes.len(),
+            want.len(),
         );
     }
 }

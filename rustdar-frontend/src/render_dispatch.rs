@@ -247,8 +247,22 @@ fn elevation_key(elevation: f32) -> i32 {
 pub struct RenderDispatcher {
     /// Per-pane render tracking (indexed by pane index).
     pub pane_render: Vec<PaneRenderState>,
-    /// Decoded Level III product data, keyed by (RadarProduct, tilt_code, site).
-    /// The latest Level III product per (product, tilt, site).
+    /// The latest fetched Level III object per `(AWIPS code, site)`.
+    ///
+    /// Keyed by the **code**, not by the product that wanted it, because an
+    /// object is not owned by a product: `DVL` is `VerticallyIntegratedLiquid`'s
+    /// whole field *and* VIL density's numerator, `EET` is `EchoTops`' field
+    /// *and* its denominator. A product-keyed cache had to be filled once per
+    /// product, which meant fetching the same ~100 KB object twice on every site
+    /// poll; keyed this way one fetch serves every reader
+    /// ([`RadarProduct::level3_readers`]).
+    ///
+    /// Which entries a product may read is still narrow, and is decided in one
+    /// place — the product's own [`RadarProduct::level3_products`] list, applied
+    /// by [`nearest_tilt`](Self::nearest_tilt) and
+    /// [`cached_by_code`](Self::cached_by_code). Nothing resolves an object it
+    /// does not name, so sharing the map does not let a product read a field it
+    /// has no palette for.
     ///
     /// Holds the whole [`Level3Product`], not just the message, so the stamp —
     /// which object it came from and when it was written — reaches the UI
@@ -257,7 +271,7 @@ pub struct RenderDispatcher {
     /// Private, so [`cache_level3`](Self::cache_level3) really is the only way
     /// in: an insert that bypassed it would drop the storm motion vector on the
     /// floor, and the pane would render with another volume's.
-    level3_data: HashMap<(RadarProduct, String, String), Arc<Level3Product>>,
+    level3_data: HashMap<(String, String), Arc<Level3Product>>,
     /// Environmental 0 °C / −20 °C heights per site, from Open-Meteo — staged
     /// for the hail products, which will read them at render time. Written by
     /// the sounding drain in `app_render`; read back by
@@ -326,19 +340,13 @@ impl RenderDispatcher {
         }
     }
 
-    /// Cache a fetched Level III product.
+    /// Cache a fetched Level III object under the `(AWIPS code, site)` it is.
     ///
-    /// The only way into [`level3_data`](Self::level3_data). The map keeps one
-    /// object per `(product, tilt, site)`.
-    pub fn cache_level3(
-        &mut self,
-        product: RadarProduct,
-        tilt_code: String,
-        site: String,
-        fetched: Level3Product,
-    ) {
-        self.level3_data
-            .insert((product, tilt_code, site), Arc::new(fetched));
+    /// The only way into [`level3_data`](Self::level3_data). No product is named:
+    /// the object is whatever `code` says it is, and every product that reads
+    /// that code reads this one entry.
+    pub fn cache_level3(&mut self, code: String, site: String, fetched: Level3Product) {
+        self.level3_data.insert((code, site), Arc::new(fetched));
     }
 
     /// Record the storm motion override in force and, if it moved, drop every
@@ -441,7 +449,7 @@ impl RenderDispatcher {
                 prs.abandon_results();
             }
         }
-        self.level3_data.retain(|(_prod, _tilt, s), _| s != site);
+        self.level3_data.retain(|(_code, s), _| s != site);
         self.render_cache.retain(|(s, _prod, _elev)| s != site);
     }
 
@@ -613,22 +621,38 @@ pub struct RenderParams {
 }
 
 impl RenderDispatcher {
-    /// The Level III product for `site` closest to `elevation`, matched on the
-    /// **Product Description Block's** elevation angle rather than on the AWIPS
-    /// mnemonic.
+    /// The Level III object for `site` closest to `elevation`, out of the objects
+    /// `product` names — matched on the **Product Description Block's** elevation
+    /// angle rather than on the AWIPS mnemonic.
+    ///
+    /// The candidate set is [`RadarProduct::level3_products`], which is what
+    /// keeps a shared cache from letting one product read another's field: echo
+    /// tops considers `EET` and nothing else, however many other objects the site
+    /// has served. A product naming several codes sees all of them here, which is
+    /// only meaningful for tilts of one field — VIL density's two inputs are not
+    /// that, and it resolves them through
+    /// [`cached_by_code`](Self::cached_by_code) instead.
     ///
     /// Ties break on elevation number so a split cut or a SAILS/MRLE repeat,
-    /// which share an angle, resolve to the same one every frame.
+    /// which share an angle, resolve to the same one every frame — and then on
+    /// the AWIPS code, which makes the order **total**. Without that last step
+    /// VIL density's two whole-volume inputs, both at elevation 0 and both
+    /// numbered 0, compare `Equal` and `min_by` yields whichever the hash
+    /// happened to visit first: the field's reported age would flip between
+    /// `DVL`'s stamp and `EET`'s from one process to the next. Alphabetical puts
+    /// `DVL` first, which is the numerator — the object the field is a density
+    /// *of*.
     fn nearest_tilt(
         &self,
         product: RadarProduct,
         site: &str,
         elevation: f32,
     ) -> Option<Arc<Level3Product>> {
+        let wanted = product.level3_products()?;
         self.level3_data
             .iter()
-            .filter(|((p, _tilt, s), _l3)| *p == product && s == site)
-            .min_by(|(_, a), (_, b)| {
+            .filter(|((code, s), _l3)| s == site && wanted.contains(&code.as_str()))
+            .min_by(|((code_a, _), a), ((code_b, _), b)| {
                 let da = (a.message.pdb.elevation_angle() - elevation).abs();
                 let db = (b.message.pdb.elevation_angle() - elevation).abs();
                 da.partial_cmp(&db)
@@ -639,6 +663,7 @@ impl RenderDispatcher {
                             .elevation_number
                             .cmp(&b.message.pdb.elevation_number),
                     )
+                    .then_with(|| code_a.cmp(code_b))
             })
             .map(|(_, msg)| Arc::clone(msg))
     }
@@ -734,22 +759,28 @@ impl RenderDispatcher {
         .flatten()
     }
 
-    /// The object cached for one `(product, AWIPS code, site)`.
+    /// The object cached for one `(AWIPS code, site)`.
     ///
-    /// The by-code counterpart of [`nearest_tilt`](Self::nearest_tilt), for the
-    /// one product whose cached objects are not tilts of itself but the two
-    /// **inputs** of a derivation: VIL density's `DVL` and `EET`
-    /// (`rustdar_radar::vild`). Selecting those by nearest PDB elevation would
-    /// be meaningless — both are whole-volume products at elevation 0 — and
-    /// would resolve by hash order.
+    /// The by-code counterpart of [`nearest_tilt`](Self::nearest_tilt), for a
+    /// product whose cached objects are not tilts of itself but the **inputs** of
+    /// a derivation: VIL density's `DVL` and `EET` (`rustdar_radar::vild`).
+    /// Selecting those by nearest PDB elevation would be meaningless — both are
+    /// whole-volume products at elevation 0 — and would resolve by hash order.
+    ///
+    /// `product` is taken so the caller cannot ask for an object the product does
+    /// not name: it is the same restriction `nearest_tilt` applies, written once
+    /// per resolution path rather than trusted to the two call sites below.
     fn cached_by_code(
         &self,
         product: RadarProduct,
         site: &str,
         code: &str,
     ) -> Option<Arc<Level3Product>> {
+        if !product.level3_products()?.contains(&code) {
+            return None;
+        }
         self.level3_data
-            .get(&(product, code.to_string(), site.to_string()))
+            .get(&(code.to_string(), site.to_string()))
             .map(Arc::clone)
     }
 
@@ -1038,8 +1069,11 @@ mod level3_dispatch_tests {
         }
     }
 
-    fn cache(d: &mut RenderDispatcher, p: RadarProduct, code: &str, site: &str, l3: Level3Product) {
-        d.cache_level3(p, code.to_string(), site.to_string(), l3);
+    /// Land an object for one `(code, site)`, as `poll_level3_results` does. No
+    /// product: the cache does not take one, because every product that reads the
+    /// code reads this entry.
+    fn cache(d: &mut RenderDispatcher, code: &str, site: &str, l3: Level3Product) {
+        d.cache_level3(code.to_string(), site.to_string(), l3);
     }
 
     /// Every single-object Level III product resolves from its cache — none is
@@ -1061,11 +1095,28 @@ mod level3_dispatch_tests {
             (RadarProduct::PrecipitationRate, "DPR", 176),
         ] {
             let p = product(product_code, 5, 1);
-            cache(&mut d, radar_product, code, "KMPX", p);
+            cache(&mut d, code, "KMPX", p);
             let picked = d
                 .nearest_tilt(radar_product, "KMPX", 0.5)
                 .unwrap_or_else(|| panic!("{code} must render"));
             assert_eq!(picked.message.pdb.product_code, product_code);
+        }
+        // Every object is now in one shared map, and each product still resolves
+        // only what it names: the filter is the product's own code list, so
+        // nothing above picked up a neighbour's field once the map filled up.
+        for (radar_product, code, product_code) in [
+            (RadarProduct::SpecificDifferentialPhase, "N0K", 163i16),
+            (RadarProduct::EchoTops, "EET", 135),
+            (RadarProduct::VerticallyIntegratedLiquid, "DVL", 134),
+            (RadarProduct::PrecipitationRate, "DPR", 176),
+        ] {
+            assert_eq!(
+                d.nearest_tilt(radar_product, "KMPX", 0.5)
+                    .map(|p| p.message.pdb.product_code),
+                Some(product_code),
+                "{} resolved something other than its own {code}",
+                radar_product.name(),
+            );
         }
         assert!(
             d.nearest_tilt(RadarProduct::StormRelativeVelocity, "KMPX", 0.5)
@@ -1115,13 +1166,7 @@ mod level3_dispatch_tests {
             "nothing cached yet",
         );
 
-        cache(
-            &mut d,
-            RadarProduct::VilDensity,
-            "DVL",
-            "KMPX",
-            product(134, 0, 0),
-        );
+        cache(&mut d, "DVL", "KMPX", product(134, 0, 0));
         assert_eq!(
             d.cached_by_code(RadarProduct::VilDensity, "KMPX", "DVL")
                 .map(|p| p.message.pdb.product_code),
@@ -1133,13 +1178,7 @@ mod level3_dispatch_tests {
             "the denominator has not landed — nothing to divide by",
         );
 
-        cache(
-            &mut d,
-            RadarProduct::VilDensity,
-            "EET",
-            "KMPX",
-            product(135, 0, 0),
-        );
+        cache(&mut d, "EET", "KMPX", product(135, 0, 0));
         assert_eq!(
             d.cached_by_code(RadarProduct::VilDensity, "KMPX", "EET")
                 .map(|p| p.message.pdb.product_code),
@@ -1153,28 +1192,75 @@ mod level3_dispatch_tests {
             Some(134),
         );
 
-        // Another site's objects are never borrowed, and neither are the
-        // identically-coded objects the single-field products cache.
+        // Another site's objects are never borrowed.
         assert!(
             d.cached_by_code(RadarProduct::VilDensity, "KTLX", "DVL")
                 .is_none(),
-        );
-        cache(
-            &mut d,
-            RadarProduct::VerticallyIntegratedLiquid,
-            "DVL",
-            "KTLX",
-            product(134, 0, 0),
-        );
-        assert!(
-            d.cached_by_code(RadarProduct::VilDensity, "KTLX", "DVL")
-                .is_none(),
-            "VIL's own DVL is not VIL density's — each product fetches its own",
         );
 
         // And it is not a whole-volume Level II product any more.
         assert!(!needs_whole_volume(RadarProduct::VilDensity));
         assert!(RadarProduct::VilDensity.is_level3());
+    }
+
+    /// **One `DVL` serves both the products that read it.**
+    ///
+    /// This is the de-duplication, seen from the cache. The object is filed under
+    /// its code, so the single fetch a poll now issues for `DVL` is the numerator
+    /// VIL density divides *and* the field VIL draws — the same `Arc`, compared by
+    /// pointer, not two copies of the same ~100 KB download.
+    ///
+    /// The premise this replaces was the opposite: the cache was keyed by
+    /// product, so `VerticallyIntegratedLiquid`'s `DVL` and `VilDensity`'s `DVL`
+    /// were separate entries and each product fetched its own. That is precisely
+    /// what cost two extra GETs per site poll.
+    #[test]
+    fn one_object_serves_every_product_that_reads_it() {
+        let mut d = RenderDispatcher::new();
+        cache(&mut d, "DVL", "KMPX", product(134, 0, 0));
+        cache(&mut d, "EET", "KMPX", product(135, 0, 0));
+
+        let vil = d
+            .nearest_tilt(RadarProduct::VerticallyIntegratedLiquid, "KMPX", 0.5)
+            .expect("VIL reads DVL");
+        let numerator = d
+            .cached_by_code(RadarProduct::VilDensity, "KMPX", "DVL")
+            .expect("VIL density's numerator is the same DVL");
+        assert!(
+            Arc::ptr_eq(&vil, &numerator),
+            "VIL and VIL density resolved different DVL objects, so the poll is \
+             still fetching it twice",
+        );
+
+        let eet = d
+            .nearest_tilt(RadarProduct::EchoTops, "KMPX", 0.5)
+            .expect("echo tops reads EET");
+        let denominator = d
+            .cached_by_code(RadarProduct::VilDensity, "KMPX", "EET")
+            .expect("VIL density's denominator is the same EET");
+        assert!(Arc::ptr_eq(&eet, &denominator));
+
+        // Sharing the map does not let a product reach an object it does not
+        // name: the resolution filter is the product's own code list.
+        assert!(
+            d.cached_by_code(RadarProduct::EchoTops, "KMPX", "DVL")
+                .is_none(),
+            "echo tops names EET only — DVL is not its field to draw",
+        );
+        assert!(
+            d.cached_by_code(RadarProduct::VerticallyIntegratedLiquid, "KMPX", "EET")
+                .is_none(),
+        );
+        assert!(
+            d.nearest_tilt(RadarProduct::PrecipitationRate, "KMPX", 0.5)
+                .is_none(),
+            "no DPR landed, and neither DVL nor EET stands in for one",
+        );
+        assert!(
+            d.nearest_tilt(RadarProduct::Reflectivity, "KMPX", 0.5)
+                .is_none(),
+            "a Level II product names no codes and resolves nothing here",
+        );
     }
 
     /// Another site's products must never be borrowed. Both sites carry the
@@ -1183,16 +1269,10 @@ mod level3_dispatch_tests {
     #[test]
     fn a_tilt_is_never_taken_from_another_site() {
         let mut d = RenderDispatcher::new();
-        cache(
-            &mut d,
-            RadarProduct::EchoTops,
-            "EET",
-            "KMPX",
-            product(135, 5, 1),
-        );
+        cache(&mut d, "EET", "KMPX", product(135, 5, 1));
         let mut other = product(135, 5, 1);
         other.message.pdb.volume_scan_time = 9999;
-        cache(&mut d, RadarProduct::EchoTops, "EET", "KFSD", other);
+        cache(&mut d, "EET", "KFSD", other);
 
         let picked = d
             .nearest_tilt(RadarProduct::EchoTops, "KFSD", 0.5)
@@ -1211,36 +1291,66 @@ mod level3_dispatch_tests {
         );
     }
 
-    /// Two cached objects at one angle resolve deterministically: the angle
-    /// alone leaves the choice to hash order, so the tie breaks on elevation
-    /// number.
+    /// Two cached objects a product could resolve either of pick the same one
+    /// every time: the angle alone leaves the choice to hash order, so the tie
+    /// breaks on elevation number and then on the AWIPS code.
+    ///
+    /// VIL density is the live case, and the reason the code is in the ordering
+    /// at all. Its two inputs are whole-volume objects — same elevation angle,
+    /// and real `DVL`/`EET` product description blocks number them both 0 — so
+    /// angle and cut number both compare `Equal` and only the code separates
+    /// them. `stamp_pane_with_data_time` resolves through here, so without a
+    /// total order the age the status bar reports for a VIL density pane would
+    /// flip between the numerator's stamp and the denominator's from one process
+    /// to the next.
     ///
     /// Asserted across **freshly built maps**, not repeated calls on one map:
     /// `std`'s `RandomState` re-seeds per `HashMap` instance, so one map
     /// iterates in the same order every time and a stability loop over it
     /// cannot see the tie-break at all.
     #[test]
-    fn two_cuts_at_one_angle_resolve_the_same_way_every_time() {
+    fn two_resolvable_objects_pick_the_same_one_every_time() {
         for round in 0..60 {
+            // Same angle, same cut number, insertion order alternating: exactly
+            // the shape a real DVL/EET pair arrives in.
             let mut d = RenderDispatcher::new();
-            let mut cuts = [("EE1", 9u16), ("EE2", 3)];
+            let mut inputs = [("DVL", 134i16), ("EET", 135)];
+            if round % 2 == 1 {
+                inputs.reverse();
+            }
+            for (code, product_code) in inputs {
+                cache(&mut d, code, "KMPX", product(product_code, 0, 0));
+            }
+            assert_eq!(
+                d.nearest_tilt(RadarProduct::VilDensity, "KMPX", 0.0)
+                    .expect("both of VIL density's inputs are cached")
+                    .message
+                    .pdb
+                    .product_code,
+                134,
+                "round {round}: VIL density must date itself from the numerator \
+                 every time, not from whichever input the hash happened to yield",
+            );
+
+            // And with the cut numbers differing — a split cut or a SAILS/MRLE
+            // repeat of one field — the lower one still wins, ahead of the code.
+            let mut d = RenderDispatcher::new();
+            let mut cuts = [("DVL", 9u16), ("EET", 3)];
             if round % 2 == 1 {
                 cuts.reverse();
             }
             for (code, elev_num) in cuts {
-                let p = product(135, 13, elev_num);
-                cache(&mut d, RadarProduct::EchoTops, code, "KMPX", p);
+                cache(&mut d, code, "KMPX", product(135, 13, elev_num));
             }
-            let picked = d
-                .nearest_tilt(RadarProduct::EchoTops, "KMPX", 1.3)
-                .expect("both cuts are at 1.3°")
-                .message
-                .pdb
-                .elevation_number;
             assert_eq!(
-                picked, 3,
-                "round {round}: the lower cut number must break the tie, or the pane \
-                 shows whichever cut the hash happened to yield",
+                d.nearest_tilt(RadarProduct::VilDensity, "KMPX", 1.3)
+                    .expect("both objects are at 1.3°")
+                    .message
+                    .pdb
+                    .elevation_number,
+                3,
+                "round {round}: the lower cut number must break the tie ahead of \
+                 the code",
             );
         }
     }
@@ -1306,13 +1416,7 @@ mod level3_dispatch_tests {
     #[test]
     fn a_render_stamps_its_pane_with_its_own_datas_time() {
         let mut d = RenderDispatcher::new();
-        cache(
-            &mut d,
-            RadarProduct::EchoTops,
-            "EET",
-            "KMPX",
-            product(135, 5, 1),
-        );
+        cache(&mut d, "EET", "KMPX", product(135, 5, 1));
 
         let mut pane = pane_with_volume("KMPX");
         d.stamp_pane_with_data_time(&mut pane, &rendered(RadarProduct::EchoTops, 0.5));
@@ -1356,7 +1460,7 @@ mod level3_dispatch_tests {
         let mut d = RenderDispatcher::new();
         let mut p = product(135, 5, 1);
         p.stamp = ProductStamp::from_key("not-a-key");
-        cache(&mut d, RadarProduct::EchoTops, "EET", "KMPX", p);
+        cache(&mut d, "EET", "KMPX", p);
 
         assert!(
             d.nearest_tilt(RadarProduct::EchoTops, "KMPX", 0.5)
