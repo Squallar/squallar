@@ -838,6 +838,115 @@ mod tests {
         );
     }
 
+    /// A sweep that opens off its own tilt while the antenna settles: the first
+    /// thirty radials ramp from `first` to `flown`, the rest sit on `flown`, so
+    /// the sweep's median is `flown` and its first radial is not.
+    fn settling_sweep(number: u8, first: f32, flown: f32) -> nexrad_model::data::Sweep {
+        use nexrad_model::data::{MomentData, Radial, RadialStatus, Sweep};
+        const RADIALS: usize = 360;
+        const SETTLING: usize = 30;
+        let radials = (0..RADIALS)
+            .map(|i| {
+                let elevation = if i < SETTLING {
+                    first + (flown - first) * (i as f32 / SETTLING as f32)
+                } else {
+                    flown
+                };
+                Radial::new(
+                    0,
+                    i as u16,
+                    i as f32 * (360.0 / RADIALS as f32),
+                    360.0 / RADIALS as f32,
+                    RadialStatus::IntermediateRadialData,
+                    number,
+                    elevation,
+                    Some(MomentData::from_fixed_point(
+                        600,
+                        0,
+                        250,
+                        8,
+                        2.0,
+                        66.0,
+                        vec![200u8; 600],
+                    )),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        Sweep::new(number, radials)
+    }
+
+    /// The picker's entries name the tilt each sweep **flew**, not the one it
+    /// happened to open on.
+    ///
+    /// These labels are the values `render::find_sweep` is later handed to find
+    /// the sweep again, so the two have to be the same quantity. Read off the
+    /// first radial, the two cuts here — 0.44° and 0.84° — would both be offered
+    /// as "0.7°", collapsing to a single entry that drew one of them and left
+    /// the other with no label that could reach it. That is the KDDC VCP 215
+    /// case this whole change is about, and no fixed-elevation fixture can
+    /// express it: it needs a sweep whose median and first radial disagree.
+    #[test]
+    fn the_picker_lists_the_tilt_each_sweep_flew() {
+        let scan = Scan::new(
+            VolumeCoveragePattern::new(
+                215,
+                0,
+                0.5,
+                PulseWidth::Short,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+                0,
+                false,
+                false,
+                Vec::new(),
+            ),
+            vec![
+                settling_sweep(1, 0.676, 0.44),
+                settling_sweep(2, 0.739, 0.84),
+            ],
+        );
+        let info = ScanInfo::from_scan(
+            &scan,
+            "KDDC",
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 26)
+                .unwrap()
+                .and_hms_opt(1, 48, 0)
+                .unwrap(),
+        );
+
+        assert_eq!(
+            info.product_elevations
+                .get(&RadarProduct::Reflectivity)
+                .map(Vec::as_slice),
+            Some(&[0.4f32, 0.8][..]),
+            "the two cuts must be offered as the tilts they flew — off the first \
+             radial both round to 0.7 and one of them disappears",
+        );
+
+        // And the labels are usable: each reaches its own cut rather than the
+        // two of them sharing one sweep.
+        for (label, flown) in [(0.4f32, 0.44f64), (0.8, 0.84)] {
+            let found = crate::render::find_sweep(&scan, RadarProduct::Reflectivity, label)
+                .unwrap_or_else(|| panic!("{label}° is offered and must be reachable"));
+            let drawn =
+                crate::volumetric::sweep_elevation_deg(found).expect("the sweep has radials");
+            assert!(
+                (drawn - flown).abs() < 1e-4,
+                "{label}° drew the {drawn}° cut, not the {flown}° one it names",
+            );
+        }
+    }
+
     /// MEHS is a hail *size*, so it reads in the unit the hail-size preference
     /// asks for — and at the precision that unit carries (`25 mm`, not
     /// `25.40 mm`: the field is quantised in quarter inches, so the hundredth
