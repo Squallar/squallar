@@ -355,6 +355,20 @@ pub struct CrossSectionPane {
     /// pane with no line is an ordinary, expected state: it is what a pane looks
     /// like between being converted and being aimed.
     pub line: Option<SectionLine>,
+    /// Which map pane the line was drawn on, or `None` for a section that has
+    /// never been aimed.
+    ///
+    /// Persisted, and validated against the pane count on load: an index past the
+    /// end of the layout is how a config saved from a wider split comes back on a
+    /// narrower one, and a stale index would name a pane that is now something
+    /// else entirely.
+    ///
+    /// Nothing sets it yet. It is here because it is the retarget rule's input —
+    /// a second line drawn on the same map should re-aim the section already
+    /// sourced from it rather than convert another pane — and a section restored
+    /// from a config without it would be retargeted as though it had come from
+    /// nowhere.
+    pub source_pane: Option<usize>,
     /// What the section currently on screen was rendered for, or `None` before
     /// the first render. Compared against the current volume and line to decide
     /// whether to render again.
@@ -500,6 +514,36 @@ impl OrbitCamera {
         self.pitch_deg = (self.pitch_deg + delta.pitch_deg).clamp(-MAX_PITCH_DEG, MAX_PITCH_DEG);
         self.eye_distance =
             (self.eye_distance / delta.zoom_factor).clamp(MIN_EYE_DISTANCE, MAX_EYE_DISTANCE);
+    }
+
+    /// Rebuild a camera from persisted angles, or `None` if they are unusable.
+    ///
+    /// The second and last constructor, and the counterpart to the three
+    /// accessors below — which is what keeps the fields private while still
+    /// letting a camera survive a save and load.
+    ///
+    /// Refuses non-finite values rather than clamping them, for the reason the
+    /// type documentation gives at length: `f32::clamp` and `rem_euclid` both
+    /// *propagate* NaN, so a clamp on the way in launders a bad number into a bad
+    /// camera that looks as though it had been checked — and a NaN camera is not
+    /// a wrong picture but a re-render comparison that fires on every frame for
+    /// the life of the pane, with a hot GPU as its only symptom.
+    ///
+    /// Finite-but-out-of-range values are wrapped and clamped instead of refused,
+    /// through the same two expressions [`Self::nudge`] uses so the invariants
+    /// keep one description. Only a hand-edited or version-skewed config can
+    /// produce one, and `ui_config`'s `restore_viewport` reasons the same way
+    /// about a saved zoom: there is nothing to propagate, and the nearest legal
+    /// camera is a better answer than discarding the pane's kind over a number.
+    pub fn restore(yaw_deg: f32, pitch_deg: f32, eye_distance: f32) -> Option<Self> {
+        if !yaw_deg.is_finite() || !pitch_deg.is_finite() || !eye_distance.is_finite() {
+            return None;
+        }
+        Some(Self {
+            yaw_deg: yaw_deg.rem_euclid(360.0),
+            pitch_deg: pitch_deg.clamp(-MAX_PITCH_DEG, MAX_PITCH_DEG),
+            eye_distance: eye_distance.clamp(MIN_EYE_DISTANCE, MAX_EYE_DISTANCE),
+        })
     }
 
     /// Azimuth about the vertical axis, degrees in `[0, 360)`.
@@ -692,6 +736,54 @@ mod tests {
             });
             assert_eq!(camera, start, "zoom factor {factor} moved the camera");
         }
+    }
+
+    /// A persisted camera comes back exactly, and a corrupt one comes back as
+    /// nothing.
+    ///
+    /// `restore` is the only way a camera can be built from numbers off disk, so
+    /// it is where a hand-edited or version-skewed config is stopped. The refusal
+    /// half matters for the same reason [`OrbitCamera::nudge`]'s does: a NaN
+    /// camera makes the re-render comparison fire every frame for ever, silently.
+    #[test]
+    fn a_restored_camera_is_the_one_that_was_saved_or_none_at_all() {
+        let start = OrbitCamera::default();
+        let round_tripped =
+            OrbitCamera::restore(start.yaw_deg(), start.pitch_deg(), start.eye_distance())
+                .expect("a camera's own values must restore");
+        assert_eq!(round_tripped, start);
+
+        // A camera that had been moved, so the round trip is not just the default
+        // agreeing with itself.
+        let mut moved = start;
+        moved.nudge(OrbitDelta {
+            yaw_deg: -47.5,
+            pitch_deg: 12.25,
+            zoom_factor: 1.5,
+        });
+        assert_ne!(moved, start, "precondition: the nudge must have moved it");
+        assert_eq!(
+            OrbitCamera::restore(moved.yaw_deg(), moved.pitch_deg(), moved.eye_distance()),
+            Some(moved)
+        );
+
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(OrbitCamera::restore(bad, 25.0, 2.5), None, "yaw {bad}");
+            assert_eq!(OrbitCamera::restore(225.0, bad, 2.5), None, "pitch {bad}");
+            assert_eq!(
+                OrbitCamera::restore(225.0, 25.0, bad),
+                None,
+                "distance {bad}"
+            );
+        }
+
+        // Finite but out of range: wrapped and clamped rather than refused, and
+        // through the same expressions `nudge` uses — so a restored camera cannot
+        // hold a value `nudge` would never produce.
+        let stretched = OrbitCamera::restore(-30.0, 1_000.0, 0.001).expect("finite, so restorable");
+        assert_eq!(stretched.yaw_deg(), 330.0);
+        assert_eq!(stretched.pitch_deg(), MAX_PITCH_DEG);
+        assert_eq!(stretched.eye_distance(), MIN_EYE_DISTANCE);
     }
 
     /// A finite nudge does move it, and lands inside the limits — so the test
