@@ -57,7 +57,7 @@
 //!
 //! The default axis is `[site_elev, site_elev + 20 km]` **km above mean sea
 //! level**. 20 km above the antenna is over anything in the volume at any
-//! range — the 19.5° cut reaches it at 55 km ground range and the 0.5° cut
+//! range — the 19.5° cut reaches it at 55.9 km ground range and the 0.5° cut
 //! never does — so the default never clips real data. MSL rather than
 //! above-radar because that is the datum a sounding, a flight level and a
 //! melting-layer height are all quoted in; a section is read *against* those.
@@ -589,7 +589,7 @@ fn sample_columns(
             let point = beam::great_circle_point(req.start, req.end, t);
             let (azimuth_deg, ground_range_km) =
                 beam::site_bearing_range_km(lat, lon, point.0, point.1);
-            let column = if ground_range_km < BLIND_GROUND_RANGE_KM {
+            let column = if is_blind(ground_range_km) {
                 Column::new()
             } else {
                 sampler.column(azimuth_deg, ground_range_km)
@@ -600,6 +600,35 @@ fn sample_columns(
             }
         })
         .collect()
+}
+
+/// Whether a column sits inside the guard over the site — see
+/// [`BLIND_GROUND_RANGE_KM`].
+///
+/// **Strict**: a column at exactly the guard's range is sampled, not blinded.
+/// No great-circle solution lands on that float, so this is a statement about
+/// which way the boundary rounds rather than about anything a user will see —
+/// and it is a named function precisely because of that. Left inline as a `<`
+/// it is a comparison no test can distinguish from `<=`, and a later edit could
+/// widen the blind slit by one boundary case with the whole suite still green.
+/// `the_two_boundary_predicates_round_the_way_the_docs_say` pins it.
+fn is_blind(ground_range_km: f64) -> bool {
+    ground_range_km < BLIND_GROUND_RANGE_KM
+}
+
+/// Whether a column's ladder ceiling leaves the topmost drawn row above the
+/// volume — the cone-of-silence test.
+///
+/// **Strict, and here the strictness is load-bearing rather than arbitrary.**
+/// [`Column::at_height_km`] answers [`SampleStatus::AboveVolume`] only for a
+/// height *strictly* over the highest rung; at exactly the rung's height it
+/// returns that rung's own sample. So a `<=` here would count a column whose
+/// ceiling lands on the top row as inside the cone while its top pixel carried
+/// a value — breaking the equivalence
+/// [`SectionAxes::cone_of_silence_km`] is documented by, in the one case no
+/// rendered fixture can reach.
+fn ceiling_is_under(ceiling_km: f64, top_row_arl_km: f64) -> bool {
+    ceiling_km < top_row_arl_km
 }
 
 /// Fill in the four measurements that can only be made once the columns exist.
@@ -633,7 +662,7 @@ fn summarize(columns: &[ColumnAt], axes: &mut SectionAxes, top_row_arl_km: f64) 
         let in_cone = at
             .column
             .height_span_km()
-            .is_none_or(|(_, ceiling_km)| ceiling_km < top_row_arl_km);
+            .is_none_or(|(_, ceiling_km)| ceiling_is_under(ceiling_km, top_row_arl_km));
         if in_cone {
             cone_columns += 1;
         }
@@ -964,6 +993,51 @@ mod tests {
                     .total_cmp(&(axes.row_height_km_msl(b) - height_km_msl).abs())
             })
             .expect("the raster has rows")
+    }
+
+    /// The two comparisons whose boundary no rendered fixture can reach, at
+    /// the boundary.
+    ///
+    /// Mutation testing found both: `<` and `<=` are indistinguishable to every
+    /// other test here, because the equality case needs a great-circle solution
+    /// or a beam height to land on an exact `f64`. They are named functions and
+    /// tested directly for that reason — one of them is a taste question and
+    /// the other is not, and only this test says which.
+    #[test]
+    fn the_two_boundary_predicates_round_the_way_the_docs_say() {
+        // Taste: a column at exactly the guard's range is sampled.
+        assert!(!is_blind(BLIND_GROUND_RANGE_KM));
+        assert!(is_blind(BLIND_GROUND_RANGE_KM * (1.0 - f64::EPSILON)));
+        assert!(!is_blind(BLIND_GROUND_RANGE_KM * (1.0 + f64::EPSILON)));
+
+        // Not taste: the cone test has to agree with what the sampler answers
+        // at that exact height, so the rule is read off the sampler rather than
+        // off this module's doc.
+        let scan = scan_with(&|_az, _slant| Gate::Dbz(30.0));
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
+        let column = sampler.column(45.0, 40.0);
+        let (_, ceiling) = column.height_span_km().expect("the ladder has rungs");
+
+        assert_ne!(
+            column.at_height_km(ceiling).status(),
+            SampleStatus::AboveVolume,
+            "the sampler now reports a height exactly on the top rung as above \
+             the volume, so `ceiling_is_under` should become non-strict",
+        );
+        assert!(
+            !ceiling_is_under(ceiling, ceiling),
+            "a ceiling exactly on the top row counts as inside the cone while \
+             its top pixel carries a value",
+        );
+
+        let just_over = ceiling * (1.0 + 8.0 * f64::EPSILON);
+        assert_eq!(
+            column.at_height_km(just_over).status(),
+            SampleStatus::AboveVolume,
+            "precondition: a height a few ulps over the top rung is not above \
+             the volume, so this pair does not straddle the boundary",
+        );
+        assert!(ceiling_is_under(ceiling, just_over));
     }
 
     // ── The raster's shape and its two axis mappings ────────────────────────
@@ -2311,7 +2385,6 @@ mod tests {
             !far.values().is_empty() && far.values().iter().any(|v| v.is_nan()),
             "precondition: the value plane is empty",
         );
-        #[allow(clippy::redundant_clone)]
         let copy = far.clone();
         assert_eq!(far, copy, "a blank section is unequal to a copy of itself");
 
