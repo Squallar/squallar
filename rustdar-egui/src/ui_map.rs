@@ -581,13 +581,10 @@ fn volume_pane_outcome(
     // is what keeps this one borrow deep rather than a clone of the pane.
     let site_code = pane.site.clone();
     let product = pane.selected_product;
-    let stamp = pane
-        .scan_info
-        .as_ref()
-        .map(|scan_info| VolumeStamp {
-            site: scan_info.site.name.to_string(),
-            collected: scan_info.timestamp,
-        });
+    let stamp = pane.scan_info.as_ref().map(|scan_info| VolumeStamp {
+        site: scan_info.site.name.to_string(),
+        collected: scan_info.timestamp,
+    });
 
     // Unreachable from the kind branch, which only enters here for a `Volume`
     // pane, and answered rather than unwrapped: this function takes a whole
@@ -659,14 +656,35 @@ fn volume_pane_outcome(
     }
 }
 
+/// Fraction of a pane's width an empty-state message is laid out across.
+///
+/// Not the whole width: a paragraph running edge to edge in a wide pane is
+/// unreadable, and the margin is also what keeps the text clear of the pane
+/// border a multi-pane layout draws.
+const EMPTY_STATE_WIDTH_FRACTION: f32 = 0.8;
+
+/// Paint a centred, **wrapped** explanation in the middle of a pane.
+///
+/// Wrapped, and it has to be: `Painter::text` lays a string out on one line
+/// whatever its length, centred — so a sentence wider than the pane runs off
+/// *both* edges with its middle showing. That is not a hypothetical. The 3D
+/// pane's palette refusal is a paragraph, and the first version of it rendered
+/// as a strip of words with the beginning and end of every line cut away, which
+/// reads as a rendering bug rather than as an explanation.
+///
+/// Newlines in the message survive, so a message can separate a headline from
+/// its detail with a blank line.
 fn paint_pane_empty_state(ui: &mut egui::Ui, pane_rect: egui::Rect, text: &str) {
-    ui.painter().text(
-        pane_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        text,
+    let galley = ui.painter().layout(
+        text.to_owned(),
         egui::FontId::proportional(14.0),
         ui.visuals().weak_text_color(),
+        pane_rect.width() * EMPTY_STATE_WIDTH_FRACTION,
     );
+    let size = galley.size();
+    let top_left = pane_rect.center() - 0.5 * size;
+    ui.painter()
+        .galley(top_left, galley, ui.visuals().weak_text_color());
 }
 
 /// Draw a border around a pane rect, highlighted when active.
@@ -914,10 +932,7 @@ mod volume_arm_tests {
         h.gui_mut().set_volume_painter(Some(painter.clone()));
         h.frames_for(2, FRAME_DT);
 
-        let outcome = h.volume_arms()[0]
-            .outcome
-            .clone()
-            .expect("an empty state");
+        let outcome = h.volume_arms()[0].outcome.clone().expect("an empty state");
         assert!(
             outcome.contains("Waiting for a volume"),
             "expected a waiting message, got {outcome:?}",
@@ -942,10 +957,7 @@ mod volume_arm_tests {
         let before = painter.seen.lock().unwrap().len();
         h.frames_for(2, FRAME_DT);
 
-        let outcome = h.volume_arms()[0]
-            .outcome
-            .clone()
-            .expect("an empty state");
+        let outcome = h.volume_arms()[0].outcome.clone().expect("an empty state");
         assert!(
             outcome.contains("no vertical structure"),
             "expected the refusal to say why, got {outcome:?}",
@@ -1148,23 +1160,75 @@ mod volume_arm_tests {
 
     /// The painter is told the pane's size in **physical** pixels, not points.
     ///
-    /// The offscreen target is allocated from this number. Handing over points
-    /// on a 2x display would allocate a quarter-sized texture and blit it
-    /// stretched, which looks like the resolution rung working rather than like
+    /// The offscreen target is allocated from this number, so handing over
+    /// points on a 2x display would allocate a quarter-sized texture and blit it
+    /// stretched — which looks like the resolution rung working rather than like
     /// a bug.
+    ///
+    /// **Run at 2x deliberately.** At the harness's default scale points and
+    /// pixels are the same number, so an assertion that multiplies by
+    /// `pixels_per_point` passes whether the production code multiplies or not.
+    /// The first version of this test did exactly that and could not see the
+    /// mutation it is named for.
     #[test]
     fn the_painter_is_told_the_pane_size_in_physical_pixels() {
-        let (h, painter) = volume_harness(StubVolumePainter::painting());
+        let (mut h, painter) = volume_harness(StubVolumePainter::painting());
+        h.set_pixels_per_point(2.0);
+        h.frames_for(2, FRAME_DT);
+
+        assert_eq!(
+            h.pixels_per_point(),
+            2.0,
+            "precondition: points and pixels must differ, or this proves nothing",
+        );
         let rect = h.pane_rects()[1];
         let seen = last_seen(&painter);
         assert_eq!(
             seen.size_px,
             [
-                (rect.width() * h.pixels_per_point()).round() as u32,
-                (rect.height() * h.pixels_per_point()).round() as u32,
+                (rect.width() * 2.0).round() as u32,
+                (rect.height() * 2.0).round() as u32,
             ],
+            "the pane is {} x {} points, so at 2x it is twice that in pixels",
+            rect.width(),
+            rect.height(),
         );
         assert_eq!(seen.pane_idx, 1);
+    }
+
+    /// A long explanation is wrapped inside the pane, not laid out on one line
+    /// that runs off both edges.
+    ///
+    /// Found by looking at the app rather than by reasoning: the 3D pane's
+    /// palette refusal is a paragraph, and `Painter::text` centres a single
+    /// unwrapped line — so it rendered as a strip of words with the start and
+    /// end of every line cut away. That reads as a rendering bug, not as an
+    /// explanation, which makes it worse than the empty box it replaced.
+    #[test]
+    fn a_long_empty_state_is_wrapped_inside_the_pane() {
+        let long = "Velocity cannot be drawn as a volume yet. Its colour table is opaque at \
+                    the bottom of its scale, so every boundary between measured and unmeasured \
+                    air paints, and a volume is mostly unmeasured air.";
+        let (h, _painter) = volume_harness(StubVolumePainter::empty(long));
+        let pane = h.pane_rects()[1];
+
+        let painted: Vec<_> = h
+            .painted_text_rects()
+            .into_iter()
+            .filter(|(_, text)| text.contains("cannot be drawn"))
+            .collect();
+        assert_eq!(painted.len(), 1, "the refusal should be painted once");
+        let (rect, _) = &painted[0];
+        assert!(
+            rect.width() <= pane.width(),
+            "the message is {} wide in a {} pane, so it runs off both edges",
+            rect.width(),
+            pane.width(),
+        );
+        assert!(
+            pane.contains_rect(*rect),
+            "the message at {rect:?} is not inside its pane {pane:?}",
+        );
     }
 
     /// Whatever the painter says is why the pane is empty is what the pane says.

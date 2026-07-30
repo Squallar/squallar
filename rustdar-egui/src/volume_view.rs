@@ -180,9 +180,11 @@ pub struct VolumeView {
 ///   strictly positive. A pane one frame wide during a divider drag is the
 ///   realistic way this arrives as zero.
 pub fn view_for(camera: OrbitCamera, box_size_km: [f32; 3], aspect: f32) -> Option<VolumeView> {
-    if !box_size_km.iter().all(|s| s.is_finite() && *s > 0.0) {
-        return None;
-    }
+    // No validation here on purpose: every check lives in `build_view`, which
+    // this delegates to. A copy of the box check here would be unreachable —
+    // mutation testing found exactly that, by deleting it and seeing nothing
+    // fail — and an unreachable guard is one that can rot into disagreement with
+    // the reachable one.
     let half_diagonal = 0.5
         * (box_size_km[0] * box_size_km[0]
             + box_size_km[1] * box_size_km[1]
@@ -486,8 +488,12 @@ mod tests {
         );
         assert!(view.eye_km[2] > 0.0, "a positive pitch is above the box");
 
-        for (yaw, axis, sign) in [(0.0, 1, 1.0), (90.0, 0, 1.0), (180.0, 1, -1.0), (270.0, 0, -1.0)]
-        {
+        for (yaw, axis, sign) in [
+            (0.0, 1, 1.0),
+            (90.0, 0, 1.0),
+            (180.0, 1, -1.0),
+            (270.0, 0, -1.0),
+        ] {
             let view = view_for(camera(yaw, 0.0, 2.0), BOX_KM, 1.0).expect("a view");
             assert!(
                 view.eye_km[axis] * sign > 0.0,

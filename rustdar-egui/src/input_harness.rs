@@ -387,6 +387,27 @@ impl InputHarness {
             .collect()
     }
 
+    /// Lay the frames out at a scale other than 1 physical pixel per point.
+    ///
+    /// The harness runs at 1 by default, which makes points and pixels the same
+    /// number — and therefore makes any test that multiplies by
+    /// [`Self::pixels_per_point`] pass whether the production code multiplies or
+    /// not. A test about *pixels* has to run at a scale where the two differ.
+    pub(crate) fn set_pixels_per_point(&mut self, ppp: f32) {
+        self.ctx.set_pixels_per_point(ppp);
+        self.warm_up();
+    }
+
+    /// Every text run the last frame painted, with the rect it occupies.
+    ///
+    /// The rect is the part [`Self::painted_text_strings_in`] throws away, and
+    /// it is what a test needs to ask whether something *fits* rather than
+    /// merely whether it was drawn. `Painter::text` will happily lay a sentence
+    /// out on one line twice as wide as its pane.
+    pub(crate) fn painted_text_rects(&self) -> Vec<(egui::Rect, String)> {
+        self.last_texts.clone()
+    }
+
     /// Whether `needle` was painted anywhere inside `rect`.
     ///
     /// The other end of a probe: a `DrawnDropdown` says what the renderer was

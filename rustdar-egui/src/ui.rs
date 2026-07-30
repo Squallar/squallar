@@ -2081,7 +2081,8 @@ impl Gui {
                 // needing one without anything else noticing: the pane is still
                 // on screen, still on the same site, still live. Nothing else in
                 // the frame is going to come back and ask.
-                if pane.kind() == crate::pane::PaneKind::Volume && kind != crate::pane::PaneKind::Volume
+                if pane.kind() == crate::pane::PaneKind::Volume
+                    && kind != crate::pane::PaneKind::Volume
                 {
                     actions.push(GuiAction::ReleaseVolume { pane_idx });
                 }

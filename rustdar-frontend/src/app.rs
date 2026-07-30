@@ -345,17 +345,30 @@ const AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3)
 /// Half the east–west and north–south extent of the box a 3D pane resamples,
 /// kilometres.
 ///
-/// 150 km rather than the 230 km surveillance limit. The grid has a fixed cell
-/// count, so half-width buys coverage at the price of resolution: 230 km over
-/// 256 cells is 1.80 km per cell, 150 km is 1.17 km — finer than the 1 km cube
-/// this replaces at a range that still holds a whole mesoscale system. Past
-/// ~150 km the lowest tilt is already above 3 km AGL, so the extra box is mostly
-/// the part of the cone the radar cannot see into.
+/// 80 km, chosen against two limits that pull the same way and one that does
+/// not.
 ///
-/// Not yet a control. When it becomes one it belongs here, because
-/// `VoxelRequest::half_width_km` is clamped rather than refused precisely so a
-/// zoom that reaches the end of its travel stops instead of failing.
-const VOLUME_HALF_WIDTH_KM: f64 = 150.0;
+/// **Resolution.** The grid has a fixed cell count, so half-width is bought with
+/// detail: 230 km over 256 cells is 1.80 km per cell and 150 km is 1.17 km —
+/// which is barely the 1 km cube this whole substrate replaces. 80 km is
+/// 0.63 km, a real gain, and the plan's own worked example (0.31 km at a 40 km
+/// half-width) sits at the tight end of the same trade.
+///
+/// **Data quality.** Past ~150 km the lowest tilt is already above 3 km AGL, so
+/// the outer box is mostly cone the radar cannot see into — cells the resample
+/// fills by interpolating between tilts that are kilometres apart vertically.
+///
+/// **Against them: the box is drawn at true proportions.** 160 x 160 x 18 km is
+/// still an 8.9:1 pancake, and every kilometre of half-width makes it flatter.
+/// Measured on a real KSRX volume, a 300 km box seen from a level camera is a
+/// sliver a few pixels tall; 160 km has visible relief from any angle.
+///
+/// Not yet a control, and it should be one — `VoxelRequest` takes a `centre` as
+/// well as a half-width precisely so the box can follow the pane's viewport.
+/// What stops that today is cost, not design: a rebuild is ~107 ms on the frame
+/// thread here, so a box that tracked a pan would hitch on every drag. It
+/// belongs behind WP-D's worker wire.
+const VOLUME_HALF_WIDTH_KM: f64 = 80.0;
 
 /// Bottom of the box a 3D pane resamples, kilometres MSL.
 ///
@@ -806,23 +819,28 @@ impl App {
         // pipelines would compile a shader against limits already known to be
         // short, and `create_render_pipeline` has no `Result` to notice it in.
         if crate::volume::support(&state.volume_support).is_supported() {
-            log::info!("3D volume view: {quality:?} on {:?}", state.adapter.get_info().device_type);
+            log::info!(
+                "3D volume view: {quality:?} on {:?}",
+                state.adapter.get_info().device_type
+            );
             let resources = crate::volume::bridge::VolumeResources::new(
                 &state.device,
                 state.egui_renderer.attachment_config(),
                 &state.queue,
             );
-            state.egui_renderer.callback_resources_mut().insert(resources);
+            state
+                .egui_renderer
+                .callback_resources_mut()
+                .insert(resources);
         }
 
-        self.gui
-            .set_volume_painter(Some(std::sync::Arc::new(
-                crate::volume::bridge::BridgeVolumePainter::new(
-                    self.volume_store.clone(),
-                    quality,
-                    state.volume_support.clone(),
-                ),
-            )));
+        self.gui.set_volume_painter(Some(std::sync::Arc::new(
+            crate::volume::bridge::BridgeVolumePainter::new(
+                self.volume_store.clone(),
+                quality,
+                state.volume_support.clone(),
+            ),
+        )));
     }
 
     /// Build the voxel grid a 3D pane asked for, unless it is already in hand.
@@ -837,11 +855,7 @@ impl App {
     /// The dedupe below is what keeps it to one hitch per volume rather than one
     /// per frame, and it is the property to preserve when the worker path
     /// arrives.
-    fn handle_prepare_volume(
-        &mut self,
-        pane_idx: usize,
-        target: rustdar_egui::pane::VolumeTarget,
-    ) {
+    fn handle_prepare_volume(&mut self, pane_idx: usize, target: rustdar_egui::pane::VolumeTarget) {
         use crate::volume::bridge::VolumeEntry;
 
         // Attaches either way. `false` means another pane already built this

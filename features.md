@@ -32,7 +32,7 @@ archive, MRMS, satellite and soundings), not the free app.
 | Precipitation rate (DPR)                      | ✅      | ✅         | ✅      |
 | Normalized rotation (NROT)                    | ✅      | ❌         | ✅      |
 | Storm-relative velocity                       | ✅      | ✅         | ✅      |
-| 3D volumetric rendering                       | ✅      | ❌         | 🚧      |
+| 3D volumetric rendering                       | ✅      | ❌         | Partial |
 | Vertical cross-sections                       | ✅      | ❌         | 🚧      |
 | MRMS national mosaic                          | ❌      | ✅         | ❌      |
 | VAD wind profiles                             | ✅      | ❓         | ❌      |
@@ -50,11 +50,18 @@ Notes on the Rustdar column:
 - **HHC, POSH, MEHS, NROT** are derived locally from the Level 2 volume;
   **KDP, EET, VIL, VILD and DPR** come from the Level III bucket
   (`RadarProduct::is_level3`).
-- **3D volumetric rendering** — the Cartesian voxel grid
-  (`rustdar-radar/src/voxel.rs`), the raymarching shader
-  (`rustdar-frontend/src/volume.wgsl`) and the wgpu pipelines
-  (`volume_raymarch.rs`) exist and are tested. There is no pane that displays
-  them, so no user can see a volume render yet.
+- **3D volumetric rendering** — a pane can be switched to a 3D view
+  (View → 3D volume view), which resamples the volume onto a Cartesian voxel
+  grid (`rustdar-radar/src/voxel.rs`) and raymarches it
+  (`rustdar-frontend/src/volume.wgsl`, `volume_raymarch.rs`, wired by
+  `volume_bridge.rs`). Drag to orbit, scroll or pinch to zoom. **Reflectivity
+  only**: the other five samplable moments have colour tables that are opaque at
+  the bottom of their scale, and a volume drawn through one of those saturates
+  into a solid block rather than a picture — the pane says so rather than
+  drawing it. Two limits behind that: the box is a fixed 160 × 160 × 18 km
+  around the site with no zoom or pan of its own, and the resample runs on the
+  frame thread (~150 ms per volume, once per volume) until the worker wire
+  carries it.
 - **Vertical cross-sections** — the volume sampler
   (`rustdar-radar/src/sampler.rs`) and the section rasterizer
   (`rustdar-radar/src/xsect.rs`) exist and are tested. Nothing draws a section
