@@ -14,6 +14,7 @@ mod palette;
 pub(crate) mod par;
 pub mod render;
 pub mod render_input;
+pub mod sampler;
 pub mod scan;
 pub mod sites;
 pub mod sounding;
