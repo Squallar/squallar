@@ -395,9 +395,9 @@ fn paint_tilt_ladder(
     site_lon: f64,
     elevations: &[f32],
 ) {
-    if elevations.len() != axes.tilt_count || elevations.is_empty() {
+    let Some(curves) = tilt_curves(layout, axes, a, b, site_lat, site_lon, elevations) else {
         return;
-    }
+    };
     // A dark halo under a bright dash, the same trick the ground track uses.
     // Alpha alone does not survive a 65 dBZ core: a faint white line over red
     // disappears exactly where the section most needs to say that its vertical
@@ -406,6 +406,43 @@ fn paint_tilt_ladder(
     let color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 130);
     let painter = painter.with_clip_rect(layout.plot);
 
+    for points in curves {
+        // Dashed rather than solid: a solid line over a reflectivity core reads
+        // as a boundary *in the data*, which is the one thing these must not be
+        // mistaken for.
+        for pair in points.windows(2) {
+            let mid = pair[0] + (pair[1] - pair[0]) * 0.55;
+            painter.line_segment([pair[0], mid], egui::Stroke::new(3.0, halo));
+            painter.line_segment([pair[0], mid], egui::Stroke::new(1.0, color));
+        }
+    }
+}
+
+/// Where each rung's beam centre crosses the section, in pane coordinates —
+/// one polyline per elevation, ascending with the ladder.
+///
+/// Split out from the painting so the geometry has something to be tested
+/// against: the guard below is a refusal, and a refusal that only ever shows up
+/// as "no lines were drawn" is one nothing can fail on.
+///
+/// `None` when the ladder the UI knows about is not the ladder the section was
+/// cut from. `ScanInfo` discovers its elevations from the sweeps and the sampler
+/// keys them through the coverage pattern's cut table, so the two can disagree —
+/// and curves drawn from the wrong ladder would be wrong lines over a correct
+/// picture, which is worse than no lines at all.
+#[allow(clippy::too_many_arguments)]
+fn tilt_curves(
+    layout: &SectionLayout,
+    axes: &SectionAxes,
+    a: (f64, f64),
+    b: (f64, f64),
+    site_lat: f64,
+    site_lon: f64,
+    elevations: &[f32],
+) -> Option<Vec<Vec<egui::Pos2>>> {
+    if elevations.is_empty() || elevations.len() != axes.tilt_count {
+        return None;
+    }
     // The ground range of each sample point, computed once and shared by every
     // rung: it is a property of the line and the site, not of the elevation.
     let ranges: Vec<(f32, f64)> = (0..=TILT_CURVE_SAMPLES)
@@ -417,24 +454,21 @@ fn paint_tilt_ladder(
         })
         .collect();
 
-    for &elev in elevations {
-        let points: Vec<egui::Pos2> = ranges
+    Some(
+        elevations
             .iter()
-            .map(|&(x, ground_km)| {
-                let km_msl =
-                    axes.base_km_msl + beam::height_at_ground_km(ground_km, f64::from(elev));
-                egui::pos2(x, layout.y_of_height(axes, km_msl))
+            .map(|&elev| {
+                ranges
+                    .iter()
+                    .map(|&(x, ground_km)| {
+                        let km_msl = axes.base_km_msl
+                            + beam::height_at_ground_km(ground_km, f64::from(elev));
+                        egui::pos2(x, layout.y_of_height(axes, km_msl))
+                    })
+                    .collect()
             })
-            .collect();
-        // Dashed rather than solid: a solid line over a reflectivity core reads
-        // as a boundary *in the data*, which is the one thing these must not be
-        // mistaken for.
-        for pair in points.windows(2) {
-            let mid = pair[0] + (pair[1] - pair[0]) * 0.55;
-            painter.line_segment([pair[0], mid], egui::Stroke::new(3.0, halo));
-            painter.line_segment([pair[0], mid], egui::Stroke::new(1.0, color));
-        }
-    }
+            .collect(),
+    )
 }
 
 /// The caption: what this is, how coarse it is, and where it disagrees with the
@@ -767,6 +801,67 @@ mod tests {
         assert!(
             tiny.plot.left() < tiny.plot.right(),
             "the picture must not be squeezed out by its own gutters"
+        );
+    }
+
+    /// The rungs are the honesty device, so both halves of them are pinned: the
+    /// refusal when the two ladders disagree, and the fanning that makes the
+    /// picture say where interpolation is worst.
+    ///
+    /// The refusal matters because `ScanInfo` discovers its elevations from the
+    /// sweeps while the sampler keys them through the coverage pattern's cut
+    /// table. Those can disagree, and curves drawn from the wrong ladder are
+    /// wrong lines over a correct picture — a fabrication, and a more convincing
+    /// one than no lines at all.
+    #[test]
+    fn the_rungs_are_refused_unless_both_ladders_are_the_same_ladder() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 500.0));
+        let layout = SectionLayout::new(rect, false, false);
+        // KTLX, and a line running away from it, so the ground range along the
+        // section really does change.
+        let (site_lat, site_lon) = (35.3333, -97.2778);
+        let a = (35.5, -96.5);
+        let b = (36.2, -95.4);
+        let ladder = [0.5f32, 1.5, 2.4, 3.4, 4.3, 6.0, 9.9, 14.6, 19.5];
+        let axes = SectionAxes {
+            tilt_count: ladder.len(),
+            ..axes()
+        };
+
+        assert!(
+            tilt_curves(&layout, &axes, a, b, site_lat, site_lon, &[]).is_none(),
+            "an empty ladder has no rungs to draw"
+        );
+        assert!(
+            tilt_curves(&layout, &axes, a, b, site_lat, site_lon, &ladder[..8]).is_none(),
+            "eight known elevations against a nine-rung section is two different \
+             ladders, and drawing either over the other is a fabrication"
+        );
+
+        let curves = tilt_curves(&layout, &axes, a, b, site_lat, site_lon, &ladder)
+            .expect("matching ladders must draw");
+        assert_eq!(curves.len(), ladder.len(), "one polyline per rung");
+
+        // Ascending: a higher elevation is a higher beam, which on screen is a
+        // smaller y. Getting this inverted would draw the ladder upside down
+        // over a correct picture.
+        for pair in curves.windows(2) {
+            assert!(
+                pair[1][0].y < pair[0][0].y,
+                "the rungs are not in ascending order of height"
+            );
+        }
+
+        // And the gap between adjacent rungs **grows with range**, which is the
+        // whole reason drawing them is honest rather than decorative: it is a
+        // picture of the interpolation getting worse further out, at the place
+        // in the section where it is getting worse.
+        let near = curves[1][0].y - curves[0][0].y;
+        let far = curves[1][TILT_CURVE_SAMPLES].y - curves[0][TILT_CURVE_SAMPLES].y;
+        assert!(
+            far.abs() > near.abs() * 1.2,
+            "the rungs do not fan apart with range ({near} near, {far} far), so \
+             the drawing says nothing about where the ladder is coarsest"
         );
     }
 
