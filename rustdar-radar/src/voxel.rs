@@ -2403,6 +2403,10 @@ mod tests {
         }
         let (data, empty) = edge.expect("the fixture must contain a strong echo edge");
         assert_eq!(empty, NO_DATA_INDEX);
+        // Measured, so the numbers below are numbers and not a description:
+        // the 65 dBZ core resamples to index 195 exactly, which is
+        // −32.5 + 195 × 0.5.
+        assert_eq!((data, grid.index_to_value(data)), (195, 65.0));
 
         // ── ours: bottom of ramp ──
         let mut previous = f64::INFINITY;
@@ -2438,6 +2442,10 @@ mod tests {
             "the fade should be a real fraction of the edge, not a rounding \
              artefact; reached transparency only at t={faded_at}",
         );
+        // Measured: index 195 × (1 − t) drops to 64 — the top of the
+        // transparent band, −0.5 dBZ — at t = 43/64, so the last third of the
+        // way to the empty neighbour is already invisible.
+        assert_eq!(faded_at, 43.0 / 64.0);
 
         // ── the rejected encoding: index 0 out of band ──
         //
@@ -2468,6 +2476,21 @@ mod tests {
             "bottom-of-ramp must read materially weaker halfway across the \
              edge than the out-of-band encoding: {ours_half} dBZ against \
              {fabricated} dBZ",
+        );
+
+        // The whole comparison as three numbers, so a change to any of them
+        // is a change to the decision rather than to a wording.
+        assert_eq!(
+            (
+                (data_value * 100.0).round(),
+                (ours_half * 100.0).round(),
+                (fabricated * 100.0).round(),
+            ),
+            (6500.0, 1625.0, 3235.0),
+            "65.00 dBZ core; halfway across its edge bottom-of-ramp reads \
+             16.25 dBZ and fades out a third of the way further on, while the \
+             rejected out-of-band encoding reads 32.35 dBZ at full opacity and \
+             only vanishes on the empty voxel itself",
         );
     }
 
