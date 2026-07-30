@@ -20,12 +20,35 @@ pub const RENDER_HEIGHT: u32 = 1080;
 /// used to take the desktop 6 while `offload` ran jobs inline, which meant six
 /// renders could run back to back inside a single frame — six times the stall
 /// this cap exists to bound. Raise it in step with the worker pool, not alone.
+///
+/// The three arms are named outside the cascade for the reason
+/// [`WASM_VOLUME_GRID_CELLS`] gives: a `cfg`-selected literal can only be
+/// checked by the target that compiles it, and this workspace runs `cargo test`
+/// on exactly one of the three.
+pub const WASM_MAX_CONCURRENT_RENDERS: usize = 1;
+/// The mobile arm. See [`WASM_MAX_CONCURRENT_RENDERS`].
+pub const MOBILE_MAX_CONCURRENT_RENDERS: usize = 3;
+/// The desktop arm. See [`WASM_MAX_CONCURRENT_RENDERS`].
+pub const DESKTOP_MAX_CONCURRENT_RENDERS: usize = 6;
+
+/// See [`WASM_MAX_CONCURRENT_RENDERS`].
 #[cfg(target_arch = "wasm32")]
-pub const MAX_CONCURRENT_RENDERS: usize = 1;
+pub const MAX_CONCURRENT_RENDERS: usize = WASM_MAX_CONCURRENT_RENDERS;
+/// See [`WASM_MAX_CONCURRENT_RENDERS`].
 #[cfg(all(not(target_arch = "wasm32"), mobile))]
-pub const MAX_CONCURRENT_RENDERS: usize = 3;
+pub const MAX_CONCURRENT_RENDERS: usize = MOBILE_MAX_CONCURRENT_RENDERS;
+/// See [`WASM_MAX_CONCURRENT_RENDERS`].
 #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
-pub const MAX_CONCURRENT_RENDERS: usize = 6;
+pub const MAX_CONCURRENT_RENDERS: usize = DESKTOP_MAX_CONCURRENT_RENDERS;
+
+/// Maximum number of loop frames to consider for rendering per dispatch cycle,
+/// on wasm32. See [`MAX_LOOP_RENDER_BUDGET`]; named outside the cascade for the
+/// reason [`WASM_VOLUME_GRID_CELLS`] gives.
+pub const WASM_MAX_LOOP_RENDER_BUDGET: usize = 8;
+/// The mobile arm. See [`MAX_LOOP_RENDER_BUDGET`].
+pub const MOBILE_MAX_LOOP_RENDER_BUDGET: usize = 12;
+/// The desktop arm. See [`MAX_LOOP_RENDER_BUDGET`].
+pub const DESKTOP_MAX_LOOP_RENDER_BUDGET: usize = 30;
 
 /// Maximum number of loop frames to consider for rendering per dispatch cycle.
 ///
@@ -34,11 +57,13 @@ pub const MAX_CONCURRENT_RENDERS: usize = 6;
 /// dispatch and drops the texture of every frame outside the render set. That makes
 /// this — not `MAX_LOOP_FRAMES` — the binding term in the per-pane texture budget.
 #[cfg(target_arch = "wasm32")]
-pub const MAX_LOOP_RENDER_BUDGET: usize = 8;
+pub const MAX_LOOP_RENDER_BUDGET: usize = WASM_MAX_LOOP_RENDER_BUDGET;
+/// See the wasm32 arm above.
 #[cfg(all(not(target_arch = "wasm32"), mobile))]
-pub const MAX_LOOP_RENDER_BUDGET: usize = 12;
+pub const MAX_LOOP_RENDER_BUDGET: usize = MOBILE_MAX_LOOP_RENDER_BUDGET;
+/// See the wasm32 arm above.
 #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
-pub const MAX_LOOP_RENDER_BUDGET: usize = 30;
+pub const MAX_LOOP_RENDER_BUDGET: usize = DESKTOP_MAX_LOOP_RENDER_BUDGET;
 
 /// Maximum number of concurrent loop scan downloads per pane.
 #[cfg(mobile)]
@@ -68,12 +93,24 @@ pub const MAX_CONCURRENT_LOOP_DOWNLOADS: usize = 8;
 /// replaced `target_os = "android"` because the distinction being made is how
 /// much memory the device has, not which OS it runs — and iOS needs the same
 /// answer. Every target that exists today selects exactly the arm it did before.
+///
+/// The three arms are named outside the cascade, like every other cascade in
+/// this file. See [`WASM_VOLUME_GRID_CELLS`] for why.
 #[cfg(target_arch = "wasm32")]
-pub const MAX_LOOP_FRAMES: usize = 12;
+pub const MAX_LOOP_FRAMES: usize = WASM_MAX_LOOP_FRAMES;
+/// See the wasm32 arm above.
 #[cfg(all(not(target_arch = "wasm32"), mobile))]
-pub const MAX_LOOP_FRAMES: usize = 20;
+pub const MAX_LOOP_FRAMES: usize = MOBILE_MAX_LOOP_FRAMES;
+/// See the wasm32 arm above.
 #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
-pub const MAX_LOOP_FRAMES: usize = 60;
+pub const MAX_LOOP_FRAMES: usize = DESKTOP_MAX_LOOP_FRAMES;
+
+/// The wasm32 arm of [`MAX_LOOP_FRAMES`].
+pub const WASM_MAX_LOOP_FRAMES: usize = 12;
+/// The mobile arm. See [`MAX_LOOP_FRAMES`].
+pub const MOBILE_MAX_LOOP_FRAMES: usize = 20;
+/// The desktop arm. See [`MAX_LOOP_FRAMES`].
+pub const DESKTOP_MAX_LOOP_FRAMES: usize = 60;
 
 /// Ceiling on what one pane's loop textures may occupy, in bytes.
 ///
@@ -96,12 +133,25 @@ pub const MAX_LOOP_FRAMES: usize = 60;
 ///
 /// wasm32's is the tight one: the whole linear memory is capped at 4 GiB, and the
 /// loop is only one of several things competing for it.
+///
+/// The table above is the *claim*; the three arms are named outside the cascade
+/// so `loop_frames_fit_the_target_texture_budget` can check every row of it from
+/// one host build rather than only the row that build compiled.
 #[cfg(target_arch = "wasm32")]
-pub const LOOP_TEXTURE_BUDGET_BYTES: usize = 48 * 1024 * 1024;
+pub const LOOP_TEXTURE_BUDGET_BYTES: usize = WASM_LOOP_TEXTURE_BUDGET_BYTES;
+/// See the wasm32 arm above.
 #[cfg(all(not(target_arch = "wasm32"), mobile))]
-pub const LOOP_TEXTURE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+pub const LOOP_TEXTURE_BUDGET_BYTES: usize = MOBILE_LOOP_TEXTURE_BUDGET_BYTES;
+/// See the wasm32 arm above.
 #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
-pub const LOOP_TEXTURE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+pub const LOOP_TEXTURE_BUDGET_BYTES: usize = DESKTOP_LOOP_TEXTURE_BUDGET_BYTES;
+
+/// The wasm32 arm of [`LOOP_TEXTURE_BUDGET_BYTES`].
+pub const WASM_LOOP_TEXTURE_BUDGET_BYTES: usize = 48 * 1024 * 1024;
+/// The mobile arm. See [`LOOP_TEXTURE_BUDGET_BYTES`].
+pub const MOBILE_LOOP_TEXTURE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+/// The desktop arm. See [`LOOP_TEXTURE_BUDGET_BYTES`].
+pub const DESKTOP_LOOP_TEXTURE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// Maximum number of entries kept in `RenderDispatcher::render_cache`.
 ///
@@ -217,12 +267,25 @@ pub const WEBGL2_MAX_TEXTURE_DIMENSION_3D: u32 =
 /// would make this ceiling untestable against [`VOLUME_GRID_CELLS`], which is
 /// the only thing it can be checked against, and would leave a doubled grid
 /// axis hiding inside the offscreen's slack.
+///
+/// Named outside the cascade, like [`VOLUME_GRID_CELLS`] itself: budgeting the
+/// grid arm-by-arm is only possible if both sides of every row of the table
+/// above have names a host build can reach.
 #[cfg(target_arch = "wasm32")]
-pub const VOLUME_TEXTURE_BUDGET_BYTES: usize = 1536 * 1024;
+pub const VOLUME_TEXTURE_BUDGET_BYTES: usize = WASM_VOLUME_TEXTURE_BUDGET_BYTES;
+/// See the wasm32 arm above.
 #[cfg(all(not(target_arch = "wasm32"), mobile))]
-pub const VOLUME_TEXTURE_BUDGET_BYTES: usize = 5 * 1024 * 1024;
+pub const VOLUME_TEXTURE_BUDGET_BYTES: usize = MOBILE_VOLUME_TEXTURE_BUDGET_BYTES;
+/// See the wasm32 arm above.
 #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
-pub const VOLUME_TEXTURE_BUDGET_BYTES: usize = 12 * 1024 * 1024;
+pub const VOLUME_TEXTURE_BUDGET_BYTES: usize = DESKTOP_VOLUME_TEXTURE_BUDGET_BYTES;
+
+/// The wasm32 arm of [`VOLUME_TEXTURE_BUDGET_BYTES`].
+pub const WASM_VOLUME_TEXTURE_BUDGET_BYTES: usize = 1536 * 1024;
+/// The mobile arm. See [`VOLUME_TEXTURE_BUDGET_BYTES`].
+pub const MOBILE_VOLUME_TEXTURE_BUDGET_BYTES: usize = 5 * 1024 * 1024;
+/// The desktop arm. See [`VOLUME_TEXTURE_BUDGET_BYTES`].
+pub const DESKTOP_VOLUME_TEXTURE_BUDGET_BYTES: usize = 12 * 1024 * 1024;
 
 /// The largest pane, in physical pixels, the offscreen budget is sized for.
 ///
@@ -377,92 +440,163 @@ const _: () = const {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustdar_radar::types::IMAGE_SIZE;
+    use rustdar_radar::types::{IMAGE_SIZE, NATIVE_IMAGE_SIZE, WASM_IMAGE_SIZE};
 
-    /// Bytes one loop frame's texture occupies: RGBA at `IMAGE_SIZE²`.
-    /// Loop frames carry no value grid — `poll_loop_render_results` stores an empty
-    /// one — so this is the whole cost, unlike a static pane render.
-    const fn loop_frame_bytes() -> usize {
-        IMAGE_SIZE * IMAGE_SIZE * 4
+    /// One device class's share of every cascade in this file.
+    ///
+    /// The four budget invariants below used to read the `cfg`-selected
+    /// constants directly, which meant each of them checked one arm out of
+    /// three and left the other two free — the same one-sided shape 3292e8d
+    /// fixed for the voxel grid, and it was still here for the budgets. The
+    /// arms all have names now, so a table can be built and every invariant
+    /// run against every row.
+    struct Arm {
+        name: &'static str,
+        /// `rustdar_radar::types::IMAGE_SIZE` for this class. It is a *two*-arm
+        /// cascade — mobile is native — so this is where the two cascade shapes
+        /// in this workspace are reconciled.
+        image_size: usize,
+        concurrent_renders: usize,
+        loop_frames: usize,
+        render_budget: usize,
+        loop_budget: usize,
+        grid: [u32; 3],
+        volume_budget: usize,
     }
 
-    /// Frames that hold a texture at once. `evict_textures_outside_render_set` runs
-    /// every dispatch with `MAX_LOOP_RENDER_BUDGET`, so a loop of `MAX_LOOP_FRAMES`
-    /// keeps only the render set textured.
-    const fn textured_frames() -> usize {
-        if MAX_LOOP_RENDER_BUDGET < MAX_LOOP_FRAMES {
-            MAX_LOOP_RENDER_BUDGET
-        } else {
-            MAX_LOOP_FRAMES
+    impl Arm {
+        /// Bytes one loop frame's texture occupies: RGBA at `image_size²`.
+        /// Loop frames carry no value grid — `poll_loop_render_results` stores an
+        /// empty one — so this is the whole cost, unlike a static pane render.
+        fn loop_frame_bytes(&self) -> usize {
+            self.image_size * self.image_size * 4
+        }
+
+        /// Frames that hold a texture at once. `evict_textures_outside_render_set`
+        /// runs every dispatch with `MAX_LOOP_RENDER_BUDGET`, so a loop of
+        /// `MAX_LOOP_FRAMES` keeps only the render set textured.
+        fn textured_frames(&self) -> usize {
+            self.render_budget.min(self.loop_frames)
+        }
+
+        /// Bytes one pane's 3D volume occupies: an `R8Unorm` cell per grid cell,
+        /// plus the RGBA table those cells index.
+        ///
+        /// One byte per cell is not an assumption to be tidied away: `R8Unorm` was
+        /// chosen because it is *filterable* under `Features::empty()`, which
+        /// `R32Float` is not, and because index-to-dBZ being affine makes hardware
+        /// filtering exactly linear dBZ interpolation.
+        fn volume_bytes(&self) -> usize {
+            self.grid.iter().map(|&n| n as usize).product::<usize>() + VOLUME_LUT_BYTES
         }
     }
 
-    /// The ceiling the per-target constants were chosen to fit. Whichever arm this
-    /// build compiled, its own constants are what get checked — so the wasm arm is
-    /// held to the wasm budget when built for wasm, and desktop to desktop's here.
+    /// Every device class this workspace builds for, exactly once.
+    fn arms() -> [Arm; 3] {
+        [
+            Arm {
+                name: "wasm32",
+                image_size: WASM_IMAGE_SIZE,
+                concurrent_renders: WASM_MAX_CONCURRENT_RENDERS,
+                loop_frames: WASM_MAX_LOOP_FRAMES,
+                render_budget: WASM_MAX_LOOP_RENDER_BUDGET,
+                loop_budget: WASM_LOOP_TEXTURE_BUDGET_BYTES,
+                grid: WASM_VOLUME_GRID_CELLS,
+                volume_budget: WASM_VOLUME_TEXTURE_BUDGET_BYTES,
+            },
+            Arm {
+                name: "mobile",
+                image_size: NATIVE_IMAGE_SIZE,
+                concurrent_renders: MOBILE_MAX_CONCURRENT_RENDERS,
+                loop_frames: MOBILE_MAX_LOOP_FRAMES,
+                render_budget: MOBILE_MAX_LOOP_RENDER_BUDGET,
+                loop_budget: MOBILE_LOOP_TEXTURE_BUDGET_BYTES,
+                grid: MOBILE_VOLUME_GRID_CELLS,
+                volume_budget: MOBILE_VOLUME_TEXTURE_BUDGET_BYTES,
+            },
+            Arm {
+                name: "desktop",
+                image_size: NATIVE_IMAGE_SIZE,
+                concurrent_renders: DESKTOP_MAX_CONCURRENT_RENDERS,
+                loop_frames: DESKTOP_MAX_LOOP_FRAMES,
+                render_budget: DESKTOP_MAX_LOOP_RENDER_BUDGET,
+                loop_budget: DESKTOP_LOOP_TEXTURE_BUDGET_BYTES,
+                grid: DESKTOP_VOLUME_GRID_CELLS,
+                volume_budget: DESKTOP_VOLUME_TEXTURE_BUDGET_BYTES,
+            },
+        ]
+    }
+
+    /// The ceiling the per-target constants were chosen to fit, checked on
+    /// **every** arm rather than on the one this build compiled.
+    ///
+    /// This is the table in [`LOOP_TEXTURE_BUDGET_BYTES`]' doc comment, executed.
+    /// Two of its three rows were previously prose.
     #[test]
     fn loop_frames_fit_the_target_texture_budget() {
-        let total = textured_frames() * loop_frame_bytes();
-        assert!(
-            total <= LOOP_TEXTURE_BUDGET_BYTES,
-            "{} textured frames x {IMAGE_SIZE}^2 x 4B = {} MiB, over the {} MiB budget",
-            textured_frames(),
-            total / (1024 * 1024),
-            LOOP_TEXTURE_BUDGET_BYTES / (1024 * 1024),
-        );
+        for arm in arms() {
+            let total = arm.textured_frames() * arm.loop_frame_bytes();
+            assert!(
+                total <= arm.loop_budget,
+                "{}: {} textured frames x {}^2 x 4B = {} MiB, over the {} MiB budget",
+                arm.name,
+                arm.textured_frames(),
+                arm.image_size,
+                total / (1024 * 1024),
+                arm.loop_budget / (1024 * 1024),
+            );
+        }
     }
 
     /// The budget is meant to be snug. A ceiling several times the real figure would
     /// pass the check above while permitting a silent doubling of any constant in it.
     #[test]
     fn the_budget_is_not_slack_enough_to_hide_a_doubling() {
-        let total = textured_frames() * loop_frame_bytes();
-        assert!(
-            total * 2 > LOOP_TEXTURE_BUDGET_BYTES,
-            "budget {} MiB is more than twice the actual {} MiB — it would not catch a regression",
-            LOOP_TEXTURE_BUDGET_BYTES / (1024 * 1024),
-            total / (1024 * 1024),
-        );
+        for arm in arms() {
+            let total = arm.textured_frames() * arm.loop_frame_bytes();
+            assert!(
+                total * 2 > arm.loop_budget,
+                "{}: budget {} MiB is more than twice the actual {} MiB — it would \
+                 not catch a regression",
+                arm.name,
+                arm.loop_budget / (1024 * 1024),
+                total / (1024 * 1024),
+            );
+        }
     }
 
     /// The eviction budget is what bounds memory, so it has to be the smaller of the
     /// two. If it ever exceeded the frame cap, `render_set_indices` would clamp it
     /// back to the frame count and every held frame would stay textured — silently
     /// restoring the `MAX_LOOP_FRAMES × frame` figure the budget above rules out.
-    /// The ordering itself is asserted at compile time next to the constants; this
-    /// pins the consequence the budget arithmetic depends on.
+    /// The ordering itself is asserted at compile time next to the constants — but
+    /// only for the compiled arm, which is why it is asserted for all three here.
     #[test]
     fn the_render_budget_is_what_bounds_the_textured_frames() {
-        assert_eq!(textured_frames(), MAX_LOOP_RENDER_BUDGET);
+        for arm in arms() {
+            assert_eq!(arm.textured_frames(), arm.render_budget, "{}", arm.name);
+            // A zero anywhere in the cascade is a loop that renders nothing, and
+            // the compile-time block next to the constants only sees one arm.
+            assert!(arm.render_budget > 0, "{}", arm.name);
+            assert!(arm.concurrent_renders > 0, "{}", arm.name);
+        }
     }
 
-    /// Bytes one pane's 3D volume occupies: an `R8Unorm` cell per grid cell, plus
-    /// the RGBA table those cells index.
-    ///
-    /// One byte per cell is not an assumption to be tidied away: `R8Unorm` was
-    /// chosen because it is *filterable* under `Features::empty()`, which
-    /// `R32Float` is not, and because index-to-dBZ being affine makes hardware
-    /// filtering exactly linear dBZ interpolation.
-    fn volume_bytes() -> usize {
-        let cells = VOLUME_GRID_CELLS
-            .iter()
-            .map(|&n| n as usize)
-            .product::<usize>();
-        cells + VOLUME_LUT_BYTES
-    }
-
-    /// Whichever arm this build compiled is held to its own budget, exactly as
-    /// `loop_frames_fit_the_target_texture_budget` is.
+    /// Every arm is held to its own volume budget, exactly as
+    /// `loop_frames_fit_the_target_texture_budget` holds it to its loop budget.
     #[test]
     fn the_volume_grid_fits_the_target_texture_budget() {
-        let total = volume_bytes();
-        assert!(
-            total <= VOLUME_TEXTURE_BUDGET_BYTES,
-            "a {:?} grid plus a {VOLUME_LUT_BYTES} B table is {total} B, over the \
-             {} B budget",
-            VOLUME_GRID_CELLS,
-            VOLUME_TEXTURE_BUDGET_BYTES,
-        );
+        for arm in arms() {
+            let total = arm.volume_bytes();
+            assert!(
+                total <= arm.volume_budget,
+                "{}: a {:?} grid plus a {VOLUME_LUT_BYTES} B table is {total} B, \
+                 over the {} B budget",
+                arm.name,
+                arm.grid,
+                arm.volume_budget,
+            );
+        }
     }
 
     /// The sibling of `the_budget_is_not_slack_enough_to_hide_a_doubling`, and for
@@ -474,13 +608,108 @@ mod tests {
     /// axis doubles the total.
     #[test]
     fn the_volume_budget_is_not_slack_enough_to_hide_a_doubling() {
-        let total = volume_bytes();
-        assert!(
-            total * 2 > VOLUME_TEXTURE_BUDGET_BYTES,
-            "budget {} B is more than twice the actual {total} B — it would not \
-             catch a doubled grid axis",
-            VOLUME_TEXTURE_BUDGET_BYTES,
+        for arm in arms() {
+            let total = arm.volume_bytes();
+            assert!(
+                total * 2 > arm.volume_budget,
+                "{}: budget {} B is more than twice the actual {total} B — it \
+                 would not catch a doubled grid axis",
+                arm.name,
+                arm.volume_budget,
+            );
+        }
+    }
+
+    /// The literals behind the tables in the two budget doc comments.
+    ///
+    /// The invariants above are relations, and a relation holds just as well
+    /// after both of its sides move together — which is the one change they
+    /// cannot see. `the_grid_dimensions_match_the_shapes_rustdar_radar_names`
+    /// pins the grid triples for the same reason; this is the rest of the row.
+    #[test]
+    fn the_documented_per_class_figures_are_what_the_arms_actually_say() {
+        let expected = [
+            // name, image, concurrent, held, textured, loop budget MiB, volume budget B
+            ("wasm32", 1024, 1, 12, 8, 48, 1536 * 1024),
+            ("mobile", 2048, 3, 20, 12, 256, 5 * 1024 * 1024),
+            ("desktop", 2048, 6, 60, 30, 512, 12 * 1024 * 1024),
+        ];
+        for (arm, (name, image, concurrent, held, textured, loop_mib, volume)) in
+            arms().into_iter().zip(expected)
+        {
+            assert_eq!(arm.name, name);
+            assert_eq!(arm.image_size, image, "{name} image size");
+            assert_eq!(arm.concurrent_renders, concurrent, "{name} renders");
+            assert_eq!(arm.loop_frames, held, "{name} held frames");
+            assert_eq!(arm.render_budget, textured, "{name} render budget");
+            assert_eq!(
+                arm.loop_budget,
+                loop_mib * 1024 * 1024,
+                "{name} loop budget"
+            );
+            assert_eq!(arm.volume_budget, volume, "{name} volume budget");
+        }
+    }
+
+    /// This target's cascades all selected the *same* arm as each other.
+    ///
+    /// `cfg`-gated, because the selection is the one thing here no other target
+    /// can check on behalf of this one — and it is a real hazard rather than a
+    /// formality: the arms are six near-identical `#[cfg(all(…))]` lines per
+    /// constant, and a mismatched one gives a build a mobile frame budget with
+    /// a desktop texture ceiling, which passes every invariant above.
+    #[test]
+    fn every_cascade_in_this_file_selected_the_same_arm() {
+        #[cfg(target_arch = "wasm32")]
+        let arm = &arms()[0];
+        #[cfg(all(not(target_arch = "wasm32"), mobile))]
+        let arm = &arms()[1];
+        #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+        let arm = &arms()[2];
+
+        assert_eq!(IMAGE_SIZE, arm.image_size, "{}", arm.name);
+        assert_eq!(
+            MAX_CONCURRENT_RENDERS, arm.concurrent_renders,
+            "{}",
+            arm.name
         );
+        assert_eq!(MAX_LOOP_FRAMES, arm.loop_frames, "{}", arm.name);
+        assert_eq!(MAX_LOOP_RENDER_BUDGET, arm.render_budget, "{}", arm.name);
+        assert_eq!(LOOP_TEXTURE_BUDGET_BYTES, arm.loop_budget, "{}", arm.name);
+        assert_eq!(VOLUME_GRID_CELLS, arm.grid, "{}", arm.name);
+        assert_eq!(
+            VOLUME_TEXTURE_BUDGET_BYTES, arm.volume_budget,
+            "{}",
+            arm.name
+        );
+    }
+
+    /// The web image fits what a browser is *guaranteed* to accept.
+    ///
+    /// `rustdar_radar` states the 2048 floor as a literal because it has no wgpu
+    /// dependency and must not grow one — it hands finished RGBA buffers to the
+    /// crate that owns the GPU. This is that crate, so this is where the floor
+    /// gets checked against wgpu's own downlevel limits rather than against a
+    /// number someone typed. Without it, `WEBGL2_MAX_TEXTURE_DIMENSION_2D` could
+    /// be raised to accommodate an over-large image instead of the image being
+    /// the thing that gives.
+    #[test]
+    fn the_web_image_fits_the_texture_size_webgl2_guarantees() {
+        let guaranteed = wgpu::Limits::downlevel_webgl2_defaults().max_texture_dimension_2d;
+        assert_eq!(
+            rustdar_radar::types::WEBGL2_MAX_TEXTURE_DIMENSION_2D as u32,
+            guaranteed,
+            "rustdar_radar's copy of the WebGL2 2D floor has drifted from wgpu's"
+        );
+        assert!(
+            WASM_IMAGE_SIZE as u32 <= guaranteed,
+            "the web radar image is {WASM_IMAGE_SIZE} px, over the {guaranteed} px \
+             2D texture WebGL2 guarantees — every browser render would fail"
+        );
+        // And with the whole other half of the guarantee still free, which is
+        // the stated reason the web arm halves rather than matching native: the
+        // overlay textures are allocated alongside the radar frame.
+        assert!(WASM_IMAGE_SIZE as u32 * 2 <= guaranteed);
     }
 
     /// The reference pane fits this target's offscreen budget **at its own
