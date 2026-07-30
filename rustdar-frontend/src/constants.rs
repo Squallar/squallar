@@ -404,7 +404,11 @@ const _: () = const {
     assert!(DEFAULT_LOOP_SPEED_FPS <= MAX_LOOP_SPEED_FPS);
     // Eviction is what bounds the textured-frame count, so it must bind first.
     assert!(MAX_LOOP_RENDER_BUDGET <= MAX_LOOP_FRAMES);
-    // Every render path indexes a square image; the projection assumes a power of two.
+    // Not every render path is square any more — `xsect`'s section raster is
+    // `IMAGE_SIZE` × `IMAGE_SIZE / 2`. What every path does share is the side
+    // itself: the plan-view projection assumes it is a power of two, and that is
+    // also what makes the section's halved height exact and a power of two in
+    // its own right rather than a truncating divide.
     assert!(rustdar_radar::types::IMAGE_SIZE.is_power_of_two());
 
     assert!(VOLUME_TEXTURE_BUDGET_BYTES > 0);
