@@ -582,18 +582,19 @@ impl VoxelGrid {
     /// of the whole ramp. `the_fade_band_is_measured_per_product` records
     /// every product's.
     pub fn fade_band(&self) -> u8 {
-        let first_opaque = self
-            .lut
-            .chunks_exact(4)
-            .position(|entry| entry[3] != 0)
-            // A table with no opaque entry at all — which no samplable
-            // product produces — fades over its whole length.
-            .unwrap_or(LUT_LEN / 4);
-        // Entry 0 is forced transparent, so `first_opaque` is at least 1 and
-        // the band is `first_opaque − 1` indices wide. `saturating_sub` rather
-        // than `−` because "index 0 is opaque" would mean a band of 0, not a
-        // panic.
-        first_opaque.saturating_sub(1) as u8
+        match self.lut.chunks_exact(4).position(|entry| entry[3] != 0) {
+            // Entry 0 is forced transparent, so the first opaque entry is at
+            // index 1 or above and the band under it is `n − 1` wide.
+            // `saturating_sub` rather than `−` because an opaque entry 0 —
+            // which `colormap_lut` cannot produce — would mean a band of 0,
+            // not a panic. `n` is a position in a 256-entry table, so the cast
+            // cannot truncate.
+            Some(n) => n.saturating_sub(1) as u8,
+            // No opaque entry anywhere: the whole ramp fades. Unreachable from
+            // `build_voxels`, since every product's palette is opaque
+            // somewhere, and reachable by hand — which is how it is tested.
+            None => u8::MAX,
+        }
     }
 
     /// The offset of cell `(x, y, z)` in [`indices`](Self::indices) and
@@ -2541,6 +2542,17 @@ mod tests {
             f64::from(grid.fade_band()) / 255.0 > 0.24,
             "a quarter of the whole ramp",
         );
+
+        // The two ends of the measurement, which no product's palette reaches
+        // and only a hand-built table can: a table opaque from index 1 has no
+        // band, and one transparent throughout fades over the whole ramp.
+        let mut opaque = hand_built(None);
+        opaque.lut = vec![255; LUT_LEN];
+        opaque.lut[3] = 0;
+        assert_eq!(opaque.fade_band(), 0);
+        let mut clear = hand_built(None);
+        clear.lut = vec![0; LUT_LEN];
+        assert_eq!(clear.fade_band(), u8::MAX);
     }
 
     /// Differential phase is circular, so the two ends of its ramp are the
