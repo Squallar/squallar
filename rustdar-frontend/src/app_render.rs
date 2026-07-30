@@ -5428,3 +5428,294 @@ mod pane_kind_render_filter_tests {
         }
     }
 }
+
+/// What a section pane is told when it cannot be cut, and when the picture on
+/// screen has stopped being the truth.
+///
+/// The two refusals here are the ones a user meets without doing anything
+/// wrong, and the whole point of separating them is that they are *unlike*: one
+/// resolves itself on the next volume and the other never will. A pane that
+/// showed the same blank for both would make the recoverable one look broken and
+/// the permanent one look like it was still loading.
+#[cfg(test)]
+mod section_dispatch_tests {
+    use super::*;
+    use crate::platform_double::TestBridge;
+    use nexrad_model::data::{
+        ChannelConfiguration, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus, Scan,
+        Sweep, VolumeCoveragePattern, WaveformType,
+    };
+    use rustdar_egui::pane::{GeoPoint, PaneKind, SectionLine, SectionUnavailable};
+    use rustdar_radar::types::{RadarProduct, ScanInfo};
+
+    const SITE: &str = "KTLX";
+
+    fn volume_time() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 30)
+            .unwrap()
+            .and_hms_opt(18, 30, 0)
+            .unwrap()
+    }
+
+    fn line() -> SectionLine {
+        SectionLine::new(
+            GeoPoint {
+                lat: 35.0,
+                lon: -97.8,
+            },
+            GeoPoint {
+                lat: 35.6,
+                lon: -96.9,
+            },
+        )
+        .expect("a fixture line must be finite and have two distinct ends")
+    }
+
+    /// One elevation cut, so the coverage pattern is a real tilt ladder rather
+    /// than the empty placeholder.
+    fn one_cut() -> ElevationCut {
+        ElevationCut::new(
+            0.5,
+            ChannelConfiguration::ConstantPhase,
+            WaveformType::CS,
+            0.0,
+            false,
+            false,
+            false,
+            false,
+            0,
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            false,
+            0,
+            false,
+            0,
+            false,
+            true,
+        )
+    }
+
+    /// A one-sweep reflectivity volume. `cuts` empty is exactly what
+    /// `chunks::placeholder_coverage_pattern(0)` produces — the shape a volume
+    /// joined mid-scan has until its VCP message lands.
+    fn volume(cuts: Vec<ElevationCut>) -> Arc<Scan> {
+        let radial = Radial::new(
+            0,
+            0,
+            0.0,
+            1.0,
+            RadialStatus::ElevationStart,
+            1,
+            0.5,
+            Some(MomentData::from_fixed_point(
+                1,
+                0,
+                250,
+                8,
+                2.0,
+                66.0,
+                vec![32],
+            )),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Arc::new(Scan::new(
+            VolumeCoveragePattern::new(
+                if cuts.is_empty() { 0 } else { 212 },
+                0,
+                0.5,
+                PulseWidth::Short,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+                0,
+                false,
+                false,
+                cuts,
+            ),
+            vec![Sweep::new(1, vec![radial])],
+        ))
+    }
+
+    /// An `App` with one section pane aimed along [`line`], on a site whose
+    /// volume is `scan`.
+    fn app_with_section(product: RadarProduct, scan: Arc<Scan>) -> crate::app::App {
+        let mut app = crate::app::tests::headless(TestBridge::desktop());
+        let site = rustdar_radar::sites::get_radar_site(SITE)
+            .expect("KTLX is a real radar")
+            .clone();
+        {
+            let pane = app.gui.pane_mut(0).unwrap();
+            pane.site = SITE.to_owned();
+            pane.selected_product = product;
+            pane.set_kind(PaneKind::CrossSection);
+            pane.cross_section_mut().unwrap().line = Some(line());
+        }
+        app.gui.set_scan_info_for_pane(
+            0,
+            ScanInfo {
+                site,
+                timestamp: volume_time(),
+                vcp_number: 212,
+                available_products: vec![product],
+                product_elevations: std::collections::HashMap::new(),
+                status: String::new(),
+            },
+        );
+        app.render.ensure_pane_count(1);
+        app.scan_data.insert(SITE.to_owned(), scan);
+        app
+    }
+
+    fn state(app: &crate::app::App) -> &rustdar_egui::pane::CrossSectionPane {
+        app.gui
+            .pane(0)
+            .unwrap()
+            .cross_section()
+            .expect("pane 0 is a section pane")
+    }
+
+    /// A volume joined mid-scan says so, and **keeps asking**.
+    ///
+    /// `chunks.rs` stands in an empty coverage pattern until the VCP message
+    /// lands, and `VolumeSampler::new` refuses that rather than inventing a
+    /// ladder out of the sweeps' own elevation numbers — correctly, but the
+    /// result is a blank pane in ordinary live use.
+    ///
+    /// Leaving the staleness key unwritten is the load-bearing half: the state
+    /// resolves itself on the next volume, so the pane has to be still asking
+    /// when it does. Writing the key here would make a transient condition
+    /// permanent for the life of the pane.
+    #[test]
+    fn a_volume_with_no_coverage_pattern_says_so_and_keeps_asking() {
+        let mut app = app_with_section(RadarProduct::Reflectivity, volume(Vec::new()));
+
+        app.dispatch_section_renders();
+
+        assert_eq!(
+            state(&app).unavailable,
+            Some(SectionUnavailable::AwaitingCoveragePattern),
+            "a mid-scan join is a blank pane with no explanation"
+        );
+        assert_eq!(
+            state(&app).rendered_for,
+            None,
+            "the key was written for a condition that clears itself, so the pane \
+             will never ask again and never show a section"
+        );
+        assert!(
+            !app.render.pane_render[0].render_in_flight,
+            "a render slot was spent to be told what the volume already said"
+        );
+
+        // The message names the cause and says it clears itself, which is the
+        // whole reason it is not folded into a generic "no data".
+        let message = SectionUnavailable::AwaitingCoveragePattern.message();
+        assert!(message.contains("mid-scan"), "{message}");
+        assert!(message.contains("next volume"), "{message}");
+    }
+
+    /// A product with no vertical structure says so, and **stops** asking.
+    ///
+    /// The mirror of the test above, and the pair is the point: nothing about
+    /// this volume or the next will make a column integral sliceable, so
+    /// re-asking every frame is a busy loop with no output and no symptom but a
+    /// warm machine.
+    #[test]
+    fn a_product_with_no_vertical_structure_says_so_and_stops_asking() {
+        let mut app = app_with_section(RadarProduct::EchoTops, volume(vec![one_cut()]));
+
+        app.dispatch_section_renders();
+
+        assert_eq!(
+            state(&app).unavailable,
+            Some(SectionUnavailable::ProductHasNoVerticalStructure(
+                RadarProduct::EchoTops
+            )),
+        );
+        assert!(
+            state(&app).rendered_for.is_some(),
+            "nothing will ever make this product sliceable, so leaving the key \
+             unwritten re-dispatches the same refusal on every frame"
+        );
+        assert!(!app.render.pane_render[0].render_in_flight);
+
+        // Named, so the message can say which product and what to do instead.
+        let message =
+            SectionUnavailable::ProductHasNoVerticalStructure(RadarProduct::EchoTops).message();
+        assert!(message.contains(RadarProduct::EchoTops.name()), "{message}");
+    }
+
+    /// A pane with no volume yet is waiting, not broken.
+    #[test]
+    fn a_section_with_no_volume_is_told_it_is_waiting() {
+        let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
+        app.gui.pane_mut(0).unwrap().scan_info = None;
+
+        app.dispatch_section_renders();
+        assert_eq!(
+            state(&app).unavailable,
+            Some(SectionUnavailable::AwaitingVolume)
+        );
+        assert_eq!(state(&app).rendered_for, None);
+    }
+
+    /// A new volume for the site makes the section on screen stale **by the
+    /// same comparison** that notices a moved endpoint or a changed moment.
+    ///
+    /// This is what buys the absence of a `reset_panes_for_*` arm for section
+    /// panes — the kind of thing that gets remembered for one of the two reset
+    /// paths and not the other. Asserted on the key itself, because the key is
+    /// what the dispatch decides on.
+    #[test]
+    fn a_new_volume_makes_the_section_on_screen_stale_with_no_reset_arm() {
+        let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
+
+        let before = app
+            .section_target_for_pane(0)
+            .expect("the pane is aimed and has a volume");
+
+        // Nothing but the volume time moves.
+        if let Some(info) = app.gui.pane_mut(0).unwrap().scan_info.as_mut() {
+            info.timestamp = volume_time() + chrono::Duration::minutes(6);
+        }
+        let after = app.section_target_for_pane(0).expect("still aimed");
+        assert_ne!(before, after, "a new volume did not make the key move");
+
+        // The product picker moves it too, so the one comparison really does
+        // cover every input rather than only the one it was written for.
+        app.gui.pane_mut(0).unwrap().selected_product = RadarProduct::Velocity;
+        assert_ne!(app.section_target_for_pane(0), Some(after));
+
+        // And so does the line, which is the input the interaction produces.
+        app.gui
+            .pane_mut(0)
+            .unwrap()
+            .cross_section_mut()
+            .unwrap()
+            .line = SectionLine::new(
+            GeoPoint {
+                lat: 35.0,
+                lon: -97.8,
+            },
+            GeoPoint {
+                lat: 36.0,
+                lon: -96.0,
+            },
+        );
+        let moved = app.section_target_for_pane(0).expect("still aimed");
+        assert_ne!(moved.line, before.line);
+    }
+}
