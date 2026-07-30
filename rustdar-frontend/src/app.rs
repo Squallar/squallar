@@ -365,9 +365,10 @@ const AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3)
 ///
 /// Not yet a control, and it should be one — `VoxelRequest` takes a `centre` as
 /// well as a half-width precisely so the box can follow the pane's viewport.
-/// What stops that today is cost, not design: a rebuild is ~107 ms on the frame
-/// thread here, so a box that tracked a pan would hitch on every drag. It
-/// belongs behind WP-D's worker wire.
+/// What stops that today is cost, not design: a rebuild is **150–200 ms** on the
+/// frame thread here (see `handle_prepare_volume` for where that figure comes
+/// from), so a box that tracked a pan would hitch on every drag. It belongs on
+/// WP-D's worker wire.
 const VOLUME_HALF_WIDTH_KM: f64 = 80.0;
 
 /// Bottom of the box a 3D pane resamples, kilometres MSL.
@@ -847,14 +848,33 @@ impl App {
     ///
     /// # Why this is on the frame thread
     ///
-    /// It should not be, and WP-D is the wire that moves it: `JobRequest::Voxels`
-    /// puts the resample on the render worker, which is the only tolerable place
-    /// for it on wasm where there is exactly one worker and no threads. That wire
-    /// is not in this tree yet, so the build happens here — measured at ~107 ms
-    /// for the desktop shape, which is a visible hitch on the frame it lands.
-    /// The dedupe below is what keeps it to one hitch per volume rather than one
-    /// per frame, and it is the property to preserve when the worker path
-    /// arrives.
+    /// It should not be. `JobRequest::Voxels` exists on the worker wire and is
+    /// the only tolerable place for this on wasm, where there is exactly one
+    /// worker and no threads; this build predates that wire landing and has not
+    /// been moved onto it yet.
+    ///
+    /// **The cost is 150–200 ms at the desktop shape, not the ~107 ms this used
+    /// to claim.** 107 was the plan's figure for the resample alone; measured
+    /// end to end on real volumes it is 155–159 ms in this build's own log line
+    /// and 158/192/197 ms in review. Either way it is a visible hitch on the
+    /// frame it lands, which is the whole reason the dedupe below exists.
+    ///
+    /// # What moving it to the worker will take, beyond changing this function
+    ///
+    /// **The dedupe works only because the build is synchronous, and that is not
+    /// obvious from reading it.** `PrepareVolume` is level-triggered — the pane
+    /// re-asks on every frame until `rendered_for` matches — and what stops the
+    /// storm today is that `claim` returns `true` once and the entry exists
+    /// before the next frame is laid out. Post a job instead and there is no
+    /// entry while it is in flight, so `claim` keeps returning `true` and a
+    /// fresh job goes out **every frame** until the first one comes back.
+    ///
+    /// So the worker path needs one more piece of state that does not exist
+    /// here: an in-flight set keyed by target, or a `VolumeEntry::Building`
+    /// placeholder inserted at `claim` time. A `Building` entry is the better
+    /// shape of the two — it also gives the pane something honest to say while
+    /// it waits, which is currently a `lookup` miss that the painter renders as
+    /// a guess.
     fn handle_prepare_volume(&mut self, pane_idx: usize, target: rustdar_egui::pane::VolumeTarget) {
         use crate::volume::bridge::VolumeEntry;
 
@@ -922,6 +942,16 @@ impl App {
 
         self.volume_store.insert(pane_idx, target.clone(), entry);
         self.mark_volume_rendered(pane_idx, &target);
+        // After the insert, so it counts what is now held. One grid is up to
+        // 8 MiB and the bound is one per 3D pane, which is the sort of figure
+        // that should be readable in a log rather than reasoned about — see
+        // `VolumeStore::memory_bytes` for the retention path already known to
+        // hold a grid no pane is showing.
+        log::info!(
+            "3D volume view: the store holds {} volume(s), {} MiB",
+            self.volume_store.live_ids().len(),
+            self.volume_store.memory_bytes() / (1024 * 1024),
+        );
     }
 
     /// This pane is holding nothing, on the host **and** on the GPU.

@@ -548,8 +548,9 @@ mod tests {
     /// that it will do nothing.
     ///
     /// **The depth range is not free of consequences, only of geometry.** The
-    /// homogeneous `w` at `depth = 1.0` is `near/(near − far)`, so a range
-    /// spanning many orders of magnitude cancels most of an `f32`'s digits away
+    /// homogeneous `w` at `depth = 1.0` is `1/far`, and it is reached as
+    /// `(1/far − 1/near) + 1/near` — a subtraction of two nearly equal numbers
+    /// whenever `far ≫ near`, which cancels most of an `f32`'s digits away
     /// before the divide. That is why this asserts over sane ranges and why the
     /// production values are a couple of hundred apart rather than a million.
     #[test]

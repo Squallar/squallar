@@ -60,8 +60,8 @@ Notes on the Rustdar column:
   into a solid block rather than a picture — the pane says so rather than
   drawing it. Two limits behind that: the box is a fixed 160 × 160 × 18 km
   around the site with no zoom or pan of its own, and the resample runs on the
-  frame thread (~150 ms per volume, once per volume) until the worker wire
-  carries it.
+  frame thread (150–200 ms per volume, once per volume) until it is moved onto
+  the worker wire.
 - **Vertical cross-sections** — the volume sampler
   (`rustdar-radar/src/sampler.rs`) and the section rasterizer
   (`rustdar-radar/src/xsect.rs`) exist and are tested. Nothing draws a section

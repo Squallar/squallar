@@ -109,8 +109,15 @@ pub enum GuiAction {
     /// instead would mean remembering across `reset_panes_for_site`,
     /// `SwitchRadarSite` and a surface loss, which is three places to forget.
     ///
-    /// A whole-volume grid is expensive — ~107 ms at the desktop shape — so the
-    /// handler must dedupe on the target before it builds, not after.
+    /// A whole-volume grid is expensive — **150–200 ms** at the desktop shape,
+    /// measured — so the handler must dedupe on the target before it builds,
+    /// not after.
+    ///
+    /// **Level-triggered is safe only while that handler is synchronous**, and a
+    /// handler that posts the build to a worker has to add state of its own or
+    /// this fires a fresh job every frame until the first returns. The handler
+    /// carries the full note; it is repeated here because this variant's own
+    /// contract is what makes the requirement.
     PrepareVolume {
         pane_idx: usize,
         target: crate::pane::VolumeTarget,

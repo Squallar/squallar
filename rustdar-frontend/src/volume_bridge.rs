@@ -55,6 +55,26 @@
 //! Only reflectivity clears it today, which is also the moment GR2Analyst's 3D
 //! view is built around.
 //!
+//! # The fade width is a proxy, and the property it stands in for is different
+//!
+//! Read [`MINIMUM_FADE_INDICES`] as a number to tune and you will tune the wrong
+//! thing. Review measured what a wider forced fade actually does to velocity, at
+//! the same 64 indices reflectivity has: **still unusable** — a speckled disc
+//! rather than a solid one. At 128 structure finally appears, and only the
+//! *outbound* half of it, because half the scale has been deleted.
+//!
+//! So the property that matters is not "how many transparent entries are
+//! there". It is **whether the low end of the ramp is unimportant**. It is for
+//! reflectivity, whose ramp bottom is sub-noise dBZ; it is not for velocity,
+//! whose ramp bottom is the strongest inbound flow the radar can encode. The
+//! fade width is a usable proxy *only because the six palettes measure 64 and
+//! 0* — every threshold in `1..=64` selects the same single moment.
+//!
+//! A hypothetical palette with a 20-index fade over a meaningful low end would
+//! clear this gate and paint a block anyway. If one appears, the fix is a
+//! per-moment statement of which end of the scale carries no information — not
+//! a bigger constant here.
+//!
 //! Two things this deliberately is *not*:
 //!
 //! * It is not a claim that the other five cannot be rendered. It is a claim
@@ -88,14 +108,17 @@ use crate::volume::uniform::VolumeUniform;
 /// The narrowest transparent run at the bottom of a palette that this renderer
 /// will draw a volume through.
 ///
-/// Two points are measured and nothing in between is: reflectivity's 64 renders
-/// cleanly, and 0 renders as a solid block. 16 sits between them, nearer the
-/// failing end, and exists so that a palette with a token one- or two-entry
-/// floor cannot pass a `> 0` test and produce the block anyway.
+/// **A proxy for a property this number cannot express, not a tuning knob** —
+/// the module doc says which property and why a wider value does not buy what it
+/// looks like it buys. In short: every threshold in `1..=64` selects exactly
+/// reflectivity, because the six palettes measure 64 and 0 and nothing between;
+/// and a *forced* fade of 64 on velocity was measured and is still unusable.
 ///
-/// It is a **bar**, not a repair — nothing here rewrites a colour table. See the
-/// module doc for why widening a table's fade would destroy measurements rather
-/// than hide an artefact.
+/// 16 rather than 1 so that a palette with a token one- or two-entry floor
+/// cannot clear a `> 0` test; 16 rather than 64 so that the value is not
+/// mistaken for reflectivity's own band, which it has no relationship to.
+///
+/// It is a **bar**, not a repair — nothing here rewrites a colour table.
 pub const MINIMUM_FADE_INDICES: u8 = 16;
 
 /// A voxel grid the store is holding, or the reason it could not build one.
@@ -237,8 +260,14 @@ impl VolumeStore {
         self.lock().entries.iter().map(|e| e.id).collect()
     }
 
-    /// Host bytes the store is holding. Reported rather than bounded: the bound
-    /// is the pane count, which is what the store is keyed by.
+    /// Host bytes the store is holding, and how many volumes that is.
+    ///
+    /// Reported rather than bounded, and logged on every build — because the
+    /// bound is "one grid per 3D pane", and 8 MiB a pane is the kind of figure
+    /// that wants to be visible in a log the day someone finds a path that
+    /// keeps a grid a pane no longer needs. One such path is already known:
+    /// reducing the pane count hides a 3D pane without converting it, and
+    /// `ReleaseVolume` fires only on a *kind* change.
     pub fn memory_bytes(&self) -> usize {
         self.lock()
             .entries

@@ -287,13 +287,18 @@ pub const PLATFORM_CEILING: VolumeQuality = DESKTOP_PLATFORM_CEILING;
 /// `ceiling` is a parameter rather than [`PLATFORM_CEILING`] read inline — see
 /// the module doc for why.
 ///
-/// **No production caller yet, deliberately.** WP-I builds the shader and the
-/// pipeline and stops there: there is no 3D pane, no camera and no
-/// `VolumePainter`, so nothing has a pane size to fit or an adapter to
-/// classify. WP-J is what calls this, with
+/// Called once per renderer, from `App::install_volume_bridge`, as
 /// `select(DeviceClass::from_device_type(adapter.get_info().device_type),
-/// PLATFORM_CEILING)`. Until then it is exercised only by tests, which is why
-/// every arm of it is pinned rather than left to be discovered later.
+/// PLATFORM_CEILING)`. The result is fixed for the life of that renderer — a
+/// device does not change class — and what varies per frame is the pane's size,
+/// which [`VolumeQuality::fit_to_budget`] applies on top and which may step the
+/// resolution rung down again.
+///
+/// It had no production caller while WP-I existed on its own, and every arm was
+/// pinned by tests for that reason. The arms that had never run outside a test
+/// until this shipped are `Virtual` and `Unknown` — which is what a browser
+/// reports for every adapter it exposes, so the web build takes one of them on
+/// every device.
 pub fn select(class: DeviceClass, ceiling: VolumeQuality) -> VolumeQuality {
     class.unconstrained_quality().capped_by(ceiling)
 }
