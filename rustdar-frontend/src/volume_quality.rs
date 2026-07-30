@@ -223,6 +223,45 @@ impl DeviceClass {
     }
 }
 
+/// The per-target quality ceilings, named **outside** the `cfg` cascade so all
+/// three are reachable from any target's tests.
+///
+/// This is the shape `constants::WASM_VOLUME_GRID_CELLS` already uses, and it
+/// is here for the reason that commit gives: a `cfg`-selected constant can only
+/// be checked by the target that compiles it, and this workspace runs
+/// `cargo test` on exactly one of three. Spelt as literals inside the cascade,
+/// two of the three could be edited freely — changing the wasm ceiling to
+/// [`VolumeQuality::BEST`] failed zero host tests, which is a browser silently
+/// promoted to the full-size shaded march on the target with the least
+/// headroom and the least coverage.
+///
+/// **wasm** is capped at Half and unshaded because the browser reports
+/// `DeviceType::Other` whatever the silicon is, so a desktop browser and a
+/// phone browser are indistinguishable here. Capping at what the phone can
+/// survive is the only honest choice until something measures the frame.
+pub const WASM_PLATFORM_CEILING: VolumeQuality = VolumeQuality {
+    resolution: ResolutionRung::Half,
+    shading: GradientShading::Off,
+};
+
+/// The mobile arm. See [`WASM_PLATFORM_CEILING`].
+///
+/// The same cap, arrived at by measurement rather than by ignorance: a phone at
+/// 1440 x 900 extrapolates to 23-60 ms, which is not a frame; at 720 x 450 it is
+/// 7-18 ms with shading and roughly 3-7.5 without. Shading is the cheap half of
+/// that saving and the one a user is least likely to notice on a five-inch
+/// screen.
+pub const MOBILE_PLATFORM_CEILING: VolumeQuality = VolumeQuality {
+    resolution: ResolutionRung::Half,
+    shading: GradientShading::Off,
+};
+
+/// The desktop arm. See [`WASM_PLATFORM_CEILING`].
+///
+/// Uncapped: the measured table is a desktop table, and a discrete GPU there
+/// should get what it paid for.
+pub const DESKTOP_PLATFORM_CEILING: VolumeQuality = VolumeQuality::BEST;
+
 /// The best quality this target may select, whatever the adapter claims.
 ///
 /// The cascade shape is the one `constants::MAX_LOOP_FRAMES` documents, and for
@@ -230,37 +269,31 @@ impl DeviceClass {
 /// the `not(target_arch = "wasm32")` guard on the lower two arms is what keeps
 /// wasm32 from matching two of them.
 ///
-/// **Desktop** is uncapped: the measured table is a desktop table, and a
-/// discrete GPU there should get what it paid for.
-///
-/// **Mobile** is capped at Half and unshaded. A phone at 1440 x 900 extrapolates
-/// to 23-60 ms, which is not a frame; at 720 x 450 it is 7-18 ms with shading
-/// and roughly 3-7.5 without. Shading is the cheap half of that saving and the
-/// one a user is least likely to notice on a five-inch screen.
-///
-/// **wasm** takes the same cap, and for a different reason: the browser reports
-/// `DeviceType::Other` whatever the silicon is, so a desktop browser and a
-/// phone browser are indistinguishable here. Capping at what the phone can
-/// survive is the only honest choice until something measures the frame.
+/// The arms *select between* the three named constants above rather than
+/// repeating their literals, so the selection is the only thing here a host
+/// build cannot check — which is the one thing no other target can check on
+/// this one's behalf.
 #[cfg(target_arch = "wasm32")]
-pub const PLATFORM_CEILING: VolumeQuality = VolumeQuality {
-    resolution: ResolutionRung::Half,
-    shading: GradientShading::Off,
-};
+pub const PLATFORM_CEILING: VolumeQuality = WASM_PLATFORM_CEILING;
 /// See the wasm32 arm.
 #[cfg(all(not(target_arch = "wasm32"), mobile))]
-pub const PLATFORM_CEILING: VolumeQuality = VolumeQuality {
-    resolution: ResolutionRung::Half,
-    shading: GradientShading::Off,
-};
+pub const PLATFORM_CEILING: VolumeQuality = MOBILE_PLATFORM_CEILING;
 /// See the wasm32 arm.
 #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
-pub const PLATFORM_CEILING: VolumeQuality = VolumeQuality::BEST;
+pub const PLATFORM_CEILING: VolumeQuality = DESKTOP_PLATFORM_CEILING;
 
 /// The quality to render a volume at on this adapter.
 ///
 /// `ceiling` is a parameter rather than [`PLATFORM_CEILING`] read inline — see
 /// the module doc for why.
+///
+/// **No production caller yet, deliberately.** WP-I builds the shader and the
+/// pipeline and stops there: there is no 3D pane, no camera and no
+/// `VolumePainter`, so nothing has a pane size to fit or an adapter to
+/// classify. WP-J is what calls this, with
+/// `select(DeviceClass::from_device_type(adapter.get_info().device_type),
+/// PLATFORM_CEILING)`. Until then it is exercised only by tests, which is why
+/// every arm of it is pinned rather than left to be discovered later.
 pub fn select(class: DeviceClass, ceiling: VolumeQuality) -> VolumeQuality {
     class.unconstrained_quality().capped_by(ceiling)
 }
@@ -592,23 +625,103 @@ mod tests {
         }
     }
 
-    /// The mobile and wasm ceiling holds a discrete GPU down on both rungs.
+    /// All three platform ceilings, checked from whichever target compiles this.
     ///
-    /// This is the arm no test binary on any CI row would otherwise reach: a
-    /// phone reports `IntegratedGpu` and a browser reports `Other`, but an
-    /// Android tablet with a fast GPU can report `DiscreteGpu`, and without the
-    /// ceiling it would select the desktop's full-size shaded march.
+    /// The earlier version of this test built a **local literal** Half/Off and
+    /// asserted against that, while its doc claimed to be reaching "the arm no
+    /// test binary on any CI row would otherwise reach". It reached nothing:
+    /// changing the wasm arm to [`VolumeQuality::BEST`] failed zero host tests,
+    /// which is a browser promoted to the full-size shaded march on the target
+    /// with the least headroom and the least coverage. Naming the three
+    /// constants outside the cascade is what makes this checkable at all —
+    /// the same fix, one level up, as `constants::WASM_VOLUME_GRID_CELLS`.
     #[test]
-    fn the_handheld_ceiling_caps_even_a_discrete_adapter() {
+    fn all_three_platform_ceilings_are_the_ones_documented() {
         let handheld = VolumeQuality {
             resolution: ResolutionRung::Half,
             shading: GradientShading::Off,
         };
+        assert_eq!(WASM_PLATFORM_CEILING, handheld);
+        assert_eq!(MOBILE_PLATFORM_CEILING, handheld);
+        assert_eq!(DESKTOP_PLATFORM_CEILING, VolumeQuality::BEST);
+    }
+
+    /// Both handheld ceilings really cap, and the desktop one really does not.
+    ///
+    /// The property rather than the values: a "ceiling" equal to the best the
+    /// build offers is not a ceiling. An Android tablet with a fast GPU reports
+    /// `DiscreteGpu`, so this is the case that decides whether a phone-class
+    /// target can select the desktop's march.
+    #[test]
+    fn the_handheld_ceilings_cap_a_discrete_adapter_and_the_desktop_one_does_not() {
+        for (target, ceiling) in [
+            ("wasm", WASM_PLATFORM_CEILING),
+            ("mobile", MOBILE_PLATFORM_CEILING),
+        ] {
+            assert_ne!(
+                ceiling,
+                VolumeQuality::BEST,
+                "the {target} ceiling is the best quality this build offers, so \
+                 it caps nothing"
+            );
+            let chosen = select(DeviceClass::Discrete, ceiling);
+            assert_eq!(
+                chosen, ceiling,
+                "a discrete adapter escaped the {target} ceiling"
+            );
+            assert_ne!(
+                chosen,
+                VolumeQuality::BEST,
+                "a discrete adapter on {target} still selects the desktop's \
+                 full-size shaded march"
+            );
+        }
+
         assert_eq!(
-            select(DeviceClass::Discrete, handheld),
-            handheld,
-            "a discrete adapter escaped the handheld ceiling"
+            select(DeviceClass::Discrete, DESKTOP_PLATFORM_CEILING),
+            VolumeQuality::BEST,
+            "the desktop ceiling holds a discrete GPU below what the measured \
+             table says it can do"
         );
+    }
+
+    /// Every device class is held to every ceiling, on both rungs.
+    ///
+    /// The general property behind the three rows above: whatever a class would
+    /// pick unconstrained, the result is never finer than the ceiling on either
+    /// axis. `Ord` on both enums runs finest-to-coarsest, so "no better than"
+    /// is `>=`.
+    #[test]
+    fn no_device_class_escapes_any_platform_ceiling() {
+        for (target, ceiling) in [
+            ("wasm", WASM_PLATFORM_CEILING),
+            ("mobile", MOBILE_PLATFORM_CEILING),
+            ("desktop", DESKTOP_PLATFORM_CEILING),
+        ] {
+            for class in [
+                DeviceClass::Discrete,
+                DeviceClass::Integrated,
+                DeviceClass::Virtual,
+                DeviceClass::Software,
+                DeviceClass::Unknown,
+            ] {
+                let chosen = select(class, ceiling);
+                assert!(
+                    chosen.resolution >= ceiling.resolution,
+                    "{class:?} selects {:?} on {target}, finer than the \
+                     {:?} ceiling",
+                    chosen.resolution,
+                    ceiling.resolution
+                );
+                assert!(
+                    chosen.shading >= ceiling.shading,
+                    "{class:?} selects {:?} shading on {target}, richer than \
+                     the {:?} ceiling",
+                    chosen.shading,
+                    ceiling.shading
+                );
+            }
+        }
     }
 
     /// A ceiling never *raises* a device that had already chosen less.
@@ -690,19 +803,89 @@ mod tests {
         );
     }
 
-    /// This target's own ceiling is one of the ladder's points.
+    /// The compiled cascade selects one of the three named ceilings.
     ///
-    /// Whichever arm this build compiled is the one checked, exactly as
-    /// `constants`' budget tests work. What it catches is a ceiling written as
-    /// a quality nothing can select.
+    /// This is the one thing about `PLATFORM_CEILING` that no other target can
+    /// check on this one's behalf, so it is all this test claims. The values
+    /// themselves are pinned unconditionally by
+    /// `all_three_platform_ceilings_are_the_ones_documented`.
+    ///
+    /// Replaces a test that asserted
+    /// `LADDER.contains(PLATFORM_CEILING.resolution)` and
+    /// `select(Discrete, PLATFORM_CEILING) == PLATFORM_CEILING`. Both were
+    /// vacuous: `LADDER` holds every variant of a three-variant enum, so
+    /// `contains` is unconditionally true, and `select(Discrete, X) == X` for
+    /// **every** `X`, because Discrete's unconstrained quality is the minimum
+    /// on both ladders. Neither could distinguish a correct ceiling from any
+    /// other value, which is precisely what the test was named for.
     #[test]
-    fn this_targets_ceiling_is_a_point_on_both_ladders() {
-        assert!(ResolutionRung::LADDER.contains(&PLATFORM_CEILING.resolution));
+    fn the_compiled_cascade_selects_one_of_the_named_ceilings() {
+        assert!(
+            [
+                WASM_PLATFORM_CEILING,
+                MOBILE_PLATFORM_CEILING,
+                DESKTOP_PLATFORM_CEILING,
+            ]
+            .contains(&PLATFORM_CEILING),
+            "PLATFORM_CEILING is {PLATFORM_CEILING:?}, which is none of the \
+             three named arms — so the cascade has grown a literal of its own, \
+             and the unconditional tests above no longer describe it"
+        );
+    }
+
+    /// `select(Discrete, ceiling)` returns the ceiling for *every* ceiling.
+    ///
+    /// Stated as its own property rather than left implicit under a test that
+    /// looked like it was checking something else. It holds because
+    /// `DeviceClass::Discrete`'s unconstrained quality is the minimum on both
+    /// ladders, and that is the fact worth pinning: change Discrete's row and
+    /// the fastest hardware silently stops reaching the ceiling it was given.
+    #[test]
+    fn a_discrete_adapter_reaches_whatever_ceiling_it_is_given() {
         assert_eq!(
-            select(DeviceClass::Discrete, PLATFORM_CEILING),
-            PLATFORM_CEILING,
-            "the fastest device this target admits cannot reach its own \
-             ceiling, so the ceiling names a quality nothing selects"
+            DeviceClass::Discrete.unconstrained_quality(),
+            VolumeQuality::BEST,
+            "Discrete no longer sits at the top of both ladders"
+        );
+        for ceiling in [
+            VolumeQuality::BEST,
+            VolumeQuality::CHEAPEST,
+            WASM_PLATFORM_CEILING,
+            VolumeQuality {
+                resolution: ResolutionRung::Native,
+                shading: GradientShading::Off,
+            },
+            VolumeQuality {
+                resolution: ResolutionRung::Quarter,
+                shading: GradientShading::On,
+            },
+        ] {
+            assert_eq!(
+                select(DeviceClass::Discrete, ceiling),
+                ceiling,
+                "a discrete adapter did not reach the {ceiling:?} ceiling"
+            );
+        }
+    }
+
+    /// A pixel costs what the offscreen's format actually costs.
+    ///
+    /// Tied to nothing until now: `OFFSCREEN_BYTES_PER_PIXEL` is a 4 in this
+    /// module and `OFFSCREEN_FORMAT` is an `Rgba8Unorm` in another, and every
+    /// budget figure in this crate is the product of the two. Moving the format
+    /// to sixteen bits a channel would leave every budget test passing while
+    /// under-counting the real allocation by half.
+    #[test]
+    fn a_pixel_costs_what_the_offscreen_format_costs() {
+        let format_bytes = crate::volume::raymarch::OFFSCREEN_FORMAT
+            .block_copy_size(None)
+            .expect("the offscreen format has no single-aspect copy size");
+        assert_eq!(
+            OFFSCREEN_BYTES_PER_PIXEL,
+            format_bytes as usize,
+            "an offscreen pixel is budgeted at {OFFSCREEN_BYTES_PER_PIXEL} B \
+             but {:?} costs {format_bytes} B",
+            crate::volume::raymarch::OFFSCREEN_FORMAT
         );
     }
 }

@@ -265,12 +265,22 @@ pub const VOLUME_OFFSCREEN_REFERENCE_PANE_PX: [u32; 2] = [2560, 1440];
 /// the blit's `Linear` sampler. On the measured hardware that is also the right
 /// call for fill rate — 4K native extrapolates to about 4 ms of a 16.7 ms frame
 /// for one pane.
+/// The three budgets, named **outside** the cascade so all three are reachable
+/// from any target's tests — the shape [`WASM_VOLUME_GRID_CELLS`] uses, for the
+/// reason it gives. Two of three arms would otherwise be editable freely, since
+/// this workspace runs `cargo test` on exactly one of them.
+pub const WASM_VOLUME_OFFSCREEN_BUDGET_BYTES: usize = 5 * 1024 * 1024;
+/// The mobile arm. See [`WASM_VOLUME_OFFSCREEN_BUDGET_BYTES`].
+pub const MOBILE_VOLUME_OFFSCREEN_BUDGET_BYTES: usize = 5 * 1024 * 1024;
+/// The desktop arm. See [`WASM_VOLUME_OFFSCREEN_BUDGET_BYTES`].
+pub const DESKTOP_VOLUME_OFFSCREEN_BUDGET_BYTES: usize = 20 * 1024 * 1024;
+
 #[cfg(target_arch = "wasm32")]
-pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = 5 * 1024 * 1024;
+pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = WASM_VOLUME_OFFSCREEN_BUDGET_BYTES;
 #[cfg(all(not(target_arch = "wasm32"), mobile))]
-pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = 5 * 1024 * 1024;
+pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = MOBILE_VOLUME_OFFSCREEN_BUDGET_BYTES;
 #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
-pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = 20 * 1024 * 1024;
+pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = DESKTOP_VOLUME_OFFSCREEN_BUDGET_BYTES;
 
 /// The playback rates the loop timer is willing to divide by.
 ///
@@ -514,6 +524,84 @@ mod tests {
             total * 2 > VOLUME_OFFSCREEN_BUDGET_BYTES,
             "budget {VOLUME_OFFSCREEN_BUDGET_BYTES} B is more than twice the \
              actual {total} B — it would not catch a doubled reference pane"
+        );
+    }
+
+    /// Both offscreen budget checks, on **all three** arms rather than the one
+    /// this build compiled.
+    ///
+    /// The two tests above are one-sided in exactly the way
+    /// `the_grid_dimensions_match_the_shapes_rustdar_radar_names` was before
+    /// `3292e8d`: they read `VOLUME_OFFSCREEN_BUDGET_BYTES` and
+    /// `PLATFORM_CEILING`, both `cfg`-selected, so two of three arms went
+    /// unchecked. A budget that could not pay for its own reference pane on
+    /// wasm would be a browser whose every volume is quietly rendered a rung
+    /// coarser than intended, and no CI row would say so.
+    ///
+    /// The pairing is the point: each arm is checked against **its own**
+    /// ceiling, because the ceiling is what decides how many pixels the
+    /// reference pane costs there.
+    #[test]
+    fn every_offscreen_budget_arm_pays_for_its_own_reference_pane() {
+        use crate::volume::quality::{
+            DESKTOP_PLATFORM_CEILING, MOBILE_PLATFORM_CEILING, WASM_PLATFORM_CEILING,
+        };
+
+        for (target, budget, ceiling) in [
+            (
+                "wasm",
+                WASM_VOLUME_OFFSCREEN_BUDGET_BYTES,
+                WASM_PLATFORM_CEILING,
+            ),
+            (
+                "mobile",
+                MOBILE_VOLUME_OFFSCREEN_BUDGET_BYTES,
+                MOBILE_PLATFORM_CEILING,
+            ),
+            (
+                "desktop",
+                DESKTOP_VOLUME_OFFSCREEN_BUDGET_BYTES,
+                DESKTOP_PLATFORM_CEILING,
+            ),
+        ] {
+            let fitted = ceiling.fit(VOLUME_OFFSCREEN_REFERENCE_PANE_PX, budget);
+            assert_eq!(
+                fitted.quality, ceiling,
+                "the {target} budget of {budget} B cannot render the \
+                 {VOLUME_OFFSCREEN_REFERENCE_PANE_PX:?} reference pane at its \
+                 own {ceiling:?} ceiling — it degrades to {:?}, so the ceiling \
+                 names a quality that target never reaches",
+                fitted.quality
+            );
+            assert!(
+                fitted.bytes() <= budget,
+                "the {target} offscreen is {} B against a {budget} B budget",
+                fitted.bytes()
+            );
+            assert!(
+                fitted.bytes() * 2 > budget,
+                "the {target} budget of {budget} B is more than twice its \
+                 actual {} B — it would not catch a doubled reference pane",
+                fitted.bytes()
+            );
+        }
+    }
+
+    /// The compiled cascade selects one of the three named budgets.
+    ///
+    /// The only thing about `VOLUME_OFFSCREEN_BUDGET_BYTES` no other target can
+    /// check on this one's behalf; the values are pinned unconditionally above.
+    #[test]
+    fn the_compiled_offscreen_budget_is_one_of_the_named_arms() {
+        assert!(
+            [
+                WASM_VOLUME_OFFSCREEN_BUDGET_BYTES,
+                MOBILE_VOLUME_OFFSCREEN_BUDGET_BYTES,
+                DESKTOP_VOLUME_OFFSCREEN_BUDGET_BYTES,
+            ]
+            .contains(&VOLUME_OFFSCREEN_BUDGET_BYTES),
+            "VOLUME_OFFSCREEN_BUDGET_BYTES is {VOLUME_OFFSCREEN_BUDGET_BYTES}, \
+             which is none of the three named arms"
         );
     }
 

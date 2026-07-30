@@ -2,15 +2,25 @@
 //!
 //! # Why by hand
 //!
-//! `rustdar-frontend` is not `forbid(unsafe_code)` — `rustdar-egui` is — so
-//! `bytemuck` is not literally barred here, and `f32` is already `Pod`, which
-//! means `[f32; 40]` plus `cast_slice` would need no derive and no `unsafe`.
-//! The reason to write the bytes out anyway is **testability**: a hand-written
-//! `to_bytes` makes every std140 offset an assertable number rather than a
-//! property of a `#[repr(C)]` a reviewer has to trust. A transposed matrix or a
-//! swapped pair of `vec4`s is exactly the sort of mistake that produces a
-//! plausible-looking image, and `every_lane_lands_at_its_std140_offset` is what
-//! catches it.
+//! `rustdar-frontend` **is** `#![forbid(unsafe_code)]` (`lib.rs:2`), and
+//! `forbid` cannot be lifted by an inner `allow`, so `bytemuck`'s derive — which
+//! emits a bare `unsafe impl` with no allow of its own — is genuinely barred
+//! here. (An earlier draft of this comment had that backwards, and named
+//! `rustdar-egui` as the crate with the attribute; it does not have one.)
+//!
+//! But impossibility is not the reason, because there is a way round it:
+//! `f32` is already `Pod`, so `[f32; 40]` plus `cast_slice` needs no derive and
+//! no `unsafe`. The reason to write the bytes out anyway is **testability**. A
+//! hand-written `to_bytes` makes every std140 offset an assertable number
+//! rather than a property of a `#[repr(C)]` a reviewer has to trust. A
+//! transposed matrix or a swapped pair of `vec4`s is exactly the sort of
+//! mistake that produces a plausible-looking image.
+//!
+//! `every_lane_lands_at_its_std140_offset` is what catches it — and note it
+//! only does so because it pins the offsets as **literals** first. Indexing
+//! with the same `OFFSET_*` constants `to_bytes` writes at would move reader
+//! and writer together, which is a test that cannot see the mistake it is
+//! named for.
 //!
 //! # The layout
 //!
@@ -347,6 +357,36 @@ mod tests {
              std140 both are, so a transpose here rotates the camera's axes"
         );
 
+        // The offsets themselves, as literals.
+        //
+        // Everything below indexes with `offset / 4` using the very constants
+        // `to_bytes` writes at, so on its own it cannot see a transposition:
+        // swap `OFFSET_BOX_SIZE_KM` and `OFFSET_GRID_DIMS` and the writer and
+        // the reader move together. A review proved it — all 103 host tests
+        // passed, and only the `#[ignore]`d GPU test noticed, on a machine CI
+        // does not have. The realistic route in is someone reordering `struct
+        // Volume` in the WGSL and transposing two offsets to match; the shader
+        // then reads the box size out of the grid-dims slot, which is wrong
+        // step lengths and wrong gradient spacing, i.e. a merely hazy volume.
+        //
+        // So the offsets are pinned to literals here, and the loop below is
+        // what says each member reaches the offset it names.
+        assert_eq!(
+            (
+                OFFSET_BOX_FROM_CLIP,
+                OFFSET_EYE_IN_BOX,
+                OFFSET_BOX_SIZE_KM,
+                OFFSET_GRID_DIMS,
+                OFFSET_LIGHT_DIR_AMBIENT,
+                OFFSET_TRANSFER,
+                OFFSET_FLAGS,
+            ),
+            (0, 64, 80, 96, 112, 128, 144),
+            "the std140 offsets have moved. They are the layout the WGSL's \
+             `struct Volume` declares, in its declaration order, and nothing \
+             else in this file can tell you they are wrong."
+        );
+
         for (offset, expected, member) in [
             (OFFSET_EYE_IN_BOX, [101.0, 102.0, 103.0, 0.0], "eye_in_box"),
             (
@@ -372,15 +412,24 @@ mod tests {
         }
     }
 
-    /// Reserved lanes are written as zero, not left as whatever was there.
+    /// Reserved lanes come out as zero, from a uniform whose every other lane
+    /// is not.
     ///
-    /// The buffer is reused every frame, so an unwritten lane holds the
-    /// previous frame's value — which is invisible until someone gives the lane
-    /// a meaning and reads it before the writer exists.
+    /// What this establishes is a property of the **bytes**, not of the writer.
+    /// `to_bytes` starts from `[0u8; VOLUME_UNIFORM_BYTES]`, so "written as
+    /// zero" and "never written" are indistinguishable from outside it, and an
+    /// earlier version of this comment claimed to start from a non-zero block
+    /// when it did not. The distinction does not exist in the output, and the
+    /// output is what the GPU reads — which is the thing that matters: the
+    /// uniform buffer is reused every frame, and `queue.write_buffer` overwrites
+    /// all 160 bytes, so a lane that is zero here is zero on the device rather
+    /// than holding the previous frame's value.
+    ///
+    /// It is not vacuous: every *other* lane of `distinct()` is a large,
+    /// unique number, so a `to_bytes` that shifted or mis-strided its writes
+    /// would land one of them in a reserved slot.
     #[test]
     fn reserved_lanes_are_written_as_zero() {
-        // Start from a block that is entirely non-zero, so "still zero" cannot
-        // be an accident of the array's initialisation.
         let bytes = distinct().to_bytes();
         let packed = lanes(&bytes);
 

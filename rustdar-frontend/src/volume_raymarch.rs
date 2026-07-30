@@ -980,12 +980,15 @@ mod tests {
     /// The two triangles tile clip space exactly once, with no gap and no
     /// overlap.
     ///
-    /// Added after a mutation survived the test above. Deleting the minus sign
-    /// from any one corner leaves all four corners present and the bounding box
-    /// unchanged — every assertion up there still passes — while turning the
-    /// pair into two triangles that both cover the upper half and leave the
-    /// lower-left quadrant of the volume simply not drawn. Corner presence is
-    /// not coverage, so assert coverage.
+    /// Added after a mutation survived the test above. `QUAD_CORNERS` has six
+    /// negative components; deleting the minus from **four** of them leaves all
+    /// four clip-space corners present and the bounding box unchanged, so every
+    /// assertion up there still passes — while turning the pair into two
+    /// triangles that both cover the upper half and leave a quadrant of the
+    /// volume simply not drawn. (The other two are vertex 0's, and the corner
+    /// check does catch those, because removing either loses `[-1, -1]`
+    /// entirely.) Corner presence is not coverage, so assert coverage: this
+    /// test catches all six.
     ///
     /// Sampled at points chosen to miss every edge: the shared diagonal is
     /// `x + y = 0`, and `-1.88 + 0.19 * (i + j)` is zero only at a
