@@ -736,19 +736,49 @@ impl<'a> VolumeSampler<'a> {
         self.product
     }
 
-    /// The ladder, as one line.
+    /// The ladder, as one line: per rung, `nominal->median radials×gates`.
     ///
     /// Hand-written rather than derived because a derived `Debug` would walk
     /// the borrowed radials and print the whole ~10 M-gate volume — which is
     /// what `assert_eq!` and `unwrap` reach for on failure, so the derive
     /// would turn a one-line test failure into an unreadable one.
+    ///
+    /// # The radial and gate counts are the load-bearing part
+    ///
+    /// They say **which sweep won each rung**, and nothing else here does. An
+    /// earlier version printed only the angles, and that made this line
+    /// structurally incapable of seeing the failure it is most often reached
+    /// for: on a real split cut the two halves share a cut angle *and* a
+    /// median — 0.4834° for both on a measured KMPX VCP 212 volume — so a
+    /// ladder that took the Doppler half where it should have taken the
+    /// surveillance half printed byte-identically to a correct one. What
+    /// separates them is range: 1832 reflectivity gates on the surveillance
+    /// half against 1192 on the Doppler half, which is 460 km against 300.
+    ///
+    /// So a comparison over this string is a comparison of the ladder, not of
+    /// its labels. `a_reconstructed_render_input_scan_builds_the_identical_ladder`
+    /// and the live harness both rest on that.
     fn describe(&self) -> String {
+        let rungs: Vec<String> = self
+            .rungs
+            .iter()
+            .map(|r| {
+                format!(
+                    "{:.4}->{:.4} {}x{}",
+                    r.nominal_deg,
+                    r.elevation_deg,
+                    r.radials.len(),
+                    self.slot
+                        .read(&r.radials[0])
+                        .map_or(0, |m| m.raw_values().len()),
+                )
+            })
+            .collect();
         format!(
-            "{} on {} rungs {:?} (nominal {:?})",
+            "{} on {} rungs [{}]",
             self.product.code(),
             self.rungs.len(),
-            self.elevations_deg().collect::<Vec<_>>(),
-            self.nominal_elevations_deg().collect::<Vec<_>>(),
+            rungs.join(", "),
         )
     }
 
@@ -1696,42 +1726,74 @@ mod tests {
     /// A volume shaped like a real SAILS one, with the cut table that separates
     /// its two base tilts.
     ///
-    /// Five sweeps over five declared cuts, in KBMX's adaptive-base-tilt
-    /// geometry: a below-horizon 359.7° cut that only the wrap correction reads
-    /// as −0.3°, **two genuine base tilts declared 0.09° apart** (0.40° and
-    /// 0.48°) whose measured medians interleave, a merged 1.5° tilt, and a
-    /// SAILS repeat of the 0.48° cut that must fuse into its own rung and win
-    /// it on recency. Every hazard the ladder rule exists for is in it.
+    /// Six sweeps over six declared cuts, carrying every hazard the ladder rule
+    /// exists for:
+    ///
+    /// * a below-horizon 359.7° cut that only the wrap correction reads as
+    ///   −0.3°;
+    /// * **two genuine base tilts declared 0.09° apart** (0.40° and 0.48°), the
+    ///   KBMX adaptive-base-tilt geometry no angular threshold can separate;
+    /// * a **split 0.48° cut** — a long-range surveillance half carrying no
+    ///   velocity, and a short-range Doppler half carrying it — plus a SAILS
+    ///   Doppler repeat of the same cut that is *newer* than both.
+    ///
+    /// The split cut is shaped the way a real one is, which is the part that
+    /// matters: all three 0.48° members share the cut angle **and the median**
+    /// (0.53°, exactly as KMPX's three 0.4834° members all measure 0.4834°), so
+    /// the only thing that distinguishes the surveillance half is its range —
+    /// [`LONG_GATES`] against [`SHORT_GATES`], standing in for 1832 gates
+    /// (460 km) against 1192 (300 km). A ladder that took the wrong half is
+    /// therefore invisible in the angles and visible only in the gate count,
+    /// which is why [`VolumeSampler::describe`] prints one.
+    const LONG_GATES: usize = 120;
+    const SHORT_GATES: usize = 40;
+
     fn sails_volume() -> Scan {
+        let refl = |dbz: f64| move |_: f64, _: f64| Some(dbz);
         Scan::new(
-            vcp(&[359.7, 0.40, 0.48, 1.5, 0.48]),
+            vcp(&[359.7, 0.40, 0.48, 0.48, 1.5, 0.48]),
             vec![
                 make_sweep(
                     1,
                     -0.28,
                     360,
-                    40,
-                    Some(&|_, _| Some(15.0)),
+                    SHORT_GATES,
+                    Some(&refl(15.0)),
                     Some(&|_, _| Some(7.0)),
                 ),
-                flat_refl_sweep(2, 0.44, 360, 40, 20.0),
+                make_sweep(2, 0.44, 360, LONG_GATES, Some(&refl(20.0)), None),
+                // The surveillance half of the split cut: no velocity, and the
+                // only member that reaches past 300 km. It must win the rung.
+                make_sweep(3, 0.53, 360, LONG_GATES, Some(&refl(25.0)), None),
+                // Its Doppler half: the same angle, the same median, a short
+                // copy of the reflectivity, and velocity.
                 make_sweep(
-                    3,
+                    4,
                     0.53,
                     360,
-                    40,
-                    Some(&|_, _| Some(25.0)),
+                    SHORT_GATES,
+                    Some(&refl(26.0)),
                     Some(&|_, _| Some(9.0)),
                 ),
                 make_sweep(
-                    4,
+                    5,
                     1.51,
                     360,
-                    40,
-                    Some(&|_, _| Some(30.0)),
+                    SHORT_GATES,
+                    Some(&refl(30.0)),
                     Some(&|_, _| Some(11.0)),
                 ),
-                flat_refl_sweep(5, 0.51, 360, 40, 35.0),
+                // A SAILS Doppler repeat, newest of the three 0.48° members —
+                // so "newest wins" and "surveillance wins" disagree here, and
+                // the surveillance preference is what has to break the tie.
+                make_sweep(
+                    6,
+                    0.53,
+                    360,
+                    SHORT_GATES,
+                    Some(&refl(35.0)),
+                    Some(&|_, _| Some(13.0)),
+                ),
             ],
         )
     }
@@ -1861,18 +1923,17 @@ mod tests {
     /// rather than only on the original.
     ///
     /// The fixture's cuts are declared 0.40° and 0.48° — 0.09° apart — while
-    /// its medians (0.44, 0.53, 0.51) interleave and sit inside every merge
-    /// threshold the campaign measured. A reconstruction that lost the cut
-    /// table would have to key by angle and would fuse the two into one rung,
-    /// deleting a genuine tilt; one that kept the table but wrote payload
-    /// indices where the elevation numbers go would key the sweeps 0, 1, 2, 3,
-    /// 4 and read every one of them off the wrong cut. Both produce a plausible
-    /// monotone ladder and neither errors.
+    /// its medians (0.44 and 0.53) sit inside every merge threshold the
+    /// campaign measured. A reconstruction that lost the cut table would have
+    /// to key by angle and would fuse the two into one rung, deleting a genuine
+    /// tilt; one that kept the table but wrote payload indices where the
+    /// elevation numbers go would key the sweeps 0..5 and read every one of
+    /// them off the wrong cut. Both produce a plausible monotone ladder and
+    /// neither errors.
     ///
-    /// The 0.48° rung's winner is the discriminator that catches the second
-    /// one: cuts 3 and 5 are the same declared angle, so the rung is chosen
-    /// newest-first and must be the SAILS repeat's 0.51° median rather than
-    /// cut 3's 0.53°.
+    /// The split cut's winner is the third thing, and the one the angles cannot
+    /// see: all three 0.48° members share a median, so which of them won is
+    /// legible only in the gate count.
     #[test]
     fn the_ported_ladder_still_separates_the_near_angle_cuts() {
         let scan = sails_volume();
@@ -1905,7 +1966,6 @@ mod tests {
         let sampler = VolumeSampler::new(&reconstructed, RadarProduct::Reflectivity)
             .expect("the reconstructed ladder builds");
         let nominal: Vec<f64> = sampler.nominal_elevations_deg().collect();
-        let geometric: Vec<f64> = sampler.elevations_deg().collect();
         assert_eq!(
             nominal.len(),
             4,
@@ -1915,12 +1975,72 @@ mod tests {
             (nominal[1] - 0.40).abs() < 1e-9 && (nominal[2] - 0.48).abs() < 1e-9,
             "the two base tilts did not survive the port as declared: {nominal:?}",
         );
+    }
+
+    /// **The surveillance half of a split cut still wins its rung after the
+    /// port** — which is a fact about *range*, and the one the angles cannot
+    /// express.
+    ///
+    /// The rule is `sampler`'s, at the `carries(&i) && …velocity().is_none()`
+    /// in `build`: reflectivity belongs to the surveillance half, which reaches
+    /// 460 km against the Doppler half's 300. It discriminates on a field that
+    /// a **reflectivity** payload does not carry — `extract_volume` ships the
+    /// product's own moment and nothing else — so unless the payload says which
+    /// sweeps had velocity, every reconstructed sweep looks like a surveillance
+    /// half and `.rev().find(…)` takes the *newest* member instead: the Doppler
+    /// one.
+    ///
+    /// Nothing about that fails. The section simply stops at ~300 km where the
+    /// main thread's own sampler reaches 460, and takes the low tilt's geometry
+    /// from the wrong antenna pass. On a real volume the two halves share a cut
+    /// angle *and* a median, so the ladder's angles are byte-identical either
+    /// way; only the gate count moves.
+    #[test]
+    fn the_ported_ladder_takes_the_surveillance_half_of_a_split_cut() {
+        let scan = sails_volume();
+        let input = crate::render_input::RenderInput::extract_volume(
+            &scan,
+            RadarProduct::Reflectivity,
+            35.33,
+            -97.27,
+        )
+        .expect("the fixture carries reflectivity");
+        let reconstructed = input.to_scan();
+
+        // precondition: the three members of the 0.48° cut are indistinguishable
+        // by angle, so what is asserted below cannot be read off the medians.
+        let split: Vec<f64> = reconstructed
+            .sweeps()
+            .iter()
+            .filter(|s| matches!(s.elevation_number(), 3 | 4 | 6))
+            .filter_map(|s| sweep_elevation_deg(s.radials()))
+            .collect();
+        assert_eq!(split.len(), 3, "the split cut lost a member in the port");
         assert!(
-            (geometric[2] - 0.51).abs() < 1e-5,
-            "the 0.48° rung was won by the wrong sweep across the port — \
-             {:.4}° rather than the SAILS repeat's 0.51°",
-            geometric[2],
+            split.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-9),
+            "the split cut's members no longer share a median ({split:?}), so \
+             this test could pass on the angles alone and would stop being \
+             about the range",
         );
+
+        for (label, scan) in [("original", &scan), ("reconstructed", &reconstructed)] {
+            let sampler =
+                VolumeSampler::new(scan, RadarProduct::Reflectivity).expect("the ladder builds");
+            let rung = sampler
+                .rungs
+                .iter()
+                .find(|r| (r.nominal_deg - 0.48).abs() < 1e-9)
+                .expect("the 0.48 cut has a rung");
+            let gates = rung.radials[0]
+                .reflectivity()
+                .map_or(0, |m| m.raw_values().len());
+            assert_eq!(
+                gates, LONG_GATES,
+                "{label}: the 0.48° rung was won by the {gates}-gate Doppler \
+                 half instead of the {LONG_GATES}-gate surveillance half — a \
+                 section drawn from it stops short with no error and no NaN",
+            );
+        }
     }
 
     /// The refusal is still reachable, and still pinned against the **real**
