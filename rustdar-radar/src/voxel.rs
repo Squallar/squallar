@@ -271,6 +271,25 @@ pub const DESKTOP_SHAPE: VoxelShape = VoxelShape {
     nz: 128,
 };
 
+/// The default shape for a device class, as a function of the class rather
+/// than of the `cfg`.
+///
+/// **Split out so both answers are reachable from a host test.** A `cfg`-gated
+/// body is invisible to every target that does not compile it, and the wasm
+/// rows of this workspace's gate are `cargo check`, never `cargo test` — so a
+/// wasm arm that named the wrong constant would pass everything that actually
+/// runs. Mutation testing found exactly that: replacing the wasm arm's body
+/// wholesale survived the entire suite. Routing both arms through one testable
+/// function is the move `rustdar-frontend`'s `mobile_cfg.rs` already makes for
+/// the `mobile` predicate, for the same reason.
+///
+/// What stays unpinned on the host is only the `cfg` dispatch itself — that
+/// the wasm arm exists and passes `true`. Nothing can pin that but a wasm test
+/// runner.
+const fn default_shape_for(is_wasm: bool) -> VoxelShape {
+    if is_wasm { WASM_SHAPE } else { DESKTOP_SHAPE }
+}
+
 /// The shape this target builds by default.
 ///
 /// wasm gets [`WASM_SHAPE`], everything else [`DESKTOP_SHAPE`].
@@ -279,13 +298,13 @@ pub const DESKTOP_SHAPE: VoxelShape = VoxelShape {
 /// rather than start from this.
 #[cfg(target_arch = "wasm32")]
 pub fn default_shape() -> VoxelShape {
-    WASM_SHAPE
+    default_shape_for(true)
 }
 
 /// The shape this target builds by default. See the wasm arm.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn default_shape() -> VoxelShape {
-    DESKTOP_SHAPE
+    default_shape_for(false)
 }
 
 /// How many cells a grid has along each axis.
@@ -1212,6 +1231,20 @@ mod tests {
         );
     }
 
+    /// Both arms of the `cfg` cascade, from a host that compiles only one of
+    /// them.
+    ///
+    /// The test above can only ever check the arm it was built for, so the
+    /// wasm arm's *content* would otherwise be checked by nothing that runs —
+    /// mutation testing found precisely that hole. See
+    /// [`default_shape_for`]'s doc.
+    #[test]
+    fn both_target_classes_get_their_own_default_shape() {
+        assert_eq!(default_shape_for(true), WASM_SHAPE);
+        assert_eq!(default_shape_for(false), DESKTOP_SHAPE);
+        assert_ne!(default_shape_for(true), default_shape_for(false));
+    }
+
     #[test]
     fn an_axis_outside_the_guarantee_is_refused() {
         let scan = scan_of(&|_, _| Some(40.0));
@@ -1764,6 +1797,74 @@ mod tests {
         assert_ne!(a, build_voxels(&scan, &lean, SITE.0, SITE.1).unwrap());
     }
 
+    /// A grid built by hand, so the equality tests can vary **one** field.
+    ///
+    /// Every field before the value plane in `eq`'s `&&` chain short-circuits,
+    /// and the index plane is a quantisation of the value plane — so a pair
+    /// built from two different scans differs on `indices` and never reaches
+    /// the value comparison at all. Mutation testing found all three of
+    /// `same_values`' arms unreachable from `build_voxels` alone for exactly
+    /// that reason.
+    fn hand_built(values: Option<Vec<f32>>) -> VoxelGrid {
+        let value_range = value_range_for(MomentSlot::Reflectivity);
+        VoxelGrid {
+            indices: vec![0, 7, 200, 255],
+            values,
+            lut: colormap_lut(RadarProduct::Reflectivity, value_range),
+            shape: VoxelShape {
+                nx: 2,
+                ny: 2,
+                nz: 1,
+            },
+            x_range_km: (-10.0, 10.0),
+            y_range_km: (-10.0, 10.0),
+            z_range_km_msl: (0.0, 5.0),
+            site: SITE,
+            value_range,
+            product: RadarProduct::Reflectivity,
+        }
+    }
+
+    /// The value plane is compared **bitwise**, its length counts, and having
+    /// no plane at all is a state of its own.
+    #[test]
+    fn the_value_plane_is_compared_bit_for_bit_and_its_absence_is_a_state() {
+        let nan = f32::NAN;
+        let a = hand_built(Some(vec![nan, -20.0, 45.0, 62.5]));
+        assert_eq!(a, hand_built(Some(vec![nan, -20.0, 45.0, 62.5])));
+
+        // Same index plane, different values — the pair `build_voxels` cannot
+        // produce.
+        let different = hand_built(Some(vec![nan, -20.0, 45.25, 62.5]));
+        assert_eq!(
+            a.indices(),
+            different.indices(),
+            "precondition: only the value plane may differ, or this proves \
+             nothing about `same_values`",
+        );
+        assert_ne!(a, different, "a different value plane is a different grid");
+
+        // A shorter plane is a different payload, not a prefix match.
+        assert_ne!(a, hand_built(Some(vec![nan, -20.0, 45.0])));
+
+        // Bitwise: two NaNs with different payloads are two different
+        // payloads, even though neither equals itself as a float.
+        let other_nan = hand_built(Some(vec![
+            f32::from_bits(nan.to_bits() ^ 1),
+            -20.0,
+            45.0,
+            62.5,
+        ]));
+        assert!(other_nan.values().unwrap()[0].is_nan());
+        assert_ne!(a, other_nan);
+
+        // No plane at all: equal to another grid with none, unequal to one
+        // with a plane, in both directions.
+        assert_eq!(hand_built(None), hand_built(None));
+        assert_ne!(a, hand_built(None));
+        assert_ne!(hand_built(None), a);
+    }
+
     /// `Debug` is a summary, for the reason the sampler's is: `assert_eq!`
     /// reaches for it on failure, and the derive would print 8 MiB.
     #[test]
@@ -1775,9 +1876,31 @@ mod tests {
         assert!(text.len() < 400, "{} chars: {text}", text.len());
         assert!(text.contains("ref"), "{text}");
         assert!(text.contains("11x13x7"), "{text}");
+
+        // The fill count is what two grids most often differ by, so it is the
+        // one number in the summary worth checking rather than merely
+        // formatting. Counted here rather than trusted.
+        let filled = grid
+            .indices()
+            .iter()
+            .filter(|&&i| i != NO_DATA_INDEX)
+            .count();
         assert!(
-            text.contains(&format!("/{}", ODD.cells())),
-            "the fill count is what two grids most often differ by: {text}",
+            filled > 0 && filled < ODD.cells(),
+            "precondition: a partly filled grid, or the count below cannot \
+             discriminate ({filled} of {})",
+            ODD.cells(),
+        );
+        assert_ne!(
+            filled,
+            ODD.cells() - filled,
+            "precondition: filled and empty must differ, or reporting the \
+             wrong one of the two would read the same",
+        );
+        assert!(
+            text.contains(&format!("{filled}/{}", ODD.cells())),
+            "the summary must report {filled} of {} cells with data: {text}",
+            ODD.cells(),
         );
     }
 
