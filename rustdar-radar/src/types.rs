@@ -3,7 +3,7 @@ use crate::sites::get_radar_site;
 use chrono::NaiveDateTime;
 use nexrad_model::data::Radial;
 use nexrad_model::data::Scan;
-use rustdar_units::UserPreferences;
+use rustdar_units::{HailSizeUnit, UserPreferences};
 use std::collections::HashMap;
 use std::f64::consts::PI;
 
@@ -599,8 +599,16 @@ impl RadarProduct {
             RadarProduct::ProbabilityOfSevereHail => format!("POSH: {:.0}%", value),
             // The field computes in mm (`crate::hail`); the render seam
             // converts to inches, so the value arrives here in inches — the
-            // unit US hail sizes are reported in.
-            RadarProduct::MaxExpectedHailSize => format!("MEHS: {:.2} in", value),
+            // unit US hail sizes are reported in — and the hail-size preference
+            // takes it from there, at the precision that unit reads well in
+            // (`HailSizeUnit::decimals`). The suffix comes from `unit_label`, so
+            // this readout and the colour bar beside it cannot name different
+            // units.
+            RadarProduct::MaxExpectedHailSize => {
+                let converted = prefs.hail_size.convert_from_inches(value);
+                let decimals = prefs.hail_size.decimals();
+                format!("MEHS: {converted:.decimals$} {}", self.unit_label(prefs))
+            }
             RadarProduct::HydrometeorClassification => {
                 let class = match value as u16 {
                     0..=9 => "No Data",
@@ -649,7 +657,17 @@ impl RadarProduct {
             RadarProduct::VerticallyIntegratedLiquid => "kg/m\u{00b2}",
             RadarProduct::VilDensity => "g/m\u{00b3}",
             RadarProduct::ProbabilityOfSevereHail => "%",
-            RadarProduct::MaxExpectedHailSize => "in",
+            // `HailSizeUnit::suffix()` is the inch *mark*, which reads well
+            // pressed against a bare number (`1.75"`, as the storm-report popup
+            // writes it) but not as a colour-bar title, and not after the space
+            // this crate's readouts put before their unit. `in` is also what
+            // MEHS has printed since it shipped, so the default reading is
+            // character for character what it was. Every other unit takes its
+            // own suffix.
+            RadarProduct::MaxExpectedHailSize => match prefs.hail_size {
+                HailSizeUnit::Inches => "in",
+                unit => unit.suffix(),
+            },
             RadarProduct::HydrometeorClassification => "HHC",
             RadarProduct::PrecipitationRate => prefs.precip_rate.suffix(),
             RadarProduct::NormalizedRotation => "NROT",
@@ -730,5 +748,80 @@ mod tests {
             "a sweepless volume listed a Level II product: {:?}",
             info.available_products,
         );
+    }
+
+    /// MEHS is a hail *size*, so it reads in the unit the hail-size preference
+    /// asks for — and at the precision that unit carries (`25 mm`, not
+    /// `25.40 mm`: the field is quantised in quarter inches, so the hundredth
+    /// of a millimetre is arithmetic, not measurement).
+    ///
+    /// Pinned at the two operational stops of the ramp, the NWS severe-hail
+    /// criterion (1.00 in) and SPC significant severe (2.00 in), so the numbers
+    /// a warning decision is made on are the ones under test. `unit_label` is
+    /// asserted alongside `format_value` because it is the same unit printed in
+    /// two places — the hover readout and the colour bar's title — and a pane
+    /// that disagreed with itself would be worse than one stuck on inches.
+    #[test]
+    fn mehs_reads_in_the_users_hail_size_unit() {
+        let expected = [
+            (HailSizeUnit::Inches, "in", "MEHS: 1.00 in", "MEHS: 2.00 in"),
+            (
+                HailSizeUnit::Centimeters,
+                "cm",
+                "MEHS: 2.5 cm",
+                "MEHS: 5.1 cm",
+            ),
+            (
+                HailSizeUnit::Millimeters,
+                "mm",
+                "MEHS: 25 mm",
+                "MEHS: 51 mm",
+            ),
+        ];
+        for (unit, label, severe, sig_severe) in expected {
+            let prefs = UserPreferences {
+                hail_size: unit,
+                ..UserPreferences::default()
+            };
+            assert_eq!(
+                RadarProduct::MaxExpectedHailSize.unit_label(&prefs),
+                label,
+                "{unit:?} colour-bar title",
+            );
+            assert_eq!(
+                RadarProduct::MaxExpectedHailSize.format_value(1.0, &prefs),
+                severe,
+                "{unit:?} at the 1.00 in severe criterion",
+            );
+            assert_eq!(
+                RadarProduct::MaxExpectedHailSize.format_value(2.0, &prefs),
+                sig_severe,
+                "{unit:?} at the 2.00 in significant-severe threshold",
+            );
+        }
+    }
+
+    /// …and the default reading is what it was before the preference reached
+    /// this arm: `MEHS: {:.2} in`, the literal the arm used to be.
+    ///
+    /// This is the whole no-silent-change claim. Everyone who has never opened
+    /// the settings dialog is on `HailSizeUnit::Inches`, so if any row here
+    /// moved, consuming the preference would have quietly restated every hail
+    /// size in the app.
+    #[test]
+    fn mehs_in_inches_is_what_it_printed_before_the_preference_existed() {
+        let prefs = UserPreferences::default();
+        assert_eq!(
+            prefs.hail_size,
+            HailSizeUnit::Inches,
+            "the premise: inches is the default nobody has to choose",
+        );
+        for value in [0.0f32, 0.25, 0.75, 1.0, 1.375, 2.0, 4.0, 7.125] {
+            assert_eq!(
+                RadarProduct::MaxExpectedHailSize.format_value(value, &prefs),
+                format!("MEHS: {value:.2} in"),
+            );
+        }
+        assert_eq!(RadarProduct::MaxExpectedHailSize.unit_label(&prefs), "in");
     }
 }

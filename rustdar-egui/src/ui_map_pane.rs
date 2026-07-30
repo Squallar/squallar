@@ -8,7 +8,7 @@ use rustdar_overlays::render::draw::{DrawPointContext, HoverContext};
 use rustdar_overlays::render::overlay_state::{
     OverlayItem, OverlayKind, OverlayRegistry, RenderMode,
 };
-use rustdar_units::UserPreferences;
+use rustdar_units::{HailSizeUnit, UserPreferences};
 use std::sync::Arc;
 
 use crate::tile_source::HttpsTiles;
@@ -787,7 +787,23 @@ const SHADOW_OFFSET: f32 = 1.0;
 /// Minimum pixel spacing between labels before thinning kicks in.
 const MIN_LABEL_SPACING: f32 = 14.0;
 
+/// The generic tick form: whole numbers bare, one decimal otherwise. Short is
+/// the point — a tick label sits in the margin beside a 20px bar.
+fn short_tick(value: f32) -> String {
+    if value.fract().abs() < 0.01 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}")
+    }
+}
+
 /// Format a legend label value. For HHC uses category names; for others, a short numeric string.
+///
+/// Values arrive in the unit `get_color_for_value` takes, which for several
+/// products is not the unit the user asked for: velocity's ramp is authored in
+/// mph and sampled in m/s, MEHS's in inches (`rustdar-radar`'s `palette.rs`).
+/// The colours stay where the palette put them and the *ticks* are converted
+/// here, so a preference change relabels the bar without recolouring it.
 fn format_legend_value(product: RadarProduct, value: f32, prefs: &UserPreferences) -> String {
     match product {
         RadarProduct::HydrometeorClassification => match value as u16 {
@@ -827,17 +843,29 @@ fn format_legend_value(product: RadarProduct, value: f32, prefs: &UserPreference
                 format!("{converted:.1}")
             }
         }
+        // The ramp's stops are the NWS quarter-inch reporting steps; the ticks
+        // are whatever unit the reader thinks in. Inches keep the generic short
+        // form the bar has always been labelled with (¼-in stops as .2 / .5 /
+        // .8), because widening every label by two characters to spell out a
+        // precision the palette's own stops already imply costs margin the
+        // labels do not have; cm and mm take the unit's own precision, which is
+        // what keeps `25.40` off a 20px bar and makes each tick the same number
+        // the hover readout gives for that value.
+        RadarProduct::MaxExpectedHailSize => {
+            let converted = prefs.hail_size.convert_from_inches(value);
+            match prefs.hail_size {
+                HailSizeUnit::Inches => short_tick(converted),
+                unit => {
+                    let decimals = unit.decimals();
+                    format!("{converted:.decimals$}")
+                }
+            }
+        }
         RadarProduct::CorrelationCoefficient => format!("{value:.2}"),
         RadarProduct::DifferentialReflectivity | RadarProduct::SpecificDifferentialPhase => {
             format!("{value:.1}")
         }
-        _ => {
-            if value.fract().abs() < 0.01 {
-                format!("{value:.0}")
-            } else {
-                format!("{value:.1}")
-            }
-        }
+        _ => short_tick(value),
     }
 }
 
@@ -1505,4 +1533,136 @@ fn draw_long_press_tooltip(
 
     painter.rect_filled(bg_rect, 4.0, egui::Color32::from_black_alpha(200));
     painter.galley(bg_rect.min + padding, galley, egui::Color32::WHITE);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ticks `render_color_scale` would paint for `product`, in order.
+    fn ticks(product: RadarProduct, prefs: &UserPreferences) -> Vec<String> {
+        get_legend_scale(product)
+            .thresholds
+            .iter()
+            .map(|&(value, _)| format_legend_value(product, value, prefs))
+            .collect()
+    }
+
+    /// The MEHS colour bar is labelled in the user's hail-size unit.
+    ///
+    /// Its stops are authored in inches (`palette.rs`'s `MEHS` table), which is
+    /// also the unit `get_color_for_value` is sampled in, so the
+    /// *colours* must not move — only the numbers written beside them. Same
+    /// arrangement velocity has had all along: an mph table sampled in m/s with
+    /// the ticks converted at the label.
+    ///
+    /// The inches row is today's labelling unchanged, quarter-inch stops and
+    /// all: nobody who has not opened the settings dialog sees a different bar.
+    #[test]
+    fn the_mehs_colour_bar_is_labelled_in_the_users_hail_size_unit() {
+        let expected = [
+            (
+                HailSizeUnit::Inches,
+                [
+                    "0.2", "0.5", "0.8", "1", "1.2", "1.5", "1.8", "2", "2.5", "3", "3.5", "4",
+                ],
+            ),
+            (
+                HailSizeUnit::Centimeters,
+                [
+                    "0.6", "1.3", "1.9", "2.5", "3.2", "3.8", "4.4", "5.1", "6.3", "7.6", "8.9",
+                    "10.2",
+                ],
+            ),
+            (
+                HailSizeUnit::Millimeters,
+                [
+                    "6", "13", "19", "25", "32", "38", "44", "51", "64", "76", "89", "102",
+                ],
+            ),
+        ];
+        for (unit, labels) in expected {
+            let prefs = UserPreferences {
+                hail_size: unit,
+                ..UserPreferences::default()
+            };
+            assert_eq!(
+                ticks(RadarProduct::MaxExpectedHailSize, &prefs),
+                labels,
+                "{unit:?} ticks",
+            );
+        }
+
+        // The stops themselves are untouched by the preference: this is a
+        // relabelling, not a repalettising.
+        let inch_stops: Vec<f32> = get_legend_scale(RadarProduct::MaxExpectedHailSize)
+            .thresholds
+            .iter()
+            .map(|&(v, _)| v)
+            .collect();
+        assert_eq!(
+            inch_stops,
+            [
+                0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0
+            ],
+            "the palette's stops are inches whatever the preference says",
+        );
+    }
+
+    /// A tick and the hover readout are the same number in the same unit.
+    ///
+    /// The failure this rules out is the half-converted one: a readout in
+    /// millimetres beside a bar still labelled in inches, where every number on
+    /// screen is individually right and the pane as a whole lies about the size
+    /// of the hail. Asserted by rebuilding the readout out of the tick, so the
+    /// two cannot drift apart in precision either.
+    ///
+    /// Inches are excluded on purpose: the ramp's ticks have always been the
+    /// generic short form (`1.2` for the 1.25 in stop) while the readout gives
+    /// hundredths, and this fix does not renumber the default bar.
+    #[test]
+    fn a_mehs_tick_and_the_hover_readout_are_the_same_number() {
+        for unit in [HailSizeUnit::Centimeters, HailSizeUnit::Millimeters] {
+            let prefs = UserPreferences {
+                hail_size: unit,
+                ..UserPreferences::default()
+            };
+            let product = RadarProduct::MaxExpectedHailSize;
+            for &(stop, _) in &get_legend_scale(product).thresholds {
+                let tick = format_legend_value(product, stop, &prefs);
+                assert_eq!(
+                    product.format_value(stop, &prefs),
+                    format!("MEHS: {tick} {}", product.unit_label(&prefs)),
+                    "{unit:?} at the {stop} in stop",
+                );
+            }
+        }
+    }
+
+    /// Every other product's ticks are exactly what they were: the shared
+    /// `short_tick` helper the MEHS arm was factored out of still answers for
+    /// them, and no product picked up a hail-size conversion on the way past.
+    #[test]
+    fn no_other_products_ticks_moved() {
+        let prefs = UserPreferences {
+            hail_size: HailSizeUnit::Millimeters,
+            ..UserPreferences::default()
+        };
+        let default = UserPreferences::default();
+        for &product in RadarProduct::all() {
+            if product == RadarProduct::MaxExpectedHailSize {
+                continue;
+            }
+            assert_eq!(
+                ticks(product, &prefs),
+                ticks(product, &default),
+                "{product:?} reads the hail-size preference and should not",
+            );
+        }
+        // And the generic form itself, which every unnamed product falls back
+        // to: whole numbers bare, one decimal otherwise.
+        assert_eq!(short_tick(4.0), "4");
+        assert_eq!(short_tick(0.25), "0.2");
+        assert_eq!(short_tick(-1.5), "-1.5");
+    }
 }

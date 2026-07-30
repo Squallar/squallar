@@ -71,10 +71,18 @@ impl OverlayItem for StormReportItem {
         if let Some(mag) = report.magnitude {
             let mag_text = match report.kind {
                 StormReportKind::Tornado => format!("F/EF Scale: {mag}"),
+                // Hundredths of an inch on the wire (`StormReport::magnitude`).
+                // The precision comes from the unit rather than being fixed at
+                // hundredths, so a report reads `1.75"`, `4.4cm` or `44mm` and
+                // not `44.45mm` — a hundredth of a millimetre nobody estimated.
+                // Same rule as the MEHS readout (`RadarProduct::format_value`),
+                // so the two hail sizes a pane can show agree about how precise
+                // a hail size is.
                 StormReportKind::Hail => {
                     let inches = (mag / 100.0) as f32;
                     let converted = prefs.hail_size.convert_from_inches(inches);
-                    format!("Size: {converted:.2}{}", prefs.hail_size.suffix())
+                    let decimals = prefs.hail_size.decimals();
+                    format!("Size: {converted:.decimals$}{}", prefs.hail_size.suffix())
                 }
                 StormReportKind::Wind => {
                     let converted = prefs.speed.convert_from_knots(mag as f32);
@@ -318,6 +326,59 @@ impl OverlayHandler for StormReportsHandler {
     fn deserialize_state(&mut self, value: serde_json::Value) {
         if let Some(enabled) = value.get("enabled").and_then(|v| v.as_bool()) {
             self.enabled = enabled;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustdar_units::HailSizeUnit;
+
+    /// A hail report's size reads in the user's hail-size unit, at the precision
+    /// that unit carries.
+    ///
+    /// This popup is the app's *other* hail size, beside the MEHS product's
+    /// readout, and it already converted; what it did not do was drop the two
+    /// decimals it needs for inches, so a millimetre reading claimed a hundredth
+    /// of a millimetre out of a size somebody estimated by eye against a golf
+    /// ball. The inches row is unchanged — `{:.2}` and the inch mark are what
+    /// this line has always printed for the default.
+    #[test]
+    fn a_hail_reports_size_reads_in_the_users_hail_size_unit() {
+        let item = StormReportItem {
+            report: StormReport {
+                kind: StormReportKind::Hail,
+                time: "2015".into(),
+                // 175 hundredths — golf ball, the SPC feed's own encoding.
+                magnitude: Some(175.0),
+                location: "NORMAN".into(),
+                county: "CLEVELAND".into(),
+                state: "OK".into(),
+                lat: 35.22,
+                lon: -97.44,
+                comments: String::new(),
+            },
+            index: 0,
+        };
+        for (unit, expected) in [
+            (HailSizeUnit::Inches, "Size: 1.75\""),
+            (HailSizeUnit::Centimeters, "Size: 4.4cm"),
+            (HailSizeUnit::Millimeters, "Size: 44mm"),
+        ] {
+            let prefs = UserPreferences {
+                hail_size: unit,
+                ..UserPreferences::default()
+            };
+            let content = item.popup_content(&prefs);
+            let Some(PopupSection::Text(size)) = content.sections.get(1) else {
+                panic!(
+                    "{unit:?}: the magnitude line is not the popup's second section \
+                     ({} sections)",
+                    content.sections.len(),
+                );
+            };
+            assert_eq!(size, expected, "{unit:?}");
         }
     }
 }

@@ -33,6 +33,24 @@ impl HailSizeUnit {
         }
     }
 
+    /// Decimals a hail size reads well in, in this unit.
+    ///
+    /// Hail is *reported* in quarter-inch steps — the NWS reporting steps the
+    /// standard hail ramp is authored in, and what the RPG rounds its own hail
+    /// size to — so roughly 6 mm is all the resolution the number carries and
+    /// anything finer than a millimetre is arithmetic rather than measurement:
+    /// `25.40 mm` claims a precision no hail size has. Hundredths of an inch
+    /// land the quarter steps exactly (0.25 / 0.50 / 0.75); tenths of a
+    /// centimetre and whole millimetres land them to within half a millimetre
+    /// and keep the number short enough for a tooltip or a colour-bar tick.
+    pub fn decimals(self) -> usize {
+        match self {
+            HailSizeUnit::Inches => 2,
+            HailSizeUnit::Centimeters => 1,
+            HailSizeUnit::Millimeters => 0,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             HailSizeUnit::Inches => "Inches",

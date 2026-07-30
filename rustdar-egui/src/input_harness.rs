@@ -373,6 +373,19 @@ impl InputHarness {
             .collect()
     }
 
+    /// Every text run the last frame painted inside `rect`.
+    ///
+    /// The whole-screen list above cannot tell a colour-bar tick from a number
+    /// in the chrome, which matters when the assertion is "this pane's bar is
+    /// labelled in millimetres and in nothing else".
+    pub(crate) fn painted_text_strings_in(&self, rect: egui::Rect) -> Vec<String> {
+        self.last_texts
+            .iter()
+            .filter(|(r, _)| rect.contains(r.center()))
+            .map(|(_, text)| text.clone())
+            .collect()
+    }
+
     /// Whether `needle` was painted anywhere inside `rect`.
     ///
     /// The other end of a probe: a `DrawnDropdown` says what the renderer was
@@ -2557,6 +2570,72 @@ mod tests {
                 horizontal, 0,
                 "pane {idx}: painted a bottom bar, i.e. the axis was taken from \
                  the pane's own shape"
+            );
+        }
+    }
+
+    /// 8c. **The hail-size preference reaches the MEHS colour bar on the glass.**
+    ///
+    ///     `format_legend_value` and `RadarProduct::unit_label` are pinned
+    ///     directly in `ui_map_pane.rs`; this is the other end of the same wire.
+    ///     What it adds is that the preference the settings dialog writes is the
+    ///     one `render_color_scale` is handed — it travels the whole way through
+    ///     `Gui::ui` and `PaneRenderCtx` — and that a unit change relabels every
+    ///     tick, not just the title above them. A bar reading `in` over
+    ///     millimetre numbers, or millimetre ticks under an inch title, is the
+    ///     half-converted state this rules out.
+    #[test]
+    fn the_mehs_colour_bar_paints_the_users_hail_size_unit() {
+        use rustdar_radar::types::RadarProduct;
+        use rustdar_units::HailSizeUnit;
+
+        /// The ¼-in stops of `palette::MEHS` as the bar labels them in inches.
+        const INCH_TICKS: [&str; 8] = ["0.2", "0.5", "0.8", "1.2", "1.5", "1.8", "2.5", "3.5"];
+        /// The same stops in whole millimetres, 1.00 in landing on 25.
+        const MM_TICKS: [&str; 12] = [
+            "6", "13", "19", "25", "32", "38", "44", "51", "64", "76", "89", "102",
+        ];
+
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.select_product(0, RadarProduct::MaxExpectedHailSize);
+        let pane = h.pane_rects()[0];
+
+        // The default nobody has to choose.
+        let painted = h.painted_text_strings_in(pane);
+        assert!(
+            painted.iter().any(|t| t == "in"),
+            "no `in` title over the default MEHS bar; painted: {painted:?}",
+        );
+        for tick in INCH_TICKS {
+            assert!(
+                painted.iter().any(|t| t == tick),
+                "the inch bar is missing its {tick} tick; painted: {painted:?}",
+            );
+        }
+
+        h.gui_mut().preferences.hail_size = HailSizeUnit::Millimeters;
+        h.warm_up();
+
+        let painted = h.painted_text_strings_in(pane);
+        assert!(
+            painted.iter().any(|t| t == "mm"),
+            "the bar still is not titled `mm`; painted: {painted:?}",
+        );
+        for tick in MM_TICKS {
+            assert!(
+                painted.iter().any(|t| t == tick),
+                "the mm bar is missing its {tick} tick; painted: {painted:?}",
+            );
+        }
+        assert!(
+            !painted.iter().any(|t| t == "in"),
+            "`in` is still over a bar labelled in millimetres; painted: {painted:?}",
+        );
+        for tick in INCH_TICKS {
+            assert!(
+                !painted.iter().any(|t| t == tick),
+                "the {tick} inch tick survived the switch to millimetres; \
+                 painted: {painted:?}",
             );
         }
     }
