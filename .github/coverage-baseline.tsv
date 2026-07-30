@@ -26,7 +26,7 @@ rustdar-egui/src/ui_popups.rs	163	4
 rustdar-egui/src/ui_settings.rs	220	177
 rustdar-frontend/src/app.rs	1358	1115
 rustdar-frontend/src/app_chunks.rs	687	603
-rustdar-frontend/src/app_fetch.rs	1030	463
+rustdar-frontend/src/app_fetch.rs	1030	474
 rustdar-frontend/src/app_render.rs	2647	2087
 rustdar-frontend/src/app_state.rs	87	0
 rustdar-frontend/src/channels.rs	43	40
@@ -92,7 +92,7 @@ rustdar-platform/src/main.rs	6	0
 rustdar-platform/src/network_security_config.rs	150	147
 rustdar-platform/src/platform.rs	98	0
 rustdar-platform/src/run.rs	31	0
-rustdar-radar/src/archive.rs	669	484
+rustdar-radar/src/archive.rs	669	485
 rustdar-radar/src/beam.rs	419	404
 rustdar-radar/src/chunks.rs	1982	1502
 rustdar-radar/src/dpprep.rs	1019	950
@@ -107,7 +107,8 @@ rustdar-radar/src/nrot.rs	1356	1149
 rustdar-radar/src/palette.rs	177	144
 rustdar-radar/src/render.rs	1183	994
 rustdar-radar/src/render_input.rs	735	722
-rustdar-radar/src/scan.rs	244	36
+rustdar-radar/src/sampler.rs	1540	1504
+rustdar-radar/src/scan.rs	244	39
 rustdar-radar/src/sites.rs	106	106
 rustdar-radar/src/sounding.rs	234	207
 rustdar-radar/src/sources.rs	172	169
@@ -115,7 +116,7 @@ rustdar-radar/src/srm.rs	1344	821
 rustdar-radar/src/srv.rs	857	555
 rustdar-radar/src/tls.rs	189	169
 rustdar-radar/src/twin.rs	471	315
-rustdar-radar/src/types.rs	422	352
+rustdar-radar/src/types.rs	422	354
 rustdar-radar/src/vil.rs	1450	937
 rustdar-radar/src/vild.rs	463	450
 rustdar-radar/src/volumetric.rs	512	506
