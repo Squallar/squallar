@@ -32,7 +32,7 @@ rustdar-frontend/src/app_state.rs	87	0
 rustdar-frontend/src/channels.rs	43	40
 rustdar-frontend/src/chunk_feed.rs	406	393
 rustdar-frontend/src/chunk_notify.rs	310	279
-rustdar-frontend/src/constants.rs	75	68
+rustdar-frontend/src/constants.rs	87	79
 rustdar-frontend/src/egui_renderer.rs	338	101
 rustdar-frontend/src/input.rs	138	127
 rustdar-frontend/src/location_hint.rs	65	65
@@ -44,6 +44,9 @@ rustdar-frontend/src/platform_double.rs	156	144
 rustdar-frontend/src/render_dispatch.rs	1171	1063
 rustdar-frontend/src/volume.rs	268	213
 rustdar-frontend/src/volume_degrade.rs	135	129
+rustdar-frontend/src/volume_quality.rs	279	273
+rustdar-frontend/src/volume_raymarch.rs	774	335
+rustdar-frontend/src/volume_uniform.rs	202	200
 rustdar-gps/src/config.rs	27	19
 rustdar-gps/src/nmea_parser.rs	52	0
 rustdar-gps/src/serial.rs	168	37
