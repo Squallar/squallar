@@ -296,10 +296,13 @@ impl SectionAxes {
 ///
 /// The fields are private and the lengths are checked in
 /// [`from_parts`](Self::from_parts), because a mis-shaped section is not a
-/// recoverable error anywhere downstream: `app_render.rs`'s
-/// `apply_render_to_pane` asserts a `ColorImage`'s length on the **main
-/// thread**, live in release, and under wasm a main-thread panic takes the
-/// whole app down. A decoder handed a short payload has to find out here.
+/// recoverable error anywhere downstream. `rustdar-frontend`'s
+/// `app_render::apply_render_to_pane` builds a `ColorImage` from a buffer and a
+/// size (`app_render.rs:331`); the length check is `epaint`'s own, an
+/// `assert_eq!` inside `ColorImage::from_rgba_unmultiplied`
+/// (`epaint-0.35.0/src/image.rs:114`). It runs on the **main thread**, live in
+/// release, and under wasm a main-thread panic takes the whole app down. A
+/// decoder handed a short payload has to find out here instead.
 #[derive(Debug, Clone)]
 pub struct CrossSection {
     image: Vec<u8>,
@@ -310,13 +313,23 @@ pub struct CrossSection {
 
 /// Equality that ignores a value where there is no value to compare.
 ///
-/// **A derived `PartialEq` makes a blank section unequal to itself.** Every
-/// non-`Value` pixel stores `f32::NAN` in `values`, and `NaN != NaN`, so a
-/// section drawn entirely below the lowest beam — the ordinary result of
-/// sectioning clear air well away from a site — would compare unequal to a
-/// byte-identical copy with nothing in the failure message saying why. WP-D's
-/// worker reply asserts `assert_eq!(execute(&…), None)` over a `JobOutput` that
-/// contains one of these, so this is load-bearing rather than tidy.
+/// **A derived `PartialEq` makes almost every section unequal to itself.**
+/// Every non-`Value` pixel stores `f32::NAN` in `values`, and `NaN != NaN`, so
+/// *one* such pixel anywhere in the raster is enough. That is not a corner
+/// case — it is the common case, and the failure is total rather than rare:
+///
+/// * A section drawn entirely below the lowest beam — clear air well away from
+///   a site — is `NaN` in every pixel.
+/// * So is an ordinary convective section a few tens of km from the site. It
+///   has `BeyondRange` where the upper cuts stop short, `BelowLowestBeam` under
+///   the base tilt and `AboveVolume` in the cone, and any one of those is a
+///   `NaN`. `a_section_with_no_values_still_equals_itself` exercises both, and
+///   substituting derived semantics fails on the near-site one too.
+///
+/// WP-D's worker reply asserts `assert_eq!(execute(&…), None)` over a
+/// `JobOutput` that contains one of these. Under a derive it would have broken
+/// on almost any input, with nothing in the failure message saying why — so
+/// this is load-bearing rather than tidy.
 ///
 /// The same reasoning already produced a hand-written `PartialEq` on
 /// [`crate::sampler::Sample`]; this is that decision applied to the plane form.
@@ -1407,8 +1420,11 @@ mod tests {
     /// The wall is planted in **ground** range: a gate is in it when
     /// `beam::ground_range_km(slant, elevation)` falls in the band. A
     /// rasterizer that forgot `cos e` would paint the 19.5° rung's share of the
-    /// wall 5.7 % further out — 5.7 km at a 100 km wall, ~58 native columns —
-    /// and every other rung's in the right place, so the wall would lean.
+    /// wall 5.7 % further out and every other rung's in the right place, so the
+    /// wall would lean. On this fixture's geometry — a 60 km wall drawn on a
+    /// 150 km line — that is **3.65 km, about 50 native columns**, which
+    /// `dropping_the_cos_e_correction_would_move_the_wall_further_than_the_tolerance`
+    /// measures rather than assumes.
     #[test]
     fn a_planted_wall_paints_at_its_ground_range_on_every_rung() {
         const WALL: (f64, f64) = (60.0, 62.0);
@@ -1470,8 +1486,9 @@ mod tests {
         assert!(!painted_columns.is_empty(), "the wall painted nothing");
         // One column is 150/SECTION_WIDTH km (73 m native); the bilinear in
         // slant range spreads the 2 km wall by up to one gate either side, so
-        // 0.6 km is generous for the smear and an order under the 3.4 km a
-        // missing `cos e` would put the 19.5° rung out at 60 km.
+        // 0.6 km is generous for the smear and 6.1x under the 3.6509 km a
+        // missing `cos e` would put the 19.5° rung out at a 60 km wall — the
+        // figure the companion test below measures.
         assert!(
             worst.0 < 0.6,
             "a value painted {:.3} km outside the wall at column {} (ground \
@@ -2381,16 +2398,31 @@ mod tests {
             "precondition: the far section has values in it, so it is not the \
              blank raster this test needs",
         );
-        assert!(
-            !far.values().is_empty() && far.values().iter().any(|v| v.is_nan()),
-            "precondition: the value plane is empty",
-        );
+        // precondition: `all` is vacuously true on an empty slice, so the
+        // assertion above says nothing unless the plane is the full raster.
+        assert_eq!(far.values().len(), SECTION_WIDTH * SECTION_HEIGHT);
         let copy = far.clone();
         assert_eq!(far, copy, "a blank section is unequal to a copy of itself");
 
+        // An ordinary near-site section — a real echo, drawn a few tens of km
+        // out — is the case that makes this more than a corner. It is mostly
+        // values, and it *still* fails under derived semantics, because the
+        // upper cuts stop short, the base tilt has a floor and the cone has a
+        // ceiling, so some pixel somewhere is a `NaN`.
+        let near = radial_section(&scan, 45.0, 100.0);
+        assert!(
+            near.values().iter().any(|v| v.is_nan()) && near.values().iter().any(|v| v.is_finite()),
+            "precondition: the near section is all one thing, so it is not the \
+             ordinary mixed raster this half of the test is about",
+        );
+        assert_eq!(
+            near,
+            near.clone(),
+            "an ordinary section is unequal to a copy of itself",
+        );
+
         // And a section *with* values still compares on them: a changed number
         // is a changed section.
-        let near = radial_section(&scan, 45.0, 100.0);
         let mut tweaked = near.clone();
         let i = tweaked
             .status
