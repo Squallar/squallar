@@ -3287,6 +3287,41 @@ mod tests {
         )
     }
 
+    /// The feed's slack stays wider than the renderer's match window.
+    ///
+    /// These two were once the same 0.3, and the comment here cited
+    /// `find_sweep` as the reason. They answer different questions: the
+    /// renderer compares a request against a sweep already flown and can be
+    /// exact, while this compares it against the VCP's *planned* angle for a cut
+    /// that has not been downloaded — the decision being what to skip. The
+    /// errors are asymmetric too, so when the renderer's window narrowed this
+    /// one deliberately did not follow it down.
+    #[test]
+    fn the_feeds_slack_stays_wider_than_the_renderers_window() {
+        assert!(
+            f64::from(ELEVATION_MATCH) > crate::render::ELEVATION_WINDOW,
+            "a cut the renderer would refuse to draw must still be downloaded — \
+             feed slack {ELEVATION_MATCH} vs renderer window {}",
+            crate::render::ELEVATION_WINDOW,
+        );
+
+        // Concretely: a planned cut a quarter of a degree from the selection is
+        // further off than the renderer would accept, and is fetched anyway.
+        let vcp = vcp_with(&[(0.5, true), (0.75, true)]);
+        let map = ElevationChunkMap::from_coverage_pattern(&vcp).expect("cuts");
+        let (second, angle) = map.cut_for(8).expect("the second cut starts at sequence 8");
+        assert_eq!(second, 2, "sequence 8 is the second cut");
+        assert!(
+            (f64::from(angle) - 0.75).abs() < 1e-6
+                && (f64::from(angle) - 0.5).abs() > crate::render::ELEVATION_WINDOW,
+            "the fixture must put the second cut outside the renderer's window",
+        );
+        assert!(
+            map.wants(8, &CutSelection::Tilts(vec![0.5])),
+            "a cut this near the selection must still be downloaded",
+        );
+    }
+
     /// A site that points its lowest cut below the horizon can still ask for it.
     ///
     /// The VCP carries the angle unsigned, so KMSX declares its base tilt as
