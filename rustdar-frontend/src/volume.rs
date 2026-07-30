@@ -164,7 +164,13 @@ fn override_from_env_value(value: Option<&str>) -> Option<VolumeSupport> {
 /// Pure, and takes the whole `Limits` so it can be exercised against synthetic
 /// ones — including `Limits::downlevel_webgl2_defaults()`, which is the floor the
 /// web build is actually held to.
-fn limits_shortfall(limits: &wgpu::Limits) -> Option<String> {
+///
+/// `pub(crate)` so `app_state` can hold the limits it *actually requests* to
+/// this floor rather than a hand-built approximation of them. That claim was
+/// prose in the sentence above until
+/// `the_web_limits_this_app_requests_clear_the_volume_probes_floor` connected
+/// the two functions.
+pub(crate) fn limits_shortfall(limits: &wgpu::Limits) -> Option<String> {
     let grid_axis = VOLUME_GRID_CELLS.iter().copied().max().unwrap_or(0);
     // The grid must fit as well as the floor, so that a device between the two is
     // reported honestly rather than failing later inside a callback. The web arm
