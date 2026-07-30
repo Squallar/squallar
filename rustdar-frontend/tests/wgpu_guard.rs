@@ -8,11 +8,22 @@
 //! check they are different crates. Parsing rather than scanning is what makes
 //! decoys in comments and string literals inert; matching on structure rather
 //! than on the aliases' names is what keeps renames and side-swaps passing.
+//!
+//! The second test here closes the hole the first one's *premise* leaves open.
+//! `guard_compares_two_different_crates` proves `app.rs` compares this crate's
+//! `wgpu` against egui-wgpu's — and that is the whole check, for the whole
+//! crate. It says nothing about any *other* file, and any other file naming
+//! `::wgpu` reaches the direct dependency rather than the re-export. Today they
+//! resolve to the same package, so such a file compiles and behaves identically;
+//! the day they do not, it renders through a copy this crate's backend features
+//! never configured, with the guard still passing. See
+//! `every_wgpu_path_outside_the_guard_goes_through_egui_wgpu`.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::HashMap;
+use std::path::{Path as FsPath, PathBuf};
 use syn::visit::Visit;
-use syn::{Expr, GenericArgument, Item, PathArguments, Stmt, Type};
+use syn::{Expr, GenericArgument, Item, PathArguments, Stmt, Type, UseTree};
 
 /// A type path reduced to the two things the guard depends on.
 #[derive(PartialEq, Eq, Debug)]
@@ -186,5 +197,141 @@ fn guard_compares_two_different_crates() {
     assert_ne!(
         ours, theirs,
         "both sides of the wgpu guard resolve to the same path"
+    );
+}
+
+/// Whether a syntax tree names `::wgpu` — the direct dependency, `::`-rooted.
+///
+/// Two node kinds reach it and they are not the same shape: ordinary paths in
+/// type and expression position are `syn::Path`, while `use ::wgpu::…;` is an
+/// `ItemUse` whose leading `::` sits beside a `UseTree` rather than inside a
+/// path. Visiting only the first misses the import that would make every later
+/// `wgpu::` in the file mean the direct dependency.
+#[derive(Default)]
+struct RootedWgpuPaths(Vec<String>);
+
+impl RootedWgpuPaths {
+    fn note(&mut self, first_segment: &syn::Ident) {
+        if first_segment == "wgpu" {
+            self.0.push(format!("::{first_segment}"));
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for RootedWgpuPaths {
+    fn visit_path(&mut self, node: &'ast syn::Path) {
+        if node.leading_colon.is_some()
+            && let Some(first) = node.segments.first()
+        {
+            self.note(&first.ident);
+        }
+        syn::visit::visit_path(self, node);
+    }
+
+    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        if node.leading_colon.is_some() {
+            match &node.tree {
+                UseTree::Path(p) => self.note(&p.ident),
+                UseTree::Name(n) => self.note(&n.ident),
+                UseTree::Rename(r) => self.note(&r.ident),
+                UseTree::Glob(_) | UseTree::Group(_) => {}
+            }
+        }
+        syn::visit::visit_item_use(self, node);
+    }
+}
+
+/// Every `.rs` file under `src/`, so a module added tomorrow is covered without
+/// anyone remembering to list it. Recursive, because `#[path]` modules and real
+/// subdirectories both exist in this crate's future.
+fn source_files(dir: &FsPath, into: &mut Vec<PathBuf>) {
+    let entries =
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+    for entry in entries {
+        let path = entry.expect("cannot read a directory entry").path();
+        if path.is_dir() {
+            source_files(&path, into);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            into.push(path);
+        }
+    }
+}
+
+/// `app.rs` must be the only file in this crate that names `::wgpu`.
+///
+/// The guard above establishes that *one* pair of paths in *one* file resolves
+/// to two different crates. That is the entire single-copy check, and its blast
+/// radius is that file. A second wgpu-touching module writing `::wgpu::Whatever`
+/// compiles today only because the direct dependency and egui-wgpu's re-export
+/// currently resolve to the same package — and on the day a bump splits them,
+/// that module renders through a copy whose backend features nobody set, while
+/// `guard_compares_two_different_crates` keeps passing. The failure has no
+/// compiler diagnostic and no runtime error; it is `request_adapter` returning
+/// nothing, or a texture that never appears.
+///
+/// So the rule is: reach wgpu through `egui_wgpu::wgpu`, everywhere except the
+/// guard itself. `app.rs` is exempt because naming the direct dependency is
+/// precisely what it is for — that is what keeps `cargo machete` and `cargo
+/// udeps` from reporting the manifest entry as dead.
+#[test]
+fn every_wgpu_path_outside_the_guard_goes_through_egui_wgpu() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    source_files(&src, &mut files);
+    files.sort();
+
+    // A scan over nothing passes. Pin that there is something to scan, and that
+    // the exemption is still earning its keep — if `app.rs` stops naming
+    // `::wgpu`, the guard has moved or gone and this test's exemption is stale.
+    assert!(
+        files.len() > 5,
+        "only {} source files found under {}; the scan is not looking where it \
+         thinks it is",
+        files.len(),
+        src.display()
+    );
+
+    let mut app_rs_seen = false;
+    for file in &files {
+        let name = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("a source file with no name");
+        let text = std::fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", file.display()));
+        let parsed = syn::parse_file(&text)
+            .unwrap_or_else(|e| panic!("{} does not parse: {e}", file.display()));
+
+        let mut found = RootedWgpuPaths::default();
+        found.visit_file(&parsed);
+
+        if name == "app.rs" {
+            app_rs_seen = true;
+            assert!(
+                !found.0.is_empty(),
+                "app.rs no longer names `::wgpu`, so the single-copy guard has \
+                 moved or gone — and this test is exempting a file that no \
+                 longer holds the guard it is exempted for"
+            );
+            continue;
+        }
+
+        assert!(
+            found.0.is_empty(),
+            "{} names `::wgpu` {} time(s). Every `wgpu::` in this crate must \
+             reach the copy egui-wgpu renders through, `egui_wgpu::wgpu`; the \
+             `::`-rooted path is the direct dependency, which exists only to \
+             *choose wgpu's features*. They resolve to the same package today, \
+             so this compiles and works — until a version bump splits them, at \
+             which point this file renders through a wgpu nothing configured, \
+             with `guard_compares_two_different_crates` still green.",
+            file.display(),
+            found.0.len(),
+        );
+    }
+
+    assert!(
+        app_rs_seen,
+        "src/app.rs was not scanned, so the guard's own file went unchecked"
     );
 }
