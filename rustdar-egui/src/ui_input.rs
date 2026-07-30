@@ -705,7 +705,7 @@ pub(crate) struct MapPointerFrame {
     pub suppress_pan: bool,
 }
 
-/// One pane's resolved pointer state **as `render_map` actually used it**.
+/// One pane's resolved pointer state **as `render_panes` actually used it**.
 ///
 /// Recorded from the very locals that feed `PaneRenderCtx` and
 /// `Map::drag_pan_buttons`, so a test observes the shipped decision rather than

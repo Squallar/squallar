@@ -7,6 +7,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use walkers::MapMemory;
 
+#[path = "pane_content.rs"]
+mod content;
+
+// Re-exported so a pane's kind is named where a pane is named:
+// `rustdar_egui::pane::PaneKind`, alongside `LoopPhase` and `RenderTarget`. The
+// split into a second file is about how much there is to say about each half,
+// not about them being different things.
+pub use content::{
+    CrossSectionPane, GeoPoint, OrbitCamera, OrbitDelta, PaneContent, PaneKind, SectionLine,
+    SectionTarget, VolumePane, VolumeStamp, VolumeTarget,
+};
+
 const DEFAULT_PANE_ZOOM: f64 = 4.0;
 
 /// Identifies a pane in the multi-pane layout.
@@ -207,6 +219,15 @@ pub struct LoopPlaybackState {
 
 /// Per-pane state: each pane independently selects a radar product,
 /// elevation, layer toggles, and maintains its own map viewport.
+///
+/// Every field below is flat, including for a pane that is not a map: what a
+/// pane is looking at (site, time, product, viewport, loop) is the same set of
+/// questions whether it draws a plan view, a vertical section or a volume. Only
+/// [`content`](Self::content) differs by kind, and it is the *only* field that
+/// does. See [`PaneContent`]'s module documentation for why — the short version
+/// is that ~53 all-panes loops keep working unchanged, one of which
+/// (`App::evict_unshown_scans`) is what stops a non-map pane's volume being
+/// freed out from under it.
 pub struct PaneState {
     /// NEXRAD site code this pane is viewing (e.g. "KTLX").
     pub site: String,
@@ -264,6 +285,18 @@ pub struct PaneState {
     /// Generation counter for RadarSites texture invalidation.
     /// Bumped when site, loading_site, or theme changes.
     pub radar_sites_render_gen: u64,
+    /// What kind of pane this is, and the state that kind needs.
+    ///
+    /// The single source of [`Self::kind`] — there is deliberately no `kind`
+    /// field beside this one, because two fields can disagree and a mismatched
+    /// pair is a state every render frame would then have to have an opinion
+    /// about.
+    ///
+    /// **Nothing may read this through `Gui::panes[..]` or `Gui::active_pane()`
+    /// during the UI pass.** Six places `std::mem::take` a pane for the duration
+    /// of a draw, and a taken slot holds `PaneState::default()`, which is a
+    /// *map* pane whatever the real one is. Branch on the taken value instead.
+    pub content: PaneContent,
 }
 
 impl Default for LoopPlaybackState {
@@ -636,7 +669,79 @@ impl PaneState {
             loop_state: LoopPlaybackState::new(),
             loading_site: None,
             radar_sites_render_gen: 0,
+            content: PaneContent::Map,
         }
+    }
+
+    /// What kind of pane this is.
+    ///
+    /// Derived from [`Self::content`] rather than stored beside it. See the
+    /// warning on that field: during the UI pass this answers `Map` for a pane
+    /// that has been `mem::take`n, so read it from the value that was taken.
+    pub fn kind(&self) -> PaneKind {
+        self.content.kind()
+    }
+
+    /// Whether this is the plan-view map pane every pane used to be.
+    ///
+    /// The predicate the all-panes loops that are *only* about maps filter on —
+    /// render dispatch, the sibling texture broadcast, loop synchronisation.
+    pub fn is_map(&self) -> bool {
+        matches!(self.content, PaneContent::Map)
+    }
+
+    /// This pane's cross-section state, or `None` if it is not a section pane.
+    pub fn cross_section(&self) -> Option<&CrossSectionPane> {
+        match &self.content {
+            PaneContent::CrossSection(section) => Some(section),
+            _ => None,
+        }
+    }
+
+    /// [`Self::cross_section`], mutably.
+    pub fn cross_section_mut(&mut self) -> Option<&mut CrossSectionPane> {
+        match &mut self.content {
+            PaneContent::CrossSection(section) => Some(section),
+            _ => None,
+        }
+    }
+
+    /// This pane's 3D volume state, or `None` if it is not a volume pane.
+    pub fn volume(&self) -> Option<&VolumePane> {
+        match &self.content {
+            PaneContent::Volume(volume) => Some(volume),
+            _ => None,
+        }
+    }
+
+    /// [`Self::volume`], mutably.
+    pub fn volume_mut(&mut self) -> Option<&mut VolumePane> {
+        match &mut self.content {
+            PaneContent::Volume(volume) => Some(volume),
+            _ => None,
+        }
+    }
+
+    /// Convert this pane to `kind`, keeping everything about *what it is looking
+    /// at*: its site, its scan, its product and elevation selection, its
+    /// viewport, its layer toggles and its loop.
+    ///
+    /// That is a property of the representation rather than of this function —
+    /// only `content` is written, and every other field is flat — which is what
+    /// makes converting a pane feel like changing a view rather than like losing
+    /// one. A user who has panned to a storm and picked a tilt has said
+    /// something; asking for a section of it is not a reason to forget any of
+    /// it.
+    ///
+    /// Converting to the kind it already is does nothing at all, rather than
+    /// replacing the per-kind state with a fresh one: re-selecting the current
+    /// kind from a menu must not discard a drawn section line or a camera the
+    /// user has spent a while aiming.
+    pub fn set_kind(&mut self, kind: PaneKind) {
+        if self.kind() == kind {
+            return;
+        }
+        self.content = PaneContent::for_kind(kind);
     }
 
     /// The currently active radar image (from loop frame or static render).
@@ -915,7 +1020,7 @@ impl PaneLayout {
     /// all drawn, just all in the same place.
     ///
     /// Every production caller clamps before it gets here today
-    /// (`load_ui_config` to [`crate::ui_layout::WidthClass::max_panes_absolute`],
+    /// (`load_ui_config` to `WidthClass::max_panes_absolute`,
     /// the pane picker to the width class's own maximum), so this is currently
     /// unreachable. It is clamped here anyway because "the caller clamped" is a
     /// property of each call site rather than of this type, and the next writer

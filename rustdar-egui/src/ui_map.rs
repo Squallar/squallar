@@ -1,4 +1,5 @@
 use crate::actions::GuiAction;
+use crate::pane::PaneKind;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 use rustdar_radar::types::{EARTH_RADIUS_KM, IMAGE_SIZE, RadarProduct};
 use rustdar_units::UserPreferences;
@@ -6,8 +7,33 @@ use rustdar_units::UserPreferences;
 #[path = "ui_map_pane.rs"]
 mod pane_render;
 
+/// What a cross-section pane says while it has nothing to show.
+///
+/// Deliberately an instruction rather than an apology: a section pane with no
+/// line is the ordinary state between converting a pane and aiming it, and the
+/// line is drawn somewhere else (on a map pane), which is not guessable.
+pub(crate) const CROSS_SECTION_EMPTY_STATE: &str =
+    "Draw a line on a map pane to cut a cross-section";
+
+/// What a 3D pane says while it has nothing to show.
+///
+/// Says unavailable, not "loading": whether a device can raymarch a volume at
+/// all is decided by a capability check, and a pane that promises a picture it
+/// cannot produce is worse than one that says so.
+pub(crate) const VOLUME_EMPTY_STATE: &str = "3D volume view unavailable";
+
 impl super::Gui {
-    pub(super) fn render_map(
+    /// Draw every visible pane, whatever kind each one is.
+    ///
+    /// Named for panes rather than for maps because the pane loop below is
+    /// shared by all three [`PaneKind`](crate::pane::PaneKind)s and only one of
+    /// them is a map. Everything except the single `match` on the pane's kind —
+    /// the rect, taking the pane, resolving the centre, taking `map_memory`,
+    /// resolving the pointer, building the child `Ui`, putting it all back and
+    /// drawing the border — is deliberately *not* per-kind: a section pane has a
+    /// site, a viewport and a pointer just as a map pane does, and duplicating
+    /// the frame around each arm is how those quietly drift apart.
+    pub(super) fn render_panes(
         &mut self,
         ui: &mut egui::Ui,
         excluded_rects: &[egui::Rect],
@@ -167,6 +193,15 @@ impl super::Gui {
                     // From the same locals that feed `PaneRenderCtx` and
                     // `drag_pan_buttons` below: after the gate, after
                     // `overlay_click_pos` is read out. See `PanePointerProbe`.
+                    //
+                    // Deliberately above the kind branch, so **every** pane
+                    // reports a frame whatever it is. The whole `input_harness`
+                    // suite reads the active pane's probe out of this vector,
+                    // and `InputHarness::frame` panics when it finds none — so a
+                    // kind whose arm forgot to push would take down ~4600 lines
+                    // of pointer tests with a message about the pointer pipeline
+                    // never running. Pinned by
+                    // `every_pane_reports_a_pointer_frame_whatever_its_kind`.
                     #[cfg(test)]
                     self.last_pane_pointers
                         .push(crate::ui_input::PanePointerProbe {
@@ -180,7 +215,17 @@ impl super::Gui {
                             },
                         });
 
-                    // Create a child UI constrained to this pane's rect
+                    // Create a child UI constrained to this pane's rect.
+                    //
+                    // `"pane_map"` is a **key, not a description**: it is the
+                    // salt every widget inside this pane derives its egui `Id`
+                    // from, so egui's memory of what the pane remembers —
+                    // combo boxes it has open, scroll offsets, resized panels —
+                    // hangs off it. Renaming it to something kind-neutral would
+                    // re-key every one of those, turning "the user made pane 2 a
+                    // 3D view" into "egui forgot everything pane 2 remembered",
+                    // and would report the conversion as a widget-id change for
+                    // no reason. It stays as it is, for all three kinds.
                     let mut child_ui = ui.new_child(
                         egui::UiBuilder::new()
                             .max_rect(pane_rect)
@@ -188,59 +233,92 @@ impl super::Gui {
                     );
                     child_ui.set_clip_rect(pane_rect);
 
-                    if let Some(tiles) = tiles_owned.as_mut() {
-                        Map::new(None, &mut map_memory, center)
-                            .with_layer(tiles, 1.0)
-                            // `zoom_with_ctrl(false)` is what puts us on walkers'
-                            // raw-scroll zoom path, and walkers 0.55 changed that
-                            // path's frame-time multiplier from
-                            // `stable_dt.max(predicted_dt * 1.5)` to
-                            // `stable_dt.clamp(predicted_dt * 0.5, predicted_dt * 2.0)`.
-                            // At a steady frame rate that is a uniform x0.667 on the
-                            // scroll-zoom step (60Hz: 0.025 -> 0.01667, so a wheel
-                            // notch that gave ~1.31x now gives ~1.21x); on a hitched
-                            // frame the old form grew unbounded and the new one is
-                            // capped, which is the bug being fixed.
-                            //
-                            // `Map::zoom_speed` (default 2.0) can compensate the
-                            // magnitude, but it is not an exact undo: it scales the
-                            // combined zoom delta, so pinch and double-click zoom
-                            // move with it. Left at the default deliberately.
-                            .zoom_with_ctrl(false)
-                            .panning(false)
-                            .drag_pan_buttons(if suppress_pan {
-                                egui::DragPanButtons::empty()
-                            } else {
-                                egui::DragPanButtons::PRIMARY
-                            })
-                            .show(&mut child_ui, |ui, _response, projector, memory| {
-                                let zoom = memory.zoom();
+                    // The single point in the UI that branches on pane kind.
+                    //
+                    // On `pane.kind()`, not `self.panes[pane_idx].kind()`: the
+                    // pane was `mem::take`n above, so its slot holds a default
+                    // `PaneState` — a *map* pane, whatever this one is — for the
+                    // whole of this block. That is the same hazard `menu_model`
+                    // has in `ui_chrome.rs`, and it has the same fix: read the
+                    // value you took, never the slot you took it from. It fails
+                    // silently in the direction that looks like it works, which
+                    // is why `last_pane_content` records what each arm actually
+                    // drew rather than what the branch was handed.
+                    match pane.kind() {
+                        PaneKind::Map => {
+                            self.record_pane_content(pane_idx, PaneKind::Map, pane_rect);
+                            if let Some(tiles) = tiles_owned.as_mut() {
+                                Map::new(None, &mut map_memory, center)
+                                    .with_layer(tiles, 1.0)
+                                    // `zoom_with_ctrl(false)` is what puts us on walkers'
+                                    // raw-scroll zoom path, and walkers 0.55 changed that
+                                    // path's frame-time multiplier from
+                                    // `stable_dt.max(predicted_dt * 1.5)` to
+                                    // `stable_dt.clamp(predicted_dt * 0.5, predicted_dt * 2.0)`.
+                                    // At a steady frame rate that is a uniform x0.667 on the
+                                    // scroll-zoom step (60Hz: 0.025 -> 0.01667, so a wheel
+                                    // notch that gave ~1.31x now gives ~1.21x); on a hitched
+                                    // frame the old form grew unbounded and the new one is
+                                    // capped, which is the bug being fixed.
+                                    //
+                                    // `Map::zoom_speed` (default 2.0) can compensate the
+                                    // magnitude, but it is not an exact undo: it scales the
+                                    // combined zoom delta, so pinch and double-click zoom
+                                    // move with it. Left at the default deliberately.
+                                    .zoom_with_ctrl(false)
+                                    .panning(false)
+                                    .drag_pan_buttons(if suppress_pan {
+                                        egui::DragPanButtons::empty()
+                                    } else {
+                                        egui::DragPanButtons::PRIMARY
+                                    })
+                                    .show(&mut child_ui, |ui, _response, projector, memory| {
+                                        let zoom = memory.zoom();
 
-                                let mut render_ctx = pane_render::PaneRenderCtx {
-                                    pane_idx,
-                                    pane: &mut pane,
-                                    overlays: &mut self.overlays,
-                                    user_location,
-                                    user_heading,
-                                    user_fix: user_fix.clone(),
-                                    label_tiles: &mut label_tiles,
-                                    actions: &mut actions,
-                                    pane_rect,
-                                    horizontal_color_scale,
-                                    pointer_available,
-                                    excluded_rects: excluded_rects.to_vec(),
-                                    long_press_pos: pointer.long_press_pos,
-                                    overlay_click_pos,
-                                    preferences: &self.preferences,
-                                };
+                                        let mut render_ctx = pane_render::PaneRenderCtx {
+                                            pane_idx,
+                                            pane: &mut pane,
+                                            overlays: &mut self.overlays,
+                                            user_location,
+                                            user_heading,
+                                            user_fix: user_fix.clone(),
+                                            label_tiles: &mut label_tiles,
+                                            actions: &mut actions,
+                                            pane_rect,
+                                            horizontal_color_scale,
+                                            pointer_available,
+                                            excluded_rects: excluded_rects.to_vec(),
+                                            long_press_pos: pointer.long_press_pos,
+                                            overlay_click_pos,
+                                            preferences: &self.preferences,
+                                        };
 
-                                pane_render::render_pane_map_content(
-                                    ui,
-                                    projector,
-                                    zoom,
-                                    &mut render_ctx,
-                                );
-                            });
+                                        pane_render::render_pane_map_content(
+                                            ui,
+                                            projector,
+                                            zoom,
+                                            &mut render_ctx,
+                                        );
+                                    });
+                            }
+                        }
+                        // The two kinds that exist as a shape and nothing more:
+                        // each paints its empty state and stops. There is no
+                        // sampler behind either one yet, and a pane that draws
+                        // *something* while there is nothing to draw is how a
+                        // fabricated picture ships.
+                        PaneKind::CrossSection => {
+                            self.record_pane_content(pane_idx, PaneKind::CrossSection, pane_rect);
+                            paint_pane_empty_state(
+                                &mut child_ui,
+                                pane_rect,
+                                CROSS_SECTION_EMPTY_STATE,
+                            );
+                        }
+                        PaneKind::Volume => {
+                            self.record_pane_content(pane_idx, PaneKind::Volume, pane_rect);
+                            paint_pane_empty_state(&mut child_ui, pane_rect, VOLUME_EMPTY_STATE);
+                        }
                     }
 
                     // Restore map_memory and pane
@@ -332,6 +410,27 @@ impl super::Gui {
         }
         pointer_available
     }
+}
+
+/// Paint a pane's empty state: one line of centred, muted text and nothing
+/// else.
+///
+/// Centred on the pane's own rect rather than on the `Ui`'s cursor, so the
+/// message sits in the middle of the pane whatever shape the pane is.
+///
+/// Painted straight through `Painter` rather than laid out as a widget: an empty
+/// state is not interactive, and a widget would consume one of the pane's
+/// auto-ids — so every widget the real content adds later would be keyed one
+/// step along from where it will finally sit, and the empty state going away
+/// would re-key all of them.
+fn paint_pane_empty_state(ui: &mut egui::Ui, pane_rect: egui::Rect, text: &str) {
+    ui.painter().text(
+        pane_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(14.0),
+        ui.visuals().weak_text_color(),
+    );
 }
 
 /// Draw a border around a pane rect, highlighted when active.

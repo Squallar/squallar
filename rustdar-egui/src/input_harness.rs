@@ -3,7 +3,7 @@
 //! Drives the real UI through a real [`egui::Context`] with hand-constructed
 //! [`egui::RawInput`] — no window, no winit, no wgpu. Each [`InputHarness::frame`]
 //! runs one full egui pass (`Gui::ui`, all panels, dialogs and map panes), and
-//! `render_map` records the pointer state it resolved for each pane on the way
+//! `render_panes` records the pointer state it resolved for each pane on the way
 //! through. [`FrameOutcome::resolved`], [`FrameOutcome::resolved_inactive`],
 //! [`FrameOutcome::modality`] and [`FrameOutcome::resolved_zoom`] are reads of
 //! *that* — the shipped decision, not a second one taken here.
@@ -57,6 +57,7 @@
 //! cancellation at all.
 
 use crate::Gui;
+use crate::pane::{GeoPoint, PaneKind, SectionLine};
 use crate::ui::DrawnMenuLeaf;
 use crate::ui_input::{MapPointerFrame, TouchGestures};
 use crate::ui_layout::PointerModality;
@@ -79,13 +80,13 @@ pub(crate) struct FrameOutcome {
     pub mouse: MapPointerFrame,
     /// Pointer resolution from the touch pipeline, driven unconditionally.
     pub touch: MapPointerFrame,
-    /// What the shipped `render_map` resolved for the active pane, read back
+    /// What the shipped `render_panes` resolved for the active pane, read back
     /// out of `Gui`. See the module note.
     pub resolved: MapPointerFrame,
     /// The same for a non-active pane. `None` in a one-pane layout, where
     /// there is no inactive pane to observe.
     pub resolved_inactive: Option<MapPointerFrame>,
-    /// The modality `render_map` ran this frame under.
+    /// The modality `render_panes` ran this frame under.
     pub modality: PointerModality,
     /// Map zoom after the frame, on the ungated `touch` path.
     pub zoom: f64,
@@ -450,7 +451,60 @@ impl InputHarness {
         self.gui.pane_count()
     }
 
-    /// The excluded rects `render_map` was actually handed on the last frame.
+    /// What kind each visible pane *is* — the **input** to `render_panes`' kind
+    /// branch, read off the live pane state.
+    ///
+    /// Deliberately not the same thing as [`Self::pane_content_probes`], which
+    /// reports the arm that ran. A test that only asserted on this would agree
+    /// with a branch that ignored it.
+    pub(crate) fn pane_kinds(&self) -> Vec<PaneKind> {
+        self.gui.panes().iter().map(|pane| pane.kind()).collect()
+    }
+
+    /// Which render arm ran for each pane on the last frame — the **output** of
+    /// the kind branch, recorded inside the arms. See
+    /// [`crate::ui::PaneContentProbe`].
+    pub(crate) fn pane_content_probes(&self) -> Vec<crate::ui::PaneContentProbe> {
+        self.gui.pane_content_for_test().to_vec()
+    }
+
+    /// The pointer state `render_panes` resolved for every pane last frame, not
+    /// just the active one that [`FrameOutcome`] exposes.
+    pub(crate) fn pane_pointers(&self) -> Vec<crate::ui_input::PanePointerProbe> {
+        self.gui.pane_pointers_for_test().to_vec()
+    }
+
+    /// Convert pane `idx` to a cross-section pane cut along `a` → `b`, as the
+    /// draw interaction will.
+    ///
+    /// Goes through `PaneState::set_kind` and `SectionLine::new` rather than
+    /// assembling a `PaneContent` here, so the fixture cannot construct a state
+    /// the shipped writers refuse — a line with a non-finite endpoint, in
+    /// particular, which is the one that would make the pane re-render forever.
+    pub(crate) fn make_pane_cross_section(&mut self, idx: usize, a: GeoPoint, b: GeoPoint) {
+        let line = SectionLine::new(a, b)
+            .expect("a fixture line must be finite and have two distinct ends");
+        let pane = self
+            .gui
+            .pane_mut(idx)
+            .unwrap_or_else(|| panic!("no pane {idx}"));
+        pane.set_kind(PaneKind::CrossSection);
+        pane.cross_section_mut()
+            .expect("the pane was just converted to a section")
+            .line = Some(line);
+        self.warm_up();
+    }
+
+    /// Convert pane `idx` to a 3D volume pane, as the menu toggle will.
+    pub(crate) fn make_pane_volume(&mut self, idx: usize) {
+        self.gui
+            .pane_mut(idx)
+            .unwrap_or_else(|| panic!("no pane {idx}"))
+            .set_kind(PaneKind::Volume);
+        self.warm_up();
+    }
+
+    /// The excluded rects `render_panes` was actually handed on the last frame.
     pub(crate) fn map_excluded_rects(&self) -> Vec<egui::Rect> {
         self.gui.map_excluded_rects_for_test().to_vec()
     }
@@ -675,7 +729,7 @@ impl InputHarness {
         self.gui.pane_rects_for_test()
     }
 
-    /// The rect the pane grid is laid out in, as `render_map` sees it.
+    /// The rect the pane grid is laid out in, as `render_panes` sees it.
     pub(crate) fn map_panel_rect(&self) -> egui::Rect {
         self.gui.map_panel_rect_for_test()
     }
@@ -1059,7 +1113,7 @@ impl InputHarness {
         let ctx = self.ctx.clone();
         ctx.begin_pass(raw_input);
 
-        // The real UI, panels, dialogs and map panes included. `render_map`
+        // The real UI, panels, dialogs and map panes included. `render_panes`
         // resolves each pane's pointer state on the way through and records it.
         self.last_actions = self.gui.ui(&ctx);
 
@@ -1079,7 +1133,7 @@ impl InputHarness {
             .copied()
             .unwrap_or_else(|| {
                 panic!(
-                    "render_map recorded no active pane this frame ({} pane probe(s)) \
+                    "render_panes recorded no active pane this frame ({} pane probe(s)) \
                      — the pointer pipeline never ran, so nothing below means anything",
                     probes.len()
                 )
@@ -2483,7 +2537,7 @@ mod tests {
     ///
     ///    This asserts on the *painted strips*, not on the resolved value,
     ///    because the resolved value was never the part at risk: what needed
-    ///    pinning was that `render_map` resolves from the panel, that the
+    ///    pinning was that `render_panes` resolves from the panel, that the
     ///    answer is threaded through `PaneRenderCtx`, and that neither renderer
     ///    quietly recomputes it from the pane it happens to be drawing.
     #[test]
@@ -2941,7 +2995,7 @@ mod tests {
     ///     yet the active one — behaviour the desktop build always had.
     ///
     ///     Split into two real panes, because an inactive pane is not a thing
-    ///     that exists in a one-pane layout: `render_map` would resolve exactly
+    ///     that exists in a one-pane layout: `render_panes` would resolve exactly
     ///     one pane and there would be nothing to compare it against.
     #[test]
     fn a_touch_reaches_only_the_active_pane_but_a_click_reaches_them_all() {
@@ -3131,12 +3185,12 @@ mod tests {
         );
 
         // The chrome reporting a rect is only half of it: the map has to be
-        // handed it. `render_map(&mut root_ui, &[])` leaves every assertion
+        // handed it. `render_panes(&mut root_ui, &[])` leaves every assertion
         // above true and the button transparent to clicks.
         assert_eq!(
             h.map_excluded_rects(),
             rects,
-            "the chrome's rects never reached render_map, so nothing downstream \
+            "the chrome's rects never reached render_panes, so nothing downstream \
              can exclude the button from a map click"
         );
 
@@ -4454,7 +4508,7 @@ mod tests {
     /// A harness showing `site`, with the radar-site overlay on, plus the
     /// screen position that site's icon is drawn at.
     ///
-    /// `render_map` centres a pane on its own scan's site, so the icon lands on
+    /// `render_panes` centres a pane on its own scan's site, so the icon lands on
     /// the pane centre. That comes from the layout, not from the hit-testing
     /// under test, so shrinking or inflating the icon cannot move it.
     fn harness_showing_site(site: &str) -> (InputHarness, egui::Pos2) {
@@ -5173,6 +5227,288 @@ mod tests {
                 .iter()
                 .any(|t| t == "HIDDEN PANE READOUT"),
             "a hidden pane's stale readout surfaced in the status bar"
+        );
+    }
+
+    // ── Pane kinds ───────────────────────────────────────────────────────
+
+    /// Two points either side of a storm near KTLX, as the ends of a drawn
+    /// line. Any finite pair with two distinct ends would do; these are
+    /// plausible so a failure message reads like a section someone asked for.
+    fn section_ends() -> (GeoPoint, GeoPoint) {
+        (
+            GeoPoint {
+                lat: 35.0,
+                lon: -97.8,
+            },
+            GeoPoint {
+                lat: 35.6,
+                lon: -96.9,
+            },
+        )
+    }
+
+    /// 39. **Every pane reports a pointer frame, whatever kind it is.**
+    ///
+    ///     The pointer probe is pushed in `render_panes`' shared preamble,
+    ///     above the kind branch, and it has to stay there. `InputHarness::frame`
+    ///     reads the *active* pane's probe out of that vector and panics when it
+    ///     finds none, so a kind whose arm skipped the push would take down the
+    ///     whole pointer suite — several thousand lines of it — with a message
+    ///     about the pointer pipeline never running, pointing at nothing that
+    ///     changed.
+    #[test]
+    fn every_pane_reports_a_pointer_frame_whatever_its_kind() {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.set_pane_count(3);
+        let (a, b) = section_ends();
+        h.make_pane_cross_section(1, a, b);
+        h.make_pane_volume(2);
+        assert_eq!(
+            h.pane_kinds(),
+            vec![PaneKind::Map, PaneKind::CrossSection, PaneKind::Volume],
+            "precondition: one pane of each kind, or this proves nothing"
+        );
+
+        assert_eq!(
+            h.pane_pointers()
+                .iter()
+                .map(|probe| probe.pane_idx)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "a pane resolved no pointer state for the frame"
+        );
+
+        // The active half, and it needs a *non-map* active pane: the active
+        // probe is the one `frame()` demands, so a section pane that skipped
+        // the push would only be caught while it is the one being driven.
+        let rects = h.pane_rects();
+        h.mouse_click(rects[2].center());
+        h.frames_for(2, FRAME_DT);
+        assert_eq!(
+            h.active_pane_index(),
+            2,
+            "precondition: clicking the volume pane must make it active"
+        );
+        assert_eq!(
+            h.pane_pointers()
+                .iter()
+                .filter(|probe| probe.is_active)
+                .map(|probe| probe.pane_idx)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "exactly one pane must own the pointer, and it is the active one"
+        );
+    }
+
+    /// 40. **Converting a pane keeps what it was looking at.**
+    ///
+    ///     Site, scan, product, elevation, live-or-parked and viewport are flat
+    ///     fields on `PaneState` precisely so that converting a pane cannot
+    ///     touch them. A user who panned to a storm and picked a tilt has said
+    ///     something; asking for a section of it is not a reason to forget it.
+    ///
+    ///     Run on a single pane deliberately: both `propagate_layer_sync` and
+    ///     `sync_viewports` return early below two panes, so every field below
+    ///     is observed changing (or not) for exactly one reason.
+    #[test]
+    fn a_converted_pane_keeps_its_site_and_viewport() {
+        let mut h = InputHarness::new();
+        h.load_scan("KAMA");
+        {
+            let pane = h
+                .gui_mut()
+                .pane_mut(0)
+                .expect("a fresh harness has one pane");
+            pane.selected_product = rustdar_radar::types::RadarProduct::Velocity;
+            pane.selected_elevation = 1.5;
+            pane.viewing_live = false;
+            let _ = pane.map_memory.set_zoom(9.25);
+            pane.map_memory.center_at(walkers::lat_lon(35.0, -97.8));
+        }
+        h.warm_up();
+
+        /// Everything about a pane that is *not* its kind.
+        fn looking_at(
+            h: &mut InputHarness,
+        ) -> (
+            String,
+            Option<&'static str>,
+            String,
+            f32,
+            bool,
+            f64,
+            Option<walkers::Position>,
+        ) {
+            let pane = h.gui_mut().pane(0).expect("pane 0");
+            (
+                pane.site.clone(),
+                pane.scan_info.as_ref().map(|info| info.site.name),
+                pane.selected_product.name().to_owned(),
+                pane.selected_elevation,
+                pane.viewing_live,
+                pane.map_memory.zoom(),
+                pane.map_memory.detached(),
+            )
+        }
+
+        let before = looking_at(&mut h);
+        assert_eq!(
+            h.pane_kinds(),
+            vec![PaneKind::Map],
+            "precondition: it starts as a map"
+        );
+
+        let (a, b) = section_ends();
+        h.make_pane_cross_section(0, a, b);
+
+        assert_eq!(
+            h.pane_kinds(),
+            vec![PaneKind::CrossSection],
+            "precondition: the conversion must actually have happened"
+        );
+        assert_eq!(
+            looking_at(&mut h),
+            before,
+            "converting the pane changed what it is looking at"
+        );
+
+        // ...and the line it was aimed with is still the line, several frames
+        // later. Geographic ends, so nothing in the UI pass can move them.
+        assert_eq!(
+            h.gui_mut()
+                .pane(0)
+                .expect("pane 0")
+                .cross_section()
+                .and_then(|section| section.line)
+                .map(|line| (line.a(), line.b())),
+            Some((a, b)),
+        );
+    }
+
+    /// 41. **A non-map pane paints its empty state, in its own rect.**
+    ///
+    ///     What each arm *recorded* rather than what the branch was handed:
+    ///     `panes[i].kind()` is the branch's input, so a test reading it back
+    ///     agrees with an arm that ignored it, and with an arm that read the
+    ///     kind off the `mem::take`n slot (where every pane is a map). Each arm
+    ///     writes its own kind as a literal, and this compares that against the
+    ///     copy that actually reached the glass and the rect it reached it in.
+    #[test]
+    fn a_non_map_pane_paints_its_empty_state() {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.set_pane_count(3);
+        let (a, b) = section_ends();
+        h.make_pane_cross_section(1, a, b);
+        h.make_pane_volume(2);
+
+        let rects = h.pane_rects();
+        assert_eq!(
+            h.pane_content_probes()
+                .iter()
+                .map(|probe| (probe.pane_idx, probe.kind, probe.rect))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, PaneKind::Map, rects[0]),
+                (1, PaneKind::CrossSection, rects[1]),
+                (2, PaneKind::Volume, rects[2]),
+            ],
+            "the arm that ran for a pane is not the arm for that pane's kind"
+        );
+
+        for (idx, copy) in [
+            (1usize, crate::ui::CROSS_SECTION_EMPTY_STATE),
+            (2, crate::ui::VOLUME_EMPTY_STATE),
+        ] {
+            assert!(
+                h.text_painted_in(rects[idx], copy),
+                "pane {idx} did not paint {copy:?}; it painted {:?}",
+                h.painted_text_strings()
+            );
+            for other in (0..3).filter(|other| *other != idx) {
+                assert!(
+                    !h.text_painted_in(rects[other], copy),
+                    "pane {other} painted pane {idx}'s empty state"
+                );
+            }
+        }
+    }
+
+    /// 42. **Converting a pane must not move any widget's egui `Id`.**
+    ///
+    ///     The `"pane_map"` id salt is a key, not a description: every widget
+    ///     inside a pane derives its `Id` from it, so egui's memory of what the
+    ///     pane remembers hangs off it. Re-keying it — by renaming it to
+    ///     something kind-neutral, or by folding the kind into it — would turn
+    ///     "the user made pane 2 a section" into "egui forgot everything pane 2
+    ///     remembered".
+    ///
+    ///     [`crossing_a_breakpoint_does_not_move_any_widget_id`] will not catch
+    ///     this: it compares the layers panel's own probed ids across a resize,
+    ///     and a pane's ids are not in that list. This reads egui's per-pass
+    ///     widget bookkeeping instead, so it fires for the kind-specific work
+    ///     later work packages add inside each arm as much as for a renamed
+    ///     salt.
+    ///
+    ///     The pane converted is the **middle** of three, which is what gives
+    ///     the assertion something to bite on today: `Ui::new_child` folds the
+    ///     parent's auto-id counter into every child's unique id — an `id_salt`
+    ///     moves only the *stable* id, as `ui_chrome.rs`'s note on the 600pt
+    ///     breakpoint records — so an arm that stopped building the shared child
+    ///     `Ui`, or built an extra one, would re-key every pane *after* it while
+    ///     leaving their rects exactly where they were. That is the shape this
+    ///     is a net for.
+    #[test]
+    fn converting_a_pane_moves_no_widget_id() {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.set_pane_count(3);
+        h.load_scan("KTLX");
+
+        // Real stored state behind a real widget id, so "nothing was lost" is a
+        // claim about something rather than about an empty set.
+        let probes = h.widget_id_probes();
+        let scroll_id = probes
+            .iter()
+            .find(|(name, _)| *name == "layers_scroll")
+            .expect("precondition: the layers panel must report a scroll id")
+            .1;
+        h.scroll_at(egui::pos2(80.0, 400.0), egui::vec2(0.0, -120.0));
+        h.frames_for(3, FRAME_DT);
+        let scrolled = h.scroll_offset(scroll_id);
+        assert!(
+            scrolled.is_some_and(|offset| offset.y > 0.0),
+            "precondition: the layers panel must have scrolled, got {scrolled:?}"
+        );
+
+        h.clear_id_changes();
+        let (a, b) = section_ends();
+        h.make_pane_cross_section(1, a, b);
+
+        assert_eq!(
+            h.pane_kinds(),
+            vec![PaneKind::Map, PaneKind::CrossSection, PaneKind::Map],
+            "precondition: the middle pane converted and the last one did not"
+        );
+        assert!(
+            h.text_painted_in(h.pane_rects()[1], crate::ui::CROSS_SECTION_EMPTY_STATE),
+            "precondition: pane 1 must really be drawing something else now"
+        );
+
+        assert_eq!(
+            h.id_changes(),
+            &[] as &[egui::Rect],
+            "egui saw a widget rect come back under a different id when a pane \
+             was converted: everything it remembers under those ids is discarded"
+        );
+        assert_eq!(
+            probes,
+            h.widget_id_probes(),
+            "a widget id that keys stored state moved when a pane was converted"
+        );
+        assert_eq!(
+            h.scroll_offset(scroll_id),
+            scrolled,
+            "the scroll position did not survive converting another pane"
         );
     }
 }

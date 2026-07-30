@@ -30,6 +30,11 @@ mod ui_menu;
 pub(crate) use ui_menu::DrawnMenuLeaf;
 #[path = "ui_map.rs"]
 mod map;
+/// The copy the two non-map pane arms paint, for the input harness — so a test
+/// can require the text to have been painted inside a given pane's rect without
+/// keeping its own copy of the sentence. Same arrangement as [`DrawnMenuLeaf`].
+#[cfg(test)]
+pub(crate) use map::{CROSS_SECTION_EMPTY_STATE, VOLUME_EMPTY_STATE};
 #[path = "ui_settings.rs"]
 mod settings;
 
@@ -42,6 +47,27 @@ use crate::ui_input::InteractionState;
 pub(crate) struct PaneOptionProbe {
     pub count: usize,
     pub selected: bool,
+    pub rect: egui::Rect,
+}
+
+/// Which render arm ran for one pane, recorded **inside the arm itself**.
+///
+/// The point is the asymmetry. `panes[i].kind()` is the *input* to
+/// `render_panes`' single kind branch, so a test reading it back proves nothing
+/// about the branch: a mis-wired arm, or an arm reading the kind off the
+/// `mem::take`n slot instead of the taken value, agrees with it perfectly. Each
+/// arm writes its own kind as a literal, so what this reports is the arm that
+/// actually drew — the one thing a wrong branch cannot fake.
+///
+/// The rect comes along because "which arm ran" and "where it drew" are the two
+/// halves of the same claim: an arm that painted the right thing into another
+/// pane's rect is still wrong.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PaneContentProbe {
+    pub pane_idx: usize,
+    /// The kind the arm that ran is *for*, written by that arm.
+    pub kind: crate::pane::PaneKind,
     pub rect: egui::Rect,
 }
 
@@ -203,7 +229,7 @@ pub struct Gui {
     /// a resize near the boundary cannot make the bars hop).
     color_scale_orientation: ColorScaleOrientation,
     /// The map panel rect the last frame laid its pane grid out in. Only read
-    /// by tests, which need the same rects `render_map` used.
+    /// by tests, which need the same rects `render_panes` used.
     #[cfg(test)]
     last_map_panel_rect: egui::Rect,
     /// egui `Id`s the last frame's layers panel actually resolved, in render
@@ -222,18 +248,24 @@ pub struct Gui {
     /// state the *renderer* saw rather than the model a test rebuilt.
     #[cfg(test)]
     last_menu_leaves: Vec<ui_menu::DrawnMenuLeaf>,
-    /// The pointer state `render_map` resolved for each pane on the last frame,
+    /// The pointer state `render_panes` resolved for each pane on the last frame,
     /// in pane order. Only read by tests — and the *only* honest way for one to
     /// observe the modality gate, since resolving it a second time alongside
     /// `Gui::ui` would assert on a replica.
     #[cfg(test)]
     last_pane_pointers: Vec<crate::ui_input::PanePointerProbe>,
+    /// Which render arm ran for each pane on the last frame, in the order the
+    /// pane loop reached them. Only read by tests — see [`PaneContentProbe`] for
+    /// why this is written inside the arms rather than derived from
+    /// `panes[i].kind()`.
+    #[cfg(test)]
+    last_pane_content: Vec<PaneContentProbe>,
     /// The pane-count buttons the picker actually drew last frame. Only read by
     /// tests, which check the picker narrows on a phone while the config clamp
     /// does not, and that clicking one takes effect.
     #[cfg(test)]
     last_pane_options: Vec<PaneOptionProbe>,
-    /// The excluded rects `render_map` was actually handed. Only read by tests,
+    /// The excluded rects `render_panes` was actually handed. Only read by tests,
     /// which check the chrome's rects reach the map's click filter rather than
     /// stopping at the call site.
     #[cfg(test)]
@@ -592,6 +624,8 @@ impl Gui {
             #[cfg(test)]
             last_pane_pointers: Vec::new(),
             #[cfg(test)]
+            last_pane_content: Vec::new(),
+            #[cfg(test)]
             last_pane_options: Vec::new(),
             #[cfg(test)]
             last_map_excluded_rects: Vec::new(),
@@ -633,6 +667,10 @@ impl Gui {
             self.widget_id_probes.clear();
             self.last_menu_leaves.clear();
             self.last_pane_pointers.clear();
+            // Cleared beside the pointer probes, and for the same reason: both
+            // are per-pane records of one frame's pane loop, so a leftover entry
+            // would report an arm that did not run this frame.
+            self.last_pane_content.clear();
             // Cleared like the rest: the picker only draws when the layers
             // panel is on screen, so a stale value would report buttons that
             // are not there — a compact layout with the drawer shut offers
@@ -672,7 +710,7 @@ impl Gui {
             actions.push(action);
         }
 
-        actions.extend(self.render_map(&mut root_ui, &chrome.excluded_rects));
+        actions.extend(self.render_panes(&mut root_ui, &chrome.excluded_rects));
 
         // Floating windows last, so they layer above the chrome and the map.
         self.render_overlay_popup(ctx);
@@ -1799,10 +1837,37 @@ impl Gui {
         &self.last_menu_leaves
     }
 
-    /// The pointer state `render_map` resolved for each pane last frame.
+    /// The pointer state `render_panes` resolved for each pane last frame.
     #[cfg(test)]
     pub(crate) fn pane_pointers_for_test(&self) -> &[crate::ui_input::PanePointerProbe] {
         &self.last_pane_pointers
+    }
+
+    /// Which render arm ran for each pane last frame. See [`PaneContentProbe`].
+    #[cfg(test)]
+    pub(crate) fn pane_content_for_test(&self) -> &[PaneContentProbe] {
+        &self.last_pane_content
+    }
+
+    /// Record that the arm for `kind` drew pane `pane_idx` into `rect`.
+    ///
+    /// Called from inside each arm of `render_panes`' kind branch, with the
+    /// kind written out as a literal there rather than passed down from the
+    /// branch's subject — that literal is the whole reason the probe can catch a
+    /// mis-wired arm. A no-op outside tests, like `ControlProbe::record_dropdown`.
+    #[inline]
+    pub(super) fn record_pane_content(
+        &mut self,
+        _pane_idx: usize,
+        _kind: crate::pane::PaneKind,
+        _rect: egui::Rect,
+    ) {
+        #[cfg(test)]
+        self.last_pane_content.push(PaneContentProbe {
+            pane_idx: _pane_idx,
+            kind: _kind,
+            rect: _rect,
+        });
     }
 
     /// The pane-count buttons the picker drew on the last frame.
@@ -1811,7 +1876,7 @@ impl Gui {
         &self.last_pane_options
     }
 
-    /// The excluded rects `render_map` was handed on the last frame.
+    /// The excluded rects `render_panes` was handed on the last frame.
     #[cfg(test)]
     pub(crate) fn map_excluded_rects_for_test(&self) -> &[egui::Rect] {
         &self.last_map_excluded_rects
@@ -1909,7 +1974,7 @@ impl Gui {
     }
 
     /// The pane rects the layout produces inside the map panel, as
-    /// `render_map` computes them.
+    /// `render_panes` computes them.
     #[cfg(test)]
     pub(crate) fn pane_rects_for_test(&self) -> Vec<egui::Rect> {
         let panel = self.last_map_panel_rect;
@@ -2282,7 +2347,7 @@ mod pane_slice_tests {
         gui.viewport_sync = true;
         gui.pane_layout = PaneLayout::for_count(4);
 
-        // Snapshots sized to the layout's claim, exactly as `render_map` would
+        // Snapshots sized to the layout's claim, exactly as `render_panes` would
         // have taken them had it trusted the raw count too. All-zero zooms
         // make every pane look interacted, so the source scan runs as deep as
         // its bound allows.
