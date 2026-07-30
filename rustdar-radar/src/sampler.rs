@@ -10,14 +10,18 @@
 //!
 //! # What a query costs, and why [`VolumeSampler::column`] exists
 //!
-//! A point query is four gate reads (bilinear in azimuth × slant range) on
-//! each of two bracketing tilts, then one vertical interpolation — eight
-//! reads. A cross-section evaluating that per output pixel would re-derive the
-//! same eight-read tilt bracket for every row of a column that never moves in
-//! azimuth or ground range. [`VolumeSampler::column`] computes the whole tilt
-//! ladder over one ground point *once* — ~16 bilinears — and then answers any
-//! number of heights with a two-point lerp each. Both consumers on the way
-//! (the cross-section rasterizer and the voxel builder) are column-shaped, so
+//! One rung costs four gate reads — a bilinear in azimuth × slant range — and
+//! a whole column is one of those per rung, `4·N`, ~64 on a 16-rung VCP 212
+//! ladder. Every height after the first is then free: it is a two-point lerp
+//! between rungs already sampled, and reads no gates at all.
+//!
+//! [`VolumeSampler::sample`] answers one point by building the column and
+//! asking it, so a `W × H` section evaluated per pixel is `W·H·4·N` gate reads
+//! against `W·4·N` for one column per output column — an **`H`-fold** saving,
+//! 1024× on a 1024-row section. (The plan's "~8×" compares against a
+//! per-pixel path that computed only the bracketing pair; this one does not,
+//! deliberately — see [`VolumeSampler::sample`].) Both consumers on the way,
+//! the cross-section rasterizer and the voxel builder, are column-shaped, so
 //! the primitive is here rather than duplicated in each.
 //!
 //! # The tilt ladder
@@ -87,7 +91,7 @@
 //!
 //! # Two more deliberate omissions
 //!
-//! [`crate::hhc::merge_split_cut_doppler`] is **not** used to fill a
+//! [`crate::hca::merge_split_cut_doppler`] is **not** used to fill a
 //! surveillance rung's missing velocity. It clones every radial it merges — a
 //! second full copy of the volume — which is affordable for the HHC's one
 //! 230 km composite and is not affordable per rung. A Doppler moment gets its
@@ -809,10 +813,18 @@ impl<'a> VolumeSampler<'a> {
 
     /// What the volume holds at one point, in radar-relative coordinates.
     ///
-    /// Equivalent to `self.column(az, ground).at_height_km(h)` and pinned as
-    /// such; prefer [`column`](Self::column) whenever more than one height of
-    /// the same column is wanted, which is about eight times cheaper per pixel
-    /// for a cross-section.
+    /// For a hover readout and anything else that asks once. It builds the
+    /// whole column and asks it, so it costs the whole ladder — `4·N` gate
+    /// reads — rather than the eight a bracketing pair would need. That is a
+    /// deliberate trade of a cost nobody pays (a hover query happens once a
+    /// frame) for **one** interpolation path: sampling only the bracketing
+    /// pair means finding the bracket a second way, and two ways of choosing a
+    /// bracket is precisely the split-key hazard this module's ladder rule
+    /// exists to close. `the_point_query_is_exactly_the_column_query` pins the
+    /// equivalence, and would keep pinning it if this were ever specialised.
+    ///
+    /// Anything asking for more than one height of the same column wants
+    /// [`column`](Self::column), which is `H` times cheaper over `H` heights.
     pub fn sample(&self, azimuth_deg: f64, ground_range_km: f64, height_km: f64) -> Sample {
         self.column(azimuth_deg, ground_range_km)
             .at_height_km(height_km)
