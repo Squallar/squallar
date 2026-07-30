@@ -133,7 +133,12 @@ pub fn simple_client(_timeout: std::time::Duration) -> reqwest::ClientBuilder {
 /// `User-Agent` either way — so picking wrong breaks nothing *today*. That is a
 /// property of one `#[cfg]` arm, not of the CORS problem: restore a `User-Agent`
 /// to the wasm client and METAR and SPC go dark in the browser with no error on
-/// native. [`sends_user_agent`] pins it.
+/// native.
+///
+/// [`sends_user_agent`] pins the routing here, but only over the arm the test
+/// runner compiled — always the native one. The wasm arms are held to the
+/// no-`User-Agent` property by `the_browser_clients_attach_no_user_agent`,
+/// which reads them as source because nothing in this workspace executes them.
 pub fn client_for(sends_user_agent: bool, timeout: std::time::Duration) -> reqwest::ClientBuilder {
     if sends_user_agent {
         client(USER_AGENT, timeout)
@@ -327,6 +332,108 @@ mod tests {
             !super::sends_user_agent(&forbidden),
             "client_for(false) must give the preflight-safe client",
         );
+    }
+
+    /// The source of one `#[cfg]`-gated function in this file, body included.
+    ///
+    /// Scraped rather than called because the wasm32 arms are not compiled by
+    /// any build this workspace tests: `cargo test` runs on the host, and the
+    /// wasm rows of the gauntlet are `cargo check`, which compiles the arms but
+    /// runs nothing. Adding a `.user_agent(…)` to either browser constructor
+    /// therefore compiles, checks and tests clean while silently killing METAR,
+    /// SPC and every basemap tile in Firefox — see
+    /// [`the_browser_clients_attach_no_user_agent`].
+    ///
+    /// Byte-scraping is the weaker tool and it is deliberate here: pinning the
+    /// property properly needs a `wasm-bindgen-test` runner, which would make
+    /// `wasm-pack` a prerequisite of `cargo test` for the whole workspace. That
+    /// is a decision to take on purpose, not a side effect of this test.
+    fn cfg_gated_source(cfg: &str, signature: &str) -> String {
+        let source = include_str!("tls.rs");
+        let needle = format!("{cfg}\n{signature}");
+        let at = source
+            .find(&needle)
+            .unwrap_or_else(|| panic!("tls.rs no longer contains\n{needle}"));
+        let open = at + source[at..].find('{').expect("no function body");
+        let mut depth = 0usize;
+        for (offset, c) in source[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return source[open..=open + offset].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces after {signature}");
+    }
+
+    /// **Neither browser client may set a `User-Agent`.**
+    ///
+    /// `User-Agent` is a forbidden header name in a browser. Chromium strips it
+    /// silently, so the request stays simple and works; Firefox forwards it,
+    /// which makes the request non-simple and forces a preflight `OPTIONS` that
+    /// `mesonet.agron.iastate.edu` answers with `405`, `www.spc.noaa.gov` with
+    /// `403`, and a plain tile CDN with no CORS headers at all. Every METAR,
+    /// every SPC outlook and every basemap tile then fails in one browser and
+    /// not the other, with nothing wrong on native.
+    ///
+    /// [`the_simple_client_sends_no_user_agent`] above looks like it covers
+    /// this and does not: it builds a `reqwest::Client` and so tests the arm the
+    /// test runner was compiled for, which is always the native one. The wasm
+    /// arms have never been executed by anything.
+    ///
+    /// The native arm is checked too, and not as a courtesy: it is the control
+    /// that keeps this from passing vacuously. A scrape that matched the wrong
+    /// text, or nothing, would report "no User-Agent here" about all four.
+    #[test]
+    fn the_browser_clients_attach_no_user_agent() {
+        const WASM: &str = r#"#[cfg(target_arch = "wasm32")]"#;
+        const NATIVE: &str = r#"#[cfg(not(target_arch = "wasm32"))]"#;
+
+        for (cfg, signature, may_set_ua) in [
+            (
+                WASM,
+                "pub fn client(_user_agent: &str, _timeout: std::time::Duration) \
+                 -> reqwest::ClientBuilder {",
+                false,
+            ),
+            (
+                WASM,
+                "pub fn simple_client(_timeout: std::time::Duration) -> reqwest::ClientBuilder {",
+                false,
+            ),
+            (
+                NATIVE,
+                "pub fn client(user_agent: &str, timeout: std::time::Duration) \
+                 -> reqwest::ClientBuilder {",
+                true,
+            ),
+            (
+                NATIVE,
+                "pub fn simple_client(timeout: std::time::Duration) -> reqwest::ClientBuilder {",
+                false,
+            ),
+        ] {
+            let body = cfg_gated_source(cfg, signature);
+            // The scrape found a real constructor and not, say, a doc comment.
+            assert!(
+                body.contains("reqwest::Client::builder()"),
+                "{signature} no longer builds a client:\n{body}"
+            );
+            assert_eq!(
+                body.contains(".user_agent("),
+                may_set_ua,
+                "{cfg}\n{signature}\nsets a User-Agent iff {}, and it must be \
+                 {may_set_ua}. In a browser that header is forbidden — Chromium \
+                 drops it, Firefox forwards it and turns every request into a \
+                 preflight the origin refuses.",
+                !may_set_ua,
+            );
+        }
     }
 
     /// End-to-end proof that the platform verifier actually verifies.
