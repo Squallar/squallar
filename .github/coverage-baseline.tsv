@@ -94,7 +94,7 @@ rustdar-platform/src/platform.rs	98	0
 rustdar-platform/src/run.rs	31	0
 rustdar-radar/src/archive.rs	669	484
 rustdar-radar/src/beam.rs	419	404
-rustdar-radar/src/chunks.rs	1982	1502
+rustdar-radar/src/chunks.rs	2016	1536
 rustdar-radar/src/dpprep.rs	1019	950
 rustdar-radar/src/eet.rs	440	346
 rustdar-radar/src/hail.rs	787	671
@@ -105,8 +105,8 @@ rustdar-radar/src/l3_values.rs	282	281
 rustdar-radar/src/level3.rs	773	453
 rustdar-radar/src/nrot.rs	1356	1149
 rustdar-radar/src/palette.rs	177	144
-rustdar-radar/src/render.rs	1183	994
-rustdar-radar/src/render_input.rs	735	722
+rustdar-radar/src/render.rs	1665	1183
+rustdar-radar/src/render_input.rs	780	765
 rustdar-radar/src/sampler.rs	1540	1504
 rustdar-radar/src/scan.rs	244	36
 rustdar-radar/src/sites.rs	106	106
@@ -116,7 +116,7 @@ rustdar-radar/src/srm.rs	1344	821
 rustdar-radar/src/srv.rs	857	555
 rustdar-radar/src/tls.rs	189	169
 rustdar-radar/src/twin.rs	471	315
-rustdar-radar/src/types.rs	422	354
+rustdar-radar/src/types.rs	483	415
 rustdar-radar/src/vil.rs	1450	937
 rustdar-radar/src/vild.rs	463	450
 rustdar-radar/src/volumetric.rs	512	506
