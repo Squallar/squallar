@@ -3435,6 +3435,52 @@ mod pane_slice_tests {
         .expect("a fixture line must be finite and have two distinct ends")
     }
 
+    /// A cut of the right shape and no content, so a fixture can hold a picture
+    /// for a retarget to throw away.
+    ///
+    /// Full size — `from_parts` refuses anything else, because a mis-shaped
+    /// section reaches `ColorImage::from_rgba_unmultiplied`'s `assert_eq!` on
+    /// the main thread. `NoCoverage` everywhere, which is what an empty volume
+    /// really renders as.
+    fn blank_section() -> rustdar_radar::xsect::CrossSection {
+        use rustdar_radar::sampler::SampleStatus;
+        use rustdar_radar::xsect::{SECTION_HEIGHT, SECTION_WIDTH, SectionAxes};
+        let pixels = SECTION_WIDTH * SECTION_HEIGHT;
+        rustdar_radar::xsect::CrossSection::from_parts(
+            vec![0u8; pixels * 4],
+            vec![f32::NAN; pixels],
+            vec![SampleStatus::NoCoverage.wire_code(); pixels],
+            SectionAxes {
+                length_km: 100.0,
+                base_km_msl: 0.4,
+                top_km_msl: 20.4,
+                near_ground_range_km: 10.0,
+                far_ground_range_km: 110.0,
+                coverage_ground_range_km: 0.0,
+                cone_of_silence_km: 0.0,
+                tilt_count: 1,
+                widest_tilt_gap_deg: 0.0,
+            },
+        )
+        .expect("a full-size, all-NoCoverage section is well formed")
+    }
+
+    /// A second line, distinguishable from [`drawn_line`], for a section that
+    /// belongs to another map and must be left alone.
+    fn other_line() -> crate::pane::SectionLine {
+        crate::pane::SectionLine::new(
+            crate::pane::GeoPoint {
+                lat: 40.0,
+                lon: -100.0,
+            },
+            crate::pane::GeoPoint {
+                lat: 41.0,
+                lon: -99.0,
+            },
+        )
+        .expect("a fixture line must be finite and have two distinct ends")
+    }
+
     fn wide(count: usize) -> Gui {
         let mut gui = Gui::new();
         gui.layout.width = crate::ui_layout::WidthClass::Expanded;
@@ -3461,9 +3507,14 @@ mod pane_slice_tests {
         );
     }
 
-    /// Step 2: with no section fed by this map, the layout grows and the new
-    /// pane is the section — beside the map it was cut from, which is the
-    /// picture the whole feature is for.
+    /// Step 2: with no section fed by *this* map, the layout grows — even when
+    /// another map's section is sitting right there.
+    ///
+    /// The pane count is the load-bearing assertion, and the second half of the
+    /// fixture is what makes it one: a section pane exists, but it belongs to
+    /// pane 1, and stealing it would silently re-aim a picture the user is
+    /// still using. Only once the layout cannot grow (the test below) is that
+    /// the right answer.
     #[test]
     fn a_line_with_nowhere_to_go_grows_the_layout_rather_than_taking_a_map() {
         let mut gui = wide(1);
@@ -3490,6 +3541,32 @@ mod pane_slice_tests {
         assert_eq!(
             gui.active_pane, 1,
             "the pane the user just asked for is not the one they are looking at"
+        );
+
+        // The same, with another map's section already on screen and room still
+        // to grow. Growing must still win: re-aiming pane 2 would throw away a
+        // picture pane 1 is still using, silently.
+        let mut gui = wide(3);
+        gui.panes[2].set_kind(crate::pane::PaneKind::CrossSection);
+        gui.panes[2].cross_section_mut().unwrap().source_pane = Some(1);
+        gui.panes[2].cross_section_mut().unwrap().line = Some(other_line());
+        gui.pending_section_line = Some((0, drawn_line()));
+        gui.apply_pending_section_line();
+
+        assert_eq!(
+            gui.pane_count(),
+            4,
+            "the layout had room and did not use it: another map's section was \
+             taken instead"
+        );
+        assert_eq!(
+            gui.pane(2).unwrap().cross_section().unwrap().line,
+            Some(other_line()),
+            "pane 1's section was re-aimed at a line drawn on pane 0"
+        );
+        assert_eq!(
+            gui.pane(3).unwrap().cross_section().unwrap().line,
+            Some(drawn_line())
         );
     }
 
@@ -3608,6 +3685,24 @@ mod pane_slice_tests {
             let section = gui.panes[1].cross_section_mut().unwrap();
             section.source_pane = Some(0);
             section.unavailable = Some(crate::pane::SectionUnavailable::RenderFailed);
+            // A picture and a key for the *previous* line, which is the state a
+            // retarget has to clear. Without them in the fixture both fields are
+            // `None` before and after, and the assertions below hold for a build
+            // that clears neither — the exact shape of test that looks like it
+            // is watching something and is not. (Found by mutation: dropping
+            // both clears survived until this fixture had something to drop.)
+            section.rendered_for = Some(crate::pane::SectionTarget {
+                volume: crate::pane::VolumeStamp {
+                    site: "KINX".to_owned(),
+                    collected: chrono::NaiveDate::from_ymd_opt(2026, 7, 30)
+                        .unwrap()
+                        .and_hms_opt(18, 30, 0)
+                        .unwrap(),
+                },
+                product: RadarProduct::Reflectivity,
+                line: other_line(),
+            });
+            section.section = Some(std::sync::Arc::new(blank_section()));
         }
 
         gui.pending_section_line = Some((0, drawn_line()));
