@@ -860,6 +860,40 @@ mod tests {
         assert_eq!(IMAGE_SIZE, NATIVE_IMAGE_SIZE);
     }
 
+    /// Each `cfg` arm of the cascade selects the constant named for it.
+    ///
+    /// The assertion at the end of the test above is `cfg`-gated and so covers
+    /// only the arm this build compiles. Pointing the wasm32 arm at
+    /// `NATIVE_IMAGE_SIZE` leaves the whole workspace passing and the wasm
+    /// `cargo check` exiting 0 — measured, not assumed; it was one of two
+    /// mutations that survived the probe run that landed these tests. Nothing
+    /// on a host evaluates that line, so the line is read rather than run.
+    #[test]
+    fn each_cfg_arm_selects_the_image_size_named_for_it() {
+        let source = include_str!("types.rs");
+        // The shipped half only: the strings below appear verbatim in this
+        // test's own source, so scanning the whole file would find them here.
+        let (code, _) = source
+            .split_once("#[cfg(test)]")
+            .expect("types.rs no longer has a test module");
+
+        for (cfg, arm) in [
+            (r#"#[cfg(target_arch = "wasm32")]"#, "WASM_IMAGE_SIZE"),
+            (
+                r#"#[cfg(not(target_arch = "wasm32"))]"#,
+                "NATIVE_IMAGE_SIZE",
+            ),
+        ] {
+            let expected = format!("{cfg}\npub const IMAGE_SIZE: usize = {arm};");
+            assert!(
+                code.contains(&expected),
+                "types.rs does not contain\n{expected}\nso the {cfg} build does \
+                 not get the image size named for it — and no host build can \
+                 evaluate that line."
+            );
+        }
+    }
+
     /// The derived geometry moves with whichever arm was selected.
     ///
     /// `PIXELS_PER_KM` is the whole rasterizer's scale factor — `render::project`

@@ -684,6 +684,100 @@ mod tests {
         );
     }
 
+    /// The `(cfg attribute, right-hand side)` of every `#[cfg]`-gated
+    /// definition of `name`, in source order.
+    fn cascade_arms(code: &str, name: &str) -> Vec<(String, String)> {
+        let definition = format!("pub const {name}: ");
+        let lines: Vec<&str> = code.lines().collect();
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.starts_with(&definition))
+            .map(|(i, line)| {
+                let (_, rhs) = line
+                    .split_once(" = ")
+                    .unwrap_or_else(|| panic!("{name} has no right-hand side: {line}"));
+                let cfg = lines[..i]
+                    .iter()
+                    .rev()
+                    .map(|l| l.trim())
+                    .find(|l| !l.is_empty() && !l.starts_with("///"))
+                    .unwrap_or_else(|| panic!("nothing at all precedes {name}"));
+                (
+                    cfg.to_string(),
+                    rhs.trim().trim_end_matches(';').to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// Every `cfg` arm selects the constant named for *its own* device class.
+    ///
+    /// `every_cascade_in_this_file_selected_the_same_arm` covers this for the
+    /// arm the running target compiles and can cover no other. That is not a
+    /// theoretical gap: pointing the wasm32 arm of `MAX_LOOP_FRAMES` at
+    /// `DESKTOP_MAX_LOOP_FRAMES` leaves every test in this workspace passing
+    /// and the wasm `cargo check` exiting 0, because nothing on a host ever
+    /// evaluates that line. It is the one mutation that survived the probe run
+    /// that landed these tests, which is why this exists.
+    ///
+    /// So read the cascades as source instead. Three arms per constant in one
+    /// fixed shape: the `cfg` picks the device class, and the right-hand side
+    /// has to name the constant for that class. Reading the source is the weak
+    /// form of the check — it cannot see a wrongly *valued* constant, which is
+    /// what every test above is for — but it is the only form available without
+    /// a wasm test runner.
+    #[test]
+    fn every_cfg_arm_selects_the_constant_named_for_its_device_class() {
+        let source = include_str!("constants.rs");
+        // The shipped half only: the expected strings below appear verbatim in
+        // this test's own source.
+        let (code, _) = source
+            .split_once("#[cfg(test)]")
+            .expect("constants.rs no longer has a test module");
+
+        let expected = [
+            (r#"#[cfg(target_arch = "wasm32")]"#, "WASM"),
+            (
+                r#"#[cfg(all(not(target_arch = "wasm32"), mobile))]"#,
+                "MOBILE",
+            ),
+            (
+                r#"#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]"#,
+                "DESKTOP",
+            ),
+        ];
+
+        for name in [
+            "MAX_CONCURRENT_RENDERS",
+            "MAX_LOOP_RENDER_BUDGET",
+            "MAX_LOOP_FRAMES",
+            "LOOP_TEXTURE_BUDGET_BYTES",
+            "VOLUME_GRID_CELLS",
+            "VOLUME_TEXTURE_BUDGET_BYTES",
+        ] {
+            let arms = cascade_arms(code, name);
+            assert_eq!(
+                arms.len(),
+                expected.len(),
+                "{name} has {} `cfg` arms, not {}: {arms:?}. The three-arm shape \
+                 is what keeps them mutually exclusive — see MAX_LOOP_FRAMES' \
+                 doc comment.",
+                arms.len(),
+                expected.len(),
+            );
+            for ((cfg, rhs), (want_cfg, class)) in arms.iter().zip(expected) {
+                assert_eq!(cfg, want_cfg, "{name}");
+                assert_eq!(
+                    rhs,
+                    &format!("{class}_{name}"),
+                    "the {cfg} arm of {name} selects `{rhs}`, which is not the \
+                     {class} value. No host build can evaluate this line."
+                );
+            }
+        }
+    }
+
     /// The web image fits what a browser is *guaranteed* to accept.
     ///
     /// `rustdar_radar` states the 2048 floor as a literal because it has no wgpu
