@@ -519,7 +519,26 @@ impl RenderDispatcher {
         hit
     }
 
-    /// Reset all pane render state (e.g. after a new scan loads).
+    /// Reset every pane's render state, every site's, and bump
+    /// [`render_generation`](Self::render_generation).
+    ///
+    /// **No production caller, and not for the reason it looks like.** It is worth
+    /// recording which, because the chunk feed's volume-close path sits next door
+    /// and the two are unrelated. This lost its last caller in March 2026, months
+    /// before the real-time feed existed, when the archive drain and the manual
+    /// navigation both narrowed to
+    /// [`reset_panes_for_site`](Self::reset_panes_for_site) — the right call for
+    /// both, since a scan arriving for one site has no business discarding another
+    /// site's in-flight renders, which is exactly what bumping the global
+    /// generation does. `App::apply_chunk_outcome`'s completed-volume branch wants
+    /// the per-site reset for the same reason and calls it.
+    ///
+    /// So `render_generation` never advances in a running app and
+    /// [`is_render_stale`](Self::is_render_stale) is always false. That is not a
+    /// hole — per-site resets abandon their panes' renders individually, through
+    /// `PaneRenderState::results_wanted` — but it does mean this function and
+    /// that counter stand or fall together, which is a judgement for whoever next
+    /// needs a global invalidation rather than a thing to delete in passing.
     pub fn reset_panes(&mut self) {
         for prs in &mut self.pane_render {
             prs.last_rendered = None;
