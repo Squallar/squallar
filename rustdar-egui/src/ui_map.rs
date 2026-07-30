@@ -364,8 +364,26 @@ impl super::Gui {
     }
 
     /// Detect which pane was clicked and make it the active pane.
+    ///
+    /// Bounded by [`Gui::visible_pane_count`], not by the layout's raw count, for
+    /// the reason [`Gui::panes`] gives — and here the consequence is one step
+    /// worse than a skipped update. This writes `active_pane`, and
+    /// [`Gui::active_pane`] resolves it as `self.panes[self.active_pane]`: a rect
+    /// the layout draws for a pane the vector does not hold would hand the index
+    /// of a `PaneState` that does not exist to every reader downstream, and the
+    /// first one to dereference it panics rather than doing nothing.
+    ///
+    /// Defensive rather than a live fix: no production writer can produce the
+    /// skew today. Both of them (`load_ui_config` and the pane picker) grow
+    /// `panes` to the requested count *before* assigning the layout, `panes` is
+    /// never shortened anywhere, and `PaneLayout::for_count` clamps its count
+    /// down — so the vector is if anything longer than the layout claims. The
+    /// bound is here because that is a property of two call sites rather than of
+    /// this type, and because a click is the one path that turns the skew from a
+    /// pane nobody updates into a crash.
     fn detect_active_pane_click(&mut self, ctx: &egui::Context, panel_rect: egui::Rect) {
-        if self.pane_layout.pane_count <= 1 {
+        let pane_count = self.visible_pane_count();
+        if pane_count <= 1 {
             return;
         }
         if let Some(pos) = ctx.input(|i| {
@@ -382,7 +400,7 @@ impl super::Gui {
             {
                 return;
             }
-            for idx in 0..self.pane_layout.pane_count {
+            for idx in 0..pane_count {
                 let rect = self.pane_layout.pane_rect(idx, panel_rect);
                 if rect.contains(pos) && idx != self.active_pane {
                     self.active_pane = idx;

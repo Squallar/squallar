@@ -2303,12 +2303,28 @@ impl Gui {
 
     /// The pane rects the layout produces inside the map panel, as
     /// `render_panes` computes them.
+    ///
+    /// "As `render_panes` computes them" is the whole contract, so the bound is
+    /// [`Self::visible_pane_count`] like the real loop's: with the raw count a
+    /// test would be handed rects for panes no frame ever drew, and any test that
+    /// clicked one would be asserting about a pane the app does not have.
     #[cfg(test)]
     pub(crate) fn pane_rects_for_test(&self) -> Vec<egui::Rect> {
         let panel = self.last_map_panel_rect;
-        (0..self.pane_layout.pane_count)
+        (0..self.visible_pane_count())
             .map(|idx| self.pane_layout.pane_rect(idx, panel))
             .collect()
+    }
+
+    /// Claim `count` panes in the layout **without** growing the pane vector.
+    ///
+    /// The skew `visible_pane_count` exists for, built on purpose. No production
+    /// writer can reach it — see `detect_active_pane_click` — so a test that wants
+    /// it has to say so, which is also what keeps the difference between "clamped
+    /// by a caller" and "clamped by the type" visible.
+    #[cfg(test)]
+    pub(crate) fn claim_pane_count_for_test(&mut self, count: usize) {
+        self.pane_layout = PaneLayout::for_count(count);
     }
 
     /// Turn a texture overlay on for every pane, as ticking its layer toggle does.
@@ -2699,10 +2715,31 @@ mod pane_slice_tests {
         assert_eq!(gui.panes().len(), 1, "a fresh Gui has one pane");
         // A layout claiming more panes than the vector holds, as a config whose
         // pane_count ran ahead of its pane list would leave it.
-        gui.pane_layout = PaneLayout::for_count(4);
+        gui.claim_pane_count_for_test(4);
 
         assert_eq!(gui.panes().len(), 1);
         assert_eq!(gui.panes_mut().len(), 1);
+    }
+
+    /// The rects a test clicks are the rects the frame drew, so the helper that
+    /// produces them takes the visible slice's bound too. With the raw count it
+    /// handed back a rect per *claimed* pane, and a test clicking the last of them
+    /// would have been driving a pane no frame ever rendered.
+    #[test]
+    fn the_pane_rects_a_test_sees_are_only_the_ones_a_frame_drew() {
+        let mut gui = Gui::new();
+        gui.set_pane_count_for_test(2);
+        gui.last_map_panel_rect =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        assert_eq!(
+            gui.pane_rects_for_test().len(),
+            2,
+            "precondition: two real panes give two rects"
+        );
+
+        gui.claim_pane_count_for_test(4);
+
+        assert_eq!(gui.pane_rects_for_test().len(), 2);
     }
 
     /// `sync_viewports` reads and writes panes by raw index, so it takes its
@@ -2713,7 +2750,7 @@ mod pane_slice_tests {
         let mut gui = Gui::new();
         gui.set_pane_count_for_test(2);
         gui.viewport_sync = true;
-        gui.pane_layout = PaneLayout::for_count(4);
+        gui.claim_pane_count_for_test(4);
 
         // Snapshots sized to the layout's claim, exactly as `render_panes` would
         // have taken them had it trusted the raw count too. All-zero zooms

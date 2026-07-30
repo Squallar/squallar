@@ -724,6 +724,13 @@ impl InputHarness {
         self.warm_up();
     }
 
+    /// Make the layout claim `count` panes without giving it that many
+    /// `PaneState`s — the skew described on `Gui::claim_pane_count_for_test`.
+    pub(crate) fn claim_pane_count(&mut self, count: usize) {
+        self.gui.claim_pane_count_for_test(count);
+        self.warm_up();
+    }
+
     /// The pane rects the real layout produces inside the map panel.
     pub(crate) fn pane_rects(&self) -> Vec<egui::Rect> {
         self.gui.pane_rects_for_test()
@@ -3048,6 +3055,41 @@ mod tests {
             confirmed.resolved.overlay_click_pos,
             Some(pos),
             "the tap was deferred, not swallowed"
+        );
+    }
+
+    /// A click can only hand the active-pane slot to a pane that exists.
+    ///
+    /// `Gui::active_pane` resolves the slot as `self.panes[self.active_pane]`, so
+    /// an index the layout drew a cell for but the vector never grew to reach is
+    /// not a pane that quietly goes unpainted — it is a panic waiting for the next
+    /// reader, and `render_layers_panel`'s `mem::take` is one of them. The skew is
+    /// built by hand because no production writer can produce it: both grow the
+    /// vector before assigning the layout. See `Gui::claim_pane_count_for_test`.
+    #[test]
+    fn a_click_on_a_cell_no_pane_occupies_leaves_the_active_pane_alone() {
+        let mut h = InputHarness::new();
+        h.set_pane_count(2);
+        h.claim_pane_count(4);
+        let panel = h.map_panel_rect();
+
+        // The 2×2 grid's bottom-right cell: a rect for pane 3, which no
+        // `PaneState` occupies.
+        let ghost = crate::pane::PaneLayout::for_count(4)
+            .pane_rect(3, panel)
+            .center();
+        assert!(
+            h.pane_rects().iter().all(|r| !r.contains(ghost)),
+            "precondition: the click lands outside every pane the frame drew"
+        );
+
+        h.mouse_click(ghost);
+
+        assert_eq!(h.active_pane_index(), 0);
+        assert_eq!(
+            h.gui_mut().active_pane().site,
+            "KTLX",
+            "the slot still resolves to a pane rather than panicking"
         );
     }
 
