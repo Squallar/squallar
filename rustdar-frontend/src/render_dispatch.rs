@@ -483,13 +483,13 @@ impl RenderDispatcher {
     /// branch of `App::apply_chunk_outcome` is the only path that would have
     /// called it, and it needs the *wider*
     /// [`reset_panes_for_site`](Self::reset_panes_for_site) for three separate
-    /// reasons. `closed` is set by `ChunkPoller` at the instant it rolls the
-    /// assembler, so the branch fires at a volume *boundary* and the scan it
-    /// installs is the new volume — every pane on the site is showing an image
-    /// built from the old one, not just the whole-volume readers. The `if/else`
-    /// there means the closing round's own `sealed_elevations` never reach
-    /// `reset_panes_for_tilts`, so the site reset is what stands in for them.
-    /// And `reset_panes_for_site` also drops the site's `level3_data` and
+    /// reasons. The branch fires at a volume *boundary* — `ChunkPoller::roll`
+    /// produces `closed` — and the volume it installs is the one that just ended,
+    /// so every pane on the site was drawing the volume before it, not just the
+    /// whole-volume readers. The `if/else` there means the closing round's own
+    /// `sealed_elevations`, which belong to the volume that just started, never
+    /// reach `reset_panes_for_tilts`, so the site reset is what stands in for
+    /// them. And `reset_panes_for_site` also drops the site's `level3_data` and
     /// `render_cache`, which the `spawn_level3_fetches` on the next line depends
     /// on and which a pane-only reset does not touch.
     ///

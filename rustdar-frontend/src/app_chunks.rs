@@ -305,17 +305,57 @@ impl super::App {
     }
 
     /// Apply one round's completions.
+    ///
+    /// # Which volume a round is about
+    ///
+    /// A round that rolled describes two: the one that closed and the one now
+    /// being assembled. When the closed one *completed*, that is the one applied,
+    /// from its own `ClosedVolume::scan` — never from the feed's live snapshot,
+    /// which by then is the new volume with no complete cut in it at all.
+    ///
+    /// Reading the live snapshot here was a staleness bug on every whole-volume
+    /// product. `ChunkPoller::roll` sets `closed` in the same statement that
+    /// replaces the assembler `snapshot` reads, so the guard below fired on the
+    /// empty new volume and the entire `volume_complete` branch — the site reset,
+    /// the Level III refetch, the loop append — never ran on a healthy feed. A
+    /// pane on echo tops, NROT, SRV, HCA or either hail product rendered once and
+    /// then stayed frozen until the user changed something.
+    ///
+    /// It was also a *correctness* bug in the minority case it did run in. After
+    /// an error backoff the probe round can find the new volume already carrying
+    /// a sealed cut, so the snapshot was not empty and a whole-volume product was
+    /// handed a one- or two-cut volume — the failure `reads_whole_volume` exists
+    /// to prevent, and one that produces a plausible wrong answer rather than an
+    /// error. Taking the closed volume's own scan makes that unreachable: the
+    /// branch is gated on `progress.volume_complete` and reads the scan that flag
+    /// describes.
+    ///
+    /// The round's *own* `sealed_elevations` belong to the new volume, so they are
+    /// not used on that path — `reset_panes_for_site` covers every pane on the
+    /// site, including the tilt panes those cuts would have refreshed, and the
+    /// freshness stamps come from the closed volume's cuts against the closed
+    /// volume's radials. Applying both volumes in one round is not an option:
+    /// `scan_data` holds one volume per site, and a partial one there is exactly
+    /// what the paragraph above is about.
     fn apply_chunk_outcome(&mut self, site: &str, outcome: &rustdar_radar::chunks::PollOutcome) {
-        let volume_complete = outcome
+        let completed = outcome
             .closed
             .as_ref()
-            .is_some_and(|closed| closed.volume_complete);
-        if outcome.sealed_elevations.is_empty() && !volume_complete {
-            return;
-        }
-
-        let Some(scan) = self.chunk_feeds.snapshot(site) else {
-            return;
+            .filter(|closed| closed.progress.volume_complete);
+        let (scan, sealed) = match completed {
+            Some(closed) => (
+                Arc::clone(&closed.scan),
+                closed.progress.sealed_elevations.as_slice(),
+            ),
+            None => {
+                if outcome.sealed_elevations.is_empty() {
+                    return;
+                }
+                let Some(scan) = self.chunk_feeds.snapshot(site) else {
+                    return;
+                };
+                (scan, outcome.sealed_elevations.as_slice())
+            }
         };
         if scan.sweeps().is_empty() {
             return;
@@ -337,33 +377,35 @@ impl super::App {
 
         self.scan_data.insert(site.to_string(), Arc::clone(&scan));
 
-        if volume_complete {
+        if completed.is_some() {
             // The volume is now exactly what the archive would have published,
             // so the steady state matches it — including the Level III refetch
             // that re-registers the tilts a merge preserved mid-volume.
             self.gui.set_scan_info_for_site(site, info);
             self.gui.clear_loading_site_for_site(site);
             // Every pane on the site, whatever its product, and deliberately not
-            // a narrower reset of the whole-volume readers alone. `closed` is set
-            // by `ChunkPoller` at the instant it rolls the assembler, so this is a
-            // volume *boundary*: every pane here is showing an image built from
-            // the volume that just ended. The `if`/`else` also means this round's
-            // own `sealed_elevations` never reach `reset_panes_for_tilts`, so this
-            // is what stands in for them. And it is the reset that drops the
-            // site's `level3_data` and `render_cache`, which the refetch below
+            // a narrower reset of the whole-volume readers alone. This is a volume
+            // *boundary*: every pane here is showing an image built from the
+            // volume before the one just installed, so all of them are stale, not
+            // only the whole-volume readers. It also stands in for this round's
+            // own `sealed_elevations`, which belong to the *new* volume and so
+            // never reach `reset_panes_for_tilts`. And it is the reset that drops
+            // the site's `level3_data` and `render_cache`, which the refetch below
             // needs — a pane-only reset would leave the previous volume's objects
             // and images to be handed straight back.
             self.render.reset_panes_for_site(site, &self.gui);
             self.spawn_level3_fetches(site);
-            self.record_tilt_freshness(site, &scan, &outcome.sealed_elevations);
-            // Only now: `append_polled_frame` dedupes by timestamp and a
-            // `LoopFrame` has no "the scan got better" transition, so a frame
-            // appended mid-volume would freeze on a one-cut volume forever.
+            self.record_tilt_freshness(site, &scan, sealed);
+            // Safe here and nowhere else: `append_polled_frame` dedupes by
+            // timestamp and a `LoopFrame` has no "the scan got better"
+            // transition, so a frame appended for a volume still being assembled
+            // would freeze on however many cuts it had at that moment. `scan` is
+            // the completed volume, so the frame is right the first time.
             self.append_scan_to_active_loops(site, timestamp, scan);
         } else {
             self.gui.apply_chunk_scan_info(site, info);
             self.gui.clear_loading_site_for_site(site);
-            self.record_tilt_freshness(site, &scan, &outcome.sealed_elevations);
+            self.record_tilt_freshness(site, &scan, sealed);
             let hit = self
                 .render
                 .reset_panes_for_tilts(site, &self.gui, &outcome.sealed_angles);
@@ -574,7 +616,7 @@ mod selection_tests {
 
     /// Re-point the pane an existing app already has, so a per-product sweep
     /// does not stand a `wgpu` instance up once per variant.
-    fn show(app: &mut App, product: RadarProduct, selected: f32, available: &[f32]) {
+    pub(super) fn show(app: &mut App, product: RadarProduct, selected: f32, available: &[f32]) {
         let pane = app.gui.pane_mut(0).unwrap();
         pane.site = "KTLX".to_string();
         pane.viewing_live = true;
@@ -797,5 +839,300 @@ mod selection_tests {
     fn the_selection_is_per_site() {
         let app = app_showing(RadarProduct::Reflectivity, 0.5, &[0.5, 4.0]);
         assert_eq!(app.cut_selection_for("KOUN"), CutSelection::All);
+    }
+}
+
+#[cfg(test)]
+mod volume_close_tests {
+    use super::super::App;
+    use super::super::tests::headless;
+    use super::selection_tests::show;
+    use crate::platform_double::TestBridge;
+    use crate::render_dispatch::CachedRenderOutput;
+    use rustdar_radar::chunks::{ClosedVolume, PollOutcome, VolumeIndex, VolumeProgress};
+    use rustdar_radar::types::RadarProduct;
+    use std::sync::Arc;
+
+    fn vol(index: u16) -> VolumeIndex {
+        VolumeIndex::new(index).expect("a legal volume index")
+    }
+
+    /// A volume carrying `sweeps` complete cuts, elevation numbers 1..=sweeps.
+    fn volume(sweeps: u8) -> Arc<nexrad_model::data::Scan> {
+        use nexrad_model::data::{
+            MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
+        };
+        let cut = |number: u8| {
+            let radial = Radial::new(
+                1_760_000_000_000,
+                0,
+                0.0,
+                1.0,
+                RadialStatus::ElevationStart,
+                number,
+                0.5 * number as f32,
+                Some(MomentData::from_fixed_point(
+                    1,
+                    0,
+                    250,
+                    8,
+                    2.0,
+                    66.0,
+                    vec![0],
+                )),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            Sweep::new(number, vec![radial])
+        };
+        Arc::new(Scan::new(
+            VolumeCoveragePattern::new(
+                212,
+                0,
+                0.5,
+                PulseWidth::Short,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+                0,
+                false,
+                false,
+                Vec::new(),
+            ),
+            (1..=sweeps).map(cut).collect(),
+        ))
+    }
+
+    /// The progress a volume of `sweeps` cuts reports once every one of them has
+    /// sealed and the volume has ended.
+    fn complete(sweeps: u8) -> VolumeProgress {
+        VolumeProgress {
+            volume: vol(42),
+            volume_time: Some(
+                chrono::NaiveDate::from_ymd_opt(2026, 7, 28)
+                    .unwrap()
+                    .and_hms_opt(12, 0, 0)
+                    .unwrap(),
+            ),
+            sealed_elevations: (1..=sweeps).collect(),
+            sealed_angles: (1..=sweeps).map(|n| 0.5 * n as f32).collect(),
+            abandoned: Vec::new(),
+            saw_scan_end: true,
+            volume_complete: true,
+            chunks_ingested: 55,
+            late_radials_dropped: 0,
+        }
+    }
+
+    /// A round that closed a `sweeps`-cut volume and rolled to the next, exactly
+    /// as `ChunkPoller::roll` reports one.
+    fn closing_round(sweeps: u8) -> PollOutcome {
+        PollOutcome {
+            closed: Some(ClosedVolume {
+                progress: complete(sweeps),
+                scan: volume(sweeps),
+            }),
+            rolled_to: Some(vol(43)),
+            ..Default::default()
+        }
+    }
+
+    /// An app with one live KTLX pane on `product` that has already drawn the
+    /// previous volume — `last_rendered` set and an image in the cache, which is
+    /// exactly the state a pane sits in between volumes.
+    ///
+    /// Deliberately started with **no chunk feed for the site**, so
+    /// `chunk_feeds.snapshot` answers `None`. That is not a convenience: on the
+    /// round under test the feed's live snapshot is the *new* volume with no
+    /// complete cut in it, so a completed volume must be applied without
+    /// consulting it at all. Reintroducing that read fails every test here.
+    fn app_showing_a_drawn_volume(product: RadarProduct) -> App {
+        let mut app = headless(TestBridge::desktop());
+        show(&mut app, product, 0.5, &[0.5, 1.0, 1.5]);
+        assert!(
+            app.chunk_feeds.snapshot("KTLX").is_none(),
+            "precondition: the site has no live snapshot to fall back on"
+        );
+        app.render.pane_render[0].last_rendered = Some((product, 0.5));
+        app.render.cache_render(
+            "KTLX",
+            product,
+            0.5,
+            CachedRenderOutput {
+                image_data: Arc::new(Vec::new()),
+                max_range_km: 100.0,
+                value_data: Arc::new(Vec::new()),
+            },
+        );
+        app
+    }
+
+    /// **The staleness bug.** A volume that completes on a healthy feed must
+    /// re-render the panes reading it.
+    ///
+    /// Swept over every product `reads_whole_volume` names rather than a written
+    /// list of the six: the predicate is what decides which panes the tilt reset
+    /// declines, so those are exactly the panes for which this branch is the
+    /// *only* refresh. A product added to that set is covered the day it is added.
+    #[test]
+    fn a_completed_volume_re_renders_every_whole_volume_pane() {
+        let mut whole_volume = 0;
+        for &product in RadarProduct::all() {
+            if !product.reads_whole_volume() {
+                continue;
+            }
+            whole_volume += 1;
+            let mut app = app_showing_a_drawn_volume(product);
+
+            app.apply_chunk_outcome("KTLX", &closing_round(5));
+
+            assert!(
+                app.render.pane_render[0].last_rendered.is_none(),
+                "{product:?}: the volume completed and the pane was not \
+                 invalidated, so it keeps showing the previous volume until the \
+                 user changes product, changes tilt, presses Refresh, or the feed \
+                 dies"
+            );
+            assert!(
+                app.render.get_cached_render("KTLX", product, 0.5).is_none(),
+                "{product:?}: the previous volume's image survived the reset, so \
+                 the pane re-renders straight back into it"
+            );
+            assert_eq!(
+                app.scan_data
+                    .get("KTLX")
+                    .map(|s| s.sweeps().len())
+                    .unwrap_or(0),
+                5,
+                "{product:?}: the completed volume never reached the display"
+            );
+        }
+        assert!(
+            whole_volume >= 6,
+            "the whole-volume set shrank to {whole_volume}; this test is about \
+             the products only this branch refreshes"
+        );
+    }
+
+    /// The rest of the branch, which is what the site reset exists to serve.
+    ///
+    /// `scan_info` moved to the completed volume — `set_scan_info_for_site`, the
+    /// wide form, not the mid-volume merge — and the volume reached the loop
+    /// cache under its own start time, which is the frame an active loop takes.
+    #[test]
+    fn a_completed_volume_reaches_the_scan_info_and_the_loop_cache() {
+        let mut app = app_showing_a_drawn_volume(RadarProduct::EchoTopsInterpolated);
+        app.gui.pane_mut(0).unwrap().loop_state.frames.clear();
+
+        app.apply_chunk_outcome("KTLX", &closing_round(5));
+
+        let shown = app
+            .gui
+            .pane(0)
+            .and_then(|p| p.scan_info.as_ref().map(|i| i.timestamp))
+            .expect("the pane must still have scan info");
+        let cached = app.loop_mgr.get_cached("KTLX", &shown);
+        assert_eq!(
+            cached.map(|s| s.sweeps().len()),
+            Some(5),
+            "the completed volume never reached the loop cache, so an active \
+             loop's newest frame stays a volume behind"
+        );
+    }
+
+    /// Freshness is stamped from the volume that was applied, cut for cut.
+    ///
+    /// The round's own `sealed_elevations` belong to the volume that just
+    /// *started*, so pairing them with the closed volume's scan would date the new
+    /// volume's cuts from the old volume's radials. The closed volume's own cuts
+    /// are the only consistent pairing.
+    #[test]
+    fn a_completed_volume_stamps_freshness_for_its_own_cuts() {
+        let mut app = app_showing_a_drawn_volume(RadarProduct::EchoTopsInterpolated);
+        let mut outcome = closing_round(5);
+        // What a backoff round carries: the new volume's first cut, at an angle
+        // the closed volume also has, so a mis-pairing would still find a sweep
+        // and pass unnoticed.
+        outcome.sealed_elevations = vec![1];
+        outcome.sealed_angles = vec![0.5];
+
+        app.apply_chunk_outcome("KTLX", &outcome);
+
+        for n in 1..=5u8 {
+            assert!(
+                app.chunk_feeds.freshness("KTLX", 0.5 * n as f32).is_some(),
+                "cut {n} of the completed volume was never stamped, so the status \
+                 bar has nothing to say about the tilt on screen"
+            );
+        }
+    }
+
+    /// The opposite failure, in the minority case. After an error backoff the
+    /// probe round can find the new volume already carrying sealed cuts, and the
+    /// branch used to render *that* — a one-cut volume through a product that
+    /// integrates the column.
+    ///
+    /// The closed volume wins, and it has to: `scan_data` holds one volume per
+    /// site, so applying both volumes of a closing round would put the partial one
+    /// there. The new volume's cuts are not lost — `reset_panes_for_site` covers
+    /// every pane on the site, and the next cut to seal reports them again.
+    #[test]
+    fn a_partial_volume_never_reaches_a_whole_volume_product() {
+        let mut app = app_showing_a_drawn_volume(RadarProduct::EchoTopsInterpolated);
+        let mut outcome = closing_round(5);
+        outcome.sealed_elevations = vec![1];
+        outcome.sealed_angles = vec![0.5];
+
+        app.apply_chunk_outcome("KTLX", &outcome);
+
+        assert_eq!(
+            app.scan_data
+                .get("KTLX")
+                .map(|s| s.sweeps().len())
+                .unwrap_or(0),
+            5,
+            "the round that closed a complete volume installed something other \
+             than that volume"
+        );
+    }
+
+    /// A volume that ended *without* completing is not applied as one.
+    ///
+    /// The gate is `progress.volume_complete`, not merely `closed.is_some()`. A
+    /// volume joined mid-flight or one that lost a chunk closes with cuts missing,
+    /// and `compute_echo_tops` would clamp every column to the topmost tilt that
+    /// happened to arrive and report a plausible, low, wrong number in kft.
+    #[test]
+    fn an_incomplete_closed_volume_is_not_applied() {
+        let product = RadarProduct::EchoTopsInterpolated;
+        let mut app = app_showing_a_drawn_volume(product);
+        let mut outcome = closing_round(5);
+        let closed = outcome.closed.as_mut().unwrap();
+        closed.progress.volume_complete = false;
+        closed.progress.abandoned = vec![rustdar_radar::chunks::AbandonedCut {
+            elevation: 6,
+            have: 12,
+            expected: 720,
+        }];
+
+        app.apply_chunk_outcome("KTLX", &outcome);
+
+        assert!(
+            !app.scan_data.contains_key("KTLX"),
+            "a volume that closed short was installed anyway"
+        );
+        assert_eq!(
+            app.render.pane_render[0].last_rendered,
+            Some((product, 0.5)),
+            "a volume that closed short ran the site reset, so the pane \
+             re-rendered from it"
+        );
     }
 }

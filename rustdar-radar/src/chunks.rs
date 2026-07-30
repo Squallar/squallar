@@ -1156,7 +1156,46 @@ pub(crate) fn fetch_disposition(e: &ArchiveError) -> FetchDisposition {
     }
 }
 
+/// A volume that ended, and what it ended as.
+///
+/// **The scan travels with the report.** [`ChunkPoller::roll`] is the only thing
+/// that closes a volume, and it closes one by replacing the assembler
+/// [`ChunkPoller::snapshot`] reads — so a caller told "that volume completed" can
+/// no longer reach the volume in question. Handing back only its
+/// [`VolumeProgress`] made every consequence gated on
+/// [`VolumeProgress::volume_complete`] unreachable: by the time the report
+/// arrived, the only readable volume was the *new* one, zero cuts in.
+///
+/// Both fields describe the same instant, which is the point: `scan` carries
+/// exactly the cuts `progress.sealed_elevations` names, so a whole-volume product
+/// checking `volume_complete` and then reading `scan` cannot be looking at two
+/// different volumes.
+#[derive(Clone)]
+pub struct ClosedVolume {
+    pub progress: VolumeProgress,
+    /// The volume as it stood when it closed — complete sweeps only, so a cut
+    /// that ended short is absent rather than present and partial.
+    pub scan: std::sync::Arc<nexrad_model::data::Scan>,
+}
+
+/// Summarised rather than derived: `Scan`'s own `Debug` prints every gate of
+/// every radial, and this type is reachable from `PollOutcome`'s derived `Debug`
+/// — one `log::debug!("{outcome:?}")` would write tens of megabytes.
+impl std::fmt::Debug for ClosedVolume {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClosedVolume")
+            .field("progress", &self.progress)
+            .field("scan_sweeps", &self.scan.sweeps().len())
+            .finish()
+    }
+}
+
 /// What one round changed.
+///
+/// A round that rolls describes **two** volumes: the one that closed, in
+/// [`Self::closed`], and the one now being assembled, in every other field. They
+/// are deliberately not merged — a caller reading a whole volume wants the first
+/// and a caller reading one tilt wants the second.
 #[derive(Debug, Clone, Default)]
 pub struct PollOutcome {
     pub ingested: usize,
@@ -1167,9 +1206,11 @@ pub struct PollOutcome {
     pub sealed_angles: Vec<f32>,
     /// The volume rolled this round; `snapshot` now describes a new volume.
     pub rolled_to: Option<VolumeIndex>,
-    /// The volume that just closed, with its final progress. Where
-    /// `volume_complete` for a finished volume is reported.
-    pub closed: Option<VolumeProgress>,
+    /// The volume that just closed, **with the scan it closed as**. Where
+    /// `volume_complete` for a finished volume is reported, and the only way to
+    /// reach that volume: the roll that produced this replaced the assembler
+    /// `snapshot` reads. See [`ClosedVolume`].
+    pub closed: Option<ClosedVolume>,
     pub progress: Option<VolumeProgress>,
     /// Keys that would not parse or bytes that would not decode. Skipped, not
     /// fatal.
@@ -1326,8 +1367,27 @@ impl ChunkPoller {
     }
 
     /// Close the current volume and begin the next.
-    pub(crate) fn roll(&mut self, to: VolumeIndex) -> Option<VolumeProgress> {
-        let closed = self.current.as_mut().map(VolumeAssembler::close);
+    ///
+    /// Returns the closed volume *and its scan*, not just its progress. The
+    /// assembler [`Self::snapshot`] reads is replaced on the next line, so
+    /// anything this does not hand back is unreachable the instant the caller
+    /// learns the volume finished — see [`ClosedVolume`].
+    ///
+    /// Building the snapshot here is normally free: [`VolumeAssembler::snapshot`]
+    /// caches, and `close` invalidates that cache only when it had to abandon a
+    /// still-open cut — which by definition did not happen to a volume that
+    /// completed.
+    pub(crate) fn roll(&mut self, to: VolumeIndex) -> Option<ClosedVolume> {
+        let closed = self.current.as_mut().map(|current| {
+            // `close` first, and the snapshot after it: closing resolves every
+            // still-open cut to `Abandoned`, which is what keeps a cut that ended
+            // short out of the scan handed over.
+            let progress = current.close();
+            ClosedVolume {
+                progress,
+                scan: current.snapshot(),
+            }
+        });
         let mut next = VolumeAssembler::new(self.site.clone(), to);
         next.set_selection(self.selection.clone());
         self.current = Some(next);
@@ -2371,6 +2431,17 @@ mod tests {
     /// only `ElevationEnd` leaves the topmost cut open forever, so
     /// `volume_complete` never fires and everything gated on it — echo tops, the
     /// Level III refetch, the loop append — is dead.
+    ///
+    /// **This is only half of that claim, and the half it is not covers a bug that
+    /// shipped.** Everything here stops at the assembler: the flag is read off
+    /// `VolumeAssembler::progress` in the same breath as `snapshot`, so of course
+    /// the two agree. What the frontend actually reads is
+    /// `PollOutcome::closed`, produced one layer up by [`ChunkPoller::roll`] —
+    /// which for a long time reported the completion and dropped the volume in the
+    /// same statement, so the flag fired and everything gated on it was dead
+    /// anyway. `a_roll_hands_back_the_volume_it_closed` is the missing layer, and
+    /// any future claim of the form "`volume_complete` reaches a reader" belongs
+    /// there rather than here.
     #[test]
     fn the_final_cut_seals_on_scan_end() {
         let mut a = assemble(golden_chunks());
@@ -2382,6 +2453,139 @@ mod tests {
         assert!(a.progress().saw_scan_end);
         assert!(a.progress().volume_complete);
         let _ = a.snapshot();
+    }
+
+    /// **A roll must hand back the volume whose completion it reports.**
+    ///
+    /// [`ChunkPoller::roll`] is the only producer of [`PollOutcome::closed`], and
+    /// both callers set that field in the same statement that replaces the
+    /// assembler [`ChunkPoller::snapshot`] reads. Whatever the roll does not hand
+    /// back is gone: the caller learns a volume completed at the exact instant it
+    /// can no longer read it, and everything gated on `volume_complete` — echo
+    /// tops, the Level III refetch, the loop append — is dead on a healthy feed.
+    ///
+    /// Asserted against the *live* snapshot as well, because that is the read the
+    /// frontend used to make and the number it got back. Reverting `roll` to
+    /// return only [`VolumeProgress`] cannot pass this.
+    #[test]
+    fn a_roll_hands_back_the_volume_it_closed() {
+        let mut poller = ChunkPoller::new("KTLX");
+        poller.current = Some(assemble(golden_chunks()));
+        let expected = crate::volumetric::tests::golden_scan().sweeps().len();
+
+        let closed = poller.roll(vol(43)).expect("a volume was open");
+
+        assert!(
+            closed.progress.volume_complete,
+            "the fixture must close complete, or this proves nothing: {:?}",
+            closed.progress
+        );
+        assert_eq!(
+            closed.scan.sweeps().len(),
+            expected,
+            "the roll reported a completed volume and did not hand it over"
+        );
+        // And the scan really is the volume the progress describes, not some
+        // other one: same cuts, in the same order.
+        let handed: Vec<u8> = closed
+            .scan
+            .sweeps()
+            .iter()
+            .map(|s| s.elevation_number())
+            .collect();
+        assert_eq!(
+            handed, closed.progress.sealed_elevations,
+            "the scan and the progress in one `ClosedVolume` describe different \
+             volumes"
+        );
+        assert_eq!(
+            poller.snapshot().map(|s| s.sweeps().len()),
+            Some(0),
+            "the poller is on the new volume now — which is why the closed one \
+             has to travel out with the outcome rather than be read back off it"
+        );
+    }
+
+    /// A cut that ended short is absent from the closed volume, not present and
+    /// partial. `close` resolves open cuts to `Abandoned` and the snapshot is
+    /// taken after it, in that order; taken before, the partial cut would still
+    /// be `Open` and the abandoned-cut list would not match the scan.
+    #[test]
+    fn a_roll_leaves_an_abandoned_cut_out_of_the_scan_it_hands_back() {
+        // Drop the chunk carrying the 0.5° cut's terminator, so that cut is still
+        // open when the volume closes.
+        let mut chunks = golden_chunks();
+        let dropped = chunks
+            .iter()
+            .position(|(_, _, c)| {
+                c.radials.iter().any(|r| {
+                    r.elevation_number() == 1 && r.radial_status() == RadialStatus::ElevationEnd
+                })
+            })
+            .expect("the 0.5° cut has a terminator chunk");
+        chunks.remove(dropped);
+
+        let mut poller = ChunkPoller::new("KTLX");
+        poller.current = Some(assemble(chunks));
+        let closed = poller.roll(vol(43)).expect("a volume was open");
+
+        assert!(
+            closed.progress.abandoned.iter().any(|a| a.elevation == 1),
+            "precondition: the 0.5° cut must have closed short: {:?}",
+            closed.progress
+        );
+        assert!(
+            !closed.progress.volume_complete,
+            "a volume with an abandoned cut reported complete"
+        );
+        assert!(
+            closed
+                .scan
+                .sweeps()
+                .iter()
+                .all(|s| s.elevation_number() != 1),
+            "the abandoned partial cut reached the scan handed to the caller"
+        );
+    }
+
+    /// One closing round describes **two** volumes, which is why the closed one
+    /// cannot be represented by the live snapshot.
+    ///
+    /// This is the shape `poll` produces whenever the probe round finds the new
+    /// directory already filling — after an error backoff of up to
+    /// [`MAX_BACKOFF`], several cuts' worth. A consumer that trusted
+    /// `closed.volume_complete` and then read the snapshot got a one-cut volume:
+    /// no error, no NaN, a plausible wrong answer from every product
+    /// [`crate::types::RadarProduct::reads_whole_volume`] names.
+    #[test]
+    fn a_closing_round_can_also_seal_a_cut_of_the_new_volume() {
+        let mut poller = ChunkPoller::new("KTLX");
+        poller.current = Some(assemble(golden_chunks()));
+        let closed = poller.roll(vol(43)).expect("a volume was open");
+        assert!(closed.progress.volume_complete);
+
+        // What `poll` does next in the same round: list the new volume's
+        // directory and ingest whatever is already in it.
+        let current = poller.current.as_mut().expect("the roll started one");
+        let mut sealed: Vec<u8> = Vec::new();
+        for (sequence, kind, contents) in golden_chunks() {
+            let outcome = current.ingest_contents(sequence, kind, volume_time(), contents);
+            sealed.extend(outcome.sealed);
+            if !sealed.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(sealed, vec![1], "the new volume's first cut did not seal");
+        assert_eq!(
+            poller.snapshot().map(|s| s.sweeps().len()),
+            Some(1),
+            "the live snapshot on a closing round is the new volume, one cut in"
+        );
+        assert_eq!(
+            closed.scan.sweeps().len(),
+            crate::volumetric::tests::golden_scan().sweeps().len(),
+            "and the closed volume is unaffected by what the new one ingests"
+        );
     }
 
     /// Reported per chunk, and only for the cut that finished on it — the
