@@ -724,7 +724,7 @@ impl PaneState {
 
     /// Convert this pane to `kind`, keeping everything about *what it is looking
     /// at*: its site, its scan, its product and elevation selection, its
-    /// viewport, its layer toggles and its loop.
+    /// viewport and its layer toggles.
     ///
     /// That is a property of the representation rather than of this function —
     /// only `content` is written, and every other field is flat — which is what
@@ -737,11 +737,55 @@ impl PaneState {
     /// replacing the per-kind state with a fresh one: re-selecting the current
     /// kind from a menu must not discard a drawn section line or a camera the
     /// user has spent a while aiming.
+    ///
+    /// # The one exception: an animation loop is torn down
+    ///
+    /// A loop frame *is* a rendered plan-view tilt, so a pane with no plan view
+    /// has nothing to animate — and a loop left running on one is not merely idle,
+    /// it is actively harmful in five separate ways, every one of them silent:
+    ///
+    /// * `App::sync_loop_playback_start` holds **every** looping pane back until
+    ///   all of them are render-ready, and a converted pane can never become
+    ///   ready — nothing renders its frames and nothing marks them failed. With
+    ///   Sync Layers on, one converted pane would stop every map pane's loop from
+    ///   ever starting. A deadlock, in the other panes.
+    /// * Its queue goes on consuming the *shared* download budget, starving the
+    ///   live panes it sits beside.
+    /// * The status readout says "Rendering n/m" for ever, with no loop transport
+    ///   drawn on this pane to cancel it — the layers panel does not offer one to
+    ///   a non-map pane.
+    /// * `Gui::any_loop_active` stays true, so the event loop keeps waking at loop
+    ///   frame rate for an animation nobody can see.
+    /// * Its frame textures are held until the egui context dies.
+    ///
+    /// So the invariant is that **a non-map pane never has an active loop**, and
+    /// it is enforced here, at the transition, rather than by a filter at each of
+    /// those five consumers. `SwitchRadarSite` already resets `loop_state` for the
+    /// same reason, which is why a site switch happens to cure this.
+    ///
+    /// One half of the teardown is out of reach from here: the host's
+    /// `LoopDownloadManager` holds this pane's download queue by index, and a
+    /// `PaneState` cannot see it. `App::dispatch_loop_renders` drops it, which also
+    /// covers a pane that reached a non-map kind by some route that never called
+    /// this — a restored config, or a future auto-create.
     pub fn set_kind(&mut self, kind: PaneKind) {
         if self.kind() == kind {
             return;
         }
-        self.content = PaneContent::for_kind(kind);
+        self.set_content(PaneContent::for_kind(kind));
+    }
+
+    /// Replace this pane's per-kind content wholesale, as the config loader does
+    /// when it has both the kind and the state in hand.
+    ///
+    /// The one writer of `content` that enforces what a kind change implies, so
+    /// every route to a non-map pane — the menu, a restored config, a test
+    /// fixture — arrives with the same invariants. See [`Self::set_kind`].
+    pub fn set_content(&mut self, content: PaneContent) {
+        self.content = content;
+        if !self.is_map() {
+            self.loop_state = LoopPlaybackState::new();
+        }
     }
 
     /// The currently active radar image (from loop frame or static render).

@@ -1899,20 +1899,41 @@ impl Gui {
     ///
     /// Used for auto-poll decisions: we should fetch data for an overlay
     /// if at least one pane wants to display it.
+    ///
+    /// # Why a pane with no map does not count, while keeping its toggles
+    ///
+    /// This and [`Self::first_pane_with_overlay_enabled`] ask "is this overlay
+    /// being *drawn* anywhere?", and every overlay is a layer over map tiles,
+    /// geo-positioned against a projector a section or a volume pane does not
+    /// have. So a converted pane must not keep an overlay's auto-poll timer
+    /// running, or be the pane a `FetchOverlay` is attributed to.
+    ///
+    /// Its `enabled_overlays` is deliberately left alone rather than cleared,
+    /// which is the same choice `set_kind` makes about the viewport and the tilt:
+    /// it is the user's remembered answer to "which layers do I want", and it
+    /// becomes meaningful again the instant the pane is converted back. Filtering
+    /// the readers keeps both properties; clearing the record would lose one.
+    ///
+    /// Both are called from `check_auto_polls`, at the very top of [`Self::ui`]
+    /// before any pane is `mem::take`n, so reading the kind through `self.panes`
+    /// is safe here — see [`PaneContent`](crate::pane::PaneContent)'s module docs
+    /// for why that is worth checking rather than assuming.
     pub fn any_pane_has_overlay_enabled(&self, kind: OverlayKind) -> bool {
         self.panes
             .iter()
             .take(self.pane_layout.pane_count)
-            .any(|p| p.is_overlay_enabled(kind))
+            .any(|p| p.is_map() && p.is_overlay_enabled(kind))
     }
 
     /// Returns the index of the first pane that has the given overlay kind enabled,
     /// or `None` if no pane has it enabled.
+    ///
+    /// Panes with no map are skipped; see [`Self::any_pane_has_overlay_enabled`].
     pub fn first_pane_with_overlay_enabled(&self, kind: OverlayKind) -> Option<usize> {
         self.panes
             .iter()
             .take(self.pane_layout.pane_count)
-            .position(|p| p.is_overlay_enabled(kind))
+            .position(|p| p.is_map() && p.is_overlay_enabled(kind))
     }
 
     /// Get the active pane (immutable).
@@ -2021,12 +2042,15 @@ impl Gui {
     /// Whether pane `idx` is a pane the **plan-view** pipeline must skip: it
     /// exists, and it is not a map.
     ///
-    /// One predicate for the four frontend loops that dispatch, cache or
-    /// broadcast a plan-view raster (`dispatch_pane_renders`, the sibling
-    /// broadcast in `poll_render_results`, and both halves of
-    /// `dispatch_loop_renders`). Named once because those four have to agree:
-    /// a pane that is dispatched but not broadcast to, or broadcast to but never
-    /// dispatched, is a pane wedged with `render_in_flight` set forever.
+    /// One predicate for the seven frontend loops that dispatch, cache, broadcast
+    /// or gate on a plan-view raster: `dispatch_pane_renders`, the sibling
+    /// broadcast in `poll_render_results`, both halves of `dispatch_loop_renders`,
+    /// the loop-frame broadcast in `poll_loop_render_results`,
+    /// `restore_cached_render`, and `sync_loop_playback_start`. Named once because
+    /// they have to agree: a pane that is dispatched to but not broadcast to, or
+    /// broadcast to but never dispatched, is a pane wedged with
+    /// `render_in_flight` set forever — and one counted as a loop participant
+    /// while nothing renders its frames holds every *other* pane's loop back.
     ///
     /// Written in the negative on purpose. An index past the end answers
     /// `false` — "not a pane to skip" — which leaves out-of-range handling
@@ -2114,6 +2138,16 @@ impl Gui {
     #[cfg(test)]
     pub(crate) fn pane_content_for_test(&self) -> &[PaneContentProbe] {
         &self.last_pane_content
+    }
+
+    /// Whether a label-tile source has been created, which is the observable half
+    /// of "is this app fetching the city-label tile pyramid?".
+    ///
+    /// `MapTileState::ensure_label_tiles` only ever *creates* the source, so this
+    /// answering `false` after a frame means no fetch was ever started.
+    #[cfg(test)]
+    pub(crate) fn label_tiles_made_for_test(&self) -> bool {
+        self.map_tiles.label_tiles_light.is_some() || self.map_tiles.label_tiles_dark.is_some()
     }
 
     /// Record that the arm for `kind` drew pane `pane_idx` into `rect`.
@@ -2765,6 +2799,121 @@ mod pane_slice_tests {
 
         assert_eq!(gui.pane(0).unwrap().kind(), PaneKind::Map);
         assert_eq!(gui.pending_pane_kind_for_test(), None);
+    }
+
+    /// Converting a pane keeps everything it was looking at, and tears down the
+    /// one thing a non-map pane cannot have: a running animation loop.
+    ///
+    /// The root fix for a family of eight consumers with one cause. A loop left
+    /// running on a pane nothing renders frames for is not idle: it blocks every
+    /// *other* pane's loop through `sync_loop_playback_start`'s all-or-nothing
+    /// rule, keeps `Gui::any_loop_active` true so the event loop wakes at loop
+    /// frame rate, reads "Rendering n/m" for ever with no transport drawn to
+    /// cancel it, and goes on spending the shared download budget. Enforced at the
+    /// transition so the state is not representable, rather than filtered at each
+    /// consumer. `SwitchRadarSite` resets `loop_state` for the same reason.
+    ///
+    /// The counterweight matters as much: every *other* field must survive, which
+    /// is the promise `set_kind` exists to make.
+    #[test]
+    fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
+        use crate::pane::{LoopPhase, PaneKind};
+
+        for kind in [PaneKind::CrossSection, PaneKind::Volume] {
+            let mut gui = Gui::new();
+            {
+                let pane = gui.pane_mut(0).unwrap();
+                pane.site = "KDDC".to_owned();
+                pane.selected_product = RadarProduct::Velocity;
+                pane.selected_elevation = 1.5;
+                pane.viewing_live = false;
+                pane.time_step_secs = 1800;
+                pane.loop_state.phase = LoopPhase::Playing;
+                assert!(
+                    pane.loop_state.is_active(),
+                    "precondition: the loop must be running, or there is nothing \
+                     to tear down"
+                );
+            }
+
+            gui.pane_mut(0).unwrap().set_kind(kind);
+
+            let pane = gui.pane(0).unwrap();
+            assert!(
+                !pane.loop_state.is_active(),
+                "{kind:?}: the loop survived, so it will hold every other pane's \
+                 loop back and never finish"
+            );
+            assert_eq!(pane.site, "KDDC", "{kind:?}: the site went with the loop");
+            assert_eq!(pane.selected_product, RadarProduct::Velocity);
+            assert_eq!(pane.selected_elevation, 1.5);
+            assert!(!pane.viewing_live);
+            assert_eq!(pane.time_step_secs, 1800);
+
+            // …and converting back does not resurrect it. A torn-down loop is torn
+            // down; re-enabling it is the transport's job.
+            gui.pane_mut(0).unwrap().set_kind(PaneKind::Map);
+            assert!(!gui.pane(0).unwrap().loop_state.is_active());
+        }
+    }
+
+    /// Overlay auto-poll and the pane a fetch is attributed to both skip panes
+    /// with no map, while the panes keep their layer toggles.
+    ///
+    /// Both questions are "is this overlay being *drawn* anywhere?", and every
+    /// overlay is a layer over map tiles positioned against a projector a non-map
+    /// pane does not have — so a converted pane must not keep an auto-poll timer
+    /// alive or be handed a `FetchOverlay`.
+    ///
+    /// `enabled_overlays` is deliberately *not* cleared, which is the second half
+    /// here: it is the user's remembered answer to "which layers do I want", it
+    /// becomes meaningful again the moment the pane converts back, and it is the
+    /// same choice `set_kind` makes about the viewport and the tilt.
+    #[test]
+    fn overlay_polling_skips_panes_with_no_map_but_keeps_their_toggles() {
+        use crate::pane::PaneKind;
+
+        let kind = OverlayKind::CityLabels;
+        let mut gui = Gui::new();
+        gui.set_pane_count_for_test(2);
+        for idx in 0..2 {
+            gui.pane_mut(idx)
+                .unwrap()
+                .enabled_overlays
+                .insert(kind, true);
+        }
+        assert!(
+            gui.any_pane_has_overlay_enabled(kind),
+            "precondition: two map panes want the layer"
+        );
+        assert_eq!(gui.first_pane_with_overlay_enabled(kind), Some(0));
+
+        gui.pane_mut(0).unwrap().set_kind(PaneKind::Volume);
+        assert_eq!(
+            gui.first_pane_with_overlay_enabled(kind),
+            Some(1),
+            "a fetch was attributed to a pane that cannot draw the overlay"
+        );
+        assert!(gui.any_pane_has_overlay_enabled(kind));
+
+        gui.pane_mut(1).unwrap().set_kind(PaneKind::CrossSection);
+        assert!(
+            !gui.any_pane_has_overlay_enabled(kind),
+            "no pane on screen can draw this overlay, yet its auto-poll timer is \
+             still being kept alive"
+        );
+        assert_eq!(gui.first_pane_with_overlay_enabled(kind), None);
+
+        // The toggles themselves are untouched, so converting back restores the
+        // layer rather than losing the user's choice.
+        for idx in 0..2 {
+            assert!(
+                gui.pane(idx).unwrap().is_overlay_enabled(kind),
+                "pane {idx} lost its remembered layer choice"
+            );
+        }
+        gui.pane_mut(0).unwrap().set_kind(PaneKind::Map);
+        assert_eq!(gui.first_pane_with_overlay_enabled(kind), Some(0));
     }
 
     /// A pane with no map neither drives the shared viewport nor follows it.

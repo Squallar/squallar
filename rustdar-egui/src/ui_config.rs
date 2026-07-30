@@ -452,13 +452,14 @@ impl super::Gui {
             {
                 legacy_radar_enabled = Some(enabled);
             }
-            // Assigned as a whole rather than through `PaneState::set_kind`,
-            // because the kind and the per-kind state arrive together and
-            // `restore_content` has already decided both. This is also the one
-            // legitimate writer of `content` outside the UI pass — the deferred
-            // `Gui::request_pane_kind` exists for the writers *inside* it, where
-            // the pane may be `mem::take`n.
-            pane.content = restore_content(i, pc, count);
+            // `set_content` rather than a write to `content`, because the kind and
+            // the per-kind state arrive together here and `restore_content` has
+            // already decided both — and because that setter is what enforces what
+            // a kind implies, so a restored non-map pane arrives with the same
+            // invariants as a converted one. This is the legitimate writer outside
+            // the UI pass; `Gui::request_pane_kind` exists for the writers *inside*
+            // it, where the pane may be `mem::take`n.
+            pane.set_content(restore_content(i, pc, count));
             pane.draw_order = reconcile_draw_order(&pc.draw_order);
             // Restore per-pane overlay enabled state.
             if !pc.enabled_overlays.is_empty() {
@@ -1032,6 +1033,50 @@ mod tests {
         );
         assert_eq!(restored.pane(0).unwrap().map_memory.zoom(), 7.0);
         assert_eq!(restored.pane(1).unwrap().site, "KOUN");
+    }
+
+    /// A restored non-map pane arrives with the same invariants as a converted
+    /// one: no running loop.
+    ///
+    /// The loader goes through `PaneState::set_content` rather than writing
+    /// `content`, so that the teardown a kind change implies has exactly one
+    /// description — see `PaneState::set_kind` for what a loop left running on a
+    /// pane nothing renders frames for actually does, which includes stopping
+    /// every *other* pane's loop from ever starting.
+    ///
+    /// The pane is given a live loop first, which the startup path cannot
+    /// currently produce (the config is loaded into a fresh `Gui`). That is the
+    /// point: the invariant belongs to the setter rather than to the sequence its
+    /// callers happen to run in today.
+    #[test]
+    fn a_restored_non_map_pane_has_no_running_loop() {
+        use crate::pane::{LoopPhase, PaneKind};
+
+        let store = MemoryConfigStore::default();
+        store
+            .store(
+                UI_CONFIG_KEY,
+                r#"{"pane_count":1,"site":"KTLX","panes":[
+                    {"kind":"Volume","volume":
+                        {"yaw_deg":225.0,"pitch_deg":25.0,"eye_distance":2.5}}]}"#,
+            )
+            .unwrap();
+
+        let mut restored = crate::Gui::new();
+        restored.pane_mut(0).unwrap().loop_state.phase = LoopPhase::Playing;
+        assert!(
+            restored.pane(0).unwrap().loop_state.is_active(),
+            "precondition: the loop must be running before the load"
+        );
+
+        restored.load_ui_config(&store);
+
+        assert_eq!(restored.pane(0).unwrap().kind(), PaneKind::Volume);
+        assert!(
+            !restored.pane(0).unwrap().loop_state.is_active(),
+            "a restored 3D pane came back with a loop nothing will ever render \
+             frames for, which holds every other pane's loop back too"
+        );
     }
 
     /// A finite camera outside the documented range is clamped, not discarded.

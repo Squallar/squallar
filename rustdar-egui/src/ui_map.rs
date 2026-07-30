@@ -56,12 +56,18 @@ impl super::Gui {
 
         // Initialize tiles via MapTileState
         self.map_tiles.ensure_base_tiles(is_dark_theme, &ctx);
-        // Visible panes only (`Gui::panes`): a pane remembered from a wider
-        // split must not keep label-tile fetching alive.
+        // Visible *map* panes only. `Gui::panes` because a pane remembered from a
+        // wider split must not keep label-tile fetching alive; `is_map` for the
+        // same reason and one more — a pane with no tiles has nowhere to put a
+        // label, so a converted pane would go on fetching a tile pyramid nothing
+        // draws. Its `enabled_overlays` is left as it is, so converting back
+        // restores the layer: see `Gui::any_pane_has_overlay_enabled`.
+        //
+        // Read before the pane loop's `mem::take`, so the kind is the real one.
         let any_city_labels = self
             .panes()
             .iter()
-            .any(|p| p.is_overlay_enabled(OverlayKind::CityLabels));
+            .any(|p| p.is_map() && p.is_overlay_enabled(OverlayKind::CityLabels));
         if any_city_labels {
             self.map_tiles.ensure_label_tiles(is_dark_theme, &ctx);
         }

@@ -5614,7 +5614,56 @@ mod tests {
         }
     }
 
-    /// 45. **A non-map pane's product picker survives the Radar layer being off.**
+    /// 45. **A pane with no map does not keep the label-tile pyramid downloading.**
+    ///
+    ///     City labels are raster tiles drawn *over* the base map, so a pane with
+    ///     no tiles has nowhere to put one — yet its `enabled_overlays` is
+    ///     inherited across the conversion and still says the layer is on, which is
+    ///     what kept `ensure_label_tiles` fetching. Mild in itself; it is here
+    ///     because it is the same shape as the overlay auto-poll gate, which is
+    ///     not mild, and because the two must agree.
+    ///
+    ///     `clear_graphics_state` in the middle of each arm, because
+    ///     `ensure_label_tiles` only ever *creates* the source — a harness that
+    ///     had already made them would keep them and prove nothing. That is not a
+    ///     contrivance either: dropping the tile sources and letting the next
+    ///     frame re-make them is exactly what a suspend or a surface loss does.
+    #[test]
+    fn a_pane_with_no_map_stops_the_label_tiles_downloading() {
+        fn tiles_remade_after_a_reset(h: &mut InputHarness) -> bool {
+            h.gui_mut().clear_graphics_state();
+            assert!(
+                !h.gui.label_tiles_made_for_test(),
+                "precondition: the reset must really have dropped the tile sources"
+            );
+            h.frames_for(2, FRAME_DT);
+            h.gui.label_tiles_made_for_test()
+        }
+
+        let mut on_a_map = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
+        on_a_map.set_overlay_on_pane(0, OverlayKind::CityLabels, true);
+        assert!(
+            tiles_remade_after_a_reset(&mut on_a_map),
+            "precondition: a map pane with city labels on must fetch label tiles"
+        );
+
+        let mut converted = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
+        converted.set_overlay_on_pane(0, OverlayKind::CityLabels, true);
+        converted.make_pane_volume(0);
+        assert!(
+            converted.overlay_enabled(OverlayKind::CityLabels),
+            "precondition: the pane still *remembers* wanting labels, which is what \
+             makes this a filter rather than a cleared flag"
+        );
+
+        assert!(
+            !tiles_remade_after_a_reset(&mut converted),
+            "a pane with no map to draw labels on kept the label-tile pyramid \
+             downloading"
+        );
+    }
+
+    /// 46. **A non-map pane's product picker survives the Radar layer being off.**
     ///
     ///     The picker used to be gated on `is_overlay_enabled(OverlayKind::Radar)`,
     ///     which asks whether the *map* should draw the radar image over its tiles.
@@ -5650,7 +5699,7 @@ mod tests {
         );
     }
 
-    /// 46. **Converting the active pane does not re-key the drawer menu.**
+    /// 47. **Converting the active pane does not re-key the drawer menu.**
     ///
     ///     The layers panel's kind-specific block sits inside a `scope_builder`
     ///     with an explicit `UiBuilder::id`, and this is why. `Ui::new_child` folds
@@ -5704,7 +5753,7 @@ mod tests {
         );
     }
 
-    /// 47. **Converting a pane must not move any widget's egui `Id`.**
+    /// 48. **Converting a pane must not move any widget's egui `Id`.**
     ///
     ///     The `"pane_map"` id salt is a key, not a description: every widget
     ///     inside a pane derives its `Id` from it, so egui's memory of what the

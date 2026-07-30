@@ -636,8 +636,9 @@ impl App {
                 ))
             });
             if let Some(state) = new_state {
+                let ctx = state.egui_renderer.context().clone();
                 self.state = Some(state);
-                self.restore_cached_render();
+                self.restore_cached_render(&ctx);
             }
         }
     }
@@ -657,8 +658,9 @@ impl App {
             match rx.try_recv() {
                 Ok(state) => {
                     self.pending_state = None;
+                    let ctx = state.egui_renderer.context().clone();
                     self.state = Some(state);
-                    self.restore_cached_render();
+                    self.restore_cached_render(&ctx);
                 }
                 // Still running — nothing to do until the redraw it will post.
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
