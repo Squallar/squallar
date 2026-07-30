@@ -489,9 +489,17 @@ impl VolumePipelines {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: OFFSCREEN_FORMAT,
+            // `COPY_SRC` and `COPY_DST` are for the tests, and worth the two
+            // words: they are what lets `tests/volume_gpu.rs` read a rendered
+            // frame back and seed a known premultiplied value without a
+            // raymarch in the way. The second is what makes the blit's
+            // zero-delta comparison against egui's own `rect_filled` possible
+            // at all, and that comparison is the only evidence for the
+            // counter-intuitive sRGB rule.
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
