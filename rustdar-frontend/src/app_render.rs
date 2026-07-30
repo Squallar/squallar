@@ -834,7 +834,7 @@ impl super::App {
         // Finish egui's pass and upload its textures, THEN ask for a surface.
         // The order is enforced by data flow, not by the order of these lines:
         // acquisition takes the finished pass as an argument. See the helper.
-        let (frame, status) = finish_then_acquire(
+        let (mut frame, status) = finish_then_acquire(
             || {
                 state.egui_renderer.end_pass_and_upload(
                     &state.device,
@@ -855,7 +855,7 @@ impl super::App {
                 // re-send them. Submitting the encoder flushes them, and the
                 // retired textures are safe to free because nothing painted with
                 // them this frame.
-                state.queue.submit(Some(encoder.finish()));
+                frame.submit(&state.queue, encoder);
                 state.egui_renderer.free_textures(frame.textures_to_free());
 
                 if matches!(status, SurfaceStatus::Lost) {
@@ -881,7 +881,7 @@ impl super::App {
             .egui_renderer
             .draw(&mut encoder, &surface_view, &frame);
 
-        state.queue.submit(Some(encoder.finish()));
+        frame.submit(&state.queue, encoder);
         state.egui_renderer.free_textures(frame.textures_to_free());
         surface_texture.present();
     }

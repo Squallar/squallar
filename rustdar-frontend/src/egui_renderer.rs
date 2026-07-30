@@ -24,12 +24,57 @@ pub struct PreparedFrame {
     screen_descriptor: ScreenDescriptor,
     /// Textures egui retired this frame.
     textures_to_free: Vec<egui::TextureId>,
+    /// Command buffers egui collected from this frame's paint callbacks.
+    ///
+    /// `egui_wgpu::Renderer::update_buffers` returns whatever every
+    /// [`egui_wgpu::CallbackTrait::prepare`] and `finish_prepare` handed back
+    /// (`egui-wgpu-0.35.0/src/renderer.rs:1050-1075`), and that return is *not*
+    /// `#[must_use]`. This field exists because dropping it — which this code did
+    /// until the fix — means a callback recording into its own command buffers
+    /// renders nothing at all, with no validation error and no warning anywhere.
+    ///
+    /// Drained by [`PreparedFrame::submit`].
+    user_command_buffers: Vec<wgpu::CommandBuffer>,
+}
+
+/// Order a frame's command buffers the way egui-wgpu documents.
+///
+/// The callbacks' buffers go first and egui's own last. This is not cosmetic:
+/// a callback's `prepare` exists to produce the resources its `paint` then reads
+/// inside egui's render pass, so submitting egui's buffer first would run the
+/// paint against whatever the callback's target held on the *previous* frame.
+///
+/// Generic over the buffer type purely so the ordering can be unit-tested
+/// without a GPU — the order is the one thing here a refactor can quietly
+/// invert. It matches `egui_wgpu`'s own painter, which submits
+/// `chain(user_cmd_bufs, [encoded])` (`egui-wgpu-0.35.0/src/winit.rs:733`).
+fn submission_order<T>(callbacks: Vec<T>, egui: T) -> Vec<T> {
+    let mut ordered = callbacks;
+    ordered.push(egui);
+    ordered
 }
 
 impl PreparedFrame {
     /// Textures egui retired this frame, to be freed once the GPU is done.
     pub fn textures_to_free(&self) -> &[egui::TextureId] {
         &self.textures_to_free
+    }
+
+    /// Submit every command buffer this frame recorded, egui's included.
+    ///
+    /// Takes the encoder **by value** so that finishing egui's own commands and
+    /// submitting the callbacks' cannot be separated: there is no way to reach
+    /// `encoder.finish()` through this type without also handing over
+    /// [`Self::user_command_buffers`]. That is the shape of the guarantee, and
+    /// `the_frame_path_submits_only_through_prepared_frame` is what keeps the
+    /// caller from routing round it.
+    ///
+    /// Safe to call on the frame that never acquired a surface, too: egui's
+    /// uploads still have to land, and a callback that recorded work for a frame
+    /// nobody draws still has to be flushed rather than leaked.
+    pub fn submit(&mut self, queue: &Queue, encoder: CommandEncoder) {
+        let callbacks = std::mem::take(&mut self.user_command_buffers);
+        queue.submit(submission_order(callbacks, encoder.finish()));
     }
 }
 
@@ -157,8 +202,12 @@ impl EguiRenderer {
             self.renderer
                 .update_texture(device, queue, *id, image_delta);
         }
-        self.renderer
-            .update_buffers(device, queue, encoder, &tris, &screen_descriptor);
+        // `update_buffers` also dispatches every paint callback's `prepare` and
+        // `finish_prepare`, and returns the command buffers they produced. The
+        // return must be carried to the submit — see `user_command_buffers`.
+        let user_command_buffers =
+            self.renderer
+                .update_buffers(device, queue, encoder, &tris, &screen_descriptor);
 
         PreparedFrame {
             tris,
@@ -166,6 +215,7 @@ impl EguiRenderer {
             // Freed by the caller AFTER queue.submit(), to avoid destroying GPU
             // resources still referenced by the recorded render pass.
             textures_to_free: full_output.textures_delta.free,
+            user_command_buffers,
         }
     }
 
@@ -223,6 +273,283 @@ impl EguiRenderer {
 
 #[cfg(test)]
 mod tests {
+    use super::submission_order;
+    #[cfg(not(target_arch = "wasm32"))]
+    use super::{PreparedFrame, Renderer, ScreenDescriptor, TextureFormat, wgpu};
+
+    /// A named function's body, read out of a source file this crate ships.
+    ///
+    /// `end_pass_and_upload` and `present_frame` both need a real `Window`, a
+    /// wgpu device and a swapchain, so no host test can run either. Reading the
+    /// source is the only handle there is — the same technique the `begin_frame`
+    /// assertions below already rely on.
+    fn body_of(source: &'static str, signature: &str) -> &'static str {
+        source
+            .split_once(signature)
+            .and_then(|(_, rest)| rest.split_once("\n    }"))
+            .map(|(body, _)| body)
+            .unwrap_or_else(|| panic!("`{signature}` is no longer a method there"))
+    }
+
+    /// The callbacks' command buffers must precede egui's own.
+    ///
+    /// A callback's `prepare` records the work its `paint` then reads inside
+    /// egui's render pass. Submitting egui's buffer first would paint against
+    /// whatever the callback's target held on the previous frame — plausible
+    /// output, one frame stale, and no error anywhere. `chain` is a one-token
+    /// edit away from being reversed, so pin the order itself.
+    #[test]
+    fn the_callbacks_command_buffers_are_submitted_before_eguis() {
+        assert_eq!(
+            submission_order(vec!["callback 0", "callback 1"], "egui"),
+            vec!["callback 0", "callback 1", "egui"],
+        );
+    }
+
+    /// With no callbacks, egui's buffer is still submitted, and alone.
+    ///
+    /// This is every frame rustdar draws today, so it is the case that must not
+    /// regress while the volume view is being built.
+    #[test]
+    fn a_frame_with_no_callbacks_still_submits_eguis_own_buffer() {
+        assert_eq!(submission_order(Vec::new(), "egui"), vec!["egui"]);
+    }
+
+    /// `update_buffers`' return must be bound and carried, not dropped.
+    ///
+    /// This is a real defect that shipped: `egui_wgpu::Renderer::update_buffers`
+    /// returns the `Vec<wgpu::CommandBuffer>` it gathered from every
+    /// `CallbackTrait::prepare` and `finish_prepare`, the return is not
+    /// `#[must_use]`, and this function discarded it. Nothing warned, and nothing
+    /// could fail — until a callback exists, at which point its work is silently
+    /// never submitted and it renders nothing.
+    ///
+    /// There is no callback in the crate yet, so no behavioural test can see the
+    /// regression; the assertion is that the value is bound and reaches the
+    /// returned frame.
+    #[test]
+    fn end_pass_and_upload_carries_the_callback_command_buffers() {
+        let body = body_of(
+            include_str!("egui_renderer.rs"),
+            "pub fn end_pass_and_upload(",
+        );
+        let call = body
+            .find("update_buffers(")
+            .expect("end_pass_and_upload no longer calls update_buffers");
+
+        // The whole statement the call sits in — from the previous statement
+        // boundary to its own `;`. Not the line: rustfmt is free to wrap the
+        // binding onto a line of its own, and it does.
+        let statement_start = body[..call].rfind(';').map_or(0, |semi| semi + 1);
+        let statement = body[statement_start..]
+            .split_once(';')
+            .map(|(head, _)| head)
+            .expect("the update_buffers call is not a statement");
+        assert!(
+            statement.contains("let user_command_buffers"),
+            "update_buffers' returned command buffers are discarded again. Any \
+             CallbackTrait::prepare that records into them then renders nothing, \
+             silently — the return is not #[must_use]. Found: {statement:?}"
+        );
+
+        assert!(
+            body.contains("user_command_buffers,"),
+            "end_pass_and_upload binds the callback command buffers but does not \
+             put them on the PreparedFrame it returns, so they are dropped one \
+             line later instead of at the call"
+        );
+    }
+
+    /// The frame path must submit through [`super::PreparedFrame::submit`].
+    ///
+    /// `submit` takes the encoder by value, so it is impossible to submit egui's
+    /// buffer *through it* without the callbacks' — but that only closes the door
+    /// on the type level for callers that use it. A caller can still write
+    /// `queue.submit(Some(encoder.finish()))` itself, which is exactly the
+    /// pre-fix code and compiles clean. There are two submit sites (the frame
+    /// that acquired a surface and the frame that did not) and both matter: a
+    /// callback that recorded work for a frame nobody draws still has to be
+    /// flushed rather than leaked.
+    #[test]
+    fn the_frame_path_submits_only_through_prepared_frame() {
+        let body = body_of(
+            include_str!("app_render.rs"),
+            "pub(super) fn present_frame(",
+        );
+
+        let submits = body.matches("frame.submit(").count();
+        assert_eq!(
+            submits, 2,
+            "present_frame should submit through PreparedFrame::submit exactly \
+             twice — once for the frame that got a surface and once for the \
+             frame that did not — found {submits}"
+        );
+        assert!(
+            !body.contains("encoder.finish()"),
+            "present_frame finishes the encoder itself instead of handing it to \
+             PreparedFrame::submit, which skips the paint callbacks' command \
+             buffers entirely"
+        );
+    }
+
+    /// A callback's own command buffer reaches the queue, on a real device.
+    ///
+    /// The end-to-end version of the defect above, and the only test that can
+    /// distinguish "recorded" from "executed": the callback's `prepare` copies a
+    /// sentinel between two buffers using a command buffer of its own, and the
+    /// sentinel is only readable back if that buffer was submitted. Before the
+    /// fix, `update_buffers`' return was dropped and this read zeroes.
+    ///
+    /// Deliberately does *not* cover the wiring inside `end_pass_and_upload` and
+    /// `present_frame` — both need a real `Window` and a swapchain. That half is
+    /// what `end_pass_and_upload_carries_the_callback_command_buffers` and
+    /// `the_frame_path_submits_only_through_prepared_frame` pin.
+    ///
+    /// Needs a real adapter, so it is ignored by default. CI has no GPU:
+    ///
+    /// ```text
+    /// cargo test -p rustdar-frontend --lib \
+    ///     egui_renderer::tests::a_paint_callbacks_own_command_buffer_reaches_the_queue \
+    ///     -- --ignored --exact --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn a_paint_callbacks_own_command_buffer_reaches_the_queue() {
+        /// Anything but zero, so a buffer that was never written is telling.
+        const SENTINEL: u32 = 0xC0FF_EE01;
+
+        /// Copies [`SENTINEL`] from `source` into `landing` — in a command buffer
+        /// of its own, which is the mechanism under test. Recording into the
+        /// `egui_encoder` argument instead would pass even with the defect
+        /// present, because that encoder was always submitted.
+        struct SentinelCallback {
+            source: wgpu::Buffer,
+            landing: wgpu::Buffer,
+        }
+
+        impl egui_wgpu::CallbackTrait for SentinelCallback {
+            fn prepare(
+                &self,
+                device: &wgpu::Device,
+                _queue: &wgpu::Queue,
+                _screen_descriptor: &ScreenDescriptor,
+                _egui_encoder: &mut wgpu::CommandEncoder,
+                _resources: &mut egui_wgpu::CallbackResources,
+            ) -> Vec<wgpu::CommandBuffer> {
+                let mut own = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("rustdar.volume.test.sentinel"),
+                });
+                own.copy_buffer_to_buffer(&self.source, 0, &self.landing, 0, 4);
+                vec![own.finish()]
+            }
+
+            fn paint(
+                &self,
+                _info: egui::epaint::PaintCallbackInfo,
+                _pass: &mut wgpu::RenderPass<'static>,
+                _resources: &egui_wgpu::CallbackResources,
+            ) {
+                // Nothing to draw: this test never records egui's render pass.
+            }
+        }
+
+        // Same constructor the app uses, so `WGPU_BACKEND` selects the backend
+        // here too.
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::default(),
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        }))
+        .expect("no wgpu adapter; this test is ignored by default for that reason");
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default()))
+            .expect("could not create a device on an adapter that was found");
+
+        let buffer = |label: &str, usage| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: 4,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let source = buffer(
+            "sentinel source",
+            wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        );
+        let landing = buffer(
+            "sentinel landing",
+            wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        );
+        let readback = buffer(
+            "sentinel readback",
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        );
+        queue.write_buffer(&source, 0, &SENTINEL.to_le_bytes());
+
+        let mut renderer = Renderer::new(
+            &device,
+            TextureFormat::Rgba8Unorm,
+            egui_wgpu::RendererOptions::default(),
+        );
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels: [64, 64],
+            pixels_per_point: 1.0,
+        };
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(64.0, 64.0));
+        let tris = vec![egui::ClippedPrimitive {
+            clip_rect: rect,
+            primitive: egui::epaint::Primitive::Callback(egui_wgpu::Callback::new_paint_callback(
+                rect,
+                SentinelCallback {
+                    source,
+                    landing: landing.clone(),
+                },
+            )),
+        }];
+
+        // The two production lines this test can reach: capture, then submit.
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let user_command_buffers =
+            renderer.update_buffers(&device, &queue, &mut encoder, &tris, &screen_descriptor);
+        assert_eq!(
+            user_command_buffers.len(),
+            1,
+            "egui did not gather the callback's command buffer at all, so this \
+             test cannot say anything about submission"
+        );
+        let mut frame = PreparedFrame {
+            tris,
+            screen_descriptor,
+            textures_to_free: Vec::new(),
+            user_command_buffers,
+        };
+        frame.submit(&queue, encoder);
+
+        let mut readback_encoder = device.create_command_encoder(&Default::default());
+        readback_encoder.copy_buffer_to_buffer(&landing, 0, &readback, 0, 4);
+        queue.submit(Some(readback_encoder.finish()));
+        readback.slice(..).map_async(wgpu::MapMode::Read, |r| {
+            r.expect("mapping the readback buffer failed");
+        });
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("polling the device failed");
+
+        let mapped = readback.slice(..).get_mapped_range();
+        let landed = u32::from_le_bytes(
+            <[u8; 4]>::try_from(&mapped[..4]).expect("the readback buffer is 4 bytes"),
+        );
+        assert_eq!(
+            landed, SENTINEL,
+            "the callback's command buffer never executed. egui returns it from \
+             update_buffers and that return is not #[must_use], so dropping it \
+             leaves a callback rendering nothing with no error anywhere."
+        );
+    }
+
     /// `begin_frame`'s body, read out of this file's own source.
     ///
     /// `begin_frame` needs a real `Window` and a wgpu device, so no unit test
@@ -230,11 +557,7 @@ mod tests {
     /// observe that this function calls them. Reading the source is the only
     /// handle there is.
     fn begin_frame_body() -> &'static str {
-        include_str!("egui_renderer.rs")
-            .split_once("pub fn begin_frame(")
-            .and_then(|(_, rest)| rest.split_once("\n    }"))
-            .map(|(body, _)| body)
-            .expect("begin_frame is no longer a method here")
+        body_of(include_str!("egui_renderer.rs"), "pub fn begin_frame(")
     }
 
     /// Both input rewrites must precede `begin_pass`, and only this file says so.
