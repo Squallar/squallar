@@ -711,6 +711,28 @@ mod tests {
             .collect()
     }
 
+    /// The name of every `pub const` whose wasm32 arm this file declares,
+    /// sorted and deduplicated.
+    ///
+    /// Keyed on the wasm32 arm because that is the one no build on this machine
+    /// compiles. Two-arm `mobile` / `not(mobile)` cascades — the download and
+    /// render-cache caps — have no `target_arch` arm at all and so are not
+    /// device-class cascades in this sense.
+    fn wasm_gated_constants(code: &str) -> Vec<&str> {
+        let lines: Vec<&str> = code.lines().collect();
+        let mut names: Vec<&str> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim() == r#"#[cfg(target_arch = "wasm32")]"#)
+            .filter_map(|(i, _)| lines.get(i + 1)?.strip_prefix("pub const "))
+            .filter_map(|rest| rest.split_once(':'))
+            .map(|(name, _)| name)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
     /// Every `cfg` arm selects the constant named for *its own* device class.
     ///
     /// `every_cascade_in_this_file_selected_the_same_arm` covers this for the
@@ -748,14 +770,39 @@ mod tests {
             ),
         ];
 
-        for name in [
+        let covered = [
             "MAX_CONCURRENT_RENDERS",
             "MAX_LOOP_RENDER_BUDGET",
             "MAX_LOOP_FRAMES",
             "LOOP_TEXTURE_BUDGET_BYTES",
             "VOLUME_GRID_CELLS",
             "VOLUME_TEXTURE_BUDGET_BYTES",
-        ] {
+        ];
+
+        // Cascades that still spell their arms as literals, and so cannot be
+        // checked here. Written down rather than left implicit: a test named
+        // "every cfg arm" that silently covered six of seven would be the same
+        // shape of vacuity it exists to catch.
+        //
+        // `VOLUME_OFFSCREEN_BUDGET_BYTES` landed while this test was being
+        // written. Lifting it means parameterising `quality::reference_offscreen`
+        // and `quality::PLATFORM_CEILING` on the device class, which is a
+        // different change to a different module.
+        let exempt = ["VOLUME_OFFSCREEN_BUDGET_BYTES"];
+
+        // Every three-arm cascade in the file is one or the other, so adding a
+        // new one is a failure here rather than a silent gap.
+        let found = wasm_gated_constants(code);
+        let mut accounted: Vec<&str> = covered.iter().chain(exempt.iter()).copied().collect();
+        accounted.sort_unstable();
+        assert_eq!(
+            found, accounted,
+            "the set of `cfg`-selected constants in this file has changed. A \
+             new one has to be lifted into named arms and listed in `covered`, \
+             or listed in `exempt` with the reason it cannot be."
+        );
+
+        for name in covered {
             let arms = cascade_arms(code, name);
             assert_eq!(
                 arms.len(),
