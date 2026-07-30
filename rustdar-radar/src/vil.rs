@@ -320,9 +320,9 @@
 //! * **The pipeline's invariants, asserted on every run** — both PDBs naming one
 //!   volume scan inside [`crate::vild::VOLUME_PAIRING_TOLERANCE_SECS`], defined
 //!   cells finite and non-negative, nothing past
-//!   [`vild_validation_policy::PLAUSIBLE_MAX_G_M3`], which is set at four times
-//!   the reference's *own* recorded extreme (KDDC's 12.06 g/m³) rather than at
-//!   what we expect of it.
+//!   [`vild_validation_policy::PLAUSIBLE_MAX_G_M3`], which is set at roughly
+//!   four times the largest value the RPG has been recorded producing (KDDC's
+//!   12.06 g/m³, KEAX's 12.80) rather than at what we expect of it.
 //! * **The threshold and skill figures, reported on every run and asserted only
 //!   where the sample is conclusive** — at the breaks whose reference-flagged
 //!   population clears [`vild_validation_policy::MIN_FLAGGED_CELLS`]. Elsewhere
@@ -1919,10 +1919,12 @@ pub(crate) mod vild_validation_policy {
     ///
     /// The **reference's own behaviour** sets the scale, not our expectation of
     /// it: the 2026-07-29 run recorded a legitimate **12.06 g/m³** maximum at
-    /// KDDC on a hail day — a large published `DVL` over a low published `EET`,
-    /// reproduced cell for cell on both sides of the comparison, and three
-    /// times Amburn & Wolf's near-certain break. This bound sits at four times
-    /// that recorded maximum, so real RPG extremes pass it. What it catches is
+    /// KDDC on a hail day and **12.80** at KEAX the same hour — a large
+    /// published `DVL` over a low published `EET`, reproduced cell for cell on
+    /// both sides of the comparison, and three times Amburn & Wolf's
+    /// near-certain break. This bound sits at roughly four times the largest
+    /// value the RPG has been recorded producing, so real RPG extremes pass it
+    /// and only a defect fails it. What it catches is
     /// the gross class of defect: a denominator left in kilofeet instead of
     /// metres (~300× high), an echo top read as metres, a numerator taken off
     /// raw gate bytes instead of through product 134's hybrid LUT. A 1.5%
@@ -2458,22 +2460,23 @@ mod vild_policy_tests {
     /// The invariant leg: `NaN` is this product's "undefined" and not a
     /// violation, while a negative value, an infinity or an implausible
     /// magnitude is. The bound accommodates the **reference's own** recorded
-    /// extreme — 12.06 g/m³ at KDDC on 2026-07-29 — rather than our
-    /// expectation of it.
+    /// extremes — 12.06 g/m³ at KDDC and 12.80 at KEAX on 2026-07-29 — rather
+    /// than our expectation of them.
     #[test]
     fn the_invariant_leg_admits_the_rpgs_own_extremes_and_nothing_absurd() {
-        let real = vec![vec![0.0f32, 0.31, 3.533_212, f32::NAN, 12.06]];
+        let real = vec![vec![0.0f32, 0.31, 3.533_212, f32::NAN, 12.06, 12.80]];
         let i = policy::field_invariants(&real);
         assert!(i.hold(), "{i:?}");
-        assert_eq!(i.defined, 4, "the NaN is undefined, not a violation");
+        assert_eq!(i.defined, 5, "the NaN is undefined, not a violation");
         assert_eq!(i.negative, 0);
         assert_eq!(i.infinite, 0);
         assert_eq!(i.above_bound, 0);
         assert_eq!(i.min, 0.0);
-        assert!((i.max - 12.06).abs() < 1e-4);
+        assert!((i.max - 12.80).abs() < 1e-4);
         assert!(
             i.max <= policy::PLAUSIBLE_MAX_G_M3,
-            "the bound must admit the RPG's own recorded KDDC maximum of {}",
+            "the bound must admit the largest value the RPG has been recorded \
+             producing, {}",
             i.max,
         );
 
