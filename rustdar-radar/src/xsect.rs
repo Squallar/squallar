@@ -705,7 +705,10 @@ mod tests {
 
     /// KTLX, whose elevation `eet::radar_height_ft_near` reports as 1213 ft.
     const SITE: (f64, f64) = (35.3333, -97.2778);
-    const SITE_ELEV_KM: f64 = 1213.0 * FT_TO_KM;
+    /// The conversion is written out rather than taken from [`FT_TO_KM`], so
+    /// that an edit to the module's factor fails here instead of moving the
+    /// expected value along with the measured one.
+    const SITE_ELEV_KM: f64 = 1213.0 * 0.000_304_8;
 
     /// Raw code for a range-folded gate. Not a magic 1: the sampler's decoder
     /// reads it as [`SampleStatus::RangeFolded`] and this is the only way to
@@ -961,6 +964,36 @@ mod tests {
                     .total_cmp(&(axes.row_height_km_msl(b) - height_km_msl).abs())
             })
             .expect("the raster has rows")
+    }
+
+    // ── The raster's shape and its two axis mappings ────────────────────────
+
+    /// The raster is `IMAGE_SIZE` by half of it, and that is what buys the
+    /// WebGL2 argument for free.
+    ///
+    /// Pinned because the two constants are the load-bearing half of "the UI
+    /// does not clamp against `max_texture_side`": if either stopped being a
+    /// power of two at or under 2048, a section would start failing to upload
+    /// on a device that reports the GLES 3.0 floor, and nothing in this crate
+    /// would notice.
+    #[test]
+    fn the_raster_is_a_half_height_image_size_and_fits_the_webgl2_floor() {
+        assert_eq!(SECTION_WIDTH, types::IMAGE_SIZE);
+        assert_eq!(SECTION_HEIGHT * 2, SECTION_WIDTH);
+        for (name, n) in [("width", SECTION_WIDTH), ("height", SECTION_HEIGHT)] {
+            assert!(
+                n.is_power_of_two(),
+                "the section {name} {n} is not a power of two"
+            );
+            assert!(n <= 2048, "the section {name} {n} exceeds the WebGL2 floor");
+            assert!(n > 0);
+        }
+        // And the target split is the one `IMAGE_SIZE` already made, not a
+        // second one: 2048 x 1024 native, 1024 x 512 on wasm.
+        #[cfg(target_arch = "wasm32")]
+        assert_eq!((SECTION_WIDTH, SECTION_HEIGHT), (1024, 512));
+        #[cfg(not(target_arch = "wasm32"))]
+        assert_eq!((SECTION_WIDTH, SECTION_HEIGHT), (2048, 1024));
     }
 
     // ── The raster's two axis mappings ──────────────────────────────────────
