@@ -428,6 +428,8 @@ pub struct VoxelGrid {
     /// *derived*. Storing either alongside the product would be two fields
     /// that can disagree.
     product: RadarProduct,
+    tilt_count: usize,
+    widest_tilt_gap_deg: f64,
 }
 
 /// One line, never the grid.
@@ -444,7 +446,8 @@ impl std::fmt::Debug for VoxelGrid {
         write!(
             f,
             "{} {}x{}x{} x{:?} y{:?} z{:?} km msl, site {:?}, range {:?}, \
-             {filled}/{} cells with data, values {}",
+             {} rungs (widest gap {:.2}°), {filled}/{} cells with data, \
+             values {}",
             self.product.code(),
             self.shape.nx,
             self.shape.ny,
@@ -454,6 +457,8 @@ impl std::fmt::Debug for VoxelGrid {
             self.z_range_km_msl,
             self.site,
             self.value_range,
+            self.tilt_count,
+            self.widest_tilt_gap_deg,
             self.indices.len(),
             if self.values.is_some() {
                 "kept"
@@ -493,6 +498,8 @@ impl PartialEq for VoxelGrid {
         }
         self.shape == other.shape
             && self.product == other.product
+            && self.tilt_count == other.tilt_count
+            && self.widest_tilt_gap_deg == other.widest_tilt_gap_deg
             && self.x_range_km == other.x_range_km
             && self.y_range_km == other.y_range_km
             && self.z_range_km_msl == other.z_range_km_msl
@@ -558,6 +565,34 @@ impl VoxelGrid {
 
     pub fn product(&self) -> RadarProduct {
         self.product
+    }
+
+    /// How many rungs the tilt ladder had when this grid was resampled.
+    ///
+    /// **Carried because the grid crosses the worker boundary and the sampler
+    /// does not.** A volume rendered from a short ladder interpolates across
+    /// whatever gap the ladder leaves and draws a smooth layer that is not
+    /// there — no error, no `NaN`, and it looks better than the truth. That is
+    /// the plan's own risk 2, and it is the reason WP-B's `SectionAxes` will
+    /// carry the same pair for a cross-section: without them the only thing
+    /// that knows is a [`crate::sampler::VolumeSampler`] that no longer
+    /// exists by the time anything is drawn.
+    ///
+    /// A ladder of **one** rung is the degenerate case and it does not
+    /// fabricate: a single beam has no vertical extent to interpolate over, so
+    /// [`crate::sampler::Column::at_height_km`] answers only at exactly that
+    /// beam's height and the grid comes back empty rather than smeared.
+    /// `a_single_tilt_volume_fills_nothing_rather_than_smearing_one_beam` pins
+    /// it.
+    pub fn tilt_count(&self) -> usize {
+        self.tilt_count
+    }
+
+    /// The largest angular step between adjacent rungs, degrees — `0.0` for a
+    /// single-rung ladder. The size of the gap
+    /// [`tilt_count`](Self::tilt_count) warns about.
+    pub fn widest_tilt_gap_deg(&self) -> f64 {
+        self.widest_tilt_gap_deg
     }
 
     /// How [`lut`](Self::lut) must be sampled. Derived from the product's
@@ -879,6 +914,8 @@ pub fn build_voxels(scan: &Scan, req: &VoxelRequest, lat: f64, lon: f64) -> Opti
         site: (lat, lon),
         value_range,
         product: req.product,
+        tilt_count: sampler.tilt_count(),
+        widest_tilt_gap_deg: sampler.widest_tilt_gap_deg(),
     })
 }
 
@@ -1677,6 +1714,63 @@ mod tests {
         assert_eq!(grid.value_at(0, 0, 7), None);
     }
 
+    /// The ladder the grid was resampled from travels with it, because the
+    /// sampler does not cross the worker boundary and the grid does.
+    #[test]
+    fn the_grid_reports_the_ladder_it_was_built_from() {
+        let scan = scan_of(&|_, _| Some(35.0));
+        let grid = build_voxels(&scan, &request(ODD), SITE.0, SITE.1).unwrap();
+        assert_eq!(grid.tilt_count(), 2);
+        assert!(
+            (grid.widest_tilt_gap_deg() - (f64::from(HIGH_DEG) - f64::from(LOW_DEG))).abs() < 1e-6,
+            "0.53° and 4.47° are 3.94° apart; reported {}",
+            grid.widest_tilt_gap_deg(),
+        );
+        // Which is a wide enough gap to be worth warning about: at 60 km a
+        // 3.94° step is over 4 km of unmeasured height.
+        assert!(grid.widest_tilt_gap_deg() > 3.0);
+
+        // And it is the sampler's own answer, not a recount.
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
+        assert_eq!(grid.tilt_count(), sampler.tilt_count());
+        assert_eq!(grid.widest_tilt_gap_deg(), sampler.widest_tilt_gap_deg());
+    }
+
+    /// A one-rung ladder is the degenerate case, and it fabricates **nothing**.
+    ///
+    /// A single beam has no vertical extent to interpolate over, so
+    /// `Column::at_height_km` answers only at exactly that beam's height —
+    /// which no cell centre lands on — and the grid comes back empty. That is
+    /// the right answer and the opposite of the plan's risk 2: the danger with
+    /// a short ladder is a smooth layer that is not there, and one rung cannot
+    /// draw one. The grid still builds, and says why through
+    /// [`VoxelGrid::tilt_count`].
+    #[test]
+    fn a_single_tilt_volume_fills_nothing_rather_than_smearing_one_beam() {
+        let scan = Scan::new(
+            vcp(&[0.5]),
+            vec![refl_sweep(
+                1,
+                LOW_DEG,
+                &wrapped_azimuths(720, 293.5),
+                LOW_GATES,
+                &|_, _| Some(50.0),
+            )],
+        );
+        let grid = build_voxels(&scan, &request(ODD), SITE.0, SITE.1).unwrap();
+        assert_eq!(grid.tilt_count(), 1);
+        assert_eq!(grid.widest_tilt_gap_deg(), 0.0);
+        assert!(
+            grid.indices().iter().all(|&i| i == NO_DATA_INDEX),
+            "one rung has no vertical extent, so nothing may be filled in",
+        );
+        // The same volume with a second cut *does* fill, so the emptiness
+        // above is the ladder's doing and not a broken fixture.
+        let two = scan_of(&|_, _| Some(50.0));
+        let filled = build_voxels(&two, &request(ODD), SITE.0, SITE.1).unwrap();
+        assert!(filled.indices().iter().any(|&i| i != NO_DATA_INDEX));
+    }
+
     // ── The builder adds no geometry of its own ─────────────────────────────
 
     /// Every cell is the sampler's own answer at that cell's coordinates.
@@ -1909,6 +2003,8 @@ mod tests {
             site: SITE,
             value_range,
             product: RadarProduct::Reflectivity,
+            tilt_count: 2,
+            widest_tilt_gap_deg: 3.94,
         }
     }
 
