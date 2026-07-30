@@ -481,8 +481,8 @@ impl VolumePipelines {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(&label("offscreen")),
             size: wgpu::Extent3d {
-                width: size[0].max(1),
-                height: size[1].max(1),
+                width: offscreen_extent(size)[0],
+                height: offscreen_extent(size)[1],
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -518,7 +518,7 @@ impl VolumePipelines {
             ],
         });
         OffscreenTarget {
-            size: [size[0].max(1), size[1].max(1)],
+            size: offscreen_extent(size),
             texture,
             view,
             bind_group,
@@ -536,8 +536,8 @@ impl VolumePipelines {
         target: &mut Option<OffscreenTarget>,
         size: [u32; 2],
     ) -> bool {
-        let wanted = [size[0].max(1), size[1].max(1)];
-        if target.as_ref().is_some_and(|held| held.size == wanted) {
+        let wanted = offscreen_extent(size);
+        if !offscreen_needs_rebuild(target.as_ref().map(OffscreenTarget::size), wanted) {
             return false;
         }
         *target = Some(self.create_offscreen(device, wanted));
@@ -558,15 +558,8 @@ impl VolumePipelines {
         indices: &[u8],
         lut: &[u8],
     ) -> Option<VolumeTextures> {
-        let expected = grid_bytes(cells)?;
-        if indices.len() != expected || lut.len() != VOLUME_LUT_BYTES {
-            log::error!(
-                "3D volume view: refusing a {cells:?} grid with {} index bytes \
-                 (expected {expected}) and a {}-byte colour table (expected \
-                 {VOLUME_LUT_BYTES})",
-                indices.len(),
-                lut.len(),
-            );
+        if let Some(why) = upload_refusal(cells, indices.len(), lut.len()) {
+            log::error!("3D volume view: {why}");
             return None;
         }
 
@@ -606,7 +599,7 @@ impl VolumePipelines {
         let lut_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(&label("lut")),
             size: wgpu::Extent3d {
-                width: (VOLUME_LUT_BYTES / 4) as u32,
+                width: lut_texel_count(),
                 height: 1,
                 depth_or_array_layers: 1,
             },
@@ -626,7 +619,7 @@ impl VolumePipelines {
                 rows_per_image: Some(1),
             },
             wgpu::Extent3d {
-                width: (VOLUME_LUT_BYTES / 4) as u32,
+                width: lut_texel_count(),
                 height: 1,
                 depth_or_array_layers: 1,
             },
@@ -771,6 +764,62 @@ pub fn grid_bytes(cells: [u32; 3]) -> Option<usize> {
         .try_fold(1usize, |acc, &n| acc.checked_mul(n as usize))
 }
 
+/// Entries in the colour table, which is also its texture's width.
+///
+/// Derived from the byte budget the table travels in rather than written as
+/// 256, so the shader's `LUT_ENTRIES`, the upload's texture width and
+/// `VOLUME_LUT_BYTES` cannot drift apart. A pure function rather than an
+/// expression inlined into the texture descriptor because the descriptor needs
+/// a device to reach, and this is arithmetic that can be wrong.
+pub fn lut_texel_count() -> u32 {
+    (VOLUME_LUT_BYTES / 4) as u32
+}
+
+/// The extent an offscreen is really created at.
+///
+/// Never zero on either axis. `wgpu` refuses a zero extent, and it refuses it
+/// from `create_texture`, which returns no `Result` — so a pane dragged to
+/// nothing would surface asynchronously through the uncaptured-error sink
+/// rather than as a value anyone could check.
+pub fn offscreen_extent(size: [u32; 2]) -> [u32; 2] {
+    [size[0].max(1), size[1].max(1)]
+}
+
+/// Whether a held offscreen has to be thrown away for a new size.
+///
+/// Split out from [`VolumePipelines::ensure_offscreen`] because that function
+/// needs a device and this decision does not. Getting it backwards reallocates
+/// a pane-sized texture on every frame, which reads as a driver problem rather
+/// than an application one.
+fn offscreen_needs_rebuild(held: Option<[u32; 2]>, wanted: [u32; 2]) -> bool {
+    held != Some(wanted)
+}
+
+/// Why an upload must be refused, or `None` when the shapes agree.
+///
+/// Pure, so the refusal can be tested without a GPU. Both halves matter and
+/// neither implies the other: `write_texture` with too few bytes is a
+/// validation error, and with too many it silently ignores the tail — so an
+/// off-by-one grid would upload a plausible volume shifted by a slice.
+fn upload_refusal(cells: [u32; 3], indices_len: usize, lut_len: usize) -> Option<String> {
+    // `?` here would be exactly backwards: a cell count that overflows `usize`
+    // is the strongest reason to refuse, and returning `None` for it would
+    // report the grid as acceptable.
+    let Some(expected) = grid_bytes(cells) else {
+        return Some(format!(
+            "refusing a {cells:?} grid: its cell count overflows"
+        ));
+    };
+    if indices_len == expected && lut_len == VOLUME_LUT_BYTES {
+        return None;
+    }
+    Some(format!(
+        "refusing a {cells:?} grid with {indices_len} index bytes (expected \
+         {expected}) and a {lut_len}-byte colour table (expected \
+         {VOLUME_LUT_BYTES})"
+    ))
+}
+
 /// Which blit fragment entry point a surface format needs.
 ///
 /// Keyed on `is_srgb` rather than on the target: `select_surface_format` only
@@ -912,6 +961,63 @@ mod tests {
                 "clip-space corner {corner:?} is not in the quad, so part of \
                  the offscreen is never drawn"
             );
+        }
+    }
+
+    /// The two triangles [`QUAD_CORNERS`] describes, in draw order.
+    ///
+    /// A test helper rather than production code: nothing that draws needs the
+    /// quad grouped into triangles, but a coverage assertion has to talk about
+    /// triangles — a quad that names all four corners can still fail to tile
+    /// the rectangle.
+    fn quad_triangles() -> [[[f32; 2]; 3]; 2] {
+        [
+            [QUAD_CORNERS[0], QUAD_CORNERS[1], QUAD_CORNERS[2]],
+            [QUAD_CORNERS[3], QUAD_CORNERS[4], QUAD_CORNERS[5]],
+        ]
+    }
+
+    /// The two triangles tile clip space exactly once, with no gap and no
+    /// overlap.
+    ///
+    /// Added after a mutation survived the test above. Deleting the minus sign
+    /// from any one corner leaves all four corners present and the bounding box
+    /// unchanged — every assertion up there still passes — while turning the
+    /// pair into two triangles that both cover the upper half and leave the
+    /// lower-left quadrant of the volume simply not drawn. Corner presence is
+    /// not coverage, so assert coverage.
+    ///
+    /// Sampled at points chosen to miss every edge: the shared diagonal is
+    /// `x + y = 0`, and `-1.88 + 0.19 * (i + j)` is zero only at a
+    /// non-integer `i + j`.
+    #[test]
+    fn the_two_triangles_tile_clip_space_exactly_once() {
+        /// Which side of the directed line `a -> b` the point falls on.
+        fn side(a: [f32; 2], b: [f32; 2], p: [f32; 2]) -> f32 {
+            (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+        }
+        /// Inside, for either winding.
+        fn inside(triangle: [[f32; 2]; 3], p: [f32; 2]) -> bool {
+            let sides = [
+                side(triangle[0], triangle[1], p),
+                side(triangle[1], triangle[2], p),
+                side(triangle[2], triangle[0], p),
+            ];
+            sides.iter().all(|&s| s >= 0.0) || sides.iter().all(|&s| s <= 0.0)
+        }
+
+        let triangles = quad_triangles();
+        for i in 0..10 {
+            for j in 0..10 {
+                let point = [-0.95 + 0.19 * i as f32, -0.93 + 0.19 * j as f32];
+                let covering = triangles.iter().filter(|t| inside(**t, point)).count();
+                assert_eq!(
+                    covering, 1,
+                    "clip-space point {point:?} is covered by {covering} of the \
+                     quad's two triangles. Anything but one means the volume is \
+                     missing a region of the pane, or drawing one twice."
+                );
+            }
         }
     }
 
@@ -1305,6 +1411,90 @@ mod tests {
             None,
             "a grid whose cell count overflows `usize` must not wrap to a small \
              number and then be compared against a slice length"
+        );
+    }
+
+    /// An offscreen never has a zero axis, and a real size passes through.
+    ///
+    /// Both halves: clamping unconditionally to 1 would be as wrong as not
+    /// clamping at all, and `create_texture` — where this lands — returns no
+    /// `Result` for either.
+    #[test]
+    fn an_offscreen_extent_is_clamped_up_from_zero_and_left_alone_otherwise() {
+        assert_eq!(offscreen_extent([0, 0]), [1, 1]);
+        assert_eq!(offscreen_extent([0, 900]), [1, 900]);
+        assert_eq!(offscreen_extent([1440, 0]), [1440, 1]);
+        assert_eq!(offscreen_extent([1440, 900]), [1440, 900]);
+    }
+
+    /// A held offscreen is rebuilt for a new size and kept for the same one.
+    ///
+    /// The mistake this catches is the comparison inverted: a pane-sized
+    /// texture reallocated on every frame is invisible in a screenshot and
+    /// reads as a driver problem rather than as an application one.
+    #[test]
+    fn an_offscreen_is_rebuilt_only_when_its_size_changed() {
+        assert!(
+            offscreen_needs_rebuild(None, [1440, 900]),
+            "nothing held must always be built"
+        );
+        assert!(
+            !offscreen_needs_rebuild(Some([1440, 900]), [1440, 900]),
+            "an offscreen of the right size was thrown away and rebuilt"
+        );
+        for changed in [[1441, 900], [1440, 901], [900, 1440]] {
+            assert!(
+                offscreen_needs_rebuild(Some([1440, 900]), changed),
+                "a {changed:?} pane reused a 1440x900 offscreen, so it would be \
+                 blitted at the wrong scale"
+            );
+        }
+    }
+
+    /// An upload whose shapes disagree is refused, and one that agrees is not.
+    ///
+    /// The three ways to get this wrong are all here: too few index bytes, too
+    /// many, and a colour table of the wrong length. `write_texture` is a
+    /// validation error for the first and **silently ignores the tail** for the
+    /// second, which uploads a plausible volume shifted by a slice.
+    #[test]
+    fn an_upload_whose_shapes_disagree_is_refused() {
+        let cells = [8u32, 8, 8];
+        let cell_count = 8 * 8 * 8;
+        assert_eq!(upload_refusal(cells, cell_count, VOLUME_LUT_BYTES), None);
+
+        for (indices, lut, what) in [
+            (cell_count - 1, VOLUME_LUT_BYTES, "one index byte short"),
+            (cell_count + 1, VOLUME_LUT_BYTES, "one index byte long"),
+            (0, VOLUME_LUT_BYTES, "no indices at all"),
+            (cell_count, VOLUME_LUT_BYTES - 4, "a table one entry short"),
+            (cell_count, 0, "no colour table"),
+        ] {
+            assert!(
+                upload_refusal(cells, indices, lut).is_some(),
+                "an upload with {what} was accepted"
+            );
+        }
+
+        assert!(
+            upload_refusal([u32::MAX, u32::MAX, u32::MAX], 0, VOLUME_LUT_BYTES).is_some(),
+            "a grid whose cell count overflows `usize` was accepted; that is \
+             the strongest reason to refuse, not a reason to say nothing"
+        );
+    }
+
+    /// The colour table's texture width is its entry count, from the budget.
+    #[test]
+    fn the_colour_tables_texture_is_as_wide_as_the_budget_pays_for() {
+        assert_eq!(lut_texel_count(), 256);
+        assert_eq!(lut_texel_count() as usize * 4, VOLUME_LUT_BYTES);
+        assert!(
+            shader_code().contains(&format!(
+                "const LUT_ENTRIES: f32 = {}.0;",
+                lut_texel_count()
+            )),
+            "the shader's palette size and the uploaded texture's width \
+             disagree, so every colour is fetched from a fraction of a texel off"
         );
     }
 

@@ -11,12 +11,17 @@
 //! cargo test -p rustdar-frontend --test volume_gpu -- --ignored --nocapture
 //! ```
 //!
-//! Each test builds its own device rather than sharing one, because
-//! `the_pipelines_build_on_a_real_device` pushes an error scope and error
-//! scopes are a per-device stack: a concurrent test's error would land inside
-//! it. The cost is four concurrent device creations on one GPU, which hung once
-//! on a machine that was also running three other builds and has not
-//! reproduced since. If it hangs, add `--test-threads 1`.
+//! **These tests hold a process-wide lock and therefore run one at a time**,
+//! whatever `--test-threads` says. Four of them creating four devices on one
+//! adapter and each blocking in `poll(wait_indefinitely)` deadlocked
+//! reproducibly on this box; serialising them is a fix rather than a
+//! workaround, and it costs nothing because the whole file runs in about a
+//! second.
+//!
+//! Serialised rather than sharing one device, because
+//! `the_pipelines_build_on_a_real_device` pushes an error scope, and error
+//! scopes are a per-device stack — a concurrent test's error would land inside
+//! it and be reported against the wrong thing.
 //!
 //! Four things are checked, and each is here because no host test can reach it:
 //!
@@ -67,6 +72,23 @@ macro_rules! clearing_pass {
             multiview_mask: None,
         })
     };
+}
+
+/// Held for the length of a test, so only one talks to the GPU at a time.
+///
+/// See the module doc: four concurrent devices each blocking in
+/// `poll(wait_indefinitely)` deadlock on this hardware.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the GPU lock, ignoring poisoning.
+///
+/// Poisoning here means an earlier test already failed and unwound. That test
+/// will report its own failure; refusing to run the rest would replace four
+/// useful results with one and three panics about the mutex.
+fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+    ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|held| held.into_inner())
 }
 
 /// A device, or `None` when there is no adapter to be had.
@@ -274,6 +296,7 @@ fn centre(pixels: &[[u8; 4]], size: [u32; 2]) -> [u8; 4] {
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn the_pipelines_build_on_a_real_device() {
+    let _serialised = gpu_lock();
     let (device, queue) = device();
 
     for format in [
@@ -318,6 +341,7 @@ fn the_pipelines_build_on_a_real_device() {
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn a_uniform_grid_paints_its_palette_colour() {
+    let _serialised = gpu_lock();
     const INDEX: u8 = 200;
     const COLOUR: [u8; 4] = [200, 60, 30, 255];
     let size = [64, 64];
@@ -400,6 +424,7 @@ fn a_uniform_grid_paints_its_palette_colour() {
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn opacity_accumulates_per_kilometre_not_per_box_diagonal() {
+    let _serialised = gpu_lock();
     const INDEX: u8 = 200;
     const EXTINCTION_PER_KM: f32 = 0.01;
     let box_size_km = [240.0f32, 240.0, 20.0];
@@ -480,6 +505,7 @@ fn opacity_accumulates_per_kilometre_not_per_box_diagonal() {
 #[test]
 #[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
 fn the_blit_matches_egui_exactly_on_both_surface_formats() {
+    let _serialised = gpu_lock();
     const SIZE: [u32; 2] = [64, 64];
     // Partial alpha on purpose: at alpha 1 the premultiply is the identity and
     // every candidate rule agrees, so a fully opaque colour would prove nothing.
