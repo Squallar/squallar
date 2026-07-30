@@ -26,6 +26,8 @@
 //! worker path rather than written beside it, and there is no pair to drift.
 
 use rustdar_radar::render_input::RenderInput;
+use rustdar_radar::voxel::{VoxelGrid, VoxelRequest, VoxelShape};
+use rustdar_radar::xsect::{CrossSection, SectionRequest};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -137,6 +139,88 @@ pub enum JobRequest {
         radar_lat: f64,
         radar_lon: f64,
     },
+    /// Draw a vertical cross-section through a volume.
+    ///
+    /// The geometry rides here rather than on the [`RenderInput`]: a section's
+    /// endpoints are not a render parameter *of reflectivity*, and a
+    /// `RenderInput` carrying them would make every plan-view payload's bytes
+    /// depend on where somebody last drew a line.
+    ///
+    /// The `input` is a [`RenderInput::extract_volume`] payload — every tilt
+    /// carrying the moment, and the cut table that keys them.
+    Section {
+        input: Box<RenderInput>,
+        request: SectionRequest,
+    },
+    /// Resample a volume into a Cartesian grid for a raymarch.
+    Voxels {
+        input: Box<RenderInput>,
+        request: VoxelRequest,
+    },
+}
+
+/// What a job produces.
+///
+/// Widened from a bare [`RenderedFrame`] when a section and a voxel grid became
+/// things a worker could be asked for. **[`RenderedFrame`] itself is
+/// deliberately untouched**, and in particular did not gain a width and a
+/// height: `loop_frame_image`'s constant-shaped length check and
+/// `ColorImage::from_rgba_unmultiplied([IMAGE_SIZE, IMAGE_SIZE], …)` are guards
+/// that exist because a `ColorImage` panic on a render worker means no response
+/// ever arrives and the pane stays blank forever. Payload-supplied dimensions
+/// would delete them. The existing `IMAGE_SIZE` assumptions survive here
+/// because the new outputs never reach them — see [`JobOutput::frame`].
+#[derive(Debug, PartialEq)]
+pub enum JobOutput {
+    Frame(RenderedFrame),
+    /// Boxed: a `CrossSection` owns three `SECTION_WIDTH × SECTION_HEIGHT`
+    /// planes, which is megabytes against the enum's other variants.
+    Section(Box<CrossSection>),
+    /// Boxed for the same reason, more so: a desktop grid is 8 MiB of indices.
+    Voxels(Box<VoxelGrid>),
+}
+
+impl JobOutput {
+    /// The frame, or `None` for an output of another kind.
+    ///
+    /// This is what makes widening the result type safe for every existing
+    /// consumer: a `Section` handed to a frame consumer becomes `None`, which
+    /// is "nothing to draw" — a state every path already handles, with
+    /// `deliver` still running and the render budget still unwound.
+    pub fn frame(self) -> Option<RenderedFrame> {
+        match self {
+            Self::Frame(frame) => Some(frame),
+            Self::Section(_) | Self::Voxels(_) => None,
+        }
+    }
+
+    /// The section, or `None` for an output of another kind.
+    pub fn section(self) -> Option<Box<CrossSection>> {
+        match self {
+            Self::Section(section) => Some(section),
+            Self::Frame(_) | Self::Voxels(_) => None,
+        }
+    }
+
+    /// The voxel grid, or `None` for an output of another kind.
+    pub fn voxels(self) -> Option<Box<VoxelGrid>> {
+        match self {
+            Self::Voxels(grid) => Some(grid),
+            Self::Frame(_) | Self::Section(_) => None,
+        }
+    }
+
+    /// Which view this output is of. For a cache key and for the sibling
+    /// broadcast, both of which must never hand a consumer a wrong-shaped
+    /// buffer.
+    pub fn view(&self) -> rustdar_radar::types::RenderView {
+        use rustdar_radar::types::RenderView;
+        match self {
+            Self::Frame(_) => RenderView::PlanView,
+            Self::Section(_) => RenderView::CrossSection,
+            Self::Voxels(_) => RenderView::Volume,
+        }
+    }
 }
 
 /// What a rasterizing job produces: the RGBA texture, the range it was
@@ -154,7 +238,7 @@ pub struct RenderedFrame {
 
 /// `None` where the renderer found nothing to draw — a scan with no matching
 /// sweep. Callers treat it as the failure the renderer already meant by it.
-pub type JobResult = Option<RenderedFrame>;
+pub type JobResult = Option<JobOutput>;
 
 impl From<(Vec<u8>, f64, Vec<f32>)> for RenderedFrame {
     fn from((image, max_range_km, values): (Vec<u8>, f64, Vec<f32>)) -> Self {
@@ -241,6 +325,21 @@ impl JobRequest {
                 out.extend_from_slice(eet);
                 out
             }
+            // Both of the two below put the `RenderInput` **last**, because
+            // `RenderInput::from_bytes` refuses trailing bytes: it has to be
+            // handed exactly the remainder, so nothing may follow it.
+            Self::Section { input, request } => {
+                let mut out = vec![TAG_SECTION];
+                encode_section_request(&mut out, request);
+                out.extend_from_slice(&input.to_bytes());
+                out
+            }
+            Self::Voxels { input, request } => {
+                let mut out = vec![TAG_VOXELS];
+                encode_voxel_request(&mut out, request);
+                out.extend_from_slice(&input.to_bytes());
+                out
+            }
         }
     }
 
@@ -282,6 +381,26 @@ impl JobRequest {
                     eet: std::sync::Arc::new(r.rest().to_vec()),
                 })
             }
+            TAG_SECTION => {
+                let mut r = Reader::new(rest);
+                let request = decode_section_request(&mut r)?;
+                let input = RenderInput::from_bytes(r.rest())?;
+                agree_on_product(request.product, &input)?;
+                Some(Self::Section {
+                    input: Box::new(input),
+                    request,
+                })
+            }
+            TAG_VOXELS => {
+                let mut r = Reader::new(rest);
+                let request = decode_voxel_request(&mut r)?;
+                let input = RenderInput::from_bytes(r.rest())?;
+                agree_on_product(request.product, &input)?;
+                Some(Self::Voxels {
+                    input: Box::new(input),
+                    request,
+                })
+            }
             _ => None,
         }
     }
@@ -296,8 +415,101 @@ impl JobRequest {
             },
             Self::Level3 { .. } => "level3",
             Self::Level3Pair { .. } => "level3/vild",
+            Self::Section { .. } => "section",
+            Self::Voxels { .. } => "voxels",
         }
     }
+}
+
+/// The product is on the wire twice — once in the request's own geometry and
+/// once inside the [`RenderInput`] — and two statements of one fact can
+/// disagree.
+///
+/// They must not be allowed to. A section of a moment the payload does not
+/// carry does not fail: `VolumeSampler` builds no rung for it, every sample
+/// comes back `NoCoverage`, and the raster is a full-size, correctly-shaped
+/// picture of clear air. That is indistinguishable from a genuinely empty
+/// section, so it is refused here rather than drawn.
+///
+/// The alternative — carrying the product only in the payload and filling the
+/// request's field from it at decode — was rejected because it makes
+/// [`JobRequest`] not round-trip: a caller who built an inconsistent pair would
+/// get a *different* request back rather than a refusal, which moves the
+/// disagreement from the wire into the type.
+fn agree_on_product(wanted: rustdar_radar::types::RadarProduct, input: &RenderInput) -> Option<()> {
+    (wanted == input.product()).then_some(())
+}
+
+fn encode_section_request(out: &mut Vec<u8>, request: &SectionRequest) {
+    out.extend_from_slice(&request.product.wire_code().to_le_bytes());
+    out.extend_from_slice(&request.start.0.to_le_bytes());
+    out.extend_from_slice(&request.start.1.to_le_bytes());
+    out.extend_from_slice(&request.end.0.to_le_bytes());
+    out.extend_from_slice(&request.end.1.to_le_bytes());
+    match request.top_km_msl {
+        None => out.push(0),
+        Some(top) => {
+            out.push(1);
+            out.extend_from_slice(&top.to_le_bytes());
+        }
+    }
+}
+
+fn decode_section_request(r: &mut Reader) -> Option<SectionRequest> {
+    let product = rustdar_radar::types::RadarProduct::from_wire_code(r.u16()?)?;
+    Some(SectionRequest {
+        start: (r.f64()?, r.f64()?),
+        end: (r.f64()?, r.f64()?),
+        top_km_msl: match r.u8()? {
+            0 => None,
+            1 => Some(r.f64()?),
+            _ => return None,
+        },
+        product,
+    })
+}
+
+fn encode_voxel_request(out: &mut Vec<u8>, request: &VoxelRequest) {
+    out.push(u8::from(request.values_wanted));
+    out.extend_from_slice(&request.product.wire_code().to_le_bytes());
+    out.extend_from_slice(&request.centre.0.to_le_bytes());
+    out.extend_from_slice(&request.centre.1.to_le_bytes());
+    out.extend_from_slice(&request.half_width_km.to_le_bytes());
+    out.extend_from_slice(&request.base_km_msl.to_le_bytes());
+    out.extend_from_slice(&request.top_km_msl.to_le_bytes());
+    // `u16` per axis rather than `u8`: `MAX_AXIS` is 256, which does not fit in
+    // a byte, and a wrapped 256 would arrive as a 0-length axis.
+    for n in [request.shape.nx, request.shape.ny, request.shape.nz] {
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+    }
+}
+
+fn decode_voxel_request(r: &mut Reader) -> Option<VoxelRequest> {
+    let values_wanted = match r.u8()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let product = rustdar_radar::types::RadarProduct::from_wire_code(r.u16()?)?;
+    let request = VoxelRequest {
+        centre: (r.f64()?, r.f64()?),
+        half_width_km: r.f64()?,
+        base_km_msl: r.f64()?,
+        top_km_msl: r.f64()?,
+        product,
+        shape: VoxelShape {
+            nx: r.u16()? as usize,
+            ny: r.u16()? as usize,
+            nz: r.u16()? as usize,
+        },
+        values_wanted,
+    };
+    // `build_voxels` refuses an unsupported shape too, and logs it — but that
+    // refusal happens after the whole payload has been decoded and the sampler
+    // built. Refusing here keeps the same rule at the boundary where the bytes
+    // are untrusted, and it is the shape check that `is_supported` owns rather
+    // than a second copy of the bounds.
+    request.shape.is_supported().then_some(request)
 }
 
 const TAG_RADAR: u8 = 1;
@@ -311,6 +523,14 @@ const TAG_SRM_RETIRED: u8 = 3;
 /// wire — the tag names it, because there is exactly one such product and a
 /// wire code would let a mismatched pair claim to be another one.
 const TAG_LEVEL3_PAIR: u8 = 4;
+/// A vertical cross-section. **5, not 4** — the next free number, not the next
+/// one that looks free. Posted as tag 4 a section lands in the
+/// [`TAG_LEVEL3_PAIR`] arm, which reads two `f64`s and a `u32` length and takes
+/// the rest: on a section's plausible bytes that *succeeds*, and renders a
+/// VIL-density product out of cross-section geometry.
+const TAG_SECTION: u8 = 5;
+/// A Cartesian voxel grid.
+const TAG_VOXELS: u8 = 6;
 
 /// A bounds-checked cursor over a job's fixed-width header.
 ///
@@ -338,6 +558,10 @@ impl<'a> Reader<'a> {
         &self.bytes[self.at..]
     }
 
+    fn u8(&mut self) -> Option<u8> {
+        self.take(1).map(|b| b[0])
+    }
+
     fn u16(&mut self) -> Option<u16> {
         Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
     }
@@ -363,7 +587,7 @@ pub fn execute(request: &JobRequest) -> JobResult {
             input,
             values_wanted,
         } => rustdar_radar::render::render_from(input).map(|(image, max_range_km, values)| {
-            RenderedFrame {
+            JobOutput::Frame(RenderedFrame {
                 image,
                 max_range_km,
                 // Dropped rather than never produced: the grid is what the
@@ -371,7 +595,7 @@ pub fn execute(request: &JobRequest) -> JobResult {
                 // Clearing it here costs nothing and keeps the renderer's
                 // output the one thing it has always been.
                 values: if *values_wanted { values } else { Vec::new() },
-            }
+            })
         }),
         JobRequest::Level3 {
             bytes,
@@ -383,6 +607,7 @@ pub fn execute(request: &JobRequest) -> JobResult {
                 &message, *product, *radar_lat, *radar_lon,
             )
             .map(Into::into)
+            .map(JobOutput::Frame)
         }),
         JobRequest::Level3Pair {
             dvl,
@@ -393,11 +618,30 @@ pub fn execute(request: &JobRequest) -> JobResult {
             (Some(dvl), Some(eet)) => rustdar_radar::render::render_derived_vild_to_image(
                 &dvl, &eet, *radar_lat, *radar_lon,
             )
-            .map(Into::into),
+            .map(Into::into)
+            .map(JobOutput::Frame),
             // One of the two did not decode, which `decode_level3` has already
             // logged: nothing to draw, the same answer a missing sweep gets.
             _ => None,
         },
+        // The `Scan` is rebuilt from the payload and dropped again here, which
+        // is the same shape the `Radar` arm has: one renderer, run wherever the
+        // job landed, rather than a worker-side reimplementation that could
+        // come to disagree with the main thread's.
+        JobRequest::Section { input, request } => rustdar_radar::xsect::render_section(
+            &input.to_scan(),
+            request,
+            input.radar_lat(),
+            input.radar_lon(),
+        )
+        .map(|section| JobOutput::Section(Box::new(section))),
+        JobRequest::Voxels { input, request } => rustdar_radar::voxel::build_voxels(
+            &input.to_scan(),
+            request,
+            input.radar_lat(),
+            input.radar_lon(),
+        )
+        .map(|grid| JobOutput::Voxels(Box::new(grid))),
     }
 }
 
@@ -418,6 +662,36 @@ fn decode_level3(bytes: &[u8]) -> Option<nexrad_level3::model::Level3Message> {
 /// reports back as a failed job rather than dropping silently.
 pub fn execute_bytes(bytes: &[u8]) -> JobResult {
     execute(&JobRequest::from_bytes(bytes)?)
+}
+
+/// The reverse of the non-frame half of a worker reply: a
+/// [`RenderView::wire_code`](rustdar_radar::types::RenderView::wire_code) byte
+/// and the payload type's own bytes, back into a [`JobOutput`].
+///
+/// Here rather than in `rustdar-web` for the reason [`execute_bytes`] is here:
+/// the browser crate is the adapter, this crate owns what a job means, and a
+/// decode that lived over there would be reachable only from a browser. It also
+/// keeps `rustdar-web` from needing a `rustdar-radar` dependency of its own.
+///
+/// `None` for a kind byte this build does not have, for a payload the type's
+/// own codec refuses, and for a `PlanView` tag — a frame does not travel this
+/// way, and a reply that says it does comes from a build whose protocol is not
+/// this one. All three are "nothing to draw", which is what a failed render has
+/// always meant, and all three still deliver.
+pub fn decode_output(kind: u8, bytes: &[u8]) -> Option<JobOutput> {
+    use rustdar_radar::types::RenderView;
+    match RenderView::from_wire_code(kind)? {
+        RenderView::CrossSection => {
+            CrossSection::from_bytes(bytes).map(|section| JobOutput::Section(Box::new(section)))
+        }
+        RenderView::Volume => {
+            VoxelGrid::from_bytes(bytes).map(|grid| JobOutput::Voxels(Box::new(grid)))
+        }
+        RenderView::PlanView => {
+            log::error!("a worker sent an out-of-band payload tagged as a plan view");
+            None
+        }
+    }
 }
 
 // ── The worker port ──────────────────────────────────────────────────────────
@@ -635,36 +909,76 @@ mod tests {
         }
     }
 
-    /// The smallest real payload: one sweep of one radial carrying no moment.
-    fn sample_input_bytes() -> Vec<u8> {
+    /// The smallest real volume: two sweeps of a handful of radials, under a
+    /// VCP that **declares its cuts**.
+    ///
+    /// The cut table is what the tilt ladder is keyed by, so a fixture without
+    /// one can only ever exercise the refusal path in
+    /// `rustdar_radar::sampler::VolumeSampler` — which would make every
+    /// assertion below about a section or a grid vacuously `None`.
+    fn sample_scan() -> nexrad_model::data::Scan {
         use nexrad_model::data::{
-            PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
+            ChannelConfiguration, ElevationCut, PulseWidth, Radial, RadialStatus, Scan, Sweep,
+            VolumeCoveragePattern, WaveformType,
         };
-        let radial = Radial::new(
-            0,
-            0,
-            0.0,
-            1.0,
-            RadialStatus::IntermediateRadialData,
-            1,
-            0.5,
-            Some(nexrad_model::data::MomentData::from_fixed_point(
-                4,
+        let cut = |angle: f64| {
+            ElevationCut::new(
+                angle,
+                ChannelConfiguration::ConstantPhase,
+                WaveformType::CS,
+                20.0,
+                true,
+                true,
+                false,
+                false,
+                1,
+                20,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                false,
                 0,
-                250,
-                8,
-                2.0,
-                66.0,
-                vec![200; 4],
-            )),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
-        let scan = Scan::new(
+                false,
+                0,
+                false,
+                false,
+            )
+        };
+        let sweep = |elevation_number: u8, elevation: f32| {
+            let radials = (0..36)
+                .map(|i| {
+                    Radial::new(
+                        0,
+                        i,
+                        f32::from(i) * 10.0,
+                        10.0,
+                        RadialStatus::IntermediateRadialData,
+                        elevation_number,
+                        elevation,
+                        Some(nexrad_model::data::MomentData::from_fixed_point(
+                            120,
+                            0,
+                            250,
+                            8,
+                            2.0,
+                            66.0,
+                            vec![200; 120],
+                        )),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                })
+                .collect();
+            Sweep::new(elevation_number, radials)
+        };
+        Scan::new(
             VolumeCoveragePattern::new(
                 212,
                 0,
@@ -679,10 +993,15 @@ mod tests {
                 0,
                 false,
                 false,
-                Vec::new(),
+                vec![cut(0.5), cut(1.5)],
             ),
-            vec![Sweep::new(1, vec![radial])],
-        );
+            vec![sweep(1, 0.5), sweep(2, 1.5)],
+        )
+    }
+
+    /// The single-tilt payload the `Radar` job carries.
+    fn sample_input_bytes() -> Vec<u8> {
+        let scan = sample_scan();
         RenderInput::extract(
             &scan,
             0.5,
@@ -719,9 +1038,63 @@ mod tests {
         }
     }
 
+    /// The whole-volume payload the two vertical job kinds carry.
+    ///
+    /// `extract_volume` rather than `extract`, which is the difference between
+    /// a section cut from the ladder and one interpolated across the tilts that
+    /// did not travel.
+    fn a_volume_input() -> RenderInput {
+        RenderInput::extract_volume(
+            &sample_scan(),
+            rustdar_radar::types::RadarProduct::Reflectivity,
+            35.0,
+            -97.0,
+        )
+        .expect("the fixture carries reflectivity")
+    }
+
+    fn a_section_job() -> JobRequest {
+        JobRequest::Section {
+            input: Box::new(a_volume_input()),
+            request: SectionRequest {
+                start: (35.0, -97.5),
+                end: (35.4, -96.8),
+                top_km_msl: Some(18.0),
+                product: rustdar_radar::types::RadarProduct::Reflectivity,
+            },
+        }
+    }
+
+    fn a_voxel_job() -> JobRequest {
+        JobRequest::Voxels {
+            input: Box::new(a_volume_input()),
+            request: VoxelRequest {
+                centre: (35.0, -97.0),
+                half_width_km: 60.0,
+                base_km_msl: 0.0,
+                top_km_msl: 15.0,
+                product: rustdar_radar::types::RadarProduct::Reflectivity,
+                // Small and *asymmetric*, so a decoder that read the three axes
+                // in the wrong order does not round-trip.
+                shape: VoxelShape {
+                    nx: 8,
+                    ny: 6,
+                    nz: 4,
+                },
+                values_wanted: true,
+            },
+        }
+    }
+
     #[test]
     fn every_job_kind_survives_the_wire_format() {
-        for job in [a_job(), a_level3_job(), a_level3_pair_job()] {
+        for job in [
+            a_job(),
+            a_level3_job(),
+            a_level3_pair_job(),
+            a_section_job(),
+            a_voxel_job(),
+        ] {
             assert_eq!(
                 JobRequest::from_bytes(&job.to_bytes()),
                 Some(job.clone()),
@@ -737,6 +1110,293 @@ mod tests {
     #[test]
     fn the_retired_srm_tag_is_refused() {
         assert_eq!(JobRequest::from_bytes(&[TAG_SRM_RETIRED, 1, 2, 3]), None);
+    }
+
+    /// Every tag is distinct, and the two new ones are **not 4**.
+    ///
+    /// 4 is [`TAG_LEVEL3_PAIR`], and because the new names are new consts
+    /// nothing would have stopped the build. Worse, nothing would have stopped
+    /// it at *runtime* either: that arm reads two `f64`s and a `u32` length and
+    /// then takes the rest, which on a section's plausible bytes succeeds — so
+    /// a section posted as tag 4 comes back as a VIL-density job built out of
+    /// cross-section geometry, and renders. The assertion below is the whole
+    /// guard, and it is cheap because the alternative is invisible.
+    #[test]
+    fn no_two_job_tags_collide() {
+        let tags = [
+            TAG_RADAR,
+            TAG_LEVEL3,
+            TAG_SRM_RETIRED,
+            TAG_LEVEL3_PAIR,
+            TAG_SECTION,
+            TAG_VOXELS,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for tag in tags {
+            assert!(seen.insert(tag), "tag {tag} is used twice");
+        }
+        assert_ne!(TAG_SECTION, TAG_LEVEL3_PAIR);
+        assert_ne!(TAG_VOXELS, TAG_LEVEL3_PAIR);
+        // And the framing really is tag-first, so the byte asserted above is
+        // the byte a decoder switches on.
+        assert_eq!(a_section_job().to_bytes()[0], TAG_SECTION);
+        assert_eq!(a_voxel_job().to_bytes()[0], TAG_VOXELS);
+    }
+
+    /// The product is on the wire twice — in the request geometry and inside
+    /// the payload — and a disagreement is refused rather than drawn.
+    ///
+    /// It has to be refused *here*, because downstream it does not fail:
+    /// `VolumeSampler` builds no rung for a moment the payload does not carry,
+    /// every sample reads `NoCoverage`, and the result is a full-size,
+    /// correctly-shaped raster of clear air — indistinguishable from a section
+    /// through genuinely empty sky.
+    #[test]
+    fn a_request_naming_a_different_product_from_its_payload_is_refused() {
+        for (job, product_offset) in [(a_section_job(), 1), (a_voxel_job(), 2)] {
+            let mut bytes = job.to_bytes();
+            let code = rustdar_radar::types::RadarProduct::Velocity.wire_code();
+            bytes[product_offset..product_offset + 2].copy_from_slice(&code.to_le_bytes());
+            assert_eq!(
+                JobRequest::from_bytes(&bytes),
+                None,
+                "{}: a request for a moment the payload does not carry was accepted",
+                job.kind(),
+            );
+        }
+    }
+
+    /// The vertical jobs' own malformed shapes.
+    #[test]
+    fn a_malformed_vertical_job_is_refused_rather_than_misread() {
+        for job in [a_section_job(), a_voxel_job()] {
+            let bytes = job.to_bytes();
+            for cut in 1..bytes.len() {
+                // Truncation anywhere must be a clean refusal. The tail is a
+                // `RenderInput`, which refuses trailing bytes, so unlike the
+                // Level III jobs every cut can be asserted rather than merely
+                // exercised.
+                assert_eq!(
+                    JobRequest::from_bytes(&bytes[..cut]),
+                    None,
+                    "{} truncated to {cut} bytes was accepted",
+                    job.kind(),
+                );
+            }
+            // Trailing bytes land inside `RenderInput::from_bytes`, which is
+            // exactly why the payload has to be last.
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert_eq!(
+                JobRequest::from_bytes(&trailing),
+                None,
+                "{}: trailing bytes mean the layouts disagree",
+                job.kind(),
+            );
+            // A product code this build does not have.
+            let mut bad_product = bytes.clone();
+            let at = if matches!(job, JobRequest::Section { .. }) {
+                1
+            } else {
+                2
+            };
+            bad_product[at] = 0xFE;
+            bad_product[at + 1] = 0xFF;
+            assert_eq!(JobRequest::from_bytes(&bad_product), None, "product code");
+        }
+
+        // The voxel job's `values_wanted` is a bool, not a byte.
+        let mut bad_flag = a_voxel_job().to_bytes();
+        bad_flag[1] = 2;
+        assert_eq!(JobRequest::from_bytes(&bad_flag), None, "values_wanted");
+
+        // And a shape with a zero axis is refused at the boundary rather than
+        // deep inside `build_voxels`: a renderer dividing an extent by a zero
+        // dimension gets an infinity.
+        let bytes = a_voxel_job().to_bytes();
+        let shape_at = bytes.len() - a_volume_input().to_bytes().len() - 6;
+        for axis in 0..3 {
+            let mut zeroed = bytes.clone();
+            let at = shape_at + axis * 2;
+            zeroed[at] = 0;
+            zeroed[at + 1] = 0;
+            assert_eq!(
+                JobRequest::from_bytes(&zeroed),
+                None,
+                "a zero axis {axis} was accepted",
+            );
+        }
+        // precondition: the offset arithmetic above really points at the shape,
+        // so the assertions are about the guard rather than about corrupting
+        // some other field into invalidity.
+        let mut same = bytes.clone();
+        same[shape_at] = 8;
+        same[shape_at + 1] = 0;
+        assert_eq!(
+            JobRequest::from_bytes(&same),
+            Some(a_voxel_job()),
+            "the shape is not where this test thinks it is",
+        );
+    }
+
+    /// The two vertical arms of [`execute`] actually run, end to end, on a
+    /// volume with a cut table.
+    ///
+    /// Without this the wire could round-trip perfectly and `execute` could
+    /// answer `None` for both kinds forever — which is what the
+    /// `assert_eq!(execute(&…), None)` assertions elsewhere in this module
+    /// would look like if they were the only evidence.
+    #[test]
+    fn the_vertical_jobs_produce_their_own_output_kinds() {
+        let section = execute(&a_section_job()).expect("the section job draws");
+        assert_eq!(
+            section.view(),
+            rustdar_radar::types::RenderView::CrossSection
+        );
+        assert!(section.section().is_some());
+
+        let voxels = execute(&a_voxel_job()).expect("the voxel job builds");
+        assert_eq!(voxels.view(), rustdar_radar::types::RenderView::Volume);
+        let grid = voxels.voxels().expect("the voxel job answers a grid");
+        assert_eq!(grid.shape().cells(), 8 * 6 * 4);
+
+        // And the same jobs off the wire, which is the path a worker takes.
+        assert_eq!(
+            execute_bytes(&a_section_job().to_bytes()).map(|o| o.view()),
+            Some(rustdar_radar::types::RenderView::CrossSection),
+        );
+        assert_eq!(
+            execute_bytes(&a_voxel_job().to_bytes()).map(|o| o.view()),
+            Some(rustdar_radar::types::RenderView::Volume),
+        );
+    }
+
+    /// A frame consumer handed an output of another kind sees `None` — the
+    /// "nothing to draw" every render path already handles — and **never** a
+    /// wrong-shaped buffer.
+    ///
+    /// This is the accessor the whole widening rests on. `RenderedFrame` was
+    /// deliberately not given a width and a height, so every consumer of one
+    /// still assumes `IMAGE_SIZE`; the assumption survives only because a
+    /// section cannot reach those consumers, and this is what says so.
+    #[test]
+    fn a_frame_consumer_sees_nothing_rather_than_another_kinds_buffers() {
+        let section = execute(&a_section_job()).expect("the section job draws");
+        assert_eq!(section.frame(), None);
+        let voxels = execute(&a_voxel_job()).expect("the voxel job builds");
+        assert_eq!(voxels.frame(), None);
+        // And the frame arm still yields its frame, so the accessor is not
+        // simply always `None`.
+        assert!(
+            execute(&a_job())
+                .and_then(JobOutput::frame)
+                .is_some_and(|f| !f.image.is_empty()),
+        );
+        // The two vertical accessors are equally narrow.
+        assert!(execute(&a_job()).and_then(JobOutput::section).is_none());
+        assert!(execute(&a_job()).and_then(JobOutput::voxels).is_none());
+        assert!(
+            execute(&a_section_job())
+                .and_then(JobOutput::voxels)
+                .is_none()
+        );
+    }
+
+    /// The worker reply's non-frame half, both directions.
+    ///
+    /// This is the whole `OUT` field: `rustdar-web` copies bytes out of a
+    /// `Uint8Array` and hands them here with the kind tag, so everything that
+    /// can go wrong with that field can be exercised on a host.
+    #[test]
+    fn an_out_of_band_payload_round_trips_and_refuses_what_it_should() {
+        use rustdar_radar::types::RenderView;
+
+        let section = execute(&a_section_job())
+            .and_then(JobOutput::section)
+            .expect("the section job draws");
+        let grid = execute(&a_voxel_job())
+            .and_then(JobOutput::voxels)
+            .expect("the voxel job builds");
+
+        let section_bytes = section.to_bytes();
+        let grid_bytes = grid.to_bytes();
+        assert_eq!(
+            decode_output(RenderView::CrossSection.wire_code(), &section_bytes),
+            Some(JobOutput::Section(section)),
+        );
+        assert_eq!(
+            decode_output(RenderView::Volume.wire_code(), &grid_bytes),
+            Some(JobOutput::Voxels(grid)),
+        );
+
+        // A kind byte this build does not have.
+        assert_eq!(decode_output(0, &section_bytes), None);
+        assert_eq!(decode_output(u8::MAX, &section_bytes), None);
+        // A frame does not travel this way; a reply claiming it does is from a
+        // build whose protocol is not this one.
+        assert_eq!(
+            decode_output(RenderView::PlanView.wire_code(), &section_bytes),
+            None,
+        );
+        // The two payload codecs each have their own magic, so the tag naming
+        // the wrong decoder is a refusal rather than a reinterpretation.
+        assert_eq!(
+            decode_output(RenderView::Volume.wire_code(), &section_bytes),
+            None,
+        );
+        assert_eq!(
+            decode_output(RenderView::CrossSection.wire_code(), &grid_bytes),
+            None,
+        );
+        assert_eq!(
+            decode_output(RenderView::CrossSection.wire_code(), &[]),
+            None
+        );
+    }
+
+    /// **The invariant the render budget depends on: every `deliver` sends on
+    /// its channel on every arm, including the wrong-kind arm.**
+    ///
+    /// A pane takes a render slot and an in-flight mark when it dispatches, and
+    /// only `deliver` running unwinds them. A wrong-kind result that returned
+    /// early instead of delivering would leak one slot per occurrence, and with
+    /// `MAX_CONCURRENT_RENDERS` at **1 on wasm** the first leak stops every
+    /// render in the tab, permanently — the pane wedges with no error.
+    #[test]
+    fn a_job_answered_with_the_wrong_output_kind_still_delivers() {
+        for job in [a_section_job(), a_voxel_job()] {
+            let kind = job.kind();
+            detach();
+            let (tx, rx) = mpsc::channel();
+            // The consumer is shaped for a frame — the shape both production
+            // `offload_job` callers have — and the job answers a section.
+            offload_job("test", Job::Described(job), move |output| {
+                let _ = tx.send(output.and_then(JobOutput::frame).is_some());
+            });
+            assert_eq!(
+                rx.recv_timeout(std::time::Duration::from_secs(10)),
+                Ok(false),
+                "{kind}: a wrong-kind result did not reach deliver, so the \
+                 render budget just leaked a slot",
+            );
+        }
+
+        // The same across the worker boundary, where the reply is what carries
+        // the result: `abandon_worker` must fail a posted vertical job too.
+        let posted = attach(true);
+        let (tx, rx) = mpsc::channel();
+        offload_job("test", Job::Described(a_section_job()), move |output| {
+            let _ = tx.send(output.is_some());
+        });
+        assert_eq!(posted.lock().unwrap().len(), 1);
+        abandon_worker("test");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(false),
+            "a posted section job the worker never answered was forgotten \
+             rather than failed",
+        );
+        assert_eq!(jobs_in_worker(), 0);
     }
 
     #[test]
@@ -863,11 +1523,11 @@ mod tests {
         let id = posted.lock().unwrap()[0].0;
         deliver_worker_reply(
             id,
-            Some(RenderedFrame {
+            Some(JobOutput::Frame(RenderedFrame {
                 image: vec![0; 4],
                 max_range_km: 230.0,
                 values: vec![f32::NAN],
-            }),
+            })),
         );
 
         assert!(rx.try_recv().is_err(), "an abandoned render must not send");

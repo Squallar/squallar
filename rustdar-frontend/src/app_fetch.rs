@@ -1035,8 +1035,13 @@ impl super::App {
                 None => crate::offload::Job::renders_nothing(),
             },
         };
-        crate::offload::offload_job("loop-render", job, move |frame| {
+        crate::offload::offload_job("loop-render", job, move |output| {
             let _guard = guard;
+            // An output of another kind is `None` here, which is the same
+            // "nothing to draw" a failed render has always been — this consumer
+            // is shaped for a plan-view frame and must never be handed a
+            // section's differently-shaped buffers. See `JobOutput::frame`.
+            let frame = output.and_then(crate::offload::JobOutput::frame);
             // A failed render still has to be sent, so render_in_flight gets cleared.
             let (image, max_range_km) = match frame {
                 Some(frame) => {
