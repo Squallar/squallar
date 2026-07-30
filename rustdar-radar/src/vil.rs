@@ -296,6 +296,78 @@
 //! Amburn & Wolf's scale and it is the **RPG's own** — a large `DVL` over a low
 //! published `EET`, reproduced cell for cell on both sides of the comparison —
 //! so it is the reference's behaviour to read, not a defect here.
+//!
+//! ## What the live harness asserts, after the 2026-07-29 restructure
+//!
+//! That re-run measured perfect figures it could not certify: every leg it
+//! asserted passed, and the one verdict that would have meant something was
+//! withheld, because 33 reference-flagged cells is not a sample and no amount of
+//! re-running fixes weather. So [`live_vild_validation`] is now built around
+//! what a live pair actually proves:
+//!
+//! * **Identity, asserted on every run** — the shipped
+//!   [`crate::vild::compute_vild`] against the reference built from the same two
+//!   messages, bit for bit over every defined cell, with a coverage floor
+//!   ([`vild_validation_policy::MIN_IDENTITY_CELLS`]) so an empty grid cannot
+//!   pass quietly. The constructors are shared, so this is *not* the
+//!   arithmetic: it is codec selection off the real PDBs (134's hybrid LUT,
+//!   135's mask/scale/offset and topped flag), resampling across both products'
+//!   real gate spacings and range extents, the composition order and the `+0.5`
+//!   bin-centre datum — the whole pipeline, on a sample any volume supplies
+//!   (tens of thousands of cells; KUEX alone carried 39,004) with no hail
+//!   needed. This is the primary evidence now, and a drifted shipped path fails
+//!   here on the first volume rather than waiting for a hail day.
+//! * **The pipeline's invariants, asserted on every run** — both PDBs naming one
+//!   volume scan inside [`crate::vild::VOLUME_PAIRING_TOLERANCE_SECS`], defined
+//!   cells finite and non-negative, nothing past
+//!   [`vild_validation_policy::PLAUSIBLE_MAX_G_M3`], which is set at four times
+//!   the reference's *own* recorded extreme (KDDC's 12.06 g/m³) rather than at
+//!   what we expect of it.
+//! * **The threshold and skill figures, reported on every run and asserted only
+//!   where the sample is conclusive** — at the breaks whose reference-flagged
+//!   population clears [`vild_validation_policy::MIN_FLAGGED_CELLS`]. Elsewhere
+//!   the run prints them under an explicit "INCONCLUSIVE SAMPLE — SKILL NOT
+//!   ASSERTED" line and stands on the two legs above. The gate was not lowered
+//!   and the POD/FAR legs were not touched: they are the trap for the next
+//!   implementation that only *approximates* the reference, and lowering a
+//!   sample floor is how a mute product gets certified by silence.
+//!
+//! The conclusive skill measurement therefore lives on an archived
+//! severe-weather day instead of on today's sky:
+//! `live_vild_validation::live_derived_vild_on_the_2022_05_04_outbreak`, the
+//! 2022-05-04 Oklahoma outbreak at 21:30Z and 23:30Z over KTLX, KINX, KVNX and
+//! KSRX — the same site-hours the hail campaign reached 102 hail cells on. That
+//! run **asserts** the 200-cell gate rather than reporting it.
+//!
+//! ## The conclusive run: 2022-05-04 outbreak, measured 2026-07-30
+//!
+//! Eight archived site-hours, 163,301 domain cells pooled, **306**
+//! reference-flagged cells at 3.5 g/m³ and **211** at 4.0. The first VILD run to
+//! clear [`vild_validation_policy::MIN_FLAGGED_CELLS`] at either break, and it
+//! clears both:
+//!
+//! * **PRIMARY (the shipped [`crate::vild::compute_vild`])**: pooled POD
+//!   **100.00%**, FAR **0.00%**, CSI **100.00%** at both breaks; threshold
+//!   agreement 100.00%, MAE **0.0000** g/m³ and ±15% 100.00% at every site-hour;
+//!   identity **163,301 of 163,301** cells bit-identical with no presence
+//!   disagreement; no invariant violation anywhere (per-site maxima 1.95–7.36
+//!   g/m³, all non-negative and finite, PDB volume skew 0 s at all eight).
+//! * The decision mass is almost entirely in the 23:30Z hour — KTLX 120 cells
+//!   ≥ 3.5 g/m³ (field maximum 6.61), KINX 97 (7.36), KSRX 48 (5.98), KVNX 39
+//!   (5.07) — against **2** across all four sites at 21:30Z, two hours earlier
+//!   in the same outbreak, where the storms were already precipitating heavily
+//!   (2,968–32,217 lowest-cut gates ≥ 35 dBZ) but topped out at 1.95–3.68 g/m³.
+//!   "Precipitating site-hour" and "hail site-hour" are not the same sample, and
+//!   this is the measurement that says so.
+//! * **The retired local quotient on these same volumes**: POD **4.90%** at 3.5
+//!   and **1.90%** at 4.0, over a sample that is now conclusive — the muteness
+//!   the July survey could only measure inconclusively, reproduced on an
+//!   outbreak day. Attribution reproduces too: our-VIL/RPG-top POD 3.59%,
+//!   RPG-DVL/our-top POD 95.75% at FAR 15.32%. The residual is still
+//!   [`compute_vil`]'s.
+//! * **The datum A/B** costs decisions at this scale: dividing by the published
+//!   floor instead of the bin centre moves pooled POD 100% → **95.92%** at 3.5
+//!   (13 cells of 319) and → 94.62% at 4.0.
 
 use crate::types::RadarProduct;
 use crate::volumetric::{
@@ -1363,6 +1435,11 @@ pub(crate) mod vild_validation_policy {
         vild_from_published as reference_vild,
     };
 
+    /// The volume-pairing rule the shipped path enforces, re-exported the same
+    /// way: one convention for volume identity, checked by the live harness on
+    /// the two real PDBs rather than restated here.
+    pub use crate::vild::{VOLUME_PAIRING_TOLERANCE_SECS, volume_scan_started, volumes_pair};
+
     /// Amburn & Wolf (1997)'s two operational breaks, g/m³: below 3.5 severe
     /// hail is rare, at 4.0 and above it is near-universal. Both are scored;
     /// both are asserted.
@@ -1713,6 +1790,203 @@ pub(crate) mod vild_validation_policy {
             }
         }
         (if max.is_finite() { max } else { f32::NAN }, counts)
+    }
+
+    // ── Identity, and the pipeline's invariants ─────────────────────────────
+    //
+    // The shipped product **is** the reference (this module's `pub use`), so
+    // what a live run has to establish is not how close the two are but that
+    // they are still the same field *through the whole real pipeline*: codec
+    // selection off each product's own PDB, resampling across two real gate
+    // spacings and two real range extents, the composition order and the
+    // bin-centre datum. None of that is exercised by the arithmetic pins, and
+    // all of it is exercised by any volume — no hail required. These legs are
+    // therefore asserted on every run, while the skill figures below depend on
+    // what the sky supplied.
+
+    /// The shipped field against the reference built from the same two Level
+    /// III messages, cell for cell.
+    ///
+    /// Agreement is **bit-for-bit** on the cells both sides define, and exact
+    /// on presence. Two constructions of one quotient over one pair of inputs
+    /// have no tolerance to spend, and a tolerance is precisely what would hide
+    /// the drift this leg exists to catch — a re-datumed denominator is 1.5625%
+    /// at a 32 kft top, a resampler off by one gate is invisible in any pooled
+    /// average.
+    #[derive(Debug, Default, Clone, Copy, PartialEq)]
+    pub struct IdentityTally {
+        /// Cells either side defines — what the comparison actually covered.
+        pub covered: usize,
+        /// Cells both sides define with identical bits.
+        pub agreed: usize,
+        /// Cells both sides define whose bits differ.
+        pub value_mismatch: usize,
+        /// Cells exactly one side defines. For two constructions of the same
+        /// quotient a presence disagreement is as much a defect as a value one:
+        /// it means one side resampled, thresholded or datumed differently.
+        pub presence_mismatch: usize,
+        /// The first disagreement in scan order, `(az, range, ours,
+        /// reference)`, so a single drifted cell comes with a coordinate to
+        /// chase rather than a count.
+        pub first_mismatch: Option<(usize, usize, f32, f32)>,
+    }
+
+    impl IdentityTally {
+        pub fn mismatched(&self) -> usize {
+            self.value_mismatch + self.presence_mismatch
+        }
+
+        pub fn holds(&self) -> bool {
+            self.mismatched() == 0
+        }
+
+        /// Pool another volume's comparison in, keeping the earliest recorded
+        /// mismatch.
+        pub fn merge(&mut self, other: &Self) {
+            self.covered += other.covered;
+            self.agreed += other.agreed;
+            self.value_mismatch += other.value_mismatch;
+            self.presence_mismatch += other.presence_mismatch;
+            self.first_mismatch = self.first_mismatch.or(other.first_mismatch);
+        }
+    }
+
+    /// [`IdentityTally`] over the whole 360° × 230 km grid. Both grids are
+    /// `[az][range]`, `NaN` undefined; a short or missing row reads undefined,
+    /// which is a presence mismatch wherever the other side has a value.
+    pub fn identity(ours: &[Vec<f32>], reference: &[Vec<f32>]) -> IdentityTally {
+        let mut t = IdentityTally::default();
+        for az in 0..360 {
+            for r in 0..RANGE_BINS {
+                let cell = |field: &[Vec<f32>]| {
+                    field
+                        .get(az)
+                        .and_then(|row| row.get(r))
+                        .copied()
+                        .unwrap_or(f32::NAN)
+                };
+                let (o, f) = (cell(ours), cell(reference));
+                if o.is_nan() && f.is_nan() {
+                    continue;
+                }
+                t.covered += 1;
+                match (o.is_nan(), f.is_nan()) {
+                    (false, false) if o.to_bits() == f.to_bits() => {
+                        t.agreed += 1;
+                        continue;
+                    }
+                    (false, false) => t.value_mismatch += 1,
+                    _ => t.presence_mismatch += 1,
+                }
+                t.first_mismatch = t.first_mismatch.or(Some((az, r, o, f)));
+            }
+        }
+        t
+    }
+
+    /// The fewest cells an identity comparison must cover for a volume that
+    /// got this far to be believed.
+    ///
+    /// A comparison of a handful of cells passes for the same reason a mute
+    /// derivation scores 99% threshold agreement: there was nothing in it. The
+    /// genuinely quiet volume is already excused upstream by
+    /// [`volume_is_scoreable`]'s 500-defined-bin gate on **both** products, so
+    /// past that gate a common domain this small is the pipeline dropping the
+    /// field, not the sky being empty — a miss here is a failure, not a skip.
+    /// Two orders of magnitude above a handful, and an order below even the
+    /// thinnest site-hour the 2026-07-29 runs measured (KSGF 2,700 cells; KUEX
+    /// 39,004; 83,098 pooled over eight).
+    pub const MIN_IDENTITY_CELLS_PER_VOLUME: usize = 100;
+
+    /// …and, pooled over the run, the identity leg's own conclusiveness floor:
+    /// "identity held" must never be a statement about an empty grid.
+    /// Deliberately [`MIN_DEFINED_CELLS`], the same number the skill side's
+    /// domain gate uses, but asserted separately from it so the identity leg
+    /// stands on its own evidence.
+    pub const MIN_IDENTITY_CELLS: usize = MIN_DEFINED_CELLS;
+
+    pub fn identity_coverage_is_scoreable(covered: usize) -> bool {
+        covered >= MIN_IDENTITY_CELLS_PER_VOLUME
+    }
+
+    pub fn identity_coverage_is_conclusive(pooled_covered: usize) -> bool {
+        pooled_covered >= MIN_IDENTITY_CELLS
+    }
+
+    /// The largest VIL density a correct decode of the RPG's own two products
+    /// may put on the grid, g/m³ — a documented plausibility bound, not a
+    /// physical ceiling.
+    ///
+    /// The **reference's own behaviour** sets the scale, not our expectation of
+    /// it: the 2026-07-29 run recorded a legitimate **12.06 g/m³** maximum at
+    /// KDDC on a hail day — a large published `DVL` over a low published `EET`,
+    /// reproduced cell for cell on both sides of the comparison, and three
+    /// times Amburn & Wolf's near-certain break. This bound sits at four times
+    /// that recorded maximum, so real RPG extremes pass it. What it catches is
+    /// the gross class of defect: a denominator left in kilofeet instead of
+    /// metres (~300× high), an echo top read as metres, a numerator taken off
+    /// raw gate bytes instead of through product 134's hybrid LUT. A 1.5%
+    /// datum slip is invisible here and belongs to [`identity`], which is why
+    /// this leg is a sanity bound and that one is the evidence.
+    pub const PLAUSIBLE_MAX_G_M3: f32 = 50.0;
+
+    /// What a real VIL-density field must satisfy whatever the weather did.
+    ///
+    /// `NaN` is not a violation — it is this product's "undefined", and most of
+    /// a volume's grid is undefined. An **infinity** is: the module documents a
+    /// zero or undefined echo top as refused rather than divided, so an
+    /// infinite cell means that refusal stopped happening.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct FieldInvariants {
+        /// Cells carrying a finite value.
+        pub defined: usize,
+        /// Defined cells below zero. Liquid water cannot be negative, and a
+        /// signed read of an unsigned level is how one would appear.
+        pub negative: usize,
+        /// Cells that are neither finite nor `NaN`.
+        pub infinite: usize,
+        /// Defined cells above [`PLAUSIBLE_MAX_G_M3`].
+        pub above_bound: usize,
+        /// Extremes over the defined cells, `NaN` when there are none.
+        pub min: f32,
+        pub max: f32,
+    }
+
+    impl FieldInvariants {
+        pub fn hold(&self) -> bool {
+            self.negative == 0 && self.infinite == 0 && self.above_bound == 0
+        }
+    }
+
+    pub fn field_invariants(field: &[Vec<f32>]) -> FieldInvariants {
+        let mut i = FieldInvariants {
+            defined: 0,
+            negative: 0,
+            infinite: 0,
+            above_bound: 0,
+            min: f32::NAN,
+            max: f32::NAN,
+        };
+        let (mut min, mut max) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &v in field.iter().flatten() {
+            if v.is_nan() {
+                continue;
+            }
+            if !v.is_finite() {
+                i.infinite += 1;
+                continue;
+            }
+            i.defined += 1;
+            i.negative += usize::from(v < 0.0);
+            i.above_bound += usize::from(v > PLAUSIBLE_MAX_G_M3);
+            min = min.min(v);
+            max = max.max(v);
+        }
+        if i.defined > 0 {
+            i.min = min;
+            i.max = max;
+        }
+        i
     }
 
     /// How much of a quarantined site stops being asserted on. VIL density is
@@ -2120,6 +2394,127 @@ mod vild_policy_tests {
         assert!(field[0][229].is_nan(), "and the domain stops at 230 km");
     }
 
+    /// The identity leg — the live run's primary evidence — counts every
+    /// disagreement and refuses a vacuous comparison.
+    ///
+    /// Bit-for-bit on the cells both sides define, exact on presence, and
+    /// cells undefined on both sides are not in the comparison at all (most of
+    /// a real grid), so the coverage figure is what says whether anything was
+    /// compared.
+    #[test]
+    fn the_identity_leg_is_bit_for_bit_and_counts_its_own_coverage() {
+        let field = vec![vec![3.533_212f32, 0.0, f32::NAN, 12.06]];
+        let same = policy::identity(&field, &field);
+        assert!(same.holds(), "{same:?}");
+        assert_eq!(same.covered, 3, "the NaN cell is in neither side's domain");
+        assert_eq!(same.agreed, 3);
+        assert_eq!(same.first_mismatch, None);
+
+        // A value that drifted by less than the datum's own 1.5625% is still a
+        // mismatch, and it comes back with a coordinate.
+        let drifted = vec![vec![3.533_212f32, 0.0, f32::NAN, 12.07]];
+        let d = policy::identity(&field, &drifted);
+        assert!(!d.holds());
+        assert_eq!(d.value_mismatch, 1);
+        assert_eq!(d.presence_mismatch, 0);
+        assert_eq!(d.agreed, 2);
+        let (az, r, ours, theirs) = d.first_mismatch.expect("a coordinate to chase");
+        assert_eq!((az, r), (0, 3));
+        assert!((ours - 12.06).abs() < 1e-4 && (theirs - 12.07).abs() < 1e-4);
+
+        // Presence: a cell one side defines and the other does not.
+        let absent = vec![vec![3.533_212f32, 0.0, 1.0, 12.06]];
+        let p = policy::identity(&field, &absent);
+        assert_eq!(p.presence_mismatch, 1, "{p:?}");
+        assert_eq!(p.value_mismatch, 0);
+        assert_eq!(p.covered, 4);
+        assert_eq!(p.mismatched(), 1);
+        // Either direction, and a short row reads as undefined.
+        assert_eq!(policy::identity(&absent, &field).presence_mismatch, 1);
+        assert_eq!(policy::identity(&field, &[]).presence_mismatch, 3);
+
+        // Pooling keeps the first coordinate and adds the counts.
+        let mut pooled = same;
+        pooled.merge(&d);
+        pooled.merge(&p);
+        assert_eq!(pooled.covered, 3 + 3 + 4);
+        assert_eq!(pooled.value_mismatch, 1);
+        assert_eq!(pooled.presence_mismatch, 1);
+        assert_eq!(pooled.first_mismatch, d.first_mismatch);
+
+        // The coverage floors: a handful of cells is not a comparison, and the
+        // pooled floor is the domain gate's own number.
+        assert!(!policy::identity_coverage_is_scoreable(99));
+        assert!(policy::identity_coverage_is_scoreable(100));
+        assert!(!policy::identity_coverage_is_conclusive(9_999));
+        assert!(policy::identity_coverage_is_conclusive(10_000));
+        // An all-undefined pair "holds" trivially — which is exactly why the
+        // live leg asserts coverage as well as holding.
+        let empty = policy::identity(&[vec![f32::NAN]], &[vec![f32::NAN]]);
+        assert!(empty.holds() && empty.covered == 0);
+        assert!(!policy::identity_coverage_is_scoreable(empty.covered));
+    }
+
+    /// The invariant leg: `NaN` is this product's "undefined" and not a
+    /// violation, while a negative value, an infinity or an implausible
+    /// magnitude is. The bound accommodates the **reference's own** recorded
+    /// extreme — 12.06 g/m³ at KDDC on 2026-07-29 — rather than our
+    /// expectation of it.
+    #[test]
+    fn the_invariant_leg_admits_the_rpgs_own_extremes_and_nothing_absurd() {
+        let real = vec![vec![0.0f32, 0.31, 3.533_212, f32::NAN, 12.06]];
+        let i = policy::field_invariants(&real);
+        assert!(i.hold(), "{i:?}");
+        assert_eq!(i.defined, 4, "the NaN is undefined, not a violation");
+        assert_eq!(i.negative, 0);
+        assert_eq!(i.infinite, 0);
+        assert_eq!(i.above_bound, 0);
+        assert_eq!(i.min, 0.0);
+        assert!((i.max - 12.06).abs() < 1e-4);
+        assert!(
+            i.max <= policy::PLAUSIBLE_MAX_G_M3,
+            "the bound must admit the RPG's own recorded KDDC maximum of {}",
+            i.max,
+        );
+
+        let broken = vec![vec![-0.001f32, f32::INFINITY, f32::NEG_INFINITY, 555.0]];
+        let b = policy::field_invariants(&broken);
+        assert!(!b.hold());
+        assert_eq!(b.negative, 1, "liquid water cannot be negative");
+        assert_eq!(b.infinite, 2, "a refused division that got painted");
+        assert_eq!(b.above_bound, 1, "a kilofoot denominator reads ~300× high");
+        assert_eq!(b.defined, 2, "the two infinities are not defined cells");
+
+        // The bound is inclusive of itself, and an all-undefined field has no
+        // extremes to report but violates nothing.
+        let edge = policy::field_invariants(&[vec![policy::PLAUSIBLE_MAX_G_M3]]);
+        assert!(edge.hold() && edge.above_bound == 0);
+        let none = policy::field_invariants(&[vec![f32::NAN]]);
+        assert!(none.hold());
+        assert_eq!(none.defined, 0);
+        assert!(none.min.is_nan() && none.max.is_nan());
+    }
+
+    /// The volume-pairing rule the live run asserts on the two real PDBs is
+    /// the shipped path's own, re-exported — not a second copy that could
+    /// widen.
+    #[test]
+    fn the_harness_pairs_volumes_by_the_shipped_rule() {
+        assert_eq!(policy::VOLUME_PAIRING_TOLERANCE_SECS, 60);
+        let volume = chrono::NaiveDate::from_ymd_opt(2022, 5, 4)
+            .and_then(|d| d.and_hms_opt(21, 30, 0))
+            .expect("a valid volume start");
+        let at = |secs: i64| volume + chrono::Duration::seconds(secs);
+        assert!(policy::volumes_pair(Some(at(0)), Some(at(60))));
+        assert!(policy::volumes_pair(Some(at(60)), Some(at(0))));
+        assert!(!policy::volumes_pair(Some(at(0)), Some(at(61))));
+        assert!(
+            !policy::volumes_pair(Some(at(0)), None),
+            "an unreadable volume start is not a pair",
+        );
+        assert!(!policy::volumes_pair(None, None));
+    }
+
     /// The campaign's bars, pinned so the ignored harness cannot drift them.
     #[test]
     fn the_vild_acceptance_bars_are_what_the_campaign_set() {
@@ -2133,6 +2528,10 @@ mod vild_policy_tests {
         assert_eq!(policy::MIN_SITES, 4);
         assert_eq!(policy::MIN_DEFINED_CELLS, 10_000);
         assert_eq!(policy::MIN_TWIN_DEFINED_BINS, 500);
+        assert_eq!(policy::MIN_IDENTITY_CELLS_PER_VOLUME, 100);
+        assert_eq!(policy::MIN_IDENTITY_CELLS, 10_000);
+        assert_eq!(policy::PLAUSIBLE_MAX_G_M3, 50.0);
+        assert_eq!(policy::VOLUME_PAIRING_TOLERANCE_SECS, 60);
         assert_eq!(policy::EET_QUANTUM_KFT, 1.0);
         assert_eq!(policy::EET_BIN_CENTRE_KFT, 0.5);
         assert_eq!(policy::VALUE_TOLERANCE_G_M3, 0.5);
@@ -2191,27 +2590,69 @@ mod vild_policy_tests {
     }
 }
 
-/// The live VIL-density harness: score the shipped
-/// [`crate::vild::compute_vild`] against a reference built from the RPG's
-/// **own two inputs** for the same volume — product 134 (`DVL`) over product
-/// 135 (`EET`) — at Amburn & Wolf's decision thresholds.
+/// The live VIL-density harness: the shipped [`crate::vild::compute_vild`] on
+/// **real fetched objects**, against a reference built from the RPG's own two
+/// inputs for the same volume — product 134 (`DVL`) over product 135 (`EET`).
 ///
-/// VIL density has no Level III twin, so this is the only oracle there is.
-/// See [`vild_validation_policy`] for the reference's construction and its
-/// quantization noise floor.
+/// VIL density has no Level III twin, so that quotient is the only oracle there
+/// is; see [`vild_validation_policy`] for its construction and its quantization
+/// noise floor.
 ///
-/// Since the product **is** that reference, the PRIMARY row is perfect by
-/// construction and its job is to prove it (a miss means the shipped path and
-/// the reference have drifted — start at
-/// `vild::tests::the_shipped_path_is_the_surveys_reference_construction`). The
-/// rows that still measure something are the two attribution mixes and the
-/// retired local quotient, which record how far the local derivations sat from
-/// the RPG's own products.
+/// # What a live run asserts, and why in that order
 ///
-/// Site-hours come from `VILD_SITE_HOURS` (`SITE=YYYY-MM-DDTHH:MM`, comma or
-/// semicolon separated, a site may appear more than once); unset, the roster
-/// at now — the clear-air fallback, which proves nothing about a hail
-/// product. Pick precipitating hours with the shared reconnaissance scan:
+/// Since the 2026-07-29 rebuild the shipped product **is** that reference —
+/// [`vild_validation_policy`] re-exports [`crate::vild`]'s own constructors and
+/// `vild::tests::the_shipped_path_is_the_surveys_reference_construction` pins
+/// the composition offline. That changes what a live run is *for*:
+///
+/// * **Identity is the primary evidence, and it is asserted on every run.**
+///   Shared constructors make the arithmetic identical by construction; what
+///   only a real pair can exercise is everything around it — codec selection off
+///   each product's own PDB (134's hybrid LUT, 135's mask/scale/offset and its
+///   topped flag), resampling across the two products' real gate spacings and
+///   real range extents, the composition order, and the `+0.5` bin-centre datum.
+///   Any volume supplies tens of thousands of cells to check that on (KUEX
+///   12:00:54 carried 39,004) and none of it needs hail. Asserted bit-for-bit,
+///   with a coverage floor ([`vild_validation_policy::MIN_IDENTITY_CELLS`]) so
+///   the comparison cannot pass by being empty.
+/// * **The pipeline's invariants are asserted on every run**: the two PDBs name
+///   the same volume scan inside
+///   [`vild_validation_policy::VOLUME_PAIRING_TOLERANCE_SECS`], every defined
+///   cell is finite and non-negative, and nothing exceeds
+///   [`vild_validation_policy::PLAUSIBLE_MAX_G_M3`] — a bound set to admit the
+///   **reference's own** recorded extreme (12.06 g/m³ at KDDC, an RPG `DVL` over
+///   an RPG `EET`) rather than our expectation of it.
+/// * **The threshold and skill figures are reported on every run and asserted
+///   only when the sample is conclusive.** Real weather crosses 3.5 g/m³ in tens
+///   of cells per volume, not hundreds — 33 across the eight site-hours the
+///   rebuild was measured on, 154 across the original 41 — so
+///   [`vild_validation_policy::MIN_FLAGGED_CELLS`]' 200-cell gate, counted on the
+///   cells the *reference* flags, usually reads INCONCLUSIVE. When it does, this
+///   run prints the figures, says plainly that skill is not asserted, and stands
+///   on the identity and invariant legs. The gate is neither lowered nor
+///   deleted: a skill bar with no minimum sample is passed by **silence** (a
+///   product that flags nothing scores ~99% threshold agreement, 0% false-high
+///   and FAR 0%), which is how the retired local derivation would have slipped
+///   through — `vild_policy_tests::a_mute_derivation_passes_every_bar_except_the_pod_leg`
+///   is that trap written down. It stays armed for the next implementation that
+///   only *approximates* the reference.
+///
+/// A conclusive skill measurement therefore has to come from a day that
+/// actually produced hail, which is what
+/// `live_derived_vild_on_the_2022_05_04_outbreak` below is for: a fixed archived
+/// roster, no dependence on today's sky, and the 200-cell gate **asserted**
+/// rather than reported.
+///
+/// The rows that still measure something on either run are the two attribution
+/// mixes and the retired local quotient, which record how far the local Level II
+/// derivations sat from the RPG's own products.
+///
+/// Site-hours for the roster run come from `VILD_SITE_HOURS`
+/// (`SITE=YYYY-MM-DDTHH:MM`, comma or semicolon separated, a site may appear
+/// more than once); unset, the roster at now — the clear-air fallback, which
+/// proves nothing about the *decision* a hail product is read for, though the
+/// identity and invariant legs hold there too. Pick precipitating hours with the
+/// shared reconnaissance scan:
 ///
 /// ```text
 /// HCA_SCAN_HOURS=2026-07-29T06:00,2026-07-28T21:00 \
@@ -2227,22 +2668,70 @@ mod live_vild_validation {
     use super::vild_validation_policy as policy;
     use crate::sources::DataSources;
     use crate::twin::{compare, live};
+    use chrono::NaiveDateTime;
+
+    /// Amburn & Wolf's two breaks, in the order every tally, print and pooled
+    /// row pairs them.
+    const BREAKS: [f32; 2] = [
+        policy::HAIL_RARE_BELOW_G_M3,
+        policy::HAIL_NEAR_CERTAIN_AT_G_M3,
+    ];
+
+    /// `SITE=YYYY-MM-DDTHH:MM`, the one spelling both rosters are written in.
+    fn parse_site_hour(site: &str, when: &str) -> (String, NaiveDateTime) {
+        let when = NaiveDateTime::parse_from_str(when.trim(), "%Y-%m-%dT%H:%M")
+            .unwrap_or_else(|e| panic!("bad site-hour {site}={when}: {e}"));
+        (site.trim().to_uppercase(), when)
+    }
 
     /// The survey's site-hours; unset, the full roster at now.
-    fn site_hours() -> Vec<(String, chrono::NaiveDateTime)> {
+    fn site_hours() -> Vec<(String, NaiveDateTime)> {
         let now = chrono::Utc::now().naive_utc();
         match std::env::var("VILD_SITE_HOURS") {
             Ok(spec) if !spec.trim().is_empty() => spec
                 .split([',', ';'])
                 .filter_map(|pair| {
                     let (site, when) = pair.trim().split_once('=')?;
-                    let when = chrono::NaiveDateTime::parse_from_str(when.trim(), "%Y-%m-%dT%H:%M")
-                        .unwrap_or_else(|e| panic!("bad VILD_SITE_HOURS entry {pair}: {e}"));
-                    Some((site.trim().to_uppercase(), when))
+                    Some(parse_site_hour(site, when))
                 })
                 .collect(),
             _ => live::SITES.iter().map(|s| (s.to_string(), now)).collect(),
         }
+    }
+
+    /// **The severe-weather roster**: the 2022-05-04 Oklahoma outbreak, at the
+    /// two hours the hail campaign used, over the four sites that covered it.
+    ///
+    /// A fixed archived day rather than "now" because the run this feeds has to
+    /// *clear* [`policy::MIN_FLAGGED_CELLS`], and only a day that produced hail
+    /// puts 200 cells above 3.5 g/m³ on the reference. 2022-05-04 21:30Z and
+    /// 23:30Z are the site-hours the hail (SHI/POSH/MEHS) work reached 102 hail
+    /// cells on, which is the recorded evidence that these volumes carry
+    /// decision-region mass at all.
+    ///
+    /// The `unidata-nexrad-level3` bucket was checked to still retain the day
+    /// before this roster was written — `TLX_DVL_2022_05_04_*` and
+    /// `TLX_EET_2022_05_04_*` list 10 objects an hour at both hours, and
+    /// `INX`/`VNX`/`SRX` 10–14 — so nothing here depends on a retention window
+    /// that has since closed. If it ever does close, the fix is another
+    /// outbreak day inside retention, not a lowered gate: the site-hours are
+    /// data, the bar is not.
+    const OUTBREAK_SITE_HOURS: &[(&str, &str)] = &[
+        ("KTLX", "2022-05-04T21:30"),
+        ("KINX", "2022-05-04T21:30"),
+        ("KVNX", "2022-05-04T21:30"),
+        ("KSRX", "2022-05-04T21:30"),
+        ("KTLX", "2022-05-04T23:30"),
+        ("KINX", "2022-05-04T23:30"),
+        ("KVNX", "2022-05-04T23:30"),
+        ("KSRX", "2022-05-04T23:30"),
+    ];
+
+    fn outbreak_site_hours() -> Vec<(String, NaiveDateTime)> {
+        OUTBREAK_SITE_HOURS
+            .iter()
+            .map(|&(site, when)| parse_site_hour(site, when))
+            .collect()
     }
 
     /// The rows every site-hour is scored on, pooled in this order: the
@@ -2267,13 +2756,7 @@ mod live_vild_validation {
         reference: &[Vec<f32>],
     ) -> [policy::ThresholdConfusion; 2] {
         let mut out = [policy::ThresholdConfusion::default(); 2];
-        for (i, threshold) in [
-            policy::HAIL_RARE_BELOW_G_M3,
-            policy::HAIL_NEAR_CERTAIN_AT_G_M3,
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (i, threshold) in BREAKS.into_iter().enumerate() {
             let c = policy::confuse(field, reference, threshold);
             out[i] = c;
             println!(
@@ -2312,21 +2795,157 @@ mod live_vild_validation {
         out
     }
 
-    #[ignore = "hits the live S3 bucket"]
-    #[tokio::test]
-    async fn live_derived_vild_matches_the_rpgs_own_inputs() {
+    /// What one run measured, and every miss it recorded.
+    #[derive(Default)]
+    struct Survey {
+        asserted_sites: usize,
+        pooled_domain: usize,
+        pooled: [policy::ThresholdConfusion; 2],
+        pooled_rows: [[policy::ThresholdConfusion; 2]; ROWS],
+        pooled_ambiguous: [usize; 2],
+        /// The identity comparison, pooled over every scored volume.
+        identity: policy::IdentityTally,
+        /// Identity misses: the shipped path stopped being the reference, or
+        /// covered too few cells for the comparison to mean anything. Never
+        /// sample-dependent — see the module doc.
+        identity_misses: Vec<String>,
+        /// Invariant misses: volume pairing, finiteness, sign, magnitude.
+        invariant_misses: Vec<String>,
+        /// Per-site-hour threshold and skill misses, on the legs the campaign
+        /// pinned per site.
+        skill_misses: Vec<String>,
+    }
+
+    impl Survey {
+        /// The legs that are load-bearing on **every** run, conclusive sample or
+        /// not: the shipped path is the reference cell for cell over enough
+        /// cells to mean it, the pipeline's invariants held, and every
+        /// per-site-hour leg the campaign pinned passed.
+        fn assert_the_legs_that_do_not_depend_on_the_weather(&self) {
+            assert!(
+                self.invariant_misses.is_empty(),
+                "the pipeline's invariants failed on real objects:\n  {}",
+                self.invariant_misses.join("\n  "),
+            );
+            assert!(
+                self.identity_misses.is_empty(),
+                "the shipped path is not the reference on real objects — this is a \
+                 defect in what the app draws, not in the survey:\n  {}",
+                self.identity_misses.join("\n  "),
+            );
+            assert!(
+                self.identity.holds(),
+                "pooled identity: {} value and {} presence mismatches over {} cells",
+                self.identity.value_mismatch,
+                self.identity.presence_mismatch,
+                self.identity.covered,
+            );
+            assert!(
+                policy::identity_coverage_is_conclusive(self.identity.covered),
+                "the identity legs compared only {} cells pooled, need ≥{} — a run that \
+                 compared nothing proves nothing; re-run on volumes that carry a field",
+                self.identity.covered,
+                policy::MIN_IDENTITY_CELLS,
+            );
+            assert!(
+                self.skill_misses.is_empty(),
+                "site-hours under the bar:\n  {}",
+                self.skill_misses.join("\n  "),
+            );
+            assert!(
+                policy::sample_is_conclusive(self.asserted_sites, self.pooled_domain),
+                "inconclusive run: {} site-hours / {} cells asserted, need ≥{} and ≥{} \
+                 — re-run on precipitating site-hours",
+                self.asserted_sites,
+                self.pooled_domain,
+                policy::MIN_SITES,
+                policy::MIN_DEFINED_CELLS,
+            );
+        }
+
+        /// The pooled skill verdict: printed at both breaks always, returned as
+        /// misses only at the breaks whose **reference-flagged** population
+        /// cleared [`policy::MIN_FLAGGED_CELLS`].
+        ///
+        /// The gate is not a bar the product has to clear — it is a statement
+        /// about the weather sample, and a run that did not get one says so out
+        /// loud instead of certifying a decision nobody's volume ever took.
+        fn pooled_skill_misses(&self) -> Vec<String> {
+            let mut misses = Vec::new();
+            for (i, threshold) in BREAKS.into_iter().enumerate() {
+                let c = self.pooled[i];
+                if !policy::flag_sample_is_conclusive(c.reference_flagged()) {
+                    println!(
+                        "POOLED @{threshold} INCONCLUSIVE SAMPLE — SKILL NOT ASSERTED: the \
+                         reference flagged {} cells pooled < {}, so its agreement measures \
+                         nothing about the decision (we flagged {}, hits {}, POD {:.2}%, \
+                         FAR {:.2}%, CSI {:.2}%). The identity and invariant legs carry this \
+                         run; the conclusive skill measurement is \
+                         live_derived_vild_on_the_2022_05_04_outbreak.",
+                        c.reference_flagged(),
+                        policy::MIN_FLAGGED_CELLS,
+                        c.hits + c.false_high,
+                        c.hits,
+                        c.pod_pct(),
+                        c.far_pct(),
+                        c.csi_pct(),
+                    );
+                    continue;
+                }
+                println!(
+                    "POOLED @{threshold} CONCLUSIVE SAMPLE — SKILL ASSERTED over {} \
+                     reference-flagged cells: POD {:.2}% (bar ≥{}%), FAR {:.2}% (bar ≤{}%), \
+                     CSI {:.2}%",
+                    c.reference_flagged(),
+                    c.pod_pct(),
+                    policy::FLAG_POD_MIN_PCT,
+                    c.far_pct(),
+                    policy::FLAG_FAR_MAX_PCT,
+                    c.csi_pct(),
+                );
+                if !policy::far_is_acceptable(c.far_pct()) {
+                    misses.push(format!(
+                        "@{threshold} pooled flag FAR {:.2}% > {}%",
+                        c.far_pct(),
+                        policy::FLAG_FAR_MAX_PCT,
+                    ));
+                }
+                if !policy::pod_is_acceptable(c.pod_pct()) {
+                    misses.push(format!(
+                        "@{threshold} pooled flag POD {:.2}% < {}%",
+                        c.pod_pct(),
+                        policy::FLAG_POD_MIN_PCT,
+                    ));
+                }
+            }
+            misses
+        }
+
+        /// The breaks this run's own sample renders a verdict at.
+        fn conclusive_breaks(&self) -> Vec<f32> {
+            BREAKS
+                .into_iter()
+                .enumerate()
+                .filter(|&(i, _)| {
+                    policy::flag_sample_is_conclusive(self.pooled[i].reference_flagged())
+                })
+                .map(|(_, threshold)| threshold)
+                .collect()
+        }
+    }
+
+    /// Fetch, score and print one roster of site-hours. Every print is the
+    /// record; every miss lands in the returned [`Survey`] for its caller to
+    /// assert on.
+    async fn survey(label: &str, site_hours: &[(String, NaiveDateTime)]) -> Survey {
         crate::tls::init();
         let sources = DataSources::production();
+        let mut s = Survey::default();
+        println!("── {label}: {} site-hours ──", site_hours.len());
 
-        let mut asserted_sites = 0usize;
-        let mut pooled_domain = 0usize;
-        let mut pooled = [policy::ThresholdConfusion::default(); 2];
-        let mut pooled_rows = [[policy::ThresholdConfusion::default(); 2]; ROWS];
-        let mut pooled_ambiguous = [0usize; 2];
-        let mut failures: Vec<String> = Vec::new();
-
-        for (site, when) in site_hours() {
+        for (site, when) in site_hours {
             let site = site.as_str();
+            let when = *when;
             let Some((scan, l2_start)) = live::l2_volume_near(site, when).await else {
                 println!("{site}: SKIP — no archived Level II volume near {when}");
                 continue;
@@ -2374,6 +2993,25 @@ mod live_vild_validation {
                 continue;
             }
 
+            // ── Invariant: the two objects are one volume ──────────────────
+            // The quotient of two different volumes is a plausible-looking
+            // field of a storm that never existed, so this is checked on the
+            // real PDBs and not merely trusted to the pairing that fetched
+            // them. A miss is a failure, not a skip: both objects were
+            // *selected* for naming this volume.
+            let (dvl_volume, eet_volume) = (
+                policy::volume_scan_started(&dvl.message.pdb),
+                policy::volume_scan_started(&eet.message.pdb),
+            );
+            if !policy::volumes_pair(dvl_volume, eet_volume) {
+                s.invariant_misses.push(format!(
+                    "{site} ({l2_start}): the two PDBs do not name one volume — DVL \
+                     {dvl_volume:?}, EET {eet_volume:?}, outside the {} s window",
+                    policy::VOLUME_PAIRING_TOLERANCE_SECS,
+                ));
+                continue;
+            }
+
             // The two published fields on our own 360° × 230 km grid, and the
             // reference they make: DVL over the EET bin centre.
             let dvl_field = policy::resampled_field(
@@ -2409,7 +3047,11 @@ mod live_vild_validation {
             let ours = match crate::vild::compute_vild(&dvl.message, &eet.message) {
                 Ok(grid) => grid.values,
                 Err(refusal) => {
-                    println!("{site}: SKIP — the shipped path refused: {refusal:?}");
+                    s.invariant_misses.push(format!(
+                        "{site} ({l2_start}): the shipped path refused a pair whose product \
+                         codes, radial packets, codecs and volume pairing all checked out: \
+                         {refusal:?}",
+                    ));
                     continue;
                 }
             };
@@ -2468,6 +3110,76 @@ mod live_vild_validation {
                  {ref_bands:?} | ours max {our_max:.2} {our_bands:?}",
             );
 
+            // ── The identity leg: the primary evidence ─────────────────────
+            // The whole real pipeline, cell for cell, on this pair: codecs off
+            // the real PDBs, both real gate spacings and range extents, the
+            // composition order and the bin-centre datum. No hail required and
+            // no tolerance spent.
+            let identity = policy::identity(&ours, &reference);
+            println!(
+                "    identity vs reference    | covered {:>7} agreed {:>7} \
+                 value-mismatch {} presence-mismatch {} | volume DVL {:?} EET {:?} \
+                 (PDB skew {} s, L2 skew {} s)",
+                identity.covered,
+                identity.agreed,
+                identity.value_mismatch,
+                identity.presence_mismatch,
+                dvl_volume,
+                eet_volume,
+                dvl_volume
+                    .zip(eet_volume)
+                    .map_or(i64::MIN, |(a, b)| (a - b).num_seconds()),
+                dvl_volume.map_or(i64::MIN, |a| (a - l2_start).num_seconds()),
+            );
+            if !identity.holds() {
+                let (az, r, o, f) = identity
+                    .first_mismatch
+                    .expect("a mismatch carries its coordinate");
+                s.identity_misses.push(format!(
+                    "{site} ({l2_start}): the shipped path is no longer the reference — \
+                     {} value and {} presence mismatches of {} cells compared, first at \
+                     az {az} r {r}: shipped {o}, reference {f}",
+                    identity.value_mismatch, identity.presence_mismatch, identity.covered,
+                ));
+            }
+            if !policy::identity_coverage_is_scoreable(identity.covered) {
+                s.identity_misses.push(format!(
+                    "{site} ({l2_start}): the identity comparison covered only {} cells (< {}) \
+                     though both twins cleared the {}-defined-bin gate (DVL {dvl_defined}, \
+                     EET {eet_defined}) — the pipeline dropped the field, and an empty \
+                     comparison must not pass",
+                    identity.covered,
+                    policy::MIN_IDENTITY_CELLS_PER_VOLUME,
+                    policy::MIN_TWIN_DEFINED_BINS,
+                ));
+            }
+            s.identity.merge(&identity);
+
+            // ── The invariant leg: what a real field must satisfy ──────────
+            let invariants = policy::field_invariants(&ours);
+            println!(
+                "    invariants               | defined {:>7} min {:+.4} max {:.4} \
+                 negative {} infinite {} above {} g/m³ {}",
+                invariants.defined,
+                invariants.min,
+                invariants.max,
+                invariants.negative,
+                invariants.infinite,
+                policy::PLAUSIBLE_MAX_G_M3,
+                invariants.above_bound,
+            );
+            if !invariants.hold() {
+                s.invariant_misses.push(format!(
+                    "{site} ({l2_start}): {} negative, {} infinite and {} cells above {} g/m³ \
+                     (max {:.4}) — a real VIL-density field carries none of those",
+                    invariants.negative,
+                    invariants.infinite,
+                    invariants.above_bound,
+                    policy::PLAUSIBLE_MAX_G_M3,
+                    invariants.max,
+                ));
+            }
+
             for (i, row) in [
                 print_row(ROW_LABELS[0], &ours, &reference),
                 print_row(ROW_LABELS[1], &our_vil_rpg_top, &reference),
@@ -2478,15 +3190,15 @@ mod live_vild_validation {
             .into_iter()
             .enumerate()
             {
-                pooled_rows[i][0].merge(&row[0]);
-                pooled_rows[i][1].merge(&row[1]);
+                s.pooled_rows[i][0].merge(&row[0]);
+                s.pooled_rows[i][1].merge(&row[1]);
             }
-            pooled_ambiguous[0] += policy::quantization_ambiguous_cells(
+            s.pooled_ambiguous[0] += policy::quantization_ambiguous_cells(
                 &reference,
                 &eet_field,
                 policy::HAIL_RARE_BELOW_G_M3,
             );
-            pooled_ambiguous[1] += policy::quantization_ambiguous_cells(
+            s.pooled_ambiguous[1] += policy::quantization_ambiguous_cells(
                 &reference,
                 &eet_field,
                 policy::HAIL_NEAR_CERTAIN_AT_G_M3,
@@ -2499,16 +3211,10 @@ mod live_vild_validation {
 
             let mut misses = Vec::new();
             let mut domain = 0usize;
-            for (i, threshold) in [
-                policy::HAIL_RARE_BELOW_G_M3,
-                policy::HAIL_NEAR_CERTAIN_AT_G_M3,
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            for (i, threshold) in BREAKS.into_iter().enumerate() {
                 let c = policy::confuse(&ours, &reference, threshold);
                 domain = domain.max(c.domain());
-                pooled[i].merge(&c);
+                s.pooled[i].merge(&c);
                 if !policy::meets_agreement_bar(c.agreement_pct()) {
                     misses.push(format!(
                         "@{threshold} agreement {:.2}% < {}%",
@@ -2543,25 +3249,21 @@ mod live_vild_validation {
                 }
             }
             if !misses.is_empty() {
-                failures.push(format!("{site} ({l2_start}): {}", misses.join("; ")));
+                s.skill_misses
+                    .push(format!("{site} ({l2_start}): {}", misses.join("; ")));
             }
-            asserted_sites += 1;
-            pooled_domain += domain;
+            s.asserted_sites += 1;
+            s.pooled_domain += domain;
         }
 
         // The decision figures are only meaningful pooled: a convective
         // volume carries tens of cells above 3.5 g/m³, not hundreds.
-        for (i, threshold) in [
-            policy::HAIL_RARE_BELOW_G_M3,
-            policy::HAIL_NEAR_CERTAIN_AT_G_M3,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let c = pooled[i];
+        for (i, threshold) in BREAKS.into_iter().enumerate() {
+            let c = s.pooled[i];
             println!(
                 "POOLED @{threshold} | domain {} agree {:.2}% false-high {} ({:.2}%) \
-                 false-low {} ({:.2}%) | flagged {} hits {} FAR {:.2}% POD {:.2}% CSI {:.2}%",
+                 false-low {} ({:.2}%) | flagged {} hits {} reference-flagged {} \
+                 FAR {:.2}% POD {:.2}% CSI {:.2}%",
                 c.domain(),
                 c.agreement_pct(),
                 c.false_high,
@@ -2570,6 +3272,7 @@ mod live_vild_validation {
                 c.false_low_pct(),
                 c.flagged_union(),
                 c.hits,
+                c.reference_flagged(),
                 c.far_pct(),
                 c.pod_pct(),
                 c.csi_pct(),
@@ -2580,14 +3283,8 @@ mod live_vild_validation {
         // for the RPG's (so what is left is VIL's), row 2 swaps our VIL out for
         // the RPG's (so what is left is the echo top's), row 3 is the retired
         // product itself.
-        for (label, row) in ROW_LABELS.into_iter().zip(pooled_rows) {
-            for (i, threshold) in [
-                policy::HAIL_RARE_BELOW_G_M3,
-                policy::HAIL_NEAR_CERTAIN_AT_G_M3,
-            ]
-            .into_iter()
-            .enumerate()
-            {
+        for (label, row) in ROW_LABELS.into_iter().zip(s.pooled_rows) {
+            for (i, threshold) in BREAKS.into_iter().enumerate() {
                 let c = row[i];
                 println!(
                     "POOLED {label:24} @{threshold:>3} | flagged {:>5} hits {:>5} \
@@ -2603,67 +3300,103 @@ mod live_vild_validation {
             }
         }
         println!(
-            "asserted {asserted_sites} site-hours, {pooled_domain} domain cells pooled; \
-             reference cells inside its own quantization floor of a break: {} @3.5, {} @4.0; \
-             failures: {}",
-            pooled_ambiguous[0],
-            pooled_ambiguous[1],
-            failures.len(),
+            "POOLED identity | covered {} agreed {} value-mismatch {} presence-mismatch {}",
+            s.identity.covered,
+            s.identity.agreed,
+            s.identity.value_mismatch,
+            s.identity.presence_mismatch,
         );
+        println!(
+            "asserted {} site-hours, {} domain cells pooled; reference cells inside its own \
+             quantization floor of a break: {} @3.5, {} @4.0; identity/invariant misses: \
+             {}/{}; per-site skill misses: {}",
+            s.asserted_sites,
+            s.pooled_domain,
+            s.pooled_ambiguous[0],
+            s.pooled_ambiguous[1],
+            s.identity_misses.len(),
+            s.invariant_misses.len(),
+            s.skill_misses.len(),
+        );
+        s
+    }
 
-        let mut pooled_misses = Vec::new();
-        for (i, threshold) in [
-            policy::HAIL_RARE_BELOW_G_M3,
-            policy::HAIL_NEAR_CERTAIN_AT_G_M3,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let c = pooled[i];
-            if !policy::flag_sample_is_conclusive(c.reference_flagged()) {
-                pooled_misses.push(format!(
-                    "@{threshold} INCONCLUSIVE: the reference flagged {} cells pooled < {} — the \
-                     sample barely crossed the threshold, so its agreement measures nothing \
-                     (we flagged {}, POD {:.2}%, FAR {:.2}%)",
-                    c.reference_flagged(),
-                    policy::MIN_FLAGGED_CELLS,
-                    c.hits + c.false_high,
-                    c.pod_pct(),
-                    c.far_pct(),
-                ));
-                continue;
-            }
-            if !policy::far_is_acceptable(c.far_pct()) {
-                pooled_misses.push(format!(
-                    "@{threshold} pooled flag FAR {:.2}% > {}%",
-                    c.far_pct(),
-                    policy::FLAG_FAR_MAX_PCT,
-                ));
-            }
-            if !policy::pod_is_acceptable(c.pod_pct()) {
-                pooled_misses.push(format!(
-                    "@{threshold} pooled flag POD {:.2}% < {}%",
-                    c.pod_pct(),
-                    policy::FLAG_POD_MIN_PCT,
-                ));
-            }
-        }
+    /// The roster run: identity and the pipeline invariants on whatever the sky
+    /// is doing, with the decision figures reported and asserted only if the
+    /// reference happened to supply a conclusive sample. See the module doc for
+    /// why that split is the honest one.
+    ///
+    /// ```text
+    /// VILD_SITE_HOURS=KUEX=2026-07-29T12:00,KDDC=2026-07-29T12:00 \
+    ///   cargo test -p rustdar-radar --release --lib -- --ignored \
+    ///   --nocapture live_derived_vild_matches
+    /// ```
+    #[ignore = "hits the live S3 bucket"]
+    #[tokio::test]
+    async fn live_derived_vild_matches_the_rpgs_own_inputs() {
+        let run = survey("VILD roster survey", &site_hours()).await;
+        run.assert_the_legs_that_do_not_depend_on_the_weather();
 
-        assert!(
-            failures.is_empty(),
-            "site-hours under the bar:\n  {}",
-            failures.join("\n  "),
-        );
-        assert!(
-            policy::sample_is_conclusive(asserted_sites, pooled_domain),
-            "inconclusive run: {asserted_sites} site-hours / {pooled_domain} cells asserted, \
-             need ≥{} and ≥{} — re-run on precipitating site-hours",
-            policy::MIN_SITES,
-            policy::MIN_DEFINED_CELLS,
-        );
+        let pooled_misses = run.pooled_skill_misses();
         assert!(
             pooled_misses.is_empty(),
             "the run's decision metric:\n  {}",
+            pooled_misses.join("\n  "),
+        );
+    }
+
+    /// **The conclusive skill measurement**: the same survey over an archived
+    /// severe-weather day, where the reference actually crosses Amburn & Wolf's
+    /// breaks often enough for POD and FAR to mean something.
+    ///
+    /// This run does not tolerate an inconclusive sample — it asserts that
+    /// [`policy::MIN_FLAGGED_CELLS`] was cleared at the break the product is
+    /// read for and that the skill legs passed wherever it was cleared. Its
+    /// roster is [`OUTBREAK_SITE_HOURS`], fixed and archived, so the record does
+    /// not depend on today's weather.
+    ///
+    /// Measured 2026-07-30: 163,301 domain cells pooled, **306**
+    /// reference-flagged cells at 3.5 g/m³ and **211** at 4.0 — the gate cleared
+    /// at *both* breaks — POD 100.00% / FAR 0.00% / CSI 100.00% at both, and
+    /// identity held over all 163,301 cells. The figures per site-hour and the
+    /// retired quotient's 4.90% POD on the same volumes are recorded in the
+    /// module doc's "The conclusive run" section. The assertion below requires
+    /// only the 3.5 break, the break the product is *read* for: the 4.0
+    /// population is a subset of it and one hour of the outbreak (21:30Z)
+    /// contributed 2 flagged cells against 23:30Z's 304, so which breaks clear
+    /// is a property of the day, not of the product.
+    ///
+    /// ```text
+    /// cargo test -p rustdar-radar --release --lib -- --ignored \
+    ///   --nocapture live_derived_vild_on_the_2022_05_04_outbreak
+    /// ```
+    #[ignore = "hits the live S3 bucket"]
+    #[tokio::test]
+    async fn live_derived_vild_on_the_2022_05_04_outbreak() {
+        let run = survey("VILD 2022-05-04 outbreak survey", &outbreak_site_hours()).await;
+        run.assert_the_legs_that_do_not_depend_on_the_weather();
+
+        let pooled_misses = run.pooled_skill_misses();
+        let conclusive = run.conclusive_breaks();
+        println!(
+            "conclusive breaks: {conclusive:?}; reference-flagged {} @3.5, {} @4.0 \
+             (gate {})",
+            run.pooled[0].reference_flagged(),
+            run.pooled[1].reference_flagged(),
+            policy::MIN_FLAGGED_CELLS,
+        );
+        assert!(
+            conclusive.contains(&policy::HAIL_RARE_BELOW_G_M3),
+            "this run exists to *clear* the conclusiveness gate: the reference flagged only \
+             {} cells at {} g/m³ pooled, need ≥{}. Do not lower the gate — pick a day that \
+             produced more hail, or add site-hours to OUTBREAK_SITE_HOURS.",
+            run.pooled[0].reference_flagged(),
+            policy::HAIL_RARE_BELOW_G_M3,
+            policy::MIN_FLAGGED_CELLS,
+        );
+        assert!(
+            pooled_misses.is_empty(),
+            "the outbreak run's decision metric:\n  {}",
             pooled_misses.join("\n  "),
         );
     }
