@@ -87,7 +87,27 @@
 //! toward the ramp bottom instead of landing mid-ramp, and the ramp bottom is
 //! placed where the palette is transparent, so the shell fades out rather than
 //! stepping to an opaque middle. `an_echo_edge_fades_instead_of_fabricating_a_mid_value`
-//! computes both encodings over the same edge and pins the difference.
+//! computes both encodings over the same edge and pins the difference: at a
+//! 65 dBZ core's edge, bottom-of-ramp reads **16.25 dBZ** halfway across and
+//! has faded to nothing by 67 % of the way, where the out-of-band encoding
+//! reads **32.35 dBZ at full opacity** right up to the empty voxel itself.
+//!
+//! **How much of that is a fade rather than a step depends on the palette, and
+//! only reflectivity's has a floor.** The band the fetch fades through is the
+//! run of transparent entries at the bottom of the table, which exists only
+//! where `get_color_for_value` refuses to paint. Measured, that is **64
+//! indices for reflectivity — a quarter of the ramp — and 0 for the other
+//! five**, whose palettes are opaque at every finite value; those five step
+//! from opaque to absent in one quantisation level. The floors the paragraph
+//! above cites (VIL, HHC, NROT) all belong to products
+//! [`crate::sampler::samplable`] refuses, so reflectivity's `< 0 dBZ` is the
+//! only one this module can reach. That is not an argument against the
+//! decision — it is still strictly better for the other five than an
+//! out-of-band index, which would put an opaque *mid-ramp* colour there
+//! instead of an opaque *end-of-ramp* one — but the fade is real for
+//! reflectivity and nominal elsewhere, and 3D volume rendering is a
+//! reflectivity feature. [`VoxelGrid::fade_band`] reports the number so a
+//! renderer does not have to assume either way.
 //!
 //! **Index 0 is one quantisation step *below* the moment's floor.** The ramp's
 //! 255 *data* levels run from the moment's lowest decodable value at index 1
