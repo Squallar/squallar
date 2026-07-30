@@ -85,15 +85,21 @@ impl super::App {
     /// What this site's feed needs to download.
     ///
     /// The tilts its panes actually render — **unless** anything on the site
-    /// shows a product that integrates the whole volume, in which case every cut
-    /// is needed and the answer is `All`.
+    /// shows a product [`rustdar_radar::types::RadarProduct::reads_whole_volume`]
+    /// names, in which case every cut is needed and the answer is `All`.
     ///
     /// That exception is the whole safety of selective download, and it is not
-    /// optional: `compute_echo_tops` walks only the tilts present and clamps each
-    /// column to the topmost one, and `render_nrot_to_image` fits its wind
-    /// profile from every velocity tilt when no external profile resolves. Both
-    /// would read a volume that skipped cuts as a complete short one and produce
-    /// a plausible, low, wrong answer with no error and no NaN to notice.
+    /// optional: every such product walks only the tilts *present* —
+    /// `compute_echo_tops` clamps each column to the topmost one, a wind profile
+    /// fits whatever velocity tilts it is handed — so all of them would read a
+    /// volume that skipped cuts as a complete short one and produce a plausible,
+    /// wrong answer with no error and no NaN to notice.
+    ///
+    /// The predicate is deliberately not restated here. It was, once, and the
+    /// restatement omitted storm-relative velocity: SRV panes narrowed their
+    /// site's feed to one tilt while SRV went on fitting its dealias seed and
+    /// its default Bunkers vector from the volume's velocity tilts, whichever
+    /// of them had happened to be downloaded.
     ///
     /// A pane with no resolvable render params contributes nothing rather than
     /// forcing `All`: it is showing nothing, so it needs nothing.
@@ -108,7 +114,12 @@ impl super::App {
             let Some((product, elevation)) = self.gui.get_rendering_params_for_pane(idx) else {
                 continue;
             };
-            if crate::render_dispatch::needs_whole_volume(product) {
+            // Ahead of the Level III check, which is safe only because the two
+            // sets are disjoint — no Level III product reads a Level II tilt, so
+            // `reads_whole_volume` is false for every one of them. Were a product
+            // ever both, this order would silently decide for it, and `All` is
+            // the answer that would still be correct.
+            if product.reads_whole_volume() {
                 return CutSelection::All;
             }
             // Level III panes draw from `level3_data` and say nothing about which
@@ -515,6 +526,13 @@ mod selection_tests {
     /// One live pane on KTLX showing `product`, snapping within `available`.
     fn app_showing(product: RadarProduct, selected: f32, available: &[f32]) -> App {
         let mut app = headless(TestBridge::desktop());
+        show(&mut app, product, selected, available);
+        app
+    }
+
+    /// Re-point the pane an existing app already has, so a per-product sweep
+    /// does not stand a `wgpu` instance up once per variant.
+    fn show(app: &mut App, product: RadarProduct, selected: f32, available: &[f32]) {
         let pane = app.gui.pane_mut(0).unwrap();
         pane.site = "KTLX".to_string();
         pane.viewing_live = true;
@@ -538,7 +556,6 @@ mod selection_tests {
             product_elevations,
             status: String::new(),
         });
-        app
     }
 
     /// The ordinary case, and where the traffic saving comes from.
@@ -560,19 +577,55 @@ mod selection_tests {
         assert_eq!(app.cut_selection_for("KTLX"), CutSelection::All);
     }
 
-    /// NROT fits its wind profile from every velocity tilt when no external
-    /// profile resolves, so it is volume-wide for the same reason.
+    /// NROT fits its wind profile from every velocity tilt — the only wind
+    /// source since the NVW fetch left — so it is volume-wide for the same
+    /// reason.
     #[test]
     fn an_nrot_pane_forces_the_whole_volume() {
         let app = app_showing(RadarProduct::NormalizedRotation, 0.5, &[0.5]);
         assert_eq!(app.cut_selection_for("KTLX"), CutSelection::All);
     }
 
+    /// And the one the divergence actually bit. SRV's dealias seeding wants that
+    /// same profile, and the profile is also where its default Bunkers vector
+    /// comes from, so narrowing the feed under it fitted both from whichever
+    /// velocity tilts happened to have been downloaded.
+    #[test]
+    fn an_srv_pane_forces_the_whole_volume() {
+        let app = app_showing(RadarProduct::StormRelativeVelocity, 0.5, &[0.5]);
+        assert_eq!(app.cut_selection_for("KTLX"), CutSelection::All);
+    }
+
+    /// Every product there is, against the one predicate that decides this.
+    ///
+    /// The bug this replaces was a second copy of that predicate living here and
+    /// disagreeing with the first, so what is checked is the *behaviour* of the
+    /// selection against [`RadarProduct::reads_whole_volume`]: a third copy, or a
+    /// special case bolted onto the loop, fails this whichever product it omits.
+    ///
+    /// A tilt list is safe for exactly one kind of pane: a Level II product that
+    /// reads the single sweep `find_sweep` picks. A volume integral needs every
+    /// cut, and a Level III pane says nothing about which Level II cuts are
+    /// needed, so neither of those may narrow the feed.
+    #[test]
+    fn only_a_one_sweep_level_two_pane_narrows_the_feed() {
+        let mut app = headless(TestBridge::desktop());
+        for &product in RadarProduct::all() {
+            show(&mut app, product, 0.5, &[0.5]);
+            let selection = app.cut_selection_for("KTLX");
+            assert_eq!(
+                matches!(&selection, CutSelection::Tilts(_)),
+                !product.reads_whole_volume() && !product.is_level3(),
+                "{product:?}: the feed was asked for {selection:?}",
+            );
+        }
+    }
+
     // Not tested here: that one volumetric pane among several outweighs the
     // rest. It needs a multi-pane `Gui`, and `set_pane_count_for_test` is
     // `#[cfg(test)]` inside `rustdar-egui` so it does not exist for this crate.
-    // The two single-pane tests above cover both branches of the decision, and
-    // the loop returns `All` on the first volumetric pane it meets.
+    // The single-pane tests above cover both branches of the decision, and the
+    // loop returns `All` on the first volumetric pane it meets.
 
     /// A site with nothing renderable takes everything rather than starving.
     #[test]

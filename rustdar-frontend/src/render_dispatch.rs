@@ -210,32 +210,6 @@ impl RenderCache {
 /// pairwise comparison, this has to be a hashable bucket, and no exact bucketing
 /// agrees with a tolerance at the edges. Tenths is finer than any real sweep spacing,
 /// so two selections that compare equal never land in different buckets in practice.
-/// Whether a Level II product reads the whole volume rather than one sweep.
-///
-/// Mirrors the `whole_volume` branch in `RenderInput::extract`, which is what
-/// actually decides how much of the `Scan` travels: `EchoTopsInterpolated`
-/// integrates every reflectivity tilt, and `NormalizedRotation` collects every
-/// velocity tilt for its wind-profile fit. The hail pair integrates every
-/// reflectivity tilt the way echo tops does — the hail SHI column reads the
-/// same local VIL machinery. All would read a volume still being assembled as a
-/// complete short one — `compute_echo_tops` clamps every column to the topmost
-/// tilt present, with no error and no NaN to notice.
-///
-/// `VilDensity` used to be here, when it was a local quotient of two
-/// whole-volume integrals. It is a Level III product now — the RPG's own `DVL`
-/// over its own `EET` (`rustdar_radar::vild`) — so it reads no Level II tilts
-/// at all and `is_level3()` covers it instead.
-pub fn needs_whole_volume(product: RadarProduct) -> bool {
-    matches!(
-        product,
-        RadarProduct::EchoTopsInterpolated
-            | RadarProduct::NormalizedRotation
-            | RadarProduct::ProbabilityOfSevereHail
-            | RadarProduct::MaxExpectedHailSize
-            | RadarProduct::HydrometeorClassification
-    )
-}
-
 fn elevation_key(elevation: f32) -> i32 {
     (elevation * 10.0).round() as i32
 }
@@ -467,12 +441,14 @@ impl RenderDispatcher {
     /// what `get_rendering_params` resolves and what `last_rendered` records —
     /// not against `selected_elevation`, which may name a tilt no sweep carries.
     ///
-    /// Volume-wide Level II products are skipped here and taken by
-    /// [`reset_panes_for_volume`]: `EchoTopsInterpolated` integrates every
-    /// reflectivity tilt, and NROT fits its wind profile from every velocity
-    /// tilt, so both would read a partial volume as a complete short one.
-    /// Level III panes are skipped outright — their pixels come from
-    /// `level3_data`, which a Level II cut says nothing about.
+    /// The products [`RadarProduct::reads_whole_volume`] names are skipped here:
+    /// every one of them would read a volume still being assembled as a complete
+    /// short one, with no error and no NaN. What refreshes them is the
+    /// `volume_complete` branch of `App::apply_chunk_outcome`, which calls
+    /// [`reset_panes_for_site`](Self::reset_panes_for_site) — every pane on the
+    /// site, whatever its product. Level III panes are skipped here too, for a
+    /// different reason: their pixels come from `level3_data`, which a Level II
+    /// cut says nothing about.
     ///
     /// Returns how many panes were invalidated, for the log and the tests.
     pub fn reset_panes_for_tilts(
@@ -482,7 +458,7 @@ impl RenderDispatcher {
         angles: &[f32],
     ) -> usize {
         let hit = self.invalidate_panes_where(site, gui, |product, elevation| {
-            if product.is_level3() || needs_whole_volume(product) {
+            if product.is_level3() || product.reads_whole_volume() {
                 return false;
             }
             angles
@@ -498,10 +474,21 @@ impl RenderDispatcher {
     }
 
     /// The tilt-independent half: the Level II products that integrate a whole
-    /// volume. Called only when a volume closes complete.
+    /// volume, the complement of what [`reset_panes_for_tilts`] skips.
+    ///
+    /// **Nothing in production calls this.** Its only callers are the tests
+    /// below, which use it to pin that the two halves partition the products the
+    /// way they claim to. A closing volume goes through
+    /// [`reset_panes_for_site`](Self::reset_panes_for_site) instead, which is
+    /// wider — every pane on the site — so these panes do get refreshed; this is
+    /// the narrow reset that was never wired up, not a gap in coverage. Left as
+    /// it is deliberately: whether the closing-volume path should narrow to this
+    /// is its own decision, and not one a predicate fix should make.
+    ///
+    /// [`reset_panes_for_tilts`]: Self::reset_panes_for_tilts
     pub fn reset_panes_for_volume(&mut self, site: &str, gui: &rustdar_egui::Gui) -> usize {
         self.invalidate_panes_where(site, gui, |product, _| {
-            !product.is_level3() && needs_whole_volume(product)
+            !product.is_level3() && product.reads_whole_volume()
         })
     }
 
@@ -1199,7 +1186,7 @@ mod level3_dispatch_tests {
         );
 
         // And it is not a whole-volume Level II product any more.
-        assert!(!needs_whole_volume(RadarProduct::VilDensity));
+        assert!(!RadarProduct::VilDensity.reads_whole_volume());
         assert!(RadarProduct::VilDensity.is_level3());
     }
 
@@ -2170,6 +2157,29 @@ mod render_invalidation_tests {
             0,
             "NROT fits its profile from every velocity tilt, so a partial \
              volume would halve its shear"
+        );
+        assert_eq!(d.reset_panes_for_volume("KOUN", &gui), 1);
+    }
+
+    /// SRV reads the same profile, for its dealias seed and for its default
+    /// Bunkers vector, so it belongs on the same side of the split. The copy of
+    /// the predicate that used to live in this module left it off, so an SRV pane
+    /// was invalidated by every completed cut and re-rendered mid-volume, fitting
+    /// its hodograph from however many velocity tilts had landed so far. It was
+    /// still put right when the volume closed — that path is
+    /// `reset_panes_for_site`, which does not consult this predicate — so the
+    /// cost was wrong pixels in the meantime, plus a render slot per cut.
+    #[test]
+    fn srv_waits_for_the_volume() {
+        let gui = gui_on_tilt("KOUN", RadarProduct::StormRelativeVelocity, 0.5, &[0.5]);
+        let mut d = RenderDispatcher::new();
+        d.ensure_pane_count(1);
+
+        assert_eq!(
+            d.reset_panes_for_tilts("KOUN", &gui, &[0.5]),
+            0,
+            "SRV re-rendered off a single completed cut, fitting its hodograph \
+             from whatever velocity tilts had arrived"
         );
         assert_eq!(d.reset_panes_for_volume("KOUN", &gui), 1);
     }

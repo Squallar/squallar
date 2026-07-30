@@ -487,11 +487,12 @@ const RADIALS_PER_CHUNK: usize = 120;
 /// Which cuts a caller wants assembled.
 ///
 /// Downloading every chunk to render one tilt is most of the traffic wasted: a
-/// 0.5° pane needs 13 of a 55-chunk volume. But two products integrate the whole
-/// volume — `EchoTopsInterpolated` always, and `NormalizedRotation` when no
-/// external wind profile resolves — and `compute_echo_tops` clamps every column
-/// to the topmost tilt *present*, so feeding it a selective volume would produce
-/// a plausible, low, wrong answer with no error to notice.
+/// 0.5° pane needs 13 of a 55-chunk volume. But several products integrate the
+/// whole volume — the set [`crate::types::RadarProduct::reads_whole_volume`]
+/// names, which is the one place it is written down — and each walks only the
+/// tilts *present*: `compute_echo_tops` clamps every column to the topmost one,
+/// so feeding it a selective volume produces a plausible, low, wrong answer with
+/// no error to notice.
 ///
 /// So the selection is the caller's to make, and [`All`](Self::All) is the
 /// answer whenever anything on screen needs the volume.
@@ -692,12 +693,14 @@ pub struct VolumeProgress {
     /// the first thing to look at when one does not.
     pub abandoned: Vec<AbandonedCut>,
     pub saw_scan_end: bool,
-    /// Gate for every product that integrates the whole volume.
+    /// Gate for every product [`crate::types::RadarProduct::reads_whole_volume`]
+    /// names.
     ///
     /// `volumetric::compute_echo_tops` walks only the tilts present and clamps
     /// each column to the topmost *available* tilt's centre height, so a partial
     /// volume yields a plausible, low, wrong number in kft — no error, no NaN.
-    /// It is the one product whose failure mode on partial data is invisible.
+    /// Every product in that set fails the same invisible way, which is why the
+    /// gate is one flag rather than a per-product judgement here.
     pub volume_complete: bool,
     pub chunks_ingested: usize,
     /// Radials that arrived for an already-sealed cut. Expected to stay zero;
@@ -1222,10 +1225,11 @@ impl ChunkPoller {
     /// on wasm happens on the main thread.
     ///
     /// **The caller owns the safety of this.** `compute_echo_tops` clamps every
-    /// column to the topmost tilt present and `render_nrot_to_image` fits its
-    /// wind profile from every velocity tilt, so either would read a selective
+    /// column to the topmost tilt present and a wind-profile fit averages
+    /// whatever velocity tilts it is handed, so either would read a selective
     /// volume as a complete short one — silently. Pass [`CutSelection::All`]
-    /// whenever anything on screen integrates the volume.
+    /// whenever anything on screen is a product
+    /// [`crate::types::RadarProduct::reads_whole_volume`] names.
     pub fn set_selection(&mut self, selection: CutSelection) {
         if self.selection == selection {
             return;

@@ -4,19 +4,24 @@
 //! [`crate::render`] takes a whole `&Scan`: a decoded volume of tens of
 //! megabytes, holding every moment of every radial of every sweep. It *reads*
 //! almost none of that. `find_sweep` picks one sweep and the rasterizer then
-//! touches only `product.get_moment(radial)` on it; the velocity-derived
-//! products (`NormalizedRotation`, `StormRelativeVelocity`) fit their wind
-//! profile from every velocity tilt, `EchoTopsInterpolated` integrates every
-//! reflectivity tilt — and nothing reads the coverage pattern, the site, the
-//! collection timestamps, the radial statuses, or any moment other than the
-//! product's own.
+//! touches only `product.get_moment(radial)` on it — unless the product is one
+//! [`RadarProduct::reads_whole_volume`] names, which reaches every tilt
+//! carrying its moment, and for the hybrid classification every *other* moment
+//! of those tilts too. Nothing reads the coverage pattern, the site, the
+//! collection timestamps or the radial statuses.
 //!
 //! [`RenderInput`] is that reachable subset, flattened. For a normal product it
 //! is one sweep: ~1.3 MB for a 720 × 1832 8-bit moment, ~2.6 MB for 16-bit
-//! dual-pol. NROT and SRV carry every velocity tilt (~10-14 MB) and
-//! interpolated echo tops every reflectivity tilt (~20 MB).
-//! Against a `Scan` that is a large reduction, and it is the difference between
-//! a payload a browser can post per render and one it cannot.
+//! dual-pol. A whole-volume product carries every tilt its moment appears on
+//! instead: NROT and SRV every velocity tilt (~10-14 MB), interpolated echo tops
+//! and the hail pair every reflectivity tilt (~20 MB). The hybrid classification
+//! is the outlier and much the largest — it takes every tilt carrying *any*
+//! moment and, on each, the other five moments as well (`RadialData::extras`),
+//! several of them 16-bit, so it runs several times the reflectivity figure
+//! rather than alongside it.
+//! Against a `Scan` even that is a large reduction, and for everything else it
+//! is the difference between a payload a browser can post per render and one it
+//! cannot.
 //!
 //! # Why it reconstructs a `Scan` instead of replacing it
 //!
@@ -151,31 +156,13 @@ impl RenderInput {
         // `None` for a Level III product: no Level II moment stands behind it,
         // so there is nothing to extract and nothing the renderer would draw.
         //
-        // Four products then need every tilt carrying that moment; anything
-        // else needs one sweep.
-        let whole_volume = match product {
-            // Tilt-independent: `compute_echo_tops` integrates the whole
-            // reflectivity volume. `VolumeCube::build` dedups same-elevation
-            // cuts in encounter order, which is why the original order is kept.
-            RadarProduct::EchoTopsInterpolated => true,
-            // And the hail pair: the SHI column integral reads every
-            // reflectivity tilt (`crate::hail`).
-            RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize => true,
-            // The selected sweep rasterizes, but `build_wind_profile` fits the
-            // dealias-seeding profile from every velocity tilt of the volume.
-            //
-            // Storm-relative velocity has the same shape and one more reason:
-            // the profile is also where its default Bunkers vector comes
-            // from. An override does not shrink the payload — dealias seeding
-            // still wants the profile, or render quality would silently vary
-            // with whether the user typed a vector in.
-            RadarProduct::NormalizedRotation | RadarProduct::StormRelativeVelocity => true,
-            // The hybrid classification composites every dual-pol tilt down
-            // the hybrid scan — and, unlike the others, reads every moment,
-            // so its radials carry the extras too.
-            RadarProduct::HydrometeorClassification => true,
-            _ => false,
-        };
+        // Some products then need every tilt carrying that moment; anything
+        // else needs one sweep. Which is which is
+        // [`RadarProduct::reads_whole_volume`], *read* rather than restated:
+        // the live chunk feed narrows its download by the same predicate, and
+        // a second copy of it here is how an SRV pane came to be handed a
+        // volume the feed had skipped cuts of.
+        let whole_volume = product.reads_whole_volume();
 
         // Only the HHC reads moments beyond its slot; everything else ships
         // the slot moment alone.
@@ -843,6 +830,38 @@ mod tests {
         )
     }
 
+    /// One tilt at `elevation` carrying every moment a radial can hold.
+    ///
+    /// [`volume`] is shaped like a real SAILS volume and so carries only
+    /// reflectivity and velocity, which is all the products behind those two
+    /// moments need. `extract` refuses a product whose moment no sweep carries,
+    /// so a claim made about *every* product needs a volume where every field
+    /// is present — the gate values do not matter, only that they are there.
+    fn every_moment_tilt(elevation: f32, number: u8) -> Sweep {
+        let radials = (0..RADIALS)
+            .map(|i| {
+                let other = || Some(moment(1.0, 0.0, shear(i), 400));
+                Radial::new(
+                    0,
+                    i as u16,
+                    i as f32 * (360.0 / RADIALS as f32),
+                    360.0 / RADIALS as f32,
+                    RadialStatus::IntermediateRadialData,
+                    number,
+                    elevation,
+                    Some(moment(REFL_SCALE, REFL_OFFSET, strong_refl(i), 600)),
+                    Some(moment(VEL_SCALE, VEL_OFFSET, shear(i), 400)),
+                    other(),
+                    other(),
+                    other(),
+                    other(),
+                    None,
+                )
+            })
+            .collect();
+        Sweep::new(number, radials)
+    }
+
     /// Byte-for-byte on the image, element-for-element on the value grid.
     /// `f32::NAN != f32::NAN`, and the grid is NaN wherever no gate claimed the
     /// pixel — which is most of it — so a naive compare would pass on two
@@ -1030,6 +1049,64 @@ mod tests {
             strong_refl(0),
             "carried the velocity gates under the reflectivity request"
         );
+    }
+
+    /// What travels is what [`RadarProduct::reads_whole_volume`] says travels,
+    /// for every product there is.
+    ///
+    /// That predicate is also what the live chunk feed narrows a site's download
+    /// by, and the two used to be separate hand-maintained matches: the feed's
+    /// copy omitted storm-relative velocity, so a live SRV pane fit its dealias
+    /// seed and its default Bunkers vector from a volume the feed had
+    /// deliberately skipped cuts of — no error, no NaN, and archived volumes are
+    /// whole, so nothing under test saw it.
+    ///
+    /// This asserts the half that lives here: that `extract` *reads* the
+    /// predicate for every product rather than deciding again, so a second copy
+    /// cannot grow back inside it. Whether the predicate's own answer is right
+    /// is a claim about the algorithms, and each whole-volume product's
+    /// individual test below is what pins that — every one of them fails if its
+    /// product is downgraded to a single sweep.
+    #[test]
+    fn every_product_carries_the_volume_exactly_when_it_says_it_reads_one() {
+        let scan = Scan::new(
+            placeholder_coverage_pattern(),
+            vec![
+                every_moment_tilt(0.5, 1),
+                every_moment_tilt(1.5, 2),
+                every_moment_tilt(2.5, 3),
+            ],
+        );
+        let tilts = scan.sweeps().len();
+        assert!(
+            tilts > 1,
+            "precondition: with one tilt in the volume, carrying the volume and \
+             carrying one sweep are the same payload and this says nothing"
+        );
+
+        for &product in RadarProduct::all() {
+            let Some(input) = RenderInput::extract(&scan, 0.5, product, LAT, LON, None, None)
+            else {
+                assert!(
+                    product.is_level3(),
+                    "{product:?} extracted nothing from a volume carrying every \
+                     moment on every tilt"
+                );
+                continue;
+            };
+            let expected = if product.reads_whole_volume() {
+                tilts
+            } else {
+                1
+            };
+            assert_eq!(
+                input.sweeps.len(),
+                expected,
+                "{product:?}: reads_whole_volume() is {}, so {expected} of the \
+                 volume's {tilts} tilts should have travelled",
+                product.reads_whole_volume(),
+            );
+        }
     }
 
     /// The sizing decision the whole design rests on: a normal product ships

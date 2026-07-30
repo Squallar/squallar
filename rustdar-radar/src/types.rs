@@ -567,6 +567,84 @@ impl RadarProduct {
         self.moment_slot()?.read(radial)
     }
 
+    /// Whether this product reads every tilt carrying its moment, rather than
+    /// the one sweep `crate::render::find_sweep` picks.
+    ///
+    /// The single product → how-much-of-the-volume table, for the same reason
+    /// [`moment_slot`](Self::moment_slot) is the single product → moment one:
+    /// three separate paths ask this question and every one of them has to get
+    /// the same answer.
+    ///
+    /// - [`crate::render_input::RenderInput::extract`] reads it to decide how
+    ///   many sweeps travel to the renderer.
+    /// - `rustdar_frontend`'s `cut_selection_for` reads it to decide how much
+    ///   of a live volume the chunk feed downloads *at all*
+    ///   ([`crate::chunks::CutSelection`]).
+    /// - `rustdar_frontend`'s `reset_panes_for_tilts` reads it to decide whether
+    ///   a completed cut re-renders a pane or leaves it for the wider reset a
+    ///   closing volume does.
+    ///
+    /// They each used to carry their own copy of the match. The copy the chunk
+    /// feed read omitted [`StormRelativeVelocity`](Self::StormRelativeVelocity),
+    /// so a live SRV pane narrowed its site's feed to a single tilt while SRV
+    /// went on fitting its dealias seed and its default Bunkers vector from
+    /// "every velocity tilt" — of a volume that had deliberately skipped cuts.
+    ///
+    /// That is the failure mode of every product below, and it is invisible:
+    /// each walks only the tilts *present* — `compute_echo_tops` clamps every
+    /// column to the topmost one, a wind profile fits whatever tilts it is
+    /// handed — so a partial volume yields a plausible, wrong answer with no
+    /// error and no NaN to notice.
+    ///
+    /// Exhaustive, like [`wire_code`](Self::wire_code): a new variant fails to
+    /// compile until it has been classified here.
+    pub fn reads_whole_volume(&self) -> bool {
+        match self {
+            // `volumetric::compute_echo_tops` integrates the whole
+            // reflectivity volume. `VolumeCube::build` dedups same-elevation
+            // cuts in encounter order, so the tilts have to arrive in scan
+            // order as well as all arrive.
+            RadarProduct::EchoTopsInterpolated => true,
+            // The SHI column integral reads every reflectivity tilt, over the
+            // same local VIL machinery echo tops uses (`crate::hail`).
+            RadarProduct::ProbabilityOfSevereHail | RadarProduct::MaxExpectedHailSize => true,
+            // The selected sweep is what rasterizes, but `build_wind_profile`
+            // fits the dealias-seeding profile from every velocity tilt of the
+            // volume — the only wind source since the NVW fetch left
+            // (`crate::nrot`).
+            //
+            // Storm-relative velocity has the same shape and one more reason:
+            // the profile is also where its default Bunkers vector comes from
+            // (`crate::srv`). A user's override does not shrink this —
+            // dealias seeding still wants the profile, or render quality would
+            // silently vary with whether a vector was typed in.
+            RadarProduct::NormalizedRotation | RadarProduct::StormRelativeVelocity => true,
+            // The hybrid classification composites every dual-pol tilt down
+            // the hybrid scan, and reads every *moment* of them too
+            // (`crate::hhc`).
+            RadarProduct::HydrometeorClassification => true,
+            // One sweep: the rasterizer touches this product's own moment on
+            // the sweep `find_sweep` chose and nothing else in the volume.
+            RadarProduct::Reflectivity
+            | RadarProduct::Velocity
+            | RadarProduct::SpectrumWidth
+            | RadarProduct::DifferentialPhase
+            | RadarProduct::CorrelationCoefficient
+            | RadarProduct::DifferentialReflectivity => false,
+            // Level III products read no Level II tilt at all — their pixels
+            // come from the RPG's own object, which is what
+            // `is_level3` covers. `VilDensity` was in the
+            // set above when it was a local quotient of two whole-volume
+            // integrals, and left it along with the integrals
+            // (`crate::vild`).
+            RadarProduct::SpecificDifferentialPhase
+            | RadarProduct::EchoTops
+            | RadarProduct::VerticallyIntegratedLiquid
+            | RadarProduct::VilDensity
+            | RadarProduct::PrecipitationRate => false,
+        }
+    }
+
     /// Format a radar product value for display (e.g. in a hover tooltip).
     pub fn format_value(&self, value: f32, prefs: &UserPreferences) -> String {
         match self {
