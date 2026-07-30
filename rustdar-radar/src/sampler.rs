@@ -431,9 +431,12 @@ impl Blend {
 /// adjacent — i.e. as a pair worth interpolating between.
 ///
 /// One step is what consecutive radials are apart by construction, and a real
-/// sweep's jitter is a few hundredths of a step, so 1.5 clears jitter by an
-/// order and still catches one dropped radial (gap 2.0 steps). What happens
-/// past it is not a fallback to nearest-across-the-hole, which is how a
+/// sweep's jitter is a few hundredths of a step, so 1.5 is bracketed from both
+/// sides: it is wide enough that a jittered sweep stays one continuous ladder
+/// (`azimuth_jitter_does_not_open_a_hole`), and narrow enough that one dropped
+/// radial — a gap of **two** steps — falls outside it and is therefore *not*
+/// bridged (`an_azimuth_hole_is_reported_rather_than_painted_across`). What
+/// happens past it is not a fallback to nearest-across-the-hole, which is how a
 /// sampler paints data where the radar never looked: past it a rung serves
 /// only the azimuths inside a surviving radial's own half-step footprint —
 /// the same footprint `render::render_gate` paints, via
@@ -563,14 +566,21 @@ impl Column {
         let lo = &self.rungs[above - 1];
         let hi = &self.rungs[above];
         let span = hi.height_km - lo.height_km;
-        // **This branch is unreachable, and is kept anyway.** `partition_point`
-        // over the ascending sort guarantees `lo.height ≤ h < hi.height`, so the
-        // span here is strictly positive; two rungs *can* share a height (every
-        // beam centre is at zero over the site, and two cuts can share a
-        // median), but then they are both at or below `h` or both above it and
-        // neither becomes a bracket. So this is not pinned by a test and cannot
-        // be — it is the arm that keeps a future edit to the sort or to
-        // `partition_point` from turning a zero span into a `NaN` weight.
+        // **This branch is unreachable given finite rung heights, and is kept
+        // anyway.** `partition_point` over the ascending sort guarantees
+        // `lo.height ≤ h < hi.height`, so the span is strictly positive; two
+        // rungs *can* share a height (every beam centre is at zero over the
+        // site, and two cuts can share a median), but then they are both at or
+        // below `h` or both above it and neither becomes a bracket.
+        //
+        // The qualifier is load-bearing. A `NaN` rung height sorts last under
+        // `total_cmp` and leaves the partition intact, so it *can* become the
+        // upper bracket — and then the span is `NaN`, `span > 0.0` is false,
+        // and this arm degrades to weighting the lower rung fully. Reaching it
+        // takes a `NaN` radial elevation, which fixed-point decoding cannot
+        // produce, which is why no test pins it. It stays a branch rather than
+        // an `unreachable!()` precisely because that path exists: a panic
+        // would turn a benign degradation into a dead frame.
         let t = if span > 0.0 {
             ((height_km - lo.height_km) / span).clamp(0.0, 1.0)
         } else {
@@ -752,7 +762,15 @@ impl<'a> VolumeSampler<'a> {
         self.rungs.len()
     }
 
-    /// Each rung's geometric elevation, ascending.
+    /// Each rung's geometric elevation, **in cut order** — which is ascending
+    /// by the nominal key, not by this number.
+    ///
+    /// The distinction is not pedantry: the ladder is ordered by the VCP's cut
+    /// angles, and a chosen sweep's median can in principle sit outside its
+    /// cut's place in that order. Measured never to, in 4 756 ordered pairs,
+    /// but `a_ladder_whose_medians_invert_still_brackets_by_height` builds one
+    /// that does and this iterator reports `[1.05, 0.55]` for it. A caller who
+    /// wants heights sorted wants [`Column::rungs`], which is.
     pub fn elevations_deg(&self) -> impl Iterator<Item = f64> + '_ {
         self.rungs.iter().map(|r| r.elevation_deg)
     }
@@ -764,12 +782,21 @@ impl<'a> VolumeSampler<'a> {
         self.rungs.iter().map(|r| r.nominal_deg)
     }
 
-    /// The largest angular step between consecutive rungs, degrees. `0.0` for
-    /// a single-rung ladder.
+    /// The largest angular step between adjacent rungs, degrees. `0.0` for a
+    /// single-rung ladder.
+    ///
+    /// Measured over the elevations **sorted**, not over the ladder's cut
+    /// order. Folding signed differences down the cut order instead would
+    /// report `0.0` for a ladder whose medians invert — every difference
+    /// negative, `f64::max` from `0.0` keeping the seed — so the one number
+    /// that exists to warn "this section is interpolating across a gap" would
+    /// read *no gap at all* in one of the few cases it is there for.
     pub fn widest_tilt_gap_deg(&self) -> f64 {
-        self.rungs
+        let mut sorted: Vec<f64> = self.elevations_deg().collect();
+        sorted.sort_by(f64::total_cmp);
+        sorted
             .windows(2)
-            .map(|w| w[1].elevation_deg - w[0].elevation_deg)
+            .map(|w| w[1] - w[0])
             .fold(0.0f64, f64::max)
     }
 
@@ -2827,11 +2854,24 @@ mod tests {
             ],
         );
         let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
-        // The ladder is in cut order, which is what the rule says.
+        // The ladder is in cut order, which is what the rule says — so the
+        // geometric elevations come out descending, and `elevations_deg` says
+        // "in cut order" rather than "ascending" for exactly this reason.
         assert_eq!(
             sampler.elevations_deg().collect::<Vec<_>>(),
             vec![f64::from(1.05f32), f64::from(0.55f32)],
         );
+        // And the gap is still a gap. Folding signed steps down the cut order
+        // would give `0.0` here — the number that exists to warn "this section
+        // is interpolating across nothing" reading *no gap* in one of the few
+        // cases it is there for.
+        let gap = sampler.widest_tilt_gap_deg();
+        assert!(
+            (gap - (f64::from(1.05f32) - f64::from(0.55f32))).abs() < 1e-9,
+            "an inverted ladder reports a widest gap of {gap}°, not the 0.5° \
+             between its two rungs",
+        );
+        assert!(gap > 0.0);
 
         // 30 km: inside these sweeps' 51.9 km of gates on both rungs.
         let column = sampler.column(45.0, 30.0);
