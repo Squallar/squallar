@@ -332,12 +332,18 @@ impl super::Gui {
             MenuEvent::Toggled(MenuToggle::LiveChunks, on) => self.live_chunks = on,
             MenuEvent::Toggled(MenuToggle::ChunkNotifications, on) => self.chunk_notifications = on,
             MenuEvent::Toggled(MenuToggle::VolumePane, on) => {
-                // Recorded, never written here. This dispatcher runs from inside
-                // `render_layers_panel`, which holds the active pane out of the
-                // vector with `mem::take` — so `self.panes[self.active_pane]` is a
-                // placeholder that the real pane going back overwrites, and a
-                // `set_kind` on it would be discarded with no error and no failing
-                // test. See the `pending_pane_kind` field on `Gui`.
+                // Recorded rather than written, through the one route the UI has.
+                //
+                // Not because this dispatcher is inside a `mem::take` window — it
+                // is not. `render_layers_panel` puts the active pane back at
+                // `ui_chrome.rs:425` and only then dispatches at `:438`, and
+                // `render_menu_bar_panel` takes no pane at all, so a direct
+                // `self.panes[self.active_pane].set_kind(..)` here would work
+                // today. It goes through `request_pane_kind` so that every writer
+                // of a pane's kind obeys one rule, including the ones WP-G adds
+                // inside `render_panes`' per-pane take, where the same direct
+                // write is silently discarded. See the `pending_pane_kind` field
+                // on `Gui` for both halves and for the one-frame cost.
                 self.request_pane_kind(
                     self.active_pane,
                     if on {
@@ -392,12 +398,13 @@ mod tests {
             gui.active_pane().kind(),
             // Both halves, because a pane conversion is deliberately a two-step
             // operation. Recording the request is the whole of what the
-            // dispatcher's arm does — the write itself cannot happen inside the UI
-            // pass at all (see the `pending_pane_kind` field on `Gui`) — so a
-            // fingerprint holding only the applied kind would report the arm as a
-            // no-op and `every_menu_entry_has_a_dispatcher_arm` would fail for a
-            // toggle that works. That the request lands on the *real* pane rather
-            // than on the `mem::take` placeholder is its own test, in `ui.rs`.
+            // dispatcher's arm does — applying it is a separate step, deferred to
+            // after the pane loop for reasons set out on the `pending_pane_kind`
+            // field — so a fingerprint holding only the *applied* kind would report
+            // the arm as a no-op and `every_menu_entry_has_a_dispatcher_arm` would
+            // fail for a toggle that works. That the request survives being
+            // recorded while a pane is held out of the vector is its own test, in
+            // `ui.rs`.
             gui.pending_pane_kind_for_test(),
         )
     }

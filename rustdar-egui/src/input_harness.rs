@@ -5701,14 +5701,17 @@ mod tests {
 
     /// 47. **Converting the active pane does not re-key the drawer menu.**
     ///
-    ///     The layers panel's kind-specific block sits inside a `scope_builder`
-    ///     with an explicit `UiBuilder::id`, and this is why. `Ui::new_child` folds
-    ///     the parent's `next_auto_id_salt` into every child's registered id, so
-    ///     two branches allocating different numbers of widgets — a map pane draws
-    ///     a loop transport and the whole overlay tree, a volume pane draws
-    ///     neither — shift the id of **everything drawn after them**. Below them,
-    ///     in the drawer, is the menu, which at every width without a menu bar is
-    ///     the only route to Exit and Settings.
+    ///     The layers panel's kind-specific block sits inside a child scope, and
+    ///     this is why. `Ui::new_child` folds the parent's `next_auto_id_salt` into
+    ///     every child's registered id, so two branches allocating different
+    ///     numbers of widgets — a map pane draws a loop transport and the whole
+    ///     overlay tree, a volume pane draws neither — shift the id of
+    ///     **everything drawn after them**. Below them, in the drawer, is the menu,
+    ///     which at every width without a menu bar is the only route to Exit and
+    ///     Settings. Any child scope fixes that, because a scope advances the
+    ///     parent's counter by exactly one however much it draws inside itself; the
+    ///     explicit `UiBuilder::id` the panel uses is for a different and weaker
+    ///     reason, set out on `render_layer_controls`.
     ///
     ///     [`converting_a_pane_moves_no_widget_id`] cannot see this: it converts a
     ///     *non-active* pane, so the panel's content does not change, and the
@@ -5717,8 +5720,12 @@ mod tests {
     ///     So the ids are compared directly, per label, which is what
     ///     `DrawnMenuLeaf::id` exists for.
     ///
-    ///     Verified by mutation: with the scope replaced by a bare `ui.scope`, or
-    ///     removed entirely, every id below the branch moves and this fails.
+    ///     Verified by mutation, and only in one direction: with the scope
+    ///     **removed** and the branch drawn straight onto the panel's `Ui`, every id
+    ///     below it moves and this fails. Replacing it with a bare `ui.scope` does
+    ///     *not* fail, and should not — all three forms advance the parent's counter
+    ///     by one, so it is the scope that is load-bearing here and not the id it
+    ///     was built with.
     #[test]
     fn converting_the_active_pane_does_not_re_key_the_drawer_menu() {
         let mut h = compact_with_drawer();

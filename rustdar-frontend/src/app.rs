@@ -918,6 +918,15 @@ impl App {
     /// only form that cannot be half-wired. It costs a walk of a map that is
     /// never longer than the pane count plus whatever one frame's switches left
     /// behind.
+    ///
+    /// **The absence of a `pane_has_no_plan_view` filter here is deliberate**, and
+    /// the one place in this file where adding one would be the bug. Every other
+    /// all-panes loop that names that predicate is asking "should this pane be
+    /// *given* a plan-view raster"; this one asks "is anyone still reading this
+    /// volume", and a section or a 3D pane reads the whole volume rather than one
+    /// tilt of it — so skipping it would free the very data it is sampling, on the
+    /// next frame, for ever. Pinned by
+    /// `a_whole_volume_pane_keeps_the_volume_it_is_sampling`.
     fn evict_unshown_scans(&mut self) {
         let mut shown: Vec<&str> = Vec::with_capacity(self.gui.pane_count() * 2);
         for idx in 0..self.gui.pane_count() {

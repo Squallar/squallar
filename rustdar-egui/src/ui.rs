@@ -283,29 +283,46 @@ pub struct Gui {
     last_dropdowns: Vec<DrawnDropdown>,
     /// A pane the user has asked to convert, applied once the UI pass is over.
     ///
-    /// # Why this cannot be a direct write
+    /// # Why the write is deferred, and what that is and is not protecting
     ///
     /// Two production paths hold a `PaneState` out of `Gui::panes` with
-    /// `std::mem::take` for the whole of a UI pass — `render_layers_panel` takes
-    /// the active pane, and `render_panes` takes each pane in turn — leaving a
-    /// default `PaneState` in the slot. The menu dispatcher runs from inside
-    /// `render_layers_panel`, so a `self.panes[self.active_pane].set_kind(..)`
-    /// there writes the **placeholder**, and the real pane going back on the next
-    /// line discards it. The menu item does nothing whatsoever: no panic, no
-    /// warning, no failing test, and a checkbox that will not stay checked.
+    /// `std::mem::take` for the whole of a pass — `render_layers_panel` takes the
+    /// active pane, and `render_panes` takes each pane in turn — leaving a default
+    /// `PaneState` in the slot. A `self.panes[idx].set_kind(..)` inside either
+    /// window writes the **placeholder**, and the real pane going back afterwards
+    /// discards it: no panic, no warning, and a control that will not stay set.
     ///
-    /// So the intent is recorded and [`Self::apply_pending_pane_kind`] applies it
-    /// after the pane loop, which is the same shape the drawn-cross-section line
-    /// uses for a related reason (growing the pane count mid-loop moves the rects
-    /// of panes the loop has not reached, desynchronising them from the ones
-    /// `detect_active_pane_click` hit-tested this frame).
+    /// **Today's menu dispatcher is not inside either window, and it is worth
+    /// being exact about that rather than leaving a scarier map behind.**
+    /// `render_layers_panel` takes the pane at `ui_chrome.rs:363` and puts it back
+    /// at `:425`; `apply_menu_event` is not called until `:438`, with the real pane
+    /// in the vector. The other dispatch site, `render_menu_bar_panel`, takes no
+    /// pane at all. So a direct write from the volume toggle would in fact work
+    /// today, and swapping this machinery out for one fails no behavioural test.
+    ///
+    /// It is still the right shape, for two reasons that are about the future
+    /// rather than the present. The writers WP-G adds — an armed section drag
+    /// resolving to a line, and the retarget rule that follows from it — run from
+    /// **inside** `render_panes`' per-pane take, where the hazard is live and
+    /// silent. And the ordering an interaction needs is the same one the pane count
+    /// needs: growing it mid-loop moves the rects of panes the loop has not
+    /// reached, desynchronising them from the ones `detect_active_pane_click`
+    /// hit-tested this frame. One deferral point, applied at
+    /// [`Self::apply_pending_pane_kind`] after the pane loop, serves both.
+    ///
+    /// The cost is one frame of latency in the current path: the dispatcher records
+    /// during chrome, and the conversion lands after `render_panes` — the same
+    /// frame, but the panes were already drawn from the old kind.
     ///
     /// One request at a time, not a queue. The requests are per pane and
     /// idempotent, they can only come from a single click, and a queue would let
     /// one frame convert a pane twice — which would throw away the per-kind state
     /// the intermediate kind had just been given.
     ///
-    /// Pinned by `a_pane_kind_request_survives_the_pane_being_held_out_of_the_vector`.
+    /// The deferral's *mechanism* is pinned by
+    /// `a_pane_kind_request_survives_the_pane_being_held_out_of_the_vector`, which
+    /// builds the take window by hand precisely because no production caller
+    /// currently provides one.
     pending_pane_kind: Option<(PaneId, crate::pane::PaneKind)>,
     viewport_sync: bool,
     sync_layers: bool,
@@ -1219,19 +1236,25 @@ impl Gui {
     /// branch ran. Pinned by
     /// `converting_the_active_pane_does_not_re_key_the_drawer_menu`.
     ///
-    /// The scope's id is [`egui::UiBuilder::id`] — the one form taking
-    /// `IdSource::Explicit`, which makes the child's `unique_id` equal its
-    /// `stable_id` and takes the parent's counter out of it entirely, as
-    /// `ui_chrome.rs`'s `status_error` note records. Here that is **defence, not a
-    /// fix for a live difference**, and it is worth saying so rather than
-    /// implying more: with `id_salt` the scope's `stable_id` would be the same
-    /// value, so everything keyed on it — the two combo boxes and the time-step
-    /// picker, i.e. all the stored state in here — would not move either, and
-    /// mutating the one form into the other fails no test. What the explicit form
-    /// buys is independence from *what precedes it*: `render_pane_selector` above
-    /// draws a button per offered pane count and a second row once the layout is
-    /// split, so the counter at this position moves when the pane count does, and
-    /// only the explicit id keeps this scope's children out of that.
+    /// The scope's id is [`egui::UiBuilder::id`] rather than `id_salt`, and what
+    /// that buys is independence from *what precedes it*. `id` is the one form
+    /// taking `IdSource::Explicit`, which makes the child's `unique_id` equal its
+    /// `stable_id`; `id_salt` leaves `unique_id` folded together with the parent's
+    /// `next_auto_id_salt`, and hence seeds this scope's own auto-id counter from
+    /// it. `render_pane_selector` above draws a button per offered pane count plus
+    /// a second row once the layout is split, so the counter at this position moves
+    /// whenever the pane count does — and only the explicit form keeps this scope's
+    /// children out of that. It is the same reason `ui_chrome.rs`'s `status_error`
+    /// note records for choosing it there.
+    ///
+    /// It is **defence rather than a fix for a live difference**, worth stating so
+    /// nobody reads more into it: mutating `id` into `id_salt` fails no test. Note
+    /// that this is *not* because the two produce the same id — they do not, since
+    /// `Id::with` wraps its argument in a second `IdSalt::new`, so an `id_salt`
+    /// scope's `stable_id` hashes the salt twice and lands somewhere else entirely.
+    /// It is because nothing in here is keyed to a *particular* value: the two
+    /// combo boxes and the time-step picker key off `stable_id`, which both forms
+    /// keep stable across a conversion, and stability is all they need.
     fn render_layer_controls(
         &mut self,
         ui: &mut egui::Ui,
@@ -1997,10 +2020,14 @@ impl Gui {
     ///
     /// **The only route by which the UI may change a pane's kind.**
     /// `PaneState::set_kind` is the mechanism and stays reachable for the config
-    /// loader and for test fixtures, but nothing drawing a frame may call it:
-    /// during the UI pass the pane it would write is a `mem::take` placeholder
-    /// about to be thrown away. See the [`pending_pane_kind`](Self::pending_pane_kind)
-    /// field.
+    /// loader and for test fixtures; nothing drawing a frame calls it, because two
+    /// UI paths hold the pane it would write out of the vector as a `mem::take`
+    /// placeholder about to be thrown away. The menu dispatcher, as it happens, is
+    /// *not* inside either window today — a direct write from it would work — so
+    /// this is one rule for both dispatch and the writers WP-G adds inside
+    /// `render_panes`' take, rather than a fix for a live bug on this path. The
+    /// [`pending_pane_kind`](Self::pending_pane_kind) field lays out which is
+    /// which.
     ///
     /// Out-of-range indices are recorded and dropped on application rather than
     /// refused here, so a caller inside the UI pass never has to know whether the
@@ -2704,26 +2731,37 @@ mod pane_slice_tests {
     /// A pane conversion asked for during the UI pass lands on the **real** pane,
     /// not on the placeholder standing in for it.
     ///
-    /// This is the pin on the write half of the `mem::take` hazard, and it is the
-    /// one the type system cannot help with. Two production paths hold a
-    /// `PaneState` out of the vector for a whole UI pass — `render_layers_panel`
-    /// takes the active pane, `render_panes` takes each pane in turn — leaving a
-    /// default `PaneState` in the slot. The menu dispatcher runs from inside
-    /// `render_layers_panel`, so the obvious implementation of the toggle's arm,
+    /// This pins the write half of the `mem::take` hazard: the thing the type
+    /// system cannot help with. Two production paths hold a `PaneState` out of the
+    /// vector for a whole pass — `render_layers_panel` takes the active pane,
+    /// `render_panes` takes each pane in turn — leaving a default `PaneState` in
+    /// the slot. Inside either window the obvious implementation of the toggle's
+    /// arm,
     ///
     /// ```ignore
     /// self.panes[self.active_pane].set_kind(kind);
     /// ```
     ///
-    /// writes the *placeholder*, and the line that puts the real pane back
-    /// discards it. The menu item does nothing at all: no panic, no warning, and
-    /// a checkbox that will not stay checked.
+    /// writes the *placeholder*, and the line that puts the real pane back discards
+    /// it: no panic, no warning, and a control that will not stay set.
     ///
-    /// The window is reproduced here exactly as those two functions create it —
-    /// take, dispatch, restore — so an implementation that wrote directly fails
-    /// this and nothing else. Driven through `apply_menu_event` rather than
-    /// through `request_pane_kind`, so it covers the arm and the mechanism
-    /// together; the end-to-end version through a real click is
+    /// # This test builds the window itself, because no caller currently provides
+    /// one
+    ///
+    /// Read the `std::mem::take` below as the load-bearing part of the fixture
+    /// rather than as scene-setting. Today's menu dispatch is **outside** both
+    /// windows — `render_layers_panel` restores the pane at `ui_chrome.rs:425` and
+    /// dispatches at `:438`, and `render_menu_bar_panel` takes no pane — so a
+    /// direct write from `apply_menu_event` would pass every behavioural test in
+    /// the suite, this one included, if this one did not hold the pane out by hand.
+    ///
+    /// That makes this a test of the *mechanism* and not of user-visible
+    /// behaviour, which is a thing worth saying out loud: it is here because
+    /// WP-G's writers run inside `render_panes`' take, where the same direct write
+    /// is silently discarded, and a test written after that code would be a test
+    /// written after the bug. Driven through `apply_menu_event` rather than
+    /// `request_pane_kind` so it covers the arm and the deferral together. The
+    /// end-to-end behavioural version, which passes either way, is
     /// `converting_the_active_pane_from_the_drawer_makes_it_a_volume_pane`.
     #[test]
     fn a_pane_kind_request_survives_the_pane_being_held_out_of_the_vector() {
