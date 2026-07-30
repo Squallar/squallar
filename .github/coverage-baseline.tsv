@@ -26,7 +26,7 @@ rustdar-egui/src/ui_popups.rs	163	4
 rustdar-egui/src/ui_settings.rs	220	177
 rustdar-frontend/src/app.rs	1338	1096
 rustdar-frontend/src/app_chunks.rs	354	212
-rustdar-frontend/src/app_fetch.rs	1030	462
+rustdar-frontend/src/app_fetch.rs	1030	474
 rustdar-frontend/src/app_render.rs	2292	1521
 rustdar-frontend/src/app_state.rs	80	0
 rustdar-frontend/src/channels.rs	43	40
@@ -100,12 +100,12 @@ rustdar-radar/src/hca.rs	2629	1949
 rustdar-radar/src/hhc.rs	595	314
 rustdar-radar/src/kdp.rs	918	600
 rustdar-radar/src/l3_values.rs	282	281
-rustdar-radar/src/level3.rs	773	421
+rustdar-radar/src/level3.rs	773	453
 rustdar-radar/src/nrot.rs	1356	1149
 rustdar-radar/src/palette.rs	177	144
 rustdar-radar/src/render.rs	1183	994
 rustdar-radar/src/render_input.rs	735	722
-rustdar-radar/src/scan.rs	244	26
+rustdar-radar/src/scan.rs	244	39
 rustdar-radar/src/sites.rs	106	106
 rustdar-radar/src/sounding.rs	234	207
 rustdar-radar/src/sources.rs	172	169
