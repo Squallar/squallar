@@ -3,6 +3,10 @@
 /target-ios
 /coverage
 /lcov.info
+# cargo-mutants writes its whole scratch build tree here, and rotates the
+# previous run alongside it.
+/mutants.out
+/mutants.out.old
 *.jks
 .env
 /.cargo/android-ndk-wrapper.cmake
