@@ -119,6 +119,31 @@ pub const MAX_RENDER_CACHE_ENTRIES: usize = 6;
 #[cfg(not(mobile))]
 pub const MAX_RENDER_CACHE_ENTRIES: usize = 8;
 
+/// The per-device-class voxel grid dimensions, named **outside** the `cfg`
+/// cascade so that all three are reachable from any target's tests.
+///
+/// A `cfg`-selected constant can only be checked by the target that compiles
+/// it, and this workspace runs `cargo test` on exactly one of the three. Spelt
+/// as literals inside the cascade, two of the three could be edited freely:
+/// the review that landed WP-C proved it by changing the wasm arm to
+/// `[160, 160, 80]` and watching the whole suite pass 1507/0 with the wasm
+/// `--all-targets` check exiting 0. That is the one-sided shape of the
+/// `needs_whole_volume` / `RenderInput::extract` divergence, and it is exactly
+/// what `the_grid_dimensions_match_the_shapes_rustdar_radar_names` exists to
+/// prevent — so the binding has to reach all three arms, and it can only do
+/// that if all three have names.
+///
+/// These are the frontend's copy of `rustdar_radar::voxel`'s `WASM_SHAPE`,
+/// `MOBILE_SHAPE` and `DESKTOP_SHAPE`. The duplication is forced rather than
+/// careless: only *this* crate's `build.rs` emits `mobile`, so only this crate
+/// can pick the middle arm, while the grid is built in `rustdar-radar`, which
+/// therefore has to name all three and let a caller choose.
+pub const WASM_VOLUME_GRID_CELLS: [u32; 3] = [128, 128, 64];
+/// The mobile arm. See [`WASM_VOLUME_GRID_CELLS`].
+pub const MOBILE_VOLUME_GRID_CELLS: [u32; 3] = [192, 192, 96];
+/// The desktop arm. See [`WASM_VOLUME_GRID_CELLS`].
+pub const DESKTOP_VOLUME_GRID_CELLS: [u32; 3] = [256, 256, 128];
+
 /// Cells along x, y and z in the Cartesian voxel grid a 3D volume renders from.
 ///
 /// Every axis is at or under 256 because that is what GLES 3.0 — and so WebGL2 —
@@ -132,12 +157,17 @@ pub const MAX_RENDER_CACHE_ENTRIES: usize = 8;
 /// documents. `mobile` is emitted by *this crate's* `build.rs`, so a copy of this
 /// constant placed in `rustdar-egui` or `rustdar-radar` would silently take the
 /// desktop arm on a phone.
+///
+/// The three arms select between [`WASM_VOLUME_GRID_CELLS`],
+/// [`MOBILE_VOLUME_GRID_CELLS`] and [`DESKTOP_VOLUME_GRID_CELLS`] rather than
+/// repeating their literals, so the selection is the only thing here that a
+/// host build cannot check.
 #[cfg(target_arch = "wasm32")]
-pub const VOLUME_GRID_CELLS: [u32; 3] = [128, 128, 64];
+pub const VOLUME_GRID_CELLS: [u32; 3] = WASM_VOLUME_GRID_CELLS;
 #[cfg(all(not(target_arch = "wasm32"), mobile))]
-pub const VOLUME_GRID_CELLS: [u32; 3] = [192, 192, 96];
+pub const VOLUME_GRID_CELLS: [u32; 3] = MOBILE_VOLUME_GRID_CELLS;
 #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
-pub const VOLUME_GRID_CELLS: [u32; 3] = [256, 256, 128];
+pub const VOLUME_GRID_CELLS: [u32; 3] = DESKTOP_VOLUME_GRID_CELLS;
 
 /// Bytes in the colour lookup table that travels with a voxel grid.
 ///
@@ -440,17 +470,49 @@ mod tests {
         use rustdar_radar::voxel::{DESKTOP_SHAPE, LUT_LEN, MOBILE_SHAPE, VoxelShape, WASM_SHAPE};
 
         let triple = |s: VoxelShape| [s.nx as u32, s.ny as u32, s.nz as u32];
-        assert_eq!(triple(WASM_SHAPE), [128, 128, 64]);
-        assert_eq!(triple(MOBILE_SHAPE), [192, 192, 96]);
-        assert_eq!(triple(DESKTOP_SHAPE), [256, 256, 128]);
 
-        // And that this target's arm is the matching one.
+        // **All three arms, unconditionally.** The first version of this test
+        // bound only the arm the running target compiled, which left two of
+        // the three free to drift — a reviewer changed the wasm triple to
+        // `[160, 160, 80]` and the entire workspace suite passed 1507/0 with
+        // the wasm `--all-targets` check exiting 0. Both sides are now named
+        // constants, so both sides are reachable from any host.
+        assert_eq!(WASM_VOLUME_GRID_CELLS, triple(WASM_SHAPE));
+        assert_eq!(MOBILE_VOLUME_GRID_CELLS, triple(MOBILE_SHAPE));
+        assert_eq!(DESKTOP_VOLUME_GRID_CELLS, triple(DESKTOP_SHAPE));
+
+        // Pinned literals as well as the binding, so that editing *both* sides
+        // in step — the one change the comparison above cannot see — still has
+        // to be deliberate.
+        assert_eq!(WASM_VOLUME_GRID_CELLS, [128, 128, 64]);
+        assert_eq!(MOBILE_VOLUME_GRID_CELLS, [192, 192, 96]);
+        assert_eq!(DESKTOP_VOLUME_GRID_CELLS, [256, 256, 128]);
+
+        // And that this target's cascade selected the matching one. This half
+        // *is* cfg-gated, because the cascade is the one thing here that no
+        // other target can check on its behalf.
         #[cfg(target_arch = "wasm32")]
-        assert_eq!(VOLUME_GRID_CELLS, triple(WASM_SHAPE));
+        assert_eq!(VOLUME_GRID_CELLS, WASM_VOLUME_GRID_CELLS);
         #[cfg(all(not(target_arch = "wasm32"), mobile))]
-        assert_eq!(VOLUME_GRID_CELLS, triple(MOBILE_SHAPE));
+        assert_eq!(VOLUME_GRID_CELLS, MOBILE_VOLUME_GRID_CELLS);
         #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
-        assert_eq!(VOLUME_GRID_CELLS, triple(DESKTOP_SHAPE));
+        assert_eq!(VOLUME_GRID_CELLS, DESKTOP_VOLUME_GRID_CELLS);
+
+        // Every axis must clear the WebGL2 floor on **every** arm, not just
+        // this one — that bound is the reason the triples are what they are,
+        // and it was previously checked on one arm out of three.
+        for cells in [
+            WASM_VOLUME_GRID_CELLS,
+            MOBILE_VOLUME_GRID_CELLS,
+            DESKTOP_VOLUME_GRID_CELLS,
+        ] {
+            for axis in cells {
+                assert!(
+                    (1..=WEBGL2_MAX_TEXTURE_DIMENSION_3D).contains(&axis),
+                    "{cells:?}"
+                );
+            }
+        }
 
         // The table travels *inside* the grid, so its size is one number in
         // two places too.
