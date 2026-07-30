@@ -359,6 +359,9 @@ pub struct VoxelRequest {
     /// Which moment. Anything [`crate::sampler::samplable`] refuses yields
     /// `None`.
     pub product: RadarProduct,
+    /// Cells per axis. Every axis must be in `1..=`[`MAX_AXIS`]; see
+    /// [`default_shape`] and the three named shapes for the sizes this module
+    /// budgets for.
     pub shape: VoxelShape,
     /// Whether to also keep the values in their own units.
     ///
@@ -1588,6 +1591,69 @@ mod tests {
         let centred = build_voxels(&scan, &request(ODD), SITE.0, SITE.1).unwrap();
         assert_eq!(centred.x_range_km(), (-60.0, 60.0));
         assert_eq!(centred.y_range_km(), (-60.0, 60.0));
+    }
+
+    /// Every number a renderer builds its model matrix from, asserted
+    /// together.
+    ///
+    /// The six range bounds plus the site are the whole contract of the
+    /// output: a renderer reading them is not allowed to look anything else
+    /// up, so an accessor quietly returning the wrong pair would put the
+    /// volume somewhere else on screen with nothing else disagreeing.
+    /// Mutation testing found `z_range_km_msl` and the height half of
+    /// `cell_centre_km` unasserted for exactly that reason — the horizontal
+    /// axes were covered and the vertical one was not.
+    #[test]
+    fn the_output_carries_everything_a_model_matrix_needs() {
+        let scan = scan_of(&|_, _| Some(35.0));
+        let req = VoxelRequest {
+            half_width_km: 37.5,
+            base_km_msl: 0.75,
+            top_km_msl: 15.25,
+            ..request(ODD)
+        };
+        let grid = build_voxels(&scan, &req, SITE.0, SITE.1).unwrap();
+        assert_eq!(grid.shape(), ODD);
+        assert_eq!(grid.x_range_km(), (-37.5, 37.5));
+        assert_eq!(grid.y_range_km(), (-37.5, 37.5));
+        assert_eq!(grid.z_range_km_msl(), (0.75, 15.25));
+        assert_eq!(grid.site(), SITE);
+        assert_eq!(grid.product(), RadarProduct::Reflectivity);
+        assert_eq!(
+            grid.value_range(),
+            (-32.5, 95.0),
+            "255 data levels of 0.5 dBZ from −32.0, with index 0 half a step \
+             under the bottom of them",
+        );
+
+        // Cell centres on all three axes at once, at the half-step, at both
+        // ends — a fencepost error moves the corner cells and leaves the
+        // middle alone.
+        let (dx, dy, dz) = (75.0 / 11.0, 75.0 / 13.0, 14.5 / 7.0);
+        let close = |got: Option<(f64, f64, f64)>, want: (f64, f64, f64)| {
+            let g = got.expect("inside the grid");
+            assert!(
+                (g.0 - want.0).abs() < 1e-9
+                    && (g.1 - want.1).abs() < 1e-9
+                    && (g.2 - want.2).abs() < 1e-9,
+                "cell centre {g:?} should be {want:?}",
+            );
+        };
+        close(
+            grid.cell_centre_km(0, 0, 0),
+            (-37.5 + dx / 2.0, -37.5 + dy / 2.0, 0.75 + dz / 2.0),
+        );
+        close(
+            grid.cell_centre_km(10, 12, 6),
+            (37.5 - dx / 2.0, 37.5 - dy / 2.0, 15.25 - dz / 2.0),
+        );
+        // And each axis's bound independently, so a guard covering two of the
+        // three survives neither.
+        assert_eq!(grid.cell_centre_km(11, 0, 0), None);
+        assert_eq!(grid.cell_centre_km(0, 13, 0), None);
+        assert_eq!(grid.cell_centre_km(0, 0, 7), None);
+        assert_eq!(grid.index_at(11, 0, 0), None);
+        assert_eq!(grid.value_at(0, 0, 7), None);
     }
 
     // ── The builder adds no geometry of its own ─────────────────────────────
