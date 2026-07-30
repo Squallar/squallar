@@ -212,17 +212,65 @@ pub const WEBGL2_MAX_TEXTURE_DIMENSION_3D: u32 =
 /// a doubled axis.
 ///
 /// **This budgets the volume texture only.** The pane-sized `Rgba8Unorm`
-/// offscreen target the raymarch renders into is a separate cost — roughly 3 MiB
-/// at 900 x 900 — and needs its own line when the code that allocates it lands.
-/// Folding it in here would make this ceiling untestable against
-/// [`VOLUME_GRID_CELLS`], which is the only thing it can currently be checked
-/// against.
+/// offscreen target the raymarch renders into is a separate cost, and it has
+/// its own line: [`VOLUME_OFFSCREEN_BUDGET_BYTES`]. Folding the two together
+/// would make this ceiling untestable against [`VOLUME_GRID_CELLS`], which is
+/// the only thing it can be checked against, and would leave a doubled grid
+/// axis hiding inside the offscreen's slack.
 #[cfg(target_arch = "wasm32")]
 pub const VOLUME_TEXTURE_BUDGET_BYTES: usize = 1536 * 1024;
 #[cfg(all(not(target_arch = "wasm32"), mobile))]
 pub const VOLUME_TEXTURE_BUDGET_BYTES: usize = 5 * 1024 * 1024;
 #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
 pub const VOLUME_TEXTURE_BUDGET_BYTES: usize = 12 * 1024 * 1024;
+
+/// The largest pane, in physical pixels, the offscreen budget is sized for.
+///
+/// Not a cascade, deliberately. A phone in landscape is about 2.6 Mpx and a
+/// browser canvas on a 1440p display is 3.7 Mpx, so one figure bounds every
+/// target; what differs per target is the *rung* applied to it
+/// (`volume::quality::PLATFORM_CEILING`), and that is where the per-target
+/// judgement belongs. Splitting it into two constants that both vary would let
+/// them drift against each other with nothing to notice.
+///
+/// A pane larger than this is not refused — `VolumeQuality::fit` steps down the
+/// resolution ladder and, at the bottom, shrinks proportionally. This figure is
+/// what the budget below is *checked* against, not a limit the code enforces.
+pub const VOLUME_OFFSCREEN_REFERENCE_PANE_PX: [u32; 2] = [2560, 1440];
+
+/// Ceiling on the pane-sized `Rgba8Unorm` target one volume renders into.
+///
+/// Unlike [`LOOP_TEXTURE_BUDGET_BYTES`] and [`VOLUME_TEXTURE_BUDGET_BYTES`],
+/// **this one is enforced at runtime**: `VolumeQuality::fit` walks down the
+/// resolution ladder until the offscreen fits it. That makes it a real bound on
+/// fill rate as well as on memory, which is the point — the offscreen exists so
+/// that resolution is tunable independently of pane size, and a budget is the
+/// only thing that makes the tuning happen without a human in the loop.
+///
+/// At [`VOLUME_OFFSCREEN_REFERENCE_PANE_PX`], with each target's own quality
+/// ceiling applied:
+///
+/// | target  | rung   | offscreen   | bytes     | budget |
+/// |---------|--------|-------------|----------:|-------:|
+/// | desktop | Native | 2560 x 1440 | 14.06 MiB | 20 MiB |
+/// | mobile  | Half   | 1280 x 720  |  3.52 MiB |  5 MiB |
+/// | wasm32  | Half   | 1280 x 720  |  3.52 MiB |  5 MiB |
+///
+/// Every arm keeps about 1.4x headroom, the same shape the two budgets above
+/// keep and for the same reason: enough for the alignment a real allocation
+/// carries, not enough to hide a doubling.
+///
+/// Consequence worth stating rather than discovering: a maximised pane on a 4K
+/// display is 31.6 MiB at `Native`, so it steps to `Half` and is upscaled by
+/// the blit's `Linear` sampler. On the measured hardware that is also the right
+/// call for fill rate — 4K native extrapolates to about 4 ms of a 16.7 ms frame
+/// for one pane.
+#[cfg(target_arch = "wasm32")]
+pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = 5 * 1024 * 1024;
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
+pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = 5 * 1024 * 1024;
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+pub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize = 20 * 1024 * 1024;
 
 /// The playback rates the loop timer is willing to divide by.
 ///
@@ -305,6 +353,15 @@ const _: () = const {
         );
         axis += 1;
     }
+
+    // The offscreen budget has to pay for at least one pixel, because
+    // `VolumeQuality::fit` guarantees a size of at least 1 x 1 and that is the
+    // one case where it can return something the budget cannot cover. Checked
+    // here rather than in a `#[test]` for the reason above: the arm that would
+    // go unexercised is the one only a wasm32 build selects.
+    assert!(VOLUME_OFFSCREEN_BUDGET_BYTES >= 4);
+    assert!(VOLUME_OFFSCREEN_REFERENCE_PANE_PX[0] > 0);
+    assert!(VOLUME_OFFSCREEN_REFERENCE_PANE_PX[1] > 0);
 };
 
 #[cfg(test)]
@@ -413,6 +470,50 @@ mod tests {
             "budget {} B is more than twice the actual {total} B — it would not \
              catch a doubled grid axis",
             VOLUME_TEXTURE_BUDGET_BYTES,
+        );
+    }
+
+    /// The reference pane fits this target's offscreen budget **at its own
+    /// quality ceiling**, i.e. without being degraded to get there.
+    ///
+    /// The sibling of `the_volume_grid_fits_the_target_texture_budget`, with
+    /// one extra assertion it does not need: the grid either fits or it does
+    /// not, whereas the offscreen would silently step down a rung. A budget
+    /// that forced the reference pane to degrade would pass a plain "fits"
+    /// check while quietly halving the resolution of every volume on a display
+    /// this target is meant to render at full size.
+    #[test]
+    fn the_reference_pane_fits_the_target_offscreen_budget_undegraded() {
+        let fitted = crate::volume::quality::reference_offscreen();
+        assert!(
+            fitted.bytes() <= VOLUME_OFFSCREEN_BUDGET_BYTES,
+            "a {:?} offscreen is {} B, over the {VOLUME_OFFSCREEN_BUDGET_BYTES} \
+             B budget",
+            fitted.size,
+            fitted.bytes(),
+        );
+        assert_eq!(
+            fitted.quality,
+            crate::volume::quality::PLATFORM_CEILING,
+            "the {VOLUME_OFFSCREEN_REFERENCE_PANE_PX:?} reference pane cannot be \
+             rendered at this target's own quality ceiling within a \
+             {VOLUME_OFFSCREEN_BUDGET_BYTES} B budget, so the ceiling describes \
+             a quality the budget never lets anything select"
+        );
+    }
+
+    /// And the offscreen budget is snug, exactly as the other two are.
+    ///
+    /// The realistic regression is the reference pane growing or the ceiling
+    /// moving up a rung — both of which double the figure, and both of which a
+    /// budget several times the real number would absorb without a word.
+    #[test]
+    fn the_offscreen_budget_is_not_slack_enough_to_hide_a_doubling() {
+        let total = crate::volume::quality::reference_offscreen().bytes();
+        assert!(
+            total * 2 > VOLUME_OFFSCREEN_BUDGET_BYTES,
+            "budget {VOLUME_OFFSCREEN_BUDGET_BYTES} B is more than twice the \
+             actual {total} B — it would not catch a doubled reference pane"
         );
     }
 

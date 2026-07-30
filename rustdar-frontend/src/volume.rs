@@ -26,6 +26,12 @@ use crate::constants::VOLUME_GRID_CELLS;
 
 #[path = "volume_degrade.rs"]
 pub mod degrade;
+#[path = "volume_quality.rs"]
+pub mod quality;
+#[path = "volume_raymarch.rs"]
+pub mod raymarch;
+#[path = "volume_uniform.rs"]
+pub mod uniform;
 
 pub use degrade::VolumeSupport;
 
