@@ -701,7 +701,7 @@ mod tests {
                     .iter()
                     .rev()
                     .map(|l| l.trim())
-                    .find(|l| !l.is_empty() && !l.starts_with("///"))
+                    .find(|l| !l.is_empty() && !l.starts_with("//"))
                     .unwrap_or_else(|| panic!("nothing at all precedes {name}"));
                 (
                     cfg.to_string(),
@@ -711,20 +711,49 @@ mod tests {
             .collect()
     }
 
-    /// The name of every `pub const` whose wasm32 arm this file declares,
-    /// sorted and deduplicated.
+    /// The name of every `const` whose wasm32 arm this file declares, sorted
+    /// and deduplicated.
     ///
     /// Keyed on the wasm32 arm because that is the one no build on this machine
     /// compiles. Two-arm `mobile` / `not(mobile)` cascades — the download and
-    /// render-cache caps — have no `target_arch` arm at all and so are not
+    /// render-cache caps — have no `target_arch` arm at all, so a host build
+    /// picks between the same two values a phone build would and they are not
     /// device-class cascades in this sense.
+    ///
+    /// Three near-misses this deliberately does *not* have, each of which was a
+    /// way to add a cascade the census could not see:
+    ///
+    /// - **a doc comment between the attribute and the item.** Legal Rust,
+    ///   `fmt`-clean, and a look at line `i + 1` alone walks straight past it.
+    ///   So the look-ahead skips `///`, `//` and blank lines, exactly as
+    ///   [`cascade_arms`] already does looking *back*.
+    /// - **`const` without `pub`, or an indented one.** Neither changes that the
+    ///   value is `cfg`-selected.
+    /// - **a wasm arm spelled some other way**, e.g. `all(target_arch =
+    ///   "wasm32")`. Matched on content rather than byte-for-byte: any `cfg`
+    ///   naming the wasm arch, other than the `not(...)` guard the sibling arms
+    ///   carry. The per-name check below then insists on the canonical spelling,
+    ///   so an odd one fails there rather than vanishing here.
     fn wasm_gated_constants(code: &str) -> Vec<&str> {
         let lines: Vec<&str> = code.lines().collect();
+        let is_wasm_arm = |line: &str| {
+            let line = line.trim();
+            line.starts_with("#[cfg(")
+                && line.contains(r#"target_arch = "wasm32""#)
+                && !line.contains(r#"not(target_arch = "wasm32")"#)
+        };
         let mut names: Vec<&str> = lines
             .iter()
             .enumerate()
-            .filter(|(_, line)| line.trim() == r#"#[cfg(target_arch = "wasm32")]"#)
-            .filter_map(|(i, _)| lines.get(i + 1)?.strip_prefix("pub const "))
+            .filter(|(_, line)| is_wasm_arm(line))
+            .filter_map(|(i, _)| {
+                lines[i + 1..]
+                    .iter()
+                    .map(|l| l.trim_start())
+                    .find(|l| !l.is_empty() && !l.starts_with("//"))
+            })
+            .map(|item| item.strip_prefix("pub ").unwrap_or(item))
+            .filter_map(|item| item.strip_prefix("const "))
             .filter_map(|rest| rest.split_once(':'))
             .map(|(name, _)| name)
             .collect();
@@ -777,18 +806,21 @@ mod tests {
             "LOOP_TEXTURE_BUDGET_BYTES",
             "VOLUME_GRID_CELLS",
             "VOLUME_TEXTURE_BUDGET_BYTES",
+            // Lifted by WP-I after this test first listed it as exempt. It is
+            // covered here as well as by
+            // `each_offscreen_budget_arm_selects_its_own_classs_constant`; the
+            // overlap is deliberate, because that test checks one cascade and
+            // this one checks that no cascade is missing.
+            "VOLUME_OFFSCREEN_BUDGET_BYTES",
         ];
 
         // Cascades that still spell their arms as literals, and so cannot be
         // checked here. Written down rather than left implicit: a test named
         // "every cfg arm" that silently covered six of seven would be the same
-        // shape of vacuity it exists to catch.
-        //
-        // `VOLUME_OFFSCREEN_BUDGET_BYTES` landed while this test was being
-        // written. Lifting it means parameterising `quality::reference_offscreen`
-        // and `quality::PLATFORM_CEILING` on the device class, which is a
-        // different change to a different module.
-        let exempt = ["VOLUME_OFFSCREEN_BUDGET_BYTES"];
+        // shape of vacuity it exists to catch. Empty today, and the mechanism
+        // stays because the next cascade to land will need it before it is
+        // lifted — as `VOLUME_OFFSCREEN_BUDGET_BYTES` did for one commit.
+        let exempt: [&str; 0] = [];
 
         // Every three-arm cascade in the file is one or the other, so adding a
         // new one is a failure here rather than a silent gap.
@@ -801,6 +833,26 @@ mod tests {
              new one has to be lifted into named arms and listed in `covered`, \
              or listed in `exempt` with the reason it cannot be."
         );
+
+        // An exemption has to still *be* one. The rot that matters runs the
+        // other way from the obvious one: a cascade gets lifted and nobody
+        // moves it out of `exempt`, so it looks accounted for while its arms go
+        // unchecked — which is exactly what happened to
+        // `VOLUME_OFFSCREEN_BUDGET_BYTES` between this test landing and WP-I
+        // lifting it, and the census did not notice. A lifted arm's right-hand
+        // side is a bare `SCREAMING_CASE` name; a literal never is.
+        for name in exempt {
+            for (cfg, rhs) in cascade_arms(code, name) {
+                assert!(
+                    !rhs.chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+                    "the {cfg} arm of {name} selects `{rhs}`, which is a named \
+                     constant, so {name} has been lifted. Move it from `exempt` \
+                     to `covered` — while it sits here its arms are checked by \
+                     nothing."
+                );
+            }
+        }
 
         for name in covered {
             let arms = cascade_arms(code, name);

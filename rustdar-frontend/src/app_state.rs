@@ -443,6 +443,18 @@ mod tests {
             .split_once("#[cfg(test)]")
             .expect("app_state.rs no longer has a test module");
 
+        // Every needle is counted before it is read. One occurrence is the
+        // claim; a second would mean whichever came first is what got checked,
+        // and a decoy in a doc comment or a string literal would be a second.
+        let unique = |needle: &str| {
+            let n = code.matches(needle).count();
+            assert_eq!(
+                n, 1,
+                "expected exactly one `{needle}` in app_state.rs, found {n}"
+            );
+        };
+
+        unique("const WEB: bool =");
         let definition = code
             .split_once("const WEB: bool =")
             .and_then(|(_, rest)| rest.split_once(';'))
@@ -459,11 +471,7 @@ mod tests {
             "device_limits(adapter.limits(), WEB)",
             "present_mode(WEB)",
         ] {
-            assert!(
-                code.contains(call),
-                "nothing in app_state.rs calls `{call}`, so that decision is no \
-                 longer taken on the arm this build is for"
-            );
+            unique(call);
         }
     }
 }

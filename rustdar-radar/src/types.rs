@@ -884,12 +884,27 @@ mod tests {
                 "NATIVE_IMAGE_SIZE",
             ),
         ] {
-            let expected = format!("{cfg}\npub const IMAGE_SIZE: usize = {arm};");
-            assert!(
-                code.contains(&expected),
-                "types.rs does not contain\n{expected}\nso the {cfg} build does \
+            // The definition under this `cfg`, counted before it is read: two
+            // would mean whichever came first is what got checked, and a decoy
+            // in a doc comment or a string literal would be a second.
+            let definition = format!("{cfg}\npub const IMAGE_SIZE: usize =");
+            let occurrences = code.matches(&definition).count();
+            assert_eq!(
+                occurrences, 1,
+                "expected exactly one IMAGE_SIZE definition under `{cfg}`, \
+                 found {occurrences}"
+            );
+            let at = code.find(&definition).expect("just counted one");
+            let (selected, _) = code[at + definition.len()..]
+                .split_once(';')
+                .expect("a const definition with no semicolon");
+            assert_eq!(
+                selected.trim(),
+                arm,
+                "the `{cfg}` arm selects `{}`, not `{arm}`, so that build does \
                  not get the image size named for it — and no host build can \
-                 evaluate that line."
+                 evaluate the line.",
+                selected.trim()
             );
         }
     }
