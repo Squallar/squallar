@@ -6300,7 +6300,7 @@ mod tests {
         h.mouse_release(to);
         h.frames_for(2, FRAME_DT);
         assert!(
-            h.pane_kinds().iter().any(|k| *k == PaneKind::CrossSection),
+            h.pane_kinds().contains(&PaneKind::CrossSection),
             "the still-armed mode did not draw the next line"
         );
     }
