@@ -538,25 +538,28 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
             return Vec::new();
         };
 
-        if !uploads.contains_key(&self.grid_id) {
-            let shape = self.grid.shape();
-            let Some(textures) = pipelines.upload_volume(
-                device,
-                queue,
-                [shape.nx as u32, shape.ny as u32, shape.nz as u32],
-                self.grid.indices(),
-                // Straight from the grid: the table travels inside it, and
-                // nothing here rewrites it. See the module doc.
-                self.grid.lut(),
-            ) else {
-                // `upload_volume` has already logged which invariant it refused
-                // on. Nothing to add, and nothing to draw.
-                return Vec::new();
-            };
-            uploads.insert(self.grid_id, textures);
-        }
-        let Some(textures) = uploads.get(&self.grid_id) else {
-            return Vec::new();
+        // Through the entry API rather than `contains_key` + `insert`, which is
+        // one hash lookup instead of two — and the upload is refusable, so this
+        // is a `match` on the entry rather than `or_insert_with`.
+        let textures = match uploads.entry(self.grid_id) {
+            std::collections::hash_map::Entry::Occupied(occupied) => occupied.into_mut(),
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let shape = self.grid.shape();
+                let Some(textures) = pipelines.upload_volume(
+                    device,
+                    queue,
+                    [shape.nx as u32, shape.ny as u32, shape.nz as u32],
+                    self.grid.indices(),
+                    // Straight from the grid: the table travels inside it, and
+                    // nothing here rewrites it. See the module doc.
+                    self.grid.lut(),
+                ) else {
+                    // `upload_volume` has already logged which invariant it
+                    // refused on. Nothing to add, and nothing to draw.
+                    return Vec::new();
+                };
+                vacant.insert(textures)
+            }
         };
 
         textures.write_uniform(queue, &self.uniform);
