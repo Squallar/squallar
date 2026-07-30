@@ -2,6 +2,25 @@ use crate::types::{MS_TO_MPH, RadarProduct};
 
 const TRANSPARENCY: u8 = 180;
 
+/// The colour of a **range-folded** gate: one whose true range is ambiguous
+/// past the unambiguous range of its cut's PRF.
+///
+/// [`get_color_for_value`] cannot produce this, and that is the point. A folded
+/// gate has no value — `MomentValue::RangeFolded` carries no number — so it
+/// arrives at a renderer as `NaN`, which every product paints fully
+/// transparent. A consumer that wants to *show* the fold (which
+/// [`crate::sampler::SampleStatus::RangeFolded`] finally makes possible) has to
+/// branch on the status and reach for this constant.
+///
+/// **Deliberately not the [`HHC`] table's class-150 entry**, which is the same
+/// idea for a different product: that one is a hydrometeor *class* code in a
+/// categorical scale, and sharing the constant would mean a future edit to the
+/// classification palette silently repainting every folded velocity gate.
+/// `the_range_folded_colour_is_unreachable_through_any_products_scale` pins that
+/// no product's own scale can produce this colour at any value, so a folded
+/// pixel is never mistaken for a measured one.
+pub(crate) const RANGE_FOLDED: (u8, u8, u8, u8) = (178, 102, 204, TRANSPARENCY);
+
 /// Ascending-threshold color scale: for value `v`, the color of the last entry
 /// whose threshold is <= `v`. The `bool` picks gradient (linear interpolation
 /// between stops) over discrete steps.
@@ -616,5 +635,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A folded gate must be unmistakable: no product's own scale may produce
+    /// [`RANGE_FOLDED`] at any value it can be asked about.
+    ///
+    /// This is what makes the constant worth having. If a reflectivity gradient
+    /// happened to pass through it, a cross-section's folded pixels would be
+    /// indistinguishable from a measured return at whatever dBZ landed there —
+    /// which is precisely the "looks plausible, is wrong" failure the status
+    /// plumbing exists to end. Swept densely over every product, including the
+    /// gradient interiors where an interpolated colour lives that no table entry
+    /// spells out.
+    #[test]
+    fn the_range_folded_colour_is_unreachable_through_any_products_scale() {
+        // The class-150 entry the plan corrected: the same *idea* for the
+        // hydrometeor classification, and deliberately a different constant.
+        assert_ne!(
+            (RANGE_FOLDED.0, RANGE_FOLDED.1, RANGE_FOLDED.2),
+            (100, 0, 150),
+            "the range-folded colour is the HHC class-150 entry again, so a \
+             change to the classification palette would repaint every folded \
+             velocity gate",
+        );
+
+        let products = [
+            RadarProduct::Reflectivity,
+            RadarProduct::Velocity,
+            RadarProduct::StormRelativeVelocity,
+            RadarProduct::SpectrumWidth,
+            RadarProduct::DifferentialReflectivity,
+            RadarProduct::CorrelationCoefficient,
+            RadarProduct::DifferentialPhase,
+            RadarProduct::SpecificDifferentialPhase,
+            RadarProduct::EchoTops,
+            RadarProduct::EchoTopsInterpolated,
+            RadarProduct::VerticallyIntegratedLiquid,
+            RadarProduct::VilDensity,
+            RadarProduct::ProbabilityOfSevereHail,
+            RadarProduct::MaxExpectedHailSize,
+            RadarProduct::HydrometeorClassification,
+            RadarProduct::PrecipitationRate,
+            RadarProduct::NormalizedRotation,
+        ];
+        let mut checked = 0usize;
+        for product in products {
+            // −200..+400 in hundredths covers every scale's domain: dBZ and
+            // classification codes at the top, m/s and ZDR in the middle,
+            // ρHV and inch/hr rates near zero, and negative velocity below.
+            for step in -20_000..=40_000 {
+                let value = step as f32 / 100.0;
+                assert_ne!(
+                    get_color_for_value(product, value),
+                    RANGE_FOLDED,
+                    "{product:?} paints {value} the range-folded colour",
+                );
+                checked += 1;
+            }
+        }
+        // precondition: the sweep really ran, so a loop bound quietly narrowed
+        // to nothing cannot leave this passing.
+        assert_eq!(checked, products.len() * 60_001);
     }
 }
