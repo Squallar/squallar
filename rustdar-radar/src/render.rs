@@ -379,15 +379,23 @@ pub fn find_closest_elevation(
 /// Both halves of that are one decision. This used to match the *first
 /// radial's* angle within 0.3°, and the wide window was a workaround for the
 /// first radial rather than a property of the radar: the antenna is still
-/// settling when a sweep opens, so the first radial misses its own cut's
-/// commanded angle by up to 0.43°, while the median lands within 0.05° of it on
-/// virtually every sweep. A window wide enough to absorb that drift is also
-/// wide enough to admit the *neighbouring* cut, and since the search runs
-/// newest-first it then answered with whichever cut came last rather than
-/// whichever was nearer. Measured over the live archive, that mislabelled a
-/// twentieth of all picker entries — one KDDC VCP 215 volume offered 0.5, 0.6,
-/// 0.7 and 0.8 and drew the *same* 0.48° sweep for all four, leaving its 0.88°
-/// cut unreachable.
+/// settling when a sweep opens, so across 951 archived sweeps the opening radial
+/// landed within 0.05° of its own cut's commanded angle only **36%** of the
+/// time, and missed it by as much as 0.23°. The median landed within 0.05° on
+/// **99.9%**, and never missed by more than 0.06°.
+///
+/// (0.23° is the first radial's error from nominal. The *span* of elevations
+/// within one sweep is a different and wider quantity — it reaches 0.43° — and
+/// the two are easy to confuse: the opening radial sits somewhere inside that
+/// span rather than at its extreme.)
+///
+/// A window wide enough to absorb that error is also wide enough to admit the
+/// *neighbouring* cut, and since the search runs newest-first it then answered
+/// with whichever cut came last rather than whichever was nearer. Measured over
+/// the live archive, that drew the wrong tilt for roughly **three quarters** of
+/// all picker entries — one KDDC VCP 215 volume offered 0.5, 0.6, 0.7 and 0.8
+/// and drew the *same* 0.48° sweep for all four, leaving its 0.88° cut
+/// unreachable.
 ///
 /// Removing the drift removes the need for the workaround: on the median, 0.1°
 /// is still twice the 0.05° worst case of the picker's own rounding, and it is
@@ -2040,6 +2048,32 @@ mod tests {
         Scan::new(crate::render_input::placeholder_coverage_pattern(), sweeps)
     }
 
+    /// Two sweeps of one cut, the second newer — newest-wins.
+    pub(super) fn sails_volume() -> Scan {
+        scan_of(vec![
+            settling_sweep(1, 0.30, 0.48, false),
+            settling_sweep(2, 0.71, 0.48, false),
+        ])
+    }
+
+    /// A split cut: a surveillance half and a newer Doppler half at one tilt —
+    /// the surveillance preference.
+    pub(super) fn split_cut_volume() -> Scan {
+        scan_of(vec![
+            settling_sweep(1, 0.30, 0.48, false),
+            settling_sweep(2, 0.71, 0.48, true),
+        ])
+    }
+
+    /// Two neighbouring cuts, both opening well off their own angle — the
+    /// window, and the KDDC case.
+    pub(super) fn adjacent_cut_volume() -> Scan {
+        scan_of(vec![
+            settling_sweep(1, 0.676, 0.44, false),
+            settling_sweep(2, 0.739, 0.84, true),
+        ])
+    }
+
     /// The tilt a sweep is found by is the one it flew, not the one it happened
     /// to open on. The first radial here is 0.68° and the flown cut is 0.44°:
     /// asking for 0.4° must reach it, and asking for 0.7° — which is where the
@@ -2219,9 +2253,10 @@ mod tests {
 ///
 /// Every policy is measured on the **same** downloaded volumes in one pass, so
 /// before and after are the same sample rather than two nights' weather.
-/// [`POLICIES`] names them; the shipped rule is one of the rows, and
-/// `the_audit_mirrors_the_shipped_find_sweep` in [`tests`] is what keeps this
-/// module honest about that.
+/// [`POLICIES`] names them, and one row is the shipped rule —
+/// [`the_audit_mirrors_the_shipped_find_sweep`] is what holds that claim, since
+/// [`chosen`] is a reimplementation of [`find_sweep`] and would otherwise go on
+/// measuring the old rule after the real one changed.
 ///
 /// ```text
 /// cargo test -p rustdar-radar --release --lib -- --ignored --nocapture elevation_labels
@@ -2505,14 +2540,96 @@ mod live_elevation_audit {
         h
     }
 
-    /// The sites the window was chosen on, and the sites it was confirmed on.
+    /// The site whose volume motivated the change, and which therefore cannot
+    /// be a holdout site.
+    ///
+    /// KDDC's VCP 215 volume — surveillance cuts opening at 0.676°/0.739° for
+    /// tilts of 0.44°/0.84° — is written into two offline guards
+    /// (`types::tests::the_picker_lists_the_tilt_each_sweep_flew` and
+    /// `render::tests::adjacent_cuts_are_reached_by_their_own_labels`). A site
+    /// that shaped the fix cannot also be evidence the fix generalises, so it
+    /// is named here rather than left to fall wherever the split lands.
+    pub(super) const MOTIVATING: &str = "KDDC";
+
+    /// The sites the window was chosen on (16) and the sites it was confirmed
+    /// on (6), **derived** from [`crate::twin::live::SITES`] rather than copied:
+    /// that constant's whole point is that a site quarantined or retired is
+    /// decided in one place.
+    ///
     /// Split so the choice cannot be tuned to the same volumes that justify it;
-    /// the holdout is never consulted until the window is fixed.
-    pub(super) const TUNING: &[&str] = &[
-        "KMPX", "KFSD", "KBIS", "KOAX", "KUEX", "KABR", "KTLX", "KMRX", "KTLH", "KMOB", "KSGF",
-        "KPAH", "KMLB", "KMTX", "KSFX",
-    ];
-    pub(super) const HOLDOUT: &[&str] = &["KMVX", "KLZK", "KSHV", "KEAX", "KDDC", "KAMA", "KFWS"];
+    /// the holdout is not consulted until the window is fixed. [`MOTIVATING`]
+    /// moves to the tuning side wherever it happens to sit in the list.
+    ///
+    /// Note KMSX — the site whose 359.82° base tilt names the sub-horizon bug —
+    /// is in neither list, because it is not in `SITES`. KMTX and KSFX are the
+    /// mountain-top sites that *are* here, and the harness prints any wrapped
+    /// cut it meets; across six of their volumes it met **none**. So this
+    /// harness is not evidence for that fix either way, and nothing here should
+    /// be read as if it were: the sub-horizon change rests on the field
+    /// definition and on `chunks::tests::
+    /// a_cut_below_the_horizon_is_wanted_by_the_angle_it_actually_points_at`.
+    pub(super) fn tuning() -> Vec<&'static str> {
+        crate::twin::live::SITES[..15]
+            .iter()
+            .copied()
+            .chain(std::iter::once(MOTIVATING))
+            .collect()
+    }
+
+    pub(super) fn holdout() -> Vec<&'static str> {
+        crate::twin::live::SITES[15..]
+            .iter()
+            .copied()
+            .filter(|s| *s != MOTIVATING)
+            .collect()
+    }
+
+    /// [`chosen`] under the shipped policy is [`find_sweep`] itself.
+    ///
+    /// [`chosen`] reimplements the selection so it can answer a sweep *index*
+    /// and so the retired policies stay measurable. That makes it a second copy
+    /// of a rule this crate owns, and an unwatched second copy is how a harness
+    /// comes to report on code that no longer exists — change the Doppler
+    /// family split, or the surveillance preference, and every number this
+    /// module prints would quietly describe the old one.
+    ///
+    /// Offline, and over volumes built to exercise the parts that could drift
+    /// apart: a SAILS repeat (newest-wins), a split cut (the surveillance
+    /// preference), two adjacent cuts (the window), and a tilt no cut flew
+    /// (both must answer nothing).
+    #[test]
+    fn the_audit_mirrors_the_shipped_find_sweep() {
+        let shipped = POLICIES
+            .iter()
+            .find(|p| p.elev == Elev::Median && (p.window - ELEVATION_WINDOW).abs() < 1e-9)
+            .copied()
+            .expect("one policy row must be the shipped rule");
+
+        for scan in [
+            tests::sails_volume(),
+            tests::split_cut_volume(),
+            tests::adjacent_cut_volume(),
+        ] {
+            for &product in &measured_products() {
+                for step in 0..=60u32 {
+                    let label = step as f32 * 0.05;
+                    let audit = chosen(&scan, product, label, shipped);
+                    let real = find_sweep(&scan, product, label);
+                    let real_index = real.map(|radials| {
+                        scan.sweeps()
+                            .iter()
+                            .position(|s| std::ptr::eq(s.radials(), radials))
+                            .expect("the sweep came from this scan")
+                    });
+                    assert_eq!(
+                        audit, real_index,
+                        "{product:?} at {label}°: the audit chose {audit:?} and \
+                         find_sweep chose {real_index:?}",
+                    );
+                }
+            }
+        }
+    }
 
     /// The products worth scoring: the ones a Level II sweep can actually be
     /// found for. A Level III-only product has no candidate sweeps at all and
@@ -2555,12 +2672,14 @@ mod live_elevation_audit {
             // own commanded angle for that cut.
             let (mut first_near, mut median_near, mut vcp_checked) = (0usize, 0usize, 0usize);
             let (mut first_outside_match, mut median_outside_match) = (0usize, 0usize);
+            let (mut worst_first_error, mut worst_median_error) = (0.0f64, 0.0f64);
             let mut worst_drift = 0.0f64;
             let mut drift_sum = 0.0f64;
             let mut drift_n = 0usize;
             let mut negative_cuts: Vec<String> = Vec::new();
 
-            for (group, sites) in [("tuning", TUNING), ("holdout", HOLDOUT)] {
+            for (group, sites) in [("tuning", tuning()), ("holdout", holdout())] {
+                let sites = sites.as_slice();
                 let g = group_totals
                     .entry(group)
                     .or_insert_with(|| vec![Harm::default(); POLICIES.len()]);
@@ -2611,6 +2730,14 @@ mod live_elevation_audit {
                                 .min_by(|a, b| (a - median).abs().total_cmp(&(b - median).abs()));
                             let Some(nominal) = nominal else { continue };
                             vcp_checked += 1;
+                            // The first radial's *own error from nominal*, which
+                            // is not the in-sweep span above: the span covers
+                            // settling and jitter at both ends, and the opening
+                            // radial sits somewhere inside it rather than at its
+                            // extreme. Conflating the two is what made a 0.42°
+                            // span read as a 0.42° labelling error.
+                            worst_first_error = worst_first_error.max((first - nominal).abs());
+                            worst_median_error = worst_median_error.max((median - nominal).abs());
                             if (first - nominal).abs() <= LABEL_ROUNDING {
                                 first_near += 1;
                             }
@@ -2668,11 +2795,16 @@ mod live_elevation_audit {
             if vcp_checked > 0 {
                 println!(
                     "sweeps {vcp_checked} | first radial within {LABEL_ROUNDING}° of nominal \
-                     {:.1}% | median {:.1}% | in-sweep drift mean {:.3}° worst {:.3}°",
+                     {:.1}% | median {:.1}% | in-sweep span mean {:.3}° worst {:.3}°",
                     100.0 * first_near as f64 / vcp_checked as f64,
                     100.0 * median_near as f64 / vcp_checked as f64,
                     drift_sum / drift_n.max(1) as f64,
                     worst_drift,
+                );
+                println!(
+                    "error from the cut's own nominal angle: first radial worst {worst_first_error:.3}°, \
+                     median worst {worst_median_error:.3}° \
+                     (the in-sweep span above is a wider quantity and not this one)",
                 );
                 println!(
                     "labels further than the chunk feed's 0.3 ELEVATION_MATCH from their own \

@@ -561,8 +561,11 @@ impl ElevationChunkMap {
     /// would never be wanted, never downloaded, and the lowest tilt of a
     /// mountain-top site would stay empty however long you waited for it.
     ///
-    /// Mountain-top sites only, and the same rule the cross-section ladder
-    /// already applies to its own elevation keys.
+    /// Mountain-top sites only. [`crate::sampler`] reaches the same rule for its
+    /// own elevation keys (`if key > 180.0 { key -= 360.0 }`) — arrived at
+    /// independently rather than copied from here, since neither existed when
+    /// the other was written, which is some evidence it is the right reading of
+    /// the field rather than a local patch.
     fn planned_angle_degrees(cut: &nexrad_model::data::ElevationCut) -> f32 {
         let angle = cut.elevation_angle_degrees();
         // Halfway round is far past any tilt a radar flies, so nothing legitimate
