@@ -859,6 +859,31 @@ impl super::App {
                 state.egui_renderer.free_textures(frame.textures_to_free());
 
                 if matches!(status, SurfaceStatus::Lost) {
+                    // A loss with a volume on screen is the one the 3D view has
+                    // to answer for, and it is counted BEFORE `self.state` is
+                    // dropped — because dropping it is exactly why the counter
+                    // cannot live in `AppState`. A WebGL2 context loss arrives
+                    // here, rebuilds the state, and would reset any counter kept
+                    // inside it; the volume would then be rebuilt, crash the
+                    // context again, and loop forever. `volume::degrade`'s
+                    // counter is a module-level `static` for that reason, and
+                    // after two such losses the view is permanently unavailable.
+                    //
+                    // Safe to read `panes()` here despite its `mem::take`
+                    // caveat: `present_frame` runs after the egui pass has
+                    // ended, never inside it.
+                    let volume_on_screen = self
+                        .gui
+                        .panes()
+                        .iter()
+                        .any(|pane| pane.kind() == rustdar_egui::pane::PaneKind::Volume);
+                    if volume_on_screen {
+                        let losses = crate::volume::degrade::note_surface_loss_with_volume();
+                        log::warn!(
+                            "wgpu surface lost with a 3D volume on screen ({losses} so far)"
+                        );
+                    }
+
                     // Surface is irrecoverably lost (e.g. display changed on a
                     // foldable). Drop the entire rendering state so the next
                     // handle_redraw() lazily recreates it with a fresh surface.

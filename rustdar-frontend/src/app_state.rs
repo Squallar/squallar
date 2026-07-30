@@ -2,6 +2,7 @@ use egui_wgpu::wgpu;
 use winit::window::Window;
 
 use crate::egui_renderer;
+use crate::volume;
 
 /// Minimum window dimension (width or height) in pixels
 const MIN_SIZE: u32 = 1;
@@ -69,6 +70,22 @@ pub struct AppState {
     pub surface_config: wgpu::SurfaceConfiguration,
     pub surface: wgpu::Surface<'static>,
     pub egui_renderer: egui_renderer::EguiRenderer,
+    /// The adapter the device came from, which used to be dropped here.
+    ///
+    /// It answers questions the device cannot: `get_texture_format_features` for
+    /// any format the app might later want, and `get_capabilities` for a surface
+    /// that is reconfigured after the fact. Both are needed by the 3D volume
+    /// view, and re-requesting an adapter to ask is not equivalent — a second
+    /// `request_adapter` may legitimately return a *different* one.
+    pub adapter: wgpu::Adapter,
+    /// What [`crate::volume::probe`] concluded about this device, before
+    /// anything was created on it.
+    ///
+    /// Read it through [`crate::volume::support`] rather than directly:
+    /// failures recorded since the probe ran — a rejected resource, a twice-lost
+    /// surface — outrank it, and they deliberately live outside this struct
+    /// because a lost surface destroys this struct. See `volume::degrade`.
+    pub volume_support: volume::VolumeSupport,
     max_surface_dimension: u32,
 }
 
@@ -107,6 +124,22 @@ impl AppState {
             .await
             .expect("Failed to create device");
 
+        // Before a single volume resource exists, and before anything can fail
+        // asynchronously: purely limits the device already reports and format
+        // features the adapter already knows. Note `required_features` stays
+        // `Features::empty()` and `device_limits` is untouched — an uncompressed
+        // 3D texture needs no feature, and the web arm's `using_resolution`
+        // already lifts `max_texture_dimension_3d`.
+        let volume_support = volume::probe(&adapter, &device.limits());
+        if let Some(why) = volume_support.reason() {
+            log::info!("3D volume view unavailable: {why}");
+        }
+        // Installed unconditionally, including when the probe already said no:
+        // the handler's other job is to keep wgpu's panicking default from
+        // taking a browser tab down over an error a release build could survive.
+        // Read the trade in `volume::install_error_latch` before moving this.
+        volume::install_error_latch(&device);
+
         let swapchain_capabilities = surface.get_capabilities(&adapter);
         let swapchain_format = select_surface_format(&swapchain_capabilities);
 
@@ -139,6 +172,8 @@ impl AppState {
             surface,
             surface_config,
             egui_renderer,
+            adapter,
+            volume_support,
             max_surface_dimension,
         }
     }
