@@ -950,11 +950,11 @@ mod selection_tests {
             }
             app.gui.pane_mut(1).unwrap().loop_state = loop_on("KTLX");
             assert_eq!(
-                app.gui
-                    .pane(1)
-                    .and_then(|p| p.scan_info.is_some().then_some(())),
-                level3.then_some(()),
-                "precondition: pane 1 resolves params only in the Level III arm"
+                app.gui.get_rendering_params_for_pane(1).is_some(),
+                level3,
+                "precondition: pane 1 must resolve params in the Level III arm — so \
+                 the `is_level3` skip is what would drop it — and not resolve them \
+                 in the other, so the params guard is"
             );
             assert!(
                 app.gui.get_rendering_params_for_pane(0).is_some(),
