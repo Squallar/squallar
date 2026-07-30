@@ -5672,6 +5672,210 @@ mod section_dispatch_tests {
         assert_eq!(state(&app).rendered_for, None);
     }
 
+    /// A cut of the right shape and no content, for the receive path.
+    fn blank_cut() -> Box<rustdar_radar::xsect::CrossSection> {
+        use rustdar_radar::sampler::SampleStatus;
+        use rustdar_radar::xsect::{CrossSection, SECTION_HEIGHT, SECTION_WIDTH, SectionAxes};
+        let pixels = SECTION_WIDTH * SECTION_HEIGHT;
+        Box::new(
+            CrossSection::from_parts(
+                vec![0u8; pixels * 4],
+                vec![f32::NAN; pixels],
+                vec![SampleStatus::NoCoverage.wire_code(); pixels],
+                SectionAxes {
+                    length_km: 100.0,
+                    base_km_msl: 0.4,
+                    top_km_msl: 20.4,
+                    near_ground_range_km: 10.0,
+                    far_ground_range_km: 110.0,
+                    coverage_ground_range_km: 0.0,
+                    cone_of_silence_km: 0.0,
+                    tilt_count: 1,
+                    widest_tilt_gap_deg: 0.0,
+                },
+            )
+            .expect("a full-size, all-NoCoverage section is well formed"),
+        )
+    }
+
+    /// A cut lands on the pane that asked for it, and clears its in-flight flag.
+    #[test]
+    fn a_finished_cut_lands_on_the_pane_that_asked_for_it() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
+        let target = app.section_target_for_pane(0).expect("aimed with a volume");
+        app.gui
+            .pane_mut(0)
+            .unwrap()
+            .cross_section_mut()
+            .unwrap()
+            .rendered_for = Some(target.clone());
+        app.render.pane_render[0].render_in_flight = true;
+
+        app.channels
+            .section_sender
+            .send(crate::channels::SectionResponse {
+                pane_idx: 0,
+                generation: app.render.render_generation,
+                target,
+                section: Some(blank_cut()),
+            })
+            .expect("the receiver is alive");
+        app.poll_section_results(&ctx);
+
+        assert!(
+            state(&app).section.is_some(),
+            "the cut never reached the pane"
+        );
+        assert!(
+            state(&app).texture.is_some(),
+            "the raster was never uploaded"
+        );
+        assert_eq!(state(&app).unavailable, None);
+        assert!(
+            !app.render.pane_render[0].render_in_flight,
+            "a pane that never hears back stops asking for another cut"
+        );
+    }
+
+    /// A cut for a line the pane is no longer aimed along is dropped, and the
+    /// key is left alone.
+    ///
+    /// A section takes an order of magnitude longer to produce than the user
+    /// takes to draw another line over it, so this is ordinary rather than
+    /// exotic — and the failure is the worst kind: a section of the *previous*
+    /// line, on screen, captioned with the current volume, looking authoritative.
+    #[test]
+    fn a_cut_for_a_line_the_pane_has_left_behind_is_dropped() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
+        let superseded = app.section_target_for_pane(0).expect("aimed with a volume");
+
+        // The pane moves on: a new line, and the key that goes with it.
+        app.gui
+            .pane_mut(0)
+            .unwrap()
+            .cross_section_mut()
+            .unwrap()
+            .line = SectionLine::new(
+            GeoPoint {
+                lat: 35.0,
+                lon: -97.8,
+            },
+            GeoPoint {
+                lat: 36.4,
+                lon: -95.9,
+            },
+        );
+        let current = app.section_target_for_pane(0).expect("still aimed");
+        assert_ne!(
+            current, superseded,
+            "precondition: the pane really moved on"
+        );
+        app.gui
+            .pane_mut(0)
+            .unwrap()
+            .cross_section_mut()
+            .unwrap()
+            .rendered_for = Some(current.clone());
+
+        app.channels
+            .section_sender
+            .send(crate::channels::SectionResponse {
+                pane_idx: 0,
+                generation: app.render.render_generation,
+                target: superseded,
+                section: Some(blank_cut()),
+            })
+            .expect("the receiver is alive");
+        app.poll_section_results(&ctx);
+
+        assert!(
+            state(&app).section.is_none(),
+            "a cut of the line the user has already replaced is on screen"
+        );
+        assert_eq!(
+            state(&app).rendered_for,
+            Some(current),
+            "the superseded cut took the key with it, so the cut still in flight \
+             will be dropped too and the pane will wait for ever"
+        );
+    }
+
+    /// A cut answering nothing says so, rather than leaving the pane looking as
+    /// though it were still working.
+    #[test]
+    fn a_cut_that_answered_nothing_says_it_failed() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
+        let target = app.section_target_for_pane(0).expect("aimed with a volume");
+        app.gui
+            .pane_mut(0)
+            .unwrap()
+            .cross_section_mut()
+            .unwrap()
+            .rendered_for = Some(target.clone());
+
+        app.channels
+            .section_sender
+            .send(crate::channels::SectionResponse {
+                pane_idx: 0,
+                generation: app.render.render_generation,
+                target,
+                section: None,
+            })
+            .expect("the receiver is alive");
+        app.poll_section_results(&ctx);
+
+        assert_eq!(
+            state(&app).unavailable,
+            Some(SectionUnavailable::RenderFailed),
+            "a pane that will never get a picture must not look like one that is \
+             about to"
+        );
+    }
+
+    /// A result from a superseded *generation* is dropped **and clears the key**.
+    ///
+    /// The opposite of the case above, and the asymmetry is the point. There the
+    /// pane has already asked for something else, so its key belongs to a cut
+    /// still in flight. Here the pane is still waiting and the answer has been
+    /// thrown away, so leaving the key would tell the dispatcher this cut had
+    /// been answered — and nothing else would ever ask again.
+    #[test]
+    fn a_result_from_a_dead_generation_puts_the_pane_back_to_asking() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
+        let target = app.section_target_for_pane(0).expect("aimed with a volume");
+        app.gui
+            .pane_mut(0)
+            .unwrap()
+            .cross_section_mut()
+            .unwrap()
+            .rendered_for = Some(target.clone());
+        let stale = app.render.render_generation;
+        app.render.render_generation += 1;
+
+        app.channels
+            .section_sender
+            .send(crate::channels::SectionResponse {
+                pane_idx: 0,
+                generation: stale,
+                target,
+                section: Some(blank_cut()),
+            })
+            .expect("the receiver is alive");
+        app.poll_section_results(&ctx);
+
+        assert!(state(&app).section.is_none(), "a stale cut was drawn");
+        assert_eq!(
+            state(&app).rendered_for,
+            None,
+            "the key outlived the answer that was thrown away, so the pane will \
+             never ask again and never show a section"
+        );
+    }
+
     /// A new volume for the site makes the section on screen stale **by the
     /// same comparison** that notices a moved endpoint or a changed moment.
     ///

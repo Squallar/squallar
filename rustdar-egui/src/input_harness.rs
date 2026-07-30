@@ -516,6 +516,40 @@ impl InputHarness {
         self.warm_up();
     }
 
+    /// Put a finished cut on pane `idx`, as `poll_section_results` does — a
+    /// full-size raster and a texture for it — so the pane draws its picture
+    /// rather than its "cutting…" state.
+    ///
+    /// `axes` is the caller's, because the caption is computed from it and the
+    /// numbers in the caption are the whole reason the caption exists.
+    pub(crate) fn place_section(&mut self, idx: usize, axes: rustdar_radar::xsect::SectionAxes) {
+        use rustdar_radar::sampler::SampleStatus;
+        use rustdar_radar::xsect::{CrossSection, SECTION_HEIGHT, SECTION_WIDTH};
+        let pixels = SECTION_WIDTH * SECTION_HEIGHT;
+        let cut = CrossSection::from_parts(
+            vec![0u8; pixels * 4],
+            vec![f32::NAN; pixels],
+            vec![SampleStatus::BelowLowestBeam.wire_code(); pixels],
+            axes,
+        )
+        .expect("a full-size, all-BelowLowestBeam section is well formed");
+        let texture = self.ctx.load_texture(
+            format!("harness-section-{idx}"),
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::NEAREST,
+        );
+        let section = self
+            .gui
+            .pane_mut(idx)
+            .unwrap_or_else(|| panic!("no pane {idx}"))
+            .cross_section_mut()
+            .expect("pane is not a section pane");
+        section.section = Some(std::sync::Arc::new(cut));
+        section.texture = Some(texture);
+        section.unavailable = None;
+        self.warm_up();
+    }
+
     /// Convert pane `idx` to a cross-section pane that has **not been aimed**,
     /// as arming the draw and then converting a pane would leave it.
     ///
@@ -6173,7 +6207,67 @@ mod tests {
         );
     }
 
-    /// 46. **A wheel-zoom part-way through a drag does not move the anchor.**
+    /// 46. **A rendered section says, in words and in its own numbers, that its
+    ///     vertical extent belongs to the tilt ladder.**
+    ///
+    ///     The third of the three honesty devices — the drawn rungs and the
+    ///     `NEAREST` upload are the other two — and the only one a test can read
+    ///     back as text. Deliberately not a dismissible banner: what it says is
+    ///     not a one-off notice but the standing meaning of every pixel in the
+    ///     pane.
+    ///
+    ///     Asserted through the ladder's *own* numbers, because a caption saying
+    ///     the same thing whatever the volume was would be boilerplate a reader
+    ///     learns to skip. 14 rungs 0.5° apart and 5 rungs 5° apart are the same
+    ///     sentence with entirely different consequences.
+    #[test]
+    fn a_rendered_section_says_its_depth_is_the_ladders_and_not_measured() {
+        use rustdar_radar::xsect::SectionAxes;
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.load_scan("KTLX");
+        let (a, b) = section_ends();
+        h.make_pane_cross_section(0, a, b);
+        h.place_section(
+            0,
+            SectionAxes {
+                length_km: 100.0,
+                base_km_msl: 0.4,
+                top_km_msl: 20.4,
+                near_ground_range_km: 10.0,
+                far_ground_range_km: 110.0,
+                coverage_ground_range_km: 110.0,
+                cone_of_silence_km: 0.0,
+                tilt_count: 14,
+                widest_tilt_gap_deg: 4.9,
+            },
+        );
+
+        let pane = h.pane_rects()[0];
+        assert!(
+            !h.text_painted_in(pane, crate::ui::CROSS_SECTION_EMPTY_STATE),
+            "precondition: the pane must be drawing a picture, not its empty state"
+        );
+
+        for phrase in [
+            // The ladder's own count and its widest step, so the warning is a
+            // measurement of *this* volume rather than a fixed sentence.
+            "14 tilts",
+            "4.9",
+            // What the reader must not do with the picture.
+            "not measured",
+            // And the registration caveat against the plan view above it, which
+            // a user comparing the two would otherwise discover as a bug.
+            "slant range",
+        ] {
+            assert!(
+                h.text_painted_in(pane, phrase),
+                "the section pane never said {phrase:?}; it painted {:?}",
+                h.painted_text_strings_in(pane)
+            );
+        }
+    }
+
+    /// 47. **A wheel-zoom part-way through a drag does not move the anchor.**
     ///
     ///     The reason the anchor is stored as *ground* and converted inside
     ///     `Map::show` on the press frame. An armed draw suppresses panning but
