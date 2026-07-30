@@ -99,7 +99,10 @@
 //! cursor. It is **not** the `1.0 / 111.32` degrees-per-km that
 //! [`crate::types::ImageBounds`] implies, which is a 6378 km sphere: that is a
 //! known 0.11 % inconsistency in the image bounds, and reproducing it here
-//! would spread it instead of containing it.
+//! would spread it instead of containing it. The map's hover readout reads
+//! [`site_bearing_range_km`] for exactly that reason — it is the range and
+//! azimuth of the ground the plan view put under the cursor, so it has to be
+//! measured the way the plan view placed it.
 //!
 //! [`ground_range_km`] is the tangent-plane projection `r·cos e`, matching
 //! `render_gate`'s own `r·sin az` / `r·cos az`, and not the spherical arc
@@ -213,10 +216,12 @@ pub fn height_at_ground_km(ground_range_km: f64, elev_deg: f64) -> f64 {
 /// walk. Haversine distance on [`EARTH_RADIUS_KM`] and the standard forward
 /// azimuth.
 ///
-/// Note that `ui_map::compute_hover_info_raw` computes the same pair inline for
-/// its hover readout, on the same constant. The two agree today; making that
-/// structural is a de-duplication for whichever work first consumes this, not a
-/// property anything currently enforces.
+/// `ui_map::compute_hover_info_raw` used to compute the same pair inline for its
+/// hover readout and now calls this. The de-duplication is provably not a change
+/// to the readout: `the_hover_readouts_polar_coordinates_are_bit_identical_to_the_deleted_copy`
+/// carries the deleted spelling and compares bit patterns, and the one place the
+/// two forms *can* diverge — the clamp below, which the inline copy had no
+/// counterpart for — is measured there too.
 ///
 /// Distance is a *ground* range, so pairing it with a slant-range gate index
 /// wants [`slant_range_for_ground_km`] in between.
@@ -746,6 +751,136 @@ mod tests {
             (EARTH_RADIUS_KM * std::f64::consts::PI / 180.0 - 111.32).abs() > 0.1,
             "precondition: the 6371 sphere and `ImageBounds`' implied 111.32 \
              km/° have converged, so recording the seam is pointless",
+        );
+    }
+
+    /// The hover readout's own haversine and forward azimuth, deleted from
+    /// `ui_map::compute_hover_info_raw` in favour of this module, pinned against
+    /// the spelling that replaced it.
+    ///
+    /// Float multiplication does not associate, and the two spellings do not
+    /// group the radius the same way — the copy computed `Rₑ · (2 · atan2(..))`
+    /// and this module computes `(Rₑ · 2) · atan2(..)`. They agree because the
+    /// factor is 2, which scales exactly, but that is a fact about this
+    /// expression and not a general licence: the same de-duplication with a
+    /// factor of 3 in it would have moved every range the readout has ever
+    /// printed. This is what says the digits did not move.
+    ///
+    /// The two are *not* identical everywhere, and the exception is measured
+    /// rather than waved past. The copy had no counterpart to the `clamp`, so at
+    /// a point antipodal to the site to within rounding it produced a `NaN`
+    /// range where this produces the half-circumference. The window is about
+    /// 5e-13 degrees wide — nine orders of magnitude below the ~3e-7 degrees one
+    /// screen pixel spans at the deepest zoom the map offers, and the hover
+    /// coordinates are unprojected from an integer pixel — so no cursor can
+    /// address it, and the readout it replaces is `NaN` rather than a number.
+    #[test]
+    fn the_hover_readouts_polar_coordinates_are_bit_identical_to_the_deleted_copy() {
+        /// Transcribed character-for-character from the deleted block, including
+        /// the association of the radius and the absence of a clamp. Do not
+        /// "tidy" it: its value is that it is literally what shipped.
+        fn deleted_copy(
+            site_lat: f64,
+            site_lon: f64,
+            hover_lat: f64,
+            hover_lon: f64,
+        ) -> (f64, f64) {
+            let lat1 = site_lat.to_radians();
+            let lon1 = site_lon.to_radians();
+            let lat2 = hover_lat.to_radians();
+            let lon2 = hover_lon.to_radians();
+            let dlat = lat2 - lat1;
+            let dlon = lon2 - lon1;
+            let a =
+                (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+            let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+            let distance_km = EARTH_RADIUS_KM * c;
+
+            let y = dlon.sin() * lat2.cos();
+            let x = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
+            let azimuth = (y.atan2(x).to_degrees() + 360.0) % 360.0;
+            (azimuth, distance_km)
+        }
+
+        // Nine sites spanning the network rather than one: the azimuth's `x`
+        // term carries `sin φ`, so a single mid-latitude site would leave the
+        // equatorial and sub-polar ends of the network untested, and PGUA is
+        // the only one east of the antimeridian.
+        let sites = [
+            ("KTLX", 35.3333, -97.2778),
+            ("KMPX", 44.8489, -93.5656),
+            ("KBGM", 42.1997, -75.9847),
+            ("KEWX", 29.7039, -98.0283),
+            ("KATX", 48.1945, -122.4958),
+            ("PABC", 60.7919, -161.8763),
+            ("PHKI", 21.8938, -159.5522),
+            ("TJUA", 18.1156, -66.0781),
+            ("PGUA", 13.4556, 144.8111),
+        ];
+
+        let mut checked = 0_u32;
+        for (name, site_lat, site_lon) in sites {
+            // Out to ±6°, which is past the 460 km the widest plan view draws,
+            // in steps small enough to land between the grid nodes.
+            for i in -30..=30 {
+                for j in -30..=30 {
+                    let hover_lat = site_lat + f64::from(i) * 0.2137;
+                    let hover_lon = site_lon + f64::from(j) * 0.2137;
+                    let (az_old, range_old) =
+                        deleted_copy(site_lat, site_lon, hover_lat, hover_lon);
+                    let (az_new, range_new) =
+                        site_bearing_range_km(site_lat, site_lon, hover_lat, hover_lon);
+                    assert_eq!(
+                        range_old.to_bits(),
+                        range_new.to_bits(),
+                        "{name} -> ({hover_lat}, {hover_lon}): range {range_old} became {range_new}",
+                    );
+                    assert_eq!(
+                        az_old.to_bits(),
+                        az_new.to_bits(),
+                        "{name} -> ({hover_lat}, {hover_lon}): azimuth {az_old} became {az_new}",
+                    );
+                    checked += 1;
+                }
+            }
+            // And the far field a panned-out map reaches, the site's own
+            // antipode included — the exact antipode agrees, so the divergence
+            // below really is confined to the rounding around it.
+            for lat in [-89.9, -45.0, 0.0, 45.0, 89.9, -site_lat] {
+                for lon in [-179.9, -90.0, 0.0, 90.0, 179.9, site_lon + 180.0] {
+                    let (az_old, range_old) = deleted_copy(site_lat, site_lon, lat, lon);
+                    let (az_new, range_new) = site_bearing_range_km(site_lat, site_lon, lat, lon);
+                    assert_eq!(
+                        range_old.to_bits(),
+                        range_new.to_bits(),
+                        "{name} -> ({lat}, {lon}): range {range_old} became {range_new}",
+                    );
+                    assert_eq!(az_old.to_bits(), az_new.to_bits());
+                    checked += 1;
+                }
+            }
+        }
+        // precondition: the grid ran at full size. Exact rather than a floor, so
+        // a loop bound quietly narrowed to one site or one ring fails here
+        // instead of leaving a weaker test passing.
+        assert_eq!(checked, 33_813, "the comparison grid changed size");
+
+        // The one divergence, in the direction that only ever replaces a
+        // non-number. Two ulps off KTLX's antipodal latitude is enough to round
+        // the haversine over 1.0.
+        let (site_lat, site_lon) = (35.3333, -97.2778);
+        let (near_antipodal_lat, antipodal_lon) = (-35.33329999999999, 82.7222);
+        let (_, range_old) = deleted_copy(site_lat, site_lon, near_antipodal_lat, antipodal_lon);
+        let (_, range_new) =
+            site_bearing_range_km(site_lat, site_lon, near_antipodal_lat, antipodal_lon);
+        assert!(
+            range_old.is_nan(),
+            "precondition: the deleted copy answered {range_old} here, so the \
+             clamp is what this pair is testing",
+        );
+        assert!(
+            (range_new - EARTH_RADIUS_KM * std::f64::consts::PI).abs() < 1e-6,
+            "the clamp should give the half-circumference, gave {range_new}",
         );
     }
 

@@ -1,7 +1,8 @@
 use crate::actions::GuiAction;
 use crate::pane::PaneKind;
 use rustdar_overlays::render::overlay_state::OverlayKind;
-use rustdar_radar::types::{EARTH_RADIUS_KM, IMAGE_SIZE, RadarProduct};
+use rustdar_radar::beam;
+use rustdar_radar::types::{IMAGE_SIZE, RadarProduct};
 use rustdar_units::UserPreferences;
 
 #[path = "ui_map_pane.rs"]
@@ -484,25 +485,26 @@ pub(super) struct HoverInput {
 }
 
 /// Compute hover info string from raw value data and site coordinates.
+///
+/// The radar-relative half of the readout comes from
+/// [`beam::site_bearing_range_km`], the crate's one spelling of "where is this
+/// point, from the radar" — it used to be a second copy of that haversine and
+/// forward azimuth inline here. Both spellings measure on
+/// [`rustdar_radar::types::EARTH_RADIUS_KM`], and
+/// `the_hover_readouts_polar_coordinates_are_bit_identical_to_the_deleted_copy`
+/// pins that the readout's digits did not move.
 pub(super) fn compute_hover_info_raw(
     value_data: &[f32],
     input: &HoverInput,
     product: RadarProduct,
     prefs: &UserPreferences,
 ) -> String {
-    let lat1 = input.site_lat.to_radians();
-    let lon1 = input.site_lon.to_radians();
-    let lat2 = input.hover_lat.to_radians();
-    let lon2 = input.hover_lon.to_radians();
-    let dlat = lat2 - lat1;
-    let dlon = lon2 - lon1;
-    let a = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
-    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
-    let distance_km = EARTH_RADIUS_KM * c;
-
-    let y = dlon.sin() * lat2.cos();
-    let x = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
-    let azimuth = (y.atan2(x).to_degrees() + 360.0) % 360.0;
+    let (azimuth, distance_km) = beam::site_bearing_range_km(
+        input.site_lat,
+        input.site_lon,
+        input.hover_lat,
+        input.hover_lon,
+    );
 
     let mut value_str = String::new();
     let frac_x = (input.hover_pos.x - input.rect.left()) / input.rect.width();
@@ -531,4 +533,60 @@ pub(super) fn compute_hover_info_raw(
         azimuth,
         value_str
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The string the status bar shows, for hover points at hand-checkable
+    /// offsets from a real site.
+    ///
+    /// The readout had no test of its own while it carried its own copy of the
+    /// haversine and forward azimuth. `beam::tests::
+    /// the_hover_readouts_polar_coordinates_are_bit_identical_to_the_deleted_copy`
+    /// pins the two spellings against each other, which is what makes moving to
+    /// the shared one provably not a change; this pins what a user reads, so the
+    /// next edit to either has something behavioural to fail.
+    #[test]
+    fn the_hover_readout_reports_range_and_azimuth_from_the_site() {
+        // KTLX. One degree due north is Rₑ·(π/180) = 111.19 km at azimuth 0; one
+        // degree due east is shorter than the parallel it looks like it follows
+        // and leaves *north* of east, because a great circle bows poleward.
+        let (site_lat, site_lon) = (35.3333, -97.2778);
+        let prefs = UserPreferences::default();
+        let readout = |hover_lat: f64, hover_lon: f64| {
+            compute_hover_info_raw(
+                &[],
+                &HoverInput {
+                    site_lat,
+                    site_lon,
+                    hover_lat,
+                    hover_lon,
+                    // Outside the rect, so no gate value is appended and the
+                    // assertion is on the geometry alone.
+                    hover_pos: egui::pos2(-1.0, -1.0),
+                    rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0)),
+                },
+                RadarProduct::Reflectivity,
+                &prefs,
+            )
+        };
+
+        assert_eq!(
+            readout(site_lat + 1.0, site_lon),
+            "Lat: 36.3333\u{b0}, Lon: -97.2778\u{b0} | Range: 111.2km, Az: 0.0\u{b0} ",
+        );
+        assert_eq!(
+            readout(site_lat, site_lon + 1.0),
+            "Lat: 35.3333\u{b0}, Lon: -96.2778\u{b0} | Range: 90.7km, Az: 89.7\u{b0} ",
+        );
+        // A site to itself: zero range, and the azimuth is unconstrained rather
+        // than wrong, so only the range half is asserted.
+        assert!(
+            readout(site_lat, site_lon).contains("Range: 0.0km"),
+            "a site is not at zero range from itself: {}",
+            readout(site_lat, site_lon),
+        );
+    }
 }
