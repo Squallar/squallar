@@ -876,4 +876,31 @@ mod tests {
         assert!(with.plot.top() > without.plot.top());
         assert!(with.plot.height() < without.plot.height());
     }
+
+    /// The plot leaves the colour bar its edge, whichever edge that is.
+    ///
+    /// `render_color_scale` is reused verbatim and paints straight onto the pane
+    /// rect with no notion of what else is in there, so the *only* thing keeping
+    /// the legend off the section is this inset. Which edge it takes is decided
+    /// by the panel's shape, once for the whole grid, so both orientations have
+    /// to be right.
+    #[test]
+    fn the_plot_leaves_room_for_whichever_edge_the_colour_bar_took() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 500.0));
+        let vertical = SectionLayout::new(rect, false, false);
+        let horizontal = SectionLayout::new(rect, false, true);
+
+        assert!(
+            rect.right() - vertical.plot.right() >= COLOR_SCALE_RESERVE,
+            "a right-edge colour bar would be painted over the section"
+        );
+        assert!(
+            rect.bottom() - horizontal.plot.bottom() >= COLOR_SCALE_RESERVE,
+            "a bottom-edge colour bar would be painted over the section"
+        );
+        // And each orientation gives back the room the other one took, rather
+        // than reserving both edges always.
+        assert!(horizontal.plot.right() > vertical.plot.right());
+        assert!(vertical.plot.bottom() > horizontal.plot.bottom());
+    }
 }

@@ -1112,6 +1112,53 @@ mod tests {
         }
     }
 
+    /// A section pane really gives up its texture — and really keeps everything
+    /// else.
+    ///
+    /// Both halves are decisions. The handle has to go, because a texture
+    /// outliving its context is a leak nothing reports: not a panic, not a blank
+    /// pane, just memory that never comes back across a suspend/resume cycle.
+    /// The `CrossSection` behind it has to *stay*, because it is plain memory
+    /// rather than a GPU handle, it is what a hover reads, and re-cutting it on
+    /// resume needs the volume — which may well have been evicted by then.
+    ///
+    /// The empty-arm version of this test passed for a build that released
+    /// nothing at all; found by mutation.
+    #[test]
+    fn a_section_pane_drops_its_texture_and_keeps_its_cut() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "section-fixture",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::NEAREST,
+        );
+        let line = SectionLine::new(point(35.3, -97.3), point(35.6, -97.0)).expect("valid line");
+        let mut content = PaneContent::CrossSection(Box::new(CrossSectionPane {
+            line: Some(line),
+            source_pane: Some(0),
+            texture: Some(texture),
+            unavailable: Some(SectionUnavailable::RenderFailed),
+            ..Default::default()
+        }));
+
+        content.release_textures();
+
+        let PaneContent::CrossSection(section) = &content else {
+            panic!("releasing a texture changed the pane's kind");
+        };
+        assert!(
+            section.texture.is_none(),
+            "the handle outlived the context that owns it"
+        );
+        assert_eq!(
+            section.line,
+            Some(line),
+            "the line went with the texture, so the pane forgot what it was aimed at"
+        );
+        assert_eq!(section.source_pane, Some(0));
+        assert_eq!(section.unavailable, Some(SectionUnavailable::RenderFailed));
+    }
+
     /// The staleness key notices a new volume with no help from any reset path,
     /// because the volume time is in the key.
     #[test]
