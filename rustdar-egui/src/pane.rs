@@ -891,8 +891,39 @@ impl Default for PaneLayout {
 }
 
 impl PaneLayout {
-    /// Create a layout for the given pane count.
+    /// Create a layout for the given pane count, clamped to
+    /// `1..=`[`MAX_PANES_DESKTOP`].
+    ///
+    /// # Why the clamp is here and not at the callers
+    ///
+    /// The table below covers exactly 1..=6, and its rows sum to the count in
+    /// every arm — that agreement between `grid` and `pane_count` is what the
+    /// rest of this type is built on. A count outside the table used to fall
+    /// through to a one-row, one-column grid while `pane_count` still stored
+    /// the raw number, and that pairing is worse than either half alone:
+    ///
+    /// * [`Self::pane_rect`] walks the grid looking for the row that holds
+    ///   `pane_idx` and hands back `total_rect` when it runs out of rows. With
+    ///   a one-cell grid, *every* index from 1 upward drew over the whole
+    ///   panel.
+    /// * `detect_active_pane_click` hit-tests those same rects in order, so
+    ///   every rect contained every pointer position: clicking anywhere made
+    ///   pane 1 active, clicking again made pane 0 active, and panes 2 and up
+    ///   could never be reached at all.
+    ///
+    /// Neither shows up as an error, a panic or a blank screen — the panes are
+    /// all drawn, just all in the same place.
+    ///
+    /// Every production caller clamps before it gets here today
+    /// (`load_ui_config` to [`crate::ui_layout::WidthClass::max_panes_absolute`],
+    /// the pane picker to the width class's own maximum), so this is currently
+    /// unreachable. It is clamped here anyway because "the caller clamped" is a
+    /// property of each call site rather than of this type, and the next writer
+    /// of `pane_count` — the pane a drawn cross-section auto-creates — is one
+    /// commit away. Making the trap unrepresentable costs one line; remembering
+    /// it at every future writer costs it forever.
     pub fn for_count(count: usize) -> Self {
+        let count = count.clamp(1, MAX_PANES_DESKTOP);
         let grid = match count {
             1 => vec![1],
             2 => vec![2],
@@ -900,6 +931,9 @@ impl PaneLayout {
             4 => vec![2, 2],
             5 => vec![3, 2],
             6 => vec![3, 3],
+            // Unreachable after the clamp above. Left as a total match rather
+            // than a panic: a layout is not worth crashing over, and the clamp
+            // is what makes this arm dead.
             _ => vec![1],
         };
         let num_rows = grid.len();
@@ -1298,6 +1332,59 @@ mod tests {
             assert!(
                 orientation.resolve(panel(960.0, 1200.0)),
                 "and not have disturbed it"
+            );
+        }
+    }
+
+    /// A pane count past the grid table is clamped, not flattened.
+    ///
+    /// Asserted on the rects rather than on `grid()`: the failure this guards
+    /// is that `pane_rect` hands every index the whole panel, so what matters
+    /// is that each pane gets its own cell and that a point inside one cell is
+    /// inside exactly one. The second claim is `detect_active_pane_click`'s
+    /// hit-test verbatim — under the old fall-through every rect contained
+    /// every position, so the active pane flipped 0 → 1 → 0 on successive
+    /// clicks and panes 2 upward were unreachable.
+    #[test]
+    fn a_pane_count_past_the_grid_table_is_clamped_rather_than_flattened() {
+        let screen = panel(1600.0, 900.0);
+        for count in [MAX_PANES_DESKTOP + 1, 12, usize::MAX] {
+            let layout = PaneLayout::for_count(count);
+            assert_eq!(
+                layout.pane_count, MAX_PANES_DESKTOP,
+                "{count} panes must land on the largest layout that has a grid"
+            );
+
+            let rects: Vec<egui::Rect> = (0..layout.pane_count)
+                .map(|idx| layout.pane_rect(idx, screen))
+                .collect();
+            for (idx, rect) in rects.iter().enumerate() {
+                assert!(
+                    *rect != screen,
+                    "pane {idx} was handed the whole panel: every pane draws \
+                     over every other one"
+                );
+                let containing = rects.iter().filter(|r| r.contains(rect.center())).count();
+                assert_eq!(
+                    containing, 1,
+                    "pane {idx}'s own centre lands inside {containing} pane \
+                     rects, so a click there names an arbitrary pane"
+                );
+            }
+        }
+
+        // Zero clamps up for the same reason: `pane_count == 0` with a one-cell
+        // grid draws no panes at all while the grid says there is one.
+        assert_eq!(PaneLayout::for_count(0).pane_count, 1);
+
+        // …and the table itself still describes exactly as many cells as it
+        // claims panes, which is the invariant the clamp exists to preserve.
+        for count in 1..=MAX_PANES_DESKTOP {
+            let layout = PaneLayout::for_count(count);
+            assert_eq!(
+                layout.grid().iter().sum::<usize>(),
+                count,
+                "the {count}-pane grid does not have {count} cells"
             );
         }
     }
