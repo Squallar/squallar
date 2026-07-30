@@ -135,13 +135,23 @@ impl ScanInfo {
 
 /// Rounds elevation angles to 0.1° so SAILS/MRLE repeat scans and split cuts
 /// at the same nominal angle collapse to one entry.
+///
+/// The angle is the sweep's **median**
+/// ([`crate::volumetric::sweep_elevation_deg`]), not its first radial's. These
+/// are the labels the picker shows and the values `render::find_sweep` is later
+/// handed to find the sweep again, so naming a tilt by a radial taken while the
+/// antenna was still settling produced entries that drew a different cut from
+/// the one on the label — and, where two labels collapsed onto one sweep, cuts
+/// the picker could not reach at all. `find_sweep` matches on the same median,
+/// so an entry and the sweep behind it are the same quantity.
 fn discover_product_elevations(scan: &Scan) -> HashMap<RadarProduct, Vec<f32>> {
     let mut product_elevations: HashMap<RadarProduct, Vec<f32>> = HashMap::new();
 
     for (i, sweep) in scan.sweeps().iter().enumerate() {
         if let Some(first_radial) = sweep.radials().first() {
-            let raw_angle = first_radial.elevation_angle_degrees();
-            let elev_angle = (raw_angle * 10.0).round() / 10.0;
+            let raw_angle = crate::volumetric::sweep_elevation_deg(sweep.radials())
+                .unwrap_or_else(|| f64::from(first_radial.elevation_angle_degrees()));
+            let elev_angle = (raw_angle * 10.0).round() as f32 / 10.0;
 
             let mut products_found: Vec<&str> = Vec::new();
             for product in RadarProduct::all() {

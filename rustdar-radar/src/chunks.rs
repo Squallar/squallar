@@ -511,9 +511,14 @@ pub enum CutSelection {
 
 /// How near a cut's planned angle must be to a wanted one to count as it.
 ///
-/// Wide enough for the drift between a VCP's commanded angle and what a split
-/// cut actually achieves — 0.32°/0.63° against a nominal 0.5° — which is the same
-/// slack `render::find_sweep` allows when picking a sweep.
+/// Deliberately wider than `render::ELEVATION_WINDOW`, which these two used to
+/// share. The quantities are not the same: `find_sweep` compares a request
+/// against a sweep the radar has already flown, and can be exact about it, but
+/// this compares a request against the VCP's *planned* angle for a cut that has
+/// not been downloaded yet — which is the whole point, since the decision is
+/// what to skip. The errors here are also asymmetric. Taking a cut that was not
+/// wanted costs one download; skipping one that was costs a cut that never
+/// completes and a volume that never closes, so the slack stays.
 const ELEVATION_MATCH: f32 = 0.3;
 
 impl CutSelection {

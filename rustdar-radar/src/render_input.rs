@@ -80,8 +80,35 @@ pub struct RenderInput {
 /// One sweep's worth of the product's moment.
 #[derive(Debug, Clone, PartialEq)]
 struct SweepData {
-    /// Carried per radial rather than per sweep by the model, but constant
-    /// across a sweep in practice and only read off the first radial.
+    /// The sweep's **median** elevation
+    /// ([`crate::volumetric::sweep_elevation_deg`]) — not its first radial's,
+    /// and not a value that may be read off any single radial.
+    ///
+    /// The model carries elevation per radial, and it is *not* constant across a
+    /// sweep: the antenna is still settling when one opens, and the opening
+    /// radial can sit a third of a degree from the tilt the sweep actually flew.
+    ///
+    /// Two things then depend on this being the median, and both fail silently
+    /// if it reverts to the first radial:
+    ///
+    /// * [`RenderInput::to_scan`] stamps this one value onto *every*
+    ///   reconstructed radial, so it **is** the reconstructed sweep's median.
+    ///   [`crate::render::find_sweep`] matches on the median within
+    ///   [`crate::render::ELEVATION_WINDOW`], so a first-radial value here puts
+    ///   the payload further from the request than the window allows: the worker
+    ///   fails to find the one sweep its own payload carries and the whole wasm
+    ///   render path draws nothing.
+    /// * Every whole-volume product — echo tops, VIL, the hail pair, the hybrid
+    ///   classification, NROT, SRV — builds its tilt ladder by asking
+    ///   `sweep_elevation_deg` for each sweep's elevation. On the desktop path
+    ///   that reads the real radials; on the web path it reads this field
+    ///   copied across them. Anything but the median makes those two paths
+    ///   compute *different ladders from the same volume*.
+    ///
+    /// `render_input::tests::a_sweep_that_opened_off_its_tilt_still_renders_after_the_port`
+    /// is the guard; fixtures giving a sweep one constant elevation cannot see
+    /// any of this, because for them the median and the first radial are the
+    /// same number.
     elevation_angle: f32,
     radials: Vec<RadialData>,
 }
@@ -333,9 +360,17 @@ const ALL_SLOTS: [MomentSlot; 6] = [
 /// this radial has" would hand a reflectivity render the velocity gates.
 fn sweep_data(radials: &[Radial], slot: MomentSlot, all_moments: bool) -> SweepData {
     SweepData {
-        elevation_angle: radials
-            .first()
-            .map(Radial::elevation_angle_degrees)
+        // The sweep's **median**, and it has to be: `to_scan` stamps this one
+        // value onto every reconstructed radial, so it is the median of the
+        // reconstructed sweep as well, and `find_sweep` — which matches on the
+        // median — reaches the same sweep on both sides of the port. Carrying
+        // the first radial's angle here instead would have left the payload
+        // describing a tilt the sweep never flew, and, since the first radial
+        // can sit a third of a degree off, `find_sweep` would have failed to
+        // find the one sweep the payload contains and the worker path would
+        // have rendered nothing at all.
+        elevation_angle: crate::volumetric::sweep_elevation_deg(radials)
+            .map(|e| e as f32)
             .unwrap_or(0.0),
         radials: radials
             .iter()
@@ -402,7 +437,10 @@ fn place_into(slots: &mut MomentSlots, slot: MomentSlot, moment: MomentData) {
 /// requires one. Pattern number 0 is not a real VCP, which is the point: a
 /// consumer that starts reading this sees an obviously synthetic value rather
 /// than a plausible wrong one.
-fn placeholder_coverage_pattern() -> VolumeCoveragePattern {
+///
+/// `pub(crate)` so [`crate::render`]'s own tests can build a `Scan` without a
+/// second synthetic pattern that could drift from this one.
+pub(crate) fn placeholder_coverage_pattern() -> VolumeCoveragePattern {
     VolumeCoveragePattern::new(
         0,
         0,
@@ -935,6 +973,85 @@ mod tests {
             );
             assert_same_frame(&direct, &viaformat, &format!("{product:?}"));
         }
+    }
+
+    /// A sweep that opens off its own tilt while the antenna settles: the first
+    /// thirty radials ramp from `first` to `flown`, the rest sit on `flown`, so
+    /// the median is `flown` and the first radial is not.
+    ///
+    /// [`volume`] gives every sweep one constant elevation, which makes the two
+    /// readings the same number — so it cannot see the hazard the next test is
+    /// about, and neither could any fixture in this module before it.
+    fn settling_sweep(number: u8, first: f32, flown: f32) -> Sweep {
+        const SETTLING: usize = 30;
+        let radials = (0..RADIALS)
+            .map(|i| {
+                let elevation = if i < SETTLING {
+                    first + (flown - first) * (i as f32 / SETTLING as f32)
+                } else {
+                    flown
+                };
+                Radial::new(
+                    0,
+                    i as u16,
+                    i as f32 * (360.0 / RADIALS as f32),
+                    360.0 / RADIALS as f32,
+                    RadialStatus::IntermediateRadialData,
+                    number,
+                    elevation,
+                    Some(moment(REFL_SCALE, REFL_OFFSET, strong_refl(i), 600)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        Sweep::new(number, radials)
+    }
+
+    /// The payload has to survive the port for a sweep that opened off its
+    /// tilt, and this is the tightest constraint on what `SweepData` may carry.
+    ///
+    /// `to_scan` stamps one elevation onto every reconstructed radial, so
+    /// whatever `sweep_data` stored *is* the reconstructed sweep's median.
+    /// `find_sweep` matches on the median within a tenth of a degree, so
+    /// storing the first radial's angle — 0.3° from the tilt the request names —
+    /// would leave the worker unable to find the one sweep its own payload
+    /// contains, and the web path would render nothing at all. Constant-elevation
+    /// fixtures cannot fail this; this one can.
+    #[test]
+    fn a_sweep_that_opened_off_its_tilt_still_renders_after_the_port() {
+        let scan = Scan::new(
+            placeholder_coverage_pattern(),
+            vec![settling_sweep(1, 0.68, 0.44)],
+        );
+        let product = RadarProduct::Reflectivity;
+
+        let direct =
+            crate::render::render_radar_to_image_full(&scan, 0.4, product, LAT, LON, None, None)
+                .expect("the scan path draws the cut this volume flew");
+        let input = RenderInput::extract(&scan, 0.4, product, LAT, LON, None, None)
+            .expect("the payload extracts that same cut");
+        assert!(
+            (input.sweeps[0].elevation_angle - 0.44).abs() < 1e-4,
+            "the payload must carry the tilt the sweep flew, not the one it opened on — got {}",
+            input.sweeps[0].elevation_angle,
+        );
+        let reconstructed = input.to_scan();
+        assert!(
+            crate::render::find_sweep(&reconstructed, product, 0.4).is_some(),
+            "the worker must find the one sweep its payload carries",
+        );
+        let via = render_from(&input).expect("the payload renders");
+        assert!(
+            painted(&direct) > 1_000,
+            "the comparison would be vacuous — only {} pixels painted",
+            painted(&direct),
+        );
+        assert_same_frame(&direct, &via, "a sweep that opened off its tilt");
     }
 
     /// The same, across the wire format the worker actually receives.

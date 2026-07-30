@@ -333,9 +333,21 @@ fn write_key(from: GateId) -> u32 {
 
 // ── Sweep / azimuth helpers ──────────────────────────────────────────────────
 
+/// How near a sweep's elevation has to sit to a requested one to count as it.
+///
+/// Read by [`find_sweep`], which explains why it is this narrow and why it can
+/// only be this narrow now that sweeps are keyed on their median rather than
+/// their first radial.
+pub const ELEVATION_WINDOW: f64 = 0.1;
+
 /// The available elevation angle (rounded to 0.1°) closest to
 /// `target_elevation` that carries this product. The loop renderer uses it to
 /// snap the selected elevation to what each historical scan actually holds.
+///
+/// On the sweep's median, for the reason [`find_sweep`] gives: a tilt named off
+/// the first radial is not the tilt the sweep flew, and the loop would snap a
+/// steady selection onto a different cut from one frame to the next as the
+/// antenna's settling wandered.
 pub fn find_closest_elevation(
     scan: &Scan,
     product: types::RadarProduct,
@@ -344,8 +356,10 @@ pub fn find_closest_elevation(
     scan.sweeps()
         .iter()
         .filter_map(|sweep| {
-            let r = sweep.radials().first()?;
-            let rounded = (r.elevation_angle_degrees() * 10.0).round() / 10.0;
+            let radials = sweep.radials();
+            let r = radials.first()?;
+            let elevation = crate::volumetric::sweep_elevation_deg(radials)?;
+            let rounded = (elevation * 10.0).round() as f32 / 10.0;
             product.get_moment(r).is_some().then_some(rounded)
         })
         .min_by(|a, b| ((*a - target_elevation).abs()).total_cmp(&((*b - target_elevation).abs())))
@@ -359,11 +373,27 @@ pub fn find_closest_elevation(
 /// reference display shows the newest cut too — cursor samples of its NROT
 /// correlate at 0.95 with the matching cut and near zero with the stale ones.
 ///
-/// The window is a wide 0.3° rather than an exact match because split-cut
-/// surveillance sweeps drift well off the nominal tilt (0.32°/0.63° cuts for
-/// a requested 0.5°), and they carry the full-range reflectivity and dual-pol
-/// fields. Doppler cuts sit within 0.05° of nominal, so velocity-family
-/// products keep picking the same sweep they always did.
+/// Sweeps are compared on [`crate::volumetric::sweep_elevation_deg`] — the
+/// **median** of the sweep's radials — and the window is a tight 0.1°.
+///
+/// Both halves of that are one decision. This used to match the *first
+/// radial's* angle within 0.3°, and the wide window was a workaround for the
+/// first radial rather than a property of the radar: the antenna is still
+/// settling when a sweep opens, so the first radial misses its own cut's
+/// commanded angle by up to 0.43°, while the median lands within 0.05° of it on
+/// virtually every sweep. A window wide enough to absorb that drift is also
+/// wide enough to admit the *neighbouring* cut, and since the search runs
+/// newest-first it then answered with whichever cut came last rather than
+/// whichever was nearer. Measured over the live archive, that mislabelled a
+/// twentieth of all picker entries — one KDDC VCP 215 volume offered 0.5, 0.6,
+/// 0.7 and 0.8 and drew the *same* 0.48° sweep for all four, leaving its 0.88°
+/// cut unreachable.
+///
+/// Removing the drift removes the need for the workaround: on the median, 0.1°
+/// is still twice the 0.05° worst case of the picker's own rounding, and it is
+/// narrow enough to keep adjacent cuts apart. Keeping the wide window on top of
+/// the median would have left most of the harm in place, so neither change is
+/// useful without the other.
 ///
 /// Within the family, non-Doppler products prefer the newest sweep *without*
 /// a velocity moment: a split cut's Doppler half repeats a short-range copy
@@ -383,11 +413,12 @@ pub(crate) fn find_sweep(
 ) -> Option<&[Radial]> {
     let newest = |surveillance_only: bool| {
         scan.sweeps().iter().rev().find_map(|sweep| {
-            let matches = sweep
-                .radials()
+            let radials = sweep.radials();
+            let matches = radials
                 .first()
-                .map(|r| {
-                    (r.elevation_angle_degrees() - elevation_angle).abs() < 0.3
+                .zip(crate::volumetric::sweep_elevation_deg(radials))
+                .map(|(r, elevation)| {
+                    (elevation - f64::from(elevation_angle)).abs() < ELEVATION_WINDOW
                         && product.get_moment(r).is_some()
                         && !(surveillance_only && r.velocity().is_some())
                 })
@@ -1945,5 +1976,228 @@ mod tests {
             "a product with no PDB override must keep the packet's spacing, got a max range \
              of {max_range} km from {BINS} gates"
         );
+    }
+
+    // ── Which sweep a requested tilt reaches ─────────────────────────────────
+
+    /// A sweep whose antenna is still settling when it opens: the first
+    /// `SETTLING` radials ramp from `first` to `flown`, and the rest sit on
+    /// `flown`. The median is therefore `flown` — the tilt the sweep actually
+    /// flew — while the first radial reads `first`.
+    ///
+    /// Every fixture in this crate before these tests gave a sweep one constant
+    /// elevation, which makes the median and the first radial the same number
+    /// and makes the difference between them invisible. That is why the switch
+    /// to the median broke no test: there was no test of it. This builder is
+    /// the one shape that can tell the two apart.
+    fn settling_sweep(
+        number: u8,
+        first: f32,
+        flown: f32,
+        velocity: bool,
+    ) -> nexrad_model::data::Sweep {
+        const SETTLING: usize = 30;
+        let radials = (0..N_RADIALS)
+            .map(|i| {
+                let elevation = if i < SETTLING {
+                    first + (flown - first) * (i as f32 / SETTLING as f32)
+                } else {
+                    flown
+                };
+                let moment = |gates: usize| {
+                    nexrad_model::data::MomentData::from_fixed_point(
+                        gates as u16,
+                        0,
+                        250,
+                        8,
+                        SCALE,
+                        OFFSET,
+                        vec![200u8; gates],
+                    )
+                };
+                Radial::new(
+                    0,
+                    i as u16,
+                    i as f32 * (360.0 / N_RADIALS as f32),
+                    360.0 / N_RADIALS as f32,
+                    nexrad_model::data::RadialStatus::IntermediateRadialData,
+                    number,
+                    elevation,
+                    Some(moment(600)),
+                    velocity.then(|| moment(400)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        nexrad_model::data::Sweep::new(number, radials)
+    }
+
+    fn scan_of(sweeps: Vec<nexrad_model::data::Sweep>) -> Scan {
+        Scan::new(crate::render_input::placeholder_coverage_pattern(), sweeps)
+    }
+
+    /// The tilt a sweep is found by is the one it flew, not the one it happened
+    /// to open on. The first radial here is 0.68° and the flown cut is 0.44°:
+    /// asking for 0.4° must reach it, and asking for 0.7° — which is where the
+    /// first radial sat — must not.
+    #[test]
+    fn find_sweep_matches_the_flown_tilt_not_the_opening_radial() {
+        let scan = scan_of(vec![settling_sweep(1, 0.68, 0.44, false)]);
+        assert!(
+            find_sweep(&scan, PRODUCT, 0.4).is_some(),
+            "0.4° names the cut this sweep flew and must reach it",
+        );
+        assert!(
+            find_sweep(&scan, PRODUCT, 0.7).is_none(),
+            "0.7° is where the antenna was still settling, not a tilt the volume flew",
+        );
+    }
+
+    /// The KDDC VCP 215 case, which is what this change is for. Two
+    /// surveillance cuts — 0.44° and 0.84° — both opening well off their own
+    /// angle, and overlapping under the old 0.3° window. Each label must reach
+    /// its own cut, so neither cut is drawn twice and neither is lost.
+    #[test]
+    fn adjacent_cuts_are_reached_by_their_own_labels() {
+        let low = settling_sweep(1, 0.676, 0.44, false);
+        let high = settling_sweep(2, 0.739, 0.84, false);
+        let scan = scan_of(vec![low, high]);
+
+        let at = |e: f32| {
+            find_sweep(&scan, PRODUCT, e)
+                .map(|r| crate::volumetric::sweep_elevation_deg(r).unwrap())
+        };
+        let (Some(a), Some(b)) = (at(0.4), at(0.8)) else {
+            panic!(
+                "both cuts must be reachable, got {:?} / {:?}",
+                at(0.4),
+                at(0.8)
+            );
+        };
+        assert!(
+            (a - 0.44).abs() < 1e-4,
+            "0.4° must draw the 0.44° cut, drew {a}"
+        );
+        assert!(
+            (b - 0.84).abs() < 1e-4,
+            "0.8° must draw the 0.84° cut, drew {b}"
+        );
+        assert!(
+            (a - b).abs() > 0.3,
+            "the two labels must draw different sweeps, both drew {a}",
+        );
+        // The labels between them belong to neither cut and must draw nothing
+        // rather than silently reusing a neighbour.
+        assert!(at(0.6).is_none(), "0.6° is not a tilt this volume flew");
+    }
+
+    /// Newest-wins is load-bearing for SAILS and is *not* what changed here:
+    /// two sweeps of the same cut must still resolve to the later one.
+    #[test]
+    fn a_sails_repeat_still_resolves_to_the_newer_sweep() {
+        let scan = scan_of(vec![
+            settling_sweep(1, 0.30, 0.48, false),
+            settling_sweep(2, 0.71, 0.48, false),
+        ]);
+        let found = find_sweep(&scan, PRODUCT, 0.5).expect("the cut is reachable");
+        assert_eq!(
+            found[0].azimuth_number(),
+            scan.sweeps()[1].radials()[0].azimuth_number(),
+            "the newer of two sweeps at one tilt must win",
+        );
+        assert_eq!(
+            found[0].elevation_number(),
+            2,
+            "the newer sweep is elevation number 2",
+        );
+    }
+
+    /// The surveillance preference, unchanged: a non-Doppler product takes the
+    /// velocity-free half of a split cut even though the Doppler half is newer.
+    #[test]
+    fn a_split_cut_still_gives_reflectivity_its_surveillance_half() {
+        let scan = scan_of(vec![
+            settling_sweep(1, 0.30, 0.48, false),
+            settling_sweep(2, 0.71, 0.48, true),
+        ]);
+        let found = find_sweep(&scan, PRODUCT, 0.5).expect("the cut is reachable");
+        assert!(
+            found[0].velocity().is_none(),
+            "reflectivity must take the surveillance half, not the newer Doppler one",
+        );
+        let vel = find_sweep(&scan, types::RadarProduct::Velocity, 0.5).expect("velocity is there");
+        assert!(
+            vel[0].velocity().is_some(),
+            "the velocity family still takes the Doppler half",
+        );
+    }
+
+    /// The window is the other half of the change: on the median it is narrow
+    /// enough that a neighbouring cut cannot answer for one that is missing.
+    #[test]
+    fn the_window_does_not_reach_the_next_cut_along() {
+        let scan = scan_of(vec![settling_sweep(1, 0.20, 0.48, false)]);
+        assert!(
+            find_sweep(&scan, PRODUCT, 0.5).is_some(),
+            "its own label reaches it"
+        );
+        for absent in [0.2, 0.3, 0.7, 0.9] {
+            assert!(
+                find_sweep(&scan, PRODUCT, absent).is_none(),
+                "{absent}° is not a tilt this volume flew and must draw nothing",
+            );
+        }
+    }
+
+    /// The contract the whole change exists to keep: **every label the picker
+    /// offers reaches a sweep, and the sweep it reaches is the one the label
+    /// names.**
+    ///
+    /// Swept across every tilt on a 0.05° grid, so the cases where a cut sits
+    /// exactly on the boundary of the picker's 0.1° rounding — the worst case
+    /// for the match window, and the ones a hand-picked fixture always misses —
+    /// are all covered. This is what says the window may not be narrowed to the
+    /// rounding itself: at 0.05° a cut landing on a boundary is half a step from
+    /// its own label and becomes unreachable.
+    #[test]
+    fn every_offered_label_reaches_the_cut_it_names() {
+        for step in 0..=240u32 {
+            let flown = step as f32 * 0.05;
+            // Opening a third of a degree off, the way a real one does.
+            let scan = scan_of(vec![settling_sweep(1, flown + 0.31, flown, false)]);
+            let label = (f64::from(flown) * 10.0).round() as f32 / 10.0;
+
+            let found = find_sweep(&scan, PRODUCT, label).unwrap_or_else(|| {
+                panic!("a cut flown at {flown}° is offered as {label}° and must be reachable")
+            });
+            let drawn =
+                crate::volumetric::sweep_elevation_deg(found).expect("the sweep has radials");
+            assert!(
+                (drawn - f64::from(flown)).abs() < 1e-4,
+                "{label}° drew a sweep at {drawn}°, not the {flown}° cut it names",
+            );
+            assert_eq!(
+                find_closest_elevation(&scan, PRODUCT, flown),
+                Some(label),
+                "the loop's snap must agree with the label the picker offers",
+            );
+        }
+    }
+
+    /// The loop's snap reads the same quantity the picker labels do, so a
+    /// steady selection stays on one cut across frames instead of following
+    /// the antenna's settling around.
+    #[test]
+    fn find_closest_elevation_snaps_to_the_flown_tilt() {
+        let scan = scan_of(vec![
+            settling_sweep(1, 0.68, 0.44, false),
+            settling_sweep(2, 0.30, 0.84, false),
+        ]);
+        assert_eq!(find_closest_elevation(&scan, PRODUCT, 0.5), Some(0.4));
+        assert_eq!(find_closest_elevation(&scan, PRODUCT, 0.8), Some(0.8));
     }
 }
