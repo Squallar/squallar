@@ -1153,7 +1153,7 @@ impl VoxelGrid {
         // with no native moment has no ramp `value_range` could have come
         // from, so its indices would decode to numbers in units nothing
         // measures.
-        samplable(product)?;
+        let slot = samplable(product)?;
 
         let shape = VoxelShape {
             nx: r.u32()? as usize,
@@ -1177,12 +1177,51 @@ impl VoxelGrid {
         let tilt_count = r.u32()? as usize;
         let widest_tilt_gap_deg = r.f64()?;
 
+        // Every number that describes where the box *is*. `build_voxels` emits
+        // only finite ones — the extents are clamped and the site is a
+        // latitude and a longitude — so this refuses nothing it produces, and
+        // it closes the same hole `CrossSection::from_parts` closes on its
+        // axes. A `NaN` extent divides into a cell size of `NaN` and every
+        // `cell_centre_km` answers `NaN`; an infinite one collapses the cell
+        // size to zero and puts every cell centre at the same place. Neither
+        // panics, which is exactly why neither would be noticed.
+        if ![
+            x_range_km.0,
+            x_range_km.1,
+            y_range_km.0,
+            y_range_km.1,
+            z_range_km_msl.0,
+            z_range_km_msl.1,
+            site.0,
+            site.1,
+            widest_tilt_gap_deg,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+            || !value_range.0.is_finite()
+            || !value_range.1.is_finite()
+        {
+            return None;
+        }
+
+        // `value_range` and the table are both **functions of the product**, so
+        // a payload states each of them twice and the copies can disagree.
+        // Neither disagreement fails: `index_to_value` would read the indices
+        // off a ramp they were not quantised against, and the raymarch would
+        // paint a table that is not this product's — a volume that renders,
+        // looks like weather, and is a different field. Recomputed and compared
+        // rather than trusted, which is `JobRequest`'s rule for the product
+        // appearing twice, applied one level down.
+        if value_range != value_range_for(slot) {
+            return None;
+        }
+
         // One byte per element on both of these, so `take` is the bound: it
         // can only hand back a slice that is really there, and nothing is
         // reserved on the claimed length before that.
         let lut_len = r.u32()?;
         let lut = r.take(lut_len as usize)?.to_vec();
-        if lut.len() != LUT_LEN {
+        if lut.len() != LUT_LEN || lut != colormap_lut(product, value_range) {
             return None;
         }
         let index_len = r.u32()?;
@@ -3540,6 +3579,109 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The header's geometry numbers must all be finite, and the two fields
+    /// that are **functions of the product** must agree with the product.
+    ///
+    /// `CrossSection::from_parts` already refuses a non-finite axis; this is
+    /// the same hole one level over, plus the pair a grid states twice. None of
+    /// these fails downstream — that is the point. A `NaN` extent divides into
+    /// a `NaN` cell size and every `cell_centre_km` answers `NaN`; an infinite
+    /// one collapses the cell size to zero and stacks every cell centre in one
+    /// place; a mismatched ramp reads the indices off a scale they were not
+    /// quantised against; a mismatched table paints another product's colours
+    /// over this product's numbers. Each renders, and each is wrong in a way
+    /// that looks like weather.
+    #[test]
+    fn a_grid_header_that_cannot_describe_its_own_product_is_refused() {
+        let good = wire_fixture().to_bytes();
+        assert!(
+            VoxelGrid::from_bytes(&good).is_some(),
+            "precondition: the unmutated payload must decode, or every \
+             assertion below passes for the wrong reason"
+        );
+
+        // The four f64 pairs and the lone f64, by offset into the header.
+        for (name, at) in [
+            ("x_range.0", 20),
+            ("x_range.1", 28),
+            ("y_range.0", 36),
+            ("y_range.1", 44),
+            ("z_range.0", 52),
+            ("z_range.1", 60),
+            ("site.0", 68),
+            ("site.1", 76),
+            ("widest_tilt_gap_deg", 96),
+        ] {
+            for (what, bits) in [("NaN", f64::NAN), ("inf", f64::INFINITY)] {
+                let mut bad = good.clone();
+                bad[at..at + 8].copy_from_slice(&bits.to_le_bytes());
+                assert!(
+                    VoxelGrid::from_bytes(&bad).is_none(),
+                    "{name} = {what} decoded",
+                );
+            }
+        }
+        // precondition: those offsets really name the header fields, rather
+        // than landing in the padding of a layout that has since moved.
+        let mut moved = good.clone();
+        moved[20..28].copy_from_slice(&(-999.0f64).to_le_bytes());
+        assert!(
+            VoxelGrid::from_bytes(&moved).is_some_and(|g| g.x_range_km().0 == -999.0),
+            "offset 20 is not x_range.0, so the finiteness assertions above are \
+             corrupting some other field into invalidity",
+        );
+
+        // The ramp is `value_range_for(slot)` and nothing else, so any other
+        // pair is a payload whose indices mean something this build cannot
+        // reproduce.
+        //
+        // Planted **with the colour table that matches it**, which is the whole
+        // point: a bare range edit is also caught by the table check below,
+        // because that recomputes the table from the decoded range — so it
+        // leaves the range check itself untested. Only a self-consistent
+        // wrong-ramp payload — which is exactly what a build with a different
+        // quantisation would send — isolates it.
+        let mut ramp = good.clone();
+        let bogus = (0.0f32, 60.0f32);
+        assert_ne!(
+            bogus,
+            value_range_for(MomentSlot::Reflectivity),
+            "precondition: the planted range is the real one",
+        );
+        ramp[84..88].copy_from_slice(&bogus.0.to_le_bytes());
+        ramp[88..92].copy_from_slice(&bogus.1.to_le_bytes());
+        ramp[LUT_LEN_AT + 4..LUT_LEN_AT + 4 + LUT_LEN]
+            .copy_from_slice(&colormap_lut(RadarProduct::Reflectivity, bogus));
+        assert!(
+            VoxelGrid::from_bytes(&ramp).is_none(),
+            "a value range this product's quantisation never produces decoded, \
+             carrying a colour table built to agree with it — so `index_to_value` \
+             would have read every index off the wrong scale",
+        );
+
+        // A length-correct table built for a different product. The fixture is
+        // reflectivity; velocity's ramp colours the same 256 indices
+        // completely differently.
+        let alien = colormap_lut(
+            RadarProduct::Velocity,
+            value_range_for(MomentSlot::Velocity),
+        );
+        assert_eq!(alien.len(), LUT_LEN, "precondition: same length");
+        let mut swapped = good.clone();
+        swapped[LUT_LEN_AT + 4..LUT_LEN_AT + 4 + LUT_LEN].copy_from_slice(&alien);
+        assert_ne!(
+            good[LUT_LEN_AT + 4..LUT_LEN_AT + 4 + LUT_LEN],
+            swapped[LUT_LEN_AT + 4..LUT_LEN_AT + 4 + LUT_LEN],
+            "precondition: the two palettes are identical here, so swapping \
+             them proves nothing",
+        );
+        assert!(
+            VoxelGrid::from_bytes(&swapped).is_none(),
+            "a colour table built for another product decoded, and the \
+             raymarch would have painted it",
+        );
     }
 
     /// The bytes arrive off a message port. Every malformed shape has to be a
