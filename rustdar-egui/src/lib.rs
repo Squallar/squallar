@@ -8,6 +8,7 @@ pub mod tiles;
 mod ui;
 pub(crate) mod ui_input;
 pub(crate) mod ui_layout;
+pub mod volume_view;
 
 #[cfg(test)]
 mod input_harness;

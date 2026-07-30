@@ -198,6 +198,12 @@ impl super::App {
             GuiAction::Exit => {
                 self.request_exit(event_loop);
             }
+            GuiAction::PrepareVolume { pane_idx, target } => {
+                self.handle_prepare_volume(pane_idx, target);
+            }
+            GuiAction::ReleaseVolume { pane_idx } => {
+                self.handle_release_volume(pane_idx);
+            }
             GuiAction::FetchOverlay { .. } | GuiAction::RefreshOverlay { .. } => {
                 self.handle_overlay_action(action)
             }

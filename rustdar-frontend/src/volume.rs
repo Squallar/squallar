@@ -24,6 +24,8 @@ use egui_wgpu::wgpu;
 
 use crate::constants::VOLUME_GRID_CELLS;
 
+#[path = "volume_bridge.rs"]
+pub mod bridge;
 #[path = "volume_degrade.rs"]
 pub mod degrade;
 #[path = "volume_quality.rs"]

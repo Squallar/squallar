@@ -264,6 +264,11 @@ pub struct Gui {
     /// `panes[i].kind()`.
     #[cfg(test)]
     last_pane_content: Vec<PaneContentProbe>,
+    /// What the 3D arm decided for each volume pane on the last frame. Only read
+    /// by tests, and it is the only thing that can tell "drew a volume" from
+    /// "drew nothing" — see [`map::VolumeArmProbe`].
+    #[cfg(test)]
+    pub(crate) last_volume_arms: Vec<map::VolumeArmProbe>,
     /// The pane-count buttons the picker actually drew last frame. Only read by
     /// tests, which check the picker narrows on a phone while the config clamp
     /// does not, and that clicking one takes effect.
@@ -358,6 +363,18 @@ pub struct Gui {
     /// take it. `None` means "use the vector the `N0S` product carries", which
     /// is the default and is what AWIPS calls the average storm motion.
     pub storm_motion_override: StormMotionOverride,
+    /// Whatever can actually draw a 3D pane, or `None` on a machine or a frame
+    /// where nothing can.
+    ///
+    /// `None` is the state **every headless test sees**, and the state after
+    /// every suspend and surface loss (`clear_graphics_state` drops it), so the
+    /// empty path is the ordinary path rather than the exceptional one.
+    ///
+    /// Not a constructor argument: the painter owns GPU handles, and those
+    /// arrive with the renderer several frames after the `Gui` exists — on the
+    /// web, asynchronously. A `Gui` that could not be built until a device
+    /// existed would be a `Gui` no test could build at all.
+    volume_painter: Option<std::sync::Arc<dyn crate::volume_view::VolumePainter>>,
 }
 
 /// A storm motion vector the user may substitute for the RPG's.
@@ -673,6 +690,8 @@ impl Gui {
             #[cfg(test)]
             last_pane_content: Vec::new(),
             #[cfg(test)]
+            last_volume_arms: Vec::new(),
+            #[cfg(test)]
             last_pane_options: Vec::new(),
             #[cfg(test)]
             last_map_excluded_rects: Vec::new(),
@@ -695,6 +714,7 @@ impl Gui {
             show_settings: false,
             gps_config: rustdar_gps::GpsConfig::default(),
             storm_motion_override: StormMotionOverride::default(),
+            volume_painter: None,
         };
         gui.initialize_pane_enabled();
         gui
@@ -719,6 +739,9 @@ impl Gui {
             // are per-pane records of one frame's pane loop, so a leftover entry
             // would report an arm that did not run this frame.
             self.last_pane_content.clear();
+            // Same reason as the line above: a per-frame record of the pane
+            // loop, so a leftover entry would report a 3D arm that did not run.
+            self.last_volume_arms.clear();
             // Cleared like the rest: the picker only draws when the layers
             // panel is on screen, so a stale value would report buttons that
             // are not there — a compact layout with the drawer shut offers
@@ -764,7 +787,7 @@ impl Gui {
         // the frame has closed. See the `pending_pane_kind` field for why
         // converting a pane cannot be a direct write from the dispatcher that
         // asked for it.
-        self.apply_pending_pane_kind();
+        self.apply_pending_pane_kind(&mut actions);
 
         // Floating windows last, so they layer above the chrome and the map.
         self.render_overlay_popup(ctx);
@@ -2041,12 +2064,25 @@ impl Gui {
     /// Called from [`Self::ui`] after the pane loop, where every pane is back in
     /// the vector. Converting a pane keeps everything about what it is looking
     /// at — see `PaneState::set_kind` — so there is nothing else to carry across.
-    fn apply_pending_pane_kind(&mut self) {
+    fn apply_pending_pane_kind(&mut self, actions: &mut Vec<GuiAction>) {
         let Some((pane_idx, kind)) = self.pending_pane_kind.take() else {
             return;
         };
         match self.panes.get_mut(pane_idx) {
-            Some(pane) => pane.set_kind(kind),
+            Some(pane) => {
+                // Before the conversion, because after it the pane no longer
+                // remembers it was a 3D view. A voxel grid is 1–8 MiB of host
+                // memory plus a GPU texture, refcounted by the volume it was
+                // built from, and this is the only moment a pane can stop
+                // needing one without anything else noticing: the pane is still
+                // on screen, still on the same site, still live. Nothing else in
+                // the frame is going to come back and ask.
+                if pane.kind() == crate::pane::PaneKind::Volume && kind != crate::pane::PaneKind::Volume
+                {
+                    actions.push(GuiAction::ReleaseVolume { pane_idx });
+                }
+                pane.set_kind(kind);
+            }
             // A pane the layout no longer holds, which a pane-count change in the
             // same frame can produce. Dropped rather than clamped to another
             // index: converting a pane the user did not point at is worse than
@@ -2514,6 +2550,34 @@ impl Gui {
             pane.content.release_textures();
         }
         self.map_tiles.clear();
+        // The painter holds wgpu handles made by the device that is going away,
+        // and every one of them — pipelines, the offscreen targets, the uploaded
+        // grid — is invalid the moment it does. Dropping the whole painter is
+        // the release: the frontend installs a fresh one when the renderer comes
+        // back, and until then every 3D pane says so instead of drawing with a
+        // dangling handle. This is the surface-loss and suspend/resume half of
+        // `ReleaseVolume`.
+        self.volume_painter = None;
+    }
+
+    /// Install what can draw 3D panes, or take it away.
+    ///
+    /// Called by the frontend when a renderer is created and, with `None`, when
+    /// one is lost. Every 3D pane on screen picks the change up on the next
+    /// frame with no other bookkeeping, because the painter is consulted afresh
+    /// inside each pane's arm rather than cached anywhere.
+    pub fn set_volume_painter(
+        &mut self,
+        painter: Option<std::sync::Arc<dyn crate::volume_view::VolumePainter>>,
+    ) {
+        self.volume_painter = painter;
+    }
+
+    /// Whatever can draw 3D panes this frame.
+    pub(crate) fn volume_painter(
+        &self,
+    ) -> Option<&std::sync::Arc<dyn crate::volume_view::VolumePainter>> {
+        self.volume_painter.as_ref()
     }
 
     /// Propagate the interacted pane's viewport (zoom + position) to all other panes.

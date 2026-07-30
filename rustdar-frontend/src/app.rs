@@ -274,6 +274,18 @@ pub struct App {
     /// so a site the user has actually settled on is never moved out from under
     /// them, however far they later travel.
     site_is_provisional: bool,
+    /// The voxel grids 3D panes are holding, refcounted by the volume they were
+    /// built from.
+    ///
+    /// Deliberately **not** in `AppState`: a surface loss destroys that struct,
+    /// and rebuilding an 8 MiB grid that took 100 ms to resample — from a scan
+    /// that is still in hand and has not changed — is work with nothing to show
+    /// for it. What does die with the device is the *upload*, which lives in
+    /// egui's callback resources instead.
+    ///
+    /// `Arc` because the painter handed to the `Gui` reads it during the UI
+    /// pass, while this side writes it from the action handler.
+    volume_store: std::sync::Arc<crate::volume::bridge::VolumeStore>,
 }
 
 /// Bookkeeping for the periodic config write.
@@ -329,6 +341,37 @@ struct AutosaveState {
 /// is closed. Three seconds keeps a pan-and-zoom durable at human timescales
 /// while staying far below the rate at which anything here is edited.
 const AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Half the east–west and north–south extent of the box a 3D pane resamples,
+/// kilometres.
+///
+/// 150 km rather than the 230 km surveillance limit. The grid has a fixed cell
+/// count, so half-width buys coverage at the price of resolution: 230 km over
+/// 256 cells is 1.80 km per cell, 150 km is 1.17 km — finer than the 1 km cube
+/// this replaces at a range that still holds a whole mesoscale system. Past
+/// ~150 km the lowest tilt is already above 3 km AGL, so the extra box is mostly
+/// the part of the cone the radar cannot see into.
+///
+/// Not yet a control. When it becomes one it belongs here, because
+/// `VoxelRequest::half_width_km` is clamped rather than refused precisely so a
+/// zoom that reaches the end of its travel stops instead of failing.
+const VOLUME_HALF_WIDTH_KM: f64 = 150.0;
+
+/// Bottom of the box a 3D pane resamples, kilometres MSL.
+///
+/// Sea level, not the antenna: the grid's vertical axis is MSL throughout
+/// (`VoxelGrid::z_range_km_msl`), and a site at 400 m with a base at its own
+/// height would silently clip the lowest 400 m of every echo — the part with
+/// the storm's inflow in it.
+const VOLUME_BASE_KM_MSL: f64 = 0.0;
+
+/// Top of the box, kilometres MSL.
+///
+/// 18 km clears every overshooting top in the continental United States with
+/// room to spare, and stopping there rather than at 20 km spends the cells on
+/// air that has weather in it: at 128 layers, 18 km is 141 m per layer against
+/// 156 m.
+const VOLUME_TOP_KM_MSL: f64 = 18.0;
 
 /// Point a fresh `Gui` at the radar nearest this device's timezone.
 ///
@@ -429,6 +472,7 @@ impl App {
                 touched: false,
             },
             site_is_provisional,
+            volume_store: std::sync::Arc::new(crate::volume::bridge::VolumeStore::new()),
             http_client,
             #[cfg(not(target_arch = "wasm32"))]
             tokio_runtime,
@@ -666,6 +710,7 @@ impl App {
                 let ctx = state.egui_renderer.context().clone();
                 self.state = Some(state);
                 self.restore_cached_render(&ctx);
+                self.install_volume_bridge();
             }
         }
     }
@@ -688,6 +733,7 @@ impl App {
                     let ctx = state.egui_renderer.context().clone();
                     self.state = Some(state);
                     self.restore_cached_render(&ctx);
+                    self.install_volume_bridge();
                 }
                 // Still running — nothing to do until the redraw it will post.
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -727,6 +773,172 @@ impl App {
             // holding a perfectly good `AppState` it never collects.
             notify_redraw(&redraw_target);
         });
+    }
+
+    /// Build the volume pipelines on the device that has just appeared and hand
+    /// the `Gui` something that can draw a 3D pane.
+    ///
+    /// Called from both arms of `ensure_rendering_state`, which is every place a
+    /// renderer comes into existence — first start, resume from suspend, and
+    /// recovery from a lost surface. The matching teardown is
+    /// `Gui::clear_graphics_state`, which drops the painter; there is no third
+    /// place either half can be forgotten.
+    ///
+    /// The painter is installed **even when the probe said no**, because it is
+    /// what tells the pane *why*. A pane with no painter falls back to a generic
+    /// "unavailable", which is the one message that helps nobody.
+    fn install_volume_bridge(&mut self) {
+        use crate::volume::quality;
+
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+
+        // The one production call site of `quality::select`, and the reason its
+        // `Virtual`/`Unknown` arms matter: that is what a browser reports for
+        // every adapter it exposes, so the web build takes them on every device.
+        let quality = quality::select(
+            quality::DeviceClass::from_device_type(state.adapter.get_info().device_type),
+            quality::PLATFORM_CEILING,
+        );
+
+        // Nothing is built on a device that cannot render a volume — the
+        // pipelines would compile a shader against limits already known to be
+        // short, and `create_render_pipeline` has no `Result` to notice it in.
+        if crate::volume::support(&state.volume_support).is_supported() {
+            log::info!("3D volume view: {quality:?} on {:?}", state.adapter.get_info().device_type);
+            let resources = crate::volume::bridge::VolumeResources::new(
+                &state.device,
+                state.egui_renderer.attachment_config(),
+                &state.queue,
+            );
+            state.egui_renderer.callback_resources_mut().insert(resources);
+        }
+
+        self.gui
+            .set_volume_painter(Some(std::sync::Arc::new(
+                crate::volume::bridge::BridgeVolumePainter::new(
+                    self.volume_store.clone(),
+                    quality,
+                    state.volume_support.clone(),
+                ),
+            )));
+    }
+
+    /// Build the voxel grid a 3D pane asked for, unless it is already in hand.
+    ///
+    /// # Why this is on the frame thread
+    ///
+    /// It should not be, and WP-D is the wire that moves it: `JobRequest::Voxels`
+    /// puts the resample on the render worker, which is the only tolerable place
+    /// for it on wasm where there is exactly one worker and no threads. That wire
+    /// is not in this tree yet, so the build happens here — measured at ~107 ms
+    /// for the desktop shape, which is a visible hitch on the frame it lands.
+    /// The dedupe below is what keeps it to one hitch per volume rather than one
+    /// per frame, and it is the property to preserve when the worker path
+    /// arrives.
+    fn handle_prepare_volume(
+        &mut self,
+        pane_idx: usize,
+        target: rustdar_egui::pane::VolumeTarget,
+    ) {
+        use crate::volume::bridge::VolumeEntry;
+
+        // Attaches either way. `false` means another pane already built this
+        // exact volume and moment, so this one shares it: one build, one upload.
+        if !self.volume_store.claim(pane_idx, &target) {
+            self.mark_volume_rendered(pane_idx, &target);
+            return;
+        }
+
+        let Some(scan) = self.scan_data.get(&target.volume.site).cloned() else {
+            // The volume has not been decoded yet. Deliberately no entry: the
+            // pane goes on asking, and the first frame after the scan lands
+            // builds it. Storing a refusal here would be a permanent "no" to a
+            // question whose answer is about to change.
+            return;
+        };
+        let Some(site) = rustdar_radar::sites::get_radar_site(&target.volume.site) else {
+            self.volume_store.insert(
+                pane_idx,
+                target.clone(),
+                VolumeEntry::Refused(format!(
+                    "{} is not a radar site this build knows the position of.",
+                    target.volume.site,
+                )),
+            );
+            self.mark_volume_rendered(pane_idx, &target);
+            return;
+        };
+
+        let request = rustdar_radar::voxel::VoxelRequest {
+            centre: (site.lat, site.lon),
+            half_width_km: VOLUME_HALF_WIDTH_KM,
+            base_km_msl: VOLUME_BASE_KM_MSL,
+            top_km_msl: VOLUME_TOP_KM_MSL,
+            product: target.product,
+            shape: rustdar_radar::voxel::default_shape(),
+            // The raymarch reads indices only. The value plane is four times
+            // larger and exists for a hover readout, which a 3D pane does not
+            // have yet.
+            values_wanted: false,
+        };
+
+        let started = web_time::Instant::now();
+        let entry = match rustdar_radar::voxel::build_voxels(&scan, &request, site.lat, site.lon) {
+            Some(grid) => {
+                log::info!(
+                    "3D volume view: built {grid:?} in {} ms",
+                    started.elapsed().as_millis(),
+                );
+                VolumeEntry::Ready(std::sync::Arc::new(grid))
+            }
+            // `build_voxels` has already logged which invariant it refused on.
+            // The live one this message is written for is a volume joined
+            // mid-flight: the scan stands in an empty coverage pattern until its
+            // VCP message arrives, and the sampler correctly declines to invent
+            // a tilt ladder for it.
+            None => VolumeEntry::Refused(format!(
+                "This volume cannot be resampled for 3D. The most likely reason is that it was \
+                 joined part-way through and its scan strategy has not arrived yet — it will \
+                 appear when the next volume completes.\n\n({} at {} UTC)",
+                target.volume.site, target.volume.collected,
+            )),
+        };
+
+        self.volume_store.insert(pane_idx, target.clone(), entry);
+        self.mark_volume_rendered(pane_idx, &target);
+    }
+
+    /// This pane is holding nothing, on the host **and** on the GPU.
+    ///
+    /// The GPU half is the part that is easy to leave out and impossible to see:
+    /// a pane-sized `Rgba8Unorm` offscreen is ~3 MiB at 900², and the voxel
+    /// texture behind it is up to 8 MiB. Dropping the store entry alone would
+    /// leave both alive inside egui's callback resources until the renderer
+    /// itself was rebuilt.
+    fn handle_release_volume(&mut self, pane_idx: usize) {
+        self.volume_store.release(pane_idx);
+        let live = self.volume_store.live_ids();
+        if let Some(state) = self.state.as_mut()
+            && let Some(resources) = state
+                .egui_renderer
+                .callback_resources_mut()
+                .get_mut::<crate::volume::bridge::VolumeResources>()
+        {
+            resources.release_pane(pane_idx, &live);
+        }
+    }
+
+    /// Record that this pane's 3D view is now about `target`, so it stops
+    /// asking. Set for a refusal as well as for a grid: a volume that cannot be
+    /// resampled must not be re-attempted every frame at 100 ms a go.
+    fn mark_volume_rendered(&mut self, pane_idx: usize, target: &rustdar_egui::pane::VolumeTarget) {
+        if let Some(pane) = self.gui.pane_mut(pane_idx)
+            && let Some(volume) = pane.volume_mut()
+        {
+            volume.rendered_for = Some(target.clone());
+        }
     }
 
     /// Process all GUI actions emitted during this frame.

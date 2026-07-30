@@ -324,7 +324,25 @@ impl super::Gui {
                         }
                         PaneKind::Volume => {
                             self.record_pane_content(pane_idx, PaneKind::Volume, pane_rect);
-                            paint_pane_empty_state(&mut child_ui, pane_rect, VOLUME_EMPTY_STATE);
+                            // Cloned rather than borrowed: `record_pane_content`
+                            // above and the probe below both want `&mut self`,
+                            // and an `Arc` clone is a refcount bump against a
+                            // borrow that would otherwise have to span the whole
+                            // arm.
+                            let painter = self.volume_painter().cloned();
+                            let outcome = render_volume_pane(
+                                &mut child_ui,
+                                pane_rect,
+                                pane_idx,
+                                &mut pane,
+                                painter.as_deref(),
+                                &mut actions,
+                            );
+                            #[cfg(test)]
+                            self.last_volume_arms
+                                .push(VolumeArmProbe { pane_idx, outcome });
+                            #[cfg(not(test))]
+                            let _ = outcome;
                         }
                     }
 
@@ -448,6 +466,199 @@ impl super::Gui {
 /// auto-ids — so every widget the real content adds later would be keyed one
 /// step along from where it will finally sit, and the empty state going away
 /// would re-key all of them.
+/// Degrees of yaw per point of horizontal drag.
+///
+/// Sized so that a drag across a 900-point pane turns the box most of the way
+/// round — enough to inspect a storm from every side in one gesture, short of
+/// the full turn that would make the end of a drag ambiguous.
+const ORBIT_YAW_DEG_PER_POINT: f32 = 0.4;
+/// Degrees of pitch per point of vertical drag. Shallower than the yaw rate
+/// because the usable pitch range is 178° against yaw's unbounded turn, so the
+/// same rate would run into the clamp within a third of a pane.
+const ORBIT_PITCH_DEG_PER_POINT: f32 = 0.25;
+/// Zoom factor per point of scroll. `exp` of this times the scroll, so a notch
+/// is a fixed *ratio* whatever the current distance — the same reason walkers'
+/// wheel zoom is multiplicative.
+const ORBIT_ZOOM_PER_SCROLL_POINT: f32 = 0.004;
+
+/// What the 3D arm did with one pane on one frame.
+///
+/// `None` means it pushed a paint callback; `Some(reason)` means it painted the
+/// empty state with that reason. Recorded because the two are indistinguishable
+/// from outside — a callback whose payload nothing can draw paints exactly as
+/// much as an empty state does — so a test that only looked at the screen could
+/// not tell a working pane from a broken one.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct VolumeArmProbe {
+    pub(crate) pane_idx: usize,
+    pub(crate) outcome: Option<String>,
+}
+
+/// Draw one 3D pane: take its gesture, ask for its grid, and either push a
+/// paint callback or say why there is not one.
+///
+/// Returns the empty-state reason, or `None` if a callback was pushed.
+///
+/// # Why the callback is built here and not before the frame
+///
+/// `painter.paint` is called with the camera **after** this frame's drag has
+/// been folded in. Building the payload before `Gui::ui` ran would be tidier and
+/// would leave the orbit one frame behind the pointer — which does not look like
+/// a bug, it looks like input lag, and it gets "fixed" by turning the drag
+/// sensitivity up rather than by fixing the order.
+///
+/// # Why the zoom gate is correctness
+///
+/// `Input::zoom_delta` is **global**: it reports the frame's pinch or
+/// ctrl-scroll wherever on screen it happened. Without the
+/// `hovered() || dragged()` gate a pinch over a map pane would orbit every 3D
+/// pane on screen at once, which is the sort of thing that gets reported as
+/// "the 3D view moves on its own".
+fn render_volume_pane(
+    ui: &mut egui::Ui,
+    pane_rect: egui::Rect,
+    pane_idx: usize,
+    pane: &mut crate::pane::PaneState,
+    painter: Option<&dyn crate::volume_view::VolumePainter>,
+    actions: &mut Vec<GuiAction>,
+) -> Option<String> {
+    let outcome = volume_pane_outcome(ui, pane_rect, pane_idx, pane, painter, actions);
+    if let Some(why) = outcome.as_deref() {
+        paint_pane_empty_state(ui, pane_rect, why);
+    }
+    outcome
+}
+
+/// The 3D arm's decision, with the painting left to its caller so that every
+/// path out of it is a `return` of a reason rather than a `return` plus a call
+/// somebody can forget to make.
+fn volume_pane_outcome(
+    ui: &mut egui::Ui,
+    pane_rect: egui::Rect,
+    pane_idx: usize,
+    pane: &mut crate::pane::PaneState,
+    painter: Option<&dyn crate::volume_view::VolumePainter>,
+    actions: &mut Vec<GuiAction>,
+) -> Option<String> {
+    use crate::pane::{OrbitDelta, VolumeStamp, VolumeTarget};
+    use crate::volume_view::{VolumeFrameState, VolumePaint};
+
+    // The gesture first, and unconditionally: the camera is the pane's own
+    // state, it survives every reason there is nothing to draw, and a user who
+    // orbits an empty box while a volume downloads should find it where they
+    // left it when the volume lands.
+    let response = ui.interact(
+        pane_rect,
+        ui.id().with(("volume_orbit", pane_idx)),
+        egui::Sense::click_and_drag(),
+    );
+    let mut delta = OrbitDelta::default();
+    if response.dragged() {
+        let drag = response.drag_delta();
+        // Grab-and-turn, in both axes: a point on the box's surface follows the
+        // pointer. Dragging right swings the eye's bearing east, which brings
+        // the box's eastern face round to face the viewer and carries every
+        // surface point rightwards with the cursor; dragging down raises the
+        // eye, which tips the top face towards the viewer and carries its far
+        // edge down. Both signs are convention rather than arithmetic, so both
+        // are pinned by a test — a sign error here still orbits perfectly well
+        // and merely feels wrong, which is the kind of defect that survives
+        // review.
+        delta.yaw_deg = drag.x * ORBIT_YAW_DEG_PER_POINT;
+        delta.pitch_deg = drag.y * ORBIT_PITCH_DEG_PER_POINT;
+    }
+    if response.hovered() || response.dragged() {
+        let (pinch, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta.y));
+        // Multiplied, not chosen between: a trackpad can deliver both in one
+        // frame, and `OrbitCamera::nudge` divides the distance by the product
+        // exactly once.
+        delta.zoom_factor = pinch * (scroll * ORBIT_ZOOM_PER_SCROLL_POINT).exp();
+    }
+
+    // Read before `volume_mut` borrows the pane: `site`, `scan_info` and
+    // `selected_product` are flat fields beside `content`, and taking them first
+    // is what keeps this one borrow deep rather than a clone of the pane.
+    let site_code = pane.site.clone();
+    let product = pane.selected_product;
+    let stamp = pane
+        .scan_info
+        .as_ref()
+        .map(|scan_info| VolumeStamp {
+            site: scan_info.site.name.to_string(),
+            collected: scan_info.timestamp,
+        });
+
+    // Unreachable from the kind branch, which only enters here for a `Volume`
+    // pane, and answered rather than unwrapped: this function takes a whole
+    // `PaneState` and is the sort of thing a future caller invokes from
+    // somewhere else.
+    let Some(volume) = pane.volume_mut() else {
+        return Some(VOLUME_EMPTY_STATE.to_owned());
+    };
+    volume.camera.nudge(delta);
+    let camera = volume.camera;
+    let already_rendered = volume.rendered_for.clone();
+
+    // Everything below is a reason there is no picture, in the order the user
+    // can act on them.
+    let Some(painter) = painter else {
+        return Some(VOLUME_EMPTY_STATE.to_owned());
+    };
+    let Some(volume_stamp) = stamp else {
+        return Some(format!("Waiting for a volume from {site_code}"));
+    };
+    if rustdar_radar::sampler::samplable(product).is_none() {
+        return Some(format!(
+            "{} has no vertical structure to render in 3D — pick a moment the radar measures \
+             directly",
+            product.name(),
+        ));
+    }
+
+    let target = VolumeTarget {
+        volume: volume_stamp,
+        product,
+    };
+    if already_rendered.as_ref() != Some(&target) {
+        // Level-triggered on purpose. See `GuiAction::PrepareVolume`: the
+        // alternative is remembering an edge across a site switch, a volume
+        // roll and a surface loss, which is three places to forget.
+        actions.push(GuiAction::PrepareVolume {
+            pane_idx,
+            target: target.clone(),
+        });
+    }
+
+    let pixels_per_point = ui.ctx().pixels_per_point();
+    let size_px = [
+        (pane_rect.width() * pixels_per_point).round().max(1.0) as u32,
+        (pane_rect.height() * pixels_per_point).round().max(1.0) as u32,
+    ];
+
+    match painter.paint(&VolumeFrameState {
+        pane_idx,
+        target,
+        camera,
+        size_px,
+    }) {
+        VolumePaint::Callback(callback) => {
+            // Hand-constructed, because `egui_wgpu::Callback` has a private
+            // field and its only constructor wants the rect up front — so a
+            // crate that cannot name `egui_wgpu` cannot make one. Both of
+            // `PaintCallback`'s fields are public, which is the whole reason
+            // this seam is an `Arc<dyn Any>` rather than a typed payload.
+            ui.painter()
+                .add(egui::Shape::Callback(egui::epaint::PaintCallback {
+                    rect: pane_rect,
+                    callback,
+                }));
+            None
+        }
+        VolumePaint::Empty(why) => Some(why),
+    }
+}
+
 fn paint_pane_empty_state(ui: &mut egui::Ui, pane_rect: egui::Rect, text: &str) {
     ui.painter().text(
         pane_rect.center(),

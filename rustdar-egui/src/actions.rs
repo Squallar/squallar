@@ -100,6 +100,30 @@ pub enum GuiAction {
     },
     /// Stop the desktop serial GPS reader.
     StopGps,
+    /// Build the voxel grid a 3D pane needs, if it is not already in hand.
+    ///
+    /// Emitted from inside the pane's own render arm, on every frame the pane
+    /// does not yet have the grid it wants. That sounds like a request storm and
+    /// is not: the handler is idempotent against the store it fills, and the
+    /// pane stops asking the moment the grid lands. Making it edge-triggered
+    /// instead would mean remembering across `reset_panes_for_site`,
+    /// `SwitchRadarSite` and a surface loss, which is three places to forget.
+    ///
+    /// A whole-volume grid is expensive — ~107 ms at the desktop shape — so the
+    /// handler must dedupe on the target before it builds, not after.
+    PrepareVolume {
+        pane_idx: usize,
+        target: crate::pane::VolumeTarget,
+    },
+    /// This pane no longer needs whatever volume it was holding.
+    ///
+    /// Refcounted **by target** on the other side, not by pane: two panes on one
+    /// volume share one build and one GPU upload, so the grid goes when the last
+    /// of them lets go. Emitted when a 3D pane stops being one, and when the
+    /// volume it wants changes.
+    ReleaseVolume {
+        pane_idx: usize,
+    },
 }
 
 impl std::fmt::Display for GuiAction {
@@ -190,6 +214,19 @@ impl std::fmt::Display for GuiAction {
             }
             GuiAction::StopGps => {
                 write!(f, "Stop GPS")
+            }
+            GuiAction::PrepareVolume { pane_idx, target } => {
+                write!(
+                    f,
+                    "Prepare {} volume for pane {} from {} at {}",
+                    target.product.code(),
+                    pane_idx,
+                    target.volume.site,
+                    target.volume.collected,
+                )
+            }
+            GuiAction::ReleaseVolume { pane_idx } => {
+                write!(f, "Release the volume pane {} was holding", pane_idx)
             }
         }
     }
