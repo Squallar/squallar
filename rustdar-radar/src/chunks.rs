@@ -1379,9 +1379,11 @@ impl ChunkPoller {
     /// completed.
     pub(crate) fn roll(&mut self, to: VolumeIndex) -> Option<ClosedVolume> {
         let closed = self.current.as_mut().map(|current| {
-            // `close` first, and the snapshot after it: closing resolves every
-            // still-open cut to `Abandoned`, which is what keeps a cut that ended
-            // short out of the scan handed over.
+            // `close`, not `progress`: it is what resolves a still-open cut to
+            // `Abandoned`, so `progress.abandoned` names exactly the cuts the scan
+            // below is missing. What keeps a short cut *out* of that scan is
+            // `snapshot`'s own sealed-only filter, so these two lines commute —
+            // this is the readable order, not a load-bearing one.
             let progress = current.close();
             ClosedVolume {
                 progress,
@@ -2507,9 +2509,15 @@ mod tests {
     }
 
     /// A cut that ended short is absent from the closed volume, not present and
-    /// partial. `close` resolves open cuts to `Abandoned` and the snapshot is
-    /// taken after it, in that order; taken before, the partial cut would still
-    /// be `Open` and the abandoned-cut list would not match the scan.
+    /// partial — and the roll says which cuts those were.
+    ///
+    /// The mutation this kills is `roll` reading `progress()` instead of
+    /// `close()`: the scan comes out identical either way, because `snapshot`
+    /// filters to sealed cuts on its own, but the still-`Open` cut would then be
+    /// missing from `progress.abandoned` and a caller asking "what is this volume
+    /// missing?" would be told "nothing". Verified by mutation, along with the
+    /// discovery that the *order* of the two calls is not observable and so is not
+    /// claimed to be.
     #[test]
     fn a_roll_leaves_an_abandoned_cut_out_of_the_scan_it_hands_back() {
         // Drop the chunk carrying the 0.5° cut's terminator, so that cut is still

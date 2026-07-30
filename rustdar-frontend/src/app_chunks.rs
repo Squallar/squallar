@@ -348,6 +348,10 @@ impl super::App {
                 closed.progress.sealed_elevations.as_slice(),
             ),
             None => {
+                // Cost, not safety — nothing below is wrong on a round that
+                // sealed nothing, it is just work for no change. `ScanInfo::from_scan`
+                // walks every radial of every sweep and `reset_panes_for_tilts`
+                // sweeps the render cache, and most rounds seal nothing.
                 if outcome.sealed_elevations.is_empty() {
                     return;
                 }
@@ -1047,6 +1051,60 @@ mod volume_close_tests {
         );
     }
 
+    /// A completed volume **replaces** the site's scan info; it does not merge
+    /// into it.
+    ///
+    /// `apply_chunk_scan_info` is the mid-volume form: it unions the product and
+    /// elevation lists, because a volume still being assembled knows only the cuts
+    /// that have completed and replacing would shrink the tilt picker every few
+    /// seconds. At completion the volume knows every cut it has, and the point of
+    /// this branch is that the steady state after each volume is *exactly* what the
+    /// archive path produces — so a tilt the previous volume had and this one does
+    /// not has to go. Merging here would accumulate a union across volumes for the
+    /// rest of the session, and a VCP change would never shrink it.
+    ///
+    /// The second half is the spinner and the archive backoff, which only the wide
+    /// form touches. This is the one moment the chunk feed is entitled to: a volume
+    /// just finished, so a Refresh waiting on one is satisfied and the archive's
+    /// retreat is over.
+    #[test]
+    fn a_completed_volume_replaces_the_scan_info_rather_than_merging_into_it() {
+        let product = RadarProduct::EchoTopsInterpolated;
+        let mut app = app_showing_a_drawn_volume(product);
+        // A tilt from the previous volume that the completed one does not carry.
+        app.gui
+            .pane_mut(0)
+            .unwrap()
+            .scan_info
+            .as_mut()
+            .unwrap()
+            .product_elevations
+            .entry(product)
+            .or_default()
+            .push(9.9);
+        app.gui.set_fetching(true);
+
+        app.apply_chunk_outcome("KTLX", &closing_round(5));
+
+        let angles: Vec<f32> = app
+            .gui
+            .pane(0)
+            .and_then(|p| p.scan_info.as_ref())
+            .and_then(|i| i.product_elevations.get(&product).cloned())
+            .unwrap_or_default();
+        assert!(
+            !angles.iter().any(|a| (a - 9.9).abs() < 0.05),
+            "a tilt the completed volume does not carry survived, so the scan \
+             info was merged rather than replaced and the tilt list only ever \
+             grows: {angles:?}"
+        );
+        assert!(
+            !app.gui.fetching(),
+            "the volume completed and the spinner stayed up, so a Refresh \
+             waiting on it never ends and the archive poll stays wedged behind it"
+        );
+    }
+
     /// Freshness is stamped from the volume that was applied, cut for cut.
     ///
     /// The round's own `sealed_elevations` belong to the volume that just
@@ -1100,6 +1158,59 @@ mod volume_close_tests {
             5,
             "the round that closed a complete volume installed something other \
              than that volume"
+        );
+    }
+
+    /// The Level III refetch, which is the one of the three named consequences no
+    /// behavioural test here can see.
+    ///
+    /// `spawn_level3_fetches` reaches the network through `spawn_async_task` and
+    /// leaves nothing behind on `App` to assert on, so this is a source probe —
+    /// the same tool this module's other positional guarantees use. Deleting the
+    /// call is otherwise invisible: every Level III pane on the site would simply
+    /// keep the previous volume's object, because `reset_panes_for_site` dropped
+    /// `level3_data` and nothing refilled it.
+    ///
+    /// The loop append is checked from the other side, as an *absence*: mid-volume
+    /// it must not happen at all. `append_polled_frame` dedupes by timestamp and a
+    /// `LoopFrame` has no "the scan got better" transition, so a frame appended
+    /// while the volume is still assembling freezes on the cuts it had then.
+    #[test]
+    fn the_completed_branch_refetches_level_three_and_owns_the_loop_append() {
+        let source = include_str!("app_chunks.rs");
+        let start = source
+            .find("fn apply_chunk_outcome(")
+            .expect("apply_chunk_outcome is gone");
+        let body = &source[start..];
+        let split = body
+            .find("if completed.is_some() {")
+            .expect("the completed branch is gone");
+        let (complete, rest) = {
+            let after = &body[split..];
+            let els = after
+                .find("\n        } else {")
+                .expect("the two branches are no longer an if/else");
+            (&after[..els], &after[els..])
+        };
+
+        for call in [
+            "self.render.reset_panes_for_site(",
+            "self.spawn_level3_fetches(",
+            "self.append_scan_to_active_loops(",
+        ] {
+            assert!(
+                complete.contains(call),
+                "{call} left the completed-volume branch, so nothing does it when a \
+                 volume finishes"
+            );
+        }
+        assert!(
+            !rest[..rest
+                .find("\n        // Deliberately absent")
+                .unwrap_or(rest.len())]
+                .contains("self.append_scan_to_active_loops("),
+            "the mid-volume branch appends a loop frame, which freezes that frame \
+             on however many cuts the volume had at the time"
         );
     }
 
