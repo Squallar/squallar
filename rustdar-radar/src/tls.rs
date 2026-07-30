@@ -350,10 +350,24 @@ mod tests {
     /// is a decision to take on purpose, not a side effect of this test.
     fn cfg_gated_source(cfg: &str, signature: &str) -> String {
         let source = include_str!("tls.rs");
+        // The shipped half only. The signatures below are line-continued string
+        // literals, so today they do not appear in this module's own source —
+        // but that is an accident of formatting, not a property, and `cargo fmt`
+        // could end it without a word.
+        let (code, _) = source
+            .split_once("\nmod tests {")
+            .expect("tls.rs no longer has a test module");
         let needle = format!("{cfg}\n{signature}");
-        let at = source
-            .find(&needle)
-            .unwrap_or_else(|| panic!("tls.rs no longer contains\n{needle}"));
+        // Exactly one definition, checked before it is read: two would mean the
+        // scrape is reading whichever came first, and a decoy in a doc comment
+        // or a string would be one.
+        let occurrences = code.matches(&needle).count();
+        assert_eq!(
+            occurrences, 1,
+            "expected exactly one\n{needle}\nin tls.rs, found {occurrences}"
+        );
+        let at = code.find(&needle).expect("just counted one");
+        let source = code;
         let open = at + source[at..].find('{').expect("no function body");
         let mut depth = 0usize;
         for (offset, c) in source[open..].char_indices() {
@@ -371,7 +385,35 @@ mod tests {
         panic!("unbalanced braces after {signature}");
     }
 
-    /// **Neither browser client may set a `User-Agent`.**
+    /// Every `.method(` called in a block of source, sorted and deduplicated.
+    ///
+    /// `::` paths are not method calls and are skipped, so
+    /// `reqwest::Client::builder()` does not appear.
+    fn method_calls(body: &str) -> Vec<String> {
+        let bytes: Vec<char> = body.chars().collect();
+        let mut found: Vec<String> = Vec::new();
+        for (i, &c) in bytes.iter().enumerate() {
+            if c != '.' || i == 0 {
+                continue;
+            }
+            // `::name(` is a path, `1.0` is a float, `..base` is a struct update.
+            if matches!(bytes[i - 1], ':' | '.' | '0'..='9') {
+                continue;
+            }
+            let name: String = bytes[i + 1..]
+                .iter()
+                .take_while(|c| c.is_alphanumeric() || **c == '_')
+                .collect();
+            if !name.is_empty() && bytes.get(i + 1 + name.chars().count()) == Some(&'(') {
+                found.push(name);
+            }
+        }
+        found.sort();
+        found.dedup();
+        found
+    }
+
+    /// **Exactly which builder calls each of the four constructors makes.**
     ///
     /// `User-Agent` is a forbidden header name in a browser. Chromium strips it
     /// silently, so the request stays simple and works; Firefox forwards it,
@@ -386,36 +428,54 @@ mod tests {
     /// test runner was compiled for, which is always the native one. The wasm
     /// arms have never been executed by anything.
     ///
-    /// The native arm is checked too, and not as a courtesy: it is the control
-    /// that keeps this from passing vacuously. A scrape that matched the wrong
-    /// text, or nothing, would report "no User-Agent here" about all four.
+    /// # Why an allowlist and not "contains `.user_agent(`"
+    ///
+    /// Because `.user_agent(` is not the only way to set the header, and the
+    /// other way was reachable. reqwest 0.13.4's **wasm** `ClientBuilder`
+    /// exposes `default_headers` (`src/wasm/client.rs:329`); a review set
+    /// `USER_AGENT` through a `HeaderMap` on the wasm client and the substring
+    /// check passed with `cargo check --target wasm32-unknown-unknown` at 0 —
+    /// the exact Firefox outage described above, shipped. Enumerating forbidden
+    /// spellings only moves the goalposts, so this enumerates the *permitted*
+    /// calls instead: every builder method is a `.method(`, so an exact set is
+    /// the whole configuration surface. Adding any call to any of the four
+    /// fails here until it is written down.
+    ///
+    /// The native arms are checked the same way, and not as a courtesy: they
+    /// are the control that keeps this from passing vacuously. A scrape that
+    /// matched the wrong text, or nothing, would report an empty call set for
+    /// all four.
     #[test]
     fn the_browser_clients_attach_no_user_agent() {
         const WASM: &str = r#"#[cfg(target_arch = "wasm32")]"#;
         const NATIVE: &str = r#"#[cfg(not(target_arch = "wasm32"))]"#;
 
-        for (cfg, signature, may_set_ua) in [
+        for (cfg, signature, permitted) in [
             (
                 WASM,
                 "pub fn client(_user_agent: &str, _timeout: std::time::Duration) \
                  -> reqwest::ClientBuilder {",
-                false,
+                // Nothing at all: the browser owns the timeout, the scheme and
+                // every forbidden header, so there is nothing left to configure.
+                &[][..],
             ),
             (
                 WASM,
                 "pub fn simple_client(_timeout: std::time::Duration) -> reqwest::ClientBuilder {",
-                false,
+                &[][..],
             ),
             (
                 NATIVE,
                 "pub fn client(user_agent: &str, timeout: std::time::Duration) \
                  -> reqwest::ClientBuilder {",
-                true,
+                // `to_owned` is the argument to `user_agent`, not a builder
+                // call; it is listed because this reads the whole body.
+                &["https_only", "timeout", "to_owned", "user_agent"][..],
             ),
             (
                 NATIVE,
                 "pub fn simple_client(timeout: std::time::Duration) -> reqwest::ClientBuilder {",
-                false,
+                &["https_only", "timeout"][..],
             ),
         ] {
             let body = cfg_gated_source(cfg, signature);
@@ -425,13 +485,14 @@ mod tests {
                 "{signature} no longer builds a client:\n{body}"
             );
             assert_eq!(
-                body.contains(".user_agent("),
-                may_set_ua,
-                "{cfg}\n{signature}\nsets a User-Agent iff {}, and it must be \
-                 {may_set_ua}. In a browser that header is forbidden — Chromium \
-                 drops it, Firefox forwards it and turns every request into a \
-                 preflight the origin refuses.",
-                !may_set_ua,
+                method_calls(&body),
+                permitted,
+                "{cfg}\n{signature}\nconfigures something this list does not \
+                 permit. On wasm the list is empty on purpose: `user_agent`, \
+                 `default_headers` and anything else that attaches a header \
+                 make the request non-simple, and the preflight that follows is \
+                 refused by IEM, SPC and every tile CDN — in Firefox only, with \
+                 nothing wrong on native.\nbody:\n{body}"
             );
         }
     }
