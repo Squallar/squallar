@@ -621,7 +621,15 @@ mod tests {
     #[test]
     fn the_payload_the_painter_hands_over_is_one_egui_wgpu_can_draw() {
         struct Nothing;
-        impl egui_wgpu::CallbackTrait for Nothing {}
+        impl egui_wgpu::CallbackTrait for Nothing {
+            fn paint(
+                &self,
+                _info: egui::PaintCallbackInfo,
+                _render_pass: &mut wgpu::RenderPass<'static>,
+                _callback_resources: &egui_wgpu::CallbackResources,
+            ) {
+            }
+        }
 
         let payload = paint_payload(Nothing);
         assert!(

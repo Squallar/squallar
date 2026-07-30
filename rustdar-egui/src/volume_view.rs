@@ -183,6 +183,37 @@ pub fn view_for(camera: OrbitCamera, box_size_km: [f32; 3], aspect: f32) -> Opti
     if !box_size_km.iter().all(|s| s.is_finite() && *s > 0.0) {
         return None;
     }
+    let half_diagonal = 0.5
+        * (box_size_km[0] * box_size_km[0]
+            + box_size_km[1] * box_size_km[1]
+            + box_size_km[2] * box_size_km[2])
+            .sqrt();
+    let distance = camera.eye_distance() * half_diagonal;
+    build_view(
+        camera,
+        box_size_km,
+        aspect,
+        NEAR_IN_HALF_DIAGONALS * half_diagonal,
+        distance + FAR_MARGIN_IN_HALF_DIAGONALS * half_diagonal,
+    )
+}
+
+/// [`view_for`] with the frustum's depth range supplied rather than derived.
+///
+/// Split out for exactly one reason: it is what lets a test build the same view
+/// twice at wildly different near and far planes and assert the rays are
+/// identical. Doing that by scaling the box instead would change the geometry as
+/// well as the frustum, which is a test that cannot see what it is named for.
+fn build_view(
+    camera: OrbitCamera,
+    box_size_km: [f32; 3],
+    aspect: f32,
+    near: f32,
+    far: f32,
+) -> Option<VolumeView> {
+    if !box_size_km.iter().all(|s| s.is_finite() && *s > 0.0) {
+        return None;
+    }
     if !aspect.is_finite() || aspect <= 0.0 {
         return None;
     }
@@ -200,9 +231,6 @@ pub fn view_for(camera: OrbitCamera, box_size_km: [f32; 3], aspect: f32) -> Opti
     let forward = normalize([-eye_km[0], -eye_km[1], -eye_km[2]])?;
     let right = normalize(cross(forward, [0.0, 0.0, 1.0]))?;
     let up = cross(right, forward);
-
-    let near = NEAR_IN_HALF_DIAGONALS * half_diagonal;
-    let far = distance + FAR_MARGIN_IN_HALF_DIAGONALS * half_diagonal;
 
     let view_from_clip = inverse_perspective(FOV_Y_DEG, aspect, near, far)?;
     let world_from_view = camera_basis(right, up, forward, eye_km);
@@ -508,53 +536,32 @@ mod tests {
     /// The near and far planes do not move a ray.
     ///
     /// They look load-bearing and are not — the shader unprojects only at
-    /// `depth = 1.0`, where the analytic inverse gives exactly the far plane and
+    /// `depth = 1.0`, where the analytic inverse gives exactly the far plane, and
     /// the normalisation divides the distance out. Pinned because the tempting
     /// "fix" for a rendering problem is to tune them, and this says in advance
     /// that it will do nothing.
+    ///
+    /// **The depth range is not free of consequences, only of geometry.** The
+    /// homogeneous `w` at `depth = 1.0` is `near/(near − far)`, so a range
+    /// spanning many orders of magnitude cancels most of an `f32`'s digits away
+    /// before the divide. That is why this asserts over sane ranges and why the
+    /// production values are a couple of hundred apart rather than a million.
     #[test]
     fn the_frustum_depth_range_does_not_move_a_ray() {
         let camera = camera(225.0, 25.0, 2.5);
-        let base = view_for(camera, BOX_KM, 1.6).expect("a view");
+        let shallow = build_view(camera, BOX_KM, 1.6, 1.0, 3_000.0).expect("a view");
+        let deep = build_view(camera, BOX_KM, 1.6, 20.0, 60_000.0).expect("a view");
+        assert_ne!(
+            shallow.box_from_clip, deep.box_from_clip,
+            "precondition: the two frustums must actually differ",
+        );
         for ndc in [[0.0, 0.0], [-1.0, -1.0], [0.9, -0.3]] {
-            let want = direction(&base, ndc);
-            // Rebuild with a wildly different depth range by scaling the box,
-            // which is the only lever the public signature offers, then compare
-            // against a hand-built inverse at a different near/far.
-            let m = multiply(
-                box_from_world(BOX_KM),
-                multiply(
-                    camera_basis(
-                        normalize(cross(
-                            normalize([-base.eye_km[0], -base.eye_km[1], -base.eye_km[2]]).unwrap(),
-                            [0.0, 0.0, 1.0],
-                        ))
-                        .unwrap(),
-                        cross(
-                            normalize(cross(
-                                normalize([-base.eye_km[0], -base.eye_km[1], -base.eye_km[2]])
-                                    .unwrap(),
-                                [0.0, 0.0, 1.0],
-                            ))
-                            .unwrap(),
-                            normalize([-base.eye_km[0], -base.eye_km[1], -base.eye_km[2]]).unwrap(),
-                        ),
-                        normalize([-base.eye_km[0], -base.eye_km[1], -base.eye_km[2]]).unwrap(),
-                        base.eye_km,
-                    ),
-                    inverse_perspective(FOV_Y_DEG, 1.6, 0.001, 90_000.0).expect("a frustum"),
-                ),
-            );
-            let other = VolumeView {
-                box_from_clip: m,
-                eye_in_box: base.eye_in_box,
-                eye_km: base.eye_km,
-            };
-            let got = direction(&other, ndc);
+            let want = direction(&shallow, ndc);
+            let got = direction(&deep, ndc);
             for axis in 0..3 {
                 assert!(
                     (got[axis] - want[axis]).abs() < 1e-3,
-                    "ndc {ndc:?}: a 90000x deeper frustum moved the ray from {want:?} to {got:?}",
+                    "ndc {ndc:?}: a 20x deeper frustum moved the ray from {want:?} to {got:?}",
                 );
             }
         }

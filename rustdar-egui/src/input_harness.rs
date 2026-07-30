@@ -504,6 +504,22 @@ impl InputHarness {
         self.warm_up();
     }
 
+    /// What the 3D arm decided for each volume pane on the last frame.
+    ///
+    /// The only thing that can tell a pane that drew a volume from one that drew
+    /// nothing: both paint the same number of egui shapes, and a callback whose
+    /// payload the renderer cannot use looks exactly like an empty state.
+    pub(crate) fn volume_arms(&self) -> Vec<crate::ui::VolumeArmProbe> {
+        self.gui.volume_arms_for_test().to_vec()
+    }
+
+    /// The scale the frames are being laid out at. The 3D pane's offscreen is
+    /// sized from this, so a test about pixels has to read it rather than assume
+    /// it is 1.
+    pub(crate) fn pixels_per_point(&self) -> f32 {
+        self.ctx.pixels_per_point()
+    }
+
     /// The excluded rects `render_panes` was actually handed on the last frame.
     pub(crate) fn map_excluded_rects(&self) -> Vec<egui::Rect> {
         self.gui.map_excluded_rects_for_test().to_vec()

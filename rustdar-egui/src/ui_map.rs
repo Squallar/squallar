@@ -801,3 +801,383 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod volume_arm_tests {
+    use super::*;
+    use crate::input_harness::InputHarness;
+    use crate::pane::PaneKind;
+    use crate::volume_view::{StubVolumePainter, VolumeFrameState};
+    use std::sync::Arc;
+
+    const FRAME_DT: f64 = 1.0 / 60.0;
+
+    /// A harness with one map pane and one 3D pane, a scan loaded, and the given
+    /// painter installed. Returns the painter so a test can read back what it
+    /// was asked.
+    fn volume_harness(painter: StubVolumePainter) -> (InputHarness, Arc<StubVolumePainter>) {
+        let painter = Arc::new(painter);
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.set_pane_count(2);
+        h.make_pane_volume(1);
+        h.load_scan("KTLX");
+        h.gui_mut().set_volume_painter(Some(painter.clone()));
+        h.frames_for(2, FRAME_DT);
+        (h, painter)
+    }
+
+    /// The last frame the painter was asked about.
+    fn last_seen(painter: &StubVolumePainter) -> VolumeFrameState {
+        painter
+            .seen
+            .lock()
+            .expect("stub painter mutex")
+            .last()
+            .cloned()
+            .expect("the painter was never asked to paint")
+    }
+
+    fn camera_of(h: &mut InputHarness, idx: usize) -> crate::pane::OrbitCamera {
+        h.gui_mut()
+            .pane_mut(idx)
+            .expect("a pane")
+            .volume()
+            .expect("a 3D pane")
+            .camera
+    }
+
+    /// A 3D pane with a painter and a volume pushes a callback rather than an
+    /// empty state.
+    ///
+    /// The baseline the rest of this suite is measured against: every other test
+    /// here asserts that some condition *stops* this happening, and would pass
+    /// vacuously if the happy path never worked.
+    #[test]
+    fn a_volume_pane_with_a_painter_pushes_a_callback() {
+        let (h, _painter) = volume_harness(StubVolumePainter::painting());
+        assert_eq!(
+            h.volume_arms(),
+            vec![VolumeArmProbe {
+                pane_idx: 1,
+                outcome: None,
+            }],
+            "the 3D arm should have painted, not explained itself",
+        );
+    }
+
+    /// Every headless machine, every suspend and every surface loss lands here,
+    /// so it is the ordinary state rather than the exceptional one.
+    #[test]
+    fn a_volume_pane_with_no_painter_says_it_is_unavailable() {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.set_pane_count(2);
+        h.make_pane_volume(1);
+        h.load_scan("KTLX");
+        h.frames_for(2, FRAME_DT);
+        assert_eq!(
+            h.volume_arms(),
+            vec![VolumeArmProbe {
+                pane_idx: 1,
+                outcome: Some(VOLUME_EMPTY_STATE.to_owned()),
+            }],
+        );
+    }
+
+    /// `clear_graphics_state` is the suspend and surface-loss path, and it must
+    /// take the painter with it: every wgpu handle the painter can reach was
+    /// made by the device that is going away.
+    #[test]
+    fn losing_the_graphics_state_stops_the_pane_drawing() {
+        let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+        assert_eq!(
+            h.volume_arms()[0].outcome,
+            None,
+            "precondition: it was drawing",
+        );
+
+        h.gui_mut().clear_graphics_state();
+        h.frames_for(2, FRAME_DT);
+        assert_eq!(
+            h.volume_arms()[0].outcome.as_deref(),
+            Some(VOLUME_EMPTY_STATE),
+            "a painter holding handles from a dead device must not be asked again",
+        );
+    }
+
+    /// A pane with no scan says what it is waiting for, naming the site.
+    #[test]
+    fn a_volume_pane_with_no_scan_names_the_site_it_is_waiting_for() {
+        let painter = Arc::new(StubVolumePainter::painting());
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.set_pane_count(2);
+        h.make_pane_volume(1);
+        h.gui_mut().set_volume_painter(Some(painter.clone()));
+        h.frames_for(2, FRAME_DT);
+
+        let outcome = h.volume_arms()[0]
+            .outcome
+            .clone()
+            .expect("an empty state");
+        assert!(
+            outcome.contains("Waiting for a volume"),
+            "expected a waiting message, got {outcome:?}",
+        );
+        assert!(
+            painter.seen.lock().unwrap().is_empty(),
+            "the painter must not be asked for a volume that has not arrived",
+        );
+    }
+
+    /// A moment the radar does not measure directly is refused by name, before
+    /// anything asks for a grid `build_voxels` would decline to build.
+    #[test]
+    fn a_product_with_no_vertical_structure_is_refused_by_name() {
+        let (mut h, painter) = volume_harness(StubVolumePainter::painting());
+        // On every pane, not just the 3D one: `sync_layers` defaults on and
+        // propagates the *active* pane's product to the rest, so writing it to
+        // pane 1 alone is undone on the next frame by pane 0.
+        for pane in h.gui_mut().panes_mut() {
+            pane.selected_product = rustdar_radar::types::RadarProduct::EchoTops;
+        }
+        let before = painter.seen.lock().unwrap().len();
+        h.frames_for(2, FRAME_DT);
+
+        let outcome = h.volume_arms()[0]
+            .outcome
+            .clone()
+            .expect("an empty state");
+        assert!(
+            outcome.contains("no vertical structure"),
+            "expected the refusal to say why, got {outcome:?}",
+        );
+        assert_eq!(
+            painter.seen.lock().unwrap().len(),
+            before,
+            "the painter must not be asked about a moment that cannot be sampled",
+        );
+    }
+
+    /// The pane asks for its grid until it has one, and stops the moment the
+    /// host records that it does.
+    ///
+    /// Level-triggered by design — see `GuiAction::PrepareVolume` — so the half
+    /// worth testing is that it *stops*, which an edge-triggered implementation
+    /// would get right for free and a broken level-triggered one would not.
+    #[test]
+    fn a_volume_pane_asks_for_its_grid_until_the_host_says_it_has_one() {
+        let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+
+        let asked: Vec<_> = h
+            .last_actions()
+            .iter()
+            .filter_map(|a| match a {
+                GuiAction::PrepareVolume { pane_idx, target } => Some((*pane_idx, target.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asked.len(), 1, "the pane should have asked exactly once");
+        let (pane_idx, target) = asked.into_iter().next().expect("one request");
+        assert_eq!(pane_idx, 1);
+        assert_eq!(target.volume.site, "KTLX");
+
+        // What the host does when the build lands.
+        h.gui_mut()
+            .pane_mut(1)
+            .expect("pane 1")
+            .volume_mut()
+            .expect("a 3D pane")
+            .rendered_for = Some(target);
+        h.frames_for(2, FRAME_DT);
+
+        assert!(
+            !h.last_actions()
+                .iter()
+                .any(|a| matches!(a, GuiAction::PrepareVolume { .. })),
+            "a pane that has its grid must stop asking for it",
+        );
+    }
+
+    /// Converting a 3D pane to something else releases its volume.
+    ///
+    /// The only moment a pane stops needing an 8 MiB grid without anything else
+    /// noticing: it is still on screen, still on the same site, still live.
+    #[test]
+    fn converting_a_volume_pane_away_releases_its_volume() {
+        let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+        h.gui_mut().request_pane_kind(1, PaneKind::Map);
+        h.frames_for(1, FRAME_DT);
+
+        assert!(
+            h.last_actions()
+                .iter()
+                .any(|a| matches!(a, GuiAction::ReleaseVolume { pane_idx: 1 })),
+            "converting away from a 3D pane must release its volume, got {:?}",
+            h.last_actions()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Converting a pane that was never a 3D pane releases nothing.
+    ///
+    /// The mutation this closes: dropping the `kind() == Volume` half of the
+    /// guard leaves a `ReleaseVolume` on every conversion — harmless today, and
+    /// a pane releasing a volume another pane is using the moment the store is
+    /// keyed any other way.
+    #[test]
+    fn converting_a_map_pane_releases_nothing() {
+        let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+        h.gui_mut().request_pane_kind(0, PaneKind::CrossSection);
+        h.frames_for(1, FRAME_DT);
+        assert!(
+            !h.last_actions()
+                .iter()
+                .any(|a| matches!(a, GuiAction::ReleaseVolume { .. })),
+            "a map pane has no volume to release",
+        );
+    }
+
+    /// The painter is asked with the camera **after** this frame's drag.
+    ///
+    /// The trap this closes is not a wrong picture but a *late* one: building
+    /// the payload before the UI pass leaves the orbit one frame behind the
+    /// pointer, which reads as input lag and gets "fixed" by turning the drag
+    /// sensitivity up.
+    #[test]
+    fn the_painter_sees_the_camera_after_this_frames_drag() {
+        let (mut h, painter) = volume_harness(StubVolumePainter::painting());
+        let rect = h.pane_rects()[1];
+
+        h.mouse_press(rect.center());
+        h.frames_for(1, FRAME_DT);
+        h.mouse_move(rect.center() + egui::vec2(120.0, 0.0));
+        h.frames_for(1, FRAME_DT);
+
+        let moved = camera_of(&mut h, 1);
+        assert_ne!(
+            moved,
+            crate::pane::OrbitCamera::default(),
+            "precondition: the drag must have moved the camera at all",
+        );
+        assert_eq!(
+            last_seen(&painter).camera,
+            moved,
+            "the painter was handed a stale camera, so the volume lags the pointer by a frame",
+        );
+        h.mouse_release(rect.center() + egui::vec2(120.0, 0.0));
+    }
+
+    /// Dragging turns the box the way the pointer went, in both axes.
+    ///
+    /// Signs, not arithmetic. A sign error still orbits perfectly smoothly and
+    /// merely feels inverted, which is the sort of defect that survives review
+    /// and is reported months later as "the 3D view is backwards".
+    #[test]
+    fn dragging_turns_the_box_the_way_the_pointer_went() {
+        for drag in [egui::vec2(120.0, 0.0), egui::vec2(0.0, 120.0)] {
+            let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+            let rect = h.pane_rects()[1];
+            let before = camera_of(&mut h, 1);
+
+            h.mouse_press(rect.center());
+            h.frames_for(1, FRAME_DT);
+            h.mouse_move(rect.center() + drag);
+            h.frames_for(1, FRAME_DT);
+            h.mouse_release(rect.center() + drag);
+            h.frames_for(1, FRAME_DT);
+
+            let after = camera_of(&mut h, 1);
+            if drag.x != 0.0 {
+                assert!(
+                    after.yaw_deg() > before.yaw_deg(),
+                    "dragging right should raise the eye's bearing: {} -> {}",
+                    before.yaw_deg(),
+                    after.yaw_deg(),
+                );
+                assert_eq!(
+                    after.pitch_deg(),
+                    before.pitch_deg(),
+                    "a horizontal drag must not pitch",
+                );
+            } else {
+                assert!(
+                    after.pitch_deg() > before.pitch_deg(),
+                    "dragging down should raise the eye: {} -> {}",
+                    before.pitch_deg(),
+                    after.pitch_deg(),
+                );
+                assert_eq!(
+                    after.yaw_deg(),
+                    before.yaw_deg(),
+                    "a vertical drag must not yaw",
+                );
+            }
+        }
+    }
+
+    /// Scrolling over the 3D pane zooms it; scrolling over another pane does
+    /// not.
+    ///
+    /// `Input::zoom_delta` and the scroll delta are **global** — they report the
+    /// frame's gesture wherever on screen it happened — so the
+    /// `hovered() || dragged()` gate is correctness rather than politeness.
+    /// Without it a wheel over a map pane would zoom every 3D pane on screen.
+    #[test]
+    fn only_a_gesture_over_the_pane_zooms_it() {
+        let (mut h, _painter) = volume_harness(StubVolumePainter::painting());
+        let rects = h.pane_rects();
+
+        let before = camera_of(&mut h, 1).eye_distance();
+        h.scroll_at(rects[0].center(), egui::vec2(0.0, 200.0));
+        h.frames_for(2, FRAME_DT);
+        assert_eq!(
+            camera_of(&mut h, 1).eye_distance(),
+            before,
+            "a scroll over the map pane must not move the 3D pane's camera",
+        );
+
+        h.scroll_at(rects[1].center(), egui::vec2(0.0, 200.0));
+        h.frames_for(2, FRAME_DT);
+        let after = camera_of(&mut h, 1).eye_distance();
+        assert!(
+            after < before,
+            "scrolling up over the 3D pane should bring the eye in: {before} -> {after}",
+        );
+    }
+
+    /// The painter is told the pane's size in **physical** pixels, not points.
+    ///
+    /// The offscreen target is allocated from this number. Handing over points
+    /// on a 2x display would allocate a quarter-sized texture and blit it
+    /// stretched, which looks like the resolution rung working rather than like
+    /// a bug.
+    #[test]
+    fn the_painter_is_told_the_pane_size_in_physical_pixels() {
+        let (h, painter) = volume_harness(StubVolumePainter::painting());
+        let rect = h.pane_rects()[1];
+        let seen = last_seen(&painter);
+        assert_eq!(
+            seen.size_px,
+            [
+                (rect.width() * h.pixels_per_point()).round() as u32,
+                (rect.height() * h.pixels_per_point()).round() as u32,
+            ],
+        );
+        assert_eq!(seen.pane_idx, 1);
+    }
+
+    /// Whatever the painter says is why the pane is empty is what the pane says.
+    ///
+    /// The renderer knows things this crate cannot name — a device error latched
+    /// mid-session, a single-tilt volume, a grid still building — and every one
+    /// of them is a different thing for the user to do about it.
+    #[test]
+    fn the_painters_own_reason_reaches_the_pane() {
+        let (h, _painter) = volume_harness(StubVolumePainter::empty("a very specific reason"));
+        assert_eq!(
+            h.volume_arms()[0].outcome.as_deref(),
+            Some("a very specific reason"),
+        );
+    }
+}

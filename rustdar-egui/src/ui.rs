@@ -34,6 +34,10 @@ pub(crate) use ui_menu::DrawnMenuLeaf;
 pub(crate) use ui_menu::VOLUME_PANE_LABEL;
 #[path = "ui_map.rs"]
 mod map;
+/// Re-exported so the input harness can name it: `map` is private to this
+/// module, and the probe is the only thing outside it that has to be.
+#[cfg(test)]
+pub(crate) use map::VolumeArmProbe;
 /// The copy the two non-map pane arms paint, for the input harness — so a test
 /// can require the text to have been painted inside a given pane's rect without
 /// keeping its own copy of the sentence. Same arrangement as [`DrawnMenuLeaf`].
@@ -2102,6 +2106,12 @@ impl Gui {
         self.pending_pane_kind
     }
 
+    /// What the 3D arm decided for each volume pane on the last frame.
+    #[cfg(test)]
+    pub(crate) fn volume_arms_for_test(&self) -> &[VolumeArmProbe] {
+        &self.last_volume_arms
+    }
+
     /// Whether pane `idx` is a pane the **plan-view** pipeline must skip: it
     /// exists, and it is not a map.
     ///
@@ -2897,7 +2907,7 @@ mod pane_slice_tests {
 
         // The restore, which throws the placeholder away.
         gui.panes[gui.active_pane] = held;
-        gui.apply_pending_pane_kind();
+        gui.apply_pending_pane_kind(&mut Vec::new());
 
         assert_eq!(
             gui.pane(1).unwrap().site,
@@ -2934,7 +2944,7 @@ mod pane_slice_tests {
 
         let mut gui = Gui::new();
         gui.request_pane_kind(7, PaneKind::Volume);
-        gui.apply_pending_pane_kind();
+        gui.apply_pending_pane_kind(&mut Vec::new());
 
         assert_eq!(gui.pane(0).unwrap().kind(), PaneKind::Map);
         assert_eq!(gui.pending_pane_kind_for_test(), None);
