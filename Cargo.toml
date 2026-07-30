@@ -38,6 +38,28 @@ web-time = "=1.1.0"
 wgpu = { version = "=29.0.4", default-features = false }
 winit = "=0.30.13"
 
+# A **dev**-only, direct handle on the shader compiler wgpu already contains,
+# pinned to the exact version wgpu-29.0.4 resolves. `rustdar-frontend`'s
+# `tests/volume_shader.rs` translates the volume raymarch to GLSL ES 300 with
+# it, so that what a WebGL2 browser will be handed is checked on every CI row
+# rather than only in a browser nobody runs in CI.
+#
+# It cannot be reached through `wgpu::naga`: that re-export is behind wgpu's
+# `naga-ir` feature, which is off. And `naga/glsl-out` arrives only via
+# `wgpu-hal`'s `gles` backend, which this workspace requests on
+# Windows/Linux/Android/FreeBSD but **not** on Apple targets — Metal takes
+# `msl-out` alone. So depending on it indirectly would fail the four macOS and
+# iOS CI rows, which build `--all-targets`. Naming it here with the features
+# spelled out makes it target-independent.
+#
+# Adds no package: naga is already in the graph via wgpu-core. Under
+# `resolver = "2"` the extra features do not reach a plain `cargo build`,
+# because dev-dependencies are not resolved for one.
+naga = { version = "=29.0.4", default-features = false, features = [
+    "wgsl-in",
+    "glsl-out",
+] }
+
 nexrad-data = { version = "=1.0.0-rc.7", default-features = false, features = [
     "nexrad-model",
 ] }

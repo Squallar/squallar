@@ -136,5 +136,13 @@ wasm-bindgen-futures = "=0.4.76"
 # `syn` parses `src/app.rs` in `tests/wgpu_guard.rs`. Same 3.0.3 the proc-macro
 # crates already resolve, so this adds no package -- and being a dev-dependency
 # it reaches no shipped artifact.
+#
+# `naga` translates `src/volume.wgsl` to GLSL ES 300 in `tests/volume_shader.rs`
+# -- the one check that says what a WebGL2 browser will actually be handed. See
+# the workspace manifest for why it is a direct dependency rather than reached
+# through wgpu. The gate here is the wasm32 clippy row: the test file is
+# `#![cfg(not(target_arch = "wasm32"))]`, so on that target the dependency would
+# be built and then used by nothing.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+naga = { workspace = true }
 syn = { version = "=3.0.3", default-features = false, features = ["full", "parsing", "visit"] }

@@ -102,10 +102,16 @@ fn gamma_from_linear_rgb(rgb: vec3<f32>) -> vec3<f32> {
 // The raymarch
 // ---------------------------------------------------------------------------
 
-// Samples along the ray, per pixel. A `const` rather than a uniform so it folds
-// to a literal in the loop bound: a dynamic bound would cost the unrolling and
-// buys nothing, because step count is dead linear in cost and the degrade rungs
-// that matter are resolution and shading.
+// Samples along the ray, per pixel.
+//
+// A `const` rather than a uniform, so the loop bound is a compile-time constant
+// an ES 300 driver can unroll. naga emits it as `const int RAYMARCH_STEPS = 96;`
+// and folds it where a conversion forces the issue — `f32(RAYMARCH_STEPS)`
+// becomes `96.0`. A uniform bound would compile, look identical, and hide the
+// march's cost from the driver on the target where fill rate is the whole risk.
+//
+// Not a degrade rung: step count is dead linear in cost, and the two rungs that
+// buy anything are resolution (3.4x for a quarter of the pixels) and shading.
 const RAYMARCH_STEPS: i32 = 96;
 
 // Entries in the colour table. Must equal `constants::VOLUME_LUT_BYTES / 4`;

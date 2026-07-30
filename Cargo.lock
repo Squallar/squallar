@@ -4104,6 +4104,7 @@ dependencies = [
  "egui-winit",
  "ewebsock",
  "log",
+ "naga",
  "nexrad-level3",
  "nexrad-model",
  "pollster",
