@@ -67,6 +67,32 @@
 //! cells, which is exactly why the section below is about what that fetch
 //! returns.
 //!
+//! # Vertical detail is the **ladder's**, never `nz`'s
+//!
+//! `nz` sets how finely the box is *diced*, not how finely the volume was
+//! *measured*. Two consequences follow from the nearest-corner fallback above,
+//! and both are inherited from the sampler rather than introduced here —
+//! WP-B measured the same pair on a cross-section, and a voxel grid gets them
+//! identically because it goes through the same
+//! [`crate::sampler::Column::at_height_km`]:
+//!
+//! * **A layer between two rungs is invisible.** The radar only looked at the
+//!   rung heights, so a 2 km slab at 100 km on a short ladder can sit entirely
+//!   between tilts and paint nothing at all, however fine `nz` is.
+//! * **A layer *on* one rung is smeared to the half-weight midpoints.** With a
+//!   data rung between two that measured nothing, the data wins the blend
+//!   wherever its weight exceeds its neighbour's — that is, out to the
+//!   midpoint on each side. `a_layer_is_quantised_to_the_ladder_rather_than_to_nz`
+//!   measures it: at 100 km on a 0.53 / 2.47 / 4.51° ladder, one rung paints a
+//!   **3.48 km** band whatever the true layer's thickness was.
+//!
+//! Neither is a defect to fix — filling in between rungs is the fabrication
+//! this whole feature is trying not to ship, and the alternative to smearing is
+//! painting a beam as a zero-thickness sheet. Both are why
+//! [`VoxelGrid::tilt_count`] and [`VoxelGrid::widest_tilt_gap_deg`] travel with
+//! the grid: they are the numbers that say how much of the vertical structure
+//! on screen was measured and how much is interpolation.
+//!
 //! # The encoding, and why index 0 is the bottom of the ramp
 //!
 //! The grid is `R8Unorm` **palette indices** with a 256-entry RGBA table
@@ -1201,6 +1227,32 @@ mod tests {
         )
     }
 
+    /// Three rungs that all reach 100 km, with reflectivity above threshold on
+    /// **exactly one** of them (or none).
+    ///
+    /// The other two carry the moment and report below threshold, so the
+    /// ladder still has three rungs — which is the whole point: the question
+    /// is what a *measured* layer on one rung does to its neighbours, not what
+    /// a one-rung ladder does.
+    fn one_rung_carries_data(carrier: Option<usize>) -> Scan {
+        let full: Field<'_> = &|_, _| Some(45.0);
+        let empty: Field<'_> = &|_, _| None;
+        // Medians deliberately off their nominal cuts, as real ones are.
+        let medians = [0.53f32, 2.47, 4.51];
+        let sweeps = (0..3)
+            .map(|i| {
+                refl_sweep(
+                    (i + 1) as u8,
+                    medians[i],
+                    &wrapped_azimuths(360, 137.0 + i as f64),
+                    LOW_GATES,
+                    if carrier == Some(i) { full } else { empty },
+                )
+            })
+            .collect();
+        Scan::new(vcp(&[0.5, 2.5, 4.5]), sweeps)
+    }
+
     /// A scan whose coverage pattern has no cuts — what a scan reconstructed
     /// from a `RenderInput` looks like.
     fn placeholder_scan() -> Scan {
@@ -1784,6 +1836,86 @@ mod tests {
         let two = scan_of(&|_, _| Some(50.0));
         let filled = build_voxels(&two, &request(ODD), SITE.0, SITE.1).unwrap();
         assert!(filled.indices().iter().any(|&i| i != NO_DATA_INDEX));
+    }
+
+    /// **Vertical detail belongs to the tilt ladder, not to `nz`.**
+    ///
+    /// WP-B measured this on a cross-section; a voxel grid inherits it exactly,
+    /// because both go through `Column::at_height_km`, whose `blend` returns
+    /// the **nearest** rung the moment its bracket partner has no value. So a
+    /// measured layer on one rung is painted out to the half-weight midpoint on
+    /// each side, and a layer that falls between rungs is painted nowhere.
+    ///
+    /// Both are pinned here in the grid's own units, on a 200-row box whose
+    /// rows are 60 m apart — a resolution 58× finer than the band the ladder
+    /// actually resolves, which is the point.
+    #[test]
+    fn a_layer_is_quantised_to_the_ladder_rather_than_to_nz() {
+        let nz = 200;
+        let (base_km_msl, top_km_msl) = (0.0, 12.0);
+        let dz = (top_km_msl - base_km_msl) / nz as f64;
+        let shape = VoxelShape { nx: 2, ny: 1, nz };
+        // Half-width 200 km with two columns puts their centres at ±100 km
+        // east on the y = 0 line — WP-B's own range.
+        let req = VoxelRequest {
+            half_width_km: 200.0,
+            base_km_msl,
+            top_km_msl,
+            ..request(shape)
+        };
+        let site_km_msl = SITE_ELEV_FT * 0.0003048;
+        let beam = |deg: f64| beam::height_at_ground_km(100.0, deg);
+        let (low, middle, high) = (beam(0.53), beam(2.47), beam(4.51));
+
+        // ── a layer measured on exactly one rung ──
+        let grid = build_voxels(&one_rung_carries_data(Some(1)), &req, SITE.0, SITE.1).unwrap();
+        assert_eq!(grid.tilt_count(), 3, "all three rungs must survive");
+        let rows: Vec<usize> = (0..nz)
+            .filter(|&iz| grid.index_at(1, 0, iz) != Some(NO_DATA_INDEX))
+            .collect();
+        assert!(!rows.is_empty(), "the middle rung's layer must paint");
+        let height_of = |iz: usize| base_km_msl + (iz as f64 + 0.5) * dz - site_km_msl;
+        let (first, last) = (height_of(rows[0]), height_of(rows[rows.len() - 1]));
+        assert_eq!(
+            rows.len(),
+            rows[rows.len() - 1] - rows[0] + 1,
+            "and it must paint one contiguous band, not a striped one",
+        );
+
+        let lower_mid = (low + middle) / 2.0;
+        let upper_mid = (middle + high) / 2.0;
+        assert!(
+            (first - lower_mid).abs() <= dz,
+            "the band's floor is the half-weight midpoint to the rung below \
+             ({lower_mid} km), not the beam itself ({middle} km); got {first}",
+        );
+        assert!(
+            (last - upper_mid).abs() <= dz,
+            "and its ceiling is the midpoint to the rung above ({upper_mid} \
+             km); got {last}",
+        );
+
+        // The fabricated thickness, as a number. One tilt, 3.48 km of band.
+        assert!(
+            ((last - first) - 3.48).abs() < 0.1,
+            "one rung paints a {} km band at 100 km on this ladder",
+            last - first,
+        );
+        assert!(
+            (last - first) / dz > 50.0,
+            "which is {}x the row height, so no amount of nz recovers the \
+             layer's true thickness",
+            (last - first) / dz,
+        );
+
+        // ── a layer that no rung looked at ──
+        let missed = build_voxels(&one_rung_carries_data(None), &req, SITE.0, SITE.1).unwrap();
+        assert_eq!(missed.tilt_count(), 3, "the ladder is the same one");
+        assert!(
+            missed.indices().iter().all(|&i| i == NO_DATA_INDEX),
+            "a layer between tilts is measured by nothing and painted nowhere, \
+             however fine the grid",
+        );
     }
 
     // ── The builder adds no geometry of its own ─────────────────────────────
