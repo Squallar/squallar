@@ -263,6 +263,26 @@ impl super::Gui {
     /// three-second timer from becoming a three-second write loop.
     ///
     /// `None` only if serialization fails, which is already logged.
+    ///
+    /// # An asymmetry, examined and deliberately left
+    ///
+    /// This writes `self.panes` **unbounded** while `load_ui_config` restores only
+    /// `.take(count)`. So a session split down from six panes to two writes six
+    /// `PaneConfig`s and reads two back, and the four extra entries are dead
+    /// weight in the file.
+    ///
+    /// Both of the tidy fixes are worse. Writing only `count` would delete the
+    /// hidden panes' state permanently on the next autosave — the very state
+    /// `Gui::panes` keeps them around for, so that re-splitting restores what they
+    /// were showing. Reading all of them would resurrect panes past the layout's
+    /// clamp, which is what the clamp exists to prevent. The asymmetry is what
+    /// makes a re-split after a restart remember anything at all, and it costs a
+    /// few hundred bytes.
+    ///
+    /// It does have one live consequence, handled where it lands rather than here:
+    /// `config.panes` can be longer than the restored `pane_count`, so a section
+    /// pane's `source_pane` has to be validated against the count and not against
+    /// the list — see `restore_content`.
     pub fn ui_config_json(&self) -> Option<String> {
         // Guard every float against NaN and infinity on the way out.
         //

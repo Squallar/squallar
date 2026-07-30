@@ -423,6 +423,12 @@ impl super::Gui {
             });
 
         self.panes[self.active_pane] = pane;
+        // After the restore, so the source it copies from is the real pane rather
+        // than the `mem::take` placeholder. It deliberately does **not** copy
+        // `content`: a pane's kind is how this pane presents the shared subject,
+        // not part of the subject, and propagating it would convert every sibling
+        // the moment one pane became a 3D view — from a setting called "Sync
+        // Layers". The reasoning is written out on `propagate_layer_sync` itself.
         self.propagate_layer_sync();
 
         #[cfg(test)]

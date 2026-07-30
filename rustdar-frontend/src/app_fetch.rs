@@ -358,6 +358,20 @@ impl super::App {
                 } else {
                     pane_idx..pane_idx + 1
                 };
+                // Every field written here is flat on `PaneState`, so this reaches
+                // a section or a volume pane unchanged and correctly: those move
+                // site with the layout exactly as a map pane does.
+                //
+                // What it deliberately does not touch is `content`, and therefore
+                // not a section's drawn line — which is stored *geographically*,
+                // so it goes on naming the same ground under the new radar.
+                // Invalidation is already automatic: `SectionTarget` carries the
+                // site, so the section on screen is stale by definition and
+                // re-cuts from the new site's volume. Whether a line the new site
+                // cannot see should be *cleared* rather than re-cut as empty
+                // coverage is a question about what the pane says while it has
+                // nothing to show, which belongs with the interaction that draws
+                // the line rather than here.
                 for idx in moving {
                     if let Some(pane) = self.gui.pane_mut(idx) {
                         pane.loading_site = Some(site.clone());
