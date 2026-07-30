@@ -46,7 +46,10 @@ const WEB: bool = cfg!(target_arch = "wasm32");
 /// Firefox — and the two browsers would then run different, separately-broken
 /// rendering paths off the same binary.
 fn instance_descriptor() -> wgpu::InstanceDescriptor {
-    backends_for(WEB)
+    backends_for(
+        WEB,
+        wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
+    )
 }
 
 /// The backend choice itself, parameterised so both arms run from one binary.
@@ -58,15 +61,23 @@ fn instance_descriptor() -> wgpu::InstanceDescriptor {
 /// `Backends::all()` — which is the Chrome-on-WebGPU / Firefox-on-WebGL2 split
 /// the doc above says this exists to prevent.
 /// `the_browser_build_asks_for_webgl2_and_refuses_webgpu` asserts the ask.
-fn backends_for(web: bool) -> wgpu::InstanceDescriptor {
-    let from_env = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+///
+/// `base` is a parameter and not `new_without_display_handle_from_env()` read
+/// inline, for a reason measured rather than assumed: with the environment as
+/// the only possible base, "the browser arm restricts something" could only be
+/// asserted against whatever `WGPU_BACKEND` happened to say. A developer or CI
+/// runner with `WGPU_BACKEND=gl` exported could then delete the `backends` line
+/// and watch the gate stay green, because `Backends::GL` is what the default
+/// already was. Taking the base in lets the test supply one that is *not* GL,
+/// so the restriction is checked rather than coincided with.
+fn backends_for(web: bool, base: wgpu::InstanceDescriptor) -> wgpu::InstanceDescriptor {
     if web {
         wgpu::InstanceDescriptor {
             backends: wgpu::Backends::GL,
-            ..from_env
+            ..base
         }
     } else {
-        from_env
+        base
     }
 }
 
@@ -1523,33 +1534,52 @@ mod tests {
     /// exists to prevent.
     #[test]
     fn the_browser_build_asks_for_webgl2_and_refuses_webgpu() {
-        let web = backends_for(true).backends;
-        assert_eq!(
-            web,
-            wgpu::Backends::GL,
-            "the browser build asks for {web:?}, not WebGL2 alone"
-        );
-        assert!(!web.contains(wgpu::Backends::BROWSER_WEBGPU));
+        // A base that is deliberately *not* GL, so "the browser arm restricts
+        // to GL" cannot be satisfied by the base already being GL. Supplying it
+        // is the whole reason `backends_for` takes a base: an earlier version
+        // read the environment inline and could only compare against whatever
+        // `WGPU_BACKEND` said, so with `WGPU_BACKEND=gl` exported the
+        // `backends` line could be deleted with the gate still green. Measured,
+        // not hypothetical.
+        let base = |backends| wgpu::InstanceDescriptor {
+            backends,
+            ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
+        };
 
-        // Native is deliberately unrestricted and still honours `WGPU_BACKEND`,
-        // which is the other half of the fork and the reason the browser arm
-        // cannot simply be the default.
-        let native = backends_for(false).backends;
-        assert_eq!(native, wgpu::Backends::all().with_env());
-
-        // With no override in the environment the two arms must differ, which
-        // is what makes the browser arm a restriction rather than a restatement
-        // of the default. Skipped when `WGPU_BACKEND` is set, because a
-        // developer who exported `WGPU_BACKEND=gl` has legitimately made them
-        // agree.
-        if std::env::var_os("WGPU_BACKEND").is_none() {
-            assert_eq!(native, wgpu::Backends::all());
-            assert_ne!(
-                native, web,
-                "the browser arm restricts nothing that the default did not \
-                 already restrict"
+        for offered in [
+            wgpu::Backends::all(),
+            wgpu::Backends::VULKAN,
+            wgpu::Backends::BROWSER_WEBGPU,
+            wgpu::Backends::VULKAN.union(wgpu::Backends::BROWSER_WEBGPU),
+            wgpu::Backends::empty(),
+        ] {
+            let web = backends_for(true, base(offered)).backends;
+            assert_eq!(
+                web,
+                wgpu::Backends::GL,
+                "offered {offered:?}, the browser build asked for {web:?} \
+                 rather than WebGL2 alone"
             );
+            assert!(!web.contains(wgpu::Backends::BROWSER_WEBGPU));
+
+            // Native is deliberately unrestricted: it passes the base through
+            // untouched, which is what keeps `WGPU_BACKEND` working. That is
+            // the other half of the fork and the reason the browser arm cannot
+            // simply be the default.
+            let native = backends_for(false, base(offered)).backends;
+            assert_eq!(native, offered, "the native arm altered the base");
         }
+
+        // And the shipped path really does read the environment, which is the
+        // claim the parameter moved out of `backends_for` and into its caller.
+        assert_eq!(
+            backends_for(
+                false,
+                wgpu::InstanceDescriptor::new_without_display_handle_from_env()
+            )
+            .backends,
+            wgpu::Backends::all().with_env()
+        );
     }
 
     /// And that this build asks on its own behalf.
@@ -1559,28 +1589,54 @@ mod tests {
     /// one line, and every way of getting it wrong — another arch,
     /// `target_family = "wasm"` (also true for WASI), a hardcoded `false` —
     /// evaluates identically on this host and differently in a browser. So the
-    /// line is scraped, from the shipped half of the file only: the assertion
-    /// quotes the string it searches for.
+    /// line is scraped, from the shipped half of the file only: the assertions
+    /// quote the strings they search for.
+    ///
+    /// Every needle is counted before it is read. One occurrence is the claim;
+    /// a second would mean the scrape is reading whichever came first, and a
+    /// decoy in a doc comment or a string literal would be one.
     #[test]
     fn the_backend_choice_is_made_on_the_wasm32_arch_and_nothing_else() {
-        assert_eq!(instance_descriptor().backends, backends_for(WEB).backends);
-
         let source = include_str!("app.rs");
         let (code, _) = source
             .split_once("#[cfg(test)]")
             .expect("app.rs no longer has a test module");
 
+        let unique = |needle: &str| {
+            let n = code.matches(needle).count();
+            assert_eq!(n, 1, "expected exactly one `{needle}` in app.rs, found {n}");
+        };
+
+        unique("const WEB: bool =");
         let definition = code
             .split_once("const WEB: bool =")
             .and_then(|(_, rest)| rest.split_once(';'))
             .map(|(value, _)| value.trim())
             .expect("`WEB` is no longer defined in app.rs");
-        assert_eq!(definition, r#"cfg!(target_arch = "wasm32")"#);
-        assert!(
-            code.contains("backends_for(WEB)"),
-            "instance_descriptor no longer forks on `WEB`, so the browser \
-             backend restriction is not reached on the arm it is for"
+        assert_eq!(
+            definition, r#"cfg!(target_arch = "wasm32")"#,
+            "`WEB` is defined as `{definition}`, which is not the browser arch. \
+             No host build can tell the difference."
         );
+
+        // The fork is reached, and reached with the *environment* as its base —
+        // the half `backends_for` no longer reads for itself. Whitespace is
+        // collapsed first so this survives `cargo fmt` rewrapping the call.
+        let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in [
+            "backends_for( WEB,",
+            "wgpu::InstanceDescriptor::new_without_display_handle_from_env(), )",
+        ] {
+            let n = flat.matches(needle).count();
+            assert_eq!(
+                n, 1,
+                "expected exactly one `{needle}` in app.rs, found {n}. \
+                 `instance_descriptor` must fork on `WEB` and hand \
+                 `backends_for` the environment's own descriptor; without \
+                 either, the browser backend restriction is not reached on the \
+                 arm it is for."
+            );
+        }
     }
 
     /// A request as `process_gui_actions` builds one: unexpanded viewport bounds
