@@ -334,17 +334,47 @@ impl super::App {
     /// not used on that path — `reset_panes_for_site` covers every pane on the
     /// site, including the tilt panes those cuts would have refreshed, and the
     /// freshness stamps come from the closed volume's cuts against the closed
-    /// volume's radials. Applying both volumes in one round is not an option:
-    /// `scan_data` holds one volume per site, and a partial one there is exactly
-    /// what the paragraph above is about.
+    /// volume's radials. (Not a repair of anything: before the closed volume
+    /// travelled out, `scan` and `sealed` both described the volume being
+    /// assembled and so agreed. The pairing changes *because* `scan` changed.)
+    /// Applying both volumes in one round is not an option: `scan_data` holds one
+    /// volume per site, and a partial one there is exactly what the paragraph above
+    /// is about.
+    ///
+    /// # `volume_complete` is not "whole", and the loop cache outlives the answer
+    ///
+    /// `volume_complete` means every cut *the selection asked for* sealed, and
+    /// narrow is the default — one Reflectivity pane at 0.5° yields
+    /// `CutSelection::Tilts([0.5])`, so every volume closes "complete" with a single
+    /// sweep. [`Self::cut_selection_for`] discharges the resulting duty for
+    /// everything on screen *now*, by widening to `All` the moment a whole-volume
+    /// product or pane kind appears.
+    ///
+    /// It cannot discharge it for a volume that is **stored**. `LoopDownloadManager`'s
+    /// scan cache is written unconditionally, read product-blind by `frame_data`,
+    /// never re-downloaded once `is_cached`, and cleared only on a site switch — so
+    /// a one-sweep volume cached while a pane looped Reflectivity is still there
+    /// when that pane is switched to echo tops, and `compute_echo_tops` clamps every
+    /// column to 0.5° and reports a plausible, low, wrong altitude. Newer frames
+    /// right and older ones wrong, which reads as more convincing than uniform
+    /// breakage.
+    ///
+    /// So the loop append is gated on `whole_volume_complete` and the live path is
+    /// not. Two different questions with two different answers, and the storage one
+    /// is the strict one.
     fn apply_chunk_outcome(&mut self, site: &str, outcome: &rustdar_radar::chunks::PollOutcome) {
+        // The flag and the scan are read together rather than one gating the other:
+        // `ChunkPoller::roll` builds the scan exactly when the volume completed, so
+        // a change to either end of that contract lands here as "nothing to apply"
+        // instead of as a volume nothing checked.
         let completed = outcome
             .closed
             .as_ref()
-            .filter(|closed| closed.progress.volume_complete);
+            .filter(|closed| closed.progress.volume_complete)
+            .and_then(|closed| closed.scan.as_ref().map(|scan| (closed, scan)));
         let (scan, sealed) = match completed {
-            Some(closed) => (
-                Arc::clone(&closed.scan),
+            Some((closed, scan)) => (
+                Arc::clone(scan),
                 closed.progress.sealed_elevations.as_slice(),
             ),
             None => {
@@ -381,7 +411,7 @@ impl super::App {
 
         self.scan_data.insert(site.to_string(), Arc::clone(&scan));
 
-        if completed.is_some() {
+        if let Some((closed, _)) = completed {
             // The volume is now exactly what the archive would have published,
             // so the steady state matches it — including the Level III refetch
             // that re-registers the tilts a merge preserved mid-volume.
@@ -400,12 +430,30 @@ impl super::App {
             self.render.reset_panes_for_site(site, &self.gui);
             self.spawn_level3_fetches(site);
             self.record_tilt_freshness(site, &scan, sealed);
-            // Safe here and nowhere else: `append_polled_frame` dedupes by
-            // timestamp and a `LoopFrame` has no "the scan got better"
-            // transition, so a frame appended for a volume still being assembled
-            // would freeze on however many cuts it had at that moment. `scan` is
-            // the completed volume, so the frame is right the first time.
-            self.append_scan_to_active_loops(site, timestamp, scan);
+            // Two conditions, and both are about permanence.
+            //
+            // *Here and not mid-volume*, because `append_polled_frame` dedupes by
+            // timestamp and a `LoopFrame` has no "the scan got better" transition,
+            // so a frame appended for a volume still being assembled would freeze
+            // on however many cuts it had at that moment.
+            //
+            // *`whole_volume_complete`, not `volume_complete`*, because this is the
+            // one place a volume outlives the selection that produced it. The cache
+            // behind this call is read product-blind and never re-downloaded, so a
+            // volume narrowed to the tilts a Reflectivity loop wanted would be
+            // handed to echo tops the moment that pane changed product. Skipping the
+            // append leaves the frame uncached, and `dispatch_loop_downloads` then
+            // fetches the archive's full volume for it — the correct data, a minute
+            // or so later, which is exactly the trade this feed makes elsewhere.
+            if closed.progress.whole_volume_complete {
+                self.append_scan_to_active_loops(site, timestamp, scan);
+            } else {
+                log::debug!(
+                    "{site}: volume complete on the {} cut(s) the feed asked for but \
+                     not whole, so it is not cached for the loops",
+                    closed.progress.sealed_elevations.len()
+                );
+            }
         } else {
             self.gui.apply_chunk_scan_info(site, info);
             self.gui.clear_loading_site_for_site(site);
@@ -916,7 +964,11 @@ mod volume_close_tests {
 
     /// The progress a volume of `sweeps` cuts reports once every one of them has
     /// sealed and the volume has ended.
-    fn complete(sweeps: u8) -> VolumeProgress {
+    ///
+    /// `whole` is the difference the loop-cache gate turns on: a volume assembled
+    /// under `CutSelection::Tilts` reports `volume_complete` with only the cuts the
+    /// selection asked for, and `whole_volume_complete` false.
+    fn complete(sweeps: u8, whole: bool) -> VolumeProgress {
         VolumeProgress {
             volume: vol(42),
             volume_time: Some(
@@ -930,18 +982,23 @@ mod volume_close_tests {
             abandoned: Vec::new(),
             saw_scan_end: true,
             volume_complete: true,
+            whole_volume_complete: whole,
             chunks_ingested: 55,
             late_radials_dropped: 0,
         }
     }
 
-    /// A round that closed a `sweeps`-cut volume and rolled to the next, exactly
-    /// as `ChunkPoller::roll` reports one.
+    /// A round that closed a whole `sweeps`-cut volume and rolled to the next,
+    /// exactly as `ChunkPoller::roll` reports one.
     fn closing_round(sweeps: u8) -> PollOutcome {
+        closing_round_of(sweeps, true)
+    }
+
+    fn closing_round_of(sweeps: u8, whole: bool) -> PollOutcome {
         PollOutcome {
             closed: Some(ClosedVolume {
-                progress: complete(sweeps),
-                scan: volume(sweeps),
+                progress: complete(sweeps, whole),
+                scan: Some(volume(sweeps)),
             }),
             rolled_to: Some(vol(43)),
             ..Default::default()
@@ -1132,32 +1189,74 @@ mod volume_close_tests {
         }
     }
 
-    /// The opposite failure, in the minority case. After an error backoff the
-    /// probe round can find the new volume already carrying sealed cuts, and the
-    /// branch used to render *that* — a one-cut volume through a product that
-    /// integrates the column.
+    /// **A volume that is complete but not whole must not enter the loop cache.**
     ///
-    /// The closed volume wins, and it has to: `scan_data` holds one volume per
-    /// site, so applying both volumes of a closing round would put the partial one
-    /// there. The new volume's cuts are not lost — `reset_panes_for_site` covers
-    /// every pane on the site, and the next cut to seal reports them again.
+    /// The narrow selection is the *default*: one Reflectivity pane at 0.5° yields
+    /// `CutSelection::Tilts([0.5])`, so on a healthy feed every volume closes
+    /// `volume_complete` with a single sweep. `cut_selection_for` keeps that off the
+    /// live display by widening to `All` whenever a whole-volume product appears —
+    /// but the loop cache is written unconditionally, read product-blind by
+    /// `frame_data`, never re-downloaded once `is_cached`, and cleared only by
+    /// `clear_all` on a site switch. So a one-sweep volume cached under a
+    /// Reflectivity loop is still there when the pane is switched to echo tops, and
+    /// `compute_echo_tops` clamps every column to 0.5° and reports a plausible,
+    /// low, wrong altitude in kft.
+    ///
+    /// Asserted on the *cache*, not on the frame list, because the cache write in
+    /// `append_scan_to_active_loops` does not require an active loop — the entry is
+    /// laid down whether or not anything is looping yet, and the pane that later
+    /// reads it may be showing anything.
+    ///
+    /// The live half is asserted alongside, because the two questions genuinely
+    /// differ: those cuts *are* all the display asked for, so the pane still has to
+    /// be refreshed. A guard that fixed the cache by skipping the whole branch would
+    /// reintroduce the staleness bug for every narrow-selection site.
     #[test]
-    fn a_partial_volume_never_reaches_a_whole_volume_product() {
-        let mut app = app_showing_a_drawn_volume(RadarProduct::EchoTopsInterpolated);
-        let mut outcome = closing_round(5);
-        outcome.sealed_elevations = vec![1];
-        outcome.sealed_angles = vec![0.5];
+    fn a_volume_complete_only_for_its_selection_stays_out_of_the_loop_cache() {
+        let mut app = app_showing_a_drawn_volume(RadarProduct::Reflectivity);
+        // One cut, complete for the tilts asked for, not a whole volume.
+        let outcome = closing_round_of(1, false);
 
         app.apply_chunk_outcome("KTLX", &outcome);
 
+        let shown = app
+            .gui
+            .pane(0)
+            .and_then(|p| p.scan_info.as_ref().map(|i| i.timestamp))
+            .expect("the live display still gets the volume");
+        assert!(
+            app.loop_mgr.get_cached("KTLX", &shown).is_none(),
+            "a volume holding only the cuts one pane's tilt asked for was cached \
+             for the loops, where `frame_data` hands it to whatever product the \
+             pane is showing later — echo tops would clamp every column to 0.5°"
+        );
+        assert!(
+            app.render.pane_render[0].last_rendered.is_none(),
+            "the live display was not refreshed either: those cuts are all it \
+             asked for, so skipping the whole branch trades one bug for the other"
+        );
+    }
+
+    /// The counterweight: a *whole* volume does reach the cache, so the assertion
+    /// above is about the flag rather than about an append that never happens.
+    #[test]
+    fn a_whole_volume_does_reach_the_loop_cache() {
+        let mut app = app_showing_a_drawn_volume(RadarProduct::Reflectivity);
+
+        app.apply_chunk_outcome("KTLX", &closing_round_of(5, true));
+
+        let shown = app
+            .gui
+            .pane(0)
+            .and_then(|p| p.scan_info.as_ref().map(|i| i.timestamp))
+            .expect("the pane must still have scan info");
         assert_eq!(
-            app.scan_data
-                .get("KTLX")
-                .map(|s| s.sweeps().len())
-                .unwrap_or(0),
-            5,
-            "the round that closed a complete volume installed something other \
-             than that volume"
+            app.loop_mgr
+                .get_cached("KTLX", &shown)
+                .map(|s| s.sweeps().len()),
+            Some(5),
+            "a whole volume was withheld from the loop cache, so every loop frame \
+             waits on an archive download the feed already had"
         );
     }
 
@@ -1183,7 +1282,7 @@ mod volume_close_tests {
             .expect("apply_chunk_outcome is gone");
         let body = &source[start..];
         let split = body
-            .find("if completed.is_some() {")
+            .find("if let Some((closed, _)) = completed {")
             .expect("the completed branch is gone");
         let (complete, rest) = {
             let after = &body[split..];
@@ -1220,6 +1319,12 @@ mod volume_close_tests {
     /// volume joined mid-flight or one that lost a chunk closes with cuts missing,
     /// and `compute_echo_tops` would clamp every column to the topmost tilt that
     /// happened to arrive and report a plausible, low, wrong number in kft.
+    ///
+    /// Driven with the scan still present, which is *not* what `roll` produces —
+    /// it builds one only when the volume completed. The point is that the flag is
+    /// what decides, so a `ClosedVolume` carrying both a short volume's progress and
+    /// a scan is refused on the flag alone rather than by happening to have nothing
+    /// to apply.
     #[test]
     fn an_incomplete_closed_volume_is_not_applied() {
         let product = RadarProduct::EchoTopsInterpolated;
@@ -1227,11 +1332,17 @@ mod volume_close_tests {
         let mut outcome = closing_round(5);
         let closed = outcome.closed.as_mut().unwrap();
         closed.progress.volume_complete = false;
+        closed.progress.whole_volume_complete = false;
         closed.progress.abandoned = vec![rustdar_radar::chunks::AbandonedCut {
             elevation: 6,
             have: 12,
             expected: 720,
         }];
+        assert!(
+            closed.scan.is_some(),
+            "precondition: the refusal must come from the flag, not from an \
+             absent scan"
+        );
 
         app.apply_chunk_outcome("KTLX", &outcome);
 

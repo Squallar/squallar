@@ -693,15 +693,27 @@ pub struct VolumeProgress {
     /// the first thing to look at when one does not.
     pub abandoned: Vec<AbandonedCut>,
     pub saw_scan_end: bool,
+    /// Every cut **the selection asked for** sealed, and the volume ended. See
+    /// [`VolumeAssembler::is_volume_complete`].
+    ///
+    /// The gate for the cuts on screen, and **not** the gate for a product that
+    /// integrates the volume: under a narrow [`CutSelection`] this is true with
+    /// most of the pattern never downloaded. Use [`Self::whole_volume_complete`]
+    /// for that, and see its doc for what goes wrong otherwise.
+    pub volume_complete: bool,
+    /// The volume is **whole**: every cut it carries sealed, contiguous from 1.
+    /// See [`VolumeAssembler::is_whole_volume_complete`].
+    ///
     /// Gate for every product [`crate::types::RadarProduct::reads_whole_volume`]
-    /// names.
+    /// names, and the only safe gate for a volume that will outlive the selection
+    /// that produced it.
     ///
     /// `volumetric::compute_echo_tops` walks only the tilts present and clamps
-    /// each column to the topmost *available* tilt's centre height, so a partial
-    /// volume yields a plausible, low, wrong number in kft — no error, no NaN.
-    /// Every product in that set fails the same invisible way, which is why the
-    /// gate is one flag rather than a per-product judgement here.
-    pub volume_complete: bool,
+    /// each column to the topmost *available* tilt's centre height, so a volume
+    /// missing cuts yields a plausible, low, wrong number in kft — no error, no
+    /// NaN. Every product in that set fails the same invisible way, which is why
+    /// the gate is one flag rather than a per-product judgement here.
+    pub whole_volume_complete: bool,
     pub chunks_ingested: usize,
     /// Radials that arrived for an already-sealed cut. Expected to stay zero;
     /// a nonzero count means elevation numbers repeat within a volume, which the
@@ -930,38 +942,29 @@ impl VolumeAssembler {
         }
     }
 
-    /// Whether every cut the volume carries is sealed and the volume has ended.
+    /// Whether every cut **the selection asked for** is sealed and the volume has
+    /// ended.
     ///
-    /// The contiguity clause is not decoration. A volume *joined mid-flight* has
-    /// no entry at all for the cuts that finished before the first chunk
-    /// arrived, so without it the assembler would report a volume complete whose
-    /// lowest tilts are simply absent — and `compute_echo_tops` would integrate
-    /// tilts 8..23 and report every column's top far too low.
+    /// This is the gate for the cuts on screen, and it is deliberately *not* the
+    /// gate for a product that integrates the volume. Under a narrow
+    /// [`CutSelection`] it is true with most of the pattern never downloaded — a
+    /// single 0.5° pane completes a volume of one cut — so a caller holding this
+    /// flag knows only "the cuts I asked for all arrived". The question a volume
+    /// integral has to ask is [`Self::is_whole_volume_complete`].
     pub fn is_volume_complete(&self) -> bool {
         if !self.saw_start_chunk || !self.saw_scan_end || self.cuts.is_empty() {
             return false;
         }
         match (&self.selection, &self.chunk_map) {
-            // Everything was asked for, so "complete" is the whole pattern: every
-            // cut sealed, and their numbers contiguous from 1. The contiguity
-            // clause is what stops a volume *joined mid-flight* — which has no
-            // entry at all for the cuts that finished before the first chunk
-            // arrived — from reporting complete and letting `compute_echo_tops`
-            // integrate only the upper tilts.
-            (CutSelection::All, _) | (_, None) => {
-                self.cuts.values().all(Cut::is_sealed)
-                    && self.cuts.keys().copied().eq(1..=self
-                        .cuts
-                        .keys()
-                        .copied()
-                        .max()
-                        .unwrap_or(0))
-            }
+            // Everything was asked for, so the two questions coincide.
+            (CutSelection::All, _) | (_, None) => self.every_cut_sealed_contiguously(),
             // Cuts were deliberately skipped, so contiguity is meaningless and
             // "complete" means every cut that was *asked for*. Note what this
             // does not license: a volume completed this way must never reach a
-            // product that integrates the volume, which is exactly why choosing
-            // a narrow selection is the caller's decision and not this type's.
+            // product that integrates the volume. That is what
+            // `is_whole_volume_complete` is for — the distinction used to be left
+            // to callers, and a volume completed this way reached the loop cache,
+            // where a later product change read it as a short whole volume.
             (selection, Some(map)) => {
                 let wanted = map.wanted_elevations(selection);
                 !wanted.is_empty()
@@ -970,6 +973,40 @@ impl VolumeAssembler {
                         .all(|elevation| self.is_elevation_sealed(*elevation))
             }
         }
+    }
+
+    /// Whether this volume is **whole**: every cut it carries sealed, their
+    /// numbers contiguous from 1, and the volume ended.
+    ///
+    /// The question every product [`crate::types::RadarProduct::reads_whole_volume`]
+    /// names has to ask, and the only one safe to ask of a volume that will outlive
+    /// the selection that produced it — a cached loop frame, say, which is read by
+    /// whatever product the pane is showing *later*.
+    ///
+    /// Asks the data, not the intent: a narrow selection whose skipped cuts turned
+    /// up anyway answers `true`, because it really is whole. Nothing about
+    /// [`CutSelection`] appears here.
+    ///
+    /// The contiguity clause is not decoration. A volume *joined mid-flight* has no
+    /// entry at all for the cuts that finished before the first chunk arrived, so
+    /// without it this would report whole a volume whose lowest tilts are simply
+    /// absent — and `compute_echo_tops` would integrate tilts 8..23 and report
+    /// every column's top far too low.
+    pub fn is_whole_volume_complete(&self) -> bool {
+        if !self.saw_start_chunk || !self.saw_scan_end || self.cuts.is_empty() {
+            return false;
+        }
+        self.every_cut_sealed_contiguously()
+    }
+
+    /// Written once so the two predicates above cannot drift apart.
+    fn every_cut_sealed_contiguously(&self) -> bool {
+        self.cuts.values().all(Cut::is_sealed)
+            && self
+                .cuts
+                .keys()
+                .copied()
+                .eq(1..=self.cuts.keys().copied().max().unwrap_or(0))
     }
 
     /// Whether this sequence has already been taken.
@@ -1047,6 +1084,7 @@ impl VolumeAssembler {
             abandoned,
             saw_scan_end: self.saw_scan_end,
             volume_complete: self.is_volume_complete(),
+            whole_volume_complete: self.is_whole_volume_complete(),
             chunks_ingested: self.ingested.len(),
             late_radials_dropped: self.late_radials_dropped,
         }
@@ -1175,17 +1213,26 @@ pub struct ClosedVolume {
     pub progress: VolumeProgress,
     /// The volume as it stood when it closed — complete sweeps only, so a cut
     /// that ended short is absent rather than present and partial.
-    pub scan: std::sync::Arc<nexrad_model::data::Scan>,
+    ///
+    /// `Some` **iff** `progress.volume_complete`. Building it costs a deep copy of
+    /// every sealed `Sweep` whenever [`VolumeAssembler::snapshot`]'s cache is cold,
+    /// and the cache is cold *exactly* when the volume did not complete —
+    /// [`VolumeAssembler::close`] clears it only when it had to abandon an open
+    /// cut. So building one unconditionally paid the full copy in precisely the
+    /// case every consumer throws it away.
+    pub scan: Option<std::sync::Arc<nexrad_model::data::Scan>>,
 }
 
-/// Summarised rather than derived: `Scan`'s own `Debug` prints every gate of
-/// every radial, and this type is reachable from `PollOutcome`'s derived `Debug`
-/// — one `log::debug!("{outcome:?}")` would write tens of megabytes.
+/// Summarised rather than derived, and not because of the gate bytes: those live
+/// in `BinaryData`, which has its own summarising `Debug`. The cost is that the
+/// summary is a **sha256 over every gate byte of every moment of every radial**,
+/// on top of ~20 MB of output text. This type is reachable from `PollOutcome`'s
+/// derived `Debug`, so one `log::debug!("{outcome:?}")` would pay all of it.
 impl std::fmt::Debug for ClosedVolume {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClosedVolume")
             .field("progress", &self.progress)
-            .field("scan_sweeps", &self.scan.sweeps().len())
+            .field("scan_sweeps", &self.scan.as_ref().map(|s| s.sweeps().len()))
             .finish()
     }
 }
@@ -1373,10 +1420,21 @@ impl ChunkPoller {
     /// anything this does not hand back is unreachable the instant the caller
     /// learns the volume finished — see [`ClosedVolume`].
     ///
-    /// Building the snapshot here is normally free: [`VolumeAssembler::snapshot`]
-    /// caches, and `close` invalidates that cache only when it had to abandon a
-    /// still-open cut — which by definition did not happen to a volume that
-    /// completed.
+    /// # What the snapshot costs, and why it is free on the path that wants it
+    ///
+    /// Only built when the volume completed, because that is exactly the case
+    /// [`VolumeAssembler::snapshot`]'s cache is *warm* in: `close` clears the cache
+    /// only when it had to abandon an open cut, which is the definition of not
+    /// completing. Built unconditionally, the deep copy of every sealed `Sweep`
+    /// landed precisely on the volumes every consumer discards.
+    ///
+    /// Warm is not automatic, and the reason is a cross-layer one worth naming: a
+    /// **seal** also clears that cache, so the cache is warm at roll time only
+    /// because the caller asked for a snapshot in the round the volume's last cut
+    /// sealed. That does hold — [`Self::plan`] runs before any ingestion, so it
+    /// cannot see `saw_scan_end` until a *later* round, and the final seal and the
+    /// roll are therefore never the same round. A caller that stops reading
+    /// snapshots would pay one cold copy per volume here instead.
     pub(crate) fn roll(&mut self, to: VolumeIndex) -> Option<ClosedVolume> {
         let closed = self.current.as_mut().map(|current| {
             // `close`, not `progress`: it is what resolves a still-open cut to
@@ -1385,10 +1443,8 @@ impl ChunkPoller {
             // `snapshot`'s own sealed-only filter, so these two lines commute —
             // this is the readable order, not a load-bearing one.
             let progress = current.close();
-            ClosedVolume {
-                progress,
-                scan: current.snapshot(),
-            }
+            let scan = progress.volume_complete.then(|| current.snapshot());
+            ClosedVolume { progress, scan }
         });
         let mut next = VolumeAssembler::new(self.site.clone(), to);
         next.set_selection(self.selection.clone());
@@ -2200,6 +2256,27 @@ mod tests {
         )
     }
 
+    /// The same radial reassigned to another elevation cut, so one sweep's radials
+    /// can stand in for a cut the golden scan does not have.
+    fn renumber(r: &Radial, elevation: u8) -> Radial {
+        Radial::new(
+            r.collection_timestamp(),
+            r.azimuth_number(),
+            r.azimuth_angle_degrees(),
+            r.azimuth_spacing_degrees(),
+            r.radial_status(),
+            elevation,
+            r.elevation_angle_degrees(),
+            r.reflectivity().cloned(),
+            r.velocity().cloned(),
+            r.spectrum_width().cloned(),
+            r.differential_reflectivity().cloned(),
+            r.differential_phase().cloned(),
+            r.correlation_coefficient().cloned(),
+            r.clutter_filter_power().cloned(),
+        )
+    }
+
     /// `volumetric::tests::golden_scan` re-sliced into the chunks the bucket
     /// actually publishes.
     ///
@@ -2482,19 +2559,18 @@ mod tests {
             "the fixture must close complete, or this proves nothing: {:?}",
             closed.progress
         );
+        let scan = closed
+            .scan
+            .as_ref()
+            .expect("a completed volume hands back its scan");
         assert_eq!(
-            closed.scan.sweeps().len(),
+            scan.sweeps().len(),
             expected,
             "the roll reported a completed volume and did not hand it over"
         );
         // And the scan really is the volume the progress describes, not some
         // other one: same cuts, in the same order.
-        let handed: Vec<u8> = closed
-            .scan
-            .sweeps()
-            .iter()
-            .map(|s| s.elevation_number())
-            .collect();
+        let handed: Vec<u8> = scan.sweeps().iter().map(|s| s.elevation_number()).collect();
         assert_eq!(
             handed, closed.progress.sealed_elevations,
             "the scan and the progress in one `ClosedVolume` describe different \
@@ -2508,16 +2584,26 @@ mod tests {
         );
     }
 
-    /// A cut that ended short is absent from the closed volume, not present and
-    /// partial — and the roll says which cuts those were.
+    /// A volume that closed short reports the cuts it lost and hands back **no
+    /// scan**.
     ///
-    /// The mutation this kills is `roll` reading `progress()` instead of
-    /// `close()`: the scan comes out identical either way, because `snapshot`
-    /// filters to sealed cuts on its own, but the still-`Open` cut would then be
-    /// missing from `progress.abandoned` and a caller asking "what is this volume
-    /// missing?" would be told "nothing". Verified by mutation, along with the
-    /// discovery that the *order* of the two calls is not observable and so is not
-    /// claimed to be.
+    /// No scan because nothing reads one: every consumer gates on
+    /// `volume_complete` first, and building it would deep-copy every sealed
+    /// `Sweep` — `close` clears [`VolumeAssembler::snapshot`]'s cache exactly when
+    /// it abandoned a cut, so the cold rebuild landed precisely on the volumes that
+    /// get discarded.
+    ///
+    /// This deliberately gives up a guarantee an earlier version of this test
+    /// asserted — that a partial cut is absent from the scan a short close hands
+    /// over — because there is now no such scan to inspect. Nothing consumed it. The
+    /// underlying property is unchanged and still pinned where it belongs, on
+    /// `snapshot` itself, by `a_partial_cut_never_reaches_the_snapshot`.
+    ///
+    /// The mutation this kills is `roll` reading `progress()` instead of `close()`:
+    /// the still-`Open` cut would be missing from `progress.abandoned`, so a caller
+    /// asking "what is this volume missing?" would be told "nothing". Verified by
+    /// mutation, along with the discovery that the *order* of `close` and `snapshot`
+    /// is not observable and so is not claimed to be.
     #[test]
     fn a_roll_leaves_an_abandoned_cut_out_of_the_scan_it_hands_back() {
         // Drop the chunk carrying the 0.5° cut's terminator, so that cut is still
@@ -2547,12 +2633,194 @@ mod tests {
             "a volume with an abandoned cut reported complete"
         );
         assert!(
-            closed
-                .scan
-                .sweeps()
+            closed.scan.is_none(),
+            "a volume that closed short built a snapshot anyway — a deep copy of \
+             every sealed sweep, on the one path where `close` had just cleared \
+             the cache, for a volume every consumer discards"
+        );
+    }
+
+    /// **`volume_complete` is not "whole", and `roll` reports both.**
+    ///
+    /// Under a narrow [`CutSelection`] a volume completes on the cuts it was asked
+    /// for — one, for a single 0.5° pane, which is the *default* layout. That is the
+    /// right answer for the tilts on screen and the wrong one for anything that
+    /// integrates the column, and the two used to be one flag, leaving the
+    /// distinction to callers. A frontend that cached such a volume for its loops
+    /// then handed it to echo tops the moment the pane changed product.
+    #[test]
+    fn a_narrow_selection_completes_without_the_volume_being_whole() {
+        let narrow = CutSelection::Tilts(vec![0.5]);
+        let mut poller = ChunkPoller::new("KTLX");
+        poller.set_selection(narrow.clone());
+        poller.current = Some(narrow_volume(&narrow));
+
+        let closed = poller.roll(vol(43)).expect("a volume was open");
+
+        assert!(
+            closed.progress.volume_complete,
+            "precondition: the cuts the selection asked for must all have sealed, \
+             or the distinction below is not the one under test: {:?}",
+            closed.progress
+        );
+        assert!(
+            !closed.progress.whole_volume_complete,
+            "a volume holding only the 0.5° cuts reported itself whole, so every \
+             product that integrates the column may read it: {:?}",
+            closed.progress
+        );
+        assert_eq!(
+            closed.scan.as_ref().map(|s| s.sweeps().len()),
+            Some(2),
+            "precondition: the narrowed volume must really be short — two 0.5° \
+             cuts out of a four-cut pattern"
+        );
+    }
+
+    /// A volume assembled the way a 0.5°-only feed assembles one: the start chunk,
+    /// both halves of the 0.5° split cut, and the volume's terminator.
+    ///
+    /// The terminator is the faithful part. It carries the *final* cut's radials,
+    /// and it arrives even under a narrow selection because its sequence runs past
+    /// the planned ranges the coverage pattern implies — SAILS and MRLE inserts are
+    /// not in message 5, so real sequence numbers overrun the map, and
+    /// `ElevationChunkMap::wants` deliberately answers `true` for anything it cannot
+    /// place. That is what lets a narrow volume ever see `ScanEnd` and so ever
+    /// report complete, and it is also why the top cut is present but partial.
+    fn narrow_volume(selection: &CutSelection) -> VolumeAssembler {
+        let vcp = vcp_with(&[(0.5, true), (0.5, true), (4.0, false), (6.0, false)]);
+        let map = ElevationChunkMap::from_coverage_pattern(&vcp).expect("cuts");
+        assert_eq!(
+            map.wanted_elevations(selection),
+            vec![1, 2],
+            "precondition: the selection must want both halves of the split cut"
+        );
+
+        let mut a = VolumeAssembler::new("KTLX", vol(42));
+        a.set_selection(selection.clone());
+        a.ingest_contents(
+            1,
+            ChunkKind::Start,
+            volume_time(),
+            ChunkContents {
+                radials: Vec::new(),
+                coverage_pattern: Some(vcp),
+            },
+        );
+
+        let scan = crate::volumetric::tests::golden_scan();
+        // Both 0.5° cuts, each ending on `ElevationEnd`, at the sequences the map
+        // places them at — checked against `wants_chunk`, so the fixture cannot
+        // quietly stop being what a narrow feed downloads.
+        let mut sequence = 2u16;
+        for elevation in [1u8, 2u8] {
+            let sweep = &scan.sweeps()[0];
+            let radials: Vec<Radial> = sweep
+                .radials()
                 .iter()
-                .all(|s| s.elevation_number() != 1),
-            "the abandoned partial cut reached the scan handed to the caller"
+                .enumerate()
+                .map(|(i, r)| {
+                    let r = renumber(r, elevation);
+                    if i + 1 == sweep.radials().len() {
+                        with_status(&r, RadialStatus::ElevationEnd)
+                    } else {
+                        r
+                    }
+                })
+                .collect();
+            for group in radials.chunks(120) {
+                assert!(
+                    a.wants_chunk(sequence),
+                    "chunk {sequence} of the 0.5° cut was not wanted"
+                );
+                a.ingest_contents(
+                    sequence,
+                    ChunkKind::Intermediate,
+                    volume_time(),
+                    ChunkContents {
+                        radials: group.to_vec(),
+                        coverage_pattern: None,
+                    },
+                );
+                sequence += 1;
+            }
+        }
+
+        // The cuts in between are never fetched.
+        for skipped in sequence..sequence + 3 {
+            assert!(
+                !a.wants_chunk(skipped),
+                "chunk {skipped} belongs to a cut the selection skipped and was \
+                 wanted anyway"
+            );
+        }
+
+        // The terminator, past the map's ranges and so wanted regardless.
+        let top = scan.sweeps().last().expect("the golden scan has sweeps");
+        let tail: Vec<Radial> = top.radials()[..20]
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let r = renumber(r, 4);
+                if i == 19 {
+                    with_status(&r, RadialStatus::ScanEnd)
+                } else {
+                    r
+                }
+            })
+            .collect();
+        let terminator = 900u16;
+        assert!(
+            a.wants_chunk(terminator),
+            "a sequence the map cannot place must be wanted, or a narrow volume \
+             never sees ScanEnd and never completes at all"
+        );
+        a.ingest_contents(
+            terminator,
+            ChunkKind::End,
+            volume_time(),
+            ChunkContents {
+                radials: tail,
+                coverage_pattern: None,
+            },
+        );
+        a
+    }
+
+    /// The counterweight: with everything asked for, the two flags agree. Without
+    /// this the assertion above could pass on a flag that is simply always false.
+    #[test]
+    fn a_whole_volume_reports_both_flags() {
+        let mut poller = ChunkPoller::new("KTLX");
+        poller.current = Some(assemble(golden_chunks()));
+        let closed = poller.roll(vol(43)).expect("a volume was open");
+        assert!(closed.progress.volume_complete);
+        assert!(
+            closed.progress.whole_volume_complete,
+            "a volume with every cut sealed contiguously from 1 did not report \
+             whole, so nothing would ever reach a volume integral: {:?}",
+            closed.progress
+        );
+    }
+
+    /// A volume joined mid-flight is complete for a narrow selection that happens
+    /// to want only cuts it caught, and is still not whole.
+    ///
+    /// The contiguity clause is what separates them. Without it the missing lower
+    /// cuts would be invisible and `compute_echo_tops` would integrate tilts 3..23
+    /// and report every column's top far too low.
+    #[test]
+    fn a_volume_joined_mid_flight_is_never_whole() {
+        let chunks: Vec<_> = golden_chunks()
+            .into_iter()
+            .filter(|(_, _, c)| c.radials.first().is_none_or(|r| r.elevation_number() >= 3))
+            .collect();
+        let a = assemble(chunks);
+        assert!(a.progress().saw_scan_end, "the fixture must reach the end");
+        assert!(
+            !a.is_whole_volume_complete(),
+            "a volume missing its lowest cuts reported whole: {:?}",
+            a.progress()
         );
     }
 
@@ -2590,8 +2858,8 @@ mod tests {
             "the live snapshot on a closing round is the new volume, one cut in"
         );
         assert_eq!(
-            closed.scan.sweeps().len(),
-            crate::volumetric::tests::golden_scan().sweeps().len(),
+            closed.scan.as_ref().map(|s| s.sweeps().len()),
+            Some(crate::volumetric::tests::golden_scan().sweeps().len()),
             "and the closed volume is unaffected by what the new one ingests"
         );
     }
