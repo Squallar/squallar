@@ -140,13 +140,49 @@
 //! from opaque to absent in one quantisation level. The floors the paragraph
 //! above cites (VIL, HHC, NROT) all belong to products
 //! [`crate::sampler::samplable`] refuses, so reflectivity's `< 0 dBZ` is the
-//! only one this module can reach. That is not an argument against the
-//! decision — it is still strictly better for the other five than an
-//! out-of-band index, which would put an opaque *mid-ramp* colour there
-//! instead of an opaque *end-of-ramp* one — but the fade is real for
-//! reflectivity and nominal elsewhere, and 3D volume rendering is a
-//! reflectivity feature. [`VoxelGrid::fade_band`] reports the number so a
-//! renderer does not have to assume either way.
+//! only one this module can reach.
+//!
+//! **For those five the shipped encoding is no worse — a wash or slightly
+//! worse per moment — and the earlier claim that it was "strictly better"
+//! was wrong.** The reasoning behind that claim was that an opaque
+//! *end-of-ramp* colour beats an opaque *mid-ramp* one. That does not hold for
+//! a bidirectional or centred palette, where the ramp's **midpoint is the
+//! neutral** and its **bottom is the saturated extreme**. Half-edge fetches
+//! under both encodings, measured by
+//! `the_half_edge_costs_of_both_encodings_are_measured_per_moment`:
+//!
+//! | moment | echo | shipped | out-of-band |
+//! |---|---|---:|---:|
+//! | reflectivity | 65 dBZ | **16.25** | 32.35 |
+//! | velocity | 30 m/s | **−17.00** | −3.12 |
+//! | spectrum width | 4 m/s | 1.875 | 1.985 |
+//! | ZDR | 1.5 dB | **−3.219** | −0.258 |
+//! | ΦDP | 60° | 29.055 | 29.203 |
+//! | ρHV | 0.98 | **0.588** | 0.714 |
+//!
+//! All ten of those are fully opaque. So every ρHV echo edge — and the whole
+//! volume shell — gets a one-voxel shell at ρHV ≈ 0.59, squarely in the
+//! debris / non-meteorological band, and velocity gets a −17 m/s *inbound*
+//! shell around every outbound couplet edge. Reflectivity is the one moment
+//! where the shipped encoding is unambiguously better, and it is also the one
+//! that 3D volume rendering is for.
+//!
+//! **Shipping bottom-of-ramp is still right**, on a different argument than
+//! the one it was given: the out-of-band ramp spans the *palette's* range
+//! rather than the moment's, so it cannot represent the moment's floor at all
+//! and clamps real measurements outside it — which is a wrong number, not
+//! merely a wrong colour on a boundary.
+//!
+//! **The actionable consequence for WP-I.** Because [`VoxelGrid::fade_band`]
+//! is **0** for those five, the renderer has to supply the fade itself; it
+//! cannot be inherited from the palette, because the palette has no
+//! transparent region. The cheap route is a short forced-transparent run at
+//! the bottom of [`colormap_lut`] — exactly the move already made for entry 0,
+//! extended from one entry to a handful — which costs the lowest few
+//! quantisation levels of a moment nobody reads at its floor and buys a real
+//! fade on every one of the five. That is a transfer-function decision, so it
+//! is WP-I's to make and is deliberately not made here;
+//! [`VoxelGrid::fade_band`] reports the number a renderer needs to decide.
 //!
 //! **Index 0 is one quantisation step *below* the moment's floor.** The ramp's
 //! 255 *data* levels run from the moment's lowest decodable value at index 1
@@ -235,9 +271,19 @@
 //! unfolder exists), but no `R8Unorm` texture filter can. It is a real defect
 //! of this encoding for exactly one moment, it is bounded to gates either side
 //! of a fold, and it is left alone rather than papered over.
-//! [`VoxelGrid::wraps`] reports it so WP-I can decide;
+//! [`VoxelGrid::wraps`] reports it;
 //! `the_wrapping_moment_is_named_and_its_seam_error_is_measured` measures the
 //! worst case.
+//!
+//! **To be explicit, because "so WP-I can decide" invited the wrong reading: a
+//! filter choice is not on the table.** Switching the volume texture to
+//! `Nearest` for ΦDP would stair-step **every voxel of every ΦDP volume** in
+//! order to repair the handful of texel pairs that straddle a fold, and it
+//! would discard the filterability the `R8Unorm` format was chosen for in the
+//! first place. The seam is a small, bounded, local error; the cure is a large,
+//! global, permanent one. `wraps()` exists so a renderer can *say* so — in a
+//! readout, or by declining to draw ΦDP isosurfaces — not so it can reach for
+//! the sampler.
 //!
 //! # Shapes and memory
 //!
@@ -305,6 +351,18 @@ pub const MAX_HALF_WIDTH_KM: f64 = 230.0;
 /// The **value** plane is not in this budget: it is host memory, it is four
 /// times larger, and it is optional. Its figures are in the module doc's
 /// table.
+///
+/// **Not the same thing as `rustdar_frontend::constants::VOLUME_TEXTURE_BUDGET_BYTES`,
+/// despite the names, and deliberately not bound to it.** That one is
+/// per-target (1.5 MiB / 5 MiB / 12 MiB) and carries ~1.5× headroom for the
+/// alignment and driver overhead a real GPU allocation costs; this one is a
+/// flat ceiling equal to the largest index plane this module will produce, so
+/// that adding a fourth shape has to be a decision. They answer different
+/// questions — "will the allocation fit the device" versus "is this module
+/// still producing what it said it would" — and binding them would make the
+/// second untestable without a GPU. What *is* bound, because it is genuinely
+/// one number in two places, is the grid's dimensions and its table size:
+/// `the_grid_dimensions_match_the_shapes_rustdar_radar_names`.
 pub const VOXEL_TEXTURE_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 
 /// 128 × 128 × 64 — one MiB of indices, for wasm's single worker and 4 GiB
@@ -623,6 +681,16 @@ impl VoxelGrid {
     /// beam's height and the grid comes back empty rather than smeared.
     /// `a_single_tilt_volume_fills_nothing_rather_than_smearing_one_beam` pins
     /// it.
+    ///
+    /// **That emptiness is measure-zero, not an invariant, so branch on this
+    /// count rather than on the index plane.** A cell centre *can* land
+    /// bit-exactly on the beam height — `at_height_km` returns the rung's own
+    /// sample when the query equals the top rung's height — it just has
+    /// probability zero over arbitrary box bounds. A caller that decided "is
+    /// this volume usable" by testing whether every index is
+    /// [`NO_DATA_INDEX`] would therefore be right almost always and wrong
+    /// without warning, which is the worst available failure mode. `== 1` is
+    /// the honest test.
     pub fn tilt_count(&self) -> usize {
         self.tilt_count
     }
@@ -2756,6 +2824,113 @@ mod tests {
              rejected out-of-band encoding reads 32.35 dBZ at full opacity and \
              only vanishes on the empty voxel itself",
         );
+    }
+
+    /// **What the shipped encoding actually costs the five non-fading
+    /// moments, measured rather than argued.**
+    ///
+    /// The module doc used to claim bottom-of-ramp was "strictly better" than
+    /// an out-of-band index for every moment, on the reasoning that an opaque
+    /// *end-of-ramp* colour beats an opaque *mid-ramp* one. **That reasoning
+    /// is wrong for a bidirectional or centred palette**, and this test is why
+    /// the claim was corrected: for velocity and ZDR the out-of-band ramp's
+    /// midpoint *is* the palette's neutral, while our ramp's bottom is its
+    /// saturated extreme — so the shipped encoding paints the **more**
+    /// alarming halo, not the less.
+    ///
+    /// Each row is a half-edge fetch: a plausible echo value adjacent to
+    /// nothing, filtered at `t = 0.5`, decoded under both encodings.
+    ///
+    /// The out-of-band ramp is data indices 1..=255 over the **palette's own**
+    /// range, with 0 reserved off it. Spanning the palette rather than the
+    /// moment's physical range is what an out-of-band design would actually
+    /// do, and the distinction is the whole comparison: widening below the
+    /// palette floor is *our* construction's requirement — index 0 has to be a
+    /// value — and an encoding that reserves 0 has no such need. Over the same
+    /// span the two are the identical mapping for every `i >= 1`, so comparing
+    /// them there would measure nothing.
+    ///
+    /// Shipping bottom-of-ramp is still right — the out-of-band ramp cannot
+    /// represent the moment's floor at all, so it clamps real measurements
+    /// outside the palette range — but the honest summary is "no worse, and a
+    /// wash or slightly worse per moment", not "strictly better".
+    #[test]
+    fn the_half_edge_costs_of_both_encodings_are_measured_per_moment() {
+        let rows: Vec<(&str, f64, f64)> = SLOTS
+            .iter()
+            .zip(SAMPLABLE)
+            .map(|(&slot, product)| {
+                // A plausible echo for the moment, at a hard edge.
+                let echo: f32 = match slot {
+                    MomentSlot::Reflectivity => 65.0,
+                    MomentSlot::Velocity => 30.0,
+                    MomentSlot::SpectrumWidth => 4.0,
+                    MomentSlot::DifferentialReflectivity => 1.5,
+                    MomentSlot::DifferentialPhase => 60.0,
+                    MomentSlot::CorrelationCoefficient => 0.98,
+                };
+                let range = value_range_for(slot);
+                let shipped = ramp_value_at(
+                    range,
+                    fetched_index(ramp_index(range, echo), NO_DATA_INDEX, 0.5),
+                );
+
+                // The rejected encoding, over the palette's own range.
+                let legend = get_legend_scale(product);
+                let (lo, hi) = (f64::from(legend.min_value), f64::from(legend.max_value));
+                let oob_index = (1.0 + (f64::from(echo) - lo) / (hi - lo) * 254.0).round();
+                let oob_half = fetched_index(oob_index as u8, 0, 0.5);
+                let out_of_band = lo + (oob_half - 1.0) / 254.0 * (hi - lo);
+
+                let round3 = |v: f64| (v * 1000.0).round() / 1000.0;
+                (product.code(), round3(shipped), round3(out_of_band))
+            })
+            .collect();
+
+        assert_eq!(
+            rows,
+            vec![
+                // Reflectivity: unambiguously better, and the only moment with
+                // a transparent band to fade into.
+                ("ref", 16.25, 32.352),
+                // Velocity: ours is a −17 m/s *inbound* shell around every
+                // outbound couplet edge; the out-of-band ramp's midpoint is
+                // near zero, which the palette paints dark.
+                ("vel", -17.0, -3.119),
+                // Spectrum width and ΦDP: a wash, sub-metre and sub-degree.
+                ("sw", 1.875, 1.985),
+                // ZDR: ours saturates the negative extreme, theirs sits near
+                // the neutral 0 dB.
+                ("zdr", -3.219, -0.258),
+                ("phi", 29.055, 29.203),
+                // ρHV: ours paints a 0.588 shell — squarely in the
+                // debris/non-meteorological band — around every echo edge and
+                // around the whole volume boundary.
+                ("rho", 0.588, 0.714),
+            ],
+            "half-edge fetch, shipped vs out-of-band, per moment",
+        );
+
+        // Both are fully opaque for all five non-fading moments, which is the
+        // point: neither encoding fades there, so the difference is only
+        // *which* wrong colour gets painted.
+        for (slot, product) in SLOTS.iter().zip(SAMPLABLE) {
+            if product == RadarProduct::Reflectivity {
+                continue;
+            }
+            let range = value_range_for(*slot);
+            let lut = colormap_lut(product, range);
+            assert_eq!(
+                lut.chunks_exact(4)
+                    .skip(1)
+                    .filter(|entry| entry[3] == 0)
+                    .count(),
+                0,
+                "{} has no transparent data entry to fade into, so WP-I must \
+                 supply the fade itself",
+                product.name(),
+            );
+        }
     }
 
     /// How wide the fade actually is, per product — the number that says
