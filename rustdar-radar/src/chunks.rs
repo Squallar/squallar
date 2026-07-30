@@ -551,6 +551,29 @@ pub struct ElevationChunkMap {
 }
 
 impl ElevationChunkMap {
+    /// A cut's planned angle, with a negative base tilt read as negative.
+    ///
+    /// A VCP carries the angle as an unsigned field, so a site that points its
+    /// lowest cut *below* the horizon declares it as a number just under 360:
+    /// KMSX's is 359.82°, and its radials duly report −0.124°. Left as it comes,
+    /// the comparison in [`CutSelection::wants_angle`] is against a wanted angle
+    /// near −0.2°, which is 360° away — so under [`CutSelection::Tilts`] that cut
+    /// would never be wanted, never downloaded, and the lowest tilt of a
+    /// mountain-top site would stay empty however long you waited for it.
+    ///
+    /// Mountain-top sites only, and the same rule the cross-section ladder
+    /// already applies to its own elevation keys.
+    fn planned_angle_degrees(cut: &nexrad_model::data::ElevationCut) -> f32 {
+        let angle = cut.elevation_angle_degrees();
+        // Halfway round is far past any tilt a radar flies, so nothing legitimate
+        // is caught by this.
+        if angle > 180.0 {
+            (angle - 360.0) as f32
+        } else {
+            angle as f32
+        }
+    }
+
     /// Build from the coverage pattern the start chunk carried.
     ///
     /// `None` when the pattern lists no cuts — a placeholder, or a message 5
@@ -575,7 +598,7 @@ impl ElevationChunkMap {
                 let chunks = (radials / RADIALS_PER_CHUNK) as u16;
                 let range = next..=(next + chunks - 1);
                 next += chunks;
-                ((i + 1) as u8, cut.elevation_angle_degrees() as f32, range)
+                ((i + 1) as u8, Self::planned_angle_degrees(cut), range)
             })
             .collect();
         Some(Self { cuts })
@@ -3262,6 +3285,44 @@ mod tests {
             false,
             elevation_cuts,
         )
+    }
+
+    /// A site that points its lowest cut below the horizon can still ask for it.
+    ///
+    /// The VCP carries the angle unsigned, so KMSX declares its base tilt as
+    /// 359.82° while its radials report −0.124°. Taken at face value that cut is
+    /// 360° from any angle a user could select, so under a narrow
+    /// [`CutSelection`] it would never be wanted, never downloaded, and the
+    /// lowest tilt of a mountain-top site would stay empty for good.
+    #[test]
+    fn a_cut_below_the_horizon_is_wanted_by_the_angle_it_actually_points_at() {
+        let vcp = vcp_with(&[(359.82, true), (0.48, true), (0.88, true)]);
+        let map = ElevationChunkMap::from_coverage_pattern(&vcp).expect("cuts");
+
+        assert_eq!(
+            map.cut_for(2)
+                .map(|(n, a)| (n, (a * 100.0).round() / 100.0)),
+            Some((1, -0.18)),
+            "the base cut points below the horizon and must read as negative",
+        );
+
+        let wanted = CutSelection::Tilts(vec![-0.1]);
+        assert!(
+            map.wants(2, &wanted),
+            "selecting the base tilt must fetch the cut that flies it",
+        );
+        assert_eq!(
+            map.wanted_elevations(&wanted),
+            vec![1],
+            "and that cut is the one the volume must wait for",
+        );
+
+        // The rest of the pattern is unaffected: a positive selection does not
+        // suddenly reach the sub-horizon cut.
+        assert!(
+            !map.wants(2, &CutSelection::Tilts(vec![0.9])),
+            "0.9° must not reach the cut below the horizon",
+        );
     }
 
     /// The mapping this rests on, against the volume shape measured on the live
