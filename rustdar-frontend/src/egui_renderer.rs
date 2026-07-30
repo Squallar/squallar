@@ -11,6 +11,40 @@ pub struct EguiRenderer {
     state: State,
     renderer: Renderer,
     applied_visuals_dark: Option<bool>,
+    /// The attachments [`EguiRenderer::draw`]'s render pass has. Recorded at
+    /// construction because there is nowhere else to read them back from — see
+    /// [`AttachmentConfig`].
+    attachment_config: AttachmentConfig,
+}
+
+/// The attachment layout of the egui render pass.
+///
+/// A `wgpu::RenderPipeline` has to declare the colour format, depth-stencil
+/// state and sample count of the pass it will be used in; a mismatch is a
+/// validation error at `create_render_pipeline`, and `create_render_pipeline`
+/// does not return `Result`. So anything building a pipeline that draws into
+/// egui's own pass has to be told these three, and `egui_wgpu::Renderer` exposes
+/// none of them — hence recording them on the way past.
+///
+/// **The volume raymarch is not the consumer.** It renders into an offscreen
+/// `Rgba8Unorm` target of its own, so it is bound by that target's format rather
+/// than by this. The consumer is the **blit quad** that composites that target
+/// into egui's pass, which is the one pipeline that genuinely has to match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttachmentConfig {
+    /// The colour attachment's format — the swapchain's, in practice.
+    ///
+    /// Note this is deliberately *not* always non-sRGB:
+    /// `app_state::select_surface_format` only prefers a non-sRGB format on
+    /// wasm32, and natively falls back to `capabilities.formats[0]`. Anything
+    /// that has to match egui's gamma convention must key off
+    /// `TextureFormat::is_srgb` on this value rather than assume either way.
+    pub color_format: TextureFormat,
+    /// The depth-stencil attachment's format, or `None` when the pass has none.
+    /// `EguiRenderer::draw` attaches no depth buffer today.
+    pub depth_format: Option<TextureFormat>,
+    /// Samples per pixel in the pass. 1 today, i.e. MSAA off.
+    pub msaa_samples: u32,
 }
 
 /// An egui pass that has been ended, tessellated and uploaded.
@@ -117,7 +151,39 @@ impl EguiRenderer {
             state: egui_state,
             renderer: egui_renderer,
             applied_visuals_dark: None,
+            // The same three values `Renderer::new` was just given, kept because
+            // it offers no way to ask for them back.
+            attachment_config: AttachmentConfig {
+                color_format: output_color_format,
+                depth_format: output_depth_format,
+                msaa_samples,
+            },
         }
+    }
+
+    /// The attachments [`Self::draw`]'s render pass has. See [`AttachmentConfig`].
+    pub fn attachment_config(&self) -> AttachmentConfig {
+        self.attachment_config
+    }
+
+    /// egui's per-type store for resources a paint callback needs across frames.
+    ///
+    /// `egui_wgpu::Renderer::callback_resources` is `pub`
+    /// (`egui-wgpu-0.35.0/src/renderer.rs:259`) but [`Self::renderer`] is not, so
+    /// this accessor is the only way to reach it — and it is the *only* channel
+    /// there is, because `CallbackTrait::prepare` and `paint` both take `&self`
+    /// and so cannot own mutable state of their own.
+    ///
+    /// `_mut` even though [`Self::draw`] takes `&self`: `update_buffers` already
+    /// hands callbacks a `&mut CallbackResources`, so nothing here is made more
+    /// mutable than it already was.
+    ///
+    /// A caveat worth knowing before inserting: `CallbackResources` is a
+    /// `TypeMap` keyed by type, not by pane or by callback. One inserted type is
+    /// one slot for the whole application, so anything that needs to be
+    /// per-instance has to carry its own map inside that slot.
+    pub fn callback_resources_mut(&mut self) -> &mut egui_wgpu::CallbackResources {
+        &mut self.renderer.callback_resources
     }
 
     pub fn handle_input(&mut self, window: &Window, event: &WindowEvent) -> bool {
@@ -220,6 +286,14 @@ impl EguiRenderer {
     }
 
     /// Record the render pass for an already-prepared frame.
+    ///
+    /// Note the pass this opens has **no depth attachment and no resolve
+    /// target**, which is what makes [`Self::attachment_config`] honest only
+    /// while `new` is called with `None` depth and one sample. Both halves are
+    /// pinned by `the_pass_draw_opens_matches_what_attachment_config_promises` —
+    /// a pipeline built from a depth format this pass does not attach fails
+    /// validation at draw time, and `create_render_pipeline` returns no `Result`
+    /// to notice it in.
     pub fn draw(
         &mut self,
         encoder: &mut CommandEncoder,
@@ -389,6 +463,76 @@ mod tests {
             "present_frame finishes the encoder itself instead of handing it to \
              PreparedFrame::submit, which skips the paint callbacks' command \
              buffers entirely"
+        );
+    }
+
+    /// `attachment_config` must report the pass, not a guess at it.
+    ///
+    /// `EguiRenderer::new` needs a real `Window`, so no host test can call the
+    /// accessor. What it can catch is the mutation that matters: each field
+    /// hard-coded to what `AppState` happens to pass today rather than taken from
+    /// the parameter. That compiles, reads plausibly, and reports a pass layout
+    /// that is right until the first caller passes something else — at which
+    /// point a consumer builds a pipeline for the wrong pass and
+    /// `create_render_pipeline` has no `Result` to say so in.
+    #[test]
+    fn attachment_config_is_built_from_new_s_own_parameters() {
+        let body = body_of(include_str!("egui_renderer.rs"), "    pub fn new(");
+        for (field, parameter) in [
+            ("color_format", "output_color_format"),
+            ("depth_format", "output_depth_format"),
+            ("msaa_samples", "msaa_samples"),
+        ] {
+            // Field-init shorthand where the two names coincide, which is what
+            // clippy asks for and what `msaa_samples` therefore has to be.
+            let written = format!("{field}: {parameter}");
+            let shorthand = format!("{field},");
+            assert!(
+                body.contains(&written) || (field == parameter && body.contains(&shorthand)),
+                "AttachmentConfig::{field} is not initialised from `new`'s \
+                 `{parameter}` parameter, so `attachment_config()` describes \
+                 something other than the pass egui was configured for"
+            );
+        }
+    }
+
+    /// The pass `draw` opens must be the pass `attachment_config` describes.
+    ///
+    /// `draw` hard-codes `depth_stencil_attachment: None` and
+    /// `resolve_target: None`, while `new` accepts *any* depth format and sample
+    /// count and forwards them to egui's own pipeline. Those two are already one
+    /// call-site edit away from disagreeing, and the failure mode is a pipeline
+    /// that declares depth (or MSAA) for a pass that has neither: a validation
+    /// error at draw time, from a `create_render_pipeline` that returns no
+    /// `Result`. Publishing `attachment_config()` makes the disagreement
+    /// reachable by anything building a pipeline, so pin both halves.
+    #[test]
+    fn the_pass_draw_opens_matches_what_attachment_config_promises() {
+        let draw = body_of(include_str!("egui_renderer.rs"), "    pub fn draw(");
+        assert!(
+            draw.contains("depth_stencil_attachment: None"),
+            "draw now attaches a depth buffer, so `AttachmentConfig::depth_format` \
+             must stop being able to disagree with it"
+        );
+        assert!(
+            draw.contains("resolve_target: None"),
+            "draw now resolves MSAA, so a single-sampled `msaa_samples` no longer \
+             describes this pass"
+        );
+
+        // The only production construction, and what makes the two consistent.
+        let state = include_str!("app_state.rs");
+        let call = state
+            .split_once("EguiRenderer::new(")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once(')'))
+            .map(|(args, _)| args)
+            .expect("app_state no longer constructs an EguiRenderer");
+        assert!(
+            call.contains("None") && call.contains(", 1,"),
+            "app_state constructs the EguiRenderer with `{call}` — a depth format \
+             or a sample count that `draw`'s render pass does not provide, so \
+             egui's own pipeline no longer matches its own pass"
         );
     }
 
