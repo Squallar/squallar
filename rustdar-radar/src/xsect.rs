@@ -623,7 +623,12 @@ fn summarize(columns: &[ColumnAt], axes: &mut SectionAxes, top_row_arl_km: f64) 
         }
     }
 
-    axes.near_ground_range_km = if near.is_finite() { near } else { 0.0 };
+    // `min(far)` rather than a finiteness test on the seed. For a non-empty
+    // raster — and [`SECTION_WIDTH`] is a nonzero constant, so it always is —
+    // the nearest column is under the farthest and this is the identity. What
+    // it buys is that the `INFINITY` seed cannot escape into the axes if that
+    // ever stops being true, without an unreachable branch nothing can pin.
+    axes.near_ground_range_km = near.min(far);
     axes.far_ground_range_km = far;
     axes.coverage_ground_range_km = coverage;
     axes.cone_of_silence_km = cone_columns as f64 * column_width_km;
@@ -1906,6 +1911,20 @@ mod tests {
             "precondition: `get_color_for_value` no longer erases a folded \
              gate, so the extra arm has nothing to fix",
         );
+        // A folded gate is also the radar *looking*, so a volume that folds
+        // everywhere still reports its full coverage. Without this arm the
+        // coverage number would collapse to "the farthest unambiguous echo",
+        // and a section through a wholly folded second trip would claim its
+        // data ran out at the site.
+        let all_folded = scan_with(&|_az, _slant| Gate::RangeFolded);
+        let folded_section = radial_section(&all_folded, 118.0, 120.0);
+        assert!(
+            folded_section.axes().coverage_ground_range_km > 119.0,
+            "a wholly range-folded volume reported coverage out to only \
+             {:.1} km",
+            folded_section.axes().coverage_ground_range_km,
+        );
+
         // And the fold is distinguishable from the echo beside it.
         let echo_col = nearest_column(&axes, 80.0);
         assert_eq!(status_at(&section, echo_col, row), SampleStatus::Value);
@@ -2262,8 +2281,31 @@ mod tests {
         // A changed *status* is a changed section even where both values are
         // NaN — the status plane is compared unconditionally.
         let mut restatused = far.clone();
+        assert_ne!(far.status[0], SampleStatus::NoCoverage.wire_code());
         restatused.status[0] = SampleStatus::NoCoverage.wire_code();
         assert_ne!(far, restatused);
+
+        // Every part is compared, and each is checked on its own: otherwise a
+        // conjunct could be dropped one at a time with every other assertion
+        // here still passing, and two sections of different places or
+        // different pictures would compare equal on the wire.
+        let mut reaxed = far.clone();
+        reaxed.axes.top_km_msl += 1.0;
+        assert_ne!(far, reaxed, "a changed axis did not change the section");
+
+        let mut repainted = far.clone();
+        repainted.image[0] = repainted.image[0].wrapping_add(1);
+        assert_ne!(far, repainted, "a changed pixel did not change the section");
+
+        // A length mismatch is an inequality and not a panic: without the
+        // length test the `zip` would compare the shorter prefix and call a
+        // truncated payload equal to a whole one.
+        let mut truncated = far.clone();
+        truncated.values.pop();
+        assert_ne!(
+            far, truncated,
+            "a truncated value plane compared equal to the whole one",
+        );
     }
 
     /// The wire constructor refuses anything that would panic a consumer, and
