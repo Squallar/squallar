@@ -1693,22 +1693,256 @@ mod tests {
         );
     }
 
-    /// The refusal that keeps the worker from building a different ladder from
-    /// the main thread's — pinned against the **real** `RenderInput` round
-    /// trip rather than a hand-built placeholder, because the hand-built one
-    /// would stop matching the day `render_input` changed.
+    /// A volume shaped like a real SAILS one, with the cut table that separates
+    /// its two base tilts.
+    ///
+    /// Five sweeps over five declared cuts, in KBMX's adaptive-base-tilt
+    /// geometry: a below-horizon 359.7° cut that only the wrap correction reads
+    /// as −0.3°, **two genuine base tilts declared 0.09° apart** (0.40° and
+    /// 0.48°) whose measured medians interleave, a merged 1.5° tilt, and a
+    /// SAILS repeat of the 0.48° cut that must fuse into its own rung and win
+    /// it on recency. Every hazard the ladder rule exists for is in it.
+    fn sails_volume() -> Scan {
+        Scan::new(
+            vcp(&[359.7, 0.40, 0.48, 1.5, 0.48]),
+            vec![
+                make_sweep(
+                    1,
+                    -0.28,
+                    360,
+                    40,
+                    Some(&|_, _| Some(15.0)),
+                    Some(&|_, _| Some(7.0)),
+                ),
+                flat_refl_sweep(2, 0.44, 360, 40, 20.0),
+                make_sweep(
+                    3,
+                    0.53,
+                    360,
+                    40,
+                    Some(&|_, _| Some(25.0)),
+                    Some(&|_, _| Some(9.0)),
+                ),
+                make_sweep(
+                    4,
+                    1.51,
+                    360,
+                    40,
+                    Some(&|_, _| Some(30.0)),
+                    Some(&|_, _| Some(11.0)),
+                ),
+                flat_refl_sweep(5, 0.51, 360, 40, 35.0),
+            ],
+        )
+    }
+
+    /// The ladder a worker builds from a reconstructed payload is the ladder
+    /// the main thread built — **identically**, not approximately.
+    ///
+    /// This is the property `render_input`'s version 6 exists for, and it used
+    /// to be impossible: the reconstruction carried an empty cut table and a
+    /// 0-based payload index where the elevation number belongs, so the sampler
+    /// refused the scan outright rather than silently keying it wrong. The
+    /// refusal was a placeholder for this test.
+    ///
+    /// Compared over the sampler's own `Debug` line, which is the whole ladder
+    /// — product, rung count, each rung's geometric elevation *in cut order*,
+    /// and each rung's wrap-corrected nominal key. Comparing rung counts alone
+    /// would pass on a ladder that had kept the right number of rungs and
+    /// chosen the wrong sweep for every one of them, which is exactly the
+    /// silent failure the split cuts and the SAILS repeat above are here to
+    /// produce.
     #[test]
-    fn a_reconstructed_render_input_scan_is_refused() {
+    fn a_reconstructed_render_input_scan_builds_the_identical_ladder() {
+        let scan = sails_volume();
+        for product in [RadarProduct::Reflectivity, RadarProduct::Velocity] {
+            let original =
+                VolumeSampler::new(&scan, product).expect("the fixture's own ladder builds");
+
+            let input =
+                crate::render_input::RenderInput::extract_volume(&scan, product, 35.33, -97.27)
+                    .expect("the fixture carries the moment");
+            // Through the bytes, not just through `to_scan`: the cut angles and
+            // the elevation numbers have to survive the wire, and a worker
+            // holds bytes rather than a `RenderInput`.
+            let decoded = crate::render_input::RenderInput::from_bytes(&input.to_bytes())
+                .expect("the payload round-trips");
+            let reconstructed = decoded.to_scan();
+
+            let ported = VolumeSampler::new(&reconstructed, product)
+                .expect("the reconstructed scan's ladder builds");
+
+            assert_eq!(
+                format!("{ported:?}"),
+                format!("{original:?}"),
+                "{product:?}: the worker's ladder is not the main thread's",
+            );
+            // precondition: the fixture is not so simple that any rule agrees.
+            assert!(
+                original.tilt_count() >= 3,
+                "precondition: a {}-rung ladder is too short to distinguish \
+                 the grouping rules this is about",
+                original.tilt_count(),
+            );
+            assert!(
+                original.nominal_elevations_deg().any(|k| k < 0.0),
+                "precondition: the below-horizon cut left the fixture, so the \
+                 wrap correction is no longer exercised across the port",
+            );
+        }
+    }
+
+    /// The same claim on a **real** volume off the archive, where the cut
+    /// table, the split cuts, the SAILS repeats and the settling drift are all
+    /// whatever the RDA actually flew rather than whatever a fixture author
+    /// thought of.
+    ///
+    /// ```text
+    /// cargo test -p rustdar-radar --release -- --ignored --nocapture live_the_ported_ladder
+    /// ```
+    ///
+    /// Walks sites until one yields a volume, so a quiet or missing site does
+    /// not fail the run; the assertion is about the port, not about the weather.
+    #[ignore = "hits the live S3 bucket"]
+    #[tokio::test]
+    async fn live_the_ported_ladder_is_the_originals() {
+        let now = chrono::Utc::now().naive_utc();
+        let mut checked = 0;
+        for site in crate::twin::live::SITES.iter().take(6) {
+            let Some((scan, start)) = crate::twin::live::l2_volume_near(site, now).await else {
+                continue;
+            };
+            let cuts = scan.coverage_pattern().elevation_cuts().len();
+            println!(
+                "{site} {start}: VCP {:?}, {} sweeps, {cuts} declared cuts",
+                scan.coverage_pattern().pattern_number(),
+                scan.sweeps().len(),
+            );
+            if cuts == 0 {
+                println!("  no cut table on this volume; skipping");
+                continue;
+            }
+            for product in [RadarProduct::Reflectivity, RadarProduct::Velocity] {
+                let original = VolumeSampler::new(&scan, product).expect("a real volume samples");
+                let input =
+                    crate::render_input::RenderInput::extract_volume(&scan, product, 0.0, 0.0)
+                        .expect("a real volume carries the moment");
+                let bytes = input.to_bytes();
+                let decoded = crate::render_input::RenderInput::from_bytes(&bytes)
+                    .expect("the payload round-trips");
+                let reconstructed = decoded.to_scan();
+                let ported = VolumeSampler::new(&reconstructed, product)
+                    .expect("the reconstructed volume samples");
+                println!(
+                    "  {product:?} {:>9} bytes\n    was {original:?}\n    now {ported:?}",
+                    bytes.len()
+                );
+                assert_eq!(
+                    format!("{ported:?}"),
+                    format!("{original:?}"),
+                    "{site} {product:?}: the worker's ladder is not the main thread's",
+                );
+            }
+            checked += 1;
+            if checked == 2 {
+                return;
+            }
+        }
+        panic!("no site yielded an archived volume with a cut table");
+    }
+
+    /// The two near-angle base tilts stay apart across the port — the thing no
+    /// angular threshold can do — and the SAILS repeat still fuses into its own
+    /// cut and still wins it on recency. Asserted on the *reconstructed* scan
+    /// rather than only on the original.
+    ///
+    /// The fixture's cuts are declared 0.40° and 0.48° — 0.09° apart — while
+    /// its medians (0.44, 0.53, 0.51) interleave and sit inside every merge
+    /// threshold the campaign measured. A reconstruction that lost the cut
+    /// table would have to key by angle and would fuse the two into one rung,
+    /// deleting a genuine tilt; one that kept the table but wrote payload
+    /// indices where the elevation numbers go would key the sweeps 0, 1, 2, 3,
+    /// 4 and read every one of them off the wrong cut. Both produce a plausible
+    /// monotone ladder and neither errors.
+    ///
+    /// The 0.48° rung's winner is the discriminator that catches the second
+    /// one: cuts 3 and 5 are the same declared angle, so the rung is chosen
+    /// newest-first and must be the SAILS repeat's 0.51° median rather than
+    /// cut 3's 0.53°.
+    #[test]
+    fn the_ported_ladder_still_separates_the_near_angle_cuts() {
+        let scan = sails_volume();
+        let input = crate::render_input::RenderInput::extract_volume(
+            &scan,
+            RadarProduct::Reflectivity,
+            35.33,
+            -97.27,
+        )
+        .expect("the fixture carries reflectivity");
+        let reconstructed = input.to_scan();
+
+        let medians: Vec<f64> = reconstructed
+            .sweeps()
+            .iter()
+            .filter_map(|s| sweep_elevation_deg(s.radials()))
+            .collect();
+        let spread = medians
+            .iter()
+            .flat_map(|a| medians.iter().map(move |b| (a - b).abs()))
+            .filter(|d| *d > 0.0)
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            spread < 0.10,
+            "precondition: the closest two medians are {spread:.3}° apart, \
+             wider than the tightest threshold the campaign measured, so this \
+             fixture no longer proves anything about angular merging",
+        );
+
+        let sampler = VolumeSampler::new(&reconstructed, RadarProduct::Reflectivity)
+            .expect("the reconstructed ladder builds");
+        let nominal: Vec<f64> = sampler.nominal_elevations_deg().collect();
+        let geometric: Vec<f64> = sampler.elevations_deg().collect();
+        assert_eq!(
+            nominal.len(),
+            4,
+            "the ported ladder fused or scattered cuts: {sampler:?}",
+        );
+        assert!(
+            (nominal[1] - 0.40).abs() < 1e-9 && (nominal[2] - 0.48).abs() < 1e-9,
+            "the two base tilts did not survive the port as declared: {nominal:?}",
+        );
+        assert!(
+            (geometric[2] - 0.51).abs() < 1e-5,
+            "the 0.48° rung was won by the wrong sweep across the port — \
+             {:.4}° rather than the SAILS repeat's 0.51°",
+            geometric[2],
+        );
+    }
+
+    /// The refusal is still reachable, and still pinned against the **real**
+    /// `RenderInput` round trip: a volume joined mid-flight has no cut table
+    /// yet (`crate::chunks`' own placeholder), so there is nothing for the
+    /// payload to carry and the reconstruction rebuilds the same empty table.
+    ///
+    /// Faithful includes faithfully unusable. The alternative — inventing cut
+    /// angles from the sweeps' own medians — would build a ladder in the worker
+    /// that the main thread would have refused to build, which is the silent
+    /// divergence this whole error exists to stop.
+    #[test]
+    fn a_payload_from_a_volume_with_no_cut_table_is_still_refused() {
         let scan = Scan::new(
-            vcp(&[0.5, 0.9]),
+            crate::render_input::placeholder_coverage_pattern(212),
             vec![
                 flat_refl_sweep(1, 0.5, 360, 40, 20.0),
                 flat_refl_sweep(2, 0.9, 360, 40, 30.0),
             ],
         );
-        // precondition: the original scan samples fine, so the refusal below
-        // is about the reconstruction and not about the fixture.
-        assert!(VolumeSampler::new(&scan, RadarProduct::Reflectivity).is_ok());
+        // precondition: the original is refused for exactly this reason, so
+        // what is asserted below is that the port preserved it.
+        assert!(matches!(
+            VolumeSampler::new(&scan, RadarProduct::Reflectivity),
+            Err(SamplerError::EmptyCoveragePattern { .. }),
+        ));
 
         let input = crate::render_input::RenderInput::extract(
             &scan,
@@ -1720,28 +1954,22 @@ mod tests {
             None,
         )
         .expect("the fixture carries reflectivity at 0.5°");
-        let reconstructed = input.to_scan();
-
         // precondition: the reconstruction really did keep a renderable sweep,
         // so what fails below is the ladder and not the payload.
-        assert!(
-            !reconstructed.sweeps().is_empty(),
-            "precondition: the round trip dropped every sweep",
-        );
         assert!(
             crate::render::render_from(&input).is_some(),
             "precondition: the reconstructed input no longer renders, so this \
              test is measuring a broken fixture rather than the sampler",
         );
 
-        let err = VolumeSampler::new(&reconstructed, RadarProduct::Reflectivity).expect_err(
-            "the sampler accepted a scan whose coverage pattern is a \
-             placeholder — it has just built a ladder in the worker that does \
-             not match the main thread's, silently",
+        let err = VolumeSampler::new(&input.to_scan(), RadarProduct::Reflectivity).expect_err(
+            "the sampler accepted a scan rebuilt from a volume that had no cut \
+             table — it has just built a ladder in the worker that the main \
+             thread would have refused to build, silently",
         );
         assert!(
-            matches!(err, SamplerError::EmptyCoveragePattern { .. }),
-            "expected the empty-cut-table refusal, got {err:?}",
+            matches!(err, SamplerError::EmptyCoveragePattern { vcp: 212 }),
+            "expected the empty-cut-table refusal naming the real VCP, got {err:?}",
         );
         // The message has to say enough for whoever hits it to know why.
         let text = err.to_string();

@@ -419,10 +419,33 @@ pub(crate) fn find_sweep(
     product: types::RadarProduct,
     elevation_angle: f32,
 ) -> Option<&[Radial]> {
+    find_sweep_owner(scan, product, elevation_angle).map(nexrad_model::data::Sweep::radials)
+}
+
+/// [`find_sweep`], answering the `Sweep` rather than its radials.
+///
+/// The policy lives here and [`find_sweep`] is one line over it, so there is
+/// no second selection rule that could come to disagree with the first.
+///
+/// It exists because [`crate::render_input::RenderInput`] needs one thing off
+/// the chosen sweep that a `&[Radial]` cannot give it *authoritatively*: the
+/// **sweep's** `elevation_number`, which is what
+/// [`crate::sampler::VolumeSampler`] keys its tilt ladder on. A radial carries
+/// an elevation number too, and in every producer in this workspace the two
+/// agree — the archive decoder splits radials into sweeps *by* that field, and
+/// the chunk assembler does the same — but "they agree in the producers we
+/// have" is a claim about data, and `Sweep::new` takes the number separately,
+/// so reading the radial's would be a second source of truth for the one field
+/// the ladder cannot get wrong. This returns the first.
+pub(crate) fn find_sweep_owner(
+    scan: &Scan,
+    product: types::RadarProduct,
+    elevation_angle: f32,
+) -> Option<&nexrad_model::data::Sweep> {
     let newest = |surveillance_only: bool| {
-        scan.sweeps().iter().rev().find_map(|sweep| {
+        scan.sweeps().iter().rev().find(|sweep| {
             let radials = sweep.radials();
-            let matches = radials
+            radials
                 .first()
                 .zip(crate::volumetric::sweep_elevation_deg(radials))
                 .map(|(r, elevation)| {
@@ -430,8 +453,7 @@ pub(crate) fn find_sweep(
                         && product.get_moment(r).is_some()
                         && !(surveillance_only && r.velocity().is_some())
                 })
-                .unwrap_or(false);
-            matches.then(|| sweep.radials())
+                .unwrap_or(false)
         })
     };
     match product {
@@ -2045,7 +2067,7 @@ mod tests {
     }
 
     fn scan_of(sweeps: Vec<nexrad_model::data::Sweep>) -> Scan {
-        Scan::new(crate::render_input::placeholder_coverage_pattern(), sweeps)
+        Scan::new(crate::render_input::placeholder_coverage_pattern(0), sweeps)
     }
 
     /// Two sweeps of one cut, the second newer — newest-wins.

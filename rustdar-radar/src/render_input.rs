@@ -48,10 +48,13 @@
 
 use crate::types::{MomentSlot, RadarProduct};
 use nexrad_model::data::{
-    DataMoment, MomentData, PulseWidth, Radial, RadialStatus, Scan, Sweep, VolumeCoveragePattern,
+    ChannelConfiguration, DataMoment, ElevationCut, MomentData, PulseWidth, Radial, RadialStatus,
+    Scan, Sweep, VolumeCoveragePattern, WaveformType,
 };
 
-/// Everything [`crate::render::render_from`] needs to produce a frame.
+/// Everything [`crate::render::render_from`] needs to produce a frame, and
+/// everything [`crate::sampler::VolumeSampler`] needs to build the same tilt
+/// ladder the main thread built.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderInput {
     product: RadarProduct,
@@ -59,6 +62,10 @@ pub struct RenderInput {
     /// `find_sweep` re-runs against it on the reconstructed scan and must reach
     /// the same sweep, which is why [`RenderInput::extract`] keeps sweeps in
     /// their original order.
+    ///
+    /// [`RenderInput::extract_volume`] has no tilt to ask for and stores
+    /// [`NO_ELEVATION_DEG`] instead — see that constant for why it is neither
+    /// `0.0` nor `NaN`.
     elevation: f32,
     radar_lat: f64,
     radar_lon: f64,
@@ -74,10 +81,21 @@ pub struct RenderInput {
     /// adaptation defaults, exactly as the RPG does without environmental
     /// data.
     env_heights_km_msl: Option<(f64, f64)>,
+    /// The volume coverage pattern number the scan was flown under.
+    ///
+    /// Nothing on a render path reads it. It travels because the *cut angles*
+    /// now do (see [`SweepData::cut_angle_deg`]), and a reconstructed pattern
+    /// that carried a real cut table while calling itself VCP 0 would be a
+    /// worse artifact than the wholly synthetic pattern this used to build:
+    /// [`crate::sampler::SamplerError::EmptyCoveragePattern`] names the VCP in
+    /// its message, and `crate::types::ScanInfo::from_scan` — the one reader of
+    /// the pattern anywhere in this workspace — puts it in the chrome.
+    vcp: u16,
     sweeps: Vec<SweepData>,
 }
 
-/// One sweep's worth of the product's moment.
+/// One sweep's worth of the product's moment, plus the two fields that let the
+/// sweep be keyed back onto its VCP cut.
 #[derive(Debug, Clone, PartialEq)]
 struct SweepData {
     /// The sweep's **median** elevation
@@ -110,6 +128,36 @@ struct SweepData {
     /// any of this, because for them the median and the first radial are the
     /// same number.
     elevation_angle: f32,
+    /// The sweep's own `elevation_number` — the RDA's statement of which cut of
+    /// the VCP this sweep is, 1-based.
+    ///
+    /// **This used to be the sweep's index in the payload**, written as
+    /// `si as u8` off an `.enumerate()` in [`to_scan`](RenderInput::to_scan),
+    /// which made the first sweep report `0` — a number that cannot index a
+    /// 1-based table at all. Nothing noticed, because nothing read it.
+    /// [`crate::sampler::VolumeSampler`] does: it is half of the ladder key,
+    /// and the wrong half of it is not a degraded ladder but a different one.
+    elevation_number: u8,
+    /// The angle of the VCP cut `elevation_number` names, **exactly as the cut
+    /// table stores it** — not wrap-corrected, not rounded, not the sweep's
+    /// median.
+    ///
+    /// Raw on purpose. The sampler applies its own `key > 180.0 → key - 360.0`
+    /// correction for cuts below the horizon, which arrive from the decoder as
+    /// ~359.7°; carrying the corrected value would mean the correction had run
+    /// once on the main thread and would not run again in the worker, and
+    /// carrying the *rounded* value would fuse two cuts that the campaign's
+    /// measurement says must stay apart to 0.09°. Raw in, raw out, one
+    /// correction on each side of the port, applied to the same number.
+    ///
+    /// `None` when the scan's own cut table could not answer — an empty table
+    /// (a volume joined mid-flight, before its start chunk landed) or an
+    /// `elevation_number` that does not index it. The reconstruction then
+    /// rebuilds an **empty** cut table, so the sampler refuses the scan exactly
+    /// as it refuses the original. Faithful includes faithfully unusable: the
+    /// alternative is a ladder in the worker that the main thread would not
+    /// have built.
+    cut_angle_deg: Option<f64>,
     radials: Vec<RadialData>,
 }
 
@@ -179,6 +227,63 @@ impl RenderInput {
         storm_motion_override: Option<(f32, f32)>,
         env_heights_km_msl: Option<(f64, f64)>,
     ) -> Option<Self> {
+        Self::extract_with(
+            scan,
+            Scope::Tilt(elevation),
+            product,
+            radar_lat,
+            radar_lon,
+            storm_motion_override,
+            env_heights_km_msl,
+        )
+    }
+
+    /// The reachable subset of `scan` for a request that reads the **whole
+    /// volume** — a cross-section or a voxel grid — or `None` when the volume
+    /// carries the product's moment nowhere.
+    ///
+    /// The arguments [`extract`](Self::extract) takes and this one does not are
+    /// the ones that mean nothing here. There is no elevation because there is
+    /// no tilt: a section cuts across all of them. There is no storm motion
+    /// override and no environment because the only products that read either
+    /// are ones [`crate::sampler::samplable`] refuses outright — the two
+    /// velocity derivations, the hail pair and the classification — so carrying
+    /// them would make a section payload's bytes depend on caches no section
+    /// can consult.
+    ///
+    /// The stored elevation is [`NO_ELEVATION_DEG`], which is what makes this
+    /// safe to hand to a frame consumer by mistake: `render_from` runs
+    /// `find_sweep` against it, matches nothing, and answers `None` — "nothing
+    /// to draw", a state every path already handles — rather than silently
+    /// drawing the base tilt.
+    pub fn extract_volume(
+        scan: &Scan,
+        product: RadarProduct,
+        radar_lat: f64,
+        radar_lon: f64,
+    ) -> Option<Self> {
+        Self::extract_with(
+            scan,
+            Scope::Volume,
+            product,
+            radar_lat,
+            radar_lon,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn extract_with(
+        scan: &Scan,
+        scope: Scope,
+        product: RadarProduct,
+        radar_lat: f64,
+        radar_lon: f64,
+        storm_motion_override: Option<(f32, f32)>,
+        env_heights_km_msl: Option<(f64, f64)>,
+    ) -> Option<Self> {
+        let elevation = scope.elevation();
         let slot = product.moment_slot()?;
         // `None` for a Level III product: no Level II moment stands behind it,
         // so there is nothing to extract and nothing the renderer would draw.
@@ -189,23 +294,25 @@ impl RenderInput {
         // the live chunk feed narrows its download by the same predicate, and
         // a second copy of it here is how an SRV pane came to be handed a
         // volume the feed had skipped cuts of.
-        let whole_volume = product.reads_whole_volume();
+        //
+        // A `Scope::Volume` request widens it further, and by `||` rather than
+        // by replacing it: the six arms of `reads_whole_volume` are unchanged
+        // and still decide for every tilt-scoped request.
+        let whole_volume = scope == Scope::Volume || product.reads_whole_volume();
 
         // Only the HHC reads moments beyond its slot; everything else ships
         // the slot moment alone.
         let all_moments = product == RadarProduct::HydrometeorClassification;
+        let cuts = CutTable::of(scan);
         let sweeps = if whole_volume {
-            collect_sweeps(scan, slot, all_moments)
+            collect_sweeps(scan, &cuts, slot, all_moments)
         } else {
             // One sweep: whichever `find_sweep` would have chosen. Selecting
             // here, against the whole volume, is the point — the reconstructed
             // scan has only this sweep to offer, so `find_sweep` reaches it
             // again whatever its preference rules do.
-            vec![sweep_data(
-                crate::render::find_sweep(scan, product, elevation)?,
-                slot,
-                false,
-            )]
+            let sweep = crate::render::find_sweep_owner(scan, product, elevation)?;
+            vec![sweep_data(sweep, &cuts, slot, false)]
         };
         // `collect_sweeps` can come back empty on a volume that carries the
         // product nowhere. The renderer answers `None` for that, so this must
@@ -228,6 +335,7 @@ impl RenderInput {
                 // unrelated cache.
                 None
             },
+            vcp: scan.coverage_pattern().pattern_number().number(),
             sweeps,
         })
     }
@@ -263,10 +371,37 @@ impl RenderInput {
 
     /// A `Scan` holding exactly the extracted sweeps.
     ///
-    /// The coverage pattern is a placeholder: nothing on any render path reads
-    /// it, or the site, or a radial's timestamp, azimuth number, status or
-    /// elevation number. The moments are rebuilt from their fixed-point fields
-    /// and raw gate bytes, so they decode to the identical values.
+    /// Nothing on any render path reads the site, or a radial's timestamp,
+    /// azimuth number or status. The moments are rebuilt from their fixed-point
+    /// fields and raw gate bytes, so they decode to the identical values.
+    ///
+    /// # The coverage pattern is rebuilt, and it used to be a placeholder
+    ///
+    /// [`crate::sampler::VolumeSampler`] keys its tilt ladder on
+    /// `coverage_pattern().elevation_cuts()[sweep.elevation_number() - 1]`, a
+    /// rule settled by measurement over 203 volumes because **no angular
+    /// threshold can substitute for it**. Both halves of that expression used
+    /// to be broken here, in ways that do not announce themselves:
+    ///
+    /// * the cut table was empty, so nothing could be indexed at all; and
+    /// * `elevation_number` was the sweep's *index in the payload*, so the
+    ///   first sweep reported `0`, which cannot index a 1-based table.
+    ///
+    /// So the table is rebuilt from the angles the payload now carries, sized
+    /// to the largest elevation number in it, and each carried sweep's slot
+    /// holds the angle its own cut had. Slots no carried sweep names are filled
+    /// with a **copy of the nearest carried angle** rather than a sentinel:
+    /// they are unreachable from this scan's sweeps by construction, and a
+    /// `NaN` or a wild value sitting in a table someone later decides to scan
+    /// linearly is a landmine for no gain. Every other field of every cut is
+    /// left at a neutral default — the ladder reads the angle and nothing else,
+    /// and a fabricated SAILS flag would be a lie a consumer could act on.
+    ///
+    /// If any carried sweep has no cut angle (see
+    /// [`SweepData::cut_angle_deg`]), the table is rebuilt **empty**, which is
+    /// what the original looked like and what the sampler refuses. The
+    /// reconstruction is faithful, including when the thing it is faithful to
+    /// cannot be sampled.
     pub fn to_scan(&self) -> Scan {
         // Always `Some`: both constructors refuse a product with no Level II
         // field. Degrading to "no moments" rather than panicking keeps a
@@ -276,8 +411,7 @@ impl RenderInput {
         let sweeps = self
             .sweeps
             .iter()
-            .enumerate()
-            .map(|(si, sweep)| {
+            .map(|sweep| {
                 let radials = sweep
                     .radials
                     .iter()
@@ -302,7 +436,7 @@ impl RenderInput {
                             radial.azimuth,
                             radial.azimuth_spacing,
                             RadialStatus::Unknown(0),
-                            si as u8,
+                            sweep.elevation_number,
                             sweep.elevation_angle,
                             reflectivity,
                             velocity,
@@ -314,19 +448,186 @@ impl RenderInput {
                         )
                     })
                     .collect();
-                Sweep::new(si as u8, radials)
+                Sweep::new(sweep.elevation_number, radials)
             })
             .collect();
 
-        Scan::new(placeholder_coverage_pattern(), sweeps)
+        Scan::new(self.coverage_pattern(), sweeps)
     }
+
+    /// The coverage pattern [`to_scan`](Self::to_scan) rebuilds. See its doc
+    /// for why the table is sized this way and why the unclaimed slots are
+    /// filled the way they are.
+    fn coverage_pattern(&self) -> VolumeCoveragePattern {
+        // One missing angle is enough: a table with a hole in it would key some
+        // sweeps and mis-key the rest, which is worse than keying none.
+        let angles: Option<Vec<(usize, f64)>> = self
+            .sweeps
+            .iter()
+            .map(|s| {
+                let index = usize::from(s.elevation_number).checked_sub(1)?;
+                Some((index, s.cut_angle_deg?))
+            })
+            .collect();
+        let Some(angles) = angles else {
+            return placeholder_coverage_pattern(self.vcp);
+        };
+        let Some(len) = angles.iter().map(|(i, _)| i + 1).max() else {
+            // No sweeps at all. `extract_with` refuses that, so this is only
+            // reachable from a hand-built payload; an empty table is the honest
+            // answer and the sampler refuses it.
+            return placeholder_coverage_pattern(self.vcp);
+        };
+        let mut table = vec![None; len];
+        for (index, angle) in &angles {
+            table[*index] = Some(*angle);
+        }
+        // Unclaimed slots take the nearest claimed angle. Unreachable from this
+        // scan's sweeps either way; this keeps the table free of values a later
+        // linear scan would have to special-case.
+        let filler = angles[0].1;
+        let mut last = filler;
+        let cuts = table
+            .iter()
+            .map(|slot| {
+                last = slot.unwrap_or(last);
+                elevation_cut(last)
+            })
+            .collect();
+        VolumeCoveragePattern::new(
+            self.vcp,
+            0,
+            0.5,
+            PulseWidth::Unknown,
+            false,
+            0,
+            false,
+            0,
+            false,
+            false,
+            0,
+            false,
+            false,
+            cuts,
+        )
+    }
+}
+
+/// How much of the volume a request reads, and — for a tilt request — which
+/// tilt.
+///
+/// One private enum rather than an `Option<f32>` argument: "no elevation" and
+/// "elevation `None`" would be the same value with two meanings, and the
+/// second is not a state [`RenderInput::extract`] has.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Scope {
+    /// One tilt, chosen by `find_sweep` against this angle — unless the
+    /// product's own [`RadarProduct::reads_whole_volume`] widens it anyway.
+    Tilt(f32),
+    /// Every tilt carrying the moment, whatever the product says.
+    Volume,
+}
+
+impl Scope {
+    fn elevation(self) -> f32 {
+        match self {
+            Self::Tilt(elevation) => elevation,
+            Self::Volume => NO_ELEVATION_DEG,
+        }
+    }
+}
+
+/// The elevation an [`RenderInput::extract_volume`] payload carries: an angle
+/// no sweep can match.
+///
+/// It exists so that a whole-volume payload handed to a *frame* consumer —
+/// a section payload routed to a plan-view pane, say — answers `None` rather
+/// than quietly drawing whatever tilt happened to be nearest.
+///
+/// Two obvious choices are wrong, and both were considered:
+///
+/// * **`0.0` is not unmatchable.** `find_sweep` matches within
+///   `render::ELEVATION_WINDOW` of a sweep's *median*, and the settling drift
+///   this module already measures puts a real base tilt as low as 0.283°. A
+///   below-horizon cut goes lower still. `0.0` would find one.
+/// * **`NaN` breaks the type.** `RenderInput` derives `PartialEq`, and
+///   `NaN != NaN` would make a whole-volume payload unequal to itself — which
+///   is precisely the failure `CrossSection` and `VoxelGrid` hand-write their
+///   `PartialEq` to avoid, and which every round-trip assertion in this module
+///   would then fail on.
+///
+/// `-1000.0` is finite, orders of magnitude outside the ±90° an elevation can
+/// occupy at all, and survives the `f32` wire round trip exactly.
+pub const NO_ELEVATION_DEG: f32 = -1000.0;
+
+/// The scan's elevation cut angles, indexed the way a sweep's
+/// `elevation_number` indexes them.
+///
+/// Reading the table once per extraction rather than per sweep, because
+/// `elevation_cuts()` is a slice off the pattern and the pattern is behind two
+/// accessors.
+struct CutTable<'a> {
+    angles: &'a [ElevationCut],
+}
+
+impl<'a> CutTable<'a> {
+    fn of(scan: &'a Scan) -> Self {
+        Self {
+            angles: scan.coverage_pattern().elevation_cuts(),
+        }
+    }
+
+    /// The raw angle of the cut `elevation_number` names, or `None` when the
+    /// table cannot answer — see [`SweepData::cut_angle_deg`].
+    fn angle_for(&self, elevation_number: u8) -> Option<f64> {
+        let index = usize::from(elevation_number).checked_sub(1)?;
+        Some(self.angles.get(index)?.elevation_angle_degrees())
+    }
+}
+
+/// One reconstructed cut: the angle, and neutral values everywhere else.
+///
+/// The neutral values are not a guess at what the RDA sent. Nothing this crate
+/// has reads any other field of a cut, and inventing a plausible SAILS flag or
+/// PRF number would be a fabrication a future consumer could act on, where an
+/// obviously blank one is a gap it will notice.
+fn elevation_cut(elevation_angle_degrees: f64) -> ElevationCut {
+    ElevationCut::new(
+        elevation_angle_degrees,
+        ChannelConfiguration::Unknown,
+        WaveformType::Unknown,
+        0.0,
+        false,
+        false,
+        false,
+        false,
+        0,
+        0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        false,
+        0,
+        false,
+        0,
+        false,
+        false,
+    )
 }
 
 /// Every sweep whose first radial carries `slot`'s moment, in scan order.
 /// With `all_moments` (the HHC), a sweep carrying *any* moment qualifies —
 /// the split-cut Doppler halves carry no differential phase but donate the
 /// velocity the classification grafts in.
-fn collect_sweeps(scan: &Scan, slot: MomentSlot, all_moments: bool) -> Vec<SweepData> {
+fn collect_sweeps(
+    scan: &Scan,
+    cuts: &CutTable<'_>,
+    slot: MomentSlot,
+    all_moments: bool,
+) -> Vec<SweepData> {
     scan.sweeps()
         .iter()
         .filter_map(|sweep| {
@@ -337,7 +638,7 @@ fn collect_sweeps(scan: &Scan, slot: MomentSlot, all_moments: bool) -> Vec<Sweep
             } else {
                 slot.read(first).is_some()
             };
-            wanted.then(|| sweep_data(radials, slot, all_moments))
+            wanted.then(|| sweep_data(sweep, cuts, slot, all_moments))
         })
         .collect()
 }
@@ -358,7 +659,13 @@ const ALL_SLOTS: [MomentSlot; 6] = [
 /// `slot` comes from the caller rather than being probed off the radial: a
 /// merged upper tilt carries reflectivity *and* velocity, so "the first moment
 /// this radial has" would hand a reflectivity render the velocity gates.
-fn sweep_data(radials: &[Radial], slot: MomentSlot, all_moments: bool) -> SweepData {
+fn sweep_data(
+    sweep: &Sweep,
+    cuts: &CutTable<'_>,
+    slot: MomentSlot,
+    all_moments: bool,
+) -> SweepData {
+    let radials = sweep.radials();
     SweepData {
         // The sweep's **median**, and it has to be: `to_scan` stamps this one
         // value onto every reconstructed radial, so it is the median of the
@@ -372,6 +679,11 @@ fn sweep_data(radials: &[Radial], slot: MomentSlot, all_moments: bool) -> SweepD
         elevation_angle: crate::volumetric::sweep_elevation_deg(radials)
             .map(|e| e as f32)
             .unwrap_or(0.0),
+        // The **sweep's** number, not the first radial's and not the payload
+        // index. `Sweep::new` takes it separately from the radials, so the two
+        // are separate claims; the sampler reads this one.
+        elevation_number: sweep.elevation_number(),
+        cut_angle_deg: cuts.angle_for(sweep.elevation_number()),
         radials: radials
             .iter()
             .map(|radial| RadialData {
@@ -433,16 +745,21 @@ fn place_into(slots: &mut MomentSlots, slot: MomentSlot, moment: MomentData) {
     }
 }
 
-/// Nothing on a render path reads the coverage pattern, but `Scan::new`
-/// requires one. Pattern number 0 is not a real VCP, which is the point: a
-/// consumer that starts reading this sees an obviously synthetic value rather
-/// than a plausible wrong one.
+/// A pattern with **no cuts**, for a payload that could not carry them.
+///
+/// This is what [`to_scan`](RenderInput::to_scan) used to build for every
+/// payload, and now builds only for one that has no cut angles to rebuild from
+/// — which is the same shape `crate::chunks`' own placeholder has for a volume
+/// joined mid-flight, before its start chunk landed. An empty cut table is what
+/// [`crate::sampler::VolumeSampler`] refuses, and that refusal is the point:
+/// the original could not have been sampled either.
 ///
 /// `pub(crate)` so [`crate::render`]'s own tests can build a `Scan` without a
-/// second synthetic pattern that could drift from this one.
-pub(crate) fn placeholder_coverage_pattern() -> VolumeCoveragePattern {
+/// second synthetic pattern that could drift from this one. Pattern number 0 is
+/// not a real VCP, which is why it is the default the tests pass.
+pub(crate) fn placeholder_coverage_pattern(pattern_number: u16) -> VolumeCoveragePattern {
     VolumeCoveragePattern::new(
-        0,
+        pattern_number,
         0,
         0.0,
         PulseWidth::Unknown,
@@ -516,7 +833,14 @@ const MAGIC: [u8; 4] = *b"RDRI";
 /// moment of every tilt, so its payload carries them alongside the sweep's
 /// own moment, and it reads the same environmental heights the hail pair
 /// does.
-const FORMAT_VERSION: u16 = 5;
+/// Version 6 added the coverage pattern number, and each sweep's own
+/// `elevation_number` and VCP cut angle, when the volume sampler became
+/// reachable from a worker: those three are what let
+/// [`RenderInput::to_scan`] rebuild a cut table, and without them a
+/// reconstructed scan builds a *different tilt ladder* from the one the main
+/// thread built — silently, since neither half errors and neither produces a
+/// `NaN`.
+const FORMAT_VERSION: u16 = 6;
 
 impl RenderInput {
     /// Encode for transport. Little-endian throughout; gate blobs are copied
@@ -548,9 +872,18 @@ impl RenderInput {
             }
         }
 
+        out.extend_from_slice(&self.vcp.to_le_bytes());
         out.extend_from_slice(&(self.sweeps.len() as u32).to_le_bytes());
         for sweep in &self.sweeps {
             out.extend_from_slice(&sweep.elevation_angle.to_le_bytes());
+            out.push(sweep.elevation_number);
+            match sweep.cut_angle_deg {
+                None => out.push(0),
+                Some(angle) => {
+                    out.push(1);
+                    out.extend_from_slice(&angle.to_le_bytes());
+                }
+            }
             out.extend_from_slice(&(sweep.radials.len() as u32).to_le_bytes());
             for radial in &sweep.radials {
                 out.extend_from_slice(&radial.azimuth.to_le_bytes());
@@ -608,12 +941,19 @@ impl RenderInput {
             _ => return None,
         };
 
+        let vcp = r.u16()?;
         let sweep_count = r.u32()?;
         // A sweep costs at least its own header, so this bounds the count
         // against what is actually left rather than trusting it.
-        let mut sweeps = Vec::with_capacity(r.bounded(sweep_count, 8)?);
+        let mut sweeps = Vec::with_capacity(r.bounded(sweep_count, 10)?);
         for _ in 0..sweep_count {
             let elevation_angle = r.f32()?;
+            let elevation_number = r.u8()?;
+            let cut_angle_deg = match r.u8()? {
+                0 => None,
+                1 => Some(r.f64()?),
+                _ => return None,
+            };
             let radial_count = r.u32()?;
             let mut radials = Vec::with_capacity(r.bounded(radial_count, 9)?);
             for _ in 0..radial_count {
@@ -644,6 +984,8 @@ impl RenderInput {
             }
             sweeps.push(SweepData {
                 elevation_angle,
+                elevation_number,
+                cut_angle_deg,
                 radials,
             });
         }
@@ -658,6 +1000,7 @@ impl RenderInput {
             radar_lon,
             storm_motion_override,
             env_heights_km_msl,
+            vcp,
             sweeps,
         })
     }
@@ -678,20 +1021,23 @@ impl RenderInput {
             .sweeps
             .iter()
             .map(|s| {
-                8 + s
-                    .radials
-                    .iter()
-                    .map(|r| {
-                        10 + r.moment.as_ref().map_or(0, |m| 19 + m.gates.len())
-                            + r.extras
-                                .iter()
-                                .map(|(_, m)| 20 + m.gates.len())
-                                .sum::<usize>()
-                    })
-                    .sum::<usize>()
+                // 4 elevation angle + 1 elevation number + 1 cut-angle flag
+                // (+ 8 for the angle) + 4 radial count.
+                10 + if s.cut_angle_deg.is_some() { 8 } else { 0 }
+                    + s.radials
+                        .iter()
+                        .map(|r| {
+                            10 + r.moment.as_ref().map_or(0, |m| 19 + m.gates.len())
+                                + r.extras
+                                    .iter()
+                                    .map(|(_, m)| 20 + m.gates.len())
+                                    .sum::<usize>()
+                        })
+                        .sum::<usize>()
             })
             .sum();
-        header + motion + env + 4 + sweeps
+        // `+ 2` for the coverage pattern number, `+ 4` for the sweep count.
+        header + motion + env + 2 + 4 + sweeps
     }
 }
 
@@ -859,7 +1205,7 @@ mod tests {
     /// payload that guessed at which moment to carry.
     fn volume() -> Scan {
         Scan::new(
-            placeholder_coverage_pattern(),
+            placeholder_coverage_pattern(0),
             vec![
                 sweep(0.5, Some(&strong_refl), None),
                 sweep(0.5, Some(&weaker_refl), Some(&shear)),
@@ -1025,7 +1371,7 @@ mod tests {
     #[test]
     fn a_sweep_that_opened_off_its_tilt_still_renders_after_the_port() {
         let scan = Scan::new(
-            placeholder_coverage_pattern(),
+            placeholder_coverage_pattern(0),
             vec![settling_sweep(1, 0.68, 0.44)],
         );
         let product = RadarProduct::Reflectivity;
@@ -1137,13 +1483,335 @@ mod tests {
 
     /// `to_bytes` reserves exactly what it writes. Wrong by a little is only a
     /// realloc; wrong by a lot means the layout and the estimate have drifted.
+    ///
+    /// Both branches of the per-sweep cut angle have to be measured: the
+    /// `volume()` fixture has no cut table so every sweep writes the one-byte
+    /// absent form, and [`cut_table_volume`] has one so every sweep writes the
+    /// nine-byte present form. An estimate that had forgotten the angle
+    /// entirely would still match the first.
     #[test]
     fn the_encoded_length_estimate_is_exact() {
         let scan = volume();
         for product in [RadarProduct::Reflectivity, RadarProduct::NormalizedRotation] {
             let input = RenderInput::extract(&scan, 0.5, product, LAT, LON, None, None).unwrap();
+            assert!(
+                input.sweeps.iter().all(|s| s.cut_angle_deg.is_none()),
+                "precondition: this fixture is supposed to have no cut table",
+            );
             assert_eq!(input.encoded_len(), input.to_bytes().len(), "{product:?}");
         }
+
+        let scan = cut_table_volume();
+        for input in [
+            RenderInput::extract(&scan, 0.5, RadarProduct::Reflectivity, LAT, LON, None, None)
+                .unwrap(),
+            RenderInput::extract_volume(&scan, RadarProduct::Reflectivity, LAT, LON).unwrap(),
+        ] {
+            assert!(
+                input.sweeps.iter().all(|s| s.cut_angle_deg.is_some()),
+                "precondition: this fixture is supposed to have a cut table",
+            );
+            assert_eq!(input.encoded_len(), input.to_bytes().len());
+        }
+    }
+
+    /// One elevation cut, angle only — the reconstruction's own
+    /// [`elevation_cut`] under a name the fixtures read.
+    fn cut(angle_deg: f64) -> ElevationCut {
+        elevation_cut(angle_deg)
+    }
+
+    /// [`volume`], but flown under a VCP that declares its cuts — three
+    /// entries, and sweeps that name them 1, 2 and 3.
+    ///
+    /// The declared angles are deliberately **not** the medians: 0.48 against a
+    /// 0.5 median, 0.51 against a 0.5, 1.47 against a 1.5. That is what real
+    /// data looks like (measured medians sit up to 0.044° off the declared cut)
+    /// and it is what tells a reconstruction that carried the cut table apart
+    /// from one that re-derived it from the sweeps.
+    fn cut_table_volume() -> Scan {
+        let mut sweeps = vec![
+            sweep(0.5, Some(&strong_refl), None),
+            sweep(0.5, Some(&weaker_refl), Some(&shear)),
+            sweep(1.5, Some(&weaker_refl), Some(&shear)),
+        ];
+        for (i, s) in sweeps.iter_mut().enumerate() {
+            *s = Sweep::new(i as u8 + 1, s.radials().to_vec());
+        }
+        Scan::new(
+            VolumeCoveragePattern::new(
+                212,
+                0,
+                0.5,
+                PulseWidth::Short,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+                0,
+                false,
+                false,
+                vec![cut(0.48), cut(0.51), cut(1.47)],
+            ),
+            sweeps,
+        )
+    }
+
+    /// The reconstruction carries the ladder key, and carries it *raw*.
+    ///
+    /// Two fields, and both used to be wrong in ways nothing reported: the cut
+    /// table was empty, and `elevation_number` was the sweep's index in the
+    /// payload, so the first sweep claimed to be cut 0 — a number that cannot
+    /// index a 1-based table at all. `crate::sampler::VolumeSampler` reads both,
+    /// and the ladder it builds from them is not checkable against anything
+    /// once the sampler is gone.
+    #[test]
+    fn the_reconstruction_carries_the_cut_table_and_the_real_elevation_numbers() {
+        let scan = cut_table_volume();
+        let input = RenderInput::extract_volume(&scan, RadarProduct::Reflectivity, LAT, LON)
+            .expect("the fixture carries reflectivity");
+        let rebuilt = RenderInput::from_bytes(&input.to_bytes())
+            .expect("the payload round-trips")
+            .to_scan();
+
+        assert_eq!(
+            rebuilt
+                .sweeps()
+                .iter()
+                .map(Sweep::elevation_number)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the reconstructed sweeps do not name the cuts the originals named",
+        );
+        assert_eq!(
+            rebuilt
+                .coverage_pattern()
+                .elevation_cuts()
+                .iter()
+                .map(ElevationCut::elevation_angle_degrees)
+                .collect::<Vec<_>>(),
+            vec![0.48, 0.51, 1.47],
+            "the reconstructed cut table is not the original's",
+        );
+        assert_eq!(
+            rebuilt.coverage_pattern().pattern_number().number(),
+            212,
+            "a rebuilt cut table under a VCP number nobody flew is worse than \
+             no table at all",
+        );
+        // And the angles are the *declared* ones, not the sweeps' medians —
+        // which is the difference between carrying the table and re-deriving it.
+        assert!(
+            rebuilt
+                .coverage_pattern()
+                .elevation_cuts()
+                .iter()
+                .zip(rebuilt.sweeps())
+                .all(|(cut, sweep)| {
+                    let median =
+                        crate::volumetric::sweep_elevation_deg(sweep.radials()).unwrap_or_default();
+                    (cut.elevation_angle_degrees() - median).abs() > 1e-6
+                }),
+            "every reconstructed cut angle equals its sweep's median, so this \
+             test cannot tell a carried table from a re-derived one",
+        );
+    }
+
+    /// A cut below the horizon arrives from the decoder as ~359.7°, and the
+    /// sampler is what turns that into −0.3°.
+    ///
+    /// So the payload must carry it **uncorrected**: correcting it here would
+    /// mean the correction ran once on the main thread and not at all in the
+    /// worker, and the two would key that cut differently — 359.7° sorts to the
+    /// top of the ladder, −0.3° to the bottom.
+    #[test]
+    fn a_below_horizon_cut_travels_uncorrected() {
+        let scan = Scan::new(
+            VolumeCoveragePattern::new(
+                212,
+                0,
+                0.5,
+                PulseWidth::Short,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+                0,
+                false,
+                false,
+                vec![cut(359.7)],
+            ),
+            vec![Sweep::new(
+                1,
+                sweep(-0.3, Some(&strong_refl), None).radials().to_vec(),
+            )],
+        );
+        let input = RenderInput::extract_volume(&scan, RadarProduct::Reflectivity, LAT, LON)
+            .expect("the fixture carries reflectivity");
+        assert_eq!(input.sweeps[0].cut_angle_deg, Some(359.7));
+        assert_eq!(
+            input.to_scan().coverage_pattern().elevation_cuts()[0].elevation_angle_degrees(),
+            359.7,
+        );
+    }
+
+    /// A payload from a volume whose cut table could not answer rebuilds an
+    /// **empty** table rather than inventing one.
+    ///
+    /// That is what a volume joined mid-flight looks like — `crate::chunks`
+    /// stands in a pattern with no cuts until the start chunk lands — and the
+    /// sampler refuses it. Faithful includes faithfully unusable; the
+    /// alternative is a ladder in the worker the main thread would not have
+    /// built.
+    #[test]
+    fn a_payload_with_no_cut_angles_rebuilds_an_empty_table() {
+        let scan = volume();
+        let input = RenderInput::extract_volume(&scan, RadarProduct::Reflectivity, LAT, LON)
+            .expect("the fixture carries reflectivity");
+        assert!(input.sweeps.iter().all(|s| s.cut_angle_deg.is_none()));
+        assert!(
+            input
+                .to_scan()
+                .coverage_pattern()
+                .elevation_cuts()
+                .is_empty(),
+        );
+    }
+
+    /// `extract_volume` carries every tilt carrying the moment, whatever
+    /// [`RadarProduct::reads_whole_volume`] says about the product.
+    ///
+    /// Reflectivity is a one-sweep product — `a_plain_product_carries_one_sweep`
+    /// pins that for `extract` — so if the two constructors ever came to share
+    /// the tilt-scoped branch this would carry one sweep and a section would be
+    /// drawn from a single beam.
+    #[test]
+    fn extract_volume_carries_every_tilt_whatever_the_product_says() {
+        let scan = volume();
+        assert!(
+            !RadarProduct::Reflectivity.reads_whole_volume(),
+            "precondition: reflectivity became a whole-volume product, so this \
+             says nothing about the scope argument",
+        );
+        let input = RenderInput::extract_volume(&scan, RadarProduct::Reflectivity, LAT, LON)
+            .expect("the fixture carries reflectivity");
+        assert_eq!(input.sweeps.len(), scan.sweeps().len());
+        // And the widening is by `||`: a product that already read the whole
+        // volume still does.
+        let nrot = RenderInput::extract_volume(&scan, RadarProduct::NormalizedRotation, LAT, LON)
+            .expect("the fixture carries velocity");
+        assert_eq!(nrot.sweeps.len(), 2, "both velocity tilts still travel");
+    }
+
+    /// A whole-volume payload handed to a *frame* consumer draws nothing — the
+    /// state every render path already handles — rather than silently drawing
+    /// whichever tilt happened to be nearest.
+    #[test]
+    fn a_whole_volume_payload_renders_no_frame() {
+        let scan = cut_table_volume();
+        let input = RenderInput::extract_volume(&scan, RadarProduct::Reflectivity, LAT, LON)
+            .expect("the fixture carries reflectivity");
+        assert_eq!(input.elevation(), NO_ELEVATION_DEG);
+        assert!(
+            render_from(&input).is_none(),
+            "a section payload drew a plan-view frame",
+        );
+        // precondition: the payload is not empty, so what refuses above is the
+        // elevation and not a missing sweep.
+        assert_eq!(input.sweeps.len(), 3);
+    }
+
+    /// Why the sentinel is `-1000.0` and not either of the two obvious
+    /// alternatives.
+    ///
+    /// The bar is not "no sweep in some fixture matches it". `find_sweep`
+    /// accepts any sweep whose median is within
+    /// [`crate::render::ELEVATION_WINDOW`], so a sentinel is only safe if it
+    /// sits that far outside **every angle an antenna can point at** — the
+    /// payload can be built from any volume, and a sentinel that is merely
+    /// unusual is one a volume eventually walks onto.
+    ///
+    /// * `0.0` fails that outright: it is a legal elevation and a below-horizon
+    ///   cut is a real thing (the wrap correction in
+    ///   [`crate::sampler::VolumeSampler`] exists for exactly those). This test
+    ///   builds a sweep 0.05° above the horizon and shows `0.0` claims it.
+    /// * `NaN` fails differently: `RenderInput` derives `PartialEq`, so a
+    ///   whole-volume payload carrying one would be unequal to itself and every
+    ///   round-trip assertion in this module would fail on it — the failure
+    ///   `CrossSection` and `VoxelGrid` hand-write their `PartialEq` to avoid.
+    #[test]
+    fn the_sentinel_elevation_is_one_no_sweep_can_carry() {
+        let near_horizon = Scan::new(
+            placeholder_coverage_pattern(0),
+            vec![Sweep::new(
+                1,
+                sweep(0.05, Some(&strong_refl), None).radials().to_vec(),
+            )],
+        );
+        assert!(
+            crate::render::find_sweep(&near_horizon, RadarProduct::Reflectivity, 0.0).is_some(),
+            "0.0 is disqualified as a sentinel because a cut just above the \
+             horizon claims it — if this stops being true, say so here rather \
+             than quietly reverting the constant",
+        );
+        assert!(
+            crate::render::find_sweep(&near_horizon, RadarProduct::Reflectivity, NO_ELEVATION_DEG)
+                .is_none(),
+        );
+        // The general bar, rather than one fixture's worth of it: outside the
+        // window of every angle an antenna can point at.
+        assert!(
+            f64::from(NO_ELEVATION_DEG).abs() > 90.0 + crate::render::ELEVATION_WINDOW,
+            "{NO_ELEVATION_DEG} is inside the window of an angle a real \
+             antenna can reach",
+        );
+        assert!(
+            NO_ELEVATION_DEG.is_finite(),
+            "a NaN sentinel breaks the derived PartialEq",
+        );
+        // Finite and exactly representable, so it survives the f32 wire field.
+        let input =
+            RenderInput::extract_volume(&cut_table_volume(), RadarProduct::Reflectivity, LAT, LON)
+                .unwrap();
+        assert_eq!(
+            RenderInput::from_bytes(&input.to_bytes()).unwrap(),
+            input,
+            "a whole-volume payload is not equal to itself after the wire",
+        );
+    }
+
+    /// The version is a *number on the wire*, not merely a check that exists.
+    ///
+    /// Every other test here round-trips a payload through this build's own
+    /// codec, so all of them pass whatever the constant says — a version that
+    /// silently failed to bump when the layout changed would be invisible to
+    /// the entire module, and the two ends of a worker port are exactly where
+    /// that costs something. The literal below is the whole assertion: changing
+    /// the layout without changing it fails here.
+    #[test]
+    fn the_format_version_is_the_one_this_layout_ships() {
+        assert_eq!(FORMAT_VERSION, 6);
+        let bytes = RenderInput::extract(
+            &volume(),
+            0.5,
+            RadarProduct::Reflectivity,
+            LAT,
+            LON,
+            None,
+            None,
+        )
+        .unwrap()
+        .to_bytes();
+        assert_eq!(&bytes[..4], &MAGIC, "the magic moved");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            6,
+            "the version is not where a decoder from another build looks for it",
+        );
     }
 
     /// A merged tilt carries reflectivity *and* velocity. Reading "whichever
@@ -1152,7 +1820,7 @@ mod tests {
     #[test]
     fn a_tilt_carrying_both_moments_still_yields_the_requested_one() {
         let scan = Scan::new(
-            placeholder_coverage_pattern(),
+            placeholder_coverage_pattern(0),
             vec![sweep(0.5, Some(&strong_refl), Some(&shear))],
         );
         let input =
@@ -1187,7 +1855,7 @@ mod tests {
     #[test]
     fn every_product_carries_the_volume_exactly_when_it_says_it_reads_one() {
         let scan = Scan::new(
-            placeholder_coverage_pattern(),
+            placeholder_coverage_pattern(0),
             vec![
                 every_moment_tilt(0.5, 1),
                 every_moment_tilt(1.5, 2),
