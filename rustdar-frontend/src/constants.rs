@@ -418,4 +418,42 @@ mod tests {
         // rather than a grid bound that silently loosened.
         assert_eq!(WEBGL2_MAX_TEXTURE_DIMENSION_3D, 256);
     }
+
+    /// [`VOLUME_GRID_CELLS`] and `rustdar_radar::voxel`'s named shapes are two
+    /// hand-maintained copies of the same three triples, in two crates.
+    ///
+    /// The split is forced, not accidental: only *this* crate has a `build.rs`
+    /// emitting `mobile`, so only this crate can pick the middle arm — while
+    /// the grid is *built* in `rustdar-radar`, which therefore has to name all
+    /// three as plain constants and let a caller choose. `voxel::default_shape`
+    /// says as much and deliberately cannot return the mobile one.
+    ///
+    /// Two copies that agree today is exactly the shape of the
+    /// `needs_whole_volume` / `RenderInput::extract` divergence this campaign
+    /// already paid for once, where the copies were "obviously" the same until
+    /// one of them was not. They agree; this is what keeps them agreeing, and
+    /// it checks **all three** arms rather than only the one this target
+    /// compiles, because the arm a host build skips is the one nothing else
+    /// would catch.
+    #[test]
+    fn the_grid_dimensions_match_the_shapes_rustdar_radar_names() {
+        use rustdar_radar::voxel::{DESKTOP_SHAPE, LUT_LEN, MOBILE_SHAPE, VoxelShape, WASM_SHAPE};
+
+        let triple = |s: VoxelShape| [s.nx as u32, s.ny as u32, s.nz as u32];
+        assert_eq!(triple(WASM_SHAPE), [128, 128, 64]);
+        assert_eq!(triple(MOBILE_SHAPE), [192, 192, 96]);
+        assert_eq!(triple(DESKTOP_SHAPE), [256, 256, 128]);
+
+        // And that this target's arm is the matching one.
+        #[cfg(target_arch = "wasm32")]
+        assert_eq!(VOLUME_GRID_CELLS, triple(WASM_SHAPE));
+        #[cfg(all(not(target_arch = "wasm32"), mobile))]
+        assert_eq!(VOLUME_GRID_CELLS, triple(MOBILE_SHAPE));
+        #[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+        assert_eq!(VOLUME_GRID_CELLS, triple(DESKTOP_SHAPE));
+
+        // The table travels *inside* the grid, so its size is one number in
+        // two places too.
+        assert_eq!(VOLUME_LUT_BYTES, LUT_LEN);
+    }
 }
