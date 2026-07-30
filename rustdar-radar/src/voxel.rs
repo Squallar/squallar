@@ -958,9 +958,11 @@ mod tests {
     //  * fields vary along **both** azimuth and range, because a field
     //    constant along range cannot tell a half-cell offset from a correct
     //    one;
-    //  * and there is always a sharp data / no-data edge, because a fixture
-    //    where every voxel has data cannot test the boundary behaviour that
-    //    motivates the whole encoding decision.
+    //  * and the boundary fixtures plant a **sharp echo edge** — below
+    //    threshold on one side, 65 dBZ on the other — because a fixture where
+    //    every voxel has data cannot test the behaviour that motivates the
+    //    whole encoding decision. The tests that need one assert that it is
+    //    there before relying on it.
 
     const REFL_SCALE: f32 = 2.0;
     const REFL_OFFSET: f32 = 66.0;
