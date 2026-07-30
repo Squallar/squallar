@@ -7,17 +7,48 @@ use rustdar_units::{HailSizeUnit, UserPreferences};
 use std::collections::HashMap;
 use std::f64::consts::PI;
 
+/// The wasm32 side length, named **outside** the [`IMAGE_SIZE`] cascade so that
+/// it is reachable from a host build's tests.
+///
+/// A `cfg`-selected literal can only be checked by the target that compiles it,
+/// and this workspace runs `cargo test` on exactly one of the two arms. Spelt as
+/// a literal inside the cascade this value was free: an audit changed it to 4096
+/// on a pristine tree and watched the whole workspace pass 1508/0 with
+/// `cargo check --target wasm32-unknown-unknown` exiting 0 — while 4096 is twice
+/// the largest 2D texture WebGL2 guarantees, so every browser render would have
+/// failed. Both arms now have names, so both arms can be asserted.
+pub const WASM_IMAGE_SIZE: usize = 1024;
+
+/// The native side length. See [`WASM_IMAGE_SIZE`].
+pub const NATIVE_IMAGE_SIZE: usize = 2048;
+
+/// The largest 2D texture WebGL2 — and so a browser — is *guaranteed* to accept
+/// per axis.
+///
+/// Written here rather than derived from wgpu because this crate has no wgpu
+/// dependency and must not grow one: it is the rasterizer, and it hands finished
+/// RGBA buffers to a caller that owns the GPU. `rustdar-frontend`'s
+/// `the_web_image_fits_the_texture_size_webgl2_guarantees` checks this figure
+/// against `wgpu::Limits::downlevel_webgl2_defaults()` from the crate that does
+/// have wgpu, so the number cannot drift away from wgpu's own.
+pub const WEBGL2_MAX_TEXTURE_DIMENSION_2D: usize = 2048;
+
 /// Side length, in pixels, of the square radar image every render produces.
 /// An RGBA texture is `IMAGE_SIZE² × 4` bytes; a static pane render keeps an
 /// `f32` value grid alongside it, doubling that.
 ///
 /// wasm32 halves the side: WebGL2 only guarantees
-/// `max_texture_dimension_2d == 2048`, so a 2048² frame sits exactly on the
-/// limit with nothing spare for the overlay textures beside it.
+/// `max_texture_dimension_2d == 2048` ([`WEBGL2_MAX_TEXTURE_DIMENSION_2D`]), so
+/// a 2048² frame sits exactly on the limit with nothing spare for the overlay
+/// textures beside it.
+///
+/// The two arms select between [`WASM_IMAGE_SIZE`] and [`NATIVE_IMAGE_SIZE`]
+/// rather than repeating their literals, so the *selection* is the only thing
+/// here a host build cannot check.
 #[cfg(target_arch = "wasm32")]
-pub const IMAGE_SIZE: usize = 1024;
+pub const IMAGE_SIZE: usize = WASM_IMAGE_SIZE;
 #[cfg(not(target_arch = "wasm32"))]
-pub const IMAGE_SIZE: usize = 2048;
+pub const IMAGE_SIZE: usize = NATIVE_IMAGE_SIZE;
 
 pub const MAX_RANGE_KM: f64 = 230.0; // NEXRAD max range ~230km
 pub const PIXELS_PER_KM: f64 = IMAGE_SIZE as f64 / (2.0 * MAX_RANGE_KM);
@@ -767,6 +798,86 @@ impl RadarProduct {
 mod tests {
     use super::*;
     use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
+
+    /// **Both** arms of the [`IMAGE_SIZE`] cascade, unconditionally.
+    ///
+    /// The arm a host build does not compile is the one nothing else would
+    /// catch: the audit that prompted this changed the wasm literal from 1024 to
+    /// 4096 on a pristine tree and the whole workspace passed 1508/0 with the
+    /// wasm `cargo check` exiting 0. `sampler.rs`'s
+    /// `the_cos_e_correction_diverges_from_the_plan_view_by_a_measured_amount`
+    /// looks like it covers this and does not — its `if cfg!(…)` picks the
+    /// running target's literal, so the other one is dead text.
+    ///
+    /// Every property here is one the render path depends on, not a restatement
+    /// of the literals for its own sake; the literals are pinned separately at
+    /// the end so that editing a value *and* its consequences in step still has
+    /// to be deliberate.
+    #[test]
+    fn both_image_size_arms_are_pinned_not_just_the_compiled_one() {
+        // The web arm has to leave room *beside* the radar frame for the overlay
+        // textures, which is the stated reason it halves; native allocates its
+        // frame on a real GPU and is only checked against the same floor for
+        // symmetry.
+        for (target, size, wants_overlay_room) in [
+            ("wasm32", WASM_IMAGE_SIZE, true),
+            ("native", NATIVE_IMAGE_SIZE, false),
+        ] {
+            // `render::project` indexes `py * IMAGE_SIZE + px` into a single
+            // allocation and `ImageBounds` divides the extent by it, so zero is
+            // a division by zero before it is an empty image.
+            assert!(size > 0, "{target}");
+            // The projection assumes a power of two; `constants.rs` asserts the
+            // same thing at compile time for whichever arm it compiled.
+            assert!(size.is_power_of_two(), "{target}: {size}");
+            // A browser may legitimately report exactly the WebGL2 guarantee, so
+            // *both* arms have to fit it — the web one with room to spare,
+            // because the overlay textures sit alongside the radar frame in the
+            // same budget. This is the assertion the 4096 mutation trips.
+            let needed = if wants_overlay_room { size * 2 } else { size };
+            assert!(
+                needed <= WEBGL2_MAX_TEXTURE_DIMENSION_2D,
+                "the {target} image is {size} px and needs {needed} px of the \
+                 {WEBGL2_MAX_TEXTURE_DIMENSION_2D} px 2D texture size WebGL2 guarantees"
+            );
+        }
+
+        // The web arm halves the side, which quarters the RGBA texture. That
+        // ratio is what `LOOP_TEXTURE_BUDGET_BYTES`' 4 MiB-vs-16 MiB frame
+        // figures are computed from, so it is a relation and not a coincidence.
+        assert_eq!(NATIVE_IMAGE_SIZE, WASM_IMAGE_SIZE * 2);
+
+        assert_eq!(WASM_IMAGE_SIZE, 1024);
+        assert_eq!(NATIVE_IMAGE_SIZE, 2048);
+        assert_eq!(WEBGL2_MAX_TEXTURE_DIMENSION_2D, 2048);
+
+        // And that this target's cascade selected the matching arm. This half
+        // *is* `cfg`-gated, because the selection is the one thing here that no
+        // other target can check on its behalf.
+        #[cfg(target_arch = "wasm32")]
+        assert_eq!(IMAGE_SIZE, WASM_IMAGE_SIZE);
+        #[cfg(not(target_arch = "wasm32"))]
+        assert_eq!(IMAGE_SIZE, NATIVE_IMAGE_SIZE);
+    }
+
+    /// The derived geometry moves with whichever arm was selected.
+    ///
+    /// `PIXELS_PER_KM` is the whole rasterizer's scale factor — `render::project`
+    /// and `sampler`'s section geometry both go through it — so a changed
+    /// `IMAGE_SIZE` that left this stale would misplace every pixel rather than
+    /// resize the image. Written as the ratio rather than as a number so it
+    /// cannot be satisfied by a literal that happens to match today.
+    #[test]
+    fn pixels_per_km_follows_the_selected_image_size() {
+        assert_eq!(PIXELS_PER_KM, IMAGE_SIZE as f64 / (2.0 * MAX_RANGE_KM));
+        // Both arms land on a usable scale: the coarser of the two still puts
+        // more than two pixels on a kilometre, which is what makes a 250 m gate
+        // land in its own pixel rather than being dropped.
+        for size in [WASM_IMAGE_SIZE, NATIVE_IMAGE_SIZE] {
+            let scale = size as f64 / (2.0 * MAX_RANGE_KM);
+            assert!(scale > 2.0, "{size} px gives {scale:.3} px/km");
+        }
+    }
 
     /// A volume with no sweeps — enough to build a `ScanInfo`, and the strongest
     /// form of the case below: no product can be *discovered* from it.
