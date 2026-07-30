@@ -587,10 +587,15 @@ fn the_worker_reply_writes_every_field_on_every_arm() {
         .expect("post_result no longer matches on the result")
         .0;
     for field in [
-        "proto::IMAGE",
-        "proto::VALUES",
-        "proto::MAX_RANGE",
-        "proto::OUT",
+        // Matched **with the trailing comma**, because `proto::OUT` is a prefix
+        // of `proto::OUT_KIND`: without it, deleting the `OUT` default outright
+        // still satisfied this loop, which is exactly how that mutation
+        // survived this test's first draft.
+        "proto::IMAGE,",
+        "proto::VALUES,",
+        "proto::MAX_RANGE,",
+        "proto::OUT,",
+        "proto::OUT_KIND,",
     ] {
         assert!(
             defaults.contains(field),
@@ -599,9 +604,4 @@ fn the_worker_reply_writes_every_field_on_every_arm() {
              null answer from a lost one"
         );
     }
-    assert!(
-        defaults.contains("proto::OUT_KIND"),
-        "the out-kind tag is not defaulted, so a reply could carry a payload \
-         with no decoder named"
-    );
 }
