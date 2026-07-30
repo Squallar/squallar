@@ -449,6 +449,39 @@ mod tests {
         assert_eq!(uniform.box_from_clip, IDENTITY);
     }
 
+    /// The default light really does come from above and from the left.
+    ///
+    /// Added after both minus signs in `DEFAULT_LIGHT_DIR` survived a mutation
+    /// pass: `the_defaults_are_a_marchable_configuration` only asks that the
+    /// vector is not all zeroes, which a light shining up from underneath the
+    /// storm satisfies. That is not a crash and not a NaN — it is a volume
+    /// whose overshooting tops read as dents, which is the failure this
+    /// convention exists to avoid.
+    ///
+    /// Box space is z-up, and x/y run east and north, so "up and over the
+    /// viewer's left shoulder" is `z > 0` with `x < 0` and `y < 0`.
+    #[test]
+    fn the_default_light_comes_from_above_and_over_the_left_shoulder() {
+        let [x, y, z] = DEFAULT_LIGHT_DIR;
+        assert!(
+            z > 0.0,
+            "the default light shines from below (z = {z}), so an overshooting \
+             top would be shaded like a dent"
+        );
+        assert!(
+            x < 0.0 && y < 0.0,
+            "the default light no longer comes over the viewer's left shoulder \
+             (x = {x}, y = {y})"
+        );
+        // Not normalised — the shader does that — but it must not be so short
+        // that it is indistinguishable from the zero vector after normalising.
+        let magnitude = (x * x + y * y + z * z).sqrt();
+        assert!(
+            magnitude > 0.5,
+            "the default light vector is {magnitude} long"
+        );
+    }
+
     /// The empty-cell threshold selects index 0 and nothing else.
     ///
     /// The shader skips a cell when `index > threshold` is false, and an

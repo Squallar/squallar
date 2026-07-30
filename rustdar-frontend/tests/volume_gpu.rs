@@ -43,7 +43,7 @@ use egui_wgpu::wgpu;
 use rustdar_frontend::constants::VOLUME_LUT_BYTES;
 use rustdar_frontend::egui_renderer::AttachmentConfig;
 use rustdar_frontend::volume::raymarch::{
-    ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, VolumePipelines,
+    ENTRY_FS_BLIT_GAMMA, ENTRY_FS_BLIT_LINEAR, OffscreenTarget, VolumePipelines,
 };
 use rustdar_frontend::volume::uniform::VolumeUniform;
 
@@ -267,8 +267,19 @@ fn raymarch_once(
     let volume = pipelines
         .upload_volume(device, queue, cells, indices, lut)
         .expect("the grid and palette were refused");
+    assert_eq!(
+        volume.cells(),
+        cells,
+        "the uploaded grid does not report the shape it was given, so the \
+         uniform block's grid_dims would describe a different texture"
+    );
     volume.write_uniform(queue, uniform);
     let target = pipelines.create_offscreen(device, size);
+    assert_eq!(
+        target.size(),
+        size,
+        "the offscreen does not report the size it was created at"
+    );
 
     let mut encoder = device.create_command_encoder(&Default::default());
     pipelines.encode_raymarch(&mut encoder, &target, &volume);
@@ -320,6 +331,54 @@ fn the_pipelines_build_on_a_real_device() {
         };
         assert_eq!(pipelines.blit_entry_point(), expected);
     }
+}
+
+/// An offscreen is reused at the same size and rebuilt at a new one.
+///
+/// `ensure_offscreen` needs a device, so no host test can reach it — and its
+/// two failure modes are both quiet. Always rebuilding churns a pane-sized
+/// texture at the frame rate, which looks like a driver problem rather than an
+/// application one. Never rebuilding blits a stale texture at the wrong scale
+/// after a resize, which looks like a camera bug.
+///
+/// ```text
+/// cargo test -p rustdar-frontend --test volume_gpu \
+///     an_offscreen_is_reused_at_one_size_and_rebuilt_at_another \
+///     -- --ignored --exact --nocapture
+/// ```
+#[test]
+#[ignore = "needs a real wgpu adapter; see the doc comment for the invocation"]
+fn an_offscreen_is_reused_at_one_size_and_rebuilt_at_another() {
+    let _serialised = gpu_lock();
+    let (device, queue) = device();
+    let pipelines = VolumePipelines::new(&device, attachments(wgpu::TextureFormat::Bgra8Unorm));
+    pipelines.upload_quad(&queue);
+
+    let mut held: Option<OffscreenTarget> = None;
+    assert!(
+        pipelines.ensure_offscreen(&device, &mut held, [1440, 900]),
+        "nothing held must be built"
+    );
+    assert_eq!(held.as_ref().map(OffscreenTarget::size), Some([1440, 900]));
+
+    assert!(
+        !pipelines.ensure_offscreen(&device, &mut held, [1440, 900]),
+        "an offscreen of exactly the right size was thrown away and rebuilt, \
+         which is a pane-sized allocation on every frame"
+    );
+    assert_eq!(held.as_ref().map(OffscreenTarget::size), Some([1440, 900]));
+
+    assert!(
+        pipelines.ensure_offscreen(&device, &mut held, [720, 450]),
+        "a resized pane reused its old offscreen, so the blit would upscale \
+         the wrong texture"
+    );
+    assert_eq!(held.as_ref().map(OffscreenTarget::size), Some([720, 450]));
+
+    // A pane dragged to nothing: the clamp is what stops `create_texture`
+    // refusing a zero extent, from a call with no `Result`.
+    assert!(pipelines.ensure_offscreen(&device, &mut held, [0, 0]));
+    assert_eq!(held.as_ref().map(OffscreenTarget::size), Some([1, 1]));
 }
 
 /// A grid of one palette index paints that entry's own colour back out.
