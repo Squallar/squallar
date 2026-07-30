@@ -41,7 +41,11 @@
 //! along an axis spanning `(lo, hi)` over `n` cells sits at
 //! `lo + (i + 0.5)·(hi − lo)/n`. All six range bounds plus [`VoxelGrid::site`]
 //! travel in the output, so a renderer builds its model matrix from the grid
-//! alone and looks nothing up.
+//! alone and looks nothing up. So do [`VoxelGrid::tilt_count`] and
+//! [`VoxelGrid::widest_tilt_gap_deg`], for the same reason one level up: the
+//! grid crosses the worker boundary and the sampler does not, so without them
+//! nothing downstream can tell a volume off a 16-rung ladder from one off a
+//! 3-rung ladder that interpolated a smooth layer into a 6° gap.
 //!
 //! `z` is **MSL**, because a 3D scene shares one vertical datum with terrain
 //! and with every other overlay. The sampler's heights are above the antenna,
