@@ -1026,6 +1026,289 @@ pub fn build_voxels(scan: &Scan, req: &VoxelRequest, lat: f64, lon: f64) -> Opti
     })
 }
 
+// ── Codec ────────────────────────────────────────────────────────────────────
+//
+// The payload type owns its codec; the job framing that carries it lives in
+// `rustdar-frontend`'s `offload`. That split is `render_input`'s, kept for the
+// reason it was made there: a grid that can encode itself can be put on a
+// message port, in an IndexedDB blob or in a test fixture without any of the
+// three learning its layout, and there is one place where the layout is
+// written down.
+//
+// So the frame is self-delimiting and self-describing — its own magic, its own
+// version, its own lengths — rather than relying on the envelope to say how
+// long it is or what it is. An envelope that had to know would be a second
+// description of this layout.
+
+/// Identifies a voxel payload, so a message that is not one fails on its first
+/// four bytes instead of being read as a wildly-sized allocation.
+///
+/// Distinct from `render_input`'s `RDRI` and `xsect`'s `RDXS` on purpose: all
+/// three travel over the same port, and a job that carried the wrong one has
+/// to fail here rather than deep inside a decode that happens to line up.
+const MAGIC: [u8; 4] = *b"RDVX";
+
+/// Bumped whenever the layout below changes. The two ends of a worker boundary
+/// can be different builds — see `rustdar-web`'s build-token handshake — so a
+/// mismatch has to be a clean `None`, not a misparse.
+const FORMAT_VERSION: u16 = 1;
+
+impl VoxelGrid {
+    /// Encode for transport. Little-endian throughout; the index plane and the
+    /// colour table are copied verbatim, and the index plane is where nearly
+    /// all the bytes are — 8 MiB at [`DESKTOP_SHAPE`], against 104 bytes of
+    /// everything else.
+    ///
+    /// The value plane is written as raw `f32` bit patterns, which is what
+    /// makes the round trip mean anything: this type's [`PartialEq`] compares
+    /// that plane **bitwise**, so two `NaN`s with different payloads are two
+    /// different grids, and an encoder that normalised them would be caught by
+    /// its own equality.
+    ///
+    /// The optional plane is a `u32` count and then the data, with `0` for
+    /// "absent". That encoding is unambiguous only because
+    /// [`VoxelShape::is_supported`] requires every axis to be at least 1 and
+    /// so guarantees [`VoxelShape::cells`] is at least 1 — a zero-cell shape
+    /// would make "no plane" and "a plane of nothing" the same bytes.
+    /// `a_supported_shape_always_has_a_cell_so_an_absent_plane_is_unambiguous`
+    /// is what holds that.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.encoded_len());
+        out.extend_from_slice(&MAGIC);
+        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        out.extend_from_slice(&self.product.wire_code().to_le_bytes());
+
+        out.extend_from_slice(&(self.shape.nx as u32).to_le_bytes());
+        out.extend_from_slice(&(self.shape.ny as u32).to_le_bytes());
+        out.extend_from_slice(&(self.shape.nz as u32).to_le_bytes());
+
+        for (lo, hi) in [self.x_range_km, self.y_range_km, self.z_range_km_msl] {
+            out.extend_from_slice(&lo.to_le_bytes());
+            out.extend_from_slice(&hi.to_le_bytes());
+        }
+        out.extend_from_slice(&self.site.0.to_le_bytes());
+        out.extend_from_slice(&self.site.1.to_le_bytes());
+        out.extend_from_slice(&self.value_range.0.to_le_bytes());
+        out.extend_from_slice(&self.value_range.1.to_le_bytes());
+
+        // A `u32` for a `usize` field. The ladder has one rung per elevation
+        // the volume flew — a couple of dozen on the longest operational VCP,
+        // and the model numbers its cuts in a `u8` — so there is no reachable
+        // count this narrows.
+        out.extend_from_slice(&(self.tilt_count as u32).to_le_bytes());
+        out.extend_from_slice(&self.widest_tilt_gap_deg.to_le_bytes());
+
+        out.extend_from_slice(&(self.lut.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.lut);
+        out.extend_from_slice(&(self.indices.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.indices);
+        match &self.values {
+            None => out.extend_from_slice(&0u32.to_le_bytes()),
+            Some(values) => {
+                out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+                for value in values {
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// Decode a payload [`to_bytes`](Self::to_bytes) produced.
+    ///
+    /// `None` on anything malformed. Every length is checked against what
+    /// remains before it is used, so a corrupt frame cannot ask for a large
+    /// allocation, and nothing is assembled into a `VoxelGrid` until all of
+    /// these have passed:
+    ///
+    /// * wrong magic, or a version this build does not speak;
+    /// * a product wire code this build does not have, or one it has but
+    ///   cannot resample — the same [`samplable`] refusal [`build_voxels`]
+    ///   makes, so the wire and the builder accept the same set of grids;
+    /// * a shape with an axis outside `1..=`[`MAX_AXIS`]
+    ///   ([`VoxelShape::is_supported`], *read* rather than restated);
+    /// * an index plane that is not [`VoxelShape::cells`] long, a table that
+    ///   is not exactly [`LUT_LEN`], or a value plane that is neither absent
+    ///   nor exactly `cells` long;
+    /// * truncation anywhere, or trailing bytes.
+    ///
+    /// The plane lengths are the ones that would be silent rather than loud.
+    /// Every accessor on this type indexes with an offset computed from the
+    /// *shape* — [`cell_offset`](Self::cell_offset) bounds-checks against
+    /// `nx`, `ny`, `nz` and then indexes the plane — so a shape that claims
+    /// more cells than the plane holds panics in [`index_at`](Self::index_at)
+    /// and [`value_at`](Self::value_at), on whatever thread is drawing. A
+    /// shape claiming fewer would instead upload a truncated texture and paint
+    /// a volume with a corner missing. Both are refused here.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        if r.take(4)? != MAGIC {
+            return None;
+        }
+        if r.u16()? != FORMAT_VERSION {
+            return None;
+        }
+        let product = RadarProduct::from_wire_code(r.u16()?)?;
+        // The same refusal `build_voxels` makes. A payload naming a product
+        // with no native moment has no ramp `value_range` could have come
+        // from, so its indices would decode to numbers in units nothing
+        // measures.
+        samplable(product)?;
+
+        let shape = VoxelShape {
+            nx: r.u32()? as usize,
+            ny: r.u32()? as usize,
+            nz: r.u32()? as usize,
+        };
+        // Before `cells()`, which multiplies three untrusted numbers: with
+        // every axis at or under `MAX_AXIS` the product is at most 16.7 M and
+        // cannot overflow, and with a zero axis it would be a plane length of
+        // zero that every later check then agreed with.
+        if !shape.is_supported() {
+            return None;
+        }
+        let cells = shape.cells();
+
+        let x_range_km = (r.f64()?, r.f64()?);
+        let y_range_km = (r.f64()?, r.f64()?);
+        let z_range_km_msl = (r.f64()?, r.f64()?);
+        let site = (r.f64()?, r.f64()?);
+        let value_range = (r.f32()?, r.f32()?);
+        let tilt_count = r.u32()? as usize;
+        let widest_tilt_gap_deg = r.f64()?;
+
+        // One byte per element on both of these, so `take` is the bound: it
+        // can only hand back a slice that is really there, and nothing is
+        // reserved on the claimed length before that.
+        let lut_len = r.u32()?;
+        let lut = r.take(lut_len as usize)?.to_vec();
+        if lut.len() != LUT_LEN {
+            return None;
+        }
+        let index_len = r.u32()?;
+        let indices = r.take(index_len as usize)?.to_vec();
+        if indices.len() != cells {
+            return None;
+        }
+
+        // Four bytes per element, so the claimed count is measured against
+        // what remains *before* it becomes a capacity — a believed `u32::MAX`
+        // would otherwise reserve 16 GiB and then fail the read. Bounding
+        // first also means the absent/present discrimination below is made on
+        // a count that could physically be there.
+        let value_len = r.u32()?;
+        let value_len = r.bounded(value_len, 4)?;
+        let values = match value_len {
+            // `is_supported` put at least one cell in the grid, so zero can
+            // only mean "no plane" and never "a plane the size of the grid".
+            0 => None,
+            n if n == cells => {
+                let mut values = Vec::with_capacity(n);
+                for _ in 0..n {
+                    values.push(r.f32()?);
+                }
+                Some(values)
+            }
+            // Any other length is a plane that does not describe this grid.
+            // Accepting one would leave `value_at` indexing it with an offset
+            // computed from the shape.
+            _ => return None,
+        };
+
+        // Trailing bytes mean the two ends disagree about the layout even
+        // though the version matched. Better to refuse than to raymarch half a
+        // volume from it.
+        if !r.at_end() {
+            return None;
+        }
+        Some(Self {
+            indices,
+            values,
+            lut,
+            shape,
+            x_range_km,
+            y_range_km,
+            z_range_km_msl,
+            site,
+            value_range,
+            product,
+            tilt_count,
+            widest_tilt_gap_deg,
+        })
+    }
+
+    /// What [`to_bytes`](Self::to_bytes) will write, exactly.
+    ///
+    /// Exactly, not approximately: a grid is 8 MiB of indices and up to 32 MiB
+    /// of values at [`DESKTOP_SHAPE`], and a reallocation partway through
+    /// copies all of it. Wrong by a little is only that copy; wrong by a lot
+    /// means the layout and the estimate have drifted, which
+    /// `the_encoded_length_of_a_grid_is_exact` is what catches.
+    fn encoded_len(&self) -> usize {
+        // Magic, version, product, three axes, three ranges, the site, the
+        // value range, the tilt count and the widest gap.
+        let header = 4 + 2 + 2 + 3 * 4 + 3 * 16 + 16 + 8 + 4 + 8;
+        header
+            + (4 + self.lut.len())
+            + (4 + self.indices.len())
+            + (4 + self.values.as_ref().map_or(0, |v| v.len() * 4))
+    }
+}
+
+/// A bounds-checked cursor. Every accessor returns `None` rather than
+/// panicking, because the bytes come off a message port and are not trusted.
+///
+/// A private copy of `render_input`'s, deliberately rather than a shared one.
+/// It is thirty lines with no state beyond an offset, and the alternative —
+/// a public type, or a fourth crate for it — would make the byte layout of
+/// three payloads depend on one shared decoder's idea of what a `u32` is.
+/// Each module owning its own reader is what lets each own its own format.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, at: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.at.checked_add(n)?;
+        let slice = self.bytes.get(self.at..end)?;
+        self.at = end;
+        Some(slice)
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn f32(&mut self) -> Option<f32> {
+        Some(f32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn f64(&mut self) -> Option<f64> {
+        Some(f64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    /// `count` as a capacity, refused if the buffer cannot possibly hold that
+    /// many items of `min_size` bytes each. Keeps a corrupt length from
+    /// reserving gigabytes before the read fails.
+    fn bounded(&self, count: u32, min_size: usize) -> Option<usize> {
+        let count = count as usize;
+        (count.checked_mul(min_size)? <= self.bytes.len() - self.at).then_some(count)
+    }
+
+    fn at_end(&self) -> bool {
+        self.at == self.bytes.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3047,5 +3330,480 @@ mod tests {
             assert_eq!(sample.value(), None, "{status:?}");
             assert_eq!(ramp_index(range, sample.value_or_nan()), NO_DATA_INDEX);
         }
+    }
+
+    // ── The wire codec ──────────────────────────────────────────────────────
+
+    /// Where the three trailing planes' length prefixes sit in an encoded
+    /// grid: after the 104-byte header, then after each preceding plane.
+    ///
+    /// Written out here rather than taken from the encoder, so a layout change
+    /// that moved a field has to be made in both places — the mutations these
+    /// offsets support are the whole point of the tests below, and an offset
+    /// derived from the code under test would follow it wherever it went.
+    /// `the_length_prefixes_are_where_the_tests_think_they_are` checks them.
+    const HEADER_BYTES: usize = 4 + 2 + 2 + 3 * 4 + 3 * 16 + 16 + 8 + 4 + 8;
+    /// The first axis of the shape, so a test can plant an unsupported one.
+    const SHAPE_AT: usize = 4 + 2 + 2;
+    const LUT_LEN_AT: usize = HEADER_BYTES;
+    const INDEX_LEN_AT: usize = LUT_LEN_AT + 4 + LUT_LEN;
+
+    fn value_len_at(cells: usize) -> usize {
+        INDEX_LEN_AT + 4 + cells
+    }
+
+    fn prefix_at(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"))
+    }
+
+    /// A grid with a real echo edge in it, on the deliberately-asymmetric
+    /// [`ODD`] shape, and with the value plane present.
+    fn wire_fixture() -> VoxelGrid {
+        let scan = scan_of(&|az, slant| (az < 120.0 && slant < 90.0).then_some(48.0));
+        build_voxels(&scan, &request(ODD), SITE.0, SITE.1).expect("the fixture grid builds")
+    }
+
+    /// The "no value plane" encoding is unambiguous only because a supported
+    /// shape has at least one cell — otherwise `0` would mean both "absent"
+    /// and "as many values as this grid has cells".
+    ///
+    /// A claim about [`VoxelShape::is_supported`] rather than about the codec,
+    /// which is why it is asserted over the boundary and the named shapes
+    /// rather than over one fixture.
+    #[test]
+    fn a_supported_shape_always_has_a_cell_so_an_absent_plane_is_unambiguous() {
+        let smallest = VoxelShape {
+            nx: 1,
+            ny: 1,
+            nz: 1,
+        };
+        for shape in [smallest, ODD, WASM_SHAPE, MOBILE_SHAPE, DESKTOP_SHAPE] {
+            assert!(shape.is_supported(), "{shape:?}");
+            assert!(
+                shape.cells() >= 1,
+                "{shape:?} is supported but has no cells, so an absent value \
+                 plane and a full one encode to the same four bytes",
+            );
+        }
+        // And the reason it holds: a zero axis is not supported in the first
+        // place, on any of the three.
+        for zeroed in [
+            VoxelShape { nx: 0, ..smallest },
+            VoxelShape { ny: 0, ..smallest },
+            VoxelShape { nz: 0, ..smallest },
+        ] {
+            assert!(!zeroed.is_supported(), "{zeroed:?}");
+            assert_eq!(zeroed.cells(), 0);
+        }
+    }
+
+    /// The three offsets the mutation tests below index by are the three the
+    /// encoder actually wrote.
+    ///
+    /// Every refusal test plants a value at one of them, so an offset that had
+    /// drifted would leave those tests corrupting a byte of some other field
+    /// and passing for the wrong reason — the classic way a suite of negative
+    /// assertions goes green while testing nothing.
+    #[test]
+    fn the_length_prefixes_are_where_the_tests_think_they_are() {
+        let grid = wire_fixture();
+        let bytes = grid.to_bytes();
+        let cells = ODD.cells();
+        assert_eq!(prefix_at(&bytes, SHAPE_AT), ODD.nx as u32);
+        assert_eq!(prefix_at(&bytes, SHAPE_AT + 4), ODD.ny as u32);
+        assert_eq!(prefix_at(&bytes, SHAPE_AT + 8), ODD.nz as u32);
+        assert_eq!(prefix_at(&bytes, LUT_LEN_AT), LUT_LEN as u32);
+        assert_eq!(prefix_at(&bytes, INDEX_LEN_AT), cells as u32);
+        assert_eq!(prefix_at(&bytes, value_len_at(cells)), cells as u32);
+        assert_eq!(bytes.len(), value_len_at(cells) + 4 + cells * 4);
+    }
+
+    /// A real grid survives the wire, for every moment, with and without the
+    /// value plane.
+    ///
+    /// This is what [`VoxelGrid`]'s hand-written `PartialEq` was written for:
+    /// the value plane is `NaN` wherever the radar did not reach, which on a
+    /// cube over a cone is most of it, and under derived semantics
+    /// `assert_eq!` here would fail on a byte-identical payload with nothing
+    /// in the message saying why.
+    #[test]
+    fn a_grid_round_trips_through_its_wire_form() {
+        let scan = six_moment_scan();
+        for product in SAMPLABLE {
+            for values_wanted in [true, false] {
+                let req = VoxelRequest {
+                    product,
+                    values_wanted,
+                    ..request(ODD)
+                };
+                let grid = build_voxels(&scan, &req, SITE.0, SITE.1)
+                    .unwrap_or_else(|| panic!("{} builds", product.name()));
+                let what = format!("{} values={values_wanted}", product.name());
+
+                if values_wanted {
+                    // precondition: without a NaN in the plane the round trip
+                    // would pass under a derived `PartialEq` too, and the
+                    // claim about the codec would be weaker than it looks.
+                    assert!(
+                        grid.values().unwrap().iter().any(|v| v.is_nan()),
+                        "{what}: the value plane has no NaN in it",
+                    );
+                    assert!(
+                        grid.values().unwrap().iter().any(|v| v.is_finite()),
+                        "{what}: the value plane has no numbers in it",
+                    );
+                }
+
+                let decoded = VoxelGrid::from_bytes(&grid.to_bytes())
+                    .unwrap_or_else(|| panic!("{what} did not decode"));
+                assert_eq!(grid, decoded, "{what} changed in transit");
+                // The absent plane is a state of its own and has to survive as
+                // one: `Some(vec![NaN; cells])` compares unequal to `None`, so
+                // this is not implied by the assertion above, but stating it
+                // says which way round the failure would be.
+                assert_eq!(
+                    decoded.values().is_some(),
+                    values_wanted,
+                    "{what}: the value plane's presence did not survive",
+                );
+                assert_eq!(decoded.product(), product, "{what}");
+                assert_eq!(decoded.shape(), ODD, "{what}");
+                assert_eq!(decoded.lut(), grid.lut(), "{what}");
+                assert_eq!(decoded.tilt_count(), grid.tilt_count(), "{what}");
+                // And re-encoding is byte-identical, which says more than
+                // equality does: `PartialEq` compares the value plane bitwise,
+                // but an encoder that reordered two fields of equal width
+                // would still satisfy it.
+                assert_eq!(grid.to_bytes(), decoded.to_bytes(), "{what}");
+            }
+        }
+
+        // The comparison is not vacuous: two grids that differ decode to two
+        // grids that differ, in the plane, in the shape and in the box.
+        let a = build_voxels(&scan, &request(ODD), SITE.0, SITE.1).unwrap();
+        let elsewhere = build_voxels(
+            &scan,
+            &VoxelRequest {
+                half_width_km: 61.0,
+                ..request(ODD)
+            },
+            SITE.0,
+            SITE.1,
+        )
+        .unwrap();
+        let lean = build_voxels(
+            &scan,
+            &VoxelRequest {
+                values_wanted: false,
+                ..request(ODD)
+            },
+            SITE.0,
+            SITE.1,
+        )
+        .unwrap();
+        for (name, other) in [("a different box", &elsewhere), ("no value plane", &lean)] {
+            assert_ne!(
+                VoxelGrid::from_bytes(&a.to_bytes()).unwrap(),
+                VoxelGrid::from_bytes(&other.to_bytes()).unwrap(),
+                "{name} decoded to the same grid",
+            );
+        }
+    }
+
+    /// `to_bytes` reserves exactly what it writes. A grid is up to 40 MiB, so
+    /// a wrong estimate is a copy of all of it.
+    #[test]
+    fn the_encoded_length_of_a_grid_is_exact() {
+        let scan = six_moment_scan();
+        // Both plane states and two shapes, so the estimate is pinned against
+        // more than one total — the optional plane is the term most likely to
+        // be dropped from it.
+        for shape in [
+            ODD,
+            VoxelShape {
+                nx: 4,
+                ny: 5,
+                nz: 3,
+            },
+        ] {
+            for values_wanted in [true, false] {
+                let req = VoxelRequest {
+                    values_wanted,
+                    shape,
+                    ..request(shape)
+                };
+                let grid = build_voxels(&scan, &req, SITE.0, SITE.1).unwrap();
+                assert_eq!(
+                    grid.encoded_len(),
+                    grid.to_bytes().len(),
+                    "{shape:?} values={values_wanted}",
+                );
+            }
+        }
+    }
+
+    /// The bytes arrive off a message port. Every malformed shape has to be a
+    /// clean `None` — the two ends of that port can be different builds.
+    #[test]
+    fn a_malformed_grid_payload_is_refused_rather_than_misread() {
+        let grid = wire_fixture();
+        let good = grid.to_bytes();
+        let cells = ODD.cells();
+        let values_prefix_at = value_len_at(cells);
+
+        assert!(VoxelGrid::from_bytes(&[]).is_none(), "empty");
+        assert!(VoxelGrid::from_bytes(b"nope").is_none(), "wrong magic");
+
+        // A **whole** payload relabelled, including with the two magics that
+        // share this port. Mutation testing is why: a four-byte buffer cannot
+        // pin the magic test, because it fails on the version read instead —
+        // deleting the magic comparison outright left every short-buffer
+        // assertion here green, and a section frame would then have been
+        // decoded as a grid.
+        for wrong in [*b"nope", *b"RDRI", *b"RDXS"] {
+            let mut relabelled = good.clone();
+            relabelled[..4].copy_from_slice(&wrong);
+            assert!(
+                VoxelGrid::from_bytes(&relabelled).is_none(),
+                "a whole payload labelled {} decoded as a grid",
+                String::from_utf8_lossy(&wrong),
+            );
+        }
+
+        let mut wrong_version = good.clone();
+        wrong_version[4] = 0xFF;
+        wrong_version[5] = 0xFF;
+        assert!(
+            VoxelGrid::from_bytes(&wrong_version).is_none(),
+            "an unknown version decoded",
+        );
+
+        // A product code this build does not have, and one it has but cannot
+        // resample. The second is the interesting half: `RadarProduct` knows
+        // what VIL is, so only the `samplable` refusal stops a payload whose
+        // `value_range` came from no moment's ramp.
+        let mut unknown_product = good.clone();
+        unknown_product[6..8].copy_from_slice(&0xFFFEu16.to_le_bytes());
+        assert!(
+            VoxelGrid::from_bytes(&unknown_product).is_none(),
+            "an unknown product code decoded",
+        );
+        let mut underivable = good.clone();
+        underivable[6..8].copy_from_slice(
+            &RadarProduct::VerticallyIntegratedLiquid
+                .wire_code()
+                .to_le_bytes(),
+        );
+        assert!(
+            samplable(RadarProduct::VerticallyIntegratedLiquid).is_none(),
+            "precondition: VIL became samplable, so this is no longer the \
+             refusal this assertion is about",
+        );
+        assert!(
+            VoxelGrid::from_bytes(&underivable).is_none(),
+            "a product with no native moment decoded",
+        );
+
+        // An axis outside `1..=MAX_AXIS`, on each of the three, at both ends.
+        for axis in 0..3 {
+            for bad in [0u32, (MAX_AXIS + 1) as u32, u32::MAX] {
+                let mut broken = good.clone();
+                broken[SHAPE_AT + axis * 4..SHAPE_AT + axis * 4 + 4]
+                    .copy_from_slice(&bad.to_le_bytes());
+                assert!(
+                    VoxelGrid::from_bytes(&broken).is_none(),
+                    "axis {axis} of {bad} decoded",
+                );
+            }
+        }
+        // A *supported* shape that is not the one the planes are sized for is
+        // refused too, and by the plane checks rather than by `is_supported` —
+        // this is the cross-build case, since the three named shapes differ.
+        let mut reshaped = good.clone();
+        reshaped[SHAPE_AT..SHAPE_AT + 4].copy_from_slice(&((ODD.nx + 1) as u32).to_le_bytes());
+        assert!(
+            VoxelGrid::from_bytes(&reshaped).is_none(),
+            "a shape claiming more cells than the index plane holds decoded — \
+             every accessor indexes that plane with an offset from the shape",
+        );
+
+        // An unsupported shape whose planes **agree** with it, so nothing but
+        // `is_supported` can object. Mutation testing needs these two: every
+        // bad-axis assertion above is caught downstream by the index-plane
+        // length instead, and deleting `is_supported` from `from_bytes`
+        // altogether left all of them green.
+        //
+        // Zero is the dangerous half, and it is why `is_supported` refuses a
+        // zero axis rather than yielding an empty grid: without the guard this
+        // frame decodes into a grid of no cells, whose extents a renderer
+        // divides by a zero dimension to get an infinity, and which is
+        // indistinguishable from a volume with nothing in it.
+        for axis in 0..3 {
+            let mut empty = good[..INDEX_LEN_AT].to_vec();
+            empty[SHAPE_AT + axis * 4..SHAPE_AT + axis * 4 + 4]
+                .copy_from_slice(&0u32.to_le_bytes());
+            // Both planes sized to match `cells() == 0`: none, and absent.
+            empty.extend_from_slice(&0u32.to_le_bytes());
+            empty.extend_from_slice(&0u32.to_le_bytes());
+            assert!(
+                VoxelGrid::from_bytes(&empty).is_none(),
+                "axis {axis} of zero decoded into a grid with no cells",
+            );
+        }
+
+        // And the other end, past `MAX_AXIS`, again with planes to match: one
+        // axis at the GLES 3.0 guarantee, bumped one over it, and both planes
+        // grown by the one cell that implies.
+        let tall = VoxelShape {
+            nx: MAX_AXIS,
+            ny: 1,
+            nz: 1,
+        };
+        let over_shape = build_voxels(&scan_of(&|_, _| Some(40.0)), &request(tall), SITE.0, SITE.1)
+            .expect("a shape at the guarantee builds");
+        let mut over = over_shape.to_bytes();
+        let tall_cells = tall.cells();
+        over[SHAPE_AT..SHAPE_AT + 4].copy_from_slice(&((MAX_AXIS + 1) as u32).to_le_bytes());
+        over[INDEX_LEN_AT..INDEX_LEN_AT + 4]
+            .copy_from_slice(&((tall_cells + 1) as u32).to_le_bytes());
+        over.insert(INDEX_LEN_AT + 4 + tall_cells, NO_DATA_INDEX);
+        // The insert above pushed the value prefix along by that one byte.
+        let moved = value_len_at(tall_cells) + 1;
+        over[moved..moved + 4].copy_from_slice(&((tall_cells + 1) as u32).to_le_bytes());
+        over.extend_from_slice(&f32::NAN.to_le_bytes());
+        assert!(
+            VoxelGrid::from_bytes(&over).is_none(),
+            "an axis of {} — one over the GLES 3.0 guarantee — decoded, with \
+             planes sized to agree with it",
+            MAX_AXIS + 1,
+        );
+
+        for cut in [
+            1,
+            8,
+            SHAPE_AT,
+            HEADER_BYTES,
+            LUT_LEN_AT + 4,
+            INDEX_LEN_AT,
+            INDEX_LEN_AT + 4,
+            values_prefix_at,
+            values_prefix_at + 4,
+            good.len() / 2,
+            good.len() - 1,
+        ] {
+            assert!(
+                VoxelGrid::from_bytes(&good[..cut]).is_none(),
+                "truncated to {cut} bytes",
+            );
+        }
+
+        let mut trailing = good.clone();
+        trailing.push(0);
+        assert!(
+            VoxelGrid::from_bytes(&trailing).is_none(),
+            "trailing bytes mean the layouts disagree",
+        );
+
+        // A length that cannot fit in what remains, on each of the three
+        // planes. The value plane is the one that matters: four bytes an
+        // element, so a believed `u32::MAX` reserves 16 GiB before the read
+        // fails.
+        for (name, at) in [
+            ("table", LUT_LEN_AT),
+            ("index", INDEX_LEN_AT),
+            ("value", values_prefix_at),
+        ] {
+            let mut absurd = good.clone();
+            absurd[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(
+                VoxelGrid::from_bytes(&absurd).is_none(),
+                "an absurd {name} plane length reached a read",
+            );
+        }
+
+        // Each plane one element short of what the shape declares, with its
+        // prefix moved to match, so the frame is well-formed right through to
+        // `at_end` and only the plane check can object.
+        for (name, at, element) in [
+            ("table", LUT_LEN_AT, 1usize),
+            ("index", INDEX_LEN_AT, 1),
+            ("value", values_prefix_at, 4),
+        ] {
+            let mut short = good.clone();
+            let count = prefix_at(&short, at) as usize;
+            let plane_end = at + 4 + count * element;
+            short[at..at + 4].copy_from_slice(&((count - 1) as u32).to_le_bytes());
+            short.drain(plane_end - element..plane_end);
+            assert!(
+                VoxelGrid::from_bytes(&short).is_none(),
+                "a {name} plane one element short decoded",
+            );
+        }
+
+        // A value plane that is neither absent nor the size of the grid. One
+        // element is the shape a sender that meant "no plane" but wrote a
+        // sentinel would produce, and it must not be read as either.
+        let mut one_value = good.clone();
+        one_value.truncate(values_prefix_at + 4 + 4);
+        one_value[values_prefix_at..values_prefix_at + 4].copy_from_slice(&1u32.to_le_bytes());
+        assert!(
+            VoxelGrid::from_bytes(&one_value).is_none(),
+            "a one-element value plane decoded",
+        );
+
+        // Absent, on the other hand, is a state: zero and nothing after it is
+        // the encoding `values_wanted: false` produces, and it decodes.
+        let mut absent = good.clone();
+        absent.truncate(values_prefix_at + 4);
+        absent[values_prefix_at..values_prefix_at + 4].copy_from_slice(&0u32.to_le_bytes());
+        let decoded = VoxelGrid::from_bytes(&absent)
+            .expect("a grid with no value plane is a grid, not a malformed one");
+        assert_eq!(decoded.values(), None);
+        assert_eq!(decoded.indices(), grid.indices());
+
+        // precondition: the fixture the mutations were made against decodes,
+        // so every refusal above is the mutation's doing and not the
+        // fixture's.
+        assert_eq!(
+            VoxelGrid::from_bytes(&good).expect("the unmutated payload decodes"),
+            grid,
+        );
+        assert!(
+            VoxelGrid::from_bytes(&over_shape.to_bytes()).is_some(),
+            "precondition: the shape-at-the-guarantee payload does not decode \
+             unmutated either, so the assertion about it says nothing",
+        );
+    }
+
+    /// The capacity guard, tested directly, because nothing end to end can
+    /// see it.
+    ///
+    /// [`Reader::bounded`] does not change *what* [`VoxelGrid::from_bytes`]
+    /// answers. `take` bounds every read, so a believed length fails on the
+    /// read either way and the payload is refused with or without it. What it
+    /// changes is whether four billion elements are reserved **first** — a
+    /// 16 GiB allocation on the way to a `None`, on a worker thread, in a
+    /// browser tab. Mutation testing confirms the gap rather than assuming it:
+    /// deleting the call from `from_bytes` leaves the whole suite green, which
+    /// is why the helper is named and pinned here instead.
+    #[test]
+    fn the_capacity_guard_refuses_a_length_the_buffer_cannot_hold() {
+        let bytes = [0u8; 16];
+        let r = Reader::new(&bytes);
+        assert_eq!(r.bounded(4, 4), Some(4), "16 bytes hold four f32");
+        assert_eq!(r.bounded(0, 4), Some(0));
+        assert_eq!(r.bounded(5, 4), None, "20 bytes claimed from 16");
+        assert_eq!(r.bounded(u32::MAX, 4), None, "16 GiB claimed from 16 bytes");
+
+        // It measures against what is *left*, not against the whole buffer —
+        // otherwise a length prefix late in a frame would be judged against
+        // bytes already consumed.
+        let mut part_way = Reader::new(&bytes);
+        part_way.take(8).expect("half the buffer");
+        assert_eq!(part_way.bounded(2, 4), Some(2));
+        assert_eq!(part_way.bounded(3, 4), None);
+
+        // And the multiply cannot overflow into a pass.
+        assert_eq!(Reader::new(&bytes).bounded(u32::MAX, usize::MAX), None);
     }
 }

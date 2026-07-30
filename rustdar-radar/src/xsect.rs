@@ -265,6 +265,37 @@ pub struct SectionAxes {
 }
 
 impl SectionAxes {
+    /// Whether every number here is finite.
+    ///
+    /// [`render_section`] guarantees it — the request-shape refusals up front
+    /// are what buy it, and `every_axis_number_of_a_rendered_section_is_finite`
+    /// pins it — but a set of axes that arrived over a wire has had no such
+    /// pass made over it, so [`CrossSection::from_parts`] makes one. What a
+    /// non-finite axis costs is not a panic but silence: the two mapping
+    /// functions above are affine in these fields, so a `NaN` `top_km_msl`
+    /// makes **every** row height and every column distance `NaN`, and a
+    /// consumer that converts a pointer position into a height and a distance
+    /// then formats `NaN km MSL` into a readout, or draws an axis tick at a
+    /// coordinate that is not a number and gets nothing. An infinite
+    /// `length_km` is the same shape of failure in the other mapping.
+    ///
+    /// [`tilt_count`](Self::tilt_count) is a `usize` and has no non-finite
+    /// value to have; every other field is an `f64` and is checked.
+    fn all_finite(self) -> bool {
+        [
+            self.length_km,
+            self.base_km_msl,
+            self.top_km_msl,
+            self.near_ground_range_km,
+            self.far_ground_range_km,
+            self.coverage_ground_range_km,
+            self.cone_of_silence_km,
+            self.widest_tilt_gap_deg,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+    }
+
     /// The height, km MSL, of the centre of row `row`.
     ///
     /// **Row 0 is the top.** Extrapolates outside `0..SECTION_HEIGHT` rather
@@ -359,12 +390,38 @@ impl CrossSection {
     /// Reassemble a section from planes that crossed a boundary — the worker
     /// wire, a cache, a test.
     ///
-    /// `None` unless all three planes are exactly the size this build's
-    /// [`SECTION_WIDTH`] × [`SECTION_HEIGHT`] demands **and** every status byte
-    /// is one this build knows. The second check is not pedantry: a payload
-    /// from a newer sender carries status codes this build cannot name, and
-    /// [`sample`](Self::sample) would otherwise have to invent an answer for
-    /// one. Refusing here keeps every accessor total.
+    /// Four refusals, and every one of them is about a section that arrived
+    /// from somewhere this build does not control:
+    ///
+    /// * **A plane that is not exactly this build's [`SECTION_WIDTH`] ×
+    ///   [`SECTION_HEIGHT`].** Not a recoverable error anywhere downstream:
+    ///   `rustdar-frontend`'s `app_render::apply_render_to_pane` builds a
+    ///   `ColorImage` from a buffer and a size, and the length check is
+    ///   `epaint`'s own `assert_eq!` inside `ColorImage::from_rgba_unmultiplied`
+    ///   (`epaint-0.35.0/src/image.rs:114`), on the **main thread**, live in
+    ///   release, where under wasm it takes the whole app down. It is also the
+    ///   ordinary shape of a cross-build payload: this constant is 2048 native
+    ///   and 1024 on wasm.
+    /// * **A status byte this build cannot name.** That is what a payload from
+    ///   a newer sender looks like, and [`sample`](Self::sample) would
+    ///   otherwise have to invent an answer for one. Refusing keeps every
+    ///   accessor total.
+    /// * **A non-finite axis** — see [`SectionAxes::all_finite`] for what one
+    ///   costs, which is a readout full of `NaN` rather than a crash.
+    /// * **A pixel whose status is [`SampleStatus::Value`] but whose value is
+    ///   not finite.** The bar is `is_finite`, not `!is_nan`, and deliberately:
+    ///   an infinity passes every `is_nan` test, reaches
+    ///   [`crate::get_color_for_value`] as a number, compares as larger than
+    ///   every threshold and paints the top of the scale — so a section
+    ///   carrying one looks like the strongest echo in the volume rather than
+    ///   like corruption. `NaN` at least paints nothing. Both are refused.
+    ///
+    /// The last of these is the pairing the whole status plane exists to keep
+    /// straight, and [`render_section`] never breaks it — every writer of the
+    /// two planes goes through one [`Sample`], and
+    /// `the_three_planes_agree_everywhere` sweeps a whole raster to say so.
+    /// It is checkable only here because only here can the two planes have
+    /// come from different senders.
     pub fn from_parts(
         image: Vec<u8>,
         values: Vec<f32>,
@@ -375,10 +432,17 @@ impl CrossSection {
         if image.len() != pixels * 4 || values.len() != pixels || status.len() != pixels {
             return None;
         }
-        if !status
-            .iter()
-            .all(|&code| SampleStatus::from_wire_code(code).is_some())
-        {
+        if !axes.all_finite() {
+            return None;
+        }
+        // One pass over the two planes that have to agree with each other, so
+        // the unknown-code test and the value-pairing test cannot drift apart
+        // into two walks with two different ideas of which pixel is which.
+        let planes_agree = status.iter().zip(&values).all(|(&code, &value)| {
+            SampleStatus::from_wire_code(code)
+                .is_some_and(|status| status != SampleStatus::Value || value.is_finite())
+        });
+        if !planes_agree {
             return None;
         }
         Some(Self {
@@ -712,6 +776,224 @@ fn section_color(product: RadarProduct, sample: Sample) -> (u8, u8, u8, u8) {
         return crate::palette::RANGE_FOLDED;
     }
     crate::get_color_for_value(product, sample.value_or_nan())
+}
+
+// ── Codec ────────────────────────────────────────────────────────────────────
+//
+// The payload type owns its codec; the job framing that carries it lives in
+// `rustdar-frontend`'s `offload`. That split is `render_input`'s, kept for the
+// reason it was made there: a section that can encode itself can be put on a
+// message port, in an IndexedDB blob or in a test fixture without any of the
+// three learning its layout, and there is one place where the layout is
+// written down.
+//
+// So the frame is self-delimiting and self-describing — its own magic, its own
+// version, its own lengths — rather than relying on the envelope to say how
+// long it is or what it is. An envelope that had to know would be a second
+// description of this layout.
+
+/// Identifies a section payload, so a message that is not one fails on its
+/// first four bytes instead of being read as a wildly-sized allocation.
+///
+/// Distinct from `render_input`'s `RDRI` on purpose: the two travel over the
+/// same port, and a job that carried the wrong one has to fail here rather
+/// than deep inside a decode that happens to line up.
+const MAGIC: [u8; 4] = *b"RDXS";
+
+/// Bumped whenever the layout below changes. The two ends of a worker boundary
+/// can be different builds — see `rustdar-web`'s build-token handshake — so a
+/// mismatch has to be a clean `None`, not a misparse.
+const FORMAT_VERSION: u16 = 1;
+
+impl CrossSection {
+    /// Encode for transport. Little-endian throughout; the image and status
+    /// planes are copied verbatim, which is where nearly all the bytes are.
+    ///
+    /// The value plane is written as raw `f32` bit patterns, so a `NaN` keeps
+    /// the payload it arrived with. That matters for what the round trip can
+    /// claim: [`PartialEq`] ignores a value under a non-`Value` status, so
+    /// equality would survive a lossier encoding, but a **byte** comparison of
+    /// two encodings of the same section would not.
+    ///
+    /// A raster is a fixed size on any one build, so the three length prefixes
+    /// are not needed to find the end of a plane — they are here to name the
+    /// size the *sender* used. A payload encoded by the 1024-wide wasm build
+    /// and decoded by the 2048-wide native one is the ordinary case, and it
+    /// has to be refused by [`from_bytes`](Self::from_bytes) rather than read
+    /// as a truncation of something else.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.encoded_len());
+        out.extend_from_slice(&MAGIC);
+        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+
+        let axes = &self.axes;
+        for number in [
+            axes.length_km,
+            axes.base_km_msl,
+            axes.top_km_msl,
+            axes.near_ground_range_km,
+            axes.far_ground_range_km,
+            axes.coverage_ground_range_km,
+            axes.cone_of_silence_km,
+        ] {
+            out.extend_from_slice(&number.to_le_bytes());
+        }
+        // A `u32` for a `usize` field. The ladder has one rung per elevation
+        // the volume flew — a couple of dozen on the longest operational VCP,
+        // and the model numbers its cuts in a `u8` — so there is no reachable
+        // count this narrows. `the_encoded_length_estimate_is_exact` would not
+        // catch a truncation here, but nothing can produce one.
+        out.extend_from_slice(&(axes.tilt_count as u32).to_le_bytes());
+        out.extend_from_slice(&axes.widest_tilt_gap_deg.to_le_bytes());
+
+        out.extend_from_slice(&(self.image.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.image);
+        out.extend_from_slice(&(self.values.len() as u32).to_le_bytes());
+        for value in &self.values {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.status.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.status);
+        out
+    }
+
+    /// Decode a payload [`to_bytes`](Self::to_bytes) produced.
+    ///
+    /// `None` on anything malformed — wrong magic, unknown version, truncation,
+    /// trailing bytes, a plane sized for a different build's raster, a status
+    /// code this build does not have, a non-finite axis, a `Value` pixel with
+    /// no finite number. Every length is checked against what remains before
+    /// it is used, so a corrupt frame cannot ask for a large allocation.
+    ///
+    /// The plane checks are **read** rather than restated: everything past the
+    /// framing goes through [`from_parts`](Self::from_parts), which is where a
+    /// section arriving from anywhere is validated. A second copy of those
+    /// rules here is how the wire and the constructor would come to disagree
+    /// about which sections are acceptable.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut r = Reader::new(bytes);
+        if r.take(4)? != MAGIC {
+            return None;
+        }
+        if r.u16()? != FORMAT_VERSION {
+            return None;
+        }
+
+        // Written in `SectionAxes`' declaration order, which is the order
+        // `to_bytes` wrote them in: a struct literal evaluates its fields in
+        // the order they appear here, so the two lists have to stay aligned
+        // and are kept adjacent for that reason.
+        let axes = SectionAxes {
+            length_km: r.f64()?,
+            base_km_msl: r.f64()?,
+            top_km_msl: r.f64()?,
+            near_ground_range_km: r.f64()?,
+            far_ground_range_km: r.f64()?,
+            coverage_ground_range_km: r.f64()?,
+            cone_of_silence_km: r.f64()?,
+            tilt_count: r.u32()? as usize,
+            widest_tilt_gap_deg: r.f64()?,
+        };
+
+        // One byte per element, so `take` is the bound: it can only hand back
+        // a slice that is really there, and nothing is reserved on the claimed
+        // length before that.
+        let image_len = r.u32()?;
+        let image = r.take(image_len as usize)?.to_vec();
+
+        // Four bytes per element, so the claimed count has to be measured
+        // against what remains before it becomes a capacity — `u32::MAX` here
+        // would otherwise reserve 16 GiB and then fail the read.
+        let value_len = r.u32()?;
+        let mut values = Vec::with_capacity(r.bounded(value_len, 4)?);
+        for _ in 0..value_len {
+            values.push(r.f32()?);
+        }
+
+        let status_len = r.u32()?;
+        let status = r.take(status_len as usize)?.to_vec();
+
+        // Trailing bytes mean the two ends disagree about the layout even
+        // though the version matched. Better to refuse than to hand a pane
+        // half a section from it.
+        if !r.at_end() {
+            return None;
+        }
+        Self::from_parts(image, values, status, axes)
+    }
+
+    /// What [`to_bytes`](Self::to_bytes) will write, exactly.
+    ///
+    /// Exactly, not approximately: a section is 12 MB natively and a
+    /// reallocation partway through copies all of it, so this is the
+    /// difference between one allocation and several. Wrong by a little is
+    /// only that copy; wrong by a lot means the layout and the estimate have
+    /// drifted, which `the_encoded_length_of_a_section_is_exact` is what
+    /// catches.
+    fn encoded_len(&self) -> usize {
+        let header = 4 + 2;
+        // Seven `f64`, the tilt count as a `u32`, and the widest gap.
+        let axes = 7 * 8 + 4 + 8;
+        header
+            + axes
+            + (4 + self.image.len())
+            + (4 + self.values.len() * 4)
+            + (4 + self.status.len())
+    }
+}
+
+/// A bounds-checked cursor. Every accessor returns `None` rather than
+/// panicking, because the bytes come off a message port and are not trusted.
+///
+/// A private copy of `render_input`'s, deliberately rather than a shared one.
+/// It is thirty lines with no state beyond an offset, and the alternative —
+/// a public type, or a fourth crate for it — would make the byte layout of
+/// three payloads depend on one shared decoder's idea of what a `u32` is.
+/// Each module owning its own reader is what lets each own its own format.
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, at: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.at.checked_add(n)?;
+        let slice = self.bytes.get(self.at..end)?;
+        self.at = end;
+        Some(slice)
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn f32(&mut self) -> Option<f32> {
+        Some(f32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn f64(&mut self) -> Option<f64> {
+        Some(f64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    /// `count` as a capacity, refused if the buffer cannot possibly hold that
+    /// many items of `min_size` bytes each. Keeps a corrupt length from
+    /// reserving gigabytes before the read fails.
+    fn bounded(&self, count: u32, min_size: usize) -> Option<usize> {
+        let count = count as usize;
+        (count.checked_mul(min_size)? <= self.bytes.len() - self.at).then_some(count)
+    }
+
+    fn at_end(&self) -> bool {
+        self.at == self.bytes.len()
+    }
 }
 
 #[cfg(test)]
@@ -2531,6 +2813,109 @@ mod tests {
             .is_none(),
             "an unknown status code was accepted",
         );
+
+        // A non-finite axis. Every field is checked on its own, because a
+        // single `all_finite` walk that dropped one of them would still pass
+        // an assertion made about any other.
+        for name in [
+            "length_km",
+            "base_km_msl",
+            "top_km_msl",
+            "near_ground_range_km",
+            "far_ground_range_km",
+            "coverage_ground_range_km",
+            "cone_of_silence_km",
+            "widest_tilt_gap_deg",
+        ] {
+            // Both bars, because `is_finite` and `!is_nan` differ exactly on
+            // the infinities and a mapping is affine in these fields: an
+            // infinite `top_km_msl` gives every row height an infinity, and
+            // `inf - inf` at the bottom of the axis a `NaN`.
+            for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let mut broken = axes;
+                match name {
+                    "length_km" => broken.length_km = bad,
+                    "base_km_msl" => broken.base_km_msl = bad,
+                    "top_km_msl" => broken.top_km_msl = bad,
+                    "near_ground_range_km" => broken.near_ground_range_km = bad,
+                    "far_ground_range_km" => broken.far_ground_range_km = bad,
+                    "coverage_ground_range_km" => broken.coverage_ground_range_km = bad,
+                    "cone_of_silence_km" => broken.cone_of_silence_km = bad,
+                    "widest_tilt_gap_deg" => broken.widest_tilt_gap_deg = bad,
+                    other => unreachable!("{other} is not a field of SectionAxes"),
+                }
+                assert!(
+                    CrossSection::from_parts(
+                        section.image().to_vec(),
+                        section.values().to_vec(),
+                        section.status().to_vec(),
+                        broken,
+                    )
+                    .is_none(),
+                    "a {name} of {bad} was accepted",
+                );
+            }
+        }
+        // `tilt_count` is a `usize` and has no non-finite value to have, so a
+        // whole-axes rejection would be wrong: an ordinary count still builds.
+        assert!(
+            CrossSection::from_parts(
+                section.image().to_vec(),
+                section.values().to_vec(),
+                section.status().to_vec(),
+                SectionAxes {
+                    tilt_count: 0,
+                    ..axes
+                },
+            )
+            .is_some(),
+            "the finiteness check refused something that has no finiteness",
+        );
+
+        // A `Value` status over a number that is not one. Both bars are
+        // exercised: `NaN` paints nothing, but an **infinity** compares larger
+        // than every threshold in the scale and paints the top of it, so a
+        // section carrying one looks like the strongest echo in the volume.
+        let at = section
+            .status()
+            .iter()
+            .position(|&s| s == SampleStatus::Value.wire_code())
+            .expect("the near section has values");
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut broken = section.values().to_vec();
+            broken[at] = bad;
+            assert!(
+                CrossSection::from_parts(
+                    section.image().to_vec(),
+                    broken,
+                    section.status().to_vec(),
+                    axes,
+                )
+                .is_none(),
+                "a Value pixel carrying {bad} was accepted",
+            );
+        }
+        // And the same number under a status that has no number is ordinary —
+        // it is what every missing pixel already holds — so the check is a
+        // pairing rather than a blanket ban on `NaN` in the plane.
+        let missing = section
+            .status()
+            .iter()
+            .position(|&s| s != SampleStatus::Value.wire_code())
+            .expect("the near section has missing pixels");
+        let mut nan_where_nothing_is = section.values().to_vec();
+        nan_where_nothing_is[missing] = f32::NAN;
+        assert!(
+            CrossSection::from_parts(
+                section.image().to_vec(),
+                nan_where_nothing_is,
+                section.status().to_vec(),
+                axes,
+            )
+            .is_some(),
+            "a NaN under a non-Value status was refused, which is every \
+             missing pixel of every section",
+        );
     }
 
     /// The per-pixel reader pairs the two planes back into the sample that
@@ -2714,6 +3099,337 @@ mod tests {
              not discriminating",
             seen.len(),
         );
+    }
+
+    // ── The wire codec ──────────────────────────────────────────────────────
+
+    /// Where each of the three planes' length prefixes sits in an encoded
+    /// section: after the magic, the version and the nine axis numbers, then
+    /// after each preceding plane.
+    ///
+    /// Written out here rather than taken from the encoder, so a layout change
+    /// that moved a field has to be made in both places — the mutations these
+    /// offsets support are the whole point of the tests below, and an offset
+    /// derived from the code under test would follow it wherever it went.
+    /// `the_length_prefixes_are_where_the_tests_think_they_are` checks them.
+    const IMAGE_LEN_AT: usize = 4 + 2 + 7 * 8 + 4 + 8;
+    const VALUE_LEN_AT: usize = IMAGE_LEN_AT + 4 + SECTION_WIDTH * SECTION_HEIGHT * 4;
+    const STATUS_LEN_AT: usize = VALUE_LEN_AT + 4 + SECTION_WIDTH * SECTION_HEIGHT * 4;
+
+    fn prefix_at(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"))
+    }
+
+    /// A mixed section — real echo, `BeyondRange` above, `BelowLowestBeam`
+    /// below — which is the ordinary shape and the one every codec test below
+    /// starts from.
+    fn wire_fixture() -> CrossSection {
+        let scan = scan_with(&|az, slant| {
+            if slant > 60.0 && slant < 80.0 {
+                Gate::RangeFolded
+            } else if az > 240.0 {
+                Gate::BelowThreshold
+            } else {
+                Gate::Dbz(-6.0 + slant / 6.0)
+            }
+        });
+        radial_section(&scan, 137.0, 150.0)
+    }
+
+    /// The three offsets the mutation tests below index by are the three the
+    /// encoder actually wrote.
+    ///
+    /// Every refusal test plants a value at one of them, so an offset that had
+    /// drifted would leave those tests corrupting a byte of some other field
+    /// and passing for the wrong reason — the classic way a suite of negative
+    /// assertions goes green while testing nothing.
+    #[test]
+    fn the_length_prefixes_are_where_the_tests_think_they_are() {
+        let bytes = wire_fixture().to_bytes();
+        let pixels = SECTION_WIDTH * SECTION_HEIGHT;
+        assert_eq!(prefix_at(&bytes, IMAGE_LEN_AT), (pixels * 4) as u32);
+        assert_eq!(prefix_at(&bytes, VALUE_LEN_AT), pixels as u32);
+        assert_eq!(prefix_at(&bytes, STATUS_LEN_AT), pixels as u32);
+        assert_eq!(bytes.len(), STATUS_LEN_AT + 4 + pixels);
+    }
+
+    /// A real section survives the wire, including one that is `NaN` in every
+    /// pixel.
+    ///
+    /// This is what [`CrossSection`]'s hand-written `PartialEq` was written
+    /// for: a blank section carries `f32::NAN` in every value, and under
+    /// derived semantics `assert_eq!` here would fail on a byte-identical
+    /// payload with nothing in the message saying why.
+    #[test]
+    fn a_section_round_trips_through_its_wire_form() {
+        let scan = scan_with(&|az, slant| {
+            if slant > 60.0 && slant < 80.0 {
+                Gate::RangeFolded
+            } else if az > 240.0 {
+                Gate::BelowThreshold
+            } else {
+                Gate::Dbz(-6.0 + slant / 6.0)
+            }
+        });
+        // A mixed section, a blank one and one whose axis the caller chose —
+        // three different shapes of payload, not three copies of one.
+        let mixed = radial_section(&scan, 137.0, 150.0);
+        let blank = render_section(
+            &scan,
+            &request(point_at(0.0, 800.0), point_at(90.0, 800.0)),
+            SITE.0,
+            SITE.1,
+        )
+        .expect("a section well outside the volume still renders");
+        let shallow = render_section(
+            &scan,
+            &SectionRequest {
+                top_km_msl: Some(SITE_ELEV_KM + 4.0),
+                ..request(SITE, point_at(45.0, 100.0))
+            },
+            SITE.0,
+            SITE.1,
+        )
+        .expect("a low axis renders");
+
+        assert!(
+            blank.values().iter().all(|v| v.is_nan()),
+            "precondition: the blank section has numbers in it, so the NaN \
+             half of this claim is untested",
+        );
+        assert!(
+            mixed.values().iter().any(|v| v.is_nan())
+                && mixed.values().iter().any(|v| v.is_finite()),
+            "precondition: the mixed section is all one thing",
+        );
+        let mut statuses = std::collections::BTreeSet::new();
+        statuses.extend(mixed.status().iter().copied());
+        assert!(
+            statuses.len() >= 3,
+            "precondition: the mixed section carries only {} statuses, so a \
+             codec that lost the status plane could still pass",
+            statuses.len(),
+        );
+
+        for (name, section) in [
+            ("mixed", &mixed),
+            ("blank", &blank),
+            ("shallow axis", &shallow),
+        ] {
+            let decoded = CrossSection::from_bytes(&section.to_bytes())
+                .unwrap_or_else(|| panic!("the {name} section did not decode"));
+            assert_eq!(*section, decoded, "the {name} section changed in transit");
+            // `PartialEq` ignores a value under a non-`Value` status, so an
+            // encoder that dropped the value plane's NaN payloads would still
+            // satisfy the assertion above. The bytes say more.
+            assert_eq!(
+                section.to_bytes(),
+                decoded.to_bytes(),
+                "the {name} section re-encodes differently",
+            );
+            assert_eq!(section.axes(), decoded.axes(), "{name}");
+        }
+
+        // And the comparison is not vacuous: three sections of three
+        // different places do not decode to one another.
+        assert_ne!(mixed, blank);
+        assert_ne!(mixed, shallow);
+        assert_ne!(
+            CrossSection::from_bytes(&mixed.to_bytes()).unwrap(),
+            CrossSection::from_bytes(&blank.to_bytes()).unwrap(),
+        );
+    }
+
+    /// `to_bytes` reserves exactly what it writes. A section is 12 MB
+    /// natively, so a wrong estimate is a copy of all of it.
+    #[test]
+    fn the_encoded_length_of_a_section_is_exact() {
+        let section = wire_fixture();
+        assert_eq!(section.encoded_len(), section.to_bytes().len());
+        // A second shape, so the estimate is pinned against something other
+        // than one raster's constant total.
+        let blank = render_section(
+            &scan_with(&|_az, _slant| Gate::Dbz(30.0)),
+            &request(point_at(0.0, 800.0), point_at(90.0, 800.0)),
+            SITE.0,
+            SITE.1,
+        )
+        .unwrap();
+        assert_eq!(blank.encoded_len(), blank.to_bytes().len());
+    }
+
+    /// The bytes arrive off a message port. Every malformed shape has to be a
+    /// clean `None` — the two ends of that port can be different builds.
+    #[test]
+    fn a_malformed_section_payload_is_refused_rather_than_misread() {
+        let section = wire_fixture();
+        let good = section.to_bytes();
+        let pixels = SECTION_WIDTH * SECTION_HEIGHT;
+
+        assert!(CrossSection::from_bytes(&[]).is_none(), "empty");
+        assert!(CrossSection::from_bytes(b"nope").is_none(), "wrong magic");
+
+        // A **whole** payload relabelled, including with the two magics that
+        // share this port. Mutation testing is why: a four-byte buffer cannot
+        // pin the magic test, because it fails on the version read instead —
+        // deleting the magic comparison outright left every short-buffer
+        // assertion here green, and a `RenderInput` frame would then have been
+        // decoded as a section.
+        for wrong in [*b"nope", *b"RDRI", *b"RDVX"] {
+            let mut relabelled = good.clone();
+            relabelled[..4].copy_from_slice(&wrong);
+            assert!(
+                CrossSection::from_bytes(&relabelled).is_none(),
+                "a whole payload labelled {} decoded as a section",
+                String::from_utf8_lossy(&wrong),
+            );
+        }
+
+        let mut wrong_version = good.clone();
+        wrong_version[4] = 0xFF;
+        wrong_version[5] = 0xFF;
+        assert!(
+            CrossSection::from_bytes(&wrong_version).is_none(),
+            "an unknown version decoded",
+        );
+
+        for cut in [
+            1,
+            8,
+            IMAGE_LEN_AT,
+            IMAGE_LEN_AT + 2,
+            VALUE_LEN_AT,
+            VALUE_LEN_AT + 4,
+            STATUS_LEN_AT,
+            good.len() / 2,
+            good.len() - 1,
+        ] {
+            assert!(
+                CrossSection::from_bytes(&good[..cut]).is_none(),
+                "truncated to {cut} bytes",
+            );
+        }
+
+        let mut trailing = good.clone();
+        trailing.push(0);
+        assert!(
+            CrossSection::from_bytes(&trailing).is_none(),
+            "trailing bytes mean the layouts disagree",
+        );
+
+        // A length that cannot fit in what remains, on each of the three
+        // planes. The value plane is the one that matters: four bytes an
+        // element, so a believed `u32::MAX` reserves 16 GiB before the read
+        // fails.
+        for (name, at) in [
+            ("image", IMAGE_LEN_AT),
+            ("values", VALUE_LEN_AT),
+            ("status", STATUS_LEN_AT),
+        ] {
+            let mut absurd = good.clone();
+            absurd[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(
+                CrossSection::from_bytes(&absurd).is_none(),
+                "an absurd {name} length reached a read",
+            );
+        }
+
+        // A plane sized for a different build's raster — the ordinary
+        // cross-build case, since `SECTION_WIDTH` is 2048 native and 1024 on
+        // wasm. Shrunk by one element each, with the prefix moved to match, so
+        // the frame is well-formed right through to `at_end` and only
+        // `from_parts` can object.
+        for (name, at, element) in [
+            ("image", IMAGE_LEN_AT, 1usize),
+            ("values", VALUE_LEN_AT, 4),
+            ("status", STATUS_LEN_AT, 1),
+        ] {
+            let mut short = good.clone();
+            let count = prefix_at(&short, at) as usize;
+            let plane_end = at + 4 + count * element;
+            short[at..at + 4].copy_from_slice(&((count - 1) as u32).to_le_bytes());
+            short.drain(plane_end - element..plane_end);
+            assert!(
+                CrossSection::from_bytes(&short).is_none(),
+                "a {name} plane one element short of this build's raster decoded",
+            );
+        }
+
+        // A status byte this build cannot name — a payload from a newer
+        // sender.
+        let mut future = good.clone();
+        future[STATUS_LEN_AT + 4 + 7] = 200;
+        assert!(
+            CrossSection::from_bytes(&future).is_none(),
+            "an unknown status code decoded",
+        );
+
+        // A non-finite axis. `top_km_msl` is the third `f64`, and it is the
+        // one that makes every row height `NaN`.
+        let mut nan_axis = good.clone();
+        nan_axis[4 + 2 + 16..4 + 2 + 24].copy_from_slice(&f64::NAN.to_le_bytes());
+        assert!(
+            CrossSection::from_bytes(&nan_axis).is_none(),
+            "a NaN top_km_msl decoded",
+        );
+
+        // A `Value` pixel with no finite number behind it.
+        let at = section
+            .status()
+            .iter()
+            .position(|&s| s == SampleStatus::Value.wire_code())
+            .expect("the fixture has values");
+        for bad in [f32::NAN, f32::INFINITY] {
+            let mut broken = good.clone();
+            let off = VALUE_LEN_AT + 4 + at * 4;
+            broken[off..off + 4].copy_from_slice(&bad.to_le_bytes());
+            assert!(
+                CrossSection::from_bytes(&broken).is_none(),
+                "a Value pixel carrying {bad} decoded",
+            );
+        }
+
+        // precondition: the fixture the mutations were made against decodes,
+        // so every refusal above is the mutation's doing and not the
+        // fixture's.
+        assert_eq!(
+            CrossSection::from_bytes(&good).expect("the unmutated payload decodes"),
+            section,
+        );
+        assert_eq!(good.len(), STATUS_LEN_AT + 4 + pixels);
+    }
+
+    /// The capacity guard, tested directly, because nothing end to end can
+    /// see it.
+    ///
+    /// [`Reader::bounded`] does not change *what*
+    /// [`CrossSection::from_bytes`] answers. `take` bounds every read, so a
+    /// believed length fails on the read either way and the payload is refused
+    /// with or without it. What it changes is whether four billion elements
+    /// are reserved **first** — a 16 GiB allocation on the way to a `None`, on
+    /// a worker thread, in a browser tab. Mutation testing confirms the gap
+    /// rather than assuming it: deleting the call from `from_bytes` leaves the
+    /// whole suite green, which is why the helper is named and pinned here
+    /// instead, exactly as `is_blind` and `ceiling_is_under` are above.
+    #[test]
+    fn the_capacity_guard_refuses_a_length_the_buffer_cannot_hold() {
+        let bytes = [0u8; 16];
+        let r = Reader::new(&bytes);
+        assert_eq!(r.bounded(4, 4), Some(4), "16 bytes hold four f32");
+        assert_eq!(r.bounded(0, 4), Some(0));
+        assert_eq!(r.bounded(5, 4), None, "20 bytes claimed from 16");
+        assert_eq!(r.bounded(u32::MAX, 4), None, "16 GiB claimed from 16 bytes");
+
+        // It measures against what is *left*, not against the whole buffer —
+        // otherwise a length prefix late in a frame would be judged against
+        // bytes already consumed.
+        let mut part_way = Reader::new(&bytes);
+        part_way.take(8).expect("half the buffer");
+        assert_eq!(part_way.bounded(2, 4), Some(2));
+        assert_eq!(part_way.bounded(3, 4), None);
+
+        // And the multiply cannot overflow into a pass.
+        assert_eq!(Reader::new(&bytes).bounded(u32::MAX, usize::MAX), None);
     }
 
     /// How long a section takes to draw, on the target it is built for.
