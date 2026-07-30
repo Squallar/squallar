@@ -345,6 +345,13 @@ impl super::App {
                 lat,
                 lon,
                 max_range_km: render.max_range_km,
+                // What these pixels are, travelling with them. Whichever
+                // datasource produced them: this is the one assignment behind
+                // `PaneState::stale_image_on_screen`, so a Level II and a
+                // Level III image are described identically and neither can
+                // stay on screen unlabelled after the selection moves.
+                product: render.product,
+                elevation: render.elevation,
             }),
             hit_map: None,
         });
@@ -723,6 +730,13 @@ impl super::App {
                         lat,
                         lon,
                         max_range_km,
+                        // The restored image depicts what the cached render did,
+                        // so it is described the same way. A resume that put the
+                        // pixels back without this would leave a pane that had
+                        // been switched while suspended showing the old product
+                        // with nothing saying so.
+                        product,
+                        elevation,
                     }),
                     hit_map: None,
                 });
@@ -3171,6 +3185,111 @@ mod stamping_tests {
             "a volume-derived product reports the volume's time — the same line, \
              filled in the same way",
         );
+    }
+
+    /// Placing an image also records **what it depicts**, so a pane can tell when
+    /// its pixels are not the selection its labels describe.
+    ///
+    /// Written into the texture's own `RadarTextureMeta`, which is what makes
+    /// `PaneState::stale_image_on_screen` impossible to leave behind: the pair is
+    /// placed together and dropped together. Nothing between the render arriving
+    /// and the pane being drawn would notice this assignment going missing — the
+    /// pane would simply never report a mismatch, and would go on captioning one
+    /// product's image with another's name, which is the defect.
+    ///
+    /// Both datasources, in both directions, from the one call: the product on the
+    /// render is the only thing that differs, so a Level II and a Level III image
+    /// cannot be described differently. This is also the contract
+    /// `InputHarness::place_radar_image` imitates.
+    #[test]
+    fn a_placed_render_describes_what_it_depicts() {
+        let ctx = egui::Context::default();
+        let mut app = app_showing_site();
+        assert!(
+            PRODUCT.is_level3() && !RadarProduct::Reflectivity.is_level3(),
+            "one product from each datasource",
+        );
+
+        // A Level III image under a Level II selection.
+        app.gui.pane_mut(0).unwrap().selected_product = RadarProduct::Reflectivity;
+        app.apply_render_to_pane(&ctx, 0, &finished(PRODUCT, 0.5));
+        assert_eq!(
+            app.gui.pane(0).unwrap().stale_image_on_screen(),
+            Some((PRODUCT, 0.5)),
+            "the placed image's own product and sweep, reported so the pane can \
+             say the label is ahead of the pixels",
+        );
+
+        // The matching render lands: nothing to report.
+        app.gui.pane_mut(0).unwrap().selected_product = PRODUCT;
+        assert_eq!(
+            app.gui.pane(0).unwrap().stale_image_on_screen(),
+            None,
+            "the image is the selection now",
+        );
+
+        // And the other way round — a Level II image under a Level III selection,
+        // through the same call.
+        app.apply_render_to_pane(&ctx, 0, &finished(RadarProduct::Reflectivity, 0.5));
+        assert_eq!(
+            app.gui.pane(0).unwrap().stale_image_on_screen(),
+            Some((RadarProduct::Reflectivity, 0.5)),
+        );
+    }
+}
+
+/// A restored image describes itself too.
+///
+/// `restore_cached_render` is the one path that puts a radar texture on screen
+/// without going through `apply_render_to_pane`: after suspend/resume or surface
+/// loss it re-uploads the cached pixels rather than re-rendering, and so builds
+/// its own [`rustdar_egui::overlay_cache::RadarTextureMeta`]. A pane switched
+/// while the app was away would otherwise come back showing the old product with
+/// nothing saying so — the exact state the pending notice exists for, reached by
+/// the one route around it.
+///
+/// Read off the source for the reason `frame_build_order_tests` gives: the
+/// function unwraps an `AppState`, which is a wgpu device, a surface and a window,
+/// none of which a headless `App` has, so it returns before its first statement.
+#[cfg(test)]
+mod restore_describes_its_image_tests {
+    /// The body of `restore_cached_render`.
+    fn restore_body() -> &'static str {
+        let (_, rest) = include_str!("app_render.rs")
+            .split_once("pub(super) fn restore_cached_render(")
+            .expect("restore_cached_render is no longer a method here");
+        rest.split_once("\n    }")
+            .map(|(body, _)| body)
+            .expect("restore_cached_render has no recognisable body")
+    }
+
+    #[test]
+    fn a_restored_image_still_says_what_it_depicts() {
+        let body = restore_body();
+        let meta = body
+            .find("RadarTextureMeta {")
+            .expect("restore_cached_render no longer describes the texture it places");
+        let fields = &body[meta..];
+        for field in ["product,", "elevation,"] {
+            assert!(
+                fields.contains(field),
+                "a restored image carries no `{field}`, so a pane switched while \
+                 suspended comes back showing the old product with nothing saying \
+                 so; `stale_image_on_screen` reads this metadata and nothing else",
+            );
+        }
+        // The values come from the *cached render*, not from the pane's live
+        // selection — which is the whole distinction the notice rests on.
+        for source in [
+            "let product = cached.product;",
+            "let elevation = cached.elevation;",
+        ] {
+            assert!(
+                body.contains(source),
+                "`{source}` is gone: the restored image would be described by \
+                 whatever the pane has selected rather than by what it depicts",
+            );
+        }
     }
 }
 

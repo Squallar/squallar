@@ -488,6 +488,124 @@ impl InputHarness {
         self.warm_up();
     }
 
+    /// Offer `product` at `elevation` on pane `idx`'s loaded scan, as a landed
+    /// Level II volume or Level III object does.
+    ///
+    /// `ScanInfo::from_scan` lists the volume's own moments and
+    /// `poll_level3_results` adds each bucket product with the angle off its PDB;
+    /// this is the state either leaves behind, which is what makes the product
+    /// selectable and gives `get_rendering_params` an angle to snap to.
+    pub(crate) fn offer_product(
+        &mut self,
+        idx: usize,
+        product: rustdar_radar::types::RadarProduct,
+        elevation: f32,
+    ) {
+        let pane = self
+            .gui
+            .pane_mut(idx)
+            .unwrap_or_else(|| panic!("no pane {idx}"));
+        let info = pane
+            .scan_info
+            .as_mut()
+            .expect("load_scan first: a product is offered on a scan");
+        if !info.available_products.contains(&product) {
+            info.available_products.push(product);
+            info.available_products
+                .sort_by_key(rustdar_radar::types::RadarProduct::sort_order);
+        }
+        let angles = info.product_elevations.entry(product).or_default();
+        if !angles.iter().any(|a| (a - elevation).abs() < 0.05) {
+            angles.push(elevation);
+            angles.sort_by(|a, b| a.total_cmp(b));
+        }
+        self.warm_up();
+    }
+
+    /// Select `product` on pane `idx`, as the layers panel's product combo box
+    /// does — including the elevation reset that combo performs on a change.
+    pub(crate) fn select_product(
+        &mut self,
+        idx: usize,
+        product: rustdar_radar::types::RadarProduct,
+    ) {
+        let pane = self
+            .gui
+            .pane_mut(idx)
+            .unwrap_or_else(|| panic!("no pane {idx}"));
+        if pane.selected_product != product {
+            pane.selected_product = product;
+            pane.selected_elevation = 0.0;
+        }
+        self.warm_up();
+    }
+
+    /// Place a finished radar image on pane `idx`, as `apply_render_to_pane` does
+    /// when a render lands: a texture in the pane's Radar overlay cache, with the
+    /// metadata that says what it depicts.
+    ///
+    /// The metadata is the point — `PaneState::stale_image_on_screen` reads
+    /// `product` and `elevation` off it — and the fields are filled the way the
+    /// host fills them, from the render's own product and *snapped* elevation
+    /// rather than from the pane's selection. There is one such assignment in
+    /// production, shared by both datasources, and
+    /// `a_placed_render_describes_what_it_depicts` in `rustdar-frontend` holds
+    /// this fixture to it.
+    pub(crate) fn place_radar_image(
+        &mut self,
+        idx: usize,
+        product: rustdar_radar::types::RadarProduct,
+        elevation: f32,
+    ) {
+        use crate::overlay_cache::{OverlayTextureData, RadarTextureMeta};
+        use rustdar_radar::types::ImageBounds;
+
+        let (lat, lon) = {
+            let pane = self
+                .gui
+                .pane(idx)
+                .unwrap_or_else(|| panic!("no pane {idx}"));
+            let info = pane
+                .scan_info
+                .as_ref()
+                .expect("load_scan first: an image is projected from a site");
+            (info.site.lat, info.site.lon)
+        };
+        let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]);
+        let texture = self
+            .ctx
+            .load_texture("harness_radar", image, egui::TextureOptions::NEAREST);
+        let bounds = ImageBounds::from_radar_site(lat, lon);
+        let cache = self
+            .gui
+            .pane_mut(idx)
+            .unwrap()
+            .overlay_cache_mut(OverlayKind::Radar);
+        cache.current = Some(OverlayTextureData {
+            texture,
+            geo_bounds: rustdar_overlays::types::GeoBounds {
+                min_lat: bounds.min_lat,
+                max_lat: bounds.max_lat,
+                min_lon: bounds.min_lon,
+                max_lon: bounds.max_lon,
+            },
+            data_generation: 0,
+            render_zoom: 0,
+            width: 1,
+            height: 1,
+            radar_meta: Some(RadarTextureMeta {
+                value_data: std::sync::Arc::new(Vec::new()),
+                lat,
+                lon,
+                max_range_km: 230.0,
+                product,
+                elevation,
+            }),
+            hit_map: None,
+        });
+        self.warm_up();
+    }
+
     /// Every rect painted during the last frame, in paint order.
     pub(crate) fn painted_rects(&self) -> &[egui::Rect] {
         &self.last_rects
@@ -3822,6 +3940,253 @@ mod tests {
             h.painted_text_strings().iter().any(|t| t == "0.5\u{b0}"),
             "painted: {:?}",
             h.painted_text_strings(),
+        );
+    }
+
+    /// A harness with one pane on KTLX offering a Level II and a Level III
+    /// product at 0.5°, radar layer on, showing a finished `showing` image.
+    ///
+    /// Both products at the same angle deliberately: it makes the product the only
+    /// thing that differs between the two selections, so a notice that appeared
+    /// would be about the product switch and nothing else.
+    fn pane_showing(showing: rustdar_radar::types::RadarProduct) -> InputHarness {
+        use rustdar_radar::types::RadarProduct;
+
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.load_scan("KTLX");
+        h.gui_mut()
+            .pane_mut(0)
+            .unwrap()
+            .set_overlay_enabled(OverlayKind::Radar, true);
+        h.offer_product(0, RadarProduct::Reflectivity, 0.5);
+        h.offer_product(0, RadarProduct::EchoTops, 0.5);
+        h.select_product(0, showing);
+        h.place_radar_image(0, showing, 0.5);
+        h
+    }
+
+    /// The pending-render notice for `product`, as the pane paints it.
+    ///
+    /// Read out of the *painted* text rather than from `stale_image_on_screen`, so
+    /// what is asserted is what a user would be looking at. Matched on the product
+    /// name the notice names — the one on screen — because that is the whole
+    /// message.
+    fn notice_painted(h: &InputHarness, product: rustdar_radar::types::RadarProduct) -> bool {
+        h.painted_text_strings()
+            .iter()
+            .any(|t| t.starts_with('\u{27f3}') && t.contains(product.name()))
+    }
+
+    /// Any pending-render notice at all, whatever it names.
+    fn any_notice_painted(h: &InputHarness) -> bool {
+        h.painted_text_strings()
+            .iter()
+            .any(|t| t.starts_with('\u{27f3}'))
+    }
+
+    /// 26f. **A pane says when its image is not the product it is labelled with.**
+    ///
+    ///      Switching product holds the previous product's image until the new
+    ///      render lands, while the color scale, the tilt picker and the status
+    ///      bar's data line have all already moved to the new selection. That is a
+    ///      label claiming something the pixels do not show — a small correctness
+    ///      problem, not a cosmetic one — and it lasts as long as a render, longer
+    ///      for a Level III product whose object has not landed.
+    ///
+    ///      The notice names what is *on screen*, since everything else on the
+    ///      pane already names the selection. The imagery stays up and undimmed
+    ///      behind it: one product's echoes are better than none.
+    #[test]
+    fn a_pane_says_when_its_image_is_not_the_selected_product() {
+        use rustdar_radar::types::RadarProduct;
+
+        let mut h = pane_showing(RadarProduct::Reflectivity);
+        assert!(
+            !any_notice_painted(&h),
+            "a pane showing what it selected has nothing to disown; painted: {:?}",
+            h.painted_text_strings(),
+        );
+
+        // The switch, with no render landed yet.
+        h.select_product(0, RadarProduct::EchoTops);
+        assert!(
+            notice_painted(&h, RadarProduct::Reflectivity),
+            "the pane is showing reflectivity and labelled echo tops, and said \
+             nothing; painted: {:?}",
+            h.painted_text_strings(),
+        );
+        // Over the pane it is about, not somewhere in the chrome: in a split
+        // layout each pane answers for its own image.
+        let pane_rect = h.pane_rects()[0];
+        assert!(
+            h.text_painted_in(pane_rect, "showing Reflectivity"),
+            "the notice was painted outside the pane it describes; painted: {:?}",
+            h.painted_text_strings(),
+        );
+        // …and the picture is still there. The notice is drawn over the imagery,
+        // never instead of it.
+        assert!(
+            h.gui_mut()
+                .pane(0)
+                .unwrap()
+                .overlay_cache(OverlayKind::Radar)
+                .and_then(|c| c.current.as_ref())
+                .is_some(),
+            "the pane was cleared rather than annotated",
+        );
+
+        // The render lands and the notice goes.
+        h.place_radar_image(0, RadarProduct::EchoTops, 0.5);
+        assert!(
+            !any_notice_painted(&h),
+            "the notice outlived the render it was waiting for; painted: {:?}",
+            h.painted_text_strings(),
+        );
+    }
+
+    /// 26g. **…and it does not flash on a routine refresh.**
+    ///
+    ///      A new volume for the site drops every pane's `last_rendered` and
+    ///      re-renders it, several times a scan under the real-time feed. The image
+    ///      on screen still depicts the selected product throughout, so there is
+    ///      nothing to disown — which is why the notice is derived from the
+    ///      *image's* own metadata rather than from "is a render in flight".
+    #[test]
+    fn a_same_selection_re_render_draws_no_notice() {
+        use rustdar_radar::types::RadarProduct;
+
+        let mut h = pane_showing(RadarProduct::Reflectivity);
+        // Two more volumes' worth of the same selection re-rendered, as an
+        // auto-poll or the chunk feed produces.
+        for _ in 0..2 {
+            h.place_radar_image(0, RadarProduct::Reflectivity, 0.5);
+            assert!(
+                !any_notice_painted(&h),
+                "a routine re-render of the selected product drew a notice; \
+                 painted: {:?}",
+                h.painted_text_strings(),
+            );
+        }
+
+        // Nor does a selection the scan snaps back onto the sweep already drawn:
+        // 0.6° snaps to the 0.5° sweep, which is the image on screen.
+        h.gui_mut().pane_mut(0).unwrap().selected_elevation = 0.6;
+        h.warm_up();
+        assert_eq!(
+            h.gui_mut().pane(0).unwrap().get_rendering_params(),
+            Some((RadarProduct::Reflectivity, 0.5)),
+            "precondition: the selection snaps to the drawn sweep",
+        );
+        assert!(
+            !any_notice_painted(&h),
+            "the snapped selection is the image on screen; painted: {:?}",
+            h.painted_text_strings(),
+        );
+    }
+
+    /// 26h. **The notice is the same for a Level II and a Level III product.**
+    ///
+    ///      The point of the parity work is that a user cannot tell the two
+    ///      datasources apart, so a notice that appeared for only one of them — or
+    ///      worded itself differently — would be a way to read the datasource off
+    ///      the screen, exactly the tell the uniform data line removed. Driven both
+    ///      ways round through the real UI so the claim is about what is painted
+    ///      rather than about a shared code path.
+    #[test]
+    fn the_pending_notice_is_identical_for_both_datasources() {
+        use rustdar_radar::types::RadarProduct;
+
+        // A Level III selection over a Level II image, and the reverse.
+        let (l2, l3) = (RadarProduct::Reflectivity, RadarProduct::EchoTops);
+        assert!(!l2.is_level3() && l3.is_level3(), "one of each datasource");
+
+        let mut awaiting_l3 = pane_showing(l2);
+        awaiting_l3.select_product(0, l3);
+        let mut awaiting_l2 = pane_showing(l3);
+        awaiting_l2.select_product(0, l2);
+
+        let notice_of = |h: &InputHarness| -> String {
+            h.painted_text_strings()
+                .iter()
+                .find(|t| t.starts_with('\u{27f3}'))
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no pending-render notice painted: {:?}",
+                        h.painted_text_strings()
+                    )
+                })
+        };
+        assert_eq!(
+            notice_of(&awaiting_l3),
+            "\u{27f3} showing Reflectivity 0.5\u{b0}"
+        );
+        assert_eq!(
+            notice_of(&awaiting_l2),
+            "\u{27f3} showing Echo Tops 0.5\u{b0}"
+        );
+
+        // The wording is one format string with the product substituted, so the
+        // two differ in the product name and nowhere else.
+        let strip = |t: &str, name: &str| t.replace(name, "<product>");
+        assert_eq!(
+            strip(&notice_of(&awaiting_l3), l2.name()),
+            strip(&notice_of(&awaiting_l2), l3.name()),
+            "the two datasources drew differently shaped notices, which is a way \
+             to tell them apart",
+        );
+
+        // And each one clears on its own render landing, the same way.
+        awaiting_l3.place_radar_image(0, l3, 0.5);
+        awaiting_l2.place_radar_image(0, l2, 0.5);
+        assert!(!any_notice_painted(&awaiting_l3));
+        assert!(!any_notice_painted(&awaiting_l2));
+    }
+
+    /// 26i. **A pane with no image says nothing, and neither does a looping one.**
+    ///
+    ///      Two states with nothing to report, for opposite reasons. An empty pane
+    ///      makes no claim its pixels contradict — there are none, and the site
+    ///      spinner already covers a first load. A looping pane never *holds* a
+    ///      stale frame: `retarget_renders` drops every frame texture the instant
+    ///      the selection moves, so the animation is blank rather than wrong, and
+    ///      the loop's own phase chrome covers the wait.
+    #[test]
+    fn nothing_is_said_where_there_is_no_stale_image() {
+        use rustdar_radar::types::RadarProduct;
+
+        // No image at all, on a selection nothing has rendered.
+        let mut bare = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        bare.load_scan("KTLX");
+        bare.gui_mut()
+            .pane_mut(0)
+            .unwrap()
+            .set_overlay_enabled(OverlayKind::Radar, true);
+        bare.offer_product(0, RadarProduct::EchoTops, 0.5);
+        bare.select_product(0, RadarProduct::EchoTops);
+        assert!(
+            !any_notice_painted(&bare),
+            "an empty pane has no pixels to disown; painted: {:?}",
+            bare.painted_text_strings(),
+        );
+
+        // A looping pane, mid-switch. The static image's metadata still describes
+        // the old product, and must not be reported: it is not what is on screen.
+        let mut looping = pane_showing(RadarProduct::Reflectivity);
+        let site = rustdar_radar::sites::get_radar_site("KTLX").expect("a real radar");
+        {
+            let pane = looping.gui_mut().pane_mut(0).unwrap();
+            pane.loop_state = crate::pane::LoopPlaybackState::new_for_loop(600, site);
+        }
+        looping.select_product(0, RadarProduct::EchoTops);
+        assert!(
+            looping.gui_mut().pane(0).unwrap().loop_state.is_active(),
+            "precondition: the loop is running",
+        );
+        assert!(
+            !any_notice_painted(&looping),
+            "a looping pane drew the static image's notice; painted: {:?}",
+            looping.painted_text_strings(),
         );
     }
 

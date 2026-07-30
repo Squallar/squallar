@@ -12,6 +12,7 @@ use std::sync::Arc;
 use rustdar_overlays::render::geo as overlay_geo;
 use rustdar_overlays::render::rasterize::HitMap;
 use rustdar_overlays::types::{GeoBounds, OverlayFeature, ScreenPoint};
+use rustdar_radar::types::RadarProduct;
 
 // ── Viewport state (reused for render-trigger detection) ─────────────────
 
@@ -166,6 +167,20 @@ pub struct RadarTextureMeta {
     pub lon: f64,
     /// Maximum range in km (for range ring).
     pub max_range_km: f64,
+    /// The product these pixels depict.
+    ///
+    /// Not the pane's `selected_product`: that is what the user has *asked* for,
+    /// and the two differ for as long as a render takes. Kept here, alongside the
+    /// texture rather than beside it, because the pair has to be replaced and
+    /// dropped together — a field on the pane could outlive the image it
+    /// described, and would then be a confident lie. See
+    /// [`crate::pane::PaneState::stale_image_on_screen`].
+    pub product: RadarProduct,
+    /// The sweep angle these pixels depict — the *snapped* elevation the
+    /// renderer was given, which is what
+    /// [`crate::pane::PaneState::get_rendering_params`] resolves and what the
+    /// selection is compared against.
+    pub elevation: f32,
 }
 
 /// A rendered overlay texture and the geo bounds it covers.

@@ -669,6 +669,60 @@ impl PaneState {
         self.data_time
     }
 
+    /// What the radar image on screen depicts, **when that is not what this pane
+    /// has selected** — the product and sweep the pixels really are, so a caller
+    /// can say so.
+    ///
+    /// `None` means the pane is showing what it claims to be showing, or is
+    /// showing nothing at all. Both are honest states with nothing to report; the
+    /// case this exists for is the third one, where a product switch leaves the
+    /// previous product's image up while the color scale, the tilt picker and the
+    /// hover readout have all already moved to the new selection. The label
+    /// claiming something the pixels do not show is a correctness problem, not a
+    /// cosmetic one, and one that lasts as long as a render — longer for a
+    /// Level III product whose object has not landed yet.
+    ///
+    /// Read off [`crate::overlay_cache::RadarTextureMeta`], which travels *with*
+    /// the texture, so this cannot outlive or lag the image it describes: the two
+    /// are placed together by `apply_render_to_pane` and dropped together whenever
+    /// the radar cache is cleared. That is also what keeps it from firing on a
+    /// routine refresh — a new volume for the site clears the dispatcher's
+    /// `last_rendered` and re-renders, but the image on screen still depicts the
+    /// selected product, so there is nothing to disown.
+    ///
+    /// The elevation is compared within [`ELEVATION_TOLERANCE`] against the
+    /// *snapped* selection from [`get_rendering_params`](Self::get_rendering_params)
+    /// — the same value the render was dispatched with — so a selection the scan
+    /// snaps onto the sweep already drawn is not a mismatch.
+    ///
+    /// `None` under an active loop, and not because the question does not arise
+    /// there: `LoopPlaybackState::retarget_renders` drops *every* frame texture
+    /// the instant the selection moves, so a looping pane never holds a frame
+    /// depicting the old product. There is no stale image to disown, and the
+    /// loop's own phase chrome covers the wait.
+    pub fn stale_image_on_screen(&self) -> Option<(RadarProduct, f32)> {
+        if self.loop_state.is_active() {
+            return None;
+        }
+        let meta = self
+            .overlay_cache(OverlayKind::Radar)?
+            .current
+            .as_ref()?
+            .radar_meta
+            .as_ref()?;
+        let matches_selection = match self.get_rendering_params() {
+            Some((product, elevation)) => {
+                meta.product == product && (meta.elevation - elevation).abs() <= ELEVATION_TOLERANCE
+            }
+            // No params means this pane's scan does not offer the selected
+            // product at all, so no render will be dispatched and the old image
+            // will stand indefinitely. There is no snapped angle to compare
+            // against, so the product alone decides.
+            None => meta.product == self.selected_product,
+        };
+        (!matches_selection).then_some((meta.product, meta.elevation))
+    }
+
     /// Whether this overlay is enabled for this pane.
     ///
     /// Falls back to `false` if the kind has no entry (uninitialised pane).

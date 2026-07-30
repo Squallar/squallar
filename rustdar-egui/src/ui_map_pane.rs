@@ -175,6 +175,32 @@ pub(super) fn render_pane_map_content(
                             );
                         }
                     }
+
+                    // The pixels above are not the selection every other label on
+                    // this pane is already describing — say which product they
+                    // are. Inside the Radar arm, so it appears only while the
+                    // radar layer is actually on screen and only for a pane that
+                    // has an image to disown; on its own layer, so an overlay
+                    // drawn later in `draw_order` cannot paint over the notice.
+                    //
+                    // Not branched on the datasource, and it must never be: this
+                    // is the same call for a Level II and a Level III product,
+                    // and `PaneState::stale_image_on_screen` answers from the
+                    // same texture metadata either way.
+                    if let Some((on_screen, elevation)) = ctx.pane.stale_image_on_screen() {
+                        let layer = egui::LayerId::new(
+                            egui::Order::Background,
+                            ui.id().with("pending_render"),
+                        );
+                        let mut notice_painter = ui.ctx().layer_painter(layer);
+                        notice_painter.set_clip_rect(ctx.pane_rect);
+                        draw_pending_render_notice(
+                            &notice_painter,
+                            ctx.pane_rect,
+                            on_screen,
+                            elevation,
+                        );
+                    }
                 }
                 // City label tiles — walkers tile layer
                 OverlayKind::CityLabels => {
@@ -813,6 +839,71 @@ fn format_legend_value(product: RadarProduct, value: f32, prefs: &UserPreference
             }
         }
     }
+}
+
+// ── Pending-render notice ─────────────────────────────────────────────────
+
+/// Font size of the pending-render notice. The color scale's title size, so the
+/// notice reads as part of the same chrome rather than as an alert.
+const PENDING_FONT_SIZE: f32 = 12.0;
+/// Gap between the notice and the pane's top edge.
+const PENDING_TOP_MARGIN: f32 = 6.0;
+/// Padding inside the notice's backing plate.
+const PENDING_PADDING: egui::Vec2 = egui::vec2(8.0, 3.0);
+
+/// What a pane says while the image on screen is not yet the product and tilt it
+/// has selected.
+///
+/// It names what is **on screen**, which is the one piece of information nothing
+/// else on the pane carries: the color scale, the tilt picker, the hover readout
+/// and the status bar's data line have all already moved to the new selection, so
+/// the pixels are the only thing left unlabelled. "Loading Velocity" would repeat
+/// what the legend beside it already says and still leave the user unable to tell
+/// what they are looking at.
+///
+/// **One wording for both datasources.** The situation is identical whichever
+/// side a product is fetched from — a Level II render takes as long as it takes,
+/// a Level III one additionally waits for its object to land — and a notice that
+/// differed, or appeared for only one of them, would be a way to read the
+/// datasource off the screen. That is exactly the tell the uniform data line was
+/// introduced to remove.
+fn pending_render_notice(product: RadarProduct, elevation: f32) -> String {
+    format!("\u{27f3} showing {} {:.1}\u{b0}", product.name(), elevation)
+}
+
+/// Draw the notice across the top of the pane, over the imagery.
+///
+/// Deliberately non-blocking: the stale image stays fully visible and
+/// undimmed. Somebody watching weather must never lose the picture to a
+/// progress indicator — the picture is still real data, just not the field
+/// they last asked for, and one product's echoes are better than none.
+///
+/// Wrapped rather than clipped, because the longest product name is wider than a
+/// pane in a six-way split and a truncated notice about a mislabelled image would
+/// be its own small lie.
+fn draw_pending_render_notice(
+    painter: &egui::Painter,
+    pane_rect: egui::Rect,
+    product: RadarProduct,
+    elevation: f32,
+) {
+    let font = egui::FontId::proportional(PENDING_FONT_SIZE);
+    let wrap_width = (pane_rect.width() - SCALE_MARGIN * 2.0 - PENDING_PADDING.x * 2.0).max(1.0);
+    let galley = painter.layout(
+        pending_render_notice(product, elevation),
+        font,
+        egui::Color32::WHITE,
+        wrap_width,
+    );
+    let plate = egui::Rect::from_center_size(
+        egui::pos2(
+            pane_rect.center().x,
+            pane_rect.top() + PENDING_TOP_MARGIN + galley.size().y / 2.0 + PENDING_PADDING.y,
+        ),
+        galley.size() + PENDING_PADDING * 2.0,
+    );
+    painter.rect_filled(plate, 4.0, egui::Color32::from_black_alpha(200));
+    painter.galley(plate.min + PENDING_PADDING, galley, egui::Color32::WHITE);
 }
 
 /// Draw text with a dark shadow for readability on the map.
