@@ -158,6 +158,32 @@ struct SweepData {
     /// alternative is a ladder in the worker that the main thread would not
     /// have built.
     cut_angle_deg: Option<f64>,
+    /// Whether the *original* sweep's radials carried a velocity moment.
+    ///
+    /// One bit, and it decides which antenna pass a section is cut from.
+    ///
+    /// [`crate::sampler::VolumeSampler`] resolves a split cut by preferring the
+    /// half that carries **no** velocity: reflectivity belongs to the
+    /// surveillance half, which reaches 460 km against the Doppler half's 300,
+    /// and the two halves are otherwise indistinguishable — on a measured KMPX
+    /// VCP 212 volume all three members of the 0.4834° cut report the same cut
+    /// angle *and* the same median. The rule discriminates on
+    /// `radial.velocity().is_none()`.
+    ///
+    /// A reflectivity payload carries the reflectivity moment and nothing else,
+    /// so before this bit every reconstructed sweep looked like a surveillance
+    /// half and the chooser fell through to "newest member" — which on a real
+    /// volume is a SAILS *Doppler* repeat. The reconstructed ladder then took
+    /// a 1192-gate rung where the main thread took an 1832-gate one, and
+    /// nothing failed: the section simply stopped at ~300 km and took the low
+    /// tilt's geometry from the wrong pass.
+    ///
+    /// **The bit, not the decision.** Applying the surveillance preference at
+    /// extraction time would put a second copy of the sampler's own rule in
+    /// this module, and this campaign has already paid twice for exactly that
+    /// duplication. What travels is the input the rule reads; the rule stays
+    /// where it is.
+    carried_velocity: bool,
     radials: Vec<RadialData>,
 }
 
@@ -429,6 +455,14 @@ impl RenderInput {
                                 place_into(&mut slots, *extra_slot, payload.to_moment_data());
                             }
                         }
+                        // The Doppler-half marker. Only when the sweep really
+                        // carried velocity and none of it travelled — for the
+                        // hybrid classification, whose payload carries every
+                        // moment, the real thing is already in the slot and
+                        // this does nothing.
+                        if sweep.carried_velocity && slots.1.is_none() {
+                            slots.1 = Some(doppler_marker());
+                        }
                         let (reflectivity, velocity, spectrum_width, zdr, phi, rho) = slots;
                         Radial::new(
                             0,
@@ -585,6 +619,30 @@ impl<'a> CutTable<'a> {
     }
 }
 
+/// A velocity moment with **no gates**: the reconstructed statement of
+/// [`SweepData::carried_velocity`].
+///
+/// The sampler's split-cut rule reads `radial.velocity().is_none()`, so the bit
+/// has to be materialised on the field the rule looks at — a `Radial` has no
+/// other channel, every one of its fields being structural.
+///
+/// Zero gates, not fabricated ones. A consumer that reads this moment's values
+/// gets an empty list, which is the honest answer to "what velocity did this
+/// payload carry" — it carried none. What it must never do is invent numbers a
+/// wind fit or a dealiaser could take for measurements.
+///
+/// Nothing else on a render path is misled by it. Every whole-volume product
+/// that reads velocity — NROT and SRV — carries the *real* velocity as its slot
+/// moment, and the hybrid classification carries it in the extras, so in every
+/// case where a consumer reads velocity values the marker is not there. The one
+/// path that reads the field's mere *presence* is
+/// [`crate::render::find_sweep`]'s surveillance preference, which is the same
+/// question the marker exists to answer, and which falls back to any sweep — so
+/// a single-sweep payload is still found.
+fn doppler_marker() -> MomentData {
+    MomentData::from_fixed_point(0, 0, 0, 8, 1.0, 0.0, Vec::new())
+}
+
 /// One reconstructed cut: the angle, and neutral values everywhere else.
 ///
 /// The neutral values are not a guess at what the RDA sent. Nothing this crate
@@ -684,6 +742,12 @@ fn sweep_data(
         // are separate claims; the sampler reads this one.
         elevation_number: sweep.elevation_number(),
         cut_angle_deg: cuts.angle_for(sweep.elevation_number()),
+        // Read off the first radial, which is where every other per-sweep
+        // property in this module is read from and where the sampler's own
+        // chooser reads it.
+        carried_velocity: radials
+            .first()
+            .is_some_and(|r| MomentSlot::Velocity.read(r).is_some()),
         radials: radials
             .iter()
             .map(|radial| RadialData {
@@ -833,13 +897,14 @@ const MAGIC: [u8; 4] = *b"RDRI";
 /// moment of every tilt, so its payload carries them alongside the sweep's
 /// own moment, and it reads the same environmental heights the hail pair
 /// does.
-/// Version 6 added the coverage pattern number, and each sweep's own
-/// `elevation_number` and VCP cut angle, when the volume sampler became
-/// reachable from a worker: those three are what let
-/// [`RenderInput::to_scan`] rebuild a cut table, and without them a
-/// reconstructed scan builds a *different tilt ladder* from the one the main
-/// thread built — silently, since neither half errors and neither produces a
-/// `NaN`.
+/// Version 6 added the coverage pattern number, and per sweep the
+/// `elevation_number`, the VCP cut angle and the carried-velocity bit, when the
+/// volume sampler became reachable from a worker. Those four are the whole
+/// input to the tilt ladder: the first three let [`RenderInput::to_scan`]
+/// rebuild a cut table, and the fourth is what resolves a split cut. Without
+/// any of them a reconstructed scan builds a *different ladder* from the one
+/// the main thread built — silently, since none of the failures errors and none
+/// produces a `NaN`.
 const FORMAT_VERSION: u16 = 6;
 
 impl RenderInput {
@@ -877,6 +942,7 @@ impl RenderInput {
         for sweep in &self.sweeps {
             out.extend_from_slice(&sweep.elevation_angle.to_le_bytes());
             out.push(sweep.elevation_number);
+            out.push(u8::from(sweep.carried_velocity));
             match sweep.cut_angle_deg {
                 None => out.push(0),
                 Some(angle) => {
@@ -945,10 +1011,15 @@ impl RenderInput {
         let sweep_count = r.u32()?;
         // A sweep costs at least its own header, so this bounds the count
         // against what is actually left rather than trusting it.
-        let mut sweeps = Vec::with_capacity(r.bounded(sweep_count, 10)?);
+        let mut sweeps = Vec::with_capacity(r.bounded(sweep_count, 11)?);
         for _ in 0..sweep_count {
             let elevation_angle = r.f32()?;
             let elevation_number = r.u8()?;
+            let carried_velocity = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
             let cut_angle_deg = match r.u8()? {
                 0 => None,
                 1 => Some(r.f64()?),
@@ -986,6 +1057,7 @@ impl RenderInput {
                 elevation_angle,
                 elevation_number,
                 cut_angle_deg,
+                carried_velocity,
                 radials,
             });
         }
@@ -1021,9 +1093,9 @@ impl RenderInput {
             .sweeps
             .iter()
             .map(|s| {
-                // 4 elevation angle + 1 elevation number + 1 cut-angle flag
-                // (+ 8 for the angle) + 4 radial count.
-                10 + if s.cut_angle_deg.is_some() { 8 } else { 0 }
+                // 4 elevation angle + 1 elevation number + 1 carried-velocity
+                // flag + 1 cut-angle flag (+ 8 for the angle) + 4 radial count.
+                11 + if s.cut_angle_deg.is_some() { 8 } else { 0 }
                     + s.radials
                         .iter()
                         .map(|r| {
@@ -1617,6 +1689,61 @@ mod tests {
             "every reconstructed cut angle equals its sweep's median, so this \
              test cannot tell a carried table from a re-derived one",
         );
+    }
+
+    /// The carried-velocity bit survives the port, and materialises as a
+    /// **gateless** marker rather than as invented data.
+    ///
+    /// The `volume()` fixture is a split cut: a surveillance 0.5° carrying only
+    /// reflectivity, a Doppler 0.5° carrying both, and a merged 1.5° carrying
+    /// both. A reflectivity payload ships none of the velocity, so the bit is
+    /// the only thing that can tell the sampler which sweep is which half.
+    #[test]
+    fn the_doppler_half_is_still_recognisable_after_the_port() {
+        let scan = volume();
+        let input = RenderInput::extract_volume(&scan, RadarProduct::Reflectivity, LAT, LON)
+            .expect("the fixture carries reflectivity");
+        assert_eq!(
+            input
+                .sweeps
+                .iter()
+                .map(|s| s.carried_velocity)
+                .collect::<Vec<_>>(),
+            vec![false, true, true],
+            "the bit does not match the fixture's split cut",
+        );
+        // precondition: none of the velocity itself travelled, so the bit is
+        // doing the work rather than the data.
+        assert!(
+            input
+                .sweeps
+                .iter()
+                .flat_map(|s| &s.radials)
+                .all(|r| r.extras.is_empty()),
+            "a reflectivity payload started carrying other moments, so this \
+             test no longer measures what the bit is for",
+        );
+
+        let rebuilt = RenderInput::from_bytes(&input.to_bytes())
+            .expect("round trips")
+            .to_scan();
+        let velocities: Vec<bool> = rebuilt
+            .sweeps()
+            .iter()
+            .map(|s| s.radials()[0].velocity().is_some())
+            .collect();
+        assert_eq!(
+            velocities,
+            vec![false, true, true],
+            "the reconstructed sweeps do not report the halves they were",
+        );
+        // And the marker is empty: a wind fit or a dealiaser reading it finds
+        // nothing, rather than finding a number nobody measured.
+        for sweep in rebuilt.sweeps().iter().skip(1) {
+            let velocity = sweep.radials()[0].velocity().expect("marked");
+            assert_eq!(velocity.raw_values().len(), 0, "the marker invented gates");
+            assert_eq!(velocity.values().len(), 0);
+        }
     }
 
     /// A cut below the horizon arrives from the decoder as ~359.7°, and the
