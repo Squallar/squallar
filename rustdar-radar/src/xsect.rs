@@ -17,11 +17,22 @@
 //! tilt ladder. [`crate::sampler::VolumeSampler::column`] resolves that ladder
 //! once — `4·N` gate reads, ~64 on a 16-rung VCP 212 volume — and every row
 //! after the first is a two-point lerp between rungs already sampled, reading
-//! no gates at all. A per-pixel section would pay the ladder
-//! [`SECTION_HEIGHT`] times over: **~33.5 M gate reads against ~4.19 M** on a
-//! 2048 × 1024 native raster. That factor is the reason `column` exists, and it
-//! is why this module builds one [`Column`] per output column up front and then
-//! fills rows across them.
+//! no gates at all. A per-pixel section pays the whole ladder
+//! [`SECTION_HEIGHT`] times over instead: `W·H·4·N` against `W·4·N`, which on
+//! the 2048 × 1024 native raster is **134 M gate reads against 131 k** — the
+//! `H`-fold saving `VolumeSampler::column`'s own doc states, 1024× here.
+//!
+//! (The plan that commissioned this module quoted "~33.5 M against ~4.19 M".
+//! Those are `W·H·N` and `W·H·2` — a per-pixel walk of every rung against a
+//! per-pixel *bracketing pair*, both of which still resolve a ladder per pixel.
+//! Neither is what the sampler's `column` primitive does, and the figures are
+//! left here corrected rather than repeated.)
+//!
+//! So this module builds one [`Column`] per output column up front and then
+//! fills rows across them. Measured at 12.5 ms per 2048 × 1024 section on a
+//! five-rung ladder with rayon, 73 ms single-threaded — the single-threaded
+//! figure being the one that bounds wasm, where the raster is a quarter the
+//! pixels and there is no pool. `section_timing` is the measurement.
 //!
 //! # The raster
 //!
@@ -143,10 +154,10 @@ pub const SECTION_HEIGHT: usize = types::IMAGE_SIZE / 2;
 /// How far above the site the default height axis reaches, km.
 ///
 /// Above every beam in the volume at every range: the 19.5° cut — the highest
-/// any operational VCP flies — passes 20 km at 55.8 km of ground range and is
-/// range-truncated long before it could come back down, and no lower cut gets
-/// there at all. So the default axis clips no data anywhere, which is what lets
-/// it be a default rather than a guess.
+/// any operational VCP flies — passes 20 km above the antenna at 55.9 km of
+/// ground range and only climbs from there, and no lower cut gets there at all.
+/// So the default axis clips no data anywhere, which is what lets it be a
+/// default rather than a guess.
 pub const DEFAULT_AXIS_HEIGHT_KM: f64 = 20.0;
 
 /// Feet to kilometres, for the site elevation
@@ -166,8 +177,10 @@ const FT_TO_KM: f64 = 0.0003048;
 /// antenna — but it makes the answer depend on the geometry rather than on the
 /// last bits of a great-circle solution.
 ///
-/// This is the "blind column" a line drawn across the site produces. It is one
-/// column wide on any line longer than ~250 m and it is honest: the radar
+/// This is the "blind column" a line drawn across the site produces. How many
+/// columns it covers is target-dependent — the guard is a 0.25 km window and a
+/// column is `length/`[`SECTION_WIDTH`] wide, so a 200 km line sees two or three
+/// natively and one or two on wasm — and it is honest either way: the radar
 /// cannot see over its own head.
 const BLIND_GROUND_RANGE_KM: f64 = 0.125;
 
@@ -208,7 +221,10 @@ pub struct SectionAxes {
     /// Top of the height axis, km MSL.
     pub top_km_msl: f64,
     /// Ground range from the site to the nearest column of the section, km.
-    /// Zero when the line crosses the site.
+    ///
+    /// Near zero, not zero, when the line crosses the site: columns are sampled
+    /// at their centres, so the closest one lands within half a column of the
+    /// antenna rather than on it.
     pub near_ground_range_km: f64,
     /// Ground range from the site to the farthest column, km.
     pub far_ground_range_km: f64,
