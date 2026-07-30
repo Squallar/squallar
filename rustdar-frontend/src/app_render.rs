@@ -159,6 +159,7 @@ impl super::App {
         let ctx = self.state.as_ref().unwrap().egui_renderer.context().clone();
 
         self.poll_render_results(&ctx);
+        self.poll_section_results(&ctx);
         self.poll_level3_results();
         self.poll_overlay_render_results();
         self.poll_loop_scan_list_results();
@@ -168,6 +169,7 @@ impl super::App {
         self.poll_loop_render_results(&ctx);
         self.advance_loop_playback();
         self.dispatch_pane_renders(&ctx);
+        self.dispatch_section_renders();
         self.dispatch_loop_renders();
         self.update_loop_readiness();
 
@@ -707,6 +709,259 @@ impl super::App {
                 }
                 self.render.pane_render[pane_idx].last_rendered = None;
             }
+        }
+    }
+
+    /// Cut a fresh cross-section for every section pane whose picture no longer
+    /// matches what it is aimed at.
+    ///
+    /// # Staleness needs no help from any reset path
+    ///
+    /// The comparison is against a whole
+    /// [`SectionTarget`](rustdar_egui::pane::SectionTarget) — site, volume time,
+    /// moment and line — so *every* way a section can go stale is one
+    /// comparison. A new volume for the site changes the time; a site switch
+    /// changes the site; the product picker changes the moment; a redrawn line
+    /// changes the line. No `reset_panes_for_*` arm has to remember section
+    /// panes, which is exactly the kind of thing that gets remembered for one of
+    /// the two reset paths and not the other.
+    ///
+    /// # Why a poll rather than an action fired on commit
+    ///
+    /// Only three of those four inputs are user gestures. The fourth — a new
+    /// volume arriving — is not something the UI does, so an action pushed when
+    /// a line is committed would cut the section once and then leave it showing
+    /// a storm that had moved on, live, indefinitely. A poll against the target
+    /// covers all four with one rule.
+    ///
+    /// It costs nothing per frame: the key is written when the job is
+    /// *dispatched*, so a matching key is the ordinary state and the loop below
+    /// falls straight through it.
+    fn dispatch_section_renders(&mut self) {
+        for pane_idx in 0..self.gui.pane_count() {
+            let Some(target) = self.section_target_for_pane(pane_idx) else {
+                continue;
+            };
+            let Some(pane) = self.gui.pane(pane_idx) else {
+                continue;
+            };
+            let Some(section) = pane.cross_section() else {
+                continue;
+            };
+            if section.rendered_for.as_ref() == Some(&target) {
+                continue;
+            }
+            if self
+                .render
+                .pane_render
+                .get(pane_idx)
+                .is_some_and(|p| p.render_in_flight)
+            {
+                continue;
+            }
+
+            let site = target.volume.site.clone();
+            let Some(scan_info) = self.gui.get_scan_info_for_pane(pane_idx) else {
+                continue;
+            };
+            let (lat, lon) = (scan_info.site.lat, scan_info.site.lon);
+            let Some(data) = self.scan_data.get(site.as_str()).map(Arc::clone) else {
+                continue;
+            };
+
+            // The two refusals that have to be *named* rather than left as a
+            // blank pane. Checked here, before any budget is taken, because both
+            // are properties of the volume and the product rather than of the
+            // cut — dispatching would burn a render slot to be told the same
+            // thing, and on wasm there is only one slot.
+            if data.coverage_pattern().elevation_cuts().is_empty() {
+                // The live chunk feed's mid-flight state: `chunks.rs` stands in
+                // an empty coverage pattern until the VCP message lands, and
+                // `VolumeSampler::new` refuses it rather than inventing a ladder
+                // out of the sweeps' own elevation numbers. It resolves itself
+                // on the next volume, so the key is *not* written — the pane
+                // will ask again, and get an answer.
+                self.mark_section_unavailable(
+                    pane_idx,
+                    rustdar_egui::pane::SectionUnavailable::AwaitingCoveragePattern,
+                );
+                continue;
+            }
+            if rustdar_radar::sampler::samplable(target.product).is_none() {
+                // Permanent for this product, so the key *is* written: nothing
+                // about this volume will make a column integral sliceable, and
+                // re-asking every frame would be a busy loop with no output.
+                self.mark_section_unavailable(
+                    pane_idx,
+                    rustdar_egui::pane::SectionUnavailable::ProductHasNoVerticalStructure(
+                        target.product,
+                    ),
+                );
+                if let Some(section) = self
+                    .gui
+                    .pane_mut(pane_idx)
+                    .and_then(|p| p.cross_section_mut())
+                {
+                    section.rendered_for = Some(target);
+                }
+                continue;
+            }
+
+            if self.render.spawn_section_render(
+                pane_idx,
+                &target,
+                &data,
+                lat,
+                lon,
+                self.channels.section_sender.clone(),
+                self.window.clone(),
+            ) && let Some(section) = self
+                .gui
+                .pane_mut(pane_idx)
+                .and_then(|p| p.cross_section_mut())
+            {
+                // Written on **dispatch**, not on arrival. A cut that answers
+                // nothing would otherwise never write it, and the pane would
+                // re-dispatch the same failing cut on every frame for as long as
+                // the volume stood — a busy loop whose only symptom is a warm
+                // machine. `poll_section_results` matches the reply against this
+                // key, so a superseded cut still cannot land.
+                section.rendered_for = Some(target);
+                section.unavailable = None;
+            }
+        }
+    }
+
+    /// What pane `pane_idx` would have to cut to be showing the truth, or `None`
+    /// if it is not a section pane, has no line, or has no volume yet.
+    ///
+    /// The "no volume yet" arm is where a pane gets told it is waiting: that is
+    /// the ordinary state at startup and after a site switch, and a section pane
+    /// showing nothing with no explanation is indistinguishable from one that is
+    /// broken.
+    fn section_target_for_pane(
+        &mut self,
+        pane_idx: usize,
+    ) -> Option<rustdar_egui::pane::SectionTarget> {
+        let pane = self.gui.pane(pane_idx)?;
+        let section = pane.cross_section()?;
+        let line = section.line?;
+        let product = pane.selected_product;
+        let site = pane.site.clone();
+        let collected = match pane.scan_info.as_ref() {
+            Some(scan_info) => scan_info.timestamp,
+            None => {
+                self.mark_section_unavailable(
+                    pane_idx,
+                    rustdar_egui::pane::SectionUnavailable::AwaitingVolume,
+                );
+                return None;
+            }
+        };
+        Some(rustdar_egui::pane::SectionTarget {
+            volume: rustdar_egui::pane::VolumeStamp { site, collected },
+            product,
+            line,
+        })
+    }
+
+    /// Record why a section pane has no picture, leaving whatever it is showing
+    /// alone.
+    ///
+    /// The picture is deliberately **not** cleared. A section of the previous
+    /// volume is stale rather than wrong, it is labelled with its own volume
+    /// time in the pane's caption, and blanking the pane every time the live
+    /// feed rejoins mid-scan would make the feature flicker for a reason the
+    /// user cannot act on.
+    fn mark_section_unavailable(
+        &mut self,
+        pane_idx: usize,
+        reason: rustdar_egui::pane::SectionUnavailable,
+    ) {
+        if let Some(section) = self
+            .gui
+            .pane_mut(pane_idx)
+            .and_then(|p| p.cross_section_mut())
+        {
+            section.unavailable = Some(reason);
+        }
+    }
+
+    /// Take delivery of finished cross-sections and upload their rasters.
+    fn poll_section_results(&mut self, ctx: &egui::Context) {
+        while let Ok(sr) = self.channels.section_receiver.try_recv() {
+            if let Some(state) = self.render.pane_render.get_mut(sr.pane_idx) {
+                state.render_in_flight = false;
+            }
+
+            if self.render.is_render_stale(sr.generation) {
+                // The key was written on dispatch, so leaving it would tell the
+                // dispatcher this cut had been answered when it had been thrown
+                // away — and nothing else would ever ask again. Cleared, so the
+                // pane re-dispatches against whatever it is aimed at now.
+                if let Some(section) = self
+                    .gui
+                    .pane_mut(sr.pane_idx)
+                    .and_then(|p| p.cross_section_mut())
+                {
+                    section.rendered_for = None;
+                }
+                continue;
+            }
+
+            let Some(section_state) = self
+                .gui
+                .pane_mut(sr.pane_idx)
+                .and_then(|p| p.cross_section_mut())
+            else {
+                continue;
+            };
+            // The pane has been re-aimed, converted or re-sited while this cut
+            // was in the air. Dropped without touching the key: whatever the
+            // pane is waiting for now is still on its way.
+            if section_state.rendered_for.as_ref() != Some(&sr.target) {
+                continue;
+            }
+
+            let Some(cut) = sr.section else {
+                section_state.unavailable =
+                    Some(rustdar_egui::pane::SectionUnavailable::RenderFailed);
+                continue;
+            };
+
+            self.texture_counter += 1;
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [
+                    rustdar_radar::xsect::SECTION_WIDTH,
+                    rustdar_radar::xsect::SECTION_HEIGHT,
+                ],
+                cut.image(),
+            );
+            // NEAREST, and it is an honesty decision rather than a performance
+            // one. A section's rows are the tilt ladder's rungs stretched to
+            // fill the gaps between them; bilinear filtering would blend those
+            // edges into a smooth gradient and paint exactly the impression the
+            // pane's caption exists to refuse — that the vertical structure was
+            // measured continuously. The blockiness is the data.
+            let texture = ctx.load_texture(
+                format!("cross_section_{}", self.texture_counter),
+                color_image,
+                egui::TextureOptions::NEAREST,
+            );
+
+            let Some(section_state) = self
+                .gui
+                .pane_mut(sr.pane_idx)
+                .and_then(|p| p.cross_section_mut())
+            else {
+                continue;
+            };
+            if let Some(old) = section_state.texture.take() {
+                self.old_textures.push(old);
+            }
+            section_state.texture = Some(texture);
+            section_state.section = Some(Arc::from(cut));
+            section_state.unavailable = None;
         }
     }
 
@@ -4256,6 +4511,10 @@ mod frame_build_order_tests {
             "self.poll_loop_l3_list_results(",
             "self.poll_loop_l3_fetch_results(",
             "self.poll_loop_render_results(",
+            // A section is the slowest thing this app produces, so it is the
+            // one most likely to be the last result of a batch — the exact case
+            // the re-arm at the end of `handle_redraw` does not cover.
+            "self.poll_section_results(",
         ] {
             let at = body
                 .find(poller)

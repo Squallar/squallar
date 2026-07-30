@@ -1207,7 +1207,7 @@ fn draw_shadowed_text(
 /// `pane::ColorScaleOrientation` — deliberately *not* recomputed from
 /// `pane_rect` here, so that every pane in the grid draws its bars on the same
 /// edge and dragging a divider cannot flip them.
-fn render_color_scale(
+pub(super) fn render_color_scale(
     painter: &egui::Painter,
     pane_rect: egui::Rect,
     horizontal: bool,

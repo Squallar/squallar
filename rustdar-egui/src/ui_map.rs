@@ -8,6 +8,9 @@ use rustdar_units::UserPreferences;
 #[path = "ui_map_pane.rs"]
 mod pane_render;
 
+#[path = "ui_section_pane.rs"]
+mod section_render;
+
 /// What a cross-section pane says while it has nothing to show.
 ///
 /// Deliberately an instruction rather than an apology: a section pane with no
@@ -361,9 +364,7 @@ impl super::Gui {
                                         // one wheel notch later. See
                                         // `SectionAnchor`.
                                         if let Some(gesture) = gesture {
-                                            self.track_section_draw(
-                                                pane_idx, gesture, projector,
-                                            );
+                                            self.track_section_draw(pane_idx, gesture, projector);
                                         }
 
                                         let mut render_ctx = pane_render::PaneRenderCtx {
@@ -415,10 +416,22 @@ impl super::Gui {
                         // fabricated picture ships.
                         PaneKind::CrossSection => {
                             self.record_pane_content(pane_idx, PaneKind::CrossSection, pane_rect);
-                            paint_pane_empty_state(
+                            section_render::render_cross_section(
                                 &mut child_ui,
+                                &mut pane,
                                 pane_rect,
-                                CROSS_SECTION_EMPTY_STATE,
+                                &self.preferences,
+                            );
+                            // The plan view's own colour bar, reused verbatim:
+                            // a section and a map of the same moment are the
+                            // same scale, and two spellings of one legend is
+                            // how they come to disagree.
+                            pane_render::render_color_scale(
+                                child_ui.painter(),
+                                pane_rect,
+                                horizontal_color_scale,
+                                &pane,
+                                &self.preferences,
                             );
                         }
                         PaneKind::Volume => {
@@ -609,11 +622,8 @@ impl super::Gui {
         pane_rect: egui::Rect,
     ) {
         let painter = ui.painter();
-        let project = |p: crate::pane::GeoPoint| {
-            projector
-                .project(walkers::lat_lon(p.lat, p.lon))
-                .to_pos2()
-        };
+        let project =
+            |p: crate::pane::GeoPoint| projector.project(walkers::lat_lon(p.lat, p.lon)).to_pos2();
 
         // Committed sections first, so a band being dragged over one is on top.
         for other in self.panes() {

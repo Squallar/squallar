@@ -17,7 +17,8 @@ mod content;
 pub use content::{
     CrossSectionPane, DEFAULT_HALF_WIDTH_KM, DEFAULT_VERTICAL_EXAGGERATION, GeoPoint,
     MAX_VERTICAL_EXAGGERATION, MIN_VERTICAL_EXAGGERATION, OrbitCamera, OrbitDelta, PaneContent,
-    PaneKind, SectionLine, SectionTarget, VolumePane, VolumeRegion, VolumeStamp, VolumeTarget,
+    PaneKind, SectionLine, SectionTarget, SectionUnavailable, VolumePane, VolumeRegion,
+    VolumeStamp, VolumeTarget,
 };
 
 const DEFAULT_PANE_ZOOM: f64 = 4.0;

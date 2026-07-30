@@ -516,6 +516,22 @@ impl InputHarness {
         self.warm_up();
     }
 
+    /// Convert pane `idx` to a cross-section pane that has **not been aimed**,
+    /// as arming the draw and then converting a pane would leave it.
+    ///
+    /// The distinction from [`make_pane_cross_section`](Self::make_pane_cross_section)
+    /// is behavioural rather than cosmetic: a section pane with no line paints
+    /// the "draw a line" instruction, and one *with* a line and no render yet
+    /// paints that it is cutting. Both are correct and they are different
+    /// screens, so a test about either has to say which pane it means.
+    pub(crate) fn make_pane_unaimed_cross_section(&mut self, idx: usize) {
+        self.gui
+            .pane_mut(idx)
+            .unwrap_or_else(|| panic!("no pane {idx}"))
+            .set_kind(PaneKind::CrossSection);
+        self.warm_up();
+    }
+
     /// Convert pane `idx` to a 3D volume pane, as the menu toggle will.
     pub(crate) fn make_pane_volume(&mut self, idx: usize) {
         self.gui
@@ -5529,8 +5545,12 @@ mod tests {
     fn a_non_map_pane_paints_its_empty_state() {
         let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
         h.set_pane_count(3);
-        let (a, b) = section_ends();
-        h.make_pane_cross_section(1, a, b);
+        // Unaimed, because `CROSS_SECTION_EMPTY_STATE` is what a section pane
+        // says while it has *no line*. A pane that has been aimed and is
+        // waiting for its cut says something else, and this test is about the
+        // arm painting into its own rect rather than about which of the two
+        // states it is in.
+        h.make_pane_unaimed_cross_section(1);
         h.make_pane_volume(2);
 
         let rects = h.pane_rects();
@@ -5950,8 +5970,7 @@ mod tests {
         );
 
         h.clear_id_changes();
-        let (a, b) = section_ends();
-        h.make_pane_cross_section(1, a, b);
+        h.make_pane_unaimed_cross_section(1);
 
         assert_eq!(
             h.pane_kinds(),

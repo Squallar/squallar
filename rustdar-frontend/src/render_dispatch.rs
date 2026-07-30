@@ -368,6 +368,45 @@ pub struct RenderDispatcher {
     /// wind profile (`rustdar_radar::srv`). The RPG-vector history that used
     /// to live beside this left with the five Level III SRM fetches.
     last_storm_motion_override: Option<StormMotionSample>,
+    /// The last whole-volume payload extracted for a cross-section, and what it
+    /// was extracted from.
+    ///
+    /// # Why one entry and not a cache
+    ///
+    /// `RenderInput::extract_volume` walks every sweep of a volume carrying the
+    /// moment and copies its gates out: **15.6 MB** for a full reflectivity
+    /// ladder, and the walk itself is the expensive half. Everything that makes
+    /// a section pane want another cut re-uses the same volume and the same
+    /// moment — moving the line, a second section pane cut from the same map,
+    /// a line redrawn because the first one missed the storm — so a single entry
+    /// keyed on `(site, volume time, product)` catches all of it, and a second
+    /// entry would only ever hold a volume nothing on screen is looking at.
+    ///
+    /// The dominant protection is upstream of this and is a property of the
+    /// interaction rather than of a cache: sections are re-cut **on commit**,
+    /// never per drag frame. The rubber band is drawn locally with no render at
+    /// all, so the payload is built when a line is finished and not while it is
+    /// being aimed. That matters most exactly where this cache helps least —
+    /// wasm, where `MAX_CONCURRENT_RENDERS` is 1 with no preemption, so a
+    /// per-frame dispatch would not merely be wasteful but would queue behind
+    /// itself.
+    section_input: Option<SectionInput>,
+}
+
+/// A whole-volume payload and the volume it came out of.
+///
+/// The product is part of the key because `extract_volume` narrows to one
+/// moment: a payload extracted for reflectivity carries no velocity, and handing
+/// it to a velocity section would produce a picture of an empty ladder rather
+/// than an error.
+struct SectionInput {
+    site: String,
+    collected: chrono::NaiveDateTime,
+    product: RadarProduct,
+    /// `Arc` so the cache and the job in flight can hold it at once; the job
+    /// needs an owned `RenderInput`, so what crosses to the worker is a clone of
+    /// the bytes rather than a second walk of the volume.
+    input: Arc<rustdar_radar::render_input::RenderInput>,
 }
 
 impl Default for RenderDispatcher {
@@ -388,6 +427,7 @@ impl RenderDispatcher {
             renders_in_flight: Arc::new(AtomicUsize::new(0)),
             render_cache: RenderCache::new(MAX_RENDER_CACHE_ENTRIES),
             last_storm_motion_override: None,
+            section_input: None,
         }
     }
 
@@ -1021,6 +1061,103 @@ impl RenderDispatcher {
             None => crate::offload::Job::renders_nothing(),
         };
         self.spawn_render(pane_idx, product, elevation, sender, window, job);
+    }
+
+    /// Cut a vertical cross-section for a section pane, in the background.
+    ///
+    /// Returns `false` when the render budget is full, which is the caller's cue
+    /// to leave the pane's staleness key alone and try again next frame. Native
+    /// builds have several slots; **wasm has exactly one, with no preemption**,
+    /// so on the platform where this matters most a section queues behind
+    /// whatever plan view is already rendering rather than displacing it.
+    ///
+    /// The volume payload is taken from
+    /// [`section_input`](Self::section_input) when it is for this volume, moment
+    /// and site, and extracted (and cached) when it is not. See that field for
+    /// what the walk costs and why one entry is the right size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_section_render(
+        &mut self,
+        pane_idx: usize,
+        target: &rustdar_egui::pane::SectionTarget,
+        data: &nexrad_model::data::Scan,
+        lat: f64,
+        lon: f64,
+        sender: std::sync::mpsc::Sender<crate::channels::SectionResponse>,
+        window: Option<WindowRef>,
+    ) -> bool {
+        if self.renders_in_flight.load(Ordering::Relaxed) >= MAX_CONCURRENT_RENDERS {
+            return false;
+        }
+
+        let product = target.product;
+        let reusable = self.section_input.as_ref().is_some_and(|cached| {
+            cached.site == target.volume.site
+                && cached.collected == target.volume.collected
+                && cached.product == product
+        });
+        if !reusable {
+            let Some(input) =
+                rustdar_radar::render_input::RenderInput::extract_volume(data, product, lat, lon)
+            else {
+                // No sweep carries this moment. Not an error and not a job: the
+                // caller has taken no budget slot and marked nothing in flight,
+                // so there is nothing to unwind — unlike `spawn_level2_render`,
+                // which dispatches `renders_nothing` precisely because it has.
+                log::info!("no volume payload for a {product:?} section");
+                return false;
+            };
+            self.section_input = Some(SectionInput {
+                site: target.volume.site.clone(),
+                collected: target.volume.collected,
+                product,
+                input: Arc::new(input),
+            });
+        }
+        // Always `Some`: either it was reusable or it was just written.
+        let Some(cached) = self.section_input.as_ref() else {
+            return false;
+        };
+
+        let request = rustdar_radar::xsect::SectionRequest {
+            start: (target.line.a().lat, target.line.a().lon),
+            end: (target.line.b().lat, target.line.b().lon),
+            // The site's elevation plus 20 km, which clears every beam in every
+            // operational VCP at every range — so the axis clips nothing and is
+            // the same height whatever the line is, which is what makes two
+            // sections of one storm comparable by eye.
+            top_km_msl: None,
+            product,
+        };
+
+        self.renders_in_flight.fetch_add(1, Ordering::Relaxed);
+        let guard = RenderGuard(Arc::clone(&self.renders_in_flight));
+        let generation = self.render_generation;
+        let wanted = self.pane_render[pane_idx].want_result();
+        let target = target.clone();
+
+        let job = crate::offload::Job::Described(crate::offload::JobRequest::Section {
+            input: Box::new((*cached.input).clone()),
+            request,
+        });
+        crate::offload::offload_job("section-render", job, move |output| {
+            let _guard = guard;
+            // An output of another kind becomes `None` — "nothing to draw" —
+            // which the receiver already handles, with the budget still unwound
+            // and the pane still told.
+            let section = output.and_then(crate::offload::JobOutput::section);
+            if wanted.load(Ordering::Relaxed) {
+                let _ = sender.send(crate::channels::SectionResponse {
+                    pane_idx,
+                    generation,
+                    target,
+                    section,
+                });
+            }
+            crate::app::notify_redraw(&window);
+        });
+        self.pane_render[pane_idx].render_in_flight = true;
+        true
     }
 
     /// Shared dispatch for both Level II and Level III renders.

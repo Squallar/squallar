@@ -2557,7 +2557,9 @@ impl Gui {
 
     /// The highest-indexed visible pane that is not `source`.
     fn highest_pane_other_than(&self, source: PaneId) -> Option<PaneId> {
-        (0..self.visible_pane_count()).rev().find(|&idx| idx != source)
+        (0..self.visible_pane_count())
+            .rev()
+            .find(|&idx| idx != source)
     }
 
     /// The pane conversion this frame recorded and has not applied yet.

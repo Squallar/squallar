@@ -62,6 +62,28 @@ pub struct RenderResponse {
     pub pane_idx: usize,
 }
 
+/// Result from a background cross-section cut.
+///
+/// Carries the [`SectionTarget`](rustdar_egui::pane::SectionTarget) it was cut
+/// for rather than a bare pane index, and that is what matches a result to a
+/// pane. A section takes an order of magnitude longer to produce than the user
+/// takes to draw another line over it, so "the pane this belongs to" and "the
+/// pane that is still waiting for this" are different questions — and answering
+/// only the first would let a section of the previous line arrive after the
+/// current one and sit there looking authoritative.
+pub struct SectionResponse {
+    pub pane_idx: usize,
+    pub generation: u64,
+    /// What was asked for: which volume, which moment, which line.
+    pub target: rustdar_egui::pane::SectionTarget,
+    /// `None` where the cut answered nothing.
+    ///
+    /// Sent either way, for the reason [`RenderResponse::rendered`] is: this
+    /// message is what clears `render_in_flight`, and a pane that never hears
+    /// back stops asking.
+    pub section: Option<Box<rustdar_radar::xsect::CrossSection>>,
+}
+
 /// Result from a Level III object fetch.
 ///
 /// Names the AWIPS **code** and no product. One poll fetches each code once and
@@ -276,6 +298,8 @@ pub struct ChannelHub {
     pub scan_receiver: Receiver<ScanResponse>,
     pub render_sender: Sender<RenderResponse>,
     pub render_receiver: Receiver<RenderResponse>,
+    pub section_sender: Sender<SectionResponse>,
+    pub section_receiver: Receiver<SectionResponse>,
     pub level3_sender: Sender<Level3Response>,
     pub level3_receiver: Receiver<Level3Response>,
     pub overlay_fetch_sender: Sender<OverlayFetchResult>,
@@ -308,6 +332,7 @@ impl ChannelHub {
     pub fn new() -> Self {
         let (scan_sender, scan_receiver) = std::sync::mpsc::channel();
         let (render_sender, render_receiver) = std::sync::mpsc::channel();
+        let (section_sender, section_receiver) = std::sync::mpsc::channel();
         let (level3_sender, level3_receiver) = std::sync::mpsc::channel();
         let (overlay_fetch_sender, overlay_fetch_receiver) = std::sync::mpsc::channel();
         let (overlay_render_sender, overlay_render_receiver) = std::sync::mpsc::channel();
@@ -324,6 +349,8 @@ impl ChannelHub {
             scan_receiver,
             render_sender,
             render_receiver,
+            section_sender,
+            section_receiver,
             level3_sender,
             level3_receiver,
             overlay_fetch_sender,
