@@ -2201,3 +2201,516 @@ mod tests {
         assert_eq!(find_closest_elevation(&scan, PRODUCT, 0.8), Some(0.8));
     }
 }
+
+/// Measuring how well a picker label reaches the sweep it names, across the
+/// live archive.
+///
+/// The picker offers one entry per elevation `discover_product_elevations`
+/// found, and [`find_sweep`] then has to reach the sweep that entry stands for.
+/// Three ways that can go wrong, and this module counts all three over real
+/// volumes:
+///
+/// * **mislabelled** — the entry draws a sweep whose true tilt is not the one
+///   on the label,
+/// * **phantom** — two entries draw the same sweep, so one of them is a
+///   duplicate the user can pick and learn nothing from,
+/// * **unreachable** — a flown sweep carrying the product that no entry
+///   reaches at all, so the volume silently loses a tilt.
+///
+/// Every policy is measured on the **same** downloaded volumes in one pass, so
+/// before and after are the same sample rather than two nights' weather.
+/// [`POLICIES`] names them; the shipped rule is one of the rows, and
+/// `the_audit_mirrors_the_shipped_find_sweep` in [`tests`] is what keeps this
+/// module honest about that.
+///
+/// ```text
+/// cargo test -p rustdar-radar --release --lib -- --ignored --nocapture elevation_labels
+/// ```
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod live_elevation_audit {
+    use super::*;
+    use crate::types::RadarProduct;
+    use nexrad_model::data::Radial;
+
+    /// How a policy reads a sweep's one elevation angle.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) enum Elev {
+        /// The first radial's instantaneous angle — what shipped before.
+        FirstRadial,
+        /// The median over the sweep ([`crate::volumetric::sweep_elevation_deg`]).
+        Median,
+    }
+
+    impl Elev {
+        pub(super) fn of(self, radials: &[Radial]) -> Option<f64> {
+            match self {
+                Self::FirstRadial => radials
+                    .first()
+                    .map(|r| f64::from(r.elevation_angle_degrees())),
+                Self::Median => crate::volumetric::sweep_elevation_deg(radials),
+            }
+        }
+    }
+
+    /// One way of turning a request into a sweep: how elevations are read, and
+    /// how near the label a sweep has to sit to count.
+    #[derive(Clone, Copy)]
+    pub(super) struct Policy {
+        pub(super) elev: Elev,
+        pub(super) window: f64,
+        pub(super) name: &'static str,
+    }
+
+    /// What shipped before, and the candidates. The first row is the `before`.
+    pub(super) const POLICIES: &[Policy] = &[
+        Policy {
+            elev: Elev::FirstRadial,
+            window: 0.30,
+            name: "first radial, 0.30",
+        },
+        Policy {
+            elev: Elev::Median,
+            window: 0.30,
+            name: "median, 0.30",
+        },
+        Policy {
+            elev: Elev::Median,
+            window: 0.15,
+            name: "median, 0.15",
+        },
+        Policy {
+            elev: Elev::Median,
+            window: 0.10,
+            name: "median, 0.10",
+        },
+        Policy {
+            elev: Elev::Median,
+            window: 0.05,
+            name: "median, 0.05",
+        },
+    ];
+
+    /// A label is only ever as precise as the 0.1° rounding the picker applies,
+    /// so a sweep half a step from its label is correctly labelled.
+    pub(super) const LABEL_ROUNDING: f64 = 0.05;
+
+    /// The ground truth a label is scored against: the sweep's median tilt,
+    /// which sits within [`LABEL_ROUNDING`] of the VCP's own commanded angle on
+    /// virtually every sweep. Deliberately *not* the policy's own reading —
+    /// scoring a policy by its own measure would make every policy perfect.
+    pub(super) fn truth(radials: &[Radial]) -> Option<f64> {
+        crate::volumetric::sweep_elevation_deg(radials)
+    }
+
+    /// Indices of the sweeps a product can be drawn from — the same test
+    /// `discover_product_elevations` and [`find_sweep`] both apply, so the
+    /// candidate set is one definition rather than three.
+    pub(super) fn candidates(scan: &Scan, product: RadarProduct) -> Vec<usize> {
+        scan.sweeps()
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.radials()
+                    .first()
+                    .is_some_and(|r| product.get_moment(r).is_some())
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The picker entries a policy would offer for a product: every candidate
+    /// sweep's elevation, rounded to 0.1° and deduplicated, exactly as
+    /// `discover_product_elevations` builds them.
+    pub(super) fn offered(scan: &Scan, product: RadarProduct, p: Policy) -> Vec<f32> {
+        let mut v: Vec<f32> = candidates(scan, product)
+            .into_iter()
+            .filter_map(|i| {
+                let e = p.elev.of(scan.sweeps()[i].radials())?;
+                Some(((e * 10.0).round() / 10.0) as f32)
+            })
+            .collect();
+        v.sort_by(f32::total_cmp);
+        v.dedup();
+        v
+    }
+
+    /// [`find_sweep`] under an arbitrary policy, answering the sweep *index* so
+    /// two labels landing on one sweep can be told apart from two labels
+    /// landing on two. Mirrors the shipped selection rule — newest-first, and
+    /// the surveillance preference for the non-Doppler products.
+    pub(super) fn chosen(
+        scan: &Scan,
+        product: RadarProduct,
+        label: f32,
+        p: Policy,
+    ) -> Option<usize> {
+        let newest = |surveillance_only: bool| {
+            scan.sweeps()
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(i, sweep)| {
+                    let r = sweep.radials().first()?;
+                    let e = p.elev.of(sweep.radials())?;
+                    ((e - f64::from(label)).abs() < p.window
+                        && product.get_moment(r).is_some()
+                        && !(surveillance_only && r.velocity().is_some()))
+                    .then_some(i)
+                })
+        };
+        match product {
+            RadarProduct::Velocity
+            | RadarProduct::SpectrumWidth
+            | RadarProduct::NormalizedRotation
+            | RadarProduct::StormRelativeVelocity => newest(false),
+            _ => newest(true).or_else(|| newest(false)),
+        }
+    }
+
+    /// The three harms, plus what they were counted out of.
+    #[derive(Default, Clone, Copy)]
+    pub(super) struct Harm {
+        pub(super) offered: usize,
+        pub(super) mislabelled: usize,
+        pub(super) badly_mislabelled: usize,
+        pub(super) phantom: usize,
+        pub(super) unreachable: usize,
+        pub(super) unreachable_volumes: usize,
+        pub(super) volumes: usize,
+        pub(super) worst_error: f64,
+        /// Non-Doppler picks that took a shorter sweep than another in the same
+        /// window — the surveillance preference, which must stay at zero.
+        pub(super) short_half: usize,
+        pub(super) short_half_checked: usize,
+    }
+
+    impl Harm {
+        pub(super) fn add(&mut self, o: Harm) {
+            self.offered += o.offered;
+            self.mislabelled += o.mislabelled;
+            self.badly_mislabelled += o.badly_mislabelled;
+            self.phantom += o.phantom;
+            self.unreachable += o.unreachable;
+            self.unreachable_volumes += o.unreachable_volumes;
+            self.volumes += o.volumes;
+            self.worst_error = self.worst_error.max(o.worst_error);
+            self.short_half += o.short_half;
+            self.short_half_checked += o.short_half_checked;
+        }
+
+        pub(super) fn line(&self, name: &str) -> String {
+            let pct = |n: usize| {
+                if self.offered == 0 {
+                    0.0
+                } else {
+                    100.0 * n as f64 / self.offered as f64
+                }
+            };
+            format!(
+                "{name:<20} offered {:5} | mislabelled {:4} ({:5.2}%) worst {:.3} \
+                 (>=0.37 {:3}) | phantom {:4} ({:5.2}%) | unreachable {:4} on {:2}/{:2} vols \
+                 | short-half {}/{}",
+                self.offered,
+                self.mislabelled,
+                pct(self.mislabelled),
+                self.worst_error,
+                self.badly_mislabelled,
+                self.phantom,
+                pct(self.phantom),
+                self.unreachable,
+                self.unreachable_volumes,
+                self.volumes,
+                self.short_half,
+                self.short_half_checked,
+            )
+        }
+    }
+
+    /// Score one product on one volume under one policy.
+    pub(super) fn score(scan: &Scan, product: RadarProduct, p: Policy) -> Harm {
+        let labels = offered(scan, product, p);
+        let cands = candidates(scan, product);
+        if cands.is_empty() {
+            return Harm::default();
+        }
+        let mut h = Harm {
+            offered: labels.len(),
+            volumes: 1,
+            ..Harm::default()
+        };
+        let mut reached: Vec<usize> = Vec::new();
+        let doppler_family = matches!(
+            product,
+            RadarProduct::Velocity
+                | RadarProduct::SpectrumWidth
+                | RadarProduct::NormalizedRotation
+                | RadarProduct::StormRelativeVelocity
+        );
+        for &label in &labels {
+            let Some(i) = chosen(scan, product, label, p) else {
+                continue;
+            };
+            reached.push(i);
+            let radials = scan.sweeps()[i].radials();
+            if let Some(t) = truth(radials) {
+                let err = (t - f64::from(label)).abs();
+                if err > LABEL_ROUNDING {
+                    h.mislabelled += 1;
+                    h.worst_error = h.worst_error.max(err);
+                    if err >= 0.37 {
+                        h.badly_mislabelled += 1;
+                    }
+                }
+            }
+            // The surveillance preference: among the sweeps this label could
+            // have reached, a non-Doppler product must not settle for one that
+            // reaches less far than another.
+            if !doppler_family {
+                let best = cands
+                    .iter()
+                    .filter(|&&j| {
+                        p.elev
+                            .of(scan.sweeps()[j].radials())
+                            .is_some_and(|e| (e - f64::from(label)).abs() < p.window)
+                    })
+                    .map(|&j| compute_max_range(scan.sweeps()[j].radials(), product))
+                    .fold(0.0f64, f64::max);
+                h.short_half_checked += 1;
+                if compute_max_range(radials, product) + 1.0 < best {
+                    h.short_half += 1;
+                }
+            }
+        }
+        reached.sort_unstable();
+        let distinct = {
+            let mut r = reached.clone();
+            r.dedup();
+            r.len()
+        };
+        h.phantom = reached.len() - distinct;
+
+        // Unreachable counts physical **tilts**, not sweeps. A SAILS volume
+        // flies the low cuts several times over; answering with only the newest
+        // of them is what `.rev()` is for and is not a lost tilt. So candidates
+        // are grouped by their true elevation, and a tilt is lost only when no
+        // label reaches *any* sweep flying it.
+        let tilt_of =
+            |i: usize| truth(scan.sweeps()[i].radials()).map(|t| (t * 10.0).round() as i32);
+        let flown: std::collections::BTreeSet<i32> =
+            cands.iter().filter_map(|&i| tilt_of(i)).collect();
+        let got: std::collections::BTreeSet<i32> =
+            reached.iter().filter_map(|&i| tilt_of(i)).collect();
+        h.unreachable = flown.difference(&got).count();
+        h.unreachable_volumes = usize::from(h.unreachable > 0);
+        h
+    }
+
+    /// The sites the window was chosen on, and the sites it was confirmed on.
+    /// Split so the choice cannot be tuned to the same volumes that justify it;
+    /// the holdout is never consulted until the window is fixed.
+    pub(super) const TUNING: &[&str] = &[
+        "KMPX", "KFSD", "KBIS", "KOAX", "KUEX", "KABR", "KTLX", "KMRX", "KTLH", "KMOB", "KSGF",
+        "KPAH", "KMLB", "KMTX", "KSFX",
+    ];
+    pub(super) const HOLDOUT: &[&str] = &["KMVX", "KLZK", "KSHV", "KEAX", "KDDC", "KAMA", "KFWS"];
+
+    /// The products worth scoring: the ones a Level II sweep can actually be
+    /// found for. A Level III-only product has no candidate sweeps at all and
+    /// would contribute nothing but zeroes.
+    pub(super) fn measured_products() -> Vec<RadarProduct> {
+        RadarProduct::all()
+            .iter()
+            .copied()
+            .filter(|p| p.moment_slot().is_some())
+            .collect()
+    }
+
+    #[cfg(test)]
+    mod live {
+        use super::*;
+        use crate::twin::live::l2_volume_near;
+        use std::collections::BTreeMap;
+
+        /// How far back to sample, so one site contributes several independent
+        /// volumes rather than one night's single look.
+        const HOURS_BACK: [i64; 3] = [0, 5, 11];
+
+        /// Download every volume once, score every policy on all of them, and
+        /// print the table. Tuning and holdout are reported apart.
+        ///
+        /// Prints and asserts only the invariants that must hold whatever the
+        /// weather: the surveillance preference never regresses, and the chosen
+        /// policy is no worse than what shipped.
+        #[ignore = "hits the live S3 bucket"]
+        #[tokio::test]
+        async fn elevation_labels_reach_the_sweeps_they_name() {
+            crate::tls::init();
+            let now = chrono::Utc::now().naive_utc();
+            let products = measured_products();
+
+            let mut group_totals: BTreeMap<&str, Vec<Harm>> = BTreeMap::new();
+            let mut refl_totals: BTreeMap<&str, Vec<Harm>> = BTreeMap::new();
+            let mut by_vcp: BTreeMap<u16, Vec<Harm>> = BTreeMap::new();
+            // Root cause: how often each reading of a sweep lands on the VCP's
+            // own commanded angle for that cut.
+            let (mut first_near, mut median_near, mut vcp_checked) = (0usize, 0usize, 0usize);
+            let mut worst_drift = 0.0f64;
+            let mut drift_sum = 0.0f64;
+            let mut drift_n = 0usize;
+            let mut negative_cuts: Vec<String> = Vec::new();
+
+            for (group, sites) in [("tuning", TUNING), ("holdout", HOLDOUT)] {
+                let g = group_totals
+                    .entry(group)
+                    .or_insert_with(|| vec![Harm::default(); POLICIES.len()]);
+                let _ = g;
+                for &site in sites {
+                    for hours in HOURS_BACK {
+                        let when = now - chrono::Duration::hours(hours);
+                        let Some((scan, start)) = l2_volume_near(site, when).await else {
+                            println!("{site} -{hours}h: SKIP — no archived volume");
+                            continue;
+                        };
+                        let vcp = scan.coverage_pattern_number().number();
+
+                        // Per-sweep drift and the VCP comparison.
+                        for sweep in scan.sweeps() {
+                            let radials = sweep.radials();
+                            let (Some(first), Some(median)) =
+                                (Elev::FirstRadial.of(radials), Elev::Median.of(radials))
+                            else {
+                                continue;
+                            };
+                            let els: Vec<f64> = radials
+                                .iter()
+                                .map(|r| f64::from(r.elevation_angle_degrees()))
+                                .collect();
+                            let span = els.iter().cloned().fold(f64::MIN, f64::max)
+                                - els.iter().cloned().fold(f64::MAX, f64::min);
+                            worst_drift = worst_drift.max(span);
+                            drift_sum += span;
+                            drift_n += 1;
+
+                            // The nominal angle of the cut this sweep flew:
+                            // nearest planned cut to the median, which is the
+                            // only reading accurate enough to identify it.
+                            let cuts = scan.coverage_pattern().elevation_cuts();
+                            if cuts.is_empty() {
+                                continue;
+                            }
+                            let nominal = cuts
+                                .iter()
+                                .map(|c| {
+                                    let mut a = c.elevation_angle_degrees();
+                                    if a > 180.0 {
+                                        a -= 360.0;
+                                    }
+                                    a
+                                })
+                                .min_by(|a, b| (a - median).abs().total_cmp(&(b - median).abs()));
+                            let Some(nominal) = nominal else { continue };
+                            vcp_checked += 1;
+                            if (first - nominal).abs() <= LABEL_ROUNDING {
+                                first_near += 1;
+                            }
+                            if (median - nominal).abs() <= LABEL_ROUNDING {
+                                median_near += 1;
+                            }
+                        }
+                        for cut in scan.coverage_pattern().elevation_cuts() {
+                            if cut.elevation_angle_degrees() > 180.0 {
+                                negative_cuts.push(format!(
+                                    "{site} VCP {vcp} declares a cut at {:.2}°",
+                                    cut.elevation_angle_degrees()
+                                ));
+                            }
+                        }
+
+                        for (pi, &p) in POLICIES.iter().enumerate() {
+                            let mut vol = Harm::default();
+                            for &product in &products {
+                                vol.add(score(&scan, product, p));
+                            }
+                            group_totals
+                                .entry(group)
+                                .or_insert_with(|| vec![Harm::default(); POLICIES.len()])[pi]
+                                .add(vol);
+                            refl_totals
+                                .entry(group)
+                                .or_insert_with(|| vec![Harm::default(); POLICIES.len()])[pi]
+                                .add(score(&scan, RadarProduct::Reflectivity, p));
+                            by_vcp
+                                .entry(vcp)
+                                .or_insert_with(|| vec![Harm::default(); POLICIES.len()])[pi]
+                                .add(score(&scan, RadarProduct::Reflectivity, p));
+                        }
+                        println!("{site} -{hours}h: vol {start} VCP {vcp} scored");
+                    }
+                }
+            }
+
+            println!("\n=== root cause: which reading lands on the VCP's own angle ===");
+            if vcp_checked > 0 {
+                println!(
+                    "sweeps {vcp_checked} | first radial within {LABEL_ROUNDING}° of nominal \
+                     {:.1}% | median {:.1}% | in-sweep drift mean {:.3}° worst {:.3}°",
+                    100.0 * first_near as f64 / vcp_checked as f64,
+                    100.0 * median_near as f64 / vcp_checked as f64,
+                    drift_sum / drift_n.max(1) as f64,
+                    worst_drift,
+                );
+            }
+
+            for (label, table) in [
+                ("ALL PRODUCTS", &group_totals),
+                ("REFLECTIVITY", &refl_totals),
+            ] {
+                println!("\n=== {label} ===");
+                for (group, harms) in table.iter() {
+                    println!("-- {group} --");
+                    for (pi, &p) in POLICIES.iter().enumerate() {
+                        println!("{}", harms[pi].line(p.name));
+                    }
+                }
+            }
+
+            println!("\n=== REFLECTIVITY by VCP ===");
+            for (vcp, harms) in &by_vcp {
+                println!("-- VCP {vcp} --");
+                for (pi, &p) in POLICIES.iter().enumerate() {
+                    println!("{}", harms[pi].line(p.name));
+                }
+            }
+
+            if !negative_cuts.is_empty() {
+                println!("\n=== negative base tilts reported as an unsigned wrap ===");
+                negative_cuts.sort();
+                negative_cuts.dedup();
+                for c in &negative_cuts {
+                    println!("{c}");
+                }
+            }
+
+            // The invariants. Everything above is measurement; these are the
+            // claims that must survive any night's weather.
+            let shipped = POLICIES.len() - 2; // median, 0.10
+            let before = 0; // first radial, 0.30
+            for (group, harms) in &group_totals {
+                assert_eq!(
+                    harms[shipped].short_half, 0,
+                    "{group}: the surveillance preference regressed — a non-Doppler product \
+                     took a shorter sweep than one it could have had",
+                );
+                assert!(
+                    harms[shipped].mislabelled <= harms[before].mislabelled
+                        && harms[shipped].phantom <= harms[before].phantom
+                        && harms[shipped].unreachable <= harms[before].unreachable,
+                    "{group}: the chosen policy must not be worse than what shipped — \
+                     before {} / after {}",
+                    harms[before].line("before"),
+                    harms[shipped].line("after"),
+                );
+            }
+        }
+    }
+}
