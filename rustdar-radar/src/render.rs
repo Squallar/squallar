@@ -2554,6 +2554,7 @@ mod live_elevation_audit {
             // Root cause: how often each reading of a sweep lands on the VCP's
             // own commanded angle for that cut.
             let (mut first_near, mut median_near, mut vcp_checked) = (0usize, 0usize, 0usize);
+            let (mut first_outside_match, mut median_outside_match) = (0usize, 0usize);
             let mut worst_drift = 0.0f64;
             let mut drift_sum = 0.0f64;
             let mut drift_n = 0usize;
@@ -2616,6 +2617,20 @@ mod live_elevation_audit {
                             if (median - nominal).abs() <= LABEL_ROUNDING {
                                 median_near += 1;
                             }
+                            // The chunk feed's own question: a narrow
+                            // `CutSelection` compares the *label* against the
+                            // VCP's planned angle within `ELEVATION_MATCH`
+                            // (0.3°). A label further than that from its own
+                            // cut's angle asks the feed for a cut that does not
+                            // exist, and the cut it is actually showing is never
+                            // downloaded.
+                            let label_of = |e: f64| (e * 10.0).round() / 10.0;
+                            if (label_of(first) - nominal).abs() > 0.3 {
+                                first_outside_match += 1;
+                            }
+                            if (label_of(median) - nominal).abs() > 0.3 {
+                                median_outside_match += 1;
+                            }
                         }
                         for cut in scan.coverage_pattern().elevation_cuts() {
                             if cut.elevation_angle_degrees() > 180.0 {
@@ -2658,6 +2673,13 @@ mod live_elevation_audit {
                     100.0 * median_near as f64 / vcp_checked as f64,
                     drift_sum / drift_n.max(1) as f64,
                     worst_drift,
+                );
+                println!(
+                    "labels further than the chunk feed's 0.3 ELEVATION_MATCH from their own \
+                     cut's planned angle: off the first radial {first_outside_match} \
+                     ({:.2}%), off the median {median_outside_match} ({:.2}%)",
+                    100.0 * first_outside_match as f64 / vcp_checked as f64,
+                    100.0 * median_outside_match as f64 / vcp_checked as f64,
                 );
             }
 
