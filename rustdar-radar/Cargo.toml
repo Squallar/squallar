@@ -27,7 +27,9 @@ xml = "=1.3.0"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rustls = { workspace = true }
 # wasm32-unknown-unknown is single-threaded: rayon compiles there but cannot
-# build a pool. `render.rs` carries a sequential fallback for the web arm.
+# build a pool. `par.rs` is the crate's one prelude for both arms — rayon here,
+# sequential stand-ins on the web — and is why this dependency is target-gated
+# rather than plain.
 rayon = "=1.12.0"
 
 # Gated, not plain `[dev-dependencies]`: `rt-multi-thread` is not one of the

@@ -11,6 +11,7 @@ pub(crate) mod l3_values;
 pub mod level3;
 pub mod nrot;
 mod palette;
+pub(crate) mod par;
 pub mod render;
 pub mod render_input;
 pub mod scan;

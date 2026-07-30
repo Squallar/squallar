@@ -40,29 +40,9 @@
 //! are not observable in its output at all.
 
 use crate::beam::RE_EFF_KM;
-#[cfg(not(target_arch = "wasm32"))]
-use rayon::prelude::*;
+// rayon on every target that has threads, the sequential stand-ins on wasm32.
+use crate::par::*;
 use std::f64::consts::PI;
-
-#[cfg(target_arch = "wasm32")]
-use seq_fallback::*;
-
-/// Sequential stand-in for the one rayon entry point this module uses, for
-/// the same reason as [`crate::render`]'s fallback: wasm32 is single-threaded.
-#[cfg(target_arch = "wasm32")]
-mod seq_fallback {
-    pub trait IntoParIterFallback {
-        type Item;
-        fn into_par_iter(self) -> impl Iterator<Item = Self::Item>;
-    }
-
-    impl IntoParIterFallback for std::ops::Range<usize> {
-        type Item = usize;
-        fn into_par_iter(self) -> impl Iterator<Item = usize> {
-            self
-        }
-    }
-}
 
 const KM_PER_NM: f64 = 1.852;
 

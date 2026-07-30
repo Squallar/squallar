@@ -1,89 +1,12 @@
-use nexrad_model::data::{DataMoment, Radial, Scan};
-#[cfg(not(target_arch = "wasm32"))]
-use rayon::prelude::*;
-
-#[cfg(target_arch = "wasm32")]
-use seq_fallback::*;
-
-/// Sequential stand-ins for the two rayon entry points this module uses.
-///
-/// wasm32-unknown-unknown is single-threaded: rayon compiles there but cannot
-/// build a thread pool. Keeping the call sites identical avoids cfg'ing four
-/// rasterization loops, which would then drift. The closures need no changes —
-/// rayon requires `Fn + Send + Sync`, strictly stronger than the `FnMut` these
-/// want.
-///
-/// This is a cfg split, **not** a removal: rasterization is the hot path on
-/// desktop, and this fallback silently becoming the native arm is a large
-/// regression that no test catches.
-#[cfg(target_arch = "wasm32")]
-mod seq_fallback {
-    /// Stands in for `rayon::prelude::ParallelSlice::par_iter`. Implemented on
-    /// `[T]` only; `Vec<T>` reaches it through deref.
-    pub trait ParIterFallback<T> {
-        fn par_iter<'a>(&'a self) -> impl Iterator<Item = &'a T>
-        where
-            T: 'a;
-    }
-
-    impl<T> ParIterFallback<T> for [T] {
-        fn par_iter<'a>(&'a self) -> impl Iterator<Item = &'a T>
-        where
-            T: 'a,
-        {
-            self.iter()
-        }
-    }
-
-    /// Stands in for `rayon::iter::IntoParallelIterator::into_par_iter`.
-    pub trait IntoParIterFallback {
-        type Item;
-        fn into_par_iter(self) -> impl Iterator<Item = Self::Item>;
-    }
-
-    impl IntoParIterFallback for std::ops::Range<usize> {
-        type Item = usize;
-        fn into_par_iter(self) -> impl Iterator<Item = usize> {
-            self
-        }
-    }
-
-    /// Stands in for `rayon::slice::ParallelSlice::par_chunks`.
-    pub trait ParChunksFallback<T> {
-        fn par_chunks<'a>(&'a self, n: usize) -> impl Iterator<Item = &'a [T]>
-        where
-            T: 'a;
-    }
-
-    impl<T> ParChunksFallback<T> for [T] {
-        fn par_chunks<'a>(&'a self, n: usize) -> impl Iterator<Item = &'a [T]>
-        where
-            T: 'a,
-        {
-            self.chunks(n)
-        }
-    }
-
-    /// Stands in for `rayon::slice::ParallelSliceMut::par_chunks_mut`.
-    pub trait ParChunksMutFallback<T> {
-        fn par_chunks_mut<'a>(&'a mut self, n: usize) -> impl Iterator<Item = &'a mut [T]>
-        where
-            T: 'a;
-    }
-
-    impl<T> ParChunksMutFallback<T> for [T] {
-        fn par_chunks_mut<'a>(&'a mut self, n: usize) -> impl Iterator<Item = &'a mut [T]>
-        where
-            T: 'a,
-        {
-            self.chunks_mut(n)
-        }
-    }
-}
+// rayon on every target that has threads, the sequential stand-ins on wasm32.
+// The whole target split lives in `par`, so the four rasterization loops below
+// need no `cfg` of their own.
+use crate::par::*;
 
 use crate::l3_values::{build_eet_lut, build_vil_lut, decode_legacy_thresholds, l3_physical_value};
 use crate::palette::get_color_for_value;
 use crate::types;
+use nexrad_model::data::{DataMoment, Radial, Scan};
 use std::f64::consts::PI;
 use std::sync::atomic::{AtomicU64, Ordering};
 
