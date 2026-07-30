@@ -1,3 +1,11 @@
+// Reached only for `wgpu::Limits::downlevel_webgl2_defaults()`, so that the
+// WebGL2 3D-texture floor below is the value the device request is held to
+// rather than a 256 written out by hand. Deliberately the `egui_wgpu` re-export
+// and not the direct `wgpu` dependency: `tests/wgpu_guard.rs` asserts that
+// `app.rs` is the only file naming `::wgpu`, because a second copy configured by
+// this crate is a copy nothing renders through.
+use egui_wgpu::wgpu;
+
 /// Default width for the application window in pixels
 pub const RENDER_WIDTH: u32 = 1920;
 
@@ -111,6 +119,81 @@ pub const MAX_RENDER_CACHE_ENTRIES: usize = 6;
 #[cfg(not(mobile))]
 pub const MAX_RENDER_CACHE_ENTRIES: usize = 8;
 
+/// Cells along x, y and z in the Cartesian voxel grid a 3D volume renders from.
+///
+/// Every axis is at or under 256 because that is what GLES 3.0 — and so WebGL2 —
+/// *guarantees*, which is the floor a phone browser may legitimately report. See
+/// [`WEBGL2_MAX_TEXTURE_DIMENSION_3D`]. One code path satisfying that floor was
+/// chosen over a larger desktop variant: 256 cells over a 40 km half-width is
+/// 0.31 km per cell, already finer than the 1 km cube the design was compared
+/// against.
+///
+/// The cascade shape is the one [`MAX_LOOP_FRAMES`] documents, for the reason it
+/// documents. `mobile` is emitted by *this crate's* `build.rs`, so a copy of this
+/// constant placed in `rustdar-egui` or `rustdar-radar` would silently take the
+/// desktop arm on a phone.
+#[cfg(target_arch = "wasm32")]
+pub const VOLUME_GRID_CELLS: [u32; 3] = [128, 128, 64];
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
+pub const VOLUME_GRID_CELLS: [u32; 3] = [192, 192, 96];
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+pub const VOLUME_GRID_CELLS: [u32; 3] = [256, 256, 128];
+
+/// Bytes in the colour lookup table that travels with a voxel grid.
+///
+/// The grid holds one-byte palette indices, so the table is the 256 RGBA entries
+/// they index — 1 KiB, on every target. It carries **alpha**, which is what makes
+/// the per-product transparency floors the raymarcher's transfer function for
+/// free, so it cannot be dropped to three bytes per entry.
+pub const VOLUME_LUT_BYTES: usize = 256 * 4;
+
+/// The largest 3D texture WebGL2 is *guaranteed* to accept, per axis.
+///
+/// Taken from wgpu's own WebGL2 downlevel limits rather than written as 256, so
+/// it cannot drift from the value the device request is actually held to
+/// (`app_state::device_limits`). Note the web arm of that function calls
+/// `using_resolution`, which *lifts* `max_texture_dimension_3d` to whatever the
+/// adapter reports (wgpu-types 29.0.4 `limits.rs:603-610`) — so this is a floor
+/// the grid must fit, not a ceiling it is held to. The grid above fits the
+/// unlifted floor on every target, which is the point: no runtime step-down is
+/// needed for a device that reports exactly the guarantee.
+pub const WEBGL2_MAX_TEXTURE_DIMENSION_3D: u32 =
+    wgpu::Limits::downlevel_webgl2_defaults().max_texture_dimension_3d;
+
+/// Ceiling on what one pane's 3D volume textures may occupy, in bytes.
+///
+/// Not a runtime check — nothing measures against it, exactly like
+/// [`LOOP_TEXTURE_BUDGET_BYTES`]. It is the budget [`VOLUME_GRID_CELLS`] was
+/// chosen to fit, written down so that growing an axis has to be a deliberate
+/// decision about memory. `the_volume_grid_fits_the_target_texture_budget`
+/// enforces it and `the_volume_budget_is_not_slack_enough_to_hide_a_doubling`
+/// keeps it snug.
+///
+/// One pane shows one volume, so the figure is one `R8Unorm` grid plus its LUT:
+///
+/// | target  | grid          | grid bytes | + LUT     | budget    |
+/// |---------|---------------|-----------:|----------:|----------:|
+/// | desktop | 256x256x128   |      8 MiB |  8.001 MiB|    12 MiB |
+/// | mobile  | 192x192x96    |  3.375 MiB |  3.376 MiB|     5 MiB |
+/// | wasm32  | 128x128x64    |      1 MiB |  1.001 MiB|   1.5 MiB |
+///
+/// Every arm keeps ~1.5x headroom, which is deliberate: enough for the alignment
+/// and driver overhead a real 3D texture allocation carries, not enough to hide
+/// a doubled axis.
+///
+/// **This budgets the volume texture only.** The pane-sized `Rgba8Unorm`
+/// offscreen target the raymarch renders into is a separate cost — roughly 3 MiB
+/// at 900 x 900 — and needs its own line when the code that allocates it lands.
+/// Folding it in here would make this ceiling untestable against
+/// [`VOLUME_GRID_CELLS`], which is the only thing it can currently be checked
+/// against.
+#[cfg(target_arch = "wasm32")]
+pub const VOLUME_TEXTURE_BUDGET_BYTES: usize = 1536 * 1024;
+#[cfg(all(not(target_arch = "wasm32"), mobile))]
+pub const VOLUME_TEXTURE_BUDGET_BYTES: usize = 5 * 1024 * 1024;
+#[cfg(all(not(target_arch = "wasm32"), not(mobile)))]
+pub const VOLUME_TEXTURE_BUDGET_BYTES: usize = 12 * 1024 * 1024;
+
 /// The playback rates the loop timer is willing to divide by.
 ///
 /// `loop_speed_fps` is a config value before it is a slider value. The settings
@@ -172,6 +255,26 @@ const _: () = const {
     assert!(MAX_LOOP_RENDER_BUDGET <= MAX_LOOP_FRAMES);
     // Every render path indexes a square image; the projection assumes a power of two.
     assert!(rustdar_radar::types::IMAGE_SIZE.is_power_of_two());
+
+    assert!(VOLUME_TEXTURE_BUDGET_BYTES > 0);
+    // A zero axis is a texture wgpu refuses outright, and every axis has to fit
+    // the WebGL2 guarantee — checked here rather than in a `#[test]` because a
+    // test only ever exercises the arm its own runner was built for, and the arm
+    // that matters most is the one only a wasm32 build selects. `cargo check
+    // --target wasm32-unknown-unknown` evaluates this, which is why the wasm row
+    // of the gauntlet is what actually enforces it.
+    let mut axis = 0;
+    while axis < VOLUME_GRID_CELLS.len() {
+        assert!(VOLUME_GRID_CELLS[axis] > 0);
+        assert!(
+            VOLUME_GRID_CELLS[axis] <= WEBGL2_MAX_TEXTURE_DIMENSION_3D,
+            "a voxel grid axis exceeds the 3D texture size WebGL2 guarantees, so \
+             a phone browser reporting exactly the guarantee could not allocate \
+             it — and the failure would be a validation error inside a callback, \
+             where there is no Result to check"
+        );
+        axis += 1;
+    }
 };
 
 #[cfg(test)]
@@ -234,5 +337,85 @@ mod tests {
     #[test]
     fn the_render_budget_is_what_bounds_the_textured_frames() {
         assert_eq!(textured_frames(), MAX_LOOP_RENDER_BUDGET);
+    }
+
+    /// Bytes one pane's 3D volume occupies: an `R8Unorm` cell per grid cell, plus
+    /// the RGBA table those cells index.
+    ///
+    /// One byte per cell is not an assumption to be tidied away: `R8Unorm` was
+    /// chosen because it is *filterable* under `Features::empty()`, which
+    /// `R32Float` is not, and because index-to-dBZ being affine makes hardware
+    /// filtering exactly linear dBZ interpolation.
+    fn volume_bytes() -> usize {
+        let cells = VOLUME_GRID_CELLS
+            .iter()
+            .map(|&n| n as usize)
+            .product::<usize>();
+        cells + VOLUME_LUT_BYTES
+    }
+
+    /// Whichever arm this build compiled is held to its own budget, exactly as
+    /// `loop_frames_fit_the_target_texture_budget` is.
+    #[test]
+    fn the_volume_grid_fits_the_target_texture_budget() {
+        let total = volume_bytes();
+        assert!(
+            total <= VOLUME_TEXTURE_BUDGET_BYTES,
+            "a {:?} grid plus a {VOLUME_LUT_BYTES} B table is {total} B, over the \
+             {} B budget",
+            VOLUME_GRID_CELLS,
+            VOLUME_TEXTURE_BUDGET_BYTES,
+        );
+    }
+
+    /// The sibling of `the_budget_is_not_slack_enough_to_hide_a_doubling`, and for
+    /// the same reason: a ceiling several times the real figure passes the check
+    /// above while permitting any axis to be silently doubled.
+    ///
+    /// Doubling one axis is the realistic regression here, not doubling the whole
+    /// grid — and it is exactly what this catches, because doubling any single
+    /// axis doubles the total.
+    #[test]
+    fn the_volume_budget_is_not_slack_enough_to_hide_a_doubling() {
+        let total = volume_bytes();
+        assert!(
+            total * 2 > VOLUME_TEXTURE_BUDGET_BYTES,
+            "budget {} B is more than twice the actual {total} B — it would not \
+             catch a doubled grid axis",
+            VOLUME_TEXTURE_BUDGET_BYTES,
+        );
+    }
+
+    /// The WebGL2 3D-texture floor is wgpu's figure, not a hand-written 256.
+    ///
+    /// Comparing the *value* against wgpu proves nothing on its own: a
+    /// `= 256;` literal satisfies that assertion exactly, because 256 is what
+    /// wgpu says today. What makes the constant honest is where it comes from, and
+    /// only the source says that. The realistic regression is someone replacing
+    /// the derivation with the literal in order to drop the `wgpu` import from
+    /// this file — at which point the doc comment above becomes false and the
+    /// bound stops tracking the limits the device request is held to.
+    #[test]
+    fn the_webgl2_3d_limit_is_derived_from_wgpu_rather_than_written_out() {
+        let source = include_str!("constants.rs");
+        let definition = source
+            .split_once("pub const WEBGL2_MAX_TEXTURE_DIMENSION_3D: u32 =")
+            .and_then(|(_, rest)| rest.split_once(';'))
+            .map(|(value, _)| value)
+            .expect("WEBGL2_MAX_TEXTURE_DIMENSION_3D is no longer defined here");
+        assert!(
+            definition.contains("downlevel_webgl2_defaults()")
+                && definition.contains("max_texture_dimension_3d"),
+            "WEBGL2_MAX_TEXTURE_DIMENSION_3D is defined as `{}`, which does not \
+             read wgpu's own WebGL2 downlevel limits. A literal cannot drift \
+             *with* wgpu, so it stops describing what the device request is held \
+             to the moment wgpu revises the figure.",
+            definition.trim()
+        );
+
+        // And 256 is still what that derivation yields. Separate assertion so a
+        // wgpu bump that raised the floor is a visible failure to be reviewed,
+        // rather than a grid bound that silently loosened.
+        assert_eq!(WEBGL2_MAX_TEXTURE_DIMENSION_3D, 256);
     }
 }
