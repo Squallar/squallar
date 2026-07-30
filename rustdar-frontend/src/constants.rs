@@ -587,10 +587,54 @@ mod tests {
         }
     }
 
+    /// Each offscreen budget arm selects **its own** class's constant.
+    ///
+    /// Naming the arms outside the cascade pins their values and nothing else:
+    /// pointing the wasm32 arm at `DESKTOP_VOLUME_OFFSCREEN_BUDGET_BYTES` was
+    /// measured to leave the whole workspace green with the wasm
+    /// `--all-targets` check at 0, because on a host the other two arms are
+    /// dead text. Reading the source is the only instrument that sees it.
+    ///
+    /// Shares its reasoning, and its shape, with
+    /// `volume::quality::each_ceiling_arm_selects_its_own_classs_constant`.
+    #[test]
+    fn each_offscreen_budget_arm_selects_its_own_classs_constant() {
+        let source = include_str!("constants.rs");
+        for (cfg, class) in [
+            (r#"target_arch = "wasm32""#, "WASM"),
+            (r#"all(not(target_arch = "wasm32"), mobile)"#, "MOBILE"),
+            (
+                r#"all(not(target_arch = "wasm32"), not(mobile))"#,
+                "DESKTOP",
+            ),
+        ] {
+            let definition =
+                format!("#[cfg({cfg})]\npub const VOLUME_OFFSCREEN_BUDGET_BYTES: usize =");
+            let occurrences = source.matches(&definition).count();
+            assert_eq!(
+                occurrences, 1,
+                "expected exactly one VOLUME_OFFSCREEN_BUDGET_BYTES definition \
+                 under `#[cfg({cfg})]`, found {occurrences}"
+            );
+            let at = source.find(&definition).expect("just counted one");
+            let (selected, _) = source[at + definition.len()..]
+                .split_once(';')
+                .expect("a const definition with no semicolon");
+            let expected = format!("{class}_VOLUME_OFFSCREEN_BUDGET_BYTES");
+            assert_eq!(
+                selected.trim(),
+                expected,
+                "the `#[cfg({cfg})]` arm does not select `{expected}`. An arm \
+                 pointing at another class's budget compiles and passes \
+                 everything CI runs."
+            );
+        }
+    }
+
     /// The compiled cascade selects one of the three named budgets.
     ///
-    /// The only thing about `VOLUME_OFFSCREEN_BUDGET_BYTES` no other target can
-    /// check on this one's behalf; the values are pinned unconditionally above.
+    /// Weaker than the scrape above and kept anyway: it is the one assertion
+    /// that survives the source being reformatted out from under the scrape.
     #[test]
     fn the_compiled_offscreen_budget_is_one_of_the_named_arms() {
         assert!(

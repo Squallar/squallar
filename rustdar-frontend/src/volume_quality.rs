@@ -803,6 +803,71 @@ mod tests {
         );
     }
 
+    /// What a `cfg` cascade's arm is defined as, read out of the source.
+    ///
+    /// The one thing about a `cfg`-selected constant that no host test can
+    /// evaluate is its **selection**: on this target the other two arms are
+    /// dead text the compiler never looks at. Naming the arms outside the
+    /// cascade pins their *values*, and that is all it pins — pointing the
+    /// wasm32 arm at `DESKTOP_PLATFORM_CEILING` leaves the whole workspace
+    /// green with the wasm `--all-targets` check at 0, which was measured
+    /// rather than assumed. Reading the text is the only instrument left.
+    ///
+    /// Asserts the definition is unique so a decoy elsewhere in the file — a
+    /// doc example, a string in an assertion message — cannot be what is found.
+    fn cascade_arm(source: &str, cfg: &str, name: &str) -> String {
+        let definition = format!("#[cfg({cfg})]\npub const {name}");
+        let occurrences = source.matches(&definition).count();
+        assert_eq!(
+            occurrences, 1,
+            "expected exactly one `{name}` definition under `#[cfg({cfg})]`, \
+             found {occurrences}"
+        );
+        let at = source.find(&definition).expect("just counted one");
+        let (declaration, _) = source[at + definition.len()..]
+            .split_once(';')
+            .expect("a const definition with no semicolon");
+        declaration
+            .split_once('=')
+            .expect("a const definition with no initialiser")
+            .1
+            .trim()
+            .to_owned()
+    }
+
+    /// The three `cfg` arms, in the order the cascades write them.
+    const CASCADE_ARMS: [(&str, &str); 3] = [
+        (r#"target_arch = "wasm32""#, "WASM"),
+        (r#"all(not(target_arch = "wasm32"), mobile)"#, "MOBILE"),
+        (
+            r#"all(not(target_arch = "wasm32"), not(mobile))"#,
+            "DESKTOP",
+        ),
+    ];
+
+    /// Each ceiling arm selects **its own** class's constant.
+    ///
+    /// This is the half `all_three_platform_ceilings_are_the_ones_documented`
+    /// cannot reach. That test pins what `WASM_PLATFORM_CEILING` *is*; this one
+    /// pins that the wasm32 arm is the one that picks it. Both mutations were
+    /// run: changing a ceiling's value dies on the first test, pointing an arm
+    /// at another class's constant dies only on this one.
+    #[test]
+    fn each_ceiling_arm_selects_its_own_classs_constant() {
+        let source = include_str!("volume_quality.rs");
+        for (cfg, class) in CASCADE_ARMS {
+            let expected = format!("{class}_PLATFORM_CEILING");
+            assert_eq!(
+                cascade_arm(source, cfg, "PLATFORM_CEILING"),
+                expected,
+                "the `#[cfg({cfg})]` arm of PLATFORM_CEILING does not select \
+                 `{expected}`. A cascade arm pointing at another class's \
+                 constant compiles, passes every host test, and passes the \
+                 wasm `--all-targets` check — it is only visible here."
+            );
+        }
+    }
+
     /// The compiled cascade selects one of the three named ceilings.
     ///
     /// This is the one thing about `PLATFORM_CEILING` that no other target can
