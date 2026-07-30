@@ -39,6 +39,7 @@
 //! reference quantizes NROT in steps of 0.04, so differences below ~0.04
 //! are not observable in its output at all.
 
+use crate::beam::RE_EFF_KM;
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::f64::consts::PI;
@@ -191,8 +192,6 @@ fn preprocess_velocity_with(
     )
 }
 
-/// Effective earth radius for beam-height, km (4/3 model).
-const RE_EFF_KM: f64 = 4.0 / 3.0 * 6371.0;
 /// Wind-profile layer thickness, km.
 const PROFILE_LAYER_KM: f64 = 0.3;
 /// Layers span 0..12 km AGL.
@@ -264,7 +263,7 @@ impl WindProfile {
     /// and elevation (degrees), or None where no layer was fit.
     fn predict(&self, az_rad: f64, range_km: f64, elevation_deg: f64) -> Option<f64> {
         let el = elevation_deg.to_radians();
-        let h = range_km * el.sin() + range_km * range_km / (2.0 * RE_EFF_KM);
+        let h = crate::beam::height_km(range_km, elevation_deg);
         let l = (h / PROFILE_LAYER_KM) as usize;
         let layer = *self
             .layers
@@ -275,6 +274,27 @@ impl WindProfile {
         let (u, v, c) = layer;
         Some(u * az_rad.sin() * el.cos() + v * az_rad.cos() * el.cos() + c)
     }
+}
+
+/// [`crate::beam::height_km`] with `sin(elevation)` already computed.
+///
+/// The one place this crate still writes the beam-height expression out, and it
+/// earns it: [`WindProfileBuilder::add_sweep`] hoists `sin` and `cos` once per
+/// sweep and then runs this over every third gate of every radial — tens of
+/// thousands of evaluations where the shared function would recompute
+/// `to_radians().sin()` each time. (Its sibling in [`WindProfile::predict`]
+/// hoisted nothing, so that one simply calls `beam::height_km`.)
+///
+/// Being a named function rather than an inline expression is the point: it is
+/// what lets `the_hoisted_beam_height_is_bit_identical_to_the_shared_one` pin
+/// the copy against `beam::height_km` **directly**, rather than against a
+/// transcription of it in a test. That matters here more than elsewhere,
+/// because NROT is the one calibrated path the echo-tops golden digests do not
+/// cover, and `(h / PROFILE_LAYER_KM) as usize` **floors** — so a one-ulp drift
+/// at a layer boundary silently moves a sample into the neighbouring wind layer.
+#[inline]
+fn height_km_with_sin_el(range_km: f64, sin_el: f64) -> f64 {
+    range_km * sin_el + range_km * range_km / (2.0 * RE_EFF_KM)
 }
 
 /// Accumulates VAD samples per height layer across the volume's velocity
@@ -305,7 +325,7 @@ impl WindProfileBuilder {
                     continue;
                 }
                 let r = sweep.first_gate_range_km + j as f64 * sweep.gate_interval_km;
-                let h = r * sin_el + r * r / (2.0 * RE_EFF_KM);
+                let h = height_km_with_sin_el(r, sin_el);
                 let l = (h / PROFILE_LAYER_KM) as usize;
                 if l < PROFILE_LAYERS && self.samples[l].len() < PROFILE_MAX_SAMPLES {
                     self.samples[l].push((s, c, *v));
@@ -1979,6 +1999,56 @@ pub(crate) fn dealias_with_knobs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hoisted beam height is the shared one, bit for bit.
+    ///
+    /// This module shares [`crate::beam::RE_EFF_KM`] but still writes the height
+    /// arithmetic out once, in [`height_km_with_sin_el`], because
+    /// [`WindProfileBuilder::add_sweep`] hoists `sin(elevation)` across tens of
+    /// thousands of gates. Sharing a constant does not stop an expression from
+    /// drifting, and NROT is the calibrated path the five pinned echo-tops
+    /// digests never touch — so the copy is pinned here instead.
+    ///
+    /// Bit-exact rather than approximate on purpose: `add_sweep` bins samples
+    /// with `(h / PROFILE_LAYER_KM) as usize`, a **floor**, so a single-ulp
+    /// difference at a layer boundary moves a sample into the adjacent wind
+    /// layer with no error, no NaN and no visible symptom.
+    #[test]
+    fn the_hoisted_beam_height_is_bit_identical_to_the_shared_one() {
+        // The VCP 212 ladder, and gate centres out past the velocity extent.
+        const ELEVS: [f64; 16] = [
+            0.2, 0.5, 0.9, 1.3, 1.8, 2.4, 3.1, 4.0, 5.1, 6.4, 8.0, 10.0, 12.0, 14.0, 16.7, 19.5,
+        ];
+        let mut checked = 0usize;
+        for &e in &ELEVS {
+            let sin_el = e.to_radians().sin();
+            // 0.125 km first-gate centre, 0.25 km gates, 1200 gates -> 300 km.
+            for j in 0..1200 {
+                let r = 0.125 + j as f64 * 0.25;
+                let hoisted = height_km_with_sin_el(r, sin_el);
+                let shared = crate::beam::height_km(r, e);
+                assert_eq!(
+                    hoisted.to_bits(),
+                    shared.to_bits(),
+                    "the hoisted height drifted from `beam::height_km` at \
+                     {r} km / {e}°: {hoisted} vs {shared}",
+                );
+                // The consequence that makes bit-identity load-bearing.
+                assert_eq!(
+                    (hoisted / PROFILE_LAYER_KM) as usize,
+                    (shared / PROFILE_LAYER_KM) as usize,
+                    "the two heights bin to different wind layers at \
+                     {r} km / {e}°",
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(
+            checked,
+            ELEVS.len() * 1200,
+            "precondition: the grid did not cover every tilt × gate",
+        );
+    }
 
     fn sweep_for<'a>(
         vel_grid: &'a [Vec<f64>],

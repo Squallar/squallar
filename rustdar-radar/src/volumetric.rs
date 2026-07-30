@@ -13,12 +13,12 @@
 use crate::types::RadarProduct;
 use nexrad_model::data::{DataMoment, MomentValue, Radial, Scan};
 
-/// Effective earth radius (4/3 model), km.
-const RE_EFF_KM: f64 = 6371.0 * 4.0 / 3.0;
-
 /// Half-power beamwidth of the WSR-88D antenna, degrees. Beam bottom and top
 /// heights sit half of this below and above the tilt centre.
-pub const HALF_POWER_BEAMWIDTH_DEG: f64 = 0.95;
+///
+/// Re-exported from [`crate::beam`], which owns the crate's beam geometry;
+/// [`crate::hail`] imports it from here alongside the rest of the cube's API.
+pub const HALF_POWER_BEAMWIDTH_DEG: f64 = crate::beam::HALF_POWER_BEAMWIDTH_DEG;
 
 /// Reflectivity threshold for echo tops, dBZ.
 const ET_THRESHOLD_DBZ: f32 = 18.3;
@@ -37,9 +37,15 @@ pub struct VolumetricGrid {
 /// Beam-center height above the radar, km, for a slant range and elevation.
 /// `pub(crate)` for [`crate::hail`], whose column geometry has to sit in the
 /// same 4/3-model vertical coordinate the cube's [`BeamHeights`] use.
+///
+/// The arithmetic moved to [`crate::beam::height_km`] — the crate's one home
+/// for beam geometry — bit for bit; this name stays so the cube's own call
+/// sites read in the cube's vocabulary. Every pinned echo-tops digest is a
+/// test of that identity, and `beam::tests::
+/// the_lifted_beam_height_is_bit_identical_to_the_one_volumetric_shipped`
+/// is the local one.
 pub(crate) fn beam_height_km(range_km: f64, elev_deg: f64) -> f64 {
-    let el = elev_deg.to_radians();
-    range_km * el.sin() + range_km * range_km / (2.0 * RE_EFF_KM)
+    crate::beam::height_km(range_km, elev_deg)
 }
 
 /// A sweep's elevation angle: the **median** of its radials' instantaneous

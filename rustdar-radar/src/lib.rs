@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod beam;
 pub mod chunks;
 pub(crate) mod dpprep;
 pub mod eet;
