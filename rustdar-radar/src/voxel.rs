@@ -19,12 +19,12 @@
 //! bilinear in azimuth × slant range per rung, ~64 on a 16-rung VCP 212
 //! ladder — and every height after the first is free, a two-point lerp between
 //! rungs already sampled. So a `nx × ny × nz` grid costs `nx·ny·4·N` gate
-//! reads, not `nx·ny·nz·4·N`. On the desktop shape that is 262 144 columns
-//! against 33.5 M per-voxel samples: **`nz`-fold, 128×**. Per-voxel
-//! [`crate::sampler::VolumeSampler::sample`] calls would be roughly 8× the
-//! gate reads even against a hypothetical bracket-only point query, and 128×
-//! against the one that exists. The loop below therefore runs
-//! `for y { for x { column_into(...); for z { ... } } }` and nothing else.
+//! reads, not `nx·ny·nz·4·N`: an **`nz`-fold** saving, 128× on the desktop
+//! shape. In numbers, [`DESKTOP_SHAPE`] is 65 536 columns over 8 388 608
+//! cells, or 4.2 M gate reads against 537 M on a 16-rung ladder. The loop
+//! below therefore runs `for y { for x { column_into(...); for z { ... } } }`
+//! and nothing else — one [`crate::sampler::VolumeSampler::sample`] per voxel
+//! is the version that does not fit in a frame.
 //!
 //! # Geometry
 //!
@@ -151,9 +151,16 @@
 //! | ρHV | scale 300, offset −60.5 | 0.208 … 1.052 | 0.2 … 1.06 | 0.003386 |
 //!
 //! Four of the six land on the encoding's own quantum exactly, so those four
-//! lose nothing at all. ΦDP and ρHV are marginally coarser than their
-//! encodings (1.417° against 1.408°, 0.00339 against 0.00333) and marginally
-//! finer than anything a viewer can distinguish.
+//! lose nothing at all. ρHV's 0.003386 against its encoding's 0.003333 is a
+//! 1.6 % coarsening, which is under the width of the digit its readout shows.
+//!
+//! **ΦDP is a real loss and is stated as one.** Its 16-bit encoding carries
+//! 1 022 levels of 0.3526° over the turn, and 255 levels of 1.4173° is **4×
+//! coarser**. That is a consequence of the one-byte index — of the format
+//! decision itself, not of where the ramp's bottom sits — and it is bounded:
+//! the ΦDP palette's stops are 15° apart, ten ramp levels each, so no colour
+//! boundary moves. When a caller needs the full precision it asks for
+//! [`VoxelRequest::values_wanted`], which keeps `f32`.
 //!
 //! Velocity's legacy 1 m/s mode reaches ±127 m/s and clamps to the ramp's
 //! ends here. A 64 m/s radial velocity is not meteorological, and the palette
@@ -553,14 +560,18 @@ impl VoxelGrid {
     /// of the whole ramp. `the_fade_band_is_measured_per_product` records
     /// every product's.
     pub fn fade_band(&self) -> u8 {
-        let mut n = 0u16;
-        while n < 256 && self.lut[usize::from(n) * 4 + 3] == 0 {
-            n += 1;
-        }
-        // Saturates rather than wraps: an all-transparent table (which no
-        // samplable product produces) would otherwise report a band of 0, the
-        // exact opposite of the truth.
-        u8::try_from(n.saturating_sub(1)).unwrap_or(u8::MAX)
+        let first_opaque = self
+            .lut
+            .chunks_exact(4)
+            .position(|entry| entry[3] != 0)
+            // A table with no opaque entry at all — which no samplable
+            // product produces — fades over its whole length.
+            .unwrap_or(LUT_LEN / 4);
+        // Entry 0 is forced transparent, so `first_opaque` is at least 1 and
+        // the band is `first_opaque − 1` indices wide. `saturating_sub` rather
+        // than `−` because "index 0 is opaque" would mean a band of 0, not a
+        // panic.
+        first_opaque.saturating_sub(1) as u8
     }
 
     /// The offset of cell `(x, y, z)` in [`indices`](Self::indices) and
