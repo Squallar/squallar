@@ -26,6 +26,9 @@ mod map_overlays;
 mod popups;
 #[path = "ui_menu.rs"]
 mod ui_menu;
+/// The cross-section arming toggle's label, for the same reason.
+#[cfg(test)]
+pub(crate) use ui_menu::DRAW_CROSS_SECTION_LABEL;
 /// What the menu presentations actually drew last frame, for the input harness.
 #[cfg(test)]
 pub(crate) use ui_menu::DrawnMenuLeaf;
@@ -3415,6 +3418,240 @@ mod pane_slice_tests {
 
         assert_eq!(gui.pane(0).unwrap().kind(), PaneKind::Map);
         assert_eq!(gui.pending_pane_kind_for_test(), None);
+    }
+
+    /// A line for the target rule to place, and the pane it was drawn on.
+    fn drawn_line() -> crate::pane::SectionLine {
+        crate::pane::SectionLine::new(
+            crate::pane::GeoPoint {
+                lat: 35.0,
+                lon: -97.8,
+            },
+            crate::pane::GeoPoint {
+                lat: 35.6,
+                lon: -96.9,
+            },
+        )
+        .expect("a fixture line must be finite and have two distinct ends")
+    }
+
+    fn wide(count: usize) -> Gui {
+        let mut gui = Gui::new();
+        gui.layout.width = crate::ui_layout::WidthClass::Expanded;
+        gui.set_pane_count_for_test(count);
+        gui
+    }
+
+    /// Step 1: a second line on the same map re-aims the section already cut
+    /// from it, rather than filling the screen with panes nobody asked for.
+    #[test]
+    fn a_second_line_on_one_map_re_aims_the_section_it_already_feeds() {
+        let mut gui = wide(2);
+        gui.panes[1].set_kind(crate::pane::PaneKind::CrossSection);
+        gui.panes[1].cross_section_mut().unwrap().source_pane = Some(0);
+        let before = gui.pane_count();
+
+        gui.pending_section_line = Some((0, drawn_line()));
+        gui.apply_pending_section_line();
+
+        assert_eq!(gui.pane_count(), before, "the layout grew for a re-aim");
+        assert_eq!(
+            gui.pane(1).unwrap().cross_section().unwrap().line,
+            Some(drawn_line())
+        );
+    }
+
+    /// Step 2: with no section fed by this map, the layout grows and the new
+    /// pane is the section — beside the map it was cut from, which is the
+    /// picture the whole feature is for.
+    #[test]
+    fn a_line_with_nowhere_to_go_grows_the_layout_rather_than_taking_a_map() {
+        let mut gui = wide(1);
+
+        gui.pending_section_line = Some((0, drawn_line()));
+        gui.apply_pending_section_line();
+
+        assert_eq!(gui.pane_count(), 2, "the layout did not grow");
+        assert_eq!(
+            gui.pane(0).unwrap().kind(),
+            crate::pane::PaneKind::Map,
+            "the map survived"
+        );
+        assert_eq!(
+            gui.pane(1).unwrap().kind(),
+            crate::pane::PaneKind::CrossSection
+        );
+        assert_eq!(
+            gui.pane(1).unwrap().cross_section().unwrap().source_pane,
+            Some(0),
+            "the section must remember its map, or the next line converts \
+             another pane instead of re-aiming this one"
+        );
+        assert_eq!(
+            gui.active_pane, 1,
+            "the pane the user just asked for is not the one they are looking at"
+        );
+    }
+
+    /// Steps 3 and 4: a full layout re-aims the lowest section before it
+    /// converts any map, and converts the *highest* map rather than the one
+    /// under the line.
+    #[test]
+    fn a_full_layout_re_aims_a_section_before_it_takes_a_map() {
+        let full = crate::ui_layout::WidthClass::Expanded.max_panes();
+
+        // Step 3: a section exists somewhere, aimed from another map.
+        let mut gui = wide(full);
+        gui.panes[2].set_kind(crate::pane::PaneKind::CrossSection);
+        gui.panes[2].cross_section_mut().unwrap().source_pane = Some(1);
+        gui.pending_section_line = Some((0, drawn_line()));
+        gui.apply_pending_section_line();
+        assert_eq!(gui.pane_count(), full, "a full layout cannot grow");
+        assert_eq!(
+            gui.pane(2).unwrap().cross_section().unwrap().source_pane,
+            Some(0),
+            "the existing section should have been re-aimed and re-sourced"
+        );
+        assert!(
+            (0..full)
+                .filter(|&i| gui.pane(i).unwrap().kind() == crate::pane::PaneKind::Map)
+                .count()
+                == full - 1,
+            "a map was converted while a section was there to re-aim"
+        );
+
+        // Step 4: no section anywhere. The highest-indexed pane converts, and
+        // the map the line was drawn on is left alone.
+        let mut gui = wide(full);
+        gui.pending_section_line = Some((0, drawn_line()));
+        gui.apply_pending_section_line();
+        assert_eq!(
+            gui.pane(0).unwrap().kind(),
+            crate::pane::PaneKind::Map,
+            "the map under the line was taken"
+        );
+        assert_eq!(
+            gui.pane(full - 1).unwrap().kind(),
+            crate::pane::PaneKind::CrossSection
+        );
+    }
+
+    /// The rule is **total**: a drawn line always lands somewhere, at every
+    /// pane count either width class can reach.
+    ///
+    /// The one that most needs saying is a compact layout already at its own
+    /// ceiling — a phone that has split as far as it is allowed to. There, every
+    /// earlier step has failed and the only answer left is to convert a map. A
+    /// silent no-op is the failure this is written against: a drag that produced
+    /// nothing, with nothing on screen to explain it, after the user had gone to
+    /// the menu to arm a mode.
+    ///
+    /// **What is not covered, and cannot be.** The final `unwrap_or(source)` —
+    /// converting the pane drawn on — needs `max_panes() == 1`, and no
+    /// [`WidthClass`](crate::ui_layout::WidthClass) reports that: `Compact` is 4
+    /// and the others 6. It is unreachable today and stays because
+    /// `highest_pane_other_than` returning `None` must mean *something* other
+    /// than dropping the line.
+    #[test]
+    fn a_drawn_line_lands_somewhere_at_every_reachable_pane_count() {
+        use crate::ui_layout::WidthClass;
+        for width in [WidthClass::Compact, WidthClass::Expanded] {
+            for count in 1..=width.max_panes() {
+                let mut gui = Gui::new();
+                gui.layout.width = width;
+                gui.set_pane_count_for_test(count);
+
+                gui.pending_section_line = Some((0, drawn_line()));
+                gui.apply_pending_section_line();
+
+                let sections = gui
+                    .panes()
+                    .iter()
+                    .filter(|p| p.kind() == crate::pane::PaneKind::CrossSection)
+                    .count();
+                assert_eq!(
+                    sections, 1,
+                    "{width:?} with {count} panes placed {sections} sections for one line"
+                );
+                assert_eq!(
+                    gui.pane(0).unwrap().kind(),
+                    crate::pane::PaneKind::Map,
+                    "{width:?} with {count} panes took the map the line was drawn on"
+                );
+                // Grown while it could, and only converted once it could not.
+                let expected = (count + 1).min(width.max_panes());
+                assert_eq!(
+                    gui.pane_count(),
+                    expected,
+                    "{width:?} with {count} panes should have ended at {expected}"
+                );
+            }
+        }
+    }
+
+    /// The section a line lands in adopts the drawing map's site and moment, and
+    /// throws away the picture it was showing.
+    ///
+    /// A section is cut from a *site's* volume, so a target pane that kept its
+    /// own site would cut the line's ground out of the wrong radar — a picture
+    /// that renders perfectly and means nothing. Clearing the old raster matters
+    /// for the interval before the new cut lands: a section of the previous line
+    /// left on screen is of ground the user is no longer pointing at.
+    #[test]
+    fn a_retargeted_section_takes_the_maps_site_and_drops_the_old_picture() {
+        let mut gui = wide(2);
+        gui.panes[0].site = "KTLX".to_owned();
+        gui.panes[0].selected_product = RadarProduct::Velocity;
+        gui.panes[1].site = "KINX".to_owned();
+        gui.panes[1].set_kind(crate::pane::PaneKind::CrossSection);
+        {
+            let section = gui.panes[1].cross_section_mut().unwrap();
+            section.source_pane = Some(0);
+            section.unavailable = Some(crate::pane::SectionUnavailable::RenderFailed);
+        }
+
+        gui.pending_section_line = Some((0, drawn_line()));
+        gui.apply_pending_section_line();
+
+        let pane = gui.pane(1).unwrap();
+        assert_eq!(pane.site, "KTLX");
+        assert_eq!(pane.selected_product, RadarProduct::Velocity);
+        let section = pane.cross_section().unwrap();
+        assert_eq!(section.line, Some(drawn_line()));
+        assert!(section.section.is_none() && section.texture.is_none());
+        assert_eq!(
+            section.rendered_for, None,
+            "a stale key would stop the dispatcher ever cutting the new line"
+        );
+        assert_eq!(
+            section.unavailable, None,
+            "a reason from the previous line outlived its cause"
+        );
+    }
+
+    /// Escape and Android's back cancel the armed draw — last, below every
+    /// painted layer, because it is a mode rather than something on screen.
+    ///
+    /// Being in the chain at all is what stops the back button from exiting the
+    /// app while a mode is on, which is the reading of a back press least likely
+    /// to be what was meant.
+    #[test]
+    fn a_back_press_cancels_an_armed_draw_after_it_has_closed_every_layer() {
+        let mut gui = Gui::new();
+        gui.set_section_draw_armed(true);
+        gui.drawer_open = true;
+
+        assert!(gui.dismiss_top_layer(), "the drawer was open");
+        assert!(
+            gui.section_draw_armed(),
+            "closing the drawer must not also disarm: one layer per press"
+        );
+        assert!(gui.dismiss_top_layer(), "the mode was armed");
+        assert!(!gui.section_draw_armed());
+        assert!(
+            !gui.dismiss_top_layer(),
+            "with nothing left, a back press is a request to leave the app"
+        );
     }
 
     /// Converting a pane keeps everything it was looking at, and tears down the

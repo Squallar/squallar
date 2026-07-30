@@ -532,6 +532,46 @@ impl InputHarness {
         self.warm_up();
     }
 
+    /// Whether the cross-section draw is armed, as the menu checkbox sets it.
+    pub(crate) fn section_draw_armed(&self) -> bool {
+        self.gui.section_draw_armed()
+    }
+
+    /// Arm or disarm the cross-section draw.
+    ///
+    /// The menu entry's own end-to-end click has its own test; this is for the
+    /// pointer tests below, whose subject is the drag rather than the checkbox.
+    pub(crate) fn set_section_draw_armed(&mut self, armed: bool) {
+        self.gui.set_section_draw_armed(armed);
+    }
+
+    /// The line pane `idx` is aimed along, if it is a section pane with one.
+    pub(crate) fn section_line(&self, idx: usize) -> Option<SectionLine> {
+        self.gui.pane(idx)?.cross_section()?.line
+    }
+
+    /// Pane `idx`'s own map centre, as the shipped `render_panes` left it.
+    ///
+    /// Read off `Gui` rather than off the harness' parallel `map_memory`, so a
+    /// test asking "did the map pan?" is asking about the map on screen.
+    pub(crate) fn pane_center(&self, idx: usize) -> Option<walkers::Position> {
+        self.gui.pane(idx)?.map_memory.detached()
+    }
+
+    /// Where pane `idx` is looking at `pos`, on the ground.
+    ///
+    /// Built from the pane's live `MapMemory` and the rect the layout gave it —
+    /// the same two inputs `Map::show` builds its own projector from, which is
+    /// what makes this the map's answer rather than a second Mercator.
+    pub(crate) fn ground_at(&self, idx: usize, pos: egui::Pos2) -> walkers::Position {
+        let rect = self.pane_rects()[idx];
+        let memory = &self.gui.pane(idx).expect("no such pane").map_memory;
+        let centre = memory
+            .detached()
+            .unwrap_or_else(|| walkers::lat_lon(35.3333, -97.2778));
+        walkers::Projector::new(rect, memory, centre).unproject(egui::vec2(pos.x, pos.y))
+    }
+
     /// Convert pane `idx` to a 3D volume pane, as the menu toggle will.
     pub(crate) fn make_pane_volume(&mut self, idx: usize) {
         self.gui
@@ -5998,5 +6038,353 @@ mod tests {
             scrolled,
             "the scroll position did not survive converting another pane"
         );
+    }
+
+    /// 44. **The menu checkbox arms the draw, and a drag on a map becomes a
+    ///     section.**
+    ///
+    ///     Through the drawer's own checkbox, which is where the mode is armed
+    ///     and — just as importantly — where it is turned off again: a mode
+    ///     whose state is invisible is a map that has mysteriously stopped
+    ///     panning.
+    #[test]
+    fn the_drawers_checkbox_arms_the_cross_section_draw() {
+        let mut h = compact_with_drawer();
+        h.load_scan("KTLX");
+        assert!(!h.section_draw_armed(), "precondition: it starts unarmed");
+        assert_eq!(
+            h.menu_leaf(crate::ui::DRAW_CROSS_SECTION_LABEL)
+                .map(|l| l.value),
+            Some(Some(false)),
+            "precondition: the drawer must draw the toggle, unchecked"
+        );
+
+        h.mouse_click(clickable_leaf(&h, crate::ui::DRAW_CROSS_SECTION_LABEL).center());
+        h.frames_for(3, FRAME_DT);
+
+        assert!(h.section_draw_armed(), "the checkbox did not arm the draw");
+        // Arming closes the drawer, and must: at every width where the drawer
+        // *is* the menu it covers the whole map, so leaving it open would arm a
+        // gesture the user has nowhere to make.
+        assert_eq!(
+            h.menu_leaf(crate::ui::DRAW_CROSS_SECTION_LABEL),
+            None,
+            "the drawer stayed open over the map the line has to be drawn on"
+        );
+
+        // Re-opened, the checkbox shows the mode it turned on — which is what a
+        // user who armed it by accident needs in order to un-tick it.
+        h.set_drawer_open(true);
+        h.frames_for(2, FRAME_DT);
+        assert_eq!(
+            h.menu_leaf(crate::ui::DRAW_CROSS_SECTION_LABEL)
+                .map(|l| l.value),
+            Some(Some(true)),
+            "the checkbox does not show the mode it just turned on"
+        );
+
+        // And un-ticking it disarms, so the mode is never a trap.
+        h.mouse_click(clickable_leaf(&h, crate::ui::DRAW_CROSS_SECTION_LABEL).center());
+        h.frames_for(3, FRAME_DT);
+        assert!(
+            !h.section_draw_armed(),
+            "the checkbox could not turn it off"
+        );
+    }
+
+    /// 45. **An armed drag on a map becomes a section aimed where it was drawn.**
+    ///
+    ///     Through the real pointer pipeline, `render_panes`' resolution and the
+    ///     deferred apply.
+    ///
+    ///     Two claims beyond "a pane appeared", and both are about what the
+    ///     drag did *not* do. The map must not have panned — the drag belongs to
+    ///     the line, and a section drawn while the ground slid under it is of
+    ///     nowhere in particular. And the mode must have disarmed itself, or the
+    ///     user's next pan is a second section.
+    #[test]
+    fn an_armed_drag_on_a_map_becomes_a_cross_section_aimed_where_it_was_drawn() {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.load_scan("KTLX");
+        h.set_section_draw_armed(true);
+        h.warm_up();
+
+        let pane = h.pane_rects()[0];
+        let from = pane.center() - egui::vec2(120.0, 60.0);
+        let to = pane.center() + egui::vec2(120.0, 60.0);
+        let centre_before = h.pane_center(0);
+        // Taken **before** the drag, and it has to be: applying the line grows
+        // the layout, which halves pane 0's rect and therefore changes what
+        // every pixel in it names. Recomputing afterwards would compare the line
+        // against a projector that never drew it.
+        let want_a = h.ground_at(0, from);
+        let want_b = h.ground_at(0, to);
+
+        h.mouse_move(from);
+        h.frame();
+        h.mouse_press(from);
+        h.frame();
+        for step in 1..=4 {
+            h.mouse_move(from + (to - from) * (step as f32 / 4.0));
+            h.frame();
+        }
+        h.mouse_release(to);
+        h.frames_for(2, FRAME_DT);
+
+        assert!(
+            !h.section_draw_armed(),
+            "the mode stayed armed after producing a line: the next pan is a \
+             second section"
+        );
+        assert_eq!(
+            h.pane_center(0),
+            centre_before,
+            "the map panned during the draw — the drag belongs to the line"
+        );
+
+        let target = h
+            .pane_kinds()
+            .iter()
+            .position(|k| *k == PaneKind::CrossSection)
+            .expect("the drag produced no section pane");
+        let line = h
+            .section_line(target)
+            .expect("the section pane has no line");
+        // A thousandth of a degree — about 90 m, or a third of a pixel at this
+        // zoom. Loose enough to absorb walkers still settling its zoom
+        // animation across the warm-up frames, and three orders of magnitude
+        // tighter than the failure it is written against: an endpoint mapped
+        // through the wrong rect, or through no projector at all, lands
+        // kilometres away or in Kansas.
+        assert!(
+            (line.a().lat - want_a.y()).abs() < 1e-3 && (line.a().lon - want_a.x()).abs() < 1e-3,
+            "the line starts at {:?}, not under the press at {want_a:?}",
+            line.a()
+        );
+        assert!(
+            (line.b().lat - want_b.y()).abs() < 1e-3 && (line.b().lon - want_b.x()).abs() < 1e-3,
+            "the line ends at {:?}, not under the release at {want_b:?}",
+            line.b()
+        );
+        assert_ne!(
+            line.a(),
+            line.b(),
+            "both ends resolved to the same ground, so the drag is not being read"
+        );
+    }
+
+    /// 46. **A wheel-zoom part-way through a drag does not move the anchor.**
+    ///
+    ///     The reason the anchor is stored as *ground* and converted inside
+    ///     `Map::show` on the press frame. An armed draw suppresses panning but
+    ///     not zooming — walkers reads the wheel itself — so with a pixel anchor
+    ///     a mid-drag notch would silently re-aim the line's near end while the
+    ///     far end tracked the finger, and the section would be a convincing
+    ///     picture of ground nobody pointed at.
+    ///
+    ///     Compared against the *same drag without the wheel* rather than
+    ///     against a recomputed projection, so the claim is exact and needs no
+    ///     tolerance: two identical presses on two identically warmed harnesses
+    ///     must produce the same anchor, whatever happened afterwards.
+    ///
+    ///     And the release end must **differ**, which is the calibration: it
+    ///     proves the zoom really landed and really changed what a pixel means,
+    ///     so the anchor's stability is a property of the anchor rather than of
+    ///     a wheel event that went nowhere.
+    #[test]
+    fn a_wheel_zoom_mid_drag_leaves_the_anchor_on_the_ground_it_was_put_on() {
+        fn drag(zoom_mid_drag: bool) -> (SectionLine, f64) {
+            let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+            h.load_scan("KTLX");
+            h.set_section_draw_armed(true);
+            h.warm_up();
+
+            let pane = h.pane_rects()[0];
+            let from = pane.center() - egui::vec2(120.0, 60.0);
+            let to = pane.center() + egui::vec2(120.0, 60.0);
+
+            h.mouse_move(from);
+            h.frame();
+            h.mouse_press(from);
+            h.frame();
+
+            if zoom_mid_drag {
+                h.wheel_notch(pane.center(), egui::MouseWheelUnit::Line, -3.0);
+            }
+            h.frames_for(6, FRAME_DT);
+
+            h.mouse_move(to);
+            h.frame();
+            h.mouse_release(to);
+            h.frames_for(2, FRAME_DT);
+
+            let target = h
+                .pane_kinds()
+                .iter()
+                .position(|k| *k == PaneKind::CrossSection)
+                .expect("the drag produced no section pane");
+            let zoom = h.gui_mut().pane(0).unwrap().map_memory.zoom();
+            (
+                h.section_line(target)
+                    .expect("the section pane has no line"),
+                zoom,
+            )
+        }
+
+        let (plain, plain_zoom) = drag(false);
+        let (zoomed, zoomed_zoom) = drag(true);
+
+        assert!(
+            (plain_zoom - zoomed_zoom).abs() > 0.05,
+            "precondition: the wheel must really have zoomed ({plain_zoom} -> \
+             {zoomed_zoom}), or nothing below distinguishes a held anchor from \
+             an ignored wheel event"
+        );
+        assert_eq!(
+            plain.a(),
+            zoomed.a(),
+            "the zoom moved the anchor: it is being held as a pixel, so the \
+             line's near end drifted to whatever ground that pixel names now"
+        );
+        assert_ne!(
+            plain.b(),
+            zoomed.b(),
+            "the release end did not move, so the zoom changed nothing about \
+             what a pixel means and the assertion above proves nothing"
+        );
+    }
+
+    /// 46. **A tap while armed is discarded, and the mode stays armed.**
+    ///
+    ///     A stray tap is the single most likely thing to happen right after
+    ///     arming — it is how a user checks which pane they are on. Turning it
+    ///     into a zero-ish-length section is wrong; *silently disarming* is
+    ///     worse, because the intent the user just expressed is gone with
+    ///     nothing on screen to say so.
+    #[test]
+    fn a_tap_while_armed_draws_nothing_and_leaves_the_mode_armed() {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.load_scan("KTLX");
+        h.set_section_draw_armed(true);
+        h.warm_up();
+
+        let pane = h.pane_rects()[0];
+        let at = pane.center();
+        h.mouse_move(at);
+        h.frame();
+        h.mouse_press(at);
+        h.frame();
+        // Under `MIN_SECTION_DRAG_PT` (24), and deliberately not zero: a
+        // threshold mutated to `> 0.0` would pass a test that never moved.
+        h.mouse_move(at + egui::vec2(9.0, 6.0));
+        h.frame();
+        h.mouse_release(at + egui::vec2(9.0, 6.0));
+        h.frames_for(2, FRAME_DT);
+
+        assert!(
+            h.pane_kinds().iter().all(|k| *k == PaneKind::Map),
+            "an 11-point drag became a cross-section"
+        );
+        assert!(
+            h.section_draw_armed(),
+            "a discarded drag disarmed the mode, throwing away the intent"
+        );
+
+        // And a real drag straight afterwards still works, so "stays armed"
+        // means armed rather than merely not-disarmed.
+        let to = at + egui::vec2(150.0, 90.0);
+        h.mouse_press(at);
+        h.frame();
+        h.mouse_move(to);
+        h.frame();
+        h.mouse_release(to);
+        h.frames_for(2, FRAME_DT);
+        assert!(
+            h.pane_kinds().iter().any(|k| *k == PaneKind::CrossSection),
+            "the still-armed mode did not draw the next line"
+        );
+    }
+
+    /// 47. **While armed, a press on a map fires no overlay click and the map
+    ///     does not pan** — for every pane the frame resolves, not just the one
+    ///     the line is on.
+    ///
+    ///     `ArmedSectionFrame` makes both properties of the returned value
+    ///     rather than rules each caller remembers, and this reads them back out
+    ///     of the probe `render_panes` records from the very locals that feed
+    ///     `PaneRenderCtx` and `drag_pan_buttons`.
+    #[test]
+    fn an_armed_press_suppresses_panning_and_fires_no_overlay_click() {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.load_scan("KTLX");
+        h.warm_up();
+
+        let pane = h.pane_rects()[0];
+        let at = pane.center();
+
+        // Unarmed first, so the assertion below is about being armed rather
+        // than about a click that never happens.
+        let unarmed = h.mouse_click(at);
+        assert!(
+            unarmed.resolved.overlay_click_pos.is_some(),
+            "precondition: an unarmed click must reach the overlays"
+        );
+        assert!(!unarmed.resolved.suppress_pan, "precondition");
+
+        h.set_section_draw_armed(true);
+        h.warm_up();
+        h.mouse_move(at);
+        h.frame();
+        let pressed = {
+            h.mouse_press(at);
+            h.frame()
+        };
+        assert_eq!(
+            pressed.resolved.overlay_click_pos, None,
+            "a press that starts a section line also opened an overlay popup \
+             over the map being drawn on"
+        );
+        assert!(
+            pressed.resolved.suppress_pan,
+            "the map was left free to pan while a line was being drawn"
+        );
+        h.mouse_release(at);
+        h.frames_for(2, FRAME_DT);
+    }
+
+    /// 48. **A pane that is not a map ignores the armed mode entirely.**
+    ///
+    ///     A line is aimed with a projector and a section pane has none, so
+    ///     arming the mode with one active leaves it exactly as it was — and in
+    ///     particular does not suppress that pane's pointer or swallow its
+    ///     clicks. The press that picks a map out of the layout is the same
+    ///     press that starts the line, because `detect_active_pane_click` runs
+    ///     at the top of the frame.
+    #[test]
+    fn arming_the_draw_changes_nothing_for_a_pane_with_no_map() {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.set_pane_count(2);
+        h.load_scan("KTLX");
+        h.make_pane_unaimed_cross_section(0);
+        h.set_section_draw_armed(true);
+        h.warm_up();
+
+        let at = h.pane_rects()[0].center();
+        h.mouse_move(at);
+        h.frame();
+        h.mouse_press(at);
+        let pressed = h.frame();
+        assert!(
+            !pressed.resolved.suppress_pan,
+            "arming the draw suppressed panning on a pane that cannot be drawn on"
+        );
+        h.mouse_release(at);
+        h.frames_for(2, FRAME_DT);
+        assert_eq!(
+            h.section_line(0),
+            None,
+            "a drag on a section pane aimed it at itself"
+        );
+        assert!(h.section_draw_armed(), "the mode should still be waiting");
     }
 }

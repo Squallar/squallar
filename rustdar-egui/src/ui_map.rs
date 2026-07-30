@@ -420,6 +420,7 @@ impl super::Gui {
                                 &mut child_ui,
                                 &mut pane,
                                 pane_rect,
+                                horizontal_color_scale,
                                 &self.preferences,
                             );
                             // The plan view's own colour bar, reused verbatim:

@@ -75,6 +75,16 @@ const TILT_CURVE_SAMPLES: usize = 64;
 /// Feet per kilometre, for the height axis in a `Feet` locale.
 const KM_TO_KFT: f64 = 1.0 / 0.3048;
 
+/// Room left along whichever edge the colour bar took, in points.
+///
+/// `render_color_scale` is reused verbatim for a section pane — the scale is a
+/// property of the moment, and two spellings of one legend is how they come to
+/// disagree — but it paints straight onto the pane rect with no notion of what
+/// else is in there. `SCALE_MARGIN` (16) plus `SCALE_BAR_WIDTH` (20) plus the
+/// value labels beside the bar; rounded up so a three-digit label does not
+/// overhang the section.
+const COLOR_SCALE_RESERVE: f32 = 64.0;
+
 /// Draw a section pane: the picture, its axes, the tilt ladder over it, and the
 /// caption that says what it is.
 ///
@@ -85,6 +95,7 @@ pub(super) fn render_cross_section(
     ui: &mut egui::Ui,
     pane: &mut PaneState,
     pane_rect: egui::Rect,
+    horizontal_color_scale: bool,
     prefs: &UserPreferences,
 ) {
     pane.hover_value = None;
@@ -120,7 +131,7 @@ pub(super) fn render_cross_section(
     let unavailable = state.unavailable;
 
     let axes = *section.axes();
-    let layout = SectionLayout::new(pane_rect, unavailable.is_some());
+    let layout = SectionLayout::new(pane_rect, unavailable.is_some(), horizontal_color_scale);
 
     let painter = ui.painter().with_clip_rect(pane_rect);
     painter.rect_filled(pane_rect, 0.0, ui.visuals().extreme_bg_color);
@@ -189,7 +200,12 @@ struct SectionLayout {
 }
 
 impl SectionLayout {
-    fn new(pane_rect: egui::Rect, has_status_line: bool) -> Self {
+    /// `horizontal_color_scale` is the orientation `ColorScaleOrientation`
+    /// resolved for the whole panel, and it is an *input* here rather than
+    /// something read back afterwards: the colour bar is painted straight onto
+    /// the pane rect by `render_color_scale`, so the plot has to leave room on
+    /// whichever edge the bar took, or the bar lands on top of the section.
+    fn new(pane_rect: egui::Rect, has_status_line: bool, horizontal_color_scale: bool) -> Self {
         let two_line_caption = pane_rect.height() >= TWO_LINE_CAPTION_MIN_HEIGHT;
         let labelled_axes = pane_rect.height() >= LABELLED_AXES_MIN_HEIGHT;
         let caption_lines =
@@ -204,9 +220,17 @@ impl SectionLayout {
         } else {
             (2.0, 2.0)
         };
+        let (scale_right, scale_bottom) = if horizontal_color_scale {
+            (0.0, COLOR_SCALE_RESERVE)
+        } else {
+            (COLOR_SCALE_RESERVE, 0.0)
+        };
         let plot = egui::Rect::from_min_max(
             egui::pos2(pane_rect.left() + left, caption.bottom() + 2.0),
-            egui::pos2(pane_rect.right() - 4.0, pane_rect.bottom() - bottom),
+            egui::pos2(
+                pane_rect.right() - 4.0 - scale_right,
+                pane_rect.bottom() - bottom - scale_bottom,
+            ),
         );
         Self {
             plot,
@@ -374,7 +398,12 @@ fn paint_tilt_ladder(
     if elevations.len() != axes.tilt_count || elevations.is_empty() {
         return;
     }
-    let color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70);
+    // A dark halo under a bright dash, the same trick the ground track uses.
+    // Alpha alone does not survive a 65 dBZ core: a faint white line over red
+    // disappears exactly where the section most needs to say that its vertical
+    // extent is the ladder's rather than the storm's.
+    let halo = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 90);
+    let color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 130);
     let painter = painter.with_clip_rect(layout.plot);
 
     // The ground range of each sample point, computed once and shared by every
@@ -402,6 +431,7 @@ fn paint_tilt_ladder(
         // mistaken for.
         for pair in points.windows(2) {
             let mid = pair[0] + (pair[1] - pair[0]) * 0.55;
+            painter.line_segment([pair[0], mid], egui::Stroke::new(3.0, halo));
             painter.line_segment([pair[0], mid], egui::Stroke::new(1.0, color));
         }
     }
@@ -623,7 +653,7 @@ mod tests {
     #[test]
     fn the_top_of_the_axis_is_the_top_of_the_plot() {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
-        let layout = SectionLayout::new(rect, false);
+        let layout = SectionLayout::new(rect, false, false);
         let axes = axes();
 
         assert_eq!(
@@ -652,7 +682,7 @@ mod tests {
     #[test]
     fn a_degenerate_axis_maps_to_the_edges_rather_than_to_nan() {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
-        let layout = SectionLayout::new(rect, false);
+        let layout = SectionLayout::new(rect, false, false);
         let flat = SectionAxes {
             length_km: 0.0,
             top_km_msl: 0.4,
@@ -714,12 +744,14 @@ mod tests {
         let tall = SectionLayout::new(
             egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 400.0)),
             false,
+            false,
         );
         assert!(tall.two_line_caption);
         assert!(tall.labelled_axes);
 
         let short = SectionLayout::new(
             egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 200.0)),
+            false,
             false,
         );
         assert!(!short.two_line_caption);
@@ -728,6 +760,7 @@ mod tests {
 
         let tiny = SectionLayout::new(
             egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 110.0)),
+            false,
             false,
         );
         assert!(!tiny.labelled_axes, "no room for labels at 110 points");
@@ -742,8 +775,8 @@ mod tests {
     #[test]
     fn a_status_line_takes_room_from_the_picture_not_from_the_warning() {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 400.0));
-        let without = SectionLayout::new(rect, false);
-        let with = SectionLayout::new(rect, true);
+        let without = SectionLayout::new(rect, false, false);
+        let with = SectionLayout::new(rect, true, false);
         assert!(with.caption.height() > without.caption.height());
         assert!(with.plot.top() > without.plot.top());
         assert!(with.plot.height() < without.plot.height());
