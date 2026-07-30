@@ -28,6 +28,10 @@ mod ui_menu;
 /// What the menu presentations actually drew last frame, for the input harness.
 #[cfg(test)]
 pub(crate) use ui_menu::DrawnMenuLeaf;
+/// The 3D-pane toggle's label, for the input harness — so the tests that look
+/// the entry up by name cannot go on passing after it is renamed.
+#[cfg(test)]
+pub(crate) use ui_menu::VOLUME_PANE_LABEL;
 #[path = "ui_map.rs"]
 mod map;
 /// The copy the two non-map pane arms paint, for the input harness — so a test
@@ -277,6 +281,32 @@ pub struct Gui {
     /// box showed. Only read by tests — see [`DrawnDropdown`].
     #[cfg(test)]
     last_dropdowns: Vec<DrawnDropdown>,
+    /// A pane the user has asked to convert, applied once the UI pass is over.
+    ///
+    /// # Why this cannot be a direct write
+    ///
+    /// Two production paths hold a `PaneState` out of `Gui::panes` with
+    /// `std::mem::take` for the whole of a UI pass — `render_layers_panel` takes
+    /// the active pane, and `render_panes` takes each pane in turn — leaving a
+    /// default `PaneState` in the slot. The menu dispatcher runs from inside
+    /// `render_layers_panel`, so a `self.panes[self.active_pane].set_kind(..)`
+    /// there writes the **placeholder**, and the real pane going back on the next
+    /// line discards it. The menu item does nothing whatsoever: no panic, no
+    /// warning, no failing test, and a checkbox that will not stay checked.
+    ///
+    /// So the intent is recorded and [`Self::apply_pending_pane_kind`] applies it
+    /// after the pane loop, which is the same shape the drawn-cross-section line
+    /// uses for a related reason (growing the pane count mid-loop moves the rects
+    /// of panes the loop has not reached, desynchronising them from the ones
+    /// `detect_active_pane_click` hit-tested this frame).
+    ///
+    /// One request at a time, not a queue. The requests are per pane and
+    /// idempotent, they can only come from a single click, and a queue would let
+    /// one frame convert a pane twice — which would throw away the per-kind state
+    /// the intermediate kind had just been given.
+    ///
+    /// Pinned by `a_pane_kind_request_survives_the_pane_being_held_out_of_the_vector`.
+    pending_pane_kind: Option<(PaneId, crate::pane::PaneKind)>,
     viewport_sync: bool,
     sync_layers: bool,
     // --- Radar loop settings ---
@@ -633,6 +663,7 @@ impl Gui {
             last_status_bar: StatusBarProbe::default(),
             #[cfg(test)]
             last_dropdowns: Vec::new(),
+            pending_pane_kind: None,
             viewport_sync: true,
             sync_layers: true,
             loop_lookback_secs: 3600, // default 1 hour
@@ -711,6 +742,12 @@ impl Gui {
         }
 
         actions.extend(self.render_panes(&mut root_ui, &chrome.excluded_rects));
+
+        // After the pane loop, and therefore after every `mem::take` window in
+        // the frame has closed. See the `pending_pane_kind` field for why
+        // converting a pane cannot be a direct write from the dispatcher that
+        // asked for it.
+        self.apply_pending_pane_kind();
 
         // Floating windows last, so they layer above the chrome and the map.
         self.render_overlay_popup(ctx);
@@ -1166,6 +1203,35 @@ impl Gui {
     ///
     /// Covers: radar product/elevation, radar loop, SPC outlooks, SPC discussions,
     /// NWS alerts, city labels, radar sites, and viewport sync toggles.
+    ///
+    /// # The kind-specific block goes in one child scope
+    ///
+    /// Which controls make sense depends on what the pane *is*, so the block that
+    /// draws them sits inside a single `scope_builder` — and that, rather than the
+    /// id form, is the load-bearing part. `Ui::new_child` folds the parent's
+    /// `next_auto_id_salt` into every child's registered id, so drawn straight
+    /// onto this `Ui` the two branches would advance that counter by different
+    /// amounts: a map pane draws a loop transport and the whole overlay tree, a
+    /// volume pane draws neither. **Everything after them would then come back
+    /// under new ids the moment a pane was converted**, including the drawer menu
+    /// below, which at every width without a menu bar is the only route to Exit
+    /// and Settings. One child scope advances the counter by exactly one whichever
+    /// branch ran. Pinned by
+    /// `converting_the_active_pane_does_not_re_key_the_drawer_menu`.
+    ///
+    /// The scope's id is [`egui::UiBuilder::id`] — the one form taking
+    /// `IdSource::Explicit`, which makes the child's `unique_id` equal its
+    /// `stable_id` and takes the parent's counter out of it entirely, as
+    /// `ui_chrome.rs`'s `status_error` note records. Here that is **defence, not a
+    /// fix for a live difference**, and it is worth saying so rather than
+    /// implying more: with `id_salt` the scope's `stable_id` would be the same
+    /// value, so everything keyed on it — the two combo boxes and the time-step
+    /// picker, i.e. all the stored state in here — would not move either, and
+    /// mutating the one form into the other fails no test. What the explicit form
+    /// buys is independence from *what precedes it*: `render_pane_selector` above
+    /// draws a button per offered pane count and a second row once the layout is
+    /// split, so the counter at this position moves when the pane count does, and
+    /// only the explicit id keeps this scope's children out of that.
     fn render_layer_controls(
         &mut self,
         ui: &mut egui::Ui,
@@ -1174,24 +1240,56 @@ impl Gui {
         id_prefix: &str,
         actions: &mut Vec<GuiAction>,
     ) {
-        self.render_radar_controls(ui, pane, combo_width, id_prefix);
+        let kind_scope = egui::UiBuilder::new().id(ui.id().with("pane_kind_controls"));
+        ui.scope_builder(kind_scope, |ui| {
+            // On `pane`, the value the caller took out of the vector — never
+            // `self.panes[..]`, which for the whole of this pass holds a default
+            // `PaneState` and therefore reads as a *map* pane whatever the real
+            // one is. This is the same hazard `menu_model` has, with the same fix.
+            match pane.kind() {
+                crate::pane::PaneKind::Map => {
+                    self.render_radar_controls(ui, pane, combo_width, id_prefix);
 
-        // --- Time navigation (forward/back/live) ---
-        self.render_time_navigation(ui, pane, id_prefix, actions);
+                    // --- Time navigation (forward/back/live) ---
+                    self.render_time_navigation(ui, pane, id_prefix, actions);
 
-        // --- Radar loop controls ---
-        self.render_loop_controls(ui, pane, actions);
+                    // --- Radar loop controls ---
+                    self.render_loop_controls(ui, pane, actions);
 
-        ui.add_space(6.0);
-        ui.separator();
+                    ui.add_space(6.0);
+                    ui.separator();
 
-        // --- Handler-backed overlay controls (generic) ---
-        self.render_overlay_controls(ui, pane, actions);
+                    // --- Handler-backed overlay controls (generic) ---
+                    self.render_overlay_controls(ui, pane, actions);
+                }
+                // A section and a volume pane get the product picker and time
+                // navigation, and nothing else.
+                //
+                // No tilt picker: both read the whole ladder, so there is nothing
+                // to choose — see `render_radar_controls`. No loop transport: a
+                // loop frame *is* a rendered plan-view tilt, and both
+                // `loop_sync_targets` and `App::dispatch_loop_renders` now decline
+                // to feed a pane like this, so the control would enable a loop
+                // that never fills. No overlay tree: every entry in it is a layer
+                // drawn over map tiles, geo-positioned against a projector this
+                // pane does not have.
+                crate::pane::PaneKind::CrossSection | crate::pane::PaneKind::Volume => {
+                    self.render_radar_controls(ui, pane, combo_width, id_prefix);
+                    self.render_time_navigation(ui, pane, id_prefix, actions);
+                }
+            }
+        });
 
         ui.add_space(6.0);
         ui.separator();
 
         // --- Viewport sync ---
+        //
+        // Outside the kind scope: both settings are properties of the *layout*
+        // rather than of the active pane, and they stay meaningful with a non-map
+        // pane on screen — `sync_layers` still converges site, product and time
+        // across every pane, and `sync_viewports` still holds the map panes
+        // together while leaving this one alone.
         if self.pane_layout.pane_count > 1 {
             ui.checkbox(&mut self.viewport_sync, "\u{1f517}  Sync Viewports");
             ui.checkbox(&mut self.sync_layers, "\u{1f517}  Sync Layers");
@@ -1199,30 +1297,56 @@ impl Gui {
         }
     }
 
-    /// Render radar product/elevation combo boxes (shown when Radar is enabled).
+    /// Render the radar product picker, and the tilt picker where a tilt means
+    /// anything.
     fn render_radar_controls(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
         pane: &mut PaneState,
         combo_width: f32,
         id_prefix: &str,
     ) {
-        if pane.is_overlay_enabled(OverlayKind::Radar) {
+        // The Radar overlay toggle governs whether the *map* draws the radar
+        // image over its tiles, which is not a question a pane with no map has.
+        // Gated on it, a section or a volume pane converted while the toggle
+        // happened to be off would have no way to choose a product at all — a
+        // control that is simply absent, for a reason nothing on screen explains.
+        if pane.is_map() && !pane.is_overlay_enabled(OverlayKind::Radar) {
+            return;
+        }
+        // A whole-volume pane has no tilt to pick: it reads the entire ladder,
+        // which is what `PaneKind::consumes_whole_volume` means, so every entry in
+        // the combo would select the same picture. `selected_elevation` stays on
+        // the pane, inert, so converting back to a map restores the tilt it had.
+        let offer_tilt = !pane.kind().consumes_whole_volume();
+        // Reported the way `time_step_sel` is, and for the same reason: a test
+        // rebuilding these ids from the same format strings could agree with a
+        // panel that drew neither control. *Which* of the two appear is how a test
+        // sees the product picker survive a conversion while the tilt picker does
+        // not.
+        #[cfg(test)]
+        let probes = &mut self.widget_id_probes;
+        {
             ui.indent(format!("{id_prefix}radar_controls"), |ui| {
                 if let Some(scan_info) = &pane.scan_info {
                     let prev_product = pane.selected_product;
-                    egui::ComboBox::from_id_salt(format!("{id_prefix}product_sel"))
-                        .selected_text(pane.selected_product.name())
-                        .width(combo_width)
-                        .show_ui(ui, |ui| {
-                            for product in &scan_info.available_products {
-                                ui.selectable_value(
-                                    &mut pane.selected_product,
-                                    *product,
-                                    product.name(),
-                                );
-                            }
-                        });
+                    let product_combo =
+                        egui::ComboBox::from_id_salt(format!("{id_prefix}product_sel"))
+                            .selected_text(pane.selected_product.name())
+                            .width(combo_width)
+                            .show_ui(ui, |ui| {
+                                for product in &scan_info.available_products {
+                                    ui.selectable_value(
+                                        &mut pane.selected_product,
+                                        *product,
+                                        product.name(),
+                                    );
+                                }
+                            });
+                    #[cfg(test)]
+                    probes.push(("product_sel", product_combo.response.id));
+                    #[cfg(not(test))]
+                    let _ = product_combo;
                     if prev_product != pane.selected_product {
                         pane.selected_elevation = 0.0;
                     }
@@ -1238,8 +1362,9 @@ impl Gui {
                     // unpopulated is the honest state: the product is selected, the
                     // selection stands (`get_rendering_params` leaves it unsnapped),
                     // and there is nothing to choose between yet.
-                    if let Some(elevations) =
-                        scan_info.product_elevations.get(&pane.selected_product)
+                    if let Some(elevations) = offer_tilt
+                        .then(|| scan_info.product_elevations.get(&pane.selected_product))
+                        .flatten()
                     {
                         let selected_angle = elevations
                             .iter()
@@ -1253,25 +1378,35 @@ impl Gui {
                         let combo = egui::ComboBox::from_id_salt(format!("{id_prefix}elev_sel"))
                             .selected_text(format!("{:.1}\u{b0}", selected_angle))
                             .width(combo_width);
-                        if elevations.is_empty() {
+                        let elev_combo = if elevations.is_empty() {
                             // Nothing to pick from, so the control is inert rather
                             // than an empty menu that opens onto nothing.
-                            ui.add_enabled_ui(false, |ui| {
-                                combo.show_ui(ui, |_| {});
-                            })
-                            .response
-                            .on_hover_text("Waiting for this product's data");
+                            let scope = ui.add_enabled_ui(false, |ui| combo.show_ui(ui, |_| {}));
+                            let id = scope.inner.response.id;
+                            scope
+                                .response
+                                .on_hover_text("Waiting for this product's data");
+                            id
                         } else {
-                            combo.show_ui(ui, |ui| {
-                                for angle in elevations.iter() {
-                                    ui.selectable_value(
-                                        &mut pane.selected_elevation,
-                                        *angle,
-                                        format!("{:.1}\u{b0}", angle),
-                                    );
-                                }
-                            });
-                        }
+                            combo
+                                .show_ui(ui, |ui| {
+                                    for angle in elevations.iter() {
+                                        ui.selectable_value(
+                                            &mut pane.selected_elevation,
+                                            *angle,
+                                            format!("{:.1}\u{b0}", angle),
+                                        );
+                                    }
+                                })
+                                .response
+                                .id
+                        };
+                        // Both branches, so the probe reports the control existing
+                        // rather than the elevation list happening to be populated.
+                        #[cfg(test)]
+                        probes.push(("elev_sel", elev_combo));
+                        #[cfg(not(test))]
+                        let _ = elev_combo;
                     }
                 } else {
                     ui.label("No scan loaded");
@@ -1834,6 +1969,53 @@ impl Gui {
     /// Get a specific pane by index (mutable), or `None` if out of bounds.
     pub fn pane_mut(&mut self, idx: usize) -> Option<&mut PaneState> {
         self.panes.get_mut(idx)
+    }
+
+    /// Ask for pane `pane_idx` to become `kind`, taking effect at the end of the
+    /// frame.
+    ///
+    /// **The only route by which the UI may change a pane's kind.**
+    /// `PaneState::set_kind` is the mechanism and stays reachable for the config
+    /// loader and for test fixtures, but nothing drawing a frame may call it:
+    /// during the UI pass the pane it would write is a `mem::take` placeholder
+    /// about to be thrown away. See the [`pending_pane_kind`](Self::pending_pane_kind)
+    /// field.
+    ///
+    /// Out-of-range indices are recorded and dropped on application rather than
+    /// refused here, so a caller inside the UI pass never has to know whether the
+    /// vector currently holds the pane it is drawing.
+    pub(crate) fn request_pane_kind(&mut self, pane_idx: PaneId, kind: crate::pane::PaneKind) {
+        self.pending_pane_kind = Some((pane_idx, kind));
+    }
+
+    /// Apply the pane conversion the frame asked for, if any.
+    ///
+    /// Called from [`Self::ui`] after the pane loop, where every pane is back in
+    /// the vector. Converting a pane keeps everything about what it is looking
+    /// at — see `PaneState::set_kind` — so there is nothing else to carry across.
+    fn apply_pending_pane_kind(&mut self) {
+        let Some((pane_idx, kind)) = self.pending_pane_kind.take() else {
+            return;
+        };
+        match self.panes.get_mut(pane_idx) {
+            Some(pane) => pane.set_kind(kind),
+            // A pane the layout no longer holds, which a pane-count change in the
+            // same frame can produce. Dropped rather than clamped to another
+            // index: converting a pane the user did not point at is worse than
+            // converting none.
+            None => log::warn!("pane {pane_idx} is gone; not converting it to {kind:?}"),
+        }
+    }
+
+    /// The pane conversion this frame recorded and has not applied yet.
+    ///
+    /// Read by `ui_menu`'s dispatcher fingerprint, which has to be able to see
+    /// that the toggle's arm did something: recording the request *is* what that
+    /// arm does, and applying it is a separate step with its own test. Nothing in
+    /// production reads it — the applier takes the field directly.
+    #[cfg(test)]
+    pub(crate) fn pending_pane_kind_for_test(&self) -> Option<(PaneId, crate::pane::PaneKind)> {
+        self.pending_pane_kind
     }
 
     /// Whether pane `idx` is a pane the **plan-view** pipeline must skip: it
@@ -2483,6 +2665,106 @@ mod pane_slice_tests {
             gui.pane(0).unwrap().map_memory.zoom(),
             gui.pane(1).unwrap().map_memory.zoom(),
         );
+    }
+
+    /// A pane conversion asked for during the UI pass lands on the **real** pane,
+    /// not on the placeholder standing in for it.
+    ///
+    /// This is the pin on the write half of the `mem::take` hazard, and it is the
+    /// one the type system cannot help with. Two production paths hold a
+    /// `PaneState` out of the vector for a whole UI pass — `render_layers_panel`
+    /// takes the active pane, `render_panes` takes each pane in turn — leaving a
+    /// default `PaneState` in the slot. The menu dispatcher runs from inside
+    /// `render_layers_panel`, so the obvious implementation of the toggle's arm,
+    ///
+    /// ```ignore
+    /// self.panes[self.active_pane].set_kind(kind);
+    /// ```
+    ///
+    /// writes the *placeholder*, and the line that puts the real pane back
+    /// discards it. The menu item does nothing at all: no panic, no warning, and
+    /// a checkbox that will not stay checked.
+    ///
+    /// The window is reproduced here exactly as those two functions create it —
+    /// take, dispatch, restore — so an implementation that wrote directly fails
+    /// this and nothing else. Driven through `apply_menu_event` rather than
+    /// through `request_pane_kind`, so it covers the arm and the mechanism
+    /// together; the end-to-end version through a real click is
+    /// `converting_the_active_pane_from_the_drawer_makes_it_a_volume_pane`.
+    #[test]
+    fn a_pane_kind_request_survives_the_pane_being_held_out_of_the_vector() {
+        use super::ui_menu::{MenuEvent, MenuToggle};
+        use crate::pane::PaneKind;
+
+        let mut gui = Gui::new();
+        gui.set_pane_count_for_test(2);
+        gui.active_pane = 1;
+        assert_eq!(
+            gui.pane(1).unwrap().kind(),
+            PaneKind::Map,
+            "precondition: the pane starts as a map"
+        );
+        // Something on the real pane that the placeholder does not have, so the
+        // restore below can be shown to have really put the original back rather
+        // than to have left a default in place.
+        gui.pane_mut(1).unwrap().site = "KDDC".to_owned();
+
+        let held = std::mem::take(&mut gui.panes[gui.active_pane]);
+        assert_eq!(
+            gui.panes[1].site, "KTLX",
+            "precondition: the slot now holds a default PaneState, which is what \
+             makes a direct write vanish"
+        );
+
+        let mut actions = Vec::new();
+        gui.apply_menu_event(
+            MenuEvent::Toggled(MenuToggle::VolumePane, true),
+            &mut actions,
+        );
+
+        // The restore, which throws the placeholder away.
+        gui.panes[gui.active_pane] = held;
+        gui.apply_pending_pane_kind();
+
+        assert_eq!(
+            gui.pane(1).unwrap().site,
+            "KDDC",
+            "precondition: the original pane must be the one back in the slot"
+        );
+        assert_eq!(
+            gui.pane(1).unwrap().kind(),
+            PaneKind::Volume,
+            "the conversion was written to the pane that was held out and thrown \
+             away, so the menu item silently did nothing"
+        );
+        assert_eq!(
+            gui.pending_pane_kind_for_test(),
+            None,
+            "the request must be consumed, or every later frame re-converts the \
+             pane and any per-kind state it gathers is discarded each time"
+        );
+        assert_eq!(
+            gui.pane(0).unwrap().kind(),
+            PaneKind::Map,
+            "the request converted a pane other than the one it named"
+        );
+    }
+
+    /// A request naming a pane the layout no longer has is dropped, not clamped.
+    ///
+    /// Reachable in one frame: the pane picker can shrink the layout after the
+    /// menu event was recorded. Converting whichever pane happens to be at a
+    /// nearby index would convert one the user never pointed at.
+    #[test]
+    fn a_pane_kind_request_for_a_pane_that_is_gone_converts_nothing() {
+        use crate::pane::PaneKind;
+
+        let mut gui = Gui::new();
+        gui.request_pane_kind(7, PaneKind::Volume);
+        gui.apply_pending_pane_kind();
+
+        assert_eq!(gui.pane(0).unwrap().kind(), PaneKind::Map);
+        assert_eq!(gui.pending_pane_kind_for_test(), None);
     }
 
     /// A pane with no map neither drives the shared viewport nor follows it.

@@ -17,6 +17,13 @@
 use crate::actions::GuiAction;
 use rustdar_overlays::render::overlay_state::OverlayKind;
 
+/// The label on the 3D-pane toggle.
+///
+/// A constant because two tests name it — the drawer-coverage list and the
+/// end-to-end conversion — and a test that carried its own copy of the string
+/// would go on passing after the entry was renamed out from under it.
+pub(crate) const VOLUME_PANE_LABEL: &str = "3D volume view";
+
 /// A command the user can invoke from the menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MenuAction {
@@ -39,6 +46,22 @@ pub(super) enum MenuToggle {
     /// Subscribe to the push-notification service so a chunk is fetched the
     /// moment it exists rather than on the next poll.
     ChunkNotifications,
+    /// Make the active pane a 3D volume view, or turn it back into a map.
+    ///
+    /// A checkbox rather than a command, and per pane rather than global,
+    /// because that is what it is: the pane either is a volume view or it is
+    /// not, and the state has to be visible or a user who converted a pane by
+    /// accident has nothing to un-tick. Unticking it returns the pane to a map,
+    /// which is also the only route out of a section pane restored from a config
+    /// — two clicks rather than one, but never a trap.
+    ///
+    /// There is deliberately no companion entry for a cross-section. Aiming one
+    /// is an armed modal drag on a *map* pane, and none of that interaction
+    /// exists yet; a checkbox arming a mode nothing implements is exactly the
+    /// button-that-does-nothing `every_menu_entry_has_a_dispatcher_arm` exists to
+    /// forbid, and satisfying that test would mean inventing a flag whose only
+    /// reader was the test's own fingerprint.
+    VolumePane,
 }
 
 /// One entry in the menu.
@@ -81,6 +104,17 @@ pub(crate) struct DrawnMenuLeaf {
     /// `Some(state)` for a toggle, `None` for a command or a submenu header.
     pub value: Option<bool>,
     pub rect: egui::Rect,
+    /// The egui `Id` the widget was really registered under.
+    ///
+    /// Reported so a test can see this menu being *re-keyed* rather than only
+    /// being moved. Every leaf here is an auto-id'd widget, so its id runs off the
+    /// enclosing `Ui`'s `next_auto_id_salt` — which means anything drawn above it
+    /// that allocates a varying number of widgets shifts every id in this list
+    /// while the labels, the values and (once the layout settles) even the rects
+    /// stay recognisable. The harness's own id-change probe cannot see it: that
+    /// one matches widgets *by rect*, so a shift which also moves the rects looks
+    /// like new widgets rather than re-keyed ones.
+    pub id: egui::Id,
 }
 
 /// What one presentation produced this frame.
@@ -95,12 +129,13 @@ pub(super) struct MenuFrame {
 impl MenuFrame {
     /// Record a leaf that was drawn. A no-op outside tests.
     #[inline]
-    fn record(&mut self, _label: &'static str, _value: Option<bool>, _rect: egui::Rect) {
+    fn record(&mut self, _label: &'static str, _value: Option<bool>, _response: &egui::Response) {
         #[cfg(test)]
         self.drawn.push(DrawnMenuLeaf {
             label: _label,
             value: _value,
-            rect: _rect,
+            rect: _response.rect,
+            id: _response.id,
         });
     }
 }
@@ -121,7 +156,7 @@ pub(super) fn render_menu_bar(ui: &mut egui::Ui, nodes: &[MenuNode]) -> MenuFram
                         .response;
                     // The header's own rect, so a test can open the drop-down
                     // the way a user does instead of reaching into egui memory.
-                    out.record(label, None, header.rect);
+                    out.record(label, None, &header);
                 }
                 // A top-level leaf is unusual but has to render *somewhere*, or
                 // adding one would silently drop it from this presentation only
@@ -160,7 +195,7 @@ fn render_menu_items(ui: &mut egui::Ui, nodes: &[MenuNode], out: &mut MenuFrame,
         match node {
             MenuNode::Item { label, action } => {
                 let response = ui.button(*label);
-                out.record(label, None, response.rect);
+                out.record(label, None, &response);
                 if response.clicked() {
                     out.events.push(MenuEvent::Invoked(*action));
                     if in_menu {
@@ -176,7 +211,7 @@ fn render_menu_items(ui: &mut egui::Ui, nodes: &[MenuNode], out: &mut MenuFrame,
                 let mut current = *value;
                 let response = ui.checkbox(&mut current, *label);
                 // `*value`, not `current`: what the checkbox was *handed*.
-                out.record(label, Some(*value), response.rect);
+                out.record(label, Some(*value), &response);
                 if response.changed() {
                     out.events.push(MenuEvent::Toggled(*toggle, current));
                 }
@@ -218,6 +253,18 @@ impl super::Gui {
             MenuNode::Submenu {
                 label: "View",
                 children: vec![
+                    // First, because it decides what the entries under it even
+                    // apply to. `pane` is `self.active_pane()`, which is why
+                    // `render_layers_panel` builds this model *before* it takes
+                    // the active pane out of the vector: inside that window the
+                    // slot holds a default `PaneState`, so this would read `Map`
+                    // for a volume pane and draw the box unchecked.
+                    MenuNode::Toggle {
+                        label: VOLUME_PANE_LABEL,
+                        toggle: MenuToggle::VolumePane,
+                        value: pane.kind() == crate::pane::PaneKind::Volume,
+                    },
+                    MenuNode::Separator,
                     MenuNode::Toggle {
                         label: "Show radar sites",
                         toggle: MenuToggle::Overlay(OverlayKind::RadarSites),
@@ -284,6 +331,22 @@ impl super::Gui {
             MenuEvent::Toggled(MenuToggle::AutoPoll, on) => self.auto_poll.enabled = on,
             MenuEvent::Toggled(MenuToggle::LiveChunks, on) => self.live_chunks = on,
             MenuEvent::Toggled(MenuToggle::ChunkNotifications, on) => self.chunk_notifications = on,
+            MenuEvent::Toggled(MenuToggle::VolumePane, on) => {
+                // Recorded, never written here. This dispatcher runs from inside
+                // `render_layers_panel`, which holds the active pane out of the
+                // vector with `mem::take` — so `self.panes[self.active_pane]` is a
+                // placeholder that the real pane going back overwrites, and a
+                // `set_kind` on it would be discarded with no error and no failing
+                // test. See the `pending_pane_kind` field on `Gui`.
+                self.request_pane_kind(
+                    self.active_pane,
+                    if on {
+                        crate::pane::PaneKind::Volume
+                    } else {
+                        crate::pane::PaneKind::Map
+                    },
+                );
+            }
         }
     }
 }
@@ -319,13 +382,23 @@ mod tests {
         overlays.sort();
         format!(
             "settings={} time={} drawer={} auto_poll={} live_chunks={} notify={} \
-             overlays={overlays:?}",
+             kind={:?} pending_kind={:?} overlays={overlays:?}",
             gui.show_settings,
             gui.time_dialog.show,
             gui.drawer_open,
             gui.auto_poll.enabled,
             gui.live_chunks,
             gui.chunk_notifications,
+            gui.active_pane().kind(),
+            // Both halves, because a pane conversion is deliberately a two-step
+            // operation. Recording the request is the whole of what the
+            // dispatcher's arm does — the write itself cannot happen inside the UI
+            // pass at all (see the `pending_pane_kind` field on `Gui`) — so a
+            // fingerprint holding only the applied kind would report the arm as a
+            // no-op and `every_menu_entry_has_a_dispatcher_arm` would fail for a
+            // toggle that works. That the request lands on the *real* pane rather
+            // than on the `mem::take` placeholder is its own test, in `ui.rs`.
+            gui.pending_pane_kind_for_test(),
         )
     }
 
@@ -414,6 +487,73 @@ mod tests {
 
     fn auto_poll_toggle(gui: &Gui) -> bool {
         find_toggle(gui, MenuToggle::AutoPoll)
+    }
+
+    /// The 3D toggle reads the *active pane's* kind, not a global flag.
+    ///
+    /// With several panes on screen the entry describes one of them, and a
+    /// version keyed on "is any pane a volume view" would show checked for the
+    /// map the user is actually working in — then convert *that* one when they
+    /// unticked it to make the box match what they were looking at.
+    #[test]
+    fn the_volume_toggle_describes_the_active_pane_and_no_other() {
+        use crate::pane::PaneKind;
+
+        let mut gui = Gui::new();
+        gui.set_pane_count_for_test(2);
+        assert!(
+            !find_toggle(&gui, MenuToggle::VolumePane),
+            "precondition: two fresh map panes"
+        );
+
+        gui.pane_mut(1).unwrap().set_kind(PaneKind::Volume);
+        assert!(
+            !find_toggle(&gui, MenuToggle::VolumePane),
+            "the toggle read some other pane's kind: pane 0 is the active one and \
+             it is still a map"
+        );
+
+        gui.active_pane = 1;
+        assert!(find_toggle(&gui, MenuToggle::VolumePane));
+    }
+
+    /// Unticking the 3D toggle asks for a map back, rather than doing nothing.
+    ///
+    /// The `on` argument is the checkbox's *new* value, so an arm that ignored it
+    /// and always asked for `Volume` would leave the box stuck ticked with no way
+    /// out of the pane — and `every_menu_entry_has_a_dispatcher_arm` would not
+    /// notice, because the first tick moves the fingerprint on its own.
+    #[test]
+    fn the_volume_toggle_converts_in_both_directions() {
+        use crate::pane::PaneKind;
+
+        let mut gui = Gui::new();
+        let mut actions = Vec::new();
+
+        gui.apply_menu_event(
+            MenuEvent::Toggled(MenuToggle::VolumePane, true),
+            &mut actions,
+        );
+        assert_eq!(
+            gui.pending_pane_kind_for_test(),
+            Some((0, PaneKind::Volume))
+        );
+
+        gui.apply_menu_event(
+            MenuEvent::Toggled(MenuToggle::VolumePane, false),
+            &mut actions,
+        );
+        assert_eq!(
+            gui.pending_pane_kind_for_test(),
+            Some((0, PaneKind::Map)),
+            "unticking the box asked for a volume pane again, so a pane converted \
+             by accident can never be converted back"
+        );
+
+        assert!(
+            actions.is_empty(),
+            "converting a pane is local to the Gui and needs nothing of the host"
+        );
     }
 
     /// Opening a dialog closes the drawer. On a compact screen the drawer

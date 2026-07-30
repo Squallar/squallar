@@ -3619,6 +3619,7 @@ mod tests {
         for wanted in [
             "Refresh Radar",
             "Exit",
+            crate::ui::VOLUME_PANE_LABEL,
             "Show radar sites",
             "Show city labels",
             "Auto-poll",
@@ -5434,7 +5435,276 @@ mod tests {
         }
     }
 
-    /// 42. **Converting a pane must not move any widget's egui `Id`.**
+    /// 43. **Converting the active pane from the drawer really converts it.**
+    ///
+    ///     The end-to-end version of
+    ///     `a_pane_kind_request_survives_the_pane_being_held_out_of_the_vector`,
+    ///     driven by a real click through the real presentation. It matters
+    ///     because the drawer's menu is rendered from *inside*
+    ///     `render_layers_panel`, which holds the active pane out of the vector
+    ///     with `mem::take` for the whole of the panel's body — so the obvious
+    ///     `self.panes[self.active_pane].set_kind(..)` in the dispatcher writes a
+    ///     placeholder that is discarded a moment later, and the checkbox simply
+    ///     never sticks.
+    ///
+    ///     Asserted all the way to the glass: the pane's kind, the arm that
+    ///     actually drew it, the copy on screen, and the checkbox reading back the
+    ///     new state on the following frame. The last of those is what a user sees
+    ///     first, and it is the one a half-wired conversion would fail.
+    #[test]
+    fn converting_the_active_pane_from_the_drawer_makes_it_a_volume_pane() {
+        let mut h = compact_with_drawer();
+        h.load_scan("KTLX");
+        assert_eq!(
+            h.pane_kinds(),
+            vec![PaneKind::Map],
+            "precondition: it starts as a map"
+        );
+        assert_eq!(
+            h.menu_leaf(crate::ui::VOLUME_PANE_LABEL).map(|l| l.value),
+            Some(Some(false)),
+            "precondition: the drawer must draw the toggle, unchecked"
+        );
+
+        h.mouse_click(clickable_leaf(&h, crate::ui::VOLUME_PANE_LABEL).center());
+        h.frames_for(3, FRAME_DT);
+
+        assert_eq!(
+            h.pane_kinds(),
+            vec![PaneKind::Volume],
+            "the click never reached the pane: the write landed on the pane the \
+             layers panel had taken out of the vector"
+        );
+        assert_eq!(
+            h.pane_content_probes()
+                .iter()
+                .map(|probe| probe.kind)
+                .collect::<Vec<_>>(),
+            vec![PaneKind::Volume],
+            "the pane converted but the map arm still drew it"
+        );
+        assert!(
+            h.text_painted_in(h.pane_rects()[0], crate::ui::VOLUME_EMPTY_STATE),
+            "the volume pane painted {:?} instead of its empty state",
+            h.painted_text_strings()
+        );
+        assert_eq!(
+            h.menu_leaf(crate::ui::VOLUME_PANE_LABEL).map(|l| l.value),
+            Some(Some(true)),
+            "the checkbox did not read back the conversion, so it looks to the \
+             user as though the click did nothing"
+        );
+
+        // …and back, from the same box. This is the only route out of a non-map
+        // pane, so a one-way toggle would be a trap.
+        h.mouse_click(clickable_leaf(&h, crate::ui::VOLUME_PANE_LABEL).center());
+        h.frames_for(3, FRAME_DT);
+        assert_eq!(h.pane_kinds(), vec![PaneKind::Map]);
+    }
+
+    /// 44. **A non-map pane's layers panel keeps what applies to it and drops the
+    ///     rest.**
+    ///
+    ///     Four claims, each with its own failure:
+    ///
+    ///     * **A product picker.** It used to be gated on the Radar *overlay*
+    ///       toggle, which asks whether the map should draw the radar image over
+    ///       its tiles — a question a pane with no tiles does not have. Left
+    ///       gated, a pane converted while that toggle happened to be off would
+    ///       have no product control at all, absent rather than disabled, for a
+    ///       reason nothing on screen explains.
+    ///     * **Time navigation**, because a section of last hour's volume is a
+    ///       perfectly good thing to ask for.
+    ///     * **No tilt picker.** Both non-map kinds read the whole ladder, which
+    ///       is what `PaneKind::consumes_whole_volume` means, so every entry in
+    ///       the combo would select the same picture.
+    ///     * **No loop transport and no overlay tree.** A loop frame *is* a
+    ///       rendered plan-view tilt and nothing now feeds one to a pane like
+    ///       this, so the control would enable a loop that never fills; every
+    ///       entry in the overlay tree is a layer drawn over map tiles against a
+    ///       projector this pane does not have.
+    ///
+    ///     The last two are also what makes this the test that notices the branch
+    ///     reading `self.panes[active]` instead of the pane it was handed. That
+    ///     slot holds a `mem::take` placeholder for the whole of the panel's pass
+    ///     and therefore reads as a *map* — so a branch on it takes the map arm
+    ///     for a converted pane, and the only visible difference is the transport
+    ///     and the tree being drawn. The tilt picker would *not* reveal it: that
+    ///     is decided inside `render_radar_controls` from the pane passed down.
+    ///
+    ///     The combos are read off the ids the panel actually resolved rather than
+    ///     off the model, for the same reason `time_step_sel` is: a test rebuilding
+    ///     the expected id from the same format string could agree with a panel
+    ///     that drew neither control.
+    #[test]
+    fn a_non_map_pane_keeps_the_controls_that_apply_to_it_and_drops_the_rest() {
+        /// Which of the layers panel's radar combos the last frame resolved an id
+        /// for — the panel's own report, not a reconstruction of it.
+        fn combos(h: &InputHarness) -> Vec<&'static str> {
+            h.widget_id_probes()
+                .into_iter()
+                .map(|(name, _)| name)
+                .filter(|name| *name == "product_sel" || *name == "elev_sel")
+                .collect()
+        }
+        fn painted(h: &InputHarness, needle: &str) -> bool {
+            h.painted_text_strings().iter().any(|t| t.contains(needle))
+        }
+
+        for kind in [PaneKind::CrossSection, PaneKind::Volume] {
+            let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
+            h.load_scan("KTLX");
+            h.offer_product(0, rustdar_radar::types::RadarProduct::Reflectivity, 0.5);
+            assert_eq!(
+                combos(&h),
+                vec!["product_sel", "elev_sel"],
+                "precondition: a map pane with a tilt on offer draws both, so the \
+                 absence below is the pane's kind and not a missing scan"
+            );
+            assert!(
+                painted(&h, "Radar Loop"),
+                "precondition: a map pane draws the loop transport"
+            );
+            // An entry from the middle of the overlay tree, so the check is not
+            // satisfied by the first one alone. `dropdowns()` is deliberately not
+            // used: in the default state no handler offers one, so it is empty for
+            // a map pane too and would pass for the wrong reason.
+            assert!(
+                painted(&h, "NWS Alerts"),
+                "precondition: a map pane draws the overlay tree"
+            );
+
+            match kind {
+                PaneKind::CrossSection => {
+                    let (a, b) = section_ends();
+                    h.make_pane_cross_section(0, a, b);
+                }
+                _ => h.make_pane_volume(0),
+            }
+            h.frames_for(2, FRAME_DT);
+            assert_eq!(
+                h.pane_kinds(),
+                vec![kind],
+                "precondition: the active pane must really have converted"
+            );
+
+            assert_eq!(
+                combos(&h),
+                vec!["product_sel"],
+                "{kind:?}: either the product picker went with the map — leaving \
+                 this pane unable to be pointed at another moment — or a tilt \
+                 picker was drawn for a pane that reads every cut"
+            );
+            assert!(
+                painted(&h, "Step:"),
+                "{kind:?}: time navigation went with the map, so this pane can \
+                 only ever show the live volume"
+            );
+            assert!(
+                !painted(&h, "Radar Loop"),
+                "{kind:?}: a loop transport was drawn for a pane nothing renders \
+                 loop frames for, so enabling it would wait for ever"
+            );
+            assert!(
+                !painted(&h, "NWS Alerts"),
+                "{kind:?}: the overlay tree was drawn for a pane with no map to \
+                 draw overlays on: {:?}",
+                h.painted_text_strings()
+            );
+        }
+    }
+
+    /// 45. **A non-map pane's product picker survives the Radar layer being off.**
+    ///
+    ///     The picker used to be gated on `is_overlay_enabled(OverlayKind::Radar)`,
+    ///     which asks whether the *map* should draw the radar image over its tiles.
+    ///     A pane with no tiles has no such layer, so a pane converted while that
+    ///     toggle happened to be off would have had no product control at all —
+    ///     absent, not disabled, for a reason nothing on screen explains. A map
+    ///     pane must still honour the toggle, which is the second half here.
+    #[test]
+    fn a_non_map_panes_product_picker_ignores_the_radar_layer_toggle() {
+        let mut h = InputHarness::with_screen(egui::vec2(1200.0, 900.0));
+        h.load_scan("KTLX");
+        h.set_overlay_on_pane(0, OverlayKind::Radar, false);
+        h.frames_for(2, FRAME_DT);
+
+        let has_product = |h: &InputHarness| {
+            h.widget_id_probes()
+                .iter()
+                .any(|(name, _)| *name == "product_sel")
+        };
+        assert!(
+            !has_product(&h),
+            "precondition: a map pane with the Radar layer off draws no product \
+             picker, or the assertion below is about nothing"
+        );
+
+        h.make_pane_volume(0);
+        h.frames_for(2, FRAME_DT);
+
+        assert!(
+            has_product(&h),
+            "the Radar layer toggle suppressed the product picker on a pane with \
+             no map, which has no such layer to turn off"
+        );
+    }
+
+    /// 46. **Converting the active pane does not re-key the drawer menu.**
+    ///
+    ///     The layers panel's kind-specific block sits inside a `scope_builder`
+    ///     with an explicit `UiBuilder::id`, and this is why. `Ui::new_child` folds
+    ///     the parent's `next_auto_id_salt` into every child's registered id, so
+    ///     two branches allocating different numbers of widgets — a map pane draws
+    ///     a loop transport and the whole overlay tree, a volume pane draws
+    ///     neither — shift the id of **everything drawn after them**. Below them,
+    ///     in the drawer, is the menu, which at every width without a menu bar is
+    ///     the only route to Exit and Settings.
+    ///
+    ///     [`converting_a_pane_moves_no_widget_id`] cannot see this: it converts a
+    ///     *non-active* pane, so the panel's content does not change, and the
+    ///     harness's id-change probe matches widgets **by rect** — a shift that
+    ///     also moves the rects reads as new widgets rather than as re-keyed ones.
+    ///     So the ids are compared directly, per label, which is what
+    ///     `DrawnMenuLeaf::id` exists for.
+    ///
+    ///     Verified by mutation: with the scope replaced by a bare `ui.scope`, or
+    ///     removed entirely, every id below the branch moves and this fails.
+    #[test]
+    fn converting_the_active_pane_does_not_re_key_the_drawer_menu() {
+        let mut h = compact_with_drawer();
+        h.load_scan("KTLX");
+
+        let ids_by_label = |h: &InputHarness| -> Vec<(&'static str, egui::Id)> {
+            h.menu_leaves().iter().map(|l| (l.label, l.id)).collect()
+        };
+
+        let before = ids_by_label(&h);
+        assert!(
+            before.len() >= 6,
+            "precondition: the drawer must really be drawing the menu, found {}",
+            before.len()
+        );
+
+        h.mouse_click(clickable_leaf(&h, crate::ui::VOLUME_PANE_LABEL).center());
+        h.frames_for(3, FRAME_DT);
+        assert_eq!(
+            h.pane_kinds(),
+            vec![PaneKind::Volume],
+            "precondition: the conversion must have happened, or the panel above \
+             the menu never changed and nothing was at risk"
+        );
+
+        assert_eq!(
+            ids_by_label(&h),
+            before,
+            "converting the active pane re-keyed the menu underneath it: egui \
+             discards everything it remembers under those ids, and on a phone \
+             this menu is the only way to reach the rest of the app"
+        );
+    }
+
+    /// 47. **Converting a pane must not move any widget's egui `Id`.**
     ///
     ///     The `"pane_map"` id salt is a key, not a description: every widget
     ///     inside a pane derives its `Id` from it, so egui's memory of what the
