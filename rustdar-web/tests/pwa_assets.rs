@@ -605,3 +605,43 @@ fn the_worker_reply_writes_every_field_on_every_arm() {
         );
     }
 }
+
+/// The `Frame` arm still writes the three fields it always wrote, and still
+/// transfers both buffers.
+///
+/// Widening the reply to carry sections and grids was supposed to leave the
+/// working path untouched, and that claim is otherwise verified only by
+/// reading the diff. A `Frame` arm that stopped setting `MAX_RANGE`, or that
+/// lost a `transfer.push`, would not fail to compile and would not fail any
+/// test that exists — it would copy 4 MiB per frame instead of moving it, or
+/// report every plan view's range as the `0.0` default, which is a texture
+/// projected at the wrong scale rather than an error.
+#[test]
+fn the_frame_arm_of_the_worker_reply_is_unchanged() {
+    let arm = RASTER_WORKER_RS
+        .split_once("Some(JobOutput::Frame(RenderedFrame {")
+        .expect("post_result no longer has a Frame arm")
+        .1
+        .split_once("Some(output) => {")
+        .expect("the Frame arm is no longer followed by the out-of-band arm")
+        .0;
+    for needle in [
+        "proto::IMAGE, &image",
+        "proto::VALUES, &values",
+        "proto::MAX_RANGE,",
+        "transfer.push(&image.buffer());",
+        "transfer.push(&values.buffer());",
+    ] {
+        assert!(
+            arm.contains(needle),
+            "the Frame arm no longer contains {needle:?}; the plan-view reply \
+             is supposed to be byte-for-byte what it was before the widening"
+        );
+    }
+    assert!(
+        !arm.contains("proto::OUT"),
+        "the Frame arm writes an out-of-band field; a frame travels in \
+         IMAGE/VALUES/MAX_RANGE and nothing else, and a reply carrying both \
+         leaves the page arbitrating between two outputs for one job"
+    );
+}
