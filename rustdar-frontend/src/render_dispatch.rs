@@ -473,28 +473,28 @@ impl RenderDispatcher {
         hit
     }
 
-    /// The tilt-independent half: the Level II products that integrate a whole
-    /// volume, the complement of what [`reset_panes_for_tilts`] skips.
+    /// The `abandon_results` + `render_in_flight` pairing, written once for the
+    /// tilt reset above.
     ///
-    /// **Nothing in production calls this.** Its only callers are the tests
-    /// below, which use it to pin that the two halves partition the products the
-    /// way they claim to. A closing volume goes through
-    /// [`reset_panes_for_site`](Self::reset_panes_for_site) instead, which is
-    /// wider — every pane on the site — so these panes do get refreshed; this is
-    /// the narrow reset that was never wired up, not a gap in coverage. Left as
-    /// it is deliberately: whether the closing-volume path should narrow to this
-    /// is its own decision, and not one a predicate fix should make.
+    /// A `reset_panes_for_volume` — the complement of what
+    /// [`reset_panes_for_tilts`](Self::reset_panes_for_tilts) skips, i.e. the
+    /// whole-volume Level II products on their own — used to sit beside it and go
+    /// through here too. It was deleted rather than wired up: the `volume_complete`
+    /// branch of `App::apply_chunk_outcome` is the only path that would have
+    /// called it, and it needs the *wider*
+    /// [`reset_panes_for_site`](Self::reset_panes_for_site) for three separate
+    /// reasons. `closed` is set by `ChunkPoller` at the instant it rolls the
+    /// assembler, so the branch fires at a volume *boundary* and the scan it
+    /// installs is the new volume — every pane on the site is showing an image
+    /// built from the old one, not just the whole-volume readers. The `if/else`
+    /// there means the closing round's own `sealed_elevations` never reach
+    /// `reset_panes_for_tilts`, so the site reset is what stands in for them.
+    /// And `reset_panes_for_site` also drops the site's `level3_data` and
+    /// `render_cache`, which the `spawn_level3_fetches` on the next line depends
+    /// on and which a pane-only reset does not touch.
     ///
-    /// [`reset_panes_for_tilts`]: Self::reset_panes_for_tilts
-    pub fn reset_panes_for_volume(&mut self, site: &str, gui: &rustdar_egui::Gui) -> usize {
-        self.invalidate_panes_where(site, gui, |product, _| {
-            !product.is_level3() && product.reads_whole_volume()
-        })
-    }
-
-    /// The one place the `abandon_results` + `render_in_flight` pairing is
-    /// written for the narrow resets. Both public methods above go through it,
-    /// so there is one new home for the invariant rather than two.
+    /// Kept as a separate function anyway: the pairing is the invariant, and it
+    /// wants one home whether one caller reads it or two.
     fn invalidate_panes_where(
         &mut self,
         site: &str,
@@ -2136,11 +2136,6 @@ mod render_invalidation_tests {
             0,
             "echo tops was invalidated by a single cut completing"
         );
-        assert_eq!(
-            d.reset_panes_for_volume("KOUN", &gui),
-            1,
-            "and the closing volume did not pick it up"
-        );
     }
 
     /// NROT fits its wind profile from every velocity tilt — the only wind
@@ -2158,7 +2153,6 @@ mod render_invalidation_tests {
             "NROT fits its profile from every velocity tilt, so a partial \
              volume would halve its shear"
         );
-        assert_eq!(d.reset_panes_for_volume("KOUN", &gui), 1);
     }
 
     /// SRV reads the same profile, for its dealias seed and for its default
@@ -2181,7 +2175,6 @@ mod render_invalidation_tests {
             "SRV re-rendered off a single completed cut, fitting its hodograph \
              from whatever velocity tilts had arrived"
         );
-        assert_eq!(d.reset_panes_for_volume("KOUN", &gui), 1);
     }
 
     /// A Level III pane's pixels come from `level3_data`; a Level II cut
@@ -2198,7 +2191,62 @@ mod render_invalidation_tests {
         let mut d = RenderDispatcher::new();
         d.ensure_pane_count(1);
         assert_eq!(d.reset_panes_for_tilts("KOUN", &gui, &[0.5]), 0);
-        assert_eq!(d.reset_panes_for_volume("KOUN", &gui), 0);
+    }
+
+    /// The other side of every skip above: what the tilt reset passes over, the
+    /// site reset takes.
+    ///
+    /// Stated once, over every product, rather than as a second assertion inside
+    /// each of the four tests above. `reset_panes_for_site` does not consult the
+    /// product at all, so per-product repetitions of this would have been the same
+    /// claim four times — which is what the deleted `reset_panes_for_volume` was
+    /// doing there. What is worth pinning is that the skips are not a hole: a
+    /// product the tilt reset declines *and* a site reset declined would never be
+    /// refreshed at all while a site is live.
+    #[test]
+    fn every_product_a_tilt_reset_skips_is_taken_by_a_site_reset() {
+        let mut skipped = 0;
+        let mut taken_by_tilts = 0;
+        for &product in RadarProduct::all() {
+            let gui = gui_on_tilt("KOUN", product, 0.5, &[0.5]);
+            let mut d = RenderDispatcher::new();
+            d.ensure_pane_count(1);
+
+            if d.reset_panes_for_tilts("KOUN", &gui, &[0.5]) == 1 {
+                taken_by_tilts += 1;
+                continue;
+            }
+            skipped += 1;
+            d.pane_render[0].last_rendered = Some((product, 0.5));
+            // Cached *after* the tilt reset, not before: that reset's own
+            // `render_cache.retain` is product-blind — it drops every entry for
+            // the site at the angles it was given, whatever the pane is showing —
+            // so an entry seeded earlier would already be gone and the assertion
+            // below would pass without the site reset doing anything.
+            d.cache_render("KOUN", product, 0.5, cached(1.0));
+
+            d.reset_panes_for_site("KOUN", &gui);
+
+            assert!(
+                d.pane_render[0].last_rendered.is_none(),
+                "{product:?} is skipped by the tilt reset and not picked up by the \
+                 site reset either, so nothing refreshes it while the site is live",
+            );
+            assert!(
+                d.get_cached_render("KOUN", product, 0.5).is_none(),
+                "{product:?}'s stale image survived the site reset, so the pane \
+                 re-renders straight back into it",
+            );
+        }
+        // precondition: both arms ran. A count of *how many* land on each side
+        // would be a hand-maintained census of the product roster, which is the
+        // defect this module already removed once — but with everything on one
+        // side the loop body above proves nothing, so that much is asserted.
+        assert!(
+            skipped > 0 && taken_by_tilts > 0,
+            "the tilt reset put every product on one side: {skipped} skipped, \
+             {taken_by_tilts} taken",
+        );
     }
 
     /// A whole-site `render_cache.retain` would throw away the images the panes

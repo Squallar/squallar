@@ -343,6 +343,16 @@ impl super::App {
             // that re-registers the tilts a merge preserved mid-volume.
             self.gui.set_scan_info_for_site(site, info);
             self.gui.clear_loading_site_for_site(site);
+            // Every pane on the site, whatever its product, and deliberately not
+            // a narrower reset of the whole-volume readers alone. `closed` is set
+            // by `ChunkPoller` at the instant it rolls the assembler, so this is a
+            // volume *boundary*: every pane here is showing an image built from
+            // the volume that just ended. The `if`/`else` also means this round's
+            // own `sealed_elevations` never reach `reset_panes_for_tilts`, so this
+            // is what stands in for them. And it is the reset that drops the
+            // site's `level3_data` and `render_cache`, which the refetch below
+            // needs — a pane-only reset would leave the previous volume's objects
+            // and images to be handed straight back.
             self.render.reset_panes_for_site(site, &self.gui);
             self.spawn_level3_fetches(site);
             self.record_tilt_freshness(site, &scan, &outcome.sealed_elevations);
