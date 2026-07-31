@@ -34,7 +34,20 @@
 //!    continuous measurement this module is refusing. The blockiness is data.
 //!    (That decision lives with the upload, in `app_render.rs`.)
 //! 3. **The caption says so in words**, with the ladder's own numbers in it —
-//!    how many rungs, and how far apart the widest pair is.
+//!    how many rungs, how far apart the widest pair is, and **where the ladder
+//!    stops** against what the coverage pattern flies.
+//!
+//!    That last one is why a live section does not wait for a complete volume.
+//!    Unlike a 3D volume, whose grid genuinely cannot be built mid-flight, a
+//!    section's picture *is* the ladder — so a three-rung section is a truthful
+//!    picture of a three-rung ladder, and waiting would blank the pane for most
+//!    of every six minutes for no gain. The argument only holds while the
+//!    picture carries its own truncation, and the gap figures alone do the
+//!    opposite: a volume four rungs in is all low, closely-spaced cuts, so
+//!    *"4 tilts, widest gap 0.5°, ≈1 km apart at 86 km"* flatters a state that
+//!    a complete volume's *"14 tilts, widest gap 4.9°, ≈7 km apart"* does not.
+//!    Every number improved as the picture got worse. Where the ladder stops is
+//!    the number that degrades with truncation, so mid-volume it replaces them.
 //!
 //! # And the second thing, which is about the map rather than the section
 //!
@@ -524,6 +537,23 @@ fn tilt_curves(
     )
 }
 
+/// Whether the ladder this section was cut from reached the top of the
+/// coverage pattern it belongs to.
+///
+/// The one predicate behind two user-visible claims — the caption's wording and
+/// what a hover says about a blank pixel above the volume — because they are the
+/// same fact and two copies of it would eventually disagree, leaving a pane that
+/// captions itself as truncated and then explains its own ceiling as the cone of
+/// silence.
+///
+/// Both numbers come off the same cut table (see [`SectionAxes::top_tilt_deg`]),
+/// so this is an exact comparison and not a tolerance. `>=` rather than `==`
+/// because a section that arrived over a wire has had no such promise made about
+/// it, and "the ladder is somehow above the pattern" is not a truncation.
+fn ladder_reaches_pattern_top(axes: &SectionAxes) -> bool {
+    axes.top_tilt_deg >= axes.top_declared_cut_deg
+}
+
 /// One line of the caption, before it is laid out.
 struct CaptionLine {
     text: String,
@@ -564,6 +594,16 @@ fn caption_lines(
     // nothing measured above or below it, and that is what it has to say.
     let widest_gap_km = axes.widest_tilt_gap_deg.to_radians() * axes.coverage_ground_range_km;
     let gap_shown = prefs.distance.convert_from_km(widest_gap_km);
+    // How high the top rung's beam is where the section's data ends — the
+    // ceiling of the picture, in the height axis's own unit and datum. Named
+    // rather than left as a degree number because "1.8°" is not a height and a
+    // forecaster reading a section is reading heights.
+    let ceiling_km_msl = axes.base_km_msl
+        + beam::height_at_ground_km(axes.coverage_ground_range_km, axes.top_tilt_deg);
+    let ceiling_shown = match prefs.height {
+        rustdar_units::HeightUnit::Feet => ceiling_km_msl * KM_TO_KFT,
+        rustdar_units::HeightUnit::Meters => ceiling_km_msl,
+    };
     let (ladder, ladder_color) = match axes.tilt_count {
         0 => (
             format!(
@@ -581,11 +621,39 @@ fn caption_lines(
             ),
             visuals.error_fg_color,
         ),
+        // **A ladder that stopped short of its own pattern.** The gap numbers
+        // are deliberately *not* in this sentence, because mid-volume they
+        // flatter: a volume four rungs in is all low, closely-spaced cuts, so
+        // "widest gap 0.5°, ≈1 km apart at 86 km" reads better than a complete
+        // VCP 212's "4.9°, ≈7 km apart" — the caption's own figures improve as
+        // the picture gets more truncated. Where the ladder stops is the number
+        // that degrades with truncation, and it is the only one that matters
+        // while a volume is filling.
+        rungs if !ladder_reaches_pattern_top(axes) => (
+            format!(
+                "{}  \u{2014}  {rungs} tilts so far: the ladder stops at {:.1}\u{b0} of the \
+                 {:.1}\u{b0} this pattern flies, so nothing above \u{2248}{:.1} {} MSL at \
+                 {:.0}{} was scanned \u{2014} this volume is still filling, or was cut \
+                 short. What is drawn is set by the ladder, not measured.",
+                product.name(),
+                axes.top_tilt_deg,
+                axes.top_declared_cut_deg,
+                ceiling_shown,
+                prefs.height.kilo_suffix(),
+                prefs
+                    .distance
+                    .convert_from_km(axes.coverage_ground_range_km),
+                prefs.distance.suffix(),
+            ),
+            visuals.error_fg_color,
+        ),
         rungs => (
             format!(
-                "{}  \u{2014}  {rungs} tilts, widest gap {:.1}\u{b0} (\u{2248}{:.0}{} apart at \
-                 {:.0}{}): layer depth and echo tops here are set by the ladder, not measured",
+                "{}  \u{2014}  {rungs} tilts to {:.1}\u{b0}, widest gap {:.1}\u{b0} \
+                 (\u{2248}{:.0}{} apart at {:.0}{}): layer depth and echo tops here are set \
+                 by the ladder, not measured",
                 product.name(),
+                axes.top_tilt_deg,
                 axes.widest_tilt_gap_deg,
                 gap_shown,
                 prefs.distance.suffix(),
@@ -731,7 +799,7 @@ fn hover_readout(
 
     let value = match sample.value() {
         Some(value) => product.format_value(value, prefs),
-        None => describe_missing(sample.status()).to_owned(),
+        None => describe_missing(sample.status(), ladder_reaches_pattern_top(axes)).to_owned(),
     };
     Some(format!(
         "{:.1}{} along  |  {:.1} {} MSL  |  {}",
@@ -750,13 +818,35 @@ fn hover_readout(
 /// a phrase anyway rather than a `unreachable!`, because the cost of being wrong
 /// about that is a panic on the main thread, which under wasm takes the tab
 /// down.
-fn describe_missing(status: SampleStatus) -> &'static str {
+///
+/// # Why `AboveVolume` needs a second question asked
+///
+/// The sampler raises it for one condition — the query height is above the top
+/// rung's beam — and that condition covers two situations a forecaster would
+/// never confuse. Over the site, a complete volume's highest cut is still nearly
+/// horizontal, so everything above it is the **cone of silence**: a permanent
+/// property of how a radar scans, and a real explanation. Away from the site,
+/// the top rung's beam is kilometres up, and a pixel lands above it only because
+/// the ladder stopped early — a live volume four rungs into its flight tops out
+/// at 1.8°, which at 100 km is under 3 km, so *everything* above 3 km at that
+/// range is `AboveVolume`. Calling that the cone of silence at 10 km and 100 km
+/// is flatly false, and it is the worst kind of false: a confident
+/// meteorological explanation for a blank region, and the wrong one. The user
+/// stops looking.
+///
+/// `ladder_reaches_top` is [`ladder_reaches_pattern_top`], the same predicate
+/// the caption's wording turns on.
+fn describe_missing(status: SampleStatus, ladder_reaches_top: bool) -> &'static str {
     match status {
         SampleStatus::Value => "no value",
         SampleStatus::BelowThreshold => "below threshold (the radar looked and saw nothing)",
         SampleStatus::RangeFolded => "range folded (a real echo, at an ambiguous distance)",
         SampleStatus::BelowLowestBeam => "below the lowest beam",
-        SampleStatus::AboveVolume => "above the volume (cone of silence)",
+        SampleStatus::AboveVolume if ladder_reaches_top => "above the volume (cone of silence)",
+        SampleStatus::AboveVolume => {
+            "above the highest tilt this volume flew \u{2014} not the cone of silence: the \
+             scan stopped short of its pattern"
+        }
         SampleStatus::BeyondRange => "beyond this tilt's range",
         SampleStatus::NoCoverage => "no coverage",
     }
@@ -894,6 +984,10 @@ mod tests {
     /// them loses the distinction the status plane exists to carry — and the
     /// pair most worth keeping apart is `BelowThreshold` (the radar looked and
     /// saw nothing) against `NoCoverage` (the radar never looked).
+    ///
+    /// `AboveVolume` is **seven** reasons' worth of one status and it has to
+    /// read as two, because the sampler cannot tell them apart and the section
+    /// can. See [`describe_missing`].
     #[test]
     fn every_blank_reason_reads_differently() {
         let all = [
@@ -904,15 +998,66 @@ mod tests {
             SampleStatus::BeyondRange,
             SampleStatus::NoCoverage,
         ];
-        let mut seen: Vec<&str> = all.iter().copied().map(describe_missing).collect();
-        seen.sort_unstable();
-        let before = seen.len();
-        seen.dedup();
-        assert_eq!(
-            before,
-            seen.len(),
-            "two blank reasons read the same: {seen:?}"
+        for complete in [true, false] {
+            let mut seen: Vec<&str> = all
+                .iter()
+                .copied()
+                .map(|status| describe_missing(status, complete))
+                .collect();
+            seen.sort_unstable();
+            let before = seen.len();
+            seen.dedup();
+            assert_eq!(
+                before,
+                seen.len(),
+                "two blank reasons read the same: {seen:?}"
+            );
+        }
+    }
+
+    /// **A volume that has not been flown is not the cone of silence.**
+    ///
+    /// One sampler status, two facts. Over the site, above a *complete* volume's
+    /// highest cut, is the cone of silence: a permanent property of how a radar
+    /// scans, and a real answer. Above a ladder that stopped at 1.8° because the
+    /// antenna has not got there yet is unscanned air — at 100 km that is
+    /// everything over about 3 km, which live is most of the pane. Naming the
+    /// second as the first is not vague, it is a confident meteorological
+    /// explanation that is wrong, and the user stops looking.
+    #[test]
+    fn air_the_antenna_never_reached_is_not_called_the_cone_of_silence() {
+        let complete = describe_missing(SampleStatus::AboveVolume, true);
+        let truncated = describe_missing(SampleStatus::AboveVolume, false);
+
+        assert!(
+            complete.contains("cone of silence"),
+            "a complete volume's ceiling really is the cone of silence: {complete}"
         );
+        assert_ne!(
+            complete, truncated,
+            "a volume that stopped short explains its own ceiling exactly as a \
+             complete one does"
+        );
+        assert!(
+            !truncated.contains("(cone of silence)"),
+            "unscanned air was named as the cone of silence: {truncated}"
+        );
+        assert!(
+            truncated.contains("not the cone of silence"),
+            "the wrong answer is the one a forecaster will reach for on their \
+             own, so it has to be refused by name: {truncated}"
+        );
+
+        // And the predicate is the caption's, so the pane cannot label itself
+        // truncated in words and then explain its ceiling as the cone of
+        // silence three centimetres below.
+        let flying = SectionAxes {
+            top_tilt_deg: 1.8,
+            top_declared_cut_deg: 19.5,
+            ..axes()
+        };
+        assert!(ladder_reaches_pattern_top(&axes()));
+        assert!(!ladder_reaches_pattern_top(&flying));
     }
 
     /// The caption band shrinks on a short pane, and the picture never
@@ -1126,6 +1271,123 @@ mod tests {
         assert!(ordinary.text.contains("14 tilts"), "{}", ordinary.text);
         assert!(ordinary.text.contains("4.9"), "{}", ordinary.text);
         assert_eq!(ordinary.color, visuals.warn_fg_color);
+    }
+
+    /// **A ladder that stopped short says where it stopped**, and it does not
+    /// hide behind numbers that improve as it truncates.
+    ///
+    /// This is what makes live sections defensible. A section's picture *is* the
+    /// ladder — unlike a 3D volume, a three-rung section is a truthful picture
+    /// of a three-rung ladder — so it should not wait for a complete volume. The
+    /// argument only holds if the picture carries its own truncation, and the
+    /// caption's original numbers carried the opposite. Live at KMPX, four rungs
+    /// in:
+    ///
+    /// > *Reflectivity — 4 tilts, widest gap 0.5° (≈1km apart at 86km)*
+    ///
+    /// against a **complete** VCP 212's *14 tilts, widest gap 4.9°, ≈7 km
+    /// apart*. Every figure in the sentence gets better as the volume gets more
+    /// truncated, because a partial ladder is all low, closely-spaced cuts. It
+    /// named the gaps *between* rungs and never named where the ladder stops,
+    /// which mid-volume is the only quantity that means anything.
+    #[test]
+    fn a_ladder_that_stopped_short_says_so_and_says_where() {
+        let prefs = UserPreferences::default();
+        let visuals = egui::Visuals::dark();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 400.0));
+        let caption = |axes: SectionAxes| {
+            caption_lines(
+                rect,
+                &axes,
+                RadarProduct::Reflectivity,
+                None,
+                &visuals,
+                &prefs,
+            )
+            .swap_remove(0)
+        };
+
+        // KMPX four rungs into VCP 212, with the SAILS repeat already in: the
+        // exact state the live caption was read in.
+        let filling = caption(SectionAxes {
+            tilt_count: 4,
+            widest_tilt_gap_deg: 0.5,
+            top_tilt_deg: 1.8,
+            top_declared_cut_deg: 19.5,
+            coverage_ground_range_km: 86.0,
+            ..axes()
+        });
+        let complete = caption(SectionAxes {
+            coverage_ground_range_km: 86.0,
+            ..axes()
+        });
+
+        // Where it stops, against what the pattern flies. Both numbers, because
+        // "stops at 1.8°" means nothing without "of 19.5°".
+        assert!(
+            filling.text.contains("1.8"),
+            "the caption never named where the ladder stops: {}",
+            filling.text
+        );
+        assert!(
+            filling.text.contains("19.5"),
+            "the caption named a ceiling with nothing to measure it against: {}",
+            filling.text
+        );
+        assert!(
+            filling.text.contains("still filling"),
+            "a volume in flight reads as a volume that simply has few tilts: {}",
+            filling.text
+        );
+
+        // The flattering number is **gone**, not merely joined. Keeping it is
+        // what let a four-rung ladder advertise a tighter sampling than a
+        // complete one.
+        assert!(
+            !filling.text.contains("widest gap"),
+            "the truncated caption still leads with a gap figure that improves \
+             as the volume truncates: {}",
+            filling.text
+        );
+        assert!(
+            complete.text.contains("widest gap"),
+            "precondition: a complete ladder does report its widest gap"
+        );
+
+        // And the ceiling is given as a **height**, in the height axis's own
+        // unit — 1.8° is not something a forecaster reads off a section.
+        let ceiling_km = 0.4 + beam::height_at_ground_km(86.0, 1.8);
+        let kft = format!("{:.1}", ceiling_km * KM_TO_KFT);
+        assert!(
+            filling.text.contains(&kft),
+            "the caption never said how high the ladder stops ({kft} kft \
+             expected): {}",
+            filling.text
+        );
+        assert!(
+            (2.0..12.0).contains(&(ceiling_km * KM_TO_KFT)),
+            "precondition: a 1.8° beam at 86 km is a low ceiling, not a \
+             plausible-looking one ({ceiling_km} km)"
+        );
+
+        // A truncated ladder is a worse state than a coarse one, and is styled
+        // like it.
+        assert_eq!(filling.color, visuals.error_fg_color);
+        assert_eq!(complete.color, visuals.warn_fg_color);
+
+        // A complete ladder still names its top — the number is useful either
+        // way, and having it only in the bad case would make its appearance the
+        // warning rather than the words.
+        assert!(
+            complete.text.contains("19.5"),
+            "a complete ladder does not say how high it reaches: {}",
+            complete.text
+        );
+        assert!(
+            !complete.text.contains("still filling"),
+            "a complete volume reported itself as in flight: {}",
+            complete.text
+        );
     }
 
     /// **A real VCP 212 ladder draws.** The rungs are the section's first
