@@ -2192,6 +2192,22 @@ impl Gui {
         &self.panes[..self.visible_pane_count()]
     }
 
+    /// How many panes are *remembered*, including the ones the current split is
+    /// not showing.
+    ///
+    /// Almost every caller wants [`panes`](Self::panes) instead: a hidden pane
+    /// is not on screen, does not want a render dispatched for it and does not
+    /// take part in any sync. The exception is the GPU-handle lifecycle.
+    /// [`clear_graphics_state`](Self::clear_graphics_state) deliberately reaches
+    /// every remembered pane — a handle belonging to a pane the user split away
+    /// from is just as invalid once the context is gone — so whatever puts those
+    /// handles *back* has to reach exactly as far, or a pane split away and
+    /// split back to comes up holding a released texture and no way to ask for
+    /// another.
+    pub fn remembered_pane_count(&self) -> usize {
+        self.panes.len()
+    }
+
     /// [`Self::panes`] for the paths that update pane state (loop frames, scan
     /// info), with the same bound.
     pub fn panes_mut(&mut self) -> &mut [PaneState] {

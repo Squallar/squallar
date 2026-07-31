@@ -1028,7 +1028,12 @@ impl super::App {
     /// fresh one over the top. The restore never *extends* the life of a stale
     /// section; it only stops one blinking out.
     fn restore_section_textures(&mut self, ctx: &egui::Context) {
-        for pane_idx in 0..self.gui.pane_count() {
+        // Every *remembered* pane, not every visible one, because
+        // `clear_graphics_state` released every remembered pane. A section pane
+        // the user has split away from comes back to a live context otherwise
+        // holding a released texture, with its `rendered_for` still satisfied —
+        // the same stuck pane, reached by splitting up instead of by suspending.
+        for pane_idx in 0..self.gui.remembered_pane_count() {
             let Some(cut) = self
                 .gui
                 .pane(pane_idx)
@@ -6095,6 +6100,47 @@ mod section_dispatch_tests {
         assert!(
             !app.render.pane_render[0].render_in_flight,
             "the pane re-cut its section on resume instead of re-uploading it"
+        );
+    }
+
+    /// **The restore reaches as far as the release does**, hidden panes
+    /// included.
+    ///
+    /// `Gui::clear_graphics_state` walks every *remembered* pane on purpose,
+    /// and its own test says why: a handle belonging to a pane the user split
+    /// away from is just as invalid once the context is gone, and a re-split
+    /// would hand it straight back to the renderer. So the restore has to walk
+    /// exactly as far. Bounding it at `pane_count()` — the *visible* count, and
+    /// the natural thing to reach for — leaves a section pane that was hidden
+    /// during a suspend holding a released texture with its `rendered_for`
+    /// still satisfied: the same permanently-waiting pane, reached by splitting
+    /// up instead of by backgrounding the app.
+    ///
+    /// Read off the source because the two counts differ only when a pane is
+    /// remembered but not shown, and the API that produces that state
+    /// (`Gui::grow_panes` and the pane picker behind it) is `pub(crate)` to
+    /// `rustdar-egui`. Same reason, and same technique, as
+    /// `restore_describes_its_image_tests` below.
+    #[test]
+    fn the_section_restore_walks_every_remembered_pane() {
+        let (_, rest) = include_str!("app_render.rs")
+            .split_once("fn restore_section_textures(")
+            .expect("restore_section_textures is no longer a method here");
+        let body = rest
+            .split_once("\n    }")
+            .map(|(body, _)| body)
+            .expect("restore_section_textures has no recognisable body");
+        assert!(
+            body.contains("self.gui.remembered_pane_count()"),
+            "the section restore is bounded by something other than the \
+             remembered pane count, so a section pane hidden across a suspend \
+             comes back holding a released texture that nothing will replace: \
+             {body}",
+        );
+        assert!(
+            !body.contains("self.gui.pane_count()"),
+            "the section restore stops at the visible pane count while \
+             `clear_graphics_state` releases every remembered pane",
         );
     }
 
