@@ -3543,11 +3543,19 @@ mod tests {
     /// as the bytes on the wire. Mirrors `render_input`'s
     /// `the_format_version_is_the_one_this_layout_ships`, which the same
     /// argument applies to.
+    ///
+    /// The magic is a literal for the same reason at lower stakes. Asserting
+    /// it against `MAGIC` is self-consistency — the encoder writes that
+    /// constant — and the relabel loop in
+    /// `a_malformed_section_payload_is_refused_rather_than_misread` pins
+    /// `RDXS` only against `RDRI` and `RDVX`, its two port-mates; any *unused*
+    /// four bytes stayed green either way. A changed magic is at least a clean
+    /// refusal rather than a misparse.
     #[test]
     fn the_format_version_is_the_one_this_layout_ships() {
         assert_eq!(FORMAT_VERSION, 2);
         let bytes = wire_fixture().to_bytes();
-        assert_eq!(&bytes[..4], &MAGIC, "the magic moved");
+        assert_eq!(&bytes[..4], b"RDXS", "the magic moved");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
             2,

@@ -2065,6 +2065,14 @@ mod tests {
     /// the entire module, and the two ends of a worker port are exactly where
     /// that costs something. The literal below is the whole assertion: changing
     /// the layout without changing it fails here.
+    ///
+    /// The magic is written as a literal for the same reason. Asserting it
+    /// against `MAGIC` is self-consistency — the encoder writes that constant,
+    /// so any unused four bytes stayed green — and the relabel loop in
+    /// `a_malformed_payload_is_refused_rather_than_misread` only pins `RDRI`
+    /// against its two port-mates, which has nothing to say about a third
+    /// value. The far end of the port has no constant that moves with this
+    /// one. Mirrors `xsect`'s and `voxel`'s tests of the same name.
     #[test]
     fn the_format_version_is_the_one_this_layout_ships() {
         assert_eq!(FORMAT_VERSION, 7);
@@ -2079,7 +2087,7 @@ mod tests {
         )
         .unwrap()
         .to_bytes();
-        assert_eq!(&bytes[..4], &MAGIC, "the magic moved");
+        assert_eq!(&bytes[..4], b"RDRI", "the magic moved");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
             7,
