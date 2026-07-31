@@ -47,7 +47,18 @@
 //!    *"4 tilts, widest gap 0.5°, ≈1 km apart at 86 km"* flatters a state that
 //!    a complete volume's *"14 tilts, widest gap 4.9°, ≈7 km apart"* does not.
 //!    Every number improved as the picture got worse. Where the ladder stops is
-//!    the number that degrades with truncation, so mid-volume it replaces them.
+//!    the number that degrades with truncation, so it replaces them.
+//!
+//!    **A short ladder is the ordinary case, not the exception**, and that is
+//!    why the wording blames nothing. AVSET ends a precipitation scan once the
+//!    echo tops are below the cuts that remain, so a *finished* VCP 212 volume
+//!    routinely tops out well under its declared 19.5°: measured live at KLNX,
+//!    every volume in a ten-minute window ended between 6.4° and 8.0°. A
+//!    caption that read as a fault would be wrong most of the times it was
+//!    shown, and a warning that is usually wrong is one people learn to skip.
+//!    The consequence is the same whichever of the three causes it was — still
+//!    filling, abandoned, or AVSET — and the consequence is all it says: the
+//!    picture's ceiling is the volume's, not the radar's.
 //!
 //! # And the second thing, which is about the map rather than the section
 //!
@@ -646,12 +657,24 @@ fn caption_lines(
         // the picture gets more truncated. Where the ladder stops is the number
         // that degrades with truncation, and it is the only one that matters
         // while a volume is filling.
+        //
+        // **The cause is deliberately not named**, only the consequence. A short
+        // ladder is a volume still in flight, a volume abandoned, *or* — much
+        // more often than either — AVSET, which ends a precipitation scan once
+        // the echo tops are below the cuts that are left. Measured live at KLNX
+        // on VCP 212: every volume in a ten-minute window topped out between
+        // 6.4° and 8.0° against a declared 19.5°, complete ones included. So
+        // this is the ordinary state of a precipitation section and not an
+        // anomaly, and wording that read as a fault ("was cut short") would
+        // train a forecaster to ignore it. What is true in all three cases, and
+        // all this needs to say, is that the picture's ceiling is the volume's
+        // rather than the radar's.
         rungs if !ladder_reaches_pattern_top(axes) => (
             format!(
-                "{}  \u{2014}  {rungs} tilts so far: the ladder stops at {:.1}\u{b0} of the \
-                 {:.1}\u{b0} this pattern flies, so nothing above \u{2248}{:.1} {} MSL at \
-                 {:.0}{} was scanned \u{2014} this volume is still filling, or was cut \
-                 short. What is drawn is set by the ladder, not measured.",
+                "{}  \u{2014}  {rungs} tilts, topping out at {:.1}\u{b0} of the {:.1}\u{b0} \
+                 this pattern flies: nothing above \u{2248}{:.1} {} MSL at {:.0}{} was \
+                 scanned, because the volume is still filling or ended early. What is \
+                 drawn is set by the ladder, not measured.",
                 product.name(),
                 axes.top_tilt_deg,
                 axes.top_declared_cut_deg,
@@ -867,7 +890,7 @@ fn describe_missing(status: SampleStatus, ladder_reaches_top: bool) -> &'static 
         SampleStatus::AboveVolume if ladder_reaches_top => "above the volume (cone of silence)",
         SampleStatus::AboveVolume => {
             "above the highest tilt this volume flew \u{2014} not the cone of silence: the \
-             scan stopped short of its pattern"
+             scan ended below its pattern's top"
         }
         SampleStatus::BeyondRange => "beyond this tilt's range",
         SampleStatus::NoCoverage => "no coverage",
@@ -1356,11 +1379,28 @@ mod tests {
             "the caption named a ceiling with nothing to measure it against: {}",
             filling.text
         );
+        // Why the ceiling is there, without claiming which of the three causes
+        // it was. AVSET ends a precipitation scan once the echo tops are below
+        // the remaining cuts, and it is much the commonest of the three —
+        // measured live at KLNX, where every VCP 212 volume in a ten-minute
+        // window topped out between 6.4° and 8.0° against a declared 19.5°. A
+        // sentence that read as a fault would be wrong most of the time it was
+        // shown, and a warning that is usually wrong is a warning people learn
+        // to skip.
         assert!(
-            filling.text.contains("still filling"),
-            "a volume in flight reads as a volume that simply has few tilts: {}",
+            filling.text.contains("still filling or ended early"),
+            "a volume whose ladder stops short does not say why the picture has \
+             a ceiling: {}",
             filling.text
         );
+        for fault in ["cut short", "abandoned", "failed"] {
+            assert!(
+                !filling.text.contains(fault),
+                "the caption blames a scan for a ceiling AVSET puts there on \
+                 purpose ({fault:?}): {}",
+                filling.text
+            );
+        }
 
         // The flattering number is **gone**, not merely joined. Keeping it is
         // what let a four-rung ladder advertise a tighter sampling than a
