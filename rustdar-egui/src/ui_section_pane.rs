@@ -56,9 +56,7 @@ use rustdar_units::UserPreferences;
 const HEIGHT_GUTTER: f32 = 44.0;
 /// Height of the distance-axis gutter, in points.
 const DISTANCE_GUTTER: f32 = 16.0;
-/// Height of one caption line, in points.
-const CAPTION_LINE: f32 = 15.0;
-/// Below this pane height the second caption line is dropped.
+/// Below this pane height the registration caveat is dropped.
 ///
 /// A **runtime** threshold on the pane's own rect, never `cfg!(target_os)`: one
 /// wasm binary serves a phone in portrait and a desktop browser, and the same
@@ -66,6 +64,24 @@ const CAPTION_LINE: f32 = 15.0;
 const TWO_LINE_CAPTION_MIN_HEIGHT: f32 = 260.0;
 /// Points a section needs before axis labels are worth the room they take.
 const LABELLED_AXES_MIN_HEIGHT: f32 = 120.0;
+/// The most of a pane's height the caption may take before the registration
+/// caveat is dropped to make room.
+///
+/// The caption is **wrapped**, so its height is a function of the pane's width
+/// as well as its own text — a tall, narrow pane clears
+/// [`TWO_LINE_CAPTION_MIN_HEIGHT`] and then wraps the caveat over half a dozen
+/// rows. Dropping the caveat is the right answer there and truncating it is not:
+/// a sentence cut off mid-clause reads as a rendering fault, and the clause it
+/// cuts is the one explaining that the section and the map disagree on purpose.
+const CAPTION_MAX_HEIGHT_FRACTION: f32 = 0.45;
+/// Headroom between the caption and the plot, for the height axis's unit label.
+///
+/// [`paint_axes`] writes `MSL kft` **bottom**-aligned on `plot.top() - 2.0`, in
+/// the left gutter — so with only a two-point gap it is drawn *upward*, over the
+/// last line of the caption, which the caption also occupies at that x. Reserved
+/// rather than relocated because the label belongs at the top of the axis it
+/// names; it is only claimed when there are axis labels to name.
+const AXIS_UNIT_HEADROOM: f32 = 13.0;
 /// How many points along the line each tilt curve is sampled at.
 ///
 /// The curve is a smooth function of ground range, and 64 segments across a
@@ -131,9 +147,19 @@ pub(super) fn render_cross_section(
     let unavailable = state.unavailable;
 
     let axes = *section.axes();
-    let layout = SectionLayout::new(pane_rect, unavailable.is_some(), horizontal_color_scale);
 
     let painter = ui.painter().with_clip_rect(pane_rect);
+    // The caption is laid out before the layout is computed, because the layout
+    // needs its height and its height is only known once it has been wrapped to
+    // this pane's width.
+    let caption = lay_out_caption(
+        &painter,
+        pane_rect,
+        caption_lines(pane_rect, &axes, product, unavailable, ui.visuals(), prefs),
+    );
+    let caption_height = caption.iter().map(|g| g.rect.height()).sum();
+    let layout = SectionLayout::new(pane_rect, caption_height, horizontal_color_scale);
+
     painter.rect_filled(pane_rect, 0.0, ui.visuals().extreme_bg_color);
     painter.image(
         texture.id(),
@@ -164,16 +190,18 @@ pub(super) fn render_cross_section(
         egui::StrokeKind::Outside,
     );
 
-    paint_caption(
-        &painter,
-        &layout,
-        &axes,
-        product,
-        elevations.len(),
-        unavailable,
-        ui.visuals(),
-        prefs,
-    );
+    // Each galley was laid out with its own colour, so the third argument is
+    // only the fallback egui uses for a galley that carries none.
+    let mut y = layout.caption.top();
+    for galley in caption {
+        let height = galley.rect.height();
+        painter.galley(
+            egui::pos2(layout.caption.left(), y),
+            galley,
+            ui.visuals().text_color(),
+        );
+        y += height;
+    }
 
     if let Some(pos) = ui.ctx().pointer_hover_pos()
         && pane_rect.contains(pos)
@@ -195,25 +223,38 @@ struct SectionLayout {
     caption: egui::Rect,
     /// Whether there was room for axis labels.
     labelled_axes: bool,
-    /// Whether there was room for the registration line of the caption.
-    two_line_caption: bool,
+}
+
+/// The width the caption's text is wrapped to on a pane of this shape.
+fn caption_wrap_width(pane_rect: egui::Rect) -> f32 {
+    (pane_rect.width() - 8.0).max(1.0)
+}
+
+/// Whether a pane of this shape has room for the registration caveat.
+///
+/// A **runtime** decision on the rect, never `cfg!(target_os)`: one wasm binary
+/// serves a phone in portrait and a desktop browser.
+fn wants_registration_line(pane_rect: egui::Rect) -> bool {
+    pane_rect.height() >= TWO_LINE_CAPTION_MIN_HEIGHT
 }
 
 impl SectionLayout {
+    /// `caption_height` is **measured**, not counted: the caption wraps, so how
+    /// many rows it occupies is a function of the pane's width and of how long
+    /// the sentences came out in the user's own units. Counting lines instead is
+    /// what let the registration caveat run flush off the right-hand edge of a
+    /// pane in a 2×2 split and be clipped mid-sentence.
+    ///
     /// `horizontal_color_scale` is the orientation `ColorScaleOrientation`
     /// resolved for the whole panel, and it is an *input* here rather than
     /// something read back afterwards: the colour bar is painted straight onto
     /// the pane rect by `render_color_scale`, so the plot has to leave room on
     /// whichever edge the bar took, or the bar lands on top of the section.
-    fn new(pane_rect: egui::Rect, has_status_line: bool, horizontal_color_scale: bool) -> Self {
-        let two_line_caption = pane_rect.height() >= TWO_LINE_CAPTION_MIN_HEIGHT;
+    fn new(pane_rect: egui::Rect, caption_height: f32, horizontal_color_scale: bool) -> Self {
         let labelled_axes = pane_rect.height() >= LABELLED_AXES_MIN_HEIGHT;
-        let caption_lines =
-            1.0 + f32::from(u8::from(two_line_caption)) + f32::from(u8::from(has_status_line));
-        let caption_height = caption_lines * CAPTION_LINE;
         let caption = egui::Rect::from_min_size(
             pane_rect.min + egui::vec2(4.0, 2.0),
-            egui::vec2(pane_rect.width() - 8.0, caption_height),
+            egui::vec2(caption_wrap_width(pane_rect), caption_height),
         );
         let (left, bottom) = if labelled_axes {
             (HEIGHT_GUTTER, DISTANCE_GUTTER)
@@ -225,8 +266,15 @@ impl SectionLayout {
         } else {
             (COLOR_SCALE_RESERVE, 0.0)
         };
+        // The gap is the axis unit label's, and it is only owed when there is an
+        // axis unit label. See `AXIS_UNIT_HEADROOM`.
+        let top_gap = if labelled_axes {
+            AXIS_UNIT_HEADROOM
+        } else {
+            2.0
+        };
         let plot = egui::Rect::from_min_max(
-            egui::pos2(pane_rect.left() + left, caption.bottom() + 2.0),
+            egui::pos2(pane_rect.left() + left, caption.bottom() + top_gap),
             egui::pos2(
                 pane_rect.right() - 4.0 - scale_right,
                 pane_rect.bottom() - bottom - scale_bottom,
@@ -236,7 +284,6 @@ impl SectionLayout {
             plot,
             caption,
             labelled_axes,
-            two_line_caption,
         }
     }
 
@@ -471,59 +518,86 @@ fn tilt_curves(
     )
 }
 
+/// One line of the caption, before it is laid out.
+struct CaptionLine {
+    text: String,
+    color: egui::Color32,
+    size: f32,
+}
+
 /// The caption: what this is, how coarse it is, and where it disagrees with the
 /// map above it.
 ///
 /// Not a dismissible banner and not a tooltip. Both of those are read once and
 /// then never again, and the thing being said is not a one-off notice — it is
 /// the standing meaning of every pixel in the pane.
-#[allow(clippy::too_many_arguments)]
-fn paint_caption(
-    painter: &egui::Painter,
-    layout: &SectionLayout,
+///
+/// Built as text before anything is measured or drawn, because the caption's
+/// height decides where the plot starts and the caption's height is only known
+/// once its text has been wrapped to the pane's width.
+fn caption_lines(
+    pane_rect: egui::Rect,
     axes: &SectionAxes,
     product: RadarProduct,
-    known_rungs: usize,
     unavailable: Option<crate::pane::SectionUnavailable>,
     visuals: &egui::Visuals,
     prefs: &UserPreferences,
-) {
-    let mut y = layout.caption.top();
-    let mut line = |text: String, color: egui::Color32, size: f32| {
-        painter.text(
-            egui::pos2(layout.caption.left(), y),
-            egui::Align2::LEFT_TOP,
-            text,
-            egui::FontId::proportional(size),
-            color,
-        );
-        y += CAPTION_LINE;
-    };
+) -> Vec<CaptionLine> {
+    let mut lines = Vec::new();
 
     // The ladder's own numbers, so the warning is a measurement rather than
     // boilerplate: 14 rungs 0.5° apart and 5 rungs 5° apart are the same
     // sentence with wildly different consequences.
+    //
+    // **Except at the bottom of the ladder, where the numbers say the opposite
+    // of what they mean.** `widest_tilt_gap_deg` is `0.0` for a single rung
+    // because there is no second rung to be apart from, so the general sentence
+    // comes out as "1 tilts, widest gap 0.0° (≈0km apart at 171km)" — and a
+    // skimmer reads a zero gap as perfect sampling when a one-rung ladder is the
+    // worst case there is. A one-rung section is one conical surface with
+    // nothing measured above or below it, and that is what it has to say.
     let widest_gap_km = axes.widest_tilt_gap_deg.to_radians() * axes.coverage_ground_range_km;
     let gap_shown = prefs.distance.convert_from_km(widest_gap_km);
-    line(
-        format!(
-            "{}  \u{2014}  {} tilts, widest gap {:.1}\u{b0} (\u{2248}{:.0}{} apart at {:.0}{}): \
-             layer depth and echo tops here are set by the ladder, not measured",
-            product.name(),
-            axes.tilt_count,
-            axes.widest_tilt_gap_deg,
-            gap_shown,
-            prefs.distance.suffix(),
-            prefs
-                .distance
-                .convert_from_km(axes.coverage_ground_range_km),
-            prefs.distance.suffix(),
+    let (ladder, ladder_color) = match axes.tilt_count {
+        0 => (
+            format!(
+                "{}  \u{2014}  no tilts: this volume carried no cut of this moment, so \
+                 nothing in the picture below was measured",
+                product.name(),
+            ),
+            visuals.error_fg_color,
         ),
-        visuals.warn_fg_color,
-        11.0,
-    );
+        1 => (
+            format!(
+                "{}  \u{2014}  one tilt only: a single conical surface, with nothing \
+                 measured above or below it. This is not a vertical profile.",
+                product.name(),
+            ),
+            visuals.error_fg_color,
+        ),
+        rungs => (
+            format!(
+                "{}  \u{2014}  {rungs} tilts, widest gap {:.1}\u{b0} (\u{2248}{:.0}{} apart at \
+                 {:.0}{}): layer depth and echo tops here are set by the ladder, not measured",
+                product.name(),
+                axes.widest_tilt_gap_deg,
+                gap_shown,
+                prefs.distance.suffix(),
+                prefs
+                    .distance
+                    .convert_from_km(axes.coverage_ground_range_km),
+                prefs.distance.suffix(),
+            ),
+            visuals.warn_fg_color,
+        ),
+    };
+    lines.push(CaptionLine {
+        text: ladder,
+        color: ladder_color,
+        size: 11.0,
+    });
 
-    if layout.two_line_caption {
+    if wants_registration_line(pane_rect) {
         // The registration caveat, in the pane the user is looking at rather
         // than only in a doc comment — because the disagreement is visible.
         // `render_gate` draws a gate at its slant range on the ground with no
@@ -547,20 +621,71 @@ fn paint_caption(
                 prefs.distance.suffix(),
             ));
         }
-        line(second, visuals.weak_text_color(), 10.0);
+        lines.push(CaptionLine {
+            text: second,
+            color: visuals.weak_text_color(),
+            size: 10.0,
+        });
     }
 
     // Last, under both, so a transient state never pushes the standing warning
     // off the top of the pane.
     if let Some(reason) = unavailable {
-        line(
-            format!("\u{26a0} {}", reason.message()),
-            visuals.error_fg_color,
-            10.0,
-        );
+        lines.push(CaptionLine {
+            text: format!("\u{26a0} {}", reason.message()),
+            color: visuals.error_fg_color,
+            size: 10.0,
+        });
     }
 
-    let _ = known_rungs;
+    lines
+}
+
+/// Wrap the caption to the pane's width, dropping the registration caveat if
+/// what is left would eat the picture.
+///
+/// The measurement is what makes the caption honest at every pane shape. Before
+/// it, the caption was drawn with `Painter::text` and no wrap width and the band
+/// was *counted* at one row per line — so on a wide pane in a 2×2 split the
+/// caveat ran flush to the pane's edge and was clipped mid-sentence, and there
+/// was nothing in the layout that could have noticed.
+fn lay_out_caption(
+    painter: &egui::Painter,
+    pane_rect: egui::Rect,
+    mut lines: Vec<CaptionLine>,
+) -> Vec<std::sync::Arc<egui::Galley>> {
+    let wrap = caption_wrap_width(pane_rect);
+    let layout_all = |lines: &[CaptionLine]| -> Vec<std::sync::Arc<egui::Galley>> {
+        lines
+            .iter()
+            .map(|l| {
+                painter.layout(
+                    l.text.clone(),
+                    egui::FontId::proportional(l.size),
+                    l.color,
+                    wrap,
+                )
+            })
+            .collect()
+    };
+    let total = |galleys: &[std::sync::Arc<egui::Galley>]| -> f32 {
+        galleys.iter().map(|g| g.rect.height()).sum()
+    };
+
+    let galleys = layout_all(&lines);
+    let budget = pane_rect.height() * CAPTION_MAX_HEIGHT_FRACTION;
+    if total(&galleys) <= budget || lines.len() < 2 {
+        return galleys;
+    }
+    // Index 1 is the registration caveat when there is one — the ladder warning
+    // is always first and the transient status line is always last, and those
+    // two are the ones that must survive. `wants_registration_line` has already
+    // said yes on the pane's *height*; this is the same judgement made on the
+    // wrapped result, which is the only place the pane's width gets a say.
+    if wants_registration_line(pane_rect) {
+        lines.remove(1);
+    }
+    layout_all(&lines)
 }
 
 /// What the status bar says about the pixel under the pointer.
@@ -664,6 +789,13 @@ fn nice_step(span: f64, wanted: f64) -> f64 {
 mod tests {
     use super::*;
 
+    /// A measured caption height standing in for one wrapped row, for the tests
+    /// that are about the *rest* of the layout. Real ones come from
+    /// [`lay_out_caption`], which needs fonts.
+    const ONE_LINE: f32 = 15.0;
+    /// Two wrapped rows, for the tests about the caption taking room.
+    const TWO_LINES: f32 = 30.0;
+
     fn axes() -> SectionAxes {
         SectionAxes {
             length_km: 100.0,
@@ -687,7 +819,7 @@ mod tests {
     #[test]
     fn the_top_of_the_axis_is_the_top_of_the_plot() {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
-        let layout = SectionLayout::new(rect, false, false);
+        let layout = SectionLayout::new(rect, ONE_LINE, false);
         let axes = axes();
 
         assert_eq!(
@@ -716,7 +848,7 @@ mod tests {
     #[test]
     fn a_degenerate_axis_maps_to_the_edges_rather_than_to_nan() {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
-        let layout = SectionLayout::new(rect, false, false);
+        let layout = SectionLayout::new(rect, ONE_LINE, false);
         let flat = SectionAxes {
             length_km: 0.0,
             top_km_msl: 0.4,
@@ -775,33 +907,209 @@ mod tests {
     /// tempting wrong answer and would compile.
     #[test]
     fn a_short_pane_drops_the_second_caption_line_and_keeps_a_picture() {
-        let tall = SectionLayout::new(
-            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 400.0)),
-            false,
-            false,
-        );
-        assert!(tall.two_line_caption);
-        assert!(tall.labelled_axes);
+        let rect =
+            |w: f32, h: f32| egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h));
 
-        let short = SectionLayout::new(
-            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 200.0)),
-            false,
-            false,
-        );
-        assert!(!short.two_line_caption);
+        assert!(wants_registration_line(rect(600.0, 400.0)));
+        assert!(SectionLayout::new(rect(600.0, 400.0), TWO_LINES, false).labelled_axes);
+
+        assert!(!wants_registration_line(rect(600.0, 200.0)));
+        let short = SectionLayout::new(rect(600.0, 200.0), ONE_LINE, false);
         assert!(short.labelled_axes);
         assert!(short.plot.height() > 0.0);
 
-        let tiny = SectionLayout::new(
-            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 110.0)),
-            false,
-            false,
-        );
+        let tiny = SectionLayout::new(rect(300.0, 110.0), ONE_LINE, false);
         assert!(!tiny.labelled_axes, "no room for labels at 110 points");
         assert!(
             tiny.plot.left() < tiny.plot.right(),
             "the picture must not be squeezed out by its own gutters"
         );
+    }
+
+    /// The height axis's unit label gets its own room, rather than being drawn
+    /// upward over the last line of the caption.
+    ///
+    /// `paint_axes` writes `MSL kft` bottom-aligned on `plot.top() - 2.0`, in the
+    /// left gutter — the same strip of pane the caption's left edge occupies. It
+    /// was overdrawn in every screenshot the feature ever produced, and only when
+    /// there are axis labels at all, which is why the reservation is conditional
+    /// on the same predicate the labels are.
+    #[test]
+    fn the_axis_unit_label_has_room_above_the_plot() {
+        let rect = |h: f32| egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, h));
+
+        let labelled = SectionLayout::new(rect(400.0), ONE_LINE, false);
+        assert!(labelled.labelled_axes, "precondition");
+        // 10 pt text bottom-aligned two points above the plot: its top sits at
+        // `plot.top() - 2 - height`, which has to clear the caption.
+        assert!(
+            labelled.plot.top() - 2.0 - 10.0 >= labelled.caption.bottom(),
+            "the MSL unit label is drawn over the caption: plot top {}, caption \
+             bottom {}",
+            labelled.plot.top(),
+            labelled.caption.bottom()
+        );
+
+        // And a pane with no axis labels does not pay for a label it never draws.
+        let bare = SectionLayout::new(rect(110.0), ONE_LINE, false);
+        assert!(!bare.labelled_axes, "precondition");
+        assert!(
+            bare.plot.top() - bare.caption.bottom() < AXIS_UNIT_HEADROOM,
+            "room was reserved for a label this pane has no room to draw"
+        );
+    }
+
+    /// The caption is **wrapped and then measured**, so no sentence in it is ever
+    /// clipped and no wrapped row is ever painted over the picture.
+    ///
+    /// Both halves matter and they fail in different places. Before the wrap, the
+    /// caveat was drawn with `Painter::text` and ran flush to the pane's edge on
+    /// a 2×2 split of a wide window — the clip cut it mid-sentence, and the
+    /// sentence it cut is the one explaining that the section and the map
+    /// disagree on purpose. Before the measurement, the band was *counted* at one
+    /// row per line, so any wrap at all landed on the plot.
+    #[test]
+    fn the_caption_wraps_and_the_layout_pays_for_the_rows_it_takes() {
+        let ctx = egui::Context::default();
+        // One frame, so the fonts exist to lay text out with.
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let prefs = UserPreferences::default();
+        let visuals = egui::Visuals::dark();
+        // Coverage stopping short of the line's far end appends the extra clause
+        // — the longest the caption ever gets, and the shape the clip was found
+        // on.
+        let truncated = SectionAxes {
+            coverage_ground_range_km: 64.0,
+            ..axes()
+        };
+
+        let rect =
+            |w: f32, h: f32| egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h));
+        let measure = |w: f32, h: f32| {
+            let rect = rect(w, h);
+            let painter = egui::Painter::new(ctx.clone(), egui::LayerId::debug(), rect);
+            let galleys = lay_out_caption(
+                &painter,
+                rect,
+                caption_lines(
+                    rect,
+                    &truncated,
+                    RadarProduct::Reflectivity,
+                    None,
+                    &visuals,
+                    &prefs,
+                ),
+            );
+            let widest = galleys
+                .iter()
+                .map(|g| g.rect.width())
+                .fold(0.0_f32, f32::max);
+            let height: f32 = galleys.iter().map(|g| g.rect.height()).sum();
+            (galleys.len(), widest, height)
+        };
+
+        // Nothing overruns the width it was wrapped to, at any pane shape, and
+        // the plot always starts below every row the caption took.
+        for (w, h) in [
+            (1780.0f32, 900.0f32),
+            (880.0, 500.0),
+            (620.0, 500.0),
+            (400.0, 400.0),
+            (300.0, 400.0),
+            (200.0, 300.0),
+            (150.0, 300.0),
+            (150.0, 700.0),
+        ] {
+            let (rows, widest, height) = measure(w, h);
+            assert!(
+                widest <= caption_wrap_width(rect(w, h)) + 0.5,
+                "at {w}x{h} the caption ran {widest} points wide and was clipped"
+            );
+            assert!(
+                height <= h * CAPTION_MAX_HEIGHT_FRACTION,
+                "at {w}x{h} the caption ate {height} points of the pane"
+            );
+            let layout = SectionLayout::new(rect(w, h), height, false);
+            assert!(
+                layout.plot.top() >= layout.caption.top() + height,
+                "at {w}x{h} the plot starts inside the {rows}-row caption above it"
+            );
+            assert!(layout.plot.height() > 0.0, "no picture left at {w}x{h}");
+        }
+
+        // The wrap really happens rather than every pane happening to fit: a
+        // 620-point pane needs more rows than a 1780-point one, and pays for them.
+        let (_, _, wide) = measure(1780.0, 900.0);
+        let (_, _, medium) = measure(620.0, 500.0);
+        assert!(
+            medium > wide,
+            "the caption did not wrap on a narrower pane ({medium} against {wide})"
+        );
+
+        // And when even the wrapped caption would eat the pane, the registration
+        // caveat is dropped rather than the sentence being cut in half.
+        let (rows_narrow, _, narrow) = measure(150.0, 300.0);
+        let (rows_roomy, _, _) = measure(200.0, 300.0);
+        assert!(
+            rows_narrow < rows_roomy,
+            "a caption with no room to wrap kept every line anyway"
+        );
+        assert!(narrow <= 300.0 * CAPTION_MAX_HEIGHT_FRACTION);
+    }
+
+    /// A one-rung ladder is the **worst** case, and the general sentence's
+    /// numbers say the opposite.
+    ///
+    /// `widest_tilt_gap_deg` is `0.0` for a single rung because there is no
+    /// second rung to be apart from, so the general wording renders as
+    /// "1 tilts, widest gap 0.0° (≈0km apart at 171km)" — which reads as perfect
+    /// sampling. It was also the standing state of every live section before the
+    /// staleness key learned to notice a volume filling.
+    #[test]
+    fn a_degenerate_ladder_does_not_report_itself_as_a_perfect_one() {
+        let prefs = UserPreferences::default();
+        let visuals = egui::Visuals::dark();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 400.0));
+        let caption = |tilt_count: usize, widest_tilt_gap_deg: f64| {
+            let axes = SectionAxes {
+                tilt_count,
+                widest_tilt_gap_deg,
+                ..axes()
+            };
+            caption_lines(
+                rect,
+                &axes,
+                RadarProduct::Reflectivity,
+                None,
+                &visuals,
+                &prefs,
+            )
+            .swap_remove(0)
+        };
+
+        for degenerate in [caption(0, 0.0), caption(1, 0.0)] {
+            let text = &degenerate.text;
+            assert!(
+                !text.contains("widest gap"),
+                "a ladder with nothing to be apart from reported a gap: {text}"
+            );
+            assert!(!text.contains("1 tilts"), "{text}");
+            assert!(
+                text.contains("measured"),
+                "the degenerate caption has to say what was and was not measured: {text}"
+            );
+            assert_eq!(
+                degenerate.color, visuals.error_fg_color,
+                "the worst case is not styled as the ordinary one"
+            );
+        }
+
+        // And the ordinary case still carries the ladder's own numbers, which is
+        // what makes the warning a measurement rather than boilerplate.
+        let ordinary = caption(14, 4.9);
+        assert!(ordinary.text.contains("14 tilts"), "{}", ordinary.text);
+        assert!(ordinary.text.contains("4.9"), "{}", ordinary.text);
+        assert_eq!(ordinary.color, visuals.warn_fg_color);
     }
 
     /// The rungs are the honesty device, so both halves of them are pinned: the
@@ -816,7 +1124,7 @@ mod tests {
     #[test]
     fn the_rungs_are_refused_unless_both_ladders_are_the_same_ladder() {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 500.0));
-        let layout = SectionLayout::new(rect, false, false);
+        let layout = SectionLayout::new(rect, ONE_LINE, false);
         // KTLX, and a line running away from it, so the ground range along the
         // section really does change.
         let (site_lat, site_lon) = (35.3333, -97.2778);
@@ -870,8 +1178,8 @@ mod tests {
     #[test]
     fn a_status_line_takes_room_from_the_picture_not_from_the_warning() {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 400.0));
-        let without = SectionLayout::new(rect, false, false);
-        let with = SectionLayout::new(rect, true, false);
+        let without = SectionLayout::new(rect, ONE_LINE, false);
+        let with = SectionLayout::new(rect, TWO_LINES, false);
         assert!(with.caption.height() > without.caption.height());
         assert!(with.plot.top() > without.plot.top());
         assert!(with.plot.height() < without.plot.height());
@@ -887,8 +1195,8 @@ mod tests {
     #[test]
     fn the_plot_leaves_room_for_whichever_edge_the_colour_bar_took() {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 500.0));
-        let vertical = SectionLayout::new(rect, false, false);
-        let horizontal = SectionLayout::new(rect, false, true);
+        let vertical = SectionLayout::new(rect, ONE_LINE, false);
+        let horizontal = SectionLayout::new(rect, ONE_LINE, true);
 
         assert!(
             rect.right() - vertical.plot.right() >= COLOR_SCALE_RESERVE,

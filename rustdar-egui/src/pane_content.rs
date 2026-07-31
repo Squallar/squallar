@@ -1169,12 +1169,19 @@ mod tests {
             egui::TextureOptions::NEAREST,
         );
         let line = SectionLine::new(point(35.3, -97.3), point(35.6, -97.0)).expect("valid line");
+        // The cut itself is in the fixture, and it is the half the test is
+        // *named* for. Without it, `section` is `None` before and after and the
+        // assertion below holds for a `release_textures` that drops it — which
+        // is the exact mutant that survived: the resume path would re-cut from a
+        // volume that may have been evicted instead of re-uploading a raster it
+        // still had.
         let mut content = PaneContent::CrossSection(Box::new(CrossSectionPane {
             line: Some(line),
             source_pane: Some(0),
+            section: Some(std::sync::Arc::new(blank_section())),
             texture: Some(texture),
             unavailable: Some(SectionUnavailable::RenderFailed),
-            ..Default::default()
+            rendered_for: None,
         }));
 
         content.release_textures();
@@ -1186,6 +1193,11 @@ mod tests {
             section.texture.is_none(),
             "the handle outlived the context that owns it"
         );
+        assert!(
+            section.section.is_some(),
+            "the cut went with the texture, so a resume has to re-cut from a \
+             volume that may no longer be in memory"
+        );
         assert_eq!(
             section.line,
             Some(line),
@@ -1193,6 +1205,35 @@ mod tests {
         );
         assert_eq!(section.source_pane, Some(0));
         assert_eq!(section.unavailable, Some(SectionUnavailable::RenderFailed));
+    }
+
+    /// A cut of the right shape and no content, so a fixture can hold a picture
+    /// for a release or a retarget to act on.
+    ///
+    /// Full size — `from_parts` refuses anything else, because a mis-shaped
+    /// section reaches `ColorImage::from_rgba_unmultiplied`'s `assert_eq!` on
+    /// the main thread.
+    fn blank_section() -> CrossSection {
+        use rustdar_radar::sampler::SampleStatus;
+        use rustdar_radar::xsect::{SECTION_HEIGHT, SECTION_WIDTH, SectionAxes};
+        let pixels = SECTION_WIDTH * SECTION_HEIGHT;
+        CrossSection::from_parts(
+            vec![0u8; pixels * 4],
+            vec![f32::NAN; pixels],
+            vec![SampleStatus::NoCoverage.wire_code(); pixels],
+            SectionAxes {
+                length_km: 100.0,
+                base_km_msl: 0.4,
+                top_km_msl: 20.4,
+                near_ground_range_km: 10.0,
+                far_ground_range_km: 110.0,
+                coverage_ground_range_km: 0.0,
+                cone_of_silence_km: 0.0,
+                tilt_count: 1,
+                widest_tilt_gap_deg: 0.0,
+            },
+        )
+        .expect("a full-size, all-NoCoverage section is well formed")
     }
 
     /// The staleness key notices a new volume with no help from any reset path,

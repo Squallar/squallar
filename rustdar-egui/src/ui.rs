@@ -3676,6 +3676,7 @@ mod pane_slice_tests {
     /// left on screen is of ground the user is no longer pointing at.
     #[test]
     fn a_retargeted_section_takes_the_maps_site_and_drops_the_old_picture() {
+        let ctx = egui::Context::default();
         let mut gui = wide(2);
         gui.panes[0].site = "KTLX".to_owned();
         gui.panes[0].selected_product = RadarProduct::Velocity;
@@ -3704,6 +3705,16 @@ mod pane_slice_tests {
                 tilts: 9,
             });
             section.section = Some(std::sync::Arc::new(blank_section()));
+            // And the raster, which needs a `Context` and is the reason the
+            // first repair of this fixture stopped at `section`. Without it,
+            // deleting `section.texture = None` from the retarget passes: the
+            // pane would go on painting the *previous* line's picture, with the
+            // new line's caption over it, for as long as the re-cut takes.
+            section.texture = Some(ctx.load_texture(
+                "retarget-fixture",
+                egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                egui::TextureOptions::NEAREST,
+            ));
         }
 
         gui.pending_section_line = Some((0, drawn_line()));
@@ -3714,7 +3725,15 @@ mod pane_slice_tests {
         assert_eq!(pane.selected_product, RadarProduct::Velocity);
         let section = pane.cross_section().unwrap();
         assert_eq!(section.line, Some(drawn_line()));
-        assert!(section.section.is_none() && section.texture.is_none());
+        assert!(
+            section.section.is_none(),
+            "the previous line's cut is still what a hover reads"
+        );
+        assert!(
+            section.texture.is_none(),
+            "the previous line's picture is still on screen under the new line's \
+             caption"
+        );
         assert_eq!(
             section.rendered_for, None,
             "a stale key would stop the dispatcher ever cutting the new line"

@@ -5748,6 +5748,28 @@ mod section_dispatch_tests {
             !app.render.pane_render[0].render_in_flight,
             "a pane that never hears back stops asking for another cut"
         );
+
+        // **And it is uploaded `NEAREST`**, which is one of the three honesty
+        // devices the section pane rests on and the only one that leaves no
+        // trace in the source of the module it protects. A section's rows are
+        // the tilt ladder's rungs stretched to fill the gaps between them;
+        // bilinear filtering blends those edges into a smooth gradient and
+        // paints exactly the impression the caption exists to refuse — that the
+        // vertical structure was measured continuously. Nothing about the
+        // picture would look broken, which is why it is asserted rather than
+        // left to a comment.
+        let id = state(&app).texture.as_ref().expect("uploaded").id();
+        let manager = ctx.tex_manager();
+        let manager = manager.read();
+        let meta = manager
+            .meta(id)
+            .expect("the handle is alive, so its meta is");
+        assert_eq!(
+            meta.options,
+            egui::TextureOptions::NEAREST,
+            "the section raster is filtered, which paints the interpolation as \
+             measurement"
+        );
     }
 
     /// A cut for a line the pane is no longer aimed along is dropped, and the
