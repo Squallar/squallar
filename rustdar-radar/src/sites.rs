@@ -3,6 +3,28 @@ pub struct RadarSite {
     pub name: &'static str,
     pub lat: f64,
     pub lon: f64,
+    /// Height of the **site base** above mean sea level, feet.
+    ///
+    /// The base, not the feedhorn: a Level II volume's own Volume Data Block
+    /// reports the two separately, and every row here that could be checked
+    /// against a file matches its `site_height` rather than
+    /// `site_height + tower_height` — KDMX 981 ft against 299 m exactly, KTLX
+    /// 1213 against 370 m, KCRP 45 against 14 m, KFTG 5497 against 1675 m.
+    /// Towers run 14–34 m, so the two datums are far enough apart to tell
+    /// apart and the choice is not arbitrary.
+    ///
+    /// It matters because [`crate::beam`] measures heights **above the
+    /// antenna**, so anything that adds this to a beam height — the
+    /// cross-section's `base_km_msl`, the hail and voxel datums — is short by
+    /// the tower. That is a pre-existing, uniform choice across all 207 rows,
+    /// worth a metre or two of a 20 km axis, and is recorded here rather than
+    /// silently corrected.
+    ///
+    /// `None` means the table does not know. Nothing in the shipped table is
+    /// `None` — `every_site_records_an_elevation` keeps it that way, because a
+    /// missing elevation used to reach [`crate::eet::radar_height_ft_near`]
+    /// and come back as sea level, which is a plausible-looking answer for a
+    /// coastal site and a 90 m error for KLWX.
     pub elev: Option<i32>,
 }
 
@@ -197,7 +219,7 @@ pub const RADARS: [RadarSite; 207] = [
         name: "KDGX",
         lat: 32.28,
         lon: -89.98444,
-        elev: None,
+        elev: Some(495),
     },
     RadarSite {
         name: "KDIX",
@@ -329,7 +351,7 @@ pub const RADARS: [RadarSite; 207] = [
         name: "KFSX",
         lat: 34.57444,
         lon: -111.19833,
-        elev: None,
+        elev: Some(7418),
     },
     RadarSite {
         name: "KFTG",
@@ -563,7 +585,7 @@ pub const RADARS: [RadarSite; 207] = [
         name: "KLWX",
         lat: 38.97628,
         lon: -77.48751,
-        elev: None,
+        elev: Some(292),
     },
     RadarSite {
         name: "KLZK",
@@ -755,7 +777,7 @@ pub const RADARS: [RadarSite; 207] = [
         name: "KRTX",
         lat: 45.715,
         lon: -122.96417,
-        elev: None,
+        elev: Some(1614),
     },
     RadarSite {
         name: "KSFX",
@@ -791,7 +813,7 @@ pub const RADARS: [RadarSite; 207] = [
         name: "KSRX",
         lat: 35.29056,
         lon: -94.36167,
-        elev: None,
+        elev: Some(656),
     },
     RadarSite {
         name: "KTBW",
@@ -869,7 +891,7 @@ pub const RADARS: [RadarSite; 207] = [
         name: "KVWX",
         lat: 38.2600,
         lon: -87.7247,
-        elev: None,
+        elev: Some(512),
     },
     RadarSite {
         name: "KYUX",
@@ -1474,6 +1496,31 @@ mod nearest_tests {
     fn a_non_finite_coordinate_has_no_nearest_site() {
         assert!(nearest_wsr88d_site(f64::NAN, -97.0).is_none());
         assert!(nearest_wsr88d_site(35.0, f64::INFINITY).is_none());
+    }
+
+    /// Every row must record an elevation.
+    ///
+    /// Six did not — KDGX, KFSX, KLWX, KRTX, KSRX, KVWX, all of them
+    /// `-99999` sentinels in the source the table was generated from, turned
+    /// into `None` by the `Option<i32>` refactor and never filled in. A row
+    /// without one is not inert: it is the datum a cross-section's height axis
+    /// is anchored on, and the old lookup answered sea level for it, which
+    /// reads as a measurement rather than as a gap.
+    ///
+    /// This is the loud failure the elevation deserves, moved to where it can
+    /// be seen — a test, rather than a render that silently sits 89 m low.
+    #[test]
+    fn every_site_records_an_elevation() {
+        let missing: Vec<&str> = RADARS
+            .iter()
+            .filter(|s| s.elev.is_none())
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these sites record no elevation and would anchor a section at sea \
+             level: {missing:?}",
+        );
     }
 
     /// Every site must be reachable as its own nearest neighbour, which catches

@@ -259,12 +259,36 @@ pub fn compute_eet(scan: &Scan, radar_height_ft: f64) -> EetGrid {
 }
 
 /// Radar height above MSL, in feet, of the site nearest a lat/lon — for the
-/// render path, which knows only the coordinates. Sites without a recorded
-/// elevation (and an empty table) fall back to 0 ft, which costs at most one
-/// data level at the handful of sites affected.
+/// render path, which knows only the coordinates.
+///
+/// # Why the nearest site rather than the named one
+///
+/// The render path is handed coordinates, not an ICAO. In practice those
+/// coordinates always *came* from a [`crate::sites::RadarSite`] row —
+/// `ScanInfo::from_scan` resolves the site by identifier through
+/// [`crate::sites::get_radar_site`] and only falls back to (0, 0) with a
+/// warning for an identifier the table does not carry — and every row is its
+/// own nearest neighbour (`every_site_is_its_own_nearest_neighbour`). So this
+/// resolves to the site the caller meant, exactly, and the nearest-neighbour
+/// search is an indirection rather than a guess.
+///
+/// # Sites the table has no elevation for
+///
+/// Rows without one are **skipped**, not selected and then unwrapped to zero.
+/// That distinction is the whole point: `and_then(|s| s.elev)` on the nearest
+/// row meant an elevation-less site short-circuited the entire lookup to 0 ft
+/// — sea level, which is a perfectly plausible reading for a coastal site and
+/// was a 292 ft error at KLWX. Skipping degrades instead to a genuine
+/// neighbour's elevation, wrong by the terrain between them rather than by the
+/// whole height of the site.
+///
+/// No shipped row is elevation-less (`every_site_records_an_elevation` pins
+/// that), so this is a guard against a future row, not a live path. An empty
+/// table still yields 0 ft, having nothing else to say.
 pub fn radar_height_ft_near(lat: f64, lon: f64) -> f64 {
     crate::sites::RADARS
         .iter()
+        .filter(|s| s.elev.is_some())
         .min_by(|a, b| {
             let da = (a.lat - lat).powi(2) + (a.lon - lon).powi(2);
             let db = (b.lat - lat).powi(2) + (b.lon - lon).powi(2);
@@ -672,14 +696,68 @@ mod tests {
         assert_eq!(encode_level(0.0, true), 130);
     }
 
-    /// The render path's site lookup: the nearest site's elevation, 0 when
-    /// the site records none.
+    /// The render path's site lookup: the nearest site's elevation.
     #[test]
     fn radar_height_lookup_finds_the_nearest_site() {
         // KTLX's own coordinates give KTLX's elevation.
         assert_eq!(radar_height_ft_near(35.33306, -97.2775), 1213.0);
         // A point nudged off-site still lands on it.
         assert_eq!(radar_height_ft_near(35.4, -97.2), 1213.0);
+    }
+
+    /// A site whose row records no elevation must not drag the lookup down to
+    /// sea level.
+    ///
+    /// This is the shape of the KLWX defect. `radar_height_ft_near` used to
+    /// pick the nearest row and *then* `and_then(|s| s.elev)`, so standing on
+    /// an elevation-less site returned 0 ft rather than anything about the
+    /// terrain — and 0 ft is indistinguishable from a real answer, several
+    /// rows of the table being under 20 ft.
+    ///
+    /// The table now records every site, so this reaches for the guard the
+    /// only way left: it asserts the *property* that no coordinate anywhere in
+    /// the table's footprint returns exactly zero. Under the old
+    /// `and_then`-after-`min_by` that failed at each of the six unrecorded
+    /// sites; under the filter it cannot fail while
+    /// `every_site_records_an_elevation` holds, and if a future row arrives
+    /// without an elevation it still cannot, because the row is skipped.
+    #[test]
+    fn an_elevationless_row_never_answers_with_sea_level() {
+        for site in crate::sites::RADARS.iter() {
+            let ft = radar_height_ft_near(site.lat, site.lon);
+            assert_ne!(
+                ft, 0.0,
+                "{} at ({}, {}) resolved to sea level",
+                site.name, site.lat, site.lon,
+            );
+        }
+    }
+
+    /// The six sites the table shipped with no elevation, pinned by value
+    /// against each one's own Level II Volume Data Block.
+    ///
+    /// These are `site_height` — the base — read out of a real volume for each
+    /// site, not recalled: KDGX 151 m, KFSX 2261 m, KRTX 492 m, KSRX 200 m,
+    /// KVWX 156 m, KLWX 89 m. Converted at 0.3048 m/ft and rounded, which is
+    /// the datum and the precision every other row in the table already uses.
+    ///
+    /// KLWX is the one the cross-section campaign caught: it anchored a
+    /// section 89 m low, and 89 m is four and a half rows of a 1024-row raster
+    /// over a 20 km axis.
+    #[test]
+    fn the_six_formerly_unrecorded_sites_carry_their_measured_elevation() {
+        for (name, ft) in [
+            ("KDGX", 495),
+            ("KFSX", 7418),
+            ("KRTX", 1614),
+            ("KSRX", 656),
+            ("KVWX", 512),
+            ("KLWX", 292),
+        ] {
+            let site = crate::sites::get_radar_site(name).expect("in the table");
+            assert_eq!(site.elev, Some(ft), "{name}");
+            assert_eq!(radar_height_ft_near(site.lat, site.lon), f64::from(ft));
+        }
     }
 }
 
