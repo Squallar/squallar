@@ -24,6 +24,15 @@ use rustdar_overlays::render::overlay_state::OverlayKind;
 /// would go on passing after the entry was renamed out from under it.
 pub(crate) const VOLUME_PANE_LABEL: &str = "3D volume view";
 
+/// The label on the region-drag toggle.
+///
+/// Names the gesture rather than the mode ("Pick…" and where to drag, not
+/// "Region mode"), because the one thing a user has to learn from it is that a
+/// *drag on a map pane* is what does the picking — there is nothing on the 3D
+/// pane itself to try, and that is exactly the discovery problem this feature
+/// exists to fix.
+pub(crate) const REGION_ARM_LABEL: &str = "Pick 3D region (drag on a map)";
+
 /// A command the user can invoke from the menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MenuAction {
@@ -62,6 +71,14 @@ pub(super) enum MenuToggle {
     /// forbid, and satisfying that test would mean inventing a flag whose only
     /// reader was the test's own fingerprint.
     VolumePane,
+    /// Arm the region drag: while it is on, a drag on a **map** pane draws the
+    /// patch of ground a 3D pane resamples instead of panning the map.
+    ///
+    /// A checkbox rather than a command for the same reason `VolumePane` is one:
+    /// it is a mode, it changes what dragging does, and a mode a user cannot see
+    /// is a mouse that has stopped working. It stays armed through a commit — see
+    /// `Gui::region_arm` — so this is also the only way out of it.
+    RegionArm,
 }
 
 /// One entry in the menu.
@@ -264,6 +281,14 @@ impl super::Gui {
                         toggle: MenuToggle::VolumePane,
                         value: pane.kind() == crate::pane::PaneKind::Volume,
                     },
+                    // Directly under the entry that makes a pane a 3D view,
+                    // because it is the other half of setting one up: the first
+                    // says *that* you want one, this says *where* it looks.
+                    MenuNode::Toggle {
+                        label: REGION_ARM_LABEL,
+                        toggle: MenuToggle::RegionArm,
+                        value: self.region_arm,
+                    },
                     MenuNode::Separator,
                     MenuNode::Toggle {
                         label: "Show radar sites",
@@ -328,6 +353,16 @@ impl super::Gui {
                 self.set_active_pane_overlay(kind, on);
                 self.propagate_layer_sync();
             }
+            MenuEvent::Toggled(MenuToggle::RegionArm, on) => {
+                self.region_arm = on;
+                // Disarming mid-drag throws the drag away rather than committing
+                // it. A user who reaches for the menu with the button still down
+                // is cancelling, and a box that appeared because of it would be
+                // one nobody asked for.
+                if !on {
+                    self.region_drag = None;
+                }
+            }
             MenuEvent::Toggled(MenuToggle::AutoPoll, on) => self.auto_poll.enabled = on,
             MenuEvent::Toggled(MenuToggle::LiveChunks, on) => self.live_chunks = on,
             MenuEvent::Toggled(MenuToggle::ChunkNotifications, on) => self.chunk_notifications = on,
@@ -388,7 +423,7 @@ mod tests {
         overlays.sort();
         format!(
             "settings={} time={} drawer={} auto_poll={} live_chunks={} notify={} \
-             kind={:?} pending_kind={:?} overlays={overlays:?}",
+             kind={:?} pending_kind={:?} region_arm={} overlays={overlays:?}",
             gui.show_settings,
             gui.time_dialog.show,
             gui.drawer_open,
@@ -406,6 +441,7 @@ mod tests {
             // recorded while a pane is held out of the vector is its own test, in
             // `ui.rs`.
             gui.pending_pane_kind_for_test(),
+            gui.region_arm,
         )
     }
 

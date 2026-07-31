@@ -338,6 +338,27 @@ pub struct Gui {
     /// builds the take window by hand precisely because no production caller
     /// currently provides one.
     pending_pane_kind: Option<(PaneId, crate::pane::PaneKind)>,
+    /// Whether the "pick a 3D region" mode is armed.
+    ///
+    /// While it is, a drag on a map pane draws the box a 3D pane resamples
+    /// instead of panning the map — see `ui_region`. It stays armed through a
+    /// commit *and* through a discarded mis-drag, and is turned off from the menu
+    /// it was turned on from: a mode that disarmed itself would make aiming two
+    /// panes, or re-aiming one that came out wrong, four clicks instead of two.
+    region_arm: bool,
+    /// The region drag in flight, if any.
+    ///
+    /// Here rather than on the pane because it is a property of the gesture. It
+    /// is written from inside `Map::show`, which is the only place a `Projector`
+    /// exists and therefore the only place a pointer position can be turned into
+    /// the ground it is over.
+    region_drag: Option<crate::ui_region::RegionDrag>,
+    /// A committed region waiting for the pane loop to end.
+    ///
+    /// The same deferral, and the same reason, as
+    /// [`pending_pane_kind`](Self::pending_pane_kind): applying it can grow the
+    /// pane count, which changes `pane_rect` for every pane not yet drawn.
+    pending_region: Option<crate::ui_region::PendingRegion>,
     viewport_sync: bool,
     sync_layers: bool,
     // --- Radar loop settings ---
@@ -710,6 +731,9 @@ impl Gui {
             #[cfg(test)]
             last_dropdowns: Vec::new(),
             pending_pane_kind: None,
+            region_arm: false,
+            region_drag: None,
+            pending_region: None,
             viewport_sync: true,
             sync_layers: true,
             loop_lookback_secs: 3600, // default 1 hour
@@ -798,6 +822,9 @@ impl Gui {
         // converting a pane cannot be a direct write from the dispatcher that
         // asked for it.
         self.apply_pending_pane_kind(&mut actions);
+        // After the kind conversion, so a region that lands on a pane the same
+        // frame converted it finds a 3D pane rather than the map it used to be.
+        self.apply_pending_region();
 
         // Floating windows last, so they layer above the chrome and the map.
         self.render_overlay_popup(ctx);
@@ -1227,24 +1254,7 @@ impl Gui {
                 });
                 if button.clicked() && self.pane_layout.pane_count != count {
                     self.panes[self.active_pane] = std::mem::take(pane);
-                    let active_site = self.panes[self.active_pane].site.clone();
-                    let active_scan_info = self.panes[self.active_pane].scan_info.clone();
-                    while self.panes.len() < count {
-                        let mut new_pane = PaneState::with_site(active_site.clone());
-                        new_pane.scan_info = active_scan_info.clone();
-                        self.panes.push(new_pane);
-                    }
-                    // A pane born here has empty overlay maps, and
-                    // `is_overlay_enabled` reads a missing entry as *off* — so
-                    // with layer sync disabled it would draw no overlays at
-                    // all, Radar included. Seed it from the handlers, which
-                    // hold the active pane's state (reloaded at the end of
-                    // every frame in `Gui::ui`), the same way startup does.
-                    self.initialize_pane_enabled();
-                    self.pane_layout = PaneLayout::for_count(count);
-                    if self.active_pane >= count {
-                        self.active_pane = 0;
-                    }
+                    self.set_pane_count(count);
                     *pane = std::mem::take(&mut self.panes[self.active_pane]);
                 }
             }
@@ -1348,9 +1358,16 @@ impl Gui {
                 // that never fills. No overlay tree: every entry in it is a layer
                 // drawn over map tiles, geo-positioned against a projector this
                 // pane does not have.
-                crate::pane::PaneKind::CrossSection | crate::pane::PaneKind::Volume => {
+                crate::pane::PaneKind::CrossSection => {
                     self.render_radar_controls(ui, pane, combo_width, id_prefix);
                     self.render_time_navigation(ui, pane, id_prefix, actions);
+                }
+                // The same two, plus the knobs that only mean something for a
+                // box being looked at from outside.
+                crate::pane::PaneKind::Volume => {
+                    self.render_radar_controls(ui, pane, combo_width, id_prefix);
+                    self.render_time_navigation(ui, pane, id_prefix, actions);
+                    map::render_volume_controls(ui, pane);
                 }
             }
         });
@@ -2086,6 +2103,101 @@ impl Gui {
     /// vector currently holds the pane it is drawing.
     pub(crate) fn request_pane_kind(&mut self, pane_idx: PaneId, kind: crate::pane::PaneKind) {
         self.pending_pane_kind = Some((pane_idx, kind));
+    }
+
+    /// Grow or shrink the layout to `count` panes, seeding any new ones.
+    ///
+    /// Factored out of the pane picker rather than left inline because it is no
+    /// longer the only writer of the pane count: a region drag on a layout with
+    /// room in it opens a 3D pane beside the map. Two copies of this would be two
+    /// places to remember [`Self::initialize_pane_enabled`], and forgetting it in
+    /// one of them produces a pane that draws no overlays at all — Radar included
+    /// — which reads as a broken pane rather than as a missing seed.
+    ///
+    /// **The caller must have put any `mem::take`n pane back first.** This indexes
+    /// `self.panes` directly, and a taken pane's slot holds a default map pane
+    /// whose site a new pane would then be seeded from.
+    fn set_pane_count(&mut self, count: usize) {
+        let active_site = self.panes[self.active_pane].site.clone();
+        let active_scan_info = self.panes[self.active_pane].scan_info.clone();
+        while self.panes.len() < count {
+            let mut new_pane = PaneState::with_site(active_site.clone());
+            new_pane.scan_info = active_scan_info.clone();
+            self.panes.push(new_pane);
+        }
+        // A pane born here has empty overlay maps, and `is_overlay_enabled` reads
+        // a missing entry as *off* — so with layer sync disabled it would draw no
+        // overlays at all, Radar included. Seed it from the handlers, which hold
+        // the active pane's state (reloaded at the end of every frame in
+        // `Gui::ui`), the same way startup does.
+        self.initialize_pane_enabled();
+        self.pane_layout = PaneLayout::for_count(count);
+        if self.active_pane >= count {
+            self.active_pane = 0;
+        }
+    }
+
+    /// Aim a 3D pane at the region the frame committed, if any.
+    ///
+    /// Called from [`Self::ui`] after the pane loop and after
+    /// [`Self::apply_pending_pane_kind`], where every pane is back in the vector
+    /// and growing the count is safe. `ui_region::destination_for` holds the
+    /// decision about *which* pane and the reasoning for it; this is only the
+    /// edit.
+    fn apply_pending_region(&mut self) {
+        let Some(pending) = self.pending_region.take() else {
+            return;
+        };
+        let max_panes = self.layout.width.max_panes();
+        let Some(destination) =
+            crate::ui_region::destination_for(self.panes(), pending.source_pane, max_panes)
+        else {
+            log::warn!("no pane to put a 3D region on; dropping it");
+            return;
+        };
+        let pane_idx = match destination {
+            crate::ui_region::RegionDestination::Existing(idx) => idx,
+            crate::ui_region::RegionDestination::Grow(count) => {
+                self.set_pane_count(count);
+                count - 1
+            }
+            crate::ui_region::RegionDestination::Convert(idx) => idx,
+        };
+        let Some(pane) = self.panes.get_mut(pane_idx) else {
+            log::warn!("pane {pane_idx} is gone; not aiming a 3D region at it");
+            return;
+        };
+        // Idempotent when it is already a 3D view, and the direct call is safe
+        // here for the reason `request_pane_kind` names: this runs after the pane
+        // loop, so nothing is `mem::take`n and the write lands in the vector
+        // rather than in a placeholder about to be discarded.
+        pane.set_kind(crate::pane::PaneKind::Volume);
+        // A pane that has just been converted or grown has the default camera,
+        // which is what should happen — but one that is being *re-aimed* keeps
+        // the angle the user set. Only the region and its provenance are written.
+        if let Some(volume) = pane.volume_mut() {
+            volume.region = Some(pending.region);
+            volume.source_pane = Some(pending.source_pane);
+        }
+        // The pane the region was drawn *from* stays active. A region drag is an
+        // instruction about another pane, not a request to go and look at it, and
+        // stealing focus mid-gesture is how a user loses the map they were
+        // working on.
+    }
+
+    /// Arm or disarm the region drag, as the menu toggle does.
+    #[cfg(test)]
+    pub(crate) fn set_region_arm_for_test(&mut self, on: bool) {
+        self.region_arm = on;
+        if !on {
+            self.region_drag = None;
+        }
+    }
+
+    /// Whether the region drag is armed.
+    #[cfg(test)]
+    pub(crate) fn region_arm_for_test(&self) -> bool {
+        self.region_arm
     }
 
     /// Apply the pane conversion the frame asked for, if any.

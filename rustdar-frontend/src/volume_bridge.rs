@@ -646,6 +646,7 @@ mod tests {
 
     fn target(product: RadarProduct, minute: u32) -> VolumeTarget {
         VolumeTarget {
+            region: None,
             volume: VolumeStamp {
                 site: "KTLX".to_owned(),
                 collected: NaiveDate::from_ymd_opt(2024, 5, 6)

@@ -8,6 +8,7 @@ pub mod tiles;
 mod ui;
 pub(crate) mod ui_input;
 pub(crate) mod ui_layout;
+pub(crate) mod ui_region;
 pub mod volume_view;
 
 #[cfg(test)]

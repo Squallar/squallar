@@ -399,13 +399,19 @@ const AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3)
 /// Measured on a real KSRX volume, a 300 km box seen from a level camera is a
 /// sliver a few pixels tall; 160 km has visible relief from any angle.
 ///
-/// Not yet a control, and it should be one — `VoxelRequest` takes a `centre` as
-/// well as a half-width precisely so the box can follow the pane's viewport.
-/// What stops that today is cost, not design: a rebuild is **150–200 ms** on the
-/// frame thread here (see `handle_prepare_volume` for where that figure comes
-/// from), so a box that tracked a pan would hitch on every drag. It belongs on
-/// WP-D's worker wire.
-const VOLUME_HALF_WIDTH_KM: f64 = 80.0;
+/// **Now the fallback rather than the only option.** A user can drag a region on
+/// a map pane, and `VoxelRequest` has always taken a `centre` as well as a
+/// half-width so that it could. What stopped it was cost — a rebuild is
+/// **150–200 ms** on the frame thread here — and what unblocked it was making the
+/// build archive-triggered: a region pick is one deliberate commit rather than a
+/// resample per frame of a drag, so the objection was to the box *tracking* the
+/// viewport and not to the box being chosen.
+///
+/// This value is `rustdar_egui::pane::DEFAULT_HALF_WIDTH_KM` read back, not a
+/// second copy: the pane reports the box's resolution in its own caption, and
+/// the two disagreeing would put a figure on screen that describes a different
+/// box from the one that was resampled.
+const VOLUME_HALF_WIDTH_KM: f64 = rustdar_egui::pane::DEFAULT_HALF_WIDTH_KM;
 
 /// Bottom of the box a 3D pane resamples, kilometres MSL.
 ///
@@ -422,6 +428,52 @@ const VOLUME_BASE_KM_MSL: f64 = 0.0;
 /// air that has weather in it: at 128 layers, 18 km is 141 m per layer against
 /// 156 m.
 const VOLUME_TOP_KM_MSL: f64 = 18.0;
+
+/// What to resample for `target`, over the region it names or the default box
+/// about the site.
+///
+/// Split out of `handle_prepare_volume` so the one decision in it that can be
+/// silently wrong is testable without an `App`, a GPU or a decoded volume: which
+/// ground gets sampled. Both failure modes are quiet — a region ignored resamples
+/// the default box and looks like a region that was never committed, and a region
+/// applied to the wrong axis resamples real ground the user did not pick — and
+/// neither shows up as an error anywhere.
+///
+/// `site_lat`/`site_lon` are still needed when a region is present:
+/// `build_voxels` reports its `x`/`y` ranges relative to the **site** whatever
+/// the box is centred on.
+fn voxel_request_for(
+    target: &rustdar_egui::pane::VolumeTarget,
+    site_lat: f64,
+    site_lon: f64,
+) -> rustdar_radar::voxel::VoxelRequest {
+    // The picked region, or the default box about the site. Both halves come
+    // straight off the target, which is what makes the grid and the pane's own
+    // resolution readout describe the same box.
+    let (centre, half_width_km) = match target.region {
+        Some(region) => (
+            (region.centre().lat, region.centre().lon),
+            region.half_width_km(),
+        ),
+        None => ((site_lat, site_lon), VOLUME_HALF_WIDTH_KM),
+    };
+    rustdar_radar::voxel::VoxelRequest {
+        centre,
+        half_width_km,
+        // The vertical extent is a separate axis from the horizontal region and
+        // is deliberately not part of the pick: this decides what is sampled over
+        // the ground, while the pane's exaggeration knob changes only how the
+        // result is drawn. Conflating them would make a region drag silently
+        // re-cut the column as well.
+        base_km_msl: VOLUME_BASE_KM_MSL,
+        top_km_msl: VOLUME_TOP_KM_MSL,
+        product: target.product,
+        shape: rustdar_radar::voxel::default_shape(),
+        // The raymarch reads indices only. The value plane is four times larger
+        // and exists for a hover readout, which a 3D pane does not have yet.
+        values_wanted: false,
+    }
+}
 
 /// Point a fresh `Gui` at the radar nearest this device's timezone.
 ///
@@ -953,18 +1005,7 @@ impl App {
             return;
         };
 
-        let request = rustdar_radar::voxel::VoxelRequest {
-            centre: (site.lat, site.lon),
-            half_width_km: VOLUME_HALF_WIDTH_KM,
-            base_km_msl: VOLUME_BASE_KM_MSL,
-            top_km_msl: VOLUME_TOP_KM_MSL,
-            product: target.product,
-            shape: rustdar_radar::voxel::default_shape(),
-            // The raymarch reads indices only. The value plane is four times
-            // larger and exists for a hover readout, which a 3D pane does not
-            // have yet.
-            values_wanted: false,
-        };
+        let request = voxel_request_for(&target, site.lat, site.lon);
 
         let started = web_time::Instant::now();
         let entry = match rustdar_radar::voxel::build_voxels(&scan, &request, site.lat, site.lon) {
@@ -3734,6 +3775,86 @@ mod chunk_feed_precedence_tests {
         );
     }
 
+    /// A picked region decides the ground that is resampled; without one, the
+    /// default box about the site does.
+    ///
+    /// Both halves, because the two failure modes are opposite and both silent.
+    /// A region ignored resamples the default box, which looks exactly like a
+    /// region that was never committed. A default applied when a region was
+    /// picked is the same thing seen from the other side.
+    #[test]
+    fn a_picked_region_decides_the_ground_that_is_resampled() {
+        use rustdar_egui::pane::{GeoPoint, VolumeRegion, VolumeStamp, VolumeTarget};
+
+        let target = |region| VolumeTarget {
+            volume: VolumeStamp {
+                site: "KTLX".to_owned(),
+                collected: chrono::NaiveDate::from_ymd_opt(2026, 7, 30)
+                    .expect("a real date")
+                    .and_hms_opt(22, 33, 0)
+                    .expect("a real time"),
+            },
+            product: rustdar_radar::types::RadarProduct::Reflectivity,
+            region,
+        };
+
+        let default = voxel_request_for(&target(None), 35.33, -97.28);
+        assert_eq!(default.centre, (35.33, -97.28), "no region means the site");
+        assert_eq!(default.half_width_km, VOLUME_HALF_WIDTH_KM);
+
+        let picked = VolumeRegion::new(
+            GeoPoint {
+                lat: 36.1,
+                lon: -98.4,
+            },
+            22.5,
+        )
+        .expect("a valid region");
+        let aimed = voxel_request_for(&target(Some(picked)), 35.33, -97.28);
+        assert_eq!(
+            aimed.centre,
+            (36.1, -98.4),
+            "a picked region must move the box off the site",
+        );
+        assert_eq!(aimed.half_width_km, 22.5);
+    }
+
+    /// The vertical extent is not part of the region pick.
+    ///
+    /// It is a separate axis by design — the region changes what is sampled over
+    /// the ground, the exaggeration changes only how it is drawn — and a region
+    /// drag that also re-cut the column would silently change what heights the
+    /// pane reports.
+    #[test]
+    fn a_region_pick_does_not_move_the_top_or_the_bottom_of_the_box() {
+        use rustdar_egui::pane::{GeoPoint, VolumeRegion, VolumeStamp, VolumeTarget};
+
+        let make = |region| VolumeTarget {
+            volume: VolumeStamp {
+                site: "KTLX".to_owned(),
+                collected: chrono::NaiveDate::from_ymd_opt(2026, 7, 30)
+                    .expect("a real date")
+                    .and_hms_opt(22, 33, 0)
+                    .expect("a real time"),
+            },
+            product: rustdar_radar::types::RadarProduct::Reflectivity,
+            region,
+        };
+        let picked = VolumeRegion::new(
+            GeoPoint {
+                lat: 36.1,
+                lon: -98.4,
+            },
+            15.0,
+        );
+
+        for target in [make(None), make(picked)] {
+            let request = voxel_request_for(&target, 35.33, -97.28);
+            assert_eq!(request.base_km_msl, VOLUME_BASE_KM_MSL);
+            assert_eq!(request.top_km_msl, VOLUME_TOP_KM_MSL);
+        }
+    }
+
     /// **The 3D build reads `archive_scans` and never `scan_data`.**
     ///
     /// The whole of the archive-only decision, stated as the behaviour a user
@@ -3756,6 +3877,7 @@ mod chunk_feed_precedence_tests {
                 collected: at(10),
             },
             product: rustdar_radar::types::RadarProduct::Reflectivity,
+            region: None,
         };
 
         // The volume the map panes are drawing, and nothing else.
@@ -3796,6 +3918,7 @@ mod chunk_feed_precedence_tests {
                 collected: at(10),
             },
             product: rustdar_radar::types::RadarProduct::Reflectivity,
+            region: None,
         };
 
         let mut app = headless(TestBridge::desktop());

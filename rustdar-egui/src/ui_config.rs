@@ -13,6 +13,7 @@ use super::PaneLayout;
 use super::PaneState;
 use crate::pane::{
     CrossSectionPane, GeoPoint, OrbitCamera, PaneContent, PaneKind, SectionLine, VolumePane,
+    VolumeRegion,
 };
 use crate::ui_layout::WidthClass;
 
@@ -114,16 +115,43 @@ struct SectionLineConfig {
     b_lon: f64,
 }
 
-/// A 3D pane, as persisted: where the eye is, and nothing else.
+/// A 3D pane, as persisted: where the eye is, and what ground was picked.
 ///
 /// The voxel grid is not here for the same reason the section raster is not:
 /// it is derived from a volume, and rebuilding it is what opening the pane does.
+/// The *region* is here rather than derived, and that is the difference between
+/// it and the grid — it is a choice the user made with a drag, and losing it on
+/// restart would silently put a carefully aimed 20 km box back to the 160 km
+/// default with the pane still claiming to be a 3D view of a storm.
+///
+/// Flat `f64`s and `f32`s throughout, never the domain types, for the reason
+/// [`SectionLineConfig`] gives: serde reads any number into these, and the
+/// validating constructors (`VolumeRegion::new`, `OrbitCamera::restore`) are the
+/// gate on the way back in.
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct VolumeConfig {
     yaw_deg: f32,
     pitch_deg: f32,
     eye_distance: f32,
+    /// The picked region, or `None` for the default box about the site.
+    region: Option<VolumeRegionConfig>,
+    /// Which map pane the region was dragged on. Validated against the pane
+    /// count on load, the same as a section's.
+    source_pane: Option<usize>,
+}
+
+/// A picked region, as persisted.
+///
+/// Two flat `f64`s and a third, rather than a `VolumeRegion`, because
+/// `VolumeRegion`'s fields are private and its constructor is the validation —
+/// exactly the arrangement [`SectionLineConfig`] has and for the same reason.
+#[derive(Serialize, Deserialize, Default, Clone, Copy)]
+#[serde(default)]
+struct VolumeRegionConfig {
+    centre_lat: f64,
+    centre_lon: f64,
+    half_width_km: f64,
 }
 
 impl Default for VolumeConfig {
@@ -137,6 +165,8 @@ impl Default for VolumeConfig {
             yaw_deg: camera.yaw_deg(),
             pitch_deg: camera.pitch_deg(),
             eye_distance: camera.eye_distance(),
+            region: None,
+            source_pane: None,
         }
     }
 }
@@ -569,10 +599,28 @@ fn content_config(
                 yaw_deg: camera.yaw_deg(),
                 pitch_deg: camera.pitch_deg(),
                 eye_distance: camera.eye_distance(),
+                region: volume.region.map(|region| VolumeRegionConfig {
+                    centre_lat: region.centre().lat,
+                    centre_lon: region.centre().lon,
+                    half_width_km: region.half_width_km(),
+                }),
+                source_pane: volume.source_pane,
             };
+            // Every float that reaches the file, not merely the three angles:
+            // `serde_json` writes a non-finite `f64` as `null`, which comes back
+            // through `#[serde(default)]` as the *default* rather than as an
+            // error — so a NaN centre would be laundered into a valid-looking one
+            // and the pane would silently move. `VolumeRegion::new` makes this
+            // unreachable today; it is here because the failure is a silent one
+            // and the check is three comparisons.
             if !config.yaw_deg.is_finite()
                 || !config.pitch_deg.is_finite()
                 || !config.eye_distance.is_finite()
+                || !config.region.is_none_or(|r| {
+                    r.centre_lat.is_finite()
+                        && r.centre_lon.is_finite()
+                        && r.half_width_km.is_finite()
+                })
             {
                 log::warn!("a 3D pane's camera is not finite; saving it as a map");
                 return (PaneKind::Map, None, None);
@@ -681,8 +729,52 @@ fn restore_content(pane_idx: usize, pc: &PaneConfig, pane_count: usize) -> PaneC
                 log::warn!("pane {pane_idx}'s saved camera is not finite; loading it as a map");
                 return PaneContent::Map;
             };
+            // Through `VolumeRegion::new`, which is where an off-Earth or
+            // non-finite centre is refused and a half-width past the resampler's
+            // limits is wound back to them — rather than re-deriving those checks
+            // here, where they would be a second copy free to disagree.
+            //
+            // A region that does not survive that gate costs the *region* and not
+            // the pane, which is the opposite of the camera above. The difference
+            // is what each one is: a pane with no camera has no view at all, but a
+            // pane with no region has a perfectly good default box about its site
+            // — so dropping to that is strictly better than dropping to a map.
+            let region = match volume.region {
+                None => None,
+                Some(saved) => {
+                    let restored = VolumeRegion::new(
+                        GeoPoint {
+                            lat: saved.centre_lat,
+                            lon: saved.centre_lon,
+                        },
+                        saved.half_width_km,
+                    );
+                    if restored.is_none() {
+                        log::warn!(
+                            "pane {pane_idx}'s saved 3D region is not a patch of ground that can \
+                             be resampled; falling back to the default box about the site"
+                        );
+                    }
+                    restored
+                }
+            };
+            // The same bound a section's source pane gets, and dropped rather
+            // than clamped for the same reason: a layout saved wider than the one
+            // being restored brings back an index that now names a different pane.
+            let source_pane = volume.source_pane.filter(|idx| {
+                let inside = *idx < pane_count;
+                if !inside {
+                    log::warn!(
+                        "pane {pane_idx}'s 3D region was dragged on pane {idx}, which this layout \
+                         does not have; forgetting where it came from"
+                    );
+                }
+                inside
+            });
             PaneContent::Volume(Box::new(VolumePane {
                 camera,
+                region,
+                source_pane,
                 rendered_for: None,
             }))
         }
@@ -1430,5 +1522,95 @@ mod notifier_config_tests {
         assert_eq!(gui.notifier_endpoint(), crate::DEFAULT_NOTIFIER_ENDPOINT);
         gui.set_notifier_endpoint("wss://example.test/");
         assert_eq!(gui.notifier_endpoint(), "wss://example.test/");
+    }
+
+    /// A 3D pane's **region** and where it was dragged from survive the round
+    /// trip, and a corrupt one costs the region rather than the pane.
+    ///
+    /// The region is the one piece of 3D state a user produced by hand, and a
+    /// carefully aimed 20 km box silently coming back as the 160 km default on
+    /// restart is a feature that looks broken rather than absent.
+    ///
+    /// The asymmetry in the second half is deliberate and is the thing worth
+    /// pinning: a bad *camera* costs the pane its kind, because a 3D pane with no
+    /// view is nothing; a bad *region* costs only the region, because a 3D pane
+    /// with no region has a perfectly good default box about its site.
+    #[test]
+    fn a_3d_panes_region_survives_the_round_trip_and_a_corrupt_one_costs_only_itself() {
+        use crate::pane::{GeoPoint, PaneKind, VolumeRegion};
+
+        let store = crate::config_store::MemoryConfigStore::default();
+        let mut gui = crate::Gui::new();
+        gui.set_pane_count_for_test(2);
+        gui.pane_mut(1).unwrap().set_kind(PaneKind::Volume);
+        let region = VolumeRegion::new(
+            GeoPoint {
+                lat: 35.3,
+                lon: -97.3,
+            },
+            23.5,
+        )
+        .expect("a valid region");
+        {
+            let volume = gui.pane_mut(1).unwrap().volume_mut().expect("converted");
+            volume.region = Some(region);
+            volume.source_pane = Some(0);
+        }
+        gui.save_ui_config(&store);
+
+        let mut restored = crate::Gui::new();
+        restored.load_ui_config(&store);
+        let volume = restored
+            .pane(1)
+            .expect("pane 1")
+            .volume()
+            .expect("a 3D pane")
+            .clone();
+        assert_eq!(
+            volume.region,
+            Some(region),
+            "the picked ground must come back"
+        );
+        assert_eq!(
+            volume.source_pane,
+            Some(0),
+            "and which map it was dragged on, or the next drag there would open \
+             another pane instead of re-aiming this one",
+        );
+
+        // A region naming ground that is not on Earth. Through the file, because
+        // the in-memory type cannot hold one — which is the whole reason the wire
+        // form is flat numbers and `VolumeRegion::new` is the gate.
+        let saved = store
+            .load(crate::config_store::UI_CONFIG_KEY)
+            .expect("just saved");
+        // Edited as a tree rather than as a string: the writer pretty-prints, so
+        // a `str::replace` on `"centre_lat":35.3` matches nothing and the test
+        // passes by asserting about an unmodified file.
+        let mut value: serde_json::Value = serde_json::from_str(&saved).expect("valid json");
+        value["panes"][1]["volume"]["region"]["centre_lat"] = serde_json::json!(1000.0);
+        let corrupt = serde_json::to_string(&value).expect("serializable");
+        assert_ne!(corrupt, saved, "the corruption must have landed");
+        let corrupt_store = crate::config_store::MemoryConfigStore::default();
+        corrupt_store
+            .store(crate::config_store::UI_CONFIG_KEY, &corrupt)
+            .expect("storable");
+        let mut restored = crate::Gui::new();
+        restored.load_ui_config(&corrupt_store);
+        assert_eq!(
+            restored.pane(1).expect("pane 1").kind(),
+            PaneKind::Volume,
+            "an unusable region must not cost the pane its kind",
+        );
+        assert_eq!(
+            restored
+                .pane(1)
+                .expect("pane 1")
+                .volume()
+                .expect("a 3D pane")
+                .region,
+            None,
+            "an unusable region must be dropped for the default box about the site",
+        );
     }
 }

@@ -397,14 +397,140 @@ pub struct CrossSectionPane {
 
 /// Everything a built voxel grid depends on.
 ///
-/// The same argument as [`SectionTarget`], minus the geometry: a volume render
-/// covers the whole scan, so the only inputs are which volume and which moment.
+/// The same argument as [`SectionTarget`]: which volume, which moment, and —
+/// since a region can be picked — over what ground. The region is in here for
+/// exactly the reason the line is in `SectionTarget`. It is an input to the
+/// resample, so a grid built for one box is the wrong picture for another, and
+/// putting it in the key means the same comparison that notices a new volume
+/// notices a re-dragged box. Left out, `rendered_for` would still match after a
+/// region change, no rebuild would be asked for, and the store's `lookup` would
+/// hand back the old box's grid — a picture that is wrong and looks right.
+///
 /// The camera is deliberately *not* in here — orbiting re-draws from the grid
-/// already in hand and must not rebuild it.
+/// already in hand and must not rebuild it. That is the line between the two
+/// halves of this feature: the region changes what is *sampled*, the camera only
+/// how it is *drawn*.
+///
+/// `None` for the region means the pane's default box about its site, and it is
+/// a distinct key from any picked region — which is right, because it denotes a
+/// different box and follows the site rather than the ground.
+///
+/// `PartialEq` is derived, `f64`s and all, on the same reasoning `SectionTarget`
+/// gives: this compares a stored key against a stored key, and it is only safe
+/// because [`VolumeRegion::new`] refuses a non-finite centre and clamps the
+/// half-width to a finite range. With a NaN in there the key would never equal
+/// itself and the pane would rebuild an 8 MiB grid every frame forever, with a
+/// hot CPU as its only symptom.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VolumeTarget {
     pub volume: VolumeStamp,
     pub product: RadarProduct,
+    /// The ground to resample, or `None` for the default box about the site.
+    pub region: Option<VolumeRegion>,
+}
+
+/// The patch of ground a 3D pane resamples, stored **geographically**.
+///
+/// # Why geographic, and why a square
+///
+/// The same argument [`SectionLine`] makes: the user picks this by dragging on a
+/// map, so a pixel rect is what the interaction produces — and a pixel rect
+/// denotes different ground after a wheel zoom, cannot be persisted across a
+/// window resize, and would silently re-aim the box if the map were panned.
+/// Converted to a centre and a half-width on the press frame, it means one thing
+/// forever.
+///
+/// A **square** because that is what [`VoxelRequest`] takes: one
+/// `half_width_km` for both horizontal axes, over a grid whose cell counts are
+/// fixed. A free rectangle would have to be either squared silently — which
+/// reads as a bug the first time a user drags a wide box and gets a tall one —
+/// or honoured with a non-uniform grid, which is a different resample. The
+/// interaction draws the square from the first frame of the drag so that the
+/// shape is never a surprise.
+///
+/// # The half-width is a resolution control, not just a crop
+///
+/// The grid has a fixed cell count, so shrinking the box buys detail rather than
+/// saving memory: at 256 cells across, an 80 km half-width is 0.625 km per cell
+/// and a 20 km half-width is 0.156 km. That is the main reason to pick a region
+/// at all, so [`Self::resolution_km`] exists to be *shown* rather than inferred.
+///
+/// Fields are private because [`Self::new`] is the only writer, and it is what
+/// makes two things true downstream: the centre is a point on Earth, and the
+/// half-width is inside the range `build_voxels` will honour. The second matters
+/// more than it looks — `build_voxels` *clamps* the half-width rather than
+/// refusing it, so a region carrying 5 km would resample 10 km and the pane's
+/// own resolution readout would be a lie about the picture beside it.
+///
+/// [`VoxelRequest`]: rustdar_radar::voxel::VoxelRequest
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VolumeRegion {
+    centre: GeoPoint,
+    half_width_km: f64,
+}
+
+/// The half-width a pane starts with, kilometres.
+///
+/// 80 km, and the reasoning is `handle_prepare_volume`'s: it is the point where
+/// the resolution gain is real (0.63 km per cell against 1.80 at the 230 km
+/// limit) but the box is not yet so tight that a storm walks out of it between
+/// volumes. It is also what the pane used before a region could be picked, so an
+/// existing user's view does not move the day the control appears.
+pub const DEFAULT_HALF_WIDTH_KM: f64 = 80.0;
+
+impl VolumeRegion {
+    /// A region centred on `centre` with `half_width_km` either side, or `None`
+    /// if the centre is not a point on Earth.
+    ///
+    /// The half-width is **clamped** where the centre is **refused**, and the
+    /// asymmetry is the same one [`OrbitCamera::restore`] draws. A centre that is
+    /// NaN or off-Earth means the projector was fed a degenerate viewport or a
+    /// config file was hand-edited: there is no nearest sensible answer, and
+    /// clamping would launder it, because `f64::clamp` propagates NaN. A
+    /// half-width past the end of its range is a zoom control that has been wound
+    /// to its stop, and stopping is what a control should do.
+    ///
+    /// The clamp is against `build_voxels`' own bounds rather than a copy of
+    /// them, so the number this holds is the number that will be resampled.
+    pub fn new(centre: GeoPoint, half_width_km: f64) -> Option<Self> {
+        if !centre.is_on_earth() || !half_width_km.is_finite() {
+            return None;
+        }
+        Some(Self {
+            centre,
+            half_width_km: half_width_km.clamp(
+                rustdar_radar::voxel::MIN_HALF_WIDTH_KM,
+                rustdar_radar::voxel::MAX_HALF_WIDTH_KM,
+            ),
+        })
+    }
+
+    /// The region a pane falls back to: [`DEFAULT_HALF_WIDTH_KM`] about a site.
+    ///
+    /// Takes the centre rather than deriving it, because the pane does not know
+    /// where its site is — `rustdar_radar::sites` is the frontend's lookup, and
+    /// the one caller that has a site already has its coordinates.
+    pub fn centred_on(centre: GeoPoint) -> Option<Self> {
+        Self::new(centre, DEFAULT_HALF_WIDTH_KM)
+    }
+
+    /// Where the box is centred.
+    pub fn centre(self) -> GeoPoint {
+        self.centre
+    }
+
+    /// Half the box's east–west and north–south extent, kilometres.
+    pub fn half_width_km(self) -> f64 {
+        self.half_width_km
+    }
+
+    /// Kilometres per cell along a horizontal axis, for `cells` cells across.
+    ///
+    /// The number the pane shows, and the reason a tight region is worth
+    /// picking. Answers `None` for a zero cell count rather than dividing by it.
+    pub fn resolution_km(self, cells: usize) -> Option<f64> {
+        (cells > 0).then(|| 2.0 * self.half_width_km / cells as f64)
+    }
 }
 
 /// A pane showing a 3D view of the volume.
@@ -412,6 +538,25 @@ pub struct VolumeTarget {
 pub struct VolumePane {
     /// Where the eye is. See [`OrbitCamera`].
     pub camera: OrbitCamera,
+    /// The patch of ground to resample, or `None` to use the default box about
+    /// the site.
+    ///
+    /// `None` is an ordinary state, not a missing value: a 3D pane works before
+    /// anyone picks a region, and the reset control puts it back here. Keeping it
+    /// an `Option` rather than filling in a site-centred default at construction
+    /// is what lets the pane follow its site when the site changes — a filled-in
+    /// default would silently pin the box over the *old* site's ground, which
+    /// looks exactly like a resample that went wrong.
+    pub region: Option<VolumeRegion>,
+    /// Which map pane the region was dragged on, or `None` for a region that was
+    /// never picked.
+    ///
+    /// The retarget rule's input, and the same field `CrossSectionPane` carries
+    /// for the same reason: a second region dragged on the same map should re-aim
+    /// the 3D pane already sourced from it rather than convert another pane.
+    /// Validated against the pane count on load, because an index past the end of
+    /// the layout is how a config saved from a wider split comes back.
+    pub source_pane: Option<usize>,
     /// Which volume the grid on screen was built from, or `None` before the
     /// first build.
     pub rendered_for: Option<VolumeTarget>,

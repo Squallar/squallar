@@ -673,6 +673,7 @@ mod tests {
         let frame = VolumeFrameState {
             pane_idx: 0,
             target: VolumeTarget {
+                region: None,
                 volume: crate::pane::VolumeStamp {
                     site: "KTLX".to_owned(),
                     collected: chrono::NaiveDate::from_ymd_opt(2024, 5, 6)

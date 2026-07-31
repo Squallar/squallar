@@ -47,6 +47,34 @@ pub(super) struct PaneRenderCtx<'a> {
     pub overlay_click_pos: Option<egui::Pos2>,
     /// User unit and timezone preferences.
     pub preferences: &'a UserPreferences,
+    /// Everything the 3D region drag needs. See [`RegionCtx`].
+    pub region: RegionCtx<'a>,
+}
+
+/// The region drag's slice of a pane's render context.
+///
+/// Grouped rather than four more flat fields because they are one feature and
+/// because three of them are `&mut` borrows of `Gui` that only this feature
+/// touches — keeping them together is what makes it obvious at the construction
+/// site that nothing else is reaching into the pane loop's borrow.
+pub(super) struct RegionCtx<'a> {
+    /// Whether the pick-a-region mode is on. While it is, a drag on this pane
+    /// draws a box instead of panning the map.
+    pub armed: bool,
+    /// The drag in flight, on this pane or another. Shared across panes because
+    /// there is one pointer: a drag that started on pane 0 and wandered over
+    /// pane 1 is still pane 0's, which is what `RegionDrag::pane_idx` is
+    /// checked for.
+    pub drag: &'a mut Option<crate::ui_region::RegionDrag>,
+    /// Where a committed region is left for the pane loop to finish and
+    /// `Gui::apply_pending_region` to act on.
+    pub pending: &'a mut Option<crate::ui_region::PendingRegion>,
+    /// Every 3D pane's committed region with the map pane it was dragged on, so
+    /// this pane can draw the ones that belong to it.
+    ///
+    /// Gathered before the pane loop, because inside the loop's `mem::take` a 3D
+    /// pane's slot reads as a default map pane with no region at all.
+    pub committed: &'a [(usize, crate::pane::VolumeRegion)],
 }
 
 /// Render the map content for a single pane (SPC/NWS overlays, radar image,
@@ -402,6 +430,227 @@ pub(super) fn render_pane_map_content(
             );
         }
     }
+
+    // Last, so the box is drawn over everything the pane put under it. A region
+    // outline hidden behind a reflectivity texture is a region the user cannot
+    // aim.
+    handle_region_drag(ui, projector, ctx);
+}
+
+/// Stroke width of a region box, points.
+const REGION_STROKE: f32 = 1.5;
+
+/// Advance the region drag on this pane and draw whatever boxes belong to it.
+///
+/// # Why the pointer is read raw here
+///
+/// `ui_input`'s convention is that map handlers consume
+/// `PaneRenderCtx::overlay_click_pos` and never `ctx.input()` directly, and that
+/// convention is about **clicks** — a confirmed tap, deferred past a double-tap
+/// window and filtered against floating dialogs. A drag is not a click: it has a
+/// press frame, a stream of moved frames and a release frame, none of which a
+/// confirmed-tap position can express. The dialog gate that convention exists to
+/// enforce is applied here explicitly, on the press, via [`is_pos_blocked`].
+///
+/// This runs inside `Map::show`, and it has to: the projector is the only thing
+/// that can turn a pointer position into the ground under it, and it exists
+/// nowhere else. That is also what makes the geographic anchor possible — see the
+/// `ui_region` module doc for why a pixel anchor would be wrong.
+fn handle_region_drag(ui: &egui::Ui, projector: &walkers::Projector, ctx: &mut PaneRenderCtx<'_>) {
+    // Committed boxes first, and regardless of the armed mode: a 3D pane's region
+    // is drawn on the map it came from for as long as it exists, which is the
+    // honest answer to "where is that volume from". Unarmed is the common case, so
+    // this is also the only work most frames do here.
+    for (_, region) in ctx
+        .region
+        .committed
+        .iter()
+        .filter(|(source, _)| *source == ctx.pane_idx)
+    {
+        draw_region_box(
+            ui,
+            projector,
+            region.centre(),
+            region.half_width_km(),
+            egui::Color32::from_rgb(120, 200, 255),
+            false,
+        );
+    }
+
+    if !ctx.region.armed {
+        // A drag that was in flight on this pane when the mode went off is
+        // already gone — the menu clears it — so there is nothing to tidy.
+        return;
+    }
+
+    let (pressed, down, released, pos) = ui.ctx().input(|i| {
+        (
+            i.pointer.primary_pressed(),
+            i.pointer.primary_down(),
+            i.pointer.primary_released(),
+            i.pointer.interact_pos(),
+        )
+    });
+
+    let to_geo = |p: egui::Pos2| {
+        let position = projector.unproject(egui::vec2(p.x, p.y));
+        crate::pane::GeoPoint {
+            lat: position.y(),
+            lon: position.x(),
+        }
+    };
+
+    // The press frame. Gated on this pane's own rect and on the dialog layer, so
+    // arming the mode and then using the menu does not start a drag behind it.
+    if pressed
+        && let Some(pos) = pos
+        && ctx.pane_rect.contains(pos)
+        && !is_pos_blocked(ui.ctx(), pos, ctx.pane_rect, &ctx.excluded_rects)
+    {
+        *ctx.region.drag = crate::ui_region::RegionDrag::begin(ctx.pane_idx, to_geo(pos));
+    }
+
+    // Everything below belongs to *this* pane's drag only. A drag that started
+    // next door is that pane's to advance, draw and commit, even while the
+    // pointer is over this one.
+    let Some(drag) = ctx
+        .region
+        .drag
+        .as_mut()
+        .filter(|d| d.pane_idx() == ctx.pane_idx)
+    else {
+        return;
+    };
+
+    // Not gated on the pane's rect: dragging past the edge of a pane to make a
+    // big box is ordinary, and stopping the box growing at the boundary would
+    // read as the gesture having been dropped.
+    if down && let Some(pos) = pos {
+        drag.extend_to(to_geo(pos));
+    }
+
+    let drag = *drag;
+    draw_region_box(
+        ui,
+        projector,
+        drag.centre(),
+        drag.half_width_km(),
+        egui::Color32::from_rgb(255, 220, 120),
+        true,
+    );
+    draw_region_hint(ui, projector, drag);
+
+    if released {
+        // Taken either way: a discarded drag must not survive into the next
+        // press, or the second box would be measured from the first one's centre.
+        *ctx.region.drag = None;
+        match drag.commit() {
+            Some(region) => {
+                *ctx.region.pending = Some(crate::ui_region::PendingRegion {
+                    source_pane: ctx.pane_idx,
+                    region,
+                });
+            }
+            // Too small to be honoured rather than clamped. Silently discarded,
+            // and the mode stays armed — see `RegionDrag::commit`.
+            None => log::debug!(
+                "3D region drag was {:.1} km across, below the resampler's minimum; discarded",
+                2.0 * drag.half_width_km(),
+            ),
+        }
+    }
+}
+
+/// Draw one region box in geographic terms.
+///
+/// The corners are projected rather than the centre offset by a pixel radius, so
+/// the box stays over the same ground at every zoom — the same thing
+/// `overlay_texture_rect` does for an overlay's bounds, and for the same reason.
+///
+/// A degenerate box — a zero half-width before the pointer has moved, or a polar
+/// centre — draws nothing rather than a dot, because a dot under the cursor at
+/// the start of every drag reads as a stray click artefact.
+fn draw_region_box(
+    ui: &egui::Ui,
+    projector: &walkers::Projector,
+    centre: crate::pane::GeoPoint,
+    half_width_km: f64,
+    color: egui::Color32,
+    filled: bool,
+) {
+    let Some(rect) = region_screen_rect(projector, centre, half_width_km) else {
+        return;
+    };
+    if filled {
+        ui.painter()
+            .rect_filled(rect, 0.0, color.gamma_multiply(0.12));
+    }
+    ui.painter().rect_stroke(
+        rect,
+        0.0,
+        egui::Stroke::new(REGION_STROKE, color),
+        egui::StrokeKind::Middle,
+    );
+}
+
+/// A region's screen rect, or `None` for one that has no square to draw.
+fn region_screen_rect(
+    projector: &walkers::Projector,
+    centre: crate::pane::GeoPoint,
+    half_width_km: f64,
+) -> Option<egui::Rect> {
+    if !(half_width_km.is_finite() && half_width_km > 0.0) {
+        return None;
+    }
+    let (nw, se) = crate::ui_region::corners_for(centre, half_width_km)?;
+    let nw = projector
+        .project(walkers::lat_lon(nw.lat, nw.lon))
+        .to_pos2();
+    let se = projector
+        .project(walkers::lat_lon(se.lat, se.lon))
+        .to_pos2();
+    Some(egui::Rect::from_two_pos(nw, se))
+}
+
+/// The width and per-cell resolution of the box being dragged, over its top edge.
+///
+/// The resolution is the whole reason to pick a region — the grid's cell count is
+/// fixed, so a tighter box spends the same cells over less ground — and it is
+/// invisible unless it is said. Shown *during* the drag rather than after, so the
+/// choice is made against the number rather than discovered after a 155 ms
+/// rebuild.
+fn draw_region_hint(
+    ui: &egui::Ui,
+    projector: &walkers::Projector,
+    drag: crate::ui_region::RegionDrag,
+) {
+    let Some(rect) = region_screen_rect(projector, drag.centre(), drag.half_width_km()) else {
+        return;
+    };
+    // Through `VolumeRegion`, so the figures shown are the ones that will be
+    // resampled: it clamps the half-width to the resampler's range, and a hint
+    // reading 4 km over a box that would become 10 km is a hint that lies.
+    let Some(region) = crate::pane::VolumeRegion::new(drag.centre(), drag.half_width_km()) else {
+        return;
+    };
+    let cells = rustdar_radar::voxel::default_shape().nx;
+    let text = match region.resolution_km(cells) {
+        Some(km) => format!("{:.0} km · {km:.2} km/cell", 2.0 * region.half_width_km()),
+        None => format!("{:.0} km", 2.0 * region.half_width_km()),
+    };
+    let galley = ui.painter().layout_no_wrap(
+        text,
+        egui::FontId::proportional(12.0),
+        egui::Color32::from_rgb(20, 20, 20),
+    );
+    let origin = egui::pos2(rect.left(), rect.top() - galley.size().y - 4.0);
+    ui.painter().rect_filled(
+        egui::Rect::from_min_size(origin, galley.size()).expand(3.0),
+        2.0,
+        egui::Color32::from_rgb(255, 220, 120),
+    );
+    ui.painter()
+        .galley(origin, galley, egui::Color32::PLACEHOLDER);
 }
 
 /// Render the radar image overlay, range ring, and hover tooltip (loop playback path) (loop playback path).
