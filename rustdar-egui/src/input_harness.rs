@@ -973,6 +973,24 @@ impl InputHarness {
         self.events.push(pointer_button(pos, false));
     }
 
+    /// The right button down. The 3D pane's pan is on it, and egui reports
+    /// per-button drags — so a test that pressed the primary button would be
+    /// testing the orbit.
+    pub(crate) fn mouse_press_secondary(&mut self, pos: egui::Pos2) {
+        self.mouse_move(pos);
+        self.events
+            .push(pointer_button_of(pos, egui::PointerButton::Secondary, true));
+    }
+
+    pub(crate) fn mouse_release_secondary(&mut self, pos: egui::Pos2) {
+        self.mouse_move(pos);
+        self.events.push(pointer_button_of(
+            pos,
+            egui::PointerButton::Secondary,
+            false,
+        ));
+    }
+
     /// The cursor left the window: `egui-winit` maps `WindowEvent::CursorLeft`
     /// to a bare [`egui::Event::PointerGone`] and forgets the pointer position
     /// (`egui-winit-0.34.1/src/lib.rs:340`). **No release is reported** — and
@@ -1252,9 +1270,13 @@ impl InputHarness {
 }
 
 fn pointer_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+    pointer_button_of(pos, egui::PointerButton::Primary, pressed)
+}
+
+fn pointer_button_of(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
     egui::Event::PointerButton {
         pos,
-        button: egui::PointerButton::Primary,
+        button,
         pressed,
         modifiers: egui::Modifiers::default(),
     }

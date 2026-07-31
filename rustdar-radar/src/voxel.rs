@@ -340,6 +340,29 @@ pub const MIN_HALF_WIDTH_KM: f64 = 10.0;
 /// surveillance range, matching [`crate::types::MAX_RANGE_KM`].
 pub const MAX_HALF_WIDTH_KM: f64 = 230.0;
 
+/// Bottom of the box a 3D view resamples by default, kilometres MSL.
+///
+/// Sea level, not the antenna: this axis is MSL throughout
+/// ([`VoxelGrid::z_range_km_msl`]), and a site at 400 m with a base at its own
+/// height would silently clip the lowest 400 m of every echo — the part with the
+/// storm's inflow in it.
+///
+/// Here rather than in the frontend because a 3D pane has to know the box's
+/// **height** to do its own camera arithmetic — the pan scale and the pivot are
+/// both fractions of the box — and the pane and the resampler disagreeing about
+/// that height would be a pan that drifts against the picture. One constant, two
+/// readers.
+pub const DEFAULT_BASE_KM_MSL: f64 = 0.0;
+
+/// Top of the box a 3D view resamples by default, kilometres MSL.
+///
+/// 18 km clears every overshooting top in the continental United States with
+/// room to spare, and stopping there rather than at 20 km spends the cells on air
+/// that has weather in it: at 128 layers, 18 km is 141 m per layer against 156 m.
+///
+/// See [`DEFAULT_BASE_KM_MSL`] for why the pair lives here.
+pub const DEFAULT_TOP_KM_MSL: f64 = 18.0;
+
 /// What one grid's index plane may occupy, bytes.
 ///
 /// Not a runtime check — nothing measures against it, exactly as

@@ -408,26 +408,10 @@ const AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3)
 /// viewport and not to the box being chosen.
 ///
 /// This value is `rustdar_egui::pane::DEFAULT_HALF_WIDTH_KM` read back, not a
-/// second copy: the pane reports the box's resolution in its own caption, and
-/// the two disagreeing would put a figure on screen that describes a different
-/// box from the one that was resampled.
+/// second copy: the pane computes its own camera arithmetic against the box it
+/// believes it has, and the two disagreeing would show up as a pan that drifts
+/// against the picture.
 const VOLUME_HALF_WIDTH_KM: f64 = rustdar_egui::pane::DEFAULT_HALF_WIDTH_KM;
-
-/// Bottom of the box a 3D pane resamples, kilometres MSL.
-///
-/// Sea level, not the antenna: the grid's vertical axis is MSL throughout
-/// (`VoxelGrid::z_range_km_msl`), and a site at 400 m with a base at its own
-/// height would silently clip the lowest 400 m of every echo — the part with
-/// the storm's inflow in it.
-const VOLUME_BASE_KM_MSL: f64 = 0.0;
-
-/// Top of the box, kilometres MSL.
-///
-/// 18 km clears every overshooting top in the continental United States with
-/// room to spare, and stopping there rather than at 20 km spends the cells on
-/// air that has weather in it: at 128 layers, 18 km is 141 m per layer against
-/// 156 m.
-const VOLUME_TOP_KM_MSL: f64 = 18.0;
 
 /// What to resample for `target`, over the region it names or the default box
 /// about the site.
@@ -465,8 +449,8 @@ fn voxel_request_for(
         // the ground, while the pane's exaggeration knob changes only how the
         // result is drawn. Conflating them would make a region drag silently
         // re-cut the column as well.
-        base_km_msl: VOLUME_BASE_KM_MSL,
-        top_km_msl: VOLUME_TOP_KM_MSL,
+        base_km_msl: rustdar_radar::voxel::DEFAULT_BASE_KM_MSL,
+        top_km_msl: rustdar_radar::voxel::DEFAULT_TOP_KM_MSL,
         product: target.product,
         shape: rustdar_radar::voxel::default_shape(),
         // The raymarch reads indices only. The value plane is four times larger
@@ -3850,9 +3834,36 @@ mod chunk_feed_precedence_tests {
 
         for target in [make(None), make(picked)] {
             let request = voxel_request_for(&target, 35.33, -97.28);
-            assert_eq!(request.base_km_msl, VOLUME_BASE_KM_MSL);
-            assert_eq!(request.top_km_msl, VOLUME_TOP_KM_MSL);
+            assert_eq!(
+                request.base_km_msl,
+                rustdar_radar::voxel::DEFAULT_BASE_KM_MSL
+            );
+            assert_eq!(request.top_km_msl, rustdar_radar::voxel::DEFAULT_TOP_KM_MSL);
         }
+    }
+
+    /// The pane and the resampler agree about how big the default box is.
+    ///
+    /// They have to: the pane does its own camera arithmetic against the box it
+    /// believes it has — the pan scale and the pivot are both fractions of it —
+    /// and a disagreement would show up as a pan that drifts against the picture,
+    /// which is the kind of thing that gets "fixed" by tuning a sensitivity.
+    #[test]
+    fn the_pane_and_the_resampler_agree_about_the_default_box() {
+        assert_eq!(
+            VOLUME_HALF_WIDTH_KM,
+            rustdar_egui::pane::DEFAULT_HALF_WIDTH_KM,
+        );
+        let pane = rustdar_egui::pane::VolumePane::default();
+        assert_eq!(
+            pane.box_size_km(),
+            [
+                (2.0 * VOLUME_HALF_WIDTH_KM) as f32,
+                (2.0 * VOLUME_HALF_WIDTH_KM) as f32,
+                (rustdar_radar::voxel::DEFAULT_TOP_KM_MSL
+                    - rustdar_radar::voxel::DEFAULT_BASE_KM_MSL) as f32,
+            ],
+        );
     }
 
     /// **The 3D build reads `archive_scans` and never `scan_data`.**

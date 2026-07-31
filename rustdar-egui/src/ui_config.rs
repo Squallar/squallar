@@ -115,7 +115,8 @@ struct SectionLineConfig {
     b_lon: f64,
 }
 
-/// A 3D pane, as persisted: where the eye is, and what ground was picked.
+/// A 3D pane, as persisted: where the eye is, how far the vertical is stretched,
+/// and what ground was picked.
 ///
 /// The voxel grid is not here for the same reason the section raster is not:
 /// it is derived from a volume, and rebuilding it is what opening the pane does.
@@ -134,6 +135,10 @@ struct VolumeConfig {
     yaw_deg: f32,
     pitch_deg: f32,
     eye_distance: f32,
+    /// The look-at point, in box-half-extent fractions. See
+    /// [`OrbitCamera::pivot`](crate::pane::OrbitCamera::pivot).
+    pivot: [f32; 3],
+    vertical_exaggeration: f32,
     /// The picked region, or `None` for the default box about the site.
     region: Option<VolumeRegionConfig>,
     /// Which map pane the region was dragged on. Validated against the pane
@@ -156,15 +161,23 @@ struct VolumeRegionConfig {
 
 impl Default for VolumeConfig {
     /// `OrbitCamera`'s own default, read out of it rather than restated — a
-    /// second copy of three angles would drift, and the drift would show up as a
+    /// second copy of the angles would drift, and the drift would show up as a
     /// 3D pane that opened at a different angle depending on whether its config
     /// predated the field.
+    ///
+    /// This is also what a config written before the pan and the exaggeration
+    /// existed deserializes to, because of `#[serde(default)]` on the struct: an
+    /// old file has no `pivot` and no `vertical_exaggeration`, and it comes back
+    /// centred and at the default stretch rather than at a zeroed 0× that would
+    /// collapse the box.
     fn default() -> Self {
         let camera = OrbitCamera::default();
         Self {
             yaw_deg: camera.yaw_deg(),
             pitch_deg: camera.pitch_deg(),
             eye_distance: camera.eye_distance(),
+            pivot: camera.pivot(),
+            vertical_exaggeration: camera.vertical_exaggeration(),
             region: None,
             source_pane: None,
         }
@@ -599,6 +612,8 @@ fn content_config(
                 yaw_deg: camera.yaw_deg(),
                 pitch_deg: camera.pitch_deg(),
                 eye_distance: camera.eye_distance(),
+                pivot: camera.pivot(),
+                vertical_exaggeration: camera.vertical_exaggeration(),
                 region: volume.region.map(|region| VolumeRegionConfig {
                     centre_lat: region.centre().lat,
                     centre_lon: region.centre().lon,
@@ -607,15 +622,17 @@ fn content_config(
                 source_pane: volume.source_pane,
             };
             // Every float that reaches the file, not merely the three angles:
-            // `serde_json` writes a non-finite `f64` as `null`, which comes back
+            // `serde_json` writes a non-finite `f32` as `null`, which comes back
             // through `#[serde(default)]` as the *default* rather than as an
-            // error — so a NaN centre would be laundered into a valid-looking one
-            // and the pane would silently move. `VolumeRegion::new` makes this
-            // unreachable today; it is here because the failure is a silent one
-            // and the check is three comparisons.
+            // error — so a NaN pivot would be laundered into a centred one and a
+            // NaN exaggeration into 3×, and the pane would silently move. The
+            // constructors make this unreachable today; it is here because the
+            // failure is a silent one and the check is four comparisons.
             if !config.yaw_deg.is_finite()
                 || !config.pitch_deg.is_finite()
                 || !config.eye_distance.is_finite()
+                || !config.pivot.iter().all(|p| p.is_finite())
+                || !config.vertical_exaggeration.is_finite()
                 || !config.region.is_none_or(|r| {
                     r.centre_lat.is_finite()
                         && r.centre_lon.is_finite()
@@ -723,9 +740,13 @@ fn restore_content(pane_idx: usize, pc: &PaneConfig, pane_count: usize) -> PaneC
             // `OrbitCamera::restore` is the gate: it refuses non-finite angles
             // outright and wraps or clamps merely out-of-range ones, so a restored
             // camera can never hold a value `nudge` would not produce.
-            let Some(camera) =
-                OrbitCamera::restore(volume.yaw_deg, volume.pitch_deg, volume.eye_distance)
-            else {
+            let Some(camera) = OrbitCamera::restore(
+                volume.yaw_deg,
+                volume.pitch_deg,
+                volume.eye_distance,
+                volume.pivot,
+                volume.vertical_exaggeration,
+            ) else {
                 log::warn!("pane {pane_idx}'s saved camera is not finite; loading it as a map");
                 return PaneContent::Map;
             };
@@ -871,7 +892,11 @@ mod tests {
                 yaw_deg: -47.5,
                 pitch_deg: 12.25,
                 zoom_factor: 1.5,
+                // Panned and stretched too, so the round trip below covers every
+                // field the camera persists rather than only the three angles.
+                pan: [0.2, -0.35, 0.1],
             });
+            volume.camera.set_vertical_exaggeration(5.5);
             volume.camera
         };
         assert_ne!(
@@ -1611,6 +1636,60 @@ mod notifier_config_tests {
                 .region,
             None,
             "an unusable region must be dropped for the default box about the site",
+        );
+    }
+
+    /// A config written before the pan and the exaggeration existed comes back
+    /// centred and at the default stretch.
+    ///
+    /// `#[serde(default)]` on the struct is what does it, and the failure it
+    /// avoids is not subtle: without it the missing `vertical_exaggeration`
+    /// deserializes as `0.0`, which collapses the box to a plane and divides by
+    /// zero in `box_from_world`. Every user with a saved 3D pane would see an
+    /// empty pane on the first run after the upgrade.
+    #[test]
+    fn a_config_from_before_the_new_camera_fields_loads_at_the_defaults() {
+        use crate::pane::{OrbitCamera, PaneKind};
+
+        let store = crate::config_store::MemoryConfigStore::default();
+        let mut gui = crate::Gui::new();
+        gui.pane_mut(0).unwrap().set_kind(PaneKind::Volume);
+        gui.save_ui_config(&store);
+
+        // Strip the three fields that did not exist, as an older writer would.
+        let json = store
+            .load(crate::config_store::UI_CONFIG_KEY)
+            .expect("just saved");
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        let volume = value["panes"][0]["volume"]
+            .as_object_mut()
+            .expect("a 3D pane's config");
+        volume.remove("pivot");
+        volume.remove("vertical_exaggeration");
+        volume.remove("region");
+        let older = serde_json::to_string(&value).expect("serializable");
+        let older_store = crate::config_store::MemoryConfigStore::default();
+        older_store
+            .store(crate::config_store::UI_CONFIG_KEY, &older)
+            .expect("storable");
+
+        let mut restored = crate::Gui::new();
+        restored.load_ui_config(&older_store);
+        let camera = restored
+            .pane(0)
+            .expect("pane 0")
+            .volume()
+            .expect("a 3D pane")
+            .camera;
+        assert_eq!(
+            camera.pivot(),
+            [0.0; 3],
+            "a missing pivot must load centred"
+        );
+        assert_eq!(
+            camera.vertical_exaggeration(),
+            OrbitCamera::default().vertical_exaggeration(),
+            "a missing exaggeration must load at the default, never at zero",
         );
     }
 }

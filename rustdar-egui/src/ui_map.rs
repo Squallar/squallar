@@ -517,6 +517,17 @@ const ORBIT_PITCH_DEG_PER_POINT: f32 = 0.25;
 /// wheel zoom is multiplicative.
 const ORBIT_ZOOM_PER_SCROLL_POINT: f32 = 0.004;
 
+/// Fingers a touch drag must have to pan a 3D pane.
+///
+/// Two, alongside the pinch that is already read from the same gesture: one
+/// finger orbits, and it has to, because that is the gesture with no modifier
+/// available on a touch screen and orbiting is the pane's primary verb. Two
+/// fingers is what every 3D viewer on a touch device uses for the same reason,
+/// and `MultiTouchInfo` reports the pinch and the translation from one gesture —
+/// so a two-finger drag that also spreads does both, which is what a user
+/// expects and what they will do without noticing.
+const TOUCH_PAN_FINGERS: usize = 2;
+
 /// What the 3D arm did with one pane on one frame.
 ///
 /// `None` means it pushed a paint callback; `Some(reason)` means it painted the
@@ -590,6 +601,17 @@ fn volume_pane_outcome(
     use crate::pane::{OrbitDelta, VolumeStamp, VolumeTarget};
     use crate::volume_view::{VolumeFrameState, VolumePaint};
 
+    // The camera and the box as they stand *before* this frame's gesture, which
+    // is what the pan has to be scaled against: the world distance a screen point
+    // spans depends on where the eye is, and folding the drag in first would
+    // measure it against a camera the user has not seen yet.
+    //
+    // Answered rather than unwrapped for the reason the `volume_mut` below gives.
+    let Some((camera_before, box_size_km)) = pane.volume().map(|v| (v.camera, v.box_size_km()))
+    else {
+        return Some(VOLUME_EMPTY_STATE.to_owned());
+    };
+
     // The gesture first, and unconditionally: the camera is the pane's own
     // state, it survives every reason there is nothing to draw, and a user who
     // orbits an empty box while a volume downloads should find it where they
@@ -600,7 +622,10 @@ fn volume_pane_outcome(
         egui::Sense::click_and_drag(),
     );
     let mut delta = OrbitDelta::default();
-    if response.dragged() {
+    // Primary drag orbits; secondary drag pans. Read as two separate questions
+    // rather than as an if/else on one drag, because `dragged_by` is per-button
+    // and a user with both buttons down means both.
+    if response.dragged_by(egui::PointerButton::Primary) {
         let drag = response.drag_delta();
         // Grab-and-turn, in both axes: a point on the box's surface follows the
         // pointer. Dragging right swings the eye's bearing east, which brings
@@ -613,6 +638,43 @@ fn volume_pane_outcome(
         // review.
         delta.yaw_deg = drag.x * ORBIT_YAW_DEG_PER_POINT;
         delta.pitch_deg = drag.y * ORBIT_PITCH_DEG_PER_POINT;
+    }
+
+    // The pan drag, in screen points, from whichever device produced one.
+    //
+    // Touch is checked first and wins, because `normalize_touch_devices` makes
+    // egui synthesise a *primary* drag from a one-finger touch: a two-finger
+    // gesture would otherwise be read as an orbit as well as a pan, and the box
+    // would spin while it slid. `multi_touch()` is `Some` only while more than
+    // one finger is down, so the one-finger orbit above is unaffected.
+    let touch = ui.ctx().multi_touch();
+    let pan_drag = match touch {
+        Some(touch) if touch.num_touches >= TOUCH_PAN_FINGERS => {
+            // Cancel the orbit this frame: the same fingers produced the
+            // synthesised primary drag that the branch above already folded in.
+            delta.yaw_deg = 0.0;
+            delta.pitch_deg = 0.0;
+            Some([touch.translation_delta.x, touch.translation_delta.y])
+        }
+        _ if response.dragged_by(egui::PointerButton::Secondary) => {
+            let drag = response.drag_delta();
+            Some([drag.x, drag.y])
+        }
+        _ => None,
+    };
+    if let Some(drag) = pan_drag
+        // `None` for a pane with no height or a degenerate box — both transient,
+        // and neither may put a NaN in the camera. The default is "did not pan",
+        // which is what the frame should do while a divider drag has the pane
+        // collapsed to nothing.
+        && let Some(pan) = crate::volume_view::pan_for_drag(
+            camera_before,
+            box_size_km,
+            pane_rect.height(),
+            drag,
+        )
+    {
+        delta.pan = pan;
     }
 
     if response.hovered() || response.dragged() {
@@ -728,7 +790,7 @@ fn volume_pane_outcome(
             paint_volume_caption(
                 ui,
                 pane_rect,
-                &volume_caption(&site_code, collected, shown_collected, region),
+                &volume_caption(&site_code, collected, shown_collected, region, camera),
             );
             None
         }
@@ -736,15 +798,28 @@ fn volume_pane_outcome(
     }
 }
 
-/// The 3D pane's own controls: a way back to the view it started at.
+/// The 3D pane's own controls: how far the vertical is stretched, and a way back
+/// to the view it started at.
 ///
-/// # Why the reset returns the region too
+/// # Why the exaggeration is a slider and not a preset list
 ///
-/// A pane that is lost — spun to a strange angle, or tightened onto a region
-/// that turned out to be empty — is one the user has no other way back from. So
-/// this returns the *whole* view: angle, zoom **and** region. Leaving the region
-/// out is the easy mistake, and the symptom is a reset that visibly does
-/// something and still leaves the pane looking at the wrong ground.
+/// It is a continuous judgement about one picture. A forecaster reading a
+/// supercell wants a different stretch from one reading a squall line's
+/// cross-section, and the useful move is nudging it until the structure reads —
+/// which is a drag, not a choice between three named values.
+///
+/// The range is `[1, 12]` and it starts at 3. 1 is true proportions, and it is
+/// reachable on purpose: the flat picture is the honest one, and a view that
+/// could not be turned back to it would be a view that had made exaggeration
+/// compulsory.
+///
+/// # Why the reset returns four things
+///
+/// A pane that is lost — panned off the box, spun to a strange angle, tightened
+/// onto a region that turned out to be empty — is one the user has no other way
+/// back from. So this returns the *whole* view: angle, zoom, pivot **and**
+/// region. Leaving the pivot out is the easy mistake, and the symptom is a reset
+/// that visibly does something and still leaves the box off screen.
 ///
 /// A free function rather than a `Gui` method because it touches nothing but the
 /// pane it is handed — and the pane it is handed is the one the caller
@@ -756,6 +831,26 @@ pub(crate) fn render_volume_controls(ui: &mut egui::Ui, pane: &mut crate::pane::
     ui.add_space(6.0);
     ui.separator();
     ui.label("3D view");
+
+    let mut exaggeration = volume.camera.vertical_exaggeration();
+    let response = ui.add(
+        egui::Slider::new(
+            &mut exaggeration,
+            crate::pane::MIN_VERTICAL_EXAGGERATION..=crate::pane::MAX_VERTICAL_EXAGGERATION,
+        )
+        .text("Vertical \u{d7}")
+        .fixed_decimals(1),
+    );
+    if response.changed() {
+        // Through the setter, which is the only writer and the only place the
+        // clamp and the non-finite refusal live. Writing the field would work
+        // here and would be a second copy of both.
+        volume.camera.set_vertical_exaggeration(exaggeration);
+    }
+    response.on_hover_text(
+        "Stretches the box vertically so storm structure is legible. Heights the pane reports \
+         stay in real kft MSL at every setting.",
+    );
 
     if ui
         .button("Reset view")
@@ -773,23 +868,35 @@ pub(crate) fn render_volume_controls(ui: &mut egui::Ui, pane: &mut crate::pane::
 /// the assignments, which passes whatever the button actually does — and this is
 /// exactly the kind of function that grows a field it forgets to clear.
 ///
-/// **It returns the region as well as the camera.** The region is easy to leave
-/// out, and the failure is a reset that visibly changes something and leaves the
-/// pane still looking at the wrong place — which reads as a control that
-/// half-works. A `source_pane` left behind is quieter still: the next region
-/// dragged on that map would re-aim this pane instead of opening one where it
-/// was dragged.
+/// **It returns the region as well as the camera**, and the pivot as well as the
+/// angles. Both are easy to leave out and both fail the same way: a reset that
+/// visibly changes something and leaves the pane still looking at the wrong
+/// place, which reads as a control that half-works. A `source_pane` left behind
+/// is quieter still — the next region dragged on that map would re-aim this pane
+/// instead of opening one where it was dragged.
 pub(crate) fn reset_volume_view(volume: &mut crate::pane::VolumePane) {
     volume.camera = crate::pane::OrbitCamera::default();
     volume.region = None;
     volume.source_pane = None;
 }
 
+/// Kilofeet per kilometre. The vertical readout is in kft MSL because that is
+/// what a forecaster reads a storm top in, and because it is the unit the rest of
+/// this application already uses for heights.
+const KFT_PER_KM: f64 = 3.280_84;
+
 /// What the pane says about the picture it is showing, one line per fact.
 ///
-/// # The volume time is always named
+/// # Every number here is a real one
 ///
-/// A 3D pane in live mode is showing an
+/// This is the counterweight to the vertical exaggeration, and it is the reason
+/// the exaggeration is defensible at all. The height line is the box's true
+/// extent in kft MSL, read from the same two constants the resample was given and
+/// **never** multiplied by the stretch; the stretch is stated beside it as a
+/// drawing convention, with its number, so that a reader can see both facts at
+/// once and cannot mistake one for the other.
+///
+/// The same applies to the volume time. A 3D pane in live mode is showing an
 /// archived volume some minutes behind the plan view next to it, and the one
 /// thing that must not happen is for it to look current — so the time is always
 /// named, and when the app has a different volume for the site the pane names
@@ -811,6 +918,7 @@ fn volume_caption(
     collected: chrono::NaiveDateTime,
     shown: Option<chrono::NaiveDateTime>,
     region: Option<crate::pane::VolumeRegion>,
+    camera: crate::pane::OrbitCamera,
 ) -> Vec<String> {
     let mut lines = vec![format!(
         "{site} archived volume {}Z",
@@ -837,6 +945,13 @@ fn volume_caption(
             shown.format("%H:%M"),
         ));
     }
+
+    let base = rustdar_radar::voxel::DEFAULT_BASE_KM_MSL * KFT_PER_KM;
+    let top = rustdar_radar::voxel::DEFAULT_TOP_KM_MSL * KFT_PER_KM;
+    lines.push(format!(
+        "{base:.0}–{top:.0} kft MSL · vertical exaggeration {:.1}×",
+        camera.vertical_exaggeration(),
+    ));
 
     let half_width = region.map_or(crate::pane::DEFAULT_HALF_WIDTH_KM, |r| r.half_width_km());
     let cells = rustdar_radar::voxel::default_shape().nx;
@@ -1576,6 +1691,46 @@ mod volume_arm_tests {
 
     // --- The caption: everything the pane claims about the picture ----------
 
+    /// **The height the pane reports is real at every exaggeration.**
+    ///
+    /// This is the counterweight that makes the exaggeration defensible at all.
+    /// The stretch is a drawing convention; a stretched *number* would be a
+    /// fabricated measurement, and 0–59 kft MSL is a figure a forecaster would
+    /// read off the screen and act on.
+    ///
+    /// The mutation this closes is the tempting one — multiplying the top of the
+    /// box by the exaggeration so the caption "matches what you see". At 3× that
+    /// produces "0–177 kft MSL", which is above the Kármán line and still looks
+    /// like a readout.
+    #[test]
+    fn the_height_the_pane_reports_is_real_at_every_exaggeration() {
+        let mut seen = Vec::new();
+        for ex in [1.0f32, 3.0, 12.0] {
+            let mut camera = crate::pane::OrbitCamera::default();
+            camera.set_vertical_exaggeration(ex);
+            let lines = volume_caption("KTLX", at(33), None, None, camera);
+            let height = lines
+                .iter()
+                .find(|l| l.contains("kft MSL"))
+                .unwrap_or_else(|| panic!("no height line at {ex}x in {lines:?}"))
+                .clone();
+            assert!(
+                height.starts_with("0–59 kft MSL"),
+                "the height must be the box's true extent, not the drawn one: {height:?}",
+            );
+            assert!(
+                height.contains(&format!("{ex:.1}×")),
+                "the exaggeration must be stated beside it: {height:?}",
+            );
+            seen.push(height);
+        }
+        assert_eq!(
+            seen.iter().filter(|h| h.starts_with("0–59")).count(),
+            3,
+            "every setting must report the same real height: {seen:?}",
+        );
+    }
+
     /// The caption names the archived volume and its time.
     ///
     /// A 3D pane in live mode is showing a volume some minutes behind the plan
@@ -1583,7 +1738,7 @@ mod volume_arm_tests {
     /// current, so "archived" and the time are both in the first line.
     #[test]
     fn the_caption_names_the_archived_volume_and_when_it_was_collected() {
-        let lines = volume_caption("KTLX", at(33), None, None);
+        let lines = volume_caption("KTLX", at(33), None, None, Default::default());
         assert!(
             lines[0].contains("KTLX")
                 && lines[0].contains("archived")
@@ -1607,7 +1762,7 @@ mod volume_arm_tests {
     /// line at all.
     #[test]
     fn the_caption_names_the_other_volume_the_app_has_for_the_site() {
-        let differs = volume_caption("KTLX", at(33), Some(at(39)), None);
+        let differs = volume_caption("KTLX", at(33), Some(at(39)), None, Default::default());
         let named = differs
             .iter()
             .find(|l| l.contains("22:39"))
@@ -1622,7 +1777,7 @@ mod volume_arm_tests {
             "the line must name the volume that is *not* on this pane: {named}",
         );
 
-        let agrees = volume_caption("KTLX", at(33), Some(at(33)), None);
+        let agrees = volume_caption("KTLX", at(33), Some(at(33)), None, Default::default());
         assert_eq!(
             agrees.len(),
             differs.len() - 1,
@@ -1643,7 +1798,7 @@ mod volume_arm_tests {
     /// written down.
     #[test]
     fn the_caption_reports_the_resolution_the_region_buys() {
-        let wide = volume_caption("KTLX", at(33), None, None);
+        let wide = volume_caption("KTLX", at(33), None, None, Default::default());
         assert!(
             wide.iter()
                 .any(|l| l.contains("160 km box") && l.contains("km/cell")),
@@ -1658,7 +1813,7 @@ mod volume_arm_tests {
             20.0,
         )
         .expect("a valid region");
-        let tight_lines = volume_caption("KTLX", at(33), None, Some(tight));
+        let tight_lines = volume_caption("KTLX", at(33), None, Some(tight), Default::default());
         let line = tight_lines
             .iter()
             .find(|l| l.contains("km box"))
@@ -1676,25 +1831,145 @@ mod volume_arm_tests {
         );
     }
 
+    // --- The pan gesture ----------------------------------------------------
+
+    /// A secondary drag pans and does not orbit; a primary drag orbits and does
+    /// not pan.
+    ///
+    /// The two are separate verbs on separate buttons, and a mutation that made
+    /// either drag do both would still move the picture — plausibly — while
+    /// making the other gesture impossible to perform cleanly.
+    #[test]
+    fn the_secondary_drag_pans_and_the_primary_drag_orbits() {
+        let mut h = volume_pane_harness();
+        let rect = h.pane_rects()[1];
+        let before = camera_of(&mut h, 1);
+
+        h.mouse_press_secondary(rect.center());
+        h.frames_for(1, FRAME_DT);
+        h.mouse_move(rect.center() + egui::vec2(90.0, 0.0));
+        h.frames_for(1, FRAME_DT);
+        h.mouse_release_secondary(rect.center() + egui::vec2(90.0, 0.0));
+        h.frames_for(1, FRAME_DT);
+
+        let panned = camera_of(&mut h, 1);
+        assert_ne!(panned.pivot(), before.pivot(), "a secondary drag must pan");
+        assert_eq!(
+            (panned.yaw_deg(), panned.pitch_deg()),
+            (before.yaw_deg(), before.pitch_deg()),
+            "a secondary drag must not orbit",
+        );
+
+        let before = panned;
+        h.mouse_press(rect.center());
+        h.frames_for(1, FRAME_DT);
+        h.mouse_move(rect.center() + egui::vec2(90.0, 0.0));
+        h.frames_for(1, FRAME_DT);
+        h.mouse_release(rect.center() + egui::vec2(90.0, 0.0));
+        h.frames_for(1, FRAME_DT);
+
+        let orbited = camera_of(&mut h, 1);
+        assert_ne!(
+            orbited.yaw_deg(),
+            before.yaw_deg(),
+            "a primary drag must orbit"
+        );
+        assert_eq!(
+            orbited.pivot(),
+            before.pivot(),
+            "a primary drag must not pan",
+        );
+    }
+
+    /// The box travels the way the pointer went.
+    ///
+    /// Through the whole shipped path rather than through `pan_for_drag` alone,
+    /// so a sign inverted between the two — the gesture reading the drag one way
+    /// and the maths another — cannot hide.
+    #[test]
+    fn a_secondary_drag_carries_the_box_the_way_the_pointer_went() {
+        let mut h = volume_pane_harness();
+        let rect = h.pane_rects()[1];
+        // Due south of the box looking north, so screen-right is due east and the
+        // axis the pivot moves on is nameable.
+        {
+            let camera = &mut h
+                .gui_mut()
+                .pane_mut(1)
+                .expect("pane 1")
+                .volume_mut()
+                .expect("a 3D pane")
+                .camera;
+            *camera =
+                crate::pane::OrbitCamera::restore(180.0, 0.0, 2.5, [0.0; 3], 1.0).expect("finite");
+        }
+        h.frames_for(1, FRAME_DT);
+
+        h.mouse_press_secondary(rect.center());
+        h.frames_for(1, FRAME_DT);
+        h.mouse_move(rect.center() + egui::vec2(80.0, 0.0));
+        h.frames_for(1, FRAME_DT);
+
+        assert!(
+            camera_of(&mut h, 1).pivot()[0] < -1e-4,
+            "dragging right must aim west so the box travels east: {:?}",
+            camera_of(&mut h, 1).pivot(),
+        );
+    }
+
+    /// A pane collapsed to nothing by a divider drag does not put a NaN in the
+    /// camera.
+    ///
+    /// The realistic path to a zero viewport height, and the consequence of
+    /// laundering it rather than refusing is a staleness key that never equals
+    /// itself — a rebuild every frame, for ever, with a hot CPU as its only
+    /// symptom.
+    #[test]
+    fn a_pane_with_no_height_pans_to_nothing_rather_than_to_nan() {
+        let mut h = volume_pane_harness();
+        let rect = h.pane_rects()[1];
+        // The gesture still runs; only the geometry is degenerate.
+        let pan = crate::volume_view::pan_for_drag(
+            camera_of(&mut h, 1),
+            [160.0, 160.0, 18.0],
+            0.0,
+            [rect.width(), 0.0],
+        );
+        assert_eq!(pan, None, "a zero-height pane must produce no pan at all");
+
+        let mut camera = camera_of(&mut h, 1);
+        camera.nudge(crate::pane::OrbitDelta {
+            pan: [f32::NAN, 0.0, 0.0],
+            ..Default::default()
+        });
+        assert!(
+            camera.pivot().iter().all(|p| p.is_finite()),
+            "a non-finite pan must be refused whole: {:?}",
+            camera.pivot(),
+        );
+    }
+
     // --- Reset --------------------------------------------------------------
 
-    /// The reset returns the region, not only the angles.
+    /// The reset returns the pivot and the region, not only the angles.
     ///
     /// Through `reset_volume_view`, which is what the button calls — a test that
     /// restated the assignments would pass whatever the button actually did.
     ///
-    /// Leaving the region out is the easy mistake and the one that matters: a
-    /// pane tightened onto an empty box and then reset would visibly change
-    /// angle and still be sampling the wrong ground, which reads as a reset that
+    /// Leaving the pivot out is the easy mistake and the one that matters: a
+    /// pane panned to its clamp and then reset would visibly change angle and
+    /// still be looking at the corner of the box, which reads as a reset that
     /// half-worked.
     #[test]
-    fn the_reset_returns_the_region_as_well_as_the_angles() {
+    fn the_reset_returns_the_pivot_and_the_region_as_well_as_the_angles() {
         let mut volume = crate::pane::VolumePane::default();
         volume.camera.nudge(crate::pane::OrbitDelta {
             yaw_deg: 40.0,
             pitch_deg: -15.0,
             zoom_factor: 1.4,
+            pan: [0.6, -0.4, 0.3],
         });
+        volume.camera.set_vertical_exaggeration(9.0);
         volume.region = crate::pane::VolumeRegion::new(
             crate::pane::GeoPoint {
                 lat: 35.3,
@@ -1703,9 +1978,19 @@ mod volume_arm_tests {
             25.0,
         );
         volume.source_pane = Some(0);
+        assert_ne!(
+            volume.camera.pivot(),
+            [0.0; 3],
+            "precondition: the view has been panned off centre",
+        );
 
         reset_volume_view(&mut volume);
 
+        assert_eq!(
+            volume.camera.pivot(),
+            [0.0; 3],
+            "the pivot must come back, or the box stays off to one side",
+        );
         assert_eq!(volume.camera, crate::pane::OrbitCamera::default());
         assert_eq!(volume.region, None, "the region must come back too");
         assert_eq!(
@@ -1719,7 +2004,7 @@ mod volume_arm_tests {
     /// This is the line between the two halves of the feature — the region
     /// changes what is *sampled*, the camera only how it is *drawn* — and it is
     /// the one that costs 155 ms on the frame thread when it is drawn in the
-    /// wrong place. Orbiting must not rebuild.
+    /// wrong place. Orbiting, panning or exaggerating must not rebuild.
     #[test]
     fn a_region_change_rebuilds_the_grid_and_a_camera_change_does_not() {
         let mut h = volume_pane_harness();
@@ -1747,7 +2032,7 @@ mod volume_arm_tests {
             "precondition: a settled pane asks for nothing",
         );
 
-        // Moving the camera.
+        // Moving the camera every way there is.
         {
             let volume = h
                 .gui_mut()
@@ -1759,14 +2044,16 @@ mod volume_arm_tests {
                 yaw_deg: 30.0,
                 pitch_deg: 10.0,
                 zoom_factor: 1.5,
+                pan: [0.5, 0.5, 0.5],
             });
+            volume.camera.set_vertical_exaggeration(11.0);
         }
         h.frames_for(2, FRAME_DT);
         assert!(
             !h.last_actions()
                 .iter()
                 .any(|a| matches!(a, GuiAction::PrepareVolume { .. })),
-            "orbiting must redraw from the grid in hand",
+            "orbiting, panning and exaggerating must all redraw from the grid in hand",
         );
 
         // Changing the region.

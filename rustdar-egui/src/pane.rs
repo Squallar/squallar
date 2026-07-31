@@ -15,7 +15,8 @@ mod content;
 // split into a second file is about how much there is to say about each half,
 // not about them being different things.
 pub use content::{
-    CrossSectionPane, DEFAULT_HALF_WIDTH_KM, GeoPoint, OrbitCamera, OrbitDelta, PaneContent,
+    CrossSectionPane, DEFAULT_HALF_WIDTH_KM, DEFAULT_VERTICAL_EXAGGERATION, GeoPoint,
+    MAX_VERTICAL_EXAGGERATION, MIN_VERTICAL_EXAGGERATION, OrbitCamera, OrbitDelta, PaneContent,
     PaneKind, SectionLine, SectionTarget, VolumePane, VolumeRegion, VolumeStamp, VolumeTarget,
 };
 

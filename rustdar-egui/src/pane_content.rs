@@ -406,10 +406,10 @@ pub struct CrossSectionPane {
 /// region change, no rebuild would be asked for, and the store's `lookup` would
 /// hand back the old box's grid — a picture that is wrong and looks right.
 ///
-/// The camera is deliberately *not* in here — orbiting re-draws from the grid
-/// already in hand and must not rebuild it. That is the line between the two
-/// halves of this feature: the region changes what is *sampled*, the camera only
-/// how it is *drawn*.
+/// The camera is deliberately *not* in here — orbiting, panning and exaggerating
+/// all re-draw from the grid already in hand and must not rebuild it. That is the
+/// line between the two halves of this feature: the region changes what is
+/// *sampled*, the camera only how it is *drawn*.
 ///
 /// `None` for the region means the pane's default box about its site, and it is
 /// a distinct key from any picked region — which is right, because it denotes a
@@ -562,6 +562,37 @@ pub struct VolumePane {
     pub rendered_for: Option<VolumeTarget>,
 }
 
+impl VolumePane {
+    /// The box's full extent in kilometres along each axis, as the resample will
+    /// produce it.
+    ///
+    /// # Why the pane derives this rather than reading it off the grid
+    ///
+    /// The grid is the truth and the painter reads it there. But the pane needs
+    /// the box's proportions *before* the painter runs, on the frame a drag is
+    /// folded in — the pan scale is a fraction of the box — and the grid lives
+    /// behind the painter in another crate. Reading last frame's box would put
+    /// the pan one frame behind the pointer, which is the exact defect
+    /// `VolumePainter::paint`'s ordering exists to avoid.
+    ///
+    /// The two agree by construction rather than by luck: `build_voxels` spans
+    /// `2 · half_width_km` horizontally and `base..top` vertically, from the same
+    /// clamped half-width [`VolumeRegion::new`] holds and the same two constants
+    /// used here. If they ever disagreed the symptom would be a pan that drifts
+    /// against the picture, which is why they read one definition each.
+    pub fn box_size_km(&self) -> [f32; 3] {
+        let half_width = self
+            .region
+            .map_or(DEFAULT_HALF_WIDTH_KM, VolumeRegion::half_width_km);
+        [
+            (2.0 * half_width) as f32,
+            (2.0 * half_width) as f32,
+            (rustdar_radar::voxel::DEFAULT_TOP_KM_MSL - rustdar_radar::voxel::DEFAULT_BASE_KM_MSL)
+                as f32,
+        ]
+    }
+}
+
 /// A movement of the orbit camera: two angles and a zoom factor.
 ///
 /// A struct rather than three `f32` parameters for the same reason
@@ -584,6 +615,17 @@ pub struct OrbitDelta {
     /// Multiplicative zoom, in egui's own sense: a spreading pinch reports a
     /// factor above 1, which brings the eye *in*.
     pub zoom_factor: f32,
+    /// Where to move the pivot, as a fraction of the box's half-extent on each
+    /// axis. See [`OrbitCamera::pivot`].
+    ///
+    /// **Already resolved into world axes by the caller**, not a screen-space
+    /// pair to be rotated here. The rotation needs the camera basis *and* the
+    /// box's proportions *and* the viewport height, and only
+    /// [`crate::volume_view::pan_for_drag`] has all three — so it does the whole
+    /// conversion and this carries the answer. The alternative, a screen delta
+    /// resolved here, would put a second copy of the camera basis in this module
+    /// for the two to drift apart.
+    pub pan: [f32; 3],
 }
 
 impl Default for OrbitDelta {
@@ -592,6 +634,7 @@ impl Default for OrbitDelta {
             yaw_deg: 0.0,
             pitch_deg: 0.0,
             zoom_factor: 1.0,
+            pan: [0.0; 3],
         }
     }
 }
@@ -605,6 +648,45 @@ const MAX_PITCH_DEG: f32 = 89.0;
 /// grid-spec rung. 1.0 is the eye on the box's corner sphere.
 const MIN_EYE_DISTANCE: f32 = 1.05;
 const MAX_EYE_DISTANCE: f32 = 8.0;
+
+/// How far the pivot may be pushed from the box's centre, as a fraction of the
+/// box's half-extent on each axis.
+///
+/// **This is the clamp that stops the box being pushed off screen**, and 1.0 is
+/// the value that makes the guarantee exactly rather than approximately: at 1.0
+/// the pivot is on the box's own surface, so the point the camera is aimed at —
+/// which is the point that lands in the middle of the pane — is always a point
+/// of the box. Some of the box is therefore under the centre of the pane at
+/// every pan, whatever the yaw, pitch or zoom.
+///
+/// Expressed per axis rather than as a radius, because the box is a 8.9:1
+/// pancake: a spherical bound of one half-extent would either let the pivot leave
+/// the box sideways or stop it well short of the top face.
+const MAX_PIVOT_FRACTION: f32 = 1.0;
+
+/// The vertical exaggeration a 3D pane starts at.
+///
+/// The box is 160 km wide and 18 km tall — **8.9:1** — and at true proportions
+/// it reads as a sheet of paper rather than as a volume with storms standing in
+/// it. That is a real property of the atmosphere and the flat view is the honest
+/// one, which is why the number is *shown* rather than hidden; but a view whose
+/// whole claim is that it shows vertical structure has to make the vertical
+/// structure visible, and 3 is where a supercell's overhang and a stratiform
+/// sheet become distinguishable at a glance.
+///
+/// 3 rather than more because it is the bottom of the 3–8 range GR2Analyst-like
+/// views are read at, and a default that starts at the bottom of a range is one
+/// the user turns *up* on purpose rather than one that has silently
+/// been making every storm look like a tower.
+pub const DEFAULT_VERTICAL_EXAGGERATION: f32 = 3.0;
+/// True proportions. The bottom of the control's travel is 1, never 0: a zero
+/// would collapse the box to a plane, which divides by zero in `box_from_world`.
+pub const MIN_VERTICAL_EXAGGERATION: f32 = 1.0;
+/// Past about 12 the box is taller than it is wide and the orbit stops behaving
+/// like an inspection of a storm — and the picture stops being a defensible
+/// rendering of anything, because a 15 km updraught drawn 180 km tall is no
+/// longer a shape a forecaster can read a height off.
+pub const MAX_VERTICAL_EXAGGERATION: f32 = 12.0;
 
 /// Where the eye is, for a 3D pane: an orbit about the centre of the volume.
 ///
@@ -640,17 +722,52 @@ pub struct OrbitCamera {
     pitch_deg: f32,
     /// Eye distance in multiples of the volume box's half-diagonal.
     eye_distance: f32,
+    /// The point the orbit turns about and the camera looks at, as a fraction of
+    /// the box's half-extent on each axis, each component in
+    /// `[-MAX_PIVOT_FRACTION, MAX_PIVOT_FRACTION]`.
+    ///
+    /// # Why a fraction of the box and not kilometres
+    ///
+    /// The box's size changes — a region drag re-cuts it from 460 km across to
+    /// as little as 20 — and a pivot in kilometres would survive that change by
+    /// pointing somewhere else, usually outside the new box. In box fractions the
+    /// same stored value means the same *part* of the box whatever the box is,
+    /// which is what a user who tightened a region and expected to still be
+    /// looking at the storm they aimed at will read as correct. It is also what
+    /// makes the clamp above a one-line guarantee rather than an argument about
+    /// aspect ratios.
+    ///
+    /// It is measured against the **exaggerated** box on the vertical axis, so
+    /// turning the exaggeration up does not slide the pivot off the top face.
+    pivot: [f32; 3],
+    /// How much the vertical axis is stretched when the box is drawn, in
+    /// `[MIN_VERTICAL_EXAGGERATION, MAX_VERTICAL_EXAGGERATION]`.
+    ///
+    /// A property of the *camera* rather than of the grid, and that is the whole
+    /// design: it changes nothing about what was sampled, so turning it is free
+    /// and never triggers a rebuild. It is deliberately not in
+    /// [`VolumeTarget`] for the same reason the yaw is not.
+    ///
+    /// **Everything the pane reports about height stays in real units.** The
+    /// stretch is applied to the geometry and to nothing else; the pane's readout
+    /// reads the grid's own `z_range_km_msl`, which this never touches. A view
+    /// that quietly reported exaggerated heights would be worse than no
+    /// exaggeration at all, because the number would look like a measurement.
+    vertical_exaggeration: f32,
 }
 
 impl Default for OrbitCamera {
-    /// Looking north-ish from above the south-west, a little way out: an angle
-    /// that shows a storm has height and depth at once, rather than the plan
-    /// view the user already has on another pane.
+    /// Looking north-ish from above the south-west, a little way out, aimed at
+    /// the box's centre and stretched by [`DEFAULT_VERTICAL_EXAGGERATION`]: an
+    /// angle that shows a storm has height and depth at once, rather than the
+    /// plan view the user already has on another pane.
     fn default() -> Self {
         Self {
             yaw_deg: 225.0,
             pitch_deg: 25.0,
             eye_distance: 2.5,
+            pivot: [0.0; 3],
+            vertical_exaggeration: DEFAULT_VERTICAL_EXAGGERATION,
         }
     }
 }
@@ -672,6 +789,12 @@ impl OrbitCamera {
         if !delta.zoom_factor.is_finite() || delta.zoom_factor <= 0.0 {
             return;
         }
+        // Checked with the rest and refused with the rest: a pan arrives from
+        // the same pointer state as the orbit, through a division by the
+        // viewport height that a pane one frame wide makes infinite.
+        if !delta.pan.iter().all(|p| p.is_finite()) {
+            return;
+        }
 
         // Only now, with every input known finite, are wrapping and clamping
         // safe: both would otherwise carry a NaN straight through.
@@ -679,6 +802,26 @@ impl OrbitCamera {
         self.pitch_deg = (self.pitch_deg + delta.pitch_deg).clamp(-MAX_PITCH_DEG, MAX_PITCH_DEG);
         self.eye_distance =
             (self.eye_distance / delta.zoom_factor).clamp(MIN_EYE_DISTANCE, MAX_EYE_DISTANCE);
+        for (axis, moved) in self.pivot.iter_mut().zip(delta.pan) {
+            *axis = (*axis + moved).clamp(-MAX_PIVOT_FRACTION, MAX_PIVOT_FRACTION);
+        }
+    }
+
+    /// Set the vertical exaggeration, or leave it exactly as it is.
+    ///
+    /// The one writer for the knob, and it refuses a non-finite value for the
+    /// reason the type documentation gives: `f32::clamp` propagates NaN, and a
+    /// NaN here would reach `box_from_world` as a divide-by-NaN and hand the GPU
+    /// a matrix the driver renders as an empty pane with no error anywhere.
+    ///
+    /// Finite values are clamped rather than refused — this is a slider, and a
+    /// slider that reaches the end of its travel should stop.
+    pub fn set_vertical_exaggeration(&mut self, exaggeration: f32) {
+        if !exaggeration.is_finite() {
+            return;
+        }
+        self.vertical_exaggeration =
+            exaggeration.clamp(MIN_VERTICAL_EXAGGERATION, MAX_VERTICAL_EXAGGERATION);
     }
 
     /// Rebuild a camera from persisted angles, or `None` if they are unusable.
@@ -700,14 +843,30 @@ impl OrbitCamera {
     /// produce one, and `ui_config`'s `restore_viewport` reasons the same way
     /// about a saved zoom: there is nothing to propagate, and the nearest legal
     /// camera is a better answer than discarding the pane's kind over a number.
-    pub fn restore(yaw_deg: f32, pitch_deg: f32, eye_distance: f32) -> Option<Self> {
+    pub fn restore(
+        yaw_deg: f32,
+        pitch_deg: f32,
+        eye_distance: f32,
+        pivot: [f32; 3],
+        vertical_exaggeration: f32,
+    ) -> Option<Self> {
         if !yaw_deg.is_finite() || !pitch_deg.is_finite() || !eye_distance.is_finite() {
             return None;
+        }
+        if !pivot.iter().all(|p| p.is_finite()) || !vertical_exaggeration.is_finite() {
+            return None;
+        }
+        let mut pivot = pivot;
+        for axis in &mut pivot {
+            *axis = axis.clamp(-MAX_PIVOT_FRACTION, MAX_PIVOT_FRACTION);
         }
         Some(Self {
             yaw_deg: yaw_deg.rem_euclid(360.0),
             pitch_deg: pitch_deg.clamp(-MAX_PITCH_DEG, MAX_PITCH_DEG),
             eye_distance: eye_distance.clamp(MIN_EYE_DISTANCE, MAX_EYE_DISTANCE),
+            pivot,
+            vertical_exaggeration: vertical_exaggeration
+                .clamp(MIN_VERTICAL_EXAGGERATION, MAX_VERTICAL_EXAGGERATION),
         })
     }
 
@@ -724,6 +883,18 @@ impl OrbitCamera {
     /// Eye distance in multiples of the volume box's half-diagonal.
     pub fn eye_distance(self) -> f32 {
         self.eye_distance
+    }
+
+    /// The look-at point, as a fraction of the box's half-extent on each axis,
+    /// each component within ±1 and so always a point of the box.
+    pub fn pivot(self) -> [f32; 3] {
+        self.pivot
+    }
+
+    /// How much the vertical axis is stretched when the box is drawn. Never
+    /// applied to anything the pane *reports*; see the field.
+    pub fn vertical_exaggeration(self) -> f32 {
+        self.vertical_exaggeration
     }
 }
 
@@ -923,9 +1094,14 @@ mod tests {
     #[test]
     fn a_restored_camera_is_the_one_that_was_saved_or_none_at_all() {
         let start = OrbitCamera::default();
-        let round_tripped =
-            OrbitCamera::restore(start.yaw_deg(), start.pitch_deg(), start.eye_distance())
-                .expect("a camera's own values must restore");
+        let round_tripped = OrbitCamera::restore(
+            start.yaw_deg(),
+            start.pitch_deg(),
+            start.eye_distance(),
+            start.pivot(),
+            start.vertical_exaggeration(),
+        )
+        .expect("a camera's own values must restore");
         assert_eq!(round_tripped, start);
 
         // A camera that had been moved, so the round trip is not just the default
@@ -935,30 +1111,70 @@ mod tests {
             yaw_deg: -47.5,
             pitch_deg: 12.25,
             zoom_factor: 1.5,
+            // Panned as well, so the round trip covers the pivot rather than
+            // agreeing with itself about a zero.
+            pan: [0.2, -0.35, 0.1],
         });
+        moved.set_vertical_exaggeration(5.5);
         assert_ne!(moved, start, "precondition: the nudge must have moved it");
         assert_eq!(
-            OrbitCamera::restore(moved.yaw_deg(), moved.pitch_deg(), moved.eye_distance()),
+            OrbitCamera::restore(
+                moved.yaw_deg(),
+                moved.pitch_deg(),
+                moved.eye_distance(),
+                moved.pivot(),
+                moved.vertical_exaggeration(),
+            ),
             Some(moved)
         );
 
+        let ok_pivot = [0.0; 3];
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            assert_eq!(OrbitCamera::restore(bad, 25.0, 2.5), None, "yaw {bad}");
-            assert_eq!(OrbitCamera::restore(225.0, bad, 2.5), None, "pitch {bad}");
             assert_eq!(
-                OrbitCamera::restore(225.0, 25.0, bad),
+                OrbitCamera::restore(bad, 25.0, 2.5, ok_pivot, 3.0),
+                None,
+                "yaw {bad}"
+            );
+            assert_eq!(
+                OrbitCamera::restore(225.0, bad, 2.5, ok_pivot, 3.0),
+                None,
+                "pitch {bad}"
+            );
+            assert_eq!(
+                OrbitCamera::restore(225.0, 25.0, bad, ok_pivot, 3.0),
                 None,
                 "distance {bad}"
             );
+            assert_eq!(
+                OrbitCamera::restore(225.0, 25.0, 2.5, ok_pivot, bad),
+                None,
+                "exaggeration {bad}"
+            );
+            for axis in 0..3 {
+                let mut pivot = ok_pivot;
+                pivot[axis] = bad;
+                assert_eq!(
+                    OrbitCamera::restore(225.0, 25.0, 2.5, pivot, 3.0),
+                    None,
+                    "pivot axis {axis} = {bad}"
+                );
+            }
         }
 
         // Finite but out of range: wrapped and clamped rather than refused, and
         // through the same expressions `nudge` uses — so a restored camera cannot
         // hold a value `nudge` would never produce.
-        let stretched = OrbitCamera::restore(-30.0, 1_000.0, 0.001).expect("finite, so restorable");
+        let stretched = OrbitCamera::restore(-30.0, 1_000.0, 0.001, [9.0, -9.0, 9.0], 1_000.0)
+            .expect("finite, so restorable");
         assert_eq!(stretched.yaw_deg(), 330.0);
         assert_eq!(stretched.pitch_deg(), MAX_PITCH_DEG);
         assert_eq!(stretched.eye_distance(), MIN_EYE_DISTANCE);
+        assert_eq!(
+            stretched.pivot(),
+            [MAX_PIVOT_FRACTION, -MAX_PIVOT_FRACTION, MAX_PIVOT_FRACTION],
+            "an out-of-range pivot must be clamped onto the box, not refused",
+        );
+        assert_eq!(stretched.vertical_exaggeration(), MAX_VERTICAL_EXAGGERATION);
     }
 
     /// A finite nudge does move it, and lands inside the limits — so the test
@@ -970,6 +1186,7 @@ mod tests {
             yaw_deg: 30.0,
             pitch_deg: 10.0,
             zoom_factor: 2.0,
+            ..Default::default()
         });
         assert_eq!(camera.yaw_deg(), 255.0);
         assert_eq!(camera.pitch_deg(), 35.0);
@@ -1000,5 +1217,37 @@ mod tests {
         });
         assert_eq!(camera.pitch_deg(), -MAX_PITCH_DEG);
         assert_eq!(camera.eye_distance(), MIN_EYE_DISTANCE);
+    }
+
+    /// The exaggeration knob clamps a finite value and refuses a non-finite one.
+    ///
+    /// The asymmetry is the same one `nudge` draws. A slider that reaches the end
+    /// of its travel should stop, so an out-of-range number is wound back. A NaN
+    /// has no nearest legal value, and `f32::clamp` **propagates** it — so a
+    /// clamp on the way in would launder it into a camera that looks checked, and
+    /// it would arrive at `box_from_world` as a divide-by-NaN. The GPU accepts
+    /// that matrix, renders an empty pane, and reports nothing anywhere.
+    #[test]
+    fn the_exaggeration_knob_clamps_the_finite_and_refuses_the_rest() {
+        let mut camera = OrbitCamera::default();
+        camera.set_vertical_exaggeration(100.0);
+        assert_eq!(camera.vertical_exaggeration(), MAX_VERTICAL_EXAGGERATION);
+        camera.set_vertical_exaggeration(0.0);
+        assert_eq!(
+            camera.vertical_exaggeration(),
+            MIN_VERTICAL_EXAGGERATION,
+            "zero would collapse the box to a plane and divide by zero",
+        );
+        camera.set_vertical_exaggeration(5.5);
+        assert_eq!(camera.vertical_exaggeration(), 5.5);
+
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            camera.set_vertical_exaggeration(bad);
+            assert_eq!(
+                camera.vertical_exaggeration(),
+                5.5,
+                "{bad} must leave the knob exactly where it was, not clamp it",
+            );
+        }
     }
 }
