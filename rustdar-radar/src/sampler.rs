@@ -425,7 +425,52 @@ impl Blend {
             _ => Blend::Arithmetic,
         }
     }
+
+    /// Whether this moment wraps at a limit that does not reach this sampler.
+    ///
+    /// **Two moments in Level II wrap, and only one of them wraps at a
+    /// constant.** Differential phase wraps at 360°, which is a property of
+    /// the quantity itself, so [`Blend::Angular360`] can be a blend *arm*:
+    /// everything it needs is in the variant. Doppler velocity wraps at the
+    /// Nyquist velocity, which is a property of the *sweep's* PRF and differs
+    /// from tilt to tilt inside one volume, so it cannot be an arm.
+    ///
+    /// **The archive does carry that number.** Message 31's Radial Data Block
+    /// has `nyquist_velocity`, `nexrad-decode` decodes it, and
+    /// [`crate::kdp::KdpParams::from_archive`] in this crate already reaches
+    /// into a raw `nexrad_data::volume::File` for radial-header parameters, so
+    /// reading it is neither impossible nor unprecedented. What drops it is
+    /// the boundary this sampler sits behind: `nexrad_model::data::Radial`
+    /// does not carry it, the worker's reconstructed `RenderInput` is built
+    /// from model types alone, and putting the Nyquist velocity on that
+    /// boundary is a wire-format change. So the number is *measured off the
+    /// data* instead, which is what [`estimate_fold_limit`] supplies and
+    /// [`Rung::fold_limit_ms`] carries.
+    ///
+    /// Every other moment this sampler serves is monotone over its encoding:
+    /// reflectivity, spectrum width, differential reflectivity and correlation
+    /// coefficient have no wraparound topology at all — spectrum width in
+    /// particular is a non-negative spread, so no two of its gates can sit on
+    /// opposite sides of a seam — and their blends are unaffected.
+    fn folds_at_measured_limit(product: RadarProduct) -> bool {
+        matches!(product, RadarProduct::Velocity)
+    }
 }
+
+/// The smallest estimated fold limit that is believed, m/s.
+///
+/// [`estimate_fold_limit`] reads the largest speed a sweep observed, which is
+/// the Nyquist velocity *when the sweep folded at all* and an underestimate
+/// when it did not. An underestimate is mostly harmless — see that function —
+/// but a sweep that saw nothing faster than a few m/s gives a limit so small
+/// that ordinary noise clears it, and then the straddle test fires on air that
+/// is merely calm. No operational NEXRAD waveform has a Nyquist velocity this
+/// low, so below it the guard is switched off rather than trusted.
+///
+/// `crate::nrot::dealias_with_knobs` abandons dealiasing under the same 8 m/s
+/// on the same reasoning about the same estimator, and the two numbers mean
+/// the same thing; they are deliberately equal.
+const FOLD_LIMIT_FLOOR_MS: f64 = 8.0;
 
 /// How many median azimuth steps two radials may be apart and still count as
 /// adjacent — i.e. as a pair worth interpolating between.
@@ -469,6 +514,16 @@ struct Rung<'a> {
     /// mean step of 0.5° only if you already ignore the 160° hole, while its
     /// median step is 0.5° whether you noticed the hole or not.
     az_step_deg: f64,
+    /// The speed this rung's sweep folds at, m/s, or `None` when this moment
+    /// has no fold seam or the sweep never got near one. Measured once here
+    /// rather than per sample because it is a property of the sweep, and a
+    /// sample must not pay a pass over the whole sweep.
+    ///
+    /// Per rung, not per volume: the Nyquist velocity follows the cut's PRF,
+    /// and it genuinely differs inside one volume — measured across the six
+    /// probe volumes, the low cuts fold at 22.5–31 m/s while the high cuts of
+    /// the same volume fold at up to 35.5.
+    fold_limit_ms: Option<f64>,
 }
 
 /// The tilt ladder over one ground point: every rung's beam height there and
@@ -500,6 +555,16 @@ pub struct ColumnRung {
     pub elevation_deg: f64,
     /// What this rung measured at this column's azimuth and ground range.
     pub sample: Sample,
+    /// This rung's fold limit, carried from [`Rung::fold_limit_ms`] so
+    /// [`Column::at_height_km`] can refuse to lerp across a Nyquist seam
+    /// without needing the sampler back — the same reason [`Column::blend`]
+    /// is carried.
+    ///
+    /// Private, unlike its neighbours, because it is a property of the *sweep*
+    /// that a reader of one rung's sample has no use for, and publishing it
+    /// would invite a caller to compare two rungs' limits and conclude
+    /// something about the air.
+    fold_limit_ms: Option<f64>,
 }
 
 impl Column {
@@ -586,7 +651,41 @@ impl Column {
         } else {
             0.0
         };
-        blend(self.blend, &[lo.sample, hi.sample], &[1.0 - t, t])
+        // **The seam between two rungs is where a fold does the most damage,
+        // not the least.** A two-corner lerp at `t = 0.5` of `+v` and `−v` is
+        // identically zero, so *every* fold-straddling rung pair halfway up
+        // fabricates, where the four-corner bilinear at least needs its other
+        // two corners to agree. Measured over fourteen volumes: of 12,918 rung
+        // pairs an independent continuity oracle confirms as folds, 12,903 —
+        // 99.9% — average to less than a quarter of the sweep's Nyquist
+        // velocity, which is the display's word for near-calm air. The
+        // corresponding figure for four-corner quads is 28,814 of 28,981, so
+        // the two are close here; what makes the vertical case worse is not a
+        // higher rate but that `t` is so often near 0.5.
+        //
+        // (An earlier note here claimed 94.9% of straddling *rung pairs at
+        // KLWX* fabricated, against 97% of straddling gate pairs. Neither
+        // number reproduces under any population this module can name, and
+        // both are withdrawn; the figures above replace them. The residual those
+        // numbers left unexplained was not rounding: it was the straddles
+        // whose smaller corner sits well inside the range, which is exactly
+        // the false-positive population [`straddles_fold`] now refuses.)
+        //
+        // The smaller of the two limits governs. The pair is folded if
+        // *either* end folded, each end folds at its own cut's Nyquist, and a
+        // reading wrapped at the lower limit is the one whose seam is easier
+        // to cross unnoticed — so testing against the larger limit would miss
+        // exactly the straddles the mixed-PRF ladder creates.
+        let fold_limit = match (lo.fold_limit_ms, hi.fold_limit_ms) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        blend(
+            self.blend,
+            &[lo.sample, hi.sample],
+            &[1.0 - t, t],
+            fold_limit,
+        )
     }
 }
 
@@ -729,12 +828,18 @@ impl<'a> VolumeSampler<'a> {
                 continue;
             };
             let (by_azimuth, az_step_deg) = index_azimuths(radials);
+            // One pass over this sweep, at ladder-build time. `folds_at_...`
+            // gates it so no moment without a seam pays for the pass at all.
+            let fold_limit_ms = Blend::folds_at_measured_limit(product)
+                .then(|| estimate_fold_limit(radials, slot))
+                .flatten();
             rungs.push(Rung {
                 nominal_deg: key,
                 elevation_deg,
                 radials,
                 by_azimuth,
                 az_step_deg,
+                fold_limit_ms,
             });
         }
 
@@ -928,6 +1033,7 @@ impl<'a> VolumeSampler<'a> {
                 height_km: beam::height_at_ground_km(ground_range_km, rung.elevation_deg),
                 elevation_deg: rung.elevation_deg,
                 sample: self.sample_rung(rung, azimuth, ground_range_km),
+                fold_limit_ms: rung.fold_limit_ms,
             });
         }
         // Ascending by height. The rungs are already ascending by cut angle,
@@ -983,7 +1089,7 @@ impl<'a> VolumeSampler<'a> {
             weights[side * 2] = wa * (1.0 - fr);
             weights[side * 2 + 1] = wa * fr;
         }
-        blend(self.blend, &corners, &weights)
+        blend(self.blend, &corners, &weights, rung.fold_limit_ms)
     }
 }
 
@@ -1154,6 +1260,196 @@ fn gate_sample(moment: &MomentData, gate: usize) -> Sample {
     }
 }
 
+/// The speed one sweep folds at, m/s, read off the sweep itself.
+///
+/// # Why this is the Nyquist velocity, and why it is sound when it is not
+///
+/// A folded field always contains gates *at* the fold limit — that is what
+/// folding does to the values it wraps — so when a sweep aliased at all, the
+/// largest speed it reports **is** its Nyquist velocity.
+///
+/// **That is measured, not assumed.** Scored against the archive's own
+/// `nyquist_velocity` (Message 31's Radial Data Block, which `nexrad-decode`
+/// exposes and this crate's render path cannot reach — see
+/// [`Blend::folds_at_measured_limit`]) over 140 rungs of fourteen volumes at
+/// six sites, the ratio of this estimate to the declared number runs
+/// 0.889–1.016, with 133 of the 140 inside 0.96–1.016 and a median of 0.992.
+/// The predicted failure — a weak-flow sweep that never reaches Nyquist and
+/// so reports a limit far below it — did not appear: every operational sweep
+/// examined folded somewhere. Note the ratios above 1: the reported extreme
+/// can exceed the declared Nyquist by one encoding step, and an over-estimate
+/// makes the guard *less* eager, which is the harmless direction.
+///
+/// When a sweep did *not* alias, this is an underestimate — the true Nyquist
+/// is higher than anything the sweep saw. [`FOLD_LIMIT_FLOOR_MS`] closes the
+/// case where that stops meaning anything at all; between the floor and the
+/// truth, an underestimate makes [`straddles_fold`] fire more readily than it
+/// should, which is why the size of the error above is worth having measured.
+///
+/// `crate::nrot`'s `estimate_nyquist` is the same measurement on the same
+/// reasoning, and this module could not call it: that one takes an
+/// already-gridded, already-median-filtered `Vec<Vec<f64>>` built by the NROT
+/// pipeline, which the sampler neither has nor wants to build. **The two uses
+/// have opposite sensitivity to the same error, and the shared reasoning
+/// should not be read as a shared safety argument.** `nrot` scales a threshold
+/// by its estimate, so a low estimate lowers the threshold and is
+/// conservative. This sampler uses it as an exact classification boundary, so
+/// a low estimate widens the fold hypothesis and manufactures false
+/// positives — the same number, the opposite direction of harm.
+///
+/// # The arithmetic deliberately mirrors [`gate_sample`]
+///
+/// Only the extreme raw words are converted, not every gate, because the
+/// encoding is affine: `(raw − offset) / scale` is monotone in `raw`, so the
+/// largest `|value|` is reached at the smallest or the largest raw word and
+/// nowhere between. Both ends are converted because a negative `scale` swaps
+/// which is which. The `raw >= 2` filter is [`gate_sample`]'s status codes,
+/// and the `scale == 0.0` skip is its "the raw words *are* the values" arm:
+/// those values are unsigned, so no two can straddle a seam and no limit is
+/// wanted from them.
+///
+/// `None` when nothing here reached [`FOLD_LIMIT_FLOOR_MS`], which switches
+/// the guard off for this sweep entirely.
+fn estimate_fold_limit(radials: &[Radial], slot: MomentSlot) -> Option<f64> {
+    let mut limit = 0.0f64;
+    for radial in radials {
+        let Some(moment) = slot.read(radial) else {
+            continue;
+        };
+        let scale = moment.scale();
+        if scale == 0.0 {
+            continue;
+        }
+        let bytes = moment.raw_values();
+        let (mut lo, mut hi) = (u16::MAX, 0u16);
+        let mut fold = |raw: u16| {
+            if raw >= 2 {
+                lo = lo.min(raw);
+                hi = hi.max(raw);
+            }
+        };
+        if moment.data_word_size() == 16 {
+            for pair in bytes.chunks_exact(2) {
+                fold(u16::from_be_bytes([pair[0], pair[1]]));
+            }
+        } else {
+            for &b in bytes {
+                fold(u16::from(b));
+            }
+        }
+        if lo > hi {
+            // Every gate was a status code: this radial measured no speed.
+            continue;
+        }
+        for raw in [lo, hi] {
+            let value = f64::from((raw as f32 - moment.offset()) / scale);
+            if value.is_finite() {
+                limit = limit.max(value.abs());
+            }
+        }
+    }
+    (limit >= FOLD_LIMIT_FLOOR_MS).then_some(limit)
+}
+
+/// How near the seam both extremes must sit before a straddle is read as a
+/// fold, as a fraction of the fold limit.
+///
+/// **This is a fraction, and saying so is the point.** An earlier rule tested
+/// only that the extremes changed sign and spread by more than `limit`, and
+/// argued that `1.0·limit` needed no shading because it is the break-even
+/// point of the two explanations — below it the pair is closer together across
+/// the middle, above it through the seam. That argument is sound about
+/// *likelihood* and wrong about *posterior*: break-even likelihood is
+/// break-even belief only if a fold and a non-fold were equally likely before
+/// either was measured, and they are not. Over the volumes measured below the
+/// sign-changing population near a spread ratio of 1.0 outnumbers the folded
+/// population by one to two orders of magnitude, so a rule that splits the
+/// likelihood evenly hands almost all of the disputed band to the wrong answer.
+///
+/// `0.5` is where the requirement below stops being free. See
+/// [`straddles_fold`] for what the requirement *is* and why the number cannot
+/// be argued away.
+const SEAM_PROXIMITY: f64 = 0.5;
+
+/// Whether these corners sit on opposite sides of a fold seam.
+///
+/// **What a fold does is wrap a continuous field across `±limit`, so both
+/// sides of the discontinuity it leaves behind are *near* `±limit`.** Take a
+/// field passing smoothly through the seam between two samples: the true
+/// speeds are `limit − a` and `limit + b` for small `a`, `b`, and what gets
+/// reported is `limit − a` and `−(limit − b)`. Both readings are within the
+/// pair's own true change of the seam. So a straddle whose *smaller* extreme
+/// sits well inside the range cannot be one fold of a smooth field — it is
+/// real shear, and this refuses it.
+///
+/// That is the whole rule: `lo < −f·limit && hi > f·limit`. Two things it
+/// used to say separately now fall out of it and are not tested again.
+/// Opposite signs: `lo` is below a negative bound and `hi` above a positive
+/// one. More than half a period of spread: `hi − lo > 2f·limit`, which at
+/// `f = 0.5` is exactly the old test — so this is *strictly stronger* than
+/// what it replaces and can only fire where that fired.
+///
+/// Only the extreme pair is tested. That is exhaustive rather than a shortcut:
+/// if any pair among the corners straddles, the widest pair's ends are at
+/// least as far either side of zero, so the extremes straddle too.
+///
+/// # What the fraction buys, and what it does not
+///
+/// Measured over fourteen archive volumes across six sites, sampled as the
+/// sampler itself samples — four-corner quads through [`VolumeSampler::column`]
+/// and two-rung pairs through [`Column::at_height_km`], 360 azimuths × 150 km:
+///
+/// | volume | quad fires, was → now | rung fires, was → now |
+/// |---|---|---|
+/// | KCRP 2021-08-01 | 0.277% → 0.102% | 0.099% → 0.014% |
+/// | KCRP 2021-12-31 | 1.181% → 0.574% | 0.578% → 0.126% |
+/// | KDMX 2025-01-01 clear air | 15.871% → 10.630% | 10.711% → 5.015% |
+/// | KFTG 2023-06-22 | 0.235% → 0.202% | 0.185% → 0.094% |
+/// | KLWX 2018-03-02 | 7.003% → 6.804% | 16.801% → 14.862% |
+/// | KTLX 2019-07-15 | 0.045% → 0.018% | 0.013% → 0.004% |
+/// | KMSX 2022-06-04 | 0.013% → 0.003% | 0.005% → 0.001% |
+///
+/// Scored against an independent oracle — a four-point continuity test on the
+/// surrounding field, which is *not* keyed on the pair and so cannot flatter a
+/// rule that is — this costs 0.6 points of fold recall on quads (99.63% →
+/// 99.05%, pooled over 41,899 oracle-confirmed folds) and 0.2 on rung pairs
+/// (99.93% → 99.77%). Neither rule ever fires on a pair the oracle can confirm
+/// is smooth shear; what both fire on is pairs the oracle calls *undecidable*,
+/// where neither reading is smooth and four numbers cannot say which.
+///
+/// **Two things this does not do, recorded so nobody re-derives them.** It
+/// does not empty the disputed population: on the clear-air volume it removes
+/// roughly half of it and leaves the rest, because a low Nyquist velocity
+/// (12.3 m/s there) makes ordinary boundary-layer shear comparable to the seam
+/// itself and no test on two numbers can separate the two. And the argument
+/// above — that a fold leaves both sides *near* the seam — assumes the pair's
+/// own true change is small next to `limit`, which holds between adjacent
+/// gates and holds far less well between adjacent *tilts* on a low-Nyquist
+/// coverage pattern, where the two rungs can be hundreds of metres apart. On
+/// that one population the fraction buys much less than it does elsewhere.
+///
+/// # The shape of the spread statistic, stated where it holds
+///
+/// On volumes that fold hard the spread is sharply bimodal — ordinary
+/// zero-crossings below `0.4·limit`, folds piled against `2·limit`, a valley
+/// around `1.2–1.6·limit` (KCRP 2017-08-26, quad spreads: 1961 counts in the
+/// lowest tenth, 27 in the `1.5` bin, 7913 in the `2.0` bin). That is *not*
+/// general. On the clear-air volume the histogram is broad and flat with no
+/// valley at all (155/182/244/206/209/170/185/169/176/173 across the first ten
+/// bins), and on the quiet KCRP 2021-08-01 volume it decays monotonically with
+/// no second mode. A threshold cannot be placed "in the valley" on a
+/// distribution that has none, which is the other half of why the argument
+/// here is about what folding *does* rather than about where the counts fall.
+fn straddles_fold(corners: &[Sample], limit: f64) -> bool {
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for corner in corners {
+        let value = f64::from(corner.value);
+        lo = lo.min(value);
+        hi = hi.max(value);
+    }
+    lo < -SEAM_PROXIMITY * limit && hi > SEAM_PROXIMITY * limit
+}
+
 /// Combine weighted corner samples.
 ///
 /// **Interpolation needs every corner to have measured something.** If any one
@@ -1173,15 +1469,36 @@ fn gate_sample(moment: &MomentData, gate: usize) -> Sample {
 ///   instead of being averaged out of existence, which is the reporting
 ///   `MomentValue::RangeFolded` never got from this crate before.
 ///
+/// `fold_limit` extends that last idea to corners that all *did* measure
+/// something. **A velocity pair straddling the Nyquist seam averages to a
+/// number neither gate saw, and the number it averages to reads as calm air:
+/// +24.50 and −24.50 m/s average to exactly 0.000, which is the display's word
+/// for "no motion" written over the display's word for "as fast as this radar
+/// can report".** Averaging cannot be rescued there — the seam is a
+/// discontinuity, and no weighted mean of two points on opposite sides of one
+/// lands near either. So a straddle falls through to the same heaviest-corner
+/// answer an echo edge gets, for the same stated reason: it fabricates
+/// nothing. See [`straddles_fold`] for how a straddle is recognised and what
+/// that recognition costs; `None` means this moment has no seam to straddle
+/// and restores the previous behaviour exactly.
+///
+/// **Heaviest means the largest bilinear weight — the *nearest* sample — not
+/// the largest magnitude.** Picking the fastest corner would bias every fold
+/// edge outward and turn this from an interpolation into a peak-hold; picking
+/// the nearest is ordinary nearest-neighbour resampling, which is what
+/// interpolation degrades to when interpolation is not defined.
+///
 /// Ties go to the earliest corner, so the result does not depend on iteration
 /// order.
-fn blend(kind: Blend, corners: &[Sample], weights: &[f64]) -> Sample {
+fn blend(kind: Blend, corners: &[Sample], weights: &[f64], fold_limit: Option<f64>) -> Sample {
     debug_assert_eq!(
         corners.len(),
         weights.len(),
         "every corner needs exactly one weight",
     );
-    if corners.iter().all(|c| c.status == SampleStatus::Value) {
+    if corners.iter().all(|c| c.status == SampleStatus::Value)
+        && !fold_limit.is_some_and(|limit| straddles_fold(corners, limit))
+    {
         let total: f64 = weights.iter().sum();
         if total > 0.0 {
             let mean = match kind {
@@ -2726,11 +3043,25 @@ mod tests {
     /// become a half turn.
     #[test]
     fn velocity_averages_arithmetically_and_phase_averages_on_the_circle() {
-        let alternating = |az: f64, _: f64| {
-            Some(if az.round() as i64 % 2 == 0 {
-                -20.0
+        // **±9 rather than ±20, and gate 0 held at 25.** A ±20 checkerboard in
+        // a sweep whose fastest gate is 20 m/s is, to anything reading only
+        // the data, a textbook Nyquist fold: adjacent radials spanning the
+        // whole observed range and changing sign. `straddles_fold` fires on it
+        // and is right to — no atmosphere produces that field — so the fixture
+        // is given an amplitude a real sweep can hold instead.
+        //
+        // The 25 m/s at gate 0 is what keeps this test honest: it arms the
+        // fold guard at 25 m/s, so the arithmetic mean asserted below is the
+        // guard *declining* on an 18 m/s step rather than the guard being
+        // switched off by `FOLD_LIMIT_FLOOR_MS`. The seam itself is pinned by
+        // `a_velocity_pair_across_the_nyquist_seam_takes_the_nearer_gate`.
+        let alternating = |az: f64, slant: f64| {
+            Some(if slant < gate_slant_km(1) {
+                25.0
+            } else if az.round() as i64 % 2 == 0 {
+                -9.0
             } else {
-                20.0
+                9.0
             })
         };
         let scan = Scan::new(
@@ -2739,13 +3070,19 @@ mod tests {
         );
         let sampler = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
         let mid = f64::from(sampler.column(0.5, 20.0).rungs()[0].sample.value().unwrap());
-        let arithmetic = 0.5 * (round_trip_vel(-20.0) + round_trip_vel(20.0));
+        assert_eq!(
+            sampler.rungs[0].fold_limit_ms,
+            Some(25.0),
+            "precondition: the fold guard is switched off for this sweep, so \
+             the mean below would pass even if the guard were over-eager",
+        );
+        let arithmetic = 0.5 * (round_trip_vel(-9.0) + round_trip_vel(9.0));
         assert!(
             (mid - arithmetic).abs() < 1e-4,
             "velocity halfway between {} and {} read {mid}, expected \
              {arithmetic}",
-            round_trip_vel(-20.0),
-            round_trip_vel(20.0),
+            round_trip_vel(-9.0),
+            round_trip_vel(9.0),
         );
 
         // Differential phase: 359° and 1° meet at 0°, not at 180°. Encoded
@@ -3693,47 +4030,810 @@ mod tests {
 
         // All values: a true weighted mean.
         assert_eq!(
-            blend(Blend::Arithmetic, &[v(10.0), v(20.0)], &[0.25, 0.75]).value(),
+            blend(Blend::Arithmetic, &[v(10.0), v(20.0)], &[0.25, 0.75], None).value(),
             Some(17.5),
         );
         // One corner missing: the heavier corner wins outright, with its own
         // value or its own status.
         assert_eq!(
-            blend(Blend::Arithmetic, &[v(10.0), folded], &[0.75, 0.25]),
+            blend(Blend::Arithmetic, &[v(10.0), folded], &[0.75, 0.25], None),
             v(10.0),
         );
         assert_eq!(
-            blend(Blend::Arithmetic, &[v(10.0), folded], &[0.25, 0.75]),
+            blend(Blend::Arithmetic, &[v(10.0), folded], &[0.25, 0.75], None),
             folded,
         );
         // Ties go to the earliest corner, so the answer does not depend on
         // iteration order.
         assert_eq!(
-            blend(Blend::Arithmetic, &[v(10.0), folded], &[0.5, 0.5]),
+            blend(Blend::Arithmetic, &[v(10.0), folded], &[0.5, 0.5], None),
             v(10.0),
         );
         assert_eq!(
-            blend(Blend::Arithmetic, &[folded, v(10.0)], &[0.5, 0.5]),
+            blend(Blend::Arithmetic, &[folded, v(10.0)], &[0.5, 0.5], None),
             folded,
         );
         // Two different reasons stay different rather than merging.
         assert_eq!(
-            blend(Blend::Arithmetic, &[below, folded], &[0.4, 0.6]),
+            blend(Blend::Arithmetic, &[below, folded], &[0.4, 0.6], None),
             folded,
         );
         assert_eq!(
-            blend(Blend::Arithmetic, &[below, folded], &[0.6, 0.4]),
+            blend(Blend::Arithmetic, &[below, folded], &[0.6, 0.4], None),
             below,
         );
         // Zero total weight cannot divide, and falls through to the same rule.
         assert_eq!(
-            blend(Blend::Arithmetic, &[v(10.0), v(20.0)], &[0.0, 0.0]),
+            blend(Blend::Arithmetic, &[v(10.0), v(20.0)], &[0.0, 0.0], None),
             v(10.0),
         );
         // Degenerate input answers rather than panicking.
         assert_eq!(
-            blend(Blend::Arithmetic, &[], &[]).status(),
+            blend(Blend::Arithmetic, &[], &[], None).status(),
             SampleStatus::NoCoverage,
+        );
+    }
+
+    // ── The Nyquist seam ────────────────────────────────────────────────────
+
+    /// **The measurement that started this: +24.50 and −24.50 m/s averaged to
+    /// exactly 0.000.**
+    ///
+    /// Nothing about that number is a rounding artefact to be waved away. It
+    /// is the display's word for calm air, written over the one place the
+    /// radar reported flow as fast as it can report — and it is stated here as
+    /// an exact equality on the old behaviour so that a future change which
+    /// merely makes the fabrication *small* cannot pass.
+    #[test]
+    fn a_velocity_pair_across_the_nyquist_seam_takes_the_nearer_gate() {
+        let (out, back) = (Sample::found(24.5), Sample::found(-24.5));
+        let limit = 24.5;
+
+        // precondition: without a limit — which is every other moment, and
+        // this moment before the fix — the answer is the fabricated calm.
+        assert_eq!(
+            blend(Blend::Arithmetic, &[out, back], &[0.5, 0.5], None).value(),
+            Some(0.0),
+            "precondition: the arithmetic mean of ±24.50 is not 0.000, so this \
+             test is no longer standing on the defect it was written for",
+        );
+
+        // With the seam known, the nearer gate answers verbatim.
+        assert_eq!(
+            blend(Blend::Arithmetic, &[out, back], &[0.5, 0.5], Some(limit)).value(),
+            Some(24.5),
+        );
+        assert_eq!(
+            blend(Blend::Arithmetic, &[back, out], &[0.5, 0.5], Some(limit)).value(),
+            Some(-24.5),
+            "the tie goes to the earliest corner here too, so the seam rule \
+             did not smuggle in an order dependence",
+        );
+        assert_eq!(
+            blend(Blend::Arithmetic, &[out, back], &[0.3, 0.7], Some(limit)).value(),
+            Some(-24.5),
+        );
+
+        // **Heaviest is the nearest sample, not the fastest one.** With the
+        // near corner at +18 and the far one at −24.5, a "largest magnitude"
+        // reading of the rule would answer −24.5 and turn every fold edge into
+        // a peak-hold. Both corners sit outside `SEAM_PROXIMITY · 24.5`, so
+        // the guard really does fire and the answer really is a choice.
+        let near_side = [Sample::found(18.0), Sample::found(-24.5)];
+        assert!(
+            straddles_fold(&near_side, limit),
+            "precondition: the guard does not fire on this pair, so the answer \
+             below is an ordinary mean and says nothing about heaviest",
+        );
+        assert_eq!(
+            blend(Blend::Arithmetic, &near_side, &[0.7, 0.3], Some(limit)).value(),
+            Some(18.0),
+            "the heaviest corner is the nearest one, not the fastest one",
+        );
+
+        // The four-corner bilinear is the same rule: one straddling pair among
+        // the corners is enough, wherever in the quad it sits.
+        assert_eq!(
+            blend(
+                Blend::Arithmetic,
+                &[out, out, out, back],
+                &[0.4, 0.2, 0.2, 0.2],
+                Some(limit),
+            )
+            .value(),
+            Some(24.5),
+        );
+    }
+
+    /// The straddle test asks where each extreme sits, not how far apart the
+    /// two are — so it is a box around the seam and not a band on the spread,
+    /// and the difference between those two shapes is the whole point.
+    #[test]
+    fn the_straddle_test_needs_both_extremes_near_the_seam() {
+        let s = |a: f64, b: f64, limit: f64| {
+            straddles_fold(&[Sample::found(a as f32), Sample::found(b as f32)], limit)
+        };
+
+        // Same sign is a ramp, never a fold — however wide.
+        assert!(!s(2.0, 40.0, 20.0), "a same-sign ramp is not a fold");
+        assert!(!s(-2.0, -40.0, 20.0));
+
+        // Opposite signs but nowhere near the seam: an ordinary zero crossing,
+        // which is the zero isodop and must keep interpolating smoothly.
+        assert!(
+            !s(2.0, -2.0, 20.0),
+            "an ordinary zero crossing is not a fold"
+        );
+        assert!(!s(9.0, -9.0, 20.0));
+
+        // Each extreme is tested on its own side. Exactly on the bound does
+        // not fire; the tie is broken towards interpolating.
+        assert!(!s(10.0, -10.0, 20.0), "the bound itself does not fire");
+        assert!(!s(10.001, -10.0, 20.0), "one end past it is not enough");
+        assert!(!s(10.0, -10.001, 20.0), "nor is the other end alone");
+        assert!(s(10.001, -10.001, 20.0), "both ends past it does");
+
+        // **The pair that the old spread-only rule got wrong.** −5 and +25
+        // against a 20 m/s limit spread by 30, which clears a whole fold
+        // period, and change sign — so the old rule called it a fold. It
+        // cannot be one: a single wrap of a smooth field leaves *both* sides
+        // near ±20, and −5 is a quarter of the way in.
+        assert!(
+            !s(25.0, -5.0, 20.0),
+            "a wide straddle with one end deep inside the range is shear, not \
+             a fold — this is the case the spread test could not see",
+        );
+        assert!(!s(5.0, -25.0, 20.0), "and the same the other way round");
+
+        // A real fold: piled against the ±limit seam.
+        assert!(s(19.5, -19.5, 20.0));
+
+        // A corner of exactly zero is on no side of the seam.
+        assert!(!s(0.0, -24.5, 12.0), "zero is not the far side of a seam");
+
+        // Strictly stronger than the rule it replaces: everything that fires
+        // here would have fired under sign-change-plus-spread, and the
+        // converse fails, which the `25.0, -5.0` case above is.
+        for a in -60..=60 {
+            for b in -60..=60 {
+                let (a, b) = (f64::from(a) * 0.5, f64::from(b) * 0.5);
+                let (lo, hi) = (a.min(b), a.max(b));
+                let old = lo < 0.0 && hi > 0.0 && hi - lo > 20.0;
+                assert!(
+                    !s(a, b, 20.0) || old,
+                    "{a} and {b} fire under the seam rule but not under the \
+                     spread rule, so the new rule is not strictly stronger",
+                );
+            }
+        }
+    }
+
+    /// **The vertical lerp is the total case: a two-corner blend at `t = 0.5`
+    /// of `±v` is identically zero, so every fold-straddling rung pair halfway
+    /// up fabricates.**
+    ///
+    /// Measured over fourteen volumes, 12,903 of the 12,918 rung pairs an
+    /// independent continuity oracle confirms as folds — 99.9% — average to
+    /// less than a quarter of the sweep's Nyquist velocity. The horizontal fix
+    /// alone *raises* the vertical count, because unsmeared fold structure
+    /// then survives to reach this stage.
+    ///
+    /// (An earlier version of this note claimed 94.9% at KLWX-2018 against 97%
+    /// of straddling gate pairs. Neither number reproduces; see
+    /// [`Column::at_height_km`] for the withdrawal.)
+    #[test]
+    fn the_vertical_lerp_does_not_average_two_tilts_across_the_seam() {
+        let scan = Scan::new(
+            vcp(&[0.5, 4.5]),
+            vec![
+                make_sweep(1, 0.5, 360, 200, None, Some(&|_, _| Some(24.5))),
+                make_sweep(2, 4.5, 360, 200, None, Some(&|_, _| Some(-24.5))),
+            ],
+        );
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
+        let column = sampler.column(90.0, 30.0);
+        let rungs = column.rungs();
+        assert_eq!(rungs.len(), 2, "precondition: two rungs to lerp between");
+        assert_eq!(rungs[0].sample.value(), Some(24.5));
+        assert_eq!(rungs[1].sample.value(), Some(-24.5));
+        assert_eq!(
+            rungs[0].fold_limit_ms,
+            Some(24.5),
+            "precondition: the seam was measured off the sweep, so the guard \
+             is armed rather than silently absent",
+        );
+
+        // Exactly halfway: `t = 0.5`, where the mean of ±24.5 is zero.
+        let mid = 0.5 * (rungs[0].height_km + rungs[1].height_km);
+        let sample = column.at_height_km(mid);
+        let value = sample.value().expect("both rungs measured");
+        assert!(
+            value == 24.5 || value == -24.5,
+            "the midpoint between a +24.50 tilt and a −24.50 tilt read \
+             {value}, which is a speed neither tilt measured",
+        );
+
+        // And the whole span between the rungs stays on measured speeds
+        // rather than sweeping through calm air on its way over.
+        for step in 0..=100 {
+            let t = f64::from(step) / 100.0;
+            let h = rungs[0].height_km + t * (rungs[1].height_km - rungs[0].height_km);
+            let v = column.at_height_km(h).value().expect("inside the ladder");
+            assert!(
+                v == 24.5 || v == -24.5,
+                "t={t}: the vertical lerp read {v} between two tilts that \
+                 measured only ±24.50",
+            );
+        }
+    }
+
+    /// The end-to-end horizontal path: a fold seam in range, sampled through
+    /// the real bilinear rather than through [`blend`] alone.
+    ///
+    /// This is the test that pins the *plumbing* — that velocity actually
+    /// reaches [`blend`] with a limit. A fix living entirely inside `blend`
+    /// with nothing wired to it would pass every unit test above and change
+    /// nothing a caller can see.
+    #[test]
+    fn a_fold_seam_in_range_never_reads_as_calm_air() {
+        // +24.5 out to 10 km, −24.5 beyond: the seam sits between two gates.
+        let seam_km = 10.0;
+        let scan = Scan::new(
+            vcp(&[0.5]),
+            vec![make_sweep(
+                1,
+                0.5,
+                360,
+                200,
+                None,
+                Some(&move |_, slant| Some(if slant < seam_km { 24.5 } else { -24.5 })),
+            )],
+        );
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
+
+        let mut crossed = false;
+        let mut previous = None;
+        for step in 0..4000 {
+            // Fine enough to land inside the one gate interval the seam
+            // occupies, from both sides.
+            let ground_km = 5.0 + f64::from(step) * 0.0025;
+            let sample = sampler.column(90.0, ground_km).rungs()[0].sample;
+            let Some(value) = sample.value() else {
+                continue;
+            };
+            assert!(
+                value == 24.5 || value == -24.5,
+                "{ground_km} km read {value} m/s across a seam whose two sides \
+                 measured only ±24.50",
+            );
+            if previous.is_some_and(|p| p != value) {
+                crossed = true;
+            }
+            previous = Some(value);
+        }
+        assert!(
+            crossed,
+            "precondition: the swept range never crossed the seam, so this \
+             test never exercised the blend it was written for",
+        );
+    }
+
+    /// **The band where the answer actually changed: a spread of 1.0–1.5 fold
+    /// limits.** Between 40% and 60% of the guard's real fires land here, and
+    /// before this test nothing exercised it through the integrated path at
+    /// all — the fixtures either straddled at `±limit` (ratio 2.0, unambiguous
+    /// fold) or crossed gently (ratio 0.04–0.72, unambiguous shear).
+    ///
+    /// +25.0 m/s inbound of 10 km and −5.0 m/s beyond it, on a sweep that
+    /// folds at 25.0. The spread is 30.0 — **1.2 fold limits**, so it changes
+    /// sign and clears a whole period, and the rule this replaces called it a
+    /// fold and answered with one endpoint or the other. It cannot be one: a
+    /// single wrap of a smooth field leaves both sides within the pair's own
+    /// true change of ±25, and −5.0 is a fifth of the way in. It is an echo
+    /// boundary with strong shear across it, and it must interpolate.
+    #[test]
+    fn a_wide_zero_crossing_in_the_disputed_band_still_interpolates() {
+        let (fast, slow, seam_km) = (25.0f32, -5.0f32, 10.0);
+        let scan = Scan::new(
+            vcp(&[0.5]),
+            vec![make_sweep(
+                1,
+                0.5,
+                360,
+                200,
+                None,
+                Some(&move |_, slant| {
+                    Some(if slant < seam_km {
+                        f64::from(fast)
+                    } else {
+                        f64::from(slow)
+                    })
+                }),
+            )],
+        );
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
+        let limit = sampler.rungs[0]
+            .fold_limit_ms
+            .expect("precondition: the sweep claimed no seam, so nothing below could misfire");
+        assert_eq!(limit, 25.0);
+
+        // precondition: this pair really is in the disputed band, and the rule
+        // being replaced really did fire on it. Without both, a pass below
+        // says nothing — the test would be standing on a case no detector
+        // ever disagreed about.
+        let pair = [Sample::found(fast), Sample::found(slow)];
+        let (lo, hi) = (f64::from(slow), f64::from(fast));
+        let ratio = (hi - lo) / limit;
+        assert!(
+            (1.0..1.5).contains(&ratio),
+            "precondition: the spread ratio is {ratio}, outside the 1.0–1.5 \
+             band this test exists to cover",
+        );
+        assert!(
+            lo < 0.0 && hi > 0.0 && hi - lo > limit,
+            "precondition: the sign-change-and-spread rule does not fire here, \
+             so this test cannot observe its removal",
+        );
+        assert!(
+            !straddles_fold(&pair, limit),
+            "a straddle with one end a fifth of the way into the range was \
+             read as a fold",
+        );
+
+        // And through the real bilinear: crossing the boundary must visit
+        // speeds between the two sides rather than stepping from one to the
+        // other.
+        let mut between = 0;
+        let mut saw_fast = false;
+        let mut saw_slow = false;
+        for step in 0..4000 {
+            let ground_km = 5.0 + f64::from(step) * 0.0025;
+            let Some(value) = sampler.column(90.0, ground_km).rungs()[0].sample.value() else {
+                continue;
+            };
+            assert!(
+                (slow..=fast).contains(&value),
+                "{ground_km} km read {value} m/s, outside the two speeds either \
+                 side of the boundary",
+            );
+            if value == fast {
+                saw_fast = true;
+            } else if value == slow {
+                saw_slow = true;
+            } else {
+                between += 1;
+            }
+        }
+        assert!(
+            saw_fast && saw_slow,
+            "precondition: the swept range never crossed the boundary",
+        );
+        assert!(
+            between > 20,
+            "only {between} samples fell between {fast} and {slow}; the \
+             boundary is being resampled rather than interpolated",
+        );
+    }
+
+    /// **A gentle zero crossing is resampled by nobody: it is interpolated,
+    /// gate by gate, across the whole ramp.** The zero isodop is where the
+    /// flow is perpendicular to the beam and the field genuinely passes
+    /// through zero, and it is the most-read feature of a velocity display.
+    ///
+    /// # What this test can and cannot catch — read before trusting the name
+    ///
+    /// The ramp below steps 1 m/s per quad against a measured limit of
+    /// 24.5 m/s, a spread ratio of **0.041**. So it refuses a detector keyed
+    /// on sign alone, and it refuses any threshold below about 4% of the fold
+    /// limit, and that is the whole of its reach — it does not appear in the
+    /// kill list of any mutation that moves the threshold within the range a
+    /// threshold could plausibly take. An earlier version of this comment
+    /// claimed it refused "any threshold small enough to catch a gentle
+    /// crossing", which is not a claim its fixture supports.
+    ///
+    /// The tests that do resolve the detector's boundary are
+    /// [`velocity_averages_arithmetically_and_phase_averages_on_the_circle`]
+    /// at a ratio of 0.72, [`the_straddle_test_needs_both_extremes_near_the_seam`]
+    /// on the rule itself, and
+    /// [`a_wide_zero_crossing_in_the_disputed_band_still_interpolates`]
+    /// through the integrated path. A smooth ramp cannot be one of them: to
+    /// put the pair bracketing zero at the rule's own bound the ramp would
+    /// have to step a whole fold limit per gate, which is not a ramp.
+    #[test]
+    fn a_gentle_zero_crossing_interpolates_gate_by_gate() {
+        // −24.5 m/s inbound at the first gate ramping to +24.5 outbound at
+        // gate 49: 4 m/s per km, which is **1 m/s per gate — two quantisation
+        // steps** — so consecutive gates really do differ, and the pair either
+        // side of zero reads −0.5 and +0.5 rather than 0 and 0. That slope is
+        // 0.004 s⁻¹, an entirely ordinary shear, and the sweep's measured
+        // limit is 24.5 m/s: the guard is armed, well clear of the floor, and
+        // genuinely has the chance to misfire on every gate of the ramp.
+        let ramp = |slant: f64| -24.5 + (slant - gate_slant_km(0)) * 4.0;
+        let scan = Scan::new(
+            vcp(&[0.5]),
+            vec![make_sweep(
+                1,
+                0.5,
+                360,
+                50,
+                None,
+                Some(&move |_, slant| Some(ramp(slant))),
+            )],
+        );
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
+
+        // precondition: the guard is armed, so a pass here is the detector
+        // declining to fire rather than the detector being switched off.
+        assert_eq!(
+            sampler.rungs[0].fold_limit_ms,
+            Some(24.5),
+            "precondition: this sweep's seam was not measured, so nothing \
+             below could have misfired anyway",
+        );
+
+        // Halfway between the two gates that bracket zero, the answer is their
+        // arithmetic mean and *not* either endpoint — which is exactly what a
+        // detector firing here would destroy.
+        let decode = |j: usize| {
+            f64::from((f32::from(encode_vel(ramp(gate_slant_km(j)))) - VEL_OFFSET) / VEL_SCALE)
+        };
+        let (near, far) = (decode(24), decode(25));
+        assert!(
+            near < 0.0 && far > 0.0,
+            "precondition: gates 24 and 25 read {near} and {far}, which do \
+             not bracket zero, so this test is not standing on a crossing",
+        );
+        assert_eq!(
+            blend(
+                Blend::Arithmetic,
+                &[Sample::found(near as f32), Sample::found(far as f32)],
+                &[0.5, 0.5],
+                Some(24.5),
+            )
+            .value(),
+            Some(((near + far) / 2.0) as f32),
+            "a gentle zero crossing was taken for a fold and went blocky",
+        );
+
+        // And across the whole ramp the sampled profile stays monotone and
+        // visits values between the gate centres, which a blocky read cannot.
+        let mut seen_between = 0;
+        let mut previous = f32::NEG_INFINITY;
+        for step in 0..2000 {
+            let ground_km = 2.5 + f64::from(step) * 0.0055;
+            let Some(value) = sampler.column(90.0, ground_km).rungs()[0].sample.value() else {
+                continue;
+            };
+            assert!(
+                value >= previous - 1e-4,
+                "the ramp reversed at {ground_km} km: {previous} then {value}",
+            );
+            // A value strictly between two encoded gate centres — the 0.5 m/s
+            // quantum — can only come from interpolating.
+            if (f64::from(value) * 2.0).fract().abs() > 1e-6 {
+                seen_between += 1;
+            }
+            previous = value;
+        }
+        assert!(
+            seen_between > 1000,
+            "only {seen_between} of ~2000 samples fell between gate centres; \
+             the ramp is being resampled rather than interpolated",
+        );
+    }
+
+    /// Below [`FOLD_LIMIT_FLOOR_MS`] the guard is off, because a sweep that
+    /// saw nothing fast has no measured seam to trust — and the lerp over such
+    /// a sweep really does come back with the plain mean, which this computes
+    /// rather than implies.
+    #[test]
+    fn a_sweep_too_slow_to_have_folded_keeps_its_plain_mean() {
+        let quiet = make_sweep(1, 0.5, 360, 200, None, Some(&|_, _| Some(3.0)));
+        let scan = Scan::new(vcp(&[0.5]), vec![quiet]);
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
+        assert_eq!(
+            sampler.rungs[0].fold_limit_ms, None,
+            "3 m/s is below the {FOLD_LIMIT_FLOOR_MS} m/s floor, so no seam \
+             should have been claimed for this sweep",
+        );
+
+        // **The mean the name promises.** Two tilts at ±7.5 m/s — the fastest
+        // pair that still leaves both sweeps under the floor — lerp to 0.0 at
+        // the midpoint. That number is the one the whole change exists to
+        // refuse *when there is a seam*, and here there is not, so it must
+        // survive: with the floor at 7.0 instead of 8.0 both sweeps would arm
+        // at 7.5, `±7.5` clears `SEAM_PROXIMITY · 7.5` at both ends, and this
+        // would read ±7.5 rather than nothing.
+        let scan = Scan::new(
+            vcp(&[0.5, 4.5]),
+            vec![
+                make_sweep(1, 0.5, 360, 200, None, Some(&|_, _| Some(7.5))),
+                make_sweep(2, 4.5, 360, 200, None, Some(&|_, _| Some(-7.5))),
+            ],
+        );
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
+        assert_eq!(sampler.rungs[0].fold_limit_ms, None);
+        assert_eq!(sampler.rungs[1].fold_limit_ms, None);
+        let column = sampler.column(90.0, 30.0);
+        let rungs = column.rungs();
+        assert_eq!(rungs[0].sample.value(), Some(7.5));
+        assert_eq!(rungs[1].sample.value(), Some(-7.5));
+        let mid = 0.5 * (rungs[0].height_km + rungs[1].height_km);
+        let value = column.at_height_km(mid).value().expect("both measured");
+        assert!(
+            value.abs() < 1e-6,
+            "with no seam measured the vertical lerp is a plain mean, and \
+             halfway between +7.5 and −7.5 that is 0.0 — this read {value}, \
+             which is a corner rather than a mean",
+        );
+
+        // The same sweep one step over the floor does arm the guard, so the
+        // floor is a threshold rather than a switch that is always off.
+        let fast = make_sweep(1, 0.5, 360, 200, None, Some(&|_, _| Some(8.0)));
+        let scan = Scan::new(vcp(&[0.5]), vec![fast]);
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
+        assert_eq!(sampler.rungs[0].fold_limit_ms, Some(8.0));
+
+        // And the two numbers mean the same thing in both modules.
+        assert_eq!(
+            FOLD_LIMIT_FLOOR_MS, 8.0,
+            "the floor moved away from the one `nrot` abandons dealiasing at",
+        );
+    }
+
+    /// **One rung with a measured seam and one without still guards the lerp.**
+    ///
+    /// [`Column::at_height_km`] takes the tighter of the two limits when both
+    /// rungs have one and falls back to whichever exists when only one does.
+    /// That fallback arm — `(a, b) => a.or(b)` — is reachable and was
+    /// unpinned: replacing it with `None` left every other velocity test
+    /// passing, because every other fixture arms both rungs.
+    ///
+    /// The shape is real rather than contrived. A clear-air coverage pattern
+    /// folds at around 12.5 m/s; a higher cut of the same volume looking at
+    /// slow air can report nothing over [`FOLD_LIMIT_FLOOR_MS`] and so claims
+    /// no seam at all, while the cut below it folds.
+    #[test]
+    fn a_lerp_between_one_measured_seam_and_one_unmeasured_still_guards() {
+        for (low, high, expect_lo, expect_hi) in
+            [(12.5, -7.5, 12.5f32, -7.5f32), (7.5, -12.5, 7.5, -12.5)]
+        {
+            let scan = Scan::new(
+                vcp(&[0.5, 4.5]),
+                vec![
+                    make_sweep(1, 0.5, 360, 200, None, Some(&move |_, _| Some(low))),
+                    make_sweep(2, 4.5, 360, 200, None, Some(&move |_, _| Some(high))),
+                ],
+            );
+            let sampler = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
+            // precondition: exactly one rung claims a seam, so this really is
+            // the one-sided arm and not the `min` of two.
+            let claimed: Vec<_> = sampler
+                .rungs
+                .iter()
+                .map(|r| r.fold_limit_ms)
+                .filter(|l| l.is_some())
+                .collect();
+            assert_eq!(
+                claimed.len(),
+                1,
+                "precondition: {low}/{high} armed {} rungs, so this fixture \
+                 does not exercise the one-sided arm",
+                claimed.len(),
+            );
+
+            let column = sampler.column(90.0, 30.0);
+            let rungs = column.rungs();
+            assert_eq!(rungs[0].sample.value(), Some(expect_lo));
+            assert_eq!(rungs[1].sample.value(), Some(expect_hi));
+            let mid = 0.5 * (rungs[0].height_km + rungs[1].height_km);
+            let value = column
+                .at_height_km(mid)
+                .value()
+                .expect("both rungs measured");
+            assert!(
+                value == expect_lo || value == expect_hi,
+                "the midpoint between {expect_lo} and {expect_hi} read {value}, \
+                 so the one rung that measured a seam did not reach the lerp",
+            );
+        }
+    }
+
+    /// Which moments have a seam at all, stated once and exhaustively.
+    #[test]
+    fn velocity_is_the_only_moment_with_an_unstated_fold_limit() {
+        for &product in RadarProduct::all() {
+            let expected = product == RadarProduct::Velocity;
+            assert_eq!(
+                Blend::folds_at_measured_limit(product),
+                expected,
+                "{product:?}",
+            );
+        }
+        // Spectrum width is the near miss: it is a Doppler moment off the same
+        // sweep, so it looks like velocity — but it is a non-negative spread,
+        // so no two of its gates can sit on opposite sides of a seam and
+        // `straddles_fold` could never fire on it even if it were armed.
+        assert!(!Blend::folds_at_measured_limit(RadarProduct::SpectrumWidth));
+        // Differential phase does wrap, and is handled by a blend arm instead,
+        // because 360° is a constant the format does not have to carry.
+        assert!(!Blend::folds_at_measured_limit(
+            RadarProduct::DifferentialPhase
+        ));
+        assert_eq!(
+            Blend::for_moment(RadarProduct::DifferentialPhase),
+            Blend::Angular360,
+        );
+        // Nothing but velocity pays for the measuring pass.
+        let scan = Scan::new(vcp(&[0.5]), vec![flat_refl_sweep(1, 0.5, 360, 40, 20.0)]);
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
+        assert_eq!(sampler.rungs[0].fold_limit_ms, None);
+    }
+
+    /// The limit is read per rung, because the Nyquist velocity follows the
+    /// cut's PRF and genuinely differs inside one volume.
+    #[test]
+    fn each_rung_measures_its_own_seam_and_the_lerp_takes_the_tighter_one() {
+        // **The two sweeps must differ in their limits *and* read something
+        // other than those limits where they are sampled**, or `min` and `max`
+        // cannot be told apart. Two flat sweeps can never separate them: a
+        // flat sweep's limit is the speed it reads, so an opposite-sign pair
+        // always differs by `l0 + l1`, which clears the larger limit too. So
+        // the high tilt reads −11 where it is sampled while folding at 30
+        // somewhere else — which is exactly the real shape, a cut whose PRF
+        // sets a seam far above anything in this particular column.
+        let low = make_sweep(1, 0.5, 360, 200, None, Some(&|_, _| Some(11.5)));
+        let high = make_sweep(
+            2,
+            4.5,
+            360,
+            200,
+            None,
+            Some(&|_, slant| {
+                Some(if slant < gate_slant_km(1) {
+                    30.0
+                } else {
+                    -11.0
+                })
+            }),
+        );
+        let scan = Scan::new(vcp(&[0.5, 4.5]), vec![low, high]);
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
+        assert_eq!(sampler.rungs[0].fold_limit_ms, Some(11.5));
+        assert_eq!(sampler.rungs[1].fold_limit_ms, Some(30.0));
+
+        // +11.5 and −11.0 differ by 22.5, which clears the *smaller* limit and
+        // not the larger. Testing against the larger would miss this straddle
+        // entirely, so this pins the `min` and not merely that some limit was
+        // reaching the lerp.
+        let pair = [Sample::found(11.5), Sample::found(-11.0)];
+        assert!(straddles_fold(&pair, 11.5), "the tighter seam is crossed");
+        assert!(
+            !straddles_fold(&pair, 30.0),
+            "precondition: the wider limit also fires here, so this fixture \
+             cannot tell `min` from `max`",
+        );
+
+        let column = sampler.column(90.0, 30.0);
+        let rungs = column.rungs();
+        assert_eq!(rungs[0].sample.value(), Some(11.5));
+        assert_eq!(rungs[1].sample.value(), Some(-11.0));
+        let mid = 0.5 * (rungs[0].height_km + rungs[1].height_km);
+        let value = column.at_height_km(mid).value().expect("both measured");
+        assert!(
+            value == 11.5 || value == -11.0,
+            "the lerp read {value} between rungs measuring +11.5 and −11.0, so \
+             it used the wider limit and averaged across the tighter seam",
+        );
+    }
+
+    /// The estimator reads the same numbers [`gate_sample`] does, off the same
+    /// bytes, including the encodings that make a reimplementation wrong.
+    #[test]
+    fn the_fold_limit_is_the_fastest_speed_the_sweep_actually_reports() {
+        // A field whose extreme is planted at one known gate, so a scan that
+        // stopped early or skipped the status codes reads differently.
+        let field = |_: f64, slant: f64| {
+            Some(if (slant - gate_slant_km(150)).abs() < 1e-9 {
+                -31.5
+            } else if (slant - gate_slant_km(3)).abs() < 1e-9 {
+                28.0
+            } else {
+                4.0
+            })
+        };
+        let sweep = make_sweep(1, 0.5, 360, 200, None, Some(&field));
+        let radials = sweep.radials();
+        assert_eq!(
+            estimate_fold_limit(radials, MomentSlot::Velocity),
+            Some(31.5),
+            "the estimate is the largest |speed| in the sweep, whichever sign \
+             it has and wherever in the radial it sits",
+        );
+
+        // Brute force over every gate, as the definition rather than the
+        // implementation: the affine shortcut must agree with it exactly.
+        let mut brute = 0.0f64;
+        for radial in radials {
+            let moment = MomentSlot::Velocity.read(radial).unwrap();
+            for gate in 0..moment.raw_values().len() {
+                let sample = gate_sample(moment, gate);
+                if sample.status == SampleStatus::Value {
+                    brute = brute.max(f64::from(sample.value).abs());
+                }
+            }
+        }
+        assert_eq!(brute, 31.5);
+
+        // **The status codes, planted as raw bytes.** Every fixture above
+        // encodes through `encode_vel`, which clamps to 2..=255 and so can
+        // never produce a 0 or a 1 — meaning no fixture above can catch an
+        // estimator that reads the status codes as speeds. Raw 0 decodes to
+        // −64.5 m/s and raw 1 to −64.0 under this encoding, so an estimator
+        // that admitted either would claim a seam nearly three times the real
+        // one and switch the guard off in practice.
+        let coded = Radial::new(
+            0,
+            0,
+            0.0,
+            1.0,
+            RadialStatus::IntermediateRadialData,
+            1,
+            0.5,
+            None,
+            Some(moment_from(
+                vec![0, 1, 2, encode_vel(24.5), encode_vel(-20.0), 1, 0],
+                VEL_SCALE,
+                VEL_OFFSET,
+            )),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            gate_sample(MomentSlot::Velocity.read(&coded).unwrap(), 0).status(),
+            SampleStatus::BelowThreshold,
+            "precondition: raw 0 is not the below-threshold code here",
+        );
+        assert_eq!(
+            gate_sample(MomentSlot::Velocity.read(&coded).unwrap(), 1).status(),
+            SampleStatus::RangeFolded,
+            "precondition: raw 1 is not the range-folded code here",
+        );
+        // **Raw 2 is the boundary the filter is actually written at, and it is
+        // an admitted value, not a code.** Planting 0 and 1 alone only shows
+        // that the filter is at least as strict as `>= 2`; a filter one step
+        // stricter still passes. Raw 2 decodes to −63.5 m/s here — larger than
+        // anything else in the radial — so admitting it and skipping it give
+        // different answers, and the estimate below distinguishes all three
+        // neighbouring filters at once: `>= 3` reads 24.5, `>= 2` reads 63.5,
+        // `>= 1` reads 64.0 and `>= 0` reads 64.5.
+        assert_eq!(
+            gate_sample(MomentSlot::Velocity.read(&coded).unwrap(), 2),
+            Sample::found(-63.5),
+            "precondition: raw 2 is not the first admitted code here, so it \
+             cannot pin the filter's boundary",
+        );
+        assert_eq!(
+            estimate_fold_limit(std::slice::from_ref(&coded), MomentSlot::Velocity),
+            Some(63.5),
+            "the estimate does not run from the first admitted code to the last",
+        );
+
+        // A sweep of nothing but below-threshold gates claims no seam at all
+        // rather than a seam of zero.
+        let empty = make_sweep(1, 0.5, 360, 200, None, Some(&|_, _| None));
+        assert_eq!(
+            estimate_fold_limit(empty.radials(), MomentSlot::Velocity),
+            None,
+        );
+        // And a sweep with no velocity moment at all does the same.
+        let refl = flat_refl_sweep(1, 0.5, 360, 40, 20.0);
+        assert_eq!(
+            estimate_fold_limit(refl.radials(), MomentSlot::Velocity),
+            None,
         );
     }
 
