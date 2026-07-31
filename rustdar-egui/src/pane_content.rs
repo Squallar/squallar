@@ -361,25 +361,42 @@ pub struct VolumeStamp {
 /// against a map pane full of echo, and only the tilt-curve refusal made it
 /// visible at all.
 ///
-/// [`tilts`](Self::tilts) is the missing input. It is the number of distinct
-/// elevation angles the UI knows this moment has, from
-/// `ScanInfo::product_elevations` — the *same* number
-/// [`tilt_curves`](crate::ui_section_pane) refuses to draw a ladder against when
-/// it disagrees with `SectionAxes::tilt_count`. So the key moves exactly when the
-/// thing that would make the picture wrong moves, and no more often than that:
+/// [`sweeps`](Self::sweeps) is the missing input: how many sweeps of the volume
+/// carried this moment when the cut was dispatched. It is counted **off the
+/// `Scan` the cut is made from**, and that is the load-bearing part of the
+/// choice rather than an implementation detail.
 ///
-/// * It is **monotonic within a volume** (`Gui::apply_chunk_scan_info` merges
-///   angles in and never removes one) and replaced wholesale at the volume
-///   boundary, so it is a growth discriminator rather than something that churns.
-/// * It changes **at most once per elevation cut**, not once per chunk. That
-///   matters because `RenderDispatcher::section_input` is keyed on the same
-///   fields, and a per-chunk discriminator would re-extract the ~15 MB volume
-///   payload every few seconds instead of once per new tilt.
+/// The obvious alternative — the number of distinct elevation angles the UI
+/// knows about, from `ScanInfo::product_elevations` — was tried first and is
+/// **wrong, for a reason that only shows up on the second volume of a session**.
+/// `Gui::apply_chunk_scan_info` *merges* angles into the pane's existing set and
+/// never removes one, and the set is only replaced wholesale when a volume
+/// completes. So after the first complete volume the pane already knows all
+/// fourteen of the VCP's angles, the next volume's chunks add nothing new to it,
+/// and the count is a constant for the rest of the session — reproducing the
+/// exact bug it was meant to fix, one volume later. Verified live: it grew
+/// 1 → 2 → 3 on a cold start and then sat at 16 for every volume after.
+///
+/// A sweep count off the `Scan` has none of that. It resets with the volume
+/// because the `Scan` does, and it moves for every kind of growth a section can
+/// show:
+///
+/// * **A new elevation**, which adds a rung to the ladder.
+/// * **A SAILS repeat of an angle already in the ladder**, which does not add a
+///   rung but does change which sweep that rung is *made of* —
+///   `VolumeSampler::build` chooses newest-first — and that rung is the lowest
+///   one, which is the part of a severe-weather section most worth being current.
+///
+/// It is bounded by the sweeps in a volume (~14–23), not by chunks (~100), which
+/// is what keeps `RenderDispatcher::section_input` from re-extracting the ~15 MB
+/// volume payload every few seconds. And it counts only the sweeps carrying
+/// *this* moment — precisely the set `RenderInput::extract_volume` copies — so
+/// the key and the payload cannot describe different things.
 ///
 /// It is deliberately **not** on [`VolumeStamp`], which [`VolumeTarget`] also
 /// uses: a 3D volume grid must be built from a complete volume and must not
 /// rebuild mid-flight, so widening the shared stamp would have paid for this fix
-/// with a 155 ms voxel rebuild per cut.
+/// with a 155 ms voxel rebuild per sweep.
 ///
 /// `PartialEq` is derived, floats and all, and that is deliberate: this compares
 /// a stored key against a stored key, never against a re-derived value, so
@@ -395,10 +412,11 @@ pub struct SectionTarget {
     /// structure to slice — so this is narrower than the pane's product picker.
     pub product: RadarProduct,
     pub line: SectionLine,
-    /// How many distinct elevation angles the UI knew this moment had when the
-    /// cut was dispatched. See the type's docs: this is what makes a live volume
-    /// that is still filling re-cut as it fills.
-    pub tilts: usize,
+    /// How many sweeps of the volume carried this moment when the cut was
+    /// dispatched. See the type's docs: this is what makes a live volume that is
+    /// still filling re-cut as it fills, and why it is counted off the `Scan`
+    /// rather than off the pane's accumulated `ScanInfo`.
+    pub sweeps: usize,
 }
 
 /// Why a section pane has no picture, when it has none.
@@ -1247,14 +1265,14 @@ mod tests {
                 .and_hms_opt(18, minute, 0)
                 .unwrap()
         };
-        let target = |site: &str, minute: u32, tilts: usize| SectionTarget {
+        let target = |site: &str, minute: u32, sweeps: usize| SectionTarget {
             volume: VolumeStamp {
                 site: site.to_owned(),
                 collected: at(minute),
             },
             product: RadarProduct::Reflectivity,
             line,
-            tilts,
+            sweeps,
         };
 
         assert_eq!(target("KTLX", 30, 9), target("KTLX", 30, 9));
@@ -1268,15 +1286,15 @@ mod tests {
             target("KOUN", 30, 9),
             "the same volume time at another site is a different picture"
         );
-        // The live-feed arm, and the reason `tilts` is in the key at all. The
+        // The live-feed arm, and the reason `sweeps` is in the key at all. The
         // volume time here is *identical* — it is the first sweep's, and on the
-        // chunk feed that is frozen for five to six minutes while the ladder
-        // grows underneath it. Without the tilt count these two keys are equal
+        // chunk feed that is frozen for five to six minutes while the volume
+        // fills underneath it. Without the sweep count these two keys are equal
         // and the section cut from the first chunk stands for the whole volume.
         assert_ne!(
             target("KTLX", 30, 1),
             target("KTLX", 30, 9),
-            "the same volume with eight more cuts in it is a different section"
+            "the same volume with eight more sweeps in it is a different section"
         );
     }
 

@@ -400,14 +400,15 @@ pub struct RenderDispatcher {
 /// it to a velocity section would produce a picture of an empty ladder rather
 /// than an error.
 ///
-/// The tilt count is part of the key for the reason
-/// [`SectionTarget::tilts`](rustdar_egui::pane::SectionTarget) exists: on the
+/// The sweep count is part of the key for the reason
+/// [`SectionTarget::sweeps`](rustdar_egui::pane::SectionTarget) exists: on the
 /// live chunk feed the volume time is frozen for the whole volume while the
 /// `Scan` grows sweep by sweep, so `(site, collected, product)` alone would hand
 /// a payload extracted from a one-sweep volume back to a cut of the same volume
-/// eight cuts later. It is also why the discriminator is a *tilt count* and not
-/// a chunk counter: this re-extracts once per new elevation, not once every few
-/// seconds for the 15.6 MB the field above is here to avoid.
+/// eight sweeps later. It is also why the discriminator is a *sweep count* and
+/// not a chunk counter: it is bounded by the ~14–23 sweeps of a volume rather
+/// than by its ~100 chunks, which is what keeps the 15.6 MB walk the field above
+/// exists to avoid down to a handful of times a volume.
 struct SectionInput {
     key: SectionInputKey,
     /// `Arc` so the cache and the job in flight can hold it at once; the job
@@ -421,16 +422,17 @@ struct SectionInput {
 /// A struct with a derived `PartialEq` rather than a chain of `&&`s at the reuse
 /// site, because the failure mode of the chain is forgetting a clause, and the
 /// consequence of forgetting one is not an error — it is the wrong volume, or an
-/// empty ladder, or (the F1 failure, and the quietest of the three) a picture of
-/// the right volume with most of it missing. Adding a field to this struct
-/// therefore cannot silently leave the comparison behind.
+/// empty ladder, or (the quietest of the three) a picture of the right volume
+/// with most of it missing. Adding a field to this struct therefore cannot
+/// silently leave the comparison behind.
 #[derive(Clone, Debug, PartialEq)]
 struct SectionInputKey {
     site: String,
     collected: chrono::NaiveDateTime,
     product: RadarProduct,
-    /// How many elevation angles the volume this was extracted from carried.
-    tilts: usize,
+    /// How many sweeps of the volume this was extracted from carried the
+    /// product's moment — exactly the set `extract_volume` copied.
+    sweeps: usize,
 }
 
 impl SectionInputKey {
@@ -440,7 +442,7 @@ impl SectionInputKey {
             site: target.volume.site.clone(),
             collected: target.volume.collected,
             product: target.product,
-            tilts: target.tilts,
+            sweeps: target.sweeps,
         }
     }
 }
@@ -2810,7 +2812,7 @@ mod section_payload_cache_tests {
             .unwrap()
     }
 
-    fn target(site: &str, minute: u32, product: RadarProduct, tilts: usize) -> SectionTarget {
+    fn target(site: &str, minute: u32, product: RadarProduct, sweeps: usize) -> SectionTarget {
         SectionTarget {
             volume: VolumeStamp {
                 site: site.to_owned(),
@@ -2828,7 +2830,7 @@ mod section_payload_cache_tests {
                 },
             )
             .expect("a valid line"),
-            tilts,
+            sweeps,
         }
     }
 
@@ -2864,9 +2866,9 @@ mod section_payload_cache_tests {
     }
 
     /// Every input the payload *does* depend on invalidates it, including the
-    /// tilt count — which on the live chunk feed is the only one that moves.
+    /// sweep count — which on the live chunk feed is the only one that moves.
     #[test]
-    fn a_payload_is_not_reused_across_volume_site_moment_or_tilt_count() {
+    fn a_payload_is_not_reused_across_volume_site_moment_or_sweep_count() {
         let base = target("KTLX", 30, RadarProduct::Reflectivity, 9);
         let key = SectionInputKey::of(&base);
 
@@ -2885,7 +2887,7 @@ mod section_payload_cache_tests {
             ),
             (
                 target("KTLX", 30, RadarProduct::Reflectivity, 1),
-                "the live-feed case: the same volume, eight cuts ago",
+                "the live-feed case: the same volume, eight sweeps ago",
             ),
         ] {
             assert_ne!(SectionInputKey::of(&other), key, "{why}");

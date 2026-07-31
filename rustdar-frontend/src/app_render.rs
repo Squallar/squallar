@@ -848,32 +848,30 @@ impl super::App {
         let line = section.line?;
         let product = pane.selected_product;
         let site = pane.site.clone();
-        let (collected, tilts) = match pane.scan_info.as_ref() {
-            // The tilt count is read from the *same* place the tilt ladder is
-            // drawn from, so the key moves when the ladder does. See
-            // `SectionTarget::tilts`: on the live chunk feed `timestamp` is the
-            // first sweep's, and so is frozen for the whole volume while the
-            // ladder grows from one rung to fourteen underneath it.
-            Some(scan_info) => (
-                scan_info.timestamp,
-                scan_info
-                    .product_elevations
-                    .get(&product)
-                    .map_or(0, Vec::len),
-            ),
-            None => {
-                self.mark_section_unavailable(
-                    pane_idx,
-                    rustdar_egui::pane::SectionUnavailable::AwaitingVolume,
-                );
-                return None;
-            }
+        let Some(collected) = pane.scan_info.as_ref().map(|s| s.timestamp) else {
+            self.mark_section_unavailable(
+                pane_idx,
+                rustdar_egui::pane::SectionUnavailable::AwaitingVolume,
+            );
+            return None;
         };
+        // Counted off the `Scan` the cut will be made from, and **not** off the
+        // pane's `ScanInfo::product_elevations`. See `SectionTarget::sweeps`: the
+        // pane's angle set is merged rather than replaced as chunks land, so
+        // after one complete volume it already holds the whole VCP and never
+        // moves again — which would freeze the key exactly the way the volume
+        // timestamp does, one volume later. A missing scan counts zero rather
+        // than refusing: the dispatch below has its own arm for that, and this
+        // one is about naming the key.
+        let sweeps = self
+            .scan_data
+            .get(site.as_str())
+            .map_or(0, |scan| sweeps_carrying(scan, product));
         Some(rustdar_egui::pane::SectionTarget {
             volume: rustdar_egui::pane::VolumeStamp { site, collected },
             product,
             line,
-            tilts,
+            sweeps,
         })
     }
 
@@ -1942,6 +1940,33 @@ impl super::App {
             }
         }
     }
+}
+
+/// How many of `scan`'s sweeps carry `product`'s moment.
+///
+/// The staleness discriminator for a cross-section — see
+/// [`SectionTarget::sweeps`](rustdar_egui::pane::SectionTarget) for why the count
+/// has to come off the `Scan` rather than off the pane's accumulated `ScanInfo`.
+///
+/// The predicate is the first radial's, which is what
+/// `ScanInfo::discover_product_elevations` and `RenderInput::extract_with` both
+/// use: a sweep carries a moment or it does not, and a volume where the first
+/// radial of a sweep disagrees with the rest of it is not a shape NEXRAD
+/// produces. Level III products have no Level II moment behind them and count
+/// zero, which is correct — nothing about them is samplable either.
+fn sweeps_carrying(
+    scan: &nexrad_model::data::Scan,
+    product: rustdar_radar::types::RadarProduct,
+) -> usize {
+    scan.sweeps()
+        .iter()
+        .filter(|sweep| {
+            sweep
+                .radials()
+                .first()
+                .is_some_and(|r| product.get_moment(r).is_some())
+        })
+        .count()
 }
 
 /// Take a scan listing for `site` into `ls`'s frame list, returning the downloads
@@ -5516,30 +5541,39 @@ mod section_dispatch_tests {
     /// `chunks::placeholder_coverage_pattern(0)` produces — the shape a volume
     /// joined mid-scan has until its VCP message lands.
     fn volume(cuts: Vec<ElevationCut>) -> Arc<Scan> {
-        let radial = Radial::new(
-            0,
-            0,
-            0.0,
-            1.0,
-            RadialStatus::ElevationStart,
-            1,
-            0.5,
-            Some(MomentData::from_fixed_point(
-                1,
+        volume_of(1, cuts)
+    }
+
+    /// The same volume with `sweeps` sweeps in it, for the live feed's growing
+    /// `Scan`. Every sweep carries reflectivity and nothing else, so it also
+    /// stands in for the surveillance-only half of a split cut.
+    fn volume_of(sweeps: u8, cuts: Vec<ElevationCut>) -> Arc<Scan> {
+        let radial = |elevation_number: u8| {
+            Radial::new(
                 0,
-                250,
-                8,
-                2.0,
-                66.0,
-                vec![32],
-            )),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+                0,
+                0.0,
+                1.0,
+                RadialStatus::ElevationStart,
+                elevation_number,
+                0.5,
+                Some(MomentData::from_fixed_point(
+                    1,
+                    0,
+                    250,
+                    8,
+                    2.0,
+                    66.0,
+                    vec![32],
+                )),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
         Arc::new(Scan::new(
             VolumeCoveragePattern::new(
                 if cuts.is_empty() { 0 } else { 212 },
@@ -5557,7 +5591,9 @@ mod section_dispatch_tests {
                 false,
                 cuts,
             ),
-            vec![Sweep::new(1, vec![radial])],
+            (1..=sweeps)
+                .map(|n| Sweep::new(n, vec![radial(n)]))
+                .collect(),
         ))
     }
 
@@ -6002,32 +6038,37 @@ mod section_dispatch_tests {
     /// `ScanInfo::timestamp` is the *first* sweep's first radial, and on the
     /// chunk feed `sweeps[0]` is fixed for the whole volume, so the stamp is a
     /// constant for five to six minutes while the ladder goes from one rung to
-    /// nine. Observed live before the fix: a map pane full of echo, a section
+    /// fourteen. Observed live before the fix: a map pane full of echo, a section
     /// pane empty, and a caption reading `1 tilts` for six minutes.
     ///
-    /// The precondition is the assertion that matters. `before.volume` and
-    /// `after.volume` are asserted **equal** — if a future change makes the
-    /// volume stamp move on the live feed this test starts failing on its
-    /// premise rather than quietly passing for the wrong reason.
+    /// Two preconditions carry the test. `before.volume` and `after.volume` are
+    /// asserted **equal**, so a future change that makes the stamp move on the
+    /// live feed fails here on the premise rather than passing for the wrong
+    /// reason. And `product_elevations` is left **untouched** across the growth,
+    /// because that is the source this discriminator was first written against
+    /// and it is wrong: `Gui::apply_chunk_scan_info` merges angles in and never
+    /// removes one, so after a session's first complete volume the pane already
+    /// knows the whole VCP and the count never moves again.
     #[test]
     fn a_live_volume_that_is_still_filling_re_cuts_as_it_fills() {
         let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
-        let grow_to = |app: &mut crate::app::App, angles: Vec<f32>| {
-            if let Some(info) = app.gui.pane_mut(0).unwrap().scan_info.as_mut() {
-                info.product_elevations
-                    .insert(RadarProduct::Reflectivity, angles);
-            }
-        };
+        // The pane already knows every angle the VCP flies — the state it is in
+        // for every volume after the first one of a session.
+        if let Some(info) = app.gui.pane_mut(0).unwrap().scan_info.as_mut() {
+            info.product_elevations.insert(
+                RadarProduct::Reflectivity,
+                vec![0.5, 0.9, 1.3, 1.8, 2.4, 3.1, 4.0, 5.1, 6.4],
+            );
+        }
 
-        grow_to(&mut app, vec![0.5]);
         let before = app
             .section_target_for_pane(0)
             .expect("the pane is aimed and has a volume");
-        assert_eq!(before.tilts, 1);
+        assert_eq!(before.sweeps, 1, "the fixture volume is one sweep");
 
-        // Exactly what `Gui::apply_chunk_scan_info` does on the next few chunks:
-        // it merges new angles in and leaves `timestamp` where it was.
-        grow_to(&mut app, vec![0.5, 0.9, 1.3, 1.8, 2.4, 3.1, 4.0, 5.1, 6.4]);
+        // The next chunks land: the `Scan` grows and nothing else does.
+        app.scan_data
+            .insert(SITE.to_owned(), volume_of(4, vec![one_cut()]));
         let after = app.section_target_for_pane(0).expect("still aimed");
 
         assert_eq!(
@@ -6035,14 +6076,15 @@ mod section_dispatch_tests {
             "precondition: the live feed's volume stamp really is frozen, so it \
              cannot be what notices the volume growing"
         );
-        assert_eq!(after.tilts, 9);
+        assert_eq!(after.sweeps, 4);
         assert_ne!(
             before, after,
-            "eight more cuts arrived and the pane went on showing a one-rung section"
+            "three more sweeps arrived and the pane went on showing a one-sweep \
+             section"
         );
 
-        // And the pane really re-dispatches on it: with the one-rung key stored,
-        // the nine-rung target no longer matches and the short-circuit at the
+        // And the pane really re-dispatches on it: with the one-sweep key stored,
+        // the four-sweep target no longer matches and the short-circuit at the
         // top of `dispatch_section_renders` falls through.
         app.gui
             .pane_mut(0)
@@ -6052,9 +6094,32 @@ mod section_dispatch_tests {
             .rendered_for = Some(before);
         app.dispatch_section_renders();
         assert_eq!(
-            state(&app).rendered_for.as_ref().map(|t| t.tilts),
-            Some(9),
-            "the dispatcher short-circuited on a key cut from one ninth of the volume"
+            state(&app).rendered_for.as_ref().map(|t| t.sweeps),
+            Some(4),
+            "the dispatcher short-circuited on a key cut from a quarter of the \
+             volume"
         );
+    }
+
+    /// Only the sweeps carrying the moment count, which is the same set
+    /// `RenderInput::extract_volume` copies into the payload the key is shared
+    /// with.
+    ///
+    /// A surveillance-only half of a split cut carries reflectivity and no
+    /// velocity. Counting it for a velocity section would re-extract 15.6 MB for
+    /// a payload that came out byte-identical.
+    #[test]
+    fn the_sweep_count_is_of_the_sweeps_that_carry_the_moment() {
+        let scan = volume_of(4, vec![one_cut()]);
+        assert_eq!(sweeps_carrying(&scan, RadarProduct::Reflectivity), 4);
+        assert_eq!(
+            sweeps_carrying(&scan, RadarProduct::Velocity),
+            0,
+            "the fixture's radials carry reflectivity alone"
+        );
+        // A Level III product has no Level II moment behind it at all. Zero is
+        // the honest answer and it costs nothing: nothing about those products
+        // is samplable either.
+        assert_eq!(sweeps_carrying(&scan, RadarProduct::EchoTops), 0);
     }
 }
