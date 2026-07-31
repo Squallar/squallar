@@ -1368,15 +1368,23 @@ mod tests {
         });
 
         // Where it stops, against what the pattern flies. Both numbers, because
-        // "stops at 1.8°" means nothing without "of 19.5°".
+        // "stops at 1.8°" means nothing without "of 19.5°" — and **as one
+        // phrase**, because which number is which is the whole sentence.
+        //
+        // Two independent `contains` checks were what this was, and they cannot
+        // tell "topping out at 1.8° of the 19.5°" from "topping out at 19.5° of
+        // the 1.8°". The two arguments are adjacent and unnamed in
+        // `caption_lines`' format string, so swapping them is a plausible edit,
+        // it compiles, and it turns the feature's headline sentence into "5
+        // tilts, topping out at 19.5° of the 6.4° this pattern flies" —
+        // nonsense, and nonsense in the reassuring direction, since it reads as
+        // a ladder that overshot its pattern rather than one that fell short.
         assert!(
-            filling.text.contains("1.8"),
-            "the caption never named where the ladder stops: {}",
-            filling.text
-        );
-        assert!(
-            filling.text.contains("19.5"),
-            "the caption named a ceiling with nothing to measure it against: {}",
+            filling
+                .text
+                .contains("topping out at 1.8\u{b0} of the 19.5\u{b0}"),
+            "the caption did not name where the ladder stops against what the \
+             pattern flies, in that order: {}",
             filling.text
         );
         // Why the ceiling is there, without claiming which of the three causes
