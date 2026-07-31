@@ -3520,6 +3520,41 @@ mod tests {
         assert_eq!(bytes.len(), STATUS_LEN_AT + 4 + pixels);
     }
 
+    /// The version this layout ships is **2**, and it is written where a
+    /// decoder from another build reads it.
+    ///
+    /// `a_malformed_section_payload_is_refused_rather_than_misread` plants
+    /// `0xFF 0xFF` and watches the decode refuse, which pins that *a* version
+    /// check exists — not *which* version ships. Setting `FORMAT_VERSION` back
+    /// to 1 left that test, and every other test in the workspace, green: both
+    /// ends of the codec move together, so a build is always self-consistent
+    /// and the constant is only load-bearing *between* builds.
+    ///
+    /// Between builds is where it is the only defence. `rustdar-web`'s
+    /// page/worker handshake is `build_token = version/PROTOCOL_VERSION/
+    /// GITHUB_SHA`, and `GITHUB_SHA` is absent outside CI, so it degrades to
+    /// `…/dev` and a stale worker shares a token with a fresh page. If a layout
+    /// change forgets the bump — reordering two same-width `f64` axis fields is
+    /// the easy one, since it round-trips perfectly through its own build's
+    /// codec — the stale worker's payload decodes into the new field order
+    /// silently, and a section is drawn with its axes swapped.
+    ///
+    /// So the literal is written twice on purpose: once as the constant, once
+    /// as the bytes on the wire. Mirrors `render_input`'s
+    /// `the_format_version_is_the_one_this_layout_ships`, which the same
+    /// argument applies to.
+    #[test]
+    fn the_format_version_is_the_one_this_layout_ships() {
+        assert_eq!(FORMAT_VERSION, 2);
+        let bytes = wire_fixture().to_bytes();
+        assert_eq!(&bytes[..4], &MAGIC, "the magic moved");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            2,
+            "the version is not where a decoder from another build looks for it",
+        );
+    }
+
     /// A real section survives the wire, including one that is `NaN` in every
     /// pixel.
     ///
