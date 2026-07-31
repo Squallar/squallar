@@ -2424,36 +2424,80 @@ mod tests {
         }
     }
 
-    /// The wire codes are a fixed table, not the enum's declaration order:
-    /// reordering the variants must not silently change what a payload means.
+    /// The wire codes are a fixed table of *literals*, not the enum's
+    /// declaration order: reordering the variants must not silently change what
+    /// an already-encoded payload means.
+    ///
+    /// The literals are the point. Distinctness and round-trip cannot see a
+    /// **renumbering** — swap two products' codes in both
+    /// [`RadarProduct::wire_code`] and [`RadarProduct::from_wire_code`] and both
+    /// properties still hold, which is exactly the four-line diff a
+    /// renumbering across a build boundary is. Nor can `from_wire_code`'s own
+    /// `debug_assert_eq!`, which compares the table against itself.
+    ///
+    /// What a renumbering costs is a **misparse, not a refusal**. A stale
+    /// worker encodes reflectivity as `1`; a fresh page reads `1` as velocity;
+    /// the magic matches, the version matches, `moment_slot()` succeeds and
+    /// every length check passes, so the frame renders — reflectivity gates
+    /// under the velocity colour ramp, labelled "kt". This one `u16` sits in
+    /// the header of all three payloads that cross the worker port
+    /// ([`RenderInput`], `CrossSection`, `VoxelGrid`) and in every arm of
+    /// `rustdar_frontend::offload`'s job framing, so it is pinned here by
+    /// value, the way `SampleStatus`'s codes are in [`crate::sampler`].
+    ///
+    /// Read the table below as the wire contract it is: a number in it is not
+    /// an implementation detail, and changing one changes what bytes already
+    /// in flight mean.
     #[test]
     fn every_product_has_a_stable_distinct_wire_code() {
-        let products = [
-            RadarProduct::Reflectivity,
-            RadarProduct::Velocity,
-            RadarProduct::SpectrumWidth,
-            RadarProduct::DifferentialPhase,
-            RadarProduct::CorrelationCoefficient,
-            RadarProduct::DifferentialReflectivity,
-            RadarProduct::StormRelativeVelocity,
-            RadarProduct::SpecificDifferentialPhase,
-            RadarProduct::EchoTops,
-            RadarProduct::EchoTopsInterpolated,
-            RadarProduct::VerticallyIntegratedLiquid,
-            RadarProduct::HydrometeorClassification,
-            RadarProduct::PrecipitationRate,
-            RadarProduct::NormalizedRotation,
-            RadarProduct::VilDensity,
-            RadarProduct::ProbabilityOfSevereHail,
-            RadarProduct::MaxExpectedHailSize,
+        let table: [(RadarProduct, u16); 17] = [
+            (RadarProduct::Reflectivity, 1),
+            (RadarProduct::Velocity, 2),
+            (RadarProduct::SpectrumWidth, 3),
+            (RadarProduct::DifferentialPhase, 4),
+            (RadarProduct::CorrelationCoefficient, 5),
+            (RadarProduct::DifferentialReflectivity, 6),
+            (RadarProduct::StormRelativeVelocity, 7),
+            (RadarProduct::SpecificDifferentialPhase, 8),
+            (RadarProduct::EchoTops, 9),
+            (RadarProduct::EchoTopsInterpolated, 10),
+            (RadarProduct::VerticallyIntegratedLiquid, 11),
+            (RadarProduct::HydrometeorClassification, 12),
+            (RadarProduct::PrecipitationRate, 13),
+            (RadarProduct::NormalizedRotation, 14),
+            (RadarProduct::VilDensity, 15),
+            (RadarProduct::ProbabilityOfSevereHail, 16),
+            (RadarProduct::MaxExpectedHailSize, 17),
         ];
         let mut seen = std::collections::HashSet::new();
-        for product in products {
-            let code = product.wire_code();
+        for (product, code) in table {
+            assert_eq!(
+                product.wire_code(),
+                code,
+                "{product:?} moved on the wire: it encodes as {} now, not {code}",
+                product.wire_code(),
+            );
             assert!(seen.insert(code), "{product:?} reuses wire code {code}");
-            assert_eq!(RadarProduct::from_wire_code(code), Some(product));
+            assert_eq!(
+                RadarProduct::from_wire_code(code),
+                Some(product),
+                "wire code {code} no longer decodes to {product:?}",
+            );
         }
         assert_eq!(RadarProduct::from_wire_code(0), None);
         assert_eq!(RadarProduct::from_wire_code(u16::MAX), None);
+        // Precondition: the table above is the whole enum. A new variant that
+        // reached `all()` without reaching the table would otherwise travel
+        // unpinned, and 18 is the next number it would take.
+        assert_eq!(
+            table.len(),
+            RadarProduct::all().len(),
+            "a product gained or lost a wire code without the table above moving",
+        );
+        assert_eq!(
+            RadarProduct::from_wire_code(18),
+            None,
+            "18 decodes, so the table above has stopped being the whole wire",
+        );
     }
 }

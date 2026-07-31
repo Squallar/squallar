@@ -1294,24 +1294,57 @@ mod tests {
         assert_eq!(RadarProduct::MaxExpectedHailSize.unit_label(&prefs), "in");
     }
 
-    /// Every view is classified, its code is stable and distinct, and the two
-    /// directions agree — the same three claims
+    /// Every view is pinned to a literal byte, its code is distinct, and the
+    /// two directions agree — the same claims
     /// `every_product_has_a_stable_distinct_wire_code` makes for products, for
     /// the axis a render cache key gained.
+    ///
+    /// The literals are what makes this more than self-consistency.
+    /// Distinctness and round-trip both survive a **renumbering** — swapping
+    /// two views' bytes in both [`RenderView::wire_code`] and
+    /// [`RenderView::from_wire_code`] keeps them — and this byte is the kind
+    /// tag on a worker's out-of-band reply (`rustdar_frontend::offload`'s
+    /// `decode_output`), so a renumbering makes the page run the *volume*
+    /// decoder over a cross-section's bytes.
+    ///
+    /// That one lands softly, and is pinned anyway. The payload magics catch
+    /// it: `VoxelGrid::from_bytes` refuses bytes wearing `RDXS`, so the frame
+    /// is a clean "nothing to draw" rather than a misparse. But the byte is
+    /// still a wire contract between two builds, the guard that saves it lives
+    /// in another type entirely, and pinning it costs three lines.
     #[test]
     fn every_render_view_has_a_stable_distinct_wire_code() {
+        let table: [(RenderView, u8); 3] = [
+            (RenderView::PlanView, 1),
+            (RenderView::CrossSection, 2),
+            (RenderView::Volume, 3),
+        ];
         let mut seen = std::collections::HashSet::new();
-        for &view in RenderView::all() {
-            let code = view.wire_code();
+        for (view, code) in table {
+            assert_eq!(
+                view.wire_code(),
+                code,
+                "{view:?} moved on the wire: it tags as {} now, not {code}",
+                view.wire_code(),
+            );
             assert!(seen.insert(code), "{view:?} reuses wire code {code}");
-            assert_eq!(RenderView::from_wire_code(code), Some(view));
+            assert_eq!(
+                RenderView::from_wire_code(code),
+                Some(view),
+                "wire code {code} no longer decodes to {view:?}",
+            );
         }
         assert_eq!(
-            seen.len(),
-            3,
-            "a view left `all()` without leaving the enum"
+            table.len(),
+            RenderView::all().len(),
+            "a view left `all()` without leaving the table above",
         );
         assert_eq!(RenderView::from_wire_code(0), None);
+        assert_eq!(
+            RenderView::from_wire_code(4),
+            None,
+            "4 decodes, so the table above has stopped being the whole wire",
+        );
         assert_eq!(RenderView::from_wire_code(u8::MAX), None);
     }
 
