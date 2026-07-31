@@ -1485,6 +1485,115 @@ mod tests {
         assert!(ceiling_is_under(ceiling, just_over));
     }
 
+    /// No pixel of a rendered section carries a `Value` whose geometry places
+    /// it above the top rung — the module's "no upward extrapolation" rule,
+    /// stated where a reader measures it rather than where the sampler
+    /// implements it.
+    ///
+    /// # Why this exists at the section level
+    ///
+    /// `sampler::tests::nothing_is_extrapolated_above_or_below_the_ladder`
+    /// already pins `Column::at_height_km`'s two edges. This pins the property
+    /// that survives the whole raster: every column, every row, through the
+    /// MSL axis and back. A clamp reintroduced anywhere between the ladder and
+    /// the pixel — in the rung search, in the row-height mapping, in a future
+    /// "fill the cone" convenience — shows up here even if
+    /// `at_height_km` keeps its contract.
+    ///
+    /// # The trap this also nails down
+    ///
+    /// A validation pass read a KDMX section as returning a value at an
+    /// implied 20.07° against a 19.56° top tilt, which looks exactly like
+    /// upward extrapolation and is not. Beam heights are **above the
+    /// antenna**; the height axis is **MSL**. Invert the beam equation on a
+    /// row's MSL height without subtracting
+    /// [`SectionAxes::base_km_msl`] and the implied angle comes out high by an
+    /// amount that grows with the site's elevation — nothing at sea-level
+    /// KLWX, half a degree at KDMX's 299 m, twelve degrees at KFTG's 1675 m.
+    /// The second half of this test performs that mistake deliberately and
+    /// asserts it overshoots, so the difference between the two readings is
+    /// recorded as a measured fact rather than as prose.
+    #[test]
+    fn no_value_in_a_section_sits_above_the_top_rung() {
+        let scan = scan_with(&|_az, _slant| Gate::Dbz(30.0));
+        let section = radial_section(&scan, 90.0, 120.0);
+        let axes = section.axes();
+        let top_rung_deg = *section
+            .tilt_elevations_deg()
+            .last()
+            .expect("the ladder has rungs");
+
+        // Invert `beam::height_at_ground_km` for the elevation angle. Bisection
+        // rather than a closed form so the test cannot inherit an algebra
+        // error from the code it is checking: it only ever calls the shipped
+        // forward function.
+        let implied_deg = |ground_km: f64, height_km: f64| {
+            let (mut lo, mut hi) = (-5.0f64, 89.0f64);
+            for _ in 0..200 {
+                let mid = 0.5 * (lo + hi);
+                if beam::height_at_ground_km(ground_km, mid) < height_km {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            0.5 * (lo + hi)
+        };
+
+        let mut checked = 0usize;
+        let mut worst = f64::NEG_INFINITY;
+        for col in 0..SECTION_WIDTH {
+            let ground_km = axes.column_distance_km(col);
+            if is_blind(ground_km) {
+                continue;
+            }
+            for row in 0..SECTION_HEIGHT {
+                if status_at(&section, col, row) != SampleStatus::Value {
+                    continue;
+                }
+                checked += 1;
+                // The row is MSL; the beam equation is above the antenna.
+                let arl_km = axes.row_height_km_msl(row) - axes.base_km_msl;
+                let deg = implied_deg(ground_km, arl_km);
+                worst = worst.max(deg);
+                assert!(
+                    deg <= top_rung_deg + 1e-6,
+                    "col {col} row {row} at {ground_km} km carries a value whose \
+                     geometry puts it at {deg}°, above the {top_rung_deg}° top rung",
+                );
+            }
+        }
+        assert!(checked > 10_000, "only {checked} values were examined");
+        assert!(
+            worst > top_rung_deg - 0.01,
+            "the highest value examined implied {worst}°, nowhere near the \
+             {top_rung_deg}° top rung — this section never reached the ceiling, \
+             so passing says nothing",
+        );
+
+        // The same raster read the wrong way. `SITE_ELEV_KM` is 0.37 km, so
+        // forgetting it inflates the implied angle and manufactures exactly the
+        // overshoot that was reported as extrapolation.
+        let mut worst_msl = f64::NEG_INFINITY;
+        for col in 0..SECTION_WIDTH {
+            let ground_km = axes.column_distance_km(col);
+            if is_blind(ground_km) {
+                continue;
+            }
+            for row in 0..SECTION_HEIGHT {
+                if status_at(&section, col, row) == SampleStatus::Value {
+                    worst_msl = worst_msl.max(implied_deg(ground_km, axes.row_height_km_msl(row)));
+                }
+            }
+        }
+        assert!(
+            worst_msl > top_rung_deg + 0.2,
+            "reading the height as MSL should overshoot the top rung by more \
+             than 0.2°, but reached only {worst_msl}° against {top_rung_deg}°; \
+             if this stops holding the trap is gone and the note above is stale",
+        );
+    }
+
     // ── The raster's shape and its two axis mappings ────────────────────────
 
     /// The raster is `IMAGE_SIZE` by half of it, and that is what buys the
