@@ -577,7 +577,36 @@ impl InputHarness {
         for pane in self.gui.panes_mut() {
             pane.site = site.to_owned();
         }
+        let collected = info.timestamp;
         self.gui.set_scan_info_for_site(site, info);
+        // And the archive half, because that is what an archive fetch does:
+        // `App` writes `archive_scans` and `set_scan_info_for_site` from the same
+        // arm. A harness that filled only the plan view's half would leave a 3D
+        // pane waiting for a volume that, in production, had already landed.
+        //
+        // Use `set_archive_volume` to take them apart — that is the live case,
+        // where the plan view has a volume the 3D pane must not build from.
+        self.set_archive_volume(site, Some(collected));
+        self.warm_up();
+    }
+
+    /// Say what the archive has most recently published for `site`, or that it
+    /// has published nothing.
+    ///
+    /// The 3D pane's only input, and deliberately separable from
+    /// [`Self::load_scan`]: a site being watched live has a `scan_info` from the
+    /// chunk feed and an archive volume some minutes behind it, and the whole of
+    /// the archive-only decision is that the pane follows the second.
+    pub(crate) fn set_archive_volume(
+        &mut self,
+        site: &str,
+        collected: Option<chrono::NaiveDateTime>,
+    ) {
+        let mut volumes = std::collections::HashMap::new();
+        if let Some(collected) = collected {
+            volumes.insert(site.to_owned(), collected);
+        }
+        self.gui.set_archive_volumes(volumes);
         self.warm_up();
     }
 

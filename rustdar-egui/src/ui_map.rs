@@ -330,12 +330,17 @@ impl super::Gui {
                             // borrow that would otherwise have to span the whole
                             // arm.
                             let painter = self.volume_painter().cloned();
+                            // Read here, beside the painter, and for the same
+                            // reason: both want `&self` across a body that also
+                            // wants `&mut self`, and both are cheap to copy out.
+                            let archive_collected = self.archive_volume_for(&pane.site);
                             let outcome = render_volume_pane(
                                 &mut child_ui,
                                 pane_rect,
                                 pane_idx,
                                 &mut pane,
                                 painter.as_deref(),
+                                archive_collected,
                                 &mut actions,
                             );
                             #[cfg(test)]
@@ -521,9 +526,18 @@ fn render_volume_pane(
     pane_idx: usize,
     pane: &mut crate::pane::PaneState,
     painter: Option<&dyn crate::volume_view::VolumePainter>,
+    archive_collected: Option<chrono::NaiveDateTime>,
     actions: &mut Vec<GuiAction>,
 ) -> Option<String> {
-    let outcome = volume_pane_outcome(ui, pane_rect, pane_idx, pane, painter, actions);
+    let outcome = volume_pane_outcome(
+        ui,
+        pane_rect,
+        pane_idx,
+        pane,
+        painter,
+        archive_collected,
+        actions,
+    );
     if let Some(why) = outcome.as_deref() {
         paint_pane_empty_state(ui, pane_rect, why);
     }
@@ -539,6 +553,7 @@ fn volume_pane_outcome(
     pane_idx: usize,
     pane: &mut crate::pane::PaneState,
     painter: Option<&dyn crate::volume_view::VolumePainter>,
+    archive_collected: Option<chrono::NaiveDateTime>,
     actions: &mut Vec<GuiAction>,
 ) -> Option<String> {
     use crate::pane::{OrbitDelta, VolumeStamp, VolumeTarget};
@@ -568,6 +583,7 @@ fn volume_pane_outcome(
         delta.yaw_deg = drag.x * ORBIT_YAW_DEG_PER_POINT;
         delta.pitch_deg = drag.y * ORBIT_PITCH_DEG_PER_POINT;
     }
+
     if response.hovered() || response.dragged() {
         let (pinch, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta.y));
         // Multiplied, not chosen between: a trackpad can deliver both in one
@@ -581,10 +597,25 @@ fn volume_pane_outcome(
     // is what keeps this one borrow deep rather than a clone of the pane.
     let site_code = pane.site.clone();
     let product = pane.selected_product;
-    let stamp = pane.scan_info.as_ref().map(|scan_info| VolumeStamp {
-        site: scan_info.site.name.to_string(),
-        collected: scan_info.timestamp,
+    // The archive volume, **not** `scan_info`, and that is the archive-only
+    // decision in one line. `scan_info` names whatever the plan view is drawing,
+    // which the real-time chunk feed rewrites on every volume roll — so keying
+    // off it would rebuild an 8 MiB grid on the frame thread every few minutes,
+    // for a volume that may have been joined mid-flight and cannot be resampled
+    // at all. The archive publishes only finished volumes, so this one is
+    // buildable the instant it is named.
+    //
+    // The site comes from `pane.site` rather than from `scan_info.site`, because
+    // this no longer follows the pane's displayed scan: a pane that has switched
+    // site should ask for the new site's archive volume, not go on naming the old
+    // one until a plan view catches up.
+    let stamp = archive_collected.map(|collected| VolumeStamp {
+        site: site_code.clone(),
+        collected,
     });
+    // What the plan view has, so the pane can say when the two differ. Read for
+    // the caption only; nothing branches on it.
+    let shown_collected = pane.scan_info.as_ref().map(|scan_info| scan_info.timestamp);
 
     // Unreachable from the kind branch, which only enters here for a `Volume`
     // pane, and answered rather than unwrapped: this function takes a whole
@@ -603,7 +634,14 @@ fn volume_pane_outcome(
         return Some(VOLUME_EMPTY_STATE.to_owned());
     };
     let Some(volume_stamp) = stamp else {
-        return Some(format!("Waiting for a volume from {site_code}"));
+        // Says *which kind* of volume, because the honest answer to "there is a
+        // live picture in the pane beside this one, why is this empty" is that
+        // they are fed from different things on purpose.
+        return Some(format!(
+            "Waiting for a completed archive volume from {site_code}.\n\nThe 3D view is built \
+             from finished Level II volumes only, so it appears when the next one is published \
+             rather than tilt by tilt.",
+        ));
     };
     if rustdar_radar::sampler::samplable(product).is_none() {
         return Some(format!(
@@ -613,6 +651,7 @@ fn volume_pane_outcome(
         ));
     }
 
+    let collected = volume_stamp.collected;
     let target = VolumeTarget {
         volume: volume_stamp,
         product,
@@ -650,10 +689,96 @@ fn volume_pane_outcome(
                     rect: pane_rect,
                     callback,
                 }));
+            // Over the callback, and only when there is a picture to caption: an
+            // empty state already says everything, and a caption under it would
+            // be two explanations of the same pane.
+            paint_volume_caption(
+                ui,
+                pane_rect,
+                &volume_caption(&site_code, collected, shown_collected),
+            );
             None
         }
         VolumePaint::Empty(why) => Some(why),
     }
+}
+
+/// What the pane says about the picture it is showing, one line per fact.
+///
+/// # The volume time is always named
+///
+/// A 3D pane in live mode is showing an
+/// archived volume some minutes behind the plan view next to it, and the one
+/// thing that must not happen is for it to look current — so the time is always
+/// named, and when the app has a different volume for the site the pane names
+/// *that* time too, rather than leaving the user to compare two corners of the
+/// screen. It names the time rather than claiming which panes are showing it,
+/// because a per-site timestamp is all `shown` is; see the line itself.
+///
+/// A pure function of three values so that what the pane claims can be tested
+/// without a GPU, a projector or a frame.
+fn volume_caption(
+    site: &str,
+    collected: chrono::NaiveDateTime,
+    shown: Option<chrono::NaiveDateTime>,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{site} archived volume {}Z",
+        collected.format("%H:%M")
+    )];
+
+    // Only when they genuinely differ. A pane whose site is on the same volume
+    // needs no explanation, and saying it anyway would train the reader to ignore
+    // the line that matters.
+    //
+    // **The sentence names the volume, not a pane**, and that is deliberate.
+    // `shown` is this pane's own `PaneState::scan_info`, which the frontend sets
+    // for *every* pane on a site at once — so it is "the volume the app has
+    // loaded for this site" and nothing more. It is not a survey of the map
+    // panes: it says nothing about a map pane on a different site, and there
+    // need not be a map pane at all. An earlier wording claimed the map panes
+    // were on something else, which was true in the live-versus-archive case it
+    // was written for and unsupported everywhere else. Stating the other time
+    // instead is both exactly what is known and more use than the claim was —
+    // the reader can now see the gap rather than being told there is one.
+    if let Some(shown) = shown.filter(|shown| *shown != collected) {
+        lines.push(format!(
+            "The app's current {site} volume is {}Z",
+            shown.format("%H:%M"),
+        ));
+    }
+
+    lines
+}
+
+/// Inset of the caption from the pane's top-left corner, points.
+const CAPTION_MARGIN: f32 = 8.0;
+
+/// Draw the caption in the pane's top-left corner, over the volume.
+///
+/// Behind a translucent plate rather than straight onto the render, because the
+/// volume beneath it is an arbitrary colour: white text over a stratiform sheet
+/// is unreadable, and a drop shadow only halves the problem. Painted rather than
+/// laid out as widgets for the reason `paint_pane_empty_state` gives — a caption
+/// is not interactive, and widgets here would consume the pane's auto-ids.
+fn paint_volume_caption(ui: &egui::Ui, pane_rect: egui::Rect, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let galley = ui.painter().layout(
+        lines.join("\n"),
+        egui::FontId::proportional(11.0),
+        egui::Color32::from_rgb(235, 235, 235),
+        pane_rect.width() - 2.0 * CAPTION_MARGIN,
+    );
+    let origin = pane_rect.left_top() + egui::vec2(CAPTION_MARGIN, CAPTION_MARGIN);
+    ui.painter().rect_filled(
+        egui::Rect::from_min_size(origin, galley.size()).expand(4.0),
+        3.0,
+        egui::Color32::from_black_alpha(160),
+    );
+    ui.painter()
+        .galley(origin, galley, egui::Color32::PLACEHOLDER);
 }
 
 /// Fraction of a pane's width an empty-state message is laid out across.
@@ -922,7 +1047,13 @@ mod volume_arm_tests {
         );
     }
 
-    /// A pane with no scan says what it is waiting for, naming the site.
+    /// A pane with no archive volume says what it is waiting for, naming the
+    /// site *and* saying that it is waiting for a finished one.
+    ///
+    /// The second half is the part worth pinning. A user watching a live plan
+    /// view beside an empty 3D pane will read "waiting for a volume" as a bug,
+    /// because there is plainly a volume on screen; the message has to say that
+    /// the two are fed from different things on purpose.
     #[test]
     fn a_volume_pane_with_no_scan_names_the_site_it_is_waiting_for() {
         let painter = Arc::new(StubVolumePainter::painting());
@@ -934,13 +1065,100 @@ mod volume_arm_tests {
 
         let outcome = h.volume_arms()[0].outcome.clone().expect("an empty state");
         assert!(
-            outcome.contains("Waiting for a volume"),
-            "expected a waiting message, got {outcome:?}",
+            outcome.contains("Waiting for a completed archive volume"),
+            "expected a waiting message naming what it waits for, got {outcome:?}",
         );
         assert!(
             painter.seen.lock().unwrap().is_empty(),
             "the painter must not be asked for a volume that has not arrived",
         );
+    }
+
+    /// **A live volume is not a volume this pane will build from.**
+    ///
+    /// The pane has a `scan_info` — the plan view beside it is drawing a
+    /// perfectly good volume — and no archive volume, which is exactly the state
+    /// a site being watched through the real-time chunk feed is in before its
+    /// first archive poll returns. The pane must wait rather than build.
+    ///
+    /// This is the whole of the archive-only decision as a test. The mutation it
+    /// closes is the obvious simplification: keying the target off
+    /// `pane.scan_info` again, which is what the code did before and which makes
+    /// every other volume test pass.
+    #[test]
+    fn a_live_volume_is_not_one_the_pane_will_build_from() {
+        let painter = Arc::new(StubVolumePainter::painting());
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.set_pane_count(2);
+        h.make_pane_volume(1);
+        h.gui_mut().set_volume_painter(Some(painter.clone()));
+        h.load_scan("KTLX");
+        // The chunk feed's volume is on screen; the archive has published
+        // nothing for this site yet. `load_scan` fills both halves — it stands in
+        // for an archive fetch — so this is what takes them apart again.
+        h.set_archive_volume("KTLX", None);
+        // Everything the painter saw belongs to the archive volume `load_scan`
+        // published. The assertion below is about what happens *after* it is
+        // withdrawn, so the record starts here.
+        painter.seen.lock().unwrap().clear();
+        h.frames_for(2, FRAME_DT);
+
+        assert!(
+            h.gui_mut().pane(1).expect("pane 1").scan_info.is_some(),
+            "precondition: the plan view has a volume",
+        );
+        let outcome = h.volume_arms()[0].outcome.clone().expect("an empty state");
+        assert!(
+            outcome.contains("Waiting for a completed archive volume"),
+            "a pane with a live volume and no archive one must wait, got {outcome:?}",
+        );
+        assert!(
+            painter.seen.lock().unwrap().is_empty(),
+            "no grid may be asked for on the strength of a live volume",
+        );
+        assert!(
+            !h.last_actions()
+                .iter()
+                .any(|a| matches!(a, GuiAction::PrepareVolume { .. })),
+            "no build may be triggered by a live volume arriving",
+        );
+    }
+
+    /// The pane names the **archive** volume, not the one the plan view shows.
+    ///
+    /// The two differ constantly in live mode — the archive publishes a volume
+    /// only once every cut is finished, so it is by construction the one before
+    /// the feed's — and a target built from the wrong one would ask the host for
+    /// a volume it does not have.
+    #[test]
+    fn the_target_names_the_archive_volume_rather_than_the_displayed_one() {
+        let painter = Arc::new(StubVolumePainter::painting());
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.set_pane_count(2);
+        h.make_pane_volume(1);
+        h.gui_mut().set_volume_painter(Some(painter.clone()));
+        h.load_scan("KTLX");
+        let shown = h
+            .gui_mut()
+            .pane(1)
+            .expect("pane 1")
+            .scan_info
+            .as_ref()
+            .expect("a scan")
+            .timestamp;
+        // The archive is one volume behind, which is the steady state while a
+        // real-time feed is running.
+        let archived = shown - chrono::Duration::minutes(6);
+        h.set_archive_volume("KTLX", Some(archived));
+        h.frames_for(2, FRAME_DT);
+
+        let seen = painter.seen.lock().unwrap();
+        let frame = seen.last().expect("the painter was asked");
+        assert_eq!(
+            frame.target.volume.collected, archived,
+            "the grid must be asked for against the archive volume, not the displayed one",
+        );
+        assert_eq!(frame.target.volume.site, "KTLX");
     }
 
     /// A moment the radar does not measure directly is refused by name, before
@@ -1243,5 +1461,72 @@ mod volume_arm_tests {
             h.volume_arms()[0].outcome.as_deref(),
             Some("a very specific reason"),
         );
+    }
+
+    // --- The caption: everything the pane claims about the picture ----------
+
+    /// The caption names the archived volume and its time.
+    ///
+    /// A 3D pane in live mode is showing a volume some minutes behind the plan
+    /// view beside it. The one thing that must not happen is for it to look
+    /// current, so "archived" and the time are both in the first line.
+    #[test]
+    fn the_caption_names_the_archived_volume_and_when_it_was_collected() {
+        let lines = volume_caption("KTLX", at(33), None);
+        assert!(
+            lines[0].contains("KTLX")
+                && lines[0].contains("archived")
+                && lines[0].contains("22:33"),
+            "the first line must name the site, that it is archived, and when: {lines:?}",
+        );
+    }
+
+    /// When the app has another volume for the site, the pane names its time —
+    /// and when it is the same one, it says nothing.
+    ///
+    /// Both halves matter. Without the first, a user comparing a live plan view
+    /// with this pane has to notice two timestamps in opposite corners. Without
+    /// the second, the line appears on every ordinary archive view and is
+    /// promptly learned to be noise.
+    ///
+    /// The time is asserted, not just the line's presence: naming the *other*
+    /// volume is the whole of what this can honestly say — `shown` is a per-site
+    /// timestamp and knows nothing about which panes exist or what kind they are
+    /// — and a line that appeared with the wrong number would be worse than no
+    /// line at all.
+    #[test]
+    fn the_caption_names_the_other_volume_the_app_has_for_the_site() {
+        let differs = volume_caption("KTLX", at(33), Some(at(39)));
+        let named = differs
+            .iter()
+            .find(|l| l.contains("22:39"))
+            .unwrap_or_else(|| panic!("a divergence must be said out loud: {differs:?}"));
+        assert!(
+            named.contains("KTLX"),
+            "the other volume must be named for a site, or a two-site layout \
+             cannot tell whose it is: {named}",
+        );
+        assert!(
+            !named.contains("22:33"),
+            "the line must name the volume that is *not* on this pane: {named}",
+        );
+
+        let agrees = volume_caption("KTLX", at(33), Some(at(33)));
+        assert_eq!(
+            agrees.len(),
+            differs.len() - 1,
+            "no divergence, no line: {agrees:?}",
+        );
+        assert!(
+            !agrees.iter().any(|l| l.contains("current")),
+            "no divergence, no line: {agrees:?}",
+        );
+    }
+
+    fn at(minute: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 30)
+            .expect("a real date")
+            .and_hms_opt(22, minute, 0)
+            .expect("a real time")
     }
 }

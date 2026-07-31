@@ -9,11 +9,12 @@ const DEFAULT_INITIAL_ZOOM: f64 = 7.0;
 use crate::pane::{ColorScaleOrientation, PaneId, PaneLayout, PaneState};
 use crate::tiles::MapTileState;
 use crate::ui_layout::{LayoutCtx, ModalityLatch};
-use chrono::Timelike;
+use chrono::{NaiveDateTime, Timelike};
 use egui::Context;
 use rustdar_overlays::render::overlay_state::{OverlayKind, OverlayRegistry};
 use rustdar_radar::types::{RadarProduct, ScanInfo};
 use rustdar_units::UserPreferences;
+use std::collections::HashMap;
 
 #[path = "ui_chrome.rs"]
 mod chrome;
@@ -219,6 +220,10 @@ pub struct Gui {
     notifier_endpoint: String,
     /// What the real-time feed is doing, refreshed each frame by the App.
     chunk_status: ChunkFeedStatus,
+    /// When the archive last published a volume for each site, refreshed each
+    /// frame by the App. The only volumes a 3D pane is built from — see
+    /// `App::archive_scans` for why a live one is not one of them.
+    archive_volumes: HashMap<String, NaiveDateTime>,
     time_dialog: TimeDialogState,
     initial_zoom_set: bool,
     // --- Map tiles (shared across panes) ---
@@ -661,6 +666,7 @@ impl Gui {
             chunk_notifications: true,
             notifier_endpoint: crate::DEFAULT_NOTIFIER_ENDPOINT.to_string(),
             chunk_status: ChunkFeedStatus::default(),
+            archive_volumes: HashMap::new(),
             auto_poll: AutoPollState {
                 last_fetch_time: None,
                 enabled: true,
@@ -1021,6 +1027,25 @@ impl Gui {
 
     pub fn chunk_status(&self) -> &ChunkFeedStatus {
         &self.chunk_status
+    }
+
+    /// Publish the most recent archive volume for each site — the only volumes a
+    /// 3D pane is built from.
+    ///
+    /// Pushed in by the App each frame, the same arrangement as
+    /// [`Self::set_chunk_status`] and for the same reason: the decoded volumes
+    /// live there, and this crate holds only their names.
+    pub fn set_archive_volumes(&mut self, volumes: HashMap<String, NaiveDateTime>) {
+        self.archive_volumes = volumes;
+    }
+
+    /// When the archive last published a volume for `site`, if this build has it.
+    ///
+    /// `None` is an ordinary state and the reason a 3D pane says "waiting": it is
+    /// what a site looks like before its first archive poll returns, including
+    /// while the real-time feed is already drawing a plan view beside it.
+    pub fn archive_volume_for(&self, site: &str) -> Option<NaiveDateTime> {
+        self.archive_volumes.get(site).copied()
     }
 
     /// The distinct sites some pane is watching live — the unit the chunk feed
