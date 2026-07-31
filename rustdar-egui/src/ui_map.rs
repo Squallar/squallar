@@ -608,6 +608,31 @@ impl super::Gui {
     /// correct for what it describes. The ring is a rendering convenience; the
     /// track is where the beam went.
     ///
+    /// # And the track is a polyline, because the cut is a great circle
+    ///
+    /// A straight segment between the two projected endpoints is a **rhumb
+    /// line**: straight in Web Mercator is constant bearing, not shortest path.
+    /// The section is cut along a great circle
+    /// ([`rustdar_radar::beam::great_circle_point`], the same walk
+    /// `tilt_curves` samples), and the two part company in the middle. Measured
+    /// on a 229 km line at 41 °N — a full-range line at the latitude of the
+    /// northern-tier sites — the peak separation is **894 m** running east-west
+    /// and 907 m running north-east. That is ~3.5× the 258 m ring offset above,
+    /// which has a doc block of its own, and about 2.9 px at a zoom filling the
+    /// pane. It is also the one error a user is placed to notice, because the
+    /// track is drawn over the echo the section was aimed at.
+    ///
+    /// So the track is subdivided rather than documented. At
+    /// [`SECTION_TRACK_SAMPLES`] segments the residual falls as the square of
+    /// the count — under a metre, comfortably inside the ring offset that is
+    /// already accepted — and it costs 32 projections per track per frame.
+    ///
+    /// The **rubber band is deliberately still a straight segment.** It is a
+    /// preview of a gesture in progress and its endpoints are pixels on purpose
+    /// (see `Gui::section_rubber_band`), so it tracks the finger exactly even on
+    /// a frame where a wheel-zoom moved the map. The line only becomes a claim
+    /// about ground when it is committed, and that is the one this curves.
+    ///
     /// # Reading `self.panes` from inside the pane loop is safe *here*
     ///
     /// The loop has `mem::take`n the pane being drawn, so its slot reads as a
@@ -637,11 +662,11 @@ impl super::Gui {
             let Some(line) = section.line else {
                 continue;
             };
-            paint_section_track(painter, project(line.a()), project(line.b()), pane_rect);
+            paint_section_track(painter, &great_circle_track(line, project), pane_rect);
         }
 
         if let Some((from, to)) = self.section_rubber_band(pane_idx) {
-            paint_section_track(painter, from, to, pane_rect);
+            paint_section_track(painter, &[from, to], pane_rect);
         }
     }
 
@@ -1272,7 +1297,35 @@ fn paint_pane_empty_state(ui: &mut egui::Ui, pane_rect: egui::Rect, text: &str) 
 /// spectrum. A track has to stay findable over a 70 dBZ core.
 const SECTION_TRACK_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 214, 10);
 
-/// Paint one section ground track: a line with a cap at each end.
+/// Segments a committed ground track is drawn with.
+///
+/// The chord error of a subdivided great circle falls as the square of the
+/// count, so 32 turns the 894 m peak measured in `draw_section_tracks` into
+/// under a metre — an order of magnitude inside the 258 m range-ring offset that
+/// module already accepts and documents.
+const SECTION_TRACK_SAMPLES: usize = 32;
+
+/// The screen polyline of the great circle a section is cut along.
+///
+/// Split out from the painting for the same reason `tilt_curves` is: the
+/// geometry is the part that can be wrong, and a wrongness that only shows up as
+/// "the line looked slightly off" is one nothing can fail on.
+fn great_circle_track(
+    line: crate::pane::SectionLine,
+    project: impl Fn(crate::pane::GeoPoint) -> egui::Pos2,
+) -> Vec<egui::Pos2> {
+    let a = (line.a().lat, line.a().lon);
+    let b = (line.b().lat, line.b().lon);
+    (0..=SECTION_TRACK_SAMPLES)
+        .map(|i| {
+            let t = i as f64 / SECTION_TRACK_SAMPLES as f64;
+            let (lat, lon) = rustdar_radar::beam::great_circle_point(a, b, t);
+            project(crate::pane::GeoPoint { lat, lon })
+        })
+        .collect()
+}
+
+/// Paint one section ground track: a polyline with a cap at each end.
 ///
 /// Clipped to the pane rather than to the whole panel, so a track belonging to a
 /// map in one pane cannot be drawn across the pane beside it — the projector is
@@ -1281,20 +1334,21 @@ const SECTION_TRACK_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 214, 10)
 /// The end caps are what make the track readable as a *section* rather than as
 /// one more line on a busy map: they mark which end is the left-hand column of
 /// the picture, which is otherwise unguessable.
-fn paint_section_track(
-    painter: &egui::Painter,
-    from: egui::Pos2,
-    to: egui::Pos2,
-    pane_rect: egui::Rect,
-) {
+fn paint_section_track(painter: &egui::Painter, points: &[egui::Pos2], pane_rect: egui::Rect) {
+    let (Some(&from), Some(&to)) = (points.first(), points.last()) else {
+        return;
+    };
     let painter = painter.with_clip_rect(pane_rect);
     // A dark halo under the line, so it reads over both a light basemap and a
     // dark radar core without the line itself having to be thick.
-    painter.line_segment(
-        [from, to],
+    painter.add(egui::Shape::line(
+        points.to_vec(),
         egui::Stroke::new(4.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140)),
-    );
-    painter.line_segment([from, to], egui::Stroke::new(2.0, SECTION_TRACK_COLOR));
+    ));
+    painter.add(egui::Shape::line(
+        points.to_vec(),
+        egui::Stroke::new(2.0, SECTION_TRACK_COLOR),
+    ));
     for (pos, label) in [(from, "A"), (to, "B")] {
         painter.circle_filled(pos, 4.0, SECTION_TRACK_COLOR);
         painter.circle_stroke(pos, 4.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
@@ -1388,6 +1442,91 @@ pub(super) fn compute_hover_info_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The committed ground track follows the great circle the cut follows, not
+    /// the rhumb line a straight screen segment would draw.
+    ///
+    /// Straight in Web Mercator is *constant bearing*, not shortest path, and the
+    /// section is cut along a great circle. On a 229 km line at 41 °N — a
+    /// full-range line at the latitude of the northern-tier sites — the two part
+    /// by 894 m in the middle, three times the range-ring offset that has a doc
+    /// block of its own, and the user is placed to notice it because the track is
+    /// drawn over the echo the section was aimed at.
+    ///
+    /// The projector is stubbed with a plain Web Mercator, which is what
+    /// `walkers` projects with — the pane's zoom and centre are an affine
+    /// transform on top and cannot turn a curve into a line.
+    #[test]
+    fn a_committed_track_bows_the_way_the_cut_does() {
+        // 229 km due east at 41 °N, the orientation where a rhumb line and a
+        // great circle are furthest apart.
+        let lat = 41.0_f64;
+        let dlon = 229.0 / (111.32 * lat.to_radians().cos());
+        let line = crate::pane::SectionLine::new(
+            crate::pane::GeoPoint { lat, lon: -97.0 },
+            crate::pane::GeoPoint {
+                lat,
+                lon: -97.0 + dlon,
+            },
+        )
+        .expect("a valid line");
+
+        // Web Mercator on a 6371 km sphere, scaled so that one point is one
+        // metre of *ground* at this latitude — Mercator's local scale factor is
+        // `1/cos(lat)`, so the `cos` is what makes the assertion below readable
+        // in metres rather than in projected units.
+        let scale = 6_371_000.0 * lat.to_radians().cos();
+        let project = |p: crate::pane::GeoPoint| {
+            let y = (std::f64::consts::FRAC_PI_4 + p.lat.to_radians() / 2.0)
+                .tan()
+                .ln();
+            egui::pos2((p.lon.to_radians() * scale) as f32, (-y * scale) as f32)
+        };
+
+        let track = great_circle_track(line, project);
+        assert_eq!(track.len(), SECTION_TRACK_SAMPLES + 1);
+        assert_eq!(
+            (track[0], track[SECTION_TRACK_SAMPLES]),
+            (project(line.a()), project(line.b())),
+            "the track no longer starts and ends where the user put it"
+        );
+
+        // How far the drawn track departs from the straight segment it replaced,
+        // measured perpendicular to that segment.
+        let (a, b) = (track[0], track[SECTION_TRACK_SAMPLES]);
+        let seg = b - a;
+        let len = seg.length();
+        let bow = track
+            .iter()
+            .map(|p| ((*p - a).x * seg.y - (*p - a).y * seg.x).abs() / len)
+            .fold(0.0_f32, f32::max);
+        assert!(
+            (700.0..1100.0).contains(&bow),
+            "the track bows {bow} m off the straight segment; a rhumb line bows \
+             0 and the great circle bows ~894"
+        );
+
+        // And every segment of it is a chord of that curve rather than a
+        // resampling of the straight line: the subdivision has to *reduce* the
+        // residual, which is the whole reason for it.
+        let mid = track[SECTION_TRACK_SAMPLES / 2];
+        let next = track[SECTION_TRACK_SAMPLES / 2 + 1];
+        let chord = (next - mid).length();
+        assert!(
+            chord < len / (SECTION_TRACK_SAMPLES as f32) * 1.05,
+            "the polyline is not evenly subdivided"
+        );
+    }
+
+    /// A track with no points paints nothing rather than panicking on `first`.
+    #[test]
+    fn an_empty_track_paints_nothing() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
+        let painter = egui::Painter::new(ctx, egui::LayerId::debug(), rect);
+        paint_section_track(&painter, &[], rect);
+    }
 
     /// The string the status bar shows, for hover points at hand-checkable
     /// offsets from a real site.

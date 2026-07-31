@@ -5684,6 +5684,43 @@ mod section_dispatch_tests {
         assert_eq!(state(&app).rendered_for, None);
     }
 
+    /// A dispatch for a pane the dispatcher does not have refuses rather than
+    /// panicking, and takes no budget on the way out.
+    ///
+    /// Unreachable today: the only caller reaches `spawn_section_render` through
+    /// `pane_render.get(pane_idx)` two lines earlier. It is pinned because the
+    /// two `pane_render` indexes inside straddle the in-flight increment and the
+    /// `RenderGuard`, so the panic a future caller would earn would leave the
+    /// render budget permanently short by one as well as taking down the frame
+    /// thread — and on wasm the budget is one.
+    #[test]
+    fn a_dispatch_for_a_pane_that_does_not_exist_refuses_instead_of_panicking() {
+        let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
+        let target = app.section_target_for_pane(0).expect("aimed with a volume");
+        let data = Arc::clone(app.scan_data.get(SITE).expect("the site has a volume"));
+        assert_eq!(app.render.pane_render.len(), 1, "precondition");
+
+        let dispatched = app.render.spawn_section_render(
+            7,
+            &target,
+            &data,
+            35.3333,
+            -97.2778,
+            app.channels.section_sender.clone(),
+            None,
+        );
+
+        assert!(!dispatched, "a pane that does not exist got a cut");
+        assert_eq!(
+            app.render
+                .renders_in_flight
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the refusal took a render slot with it, so the budget is short by \
+             one for the life of the process"
+        );
+    }
+
     /// A cut of the right shape and no content, for the receive path.
     fn blank_cut() -> Box<rustdar_radar::xsect::CrossSection> {
         use rustdar_radar::sampler::SampleStatus;
