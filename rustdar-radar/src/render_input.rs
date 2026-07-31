@@ -2285,6 +2285,65 @@ mod tests {
         }
     }
 
+    /// Every extras tag is pinned to a literal index, because the index *is*
+    /// the wire code.
+    ///
+    /// The same discipline as [`RadarProduct::wire_code`] and
+    /// [`RenderView::wire_code`], for the one table in this module whose wire
+    /// codes are never written down: an extra's tag byte is its position in
+    /// [`ALL_SLOTS`], produced by `.enumerate()` in `sweep_data` and consumed
+    /// by `ALL_SLOTS.get(code as usize)` in `to_scan`. Both ends read the same
+    /// array, so **reordering it renumbers the wire consistently on both
+    /// sides** and no round-trip test can see it — `input == from_bytes(to_bytes(input))`
+    /// holds for any order, and so does every distinctness claim.
+    ///
+    /// What a reorder costs is a misparse, not a refusal. Swap indices 2 and 3
+    /// and a stale worker's differential reflectivity arrives on the φDP field
+    /// of the HHC's reconstructed radial; the classifier reads a plausible
+    /// number off the wrong moment and produces a category field with no
+    /// `NaN`, no blank frame, and nothing to refuse. The literals below are
+    /// the only thing standing between that and a green suite.
+    #[test]
+    fn every_extras_slot_is_pinned_to_its_wire_index() {
+        // Written out, not derived: deriving these from `ALL_SLOTS` would
+        // re-import exactly the self-consistency this test exists to remove.
+        let table: [(u8, MomentSlot); 6] = [
+            (0, MomentSlot::Reflectivity),
+            (1, MomentSlot::Velocity),
+            (2, MomentSlot::SpectrumWidth),
+            (3, MomentSlot::DifferentialReflectivity),
+            (4, MomentSlot::DifferentialPhase),
+            (5, MomentSlot::CorrelationCoefficient),
+        ];
+        for (code, slot) in table {
+            // The encoder's side: `.enumerate()` hands out this position.
+            assert_eq!(
+                ALL_SLOTS[code as usize], slot,
+                "wire index {code} is {:?} now, not {slot:?} — a stale worker's \
+                 {:?} would land on {slot:?}'s field",
+                ALL_SLOTS[code as usize], ALL_SLOTS[code as usize],
+            );
+            // The decoder's side, spelled the way `to_scan` spells it.
+            assert_eq!(
+                ALL_SLOTS.get(code as usize),
+                Some(&slot),
+                "wire index {code} no longer decodes to {slot:?}",
+            );
+        }
+        assert_eq!(
+            table.len(),
+            ALL_SLOTS.len(),
+            "a moment slot joined `ALL_SLOTS` without being given a literal \
+             wire index in the table above",
+        );
+        // The N+1 guard, and it is the decoder's own bound: `to_scan` drops a
+        // tag this answers `None` for, and `from_bytes` refuses the frame. If
+        // this ever decodes, a slot was appended and the table above has
+        // stopped being the whole wire.
+        assert_eq!(ALL_SLOTS.get(table.len()), None);
+        assert_eq!(ALL_SLOTS.get(u8::MAX as usize), None);
+    }
+
     /// The hybrid classification's payload carries every sweep with every
     /// moment (the extras), plus the environmental heights — and the whole
     /// bundle survives the byte round trip. The fixture volume carries only

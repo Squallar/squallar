@@ -1143,6 +1143,84 @@ mod tests {
         assert_eq!(a_voxel_job().to_bytes()[0], TAG_VOXELS);
     }
 
+    /// Every job tag is pinned to the literal byte it ships as.
+    ///
+    /// [`no_two_job_tags_collide`] above asserts distinctness, and the round
+    /// trip asserts the two ends agree — but **both survive a renumbering**,
+    /// because both read the constants they are checking. Swap
+    /// [`TAG_LEVEL3_PAIR`]'s 4 with [`TAG_VOXELS`]'s 6 and every tag is still
+    /// distinct, every job still round-trips through this build, and the whole
+    /// workspace still passes.
+    ///
+    /// What that costs is already written down above the constants: a job
+    /// landing in the `TAG_LEVEL3_PAIR` arm reads two `f64`s and a `u32`
+    /// length and then takes the rest, so on another kind's plausible bytes it
+    /// *succeeds* and renders a VIL-density product out of the wrong geometry.
+    /// The tag is a contract between two builds — a page that renumbers is
+    /// talking to workers that did not — so the numbers have to be written
+    /// out, not read back.
+    #[test]
+    fn every_job_tag_is_the_literal_byte_it_ships_as() {
+        // Deliberately spelled out. Do not regenerate this from the constants.
+        let table: [(&str, u8, u8); 6] = [
+            ("TAG_RADAR", TAG_RADAR, 1),
+            ("TAG_LEVEL3", TAG_LEVEL3, 2),
+            ("TAG_SRM_RETIRED", TAG_SRM_RETIRED, 3),
+            ("TAG_LEVEL3_PAIR", TAG_LEVEL3_PAIR, 4),
+            ("TAG_SECTION", TAG_SECTION, 5),
+            ("TAG_VOXELS", TAG_VOXELS, 6),
+        ];
+        for (name, actual, expected) in table {
+            assert_eq!(
+                actual, expected,
+                "{name} moved on the wire: it is {actual} now, not {expected}",
+            );
+        }
+
+        // And the encoder really posts those bytes — the constant could be
+        // right while the arm that writes it is not. Every constructible kind,
+        // framed against its literal rather than against its own constant.
+        let framing: [(JobRequest, u8); 5] = [
+            (a_job(), 1),
+            (a_level3_job(), 2),
+            (a_level3_pair_job(), 4),
+            (a_section_job(), 5),
+            (a_voxel_job(), 6),
+        ];
+        for (job, tag) in framing {
+            let bytes = job.to_bytes();
+            assert_eq!(
+                bytes[0],
+                tag,
+                "{:?} posts tag {}, not {tag} — a worker of another build \
+                 decodes it as whatever {} names there",
+                job.kind(),
+                bytes[0],
+                bytes[0],
+            );
+            assert_eq!(
+                JobRequest::from_bytes(&bytes),
+                Some(job.clone()),
+                "{:?} did not decode back from its own framing",
+                job.kind(),
+            );
+        }
+
+        // The unallocated bytes on either end of the table stay unallocated.
+        // A seventh kind added without a line in the table above makes 7
+        // decode, and this is what says so.
+        let mut bytes = a_voxel_job().to_bytes();
+        for unallocated in [0u8, 7] {
+            bytes[0] = unallocated;
+            assert_eq!(
+                JobRequest::from_bytes(&bytes),
+                None,
+                "tag {unallocated} decodes, so the table above has stopped \
+                 being the whole wire",
+            );
+        }
+    }
+
     /// The product is on the wire twice — in the request geometry and inside
     /// the payload — and a disagreement is refused rather than drawn.
     ///
