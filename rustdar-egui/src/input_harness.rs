@@ -690,6 +690,22 @@ impl InputHarness {
         self.gui.set_section_draw_armed(armed);
     }
 
+    /// Whether the 3D region drag is armed — the *other* modal drag on a map
+    /// pane, and the one the cross-section draw has to be mutually exclusive
+    /// with.
+    pub(crate) fn region_arm(&self) -> bool {
+        self.gui.region_arm_for_test()
+    }
+
+    /// Arm or disarm the 3D region drag, through the same setter the menu uses.
+    ///
+    /// Deliberately the real setter and not a field write: arming this is what
+    /// disarms the cross-section draw, and a test that reached past that rule
+    /// would be testing a state the app cannot be in.
+    pub(crate) fn set_region_arm(&mut self, on: bool) {
+        self.gui.set_region_arm_for_test(on);
+    }
+
     /// The line pane `idx` is aimed along, if it is a section pane with one.
     pub(crate) fn section_line(&self, idx: usize) -> Option<SectionLine> {
         self.gui.pane(idx)?.cross_section()?.line
@@ -6840,5 +6856,242 @@ mod tests {
             "a drag on a section pane aimed it at itself"
         );
         assert!(h.section_draw_armed(), "the mode should still be waiting");
+    }
+
+    // --- The two armed modal drags, together --------------------------------
+    //
+    // Neither feature's author could have written these: the cross-section draw
+    // and the 3D region drag were built on the same base, in parallel, and this
+    // is the first branch on which both exist. Everything below is about the
+    // pair rather than about either one.
+
+    /// **Arming either modal drag disarms the other, and the menu says so.**
+    ///
+    /// The two entries are adjacent checkboxes in the same submenu and they arm
+    /// the same gesture — press, move, release, on a map pane. With both on, one
+    /// drag would have to mean two things at once, so exactly one may be armed.
+    ///
+    /// Driven through the drawer's own checkboxes rather than through the
+    /// setters, because the claim is about what a user sees: the box that
+    /// un-ticked itself has to *read* as un-ticked, or the mode they think they
+    /// are in is not the one a drag will do. A rule enforced only in the setter
+    /// would leave two ticked boxes on screen and one working gesture.
+    #[test]
+    fn arming_either_modal_drag_un_ticks_the_other_in_the_menu() {
+        let mut h = compact_with_drawer();
+        h.load_scan("KTLX");
+        assert!(!h.section_draw_armed() && !h.region_arm(), "both start off");
+
+        // Region first, then section.
+        h.mouse_click(clickable_leaf(&h, crate::ui::REGION_ARM_LABEL).center());
+        h.frames_for(3, FRAME_DT);
+        assert!(h.region_arm(), "the region checkbox did not arm the drag");
+
+        h.set_drawer_open(true);
+        h.frames_for(2, FRAME_DT);
+        h.mouse_click(clickable_leaf(&h, crate::ui::DRAW_CROSS_SECTION_LABEL).center());
+        h.frames_for(3, FRAME_DT);
+        assert!(h.section_draw_armed(), "the section checkbox did not arm");
+        assert!(
+            !h.region_arm(),
+            "both drags are armed: one press would anchor a line and start a box"
+        );
+
+        h.set_drawer_open(true);
+        h.frames_for(2, FRAME_DT);
+        assert_eq!(
+            h.menu_leaf(crate::ui::REGION_ARM_LABEL).map(|l| l.value),
+            Some(Some(false)),
+            "the region checkbox still shows ticked after being un-armed"
+        );
+        assert_eq!(
+            h.menu_leaf(crate::ui::DRAW_CROSS_SECTION_LABEL)
+                .map(|l| l.value),
+            Some(Some(true)),
+            "the section checkbox does not show the mode it just turned on"
+        );
+
+        // And the other way round, which is not symmetric for free: the two
+        // dispatcher arms are separate code.
+        h.mouse_click(clickable_leaf(&h, crate::ui::REGION_ARM_LABEL).center());
+        h.frames_for(3, FRAME_DT);
+        assert!(h.region_arm(), "the region checkbox did not re-arm");
+        assert!(
+            !h.section_draw_armed(),
+            "arming the region drag left the section draw armed"
+        );
+
+        h.set_drawer_open(true);
+        h.frames_for(2, FRAME_DT);
+        assert_eq!(
+            h.menu_leaf(crate::ui::DRAW_CROSS_SECTION_LABEL)
+                .map(|l| l.value),
+            Some(Some(false)),
+            "the section checkbox still shows ticked after being un-armed"
+        );
+    }
+
+    /// **A back press cancels whichever modal drag is armed.**
+    ///
+    /// One layer for both, below every painted layer — see
+    /// `Gui::dismiss_top_layer`. The reason it matters for the region drag is the
+    /// reason it mattered for the section draw: on Android a back press with a
+    /// mode on would otherwise exit the app, which is the reading of it least
+    /// likely to be what was meant.
+    #[test]
+    fn a_back_press_cancels_whichever_modal_drag_is_armed() {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.load_scan("KTLX");
+
+        h.set_region_arm(true);
+        assert!(h.gui_mut().dismiss_top_layer(), "the region drag was armed");
+        assert!(!h.region_arm());
+
+        h.set_section_draw_armed(true);
+        assert!(h.gui_mut().dismiss_top_layer(), "the draw was armed");
+        assert!(!h.section_draw_armed());
+
+        assert!(
+            !h.gui_mut().dismiss_top_layer(),
+            "with nothing left, a back press is a request to leave the app"
+        );
+    }
+
+    /// **Two appliers, and never both with something to apply.**
+    ///
+    /// `Gui::ui` runs `apply_pending_section_line` and then
+    /// `apply_pending_region` after the pane loop, and each of them can grow the
+    /// layout. Two growths in one frame is the case neither feature was written
+    /// for: the second applier's target rule would run against a layout the first
+    /// had already changed, and in a full layout both rules' last resort is the
+    /// same pane — so the second would convert the pane the first had just
+    /// filled, and one of two completed gestures would visibly produce nothing.
+    ///
+    /// It cannot happen, and this is why: arming is exclusive, only an armed mode
+    /// records a pending, and each pending is recorded and consumed inside one
+    /// frame. So one drag, however the modes were armed, produces **one** new
+    /// pane of **one** kind — the kind the mode armed *last* asked for.
+    ///
+    /// Asserted on the pane count as well as the kinds, because a rule that
+    /// produced the right kind by converting a pane the other applier had just
+    /// grown would leave the count at three and one of the two panes empty.
+    #[test]
+    fn two_appliers_never_both_have_something_to_apply() {
+        for section_last in [true, false] {
+            let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+            h.load_scan("KTLX");
+            // Both armed, in turn, through the setters the menu uses. The second
+            // call is what disarms the first, and that is the whole subject.
+            if section_last {
+                h.set_region_arm(true);
+                h.set_section_draw_armed(true);
+            } else {
+                h.set_section_draw_armed(true);
+                h.set_region_arm(true);
+            }
+            h.warm_up();
+            let before = h.pane_kinds().len();
+            assert_eq!(before, 1, "precondition: one map pane to drag on");
+
+            let pane = h.pane_rects()[0];
+            let from = pane.center() - egui::vec2(120.0, 60.0);
+            let to = pane.center() + egui::vec2(120.0, 60.0);
+            h.mouse_move(from);
+            h.frame();
+            h.mouse_press(from);
+            h.frame();
+            for step in 1..=4 {
+                h.mouse_move(from + (to - from) * (step as f32 / 4.0));
+                h.frame();
+            }
+            h.mouse_release(to);
+            h.frames_for(2, FRAME_DT);
+
+            let kinds = h.pane_kinds();
+            assert_eq!(
+                kinds.len(),
+                before + 1,
+                "one drag grew the layout to {} panes (section_last={section_last}): {kinds:?}",
+                kinds.len(),
+            );
+            assert_eq!(kinds[0], PaneKind::Map, "the map under the drag was spent");
+            let wanted = if section_last {
+                PaneKind::CrossSection
+            } else {
+                PaneKind::Volume
+            };
+            assert_eq!(
+                kinds[1], wanted,
+                "the mode armed last is not the one the drag did \
+                 (section_last={section_last})",
+            );
+            assert_eq!(
+                kinds.iter().filter(|k| **k != PaneKind::Map).count(),
+                1,
+                "one drag produced two non-map panes: {kinds:?}",
+            );
+        }
+    }
+
+    /// **While the section draw is armed, a drag commits no region — and the
+    /// converse.**
+    ///
+    /// The narrower claim under the test above, and the one that would break
+    /// first. The two gestures are read by *different* code on different paths:
+    /// the section draw goes through `InteractionState::resolve_armed`, while
+    /// `handle_region_drag` reads `ui.ctx().input()` raw from inside `Map::show`.
+    /// Neither path knows about the other, so if the exclusion at the menu were
+    /// ever relaxed both would fire from the same press — and the symptom would
+    /// be a section pane *and* a 3D pane from one drag, which is exactly what a
+    /// reader would assume could not happen.
+    #[test]
+    fn an_armed_section_drag_leaves_no_region_behind_and_the_converse() {
+        for section in [true, false] {
+            let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+            h.load_scan("KTLX");
+            if section {
+                h.set_section_draw_armed(true);
+            } else {
+                h.set_region_arm(true);
+            }
+            h.warm_up();
+
+            let pane = h.pane_rects()[0];
+            let from = pane.center() - egui::vec2(120.0, 60.0);
+            let to = pane.center() + egui::vec2(120.0, 60.0);
+            h.mouse_move(from);
+            h.frame();
+            h.mouse_press(from);
+            h.frame();
+            for step in 1..=4 {
+                h.mouse_move(from + (to - from) * (step as f32 / 4.0));
+                h.frame();
+            }
+            h.mouse_release(to);
+            h.frames_for(2, FRAME_DT);
+
+            let panes = h.pane_kinds().len();
+            let aimed_regions = (0..panes)
+                .filter(|idx| {
+                    h.gui_mut()
+                        .pane(*idx)
+                        .and_then(|p| p.volume())
+                        .is_some_and(|v| v.region.is_some())
+                })
+                .count();
+            let lines = (0..panes)
+                .filter(|idx| h.section_line(*idx).is_some())
+                .count();
+            if section {
+                assert_eq!(lines, 1, "the drag drew no section line");
+                assert_eq!(
+                    aimed_regions, 0,
+                    "a section drag also committed a 3D region"
+                );
+            } else {
+                assert_eq!(aimed_regions, 1, "the drag committed no region");
+                assert_eq!(lines, 0, "a region drag also drew a section line");
+            }
+        }
     }
 }
