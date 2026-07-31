@@ -1794,6 +1794,52 @@ mod tests {
         );
     }
 
+    /// The *declared* ceiling needs the same wrap correction the ladder's keys
+    /// get, and nothing else in the suite notices when it is missing.
+    ///
+    /// The cut table is read twice — once per sweep to key a rung, once over
+    /// the whole table for [`VolumeSampler::top_declared_cut_deg`] — and only
+    /// the first read is covered by
+    /// `a_cut_angle_past_180_degrees_wraps_to_a_negative_elevation`. Drop the
+    /// correction from the second and the ladder is still perfect; what breaks
+    /// is the comparison a caller makes against it.
+    ///
+    /// The cuts here are KMSX's, which declares its base tilt at **359.82°** —
+    /// a real below-horizon cut at a real site, not a constructed one. Left
+    /// unwrapped it is the table's largest number, so `top_declared_cut_deg`
+    /// reports 359.8° for a volume that flew its pattern to the top, every
+    /// section caption reads "topping out at 19.5° of the 359.8°", and
+    /// `describe_missing` calls the cone of silence unflown air — for **every**
+    /// volume at every site whose base tilt is below the horizon.
+    #[test]
+    fn a_below_horizon_declared_cut_does_not_become_the_declared_ceiling() {
+        let scan = Scan::new(
+            vcp(&[359.82, 0.48, 0.88, 1.31, 19.5]),
+            vec![
+                flat_refl_sweep(1, -0.16, 360, 40, 10.0),
+                flat_refl_sweep(2, 0.51, 360, 40, 20.0),
+                flat_refl_sweep(3, 0.90, 360, 40, 30.0),
+                flat_refl_sweep(4, 1.33, 360, 40, 40.0),
+                flat_refl_sweep(5, 19.52, 360, 40, 50.0),
+            ],
+        );
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Reflectivity).unwrap();
+        assert_eq!(
+            sampler.top_declared_cut_deg(),
+            19.5,
+            "the pattern's declared ceiling is a below-horizon cut read \
+             unsigned: the ladder is {sampler:?}",
+        );
+        // The two are compared for equality by every consumer of a short
+        // ladder, so the point of the assertion above is that they agree here:
+        // this volume flew its pattern to the top and must read as complete.
+        assert_eq!(
+            sampler.top_tilt_deg(),
+            sampler.top_declared_cut_deg(),
+            "a complete volume reads as short of its own pattern",
+        );
+    }
+
     /// A volume shaped like a real SAILS one, with the cut table that separates
     /// its two base tilts.
     ///
