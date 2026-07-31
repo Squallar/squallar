@@ -424,6 +424,23 @@ fn paint_axes(
     );
 }
 
+/// The tilt ladder's bright dash.
+///
+/// A function rather than an inline literal so a harness test can ask which
+/// segments in a painted pane are the ladder's. Three different things in this
+/// pane are drawn with `line_segment` — the axis grid, the ladder's halo and the
+/// ladder — and a test that could not tell them apart could not tell a missing
+/// ladder from a grid with more ticks on it.
+pub(crate) fn tilt_rung_color() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 130)
+}
+
+/// The dark halo drawn under [`tilt_rung_color`]. See its use for why alpha
+/// alone does not survive a 65 dBZ core.
+pub(crate) fn tilt_rung_halo() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 90)
+}
+
 /// Trace each elevation cut's beam centre across the section.
 ///
 /// **This is the honest device.** See the module documentation: a section is a
@@ -465,8 +482,8 @@ fn paint_tilt_ladder(
     // Alpha alone does not survive a 65 dBZ core: a faint white line over red
     // disappears exactly where the section most needs to say that its vertical
     // extent is the ladder's rather than the storm's.
-    let halo = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 90);
-    let color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 130);
+    let halo = tilt_rung_halo();
+    let color = tilt_rung_color();
     let painter = painter.with_clip_rect(layout.plot);
 
     for points in curves {

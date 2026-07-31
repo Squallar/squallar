@@ -129,6 +129,10 @@ pub(crate) struct InputHarness {
     last_actions: Vec<crate::actions::GuiAction>,
     /// Every text run painted during the last frame, with its layout rect.
     last_texts: Vec<(egui::Rect, String)>,
+    /// Every textured quad painted during the last frame — see [`PaintedImage`].
+    last_images: Vec<PaintedImage>,
+    /// Every line segment painted during the last frame, with its stroke.
+    last_segments: Vec<(egui::Pos2, egui::Pos2, egui::Stroke)>,
     /// Rects that came back under a different widget id between passes,
     /// accumulated over every frame since the last [`InputHarness::clear_id_changes`].
     /// See [`InputHarness::id_changes`].
@@ -136,6 +140,61 @@ pub(crate) struct InputHarness {
     /// The previous pass's widget bookkeeping, diffed against each new pass by
     /// [`id_changes_between`] to feed [`InputHarness::id_changes`].
     prev_widgets: egui::WidgetRects,
+}
+
+/// A textured quad the last frame painted: where it went, and **which way up**
+/// its texture was mapped onto it.
+///
+/// The second half is the whole reason this exists. `Painter::image` takes a uv
+/// rect, and swapping its corners flips the picture vertically with no error, no
+/// layout change and no visible fault — a flipped section of a mature storm
+/// still looks like a storm, which the section module's own doc calls the single
+/// most likely mistake in it and the least likely to be noticed. Reading the uv
+/// back off the mesh is the only way a test can see it: the shape carries no
+/// image identity beyond a texture id, and the pixels never reach a test at all.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PaintedImage {
+    /// The screen rect the quad covers.
+    pub rect: egui::Rect,
+    /// The texture coordinate at [`rect`](Self::rect)'s top-left corner. `(0,0)`
+    /// for an unflipped image, because egui's uv origin is the texture's top
+    /// left.
+    pub uv_at_top_left: egui::Pos2,
+    /// The texture coordinate at [`rect`](Self::rect)'s bottom-right corner.
+    /// `(1,1)` for an unflipped image.
+    pub uv_at_bottom_right: egui::Pos2,
+}
+
+/// Read a textured quad's geometry back off the mesh `Painter::image` built.
+///
+/// `None` for any mesh that is not one — egui tessellates fonts, shadows and
+/// rounded rectangles into meshes too, and none of them is a four-corner image.
+fn painted_image(mesh: &egui::epaint::Mesh) -> Option<PaintedImage> {
+    if mesh.vertices.len() != 4 {
+        return None;
+    }
+    let mut rect = egui::Rect::NOTHING;
+    for vertex in &mesh.vertices {
+        rect.extend_with(vertex.pos);
+    }
+    // Matched by position rather than by index, because the corner order
+    // `add_rect_with_uv` emits is epaint's business and not something a test
+    // should encode.
+    let uv_at = |corner: egui::Pos2| {
+        mesh.vertices
+            .iter()
+            .min_by(|a, b| {
+                (a.pos - corner)
+                    .length_sq()
+                    .total_cmp(&(b.pos - corner).length_sq())
+            })
+            .map(|v| v.uv)
+    };
+    Some(PaintedImage {
+        rect,
+        uv_at_top_left: uv_at(rect.min)?,
+        uv_at_bottom_right: uv_at(rect.max)?,
+    })
 }
 
 /// The finished pass's widget bookkeeping, read back out of the context.
@@ -245,6 +304,8 @@ impl InputHarness {
             max_texture_side: None,
             last_actions: Vec::new(),
             last_texts: Vec::new(),
+            last_images: Vec::new(),
+            last_segments: Vec::new(),
             id_changes: Vec::new(),
             prev_widgets: egui::WidgetRects::default(),
         };
@@ -406,6 +467,40 @@ impl InputHarness {
     /// out on one line twice as wide as its pane.
     pub(crate) fn painted_text_rects(&self) -> Vec<(egui::Rect, String)> {
         self.last_texts.clone()
+    }
+
+    /// Every textured quad the last frame painted whose rect is inside `rect`.
+    ///
+    /// The other end of [`Self::painted_text_strings_in`]: a section pane's
+    /// picture is not text and cannot be read back as any, so without this the
+    /// only thing a harness test could say about a rendered section was what its
+    /// caption said about it.
+    pub(crate) fn painted_images_in(&self, rect: egui::Rect) -> Vec<PaintedImage> {
+        self.last_images
+            .iter()
+            .copied()
+            .filter(|image| rect.contains(image.rect.center()))
+            .collect()
+    }
+
+    /// Every line segment the last frame painted inside `rect` with `color`.
+    ///
+    /// Filtered by colour because a section pane draws three different things
+    /// with `line_segment` — the axis grid, the tilt ladder's halo and the
+    /// ladder itself — and a count that mixed them could not tell a missing
+    /// ladder from a grid with more ticks on it.
+    pub(crate) fn painted_segments_in(
+        &self,
+        rect: egui::Rect,
+        color: egui::Color32,
+    ) -> Vec<(egui::Pos2, egui::Pos2)> {
+        self.last_segments
+            .iter()
+            .filter(|(a, b, stroke)| {
+                stroke.color == color && rect.contains(*a) && rect.contains(*b)
+            })
+            .map(|&(a, b, _)| (a, b))
+            .collect()
     }
 
     /// Whether `needle` was painted anywhere inside `rect`.
@@ -1368,6 +1463,24 @@ impl InputHarness {
                     egui::Rect::from_min_size(text.pos, text.galley.size()),
                     text.galley.text().to_owned(),
                 )),
+                _ => None,
+            })
+            .collect();
+        self.last_images = full_output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Mesh(mesh) => painted_image(mesh),
+                _ => None,
+            })
+            .collect();
+        self.last_segments = full_output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::LineSegment { points, stroke } => {
+                    Some((points[0], points[1], *stroke))
+                }
                 _ => None,
             })
             .collect();
@@ -6301,6 +6414,217 @@ mod tests {
                 h.painted_text_strings_in(pane)
             );
         }
+    }
+
+    /// 46b. **A rendered section is drawn the right way up, over the caption
+    ///      that describes it, with its ladder on it and its readout live.**
+    ///
+    ///      Test 46 above is the only other thing that drives
+    ///      `render_cross_section` end to end, and it reads back **painted text
+    ///      only**. Every mutation inside the function body that does not change
+    ///      a word therefore survived it: the tilt ladder gated off entirely,
+    ///      `caption_height` reverted to a counted `len * 13.0`, the image's uv
+    ///      flipped so the section is drawn upside down, `hover_value` never
+    ///      written, and the transient status line never pushed into the
+    ///      caption. Five mutants, one test, no failures — because nothing here
+    ///      asserted a shape.
+    ///
+    ///      Two of the five are pointed:
+    ///
+    ///      * **The flip.** `y_of_height` is pinned in the module's own tests
+    ///        and it is only half of the mapping; the image's uv rect is the
+    ///        half that actually turns the picture over, and it was pinned
+    ///        nowhere. The section module's doc calls this "the single most
+    ///        likely mistake in the module and the least likely to be noticed —
+    ///        a flipped section of a mature storm still looks like a storm".
+    ///      * **`caption_height`.** It is the whole of F8's fix. The module's
+    ///        own test computes the height itself and hands it to
+    ///        `SectionLayout::new`, so reverting the production line to a count
+    ///        passes it; only a test that goes through the real wiring, on a
+    ///        pane narrow enough to make the caption *wrap*, can tell.
+    #[test]
+    fn a_rendered_section_is_the_right_way_up_and_carries_its_ladder() {
+        // Narrow and tall on purpose, and the shape is load-bearing twice. The
+        // width makes the caption *wrap* to half a dozen rows, which is the only
+        // condition under which a measured caption height differs from a counted
+        // one by more than a point or two — at 760 points both sentences fit on
+        // one row each, `len * 13.0` lands within two points of the truth, and
+        // the mutant passes. The height keeps it clear of
+        // `TWO_LINE_CAPTION_MIN_HEIGHT` and of `CAPTION_MAX_HEIGHT_FRACTION`, so
+        // the registration caveat is really there to be wrapped.
+        let mut h = InputHarness::with_screen(egui::vec2(480.0, 900.0));
+        h.load_scan("KTLX");
+        let (a, b) = section_ends();
+        h.make_pane_cross_section(0, a, b);
+        h.place_section(0, vcp_212_axes(), &vcp_212_rungs());
+
+        let pane = h.pane_rects()[0];
+        let images = h.painted_images_in(pane);
+        assert_eq!(
+            images.len(),
+            1,
+            "a section pane paints exactly one textured quad, its raster; found \
+             {images:?}"
+        );
+        let raster = images[0];
+        assert!(
+            raster.rect.width() > 0.0 && raster.rect.height() > 0.0,
+            "the raster was painted into an empty rect: {:?}",
+            raster.rect
+        );
+
+        // **The right way up.** egui's uv origin is the texture's top left and
+        // the section's row 0 is the top of the height axis, so the quad's
+        // top-left corner must sample the texture's top-left corner. Swapping
+        // the uv rect's corners flips the picture with no error and no layout
+        // change.
+        assert_eq!(
+            (raster.uv_at_top_left.x, raster.uv_at_top_left.y),
+            (0.0, 0.0),
+            "the top of the section's height axis is sampling the bottom of its \
+             raster: the picture is drawn upside down, and a flipped storm still \
+             looks like a storm"
+        );
+        assert_eq!(
+            (raster.uv_at_bottom_right.x, raster.uv_at_bottom_right.y),
+            (1.0, 1.0),
+            "the section's raster is mirrored or cropped: uv {:?}..{:?}",
+            raster.uv_at_top_left,
+            raster.uv_at_bottom_right
+        );
+
+        // **The caption is paid for.** Every row of it is above the picture, not
+        // over it — which is only true if the layout used the caption's
+        // *measured* wrapped height rather than a count of its lines.
+        // Both sentences, not just the first. A galley's rect spans every row it
+        // wrapped to, and it is the *caveat* — the last line of the block — that
+        // a short measurement pushes onto the picture; the ladder warning is
+        // first and sits above the plot however wrong the height is.
+        let caption_rows: Vec<(egui::Rect, String)> = h
+            .painted_text_rects()
+            .into_iter()
+            .filter(|(rect, text)| {
+                pane.contains(rect.center())
+                    && (text.contains("tilts") || text.contains("slant range"))
+            })
+            .collect();
+        assert_eq!(
+            caption_rows.len(),
+            2,
+            "precondition: both caption sentences have to be on the pane, or the \
+             overlap check below is looking at the wrong thing: {:?}",
+            h.painted_text_strings_in(pane)
+        );
+        let measured: f32 = caption_rows.iter().map(|(rect, _)| rect.height()).sum();
+        let counted = caption_rows.len() as f32 * 13.0;
+        assert!(
+            measured - counted > 15.0,
+            "precondition: the caption occupies {measured} points against a \
+             counted {counted} — they agree at this pane width, so nothing here \
+             says which of the two the layout used: {caption_rows:?}"
+        );
+        for (rect, text) in &caption_rows {
+            assert!(
+                rect.bottom() <= raster.rect.top() + 0.5,
+                "a caption row was painted over the picture (row bottom {}, \
+                 picture top {}): {text:?}",
+                rect.bottom(),
+                raster.rect.top(),
+            );
+        }
+
+        // **The ladder is on it.** The rungs are the section's first honesty
+        // device; without them the picture is a smooth field with nothing saying
+        // which parts of it were measured.
+        let color = crate::ui::map::section_render::tilt_rung_color();
+        // Over everything rather than over the picture: the upper rungs leave
+        // the top of the height axis part way along the line — a 19.5° beam is
+        // 33 km up at 90 km — and are *clipped* when painted rather than
+        // shortened, so filtering on the plot rect would read a real rung as a
+        // missing one.
+        let rungs = h.painted_segments_in(egui::Rect::EVERYTHING, color);
+        assert!(
+            !rungs.is_empty(),
+            "no tilt rungs were drawn over the section, so nothing in the \
+             picture says where the data actually is"
+        );
+        // One polyline per rung: every curve is sampled from the `A` end, so
+        // each contributes exactly one segment starting at the plot's left
+        // edge, and counting those counts the rungs.
+        let left = rungs.iter().map(|(p, _)| p.x).fold(f32::INFINITY, f32::min);
+        let starts = rungs
+            .iter()
+            .filter(|(p, _)| (p.x - left).abs() < 0.01)
+            .count();
+        assert_eq!(
+            starts,
+            vcp_212_rungs().len(),
+            "the ladder drew {starts} curves for a 14-rung section",
+        );
+        // Each curve is traced rather than dashed once, and all of them the
+        // same length.
+        assert_eq!(
+            rungs.len() % starts,
+            0,
+            "{} segments do not divide into {starts} curves",
+            rungs.len()
+        );
+        assert!(
+            rungs.len() >= starts * 32,
+            "the rungs were drawn as {} segments across {starts} curves, which \
+             is not a traced beam centre",
+            rungs.len(),
+        );
+        // And they are on the *picture*, not merely somewhere on the pane.
+        let over_the_picture = h.painted_segments_in(raster.rect, color).len();
+        assert!(
+            over_the_picture * 3 >= rungs.len(),
+            "only {over_the_picture} of {} rung segments landed inside the \
+             raster, so the ladder is not drawn where the data is",
+            rungs.len(),
+        );
+
+        // **The readout is live.** Most of the value of the status plane is the
+        // hover: it is the first place in the codebase that can say *why* a
+        // pixel is blank, and it is written by this function after everything
+        // above it has drawn.
+        h.mouse_move(raster.rect.center());
+        h.frame();
+        let readout = h
+            .gui
+            .pane(0)
+            .expect("pane 0")
+            .hover_value
+            .clone()
+            .expect("a pointer over the picture wrote no readout");
+        assert!(
+            readout.contains("MSL") && readout.contains("along"),
+            "the readout says nothing about where in the section the pointer is: \
+             {readout}"
+        );
+
+        // **A transient state reaches the caption.** It is pushed last, under
+        // the standing warning, so it can never push that off the pane — and a
+        // build that never pushed it at all looks identical.
+        h.gui_mut()
+            .pane_mut(0)
+            .expect("pane 0")
+            .cross_section_mut()
+            .expect("a section pane")
+            .unavailable = Some(crate::pane::SectionUnavailable::AwaitingCoveragePattern);
+        h.frame();
+        let notice = crate::pane::SectionUnavailable::AwaitingCoveragePattern.message();
+        let head = notice
+            .split_whitespace()
+            .take(4)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            h.text_painted_in(pane, &head),
+            "the pane is showing a stale picture with no word of why it is \
+             stale; it painted {:?}",
+            h.painted_text_strings_in(pane)
+        );
     }
 
     /// 47. **A wheel-zoom part-way through a drag does not move the anchor.**

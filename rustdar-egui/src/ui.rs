@@ -37,7 +37,7 @@ pub(crate) use ui_menu::DrawnMenuLeaf;
 #[cfg(test)]
 pub(crate) use ui_menu::VOLUME_PANE_LABEL;
 #[path = "ui_map.rs"]
-mod map;
+pub(crate) mod map;
 /// Re-exported so the input harness can name it: `map` is private to this
 /// module, and the probe is the only thing outside it that has to be.
 #[cfg(test)]

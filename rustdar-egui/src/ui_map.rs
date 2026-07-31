@@ -9,7 +9,7 @@ use rustdar_units::UserPreferences;
 mod pane_render;
 
 #[path = "ui_section_pane.rs"]
-mod section_render;
+pub(crate) mod section_render;
 
 /// What a cross-section pane says while it has nothing to show.
 ///
