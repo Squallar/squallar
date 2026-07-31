@@ -91,6 +91,29 @@ pub struct RenderInput {
     /// its message, and `crate::types::ScanInfo::from_scan` — the one reader of
     /// the pattern anywhere in this workspace — puts it in the chrome.
     vcp: u16,
+    /// Every cut angle the coverage pattern **declares**, in table order and
+    /// exactly as the decoder hands them over — a below-horizon cut arrives as
+    /// ~359.7° here, because wrap-correcting on the way in would make this a
+    /// different table from the one the main thread keys against.
+    ///
+    /// # The reconstruction used to top out wherever the volume did
+    ///
+    /// [`RenderInput::to_scan`] rebuilds the cut table, and before this it
+    /// rebuilt it from the *carried sweeps' own* angles, sized to the largest
+    /// elevation number in the payload. That keys every carried sweep
+    /// correctly, which was all the ladder needed — but it silently loses the
+    /// one fact that distinguishes a volume which flew its whole pattern from
+    /// one that stopped early. A KLNX section cut three rungs in came back with
+    /// a table whose highest angle was 1.3°, so "the ladder reached the top of
+    /// its pattern" was true of every volume ever cut in a worker, and a live
+    /// section captioned itself complete for the whole six minutes it was not.
+    /// Every section goes through this type, so that was every section.
+    ///
+    /// Carrying the real table also makes the reconstruction *more* faithful
+    /// where it was already only nearly so: slots no carried sweep names now
+    /// hold their own declared angle instead of a copy of the nearest carried
+    /// one.
+    declared_cut_angles_deg: Vec<f64>,
     sweeps: Vec<SweepData>,
 }
 
@@ -362,6 +385,12 @@ impl RenderInput {
                 None
             },
             vcp: scan.coverage_pattern().pattern_number().number(),
+            declared_cut_angles_deg: scan
+                .coverage_pattern()
+                .elevation_cuts()
+                .iter()
+                .map(ElevationCut::elevation_angle_degrees)
+                .collect(),
             sweeps,
         })
     }
@@ -512,6 +541,16 @@ impl RenderInput {
             // answer and the sampler refuses it.
             return placeholder_coverage_pattern(self.vcp);
         };
+        // The declared table, when the payload carries one that can key every
+        // sweep in it. This is the whole table the radar was flying, not the
+        // part of it this volume got to, which is the difference between a
+        // section that knows it stopped early and one that cannot tell. The
+        // reconstruction below stands in only for a payload built by hand or by
+        // an older sender, and it is kept rather than removed because it is
+        // what makes the fallback a *worse table* rather than no table.
+        if self.declared_cut_angles_deg.len() >= len {
+            return rebuild_pattern(self.vcp, &self.declared_cut_angles_deg);
+        }
         let mut table = vec![None; len];
         for (index, angle) in &angles {
             table[*index] = Some(*angle);
@@ -521,30 +560,41 @@ impl RenderInput {
         // linear scan would have to special-case.
         let filler = angles[0].1;
         let mut last = filler;
-        let cuts = table
+        let angles: Vec<f64> = table
             .iter()
             .map(|slot| {
                 last = slot.unwrap_or(last);
-                elevation_cut(last)
+                last
             })
             .collect();
-        VolumeCoveragePattern::new(
-            self.vcp,
-            0,
-            0.5,
-            PulseWidth::Unknown,
-            false,
-            0,
-            false,
-            0,
-            false,
-            false,
-            0,
-            false,
-            false,
-            cuts,
-        )
+        rebuild_pattern(self.vcp, &angles)
     }
+}
+
+/// A coverage pattern carrying `angles` and nothing else.
+///
+/// Every other field is left at a neutral default, which is the same decision
+/// [`elevation_cut`] makes per cut and for the same reason: the ladder reads
+/// the angle, and a fabricated SAILS flag or PRF number would be a lie a
+/// consumer could act on. Shared by the declared table and the reconstructed
+/// one so the two cannot come to differ in anything but their angles.
+fn rebuild_pattern(vcp: u16, angles: &[f64]) -> VolumeCoveragePattern {
+    VolumeCoveragePattern::new(
+        vcp,
+        0,
+        0.5,
+        PulseWidth::Unknown,
+        false,
+        0,
+        false,
+        0,
+        false,
+        false,
+        0,
+        false,
+        false,
+        angles.iter().copied().map(elevation_cut).collect(),
+    )
 }
 
 /// How much of the volume a request reads, and — for a tilt request — which
@@ -905,7 +955,13 @@ const MAGIC: [u8; 4] = *b"RDRI";
 /// any of them a reconstructed scan builds a *different ladder* from the one
 /// the main thread built — silently, since none of the failures errors and none
 /// produces a `NaN`.
-const FORMAT_VERSION: u16 = 6;
+/// Version 7 added the coverage pattern's **whole declared cut-angle table**,
+/// after the pattern number. Version 6's table was rebuilt from the carried
+/// sweeps alone, which keys every carried sweep correctly and tops out wherever
+/// the volume did — so a reconstructed scan could not tell a pattern it had
+/// flown to the top from one it had stopped a third of the way up, and every
+/// cross-section in the app is cut from a reconstructed scan.
+const FORMAT_VERSION: u16 = 7;
 
 impl RenderInput {
     /// Encode for transport. Little-endian throughout; gate blobs are copied
@@ -938,6 +994,10 @@ impl RenderInput {
         }
 
         out.extend_from_slice(&self.vcp.to_le_bytes());
+        out.extend_from_slice(&(self.declared_cut_angles_deg.len() as u32).to_le_bytes());
+        for angle in &self.declared_cut_angles_deg {
+            out.extend_from_slice(&angle.to_le_bytes());
+        }
         out.extend_from_slice(&(self.sweeps.len() as u32).to_le_bytes());
         for sweep in &self.sweeps {
             out.extend_from_slice(&sweep.elevation_angle.to_le_bytes());
@@ -1008,6 +1068,13 @@ impl RenderInput {
         };
 
         let vcp = r.u16()?;
+        // Eight bytes per angle, so the claimed count is measured against what
+        // remains before it becomes a capacity.
+        let declared_count = r.u32()?;
+        let mut declared_cut_angles_deg = Vec::with_capacity(r.bounded(declared_count, 8)?);
+        for _ in 0..declared_count {
+            declared_cut_angles_deg.push(r.f64()?);
+        }
         let sweep_count = r.u32()?;
         // A sweep costs at least its own header, so this bounds the count
         // against what is actually left rather than trusting it.
@@ -1073,6 +1140,7 @@ impl RenderInput {
             storm_motion_override,
             env_heights_km_msl,
             vcp,
+            declared_cut_angles_deg,
             sweeps,
         })
     }
@@ -1108,8 +1176,10 @@ impl RenderInput {
                         .sum::<usize>()
             })
             .sum();
-        // `+ 2` for the coverage pattern number, `+ 4` for the sweep count.
-        header + motion + env + 2 + 4 + sweeps
+        // `+ 2` for the coverage pattern number, `+ 4` and its `f64`s for the
+        // declared cut table, `+ 4` for the sweep count.
+        let declared = 4 + self.declared_cut_angles_deg.len() * 8;
+        header + motion + env + 2 + declared + 4 + sweeps
     }
 }
 
@@ -1691,6 +1761,82 @@ mod tests {
         );
     }
 
+    /// **A volume that stopped part way up still knows how far up its pattern
+    /// goes.**
+    ///
+    /// The reconstruction used to size the cut table to the largest elevation
+    /// number the payload carried, filling unnamed slots with a copy of the
+    /// nearest carried angle. That keys every carried sweep correctly, which is
+    /// all the ladder needs — and it silently makes the table's ceiling the
+    /// *volume's* ceiling. Every cross-section in the app is cut from a
+    /// reconstructed scan, so "did this volume reach the top of its pattern?"
+    /// answered yes for all of them, and a live section three rungs into VCP
+    /// 212 captioned itself as complete for the whole six minutes it was not.
+    ///
+    /// Nothing about that failure is visible in the ladder: the rungs are
+    /// right, the heights are right, the raster is right. Only the sentence
+    /// underneath it is wrong, and it is wrong in the reassuring direction.
+    #[test]
+    fn a_part_flown_volume_still_carries_the_ceiling_its_pattern_declares() {
+        // The first cut only, out of a three-cut table: a volume caught early.
+        let whole = cut_table_volume();
+        let part_flown = Scan::new(
+            whole.coverage_pattern().clone(),
+            vec![whole.sweeps()[0].clone()],
+        );
+
+        let input = RenderInput::extract_volume(&part_flown, RadarProduct::Reflectivity, LAT, LON)
+            .expect("the fixture carries reflectivity");
+        let rebuilt = RenderInput::from_bytes(&input.to_bytes())
+            .expect("the payload round-trips")
+            .to_scan();
+
+        let angles: Vec<f64> = rebuilt
+            .coverage_pattern()
+            .elevation_cuts()
+            .iter()
+            .map(ElevationCut::elevation_angle_degrees)
+            .collect();
+        assert_eq!(
+            angles,
+            vec![0.48, 0.51, 1.47],
+            "the reconstructed table stops where the volume stopped, so nothing \
+             downstream can tell a truncated volume from a complete one",
+        );
+        assert_eq!(
+            rebuilt.sweeps().len(),
+            1,
+            "precondition: only one cut was flown, so the table is longer than \
+             anything that could have been derived from the sweeps",
+        );
+
+        // Which is the fact the sampler hands a section, and the one a caption
+        // reads to decide whether the blank above the top rung is the cone of
+        // silence or air nobody has looked at yet.
+        let sampler = crate::sampler::VolumeSampler::new(&rebuilt, RadarProduct::Reflectivity)
+            .expect("one cut is a ladder");
+        assert_eq!(sampler.top_tilt_deg(), 0.48);
+        assert_eq!(sampler.top_declared_cut_deg(), 1.47);
+        assert!(
+            sampler.top_tilt_deg() < sampler.top_declared_cut_deg(),
+            "a one-rung volume out of a three-cut pattern reported a complete \
+             ladder",
+        );
+
+        // And a complete volume through the same path still reports complete,
+        // so the fix is not simply "always warn".
+        let complete = RenderInput::from_bytes(
+            &RenderInput::extract_volume(&whole, RadarProduct::Reflectivity, LAT, LON)
+                .expect("the fixture carries reflectivity")
+                .to_bytes(),
+        )
+        .expect("the payload round-trips")
+        .to_scan();
+        let sampler = crate::sampler::VolumeSampler::new(&complete, RadarProduct::Reflectivity)
+            .expect("three cuts are a ladder");
+        assert_eq!(sampler.top_tilt_deg(), sampler.top_declared_cut_deg());
+    }
+
     /// The carried-velocity bit survives the port, and materialises as a
     /// **gateless** marker rather than as invented data.
     ///
@@ -1921,7 +2067,7 @@ mod tests {
     /// the layout without changing it fails here.
     #[test]
     fn the_format_version_is_the_one_this_layout_ships() {
-        assert_eq!(FORMAT_VERSION, 6);
+        assert_eq!(FORMAT_VERSION, 7);
         let bytes = RenderInput::extract(
             &volume(),
             0.5,
@@ -1936,7 +2082,7 @@ mod tests {
         assert_eq!(&bytes[..4], &MAGIC, "the magic moved");
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
-            6,
+            7,
             "the version is not where a decoder from another build looks for it",
         );
     }
