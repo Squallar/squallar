@@ -3480,6 +3480,47 @@ mod tests {
         assert_eq!(bytes.len(), value_len_at(cells) + 4 + cells * 4);
     }
 
+    /// The version this layout ships is **1**, and it sits where a decoder
+    /// from another build reads it — as does the magic, `RDVX` by literal.
+    ///
+    /// `a_malformed_grid_payload_is_refused_rather_than_misread` plants
+    /// `0xFF 0xFF` in the version and watches the decode refuse, which pins
+    /// that *a* version check exists — not *which* version ships. Both ends of
+    /// this codec move together, so every other test here round-trips through
+    /// one build and passes whatever the constant says; the constant is only
+    /// load-bearing *between* builds.
+    ///
+    /// Between builds is where it is the only defence. `rustdar-web`'s
+    /// page/worker handshake is `build_token = version/PROTOCOL_VERSION/
+    /// GITHUB_SHA`, and `GITHUB_SHA` is absent outside CI, so it degrades to
+    /// `…/dev` and a stale worker shares a token with a fresh page. `RDVX` has
+    /// never been bumped, so the exposure is the *first* bump being forgotten:
+    /// a layout change that reorders two same-width fields — the three `f64`
+    /// axis ranges, or `site` against them — round-trips perfectly through its
+    /// own build's codec, so the stale worker would decode a fresh payload
+    /// into the new field order and raymarch a volume with its axes swapped.
+    ///
+    /// The magic is here for the same reason at lower stakes. The relabel loop
+    /// in that test pins `RDVX` only against `RDRI` and `RDXS`, its two
+    /// port-mates; any *unused* four bytes would have stayed green, and the
+    /// far end of the port has no matching constant to move with it. A changed
+    /// magic is at least a clean refusal rather than a misparse.
+    ///
+    /// Byte 4 is where the version starts because [`to_bytes`](VoxelGrid::to_bytes)
+    /// writes [`MAGIC`] and then it — the same reading [`SHAPE_AT`] is built
+    /// on. Mirrors `render_input`'s and `xsect`'s tests of the same name.
+    #[test]
+    fn the_format_version_is_the_one_this_layout_ships() {
+        assert_eq!(FORMAT_VERSION, 1);
+        let bytes = wire_fixture().to_bytes();
+        assert_eq!(&bytes[..4], b"RDVX", "the magic moved");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            1,
+            "the version is not where a decoder from another build looks for it",
+        );
+    }
+
     /// A real grid survives the wire, for every moment, with and without the
     /// value plane.
     ///
