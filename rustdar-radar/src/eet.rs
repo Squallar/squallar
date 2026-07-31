@@ -723,6 +723,21 @@ mod tests {
     /// without an elevation it still cannot, because the row is skipped.
     #[test]
     fn an_elevationless_row_never_answers_with_sea_level() {
+        // The precondition that makes "exactly 0 ft" a usable sentinel: no row
+        // is genuinely at sea level, the lowest being KBYX at 8 ft. A future
+        // row at exactly 0 would make this test wrong rather than the code, so
+        // it fails here first and says so.
+        let lowest = crate::sites::RADARS
+            .iter()
+            .filter_map(|s| s.elev)
+            .min()
+            .expect("the table is not empty");
+        assert!(
+            lowest > 0,
+            "a site now records {lowest} ft, so 0 ft no longer means \
+             'no elevation' and this test needs a different sentinel",
+        );
+
         for site in crate::sites::RADARS.iter() {
             let ft = radar_height_ft_near(site.lat, site.lon);
             assert_ne!(
