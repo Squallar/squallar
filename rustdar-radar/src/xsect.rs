@@ -262,6 +262,30 @@ pub struct SectionAxes {
     /// The largest angular step between adjacent rungs of the ladder, degrees.
     /// `0.0` for a single-rung ladder.
     pub widest_tilt_gap_deg: f64,
+    /// The highest cut angle this ladder **has**, degrees — the top rung's VCP
+    /// key, `0.0` for an empty ladder.
+    ///
+    /// [`widest_tilt_gap_deg`](Self::widest_tilt_gap_deg) says how coarse the
+    /// ladder is *between* its rungs; this says where it stops, and mid-volume
+    /// that is the only one of the two that means anything. A volume four rungs
+    /// into its flight is all low, closely-spaced cuts, so its gap number is
+    /// *better* than a complete volume's — the caption's own figures improve as
+    /// the picture gets more truncated. This is the number that does not.
+    pub top_tilt_deg: f64,
+    /// The highest cut angle the coverage pattern **declares**, degrees.
+    ///
+    /// Read against [`top_tilt_deg`](Self::top_tilt_deg): equal means the
+    /// volume flew its whole pattern and the ceiling in the picture is the
+    /// radar's, lower means the ladder stopped short of what the pattern says
+    /// and the ceiling is the *volume's* — either still filling, live, or
+    /// abandoned. The two are the same pixels and completely different facts,
+    /// and it is the second that turns
+    /// [`SampleStatus::AboveVolume`](crate::sampler::SampleStatus::AboveVolume)
+    /// from "the cone of silence" into "not scanned".
+    ///
+    /// See [`VolumeSampler::top_declared_cut_deg`](crate::sampler::VolumeSampler::top_declared_cut_deg)
+    /// for why this is a comparison of the tops rather than of the counts.
+    pub top_declared_cut_deg: f64,
 }
 
 impl SectionAxes {
@@ -280,7 +304,13 @@ impl SectionAxes {
     /// `length_km` is the same shape of failure in the other mapping.
     ///
     /// [`tilt_count`](Self::tilt_count) is a `usize` and has no non-finite
-    /// value to have; every other field is an `f64` and is checked.
+    /// value to have; every other field is an `f64` and is checked. The two
+    /// tilt angles are in here too and for the same reason as the rest: a `NaN`
+    /// [`top_tilt_deg`](Self::top_tilt_deg) compares false against
+    /// [`top_declared_cut_deg`](Self::top_declared_cut_deg) whatever it holds,
+    /// so a consumer asking "did this volume reach the top of its pattern?"
+    /// gets a confident *no* and captions an ordinary complete volume as
+    /// truncated.
     fn all_finite(self) -> bool {
         [
             self.length_km,
@@ -291,6 +321,8 @@ impl SectionAxes {
             self.coverage_ground_range_km,
             self.cone_of_silence_km,
             self.widest_tilt_gap_deg,
+            self.top_tilt_deg,
+            self.top_declared_cut_deg,
         ]
         .iter()
         .all(|v| v.is_finite())
@@ -340,6 +372,12 @@ pub struct CrossSection {
     values: Vec<f32>,
     status: Vec<u8>,
     axes: SectionAxes,
+    /// Where the ladder's rungs actually are, in degrees of beam elevation, in
+    /// the cut order the sampler resolved them in.
+    ///
+    /// See [`tilt_elevations_deg`](CrossSection::tilt_elevations_deg) for why
+    /// this travels with the raster instead of being looked up.
+    tilt_elevations_deg: Vec<f64>,
 }
 
 /// Equality that ignores a value where there is no value to compare.
@@ -370,6 +408,7 @@ pub struct CrossSection {
 impl PartialEq for CrossSection {
     fn eq(&self, other: &Self) -> bool {
         self.axes == other.axes
+            && self.tilt_elevations_deg == other.tilt_elevations_deg
             && self.image == other.image
             && self.status == other.status
             && self.values.len() == other.values.len()
@@ -427,12 +466,32 @@ impl CrossSection {
         values: Vec<f32>,
         status: Vec<u8>,
         axes: SectionAxes,
+        tilt_elevations_deg: Vec<f64>,
     ) -> Option<Self> {
         let pixels = SECTION_WIDTH * SECTION_HEIGHT;
         if image.len() != pixels * 4 || values.len() != pixels || status.len() != pixels {
             return None;
         }
         if !axes.all_finite() {
+            return None;
+        }
+        // **The two ladders are the same ladder, by construction.** A consumer
+        // drawing the rungs over the picture has to know that the angles it is
+        // drawing are the angles the picture was sampled at, and before this
+        // the only thing standing between it and a fabrication was a UI-side
+        // count comparison against a *separately discovered* elevation list —
+        // which counted something else (medians rounded to 0.1°, deduped) and
+        // so disagreed on half of all precipitation-mode volumes, complete ones
+        // included. Refusing here is what lets that comparison go away
+        // entirely: there is one ladder, it arrives with the raster, and it
+        // cannot be a different length from the count that describes it.
+        //
+        // Non-finite refused for the same reason every axis number is: a `NaN`
+        // rung draws no curve and reports no error, so the honesty device goes
+        // quiet in exactly the way nothing notices.
+        if tilt_elevations_deg.len() != axes.tilt_count
+            || !tilt_elevations_deg.iter().all(|deg| deg.is_finite())
+        {
             return None;
         }
         // One pass over the two planes that have to agree with each other, so
@@ -450,6 +509,7 @@ impl CrossSection {
             values,
             status,
             axes,
+            tilt_elevations_deg,
         })
     }
 
@@ -472,6 +532,42 @@ impl CrossSection {
     /// What the two axes mean and how much of the drawing is real.
     pub fn axes(&self) -> &SectionAxes {
         &self.axes
+    }
+
+    /// The beam elevation of each rung of the ladder this section was sampled
+    /// from, degrees, in cut order. Exactly
+    /// [`SectionAxes::tilt_count`] of them —
+    /// [`from_parts`](Self::from_parts) refuses any other length.
+    ///
+    /// # Why this travels with the raster
+    ///
+    /// Drawing the rungs across the picture is the section's **first** honesty
+    /// device (see the `rustdar-egui` section pane's module doc): data exists
+    /// along those curves and everything between them is two-point
+    /// interpolation, and the curves fan apart with range at exactly the rate
+    /// the error grows. A curve drawn at the wrong angle is worse than no
+    /// curve, so a consumer needs the ladder the section was *cut* from, not a
+    /// ladder it discovered some other way.
+    ///
+    /// There is no other way that works. `ScanInfo::discover_product_elevations`
+    /// rounds each sweep's median to 0.1° and dedups; [`crate::sampler`] groups
+    /// by the cut table's nominal angle. Those count different things, and they
+    /// disagree whenever two sweeps of one cut have medians straddling an
+    /// `x.x5` boundary — measured at KLNX on a **complete** volume, where one
+    /// 0.4834° cut flown at medians 0.4394 and 0.4779 became two entries for
+    /// one rung, 16 against 14. Across 19 sites, five of ten complete VCP
+    /// 212/215 reflectivity volumes disagreed. A consumer comparing counts to
+    /// decide whether to draw was therefore silent on half of all
+    /// precipitation-mode volumes — exactly where the ladder is coarse enough
+    /// for the interpolation to matter.
+    ///
+    /// These are the chosen sweeps' **median** elevations, which is the angle
+    /// every height in the section was computed from, and so the angle a curve
+    /// has to be drawn at for it to lie where the data is. The ladder's
+    /// *identity* — the VCP keys it was grouped by — is
+    /// [`SectionAxes::top_tilt_deg`]'s business, not this list's.
+    pub fn tilt_elevations_deg(&self) -> &[f64] {
+        &self.tilt_elevations_deg
     }
 
     /// The sample behind one pixel, re-paired from the value and status planes.
@@ -601,6 +697,8 @@ fn render_with_sampler(
         cone_of_silence_km: 0.0,
         tilt_count: sampler.tilt_count(),
         widest_tilt_gap_deg: sampler.widest_tilt_gap_deg(),
+        top_tilt_deg: sampler.top_tilt_deg(),
+        top_declared_cut_deg: sampler.top_declared_cut_deg(),
     };
 
     let columns = sample_columns(sampler, req, &axes, lat, lon);
@@ -629,11 +727,17 @@ fn render_with_sampler(
             }
         });
 
+    // Not `from_parts`: this is the writer the constructor's refusals exist to
+    // check *other* senders against, and going through it would mean handing it
+    // three planes it just built and then unwrapping an `Option` that cannot be
+    // `None`. The ladder is the sampler's own, so it is `tilt_count` long by
+    // the same construction that produced the count.
     Some(CrossSection {
         image,
         values,
         status,
         axes,
+        tilt_elevations_deg: sampler.elevations_deg().collect(),
     })
 }
 
@@ -803,7 +907,13 @@ const MAGIC: [u8; 4] = *b"RDXS";
 /// Bumped whenever the layout below changes. The two ends of a worker boundary
 /// can be different builds — see `rustdar-web`'s build-token handshake — so a
 /// mismatch has to be a clean `None`, not a misparse.
-const FORMAT_VERSION: u16 = 1;
+///
+/// * **1 → 2**: the axes gained `top_tilt_deg` and `top_declared_cut_deg`, and
+///   the section gained the ladder's own rung elevations. A version 1 payload
+///   is not a version 2 payload missing three fields — it is a payload whose
+///   consumer would have to invent a ladder to draw, which is the fabrication
+///   the whole change exists to remove. So it is refused rather than defaulted.
+const FORMAT_VERSION: u16 = 2;
 
 impl CrossSection {
     /// Encode for transport. Little-endian throughout; the image and status
@@ -844,7 +954,22 @@ impl CrossSection {
         // count this narrows. `the_encoded_length_estimate_is_exact` would not
         // catch a truncation here, but nothing can produce one.
         out.extend_from_slice(&(axes.tilt_count as u32).to_le_bytes());
-        out.extend_from_slice(&axes.widest_tilt_gap_deg.to_le_bytes());
+        for number in [
+            axes.widest_tilt_gap_deg,
+            axes.top_tilt_deg,
+            axes.top_declared_cut_deg,
+        ] {
+            out.extend_from_slice(&number.to_le_bytes());
+        }
+
+        // The ladder itself. Its length is written even though `tilt_count`
+        // already implies it, because `from_parts` is where the two are made to
+        // agree and a decoder that derived one from the other could not hand it
+        // a disagreement to refuse.
+        out.extend_from_slice(&(self.tilt_elevations_deg.len() as u32).to_le_bytes());
+        for elevation in &self.tilt_elevations_deg {
+            out.extend_from_slice(&elevation.to_le_bytes());
+        }
 
         out.extend_from_slice(&(self.image.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.image);
@@ -893,7 +1018,18 @@ impl CrossSection {
             cone_of_silence_km: r.f64()?,
             tilt_count: r.u32()? as usize,
             widest_tilt_gap_deg: r.f64()?,
+            top_tilt_deg: r.f64()?,
+            top_declared_cut_deg: r.f64()?,
         };
+
+        // Eight bytes per element, so the claimed count is measured against
+        // what remains before it becomes a capacity, exactly as the value plane
+        // below is.
+        let tilt_len = r.u32()?;
+        let mut tilt_elevations_deg = Vec::with_capacity(r.bounded(tilt_len, 8)?);
+        for _ in 0..tilt_len {
+            tilt_elevations_deg.push(r.f64()?);
+        }
 
         // One byte per element, so `take` is the bound: it can only hand back
         // a slice that is really there, and nothing is reserved on the claimed
@@ -919,7 +1055,7 @@ impl CrossSection {
         if !r.at_end() {
             return None;
         }
-        Self::from_parts(image, values, status, axes)
+        Self::from_parts(image, values, status, axes, tilt_elevations_deg)
     }
 
     /// What [`to_bytes`](Self::to_bytes) will write, exactly.
@@ -932,10 +1068,12 @@ impl CrossSection {
     /// catches.
     fn encoded_len(&self) -> usize {
         let header = 4 + 2;
-        // Seven `f64`, the tilt count as a `u32`, and the widest gap.
-        let axes = 7 * 8 + 4 + 8;
+        // Seven `f64`, the tilt count as a `u32`, then the widest gap and the
+        // two ladder-top angles.
+        let axes = 7 * 8 + 4 + 3 * 8;
         header
             + axes
+            + (4 + self.tilt_elevations_deg.len() * 8)
             + (4 + self.image.len())
             + (4 + self.values.len() * 4)
             + (4 + self.status.len())
@@ -1385,6 +1523,8 @@ mod tests {
             cone_of_silence_km: 0.0,
             tilt_count: 5,
             widest_tilt_gap_deg: 9.53,
+            top_tilt_deg: 19.5,
+            top_declared_cut_deg: 19.5,
         };
 
         let cell = 20.0 / SECTION_HEIGHT as f64;
@@ -2396,6 +2536,126 @@ mod tests {
         }
     }
 
+    /// **The section carries the ladder it was cut from**, and it carries where
+    /// that ladder stops against where the pattern says it should.
+    ///
+    /// # Why the rungs travel with the raster
+    ///
+    /// Drawing the rungs is the section's first honesty device, and a rung
+    /// drawn at the wrong angle over a correct picture is worse than no rung at
+    /// all. Before this the consumer had to *rediscover* the ladder — from
+    /// `ScanInfo::product_elevations`, which rounds each sweep's median to 0.1°
+    /// and dedups, against a sampler that groups by the cut table's nominal
+    /// angle. Those count different things and disagree whenever two sweeps of
+    /// one cut have medians straddling an `x.x5` boundary, which is half of all
+    /// precipitation-mode volumes, complete ones included. The guard that
+    /// noticed the disagreement could only refuse, so the device was simply
+    /// absent there. One ladder, arriving with the picture, has nothing to
+    /// disagree with.
+    ///
+    /// # Why the two tops
+    ///
+    /// `widest_tilt_gap_deg` is the *wrong* number mid-volume and it is wrong
+    /// in the flattering direction: a volume four rungs in is all low, closely
+    /// spaced cuts, so its gap reads better than a complete volume's. Where the
+    /// ladder **stops** is the number that degrades as the volume truncates,
+    /// and it only means anything beside what the pattern declares.
+    #[test]
+    fn the_section_carries_its_own_rungs_and_says_where_they_stop() {
+        let field = |_az: f64, _slant: f64| Gate::Dbz(25.0);
+        let build = |rungs: &[(u8, f32, usize)]| {
+            let sweeps: Vec<Sweep> = rungs
+                .iter()
+                .map(|&(number, elevation, gates)| {
+                    sweep(
+                        number,
+                        elevation,
+                        720,
+                        gates,
+                        41.9 * f64::from(number),
+                        &field,
+                        FIRST_GATE_M,
+                    )
+                })
+                .collect();
+            Scan::new(vcp(&[0.5, 1.3, 4.0, 10.0, 19.5]), sweeps)
+        };
+
+        let complete = build(&LADDER);
+        let section = radial_section(&complete, 77.0, 100.0);
+
+        // One rung per rung, always — `from_parts` refuses any other length, so
+        // a consumer never has a count to check against.
+        assert_eq!(
+            section.tilt_elevations_deg().len(),
+            section.axes().tilt_count,
+            "the ladder and the count that describes it disagree",
+        );
+        // And they are the *sampler's* angles, the ones every height in the
+        // raster was computed from — not the cut table's nominal keys, which
+        // sit up to 0.044° off and would draw each curve slightly clear of the
+        // data it is meant to mark.
+        let sampler = crate::sampler::VolumeSampler::new(&complete, RadarProduct::Reflectivity)
+            .expect("the fixture volume samples");
+        let expected: Vec<f64> = sampler.elevations_deg().collect();
+        assert_eq!(section.tilt_elevations_deg(), expected.as_slice());
+        // Which is emphatically not the nominal ladder: if it were, the two
+        // would be interchangeable and this test would be pinning nothing.
+        let nominal: Vec<f64> = sampler.nominal_elevations_deg().collect();
+        assert_ne!(
+            expected, nominal,
+            "the fixture's medians land exactly on its cut angles, so this \
+             cannot tell a section carrying geometry from one carrying keys",
+        );
+
+        // A volume that flew its whole pattern has reached its own ceiling, so
+        // the blank above the top rung really is the cone of silence.
+        assert_eq!(
+            section.axes().top_tilt_deg,
+            section.axes().top_declared_cut_deg,
+            "a complete volume reported itself truncated",
+        );
+        assert_eq!(section.axes().top_declared_cut_deg, 19.5);
+
+        // Four rungs into the same pattern — the live chunk feed's ordinary
+        // state for most of every six minutes — the ceiling is the *volume's*,
+        // and the picture has to be able to say so.
+        let partial = build(&LADDER[..2]);
+        let mid_flight = radial_section(&partial, 77.0, 100.0);
+        assert_eq!(mid_flight.axes().tilt_count, 2);
+        assert!(
+            mid_flight.axes().top_tilt_deg < mid_flight.axes().top_declared_cut_deg,
+            "a volume two cuts into a five-cut pattern reported a complete \
+             ladder ({} against a declared {})",
+            mid_flight.axes().top_tilt_deg,
+            mid_flight.axes().top_declared_cut_deg,
+        );
+        // The declared ceiling is a property of the *pattern*, so it does not
+        // move as the volume fills. That is what makes the comparison mean
+        // anything: a number that shrank with the ladder would always agree
+        // with it.
+        assert_eq!(
+            mid_flight.axes().top_declared_cut_deg,
+            section.axes().top_declared_cut_deg,
+            "the declared ceiling followed the ladder down, so a truncated \
+             volume can never be told from a complete one",
+        );
+
+        // And it survives the wire, which is where a section that was cut in a
+        // worker reaches the pane that draws it.
+        let decoded = CrossSection::from_bytes(&mid_flight.to_bytes())
+            .expect("a mid-flight section round-trips");
+        assert_eq!(
+            decoded.tilt_elevations_deg(),
+            mid_flight.tilt_elevations_deg()
+        );
+        assert_eq!(decoded.axes().top_tilt_deg, mid_flight.axes().top_tilt_deg);
+        assert_eq!(
+            decoded.axes().top_declared_cut_deg,
+            mid_flight.axes().top_declared_cut_deg,
+        );
+    }
+
     /// A short ladder is the hazard these numbers exist for: it fills the gap
     /// with a smooth layer that is not there, and only the numbers say so.
     ///
@@ -2751,12 +3011,14 @@ mod tests {
         let scan = scan_with(&|_az, _slant| Gate::Dbz(30.0));
         let section = radial_section(&scan, 45.0, 100.0);
         let axes = *section.axes();
+        let ladder = || section.tilt_elevations_deg().to_vec();
 
         let rebuilt = CrossSection::from_parts(
             section.image().to_vec(),
             section.values().to_vec(),
             section.status().to_vec(),
             axes,
+            ladder(),
         )
         .expect("a section round-trips through its own planes");
         assert_eq!(rebuilt, section);
@@ -2772,6 +3034,7 @@ mod tests {
                 section.values().to_vec(),
                 section.status().to_vec(),
                 axes,
+                ladder(),
             )
             .is_none(),
             "a short image plane was accepted — `apply_render_to_pane` asserts \
@@ -2783,6 +3046,7 @@ mod tests {
                 section.values()[1..].to_vec(),
                 section.status().to_vec(),
                 axes,
+                ladder(),
             )
             .is_none(),
             "a short value plane was accepted",
@@ -2793,6 +3057,7 @@ mod tests {
                 section.values().to_vec(),
                 section.status()[1..].to_vec(),
                 axes,
+                ladder(),
             )
             .is_none(),
             "a short status plane was accepted",
@@ -2809,6 +3074,7 @@ mod tests {
                 section.values().to_vec(),
                 future,
                 axes,
+                ladder(),
             )
             .is_none(),
             "an unknown status code was accepted",
@@ -2850,14 +3116,42 @@ mod tests {
                         section.values().to_vec(),
                         section.status().to_vec(),
                         broken,
+                        ladder(),
                     )
                     .is_none(),
                     "a {name} of {bad} was accepted",
                 );
             }
         }
+        // The two tilt-top angles are checked by the same walk, and they are
+        // the pair a caption reads to decide whether a ceiling in the picture
+        // is the radar's or the volume's. A `NaN` in either makes that
+        // comparison answer "truncated" for every complete volume there is.
+        for name in ["top_tilt_deg", "top_declared_cut_deg"] {
+            for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let mut broken = axes;
+                match name {
+                    "top_tilt_deg" => broken.top_tilt_deg = bad,
+                    "top_declared_cut_deg" => broken.top_declared_cut_deg = bad,
+                    other => unreachable!("{other} is not a field of SectionAxes"),
+                }
+                assert!(
+                    CrossSection::from_parts(
+                        section.image().to_vec(),
+                        section.values().to_vec(),
+                        section.status().to_vec(),
+                        broken,
+                        ladder(),
+                    )
+                    .is_none(),
+                    "a {name} of {bad} was accepted",
+                );
+            }
+        }
+
         // `tilt_count` is a `usize` and has no non-finite value to have, so a
-        // whole-axes rejection would be wrong: an ordinary count still builds.
+        // whole-axes rejection would be wrong: an ordinary count still builds —
+        // as long as the ladder that comes with it is that long.
         assert!(
             CrossSection::from_parts(
                 section.image().to_vec(),
@@ -2867,10 +3161,55 @@ mod tests {
                     tilt_count: 0,
                     ..axes
                 },
+                Vec::new(),
             )
             .is_some(),
             "the finiteness check refused something that has no finiteness",
         );
+
+        // **The ladder and the count that describes it are one fact.** This is
+        // the refusal that lets a consumer draw the rungs without first
+        // checking them against a separately-discovered elevation list — the
+        // check that counted something else and went silent on half of all
+        // precipitation-mode volumes. A section whose two halves disagree is
+        // not representable.
+        assert!(
+            !ladder().is_empty(),
+            "precondition: the fixture has a ladder to shorten"
+        );
+        for wrong in [ladder()[1..].to_vec(), Vec::new()] {
+            assert!(
+                CrossSection::from_parts(
+                    section.image().to_vec(),
+                    section.values().to_vec(),
+                    section.status().to_vec(),
+                    axes,
+                    wrong.clone(),
+                )
+                .is_none(),
+                "a {}-rung ladder was accepted for a {}-rung section",
+                wrong.len(),
+                axes.tilt_count,
+            );
+        }
+        // And a rung that is not an angle. A `NaN` elevation draws no curve and
+        // reports nothing, so the honesty device goes quiet in the one way
+        // nobody notices.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut broken = ladder();
+            broken[0] = bad;
+            assert!(
+                CrossSection::from_parts(
+                    section.image().to_vec(),
+                    section.values().to_vec(),
+                    section.status().to_vec(),
+                    axes,
+                    broken,
+                )
+                .is_none(),
+                "a rung at {bad} degrees was accepted",
+            );
+        }
 
         // A `Value` status over a number that is not one. Both bars are
         // exercised: `NaN` paints nothing, but an **infinity** compares larger
@@ -2890,6 +3229,7 @@ mod tests {
                     broken,
                     section.status().to_vec(),
                     axes,
+                    ladder(),
                 )
                 .is_none(),
                 "a Value pixel carrying {bad} was accepted",
@@ -2911,6 +3251,7 @@ mod tests {
                 nan_where_nothing_is,
                 section.status().to_vec(),
                 axes,
+                ladder(),
             )
             .is_some(),
             "a NaN under a non-Value status was refused, which is every \
@@ -3111,8 +3452,14 @@ mod tests {
     /// that moved a field has to be made in both places — the mutations these
     /// offsets support are the whole point of the tests below, and an offset
     /// derived from the code under test would follow it wherever it went.
-    /// `the_length_prefixes_are_where_the_tests_think_they_are` checks them.
-    const IMAGE_LEN_AT: usize = 4 + 2 + 7 * 8 + 4 + 8;
+    /// `the_length_prefixes_are_where_the_tests_think_they_are` checks them,
+    /// [`WIRE_FIXTURE_RUNGS`] included.
+    ///
+    /// How many rungs every fixture below encodes: `scan_with` flies a
+    /// five-cut pattern, and the ladder's `f64` per rung sits between the axes
+    /// and the first plane.
+    const WIRE_FIXTURE_RUNGS: usize = 5;
+    const IMAGE_LEN_AT: usize = 4 + 2 + 7 * 8 + 4 + 3 * 8 + 4 + WIRE_FIXTURE_RUNGS * 8;
     const VALUE_LEN_AT: usize = IMAGE_LEN_AT + 4 + SECTION_WIDTH * SECTION_HEIGHT * 4;
     const STATUS_LEN_AT: usize = VALUE_LEN_AT + 4 + SECTION_WIDTH * SECTION_HEIGHT * 4;
 
@@ -3145,7 +3492,15 @@ mod tests {
     /// assertions goes green while testing nothing.
     #[test]
     fn the_length_prefixes_are_where_the_tests_think_they_are() {
-        let bytes = wire_fixture().to_bytes();
+        let fixture = wire_fixture();
+        assert_eq!(
+            fixture.tilt_elevations_deg().len(),
+            WIRE_FIXTURE_RUNGS,
+            "the fixture's ladder changed length, so every offset below now \
+             points into the middle of a plane and the negative tests are \
+             corrupting the wrong bytes",
+        );
+        let bytes = fixture.to_bytes();
         let pixels = SECTION_WIDTH * SECTION_HEIGHT;
         assert_eq!(prefix_at(&bytes, IMAGE_LEN_AT), (pixels * 4) as u32);
         assert_eq!(prefix_at(&bytes, VALUE_LEN_AT), pixels as u32);

@@ -118,12 +118,6 @@ pub(super) fn render_cross_section(
 
     let product = pane.selected_product;
     let site = pane.scan_info.as_ref().map(|s| (s.site.lat, s.site.lon));
-    let elevations = pane
-        .scan_info
-        .as_ref()
-        .and_then(|s| s.product_elevations.get(&product))
-        .cloned()
-        .unwrap_or_default();
 
     let Some(state) = pane.cross_section() else {
         return;
@@ -180,7 +174,7 @@ pub(super) fn render_cross_section(
             (line.b().lat, line.b().lon),
             site_lat,
             site_lon,
-            &elevations,
+            section.tilt_elevations_deg(),
         );
     }
     painter.rect_stroke(
@@ -425,12 +419,21 @@ fn paint_axes(
 /// beam height, and the curves fan apart with range at exactly the rate the
 /// interpolation error grows.
 ///
-/// Drawn only when the ladder the UI knows about has the same number of rungs
-/// the section was cut from. They are two different reads — `ScanInfo` discovers
-/// elevations from the sweeps, the sampler keys them through the coverage
-/// pattern's cut table — and if they disagree, these curves would be drawn in
-/// the wrong places over a correct picture, which is worse than not drawing them
-/// at all.
+/// `elevations` is [`CrossSection::tilt_elevations_deg`] — **the section's own
+/// ladder**, not one looked up beside it. That is a correctness property rather
+/// than a convenience: these curves say "the data is here", so drawing them
+/// from any list that could differ from the one the raster was sampled at is a
+/// fabrication, and a more convincing one than drawing nothing.
+///
+/// It used to be looked up, from `ScanInfo::product_elevations`, guarded by a
+/// count comparison against `axes.tilt_count`. The two lists count different
+/// things — `ScanInfo` rounds each sweep's median to 0.1° and dedups, the
+/// sampler groups by the cut table's nominal angle — so they disagreed whenever
+/// two sweeps of one cut had medians straddling an `x.x5` boundary. The guard
+/// then did the only safe thing and drew nothing: measured dark on five of ten
+/// complete VCP 212/215 reflectivity volumes across 19 sites, and on 20 of 23
+/// mid-volume fill states at KLNX. The honesty device was absent exactly where
+/// a coarse ladder makes it matter.
 #[allow(clippy::too_many_arguments)]
 fn paint_tilt_ladder(
     painter: &egui::Painter,
@@ -440,7 +443,7 @@ fn paint_tilt_ladder(
     b: (f64, f64),
     site_lat: f64,
     site_lon: f64,
-    elevations: &[f32],
+    elevations: &[f64],
 ) {
     let Some(curves) = tilt_curves(layout, axes, a, b, site_lat, site_lon, elevations) else {
         return;
@@ -469,14 +472,18 @@ fn paint_tilt_ladder(
 /// one polyline per elevation, ascending with the ladder.
 ///
 /// Split out from the painting so the geometry has something to be tested
-/// against: the guard below is a refusal, and a refusal that only ever shows up
-/// as "no lines were drawn" is one nothing can fail on.
+/// against.
 ///
-/// `None` when the ladder the UI knows about is not the ladder the section was
-/// cut from. `ScanInfo` discovers its elevations from the sweeps and the sampler
-/// keys them through the coverage pattern's cut table, so the two can disagree —
-/// and curves drawn from the wrong ladder would be wrong lines over a correct
-/// picture, which is worse than no lines at all.
+/// `None` only for a ladder with no rungs — a section of a volume that carried
+/// no cut of this moment, which the caption already reports in red and which
+/// has no curve to draw anyway.
+///
+/// There is deliberately **no** agreement check any more. The elevations are
+/// the section's own (see [`paint_tilt_ladder`]), and
+/// [`CrossSection::from_parts`] refuses a section whose ladder is not
+/// `tilt_count` long — so "these angles belong to this raster" is an invariant
+/// of the type rather than a comparison made here, and a comparison made here
+/// could only ever be wrong in the direction of silence.
 #[allow(clippy::too_many_arguments)]
 fn tilt_curves(
     layout: &SectionLayout,
@@ -485,9 +492,9 @@ fn tilt_curves(
     b: (f64, f64),
     site_lat: f64,
     site_lon: f64,
-    elevations: &[f32],
+    elevations: &[f64],
 ) -> Option<Vec<Vec<egui::Pos2>>> {
-    if elevations.is_empty() || elevations.len() != axes.tilt_count {
+    if elevations.is_empty() {
         return None;
     }
     // The ground range of each sample point, computed once and shared by every
@@ -508,8 +515,7 @@ fn tilt_curves(
                 ranges
                     .iter()
                     .map(|&(x, ground_km)| {
-                        let km_msl = axes.base_km_msl
-                            + beam::height_at_ground_km(ground_km, f64::from(elev));
+                        let km_msl = axes.base_km_msl + beam::height_at_ground_km(ground_km, elev);
                         egui::pos2(x, layout.y_of_height(axes, km_msl))
                     })
                     .collect()
@@ -807,8 +813,18 @@ mod tests {
             cone_of_silence_km: 0.0,
             tilt_count: 14,
             widest_tilt_gap_deg: 4.9,
+            top_tilt_deg: 19.5,
+            top_declared_cut_deg: 19.5,
         }
     }
+
+    /// VCP 212's reflectivity ladder as KTLX really flies it, in the sampler's
+    /// own median angles rather than in round numbers — the shape a section
+    /// arrives carrying.
+    const VCP_212: [f64; 14] = [
+        0.4834, 0.8789, 1.3184, 1.8018, 2.4170, 3.1201, 4.0430, 5.0977, 6.4160, 8.0273, 10.0195,
+        12.5000, 15.6006, 19.5117,
+    ];
 
     /// The two mappings are inverses of the raster's own convention: row 0 is
     /// the **top**, so the top of the axis is the top of the plot.
@@ -1112,17 +1128,31 @@ mod tests {
         assert_eq!(ordinary.color, visuals.warn_fg_color);
     }
 
-    /// The rungs are the honesty device, so both halves of them are pinned: the
-    /// refusal when the two ladders disagree, and the fanning that makes the
-    /// picture say where interpolation is worst.
+    /// **A real VCP 212 ladder draws.** The rungs are the section's first
+    /// honesty device, and the way it failed was not a wrong line — it was no
+    /// line at all, on half of every precipitation volume.
     ///
-    /// The refusal matters because `ScanInfo` discovers its elevations from the
-    /// sweeps while the sampler keys them through the coverage pattern's cut
-    /// table. Those can disagree, and curves drawn from the wrong ladder are
-    /// wrong lines over a correct picture — a fabrication, and a more convincing
-    /// one than no lines at all.
+    /// # Why this test is the shape it is
+    ///
+    /// Its predecessor asserted a *refusal*: an eight-entry list against a
+    /// nine-rung section drew nothing, because the pane looked the ladder up in
+    /// `ScanInfo::product_elevations` and could not trust a list that disagreed.
+    /// The refusal was correct, the test passed, and the feature was dark
+    /// anyway — because the two lists count different things. `ScanInfo` rounds
+    /// each sweep's median to 0.1\u{b0} and dedups; the sampler groups by the cut
+    /// table's nominal angle. One cut flown twice with medians straddling an
+    /// `x.x5` boundary becomes two entries for one rung. Measured at KLNX on a
+    /// **complete** volume: 0.4834\u{b0} flown at 0.4394 and 0.4779, 0.8789\u{b0} flown
+    /// at 0.8350 and 0.9229 — 16 against 14, refused. Across 19 sites, five of
+    /// ten complete VCP 212/215 reflectivity volumes were dark; mid-volume, 20
+    /// of 23 fill states at KLNX.
+    ///
+    /// So the ladder now arrives *with* the section, the refusal is gone, and
+    /// what replaces it starts from the angles the failure was measured on. A
+    /// synthetic ladder of round degrees would have drawn under the old code
+    /// too, which is why the old test could not see any of this.
     #[test]
-    fn the_rungs_are_refused_unless_both_ladders_are_the_same_ladder() {
+    fn a_real_tilt_ladder_draws_and_fans_apart_with_range() {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 500.0));
         let layout = SectionLayout::new(rect, ONE_LINE, false);
         // KTLX, and a line running away from it, so the ground range along the
@@ -1130,25 +1160,14 @@ mod tests {
         let (site_lat, site_lon) = (35.3333, -97.2778);
         let a = (35.5, -96.5);
         let b = (36.2, -95.4);
-        let ladder = [0.5f32, 1.5, 2.4, 3.4, 4.3, 6.0, 9.9, 14.6, 19.5];
         let axes = SectionAxes {
-            tilt_count: ladder.len(),
+            tilt_count: VCP_212.len(),
             ..axes()
         };
 
-        assert!(
-            tilt_curves(&layout, &axes, a, b, site_lat, site_lon, &[]).is_none(),
-            "an empty ladder has no rungs to draw"
-        );
-        assert!(
-            tilt_curves(&layout, &axes, a, b, site_lat, site_lon, &ladder[..8]).is_none(),
-            "eight known elevations against a nine-rung section is two different \
-             ladders, and drawing either over the other is a fabrication"
-        );
-
-        let curves = tilt_curves(&layout, &axes, a, b, site_lat, site_lon, &ladder)
-            .expect("matching ladders must draw");
-        assert_eq!(curves.len(), ladder.len(), "one polyline per rung");
+        let curves = tilt_curves(&layout, &axes, a, b, site_lat, site_lon, &VCP_212)
+            .expect("a complete VCP 212 reflectivity ladder must draw its rungs");
+        assert_eq!(curves.len(), VCP_212.len(), "one polyline per rung");
 
         // Ascending: a higher elevation is a higher beam, which on screen is a
         // smaller y. Getting this inverted would draw the ladder upside down
@@ -1171,6 +1190,26 @@ mod tests {
             "the rungs do not fan apart with range ({near} near, {far} far), so \
              the drawing says nothing about where the ladder is coarsest"
         );
+
+        // The one refusal left, and it is not an agreement check: a volume that
+        // carried no cut of this moment has no rung to draw, and its caption
+        // already says so in red.
+        assert!(
+            tilt_curves(&layout, &axes, a, b, site_lat, site_lon, &[]).is_none(),
+            "an empty ladder has no rungs to draw"
+        );
+
+        // A **mid-volume** ladder draws too, and that is the half the count
+        // check got most wrong — KLNX refused 20 of 23 fill states, and a
+        // partial ladder is precisely when a section interpolates furthest.
+        let partial = &VCP_212[..4];
+        let mid_flight = SectionAxes {
+            tilt_count: partial.len(),
+            ..axes
+        };
+        let curves = tilt_curves(&layout, &mid_flight, a, b, site_lat, site_lon, partial)
+            .expect("a volume four cuts into its flight still has four real rungs");
+        assert_eq!(curves.len(), partial.len());
     }
 
     /// A pane carrying a status line makes room for it rather than drawing it

@@ -606,6 +606,10 @@ pub struct VolumeSampler<'a> {
     slot: MomentSlot,
     blend: Blend,
     rungs: Vec<Rung<'a>>,
+    /// The highest cut angle the coverage pattern *declares*, wrap-corrected —
+    /// which is not the highest rung the ladder *has*. See
+    /// [`top_declared_cut_deg`](Self::top_declared_cut_deg).
+    top_declared_cut_deg: f64,
 }
 
 impl<'a> VolumeSampler<'a> {
@@ -634,6 +638,22 @@ impl<'a> VolumeSampler<'a> {
                 vcp: scan.coverage_pattern().pattern_number().number(),
             });
         }
+
+        // The ceiling the *pattern* declares, before a word about what flew.
+        // Read off the same table the rungs are keyed through and corrected the
+        // same way, so a comparison against a rung's own key is exact rather
+        // than a tolerance. Non-finite entries are skipped rather than refused:
+        // this is a summary of cuts that may never be referenced by a sweep,
+        // and a garbage angle in one of those is not a reason to refuse a
+        // volume the ladder can be built from perfectly well.
+        let top_declared_cut_deg = cuts
+            .iter()
+            .map(|cut| {
+                let angle = cut.elevation_angle_degrees();
+                if angle > 180.0 { angle - 360.0 } else { angle }
+            })
+            .filter(|angle| angle.is_finite())
+            .fold(f64::NEG_INFINITY, f64::max);
 
         // Step 1 and 2: key every sweep on its cut, then group by exact key,
         // preserving volume order inside each group so "newest" below means
@@ -723,11 +743,24 @@ impl<'a> VolumeSampler<'a> {
         }
         rungs.sort_by(|a, b| a.nominal_deg.total_cmp(&b.nominal_deg));
 
+        // Every rung came from a cut whose angle was checked finite above, so a
+        // ladder with rungs always has a finite top. The fold's seed only
+        // survives a table of nothing but non-finite angles, and then the
+        // ladder's own top is the honest answer: it says "as far as anything
+        // here knows, the volume delivered its whole pattern", which
+        // under-warns rather than crying wolf about a table nobody can read.
+        let top_declared_cut_deg = if top_declared_cut_deg.is_finite() {
+            top_declared_cut_deg
+        } else {
+            rungs.last().map_or(0.0, |rung: &Rung<'a>| rung.nominal_deg)
+        };
+
         Ok(Self {
             product,
             slot,
             blend: Blend::for_moment(product),
             rungs,
+            top_declared_cut_deg,
         })
     }
 
@@ -810,6 +843,44 @@ impl<'a> VolumeSampler<'a> {
     /// delivered.
     pub fn nominal_elevations_deg(&self) -> impl Iterator<Item = f64> + '_ {
         self.rungs.iter().map(|r| r.nominal_deg)
+    }
+
+    /// The highest cut angle **this ladder has**, degrees — the top rung's
+    /// grouping key, or `0.0` for a ladder with no rungs (which
+    /// [`new`](Self::new) refuses to build, so only a caller holding one by
+    /// other means can see it).
+    ///
+    /// The key rather than the median, so it can be compared against
+    /// [`top_declared_cut_deg`](Self::top_declared_cut_deg) exactly. The two
+    /// come off the same cut table.
+    pub fn top_tilt_deg(&self) -> f64 {
+        self.rungs.last().map_or(0.0, |rung| rung.nominal_deg)
+    }
+
+    /// The highest cut angle the coverage pattern **declares**, degrees.
+    ///
+    /// # Why this travels with a section
+    ///
+    /// Read against [`top_tilt_deg`](Self::top_tilt_deg) it answers the one
+    /// question a consumer of a short ladder cannot otherwise ask: *did the
+    /// volume stop early, or is this all there is?* They are different pictures
+    /// with the same pixels. A complete VCP 35 delivering five cuts to 4.5° has
+    /// a ceiling because that is the pattern; a VCP 212 four rungs into its
+    /// flight has a ceiling because the antenna has not got there yet, and
+    /// everything above 1.8° in that picture is unscanned air rather than the
+    /// cone of silence. Naming the second as the first hands the user a
+    /// confident meteorological explanation for a blank region and it is the
+    /// wrong one.
+    ///
+    /// The count is deliberately *not* the comparison. A pattern declares more
+    /// cut-table entries than it has distinct angles — a split cut is two
+    /// entries at one angle — and the surveillance-only entries at the bottom
+    /// of a precipitation VCP carry no Doppler moment at all, so counting would
+    /// report a complete volume's velocity ladder as short for ever. Every
+    /// operational pattern's *highest* cut carries every moment, so the top is
+    /// the comparison that holds across moments.
+    pub fn top_declared_cut_deg(&self) -> f64 {
+        self.top_declared_cut_deg
     }
 
     /// The largest angular step between adjacent rungs, degrees. `0.0` for a

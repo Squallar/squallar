@@ -1300,7 +1300,10 @@ mod tests {
                 cone_of_silence_km: 0.0,
                 tilt_count: 1,
                 widest_tilt_gap_deg: 0.0,
+                top_tilt_deg: 0.5,
+                top_declared_cut_deg: 19.5,
             },
+            vec![0.5],
         )
         .expect("a full-size, all-NoCoverage section is well formed")
     }

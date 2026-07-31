@@ -522,7 +522,19 @@ impl InputHarness {
     ///
     /// `axes` is the caller's, because the caption is computed from it and the
     /// numbers in the caption are the whole reason the caption exists.
-    pub(crate) fn place_section(&mut self, idx: usize, axes: rustdar_radar::xsect::SectionAxes) {
+    ///
+    /// `rungs` likewise, and it is not decoration: the drawn tilt ladder is the
+    /// section's *first* honesty device and it is drawn from the elevations the
+    /// cut carries, so a fixture that left them out would paint a picture with
+    /// the device missing and no test could tell.
+    /// `CrossSection::from_parts` refuses a ladder that is not `tilt_count`
+    /// long, so the two cannot drift apart here either.
+    pub(crate) fn place_section(
+        &mut self,
+        idx: usize,
+        axes: rustdar_radar::xsect::SectionAxes,
+        rungs: &[f64],
+    ) {
         use rustdar_radar::sampler::SampleStatus;
         use rustdar_radar::xsect::{CrossSection, SECTION_HEIGHT, SECTION_WIDTH};
         let pixels = SECTION_WIDTH * SECTION_HEIGHT;
@@ -531,8 +543,12 @@ impl InputHarness {
             vec![f32::NAN; pixels],
             vec![SampleStatus::BelowLowestBeam.wire_code(); pixels],
             axes,
+            rungs.to_vec(),
         )
-        .expect("a full-size, all-BelowLowestBeam section is well formed");
+        .expect(
+            "a full-size, all-BelowLowestBeam section with a matching ladder is \
+             well formed",
+        );
         let texture = self.ctx.load_texture(
             format!("harness-section-{idx}"),
             egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
@@ -5469,6 +5485,40 @@ mod tests {
         )
     }
 
+    /// KTLX's reflectivity ladder on VCP 212, as the sampler resolves it — the
+    /// chosen sweeps' **median** elevations, not the cut table's round numbers.
+    ///
+    /// Real-shaped on purpose. A synthetic ladder of round degrees would draw
+    /// perfectly well against a build whose rungs came from the wrong list; the
+    /// production failure this pins was measured on exactly these angles, where
+    /// `ScanInfo`'s 0.1°-rounded, deduped view of the same volume reports 16
+    /// entries for the sampler's 14 rungs (0.4394 → 0.4 and 0.4779 → 0.5 for
+    /// one 0.4834° cut; 0.8350 → 0.8 and 0.9229 → 0.9 for one 0.8789° cut).
+    fn vcp_212_rungs() -> Vec<f64> {
+        vec![
+            0.4834, 0.8789, 1.3184, 1.8018, 2.4170, 3.1201, 4.0430, 5.0977, 6.4160, 8.0273,
+            10.0195, 12.5000, 15.6006, 19.5117,
+        ]
+    }
+
+    /// The axes of a complete VCP 212 reflectivity section 100 km long, whose
+    /// ladder is [`vcp_212_rungs`].
+    fn vcp_212_axes() -> rustdar_radar::xsect::SectionAxes {
+        rustdar_radar::xsect::SectionAxes {
+            length_km: 100.0,
+            base_km_msl: 0.4,
+            top_km_msl: 20.4,
+            near_ground_range_km: 10.0,
+            far_ground_range_km: 110.0,
+            coverage_ground_range_km: 110.0,
+            cone_of_silence_km: 0.0,
+            tilt_count: 14,
+            widest_tilt_gap_deg: 4.9,
+            top_tilt_deg: 19.5,
+            top_declared_cut_deg: 19.5,
+        }
+    }
+
     /// 39. **Every pane reports a pointer frame, whatever kind it is.**
     ///
     ///     The pointer probe is pushed in `render_panes`' shared preamble,
@@ -6222,25 +6272,11 @@ mod tests {
     ///     sentence with entirely different consequences.
     #[test]
     fn a_rendered_section_says_its_depth_is_the_ladders_and_not_measured() {
-        use rustdar_radar::xsect::SectionAxes;
         let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
         h.load_scan("KTLX");
         let (a, b) = section_ends();
         h.make_pane_cross_section(0, a, b);
-        h.place_section(
-            0,
-            SectionAxes {
-                length_km: 100.0,
-                base_km_msl: 0.4,
-                top_km_msl: 20.4,
-                near_ground_range_km: 10.0,
-                far_ground_range_km: 110.0,
-                coverage_ground_range_km: 110.0,
-                cone_of_silence_km: 0.0,
-                tilt_count: 14,
-                widest_tilt_gap_deg: 4.9,
-            },
-        );
+        h.place_section(0, vcp_212_axes(), &vcp_212_rungs());
 
         let pane = h.pane_rects()[0];
         assert!(
