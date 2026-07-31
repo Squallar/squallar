@@ -1506,15 +1506,33 @@ mod tests {
              0 and the great circle bows ~894"
         );
 
-        // And every segment of it is a chord of that curve rather than a
-        // resampling of the straight line: the subdivision has to *reduce* the
-        // residual, which is the whole reason for it.
-        let mid = track[SECTION_TRACK_SAMPLES / 2];
-        let next = track[SECTION_TRACK_SAMPLES / 2 + 1];
-        let chord = (next - mid).length();
+        // And the *residual* — what is left of that bow between two drawn
+        // vertices — is inside the error budget the module already accepts.
+        //
+        // This is the assertion that says what the subdivision is for, and it is
+        // deliberately a **bar rather than a count**: 258 m is the range-ring
+        // offset `draw_section_tracks` documents and lives with, so a track that
+        // beats it is as registered as everything else on the map. The exact
+        // `SECTION_TRACK_SAMPLES` is a quality knob above that bar — it is not
+        // pinned here, and lowering it to 8 would still pass, correctly.
+        let sagitta = (0..SECTION_TRACK_SAMPLES)
+            .map(|i| {
+                let (p, q) = (track[i], track[i + 1]);
+                let half = (i as f64 + 0.5) / SECTION_TRACK_SAMPLES as f64;
+                let (lat, lon) = rustdar_radar::beam::great_circle_point(
+                    (line.a().lat, line.a().lon),
+                    (line.b().lat, line.b().lon),
+                    half,
+                );
+                let on_curve = project(crate::pane::GeoPoint { lat, lon });
+                (on_curve - (p + (q - p) * 0.5)).length()
+            })
+            .fold(0.0_f32, f32::max);
         assert!(
-            chord < len / (SECTION_TRACK_SAMPLES as f32) * 1.05,
-            "the polyline is not evenly subdivided"
+            sagitta < 258.0,
+            "the drawn track leaves {sagitta} m of the curve between vertices, \
+             which is worse than the 258 m range-ring offset the module already \
+             documents as the error it lives with"
         );
     }
 
