@@ -2342,6 +2342,31 @@ mod tests {
         assert!(RenderInput::from_bytes(&[]).is_none(), "empty");
         assert!(RenderInput::from_bytes(b"nope").is_none(), "wrong magic");
 
+        // A **whole** payload relabelled, including with the two magics that
+        // share this port. Mutation testing is why: the four-byte buffer above
+        // cannot pin the magic test, because it runs out on the *version* read
+        // whether or not the comparison exists, and the truncation loop below
+        // never cuts inside the magic. Deleting `if r.take(4)? != MAGIC` left
+        // the entire workspace green — so an `RDVX` grid or an `RDXS` section
+        // arriving on the shared worker port would have been read as a render
+        // input rather than refused. `render_input` was the last of the three
+        // legs of that handshake without this loop; `voxel` and `xsect` both
+        // caught the same mutation in themselves with it.
+        assert!(
+            RenderInput::from_bytes(&good).is_some(),
+            "precondition: the payload being relabelled has to decode as it \
+             stands, or each refusal below could be for some other reason",
+        );
+        for wrong in [*b"nope", *b"RDVX", *b"RDXS"] {
+            let mut relabelled = good.clone();
+            relabelled[..4].copy_from_slice(&wrong);
+            assert!(
+                RenderInput::from_bytes(&relabelled).is_none(),
+                "a whole payload labelled {} decoded as a render input",
+                String::from_utf8_lossy(&wrong),
+            );
+        }
+
         let mut wrong_version = good.clone();
         wrong_version[4] = 0xFF;
         wrong_version[5] = 0xFF;
