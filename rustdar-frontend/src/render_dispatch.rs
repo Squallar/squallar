@@ -399,14 +399,50 @@ pub struct RenderDispatcher {
 /// moment: a payload extracted for reflectivity carries no velocity, and handing
 /// it to a velocity section would produce a picture of an empty ladder rather
 /// than an error.
+///
+/// The tilt count is part of the key for the reason
+/// [`SectionTarget::tilts`](rustdar_egui::pane::SectionTarget) exists: on the
+/// live chunk feed the volume time is frozen for the whole volume while the
+/// `Scan` grows sweep by sweep, so `(site, collected, product)` alone would hand
+/// a payload extracted from a one-sweep volume back to a cut of the same volume
+/// eight cuts later. It is also why the discriminator is a *tilt count* and not
+/// a chunk counter: this re-extracts once per new elevation, not once every few
+/// seconds for the 15.6 MB the field above is here to avoid.
 struct SectionInput {
-    site: String,
-    collected: chrono::NaiveDateTime,
-    product: RadarProduct,
+    key: SectionInputKey,
     /// `Arc` so the cache and the job in flight can hold it at once; the job
     /// needs an owned `RenderInput`, so what crosses to the worker is a clone of
     /// the bytes rather than a second walk of the volume.
     input: Arc<rustdar_radar::render_input::RenderInput>,
+}
+
+/// What a cached section payload is a payload *of*.
+///
+/// A struct with a derived `PartialEq` rather than a chain of `&&`s at the reuse
+/// site, because the failure mode of the chain is forgetting a clause, and the
+/// consequence of forgetting one is not an error — it is the wrong volume, or an
+/// empty ladder, or (the F1 failure, and the quietest of the three) a picture of
+/// the right volume with most of it missing. Adding a field to this struct
+/// therefore cannot silently leave the comparison behind.
+#[derive(Clone, Debug, PartialEq)]
+struct SectionInputKey {
+    site: String,
+    collected: chrono::NaiveDateTime,
+    product: RadarProduct,
+    /// How many elevation angles the volume this was extracted from carried.
+    tilts: usize,
+}
+
+impl SectionInputKey {
+    /// The key a payload would have to carry to serve `target`.
+    fn of(target: &rustdar_egui::pane::SectionTarget) -> Self {
+        Self {
+            site: target.volume.site.clone(),
+            collected: target.volume.collected,
+            product: target.product,
+            tilts: target.tilts,
+        }
+    }
 }
 
 impl Default for RenderDispatcher {
@@ -1086,16 +1122,27 @@ impl RenderDispatcher {
         sender: std::sync::mpsc::Sender<crate::channels::SectionResponse>,
         window: Option<WindowRef>,
     ) -> bool {
+        // Bounds-checked once, here, rather than left to the two `pane_render`
+        // indexes further down. It cannot be out of range today — the only
+        // caller reaches this through `pane_render.get(pane_idx)` two lines
+        // earlier — but the two indexes straddle the budget increment and the
+        // `RenderGuard`, so an out-of-range pane would not merely panic, it
+        // would panic with the in-flight count already raised. Returning `false`
+        // is the same contract as a full budget: nothing has been taken, no
+        // staleness key is written, and the pane asks again next frame.
+        if pane_idx >= self.pane_render.len() {
+            return false;
+        }
         if self.renders_in_flight.load(Ordering::Relaxed) >= MAX_CONCURRENT_RENDERS {
             return false;
         }
 
         let product = target.product;
-        let reusable = self.section_input.as_ref().is_some_and(|cached| {
-            cached.site == target.volume.site
-                && cached.collected == target.volume.collected
-                && cached.product == product
-        });
+        let wanted_key = SectionInputKey::of(target);
+        let reusable = self
+            .section_input
+            .as_ref()
+            .is_some_and(|cached| cached.key == wanted_key);
         if !reusable {
             let Some(input) =
                 rustdar_radar::render_input::RenderInput::extract_volume(data, product, lat, lon)
@@ -1108,9 +1155,7 @@ impl RenderDispatcher {
                 return false;
             };
             self.section_input = Some(SectionInput {
-                site: target.volume.site.clone(),
-                collected: target.volume.collected,
-                product,
+                key: wanted_key,
                 input: Arc::new(input),
             });
         }
@@ -2750,5 +2795,100 @@ mod render_invalidation_tests {
             "flags accumulated: {}",
             d.pane_render[0].results_wanted.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod section_payload_cache_tests {
+    use super::*;
+    use rustdar_egui::pane::{GeoPoint, SectionLine, SectionTarget, VolumeStamp};
+
+    fn at(minute: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 30)
+            .unwrap()
+            .and_hms_opt(18, minute, 0)
+            .unwrap()
+    }
+
+    fn target(site: &str, minute: u32, product: RadarProduct, tilts: usize) -> SectionTarget {
+        SectionTarget {
+            volume: VolumeStamp {
+                site: site.to_owned(),
+                collected: at(minute),
+            },
+            product,
+            line: SectionLine::new(
+                GeoPoint {
+                    lat: 35.3,
+                    lon: -97.3,
+                },
+                GeoPoint {
+                    lat: 35.6,
+                    lon: -97.0,
+                },
+            )
+            .expect("a valid line"),
+            tilts,
+        }
+    }
+
+    /// The payload cache reuses on the four things the payload actually depends
+    /// on, and the **line is not one of them**.
+    ///
+    /// That asymmetry is the cache's whole reason to exist: moving the line is
+    /// the commonest way to want another cut, and it is the one case that must
+    /// *not* pay for a 15.6 MB re-extraction.
+    #[test]
+    fn a_payload_is_reused_for_another_line_through_the_same_volume() {
+        let base = target("KTLX", 30, RadarProduct::Reflectivity, 9);
+        let key = SectionInputKey::of(&base);
+
+        let mut elsewhere = base.clone();
+        elsewhere.line = SectionLine::new(
+            GeoPoint {
+                lat: 34.0,
+                lon: -99.0,
+            },
+            GeoPoint {
+                lat: 36.9,
+                lon: -95.1,
+            },
+        )
+        .expect("a valid line");
+        assert_ne!(elsewhere, base, "precondition: the line really moved");
+        assert_eq!(
+            SectionInputKey::of(&elsewhere),
+            key,
+            "a redrawn line re-extracted the whole volume"
+        );
+    }
+
+    /// Every input the payload *does* depend on invalidates it, including the
+    /// tilt count — which on the live chunk feed is the only one that moves.
+    #[test]
+    fn a_payload_is_not_reused_across_volume_site_moment_or_tilt_count() {
+        let base = target("KTLX", 30, RadarProduct::Reflectivity, 9);
+        let key = SectionInputKey::of(&base);
+
+        for (other, why) in [
+            (
+                target("KTLX", 36, RadarProduct::Reflectivity, 9),
+                "a payload of the previous volume",
+            ),
+            (
+                target("KOUN", 30, RadarProduct::Reflectivity, 9),
+                "a payload projected around another site",
+            ),
+            (
+                target("KTLX", 30, RadarProduct::Velocity, 9),
+                "extract_volume narrows to one moment, so this is an empty ladder",
+            ),
+            (
+                target("KTLX", 30, RadarProduct::Reflectivity, 1),
+                "the live-feed case: the same volume, eight cuts ago",
+            ),
+        ] {
+            assert_ne!(SectionInputKey::of(&other), key, "{why}");
+        }
     }
 }

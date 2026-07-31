@@ -848,8 +848,19 @@ impl super::App {
         let line = section.line?;
         let product = pane.selected_product;
         let site = pane.site.clone();
-        let collected = match pane.scan_info.as_ref() {
-            Some(scan_info) => scan_info.timestamp,
+        let (collected, tilts) = match pane.scan_info.as_ref() {
+            // The tilt count is read from the *same* place the tilt ladder is
+            // drawn from, so the key moves when the ladder does. See
+            // `SectionTarget::tilts`: on the live chunk feed `timestamp` is the
+            // first sweep's, and so is frozen for the whole volume while the
+            // ladder grows from one rung to fourteen underneath it.
+            Some(scan_info) => (
+                scan_info.timestamp,
+                scan_info
+                    .product_elevations
+                    .get(&product)
+                    .map_or(0, Vec::len),
+            ),
             None => {
                 self.mark_section_unavailable(
                     pane_idx,
@@ -862,6 +873,7 @@ impl super::App {
             volume: rustdar_egui::pane::VolumeStamp { site, collected },
             product,
             line,
+            tilts,
         })
     }
 
@@ -5921,5 +5933,69 @@ mod section_dispatch_tests {
         );
         let moved = app.section_target_for_pane(0).expect("still aimed");
         assert_ne!(moved.line, before.line);
+    }
+
+    /// A live volume that is still filling re-cuts as it fills, **even though
+    /// its timestamp never moves**.
+    ///
+    /// This is the configuration the feature actually ships in — live chunks are
+    /// on by default — and it is the one the volume-time key does not cover.
+    /// `ScanInfo::timestamp` is the *first* sweep's first radial, and on the
+    /// chunk feed `sweeps[0]` is fixed for the whole volume, so the stamp is a
+    /// constant for five to six minutes while the ladder goes from one rung to
+    /// nine. Observed live before the fix: a map pane full of echo, a section
+    /// pane empty, and a caption reading `1 tilts` for six minutes.
+    ///
+    /// The precondition is the assertion that matters. `before.volume` and
+    /// `after.volume` are asserted **equal** — if a future change makes the
+    /// volume stamp move on the live feed this test starts failing on its
+    /// premise rather than quietly passing for the wrong reason.
+    #[test]
+    fn a_live_volume_that_is_still_filling_re_cuts_as_it_fills() {
+        let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
+        let grow_to = |app: &mut crate::app::App, angles: Vec<f32>| {
+            if let Some(info) = app.gui.pane_mut(0).unwrap().scan_info.as_mut() {
+                info.product_elevations
+                    .insert(RadarProduct::Reflectivity, angles);
+            }
+        };
+
+        grow_to(&mut app, vec![0.5]);
+        let before = app
+            .section_target_for_pane(0)
+            .expect("the pane is aimed and has a volume");
+        assert_eq!(before.tilts, 1);
+
+        // Exactly what `Gui::apply_chunk_scan_info` does on the next few chunks:
+        // it merges new angles in and leaves `timestamp` where it was.
+        grow_to(&mut app, vec![0.5, 0.9, 1.3, 1.8, 2.4, 3.1, 4.0, 5.1, 6.4]);
+        let after = app.section_target_for_pane(0).expect("still aimed");
+
+        assert_eq!(
+            before.volume, after.volume,
+            "precondition: the live feed's volume stamp really is frozen, so it \
+             cannot be what notices the volume growing"
+        );
+        assert_eq!(after.tilts, 9);
+        assert_ne!(
+            before, after,
+            "eight more cuts arrived and the pane went on showing a one-rung section"
+        );
+
+        // And the pane really re-dispatches on it: with the one-rung key stored,
+        // the nine-rung target no longer matches and the short-circuit at the
+        // top of `dispatch_section_renders` falls through.
+        app.gui
+            .pane_mut(0)
+            .unwrap()
+            .cross_section_mut()
+            .unwrap()
+            .rendered_for = Some(before);
+        app.dispatch_section_renders();
+        assert_eq!(
+            state(&app).rendered_for.as_ref().map(|t| t.tilts),
+            Some(9),
+            "the dispatcher short-circuited on a key cut from one ninth of the volume"
+        );
     }
 }

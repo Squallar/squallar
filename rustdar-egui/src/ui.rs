@@ -3701,6 +3701,7 @@ mod pane_slice_tests {
                 },
                 product: RadarProduct::Reflectivity,
                 line: other_line(),
+                tilts: 9,
             });
             section.section = Some(std::sync::Arc::new(blank_section()));
         }

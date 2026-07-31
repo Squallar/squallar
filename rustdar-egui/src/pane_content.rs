@@ -349,6 +349,38 @@ pub struct VolumeStamp {
 /// exactly the kind of thing that gets remembered for one of the two reset paths
 /// and not the other.
 ///
+/// # Why the volume time is not enough on the live feed
+///
+/// [`VolumeStamp::collected`] comes from `ScanInfo::timestamp`, which is the
+/// **first** sweep's first radial. On the archive path that is a fine key: the
+/// volume arrives whole, so a new time is the only way it ever changes. On the
+/// live chunk feed it is a *constant for five to six minutes* — the `Scan` grows
+/// sweep by sweep with `sweeps[0]` fixed, so the tilt ladder goes from one rung
+/// to fourteen without the stamp moving a millisecond. A section cut from the
+/// first chunk therefore stood for the whole volume, showing a one-rung ladder
+/// against a map pane full of echo, and only the tilt-curve refusal made it
+/// visible at all.
+///
+/// [`tilts`](Self::tilts) is the missing input. It is the number of distinct
+/// elevation angles the UI knows this moment has, from
+/// `ScanInfo::product_elevations` — the *same* number
+/// [`tilt_curves`](crate::ui_section_pane) refuses to draw a ladder against when
+/// it disagrees with `SectionAxes::tilt_count`. So the key moves exactly when the
+/// thing that would make the picture wrong moves, and no more often than that:
+///
+/// * It is **monotonic within a volume** (`Gui::apply_chunk_scan_info` merges
+///   angles in and never removes one) and replaced wholesale at the volume
+///   boundary, so it is a growth discriminator rather than something that churns.
+/// * It changes **at most once per elevation cut**, not once per chunk. That
+///   matters because `RenderDispatcher::section_input` is keyed on the same
+///   fields, and a per-chunk discriminator would re-extract the ~15 MB volume
+///   payload every few seconds instead of once per new tilt.
+///
+/// It is deliberately **not** on [`VolumeStamp`], which [`VolumeTarget`] also
+/// uses: a 3D volume grid must be built from a complete volume and must not
+/// rebuild mid-flight, so widening the shared stamp would have paid for this fix
+/// with a 155 ms voxel rebuild per cut.
+///
 /// `PartialEq` is derived, floats and all, and that is deliberate: this compares
 /// a stored key against a stored key, never against a re-derived value, so
 /// bitwise equality is the right test rather than an approximation of one. It is
@@ -363,6 +395,10 @@ pub struct SectionTarget {
     /// structure to slice — so this is narrower than the pane's product picker.
     pub product: RadarProduct,
     pub line: SectionLine,
+    /// How many distinct elevation angles the UI knew this moment had when the
+    /// cut was dispatched. See the type's docs: this is what makes a live volume
+    /// that is still filling re-cut as it fills.
+    pub tilts: usize,
 }
 
 /// Why a section pane has no picture, when it has none.
@@ -1170,25 +1206,36 @@ mod tests {
                 .and_hms_opt(18, minute, 0)
                 .unwrap()
         };
-        let target = |site: &str, minute: u32| SectionTarget {
+        let target = |site: &str, minute: u32, tilts: usize| SectionTarget {
             volume: VolumeStamp {
                 site: site.to_owned(),
                 collected: at(minute),
             },
             product: RadarProduct::Reflectivity,
             line,
+            tilts,
         };
 
-        assert_eq!(target("KTLX", 30), target("KTLX", 30));
+        assert_eq!(target("KTLX", 30, 9), target("KTLX", 30, 9));
         assert_ne!(
-            target("KTLX", 30),
-            target("KTLX", 36),
+            target("KTLX", 30, 9),
+            target("KTLX", 36, 9),
             "a new volume for the site makes the section on screen stale"
         );
         assert_ne!(
-            target("KTLX", 30),
-            target("KOUN", 30),
+            target("KTLX", 30, 9),
+            target("KOUN", 30, 9),
             "the same volume time at another site is a different picture"
+        );
+        // The live-feed arm, and the reason `tilts` is in the key at all. The
+        // volume time here is *identical* — it is the first sweep's, and on the
+        // chunk feed that is frozen for five to six minutes while the ladder
+        // grows underneath it. Without the tilt count these two keys are equal
+        // and the section cut from the first chunk stands for the whole volume.
+        assert_ne!(
+            target("KTLX", 30, 1),
+            target("KTLX", 30, 9),
+            "the same volume with eight more cuts in it is a different section"
         );
     }
 
