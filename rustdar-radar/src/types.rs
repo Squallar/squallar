@@ -101,12 +101,33 @@ impl ImageBounds {
 #[derive(Debug, Clone)]
 pub struct ScanInfo {
     pub site: RadarSite,
-    /// From the first radial's collection timestamp, not the request.
+    /// From the **first** radial of the **first** sweep, not the request.
+    ///
+    /// # Not a freshness signal on the live chunk feed
+    ///
+    /// On the archive path a volume arrives whole, so this moves once per volume
+    /// and is a sound key for "is what is on screen still the truth?". On the
+    /// live chunk feed the `Scan` grows sweep by sweep with `sweeps[0]` fixed, so
+    /// this is a **constant for the whole five-to-six minute volume** while the
+    /// tilt ladder underneath it goes from one rung to fourteen. Anything that
+    /// wants to notice a live volume filling has to look at the volume, not at
+    /// this — see `SectionTarget::sweeps` in `rustdar-egui`, which is the
+    /// discriminator a cross-section pane uses and the second attempt at one.
     pub timestamp: NaiveDateTime,
     /// Volume Coverage Pattern number (e.g. 212, 215, 35)
     pub vcp_number: u16,
     pub available_products: Vec<RadarProduct>,
     /// Elevation angles per product, sorted ascending.
+    ///
+    /// **Accumulated by the UI, not a property of one volume.** `ScanInfo` is
+    /// rebuilt per chunk round, but `Gui::apply_chunk_scan_info` *merges* the
+    /// fresh angles into the pane's existing set and never removes one; only a
+    /// completed volume replaces it wholesale. So mid-volume this can hold angles
+    /// the `Scan` in hand does not carry, and after a session's first complete
+    /// volume it already holds every angle the VCP flies. It answers "what can
+    /// this site show?", which is what the product and tilt pickers want. It does
+    /// **not** answer "how much of this volume has arrived?", and using it for
+    /// that is a bug that only appears on the second volume of a session.
     pub product_elevations: HashMap<RadarProduct, Vec<f32>>,
     pub status: String,
 }
