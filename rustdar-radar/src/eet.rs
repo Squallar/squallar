@@ -748,13 +748,20 @@ mod tests {
         }
     }
 
-    /// The six sites the table shipped with no elevation, pinned by value
-    /// against each one's own Level II Volume Data Block.
+    /// The six sites the table shipped with no elevation, pinned by value.
     ///
-    /// These are `site_height` — the base — read out of a real volume for each
-    /// site, not recalled: KDGX 151 m, KFSX 2261 m, KRTX 492 m, KSRX 200 m,
-    /// KVWX 156 m, KLWX 89 m. Converted at 0.3048 m/ft and rounded, which is
-    /// the datum and the precision every other row in the table already uses.
+    /// These are `site_height` — the base — in metres: KDGX 151, KFSX 2261,
+    /// KRTX 492, KSRX 200, KVWX 156, KLWX 89. Converted at 0.3048 m/ft and
+    /// rounded, which is the datum and the precision every other row in the
+    /// table already uses (see [`crate::sites::RadarSite::elev`] for what was
+    /// measured about that datum and what was not).
+    ///
+    /// **Only KLWX has been read back out of a Level II volume here** — 89 m
+    /// in `KLWX20180302_115347_V06`'s Volume Data Block, which is the 292 ft
+    /// below. The other five had no volume available to this host, so their
+    /// metre figures are transcribed rather than measured, and a transcription
+    /// error in any of them would not be caught by this test or any other in
+    /// the crate. That is the standing gap, not a claim of verification.
     ///
     /// KLWX is the one the cross-section campaign caught: it anchored a
     /// section 89 m low, and 89 m is four and a half rows of a 1024-row raster

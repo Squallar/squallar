@@ -6,19 +6,37 @@ pub struct RadarSite {
     /// Height of the **site base** above mean sea level, feet.
     ///
     /// The base, not the feedhorn: a Level II volume's own Volume Data Block
-    /// reports the two separately, and every row here that could be checked
-    /// against a file matches its `site_height` rather than
-    /// `site_height + tower_height` — KDMX 981 ft against 299 m exactly, KTLX
-    /// 1213 against 370 m, KCRP 45 against 14 m, KFTG 5497 against 1675 m.
-    /// Towers run 14–34 m, so the two datums are far enough apart to tell
-    /// apart and the choice is not arbitrary.
+    /// reports the two separately, and the rows that could be checked against
+    /// a file sit on `site_height` rather than `site_height + tower_height`.
     ///
-    /// It matters because [`crate::beam`] measures heights **above the
+    /// **What was actually measured — six rows, against one volume each:**
+    ///
+    /// | site | this table | `site_height` | as feet | `+ tower` |
+    /// |---|---|---|---|---|
+    /// | KDMX | 981 | 299 m | 981 | 1093 |
+    /// | KLWX | 292 | 89 m | 292 | 404 |
+    /// | KTLX | 1213 | 370 m | 1214 | 1276 |
+    /// | KCRP | 45 | 14 m | 46 | 141 |
+    /// | KFTG | 5497 | 1675 m | 5495 | 5607 |
+    /// | KMSX | 7855 | 2417 m | 7930 | 7976 |
+    ///
+    /// Five of the six are on `site_height` to within 2 ft, which is the
+    /// rounding of a field the archive reports in whole metres. **KMSX is on
+    /// neither**, 75 ft below its own volume's `site_height` and 121 below
+    /// `site_height + tower_height`, and nothing here explains that. Towers
+    /// run 14–34 m, so the two datums are far enough apart that the five
+    /// agreements are not coincidence and the one disagreement is not
+    /// rounding.
+    ///
+    /// The remaining **201 rows are unverified**: no volume for them was
+    /// examined, and the claim that the table is uniform on one datum is a
+    /// generalisation from six rows, one of which contradicts it.
+    ///
+    /// The datum matters because [`crate::beam`] measures heights **above the
     /// antenna**, so anything that adds this to a beam height — the
     /// cross-section's `base_km_msl`, the hail and voxel datums — is short by
-    /// the tower. That is a pre-existing, uniform choice across all 207 rows,
-    /// worth a metre or two of a 20 km axis, and is recorded here rather than
-    /// silently corrected.
+    /// the tower. That shortfall is pre-existing, worth a metre or two of a
+    /// 20 km axis, and is recorded here rather than silently corrected.
     ///
     /// `None` means the table does not know. Nothing in the shipped table is
     /// `None` — `every_site_records_an_elevation` keeps it that way, because a
