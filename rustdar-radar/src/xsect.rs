@@ -251,6 +251,18 @@ pub struct SectionAxes {
     /// the columns that are in it, so a line that enters and leaves the cone
     /// twice reports both crossings. A blind column (see the module doc) counts
     /// as inside it, having no ceiling at all.
+    ///
+    /// **The name is only true of a volume that flew its whole pattern.** It
+    /// measures the region above the top *rung*, and mid-volume that rung is
+    /// wherever the antenna has got to — a KMPX section four cuts into VCP 212
+    /// tops out at 1.8°, so this reports most of the line as "cone of silence"
+    /// when what it has measured is unscanned air. No consumer reads it yet;
+    /// one that does should check
+    /// [`top_tilt_deg`](Self::top_tilt_deg) against
+    /// [`top_declared_cut_deg`](Self::top_declared_cut_deg) first and call it
+    /// something else when they disagree, as
+    /// `rustdar-egui`'s `describe_missing` does for the per-pixel version of
+    /// exactly this conflation.
     pub cone_of_silence_km: f64,
     /// How many rungs the tilt ladder had for this moment.
     ///

@@ -786,10 +786,15 @@ fn lay_out_caption(
 /// The sampler propagates seven reasons a pixel has no number, and this is the
 /// first place in the codebase that can *say* one. A blank region of a section
 /// is not one thing: below the lowest beam is a permanent blind spot near the
-/// ground, above the volume is the cone of silence, beyond range is an upper cut
-/// that stops short, range folded is a real echo at an ambiguous distance, and
-/// below threshold is the radar looking and finding nothing. Those are five
-/// completely different facts and they are painted identically.
+/// ground, above the volume is either the cone of silence or air the antenna
+/// has not reached yet, beyond range is an upper cut that stops short, range
+/// folded is a real echo at an ambiguous distance, and below threshold is the
+/// radar looking and finding nothing. Those are six completely different facts
+/// and they are painted identically.
+///
+/// It is also the only place that can *tell* the two halves of `AboveVolume`
+/// apart — the sampler raises one status for both — which is why
+/// [`describe_missing`] takes the ladder's completeness as well as the status.
 fn hover_readout(
     section: &CrossSection,
     layout: &SectionLayout,
