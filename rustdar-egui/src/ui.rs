@@ -3022,11 +3022,14 @@ impl Gui {
                 cache.current = None;
                 cache.render_in_flight = false;
             }
-            // And whatever the pane's *kind* holds. Nothing yet — every arm of
-            // `release_textures` is empty — but this is the only place a
-            // pane-held handle is released when the egui context dies, so the
-            // call is wired before there is anything to release rather than
-            // remembered afterwards. See `PaneContent::release_textures`.
+            // And whatever the pane's *kind* holds — today, a section pane's
+            // raster. This is the only place a pane-held handle is released when
+            // the egui context dies. Note that every arm deliberately keeps
+            // enough to put its picture *back*: the frontend's
+            // `restore_section_textures` re-uploads a section from the
+            // `CrossSection` this leaves behind, exactly as the loop above
+            // relies on `dispatch_loop_renders` re-uploading a loop frame. See
+            // `PaneContent::release_textures`.
             pane.content.release_textures();
         }
         self.map_tiles.clear();

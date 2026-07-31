@@ -939,25 +939,7 @@ impl super::App {
                 continue;
             };
 
-            self.texture_counter += 1;
-            let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                [
-                    rustdar_radar::xsect::SECTION_WIDTH,
-                    rustdar_radar::xsect::SECTION_HEIGHT,
-                ],
-                cut.image(),
-            );
-            // NEAREST, and it is an honesty decision rather than a performance
-            // one. A section's rows are the tilt ladder's rungs stretched to
-            // fill the gaps between them; bilinear filtering would blend those
-            // edges into a smooth gradient and paint exactly the impression the
-            // pane's caption exists to refuse — that the vertical structure was
-            // measured continuously. The blockiness is the data.
-            let texture = ctx.load_texture(
-                format!("cross_section_{}", self.texture_counter),
-                color_image,
-                egui::TextureOptions::NEAREST,
-            );
+            let texture = self.upload_section_raster(ctx, &cut);
 
             let Some(section_state) = self
                 .gui
@@ -972,6 +954,100 @@ impl super::App {
             section_state.texture = Some(texture);
             section_state.section = Some(Arc::from(cut));
             section_state.unavailable = None;
+        }
+    }
+
+    /// Upload a cut's raster and hand back the handle. The **one** place a
+    /// section becomes a texture.
+    ///
+    /// Two callers — the arrival path above and the resume path below — and
+    /// they share this rather than each doing their own `load_texture` because
+    /// the options are an honesty decision that has to hold on both. NEAREST,
+    /// and it is not a performance choice: a section's rows are the tilt
+    /// ladder's rungs stretched to fill the gaps between them, and bilinear
+    /// filtering would blend those edges into a smooth gradient and paint
+    /// exactly the impression the pane's caption exists to refuse — that the
+    /// vertical structure was measured continuously. The blockiness is the
+    /// data. A resume that quietly re-uploaded the same pixels `LINEAR` would
+    /// look like nothing at all had changed.
+    fn upload_section_raster(
+        &mut self,
+        ctx: &egui::Context,
+        cut: &rustdar_radar::xsect::CrossSection,
+    ) -> egui::TextureHandle {
+        self.texture_counter += 1;
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+            [
+                rustdar_radar::xsect::SECTION_WIDTH,
+                rustdar_radar::xsect::SECTION_HEIGHT,
+            ],
+            cut.image(),
+        );
+        ctx.load_texture(
+            format!("cross_section_{}", self.texture_counter),
+            color_image,
+            egui::TextureOptions::NEAREST,
+        )
+    }
+
+    /// Put every section pane's raster back on the GPU, from the
+    /// [`CrossSection`](rustdar_radar::xsect::CrossSection) the pane still
+    /// holds.
+    ///
+    /// # This is the whole reason the cut is retained across a release
+    ///
+    /// `PaneContent::release_textures` drops the handle and keeps the cut, and
+    /// without this function that keeping bought nothing: a section pane came
+    /// back from a suspend, a display change or a wgpu surface loss with
+    /// `texture: None`, `section: Some(..)` and `rendered_for: Some(target)`,
+    /// which paints "Cutting the cross-section…" while
+    /// `dispatch_section_renders` short-circuits on the matching key and never
+    /// asks again. The hover readout is gone with it, because
+    /// `render_cross_section` returns before it. On the live feed the next
+    /// volume rescued the pane within a scan; on an archived or paused volume
+    /// nothing ever did — the "waiting that will never end" the section module
+    /// names as the worst state a pane can be in.
+    ///
+    /// # Why re-upload rather than re-cut
+    ///
+    /// Clearing `rendered_for` here instead would make the dispatcher ask
+    /// again, and that answer is worse three ways. It is a 15.6 MB volume walk
+    /// plus an 8–13 ms raster for a picture already in memory, paid on resume,
+    /// which on Android is the moment with the least budget. It needs the
+    /// *volume*, which may have been evicted while the app was away — turning a
+    /// recoverable state into `AwaitingVolume` forever. And it is slow enough
+    /// to be seen, where this is on screen the frame the context comes back.
+    ///
+    /// # Why re-uploading cannot show a stale picture
+    ///
+    /// Because the key is kept too. This restores exactly the picture that was
+    /// on the glass when the context died, still described by the
+    /// `rendered_for` it was cut for. If the pane's target has moved on since —
+    /// a new volume, a different moment, a redrawn line — `dispatch_section_renders`
+    /// compares against that same key on the next frame, disagrees, and cuts a
+    /// fresh one over the top. The restore never *extends* the life of a stale
+    /// section; it only stops one blinking out.
+    fn restore_section_textures(&mut self, ctx: &egui::Context) {
+        for pane_idx in 0..self.gui.pane_count() {
+            let Some(cut) = self
+                .gui
+                .pane(pane_idx)
+                .and_then(|pane| pane.cross_section())
+                // A pane that still has its handle was not released, so
+                // re-uploading would leak the live one it is drawing with.
+                .filter(|section| section.texture.is_none())
+                .and_then(|section| section.section.clone())
+            else {
+                continue;
+            };
+            let texture = self.upload_section_raster(ctx, &cut);
+            if let Some(section) = self
+                .gui
+                .pane_mut(pane_idx)
+                .and_then(|p| p.cross_section_mut())
+            {
+                section.texture = Some(texture);
+            }
         }
     }
 
@@ -992,6 +1068,11 @@ impl super::App {
         use rustdar_overlays::render::overlay_state::OverlayKind;
         use rustdar_overlays::types::GeoBounds;
         use rustdar_radar::types::ImageBounds;
+
+        // Section panes first, and through their own loop: the one below is
+        // bounded by `pane_render.len()` and skips every pane with no plan
+        // view, which is every section pane there is.
+        self.restore_section_textures(ctx);
 
         for pane_idx in 0..self.render.pane_render.len().min(self.gui.pane_count()) {
             // `dispatch_pane_renders` deliberately *keeps* `cached_render` on a
@@ -5906,6 +5987,111 @@ mod section_dispatch_tests {
             Some(current),
             "the superseded cut took the key with it, so the cut still in flight \
              will be dropped too and the pane will wait for ever"
+        );
+    }
+
+    /// **A section pane comes back from a suspend, a display change or a lost
+    /// surface** — and comes back with its picture rather than with a promise.
+    ///
+    /// The whole cycle, in the order the app runs it:
+    /// `clear_graphics_state` (Android's `onPause`, a foldable unfolding, a GPU
+    /// reset — `app_render.rs`'s surface-loss arm and `app.rs`'s resume path
+    /// both land here) drops the handle, then `restore_cached_render` runs when
+    /// the renderer is rebuilt, then the ordinary per-frame dispatch.
+    ///
+    /// Without the restore this is the pane's worst state and it is silent: the
+    /// handle is gone, the cut and its `rendered_for` are not, so
+    /// `render_cross_section` paints "Cutting the cross-section…" — the *in
+    /// flight* message — while `dispatch_section_renders` reads the matching key
+    /// and declines to cut. Nothing is in flight and nothing ever will be. The
+    /// hover readout goes with it, since the paint returns before it. Live, the
+    /// next volume rescues it in about six minutes; on an archived volume it
+    /// never recovers at all, which is exactly the "waiting that will never end"
+    /// `ui_section_pane`'s doc calls the worst state a pane can be in.
+    #[test]
+    fn a_section_pane_gets_its_picture_back_after_the_context_dies() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_section(RadarProduct::Reflectivity, volume(vec![one_cut()]));
+        let target = app.section_target_for_pane(0).expect("aimed with a volume");
+        app.gui
+            .pane_mut(0)
+            .unwrap()
+            .cross_section_mut()
+            .unwrap()
+            .rendered_for = Some(target.clone());
+        app.render.pane_render[0].render_in_flight = true;
+        app.channels
+            .section_sender
+            .send(crate::channels::SectionResponse {
+                pane_idx: 0,
+                generation: app.render.render_generation,
+                target: target.clone(),
+                section: Some(blank_cut()),
+            })
+            .expect("the receiver is alive");
+        app.poll_section_results(&ctx);
+        let before = state(&app).texture.as_ref().expect("uploaded").id();
+
+        // Suspend, unfold, or a wgpu surface loss. Same call in all three.
+        app.gui.clear_graphics_state();
+        assert!(
+            state(&app).texture.is_none(),
+            "precondition: the handle has to actually be released, or this test \
+             passes against a build that never had the bug"
+        );
+        assert!(
+            state(&app).section.is_some() && state(&app).rendered_for.is_some(),
+            "precondition: the cut and its key survive the release — that pair is \
+             what makes the pane look busy while nothing is running"
+        );
+
+        // The renderer is rebuilt and the app restores what it can.
+        app.restore_cached_render(&ctx);
+
+        let after = state(&app).texture.as_ref().map(|t| t.id());
+        assert!(
+            after.is_some(),
+            "the pane came back with no raster, so it paints \"Cutting the \
+             cross-section…\" for a cut that will never be dispatched",
+        );
+        assert_ne!(
+            after,
+            Some(before),
+            "the same handle came back, so nothing was uploaded and the id is a \
+             dangling one from the context that died"
+        );
+
+        // The restored raster is the honest one. `restore_section_textures` and
+        // `poll_section_results` share `upload_section_raster` for this reason —
+        // a resume that silently re-uploaded LINEAR would blend the rungs into a
+        // smooth gradient and nothing about the picture would look wrong.
+        let manager = ctx.tex_manager();
+        let manager = manager.read();
+        assert_eq!(
+            manager
+                .meta(after.expect("uploaded"))
+                .expect("the handle is alive, so its meta is")
+                .options,
+            egui::TextureOptions::NEAREST,
+            "the restored raster is filtered, which paints the interpolation as \
+             measurement"
+        );
+        drop(manager);
+
+        // And it was a **re-upload**, not a re-cut. The key is untouched, so the
+        // dispatcher stays quiet: a resume must not walk a 15.6 MB volume for a
+        // picture already in memory, and must not depend on that volume still
+        // being in memory at all.
+        assert_eq!(
+            state(&app).rendered_for,
+            Some(target),
+            "the resume path moved the staleness key"
+        );
+        app.render.pane_render[0].render_in_flight = false;
+        app.dispatch_section_renders();
+        assert!(
+            !app.render.pane_render[0].render_in_flight,
+            "the pane re-cut its section on resume instead of re-uploading it"
         );
     }
 

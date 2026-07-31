@@ -198,28 +198,42 @@ impl PaneContent {
     /// Drop every `egui::TextureHandle` this content holds, because the context
     /// that owns them is going away.
     ///
-    /// Every arm is empty today — no per-kind state holds a texture yet — and
-    /// this exists anyway, already called from `Gui::clear_graphics_state`. That
-    /// is the only place a pane-held handle is released when the egui context
-    /// dies (`app.rs`'s suspend path and `app_render.rs`'s surface-loss path both
-    /// route through it), and a handle outliving its context is a leak that
-    /// nothing reports: it is not a panic, not a blank pane, just memory that
-    /// never comes back across a suspend/resume cycle.
+    /// Called from `Gui::clear_graphics_state`, which is the only place a
+    /// pane-held handle is released when the egui context dies (`app.rs`'s
+    /// suspend path and `app_render.rs`'s surface-loss path both route through
+    /// it). A handle outliving its context is a leak that nothing reports: it is
+    /// not a panic, not a blank pane, just memory that never comes back across a
+    /// suspend/resume cycle.
     ///
-    /// So the wiring is done first and the fields come later, rather than the
-    /// other way round. The `match` is exhaustive and by value, so a fourth kind
-    /// stops the build here — the same reasoning as `PaneLayout::for_count`'s
-    /// clamp, which is that a trap someone has to *remember* at the moment they
-    /// add a field is a trap that eventually catches someone. A doc comment on
-    /// the field only fires if it is read; this fires either way.
+    /// # Releasing is only half of a cycle
+    ///
+    /// **Every arm that drops a handle owes a path that puts one back**, and the
+    /// owed path is a *restore*, not a re-render. Dropping a texture with nothing
+    /// to re-upload it leaves a pane that is not blank and not broken — it is
+    /// waiting, on a piece of work nobody will ever dispatch, because the
+    /// staleness key that would trigger the dispatch is still satisfied. That
+    /// state cost the section pane one review cycle: `texture: None` with
+    /// `section: Some(..)` and a matching `rendered_for` paints "Cutting the
+    /// cross-section…" forever, with the hover readout dead behind it.
+    /// `App::restore_section_textures` is the other half, and its doc is where
+    /// the argument for re-uploading over re-cutting lives.
+    ///
+    /// The `match` is exhaustive and by value, so a fourth kind stops the build
+    /// here — the same reasoning as `PaneLayout::for_count`'s clamp, which is
+    /// that a trap someone has to *remember* at the moment they add a field is a
+    /// trap that eventually catches someone. A doc comment on the field only
+    /// fires if it is read; this fires either way.
     pub fn release_textures(&mut self) {
         match self {
             Self::Map => {}
-            // The section raster. The `CrossSection` behind it stays: it is
-            // plain memory rather than a GPU handle, it is what a hover reads,
-            // and keeping it means a resume re-uploads a texture instead of
-            // re-cutting the section — which needs the volume, and the volume
-            // may well have been evicted by then.
+            // The section raster, and **only** the raster. The `CrossSection`
+            // behind it is plain memory rather than a GPU handle and it is what
+            // a hover reads, so it stays; `rendered_for` stays with it, because
+            // together they are what lets `App::restore_section_textures`
+            // re-upload the picture that was on the glass instead of walking a
+            // 15.6 MB volume again for a volume that may have been evicted.
+            // Clearing the key here is the tempting one-line alternative and it
+            // is the expensive, fragile one.
             Self::CrossSection(section) => section.texture = None,
             // `VolumePane` will hold whatever the volume painter hands back.
             Self::Volume(_volume) => {}
@@ -526,12 +540,17 @@ pub struct CrossSectionPane {
     /// a hover on every frame the pointer is over the pane; a clone per frame
     /// would be the most expensive thing in the UI pass.
     ///
-    /// Kept when the texture is released, so a suspend/resume re-uploads rather
-    /// than re-cutting — the volume behind the cut may have been evicted by
-    /// then, which would make the re-cut impossible rather than slow.
+    /// Kept when the texture is released, and `App::restore_section_textures`
+    /// is what makes the keeping worth anything: a suspend/resume re-uploads
+    /// this rather than re-cutting, because the volume behind the cut may have
+    /// been evicted by then, which would make the re-cut impossible rather than
+    /// merely slow.
     pub section: Option<Arc<CrossSection>>,
     /// The section's raster, uploaded. Dropped by
-    /// [`PaneContent::release_textures`].
+    /// [`PaneContent::release_textures`] and put back by
+    /// `App::restore_section_textures` from
+    /// [`section`](Self::section) — the two are a pair, and a release with no
+    /// restore is a pane that waits forever.
     pub texture: Option<egui::TextureHandle>,
     /// Why there is no section, when there is none *and* a line has been drawn.
     ///
@@ -1167,14 +1186,25 @@ mod tests {
     }
 
     /// A section pane really gives up its texture — and really keeps everything
-    /// else.
+    /// else, **including its staleness key**.
     ///
-    /// Both halves are decisions. The handle has to go, because a texture
-    /// outliving its context is a leak nothing reports: not a panic, not a blank
-    /// pane, just memory that never comes back across a suspend/resume cycle.
-    /// The `CrossSection` behind it has to *stay*, because it is plain memory
-    /// rather than a GPU handle, it is what a hover reads, and re-cutting it on
-    /// resume needs the volume — which may well have been evicted by then.
+    /// Three decisions, and the third is the one with a mutant of its own. The
+    /// handle has to go, because a texture outliving its context is a leak
+    /// nothing reports: not a panic, not a blank pane, just memory that never
+    /// comes back across a suspend/resume cycle. The `CrossSection` behind it
+    /// has to *stay*, because it is plain memory rather than a GPU handle, it is
+    /// what a hover reads, and re-cutting it on resume needs the volume — which
+    /// may well have been evicted by then.
+    ///
+    /// And `rendered_for` has to stay too, which is the half that looks
+    /// optional. Clearing it here is the one-line way to make the pane recover:
+    /// the dispatcher would see no key, ask again, and the picture would come
+    /// back. It is also a 15.6 MB volume walk plus an 8–13 ms raster on the
+    /// resume frame, for a picture already in memory, and it fails outright when
+    /// the volume is gone. Keeping the key is what makes the recovery a
+    /// re-upload — `App::restore_section_textures` — instead of a re-cut, so
+    /// this asserts the key survives rather than merely that the pane recovers.
+    /// Both would pass the second claim; only this one fails the mutant.
     ///
     /// The empty-arm version of this test passed for a build that released
     /// nothing at all; found by mutation.
@@ -1193,13 +1223,27 @@ mod tests {
         // is the exact mutant that survived: the resume path would re-cut from a
         // volume that may have been evicted instead of re-uploading a raster it
         // still had.
+        // Likewise the key: with `rendered_for: None` in the fixture it is
+        // `None` before and after, and an arm that cleared it would pass.
+        let target = SectionTarget {
+            volume: VolumeStamp {
+                site: "KTLX".to_owned(),
+                collected: chrono::NaiveDate::from_ymd_opt(2026, 7, 30)
+                    .expect("a real date")
+                    .and_hms_opt(18, 42, 0)
+                    .expect("a real time"),
+            },
+            product: RadarProduct::Reflectivity,
+            line,
+            sweeps: 11,
+        };
         let mut content = PaneContent::CrossSection(Box::new(CrossSectionPane {
             line: Some(line),
             source_pane: Some(0),
             section: Some(std::sync::Arc::new(blank_section())),
             texture: Some(texture),
             unavailable: Some(SectionUnavailable::RenderFailed),
-            rendered_for: None,
+            rendered_for: Some(target.clone()),
         }));
 
         content.release_textures();
@@ -1215,6 +1259,13 @@ mod tests {
             section.section.is_some(),
             "the cut went with the texture, so a resume has to re-cut from a \
              volume that may no longer be in memory"
+        );
+        assert_eq!(
+            section.rendered_for,
+            Some(target),
+            "the staleness key went with the texture, so the resume re-cuts a \
+             15.6 MB volume instead of re-uploading the raster it still holds — \
+             and fails outright if that volume has been evicted"
         );
         assert_eq!(
             section.line,
