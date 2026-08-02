@@ -11,7 +11,7 @@ rustdar-egui/src/overlay_cache.rs	421	402
 rustdar-egui/src/pane.rs	1079	1066
 rustdar-egui/src/pane_content.rs	357	354
 rustdar-egui/src/point_painter.rs	55	0
-rustdar-egui/src/tile_source.rs	188	182
+rustdar-egui/src/tile_source.rs	188	183
 rustdar-egui/src/tiles.rs	120	110
 rustdar-egui/src/ui.rs	1776	1429
 rustdar-egui/src/ui_chrome.rs	329	306
@@ -28,7 +28,7 @@ rustdar-egui/src/ui_settings.rs	220	177
 rustdar-egui/src/volume_view.rs	512	503
 rustdar-frontend/src/app.rs	1699	1411
 rustdar-frontend/src/app_chunks.rs	695	611
-rustdar-frontend/src/app_fetch.rs	1037	464
+rustdar-frontend/src/app_fetch.rs	1037	474
 rustdar-frontend/src/app_render.rs	2657	2097
 rustdar-frontend/src/app_state.rs	184	108
 rustdar-frontend/src/channels.rs	43	40
@@ -108,13 +108,13 @@ rustdar-radar/src/hca.rs	2629	1949
 rustdar-radar/src/hhc.rs	595	314
 rustdar-radar/src/kdp.rs	918	600
 rustdar-radar/src/l3_values.rs	282	281
-rustdar-radar/src/level3.rs	773	450
+rustdar-radar/src/level3.rs	773	453
 rustdar-radar/src/nrot.rs	1356	1149
 rustdar-radar/src/palette.rs	207	207
 rustdar-radar/src/render.rs	1671	1188
 rustdar-radar/src/render_input.rs	1089	1071
 rustdar-radar/src/sampler.rs	1726	1654
-rustdar-radar/src/scan.rs	244	38
+rustdar-radar/src/scan.rs	244	39
 rustdar-radar/src/sites.rs	106	106
 rustdar-radar/src/sounding.rs	234	207
 rustdar-radar/src/sources.rs	172	169
