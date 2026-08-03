@@ -36,7 +36,7 @@ walkers = { workspace = true }
 futures = "=0.3.33"
 # Bounded tile cache with LRU eviction. Pinned to the version walkers already
 # resolves, so this adds no new node to the dependency graph.
-lru = "=0.18.1"
+lru = "=0.18.2"
 # Basemap tiles go through the workspace TLS pin like every other rustdar
 # request. No extra features: `tile_source` needs neither `json` nor `default`,
 # and `default` would re-enable `default-tls` (= platform verifier + aws-lc-rs)
