@@ -17,7 +17,7 @@ nexrad-level3 = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
 # ListObjectsV2 response parsing in `archive`. Pure Rust (xml-rs).
-xml = "=1.3.0"
+xml = "=1.4.0"
 
 # `tls` installs the process-wide *ring* provider here: this is the lowest crate
 # in the graph that reaches a TLS handshake.
