@@ -6395,21 +6395,24 @@ mod tests {
         );
     }
 
-    /// 46. **A rendered section says, in words and in its own numbers, that its
-    ///     vertical extent belongs to the tilt ladder.**
+    /// 46. **A rendered section's caption is calm by default, and the honesty
+    ///     detail is one click away — reachable, in the user's words, and
+    ///     closable again.**
     ///
-    ///     The third of the three honesty devices — the drawn rungs and the
-    ///     `NEAREST` upload are the other two — and the only one a test can read
-    ///     back as text. Deliberately not a dismissible banner: what it says is
-    ///     not a one-off notice but the standing meaning of every pixel in the
-    ///     pane.
+    ///     The redesign's whole contract, end to end. The old caption painted
+    ///     the ladder warning and the registration caveat on every ordinary
+    ///     section, the warning in error styling — and watched with real users
+    ///     it read as something broken, something they had broken. The drawn
+    ///     rungs and the `NEAREST` upload stay as the standing honesty devices;
+    ///     the words move behind the ⓘ.
     ///
-    ///     Asserted through the ladder's *own* numbers, because a caption saying
-    ///     the same thing whatever the volume was would be boilerplate a reader
-    ///     learns to skip. 14 rungs 0.5° apart and 5 rungs 5° apart are the same
-    ///     sentence with entirely different consequences.
+    ///     Asserted through the ladder's *own* numbers on both sides of the
+    ///     toggle, because a detail saying the same thing whatever the volume
+    ///     was would be boilerplate a reader learns to skip. 14 rungs 0.5°
+    ///     apart and 5 rungs 5° apart are the same sentence with entirely
+    ///     different consequences.
     #[test]
-    fn a_rendered_section_says_its_depth_is_the_ladders_and_not_measured() {
+    fn a_rendered_sections_caption_is_calm_and_its_detail_is_one_click_away() {
         let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
         h.load_scan("KTLX");
         let (a, b) = section_ends();
@@ -6422,23 +6425,67 @@ mod tests {
             "precondition: the pane must be drawing a picture, not its empty state"
         );
 
-        for phrase in [
-            // The ladder's own count and its widest step, so the warning is a
-            // measurement of *this* volume rather than a fixed sentence.
-            "14 tilts",
-            "4.9",
-            // What the reader must not do with the picture.
-            "not measured",
-            // And the registration caveat against the plan view above it, which
-            // a user comparing the two would otherwise discover as a bug.
-            "slant range",
-        ] {
+        // The default: the ladder's own headline numbers, and none of the
+        // long-form copy that read as an error state.
+        assert!(
+            h.text_painted_in(pane, "14 tilts"),
+            "the default caption lost the ladder's own count; it painted {:?}",
+            h.painted_text_strings_in(pane)
+        );
+        for wall_of_text in ["not measured", "slant range", "widest", "Echoes can sit"] {
             assert!(
-                h.text_painted_in(pane, phrase),
-                "the section pane never said {phrase:?}; it painted {:?}",
+                !h.text_painted_in(pane, wall_of_text),
+                "the long-form detail is back in the default caption \
+                 ({wall_of_text:?}); it painted {:?}",
                 h.painted_text_strings_in(pane)
             );
         }
+
+        // The ⓘ is on the pane, and clicking it opens the detail.
+        let glyph = h
+            .painted_text_rects()
+            .into_iter()
+            .find(|(rect, text)| text == "\u{2139}" && pane.contains(rect.center()))
+            .map(|(rect, _)| rect)
+            .expect("the caption has no \u{2139} detail toggle");
+        h.mouse_click(glyph.center());
+        h.frame();
+
+        for phrase in [
+            // The ladder's widest step: a measurement of *this* volume.
+            "4.9",
+            // What the reader must not do with the picture.
+            "not measured",
+            // And why echoes sit off the map's track, in words about what the
+            // user sees rather than about which renderer is right.
+            "Echoes can sit",
+        ] {
+            assert!(
+                h.text_painted_in(pane, phrase),
+                "the opened detail never said {phrase:?}; it painted {:?}",
+                h.painted_text_strings_in(pane)
+            );
+        }
+        // The developer-voice sentence is gone for good, open or closed: "the
+        // section is right" is the app arguing with itself in front of the
+        // user.
+        assert!(
+            !h.text_painted_in(pane, "The section is right"),
+            "the detail still argues with the map in front of the user"
+        );
+
+        // And the detail closes again: an explanation that cannot be dismissed
+        // is the old wall of text with an extra click in front of it.
+        h.mouse_click(glyph.center());
+        h.frame();
+        assert!(
+            !h.text_painted_in(pane, "not measured"),
+            "the detail did not close on a second click"
+        );
+        assert!(
+            h.text_painted_in(pane, "14 tilts"),
+            "closing the detail lost the caption itself"
+        );
     }
 
     /// 46b. **A rendered section is drawn the right way up, over the caption
@@ -6482,6 +6529,16 @@ mod tests {
         let (a, b) = section_ends();
         h.make_pane_cross_section(0, a, b);
         h.place_section(0, vcp_212_axes(), &vcp_212_rungs());
+        // With the ⓘ detail open — the caption's longest shape, and the only
+        // one whose lines wrap enough rows for a counted height to be wrong by
+        // more than a point or two.
+        h.gui_mut()
+            .pane_mut(0)
+            .expect("pane 0 exists")
+            .cross_section_mut()
+            .expect("pane 0 is a section pane")
+            .detail_open = true;
+        h.warm_up();
 
         let pane = h.pane_rects()[0];
         let images = h.painted_images_in(pane);
@@ -6530,14 +6587,17 @@ mod tests {
             .into_iter()
             .filter(|(rect, text)| {
                 pane.contains(rect.center())
-                    && (text.contains("tilts") || text.contains("slant range"))
+                    && (text.contains("tilts")
+                        || text.contains("dotted curves")
+                        || text.contains("Echoes can sit"))
             })
             .collect();
         assert_eq!(
             caption_rows.len(),
-            2,
-            "precondition: both caption sentences have to be on the pane, or the \
-             overlap check below is looking at the wrong thing: {:?}",
+            3,
+            "precondition: the headline and both detail sentences have to be on \
+             the pane, or the overlap check below is looking at the wrong \
+             thing: {:?}",
             h.painted_text_strings_in(pane)
         );
         let measured: f32 = caption_rows.iter().map(|(rect, _)| rect.height()).sum();

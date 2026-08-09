@@ -566,6 +566,16 @@ pub struct CrossSectionPane {
     /// state, which is not a failure and has its own message. `None` with a
     /// line and no [`section`](Self::section) means a cut is in flight.
     pub unavailable: Option<SectionUnavailable>,
+    /// Whether the caption's ⓘ detail — the long-form account of what the
+    /// picture is and is not — is expanded.
+    ///
+    /// View state, not a claim about the data, so it is deliberately **not**
+    /// persisted and **not** part of any staleness key: toggling it must never
+    /// cost a re-cut. It lives on the pane rather than in egui memory so the
+    /// renderer reads and writes it through the same struct everything else
+    /// about the pane goes through — and so a test can drive it without
+    /// reaching into a private id-keyed store.
+    pub detail_open: bool,
 }
 
 impl std::fmt::Debug for CrossSectionPane {
@@ -579,6 +589,7 @@ impl std::fmt::Debug for CrossSectionPane {
             .field("section", &self.section.is_some())
             .field("texture", &self.texture.as_ref().map(|t| t.id()))
             .field("unavailable", &self.unavailable)
+            .field("detail_open", &self.detail_open)
             .finish()
     }
 }
@@ -1312,6 +1323,7 @@ mod tests {
             texture: Some(texture),
             unavailable: Some(SectionUnavailable::RenderFailed),
             rendered_for: Some(target.clone()),
+            detail_open: false,
         }));
 
         content.release_textures();

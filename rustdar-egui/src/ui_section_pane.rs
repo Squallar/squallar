@@ -33,32 +33,37 @@
 //!    rung edges into a smooth gradient and paint precisely the impression of
 //!    continuous measurement this module is refusing. The blockiness is data.
 //!    (That decision lives with the upload, in `app_render.rs`.)
-//! 3. **The caption says so in words**, with the ladder's own numbers in it —
-//!    how many rungs, how far apart the widest pair is, and **where the ladder
-//!    stops** against what the coverage pattern flies.
+//! 3. **The caption stays calm, and the words live behind the ⓘ.** The
+//!    default caption is the product, the ladder's own count and top angle,
+//!    and the time of the volume the picture was cut from — nothing else, in
+//!    the pane's quiet text colour. Everything long-form — what a short ladder
+//!    means for what is on screen, where the interpolation lives, why echoes
+//!    can sit off the map's ground track — moves behind the ⓘ beside the
+//!    caption, written to a user rather than to this module's reviewers.
 //!
-//!    That last one is why a live section does not wait for a complete volume.
-//!    Unlike a 3D volume, whose grid genuinely cannot be built mid-flight, a
-//!    section's picture *is* the ladder — so a three-rung section is a truthful
-//!    picture of a three-rung ladder, and waiting would blank the pane for most
-//!    of every six minutes for no gain. The argument only holds while the
-//!    picture carries its own truncation, and the gap figures alone do the
-//!    opposite: a volume four rungs in is all low, closely-spaced cuts, so
-//!    *"4 tilts, widest gap 0.5°, ≈1 km apart at 86 km"* flatters a state that
-//!    a complete volume's *"14 tilts, widest gap 4.9°, ≈7 km apart"* does not.
-//!    Every number improved as the picture got worse. Where the ladder stops is
-//!    the number that degrades with truncation, so it replaces them.
+//!    That split is a lesson paid for, not a retreat from honesty. The first
+//!    caption led, in **error styling**, with where the ladder stopped against
+//!    what the pattern declares, and quoted the top-of-coverage height at
+//!    maximum range. Watched with real users, it read as something broken —
+//!    something *they* had broken — and it fired on almost every volume,
+//!    because AVSET ends a precipitation scan once the echo tops are below the
+//!    cuts that remain: measured live at KLNX, every VCP 212 volume in a
+//!    ten-minute window topped out between 6.4° and 8.0° of a declared 19.5°.
+//!    A warning styled as a fault and shown on the ordinary case is not
+//!    honesty; it is an alarm people learn to skip. And its headline number —
+//!    ≈114.5 kft MSL at 225 km — was above the pane's own axis: a height no
+//!    echo could ever be drawn at, pure alarm carrying zero information.
 //!
-//!    **A short ladder is the ordinary case, not the exception**, and that is
-//!    why the wording blames nothing. AVSET ends a precipitation scan once the
-//!    echo tops are below the cuts that remain, so a *finished* VCP 212 volume
-//!    routinely tops out well under its declared 19.5°: measured live at KLNX,
-//!    every volume in a ten-minute window ended between 6.4° and 8.0°. A
-//!    caption that read as a fault would be wrong most of the times it was
-//!    shown, and a warning that is usually wrong is one people learn to skip.
-//!    The consequence is the same whichever of the three causes it was — still
-//!    filling, abandoned, or AVSET — and the consequence is all it says: the
-//!    picture's ceiling is the volume's, not the radar's.
+//!    So the redesign keeps every fact and re-homes it. Red is reserved for
+//!    states that are genuinely broken — a failed cut, a volume with no data
+//!    for this moment. A filling or AVSET-ended volume is captioned in the
+//!    same calm voice as a complete one, with its top angle in the default
+//!    line for whoever knows what it means. The ⓘ detail says the consequence
+//!    in the user's own units — and quotes a ceiling height **only when it is
+//!    on the chart**, because a figure above the axis is unfalsifiable by
+//!    looking. The cause of a short ladder is still never blamed: filling,
+//!    abandoned and AVSET all read the same from one volume, and a caption
+//!    that guessed would be wrong most often exactly when it sounded surest.
 //!
 //! # And the second thing, which is about the map rather than the section
 //!
@@ -67,7 +72,10 @@
 //! ground. This section applies both. They therefore disagree, by 0.9 px at
 //! 2.4° and by 18 px at 19.5° and 70 km. The section is the correct one. A user
 //! comparing the section against the ground track drawn on the map above it
-//! **will** see this, so it is in the caption rather than only in a doc comment.
+//! can see this, which is why it is explained at all — but it is explained in
+//! the ⓘ detail, in words about what the user sees, not shipped in the default
+//! caption: *"the section is right"* is this module arguing with itself in
+//! front of the user, and it read exactly that way.
 
 use crate::pane::PaneState;
 use rustdar_radar::beam;
@@ -80,24 +88,22 @@ use rustdar_units::UserPreferences;
 const HEIGHT_GUTTER: f32 = 44.0;
 /// Height of the distance-axis gutter, in points.
 const DISTANCE_GUTTER: f32 = 16.0;
-/// Below this pane height the registration caveat is dropped.
-///
-/// A **runtime** threshold on the pane's own rect, never `cfg!(target_os)`: one
-/// wasm binary serves a phone in portrait and a desktop browser, and the same
-/// desktop window can be dragged to either size.
-const TWO_LINE_CAPTION_MIN_HEIGHT: f32 = 260.0;
 /// Points a section needs before axis labels are worth the room they take.
 const LABELLED_AXES_MIN_HEIGHT: f32 = 120.0;
-/// The most of a pane's height the caption may take before the registration
-/// caveat is dropped to make room.
+/// The most of a pane's height the caption may take before detail lines are
+/// dropped, last first, to make room.
 ///
 /// The caption is **wrapped**, so its height is a function of the pane's width
-/// as well as its own text — a tall, narrow pane clears
-/// [`TWO_LINE_CAPTION_MIN_HEIGHT`] and then wraps the caveat over half a dozen
-/// rows. Dropping the caveat is the right answer there and truncating it is not:
-/// a sentence cut off mid-clause reads as a rendering fault, and the clause it
-/// cuts is the one explaining that the section and the map disagree on purpose.
+/// as well as its own text — with the ⓘ detail open, a narrow pane wraps each
+/// explanation over half a dozen rows. Dropping whole detail lines is the right
+/// answer there and truncating one is not: a sentence cut off mid-clause reads
+/// as a rendering fault, and the sentences here are the ones the user just
+/// asked to read in full. The default line and the status line are never
+/// dropped — see [`CaptionLine::essential`].
 const CAPTION_MAX_HEIGHT_FRACTION: f32 = 0.45;
+/// Points reserved beside the caption for the ⓘ detail toggle, so the first
+/// line's wrap never runs under the glyph that expands it.
+const INFO_TOGGLE_RESERVE: f32 = 26.0;
 /// Headroom between the caption and the plot, for the height axis's unit label.
 ///
 /// [`paint_axes`] writes `MSL kft` **bottom**-aligned on `plot.top() - 2.0`, in
@@ -163,6 +169,12 @@ pub(super) fn render_cross_section(
         return;
     };
     let unavailable = state.unavailable;
+    let detail_open = state.detail_open;
+    // The volume the picture on screen was actually cut from — not the pane's
+    // `scan_info`, which follows the feed and can already name the *next*
+    // volume while this raster is still of the last one. The caption describes
+    // the picture, so its time has to be the picture's.
+    let collected = state.rendered_for.as_ref().map(|t| t.volume.collected);
 
     let axes = *section.axes();
 
@@ -173,7 +185,15 @@ pub(super) fn render_cross_section(
     let caption = lay_out_caption(
         &painter,
         pane_rect,
-        caption_lines(pane_rect, &axes, product, unavailable, ui.visuals(), prefs),
+        caption_lines(
+            &axes,
+            product,
+            collected,
+            unavailable,
+            detail_open,
+            ui.visuals(),
+            prefs,
+        ),
     );
     let caption_height = caption.iter().map(|g| g.rect.height()).sum();
     let layout = SectionLayout::new(pane_rect, caption_height, horizontal_color_scale);
@@ -211,14 +231,56 @@ pub(super) fn render_cross_section(
     // Each galley was laid out with its own colour, so the third argument is
     // only the fallback egui uses for a galley that carries none.
     let mut y = layout.caption.top();
-    for galley in caption {
+    let mut first_line_end = egui::pos2(layout.caption.left(), y);
+    for (i, galley) in caption.into_iter().enumerate() {
         let height = galley.rect.height();
+        if i == 0 {
+            // Where the first *visual* row ends, not where the galley's widest
+            // row does: the toggle sits beside the sentence it expands.
+            let first_row_width = galley
+                .rows
+                .first()
+                .map_or(0.0, |row| row.rect().width());
+            first_line_end = egui::pos2(layout.caption.left() + first_row_width + 6.0, y);
+        }
         painter.galley(
             egui::pos2(layout.caption.left(), y),
             galley,
             ui.visuals().text_color(),
         );
         y += height;
+    }
+
+    // The ⓘ detail toggle, at the end of the caption's first line. A widget in
+    // a pane that is otherwise pure painting, because the whole point of the
+    // redesign is that the long-form honesty is *reachable* rather than shouted:
+    // a glyph that could not be clicked would be a decoration.
+    let toggle_color = if detail_open {
+        ui.visuals().hyperlink_color
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    // `ℹ` (U+2139) rather than the prettier `ⓘ` (U+24D8): egui's bundled
+    // fonts carry a glyph for the former (NotoEmoji) and none for the latter,
+    // and a tofu box is not an affordance.
+    let glyph_rect = painter.text(
+        first_line_end,
+        egui::Align2::LEFT_TOP,
+        "\u{2139}",
+        egui::FontId::proportional(12.0),
+        toggle_color,
+    );
+    let response = ui
+        .interact(
+            glyph_rect.expand(4.0),
+            ui.id().with("section_detail_toggle"),
+            egui::Sense::click(),
+        )
+        .on_hover_text("What this picture is \u{2014} and what it is not");
+    if response.clicked()
+        && let Some(state) = pane.cross_section_mut()
+    {
+        state.detail_open = !detail_open;
     }
 
     if let Some(pos) = ui.ctx().pointer_hover_pos()
@@ -244,16 +306,13 @@ struct SectionLayout {
 }
 
 /// The width the caption's text is wrapped to on a pane of this shape.
-fn caption_wrap_width(pane_rect: egui::Rect) -> f32 {
-    (pane_rect.width() - 8.0).max(1.0)
-}
-
-/// Whether a pane of this shape has room for the registration caveat.
 ///
-/// A **runtime** decision on the rect, never `cfg!(target_os)`: one wasm binary
-/// serves a phone in portrait and a desktop browser.
-fn wants_registration_line(pane_rect: egui::Rect) -> bool {
-    pane_rect.height() >= TWO_LINE_CAPTION_MIN_HEIGHT
+/// [`INFO_TOGGLE_RESERVE`] is held back so the first line's text can never run
+/// under the ⓘ drawn at its end — and it is held back from every line rather
+/// than only the first, because two wrap widths in one block would make the
+/// detail lines ragged against the line above them.
+fn caption_wrap_width(pane_rect: egui::Rect) -> f32 {
+    (pane_rect.width() - 8.0 - INFO_TOGGLE_RESERVE).max(1.0)
 }
 
 impl SectionLayout {
@@ -587,182 +646,249 @@ struct CaptionLine {
     text: String,
     color: egui::Color32,
     size: f32,
+    /// Whether [`lay_out_caption`] may drop this line to fit the pane.
+    ///
+    /// The default line and the status line always survive: a pane whose
+    /// caption vanished entirely names nothing, and a transient failure that
+    /// could be squeezed off screen is one the user never learns about. The
+    /// ⓘ detail lines are the droppable ones — they were asked for, and on a
+    /// pane too small to hold them the alternative is eating the picture they
+    /// describe.
+    essential: bool,
 }
 
-/// The caption: what this is, how coarse it is, and where it disagrees with the
-/// map above it.
+/// The caption: one calm line saying what this is, and — behind the ⓘ — the
+/// detail saying what it is not.
 ///
-/// Not a dismissible banner and not a tooltip. Both of those are read once and
-/// then never again, and the thing being said is not a one-off notice — it is
-/// the standing meaning of every pixel in the pane.
+/// # The default line is deliberately minimal
+///
+/// Product, tilt count, top angle, volume time. Watched with real users, the
+/// previous caption — a red paragraph of ladder numbers and a registration
+/// caveat, on every ordinary section — read as an error state they had caused.
+/// The module documentation carries the full account; the short version is that
+/// a warning shown on almost every volume in error styling is an alarm people
+/// learn to skip, which serves honesty worse than a calm line with the facts
+/// one tap away.
+///
+/// # What the colours mean now
+///
+/// **Red is reserved for genuinely broken states**: a cut that failed, a volume
+/// carrying no data for this moment. A filling or AVSET-ended volume is the
+/// ordinary case — measured live at KLNX, *every* VCP 212 volume in a
+/// ten-minute window topped out between 6.4° and 8.0° of a declared 19.5° — so
+/// it is captioned in the same quiet colour as a complete one. Pinned by
+/// `red_is_reserved_for_broken_states`.
 ///
 /// Built as text before anything is measured or drawn, because the caption's
 /// height decides where the plot starts and the caption's height is only known
 /// once its text has been wrapped to the pane's width.
 fn caption_lines(
-    pane_rect: egui::Rect,
     axes: &SectionAxes,
     product: RadarProduct,
+    collected: Option<chrono::NaiveDateTime>,
     unavailable: Option<crate::pane::SectionUnavailable>,
+    detail_open: bool,
     visuals: &egui::Visuals,
     prefs: &UserPreferences,
 ) -> Vec<CaptionLine> {
     let mut lines = Vec::new();
+    let calm = visuals.weak_text_color();
 
-    // The ladder's own numbers, so the warning is a measurement rather than
-    // boilerplate: 14 rungs 0.5° apart and 5 rungs 5° apart are the same
-    // sentence with wildly different consequences.
-    //
-    // **Except at the bottom of the ladder, where the numbers say the opposite
-    // of what they mean.** `widest_tilt_gap_deg` is `0.0` for a single rung
-    // because there is no second rung to be apart from, so the general sentence
-    // comes out as "1 tilts, widest gap 0.0° (≈0km apart at 171km)" — and a
-    // skimmer reads a zero gap as perfect sampling when a one-rung ladder is the
-    // worst case there is. A one-rung section is one conical surface with
-    // nothing measured above or below it, and that is what it has to say.
-    let widest_gap_km = axes.widest_tilt_gap_deg.to_radians() * axes.coverage_ground_range_km;
-    let gap_shown = prefs.distance.convert_from_km(widest_gap_km);
-    // How high the top rung's beam is where the section's data ends — the
-    // ceiling of the picture, in the height axis's own unit and datum. Named
-    // rather than left as a degree number because "1.8°" is not a height and a
-    // forecaster reading a section is reading heights.
-    let ceiling_km_msl = axes.base_km_msl
-        + beam::height_at_ground_km(axes.coverage_ground_range_km, axes.top_tilt_deg);
-    let ceiling_shown = match prefs.height {
-        rustdar_units::HeightUnit::Feet => ceiling_km_msl * KM_TO_KFT,
-        rustdar_units::HeightUnit::Meters => ceiling_km_msl,
-    };
-    let (ladder, ladder_color) = match axes.tilt_count {
+    // The volume time in the user's zone, because "how fresh is this picture"
+    // is the third thing the default line owes — a section is cut once per
+    // volume and a storm outruns one in minutes.
+    let stamp = collected.map_or_else(String::new, |t| {
+        format!("  \u{b7}  {}", prefs.timezone.format_naive_utc(t, "%H:%M"))
+    });
+
+    let (headline, headline_color) = match axes.tilt_count {
+        // No data for this moment at all is a genuinely broken picture, and the
+        // one ladder state red is still for: nothing below was measured, and no
+        // amount of waiting on *this* volume changes that.
         0 => (
             format!(
-                "{}  \u{2014}  no tilts: this volume carried no cut of this moment, so \
-                 nothing in the picture below was measured",
+                "{}  \u{2014}  no tilts: this volume carried none of this product, so \
+                 nothing below was measured",
                 product.name(),
             ),
             visuals.error_fg_color,
         ),
+        // One rung is the worst *picture* there is — a single conical surface
+        // smeared over the pane — but it is a routine early-volume state, not a
+        // fault, so it says what it is in the calm colour rather than shouting.
         1 => (
             format!(
-                "{}  \u{2014}  one tilt only: a single conical surface, with nothing \
-                 measured above or below it. This is not a vertical profile.",
+                "{}  \u{2014}  one tilt: a single scanned surface, not a vertical profile",
                 product.name(),
             ),
-            visuals.error_fg_color,
+            calm,
         ),
-        // **A ladder that stopped short of its own pattern.** The gap numbers
-        // are deliberately *not* in this sentence, because mid-volume they
-        // flatter: a volume four rungs in is all low, closely-spaced cuts, so
-        // "widest gap 0.5°, ≈1 km apart at 86 km" reads better than a complete
-        // VCP 212's "4.9°, ≈7 km apart" — the caption's own figures improve as
-        // the picture gets more truncated. Where the ladder stops is the number
-        // that degrades with truncation, and it is the only one that matters
-        // while a volume is filling.
-        //
-        // **The cause is deliberately not named**, only the consequence. A short
-        // ladder is a volume still in flight, a volume abandoned, *or* — much
-        // more often than either — AVSET, which ends a precipitation scan once
-        // the echo tops are below the cuts that are left. Measured live at KLNX
-        // on VCP 212: every volume in a ten-minute window topped out between
-        // 6.4° and 8.0° against a declared 19.5°, complete ones included. So
-        // this is the ordinary state of a precipitation section and not an
-        // anomaly, and wording that read as a fault ("was cut short") would
-        // train a forecaster to ignore it. What is true in all three cases, and
-        // all this needs to say, is that the picture's ceiling is the volume's
-        // rather than the radar's.
-        rungs if !ladder_reaches_pattern_top(axes) => (
-            format!(
-                "{}  \u{2014}  {rungs} tilts, topping out at {:.1}\u{b0} of the {:.1}\u{b0} \
-                 this pattern flies: nothing above \u{2248}{:.1} {} MSL at {:.0}{} was \
-                 scanned, because the volume is still filling or ended early. What is \
-                 drawn is set by the ladder, not measured.",
-                product.name(),
-                axes.top_tilt_deg,
-                axes.top_declared_cut_deg,
-                ceiling_shown,
-                prefs.height.kilo_suffix(),
-                prefs
-                    .distance
-                    .convert_from_km(axes.coverage_ground_range_km),
-                prefs.distance.suffix(),
-            ),
-            visuals.error_fg_color,
-        ),
+        // The ordinary case, complete or filling alike: the count and the top
+        // angle are the ladder's own numbers, compact enough to stay calm and
+        // exact enough that a reader who knows what 8.0° of a VCP means loses
+        // nothing to the redesign. Which pattern the volume flies, and where
+        // this one stopped against it, is the ⓘ detail's to explain.
         rungs => (
             format!(
-                "{}  \u{2014}  {rungs} tilts to {:.1}\u{b0}, widest gap {:.1}\u{b0} \
-                 (\u{2248}{:.0}{} apart at {:.0}{}): layer depth and echo tops here are set \
-                 by the ladder, not measured",
+                "{}  \u{2014}  {rungs} tilts to {:.1}\u{b0}{stamp}",
                 product.name(),
                 axes.top_tilt_deg,
-                axes.widest_tilt_gap_deg,
-                gap_shown,
-                prefs.distance.suffix(),
-                prefs
-                    .distance
-                    .convert_from_km(axes.coverage_ground_range_km),
-                prefs.distance.suffix(),
             ),
-            visuals.warn_fg_color,
+            calm,
         ),
     };
     lines.push(CaptionLine {
-        text: ladder,
-        color: ladder_color,
+        text: headline,
+        color: headline_color,
         size: 11.0,
+        essential: true,
     });
 
-    if wants_registration_line(pane_rect) {
-        // The registration caveat, in the pane the user is looking at rather
-        // than only in a doc comment — because the disagreement is visible.
-        // `render_gate` draws a gate at its slant range on the ground with no
-        // `cos(e)` and no beam height; this applies both. 0.9 px at 2.4°,
-        // 18 px at 19.5° and 70 km.
-        let mut second = String::from(
-            "The map draws gates at slant range, ignoring beam tilt; this section does not, \
-             so echoes sit slightly off the ground track on high tilts. The section is right.",
-        );
-        // Only when it is true of *this* section: a line that ran out of data
-        // half way along is a fact about the picture, and saying it always
-        // would make it noise.
-        if axes.coverage_ground_range_km + 0.5 < axes.far_ground_range_km {
-            second.push_str(&format!(
-                "  Coverage stops at {:.0}{} of {:.0}{}.",
-                prefs
-                    .distance
-                    .convert_from_km(axes.coverage_ground_range_km),
-                prefs.distance.suffix(),
-                prefs.distance.convert_from_km(axes.far_ground_range_km),
-                prefs.distance.suffix(),
-            ));
-        }
-        lines.push(CaptionLine {
-            text: second,
-            color: visuals.weak_text_color(),
-            size: 10.0,
-        });
+    if detail_open {
+        detail_lines(axes, visuals, prefs, &mut lines);
     }
 
-    // Last, under both, so a transient state never pushes the standing warning
-    // off the top of the pane.
+    // Last, under everything, so a transient state never pushes the caption off
+    // the top of the pane. **Red only when the state is broken**: a failed cut
+    // is a dead end, but a volume still downloading or a pattern still on its
+    // way resolve themselves, and painting the ordinary path to a picture in
+    // error styling is exactly what the redesign exists to stop.
     if let Some(reason) = unavailable {
+        let broken = matches!(reason, crate::pane::SectionUnavailable::RenderFailed);
         lines.push(CaptionLine {
-            text: format!("\u{26a0} {}", reason.message()),
-            color: visuals.error_fg_color,
+            text: if broken {
+                format!("\u{26a0} {}", reason.message())
+            } else {
+                reason.message()
+            },
+            color: if broken { visuals.error_fg_color } else { calm },
             size: 10.0,
+            essential: true,
         });
     }
 
     lines
 }
 
-/// Wrap the caption to the pane's width, dropping the registration caveat if
-/// what is left would eat the picture.
+/// The ⓘ detail: the long-form honesty, in the user's words and units.
+///
+/// Three facts, one line each, every one droppable on a pane too small to hold
+/// it ([`CaptionLine::essential`]):
+///
+/// 1. **Where the ladder stopped**, when it stopped short of its pattern. The
+///    cause is deliberately not named — filling, abandoned and AVSET read the
+///    same from one volume — and the ceiling height is quoted **only when it is
+///    on the chart**: the old caption quoted the top of coverage at maximum
+///    range, ≈114.5 kft against an axis ending near 65, a number no echo could
+///    be drawn at and therefore pure alarm.
+/// 2. **Where the interpolation lives**, with the ladder's own gap numbers so
+///    the sentence is a measurement of this volume rather than boilerplate.
+///    These are the figures the old caption led with; they moved here because
+///    mid-volume they *flatter* — a four-rung ladder's "widest gap 0.5°" reads
+///    better than a complete VCP 212's "4.9°" — so they inform alongside the
+///    truncation line rather than standing in for it.
+/// 3. **Why echoes sit off the map's track**, described as what the user sees.
+///    The old spelling ended "The section is right", which is this module
+///    arguing with its sibling in front of the user; which renderer applies
+///    the beam model is a fact for `render_gate`'s docs, not for the pane.
+fn detail_lines(
+    axes: &SectionAxes,
+    visuals: &egui::Visuals,
+    prefs: &UserPreferences,
+    lines: &mut Vec<CaptionLine>,
+) {
+    let color = visuals.weak_text_color();
+    let mut push = |text: String| {
+        lines.push(CaptionLine {
+            text,
+            color,
+            size: 10.0,
+            essential: false,
+        });
+    };
+
+    if axes.tilt_count >= 2 && !ladder_reaches_pattern_top(axes) {
+        let mut text = format!(
+            "The radar scanned to {:.1}\u{b0} this volume, of the {:.1}\u{b0} its pattern \
+             can reach \u{2014} air above the top dotted curve was not sampled. That is \
+             ordinary: scans often stop climbing once storm tops sit below the remaining \
+             tilts, and the picture fills in if more arrive.",
+            axes.top_tilt_deg, axes.top_declared_cut_deg,
+        );
+        // The ceiling as a height, because "1.8°" is not a height and a
+        // forecaster reading a section is reading heights — but **only when the
+        // height is on the pane's own axis**. Above it, the figure describes a
+        // place the picture cannot show, and a warning about an off-chart
+        // number is indistinguishable from a bug.
+        let ceiling_km_msl = axes.base_km_msl
+            + beam::height_at_ground_km(axes.coverage_ground_range_km, axes.top_tilt_deg);
+        if ceiling_km_msl <= axes.top_km_msl {
+            let ceiling_shown = match prefs.height {
+                rustdar_units::HeightUnit::Feet => ceiling_km_msl * KM_TO_KFT,
+                rustdar_units::HeightUnit::Meters => ceiling_km_msl,
+            };
+            text.push_str(&format!(
+                " The picture's ceiling is \u{2248}{:.0} {} MSL at the far end of the line.",
+                ceiling_shown,
+                prefs.height.kilo_suffix(),
+            ));
+        }
+        push(text);
+    }
+
+    if axes.tilt_count >= 2 {
+        let widest_gap_km = axes.widest_tilt_gap_deg.to_radians() * axes.coverage_ground_range_km;
+        push(format!(
+            "Data exists along the dotted curves \u{2014} one per tilt \u{2014} and the \
+             picture between them is interpolated: layer depth and echo tops are set by \
+             the tilt spacing, not measured. The widest step here is {:.1}\u{b0}, \
+             \u{2248}{:.0}{} at {:.0}{}.",
+            axes.widest_tilt_gap_deg,
+            prefs.distance.convert_from_km(widest_gap_km),
+            prefs.distance.suffix(),
+            prefs
+                .distance
+                .convert_from_km(axes.coverage_ground_range_km),
+            prefs.distance.suffix(),
+        ));
+    }
+
+    let mut registration = String::from(
+        "Echoes can sit a little off the line drawn on the map, most visibly on high \
+         tilts: the map flattens every tilt to the ground, while this section keeps \
+         the beam's height.",
+    );
+    // Only when it is true of *this* section: a line that ran out of data half
+    // way along is a fact about the picture, and saying it always would make it
+    // noise.
+    if axes.coverage_ground_range_km + 0.5 < axes.far_ground_range_km {
+        registration.push_str(&format!(
+            "  Data ends {:.0}{} of {:.0}{} along the line.",
+            prefs
+                .distance
+                .convert_from_km(axes.coverage_ground_range_km),
+            prefs.distance.suffix(),
+            prefs.distance.convert_from_km(axes.far_ground_range_km),
+            prefs.distance.suffix(),
+        ));
+    }
+    push(registration);
+}
+
+/// Wrap the caption to the pane's width, dropping detail lines — last first —
+/// if what is left would eat the picture.
 ///
 /// The measurement is what makes the caption honest at every pane shape. Before
 /// it, the caption was drawn with `Painter::text` and no wrap width and the band
-/// was *counted* at one row per line — so on a wide pane in a 2×2 split the
-/// caveat ran flush to the pane's edge and was clipped mid-sentence, and there
-/// was nothing in the layout that could have noticed.
+/// was *counted* at one row per line — so on a wide pane in a 2×2 split a
+/// caption line ran flush to the pane's edge and was clipped mid-sentence, and
+/// there was nothing in the layout that could have noticed.
+///
+/// Only lines marked droppable are dropped ([`CaptionLine::essential`]), and
+/// whole lines rather than rows: a sentence cut off mid-clause reads as a
+/// rendering fault. If every droppable line is gone and the essentials still
+/// overrun the budget, the essentials are kept anyway — a caption that names
+/// nothing is worse than a plot that starts low.
 fn lay_out_caption(
     painter: &egui::Painter,
     pane_rect: egui::Rect,
@@ -786,20 +912,19 @@ fn lay_out_caption(
         galleys.iter().map(|g| g.rect.height()).sum()
     };
 
-    let galleys = layout_all(&lines);
     let budget = pane_rect.height() * CAPTION_MAX_HEIGHT_FRACTION;
-    if total(&galleys) <= budget || lines.len() < 2 {
-        return galleys;
+    let mut galleys = layout_all(&lines);
+    while total(&galleys) > budget {
+        // Last droppable line first: the detail lines are ordered most- to
+        // least-load-bearing, so the registration note goes before the
+        // interpolation note goes before the truncation note.
+        let Some(idx) = lines.iter().rposition(|l| !l.essential) else {
+            return galleys;
+        };
+        lines.remove(idx);
+        galleys = layout_all(&lines);
     }
-    // Index 1 is the registration caveat when there is one — the ladder warning
-    // is always first and the transient status line is always last, and those
-    // two are the ones that must survive. `wants_registration_line` has already
-    // said yes on the pane's *height*; this is the same judgement made on the
-    // wrapped result, which is the only place the pane's width gets a say.
-    if wants_registration_line(pane_rect) {
-        lines.remove(1);
-    }
-    layout_all(&lines)
+    galleys
 }
 
 /// What the status bar says about the pixel under the pointer.
@@ -1116,10 +1241,8 @@ mod tests {
         let rect =
             |w: f32, h: f32| egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h));
 
-        assert!(wants_registration_line(rect(600.0, 400.0)));
         assert!(SectionLayout::new(rect(600.0, 400.0), TWO_LINES, false).labelled_axes);
 
-        assert!(!wants_registration_line(rect(600.0, 200.0)));
         let short = SectionLayout::new(rect(600.0, 200.0), ONE_LINE, false);
         assert!(short.labelled_axes);
         assert!(short.plot.height() > 0.0);
@@ -1168,12 +1291,15 @@ mod tests {
     /// The caption is **wrapped and then measured**, so no sentence in it is ever
     /// clipped and no wrapped row is ever painted over the picture.
     ///
-    /// Both halves matter and they fail in different places. Before the wrap, the
-    /// caveat was drawn with `Painter::text` and ran flush to the pane's edge on
-    /// a 2×2 split of a wide window — the clip cut it mid-sentence, and the
-    /// sentence it cut is the one explaining that the section and the map
-    /// disagree on purpose. Before the measurement, the band was *counted* at one
-    /// row per line, so any wrap at all landed on the plot.
+    /// Both halves matter and they fail in different places. Before the wrap, a
+    /// caption line was drawn with `Painter::text` and ran flush to the pane's
+    /// edge on a 2×2 split of a wide window — the clip cut it mid-sentence.
+    /// Before the measurement, the band was *counted* at one row per line, so
+    /// any wrap at all landed on the plot.
+    ///
+    /// Driven with the ⓘ detail **open**, which is the longest shape the
+    /// caption takes: a truncated ladder over stopped-short coverage puts every
+    /// detail line in, each with its extra clause.
     #[test]
     fn the_caption_wraps_and_the_layout_pays_for_the_rows_it_takes() {
         let ctx = egui::Context::default();
@@ -1181,11 +1307,12 @@ mod tests {
         let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
         let prefs = UserPreferences::default();
         let visuals = egui::Visuals::dark();
-        // Coverage stopping short of the line's far end appends the extra clause
-        // — the longest the caption ever gets, and the shape the clip was found
-        // on.
+        // A ladder stopped short over coverage stopped short: every detail line
+        // present, each with its appended clause — the longest the caption ever
+        // gets, and the shape the clip was found on.
         let truncated = SectionAxes {
             coverage_ground_range_km: 64.0,
+            top_tilt_deg: 6.4,
             ..axes()
         };
 
@@ -1198,10 +1325,11 @@ mod tests {
                 &painter,
                 rect,
                 caption_lines(
-                    rect,
                     &truncated,
                     RadarProduct::Reflectivity,
                     None,
+                    None,
+                    true,
                     &visuals,
                     &prefs,
                 ),
@@ -1252,30 +1380,66 @@ mod tests {
             "the caption did not wrap on a narrower pane ({medium} against {wide})"
         );
 
-        // And when even the wrapped caption would eat the pane, the registration
-        // caveat is dropped rather than the sentence being cut in half.
+        // And when even the wrapped caption would eat the pane, whole detail
+        // lines are dropped rather than a sentence being cut in half.
         let (rows_narrow, _, narrow) = measure(150.0, 300.0);
-        let (rows_roomy, _, _) = measure(200.0, 300.0);
+        let (rows_roomy, _, _) = measure(400.0, 400.0);
         assert!(
             rows_narrow < rows_roomy,
             "a caption with no room to wrap kept every line anyway"
         );
         assert!(narrow <= 300.0 * CAPTION_MAX_HEIGHT_FRACTION);
+        // The default line survives every squeeze: the last thing a pane may
+        // lose is its own name.
+        let (rows_tiny, _, _) = measure(150.0, 120.0);
+        assert!(
+            rows_tiny >= 1,
+            "the essential line was dropped to fit the budget"
+        );
+
+        // And a **status line survives the squeeze too**, even though it is
+        // last in the vector: the droppable lines are the detail's, wherever
+        // they sit, and a transient failure squeezed off screen is one the
+        // user never learns about. This is the case that tells "drop
+        // non-essential lines" from "drop from the end".
+        let squeezed = {
+            let rect = rect(150.0, 300.0);
+            let painter = egui::Painter::new(ctx.clone(), egui::LayerId::debug(), rect);
+            lay_out_caption(
+                &painter,
+                rect,
+                caption_lines(
+                    &truncated,
+                    RadarProduct::Reflectivity,
+                    None,
+                    Some(crate::pane::SectionUnavailable::RenderFailed),
+                    true,
+                    &visuals,
+                    &prefs,
+                ),
+            )
+        };
+        assert!(
+            squeezed
+                .iter()
+                .any(|g| g.text().contains("could not be cut")),
+            "the squeeze dropped the failure status instead of a detail line: {:?}",
+            squeezed.iter().map(|g| g.text()).collect::<Vec<_>>()
+        );
     }
 
-    /// A one-rung ladder is the **worst** case, and the general sentence's
-    /// numbers say the opposite.
+    /// A one-rung ladder is the **worst** case, and the caption must not
+    /// describe it in the ordinary case's words.
     ///
     /// `widest_tilt_gap_deg` is `0.0` for a single rung because there is no
-    /// second rung to be apart from, so the general wording renders as
-    /// "1 tilts, widest gap 0.0° (≈0km apart at 171km)" — which reads as perfect
+    /// second rung to be apart from, so wording that reached for the general
+    /// template would render "1 tilts" with a zero gap — which reads as perfect
     /// sampling. It was also the standing state of every live section before the
     /// staleness key learned to notice a volume filling.
     #[test]
     fn a_degenerate_ladder_does_not_report_itself_as_a_perfect_one() {
         let prefs = UserPreferences::default();
         let visuals = egui::Visuals::dark();
-        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 400.0));
         let caption = |tilt_count: usize, widest_tilt_gap_deg: f64| {
             let axes = SectionAxes {
                 tilt_count,
@@ -1283,181 +1447,372 @@ mod tests {
                 ..axes()
             };
             caption_lines(
-                rect,
                 &axes,
                 RadarProduct::Reflectivity,
                 None,
+                None,
+                false,
                 &visuals,
                 &prefs,
             )
             .swap_remove(0)
         };
 
-        for degenerate in [caption(0, 0.0), caption(1, 0.0)] {
-            let text = &degenerate.text;
+        // No tilts at all: nothing below the caption was measured, which is a
+        // genuinely broken picture and the one ladder state red is still for.
+        let empty = caption(0, 0.0);
+        assert!(
+            empty.text.contains("measured"),
+            "an empty ladder has to say nothing was measured: {}",
+            empty.text
+        );
+        assert_eq!(
+            empty.color, visuals.error_fg_color,
+            "a picture with no data behind it is a broken state"
+        );
+
+        // One tilt: the worst picture there is, and it says what it is — but in
+        // the calm colour, because a volume one rung in is a routine state, not
+        // a fault the user caused.
+        let single = caption(1, 0.0);
+        assert!(
+            single.text.contains("not a vertical profile"),
+            "a one-tilt section has to refuse the reading a user will make: {}",
+            single.text
+        );
+        assert!(!single.text.contains("1 tilts"), "{}", single.text);
+        assert_ne!(
+            single.color, visuals.error_fg_color,
+            "a filling volume's first rung is not an error"
+        );
+
+        for degenerate in [&empty, &single] {
             assert!(
-                !text.contains("widest gap"),
-                "a ladder with nothing to be apart from reported a gap: {text}"
-            );
-            assert!(!text.contains("1 tilts"), "{text}");
-            assert!(
-                text.contains("measured"),
-                "the degenerate caption has to say what was and was not measured: {text}"
-            );
-            assert_eq!(
-                degenerate.color, visuals.error_fg_color,
-                "the worst case is not styled as the ordinary one"
+                !degenerate.text.contains("widest gap"),
+                "a ladder with nothing to be apart from reported a gap: {}",
+                degenerate.text
             );
         }
 
-        // And the ordinary case still carries the ladder's own numbers, which is
-        // what makes the warning a measurement rather than boilerplate.
+        // The ordinary case names the ladder's own count and top angle — a
+        // measurement of this volume, compact enough to stay calm.
         let ordinary = caption(14, 4.9);
         assert!(ordinary.text.contains("14 tilts"), "{}", ordinary.text);
-        assert!(ordinary.text.contains("4.9"), "{}", ordinary.text);
-        assert_eq!(ordinary.color, visuals.warn_fg_color);
+        assert!(ordinary.text.contains("19.5"), "{}", ordinary.text);
+        assert_ne!(
+            ordinary.color, visuals.error_fg_color,
+            "the ordinary case must not be styled as a fault"
+        );
+        // And the gap figures are the detail's, not the headline's: they are
+        // exactly the numbers that flatter a truncated volume (see
+        // `a_ladder_that_stopped_short_stays_calm_and_explains_on_request`).
+        assert!(
+            !ordinary.text.contains("widest gap"),
+            "the default line took the detail's numbers back: {}",
+            ordinary.text
+        );
     }
 
-    /// **A ladder that stopped short says where it stopped**, and it does not
-    /// hide behind numbers that improve as it truncates.
+    /// **A ladder that stopped short is captioned as the ordinary case it is**,
+    /// and the truncation is explained — in the user's words, on request.
     ///
-    /// This is what makes live sections defensible. A section's picture *is* the
-    /// ladder — unlike a 3D volume, a three-rung section is a truthful picture
-    /// of a three-rung ladder — so it should not wait for a complete volume. The
-    /// argument only holds if the picture carries its own truncation, and the
-    /// caption's original numbers carried the opposite. Live at KMPX, four rungs
-    /// in:
+    /// The contract this replaces led with a red sentence on almost every
+    /// volume, because AVSET ends a precipitation scan once echo tops are below
+    /// the cuts that remain: measured live at KLNX, *every* VCP 212 volume in a
+    /// ten-minute window topped out between 6.4° and 8.0° of a declared 19.5°.
+    /// Watched with real users, that read as an error they had caused. The
+    /// redesign's contract, pinned here:
     ///
-    /// > *Reflectivity — 4 tilts, widest gap 0.5° (≈1km apart at 86km)*
-    ///
-    /// against a **complete** VCP 212's *14 tilts, widest gap 4.9°, ≈7 km
-    /// apart*. Every figure in the sentence gets better as the volume gets more
-    /// truncated, because a partial ladder is all low, closely-spaced cuts. It
-    /// named the gaps *between* rungs and never named where the ladder stops,
-    /// which mid-volume is the only quantity that means anything.
+    /// * the default line is **calm** — same colour as a complete volume's, no
+    ///   error styling, no wall of text;
+    /// * the default line still carries the ladder's top angle, so nothing is
+    ///   hidden — a reader who knows what 1.8° means loses nothing;
+    /// * the **detail**, when opened, names where the ladder stopped against
+    ///   its pattern, blames nothing, and quotes the ceiling height **only when
+    ///   it is on the chart**.
     #[test]
-    fn a_ladder_that_stopped_short_says_so_and_says_where() {
+    fn a_ladder_that_stopped_short_stays_calm_and_explains_on_request() {
         let prefs = UserPreferences::default();
         let visuals = egui::Visuals::dark();
-        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 400.0));
-        let caption = |axes: SectionAxes| {
+        let lines = |axes: SectionAxes, detail_open: bool| {
             caption_lines(
-                rect,
                 &axes,
                 RadarProduct::Reflectivity,
                 None,
+                None,
+                detail_open,
                 &visuals,
                 &prefs,
             )
-            .swap_remove(0)
         };
 
         // KMPX four rungs into VCP 212, with the SAILS repeat already in: the
-        // exact state the live caption was read in.
-        let filling = caption(SectionAxes {
+        // exact state the old caption was read in with users watching.
+        let filling_axes = SectionAxes {
             tilt_count: 4,
             widest_tilt_gap_deg: 0.5,
             top_tilt_deg: 1.8,
             top_declared_cut_deg: 19.5,
             coverage_ground_range_km: 86.0,
             ..axes()
-        });
-        let complete = caption(SectionAxes {
+        };
+        let complete_axes = SectionAxes {
             coverage_ground_range_km: 86.0,
             ..axes()
-        });
+        };
 
-        // Where it stops, against what the pattern flies. Both numbers, because
-        // "stops at 1.8°" means nothing without "of 19.5°" — and **as one
-        // phrase**, because which number is which is the whole sentence.
-        //
-        // Two independent `contains` checks were what this was, and they cannot
-        // tell "topping out at 1.8° of the 19.5°" from "topping out at 19.5° of
-        // the 1.8°". The two arguments are adjacent and unnamed in
-        // `caption_lines`' format string, so swapping them is a plausible edit,
-        // it compiles, and it turns the feature's headline sentence into "5
-        // tilts, topping out at 19.5° of the 6.4° this pattern flies" —
-        // nonsense, and nonsense in the reassuring direction, since it reads as
-        // a ladder that overshot its pattern rather than one that fell short.
-        assert!(
-            filling
-                .text
-                .contains("topping out at 1.8\u{b0} of the 19.5\u{b0}"),
-            "the caption did not name where the ladder stops against what the \
-             pattern flies, in that order: {}",
+        // --- The default is calm, and identical in styling to a complete
+        // volume's: a state that is true of nearly every volume ever flown must
+        // not be dressed as a fault.
+        let filling = lines(filling_axes, false).swap_remove(0);
+        let complete = lines(complete_axes, false).swap_remove(0);
+        assert_ne!(
+            filling.color, visuals.error_fg_color,
+            "a filling volume is captioned in error styling: {}",
             filling.text
         );
-        // Why the ceiling is there, without claiming which of the three causes
-        // it was. AVSET ends a precipitation scan once the echo tops are below
-        // the remaining cuts, and it is much the commonest of the three —
-        // measured live at KLNX, where every VCP 212 volume in a ten-minute
-        // window topped out between 6.4° and 8.0° against a declared 19.5°. A
-        // sentence that read as a fault would be wrong most of the time it was
-        // shown, and a warning that is usually wrong is a warning people learn
-        // to skip.
-        assert!(
-            filling.text.contains("still filling or ended early"),
-            "a volume whose ladder stops short does not say why the picture has \
-             a ceiling: {}",
-            filling.text
+        assert_eq!(
+            filling.color, complete.color,
+            "a filling volume is styled differently from a complete one, which \
+             makes its ordinary state read as a state to worry about"
         );
-        for fault in ["cut short", "abandoned", "failed"] {
-            assert!(
-                !filling.text.contains(fault),
-                "the caption blames a scan for a ceiling AVSET puts there on \
-                 purpose ({fault:?}): {}",
-                filling.text
-            );
-        }
-
-        // The flattering number is **gone**, not merely joined. Keeping it is
-        // what let a four-rung ladder advertise a tighter sampling than a
-        // complete one.
         assert!(
-            !filling.text.contains("widest gap"),
-            "the truncated caption still leads with a gap figure that improves \
-             as the volume truncates: {}",
+            filling.text.contains("4 tilts to 1.8\u{b0}"),
+            "the default line lost the ladder's own numbers: {}",
             filling.text
         );
         assert!(
-            complete.text.contains("widest gap"),
-            "precondition: a complete ladder does report its widest gap"
-        );
-
-        // And the ceiling is given as a **height**, in the height axis's own
-        // unit — 1.8° is not something a forecaster reads off a section.
-        let ceiling_km = 0.4 + beam::height_at_ground_km(86.0, 1.8);
-        let kft = format!("{:.1}", ceiling_km * KM_TO_KFT);
-        assert!(
-            filling.text.contains(&kft),
-            "the caption never said how high the ladder stops ({kft} kft \
-             expected): {}",
-            filling.text
-        );
-        assert!(
-            (2.0..12.0).contains(&(ceiling_km * KM_TO_KFT)),
-            "precondition: a 1.8° beam at 86 km is a low ceiling, not a \
-             plausible-looking one ({ceiling_km} km)"
-        );
-
-        // A truncated ladder is a worse state than a coarse one, and is styled
-        // like it.
-        assert_eq!(filling.color, visuals.error_fg_color);
-        assert_eq!(complete.color, visuals.warn_fg_color);
-
-        // A complete ladder still names its top — the number is useful either
-        // way, and having it only in the bad case would make its appearance the
-        // warning rather than the words.
-        assert!(
-            complete.text.contains("19.5"),
+            complete.text.contains("14 tilts to 19.5\u{b0}"),
             "a complete ladder does not say how high it reaches: {}",
             complete.text
         );
-        assert!(
-            !complete.text.contains("still filling"),
-            "a complete volume reported itself as in flight: {}",
-            complete.text
+        // The long-form explanation is *not* in the default: it is the wall of
+        // text users read as an error.
+        for (line, name) in [(&filling, "filling"), (&complete, "complete")] {
+            for leaked in ["pattern", "not measured", "interpolated", "MSL"] {
+                assert!(
+                    !line.text.contains(leaked),
+                    "the {name} default line carries detail copy ({leaked:?}): {}",
+                    line.text
+                );
+            }
+        }
+        assert_eq!(
+            lines(filling_axes, false).len(),
+            1,
+            "a closed detail still contributed caption lines"
         );
+
+        // --- The detail, opened, says where the ladder stopped — against what
+        // the pattern flies, as one phrase, because which number is which is
+        // the whole sentence. (Two independent `contains` cannot tell
+        // "to 1.8° of the 19.5°" from its swap, which compiles and reads as a
+        // ladder that overshot its pattern.)
+        let opened = lines(filling_axes, true);
+        let detail: String = opened
+            .iter()
+            .skip(1)
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            detail.contains("scanned to 1.8\u{b0} this volume, of the 19.5\u{b0}"),
+            "the detail did not name where the ladder stops against what the \
+             pattern can reach, in that order: {detail}"
+        );
+        // Blame nothing: filling, abandoned and AVSET read the same from one
+        // volume, and a guessed cause is wrong exactly when it sounds surest.
+        for fault in ["cut short", "abandoned", "failed", "error"] {
+            assert!(
+                !detail.contains(fault),
+                "the detail blames a scan for a ceiling AVSET puts there on \
+                 purpose ({fault:?}): {detail}"
+            );
+        }
+        // The interpolation truth is stated, with the ladder's own gap numbers,
+        // and every detail line is in the calm colour.
+        assert!(
+            detail.contains("not measured"),
+            "the detail no longer says what the picture is not: {detail}"
+        );
+        assert!(detail.contains("0.5\u{b0}"), "{detail}");
+        for line in opened.iter().skip(1) {
+            assert_ne!(
+                line.color, visuals.error_fg_color,
+                "a detail line is styled as an error: {}",
+                line.text
+            );
+        }
+
+        // --- The ceiling height appears only when it is on the chart.
+        //
+        // On: a 1.8° beam at 86 km is ~3 km MSL against a 20.4 km axis, and it
+        // is given as a height because a forecaster reading a section is
+        // reading heights, not degrees.
+        let ceiling_km = 0.4 + beam::height_at_ground_km(86.0, 1.8);
+        assert!(
+            ceiling_km <= filling_axes.top_km_msl,
+            "precondition: this ceiling is on the chart"
+        );
+        let kft = format!(
+            "\u{2248}{:.0} {} MSL",
+            ceiling_km * KM_TO_KFT,
+            prefs.height.kilo_suffix()
+        );
+        assert!(
+            detail.contains(&kft),
+            "an on-chart ceiling was not quoted ({kft} expected): {detail}"
+        );
+
+        // Off: the old caption's absurdity — the top of coverage at maximum
+        // range, ≈114.5 kft against an axis ending at ~67 — must never be
+        // quoted. A figure the pane cannot show is pure alarm.
+        let absurd_axes = SectionAxes {
+            tilt_count: 9,
+            top_tilt_deg: 8.0,
+            top_declared_cut_deg: 19.5,
+            coverage_ground_range_km: 225.0,
+            ..axes()
+        };
+        let absurd_ceiling = 0.4 + beam::height_at_ground_km(225.0, 8.0);
+        assert!(
+            absurd_ceiling > absurd_axes.top_km_msl,
+            "precondition: this ceiling is off the chart ({absurd_ceiling} km \
+             against a {} km axis)",
+            absurd_axes.top_km_msl
+        );
+        let absurd_detail: String = lines(absurd_axes, true)
+            .iter()
+            .skip(1)
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !absurd_detail.contains("MSL at the far end"),
+            "an off-chart ceiling height was quoted — a number no echo could \
+             ever be drawn at: {absurd_detail}"
+        );
+        assert!(
+            absurd_detail.contains("scanned to 8.0\u{b0}"),
+            "dropping the off-chart figure must not drop the truncation fact \
+             itself: {absurd_detail}"
+        );
+
+        // --- And a complete volume's detail carries no truncation line at all:
+        // there is nothing to explain, and a standing explanation would be the
+        // old noise back under a new glyph.
+        let complete_detail: String = lines(complete_axes, true)
+            .iter()
+            .skip(1)
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !complete_detail.contains("can reach"),
+            "a complete ladder explains a truncation it does not have: \
+             {complete_detail}"
+        );
+        assert!(
+            complete_detail.contains("widest step here is 4.9\u{b0}"),
+            "the complete detail lost the interpolation measurement: \
+             {complete_detail}"
+        );
+    }
+
+    /// **Red is reserved for genuinely broken states.**
+    ///
+    /// The one-sentence contract of issue #8: routine states — a volume
+    /// filling, a volume AVSET ended, a first download in flight — are calm,
+    /// and error styling is spent only where something is actually wrong, so
+    /// that when it does appear it still means something.
+    #[test]
+    fn red_is_reserved_for_broken_states() {
+        use crate::pane::SectionUnavailable;
+        let prefs = UserPreferences::default();
+        let visuals = egui::Visuals::dark();
+        let lines = |axes: SectionAxes, unavailable: Option<SectionUnavailable>| {
+            caption_lines(
+                &axes,
+                RadarProduct::Reflectivity,
+                None,
+                unavailable,
+                false,
+                &visuals,
+                &prefs,
+            )
+        };
+
+        // Routine ladders: never red.
+        for (name, axes) in [
+            ("complete", axes()),
+            (
+                "filling",
+                SectionAxes {
+                    tilt_count: 4,
+                    top_tilt_deg: 1.8,
+                    ..axes()
+                },
+            ),
+            (
+                "one rung",
+                SectionAxes {
+                    tilt_count: 1,
+                    widest_tilt_gap_deg: 0.0,
+                    ..axes()
+                },
+            ),
+        ] {
+            let line = lines(axes, None).swap_remove(0);
+            assert_ne!(
+                line.color, visuals.error_fg_color,
+                "the {name} ladder is styled as an error: {}",
+                line.text
+            );
+        }
+
+        // No data at all for this moment: red, because nothing below the
+        // caption was measured and waiting on this volume will not change it.
+        let empty = lines(
+            SectionAxes {
+                tilt_count: 0,
+                widest_tilt_gap_deg: 0.0,
+                ..axes()
+            },
+            None,
+        )
+        .swap_remove(0);
+        assert_eq!(empty.color, visuals.error_fg_color);
+
+        // Transient states resolve themselves and are told calmly; a failed cut
+        // is a dead end and is the one status line red is for.
+        for (reason, broken) in [
+            (SectionUnavailable::AwaitingVolume, false),
+            (SectionUnavailable::AwaitingCoveragePattern, false),
+            (
+                SectionUnavailable::ProductHasNoVerticalStructure(
+                    RadarProduct::VerticallyIntegratedLiquid,
+                ),
+                false,
+            ),
+            (SectionUnavailable::RenderFailed, true),
+        ] {
+            let all = lines(axes(), Some(reason));
+            let status = all.last().expect("a status line was pushed");
+            assert_eq!(
+                status.color == visuals.error_fg_color,
+                broken,
+                "{reason:?} has the wrong styling: {}",
+                status.text
+            );
+            // The warning glyph follows the same rule: a ⚠ on a routine state
+            // is the old alarm back in miniature.
+            assert_eq!(
+                status.text.starts_with('\u{26a0}'),
+                broken,
+                "{reason:?} carries the wrong glyph: {}",
+                status.text
+            );
+        }
     }
 
     /// **A real VCP 212 ladder draws.** The rungs are the section's first
