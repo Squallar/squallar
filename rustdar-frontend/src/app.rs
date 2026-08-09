@@ -4112,6 +4112,35 @@ mod chunk_feed_precedence_tests {
         );
     }
 
+    /// **The overlay dies with the setting.** With live chunks toggled off,
+    /// `drive_chunk_feeds` returns before `retain_live`, so the feed map kept
+    /// its last assembler for the session — and no consumer of the merged
+    /// current volume gates on the setting, so the frozen partial overlay
+    /// went on standing over a base the archive polls keep rolling forward.
+    #[test]
+    fn turning_live_chunks_off_stops_the_overlay_from_standing() {
+        let mut app = app_showing(at(10));
+        // No sockets from a unit test: the notification driver runs ahead of
+        // the enabled gate and would otherwise open real connections.
+        app.gui.set_chunk_notifications(false);
+        app.chunk_feeds.ensure("KTLX");
+        app.chunk_feeds
+            .force_serving("KTLX", Arc::new(empty_scan()));
+        assert!(
+            app.chunk_feeds.snapshot("KTLX").is_some(),
+            "precondition: the feed is serving an overlay",
+        );
+
+        app.gui.set_live_chunks(false);
+        app.drive_chunk_feeds();
+
+        assert!(
+            app.chunk_feeds.snapshot("KTLX").is_none(),
+            "the setting went off and the last assembler kept serving its \
+             frozen overlay to every consumer of the merged current volume",
+        );
+    }
+
     /// A picked region decides the ground that is resampled; without one, the
     /// default box about the site does.
     ///

@@ -271,6 +271,11 @@ impl ChunkFeedManager {
         if let Some(reason) = retirement {
             log::warn!("{site}: retiring the chunk feed ({reason:?}); falling back to the archive");
             feed.retired = Some((reason, now));
+            // The bridge copy dies with the flight. [`Self::snapshot`]
+            // already answers `None` for a retired feed; this is the other
+            // half, so the kept-snapshot bridge cannot serve the frozen
+            // volume across the retirement from any path either.
+            feed.last_snapshot = None;
         }
         retirement
     }
@@ -336,8 +341,19 @@ impl ChunkFeedManager {
     }
 
     /// The volume so far for a site, complete sweeps only.
+    ///
+    /// `None` once the feed is retired, whatever the assembler still holds.
+    /// The flight is dead and the archive path owns the site — but the kept
+    /// poller keeps its assembler, and the partial volume it froze on must
+    /// not go on standing over a base the archive polls keep rolling
+    /// forward: overlay sweeps supersede base cuts by list order, not by
+    /// time, so a dead flight's low tilts would be served under a caption
+    /// whose newest time reads the newer base.
     pub fn snapshot(&mut self, site: &str) -> Option<std::sync::Arc<nexrad_model::data::Scan>> {
         let feed = self.feeds.get_mut(site)?;
+        if feed.retired.is_some() {
+            return None;
+        }
         match feed.poller.as_mut() {
             Some(poller) => {
                 let snapshot = poller.snapshot();
@@ -403,6 +419,22 @@ impl ChunkFeedManager {
     pub(crate) fn force_retire_at(&mut self, site: &str, ago: std::time::Duration) {
         if let Some(feed) = self.feeds.get_mut(site) {
             feed.retired = Some((Retirement::Errors, web_time::Instant::now() - ago));
+        }
+    }
+
+    /// Put a feed mid-round with `scan` in hand: the poller away and the
+    /// bridge serving — the shape every frame of a live round sees. For tests
+    /// that need a serving overlay without a network to assemble one.
+    #[cfg(test)]
+    pub(crate) fn force_serving(
+        &mut self,
+        site: &str,
+        scan: std::sync::Arc<nexrad_model::data::Scan>,
+    ) {
+        if let Some(feed) = self.feeds.get_mut(site) {
+            feed.last_snapshot = Some(scan);
+            feed.poller = None;
+            feed.in_flight = true;
         }
     }
 }
@@ -477,6 +509,107 @@ mod tests {
 
     fn empty() -> Result<PollOutcome, String> {
         Ok(PollOutcome::default())
+    }
+
+    /// The smallest `Scan` the bridge can hold — for fixtures that need a
+    /// volume in hand without a network to assemble one.
+    fn stub_volume() -> std::sync::Arc<nexrad_model::data::Scan> {
+        use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
+        std::sync::Arc::new(Scan::new(
+            VolumeCoveragePattern::new(
+                212,
+                0,
+                0.5,
+                PulseWidth::Short,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+                0,
+                false,
+                false,
+                Vec::new(),
+            ),
+            Vec::new(),
+        ))
+    }
+
+    /// **The dead flight's frozen volume dies with the feed.** A retired
+    /// poller keeps its assembler, so without the retired gate `snapshot`
+    /// goes on serving the partial volume the flight froze on — while the
+    /// archive polls roll `base_scans` forward underneath, and overlay
+    /// sweeps supersede base cuts by list order rather than by time. Every
+    /// consumer of the merged current volume then serves a dead flight's low
+    /// tilts under a caption whose newest time reads the newer base.
+    #[test]
+    fn a_retired_feed_serves_no_snapshot() {
+        let volume = stub_volume();
+        let mut mgr = ChunkFeedManager::new();
+        mgr.ensure("KICT");
+        mgr.feeds.get_mut("KICT").expect("ensured").last_snapshot =
+            Some(std::sync::Arc::clone(&volume));
+        mgr.force_due("KICT");
+        let _poller = mgr.take_for_round("KICT").expect("the poller leaves");
+        assert!(
+            mgr.snapshot("KICT").is_some(),
+            "precondition: the feed is serving the volume its flight assembled",
+        );
+
+        mgr.force_retire_at("KICT", std::time::Duration::from_secs(1));
+        assert!(
+            mgr.snapshot("KICT").is_none(),
+            "a retired feed kept serving its frozen partial volume, so every \
+             consumer merges a dead flight's low tilts over a rolling base",
+        );
+    }
+
+    /// Retirement along the real path — a stalled feed's round comes home
+    /// empty — takes the bridge copy with it, so nothing can serve the frozen
+    /// volume across the retirement. And recovery after the window is a
+    /// genuinely fresh flight: feeding again, rounds resuming, with nothing
+    /// left of the dead flight to serve while the new one assembles.
+    #[test]
+    fn retirement_drops_the_bridge_copy_and_recovery_starts_fresh() {
+        let mut mgr = ChunkFeedManager::new();
+        mgr.ensure("KICT");
+        mgr.feeds.get_mut("KICT").expect("ensured").last_snapshot = Some(stub_volume());
+
+        mgr.force_stall("KICT");
+        let poller = take(&mut mgr, "KICT");
+        assert_eq!(
+            mgr.finish_round("KICT", poller, &empty()),
+            Some(Retirement::Stalled),
+            "precondition: this is the real retirement path",
+        );
+        assert!(
+            mgr.feeds
+                .get("KICT")
+                .expect("still present")
+                .last_snapshot
+                .is_none(),
+            "retirement left the bridge copy in hand; the retired gate is then \
+             the only thing between it and every consumer",
+        );
+        assert!(mgr.snapshot("KICT").is_none());
+
+        // Recovery after the window is a fresh flight, not the dead one
+        // revived.
+        mgr.force_retire_at("KICT", RETRY_AFTER + std::time::Duration::from_secs(1));
+        mgr.ensure("KICT");
+        assert!(mgr.is_feeding("KICT"), "the retry window has passed");
+        assert!(
+            mgr.snapshot("KICT").is_none(),
+            "a fresh flight has assembled nothing yet; anything else is the \
+             dead flight's volume back from the grave",
+        );
+        mgr.force_due("KICT");
+        assert!(
+            mgr.take_for_round("KICT").is_some(),
+            "recovery must resume rounds, so the fresh flight's overlay can \
+             merge again",
+        );
     }
 
     /// Take a round, skipping the real interval — these tests are about the

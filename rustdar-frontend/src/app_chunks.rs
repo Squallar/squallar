@@ -48,6 +48,13 @@ impl super::App {
         // the setting was briefly off is never retried after it comes back.
         self.drive_chunk_notifications(&live);
         if !enabled {
+            // The feeds go with the setting, not merely the rounds. Kept, the
+            // map's last assemblers would go on serving their frozen partial
+            // overlays to every consumer of the merged current volume — none
+            // of which gates on this setting — and each one holds tens of
+            // megabytes of dead volume besides. A no-op every frame after the
+            // first: the map is already empty.
+            self.chunk_feeds.retain_live(&[]);
             return;
         }
         // Narrower than `evict_unshown_scans`: a feed has no reader once no pane
