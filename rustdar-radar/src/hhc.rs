@@ -96,6 +96,10 @@
 //!
 //! # Validation status
 //!
+//! **The live twin harness now lives on branch `campaign-harness`.** The
+//! figures below are the last measured before the move; re-measuring
+//! means that branch.
+//!
 //! Surveyed 2026-07-29 against live `HHC` twins on the precipitation
 //! campaign's site-hours (see [`crate::hca`]'s precipitation re-survey for
 //! the selection protocol), paired by volume start with the volume's

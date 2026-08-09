@@ -98,6 +98,11 @@
 //!
 //! # Validation status — read before trusting the twin harness to pass
 //!
+//! **The live harnesses and both policy modules (`validation_policy`,
+//! `vild_validation_policy`) now live on branch `campaign-harness`.**
+//! The figures below are the last measured before the move; re-measuring
+//! means that branch.
+//!
 //! Three surveys over live volumes on 2026-07-28 arbitrated the
 //! conventions, and the final one (21 sites asserted, 815,797 bins pooled)
 //! does **not** meet the campaign bar (99% within one data level and ≤ 2%
@@ -166,7 +171,7 @@
 //! anywhere claims this field to better than about a tenth of a g/m³.
 //!
 //! **The survey's construction is the shipped product.** The harness does not
-//! rebuild the quotient: [`vild_validation_policy`] re-exports
+//! rebuild the quotient: `vild_validation_policy` re-exports
 //! [`crate::vild`]'s own constructors, and
 //! `vild::tests::the_shipped_path_is_the_surveys_reference_construction` pins
 //! that [`crate::vild::compute_vild`] composes them in exactly the order the
@@ -193,9 +198,9 @@
 //!   because only **154** of 310,215 cells cross 3.5 g/m³ on the reference at
 //!   all: a metric whose denominator is the whole field cannot fail on a
 //!   decision that is never taken. This is exactly the triviality
-//!   [`vild_validation_policy::FLAG_FAR_MAX_PCT`]'s doc warns about, and why
+//!   `vild_validation_policy::FLAG_FAR_MAX_PCT`'s doc warns about, and why
 //!   the run is gated on
-//!   [`vild_validation_policy::flag_sample_is_conclusive`] as well.
+//!   `vild_validation_policy::flag_sample_is_conclusive` as well.
 //! * **The decision metric is INCONCLUSIVE and pointing the wrong way.**
 //!   Pooled at 3.5 g/m³ the reference flags 154 cells, we flag 24, 21 of them
 //!   shared: **POD 13.64%**, FAR 12.50%, CSI 13.38%. At 4.0 the reference
@@ -244,7 +249,7 @@
 //! Nothing was tuned to this result and no bar was moved to accommodate it.
 //! Two legs were *added* after the first 13-site-hour run, both making the
 //! survey stricter and both because a FAR-only skill bar is passed by
-//! silence: [`vild_validation_policy::FLAG_POD_MIN_PCT`] and the
+//! silence: `vild_validation_policy::FLAG_POD_MIN_PCT` and the
 //! reference-flagged conclusiveness gate. The 28 later site-hours played no
 //! part in either and reproduced every figure.
 //!
@@ -279,7 +284,7 @@
 //!   instead of the bin centre moves POD 100% → 97.06% at 3.5 (one cell of 34).
 //! * The pooled **conclusiveness gate still reads INCONCLUSIVE** — 33
 //!   reference-flagged cells against
-//!   [`vild_validation_policy::MIN_FLAGGED_CELLS`]'s 200 — for exactly the
+//!   `vild_validation_policy::MIN_FLAGGED_CELLS`'s 200 — for exactly the
 //!   reason it did over 41 site-hours (154 cells): real volumes carry tens of
 //!   cells above 3.5 g/m³, not hundreds. That gate is now a statement about
 //!   the *weather sample*, and it has deliberately **not** been relaxed: the
@@ -302,13 +307,13 @@
 //! That re-run measured perfect figures it could not certify: every leg it
 //! asserted passed, and the one verdict that would have meant something was
 //! withheld, because 33 reference-flagged cells is not a sample and no amount of
-//! re-running fixes weather. So [`live_vild_validation`] is now built around
+//! re-running fixes weather. So `live_vild_validation` is now built around
 //! what a live pair actually proves:
 //!
 //! * **Identity, asserted on every run** — the shipped
 //!   [`crate::vild::compute_vild`] against the reference built from the same two
 //!   messages, bit for bit over every defined cell, with a coverage floor
-//!   ([`vild_validation_policy::MIN_IDENTITY_CELLS`]) so an empty grid cannot
+//!   (`vild_validation_policy::MIN_IDENTITY_CELLS`) so an empty grid cannot
 //!   pass quietly. The constructors are shared, so this is *not* the
 //!   arithmetic: it is codec selection off the real PDBs (134's hybrid LUT,
 //!   135's mask/scale/offset and topped flag), resampling across both products'
@@ -320,12 +325,12 @@
 //! * **The pipeline's invariants, asserted on every run** — both PDBs naming one
 //!   volume scan inside [`crate::vild::VOLUME_PAIRING_TOLERANCE_SECS`], defined
 //!   cells finite and non-negative, nothing past
-//!   [`vild_validation_policy::PLAUSIBLE_MAX_G_M3`], which is set at roughly
+//!   `vild_validation_policy::PLAUSIBLE_MAX_G_M3`, which is set at roughly
 //!   four times the largest value the RPG has been recorded producing (KDDC's
 //!   12.06 g/m³, KEAX's 12.80) rather than at what we expect of it.
 //! * **The threshold and skill figures, reported on every run and asserted only
 //!   where the sample is conclusive** — at the breaks whose reference-flagged
-//!   population clears [`vild_validation_policy::MIN_FLAGGED_CELLS`]. Elsewhere
+//!   population clears `vild_validation_policy::MIN_FLAGGED_CELLS`. Elsewhere
 //!   the run prints them under an explicit "INCONCLUSIVE SAMPLE — SKILL NOT
 //!   ASSERTED" line and stands on the two legs above. The gate was not lowered
 //!   and the POD/FAR legs were not touched: they are the trap for the next
@@ -343,7 +348,7 @@
 //!
 //! Eight archived site-hours, 163,301 domain cells pooled, **306**
 //! reference-flagged cells at 3.5 g/m³ and **211** at 4.0. The first VILD run to
-//! clear [`vild_validation_policy::MIN_FLAGGED_CELLS`] at either break, and it
+//! clear `vild_validation_policy::MIN_FLAGGED_CELLS` at either break, and it
 //! clears both:
 //!
 //! * **PRIMARY (the shipped [`crate::vild::compute_vild`])**: pooled POD

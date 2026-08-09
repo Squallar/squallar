@@ -52,6 +52,10 @@
 //!
 //! # Validation status (2026-07-28 survey)
 //!
+//! **The live harness and its `validation_policy` (bars, quarantine
+//! table) now live on branch `campaign-harness`.** The figures below are
+//! the last measured before the move; re-measuring means that branch.
+//!
 //! **Protocol A** — the dealiased grid (Coverage profile, no median filter,
 //! pre-SRM) against the RPG's own dealiased velocity, per site per tilt,
 //! all 22 roster sites, 1.37 M gates compared: within one 0.5 m/s level

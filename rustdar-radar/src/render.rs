@@ -414,6 +414,11 @@ pub fn find_closest_elevation(
 /// `pub(crate)` for [`crate::render_input`], which has to make this exact
 /// choice against the whole volume so the one sweep it carries is the one
 /// `find_sweep` reaches again on the reconstructed scan.
+///
+/// The live elevation audit that measured these rules over archived volumes
+/// (`live_elevation_audit`, with its mirror test of this function) lives on
+/// branch `campaign-harness`; changing `find_sweep` invalidates that audit's
+/// figures until it is re-run there.
 pub(crate) fn find_sweep(
     scan: &Scan,
     product: types::RadarProduct,

@@ -128,6 +128,10 @@
 //!
 //! # Validation — read this before trusting any harness
 //!
+//! **The harnesses and their `validation_policy` (bounds, fixture pins)
+//! now live on branch `campaign-harness`.** The figures below are the
+//! last measured before the move; re-measuring means that branch.
+//!
 //! **There is no gridded RPG twin for POSH or MEHS.** The RPG publishes hail
 //! only cell-based (product 59, NHI: per-cell values at SCIT centroids), so
 //! the campaign's usual per-bin twin bar is *unavailable by construction* —

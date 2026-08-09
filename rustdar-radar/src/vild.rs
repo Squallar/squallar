@@ -79,8 +79,8 @@ pub const EET_QUANTUM_KFT: f32 = 1.0;
 pub const EET_BIN_CENTRE_KFT: f32 = EET_QUANTUM_KFT / 2.0;
 
 /// How far apart two PDB volume-scan starts may be and still name the same
-/// volume, seconds. The same window [`crate::twin::live::l3_twin`] pairs a
-/// twin by — one convention for volume identity in the crate — and two orders
+/// volume, seconds. The same window the harness branch's `twin::live::l3_twin`
+/// pairs a twin by — one convention for volume identity in the crate — and two orders
 /// of magnitude tighter than the 4–10 minutes between consecutive volumes, so
 /// it cannot admit a neighbour.
 pub const VOLUME_PAIRING_TOLERANCE_SECS: i64 = 60;

@@ -87,6 +87,10 @@
 //!
 //! # Validation status — read before trusting the twin harness to pass
 //!
+//! **The live twin harness and its `validation_policy` now live on
+//! branch `campaign-harness`.** The figures below are the last measured
+//! before the move; re-measuring means that branch.
+//!
 //! The live harness below holds this derivation to the campaign bar (99%
 //! within one level, per site) against the RPG's own EET for the same
 //! volume. As of the 2026-07-28 survey it does **not** meet that bar on

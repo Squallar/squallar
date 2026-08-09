@@ -238,9 +238,9 @@ pub async fn fetch_latest_product(
 // ── Pairing an object to a Level II volume ────────────────────────────────
 //
 // Everything below pairs by **volume identity**, never by key recency. It is
-// the one implementation: the validation twins ([`crate::twin::live`]), the
-// SRM harness and the frontend's Level III loop all route through it, so the
-// rule that makes it correct cannot hold in one copy and not another.
+// the one implementation: the validation twins and the SRM harness (branch
+// `campaign-harness`) and the frontend's Level III loop all route through it,
+// so the rule that makes it correct cannot hold in one copy and not another.
 
 /// How many bucket objects to open looking for a particular volume, and how
 /// far from the volume start to look.

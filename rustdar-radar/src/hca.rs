@@ -213,10 +213,15 @@
 //!
 //! # Validation status — read before trusting the twin harness to pass
 //!
+//! **The live twin harness, its `validation_policy` (compatible pairs,
+//! quarantine table) and the offline policy pins now live on branch
+//! `campaign-harness`.** The figures below are the last measured before
+//! the move; re-measuring means that branch.
+//!
 //! The live harness scores the derivation against the RPG's own N0H for the
 //! same volume and cut (paired like the KDP twin, elevation-angle fallback
 //! included), as classes: exact agreement plus a compatible-pair band
-//! (WS↔GR, BD↔RA, HR↔RA — see [`validation_policy`]) and the full confusion
+//! (WS↔GR, BD↔RA, HR↔RA — see `validation_policy`) and the full confusion
 //! matrix per site. Verifying the encoding against live PDBs found product
 //! 165's packet scale factor carrying the projection constant, like its
 //! sibling 163 — every roster site declared PDB scale 1 / offset 0 (levels
@@ -276,7 +281,7 @@
 //! too — KUEX 96.36/96.43, KOAX 95.45/95.56, KDDC 97.76/97.82, KEAX
 //! 95.74/95.75, KSGF 97.80/97.80, KAMA 97.53/97.53, KMLB 96.02/96.22,
 //! KMOB 98.77/98.84 (exact/compatible) — 330k compared gates pooled over
-//! the asserted eight, conclusive under [`validation_policy`]. The
+//! the asserted eight, conclusive under `validation_policy`. The
 //! confusion matrix finally carries the precipitation classes, with
 //! per-site producer accuracies at the asserted sites: RA 74–99% over
 //! ~27k twin gates, HR 97–100% (KUEX n=448, KMLB n=143), BD 82–95%
@@ -288,7 +293,7 @@
 //! when those cells could only read RH.
 //!
 //! Four sites are **quarantined** with two-run, multi-volume evidence
-//! (see [`validation_policy::QUARANTINED`]): KFSD (biology-dominated
+//! (see `validation_policy::QUARANTINED`): KFSD (biology-dominated
 //! field, compatible adds nothing, residual = the documented BI↔GC/UK
 //! state fingerprints), KMRX and KSFX (terrain blockage-store residual),
 //! and KMTX (the 07-28 episode's twin ran a model-enhanced melting layer

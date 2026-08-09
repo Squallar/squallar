@@ -1,14 +1,25 @@
 //! Validation twins: score a locally derived polar product against the RPG's
 //! own Level III rendition of the **same volume**.
 //!
-//! Two layers. [`compare`] is pure math — wasm-safe, no network — and is what
-//! the `compare_l3` example and the product harnesses (EET, DVL, KDP, HCA,
-//! DPR) share: resample a Level III radial packet onto the derived 360° ×
-//! 230 km grid and produce a [`compare::Tally`]. [`live`] is the native,
-//! test-only layer that finds the twin in the first place: the archived Level
-//! II volume nearest a moment, and the Level III bucket object generated from
-//! that very volume — never merely the newest key, which SAILS republishing
-//! makes a mid-volume repeat more often than not.
+//! Two layers. [`compare`] is pure math — wasm-safe, no network — shipped
+//! code called at runtime by the render and VILD paths, and shared by the
+//! product harnesses (EET, DVL, KDP, HCA, DPR). [`live`] was the native,
+//! test-only layer that finds the twin in the first place: the archived
+//! Level II volume nearest a moment, and the Level III bucket object
+//! generated from that very volume — never merely the newest key, which
+//! SAILS republishing makes a mid-volume repeat more often than not.
+//!
+//! **The live rigs live on branch `campaign-harness`**, not here: `l3_twin`,
+//! the per-product `live_validation` harnesses, their `validation_policy`
+//! modules and offline policy pins, the `compare_l3` example, and
+//! `live_elevation_audit`. Check that branch out and run a rig with e.g.
+//!
+//! ```text
+//! cargo test -p rustdar-radar --release --lib -- --ignored --nocapture live_
+//! ```
+//!
+//! What remains of [`live`] on this branch is the site roster and the two
+//! Level II fetchers that `sampler.rs`'s deferred ladder probe still reads.
 
 /// Pure-math comparison of a derived grid against a decoded Level III radial
 /// product. Everything here is deterministic and network-free.
@@ -106,9 +117,9 @@ pub mod compare {
     /// The PDB's volume scan start as a timestamp — re-exported from
     /// [`crate::level3`], where the pairing that reads it lives.
     ///
-    /// Kept in this namespace because the `compare_l3` example and the product
-    /// harnesses reach it here, and because it belongs to the same idea as the
-    /// rest of `compare`: a twin is the object of *this* volume, not the newest
+    /// Kept in this namespace because the product harnesses (on branch
+    /// `campaign-harness`) reach it here, and because it belongs to the same
+    /// idea as the rest of `compare`: a twin is the object of *this* volume, not the newest
     /// one. There is one implementation, in production code, so the frontend's
     /// Level III loop and the harnesses cannot disagree about which volume an
     /// object names.

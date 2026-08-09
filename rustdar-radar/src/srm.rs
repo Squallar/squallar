@@ -44,7 +44,12 @@
 //!
 //! # Accuracy
 //!
-//! Measured by [`live_validation`], which fetches exactly what production
+//! **The live harness, its `validation_policy` (quarantine table, bars,
+//! resampler) and the offline policy pins now live on branch
+//! `campaign-harness`.** The figures below are the last measured before the
+//! move; re-measuring means that branch.
+//!
+//! Measured by `live_validation`, which fetches exactly what production
 //! fetches and pairs every velocity product with its own volume's vector.
 //! Across two volumes at each of thirteen sites carrying a nonzero vector, on
 //! 2026-07-26 — 23 site-volumes per tilt, then-quarantined sites excluded,
@@ -78,7 +83,7 @@
 //!
 //! Almost all of it is the comparison's resampler, not the derivation. The
 //! ranking above is the tell: `N2U`/`N3U` are already 1°, so only the range
-//! step of [`validation_policy::resample_to_rpg_grid`] runs on them and they
+//! step of `validation_policy::resample_to_rpg_grid` runs on them and they
 //! agree to 99.9%+; `N0G`/`N1G` are half-degree and need the azimuth step too,
 //! and they are the two that fall short. It gets worse as the tilt gets
 //! lower, where azimuthal gradients are sharpest.
@@ -114,7 +119,7 @@
 //! For that reading to hold the *oracle's* vector has to be zero as well, not
 //! just the applied one — the RPG's product has its own volume's fit baked into
 //! its gate values, so a zero vector applied against a moving oracle measures
-//! the mismatch and nothing about the resampler. [`validation_policy::classify_sample`]
+//! the mismatch and nothing about the resampler. `validation_policy::classify_sample`
 //! requires both; before it did, a `KMPX` tilt whose applied vector read 0.0 kt
 //! against a moving volume scored 31.04% within one level and pooled this
 //! control down to 74.39%.
@@ -122,7 +127,7 @@
 //! **This does not hold everywhere, and the exceptions are not rare.** The
 //! table above is two volumes a site. At 0.5° the oracle is `N0S`, which the
 //! bucket keeps for the whole UTC day, so
-//! [`live_validation::live_lowest_tilt_across_volumes`] can measure the same
+//! `live_validation::live_lowest_tilt_across_volumes` can measure the same
 //! quantity over up to forty volumes instead of two. Two such surveys, four
 //! hours apart on 2026-07-26, own-volume vector, 0.5°, pooled percentage and
 //! the count of volumes under the bar:
@@ -172,7 +177,7 @@
 //!
 //! Expect this list to grow as more sites are surveyed on more days. It is a
 //! statement about the half-degree recombination, not about those radars.
-//! See [`validation_policy::QUARANTINED`] for each site's numbers and
+//! See `validation_policy::QUARANTINED` for each site's numbers and
 //! eliminations.
 //!
 //! Quarantining sites at 0.5° also surfaced a flaw in what the quarantine
@@ -181,7 +186,7 @@
 //! and averaged into the shared one. Tilt 0 is about a quarter of a site's
 //! gates, so `KBIS` failed a run at 98.87% pooled whose upper three tilts were
 //! 99.52%. The total now runs over the tilts
-//! [`validation_policy::tilt_is_asserted`] admits.
+//! `validation_policy::tilt_is_asserted` admits.
 //!
 //! `KSFX` remains the only whole-site exclusion, and the only one where
 //! narrowing the scope would not help: it misses at its lowest *two* tilts —
@@ -200,7 +205,7 @@
 //! it was built against this same oracle. Its *ordering* now has an argument
 //! that does not appeal to the score; its averaging operator does not, and
 //! cannot have one from this data — see
-//! [`validation_policy::resample_to_rpg_grid`]. Treat exact-match as indicative
+//! `validation_policy::resample_to_rpg_grid`. Treat exact-match as indicative
 //! and within-one-level as the criterion.
 //!
 //! ## Volume pairing
@@ -215,7 +220,7 @@
 //! of a volume the newest `N0S` belongs to a volume the upper tilts have not
 //! reached yet — the vector is a volume *ahead* of them rather than behind.
 //! [`MotionProvenance::PreviousVolume`] records when it happens, and
-//! [`live_validation::live_storm_motion_volume_pairing_rate`] fetches exactly
+//! `live_validation::live_storm_motion_volume_pairing_rate` fetches exactly
 //! what a site load fetches and measures how often. 22 sites × 9 sweeps five
 //! minutes apart on 2026-07-26, 792 renders:
 //!
@@ -237,7 +242,7 @@
 //! all — and no history can help with that one.
 //!
 //! **What it costs is bimodal, and the tail is what matters.** Measured by
-//! [`validation_policy::level_shift`], which derives the same velocity product
+//! `validation_policy::level_shift`, which derives the same velocity product
 //! twice — once with the newest vector, once with its own volume's — so no
 //! oracle and no resampler enters the number. The median mismatch costs
 //! *nothing*: adjacent volumes usually re-fit to within 1.4 kt, and 93.6% of

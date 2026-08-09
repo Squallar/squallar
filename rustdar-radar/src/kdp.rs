@@ -117,6 +117,10 @@
 //!
 //! # Validation status — read before trusting the twin harness to pass
 //!
+//! **The live twin harness and its `validation_policy` now live on
+//! branch `campaign-harness`.** The figures below are the last measured
+//! before the move; re-measuring means that branch.
+//!
 //! The live harness scores the derivation against the RPG's own N0K for
 //! the **same volume and cut** (paired by PDB volume start plus elevation
 //! number, angle-matched where a site's product cut numbering differs from
@@ -172,8 +176,9 @@
 //!
 //! Product 163 therefore **stays a Level III fetch**; this module ships as
 //! the documented local derivation with the render path wired
-//! ([`crate::render::render_derived_kdp_to_image`], the `kdp` arm of
-//! `examples/render_product.rs`) and that provenance recorded.
+//! ([`crate::render::render_derived_kdp_to_image`], the `kdp` arm of the
+//! `render_product.rs` example on branch `campaign-harness`) and that
+//! provenance recorded.
 //!
 //! # Build 21 note (2026-07 cross-check)
 //!
