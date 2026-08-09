@@ -43,6 +43,20 @@ pub struct SiteFeed {
     /// request and comes back on the response, because it owns the assembled
     /// volume and a detached task cannot borrow it out of `App`.
     poller: Option<Box<ChunkPoller>>,
+    /// The last snapshot the poller handed out, bridging the window the
+    /// poller is away on a round.
+    ///
+    /// Without it, [`ChunkFeedManager::snapshot`] answered `None` for the
+    /// ~0.1–1 s of every ~5 s round — and everything resolved through
+    /// `current::resolve` flapped between the merged volume and the base
+    /// alone at the poll cadence. Measured live before the fix: 65 voxel
+    /// rebuilds in 5.5 minutes against ~20 sealed sweeps, every extra one a
+    /// full worker resample of a picture that had not changed, and the
+    /// section re-cut key moving per *round* rather than per rung change —
+    /// exactly the waste its fingerprint exists to prevent. An `Arc` clone
+    /// of the assembler's own cached snapshot, so the bridge costs a
+    /// refcount, not a copy.
+    last_snapshot: Option<std::sync::Arc<nexrad_model::data::Scan>>,
     in_flight: bool,
     consecutive_errors: u32,
     last_progress: web_time::Instant,
@@ -61,6 +75,7 @@ impl SiteFeed {
         };
         Self {
             poller: Some(Box::new(poller)),
+            last_snapshot: None,
             in_flight: false,
             consecutive_errors: 0,
             last_progress: web_time::Instant::now(),
@@ -322,11 +337,23 @@ impl ChunkFeedManager {
 
     /// The volume so far for a site, complete sweeps only.
     pub fn snapshot(&mut self, site: &str) -> Option<std::sync::Arc<nexrad_model::data::Scan>> {
-        self.feeds
-            .get_mut(site)?
-            .poller
-            .as_mut()
-            .and_then(|p| p.snapshot())
+        let feed = self.feeds.get_mut(site)?;
+        match feed.poller.as_mut() {
+            Some(poller) => {
+                let snapshot = poller.snapshot();
+                // Refreshed here — the one place the poller's answer passes —
+                // so the bridge below can only ever serve what some frame
+                // already saw.
+                feed.last_snapshot.clone_from(&snapshot);
+                snapshot
+            }
+            // The poller is away on a round. Serve the volume as it stood
+            // when the round left: a round only adds, so this is the same
+            // data the previous frame resolved — see
+            // [`SiteFeed::last_snapshot`] for what answering `None` here did
+            // to every consumer of the merged volume.
+            None => feed.last_snapshot.clone(),
+        }
     }
 
     /// Drop the feeds of sites nothing is watching live.
@@ -389,6 +416,63 @@ mod tests {
             ingested: 1,
             ..Default::default()
         })
+    }
+
+    /// **The volume must not vanish for the duration of every round.** The
+    /// poller travels with the round, and before the bridge existed
+    /// `snapshot` answered `None` for the ~0.1–1 s of every ~5 s poll — so
+    /// everything resolved through `current::resolve` flapped between the
+    /// merged volume and the base alone at the poll cadence. Measured live:
+    /// 65 voxel rebuilds in 5.5 minutes against ~20 sealed sweeps, and the
+    /// section re-cut key moving per round.
+    ///
+    /// The tail matters as much as the bridge: when the poller comes home
+    /// with no volume yet (a fresh feed, pre-first-chunk), the live answer is
+    /// `None` and the bridge must not overrule it with the stale copy.
+    #[test]
+    fn a_round_in_flight_does_not_take_the_snapshot_with_it() {
+        use nexrad_model::data::{PulseWidth, Scan, VolumeCoveragePattern};
+        let volume = std::sync::Arc::new(Scan::new(
+            VolumeCoveragePattern::new(
+                212,
+                0,
+                0.5,
+                PulseWidth::Short,
+                false,
+                0,
+                false,
+                0,
+                false,
+                false,
+                0,
+                false,
+                false,
+                Vec::new(),
+            ),
+            Vec::new(),
+        ));
+
+        let mut mgr = ChunkFeedManager::new();
+        mgr.ensure("KICT");
+        mgr.feeds.get_mut("KICT").expect("ensured").last_snapshot =
+            Some(std::sync::Arc::clone(&volume));
+
+        mgr.force_due("KICT");
+        let poller = mgr.take_for_round("KICT").expect("the poller leaves");
+        let held = mgr
+            .snapshot("KICT")
+            .expect("the volume vanished for the duration of the round");
+        assert!(
+            std::sync::Arc::ptr_eq(&held, &volume),
+            "the bridge must serve the very volume the last frame resolved",
+        );
+
+        mgr.finish_round("KICT", poller, &empty());
+        assert!(
+            mgr.snapshot("KICT").is_none(),
+            "a poller home with no volume yet answers None, and a bridge that \
+             never refreshes would overrule it with the stale copy",
+        );
     }
 
     fn empty() -> Result<PollOutcome, String> {
