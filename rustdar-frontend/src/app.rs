@@ -215,42 +215,46 @@ pub struct App {
     ///
     /// [`evict_unshown_scans`]: Self::evict_unshown_scans
     scan_data: std::collections::HashMap<String, Arc<nexrad_model::data::Scan>>,
-    /// The most recent **archive** volume for each site, with the time it was
-    /// collected — the only thing a 3D pane is ever built from.
+    /// The most recent **complete** volume for each site, with the time its
+    /// first radial was collected — the base of the current merged volume
+    /// ([`rustdar_radar::current::resolve`]) that sections, the 3D view and
+    /// every other whole-volume reader stand on.
     ///
     /// # Why this is separate from `scan_data`
     ///
-    /// `scan_data` holds whichever volume the plan view is drawing, and by
-    /// design that can be one the real-time chunk feed assembled: `chunks.rs`
-    /// reconstructs the coverage pattern precisely so a chunk-assembled `Scan` is
-    /// indistinguishable from an archive-decoded one. Indistinguishable is right
-    /// for a plan view and wrong here, because the property the 3D view needs is
-    /// not "is it accurate" but **"was it complete when it arrived"**:
+    /// `scan_data` holds whichever volume the plan view is drawing, and
+    /// mid-volume that is the live snapshot: sealed sweeps only, one rung tall
+    /// after every roll. The property this map holds is **completeness** — a
+    /// volume that carries every cut its flight sealed, so a ladder built over
+    /// it reaches the top of what was flown. Two writers satisfy it:
     ///
-    /// * An archive volume is published only once every cut is finished, so the
-    ///   pane can build the instant the download lands.
-    /// * A live volume is assembled tilt by tilt, so a build has to wait — and a
-    ///   volume **joined mid-flight cannot be built at all**, because it stands in
-    ///   an empty coverage pattern until its VCP message arrives and the sampler
-    ///   correctly refuses to invent a tilt ladder for it.
-    /// * A 155 ms resample on the frame thread fires on every live volume roll,
-    ///   which is a visible hitch the user did not ask for.
+    /// * the archive path, whose volumes are published only once every cut is
+    ///   finished — all three of its branches write here, because the two that
+    ///   decline to *display* a volume still received a real, complete one;
+    /// * `app_chunks`' completed branch, exactly when the closed volume is
+    ///   `whole_volume_complete` — the live feed's own statement of the same
+    ///   property, and what keeps the base rolling forward without another
+    ///   archive download for as long as the feed runs.
     ///
-    /// Written on the archive path only, in **all three** of its branches — the
-    /// two that decline to *display* the volume still received a real, complete
-    /// one, and a 3D pane wants it even when the live plan view beside it does
-    /// not. Never written from `app_chunks`.
+    /// This used to be `archive_scans`, archive-written only, and the one
+    /// thing a 3D pane could build from — a rule made when completeness seemed
+    /// to require the archive's provenance. It does not: a closed chunk volume
+    /// that sealed every cut is the same volume the archive will publish
+    /// minutes later, and holding the 3D view to the slower copy held it a
+    /// full volume behind the pane beside it. What the rule protected against
+    /// — building from a *partial* volume — is still protected, by the
+    /// `whole_volume_complete` gate on the live writer.
     ///
-    /// This follows *arrival*, not maximum timestamp, and that is deliberate: it
-    /// means scrubbing the plan view back through archive time carries the 3D
-    /// pane with it, while the live chunk feed — the one thing it must ignore —
-    /// goes past without touching it.
+    /// This follows *arrival*, not maximum timestamp, and that is deliberate:
+    /// scrubbing the plan view back through archive time carries the
+    /// whole-volume panes with it. While a site is viewed live its feed's
+    /// closed volumes land here too; while it is viewed historic they divert
+    /// to `latest_cached_scans`, so a scrubbed base stays scrubbed.
     ///
-    /// Bounded by the same `evict_unshown_scans` pass as `scan_data`, and mostly
-    /// free even so: the `Arc` is usually the very same allocation `scan_data`
-    /// holds, so a site being viewed live is the only case that costs a second
-    /// volume.
-    archive_scans: HashMap<String, (Arc<nexrad_model::data::Scan>, chrono::NaiveDateTime)>,
+    /// Bounded by the same `evict_unshown_scans` pass as `scan_data`, and
+    /// often sharing an allocation with it: at a volume boundary both maps
+    /// hold the same `Arc` until the next sweep seals.
+    base_scans: HashMap<String, (Arc<nexrad_model::data::Scan>, chrono::NaiveDateTime)>,
     input: InputHandler,
     channels: ChannelHub,
     render: RenderDispatcher,
@@ -534,7 +538,7 @@ impl App {
             window: None,
             gui,
             scan_data: std::collections::HashMap::new(),
-            archive_scans: HashMap::new(),
+            base_scans: HashMap::new(),
             input,
             channels,
             render,
@@ -951,14 +955,14 @@ impl App {
             return;
         }
 
-        // From `archive_scans`, never from `scan_data`, and the difference is the
-        // whole of the archive-only decision — see the field for why. Matched on
-        // the collected time as well as the site, because a target names one
-        // volume: without it a pane that asked for 22:33Z would be handed 22:39Z
-        // the moment the next poll landed, and `mark_volume_rendered` would then
-        // record that it had built the one it asked for.
+        // From `base_scans`, never from `scan_data`, and the difference is
+        // completeness — see the field for why. Matched on the collected time
+        // as well as the site, because a target names one volume: without it a
+        // pane that asked for 22:33Z would be handed 22:39Z the moment the
+        // next poll landed, and `mark_volume_rendered` would then record that
+        // it had built the one it asked for.
         let Some(scan) = self
-            .archive_scans
+            .base_scans
             .get(&target.volume.site)
             .filter(|(_, collected)| *collected == target.volume.collected)
             .map(|(scan, _)| Arc::clone(scan))
@@ -1181,7 +1185,7 @@ impl App {
                         // warning that is always on is one the reader learns to
                         // ignore, and it is the same line that has to be
                         // believed in live mode.
-                        self.archive_scans
+                        self.base_scans
                             .insert(site.clone(), (Arc::clone(&scan_arc), scan_info.timestamp));
 
                         // When auto-poll delivers a new scan, check if any pane
@@ -1280,7 +1284,7 @@ impl App {
         // arrived rather than the frame after. A 3D pane reads this to decide
         // which volume to ask for, so a frame's delay here is a frame's delay on
         // every build.
-        self.publish_archive_volumes();
+        self.publish_base_volumes();
 
         // Check for received overlay fetch results (unified channel)
         while let Ok(result) = self.channels.overlay_fetch_receiver.try_recv() {
@@ -1288,15 +1292,16 @@ impl App {
         }
     }
 
-    /// Tell the UI which archive volume each site's 3D pane may build from.
+    /// Tell the UI which base volume each site's whole-volume panes may build
+    /// from.
     ///
     /// Times only — the `Scan` itself stays here, because `rustdar-egui` has no
     /// business holding a decoded volume and the pane only needs to *name* the
     /// one it wants. `handle_prepare_volume` looks the bytes back up under the
     /// same key, and the two agree because this is the only writer of either.
-    fn publish_archive_volumes(&mut self) {
+    fn publish_base_volumes(&mut self) {
         self.gui.set_archive_volumes(
-            self.archive_scans
+            self.base_scans
                 .iter()
                 .map(|(site, (_, collected))| (site.clone(), *collected))
                 .collect(),
@@ -1340,7 +1345,17 @@ impl App {
         // ten resident. `shown` already covers a pane's live site *and* the site
         // of the scan it is drawing, which is what stops a switch evicting the
         // volume a 3D pane is still building from.
-        self.archive_scans
+        self.base_scans
+            .retain(|site, _| shown.iter().any(|shown| *shown == site));
+        // And the third holder of whole volumes, which used to be exempt and
+        // simply grew: an entry is written for every site whose panes are all
+        // historic when its feed delivers, it was removed only by
+        // `handle_jump_to_live` for that one site, and nothing else ever
+        // touched it — so a session that toured sites in historic mode kept
+        // every one of their latest volumes for the life of the process. The
+        // entry exists to serve `JumpToLive`, which is a per-pane action, so a
+        // site no pane shows cannot be jumped to and holds nothing here.
+        self.latest_cached_scans
             .retain(|site, _| shown.iter().any(|shown| *shown == site));
     }
 
@@ -3180,12 +3195,15 @@ mod tests {
     /// process ended — next to a render cache that is carefully bounded and a
     /// loop cache with a written-down byte budget.
     ///
-    /// **Both maps, and `archive_scans` is not the incidental one.** It holds
-    /// whole decoded volumes on exactly the same terms and is swept by the same
-    /// pass off the same `shown` set, so a sweep that covered only `scan_data`
-    /// would leave the leak in place while looking closed. The app already has a
-    /// known retention path on the 3D side; an unbounded second map beside it is
-    /// the same fault twice.
+    /// **All three maps, and none is the incidental one.** `base_scans` holds
+    /// whole decoded volumes on exactly the same terms as `scan_data` and is
+    /// swept by the same pass off the same `shown` set, so a sweep that covered
+    /// only `scan_data` would leave the leak in place while looking closed.
+    /// `latest_cached_scans` was the leak this shape predicts: written for
+    /// every historic-mode site whose feed delivered, removed only by
+    /// `handle_jump_to_live` for that one site, and — until this pass covered
+    /// it — never bounded at all, so a session touring sites in historic mode
+    /// kept every one of their latest volumes for the life of the process.
     #[test]
     fn a_volume_no_pane_is_showing_is_dropped() {
         let mut app = headless(TestBridge::desktop());
@@ -3194,9 +3212,17 @@ mod tests {
         for site in ["KTLX", "KOUN"] {
             app.scan_data
                 .insert(site.to_string(), Arc::new(empty_scan()));
-            app.archive_scans.insert(
+            app.base_scans.insert(
                 site.to_string(),
                 (Arc::new(empty_scan()), scan_info_for(site).timestamp),
+            );
+            app.latest_cached_scans.insert(
+                site.to_string(),
+                (
+                    Arc::new(empty_scan()),
+                    scan_info_for(site),
+                    scan_info_for(site).timestamp,
+                ),
             );
         }
 
@@ -3211,14 +3237,25 @@ mod tests {
             "a radar no pane is on is still holding its whole decoded volume",
         );
         assert!(
-            app.archive_scans.contains_key("KTLX"),
-            "the archive volume a 3D pane on this site would build from was \
-             evicted, so the pane can never be handed one",
+            app.base_scans.contains_key("KTLX"),
+            "the base volume the site's whole-volume panes build from was \
+             evicted, so none of them can ever be handed one",
         );
         assert!(
-            !app.archive_scans.contains_key("KOUN"),
-            "a radar no pane is on is still holding its whole decoded archive \
+            !app.base_scans.contains_key("KOUN"),
+            "a radar no pane is on is still holding its whole decoded base \
              volume; nothing else in this crate ever removes one",
+        );
+        assert!(
+            app.latest_cached_scans.contains_key("KTLX"),
+            "the cached latest volume for a shown site was evicted, so \
+             JumpToLive on its pane has nothing to jump to",
+        );
+        assert!(
+            !app.latest_cached_scans.contains_key("KOUN"),
+            "a radar no pane is on is still holding its cached latest volume; \
+             only JumpToLive ever removed one, and it cannot fire for a site \
+             no pane shows",
         );
     }
 
@@ -3232,8 +3269,8 @@ mod tests {
     /// symptom is a product change that silently does nothing until the switch
     /// completes.
     ///
-    /// `archive_scans` rides the same `shown` set for the same window: a 3D pane
-    /// mid-switch is still building from the old site's archive volume, and an
+    /// `base_scans` rides the same `shown` set for the same window: a 3D pane
+    /// mid-switch is still building from the old site's base volume, and an
     /// eviction keyed on the live site alone would free it under the resampler.
     #[test]
     fn the_volume_a_switching_pane_is_still_drawing_survives() {
@@ -3242,7 +3279,7 @@ mod tests {
         app.gui.pane_mut(0).unwrap().site = "KOUN".to_string();
         app.scan_data
             .insert("KTLX".to_string(), Arc::new(empty_scan()));
-        app.archive_scans.insert(
+        app.base_scans.insert(
             "KTLX".to_string(),
             (Arc::new(empty_scan()), scan_info_for("KTLX").timestamp),
         );
@@ -3255,8 +3292,8 @@ mod tests {
              render path looks the volume up by",
         );
         assert!(
-            app.archive_scans.contains_key("KTLX"),
-            "the archive volume was pulled out from under a 3D pane that is \
+            app.base_scans.contains_key("KTLX"),
+            "the base volume was pulled out from under a 3D pane that is \
              still building from it",
         );
     }
@@ -3859,22 +3896,26 @@ mod chunk_feed_precedence_tests {
         );
     }
 
-    /// **The 3D build reads `archive_scans` and never `scan_data`.**
+    /// **The 3D build reads `base_scans` and never `scan_data`.**
     ///
-    /// The whole of the archive-only decision, stated as the behaviour a user
-    /// gets: a volume that is only in the map panes' hands must not reach the
-    /// resampler, and one that is only on the archive path must. Reading
-    /// `scan_data` instead works, and reintroduces every problem the decision
-    /// exists to remove — a 155 ms hitch on every live roll, a wait on tilts,
-    /// and a mid-flight volume the sampler correctly refuses.
+    /// The completeness decision, stated as the behaviour a user gets: what
+    /// reaches the resampler must be a volume whose every flown cut sealed —
+    /// an archive decode or a whole closed chunk volume — and never whatever
+    /// partial snapshot the map panes happen to be drawing mid-volume. Reading
+    /// `scan_data` instead works, and silently: mid-volume it is the live
+    /// snapshot, so the grid would be built from however many cuts had sealed
+    /// by that frame, a plausible short volume with nothing to notice. (The
+    /// archive-only half of the old rule is gone on purpose — see
+    /// `base_scans` — but the partial-volume half is the one that was always
+    /// load-bearing, and it is what this pins.)
     ///
     /// An empty scan cannot be resampled, so the store's answer here is a
     /// `Refused` entry rather than a grid. That is the right discriminator
     /// anyway: what is under test is whether the build was *reached*, and the
-    /// arm that finds no archive volume deliberately stores nothing at all so
+    /// arm that finds no base volume deliberately stores nothing at all so
     /// that the pane goes on asking.
     #[test]
-    fn the_3d_build_reads_the_archive_volume_and_not_the_live_one() {
+    fn the_3d_build_reads_the_base_volume_and_not_the_live_snapshot() {
         let target = rustdar_egui::pane::VolumeTarget {
             volume: rustdar_egui::pane::VolumeStamp {
                 site: "KTLX".to_owned(),
@@ -3898,7 +3939,7 @@ mod chunk_feed_precedence_tests {
         // The same volume, arrived from the archive.
         let mut archived = headless(TestBridge::desktop());
         archived
-            .archive_scans
+            .base_scans
             .insert("KTLX".to_string(), (Arc::new(empty_scan()), at(10)));
         archived.handle_prepare_volume(0, target.clone());
         assert!(
@@ -3926,7 +3967,7 @@ mod chunk_feed_precedence_tests {
         };
 
         let mut app = headless(TestBridge::desktop());
-        app.archive_scans
+        app.base_scans
             .insert("KTLX".to_string(), (Arc::new(empty_scan()), at(15)));
         app.handle_prepare_volume(0, target.clone());
 
@@ -3947,7 +3988,7 @@ mod chunk_feed_precedence_tests {
     /// which stopped reaching its arm fails rather than passes vacuously.
     #[test]
     fn every_archive_path_offers_its_volume_to_the_3d_pane() {
-        let collected = |app: &App| app.archive_scans.get("KTLX").map(|(_, at)| *at);
+        let collected = |app: &App| app.base_scans.get("KTLX").map(|(_, at)| *at);
 
         // 1. The arm that displays it.
         let mut shown = app_showing(at(10));

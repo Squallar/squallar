@@ -82,132 +82,41 @@ impl super::App {
         }
     }
 
-    /// What this site's feed needs to download.
+    /// What this site's feed needs to download: **everything, always.**
     ///
-    /// The tilts its panes actually render — **unless** anything on the site
-    /// shows a product [`rustdar_radar::types::RadarProduct::reads_whole_volume`]
-    /// names, or *is* a pane whose kind
-    /// ([`PaneKind::consumes_whole_volume`](rustdar_egui::pane::PaneKind::consumes_whole_volume))
-    /// reads the whole ladder, or has an **active loop**, in which case every cut
-    /// is needed and the answer is `All`.
+    /// This used to narrow the feed to the tilts on screen, with `All` forced
+    /// by whole-volume products, whole-volume pane kinds, and active loops —
+    /// three exceptions whose omission each produced a plausible, wrong
+    /// picture with no error to notice. The narrowing is superseded by the
+    /// current merged volume: a live site's whole point is now that the app
+    /// *always* holds a full and current copy of its data, so that a
+    /// cross-section or a 3D pane opened at any moment cuts instantly from
+    /// `base_scans` plus every sealed sweep, and so that each closed volume is
+    /// `whole_volume_complete` and rolls the base forward without another
+    /// archive download. A narrowed feed breaks both halves of that promise:
+    /// the overlay would carry only the shown tilts, and no closed volume
+    /// would ever be whole, so the base would age from the moment the first
+    /// archive fetch landed — `CheckForNewScans` is skipped for any chunk-fed
+    /// site, so nothing else would refresh it.
     ///
-    /// Those exceptions are the whole safety of selective download, and none is
-    /// optional: every such product walks only the tilts *present* —
-    /// `compute_echo_tops` clamps each column to the topmost one, a wind profile
-    /// fits whatever velocity tilts it is handed — so all of them would read a
-    /// volume that skipped cuts as a complete short one and produce a plausible,
-    /// wrong answer with no error and no NaN to notice.
+    /// The cost this buys back is one full volume per volume period —
+    /// measured against KTLX, chunks for a complete super-resolution volume
+    /// run 10–25 MB per 4–7 minutes — which is the price of the product
+    /// working the way the reference display does.
     ///
-    /// Neither predicate is restated here. The product one was, once, and the
-    /// restatement omitted storm-relative velocity: SRV panes narrowed their
-    /// site's feed to one tilt while SRV went on fitting its dealias seed and
-    /// its default Bunkers vector from the volume's velocity tilts, whichever
-    /// of them had happened to be downloaded.
+    /// What the narrowing protected is still protected, one layer down:
+    /// `App::apply_chunk_outcome` refuses to cache or base a volume that is
+    /// not whole. That guard is now the belt for a rule this function makes
+    /// true by construction, exactly as before — it must never be the thing
+    /// that fires.
     ///
-    /// # Three questions, and all of them have to be asked
-    ///
-    /// The product question is "does this field integrate the column?"; the
-    /// pane-kind question is "does this view slice vertically?". A reflectivity
-    /// cross-section answers *no* to the first — it is one moment, the same
-    /// moment the plan view rasterizes — and *yes* to the second. So a copy of
-    /// this loop that asked only about the product would narrow the site's feed
-    /// to the section pane's nominal tilt and then let the section be
-    /// interpolated between whichever cuts happened to arrive. That is the worst
-    /// failure mode in the feature: a partial volume does not fail and does not
-    /// produce a NaN, it produces a smooth, plausible, wrong slice, and it looks
-    /// *better* than the truth because the gaps are bridged.
-    ///
-    /// The loop question is different in kind from both: "will a volume from this
-    /// site be **stored** and read again later?" Neither of the other two can answer
-    /// it, because the product and the pane kind describe what is on screen *now*
-    /// and a cached loop frame is read by whatever the pane is showing *later*.
-    /// `LoopDownloadManager`'s scan cache is written for every completed volume,
-    /// read product-blind by `frame_data`, never re-downloaded once `is_cached`, and
-    /// cleared only on a site switch — so a volume narrowed to what a Reflectivity
-    /// loop wanted is handed to echo tops the moment that pane changes product.
-    ///
-    /// That has a second, equal reason. `App::apply_chunk_outcome` refuses to cache a
-    /// volume that is not whole, and the call it skips to do so is *also* the frame
-    /// append (`append_scan_to_active_loops` is both), so a narrow looping site would
-    /// gain no frames from the feed at all — nothing else backfills one, since the
-    /// 60 s archive check is skipped for any chunk-fed site and only enabling a loop
-    /// lists a window. The loop would play the window it was built with and age
-    /// indefinitely. Widening here is what makes the refusal never fire in practice,
-    /// leaving it as the guard it is meant to be rather than a brake.
-    ///
-    /// Asked of any active loop, Level III ones included: what decides is that a
-    /// *Level II volume* gets cached under this site, which happens whatever the
-    /// looping pane renders. And asked of the panes on this site, which is
-    /// conservative in the safe direction — a loop keeps the geometry site it was
-    /// built for, so a pane re-pointed without its loop being rebuilt widens the feed
-    /// of the site it now sits on rather than narrowing the one it still reads.
-    ///
-    /// The kind check is deliberately **above** the rendering-params guard below.
-    /// A whole-volume pane with no resolvable params — no scan info yet, or a
-    /// product whose elevations have not landed — contributes nothing under that
-    /// guard, so a sibling map pane on the same site would be left to narrow the
-    /// feed on its own and the section would be cut from what the *map* asked
-    /// for. That window is the whole time between converting a pane and its
-    /// volume arriving, which is exactly when the first section is cut.
-    ///
-    /// A pane with no resolvable render params and an ordinary map kind still
-    /// contributes nothing rather than forcing `All`: it is showing nothing, so
-    /// it needs nothing.
-    fn cut_selection_for(&self, site: &str) -> rustdar_radar::chunks::CutSelection {
-        use rustdar_radar::chunks::CutSelection;
-
-        let mut tilts: Vec<f32> = Vec::new();
-        for idx in 0..self.gui.pane_count() {
-            if self.gui.pane(idx).is_none_or(|p| p.site != site) {
-                continue;
-            }
-            // The pane-kind half of the whole-volume question. See this
-            // function's own documentation for why it is asked here rather than
-            // after the params guard, and why answering only the product half
-            // silently mis-cuts a section.
-            if self.gui.pane_consumes_whole_volume(idx) {
-                return CutSelection::All;
-            }
-            // The storage half. A completed volume on this site becomes a loop
-            // frame, and a loop frame is read later by whatever the pane is
-            // showing then — so what is on screen now cannot answer for it.
-            //
-            // Above both the params guard and the Level III skip, and it takes two
-            // panes to see why either matters — see
-            // `a_looping_pane_that_contributes_no_tilt_still_forces_the_whole_volume`.
-            // What decides is that a *Level II volume* gets cached under this site,
-            // which happens whatever the looping pane renders or fails to resolve.
-            // A loop is also active from the moment it is enabled, before any of its
-            // own frames exist, which is when the first live volume closes under it.
-            if self.gui.pane(idx).is_some_and(|p| p.loop_state.is_active()) {
-                return CutSelection::All;
-            }
-            let Some((product, elevation)) = self.gui.get_rendering_params_for_pane(idx) else {
-                continue;
-            };
-            // Ahead of the Level III check, which is safe only because the two
-            // sets are disjoint — no Level III product reads a Level II tilt, so
-            // `reads_whole_volume` is false for every one of them. Were a product
-            // ever both, this order would silently decide for it, and `All` is
-            // the answer that would still be correct.
-            if product.reads_whole_volume() {
-                return CutSelection::All;
-            }
-            // Level III panes draw from `level3_data` and say nothing about which
-            // Level II cuts are needed.
-            if product.is_level3() {
-                continue;
-            }
-            if !tilts.iter().any(|t| (t - elevation).abs() < 0.05) {
-                tilts.push(elevation);
-            }
-        }
-        // Nothing renderable on this site yet — take everything until something
-        // says otherwise, so a site that has only just loaded is never starved.
-        if tilts.is_empty() {
-            return CutSelection::All;
-        }
-        CutSelection::Tilts(tilts)
+    /// [`CutSelection::Tilts`](rustdar_radar::chunks::CutSelection::Tilts)
+    /// itself stays in `rustdar-radar`, tested and working: the decision
+    /// retired here is the *frontend's*, and a future caller with a genuine
+    /// bandwidth ceiling (a metered mobile build, say) has the mechanism and
+    /// this history to weigh against it.
+    fn cut_selection_for(&self, _site: &str) -> rustdar_radar::chunks::CutSelection {
+        rustdar_radar::chunks::CutSelection::All
     }
 
     /// Keep the notification subscriptions matched to the live sites, and turn
@@ -380,27 +289,18 @@ impl super::App {
     /// volume per site, and a partial one there is exactly what the paragraph above
     /// is about.
     ///
-    /// # `volume_complete` is not "whole", and the loop cache outlives the answer
+    /// # `volume_complete` is not "whole", and what is stored takes the strict gate
     ///
-    /// `volume_complete` means every cut *the selection asked for* sealed, and
-    /// narrow is the default — one Reflectivity pane at 0.5° yields
-    /// `CutSelection::Tilts([0.5])`, so every volume closes "complete" with a single
-    /// sweep. [`Self::cut_selection_for`] discharges the resulting duty for
-    /// everything on screen *now*, by widening to `All` the moment a whole-volume
-    /// product or pane kind appears.
-    ///
-    /// It cannot discharge it for a volume that is **stored**. `LoopDownloadManager`'s
-    /// scan cache is written unconditionally, read product-blind by `frame_data`,
-    /// never re-downloaded once `is_cached`, and cleared only on a site switch — so
-    /// a one-sweep volume cached while a pane looped Reflectivity is still there
-    /// when that pane is switched to echo tops, and `compute_echo_tops` clamps every
-    /// column to 0.5° and reports a plausible, low, wrong altitude. Newer frames
-    /// right and older ones wrong, which reads as more convincing than uniform
-    /// breakage.
-    ///
-    /// So the loop append is gated on `whole_volume_complete` and the live path is
-    /// not. Two different questions with two different answers, and the storage one
-    /// is the strict one.
+    /// `volume_complete` means every cut *the selection asked for* sealed. The
+    /// selection is now always `All` ([`Self::cut_selection_for`]), so the two
+    /// predicates coincide in practice — but the distinction stays load-bearing
+    /// for everything a volume outlives: the loop cache is read product-blind
+    /// later, and `base_scans` puts a ladder under every whole-volume consumer
+    /// for the whole next volume. Both writers therefore gate on
+    /// `whole_volume_complete`, the statement about the *data*, so that a
+    /// regression in the selection — or a volume genuinely missing a cut to
+    /// chunk loss — degrades to "the base ages one volume" rather than to a
+    /// plausible, short ladder nothing would notice.
     fn apply_chunk_outcome(&mut self, site: &str, outcome: &rustdar_radar::chunks::PollOutcome) {
         // The flag and the scan are read together rather than one gating the other:
         // `ChunkPoller::roll` builds the scan exactly when the volume completed, so
@@ -451,6 +351,18 @@ impl super::App {
         self.scan_data.insert(site.to_string(), Arc::clone(&scan));
 
         if let Some((closed, _)) = completed {
+            // A whole closed volume is the same volume the archive will
+            // publish minutes from now, so it becomes the site's merge base
+            // immediately — this is what keeps sections and the 3D view
+            // standing on a complete volume across every roll without another
+            // archive download. Gated on `whole_volume_complete`, the same
+            // strictness the loop append below carries and for the same
+            // reason: the base outlives this round, and a base missing cuts
+            // would put a plausible, short ladder under every consumer.
+            if closed.progress.whole_volume_complete {
+                self.base_scans
+                    .insert(site.to_string(), (Arc::clone(&scan), timestamp));
+            }
             // The volume is now exactly what the archive would have published,
             // so the steady state matches it — including the Level III refetch
             // that re-registers the tilts a merge preserved mid-volume.
@@ -701,17 +613,10 @@ mod tests {
 #[cfg(test)]
 mod selection_tests {
     use super::super::App;
-    use super::super::tests::{headless, two_pane_app};
+    use super::super::tests::headless;
     use crate::platform_double::TestBridge;
     use rustdar_radar::chunks::CutSelection;
     use rustdar_radar::types::{RadarProduct, ScanInfo};
-
-    /// One live pane on KTLX showing `product`, snapping within `available`.
-    fn app_showing(product: RadarProduct, selected: f32, available: &[f32]) -> App {
-        let mut app = headless(TestBridge::desktop());
-        show(&mut app, product, selected, available);
-        app
-    }
 
     /// Re-point the pane an existing app already has, so a per-product sweep
     /// does not stand a `wgpu` instance up once per variant.
@@ -752,349 +657,42 @@ mod selection_tests {
         });
     }
 
-    /// The ordinary case, and where the traffic saving comes from.
-    #[test]
-    fn a_single_tilt_pane_asks_for_only_its_tilt() {
-        let app = app_showing(RadarProduct::Reflectivity, 0.5, &[0.5, 1.5, 4.0]);
-        assert_eq!(
-            app.cut_selection_for("KTLX"),
-            CutSelection::Tilts(vec![0.5])
-        );
-    }
-
-    /// The guard the whole feature's safety rests on. `compute_echo_tops` clamps
-    /// every column to the topmost tilt present, so a volume that skipped cuts
-    /// would give it a plausible, low, wrong answer with nothing to notice.
-    #[test]
-    fn a_volumetric_pane_forces_the_whole_volume() {
-        let app = app_showing(RadarProduct::EchoTopsInterpolated, 0.5, &[0.5]);
-        assert_eq!(app.cut_selection_for("KTLX"), CutSelection::All);
-    }
-
-    /// NROT fits its wind profile from every velocity tilt — the only wind
-    /// source since the NVW fetch left — so it is volume-wide for the same
-    /// reason.
-    #[test]
-    fn an_nrot_pane_forces_the_whole_volume() {
-        let app = app_showing(RadarProduct::NormalizedRotation, 0.5, &[0.5]);
-        assert_eq!(app.cut_selection_for("KTLX"), CutSelection::All);
-    }
-
-    /// And the one the divergence actually bit. SRV's dealias seeding wants that
-    /// same profile, and the profile is also where its default Bunkers vector
-    /// comes from, so narrowing the feed under it fitted both from whichever
-    /// velocity tilts happened to have been downloaded.
-    #[test]
-    fn an_srv_pane_forces_the_whole_volume() {
-        let app = app_showing(RadarProduct::StormRelativeVelocity, 0.5, &[0.5]);
-        assert_eq!(app.cut_selection_for("KTLX"), CutSelection::All);
-    }
-
-    /// Every product there is, against the one predicate that decides this.
+    /// **Every pane shape takes the whole feed.** The narrowing this module
+    /// used to pin — tilt lists for single-sweep panes, `All` forced by
+    /// whole-volume products, section/3D pane kinds and active loops — is
+    /// superseded by the current merged volume: the substrate's premise is
+    /// that a live site always holds a full, current copy of its data, and a
+    /// feed that skips cuts breaks it twice over (the overlay misses rungs,
+    /// and no closed volume is ever whole, so the base never rolls forward).
     ///
-    /// The bug this replaces was a second copy of that predicate living here and
-    /// disagreeing with the first, so what is checked is the *behaviour* of the
-    /// selection against [`RadarProduct::reads_whole_volume`]: a third copy, or a
-    /// special case bolted onto the loop, fails this whichever product it omits.
-    ///
-    /// A tilt list is safe for exactly one kind of pane: a Level II product that
-    /// reads the single sweep `find_sweep` picks. A volume integral needs every
-    /// cut, and a Level III pane says nothing about which Level II cuts are
-    /// needed, so neither of those may narrow the feed.
+    /// The sweep runs the very configurations that used to narrow — most
+    /// pointedly the single-tilt Reflectivity pane, the case the traffic
+    /// saving existed for — so reintroducing any narrowing arm fails here on
+    /// the exact shape it would narrow.
     #[test]
-    fn only_a_one_sweep_level_two_pane_narrows_the_feed() {
+    fn every_pane_shape_takes_the_whole_feed() {
+        use rustdar_egui::pane::PaneKind;
+
         let mut app = headless(TestBridge::desktop());
         for &product in RadarProduct::all() {
-            show(&mut app, product, 0.5, &[0.5]);
-            let selection = app.cut_selection_for("KTLX");
+            show(&mut app, product, 0.5, &[0.5, 1.5, 4.0]);
             assert_eq!(
-                matches!(&selection, CutSelection::Tilts(_)),
-                !product.reads_whole_volume() && !product.is_level3(),
-                "{product:?}: the feed was asked for {selection:?}",
+                app.cut_selection_for("KTLX"),
+                CutSelection::All,
+                "{product:?}: a live site's feed was narrowed; the merge base \
+                 can no longer roll forward and an opened section waits on cuts \
+                 the feed skipped",
             );
         }
-    }
-
-    // Not tested here: that one volumetric pane among several outweighs the
-    // rest. It needs a multi-pane `Gui`, and `set_pane_count_for_test` is
-    // `#[cfg(test)]` inside `rustdar-egui` so it does not exist for this crate.
-    // The single-pane tests above cover both branches of the decision, and the
-    // loop returns `All` on the first volumetric pane it meets.
-
-    /// The other half of the whole-volume question: the pane's **kind**.
-    ///
-    /// This is the single place a live cross-section can go quietly wrong. The
-    /// product half above asks "does this field integrate the column?" and a
-    /// reflectivity section answers *no* — it is one moment, the same moment the
-    /// plan view rasterizes. The pane-kind half asks "does this view slice
-    /// vertically?", and there the answer is yes. Ask only the product and the
-    /// site's feed narrows to the section pane's nominal tilt, after which the
-    /// section is interpolated between whichever cuts happened to arrive: no
-    /// error, no NaN, and a smooth plausible layer where there is no data at all.
-    /// It looks *better* than the truth, which is what makes it the worst failure
-    /// mode in the feature.
-    ///
-    /// Driven with a product that is deliberately `Tilts`-worthy on its own —
-    /// asserted as a precondition — so the `All` below can only have come from
-    /// the kind.
-    #[test]
-    fn a_whole_volume_pane_kind_forces_the_whole_volume() {
-        use rustdar_egui::pane::PaneKind;
 
         for kind in [PaneKind::CrossSection, PaneKind::Volume] {
-            let mut app = app_showing(RadarProduct::Reflectivity, 0.5, &[0.5, 1.5, 4.0]);
-            assert_eq!(
-                app.cut_selection_for("KTLX"),
-                CutSelection::Tilts(vec![0.5]),
-                "precondition: as a map pane this selection narrows the feed, so \
-                 the kind is the only thing that can widen it below"
-            );
-
+            show(&mut app, RadarProduct::Reflectivity, 0.5, &[0.5, 1.5, 4.0]);
             app.gui.pane_mut(0).unwrap().set_kind(kind);
-
-            assert_eq!(
-                app.cut_selection_for("KTLX"),
-                CutSelection::All,
-                "{kind:?}: the feed was narrowed under a pane that reads every cut"
-            );
+            assert_eq!(app.cut_selection_for("KTLX"), CutSelection::All, "{kind:?}");
         }
-    }
 
-    /// A loop enabled on `site`, in the state `handle_enable_loop` leaves one in
-    /// before any frame has arrived.
-    ///
-    /// The site is built here rather than looked up because `RadarSite` is what
-    /// `new_for_loop` stores and not every site name these tests use is in the
-    /// compiled table.
-    fn loop_on(site: &'static str) -> rustdar_egui::pane::LoopPlaybackState {
-        rustdar_egui::pane::LoopPlaybackState::new_for_loop(
-            1800,
-            &rustdar_radar::sites::RadarSite {
-                name: site,
-                lat: 35.3,
-                lon: -97.3,
-                elev: None,
-            },
-        )
-    }
-
-    /// **An active loop forces the whole volume**, whatever it is looping.
-    ///
-    /// Two independent reasons, and the test asserts the one condition that serves
-    /// both. A loop frame is *stored*: `LoopDownloadManager`'s scan cache is read
-    /// product-blind and never re-downloaded, so a volume narrowed to what a
-    /// Reflectivity loop wanted is handed to echo tops the moment the pane changes
-    /// product — and what is on screen now cannot answer for what reads the frame
-    /// later. And `apply_chunk_outcome` refuses to cache a volume that is not whole
-    /// using the same call that appends the frame, so without this the loop on a
-    /// narrow site would gain no frames from the feed at all.
-    ///
-    /// The single-pane case, where the pane's own product would otherwise narrow
-    /// the feed to its one tilt.
-    #[test]
-    fn an_active_loop_forces_the_whole_volume() {
-        let mut app = app_showing(RadarProduct::Reflectivity, 0.5, &[0.5, 1.5, 4.0]);
-        assert_eq!(
-            app.cut_selection_for("KTLX"),
-            CutSelection::Tilts(vec![0.5]),
-            "precondition: this pane narrows the feed on its own, so the loop is \
-             the only thing that can widen it below"
-        );
-
-        app.gui.pane_mut(0).unwrap().loop_state = loop_on("KTLX");
-        assert!(
-            app.gui.pane(0).unwrap().loop_state.is_active(),
-            "precondition: the loop must read as active from the moment it is \
-             enabled, before any of its frames exist"
-        );
-
-        assert_eq!(
-            app.cut_selection_for("KTLX"),
-            CutSelection::All,
-            "a looping site's feed was narrowed, so its cached frames are volumes \
-             missing cuts — and the frame append that would have advanced the loop \
-             is refused for exactly that reason"
-        );
-    }
-
-    /// The loop check is asked **above** the Level III skip and the params guard,
-    /// and it takes **two** panes to see either.
-    ///
-    /// With the looping pane alone the tilt list ends up empty and the
-    /// nothing-renderable fallback returns `All` anyway, so a single-pane version
-    /// passes wherever the check sits and proves nothing — the same trap
-    /// `a_whole_volume_pane_with_no_scan_yet_still_forces_the_whole_volume` documents
-    /// for the kind check. A sibling map pane supplying a real tilt is what makes
-    /// the position observable, and it is also the arrangement a user is in.
-    ///
-    /// Both arms are cases where the looping pane contributes no tilt of its own: a
-    /// Level III product, which `is_level3()` skips, and a pane whose params do not
-    /// resolve. Neither says anything about which Level II cuts are wanted, and
-    /// neither is allowed to leave the feed narrow — a Level II volume is cached
-    /// under this site whatever the looping pane happens to render.
-    #[test]
-    fn a_looping_pane_that_contributes_no_tilt_still_forces_the_whole_volume() {
-        for level3 in [true, false] {
-            let mut app = two_pane_app("KTLX", "KTLX");
-            // Pane 0: an ordinary map pane with a resolvable tilt, so the
-            // empty-list fallback cannot be what answers.
-            show(&mut app, RadarProduct::Reflectivity, 0.5, &[0.5, 1.5]);
-            if level3 {
-                show_on(
-                    &mut app,
-                    1,
-                    RadarProduct::VerticallyIntegratedLiquid,
-                    0.5,
-                    &[0.5],
-                );
-            }
-            app.gui.pane_mut(1).unwrap().loop_state = loop_on("KTLX");
-            assert_eq!(
-                app.gui.get_rendering_params_for_pane(1).is_some(),
-                level3,
-                "precondition: pane 1 must resolve params in the Level III arm — so \
-                 the `is_level3` skip is what would drop it — and not resolve them \
-                 in the other, so the params guard is"
-            );
-            assert!(
-                app.gui.get_rendering_params_for_pane(0).is_some(),
-                "precondition: the sibling must supply a tilt, or the empty-list \
-                 fallback returns All wherever the check sits"
-            );
-
-            assert_eq!(
-                app.cut_selection_for("KTLX"),
-                CutSelection::All,
-                "level3={level3}: a looping pane that contributes no tilt left the \
-                 feed narrowed to what the sibling map pane asked for, and the loop \
-                 caches Level II volumes missing cuts"
-            );
-        }
-    }
-
-    /// The counterweight, and it is load-bearing for the whole guard: **without a
-    /// loop, a narrow site is still narrow.**
-    ///
-    /// If this ever fails, selective download is gone — and so is the reachability
-    /// of `apply_chunk_outcome`'s whole-volume refusal, which would become dead code
-    /// that no test could distinguish from a working guard.
-    #[test]
-    fn a_site_with_no_loop_still_narrows_the_feed() {
-        let app = app_showing(RadarProduct::Reflectivity, 0.5, &[0.5, 1.5, 4.0]);
-        assert!(
-            !app.gui.pane(0).unwrap().loop_state.is_active(),
-            "precondition: no loop"
-        );
-        assert_eq!(
-            app.cut_selection_for("KTLX"),
-            CutSelection::Tilts(vec![0.5])
-        );
-    }
-
-    /// A loop on one site does not widen another site's feed — the loop check sits
-    /// inside the per-site loop, after the site test, like the kind check.
-    #[test]
-    fn an_active_loop_widens_only_its_own_site() {
-        let mut app = two_pane_app("KTLX", "KOUN");
-        show(&mut app, RadarProduct::Reflectivity, 0.5, &[0.5, 1.5]);
-        app.gui.pane_mut(1).unwrap().loop_state = loop_on("KOUN");
-
-        assert_eq!(
-            app.cut_selection_for("KTLX"),
-            CutSelection::Tilts(vec![0.5]),
-            "the loop on KOUN widened KTLX's feed"
-        );
-        assert_eq!(app.cut_selection_for("KOUN"), CutSelection::All);
-    }
-
-    /// The kind is asked **before** the rendering-params guard, not after it.
-    ///
-    /// A whole-volume pane whose params do not resolve — no scan info yet, or a
-    /// product whose elevations have not landed — falls straight through that
-    /// guard contributing nothing. Behind the guard, a sibling map pane on the
-    /// same site is then left to narrow the feed on its own and the section gets
-    /// cut from whatever the *map* asked for. The window is the whole time
-    /// between converting a pane and its volume arriving, which is exactly when
-    /// the first section is cut.
-    ///
-    /// It needs **two** panes to bite, and that is why. With the section pane
-    /// alone, the tilt list ends up empty and the nothing-renderable fallback at
-    /// the bottom returns `All` anyway — so a single-pane version of this test
-    /// passes with the check on either side of the guard and proves nothing. It
-    /// takes a sibling supplying a real tilt for the ordering to be observable,
-    /// which is also precisely the arrangement a user is in.
-    #[test]
-    fn a_whole_volume_pane_with_no_scan_yet_still_forces_the_whole_volume() {
-        use rustdar_egui::pane::PaneKind;
-
-        let mut app = two_pane_app("KTLX", "KTLX");
-        // Pane 0: an ordinary map pane on KTLX with a resolvable tilt.
-        show(&mut app, RadarProduct::Reflectivity, 0.5, &[0.5, 1.5]);
-        // Pane 1: a section on the same site, still waiting for its scan.
-        app.gui
-            .pane_mut(1)
-            .unwrap()
-            .set_kind(PaneKind::CrossSection);
-        assert!(
-            app.gui.get_rendering_params_for_pane(1).is_none(),
-            "precondition: with no scan info the params guard is what this pane \
-             would otherwise hit"
-        );
-        assert!(
-            app.gui.get_rendering_params_for_pane(0).is_some(),
-            "precondition: the sibling must supply a tilt, or the empty-list \
-             fallback returns All whichever side of the guard the check is on"
-        );
-
-        assert_eq!(app.cut_selection_for("KTLX"), CutSelection::All);
-    }
-
-    /// A section pane on one site does not widen another site's feed.
-    ///
-    /// The kind check sits inside the per-site loop, *after* the site test.
-    /// Hoisted out of it — or written as "any pane anywhere is a section" — every
-    /// site in a multi-site layout would start downloading every cut the moment
-    /// one pane anywhere became a section, and the traffic saving the whole
-    /// selective feed exists for would be gone.
-    ///
-    /// Two panes, built through `Gui::load_ui_config`. That is the only public
-    /// route to a multi-pane `Gui` from this crate —
-    /// `Gui::set_pane_count_for_test` is `#[cfg(test)]` inside `rustdar-egui`, so
-    /// it does not exist here — and it is why the older tests in this module
-    /// could only cover the single-pane branches.
-    #[test]
-    fn a_whole_volume_pane_widens_only_its_own_site() {
-        use rustdar_egui::pane::PaneKind;
-
-        let mut app = two_pane_app("KTLX", "KOUN");
-        show(&mut app, RadarProduct::Reflectivity, 0.5, &[0.5, 1.5]);
-        app.gui
-            .pane_mut(1)
-            .unwrap()
-            .set_kind(PaneKind::CrossSection);
-        assert_eq!(
-            app.cut_selection_for("KTLX"),
-            CutSelection::Tilts(vec![0.5]),
-            "the section pane on KOUN widened KTLX's feed"
-        );
-
-        // The counterweight: the section pane's *own* site does widen, so the
-        // assertion above is about the site term rather than about a check that
-        // never fires.
-        assert_eq!(app.cut_selection_for("KOUN"), CutSelection::All);
-    }
-
-    /// A site with nothing renderable takes everything rather than starving.
-    #[test]
-    fn a_site_with_nothing_to_render_asks_for_everything() {
-        let app = headless(TestBridge::desktop());
-        assert_eq!(app.cut_selection_for("KTLX"), CutSelection::All);
-    }
-
-    /// Another site's panes never narrow this one's feed.
-    #[test]
-    fn the_selection_is_per_site() {
-        let app = app_showing(RadarProduct::Reflectivity, 0.5, &[0.5, 4.0]);
+        // A site with no pane at all still answers `All`: the answer is a
+        // property of the substrate now, not of what is on screen.
         assert_eq!(app.cut_selection_for("KOUN"), CutSelection::All);
     }
 }
@@ -1447,6 +1045,41 @@ mod volume_close_tests {
             app.render.pane_render[0].last_rendered.is_none(),
             "the live display was not refreshed either: those cuts are all it \
              asked for, so skipping the whole branch trades one bug for the other"
+        );
+    }
+
+    /// **A whole closed volume becomes the site's merge base** — the live
+    /// writer that keeps sections and 3D standing on a complete volume across
+    /// every roll without another archive download — and a volume that closed
+    /// short of whole does not: a base missing cuts would put a plausible,
+    /// short ladder under every whole-volume consumer for the whole next
+    /// volume, with nothing to notice.
+    #[test]
+    fn a_whole_closed_volume_becomes_the_merge_base() {
+        let mut app = app_showing_a_drawn_volume(RadarProduct::Reflectivity);
+        assert!(
+            !app.base_scans.contains_key("KTLX"),
+            "precondition: no base yet, so the write below is this round's"
+        );
+
+        app.apply_chunk_outcome("KTLX", &closing_round_of(5, true));
+        let based = app
+            .base_scans
+            .get("KTLX")
+            .map(|(scan, _)| scan.sweeps().len());
+        assert_eq!(
+            based,
+            Some(5),
+            "the whole closed volume did not become the merge base, so the \
+             base ages from the first archive fetch for as long as the feed runs"
+        );
+
+        let mut short = app_showing_a_drawn_volume(RadarProduct::Reflectivity);
+        short.apply_chunk_outcome("KTLX", &closing_round_of(1, false));
+        assert!(
+            !short.base_scans.contains_key("KTLX"),
+            "a volume that closed short of whole was installed as the merge \
+             base; every consumer now stands on a ladder missing cuts"
         );
     }
 
