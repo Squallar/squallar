@@ -32,7 +32,8 @@
 //! fills rows across them. Measured at 12.5 ms per 2048 × 1024 section on a
 //! five-rung ladder with rayon, 73 ms single-threaded — the single-threaded
 //! figure being the one that bounds wasm, where the raster is a quarter the
-//! pixels and there is no pool. `section_timing` is the measurement.
+//! pixels and there is no pool. `section_timing` (on branch
+//! `campaign-harness`) is the measurement.
 //!
 //! # The raster
 //!
@@ -3949,33 +3950,5 @@ mod tests {
 
         // And the multiply cannot overflow into a pass.
         assert_eq!(Reader::new(&bytes).bounded(u32::MAX, usize::MAX), None);
-    }
-
-    /// How long a section takes to draw, on the target it is built for.
-    ///
-    /// Ignored: it is a measurement, not a bound, and a shared CI runner cannot
-    /// hold one. Run it with
-    ///
-    /// ```text
-    /// cargo test -p rustdar-radar --release -- --ignored --nocapture section_timing
-    /// ```
-    #[test]
-    #[ignore = "a measurement, not an assertion; see the doc comment"]
-    fn section_timing() {
-        let scan = scan_with(&|az, slant| Gate::Dbz(15.0 + az / 60.0 + slant / 30.0));
-        let req = request(SITE, point_at(45.0, 230.0));
-        // One warm run so the measurement is not the first-touch page faults.
-        let _ = render_section(&scan, &req, SITE.0, SITE.1).unwrap();
-        let started = std::time::Instant::now();
-        let runs = 10;
-        for _ in 0..runs {
-            let _ = render_section(&scan, &req, SITE.0, SITE.1).unwrap();
-        }
-        let each = started.elapsed() / runs;
-        println!(
-            "render_section: {each:?} per {SECTION_WIDTH}x{SECTION_HEIGHT} \
-             section, {} rungs",
-            LADDER.len(),
-        );
     }
 }
