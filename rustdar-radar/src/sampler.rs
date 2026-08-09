@@ -688,6 +688,12 @@ impl Column {
         // construction.
         let fold_limit = match (lo.fold_limit_ms, hi.fold_limit_ms) {
             (Some(a), Some(b)) => Some(a.min(b)),
+            // This one-sided arm can fire only for armed limits in
+            // [8.0, ≈11.94): the pair must clear `SEAM_PROXIMITY_ACROSS_TILTS`
+            // of the measured limit on both ends while the unarmed rung's
+            // speeds stay under the 8.0 m/s floor, which caps the armed limit
+            // below `8.0 / 0.67` — dead at a 12.5 m/s cut, alive at the
+            // ~11 m/s cuts VCP 31 actually flies.
             (a, b) => a.or(b),
         };
         blend(
@@ -1400,6 +1406,20 @@ fn estimate_fold_limit(radials: &[Radial], slot: MomentSlot) -> Option<f64> {
 /// afterwards, reproduces the crossing to within one band; the seven-volume
 /// storm control and the VCP 32/35 mid-Nyquist control are recorded with the
 /// corpus in `seam_probe`'s module doc.
+///
+/// # What the shipped point costs
+///
+/// A break-even keeps a trade, and the kept side is recorded here rather
+/// than left to a re-run. Measured on the KILN holdout — clear-air VCP 31,
+/// once: at the shipped `0.60`/`0.67` the guard still passes **2,925
+/// fabricating quads and 2,199 fabricating rung pairs**, oracle-confirmed
+/// folds it now declines that average to near-calm. (On KILN the quad rows
+/// at `0.65` and `0.67` are identical: legacy-resolution velocity is
+/// quantised at 0.5 m/s, and at that site's ~12.5 m/s estimated limits no
+/// half-m/s reading falls between the two bounds.) The seven-volume storm
+/// control fabricated nothing at the shipped fractions on its original
+/// measuring run — a claim scoped to that run, whose corpus hours were
+/// never recorded, not a property of storm volumes in general.
 const SEAM_PROXIMITY_ACROSS_GATES: f64 = 0.60;
 
 /// How near the seam both rungs must sit before a straddle between adjacent
@@ -1443,6 +1463,15 @@ const SEAM_PROXIMITY_ACROSS_GATES: f64 = 0.60;
 /// exactly where [`SEAM_PROXIMITY_ACROSS_GATES`] applies; here it is only a
 /// tendency, which is why this number is a measured break-even and not a
 /// theorem.
+///
+/// # What the shipped point costs
+///
+/// The recall quoted above is at `0.50` and `0.75`; the shipped point has
+/// its own number: on the KILN holdout — clear-air VCP 31, measured once —
+/// **rung recall at `0.67` is 63.06%**, so the vertical guard keeps under
+/// two-thirds of oracle-confirmed rung folds at its own line. The
+/// fabrications that survive both shipped fractions are recorded with the
+/// quad figures on [`SEAM_PROXIMITY_ACROSS_GATES`].
 const SEAM_PROXIMITY_ACROSS_TILTS: f64 = 0.67;
 
 /// Which adjacency a velocity blend spans, carrying the fold limit its guard
@@ -4312,14 +4341,16 @@ mod tests {
         }
 
         // Each extreme is tested on its own side of its own adjacency's
-        // line, and one end past it is not enough. (An earlier fixture put
-        // the pair *exactly* on the bound and pinned that the tie
-        // interpolates, which `0.5 · 20` afforded because 10.0 survives the
-        // trip through a `Sample`'s `f32`; neither shipped fraction's bound
-        // is representable there, so the nearest half-m/s readings either
-        // side — the finest step legacy-resolution velocity takes — stand
-        // in, and the strictness of the comparison stays visible in the
-        // rule's own `<`.)
+        // line, and one end past it is not enough. The gate bound survives
+        // every conversion — `0.60 · 20` is exactly 12.0 in f64 and in a
+        // `Sample`'s f32 alike — so the strictness of the rule's own `<` is
+        // pinned exactly on the bound as well as either side of it. The tilt
+        // bound `0.67 · 20 = 13.4` is representable in neither, so there the
+        // nearest half-m/s readings either side — the finest step
+        // legacy-resolution velocity takes — stand in. (An earlier note here
+        // retired the exact-on-bound pin claiming neither shipped bound
+        // survived the trip; the gate bound does, and the three on-bound
+        // cases below restore the pin that claim removed.)
         let g = |a: f64, b: f64| {
             straddles_fold(
                 &[Sample::found(a as f32), Sample::found(b as f32)],
@@ -4330,6 +4361,12 @@ mod tests {
         assert!(!g(12.5, -11.5), "one end past the gate line is not enough");
         assert!(!g(11.5, -12.5), "nor is the other end alone");
         assert!(g(12.5, -12.5), "62.5% is past the gate line on both ends");
+        assert!(
+            !g(12.0, -12.0),
+            "exactly on the gate bound is not past it — the rule is strict",
+        );
+        assert!(!g(12.5, -12.0), "on the bound at the low end interpolates");
+        assert!(!g(12.0, -12.5), "and on the bound at the high end too");
 
         let t = |a: f64, b: f64| {
             straddles_fold(
@@ -4626,6 +4663,97 @@ mod tests {
         );
     }
 
+    /// **The tilt line's lower side, at quarter-quantum resolution.** Against
+    /// a 20 m/s limit the tilt fraction `0.67` draws its line at 13.4 and the
+    /// next band down, `0.65`, at 13.0 — and the 0.5 m/s legacy-resolution
+    /// grid steps from 13.0 straight to 13.5, over the whole interval where
+    /// the two disagree. So every half-quantum fixture in this file is blind
+    /// to the tilt fraction slipping `0.67 → 0.65`, and only the literal
+    /// value pin would notice. Super-res velocity is quantised at 0.25 m/s,
+    /// and ±13.25 — 66.25% of the limit — sits inside the disputed band:
+    /// short of the shipped line, past the band below it. This drives that
+    /// pair through the real vertical path at the real super-res encoding
+    /// and pins that it still lerps.
+    #[test]
+    fn the_tilt_line_holds_its_lower_side_at_quarter_quantum() {
+        // The super-res encoding: 0.25 m/s per raw step. ±20 planted at the
+        // first gate arms both rungs at 20; ±13.25 everywhere else is the
+        // pair under test, and both survive the encoding exactly.
+        const SUPER_RES_VEL_SCALE: f32 = 4.0;
+        let sweep = |elevation_number: u8, elevation_deg: f32, sign: f64| {
+            let radials = (0..360u16)
+                .map(|i| {
+                    let bytes: Vec<u8> = (0..200usize)
+                        .map(|j| {
+                            let ms = sign * if j == 0 { 20.0 } else { 13.25 };
+                            (ms * f64::from(SUPER_RES_VEL_SCALE) + f64::from(VEL_OFFSET)).round()
+                                as u8
+                        })
+                        .collect();
+                    Radial::new(
+                        0,
+                        i,
+                        f32::from(i),
+                        1.0,
+                        RadialStatus::IntermediateRadialData,
+                        elevation_number,
+                        elevation_deg,
+                        None,
+                        Some(moment_from(bytes, SUPER_RES_VEL_SCALE, VEL_OFFSET)),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                })
+                .collect();
+            Sweep::new(elevation_number, radials)
+        };
+        let scan = Scan::new(
+            vcp(&[0.5, 4.5]),
+            vec![sweep(1, 0.5, 1.0), sweep(2, 4.5, -1.0)],
+        );
+        let sampler = VolumeSampler::new(&scan, RadarProduct::Velocity).unwrap();
+        for rung in 0..2 {
+            assert_eq!(
+                sampler.rungs[rung].fold_limit_ms,
+                Some(20.0),
+                "precondition: the planted gate did not set this rung's \
+                 limit, so the ratio under test is not the stated one",
+            );
+        }
+
+        // The rule itself, on the pair the fixture carries.
+        assert!(
+            !straddles_fold(
+                &[Sample::found(13.25), Sample::found(-13.25)],
+                Seam::AcrossTilts(20.0),
+            ),
+            "±13.25 against 20 is 66.25%, short of the 67% line, and must \
+             not fire — a tilt fraction of 0.65 would fire here",
+        );
+
+        // And through the real lerp: the midpoint is the plain mean, 0.0.
+        let column = sampler.column(90.0, 30.0);
+        let rungs = column.rungs();
+        assert_eq!(
+            rungs[0].sample.value(),
+            Some(13.25),
+            "precondition: the quarter-quantum speed did not survive the \
+             super-res encoding, so the pair under test is not ±13.25",
+        );
+        assert_eq!(rungs[1].sample.value(), Some(-13.25));
+        let mid = 0.5 * (rungs[0].height_km + rungs[1].height_km);
+        let value = column.at_height_km(mid).value().expect("both measured");
+        assert!(
+            value.abs() < 1e-6,
+            "±13.25 under a 20 m/s limit is short of the tilt line and must \
+             lerp to its plain mean at the midpoint; it read {value}, a \
+             corner — the tilt guard slipped to a lower band",
+        );
+    }
+
     /// **The vertical lerp is the total case: a two-corner blend at `t = 0.5`
     /// of `±v` is identically zero, so every fold-straddling rung pair halfway
     /// up fabricates.**
@@ -4856,11 +4984,11 @@ mod tests {
     /// crossing", which is not a claim its fixture supports.
     ///
     /// The tests that do resolve the detector's boundary are
-    /// [`velocity_averages_arithmetically_and_phase_averages_on_the_circle`]
-    /// at a ratio of 0.72, [`the_straddle_test_needs_both_extremes_near_the_seam`]
-    /// on the rule itself, and
-    /// [`a_wide_zero_crossing_in_the_disputed_band_still_interpolates`]
-    /// through the integrated path. A smooth ramp cannot be one of them: to
+    /// [`the_straddle_test_needs_both_extremes_near_the_seam`] on the rule
+    /// itself, [`each_guard_draws_its_line_at_its_own_fraction`] on the two
+    /// fractions by value, and the two `holds_its_line` tests beside them,
+    /// which hold each adjacency's own line from both sides through the
+    /// integrated paths. A smooth ramp cannot be one of them: to
     /// put the pair bracketing zero at the rule's own bound the ramp would
     /// have to step a whole fold limit per gate, which is not a ramp.
     #[test]
