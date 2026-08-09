@@ -1,7 +1,7 @@
 //! Concrete [`PlatformBridge`] implementations. The trait lives in
 //! `rustdar-frontend`, which must never name a per-OS type.
 
-use rustdar_frontend::platform::PlatformBridge;
+use rustdar_frontend::platform::{PlatformBridge, RedrawWaker};
 // The iOS bridge has no pollable channels yet; see the note above `IosPlatform`.
 #[cfg(not(target_os = "ios"))]
 use rustdar_frontend::platform::drain_latest;
@@ -41,6 +41,9 @@ pub struct DesktopPlatform {
     gps_reader: Option<rustdar_gps::SerialGpsReader>,
     /// Receives GPS fixes from the serial reader thread.
     gps_fix_receiver: Option<std::sync::mpsc::Receiver<rustdar_gps::GpsFix>>,
+    /// Handed to the reader thread so a fix arriving while the loop is parked
+    /// gets a frame to be shown on. See [`RedrawWaker`].
+    redraw_waker: RedrawWaker,
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -59,6 +62,7 @@ impl DesktopPlatform {
             config_dir: Self::default_config_dir(),
             gps_reader: None,
             gps_fix_receiver: None,
+            redraw_waker: RedrawWaker::new(),
         }
     }
 
@@ -141,11 +145,23 @@ impl PlatformBridge for DesktopPlatform {
         false
     }
 
+    /// The waker is taken here rather than at `start_gps`, because `start_gps`
+    /// is reached from a menu toggle and carries nothing but a config. It is
+    /// also handed over before any window exists, which is what
+    /// [`RedrawWaker`]'s slot is for.
+    fn set_redraw_waker(&mut self, waker: RedrawWaker) {
+        self.redraw_waker = waker;
+    }
+
     fn start_gps(&mut self, config: &rustdar_gps::GpsConfig) {
         // Stop any existing reader first
         self.stop_gps();
         let (tx, rx) = std::sync::mpsc::channel();
-        if let Some(reader) = rustdar_gps::SerialGpsReader::start(config, tx) {
+        // The reader is a thread of its own, and `poll_gps_fix` is drained only
+        // on a frame: under `ControlFlow::Wait` a fix it pushes while the app is
+        // idle is invisible until something else happens to draw one.
+        let wake = self.redraw_waker.clone();
+        if let Some(reader) = rustdar_gps::SerialGpsReader::start(config, tx, move || wake.wake()) {
             self.gps_reader = Some(reader);
             self.gps_fix_receiver = Some(rx);
             log::info!("Desktop serial GPS reader started");
@@ -184,6 +200,9 @@ pub struct AndroidPlatform {
     back_press_taker: Option<fn() -> bool>,
     zone_cache_dir: Option<std::path::PathBuf>,
     config_dir: Option<std::path::PathBuf>,
+    /// Handed to the theme poller below, so a light/dark switch noticed on that
+    /// thread gets a frame to be applied on. See [`RedrawWaker`].
+    redraw_waker: RedrawWaker,
 }
 
 #[cfg(target_os = "android")]
@@ -206,6 +225,7 @@ impl AndroidPlatform {
             back_press_taker: None,
             zone_cache_dir: None,
             config_dir: None,
+            redraw_waker: RedrawWaker::new(),
         }
     }
 }
@@ -297,6 +317,13 @@ impl PlatformBridge for AndroidPlatform {
         true
     }
 
+    /// Taken before the theme poller is started, which is the only ordering
+    /// this bridge depends on: `android_main` calls `App::new` (which delivers
+    /// this) and only then `set_theme_detector` (which spawns the thread).
+    fn set_redraw_waker(&mut self, waker: RedrawWaker) {
+        self.redraw_waker = waker;
+    }
+
     fn set_gps_fix_receiver(&mut self, receiver: std::sync::mpsc::Receiver<rustdar_gps::GpsFix>) {
         self.gps_fix_receiver = Some(receiver);
     }
@@ -325,6 +352,7 @@ impl PlatformBridge for AndroidPlatform {
             "theme-detect",
             std::time::Duration::from_secs(2),
             detector,
+            self.redraw_waker.clone(),
         ) {
             Ok(receiver) => self.theme_receiver = Some(receiver),
             // Not fatal: `detect_dark_theme` still answers synchronously, so

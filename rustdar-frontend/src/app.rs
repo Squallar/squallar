@@ -18,7 +18,7 @@ use crate::channels::ChannelHub;
 use crate::constants::{RENDER_HEIGHT, RENDER_WIDTH};
 use crate::input::InputHandler;
 use crate::loop_downloads::LoopDownloadManager;
-use crate::platform::PlatformBridge;
+use crate::platform::{PlatformBridge, RedrawWaker};
 use crate::render_dispatch::RenderDispatcher;
 use rustdar_egui::{Gui, actions::GuiAction};
 use rustdar_radar::types::ScanInfo;
@@ -361,6 +361,13 @@ pub struct App {
     /// the debt is only re-marked when the next reply arrives — and costs
     /// nothing while every floor is in hand.
     floor_owed: Vec<(String, Option<rustdar_egui::pane::VolumeRegion>)>,
+    /// How a thread that is not this one asks for a frame.
+    ///
+    /// Filled in [`create_window`](Self::create_window) and emptied in
+    /// [`suspended`](App::suspended), so it tracks [`window`](Self::window)
+    /// exactly — see [`RedrawWaker`] for why a slot rather than a snapshot, and
+    /// why the emptying is the load-bearing half.
+    redraw_waker: RedrawWaker,
 }
 
 /// Bookkeeping for the periodic config write.
@@ -567,7 +574,7 @@ impl App {
         // user. That is handled where the real load happens, not here.
         let site_is_provisional = !restored && apply_location_hint(&mut gui, platform.as_ref());
 
-        Self {
+        let mut app = Self {
             instance,
             state: None,
             window: None,
@@ -607,7 +614,28 @@ impl App {
             latest_cached_scans: HashMap::new(),
             manual_nav_pending: false,
             last_viewport: None,
-        }
+            redraw_waker: RedrawWaker::new(),
+        };
+
+        // Here, and not later, because "later" does not exist for two of the
+        // bridge's producers: Android starts its theme poller from
+        // `set_theme_detector`, which `android_main` calls before `run_app`, and
+        // `DesktopPlatform::start_gps` needs the waker already in hand when a
+        // menu toggle reaches it. Both are before any window, which is the
+        // situation `RedrawWaker`'s slot exists for.
+        app.platform.set_redraw_waker(app.redraw_waker.clone());
+        app
+    }
+
+    /// A handle an entry point can give its own sensor threads.
+    ///
+    /// The bridge gets one directly (see [`PlatformBridge::set_redraw_waker`]).
+    /// This is for the producers that are not the bridge's: `android_main`'s
+    /// location and compass threads, and the browser's `watchPosition` watch —
+    /// all three of which are started by an entry point that owns the `App` but
+    /// has no window either.
+    pub fn redraw_waker(&self) -> RedrawWaker {
+        self.redraw_waker.clone()
     }
 
     /// Create surface and initialize AppState for a given window and dimensions.
@@ -2076,6 +2104,13 @@ impl App {
         let _ = window.request_inner_size(PhysicalSize::new(RENDER_WIDTH, RENDER_HEIGHT));
         self.window = Some(window.clone());
 
+        // Every sensor thread's waker is a clone of one slot, and this is where
+        // the slot learns what a wake means. Written beside the assignment above
+        // because the two must not drift: a producer holding a waker that points
+        // at a *previous* window would be asking a destroyed surface for frames.
+        let held = Some(window.clone());
+        self.redraw_waker.install(move || notify_redraw(&held));
+
         // Rendering state is initialized lazily in handle_redraw().
         // This keeps resumed() fast on Android, preventing ANRs during
         // configuration changes (e.g. folding/unfolding the device).
@@ -2210,6 +2245,14 @@ impl ApplicationHandler for App {
         // Leaving state alive would keep a wgpu surface referencing the destroyed window.
         self.window = None;
         self.state = None;
+        // The third holder of that window, and the only one this thread does
+        // not own outright: five sensor threads have a clone of the waker. A
+        // slot left filled would leave every one of them holding an
+        // `Arc<Window>` whose `ANativeWindow` is gone — surviving a suspend is
+        // the bug, not the virtue. `resumed` refills it through
+        // `create_window`; until then a wake is a no-op, which is the right
+        // answer for an app with nothing on screen.
+        self.redraw_waker.detach();
         // An init in flight targets the window just dropped. Leaving the
         // receiver in place would let `ensure_rendering_state` collect an
         // `AppState` holding a surface for a destroyed window and treat it as
@@ -3129,6 +3172,117 @@ mod tests {
             opening_site(&app),
             "KDLH",
             "a second fix moved a site that was already settled"
+        );
+    }
+
+    // ── Waking the loop from a thread that is not this one ──────────────
+    //
+    // The tests above hand a fix straight to `poll_platform_state`, which is
+    // the frame's own drain. In production nothing calls that until a frame
+    // happens, and under `ControlFlow::Wait` nothing schedules a frame unless
+    // something asks — so the five sensor producers each need a way to ask.
+    // `RedrawWaker`'s own guarantees are pinned in `platform.rs`; what belongs
+    // here is that the `App` fills it, empties it, and hands it out.
+
+    /// How many times `waker` has fired since this was called.
+    fn count_wakes(waker: &RedrawWaker) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = std::sync::Arc::clone(&count);
+        waker.install(move || {
+            probe.fetch_add(1, Ordering::SeqCst);
+        });
+        count
+    }
+
+    /// The ordering the desktop and Android bridges both depend on.
+    ///
+    /// `DesktopPlatform::start_gps` spawns the serial reader from a menu toggle
+    /// and `AndroidPlatform::set_theme_detector` spawns the theme poller during
+    /// `android_main`; neither call carries a window, and on Android the second
+    /// happens before `run_app`. So the bridge has to be holding the waker from
+    /// construction, and it has to be the *same* slot the window later fills —
+    /// a bridge handed a private copy would spawn threads that wake nothing for
+    /// the life of the process.
+    #[test]
+    fn the_bridge_gets_the_apps_own_waker_before_any_window_exists() {
+        let bridge = TestBridge::desktop();
+        let handed_to_the_bridge = bridge.waker_record();
+        let app = headless(bridge);
+
+        // Stands in for what `create_window` installs; no test can build the
+        // `Window` it captures, so that half is read off the source below.
+        let woke = count_wakes(&app.redraw_waker());
+
+        handed_to_the_bridge.borrow().wake();
+
+        assert_eq!(
+            woke.load(Ordering::SeqCst),
+            1,
+            "the bridge is holding a waker the app does not fill, so every \
+             thread it starts — the serial GPS reader, the Android theme \
+             poller — asks for frames that nobody hears"
+        );
+    }
+
+    /// The entry points' own producers — `android_main`'s location and compass
+    /// threads, the browser's `watchPosition` watch — are not the bridge's, and
+    /// take their handle from here. Same slot, same reasoning.
+    #[test]
+    fn every_handle_the_app_gives_out_is_the_same_slot() {
+        let app = headless(TestBridge::desktop());
+        let woke = count_wakes(&app.redraw_waker());
+
+        // What `android_main` and `entry::start` keep: a clone taken at
+        // startup, several seconds before the first `resumed()`.
+        app.redraw_waker().wake();
+
+        assert_eq!(woke.load(Ordering::SeqCst), 1);
+    }
+
+    /// The window half of the wiring. `create_window` takes an
+    /// `ActiveEventLoop`, so this is a source probe for the reason
+    /// `both_inset_queries_are_still_wired` is.
+    ///
+    /// Two claims. That the slot is filled at all — without it every producer's
+    /// wake is a no-op forever and the app is exactly as broken as before, with
+    /// the tests above still green because they install their own. And that
+    /// what goes in is `notify_redraw`: a wake that reaches anything *other*
+    /// than a redraw request produces an iteration, and the sensor channels are
+    /// drained on a frame.
+    #[test]
+    fn the_window_teaches_every_outstanding_waker_what_a_wake_means() {
+        let body = fn_body("fn create_window(");
+        assert!(
+            body.contains("self.redraw_waker.install("),
+            "the window came up without filling the waker slot, so every sensor \
+             thread's wake is a no-op for the life of the process: {body}"
+        );
+        assert!(
+            body.contains("notify_redraw("),
+            "the waker no longer ends in a redraw request, so a fix wakes the \
+             loop for an iteration that never drains the channel: {body}"
+        );
+    }
+
+    /// And the teardown. `suspended` clears `window` and `state` precisely so
+    /// no wgpu surface outlives the destroyed window; the waker is the third
+    /// holder of that window and the only one this thread does not own outright
+    /// — five sensor threads have a clone. Surviving the suspend is the bug.
+    ///
+    /// Probed rather than driven: `suspended` takes an `ActiveEventLoop`.
+    #[test]
+    fn a_waker_stops_holding_the_window_once_the_app_is_suspended() {
+        let body = fn_body("fn suspended(");
+        assert!(
+            body.contains("self.window = None"),
+            "the premise of this test is gone: suspend no longer drops the \
+             window, so there is nothing for the waker to be holding past it"
+        );
+        assert!(
+            body.contains("self.redraw_waker.detach()"),
+            "the waker keeps the destroyed window alive across a suspend, so \
+             every sensor thread holds an Arc<Window> whose ANativeWindow is \
+             gone: {body}"
         );
     }
 

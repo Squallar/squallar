@@ -33,7 +33,7 @@
 //! Nothing here is `Send`: `App` never requires it of a bridge, and `Rc` keeps
 //! the shared handles cheap.
 
-use crate::platform::{PlatformBridge, drain_latest};
+use crate::platform::{PlatformBridge, RedrawWaker, drain_latest};
 use rustdar_egui::config_store::{ConfigStore, MemoryConfigStore};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -74,6 +74,18 @@ impl ConfigStore for SharedStore {
 /// `gps_active` alone cannot tell.
 pub(crate) type GpsRecord = Rc<RefCell<Option<rustdar_gps::GpsConfig>>>;
 
+/// The [`RedrawWaker`] the app handed this bridge, or a fresh empty one if it
+/// never did.
+///
+/// The second thing here kept behind a shared handle rather than read back
+/// through a getter, and for the same reason as [`GpsRecord`]: the real bridges
+/// spend a waker on threads (`DesktopPlatform::start_gps`,
+/// `AndroidPlatform::set_theme_detector`) that this double deliberately does not
+/// start, so there is no downstream observable to ask. Waking through it and
+/// watching what the *app* installed fire is what puts production code between
+/// the fixture and the assertion.
+pub(crate) type WakerRecord = Rc<RefCell<RedrawWaker>>;
+
 pub(crate) struct TestBridge {
     /// `false` on iOS, where `exit()` is an App Store rejection.
     supports_exit: bool,
@@ -106,6 +118,8 @@ pub(crate) struct TestBridge {
     gps_fix_receiver: Option<Receiver<rustdar_gps::GpsFix>>,
     heading_receiver: Option<Receiver<f32>>,
     gps: GpsRecord,
+    /// See [`WakerRecord`].
+    waker: WakerRecord,
     writes: Rc<std::cell::Cell<usize>>,
     /// What `iana_timezone` answers. `None` stands for the platforms and
     /// environments that cannot say — a container with no zone configured, or a
@@ -130,6 +144,7 @@ impl TestBridge {
             gps_fix_receiver: None,
             heading_receiver: None,
             gps: Rc::new(RefCell::new(None)),
+            waker: Rc::new(RefCell::new(RedrawWaker::new())),
             writes: Rc::new(std::cell::Cell::new(0)),
             timezone: None,
         }
@@ -182,6 +197,12 @@ impl TestBridge {
     /// See [`GpsRecord`].
     pub(crate) fn gps_record(&self) -> GpsRecord {
         Rc::clone(&self.gps)
+    }
+
+    /// See [`WakerRecord`]. Taken before the bridge is boxed into an `App`,
+    /// like every other handle here.
+    pub(crate) fn waker_record(&self) -> WakerRecord {
+        Rc::clone(&self.waker)
     }
 
     /// Report `zone` as the device's IANA timezone.
@@ -294,6 +315,12 @@ impl PlatformBridge for TestBridge {
 
     fn supports_exit(&self) -> bool {
         self.supports_exit
+    }
+
+    /// Kept, as the real bridges keep it — they hand it to threads this double
+    /// does not start, so [`WakerRecord`] is where a test picks it up.
+    fn set_redraw_waker(&mut self, waker: RedrawWaker) {
+        *self.waker.borrow_mut() = waker;
     }
 
     fn set_gps_fix_receiver(&mut self, receiver: Receiver<rustdar_gps::GpsFix>) {

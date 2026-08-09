@@ -419,7 +419,33 @@ fn start_location_updates() -> bool {
 /// a permission is granted -- switches real location updates on via
 /// [`start_location_updates`], without which the poll below can read null
 /// forever on a device where no other app is requesting location.
-fn start_location_thread(sender: std::sync::mpsc::Sender<rustdar_gps::GpsFix>) {
+///
+/// # `wake`
+///
+/// Called after each fix reaches the channel. The frontend drains that channel
+/// from `App::poll_platform_state`, which runs only while rendering a frame,
+/// and the loop sits on `ControlFlow::Wait` -- so without this a fix pushed
+/// from here is invisible until something unrelated happens to draw one. It is
+/// `rustdar_frontend::platform::RedrawWaker::wake` in production.
+///
+/// **Not** [`EVENT_LOOP_PROXY`], and the difference is not that the proxy would
+/// fail to wake the loop -- it would. It is that a proxy wake surfaces as
+/// `ApplicationHandler::user_event`, which `App` does not override, so it
+/// produces an *iteration* and not a *frame*; the back press below is collected
+/// in `about_to_wait` and is happy with an iteration, while a GPS fix is drained
+/// on the frame and is not. `Window::request_redraw` -- which is what the waker
+/// ends in -- is also the stronger wake on this platform specifically: it sets
+/// `redraw_flag` before `waker.wake()`, and the backend drops a bare
+/// `PollEvent::Wake` unless a redraw or a user event is already outstanding.
+///
+/// A bare `impl Fn()` rather than the concrete waker type: under the
+/// `jni-typecheck` feature this crate compiles for the host, where
+/// `rustdar-frontend` is not a dependency at all (see Cargo.toml) and the type
+/// cannot be named.
+fn start_location_thread(
+    sender: std::sync::mpsc::Sender<rustdar_gps::GpsFix>,
+    wake: impl Fn() + Send + 'static,
+) {
     std::thread::Builder::new()
         .name("gps-location".into())
         .spawn(move || {
@@ -460,10 +486,11 @@ fn start_location_thread(sender: std::sync::mpsc::Sender<rustdar_gps::GpsFix>) {
                     if !updates_started {
                         updates_started = start_location_updates();
                     }
-                    if let Some(fix) = get_last_known_location()
-                        && sender.send(fix).is_err()
-                    {
-                        break; // channel closed
+                    if let Some(fix) = get_last_known_location() {
+                        if sender.send(fix).is_err() {
+                            break; // channel closed
+                        }
+                        wake();
                     }
                 } else if requests_made < MAX_PERMISSION_REQUESTS {
                     log::info!(
@@ -842,6 +869,23 @@ static BACK_PRESS_PENDING: std::sync::atomic::AtomicBool =
 /// Empty until [`android_main`] builds the loop, which is after
 /// [`register_java_helper`] has already registered `BackHandler`; presses in
 /// that window are what the Java side's fallback covers.
+///
+/// # Why the sensor threads do not use this
+///
+/// They wake the loop through `Window::request_redraw` instead (see
+/// [`start_location_thread`]), and the split is about what each side needs
+/// delivered rather than about which mechanism wakes harder.
+///
+/// A back press is collected in `App::about_to_wait`, which every dispatch
+/// reaches, so it needs an *iteration* — and `send_event` is what guarantees
+/// one here, because it queues a user event and the Android backend drops a
+/// bare `PollEvent::Wake` when nothing is outstanding. A GPS fix, a heading or
+/// a theme reading is drained by `App::poll_platform_state`, which runs only
+/// from `handle_redraw`, so it needs a *frame*; `user_event` is not overridden
+/// on `App` and would not produce one. `request_redraw` sets `redraw_flag`
+/// before its own `waker.wake()`, so it survives the same drop this one
+/// documents, and it is `Send + Sync` on every backend without a per-entry-point
+/// proxy to thread through the three that build event loops.
 #[cfg(target_os = "android")]
 static EVENT_LOOP_PROXY: std::sync::Mutex<Option<winit::event_loop::EventLoopProxy<()>>> =
     std::sync::Mutex::new(None);
@@ -991,7 +1035,15 @@ fn get_compass_heading() -> Option<f32> {
 
 /// Start a background thread that polls the compass heading every 200ms and
 /// sends updates through the provided channel.
-fn start_compass_thread(sender: std::sync::mpsc::Sender<f32>) {
+///
+/// `wake` is the same handle, for the same reason, as
+/// [`start_location_thread`]'s -- with one extra consequence at this cadence:
+/// the heading is read five times a second, and the reading moves whenever the
+/// device is held in a human hand, so this is the producer that would most
+/// often be asking for a frame nothing else would have drawn. That is the
+/// feature working (a heading-up map that does not turn is broken), and it is
+/// bounded by the poll interval either way.
+fn start_compass_thread(sender: std::sync::mpsc::Sender<f32>, wake: impl Fn() + Send + 'static) {
     std::thread::Builder::new()
         .name("compass-heading".into())
         .spawn(move || {
@@ -999,10 +1051,11 @@ fn start_compass_thread(sender: std::sync::mpsc::Sender<f32>) {
             std::thread::sleep(std::time::Duration::from_secs(4));
 
             loop {
-                if let Some(heading) = get_compass_heading()
-                    && sender.send(heading).is_err()
-                {
-                    break; // channel closed
+                if let Some(heading) = get_compass_heading() {
+                    if sender.send(heading).is_err() {
+                        break; // channel closed
+                    }
+                    wake();
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
@@ -1277,14 +1330,22 @@ fn android_main(app: AndroidApp) {
     // light/dark switch; it also answers the initial query on the first frame.
     platform_app.set_theme_detector(detect_dark_theme);
 
+    // Both threads below ask for the frame their value will be read on through
+    // a handle that is *empty right now* -- the window does not exist until the
+    // first `resumed()`, which is inside `run_app`. That is the whole reason it
+    // is a slot they share rather than a window handle each takes a copy of;
+    // see `rustdar_frontend::platform::RedrawWaker`.
+
     // Start GPS location polling thread and wire it to the app
     let (location_sender, location_receiver) = std::sync::mpsc::channel();
-    start_location_thread(location_sender);
+    let location_waker = platform_app.redraw_waker();
+    start_location_thread(location_sender, move || location_waker.wake());
     platform_app.set_gps_fix_receiver(location_receiver);
 
     // Start compass heading thread and wire it to the app
     let (heading_sender, heading_receiver) = std::sync::mpsc::channel();
-    start_compass_thread(heading_sender);
+    let heading_waker = platform_app.redraw_waker();
+    start_compass_thread(heading_sender, move || heading_waker.wake());
     platform_app.set_heading_receiver(heading_receiver);
 
     if let Err(e) = event_loop.run_app(&mut platform_app) {

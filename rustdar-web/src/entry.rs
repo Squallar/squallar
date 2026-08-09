@@ -18,8 +18,18 @@ const CANVAS_ID: &str = "rustdar-canvas";
 /// `Wait`, not `Poll`: `Poll` schedules through winit's web scheduler
 /// (`Scheduler.postTask`), whose teardown via `AbortController.abort()` is a
 /// large fraction of Firefox main-thread time — all wasted for an app that only
-/// redraws on change. Every async completion here ends in `notify_redraw`, so
-/// nothing depends on an unbidden frame.
+/// redraws on change. Every async completion here asks for a frame when it
+/// lands, so nothing depends on an unbidden one.
+///
+/// That last sentence used to say every completion "ends in `notify_redraw`",
+/// and it was not true of [`geolocation::start_watch`]: its success callback
+/// pushed the fix into a channel that is drained only while rendering and
+/// stopped there, so under `Wait` a browser location update was invisible until
+/// something else drew. It now takes the app's [`RedrawWaker`], which is why the
+/// app is built first below.
+///
+/// [`geolocation::start_watch`]: crate::geolocation::start_watch
+/// [`RedrawWaker`]: rustdar_frontend::platform::RedrawWaker
 #[wasm_bindgen]
 pub fn start() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
@@ -41,11 +51,16 @@ pub fn start() -> Result<(), JsValue> {
     // thread until the worker answers, and forever if it does not.
     crate::worker_port::attach();
 
-    let (fix_sender, fix_receiver) = std::sync::mpsc::channel();
-    crate::geolocation::start_watch(fix_sender);
-
     let platform = crate::bridge::WebPlatform::new(canvas);
     let mut app = rustdar_frontend::app::App::new(Box::new(platform));
+
+    // The watch is started after the app, not before it, because it needs the
+    // app's waker. There is no window behind that waker yet — the first one is
+    // created on the `resumed()` that `spawn_app` below leads to — and there
+    // does not need to be: the waker is a slot every producer shares, and
+    // `create_window` fills it for all of them at once.
+    let (fix_sender, fix_receiver) = std::sync::mpsc::channel();
+    crate::geolocation::start_watch(fix_sender, app.redraw_waker());
     app.set_gps_fix_receiver(fix_receiver);
 
     event_loop.spawn_app(app);

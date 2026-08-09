@@ -122,7 +122,28 @@ impl SerialGpsReader {
     /// seconds and the caller is the GUI thread — so the reader is returned
     /// before any port is confirmed; if none ever turns up, the thread keeps
     /// retrying detection until the reader is dropped.
-    pub fn start(config: &GpsConfig, fix_sender: mpsc::Sender<GpsFix>) -> Option<Self> {
+    ///
+    /// # `wake`
+    ///
+    /// Called after every fix that reaches `fix_sender`, and it is what makes
+    /// the fix *visible*. The frontend runs its event loop on
+    /// `ControlFlow::Wait` and drains this channel only while rendering a
+    /// frame, so a fix pushed from this thread while the app is idle waits for
+    /// some unrelated event to produce one — with auto-refresh off, that can be
+    /// the next mouse move, or never.
+    ///
+    /// A bare `impl Fn()` rather than the frontend's `RedrawWaker`: this crate
+    /// is a *dependency* of the frontend and cannot name its types. The desktop
+    /// bridge passes one through; the shape matches
+    /// `ChunkNotifier::sync_sites`, which takes a `wake` for the same reason.
+    ///
+    /// `Send` and not `Sync`, because the closure is moved into one thread and
+    /// shared with none.
+    pub fn start(
+        config: &GpsConfig,
+        fix_sender: mpsc::Sender<GpsFix>,
+        wake: impl Fn() + Send + 'static,
+    ) -> Option<Self> {
         let configured_port = config.port_path.clone();
         let auto_baud = config.auto_baud();
         let configured_baud = config.baud_rate;
@@ -141,7 +162,7 @@ impl SerialGpsReader {
                     configured_baud
                 };
                 log::info!("Starting GPS reader on {} @ {} baud", port_name, baud);
-                gps_read_loop(&port_name, baud, &fix_sender, &stop_rx);
+                gps_read_loop(&port_name, baud, &fix_sender, &stop_rx, &wake);
             })
             .expect("failed to spawn gps-serial thread");
 
@@ -149,6 +170,22 @@ impl SerialGpsReader {
             _stop_signal: stop_tx,
         })
     }
+}
+
+/// Hand one parsed sentence's outcome to the consumer, and say whether the
+/// reader may keep going.
+///
+/// Split out of [`gps_read_loop`]'s inner match so the pairing can be tested
+/// without a serial port: the send and the wake are one step, and a wake that
+/// gets separated from its send is a fix that sits in the channel until
+/// something else draws a frame — the exact failure this parameter exists for.
+/// `false` means the consumer is gone and the thread should stop.
+fn deliver(fix: GpsFix, fix_sender: &mpsc::Sender<GpsFix>, wake: &impl Fn()) -> bool {
+    if fix_sender.send(fix).is_err() {
+        return false;
+    }
+    wake();
+    true
 }
 
 /// The configured port when set, otherwise the first detected port — retrying
@@ -187,6 +224,7 @@ fn gps_read_loop(
     baud: u32,
     fix_sender: &mpsc::Sender<GpsFix>,
     stop_rx: &mpsc::Receiver<()>,
+    wake: &impl Fn(),
 ) {
     loop {
         if should_stop(stop_rx) {
@@ -239,7 +277,7 @@ fn gps_read_loop(
                 Ok(_) => {
                     let trimmed = line.trim();
                     if let Some(fix) = nmea.feed_sentence(trimmed)
-                        && fix_sender.send(fix).is_err()
+                        && !deliver(fix, fix_sender, wake)
                     {
                         log::info!("GPS fix channel closed, stopping reader");
                         return;
@@ -291,5 +329,56 @@ mod tests {
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         drop(stop_tx);
         assert!(should_stop(&stop_rx));
+    }
+
+    /// A counting wake, and the count.
+    fn counted() -> (
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        impl Fn() + Send,
+    ) {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = std::sync::Arc::clone(&count);
+        (count, move || {
+            probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+    }
+
+    fn woke(count: &std::sync::atomic::AtomicUsize) -> usize {
+        count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The bug this parameter exists for. The consumer drains this channel only
+    /// while drawing a frame, and its loop runs on `ControlFlow::Wait`: a fix
+    /// that lands with nothing else happening sits there until some unrelated
+    /// event draws one.
+    #[test]
+    fn a_fix_arriving_while_the_app_is_idle_asks_for_the_frame_that_shows_it() {
+        let (tx, rx) = mpsc::channel();
+        let (woken, wake) = counted();
+
+        assert!(deliver(GpsFix::from_lat_lon(35.25, -97.5), &tx, &wake));
+
+        assert_eq!(rx.try_recv().map(|f| f.latitude), Ok(35.25));
+        assert_eq!(
+            woke(&woken),
+            1,
+            "the fix reached the channel and nothing asked for the frame that \
+             would read it"
+        );
+    }
+
+    /// The reader stops when the app is gone, and must not wake something that
+    /// no longer exists on the way out.
+    #[test]
+    fn a_fix_with_no_consumer_left_stops_the_reader_without_waking() {
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        let (woken, wake) = counted();
+
+        assert!(
+            !deliver(GpsFix::from_lat_lon(35.25, -97.5), &tx, &wake),
+            "a closed channel must stop the reader"
+        );
+        assert_eq!(woke(&woken), 0, "woke the loop for a fix nothing received");
     }
 }

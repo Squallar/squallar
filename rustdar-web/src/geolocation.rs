@@ -68,8 +68,24 @@ pub fn browser_timezone() -> Option<String> {
 ///
 /// A refused permission arrives as an error callback and leaves the channel
 /// empty forever, which is the same observable state as a desktop with no GPS.
+///
+/// # `waker`
+///
+/// The success callback is invoked by the browser, not by the event loop, and
+/// the loop is on `ControlFlow::Wait`. `App::poll_platform_state` drains this
+/// channel only while rendering, so a reading that lands with the page idle
+/// waits for the next pointer move or resize. This was the one place in this
+/// crate that handed the app a value and did not ask for the frame that reads
+/// it — the worker's replies go out through `offload`'s per-job `deliver`,
+/// which does — despite what `entry::start`'s comment claimed of all of them.
+///
+/// `request_redraw` on the web backend is `requestAnimationFrame`, so this is
+/// one frame per reading, not a poll.
 #[cfg(target_arch = "wasm32")]
-pub fn start_watch(sender: std::sync::mpsc::Sender<GpsFix>) {
+pub fn start_watch(
+    sender: std::sync::mpsc::Sender<GpsFix>,
+    waker: rustdar_frontend::platform::RedrawWaker,
+) {
     use wasm_bindgen::JsCast;
     use wasm_bindgen::prelude::Closure;
 
@@ -91,7 +107,9 @@ pub fn start_watch(sender: std::sync::mpsc::Sender<GpsFix>) {
             // A closed receiver means the app is gone; the watch dies with the page.
             if sender.send(fix).is_err() {
                 log::debug!("GPS receiver dropped; geolocation updates have nowhere to go");
+                return;
             }
+            waker.wake();
         });
 
     let on_error =
