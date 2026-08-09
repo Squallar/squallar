@@ -169,11 +169,12 @@
 //! is short on all of them.
 //!
 //! `KDDC` is the one left undecided, on three volumes each time — genuinely
-//! thin, and it is twentieth in `SITES`, so a run reaches it only when most of
-//! the list is quiet. If one does it will probably fail. Re-survey on a day it
-//! carries a vector for longer, then quarantine or clear it; do not leave it
-//! undecided indefinitely. Note that "thin evidence" was the reasoning that
-//! left `KUEX` out for a round, and `KUEX` then failed a live run.
+//! thin, and it is twentieth in the harness branch's `SITES`, so a run
+//! reaches it only when most of the list is quiet. If one does it will
+//! probably fail. Re-survey on a day it carries a vector for longer, then
+//! quarantine or clear it; do not leave it undecided indefinitely. Note that
+//! "thin evidence" was the reasoning that left `KUEX` out for a round, and
+//! `KUEX` then failed a live run.
 //!
 //! Expect this list to grow as more sites are surveyed on more days. It is a
 //! statement about the half-degree recombination, not about those radars.

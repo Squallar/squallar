@@ -3,23 +3,21 @@
 //!
 //! Two layers. [`compare`] is pure math — wasm-safe, no network — shipped
 //! code called at runtime by the render and VILD paths, and shared by the
-//! product harnesses (EET, DVL, KDP, HCA, DPR). [`live`] was the native,
+//! product harnesses (EET, DVL, KDP, HCA, DPR). `live` was the native,
 //! test-only layer that finds the twin in the first place: the archived
 //! Level II volume nearest a moment, and the Level III bucket object
 //! generated from that very volume — never merely the newest key, which
 //! SAILS republishing makes a mid-volume repeat more often than not.
 //!
 //! **The live rigs live on branch `campaign-harness`**, not here: `l3_twin`,
-//! the per-product `live_validation` harnesses, their `validation_policy`
-//! modules and offline policy pins, the `compare_l3` example, and
-//! `live_elevation_audit`. Check that branch out and run a rig with e.g.
+//! the site roster and its two Level II fetchers, the per-product
+//! `live_validation` harnesses, their `validation_policy` modules and offline
+//! policy pins, the `compare_l3` example, and `live_elevation_audit`. Check
+//! that branch out and run a rig with e.g.
 //!
 //! ```text
 //! cargo test -p rustdar-radar --release --lib -- --ignored --nocapture live_
 //! ```
-//!
-//! What remains of [`live`] on this branch is the site roster and the two
-//! Level II fetchers that `sampler.rs`'s deferred ladder probe still reads.
 
 /// Pure-math comparison of a derived grid against a decoded Level III radial
 /// product. Everything here is deterministic and network-free.
@@ -309,68 +307,6 @@ pub mod compare {
             }
         }
         t
-    }
-}
-
-/// What remains of the live-twin rig: the full apparatus — `l3_twin`, the
-/// oracle pairing, the per-product validation harnesses — lives on branch
-/// `campaign-harness`. These two fetchers and the roster stay only because
-/// `sampler.rs`'s `live_the_ported_ladder_is_the_originals` still reads them;
-/// they leave with it once that probe moves to the harness branch too.
-#[cfg(all(test, not(target_arch = "wasm32")))]
-pub mod live {
-    use crate::archive;
-    use crate::sources::DataSources;
-    use chrono::NaiveDateTime;
-    use nexrad_model::data::Scan;
-
-    /// Sites are tried in order until one yields a volume. Long and
-    /// geographically spread so a calm night over any one region does not
-    /// starve the sample. The full roster's quarantine history is recorded on
-    /// branch `campaign-harness`.
-    pub const SITES: &[&str] = &[
-        "KMPX", "KFSD", "KBIS", "KOAX", "KUEX", "KABR", "KTLX", "KMRX", "KTLH", "KMOB", "KSGF",
-        "KPAH", "KMLB", "KMTX", "KSFX", "KMVX", "KLZK", "KSHV", "KEAX", "KDDC", "KAMA", "KFWS",
-    ];
-
-    /// The archived Level II volume nearest `when`, as the **raw file**: the
-    /// undecoded archive plus the volume start its identifier names. Looks at
-    /// the previous UTC day too, and skips the `_MDM` sidecars the listing
-    /// interleaves.
-    pub async fn l2_archive_near(
-        site: &str,
-        when: NaiveDateTime,
-    ) -> Option<(nexrad_data::volume::File, NaiveDateTime)> {
-        crate::tls::init();
-        let sources = DataSources::production();
-        let mut nearest: Option<(i64, NaiveDateTime, archive::Identifier)> = None;
-        for day in [when.date(), when.date() - chrono::Duration::days(1)] {
-            let Ok(ids) = archive::list_files(&sources, site, &day).await else {
-                continue;
-            };
-            for id in ids {
-                if id.name().ends_with("_MDM") {
-                    continue;
-                }
-                let Some(start) = id.date_time() else {
-                    continue;
-                };
-                let start = start.naive_utc();
-                let delta = (start - when).num_seconds().abs();
-                if nearest.as_ref().is_none_or(|(d, ..)| delta < *d) {
-                    nearest = Some((delta, start, id));
-                }
-            }
-        }
-        let (_, start, id) = nearest?;
-        let file = archive::download_file(&sources, id).await.ok()?;
-        Some((file, start))
-    }
-
-    /// [`l2_archive_near`], decoded: the scan and its volume start.
-    pub async fn l2_volume_near(site: &str, when: NaiveDateTime) -> Option<(Scan, NaiveDateTime)> {
-        let (file, start) = l2_archive_near(site, when).await?;
-        Some((file.scan().ok()?, start))
     }
 }
 

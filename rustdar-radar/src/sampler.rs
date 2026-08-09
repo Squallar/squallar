@@ -2522,69 +2522,6 @@ mod tests {
         }
     }
 
-    /// The same claim on a **real** volume off the archive, where the cut
-    /// table, the split cuts, the SAILS repeats and the settling drift are all
-    /// whatever the RDA actually flew rather than whatever a fixture author
-    /// thought of.
-    ///
-    /// ```text
-    /// cargo test -p rustdar-radar --release -- --ignored --nocapture live_the_ported_ladder
-    /// ```
-    ///
-    /// Walks sites until one yields a volume, so a quiet or missing site does
-    /// not fail the run; the assertion is about the port, not about the weather.
-    /// Host-only: `twin::live` and the `tokio` dev-dependency are both
-    /// `cfg(not(target_arch = "wasm32"))`, so an ungated harness here fails the
-    /// wasm `--all-targets` row — which builds dev-dependencies too.
-    #[cfg(not(target_arch = "wasm32"))]
-    #[ignore = "hits the live S3 bucket"]
-    #[tokio::test]
-    async fn live_the_ported_ladder_is_the_originals() {
-        let now = chrono::Utc::now().naive_utc();
-        let mut checked = 0;
-        for site in crate::twin::live::SITES.iter().take(6) {
-            let Some((scan, start)) = crate::twin::live::l2_volume_near(site, now).await else {
-                continue;
-            };
-            let cuts = scan.coverage_pattern().elevation_cuts().len();
-            println!(
-                "{site} {start}: VCP {:?}, {} sweeps, {cuts} declared cuts",
-                scan.coverage_pattern().pattern_number(),
-                scan.sweeps().len(),
-            );
-            if cuts == 0 {
-                println!("  no cut table on this volume; skipping");
-                continue;
-            }
-            for product in [RadarProduct::Reflectivity, RadarProduct::Velocity] {
-                let original = VolumeSampler::new(&scan, product).expect("a real volume samples");
-                let input =
-                    crate::render_input::RenderInput::extract_volume(&scan, product, 0.0, 0.0)
-                        .expect("a real volume carries the moment");
-                let bytes = input.to_bytes();
-                let decoded = crate::render_input::RenderInput::from_bytes(&bytes)
-                    .expect("the payload round-trips");
-                let reconstructed = decoded.to_scan();
-                let ported = VolumeSampler::new(&reconstructed, product)
-                    .expect("the reconstructed volume samples");
-                println!(
-                    "  {product:?} {:>9} bytes\n    was {original:?}\n    now {ported:?}",
-                    bytes.len()
-                );
-                assert_eq!(
-                    format!("{ported:?}"),
-                    format!("{original:?}"),
-                    "{site} {product:?}: the worker's ladder is not the main thread's",
-                );
-            }
-            checked += 1;
-            if checked == 2 {
-                return;
-            }
-        }
-        panic!("no site yielded an archived volume with a cut table");
-    }
-
     /// The two near-angle base tilts stay apart across the port — the thing no
     /// angular threshold can do — and the SAILS repeat still fuses into its own
     /// cut and still wins it on recency. Asserted on the *reconstructed* scan
