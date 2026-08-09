@@ -326,6 +326,14 @@ pub struct App {
     /// `Arc` because the painter handed to the `Gui` reads it during the UI
     /// pass, while this side writes it from the action handler.
     volume_store: std::sync::Arc<crate::volume::bridge::VolumeStore>,
+    /// How many times [`extract_current_volume`] has run — the call-count
+    /// seam for the tests that pin *when* the frame thread pays for the
+    /// merged-volume walk, the same property the section path carries in its
+    /// extraction closure.
+    ///
+    /// [`extract_current_volume`]: App::extract_current_volume
+    #[cfg(test)]
+    pub(crate) volume_extractions: std::cell::Cell<u32>,
 }
 
 /// Bookkeeping for the periodic config write.
@@ -557,6 +565,8 @@ impl App {
             },
             site_is_provisional,
             volume_store: std::sync::Arc::new(crate::volume::bridge::VolumeStore::new()),
+            #[cfg(test)]
+            volume_extractions: std::cell::Cell::new(0),
             http_client,
             #[cfg(not(target_arch = "wasm32"))]
             tokio_runtime,
@@ -975,6 +985,18 @@ impl App {
             return;
         };
 
+        // The budget gate, **before** the extraction — the same shape
+        // `spawn_section_render` has built in. The extraction below is the
+        // full merged-volume walk and copy, multi-ms on the frame thread, and
+        // `PrepareVolume` is level-triggered: refused *after* extracting, the
+        // walk repeats every frame until a slot frees — on wasm, where the
+        // budget is 1, that is a per-frame multi-ms stall behind any
+        // in-flight render. `spawn_voxel_build`'s own check stays as the
+        // belt; this one is what decides whether the walk is paid at all.
+        if !self.render.render_slot_free() {
+            return;
+        }
+
         let started = web_time::Instant::now();
         let Some(input) = self.extract_current_volume(&target.volume.site, target.product) else {
             // The merged volume carries this moment nowhere — the same answer
@@ -1065,6 +1087,9 @@ impl App {
         site: &str,
         product: rustdar_radar::types::RadarProduct,
     ) -> Option<rustdar_radar::render_input::RenderInput> {
+        #[cfg(test)]
+        self.volume_extractions
+            .set(self.volume_extractions.get() + 1);
         let radar = rustdar_radar::sites::get_radar_site(site)?;
         let base = self.base_scans.get(site).map(|(scan, _)| Arc::clone(scan));
         let overlay = self.chunk_feeds.snapshot(site);
@@ -4379,6 +4404,75 @@ mod chunk_feed_precedence_tests {
             based.volume_store.lookup(&target).is_some(),
             "the 3D pane was offered a base volume and the build never \
              reached it, so the pane waits for ever",
+        );
+    }
+
+    /// **A budget-refused frame pays nothing for the refusal.** The voxel
+    /// path used to run `extract_current_volume` — the full merged-volume
+    /// walk and copy, multi-ms on the frame thread — and *then* ask
+    /// `spawn_voxel_build`, which refuses on a full budget with nothing
+    /// marked. `PrepareVolume` is level-triggered, so the pane re-asked and
+    /// the extraction repeated every frame until a slot freed — on wasm,
+    /// where the budget is 1, any in-flight render made a pending 3D rebuild
+    /// a per-frame multi-ms stall. The section path's shape is the model:
+    /// the budget gate runs before the extraction closure, so the walk is
+    /// paid exactly when a slot is actually taken.
+    #[test]
+    fn a_full_budget_refuses_the_3d_ask_before_paying_the_extraction() {
+        use crate::constants::MAX_CONCURRENT_RENDERS;
+        use std::sync::atomic::Ordering;
+
+        let target = rustdar_egui::pane::VolumeTarget {
+            volume: rustdar_egui::pane::VolumeStamp {
+                site: "KTLX".to_owned(),
+                collected: at(10),
+            },
+            product: rustdar_radar::types::RadarProduct::Reflectivity,
+            region: None,
+        };
+        let mut app = headless(TestBridge::desktop());
+        app.base_scans
+            .insert("KTLX".to_string(), (Arc::new(stamped_scan(10)), at(10)));
+
+        // Every slot is taken. Several frames of the level-triggered ask
+        // arrive, as they do while a render is in flight.
+        app.render
+            .renders_in_flight
+            .store(MAX_CONCURRENT_RENDERS, Ordering::Relaxed);
+        for _ in 0..3 {
+            app.handle_prepare_volume(0, target.clone());
+        }
+        assert_eq!(
+            app.volume_extractions.get(),
+            0,
+            "a budget-refused frame paid the multi-ms merged-volume walk, and \
+             the level-triggered pane repeats it every frame until a slot frees",
+        );
+        assert!(
+            app.volume_store.lookup(&target).is_none(),
+            "the ask must stay pending: nothing dispatched and nothing marked",
+        );
+
+        // A slot frees: exactly one extraction, and the build dispatches.
+        app.render.renders_in_flight.store(0, Ordering::Relaxed);
+        app.handle_prepare_volume(0, target.clone());
+        assert_eq!(
+            app.volume_extractions.get(),
+            1,
+            "the freed slot performs exactly one extraction",
+        );
+        assert!(
+            app.volume_store.lookup(&target).is_some(),
+            "the freed slot dispatches the build",
+        );
+
+        // And the next frame attaches to the `Building` entry rather than
+        // extracting again — the dedupe gate stays ahead of the walk.
+        app.handle_prepare_volume(0, target.clone());
+        assert_eq!(
+            app.volume_extractions.get(),
+            1,
+            "the level-triggered re-ask must attach, not re-extract",
         );
     }
 

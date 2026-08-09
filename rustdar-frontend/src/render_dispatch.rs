@@ -1206,6 +1206,20 @@ impl RenderDispatcher {
         true
     }
 
+    /// Whether a render slot is free right now — the caller's pre-flight for
+    /// work that is only worth paying when a dispatch can actually follow.
+    ///
+    /// `handle_prepare_volume` reads this **before** running the merged-volume
+    /// extraction, the same shape [`Self::spawn_section_render`] has built in:
+    /// budget first, extraction only when a slot will be taken. Advisory by
+    /// nature — the count can move between this and the spawn — but every
+    /// increment happens on the frame thread, so within one handler a `true`
+    /// cannot turn stale (workers only ever *free* slots), and a `false` costs
+    /// a frame's retry exactly as the spawn's own refusal does.
+    pub fn render_slot_free(&self) -> bool {
+        self.renders_in_flight.load(Ordering::Relaxed) < MAX_CONCURRENT_RENDERS
+    }
+
     /// Resample a volume into a voxel grid, away from the frame thread.
     ///
     /// Returns `false` when the render budget is full — the caller dispatches
