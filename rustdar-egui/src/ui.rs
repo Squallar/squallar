@@ -43,6 +43,11 @@ pub(crate) use ui_menu::REGION_ARM_LABEL;
 pub(crate) use ui_menu::VOLUME_PANE_LABEL;
 #[path = "ui_map.rs"]
 pub(crate) mod map;
+/// The 3D block's sidebar header, for the input harness — so the test that
+/// pins the sidebar's shared structure names the header the panel really
+/// draws rather than keeping its own copy of it.
+#[cfg(test)]
+pub(crate) use map::VOLUME_SIDEBAR_HEADER;
 /// Re-exported so the input harness can name it: `map` is private to this
 /// module, and the probe is the only thing outside it that has to be.
 #[cfg(test)]
@@ -52,11 +57,6 @@ pub(crate) use map::VolumeArmProbe;
 /// keeping its own copy of the sentence. Same arrangement as [`DrawnMenuLeaf`].
 #[cfg(test)]
 pub(crate) use map::{CROSS_SECTION_EMPTY_STATE, VOLUME_EMPTY_STATE};
-/// The 3D block's sidebar header, for the input harness — so the test that
-/// pins the sidebar's shared structure names the header the panel really
-/// draws rather than keeping its own copy of it.
-#[cfg(test)]
-pub(crate) use map::VOLUME_SIDEBAR_HEADER;
 #[path = "ui_settings.rs"]
 mod settings;
 

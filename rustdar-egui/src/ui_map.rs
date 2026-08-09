@@ -1353,8 +1353,7 @@ pub(crate) fn render_volume_controls(ui: &mut egui::Ui, pane: &mut crate::pane::
             let response = ui.add(
                 egui::Slider::new(
                     &mut exaggeration,
-                    crate::pane::MIN_VERTICAL_EXAGGERATION
-                        ..=crate::pane::MAX_VERTICAL_EXAGGERATION,
+                    crate::pane::MIN_VERTICAL_EXAGGERATION..=crate::pane::MAX_VERTICAL_EXAGGERATION,
                 )
                 .suffix("\u{d7}")
                 .fixed_decimals(1),
