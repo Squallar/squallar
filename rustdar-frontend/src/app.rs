@@ -1570,33 +1570,74 @@ impl App {
         );
     }
 
-    /// Arrange for one more frame if a change might still be unsaved.
+    /// Arrange for one more look if a change might still be unsaved.
     ///
-    /// The app runs on `ControlFlow::Wait` and redraws only when something
-    /// happens, which leaves a gap the timer alone cannot close: the user pans
-    /// the map, the pan's final frame lands less than [`AUTOSAVE_INTERVAL`]
-    /// after the previous check, nothing else happens, and the app sleeps
-    /// forever holding an unwritten change. Asking for a wake-up once the
-    /// interval is up gives that change a frame to be saved on.
+    /// The app runs on `ControlFlow::Wait` and wakes only when something
+    /// happens, which leaves a gap the interval alone cannot close: the user
+    /// pans the map, the pan's final frame lands less than
+    /// [`AUTOSAVE_INTERVAL`] after the previous check, nothing else happens,
+    /// and the app sleeps forever holding an unwritten change. Asking for a
+    /// wake-up once the interval is up gives that change an iteration to be
+    /// saved on — an iteration, not a frame, because the timer that grants it
+    /// does not produce one (see [`about_to_wait`]).
     ///
     /// Only when something has actually happened. Scheduling unconditionally
     /// would turn an idle tab into a 0.33 Hz poll for no benefit, which is the
     /// cost `ControlFlow::Wait` was chosen to avoid in the first place.
-    fn schedule_autosave_wakeup(&mut self, event_loop: &ActiveEventLoop) {
+    ///
+    /// [`about_to_wait`]: App::about_to_wait
+    fn schedule_autosave_wakeup(&self, event_loop: &ActiveEventLoop) {
+        event_loop.set_control_flow(self.autosave_control_flow());
+    }
+
+    /// The state the loop should be left in, given what the autosave still
+    /// owes.
+    ///
+    /// Split out of [`schedule_autosave_wakeup`] so the whole decision is
+    /// reachable from a test: an `ActiveEventLoop` cannot be had outside a
+    /// running winit loop, so a function that takes one can only ever be read
+    /// as source.
+    ///
+    /// [`ControlFlow::Wait`] — the loop's resting state, set once at startup by
+    /// each platform's entry point — is the answer whenever nothing is owed,
+    /// and returning it is load-bearing rather than tidy. `set_control_flow` is
+    /// sticky, and a `WaitUntil` is compared against the clock afresh every
+    /// iteration: one left behind after its deadline passes makes every
+    /// subsequent iteration compute a zero timeout, wake immediately, and find
+    /// the same expired deadline. Measured on X11 at winit 0.30.13, that is
+    /// ~164,000 iterations per second on a full core, forever.
+    fn autosave_control_flow(&self) -> ControlFlow {
+        match self.autosave_delay() {
+            // `wait_duration` rather than `WaitUntil`: winit's `Instant` is
+            // `std::time`'s natively and `web_time`'s on wasm, so no single
+            // instant value typechecks for both targets. A duration does, and
+            // the helper also degrades an overflowing deadline to a plain
+            // `Wait`.
+            Some(delay) => ControlFlow::wait_duration(delay),
+            None => ControlFlow::Wait,
+        }
+    }
+
+    /// How long the loop may sleep before the autosave next needs a look, or
+    /// `None` when nothing is owed and it may sleep until something happens.
+    ///
+    /// A duration rather than the deadline it was computed from, for the same
+    /// reason [`autosave_control_flow`] builds its `WaitUntil` out of one: an
+    /// instant here would be `std::time`'s on three platforms and `web_time`'s
+    /// on the fourth, and a test naming either could only be written for half
+    /// the targets it is meant to hold for.
+    ///
+    /// [`autosave_control_flow`]: App::autosave_control_flow
+    fn autosave_delay(&self) -> Option<std::time::Duration> {
         if !self.autosave.touched {
-            return;
+            return None;
         }
         let deadline = self
             .autosave
             .last_check
             .map(|last| last + AUTOSAVE_INTERVAL)
             .unwrap_or_else(web_time::Instant::now);
-        // `wait_duration` rather than `WaitUntil`: winit's `Instant` is
-        // `std::time`'s natively and `web_time`'s on wasm, so no single instant
-        // value typechecks for both targets. A duration does, and the helper
-        // also degrades an overflowing deadline to a plain `Wait`.
-        let delay = deadline.saturating_duration_since(web_time::Instant::now());
-        event_loop.set_control_flow(ControlFlow::wait_duration(delay));
+        Some(deadline.saturating_duration_since(web_time::Instant::now()))
     }
 
     /// Request application exit - handles both GUI and keyboard exit requests
@@ -1918,6 +1959,18 @@ impl ApplicationHandler for App {
         if self.platform.poll_back_press() {
             self.back_out(event_loop);
         }
+        // The save the wake-up below is scheduled for, spent here rather than on
+        // a frame. A `WaitUntil` deadline expiring dispatches `new_events` and
+        // then this — and nothing else. It never delivers `RedrawRequested`, so
+        // `handle_redraw`, the app's only other route into `autosave_config`, is
+        // unreachable from the one timer that exists to reach it.
+        //
+        // Directly rather than by asking for a redraw: the check is a
+        // subtraction until the interval is up and a serialization plus a string
+        // compare after it, against a whole frame — egui pass, texture sampling,
+        // present — to write a few hundred bytes of JSON on a timer whose entire
+        // premise is that the app is otherwise asleep.
+        self.autosave_config(false);
         self.schedule_autosave_wakeup(event_loop);
     }
 
@@ -2955,6 +3008,150 @@ mod tests {
         let mut reloaded = Gui::new();
         assert!(reloaded.load_ui_config(store.as_ref()));
         assert_eq!(reloaded.pane(0).unwrap().site, "KFTG");
+    }
+
+    /// The state a pan leaves behind: an event has been seen, and the last
+    /// autosave check was `ago` in the past. `ago` past [`AUTOSAVE_INTERVAL`]
+    /// is a save that is due; short of it is one still waiting.
+    fn owes_a_save_from(app: &mut App, ago: std::time::Duration) {
+        app.autosave.last_check = Some(web_time::Instant::now() - ago);
+        app.autosave.touched = true;
+    }
+
+    /// Everything an expired `WaitUntil` actually dispatches, and nothing more.
+    ///
+    /// Deliberately not `handle_redraw`: the whole bug is that the timer never
+    /// produces a frame, so a test that renders one is testing the path that
+    /// was already working.
+    fn wake_on_the_timer(app: &mut App) -> ControlFlow {
+        app.autosave_config(false);
+        app.autosave_control_flow()
+    }
+
+    /// A wake-up asked for and granted has to end in the write it was asked
+    /// for.
+    ///
+    /// It did not. `autosave_config` was reachable only from `handle_redraw`,
+    /// and a `WaitUntil` deadline expiring dispatches `new_events` and
+    /// `about_to_wait` — never `RedrawRequested`. So the timer woke the app,
+    /// found no route to the save, and re-armed; the change survived only if
+    /// some unrelated event later drew a frame, and a user who panned and
+    /// walked away lost it.
+    #[test]
+    fn a_timed_wakeup_actually_saves_the_change_it_was_scheduled_for() {
+        let bridge = TestBridge::desktop();
+        let store = bridge.store();
+        let mut app = headless(bridge);
+
+        // The frame the pan ended on: it checked, so nothing was owed yet.
+        app.autosave_config(true);
+        app.gui.loop_speed_fps = STORED_FPS;
+        owes_a_save_from(&mut app, AUTOSAVE_INTERVAL);
+
+        wake_on_the_timer(&mut app);
+
+        assert_eq!(
+            stored_fps(&store),
+            STORED_FPS,
+            "the wake-up spent itself on a reschedule: the change it was \
+             scheduled to save is still unwritten"
+        );
+    }
+
+    /// `about_to_wait` is where the save has to happen, and it takes an
+    /// `ActiveEventLoop` — so this is a source probe for the same reason
+    /// `a_back_press_from_the_platform_reaches_the_funnel_too` is.
+    ///
+    /// The behavioural tests either side of this one drive `autosave_config`
+    /// and `autosave_control_flow` themselves, which says nothing about
+    /// whether the event loop ever reaches them. Drop the call and they all
+    /// stay green while the timer goes back to waking for nothing.
+    #[test]
+    fn the_autosave_wakeup_is_spent_on_a_save_not_only_on_a_reschedule() {
+        let body = fn_body("fn about_to_wait(");
+        assert!(
+            body.contains("self.autosave_config("),
+            "about_to_wait no longer saves, so the only dispatch a WaitUntil \
+             expiry produces cannot reach the config write it was armed for: \
+             {body}"
+        );
+        assert!(
+            body.contains("self.schedule_autosave_wakeup("),
+            "about_to_wait no longer re-arms, so one missed interval ends the \
+             autosave for the life of the process: {body}"
+        );
+    }
+
+    /// A deadline in the past must put the loop back to sleep, not re-arm at
+    /// zero.
+    ///
+    /// `set_control_flow` is sticky and `WaitUntil` is compared against the
+    /// clock every iteration, so an expired deadline left in place — or
+    /// re-armed with a saturated-to-zero delay — is a timeout of zero forever:
+    /// measured at ~164,000 iterations per second on one X11 core, with the
+    /// config still unwritten. This is the half that burns the battery, and it
+    /// survives the save being wired up: the save clears `touched`, and an
+    /// early return that leaves the stale `WaitUntil` alone spins just as hard
+    /// (measured: ~162,000/s).
+    #[test]
+    fn a_passed_autosave_deadline_does_not_re_arm_at_zero_delay() {
+        let mut app = headless(TestBridge::desktop());
+
+        // Well past due, so a deadline recomputed from `last_check` saturates.
+        owes_a_save_from(&mut app, AUTOSAVE_INTERVAL * 4);
+
+        let flow = wake_on_the_timer(&mut app);
+
+        assert_eq!(
+            flow,
+            ControlFlow::Wait,
+            "the loop was left on an expired WaitUntil, which is a zero timeout \
+             on every following iteration — a busy loop that saves nothing"
+        );
+    }
+
+    /// The positive control for the test above: closing the spin must not be
+    /// done by switching the timer off.
+    #[test]
+    fn a_change_inside_the_interval_still_arms_a_timer_for_the_rest_of_it() {
+        let mut app = headless(TestBridge::desktop());
+
+        // A third of the way in, so two thirds are still owed.
+        owes_a_save_from(&mut app, AUTOSAVE_INTERVAL / 3);
+
+        app.autosave_config(false);
+        let Some(delay) = app.autosave_delay() else {
+            panic!(
+                "a change less than one interval old got no wake-up at all, so \
+                 an app that goes quiet now sleeps on it forever"
+            );
+        };
+        assert!(
+            !delay.is_zero() && delay <= AUTOSAVE_INTERVAL,
+            "the re-arm is not the remainder of the interval: {delay:?}"
+        );
+        assert!(
+            matches!(app.autosave_control_flow(), ControlFlow::WaitUntil(_)),
+            "the delay is owed but the loop is not being woken to spend it"
+        );
+    }
+
+    /// An app nothing has touched has to be left free to sleep indefinitely,
+    /// which is the whole reason `touched` exists.
+    #[test]
+    fn an_untouched_app_is_left_free_to_sleep() {
+        let mut app = headless(TestBridge::desktop());
+        app.autosave_config(true);
+        assert!(
+            !app.autosave.touched,
+            "the check did not account for itself"
+        );
+
+        assert_eq!(
+            app.autosave_control_flow(),
+            ControlFlow::Wait,
+            "an idle app is being woken on a timer for a change nobody made"
+        );
     }
 
     /// Set by the back handler the app installs, so a test can see it *ran*
