@@ -1381,55 +1381,6 @@ pub(crate) mod lambert_fixture {
             max_lon: lon + span / 2.0,
         }
     }
-
-    /// Coverages a pane actually asks for. The overlay texture spans
-    /// `1 + 2 * OVERDRAW_FRACTION` = 3 viewports per axis, so these are already
-    /// tripled: the 12° box is a ~4° pane, roughly 340 px at zoom 7.
-    pub(crate) const CONUS_SCENARIOS: &[(&str, f64, f64, f64)] = &[
-        // A 3 km cell is ~0.033 deg, so this texture sits inside one cell.
-        ("street level, zoom 19", 35.5, -97.5, 0.008),
-        ("zoomed in, 3deg", 35.5, -97.5, 3.0),
-        ("typical pane, 12deg", 35.5, -97.5, 12.0),
-        ("regional, 30deg", 35.5, -97.5, 30.0),
-        ("whole CONUS, 75deg", 37.0, -97.5, 75.0),
-        ("off-grid (Atlantic)", 35.5, -40.0, 12.0),
-    ];
-}
-
-/// `cargo test -p rustdar-overlays --release --lib -- --ignored --nocapture bench_`
-#[cfg(test)]
-mod model_raster_bench {
-    use super::lambert_fixture::{CONUS_SCENARIOS, coverage, lambert_grid, materialised};
-    use super::*;
-
-    #[test]
-    #[ignore = "benchmark"]
-    fn bench_rasterize_model_data() {
-        let lambert = lambert_grid(1799, 1059, 0b0100_0000);
-        // The pre-lazy shape: coordinates already in memory, nothing to skip.
-        let eager = materialised(&lambert);
-
-        for &size in &[1024u32, 2048] {
-            for &(label, lat, lon, span) in CONUS_SCENARIOS {
-                let bounds = coverage(lat, lon, span);
-                let mut row = Vec::new();
-                for grid in [&lambert, &eager] {
-                    let mut best = f64::MAX;
-                    for _ in 0..5 {
-                        let t = web_time::Instant::now();
-                        let out = rasterize_model_data(grid, &bounds, size, size);
-                        best = best.min(t.elapsed().as_secs_f64() * 1000.0);
-                        std::hint::black_box(&out.rgba);
-                    }
-                    row.push(best);
-                }
-                println!(
-                    "{size}^2  {label:<22} lambert {:7.1} ms   eager(30MB) {:7.1} ms",
-                    row[0], row[1],
-                );
-            }
-        }
-    }
 }
 
 #[cfg(test)]
