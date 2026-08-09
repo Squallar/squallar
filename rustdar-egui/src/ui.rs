@@ -382,10 +382,12 @@ pub struct Gui {
     /// Whether the "pick a 3D region" mode is armed.
     ///
     /// While it is, a drag on a map pane draws the box a 3D pane resamples
-    /// instead of panning the map — see `ui_region`. It stays armed through a
-    /// commit *and* through a discarded mis-drag, and is turned off from the menu
-    /// it was turned on from: a mode that disarmed itself would make aiming two
-    /// panes, or re-aiming one that came out wrong, four clicks instead of two.
+    /// instead of panning the map — see `ui_region`. A successful commit
+    /// disarms it ([`Self::apply_pending_region`]), exactly as the section draw
+    /// disarms on drawing its line: the mode's job is done, and leaving it on
+    /// would turn the next pan into a second box. A discarded mis-drag leaves
+    /// it armed — a stray tap must not silently throw away the intent the user
+    /// just expressed — and the menu it was armed from can always turn it off.
     /// [`Self::dismiss_top_layer`] also cancels it, so Escape and Android's back
     /// button mean here what they mean everywhere else — the same layer the
     /// cross-section draw sits on, and for the same reason.
@@ -2313,6 +2315,17 @@ impl Gui {
         let Some(pending) = self.pending_region.take() else {
             return;
         };
+        // Disarmed by committing, exactly as the section draw disarms on
+        // drawing its line (`track_section_draw`): the mode's job is done, and
+        // leaving it on would turn the user's next pan into a second box. A
+        // too-small drag never reaches here — it is discarded on release and
+        // the mode stays armed, so a mis-click still costs nothing.
+        //
+        // Through the setter, not a field write: `set_region_arm` is one of the
+        // two chokepoints the modes' mutual exclusion lives in, and it is also
+        // what drops a drag in flight. Disarming here moves `region_arm`, which
+        // is how the menu's checkbox visibly un-ticks itself.
+        self.set_region_arm(false);
         // The box means ground on the *source map's* radar, so the pane that
         // shows it has to follow that map's site and moment — exactly as
         // `apply_pending_section_line` writes them for a line. Without this, a

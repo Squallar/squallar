@@ -81,8 +81,10 @@ pub(super) enum MenuToggle {
     ///
     /// A checkbox rather than a command for the same reason `VolumePane` is one:
     /// it is a mode, it changes what dragging does, and a mode a user cannot see
-    /// is a mouse that has stopped working. It stays armed through a commit — see
-    /// `Gui::region_arm` — so this and a back press are the two ways out of it.
+    /// is a mouse that has stopped working. Committing a box disarms it — the
+    /// checkbox un-ticks itself, see `Gui::region_arm` — while a discarded
+    /// mis-drag leaves it armed, so this and a back press are the ways out of a
+    /// mode that has not yet done its job.
     ///
     /// Ticking it un-ticks [`DrawCrossSection`](Self::DrawCrossSection), which is
     /// the other armed drag on a map pane: one drag cannot be two gestures. See

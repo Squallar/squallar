@@ -2669,34 +2669,59 @@ mod volume_arm_tests {
         );
     }
 
-    /// The mode stays armed after a commit, and after a discarded mis-drag.
+    /// A commit disarms the mode; a discarded mis-drag leaves it armed.
     ///
-    /// Aiming a second pane, or re-aiming one that came out wrong, is the normal
-    /// next thing a user does. A mode that disarmed itself would make each of
-    /// those two menu trips instead of none.
+    /// The same shape the section draw has always had, and for the same two
+    /// reasons. Once a box is committed the mode's job is done — leaving it on
+    /// turns the user's next pan into a second box, which is how a pane they
+    /// never asked for appears. But a mis-click while armed must cost nothing:
+    /// a stray tap is how a user checks which pane they are on, and disarming
+    /// there would silently throw away the intent they just expressed.
     #[test]
-    fn the_mode_stays_armed_through_a_commit_and_through_a_mis_drag() {
+    fn a_commit_disarms_the_mode_and_a_mis_drag_leaves_it_armed() {
         let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
         h.load_scan("KTLX");
         h.gui_mut().set_region_arm_for_test(true);
         h.frames_for(1, FRAME_DT);
 
         let rect = h.pane_rects()[0];
+        // A press and release with no movement at all: the mis-click, first,
+        // while the mode is still fresh.
+        drag_region(&mut h, rect.center(), rect.center());
+        assert!(
+            h.gui_mut().region_arm_for_test(),
+            "a discarded drag must leave the mode armed",
+        );
+
         drag_region(
             &mut h,
             rect.center(),
             rect.center() + egui::vec2(120.0, 0.0),
         );
         assert!(
-            h.gui_mut().region_arm_for_test(),
-            "a commit must leave the mode armed",
+            !h.gui_mut().region_arm_for_test(),
+            "a commit must disarm the mode: its job is done",
         );
 
-        // A press and release with no movement at all: the mis-click.
-        drag_region(&mut h, rect.center(), rect.center());
-        assert!(
-            h.gui_mut().region_arm_for_test(),
-            "a discarded drag must leave the mode armed",
+        // And the consequence the disarm exists for: the next drag is a pan
+        // again, not a second box. The committed pane keeps the region it was
+        // aimed at and no further pane appears.
+        let kinds = h.pane_kinds();
+        let aimed = aimed_region(&mut h);
+        drag_region(
+            &mut h,
+            rect.center(),
+            rect.center() + egui::vec2(-90.0, 40.0),
+        );
+        assert_eq!(
+            h.pane_kinds(),
+            kinds,
+            "a drag after the disarm must not grow or convert anything",
+        );
+        assert_eq!(
+            aimed_region(&mut h),
+            aimed,
+            "a drag after the disarm must not re-aim the pane",
         );
     }
 
