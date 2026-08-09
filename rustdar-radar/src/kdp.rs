@@ -117,62 +117,44 @@
 //!
 //! # Validation status — read before trusting the twin harness to pass
 //!
-//! **The live twin harness and its `validation_policy` now live on
-//! branch `campaign-harness`.** The figures below are the last measured
-//! before the move; re-measuring means that branch.
+//! **The live twin harness, its `validation_policy`, and the full survey
+//! record live on branch `campaign-harness`**; re-measuring means that
+//! branch.
 //!
-//! The live harness scores the derivation against the RPG's own N0K for
-//! the **same volume and cut** (paired by PDB volume start plus elevation
+//! The harness scores the derivation against the RPG's own N0K for the
+//! **same volume and cut** (paired by PDB volume start plus elevation
 //! number, angle-matched where a site's product cut numbering differs from
 //! the RDA's), in the twin's own data levels — the PDB's declared scale 20
-//! / offset 43 was verified on every live twin, so ±1 level is ±0.05 °/km
-//! and the double bar (≥ 90% within ±1 **and** ≥ 98% within ±2, per site,
-//! never pooled) is ±0.10 °/km at the ±2 leg.
+//! / offset 43 was verified on every live twin, so one data level is
+//! 0.05 °/km. As last measured (three full-roster surveys) the derivation
+//! does **not** meet the campaign's double bar: quiet/stratiform sites
+//! read gate-exact, convective sites miss. What the surveys established,
+//! each A/B scored on tuning sites and confirmed on holdouts that played
+//! no part in the choice:
 //!
-//! Three full-roster surveys on 2026-07-28 (fresh volumes in each) do
-//! **not** meet that bar: 7 of 22 sites pass (weak/stratiform fields —
-//! KSHV read 100.00% exact on 3,383 compared gates, KABR 98.05%, KMVX
-//! 97.63%: where the field is quiet the transcription is gate-exact), and
-//! 15 miss, worst where the weather is (KMRX 63.7/80.5, KSGF 76.3/86.3,
-//! KSFX 72.9/86.9). Presence disagreement is 1.5–15% everywhere — RhoHV
-//! censoring, unlike the reflectivity products' DQA wall, is reproducible.
-//! What the surveys established, each A/B scored on the tuning sites
-//! (KTLX, KMLB, KMTX, KMPX, KSHV) and confirmed on holdouts (KFSD, KMRX,
-//! KTLH, KDDC, KAMA) that played no part in the choice:
-//!
-//! * **Coherent recombination** wins everywhere, both sets, every survey:
-//!   against the plain pair mean it is 1–7 points better on levels and
-//!   3–15× better on presence (2–7% against 14–35%); against no
-//!   recombination (super-res passthrough) the gap is wider still. The
-//!   documented `Recomb_dp_data` average is the primary, uncontradicted.
+//! * **Coherent recombination** wins everywhere, both sets, every survey,
+//!   on levels and on presence. The documented `Recomb_dp_data` average
+//!   is the primary, uncontradicted.
 //! * **The attenuation term in the window switch** (`delta_z`) is inert:
 //!   identical scores to two decimals at every site. Kept, per the source.
 //! * **Initial system phase** is the residual's first component. Every
 //!   RDA header on the roster declares the default 60.0°, but the twins
 //!   behave like the `isdp_apply` branch is live in the fleet: the misses
-//!   concentrate in a **one-sided +1-level shoulder** (KEAX +1: 18.2%
-//!   against −1: 0.7%; KTLH 16.8/0.8) — the exact signature of our
+//!   concentrate in a one-sided +1-level shoulder — the signature of
 //!   leading-edge ramps climbing from 60° to the data's true system phase
 //!   while the twin's sit flat. Where the single-volume estimator
-//!   concludes, applying it (`isdp-applied`, the source's `isdp_est !=
-//!   -99` semantics) recovers 10–14 points of within-±1 (KMRX 63.7 →
-//!   74.9, KSFX 72.9 → 83.5) and never loses; but it concludes only in
-//!   broad rain (the documented gates: 11 consecutive ρ ≥ 0.986 gates
-//!   past 25 km with nothing ≥ 40 dBZ, ≥ 40 radials), while the RPG
-//!   **persists** its estimate across volumes in `DP_ISDP_EST` — state a
-//!   single archived volume cannot reproduce. On the tuning set the two
-//!   variants tie (the estimator concludes at none of the five), so the
-//!   documented `isdp_apply = NO` default stays primary and the finding
-//!   is recorded here instead of tuned around.
-//! * The rest of the residual is weak-band jitter around gradients
-//!   (symmetric ±1–3-level spread at KSGF/KMTX/KLZK, near-zero mean
-//!   bias): the censor and the meteorological grouping both hinge on
-//!   `rho_smd ≥ 0.9` at gates where smoothed ρ sits within rounding of
-//!   the threshold, and one flipped gate moves a whole interpolation
-//!   bridge. `corr_thresh` itself is URC-adaptable per site ([0.5, 1.0]),
-//!   like the ISDP store — operational state the archive stream does not
-//!   carry. Per the campaign's early-stop rule nothing undocumented was
-//!   chased.
+//!   concludes, applying it recovers within-±1 and never loses; but it
+//!   concludes only in broad rain, while the RPG **persists** its
+//!   estimate across volumes in `DP_ISDP_EST` — state a single archived
+//!   volume cannot reproduce. The documented `isdp_apply = NO` default
+//!   stays primary and the finding is recorded instead of tuned around.
+//! * The rest of the residual is weak-band jitter around gradients: the
+//!   censor and the meteorological grouping both hinge on `rho_smd ≥ 0.9`
+//!   at gates where smoothed ρ sits within rounding of the threshold, and
+//!   one flipped gate moves a whole interpolation bridge. `corr_thresh`
+//!   itself is URC-adaptable per site ([0.5, 1.0]), like the ISDP store —
+//!   operational state the archive stream does not carry. Nothing
+//!   undocumented was chased.
 //!
 //! Product 163 therefore **stays a Level III fetch**; this module ships as
 //! the documented local derivation with the render path wired
@@ -188,10 +170,10 @@
 //! the fuzzy met signal, not `rho_smd ≥ 0.9` — see [`crate::dpprep`]'s
 //! module doc. That machinery is implemented and is the HCA chain's
 //! primary; **this module's pipeline keeps the legacy flag its survey
-//! record above was measured with** (three full-roster surveys; the product
-//! ships as a fetch either way), so the figures and the code stay one
-//! thing. The B21-new `ra_gate` φ chain (`DPRA`, window 7) and `DPIN` feed
-//! DP QPE/CDA, not KDP.
+//! record was measured with** (the record lives on branch
+//! `campaign-harness`; the product ships as a fetch either way), so the
+//! record and the code stay one thing. The B21-new `ra_gate` φ chain
+//! (`DPRA`, window 7) and `DPIN` feed DP QPE/CDA, not KDP.
 
 #[cfg(test)]
 use crate::dpprep::coherent_phi_rho;
@@ -244,9 +226,10 @@ impl KdpParams {
     /// The render path's stand-in when only a decoded `Scan` is in hand
     /// (the model drops the radial-header blocks): fleet-typical values
     /// for the two parameters the classification cannot run without.
-    /// `dbz0` −43.5 dB sits mid-range of the RDA calibration constants the
-    /// 2026-07 precipitation survey read from archives (−41.0…−45.9);
-    /// `atmos` −0.012 dB/km was the value at every site surveyed. The
+    /// `dbz0` −43.5 dB sits mid-range of the RDA calibration constants
+    /// read from live archives; `atmos` −0.012 dB/km was the value at
+    /// every site surveyed (measured provenance: branch
+    /// `campaign-harness`). The
     /// initial phase stays `None` — the documented estimator resolves it
     /// from the data. A ±2 dB `dbz0` error moves only the no-echo boundary
     /// at the SNR-5 dB fringe; the twin-validated paths always read the

@@ -1,11 +1,11 @@
 //! Normalized Rotation (NROT): the azimuthal derivative of radial velocity,
 //! normalized by a range-dependent divisor so one number reads the same at
-//! every distance from the radar. Every stage below was empirically
-//! calibrated against a reference implementation by injecting synthetic
-//! Level II volumes with known velocity patterns (azimuthal steps, couplets,
-//! noise, sinusoids, range slabs) and measuring the response — kernel taps,
-//! divisor curve, median geometry, and gating all measured rather than
-//! guessed:
+//! every distance from the radar. The pipeline is reverse-engineered against
+//! a reference implementation: kernel taps, divisor curve, median geometry,
+//! and gating are all empirical rather than derived. As last measured it
+//! matches the reference's painted density and correlates 0.996 with its
+//! cursor readouts; the measurement apparatus and the full calibration
+//! record live on branch `campaign-harness`.
 //!
 //! 1. Dealias the base velocity with the validity-marking multi-pass
 //!    ([`dealias`]): environmental-wind and zero-isodop seeds, then
@@ -16,24 +16,21 @@
 //! 2. Median-filter the dealiased field (3–5 radials by physical width × 5
 //!    gates); centres whose window is mostly missing raw data read ND.
 //! 3. At each bin, the azimuthal derivative is the split-tap per-radial
-//!    operator ([`SPLIT_CLEAN`]/[`SPLIT_AWAY`]) inside 80 km — solved
-//!    exactly from measured per-radial step profiles — and the
-//!    composite 11-radial stencil [`COMPOSITE_TAPS`] beyond, measured from
-//!    the step response, applied to 3-gate range means and divided by the
-//!    local arc per radial. The sign-reversed outer taps produce the small
-//!    negative side lobes flanking every strong gradient. All five tap pairs
-//!    must be intact and the profile must correlate with the stencil
-//!    (r² ≥ 0.05); constant or incoherent profiles read ND.
+//!    operator ([`SPLIT_CLEAN`]/[`SPLIT_AWAY`]) inside 80 km and the
+//!    composite 11-radial stencil [`COMPOSITE_TAPS`] beyond, applied to
+//!    3-gate range means and divided by the local arc per radial. The
+//!    sign-reversed outer taps produce the small negative side lobes
+//!    flanking every strong gradient. All five tap pairs must be intact and
+//!    the profile must correlate with the stencil (r² ≥ 0.05); constant or
+//!    incoherent profiles read ND.
 //! 4. Divide ROT by the divisor curve — knot ranges in KILOMETRES, linearly
 //!    interpolated (25 at ≤20 km → 20 → 12 → 8 at 80 km, flat beyond) — and
-//!    clamp to ±5. Measured from the step-response ladder.
+//!    clamp to ±5.
 //!    Inside 80 km a matched-filter footprint pass ([`apply_kernel_bank`])
 //!    then caps each detected rotation couplet with the kernel fitted to
 //!    its measured pole width, reproducing the reference's width-dependent
 //!    edge compression while monopolar notches keep the full value.
-//! 5. Blank painted clusters under 4 bins and one-gate-deep slivers; the
-//!    result matches the reference painted density and correlates 0.996
-//!    with reference cursor readouts over a real-volume ground-truth set.
+//! 5. Blank painted clusters under 4 bins and one-gate-deep slivers.
 //!
 //! Values above 1.0 are significant rotation; above 2.5, extreme. The
 //! reference quantizes NROT in steps of 0.04, so differences below ~0.04
@@ -51,14 +48,13 @@ const NROT_LIMIT: f64 = 5.0;
 
 /// Skip bins closer than this. Residual ground clutter close to the radar
 /// produces clamp-level fake shear (adjacent ±30 m/s bins over tens of meters
-/// of arc). Measured exactly on a synthetic volume: the reference reads ND
-/// for a ±15 m/s couplet at 12.48 km and a value at 12.59 km, so the floor is
-/// 12.5 km (6.75 nm) — consistent with reference sweep extremes always
-/// landing at 6.8-7.2 nm on real volumes.
+/// of arc). Empirical floor — 12.5 km (6.75 nm), where the reference's own
+/// painting starts. Measured provenance: branch `campaign-harness`.
 const MIN_RANGE_NM: f64 = 6.75;
 
 /// Blank painted clusters (8-connected runs of |NROT| ≥ 0.25) smaller than
-/// this many bins. Matches the reference painted density over five volumes.
+/// this many bins. Empirical, chosen to match the reference's painted
+/// density. Measured provenance: branch `campaign-harness`.
 const DESPECKLE_MIN_BINS: usize = 4;
 
 /// A velocity sweep as a dense azimuth × range grid. NaN marks missing data.
@@ -373,8 +369,8 @@ impl WindProfileBuilder {
         // Clamp-extrapolate every unfitted layer from the nearest fitted one:
         // winds vary slowly with height, and a None prediction is worse than
         // the nearest fitted layer's — it vetoes every wind seed tile whose
-        // beam reaches that height. Measured on a real volume: the reference
-        // keeps 56% of its far band where we kept 11% without the extension.
+        // beam reaches that height. Measured: without the extension most of
+        // the reference's far band is lost (branch `campaign-harness`).
         let filled: Vec<usize> = (0..layers.len()).filter(|&l| layers[l].is_some()).collect();
         if !filled.is_empty() {
             for l in 0..layers.len() {
@@ -414,25 +410,24 @@ fn estimate_nyquist(vel_grid: &[Vec<f64>]) -> f64 {
 /// at 5 radials and floored at 3.
 const MEDIAN_HALF_WIDTH_KM: f64 = 0.4;
 
-/// Cap on the median filter's azimuthal half-count. Measured: the reference
-/// median erases 2-radial couplets at 31 km and reads compact near-radar
-/// couplets ~40% below a 5-radial-median pipeline, implying its azimuthal
-/// window keeps growing toward the radar (a 5×5 window counted in legacy 1°
-/// radials ≈ 9 super-res).
+/// Cap on the median filter's azimuthal half-count. Empirical, set against
+/// the reference median's couplet erasure and near-radar couplet amplitudes
+/// (a 5×5 window counted in legacy 1° radials ≈ 9 super-res). Measured
+/// provenance: branch `campaign-harness`.
 const MEDIAN_AZ_HALF_MAX: i32 = 2;
 
 /// Half-depth of the median kernel in range gates — deliberately deeper than it
 /// is wide. Range is the axis this module does *not* differentiate, so smoothing
 /// along it removes noise without touching the azimuthal shear being measured.
-/// Deepening it from 1 to 2 gates took agreement with reference readouts from
-/// 0.99 to 1.00 in amplitude and 0.968 to 0.972 in correlation, and pulled
-/// painted density to 1.00 of the reference's averaged over five volumes.
+/// The depth is empirical: 2 gates agreed with reference readouts better than
+/// 1 on amplitude, correlation and painted density. Measured provenance:
+/// branch `campaign-harness`.
 const MEDIAN_RNG_HALF: i32 = 2;
 
 /// Minimum RAW-data fraction of the median window for a valid centre to
-/// survive. Measured on sparsity ladders: the reference NROT paints at 25%
-/// ND and dies by 50% — its median footprint NDs under-populated windows,
-/// cleaning sparse fold soup the raw-default dealias rule re-admits.
+/// survive: the reference NDs under-populated windows, cleaning sparse fold
+/// soup the raw-default dealias rule re-admits. The fraction is empirical.
+/// Measured provenance: branch `campaign-harness`.
 const MEDIAN_MIN_RAW_OCC: f64 = 0.6;
 
 fn median_filter(
@@ -509,11 +504,10 @@ fn rot_divisor(range_nm: f64) -> f64 {
     rot_divisor_km(range_nm * KM_PER_NM)
 }
 
-/// The divisor curve as measured from the reference step response on a
-/// synthetic volume: the knot ranges are KILOMETERS and the curve is
-/// linearly interpolated between knots (25 at ≤20 km ramping to 8 at
-/// 80 km, flat 8 beyond). Solving NROT·div·range·(taps) = const across an
-/// 8–140 nm ladder of step-response peaks reproduces this to ±0.8.
+/// The divisor curve, empirically fitted to the reference's range response:
+/// the knot ranges are KILOMETERS and the curve is linearly interpolated
+/// between knots (25 at ≤20 km ramping to 8 at 80 km, flat 8 beyond).
+/// Measured provenance: branch `campaign-harness`.
 fn rot_divisor_km(range_km: f64) -> f64 {
     const KNOTS: [(f64, f64); 4] = [(20.0, 25.0), (40.0, 20.0), (60.0, 12.0), (80.0, 8.0)];
     if range_km <= KNOTS[0].0 {
@@ -528,36 +522,32 @@ fn rot_divisor_km(range_km: f64) -> f64 {
     KNOTS[KNOTS.len() - 1].1
 }
 
-/// Composite azimuthal derivative stencil, measured via synthetic-volume
-/// injection: the per-bin NROT values of the reference response to a
-/// ±8 m/s azimuthal velocity step are the cumulative sums of these taps.
+/// Composite azimuthal derivative stencil, empirically measured from the
+/// reference's step response (measured provenance: branch `campaign-harness`).
 /// Antisymmetric, dimensionless; ROT = Σ cⱼ·v(i+j) / arc. The sign-reversed
 /// outer taps are what produce the small negative side lobes flanking every
 /// strong gradient — a plain least-squares slope cannot produce those.
 const COMPOSITE_TAPS: [f64; 5] = [0.1039, 0.1595, 0.1187, -0.0037, -0.0630];
 
-/// The measured per-radial split-tap operator, solved exactly from
-/// per-radial step-response profiles: the side toward the whole-degree pair
+/// The per-radial split-tap operator: the side toward the whole-degree pair
 /// partner applies `SPLIT_CLEAN` (the legacy-grid taps ĉ = [0.580, 0.238,
 /// −0.151]) at 2/3/4 super-res offsets; the side away from the partner
 /// applies `SPLIT_AWAY` = [ĉ₂, ĉ₁−ĉ₂, ĉ₂, ĉ₃] at 1/2/3/4. Both sides sum to
 /// ĉ₁+ĉ₂+ĉ₃, so the operator is zero-sum; normalization is the legacy 1.0°
-/// arc. This is the unique zero-sum anchored linear operator reproducing
-/// both measured step profiles — pair-aligned [−0.18, +0.10, +0.77×4, +0.10,
-/// −0.18] and mid-pair [−0.18, +0.10, +0.49, +0.77×2, +0.49, +0.10, −0.18] —
-/// per radial, and via superposition the reference's full −1.48 response to
-/// an aligned synthetic 6-radial couplet where every
-/// pair-average-then-convolve chain reads ~−1.1.
+/// arc. Empirical: it is the unique zero-sum anchored linear operator
+/// solved exactly from the reference's measured per-radial step-response
+/// profiles, which no pair-average-then-convolve chain reproduces.
+/// Measured provenance: branch `campaign-harness`.
 const SPLIT_CLEAN: [(i32, f64); 3] = [(2, 0.580), (3, 0.238), (4, -0.151)];
 const SPLIT_AWAY: [(i32, f64); 4] = [(1, 0.238), (2, 0.342), (3, 0.238), (4, -0.151)];
 
 /// Matched-filter kernel bank: one per-radial tap operator per couplet pole
 /// width (2/3/4 radials), with the same (offset, tap) clean/away semantics
-/// as [`SPLIT_CLEAN`]/[`SPLIT_AWAY`]. Each kernel was empirically fitted
-/// (ridge least squares, profile-only — no step constraints) so that its
-/// response to the ideal 3-median-filtered width-w couplet matches the
-/// measured width-w couplet response profile, scaled by the primary
-/// operator's own core response on the same pattern. The kernels never see
+/// as [`SPLIT_CLEAN`]/[`SPLIT_AWAY`]. Each kernel is empirically fitted so
+/// that its response to the ideal median-filtered width-w couplet matches
+/// the reference's measured width-w couplet response, anchored to the
+/// primary operator's own core response on the same pattern (measured
+/// provenance: branch `campaign-harness`). The kernels never see
 /// steps or notches: [`apply_kernel_bank`] only engages them — and only as
 /// magnitude caps — where the local velocity profile carries a bipolar
 /// couplet signature, so the primary chain keeps full ownership of sign,
@@ -624,16 +614,16 @@ const BANK_K4_AWAY: [(i32, f64); 11] = [
 ];
 
 /// Asymmetric-couplet kernels: span-7 operators with the same clean/away
-/// semantics, empirically fitted to the measured graded-asymmetry couplet
-/// profiles — a +6/−4 pole pair (ratio 0.67) and a +6/−2 pair (ratio
-/// 0.33). The reference compresses asymmetric-couplet edges harder as the
-/// weak pole shrinks (edge/core 0.26 and 0.13 vs 0.34 balanced); symmetric
-/// templates cannot match these patterns, so they get their own kernels
-/// and templates. Footprint-only: their tap energy is too high for the
-/// per-bin base cap, and their template gate is the sole notch guard (the
-/// measured monopolar notch scores r² ≈ 0.2–0.3 against them, far under
-/// the 0.8 floor — the balance gate, which such couplets themselves fail,
-/// is deliberately not applied).
+/// semantics, empirically fitted to the reference's measured
+/// graded-asymmetry couplet responses — a +6/−4 pole pair (ratio 0.67) and
+/// a +6/−2 pair (ratio 0.33). The reference compresses asymmetric-couplet
+/// edges harder as the weak pole shrinks, and symmetric templates cannot
+/// match these patterns, so they get their own kernels and templates.
+/// Footprint-only: their tap energy is too high for the per-bin base cap,
+/// and their template gate is the sole notch guard (measured monopolar
+/// notches score far under the r² floor against them — the balance gate,
+/// which such couplets themselves fail, is deliberately not applied).
+/// Measured provenance: branch `campaign-harness`.
 const BANK_A067_CLEAN: [(i32, f64); 7] = [
     (1, -0.1595),
     (2, 0.8119),
@@ -692,30 +682,29 @@ const BANK_R2_MIN: f64 = 0.8;
 const BANK_CAP_FLOOR: f64 = 0.7;
 
 /// Gain on the cap operators' output. The kernel fits are anchored to the
-/// primary operator's core response on ideal patterns; hover readouts on
-/// real weak couplet shoulders show the reference's compressed values run
-/// below that anchor, so the cap output is recalibrated by this factor,
-/// measured against a real-volume readout set.
+/// primary operator's core response on ideal patterns; on real weak couplet
+/// shoulders the reference's compressed values run below that anchor, so
+/// the cap output is recalibrated by this empirical factor. Measured
+/// provenance: branch `campaign-harness`.
 const BANK_CAP_GAIN: f64 = 0.90;
 
-/// Deviation-balance floor for the per-bin base cap, measured on real
-/// volumes: the KMKX monopolar notch balances at 0.29, rotation couplets
-/// at 0.42 and above.
+/// Deviation-balance floor for the per-bin base cap. Empirical separator:
+/// measured monopolar notches balance well below it, rotation couplets at
+/// or above it. Measured provenance: branch `campaign-harness`.
 const BANK_BASE_BALANCE_MIN: f64 = 0.42;
 
 /// Deviation-balance floor for footprint candidates: opposite deviations
-/// about the window median must reach this ratio. Measured on real
-/// volumes: a monopolar notch the reference paints at full value balances
-/// at 0.29, rotation couplets at 0.42 and above; the floor sits between,
-/// nearer the notch to keep weak lopsided couplets eligible.
+/// about the window median must reach this ratio. Sits between the
+/// measured notch and couplet balance points, nearer the notch to keep
+/// weak lopsided couplets eligible. Measured provenance: branch
+/// `campaign-harness`.
 const BANK_BALANCE_MIN: f64 = 0.35;
 
 /// Range limit in km for the split-tap operator; beyond it the composite
-/// 11-tap stencil takes over. The split operator is measured ground truth
-/// near the radar (synthetic steps at 36–41 km, a real couplet at 12.6 km);
-/// the composite's 0.997 real-field agreement was earned at 70–240 km where
-/// pairing phase is invisible — each kernel is used inside its measured
-/// domain.
+/// 11-tap stencil takes over. Each operator is used inside the range band
+/// its calibration measurements cover: the split operator near the radar,
+/// the composite at long range where pairing phase is invisible. Measured
+/// provenance: branch `campaign-harness`.
 const SPLIT_MAX_RANGE_KM: f64 = 80.0;
 
 /// Range half-depth in gates for the stencils' 3-gate range means, per
@@ -832,9 +821,9 @@ fn split_stencil_rot(
 
 /// Which index phase pairs super-res radials into whole-degree legacy bins:
 /// radials (2k+phase, 2k+1+phase) share a degree sector. The legacy pairing
-/// is anchored to ABSOLUTE azimuth, proven with synthetic steps: a step at a
-/// whole degree (az 45.0) reads clean while the same step at a half degree
-/// (az 135.5) reads pair-averaged.
+/// is anchored to ABSOLUTE azimuth — a measured fact: steps at whole-degree
+/// boundaries read clean, at half-degree boundaries pair-averaged. Measured
+/// provenance: branch `campaign-harness`.
 fn pair_phase(azimuths_deg: &[f64]) -> usize {
     let n = azimuths_deg.len();
     if n < 4 {
@@ -1000,11 +989,11 @@ fn bank_kernel_rot(
 ///    the couplet's whole footprint (core ± (w+2) radials), floored at
 ///    [`BANK_CAP_FLOOR`] of the primary value.
 ///
-/// Measured on couplet-width ladders: the reference's width-dependent edge
-/// compression (0.47/0.34/0.55 of core for pole widths 2/3/4) with
+/// The reference's measured width-dependent edge compression with
 /// full-value pass-through on monopolar notches follows from this
 /// selection rule, and the cap form bounds the wide kernels' noise gain by
-/// the primary response on real velocity texture.
+/// the primary response on real velocity texture. Measured provenance:
+/// branch `campaign-harness`.
 fn apply_kernel_bank(
     sweep: &VelocitySweep,
     vel_grid: &[Vec<f64>],
@@ -1041,8 +1030,7 @@ fn apply_kernel_bank(
             let arc_per_radial = range_km * spacing_rad;
             let divisor = rot_divisor(range_km / KM_PER_NM);
             let mut col: Vec<f64> = (0..num_radials).map(|i| primary[i][j]).collect();
-            // Base layer: per-bin bank cap, the direct successor of the
-            // second-chain magnitude cap this bank replaces. Every bin
+            // Base layer: per-bin bank cap. Every bin
             // whose profile returns to its background at the window ends
             // (steps and pure azimuthal ramps do not — they keep the full
             // primary value) and shows balanced opposite deviations about
@@ -1285,7 +1273,7 @@ fn composite_stencil_rot(
         return None;
     }
     // The normalization is Σc·v/arc with the full stencil (verified against
-    // the step-response ladder at 20–140 nm to ~5%).
+    // the reference's step response; branch `campaign-harness`).
     Some(acc / arc_per_radial)
 }
 
@@ -1344,19 +1332,21 @@ fn llsd_nrot(sweep: &VelocitySweep, vel_grid: &[Vec<f64>]) -> Vec<Vec<f64>> {
 // are censored.
 // ————————————————————————————————————————————————————————————————————
 
-/// Environmental-wind seed tolerance in m/s — deliberately tight, tuned on a
-/// real folded volume against the reference kept-fraction per region.
+/// Environmental-wind seed tolerance in m/s — deliberately tight; empirical,
+/// tuned against the reference's kept fraction on folded volumes. Measured
+/// provenance: branch `campaign-harness`.
 const DA_SEED_TOL: f64 = 5.0;
 
 /// Agreeing 4-neighbors required for a gate-level wind seed. A wind-matching
-/// pocket inside storm-perturbed flow (the 50.7°/61 nm case the reference
-/// paints −1.13) can never seed a 5×10 all-gates tile; gate seeds anchor it
-/// at raw before any bridge can unfold it to the wrong branch.
+/// pocket inside storm-perturbed flow can never seed a 5×10 all-gates tile;
+/// gate seeds anchor it at raw before any bridge can unfold it to the wrong
+/// branch. Measured provenance: branch `campaign-harness`.
 const DA_SEEDGATE_NEIGHBORS: i32 = 3;
 
 /// Scale on every bridge/fill threshold — the pass ordering is fixed but the
-/// base thresholds are nominal; 1.4 measured as the point where dealias
-/// coverage matches the reference on real volumes.
+/// base thresholds are nominal; the scale is empirical, set where dealias
+/// coverage matches the reference. Measured provenance: branch
+/// `campaign-harness`.
 const DA_THRESH_SCALE: f64 = 1.4;
 
 /// Iteration cap for the pass loop; propagation converges within ten on
@@ -1384,15 +1374,15 @@ const DA_ZISO_TOL: f64 = 1.5;
 
 /// Minimum connected-component size (bins, 4-adjacency) for a never-reached
 /// data region to be kept at raw, and for a gate-seed cluster to count.
-/// Empirically, the reference paints nothing for isolated 2×4-bin
-/// distinct-velocity patches but paints 4×8 ones — its raw-default keeps
-/// only regions above a size gate between 8 and 32 bins.
+/// Empirical: the reference's raw-default keeps only regions above a
+/// measured size gate this value sits inside. Measured provenance: branch
+/// `campaign-harness`.
 const DA_RAWMIN_BINS: usize = 16;
 
-/// Censor threshold in units of Vny — measured fold-wall transfer:
-/// the reference keeps a 1.25·Vny adjacent jump (a clean ±15 m/s synthetic
-/// couplet at Vny 23.9 reads as rotation) and censors a 1.9·Vny fold soup,
-/// so the threshold sits between; 1.2 censored real couplet cores.
+/// Censor threshold in units of Vny. Empirical fold-wall transfer point:
+/// it sits between the largest adjacent jump the reference keeps as
+/// rotation and the smallest fold soup it censors — lower values censored
+/// real couplet cores. Measured provenance: branch `campaign-harness`.
 const CENSOR_VNY_FRAC: f64 = 1.24;
 
 /// The censoring posture [`dealias`] takes once the unfolding passes are done.
@@ -1420,10 +1410,10 @@ pub enum DealiasProfile {
     /// unreached data gate keeps its raw value regardless of region size
     /// ([`COVERAGE_RAWMIN_BINS`]), and the fold-wall censor runs at the same
     /// measured [`CENSOR_VNY_FRAC`] threshold — dropping the censor entirely
-    /// was measured worse against the RPG's own dealiased velocity (see
-    /// `crate::srv`'s A/B notes; a kept fold wall is a 2·Vny error on every
-    /// gate it touches, which costs more level agreement than the censored
-    /// hole costs coverage).
+    /// was measured worse against the RPG's own dealiased velocity (a kept
+    /// fold wall is a 2·Vny error on every gate it touches, which costs
+    /// more level agreement than the censored hole costs coverage; the A/B
+    /// record lives on branch `campaign-harness`).
     Coverage,
 }
 
@@ -1431,8 +1421,8 @@ pub enum DealiasProfile {
 /// data gate, however small the region. The RPG's dealiaser resolves all
 /// present data, so for a field that is *displayed* rather than
 /// differentiated, matching its coverage matters more than suppressing
-/// isolated pockets — the A/B against live N0G/N1G twins is recorded in
-/// `crate::srv`.
+/// isolated pockets — the A/B against live N0G/N1G twins lives on branch
+/// `campaign-harness`.
 const COVERAGE_RAWMIN_BINS: usize = 1;
 
 /// The two post-pass knobs a [`DealiasProfile`] resolves to. `pub(crate)` so
@@ -1643,10 +1633,10 @@ pub(crate) fn dealias_with_knobs(
     // Robust directional unfold chain over a gap (NaN = missing gate):
     // references the running mean of the last ≤3 accepted values and skips
     // isolated outliers (left uncommitted), aborting only when over a third
-    // of the gap's data gates fail. At the nominal per-gate thresholds a
-    // fragile strict chain needs a 2.125× threshold widening to reach
-    // reference coverage — and the widened radial bridge is what mis-unfolds
-    // the 50.7°/61 nm pocket the reference keeps.
+    // of the gap's data gates fail. Measured: a fragile strict chain reaches
+    // reference coverage only with its thresholds widened far enough that
+    // the radial bridge mis-unfolds pockets the reference keeps (branch
+    // `campaign-harness`).
     let chain = |seed: f64, raws: &[f64], t: f64, gap_free: i32| -> Option<Vec<f64>> {
         let mut out = Vec::with_capacity(raws.len());
         let mut acc: Vec<f64> = vec![seed];
@@ -1888,8 +1878,8 @@ pub(crate) fn dealias_with_knobs(
     }
 
     // Convert unresolved to ND; write dealiased values back. Never-reached
-    // data gates keep their raw values in bulk: measured over sparsity and
-    // amplitude ladders, the reference dealiaser resolves ALL present data,
+    // data gates keep their raw values in bulk — measured: the reference
+    // dealiaser resolves ALL present data,
     // including isolated gates no propagation pass can reach —
     // unresolved-to-ND conversion evidently applies to contradictory
     // bridging, not unreached data. Size-gate the kept-raw regions: connected
@@ -1945,8 +1935,7 @@ pub(crate) fn dealias_with_knobs(
     }
     // Post-dealias fold censor: a bin more than CENSOR_VNY_FRAC·Vny from any
     // 4-neighbor marks a fold wall no pass could place — kept-raw folded
-    // regions meet correctly unfolded ones exactly there. The measured
-    // transfer censors 1.9·Vny soup and keeps 1.25·Vny.
+    // regions meet correctly unfolded ones exactly there.
     if knobs.censor_vny_frac.is_infinite() {
         return;
     }

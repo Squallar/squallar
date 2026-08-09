@@ -20,8 +20,8 @@
 //!
 //! **Threshold** — 18.3 dBZ, the fleet default for `alg.vil_echo_tops
 //! min_refl` (`vil_echo_tops.alg`; a live KTLX EET PDB annotates it as the
-//! truncated `18`). Site-adaptable in principle; the twin harness below
-//! measures whether 18.3 holds in practice.
+//! truncated `18`). Site-adaptable in principle; the twin harness (branch
+//! `campaign-harness`) measures whether 18.3 holds in practice.
 //!
 //! **Altitude and datum** — the RPG's own height computation, from the legacy
 //! VIL/Echo Tops source (`a313e1.ftn`):
@@ -65,57 +65,42 @@
 //!   the adjacent tilt above holds DQA *bad data*. Raw Level II cannot tell
 //!   "artifact-edited" from "below SNR" — both are simply censored — and
 //!   treating every censored-above column as topped would flag vast areas the
-//!   RPG does not (a live TLX volume carried 12 topped bins in 124,560).
-//!   Here **only the volume's highest tilt makes a top topped**; a censored
+//!   RPG does not (measured: topped bins are vanishingly rare on live
+//!   volumes). Here **only the volume's highest tilt makes a top topped**; a censored
 //!   cell above clamps the top to the crossing tilt's own altitude,
 //!   non-topped. Topped-flag agreement is printed by the harness so the gap
 //!   stays measured.
 //! * **SAILS/MRLE revisits**: HREET consumes each elevation's DQA buffer once
 //!   as the volume completes, so the cube is deduplicated
 //!   [`DedupPolicy::FirstOfVolume`] — the coherent first pass the RPG's
-//!   volume products are computed from, not the freshest look. (Measured
-//!   against a live KMRX 212 twin, newest-wins changes the score by under a
-//!   tenth of a point either way, so the choice is by the doc, uncontradicted.)
+//!   volume products are computed from, not the freshest look. (Measured:
+//!   newest-wins is indistinguishable, so the choice is by the doc,
+//!   uncontradicted.)
 //! * **Cell statistic** — twin-arbitrated, not documented: each 1° × 1 km
 //!   cell takes the **maximum** dBZ of its sub-gates ([`CellStat::Max`]).
-//!   The documented recombination average (linear-Z mean) reads 1.5 data
-//!   levels *lower* against a live KMRX EET twin (mean level bias −2.75
-//!   against −1.23, within-±1 43% against 58%), and leaves thousands of bins
-//!   undefined that the twin defines whose column maximum sits at 14–18 dBZ —
-//!   just under threshold. The same finding as the SRM campaign's range
-//!   recombination: the RPG keeps peaks.
+//!   The documented recombination average (linear-Z mean) measured lower
+//!   against a live EET twin and left bins undefined that the twin defines:
+//!   the RPG keeps peaks. Measured provenance: branch `campaign-harness`.
 //!
 //! # Validation status — read before trusting the twin harness to pass
 //!
-//! **The live twin harness and its `validation_policy` now live on
-//! branch `campaign-harness`.** The figures below are the last measured
-//! before the move; re-measuring means that branch.
+//! **The live twin harness, its `validation_policy`, and the full survey
+//! record live on branch `campaign-harness`**; re-measuring means that
+//! branch.
 //!
-//! The live harness below holds this derivation to the campaign bar (99%
-//! within one level, per site) against the RPG's own EET for the same
-//! volume. As of the 2026-07-28 survey it does **not** meet that bar on
-//! convective volumes: clear-air/weak sites read 99–100% within-±1, but
-//! sites with real storms plateau at 60–80% with a storm-depth-dependent
-//! low bias, and the twin defines 15–30% more bins than any per-column
-//! recomputation of the same Level II data can (its extra bins sit at
-//! column maxima of 14–18 dBZ). The twin's field is also visibly smoother
-//! than a raw column scan — flat 2–3-level plateaus across cores.
-//!
-//! Ruled out by measurement (single-volume A/B against the KMRX/KSGF/KMLB
-//! twins, each change isolated): dedup policy (first against newest —
-//! indistinguishable); datum (MSL confirmed: near-radar twin bins encode
-//! site-elevation heights, low-top bins agree to a quarter level); beam top
-//! against beam centre (+0.475–0.5° overshoots, range-proportionally);
-//! linear-Z interpolation (centres the mean but widens the spread); azimuth
-//! registration (cells cover [k, k+1)°, the centred alternative is worse);
-//! range sub-column lanes, azimuth pooling across the half-degree radials,
-//! ground-projected (flat-polar) sampling, interpolating toward a floor when
-//! censored above, and 3×3 median/max input and output filters — each moves
-//! the score by single points, none closes it. The remaining candidate is
-//! HREET's own pre/post-processing (its input is the DQA buffer and its
-//! source, `cpc014/tsk012`, is not in any public CODE distribution), so the
-//! residual is recorded here rather than papered over: do not lower the bar,
-//! and do not calibrate further heuristics against a single twin volume.
+//! As last measured, this derivation does **not** meet the campaign bar
+//! (99% within one level, per site) against the RPG's own EET on
+//! convective volumes: clear-air/weak sites pass, sites with real storms
+//! fall well short with a storm-depth-dependent low bias, and the twin
+//! defines bins no per-column recomputation of the same Level II data can
+//! (its field is also visibly smoother than a raw column scan). Every
+//! reproducible candidate for the residual was measured and ruled out,
+//! each change isolated — the A/B record lives on the branch. The
+//! remaining candidate is HREET's own pre/post-processing (its input is
+//! the DQA buffer and its source, `cpc014/tsk012`, is not in any public
+//! CODE distribution), so the residual is recorded here rather than
+//! papered over: do not lower the bar, and do not calibrate further
+//! heuristics against a single twin volume.
 
 use crate::types::RadarProduct;
 use crate::volumetric::{CellStat, DedupPolicy, RANGE_BINS, VolumeCube};

@@ -46,7 +46,7 @@
 //! usable that R(Z, ZDR) could not, at a gate whose class is rain but whose
 //! ZDR is absent — that combination is vanishingly rare (the fuzzy
 //! classification needs ZDR to reach RA in the first place) and the
-//! surveyed agreement below is measured with it absent. A rate product,
+//! surveyed agreement is measured with it absent. A rate product,
 //! which must have R(A) for the rate itself, runs the full test and so
 //! fills a handful more bins than this module does.
 //!
@@ -96,46 +96,35 @@
 //!
 //! # Validation status
 //!
-//! **The live twin harness now lives on branch `campaign-harness`.** The
-//! figures below are the last measured before the move; re-measuring
-//! means that branch.
+//! **The live twin harness and the full survey record live on branch
+//! `campaign-harness`**; re-measuring means that branch.
 //!
-//! Surveyed 2026-07-29 against live `HHC` twins on the precipitation
-//! campaign's site-hours (see [`crate::hca`]'s precipitation re-survey for
-//! the selection protocol), paired by volume start with the volume's
-//! latest HHC object, scored as class codes under the same 85% exact /
-//! 95% compatible per-site bars. Live packets confirmed the geometry this
+//! Surveyed against live `HHC` twins on the precipitation campaign's
+//! site-hours (see [`crate::hca`]'s precipitation re-survey for the
+//! selection protocol), paired by volume start with the volume's latest
+//! HHC object, scored as class codes under the same 85% exact / 95%
+//! compatible per-site bars. Live packets confirmed the geometry this
 //! module and `nexrad_level3`'s gate-spacing override assume: PDB scale
 //! 1 / offset 0 (levels are the class codes), 360 × 920 gates whose packet
 //! scale-factor halfword reads 1000 (~1 km) for a 0.25 km product.
 //!
-//! **Every asserted measurement passed both bars** across two runs and
-//! fourteen distinct volumes: in the 2026-07-29 08 UTC plains MCS, KUEX
-//! 97.81 exact / 98.25 compatible and KOAX 99.16/99.28; in the 07-28
-//! 20–21 UTC convection, KMLB 95.51/97.02 (Florida) and KMOB 99.30/99.75
-//! (gulf); the remaining plains site-hours (KDDC, KEAX, KSGF, KAMA, KFSD)
-//! ran 99.7–100.0/96.3+ — the Phase-3 gate (≥ 3 sites, ≥ 2 of them
-//! plains, in precipitation) is met with margin. The N0H-quarantined
-//! sites stay measured-not-asserted here and even so read *better* than
-//! their per-tilt product — KMRX 91.81/96.82 and KSFX 95.03/96.13 clear
-//! both bars numerically, KMTX 94.31/95.70 at the hour whose N0H missed —
-//! because the hybrid ladder resolves the GC/UK gates upward on both
-//! sides, taking the blockage-store confusion out of the compared set.
-//! The residual confusions are the melting-band pairs the per-tilt survey
-//! documented (BD→RA, RA↔DS at the mountain sites).
-//!
-//! A curiosity for reproducers: the twins' `highest_elang` parameter
-//! sometimes reads lower than the archive volume's top dual-pol tilt
-//! (10.0° vs 12.3° at KUEX) — AVSET bookkeeping inside qperate; the bins
-//! those extra tilts could fill are the innermost cone and sit inside the
-//! measured agreement.
+//! As last measured, **every asserted measurement passed both bars**, with
+//! the required plains-in-precipitation spread met with margin. The
+//! N0H-quarantined sites stay measured-not-asserted and even so read
+//! *better* than their per-tilt product — the hybrid ladder resolves the
+//! GC/UK gates upward on both sides, taking the blockage-store confusion
+//! out of the compared set. The residual confusions are the melting-band
+//! pairs the per-tilt survey documented (BD→RA, RA↔DS at the mountain
+//! sites). One note for reproducers: a twin's `highest_elang` parameter
+//! can read lower than the archive volume's top dual-pol tilt (AVSET
+//! bookkeeping inside qperate); the bins those extra tilts could fill are
+//! the innermost cone and sit inside the measured agreement.
 //!
 //! **A/B in precipitation** (same tuning/holdout split as the per-tilt
 //! survey): the B21 met-signal flag beats the legacy ρ/SNR flag
-//! **unanimously and by more than it does per-tilt** (+0.4…+3.9 exact —
-//! the met gate directly decides bin usability here); the volume-built
-//! CAPPI beats the cold start at 4 of 5 tuning sites by small margins
-//! (+0.03…+0.26, one −0.02 tie) now that ≥ 1° tilts feed the composite;
+//! **unanimously and by more than it does per-tilt** — the met gate
+//! directly decides bin usability here; the volume-built CAPPI beats the
+//! cold start by small margins now that ≥ 1° tilts feed the composite;
 //! radar-MLDA vs flat tied everywhere (no wet-snow detection, as
 //! per-tilt).
 //!
