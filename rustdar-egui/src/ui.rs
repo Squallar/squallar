@@ -478,15 +478,19 @@ pub struct Gui {
     /// [`Self::dismiss_top_layer`], so Escape mid-drag means what it means
     /// everywhere else.
     section_edit_drag: Option<crate::ui_section_edit::SectionEditDrag>,
-    /// Where every grabbable section handle was drawn **last frame**, in screen
-    /// points.
+    /// Where every committed line's grabbable geometry was drawn **last
+    /// frame**, in screen points — endpoints and body track alike.
     ///
     /// Written from inside `Map::show`, read by `render_panes`' pan-suppression
     /// decision *before* it — the press frame has to suppress the pan, and the
     /// press frame is the one frame that cannot yet ask the projector. One
     /// frame stale by construction, which for a press is harmless: a pointer
-    /// about to press is not also flinging the viewport.
-    section_handles: Vec<crate::ui_section_edit::SectionHandleSpot>,
+    /// about to press is not also flinging the viewport. Both readers go
+    /// through [`SectionGrabZone::grab_at`], so the suppression and the
+    /// authoritative in-show hit test cannot drift apart.
+    ///
+    /// [`SectionGrabZone::grab_at`]: crate::ui_section_edit::SectionGrabZone::grab_at
+    section_handles: Vec<crate::ui_section_edit::SectionGrabZone>,
     /// A dropped handle's line and the section pane it belongs to, applied
     /// **after** the pane loop.
     ///

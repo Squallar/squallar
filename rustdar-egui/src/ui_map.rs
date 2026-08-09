@@ -653,10 +653,9 @@ impl super::Gui {
         }) else {
             return false;
         };
-        self.section_handles.iter().any(|h| {
-            h.map_pane == pane_idx
-                && h.pos.distance(pos) <= crate::ui_section_edit::ENDPOINT_GRAB_RADIUS_PT
-        })
+        self.section_handles
+            .iter()
+            .any(|zone| zone.map_pane == pane_idx && zone.grab_at(pos).is_some())
     }
 
     /// Advance the unarmed endpoint drag on this pane by one frame, and record
@@ -702,12 +701,12 @@ impl super::Gui {
         pane_rect: egui::Rect,
         excluded_rects: &[egui::Rect],
     ) {
-        use crate::ui_section_edit::{SectionEditDrag, SectionGrab, SectionHandleSpot, grab_at};
+        use crate::ui_section_edit::{SectionEditDrag, SectionGrabZone};
 
-        // Re-recorded every frame, armed or not: spots left over from before a
+        // Re-recorded every frame, armed or not: zones left over from before a
         // mode change would go on suppressing pans near handles that are no
         // longer live.
-        self.section_handles.retain(|h| h.map_pane != pane_idx);
+        self.section_handles.retain(|z| z.map_pane != pane_idx);
         if self.section_draw_armed || self.region_arm {
             return;
         }
@@ -715,11 +714,12 @@ impl super::Gui {
         let project = |p: crate::pane::GeoPoint| {
             projector.project(walkers::lat_lon(p.lat, p.lon)).to_pos2()
         };
-        // Every committed line this map owns, with its projected ends. Reading
-        // `self.panes` mid-loop is safe here for the reason
-        // `draw_section_tracks` gives: the taken slot reads as a default map
-        // pane, which has no cross-section to offer.
-        let tracks: Vec<(usize, crate::pane::SectionLine, egui::Pos2, egui::Pos2)> = self
+        // Every committed line this map owns, with its projected geometry —
+        // the same polyline the track is drawn from, so what is grabbable is
+        // exactly what is visible. Reading `self.panes` mid-loop is safe here
+        // for the reason `draw_section_tracks` gives: the taken slot reads as
+        // a default map pane, which has no cross-section to offer.
+        let lines: Vec<(usize, crate::pane::SectionLine)> = self
             .panes()
             .iter()
             .enumerate()
@@ -728,27 +728,35 @@ impl super::Gui {
                 if section.source_pane != Some(pane_idx) {
                     return None;
                 }
-                let line = section.line?;
-                Some((idx, line, project(line.a()), project(line.b())))
+                Some((idx, section.line?))
             })
             .collect();
-        for (section_pane, _, a_px, b_px) in &tracks {
-            for (grab, pos) in [(SectionGrab::A, *a_px), (SectionGrab::B, *b_px)] {
-                self.section_handles.push(SectionHandleSpot {
-                    map_pane: pane_idx,
-                    section_pane: *section_pane,
-                    grab,
-                    pos,
-                });
-            }
-        }
+        let zones: Vec<(SectionGrabZone, crate::pane::SectionLine)> = lines
+            .into_iter()
+            .map(|(section_pane, line)| {
+                let track = great_circle_track(line, project);
+                (
+                    SectionGrabZone {
+                        map_pane: pane_idx,
+                        section_pane,
+                        a_px: track[0],
+                        b_px: track[track.len() - 1],
+                        track,
+                    },
+                    line,
+                )
+            })
+            .collect();
+        self.section_handles
+            .extend(zones.iter().map(|(zone, _)| zone.clone()));
 
-        let (pressed, down, released, pos) = ui.ctx().input(|i| {
+        let (pressed, down, released, pos, shift) = ui.ctx().input(|i| {
             (
                 i.pointer.primary_pressed(),
                 i.pointer.primary_down(),
                 i.pointer.primary_released(),
                 i.pointer.interact_pos(),
+                i.modifiers.shift,
             )
         });
         let ground = |p: egui::Pos2| {
@@ -760,21 +768,26 @@ impl super::Gui {
         };
 
         // The press frame. Gated on this pane's own rect and on the dialog
-        // layer, exactly as the region drag's press is.
+        // layer, exactly as the region drag's press is. Shift at the press
+        // picks the body drag's verb — sweep about the midpoint instead of
+        // translate — and is latched into the drag: see
+        // `SectionEditDrag::begin`.
         if pressed
             && self.section_edit_drag.is_none()
             && let Some(pos) = pos
             && pane_rect.contains(pos)
             && !super::map_overlays::is_pos_blocked(ui.ctx(), pos, pane_rect, excluded_rects)
         {
-            for (section_pane, line, a_px, b_px) in &tracks {
-                if let Some(grab) = grab_at(pos, *a_px, *b_px) {
+            for (zone, line) in &zones {
+                if let Some(grab) = zone.grab_at(pos) {
                     self.section_edit_drag = Some(SectionEditDrag::begin(
                         pane_idx,
-                        *section_pane,
+                        zone.section_pane,
                         grab,
                         *line,
                         pos,
+                        ground(pos),
+                        shift,
                     ));
                     break;
                 }

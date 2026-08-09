@@ -283,10 +283,157 @@ pub(super) fn render_cross_section(
         state.detail_open = !detail_open;
     }
 
+    // The pan/sweep controls and the bearing readout, over the plot's top-right
+    // corner. A step is one deliberate action, so — unlike the map-side drag,
+    // which previews live and re-cuts only on the drop — each step writes the
+    // line immediately and lets the ordinary staleness poll re-cut: one click,
+    // one cut, and the pane feels like a control rather than a queue. The
+    // picture stands until the new cut lands, for the reason
+    // `Gui::apply_pending_section_edit` gives at length.
+    if let Some(new_line) = render_line_controls(ui, &painter, &layout, line, prefs)
+        && let Some(state) = pane.cross_section_mut()
+    {
+        state.line = Some(new_line);
+    }
+
     if let Some(pos) = ui.ctx().pointer_hover_pos()
         && pane_rect.contains(pos)
     {
         pane.hover_value = hover_readout(&section, &layout, pos, product, prefs);
+    }
+}
+
+/// One step-control button: a small dark chip with a glyph, clickable.
+///
+/// Painted rather than a widget beyond the `interact`, like everything else in
+/// this pane — and each chip carries a tooltip because four bare glyphs in a
+/// corner are a puzzle, not a control.
+fn control_chip(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    glyph: &str,
+    salt: &str,
+    tooltip: &str,
+) -> bool {
+    let response = ui.interact(
+        rect,
+        ui.id().with(("section_line_control", salt)),
+        egui::Sense::click(),
+    );
+    painter.rect_filled(
+        rect,
+        4.0,
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150),
+    );
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0, ui.visuals().weak_text_color()),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        egui::FontId::proportional(12.0),
+        ui.visuals().text_color(),
+    );
+    response.on_hover_text(tooltip).clicked()
+}
+
+/// The section pane's own line controls: pan the line across itself, sweep it
+/// about its midpoint, and read its bearing and length — GR2Analyst's Position
+/// slider, as steps, plus the orientation that makes sweeping feel aimed.
+///
+/// Returns the stepped line for the caller to commit, or `None`.
+///
+/// # Why these live on the section pane
+///
+/// The map-side gestures (issue #9's handles, the body drag) are the coarse,
+/// direct motion; these are the fine one, and they belong where the user is
+/// *looking* while walking a cut through a storm — at the section. A hand on
+/// these chips and eyes on the picture is the whole "sweep along a storm"
+/// workflow, and it needs no second pane on a phone.
+///
+/// # The readout
+///
+/// `056° · 62 mi` — the A→B bearing at the line's midpoint and the line's
+/// ground length, in the user's units. Without it a sweep is blind: every step
+/// looks like "the picture changed", and only the number says which way the
+/// cut now faces. Three digits so north reads `000°`, not `0°`.
+///
+/// The glyphs are chosen from what egui's bundled fonts actually carry
+/// (`◀`/`▶` from NotoEmoji, `↺`/`↻` from emoji-icon-font) — see the caption's
+/// ⓘ for the tofu lesson.
+fn render_line_controls(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    layout: &SectionLayout,
+    line: crate::pane::SectionLine,
+    prefs: &UserPreferences,
+) -> Option<crate::pane::SectionLine> {
+    use crate::ui_section_edit as edit;
+
+    let button = egui::vec2(22.0, 18.0);
+    let gap = 4.0;
+    let top = layout.plot.top() + 4.0;
+    // Too narrow for the row means no row: the plot keeps its corner, and the
+    // map-side gestures still work.
+    if layout.plot.width() < 4.0 * (button.x + gap) + 80.0 {
+        return None;
+    }
+
+    let mut right = layout.plot.right() - 6.0;
+    let mut chip = |glyph: &str, salt: &str, tooltip: &str| -> bool {
+        let rect = egui::Rect::from_min_size(egui::pos2(right - button.x, top), button);
+        right -= button.x + gap;
+        control_chip(ui, painter, rect, glyph, salt, tooltip)
+    };
+
+    // Right-to-left, so on screen the row reads ◀ ▶ ↺ ↻.
+    let cw = chip("\u{21bb}", "cw", "Sweep the line clockwise about its middle");
+    let ccw = chip(
+        "\u{21ba}",
+        "ccw",
+        "Sweep the line counter-clockwise about its middle",
+    );
+    let pan_right = chip(
+        "\u{25b6}",
+        "pan_right",
+        "Slide the line to the right of its A\u{2192}B direction",
+    );
+    let pan_left = chip(
+        "\u{25c0}",
+        "pan_left",
+        "Slide the line to the left of its A\u{2192}B direction",
+    );
+
+    let length_km = edit::length_km(line);
+    painter.text(
+        egui::pos2(right - 4.0, top + button.y * 0.5),
+        egui::Align2::RIGHT_CENTER,
+        format!(
+            "{:03.0}\u{b0} \u{b7} {:.0}{}",
+            edit::bearing_deg(line).rem_euclid(360.0),
+            prefs.distance.convert_from_km(length_km),
+            prefs.distance.suffix(),
+        ),
+        egui::FontId::proportional(10.0),
+        ui.visuals().text_color(),
+    );
+
+    let step_km = edit::pan_step_km(length_km);
+    if pan_left {
+        edit::panned(line, -step_km)
+    } else if pan_right {
+        edit::panned(line, step_km)
+    } else if ccw {
+        edit::rotated(line, -edit::SWEEP_STEP_DEG)
+    } else if cw {
+        edit::rotated(line, edit::SWEEP_STEP_DEG)
+    } else {
+        None
     }
 }
 

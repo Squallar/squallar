@@ -115,6 +115,9 @@ pub(crate) struct InputHarness {
     time: f64,
     /// Events queued for the next frame.
     events: Vec<egui::Event>,
+    /// Keyboard modifiers reported with every frame's `RawInput`, as a held
+    /// key really is — set by [`InputHarness::set_modifiers`].
+    modifiers: egui::Modifiers,
     screen_rect: egui::Rect,
     /// Every rect painted during the last frame, in paint order. Lets a test
     /// assert on what was actually *drawn* rather than on an intermediate value
@@ -299,6 +302,7 @@ impl InputHarness {
             pane_rect: egui::Rect::from_min_max(egui::pos2(220.0, 80.0), egui::pos2(1004.0, 690.0)),
             time: 100.0,
             events: Vec::new(),
+            modifiers: egui::Modifiers::default(),
             screen_rect,
             last_rects: Vec::new(),
             max_texture_side: None,
@@ -1414,6 +1418,12 @@ impl InputHarness {
         self.frame_after(0.05)
     }
 
+    /// Hold or release keyboard modifiers for every following frame, as a key
+    /// held across a gesture really is. Pass `Modifiers::default()` to let go.
+    pub(crate) fn set_modifiers(&mut self, modifiers: egui::Modifiers) {
+        self.modifiers = modifiers;
+    }
+
     /// A quick mouse click (press + release), spread over two frames.
     pub(crate) fn mouse_click(&mut self, pos: egui::Pos2) -> FrameOutcome {
         self.mouse_press(pos);
@@ -1429,6 +1439,7 @@ impl InputHarness {
             time: Some(self.time),
             events: std::mem::take(&mut self.events),
             max_texture_side: self.max_texture_side,
+            modifiers: self.modifiers,
             ..Default::default()
         };
         // The same call `EguiRenderer::begin_frame` makes, at the same point in
@@ -7106,6 +7117,276 @@ mod tests {
             h.section_line(1),
             Some(line_before),
             "a cancelled drag still moved the line"
+        );
+    }
+
+    /// 45h. **Dragging the line's body slides it rigidly** — length and
+    ///      bearing kept — **previewing live and re-cutting only on the
+    ///      drop**, exactly like an endpoint drag.
+    ///
+    ///      This is the "walk the section through the storm" motion (GR's
+    ///      Position slider, as a direct gesture), so the mid-drag stillness
+    ///      matters twice over: it is one re-cut per walk step instead of one
+    ///      per frame, and the body is the *likeliest* thing to be dragged
+    ///      repeatedly.
+    #[test]
+    fn a_body_drag_slides_the_line_rigidly_and_re_cuts_on_drop() {
+        let (mut h, _, _) = harness_with_committed_section();
+        let line_before = h.section_line(1).expect("the fixture committed a line");
+        let mid_px = h.screen_of(0, crate::ui_section_edit::midpoint(line_before));
+        let target_px = mid_px + egui::vec2(20.0, -60.0);
+
+        h.mouse_move(mid_px);
+        h.frame();
+        h.mouse_press(mid_px);
+        let pressed = h.frame();
+        assert!(
+            pressed.resolved.suppress_pan,
+            "a press on the line's body left the map free to pan"
+        );
+        for step in 1..=4 {
+            h.mouse_move(mid_px + (target_px - mid_px) * (step as f32 / 4.0));
+            h.frame();
+            assert_eq!(
+                h.section_line(1),
+                Some(line_before),
+                "the stored line moved mid-drag on step {step}"
+            );
+        }
+        h.mouse_release(target_px);
+        h.frames_for(2, FRAME_DT);
+
+        let line = h.section_line(1).expect("the drop lost the line");
+        assert_ne!(line, line_before, "the body drag committed nothing");
+        let (len_before, len_after) = (
+            crate::ui_section_edit::length_km(line_before),
+            crate::ui_section_edit::length_km(line),
+        );
+        assert!(
+            (len_after - len_before).abs() < len_before * 0.01,
+            "a body drag stretched the line: {len_before} km -> {len_after} km"
+        );
+        let (bearing_before, bearing_after) = (
+            crate::ui_section_edit::bearing_deg(line_before),
+            crate::ui_section_edit::bearing_deg(line),
+        );
+        assert!(
+            (bearing_after - bearing_before).abs() < 0.5,
+            "a body drag turned the line: {bearing_before}\u{b0} -> {bearing_after}\u{b0}"
+        );
+        // And it really moved: both ends, together.
+        assert_ne!(line.a(), line_before.a());
+        assert_ne!(line.b(), line_before.b());
+    }
+
+    /// 45i. **A shift-drag on the body sweeps the line about its midpoint** —
+    ///      midpoint and length kept, bearing following the pointer.
+    ///
+    ///      The rotate affordance of issue #10. Shift is latched at the press,
+    ///      so the verb cannot change mid-gesture; the fine-step spelling for
+    ///      pointers with no modifier lives on the section pane's chips.
+    #[test]
+    fn a_shift_body_drag_sweeps_about_the_midpoint() {
+        let (mut h, a, b) = harness_with_committed_section();
+        let line_before = h.section_line(1).expect("the fixture committed a line");
+        let mid_before = crate::ui_section_edit::midpoint(line_before);
+        // Press three quarters of the way along, where a bearing about the
+        // midpoint is well defined.
+        let (press_lat, press_lon) =
+            rustdar_radar::beam::great_circle_point((a.lat, a.lon), (b.lat, b.lon), 0.75);
+        let press_px = h.screen_of(
+            0,
+            GeoPoint {
+                lat: press_lat,
+                lon: press_lon,
+            },
+        );
+
+        h.set_modifiers(egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        });
+        h.mouse_move(press_px);
+        h.frame();
+        h.mouse_press(press_px);
+        h.frame();
+        // Pull the grabbed point across the line's run — a turn, not a slide.
+        for step in 1..=4 {
+            h.mouse_move(press_px + egui::vec2(-10.0, -12.0) * step as f32);
+            h.frame();
+        }
+        h.mouse_release(press_px + egui::vec2(-40.0, -48.0));
+        h.frames_for(2, FRAME_DT);
+        h.set_modifiers(egui::Modifiers::default());
+
+        let line = h.section_line(1).expect("the drop lost the line");
+        assert_ne!(line, line_before, "the sweep committed nothing");
+        let mid_after = crate::ui_section_edit::midpoint(line);
+        assert!(
+            (mid_after.lat - mid_before.lat).abs() < 1e-6
+                && (mid_after.lon - mid_before.lon).abs() < 1e-6,
+            "the sweep moved its own pivot: {mid_before:?} -> {mid_after:?}"
+        );
+        assert!(
+            (crate::ui_section_edit::length_km(line)
+                - crate::ui_section_edit::length_km(line_before))
+            .abs()
+                < 0.5,
+            "the sweep changed the line's length"
+        );
+        assert!(
+            (crate::ui_section_edit::bearing_deg(line)
+                - crate::ui_section_edit::bearing_deg(line_before))
+            .abs()
+                > 2.0,
+            "a drag across the line's run turned it by nothing"
+        );
+    }
+
+    /// A single section pane with a rendered cut, for the step-control tests —
+    /// the layout a phone gets, where the chips are the only pan/sweep there
+    /// is.
+    fn harness_with_section_pane() -> (InputHarness, SectionLine) {
+        let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+        h.load_scan("KTLX");
+        let (a, b) = section_ends();
+        h.make_pane_cross_section(0, a, b);
+        h.place_section(0, vcp_212_axes(), &vcp_212_rungs());
+        let line = h.section_line(0).expect("the fixture committed a line");
+        (h, line)
+    }
+
+    /// The rect a control chip's glyph was painted in, inside `pane`.
+    fn chip_rect(h: &InputHarness, pane: egui::Rect, glyph: &str) -> egui::Rect {
+        h.painted_text_rects()
+            .into_iter()
+            .find(|(rect, text)| text == glyph && pane.contains(rect.center()))
+            .map(|(rect, _)| rect)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no {glyph:?} chip on the section pane; painted {:?}",
+                    h.painted_text_strings_in(pane)
+                )
+            })
+    }
+
+    /// 45j. **The section pane's pan chips slide the line perpendicular to
+    ///      itself, one step per click, keeping the picture** — and the pane
+    ///      says which way the line faces while you do it.
+    ///
+    ///      A chip click is one deliberate action, so unlike the map drags it
+    ///      commits immediately: one click, one re-cut, which is what makes
+    ///      stepping feel like a control. The picture stands until the new cut
+    ///      lands — strobing to "Cutting…" on every step is the exact failure
+    ///      the walk-through-the-storm flow cannot have.
+    #[test]
+    fn a_pan_step_on_the_section_pane_slides_the_line_and_keeps_the_picture() {
+        let (mut h, line_before) = harness_with_section_pane();
+        let pane = h.pane_rects()[0];
+
+        // The orientation readout: bearing (three digits, so north is 000°)
+        // and length, in the user's units — sweeping blind is the alternative.
+        let expected_readout = format!(
+            "{:03.0}\u{b0} \u{b7} {:.0}{}",
+            crate::ui_section_edit::bearing_deg(line_before).rem_euclid(360.0),
+            rustdar_units::UserPreferences::default()
+                .distance
+                .convert_from_km(crate::ui_section_edit::length_km(line_before)),
+            rustdar_units::UserPreferences::default().distance.suffix(),
+        );
+        assert!(
+            h.text_painted_in(pane, &expected_readout),
+            "the pane never says which way the line faces (wanted \
+             {expected_readout:?}); it painted {:?}",
+            h.painted_text_strings_in(pane)
+        );
+
+        h.mouse_click(chip_rect(&h, pane, "\u{25c0}").center());
+        h.frame();
+
+        let line = h.section_line(0).expect("the step lost the line");
+        assert_ne!(line, line_before, "the pan chip moved nothing");
+        assert!(
+            (crate::ui_section_edit::length_km(line)
+                - crate::ui_section_edit::length_km(line_before))
+            .abs()
+                < 0.1,
+            "a pan step stretched the line"
+        );
+        assert!(
+            (crate::ui_section_edit::bearing_deg(line)
+                - crate::ui_section_edit::bearing_deg(line_before))
+            .abs()
+                < 0.1,
+            "a pan step turned the line"
+        );
+        // Perpendicular, to the left of A→B, by exactly one step.
+        let mid_before = crate::ui_section_edit::midpoint(line_before);
+        let mid_after = crate::ui_section_edit::midpoint(line);
+        let (moved_bearing, moved_km) = rustdar_radar::beam::site_bearing_range_km(
+            mid_before.lat,
+            mid_before.lon,
+            mid_after.lat,
+            mid_after.lon,
+        );
+        let step =
+            crate::ui_section_edit::pan_step_km(crate::ui_section_edit::length_km(line_before));
+        assert!(
+            (moved_km - step).abs() < step * 0.05,
+            "one click moved the line {moved_km} km for a {step} km step"
+        );
+        let want_bearing =
+            (crate::ui_section_edit::bearing_deg(line_before) - 90.0).rem_euclid(360.0);
+        let off = (moved_bearing - want_bearing).rem_euclid(360.0);
+        assert!(
+            off.min(360.0 - off) < 1.0,
+            "the ◀ chip moved the line on bearing {moved_bearing}\u{b0}, not \
+             perpendicular-left at {want_bearing}\u{b0}"
+        );
+        // The picture stands until the re-cut lands.
+        assert!(
+            h.gui_mut()
+                .pane(0)
+                .and_then(|p| p.cross_section())
+                .is_some_and(|s| s.texture.is_some()),
+            "a pan step blanked the pane"
+        );
+    }
+
+    /// 45k. **The sweep chips rotate the line about its midpoint by one step**
+    ///      — the fine-grained spelling of the sweep, and the only one a
+    ///      touch screen with no modifier keys gets.
+    #[test]
+    fn a_sweep_step_on_the_section_pane_rotates_about_the_midpoint() {
+        let (mut h, line_before) = harness_with_section_pane();
+        let pane = h.pane_rects()[0];
+
+        h.mouse_click(chip_rect(&h, pane, "\u{21bb}").center());
+        h.frame();
+
+        let line = h.section_line(0).expect("the step lost the line");
+        let turned = (crate::ui_section_edit::bearing_deg(line)
+            - crate::ui_section_edit::bearing_deg(line_before))
+        .rem_euclid(360.0);
+        assert!(
+            (turned - crate::ui_section_edit::SWEEP_STEP_DEG).abs() < 0.1,
+            "the ↻ chip turned the line {turned}\u{b0} for a \
+             {}\u{b0} step",
+            crate::ui_section_edit::SWEEP_STEP_DEG
+        );
+        let mid_before = crate::ui_section_edit::midpoint(line_before);
+        let mid_after = crate::ui_section_edit::midpoint(line);
+        assert!(
+            (mid_after.lat - mid_before.lat).abs() < 1e-6
+                && (mid_after.lon - mid_before.lon).abs() < 1e-6,
+            "a sweep step moved the pivot"
+        );
+        assert!(
+            (crate::ui_section_edit::length_km(line)
+                - crate::ui_section_edit::length_km(line_before))
+            .abs()
+                < 0.1,
+            "a sweep step changed the length"
         );
     }
 
